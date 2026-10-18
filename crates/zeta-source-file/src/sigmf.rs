@@ -309,7 +309,11 @@ impl Port for FileSource {
                 suggested: None,
             });
         }
-        Ok(t)
+        // The recording's band is fixed: report it, not the request.
+        Ok(Tuning {
+            center_hz: self.meta.center_hz,
+            bandwidth_hz: self.meta.sample_rate_hz,
+        })
     }
 
     fn current(&self) -> Option<Tuning> {

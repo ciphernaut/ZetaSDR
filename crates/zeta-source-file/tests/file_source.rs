@@ -113,11 +113,17 @@ async fn tune_off_center_is_out_of_range() {
         }) => {}
         other => panic!("got {other:?}"),
     }
-    let ok = Tuning {
+    // A narrower band is accepted; the answer is the band actually captured.
+    let narrow = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let captured = Tuning {
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(48_000),
     };
-    assert_eq!(src.tune(ok).await.unwrap(), ok);
+    assert_eq!(src.tune(narrow).await.unwrap(), captured);
+    assert_eq!(src.current(), Some(captured));
 }
 
 fn write_raw(dir: &std::path::Path, dt: &str, bytes: &[u8]) -> std::path::PathBuf {
