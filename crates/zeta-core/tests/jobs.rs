@@ -25,7 +25,7 @@ fn source_with(dir: &Path, repeat: bool) -> (Arc<FileSource>, Arc<dyn Port>) {
 }
 
 fn cfg(dir: &Path) -> NodeConfig {
-    NodeConfig { state_dir: dir.join("state"), ring_seconds: 1.0, backends: vec![Backend::Cpu] }
+    NodeConfig { state_dir: dir.join("state"), ring_seconds: 1.0, backends: vec![Backend::Cpu], resume: true }
 }
 
 fn registry() -> StageRegistry {
@@ -103,6 +103,27 @@ async fn restart_resumes_running_job_with_same_id() {
     assert_eq!(list[0].state, JobState::Running);
     assert_eq!(node.job_context(&id).unwrap()["note"], "kept");
     assert_eq!(node.lease_holders(&SourceId("file0".into())).len(), 1);
+    assert_eq!(on_disk(dir.path(), &id).state, JobState::Running);
+}
+
+#[tokio::test]
+async fn open_without_resume_leaves_records_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    src.start();
+    let id = start_job(&node).await;
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let path = dir.path().join("state").join("jobs").join(format!("{}.json", id.0));
+    let before = std::fs::read(&path).unwrap();
+    let node = Node::open(NodeConfig { resume: false, ..cfg(dir.path()) }, registry(), vec![]).await.unwrap();
+    let list = node.job_list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, id);
+    assert_eq!(list[0].state, JobState::Running);
+    assert!(node.lease_holders(&SourceId("file0".into())).is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before, "record rewritten");
     assert_eq!(on_disk(dir.path(), &id).state, JobState::Running);
 }
 

@@ -77,7 +77,7 @@ impl Port for WidePort {
 }
 
 fn cfg(dir: &Path) -> NodeConfig {
-    NodeConfig { state_dir: dir.join("state"), ring_seconds: 1.0, backends: vec![Backend::Cpu] }
+    NodeConfig { state_dir: dir.join("state"), ring_seconds: 1.0, backends: vec![Backend::Cpu], resume: true }
 }
 
 fn registry() -> StageRegistry {

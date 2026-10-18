@@ -28,6 +28,9 @@ pub struct NodeConfig {
     pub state_dir: PathBuf,
     pub ring_seconds: f64,
     pub backends: Vec<Backend>,
+    /// Relaunch `Running` jobs on `open` (a long-lived node). When false, records
+    /// are loaded as persisted and nothing is launched, leased or rewritten.
+    pub resume: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,9 +123,11 @@ fn load(dir: &Path) -> Result<(Vec<JobRecord>, Vec<String>), NodeError> {
 }
 
 impl Node {
-    /// Open the node on `cfg.state_dir`, attach `ports`, and resume every
-    /// `Running` job. A job whose source is absent or cannot be resumed is
-    /// kept as `Failed`; `open` itself fails only on state-directory I/O.
+    /// Open the node on `cfg.state_dir`, attach `ports`, and, when
+    /// `cfg.resume`, resume every `Running` job: one whose source is absent or
+    /// cannot be resumed is kept as `Failed`. Without `cfg.resume` every record
+    /// is loaded as persisted, untouched. `open` itself fails only on
+    /// state-directory I/O.
     pub async fn open(
         cfg: NodeConfig,
         registry: StageRegistry,
@@ -131,6 +136,7 @@ impl Node {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (records, load_errors) = load(&jobs_dir)?;
+        let resume = cfg.resume;
         let node = Node {
             inner: Arc::new(Inner {
                 state_dir: cfg.state_dir.clone(),
@@ -154,7 +160,7 @@ impl Node {
             node.add_port(port);
         }
         for rec in records {
-            if rec.state != JobState::Running {
+            if !resume || rec.state != JobState::Running {
                 node.inner.jobs.lock().unwrap().insert(rec.id.clone(), JobEntry { record: rec, cancel: None, done: None });
                 continue;
             }

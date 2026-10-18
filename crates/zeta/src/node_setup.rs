@@ -24,8 +24,9 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
 
 /// Open the node on `state_dir` with one looping `FileSource` per `(id, meta path)`.
 /// Sources start after the node has subscribed to them: a source with no
-/// subscriber stops at once.
-pub async fn open(state_dir: PathBuf, source_files: &[(String, PathBuf)]) -> Result<Node, String> {
+/// subscriber stops at once. `resume` relaunches persisted `Running` jobs
+/// (`serve`); without it they are listed as persisted and left alone (one-shot).
+pub async fn open(state_dir: PathBuf, source_files: &[(String, PathBuf)], resume: bool) -> Result<Node, String> {
     let opts = FileOpts { realtime: false, block_samples: 4800, repeat: true };
     let sources = source_files
         .iter()
@@ -37,7 +38,7 @@ pub async fn open(state_dir: PathBuf, source_files: &[(String, PathBuf)]) -> Res
         .collect::<Result<Vec<_>, _>>()?;
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
-    let cfg = NodeConfig { state_dir, ring_seconds: 10.0, backends: vec![Backend::Cpu] };
+    let cfg = NodeConfig { state_dir, ring_seconds: 10.0, backends: vec![Backend::Cpu], resume };
     let ports = sources.iter().map(|s| s.clone() as Arc<dyn Port>).collect();
     let node = Node::open(cfg, registry, ports).await.map_err(|e| e.to_string())?;
     for s in &sources {

@@ -30,7 +30,8 @@ async fn main() -> ExitCode {
         Ok(d) => d,
         Err(e) => return fail(&e),
     };
-    let node = match node_setup::open(state_dir, &cli.source_files).await {
+    // Only `serve` (op `None`) resumes jobs; a one-shot never launches or fails them.
+    let node = match node_setup::open(state_dir, &cli.source_files, op.is_none()).await {
         Ok(n) => n,
         Err(e) => return fail(&e),
     };
