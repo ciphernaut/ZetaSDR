@@ -53,20 +53,27 @@ pub struct AgentFailure {
 
 const QUESTION_WORDS: &[&str] = &[
     "what", "which", "where", "when", "who", "whom", "whose", "why", "how", "is", "are", "was",
-    "were", "do", "does", "did", "can", "could", "will", "would", "should", "has", "have", "any",
+    "were", "does", "did", "can", "could", "will", "would", "should", "has", "have", "any",
 ];
 
 /// Whether `request` asks something rather than commands something: it ends
-/// with `?`, or its first word is a question word.
+/// with `?`, or its first word is a question word. `can`, `could`, `will` and
+/// `would` followed by `you` make a polite request, not a question.
 pub fn is_question(request: &str) -> bool {
     let text = request.trim();
     if text.ends_with('?') {
         return true;
     }
-    let first = text.split_whitespace().next().unwrap_or("");
-    let word = first
-        .trim_matches(|c: char| c.is_ascii_punctuation())
-        .to_lowercase();
+    let mut words = text.split_whitespace().map(|w| {
+        w.trim_matches(|c: char| c.is_ascii_punctuation())
+            .to_lowercase()
+    });
+    let word = words.next().unwrap_or_default();
+    if matches!(word.as_str(), "can" | "could" | "will" | "would")
+        && words.next().as_deref() == Some("you")
+    {
+        return false;
+    }
     QUESTION_WORDS.contains(&word.as_str())
 }
 
@@ -105,7 +112,8 @@ impl<E: Executor> Agent<E> {
             t.turns += 1;
             let c = self.llm.complete(&messages, &self.cfg.tools).await?;
             if c.tool_calls.is_empty() {
-                // Design 10: prose is an answer only to a question or after
+                // Design 10: prose is an answer only to a question (see
+                // `is_question`: a polite request is not one) or after
                 // tool calls; it is never parsed for operations.
                 let content = c.content.unwrap_or_default();
                 let text = content.trim();

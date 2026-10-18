@@ -64,7 +64,11 @@ async fn tone_node(dir: &std::path::Path) -> Arc<Node> {
 #[test]
 fn is_question_cases() {
     assert!(is_question("What radios do I have connected?"));
-    assert!(is_question("can you hear any weather balloons right now"));
+    assert!(!is_question("can you hear any weather balloons right now"));
+    assert!(is_question("can I see the job list?"));
+    assert!(!is_question("could you start a passthrough job on tone"));
+    assert!(!is_question("do a scan of 433 MHz"));
+    assert!(is_question("does tone have a job?"));
     assert!(is_question("  how many jobs"));
     assert!(!is_question(
         "Tune hackrf0 to 101.5 MHz with 200 kHz bandwidth."

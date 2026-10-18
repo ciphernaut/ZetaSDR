@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use zeta_client::ToolDef;
 
 /// Where and how to reach the model (design 10 sets the defaults).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LlmConfig {
     pub url: String,
     pub model: String,
@@ -20,6 +20,24 @@ pub struct LlmConfig {
     pub request_timeout: Duration,
     pub backoff_initial: Duration,
     pub backoff_max: Duration,
+}
+
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("url", &self.url)
+            .field("model", &self.model)
+            .field("key", &self.key.as_ref().map(|_| "***"))
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("thinking", &self.thinking)
+            .field("status_url", &self.status_url)
+            .field("ready_timeout", &self.ready_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("backoff_initial", &self.backoff_initial)
+            .field("backoff_max", &self.backoff_max)
+            .finish()
+    }
 }
 
 impl LlmConfig {
@@ -305,6 +323,17 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_secret() {
+        let mut cfg = LlmConfig::new("http://h:8080", "m");
+        assert!(format!("{cfg:?}").contains("key: None"));
+        cfg.key = Some("sk-very-secret".into());
+        let shown = format!("{cfg:?}");
+        assert!(shown.contains("http://h:8080"));
+        assert!(shown.contains("Some(\"***\")"));
+        assert!(!shown.contains("sk-very-secret"));
+    }
 
     #[test]
     fn endpoint_forms() {

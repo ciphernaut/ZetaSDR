@@ -29,11 +29,21 @@ pub enum ClientError {
     Decode(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NodeClient {
     url: String,
     secret: String,
     http: Client,
+}
+
+impl std::fmt::Debug for NodeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeClient")
+            .field("url", &self.url)
+            .field("secret", &"***")
+            .field("http", &self.http)
+            .finish()
+    }
 }
 
 impl NodeClient {
@@ -185,5 +195,19 @@ impl NodeClient {
             status,
             body: String::from_utf8_lossy(body).into_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_secret() {
+        let client = NodeClient::new("http://127.0.0.1:7979", "hunter2-very-secret").unwrap();
+        let shown = format!("{client:?}");
+        assert!(shown.contains("http://127.0.0.1:7979"));
+        assert!(shown.contains("***"));
+        assert!(!shown.contains("hunter2-very-secret"));
     }
 }

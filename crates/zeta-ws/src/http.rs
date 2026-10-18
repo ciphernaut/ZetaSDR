@@ -212,8 +212,8 @@ async fn op(State(st): State<Shared>, body: Body) -> Response {
         Err(_) => error_response(
             StatusCode::GATEWAY_TIMEOUT,
             other(format!(
-                "operation timed out after {} s",
-                timeout.as_secs_f64()
+                "operation timed out after {} s; it may have been partly applied, check `job list`",
+                timeout.as_secs()
             )),
         ),
     }
