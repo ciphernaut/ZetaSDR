@@ -231,3 +231,31 @@ async fn serve_serves_committed_agents_md() {
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENTS.md")).unwrap();
     assert_eq!(served, committed);
 }
+
+#[test]
+fn then_tail_with_node_is_usage_error() {
+    // Rejected before any request, so no node needs to be listening.
+    plain()
+        .args([
+            "--node",
+            "http://127.0.0.1:9",
+            "--secret",
+            SECRET,
+            "job",
+            "start",
+            "--kind",
+            "aprs_decode",
+            "--source",
+            "aprs",
+            "--center-hz",
+            "144800000",
+            "--bandwidth-hz",
+            "12500",
+            "--then-tail",
+            "1,1000",
+        ])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(contains("--then-tail is not supported with --node yet"));
+}

@@ -48,6 +48,9 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     if matches!(cli.command, Command::Serve(_)) {
         return usage("serve does not take --node");
     }
+    if cli.command.then_tail().is_some() {
+        return usage("--then-tail is not supported with --node yet");
+    }
     if !cli.source_files.is_empty() || cli.state_dir.is_some() {
         return usage(
             "--source-file and --state-dir belong to the serving node; drop them with --node",
