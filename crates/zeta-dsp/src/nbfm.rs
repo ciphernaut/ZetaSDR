@@ -14,7 +14,7 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, StreamId, StreamKind};
 
 use crate::util::lowpass_taps;
-use crate::{frame_span, run_map};
+use crate::{Input, frame_span, run_map};
 
 /// Taps of the audio low-pass filter.
 const TAPS: usize = 63;
@@ -173,7 +173,15 @@ impl Stage for NbfmDemodStage {
         };
         let mut prev = Complex::new(0.0f32, 0.0);
         let mut filter = AudioFilter::default();
-        run_map(inputs, bus, cancel, move |frame| {
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    prev = Complex::new(0.0, 0.0);
+                    filter = AudioFilter::default();
+                    return Ok(Vec::new());
+                }
+            };
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed(
                     "nbfm_demod stage expects iq frames".into(),
@@ -361,5 +369,47 @@ mod tests {
             }
             r => panic!("expected Failed, got {r:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn nbfm_resets_on_lag() {
+        let (tx, mut rx_out, h) =
+            spawn(serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000}));
+        let a = nbfm_modulate(
+            &tone(48_000, 4_800, 1_000.0, 1.0),
+            48_000,
+            96_000,
+            2_500.0,
+            0.3,
+        );
+        let b = nbfm_modulate(
+            &tone(48_000, 4_800, 700.0, 1.0),
+            48_000,
+            96_000,
+            2_500.0,
+            2.0,
+        );
+        tx.send(iq_frame(a, 96_000)).unwrap();
+        rx_out.recv().await.unwrap();
+        tx.send(iq_frame(vec![Complex::new(0.0, 1.0); 9_600], 96_000))
+            .unwrap();
+        for _ in 0..8 {
+            tx.send(iq_frame(b.clone(), 96_000)).unwrap();
+        }
+        let f = rx_out.recv().await.unwrap();
+        let Payload::Audio { samples, .. } = &f.payload else {
+            panic!("expected an audio payload")
+        };
+        let mut prev = Complex::new(0.0f32, 0.0);
+        let demod = nbfm_demod(&b, 96_000, 2_500, &mut prev);
+        let want = AudioFilter::default()
+            .process(&demod, 96_000, 48_000)
+            .unwrap();
+        assert_eq!(samples.len(), want.len());
+        for (g, w) in samples.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-6, "{g} vs {w}");
+        }
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
     }
 }

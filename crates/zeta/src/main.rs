@@ -5,6 +5,7 @@ mod ask;
 mod cli;
 mod node_setup;
 mod serve_lock;
+mod sources;
 mod transport;
 
 use std::process::ExitCode;
@@ -39,10 +40,15 @@ async fn main() -> ExitCode {
     if let cli::Command::AgentsMd { check, skill } = cli.command {
         return agents_md::run(check, skill);
     }
+    // Device discovery is local to this machine, whatever --node says.
+    if let cli::Command::Soapy(cli::SoapyCmd::Find { filter }) = &cli.command {
+        return node_setup::soapy_find(filter);
+    }
     let cli = match transport::dispatch(cli).await {
         Ok(code) => return code,
         Err(cli) => cli,
     };
+    let (sources, plugins) = (cli.sources(), cli.plugins.clone());
     let state_dir = match cli.state_dir.map_or_else(node_setup::default_state_dir, Ok) {
         Ok(d) => d,
         Err(e) => return fail(&e),
@@ -77,7 +83,7 @@ async fn main() -> ExitCode {
         Some(_) => None,
     };
     // Only `serve` (op `None`) resumes jobs; a one-shot never launches or fails them.
-    let node = match node_setup::open(state_dir, &cli.source_files, op.is_none()).await {
+    let node = match node_setup::open(state_dir, &sources, &plugins, op.is_none()).await {
         Ok(n) => n,
         Err(e) => return fail(&e),
     };

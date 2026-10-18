@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value;
 use zeta_source_file::fixtures::write_tone;
@@ -358,9 +359,9 @@ fn then_tail_malformed_value_is_usage_error() {
 #[test]
 fn then_tail_reports_failed_job() {
     let dir = tempfile::tempdir().unwrap();
-    // 44.1 kHz is not a multiple of fm_demod's 48 kHz channel rate.
-    let iq = zeta_dsp::util::nco(44_100, 1_000.0, 44_100.0);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 44_100, 100_000_000);
+    // A 1 kHz source channelises at 1 kHz, too slow for the AFSK1200 decoder.
+    let iq = zeta_dsp::util::nco(1_000, 100.0, 1_000.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 1_000, 100_000_000);
     let src = format!("cd={}", meta.display());
     let out = zeta(
         dir.path(),
@@ -370,13 +371,13 @@ fn then_tail_reports_failed_job() {
             "job",
             "start",
             "--kind",
-            "fm_demod",
+            "aprs_decode",
             "--source",
             "cd",
             "--center-hz",
             "100000000",
             "--bandwidth-hz",
-            "12500",
+            "500",
             "--then-tail",
             "1,2000",
         ],
@@ -389,5 +390,313 @@ fn then_tail_reports_failed_job() {
     let v = json(&out);
     assert_eq!(v[0]["result"], "job");
     assert_eq!(v[1]["state"]["status"], "failed", "{v}");
-    assert!(v[1]["state"]["reason"].is_string(), "{v}");
+    let reason = v[1]["state"]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("too low for afsk1200"), "{v}");
+}
+
+#[test]
+fn job_start_accepts_deviation_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "fm_demod",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "12500",
+            "--deviation-hz",
+            "3000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let id = json(&out)["value"].as_str().expect("job id").to_owned();
+    let out = zeta(dir.path(), &["graph", "get", "--job", &id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let g = json(&out);
+    let nodes = g["value"]["nodes"].as_array().expect("nodes");
+    let nbfm = nodes
+        .iter()
+        .find(|n| n["kind"] == "nbfm_demod")
+        .expect("nbfm node");
+    assert_eq!(nbfm["params"]["deviation_hz"], 3000);
+}
+
+/// `examples/python/gain.py` as an absolute path.
+fn gain_py() -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/python/gain.py")
+        .canonicalize()
+        .expect("examples/python/gain.py")
+        .display()
+        .to_string()
+}
+
+fn have_python3() -> bool {
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[test]
+fn source_list_shows_kiwi_capabilities_without_connecting() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta_bin()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args([
+            "--source-kiwi",
+            "kiwi0=127.0.0.1:9/hunter2",
+            "source",
+            "list",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("hunter2"), "password leaked: {text}");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("hunter2"));
+    let v = json(&out.stdout);
+    let s = v["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "kiwi0")
+        .expect("kiwi0 listed");
+    assert_eq!(s["capabilities"]["remote"], true);
+    assert_eq!(s["capabilities"]["push"], true);
+    assert_eq!(
+        s["capabilities"]["max_bandwidth_hz"],
+        serde_json::json!({"asserted": 12000})
+    );
+    assert!(s["current"].is_null(), "{s}");
+    assert!(s["fault"].is_null(), "{s}");
+}
+
+#[test]
+fn duplicate_source_id_across_kinds_rejected() {
+    zeta_bin()
+        .args(["--source-file", "a=x.sigmf-meta", "--source-kiwi", "a=h:1"])
+        .args(["source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("\"a\""))
+        .stderr(contains("more than once"));
+}
+
+#[test]
+fn kiwi_flag_errors_never_echo_the_password() {
+    zeta_bin()
+        .args(["--source-kiwi", "k=h/hunter2", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("expected ID=HOST:PORT"))
+        .stderr(contains("hunter2").not());
+    let dir = tempfile::tempdir().unwrap();
+    zeta_bin()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["--source-kiwi", "k=h:1/hunter 2", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("--source-kiwi k=h:1"))
+        .stderr(contains("hunter").not());
+}
+
+#[test]
+fn plugin_flag_registers_stage_in_schema() {
+    if !have_python3() {
+        eprintln!("skipped: no python3");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta_bin()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--plugin")
+        .arg(format!("gain={}", gain_py()))
+        .arg("schema")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let gain = v["value"]["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "gain")
+        .expect("gain stage in schema");
+    assert_eq!(
+        gain["params_schema"]["required"],
+        serde_json::json!(["factor"])
+    );
+}
+
+#[test]
+fn plugin_kind_colliding_with_builtin_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    zeta_bin()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--plugin")
+        .arg(format!("channel={}", gain_py()))
+        .args(["source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("collides"));
+}
+
+#[test]
+fn failed_plugin_probe_is_a_startup_error_naming_the_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    zeta_bin()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args([
+            "--plugin",
+            "nope=/nonexistent/zeta-plugin",
+            "source",
+            "list",
+        ])
+        .assert()
+        .code(1)
+        .stderr(contains("--plugin nope="))
+        .stderr(contains("cannot start"));
+    zeta_bin()
+        .args(["--plugin", "Gain=/x", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("must match"));
+}
+
+#[cfg(not(soapy))]
+#[test]
+fn soapy_without_cfg_is_explained() {
+    let dir = tempfile::tempdir().unwrap();
+    zeta_bin()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["--source-soapy", "h=driver=hackrf", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("--source-soapy h=driver=hackrf"))
+        .stderr(contains("--cfg soapy"));
+    zeta_bin()
+        .args(["soapy", "find", "--filter", "driver=hackrf"])
+        .assert()
+        .code(1)
+        .stderr(contains("--cfg soapy"))
+        .stderr(contains("libsoapysdr-dev"));
+}
+
+#[test]
+fn node_mode_rejects_source_and_plugin_flags() {
+    for flags in [
+        ["--source-kiwi", "k=h:1"],
+        ["--source-soapy", "h=driver=hackrf"],
+        ["--plugin", "gain=/x"],
+    ] {
+        zeta_bin()
+            .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
+            .args(flags)
+            .args(["source", "list"])
+            .assert()
+            .code(1)
+            .stderr(contains("configured on the serving node"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_start_on_fake_kiwi_measures() {
+    use zeta_source_kiwi::testing::{FakeKiwi, FakeScript};
+    let fake = FakeKiwi::start(FakeScript::default()).await;
+    let port = fake.addr().port();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let out = tokio::task::spawn_blocking(move || {
+        zeta_bin()
+            .arg("--state-dir")
+            .arg(state)
+            .arg("--source-kiwi")
+            .arg(format!("k=127.0.0.1:{port}"))
+            .args(["job", "start", "--kind", "measure", "--source", "k"])
+            .args(["--center-hz", "7100000", "--bandwidth-hz", "10000"])
+            .args(["--then-tail", "1,5000"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    })
+    .await
+    .unwrap();
+    let v = json(&out);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames");
+    assert!(!frames.is_empty(), "{v}");
+    let center = frames[0]["payload"]["center_hz"]
+        .as_f64()
+        .expect("center_hz is a number");
+    assert!(
+        (7_095_000.0..=7_105_000.0).contains(&center),
+        "center_hz {center} not within 5 kHz of 7 100 000: {v}"
+    );
+    assert!(fake.connections() >= 1);
+}
+
+/// `ZETA_KIWI_PASSWORD_<ID>` supplies the password when the flag has none: it reaches the
+/// Kiwi's `SET auth` and is printed nowhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kiwi_password_from_env_reaches_kiwi_and_is_never_printed() {
+    use zeta_source_kiwi::testing::{FakeKiwi, FakeScript};
+    let fake = FakeKiwi::start(FakeScript::default()).await;
+    let port = fake.addr().port();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let out = tokio::task::spawn_blocking(move || {
+        zeta_bin()
+            .env("ZETA_KIWI_PASSWORD_MY_KIWI", "hunter2")
+            .arg("--state-dir")
+            .arg(state)
+            .arg("--source-kiwi")
+            .arg(format!("my-kiwi=127.0.0.1:{port}"))
+            .args(["job", "start", "--kind", "measure", "--source", "my-kiwi"])
+            .args(["--center-hz", "7100000", "--bandwidth-hz", "10000"])
+            .args(["--then-tail", "1,3000"])
+            .assert()
+            .success()
+            .get_output()
+            .clone()
+    })
+    .await
+    .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all.contains("hunter2"), "password printed: {all}");
+    assert!(
+        fake.commands()
+            .iter()
+            .any(|c| c == "SET auth t=kiwi p=hunter2"),
+        "{:?}",
+        fake.commands()
+    );
 }

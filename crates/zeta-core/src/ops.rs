@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{CaptureMeta, write_cf32};
-use crate::classify::Label;
+use crate::classify::{Band, Label};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::JobRecord;
 use crate::knowledge::{Allocation, Signature};
@@ -32,6 +32,10 @@ use crate::types::{
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub enum Op {
+    /// List the sources: id, capabilities, `current` band, `holders` (job
+    /// ids) and `fault`, the source's unrecoverable failure (`null` when
+    /// healthy). Jobs on a faulted source fail with `source ID: FAULT` as
+    /// their reason; a successful tune (`source_ensure`, `job_start`) clears it.
     SourceList {},
     /// Check a band against the source and tune it if no job holds it. Takes
     /// no lease: an unheld source is tuned directly (a later `job_start` may
@@ -49,6 +53,11 @@ pub enum Op {
         source: SourceId,
         center_hz: Hz,
         bandwidth_hz: Hz,
+        /// FM peak deviation in Hz (100..=75000) for `fm_demod`; `null` is the
+        /// kind's default (5000). Any other kind must pass `null`.
+        #[serde(deserialize_with = "nullable_u64")]
+        #[schemars(required, schema_with = "nullable_hz_u64")]
+        deviation_hz: Option<u64>,
     },
     JobList {},
     JobStop {
@@ -90,19 +99,49 @@ pub enum Op {
         center_hz: Hz,
         bandwidth_hz: Hz,
     },
-    /// Run every registered classifier over the selection's span of the
-    /// source ring (no upstream features). The analysis covers the whole
-    /// source band; the selection band is validated but not used to narrow
-    /// the analysis in this release.
+    /// Run every registered classifier over the selection's band and span of
+    /// the source ring (no upstream features).
     Classify {
         selection: Selection,
     },
     Schema {},
 }
 
-/// Built-in job kinds; each expands to a graph. `measure` and `spectrum`
-/// cover the whole source band; the job band is validated but not used to
-/// narrow the analysis in this release.
+/// Deserialize a required `Option<u64>`: without `#[serde(default)]` a missing
+/// key is a "missing field" error, while an explicit `null` is `None`.
+fn nullable_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    <Option<u64> as Deserialize>::deserialize(d)
+}
+
+/// Schema of a required `Option<u64>`: `["integer","null"]`. (`required` alone
+/// would drop the `null`.)
+fn nullable_hz_u64(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint64",
+        "minimum": 0,
+        "description": "FM peak deviation in Hz (100..=75000) for `fm_demod`; `null` is the kind's default (5000). Any other kind must pass `null`."
+    })
+}
+
+/// Schema of a required `Option<String>`: `["string","null"]`.
+fn nullable_string(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "description": "The port's unrecoverable failure (`Port::fault`); `null` when healthy. Jobs on a faulted source fail with it; a successful tune clears it."
+    })
+}
+
+/// `fm_demod` peak deviation when a job start passes `null`.
+pub const FM_DEVIATION_DEFAULT_HZ: u64 = 5_000;
+const FM_DEVIATION_MIN_HZ: u64 = 100;
+const FM_DEVIATION_MAX_HZ: u64 = 75_000;
+
+/// Built-in job kinds; each expands to a graph. `fm_demod` and `aprs_decode`
+/// channelise the job band at the narrowest exact divisor of the source rate
+/// that is at least 48 kHz and at least the band; `spectrum` covers the whole
+/// capture band. `measure` channelises the job band the same way and
+/// measures only that band, reporting its absolute `center_hz`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
@@ -125,8 +164,42 @@ impl JobKind {
         }
     }
 
-    pub fn expand(&self, _source: &SourceId, tuning: Tuning) -> Graph {
-        match self {
+    /// Whether the kind's graph has a `channel` node, so depends on the source rate.
+    fn channelised(&self) -> bool {
+        matches!(
+            self,
+            JobKind::FmDemod | JobKind::AprsDecode | JobKind::Measure
+        )
+    }
+
+    /// The kind's graph for `tuning` on a source sampling at `source_rate_hz`
+    /// (the port-returned `bandwidth_hz`). Kinds with a `channel` node refuse
+    /// an unknown (0) rate and a band wider than [`channel_rate_hz`].
+    pub fn expand(
+        &self,
+        _source: &SourceId,
+        tuning: Tuning,
+        source_rate_hz: Hz,
+        deviation_hz: Option<Hz>,
+    ) -> Result<Graph, OpError> {
+        let out = channel_rate_hz(source_rate_hz.0, tuning.bandwidth_hz.0);
+        if self.channelised() {
+            if source_rate_hz.0 == 0 {
+                return Err(OpError::Other {
+                    message: "source rate unknown: tune returned bandwidth_hz 0".into(),
+                });
+            }
+            if tuning.bandwidth_hz.0 > out {
+                return Err(OpError::OutOfRange {
+                    field: "bandwidth_hz".into(),
+                    value: tuning.bandwidth_hz.0,
+                    min: 1,
+                    max: out,
+                    suggested: None,
+                });
+            }
+        }
+        Ok(match self {
             JobKind::Passthrough => Graph {
                 id: GraphId::new(),
                 nodes: vec![GraphNode {
@@ -136,15 +209,33 @@ impl JobKind {
                 }],
                 edges: vec![],
             },
-            JobKind::Measure => Graph {
-                id: GraphId::new(),
-                nodes: vec![GraphNode {
-                    id: NodeId::new(),
-                    kind: "measure".into(),
-                    params: serde_json::json!({}),
-                }],
-                edges: vec![],
-            },
+            JobKind::Measure => {
+                let (channel, measure) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": out,
+                            }),
+                        },
+                        GraphNode {
+                            id: measure.clone(),
+                            kind: "measure".into(),
+                            params: serde_json::json!({"bandwidth_hz": tuning.bandwidth_hz.0}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: measure,
+                        kind: StreamKind::Iq,
+                    }],
+                }
+            }
             JobKind::Spectrum => Graph {
                 id: GraphId::new(),
                 nodes: vec![GraphNode {
@@ -165,13 +256,13 @@ impl JobKind {
                             params: serde_json::json!({
                                 "center_hz": tuning.center_hz.0,
                                 "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": 48_000,
+                                "out_rate_hz": out,
                             }),
                         },
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000}),
+                            params: serde_json::json!({"deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0), "audio_rate_hz": out}),
                         },
                     ],
                     edges: vec![Edge {
@@ -192,13 +283,13 @@ impl JobKind {
                             params: serde_json::json!({
                                 "center_hz": tuning.center_hz.0,
                                 "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": 48_000,
+                                "out_rate_hz": out,
                             }),
                         },
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({"deviation_hz": 3_000, "audio_rate_hz": 48_000}),
+                            params: serde_json::json!({"deviation_hz": 3_000, "audio_rate_hz": out}),
                         },
                         GraphNode {
                             id: decode.clone(),
@@ -220,8 +311,26 @@ impl JobKind {
                     ],
                 }
             }
-        }
+        })
     }
+}
+
+/// The lowest channel output rate a job is channelised at.
+pub const CHANNEL_RATE_MIN_HZ: u64 = 48_000;
+
+/// The narrowest exact divisor of `source_rate_hz` that is at least
+/// [`CHANNEL_RATE_MIN_HZ`] and at least `bandwidth_hz`; the source rate itself
+/// when it is no wider than that. Integer only: the channel stage decimates by
+/// an exact integer factor.
+pub fn channel_rate_hz(source_rate_hz: u64, bandwidth_hz: u64) -> u64 {
+    let target = bandwidth_hz.max(CHANNEL_RATE_MIN_HZ);
+    if target >= source_rate_hz {
+        return source_rate_hz;
+    }
+    (1..=source_rate_hz / target)
+        .rev()
+        .find(|d| source_rate_hz.is_multiple_of(*d))
+        .map_or(source_rate_hz, |d| source_rate_hz / d)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -230,9 +339,13 @@ impl JobKind {
 pub struct SourceInfo {
     pub id: SourceId,
     pub capabilities: Capabilities,
-    #[schemars(required)]
+    #[schemars(required, schema_with = "crate::types::nullable::<Tuning>")]
     pub current: Option<Tuning>,
     pub holders: Vec<JobId>,
+    /// The port's unrecoverable failure (`Port::fault`); `null` when healthy.
+    /// Jobs on a faulted source fail with it; a successful tune clears it.
+    #[schemars(required, schema_with = "nullable_string")]
+    pub fault: Option<String>,
 }
 
 /// One frame of a `stream_tail`, as JSON. `source`, `job`, `channel` and
@@ -248,9 +361,9 @@ pub struct FrameSummary {
     pub stream: StreamId,
     pub kind: StreamKind,
     pub source: SourceId,
-    #[schemars(required)]
+    #[schemars(required, schema_with = "crate::types::nullable::<JobId>")]
     pub job: Option<JobId>,
-    #[schemars(required)]
+    #[schemars(required, schema_with = "crate::types::nullable::<ChannelId>")]
     pub channel: Option<ChannelId>,
     pub start_ns: Timestamp,
     pub end_ns: Timestamp,
@@ -339,7 +452,7 @@ pub enum OpError {
         value: u64,
         min: u64,
         max: u64,
-        #[schemars(required)]
+        #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
         suggested: Option<u64>,
     },
     /// The source is held by `holders` at `current`, which the request does
@@ -559,6 +672,73 @@ fn checked_port(
     Ok(port)
 }
 
+/// The capture band `id` leased on `port`: the port's current band, else the
+/// first holder's (as the lease manager takes it), or `None` once `id` holds
+/// no lease (the job already ended).
+fn leased_band(node: &Node, port: &dyn Port, id: &JobId) -> Option<Tuning> {
+    let holders = node.lease_holders(port.id());
+    if !holders.iter().any(|(j, _)| j == id) {
+        return None;
+    }
+    port.current().or_else(|| holders.first().map(|(_, t)| *t))
+}
+
+/// `job_start` expands against the pre-tune rate, but another job can lease
+/// the source between that tune and this job's lease, so the lease may share a
+/// capture at another rate. Re-expand against the leased rate and relaunch the
+/// job under the same id (`job_graph_put`), once; if the rate moves again the
+/// job is stopped and the start is a `Conflict`. Kinds without a `channel`
+/// node do not depend on the rate and are left alone.
+async fn reconcile_rate(
+    node: &Node,
+    port: &dyn Port,
+    id: &JobId,
+    kind: JobKind,
+    tuning: Tuning,
+    deviation_hz: Option<Hz>,
+    mut expected: Hz,
+) -> Result<(), OpError> {
+    if !kind.channelised() {
+        return Ok(());
+    }
+    for attempt in 0..2 {
+        let Some(leased) = leased_band(node, port, id) else {
+            return Ok(());
+        };
+        if leased.bandwidth_hz == expected {
+            return Ok(());
+        }
+        if attempt == 1 {
+            // Best effort: the conflict is the answer whether or not the stop lands.
+            let _ = node.job_stop(id).await;
+            let holders = node
+                .lease_holders(port.id())
+                .into_iter()
+                .map(|(j, _)| j)
+                .filter(|j| j != id)
+                .collect();
+            return Err(OpError::Conflict {
+                source: port.id().clone(),
+                holders,
+                current: leased,
+                options: vec!["retry job_start".into(), "stop one of the holders".into()],
+            });
+        }
+        let graph = match kind.expand(port.id(), tuning, leased.bandwidth_hz, deviation_hz) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = node.job_stop(id).await;
+                return Err(e);
+            }
+        };
+        node.job_graph_put(id, graph)
+            .await
+            .map_err(|e| node_error(node, e))?;
+        expected = leased.bandwidth_hz;
+    }
+    Ok(())
+}
+
 pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
     match op {
         Op::SourceList {} => {
@@ -572,6 +752,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                         .into_iter()
                         .map(|(j, _)| j)
                         .collect(),
+                    fault: node.port(&id).and_then(|p| p.fault()),
                     id,
                     capabilities,
                 })
@@ -599,17 +780,49 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             source,
             center_hz,
             bandwidth_hz,
+            deviation_hz,
         } => {
+            let deviation = match deviation_hz {
+                None => None,
+                Some(_) if kind != JobKind::FmDemod => {
+                    return Err(OpError::Other {
+                        message: format!(
+                            "deviation_hz applies only to kind fm_demod; pass null (kind is {})",
+                            kind.name()
+                        ),
+                    });
+                }
+                Some(d) => {
+                    range("deviation_hz", d, FM_DEVIATION_MIN_HZ, FM_DEVIATION_MAX_HZ)?;
+                    Some(Hz(d))
+                }
+            };
             let tuning = Tuning {
                 center_hz,
                 bandwidth_hz,
             };
-            checked_port(node, &source, &tuning)?;
-            let graph = kind.expand(&source, tuning);
-            node.job_start(kind.name(), source, tuning, graph)
+            let port = checked_port(node, &source, &tuning)?;
+            // The granted capture band: its width is the source rate (Port contract).
+            let granted = node
+                .tune_if_unheld(port.as_ref(), tuning)
                 .await
-                .map(OpResult::Job)
-                .map_err(|e| node_error(node, e))
+                .map_err(lease_error)?;
+            let graph = kind.expand(&source, tuning, granted.bandwidth_hz, deviation)?;
+            let id = node
+                .job_start(kind.name(), source, tuning, graph)
+                .await
+                .map_err(|e| node_error(node, e))?;
+            reconcile_rate(
+                node,
+                port.as_ref(),
+                &id,
+                kind,
+                tuning,
+                deviation,
+                granted.bandwidth_hz,
+            )
+            .await?;
+            Ok(OpResult::Job(id))
         }
         Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),
         Op::JobStop { job } => node
@@ -702,11 +915,16 @@ fn check_band(sel: &Selection, center: Hz, rate: Hz) -> Result<(), OpError> {
     )
 }
 
-/// Run the classifier set over the selection's span of the source ring.
+/// Run the classifier set over the selection's band and span of the source ring.
 async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
-    let (rate, _, samples) = ring_samples(node, &sel)?;
+    let (rate, center, samples) = ring_samples(node, &sel)?;
+    // `check_band` has proved the band lies inside the ring's.
+    let band = Band {
+        offset_hz: sel.center_hz.0 as i64 - center.0 as i64,
+        bandwidth_hz: sel.bandwidth_hz,
+    };
     Ok(OpResult::Labels(
-        node.classifiers().run_all(&samples, rate, None).await,
+        node.classifiers().run_all(&samples, rate, band, None).await,
     ))
 }
 

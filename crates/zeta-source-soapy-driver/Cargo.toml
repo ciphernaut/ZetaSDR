@@ -1,0 +1,20 @@
+[package]
+name = "zeta-source-soapy-driver"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "ZetaSDR SoapySDR driver adapter (links libSoapySDR; outside the workspace)"
+publish = false
+
+# Excluded from the workspace (root Cargo.toml `exclude`): soapysdr-sys needs
+# libsoapysdr-dev to build, which the workspace gate must never require.
+# Build from this directory; see README.md.
+
+[dependencies]
+num-complex = "0.4.6"
+soapysdr = "0.5"
+zeta-core = { path = "../zeta-core" }
+zeta-source-soapy = { path = "../zeta-source-soapy" }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "time", "sync"] }

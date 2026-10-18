@@ -16,9 +16,20 @@ tokio-util = "0.7.20"
 zeta-dsp = { path = "../zeta-dsp" }
 zeta-source-file = { version = "0.1.0", path = "../zeta-source-file" }
 zeta-agent = { path = "../zeta-agent" }
+zeta-source-kiwi = { path = "../zeta-source-kiwi" }
+zeta-plugin = { path = "../zeta-plugin" }
+
+# The real SoapySDR driver links libSoapySDR (needs libsoapysdr-dev), so it is
+# behind a cfg, not a feature: `--all-features` must never build it. Build with
+# RUSTFLAGS="--cfg soapy" cargo build -p zeta --release
+[target.'cfg(soapy)'.dependencies]
+zeta-source-soapy-driver = { path = "../zeta-source-soapy-driver" }
 
 [features]
 gpu = ["zeta-dsp/gpu"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(soapy)'] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
@@ -28,3 +39,4 @@ zeta-client = { path = "../zeta-client" }
 zeta-dsp = { path = "../zeta-dsp", features = ["test-fixtures"] }
 zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] }
 zeta-agent = { path = "../zeta-agent", features = ["test-fake"] }
+zeta-source-kiwi = { path = "../zeta-source-kiwi", features = ["test-fake"] }

@@ -1,0 +1,28 @@
+[package]
+name = "zeta-source-kiwi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZetaSDR KiwiSDR websocket IQ source"
+
+[dependencies]
+async-trait = "0.1.92"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+num-complex = "0.4.6"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["net", "time", "sync", "macros", "rt"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
+tokio-util = "0.7.20"
+zeta-core = { path = "../zeta-core" }
+
+[features]
+test-fake = []
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["rt-multi-thread"] }
+zeta-dsp = { path = "../zeta-dsp" }
+
+[dev-dependencies.zeta-source-kiwi]
+path = "."
+features = ["test-fake"]

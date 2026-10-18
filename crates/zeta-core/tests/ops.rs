@@ -10,7 +10,7 @@ use zeta_core::classify::StubClassifier;
 use zeta_core::job::JobState;
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::node::{Node, NodeConfig};
-use zeta_core::ops::{JobKind, Op, OpError, OpResult, schema};
+use zeta_core::ops::{JobKind, Op, OpError, OpResult, channel_rate_hz, schema};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{
@@ -27,6 +27,10 @@ struct WidePort {
     tx: tokio::sync::broadcast::Sender<IqBlock>,
     /// Sleep inside `tune`, to widen the window a concurrent call could race into.
     slow: bool,
+    /// `tune` calls so far, counted on entry.
+    tunes: std::sync::atomic::AtomicUsize,
+    /// What `fault()` reports.
+    fault: Mutex<Option<String>>,
 }
 
 impl WidePort {
@@ -40,6 +44,8 @@ impl WidePort {
     fn new(id: &str) -> Self {
         Self {
             slow: false,
+            tunes: std::sync::atomic::AtomicUsize::new(0),
+            fault: Mutex::new(None),
             id: SourceId(id.into()),
             caps: Capabilities {
                 tune_min_hz: Claim::Asserted(Hz(1_000_000)),
@@ -67,6 +73,7 @@ impl Port for WidePort {
         &self.caps
     }
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        self.tunes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.slow {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -78,6 +85,9 @@ impl Port for WidePort {
     }
     fn subscribe(&self) -> IqReceiver {
         self.tx.subscribe()
+    }
+    fn fault(&self) -> Option<String> {
+        self.fault.lock().unwrap().clone()
     }
 }
 
@@ -181,6 +191,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         source: SourceId("file0".into()),
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(48_000),
+        deviation_hz: None,
     };
     let id = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -311,14 +322,23 @@ async fn source_ensure_during_job_start_does_not_retune() {
         source: source.clone(),
         center_hz: job_tuning.center_hz,
         bandwidth_hz: job_tuning.bandwidth_hz,
+        deviation_hz: None,
     };
     let ensure = Op::SourceEnsure {
         source,
         center_hz: Hz(433_000_000),
         bandwidth_hz: Hz(200_000),
     };
-    // `join!` polls `start` first, so the job is inside its slow tune when `ensure` runs.
-    let (started, ensured) = tokio::join!(node.apply(start), node.apply(ensure));
+    // `job_start` tunes twice: once (unheld) to learn the source rate, then
+    // under its lease. Send `ensure` once the second, slow tune has begun, so
+    // it lands inside the job's lease-and-tune.
+    let ensured = async {
+        while port.tunes.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        node.apply(ensure).await
+    };
+    let (started, ensured) = tokio::join!(node.apply(start), ensured);
     let job: JobId = match started {
         Ok(OpResult::Job(id)) => id,
         other => panic!("expected Job, got {other:?}"),
@@ -329,6 +349,101 @@ async fn source_ensure_during_job_start_does_not_retune() {
         other => panic!("expected Conflict or the job's tuning, got {other:?}"),
     }
     assert_eq!(port.current(), Some(job_tuning));
+}
+
+/// A stage that runs until cancelled, registered under another stage's kind
+/// so graphs naming DSP stages validate in core tests.
+struct IdleStage(zeta_core::stage::StageSpec);
+
+impl IdleStage {
+    fn new(kind: &'static str, input: StreamKind, output: StreamKind) -> Self {
+        Self(zeta_core::stage::StageSpec {
+            kind,
+            inputs: vec![input],
+            outputs: vec![output],
+            params_schema: schemars::json_schema!({}),
+        })
+    }
+}
+
+#[async_trait]
+impl zeta_core::stage::Stage for IdleStage {
+    fn spec(&self) -> &zeta_core::stage::StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        _inputs: Vec<tokio::sync::broadcast::Receiver<zeta_core::stream::Frame>>,
+        _outputs: Vec<StreamId>,
+        _bus: Arc<zeta_core::stream::StreamBus>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), zeta_core::stage::StageError> {
+        cancel.cancelled().await;
+        Err(zeta_core::stage::StageError::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn job_start_reexpands_when_lease_rate_differs() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = Arc::new(WidePort::slow("hackrf0"));
+    let mut reg = registry();
+    reg.register(Arc::new(IdleStage::new(
+        "channel",
+        StreamKind::Iq,
+        StreamKind::Iq,
+    )));
+    reg.register(Arc::new(IdleStage::new(
+        "nbfm_demod",
+        StreamKind::Iq,
+        StreamKind::Audio,
+    )));
+    let node = Node::open(cfg(dir.path()), reg, vec![port.clone()])
+        .await
+        .unwrap();
+    let source = SourceId("hackrf0".into());
+    // A: narrow; WidePort grants the requested band, so its pre-tune rate is 12.5 kHz.
+    let a = Op::JobStart {
+        kind: JobKind::FmDemod,
+        source: source.clone(),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+    };
+    // B: 2 MHz around A's band, leased while A's slow pre-tune holds the gate,
+    // so B's lease is queued ahead of A's and A's lease shares B's 2 MS/s capture.
+    let wide = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(2_000_000),
+    };
+    let b = async {
+        while port.tunes.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let g = JobKind::Passthrough
+            .expand(&source, wide, wide.bandwidth_hz, None)
+            .unwrap();
+        node.job_start("passthrough", source.clone(), wide, g).await
+    };
+    let (a, b) = tokio::join!(node.apply(a), b);
+    let a = match a {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected Job, got {other:?}"),
+    };
+    b.unwrap();
+    assert_eq!(port.current(), Some(wide));
+    let rec = node.job_list().into_iter().find(|r| r.id == a).unwrap();
+    assert_eq!(rec.state, JobState::Running);
+    let out = rec.graph.nodes[0].params["out_rate_hz"].as_u64().unwrap();
+    assert_eq!(out, 50_000);
+    assert_eq!(2_000_000 % out, 0);
+    assert_eq!(rec.graph.nodes[1].params["audio_rate_hz"], 50_000);
+    // Relaunched under the same id: no stray stopped record.
+    assert_eq!(node.job_list().len(), 2);
 }
 
 fn variants(op: &Value) -> &Vec<Value> {
@@ -403,6 +518,10 @@ fn nested_schemas_are_strict() {
     let s = schema();
     for key in ["op", "result", "error"] {
         check_strict(&s[key], key);
+    }
+    // Stage params, as `node.schema()["stages"]` publishes them.
+    for st in registry().describe().as_array().unwrap() {
+        check_strict(&st["params_schema"], &format!("stages.{}", st["kind"]));
     }
     // stream_tail: provenance fields on every frame, and the missed count.
     let fs = &s["result"]["$defs"]["FrameSummary"];
@@ -653,6 +772,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         source: source.clone(),
         center_hz: held.center_hz,
         bandwidth_hz: held.bandwidth_hz,
+        deviation_hz: None,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -746,6 +866,7 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         source: SourceId("file0".into()),
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(48_000),
+        deviation_hz: None,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -790,7 +911,9 @@ fn spectrum_kind_expands_to_single_fft_node() {
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(48_000),
     };
-    let g = JobKind::Spectrum.expand(&SourceId("file0".into()), tuning);
+    let g = JobKind::Spectrum
+        .expand(&SourceId("file0".into()), tuning, Hz(48_000), None)
+        .unwrap();
     assert_eq!(g.nodes.len(), 1);
     assert!(g.edges.is_empty());
     assert_eq!(g.nodes[0].kind, "fft");
@@ -811,7 +934,9 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
         center_hz: Hz(100_005_000),
         bandwidth_hz: Hz(12_500),
     };
-    let g = JobKind::FmDemod.expand(&SourceId("file0".into()), tuning);
+    let g = JobKind::FmDemod
+        .expand(&SourceId("file0".into()), tuning, Hz(48_000), None)
+        .unwrap();
     assert_eq!(g.nodes.len(), 2);
     assert_eq!(g.nodes[0].kind, "channel");
     assert_eq!(
@@ -821,7 +946,7 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
     assert_eq!(g.nodes[1].kind, "nbfm_demod");
     assert_eq!(
         g.nodes[1].params,
-        serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000})
+        serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000})
     );
     assert_eq!(g.edges.len(), 1);
     assert_eq!(g.edges[0].from, g.nodes[0].id);
@@ -830,21 +955,129 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
 }
 
 #[test]
-fn measure_kind_expands_to_one_measure_node() {
+fn measure_kind_expands_to_channel_then_measure() {
     assert_eq!(JobKind::Measure.name(), "measure");
     assert_eq!(
         serde_json::to_value(JobKind::Measure).unwrap(),
         serde_json::json!("measure")
     );
     let tuning = Tuning {
+        center_hz: Hz(144_812_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let g = JobKind::Measure
+        .expand(&SourceId("file0".into()), tuning, Hz(2_048_000), None)
+        .unwrap();
+    assert_eq!(g.nodes.len(), 2);
+    assert_eq!(g.nodes[0].kind, "channel");
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"center_hz": 144_812_000, "bandwidth_hz": 12_500, "out_rate_hz": 51_200})
+    );
+    assert_eq!(g.nodes[1].kind, "measure");
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({"bandwidth_hz": 12_500})
+    );
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!(g.edges[0].from, g.nodes[0].id);
+    assert_eq!(g.edges[0].to, g.nodes[1].id);
+    assert_eq!(g.edges[0].kind, zeta_core::types::StreamKind::Iq);
+    // Channelised, so an unknown source rate is refused.
+    assert!(
+        JobKind::Measure
+            .expand(&SourceId("file0".into()), tuning, Hz(0), None)
+            .is_err()
+    );
+}
+
+#[test]
+fn channel_rate_table() {
+    for (rate, bw, want) in [
+        (48_000, 12_500, 48_000),
+        (12_000, 10_000, 12_000),
+        (1_000_000, 12_500, 50_000),
+        (2_048_000, 12_500, 51_200),
+        (2_400_000, 12_500, 48_000),
+        (8_000_000, 12_500, 50_000),
+        (10_000_000, 12_500, 50_000),
+        (20_000_000, 200_000, 200_000),
+        (12_007, 5_000, 12_007),
+    ] {
+        assert_eq!(channel_rate_hz(rate, bw), want, "{rate} {bw}");
+    }
+}
+
+#[test]
+fn expand_uses_source_rate_for_channel_and_audio() {
+    let rates = |g: &zeta_core::graph::Graph| {
+        assert_eq!(g.nodes[0].kind, "channel");
+        assert_eq!(g.nodes[1].kind, "nbfm_demod");
+        (
+            g.nodes[0].params["out_rate_hz"].as_u64().unwrap(),
+            g.nodes[1].params["audio_rate_hz"].as_u64().unwrap(),
+        )
+    };
+    let src = SourceId("rtl0".into());
+    let tuning = Tuning {
         center_hz: Hz(144_800_000),
         bandwidth_hz: Hz(12_500),
     };
-    let g = JobKind::Measure.expand(&SourceId("file0".into()), tuning);
-    assert_eq!(g.nodes.len(), 1);
-    assert_eq!(g.nodes[0].kind, "measure");
-    assert_eq!(g.nodes[0].params, serde_json::json!({}));
-    assert!(g.edges.is_empty());
+    let g = JobKind::FmDemod
+        .expand(&src, tuning, Hz(2_048_000), None)
+        .unwrap();
+    assert_eq!(rates(&g), (51_200, 51_200));
+    let tuning = Tuning {
+        center_hz: Hz(7_100_000),
+        bandwidth_hz: Hz(10_000),
+    };
+    let g = JobKind::FmDemod
+        .expand(&src, tuning, Hz(12_000), None)
+        .unwrap();
+    assert_eq!(rates(&g), (12_000, 12_000));
+    let g = JobKind::AprsDecode
+        .expand(&src, tuning, Hz(12_000), None)
+        .unwrap();
+    assert_eq!(rates(&g), (12_000, 12_000));
+    assert_eq!(g.nodes[1].params["deviation_hz"], 3_000);
+}
+
+#[test]
+fn expand_rejects_band_wider_than_channel_rate() {
+    let tuning = Tuning {
+        center_hz: Hz(7_100_000),
+        bandwidth_hz: Hz(20_000),
+    };
+    let err = JobKind::FmDemod
+        .expand(&SourceId("kiwi0".into()), tuning, Hz(12_000), None)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        OpError::OutOfRange {
+            field: "bandwidth_hz".into(),
+            value: 20_000,
+            min: 1,
+            max: 12_000,
+            suggested: None,
+        }
+    );
+}
+
+#[test]
+fn expand_rejects_unknown_source_rate() {
+    let tuning = Tuning {
+        center_hz: Hz(7_100_000),
+        bandwidth_hz: Hz(10_000),
+    };
+    let err = JobKind::AprsDecode
+        .expand(&SourceId("kiwi0".into()), tuning, Hz(0), None)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        OpError::Other {
+            message: "source rate unknown: tune returned bandwidth_hz 0".into(),
+        }
+    );
 }
 
 #[tokio::test]
@@ -1059,4 +1292,184 @@ async fn stream_tail_validates_limits() {
             })
         );
     }
+}
+
+fn fm_tuning() -> Tuning {
+    Tuning {
+        center_hz: Hz(100_005_000),
+        bandwidth_hz: Hz(12_500),
+    }
+}
+
+#[test]
+fn fm_demod_default_deviation_is_5000() {
+    let g = JobKind::FmDemod
+        .expand(&SourceId("file0".into()), fm_tuning(), Hz(48_000), None)
+        .unwrap();
+    assert_eq!(g.nodes[1].params["deviation_hz"], 5_000);
+    assert_eq!(zeta_core::ops::FM_DEVIATION_DEFAULT_HZ, 5_000);
+}
+
+#[test]
+fn deviation_param_reaches_nbfm_node() {
+    let g = JobKind::FmDemod
+        .expand(
+            &SourceId("file0".into()),
+            fm_tuning(),
+            Hz(48_000),
+            Some(Hz(2_500)),
+        )
+        .unwrap();
+    assert_eq!(g.nodes[1].params["deviation_hz"], 2_500);
+}
+
+fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
+    Op::JobStart {
+        kind,
+        source: SourceId("hackrf0".into()),
+        center_hz: Hz(100_005_000),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz,
+    }
+}
+
+#[tokio::test]
+async fn deviation_out_of_range_names_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    // 5 Hz is below 100; the x1000 suggestion (5000 Hz) is in range.
+    match node.apply(start_with(JobKind::FmDemod, Some(5))).await {
+        Err(OpError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+            suggested,
+        }) => {
+            assert_eq!(field, "deviation_hz");
+            assert_eq!((value, min, max), (5, 100, 75_000));
+            assert_eq!(suggested, Some(5_000));
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+    assert!(matches!(
+        node.apply(start_with(JobKind::FmDemod, Some(75_001))).await,
+        Err(OpError::OutOfRange { .. })
+    ));
+}
+
+#[tokio::test]
+async fn deviation_on_other_kind_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    for kind in [JobKind::Measure, JobKind::AprsDecode] {
+        match node.apply(start_with(kind, Some(5_000))).await {
+            Err(OpError::Other { message }) => {
+                assert!(
+                    message.starts_with("deviation_hz applies only"),
+                    "{message}"
+                );
+                assert!(message.contains(kind.name()), "{message}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn job_start_schema_requires_nullable_deviation() {
+    let s = schema();
+    let v = variants(&s["op"])
+        .iter()
+        .find(|v| v["properties"]["op"]["const"] == "job_start")
+        .expect("job_start variant");
+    let req = v["required"].as_array().unwrap();
+    assert!(req.contains(&"deviation_hz".into()), "{v}");
+    let ty = &v["properties"]["deviation_hz"]["type"];
+    assert_eq!(ty, &serde_json::json!(["integer", "null"]), "{v}");
+}
+
+#[test]
+fn job_start_without_deviation_key_is_rejected() {
+    let v = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
+        "center_hz":100_000_000,"bandwidth_hz":48_000});
+    let e = serde_json::from_value::<Op>(v).unwrap_err().to_string();
+    assert!(e.contains("deviation_hz"), "{e}");
+    let ok = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
+        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null});
+    assert!(serde_json::from_value::<Op>(ok).is_ok());
+}
+
+#[tokio::test]
+async fn source_list_reports_fault() {
+    let dir = tempfile::tempdir().unwrap();
+    let wide = Arc::new(WidePort::new("hackrf0"));
+    *wide.fault.lock().unwrap() = Some("device gone".into());
+    let (_src, file) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![wide, file])
+        .await
+        .unwrap();
+    let Ok(OpResult::Sources(v)) = node.apply(Op::SourceList {}).await else {
+        panic!("expected sources");
+    };
+    let fault = |id: &str| v.iter().find(|s| s.id.0 == id).unwrap().fault.clone();
+    assert_eq!(fault("hackrf0"), Some("device gone".into()));
+    assert_eq!(fault("file0"), None);
+    let json = serde_json::to_value(&v).unwrap();
+    assert!(
+        json.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["fault"].is_null())
+    );
+    // Required and nullable in the result schema.
+    let si = &schema()["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"].as_array().unwrap().contains(&"fault".into()),
+        "{si}"
+    );
+    assert_eq!(
+        si["properties"]["fault"]["type"],
+        serde_json::json!(["string", "null"]),
+        "{si}"
+    );
+}
+
+/// Fields that serialize `null` say so in their schema: `"null"` is in the
+/// `type` of each.
+#[test]
+fn nullable_fields_have_null_in_schema_type() {
+    let s = schema();
+    let paths = [
+        "/result/$defs/Allocation/properties/note",
+        "/result/$defs/Provenance/properties/job",
+        "/result/$defs/Provenance/properties/channel",
+        "/result/$defs/FrameSummary/properties/job",
+        "/result/$defs/FrameSummary/properties/channel",
+        "/result/$defs/SourceInfo/properties/current",
+        "/result/$defs/SourceInfo/properties/fault",
+        "/error/oneOf/0/properties/suggested",
+    ];
+    for p in paths {
+        let f = s.pointer(p).unwrap_or_else(|| panic!("{p} missing"));
+        let ty = f["type"].as_array().unwrap_or_else(|| panic!("{p}: {f}"));
+        assert!(ty.contains(&Value::from("null")), "{p}: {f}");
+    }
+    assert_eq!(
+        s.pointer("/error/oneOf/0/properties/error/const"),
+        Some(&Value::from("out_of_range")),
+        "oneOf/0 is OutOfRange"
+    );
 }

@@ -4,12 +4,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::stream::Payload;
-use zeta_core::types::{Hz, SourceId, StreamKind};
+use zeta_core::types::{Hz, JobId, SourceId, StreamId, StreamKind};
 use zeta_dsp::fixtures::{nbfm_modulate, tone, write_fixture};
 use zeta_source_file::{FileOpts, FileSource};
 
@@ -66,6 +67,7 @@ async fn fm_demod_job_produces_audio_with_tone() {
             source: SourceId("file0".into()),
             center_hz: Hz(100_005_000),
             bandwidth_hz: Hz(12_500),
+            deviation_hz: Some(2_500), // the fixture's deviation
         })
         .await
         .unwrap()
@@ -154,6 +156,7 @@ async fn aprs_decode_job_decodes_fixture_packet() {
             source: SourceId("file0".into()),
             center_hz: Hz(CENTER),
             bandwidth_hz: Hz(12_500),
+            deviation_hz: None,
         })
         .await
         .unwrap()
@@ -203,4 +206,226 @@ async fn aprs_decode_job_decodes_fixture_packet() {
     assert_eq!(ev["dst"], "APRS");
     assert_eq!(ev["info"], ">hi");
     assert_eq!(ev["fcs_ok"], true);
+}
+
+/// A node over one SigMF fixture `iq` at `rate_hz` centred on `center_hz`,
+/// playback started, with the DSP stages registered.
+async fn node_over(
+    dir: &std::path::Path,
+    iq: &[num_complex::Complex<f32>],
+    rate_hz: u32,
+    center_hz: u64,
+    opts: FileOpts,
+) -> Node {
+    let meta = write_fixture(dir, "fixture", iq, rate_hz, center_hz);
+    let src = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
+    let port: Arc<dyn Port> = src.clone();
+    let mut reg = StageRegistry::new();
+    zeta_dsp::register_all(&mut reg);
+    let cfg = NodeConfig {
+        state_dir: dir.join("state"),
+        ring_seconds: 1.0,
+        backends: vec![Backend::Cpu],
+        resume: true,
+    };
+    let node = Node::open(cfg, reg, vec![port]).await.unwrap();
+    src.start();
+    node
+}
+
+async fn start(node: &Node, kind: JobKind, center_hz: u64, bandwidth_hz: u64) -> JobId {
+    let OpResult::Job(id) = node
+        .apply(Op::JobStart {
+            kind,
+            source: SourceId("file0".into()),
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(bandwidth_hz),
+            deviation_hz: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a job id")
+    };
+    id
+}
+
+/// The job's stream of `kind`, waiting up to 2 s for it to be registered.
+async fn job_stream(node: &Node, id: &JobId, kind: StreamKind) -> StreamId {
+    let bus = node.bus();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let found = bus
+            .list()
+            .into_iter()
+            .find(|s| s.kind == kind && s.provenance.job.as_ref() == Some(id));
+        if let Some(s) = found {
+            return s.id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no {kind:?} stream for the job"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Collect `want` audio samples from the job, asserting every frame is at `rate_hz`.
+async fn collect_audio(node: &Node, id: &JobId, rate_hz: u64, want: usize) -> Vec<f32> {
+    let stream = job_stream(node, id, StreamKind::Audio).await;
+    let mut rx = node.bus().subscribe(&stream).unwrap();
+    let mut samples: Vec<f32> = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while samples.len() < want {
+            match rx.recv().await {
+                Ok(f) => {
+                    let Payload::Audio {
+                        sample_rate_hz,
+                        samples: s,
+                    } = &f.payload
+                    else {
+                        panic!("expected an audio payload")
+                    };
+                    assert_eq!(*sample_rate_hz, Hz(rate_hz));
+                    samples.extend_from_slice(s);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("audio stream ended: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("audio within 10 s");
+    samples
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fm_demod_job_on_12_khz_source() {
+    const RATE: u32 = 12_000;
+    const CENTER: u64 = 7_100_000;
+    let dir = tempfile::tempdir().unwrap();
+    let audio = tone(48_000, 48_000, 1_000.0, 1.0);
+    let iq = nbfm_modulate(&audio, 48_000, RATE, 2_500.0, 0.0);
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 1_200,
+        repeat: true,
+    };
+    let node = node_over(dir.path(), &iq, RATE, CENTER, opts).await;
+    let id = start(&node, JobKind::FmDemod, CENTER, 10_000).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rec = node.job_list().into_iter().find(|r| r.id == id).unwrap();
+    assert_eq!(rec.state, JobState::Running);
+
+    let samples = collect_audio(&node, &id, RATE as u64, RATE as usize).await;
+    // 1 200 samples: 10 Hz bins at 12 kHz.
+    let (peak, rms) = peak_and_rms(&samples[samples.len() - 1_200..], RATE as f64);
+    eprintln!("fm_demod at 12 kHz: peak {peak} Hz, rms {rms:.4}");
+    assert_eq!(peak, 1_000.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fm_demod_job_at_2_048_msps() {
+    const RATE: u32 = 2_048_000;
+    const CENTER: u64 = 144_000_000;
+    const OUT: u64 = 51_200;
+    let dir = tempfile::tempdir().unwrap();
+    // 0.5 s of a 1 kHz tone (whole cycles, so the repeat is seamless) 100 kHz above centre.
+    let audio = tone(48_000, 24_000, 1_000.0, 1.0);
+    let iq = nbfm_modulate(&audio, 48_000, RATE, 2_500.0, 100_000.0);
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 20_480,
+        repeat: true,
+    };
+    let node = node_over(dir.path(), &iq, RATE, CENTER, opts).await;
+    let id = start(&node, JobKind::FmDemod, CENTER + 100_000, 12_500).await;
+
+    let samples = collect_audio(&node, &id, OUT, OUT as usize / 2).await;
+    // 5 120 samples: 10 Hz bins at 51.2 kHz.
+    let (peak, rms) = peak_and_rms(&samples[samples.len() - 5_120..], OUT as f64);
+    eprintln!("fm_demod at 2.048 MS/s: peak {peak} Hz, rms {rms:.4}");
+    assert_eq!(peak, 1_000.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aprs_decode_job_decodes_at_12_khz() {
+    const RATE: u32 = 12_000;
+    const CENTER: u64 = 144_800_000;
+    let dir = tempfile::tempdir().unwrap();
+    let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", RATE, 0.0);
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 1_200,
+        repeat: true,
+    };
+    let node = node_over(dir.path(), &iq, RATE, CENTER, opts).await;
+    let started = tokio::time::Instant::now();
+    let id = start(&node, JobKind::AprsDecode, CENTER, 10_000).await;
+    let stream = job_stream(&node, &id, StreamKind::Event).await;
+    let mut rx = node.bus().subscribe(&stream).unwrap();
+    let left = Duration::from_secs(3).saturating_sub(started.elapsed());
+    let ev = tokio::time::timeout(left, async {
+        loop {
+            match rx.recv().await {
+                Ok(f) => {
+                    let Payload::Event(v) = f.payload.clone() else {
+                        panic!("expected an event payload")
+                    };
+                    break v;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("event stream ended: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("an event within 3 s");
+    eprintln!(
+        "aprs_decode at 12 kHz: first event after {:?}: {ev}",
+        started.elapsed()
+    );
+    assert_eq!(ev["src"], "VK3ABC");
+    assert_eq!(ev["fcs_ok"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn measure_job_measures_only_its_band() {
+    const CENTER: u64 = 144_800_000;
+    let dir = tempfile::tempdir().unwrap();
+    // APRS 12 kHz above centre, an FM tone 10 dB stronger 12 kHz below it.
+    let aprs = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 12_000.0);
+    let audio = tone(48_000, aprs.len(), 1_000.0, 1.0);
+    let fm = nbfm_modulate(&audio, 48_000, 48_000, 2_500.0, -12_000.0);
+    let iq: Vec<_> = aprs.iter().zip(&fm).map(|(a, t)| a + t * 3.16).collect();
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 4_800,
+        repeat: true,
+    };
+    let node = node_over(dir.path(), &iq, 48_000, CENTER, opts).await;
+    let id = start(&node, JobKind::Measure, CENTER + 12_000, 12_500).await;
+    let stream = job_stream(&node, &id, StreamKind::Event).await;
+    let mut rx = node.bus().subscribe(&stream).unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Ok(f) => {
+                    let Payload::Event(v) = f.payload.clone() else {
+                        panic!("expected an event payload")
+                    };
+                    break v;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("event stream ended: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a measure event within 10 s");
+    eprintln!("measure job: {ev}");
+    let center = ev["center_hz"].as_u64().unwrap();
+    assert!(center.abs_diff(CENTER + 12_000) <= 200, "{ev}");
+    assert!(ev["bandwidth_hz"].as_u64().unwrap() <= 12_500, "{ev}");
+    assert_eq!(ev["label"]["name"], "fsk", "{ev}");
 }

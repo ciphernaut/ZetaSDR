@@ -3,3 +3,5 @@
 *.sigmf-data
 /scratch
 /.claude/
+/crates/zeta-source-soapy-driver/target
+__pycache__/

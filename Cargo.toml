@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/*"]
+# Links libSoapySDR (needs libsoapysdr-dev); built on its own, see its README.
+exclude = ["crates/zeta-source-soapy-driver"]
 resolver = "2"
 
 [workspace.package]

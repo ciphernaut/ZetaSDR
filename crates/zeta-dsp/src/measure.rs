@@ -10,13 +10,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::classify::{Classifier, FeatureRecord, Label};
+use zeta_core::classify::{Band, Classifier, FeatureRecord, Label};
+use zeta_core::ops::channel_rate_hz;
 use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Baud, Hz, Provenance, StreamId, StreamKind, Timestamp};
 
+use crate::channel::extract_offset;
 use crate::fft::{Window, power_spectrum_db};
-use crate::{frame_span, run_map};
+use crate::{Input, frame_span, run_map};
 
 /// FFT size of every spectrum taken here.
 const SIZE: usize = 1024;
@@ -49,6 +51,22 @@ const FM_MAX_BW_HZ: u64 = 25_000;
 const FSK_PEAK_DB: f32 = 6.0;
 /// FSK: tone separation range.
 const FSK_SEP_HZ: (f64, f64) = (500.0, 3_000.0);
+
+/// Noise floor of [`measure_band`]: this percentile of the in-band bins. A
+/// signal may fill more than half of a channel (APRS: Carson ~10.4 kHz in
+/// 12.5 kHz), so the median would be signal, not noise.
+const FLOOR_PERCENTILE: usize = 15;
+
+/// The `pct`th percentile of `v` (the value at index `len · pct / 100` when
+/// sorted); 0 when empty.
+fn percentile(v: &[f32], pct: usize) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(f32::total_cmp);
+    s[(s.len() * pct / 100).min(s.len() - 1)]
+}
 
 /// Median of `v` (upper median for an even length); 0 when empty.
 fn median(v: &[f32]) -> f32 {
@@ -296,13 +314,26 @@ fn symbol_rate(iq: &[Complex<f32>], rate_hz: u64, cv: f32, bandwidth_hz: u64) ->
 
 /// Measure one IQ block centred at `block_center_hz`.
 ///
-/// From the `SIZE`-bin Hann power spectrum: noise floor = median bin;
+/// From the `SIZE`-bin Hann power spectrum: noise floor = 15th-percentile bin;
 /// `snr_db` = peak − floor; occupied band = the run of bins around the peak at
 /// or above floor + 6 dB, giving `bandwidth_hz` (run length × bin width, at
 /// least one bin) and `center_hz` (block centre plus the run's centre offset,
 /// clamped at 0). `burst` compares 10 ms chunk powers; `symbol_rate_baud` is
 /// the keying line of [`keying_signal`].
 pub fn measure(iq: &[Complex<f32>], rate_hz: u64, block_center_hz: u64) -> FeatureRecord {
+    measure_band(iq, rate_hz, block_center_hz, rate_hz)
+}
+
+/// [`measure`] restricted to the central `bandwidth_hz` of the block: floor,
+/// peak and occupied run use only the bins within `± bandwidth_hz / 2` of the
+/// centre (at least one bin), so the skirts of a channel filter wider than its
+/// band are not measured as occupied.
+pub fn measure_band(
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    block_center_hz: u64,
+    bandwidth_hz: u64,
+) -> FeatureRecord {
     if iq.is_empty() || rate_hz == 0 {
         return FeatureRecord {
             bandwidth_hz: Hz(0),
@@ -312,12 +343,15 @@ pub fn measure(iq: &[Complex<f32>], rate_hz: u64, block_center_hz: u64) -> Featu
             burst: false,
         };
     }
-    let db = spectrum(iq);
     let bin_hz = rate_hz as f64 / SIZE as f64;
-    let floor = median(&db);
-    let peak = argmax(&db);
+    let half_bins = ((bandwidth_hz as f64 / 2.0 / bin_hz).floor() as usize).min(SIZE / 2);
+    let first = SIZE / 2 - half_bins;
+    let db = &spectrum(iq)[first..(SIZE / 2 + half_bins + 1).min(SIZE)];
+    let floor = percentile(db, FLOOR_PERCENTILE);
+    let peak = argmax(db);
     let gap = (GAP_HZ / bin_hz).floor() as usize;
-    let (lo, hi) = occupied(&db, peak, floor + OCCUPIED_DB, gap);
+    let (lo, hi) = occupied(db, peak, floor + OCCUPIED_DB, gap);
+    let (lo, hi) = (lo + first, hi + first);
     let bins = (hi - lo + 1) as f64;
     let offset = ((lo + hi) as f64 / 2.0 - (SIZE / 2) as f64) * bin_hz;
     let center = (block_center_hz as i64)
@@ -456,11 +490,32 @@ fn classify_block(
     ("unknown", 0.5, "no layer-1 rule matched".into())
 }
 
-/// `measure` takes no parameters.
+/// `measure` parameters.
 #[derive(JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
-pub struct MeasureParams {}
+pub struct MeasureParams {
+    /// Measure only the central `bandwidth_hz` of each block (see
+    /// [`measure_band`]); `null` measures the whole block.
+    #[serde(deserialize_with = "nullable_u64")]
+    #[schemars(required, schema_with = "nullable_bandwidth")]
+    pub bandwidth_hz: Option<u64>,
+}
+
+/// Deserialize a required `Option<u64>`: a missing key is an error, `null` is `None`.
+fn nullable_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    <Option<u64> as Deserialize>::deserialize(d)
+}
+
+/// Schema of the required, nullable `bandwidth_hz`: `["integer","null"]`.
+fn nullable_bandwidth(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint64",
+        "minimum": 0,
+        "description": "Measure only the central bandwidth_hz of each block; null measures the whole block."
+    })
+}
 
 /// Accumulates IQ until it holds at least one second (`rate_hz` samples),
 /// then emits one Event for that window: its [`FeatureRecord`] fields plus
@@ -512,7 +567,7 @@ impl Stage for MeasureStage {
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
     ) -> Result<(), StageError> {
-        let _: MeasureParams = serde_json::from_value(params)
+        let p: MeasureParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("measure params: {e}")))?;
         let Some(out) = outputs.first().cloned() else {
             return Err(StageError::Failed("expected 1 output".into()));
@@ -520,7 +575,15 @@ impl Stage for MeasureStage {
         // Window under construction: first frame's provenance, t0, rate, centre.
         let mut window: Option<(Provenance, Timestamp, u64, u64)> = None;
         let mut buf: Vec<Complex<f32>> = Vec::new();
-        run_map(inputs, bus, cancel, move |frame| {
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    window = None;
+                    buf.clear();
+                    return Ok(Vec::new());
+                }
+            };
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed("measure stage expects iq frames".into()));
             };
@@ -548,7 +611,7 @@ impl Stage for MeasureStage {
             if rate == 0 || (buf.len() as u64) < rate {
                 return Ok(Vec::new());
             }
-            let f = measure(&buf, rate, center);
+            let f = measure_band(&buf, rate, center, p.bandwidth_hz.unwrap_or(rate));
             let label = layer1_label(&f, &buf, rate);
             let mut ev = serde_json::to_value(&f)
                 .map_err(|e| StageError::Failed(format!("measure: {e}")))?;
@@ -564,8 +627,9 @@ impl Stage for MeasureStage {
     }
 }
 
-/// Layer-1 classifier: [`measure`] then [`layer1_label`]; upstream features
-/// are not used, the block is measured afresh.
+/// Layer-1 classifier: [`measure`] then [`layer1_label`] on the requested
+/// band, extracted at [`channel_rate_hz`] unless it is the whole block;
+/// upstream features are not used, the band is measured afresh.
 pub struct Layer1Classifier;
 
 #[async_trait]
@@ -580,10 +644,22 @@ impl Classifier for Layer1Classifier {
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
+        band: Band,
         _features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
-        let f = measure(iq, sample_rate_hz.0, 0);
-        vec![layer1_label(&f, iq, sample_rate_hz.0)]
+        let rate = sample_rate_hz.0;
+        if band.is_whole(sample_rate_hz) {
+            let f = measure(iq, rate, 0);
+            return vec![layer1_label(&f, iq, rate)];
+        }
+        let bw = band.bandwidth_hz.0;
+        let Ok((chan, out_rate)) =
+            extract_offset(iq, rate, band.offset_hz, bw, channel_rate_hz(rate, bw))
+        else {
+            return Vec::new();
+        };
+        let f = measure_band(&chan, out_rate, 0, bw);
+        vec![layer1_label(&f, &chan, out_rate)]
     }
 }
 
@@ -598,6 +674,45 @@ mod tests {
 
     fn show(what: &str, f: &FeatureRecord, l: &Label) {
         eprintln!("{what}: {f:?} -> {} ({})", l.name, l.evidence);
+    }
+
+    #[test]
+    fn measure_bandwidth_param_is_required_nullable() {
+        let parse = |v| serde_json::from_value::<MeasureParams>(v);
+        assert!(parse(serde_json::json!({})).is_err());
+        assert_eq!(
+            parse(serde_json::json!({"bandwidth_hz": null}))
+                .unwrap()
+                .bandwidth_hz,
+            None
+        );
+        assert_eq!(
+            parse(serde_json::json!({"bandwidth_hz": 12_500}))
+                .unwrap()
+                .bandwidth_hz,
+            Some(12_500)
+        );
+    }
+
+    #[tokio::test]
+    async fn layer1_labels_aprs_fsk_in_12k5_band() {
+        for offset in [0i64, 12_000] {
+            let mut iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", RATE as u32, offset as f64);
+            awgn(&mut iq, 20.0, 5);
+            let band = Band {
+                offset_hz: offset,
+                bandwidth_hz: Hz(12_500),
+            };
+            let chan = extract_offset(&iq, RATE, offset, 12_500, RATE).unwrap().0;
+            let f = measure_band(&chan, RATE, CENTER, 12_500);
+            eprintln!("offset {offset}: {f:?}");
+            let labels = Layer1Classifier.classify(&iq, Hz(RATE), band, None).await;
+            eprintln!("offset {offset}: {labels:?}");
+            assert_eq!(labels.len(), 1, "{labels:?}");
+            assert_eq!(labels[0].name, "fsk", "offset {offset}: {labels:?}");
+            let baud = f.symbol_rate_baud.expect("a keying line").0;
+            assert!(baud.abs_diff(1_200) <= 60, "offset {offset}: {baud} Bd");
+        }
     }
 
     #[test]
@@ -703,7 +818,7 @@ mod tests {
         let h = tokio::spawn(async move {
             MeasureStage::new()
                 .run(
-                    serde_json::json!({}),
+                    serde_json::json!({"bandwidth_hz": null}),
                     vec![rx_in],
                     vec![out],
                     bus,
@@ -772,7 +887,7 @@ mod tests {
         let h = tokio::spawn(async move {
             MeasureStage::new()
                 .run(
-                    serde_json::json!({}),
+                    serde_json::json!({"bandwidth_hz": null}),
                     vec![rx_in],
                     vec![out],
                     bus,
@@ -810,5 +925,63 @@ mod tests {
         );
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
+    }
+
+    #[tokio::test]
+    async fn measure_stage_discards_window_on_lag() {
+        use zeta_core::port::IqBlock;
+        use zeta_core::types::{Provenance, SourceId, Span, Timestamp};
+        let prov = Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(1),
+            },
+        };
+        let bus = Arc::new(StreamBus::new(8));
+        let out = bus.register(StreamKind::Event, prov.clone());
+        let mut rx_out = bus.subscribe(&out).unwrap();
+        let (tx, rx_in) = broadcast::channel(8);
+        let h = tokio::spawn(async move {
+            MeasureStage::new()
+                .run(
+                    serde_json::json!({"bandwidth_hz": null}),
+                    vec![rx_in],
+                    vec![out],
+                    bus,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let mut iq = vec![Complex::new(0.0f32, 0.0); 14 * 4_800];
+        awgn(&mut iq, 0.0, 3);
+        let mk = |i: u64, block: &[Complex<f32>]| {
+            Frame::new(
+                StreamId::new(),
+                prov.clone(),
+                Payload::Iq(IqBlock {
+                    t0: Timestamp(1_000_000_000 + i * 100_000_000),
+                    sample_rate_hz: Hz(RATE),
+                    center_hz: Hz(CENTER),
+                    samples: block.to_vec().into(),
+                }),
+            )
+        };
+        let blocks: Vec<_> = iq.chunks(4_800).collect();
+        // 0.5 s held, then a lag, then 0.8 s more with contiguous timestamps:
+        // 1.3 s in total, but only if the lag did not discard the window.
+        for (i, b) in blocks.iter().enumerate().take(5) {
+            tx.send(mk(i as u64, b)).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.send(mk(5, blocks[5])).unwrap(); // overwritten
+        for i in 5..13 {
+            tx.send(mk(i, blocks[i as usize])).unwrap();
+        }
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        assert!(rx_out.try_recv().is_err(), "no event spans the lag");
     }
 }

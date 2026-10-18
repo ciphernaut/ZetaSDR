@@ -83,11 +83,22 @@ pub fn lagged_frames() -> u64 {
     LAGGED_FRAMES.load(Ordering::Relaxed)
 }
 
+/// What a stage's closure sees: a frame, or a marker that `missed` frames were
+/// skipped before the next one, so stateful stages must reset.
+pub(crate) enum Input {
+    Frame(Frame),
+    #[allow(dead_code)] // reported for stages that want the count
+    Lagged {
+        missed: u64,
+    },
+}
+
 /// The loop every single-input stage runs: map each frame on `inputs[0]` through
 /// `f` and publish what it returns. Cancellation wins over pending input and
-/// returns `Cancelled`; lagged input is skipped, counted in [`LAGGED_FRAMES`]
-/// and logged to stderr once per lag event; a closed input returns `Ok(())`;
-/// an error from `f` ends the stage with that error.
+/// returns `Cancelled`; lagged input is counted in [`LAGGED_FRAMES`], logged to
+/// stderr once per lag event and passed to `f` as [`Input::Lagged`] so the
+/// stage can drop its streaming state; a closed input returns `Ok(())`; an
+/// error from `f` ends the stage with that error.
 pub(crate) async fn run_map<F>(
     mut inputs: Vec<broadcast::Receiver<Frame>>,
     bus: Arc<StreamBus>,
@@ -95,7 +106,7 @@ pub(crate) async fn run_map<F>(
     mut f: F,
 ) -> Result<(), StageError>
 where
-    F: FnMut(Frame) -> Result<Vec<Frame>, StageError> + Send,
+    F: FnMut(Input) -> Result<Vec<Frame>, StageError> + Send,
 {
     if inputs.len() != 1 {
         return Err(StageError::Failed("expected 1 input".into()));
@@ -107,17 +118,119 @@ where
             _ = cancel.cancelled() => return Err(StageError::Cancelled),
             r = rx.recv() => match r {
                 Ok(frame) => {
-                    for out in f(frame)? {
+                    for out in f(Input::Frame(frame))? {
                         bus.publish(out);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     LAGGED_FRAMES.fetch_add(n, Ordering::Relaxed);
                     eprintln!("zeta-dsp: stage lagged, {n} frames skipped");
-                    continue;
+                    for out in f(Input::Lagged { missed: n })? {
+                        bus.publish(out);
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::Value;
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
+    use zeta_core::stream::{Frame, Payload, StreamBus};
+    use zeta_core::types::{Provenance, SourceId, Span, StreamId, Timestamp};
+
+    use super::{Input, run_map};
+
+    #[tokio::test]
+    async fn run_map_passes_lag_marker() {
+        let prov = Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(1),
+            },
+        };
+        let (tx, rx) = broadcast::channel(2);
+        for i in 0..4 {
+            tx.send(Frame::new(
+                StreamId::new(),
+                prov.clone(),
+                Payload::Event(serde_json::json!(i)),
+            ))
+            .unwrap();
+        }
+        drop(tx);
+        let mut seen = Vec::new();
+        run_map(
+            vec![rx],
+            Arc::new(StreamBus::new(4)),
+            CancellationToken::new(),
+            |i| {
+                seen.push(match i {
+                    Input::Lagged { missed } => format!("lag{missed}"),
+                    Input::Frame(f) => match f.payload {
+                        Payload::Event(v) => v.to_string(),
+                        _ => unreachable!(),
+                    },
+                });
+                Ok(Vec::new())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen, ["lag2", "2", "3"]);
+    }
+
+    /// Every object schema with properties denies unknown fields and requires
+    /// every property (optional values are required-nullable).
+    fn check_strict(v: &Value, path: &str) {
+        match v {
+            Value::Object(m) => {
+                if let Some(Value::Object(props)) = m.get("properties") {
+                    assert_eq!(
+                        m.get("additionalProperties"),
+                        Some(&Value::Bool(false)),
+                        "{path} allows extra fields"
+                    );
+                    let mut want: Vec<&str> = props.keys().map(String::as_str).collect();
+                    let mut req: Vec<&str> = m
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    want.sort();
+                    req.sort();
+                    assert_eq!(req, want, "{path} does not require every property");
+                }
+                for (k, c) in m {
+                    check_strict(c, &format!("{path}.{k}"));
+                }
+            }
+            Value::Array(a) => a
+                .iter()
+                .enumerate()
+                .for_each(|(i, c)| check_strict(c, &format!("{path}[{i}]"))),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn stage_params_schemas_are_strict() {
+        let mut reg = zeta_core::stage::StageRegistry::new();
+        super::register_all(&mut reg);
+        let stages = reg.describe();
+        let stages = stages.as_array().unwrap();
+        assert!(stages.iter().any(|s| s["kind"] == "measure"));
+        for st in stages {
+            check_strict(&st["params_schema"], &format!("stages.{}", st["kind"]));
         }
     }
 }

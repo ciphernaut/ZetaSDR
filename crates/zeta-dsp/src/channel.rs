@@ -14,7 +14,7 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{ChannelId, Hz, StreamId, StreamKind, Timestamp};
 
 use crate::util::lowpass_taps;
-use crate::{frame_span, run_map};
+use crate::{Input, frame_span, run_map};
 
 /// Fewest and most taps of the channel low-pass filter.
 const MIN_TAPS: usize = 63;
@@ -259,7 +259,14 @@ impl Stage for ChannelStage {
         };
         let channel = ChannelId(format!("{}/{}", p.center_hz, p.bandwidth_hz));
         let mut state = ChannelState::new();
-        run_map(inputs, bus, cancel, move |frame| {
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    state = ChannelState::new();
+                    return Ok(Vec::new());
+                }
+            };
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed("channel stage expects iq frames".into()));
             };
@@ -524,5 +531,30 @@ mod tests {
         let (_tx, _out, _rx, h) = spawn(params(100_005_000), cancel.clone());
         cancel.cancel();
         assert!(matches!(h.await.unwrap(), Err(StageError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn channel_resets_on_lag() {
+        let (tx, _out, mut rx_out, h) = spawn(params(100_005_000), CancellationToken::new());
+        // Block A leaves FIR history, decimation phase and NCO phase behind.
+        tx.send(iq_frame(tone(4801, 4_000.0))).unwrap();
+        rx_out.recv().await.unwrap();
+        // Capacity 8: one junk frame is overwritten, then B and seven more.
+        let b = tone(4800, 6_000.0);
+        tx.send(iq_frame(tone(4800, 1_000.0))).unwrap();
+        for _ in 0..8 {
+            tx.send(iq_frame(b.clone())).unwrap();
+        }
+        let f = rx_out.recv().await.unwrap();
+        let Payload::Iq(got) = &f.payload else {
+            panic!("expected an iq payload")
+        };
+        let (want, _) = extract_offset(&b, RATE, 5_000, 10_000, 12_000).unwrap();
+        assert_eq!(got.samples.len(), want.len());
+        for (g, w) in got.samples.iter().zip(&want) {
+            assert!((g - w).norm() < 1e-5, "{g} vs {w}");
+        }
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
     }
 }

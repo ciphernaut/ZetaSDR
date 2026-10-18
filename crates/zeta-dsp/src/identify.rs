@@ -3,7 +3,8 @@
 
 use async_trait::async_trait;
 use num_complex::Complex;
-use zeta_core::classify::{Classifier, FeatureRecord, Label};
+use zeta_core::classify::{Band, Classifier, FeatureRecord, Label};
+use zeta_core::ops::channel_rate_hz;
 use zeta_core::types::Hz;
 
 use crate::afsk::Afsk1200Demod;
@@ -16,30 +17,14 @@ use crate::nbfm::nbfm_demod;
 const MIN_SAMPLES: usize = 1024;
 /// Narrowest channel extracted.
 const MIN_BW_HZ: u64 = 12_500;
-/// Preferred audio rate and the lowest acceptable fallback.
-const AUDIO_HZ: u64 = 48_000;
-const MIN_AUDIO_HZ: u64 = 24_000;
+/// Lowest block rate decoded (a 12 kHz channel carries AFSK1200).
+const MIN_AUDIO_HZ: u64 = 9_600;
 /// FM deviation assumed for APRS.
 const DEVIATION_HZ: u64 = 3_000;
 
-/// Output rate for `rate`: 48 kHz when it divides, else the largest integer
-/// divisor of `rate` in `[24 kHz, 48 kHz]`, else `rate` itself.
-fn audio_rate(rate: u64) -> u64 {
-    if rate.is_multiple_of(AUDIO_HZ) {
-        return AUDIO_HZ;
-    }
-    (MIN_AUDIO_HZ..AUDIO_HZ)
-        .rev()
-        .find(|r| rate.is_multiple_of(*r))
-        .unwrap_or(rate)
-}
-
-/// Decodes APRS from the strongest occupied band of the block.
-///
-/// A caller-supplied `FeatureRecord.center_hz` must be measured with the block
-/// centre at `rate/2` (as `measure(iq, rate, rate / 2)` does); the channel
-/// offset taken from it is `center_hz - rate/2`. A record measured against the
-/// real RF centre would put the channel far outside the block.
+/// Decodes APRS from the requested band, at least [`MIN_BW_HZ`] wide and
+/// extracted at [`channel_rate_hz`]; for the whole block, from its strongest
+/// occupied band instead. Upstream features are not used.
 pub struct DecodeToIdentify;
 
 #[async_trait]
@@ -54,26 +39,24 @@ impl Classifier for DecodeToIdentify {
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
-        features: Option<&FeatureRecord>,
+        band: Band,
+        _features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
         let rate = sample_rate_hz.0;
         if iq.len() < MIN_SAMPLES || rate < MIN_AUDIO_HZ {
             return Vec::new();
         }
-        let owned;
-        let f = match features {
-            Some(f) => f,
-            None => {
-                owned = measure(iq, rate, rate / 2);
-                &owned
-            }
+        let (offset, bw) = if band.is_whole(sample_rate_hz) {
+            // Measured against a block centre of `rate`, so the offset of a
+            // band below centre does not clamp at 0.
+            let f = measure(iq, rate, rate);
+            (f.center_hz.0 as i64 - rate as i64, f.bandwidth_hz.0)
+        } else {
+            (band.offset_hz, band.bandwidth_hz.0)
         };
-        let half = (rate / 2) as i64;
-        // `center_hz` is measured with the block centre at rate/2, so negative offsets survive.
-        let offset = (f.center_hz.0 as i64 - half).clamp(-half, half);
-        let out_rate = audio_rate(rate);
+        let out_rate = channel_rate_hz(rate, bw.max(MIN_BW_HZ));
         // The channel filter refuses a band wider than its output rate.
-        let bw = f.bandwidth_hz.0.max(MIN_BW_HZ).min(out_rate);
+        let bw = bw.max(MIN_BW_HZ).min(out_rate);
         let Ok((chan, out_rate)) = extract_offset(iq, rate, offset, bw, out_rate) else {
             return Vec::new();
         };
@@ -113,7 +96,9 @@ mod tests {
     #[tokio::test]
     async fn identifies_aprs_in_baseband_iq() {
         let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
-        let labels = DecodeToIdentify.classify(&iq, Hz(48_000), None).await;
+        let labels = DecodeToIdentify
+            .classify(&iq, Hz(48_000), Band::whole(Hz(48_000)), None)
+            .await;
         assert_eq!(labels.len(), 1, "{labels:?}");
         assert_eq!(labels[0].layer, 2);
         assert_eq!(labels[0].name, "APRS");
@@ -123,7 +108,9 @@ mod tests {
 
     async fn aprs_at(offset: f64) {
         let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, offset);
-        let labels = DecodeToIdentify.classify(&iq, Hz(48_000), None).await;
+        let labels = DecodeToIdentify
+            .classify(&iq, Hz(48_000), Band::whole(Hz(48_000)), None)
+            .await;
         assert_eq!(labels.len(), 1, "offset {offset}: {labels:?}");
         assert_eq!(labels[0].name, "APRS");
     }
@@ -144,15 +131,37 @@ mod tests {
         let iq = nbfm_modulate(&audio, 48_000, 48_000, 2_500.0, 0.0);
         assert!(
             DecodeToIdentify
-                .classify(&iq, Hz(48_000), None)
+                .classify(&iq, Hz(48_000), Band::whole(Hz(48_000)), None)
                 .await
                 .is_empty()
         );
         assert!(
             DecodeToIdentify
-                .classify(&iq[..100], Hz(48_000), None)
+                .classify(&iq[..100], Hz(48_000), Band::whole(Hz(48_000)), None)
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn identifies_aprs_in_requested_band_only() {
+        // APRS 12 kHz above centre, an FM tone 10 dB stronger 12 kHz below it.
+        let aprs = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 12_000.0);
+        let audio = tone(48_000, aprs.len(), 1_000.0, 1.0);
+        let fm = nbfm_modulate(&audio, 48_000, 48_000, 2_500.0, -12_000.0);
+        let iq: Vec<_> = aprs.iter().zip(&fm).map(|(a, t)| a + t * 3.16).collect();
+        let band = |offset_hz| Band {
+            offset_hz,
+            bandwidth_hz: Hz(12_500),
+        };
+        let above = DecodeToIdentify
+            .classify(&iq, Hz(48_000), band(12_000), None)
+            .await;
+        assert_eq!(above.len(), 1, "{above:?}");
+        assert_eq!(above[0].name, "APRS");
+        let below = DecodeToIdentify
+            .classify(&iq, Hz(48_000), band(-12_000), None)
+            .await;
+        assert!(below.is_empty(), "{below:?}");
     }
 }

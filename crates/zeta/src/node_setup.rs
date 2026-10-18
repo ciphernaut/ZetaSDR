@@ -1,5 +1,6 @@
-//! Build the node the CLI drives: stage registry (core plus `zeta-dsp`), file
-//! sources, knowledge and classifiers.
+//! Build the node the CLI drives: stage registry (core plus `zeta-dsp`, plus `--plugin`
+//! stages), sources (SigMF files, KiwiSDRs, and SoapySDR devices when built with
+//! `--cfg soapy`), knowledge and classifiers.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,7 +11,11 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::SourceId;
+use zeta_plugin::host::PluginCommand;
 use zeta_source_file::{FileOpts, FileSource};
+use zeta_source_kiwi::{KiwiConfig, KiwiSource};
+
+use crate::sources::{PluginSpec, SourceSpec};
 
 /// `$XDG_STATE_HOME/zetasdr`, else `$HOME/.local/state/zetasdr`.
 pub fn default_state_dir() -> Result<PathBuf, String> {
@@ -35,13 +40,85 @@ pub fn registry() -> StageRegistry {
     registry
 }
 
-/// Open the node on `state_dir` with one looping, real-time `FileSource` per `(id, meta path)`.
-/// Sources start after the node has subscribed to them: a source with no
-/// subscriber stops at once. `resume` relaunches persisted `Running` jobs
-/// (`serve`); without it they are listed as persisted and left alone (one-shot).
+/// Why a `--source-soapy` or `zeta soapy find` cannot run in this build.
+#[cfg(not(soapy))]
+pub const NO_SOAPY: &str = "zeta was built without soapy: rebuild with RUSTFLAGS=\"--cfg soapy\" after installing libsoapysdr-dev";
+
+/// `zeta soapy find`: print the attached SoapySDR devices matching `filter` as JSON.
+pub fn soapy_find(filter: &str) -> std::process::ExitCode {
+    #[cfg(soapy)]
+    {
+        match zeta_source_soapy_driver::find(filter) {
+            Ok(found) => match serde_json::to_string_pretty(&found) {
+                Ok(s) => {
+                    println!("{s}");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("zeta: serialising output: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            },
+            Err(e) => {
+                eprintln!("zeta: soapy find {filter:?}: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(not(soapy))]
+    {
+        let _ = filter;
+        eprintln!("zeta: soapy find: {NO_SOAPY}");
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// Open the SoapySDR device `args` as source `id`.
+#[cfg(soapy)]
+fn open_soapy(id: &str, args: &str) -> Result<Arc<dyn Port>, String> {
+    zeta_source_soapy_driver::open(SourceId(id.to_owned()), args)
+        .map(|s| Arc::new(s) as Arc<dyn Port>)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(soapy))]
+fn open_soapy(_id: &str, _args: &str) -> Result<Arc<dyn Port>, String> {
+    Err(NO_SOAPY.into())
+}
+
+/// Probe each plugin and register it after the built-in stages. A kind that a built-in
+/// stage already has, or a failed probe, is an error naming the flag.
+async fn with_plugins(plugins: &[PluginSpec]) -> Result<StageRegistry, String> {
+    let mut reg = registry();
+    for p in plugins {
+        if reg.spec(&p.kind).is_some() {
+            return Err(format!(
+                "{p}: plugin kind {:?} collides with a built-in stage",
+                p.kind
+            ));
+        }
+        let cmd = PluginCommand {
+            program: p.program.clone(),
+            args: vec![],
+        };
+        let stage = zeta_plugin::host::probe(&p.kind, cmd)
+            .await
+            .map_err(|e| format!("{p}: {e}"))?;
+        reg.register(Arc::new(stage));
+    }
+    Ok(reg)
+}
+
+/// Open the node on `state_dir` with the given sources and plugin stages. File sources
+/// loop in real time and start after the node has subscribed to them (a source with no
+/// subscriber stops at once); a KiwiSDR connects on its first tune; a SoapySDR device is
+/// opened here. `resume` relaunches persisted `Running` jobs (`serve`); without it they
+/// are listed as persisted and left alone (one-shot). Errors name the flag, never a
+/// Kiwi password.
 pub async fn open(
     state_dir: PathBuf,
-    source_files: &[(String, PathBuf)],
+    sources: &[SourceSpec],
+    plugins: &[PluginSpec],
     resume: bool,
 ) -> Result<Node, String> {
     let opts = FileOpts {
@@ -49,14 +126,35 @@ pub async fn open(
         block_samples: 4800,
         repeat: true,
     };
-    let sources = source_files
-        .iter()
-        .map(|(id, path): &(String, PathBuf)| {
-            FileSource::open(SourceId(id.clone()), Path::new(path), opts)
-                .map(Arc::new)
-                .map_err(|e| format!("--source-file {id}={}: {e}", path.display()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let registry = with_plugins(plugins).await?;
+    let mut files = Vec::new();
+    let mut ports: Vec<Arc<dyn Port>> = Vec::new();
+    for spec in sources {
+        let flag = |e: &dyn std::fmt::Display| format!("{spec}: {e}");
+        let id = SourceId(spec.id().to_owned());
+        match spec {
+            SourceSpec::File { path, .. } => {
+                let f = FileSource::open(id, Path::new(path), opts)
+                    .map(Arc::new)
+                    .map_err(|e| flag(&e))?;
+                ports.push(f.clone());
+                files.push(f);
+            }
+            SourceSpec::Kiwi {
+                host,
+                port,
+                password,
+                ..
+            } => {
+                let cfg =
+                    KiwiConfig::new(host.clone(), *port, password.clone()).map_err(|e| flag(&e))?;
+                ports.push(Arc::new(KiwiSource::new(id, cfg)));
+            }
+            SourceSpec::Soapy { args, .. } => {
+                ports.push(open_soapy(spec.id(), args).map_err(|e| flag(&e))?);
+            }
+        }
+    }
     #[allow(unused_mut)]
     let mut backends = vec![Backend::Cpu];
     #[cfg(feature = "gpu")]
@@ -69,11 +167,10 @@ pub async fn open(
         backends,
         resume,
     };
-    let ports = sources.iter().map(|s| s.clone() as Arc<dyn Port>).collect();
-    let node = Node::open(cfg, registry(), ports)
+    let node = Node::open(cfg, registry, ports)
         .await
         .map_err(|e| e.to_string())?;
-    for s in &sources {
+    for s in &files {
         s.start();
     }
     node.add_knowledge(Arc::new(StaticKnowledge::builtin()));
@@ -82,4 +179,69 @@ pub async fn open(
         node.add_classifier(c);
     }
     Ok(node)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeta_core::graph::validate;
+    use zeta_core::ops::{JobKind, OpError, schema};
+    use zeta_core::port::Tuning;
+    use zeta_core::types::Hz;
+
+    fn param(n: &zeta_core::graph::Node, key: &str) -> u64 {
+        n.params[key].as_u64().unwrap()
+    }
+
+    #[test]
+    fn every_job_kind_expands_to_a_valid_graph() {
+        let schema = schema();
+        let kinds: Vec<JobKind> = schema["op"]["$defs"]["JobKind"]["enum"]
+            .as_array()
+            .expect("JobKind enum in the schema")
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()).unwrap())
+            .collect();
+        assert!(kinds.len() >= 5, "kinds read from schema: {kinds:?}");
+        let src = SourceId("src".into());
+        let registry = registry();
+        for kind in kinds {
+            for rate in [
+                12_000u64, 48_000, 1_000_000, 2_048_000, 2_400_000, 8_000_000, 10_000_000,
+                20_000_000,
+            ] {
+                for bw in [10_000u64, 12_500] {
+                    let tuning = Tuning {
+                        center_hz: Hz(7_100_000),
+                        bandwidth_hz: Hz(bw),
+                    };
+                    match kind.expand(&src, tuning, Hz(rate), None) {
+                        Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
+                            assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
+                        }
+                        Ok(g) => {
+                            validate(&g, &registry)
+                                .unwrap_or_else(|e| panic!("{kind:?} {rate} {bw}: {e}"));
+                            for n in g.nodes.iter().filter(|n| n.kind == "channel") {
+                                let out = param(n, "out_rate_hz");
+                                assert_eq!(rate % out, 0, "{kind:?} {rate} {bw}");
+                                assert!(param(n, "bandwidth_hz") <= out);
+                                for e in g.edges.iter().filter(|e| e.from == n.id) {
+                                    let to = g.nodes.iter().find(|m| m.id == e.to).unwrap();
+                                    if to.kind == "nbfm_demod" {
+                                        assert_eq!(
+                                            out % param(to, "audio_rate_hz"),
+                                            0,
+                                            "{kind:?} {rate} {bw}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => panic!("{kind:?} {rate} {bw}: {e}"),
+                    }
+                }
+            }
+        }
+    }
 }

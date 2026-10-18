@@ -109,14 +109,34 @@ pub struct Capabilities {
     pub push: bool,
 }
 
+/// Schema of a required `Option<T>`: `T`'s schema inlined with `"null"` added
+/// to its `type`. (`#[schemars(required)]` alone drops the `null`.) Use as
+/// `#[schemars(required, schema_with = "crate::types::nullable::<T>")]`.
+pub(crate) fn nullable<T: JsonSchema>(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let mut s = T::json_schema(g);
+    let null = serde_json::Value::from("null");
+    let ty = match s.get("type").cloned() {
+        Some(serde_json::Value::Array(mut a)) => {
+            if !a.contains(&null) {
+                a.push(null);
+            }
+            a
+        }
+        Some(t) => vec![t, null],
+        None => panic!("nullable::<{}>: schema has no `type`", T::schema_name()),
+    };
+    s.insert("type".into(), serde_json::Value::Array(ty));
+    s
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct Provenance {
     pub source: SourceId,
-    #[schemars(required)]
+    #[schemars(required, schema_with = "nullable::<JobId>")]
     pub job: Option<JobId>,
-    #[schemars(required)]
+    #[schemars(required, schema_with = "nullable::<ChannelId>")]
     pub channel: Option<ChannelId>,
     pub span: Span,
 }

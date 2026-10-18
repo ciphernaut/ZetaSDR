@@ -1,16 +1,18 @@
 //! Launching jobs: lease, spawn stages, supervise, and the IQ forwarders.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinSet;
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::persist::{now, persist};
 use super::{Inner, JobEntry, NodeError};
 use crate::graph::{self, GraphError};
 use crate::job::{JobRecord, JobState};
-use crate::port::IqReceiver;
+use crate::port::{IqReceiver, Port};
 use crate::ring::IqRing;
 use crate::stage::StageError;
 use crate::stream::{Frame, Payload, StreamBus};
@@ -106,11 +108,13 @@ impl Inner {
             set.spawn(async move { stage.run(params, inputs, outputs, bus, cancel).await });
         }
         if let Some(sid) = iq {
-            tokio::spawn(forward_iq(
+            let rx = port.subscribe();
+            set.spawn(forward_iq(
                 self.bus.clone(),
                 prov,
                 sid,
-                port.subscribe(),
+                port,
+                rx,
                 token.clone(),
             ));
         }
@@ -180,27 +184,47 @@ async fn supervise(
     }
 }
 
-/// Republish a port's blocks as `Payload::Iq` frames on a job's IQ stream.
+/// Republish a port's blocks as `Payload::Iq` frames on a job's IQ stream,
+/// as one of the job's supervised tasks. A port fault (checked on every block
+/// and every 200 ms) fails the job. A port that closes without a fault closes
+/// the IQ stream so the stages drain and end the job; the forwarder itself
+/// then waits for cancellation, so it never ends a job on its own.
 async fn forward_iq(
     bus: Arc<StreamBus>,
     prov: Provenance,
     stream: StreamId,
+    port: Arc<dyn Port>,
     mut rx: IqReceiver,
     cancel: CancellationToken,
-) {
+) -> Result<(), StageError> {
+    let faulted = |f: String| StageError::Failed(format!("source {}: {f}", port.id().0));
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         let block = tokio::select! {
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => return Err(StageError::Cancelled),
+            _ = tick.tick() => {
+                if let Some(f) = port.fault() {
+                    return Err(faulted(f));
+                }
+                continue;
+            }
             r = rx.recv() => match r {
                 Ok(b) => b,
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => {
-                    // The port has ended: close the job's IQ stream so its stages end too.
+                    if let Some(f) = port.fault() {
+                        return Err(faulted(f));
+                    }
                     bus.unregister(&stream);
-                    return;
+                    cancel.cancelled().await;
+                    return Err(StageError::Cancelled);
                 }
             },
         };
+        if let Some(f) = port.fault() {
+            return Err(faulted(f));
+        }
         let rate = block.sample_rate_hz.0.max(1) as u128;
         let end = block.t0.0 + (block.samples.len() as u128 * 1_000_000_000 / rate) as u64;
         let provenance = Provenance {
