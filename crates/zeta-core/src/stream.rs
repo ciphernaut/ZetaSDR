@@ -75,6 +75,12 @@ impl StreamBus {
         }
     }
 
+    /// Remove a stream; its sender is dropped, so subscribers see `Closed`
+    /// once they have drained what was already sent.
+    pub fn unregister(&self, id: &StreamId) {
+        self.streams.write().unwrap().remove(id);
+    }
+
     pub fn subscribe(&self, id: &StreamId) -> Option<broadcast::Receiver<Frame>> {
         self.streams.read().unwrap().get(id).map(|(_, tx)| tx.subscribe())
     }
@@ -126,6 +132,17 @@ mod tests {
         assert_eq!(l.len(), 2);
         assert_eq!(l[0].provenance.source, SourceId("a".into()));
         assert_eq!(l[1].kind, StreamKind::Event);
+    }
+
+    #[tokio::test]
+    async fn unregister_closes_subscribers_and_drops_from_list() {
+        let bus = StreamBus::new(8);
+        let id = bus.register(StreamKind::Text, prov("s"));
+        let mut rx = bus.subscribe(&id).unwrap();
+        bus.unregister(&id);
+        assert!(bus.list().is_empty());
+        assert!(bus.subscribe(&id).is_none());
+        assert!(matches!(rx.recv().await, Err(broadcast::error::RecvError::Closed)));
     }
 
     #[test]

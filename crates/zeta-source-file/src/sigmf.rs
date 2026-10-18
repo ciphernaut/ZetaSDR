@@ -1,7 +1,7 @@
 //! SigMF recording playback as a [`Port`].
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -137,7 +137,8 @@ pub struct FileSource {
     caps: Capabilities,
     opts: FileOpts,
     samples: Arc<[Complex<f32>]>,
-    tx: broadcast::Sender<IqBlock>,
+    /// Taken (dropped) when a non-repeating playback ends, so subscribers see `Closed`.
+    tx: Arc<Mutex<Option<broadcast::Sender<IqBlock>>>>,
     stopped: Arc<AtomicBool>,
 }
 
@@ -180,20 +181,27 @@ impl FileSource {
             push: true,
         };
         let (tx, _) = broadcast::channel(64);
+        let tx = Arc::new(Mutex::new(Some(tx)));
         Ok(Self { id, meta, caps, opts, samples, tx, stopped: Arc::new(AtomicBool::new(false)) })
     }
 
     /// Begin broadcasting blocks to subscribers. Call `subscribe()` first: the task
     /// exits as soon as there are no receivers, or when this source is dropped.
+    /// Without `repeat`, the end of the recording closes the stream for good.
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
-        let tx = self.tx.clone();
+        let shared = self.tx.clone();
+        let tx = shared.lock().unwrap().clone();
         let samples = self.samples.clone();
         let (meta, opts) = (self.meta.clone(), self.opts);
         let stopped = self.stopped.clone();
         tokio::spawn(async move {
+            let Some(tx) = tx else { return };
             let rate = meta.sample_rate_hz.0;
             let mut elapsed: u64 = 0;
             if samples.is_empty() {
+                if !opts.repeat {
+                    shared.lock().unwrap().take();
+                }
                 return;
             }
             loop {
@@ -216,6 +224,7 @@ impl FileSource {
                     }
                 }
                 if !opts.repeat {
+                    shared.lock().unwrap().take();
                     break;
                 }
             }
@@ -250,7 +259,11 @@ impl Port for FileSource {
     }
 
     fn subscribe(&self) -> IqReceiver {
-        self.tx.subscribe()
+        match self.tx.lock().unwrap().as_ref() {
+            Some(tx) => tx.subscribe(),
+            // Playback has ended: hand out a receiver that is already closed.
+            None => broadcast::channel(1).1,
+        }
     }
 }
 

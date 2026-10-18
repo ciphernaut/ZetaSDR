@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast::error::RecvError;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::graph::{self, Graph, GraphError};
@@ -44,6 +44,8 @@ pub enum NodeError {
 struct JobEntry {
     record: JobRecord,
     cancel: Option<CancellationToken>,
+    /// The supervisor; it releases the lease and unregisters the job's streams.
+    done: Option<JoinHandle<()>>,
 }
 
 struct Inner {
@@ -56,6 +58,8 @@ struct Inner {
     ports: RwLock<HashMap<SourceId, Arc<dyn Port>>>,
     rings: Mutex<HashMap<SourceId, Arc<RwLock<IqRing>>>>,
     jobs: Mutex<HashMap<JobId, JobEntry>>,
+    /// Failures to persist a job's natural end; memory and disk disagree for these.
+    persist_errors: Mutex<Vec<String>>,
     /// Cancelled when the `Node` is dropped; every job token is a child of it.
     shutdown: CancellationToken,
 }
@@ -132,6 +136,7 @@ impl Node {
                 ports: RwLock::new(HashMap::new()),
                 rings: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
+                persist_errors: Mutex::new(Vec::new()),
                 shutdown: CancellationToken::new(),
             }),
             load_errors,
@@ -141,7 +146,7 @@ impl Node {
         }
         for rec in records {
             if rec.state != JobState::Running {
-                node.inner.jobs.lock().unwrap().insert(rec.id.clone(), JobEntry { record: rec, cancel: None });
+                node.inner.jobs.lock().unwrap().insert(rec.id.clone(), JobEntry { record: rec, cancel: None, done: None });
                 continue;
             }
             let mut failed = rec.clone();
@@ -152,7 +157,7 @@ impl Node {
                 };
                 failed.state = JobState::Failed { reason };
                 persist(&node.inner.jobs_dir, &failed)?;
-                node.inner.jobs.lock().unwrap().insert(failed.id.clone(), JobEntry { record: failed, cancel: None });
+                node.inner.jobs.lock().unwrap().insert(failed.id.clone(), JobEntry { record: failed, cancel: None, done: None });
             }
         }
         Ok(node)
@@ -200,18 +205,26 @@ impl Node {
         Ok(id)
     }
 
-    /// Cancel the job's stages, release its lease and persist it as `Stopped`.
+    /// Persist the job as `Stopped`, then cancel its stages and wait for its
+    /// supervisor to release the lease and unregister its streams. If the
+    /// record cannot be written the job is left running and `Io` is returned.
     /// A `Failed` job keeps its state and reason.
     pub async fn job_stop(&self, id: &JobId) -> Result<(), NodeError> {
-        let mut jobs = self.inner.jobs.lock().unwrap();
-        let entry = jobs.get_mut(id).ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
-        if let Some(c) = entry.cancel.take() {
-            c.cancel();
-        }
-        self.inner.leases.release(id);
-        if !matches!(entry.record.state, JobState::Failed { .. } | JobState::Stopped) {
-            entry.record.state = JobState::Stopped;
-            persist(&self.inner.jobs_dir, &entry.record)?;
+        let done = {
+            let mut jobs = self.inner.jobs.lock().unwrap();
+            let entry = jobs.get_mut(id).ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            if !matches!(entry.record.state, JobState::Failed { .. } | JobState::Stopped) {
+                let rec = JobRecord { state: JobState::Stopped, ..entry.record.clone() };
+                persist(&self.inner.jobs_dir, &rec)?;
+                entry.record = rec;
+            }
+            if let Some(c) = entry.cancel.take() {
+                c.cancel();
+            }
+            entry.done.take()
+        };
+        if let Some(h) = done {
+            let _ = h.await;
         }
         Ok(())
     }
@@ -261,6 +274,11 @@ impl Node {
         self.inner.bus.clone()
     }
 
+    /// Natural job ends that could not be written to disk, one message each.
+    pub fn persist_errors(&self) -> Vec<String> {
+        self.inner.persist_errors.lock().unwrap().clone()
+    }
+
     /// Jobs currently holding a lease on `source`, with the band each asked for.
     pub fn lease_holders(&self, source: &SourceId) -> Vec<(JobId, Tuning)> {
         self.inner.leases.holders(source)
@@ -293,13 +311,14 @@ impl Inner {
         let t = now();
         let prov = Provenance { source: rec.source.clone(), job: Some(id.clone()), channel: None, span: Span { start: t, end: t } };
         let graph = rec.graph.clone();
-        self.jobs.lock().unwrap().insert(id.clone(), JobEntry { record: rec, cancel: Some(token.clone()) });
+        self.jobs.lock().unwrap().insert(id.clone(), JobEntry { record: rec, cancel: Some(token.clone()), done: None });
 
         // One stream per edge; a node with no outgoing edge gets one job output
         // stream of its stage's first output kind.
         let edge_streams: Vec<_> = graph.edges.iter().map(|e| self.bus.register(e.kind, prov.clone())).collect();
         let roots = graph.nodes.iter().any(|n| !graph.edges.iter().any(|e| e.to == n.id));
         let iq = roots.then(|| self.bus.register(StreamKind::Iq, prov.clone()));
+        let mut streams: Vec<StreamId> = edge_streams.iter().cloned().chain(iq.clone()).collect();
         let mut set = JoinSet::new();
         for (n, stage) in graph.nodes.iter().zip(stages) {
             let mut inputs = Vec::new();
@@ -318,7 +337,9 @@ impl Inner {
             }
             if outputs.is_empty() {
                 if let Some(&k) = stage.spec().outputs.first() {
-                    outputs.push(self.bus.register(k, prov.clone()));
+                    let sid = self.bus.register(k, prov.clone());
+                    streams.push(sid.clone());
+                    outputs.push(sid);
                 }
             }
             let (params, bus, cancel) = (n.params.clone(), self.bus.clone(), token.clone());
@@ -327,32 +348,39 @@ impl Inner {
         if let Some(sid) = iq {
             tokio::spawn(forward_iq(self.bus.clone(), prov, sid, port.subscribe(), token.clone()));
         }
-        tokio::spawn(supervise(self.clone(), id, set, token));
+        let h = tokio::spawn(supervise(self.clone(), id.clone(), set, token, streams));
+        if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
+            e.done = Some(h);
+        }
         Ok(())
     }
 
     /// Record how a job ended on its own, unless it was stopped meanwhile.
+    /// A failed write keeps the new state in memory and is reported through
+    /// `persist_errors`; the job will be resumed on the next `open`.
     fn finish(&self, id: &JobId, state: JobState) {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(entry) = jobs.get_mut(id) {
             if entry.record.state == JobState::Running {
                 entry.record.state = state;
                 entry.cancel = None;
-                // No caller to report to; the in-memory state is still correct.
-                let _ = persist(&self.jobs_dir, &entry.record);
+                if let Err(e) = persist(&self.jobs_dir, &entry.record) {
+                    self.persist_errors.lock().unwrap().push(format!("job {}: {e}", id.0));
+                }
             }
         }
-        self.leases.release(id);
     }
 }
 
 /// Await a job's stages. The first to end for any reason other than
-/// cancellation stops the rest; `Failed` wins over a clean end.
+/// cancellation stops the rest; `Failed` wins over a clean end. Then release
+/// the lease and unregister the job's streams.
 async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
     mut set: JoinSet<Result<(), StageError>>,
     token: CancellationToken,
+    streams: Vec<StreamId>,
 ) {
     let mut failure = None;
     while let Some(r) = set.join_next().await {
@@ -369,10 +397,15 @@ async fn supervise(
             }
         }
     }
-    if inner.shutdown.is_cancelled() {
-        return;
+    // After node shutdown the record must stay `Running` so the job resumes.
+    if !inner.shutdown.is_cancelled() {
+        inner.finish(&id, failure.map_or(JobState::Stopped, |reason| JobState::Failed { reason }));
     }
-    inner.finish(&id, failure.map_or(JobState::Stopped, |reason| JobState::Failed { reason }));
+    // The only place a started job's lease is released.
+    inner.leases.release(&id);
+    for s in &streams {
+        inner.bus.unregister(s);
+    }
 }
 
 /// Republish a port's blocks as `Payload::Iq` frames on a job's IQ stream.
@@ -389,7 +422,11 @@ async fn forward_iq(
             r = rx.recv() => match r {
                 Ok(b) => b,
                 Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return,
+                Err(RecvError::Closed) => {
+                    // The port has ended: close the job's IQ stream so its stages end too.
+                    bus.unregister(&stream);
+                    return;
+                }
             },
         };
         let rate = block.sample_rate_hz.0.max(1) as u128;

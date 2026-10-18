@@ -13,8 +13,12 @@ use zeta_core::types::{Hz, JobId, SourceId};
 use zeta_source_file::{FileOpts, FileSource, fixtures};
 
 fn source(dir: &Path) -> (Arc<FileSource>, Arc<dyn Port>) {
+    source_with(dir, true)
+}
+
+fn source_with(dir: &Path, repeat: bool) -> (Arc<FileSource>, Arc<dyn Port>) {
     let meta = fixtures::write_tone(dir);
-    let opts = FileOpts { realtime: false, block_samples: 4800, repeat: true };
+    let opts = FileOpts { realtime: false, block_samples: 4800, repeat };
     let src = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
     let port: Arc<dyn Port> = src.clone();
     (src, port)
@@ -144,4 +148,70 @@ async fn ring_fills_from_port() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let ring = node.ring(&SourceId("file0".into())).expect("ring created");
     assert!(ring.read().unwrap().latest().is_some());
+}
+
+fn job_streams(node: &Node, id: &JobId) -> usize {
+    node.bus().list().iter().filter(|s| s.provenance.job.as_ref() == Some(id)).count()
+}
+
+#[tokio::test]
+async fn stopped_job_streams_are_unregistered() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    src.start();
+    let id = start_job(&node).await;
+    assert!(job_streams(&node, &id) > 0);
+    node.job_stop(&id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(job_streams(&node, &id), 0);
+}
+
+#[tokio::test]
+async fn port_close_ends_job_as_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source_with(dir.path(), false);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    src.start();
+    let id = start_job(&node).await;
+    let mut state = JobState::Running;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state = node.job_list()[0].state.clone();
+        if state != JobState::Running {
+            break;
+        }
+    }
+    assert_eq!(state, JobState::Stopped);
+    assert_eq!(on_disk(dir.path(), &id).state, JobState::Stopped);
+    assert!(node.lease_holders(&SourceId("file0".into())).is_empty());
+    assert_eq!(job_streams(&node, &id), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_persist_failure_leaves_job_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    src.start();
+    let id = start_job(&node).await;
+    let jobs = dir.path().join("state").join("jobs");
+    std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root ignores directory permissions; the failure cannot be provoked this way.
+    if std::fs::write(jobs.join("probe"), b"").is_ok() {
+        std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: directory permissions are not enforced (running as root?)");
+        return;
+    }
+    let r = node.job_stop(&id).await;
+    std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(r, Err(NodeError::Io(_))), "{r:?}");
+    assert_eq!(node.job_list()[0].state, JobState::Running);
+    assert_eq!(on_disk(dir.path(), &id).state, JobState::Running);
+    assert_eq!(node.lease_holders(&SourceId("file0".into())).len(), 1);
+    assert!(job_streams(&node, &id) > 0);
+    node.job_stop(&id).await.unwrap();
+    assert_eq!(node.job_list()[0].state, JobState::Stopped);
 }
