@@ -147,13 +147,7 @@ fn iq_read_one_shot_writes_capture() {
     .stdout
     .clone();
     let v = json(&out);
-    eprintln!("{v}");
-    let meta = std::path::PathBuf::from(
-        v["value"]["path"]
-            .as_str()
-            .or_else(|| v["value"].as_str())
-            .expect("capture path"),
-    );
+    let meta = std::path::PathBuf::from(v["value"]["path"].as_str().expect("capture path"));
     assert!(meta.exists(), "{}", meta.display());
     assert!(meta.starts_with(dir.path().join("state").join("captures")));
     assert!(meta.with_extension("sigmf-data").exists());

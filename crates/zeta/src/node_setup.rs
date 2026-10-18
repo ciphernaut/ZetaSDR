@@ -26,7 +26,7 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is set; pass --state-dir".into())
 }
 
-/// Open the node on `state_dir` with one looping `FileSource` per `(id, meta path)`.
+/// Open the node on `state_dir` with one looping, real-time `FileSource` per `(id, meta path)`.
 /// Sources start after the node has subscribed to them: a source with no
 /// subscriber stops at once. `resume` relaunches persisted `Running` jobs
 /// (`serve`); without it they are listed as persisted and left alone (one-shot).
@@ -36,7 +36,7 @@ pub async fn open(
     resume: bool,
 ) -> Result<Node, String> {
     let opts = FileOpts {
-        realtime: false,
+        realtime: true,
         block_samples: 4800,
         repeat: true,
     };
