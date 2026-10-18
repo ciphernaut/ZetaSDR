@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use zeta_core::classify::{Classifier, FeatureRecord, Label};
 use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::{Baud, Hz, StreamId, StreamKind};
+use zeta_core::types::{Baud, Hz, Provenance, StreamId, StreamKind, Timestamp};
 
 use crate::fft::{Window, power_spectrum_db};
 use crate::{frame_span, run_map};
@@ -25,7 +25,7 @@ const OCCUPIED_DB: f32 = 6.0;
 /// Below-threshold gaps of at most this width inside the occupied band are
 /// bridged, so the discrete sidebands of an FM tone count as one band.
 const GAP_HZ: f64 = 1_500.0;
-/// `burst` when the loudest 10 ms chunk exceeds the mean chunk power by this ratio.
+/// `burst` when the loudest 10 ms chunk exceeds the median chunk power by this ratio.
 const BURST_RATIO: f64 = 3.0;
 /// A symbol-rate line must stand this far above the median of its spectrum.
 const LINE_DB: f32 = 10.0;
@@ -37,6 +37,9 @@ const SILENT_AUDIO: f32 = 0.25;
 const MIN_LINE_HZ: f64 = 50.0;
 /// Below this SNR a block is labelled noise.
 const NOISE_SNR_DB: f32 = 6.0;
+/// FM needs discriminator audio (band-limited to half the occupied band) with
+/// an RMS deviation above this; below it a constant-envelope signal is a carrier.
+const FM_MIN_DEV_HZ: f64 = 100.0;
 /// FM: envelope coefficient of variation below this ...
 const FM_MAX_CV: f32 = 0.2;
 /// ... and occupied bandwidth at most this.
@@ -125,19 +128,21 @@ pub fn envelope_cv(iq: &[Complex<f32>]) -> f32 {
 }
 
 /// Whether the loudest 10 ms chunk of `iq` is more than `BURST_RATIO` times
-/// the mean chunk power. Fewer than two chunks is never a burst.
+/// the median chunk power (the median is the idle level whenever the signal
+/// is on for under half the block). Fewer than two chunks is never a burst.
 fn is_burst(iq: &[Complex<f32>], rate_hz: u64) -> bool {
     let chunk = ((rate_hz / 100) as usize).max(1);
-    let powers: Vec<f64> = iq
+    let mut powers: Vec<f64> = iq
         .chunks_exact(chunk)
         .map(|c| c.iter().map(|s| s.norm_sqr() as f64).sum::<f64>() / chunk as f64)
         .collect();
     if powers.len() < 2 {
         return false;
     }
-    let mean = powers.iter().sum::<f64>() / powers.len() as f64;
-    let max = powers.iter().cloned().fold(0.0, f64::max);
-    mean > 0.0 && max / mean > BURST_RATIO
+    powers.sort_by(f64::total_cmp);
+    let median = powers[powers.len() / 2];
+    let max = powers[powers.len() - 1];
+    median > 0.0 && max / median > BURST_RATIO
 }
 
 /// Phase-difference discriminator in radians per sample (`arg(x[n] x*[n-1])`);
@@ -234,6 +239,10 @@ fn real_spectrum(x: &[f32]) -> Option<Vec<f32>> {
 /// the median of its own neighbourhood (`LOCAL_BINS` either side, its main
 /// lobe excluded), so a coloured noise hump is not mistaken for a line. The
 /// frequency is refined by a parabola through the peak bin and its neighbours.
+///
+/// On an HDLC flag-only stretch (e.g. an APRS preamble of 0x7E flags) the
+/// keying repeats once per 8-bit flag, so the strongest line is the byte rate
+/// (150 Bd for 1200 bit/s), not the bit rate; the full APRS packet reports 1200.
 fn symbol_rate(iq: &[Complex<f32>], rate_hz: u64, cv: f32, bandwidth_hz: u64) -> Option<Baud> {
     let db = real_spectrum(&keying_signal(iq, rate_hz, cv, bandwidth_hz))?;
     let bin_hz = rate_hz as f64 / SIZE as f64;
@@ -345,7 +354,9 @@ fn tone_pair(
 /// has exactly two dominant peaks inside the occupied band 500–3000 Hz apart
 /// and within 6 dB of each other, or, for a constant-envelope signal, when
 /// its discriminator audio does (AFSK on FM); `"fm"` (0.6) when the envelope
-/// CV is below 0.2 and the band is at most 25 kHz; otherwise `"unknown"` (0.5).
+/// CV is below 0.2, the band is at most 25 kHz and the discriminator audio
+/// deviates by more than 100 Hz RMS, `"carrier"` (0.7) when it does not;
+/// otherwise `"unknown"` (0.5).
 pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Label {
     let cv = envelope_cv(iq);
     let (name, confidence, reason) = classify_block(f, iq, rate_hz, cv);
@@ -361,6 +372,21 @@ pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Lab
             f.snr_db, f.bandwidth_hz.0
         ),
     }
+}
+
+/// RMS frequency deviation, in Hz, of the discriminator audio with its mean
+/// (the carrier's offset from centre) removed, band-limited to half the
+/// occupied band.
+fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> f64 {
+    let mut d = discriminator(iq);
+    let mean = d.iter().map(|&v| v as f64).sum::<f64>() / d.len().max(1) as f64;
+    d.iter_mut().for_each(|v| *v -= mean as f32);
+    let audio = analytic(&d, rate_hz, bandwidth_hz as f64 / 2.0);
+    if audio.is_empty() {
+        return 0.0;
+    }
+    let ms = audio.iter().map(|a| (a.re as f64).powi(2)).sum::<f64>() / audio.len() as f64;
+    ms.sqrt() * rate_hz as f64 / (2.0 * std::f64::consts::PI)
 }
 
 fn classify_block(
@@ -401,7 +427,21 @@ fn classify_block(
             }
         }
         if f.bandwidth_hz.0 <= FM_MAX_BW_HZ {
-            return ("fm", 0.6, "constant envelope, narrow band".into());
+            let dev = audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0);
+            if dev < FM_MIN_DEV_HZ {
+                return (
+                    "carrier",
+                    0.7,
+                    format!(
+                        "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz)"
+                    ),
+                );
+            }
+            return (
+                "fm",
+                0.6,
+                format!("constant envelope, narrow band, rms deviation {dev:.0} Hz"),
+            );
         }
     }
     ("unknown", 0.5, "no layer-1 rule matched".into())
@@ -413,8 +453,11 @@ fn classify_block(
 #[schemars(deny_unknown_fields)]
 pub struct MeasureParams {}
 
-/// Emits one Event per IQ block: the block's [`FeatureRecord`] fields plus
-/// `"label"`, its [`layer1_label`].
+/// Accumulates IQ until it holds at least one second (`rate_hz` samples),
+/// then emits one Event for that window: its [`FeatureRecord`] fields plus
+/// `"label"`, its [`layer1_label`], with the provenance span covering the
+/// window. A change of sample rate or centre frequency discards the partial
+/// window; a partial window left when the input closes is not measured.
 pub struct MeasureStage {
     spec: StageSpec,
 }
@@ -461,19 +504,38 @@ impl Stage for MeasureStage {
         let Some(out) = outputs.first().cloned() else {
             return Err(StageError::Failed("expected 1 output".into()));
         };
+        // Window under construction: first frame's provenance, t0, rate, centre.
+        let mut window: Option<(Provenance, Timestamp, u64, u64)> = None;
+        let mut buf: Vec<Complex<f32>> = Vec::new();
         run_map(inputs, bus, cancel, move |frame| {
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed("measure stage expects iq frames".into()));
             };
-            let rate = block.sample_rate_hz.0;
-            let f = measure(&block.samples, rate, block.center_hz.0);
-            let label = layer1_label(&f, &block.samples, rate);
+            let (rate, center) = (block.sample_rate_hz.0, block.center_hz.0);
+            if window
+                .as_ref()
+                .is_some_and(|w| (w.2, w.3) != (rate, center))
+            {
+                window = None;
+                buf.clear();
+            }
+            let (prov, t0, _, _) = window
+                .get_or_insert_with(|| (frame.provenance.clone(), block.t0, rate, center))
+                .clone();
+            buf.extend_from_slice(&block.samples);
+            if rate == 0 || (buf.len() as u64) < rate {
+                return Ok(Vec::new());
+            }
+            let f = measure(&buf, rate, center);
+            let label = layer1_label(&f, &buf, rate);
             let mut ev = serde_json::to_value(&f)
                 .map_err(|e| StageError::Failed(format!("measure: {e}")))?;
             ev["label"] = serde_json::to_value(&label)
                 .map_err(|e| StageError::Failed(format!("measure: {e}")))?;
-            let mut prov = frame.provenance.clone();
-            prov.span = frame_span(block.t0, block.samples.len(), rate);
+            let mut prov = prov;
+            prov.span = frame_span(t0, buf.len(), rate);
+            window = None;
+            buf.clear();
             Ok(vec![Frame::new(out.clone(), prov, Payload::Event(ev))])
         })
         .await
@@ -545,6 +607,8 @@ mod tests {
         );
         assert!(f.snr_db > 20.0, "snr_db {}", f.snr_db);
         assert!(!f.burst);
+        // Half-band and local-median guards: a pure FM tone has no keying line.
+        assert_eq!(f.symbol_rate_baud, None);
         assert_eq!(l.name, "fm");
     }
 
@@ -569,20 +633,18 @@ mod tests {
         assert_eq!(l.name, "fsk");
         // Whole fixture with the carrier keyed only for the packet. The audio
         // silence of `aprs_packet_iq` is an unmodulated carrier (flat
-        // envelope, so never a burst), so model the transmitter as off there
-        // and leave only receiver noise. With the fixture's 0.5 s either side
-        // the packet fills 34% of the block and max/mean chunk power is ~2.9,
-        // just under the 3.0 burst ratio, so the key-off time is 1 s either side.
-        let mut keyed = vec![Complex::new(0.0f32, 0.0); RATE as usize];
-        keyed.extend_from_slice(&clean[silence..clean.len() - silence]);
-        keyed.extend(std::iter::repeat_n(
-            Complex::new(0.0f32, 0.0),
-            RATE as usize,
-        ));
+        // envelope, so never a burst), so model the transmitter as off for
+        // those 0.5 s either side and leave only receiver noise.
+        let mut keyed = clean.clone();
+        let n = keyed.len();
+        keyed[..silence].fill(Complex::new(0.0, 0.0));
+        keyed[n - silence..].fill(Complex::new(0.0, 0.0));
         awgn(&mut keyed, 20.0, 9);
         let f = measure(&keyed, RATE, CENTER);
         show("afsk keyed whole", &f, &layer1_label(&f, &keyed, RATE));
         assert!(f.burst);
+        // Local-maximum guard: the on/off gating leaves a 1/f skirt, not a line.
+        assert_eq!(f.symbol_rate_baud, None);
     }
 
     #[test]
@@ -590,13 +652,17 @@ mod tests {
         let mut iq = crate::util::nco(RATE as usize, 5_000.0, RATE as f64);
         awgn(&mut iq, 20.0, 13);
         let f = measure(&iq, RATE, CENTER);
-        show("tone +5k", &f, &layer1_label(&f, &iq, RATE));
+        let l = layer1_label(&f, &iq, RATE);
+        show("tone +5k", &f, &l);
+        assert_eq!(l.name, "carrier");
+        // Half-band guard: discriminator noise of a bare carrier is not keying.
+        assert_eq!(f.symbol_rate_baud, None);
         let err = f.center_hz.0 as f64 - (CENTER + 5_000) as f64;
         assert!(err.abs() <= BIN_HZ, "center_hz {} err {err}", f.center_hz.0);
     }
 
     #[tokio::test]
-    async fn measure_stage_emits_features_and_label() {
+    async fn measure_stage_noise_in_production_blocks_is_noise() {
         use zeta_core::port::IqBlock;
         use zeta_core::types::{Provenance, SourceId, Span, Timestamp};
         let prov = Provenance {
@@ -611,7 +677,7 @@ mod tests {
         let bus = Arc::new(StreamBus::new(8));
         let out = bus.register(StreamKind::Event, prov.clone());
         let mut rx_out = bus.subscribe(&out).unwrap();
-        let (tx, rx_in) = broadcast::channel(8);
+        let (tx, rx_in) = broadcast::channel(16);
         let h = tokio::spawn(async move {
             MeasureStage::new()
                 .run(
@@ -623,30 +689,43 @@ mod tests {
                 )
                 .await
         });
+        // Review Focus 6 at the production block size: 4800-sample blocks of
+        // pure noise, one event once a full second has accumulated.
         let mut iq = vec![Complex::new(0.0f32, 0.0); RATE as usize];
         awgn(&mut iq, 0.0, 1);
-        tx.send(Frame::new(
-            StreamId::new(),
-            prov,
-            Payload::Iq(IqBlock {
-                t0: Timestamp(0),
-                sample_rate_hz: Hz(RATE),
-                center_hz: Hz(CENTER),
-                samples: iq.into(),
-            }),
-        ))
-        .unwrap();
+        for (i, block) in iq.chunks(4_800).enumerate() {
+            tx.send(Frame::new(
+                StreamId::new(),
+                prov.clone(),
+                Payload::Iq(IqBlock {
+                    t0: Timestamp(1_000_000_000 + i as u64 * 100_000_000),
+                    sample_rate_hz: Hz(RATE),
+                    center_hz: Hz(CENTER),
+                    samples: block.to_vec().into(),
+                }),
+            ))
+            .unwrap();
+        }
         let f = rx_out.recv().await.unwrap();
+        assert_eq!(f.provenance.span.start_ns, Timestamp(1_000_000_000));
+        assert_eq!(f.provenance.span.end_ns, Timestamp(2_000_000_000));
         let Payload::Event(ev) = &f.payload else {
             panic!("expected an event")
         };
         let mut ev = ev.clone();
         let label: Label = serde_json::from_value(ev["label"].take()).unwrap();
         ev.as_object_mut().unwrap().remove("label");
+        assert_eq!(ev["symbol_rate_baud"], serde_json::Value::Null);
         let rec: FeatureRecord = serde_json::from_value(ev).unwrap();
+        eprintln!(
+            "stage noise: {rec:?} -> {} ({})",
+            label.name, label.evidence
+        );
+        assert!(rec.snr_db < 3.0, "snr_db {}", rec.snr_db);
+        assert!(!rec.burst);
+        assert_eq!(rec.symbol_rate_baud, None);
         assert_eq!(label.layer, 1);
         assert_eq!(label.name, "noise");
-        assert_eq!(rec.symbol_rate_baud, None);
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
     }
