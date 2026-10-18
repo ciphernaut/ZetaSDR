@@ -88,6 +88,9 @@ pub enum Command {
         /// Exit 1 if the committed AGENTS.md differs from the rendering
         #[arg(long)]
         check: bool,
+        /// Wrap the guide as a Claude Code skill (SKILL.md); with --check compare skills/zetasdr/SKILL.md
+        #[arg(long)]
+        skill: bool,
     },
     /// Run the node, resuming persisted jobs, until Ctrl-C
     Serve(ServeArgs),

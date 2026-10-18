@@ -179,3 +179,55 @@ fn listen_requires_secret_and_lan() {
         .stderr(contains("LAN only"));
     assert!(!state.join("serve.lock").exists());
 }
+
+fn stdout_of(args: &[&str]) -> String {
+    let out = plain()
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn committed_skill_matches_rendering() {
+    plain()
+        .args(["agents-md", "--skill", "--check"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn skill_has_frontmatter_and_full_guide() {
+    let skill = stdout_of(&["agents-md", "--skill"]);
+    let guide = stdout_of(&["agents-md"]);
+    assert!(skill.starts_with("---\nname: zetasdr\n"));
+    assert!(skill.ends_with(&guide));
+}
+
+#[test]
+fn guide_documents_transports() {
+    let guide = stdout_of(&["agents-md"]);
+    for needle in [
+        "--node URL",
+        "ZETA_SECRET",
+        "zeta serve --listen",
+        "zeta-mcp --node URL",
+        "zeta ask",
+    ] {
+        assert!(guide.contains(needle), "guide lacks {needle}");
+    }
+}
+
+#[tokio::test]
+async fn serve_serves_committed_agents_md() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ServeProc::start(dir.path(), SECRET);
+    let client = zeta_client::NodeClient::new(&p.url, SECRET).unwrap();
+    let served = client.agents_md().await.unwrap();
+    let committed =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENTS.md")).unwrap();
+    assert_eq!(served, committed);
+}

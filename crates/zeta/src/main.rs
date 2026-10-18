@@ -32,8 +32,8 @@ async fn main() -> ExitCode {
             };
         }
     };
-    if let cli::Command::AgentsMd { check } = cli.command {
-        return agents_md::run(check);
+    if let cli::Command::AgentsMd { check, skill } = cli.command {
+        return agents_md::run(check, skill);
     }
     let cli = match transport::dispatch(cli).await {
         Ok(code) => return code,
