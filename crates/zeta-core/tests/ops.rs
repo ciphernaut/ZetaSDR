@@ -507,3 +507,53 @@ async fn classify_op_runs_stub_and_returns_empty_labels() {
         Ok(OpResult::Labels(vec![]))
     );
 }
+
+#[tokio::test]
+async fn iq_read_rejects_band_outside_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let selection = selection(&node, 433_000_000, 12_500).await;
+    match node.apply(Op::IqRead { selection }).await {
+        Err(OpError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+            ..
+        }) => {
+            assert_eq!(field, "selection.center_hz");
+            assert_eq!(value, 433_000_000);
+            // 100 MHz ring at 48 kHz: centres keeping a 12.5 kHz band inside it.
+            assert_eq!((min, max), (99_982_250, 100_017_750));
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn iq_read_rejects_zero_bandwidth() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let selection = selection(&node, 100_000_000, 0).await;
+    match node.apply(Op::IqRead { selection }).await {
+        Err(OpError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+            ..
+        }) => {
+            assert_eq!(field, "selection.bandwidth_hz");
+            assert_eq!((value, min, max), (0, 1, 48_000));
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+}

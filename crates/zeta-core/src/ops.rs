@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -479,28 +480,9 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
     }
 }
 
-/// Run the classifier set over the selection's span of the source ring.
-async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
-    if node.port(&sel.source).is_none() {
-        return Err(unknown_source(node, &sel.source));
-    }
-    let ring = node.ring(&sel.source).ok_or(OpError::Ring {
-        detail: RingError::Empty,
-    })?;
-    let (rate, samples) = {
-        let r = ring.read().unwrap();
-        let samples = r
-            .read(sel.span)
-            .map_err(|detail| OpError::Ring { detail })?;
-        (r.sample_rate_hz(), samples)
-    };
-    Ok(OpResult::Labels(
-        node.classifiers().run_all(&samples, rate, None).await,
-    ))
-}
-
-/// Write the selection's span from the source ring as a cf32_le SigMF pair.
-fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
+/// The ring's sample rate and centre and the selection's samples, once the
+/// selection's band is checked to lie within the ring's band.
+fn ring_samples(node: &Node, sel: &Selection) -> Result<(Hz, Hz, Vec<Complex<f32>>), OpError> {
     if node.port(&sel.source).is_none() {
         return Err(unknown_source(node, &sel.source));
     }
@@ -508,17 +490,39 @@ fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         detail: RingError::Empty,
     };
     let ring = node.ring(&sel.source).ok_or_else(empty)?;
-    let (rate, center, samples) = {
-        let r = ring.read().unwrap();
-        let samples = r
-            .read(sel.span)
-            .map_err(|detail| OpError::Ring { detail })?;
-        (
-            r.sample_rate_hz(),
-            r.center_hz().ok_or_else(empty)?,
-            samples,
-        )
-    };
+    let r = ring.read().unwrap();
+    let (rate, center) = (r.sample_rate_hz(), r.center_hz().ok_or_else(empty)?);
+    check_band(sel, center, rate)?;
+    let samples = r
+        .read(sel.span.clone())
+        .map_err(|detail| OpError::Ring { detail })?;
+    Ok((rate, center, samples))
+}
+
+/// `[center - bw/2, center + bw/2]` of the selection must lie within the
+/// ring's `[center - rate/2, center + rate/2]`, with a bandwidth of at least 1 Hz.
+fn check_band(sel: &Selection, center: Hz, rate: Hz) -> Result<(), OpError> {
+    range("selection.bandwidth_hz", sel.bandwidth_hz.0, 1, rate.0)?;
+    let (half, ring_half) = (sel.bandwidth_hz.0 / 2, rate.0 / 2);
+    range(
+        "selection.center_hz",
+        sel.center_hz.0,
+        center.0.saturating_sub(ring_half).saturating_add(half),
+        center.0.saturating_add(ring_half).saturating_sub(half),
+    )
+}
+
+/// Run the classifier set over the selection's span of the source ring.
+async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
+    let (rate, _, samples) = ring_samples(node, &sel)?;
+    Ok(OpResult::Labels(
+        node.classifiers().run_all(&samples, rate, None).await,
+    ))
+}
+
+/// Write the selection's span from the source ring as a cf32_le SigMF pair.
+fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
+    let (rate, center, samples) = ring_samples(node, &sel)?;
     let dir = node.state_dir().join("captures");
     std::fs::create_dir_all(&dir).map_err(other)?;
     let name = ulid::Ulid::generate().to_string();
