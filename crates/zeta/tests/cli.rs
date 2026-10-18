@@ -582,7 +582,8 @@ fn failed_plugin_probe_is_a_startup_error_naming_the_kind() {
     zeta_bin()
         .args(["--plugin", "Gain=/x", "source", "list"])
         .assert()
-        .code(1);
+        .code(1)
+        .stderr(contains("must match"));
 }
 
 #[cfg(not(soapy))]
@@ -649,6 +650,12 @@ async fn job_start_on_fake_kiwi_measures() {
     let v = json(&out);
     let frames = v[1]["value"]["frames"].as_array().expect("frames");
     assert!(!frames.is_empty(), "{v}");
-    assert!(frames[0]["payload"].get("center_hz").is_some(), "{v}");
+    let center = frames[0]["payload"]["center_hz"]
+        .as_f64()
+        .expect("center_hz is a number");
+    assert!(
+        (7_095_000.0..=7_105_000.0).contains(&center),
+        "center_hz {center} not within 5 kHz of 7 100 000: {v}"
+    );
     assert!(fake.connections() >= 1);
 }
