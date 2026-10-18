@@ -1,0 +1,20 @@
+# ZetaSDR plan series
+
+The design (`docs/superpowers/specs/2026-10-18-zetasdr-design.md`) describes
+six subsystems. Each gets its own plan; each plan ends with working,
+testable software. Order is dependency order. Plan 1 is written; the rest
+are written when their predecessor is done, so they can argue from real
+interfaces rather than guessed ones.
+
+| # | Plan | Delivers | Depends on |
+|---|------|----------|------------|
+| 1 | Core node | Cargo workspace, typed streams, port trait with leases, IQ ring buffer, SigMF file source, graph document, persistent job runtime, operation set with JSON schema and corrective errors, stage registry with multi-implementation selection, knowledge and classifier traits with stubs, `zeta` CLI, AGENTS.md seed generated from the schema. Test suite passes with no hardware. | none |
+| 2 | DSP slice | Channeliser, NBFM demod to an audio stream, AFSK1200/APRS decode-to-identify to an event stream, layer-1 classical measurement producing feature records, CPU and GPU FFT implementations of one stage. | 1 |
+| 3 | Transports and agent | Websocket+JSON server with shared secret, MCP server generated from the schema, OpenAI-compatible in-process agent adapter (thinking off, token budget, readiness sequence, prose-answer detection), skill and tool descriptions generated from AGENTS.md. | 1 |
+| 4 | Hardware and foreign sources | HackRF via SoapySDR plugin crate, KiwiSDR websocket client, external-process plugin SDK (Python) speaking the typed envelope. | 1, 2 |
+| 5 | Federation | Node-to-node: VITA 49.2 for IQ, typed envelope for the rest, back-pressure, shared secret, Pi 5 build and deployment, remote node as a source. | 3, 4 |
+| 6 | UI | Wide renderer (waterfall, ribbons, context menu, agent pane, jobs), narrow renderer, graph view. All clients of the plan-3 websocket. | 3 |
+
+Plan 5 completes the first vertical slice (design section 8). Plan 6 is
+required for the GUI half of slice item 4; until then that item is
+satisfied by CLI and MCP hitting the same code path.
