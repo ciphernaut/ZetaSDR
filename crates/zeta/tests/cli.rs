@@ -118,7 +118,7 @@ fn job_start_persists_and_list_sees_it_in_new_process() {
         .iter()
         .find(|j| j["id"] == id.as_str())
         .expect("started job listed");
-    assert_eq!(job["state"]["state"], "running");
+    assert_eq!(job["state"]["status"], "running");
 }
 
 #[test]
