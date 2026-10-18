@@ -2,11 +2,13 @@
 
 ZetaSDR is an agentic RF runtime: a node that owns signal sources, keeps a live picture of the
 spectrum and exposes "what is there, what is it, decode it" as typed operations that a human, a
-script or an LLM can invoke. This branch is the core node: ports and leases, IQ ring, stream bus,
-jobs, the operation set, a SigMF file source and the `zeta` CLI.
+script or an LLM can invoke. This branch is the core node (ports and leases, IQ ring, stream bus,
+jobs, the operation set, a SigMF file source and the `zeta` CLI) and the DSP slice (channel
+extraction, spectrum, NBFM demodulation, APRS decoding, layer-1 measurement and classifiers).
 
 Design: [docs/superpowers/specs/2026-10-18-zetasdr-design.md](docs/superpowers/specs/2026-10-18-zetasdr-design.md).
-Plan: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2026-10-18-core-node.md).
+Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2026-10-18-core-node.md),
+[docs/superpowers/plans/2026-10-18-dsp-slice.md](docs/superpowers/plans/2026-10-18-dsp-slice.md).
 
 ## Tests
 

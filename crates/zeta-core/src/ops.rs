@@ -88,14 +88,18 @@ pub enum Op {
         bandwidth_hz: Hz,
     },
     /// Run every registered classifier over the selection's span of the
-    /// source ring (no upstream features).
+    /// source ring (no upstream features). The analysis covers the whole
+    /// source band; the selection band is validated but not used to narrow
+    /// the analysis in this release.
     Classify {
         selection: Selection,
     },
     Schema {},
 }
 
-/// Built-in job kinds; each expands to a graph.
+/// Built-in job kinds; each expands to a graph. `measure` and `spectrum`
+/// cover the whole source band; the job band is validated but not used to
+/// narrow the analysis in this release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {

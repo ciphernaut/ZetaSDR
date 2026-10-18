@@ -140,7 +140,9 @@ pub struct FftParams {
     pub window: Window,
 }
 
-/// Turns each IQ block into one averaged power-spectrum event.
+/// Turns each IQ block into one averaged power-spectrum event, averaging the
+/// block's complete `size`-sample chunks. A block shorter than `size` emits no
+/// event, and a trailing partial chunk of a longer block is dropped.
 pub struct FftStage {
     spec: StageSpec,
     backend: Arc<dyn FftBackend>,
