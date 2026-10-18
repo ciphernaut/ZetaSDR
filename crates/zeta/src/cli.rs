@@ -48,6 +48,12 @@ pub enum Command {
     Classify(SelectionArgs),
     /// JSON schemas of operations, results and errors
     Schema,
+    /// Print AGENTS.md rendered from the operation schema; --check compares it to the committed file
+    AgentsMd {
+        /// Exit 1 if the committed AGENTS.md differs from the rendering
+        #[arg(long)]
+        check: bool,
+    },
     /// Run the node, resuming persisted jobs, until Ctrl-C
     Serve,
 }
@@ -219,7 +225,7 @@ impl Command {
             }
             Command::Classify(s) => Op::Classify { selection: s.into() },
             Command::Schema => Op::Schema {},
-            Command::Serve => return Ok(None),
+            Command::AgentsMd { .. } | Command::Serve => return Ok(None),
         }))
     }
 }

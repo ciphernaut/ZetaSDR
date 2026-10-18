@@ -1,5 +1,6 @@
 //! `zeta`: the command-line transport over the ZetaSDR operation set.
 
+mod agents_md;
 mod cli;
 mod node_setup;
 
@@ -22,6 +23,9 @@ async fn main() -> ExitCode {
             return if e.use_stderr() { ExitCode::FAILURE } else { ExitCode::SUCCESS };
         }
     };
+    if let cli::Command::AgentsMd { check } = cli.command {
+        return agents_md::run(check);
+    }
     let op = match cli.command.into_op() {
         Ok(op) => op,
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
