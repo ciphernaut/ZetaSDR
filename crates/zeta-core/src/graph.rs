@@ -102,9 +102,9 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
         } else {
             continue;
         };
-        if let Some(&expected) = expected {
-            return Err(GraphError::TypeMismatch { edge: i, expected, got: e.kind });
-        }
+        // A stage with no ports on the offending side still rejects the edge.
+        let expected = expected.copied().unwrap_or(e.kind);
+        return Err(GraphError::TypeMismatch { edge: i, expected, got: e.kind });
     }
     Ok(())
 }
@@ -212,6 +212,29 @@ mod tests {
             validate(&g2, &r),
             Err(GraphError::TypeMismatch { edge: 0, expected: StreamKind::Iq, got: StreamKind::Audio })
         );
+    }
+
+    #[test]
+    fn edge_to_stage_with_no_ports_is_mismatch() {
+        let mut r = registry();
+        r.register(Arc::new(Fixed(StageSpec {
+            kind: "sink_only",
+            inputs: vec![],
+            outputs: vec![],
+            params_schema: schemars::json_schema!({"type": "object"}),
+        })));
+        let n = |id, k| node(id, k, serde_json::json!({}));
+        let mk = |from: &str, to: &str| Graph {
+            id: GraphId::new(),
+            nodes: vec![
+                node("p", "passthrough", serde_json::json!({"kind": "Iq"})),
+                n("s", "sink_only"),
+            ],
+            edges: vec![Edge { from: NodeId(from.into()), to: NodeId(to.into()), kind: StreamKind::Iq }],
+        };
+        let want = Err(GraphError::TypeMismatch { edge: 0, expected: StreamKind::Iq, got: StreamKind::Iq });
+        assert_eq!(validate(&mk("s", "p"), &r), want);
+        assert_eq!(validate(&mk("p", "s"), &r), want);
     }
 
     #[test]

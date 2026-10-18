@@ -47,6 +47,10 @@ pub struct StageSpec {
 pub trait Stage: Send + Sync {
     fn spec(&self) -> &StageSpec;
     fn backend(&self) -> Backend;
+    /// Run until the inputs close or `cancel` fires.
+    ///
+    /// Cancellation returns `Err(StageError::Cancelled)`; the runtime treats it as a clean
+    /// stop. A closed input ends the stage with `Ok(())`.
     async fn run(
         &self,
         params: serde_json::Value,
@@ -153,6 +157,7 @@ impl Stage for PassthroughStage {
         };
         loop {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => return Err(StageError::Cancelled),
                 r = rx.recv() => match r {
                     Ok(mut frame) => {
@@ -217,29 +222,60 @@ mod tests {
         assert!(r.select("other", &[Backend::Cpu]).is_none());
     }
 
-    #[tokio::test]
-    async fn passthrough_rewrites_stream_and_stops_on_close() {
-        let bus = Arc::new(StreamBus::new(8));
-        let prov = Provenance {
+    fn prov() -> Provenance {
+        Provenance {
             source: SourceId("s".into()),
             job: None,
             channel: None,
             span: Span { start: Timestamp(0), end: Timestamp(1) },
-        };
-        let inp = bus.register(StreamKind::Text, prov.clone());
-        let out = bus.register(StreamKind::Text, prov.clone());
-        let rx_in = bus.subscribe(&inp).unwrap();
-        let mut rx_out = bus.subscribe(&out).unwrap();
+        }
+    }
+
+    fn text(stream: StreamId, s: &str) -> Frame {
+        Frame { stream, kind: StreamKind::Text, provenance: prov(), payload: Payload::Text(s.into()) }
+    }
+
+    type Run = tokio::task::JoinHandle<Result<(), StageError>>;
+
+    /// Spawn a passthrough fed by a local broadcast channel, so the test can drop the sender.
+    fn spawn(
+        cancel: CancellationToken,
+    ) -> (broadcast::Sender<Frame>, Arc<StreamBus>, StreamId, broadcast::Receiver<Frame>, Run) {
+        let bus = Arc::new(StreamBus::new(8));
+        let out = bus.register(StreamKind::Text, prov());
+        let rx_out = bus.subscribe(&out).unwrap();
+        let (tx, rx_in) = broadcast::channel(8);
         let (b2, o2) = (bus.clone(), out.clone());
         let h = tokio::spawn(async move {
             PassthroughStage::new()
-                .run(serde_json::json!({"kind": "Text"}), vec![rx_in], vec![o2], b2, CancellationToken::new())
+                .run(serde_json::json!({"kind": "Text"}), vec![rx_in], vec![o2], b2, cancel)
                 .await
         });
-        bus.publish(Frame { stream: inp, kind: StreamKind::Text, provenance: prov, payload: Payload::Text("x".into()) });
+        (tx, bus, out, rx_out, h)
+    }
+
+    #[tokio::test]
+    async fn passthrough_rewrites_stream_id() {
+        let (tx, _bus, out, mut rx_out, h) = spawn(CancellationToken::new());
+        tx.send(text(StreamId::new(), "x")).unwrap();
         let f = rx_out.recv().await.unwrap();
         assert_eq!(f.stream, out);
         assert!(matches!(f.payload, Payload::Text(ref s) if s == "x"));
         h.abort();
+    }
+
+    #[tokio::test]
+    async fn passthrough_returns_cancelled_on_cancel() {
+        let cancel = CancellationToken::new();
+        let (_tx, _bus, _out, _rx, h) = spawn(cancel.clone());
+        cancel.cancel();
+        assert!(matches!(h.await.unwrap(), Err(StageError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn passthrough_returns_ok_when_input_closed() {
+        let (tx, _bus, _out, _rx, h) = spawn(CancellationToken::new());
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
     }
 }
