@@ -347,3 +347,23 @@ async fn failed_missing_source_job_resumes_when_source_returns() {
     assert_eq!(node.lease_holders(&SourceId("file0".into())).len(), 1);
     assert_eq!(on_disk(dir.path(), &id).state, JobState::Running);
 }
+
+#[tokio::test]
+async fn duplicate_source_ids_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_a, pa) = source(dir.path());
+    let (_b, pb) = source(dir.path());
+    match Node::open(cfg(dir.path()), registry(), vec![pa.clone(), pb.clone()]).await {
+        Err(NodeError::DuplicateSource(s)) => assert_eq!(s, SourceId("file0".into())),
+        Err(e) => panic!("expected DuplicateSource, got {e:?}"),
+        Ok(_) => panic!("expected DuplicateSource, got a node"),
+    }
+    let node = Node::open(cfg(dir.path()), registry(), vec![pa])
+        .await
+        .unwrap();
+    match node.add_port(pb) {
+        Err(NodeError::DuplicateSource(s)) => assert_eq!(s, SourceId("file0".into())),
+        other => panic!("expected DuplicateSource, got {other:?}"),
+    }
+    assert_eq!(node.ports().len(), 1);
+}

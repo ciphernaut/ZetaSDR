@@ -361,7 +361,7 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
         NodeError::UnknownJob(j) => unknown_job(node, &j),
         NodeError::Graph(detail) => OpError::Graph { detail },
         NodeError::Lease(l) => lease_error(l),
-        e @ NodeError::Io(_) => other(e),
+        e @ (NodeError::Io(_) | NodeError::DuplicateSource(_)) => other(e),
     }
 }
 

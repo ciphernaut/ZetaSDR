@@ -28,6 +28,24 @@ pub struct Cli {
     pub command: Command,
 }
 
+impl Cli {
+    /// Parse the command line, rejecting a `--source-file` id given twice.
+    pub fn try_parse_checked() -> Result<Self, clap::Error> {
+        use clap::CommandFactory;
+        let cli = Self::try_parse()?;
+        let mut seen = std::collections::HashSet::new();
+        for (id, _) in &cli.source_files {
+            if !seen.insert(id) {
+                return Err(Self::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    format!("--source-file id {id:?} given more than once"),
+                ));
+            }
+        }
+        Ok(cli)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Sources attached to the node

@@ -8,7 +8,6 @@ mod serve_lock;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser;
 use zeta_core::ops::{Op, OpError};
 
 /// Time a one-shot `job start` keeps the node up so the first blocks flow.
@@ -21,7 +20,7 @@ const RING_POLL: Duration = Duration::from_millis(20);
 #[tokio::main]
 async fn main() -> ExitCode {
     // Usage errors exit 1, not clap's 2: exit 2 is reserved for `OpError`.
-    let cli = match cli::Cli::try_parse() {
+    let cli = match cli::Cli::try_parse_checked() {
         Ok(c) => c,
         Err(e) => {
             let _ = e.print();

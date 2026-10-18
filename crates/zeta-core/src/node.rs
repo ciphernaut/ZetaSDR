@@ -41,6 +41,8 @@ pub enum NodeError {
     UnknownSource(SourceId),
     #[error("unknown job {}", .0.0)]
     UnknownJob(JobId),
+    #[error("source {} is already attached", .0.0)]
+    DuplicateSource(SourceId),
     #[error(transparent)]
     Graph(#[from] GraphError),
     #[error(transparent)]
@@ -140,7 +142,8 @@ impl Node {
     /// and creation time): one whose source is absent or cannot be resumed is
     /// kept as `Failed`. Without `cfg.resume` every record
     /// is loaded as persisted, untouched. `open` itself fails only on
-    /// state-directory I/O.
+    /// state-directory I/O and on two ports sharing a source id
+    /// (`DuplicateSource`).
     pub async fn open(
         cfg: NodeConfig,
         registry: StageRegistry,
@@ -170,7 +173,7 @@ impl Node {
             load_errors,
         };
         for port in ports {
-            node.add_port(port);
+            node.add_port(port)?;
         }
         for rec in records {
             if !resume || !node.resumable(&rec) {
@@ -225,13 +228,20 @@ impl Node {
     }
 
     /// Attach a port and start feeding its blocks into that source's ring.
+    /// A second port with an attached source's id is `DuplicateSource`.
     /// Does not resume jobs.
-    pub fn add_port(&self, port: Arc<dyn Port>) {
+    pub fn add_port(&self, port: Arc<dyn Port>) -> Result<(), NodeError> {
         let inner = &self.inner;
         let source = port.id().clone();
-        let rx = port.subscribe();
-        inner.ports.write().unwrap().insert(source.clone(), port);
-        tokio::spawn(feed_ring(inner.clone(), source, rx));
+        {
+            let mut ports = inner.ports.write().unwrap();
+            if ports.contains_key(&source) {
+                return Err(NodeError::DuplicateSource(source));
+            }
+            ports.insert(source.clone(), port.clone());
+        }
+        tokio::spawn(feed_ring(inner.clone(), source, port.subscribe()));
+        Ok(())
     }
 
     /// Register a knowledge provider; `KnowledgeLookup` queries all of them.

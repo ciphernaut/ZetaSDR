@@ -205,3 +205,26 @@ fn mutating_one_shot_refused_while_serve_lock_held() {
     std::fs::write(state.join("serve.lock"), "4194305").unwrap();
     zeta(dir.path(), &start).assert().success();
 }
+
+#[test]
+fn repeated_source_file_id_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = write_tone(dir.path());
+    let tone = format!("tone={}", meta.display());
+    Command::cargo_bin("zeta")
+        .unwrap()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args([
+            "--source-file",
+            &tone,
+            "--source-file",
+            &tone,
+            "source",
+            "list",
+        ])
+        .assert()
+        .code(1)
+        .stderr(contains("tone"))
+        .stderr(contains("more than once"));
+}
