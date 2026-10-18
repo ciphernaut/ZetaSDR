@@ -15,7 +15,7 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{StreamId, StreamKind};
 
 use crate::util::hann;
-use crate::{frame_span, run_map};
+use crate::{Input, frame_span, run_map};
 
 /// Floor added to linear power before the dB conversion.
 const DB_FLOOR: f32 = 1e-20;
@@ -193,7 +193,13 @@ impl Stage for FftStage {
         };
         let size = p.size as usize;
         let backend = self.backend.clone();
-        run_map(inputs, bus, cancel, move |frame| {
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    return Ok(Vec::new());
+                }
+            };
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed("fft stage expects iq frames".into()));
             };

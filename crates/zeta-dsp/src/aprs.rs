@@ -14,7 +14,7 @@ use zeta_core::types::{StreamId, StreamKind};
 
 use crate::afsk::Afsk1200Demod;
 use crate::ax25::{HdlcDeframer, parse_ax25_ui};
-use crate::run_map;
+use crate::{Input, run_map};
 
 /// `aprs_decode` takes no parameters.
 #[derive(JsonSchema, Serialize, Deserialize)]
@@ -77,7 +77,14 @@ impl Stage for AprsDecodeStage {
             return Err(StageError::Failed("expected 1 output".into()));
         };
         let mut dec: Option<Decoder> = None;
-        run_map(inputs, bus, cancel, move |frame| {
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    dec = None;
+                    return Ok(Vec::new());
+                }
+            };
             let Payload::Audio {
                 sample_rate_hz,
                 samples,
@@ -255,5 +262,38 @@ mod tests {
         assert!(serde_json::from_value::<AprsParams>(serde_json::json!({})).is_ok());
         assert!(serde_json::from_value::<AprsParams>(serde_json::json!({"x": 1})).is_err());
         let _ = s.spec();
+    }
+
+    fn packet_audio(src: &str) -> Vec<f32> {
+        let frame = ax25_ui_frame(src, "APRS", &[], b">x");
+        afsk1200_modulate(&nrzi_encode(&hdlc_frame_bits(&frame, 32, 4)), 48_000)
+    }
+
+    #[tokio::test]
+    async fn aprs_lag_mid_packet_discards_partial() {
+        let (tx, mut rx_out, h) = spawn(serde_json::json!({}));
+        // Packet AAA is cut in two by a lag; its second half must not complete it.
+        let a = packet_audio("VK3AAA");
+        let (a1, a2) = a.split_at(a.len() * 2 / 3);
+        tx.send(audio_frame(a1.to_vec(), 48_000)).unwrap();
+        // Let the stage consume the first half before the flood.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Capacity 64: one overwritten frame, then AAA's tail, silence, packet BBB.
+        tx.send(audio_frame(vec![0.0; 480], 48_000)).unwrap();
+        tx.send(audio_frame(a2.to_vec(), 48_000)).unwrap();
+        for _ in 0..62 {
+            tx.send(audio_frame(vec![0.0; 480], 48_000)).unwrap();
+        }
+        tx.send(audio_frame(packet_audio("VK3BBB"), 48_000))
+            .unwrap();
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        let f = rx_out.recv().await.unwrap();
+        let Payload::Event(v) = &f.payload else {
+            panic!("expected an event")
+        };
+        assert_eq!(v["src"], "VK3BBB");
+        assert!(rx_out.try_recv().is_err(), "the cut packet yields nothing");
     }
 }

@@ -18,7 +18,7 @@ use zeta_core::types::{Baud, Hz, Provenance, StreamId, StreamKind, Timestamp};
 
 use crate::channel::extract_offset;
 use crate::fft::{Window, power_spectrum_db};
-use crate::{frame_span, run_map};
+use crate::{Input, frame_span, run_map};
 
 /// FFT size of every spectrum taken here.
 const SIZE: usize = 1024;
@@ -575,7 +575,15 @@ impl Stage for MeasureStage {
         // Window under construction: first frame's provenance, t0, rate, centre.
         let mut window: Option<(Provenance, Timestamp, u64, u64)> = None;
         let mut buf: Vec<Complex<f32>> = Vec::new();
-        run_map(inputs, bus, cancel, move |frame| {
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    window = None;
+                    buf.clear();
+                    return Ok(Vec::new());
+                }
+            };
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed("measure stage expects iq frames".into()));
             };
@@ -917,5 +925,63 @@ mod tests {
         );
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
+    }
+
+    #[tokio::test]
+    async fn measure_stage_discards_window_on_lag() {
+        use zeta_core::port::IqBlock;
+        use zeta_core::types::{Provenance, SourceId, Span, Timestamp};
+        let prov = Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(1),
+            },
+        };
+        let bus = Arc::new(StreamBus::new(8));
+        let out = bus.register(StreamKind::Event, prov.clone());
+        let mut rx_out = bus.subscribe(&out).unwrap();
+        let (tx, rx_in) = broadcast::channel(8);
+        let h = tokio::spawn(async move {
+            MeasureStage::new()
+                .run(
+                    serde_json::json!({"bandwidth_hz": null}),
+                    vec![rx_in],
+                    vec![out],
+                    bus,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let mut iq = vec![Complex::new(0.0f32, 0.0); 14 * 4_800];
+        awgn(&mut iq, 0.0, 3);
+        let mk = |i: u64, block: &[Complex<f32>]| {
+            Frame::new(
+                StreamId::new(),
+                prov.clone(),
+                Payload::Iq(IqBlock {
+                    t0: Timestamp(1_000_000_000 + i * 100_000_000),
+                    sample_rate_hz: Hz(RATE),
+                    center_hz: Hz(CENTER),
+                    samples: block.to_vec().into(),
+                }),
+            )
+        };
+        let blocks: Vec<_> = iq.chunks(4_800).collect();
+        // 0.5 s held, then a lag, then 0.8 s more with contiguous timestamps:
+        // 1.3 s in total, but only if the lag did not discard the window.
+        for (i, b) in blocks.iter().enumerate().take(5) {
+            tx.send(mk(i as u64, b)).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.send(mk(5, blocks[5])).unwrap(); // overwritten
+        for i in 5..13 {
+            tx.send(mk(i, blocks[i as usize])).unwrap();
+        }
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        assert!(rx_out.try_recv().is_err(), "no event spans the lag");
     }
 }
