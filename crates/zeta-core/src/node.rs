@@ -135,8 +135,10 @@ fn load(dir: &Path) -> Result<(Vec<JobRecord>, Vec<String>), NodeError> {
 
 impl Node {
     /// Open the node on `cfg.state_dir`, attach `ports`, and, when
-    /// `cfg.resume`, resume every `Running` job: one whose source is absent or
-    /// cannot be resumed is kept as `Failed`. Without `cfg.resume` every record
+    /// `cfg.resume`, resume every `Running` job and every job that `Failed`
+    /// because its source was absent and is now attached (same id, context
+    /// and creation time): one whose source is absent or cannot be resumed is
+    /// kept as `Failed`. Without `cfg.resume` every record
     /// is loaded as persisted, untouched. `open` itself fails only on
     /// state-directory I/O.
     pub async fn open(
@@ -171,7 +173,7 @@ impl Node {
             node.add_port(port);
         }
         for rec in records {
-            if !resume || rec.state != JobState::Running {
+            if !resume || !node.resumable(&rec) {
                 node.inner.jobs.lock().unwrap().insert(
                     rec.id.clone(),
                     JobEntry {
@@ -201,6 +203,20 @@ impl Node {
             }
         }
         Ok(node)
+    }
+
+    /// Whether `open` relaunches `rec`: it is `Running`, or it `Failed` only
+    /// because its source was absent and that source is now attached.
+    fn resumable(&self, rec: &JobRecord) -> bool {
+        match &rec.state {
+            JobState::Running => true,
+            JobState::Failed { reason } => {
+                reason.starts_with("source ")
+                    && reason.ends_with(" not present")
+                    && self.port(&rec.source).is_some()
+            }
+            _ => false,
+        }
     }
 
     /// Files in `state_dir/jobs` that could not be read as a `JobRecord`.

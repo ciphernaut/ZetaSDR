@@ -315,3 +315,35 @@ async fn stop_persist_failure_leaves_job_running() {
     node.job_stop(&id).await.unwrap();
     assert_eq!(node.job_list()[0].state, JobState::Stopped);
 }
+
+#[tokio::test]
+async fn failed_missing_source_job_resumes_when_source_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    src.start();
+    let id = start_job(&node).await;
+    node.job_context_merge(&id, serde_json::json!({"note": "kept"}))
+        .unwrap();
+    let created = node.job_list()[0].created_ns;
+    drop(node);
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    assert!(matches!(node.job_list()[0].state, JobState::Failed { .. }));
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    let list = node.job_list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, id);
+    assert_eq!(list[0].state, JobState::Running);
+    assert_eq!(list[0].created_ns, created);
+    assert_eq!(node.job_context(&id).unwrap()["note"], "kept");
+    assert_eq!(node.lease_holders(&SourceId("file0".into())).len(), 1);
+    assert_eq!(on_disk(dir.path(), &id).state, JobState::Running);
+}
