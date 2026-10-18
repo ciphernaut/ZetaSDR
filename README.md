@@ -128,8 +128,10 @@ they belong to the serving node and are rejected. Source ids are unique across t
   (`max_bandwidth_hz` 12000, so a wider job is refused `out_of_range` naming `bandwidth_hz`).
   `remote` and `push`: it connects on the first tune and holds one of the Kiwi's user slots
   while tuned, so a one-shot command holds the slot only while that process runs. The password
-  is never printed, but like `--secret` it is visible in `ps` to every user of the
-  machine.
+  is never printed, but like `--secret` it is visible in `ps` to every user of the machine;
+  leave out `/PASSWORD` and set `ZETA_KIWI_PASSWORD_<ID>` instead (`ID` upper-cased, other
+  characters as `_`, so `kiwi-0` reads `ZETA_KIWI_PASSWORD_KIWI_0`). The flag wins when both
+  are given.
 - **SoapySDR**, `--source-soapy ID=ARGS` (`ARGS` such as `driver=hackrf,serial=...`): a local
   device, `push` false (the node reads it). Gains are left at the driver's defaults (no gain
   operation yet), and a job centred exactly on the tuned frequency sees the device's DC spike.

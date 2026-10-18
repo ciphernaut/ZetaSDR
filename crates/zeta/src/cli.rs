@@ -27,7 +27,8 @@ pub struct Cli {
     #[arg(long = "source-soapy", global = true, value_name = "ID=ARGS", value_parser = sources::parse_soapy)]
     source_soapy: Vec<SourceSpec>,
     /// Register a KiwiSDR as source <ID> (repeatable). The password is never printed,
-    /// but like --secret it is visible in `ps`
+    /// but like --secret it is visible in `ps`; prefer ZETA_KIWI_PASSWORD_<ID> (ID
+    /// upper-cased, other characters as `_`), used when there is no /PASSWORD
     #[arg(
         long = "source-kiwi",
         global = true,

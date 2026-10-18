@@ -2,7 +2,9 @@
 //! one [`SourceSpec`]; `--plugin` to a [`PluginSpec`].
 //!
 //! A Kiwi password never appears in a `SourceSpec`'s `Debug` or `Display`, nor in a parse
-//! error: everything after the `/` is replaced by `<redacted>`.
+//! error: everything after the `/` is replaced by `<redacted>`. Without a `/PASSWORD` part
+//! the password comes from `ZETA_KIWI_PASSWORD_<ID>` (see [`kiwi_password_env`]), which
+//! keeps it out of `ps`.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -92,8 +94,31 @@ fn redact_kiwi(s: &str) -> String {
     }
 }
 
-/// `ID=HOST:PORT[/PASSWORD]`; the port is required. Errors never contain the password.
+/// The variable holding source `id`'s Kiwi password: `ZETA_KIWI_PASSWORD_<ID>`, `ID`
+/// upper-cased with every non-alphanumeric character mapped to `_`.
+pub fn kiwi_password_env(id: &str) -> String {
+    let tail: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("ZETA_KIWI_PASSWORD_{tail}")
+}
+
+/// `ID=HOST:PORT[/PASSWORD]`; the port is required. Without `/PASSWORD` the password is
+/// [`kiwi_password_env`] when set and non-empty; the flag wins when both are given.
+/// Errors never contain the password.
 pub fn parse_kiwi(s: &str) -> Result<SourceSpec, String> {
+    parse_kiwi_with(s, |k| std::env::var(k).ok())
+}
+
+/// [`parse_kiwi`] with the environment lookup given.
+fn parse_kiwi_with(s: &str, env: impl Fn(&str) -> Option<String>) -> Result<SourceSpec, String> {
     let bad = || format!("expected ID=HOST:PORT[/PASSWORD], got {:?}", redact_kiwi(s));
     let (id, rest) = split_id(s).ok_or_else(bad)?;
     let (addr, password) = match rest.split_once('/') {
@@ -106,6 +131,7 @@ pub fn parse_kiwi(s: &str) -> Result<SourceSpec, String> {
     if host.is_empty() || port == 0 {
         return Err(bad());
     }
+    let password = password.or_else(|| env(&kiwi_password_env(id)).filter(|p| !p.is_empty()));
     Ok(SourceSpec::Kiwi {
         id: id.into(),
         host: host.into(),
@@ -206,6 +232,30 @@ mod tests {
         for bad in ["Gain=x", "2g=x", "g-x=x", "gain=", "=x", "gain"] {
             assert!(parse_plugin(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn kiwi_password_env_name() {
+        assert_eq!(kiwi_password_env("kiwi0"), "ZETA_KIWI_PASSWORD_KIWI0");
+        assert_eq!(
+            kiwi_password_env("my-kiwi.2"),
+            "ZETA_KIWI_PASSWORD_MY_KIWI_2"
+        );
+    }
+
+    #[test]
+    fn kiwi_password_from_env_when_flag_has_none() {
+        let env = |k: &str| (k == "ZETA_KIWI_PASSWORD_MY_KIWI").then(|| "hunter2".to_owned());
+        let s = parse_kiwi_with("my-kiwi=h:1", env).unwrap();
+        assert_eq!(s, kiwi("my-kiwi", "h", 1, Some("hunter2")));
+        assert_eq!(s.to_string(), "--source-kiwi my-kiwi=h:1");
+        assert!(!format!("{s:?}").contains("hunter2"));
+        // The flag wins over the environment.
+        let s = parse_kiwi_with("my-kiwi=h:1/flagpw", env).unwrap();
+        assert_eq!(s, kiwi("my-kiwi", "h", 1, Some("flagpw")));
+        // An empty variable is no password.
+        let empty = |_: &str| Some(String::new());
+        assert_eq!(parse_kiwi_with("k=h:1", empty), Ok(kiwi("k", "h", 1, None)));
     }
 
     #[test]

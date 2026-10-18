@@ -659,3 +659,44 @@ async fn job_start_on_fake_kiwi_measures() {
     );
     assert!(fake.connections() >= 1);
 }
+
+/// `ZETA_KIWI_PASSWORD_<ID>` supplies the password when the flag has none: it reaches the
+/// Kiwi's `SET auth` and is printed nowhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kiwi_password_from_env_reaches_kiwi_and_is_never_printed() {
+    use zeta_source_kiwi::testing::{FakeKiwi, FakeScript};
+    let fake = FakeKiwi::start(FakeScript::default()).await;
+    let port = fake.addr().port();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let out = tokio::task::spawn_blocking(move || {
+        zeta_bin()
+            .env("ZETA_KIWI_PASSWORD_MY_KIWI", "hunter2")
+            .arg("--state-dir")
+            .arg(state)
+            .arg("--source-kiwi")
+            .arg(format!("my-kiwi=127.0.0.1:{port}"))
+            .args(["job", "start", "--kind", "measure", "--source", "my-kiwi"])
+            .args(["--center-hz", "7100000", "--bandwidth-hz", "10000"])
+            .args(["--then-tail", "1,3000"])
+            .assert()
+            .success()
+            .get_output()
+            .clone()
+    })
+    .await
+    .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all.contains("hunter2"), "password printed: {all}");
+    assert!(
+        fake.commands()
+            .iter()
+            .any(|c| c == "SET auth t=kiwi p=hunter2"),
+        "{:?}",
+        fake.commands()
+    );
+}
