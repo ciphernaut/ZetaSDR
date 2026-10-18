@@ -2894,14 +2894,17 @@ name = "zeta-ws"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "zeta-client",
  "zeta-core",
  "zeta-source-file",
+ "zeta-ws",
 ]
 
 [[package]]
