@@ -32,7 +32,7 @@
 //! - `text`: payload is the string, `B = 0`.
 //! - `video` and `sink` are refused in protocol 1.
 //!
-//! `B` must match `N`. Every length is checked before anything is allocated or indexed: a
+//! `B` must match `N`, and an `iq` or `audio` `sample_rate_hz` must not be 0. Every length is checked before anything is allocated or indexed: a
 //! malformed message is a [`WireError`] naming what was wrong, never a panic.
 
 use std::sync::Arc;
@@ -87,6 +87,8 @@ pub enum WireError {
     },
     #[error("{} frames are not carried by plugin protocol 1", kind_name(*.0))]
     KindNotCarried(StreamKind),
+    #[error("{} frame has sample_rate_hz 0", kind_name(*.0))]
+    ZeroRate(StreamKind),
     #[error("bad json: {0}")]
     Json(String),
     #[error("i/o: {0}")]
@@ -198,8 +200,8 @@ pub enum Message {
 }
 
 /// Encode a control message: compact JSON and `\n`. Compact JSON escapes every newline
-/// inside strings, so the only `0x0A` is the terminator. Length is not checked here: a
-/// host-built `run` whose params exceed [`MAX_CONTROL`] will be refused by the plugin.
+/// inside strings, so the only `0x0A` is the terminator. Length is not checked here: the
+/// sender checks the line against [`MAX_CONTROL`] (the host refuses to send a longer `run`).
 pub fn encode_control(c: &Control) -> Vec<u8> {
     // Serialising these types cannot fail: every map key is a string.
     let mut line = serde_json::to_vec(c).expect("control messages always serialise");
@@ -353,16 +355,17 @@ async fn read_control<R: AsyncRead + Unpin>(r: &mut R) -> Result<Control, WireEr
                 want: line.len() + 1,
             });
         }
-        if b[0] == b'\n' {
-            break;
-        }
-        if line.len() == MAX_CONTROL {
-            // MAX_CONTROL bytes and still no newline: at least one byte too long.
+        if line.len() >= MAX_CONTROL {
+            // MAX_CONTROL bytes held and one more read (the newline or not): the line,
+            // newline included, is at least MAX_CONTROL + 1 bytes.
             return Err(WireError::TooLong {
                 what: "control line",
                 len: MAX_CONTROL + 1,
                 max: MAX_CONTROL,
             });
+        }
+        if b[0] == b'\n' {
+            break;
         }
         line.push(b[0]);
     }
@@ -396,11 +399,17 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, WireError>
     let (shape, samples, width) = match s.kind {
         StreamKind::Iq => {
             let p: IqSummary = serde_json::from_value(s.payload).map_err(json_err)?;
+            if p.sample_rate_hz == 0 {
+                return Err(WireError::ZeroRate(StreamKind::Iq));
+            }
             let n = p.samples;
             (Shape::Iq(p), n, 8usize)
         }
         StreamKind::Audio => {
             let p: AudioSummary = serde_json::from_value(s.payload).map_err(json_err)?;
+            if p.sample_rate_hz == 0 {
+                return Err(WireError::ZeroRate(StreamKind::Audio));
+            }
             let n = p.samples;
             (Shape::Audio(p), n, 4)
         }
@@ -887,6 +896,32 @@ mod tests {
             read_all(&at).await.unwrap_err(),
             WireError::Json(_)
         ));
+        // One byte over: 65 536 content bytes and the newline (65 537 in all).
+        let mut over = vec![b' '; MAX_CONTROL];
+        over[0] = b'{';
+        over[MAX_CONTROL - 1] = b'}';
+        over.push(b'\n');
+        assert_eq!(
+            read_all(&over).await.unwrap_err(),
+            WireError::TooLong {
+                what: "control line",
+                len: MAX_CONTROL + 1,
+                max: MAX_CONTROL
+            }
+        );
+        // A rate of zero is refused for iq and audio.
+        let mut h = iq_header(0);
+        h["payload"]["sample_rate_hz"] = json!(0);
+        assert_eq!(
+            read_all(&raw_frame(&h, 0, &[])).await.unwrap_err(),
+            WireError::ZeroRate(StreamKind::Iq)
+        );
+        let mut h = iq_header(0);
+        h["kind"] = json!("audio");
+        h["payload"] = json!({"sample_rate_hz":0,"samples":0,"peak":null});
+        let err = read_all(&raw_frame(&h, 0, &[])).await.unwrap_err();
+        assert_eq!(err, WireError::ZeroRate(StreamKind::Audio));
+        assert_eq!(err.to_string(), "audio frame has sample_rate_hz 0");
         // A text frame with a body, an event with a sample count it lacks.
         let mut text = iq_header(0);
         text["kind"] = json!("text");
