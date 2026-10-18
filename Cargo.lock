@@ -1325,6 +1325,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "zeta-core",
  "zeta-source-file",
 ]
