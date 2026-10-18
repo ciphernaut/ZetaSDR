@@ -1,0 +1,470 @@
+//! The SoapySDR [`Port`]: one receive channel read on a dedicated thread.
+//!
+//! SoapySDR reads block, so each active stream is owned by a `std::thread`
+//! named `soapy-<id>` that reads blocks of `max(16 384, rate / 100)` samples
+//! with a 100 ms timeout and sends them on the source's broadcast. Blocks are
+//! stamped from the sample count: `t0 = anchor + count · 1e9 / rate` (integer
+//! ns), `anchor` being the wall clock when the stream was activated. An
+//! overflow (samples lost in the driver) or a retune re-anchors at
+//! `max(now, end of the last block)`, so `t0` jumps forward and never back.
+//!
+//! Device gains are left at the driver's defaults; a `source.set_gain`
+//! operation is future work.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use num_complex::Complex;
+use tokio::sync::{broadcast, oneshot};
+use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
+use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
+
+use crate::caps::{capabilities, pick_format, pick_rate};
+use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
+
+/// Blocks buffered per receiver.
+const BROADCAST_CAPACITY: usize = 64;
+/// Smallest read, in samples.
+const MIN_BLOCK: usize = 16_384;
+/// Timeout of one blocking read.
+const READ_TIMEOUT_US: i64 = 100_000;
+/// Consecutive read timeouts (1 s without samples) that fault the port.
+const QUIET_READS: u32 = 10;
+/// How long `tune` waits for the reader thread to apply a retune.
+const RETUNE_ACK: Duration = Duration::from_secs(2);
+/// Window of [`SoapySource::measured_rate_hz`].
+const RATE_WINDOW: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct Status {
+    fault: Option<String>,
+    current: Option<Tuning>,
+    overflows: u64,
+    timeouts: u64,
+    /// `(when, samples)` per block over the last [`RATE_WINDOW`].
+    window: VecDeque<(Instant, u64)>,
+}
+
+/// A retune handed to the reader thread; acknowledged with the device's
+/// actual sample rate.
+struct Retune {
+    center_hz: u64,
+    rate_hz: u64,
+    ack: oneshot::Sender<Result<u64, String>>,
+}
+
+/// A running reader thread; dropping it asks the thread to stop (it exits
+/// after the read in progress, at most 100 ms, and deactivates the stream).
+struct Reader {
+    /// Requested centre and picked rate, for the unchanged-band check.
+    band: (u64, u64),
+    cmds: std_mpsc::Sender<Retune>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Reader {
+    fn alive(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A SoapySDR device's first receive channel as a push [`Port`]. Nothing
+/// touches the device until the first `tune`; dropping the source stops its
+/// reader thread. The broadcast lives as long as the source, so receivers
+/// taken before a fault (the node's ring feeder) resume after a retune; a
+/// reader's end is reported through [`Port::fault`].
+pub struct SoapySource {
+    id: SourceId,
+    caps: Capabilities,
+    dev: Arc<dyn SoapyDevice>,
+    freq: Vec<RangeHz>,
+    rates: Vec<RangeHz>,
+    format: WireFormat,
+    tx: broadcast::Sender<IqBlock>,
+    status: Arc<Mutex<Status>>,
+    reader: Mutex<Option<Reader>>,
+    /// Serialises `tune`, which may wait on the reader thread.
+    gate: tokio::sync::Mutex<()>,
+}
+
+impl SoapySource {
+    /// Query the device's ranges and formats once; no streaming yet.
+    pub fn with_device(id: SourceId, dev: Arc<dyn SoapyDevice>) -> Result<Self, PortError> {
+        let io = |e: String| PortError::Io(format!("soapy {}: {e}", dev.driver_key()));
+        let caps = capabilities(dev.as_ref()).map_err(io)?;
+        let freq = dev.frequency_ranges().map_err(io)?;
+        let rates = dev.sample_rate_ranges().map_err(io)?;
+        let (native, supported) = dev.formats().map_err(io)?;
+        let format = pick_format(native, &supported).map_err(PortError::Unsupported)?;
+        Ok(Self {
+            id,
+            caps,
+            dev,
+            freq,
+            rates,
+            format,
+            tx: broadcast::channel(BROADCAST_CAPACITY).0,
+            status: Arc::default(),
+            reader: Mutex::new(None),
+            gate: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Read overflows (samples dropped by the driver) since the source opened.
+    pub fn overflows(&self) -> u64 {
+        self.status.lock().unwrap().overflows
+    }
+
+    /// Reads that timed out (100 ms without samples) since the source opened.
+    pub fn read_timeouts(&self) -> u64 {
+        self.status.lock().unwrap().timeouts
+    }
+
+    /// Samples per second actually delivered over the last 10 s, for reports;
+    /// the capabilities stay `Asserted`.
+    pub fn measured_rate_hz(&self) -> Option<f64> {
+        let st = self.status.lock().unwrap();
+        let (first, last) = (st.window.front()?, st.window.back()?);
+        let secs = last.0.duration_since(first.0).as_secs_f64();
+        let n: u64 = st.window.iter().skip(1).map(|(_, n)| n).sum();
+        (secs > 0.0).then(|| n as f64 / secs)
+    }
+
+    fn fail(&self, msg: String) -> PortError {
+        self.status.lock().unwrap().fault = Some(msg.clone());
+        PortError::Io(msg)
+    }
+
+    /// The answer on the live, unfaulted reader, retuning it when the band
+    /// changed; `Ok(None)` when a new stream is needed.
+    async fn retune_live(&self, center_hz: u64, rate_hz: u64) -> Result<Option<Tuning>, PortError> {
+        let ack = {
+            let reader = self.reader.lock().unwrap();
+            let Some(r) = reader.as_ref().filter(|r| r.alive()) else {
+                return Ok(None);
+            };
+            let st = self.status.lock().unwrap();
+            if st.fault.is_some() {
+                return Ok(None);
+            }
+            if r.band == (center_hz, rate_hz) {
+                return Ok(st.current);
+            }
+            let (ack, done) = oneshot::channel();
+            let cmd = Retune {
+                center_hz,
+                rate_hz,
+                ack,
+            };
+            if r.cmds.send(cmd).is_err() {
+                return Ok(None);
+            }
+            done
+        };
+        let actual = match tokio::time::timeout(RETUNE_ACK, ack).await {
+            Ok(Ok(Ok(actual))) => actual,
+            Ok(Ok(Err(m))) => return Err(PortError::Io(m)),
+            Ok(Err(_)) => return Ok(None),
+            Err(_) => return Err(PortError::Io("soapy retune timed out".into())),
+        };
+        if let Some(r) = self.reader.lock().unwrap().as_mut() {
+            r.band = (center_hz, rate_hz);
+        }
+        let cur = Tuning {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(actual),
+        };
+        self.status.lock().unwrap().current = Some(cur);
+        Ok(Some(cur))
+    }
+
+    /// Configure and activate a new stream, then start its reader thread.
+    fn open_stream(&self, center_hz: u64, rate_hz: u64) -> Result<Tuning, PortError> {
+        let dev = &self.dev;
+        dev.set_sample_rate(rate_hz as f64)
+            .map_err(|e| self.fail(format!("soapy set_sample_rate({rate_hz}): {e}")))?;
+        dev.set_frequency(center_hz as f64)
+            .map_err(|e| self.fail(format!("soapy set_frequency({center_hz}): {e}")))?;
+        let actual = dev
+            .sample_rate()
+            .map_err(|e| self.fail(format!("soapy sample_rate: {e}")))?
+            .round() as u64;
+        if actual == 0 {
+            return Err(self.fail("soapy sample_rate: device reports 0 Hz".into()));
+        }
+        let mut rx = dev
+            .open_rx(self.format)
+            .map_err(|e| self.fail(format!("soapy open_rx({:?}): {e}", self.format)))?;
+        rx.activate()
+            .map_err(|e| self.fail(format!("soapy activate: {e}")))?;
+        let cur = Tuning {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(actual),
+        };
+        {
+            // Cleared before the thread starts, so a fault it raises sticks.
+            let mut st = self.status.lock().unwrap();
+            st.fault = None;
+            st.current = Some(cur);
+            st.window.clear();
+        }
+        let (cmds, cmds_rx) = std_mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = Ctx {
+            dev: self.dev.clone(),
+            tx: self.tx.clone(),
+            status: self.status.clone(),
+            stop: stop.clone(),
+            cmds: cmds_rx,
+        };
+        let handle = std::thread::Builder::new()
+            .name(format!("soapy-{}", self.id.0))
+            .spawn(move || run(ctx, rx, center_hz, actual))
+            .map_err(|e| self.fail(format!("soapy reader thread: {e}")))?;
+        *self.reader.lock().unwrap() = Some(Reader {
+            band: (center_hz, rate_hz),
+            cmds,
+            stop,
+            handle: Some(handle),
+        });
+        Ok(cur)
+    }
+}
+
+fn out_of_range(field: &'static str, value: u64, min: u64, max: u64) -> PortError {
+    PortError::OutOfRange {
+        field,
+        value,
+        min,
+        max,
+        suggested: None,
+    }
+}
+
+fn claim(c: &Claim<Hz>) -> u64 {
+    c.value().0
+}
+
+#[async_trait]
+impl Port for SoapySource {
+    fn id(&self) -> &SourceId {
+        &self.id
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    /// Validates the centre against the device's ranges and picks the smallest
+    /// supported rate at least `bandwidth_hz` wide. An unchanged band on a
+    /// live, unfaulted reader is a no-op; a changed one is applied by the
+    /// reader between reads; otherwise (first tune, fault, reader gone) the
+    /// stream is (re)opened, which clears the fault. Returns the capture band:
+    /// the requested centre, the device's actual sample rate wide.
+    async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        let (center, bw) = (t.center_hz.0, t.bandwidth_hz.0);
+        let (fmin, fmax) = (claim(&self.caps.tune_min_hz), claim(&self.caps.tune_max_hz));
+        let c = center as f64;
+        if !self.freq.iter().any(|r| r.min_hz <= c && c <= r.max_hz) {
+            return Err(out_of_range("center_hz", center, fmin, fmax));
+        }
+        let max_rate = claim(&self.caps.max_bandwidth_hz);
+        let rate = (bw > 0)
+            .then(|| pick_rate(&self.rates, bw))
+            .flatten()
+            .ok_or_else(|| out_of_range("bandwidth_hz", bw, 1, max_rate))?;
+
+        let _gate = self.gate.lock().await;
+        if let Some(cur) = self.retune_live(center, rate).await? {
+            return Ok(cur);
+        }
+        // A new stream: stop the old reader (finished or faulted) and wait for
+        // it to deactivate its stream before the device is reconfigured.
+        let old = self.reader.lock().unwrap().take();
+        if let Some(mut old) = old {
+            let handle = old.handle.take();
+            drop(old);
+            if let Some(h) = handle {
+                let _ = tokio::task::spawn_blocking(move || h.join()).await;
+            }
+        }
+        self.status.lock().unwrap().current = None;
+        self.open_stream(center, rate)
+    }
+
+    fn current(&self) -> Option<Tuning> {
+        self.status.lock().unwrap().current
+    }
+
+    fn subscribe(&self) -> IqReceiver {
+        self.tx.subscribe()
+    }
+
+    fn fault(&self) -> Option<String> {
+        self.status.lock().unwrap().fault.clone()
+    }
+}
+
+/// What the reader thread shares with the source.
+struct Ctx {
+    dev: Arc<dyn SoapyDevice>,
+    tx: broadcast::Sender<IqBlock>,
+    status: Arc<Mutex<Status>>,
+    stop: Arc<AtomicBool>,
+    cmds: std_mpsc::Receiver<Retune>,
+}
+
+impl Ctx {
+    fn fault(&self, m: String) {
+        self.status.lock().unwrap().fault = Some(m);
+    }
+}
+
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+fn block_len(rate_hz: u64) -> usize {
+    MIN_BLOCK.max(usize::try_from(rate_hz / 100).unwrap_or(usize::MAX))
+}
+
+/// Sample-count clock: `t0 = anchor + count · 1e9 / rate`.
+struct Clock {
+    anchor: u64,
+    count: u64,
+    rate: u64,
+}
+
+impl Clock {
+    fn at(&self, count: u64) -> u64 {
+        self.anchor + (u128::from(count) * 1_000_000_000 / u128::from(self.rate)) as u64
+    }
+
+    /// Start counting again from `max(now, end of the last block)`.
+    fn reanchor(&mut self, rate: u64) {
+        self.anchor = now_ns().max(self.at(self.count));
+        self.count = 0;
+        self.rate = rate;
+    }
+}
+
+/// Apply a retune between reads: a rate change restarts the stream.
+fn apply(ctx: &Ctx, rx: &mut dyn SoapyRx, cmd: &Retune, rate: u64) -> Result<u64, String> {
+    if cmd.rate_hz != rate {
+        rx.deactivate()
+            .map_err(|e| format!("soapy deactivate: {e}"))?;
+        ctx.dev
+            .set_sample_rate(cmd.rate_hz as f64)
+            .map_err(|e| format!("soapy set_sample_rate({}): {e}", cmd.rate_hz))?;
+    }
+    ctx.dev
+        .set_frequency(cmd.center_hz as f64)
+        .map_err(|e| format!("soapy set_frequency({}): {e}", cmd.center_hz))?;
+    if cmd.rate_hz == rate {
+        return Ok(rate);
+    }
+    let actual = ctx
+        .dev
+        .sample_rate()
+        .map_err(|e| format!("soapy sample_rate: {e}"))?
+        .round() as u64;
+    if actual == 0 {
+        return Err("soapy sample_rate: device reports 0 Hz".into());
+    }
+    rx.activate().map_err(|e| format!("soapy activate: {e}"))?;
+    Ok(actual)
+}
+
+/// The reader thread. Exits on stop, on no receivers, or with a fault (set
+/// before the stream is deactivated); always deactivates on exit.
+fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, rate: u64) {
+    let mut clock = Clock {
+        anchor: now_ns(),
+        count: 0,
+        rate,
+    };
+    let mut buf = vec![Complex::new(0.0f32, 0.0); block_len(rate)];
+    let mut quiet = 0u32;
+    loop {
+        if ctx.stop.load(Ordering::Relaxed) || ctx.tx.receiver_count() == 0 {
+            break;
+        }
+        if let Ok(cmd) = ctx.cmds.try_recv() {
+            match apply(&ctx, rx.as_mut(), &cmd, clock.rate) {
+                Ok(actual) => {
+                    center = cmd.center_hz;
+                    clock.reanchor(actual);
+                    buf.resize(block_len(actual), Complex::new(0.0, 0.0));
+                    ctx.status.lock().unwrap().window.clear();
+                    let _ = cmd.ack.send(Ok(actual));
+                }
+                Err(m) => {
+                    ctx.fault(m.clone());
+                    let _ = cmd.ack.send(Err(m));
+                    break;
+                }
+            }
+            continue;
+        }
+        match rx.read(&mut buf, READ_TIMEOUT_US) {
+            Ok(n) if n > 0 => {
+                quiet = 0;
+                let t0 = clock.at(clock.count);
+                clock.count += n as u64;
+                {
+                    let mut st = ctx.status.lock().unwrap();
+                    let now = Instant::now();
+                    st.window.push_back((now, n as u64));
+                    while st
+                        .window
+                        .front()
+                        .is_some_and(|(t, _)| now.duration_since(*t) > RATE_WINDOW)
+                    {
+                        st.window.pop_front();
+                    }
+                }
+                let block = IqBlock {
+                    t0: Timestamp(t0),
+                    sample_rate_hz: Hz(clock.rate),
+                    center_hz: Hz(center),
+                    samples: buf[..n].into(),
+                };
+                if ctx.tx.send(block).is_err() {
+                    break;
+                }
+            }
+            // A zero-length read counts as a timeout: no samples arrived.
+            Ok(_) | Err(ReadError::Timeout) => {
+                quiet += 1;
+                ctx.status.lock().unwrap().timeouts += 1;
+                if quiet >= QUIET_READS {
+                    ctx.fault("no samples for 1000 ms (device unplugged?)".into());
+                    break;
+                }
+            }
+            Err(ReadError::Overflow) => {
+                ctx.status.lock().unwrap().overflows += 1;
+                clock.reanchor(clock.rate);
+            }
+            Err(ReadError::Fatal(m)) => {
+                ctx.fault(format!("read failed: {m}"));
+                break;
+            }
+        }
+    }
+    let _ = rx.deactivate();
+}

@@ -17,6 +17,10 @@ zeta-core = { path = "../zeta-core" }
 # soapysdr-sys cannot build without libsoapysdr-dev. See Task 11 notes.
 test-mock = []
 
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros"] }
+
 [dev-dependencies.zeta-source-soapy]
 path = "."
 features = ["test-mock"]

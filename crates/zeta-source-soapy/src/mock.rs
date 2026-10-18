@@ -67,11 +67,21 @@ impl MockDevice {
         self
     }
 
+    /// Append steps to the read script (shared with any open stream).
+    pub fn push_reads(&self, r: Vec<MockRead>) {
+        self.reads.lock().unwrap().extend(r);
+    }
+
     /// Make the named call (`set_frequency`, `set_sample_rate`, `open_rx`,
     /// `activate`) fail once with `msg`; calls are still recorded.
     pub fn fail_on(self, op: &str, msg: &str) -> Self {
         self.fails.lock().unwrap().push((op.into(), msg.into()));
         self
+    }
+
+    /// As [`MockDevice::fail_on`], on a device already shared.
+    pub fn fail_next(&self, op: &str, msg: &str) {
+        self.fails.lock().unwrap().push((op.into(), msg.into()));
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -154,7 +164,9 @@ impl SoapyRx for MockRx {
         self.calls.lock().unwrap().push("deactivate".into());
         Ok(())
     }
-    fn read(&mut self, out: &mut [Complex<f32>], _timeout_us: i64) -> Result<usize, ReadError> {
+    /// An empty script reads as `Timeout` forever. A `Timeout` step blocks for
+    /// `timeout_us`, as a real device does.
+    fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError> {
         let step = self
             .reads
             .lock()
@@ -171,7 +183,11 @@ impl SoapyRx for MockRx {
                 }
                 Ok(n)
             }
-            MockRead::Timeout => Err(ReadError::Timeout),
+            MockRead::Timeout => {
+                let us = u64::try_from(timeout_us).unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_micros(us));
+                Err(ReadError::Timeout)
+            }
             MockRead::Overflow => Err(ReadError::Overflow),
             MockRead::Fatal(m) => Err(ReadError::Fatal(m)),
         }
