@@ -153,6 +153,9 @@ pub enum KnowledgeCmd {
 pub enum Kind {
     Passthrough,
     Spectrum,
+    // Spelled as on the wire, not clap's default `fm-demod`.
+    #[value(name = "fm_demod")]
+    FmDemod,
 }
 
 impl From<Kind> for JobKind {
@@ -160,6 +163,7 @@ impl From<Kind> for JobKind {
         match k {
             Kind::Passthrough => JobKind::Passthrough,
             Kind::Spectrum => JobKind::Spectrum,
+            Kind::FmDemod => JobKind::FmDemod,
         }
     }
 }

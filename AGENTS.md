@@ -47,7 +47,7 @@ CLI: `zeta source ensure --source <id> --center-hz 144800000 --bandwidth-hz 1250
 
 ### job_start
 
-- kind: string (JobKind: passthrough|spectrum)
+- kind: string (JobKind: passthrough|spectrum|fm_demod)
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)

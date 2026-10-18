@@ -782,3 +782,32 @@ fn spectrum_kind_expands_to_single_fft_node() {
         serde_json::json!({"size": 1024, "window": "hann"})
     );
 }
+
+#[test]
+fn fm_demod_kind_expands_to_channel_then_nbfm() {
+    assert_eq!(JobKind::FmDemod.name(), "fm_demod");
+    assert_eq!(
+        serde_json::to_value(JobKind::FmDemod).unwrap(),
+        serde_json::json!("fm_demod")
+    );
+    let tuning = Tuning {
+        center_hz: Hz(100_005_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let g = JobKind::FmDemod.expand(&SourceId("file0".into()), tuning);
+    assert_eq!(g.nodes.len(), 2);
+    assert_eq!(g.nodes[0].kind, "channel");
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"center_hz": 100_005_000, "bandwidth_hz": 12_500, "out_rate_hz": 48_000})
+    );
+    assert_eq!(g.nodes[1].kind, "nbfm_demod");
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000})
+    );
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!(g.edges[0].from, g.nodes[0].id);
+    assert_eq!(g.edges[0].to, g.nodes[1].id);
+    assert_eq!(g.edges[0].kind, zeta_core::types::StreamKind::Iq);
+}

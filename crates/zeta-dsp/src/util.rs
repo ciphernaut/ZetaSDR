@@ -66,6 +66,21 @@ pub fn fir_decimate(x: &[Complex<f32>], taps: &[f32], decim: usize) -> Vec<Compl
         .collect()
 }
 
+/// Real-valued [`fir_decimate`]: causal FIR from zero history, keeping every
+/// `decim`-th output starting with the first (`x.len().div_ceil(decim)` samples).
+pub fn fir_decimate_real(x: &[f32], taps: &[f32], decim: usize) -> Vec<f32> {
+    assert!(decim > 0, "fir_decimate_real: decim must be > 0");
+    (0..x.len())
+        .step_by(decim)
+        .map(|n| {
+            taps.iter()
+                .enumerate()
+                .take(n + 1)
+                .fold(0.0, |acc, (j, &t)| acc + x[n - j] * t)
+        })
+        .collect()
+}
+
 /// Mean power of `x` in dB (`10 log10(mean |x|^2)`); negative infinity when
 /// `x` is empty or all zero.
 pub fn power_db(x: &[Complex<f32>]) -> f32 {

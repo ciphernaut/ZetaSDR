@@ -10,6 +10,7 @@ use zeta_core::types::{Span, Timestamp};
 
 pub mod channel;
 pub mod fft;
+pub mod nbfm;
 pub mod util;
 
 #[cfg(feature = "test-fixtures")]
@@ -21,6 +22,7 @@ pub use util::crc16_x25;
 pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(channel::ChannelStage::new()));
     reg.register(Arc::new(fft::FftStage::new(Arc::new(fft::CpuFft::new()))));
+    reg.register(Arc::new(nbfm::NbfmDemodStage::new()));
 }
 
 /// Span of `n` samples at `rate_hz` starting at `t0`; zero-length when `rate_hz` is 0.

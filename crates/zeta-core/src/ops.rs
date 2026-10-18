@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capture::{CaptureMeta, write_cf32};
 use crate::classify::Label;
-use crate::graph::{Graph, GraphError, GraphId, Node as GraphNode, NodeId};
+use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::JobRecord;
 use crate::knowledge::{Allocation, Signature};
 use crate::lease::LeaseError;
@@ -19,7 +19,7 @@ use crate::node::{Node, NodeError};
 use crate::port::{Port, PortError, Tuning};
 use crate::ring::RingError;
 use crate::stream::StreamInfo;
-use crate::types::{Capabilities, Hz, JobId, Selection, SourceId};
+use crate::types::{Capabilities, Hz, JobId, Selection, SourceId, StreamKind};
 
 /// One request to the node.
 ///
@@ -93,6 +93,7 @@ pub enum Op {
 pub enum JobKind {
     Passthrough,
     Spectrum,
+    FmDemod,
 }
 
 impl JobKind {
@@ -101,10 +102,11 @@ impl JobKind {
         match self {
             JobKind::Passthrough => "passthrough",
             JobKind::Spectrum => "spectrum",
+            JobKind::FmDemod => "fm_demod",
         }
     }
 
-    pub fn expand(&self, _source: &SourceId, _tuning: Tuning) -> Graph {
+    pub fn expand(&self, _source: &SourceId, tuning: Tuning) -> Graph {
         match self {
             JobKind::Passthrough => Graph {
                 id: GraphId::new(),
@@ -124,6 +126,33 @@ impl JobKind {
                 }],
                 edges: vec![],
             },
+            JobKind::FmDemod => {
+                let (channel, demod) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": 48_000,
+                            }),
+                        },
+                        GraphNode {
+                            id: demod.clone(),
+                            kind: "nbfm_demod".into(),
+                            params: serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: demod,
+                        kind: StreamKind::Iq,
+                    }],
+                }
+            }
         }
     }
 }
