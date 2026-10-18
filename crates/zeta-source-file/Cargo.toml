@@ -1,0 +1,9 @@
+[package]
+name = "zeta-source-file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZetaSDR file-based IQ source"
+
+[dependencies]
+zeta-core = { path = "../zeta-core" }

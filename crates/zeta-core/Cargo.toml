@@ -1,0 +1,8 @@
+[package]
+name = "zeta-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZetaSDR core runtime types"
+
+[dependencies]

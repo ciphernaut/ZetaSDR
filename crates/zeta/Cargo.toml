@@ -1,0 +1,9 @@
+[package]
+name = "zeta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZetaSDR command-line node"
+
+[dependencies]
+zeta-core = { path = "../zeta-core" }
