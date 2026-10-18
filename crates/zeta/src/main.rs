@@ -1,6 +1,7 @@
 //! `zeta`: the command-line transport over the ZetaSDR operation set.
 
 mod agents_md;
+mod ask;
 mod cli;
 mod node_setup;
 mod serve_lock;

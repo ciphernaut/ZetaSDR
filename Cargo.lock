@@ -2904,6 +2904,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "zeta-agent",
  "zeta-client",
  "zeta-core",
  "zeta-source-file",

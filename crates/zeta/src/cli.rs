@@ -94,6 +94,38 @@ pub enum Command {
     },
     /// Run the node, resuming persisted jobs, until Ctrl-C
     Serve(ServeArgs),
+    /// Let a local model call the node's operations to satisfy a request
+    Ask(AskArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct AskArgs {
+    /// The request; omit it or pass "-" to read it from stdin
+    pub request: Option<String>,
+    /// Base URL of an OpenAI-compatible endpoint
+    #[arg(long, env = "ZETA_LLM_URL", value_name = "URL")]
+    pub llm_url: String,
+    /// Model name sent to the endpoint
+    #[arg(long, env = "ZETA_LLM_MODEL", value_name = "NAME")]
+    pub llm_model: String,
+    /// API key for the endpoint, if it needs one
+    #[arg(long, env = "ZETA_LLM_KEY", hide_env_values = true, value_name = "KEY")]
+    pub llm_key: Option<String>,
+    /// Token budget per model turn
+    #[arg(long, default_value_t = 1024, value_name = "N")]
+    pub llm_max_tokens: u32,
+    /// Enable model thinking (off by default)
+    #[arg(long)]
+    pub llm_thinking: bool,
+    /// URL polled until it reports the model healthy before the first request
+    #[arg(long, value_name = "URL")]
+    pub llm_status_url: Option<String>,
+    /// Longest wait for the model to become ready, seconds
+    #[arg(long, default_value_t = 600, value_name = "SECONDS")]
+    pub llm_ready_timeout_s: u64,
+    /// Most model turns before giving up
+    #[arg(long, default_value_t = 8, value_name = "N")]
+    pub max_turns: u32,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -300,7 +332,7 @@ impl Command {
                 selection: s.into(),
             },
             Command::Schema => Op::Schema {},
-            Command::AgentsMd { .. } | Command::Serve(_) => return Ok(None),
+            Command::AgentsMd { .. } | Command::Serve(_) | Command::Ask(_) => return Ok(None),
         }))
     }
 }

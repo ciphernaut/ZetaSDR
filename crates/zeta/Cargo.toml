@@ -14,6 +14,7 @@ zeta-client = { path = "../zeta-client" }
 zeta-ws = { path = "../zeta-ws" }
 tokio-util = "0.7.20"
 zeta-source-file = { version = "0.1.0", path = "../zeta-source-file" }
+zeta-agent = { path = "../zeta-agent" }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
@@ -21,3 +22,4 @@ predicates = "3.1.4"
 tempfile = "3.27.0"
 zeta-client = { path = "../zeta-client" }
 zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] }
+zeta-agent = { path = "../zeta-agent", features = ["test-fake"] }

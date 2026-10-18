@@ -10,8 +10,10 @@ use zeta_ws::addr::parse_listen;
 use zeta_ws::auth::Secret;
 use zeta_ws::{Limits, ServerConfig, bind};
 
-use crate::agents_md;
+use std::path::PathBuf;
+
 use crate::cli::{Cli, Command, ServeArgs};
+use crate::{agents_md, ask, node_setup};
 
 const MIN_SECRET_LEN: usize = 12;
 
@@ -31,6 +33,13 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             return Ok(usage("--listen requires --secret or ZETA_SECRET"));
         }
     }
+    if let Command::Ask(args) = cli.command {
+        let state_dir = match cli.state_dir.map_or_else(node_setup::default_state_dir, Ok) {
+            Ok(d) => d,
+            Err(e) => return Ok(usage(&e)),
+        };
+        return Ok(ask::run(args, None, state_dir, &cli.source_files).await);
+    }
     Err(cli)
 }
 
@@ -47,14 +56,17 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {
         return usage("--node requires --secret or ZETA_SECRET");
     };
+    let client = match NodeClient::new(url, secret) {
+        Ok(c) => c,
+        Err(e) => return usage(&e.to_string()),
+    };
+    if let Command::Ask(args) = cli.command {
+        return ask::run(args, Some(client), PathBuf::new(), &[]).await;
+    }
     let op = match cli.command.into_op() {
         Ok(Some(op)) => op,
         Ok(None) => return usage("this command cannot run on a remote node"),
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
-    };
-    let client = match NodeClient::new(url, secret) {
-        Ok(c) => c,
-        Err(e) => return usage(&e.to_string()),
     };
     match client.apply(&op).await {
         Ok(Ok(r)) => print(serde_json::to_string_pretty(&r), 0),
