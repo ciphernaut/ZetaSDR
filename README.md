@@ -4,11 +4,15 @@ ZetaSDR is an agentic RF runtime: a node that owns signal sources, keeps a live 
 spectrum and exposes "what is there, what is it, decode it" as typed operations that a human, a
 script or an LLM can invoke. This branch is the core node (ports and leases, IQ ring, stream bus,
 jobs, the operation set, a SigMF file source and the `zeta` CLI) and the DSP slice (channel
-extraction, spectrum, NBFM demodulation, APRS decoding, layer-1 measurement and classifiers).
+extraction, spectrum, NBFM demodulation, APRS decoding, layer-1 measurement and classifiers),
+with the transports and agent of plan 3 and the hardware and foreign sources of plan 4 (KiwiSDR,
+SoapySDR, external-process stages).
 
 Design: [docs/superpowers/specs/2026-10-18-zetasdr-design.md](docs/superpowers/specs/2026-10-18-zetasdr-design.md).
 Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2026-10-18-core-node.md),
-[docs/superpowers/plans/2026-10-18-dsp-slice.md](docs/superpowers/plans/2026-10-18-dsp-slice.md).
+[docs/superpowers/plans/2026-10-18-dsp-slice.md](docs/superpowers/plans/2026-10-18-dsp-slice.md),
+[docs/superpowers/plans/2026-10-18-transports-agent.md](docs/superpowers/plans/2026-10-18-transports-agent.md),
+[docs/superpowers/plans/2026-10-19-hardware-sources.md](docs/superpowers/plans/2026-10-19-hardware-sources.md).
 
 ## Tests
 
@@ -101,24 +105,44 @@ $Z $S --source-file aprs=scratch/fx/aprs.sigmf-meta classify --source aprs \
     --start-ns 0 --end-ns 2000000000 --center-hz 144800000 --bandwidth-hz 12500
 ```
 
-### Hardware sources and plugins
+### GPU
 
-Besides `--source-file ID=PATH.sigmf-meta`, every command takes `--source-kiwi
-ID=HOST:PORT[/PASSWORD]` (a KiwiSDR, 0-30 MHz, 12 kHz of IQ; it connects on the first tune; the
-password is never printed, but like `--secret` it is visible in `ps`) and `--source-soapy ID=ARGS`
-(a SoapySDR device, `ARGS` such as `driver=hackrf,serial=...`). Source ids are unique across the
-three flags. `--plugin KIND=/abs/path` registers an external stage (see `sdk/python` and
-`examples/python/gain.py`); it is probed at startup and a failed probe exits 1. A plugin runs with
-a cleared environment; set `ZETA_PLUGIN_ENV_<NAME>` to hand it `<NAME>`.
+The FFT stage has a GPU implementation behind the `gpu` cargo feature (wgpu compute shader;
+`cargo build -p zeta --features gpu`, tests with `cargo test -p zeta-dsp --features gpu`). With
+the feature on, the node adds the GPU backend only when a hardware adapter is found, and the
+scheduler then prefers it; without one the CPU FFT runs, so a missing GPU never fails a job.
+`gpu_matches_cpu_within_0_1_db` must be run on a GPU host to count as verification (hardware equivalence is pending on the field host): elsewhere it prints `skipped: no adapter` and passes. Software adapters (lavapipe, llvmpipe) are ignored unless `ZETA_GPU_ALLOW_SOFTWARE=1`;
+`software_adapter_allowed_by_env` sets it, so a GPU-less box with Mesa still runs the GPU path. A
+GPU failure at run time is logged to stderr and that spectrum is computed on the CPU.
+
+## Sources
+
+Every command takes the source flags of the node it opens (`zeta serve` included); with `--node`
+they belong to the serving node and are rejected. Source ids are unique across the three flags.
+`source list` shows each source's capability record: tuning range, `max_bandwidth_hz`, formats,
+`remote` and `push`, all `asserted` (taken from the device or the protocol, not measured).
+
+- **File**, `--source-file ID=PATH.sigmf-meta`: a SigMF recording (`cf32_le`, `ci16_le` or `ci8`)
+  replayed in real time and repeated.
+- **KiwiSDR**, `--source-kiwi ID=HOST:PORT[/PASSWORD]`: 0-30 MHz, one 12 kHz IQ channel
+  (`max_bandwidth_hz` 12000, so a wider job is refused `out_of_range` naming `bandwidth_hz`).
+  `remote` and `push`: it connects on the first tune and holds one of the Kiwi's user slots
+  while tuned, so a one-shot command holds the slot only while that process runs. The password
+  is never printed, but like `--secret` it is visible in `ps` to every user of the
+  machine.
+- **SoapySDR**, `--source-soapy ID=ARGS` (`ARGS` such as `driver=hackrf,serial=...`): a local
+  device, `push` false (the node reads it). Gains are left at the driver's defaults (no gain
+  operation yet), and a job centred exactly on the tuned frequency sees the device's DC spike.
 
 ```bash
+./target/debug/zeta --source-kiwi kiwi0=kiwisdr.example:8073 source list   # remote true, current null
 ./target/debug/zeta --source-kiwi kiwi0=kiwisdr.example:8073 job start --kind measure \
-  --source kiwi0 --center-hz 7100000 --bandwidth-hz 10000 --then-tail 1,5000
-./target/debug/zeta --plugin gain=$PWD/examples/python/gain.py schema   # "gain" under stages
+  --source kiwi0 --center-hz 7100000 --bandwidth-hz 10000 --then-tail 2,5000
 ```
 
-SoapySDR links libSoapySDR, so it is behind a compiler cfg rather than a cargo feature (so that
-`--all-features` never needs the headers). Without it, `--source-soapy` and `zeta soapy find` exit
+SoapySDR links libSoapySDR, so its driver (`crates/zeta-source-soapy-driver`, outside the
+workspace) is behind a compiler cfg rather than a cargo feature: neither the default build nor
+`--all-features` needs the headers. Without the cfg, `--source-soapy` and `zeta soapy find` exit
 1 saying how to rebuild. With it:
 
 ```bash
@@ -129,17 +153,53 @@ RUSTFLAGS="--cfg soapy" cargo build -p zeta --release
 ```
 
 Without the package, `DOCS_RS=1 RUSTFLAGS="--cfg soapy" cargo check -p zeta --all-targets`
-type-checks that path (use a separate `CARGO_TARGET_DIR`; the flags rebuild everything).
+type-checks that path (use a separate `CARGO_TARGET_DIR`; the flags rebuild everything). The
+port logic is tested without hardware (`cargo test -p zeta-source-soapy --features test-mock`,
+`cargo test -p zeta-source-kiwi --features test-fake`); the live tests are `--ignored`
+(`cargo test -p zeta-source-kiwi --test live -- --ignored` needs a reachable Kiwi; the HackRF
+test lives in the driver crate, see its README).
 
-### GPU
+## External stages
 
-The FFT stage has a GPU implementation behind the `gpu` cargo feature (wgpu compute shader;
-`cargo build -p zeta --features gpu`, tests with `cargo test -p zeta-dsp --features gpu`). With
-the feature on, the node adds the GPU backend only when a hardware adapter is found, and the
-scheduler then prefers it; without one the CPU FFT runs, so a missing GPU never fails a job.
-`gpu_matches_cpu_within_0_1_db` must be run on a GPU host to count as verification (hardware equivalence is pending on the field host): elsewhere it prints `skipped: no adapter` and passes. Software adapters (lavapipe, llvmpipe) are ignored unless `ZETA_GPU_ALLOW_SOFTWARE=1`;
-`software_adapter_allowed_by_env` sets it, so a GPU-less box with Mesa still runs the GPU path. A
-GPU failure at run time is logged to stderr and that spectrum is computed on the CPU.
+`--plugin KIND=/abs/path` registers a program as stage kind `KIND`, usable in any graph
+(`graph put`) like a built-in stage. The program is a separate process speaking plugin protocol 1
+on its stdio (`crates/zeta-plugin/src/wire.rs` has the full definition):
+
+- control messages are one line of JSON; data frames are a 0x00 byte, a length-prefixed JSON
+  header (the websocket's frame message) and a length-prefixed body (`iq`: interleaved `f32` LE,
+  SigMF `cf32_le`; `audio`: `f32` LE; `event` and `text`: no body);
+- the plugin's first message is `hello` (kind, input and output stream kinds, params schema),
+  within 5 s; the host answers `run` with the params and output stream ids, then streams frames,
+  `lagged` and `closed`, and ends with `stop`. stderr is copied to the node's stderr prefixed
+  `[plugin KIND]`.
+
+The node probes every `--plugin` at startup (one-shot commands too, so each costs a process
+start); a failed probe, or a `hello` whose kind differs from `KIND`, exits 1 naming the flag.
+Each job run spawns a fresh process. Plugins are untrusted: the path must be absolute (no `PATH`
+lookup, no shell), the process leads its own process group and the whole group is killed when
+the stage ends, its output frames are checked against the run's output streams and get the run's
+`source` and `job`, and its environment is cleared except `PATH`, `HOME`, `LANG`, `LC_ALL`,
+`LC_CTYPE`, `TERM` and `PYTHONPATH` (plus `PYTHONUNBUFFERED=1`). To hand a plugin a variable,
+set `ZETA_PLUGIN_ENV_<NAME>`; it arrives as `<NAME>`. Nothing else reaches it, `ZETA_SECRET`
+included.
+
+`sdk/python/zeta_plugin` is a standard-library-only Python SDK: a plugin calls
+`zeta_plugin.run(kind, inputs, outputs, params_schema, on_frame)`. `examples/python/gain.py`
+(iq in, iq out, every sample times `params.factor`) is the example:
+
+```bash
+A="--state-dir scratch/st --source-file tone=scratch/fx/tone.sigmf-meta"
+ZETA_SECRET=correct-horse-battery ./target/debug/zeta $A \
+  --plugin gain=$PWD/examples/python/gain.py serve --listen 127.0.0.1:7373
+
+export ZETA_NODE=http://127.0.0.1:7373 ZETA_SECRET=correct-horse-battery   # second terminal
+./target/debug/zeta job start --kind passthrough --source tone --center-hz 100000000 --bandwidth-hz 12500
+echo '{"id":"gain-graph","nodes":[{"id":"g","kind":"gain","params":{"factor":0.5}}],"edges":[]}' \
+  > scratch/gain-graph.json
+./target/debug/zeta graph put --job <JOB> --file scratch/gain-graph.json
+./target/debug/zeta stream list                     # the job's two iq streams: source and gain
+./target/debug/zeta stream tail --stream <STREAM> --max-frames 3 --timeout-ms 3000
+```
 
 ## Transports
 
