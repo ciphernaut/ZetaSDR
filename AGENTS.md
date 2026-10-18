@@ -63,7 +63,7 @@ CLI: `zeta job context --job <id>`
 
 ### iq_read
 
-- selection: object (Selection: source, span{start,end}, center_hz, bandwidth_hz)
+- selection: object (Selection: source, span{start,end: integer (ns since epoch)}, center_hz, bandwidth_hz)
 
 JSON: `{"op":"iq_read","selection":{"source":"<id>","span":{"start":1760000000000000000,"end":1760000001000000000},"center_hz":144800000,"bandwidth_hz":12500}}`
 
@@ -86,11 +86,13 @@ CLI: `zeta graph get --job <id>`
 ### graph_put
 
 - job: string
-- graph: object (Graph: id, nodes, edges)
+- graph: object (Graph: id, nodes[Node: id, kind, params], edges[Edge: from, to, kind])
 
-JSON: `{"op":"graph_put","job":"<id>","graph":{"id":"<id>","nodes":[],"edges":[]}}`
+JSON: `{"op":"graph_put","job":"<id>","graph":{"id":"<id>","nodes":[{"id":"<node-id>","kind":"passthrough","params":{"kind":"iq"}}],"edges":[]}}`
 
 CLI: `zeta graph put --job <id> --file graph.json`
+
+Fetch the current graph with `graph get`, edit it, and put it back; stage kinds and their params are listed by `schema`.
 
 ### knowledge_lookup
 
@@ -104,7 +106,7 @@ CLI: `zeta knowledge lookup --region AU --center-hz 144800000 --bandwidth-hz 125
 
 ### classify
 
-- selection: object (Selection: source, span{start,end}, center_hz, bandwidth_hz)
+- selection: object (Selection: source, span{start,end: integer (ns since epoch)}, center_hz, bandwidth_hz)
 
 JSON: `{"op":"classify","selection":{"source":"<id>","span":{"start":1760000000000000000,"end":1760000001000000000},"center_hz":144800000,"bandwidth_hz":12500}}`
 
@@ -122,7 +124,7 @@ Measured facts first, then method. Verify against the node's `knowledge lookup` 
 
 ### Where to look
 
-- Radiosondes: 400-406 MHz. RS41 is GFSK at 4800 baud, about 10 kHz wide. Australian launches are usually around 401-403 MHz.
+- Radiosondes: 400-406 MHz. RS41 is GFSK at 4800 baud, about 10 kHz wide.
 - APRS: 144.800 MHz in AU and EU, 144.390 MHz in the US. AFSK at 1200 baud.
 - POCSAG: the preamble is 576 bits of alternating 1/0, then the 32-bit sync word 0x7CD215D8. Common rates are 512, 1200 and 2400 baud.
 - ADS-B: 1090 MHz, PPM at 1 Mbaud, 112-bit extended squitter.

@@ -18,6 +18,26 @@ const RULES: &[&str] = &[
     "Unknown signals are reported as unknown, never guessed.",
 ];
 
+/// Hand-written sentence appended to an operation's section.
+fn note(op: &str) -> Option<&'static str> {
+    match op {
+        "graph_put" => Some(
+            "Fetch the current graph with `graph get`, edit it, and put it back; stage kinds and their params are listed by `schema`.",
+        ),
+        _ => None,
+    }
+}
+
+/// Unit label of a named integer type, stated explicitly.
+fn unit(name: &str) -> Option<&'static str> {
+    match name {
+        "Hz" => Some("Hz"),
+        "Baud" => Some("baud"),
+        "Timestamp" => Some("ns since epoch"),
+        _ => None,
+    }
+}
+
 /// Render the guide from `schema()` and the field-craft text.
 pub fn render(schema: &Value, field_craft: &str) -> String {
     let op = &schema["op"];
@@ -50,6 +70,9 @@ pub fn render(schema: &Value, field_craft: &str) -> String {
         }
         json.push('}');
         out.push_str(&format!("JSON: `{json}`\n\nCLI: `{}`\n", cli_form(name, &fields, defs)));
+        if let Some(n) = note(name) {
+            out.push_str(&format!("\n{n}\n"));
+        }
     }
     out.push_str("\n## Field craft\n\n");
     out.push_str(field_craft);
@@ -72,7 +95,7 @@ fn type_of(s: &Value, defs: &Value) -> String {
     let (name, def) = resolve(s, defs);
     let ty = def["type"].as_str().unwrap_or("any");
     match (ty, name) {
-        ("integer", Some(n)) => format!("integer ({n})"),
+        ("integer", Some(n)) => format!("integer ({})", unit(n).unwrap_or(n)),
         ("string", Some(n)) if def["enum"].is_array() => {
             let vals: Vec<&str> = def["enum"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
             format!("string ({n}: {})", vals.join("|"))
@@ -82,8 +105,20 @@ fn type_of(s: &Value, defs: &Value) -> String {
                 .into_iter()
                 .map(|p| {
                     let (_, pd) = resolve(&def["properties"][p], defs);
+                    let (item_name, item) = resolve(&pd["items"], defs);
                     if pd["type"] == "object" {
-                        format!("{p}{{{}}}", required(pd).join(","))
+                        let subs = required(pd);
+                        let units: Vec<Option<&str>> = subs
+                            .iter()
+                            .map(|q| resolve(&pd["properties"][*q], defs).0.and_then(unit))
+                            .collect();
+                        let tail = match units.first() {
+                            Some(Some(u)) if units.iter().all(|x| *x == Some(*u)) => format!(": integer ({u})"),
+                            _ => String::new(),
+                        };
+                        format!("{p}{{{}{tail}}}", subs.join(","))
+                    } else if let (Some(n), "object") = (item_name, item["type"].as_str().unwrap_or("")) {
+                        format!("{p}[{n}: {}]", required(item).join(", "))
                     } else {
                         p.to_string()
                     }
@@ -98,6 +133,7 @@ fn type_of(s: &Value, defs: &Value) -> String {
 fn example(field: &str, s: &Value, defs: &Value) -> Value {
     let (name, def) = resolve(s, defs);
     match def["type"].as_str() {
+        _ if name == Some("NodeId") => "<node-id>".into(),
         Some("integer") => match (field, name) {
             ("bandwidth_hz", _) => 12500.into(),
             (_, Some("Hz")) => 144800000u64.into(),
@@ -108,6 +144,7 @@ fn example(field: &str, s: &Value, defs: &Value) -> Value {
         Some("string") => match def["enum"].as_array().and_then(|a| a.first()) {
             Some(first) => first.clone(),
             None if field == "region" => "AU".into(),
+            None if field == "kind" => "passthrough".into(),
             None => "<id>".into(),
         },
         Some("object") => {
@@ -117,7 +154,9 @@ fn example(field: &str, s: &Value, defs: &Value) -> Value {
             }
             Value::Object(m)
         }
+        Some("array") if field == "nodes" => Value::Array(vec![example("node", &s["items"], defs)]),
         Some("array") => Value::Array(vec![]),
+        _ if field == "params" => serde_json::json!({"kind": "iq"}),
         _ => Value::Null,
     }
 }

@@ -2,7 +2,7 @@ Measured facts first, then method. Verify against the node's `knowledge lookup` 
 
 ### Where to look
 
-- Radiosondes: 400-406 MHz. RS41 is GFSK at 4800 baud, about 10 kHz wide. Australian launches are usually around 401-403 MHz.
+- Radiosondes: 400-406 MHz. RS41 is GFSK at 4800 baud, about 10 kHz wide.
 - APRS: 144.800 MHz in AU and EU, 144.390 MHz in the US. AFSK at 1200 baud.
 - POCSAG: the preamble is 576 bits of alternating 1/0, then the 32-bit sync word 0x7CD215D8. Common rates are 512, 1200 and 2400 baud.
 - ADS-B: 1090 MHz, PPM at 1 Mbaud, 112-bit extended squitter.
