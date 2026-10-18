@@ -216,3 +216,25 @@ pub fn write_fixture(
     };
     write_cf32(dir, stem, &meta, iq).expect("write fixture")
 }
+
+/// Add real white Gaussian noise at `snr_db` below the mean power of real `x`
+/// (taken as 1.0 if zero). Same deterministic LCG plus Box-Muller as [`awgn`].
+pub fn awgn_real(x: &mut [f32], snr_db: f32, seed: u64) {
+    if x.is_empty() {
+        return;
+    }
+    let p: f64 = x.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / x.len() as f64;
+    let p = if p > 0.0 { p } else { 1.0 };
+    let sigma = (p / 10f64.powf(snr_db as f64 / 10.0)).sqrt();
+    let mut state = seed;
+    let mut uniform = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) + 1) as f64 / (1u64 << 53) as f64
+    };
+    for s in x.iter_mut() {
+        let (u1, u2) = (uniform(), uniform());
+        *s += (sigma * (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()) as f32;
+    }
+}

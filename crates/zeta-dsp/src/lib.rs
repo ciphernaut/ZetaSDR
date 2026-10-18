@@ -8,6 +8,8 @@ use zeta_core::stage::StageError;
 use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{Span, Timestamp};
 
+pub mod afsk;
+pub mod ax25;
 pub mod channel;
 pub mod fft;
 pub mod nbfm;
