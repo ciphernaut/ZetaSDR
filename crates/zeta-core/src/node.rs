@@ -272,7 +272,7 @@ impl Node {
             tuning,
             state: JobState::Running,
             context: serde_json::json!({}),
-            created: now(),
+            created_ns: now(),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -357,9 +357,9 @@ impl Node {
             .map(|e| e.record.clone())
             .collect();
         v.sort_by(|a, b| {
-            a.created
+            a.created_ns
                 .0
-                .cmp(&b.created.0)
+                .cmp(&b.created_ns.0)
                 .then_with(|| a.id.0.cmp(&b.id.0))
         });
         v
@@ -464,7 +464,10 @@ impl Inner {
             source: rec.source.clone(),
             job: Some(id.clone()),
             channel: None,
-            span: Span { start: t, end: t },
+            span: Span {
+                start_ns: t,
+                end_ns: t,
+            },
         };
         let graph = rec.graph.clone();
         self.jobs.lock().unwrap().insert(
@@ -615,8 +618,8 @@ async fn forward_iq(
         let end = block.t0.0 + (block.samples.len() as u128 * 1_000_000_000 / rate) as u64;
         let provenance = Provenance {
             span: Span {
-                start: block.t0,
-                end: Timestamp(end),
+                start_ns: block.t0,
+                end_ns: Timestamp(end),
             },
             ..prov.clone()
         };

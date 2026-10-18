@@ -11,7 +11,7 @@ The CLI form and the JSON form of every operation are equivalent: `zeta <group> 
 and `{\"op\": \"<name>\", ...}` do the same thing.";
 
 const RULES: &[&str] = &[
-    "One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`.",
+    "One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`, times are integer nanoseconds since the UNIX epoch in fields ending `_ns`.",
     "Every field is required and unknown fields are rejected.",
     "Call operations, do not explain.",
     "Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.",
@@ -154,8 +154,8 @@ fn example(field: &str, s: &Value, defs: &Value) -> Value {
         Some("integer") => match (field, name) {
             ("bandwidth_hz", _) => 12500.into(),
             (_, Some("Hz")) => 144800000u64.into(),
-            ("start", _) => 1760000000000000000u64.into(),
-            ("end", _) => 1760000001000000000u64.into(),
+            ("start_ns", _) => 1760000000000000000u64.into(),
+            ("end_ns", _) => 1760000001000000000u64.into(),
             _ => 0.into(),
         },
         Some("string") => match def["enum"].as_array().and_then(|a| a.first()) {
@@ -197,18 +197,10 @@ fn cli_flags(field: &str, s: &Value, defs: &Value, out: &mut Vec<(String, String
     match (field, name) {
         ("selection", _) | ("span", _) => {
             for p in required(def) {
-                let flag = match (field, p) {
-                    ("span", "start") => "start_ns",
-                    ("span", "end") => "end_ns",
-                    _ => p,
-                };
                 if p == "span" {
                     cli_flags(p, &def["properties"][p], defs, out);
                 } else {
-                    out.push((
-                        flag.replace('_', "-"),
-                        value(p, &def["properties"][p], defs),
-                    ));
+                    out.push((p.replace('_', "-"), value(p, &def["properties"][p], defs)));
                 }
             }
         }

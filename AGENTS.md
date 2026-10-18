@@ -4,7 +4,7 @@ ZetaSDR is an agentic SDR runtime. You drive it through a small typed operation 
 
 ## Rules
 
-- One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`.
+- One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`, times are integer nanoseconds since the UNIX epoch in fields ending `_ns`.
 - Every field is required and unknown fields are rejected.
 - Call operations, do not explain.
 - Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.
@@ -63,9 +63,9 @@ CLI: `zeta job context --job <id>`
 
 ### iq_read
 
-- selection: object (Selection: source, span{start,end: integer (ns since epoch)}, center_hz, bandwidth_hz)
+- selection: object (Selection: source, span{start_ns,end_ns: integer (ns since epoch)}, center_hz, bandwidth_hz)
 
-JSON: `{"op":"iq_read","selection":{"source":"<id>","span":{"start":1760000000000000000,"end":1760000001000000000},"center_hz":144800000,"bandwidth_hz":12500}}`
+JSON: `{"op":"iq_read","selection":{"source":"<id>","span":{"start_ns":1760000000000000000,"end_ns":1760000001000000000},"center_hz":144800000,"bandwidth_hz":12500}}`
 
 CLI: `zeta iq read --source <id> --start-ns 1760000000000000000 --end-ns 1760000001000000000 --center-hz 144800000 --bandwidth-hz 12500`
 
@@ -106,9 +106,9 @@ CLI: `zeta knowledge lookup --region AU --center-hz 144800000 --bandwidth-hz 125
 
 ### classify
 
-- selection: object (Selection: source, span{start,end: integer (ns since epoch)}, center_hz, bandwidth_hz)
+- selection: object (Selection: source, span{start_ns,end_ns: integer (ns since epoch)}, center_hz, bandwidth_hz)
 
-JSON: `{"op":"classify","selection":{"source":"<id>","span":{"start":1760000000000000000,"end":1760000001000000000},"center_hz":144800000,"bandwidth_hz":12500}}`
+JSON: `{"op":"classify","selection":{"source":"<id>","span":{"start_ns":1760000000000000000,"end_ns":1760000001000000000},"center_hz":144800000,"bandwidth_hz":12500}}`
 
 CLI: `zeta classify --source <id> --start-ns 1760000000000000000 --end-ns 1760000001000000000 --center-hz 144800000 --bandwidth-hz 12500`
 

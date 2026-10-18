@@ -19,8 +19,8 @@ pub struct Timestamp(pub u64);
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct Span {
-    pub start: Timestamp,
-    pub end: Timestamp,
+    pub start_ns: Timestamp,
+    pub end_ns: Timestamp,
 }
 
 macro_rules! ulid_id {
@@ -71,6 +71,7 @@ pub enum StreamKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum SampleFormat {
     Ci8,
     Ci16,
@@ -129,8 +130,8 @@ mod tests {
         let s = Selection {
             source: SourceId("hackrf0".into()),
             span: Span {
-                start: Timestamp(0),
-                end: Timestamp(1_000_000_000),
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(1_000_000_000),
             },
             center_hz: Hz(101_500_000),
             bandwidth_hz: Hz(200_000),

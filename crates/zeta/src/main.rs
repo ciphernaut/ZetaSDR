@@ -81,7 +81,7 @@ async fn wait_for_ring(node: &zeta_core::node::Node, sel: &zeta_core::types::Sel
             r.read()
                 .unwrap()
                 .latest()
-                .is_some_and(|t| t.0 >= sel.span.end.0)
+                .is_some_and(|t| t.0 >= sel.span.end_ns.0)
         });
         if covered || tokio::time::Instant::now() >= deadline {
             return;

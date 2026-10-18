@@ -223,8 +223,8 @@ async fn selection(node: &Node, center_hz: u64, bandwidth_hz: u64) -> Selection 
     Selection {
         source,
         span: Span {
-            start: Timestamp(start),
-            end: Timestamp(start + 50_000_000),
+            start_ns: Timestamp(start),
+            end_ns: Timestamp(start + 50_000_000),
         },
         center_hz: Hz(center_hz),
         bandwidth_hz: Hz(bandwidth_hz),
@@ -404,11 +404,44 @@ fn nested_schemas_are_strict() {
     }
 }
 
-fn check_units(v: &Value, path: &str) {
+/// Whether a unit field's schema `s` is an integer or a `$ref` to a unit type.
+/// `Option<T>` (`anyOf` with `null`) and `Claim<T>` (a def whose variants each
+/// hold one unit value under `asserted` / `measured`) are unwrapped.
+fn unit_typed(s: &Value, defs: &Value) -> bool {
+    let is_int =
+        |t: &Value| t == "integer" || t.as_array().is_some_and(|a| a.contains(&"integer".into()));
+    if is_int(&s["type"]) {
+        return true;
+    }
+    if let Some(alts) = s["anyOf"].as_array() {
+        return alts
+            .iter()
+            .filter(|a| a["type"] != "null")
+            .all(|a| unit_typed(a, defs));
+    }
+    match s["$ref"].as_str().and_then(|r| r.rsplit('/').next()) {
+        Some("Hz" | "Baud" | "Timestamp") => true,
+        Some(n) if n.starts_with("Claim") => defs[n]["oneOf"].as_array().is_some_and(|vs| {
+            vs.iter().all(|v| {
+                let props = v["properties"].as_object();
+                props.is_some_and(|p| p.len() == 1 && p.values().all(|x| unit_typed(x, defs)))
+            })
+        }),
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct UnitsSeen {
+    hz: usize,
+    ns: usize,
+}
+
+fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
     match v {
         Value::Object(m) => {
             if let Some(Value::Object(props)) = m.get("properties") {
-                for name in props.keys() {
+                for (name, s) in props {
                     let unit = ["freq", "rate", "bandwidth", "center"]
                         .iter()
                         .any(|w| name.contains(w));
@@ -416,27 +449,50 @@ fn check_units(v: &Value, path: &str) {
                         !unit || name.ends_with("_hz") || name.ends_with("_baud"),
                         "{path}.{name} is a unit field without _hz/_baud"
                     );
+                    let time = [
+                        "start",
+                        "end",
+                        "created",
+                        "requested",
+                        "earliest",
+                        "latest",
+                        "time",
+                    ]
+                    .iter()
+                    .any(|w| name.contains(w));
+                    assert!(
+                        !time || name.ends_with("_ns"),
+                        "{path}.{name} is a time field without _ns"
+                    );
+                    if ["_hz", "_ns", "_baud"].iter().any(|u| name.ends_with(u)) {
+                        assert!(unit_typed(s, defs), "{path}.{name} is not a unit type: {s}");
+                    }
+                    seen.hz += name.ends_with("_hz") as usize;
+                    seen.ns += name.ends_with("_ns") as usize;
                 }
             }
             for (k, c) in m {
-                check_units(c, &format!("{path}.{k}"));
+                check_units(c, defs, &format!("{path}.{k}"), seen);
             }
         }
         Value::Array(a) => a
             .iter()
             .enumerate()
-            .for_each(|(i, c)| check_units(c, &format!("{path}[{i}]"))),
+            .for_each(|(i, c)| check_units(c, defs, &format!("{path}[{i}]"), seen)),
         _ => {}
     }
 }
 
 #[test]
-fn unit_fields_end_in_hz_or_baud() {
+fn unit_fields_carry_their_unit() {
     let s = schema();
+    let mut seen = UnitsSeen::default();
     for key in ["op", "result", "error"] {
         assert!(s[key].is_object(), "schema has {key}");
+        check_units(&s[key], &s[key]["$defs"], key, &mut seen);
     }
-    check_units(&s, "schema");
+    assert!(seen.hz > 0, "no _hz field seen");
+    assert!(seen.ns > 0, "no _ns field seen");
 }
 
 struct TestProvider;

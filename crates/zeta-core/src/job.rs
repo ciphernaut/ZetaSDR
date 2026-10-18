@@ -29,7 +29,7 @@ pub struct JobRecord {
     pub tuning: Tuning,
     pub state: JobState,
     pub context: serde_json::Value,
-    pub created: Timestamp,
+    pub created_ns: Timestamp,
 }
 
 #[cfg(test)]

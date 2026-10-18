@@ -15,15 +15,15 @@ const NS: u128 = 1_000_000_000;
 #[serde(tag = "cause", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub enum RingError {
-    #[error("requested {requested:?} is older than earliest retained {earliest:?}")]
+    #[error("requested {requested_ns:?} is older than earliest retained {earliest_ns:?}")]
     TooOld {
-        requested: Timestamp,
-        earliest: Timestamp,
+        requested_ns: Timestamp,
+        earliest_ns: Timestamp,
     },
-    #[error("requested {requested:?} is later than latest retained {latest:?}")]
+    #[error("requested {requested_ns:?} is later than latest retained {latest_ns:?}")]
     Future {
-        requested: Timestamp,
-        latest: Timestamp,
+        requested_ns: Timestamp,
+        latest_ns: Timestamp,
     },
     #[error("ring is empty or span is empty")]
     Empty,
@@ -133,23 +133,23 @@ impl IqRing {
             (Some(e), Some(l)) => (e, l),
             _ => return Err(RingError::Empty),
         };
-        if span.end.0 <= span.start.0 {
+        if span.end_ns.0 <= span.start_ns.0 {
             return Err(RingError::Empty);
         }
-        if span.start.0 < earliest.0 {
+        if span.start_ns.0 < earliest.0 {
             return Err(RingError::TooOld {
-                requested: span.start,
-                earliest,
+                requested_ns: span.start_ns,
+                earliest_ns: earliest,
             });
         }
         let rate = self.sample_rate_hz as u128;
         let offset =
             |t: u64| -> usize { (((t - earliest.0) as u128 * rate + NS / 2) / NS) as usize };
-        let (from, to) = (offset(span.start.0), offset(span.end.0));
+        let (from, to) = (offset(span.start_ns.0), offset(span.end_ns.0));
         if to > self.buf.len() {
             return Err(RingError::Future {
-                requested: span.end,
-                latest,
+                requested_ns: span.end_ns,
+                latest_ns: latest,
             });
         }
         Ok(self.buf.range(from..to).copied().collect())
@@ -177,8 +177,8 @@ mod tests {
 
     fn span(a: u64, b: u64) -> Span {
         Span {
-            start: Timestamp(a * 1_000_000_000),
-            end: Timestamp(b * 1_000_000_000),
+            start_ns: Timestamp(a * 1_000_000_000),
+            end_ns: Timestamp(b * 1_000_000_000),
         }
     }
 
@@ -202,8 +202,8 @@ mod tests {
         assert_eq!(
             ring.read(span(0, 1)),
             Err(RingError::TooOld {
-                requested: Timestamp(0),
-                earliest: Timestamp(3_000_000_000)
+                requested_ns: Timestamp(0),
+                earliest_ns: Timestamp(3_000_000_000)
             })
         );
     }
@@ -215,8 +215,8 @@ mod tests {
         assert_eq!(
             ring.read(span(0, 2)),
             Err(RingError::Future {
-                requested: Timestamp(2_000_000_000),
-                latest: Timestamp(999_000_000)
+                requested_ns: Timestamp(2_000_000_000),
+                latest_ns: Timestamp(999_000_000)
             })
         );
     }
@@ -231,8 +231,8 @@ mod tests {
 
     fn span_ns(a: u64, b: u64) -> Span {
         Span {
-            start: Timestamp(a),
-            end: Timestamp(b),
+            start_ns: Timestamp(a),
+            end_ns: Timestamp(b),
         }
     }
 
@@ -268,8 +268,8 @@ mod tests {
         assert_eq!(
             wrapped().read(span_ns(2999 * MS, 3001 * MS)),
             Err(RingError::TooOld {
-                requested: Timestamp(2999 * MS),
-                earliest: Timestamp(3000 * MS)
+                requested_ns: Timestamp(2999 * MS),
+                earliest_ns: Timestamp(3000 * MS)
             })
         );
     }
@@ -286,8 +286,8 @@ mod tests {
         assert_eq!(
             wrapped().read(span_ns(4000 * MS, 5001 * MS)),
             Err(RingError::Future {
-                requested: Timestamp(5001 * MS),
-                latest: Timestamp(4999 * MS)
+                requested_ns: Timestamp(5001 * MS),
+                latest_ns: Timestamp(4999 * MS)
             })
         );
     }

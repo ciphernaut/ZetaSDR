@@ -245,8 +245,8 @@ mod tests {
             job: None,
             channel: None,
             span: Span {
-                start: Timestamp(0),
-                end: Timestamp(1),
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(1),
             },
         }
     }

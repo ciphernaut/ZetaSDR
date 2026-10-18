@@ -188,8 +188,8 @@ impl From<SelectionArgs> for Selection {
         Selection {
             source: SourceId(a.source),
             span: Span {
-                start: Timestamp(a.start_ns),
-                end: Timestamp(a.end_ns),
+                start_ns: Timestamp(a.start_ns),
+                end_ns: Timestamp(a.end_ns),
             },
             center_hz: Hz(a.center_hz),
             bandwidth_hz: Hz(a.bandwidth_hz),
