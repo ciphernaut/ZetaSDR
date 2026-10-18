@@ -57,10 +57,16 @@ pub async fn open(
                 .map_err(|e| format!("--source-file {id}={}: {e}", path.display()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    #[allow(unused_mut)]
+    let mut backends = vec![Backend::Cpu];
+    #[cfg(feature = "gpu")]
+    if zeta_dsp::gpu_available() {
+        backends.push(Backend::Gpu);
+    }
     let cfg = NodeConfig {
         state_dir,
         ring_seconds: 10.0,
-        backends: vec![Backend::Cpu],
+        backends,
         resume,
     };
     let ports = sources.iter().map(|s| s.clone() as Arc<dyn Port>).collect();

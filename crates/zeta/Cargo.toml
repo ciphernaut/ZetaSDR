@@ -13,6 +13,9 @@ zeta-core = { path = "../zeta-core" }
 zeta-dsp = { path = "../zeta-dsp" }
 zeta-source-file = { version = "0.1.0", path = "../zeta-source-file" }
 
+[features]
+gpu = ["zeta-dsp/gpu"]
+
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"

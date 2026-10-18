@@ -14,6 +14,8 @@ pub mod aprs;
 pub mod ax25;
 pub mod channel;
 pub mod fft;
+#[cfg(feature = "gpu")]
+pub mod gpu_fft;
 pub mod identify;
 pub mod measure;
 pub mod nbfm;
@@ -28,9 +30,26 @@ pub use util::crc16_x25;
 pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(channel::ChannelStage::new()));
     reg.register(Arc::new(fft::FftStage::new(Arc::new(fft::CpuFft::new()))));
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = gpu_fft::GpuFft::try_new() {
+        reg.register(Arc::new(fft::FftStage::new(Arc::new(gpu))));
+    }
     reg.register(Arc::new(nbfm::NbfmDemodStage::new()));
     reg.register(Arc::new(aprs::AprsDecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
+}
+
+/// Whether a hardware GPU adapter is usable for the GPU stages; always false
+/// without the `gpu` feature.
+pub fn gpu_available() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        gpu_fft::GpuFft::try_new().is_some()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
 }
 
 /// This crate's classifiers, lowest layer first.

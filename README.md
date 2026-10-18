@@ -17,6 +17,15 @@ The toolchain is pinned by `rust-toolchain.toml` (1.97); install `rustfmt` and `
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
+### GPU backend
+
+The FFT stage has a GPU implementation behind the `gpu` cargo feature (wgpu compute shader;
+`cargo build -p zeta --features gpu`, tests with `cargo test -p zeta-dsp --features gpu`). With
+the feature on, the node adds the GPU backend only when a hardware adapter is found, and the
+scheduler then prefers it; without one the CPU FFT runs, so a missing GPU never fails a job.
+`gpu_matches_cpu_within_0_1_db` needs a GPU host: elsewhere it prints `skipped: no adapter` and
+passes.
+
 ## CLI walkthrough
 
 One-shot commands open the node, apply one operation, persist and exit; they do not resume jobs.
