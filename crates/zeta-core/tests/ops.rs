@@ -404,6 +404,19 @@ fn nested_schemas_are_strict() {
     for key in ["op", "result", "error"] {
         check_strict(&s[key], key);
     }
+    // stream_tail: provenance fields on every frame, and the missed count.
+    let fs = &s["result"]["$defs"]["FrameSummary"];
+    for f in ["source", "job", "channel"] {
+        assert!(fs["properties"].get(f).is_some(), "FrameSummary.{f}: {fs}");
+    }
+    let frames = variants(&s["result"])
+        .iter()
+        .find(|v| v["properties"]["result"]["const"] == "frames")
+        .expect("frames result variant");
+    let value = &frames["properties"]["value"];
+    for f in ["frames", "missed"] {
+        assert!(value["properties"].get(f).is_some(), "frames.{f}: {value}");
+    }
 }
 
 /// Whether a unit field's schema `s` is an integer or a `$ref` to a unit type.
@@ -876,8 +889,8 @@ async fn stream_tail_unknown_stream_lists_known() {
 fn tail_prov() -> zeta_core::types::Provenance {
     zeta_core::types::Provenance {
         source: SourceId("s".into()),
-        job: None,
-        channel: None,
+        job: Some(JobId("j".into())),
+        channel: Some(zeta_core::types::ChannelId("c".into())),
         span: Span {
             start_ns: Timestamp(10),
             end_ns: Timestamp(20),
@@ -901,7 +914,13 @@ async fn stream_tail_times_out_with_empty_when_no_frames() {
         })
         .await;
     let took = t0.elapsed();
-    assert_eq!(r, Ok(OpResult::Frames(vec![])));
+    assert_eq!(
+        r,
+        Ok(OpResult::Frames {
+            frames: vec![],
+            missed: 0
+        })
+    );
     assert!(took >= Duration::from_millis(100), "{took:?}");
     assert!(took < Duration::from_millis(300), "{took:?}");
 }
@@ -940,19 +959,104 @@ async fn stream_tail_returns_collected_when_stream_closes() {
         bus.publish(Frame::new(id.clone(), tail_prov(), Payload::Text(t.into())));
     }
     bus.unregister(&id);
-    let frames = match tail.await.unwrap() {
-        Ok(OpResult::Frames(f)) => f,
+    let (frames, missed) = match tail.await.unwrap() {
+        Ok(OpResult::Frames { frames, missed }) => (frames, missed),
         other => panic!("expected Frames, got {other:?}"),
     };
     assert!(
         t0.elapsed() < Duration::from_secs(2),
         "closed stream must end the tail"
     );
+    assert_eq!(missed, 0);
     assert_eq!(frames.len(), 2);
     for (f, t) in frames.iter().zip(["one", "two"]) {
         assert_eq!(f.stream, id);
+        assert_eq!(f.source, SourceId("s".into()));
+        assert_eq!(f.job, Some(JobId("j".into())));
+        assert_eq!(f.channel, Some(zeta_core::types::ChannelId("c".into())));
         assert_eq!(f.kind, StreamKind::Text);
         assert_eq!((f.start_ns, f.end_ns), (Timestamp(10), Timestamp(20)));
         assert_eq!(f.payload, Value::String(t.into()));
+    }
+}
+
+#[tokio::test]
+async fn stream_tail_counts_missed_frames() {
+    use zeta_core::stream::{Frame, Payload};
+    let dir = tempfile::tempdir().unwrap();
+    let node = Arc::new(
+        Node::open(cfg(dir.path()), registry(), vec![])
+            .await
+            .unwrap(),
+    );
+    let bus = node.bus();
+    let id = bus.register(StreamKind::Text, tail_prov());
+    let (n, sid) = (node.clone(), id.clone());
+    let tail = tokio::spawn(async move {
+        n.apply(Op::StreamTail {
+            stream: sid,
+            max_frames: 1000,
+            timeout_ms: 5000,
+        })
+        .await
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while bus.receiver_count(&id).unwrap_or(0) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tail never subscribed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Single-threaded runtime: the tail cannot drain while these are
+    // published, so it falls more than the bus capacity behind.
+    const SENT: u64 = 600;
+    for i in 0..SENT {
+        bus.publish(Frame::new(
+            id.clone(),
+            tail_prov(),
+            Payload::Text(i.to_string()),
+        ));
+    }
+    bus.unregister(&id);
+    let (frames, missed) = match tail.await.unwrap() {
+        Ok(OpResult::Frames { frames, missed }) => (frames, missed),
+        other => panic!("expected Frames, got {other:?}"),
+    };
+    assert!(missed > 0, "missed {missed}");
+    assert_eq!(frames.len() as u64 + missed, SENT);
+    assert_eq!(frames.last().unwrap().payload, Value::String("599".into()));
+}
+
+#[tokio::test]
+async fn stream_tail_validates_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let id = node.bus().register(StreamKind::Text, tail_prov());
+    for (max_frames, timeout_ms, field, value, max) in [
+        (0, 10, "max_frames", 0, 1000),
+        (1001, 10, "max_frames", 1001, 1000),
+        (1, 0, "timeout_ms", 0, 10_000),
+        (1, 10_001, "timeout_ms", 10_001, 10_000),
+    ] {
+        let r = node
+            .apply(Op::StreamTail {
+                stream: id.clone(),
+                max_frames,
+                timeout_ms,
+            })
+            .await;
+        assert_eq!(
+            r,
+            Err(OpError::OutOfRange {
+                field: field.into(),
+                value,
+                min: 1,
+                max,
+                suggested: None,
+            })
+        );
     }
 }

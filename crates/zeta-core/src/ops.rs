@@ -19,7 +19,9 @@ use crate::node::{Node, NodeError};
 use crate::port::{Port, PortError, Tuning};
 use crate::ring::RingError;
 use crate::stream::{Frame, Payload, StreamInfo};
-use crate::types::{Capabilities, Hz, JobId, Selection, SourceId, StreamId, StreamKind, Timestamp};
+use crate::types::{
+    Capabilities, ChannelId, Hz, JobId, Selection, SourceId, StreamId, StreamKind, Timestamp,
+};
 
 /// One request to the node.
 ///
@@ -63,9 +65,10 @@ pub enum Op {
         selection: Selection,
     },
     StreamList {},
-    /// Collect frames from a stream until `max_frames` arrive or `timeout_ms`
-    /// passes, whichever is first; frames published before the call are not
-    /// seen. Frames skipped because the caller fell behind are dropped.
+    /// Collect frames from a stream until `max_frames` (1..=1000) arrive or
+    /// `timeout_ms` (1..=10000) passes, whichever is first; frames published
+    /// before the call are not seen. Frames skipped because the caller fell
+    /// behind are dropped and counted in the result's `missed`.
     StreamTail {
         stream: StreamId,
         max_frames: u32,
@@ -232,17 +235,23 @@ pub struct SourceInfo {
     pub holders: Vec<JobId>,
 }
 
-/// One frame of a `stream_tail`, as JSON. `start_ns`/`end_ns` are the frame's
-/// provenance span. `payload` by kind: event, the event value; text, the
-/// string; audio, `{"sample_rate_hz", "samples", "peak"}` (count and largest
-/// absolute sample); iq, `{"sample_rate_hz", "center_hz", "samples"}`;
-/// video and sink, `{}`.
+/// One frame of a `stream_tail`, as JSON. `source`, `job`, `channel` and
+/// `start_ns`/`end_ns` are the frame's provenance (`job`/`channel` null when
+/// absent). `payload` by kind: event, the event value; text, the string;
+/// audio, `{"sample_rate_hz", "samples", "peak"}` (count and largest absolute
+/// sample); iq and sink, `{"sample_rate_hz", "center_hz", "samples"}`;
+/// video, `{}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct FrameSummary {
     pub stream: StreamId,
     pub kind: StreamKind,
+    pub source: SourceId,
+    #[schemars(required)]
+    pub job: Option<JobId>,
+    #[schemars(required)]
+    pub channel: Option<ChannelId>,
     pub start_ns: Timestamp,
     pub end_ns: Timestamp,
     pub payload: serde_json::Value,
@@ -261,16 +270,19 @@ impl FrameSummary {
                 "samples": samples.len(),
                 "peak": samples.iter().fold(0.0f32, |m, s| m.max(s.abs())),
             }),
-            Payload::Iq(b) => serde_json::json!({
+            Payload::Iq(b) | Payload::Sink(b) => serde_json::json!({
                 "sample_rate_hz": b.sample_rate_hz.0,
                 "center_hz": b.center_hz.0,
                 "samples": b.samples.len(),
             }),
-            Payload::Video | Payload::Sink(_) => serde_json::json!({}),
+            Payload::Video => serde_json::json!({}),
         };
         Self {
             stream: f.stream.clone(),
             kind: f.kind,
+            source: f.provenance.source.clone(),
+            job: f.provenance.job.clone(),
+            channel: f.provenance.channel.clone(),
             start_ns: f.provenance.span.start_ns,
             end_ns: f.provenance.span.end_ns,
             payload,
@@ -303,7 +315,11 @@ pub enum OpResult {
         path: PathBuf,
     },
     Streams(Vec<StreamInfo>),
-    Frames(Vec<FrameSummary>),
+    /// `missed`: frames skipped during the tail because it fell behind.
+    Frames {
+        frames: Vec<FrameSummary>,
+        missed: u64,
+    },
     Graph(Graph),
     Knowledge {
         allocations: Vec<Allocation>,
@@ -694,14 +710,35 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     ))
 }
 
+/// Most frames and longest wait one `stream_tail` takes.
+const TAIL_MAX_FRAMES: u64 = 1000;
+const TAIL_MAX_TIMEOUT_MS: u64 = 10_000;
+
+/// `field` = `value` must be in `1..=max`; no suggestion is offered.
+fn limit(field: &str, value: u32, max: u64) -> Result<(), OpError> {
+    if (1..=max).contains(&(value as u64)) {
+        return Ok(());
+    }
+    Err(OpError::OutOfRange {
+        field: field.into(),
+        value: value as u64,
+        min: 1,
+        max,
+        suggested: None,
+    })
+}
+
 /// Subscribe to `stream` and collect up to `max` frames within `timeout_ms`.
-/// A lagged receiver keeps going; a closed stream returns what was collected.
+/// A lagged receiver keeps going and counts the skipped frames in `missed`;
+/// a closed stream returns what was collected.
 async fn stream_tail(
     node: &Node,
     stream: StreamId,
     max: u32,
     timeout_ms: u32,
 ) -> Result<OpResult, OpError> {
+    limit("max_frames", max, TAIL_MAX_FRAMES)?;
+    limit("timeout_ms", timeout_ms, TAIL_MAX_TIMEOUT_MS)?;
     let bus = node.bus();
     let Some(mut rx) = bus.subscribe(&stream) else {
         let mut known: Vec<String> = bus.list().into_iter().map(|s| s.id.0).collect();
@@ -713,17 +750,21 @@ async fn stream_tail(
         });
     };
     let mut out = Vec::new();
+    let mut missed = 0u64;
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
     while out.len() < max as usize {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Err(_) => break,
             Ok(Ok(f)) => out.push(FrameSummary::from_frame(&f)),
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => missed += n,
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
         }
     }
-    Ok(OpResult::Frames(out))
+    Ok(OpResult::Frames {
+        frames: out,
+        missed,
+    })
 }
 
 /// Write the selection's span from the source ring as a cf32_le SigMF pair.

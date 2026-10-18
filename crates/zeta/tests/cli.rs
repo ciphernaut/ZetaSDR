@@ -309,9 +309,13 @@ fn job_start_then_tail_prints_aprs_event() {
     let v = json(&out);
     assert_eq!(v[0]["result"], "job");
     assert_eq!(v[1]["result"], "frames");
-    let frames = v[1]["value"].as_array().expect("frames array");
+    assert_eq!(v[1]["value"]["missed"], 0);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0]["kind"], "event");
+    assert_eq!(frames[0]["source"], "aprs");
+    assert_eq!(frames[0]["job"], v[0]["value"]);
+    assert_eq!(frames[0]["channel"], "144800000/12500");
     assert_eq!(frames[0]["payload"]["src"], "VK3ABC");
 }
 

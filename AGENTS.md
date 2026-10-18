@@ -96,7 +96,7 @@ CLI: `zeta stream list`
 
 ### stream_tail
 
-Collect frames from a stream until `max_frames` arrive or `timeout_ms` passes, whichever is first; frames published before the call are not seen. Frames skipped because the caller fell behind are dropped.
+Collect frames from a stream until `max_frames` (1..=1000) arrive or `timeout_ms` (1..=10000) passes, whichever is first; frames published before the call are not seen. Frames skipped because the caller fell behind are dropped and counted in the result's `missed`.
 
 - stream: string; an id from `stream list`
 - max_frames: integer

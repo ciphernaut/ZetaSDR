@@ -63,12 +63,15 @@ async fn stream_tail_returns_events_from_running_job() {
         timeout_ms: 2000,
     };
     let frames = match node.apply(op).await {
-        Ok(OpResult::Frames(f)) => f,
+        Ok(OpResult::Frames { frames, .. }) => frames,
         other => panic!("expected Frames, got {other:?}"),
     };
     assert_eq!(frames.len(), 3);
     for f in &frames {
         assert_eq!(f.stream, stream);
+        assert_eq!(f.source, SourceId("file0".into()));
+        assert_eq!(f.job.as_ref(), Some(&job));
+        assert_eq!(f.channel, None);
         assert_eq!(f.kind, StreamKind::Event);
         assert!(f.end_ns.0 > f.start_ns.0, "{f:?}");
         assert_eq!(f.payload["size"], 1024);
