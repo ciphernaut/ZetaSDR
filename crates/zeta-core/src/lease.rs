@@ -48,6 +48,8 @@ impl From<PortError> for LeaseError {
 #[derive(Default)]
 pub struct LeaseManager {
     leases: Mutex<HashMap<SourceId, Vec<(JobId, Tuning)>>>,
+    /// Per-source gate held for the whole of `ensure`, across `port.tune().await`.
+    gates: Mutex<HashMap<SourceId, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 fn band(t: &Tuning) -> (u64, u64) {
@@ -74,6 +76,8 @@ impl LeaseManager {
         want: Tuning,
     ) -> Result<Tuning, LeaseError> {
         let source = port.id().clone();
+        let gate = self.gates.lock().unwrap().entry(source.clone()).or_default().clone();
+        let _guard = gate.lock().await;
         {
             let mut leases = self.leases.lock().unwrap();
             let held = leases.get(&source).is_some_and(|v| !v.is_empty());
@@ -102,7 +106,7 @@ impl LeaseManager {
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source).or_default();
         v.retain(|(j, _)| j != &holder);
-        v.push((holder, want));
+        v.push((holder, got));
         Ok(got)
     }
 
@@ -133,6 +137,8 @@ mod tests {
         caps: Capabilities,
         cur: Mutex<Option<Tuning>>,
         tx: tokio::sync::broadcast::Sender<crate::port::IqBlock>,
+        tunes: std::sync::atomic::AtomicUsize,
+        delay: bool,
     }
 
     impl FakePort {
@@ -152,6 +158,8 @@ mod tests {
                 },
                 cur: Mutex::new(None),
                 tx: tokio::sync::broadcast::channel(1).0,
+                tunes: std::sync::atomic::AtomicUsize::new(0),
+                delay: false,
             }
         }
     }
@@ -165,6 +173,10 @@ mod tests {
             &self.caps
         }
         async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+            self.tunes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.delay {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
             *self.cur.lock().unwrap() = Some(t);
             Ok(t)
         }
@@ -221,5 +233,22 @@ mod tests {
         m.release(&j1);
         let want = t(433_000_000, 1_000_000);
         assert_eq!(m.ensure(&p, j2, want).await.unwrap(), want);
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensure_on_unheld_port_yields_one_tune() {
+        let mut p = FakePort::new();
+        p.delay = true;
+        let m = LeaseManager::new();
+        let (j1, j2) = (JobId::new(), JobId::new());
+        let (a, b) = tokio::join!(
+            m.ensure(&p, j1, t(100_000_000, 1_000_000)),
+            m.ensure(&p, j2, t(433_000_000, 1_000_000)),
+        );
+        let conflicts = [&a, &b].iter().filter(|r| matches!(r, Err(LeaseError::Conflict { .. }))).count();
+        assert_eq!(conflicts, 1);
+        assert_eq!([&a, &b].iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(m.holders(p.id()).len(), 1);
     }
 }
