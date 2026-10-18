@@ -77,16 +77,20 @@ fn fits(want: &Tuning, cur: &Tuning) -> bool {
     wl >= cl && wh <= ch
 }
 
-/// Ways out of a conflict between `want` and the port's current band `cur`.
+/// Ways out of a conflict between `want` and the port's current band `cur`
+/// that the caller can act on. Widening is listed only when the port could
+/// capture both bands at once; no operation performs it yet.
 fn conflict_options(port: &dyn Port, want: &Tuning, cur: &Tuning) -> Vec<String> {
-    let mut options = vec!["stop one of the holders".to_string()];
+    let mut options = vec![
+        "stop one of the holders".to_string(),
+        "choose a band inside current".to_string(),
+    ];
     let (wl, wh) = band(want);
     let (cl, ch) = band(cur);
     let n = wh.max(ch) - wl.min(cl);
     if n <= port.capabilities().max_bandwidth_hz.value().0 {
-        options.push(format!("widen capture to {n} Hz"));
+        options.push(format!("widen capture to {n} Hz (not yet available)"));
     }
-    options.push("run a scan job".to_string());
     options
 }
 
@@ -303,14 +307,40 @@ mod tests {
         m.ensure(&p, j1.clone(), first).await.unwrap();
         match m.ensure(&p, j2, t(433_000_000, 1_000_000)).await {
             Err(LeaseError::Conflict {
-                holders, options, ..
+                holders,
+                current,
+                options,
+                ..
             }) => {
                 assert_eq!(holders, vec![j1]);
-                assert!(options.iter().any(|o| o.contains("scan")));
+                assert_eq!(current, first);
+                assert_eq!(
+                    options,
+                    vec!["stop one of the holders", "choose a band inside current"]
+                );
             }
             other => panic!("expected conflict, got {other:?}"),
         }
         assert_eq!(p.current(), Some(first));
+    }
+
+    #[tokio::test]
+    async fn conflict_offers_widening_only_when_the_port_can() {
+        let (p, m) = (FakePort::new(), LeaseManager::new());
+        m.ensure(&p, JobId::new(), t(100_000_000, 1_000_000))
+            .await
+            .unwrap();
+        match m.ensure(&p, JobId::new(), t(105_000_000, 1_000_000)).await {
+            Err(LeaseError::Conflict { options, .. }) => assert_eq!(
+                options,
+                vec![
+                    "stop one of the holders",
+                    "choose a band inside current",
+                    "widen capture to 6000000 Hz (not yet available)",
+                ]
+            ),
+            other => panic!("expected conflict, got {other:?}"),
+        }
     }
 
     #[tokio::test]

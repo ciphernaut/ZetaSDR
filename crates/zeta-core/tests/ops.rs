@@ -613,3 +613,52 @@ async fn iq_read_rejects_zero_bandwidth() {
         other => panic!("expected OutOfRange, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn conflict_reports_current_tuning_and_real_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    let source = SourceId("hackrf0".into());
+    let held = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(200_000),
+    };
+    let start = Op::JobStart {
+        kind: JobKind::Passthrough,
+        source: source.clone(),
+        center_hz: held.center_hz,
+        bandwidth_hz: held.bandwidth_hz,
+    };
+    let job = match node.apply(start).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected Job, got {other:?}"),
+    };
+    let ensure = Op::SourceEnsure {
+        source: source.clone(),
+        center_hz: Hz(433_000_000),
+        bandwidth_hz: Hz(200_000),
+    };
+    match node.apply(ensure).await {
+        Err(OpError::Conflict {
+            source: s,
+            holders,
+            current,
+            options,
+        }) => {
+            assert_eq!(s, source);
+            assert_eq!(holders, vec![job]);
+            assert_eq!(current, held);
+            assert_eq!(
+                options,
+                vec!["stop one of the holders", "choose a band inside current"]
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}

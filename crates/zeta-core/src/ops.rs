@@ -173,9 +173,12 @@ pub enum OpError {
         #[schemars(required)]
         suggested: Option<u64>,
     },
+    /// The source is held by `holders` at `current`, which the request does
+    /// not fit inside.
     Conflict {
         source: SourceId,
         holders: Vec<JobId>,
+        current: Tuning,
         options: Vec<String>,
     },
     Unknown {
@@ -218,12 +221,15 @@ impl std::fmt::Display for OpError {
             OpError::Conflict {
                 source,
                 holders,
+                current,
                 options,
             } => write!(
                 f,
-                "source {} is held by {:?}; options: {}",
+                "source {} is held by {:?} at centre {} Hz, bandwidth {} Hz; options: {}",
                 source.0,
                 holders.iter().map(|j| j.0.as_str()).collect::<Vec<_>>(),
+                current.center_hz.0,
+                current.bandwidth_hz.0,
                 options.join("; ")
             ),
             OpError::Unknown {
@@ -334,11 +340,12 @@ fn lease_error(e: LeaseError) -> OpError {
         LeaseError::Conflict {
             source,
             holders,
+            current,
             options,
-            ..
         } => OpError::Conflict {
             source,
             holders,
+            current,
             options,
         },
         LeaseError::Port(p) => port_error(p),
