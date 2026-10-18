@@ -3764,6 +3764,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "zeta-core",
+ "zeta-source-file",
  "zeta-ws",
 ]
 
