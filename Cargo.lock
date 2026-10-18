@@ -1015,10 +1015,12 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
  "ulid",
+ "zeta-source-file",
 ]
 
 [[package]]
