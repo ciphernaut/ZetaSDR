@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::NodeError;
-use crate::job::JobRecord;
+use crate::job::{JOB_RECORD_FORMAT, JobRecord};
 use crate::types::Timestamp;
 
 pub(super) fn now() -> Timestamp {
@@ -45,18 +45,31 @@ pub(super) fn load(dir: &Path) -> Result<(Vec<JobRecord>, Vec<String>), NodeErro
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let parsed = std::fs::read_to_string(&path)
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let value = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str::<JobRecord>(&s).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let format = value
+            .as_ref()
+            .and_then(|v| v.get("format"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(u64::from(JOB_RECORD_FORMAT));
+        if format > u64::from(JOB_RECORD_FORMAT) {
+            errors.push(format!(
+                "{name}: format {format} newer than supported {JOB_RECORD_FORMAT}"
+            ));
+            continue;
+        }
+        let parsed = value
+            .and_then(|v| serde_json::from_value::<JobRecord>(v).ok())
             .filter(|r| r.id.0 == stem && r.id.0.parse::<ulid::Ulid>().is_ok());
         match parsed {
             Some(r) => records.push(r),
-            None => errors.push(
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            None => errors.push(name),
         }
     }
     Ok((records, errors))

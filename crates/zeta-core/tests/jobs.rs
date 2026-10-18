@@ -399,3 +399,57 @@ async fn record_with_mismatched_id_is_skipped() {
     assert_eq!(errors, want);
     assert!(!jobs.join(format!("{}.json.tmp", other.0)).exists());
 }
+
+/// Persist one stopped record, then rewrite its file with `edit` applied to the raw JSON.
+async fn reopen_with_edited_record(
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> (Node, JobId, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    src.start();
+    let id = start_job(&node).await;
+    node.job_stop(&id).await.unwrap();
+    drop(node);
+    let path = dir
+        .path()
+        .join("state")
+        .join("jobs")
+        .join(format!("{}.json", id.0));
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    edit(v.as_object_mut().unwrap());
+    std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let mut c = cfg(dir.path());
+    c.resume = false;
+    let node = Node::open(c, registry(), vec![port]).await.unwrap();
+    (node, id, dir)
+}
+
+#[tokio::test]
+async fn format_1_record_without_format_field_loads() {
+    let (node, id, _dir) = reopen_with_edited_record(|m| {
+        assert!(m.remove("format").is_some());
+    })
+    .await;
+    let list = node.job_list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, id);
+    assert_eq!(list[0].format, 1);
+    assert!(node.load_errors().is_empty());
+}
+
+#[tokio::test]
+async fn newer_format_record_is_reported_not_loaded() {
+    let (node, id, _dir) = reopen_with_edited_record(|m| {
+        m.insert("format".into(), serde_json::json!(2));
+    })
+    .await;
+    assert!(node.job_list().is_empty());
+    assert_eq!(
+        node.load_errors(),
+        [format!("{}.json: format 2 newer than supported 1", id.0)]
+    );
+}

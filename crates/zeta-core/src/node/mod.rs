@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::classify::{Classifier, ClassifierSet};
 use crate::graph::{self, Graph, GraphError};
-use crate::job::{JobRecord, JobState};
+use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
 use crate::ops::{Op, OpError, OpResult};
@@ -257,6 +257,7 @@ impl Node {
         graph: Graph,
     ) -> Result<JobId, NodeError> {
         let rec = JobRecord {
+            format: JOB_RECORD_FORMAT,
             id: JobId::new(),
             kind: kind.to_string(),
             graph,
