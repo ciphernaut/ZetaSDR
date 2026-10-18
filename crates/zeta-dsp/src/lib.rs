@@ -14,6 +14,7 @@ pub mod aprs;
 pub mod ax25;
 pub mod channel;
 pub mod fft;
+pub mod identify;
 pub mod measure;
 pub mod nbfm;
 pub mod util;
@@ -34,7 +35,10 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
 
 /// This crate's classifiers, lowest layer first.
 pub fn classifiers() -> Vec<Arc<dyn Classifier>> {
-    vec![Arc::new(measure::Layer1Classifier)]
+    vec![
+        Arc::new(measure::Layer1Classifier),
+        Arc::new(identify::DecodeToIdentify),
+    ]
 }
 
 /// Span of `n` samples at `rate_hz` starting at `t0`; zero-length when `rate_hz` is 0.
