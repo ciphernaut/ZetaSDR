@@ -57,10 +57,13 @@ Five job kinds, chosen with `job start --kind` (`zeta job start --help` lists th
 - `aprs_decode` demodulates AFSK 1200 and HDLC-deframes AX.25, emitting one event per CRC-valid packet.
 - `measure` emits one layer-1 feature record per second of IQ (occupied band, SNR, burst, symbol rate, label).
 
-`--then-tail N,MS` on `job start` starts the job and then tails up to N frames from its stream, waiting
-up to MS ms; the same thing is available later as `zeta stream tail`. `zeta classify` runs every
-classifier (layer 1 measurement, layer 2 signature and decode-to-identify) over a span of a source ring.
-Outputs below are trimmed.
+`--then-tail N,MS` on `job start` starts the job, tails up to N frames from its event (else audio)
+stream, waiting up to MS ms, then stops the job unless `--keep` is given, and prints
+`[job, frames, {"stopped": bool}]`. If the job is not running (for example it failed), it prints
+`[job, job_record]` and exits 2. `zeta stream tail` tails a stream on its own. `--then-tail` is
+not supported with `--node` yet: start the job remotely, then `stream list` and `stream tail`.
+`zeta classify` runs every classifier (layer 1 measurement, layer 2 signature and
+decode-to-identify) over a span of a source ring. Outputs below are trimmed.
 
 ```bash
 cargo build -q -p zeta
