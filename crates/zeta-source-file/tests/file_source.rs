@@ -82,3 +82,89 @@ async fn tune_off_center_is_out_of_range() {
     let ok = Tuning { center_hz: Hz(100_000_000), bandwidth_hz: Hz(48_000) };
     assert_eq!(src.tune(ok).await.unwrap(), ok);
 }
+
+fn write_raw(dir: &std::path::Path, dt: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let meta = dir.join("raw.sigmf-meta");
+    std::fs::write(
+        &meta,
+        format!(r#"{{"global":{{"core:datatype":"{dt}","core:sample_rate":48000}},"captures":[{{"core:frequency":100000000}}]}}"#),
+    )
+    .unwrap();
+    std::fs::write(dir.join("raw.sigmf-data"), bytes).unwrap();
+    meta
+}
+
+fn opts(repeat: bool) -> FileOpts {
+    FileOpts { realtime: false, block_samples: 4800, repeat }
+}
+
+async fn finished(h: tokio::task::JoinHandle<()>) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(2), h).await.is_ok()
+}
+
+#[tokio::test]
+async fn producer_exits_when_receivers_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = FileSource::open(SourceId("f".into()), &common::tone(dir.path()), opts(true)).unwrap();
+    let rx = src.subscribe();
+    let h = src.start();
+    drop(rx);
+    assert!(finished(h).await);
+}
+
+#[tokio::test]
+async fn producer_exits_when_source_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = FileSource::open(SourceId("f".into()), &common::tone(dir.path()), opts(true)).unwrap();
+    let _rx = src.subscribe();
+    let h = src.start();
+    drop(src);
+    assert!(finished(h).await);
+}
+
+#[test]
+fn odd_length_data_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = write_raw(dir.path(), "ci16_le", &[1, 2, 3]);
+    assert!(matches!(FileSource::open(SourceId("f".into()), &meta, opts(false)), Err(PortError::Io(_))));
+}
+
+#[tokio::test]
+async fn ci8_and_ci16_scale_to_unit_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let m8 = write_raw(dir.path(), "ci8", &[127, 0x80]);
+    let src = FileSource::open(SourceId("a".into()), &m8, opts(false)).unwrap();
+    let mut rx = src.subscribe();
+    let _h = src.start();
+    let b = rx.recv().await.unwrap();
+    assert_eq!((b.samples[0].re, b.samples[0].im), (0.9921875, -1.0));
+
+    let mut bytes = 32767i16.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&(-32768i16).to_le_bytes());
+    let m16 = write_raw(dir.path(), "ci16_le", &bytes);
+    let src = FileSource::open(SourceId("b".into()), &m16, opts(false)).unwrap();
+    let mut rx = src.subscribe();
+    let _h = src.start();
+    let b = rx.recv().await.unwrap();
+    assert!((b.samples[0].re - 1.0).abs() < 1e-4 && b.samples[0].re < 1.0);
+    assert_eq!(b.samples[0].im, -1.0);
+}
+
+#[tokio::test]
+async fn repeat_keeps_t0_monotonic() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = FileSource::open(SourceId("f".into()), &common::tone(dir.path()), opts(true)).unwrap();
+    let mut rx = src.subscribe();
+    let _h = src.start();
+    let mut prev: Option<Timestamp> = None;
+    for i in 0..12 {
+        let b = rx.recv().await.unwrap();
+        if let Some(p) = prev {
+            assert!(b.t0.0 > p.0);
+        }
+        if i == 10 {
+            assert_eq!(b.t0, Timestamp(1_000_000_000));
+        }
+        prev = Some(b.t0);
+    }
+}

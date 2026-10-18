@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -137,6 +138,13 @@ pub struct FileSource {
     opts: FileOpts,
     samples: Arc<[Complex<f32>]>,
     tx: broadcast::Sender<IqBlock>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Drop for FileSource {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
 }
 
 impl FileSource {
@@ -151,6 +159,14 @@ impl FileSource {
         }
         let data_path: PathBuf = meta_path.with_extension("sigmf-data");
         let raw = std::fs::read(&data_path).map_err(|e| io(format!("{}: {e}", data_path.display())))?;
+        let unit = match fmt {
+            SampleFormat::Cf32 => 8,
+            SampleFormat::Ci16 => 4,
+            SampleFormat::Ci8 => 2,
+        };
+        if raw.len() % unit != 0 {
+            return Err(io(format!("{}: length not a multiple of {unit} bytes", data_path.display())));
+        }
         let samples: Arc<[Complex<f32>]> = convert(fmt, &raw).into();
         let caps = Capabilities {
             tune_min_hz: Claim::Asserted(meta.center_hz),
@@ -164,14 +180,16 @@ impl FileSource {
             push: true,
         };
         let (tx, _) = broadcast::channel(64);
-        Ok(Self { id, meta, caps, opts, samples, tx })
+        Ok(Self { id, meta, caps, opts, samples, tx, stopped: Arc::new(AtomicBool::new(false)) })
     }
 
-    /// Begin broadcasting blocks to subscribers.
+    /// Begin broadcasting blocks to subscribers. Call `subscribe()` first: the task
+    /// exits as soon as there are no receivers, or when this source is dropped.
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
         let tx = self.tx.clone();
         let samples = self.samples.clone();
         let (meta, opts) = (self.meta.clone(), self.opts);
+        let stopped = self.stopped.clone();
         tokio::spawn(async move {
             let rate = meta.sample_rate_hz.0;
             let mut elapsed: u64 = 0;
@@ -180,6 +198,9 @@ impl FileSource {
             }
             loop {
                 for chunk in samples.chunks(opts.block_samples) {
+                    if stopped.load(Ordering::Relaxed) || tx.receiver_count() == 0 {
+                        return;
+                    }
                     let t0 = Timestamp(meta.start.0 + (elapsed as u128 * 1_000_000_000 / rate as u128) as u64);
                     elapsed += chunk.len() as u64;
                     let _ = tx.send(IqBlock {
