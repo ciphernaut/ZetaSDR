@@ -9,6 +9,7 @@ use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{Span, Timestamp};
 
 pub mod afsk;
+pub mod aprs;
 pub mod ax25;
 pub mod channel;
 pub mod fft;
@@ -25,6 +26,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(channel::ChannelStage::new()));
     reg.register(Arc::new(fft::FftStage::new(Arc::new(fft::CpuFft::new()))));
     reg.register(Arc::new(nbfm::NbfmDemodStage::new()));
+    reg.register(Arc::new(aprs::AprsDecodeStage::new()));
 }
 
 /// Span of `n` samples at `rate_hz` starting at `t0`; zero-length when `rate_hz` is 0.

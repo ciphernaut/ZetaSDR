@@ -94,6 +94,7 @@ pub enum JobKind {
     Passthrough,
     Spectrum,
     FmDemod,
+    AprsDecode,
 }
 
 impl JobKind {
@@ -103,6 +104,7 @@ impl JobKind {
             JobKind::Passthrough => "passthrough",
             JobKind::Spectrum => "spectrum",
             JobKind::FmDemod => "fm_demod",
+            JobKind::AprsDecode => "aprs_decode",
         }
     }
 
@@ -151,6 +153,45 @@ impl JobKind {
                         to: demod,
                         kind: StreamKind::Iq,
                     }],
+                }
+            }
+            JobKind::AprsDecode => {
+                let (channel, demod, decode) = (NodeId::new(), NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": 48_000,
+                            }),
+                        },
+                        GraphNode {
+                            id: demod.clone(),
+                            kind: "nbfm_demod".into(),
+                            params: serde_json::json!({"deviation_hz": 3_000, "audio_rate_hz": 48_000}),
+                        },
+                        GraphNode {
+                            id: decode.clone(),
+                            kind: "aprs_decode".into(),
+                            params: serde_json::json!({}),
+                        },
+                    ],
+                    edges: vec![
+                        Edge {
+                            from: channel,
+                            to: demod.clone(),
+                            kind: StreamKind::Iq,
+                        },
+                        Edge {
+                            from: demod,
+                            to: decode,
+                            kind: StreamKind::Audio,
+                        },
+                    ],
                 }
             }
         }

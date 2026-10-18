@@ -156,6 +156,8 @@ pub enum Kind {
     // Spelled as on the wire, not clap's default `fm-demod`.
     #[value(name = "fm_demod")]
     FmDemod,
+    #[value(name = "aprs_decode")]
+    AprsDecode,
 }
 
 impl From<Kind> for JobKind {
@@ -164,6 +166,7 @@ impl From<Kind> for JobKind {
             Kind::Passthrough => JobKind::Passthrough,
             Kind::Spectrum => JobKind::Spectrum,
             Kind::FmDemod => JobKind::FmDemod,
+            Kind::AprsDecode => JobKind::AprsDecode,
         }
     }
 }

@@ -119,3 +119,86 @@ async fn fm_demod_job_produces_audio_with_tone() {
     assert_eq!(peak, 1_000.0);
     assert!((rms - 0.707).abs() <= 0.0707, "rms {rms}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aprs_decode_job_decodes_fixture_packet() {
+    const RATE: u32 = 48_000;
+    const CENTER: u64 = 144_800_000;
+    let dir = tempfile::tempdir().unwrap();
+    let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", RATE, 0.0);
+    let meta = write_fixture(dir.path(), "aprs", &iq, RATE, CENTER);
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 4800,
+        repeat: true,
+    };
+    let src = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
+    let port: Arc<dyn Port> = src.clone();
+    let mut reg = StageRegistry::new();
+    zeta_dsp::register_all(&mut reg);
+    let cfg = NodeConfig {
+        state_dir: dir.path().join("state"),
+        ring_seconds: 1.0,
+        backends: vec![Backend::Cpu],
+        resume: true,
+    };
+    let node = Node::open(cfg, reg, vec![port]).await.unwrap();
+    src.start();
+
+    let started = tokio::time::Instant::now();
+    let OpResult::Job(id) = node
+        .apply(Op::JobStart {
+            kind: JobKind::AprsDecode,
+            source: SourceId("file0".into()),
+            center_hz: Hz(CENTER),
+            bandwidth_hz: Hz(12_500),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a job id")
+    };
+
+    let bus = node.bus();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let stream = loop {
+        let found = bus
+            .list()
+            .into_iter()
+            .find(|s| s.kind == StreamKind::Event && s.provenance.job.as_ref() == Some(&id));
+        if let Some(s) = found {
+            break s.id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no event stream for the job"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let mut rx = bus.subscribe(&stream).unwrap();
+
+    let ev = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(f) => {
+                    let Payload::Event(v) = f.payload.clone() else {
+                        panic!("expected an event payload")
+                    };
+                    break v;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("event stream ended: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("an event within 5 s");
+    eprintln!(
+        "aprs_decode end to end: first event after {:?}: {ev}",
+        started.elapsed()
+    );
+    assert_eq!(ev["src"], "VK3ABC");
+    assert_eq!(ev["dst"], "APRS");
+    assert_eq!(ev["info"], ">hi");
+    assert_eq!(ev["fcs_ok"], true);
+}
