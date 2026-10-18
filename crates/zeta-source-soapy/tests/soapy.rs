@@ -210,6 +210,63 @@ async fn retune_failure_names_the_call_and_faults() {
     assert_deactivated(&dev).await;
 }
 
+#[tokio::test]
+async fn retune_timeout_faults_and_next_tune_reopens() {
+    let mut reads = samples(1);
+    reads.extend(vec![MockRead::Timeout; 3]);
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
+    let src = Arc::new(
+        SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
+            .unwrap()
+            .with_retune_timeout(Duration::from_millis(100)),
+    );
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    next_block(&mut rx).await;
+    dev.delay_next("set_frequency", 300);
+    let Err(PortError::Io(m)) = src.tune(tuning(101_000_000, 1_000_000)).await else {
+        panic!("expected Io")
+    };
+    assert_eq!(m, "soapy retune timed out");
+    assert_eq!(src.fault().as_deref(), Some("soapy retune timed out"));
+    // The reader still applies the late retune; `current` follows the device.
+    assert!(
+        wait_until(1_000, || src.current()
+            == Some(tuning(101_000_000, 1_000_000)))
+        .await,
+        "{:?}",
+        src.current()
+    );
+    // Faulted: the old band is not short-circuited but reopened.
+    let opens = |d: &MockDevice| d.calls().iter().filter(|c| *c == "activate").count();
+    let got = src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    assert_eq!(got, tuning(100_000_000, 1_000_000));
+    assert_eq!(src.current(), Some(got));
+    assert_eq!(src.fault(), None);
+    assert_eq!(opens(&dev), 2);
+}
+
+#[tokio::test]
+async fn t0_monotonic_across_reopen() {
+    // Ten instant blocks run 164 ms ahead of the wall clock, then the unplug.
+    let mut reads = samples(10);
+    reads.push(MockRead::Fatal("LIBUSB_ERROR_IO".into()));
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
+    let src = source(&dev);
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    let mut last = None;
+    for _ in 0..10 {
+        last = Some(next_block(&mut rx).await);
+    }
+    let last = last.unwrap();
+    assert!(wait_until(500, || src.fault().is_some()).await);
+    dev.push_reads(samples(1));
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    let b = next_block(&mut rx).await;
+    assert!(b.t0.0 >= end_ns(&last), "{} < {}", b.t0.0, end_ns(&last));
+}
+
 async fn node_with(src: Arc<SoapySource>) -> (Node, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut reg = StageRegistry::new();
@@ -249,15 +306,15 @@ async fn wait_failed(node: &Node, ms: u64) -> String {
 
 #[tokio::test]
 async fn unplug_mid_stream_fails_job() {
-    // `JobStart` tunes twice (`tune_if_unheld`, then the lease); a leading
-    // 100 ms timeout keeps the unplug after both, as a real device would.
-    let mut reads = vec![MockRead::Timeout];
-    reads.extend(samples(5));
-    reads.push(MockRead::Fatal("LIBUSB_ERROR_NO_DEVICE".into()));
-    let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
+    // Empty script (100 ms timeouts) until the job runs, then the unplug.
+    let dev = Arc::new(MockDevice::hackrf_like());
     let src = source(&dev);
     let (node, _dir) = node_with(src.clone()).await;
     node.apply(passthrough()).await.unwrap();
+    assert_eq!(node.job_list()[0].state, JobState::Running);
+    let mut reads = samples(5);
+    reads.push(MockRead::Fatal("LIBUSB_ERROR_NO_DEVICE".into()));
+    dev.push_reads(reads);
     let reason = wait_failed(&node, 1_000).await;
     assert!(
         reason.contains("source sdr0: read failed") && reason.contains("LIBUSB_ERROR_NO_DEVICE"),

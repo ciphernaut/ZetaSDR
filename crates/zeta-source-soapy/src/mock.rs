@@ -26,6 +26,7 @@ pub struct MockDevice {
     calls: Arc<Mutex<Vec<String>>>,
     rate: Mutex<f64>,
     fails: Arc<Mutex<Vec<(String, String)>>>,
+    delays: Mutex<Vec<(String, u64)>>,
 }
 
 impl MockDevice {
@@ -49,6 +50,7 @@ impl MockDevice {
             calls: Arc::default(),
             rate: Mutex::new(0.0),
             fails: Arc::default(),
+            delays: Mutex::default(),
         }
     }
 
@@ -84,6 +86,12 @@ impl MockDevice {
         self.fails.lock().unwrap().push((op.into(), msg.into()));
     }
 
+    /// Make the next named control call (`set_frequency`, `set_sample_rate`)
+    /// block for `ms` before it completes.
+    pub fn delay_next(&self, op: &str, ms: u64) {
+        self.delays.lock().unwrap().push((op.into(), ms));
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
@@ -93,6 +101,13 @@ impl MockDevice {
     }
 
     fn check(&self, op: &str) -> Result<(), String> {
+        let ms = {
+            let mut d = self.delays.lock().unwrap();
+            d.iter().position(|(o, _)| o == op).map(|i| d.remove(i).1)
+        };
+        if let Some(ms) = ms {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
         take_fail(&self.fails, op)
     }
 }
