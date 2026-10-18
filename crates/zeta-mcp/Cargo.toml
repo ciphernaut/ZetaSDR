@@ -12,6 +12,13 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "env"] }
 rmcp = { version = "3.5", default-features = false, features = ["server", "transport-io"] }
+serde_json = "1.0.154"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "io-std"] }
 zeta-client = { path = "../zeta-client" }
 zeta-core = { path = "../zeta-core" }
+
+[dev-dependencies]
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "process", "io-util"] }
+zeta-ws = { path = "../zeta-ws", features = ["test-server"] }

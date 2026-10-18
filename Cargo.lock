@@ -2961,9 +2961,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "rmcp",
+ "serde_json",
+ "tempfile",
  "tokio",
  "zeta-client",
  "zeta-core",
+ "zeta-ws",
 ]
 
 [[package]]
