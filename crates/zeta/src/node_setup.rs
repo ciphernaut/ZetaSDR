@@ -83,3 +83,68 @@ pub async fn open(
     }
     Ok(node)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeta_core::graph::validate;
+    use zeta_core::ops::{JobKind, OpError, schema};
+    use zeta_core::port::Tuning;
+    use zeta_core::types::Hz;
+
+    fn param(n: &zeta_core::graph::Node, key: &str) -> u64 {
+        n.params[key].as_u64().unwrap()
+    }
+
+    #[test]
+    fn every_job_kind_expands_to_a_valid_graph() {
+        let schema = schema();
+        let kinds: Vec<JobKind> = schema["op"]["$defs"]["JobKind"]["enum"]
+            .as_array()
+            .expect("JobKind enum in the schema")
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()).unwrap())
+            .collect();
+        assert!(kinds.len() >= 5, "kinds read from schema: {kinds:?}");
+        let src = SourceId("src".into());
+        let registry = registry();
+        for kind in kinds {
+            for rate in [
+                12_000u64, 48_000, 1_000_000, 2_048_000, 2_400_000, 8_000_000, 10_000_000,
+                20_000_000,
+            ] {
+                for bw in [10_000u64, 12_500] {
+                    let tuning = Tuning {
+                        center_hz: Hz(7_100_000),
+                        bandwidth_hz: Hz(bw),
+                    };
+                    match kind.expand(&src, tuning, Hz(rate), None) {
+                        Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
+                            assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
+                        }
+                        Ok(g) => {
+                            validate(&g, &registry)
+                                .unwrap_or_else(|e| panic!("{kind:?} {rate} {bw}: {e}"));
+                            for n in g.nodes.iter().filter(|n| n.kind == "channel") {
+                                let out = param(n, "out_rate_hz");
+                                assert_eq!(rate % out, 0, "{kind:?} {rate} {bw}");
+                                assert!(param(n, "bandwidth_hz") <= out);
+                                for e in g.edges.iter().filter(|e| e.from == n.id) {
+                                    let to = g.nodes.iter().find(|m| m.id == e.to).unwrap();
+                                    if to.kind == "nbfm_demod" {
+                                        assert_eq!(
+                                            out % param(to, "audio_rate_hz"),
+                                            0,
+                                            "{kind:?} {rate} {bw}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => panic!("{kind:?} {rate} {bw}: {e}"),
+                    }
+                }
+            }
+        }
+    }
+}
