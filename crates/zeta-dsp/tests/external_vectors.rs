@@ -54,10 +54,21 @@ fn direwolf_frame_through_deframer() {
 fn direwolf_audio_decodes() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data/direwolf-1.7-vk3abc9-48k.wav");
-    let Ok(wav) = std::fs::read(&path) else {
-        eprintln!("skipping: {} not present", path.display());
-        return;
+    let wav = match std::fs::read(&path) {
+        Ok(w) => w,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        Err(e) => panic!("reading {}: {e}", path.display()),
     };
+    // Pin the fixture: length, and FNV-1a 64 (no hash dependency). The external reference is the
+    // SHA-256 in the module comment.
+    assert_eq!(wav.len(), 67_446);
+    let fnv = wav.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    assert_eq!(fnv, 0xd527_b632_6ef4_eabb, "fixture changed");
     assert!(wav.len() > 44);
     assert_eq!(&wav[0..4], b"RIFF");
     assert_eq!(&wav[8..16], b"WAVEfmt ");
