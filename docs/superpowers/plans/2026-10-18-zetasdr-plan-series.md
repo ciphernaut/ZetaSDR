@@ -11,7 +11,7 @@ interfaces rather than guessed ones.
 | 1 | Core node | Cargo workspace, typed streams, port trait with leases, IQ ring buffer, SigMF file source, graph document, persistent job runtime, operation set with JSON schema and corrective errors, stage registry with multi-implementation selection, knowledge and classifier traits with stubs, `zeta` CLI, AGENTS.md seed generated from the schema. Test suite passes with no hardware. | none |
 | 2 | DSP slice | Channeliser, NBFM demod to an audio stream, AFSK1200/APRS decode-to-identify to an event stream, layer-1 classical measurement producing feature records, CPU and GPU FFT implementations of one stage. **Delivered** on branch `dsp-slice`, 2026-10-19. GPU hardware equivalence (`gpu_matches_cpu_within_0_1_db`) is pending on the field host. | 1 |
 | 3 | Transports and agent | Websocket+JSON server with shared secret, MCP server generated from the schema, OpenAI-compatible in-process agent adapter (thinking off, token budget, readiness sequence, prose-answer detection), skill and tool descriptions generated from AGENTS.md. **Delivered** on branch `transports-agent`, 2026-10-19. | 1 |
-| 4 | Hardware and foreign sources | HackRF via SoapySDR plugin crate, KiwiSDR websocket client, external-process plugin SDK (Python) speaking the typed envelope. **Delivered** on branch `hardware-sources`, 2026-10-19. Pending: the HackRF hardware test and the `cfg(soapy)` driver build (`libsoapysdr-dev` is not installed on the dev box); GPU equivalence on the field host is still pending from plan 2. | 1, 2 |
+| 4 | Hardware and foreign sources | HackRF via SoapySDR plugin crate, KiwiSDR websocket client, external-process plugin SDK (Python) speaking the typed envelope. **Delivered** on branch `hardware-sources`, 2026-10-19. The `cfg(soapy)` driver build and clippy passed against SoapySDR 0.8.1 once `libsoapysdr-dev` was installed later the same day. Pending: the HackRF hardware test; GPU equivalence on the field host is still pending from plan 2. | 1, 2 |
 | 5 | Federation | Node-to-node: VITA 49.2 for IQ, typed envelope for the rest, back-pressure, shared secret, Pi 5 build and deployment, remote node as a source. | 3, 4 |
 | 6 | UI | Wide renderer (waterfall, ribbons, context menu, agent pane, jobs), narrow renderer, graph view. All clients of the plan-3 websocket. | 3 |
 
@@ -55,5 +55,7 @@ two records with finite `snr_db` (5.1 and 5.4 dB, labelled `noise`, reception is
 12000; the ignored live test passed (24 blocks in 1.29 s, RSSI -71 dBm). By hand, `gain.py` ran
 inside a job of a `serve --listen` node after `graph put`: `stream list` showed the job's two iq
 streams, each tailed three 4800-sample frames, and after `job stop` and stopping the server no
-`gain.py` process remained. Not run: the HackRF live test and `cargo clippy` under
-`--cfg soapy`, both needing `libsoapysdr-dev`.
+`gain.py` process remained. Later on 2026-10-19, with `libsoapysdr-dev` installed, `RUSTFLAGS="--cfg soapy" cargo build -p zeta`
+and `cargo clippy -p zeta --all-targets -- -D warnings` passed against SoapySDR 0.8.1 (HackRF
+module 0.3.4); `zeta soapy find` printed `[]` with no device attached and a `--source-soapy`
+open with no device exited 1 with a clear error. Not run: the HackRF live test (no hardware yet).
