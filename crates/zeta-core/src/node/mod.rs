@@ -1,13 +1,14 @@
 //! The node: owns ports, leases, rings and the stream bus, and runs graphs as
 //! persistent jobs that resume after restart.
 
+mod launch;
+mod persist;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::broadcast::error::RecvError;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::classify::{Classifier, ClassifierSet};
@@ -16,13 +17,14 @@ use crate::job::{JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
 use crate::ops::{Op, OpError, OpResult};
-use crate::port::{IqReceiver, Port, Tuning};
+use crate::port::{Port, Tuning};
 use crate::ring::IqRing;
-use crate::stage::{Backend, StageError, StageRegistry};
-use crate::stream::{Frame, Payload, StreamBus};
-use crate::types::{
-    Capabilities, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
-};
+use crate::stage::{Backend, StageRegistry};
+use crate::stream::StreamBus;
+use crate::types::{Capabilities, JobId, SourceId};
+
+use launch::feed_ring;
+use persist::{io, load, now, persist};
 
 const BUS_CAPACITY: usize = 256;
 
@@ -88,61 +90,6 @@ impl Drop for Node {
     fn drop(&mut self) {
         self.inner.shutdown.cancel();
     }
-}
-
-fn now() -> Timestamp {
-    Timestamp(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64),
-    )
-}
-
-fn io(e: impl std::fmt::Display) -> NodeError {
-    NodeError::Io(e.to_string())
-}
-
-/// Write `<id>.json` atomically: temp file, then rename.
-fn persist(dir: &Path, rec: &JobRecord) -> Result<(), NodeError> {
-    let json = serde_json::to_vec_pretty(rec).map_err(io)?;
-    let path = dir.join(format!("{}.json", rec.id.0));
-    let tmp = dir.join(format!("{}.json.tmp", rec.id.0));
-    std::fs::write(&tmp, json).map_err(io)?;
-    std::fs::rename(&tmp, &path).map_err(io)
-}
-
-/// Load every `*.json` record and delete leftover `*.json.tmp` files from an
-/// interrupted `persist`. A file that cannot be read or parsed, or whose
-/// record id is not a ULID equal to the file stem, is skipped and reported by
-/// name.
-fn load(dir: &Path) -> Result<(Vec<JobRecord>, Vec<String>), NodeError> {
-    let (mut records, mut errors) = (Vec::new(), Vec::new());
-    for entry in std::fs::read_dir(dir).map_err(io)? {
-        let path = entry.map_err(io)?.path();
-        if path.to_string_lossy().ends_with(".json.tmp") {
-            // Best effort: a leftover that cannot be removed is harmless.
-            let _ = std::fs::remove_file(&path);
-            continue;
-        }
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let parsed = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<JobRecord>(&s).ok())
-            .filter(|r| r.id.0 == stem && r.id.0.parse::<ulid::Ulid>().is_ok());
-        match parsed {
-            Some(r) => records.push(r),
-            None => errors.push(
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        }
-    }
-    Ok((records, errors))
 }
 
 impl Node {
@@ -472,235 +419,5 @@ impl Node {
     /// Jobs currently holding a lease on `source`, with the band each asked for.
     pub fn lease_holders(&self, source: &SourceId) -> Vec<(JobId, Tuning)> {
         self.inner.leases.holders(source)
-    }
-}
-
-impl Inner {
-    /// Validate, lease, record as `Running`, persist, then spawn the job's tasks.
-    /// On error nothing is recorded and no lease is held.
-    async fn launch(self: &Arc<Self>, mut rec: JobRecord) -> Result<(), NodeError> {
-        let port = self.ports.read().unwrap().get(&rec.source).cloned();
-        let port = port.ok_or_else(|| NodeError::UnknownSource(rec.source.clone()))?;
-        graph::validate(&rec.graph, &self.registry)?;
-        let mut stages = Vec::with_capacity(rec.graph.nodes.len());
-        for n in &rec.graph.nodes {
-            let stage = self
-                .registry
-                .select(&n.kind, &self.backends)
-                .ok_or_else(|| GraphError::UnknownStage {
-                    node: n.id.clone(),
-                    kind: n.kind.clone(),
-                    known: self.registry.kinds(),
-                })?;
-            stages.push(stage);
-        }
-        self.leases
-            .ensure(port.as_ref(), rec.id.clone(), rec.tuning)
-            .await?;
-
-        let id = rec.id.clone();
-        let token = self.shutdown.child_token();
-        rec.state = JobState::Running;
-        if let Err(e) = persist(&self.jobs_dir, &rec) {
-            self.leases.release(&id);
-            return Err(e);
-        }
-        let t = now();
-        let prov = Provenance {
-            source: rec.source.clone(),
-            job: Some(id.clone()),
-            channel: None,
-            span: Span {
-                start_ns: t,
-                end_ns: t,
-            },
-        };
-        let graph = rec.graph.clone();
-        self.jobs.lock().unwrap().insert(
-            id.clone(),
-            JobEntry {
-                record: rec,
-                cancel: Some(token.clone()),
-                done: None,
-            },
-        );
-
-        // One stream per edge; a node with no outgoing edge gets one job output
-        // stream of its stage's first output kind.
-        let edge_streams: Vec<_> = graph
-            .edges
-            .iter()
-            .map(|e| self.bus.register(e.kind, prov.clone()))
-            .collect();
-        let roots = graph
-            .nodes
-            .iter()
-            .any(|n| !graph.edges.iter().any(|e| e.to == n.id));
-        let iq = roots.then(|| self.bus.register(StreamKind::Iq, prov.clone()));
-        let mut streams: Vec<StreamId> = edge_streams.iter().cloned().chain(iq.clone()).collect();
-        let mut set = JoinSet::new();
-        for (n, stage) in graph.nodes.iter().zip(stages) {
-            let mut inputs = Vec::new();
-            let mut outputs = Vec::new();
-            for (e, sid) in graph.edges.iter().zip(&edge_streams) {
-                if e.to == n.id {
-                    inputs.push(self.bus.subscribe(sid).expect("registered"));
-                }
-                if e.from == n.id {
-                    outputs.push(sid.clone());
-                }
-            }
-            if inputs.is_empty() {
-                let sid = iq.as_ref().expect("root nodes have the IQ stream");
-                inputs.push(self.bus.subscribe(sid).expect("registered"));
-            }
-            if outputs.is_empty()
-                && let Some(&k) = stage.spec().outputs.first()
-            {
-                let sid = self.bus.register(k, prov.clone());
-                streams.push(sid.clone());
-                outputs.push(sid);
-            }
-            let (params, bus, cancel) = (n.params.clone(), self.bus.clone(), token.clone());
-            set.spawn(async move { stage.run(params, inputs, outputs, bus, cancel).await });
-        }
-        if let Some(sid) = iq {
-            tokio::spawn(forward_iq(
-                self.bus.clone(),
-                prov,
-                sid,
-                port.subscribe(),
-                token.clone(),
-            ));
-        }
-        let h = tokio::spawn(supervise(self.clone(), id.clone(), set, token, streams));
-        if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
-            e.done = Some(h);
-        }
-        Ok(())
-    }
-
-    /// Record how a job ended on its own, unless it was stopped meanwhile.
-    /// A failed write keeps the new state in memory and is reported through
-    /// `persist_errors`; the job will be resumed on the next `open`.
-    fn finish(&self, id: &JobId, state: JobState) {
-        let mut jobs = self.jobs.lock().unwrap();
-        if let Some(entry) = jobs.get_mut(id)
-            && entry.record.state == JobState::Running
-        {
-            entry.record.state = state;
-            entry.cancel = None;
-            if let Err(e) = persist(&self.jobs_dir, &entry.record) {
-                self.persist_errors
-                    .lock()
-                    .unwrap()
-                    .push(format!("job {}: {e}", id.0));
-            }
-        }
-    }
-}
-
-/// Await a job's stages. The first to end for any reason other than
-/// cancellation stops the rest; `Failed` wins over a clean end. Then release
-/// the lease and unregister the job's streams.
-async fn supervise(
-    inner: Arc<Inner>,
-    id: JobId,
-    mut set: JoinSet<Result<(), StageError>>,
-    token: CancellationToken,
-    streams: Vec<StreamId>,
-) {
-    let mut failure = None;
-    while let Some(r) = set.join_next().await {
-        match r {
-            Ok(Err(StageError::Cancelled)) => {}
-            Ok(Ok(())) => token.cancel(),
-            Ok(Err(StageError::Failed(m))) => {
-                failure.get_or_insert(m);
-                token.cancel();
-            }
-            Err(e) => {
-                failure.get_or_insert(format!("stage task: {e}"));
-                token.cancel();
-            }
-        }
-    }
-    // After node shutdown the record must stay `Running` so the job resumes.
-    if !inner.shutdown.is_cancelled() {
-        inner.finish(
-            &id,
-            failure.map_or(JobState::Stopped, |reason| JobState::Failed { reason }),
-        );
-    }
-    // The only place a started job's lease is released.
-    inner.leases.release(&id);
-    for s in &streams {
-        inner.bus.unregister(s);
-    }
-}
-
-/// Republish a port's blocks as `Payload::Iq` frames on a job's IQ stream.
-async fn forward_iq(
-    bus: Arc<StreamBus>,
-    prov: Provenance,
-    stream: StreamId,
-    mut rx: IqReceiver,
-    cancel: CancellationToken,
-) {
-    loop {
-        let block = tokio::select! {
-            _ = cancel.cancelled() => return,
-            r = rx.recv() => match r {
-                Ok(b) => b,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => {
-                    // The port has ended: close the job's IQ stream so its stages end too.
-                    bus.unregister(&stream);
-                    return;
-                }
-            },
-        };
-        let rate = block.sample_rate_hz.0.max(1) as u128;
-        let end = block.t0.0 + (block.samples.len() as u128 * 1_000_000_000 / rate) as u64;
-        let provenance = Provenance {
-            span: Span {
-                start_ns: block.t0,
-                end_ns: Timestamp(end),
-            },
-            ..prov.clone()
-        };
-        bus.publish(Frame {
-            stream: stream.clone(),
-            kind: StreamKind::Iq,
-            provenance,
-            payload: Payload::Iq(block),
-        });
-    }
-}
-
-/// Push a port's blocks into its ring, creating the ring on the first block.
-async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqReceiver) {
-    loop {
-        let block = tokio::select! {
-            _ = inner.shutdown.cancelled() => return,
-            r = rx.recv() => match r {
-                Ok(b) => b,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return,
-            },
-        };
-        let ring = inner
-            .rings
-            .lock()
-            .unwrap()
-            .entry(source.clone())
-            .or_insert_with(|| {
-                Arc::new(RwLock::new(IqRing::new(
-                    inner.ring_seconds,
-                    block.sample_rate_hz,
-                )))
-            })
-            .clone();
-        ring.write().unwrap().push(&block);
     }
 }
