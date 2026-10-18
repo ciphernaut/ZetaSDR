@@ -3781,6 +3781,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeta-source-soapy"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "num-complex",
+ "thiserror",
+ "tokio",
+ "zeta-core",
+ "zeta-source-soapy",
+]
+
+[[package]]
 name = "zeta-ws"
 version = "0.1.0"
 dependencies = [
