@@ -6,6 +6,10 @@ use crate::device::{RangeHz, SoapyDevice, WireFormat};
 
 const RATE_QUANTUM_HZ: u64 = 100_000;
 
+/// Asserted capabilities from the device's reported ranges.
+///
+/// Min-of-minimums / max-of-maximums overstates coverage on devices whose
+/// ranges have gaps; `tune` still validates against the real device.
 pub fn capabilities(dev: &dyn SoapyDevice) -> Result<Capabilities, String> {
     let freq = dev.frequency_ranges()?;
     let rates = dev.sample_rate_ranges()?;
@@ -53,9 +57,13 @@ pub fn pick_rate(ranges: &[RangeHz], bandwidth_hz: u64) -> Option<u64> {
                 return None;
             }
             if r.step_hz > 0.0 {
-                let k = ((bw - r.min_hz) / r.step_hz).ceil().max(0.0);
-                let v = r.min_hz + k * r.step_hz;
-                (v <= r.max_hz).then(|| v.round() as u64)
+                let (min, step) = (r.min_hz.round() as u64, r.step_hz.round() as u64);
+                if step == 0 {
+                    return None;
+                }
+                let k = bandwidth_hz.saturating_sub(min).div_ceil(step);
+                let v = min + k * step;
+                (v as f64 <= r.max_hz).then_some(v)
             } else if r.min_hz == r.max_hz {
                 Some(r.min_hz.round() as u64)
             } else {
@@ -71,12 +79,20 @@ pub fn pick_rate(ranges: &[RangeHz], bandwidth_hz: u64) -> Option<u64> {
         .min()
 }
 
-/// Native format when it is one the runtime converts, else cf32.
-pub fn pick_format(native: Option<WireFormat>, supported: &[WireFormat]) -> WireFormat {
-    match native {
-        Some(n) if supported.contains(&n) => n,
-        _ => WireFormat::Cf32,
+/// Native format when it is one the runtime converts and the device supports;
+/// otherwise the first of CF32 > CS16 > CS8 in `supported`. Never returns a
+/// format outside `supported`; errors when none of the three is supported.
+pub fn pick_format(
+    native: Option<WireFormat>,
+    supported: &[WireFormat],
+) -> Result<WireFormat, String> {
+    if let Some(n) = native.filter(|n| supported.contains(n)) {
+        return Ok(n);
     }
+    [WireFormat::Cf32, WireFormat::Cs16, WireFormat::Cs8]
+        .into_iter()
+        .find(|f| supported.contains(f))
+        .ok_or_else(|| "device supports none of CF32, CS16, CS8".to_string())
 }
 
 #[cfg(all(test, feature = "test-mock"))]
@@ -135,9 +151,54 @@ mod tests {
     }
 
     #[test]
-    fn pick_format_prefers_native() {
+    fn pick_format_native_when_supported() {
         let all = [WireFormat::Cs8, WireFormat::Cs16, WireFormat::Cf32];
-        assert_eq!(pick_format(Some(WireFormat::Cs8), &all), WireFormat::Cs8);
-        assert_eq!(pick_format(None, &all), WireFormat::Cf32);
+        assert_eq!(
+            pick_format(Some(WireFormat::Cs8), &all),
+            Ok(WireFormat::Cs8)
+        );
+        assert_eq!(pick_format(None, &all), Ok(WireFormat::Cf32));
+        assert_eq!(
+            pick_format(Some(WireFormat::Cf32), &[WireFormat::Cs16]),
+            Ok(WireFormat::Cs16)
+        );
+    }
+
+    #[test]
+    fn pick_format_falls_back_within_supported() {
+        assert_eq!(pick_format(None, &[WireFormat::Cs8]), Ok(WireFormat::Cs8));
+        assert_eq!(
+            pick_format(None, &[WireFormat::Cs8, WireFormat::Cs16]),
+            Ok(WireFormat::Cs16)
+        );
+    }
+
+    #[test]
+    fn pick_format_unsupported_is_error() {
+        assert!(pick_format(None, &[]).is_err());
+        assert!(pick_format(Some(WireFormat::Cs8), &[]).is_err());
+    }
+
+    #[test]
+    fn pick_rate_edges() {
+        let unsorted = [d(2.4e6), d(250e3), d(2.048e6)];
+        assert_eq!(pick_rate(&unsorted, 300_000), Some(2_048_000));
+        assert_eq!(pick_rate(&unsorted, 2_048_000), Some(2_048_000));
+        let c = [RangeHz {
+            min_hz: 1e6,
+            max_hz: 20e6,
+            step_hz: 0.0,
+        }];
+        assert_eq!(pick_rate(&c, 500_000), Some(1_000_000));
+        assert_eq!(pick_rate(&c, 2_000_000), Some(2_000_000));
+        let s = [RangeHz {
+            min_hz: 1e6,
+            max_hz: 1e7,
+            step_hz: 5e5,
+        }];
+        assert_eq!(pick_rate(&s, 500_000), Some(1_000_000));
+        assert_eq!(pick_rate(&s, 1_500_000), Some(1_500_000));
+        assert_eq!(pick_rate(&s, 1_500_001), Some(2_000_000));
+        assert_eq!(pick_rate(&s, 10_000_001), None);
     }
 }

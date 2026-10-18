@@ -25,6 +25,7 @@ pub struct MockDevice {
     reads: Arc<Mutex<VecDeque<MockRead>>>,
     calls: Arc<Mutex<Vec<String>>>,
     rate: Mutex<f64>,
+    fails: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl MockDevice {
@@ -47,6 +48,7 @@ impl MockDevice {
             reads: Arc::default(),
             calls: Arc::default(),
             rate: Mutex::new(0.0),
+            fails: Arc::default(),
         }
     }
 
@@ -65,12 +67,23 @@ impl MockDevice {
         self
     }
 
+    /// Make the named call (`set_frequency`, `set_sample_rate`, `open_rx`,
+    /// `activate`) fail once with `msg`; calls are still recorded.
+    pub fn fail_on(self, op: &str, msg: &str) -> Self {
+        self.fails.lock().unwrap().push((op.into(), msg.into()));
+        self
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
 
     fn rec(&self, s: String) {
         self.calls.lock().unwrap().push(s);
+    }
+
+    fn check(&self, op: &str) -> Result<(), String> {
+        take_fail(&self.fails, op)
     }
 }
 
@@ -92,10 +105,12 @@ impl SoapyDevice for MockDevice {
     }
     fn set_frequency(&self, hz: f64) -> Result<(), String> {
         self.rec(format!("set_frequency({hz})"));
+        self.check("set_frequency")?;
         Ok(())
     }
     fn set_sample_rate(&self, hz: f64) -> Result<(), String> {
         self.rec(format!("set_sample_rate({hz})"));
+        self.check("set_sample_rate")?;
         *self.rate.lock().unwrap() = hz;
         Ok(())
     }
@@ -104,23 +119,35 @@ impl SoapyDevice for MockDevice {
     }
     fn open_rx(&self, format: WireFormat) -> Result<Box<dyn SoapyRx>, String> {
         self.rec(format!("open_rx({format:?})"));
+        self.check("open_rx")?;
         Ok(Box::new(MockRx {
             reads: self.reads.clone(),
             calls: self.calls.clone(),
+            fails: self.fails.clone(),
             next: 0,
         }))
+    }
+}
+
+fn take_fail(f: &Mutex<Vec<(String, String)>>, op: &str) -> Result<(), String> {
+    let mut f = f.lock().unwrap();
+    match f.iter().position(|(o, _)| o == op) {
+        Some(i) => Err(f.remove(i).1),
+        None => Ok(()),
     }
 }
 
 struct MockRx {
     reads: Arc<Mutex<VecDeque<MockRead>>>,
     calls: Arc<Mutex<Vec<String>>>,
+    fails: Arc<Mutex<Vec<(String, String)>>>,
     next: u64,
 }
 
 impl SoapyRx for MockRx {
     fn activate(&mut self) -> Result<(), String> {
         self.calls.lock().unwrap().push("activate".into());
+        take_fail(&self.fails, "activate")?;
         Ok(())
     }
     fn deactivate(&mut self) -> Result<(), String> {
@@ -183,5 +210,21 @@ mod tests {
                 "deactivate"
             ]
         );
+    }
+
+    #[test]
+    fn control_calls_can_fail() {
+        let d = MockDevice::hackrf_like()
+            .fail_on("set_frequency", "f")
+            .fail_on("set_sample_rate", "r")
+            .fail_on("open_rx", "o");
+        assert_eq!(d.set_frequency(1e8), Err("f".into()));
+        assert!(d.set_frequency(1e8).is_ok());
+        assert_eq!(d.set_sample_rate(2e6), Err("r".into()));
+        assert!(d.open_rx(WireFormat::Cs8).is_err());
+        let d = MockDevice::hackrf_like().fail_on("activate", "a");
+        let mut rx = d.open_rx(WireFormat::Cs8).unwrap();
+        assert_eq!(rx.activate(), Err("a".into()));
+        assert!(rx.activate().is_ok());
     }
 }
