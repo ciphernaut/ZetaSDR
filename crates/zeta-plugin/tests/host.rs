@@ -33,12 +33,36 @@ fn fake_pids(mode: &str, pidfile: &Path) -> PluginCommand {
     c
 }
 
+/// The process ids recorded in `pidfile`.
+fn pids_in(pidfile: &Path) -> Vec<String> {
+    let pids: Vec<String> = std::fs::read_to_string(pidfile)
+        .unwrap()
+        .lines()
+        .map(|p| p.trim().to_owned())
+        .collect();
+    assert!(!pids.is_empty(), "no pid recorded");
+    pids
+}
+
 /// Every process id in `pidfile` no longer exists (killed and reaped).
 fn all_gone(pidfile: &Path) -> bool {
-    let pids = std::fs::read_to_string(pidfile).unwrap();
-    assert!(!pids.trim().is_empty(), "no pid recorded");
-    pids.lines()
-        .all(|p| !Path::new(&format!("/proc/{}", p.trim())).exists())
+    pids_in(pidfile)
+        .iter()
+        .all(|p| !Path::new(&format!("/proc/{p}")).exists())
+}
+
+/// `all_gone`, allowing up to `within` for init to reap orphans that were killed.
+async fn all_gone_within(pidfile: &Path, within: Duration) -> bool {
+    let t = Instant::now();
+    loop {
+        if all_gone(pidfile) {
+            return true;
+        }
+        if t.elapsed() > within {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn prov(job: &str) -> Provenance {
@@ -376,4 +400,134 @@ async fn graph_validation_uses_plugin_schema() {
         Err(GraphError::BadParams { .. })
     ));
     assert_eq!(validate(&graph(json!({})), &reg), Ok(()));
+}
+
+#[tokio::test]
+async fn cancel_kills_the_plugins_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let pids = dir.path().join("pids");
+    // The probe's process and its `sleep` are killed when the probe ends.
+    let stage = probe("fake", fake_pids("fork", &pids)).await.unwrap();
+    assert_eq!(pids_in(&pids).len(), 2);
+    assert!(
+        all_gone_within(&pids, Duration::from_secs(3)).await,
+        "probe left {:?}",
+        pids_in(&pids)
+    );
+    let mut rig = start(stage, StreamKind::Iq, 16, 0);
+    rig.tx.send(iq(0)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), rig.rx_out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // The run's plugin and its `sleep` are alive.
+    let run_pids = pids_in(&pids).split_off(2);
+    assert_eq!(run_pids.len(), 2);
+    assert!(
+        run_pids
+            .iter()
+            .all(|p| Path::new(&format!("/proc/{p}")).exists())
+    );
+    let t = Instant::now();
+    rig.cancel.cancel();
+    let r = tokio::time::timeout(Duration::from_secs(3), rig.run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(r, Err(StageError::Cancelled)), "{r:?}");
+    let left = Duration::from_secs(3).saturating_sub(t.elapsed());
+    assert!(
+        all_gone_within(&pids, left).await,
+        "still alive: {:?}",
+        pids_in(&pids)
+    );
+}
+
+#[tokio::test]
+async fn plugin_env_is_minimal() {
+    // SAFETY: these names are read by no other test, and the process is spawned after.
+    unsafe {
+        std::env::set_var("ZETA_SECRET", "hunter2");
+        std::env::set_var("ZETA_PLUGIN_ENV_FAKE_GAIN", "3");
+    }
+    let stage = probe("fake", fake("env")).await.unwrap();
+    let mut rig = start(stage, StreamKind::Event, 16, 0);
+    let f = tokio::time::timeout(Duration::from_secs(5), rig.rx_out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(rig.tx);
+    let r = tokio::time::timeout(Duration::from_secs(5), rig.run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    let Payload::Event(v) = f.payload else {
+        panic!("event expected");
+    };
+    let env = v["env"].as_object().unwrap();
+    assert!(env.get("ZETA_SECRET").is_none(), "{env:?}");
+    assert!(env.get("PATH").is_some(), "{env:?}");
+    assert_eq!(env["FAKE_GAIN"], "3");
+    assert!(env.get("ZETA_PLUGIN_ENV_FAKE_GAIN").is_none());
+    assert_eq!(env["PYTHONUNBUFFERED"], "1");
+    let allowed = [
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "PYTHONPATH",
+        "PYTHONUNBUFFERED",
+        "FAKE_GAIN",
+    ];
+    for k in env.keys() {
+        assert!(allowed.contains(&k.as_str()), "unexpected variable {k}");
+    }
+    let bin = Path::new(env!("CARGO_BIN_EXE_zeta-plugin-fake"));
+    assert_eq!(
+        Path::new(v["cwd"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        bin.parent().unwrap().canonicalize().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn probe_refuses_a_relative_program() {
+    let cmd = PluginCommand {
+        program: "zeta-plugin-fake".into(),
+        args: vec![],
+    };
+    let e = probe("fake", cmd)
+        .await
+        .err()
+        .expect("probe fails")
+        .to_string();
+    assert!(
+        e.contains("zeta-plugin-fake") && e.contains("absolute"),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn input_of_undeclared_kind_fails_stage() {
+    let stage = probe("fake", fake("echo")).await.unwrap();
+    let mut rig = start(stage, StreamKind::Iq, 16, 0);
+    rig.tx
+        .send(Frame::new(
+            StreamId("in".into()),
+            prov("j1"),
+            Payload::Text("hi".into()),
+        ))
+        .unwrap();
+    assert_eq!(
+        failed(rig.run).await,
+        "plugin fake got a text input frame; it accepts iq"
+    );
+    assert!(matches!(
+        rig.rx_out.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
 }

@@ -12,6 +12,10 @@
 //! - `lag-report`: iq in, event out: `{"lagged":N}` per `lagged`, `{"samples":n}` per
 //!   frame.
 //! - `stall`: `lag-report` that stops reading for 1 s after `run`, so its stdin fills.
+//! - `fork`: `echo` that first starts `sleep 30` as its own child (its pid also goes to the
+//!   pidfile), to check that the host kills what a plugin starts.
+//! - `env`: iq in, event out; on `run` sends `{"env":{…},"cwd":"…"}`, its environment and
+//!   working directory.
 //! - `ignore-stop`: echoes, ignores `stop`, and never exits on its own after `run`.
 //!
 //! `closed`, `stop` (outside `ignore-stop`) and stdin EOF end the process with status 0.
@@ -69,12 +73,27 @@ async fn main() {
         writeln!(f, "{}", std::process::id()).expect("pidfile writes");
     }
 
+    if mode == "fork" {
+        // Deliberately never waited on: the host must kill it, not this process.
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep starts");
+        if let Some(path) = arg("--pidfile") {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("pidfile opens");
+            writeln!(f, "{}", child.id()).expect("pidfile writes");
+        }
+    }
     if mode == "no-hello" {
         tokio::time::sleep(Duration::from_secs(10)).await;
         return;
     }
     let outputs = match mode.as_str() {
-        "lag-report" | "stall" => vec![StreamKind::Event],
+        "lag-report" | "stall" | "env" => vec![StreamKind::Event],
         _ => vec![StreamKind::Iq],
     };
     let params_schema = if mode == "loose-schema" {
@@ -108,6 +127,19 @@ async fn main() {
         match msg {
             Message::Control(Control::Run(r)) => {
                 out = r.outputs.first().map(|o| o.stream.clone());
+                if mode == "env"
+                    && let Some(o) = &out
+                {
+                    let env: serde_json::Map<String, serde_json::Value> = std::env::vars()
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
+                        .collect();
+                    let cwd = std::env::current_dir().expect("cwd");
+                    send_frame(&Frame::new(
+                        o.clone(),
+                        prov(),
+                        Payload::Event(json!({"env": env, "cwd": cwd.display().to_string()})),
+                    ));
+                }
                 if mode == "stall" {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }

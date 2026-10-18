@@ -9,6 +9,15 @@
 //! [`STOP_GRACE`], then kill). Every process is spawned directly (never through a shell)
 //! with `kill_on_drop`, and every path out of `probe` or `run` waits for (reaps) it.
 //!
+//! **Containment.** A plugin is untrusted and may be a wrapper (a Python script) that starts
+//! processes of its own, so on Unix each plugin leads its own process group
+//! (`process_group(0)`) and every kill, and the end of every `probe` or `run`, sends `SIGKILL`
+//! to the whole group: nothing it started outlives it. Its environment is cleared and only
+//! [`PASS_ENV`] is passed through, plus `PYTHONUNBUFFERED=1` and every host variable
+//! `ZETA_PLUGIN_ENV_<NAME>` as `<NAME>` (so the node's credentials, `ZETA_SECRET` among them,
+//! never reach a plugin). Its working directory is the program's own directory, and the
+//! program must be given as an absolute path (no `PATH` lookup).
+//!
 //! **Pumping.** A reader task decodes stdout into a queue of [`OUT_QUEUE`] messages; a
 //! writer task drains a queue of [`IN_QUEUE`] encoded messages into stdin. The run loop never
 //! awaits stdin: an input frame that finds the writer queue full is dropped and counted, and
@@ -50,6 +59,18 @@ pub const STOP_GRACE: Duration = Duration::from_millis(2000);
 pub const OUT_QUEUE: usize = 64;
 /// Encoded messages buffered between the run loop and the stdin writer.
 pub const IN_QUEUE: usize = 16;
+/// Host variables passed through to a plugin unchanged, when set.
+pub const PASS_ENV: [&str; 7] = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "PYTHONPATH",
+];
+/// Host variables `ZETA_PLUGIN_ENV_<NAME>` reach the plugin as `<NAME>`.
+pub const PLUGIN_ENV_PREFIX: &str = "ZETA_PLUGIN_ENV_";
 /// Longest stderr line copied to the host's stderr in one piece.
 const STDERR_LINE: usize = 4096;
 
@@ -63,6 +84,9 @@ pub struct PluginCommand {
 /// Why [`probe`] refused a plugin.
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
+    /// The program is not an absolute path.
+    #[error("plugin {kind}: program {program} is not an absolute path")]
+    RelativeProgram { kind: String, program: String },
     #[error("plugin {kind}: cannot start {program}: {error}")]
     Spawn {
         kind: String,
@@ -94,13 +118,19 @@ impl ExternalStage {
 /// Start `cmd` once, read and check its `hello`, stop it, and build the stage it describes,
 /// registered as `kind`.
 ///
-/// The `hello` must arrive within [`HELLO_TIMEOUT`] and have `protocol` [`PROTOCOL`], `kind`
+/// `cmd.program` must be an absolute path. The `hello` must arrive within [`HELLO_TIMEOUT`] and have `protocol` [`PROTOCOL`], `kind`
 /// equal to `kind`, at least one input, only `iq`, `audio`, `text` or `event` ports, and a
 /// `params_schema` passing [`check_strict_schema`].
 ///
 /// `StageSpec::kind` is `&'static str`, so the kind string is leaked: one small allocation per
 /// registered plugin, made once at startup.
 pub async fn probe(kind: &str, cmd: PluginCommand) -> Result<ExternalStage, PluginError> {
+    if !cmd.program.is_absolute() {
+        return Err(PluginError::RelativeProgram {
+            kind: kind.into(),
+            program: cmd.program.display().to_string(),
+        });
+    }
     let mut p = Proc::spawn(kind, &cmd).map_err(|error| PluginError::Spawn {
         kind: kind.into(),
         program: cmd.program.display().to_string(),
@@ -173,21 +203,29 @@ fn check_hello(kind: &str, h: &Hello) -> Result<schemars::Schema, String> {
 
 /// A spawned plugin: stderr is already being copied to the host's stderr.
 struct Proc {
-    child: Child,
+    child: Kid,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
 impl Proc {
     fn spawn(kind: &str, cmd: &PluginCommand) -> Result<Proc, String> {
-        let mut child = Command::new(&cmd.program)
-            .args(&cmd.args)
+        let mut c = Command::new(&cmd.program);
+        c.args(&cmd.args)
+            .env_clear()
+            .envs(plugin_env(std::env::vars_os()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .kill_on_drop(true);
+        if let Some(dir) = cmd.program.parent() {
+            c.current_dir(dir);
+        }
+        #[cfg(unix)]
+        c.process_group(0);
+        let mut child = c.spawn().map_err(|e| e.to_string())?;
+        // The group id is the leader's pid (process_group(0)).
+        let group = Group(child.id());
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -197,7 +235,7 @@ impl Proc {
         // Ends at stderr EOF, when the plugin exits.
         tokio::spawn(copy_stderr(kind.to_owned(), stderr));
         Ok(Proc {
-            child,
+            child: Kid { child, group },
             stdin,
             // Control lines are read a byte at a time: buffer the pipe.
             stdout: BufReader::new(stdout),
@@ -268,21 +306,97 @@ fn status_text(s: ExitStatus) -> String {
     s.to_string()
 }
 
-/// Wait up to [`STOP_GRACE`] for the plugin to exit, then kill it; its exit status.
-async fn finish(child: &mut Child) -> std::io::Result<ExitStatus> {
-    match tokio::time::timeout(STOP_GRACE, child.wait()).await {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = child.kill().await;
-            child.wait().await
+/// The environment a plugin gets from the host's `vars`: [`PASS_ENV`] as is,
+/// `ZETA_PLUGIN_ENV_<NAME>` as `<NAME>`, and `PYTHONUNBUFFERED=1` (so a Python plugin's
+/// frames are not held in its stdout buffer). Nothing else.
+fn plugin_env(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut env: Vec<_> = vars
+        .filter_map(|(k, v)| {
+            let name = k.to_str()?;
+            if PASS_ENV.contains(&name) {
+                Some((k, v))
+            } else {
+                let rest = name.strip_prefix(PLUGIN_ENV_PREFIX)?;
+                (!rest.is_empty()).then(|| (rest.into(), v))
+            }
+        })
+        .collect();
+    env.push(("PYTHONUNBUFFERED".into(), "1".into()));
+    env
+}
+
+/// The plugin's process group; `SIGKILL`ed whole when dropped, so nothing the plugin
+/// started outlives the `probe` or `run` that spawned it. `None` if the plugin had exited
+/// before its id was read.
+struct Group(Option<u32>);
+
+#[cfg(unix)]
+mod sys {
+    // `killpg(2)`, declared here rather than taking a `libc` dependency for one call.
+    unsafe extern "C" {
+        fn killpg(pgrp: i32, sig: i32) -> i32;
+    }
+    /// `SIGKILL` is 9 on every Unix.
+    const SIGKILL: i32 = 9;
+
+    /// `SIGKILL` every process in group `pgrp`; a group already gone is not an error.
+    pub(super) fn kill_group(pgrp: u32) {
+        // A pid fits i32; 0 or less would mean "my own group" or "everything".
+        if let Ok(g) = i32::try_from(pgrp)
+            && g > 1
+        {
+            // SAFETY: killpg takes two integers and touches no memory of ours.
+            unsafe {
+                killpg(g, SIGKILL);
+            }
         }
     }
 }
 
-/// Kill the plugin now (a no-op if it has exited) and reap it; its exit status.
-async fn kill_now(child: &mut Child) -> std::io::Result<ExitStatus> {
-    let _ = child.kill().await;
-    child.wait().await
+impl Group {
+    fn kill(&self) {
+        #[cfg(unix)]
+        if let Some(g) = self.0 {
+            sys::kill_group(g);
+        }
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// A plugin process and its process group.
+struct Kid {
+    child: Child,
+    group: Group,
+}
+
+/// Wait up to [`STOP_GRACE`] for the plugin to exit, then kill it; its exit status. Either
+/// way, whatever it started is killed with it.
+async fn finish(kid: &mut Kid) -> std::io::Result<ExitStatus> {
+    let s = match tokio::time::timeout(STOP_GRACE, kid.child.wait()).await {
+        Ok(s) => s,
+        Err(_) => {
+            kid.group.kill();
+            let _ = kid.child.kill().await;
+            kid.child.wait().await
+        }
+    };
+    kid.group.kill();
+    s
+}
+
+/// Kill the plugin and its group now (a no-op if they have exited) and reap it; its exit
+/// status.
+async fn kill_now(kid: &mut Kid) -> std::io::Result<ExitStatus> {
+    kid.group.kill();
+    let _ = kid.child.kill().await;
+    kid.child.wait().await
 }
 
 /// An exit status (or the failure to get one) as text.
@@ -518,6 +632,18 @@ impl Stage for ExternalStage {
                 }
                 r = rx.recv(), if !input_closed => match r {
                     Ok(frame) => {
+                        if !self.spec.inputs.contains(&frame.kind) {
+                            break End::Fail(format!(
+                                "plugin {kind} got a {} input frame; it accepts {}",
+                                kind_name(frame.kind),
+                                self.spec
+                                    .inputs
+                                    .iter()
+                                    .map(|k| kind_name(*k))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
                         if run_prov.is_none() {
                             run_prov = Some((
                                 frame.provenance.source.clone(),
