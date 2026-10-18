@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use zeta_client::parse_op;
 use zeta_core::node::Node;
 use zeta_core::ops::OpError;
@@ -120,6 +121,8 @@ pub(crate) struct AppState {
     pub(crate) ws_slots: Arc<Semaphore>,
     /// Cancelled by `Server::run` when shutdown starts; every websocket task watches it.
     pub(crate) ws_shutdown: CancellationToken,
+    /// Every websocket connection, from its accepted upgrade request until its task ends.
+    pub(crate) ws_tasks: TaskTracker,
     pub(crate) stats: StatsHandle,
     pub(crate) started: Instant,
     pub(crate) agents_md: String,
@@ -287,6 +290,7 @@ pub async fn bind(node: Arc<Node>, cfg: ServerConfig) -> io::Result<Server> {
         op_slots: Semaphore::new(cfg.limits.max_concurrent_ops),
         ws_slots: Arc::new(Semaphore::new(cfg.limits.max_ws)),
         ws_shutdown: CancellationToken::new(),
+        ws_tasks: TaskTracker::new(),
         stats: StatsHandle::default(),
         started: Instant::now(),
         agents_md: cfg.agents_md,
@@ -307,17 +311,26 @@ impl Server {
         self.state.stats.clone()
     }
 
-    /// Serve until `shutdown` is cancelled, then close every stream websocket and finish
-    /// in-flight requests.
+    /// Serve until `shutdown` is cancelled, then finish in-flight requests and wait for every
+    /// stream websocket to send `Closed` and a 1001 close frame. A stream task may be part way
+    /// through a send when shutdown starts and its close is itself bounded by
+    /// `ws_send_timeout`, so the wait is bounded by twice that; a client too slow to take the
+    /// close in that time is dropped without it.
     pub async fn run(self, shutdown: CancellationToken) -> io::Result<()> {
         let ws_shutdown = self.state.ws_shutdown.clone();
+        let ws_tasks = self.state.ws_tasks.clone();
+        let ws_bound = 2 * self.state.limits.ws_send_timeout;
         let app = router(self.state).into_make_service_with_connect_info::<SocketAddr>();
-        axum::serve(self.listener, app)
+        let served = axum::serve(self.listener, app)
             .with_graceful_shutdown(async move {
                 shutdown.cancelled().await;
                 // Upgraded websockets are not tracked by graceful shutdown: tell them first.
                 ws_shutdown.cancel();
             })
-            .await
+            .await;
+        ws_tasks.close();
+        // A connection task that outlives the bound sees the cancelled token and ends alone.
+        let _ = tokio::time::timeout(ws_bound, ws_tasks.wait()).await;
+        served
     }
 }

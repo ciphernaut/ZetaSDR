@@ -226,16 +226,20 @@ async fn stream_end_sends_closed_then_close_1000() {
 
 #[tokio::test]
 async fn shutdown_sends_closed_then_going_away_and_new_node_404s_old_id() {
-    // Stopping the server sends Closed{"node shutting down"} then Close 1001 within 2 s; a new
+    // Stopping the server sends Closed{"node shutting down"} then Close 1001 within 2 s, and
+    // `run` waits for the websocket task to finish before returning; a new
     // node on the same dir and address does not know the old stream id.
     let dir = tempfile::tempdir().unwrap();
     let ts = spawn(dir.path()).await;
     let addr = ts.addr;
     let id = register(&ts);
     let mut ws = connect(&ts, &id.0, Some(BEARER)).await.unwrap();
+    let stats = ts.stats.clone();
     tokio::time::timeout(Duration::from_secs(2), ts.stop())
         .await
         .expect("stop took longer than 2 s");
+    // `run` returned only after the websocket task had sent its close and ended.
+    assert_eq!(stats.get().ws_connections, 0);
     assert_eq!(
         parse(next(&mut ws, Duration::from_secs(2)).await),
         WsMessage::Closed {

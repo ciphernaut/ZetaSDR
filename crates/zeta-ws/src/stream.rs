@@ -13,6 +13,7 @@ use serde::Deserialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::{Instant, timeout, timeout_at};
+use tokio_util::task::task_tracker::TaskTrackerToken;
 use zeta_core::ops::OpError;
 use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::StreamId;
@@ -110,13 +111,15 @@ pub(crate) async fn ws(
             other("too many stream connections"),
         );
     };
+    // Taken before upgrading so `Server::run` waits for an upgrade still in progress.
+    let tracked = st.ws_tasks.token();
     let upgrade = match upgrade {
         Ok(u) => u,
         Err(e) => return error_response(e.status(), other(e.body_text())),
     };
     upgrade
         .max_message_size(st.limits.ws_max_message_bytes)
-        .on_upgrade(move |socket| connection(socket, rx, st, permit))
+        .on_upgrade(move |socket| connection(socket, rx, st, permit, tracked))
 }
 
 /// Counts a live connection for as long as it is held.
@@ -145,26 +148,31 @@ async fn send_json(socket: &mut WebSocket, msg: &WsMessage, limit: Duration) -> 
     send(socket, Message::Text(text.into()), limit).await
 }
 
-/// Send `Closed { reason }`, then a close frame with `code`.
+/// Send `Closed { reason }`, then a close frame with `code`, both within one `limit`.
 async fn close(socket: &mut WebSocket, reason: &str, code: u16, limit: Duration) {
     let closed = WsMessage::Closed {
         reason: reason.to_string(),
     };
-    if send_json(socket, &closed, limit).await {
-        let frame = CloseFrame {
-            code,
-            reason: "".into(),
-        };
-        send(socket, Message::Close(Some(frame)), limit).await;
-    }
+    let text = serde_json::to_string(&closed).expect("WsMessage serialises");
+    let frame = CloseFrame {
+        code,
+        reason: "".into(),
+    };
+    let _ = timeout(limit, async {
+        socket.send(Message::Text(text.into())).await?;
+        socket.send(Message::Close(Some(frame))).await
+    })
+    .await;
 }
 
-/// One task per connection; the permit and the live count are released on every exit.
+/// One task per connection; the permit, the live count and the tracker token are released on
+/// every exit.
 async fn connection(
     mut socket: WebSocket,
     mut rx: broadcast::Receiver<Frame>,
     st: Shared,
     _permit: OwnedSemaphorePermit,
+    _tracked: TaskTrackerToken,
 ) {
     let _live = Live::new(&st.stats);
     let limit = st.limits.ws_send_timeout;
