@@ -117,8 +117,10 @@ impl LeaseManager {
         let _guard = gate.lock().await;
         {
             let mut leases = self.leases.lock().unwrap();
-            let held = leases.get(&source).is_some_and(|v| !v.is_empty());
-            if held && let Some(cur) = port.current() {
+            // A held port lacking a current tuning is taken to be at its
+            // first holder's band, as in `tune_if_unheld`; it is never retuned.
+            let first = leases.get(&source).and_then(|v| v.first()).map(|(_, t)| *t);
+            if let Some(cur) = first.map(|f| port.current().unwrap_or(f)) {
                 if fits(&want, &cur) {
                     let v = leases.get_mut(&source).unwrap();
                     v.retain(|(j, _)| j != &holder);
@@ -341,6 +343,22 @@ mod tests {
             ),
             other => panic!("expected conflict, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn held_port_without_current_is_not_retuned() {
+        let (p, m) = (FakePort::new(), LeaseManager::new());
+        let first = t(100_000_000, 1_000_000);
+        m.ensure(&p, JobId::new(), first).await.unwrap();
+        *p.cur.lock().unwrap() = None;
+        match m.ensure(&p, JobId::new(), t(433_000_000, 1_000_000)).await {
+            Err(LeaseError::Conflict { current, .. }) => assert_eq!(current, first),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        let inside = t(100_100_000, 100_000);
+        assert_eq!(m.ensure(&p, JobId::new(), inside).await.unwrap(), first);
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(m.holders(p.id()).len(), 2);
     }
 
     #[tokio::test]
