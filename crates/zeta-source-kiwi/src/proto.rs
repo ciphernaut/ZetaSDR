@@ -13,7 +13,8 @@ pub const SND_FLAG_ADC_OVFL: u8 = 0x02;
 pub const SND_FLAG_STEREO: u8 = 0x08;
 /// SND flag: the frame is IMA-ADPCM compressed (never the case in IQ mode).
 pub const SND_FLAG_COMPRESSED: u8 = 0x10;
-/// SND flag: samples are little-endian instead of the default big-endian.
+/// SND flag: little-endian samples, used by the Kiwi only for camped streams;
+/// this client never camps, so [`parse_snd`] ignores it.
 pub const SND_FLAG_LITTLE_ENDIAN: u8 = 0x80;
 
 pub const CMD_SQUELCH: &str = "SET squelch=0 max=0";
@@ -224,8 +225,8 @@ fn le_u32(b: &[u8]) -> u32 {
 /// Parses an IQ-mode SND payload. Offsets from the payload start: `[0..3]`
 /// `SND`; `[3]` flags; `[4..8]` seq u32 LE; `[8..10]` S-meter u16 BE; `[10]`
 /// last GPS solution; `[11]` dummy; `[12..16]` GPS seconds u32 LE; `[16..20]`
-/// GPS nanoseconds u32 LE; `[20..]` interleaved I,Q `i16`, big-endian unless
-/// [`SND_FLAG_LITTLE_ENDIAN`] is set.
+/// GPS nanoseconds u32 LE; `[20..]` interleaved I,Q `i16`, big-endian whatever
+/// [`SND_FLAG_LITTLE_ENDIAN`] says (it applies only to camped streams).
 pub fn parse_snd(payload: &[u8]) -> Result<Snd, ProtoError> {
     expect_tag(payload, Tag::Snd, SND_IQ_HEADER)?;
     let flags = payload[3];
@@ -240,12 +241,9 @@ pub fn parse_snd(payload: &[u8]) -> Result<Snd, ProtoError> {
         return Err(ProtoError::OddSamples { bytes: data.len() });
     }
     let smeter = u16::from_be_bytes([payload[8], payload[9]]);
-    let to_i16: fn([u8; 2]) -> i16 = if flags & SND_FLAG_LITTLE_ENDIAN != 0 {
-        i16::from_le_bytes
-    } else {
-        i16::from_be_bytes
-    };
-    let scale = |b: &[u8]| f32::from(to_i16([b[0], b[1]])) / 32768.0;
+    // Big-endian always: the reference honours SND_FLAG_LITTLE_ENDIAN only for
+    // camped streams, and this client never camps.
+    let scale = |b: &[u8]| f32::from(i16::from_be_bytes([b[0], b[1]])) / 32768.0;
     let samples = data
         .chunks_exact(4)
         .map(|s| Complex::new(scale(&s[..2]), scale(&s[2..])))
@@ -472,12 +470,11 @@ ext_clk=0 freq_offset=0.000 abyy=A26 dx_db_name=dx has_attn=1";
     }
 
     #[test]
-    fn little_endian_flag_is_honoured() {
+    fn little_endian_flag_is_ignored() {
+        // The reference only honours 0x80 for camped streams; this port never
+        // camps, so samples are big-endian whatever the flag says.
         let mut frame = hex(LIVE_FRAME_2);
         frame[3] = 0x88;
-        for pair in frame[20..].chunks_exact_mut(2) {
-            pair.swap(0, 1);
-        }
         let snd = parse_snd(&frame).unwrap();
         assert_eq!(snd.flags, 0x88);
         assert_eq!(snd.samples, parse_snd(&hex(LIVE_FRAME_2)).unwrap().samples);

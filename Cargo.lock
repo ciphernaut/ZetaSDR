@@ -3770,11 +3770,13 @@ dependencies = [
  "async-trait",
  "futures-util",
  "num-complex",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "zeta-core",
+ "zeta-dsp",
  "zeta-source-kiwi",
 ]
 
