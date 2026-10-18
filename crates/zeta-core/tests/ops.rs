@@ -910,37 +910,40 @@ async fn stream_tail_times_out_with_empty_when_no_frames() {
 async fn stream_tail_returns_collected_when_stream_closes() {
     use zeta_core::stream::{Frame, Payload};
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(cfg(dir.path()), registry(), vec![])
-        .await
-        .unwrap();
+    let node = Arc::new(
+        Node::open(cfg(dir.path()), registry(), vec![])
+            .await
+            .unwrap(),
+    );
     let bus = node.bus();
     let id = bus.register(StreamKind::Text, tail_prov());
-    let (b, sid) = (bus.clone(), id.clone());
-    let publisher = tokio::spawn(async move {
-        // Give the tail time to subscribe before anything is sent.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        for t in ["one", "two"] {
-            b.publish(Frame::new(
-                sid.clone(),
-                tail_prov(),
-                Payload::Text(t.into()),
-            ));
-        }
-        b.unregister(&sid);
-    });
+    let (n, sid) = (node.clone(), id.clone());
     let t0 = std::time::Instant::now();
-    let frames = match node
-        .apply(Op::StreamTail {
-            stream: id.clone(),
+    let tail = tokio::spawn(async move {
+        n.apply(Op::StreamTail {
+            stream: sid,
             max_frames: 10,
             timeout_ms: 5000,
         })
         .await
-    {
+    });
+    // Publish only once the tail has subscribed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while bus.receiver_count(&id).unwrap_or(0) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tail never subscribed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for t in ["one", "two"] {
+        bus.publish(Frame::new(id.clone(), tail_prov(), Payload::Text(t.into())));
+    }
+    bus.unregister(&id);
+    let frames = match tail.await.unwrap() {
         Ok(OpResult::Frames(f)) => f,
         other => panic!("expected Frames, got {other:?}"),
     };
-    publisher.await.unwrap();
     assert!(
         t0.elapsed() < Duration::from_secs(2),
         "closed stream must end the tail"

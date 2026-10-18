@@ -126,6 +126,15 @@ impl StreamBus {
             .map(|(_, tx)| tx.subscribe())
     }
 
+    /// Live subscribers of a registered stream; `None` if it is not registered.
+    pub fn receiver_count(&self, id: &StreamId) -> Option<usize> {
+        self.streams
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|(_, tx)| tx.receiver_count())
+    }
+
     pub fn list(&self) -> Vec<StreamInfo> {
         self.streams
             .read()
@@ -202,6 +211,16 @@ mod tests {
             rx.recv().await,
             Err(broadcast::error::RecvError::Closed)
         ));
+    }
+
+    #[test]
+    fn receiver_count_tracks_subscribers() {
+        let bus = StreamBus::new(1);
+        let id = bus.register(StreamKind::Text, prov("s"));
+        assert_eq!(bus.receiver_count(&id), Some(0));
+        let _rx = bus.subscribe(&id).unwrap();
+        assert_eq!(bus.receiver_count(&id), Some(1));
+        assert_eq!(bus.receiver_count(&StreamId::new()), None);
     }
 
     #[test]
