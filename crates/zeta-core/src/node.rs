@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::graph::{self, Graph, GraphError};
 use crate::job::{JobRecord, JobState};
 use crate::lease::{LeaseError, LeaseManager};
+use crate::ops::{Op, OpError, OpResult};
 use crate::port::{IqReceiver, Port, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Backend, StageError, StageRegistry};
@@ -49,6 +50,7 @@ struct JobEntry {
 }
 
 struct Inner {
+    state_dir: PathBuf,
     jobs_dir: PathBuf,
     ring_seconds: f64,
     backends: Vec<Backend>,
@@ -127,6 +129,7 @@ impl Node {
         let (records, load_errors) = load(&jobs_dir)?;
         let node = Node {
             inner: Arc::new(Inner {
+                state_dir: cfg.state_dir.clone(),
                 jobs_dir,
                 ring_seconds: cfg.ring_seconds,
                 backends: cfg.backends,
@@ -178,6 +181,19 @@ impl Node {
         tokio::spawn(feed_ring(inner.clone(), source, rx));
     }
 
+    pub(crate) fn port(&self, id: &SourceId) -> Option<Arc<dyn Port>> {
+        self.inner.ports.read().unwrap().get(id).cloned()
+    }
+
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.inner.state_dir
+    }
+
+    /// Apply one operation; see [`crate::ops`].
+    pub async fn apply(&self, op: Op) -> Result<OpResult, OpError> {
+        crate::ops::apply(self, op).await
+    }
+
     pub fn ports(&self) -> Vec<(SourceId, Capabilities)> {
         let ports = self.inner.ports.read().unwrap();
         ports.values().map(|p| (p.id().clone(), p.capabilities().clone())).collect()
@@ -225,6 +241,34 @@ impl Node {
         };
         if let Some(h) = done {
             let _ = h.await;
+        }
+        Ok(())
+    }
+
+    /// Replace a job's graph, keeping its id. The graph is validated first. A
+    /// `Running` job is stopped and relaunched on the new graph; any other job
+    /// only has its record rewritten. If the relaunch fails (say, a lease
+    /// conflict after the stop) the job is left `Stopped` with the new graph.
+    pub async fn job_graph_put(&self, id: &JobId, graph: Graph) -> Result<(), NodeError> {
+        graph::validate(&graph, &self.inner.registry)?;
+        let running = {
+            let jobs = self.inner.jobs.lock().unwrap();
+            let entry = jobs.get(id).ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            entry.record.state == JobState::Running
+        };
+        if running {
+            self.job_stop(id).await?;
+        }
+        let rec = {
+            let mut jobs = self.inner.jobs.lock().unwrap();
+            let entry = jobs.get_mut(id).ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            let rec = JobRecord { graph, ..entry.record.clone() };
+            persist(&self.inner.jobs_dir, &rec)?;
+            entry.record = rec.clone();
+            rec
+        };
+        if running {
+            self.inner.launch(rec).await?;
         }
         Ok(())
     }

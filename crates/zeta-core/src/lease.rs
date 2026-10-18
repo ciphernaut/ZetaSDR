@@ -57,10 +57,24 @@ fn band(t: &Tuning) -> (u64, u64) {
     (t.center_hz.0.saturating_sub(half), t.center_hz.0.saturating_add(half))
 }
 
-fn fits(want: &Tuning, cur: &Tuning) -> bool {
+/// Whether the band `want` lies inside the band `cur`.
+pub(crate) fn fits(want: &Tuning, cur: &Tuning) -> bool {
     let (wl, wh) = band(want);
     let (cl, ch) = band(cur);
     wl >= cl && wh <= ch
+}
+
+/// Ways out of a conflict between `want` and the port's current band `cur`.
+pub(crate) fn conflict_options(port: &dyn Port, want: &Tuning, cur: &Tuning) -> Vec<String> {
+    let mut options = vec!["stop one of the holders".to_string()];
+    let (wl, wh) = band(want);
+    let (cl, ch) = band(cur);
+    let n = wh.max(ch) - wl.min(cl);
+    if n <= port.capabilities().max_bandwidth_hz.value().0 {
+        options.push(format!("widen capture to {n} Hz"));
+    }
+    options.push("run a scan job".to_string());
+    options
 }
 
 impl LeaseManager {
@@ -90,14 +104,7 @@ impl LeaseManager {
                         return Ok(cur);
                     }
                     let holders = leases[&source].iter().map(|(j, _)| j.clone()).collect();
-                    let mut options = vec!["stop one of the holders".to_string()];
-                    let (wl, wh) = band(&want);
-                    let (cl, ch) = band(&cur);
-                    let n = wh.max(ch) - wl.min(cl);
-                    if n <= port.capabilities().max_bandwidth_hz.value().0 {
-                        options.push(format!("widen capture to {n} Hz"));
-                    }
-                    options.push("run a scan job".to_string());
+                    let options = conflict_options(port, &want, &cur);
                     return Err(LeaseError::Conflict { source, holders, current: cur, options });
                 }
             }

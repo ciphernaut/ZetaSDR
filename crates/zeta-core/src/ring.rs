@@ -3,13 +3,16 @@
 use std::collections::VecDeque;
 
 use num_complex::Complex;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::port::IqBlock;
 use crate::types::{Hz, Span, Timestamp};
 
 const NS: u128 = 1_000_000_000;
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "cause", rename_all = "snake_case")]
 pub enum RingError {
     #[error("requested {requested:?} is older than earliest retained {earliest:?}")]
     TooOld { requested: Timestamp, earliest: Timestamp },
@@ -87,6 +90,10 @@ impl IqRing {
             self.buf.drain(..excess);
             self.dropped += excess as u64;
         }
+    }
+
+    pub fn sample_rate_hz(&self) -> Hz {
+        Hz(self.sample_rate_hz)
     }
 
     /// Timestamp of the oldest retained sample.

@@ -56,7 +56,8 @@ pub struct Graph {
     pub edges: Vec<Edge>,
 }
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "cause", rename_all = "snake_case")]
 pub enum GraphError {
     #[error("unknown stage kind {kind:?} on node {node:?}")]
     UnknownStage { node: NodeId, kind: String },
