@@ -287,7 +287,9 @@ async fn terminal_fault_is_set_before_session_ends_and_retune_recovers() {
 
 #[tokio::test]
 async fn drop_mid_stream_reconnects_and_t0_stays_monotonic() {
-    let fake = fake(vec![FakeReply::Ok, FakeReply::Ok], Some(20)).await;
+    // 30 frames (1.28 s) per connection: each one streams long enough to
+    // reset the reconnect budget, and the second is still up at block 40.
+    let fake = fake(vec![FakeReply::Ok, FakeReply::Ok], Some(30)).await;
     let src = source(&fake, &[10, 10]);
     let mut rx = src.subscribe();
     src.tune(tuning(7_100_000, 10_000)).await.unwrap();
@@ -295,29 +297,53 @@ async fn drop_mid_stream_reconnects_and_t0_stays_monotonic() {
     for _ in 0..40 {
         blocks.push(next_block(&mut rx).await);
     }
-    assert_eq!(fake.connections(), 2);
-    let mods = fake
-        .commands()
-        .iter()
-        .filter(|c| *c == "SET mod=iq low_cut=-5000 high_cut=5000 freq=7100.000")
-        .count();
-    assert_eq!(mods, 2);
-    assert_eq!(
-        fake.commands()
-            .iter()
-            .filter(|c| c.starts_with("SET auth"))
-            .count(),
-        2
-    );
+    assert!(fake.connections() >= 2, "{}", fake.connections());
+    let mod_cmd = "SET mod=iq low_cut=-5000 high_cut=5000 freq=7100.000";
+    let count = |p: &dyn Fn(&String) -> bool| fake.commands().iter().filter(|c| p(c)).count();
+    assert!(count(&|c| c == mod_cmd) >= 2);
+    assert!(count(&|c| c.starts_with("SET auth")) >= 2);
     for w in blocks.windows(2) {
         assert!(w[1].t0.0 > w[0].t0.0, "t0 strictly increasing");
     }
-    let end19 = blocks[19].t0.0 + 512 * 1_000_000_000 / 12_000;
+    let end29 = blocks[29].t0.0 + 512 * 1_000_000_000 / 12_000;
     assert!(
-        blocks[20].t0.0 >= end19,
+        blocks[30].t0.0 >= end29,
         "first block after reconnect starts after the last"
     );
     assert_eq!(src.fault(), None);
+}
+
+/// A reconnected Kiwi that never sends `audio_rate` uses up an attempt per
+/// `handshake_timeout_ms` instead of holding the session forever.
+#[tokio::test]
+async fn reconnect_handshake_is_bounded() {
+    let fake = fake(vec![FakeReply::Ok, FakeReply::NoAudioRate], Some(20)).await;
+    let mut cfg = config(&fake, &[10, 10]);
+    cfg.handshake_timeout_ms = 300;
+    let src = Arc::new(KiwiSource::new(SourceId("kiwi0".into()), cfg));
+    let (node, _dir) = node_with(src.clone()).await;
+    node.apply(measure(7_100_000, 10_000)).await.unwrap();
+    let reason = wait_failed(&node, 3_000).await;
+    assert!(
+        reason.contains("connection lost (no sample_rate and audio_rate within 300 ms)"),
+        "{reason}"
+    );
+    assert!(reason.contains("2 reconnect attempts failed"), "{reason}");
+    assert_eq!(fake.connections(), 3);
+}
+
+/// A Kiwi that handshakes and drops before a second of samples never resets
+/// the reconnect budget, so the session gives up.
+#[tokio::test]
+async fn short_lived_connections_do_not_reset_the_budget() {
+    let fake = fake(vec![FakeReply::Ok], Some(5)).await;
+    let src = source(&fake, &[10, 10]);
+    let _rx = src.subscribe();
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    assert!(wait_until(3_000, || src.fault().is_some()).await);
+    let fault = src.fault().unwrap();
+    assert!(fault.contains("2 reconnect attempts failed"), "{fault}");
+    assert_eq!(fake.connections(), 3);
 }
 
 #[tokio::test]

@@ -28,6 +28,9 @@ pub enum FakeReply {
     BadPassword(u8),
     /// `MSG down`, then close.
     Down,
+    /// `MSG sample_rate=…` and `badp=0`, then a filler `MSG` every frame
+    /// interval and never `audio_rate`: a handshake that never completes.
+    NoAudioRate,
 }
 
 #[derive(Clone, Debug)]
@@ -179,16 +182,34 @@ async fn connection(tcp: TcpStream, reply: FakeReply, script: FakeScript, seen: 
     }
     let msg = |s: &str| Message::Binary(encode_msg(s).into());
     let refusal = match reply {
-        FakeReply::Ok => None,
+        FakeReply::Ok | FakeReply::NoAudioRate => None,
         FakeReply::TooBusy(n) => Some(format!("too_busy={n}")),
         FakeReply::BadPassword(n) => Some(format!("badp={n}")),
         FakeReply::Down => Some("down".to_string()),
     };
+    let interval = Duration::from_millis(script.frame_interval_ms.max(1));
     if let Some(r) = refusal {
         let _ = tx.send(msg(&r)).await;
         let _ = tx.close().await;
         let _ = reader.await;
         return;
+    }
+    if reply == FakeReply::NoAudioRate {
+        for m in ["sample_rate=11998.902088", "badp=0"] {
+            if tx.send(msg(m)).await.is_err() {
+                return;
+            }
+        }
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tokio::select! {
+                _ = &mut closed => return,
+                _ = tick.tick() => {}
+            }
+            if tx.send(msg("cfg_loaded")).await.is_err() {
+                return;
+            }
+        }
     }
     for m in [
         "sample_rate=11998.902088",
@@ -203,7 +224,7 @@ async fn connection(tcp: TcpStream, reply: FakeReply, script: FakeScript, seen: 
     let ramp: Vec<(i16, i16)> = (0..FAKE_FRAME_SAMPLES as i32)
         .map(|k| ((k * 60 - 15_360) as i16, (15_360 - k * 60) as i16))
         .collect();
-    let mut tick = tokio::time::interval(Duration::from_millis(script.frame_interval_ms.max(1)));
+    let mut tick = tokio::time::interval(interval);
     let mut seq: u32 = 0;
     loop {
         if script

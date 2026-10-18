@@ -10,9 +10,13 @@
 //!                              └─ too_busy / badp≠0 / down / redirect / bad rate ─► Terminal
 //! ```
 //!
-//! [`run`] drives connections: a [`End::Lost`] connection (dropped, silent,
-//! refused) is retried after each of `reconnect_delays_ms`, the budget reset
-//! by every connection that reached `Ready`; an [`End::Terminal`] one is not.
+//! [`run`] drives connections: a [`End::Lost`] connection (dropped, silent
+//! for `read_timeout_ms`, refused, or not `Ready` within
+//! `handshake_timeout_ms` of connecting) is retried after each of
+//! `reconnect_delays_ms` in turn; an [`End::Terminal`] one is not. The budget
+//! resets only after a connection has delivered at least one second of
+//! samples, so a Kiwi that handshakes and drops at once cannot keep the
+//! session reconnecting forever.
 //! Before the first `Ready` nothing is retried, so `tune` answers promptly.
 //! A terminal failure sets the port's fault before the task lets go of its
 //! broadcast sender.
@@ -262,10 +266,11 @@ pub(crate) enum End {
     /// Cancelled, the port dropped, or no receivers: nothing to report.
     Stop,
     Terminal(String),
-    /// A transport failure; `ready` when the connection had completed its handshake.
+    /// A transport failure; `streamed` when the connection had delivered at
+    /// least one second of samples (which resets the reconnect budget).
     Lost {
         err: String,
-        ready: bool,
+        streamed: bool,
     },
 }
 
@@ -308,11 +313,8 @@ pub(crate) async fn run(
             End::Stop => return,
             End::Terminal(r) => break r,
             End::Lost { err, .. } if ready.is_some() => break err,
-            End::Lost {
-                err,
-                ready: was_ready,
-            } => {
-                if was_ready {
+            End::Lost { err, streamed } => {
+                if streamed {
                     attempts = 0;
                 }
                 let Some(&delay) = ctx.cfg.reconnect_delays_ms.get(attempts) else {
@@ -353,7 +355,8 @@ async fn connection(
     ready: &mut Option<oneshot::Sender<Result<(), String>>>,
 ) -> End {
     let cfg = &ctx.cfg;
-    let lost = |err: String, ready: bool| End::Lost { err, ready };
+    let lost = |err: String, streamed: bool| End::Lost { err, streamed };
+    let started = Instant::now();
     let url = snd_url(&cfg.host, cfg.port, path_ts());
     let ws_cfg = WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME_BYTES))
@@ -382,6 +385,11 @@ async fn connection(
     let mut keepalive = interval_at(Instant::now() + second, second);
     let read_timeout = Duration::from_millis(cfg.read_timeout_ms);
     let mut deadline = Instant::now() + read_timeout;
+    // Until Ready, the whole connection (connect included) has this long.
+    let handshake_deadline = started + handshake;
+    // Samples delivered on this connection; a second's worth resets the budget.
+    let mut sent: u64 = 0;
+    let streamed = |sent: u64, conn: &Conn| conn.audio_rate.is_some_and(|r| sent >= u64::from(r));
     let mut conn = Conn::default();
     let mut events = Vec::new();
     loop {
@@ -399,7 +407,7 @@ async fn connection(
                 if conn.sample_rate.is_some() {
                     for c in tuning_cmds(t) {
                         if let Err(e) = sink.send(Message::text(c)).await {
-                            return lost(format!("send: {e}"), conn.ready);
+                            return lost(format!("send: {e}"), streamed(sent, &conn));
                         }
                     }
                 }
@@ -407,22 +415,26 @@ async fn connection(
             }
             _ = keepalive.tick() => {
                 if let Err(e) = sink.send(Message::text(CMD_KEEPALIVE)).await {
-                    return lost(format!("send: {e}"), conn.ready);
+                    return lost(format!("send: {e}"), streamed(sent, &conn));
                 }
                 continue;
             }
+            _ = sleep_until(handshake_deadline), if !conn.ready => {
+                let ms = cfg.handshake_timeout_ms;
+                return lost(format!("no sample_rate and audio_rate within {ms} ms"), false);
+            }
             _ = sleep_until(deadline) => {
                 let ms = cfg.read_timeout_ms;
-                return lost(format!("no message for {ms} ms"), conn.ready);
+                return lost(format!("no message for {ms} ms"), streamed(sent, &conn));
             }
             m = stream.next() => m,
         };
         deadline = Instant::now() + read_timeout;
         let payload = match msg {
             None | Some(Ok(Message::Close(_))) => {
-                return lost("closed by the kiwi".into(), conn.ready);
+                return lost("closed by the kiwi".into(), streamed(sent, &conn));
             }
-            Some(Err(e)) => return lost(e.to_string(), conn.ready),
+            Some(Err(e)) => return lost(e.to_string(), streamed(sent, &conn)),
             Some(Ok(Message::Binary(b))) => b,
             Some(Ok(Message::Text(t))) => t.into(),
             Some(Ok(_)) => continue,
@@ -433,7 +445,7 @@ async fn connection(
             match ev {
                 Event::Send(c) => {
                     if let Err(e) = sink.send(Message::text(c)).await {
-                        return lost(format!("send: {e}"), conn.ready);
+                        return lost(format!("send: {e}"), streamed(sent, &conn));
                     }
                 }
                 Event::Ready => {
@@ -467,6 +479,7 @@ async fn connection(
                         clock.gap();
                     }
                     let t0 = clock.stamp(rate, snd.samples.len(), now_ns());
+                    sent += snd.samples.len() as u64;
                     let block = IqBlock {
                         t0: Timestamp(t0),
                         sample_rate_hz: Hz(rate),
@@ -480,6 +493,9 @@ async fn connection(
                     }
                 }
                 Event::Terminal(r) => {
+                    // Fault before the (up to 1 s) close: meanwhile `fault()`
+                    // already reports it and `tune` will not reuse this session.
+                    ctx.status.lock().unwrap().fault = Some(r.clone());
                     close(sink).await;
                     return End::Terminal(r);
                 }
