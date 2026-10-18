@@ -20,9 +20,8 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 ## CLI walkthrough
 
 One-shot commands open the node, apply one operation, persist and exit; they do not resume jobs.
-`zeta serve` resumes persisted jobs and keeps them running until Ctrl-C. The IQ ring lives in the
-node process, so `iq read` only sees samples inside a process that is running the source (see the
-test suite for in-process use); from separate one-shot invocations it reports an empty ring.
+`zeta serve` resumes persisted jobs and keeps them running until Ctrl-C. A one-shot `iq read` or
+`classify` waits (up to 5 s) for the source ring to cover the requested span.
 
 ```bash
 cargo build -q -p zeta
@@ -31,6 +30,8 @@ A="--state-dir scratch/state --source-file tone=scratch/fx/tone.sigmf-meta"
 ./target/debug/zeta $A source list
 ./target/debug/zeta $A job start --kind passthrough --source tone --center-hz 100000000 --bandwidth-hz 48000
 ./target/debug/zeta $A job list
+./target/debug/zeta $A iq read --source tone --start-ns 0 --end-ns 1000000000 --center-hz 100000000 --bandwidth-hz 48000
+ls scratch/state/captures               # a .sigmf-meta / .sigmf-data pair
 ./target/debug/zeta $A job stop --job <id from job start>
 ./target/debug/zeta agents-md            # the agent guide, rendered from the operation schema
 ```

@@ -120,3 +120,41 @@ fn job_start_persists_and_list_sees_it_in_new_process() {
         .expect("started job listed");
     assert_eq!(job["state"]["state"], "running");
 }
+
+#[test]
+fn iq_read_one_shot_writes_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(
+        dir.path(),
+        &[
+            "iq",
+            "read",
+            "--source",
+            "tone",
+            "--start-ns",
+            "0",
+            "--end-ns",
+            "1000000000",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    eprintln!("{v}");
+    let meta = std::path::PathBuf::from(
+        v["value"]["path"]
+            .as_str()
+            .or_else(|| v["value"].as_str())
+            .expect("capture path"),
+    );
+    assert!(meta.exists(), "{}", meta.display());
+    assert!(meta.starts_with(dir.path().join("state").join("captures")));
+    assert!(meta.with_extension("sigmf-data").exists());
+}

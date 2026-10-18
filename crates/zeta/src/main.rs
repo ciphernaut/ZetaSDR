@@ -13,6 +13,10 @@ use zeta_core::ops::Op;
 /// Time a one-shot `job start` keeps the node up so the first blocks flow.
 const JOB_START_GRACE: Duration = Duration::from_millis(150);
 
+/// Longest a one-shot ring read waits for the ring to cover its span, and the poll interval.
+const RING_WAIT: Duration = Duration::from_secs(5);
+const RING_POLL: Duration = Duration::from_millis(20);
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Usage errors exit 1, not clap's 2: exit 2 is reserved for `OpError`.
@@ -54,6 +58,9 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let starts_job = matches!(op, Op::JobStart { .. });
+    if let Op::IqRead { selection } | Op::Classify { selection } = &op {
+        wait_for_ring(&node, selection).await;
+    }
     match node.apply(op).await {
         Ok(r) => {
             if starts_job {
@@ -62,6 +69,24 @@ async fn main() -> ExitCode {
             print(serde_json::to_string_pretty(&r), 0)
         }
         Err(e) => print(serde_json::to_string_pretty(&e), 2),
+    }
+}
+
+/// Poll until the source's ring covers the selection's span end, or `RING_WAIT` passes
+/// (then the op runs anyway and reports the normal ring error).
+async fn wait_for_ring(node: &zeta_core::node::Node, sel: &zeta_core::types::Selection) {
+    let deadline = tokio::time::Instant::now() + RING_WAIT;
+    loop {
+        let covered = node.ring(&sel.source).is_some_and(|r| {
+            r.read()
+                .unwrap()
+                .latest()
+                .is_some_and(|t| t.0 >= sel.span.end.0)
+        });
+        if covered || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(RING_POLL).await;
     }
 }
 
