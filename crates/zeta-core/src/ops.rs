@@ -127,6 +127,11 @@ impl JobKind {
         }
     }
 
+    /// Whether the kind's graph has a `channel` node, so depends on the source rate.
+    fn channelised(&self) -> bool {
+        matches!(self, JobKind::FmDemod | JobKind::AprsDecode)
+    }
+
     /// The kind's graph for `tuning` on a source sampling at `source_rate_hz`
     /// (the port-returned `bandwidth_hz`). Kinds with a `channel` node refuse
     /// an unknown (0) rate and a band wider than [`channel_rate_hz`].
@@ -137,7 +142,7 @@ impl JobKind {
         source_rate_hz: Hz,
     ) -> Result<Graph, OpError> {
         let out = channel_rate_hz(source_rate_hz.0, tuning.bandwidth_hz.0);
-        if matches!(self, JobKind::FmDemod | JobKind::AprsDecode) {
+        if self.channelised() {
             if source_rate_hz.0 == 0 {
                 return Err(OpError::Other {
                     message: "source rate unknown: tune returned bandwidth_hz 0".into(),
@@ -604,6 +609,72 @@ fn checked_port(
     Ok(port)
 }
 
+/// The capture band `id` leased on `port`: the port's current band, else the
+/// first holder's (as the lease manager takes it), or `None` once `id` holds
+/// no lease (the job already ended).
+fn leased_band(node: &Node, port: &dyn Port, id: &JobId) -> Option<Tuning> {
+    let holders = node.lease_holders(port.id());
+    if !holders.iter().any(|(j, _)| j == id) {
+        return None;
+    }
+    port.current().or_else(|| holders.first().map(|(_, t)| *t))
+}
+
+/// `job_start` expands against the pre-tune rate, but another job can lease
+/// the source between that tune and this job's lease, so the lease may share a
+/// capture at another rate. Re-expand against the leased rate and relaunch the
+/// job under the same id (`job_graph_put`), once; if the rate moves again the
+/// job is stopped and the start is a `Conflict`. Kinds without a `channel`
+/// node do not depend on the rate and are left alone.
+async fn reconcile_rate(
+    node: &Node,
+    port: &dyn Port,
+    id: &JobId,
+    kind: JobKind,
+    tuning: Tuning,
+    mut expected: Hz,
+) -> Result<(), OpError> {
+    if !kind.channelised() {
+        return Ok(());
+    }
+    for attempt in 0..2 {
+        let Some(leased) = leased_band(node, port, id) else {
+            return Ok(());
+        };
+        if leased.bandwidth_hz == expected {
+            return Ok(());
+        }
+        if attempt == 1 {
+            // Best effort: the conflict is the answer whether or not the stop lands.
+            let _ = node.job_stop(id).await;
+            let holders = node
+                .lease_holders(port.id())
+                .into_iter()
+                .map(|(j, _)| j)
+                .filter(|j| j != id)
+                .collect();
+            return Err(OpError::Conflict {
+                source: port.id().clone(),
+                holders,
+                current: leased,
+                options: vec!["retry job_start".into(), "stop one of the holders".into()],
+            });
+        }
+        let graph = match kind.expand(port.id(), tuning, leased.bandwidth_hz) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = node.job_stop(id).await;
+                return Err(e);
+            }
+        };
+        node.job_graph_put(id, graph)
+            .await
+            .map_err(|e| node_error(node, e))?;
+        expected = leased.bandwidth_hz;
+    }
+    Ok(())
+}
+
 pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
     match op {
         Op::SourceList {} => {
@@ -656,10 +727,12 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 .await
                 .map_err(lease_error)?;
             let graph = kind.expand(&source, tuning, granted.bandwidth_hz)?;
-            node.job_start(kind.name(), source, tuning, graph)
+            let id = node
+                .job_start(kind.name(), source, tuning, graph)
                 .await
-                .map(OpResult::Job)
-                .map_err(|e| node_error(node, e))
+                .map_err(|e| node_error(node, e))?;
+            reconcile_rate(node, port.as_ref(), &id, kind, tuning, granted.bandwidth_hz).await?;
+            Ok(OpResult::Job(id))
         }
         Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),
         Op::JobStop { job } => node

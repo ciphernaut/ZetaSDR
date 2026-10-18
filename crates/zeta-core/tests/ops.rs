@@ -343,6 +343,100 @@ async fn source_ensure_during_job_start_does_not_retune() {
     assert_eq!(port.current(), Some(job_tuning));
 }
 
+/// A stage that runs until cancelled, registered under another stage's kind
+/// so graphs naming DSP stages validate in core tests.
+struct IdleStage(zeta_core::stage::StageSpec);
+
+impl IdleStage {
+    fn new(kind: &'static str, input: StreamKind, output: StreamKind) -> Self {
+        Self(zeta_core::stage::StageSpec {
+            kind,
+            inputs: vec![input],
+            outputs: vec![output],
+            params_schema: schemars::json_schema!({}),
+        })
+    }
+}
+
+#[async_trait]
+impl zeta_core::stage::Stage for IdleStage {
+    fn spec(&self) -> &zeta_core::stage::StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        _inputs: Vec<tokio::sync::broadcast::Receiver<zeta_core::stream::Frame>>,
+        _outputs: Vec<StreamId>,
+        _bus: Arc<zeta_core::stream::StreamBus>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), zeta_core::stage::StageError> {
+        cancel.cancelled().await;
+        Err(zeta_core::stage::StageError::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn job_start_reexpands_when_lease_rate_differs() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = Arc::new(WidePort::slow("hackrf0"));
+    let mut reg = registry();
+    reg.register(Arc::new(IdleStage::new(
+        "channel",
+        StreamKind::Iq,
+        StreamKind::Iq,
+    )));
+    reg.register(Arc::new(IdleStage::new(
+        "nbfm_demod",
+        StreamKind::Iq,
+        StreamKind::Audio,
+    )));
+    let node = Node::open(cfg(dir.path()), reg, vec![port.clone()])
+        .await
+        .unwrap();
+    let source = SourceId("hackrf0".into());
+    // A: narrow; WidePort grants the requested band, so its pre-tune rate is 12.5 kHz.
+    let a = Op::JobStart {
+        kind: JobKind::FmDemod,
+        source: source.clone(),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    // B: 2 MHz around A's band, leased while A's slow pre-tune holds the gate,
+    // so B's lease is queued ahead of A's and A's lease shares B's 2 MS/s capture.
+    let wide = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(2_000_000),
+    };
+    let b = async {
+        while port.tunes.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let g = JobKind::Passthrough
+            .expand(&source, wide, wide.bandwidth_hz)
+            .unwrap();
+        node.job_start("passthrough", source.clone(), wide, g).await
+    };
+    let (a, b) = tokio::join!(node.apply(a), b);
+    let a = match a {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected Job, got {other:?}"),
+    };
+    b.unwrap();
+    assert_eq!(port.current(), Some(wide));
+    let rec = node.job_list().into_iter().find(|r| r.id == a).unwrap();
+    assert_eq!(rec.state, JobState::Running);
+    let out = rec.graph.nodes[0].params["out_rate_hz"].as_u64().unwrap();
+    assert_eq!(out, 50_000);
+    assert_eq!(2_000_000 % out, 0);
+    assert_eq!(rec.graph.nodes[1].params["audio_rate_hz"], 50_000);
+    // Relaunched under the same id: no stray stopped record.
+    assert_eq!(node.job_list().len(), 2);
+}
+
 fn variants(op: &Value) -> &Vec<Value> {
     op.get("oneOf")
         .or_else(|| op.get("anyOf"))
