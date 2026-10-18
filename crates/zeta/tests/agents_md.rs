@@ -3,8 +3,11 @@
 use assert_cmd::Command;
 use serde_json::Value;
 
+/// The `zeta` binary without `ZETA_NODE`/`ZETA_SECRET`, so `schema` is never sent remote.
 fn zeta() -> Command {
-    Command::cargo_bin("zeta").unwrap()
+    let mut cmd = Command::cargo_bin("zeta").unwrap();
+    cmd.env_remove("ZETA_NODE").env_remove("ZETA_SECRET");
+    cmd
 }
 
 #[test]

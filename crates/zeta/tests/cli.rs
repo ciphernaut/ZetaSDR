@@ -7,13 +7,19 @@ use predicates::str::contains;
 use serde_json::Value;
 use zeta_source_file::fixtures::write_tone;
 
+/// The `zeta` binary with `ZETA_NODE` and `ZETA_SECRET` removed, so a caller's environment
+/// cannot send a test to a remote node. Every test here starts from this.
+fn zeta_bin() -> Command {
+    let mut cmd = Command::cargo_bin("zeta").unwrap();
+    cmd.env_remove("ZETA_NODE").env_remove("ZETA_SECRET");
+    cmd
+}
+
 /// `zeta --state-dir <dir>/state --source-file tone=<fixture> --json <args…>`.
 fn zeta(dir: &Path, args: &[&str]) -> Command {
     let meta = write_tone(dir);
-    let mut cmd = Command::cargo_bin("zeta").unwrap();
-    cmd.env_remove("ZETA_NODE")
-        .env_remove("ZETA_SECRET")
-        .arg("--state-dir")
+    let mut cmd = zeta_bin();
+    cmd.arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--source-file")
         .arg(format!("tone={}", meta.display()))
@@ -228,8 +234,7 @@ fn repeated_source_file_id_is_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();
     let meta = write_tone(dir.path());
     let tone = format!("tone={}", meta.display());
-    Command::cargo_bin("zeta")
-        .unwrap()
+    zeta_bin()
         .arg("--state-dir")
         .arg(dir.path().join("state"))
         .args([

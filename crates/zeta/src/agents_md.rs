@@ -28,8 +28,9 @@ There are two ways to run:
 
 - One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. `job start --then-tail MAX_FRAMES,TIMEOUT_MS` keeps that one-shot node up after the start, tails the job's first event stream (else its audio stream), then stops the job and prints `[job_result, frames_result, {\"stopped\": true}]`; add `--keep` to leave it running (`{\"stopped\": false}`). If the job is not running (e.g. failed) it prints `[job_result, job_record]`, the record's `state` carrying `status` and `reason`, and exits 2; `stream tail` on its own only sees streams of jobs running in the same process. A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span.
 - `zeta serve`: resumes persisted jobs and keeps them running until Ctrl-C.
+- Against a running node, `zeta --node URL --secret SECRET <group> <verb> ...` (or the `ZETA_NODE` and `ZETA_SECRET` variables): the operation is sent to that node over HTTP and applied there, so jobs started this way keep running; `--state-dir` and `--source-file` belong to the serving node and are rejected. `--then-tail` is not supported with `--node` yet (a usage error, exit 1): start the job, then `stream list` and `stream tail` against the node. Start that node with `zeta serve --listen PORT` (binds 127.0.0.1) or `--listen ADDR:PORT` (a LAN address) and a secret. `zeta-mcp --node URL` offers the same operations as MCP tools, and `zeta ask \"REQUEST\"` lets a local model call them.
 
-While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job stop`, `graph put`, `source ensure`) are then refused with an `other` error naming the server's pid; read-only commands still work.";
+While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job stop`, `graph put`, `source ensure`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.";
 
 /// Hand-written sentence appended to an operation's section.
 fn note(op: &str) -> Option<&'static str> {
@@ -292,23 +293,50 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     line
 }
 
-/// Print the rendering, or with `check` compare it to the committed `AGENTS.md`.
-pub fn run(check: bool) -> ExitCode {
+/// The full AGENTS.md text for this build.
+pub fn rendering() -> String {
     let mut schema = zeta_core::ops::schema();
     schema["stages"] = crate::node_setup::registry().describe();
-    let text = render(&schema, FIELD_CRAFT);
+    render(&schema, FIELD_CRAFT)
+}
+
+/// The Claude Code skill: front matter naming when to use it, then the full guide.
+pub fn render_skill(md: &str) -> String {
+    format!(
+        "---\nname: zetasdr\ndescription: Use when driving a ZetaSDR node (sources, jobs, IQ captures, classification, knowledge lookup) through the zeta CLI or the zeta-mcp tools.\n---\n\n{md}"
+    )
+}
+
+/// Print the rendering, or with `check` compare it to the committed file
+/// (`AGENTS.md`, or `skills/zetasdr/SKILL.md` with `skill`).
+pub fn run(check: bool, skill: bool) -> ExitCode {
+    let guide = rendering();
+    let (text, path, name, regen) = if skill {
+        (
+            render_skill(&guide),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../skills/zetasdr/SKILL.md"),
+            "skills/zetasdr/SKILL.md",
+            "zeta agents-md --skill > skills/zetasdr/SKILL.md",
+        )
+    } else {
+        (
+            guide,
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENTS.md"),
+            "AGENTS.md",
+            "zeta agents-md > AGENTS.md",
+        )
+    };
     if !check {
         print!("{text}");
         return ExitCode::SUCCESS;
     }
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENTS.md");
     match std::fs::read_to_string(path) {
         Ok(on_disk) if on_disk == text => ExitCode::SUCCESS,
         Ok(on_disk) => {
             let line = text.lines().zip(on_disk.lines()).position(|(a, b)| a != b);
             let at = line.unwrap_or_else(|| text.lines().count().min(on_disk.lines().count())) + 1;
             eprintln!(
-                "zeta: AGENTS.md differs from the rendering (first difference at line {at}); regenerate with `zeta agents-md > AGENTS.md`"
+                "zeta: {name} differs from the rendering (first difference at line {at}); regenerate with `{regen}`"
             );
             ExitCode::FAILURE
         }

@@ -1,0 +1,30 @@
+[package]
+name = "zeta-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LLM agent loop for ZetaSDR"
+
+[features]
+test-fake = ["dep:axum", "tokio/net"]
+
+[dependencies]
+async-trait = "0.1.92"
+axum = { version = "0.8.9", optional = true }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "sync"] }
+zeta-client = { path = "../zeta-client" }
+zeta-core = { path = "../zeta-core" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["macros"] }
+zeta-agent = { path = ".", features = ["test-fake"] }
+zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] }
+
+[[example]]
+name = "fake_llm"
+required-features = ["test-fake"]
