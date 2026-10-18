@@ -12,14 +12,17 @@ use zeta_agent::{
 use zeta_client::{NodeClient, op_tools, system_prompt};
 
 use crate::cli::AskArgs;
+use crate::sources::{PluginSpec, SourceSpec};
 use crate::{agents_md, node_setup, serve_lock};
 
-/// Run the request against the remote node, or against a local node on `state_dir`.
+/// Run the request against the remote node, or against a local node on `state_dir`
+/// with `sources` and `plugins`.
 pub async fn run(
     args: AskArgs,
     remote: Option<NodeClient>,
     state_dir: PathBuf,
-    source_files: &[(String, PathBuf)],
+    sources: &[SourceSpec],
+    plugins: &[PluginSpec],
 ) -> ExitCode {
     let request = match read_request(args.request.as_deref()) {
         Ok(r) => r,
@@ -49,7 +52,7 @@ pub async fn run(
                     "zeta serve (pid {pid}) owns this state dir; use --node"
                 ));
             }
-            let node = match node_setup::open(state_dir, source_files, false).await {
+            let node = match node_setup::open(state_dir, sources, plugins, false).await {
                 Ok(n) => Arc::new(n),
                 Err(e) => return fail(&e),
             };

@@ -101,6 +101,36 @@ $Z $S --source-file aprs=scratch/fx/aprs.sigmf-meta classify --source aprs \
     --start-ns 0 --end-ns 2000000000 --center-hz 144800000 --bandwidth-hz 12500
 ```
 
+### Hardware sources and plugins
+
+Besides `--source-file ID=PATH.sigmf-meta`, every command takes `--source-kiwi
+ID=HOST:PORT[/PASSWORD]` (a KiwiSDR, 0-30 MHz, 12 kHz of IQ; it connects on the first tune; the
+password is never printed, but like `--secret` it is visible in `ps`) and `--source-soapy ID=ARGS`
+(a SoapySDR device, `ARGS` such as `driver=hackrf,serial=...`). Source ids are unique across the
+three flags. `--plugin KIND=/abs/path` registers an external stage (see `sdk/python` and
+`examples/python/gain.py`); it is probed at startup and a failed probe exits 1. A plugin runs with
+a cleared environment; set `ZETA_PLUGIN_ENV_<NAME>` to hand it `<NAME>`.
+
+```bash
+./target/debug/zeta --source-kiwi kiwi0=kiwisdr.example:8073 job start --kind measure \
+  --source kiwi0 --center-hz 7100000 --bandwidth-hz 10000 --then-tail 1,5000
+./target/debug/zeta --plugin gain=$PWD/examples/python/gain.py schema   # "gain" under stages
+```
+
+SoapySDR links libSoapySDR, so it is behind a compiler cfg rather than a cargo feature (so that
+`--all-features` never needs the headers). Without it, `--source-soapy` and `zeta soapy find` exit
+1 saying how to rebuild. With it:
+
+```bash
+sudo apt install libsoapysdr-dev soapysdr-module-hackrf
+RUSTFLAGS="--cfg soapy" cargo build -p zeta --release
+./target/release/zeta soapy find --filter driver=hackrf
+./target/release/zeta --source-soapy hackrf0=driver=hackrf source list
+```
+
+Without the package, `DOCS_RS=1 RUSTFLAGS="--cfg soapy" cargo check -p zeta --all-targets`
+type-checks that path (use a separate `CARGO_TARGET_DIR`; the flags rebuild everything).
+
 ### GPU
 
 The FFT stage has a GPU implementation behind the `gpu` cargo feature (wgpu compute shader;
@@ -157,7 +187,8 @@ curl -s -H "Authorization: Bearer $ZETA_SECRET" $ZETA_NODE/health
 
 `--node URL --secret SECRET` (or `ZETA_NODE` and `ZETA_SECRET`) sends any CLI operation to a
 running node instead of opening a local one. This is the way to change a node that `zeta serve`
-owns. `--state-dir` and `--source-file` belong to the serving node and are rejected.
+owns. `--state-dir`, the `--source-*` flags and `--plugin` belong to the serving node and are
+rejected.
 
 `zeta-mcp` is a stdio MCP server with one tool per operation, generated from the schema, with
 `AGENTS.md` as its instructions. Register it with Claude Code:

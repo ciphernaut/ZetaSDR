@@ -26,3 +26,15 @@ With no HackRF attached the ignored test prints `skipped: no hackrf attached`.
 Without the package, `DOCS_RS=1 cargo check --all-targets` type-checks the
 crate (soapysdr-sys ships pre-generated bindings and skips its library probe
 under `DOCS_RS`), but nothing links.
+
+## In the `zeta` CLI
+
+`crates/zeta` depends on this crate under `[target.'cfg(soapy)'.dependencies]`, so it is built
+only when the `soapy` cfg is set (never by a cargo feature, so `--all-features` stays free of
+libSoapySDR):
+
+```sh
+RUSTFLAGS="--cfg soapy" cargo build -p zeta --release   # from the workspace root
+zeta soapy find                                         # attached devices as JSON
+zeta --source-soapy hackrf0=driver=hackrf source list
+```

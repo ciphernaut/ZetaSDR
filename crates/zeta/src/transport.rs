@@ -33,12 +33,16 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             return Ok(usage("--listen requires --secret or ZETA_SECRET"));
         }
     }
-    if let Command::Ask(args) = cli.command {
+    if matches!(cli.command, Command::Ask(_)) {
+        let (sources, plugins) = (cli.sources(), cli.plugins.clone());
+        let Command::Ask(args) = cli.command else {
+            unreachable!("matched above")
+        };
         let state_dir = match cli.state_dir.map_or_else(node_setup::default_state_dir, Ok) {
             Ok(d) => d,
             Err(e) => return Ok(usage(&e)),
         };
-        return Ok(ask::run(args, None, state_dir, &cli.source_files).await);
+        return Ok(ask::run(args, None, state_dir, &sources, &plugins).await);
     }
     Err(cli)
 }
@@ -51,9 +55,9 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     if cli.command.then_tail().is_some() {
         return usage("--then-tail is not supported with --node yet");
     }
-    if !cli.source_files.is_empty() || cli.state_dir.is_some() {
+    if cli.configures_local_node() {
         return usage(
-            "--source-file and --state-dir belong to the serving node; drop them with --node",
+            "sources and plugins are configured on the serving node: drop --source-*, --plugin and --state-dir with --node",
         );
     }
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {
@@ -64,7 +68,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
         Err(e) => return usage(&e.to_string()),
     };
     if let Command::Ask(args) = cli.command {
-        return ask::run(args, Some(client), PathBuf::new(), &[]).await;
+        return ask::run(args, Some(client), PathBuf::new(), &[], &[]).await;
     }
     let op = match cli.command.into_op() {
         Ok(Some(op)) => op,

@@ -2537,6 +2537,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 
 [[package]]
+name = "soapysdr"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a18cfe7033985b73ab920b34b79ea333ac9271c64910023054efefd8a5f08088"
+dependencies = [
+ "log",
+ "num-complex",
+ "soapysdr-sys",
+]
+
+[[package]]
+name = "soapysdr-sys"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f436607817a47de9b0716931dd874cd273993a69091d174222d0b9099c2f748b"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3661,7 +3681,10 @@ dependencies = [
  "zeta-client",
  "zeta-core",
  "zeta-dsp",
+ "zeta-plugin",
  "zeta-source-file",
+ "zeta-source-kiwi",
+ "zeta-source-soapy-driver",
  "zeta-ws",
 ]
 
@@ -3807,6 +3830,16 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "zeta-core",
+ "zeta-source-soapy",
+]
+
+[[package]]
+name = "zeta-source-soapy-driver"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "soapysdr",
  "zeta-core",
  "zeta-source-soapy",
 ]
