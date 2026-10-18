@@ -240,6 +240,7 @@ async fn iq_read_writes_sigmf_pair() {
         .unwrap();
     src.start();
     let selection = selection(&node, 100_000_000, 48_000).await;
+    let start = selection.span.start_ns;
     let (rate, samples, path) = match node.apply(Op::IqRead { selection }).await {
         Ok(OpResult::Iq {
             sample_rate_hz,
@@ -258,6 +259,7 @@ async fn iq_read_writes_sigmf_pair() {
     assert_eq!(meta.datatype, "cf32_le");
     assert_eq!(meta.sample_rate_hz, Hz(48_000));
     assert_eq!(meta.center_hz, Hz(100_000_000));
+    assert_eq!(meta.start, start);
     let data = std::fs::metadata(path.with_extension("sigmf-data")).unwrap();
     assert_eq!(data.len(), 2400 * 8);
 }
