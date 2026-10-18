@@ -24,7 +24,9 @@ The FFT stage has a GPU implementation behind the `gpu` cargo feature (wgpu comp
 the feature on, the node adds the GPU backend only when a hardware adapter is found, and the
 scheduler then prefers it; without one the CPU FFT runs, so a missing GPU never fails a job.
 `gpu_matches_cpu_within_0_1_db` needs a GPU host: elsewhere it prints `skipped: no adapter` and
-passes.
+passes. Software adapters (lavapipe, llvmpipe) are ignored unless `ZETA_GPU_ALLOW_SOFTWARE=1`;
+`software_adapter_allowed_by_env` sets it, so a GPU-less box with Mesa still runs the GPU path. A
+GPU failure at run time is logged to stderr and that spectrum is computed on the CPU.
 
 ## CLI walkthrough
 
