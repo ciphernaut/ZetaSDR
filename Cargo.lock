@@ -2919,11 +2919,13 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "zeta-agent",
  "zeta-client",
  "zeta-core",
+ "zeta-source-file",
 ]
 
 [[package]]

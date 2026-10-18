@@ -1,11 +1,14 @@
 //! Fake OpenAI-compatible server for tests (feature `test-fake`).
 
+use crate::exec::Executor;
+use crate::llm::AgentError;
+use async_trait::async_trait;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -140,4 +143,36 @@ pub fn text_response(content: &str, finish_reason: &str) -> Value {
             "message": {"role": "assistant", "content": content},
         }],
     })
+}
+
+/// An executor that records every operation and answers from a table keyed
+/// by op name; an unlisted op answers `{"result":"ok"}`.
+pub struct RecordingExecutor {
+    /// Every operation it was asked to apply, in order.
+    pub calls: Mutex<Vec<Value>>,
+    answers: HashMap<String, Result<Value, Value>>,
+}
+
+impl RecordingExecutor {
+    pub fn new(answers: Vec<(&str, Result<Value, Value>)>) -> Self {
+        Self {
+            calls: Mutex::default(),
+            answers: answers
+                .into_iter()
+                .map(|(op, answer)| (op.to_string(), answer))
+                .collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for RecordingExecutor {
+    async fn apply(&self, op: Value) -> Result<Result<Value, Value>, AgentError> {
+        let answer = op["op"]
+            .as_str()
+            .and_then(|name| self.answers.get(name).cloned())
+            .unwrap_or_else(|| Ok(json!({"result": "ok"})));
+        self.calls.lock().unwrap().push(op);
+        Ok(answer)
+    }
 }
