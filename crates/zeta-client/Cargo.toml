@@ -11,3 +11,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 zeta-core = { path = "../zeta-core" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros"] }
+zeta-ws = { path = "../zeta-ws", features = ["test-server"] }

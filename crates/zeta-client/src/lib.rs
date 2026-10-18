@@ -1,5 +1,8 @@
 //! Typed client for a ZetaSDR node.
 
+pub mod remote;
+pub use remote::{ClientError, NodeClient};
+
 use serde_json::Value;
 use zeta_core::ops::{Op, OpError};
 

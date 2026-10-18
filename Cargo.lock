@@ -2927,8 +2927,11 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
  "zeta-core",
+ "zeta-ws",
 ]
 
 [[package]]
