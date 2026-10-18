@@ -79,6 +79,13 @@ fn parse(m: Message) -> WsMessage {
     }
 }
 
+/// The `frames` of a tail response, which is the `stream_tail` operation's result.
+async fn frames_of(resp: reqwest::Response) -> Vec<zeta_ws::WsFrame> {
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["result"], "frames", "{v}");
+    serde_json::from_value(v["value"]["frames"].clone()).unwrap()
+}
+
 async fn tail(ts: &TestServer, id: &str, query: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}/streams/{id}/tail?{query}", ts.url))
@@ -287,7 +294,7 @@ async fn tail_collects_until_max_or_timeout() {
     });
     let resp = tail(&ts, &id.0, "max_frames=2&timeout_ms=1000").await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let frames: Vec<zeta_ws::WsFrame> = resp.json().await.unwrap();
+    let frames = frames_of(resp).await;
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[0].payload, json!({"n": 0}));
     assert_eq!(frames[1].payload, json!({"n": 1}));
@@ -296,7 +303,7 @@ async fn tail_collects_until_max_or_timeout() {
     let started = Instant::now();
     let resp = tail(&ts, &id.0, "max_frames=5&timeout_ms=200").await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let frames: Vec<zeta_ws::WsFrame> = resp.json().await.unwrap();
+    let frames = frames_of(resp).await;
     assert!(frames.is_empty());
     assert!(started.elapsed() >= Duration::from_millis(200));
 
@@ -305,5 +312,44 @@ async fn tail_collects_until_max_or_timeout() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "out_of_range");
     assert_eq!(body["field"], "max_frames");
+
+    // The limits are the operation's (1..=1000 frames, 1..=10_000 ms), not a second HTTP set.
+    let resp = tail(&ts, &id.0, "max_frames=1001&timeout_ms=10").await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["max"], 1000);
+    let resp = tail(&ts, &id.0, "max_frames=1000&timeout_ms=10").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = tail(&ts, &id.0, "max_frames=1&timeout_ms=10001").await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["field"], "timeout_ms");
+    ts.stop().await;
+}
+
+#[tokio::test]
+async fn tail_route_matches_stream_tail_op() {
+    // GET /streams/{id}/tail and POST /op stream_tail return the same `frames` result.
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let id = register(&ts);
+    let get = tail(&ts, &id.0, "max_frames=1&timeout_ms=50").await;
+    assert_eq!(get.status(), StatusCode::OK);
+    let get: Value = get.json().await.unwrap();
+    let post: Value = reqwest::Client::new()
+        .post(format!("{}/op", ts.url))
+        .header("authorization", BEARER)
+        .json(&json!({"op": "stream_tail", "stream": id.0, "max_frames": 1, "timeout_ms": 50}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(get, post);
+    assert_eq!(
+        get,
+        json!({"result": "frames", "value": {"frames": [], "missed": 0}})
+    );
     ts.stop().await;
 }

@@ -89,8 +89,9 @@ async fn schema_streams_agents_md_tail() {
             payload: Payload::Event(json!({"n": 1})),
         });
     });
-    let frames = c.tail(&id, 1, 1000).await.unwrap().unwrap();
-    assert_eq!(frames.as_array().unwrap().len(), 1);
+    let tail = c.tail(&id, 1, 1000).await.unwrap().unwrap();
+    assert_eq!(tail["result"], "frames", "{tail}");
+    assert_eq!(tail["value"]["frames"].as_array().unwrap().len(), 1);
 
     let bogus = c
         .tail(&StreamId("bogus".to_string()), 1, 10)

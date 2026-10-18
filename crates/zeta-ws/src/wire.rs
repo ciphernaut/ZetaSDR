@@ -1,24 +1,12 @@
-//! The websocket wire shapes: `WsFrame`, `WsMessage` and the `Frame` to `WsFrame` summary.
+//! The websocket wire shapes: `WsMessage`, and `WsFrame`, which is core's `FrameSummary`.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use zeta_core::port::IqBlock;
-use zeta_core::stream::{Frame, Payload};
-use zeta_core::types::{ChannelId, JobId, SourceId, StreamId, StreamKind, Timestamp};
+use zeta_core::stream::Frame;
 
-/// One frame as it crosses the wire: provenance flattened, sample data summarised.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct WsFrame {
-    pub stream: StreamId,
-    pub kind: StreamKind,
-    pub source: SourceId,
-    pub job: Option<JobId>,
-    pub channel: Option<ChannelId>,
-    pub start_ns: Timestamp,
-    pub end_ns: Timestamp,
-    pub payload: Value,
-}
+/// One frame as it crosses the wire: provenance flattened, sample data summarised. The same
+/// shape as a `stream_tail` frame, so the websocket and the operation agree.
+pub type WsFrame = zeta_core::ops::FrameSummary;
 
 /// Every text message a stream websocket sends.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -29,51 +17,21 @@ pub enum WsMessage {
     Closed { reason: String },
 }
 
-fn iq_summary(b: &IqBlock) -> Value {
-    json!({
-        "sample_rate_hz": b.sample_rate_hz,
-        "center_hz": b.center_hz,
-        "samples": b.samples.len(),
-    })
-}
-
 /// Summarise a bus frame for the wire; sample data does not cross it.
 pub fn ws_frame(f: &Frame) -> WsFrame {
-    let payload = match &f.payload {
-        Payload::Event(v) => v.clone(),
-        Payload::Text(s) => Value::String(s.clone()),
-        Payload::Audio {
-            sample_rate_hz,
-            samples,
-        } => {
-            let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-            json!({
-                "sample_rate_hz": sample_rate_hz,
-                "samples": samples.len(),
-                "peak": peak,
-            })
-        }
-        Payload::Iq(b) | Payload::Sink(b) => iq_summary(b),
-        Payload::Video => json!({}),
-    };
-    let p = &f.provenance;
-    WsFrame {
-        stream: f.stream.clone(),
-        kind: f.kind,
-        source: p.source.clone(),
-        job: p.job.clone(),
-        channel: p.channel.clone(),
-        start_ns: p.span.start_ns,
-        end_ns: p.span.end_ns,
-        payload,
-    }
+    WsFrame::from_frame(f)
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use zeta_core::types::{Hz, Provenance, Span};
+    use serde_json::json;
+    use zeta_core::port::IqBlock;
+    use zeta_core::stream::Payload;
+    use zeta_core::types::{
+        ChannelId, Hz, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
+    };
 
     use super::*;
 
@@ -142,5 +100,7 @@ mod tests {
         assert_eq!(v["type"], "frame");
         assert_eq!(v["stream"], "s1");
         assert_eq!(v["payload"], "hi");
+        let back: WsMessage = serde_json::from_value(v).unwrap();
+        assert!(matches!(back, WsMessage::Frame(f) if f.payload == "hi"));
     }
 }

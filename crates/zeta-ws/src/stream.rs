@@ -12,14 +12,14 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::broadcast::{self, error::RecvError};
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::timeout;
 use tokio_util::task::task_tracker::TaskTrackerToken;
-use zeta_core::ops::OpError;
+use zeta_core::ops::{Op, OpError};
 use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::StreamId;
 
 use crate::http::{Shared, StatsHandle, error_response, other};
-use crate::wire::{WsFrame, WsMessage, ws_frame};
+use crate::wire::{WsMessage, ws_frame};
 
 fn unknown_stream(bus: &StreamBus, id: &StreamId) -> OpError {
     let mut known: Vec<String> = bus.list().into_iter().map(|i| i.id.0).collect();
@@ -31,47 +31,15 @@ fn unknown_stream(bus: &StreamBus, id: &StreamId) -> OpError {
     }
 }
 
-/// Subscribe to `id` and collect frames until `max_frames` arrive, `timeout` passes or the
-/// stream ends. Lag notices are skipped.
-pub async fn tail(
-    bus: &StreamBus,
-    id: &StreamId,
-    max_frames: u32,
-    timeout: Duration,
-) -> Result<Vec<WsFrame>, OpError> {
-    let mut rx = bus.subscribe(id).ok_or_else(|| unknown_stream(bus, id))?;
-    let deadline = Instant::now() + timeout;
-    let mut frames = Vec::new();
-    while frames.len() < max_frames as usize {
-        match timeout_at(deadline, rx.recv()).await {
-            Ok(Ok(frame)) => frames.push(ws_frame(&frame)),
-            Ok(Err(RecvError::Lagged(_))) => continue,
-            Ok(Err(RecvError::Closed)) | Err(_) => break,
-        }
-    }
-    Ok(frames)
-}
-
 #[derive(Deserialize)]
 pub(crate) struct TailQuery {
     max_frames: u32,
     timeout_ms: u32,
 }
 
-fn in_range(field: &str, value: u32, max: u32) -> Result<(), OpError> {
-    if (1..=max).contains(&value) {
-        return Ok(());
-    }
-    Err(OpError::OutOfRange {
-        field: field.to_string(),
-        value: value.into(),
-        min: 1,
-        max: max.into(),
-        suggested: None,
-    })
-}
-
-/// `GET /streams/{id}/tail?max_frames=N&timeout_ms=T`.
+/// `GET /streams/{id}/tail?max_frames=N&timeout_ms=T`: applies `Op::StreamTail`, so limits,
+/// errors and the body (the `frames` result, as `POST /op` returns it) are the operation's.
+/// An unknown stream is 404, any other operation error 422.
 pub(crate) async fn tail_route(
     State(st): State<Shared>,
     Path(id): Path<String>,
@@ -81,14 +49,13 @@ pub(crate) async fn tail_route(
         Ok(q) => q,
         Err(e) => return error_response(e.status(), other(e.body_text())),
     };
-    let checked = in_range("max_frames", q.max_frames, st.limits.tail_max_frames)
-        .and_then(|()| in_range("timeout_ms", q.timeout_ms, st.limits.tail_max_timeout_ms));
-    if let Err(e) = checked {
-        return error_response(StatusCode::UNPROCESSABLE_ENTITY, e);
-    }
-    let wait = Duration::from_millis(q.timeout_ms.into());
-    match tail(&st.node.bus(), &StreamId(id), q.max_frames, wait).await {
-        Ok(frames) => Json(frames).into_response(),
+    let op = Op::StreamTail {
+        stream: StreamId(id),
+        max_frames: q.max_frames,
+        timeout_ms: q.timeout_ms,
+    };
+    match st.node.apply(op).await {
+        Ok(result) => Json(result).into_response(),
         Err(e @ OpError::Unknown { .. }) => error_response(StatusCode::NOT_FOUND, e),
         Err(e) => error_response(StatusCode::UNPROCESSABLE_ENTITY, e),
     }

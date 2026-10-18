@@ -127,12 +127,18 @@ else it gets 401.
 | `GET /streams` | live streams |
 | `GET /agents-md` | the node's agent guide |
 | `GET /stream/{id}` | websocket of one stream |
-| `GET /streams/{id}/tail?max_frames=N&timeout_ms=T` | up to N recent frames as a JSON array |
+| `GET /streams/{id}/tail?max_frames=N&timeout_ms=T` | the `stream_tail` operation: up to N frames arriving within T ms |
 
-The websocket sends text messages tagged by `type`: `{"type":"frame", ...}` carries a `WsFrame`
-(`stream`, `kind`, `source`, `job`, `channel`, `start_ns`, `end_ns` and a `payload` summary; sample
-data does not cross the wire), `{"type":"lagged","missed":N}` reports dropped frames and
-`{"type":"closed","reason":...}` ends the stream.
+`POST /op` answers 504 if an operation takes longer than 30 s. `GET /streams/{id}/tail` applies
+`stream_tail` and returns exactly what `POST /op` returns for it (`{"result":"frames","value":
+{"frames":[...],"missed":N}}`, limits 1..=1000 frames and 1..=10000 ms), so a tail over HTTP is
+bounded by the operation's own 10 s, well inside the 30 s.
+
+The websocket sends text messages tagged by `type`: `{"type":"frame", ...}` carries one frame in
+the same shape as a `stream_tail` frame (`stream`, `kind`, `source`, `job`, `channel`, `start_ns`,
+`end_ns` and a `payload` summary; sample data does not cross the wire),
+`{"type":"lagged","missed":N}` reports dropped frames and `{"type":"closed","reason":...}` ends
+the stream.
 
 `zeta serve --listen` runs in the foreground, so run the commands that follow in a second terminal.
 

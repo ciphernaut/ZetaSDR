@@ -38,8 +38,6 @@ pub struct Limits {
     pub ws_send_timeout: Duration,
     pub auth_fail_delay: Duration,
     pub ws_max_message_bytes: usize,
-    pub tail_max_frames: u32,
-    pub tail_max_timeout_ms: u32,
 }
 
 impl Default for Limits {
@@ -52,8 +50,6 @@ impl Default for Limits {
             ws_send_timeout: Duration::from_secs(5),
             auth_fail_delay: Duration::from_millis(250),
             ws_max_message_bytes: 64 << 10,
-            tail_max_frames: 100,
-            tail_max_timeout_ms: 10_000,
         }
     }
 }
