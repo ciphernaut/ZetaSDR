@@ -279,12 +279,7 @@ mod tests {
     }
 
     fn text(stream: StreamId, s: &str) -> Frame {
-        Frame {
-            stream,
-            kind: StreamKind::Text,
-            provenance: prov(),
-            payload: Payload::Text(s.into()),
-        }
+        Frame::new(stream, prov(), Payload::Text(s.into()))
     }
 
     type Run = tokio::task::JoinHandle<Result<(), StageError>>;

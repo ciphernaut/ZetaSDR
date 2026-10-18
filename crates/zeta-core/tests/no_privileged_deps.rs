@@ -10,6 +10,7 @@ fn core_has_no_driver_or_vendor_deps() {
         "egui",
         "tauri",
         "wgpu",
+        "rustfft",
     ] {
         assert!(
             !toml.contains(banned),

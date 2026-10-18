@@ -1,6 +1,7 @@
 //! Typed stream bus: every output stream, with provenance, between stages, jobs and clients.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use schemars::JsonSchema;
@@ -45,6 +46,18 @@ pub struct Frame {
     pub payload: Payload,
 }
 
+impl Frame {
+    /// Build a frame whose `kind` is derived from its payload.
+    pub fn new(stream: StreamId, provenance: Provenance, payload: Payload) -> Self {
+        Self {
+            stream,
+            kind: payload.kind(),
+            provenance,
+            payload,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -56,6 +69,7 @@ pub struct StreamInfo {
 
 pub struct StreamBus {
     capacity: usize,
+    dropped: AtomicU64,
     streams: RwLock<HashMap<StreamId, (StreamInfo, broadcast::Sender<Frame>)>>,
 }
 
@@ -63,6 +77,7 @@ impl StreamBus {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            dropped: AtomicU64::new(0),
             streams: RwLock::new(HashMap::new()),
         }
     }
@@ -80,11 +95,21 @@ impl StreamBus {
     }
 
     /// Publish to subscribers. Frames for unregistered streams and sends with
-    /// no subscribers are dropped silently.
+    /// no subscribers are dropped silently; frames whose kind differs from the
+    /// registered stream's are dropped and counted in [`StreamBus::dropped`].
     pub fn publish(&self, frame: Frame) {
-        if let Some((_, tx)) = self.streams.read().unwrap().get(&frame.stream) {
+        if let Some((info, tx)) = self.streams.read().unwrap().get(&frame.stream) {
+            if info.kind != frame.kind {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let _ = tx.send(frame);
         }
+    }
+
+    /// Number of frames dropped for carrying the wrong kind for their stream.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Remove a stream; its sender is dropped, so subscribers see `Closed`
@@ -99,6 +124,15 @@ impl StreamBus {
             .unwrap()
             .get(id)
             .map(|(_, tx)| tx.subscribe())
+    }
+
+    /// Live subscribers of a registered stream; `None` if it is not registered.
+    pub fn receiver_count(&self, id: &StreamId) -> Option<usize> {
+        self.streams
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|(_, tx)| tx.receiver_count())
     }
 
     pub fn list(&self) -> Vec<StreamInfo> {
@@ -134,16 +168,23 @@ mod tests {
         let p = prov("s");
         let id = bus.register(StreamKind::Text, p.clone());
         let mut rx = bus.subscribe(&id).unwrap();
-        bus.publish(Frame {
-            stream: id.clone(),
-            kind: StreamKind::Text,
-            provenance: p,
-            payload: Payload::Text("hi".into()),
-        });
+        bus.publish(Frame::new(id.clone(), p, Payload::Text("hi".into())));
         let f = rx.recv().await.unwrap();
         assert_eq!(f.stream, id);
         assert_eq!(f.kind, StreamKind::Text);
         assert!(matches!(f.payload, Payload::Text(ref s) if s == "hi"));
+    }
+
+    #[tokio::test]
+    async fn publish_with_mismatched_kind_is_dropped_and_counted() {
+        let bus = StreamBus::new(8);
+        let p = prov("s");
+        let id = bus.register(StreamKind::Text, p.clone());
+        let mut rx = bus.subscribe(&id).unwrap();
+        bus.publish(Frame::new(id, p, Payload::Event(serde_json::json!({}))));
+        let got = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(got.is_err(), "mismatched frame must not be delivered");
+        assert_eq!(bus.dropped(), 1);
     }
 
     #[tokio::test]
@@ -170,6 +211,16 @@ mod tests {
             rx.recv().await,
             Err(broadcast::error::RecvError::Closed)
         ));
+    }
+
+    #[test]
+    fn receiver_count_tracks_subscribers() {
+        let bus = StreamBus::new(1);
+        let id = bus.register(StreamKind::Text, prov("s"));
+        assert_eq!(bus.receiver_count(&id), Some(0));
+        let _rx = bus.subscribe(&id).unwrap();
+        assert_eq!(bus.receiver_count(&id), Some(1));
+        assert_eq!(bus.receiver_count(&StreamId::new()), None);
     }
 
     #[test]

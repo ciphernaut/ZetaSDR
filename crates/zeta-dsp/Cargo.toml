@@ -1,0 +1,33 @@
+[package]
+name = "zeta-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZetaSDR DSP stages"
+
+[dependencies]
+async-trait = "0.1.92"
+bytemuck = { version = "1.25.2", optional = true }
+num-complex = "0.4.6"
+pollster = { version = "1.0.1", optional = true }
+rustfft = "6.4.1"
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["sync", "rt", "macros", "time"] }
+tokio-util = "0.7.20"
+wgpu = { version = "30.0.1", optional = true }
+zeta-core = { path = "../zeta-core" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] }
+
+[features]
+test-fixtures = []
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+
+[[example]]
+name = "gen_aprs"
+required-features = ["test-fixtures"]

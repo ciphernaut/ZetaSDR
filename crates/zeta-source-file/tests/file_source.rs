@@ -126,6 +126,71 @@ async fn tune_off_center_is_out_of_range() {
     assert_eq!(src.current(), Some(captured));
 }
 
+#[tokio::test]
+async fn tune_sub_band_inside_recording_returns_capture_band() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = FileSource::open(
+        SourceId("f".into()),
+        &common::tone(dir.path()),
+        FileOpts {
+            realtime: false,
+            block_samples: 4800,
+            repeat: false,
+        },
+    )
+    .unwrap();
+    let caps = src.capabilities();
+    assert_eq!(*caps.tune_min_hz.value(), Hz(99_976_000));
+    assert_eq!(*caps.tune_max_hz.value(), Hz(100_024_000));
+    let captured = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(48_000),
+    };
+    // Off-centre sub-band, and one touching the upper edge exactly.
+    for (c, bw) in [(100_005_000, 12_500), (100_017_750, 12_500)] {
+        let t = Tuning {
+            center_hz: Hz(c),
+            bandwidth_hz: Hz(bw),
+        };
+        assert_eq!(src.tune(t).await.unwrap(), captured, "{c} / {bw}");
+    }
+    // Centre inside but the band spills over the edge: center_hz names the range.
+    match src
+        .tune(Tuning {
+            center_hz: Hz(100_018_000),
+            bandwidth_hz: Hz(12_500),
+        })
+        .await
+    {
+        Err(PortError::OutOfRange {
+            field: "center_hz",
+            value: 100_018_000,
+            min: 99_976_000,
+            max: 100_024_000,
+            suggested: None,
+        }) => {}
+        other => panic!("got {other:?}"),
+    }
+    // Bandwidth alone at fault.
+    for bw in [0, 48_001] {
+        match src
+            .tune(Tuning {
+                center_hz: Hz(100_000_000),
+                bandwidth_hz: Hz(bw),
+            })
+            .await
+        {
+            Err(PortError::OutOfRange {
+                field: "bandwidth_hz",
+                min: 1,
+                max: 48_000,
+                ..
+            }) => {}
+            other => panic!("bw {bw}: got {other:?}"),
+        }
+    }
+}
+
 fn write_raw(dir: &std::path::Path, dt: &str, bytes: &[u8]) -> std::path::PathBuf {
     let meta = dir.join("raw.sigmf-meta");
     std::fs::write(

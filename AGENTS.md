@@ -4,7 +4,7 @@ ZetaSDR is an agentic SDR runtime. You drive it through a small typed operation 
 
 ## Rules
 
-- One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`, times are integer nanoseconds since the UNIX epoch in fields ending `_ns`.
+- One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`, times are integer nanoseconds since the UNIX epoch in fields ending `_ns`, durations are integer milliseconds in fields ending `_ms`.
 - Every field is required and unknown fields are rejected.
 - Call operations, do not explain.
 - Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.
@@ -20,7 +20,7 @@ Every command takes two global flags:
 
 There are two ways to run:
 
-- One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span.
+- One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. `job start --then-tail MAX_FRAMES,TIMEOUT_MS` keeps that one-shot node up after the start, tails the job's first event stream (else its audio stream), then stops the job and prints `[job_result, frames_result, {"stopped": true}]`; add `--keep` to leave it running (`{"stopped": false}`). If the job is not running (e.g. failed) it prints `[job_result, job_record]`, the record's `state` carrying `status` and `reason`, and exits 2; `stream tail` on its own only sees streams of jobs running in the same process. A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span.
 - `zeta serve`: resumes persisted jobs and keeps them running until Ctrl-C.
 - Against a running node, `zeta --node URL --secret SECRET <group> <verb> ...` (or the `ZETA_NODE` and `ZETA_SECRET` variables): the operation is sent to that node over HTTP and applied there, so jobs started this way keep running; `--state-dir` and `--source-file` belong to the serving node and are rejected. Start that node with `zeta serve --listen PORT` (binds 127.0.0.1) or `--listen ADDR:PORT` (a LAN address) and a secret. `zeta-mcp --node URL` offers the same operations as MCP tools, and `zeta ask "REQUEST"` lets a local model call them.
 
@@ -48,7 +48,7 @@ CLI: `zeta source ensure --source <id> --center-hz 144800000 --bandwidth-hz 1250
 
 ### job_start
 
-- kind: string (JobKind: passthrough)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|aprs_decode|measure)
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
@@ -95,6 +95,18 @@ JSON: `{"op":"stream_list"}`
 
 CLI: `zeta stream list`
 
+### stream_tail
+
+Collect frames from a stream until `max_frames` (1..=1000) arrive or `timeout_ms` (1..=10000) passes, whichever is first; frames published before the call are not seen. Frames skipped because the caller fell behind are dropped and counted in the result's `missed`.
+
+- stream: string; an id from `stream list`
+- max_frames: integer
+- timeout_ms: integer
+
+JSON: `{"op":"stream_tail","stream":"<id>","max_frames":1,"timeout_ms":5000}`
+
+CLI: `zeta stream tail --stream <id> --max-frames 1 --timeout-ms 5000`
+
 ### graph_get
 
 - job: string; an id from `job list`
@@ -132,7 +144,7 @@ The built-in provider has signatures but no allocations, so an empty `allocation
 
 ### classify
 
-Run every registered classifier over the selection's span of the source ring (no upstream features).
+Run every registered classifier over the selection's span of the source ring (no upstream features). The analysis covers the whole source band; the selection band is validated but not used to narrow the analysis in this release.
 
 - selection: object (Selection: source, span{start_ns,end_ns: integer (ns since epoch)}, center_hz, bandwidth_hz)
 
@@ -149,6 +161,38 @@ CLI: `zeta schema`
 ## Stage kinds
 
 A graph node's `kind` names one of these; its `params` must match the listed fields.
+
+### aprs_decode
+
+- inputs: audio
+- outputs: event
+
+### channel
+
+- inputs: iq
+- outputs: iq
+- params.center_hz: integer
+- params.bandwidth_hz: integer
+- params.out_rate_hz: integer
+
+### fft
+
+- inputs: iq
+- outputs: event
+- params.size: integer
+- params.window: string (Window: hann|rect)
+
+### measure
+
+- inputs: iq
+- outputs: event
+
+### nbfm_demod
+
+- inputs: iq
+- outputs: audio
+- params.deviation_hz: integer
+- params.audio_rate_hz: integer
 
 ### passthrough
 
@@ -167,6 +211,10 @@ Measured facts first, then method. Verify against the node's `knowledge lookup` 
 - POCSAG: the preamble is 576 bits of alternating 1/0, then the 32-bit sync word 0x7CD215D8. Common rates are 512, 1200 and 2400 baud.
 - ADS-B: 1090 MHz, PPM at 1 Mbaud, 112-bit extended squitter.
 - MeshCore: LoRa around 915 MHz in AU and 869 MHz in EU, 250 kHz wide. Not decodable without the network key; classify and report, do not try to decode.
+
+### Decoding APRS and reading measurements
+
+To decode APRS from a source, start the job and tail its events in one call: `zeta job start --kind aprs_decode --source S --center-hz 144800000 --bandwidth-hz 12500 --then-tail 1,5000`. It prints `[job_result, frames_result, {"stopped": true}]` (the job is stopped after the tail; add `--keep` to leave it running); each frame's `payload` is one decoded packet (`src`, `dst`, `info`, `fcs_ok`). An empty frame list means no packet arrived within the timeout, not that none exist. Exit 2 with `[job_result, job_record]` means the job is not running: read `state.reason` (e.g. a source rate the 48 kHz channel cannot divide). A `measure` job emits one event per second of IQ: `center_hz` and `bandwidth_hz` are the occupied band (spectrum bins at least 6 dB above the median noise floor), `snr_db` is the peak above that floor, `burst` is true when the loudest 10 ms is more than 3 times the median 10 ms power, `symbol_rate_baud` is the keying rate when a symbol-rate line stands out and `null` otherwise, and `label.name` is one of `noise` (SNR under 6 dB), `carrier` (steady envelope, no modulation), `fm` (steady envelope with deviation), `fsk` (two tones 500-3000 Hz apart, on RF or in FM audio) or `unknown`. Report `unknown` as unknown, with the measured fields. `classify`, `measure` and `spectrum` cover the whole source band; the selection/job band is validated but not used to narrow the analysis in this release.
 
 ### Working layer 4
 

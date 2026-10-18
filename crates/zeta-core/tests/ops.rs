@@ -13,10 +13,10 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, schema};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::JobId;
 use zeta_core::types::{
     Capabilities, Claim, Hz, SampleFormat, Selection, SourceId, Span, Timestamp,
 };
+use zeta_core::types::{JobId, StreamId, StreamKind};
 use zeta_source_file::{FileOpts, FileSource, fixtures, read_meta};
 
 /// A port tunable over 1 MHz..6 GHz that accepts any in-range request.
@@ -342,7 +342,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 13, "one schema per Op variant");
+    assert_eq!(vs.len(), 14, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -404,6 +404,19 @@ fn nested_schemas_are_strict() {
     for key in ["op", "result", "error"] {
         check_strict(&s[key], key);
     }
+    // stream_tail: provenance fields on every frame, and the missed count.
+    let fs = &s["result"]["$defs"]["FrameSummary"];
+    for f in ["source", "job", "channel"] {
+        assert!(fs["properties"].get(f).is_some(), "FrameSummary.{f}: {fs}");
+    }
+    let frames = variants(&s["result"])
+        .iter()
+        .find(|v| v["properties"]["result"]["const"] == "frames")
+        .expect("frames result variant");
+    let value = &frames["properties"]["value"];
+    for f in ["frames", "missed"] {
+        assert!(value["properties"].get(f).is_some(), "frames.{f}: {value}");
+    }
 }
 
 /// Whether a unit field's schema `s` is an integer or a `$ref` to a unit type.
@@ -462,10 +475,14 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                     ]
                     .iter()
                     .any(|w| name.contains(w));
+                    // `_ns` is an instant; `_ms` a duration (a timeout), plain integer.
                     assert!(
-                        !time || name.ends_with("_ns"),
-                        "{path}.{name} is a time field without _ns"
+                        !time || name.ends_with("_ns") || name.ends_with("_ms"),
+                        "{path}.{name} is a time field without _ns/_ms"
                     );
+                    if name.ends_with("_ms") {
+                        assert_eq!(s["type"], "integer", "{path}.{name} is not an integer");
+                    }
                     if ["_hz", "_ns", "_baud"].iter().any(|u| name.ends_with(u)) {
                         assert!(unit_typed(s, defs), "{path}.{name} is not a unit type: {s}");
                     }
@@ -764,4 +781,282 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
     assert_eq!(rec.state, JobState::Running);
     assert_eq!(rec.graph, before);
     assert_eq!(node.lease_holders(&SourceId("file0".into())).len(), 1);
+}
+
+#[test]
+fn spectrum_kind_expands_to_single_fft_node() {
+    assert_eq!(JobKind::Spectrum.name(), "spectrum");
+    let tuning = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(48_000),
+    };
+    let g = JobKind::Spectrum.expand(&SourceId("file0".into()), tuning);
+    assert_eq!(g.nodes.len(), 1);
+    assert!(g.edges.is_empty());
+    assert_eq!(g.nodes[0].kind, "fft");
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"size": 1024, "window": "hann"})
+    );
+}
+
+#[test]
+fn fm_demod_kind_expands_to_channel_then_nbfm() {
+    assert_eq!(JobKind::FmDemod.name(), "fm_demod");
+    assert_eq!(
+        serde_json::to_value(JobKind::FmDemod).unwrap(),
+        serde_json::json!("fm_demod")
+    );
+    let tuning = Tuning {
+        center_hz: Hz(100_005_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let g = JobKind::FmDemod.expand(&SourceId("file0".into()), tuning);
+    assert_eq!(g.nodes.len(), 2);
+    assert_eq!(g.nodes[0].kind, "channel");
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"center_hz": 100_005_000, "bandwidth_hz": 12_500, "out_rate_hz": 48_000})
+    );
+    assert_eq!(g.nodes[1].kind, "nbfm_demod");
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000})
+    );
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!(g.edges[0].from, g.nodes[0].id);
+    assert_eq!(g.edges[0].to, g.nodes[1].id);
+    assert_eq!(g.edges[0].kind, zeta_core::types::StreamKind::Iq);
+}
+
+#[test]
+fn measure_kind_expands_to_one_measure_node() {
+    assert_eq!(JobKind::Measure.name(), "measure");
+    assert_eq!(
+        serde_json::to_value(JobKind::Measure).unwrap(),
+        serde_json::json!("measure")
+    );
+    let tuning = Tuning {
+        center_hz: Hz(144_800_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let g = JobKind::Measure.expand(&SourceId("file0".into()), tuning);
+    assert_eq!(g.nodes.len(), 1);
+    assert_eq!(g.nodes[0].kind, "measure");
+    assert_eq!(g.nodes[0].params, serde_json::json!({}));
+    assert!(g.edges.is_empty());
+}
+
+#[tokio::test]
+async fn stream_tail_unknown_stream_lists_known() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let span = Span {
+        start_ns: Timestamp(0),
+        end_ns: Timestamp(1),
+    };
+    let prov = |s: &str| zeta_core::types::Provenance {
+        source: SourceId(s.into()),
+        job: None,
+        channel: None,
+        span: span.clone(),
+    };
+    let a = node.bus().register(StreamKind::Event, prov("a"));
+    let b = node.bus().register(StreamKind::Audio, prov("b"));
+    let mut want = vec![a.0, b.0];
+    want.sort();
+    let op = Op::StreamTail {
+        stream: StreamId("nope".into()),
+        max_frames: 1,
+        timeout_ms: 10,
+    };
+    match node.apply(op).await {
+        Err(OpError::Unknown {
+            field,
+            value,
+            known,
+        }) => {
+            assert_eq!(field, "stream");
+            assert_eq!(value, "nope");
+            assert_eq!(known, want);
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+fn tail_prov() -> zeta_core::types::Provenance {
+    zeta_core::types::Provenance {
+        source: SourceId("s".into()),
+        job: Some(JobId("j".into())),
+        channel: Some(zeta_core::types::ChannelId("c".into())),
+        span: Span {
+            start_ns: Timestamp(10),
+            end_ns: Timestamp(20),
+        },
+    }
+}
+
+#[tokio::test]
+async fn stream_tail_times_out_with_empty_when_no_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let id = node.bus().register(StreamKind::Text, tail_prov());
+    let t0 = std::time::Instant::now();
+    let r = node
+        .apply(Op::StreamTail {
+            stream: id,
+            max_frames: 3,
+            timeout_ms: 100,
+        })
+        .await;
+    let took = t0.elapsed();
+    assert_eq!(
+        r,
+        Ok(OpResult::Frames {
+            frames: vec![],
+            missed: 0
+        })
+    );
+    assert!(took >= Duration::from_millis(100), "{took:?}");
+    assert!(took < Duration::from_millis(300), "{took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_tail_returns_collected_when_stream_closes() {
+    use zeta_core::stream::{Frame, Payload};
+    let dir = tempfile::tempdir().unwrap();
+    let node = Arc::new(
+        Node::open(cfg(dir.path()), registry(), vec![])
+            .await
+            .unwrap(),
+    );
+    let bus = node.bus();
+    let id = bus.register(StreamKind::Text, tail_prov());
+    let (n, sid) = (node.clone(), id.clone());
+    let t0 = std::time::Instant::now();
+    let tail = tokio::spawn(async move {
+        n.apply(Op::StreamTail {
+            stream: sid,
+            max_frames: 10,
+            timeout_ms: 5000,
+        })
+        .await
+    });
+    // Publish only once the tail has subscribed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while bus.receiver_count(&id).unwrap_or(0) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tail never subscribed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for t in ["one", "two"] {
+        bus.publish(Frame::new(id.clone(), tail_prov(), Payload::Text(t.into())));
+    }
+    bus.unregister(&id);
+    let (frames, missed) = match tail.await.unwrap() {
+        Ok(OpResult::Frames { frames, missed }) => (frames, missed),
+        other => panic!("expected Frames, got {other:?}"),
+    };
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "closed stream must end the tail"
+    );
+    assert_eq!(missed, 0);
+    assert_eq!(frames.len(), 2);
+    for (f, t) in frames.iter().zip(["one", "two"]) {
+        assert_eq!(f.stream, id);
+        assert_eq!(f.source, SourceId("s".into()));
+        assert_eq!(f.job, Some(JobId("j".into())));
+        assert_eq!(f.channel, Some(zeta_core::types::ChannelId("c".into())));
+        assert_eq!(f.kind, StreamKind::Text);
+        assert_eq!((f.start_ns, f.end_ns), (Timestamp(10), Timestamp(20)));
+        assert_eq!(f.payload, Value::String(t.into()));
+    }
+}
+
+#[tokio::test]
+async fn stream_tail_counts_missed_frames() {
+    use zeta_core::stream::{Frame, Payload};
+    let dir = tempfile::tempdir().unwrap();
+    let node = Arc::new(
+        Node::open(cfg(dir.path()), registry(), vec![])
+            .await
+            .unwrap(),
+    );
+    let bus = node.bus();
+    let id = bus.register(StreamKind::Text, tail_prov());
+    let (n, sid) = (node.clone(), id.clone());
+    let tail = tokio::spawn(async move {
+        n.apply(Op::StreamTail {
+            stream: sid,
+            max_frames: 1000,
+            timeout_ms: 5000,
+        })
+        .await
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while bus.receiver_count(&id).unwrap_or(0) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tail never subscribed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Single-threaded runtime: the tail cannot drain while these are
+    // published, so it falls more than the bus capacity behind.
+    const SENT: u64 = 600;
+    for i in 0..SENT {
+        bus.publish(Frame::new(
+            id.clone(),
+            tail_prov(),
+            Payload::Text(i.to_string()),
+        ));
+    }
+    bus.unregister(&id);
+    let (frames, missed) = match tail.await.unwrap() {
+        Ok(OpResult::Frames { frames, missed }) => (frames, missed),
+        other => panic!("expected Frames, got {other:?}"),
+    };
+    assert!(missed > 0, "missed {missed}");
+    assert_eq!(frames.len() as u64 + missed, SENT);
+    assert_eq!(frames.last().unwrap().payload, Value::String("599".into()));
+}
+
+#[tokio::test]
+async fn stream_tail_validates_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let id = node.bus().register(StreamKind::Text, tail_prov());
+    for (max_frames, timeout_ms, field, value, max) in [
+        (0, 10, "max_frames", 0, 1000),
+        (1001, 10, "max_frames", 1001, 1000),
+        (1, 0, "timeout_ms", 0, 10_000),
+        (1, 10_001, "timeout_ms", 10_001, 10_000),
+    ] {
+        let r = node
+            .apply(Op::StreamTail {
+                stream: id.clone(),
+                max_frames,
+                timeout_ms,
+            })
+            .await;
+        assert_eq!(
+            r,
+            Err(OpError::OutOfRange {
+                field: field.into(),
+                value,
+                min: 1,
+                max,
+                suggested: None,
+            })
+        );
+    }
 }

@@ -203,8 +203,16 @@ impl FileSource {
         }
         let samples: Arc<[Complex<f32>]> = convert(fmt, &raw).into();
         let caps = Capabilities {
-            tune_min_hz: Claim::Asserted(meta.center_hz),
-            tune_max_hz: Claim::Asserted(meta.center_hz),
+            tune_min_hz: Claim::Asserted(Hz(recording_band(
+                meta.center_hz.0,
+                meta.sample_rate_hz.0,
+            )
+            .0)),
+            tune_max_hz: Claim::Asserted(Hz(recording_band(
+                meta.center_hz.0,
+                meta.sample_rate_hz.0,
+            )
+            .1)),
             max_bandwidth_hz: Claim::Asserted(meta.sample_rate_hz),
             formats: vec![fmt],
             channels: 1,
@@ -278,6 +286,14 @@ impl FileSource {
     }
 }
 
+/// Edges `(center - rate/2, center + rate/2)` of a recording's band, saturating.
+fn recording_band(center_hz: u64, rate_hz: u64) -> (u64, u64) {
+    (
+        center_hz.saturating_sub(rate_hz / 2),
+        center_hz.saturating_add(rate_hz / 2),
+    )
+}
+
 #[async_trait]
 impl Port for FileSource {
     fn id(&self) -> &SourceId {
@@ -288,24 +304,34 @@ impl Port for FileSource {
         &self.caps
     }
 
+    /// Any band `t.center_hz ± t.bandwidth_hz / 2` (bandwidth >= 1) inside the
+    /// recording's band `file_center ± rate / 2` is accepted; the answer is the
+    /// recording's fixed band, never the request.
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
-        let c = self.meta.center_hz.0;
-        if t.center_hz.0 != c {
-            return Err(PortError::OutOfRange {
-                field: "center_hz",
-                value: t.center_hz.0,
-                min: c,
-                max: c,
-                suggested: None,
-            });
-        }
-        let bw = self.meta.sample_rate_hz.0;
-        if t.bandwidth_hz.0 > bw {
+        let (c, rate) = (self.meta.center_hz.0, self.meta.sample_rate_hz.0);
+        let (min, max) = recording_band(c, rate);
+        if t.bandwidth_hz.0 == 0 || t.bandwidth_hz.0 > rate {
             return Err(PortError::OutOfRange {
                 field: "bandwidth_hz",
                 value: t.bandwidth_hz.0,
-                min: 0,
-                max: bw,
+                min: 1,
+                max: rate,
+                suggested: None,
+            });
+        }
+        // Edges compared doubled in i128, so odd values are exact and nothing underflows.
+        let (tc, tb, fc, r) = (
+            t.center_hz.0 as i128,
+            t.bandwidth_hz.0 as i128,
+            c as i128,
+            rate as i128,
+        );
+        if 2 * tc - tb < 2 * fc - r || 2 * tc + tb > 2 * fc + r {
+            return Err(PortError::OutOfRange {
+                field: "center_hz",
+                value: t.center_hz.0,
+                min,
+                max,
                 suggested: None,
             });
         }

@@ -40,7 +40,22 @@ fn schema_prints_json_with_op_result_error() {
     for key in ["op", "result", "error", "stages"] {
         assert!(v["value"].get(key).is_some(), "schema missing {key}");
     }
-    assert_eq!(v["value"]["stages"][0]["kind"], "passthrough");
+    let kinds: Vec<&str> = v["value"]["stages"]
+        .as_array()
+        .expect("stages array")
+        .iter()
+        .filter_map(|s| s["kind"].as_str())
+        .collect();
+    for k in [
+        "passthrough",
+        "channel",
+        "fft",
+        "nbfm_demod",
+        "aprs_decode",
+        "measure",
+    ] {
+        assert!(kinds.contains(&k), "stages missing {k}: {kinds:?}");
+    }
 }
 
 #[test]
@@ -229,4 +244,145 @@ fn repeated_source_file_id_is_a_usage_error() {
         .code(1)
         .stderr(contains("tone"))
         .stderr(contains("more than once"));
+}
+
+/// Write the APRS fixture in `dir`; returns the `--source-file aprs=<meta>` value.
+fn aprs_source(dir: &Path) -> String {
+    let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir, "aprs", &iq, 48_000, 144_800_000);
+    format!("aprs={}", meta.display())
+}
+
+/// `job start` of an APRS decode on the `aprs` source, tailing `then_tail`, plus `extra`.
+fn aprs_start(dir: &Path, then_tail: &str, extra: &[&str]) -> Command {
+    let src = aprs_source(dir);
+    let mut args = vec![
+        "--source-file",
+        &src,
+        "job",
+        "start",
+        "--kind",
+        "aprs_decode",
+        "--source",
+        "aprs",
+        "--center-hz",
+        "144800000",
+        "--bandwidth-hz",
+        "12500",
+        "--then-tail",
+        then_tail,
+    ];
+    args.extend_from_slice(extra);
+    zeta(dir, &args)
+}
+
+/// The listed job `id`'s `state.status`.
+fn job_status(dir: &Path, id: &str) -> String {
+    let src = aprs_source(dir);
+    let out = zeta(dir, &["--source-file", &src, "job", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let job = v["value"]
+        .as_array()
+        .expect("jobs array")
+        .iter()
+        .find(|j| j["id"] == id)
+        .expect("job listed")
+        .clone();
+    job["state"]["status"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn job_start_then_tail_prints_aprs_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = aprs_start(dir.path(), "1,5000", &[])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    eprintln!("{}", String::from_utf8_lossy(&out));
+    let v = json(&out);
+    assert_eq!(v[0]["result"], "job");
+    assert_eq!(v[1]["result"], "frames");
+    assert_eq!(v[1]["value"]["missed"], 0);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["kind"], "event");
+    assert_eq!(frames[0]["source"], "aprs");
+    assert_eq!(frames[0]["job"], v[0]["value"]);
+    assert_eq!(frames[0]["channel"], "144800000/12500");
+    assert_eq!(frames[0]["payload"]["src"], "VK3ABC");
+}
+
+#[test]
+fn then_tail_stops_job_unless_keep() {
+    for (extra, stopped, status) in [
+        (&[][..], true, "stopped"),
+        (&["--keep"][..], false, "running"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = aprs_start(dir.path(), "1,5000", extra)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = json(&out);
+        assert_eq!(v.as_array().map(Vec::len), Some(3), "{v}");
+        assert_eq!(v[1]["result"], "frames");
+        assert_eq!(v[2], serde_json::json!({"stopped": stopped}));
+        let id = v[0]["value"].as_str().expect("job id");
+        assert_eq!(job_status(dir.path(), id), status, "{extra:?}");
+    }
+}
+
+#[test]
+fn then_tail_malformed_value_is_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    aprs_start(dir.path(), "1", &[])
+        .assert()
+        .code(1)
+        .stderr(contains("expected MAX_FRAMES,TIMEOUT_MS"));
+}
+
+#[test]
+fn then_tail_reports_failed_job() {
+    let dir = tempfile::tempdir().unwrap();
+    // 44.1 kHz is not a multiple of fm_demod's 48 kHz channel rate.
+    let iq = zeta_dsp::util::nco(44_100, 1_000.0, 44_100.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 44_100, 100_000_000);
+    let src = format!("cd={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "fm_demod",
+            "--source",
+            "cd",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "12500",
+            "--then-tail",
+            "1,2000",
+        ],
+    )
+    .assert()
+    .code(2)
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v[0]["result"], "job");
+    assert_eq!(v[1]["state"]["status"], "failed", "{v}");
+    assert!(v[1]["state"]["reason"].is_string(), "{v}");
 }

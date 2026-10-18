@@ -78,13 +78,15 @@ pub enum GraphError {
     BadParams { node: NodeId, reason: String },
     #[error("node id {node:?} is used more than once")]
     DuplicateNode { node: NodeId },
+    #[error("root node {node:?} must accept iq input")]
+    RootNeedsIq { node: NodeId },
     #[error("graph has no nodes")]
     Empty,
     #[error("edges form a cycle")]
     Cycle,
 }
 
-/// Check kinds, params, endpoints, edge types, unique node ids, that there is
+/// Check kinds, params, endpoints, edge types, unique node ids, that every root accepts IQ, that there is
 /// at least one node, and that the edges form no cycle, in that order.
 pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphError> {
     for n in &graph.nodes {
@@ -137,6 +139,17 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
     let mut seen = std::collections::HashSet::new();
     if let Some(n) = graph.nodes.iter().find(|n| !seen.insert(&n.id)) {
         return Err(GraphError::DuplicateNode { node: n.id.clone() });
+    }
+    for n in &graph.nodes {
+        if graph.edges.iter().any(|e| e.to == n.id) {
+            continue;
+        }
+        let takes_iq = registry
+            .spec(&n.kind)
+            .is_some_and(|s| s.inputs.contains(&StreamKind::Iq));
+        if !takes_iq {
+            return Err(GraphError::RootNeedsIq { node: n.id.clone() });
+        }
     }
     if graph.nodes.is_empty() {
         return Err(GraphError::Empty);
@@ -387,6 +400,23 @@ mod tests {
         assert_eq!(
             validate(&g, &registry()),
             Err(GraphError::DuplicateNode {
+                node: NodeId("a".into())
+            })
+        );
+    }
+
+    #[test]
+    fn root_node_without_iq_input_is_rejected() {
+        let mut r = registry();
+        r.register(fixed("audio_only", StreamKind::Audio, StreamKind::Audio));
+        let g = Graph {
+            id: GraphId::new(),
+            nodes: vec![node("a", "audio_only", serde_json::json!({}))],
+            edges: vec![],
+        };
+        assert_eq!(
+            validate(&g, &r),
+            Err(GraphError::RootNeedsIq {
                 node: NodeId("a".into())
             })
         );

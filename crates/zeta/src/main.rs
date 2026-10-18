@@ -19,6 +19,9 @@ const JOB_START_GRACE: Duration = Duration::from_millis(150);
 const RING_WAIT: Duration = Duration::from_secs(5);
 const RING_POLL: Duration = Duration::from_millis(20);
 
+/// Longest `--then-tail` waits for the job's streams to appear.
+const STREAM_WAIT: Duration = Duration::from_secs(2);
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Usage errors exit 1, not clap's 2: exit 2 is reserved for `OpError`.
@@ -59,6 +62,8 @@ async fn main() -> ExitCode {
         },
         cli.secret.clone(),
     );
+    let then_tail = cli.command.then_tail();
+    let keep = cli.command.keep();
     let op = match cli.command.into_op() {
         Ok(op) => op,
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
@@ -87,6 +92,10 @@ async fn main() -> ExitCode {
         wait_for_ring(&node, selection).await;
     }
     match node.apply(op).await {
+        Ok(zeta_core::ops::OpResult::Job(id)) if then_tail.is_some() => {
+            let t = then_tail.expect("checked");
+            then_tail_job(&node, id, t, keep).await
+        }
         Ok(r) => {
             if starts_job {
                 tokio::time::sleep(JOB_START_GRACE).await;
@@ -95,6 +104,90 @@ async fn main() -> ExitCode {
         }
         Err(e) => print(serde_json::to_string_pretty(&e), 2),
     }
+}
+
+/// `job start --then-tail`: report a job that is not running (before or
+/// after the tail) as `[job_result, job_record]` with exit 2; otherwise tail
+/// it, stop it unless `keep`, and print
+/// `[job_result, frames_result, {"stopped": bool}]`.
+async fn then_tail_job(
+    node: &zeta_core::node::Node,
+    id: zeta_core::types::JobId,
+    t: cli::ThenTail,
+    keep: bool,
+) -> ExitCode {
+    use zeta_core::job::JobState;
+    let job = zeta_core::ops::OpResult::Job(id.clone());
+    let not_running = || {
+        node.job_list()
+            .into_iter()
+            .find(|r| r.id == id)
+            .filter(|r| r.state != JobState::Running)
+    };
+    if let Some(rec) = not_running() {
+        return print(serde_json::to_string_pretty(&(job, rec)), 2);
+    }
+    let tail = tail_job(node, &id, t).await;
+    if let Some(rec) = not_running() {
+        return print(serde_json::to_string_pretty(&(job, rec)), 2);
+    }
+    let stopped = if keep {
+        Ok(false)
+    } else {
+        node.apply(Op::JobStop { job: id.clone() })
+            .await
+            .map(|_| true)
+    };
+    match (tail, stopped) {
+        (Ok(f), Ok(s)) => print(
+            serde_json::to_string_pretty(&(job, f, serde_json::json!({"stopped": s}))),
+            0,
+        ),
+        (Ok(f), Err(e)) => print(serde_json::to_string_pretty(&(job, f, e)), 2),
+        (Err(e), Ok(s)) => print(
+            serde_json::to_string_pretty(&(job, e, serde_json::json!({"stopped": s}))),
+            2,
+        ),
+        (Err(e), Err(e2)) => print(serde_json::to_string_pretty(&(job, e, e2)), 2),
+    }
+}
+
+/// `--then-tail`: wait up to `STREAM_WAIT` for the job's first event (else
+/// audio) stream, then apply `StreamTail` to it.
+async fn tail_job(
+    node: &zeta_core::node::Node,
+    job: &zeta_core::types::JobId,
+    t: cli::ThenTail,
+) -> Result<zeta_core::ops::OpResult, OpError> {
+    use zeta_core::types::StreamKind;
+    let deadline = tokio::time::Instant::now() + STREAM_WAIT;
+    let stream = loop {
+        let mut mine: Vec<_> = node
+            .bus()
+            .list()
+            .into_iter()
+            .filter(|s| s.provenance.job.as_ref() == Some(job))
+            .collect();
+        mine.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        let pick = [StreamKind::Event, StreamKind::Audio]
+            .into_iter()
+            .find_map(|k| mine.iter().find(|s| s.kind == k));
+        if let Some(s) = pick {
+            break s.id.clone();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(OpError::Other {
+                message: format!("job {} has no event or audio stream to tail", job.0),
+            });
+        }
+        tokio::time::sleep(RING_POLL).await;
+    };
+    let op = Op::StreamTail {
+        stream,
+        max_frames: t.max_frames,
+        timeout_ms: t.timeout_ms,
+    };
+    node.apply(op).await
 }
 
 /// Poll until the source's ring covers the selection's span end, or `RING_WAIT` passes

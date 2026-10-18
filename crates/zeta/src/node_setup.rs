@@ -1,4 +1,5 @@
-//! Build the node the CLI drives: stage registry, file sources, knowledge and classifiers.
+//! Build the node the CLI drives: stage registry (core plus `zeta-dsp`), file
+//! sources, knowledge and classifiers.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +31,7 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
 pub fn registry() -> StageRegistry {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
+    zeta_dsp::register_all(&mut registry);
     registry
 }
 
@@ -55,10 +57,16 @@ pub async fn open(
                 .map_err(|e| format!("--source-file {id}={}: {e}", path.display()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    #[allow(unused_mut)]
+    let mut backends = vec![Backend::Cpu];
+    #[cfg(feature = "gpu")]
+    if zeta_dsp::gpu_available() {
+        backends.push(Backend::Gpu);
+    }
     let cfg = NodeConfig {
         state_dir,
         ring_seconds: 10.0,
-        backends: vec![Backend::Cpu],
+        backends,
         resume,
     };
     let ports = sources.iter().map(|s| s.clone() as Arc<dyn Port>).collect();
@@ -70,5 +78,8 @@ pub async fn open(
     }
     node.add_knowledge(Arc::new(StaticKnowledge::builtin()));
     node.add_classifier(Arc::new(StubClassifier));
+    for c in zeta_dsp::classifiers() {
+        node.add_classifier(c);
+    }
     Ok(node)
 }
