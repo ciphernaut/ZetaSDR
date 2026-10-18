@@ -210,12 +210,7 @@ async fn forward_iq(
             },
             ..prov.clone()
         };
-        bus.publish(Frame {
-            stream: stream.clone(),
-            kind: StreamKind::Iq,
-            provenance,
-            payload: Payload::Iq(block),
-        });
+        bus.publish(Frame::new(stream.clone(), provenance, Payload::Iq(block)));
     }
 }
 
