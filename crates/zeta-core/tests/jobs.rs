@@ -367,3 +367,35 @@ async fn duplicate_source_ids_are_rejected() {
     }
     assert_eq!(node.ports().len(), 1);
 }
+
+#[tokio::test]
+async fn record_with_mismatched_id_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    src.start();
+    let id = start_job(&node).await;
+    node.job_stop(&id).await.unwrap();
+    drop(node);
+    let jobs = dir.path().join("state").join("jobs");
+    let text = std::fs::read_to_string(jobs.join(format!("{}.json", id.0))).unwrap();
+    // A valid ULID file name holding another id, and a non-ULID id in its own file.
+    let other = JobId::new();
+    std::fs::write(jobs.join(format!("{}.json", other.0)), &text).unwrap();
+    let bad = text.replace(&id.0, "not-a-ulid");
+    std::fs::write(jobs.join("not-a-ulid.json"), bad).unwrap();
+    std::fs::write(jobs.join(format!("{}.json.tmp", other.0)), "partial").unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    let ids: Vec<JobId> = node.job_list().into_iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![id]);
+    let mut errors = node.load_errors().to_vec();
+    errors.sort();
+    let mut want = vec![format!("{}.json", other.0), "not-a-ulid.json".to_string()];
+    want.sort();
+    assert_eq!(errors, want);
+    assert!(!jobs.join(format!("{}.json.tmp", other.0)).exists());
+}

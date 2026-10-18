@@ -111,17 +111,27 @@ fn persist(dir: &Path, rec: &JobRecord) -> Result<(), NodeError> {
     std::fs::rename(&tmp, &path).map_err(io)
 }
 
-/// Load every `*.json` record; unreadable or unparsable files are reported by name.
+/// Load every `*.json` record and delete leftover `*.json.tmp` files from an
+/// interrupted `persist`. A file that cannot be read or parsed, or whose
+/// record id is not a ULID equal to the file stem, is skipped and reported by
+/// name.
 fn load(dir: &Path) -> Result<(Vec<JobRecord>, Vec<String>), NodeError> {
     let (mut records, mut errors) = (Vec::new(), Vec::new());
     for entry in std::fs::read_dir(dir).map_err(io)? {
         let path = entry.map_err(io)?.path();
+        if path.to_string_lossy().ends_with(".json.tmp") {
+            // Best effort: a leftover that cannot be removed is harmless.
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let parsed = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str::<JobRecord>(&s).ok());
+            .and_then(|s| serde_json::from_str::<JobRecord>(&s).ok())
+            .filter(|r| r.id.0 == stem && r.id.0.parse::<ulid::Ulid>().is_ok());
         match parsed {
             Some(r) => records.push(r),
             None => errors.push(
@@ -222,7 +232,8 @@ impl Node {
         }
     }
 
-    /// Files in `state_dir/jobs` that could not be read as a `JobRecord`.
+    /// Files in `state_dir/jobs` that could not be read as a `JobRecord`, or
+    /// whose record id is not a ULID matching the file name.
     pub fn load_errors(&self) -> &[String] {
         &self.load_errors
     }
