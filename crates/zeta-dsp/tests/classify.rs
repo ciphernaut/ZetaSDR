@@ -29,7 +29,7 @@ async fn classify_op_returns_layer1_and_layer2_labels() {
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
-        ring_seconds: 60.0,
+        ring_seconds: 600.0,
         backends: vec![Backend::Cpu],
         resume: true,
     };

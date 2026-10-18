@@ -59,12 +59,13 @@ impl Classifier for DecodeToIdentify {
         let f = match features {
             Some(f) => f,
             None => {
-                owned = measure(iq, rate, 0);
+                owned = measure(iq, rate, rate / 2);
                 &owned
             }
         };
         let half = (rate / 2) as i64;
-        let offset = (f.center_hz.0 as i64).clamp(-half, half);
+        // `center_hz` is measured with the block centre at rate/2, so negative offsets survive.
+        let offset = (f.center_hz.0 as i64 - half).clamp(-half, half);
         let bw = f.bandwidth_hz.0.max(MIN_BW_HZ).min(rate);
         let Ok((chan, out_rate)) = extract_offset(iq, rate, offset, bw, audio_rate(rate)) else {
             return Vec::new();
@@ -108,6 +109,23 @@ mod tests {
         assert_eq!(labels[0].name, "APRS");
         assert_eq!(labels[0].confidence, 1.0);
         assert!(labels[0].evidence.contains("VK3ABC>APRS"), "{labels:?}");
+    }
+
+    async fn aprs_at(offset: f64) {
+        let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, offset);
+        let labels = DecodeToIdentify.classify(&iq, Hz(48_000), None).await;
+        assert_eq!(labels.len(), 1, "offset {offset}: {labels:?}");
+        assert_eq!(labels[0].name, "APRS");
+    }
+
+    #[tokio::test]
+    async fn identifies_aprs_at_positive_offset() {
+        aprs_at(5000.0).await;
+    }
+
+    #[tokio::test]
+    async fn identifies_aprs_at_negative_offset() {
+        aprs_at(-5000.0).await;
     }
 
     #[tokio::test]
