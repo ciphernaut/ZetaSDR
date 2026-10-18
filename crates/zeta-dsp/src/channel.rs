@@ -16,8 +16,22 @@ use zeta_core::types::{ChannelId, Hz, StreamId, StreamKind, Timestamp};
 use crate::util::lowpass_taps;
 use crate::{frame_span, run_map};
 
-/// Taps of the channel low-pass filter.
-const TAPS: usize = 63;
+/// Fewest and most taps of the channel low-pass filter.
+const MIN_TAPS: usize = 63;
+const MAX_TAPS: usize = 1025;
+
+/// Channel low-pass length for decimation by `decim`: `8 · decim + 1` taps,
+/// at least [`MIN_TAPS`] and at most [`MAX_TAPS`]. The transition band of a
+/// Hann-windowed sinc is about `4 · rate / taps` wide, so scaling the length
+/// with the decimation keeps it near half the output rate and the adjacent
+/// band that would alias onto the channel well attenuated; the cap bounds the
+/// per-sample cost (decimation by 128 and above all use 1025 taps).
+fn taps_for(decim: usize) -> usize {
+    decim
+        .saturating_mul(8)
+        .saturating_add(1)
+        .clamp(MIN_TAPS, MAX_TAPS)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChannelError {
@@ -29,8 +43,8 @@ pub enum ChannelError {
     },
     #[error("out_rate_hz {out_rate_hz} must divide rate_hz {rate_hz} by an integer >= 1")]
     Rate { rate_hz: u64, out_rate_hz: u64 },
-    #[error("bandwidth_hz {bandwidth_hz} must be in 1..={rate_hz} (rate_hz)")]
-    Bandwidth { bandwidth_hz: u64, rate_hz: u64 },
+    #[error("bandwidth_hz {bandwidth_hz} must be in 1..=out_rate_hz {out_rate_hz}")]
+    Bandwidth { bandwidth_hz: u64, out_rate_hz: u64 },
 }
 
 /// Streaming state of one channel extraction: NCO phase, FIR history and
@@ -56,8 +70,9 @@ impl ChannelState {
 }
 
 /// Bring a signal at `+offset_hz` to baseband (multiply by `exp(-j2π·offset·t)`),
-/// low-pass at `bandwidth_hz / 2` and decimate to `out_rate_hz`, continuing
-/// from `state`. Returns the samples and the achieved output rate.
+/// low-pass at `bandwidth_hz / 2` (filter length `8 · decim + 1` taps, 63..=1025) and
+/// decimate to `out_rate_hz`, continuing from `state`. `bandwidth_hz` must be
+/// in `1..=out_rate_hz`. Returns the samples and the achieved output rate.
 pub fn extract_offset_streaming(
     state: &mut ChannelState,
     iq: &[Complex<f32>],
@@ -72,20 +87,22 @@ pub fn extract_offset_streaming(
             out_rate_hz,
         });
     }
-    if bandwidth_hz == 0 || bandwidth_hz > rate_hz {
+    // Wider than the output rate would fold the band's edges onto itself.
+    if bandwidth_hz == 0 || bandwidth_hz > out_rate_hz {
         return Err(ChannelError::Bandwidth {
             bandwidth_hz,
-            rate_hz,
+            out_rate_hz,
         });
     }
     let key = (rate_hz, offset_hz, bandwidth_hz, out_rate_hz);
     if state.key != Some(key) {
-        let taps = lowpass_taps(bandwidth_hz as f64 / 2.0, rate_hz as f64, TAPS);
+        let decim = (rate_hz / out_rate_hz) as usize;
+        let taps = lowpass_taps(bandwidth_hz as f64 / 2.0, rate_hz as f64, taps_for(decim));
         *state = ChannelState {
             key: Some(key),
             history: vec![Complex::new(0.0, 0.0); taps.len() - 1],
             taps,
-            decim: (rate_hz / out_rate_hz) as usize,
+            decim,
             phase: 0.0,
             next: 0,
         };
@@ -370,6 +387,44 @@ mod tests {
         for (a, b) in parts.iter().zip(&whole) {
             assert!((a - b).norm() < 1e-4, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn wideband_decimation_rejects_adjacent_channel() {
+        const WIDE: u64 = 2_400_000;
+        let n = WIDE as usize / 5; // 0.2 s
+        // Equal-amplitude in-band tone at +1 kHz and adjacent tone at +48 kHz,
+        // which aliases onto 0 Hz after decimation to 48 kHz.
+        let a = crate::util::nco(n, 1_000.0, WIDE as f64);
+        let b = crate::util::nco(n, 48_000.0, WIDE as f64);
+        let iq: Vec<Complex<f32>> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+        let (out, rate) = extract_offset(&iq, WIDE, 0, 12_500, 48_000).unwrap();
+        assert_eq!(rate, 48_000);
+        // Skip the filter start-up; 4800 samples put 0 and 1 kHz exactly on bins.
+        let w = &out[200..5_000];
+        let wanted = bin(w, 1_000.0, 48_000.0);
+        let alias = bin(w, 0.0, 48_000.0);
+        let db = 20.0 * (wanted / alias).log10();
+        assert!(
+            db >= 60.0,
+            "+1 kHz {wanted} vs aliased +48 kHz {alias}: {db} dB"
+        );
+    }
+
+    #[test]
+    fn bandwidth_above_out_rate_is_rejected() {
+        let iq = tone(480, 5_000.0);
+        let err = extract_offset(&iq, RATE, 0, 20_000, 12_000).unwrap_err();
+        assert_eq!(
+            err,
+            ChannelError::Bandwidth {
+                bandwidth_hz: 20_000,
+                out_rate_hz: 12_000,
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("bandwidth_hz 20000"), "{msg}");
+        assert!(msg.contains("out_rate_hz 12000"), "{msg}");
     }
 
     fn prov() -> Provenance {

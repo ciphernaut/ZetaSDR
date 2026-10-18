@@ -71,8 +71,10 @@ impl Classifier for DecodeToIdentify {
         let half = (rate / 2) as i64;
         // `center_hz` is measured with the block centre at rate/2, so negative offsets survive.
         let offset = (f.center_hz.0 as i64 - half).clamp(-half, half);
-        let bw = f.bandwidth_hz.0.max(MIN_BW_HZ).min(rate);
-        let Ok((chan, out_rate)) = extract_offset(iq, rate, offset, bw, audio_rate(rate)) else {
+        let out_rate = audio_rate(rate);
+        // The channel filter refuses a band wider than its output rate.
+        let bw = f.bandwidth_hz.0.max(MIN_BW_HZ).min(out_rate);
+        let Ok((chan, out_rate)) = extract_offset(iq, rate, offset, bw, out_rate) else {
             return Vec::new();
         };
         let mut prev = Complex::new(0.0, 0.0);
