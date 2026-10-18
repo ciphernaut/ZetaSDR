@@ -25,6 +25,7 @@ use zeta_core::ops::OpError;
 
 use crate::addr::is_lan;
 use crate::auth::Secret;
+use crate::stream;
 
 /// Resource limits sized for a Raspberry Pi.
 #[derive(Clone, Copy, Debug)]
@@ -87,6 +88,18 @@ impl StatsHandle {
             ws_dropped_slow: self.0.ws_dropped_slow.load(Ordering::Relaxed),
         }
     }
+
+    pub(crate) fn ws_opened(&self) {
+        self.0.ws_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn ws_closed(&self) {
+        self.0.ws_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn ws_dropped_slow(&self) {
+        self.0.ws_dropped_slow.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The `GET /health` body.
@@ -104,19 +117,22 @@ pub(crate) struct AppState {
     pub(crate) secret: Secret,
     pub(crate) limits: Limits,
     pub(crate) op_slots: Semaphore,
+    pub(crate) ws_slots: Arc<Semaphore>,
+    /// Cancelled by `Server::run` when shutdown starts; every websocket task watches it.
+    pub(crate) ws_shutdown: CancellationToken,
     pub(crate) stats: StatsHandle,
     pub(crate) started: Instant,
     pub(crate) agents_md: String,
 }
 
-type Shared = Arc<AppState>;
+pub(crate) type Shared = Arc<AppState>;
 
 /// Every non-2xx answer: the error as JSON under `status`.
 pub(crate) fn error_response(status: StatusCode, err: OpError) -> Response {
     (status, Json(err)).into_response()
 }
 
-fn other(message: impl Into<String>) -> OpError {
+pub(crate) fn other(message: impl Into<String>) -> OpError {
     OpError::Other {
         message: message.into(),
     }
@@ -236,6 +252,8 @@ fn router(state: Shared) -> Router {
         .route("/schema", get(schema))
         .route("/streams", get(streams))
         .route("/agents-md", get(agents_md))
+        .route("/stream/{id}", get(stream::ws))
+        .route("/streams/{id}/tail", get(stream::tail_route))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
@@ -267,6 +285,8 @@ pub async fn bind(node: Arc<Node>, cfg: ServerConfig) -> io::Result<Server> {
         secret: cfg.secret,
         limits: cfg.limits,
         op_slots: Semaphore::new(cfg.limits.max_concurrent_ops),
+        ws_slots: Arc::new(Semaphore::new(cfg.limits.max_ws)),
+        ws_shutdown: CancellationToken::new(),
         stats: StatsHandle::default(),
         started: Instant::now(),
         agents_md: cfg.agents_md,
@@ -287,11 +307,17 @@ impl Server {
         self.state.stats.clone()
     }
 
-    /// Serve until `shutdown` is cancelled, then finish in-flight requests.
+    /// Serve until `shutdown` is cancelled, then close every stream websocket and finish
+    /// in-flight requests.
     pub async fn run(self, shutdown: CancellationToken) -> io::Result<()> {
+        let ws_shutdown = self.state.ws_shutdown.clone();
         let app = router(self.state).into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(self.listener, app)
-            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .with_graceful_shutdown(async move {
+                shutdown.cancelled().await;
+                // Upgraded websockets are not tracked by graceful shutdown: tell them first.
+                ws_shutdown.cancel();
+            })
             .await
     }
 }

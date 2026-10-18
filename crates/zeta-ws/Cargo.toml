@@ -20,6 +20,8 @@ zeta-core = { path = "../zeta-core" }
 zeta-source-file = { path = "../zeta-source-file", optional = true }
 
 [dev-dependencies]
+futures-util = "0.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 tempfile = "3.27.0"
+tokio-tungstenite = "0.30.0"
 zeta-ws = { path = ".", features = ["test-server"] }
