@@ -339,7 +339,7 @@ pub fn channel_rate_hz(source_rate_hz: u64, bandwidth_hz: u64) -> u64 {
 pub struct SourceInfo {
     pub id: SourceId,
     pub capabilities: Capabilities,
-    #[schemars(required)]
+    #[schemars(required, schema_with = "crate::types::nullable::<Tuning>")]
     pub current: Option<Tuning>,
     pub holders: Vec<JobId>,
     /// The port's unrecoverable failure (`Port::fault`); `null` when healthy.
@@ -361,9 +361,9 @@ pub struct FrameSummary {
     pub stream: StreamId,
     pub kind: StreamKind,
     pub source: SourceId,
-    #[schemars(required)]
+    #[schemars(required, schema_with = "crate::types::nullable::<JobId>")]
     pub job: Option<JobId>,
-    #[schemars(required)]
+    #[schemars(required, schema_with = "crate::types::nullable::<ChannelId>")]
     pub channel: Option<ChannelId>,
     pub start_ns: Timestamp,
     pub end_ns: Timestamp,
@@ -452,7 +452,7 @@ pub enum OpError {
         value: u64,
         min: u64,
         max: u64,
-        #[schemars(required)]
+        #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
         suggested: Option<u64>,
     },
     /// The source is held by `holders` at `current`, which the request does

@@ -1446,3 +1446,30 @@ async fn source_list_reports_fault() {
         "{si}"
     );
 }
+
+/// Fields that serialize `null` say so in their schema: `"null"` is in the
+/// `type` of each.
+#[test]
+fn nullable_fields_have_null_in_schema_type() {
+    let s = schema();
+    let paths = [
+        "/result/$defs/Allocation/properties/note",
+        "/result/$defs/Provenance/properties/job",
+        "/result/$defs/Provenance/properties/channel",
+        "/result/$defs/FrameSummary/properties/job",
+        "/result/$defs/FrameSummary/properties/channel",
+        "/result/$defs/SourceInfo/properties/current",
+        "/result/$defs/SourceInfo/properties/fault",
+        "/error/oneOf/0/properties/suggested",
+    ];
+    for p in paths {
+        let f = s.pointer(p).unwrap_or_else(|| panic!("{p} missing"));
+        let ty = f["type"].as_array().unwrap_or_else(|| panic!("{p}: {f}"));
+        assert!(ty.contains(&Value::from("null")), "{p}: {f}");
+    }
+    assert_eq!(
+        s.pointer("/error/oneOf/0/properties/error/const"),
+        Some(&Value::from("out_of_range")),
+        "oneOf/0 is OutOfRange"
+    );
+}

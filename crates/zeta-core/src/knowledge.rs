@@ -18,7 +18,7 @@ pub struct Allocation {
     pub min_hz: Hz,
     pub max_hz: Hz,
     pub service: String,
-    #[schemars(required)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     pub note: Option<String>,
 }
 

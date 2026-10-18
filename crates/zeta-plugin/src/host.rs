@@ -586,13 +586,13 @@ impl Stage for ExternalStage {
                         let Some((port, reg)) = ports.iter().find(|(p, _)| p.stream == f.stream)
                         else {
                             break End::Fail(format!(
-                                "plugin {kind} sent a {sent} frame on undeclared stream {}",
+                                "plugin {kind} sent {sent} frame on undeclared stream {}",
                                 f.stream.0
                             ));
                         };
                         if port.kind != f.kind {
                             break End::Fail(format!(
-                                "plugin {kind} sent a {sent} frame on stream {} declared {}",
+                                "plugin {kind} sent {sent} frame on stream {} declared {}",
                                 f.stream.0,
                                 kind_name(port.kind)
                             ));

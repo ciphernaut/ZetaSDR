@@ -208,7 +208,7 @@ async fn plugin_wrong_kind_frame_fails_stage() {
     assert_eq!(
         m,
         format!(
-            "plugin fake sent a audio frame on stream {} declared iq",
+            "plugin fake sent audio frame on stream {} declared iq",
             rig.out.0
         )
     );
