@@ -95,6 +95,7 @@ pub enum JobKind {
     Spectrum,
     FmDemod,
     AprsDecode,
+    Measure,
 }
 
 impl JobKind {
@@ -105,6 +106,7 @@ impl JobKind {
             JobKind::Spectrum => "spectrum",
             JobKind::FmDemod => "fm_demod",
             JobKind::AprsDecode => "aprs_decode",
+            JobKind::Measure => "measure",
         }
     }
 
@@ -116,6 +118,15 @@ impl JobKind {
                     id: NodeId::new(),
                     kind: "passthrough".into(),
                     params: serde_json::json!({"kind": "iq"}),
+                }],
+                edges: vec![],
+            },
+            JobKind::Measure => Graph {
+                id: GraphId::new(),
+                nodes: vec![GraphNode {
+                    id: NodeId::new(),
+                    kind: "measure".into(),
+                    params: serde_json::json!({}),
                 }],
                 edges: vec![],
             },

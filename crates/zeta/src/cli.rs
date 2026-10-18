@@ -158,6 +158,7 @@ pub enum Kind {
     FmDemod,
     #[value(name = "aprs_decode")]
     AprsDecode,
+    Measure,
 }
 
 impl From<Kind> for JobKind {
@@ -167,6 +168,7 @@ impl From<Kind> for JobKind {
             Kind::Spectrum => JobKind::Spectrum,
             Kind::FmDemod => JobKind::FmDemod,
             Kind::AprsDecode => JobKind::AprsDecode,
+            Kind::Measure => JobKind::Measure,
         }
     }
 }

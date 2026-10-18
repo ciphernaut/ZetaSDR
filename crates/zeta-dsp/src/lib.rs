@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use zeta_core::classify::Classifier;
 use zeta_core::stage::StageError;
 use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{Span, Timestamp};
@@ -13,6 +14,7 @@ pub mod aprs;
 pub mod ax25;
 pub mod channel;
 pub mod fft;
+pub mod measure;
 pub mod nbfm;
 pub mod util;
 
@@ -27,6 +29,12 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(fft::FftStage::new(Arc::new(fft::CpuFft::new()))));
     reg.register(Arc::new(nbfm::NbfmDemodStage::new()));
     reg.register(Arc::new(aprs::AprsDecodeStage::new()));
+    reg.register(Arc::new(measure::MeasureStage::new()));
+}
+
+/// This crate's classifiers, lowest layer first.
+pub fn classifiers() -> Vec<Arc<dyn Classifier>> {
+    vec![Arc::new(measure::Layer1Classifier)]
 }
 
 /// Span of `n` samples at `rate_hz` starting at `t0`; zero-length when `rate_hz` is 0.

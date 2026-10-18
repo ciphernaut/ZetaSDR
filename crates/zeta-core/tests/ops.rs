@@ -811,3 +811,21 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
     assert_eq!(g.edges[0].to, g.nodes[1].id);
     assert_eq!(g.edges[0].kind, zeta_core::types::StreamKind::Iq);
 }
+
+#[test]
+fn measure_kind_expands_to_one_measure_node() {
+    assert_eq!(JobKind::Measure.name(), "measure");
+    assert_eq!(
+        serde_json::to_value(JobKind::Measure).unwrap(),
+        serde_json::json!("measure")
+    );
+    let tuning = Tuning {
+        center_hz: Hz(144_800_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let g = JobKind::Measure.expand(&SourceId("file0".into()), tuning);
+    assert_eq!(g.nodes.len(), 1);
+    assert_eq!(g.nodes[0].kind, "measure");
+    assert_eq!(g.nodes[0].params, serde_json::json!({}));
+    assert!(g.edges.is_empty());
+}
