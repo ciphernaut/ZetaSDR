@@ -449,14 +449,47 @@ wall".
 - Layer-1 classifier training recipe, provided the plugin contract holds.
 - Repository tooling, CI, packaging for the Pi.
 
-## 10. Open items the author is still resolving
+## 10. Floor model: probe result (2026-10-18)
 
-- **Floor model for the in-process agent.** A tool-calling probe of the
-  four small models on `orangepirv2` (gemma-4-e2b, lfm2.5-8b-a1b,
-  smallthinker-4b-a06b, olmoe-1b-7b) is in progress. Its result sets
-  how small the vocabulary must be and whether constrained JSON output is
-  needed as a fallback to native tool calling. The vocabulary rules in
-  5.1 are designed to survive either answer.
+Four small models on `orangepirv2` (RISC-V, llama-server behind LiteLLM)
+were given the illustrative vocabulary with strict schemas and four
+radio prompts, temperature 0, 300 max tokens.
+
+| Model | Tool calls | Correct values | Median latency |
+|---|---|---|---|
+| smallthinker-4b-a06b | every prompt, well-formed | MHz to Hz conversion wrong twice (dropped zeros) | 7.6 s |
+| lfm2.5-8b-a1b | 2 of 4; the rest ran out of tokens in reasoning | exact when it finished | 142 s |
+| gemma-4-e2b | 2 of 4; same reasoning overrun | exact when it finished | 132 s |
+| olmoe-1b-7b | never; prose pseudo-code instead | n/a | 15.7 s |
+
+Every tool call any model emitted had parseable, schema-valid JSON. The
+failures were unit arithmetic and reasoning overrun, never malformed
+calls. Constrained JSON output only beat native tool calling for the
+thinking models when their reasoning could not be turned off.
+
+Consequences written into the design:
+
+- **Floor model is smallthinker-4b-a06b class**: 4B, non-thinking, native
+  tool calling. The in-process agent adapter must support disabling
+  reasoning (`enable_thinking` style template flags) and raising
+  `max_tokens` for thinking models, and must treat a model that emits no
+  tool calls as unusable rather than parsing prose.
+- **Unit arithmetic is the weak point, not JSON.** The runtime validates
+  every frequency against the source's tuning range and returns a
+  corrective error that proposes the likely intended value ("101500 Hz is
+  below hackrf0's range; did you mean 101500000?"). The vocabulary keeps
+  one unit per field; it does not add alternative unit fields.
+- **Thermal telemetry lies.** The board clamped its clock from 1600 to
+  1229 MHz under load while its throttle flags stayed false. The
+  scheduler measures clock and temperature itself rather than trusting
+  flags.
+- **Readiness is a sequence, not a flag.** Model loads from SD took four to
+  six minutes, the manager reported a timeout error and then became
+  healthy anyway, and the stats endpoint lagged the manager. The agent
+  adapter polls the manager's status, tolerates error-then-healthy, and
+  treats a 503 "loading" from the chat endpoint as "wait", not "fail".
+
+Raw responses: the job's tmp directory, `toolprobe/`.
 
 ## 11. Prior art and why not
 
