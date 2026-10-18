@@ -45,6 +45,16 @@ pub enum PortError {
     Io(String),
 }
 
+/// A signal source.
+///
+/// Contract: `tune` and `current` return the capture band, whose
+/// `bandwidth_hz` equals the complex sample rate of the blocks the port emits;
+/// a port's producer exits when it has no subscribers or is dropped;
+/// consecutive blocks have `t0` rising by exactly
+/// `samples · 1e9 / sample_rate_hz` (integer nanoseconds) unless samples were
+/// really lost, in which case `t0` jumps forward and never backward;
+/// unrecoverable failures are reported through [`Port::fault`], never by
+/// panicking or by closing the stream silently.
 #[async_trait]
 pub trait Port: Send + Sync {
     fn id(&self) -> &SourceId;
@@ -52,4 +62,10 @@ pub trait Port: Send + Sync {
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError>;
     fn current(&self) -> Option<Tuning>;
     fn subscribe(&self) -> IqReceiver;
+    /// The port's unrecoverable failure, if any (a remote receiver that is
+    /// full or gone, a device that was unplugged). Jobs reading the port fail
+    /// with it as their reason. A successful `tune` clears it.
+    fn fault(&self) -> Option<String> {
+        None
+    }
 }

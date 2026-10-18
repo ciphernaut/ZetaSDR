@@ -35,6 +35,8 @@ While `zeta serve` runs it owns the state directory (it holds `serve.lock` there
 
 ### source_list
 
+List the sources: id, capabilities, `current` band, `holders` (job ids) and `fault`, the source's unrecoverable failure (`null` when healthy). Jobs on a faulted source fail with `source ID: FAULT` as their reason; a successful tune (`source_ensure`, `job_start`) clears it.
+
 JSON: `{"op":"source_list"}`
 
 CLI: `zeta source list`

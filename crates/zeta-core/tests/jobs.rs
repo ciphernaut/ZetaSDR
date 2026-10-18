@@ -1,15 +1,18 @@
 //! Node job runtime: persistence, stop, resume and the per-source ring.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use async_trait::async_trait;
+use num_complex::Complex;
 
 use zeta_core::graph::{Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use zeta_core::job::{JobRecord, JobState};
 use zeta_core::node::{Node, NodeConfig, NodeError};
-use zeta_core::port::{Port, Tuning};
+use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Hz, JobId, SourceId};
+use zeta_core::types::{Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, Timestamp};
 use zeta_source_file::{FileOpts, FileSource, fixtures};
 
 fn source(dir: &Path) -> (Arc<FileSource>, Arc<dyn Port>) {
@@ -452,4 +455,160 @@ async fn newer_format_record_is_reported_not_loaded() {
         node.load_errors(),
         [format!("{}.json: format 2 newer than supported 1", id.0)]
     );
+}
+
+/// A port whose blocks the test sends by hand and whose fault the test sets;
+/// a successful `tune` clears the fault, dropping the sender closes the stream.
+struct FaultyPort {
+    id: SourceId,
+    caps: Capabilities,
+    cur: Mutex<Option<Tuning>>,
+    tx: Mutex<Option<tokio::sync::broadcast::Sender<IqBlock>>>,
+    rx: IqReceiver,
+    fault: Mutex<Option<String>>,
+}
+
+impl FaultyPort {
+    fn new() -> Arc<Self> {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        Arc::new(Self {
+            id: SourceId("flaky".into()),
+            caps: Capabilities {
+                tune_min_hz: Claim::Asserted(Hz(1_000_000)),
+                tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
+                max_bandwidth_hz: Claim::Asserted(Hz(20_000_000)),
+                formats: vec![SampleFormat::Cf32],
+                channels: 1,
+                rx: true,
+                tx: false,
+                remote: false,
+                push: false,
+            },
+            cur: Mutex::new(None),
+            tx: Mutex::new(Some(tx)),
+            rx,
+            fault: Mutex::new(None),
+        })
+    }
+
+    fn send(&self, n: u64) {
+        let block = IqBlock {
+            t0: Timestamp(n * 1_000_000),
+            sample_rate_hz: Hz(48_000),
+            center_hz: Hz(100_000_000),
+            samples: vec![Complex::new(0.0, 0.0); 48].into(),
+        };
+        let _ = self.tx.lock().unwrap().as_ref().unwrap().send(block);
+    }
+
+    fn close(&self) {
+        self.tx.lock().unwrap().take();
+    }
+
+    fn set_fault(&self, f: &str) {
+        *self.fault.lock().unwrap() = Some(f.into());
+    }
+}
+
+#[async_trait]
+impl Port for FaultyPort {
+    fn id(&self) -> &SourceId {
+        &self.id
+    }
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        *self.cur.lock().unwrap() = Some(t);
+        *self.fault.lock().unwrap() = None;
+        Ok(t)
+    }
+    fn current(&self) -> Option<Tuning> {
+        *self.cur.lock().unwrap()
+    }
+    fn subscribe(&self) -> IqReceiver {
+        self.rx.resubscribe()
+    }
+    fn fault(&self) -> Option<String> {
+        self.fault.lock().unwrap().clone()
+    }
+}
+
+async fn start_flaky(node: &Node) -> JobId {
+    node.job_start(
+        "monitor",
+        SourceId("flaky".into()),
+        tuning(),
+        graph("passthrough"),
+    )
+    .await
+    .unwrap()
+}
+
+async fn wait_not_running(node: &Node, ms: u64) -> JobState {
+    let mut state = JobState::Running;
+    for _ in 0..ms / 20 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        state = node.job_list()[0].state.clone();
+        if state != JobState::Running {
+            break;
+        }
+    }
+    state
+}
+
+#[tokio::test]
+async fn port_fault_fails_running_job_with_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = FaultyPort::new();
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    let id = start_flaky(&node).await;
+    port.send(0);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(node.job_list()[0].state, JobState::Running);
+    // No block follows the fault: the job must fail from the periodic check.
+    port.set_fault("device gone");
+    let state = wait_not_running(&node, 1000).await;
+    assert_eq!(
+        state,
+        JobState::Failed {
+            reason: "source flaky: device gone".into()
+        }
+    );
+    assert_eq!(on_disk(dir.path(), &id).state, state);
+    assert!(node.lease_holders(&SourceId("flaky".into())).is_empty());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(job_streams(&node, &id), 0);
+}
+
+#[tokio::test]
+async fn closed_port_without_fault_still_drains_and_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = FaultyPort::new();
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    let id = start_flaky(&node).await;
+    // The job output is the job stream nothing in the job subscribes to.
+    let bus = node.bus();
+    let out = bus
+        .list()
+        .into_iter()
+        .filter(|s| s.provenance.job.as_ref() == Some(&id))
+        .find(|s| bus.receiver_count(&s.id) == Some(0))
+        .expect("job output stream");
+    let mut rx = bus.subscribe(&out.id).unwrap();
+    for n in 0..3 {
+        port.send(n);
+    }
+    port.close();
+    let mut frames = 0;
+    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+        frames += 1;
+    }
+    assert_eq!(frames, 3);
+    assert_eq!(wait_not_running(&node, 1000).await, JobState::Stopped);
+    assert!(node.lease_holders(&SourceId("flaky".into())).is_empty());
 }

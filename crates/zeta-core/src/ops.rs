@@ -32,6 +32,10 @@ use crate::types::{
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub enum Op {
+    /// List the sources: id, capabilities, `current` band, `holders` (job
+    /// ids) and `fault`, the source's unrecoverable failure (`null` when
+    /// healthy). Jobs on a faulted source fail with `source ID: FAULT` as
+    /// their reason; a successful tune (`source_ensure`, `job_start`) clears it.
     SourceList {},
     /// Check a band against the source and tune it if no job holds it. Takes
     /// no lease: an unheld source is tuned directly (a later `job_start` may
@@ -117,6 +121,14 @@ fn nullable_hz_u64(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         "format": "uint64",
         "minimum": 0,
         "description": "FM peak deviation in Hz (100..=75000) for `fm_demod`; `null` is the kind's default (5000). Any other kind must pass `null`."
+    })
+}
+
+/// Schema of a required `Option<String>`: `["string","null"]`.
+fn nullable_string(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "description": "The port's unrecoverable failure (`Port::fault`); `null` when healthy. Jobs on a faulted source fail with it; a successful tune clears it."
     })
 }
 
@@ -330,6 +342,10 @@ pub struct SourceInfo {
     #[schemars(required)]
     pub current: Option<Tuning>,
     pub holders: Vec<JobId>,
+    /// The port's unrecoverable failure (`Port::fault`); `null` when healthy.
+    /// Jobs on a faulted source fail with it; a successful tune clears it.
+    #[schemars(required, schema_with = "nullable_string")]
+    pub fault: Option<String>,
 }
 
 /// One frame of a `stream_tail`, as JSON. `source`, `job`, `channel` and
@@ -736,6 +752,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                         .into_iter()
                         .map(|(j, _)| j)
                         .collect(),
+                    fault: node.port(&id).and_then(|p| p.fault()),
                     id,
                     capabilities,
                 })

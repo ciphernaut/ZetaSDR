@@ -11,6 +11,7 @@ fn core_has_no_driver_or_vendor_deps() {
         "tauri",
         "wgpu",
         "rustfft",
+        "tungstenite",
     ] {
         assert!(
             !toml.contains(banned),

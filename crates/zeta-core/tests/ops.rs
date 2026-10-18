@@ -29,6 +29,8 @@ struct WidePort {
     slow: bool,
     /// `tune` calls so far, counted on entry.
     tunes: std::sync::atomic::AtomicUsize,
+    /// What `fault()` reports.
+    fault: Mutex<Option<String>>,
 }
 
 impl WidePort {
@@ -43,6 +45,7 @@ impl WidePort {
         Self {
             slow: false,
             tunes: std::sync::atomic::AtomicUsize::new(0),
+            fault: Mutex::new(None),
             id: SourceId(id.into()),
             caps: Capabilities {
                 tune_min_hz: Claim::Asserted(Hz(1_000_000)),
@@ -82,6 +85,9 @@ impl Port for WidePort {
     }
     fn subscribe(&self) -> IqReceiver {
         self.tx.subscribe()
+    }
+    fn fault(&self) -> Option<String> {
+        self.fault.lock().unwrap().clone()
     }
 }
 
@@ -1404,4 +1410,39 @@ fn job_start_without_deviation_key_is_rejected() {
     let ok = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
         "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null});
     assert!(serde_json::from_value::<Op>(ok).is_ok());
+}
+
+#[tokio::test]
+async fn source_list_reports_fault() {
+    let dir = tempfile::tempdir().unwrap();
+    let wide = Arc::new(WidePort::new("hackrf0"));
+    *wide.fault.lock().unwrap() = Some("device gone".into());
+    let (_src, file) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![wide, file])
+        .await
+        .unwrap();
+    let Ok(OpResult::Sources(v)) = node.apply(Op::SourceList {}).await else {
+        panic!("expected sources");
+    };
+    let fault = |id: &str| v.iter().find(|s| s.id.0 == id).unwrap().fault.clone();
+    assert_eq!(fault("hackrf0"), Some("device gone".into()));
+    assert_eq!(fault("file0"), None);
+    let json = serde_json::to_value(&v).unwrap();
+    assert!(
+        json.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["fault"].is_null())
+    );
+    // Required and nullable in the result schema.
+    let si = &schema()["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"].as_array().unwrap().contains(&"fault".into()),
+        "{si}"
+    );
+    assert_eq!(
+        si["properties"]["fault"]["type"],
+        serde_json::json!(["string", "null"]),
+        "{si}"
+    );
 }
