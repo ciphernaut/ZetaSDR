@@ -100,9 +100,12 @@ impl Stage for AprsDecodeStage {
                     let r = u32::try_from(rate).map_err(|_| {
                         StageError::Failed(format!("sample_rate_hz {rate} out of range"))
                     })?;
+                    let demod = Afsk1200Demod::new(r).ok_or_else(|| {
+                        StageError::Failed(format!("sample_rate_hz {r} too low for afsk1200"))
+                    })?;
                     dec.insert(Decoder {
                         rate_hz: rate,
-                        demod: Afsk1200Demod::new(r),
+                        demod,
                         deframer: HdlcDeframer::new(),
                     })
                 }

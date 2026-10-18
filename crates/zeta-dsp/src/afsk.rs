@@ -37,12 +37,12 @@ pub struct Afsk1200Demod {
 }
 
 impl Afsk1200Demod {
-    /// Demodulator for audio at `audio_rate_hz` (at least 1200 Hz).
-    pub fn new(audio_rate_hz: u32) -> Self {
-        assert!(
-            audio_rate_hz >= 1200,
-            "Afsk1200Demod: audio rate below 1200 Hz"
-        );
+    /// Demodulator for audio at `audio_rate_hz`; `None` below 1200 Hz, where
+    /// a bit period is shorter than one sample.
+    pub fn new(audio_rate_hz: u32) -> Option<Self> {
+        if audio_rate_hz < 1200 {
+            return None;
+        }
         let rate = audio_rate_hz as f32;
         let n = (audio_rate_hz / 1200) as usize;
         let table = |f: f32, sin: bool| -> Vec<f32> {
@@ -53,7 +53,7 @@ impl Afsk1200Demod {
                 })
                 .collect()
         };
-        Self {
+        Some(Self {
             ring: vec![0.0; n],
             pos: 0,
             refs: [
@@ -66,7 +66,7 @@ impl Afsk1200Demod {
             step: BAUD / rate,
             level: true,
             last_bit_level: true,
-        }
+        })
     }
 
     /// Feed audio; returns the NRZI-decoded data bits (0 or 1) recovered from it.
@@ -122,10 +122,17 @@ mod tests {
     }
 
     #[test]
+    fn afsk_rejects_low_rate() {
+        assert!(Afsk1200Demod::new(0).is_none());
+        assert!(Afsk1200Demod::new(1_199).is_none());
+        assert!(Afsk1200Demod::new(1_200).is_some());
+    }
+
+    #[test]
     fn afsk_roundtrip_recovers_bits() {
         let bits = hdlc_frame_bits(&frame(), 8, 2);
         let audio = afsk1200_modulate(&nrzi_encode(&bits), 48_000);
-        let mut demod = Afsk1200Demod::new(48_000);
+        let mut demod = Afsk1200Demod::new(48_000).unwrap();
         // Feed in uneven chunks so state must carry across calls.
         let mut out = Vec::new();
         for chunk in audio.chunks(777) {
@@ -145,7 +152,7 @@ mod tests {
         audio.extend(afsk1200_modulate(&nrzi_encode(&bits), 48_000));
         audio.extend(vec![0.0f32; 4_800]);
         awgn_real(&mut audio, 10.0, 0x5eed);
-        let mut demod = Afsk1200Demod::new(48_000);
+        let mut demod = Afsk1200Demod::new(48_000).unwrap();
         let mut deframer = HdlcDeframer::new();
         let frames = deframer.feed(&demod.feed(&audio));
         assert_eq!(frames, vec![f[..f.len() - 2].to_vec()]);

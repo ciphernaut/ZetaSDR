@@ -79,7 +79,10 @@ impl Classifier for DecodeToIdentify {
         };
         let mut prev = Complex::new(0.0, 0.0);
         let audio = nbfm_demod(&chan, out_rate, DEVIATION_HZ, &mut prev);
-        let bits = Afsk1200Demod::new(out_rate as u32).feed(&audio);
+        let Some(mut demod) = Afsk1200Demod::new(out_rate as u32) else {
+            return Vec::new();
+        };
+        let bits = demod.feed(&audio);
         let frames: Vec<_> = HdlcDeframer::new()
             .feed(&bits)
             .iter()
