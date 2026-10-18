@@ -209,10 +209,19 @@ fn keying_signal(iq: &[Complex<f32>], rate_hz: u64, cv: f32, bandwidth_hz: u64) 
         .map(|w| w[0].norm().min(w[1].norm()) >= SILENT_AUDIO * rms)
         .collect();
     let m = ((rate_hz / 4_800) as usize).max(1);
-    let smooth: Vec<f32> = tone_freq
-        .windows(m)
-        .map(|w| w.iter().sum::<f32>() / m as f32)
-        .collect();
+    // Moving average over `m` samples by running sum (f64, so long blocks do
+    // not drift); one output per full window, as `windows(m)` gives.
+    let mut smooth = Vec::with_capacity((tone_freq.len() + 1).saturating_sub(m));
+    let mut sum = 0.0f64;
+    for (i, &v) in tone_freq.iter().enumerate() {
+        sum += v as f64;
+        if i >= m {
+            sum -= tone_freq[i - m] as f64;
+        }
+        if i + 1 >= m {
+            smooth.push((sum / m as f64) as f32);
+        }
+    }
     smooth
         .windows(2)
         .zip(&audible)
