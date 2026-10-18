@@ -1,0 +1,17 @@
+[package]
+name = "zeta-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server exposing a ZetaSDR node"
+
+[[bin]]
+name = "zeta-mcp"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive", "env"] }
+rmcp = { version = "3.5", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "io-std"] }
+zeta-client = { path = "../zeta-client" }
+zeta-core = { path = "../zeta-core" }
