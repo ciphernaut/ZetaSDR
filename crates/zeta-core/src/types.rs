@@ -151,4 +151,26 @@ mod tests {
         let s = serde_json::to_value(schemars::schema_for!(Capabilities)).unwrap();
         assert_eq!(s["additionalProperties"], serde_json::Value::Bool(false));
     }
+
+    fn assert_all_required<T: JsonSchema>() {
+        let s = serde_json::to_value(schemars::schema_for!(T)).unwrap();
+        let mut props: Vec<String> = s["properties"].as_object().unwrap().keys().cloned().collect();
+        let mut req: Vec<String> = s["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        props.sort();
+        req.sort();
+        assert_eq!(req, props);
+        assert_eq!(s["additionalProperties"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn schemas_require_every_non_optional_field() {
+        assert_all_required::<Capabilities>();
+        assert_all_required::<Selection>();
+        assert_all_required::<Span>();
+    }
 }
