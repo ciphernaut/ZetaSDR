@@ -456,8 +456,12 @@ pub struct MeasureParams {}
 /// Accumulates IQ until it holds at least one second (`rate_hz` samples),
 /// then emits one Event for that window: its [`FeatureRecord`] fields plus
 /// `"label"`, its [`layer1_label`], with the provenance span covering the
-/// window. A change of sample rate or centre frequency discards the partial
-/// window; a partial window left when the input closes is not measured.
+/// window. A change of sample rate or centre frequency, or a discontinuity in
+/// time (a block whose `t0` is more than one sample away from where the window
+/// expects it, e.g. after the stage lagged and frames were skipped), discards
+/// the partial window without an event and starts a new window from that
+/// block, so a window never stitches across a gap; a partial window left when
+/// the input closes is not measured.
 pub struct MeasureStage {
     spec: StageSpec,
 }
@@ -512,9 +516,18 @@ impl Stage for MeasureStage {
                 return Err(StageError::Failed("measure stage expects iq frames".into()));
             };
             let (rate, center) = (block.sample_rate_hz.0, block.center_hz.0);
-            if window
-                .as_ref()
-                .is_some_and(|w| (w.2, w.3) != (rate, center))
+            // Where the next block should start: the window's t0 plus the
+            // samples held, within one sample (the ring's gap rule).
+            let gap = window.as_ref().is_some_and(|w| {
+                let expected =
+                    w.1.0 as u128 + buf.len() as u128 * 1_000_000_000 / rate.max(1) as u128;
+                let tolerance = 1_000_000_000u128.div_ceil(rate.max(1) as u128);
+                (block.t0.0 as u128).abs_diff(expected) > tolerance
+            });
+            if gap
+                || window
+                    .as_ref()
+                    .is_some_and(|w| (w.2, w.3) != (rate, center))
             {
                 window = None;
                 buf.clear();
@@ -726,6 +739,66 @@ mod tests {
         assert_eq!(rec.symbol_rate_baud, None);
         assert_eq!(label.layer, 1);
         assert_eq!(label.name, "noise");
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+    }
+
+    #[tokio::test]
+    async fn measure_stage_discards_window_on_gap() {
+        use zeta_core::port::IqBlock;
+        use zeta_core::types::{Provenance, SourceId, Span, Timestamp};
+        let prov = Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(1),
+            },
+        };
+        let bus = Arc::new(StreamBus::new(8));
+        let out = bus.register(StreamKind::Event, prov.clone());
+        let mut rx_out = bus.subscribe(&out).unwrap();
+        let (tx, rx_in) = broadcast::channel(32);
+        let h = tokio::spawn(async move {
+            MeasureStage::new()
+                .run(
+                    serde_json::json!({}),
+                    vec![rx_in],
+                    vec![out],
+                    bus,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let mut iq = vec![Complex::new(0.0f32, 0.0); 16 * 4_800];
+        awgn(&mut iq, 0.0, 2);
+        // 5 contiguous 100 ms blocks from 1 s, then a block 1 s late, then
+        // 10 contiguous blocks after it.
+        let pre_gap = 1_000_000_000u64;
+        let post_gap = pre_gap + 5 * 100_000_000 + 1_000_000_000;
+        let t0s = (0..5)
+            .map(|i| pre_gap + i * 100_000_000)
+            .chain((0..11).map(|i| post_gap + i * 100_000_000));
+        for (block, t0) in iq.chunks(4_800).zip(t0s) {
+            tx.send(Frame::new(
+                StreamId::new(),
+                prov.clone(),
+                Payload::Iq(IqBlock {
+                    t0: Timestamp(t0),
+                    sample_rate_hz: Hz(RATE),
+                    center_hz: Hz(CENTER),
+                    samples: block.to_vec().into(),
+                }),
+            ))
+            .unwrap();
+        }
+        let f = rx_out.recv().await.unwrap();
+        assert_eq!(f.provenance.span.start_ns, Timestamp(post_gap));
+        assert_eq!(
+            f.provenance.span.end_ns,
+            Timestamp(post_gap + 1_000_000_000)
+        );
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
     }

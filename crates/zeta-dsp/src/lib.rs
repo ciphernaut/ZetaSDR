@@ -1,6 +1,7 @@
 //! ZetaSDR DSP stages.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -73,9 +74,19 @@ pub(crate) fn frame_span(t0: Timestamp, n: usize, rate_hz: u64) -> Span {
     }
 }
 
+/// Input frames skipped by this crate's stages because they lagged behind
+/// their input, summed over every stage since start-up.
+pub static LAGGED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of [`LAGGED_FRAMES`].
+pub fn lagged_frames() -> u64 {
+    LAGGED_FRAMES.load(Ordering::Relaxed)
+}
+
 /// The loop every single-input stage runs: map each frame on `inputs[0]` through
 /// `f` and publish what it returns. Cancellation wins over pending input and
-/// returns `Cancelled`; lagged input is skipped; a closed input returns `Ok(())`;
+/// returns `Cancelled`; lagged input is skipped, counted in [`LAGGED_FRAMES`]
+/// and logged to stderr once per lag event; a closed input returns `Ok(())`;
 /// an error from `f` ends the stage with that error.
 pub(crate) async fn run_map<F>(
     mut inputs: Vec<broadcast::Receiver<Frame>>,
@@ -100,7 +111,11 @@ where
                         bus.publish(out);
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    LAGGED_FRAMES.fetch_add(n, Ordering::Relaxed);
+                    eprintln!("zeta-dsp: stage lagged, {n} frames skipped");
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
         }
