@@ -13,7 +13,11 @@ use zeta_source_file::{FileOpts, FileSource};
 
 /// `$XDG_STATE_HOME/zetasdr`, else `$HOME/.local/state/zetasdr`.
 pub fn default_state_dir() -> Result<PathBuf, String> {
-    let var = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let var = |k| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
     if let Some(x) = var("XDG_STATE_HOME") {
         return Ok(x.join("zetasdr"));
     }
@@ -26,8 +30,16 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
 /// Sources start after the node has subscribed to them: a source with no
 /// subscriber stops at once. `resume` relaunches persisted `Running` jobs
 /// (`serve`); without it they are listed as persisted and left alone (one-shot).
-pub async fn open(state_dir: PathBuf, source_files: &[(String, PathBuf)], resume: bool) -> Result<Node, String> {
-    let opts = FileOpts { realtime: false, block_samples: 4800, repeat: true };
+pub async fn open(
+    state_dir: PathBuf,
+    source_files: &[(String, PathBuf)],
+    resume: bool,
+) -> Result<Node, String> {
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 4800,
+        repeat: true,
+    };
     let sources = source_files
         .iter()
         .map(|(id, path): &(String, PathBuf)| {
@@ -38,9 +50,16 @@ pub async fn open(state_dir: PathBuf, source_files: &[(String, PathBuf)], resume
         .collect::<Result<Vec<_>, _>>()?;
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
-    let cfg = NodeConfig { state_dir, ring_seconds: 10.0, backends: vec![Backend::Cpu], resume };
+    let cfg = NodeConfig {
+        state_dir,
+        ring_seconds: 10.0,
+        backends: vec![Backend::Cpu],
+        resume,
+    };
     let ports = sources.iter().map(|s| s.clone() as Arc<dyn Port>).collect();
-    let node = Node::open(cfg, registry, ports).await.map_err(|e| e.to_string())?;
+    let node = Node::open(cfg, registry, ports)
+        .await
+        .map_err(|e| e.to_string())?;
     for s in &sources {
         s.start();
     }

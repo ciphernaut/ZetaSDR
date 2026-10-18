@@ -20,7 +20,9 @@ use crate::port::{IqReceiver, Port, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Backend, StageError, StageRegistry};
 use crate::stream::{Frame, Payload, StreamBus};
-use crate::types::{Capabilities, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
+use crate::types::{
+    Capabilities, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
+};
 
 const BUS_CAPACITY: usize = 256;
 
@@ -87,7 +89,11 @@ impl Drop for Node {
 }
 
 fn now() -> Timestamp {
-    Timestamp(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64))
+    Timestamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64),
+    )
 }
 
 fn io(e: impl std::fmt::Display) -> NodeError {
@@ -116,7 +122,12 @@ fn load(dir: &Path) -> Result<(Vec<JobRecord>, Vec<String>), NodeError> {
             .and_then(|s| serde_json::from_str::<JobRecord>(&s).ok());
         match parsed {
             Some(r) => records.push(r),
-            None => errors.push(path.file_name().unwrap_or_default().to_string_lossy().into_owned()),
+            None => errors.push(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         }
     }
     Ok((records, errors))
@@ -161,7 +172,14 @@ impl Node {
         }
         for rec in records {
             if !resume || rec.state != JobState::Running {
-                node.inner.jobs.lock().unwrap().insert(rec.id.clone(), JobEntry { record: rec, cancel: None, done: None });
+                node.inner.jobs.lock().unwrap().insert(
+                    rec.id.clone(),
+                    JobEntry {
+                        record: rec,
+                        cancel: None,
+                        done: None,
+                    },
+                );
                 continue;
             }
             let mut failed = rec.clone();
@@ -172,7 +190,14 @@ impl Node {
                 };
                 failed.state = JobState::Failed { reason };
                 persist(&node.inner.jobs_dir, &failed)?;
-                node.inner.jobs.lock().unwrap().insert(failed.id.clone(), JobEntry { record: failed, cancel: None, done: None });
+                node.inner.jobs.lock().unwrap().insert(
+                    failed.id.clone(),
+                    JobEntry {
+                        record: failed,
+                        cancel: None,
+                        done: None,
+                    },
+                );
             }
         }
         Ok(node)
@@ -226,7 +251,10 @@ impl Node {
 
     pub fn ports(&self) -> Vec<(SourceId, Capabilities)> {
         let ports = self.inner.ports.read().unwrap();
-        ports.values().map(|p| (p.id().clone(), p.capabilities().clone())).collect()
+        ports
+            .values()
+            .map(|p| (p.id().clone(), p.capabilities().clone()))
+            .collect()
     }
 
     pub async fn job_start(
@@ -258,9 +286,17 @@ impl Node {
     pub async fn job_stop(&self, id: &JobId) -> Result<(), NodeError> {
         let done = {
             let mut jobs = self.inner.jobs.lock().unwrap();
-            let entry = jobs.get_mut(id).ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
-            if !matches!(entry.record.state, JobState::Failed { .. } | JobState::Stopped) {
-                let rec = JobRecord { state: JobState::Stopped, ..entry.record.clone() };
+            let entry = jobs
+                .get_mut(id)
+                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            if !matches!(
+                entry.record.state,
+                JobState::Failed { .. } | JobState::Stopped
+            ) {
+                let rec = JobRecord {
+                    state: JobState::Stopped,
+                    ..entry.record.clone()
+                };
                 persist(&self.inner.jobs_dir, &rec)?;
                 entry.record = rec;
             }
@@ -283,7 +319,9 @@ impl Node {
         graph::validate(&graph, &self.inner.registry)?;
         let running = {
             let jobs = self.inner.jobs.lock().unwrap();
-            let entry = jobs.get(id).ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            let entry = jobs
+                .get(id)
+                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
             entry.record.state == JobState::Running
         };
         if running {
@@ -291,8 +329,13 @@ impl Node {
         }
         let rec = {
             let mut jobs = self.inner.jobs.lock().unwrap();
-            let entry = jobs.get_mut(id).ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
-            let rec = JobRecord { graph, ..entry.record.clone() };
+            let entry = jobs
+                .get_mut(id)
+                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            let rec = JobRecord {
+                graph,
+                ..entry.record.clone()
+            };
             persist(&self.inner.jobs_dir, &rec)?;
             entry.record = rec.clone();
             rec
@@ -305,20 +348,39 @@ impl Node {
 
     /// Every job record, oldest first.
     pub fn job_list(&self) -> Vec<JobRecord> {
-        let mut v: Vec<JobRecord> = self.inner.jobs.lock().unwrap().values().map(|e| e.record.clone()).collect();
-        v.sort_by(|a, b| a.created.0.cmp(&b.created.0).then_with(|| a.id.0.cmp(&b.id.0)));
+        let mut v: Vec<JobRecord> = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| e.record.clone())
+            .collect();
+        v.sort_by(|a, b| {
+            a.created
+                .0
+                .cmp(&b.created.0)
+                .then_with(|| a.id.0.cmp(&b.id.0))
+        });
         v
     }
 
     pub fn job_context(&self, id: &JobId) -> Option<serde_json::Value> {
-        self.inner.jobs.lock().unwrap().get(id).map(|e| e.record.context.clone())
+        self.inner
+            .jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|e| e.record.context.clone())
     }
 
     /// Shallow JSON merge patch: each top-level key of an object `patch` is set,
     /// or removed when its value is `null`; a non-object `patch` replaces the context.
     pub fn job_context_merge(&self, id: &JobId, patch: serde_json::Value) -> Result<(), NodeError> {
         let mut jobs = self.inner.jobs.lock().unwrap();
-        let entry = jobs.get_mut(id).ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        let entry = jobs
+            .get_mut(id)
+            .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
         let ctx = &mut entry.record.context;
         match patch {
             serde_json::Value::Object(p) => {
@@ -354,7 +416,11 @@ impl Node {
     }
 
     /// Tune `source` to `t` unless a job holds it; see [`LeaseManager::tune_if_unheld`].
-    pub(crate) async fn tune_if_unheld(&self, port: &dyn Port, t: Tuning) -> Result<Tuning, LeaseError> {
+    pub(crate) async fn tune_if_unheld(
+        &self,
+        port: &dyn Port,
+        t: Tuning,
+    ) -> Result<Tuning, LeaseError> {
         self.inner.leases.tune_if_unheld(port, t).await
     }
 
@@ -373,12 +439,18 @@ impl Inner {
         graph::validate(&rec.graph, &self.registry)?;
         let mut stages = Vec::with_capacity(rec.graph.nodes.len());
         for n in &rec.graph.nodes {
-            let stage = self.registry.select(&n.kind, &self.backends).ok_or_else(|| {
-                GraphError::UnknownStage { node: n.id.clone(), kind: n.kind.clone() }
-            })?;
+            let stage = self
+                .registry
+                .select(&n.kind, &self.backends)
+                .ok_or_else(|| GraphError::UnknownStage {
+                    node: n.id.clone(),
+                    kind: n.kind.clone(),
+                })?;
             stages.push(stage);
         }
-        self.leases.ensure(port.as_ref(), rec.id.clone(), rec.tuning).await?;
+        self.leases
+            .ensure(port.as_ref(), rec.id.clone(), rec.tuning)
+            .await?;
 
         let id = rec.id.clone();
         let token = self.shutdown.child_token();
@@ -388,14 +460,33 @@ impl Inner {
             return Err(e);
         }
         let t = now();
-        let prov = Provenance { source: rec.source.clone(), job: Some(id.clone()), channel: None, span: Span { start: t, end: t } };
+        let prov = Provenance {
+            source: rec.source.clone(),
+            job: Some(id.clone()),
+            channel: None,
+            span: Span { start: t, end: t },
+        };
         let graph = rec.graph.clone();
-        self.jobs.lock().unwrap().insert(id.clone(), JobEntry { record: rec, cancel: Some(token.clone()), done: None });
+        self.jobs.lock().unwrap().insert(
+            id.clone(),
+            JobEntry {
+                record: rec,
+                cancel: Some(token.clone()),
+                done: None,
+            },
+        );
 
         // One stream per edge; a node with no outgoing edge gets one job output
         // stream of its stage's first output kind.
-        let edge_streams: Vec<_> = graph.edges.iter().map(|e| self.bus.register(e.kind, prov.clone())).collect();
-        let roots = graph.nodes.iter().any(|n| !graph.edges.iter().any(|e| e.to == n.id));
+        let edge_streams: Vec<_> = graph
+            .edges
+            .iter()
+            .map(|e| self.bus.register(e.kind, prov.clone()))
+            .collect();
+        let roots = graph
+            .nodes
+            .iter()
+            .any(|n| !graph.edges.iter().any(|e| e.to == n.id));
         let iq = roots.then(|| self.bus.register(StreamKind::Iq, prov.clone()));
         let mut streams: Vec<StreamId> = edge_streams.iter().cloned().chain(iq.clone()).collect();
         let mut set = JoinSet::new();
@@ -425,7 +516,13 @@ impl Inner {
             set.spawn(async move { stage.run(params, inputs, outputs, bus, cancel).await });
         }
         if let Some(sid) = iq {
-            tokio::spawn(forward_iq(self.bus.clone(), prov, sid, port.subscribe(), token.clone()));
+            tokio::spawn(forward_iq(
+                self.bus.clone(),
+                prov,
+                sid,
+                port.subscribe(),
+                token.clone(),
+            ));
         }
         let h = tokio::spawn(supervise(self.clone(), id.clone(), set, token, streams));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
@@ -444,7 +541,10 @@ impl Inner {
                 entry.record.state = state;
                 entry.cancel = None;
                 if let Err(e) = persist(&self.jobs_dir, &entry.record) {
-                    self.persist_errors.lock().unwrap().push(format!("job {}: {e}", id.0));
+                    self.persist_errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("job {}: {e}", id.0));
                 }
             }
         }
@@ -478,7 +578,10 @@ async fn supervise(
     }
     // After node shutdown the record must stay `Running` so the job resumes.
     if !inner.shutdown.is_cancelled() {
-        inner.finish(&id, failure.map_or(JobState::Stopped, |reason| JobState::Failed { reason }));
+        inner.finish(
+            &id,
+            failure.map_or(JobState::Stopped, |reason| JobState::Failed { reason }),
+        );
     }
     // The only place a started job's lease is released.
     inner.leases.release(&id);
@@ -510,8 +613,19 @@ async fn forward_iq(
         };
         let rate = block.sample_rate_hz.0.max(1) as u128;
         let end = block.t0.0 + (block.samples.len() as u128 * 1_000_000_000 / rate) as u64;
-        let provenance = Provenance { span: Span { start: block.t0, end: Timestamp(end) }, ..prov.clone() };
-        bus.publish(Frame { stream: stream.clone(), kind: StreamKind::Iq, provenance, payload: Payload::Iq(block) });
+        let provenance = Provenance {
+            span: Span {
+                start: block.t0,
+                end: Timestamp(end),
+            },
+            ..prov.clone()
+        };
+        bus.publish(Frame {
+            stream: stream.clone(),
+            kind: StreamKind::Iq,
+            provenance,
+            payload: Payload::Iq(block),
+        });
     }
 }
 
@@ -531,7 +645,12 @@ async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqReceiver) {
             .lock()
             .unwrap()
             .entry(source.clone())
-            .or_insert_with(|| Arc::new(RwLock::new(IqRing::new(inner.ring_seconds, block.sample_rate_hz))))
+            .or_insert_with(|| {
+                Arc::new(RwLock::new(IqRing::new(
+                    inner.ring_seconds,
+                    block.sample_rate_hz,
+                )))
+            })
             .clone();
         ring.write().unwrap().push(&block);
     }

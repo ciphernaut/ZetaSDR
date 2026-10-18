@@ -62,20 +62,29 @@ fn overlaps(min: Hz, max: Hz, center: Hz, bandwidth: Hz) -> bool {
 }
 
 impl StaticKnowledge {
-    pub fn from_files(signatures: &Path, allocations: Option<&Path>) -> Result<Self, std::io::Error> {
+    pub fn from_files(
+        signatures: &Path,
+        allocations: Option<&Path>,
+    ) -> Result<Self, std::io::Error> {
         let signatures = serde_json::from_slice(&std::fs::read(signatures)?).map_err(invalid)?;
         let allocations = match allocations {
             Some(p) => serde_json::from_slice(&std::fs::read(p)?).map_err(invalid)?,
             None => Vec::new(),
         };
-        Ok(Self { signatures, allocations })
+        Ok(Self {
+            signatures,
+            allocations,
+        })
     }
 
     /// The seed signatures embedded in the binary, with no allocations.
     pub fn builtin() -> Self {
         let signatures = serde_json::from_str(include_str!("../data/signatures.json"))
             .expect("data/signatures.json is valid");
-        Self { signatures, allocations: Vec::new() }
+        Self {
+            signatures,
+            allocations: Vec::new(),
+        }
     }
 }
 
@@ -88,13 +97,20 @@ impl KnowledgeProvider for StaticKnowledge {
     async fn allocations(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Allocation> {
         self.allocations
             .iter()
-            .filter(|a| a.region.eq_ignore_ascii_case(region) && overlaps(a.min_hz, a.max_hz, center_hz, bandwidth_hz))
+            .filter(|a| {
+                a.region.eq_ignore_ascii_case(region)
+                    && overlaps(a.min_hz, a.max_hz, center_hz, bandwidth_hz)
+            })
             .cloned()
             .collect()
     }
 
     async fn signatures(&self, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Signature> {
-        self.signatures.iter().filter(|s| overlaps(s.min_hz, s.max_hz, center_hz, bandwidth_hz)).cloned().collect()
+        self.signatures
+            .iter()
+            .filter(|s| overlaps(s.min_hz, s.max_hz, center_hz, bandwidth_hz))
+            .cloned()
+            .collect()
     }
 }
 
@@ -106,7 +122,10 @@ mod tests {
     async fn builtin_signatures_include_aprs_at_144_800() {
         let k = StaticKnowledge::builtin();
         let sigs = k.signatures(Hz(144_800_000), Hz(25_000)).await;
-        let aprs = sigs.iter().find(|s| s.name == "APRS").expect("APRS present");
+        let aprs = sigs
+            .iter()
+            .find(|s| s.name == "APRS")
+            .expect("APRS present");
         assert_eq!(aprs.decoder.as_deref(), Some("aprs"));
         assert!(k.signatures(Hz(100_000_000), Hz(25_000)).await.is_empty());
     }
@@ -122,8 +141,19 @@ mod tests {
         )
         .unwrap();
         let k = StaticKnowledge::from_files(&sp, Some(&ap)).unwrap();
-        assert_eq!(k.allocations("au", Hz(145_000_000), Hz(1_000)).await.len(), 1);
-        assert!(k.allocations("EU", Hz(145_000_000), Hz(1_000)).await.is_empty());
-        assert!(k.allocations("AU", Hz(100_000_000), Hz(1_000)).await.is_empty());
+        assert_eq!(
+            k.allocations("au", Hz(145_000_000), Hz(1_000)).await.len(),
+            1
+        );
+        assert!(
+            k.allocations("EU", Hz(145_000_000), Hz(1_000))
+                .await
+                .is_empty()
+        );
+        assert!(
+            k.allocations("AU", Hz(100_000_000), Hz(1_000))
+                .await
+                .is_empty()
+        );
     }
 }

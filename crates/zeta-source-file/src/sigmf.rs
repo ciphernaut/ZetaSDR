@@ -1,8 +1,8 @@
 //! SigMF recording playback as a [`Port`].
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,7 +32,9 @@ fn io(msg: impl Into<String>) -> PortError {
 }
 
 fn number(v: Option<&serde_json::Value>, key: &str) -> Result<u64, PortError> {
-    let f = v.and_then(|v| v.as_f64()).ok_or_else(|| io(format!("{key} missing")))?;
+    let f = v
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| io(format!("{key} missing")))?;
     if f < 0.0 || !f.is_finite() {
         return Err(io(format!("{key} invalid")));
     }
@@ -48,11 +50,24 @@ fn parse_datetime(s: &str) -> Result<Timestamp, PortError> {
         None => (body, None),
     };
     let b = main.as_bytes();
-    if b.len() != 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b.len() != 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return Err(bad());
     }
     let n = |r: std::ops::Range<usize>| main[r].parse::<i64>().map_err(|_| bad());
-    let (y, mo, d, h, mi, sec) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    let (y, mo, d, h, mi, sec) = (
+        n(0..4)?,
+        n(5..7)?,
+        n(8..10)?,
+        n(11..13)?,
+        n(14..16)?,
+        n(17..19)?,
+    );
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
         return Err(bad());
     }
@@ -72,13 +87,16 @@ fn parse_datetime(s: &str) -> Result<Timestamp, PortError> {
         let digits: String = f.chars().take(9).collect();
         nanos = format!("{digits:0<9}").parse().map_err(|_| bad())?;
     }
-    u64::try_from(secs).map_err(|_| bad()).map(|s| Timestamp(s * 1_000_000_000 + nanos))
+    u64::try_from(secs)
+        .map_err(|_| bad())
+        .map(|s| Timestamp(s * 1_000_000_000 + nanos))
 }
 
 /// Read the fields this source needs from a `.sigmf-meta` file.
 pub fn read_meta(path: &Path) -> Result<SigmfMeta, PortError> {
     let text = std::fs::read_to_string(path).map_err(|e| io(format!("{}: {e}", path.display())))?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| io(format!("meta json: {e}")))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| io(format!("meta json: {e}")))?;
     let global = &v["global"];
     let datatype = global["core:datatype"]
         .as_str()
@@ -86,12 +104,23 @@ pub fn read_meta(path: &Path) -> Result<SigmfMeta, PortError> {
         .to_string();
     let sample_rate_hz = Hz(number(global.get("core:sample_rate"), "core:sample_rate")?);
     let cap = v["captures"].get(0);
-    let center_hz = Hz(number(cap.and_then(|c| c.get("core:frequency")), "core:frequency")?);
-    let start = match cap.and_then(|c| c.get("core:datetime")).and_then(|d| d.as_str()) {
+    let center_hz = Hz(number(
+        cap.and_then(|c| c.get("core:frequency")),
+        "core:frequency",
+    )?);
+    let start = match cap
+        .and_then(|c| c.get("core:datetime"))
+        .and_then(|d| d.as_str())
+    {
         Some(s) => parse_datetime(s)?,
         None => Timestamp(0),
     };
-    Ok(SigmfMeta { datatype, sample_rate_hz, center_hz, start })
+    Ok(SigmfMeta {
+        datatype,
+        sample_rate_hz,
+        center_hz,
+        start,
+    })
 }
 
 fn format_of(datatype: &str) -> Result<SampleFormat, PortError> {
@@ -159,14 +188,18 @@ impl FileSource {
             return Err(io("core:sample_rate invalid"));
         }
         let data_path: PathBuf = meta_path.with_extension("sigmf-data");
-        let raw = std::fs::read(&data_path).map_err(|e| io(format!("{}: {e}", data_path.display())))?;
+        let raw =
+            std::fs::read(&data_path).map_err(|e| io(format!("{}: {e}", data_path.display())))?;
         let unit = match fmt {
             SampleFormat::Cf32 => 8,
             SampleFormat::Ci16 => 4,
             SampleFormat::Ci8 => 2,
         };
         if raw.len() % unit != 0 {
-            return Err(io(format!("{}: length not a multiple of {unit} bytes", data_path.display())));
+            return Err(io(format!(
+                "{}: length not a multiple of {unit} bytes",
+                data_path.display()
+            )));
         }
         let samples: Arc<[Complex<f32>]> = convert(fmt, &raw).into();
         let caps = Capabilities {
@@ -182,7 +215,15 @@ impl FileSource {
         };
         let (tx, _) = broadcast::channel(64);
         let tx = Arc::new(Mutex::new(Some(tx)));
-        Ok(Self { id, meta, caps, opts, samples, tx, stopped: Arc::new(AtomicBool::new(false)) })
+        Ok(Self {
+            id,
+            meta,
+            caps,
+            opts,
+            samples,
+            tx,
+            stopped: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Begin broadcasting blocks to subscribers. Call `subscribe()` first: the task
@@ -209,7 +250,9 @@ impl FileSource {
                     if stopped.load(Ordering::Relaxed) || tx.receiver_count() == 0 {
                         return;
                     }
-                    let t0 = Timestamp(meta.start.0 + (elapsed as u128 * 1_000_000_000 / rate as u128) as u64);
+                    let t0 = Timestamp(
+                        meta.start.0 + (elapsed as u128 * 1_000_000_000 / rate as u128) as u64,
+                    );
                     elapsed += chunk.len() as u64;
                     let _ = tx.send(IqBlock {
                         t0,
@@ -218,7 +261,10 @@ impl FileSource {
                         samples: chunk.into(),
                     });
                     if opts.realtime {
-                        tokio::time::sleep(Duration::from_secs_f64(chunk.len() as f64 / rate as f64)).await;
+                        tokio::time::sleep(Duration::from_secs_f64(
+                            chunk.len() as f64 / rate as f64,
+                        ))
+                        .await;
                     } else {
                         tokio::task::yield_now().await;
                     }
@@ -245,17 +291,32 @@ impl Port for FileSource {
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let c = self.meta.center_hz.0;
         if t.center_hz.0 != c {
-            return Err(PortError::OutOfRange { field: "center_hz", value: t.center_hz.0, min: c, max: c, suggested: None });
+            return Err(PortError::OutOfRange {
+                field: "center_hz",
+                value: t.center_hz.0,
+                min: c,
+                max: c,
+                suggested: None,
+            });
         }
         let bw = self.meta.sample_rate_hz.0;
         if t.bandwidth_hz.0 > bw {
-            return Err(PortError::OutOfRange { field: "bandwidth_hz", value: t.bandwidth_hz.0, min: 0, max: bw, suggested: None });
+            return Err(PortError::OutOfRange {
+                field: "bandwidth_hz",
+                value: t.bandwidth_hz.0,
+                min: 0,
+                max: bw,
+                suggested: None,
+            });
         }
         Ok(t)
     }
 
     fn current(&self) -> Option<Tuning> {
-        Some(Tuning { center_hz: self.meta.center_hz, bandwidth_hz: self.meta.sample_rate_hz })
+        Some(Tuning {
+            center_hz: self.meta.center_hz,
+            bandwidth_hz: self.meta.sample_rate_hz,
+        })
     }
 
     fn subscribe(&self) -> IqReceiver {
@@ -273,8 +334,14 @@ mod tests {
 
     #[test]
     fn datetime_parses_to_epoch_nanos() {
-        assert_eq!(parse_datetime("1970-01-01T00:00:00Z").unwrap(), Timestamp(0));
-        assert_eq!(parse_datetime("2000-03-01T00:00:01.5Z").unwrap(), Timestamp(951_868_801_500_000_000));
+        assert_eq!(
+            parse_datetime("1970-01-01T00:00:00Z").unwrap(),
+            Timestamp(0)
+        );
+        assert_eq!(
+            parse_datetime("2000-03-01T00:00:01.5Z").unwrap(),
+            Timestamp(951_868_801_500_000_000)
+        );
         assert!(parse_datetime("2000-03-01T00:00:01+01:00").is_err());
     }
 }

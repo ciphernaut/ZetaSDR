@@ -16,9 +16,15 @@ const NS: u128 = 1_000_000_000;
 #[schemars(deny_unknown_fields)]
 pub enum RingError {
     #[error("requested {requested:?} is older than earliest retained {earliest:?}")]
-    TooOld { requested: Timestamp, earliest: Timestamp },
+    TooOld {
+        requested: Timestamp,
+        earliest: Timestamp,
+    },
     #[error("requested {requested:?} is later than latest retained {latest:?}")]
-    Future { requested: Timestamp, latest: Timestamp },
+    Future {
+        requested: Timestamp,
+        latest: Timestamp,
+    },
     #[error("ring is empty or span is empty")]
     Empty,
 }
@@ -117,7 +123,8 @@ impl IqRing {
 
     /// Timestamp of the newest retained sample.
     pub fn latest(&self) -> Option<Timestamp> {
-        (!self.buf.is_empty()).then(|| Timestamp(self.time_of(self.dropped + self.buf.len() as u64 - 1)))
+        (!self.buf.is_empty())
+            .then(|| Timestamp(self.time_of(self.dropped + self.buf.len() as u64 - 1)))
     }
 
     /// Samples covering the half-open span `[start, end)`, or an error; never partial.
@@ -130,15 +137,20 @@ impl IqRing {
             return Err(RingError::Empty);
         }
         if span.start.0 < earliest.0 {
-            return Err(RingError::TooOld { requested: span.start, earliest });
+            return Err(RingError::TooOld {
+                requested: span.start,
+                earliest,
+            });
         }
         let rate = self.sample_rate_hz as u128;
-        let offset = |t: u64| -> usize {
-            (((t - earliest.0) as u128 * rate + NS / 2) / NS) as usize
-        };
+        let offset =
+            |t: u64| -> usize { (((t - earliest.0) as u128 * rate + NS / 2) / NS) as usize };
         let (from, to) = (offset(span.start.0), offset(span.end.0));
         if to > self.buf.len() {
-            return Err(RingError::Future { requested: span.end, latest });
+            return Err(RingError::Future {
+                requested: span.end,
+                latest,
+            });
         }
         Ok(self.buf.range(from..to).copied().collect())
     }
@@ -152,8 +164,9 @@ mod tests {
     const RATE: u64 = 1000;
 
     fn block(index: u64) -> IqBlock {
-        let samples: Vec<Complex<f32>> =
-            (0..1000).map(|i| Complex::new((index * 1000 + i) as f32, 0.0)).collect();
+        let samples: Vec<Complex<f32>> = (0..1000)
+            .map(|i| Complex::new((index * 1000 + i) as f32, 0.0))
+            .collect();
         IqBlock {
             t0: Timestamp(index * 1_000_000_000),
             sample_rate_hz: Hz(RATE),
@@ -163,7 +176,10 @@ mod tests {
     }
 
     fn span(a: u64, b: u64) -> Span {
-        Span { start: Timestamp(a * 1_000_000_000), end: Timestamp(b * 1_000_000_000) }
+        Span {
+            start: Timestamp(a * 1_000_000_000),
+            end: Timestamp(b * 1_000_000_000),
+        }
     }
 
     #[test]
@@ -214,12 +230,16 @@ mod tests {
     const MS: u64 = 1_000_000;
 
     fn span_ns(a: u64, b: u64) -> Span {
-        Span { start: Timestamp(a), end: Timestamp(b) }
+        Span {
+            start: Timestamp(a),
+            end: Timestamp(b),
+        }
     }
 
     fn block_at(t0_ns: u64, first: u64, n: u64) -> IqBlock {
-        let samples: Vec<Complex<f32>> =
-            (0..n).map(|i| Complex::new((first + i) as f32, 0.0)).collect();
+        let samples: Vec<Complex<f32>> = (0..n)
+            .map(|i| Complex::new((first + i) as f32, 0.0))
+            .collect();
         IqBlock {
             t0: Timestamp(t0_ns),
             sample_rate_hz: Hz(RATE),
@@ -287,7 +307,10 @@ mod tests {
         ring.push(&block_at(5_000 * MS, 5000, 1000));
         assert_eq!(ring.earliest(), Some(Timestamp(5_000 * MS)));
         assert_eq!(ring.latest(), Some(Timestamp(5_999 * MS)));
-        assert!(matches!(ring.read(span(0, 1)), Err(RingError::TooOld { .. })));
+        assert!(matches!(
+            ring.read(span(0, 1)),
+            Err(RingError::TooOld { .. })
+        ));
         assert_eq!(ring.read(span(5, 6)).unwrap().len(), 1000);
     }
 
@@ -297,7 +320,10 @@ mod tests {
         assert_eq!(ring.center_hz(), None);
         ring.push(&block(0));
         assert_eq!(ring.center_hz(), Some(Hz(100_000_000)));
-        let moved = IqBlock { center_hz: Hz(433_000_000), ..block(1) };
+        let moved = IqBlock {
+            center_hz: Hz(433_000_000),
+            ..block(1)
+        };
         ring.push(&moved);
         assert_eq!(ring.center_hz(), Some(Hz(433_000_000)));
         assert_eq!(ring.earliest(), Some(Timestamp(1_000 * MS)));
@@ -309,7 +335,11 @@ mod tests {
             let mut ring = IqRing::new(10.0, Hz(RATE));
             ring.push(&block(0));
             ring.push(&block_at(t0, 1000, 1000));
-            assert_eq!(ring.earliest(), Some(Timestamp(0)), "jitter at {t0} cleared the ring");
+            assert_eq!(
+                ring.earliest(),
+                Some(Timestamp(0)),
+                "jitter at {t0} cleared the ring"
+            );
             assert_eq!(ring.read(span_ns(0, 2_000 * MS)).unwrap().len(), 2000);
         }
     }

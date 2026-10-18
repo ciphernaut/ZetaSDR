@@ -38,7 +38,12 @@ pub struct Label {
 pub trait Classifier: Send + Sync {
     fn name(&self) -> &str;
     fn layer(&self) -> u8;
-    async fn classify(&self, iq: &[Complex<f32>], sample_rate_hz: Hz, features: Option<&FeatureRecord>) -> Vec<Label>;
+    async fn classify(
+        &self,
+        iq: &[Complex<f32>],
+        sample_rate_hz: Hz,
+        features: Option<&FeatureRecord>,
+    ) -> Vec<Label>;
 }
 
 /// The layer-3 slot, proving a SIGINT classifier can plug in; labels nothing.
@@ -52,7 +57,12 @@ impl Classifier for StubClassifier {
     fn layer(&self) -> u8 {
         3
     }
-    async fn classify(&self, _iq: &[Complex<f32>], _sample_rate_hz: Hz, _features: Option<&FeatureRecord>) -> Vec<Label> {
+    async fn classify(
+        &self,
+        _iq: &[Complex<f32>],
+        _sample_rate_hz: Hz,
+        _features: Option<&FeatureRecord>,
+    ) -> Vec<Label> {
         Vec::new()
     }
 }
@@ -98,8 +108,18 @@ mod tests {
         fn layer(&self) -> u8 {
             self.0
         }
-        async fn classify(&self, _: &[Complex<f32>], _: Hz, _: Option<&FeatureRecord>) -> Vec<Label> {
-            vec![Label { layer: self.0, name: self.1.into(), confidence: 1.0, evidence: String::new() }]
+        async fn classify(
+            &self,
+            _: &[Complex<f32>],
+            _: Hz,
+            _: Option<&FeatureRecord>,
+        ) -> Vec<Label> {
+            vec![Label {
+                layer: self.0,
+                name: self.1.into(),
+                confidence: 1.0,
+                evidence: String::new(),
+            }]
         }
     }
 
@@ -110,7 +130,12 @@ mod tests {
         set.register(Arc::new(Fixed(1, "a")));
         set.register(Arc::new(StubClassifier));
         set.register(Arc::new(Fixed(2, "b")));
-        let names: Vec<String> = set.run_all(&[], Hz(48_000), None).await.into_iter().map(|l| l.name).collect();
+        let names: Vec<String> = set
+            .run_all(&[], Hz(48_000), None)
+            .await
+            .into_iter()
+            .map(|l| l.name)
+            .collect();
         assert_eq!(names, ["a", "b", "c"]);
     }
 }

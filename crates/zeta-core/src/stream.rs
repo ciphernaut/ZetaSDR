@@ -13,7 +13,10 @@ use crate::types::{Hz, Provenance, StreamId, StreamKind};
 #[derive(Clone, Debug)]
 pub enum Payload {
     Iq(IqBlock),
-    Audio { sample_rate_hz: Hz, samples: Arc<[f32]> },
+    Audio {
+        sample_rate_hz: Hz,
+        samples: Arc<[f32]>,
+    },
     /// Deferred: no video payload is carried yet.
     Video,
     Text(String),
@@ -58,13 +61,20 @@ pub struct StreamBus {
 
 impl StreamBus {
     pub fn new(capacity: usize) -> Self {
-        Self { capacity, streams: RwLock::new(HashMap::new()) }
+        Self {
+            capacity,
+            streams: RwLock::new(HashMap::new()),
+        }
     }
 
     pub fn register(&self, kind: StreamKind, provenance: Provenance) -> StreamId {
         let id = StreamId::new();
         let (tx, _) = broadcast::channel(self.capacity);
-        let info = StreamInfo { id: id.clone(), kind, provenance };
+        let info = StreamInfo {
+            id: id.clone(),
+            kind,
+            provenance,
+        };
         self.streams.write().unwrap().insert(id.clone(), (info, tx));
         id
     }
@@ -84,11 +94,20 @@ impl StreamBus {
     }
 
     pub fn subscribe(&self, id: &StreamId) -> Option<broadcast::Receiver<Frame>> {
-        self.streams.read().unwrap().get(id).map(|(_, tx)| tx.subscribe())
+        self.streams
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|(_, tx)| tx.subscribe())
     }
 
     pub fn list(&self) -> Vec<StreamInfo> {
-        self.streams.read().unwrap().values().map(|(i, _)| i.clone()).collect()
+        self.streams
+            .read()
+            .unwrap()
+            .values()
+            .map(|(i, _)| i.clone())
+            .collect()
     }
 }
 
@@ -102,7 +121,10 @@ mod tests {
             source: SourceId(src.into()),
             job: None,
             channel: None,
-            span: Span { start: Timestamp(0), end: Timestamp(1) },
+            span: Span {
+                start: Timestamp(0),
+                end: Timestamp(1),
+            },
         }
     }
 
@@ -144,7 +166,10 @@ mod tests {
         bus.unregister(&id);
         assert!(bus.list().is_empty());
         assert!(bus.subscribe(&id).is_none());
-        assert!(matches!(rx.recv().await, Err(broadcast::error::RecvError::Closed)));
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
     }
 
     #[test]

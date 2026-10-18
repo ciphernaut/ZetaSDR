@@ -77,14 +77,21 @@ impl StageRegistry {
 
     /// Spec of the first implementation registered for `kind`.
     pub fn spec(&self, kind: &str) -> Option<&StageSpec> {
-        self.stages.iter().map(|s| s.spec()).find(|s| s.kind == kind)
+        self.stages
+            .iter()
+            .map(|s| s.spec())
+            .find(|s| s.kind == kind)
     }
 
     /// Best implementation of `kind` on an available backend (Fpga > Gpu > Cpu);
     /// ties go to the first registered.
     pub fn select(&self, kind: &str, available: &[Backend]) -> Option<Arc<dyn Stage>> {
         let mut best: Option<&Arc<dyn Stage>> = None;
-        for s in self.stages.iter().filter(|s| s.spec().kind == kind && available.contains(&s.backend())) {
+        for s in self
+            .stages
+            .iter()
+            .filter(|s| s.spec().kind == kind && available.contains(&s.backend()))
+        {
             if best.is_none_or(|b| s.backend().rank() > b.backend().rank()) {
                 best = Some(s);
             }
@@ -153,7 +160,9 @@ impl Stage for PassthroughStage {
         cancel: CancellationToken,
     ) -> Result<(), StageError> {
         let (Some(rx), Some(out)) = (inputs.first_mut(), outputs.first()) else {
-            return Err(StageError::Failed("passthrough needs one input and one output".into()));
+            return Err(StageError::Failed(
+                "passthrough needs one input and one output".into(),
+            ));
         };
         loop {
             tokio::select! {
@@ -175,8 +184,8 @@ impl Stage for PassthroughStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Provenance, SourceId, Span, Timestamp};
     use crate::stream::Payload;
+    use crate::types::{Provenance, SourceId, Span, Timestamp};
 
     struct Fake(StageSpec, Backend);
     #[async_trait]
@@ -216,8 +225,16 @@ mod tests {
         let mut r = StageRegistry::new();
         r.register(fake(Backend::Cpu));
         r.register(fake(Backend::Gpu));
-        assert_eq!(r.select("fft", &[Backend::Cpu, Backend::Gpu]).unwrap().backend(), Backend::Gpu);
-        assert_eq!(r.select("fft", &[Backend::Cpu]).unwrap().backend(), Backend::Cpu);
+        assert_eq!(
+            r.select("fft", &[Backend::Cpu, Backend::Gpu])
+                .unwrap()
+                .backend(),
+            Backend::Gpu
+        );
+        assert_eq!(
+            r.select("fft", &[Backend::Cpu]).unwrap().backend(),
+            Backend::Cpu
+        );
         assert!(r.select("fft", &[]).is_none());
         assert!(r.select("other", &[Backend::Cpu]).is_none());
     }
@@ -227,12 +244,20 @@ mod tests {
             source: SourceId("s".into()),
             job: None,
             channel: None,
-            span: Span { start: Timestamp(0), end: Timestamp(1) },
+            span: Span {
+                start: Timestamp(0),
+                end: Timestamp(1),
+            },
         }
     }
 
     fn text(stream: StreamId, s: &str) -> Frame {
-        Frame { stream, kind: StreamKind::Text, provenance: prov(), payload: Payload::Text(s.into()) }
+        Frame {
+            stream,
+            kind: StreamKind::Text,
+            provenance: prov(),
+            payload: Payload::Text(s.into()),
+        }
     }
 
     type Run = tokio::task::JoinHandle<Result<(), StageError>>;
@@ -240,7 +265,13 @@ mod tests {
     /// Spawn a passthrough fed by a local broadcast channel, so the test can drop the sender.
     fn spawn(
         cancel: CancellationToken,
-    ) -> (broadcast::Sender<Frame>, Arc<StreamBus>, StreamId, broadcast::Receiver<Frame>, Run) {
+    ) -> (
+        broadcast::Sender<Frame>,
+        Arc<StreamBus>,
+        StreamId,
+        broadcast::Receiver<Frame>,
+        Run,
+    ) {
         let bus = Arc::new(StreamBus::new(8));
         let out = bus.register(StreamKind::Text, prov());
         let rx_out = bus.subscribe(&out).unwrap();
@@ -248,7 +279,13 @@ mod tests {
         let (b2, o2) = (bus.clone(), out.clone());
         let h = tokio::spawn(async move {
             PassthroughStage::new()
-                .run(serde_json::json!({"kind": "text"}), vec![rx_in], vec![o2], b2, cancel)
+                .run(
+                    serde_json::json!({"kind": "text"}),
+                    vec![rx_in],
+                    vec![o2],
+                    b2,
+                    cancel,
+                )
                 .await
         });
         (tx, bus, out, rx_out, h)

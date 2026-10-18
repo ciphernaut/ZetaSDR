@@ -20,7 +20,11 @@ async fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             let _ = e.print();
-            return if e.use_stderr() { ExitCode::FAILURE } else { ExitCode::SUCCESS };
+            return if e.use_stderr() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            };
         }
     };
     if let cli::Command::AgentsMd { check } = cli.command {

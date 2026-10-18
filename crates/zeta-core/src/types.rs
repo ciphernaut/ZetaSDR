@@ -128,7 +128,10 @@ mod tests {
     fn selection_roundtrips_json_with_hz_fields() {
         let s = Selection {
             source: SourceId("hackrf0".into()),
-            span: Span { start: Timestamp(0), end: Timestamp(1_000_000_000) },
+            span: Span {
+                start: Timestamp(0),
+                end: Timestamp(1_000_000_000),
+            },
             center_hz: Hz(101_500_000),
             bandwidth_hz: Hz(200_000),
         };
@@ -157,7 +160,12 @@ mod tests {
 
     fn assert_all_required<T: JsonSchema>() {
         let s = serde_json::to_value(schemars::schema_for!(T)).unwrap();
-        let mut props: Vec<String> = s["properties"].as_object().unwrap().keys().cloned().collect();
+        let mut props: Vec<String> = s["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
         let mut req: Vec<String> = s["required"]
             .as_array()
             .unwrap()

@@ -26,7 +26,15 @@ fn unsupported_datatype_is_named() {
             "captures":[{"core:sample_start":0,"core:frequency":100000000}],"annotations":[]}"#,
     )
     .unwrap();
-    match FileSource::open(SourceId("f".into()), &p, FileOpts { realtime: false, block_samples: 4800, repeat: false }) {
+    match FileSource::open(
+        SourceId("f".into()),
+        &p,
+        FileOpts {
+            realtime: false,
+            block_samples: 4800,
+            repeat: false,
+        },
+    ) {
         Err(PortError::Unsupported(s)) => assert!(s.contains("rf32_le")),
         other => panic!("expected Unsupported, got {:?}", other.map(|_| ())),
     }
@@ -49,7 +57,16 @@ async fn streams_all_samples_in_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let path = common::tone(dir.path());
     let meta = read_meta(&path).unwrap();
-    let src = FileSource::open(SourceId("f".into()), &path, FileOpts { realtime: false, block_samples: 4800, repeat: false }).unwrap();
+    let src = FileSource::open(
+        SourceId("f".into()),
+        &path,
+        FileOpts {
+            realtime: false,
+            block_samples: 4800,
+            repeat: false,
+        },
+    )
+    .unwrap();
     let mut rx = src.subscribe();
     let _h = src.start();
     let mut total = 0;
@@ -74,12 +91,32 @@ async fn streams_all_samples_in_blocks() {
 #[tokio::test]
 async fn tune_off_center_is_out_of_range() {
     let dir = tempfile::tempdir().unwrap();
-    let src = FileSource::open(SourceId("f".into()), &common::tone(dir.path()), FileOpts { realtime: false, block_samples: 4800, repeat: false }).unwrap();
-    match src.tune(Tuning { center_hz: Hz(101_000_000), bandwidth_hz: Hz(48_000) }).await {
-        Err(PortError::OutOfRange { field: "center_hz", .. }) => {}
+    let src = FileSource::open(
+        SourceId("f".into()),
+        &common::tone(dir.path()),
+        FileOpts {
+            realtime: false,
+            block_samples: 4800,
+            repeat: false,
+        },
+    )
+    .unwrap();
+    match src
+        .tune(Tuning {
+            center_hz: Hz(101_000_000),
+            bandwidth_hz: Hz(48_000),
+        })
+        .await
+    {
+        Err(PortError::OutOfRange {
+            field: "center_hz", ..
+        }) => {}
         other => panic!("got {other:?}"),
     }
-    let ok = Tuning { center_hz: Hz(100_000_000), bandwidth_hz: Hz(48_000) };
+    let ok = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(48_000),
+    };
     assert_eq!(src.tune(ok).await.unwrap(), ok);
 }
 
@@ -95,17 +132,24 @@ fn write_raw(dir: &std::path::Path, dt: &str, bytes: &[u8]) -> std::path::PathBu
 }
 
 fn opts(repeat: bool) -> FileOpts {
-    FileOpts { realtime: false, block_samples: 4800, repeat }
+    FileOpts {
+        realtime: false,
+        block_samples: 4800,
+        repeat,
+    }
 }
 
 async fn finished(h: tokio::task::JoinHandle<()>) -> bool {
-    tokio::time::timeout(std::time::Duration::from_secs(2), h).await.is_ok()
+    tokio::time::timeout(std::time::Duration::from_secs(2), h)
+        .await
+        .is_ok()
 }
 
 #[tokio::test]
 async fn producer_exits_when_receivers_dropped() {
     let dir = tempfile::tempdir().unwrap();
-    let src = FileSource::open(SourceId("f".into()), &common::tone(dir.path()), opts(true)).unwrap();
+    let src =
+        FileSource::open(SourceId("f".into()), &common::tone(dir.path()), opts(true)).unwrap();
     let rx = src.subscribe();
     let h = src.start();
     drop(rx);
@@ -115,7 +159,8 @@ async fn producer_exits_when_receivers_dropped() {
 #[tokio::test]
 async fn producer_exits_when_source_dropped() {
     let dir = tempfile::tempdir().unwrap();
-    let src = FileSource::open(SourceId("f".into()), &common::tone(dir.path()), opts(true)).unwrap();
+    let src =
+        FileSource::open(SourceId("f".into()), &common::tone(dir.path()), opts(true)).unwrap();
     let _rx = src.subscribe();
     let h = src.start();
     drop(src);
@@ -126,7 +171,10 @@ async fn producer_exits_when_source_dropped() {
 fn odd_length_data_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let meta = write_raw(dir.path(), "ci16_le", &[1, 2, 3]);
-    assert!(matches!(FileSource::open(SourceId("f".into()), &meta, opts(false)), Err(PortError::Io(_))));
+    assert!(matches!(
+        FileSource::open(SourceId("f".into()), &meta, opts(false)),
+        Err(PortError::Io(_))
+    ));
 }
 
 #[tokio::test]
@@ -153,7 +201,8 @@ async fn ci8_and_ci16_scale_to_unit_range() {
 #[tokio::test]
 async fn repeat_keeps_t0_monotonic() {
     let dir = tempfile::tempdir().unwrap();
-    let src = FileSource::open(SourceId("f".into()), &common::tone(dir.path()), opts(true)).unwrap();
+    let src =
+        FileSource::open(SourceId("f".into()), &common::tone(dir.path()), opts(true)).unwrap();
     let mut rx = src.subscribe();
     let _h = src.start();
     let mut prev: Option<Timestamp> = None;

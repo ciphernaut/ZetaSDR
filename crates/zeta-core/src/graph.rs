@@ -65,7 +65,11 @@ pub enum GraphError {
     #[error("edge {edge} references a missing node")]
     DanglingEdge { edge: usize },
     #[error("edge {edge} carries {got:?} but {expected:?} was expected")]
-    TypeMismatch { edge: usize, expected: StreamKind, got: StreamKind },
+    TypeMismatch {
+        edge: usize,
+        expected: StreamKind,
+        got: StreamKind,
+    },
     #[error("bad params on node {node:?}: {reason}")]
     BadParams { node: NodeId, reason: String },
 }
@@ -75,8 +79,14 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
     for n in &graph.nodes {
         let spec = registry
             .spec(&n.kind)
-            .ok_or_else(|| GraphError::UnknownStage { node: n.id.clone(), kind: n.kind.clone() })?;
-        let bad = |reason: String| GraphError::BadParams { node: n.id.clone(), reason };
+            .ok_or_else(|| GraphError::UnknownStage {
+                node: n.id.clone(),
+                kind: n.kind.clone(),
+            })?;
+        let bad = |reason: String| GraphError::BadParams {
+            node: n.id.clone(),
+            reason,
+        };
         let schema = serde_json::to_value(&spec.params_schema).map_err(|e| bad(e.to_string()))?;
         let validator = jsonschema::validator_for(&schema).map_err(|e| bad(e.to_string()))?;
         if let Some(e) = validator.iter_errors(&n.params).next() {
@@ -106,7 +116,11 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
         };
         // A stage with no ports on the offending side still rejects the edge.
         let expected = expected.copied().unwrap_or(e.kind);
-        return Err(GraphError::TypeMismatch { edge: i, expected, got: e.kind });
+        return Err(GraphError::TypeMismatch {
+            edge: i,
+            expected,
+            got: e.kind,
+        });
     }
     Ok(())
 }
@@ -125,7 +139,11 @@ mod tests {
     }
 
     fn node(id: &str, kind: &str, params: serde_json::Value) -> Node {
-        Node { id: NodeId(id.into()), kind: kind.into(), params }
+        Node {
+            id: NodeId(id.into()),
+            kind: kind.into(),
+            params,
+        }
     }
 
     #[test]
@@ -136,7 +154,11 @@ mod tests {
                 node("a", "passthrough", serde_json::json!({"kind": "iq"})),
                 node("b", "passthrough", serde_json::json!({"kind": "iq"})),
             ],
-            edges: vec![Edge { from: NodeId("a".into()), to: NodeId("b".into()), kind: StreamKind::Iq }],
+            edges: vec![Edge {
+                from: NodeId("a".into()),
+                to: NodeId("b".into()),
+                kind: StreamKind::Iq,
+            }],
         };
         let j = serde_json::to_string(&g).unwrap();
         assert_eq!(serde_json::from_str::<Graph>(&j).unwrap(), g);
@@ -199,20 +221,36 @@ mod tests {
                 node("a", "iq_out", serde_json::json!({})),
                 node("b", "audio_in", serde_json::json!({})),
             ],
-            edges: vec![Edge { from: NodeId("a".into()), to: NodeId("b".into()), kind: StreamKind::Iq }],
+            edges: vec![Edge {
+                from: NodeId("a".into()),
+                to: NodeId("b".into()),
+                kind: StreamKind::Iq,
+            }],
         };
         assert_eq!(
             validate(&g, &r),
-            Err(GraphError::TypeMismatch { edge: 0, expected: StreamKind::Audio, got: StreamKind::Iq })
+            Err(GraphError::TypeMismatch {
+                edge: 0,
+                expected: StreamKind::Audio,
+                got: StreamKind::Iq
+            })
         );
         // `from` lacking the kind reports its first output.
         let g2 = Graph {
-            edges: vec![Edge { from: NodeId("a".into()), to: NodeId("b".into()), kind: StreamKind::Audio }],
+            edges: vec![Edge {
+                from: NodeId("a".into()),
+                to: NodeId("b".into()),
+                kind: StreamKind::Audio,
+            }],
             ..g.clone()
         };
         assert_eq!(
             validate(&g2, &r),
-            Err(GraphError::TypeMismatch { edge: 0, expected: StreamKind::Iq, got: StreamKind::Audio })
+            Err(GraphError::TypeMismatch {
+                edge: 0,
+                expected: StreamKind::Iq,
+                got: StreamKind::Audio
+            })
         );
     }
 
@@ -232,9 +270,17 @@ mod tests {
                 node("p", "passthrough", serde_json::json!({"kind": "iq"})),
                 n("s", "sink_only"),
             ],
-            edges: vec![Edge { from: NodeId(from.into()), to: NodeId(to.into()), kind: StreamKind::Iq }],
+            edges: vec![Edge {
+                from: NodeId(from.into()),
+                to: NodeId(to.into()),
+                kind: StreamKind::Iq,
+            }],
         };
-        let want = Err(GraphError::TypeMismatch { edge: 0, expected: StreamKind::Iq, got: StreamKind::Iq });
+        let want = Err(GraphError::TypeMismatch {
+            edge: 0,
+            expected: StreamKind::Iq,
+            got: StreamKind::Iq,
+        });
         assert_eq!(validate(&mk("s", "p"), &r), want);
         assert_eq!(validate(&mk("p", "s"), &r), want);
     }
@@ -244,14 +290,25 @@ mod tests {
         let r = registry();
         let g = Graph {
             id: GraphId::new(),
-            nodes: vec![node("a", "passthrough", serde_json::json!({"kind": "Nope"}))],
+            nodes: vec![node(
+                "a",
+                "passthrough",
+                serde_json::json!({"kind": "Nope"}),
+            )],
             edges: vec![],
         };
-        assert!(matches!(validate(&g, &r), Err(GraphError::BadParams { .. })));
+        assert!(matches!(
+            validate(&g, &r),
+            Err(GraphError::BadParams { .. })
+        ));
         let g = Graph {
             id: GraphId::new(),
             nodes: vec![node("a", "passthrough", serde_json::json!({"kind": "iq"}))],
-            edges: vec![Edge { from: NodeId("a".into()), to: NodeId("z".into()), kind: StreamKind::Iq }],
+            edges: vec![Edge {
+                from: NodeId("a".into()),
+                to: NodeId("z".into()),
+                kind: StreamKind::Iq,
+            }],
         };
         assert_eq!(validate(&g, &r), Err(GraphError::DanglingEdge { edge: 0 }));
     }

@@ -32,7 +32,13 @@ pub type IqReceiver = tokio::sync::broadcast::Receiver<IqBlock>;
 #[derive(Debug, thiserror::Error)]
 pub enum PortError {
     #[error("{field} {value} out of range {min}..={max}")]
-    OutOfRange { field: &'static str, value: u64, min: u64, max: u64, suggested: Option<u64> },
+    OutOfRange {
+        field: &'static str,
+        value: u64,
+        min: u64,
+        max: u64,
+        suggested: Option<u64>,
+    },
     #[error("unsupported: {0}")]
     Unsupported(String),
     #[error("io: {0}")]

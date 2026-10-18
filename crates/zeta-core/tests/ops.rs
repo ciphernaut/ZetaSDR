@@ -6,15 +6,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use zeta_core::classify::StubClassifier;
 use zeta_core::job::JobState;
+use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, schema};
-use zeta_core::classify::StubClassifier;
-use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
-use zeta_core::types::JobId;
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, Selection, SourceId, Span, Timestamp};
+use zeta_core::types::JobId;
+use zeta_core::types::{
+    Capabilities, Claim, Hz, SampleFormat, Selection, SourceId, Span, Timestamp,
+};
 use zeta_source_file::{FileOpts, FileSource, fixtures, read_meta};
 
 /// A port tunable over 1 MHz..6 GHz that accepts any in-range request.
@@ -29,7 +31,10 @@ struct WidePort {
 
 impl WidePort {
     fn slow(id: &str) -> Self {
-        Self { slow: true, ..Self::new(id) }
+        Self {
+            slow: true,
+            ..Self::new(id)
+        }
     }
 
     fn new(id: &str) -> Self {
@@ -77,7 +82,12 @@ impl Port for WidePort {
 }
 
 fn cfg(dir: &Path) -> NodeConfig {
-    NodeConfig { state_dir: dir.join("state"), ring_seconds: 1.0, backends: vec![Backend::Cpu], resume: true }
+    NodeConfig {
+        state_dir: dir.join("state"),
+        ring_seconds: 1.0,
+        backends: vec![Backend::Cpu],
+        resume: true,
+    }
 }
 
 fn registry() -> StageRegistry {
@@ -88,7 +98,11 @@ fn registry() -> StageRegistry {
 
 fn file_source(dir: &Path) -> (Arc<FileSource>, Arc<dyn Port>) {
     let meta = fixtures::write_tone(dir);
-    let opts = FileOpts { realtime: false, block_samples: 4800, repeat: true };
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 4800,
+        repeat: true,
+    };
     let src = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
     let port: Arc<dyn Port> = src.clone();
     (src, port)
@@ -97,10 +111,26 @@ fn file_source(dir: &Path) -> (Arc<FileSource>, Arc<dyn Port>) {
 #[tokio::test]
 async fn ensure_out_of_range_suggests_dropped_zeros() {
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(cfg(dir.path()), registry(), vec![Arc::new(WidePort::new("hackrf0"))]).await.unwrap();
-    let op = Op::SourceEnsure { source: SourceId("hackrf0".into()), center_hz: Hz(101_500), bandwidth_hz: Hz(200_000) };
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    let op = Op::SourceEnsure {
+        source: SourceId("hackrf0".into()),
+        center_hz: Hz(101_500),
+        bandwidth_hz: Hz(200_000),
+    };
     match node.apply(op).await {
-        Err(OpError::OutOfRange { field, value, min, max, suggested }) => {
+        Err(OpError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+            suggested,
+        }) => {
             assert_eq!(field, "center_hz");
             assert_eq!((value, min, max), (101_500, 1_000_000, 6_000_000_000));
             assert_eq!(suggested, Some(101_500_000));
@@ -112,11 +142,24 @@ async fn ensure_out_of_range_suggests_dropped_zeros() {
 #[tokio::test]
 async fn ensure_unknown_source_lists_known() {
     let dir = tempfile::tempdir().unwrap();
-    let ports: Vec<Arc<dyn Port>> = vec![Arc::new(WidePort::new("rtl0")), Arc::new(WidePort::new("hackrf0"))];
-    let node = Node::open(cfg(dir.path()), registry(), ports).await.unwrap();
-    let op = Op::SourceEnsure { source: SourceId("nope".into()), center_hz: Hz(100_000_000), bandwidth_hz: Hz(200_000) };
+    let ports: Vec<Arc<dyn Port>> = vec![
+        Arc::new(WidePort::new("rtl0")),
+        Arc::new(WidePort::new("hackrf0")),
+    ];
+    let node = Node::open(cfg(dir.path()), registry(), ports)
+        .await
+        .unwrap();
+    let op = Op::SourceEnsure {
+        source: SourceId("nope".into()),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(200_000),
+    };
     match node.apply(op).await {
-        Err(OpError::Unknown { field, value, known }) => {
+        Err(OpError::Unknown {
+            field,
+            value,
+            known,
+        }) => {
             assert_eq!(field, "source");
             assert_eq!(value, "nope");
             assert_eq!(known, vec!["hackrf0".to_string(), "rtl0".to_string()]);
@@ -129,7 +172,9 @@ async fn ensure_unknown_source_lists_known() {
 async fn job_start_passthrough_then_list_then_stop() {
     let dir = tempfile::tempdir().unwrap();
     let (src, port) = file_source(dir.path());
-    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
     src.start();
     let op = Op::JobStart {
         kind: JobKind::Passthrough,
@@ -150,7 +195,10 @@ async fn job_start_passthrough_then_list_then_stop() {
         }
         other => panic!("expected Jobs, got {other:?}"),
     }
-    assert_eq!(node.apply(Op::JobStop { job: id.clone() }).await, Ok(OpResult::Ok));
+    assert_eq!(
+        node.apply(Op::JobStop { job: id.clone() }).await,
+        Ok(OpResult::Ok)
+    );
     match node.apply(Op::JobList {}).await {
         Ok(OpResult::Jobs(jobs)) => assert_eq!(jobs[0].state, JobState::Stopped),
         other => panic!("expected Jobs, got {other:?}"),
@@ -164,7 +212,9 @@ async fn selection(node: &Node, center_hz: u64, bandwidth_hz: u64) -> Selection 
     let mut earliest = None;
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(25)).await;
-        earliest = node.ring(&source).and_then(|r| r.read().unwrap().earliest());
+        earliest = node
+            .ring(&source)
+            .and_then(|r| r.read().unwrap().earliest());
         if earliest.is_some() {
             break;
         }
@@ -172,7 +222,10 @@ async fn selection(node: &Node, center_hz: u64, bandwidth_hz: u64) -> Selection 
     let start = earliest.expect("ring has data").0;
     Selection {
         source,
-        span: Span { start: Timestamp(start), end: Timestamp(start + 50_000_000) },
+        span: Span {
+            start: Timestamp(start),
+            end: Timestamp(start + 50_000_000),
+        },
         center_hz: Hz(center_hz),
         bandwidth_hz: Hz(bandwidth_hz),
     }
@@ -182,11 +235,18 @@ async fn selection(node: &Node, center_hz: u64, bandwidth_hz: u64) -> Selection 
 async fn iq_read_writes_sigmf_pair() {
     let dir = tempfile::tempdir().unwrap();
     let (src, port) = file_source(dir.path());
-    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
     src.start();
     let selection = selection(&node, 100_000_000, 48_000).await;
     let (rate, samples, path) = match node.apply(Op::IqRead { selection }).await {
-        Ok(OpResult::Iq { sample_rate_hz, samples, path, .. }) => (sample_rate_hz, samples, path),
+        Ok(OpResult::Iq {
+            sample_rate_hz,
+            samples,
+            path,
+            ..
+        }) => (sample_rate_hz, samples, path),
         other => panic!("expected Iq, got {other:?}"),
     };
     assert_eq!(rate, Hz(48_000));
@@ -206,12 +266,19 @@ async fn iq_read_writes_sigmf_pair() {
 async fn iq_read_labels_capture_centre_not_selection_centre() {
     let dir = tempfile::tempdir().unwrap();
     let (src, port) = file_source(dir.path());
-    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
     src.start();
     // A 10 kHz band 10 kHz above the ring's 100 MHz centre.
     let selection = selection(&node, 100_010_000, 10_000).await;
     let (center, bandwidth, path) = match node.apply(Op::IqRead { selection }).await {
-        Ok(OpResult::Iq { center_hz, bandwidth_hz, path, .. }) => (center_hz, bandwidth_hz, path),
+        Ok(OpResult::Iq {
+            center_hz,
+            bandwidth_hz,
+            path,
+            ..
+        }) => (center_hz, bandwidth_hz, path),
         other => panic!("expected Iq, got {other:?}"),
     };
     assert_eq!((center, bandwidth), (Hz(100_000_000), Hz(48_000)));
@@ -229,16 +296,25 @@ async fn iq_read_labels_capture_centre_not_selection_centre() {
 async fn source_ensure_during_job_start_does_not_retune() {
     let dir = tempfile::tempdir().unwrap();
     let port = Arc::new(WidePort::slow("hackrf0"));
-    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()]).await.unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
     let source = SourceId("hackrf0".into());
-    let job_tuning = Tuning { center_hz: Hz(100_000_000), bandwidth_hz: Hz(200_000) };
+    let job_tuning = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(200_000),
+    };
     let start = Op::JobStart {
         kind: JobKind::Passthrough,
         source: source.clone(),
         center_hz: job_tuning.center_hz,
         bandwidth_hz: job_tuning.bandwidth_hz,
     };
-    let ensure = Op::SourceEnsure { source, center_hz: Hz(433_000_000), bandwidth_hz: Hz(200_000) };
+    let ensure = Op::SourceEnsure {
+        source,
+        center_hz: Hz(433_000_000),
+        bandwidth_hz: Hz(200_000),
+    };
     // `join!` polls `start` first, so the job is inside its slow tune when `ensure` runs.
     let (started, ensured) = tokio::join!(node.apply(start), node.apply(ensure));
     let job: JobId = match started {
@@ -254,7 +330,10 @@ async fn source_ensure_during_job_start_does_not_retune() {
 }
 
 fn variants(op: &Value) -> &Vec<Value> {
-    op.get("oneOf").or_else(|| op.get("anyOf")).and_then(Value::as_array).expect("op schema has oneOf/anyOf")
+    op.get("oneOf")
+        .or_else(|| op.get("anyOf"))
+        .and_then(Value::as_array)
+        .expect("op schema has oneOf/anyOf")
 }
 
 #[test]
@@ -264,8 +343,17 @@ fn every_op_variant_denies_unknown_fields_and_requires_all() {
     assert_eq!(vs.len(), 13, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
-        let mut props: Vec<&String> = v["properties"].as_object().expect("properties").keys().collect();
-        let mut req: Vec<&str> = v["required"].as_array().expect("required").iter().map(|r| r.as_str().unwrap()).collect();
+        let mut props: Vec<&String> = v["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .collect();
+        let mut req: Vec<&str> = v["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
         props.sort();
         req.sort();
         assert_eq!(req, props, "{v}");
@@ -281,7 +369,11 @@ fn check_strict(v: &Value, path: &str) {
     match v {
         Value::Object(m) => {
             if let Some(Value::Object(props)) = m.get("properties") {
-                assert_eq!(m.get("additionalProperties"), Some(&Value::Bool(false)), "{path} allows extra fields");
+                assert_eq!(
+                    m.get("additionalProperties"),
+                    Some(&Value::Bool(false)),
+                    "{path} allows extra fields"
+                );
                 let mut want: Vec<&str> = props.keys().map(String::as_str).collect();
                 let mut req: Vec<&str> = m
                     .get("required")
@@ -296,7 +388,10 @@ fn check_strict(v: &Value, path: &str) {
                 check_strict(c, &format!("{path}.{k}"));
             }
         }
-        Value::Array(a) => a.iter().enumerate().for_each(|(i, c)| check_strict(c, &format!("{path}[{i}]"))),
+        Value::Array(a) => a
+            .iter()
+            .enumerate()
+            .for_each(|(i, c)| check_strict(c, &format!("{path}[{i}]"))),
         _ => {}
     }
 }
@@ -314,7 +409,9 @@ fn check_units(v: &Value, path: &str) {
         Value::Object(m) => {
             if let Some(Value::Object(props)) = m.get("properties") {
                 for name in props.keys() {
-                    let unit = ["freq", "rate", "bandwidth", "center"].iter().any(|w| name.contains(w));
+                    let unit = ["freq", "rate", "bandwidth", "center"]
+                        .iter()
+                        .any(|w| name.contains(w));
                     assert!(
                         !unit || name.ends_with("_hz") || name.ends_with("_baud"),
                         "{path}.{name} is a unit field without _hz/_baud"
@@ -325,7 +422,10 @@ fn check_units(v: &Value, path: &str) {
                 check_units(c, &format!("{path}.{k}"));
             }
         }
-        Value::Array(a) => a.iter().enumerate().for_each(|(i, c)| check_units(c, &format!("{path}[{i}]"))),
+        Value::Array(a) => a
+            .iter()
+            .enumerate()
+            .for_each(|(i, c)| check_units(c, &format!("{path}[{i}]"))),
         _ => {}
     }
 }
@@ -346,7 +446,12 @@ impl KnowledgeProvider for TestProvider {
     fn name(&self) -> &str {
         "test"
     }
-    async fn allocations(&self, region: &str, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Allocation> {
+    async fn allocations(
+        &self,
+        region: &str,
+        _center_hz: Hz,
+        _bandwidth_hz: Hz,
+    ) -> Vec<Allocation> {
         vec![Allocation {
             provider: "test".into(),
             region: region.into(),
@@ -364,11 +469,20 @@ impl KnowledgeProvider for TestProvider {
 #[tokio::test]
 async fn knowledge_lookup_op_returns_allocations_from_provider() {
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(cfg(dir.path()), registry(), vec![]).await.unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
     node.add_knowledge(Arc::new(TestProvider));
-    let op = Op::KnowledgeLookup { region: "AU".into(), center_hz: Hz(144_800_000), bandwidth_hz: Hz(25_000) };
+    let op = Op::KnowledgeLookup {
+        region: "AU".into(),
+        center_hz: Hz(144_800_000),
+        bandwidth_hz: Hz(25_000),
+    };
     match node.apply(op).await {
-        Ok(OpResult::Knowledge { allocations, signatures }) => {
+        Ok(OpResult::Knowledge {
+            allocations,
+            signatures,
+        }) => {
             assert_eq!(allocations.len(), 1);
             assert_eq!(allocations[0].provider, "test");
             assert_eq!(allocations[0].region, "AU");
@@ -382,9 +496,14 @@ async fn knowledge_lookup_op_returns_allocations_from_provider() {
 async fn classify_op_runs_stub_and_returns_empty_labels() {
     let dir = tempfile::tempdir().unwrap();
     let (src, port) = file_source(dir.path());
-    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
     node.add_classifier(Arc::new(StubClassifier));
     src.start();
     let selection = selection(&node, 100_000_000, 48_000).await;
-    assert_eq!(node.apply(Op::Classify { selection }).await, Ok(OpResult::Labels(vec![])));
+    assert_eq!(
+        node.apply(Op::Classify { selection }).await,
+        Ok(OpResult::Labels(vec![]))
+    );
 }

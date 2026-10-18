@@ -69,7 +69,10 @@ pub fn render(schema: &Value, field_craft: &str) -> String {
             json.push_str(&format!(",\"{f}\":{}", example_json(f, s, defs)));
         }
         json.push('}');
-        out.push_str(&format!("JSON: `{json}`\n\nCLI: `{}`\n", cli_form(name, &fields, defs)));
+        out.push_str(&format!(
+            "JSON: `{json}`\n\nCLI: `{}`\n",
+            cli_form(name, &fields, defs)
+        ));
         if let Some(n) = note(name) {
             out.push_str(&format!("\n{n}\n"));
         }
@@ -88,7 +91,12 @@ fn resolve<'a>(s: &'a Value, defs: &'a Value) -> (Option<&'a str>, &'a Value) {
 }
 
 fn required<'a>(def: &'a Value) -> Vec<&'a str> {
-    def["required"].as_array().into_iter().flatten().filter_map(Value::as_str).collect()
+    def["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
 }
 
 fn type_of(s: &Value, defs: &Value) -> String {
@@ -97,7 +105,12 @@ fn type_of(s: &Value, defs: &Value) -> String {
     match (ty, name) {
         ("integer", Some(n)) => format!("integer ({})", unit(n).unwrap_or(n)),
         ("string", Some(n)) if def["enum"].is_array() => {
-            let vals: Vec<&str> = def["enum"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+            let vals: Vec<&str> = def["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
             format!("string ({n}: {})", vals.join("|"))
         }
         ("object", Some(n)) => {
@@ -113,11 +126,15 @@ fn type_of(s: &Value, defs: &Value) -> String {
                             .map(|q| resolve(&pd["properties"][*q], defs).0.and_then(unit))
                             .collect();
                         let tail = match units.first() {
-                            Some(Some(u)) if units.iter().all(|x| *x == Some(*u)) => format!(": integer ({u})"),
+                            Some(Some(u)) if units.iter().all(|x| *x == Some(*u)) => {
+                                format!(": integer ({u})")
+                            }
                             _ => String::new(),
                         };
                         format!("{p}{{{}{tail}}}", subs.join(","))
-                    } else if let (Some(n), "object") = (item_name, item["type"].as_str().unwrap_or("")) {
+                    } else if let (Some(n), "object") =
+                        (item_name, item["type"].as_str().unwrap_or(""))
+                    {
                         format!("{p}[{n}: {}]", required(item).join(", "))
                     } else {
                         p.to_string()
@@ -167,8 +184,10 @@ fn example_json(field: &str, s: &Value, defs: &Value) -> String {
     if def["type"] != "object" {
         return example(field, s, defs).to_string();
     }
-    let parts: Vec<String> =
-        required(def).into_iter().map(|p| format!("\"{p}\":{}", example_json(p, &def["properties"][p], defs))).collect();
+    let parts: Vec<String> = required(def)
+        .into_iter()
+        .map(|p| format!("\"{p}\":{}", example_json(p, &def["properties"][p], defs)))
+        .collect();
     format!("{{{}}}", parts.join(","))
 }
 
@@ -186,7 +205,10 @@ fn cli_flags(field: &str, s: &Value, defs: &Value, out: &mut Vec<(String, String
                 if p == "span" {
                     cli_flags(p, &def["properties"][p], defs, out);
                 } else {
-                    out.push((flag.replace('_', "-"), value(p, &def["properties"][p], defs)));
+                    out.push((
+                        flag.replace('_', "-"),
+                        value(p, &def["properties"][p], defs),
+                    ));
                 }
             }
         }
@@ -231,7 +253,9 @@ pub fn run(check: bool) -> ExitCode {
         Ok(on_disk) => {
             let line = text.lines().zip(on_disk.lines()).position(|(a, b)| a != b);
             let at = line.unwrap_or_else(|| text.lines().count().min(on_disk.lines().count())) + 1;
-            eprintln!("zeta: AGENTS.md differs from the rendering (first difference at line {at}); regenerate with `zeta agents-md > AGENTS.md`");
+            eprintln!(
+                "zeta: AGENTS.md differs from the rendering (first difference at line {at}); regenerate with `zeta agents-md > AGENTS.md`"
+            );
             ExitCode::FAILURE
         }
         Err(e) => {

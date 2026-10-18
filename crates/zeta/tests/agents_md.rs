@@ -9,15 +9,30 @@ fn zeta() -> Command {
 
 #[test]
 fn rendering_lists_every_op_variant() {
-    let out = zeta().args(["--json", "schema"]).assert().success().get_output().stdout.clone();
+    let out = zeta()
+        .args(["--json", "schema"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let variants = v["value"]["op"]["oneOf"].as_array().unwrap();
     assert_eq!(variants.len(), 13);
-    let md = zeta().arg("agents-md").assert().success().get_output().stdout.clone();
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
     let md = String::from_utf8(md).unwrap();
     for variant in variants {
         let name = variant["properties"]["op"]["const"].as_str().unwrap();
-        assert!(md.contains(&format!("## {name}\n")), "missing section for {name}");
+        assert!(
+            md.contains(&format!("## {name}\n")),
+            "missing section for {name}"
+        );
     }
 }
 

@@ -8,7 +8,11 @@ use zeta_core::ops::{JobKind, Op, OpError};
 use zeta_core::types::{Hz, JobId, Selection, SourceId, Span, Timestamp};
 
 #[derive(Debug, Parser)]
-#[command(name = "zeta", version, about = "ZetaSDR node: apply one operation, or serve until Ctrl-C")]
+#[command(
+    name = "zeta",
+    version,
+    about = "ZetaSDR node: apply one operation, or serve until Ctrl-C"
+)]
 pub struct Cli {
     /// Node state directory [default: $XDG_STATE_HOME/zetasdr or ~/.local/state/zetasdr]
     #[arg(long, global = true, value_name = "PATH")]
@@ -183,7 +187,10 @@ impl From<SelectionArgs> for Selection {
     fn from(a: SelectionArgs) -> Self {
         Selection {
             source: SourceId(a.source),
-            span: Span { start: Timestamp(a.start_ns), end: Timestamp(a.end_ns) },
+            span: Span {
+                start: Timestamp(a.start_ns),
+                end: Timestamp(a.end_ns),
+            },
             center_hz: Hz(a.center_hz),
             bandwidth_hz: Hz(a.bandwidth_hz),
         }
@@ -204,9 +211,11 @@ impl Command {
         let job = |a: JobArg| JobId(a.job);
         Ok(Some(match self {
             Command::Source(SourceCmd::List) => Op::SourceList {},
-            Command::Source(SourceCmd::Ensure(b)) => {
-                Op::SourceEnsure { source: SourceId(b.source), center_hz: Hz(b.center_hz), bandwidth_hz: Hz(b.bandwidth_hz) }
-            }
+            Command::Source(SourceCmd::Ensure(b)) => Op::SourceEnsure {
+                source: SourceId(b.source),
+                center_hz: Hz(b.center_hz),
+                bandwidth_hz: Hz(b.bandwidth_hz),
+            },
             Command::Job(JobCmd::Start { kind, band: b }) => Op::JobStart {
                 kind: kind.into(),
                 source: SourceId(b.source),
@@ -216,14 +225,27 @@ impl Command {
             Command::Job(JobCmd::List) => Op::JobList {},
             Command::Job(JobCmd::Stop(a)) => Op::JobStop { job: job(a) },
             Command::Job(JobCmd::Context(a)) => Op::JobContext { job: job(a) },
-            Command::Iq(IqCmd::Read(s)) => Op::IqRead { selection: s.into() },
+            Command::Iq(IqCmd::Read(s)) => Op::IqRead {
+                selection: s.into(),
+            },
             Command::Stream(StreamCmd::List) => Op::StreamList {},
             Command::Graph(GraphCmd::Get(a)) => Op::GraphGet { job: job(a) },
-            Command::Graph(GraphCmd::Put { job: a, file }) => Op::GraphPut { job: job(a), graph: read_graph(&file)? },
-            Command::Knowledge(KnowledgeCmd::Lookup { region, center_hz, bandwidth_hz }) => {
-                Op::KnowledgeLookup { region, center_hz: Hz(center_hz), bandwidth_hz: Hz(bandwidth_hz) }
-            }
-            Command::Classify(s) => Op::Classify { selection: s.into() },
+            Command::Graph(GraphCmd::Put { job: a, file }) => Op::GraphPut {
+                job: job(a),
+                graph: read_graph(&file)?,
+            },
+            Command::Knowledge(KnowledgeCmd::Lookup {
+                region,
+                center_hz,
+                bandwidth_hz,
+            }) => Op::KnowledgeLookup {
+                region,
+                center_hz: Hz(center_hz),
+                bandwidth_hz: Hz(bandwidth_hz),
+            },
+            Command::Classify(s) => Op::Classify {
+                selection: s.into(),
+            },
             Command::Schema => Op::Schema {},
             Command::AgentsMd { .. } | Command::Serve => return Ok(None),
         }))
@@ -231,7 +253,9 @@ impl Command {
 }
 
 fn read_graph(path: &std::path::Path) -> Result<Graph, OpError> {
-    let other = |e: &dyn std::fmt::Display| OpError::Other { message: format!("{}: {e}", path.display()) };
+    let other = |e: &dyn std::fmt::Display| OpError::Other {
+        message: format!("{}: {e}", path.display()),
+    };
     let text = std::fs::read_to_string(path).map_err(|e| other(&e))?;
     serde_json::from_str(&text).map_err(|e| other(&e))
 }

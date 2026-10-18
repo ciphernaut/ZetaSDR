@@ -35,26 +35,52 @@ pub enum Op {
     /// fits the current band (`Tuning`) or is a `Conflict`. Runs under the
     /// lease manager's per-source gate, so it never interleaves with a job's
     /// lease-and-tune.
-    SourceEnsure { source: SourceId, center_hz: Hz, bandwidth_hz: Hz },
-    JobStart { kind: JobKind, source: SourceId, center_hz: Hz, bandwidth_hz: Hz },
+    SourceEnsure {
+        source: SourceId,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+    },
+    JobStart {
+        kind: JobKind,
+        source: SourceId,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+    },
     JobList {},
-    JobStop { job: JobId },
-    JobContext { job: JobId },
+    JobStop {
+        job: JobId,
+    },
+    JobContext {
+        job: JobId,
+    },
     /// Save the selection's span as a SigMF pair under `state_dir/captures`.
     /// The whole ring bandwidth is written: frequency sub-selection is not
     /// applied yet. The capture is labelled with the ring's centre; the
     /// selection's band is recorded as an annotation labelled `selection`.
-    IqRead { selection: Selection },
+    IqRead {
+        selection: Selection,
+    },
     StreamList {},
-    GraphGet { job: JobId },
+    GraphGet {
+        job: JobId,
+    },
     /// Replace a job's graph; a running job is restarted on it, keeping its id.
-    GraphPut { job: JobId, graph: Graph },
+    GraphPut {
+        job: JobId,
+        graph: Graph,
+    },
     /// Band-plan allocations in `region` and known signatures overlapping the
     /// band, from every registered knowledge provider.
-    KnowledgeLookup { region: String, center_hz: Hz, bandwidth_hz: Hz },
+    KnowledgeLookup {
+        region: String,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+    },
     /// Run every registered classifier over the selection's span of the
     /// source ring (no upstream features).
-    Classify { selection: Selection },
+    Classify {
+        selection: Selection,
+    },
     Schema {},
 }
 
@@ -100,7 +126,12 @@ pub struct SourceInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "result", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "result",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 #[schemars(deny_unknown_fields)]
 pub enum OpResult {
     Sources(Vec<SourceInfo>),
@@ -111,10 +142,19 @@ pub enum OpResult {
     /// `path` is the `.sigmf-meta` file; the data file sits beside it.
     /// `center_hz` and `bandwidth_hz` are the band actually written (the
     /// ring's), not the selection's.
-    Iq { sample_rate_hz: Hz, center_hz: Hz, bandwidth_hz: Hz, samples: usize, path: PathBuf },
+    Iq {
+        sample_rate_hz: Hz,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+        samples: usize,
+        path: PathBuf,
+    },
     Streams(Vec<StreamInfo>),
     Graph(Graph),
-    Knowledge { allocations: Vec<Allocation>, signatures: Vec<Signature> },
+    Knowledge {
+        allocations: Vec<Allocation>,
+        signatures: Vec<Signature>,
+    },
     Labels(Vec<Label>),
     Ok,
     Schema(serde_json::Value),
@@ -132,36 +172,64 @@ pub enum OpError {
         #[schemars(required)]
         suggested: Option<u64>,
     },
-    Conflict { source: SourceId, holders: Vec<JobId>, options: Vec<String> },
-    Unknown { field: String, value: String, known: Vec<String> },
+    Conflict {
+        source: SourceId,
+        holders: Vec<JobId>,
+        options: Vec<String>,
+    },
+    Unknown {
+        field: String,
+        value: String,
+        known: Vec<String>,
+    },
     /// Struct variants, not `Ring(RingError)`: flattening a tagged enum into
     /// this one makes a schema that cannot forbid extra fields.
-    Ring { detail: RingError },
-    Graph { detail: GraphError },
+    Ring {
+        detail: RingError,
+    },
+    Graph {
+        detail: GraphError,
+    },
     /// A struct variant, not `Other(String)`: an internally tagged enum cannot
     /// carry a bare string.
-    Other { message: String },
+    Other {
+        message: String,
+    },
 }
 
 // Hand-written: thiserror treats a field named `source` as the error source.
 impl std::fmt::Display for OpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpError::OutOfRange { field, value, min, max, suggested } => {
+            OpError::OutOfRange {
+                field,
+                value,
+                min,
+                max,
+                suggested,
+            } => {
                 write!(f, "{field} {value} out of range {min}..={max}")?;
                 match suggested {
                     Some(s) => write!(f, "; did you mean {s}?"),
                     None => Ok(()),
                 }
             }
-            OpError::Conflict { source, holders, options } => write!(
+            OpError::Conflict {
+                source,
+                holders,
+                options,
+            } => write!(
                 f,
                 "source {} is held by {:?}; options: {}",
                 source.0,
                 holders.iter().map(|j| j.0.as_str()).collect::<Vec<_>>(),
                 options.join("; ")
             ),
-            OpError::Unknown { field, value, known } => {
+            OpError::Unknown {
+                field,
+                value,
+                known,
+            } => {
                 write!(f, "unknown {field} {value:?}; known: {}", known.join(", "))
             }
             OpError::Ring { detail } => write!(f, "{detail}"),
@@ -204,30 +272,52 @@ pub fn schema() -> serde_json::Value {
 }
 
 fn other(e: impl std::fmt::Display) -> OpError {
-    OpError::Other { message: e.to_string() }
+    OpError::Other {
+        message: e.to_string(),
+    }
 }
 
 fn range(field: &str, value: u64, min: u64, max: u64) -> Result<(), OpError> {
     if (min..=max).contains(&value) {
         return Ok(());
     }
-    Err(OpError::OutOfRange { field: field.into(), value, min, max, suggested: suggest(value, min, max) })
+    Err(OpError::OutOfRange {
+        field: field.into(),
+        value,
+        min,
+        max,
+        suggested: suggest(value, min, max),
+    })
 }
 
 fn unknown_source(node: &Node, source: &SourceId) -> OpError {
     let mut known: Vec<String> = node.ports().into_iter().map(|(id, _)| id.0).collect();
     known.sort();
-    OpError::Unknown { field: "source".into(), value: source.0.clone(), known }
+    OpError::Unknown {
+        field: "source".into(),
+        value: source.0.clone(),
+        known,
+    }
 }
 
 fn unknown_job(node: &Node, job: &JobId) -> OpError {
     let known = node.job_list().into_iter().map(|r| r.id.0).collect();
-    OpError::Unknown { field: "job".into(), value: job.0.clone(), known }
+    OpError::Unknown {
+        field: "job".into(),
+        value: job.0.clone(),
+        known,
+    }
 }
 
 fn port_error(e: PortError) -> OpError {
     match e {
-        PortError::OutOfRange { field, value, min, max, suggested } => OpError::OutOfRange {
+        PortError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+            suggested,
+        } => OpError::OutOfRange {
             field: field.into(),
             value,
             min,
@@ -240,7 +330,16 @@ fn port_error(e: PortError) -> OpError {
 
 fn lease_error(e: LeaseError) -> OpError {
     match e {
-        LeaseError::Conflict { source, holders, options, .. } => OpError::Conflict { source, holders, options },
+        LeaseError::Conflict {
+            source,
+            holders,
+            options,
+            ..
+        } => OpError::Conflict {
+            source,
+            holders,
+            options,
+        },
         LeaseError::Port(p) => port_error(p),
     }
 }
@@ -257,11 +356,27 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
 
 /// The source's port, once `want` is checked against its declared ranges, so
 /// the corrective error never depends on the port's own `tune`.
-fn checked_port(node: &Node, source: &SourceId, want: &Tuning) -> Result<std::sync::Arc<dyn Port>, OpError> {
-    let port = node.port(source).ok_or_else(|| unknown_source(node, source))?;
+fn checked_port(
+    node: &Node,
+    source: &SourceId,
+    want: &Tuning,
+) -> Result<std::sync::Arc<dyn Port>, OpError> {
+    let port = node
+        .port(source)
+        .ok_or_else(|| unknown_source(node, source))?;
     let caps = port.capabilities();
-    range("center_hz", want.center_hz.0, caps.tune_min_hz.value().0, caps.tune_max_hz.value().0)?;
-    range("bandwidth_hz", want.bandwidth_hz.0, 1, caps.max_bandwidth_hz.value().0)?;
+    range(
+        "center_hz",
+        want.center_hz.0,
+        caps.tune_min_hz.value().0,
+        caps.tune_max_hz.value().0,
+    )?;
+    range(
+        "bandwidth_hz",
+        want.bandwidth_hz.0,
+        1,
+        caps.max_bandwidth_hz.value().0,
+    )?;
     Ok(port)
 }
 
@@ -273,7 +388,11 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 .into_iter()
                 .map(|(id, capabilities)| SourceInfo {
                     current: node.port(&id).and_then(|p| p.current()),
-                    holders: node.lease_holders(&id).into_iter().map(|(j, _)| j).collect(),
+                    holders: node
+                        .lease_holders(&id)
+                        .into_iter()
+                        .map(|(j, _)| j)
+                        .collect(),
                     id,
                     capabilities,
                 })
@@ -281,13 +400,31 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             v.sort_by(|a, b| a.id.0.cmp(&b.id.0));
             Ok(OpResult::Sources(v))
         }
-        Op::SourceEnsure { source, center_hz, bandwidth_hz } => {
-            let want = Tuning { center_hz, bandwidth_hz };
+        Op::SourceEnsure {
+            source,
+            center_hz,
+            bandwidth_hz,
+        } => {
+            let want = Tuning {
+                center_hz,
+                bandwidth_hz,
+            };
             let port = checked_port(node, &source, &want)?;
-            node.tune_if_unheld(port.as_ref(), want).await.map(OpResult::Tuning).map_err(lease_error)
+            node.tune_if_unheld(port.as_ref(), want)
+                .await
+                .map(OpResult::Tuning)
+                .map_err(lease_error)
         }
-        Op::JobStart { kind, source, center_hz, bandwidth_hz } => {
-            let tuning = Tuning { center_hz, bandwidth_hz };
+        Op::JobStart {
+            kind,
+            source,
+            center_hz,
+            bandwidth_hz,
+        } => {
+            let tuning = Tuning {
+                center_hz,
+                bandwidth_hz,
+            };
             checked_port(node, &source, &tuning)?;
             let graph = kind.expand(&source, tuning);
             node.job_start(kind.name(), source, tuning, graph)
@@ -296,8 +433,15 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 .map_err(|e| node_error(node, e))
         }
         Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),
-        Op::JobStop { job } => node.job_stop(&job).await.map(|()| OpResult::Ok).map_err(|e| node_error(node, e)),
-        Op::JobContext { job } => node.job_context(&job).map(OpResult::Context).ok_or_else(|| unknown_job(node, &job)),
+        Op::JobStop { job } => node
+            .job_stop(&job)
+            .await
+            .map(|()| OpResult::Ok)
+            .map_err(|e| node_error(node, e)),
+        Op::JobContext { job } => node
+            .job_context(&job)
+            .map(OpResult::Context)
+            .ok_or_else(|| unknown_job(node, &job)),
         Op::IqRead { selection } => iq_read(node, selection),
         Op::StreamList {} => {
             let mut v = node.bus().list();
@@ -310,16 +454,25 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             .find(|r| r.id == job)
             .map(|r| OpResult::Graph(r.graph))
             .ok_or_else(|| unknown_job(node, &job)),
-        Op::GraphPut { job, graph } => {
-            node.job_graph_put(&job, graph).await.map(|()| OpResult::Ok).map_err(|e| node_error(node, e))
-        }
-        Op::KnowledgeLookup { region, center_hz, bandwidth_hz } => {
+        Op::GraphPut { job, graph } => node
+            .job_graph_put(&job, graph)
+            .await
+            .map(|()| OpResult::Ok)
+            .map_err(|e| node_error(node, e)),
+        Op::KnowledgeLookup {
+            region,
+            center_hz,
+            bandwidth_hz,
+        } => {
             let (mut allocations, mut signatures) = (Vec::new(), Vec::new());
             for p in node.knowledge() {
                 allocations.extend(p.allocations(&region, center_hz, bandwidth_hz).await);
                 signatures.extend(p.signatures(center_hz, bandwidth_hz).await);
             }
-            Ok(OpResult::Knowledge { allocations, signatures })
+            Ok(OpResult::Knowledge {
+                allocations,
+                signatures,
+            })
         }
         Op::Classify { selection } => classify(node, selection).await,
         Op::Schema {} => Ok(OpResult::Schema(schema())),
@@ -331,13 +484,19 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     if node.port(&sel.source).is_none() {
         return Err(unknown_source(node, &sel.source));
     }
-    let ring = node.ring(&sel.source).ok_or(OpError::Ring { detail: RingError::Empty })?;
+    let ring = node.ring(&sel.source).ok_or(OpError::Ring {
+        detail: RingError::Empty,
+    })?;
     let (rate, samples) = {
         let r = ring.read().unwrap();
-        let samples = r.read(sel.span).map_err(|detail| OpError::Ring { detail })?;
+        let samples = r
+            .read(sel.span)
+            .map_err(|detail| OpError::Ring { detail })?;
         (r.sample_rate_hz(), samples)
     };
-    Ok(OpResult::Labels(node.classifiers().run_all(&samples, rate, None).await))
+    Ok(OpResult::Labels(
+        node.classifiers().run_all(&samples, rate, None).await,
+    ))
 }
 
 /// Write the selection's span from the source ring as a cf32_le SigMF pair.
@@ -345,12 +504,20 @@ fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     if node.port(&sel.source).is_none() {
         return Err(unknown_source(node, &sel.source));
     }
-    let empty = || OpError::Ring { detail: RingError::Empty };
+    let empty = || OpError::Ring {
+        detail: RingError::Empty,
+    };
     let ring = node.ring(&sel.source).ok_or_else(empty)?;
     let (rate, center, samples) = {
         let r = ring.read().unwrap();
-        let samples = r.read(sel.span).map_err(|detail| OpError::Ring { detail })?;
-        (r.sample_rate_hz(), r.center_hz().ok_or_else(empty)?, samples)
+        let samples = r
+            .read(sel.span)
+            .map_err(|detail| OpError::Ring { detail })?;
+        (
+            r.sample_rate_hz(),
+            r.center_hz().ok_or_else(empty)?,
+            samples,
+        )
     };
     let dir = node.state_dir().join("captures");
     std::fs::create_dir_all(&dir).map_err(other)?;
@@ -376,7 +543,13 @@ fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     let path = dir.join(format!("{name}.sigmf-meta"));
     std::fs::write(&path, serde_json::to_vec_pretty(&meta).map_err(other)?).map_err(other)?;
     // Complex baseband: the written band is as wide as the sample rate.
-    Ok(OpResult::Iq { sample_rate_hz: rate, center_hz: center, bandwidth_hz: rate, samples: samples.len(), path })
+    Ok(OpResult::Iq {
+        sample_rate_hz: rate,
+        center_hz: center,
+        bandwidth_hz: rate,
+        samples: samples.len(),
+        path,
+    })
 }
 
 #[cfg(test)]
@@ -385,25 +558,58 @@ mod tests {
 
     #[test]
     fn suggest_scales_by_powers_of_ten() {
-        assert_eq!(suggest(101_500, 1_000_000, 6_000_000_000), Some(101_500_000));
-        assert_eq!(suggest(100_000, 100_000_000, 100_000_000), Some(100_000_000));
-        assert_eq!(suggest(2_400_000, 24_000_000, 1_766_000_000), Some(24_000_000));
-        assert_eq!(suggest(101_500_000_000, 1_000_000, 6_000_000_000), Some(101_500_000));
-        assert_eq!(suggest(101_500_001_000, 1_000_000, 6_000_000_000), Some(101_500_001));
+        assert_eq!(
+            suggest(101_500, 1_000_000, 6_000_000_000),
+            Some(101_500_000)
+        );
+        assert_eq!(
+            suggest(100_000, 100_000_000, 100_000_000),
+            Some(100_000_000)
+        );
+        assert_eq!(
+            suggest(2_400_000, 24_000_000, 1_766_000_000),
+            Some(24_000_000)
+        );
+        assert_eq!(
+            suggest(101_500_000_000, 1_000_000, 6_000_000_000),
+            Some(101_500_000)
+        );
+        assert_eq!(
+            suggest(101_500_001_000, 1_000_000, 6_000_000_000),
+            Some(101_500_001)
+        );
         assert_eq!(suggest(7, 1_000_000_000, 6_000_000_000), None);
         assert_eq!(suggest(7_000_000_001, 1_000_000, 6_000_000_000), None);
     }
 
     #[test]
     fn wire_shapes_are_tagged() {
-        let op = Op::JobStop { job: JobId("j".into()) };
-        assert_eq!(serde_json::to_value(&op).unwrap(), serde_json::json!({"op": "job_stop", "job": "j"}));
-        assert_eq!(serde_json::to_value(Op::JobList {}).unwrap(), serde_json::json!({"op": "job_list"}));
-        assert_eq!(serde_json::to_value(OpResult::Ok).unwrap(), serde_json::json!({"result": "ok"}));
-        let e = OpError::Ring { detail: RingError::Empty };
+        let op = Op::JobStop {
+            job: JobId("j".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&op).unwrap(),
+            serde_json::json!({"op": "job_stop", "job": "j"})
+        );
+        assert_eq!(
+            serde_json::to_value(Op::JobList {}).unwrap(),
+            serde_json::json!({"op": "job_list"})
+        );
+        assert_eq!(
+            serde_json::to_value(OpResult::Ok).unwrap(),
+            serde_json::json!({"result": "ok"})
+        );
+        let e = OpError::Ring {
+            detail: RingError::Empty,
+        };
         let want = serde_json::json!({"error": "ring", "detail": {"cause": "empty"}});
         assert_eq!(serde_json::to_value(&e).unwrap(), want);
-        let e = OpError::Other { message: "m".into() };
-        assert_eq!(serde_json::from_value::<OpError>(serde_json::to_value(&e).unwrap()).unwrap(), e);
+        let e = OpError::Other {
+            message: "m".into(),
+        };
+        assert_eq!(
+            serde_json::from_value::<OpError>(serde_json::to_value(&e).unwrap()).unwrap(),
+            e
+        );
     }
 }

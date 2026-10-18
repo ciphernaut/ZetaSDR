@@ -9,7 +9,12 @@ use crate::types::{JobId, SourceId};
 
 #[derive(Debug)]
 pub enum LeaseError {
-    Conflict { source: SourceId, holders: Vec<JobId>, current: Tuning, options: Vec<String> },
+    Conflict {
+        source: SourceId,
+        holders: Vec<JobId>,
+        current: Tuning,
+        options: Vec<String>,
+    },
     Port(PortError),
 }
 
@@ -17,7 +22,12 @@ pub enum LeaseError {
 impl std::fmt::Display for LeaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LeaseError::Conflict { source, holders, current, options } => write!(
+            LeaseError::Conflict {
+                source,
+                holders,
+                current,
+                options,
+            } => write!(
                 f,
                 "source {} is held by {:?} at {:?}; options: {}",
                 source.0,
@@ -54,7 +64,10 @@ pub struct LeaseManager {
 
 fn band(t: &Tuning) -> (u64, u64) {
     let half = t.bandwidth_hz.0 / 2;
-    (t.center_hz.0.saturating_sub(half), t.center_hz.0.saturating_add(half))
+    (
+        t.center_hz.0.saturating_sub(half),
+        t.center_hz.0.saturating_add(half),
+    )
 }
 
 /// Whether the band `want` lies inside the band `cur`.
@@ -90,7 +103,13 @@ impl LeaseManager {
         want: Tuning,
     ) -> Result<Tuning, LeaseError> {
         let source = port.id().clone();
-        let gate = self.gates.lock().unwrap().entry(source.clone()).or_default().clone();
+        let gate = self
+            .gates
+            .lock()
+            .unwrap()
+            .entry(source.clone())
+            .or_default()
+            .clone();
         let _guard = gate.lock().await;
         {
             let mut leases = self.leases.lock().unwrap();
@@ -105,7 +124,12 @@ impl LeaseManager {
                     }
                     let holders = leases[&source].iter().map(|(j, _)| j.clone()).collect();
                     let options = conflict_options(port, &want, &cur);
-                    return Err(LeaseError::Conflict { source, holders, current: cur, options });
+                    return Err(LeaseError::Conflict {
+                        source,
+                        holders,
+                        current: cur,
+                        options,
+                    });
                 }
             }
         }
@@ -121,9 +145,19 @@ impl LeaseManager {
     /// gate as `ensure`, so it cannot interleave with a job's lease-and-tune.
     /// A held port is never retuned: the request either fits its current band
     /// (which is returned) or is a conflict.
-    pub async fn tune_if_unheld(&self, port: &dyn Port, want: Tuning) -> Result<Tuning, LeaseError> {
+    pub async fn tune_if_unheld(
+        &self,
+        port: &dyn Port,
+        want: Tuning,
+    ) -> Result<Tuning, LeaseError> {
         let source = port.id().clone();
-        let gate = self.gates.lock().unwrap().entry(source.clone()).or_default().clone();
+        let gate = self
+            .gates
+            .lock()
+            .unwrap()
+            .entry(source.clone())
+            .or_default()
+            .clone();
         let _guard = gate.lock().await;
         let held = self.holders(&source);
         let Some((_, first)) = held.first() else {
@@ -135,7 +169,12 @@ impl LeaseManager {
         }
         let options = conflict_options(port, &want, &cur);
         let holders = held.into_iter().map(|(j, _)| j).collect();
-        Err(LeaseError::Conflict { source, holders, current: cur, options })
+        Err(LeaseError::Conflict {
+            source,
+            holders,
+            current: cur,
+            options,
+        })
     }
 
     /// Drop every lease held by `holder`.
@@ -149,7 +188,12 @@ impl LeaseManager {
 
     /// Current holders of `source`, in insertion order.
     pub fn holders(&self, source: &SourceId) -> Vec<(JobId, Tuning)> {
-        self.leases.lock().unwrap().get(source).cloned().unwrap_or_default()
+        self.leases
+            .lock()
+            .unwrap()
+            .get(source)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -217,7 +261,10 @@ mod tests {
     }
 
     fn t(c: u64, b: u64) -> Tuning {
-        Tuning { center_hz: Hz(c), bandwidth_hz: Hz(b) }
+        Tuning {
+            center_hz: Hz(c),
+            bandwidth_hz: Hz(b),
+        }
     }
 
     #[tokio::test]
@@ -230,10 +277,17 @@ mod tests {
 
     #[tokio::test]
     async fn fitting_request_shares_without_retune() {
-        let (p, m, j1, j2) = (FakePort::new(), LeaseManager::new(), JobId::new(), JobId::new());
+        let (p, m, j1, j2) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+        );
         let first = t(100_000_000, 10_000_000);
         m.ensure(&p, j1.clone(), first).await.unwrap();
-        m.ensure(&p, j2.clone(), t(102_000_000, 1_000_000)).await.unwrap();
+        m.ensure(&p, j2.clone(), t(102_000_000, 1_000_000))
+            .await
+            .unwrap();
         assert_eq!(p.current(), Some(first));
         let ids: Vec<JobId> = m.holders(p.id()).into_iter().map(|(j, _)| j).collect();
         assert_eq!(ids, vec![j1, j2]);
@@ -241,11 +295,18 @@ mod tests {
 
     #[tokio::test]
     async fn conflicting_request_errors_naming_holders() {
-        let (p, m, j1, j2) = (FakePort::new(), LeaseManager::new(), JobId::new(), JobId::new());
+        let (p, m, j1, j2) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+        );
         let first = t(100_000_000, 1_000_000);
         m.ensure(&p, j1.clone(), first).await.unwrap();
         match m.ensure(&p, j2, t(433_000_000, 1_000_000)).await {
-            Err(LeaseError::Conflict { holders, options, .. }) => {
+            Err(LeaseError::Conflict {
+                holders, options, ..
+            }) => {
                 assert_eq!(holders, vec![j1]);
                 assert!(options.iter().any(|o| o.contains("scan")));
             }
@@ -256,8 +317,15 @@ mod tests {
 
     #[tokio::test]
     async fn release_frees_port() {
-        let (p, m, j1, j2) = (FakePort::new(), LeaseManager::new(), JobId::new(), JobId::new());
-        m.ensure(&p, j1.clone(), t(100_000_000, 1_000_000)).await.unwrap();
+        let (p, m, j1, j2) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+        );
+        m.ensure(&p, j1.clone(), t(100_000_000, 1_000_000))
+            .await
+            .unwrap();
         m.release(&j1);
         let want = t(433_000_000, 1_000_000);
         assert_eq!(m.ensure(&p, j2, want).await.unwrap(), want);
@@ -273,7 +341,10 @@ mod tests {
             m.ensure(&p, j1, t(100_000_000, 1_000_000)),
             m.ensure(&p, j2, t(433_000_000, 1_000_000)),
         );
-        let conflicts = [&a, &b].iter().filter(|r| matches!(r, Err(LeaseError::Conflict { .. }))).count();
+        let conflicts = [&a, &b]
+            .iter()
+            .filter(|r| matches!(r, Err(LeaseError::Conflict { .. })))
+            .count();
         assert_eq!(conflicts, 1);
         assert_eq!([&a, &b].iter().filter(|r| r.is_ok()).count(), 1);
         assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);

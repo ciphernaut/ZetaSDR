@@ -38,7 +38,10 @@ mod tests {
 
     #[test]
     fn state_serialises_tagged_snake_case() {
-        assert_eq!(serde_json::to_value(JobState::Running).unwrap(), serde_json::json!({"state": "running"}));
+        assert_eq!(
+            serde_json::to_value(JobState::Running).unwrap(),
+            serde_json::json!({"state": "running"})
+        );
         let f = JobState::Failed { reason: "x".into() };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v, serde_json::json!({"state": "failed", "reason": "x"}));
