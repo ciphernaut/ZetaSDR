@@ -16,7 +16,7 @@ use crate::session::{self, Ctx, Status};
 /// Highest centre frequency a KiwiSDR tunes, in Hz.
 const TUNE_MAX_HZ: u64 = 30_000_000;
 /// Widest IQ passband: `±6000` Hz around the centre.
-const MAX_BANDWIDTH_HZ: u64 = 12_000;
+pub(crate) const MAX_BANDWIDTH_HZ: u64 = 12_000;
 /// Blocks buffered per receiver.
 const BROADCAST_CAPACITY: usize = 64;
 
@@ -183,7 +183,9 @@ impl KiwiSource {
             (st.fault.is_some(), st.audio_rate)
         };
         let rate = rate.filter(|_| !fault && !s.task.is_finished())?;
-        if s.band != t {
+        // The passband is always the full capture band, so only a new centre
+        // needs commands.
+        if s.band.center_hz != t.center_hz {
             s.cmds.send(t).ok()?;
             s.band = t;
         }
@@ -225,8 +227,8 @@ impl Port for KiwiSource {
 
     /// Opens a session when there is none or the port is faulted (clearing
     /// the fault once the Kiwi has answered `sample_rate` and `audio_rate`);
-    /// on a live session sends the tuning commands unless the band is
-    /// unchanged. Returns the capture band: the requested centre, `audio_rate`
+    /// on a live session sends the tuning commands unless the centre is
+    /// unchanged (the passband is always the full capture band). Returns the capture band: the requested centre, `audio_rate`
     /// wide.
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let bw = t.bandwidth_hz.0;

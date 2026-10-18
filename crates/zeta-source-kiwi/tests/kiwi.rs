@@ -130,7 +130,9 @@ async fn tune_handshakes_and_sends_exact_commands() {
         "SET genattn=0",
         "SET gen=0 mix=-1",
         "SET ident_user=zetasdr",
-        "SET mod=iq low_cut=-5000 high_cut=5000 freq=7100.000",
+        // Full capture passband whatever the requested bandwidth (see
+        // `tune_sends_full_capture_passband`).
+        "SET mod=iq low_cut=-6000 high_cut=6000 freq=7100.000",
         "SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50",
         "SET compression=0",
         "SET keepalive",
@@ -158,10 +160,11 @@ async fn tune_handshakes_and_sends_exact_commands() {
     );
     assert_eq!(fake.connections(), 1);
 
-    // A new band on the live session: the three tuning commands only.
+    // A new centre on the live session: the three tuning commands only, the
+    // passband still the full capture band rather than the requested 2 kHz.
     src.tune(tuning(7_100_250, 2_000)).await.unwrap();
     let want_retune = [
-        "SET mod=iq low_cut=-1000 high_cut=1000 freq=7100.250",
+        "SET mod=iq low_cut=-6000 high_cut=6000 freq=7100.250",
         "SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50",
         "SET compression=0",
     ];
@@ -172,6 +175,35 @@ async fn tune_handshakes_and_sends_exact_commands() {
     );
     assert_eq!(not_keepalive(fake.commands())[before.len()..], want_retune);
     assert_eq!(fake.connections(), 1);
+}
+
+/// The IQ passband is always the whole capture band (`±6000` Hz): `tune`
+/// reports `audio_rate` wide and the lease admits other jobs' bands inside
+/// it, so narrowing to the requested band is left to the `channel` stage.
+#[tokio::test]
+async fn tune_sends_full_capture_passband() {
+    let fake = fake(vec![FakeReply::Ok], None).await;
+    let src = source(&fake, &[10]);
+    let _rx = src.subscribe();
+    let got = src.tune(tuning(7_100_000, 4_000)).await.unwrap();
+    assert_eq!(got, tuning(7_100_000, 12_000));
+    assert_eq!(src.current(), Some(got));
+    let full = "SET mod=iq low_cut=-6000 high_cut=6000 freq=7100.000";
+    let has = |c: &str| fake.commands().iter().any(|x| x == c);
+    assert!(wait_until(1_000, || has(full) && has("SET AR OK in=12000 out=44100")).await);
+    assert!(
+        !fake.commands().iter().any(|c| c.contains("low_cut=-2000")),
+        "{:?}",
+        fake.commands()
+    );
+
+    // Same centre, another bandwidth: the capture band is unchanged, so
+    // nothing is re-sent.
+    let before = not_keepalive(fake.commands());
+    assert_eq!(src.tune(tuning(7_100_000, 1_000)).await.unwrap(), got);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(not_keepalive(fake.commands()), before);
+    assert_eq!(src.current(), Some(got));
 }
 
 #[tokio::test]
@@ -298,7 +330,8 @@ async fn drop_mid_stream_reconnects_and_t0_stays_monotonic() {
         blocks.push(next_block(&mut rx).await);
     }
     assert!(fake.connections() >= 2, "{}", fake.connections());
-    let mod_cmd = "SET mod=iq low_cut=-5000 high_cut=5000 freq=7100.000";
+    // Full capture passband, not the requested 10 kHz.
+    let mod_cmd = "SET mod=iq low_cut=-6000 high_cut=6000 freq=7100.000";
     let count = |p: &dyn Fn(&String) -> bool| fake.commands().iter().filter(|c| p(c)).count();
     assert!(count(&|c| c == mod_cmd) >= 2);
     assert!(count(&|c| c.starts_with("SET auth")) >= 2);

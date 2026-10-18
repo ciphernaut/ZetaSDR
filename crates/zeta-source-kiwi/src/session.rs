@@ -39,6 +39,7 @@ use crate::proto::{
     snd_url, tag,
 };
 use crate::source::KiwiConfig;
+use crate::source::MAX_BANDWIDTH_HZ;
 
 /// Largest websocket message or frame accepted; larger ones end the connection.
 pub(crate) const MAX_FRAME_BYTES: usize = 1 << 20;
@@ -99,9 +100,13 @@ fn badp_meaning(n: u8) -> &'static str {
     }
 }
 
+/// The IQ passband is always the full capture band (`±6000` Hz), never the
+/// requested bandwidth: `tune` reports the capture band as `audio_rate` wide
+/// and the lease admits other jobs' bands inside it, so a narrower passband
+/// would hand them stopband noise. Narrowing is the `channel` stage's job.
 fn tuning_cmds(t: Tuning) -> [String; 3] {
     [
-        cmd_mod_iq(t.center_hz.0, t.bandwidth_hz.0),
+        cmd_mod_iq(t.center_hz.0, MAX_BANDWIDTH_HZ),
         CMD_AGC.to_string(),
         CMD_COMPRESSION_OFF.to_string(),
     ]
