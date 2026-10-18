@@ -108,7 +108,16 @@ impl KnowledgeProvider for StaticKnowledge {
     async fn signatures(&self, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Signature> {
         self.signatures
             .iter()
-            .filter(|s| overlaps(s.min_hz, s.max_hz, center_hz, bandwidth_hz))
+            .filter(|s| {
+                // A signature occupies its bandwidth around every centre in
+                // `[min_hz, max_hz]`, not just that range.
+                let half = s.bandwidth_hz.0 / 2;
+                let (lo, hi) = (
+                    s.min_hz.0.saturating_sub(half),
+                    s.max_hz.0.saturating_add(half),
+                );
+                overlaps(Hz(lo), Hz(hi), center_hz, bandwidth_hz)
+            })
             .cloned()
             .collect()
     }
@@ -128,6 +137,16 @@ mod tests {
             .expect("APRS present");
         assert_eq!(aprs.decoder.as_deref(), Some("aprs"));
         assert!(k.signatures(Hz(100_000_000), Hz(25_000)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lookup_near_aprs_within_its_bandwidth_matches() {
+        let k = StaticKnowledge::builtin();
+        let sigs = k.signatures(Hz(144_805_000), Hz(1_000)).await;
+        assert!(sigs.iter().any(|s| s.name == "APRS"), "{sigs:?}");
+        // Beyond APRS's 12.5 kHz (6.25 kHz either side of 144.800 MHz).
+        let far = k.signatures(Hz(144_810_000), Hz(1_000)).await;
+        assert!(!far.iter().any(|s| s.name == "APRS"), "{far:?}");
     }
 
     #[tokio::test]
