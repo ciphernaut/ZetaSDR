@@ -253,7 +253,7 @@ pub fn suggest(value: u64, min: u64, max: u64) -> Option<u64> {
         let p = 10u64.pow(k);
         let v = if value < min {
             value.checked_mul(p)?
-        } else if value > max && value % p == 0 {
+        } else if value > max && value.is_multiple_of(p) {
             value / p
         } else {
             return None;

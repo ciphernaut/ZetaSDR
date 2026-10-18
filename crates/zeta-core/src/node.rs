@@ -505,12 +505,12 @@ impl Inner {
                 let sid = iq.as_ref().expect("root nodes have the IQ stream");
                 inputs.push(self.bus.subscribe(sid).expect("registered"));
             }
-            if outputs.is_empty() {
-                if let Some(&k) = stage.spec().outputs.first() {
-                    let sid = self.bus.register(k, prov.clone());
-                    streams.push(sid.clone());
-                    outputs.push(sid);
-                }
+            if outputs.is_empty()
+                && let Some(&k) = stage.spec().outputs.first()
+            {
+                let sid = self.bus.register(k, prov.clone());
+                streams.push(sid.clone());
+                outputs.push(sid);
             }
             let (params, bus, cancel) = (n.params.clone(), self.bus.clone(), token.clone());
             set.spawn(async move { stage.run(params, inputs, outputs, bus, cancel).await });
@@ -536,16 +536,16 @@ impl Inner {
     /// `persist_errors`; the job will be resumed on the next `open`.
     fn finish(&self, id: &JobId, state: JobState) {
         let mut jobs = self.jobs.lock().unwrap();
-        if let Some(entry) = jobs.get_mut(id) {
-            if entry.record.state == JobState::Running {
-                entry.record.state = state;
-                entry.cancel = None;
-                if let Err(e) = persist(&self.jobs_dir, &entry.record) {
-                    self.persist_errors
-                        .lock()
-                        .unwrap()
-                        .push(format!("job {}: {e}", id.0));
-                }
+        if let Some(entry) = jobs.get_mut(id)
+            && entry.record.state == JobState::Running
+        {
+            entry.record.state = state;
+            entry.cancel = None;
+            if let Err(e) = persist(&self.jobs_dir, &entry.record) {
+                self.persist_errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("job {}: {e}", id.0));
             }
         }
     }

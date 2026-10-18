@@ -90,7 +90,7 @@ fn resolve<'a>(s: &'a Value, defs: &'a Value) -> (Option<&'a str>, &'a Value) {
     }
 }
 
-fn required<'a>(def: &'a Value) -> Vec<&'a str> {
+fn required(def: &Value) -> Vec<&str> {
     def["required"]
         .as_array()
         .into_iter()

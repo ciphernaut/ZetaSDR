@@ -114,23 +114,21 @@ impl LeaseManager {
         {
             let mut leases = self.leases.lock().unwrap();
             let held = leases.get(&source).is_some_and(|v| !v.is_empty());
-            if held {
-                if let Some(cur) = port.current() {
-                    if fits(&want, &cur) {
-                        let v = leases.get_mut(&source).unwrap();
-                        v.retain(|(j, _)| j != &holder);
-                        v.push((holder, want));
-                        return Ok(cur);
-                    }
-                    let holders = leases[&source].iter().map(|(j, _)| j.clone()).collect();
-                    let options = conflict_options(port, &want, &cur);
-                    return Err(LeaseError::Conflict {
-                        source,
-                        holders,
-                        current: cur,
-                        options,
-                    });
+            if held && let Some(cur) = port.current() {
+                if fits(&want, &cur) {
+                    let v = leases.get_mut(&source).unwrap();
+                    v.retain(|(j, _)| j != &holder);
+                    v.push((holder, want));
+                    return Ok(cur);
                 }
+                let holders = leases[&source].iter().map(|(j, _)| j.clone()).collect();
+                let options = conflict_options(port, &want, &cur);
+                return Err(LeaseError::Conflict {
+                    source,
+                    holders,
+                    current: cur,
+                    options,
+                });
             }
         }
         let got = port.tune(want).await?;
