@@ -168,10 +168,10 @@ on its stdio (`crates/zeta-plugin/src/wire.rs` has the full definition):
 - control messages are one line of JSON; data frames are a 0x00 byte, a length-prefixed JSON
   header (the websocket's frame message) and a length-prefixed body (`iq`: interleaved `f32` LE,
   SigMF `cf32_le`; `audio`: `f32` LE; `event` and `text`: no body);
-- the plugin's first message is `hello` (kind, input and output stream kinds, params schema),
-  within 5 s; the host answers `run` with the params and output stream ids, then streams frames,
-  `lagged` and `closed`, and ends with `stop`. stderr is copied to the node's stderr prefixed
-  `[plugin KIND]`.
+- the plugin's first message is `hello` (kind, its one input stream kind, output stream kinds,
+  params schema), within 5 s; a `hello` with more than one input kind is refused; the host
+  answers `run` with the params and output stream ids, then streams frames, `lagged` and
+  `closed`, and ends with `stop`. stderr is copied to the node's stderr prefixed `[plugin KIND]`.
 
 The node probes every `--plugin` at startup (one-shot commands too, so each costs a process
 start); a failed probe, or a `hello` whose kind differs from `KIND`, exits 1 naming the flag.

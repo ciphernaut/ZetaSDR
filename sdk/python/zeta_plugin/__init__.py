@@ -224,6 +224,10 @@ def read_message(stream):
 def run(kind, inputs, outputs, params_schema, on_frame, on_lagged=None):
     """Be a plugin: say hello, wait for `run`, call back per frame until the input closes.
 
+    `inputs` lists the one stream kind the plugin accepts (e.g. `["iq"]`); the host
+    refuses a hello with more than one input kind ("multiple input kinds are not
+    supported yet"). `outputs` lists the output stream kinds.
+
     `on_frame(params, frame)` returns `None`, a `Frame` or a list of `Frame`s; each is sent
     on the first output stream of its kind. `on_lagged(params, missed)` is told how many
     input frames the host dropped. Returns on `closed`, `stop` or end of input (the process

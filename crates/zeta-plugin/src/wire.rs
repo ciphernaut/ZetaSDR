@@ -162,6 +162,8 @@ impl From<ControlIn> for Control {
 pub struct Hello {
     pub protocol: u32,
     pub kind: String,
+    /// The accepted input kind; the host refuses more than one (multiple
+    /// input kinds are not supported yet) and names it in `run.inputs`.
     pub inputs: Vec<StreamKind>,
     pub outputs: Vec<StreamKind>,
     /// Must pass [`check_strict_schema`] or the host refuses the plugin.

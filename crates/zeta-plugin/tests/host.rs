@@ -244,6 +244,20 @@ async fn probe_rejects_loose_params_schema() {
     assert!(e.contains("additionalProperties"), "{e}");
 }
 
+/// `run.inputs` names one kind, so a plugin may accept only one.
+#[tokio::test]
+async fn probe_rejects_multiple_input_kinds() {
+    let e = probe("fake", fake("multi-input"))
+        .await
+        .err()
+        .expect("probe fails")
+        .to_string();
+    assert!(
+        e.starts_with("plugin fake") && e.contains("multiple input kinds are not supported yet"),
+        "{e}"
+    );
+}
+
 #[tokio::test]
 async fn probe_rejects_kind_mismatch() {
     let e = probe("gain", fake("echo"))

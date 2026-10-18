@@ -185,6 +185,11 @@ fn check_hello(kind: &str, h: &Hello) -> Result<schemars::Schema, String> {
     if h.inputs.is_empty() {
         return Err("its hello declares no inputs".into());
     }
+    // `run.inputs` names one kind (the stage has one input port), so the
+    // kind declared must be the kind in use.
+    if h.inputs.len() > 1 {
+        return Err("multiple input kinds are not supported yet".into());
+    }
     for (side, kinds) in [("input", &h.inputs), ("output", &h.outputs)] {
         if let Some(k) = kinds
             .iter()
@@ -492,7 +497,7 @@ impl Stage for ExternalStage {
         let run = encode_control(&Control::Run(Run {
             protocol: PROTOCOL,
             params,
-            // `inputs` is non-empty (checked by probe); one port, its first declared kind.
+            // `inputs` has exactly one kind (checked by probe): the kind in use.
             inputs: vec![PortKind {
                 kind: self.spec.inputs[0],
             }],

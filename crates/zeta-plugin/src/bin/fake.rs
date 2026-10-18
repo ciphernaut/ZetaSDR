@@ -8,6 +8,7 @@
 //! - `wrong-kind`: declares `[iq]` outputs, answers the first input frame with audio.
 //! - `no-hello`: says nothing for 10 s, then exits.
 //! - `loose-schema`: its `params_schema` lacks `additionalProperties`.
+//! - `multi-input`: declares `[iq, audio]` inputs.
 //! - `error`: sends `{"type":"error","message":"boom"}` after `run`, then exits 1.
 //! - `lag-report`: iq in, event out: `{"lagged":N}` per `lagged`, `{"samples":n}` per
 //!   frame.
@@ -104,7 +105,11 @@ async fn main() {
     send(&encode_control(&Control::Hello(Hello {
         protocol: PROTOCOL,
         kind: "fake".into(),
-        inputs: vec![StreamKind::Iq],
+        inputs: if mode == "multi-input" {
+            vec![StreamKind::Iq, StreamKind::Audio]
+        } else {
+            vec![StreamKind::Iq]
+        },
         outputs,
         params_schema,
     })));
