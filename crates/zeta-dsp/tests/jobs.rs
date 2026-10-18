@@ -427,4 +427,5 @@ async fn measure_job_measures_only_its_band() {
     let center = ev["center_hz"].as_u64().unwrap();
     assert!(center.abs_diff(CENTER + 12_000) <= 200, "{ev}");
     assert!(ev["bandwidth_hz"].as_u64().unwrap() <= 12_500, "{ev}");
+    assert_eq!(ev["label"]["name"], "fsk", "{ev}");
 }

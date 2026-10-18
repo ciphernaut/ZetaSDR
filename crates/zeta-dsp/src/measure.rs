@@ -52,6 +52,22 @@ const FSK_PEAK_DB: f32 = 6.0;
 /// FSK: tone separation range.
 const FSK_SEP_HZ: (f64, f64) = (500.0, 3_000.0);
 
+/// Noise floor of [`measure_band`]: this percentile of the in-band bins. A
+/// signal may fill more than half of a channel (APRS: Carson ~10.4 kHz in
+/// 12.5 kHz), so the median would be signal, not noise.
+const FLOOR_PERCENTILE: usize = 15;
+
+/// The `pct`th percentile of `v` (the value at index `len · pct / 100` when
+/// sorted); 0 when empty.
+fn percentile(v: &[f32], pct: usize) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(f32::total_cmp);
+    s[(s.len() * pct / 100).min(s.len() - 1)]
+}
+
 /// Median of `v` (upper median for an even length); 0 when empty.
 fn median(v: &[f32]) -> f32 {
     if v.is_empty() {
@@ -298,7 +314,7 @@ fn symbol_rate(iq: &[Complex<f32>], rate_hz: u64, cv: f32, bandwidth_hz: u64) ->
 
 /// Measure one IQ block centred at `block_center_hz`.
 ///
-/// From the `SIZE`-bin Hann power spectrum: noise floor = median bin;
+/// From the `SIZE`-bin Hann power spectrum: noise floor = 15th-percentile bin;
 /// `snr_db` = peak − floor; occupied band = the run of bins around the peak at
 /// or above floor + 6 dB, giving `bandwidth_hz` (run length × bin width, at
 /// least one bin) and `center_hz` (block centre plus the run's centre offset,
@@ -331,7 +347,7 @@ pub fn measure_band(
     let half_bins = ((bandwidth_hz as f64 / 2.0 / bin_hz).floor() as usize).min(SIZE / 2);
     let first = SIZE / 2 - half_bins;
     let db = &spectrum(iq)[first..(SIZE / 2 + half_bins + 1).min(SIZE)];
-    let floor = median(db);
+    let floor = percentile(db, FLOOR_PERCENTILE);
     let peak = argmax(db);
     let gap = (GAP_HZ / bin_hz).floor() as usize;
     let (lo, hi) = occupied(db, peak, floor + OCCUPIED_DB, gap);
@@ -474,15 +490,31 @@ fn classify_block(
     ("unknown", 0.5, "no layer-1 rule matched".into())
 }
 
-/// `measure` takes no parameters.
+/// `measure` parameters.
 #[derive(JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct MeasureParams {
     /// Measure only the central `bandwidth_hz` of each block (see
-    /// [`measure_band`]); absent, the whole block.
-    #[serde(default)]
+    /// [`measure_band`]); `null` measures the whole block.
+    #[serde(deserialize_with = "nullable_u64")]
+    #[schemars(required, schema_with = "nullable_bandwidth")]
     pub bandwidth_hz: Option<u64>,
+}
+
+/// Deserialize a required `Option<u64>`: a missing key is an error, `null` is `None`.
+fn nullable_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    <Option<u64> as Deserialize>::deserialize(d)
+}
+
+/// Schema of the required, nullable `bandwidth_hz`: `["integer","null"]`.
+fn nullable_bandwidth(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint64",
+        "minimum": 0,
+        "description": "Measure only the central bandwidth_hz of each block; null measures the whole block."
+    })
 }
 
 /// Accumulates IQ until it holds at least one second (`rate_hz` samples),
@@ -637,6 +669,45 @@ mod tests {
     }
 
     #[test]
+    fn measure_bandwidth_param_is_required_nullable() {
+        let parse = |v| serde_json::from_value::<MeasureParams>(v);
+        assert!(parse(serde_json::json!({})).is_err());
+        assert_eq!(
+            parse(serde_json::json!({"bandwidth_hz": null}))
+                .unwrap()
+                .bandwidth_hz,
+            None
+        );
+        assert_eq!(
+            parse(serde_json::json!({"bandwidth_hz": 12_500}))
+                .unwrap()
+                .bandwidth_hz,
+            Some(12_500)
+        );
+    }
+
+    #[tokio::test]
+    async fn layer1_labels_aprs_fsk_in_12k5_band() {
+        for offset in [0i64, 12_000] {
+            let mut iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", RATE as u32, offset as f64);
+            awgn(&mut iq, 20.0, 5);
+            let band = Band {
+                offset_hz: offset,
+                bandwidth_hz: Hz(12_500),
+            };
+            let chan = extract_offset(&iq, RATE, offset, 12_500, RATE).unwrap().0;
+            let f = measure_band(&chan, RATE, CENTER, 12_500);
+            eprintln!("offset {offset}: {f:?}");
+            let labels = Layer1Classifier.classify(&iq, Hz(RATE), band, None).await;
+            eprintln!("offset {offset}: {labels:?}");
+            assert_eq!(labels.len(), 1, "{labels:?}");
+            assert_eq!(labels[0].name, "fsk", "offset {offset}: {labels:?}");
+            let baud = f.symbol_rate_baud.expect("a keying line").0;
+            assert!(baud.abs_diff(1_200) <= 60, "offset {offset}: {baud} Bd");
+        }
+    }
+
+    #[test]
     fn measure_noise_is_noise() {
         let mut iq = vec![Complex::new(0.0f32, 0.0); RATE as usize];
         awgn(&mut iq, 0.0, 11);
@@ -739,7 +810,7 @@ mod tests {
         let h = tokio::spawn(async move {
             MeasureStage::new()
                 .run(
-                    serde_json::json!({}),
+                    serde_json::json!({"bandwidth_hz": null}),
                     vec![rx_in],
                     vec![out],
                     bus,
@@ -808,7 +879,7 @@ mod tests {
         let h = tokio::spawn(async move {
             MeasureStage::new()
                 .run(
-                    serde_json::json!({}),
+                    serde_json::json!({"bandwidth_hz": null}),
                     vec![rx_in],
                     vec![out],
                     bus,

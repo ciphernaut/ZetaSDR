@@ -121,3 +121,53 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    /// Every object schema with properties denies unknown fields and requires
+    /// every property (optional values are required-nullable).
+    fn check_strict(v: &Value, path: &str) {
+        match v {
+            Value::Object(m) => {
+                if let Some(Value::Object(props)) = m.get("properties") {
+                    assert_eq!(
+                        m.get("additionalProperties"),
+                        Some(&Value::Bool(false)),
+                        "{path} allows extra fields"
+                    );
+                    let mut want: Vec<&str> = props.keys().map(String::as_str).collect();
+                    let mut req: Vec<&str> = m
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    want.sort();
+                    req.sort();
+                    assert_eq!(req, want, "{path} does not require every property");
+                }
+                for (k, c) in m {
+                    check_strict(c, &format!("{path}.{k}"));
+                }
+            }
+            Value::Array(a) => a
+                .iter()
+                .enumerate()
+                .for_each(|(i, c)| check_strict(c, &format!("{path}[{i}]"))),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn stage_params_schemas_are_strict() {
+        let mut reg = zeta_core::stage::StageRegistry::new();
+        super::register_all(&mut reg);
+        let stages = reg.describe();
+        let stages = stages.as_array().unwrap();
+        assert!(stages.iter().any(|s| s["kind"] == "measure"));
+        for st in stages {
+            check_strict(&st["params_schema"], &format!("stages.{}", st["kind"]));
+        }
+    }
+}

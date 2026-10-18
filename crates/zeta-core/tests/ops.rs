@@ -513,6 +513,10 @@ fn nested_schemas_are_strict() {
     for key in ["op", "result", "error"] {
         check_strict(&s[key], key);
     }
+    // Stage params, as `node.schema()["stages"]` publishes them.
+    for st in registry().describe().as_array().unwrap() {
+        check_strict(&st["params_schema"], &format!("stages.{}", st["kind"]));
+    }
     // stream_tail: provenance fields on every frame, and the missed count.
     let fs = &s["result"]["$defs"]["FrameSummary"];
     for f in ["source", "job", "channel"] {
