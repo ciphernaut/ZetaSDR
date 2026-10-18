@@ -714,3 +714,54 @@ async fn reversed_span_is_bad_span_even_before_ring_data() {
         })
     );
 }
+
+#[tokio::test]
+async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
+    use zeta_core::graph::{Graph, GraphError, GraphId, Node as GraphNode, NodeId};
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let start = Op::JobStart {
+        kind: JobKind::Passthrough,
+        source: SourceId("file0".into()),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(48_000),
+    };
+    let job = match node.apply(start).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected Job, got {other:?}"),
+    };
+    let before = node.job_list()[0].graph.clone();
+    let graph = Graph {
+        id: GraphId::new(),
+        nodes: vec![GraphNode {
+            id: NodeId("x".into()),
+            kind: "nope".into(),
+            params: serde_json::json!({}),
+        }],
+        edges: vec![],
+    };
+    match node
+        .apply(Op::GraphPut {
+            job: job.clone(),
+            graph,
+        })
+        .await
+    {
+        Err(OpError::Graph {
+            detail: GraphError::UnknownStage { kind, known, .. },
+        }) => {
+            assert_eq!(kind, "nope");
+            assert_eq!(known, vec!["passthrough".to_string()]);
+        }
+        other => panic!("expected UnknownStage, got {other:?}"),
+    }
+    let rec = &node.job_list()[0];
+    assert_eq!(rec.id, job);
+    assert_eq!(rec.state, JobState::Running);
+    assert_eq!(rec.graph, before);
+    assert_eq!(node.lease_holders(&SourceId("file0".into())).len(), 1);
+}
