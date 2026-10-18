@@ -3764,6 +3764,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeta-source-kiwi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "num-complex",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "zeta-core",
+ "zeta-source-kiwi",
+]
+
+[[package]]
 name = "zeta-ws"
 version = "0.1.0"
 dependencies = [
