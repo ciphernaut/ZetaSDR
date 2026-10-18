@@ -34,14 +34,39 @@ pub struct Label {
     pub evidence: String,
 }
 
+/// The band a classifier analyses within an IQ block: its centre's offset
+/// from the block centre (negative below) and its width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Band {
+    pub offset_hz: i64,
+    pub bandwidth_hz: Hz,
+}
+
+impl Band {
+    /// The whole block at `sample_rate_hz`.
+    pub fn whole(sample_rate_hz: Hz) -> Band {
+        Band {
+            offset_hz: 0,
+            bandwidth_hz: sample_rate_hz,
+        }
+    }
+
+    /// Whether this band covers the whole block: centred, at least as wide as the rate.
+    pub fn is_whole(&self, sample_rate_hz: Hz) -> bool {
+        self.offset_hz == 0 && self.bandwidth_hz.0 >= sample_rate_hz.0
+    }
+}
+
 #[async_trait]
 pub trait Classifier: Send + Sync {
     fn name(&self) -> &str;
     fn layer(&self) -> u8;
+    /// Labels for `band` of `iq`, a block sampled at `sample_rate_hz`.
     async fn classify(
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
+        band: Band,
         features: Option<&FeatureRecord>,
     ) -> Vec<Label>;
 }
@@ -61,6 +86,7 @@ impl Classifier for StubClassifier {
         &self,
         _iq: &[Complex<f32>],
         _sample_rate_hz: Hz,
+        _band: Band,
         _features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
         Vec::new()
@@ -77,18 +103,20 @@ impl ClassifierSet {
         self.classifiers.push(c);
     }
 
-    /// Every classifier's labels, lowest layer first; registration order within a layer.
+    /// Every classifier's labels for `band` of `iq`, lowest layer first;
+    /// registration order within a layer.
     pub async fn run_all(
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
+        band: Band,
         features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
         let mut ordered: Vec<&Arc<dyn Classifier>> = self.classifiers.iter().collect();
         ordered.sort_by_key(|c| c.layer());
         let mut labels = Vec::new();
         for c in ordered {
-            labels.extend(c.classify(iq, sample_rate_hz, features).await);
+            labels.extend(c.classify(iq, sample_rate_hz, band, features).await);
         }
         labels
     }
@@ -112,6 +140,7 @@ mod tests {
             &self,
             _: &[Complex<f32>],
             _: Hz,
+            _: Band,
             _: Option<&FeatureRecord>,
         ) -> Vec<Label> {
             vec![Label {
@@ -131,7 +160,7 @@ mod tests {
         set.register(Arc::new(StubClassifier));
         set.register(Arc::new(Fixed(2, "b")));
         let names: Vec<String> = set
-            .run_all(&[], Hz(48_000), None)
+            .run_all(&[], Hz(48_000), Band::whole(Hz(48_000)), None)
             .await
             .into_iter()
             .map(|l| l.name)

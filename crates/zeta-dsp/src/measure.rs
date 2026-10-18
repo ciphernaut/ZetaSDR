@@ -10,11 +10,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::classify::{Classifier, FeatureRecord, Label};
+use zeta_core::classify::{Band, Classifier, FeatureRecord, Label};
+use zeta_core::ops::channel_rate_hz;
 use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Baud, Hz, Provenance, StreamId, StreamKind, Timestamp};
 
+use crate::channel::extract_offset;
 use crate::fft::{Window, power_spectrum_db};
 use crate::{frame_span, run_map};
 
@@ -303,6 +305,19 @@ fn symbol_rate(iq: &[Complex<f32>], rate_hz: u64, cv: f32, bandwidth_hz: u64) ->
 /// clamped at 0). `burst` compares 10 ms chunk powers; `symbol_rate_baud` is
 /// the keying line of [`keying_signal`].
 pub fn measure(iq: &[Complex<f32>], rate_hz: u64, block_center_hz: u64) -> FeatureRecord {
+    measure_band(iq, rate_hz, block_center_hz, rate_hz)
+}
+
+/// [`measure`] restricted to the central `bandwidth_hz` of the block: floor,
+/// peak and occupied run use only the bins within `± bandwidth_hz / 2` of the
+/// centre (at least one bin), so the skirts of a channel filter wider than its
+/// band are not measured as occupied.
+pub fn measure_band(
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    block_center_hz: u64,
+    bandwidth_hz: u64,
+) -> FeatureRecord {
     if iq.is_empty() || rate_hz == 0 {
         return FeatureRecord {
             bandwidth_hz: Hz(0),
@@ -312,12 +327,15 @@ pub fn measure(iq: &[Complex<f32>], rate_hz: u64, block_center_hz: u64) -> Featu
             burst: false,
         };
     }
-    let db = spectrum(iq);
     let bin_hz = rate_hz as f64 / SIZE as f64;
-    let floor = median(&db);
-    let peak = argmax(&db);
+    let half_bins = ((bandwidth_hz as f64 / 2.0 / bin_hz).floor() as usize).min(SIZE / 2);
+    let first = SIZE / 2 - half_bins;
+    let db = &spectrum(iq)[first..(SIZE / 2 + half_bins + 1).min(SIZE)];
+    let floor = median(db);
+    let peak = argmax(db);
     let gap = (GAP_HZ / bin_hz).floor() as usize;
-    let (lo, hi) = occupied(&db, peak, floor + OCCUPIED_DB, gap);
+    let (lo, hi) = occupied(db, peak, floor + OCCUPIED_DB, gap);
+    let (lo, hi) = (lo + first, hi + first);
     let bins = (hi - lo + 1) as f64;
     let offset = ((lo + hi) as f64 / 2.0 - (SIZE / 2) as f64) * bin_hz;
     let center = (block_center_hz as i64)
@@ -460,7 +478,12 @@ fn classify_block(
 #[derive(JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
-pub struct MeasureParams {}
+pub struct MeasureParams {
+    /// Measure only the central `bandwidth_hz` of each block (see
+    /// [`measure_band`]); absent, the whole block.
+    #[serde(default)]
+    pub bandwidth_hz: Option<u64>,
+}
 
 /// Accumulates IQ until it holds at least one second (`rate_hz` samples),
 /// then emits one Event for that window: its [`FeatureRecord`] fields plus
@@ -512,7 +535,7 @@ impl Stage for MeasureStage {
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
     ) -> Result<(), StageError> {
-        let _: MeasureParams = serde_json::from_value(params)
+        let p: MeasureParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("measure params: {e}")))?;
         let Some(out) = outputs.first().cloned() else {
             return Err(StageError::Failed("expected 1 output".into()));
@@ -548,7 +571,7 @@ impl Stage for MeasureStage {
             if rate == 0 || (buf.len() as u64) < rate {
                 return Ok(Vec::new());
             }
-            let f = measure(&buf, rate, center);
+            let f = measure_band(&buf, rate, center, p.bandwidth_hz.unwrap_or(rate));
             let label = layer1_label(&f, &buf, rate);
             let mut ev = serde_json::to_value(&f)
                 .map_err(|e| StageError::Failed(format!("measure: {e}")))?;
@@ -564,8 +587,9 @@ impl Stage for MeasureStage {
     }
 }
 
-/// Layer-1 classifier: [`measure`] then [`layer1_label`]; upstream features
-/// are not used, the block is measured afresh.
+/// Layer-1 classifier: [`measure`] then [`layer1_label`] on the requested
+/// band, extracted at [`channel_rate_hz`] unless it is the whole block;
+/// upstream features are not used, the band is measured afresh.
 pub struct Layer1Classifier;
 
 #[async_trait]
@@ -580,10 +604,22 @@ impl Classifier for Layer1Classifier {
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
+        band: Band,
         _features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
-        let f = measure(iq, sample_rate_hz.0, 0);
-        vec![layer1_label(&f, iq, sample_rate_hz.0)]
+        let rate = sample_rate_hz.0;
+        if band.is_whole(sample_rate_hz) {
+            let f = measure(iq, rate, 0);
+            return vec![layer1_label(&f, iq, rate)];
+        }
+        let bw = band.bandwidth_hz.0;
+        let Ok((chan, out_rate)) =
+            extract_offset(iq, rate, band.offset_hz, bw, channel_rate_hz(rate, bw))
+        else {
+            return Vec::new();
+        };
+        let f = measure_band(&chan, out_rate, 0, bw);
+        vec![layer1_label(&f, &chan, out_rate)]
     }
 }
 

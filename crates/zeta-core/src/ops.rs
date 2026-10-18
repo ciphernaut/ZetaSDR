@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{CaptureMeta, write_cf32};
-use crate::classify::Label;
+use crate::classify::{Band, Label};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::JobRecord;
 use crate::knowledge::{Allocation, Signature};
@@ -95,10 +95,8 @@ pub enum Op {
         center_hz: Hz,
         bandwidth_hz: Hz,
     },
-    /// Run every registered classifier over the selection's span of the
-    /// source ring (no upstream features). The analysis covers the whole
-    /// source band; the selection band is validated but not used to narrow
-    /// the analysis in this release.
+    /// Run every registered classifier over the selection's band and span of
+    /// the source ring (no upstream features).
     Classify {
         selection: Selection,
     },
@@ -130,8 +128,8 @@ const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 /// Built-in job kinds; each expands to a graph. `fm_demod` and `aprs_decode`
 /// channelise the job band at the narrowest exact divisor of the source rate
 /// that is at least 48 kHz and at least the band; `spectrum` covers the whole
-/// capture band. `measure` covers the whole source band; the job band is
-/// validated but not used to narrow the analysis in this release.
+/// capture band. `measure` channelises the job band the same way and
+/// measures only that band, reporting its absolute `center_hz`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
@@ -156,7 +154,10 @@ impl JobKind {
 
     /// Whether the kind's graph has a `channel` node, so depends on the source rate.
     fn channelised(&self) -> bool {
-        matches!(self, JobKind::FmDemod | JobKind::AprsDecode)
+        matches!(
+            self,
+            JobKind::FmDemod | JobKind::AprsDecode | JobKind::Measure
+        )
     }
 
     /// The kind's graph for `tuning` on a source sampling at `source_rate_hz`
@@ -196,15 +197,33 @@ impl JobKind {
                 }],
                 edges: vec![],
             },
-            JobKind::Measure => Graph {
-                id: GraphId::new(),
-                nodes: vec![GraphNode {
-                    id: NodeId::new(),
-                    kind: "measure".into(),
-                    params: serde_json::json!({}),
-                }],
-                edges: vec![],
-            },
+            JobKind::Measure => {
+                let (channel, measure) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": out,
+                            }),
+                        },
+                        GraphNode {
+                            id: measure.clone(),
+                            kind: "measure".into(),
+                            params: serde_json::json!({"bandwidth_hz": tuning.bandwidth_hz.0}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: measure,
+                        kind: StreamKind::Iq,
+                    }],
+                }
+            }
             JobKind::Spectrum => Graph {
                 id: GraphId::new(),
                 nodes: vec![GraphNode {
@@ -879,11 +898,16 @@ fn check_band(sel: &Selection, center: Hz, rate: Hz) -> Result<(), OpError> {
     )
 }
 
-/// Run the classifier set over the selection's span of the source ring.
+/// Run the classifier set over the selection's band and span of the source ring.
 async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
-    let (rate, _, samples) = ring_samples(node, &sel)?;
+    let (rate, center, samples) = ring_samples(node, &sel)?;
+    // `check_band` has proved the band lies inside the ring's.
+    let band = Band {
+        offset_hz: sel.center_hz.0 as i64 - center.0 as i64,
+        bandwidth_hz: sel.bandwidth_hz,
+    };
     Ok(OpResult::Labels(
-        node.classifiers().run_all(&samples, rate, None).await,
+        node.classifiers().run_all(&samples, rate, band, None).await,
     ))
 }
 

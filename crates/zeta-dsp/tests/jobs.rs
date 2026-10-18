@@ -388,3 +388,43 @@ async fn aprs_decode_job_decodes_at_12_khz() {
     assert_eq!(ev["src"], "VK3ABC");
     assert_eq!(ev["fcs_ok"], true);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn measure_job_measures_only_its_band() {
+    const CENTER: u64 = 144_800_000;
+    let dir = tempfile::tempdir().unwrap();
+    // APRS 12 kHz above centre, an FM tone 10 dB stronger 12 kHz below it.
+    let aprs = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 12_000.0);
+    let audio = tone(48_000, aprs.len(), 1_000.0, 1.0);
+    let fm = nbfm_modulate(&audio, 48_000, 48_000, 2_500.0, -12_000.0);
+    let iq: Vec<_> = aprs.iter().zip(&fm).map(|(a, t)| a + t * 3.16).collect();
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 4_800,
+        repeat: true,
+    };
+    let node = node_over(dir.path(), &iq, 48_000, CENTER, opts).await;
+    let id = start(&node, JobKind::Measure, CENTER + 12_000, 12_500).await;
+    let stream = job_stream(&node, &id, StreamKind::Event).await;
+    let mut rx = node.bus().subscribe(&stream).unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Ok(f) => {
+                    let Payload::Event(v) = f.payload.clone() else {
+                        panic!("expected an event payload")
+                    };
+                    break v;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("event stream ended: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a measure event within 10 s");
+    eprintln!("measure job: {ev}");
+    let center = ev["center_hz"].as_u64().unwrap();
+    assert!(center.abs_diff(CENTER + 12_000) <= 200, "{ev}");
+    assert!(ev["bandwidth_hz"].as_u64().unwrap() <= 12_500, "{ev}");
+}

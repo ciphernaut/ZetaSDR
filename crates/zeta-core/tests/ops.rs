@@ -945,23 +945,40 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
 }
 
 #[test]
-fn measure_kind_expands_to_one_measure_node() {
+fn measure_kind_expands_to_channel_then_measure() {
     assert_eq!(JobKind::Measure.name(), "measure");
     assert_eq!(
         serde_json::to_value(JobKind::Measure).unwrap(),
         serde_json::json!("measure")
     );
     let tuning = Tuning {
-        center_hz: Hz(144_800_000),
+        center_hz: Hz(144_812_000),
         bandwidth_hz: Hz(12_500),
     };
     let g = JobKind::Measure
-        .expand(&SourceId("file0".into()), tuning, Hz(48_000), None)
+        .expand(&SourceId("file0".into()), tuning, Hz(2_048_000), None)
         .unwrap();
-    assert_eq!(g.nodes.len(), 1);
-    assert_eq!(g.nodes[0].kind, "measure");
-    assert_eq!(g.nodes[0].params, serde_json::json!({}));
-    assert!(g.edges.is_empty());
+    assert_eq!(g.nodes.len(), 2);
+    assert_eq!(g.nodes[0].kind, "channel");
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"center_hz": 144_812_000, "bandwidth_hz": 12_500, "out_rate_hz": 51_200})
+    );
+    assert_eq!(g.nodes[1].kind, "measure");
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({"bandwidth_hz": 12_500})
+    );
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!(g.edges[0].from, g.nodes[0].id);
+    assert_eq!(g.edges[0].to, g.nodes[1].id);
+    assert_eq!(g.edges[0].kind, zeta_core::types::StreamKind::Iq);
+    // Channelised, so an unknown source rate is refused.
+    assert!(
+        JobKind::Measure
+            .expand(&SourceId("file0".into()), tuning, Hz(0), None)
+            .is_err()
+    );
 }
 
 #[test]
