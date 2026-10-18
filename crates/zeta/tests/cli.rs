@@ -35,9 +35,10 @@ fn schema_prints_json_with_op_result_error() {
         .clone();
     let v = json(&out);
     assert_eq!(v["result"], "schema");
-    for key in ["op", "result", "error"] {
+    for key in ["op", "result", "error", "stages"] {
         assert!(v["value"].get(key).is_some(), "schema missing {key}");
     }
+    assert_eq!(v["value"]["stages"][0]["kind"], "passthrough");
 }
 
 #[test]
@@ -151,4 +152,56 @@ fn iq_read_one_shot_writes_capture() {
     assert!(meta.exists(), "{}", meta.display());
     assert!(meta.starts_with(dir.path().join("state").join("captures")));
     assert!(meta.with_extension("sigmf-data").exists());
+}
+
+#[test]
+fn mutating_one_shot_refused_while_serve_lock_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let pid = std::process::id();
+    std::fs::write(state.join("serve.lock"), pid.to_string()).unwrap();
+    let band = [
+        "--source",
+        "tone",
+        "--center-hz",
+        "100000000",
+        "--bandwidth-hz",
+        "48000",
+    ];
+    let start: Vec<&str> = ["job", "start", "--kind", "passthrough"]
+        .into_iter()
+        .chain(band)
+        .collect();
+    let ensure: Vec<&str> = ["source", "ensure"].into_iter().chain(band).collect();
+    let graph = dir.path().join("g.json");
+    std::fs::write(&graph, "{}").unwrap();
+    let put = [
+        "graph",
+        "put",
+        "--job",
+        "j",
+        "--file",
+        graph.to_str().unwrap(),
+    ];
+    let stop = ["job", "stop", "--job", "j"];
+    let want = format!("zeta serve (pid {pid}) owns this state dir");
+    for args in [&start[..], &ensure[..], &put[..], &stop[..]] {
+        let out = zeta(dir.path(), args)
+            .assert()
+            .code(2)
+            .get_output()
+            .stdout
+            .clone();
+        let v = json(&out);
+        assert_eq!(v["error"], "other", "{args:?}");
+        assert_eq!(v["message"], want.as_str(), "{args:?}");
+    }
+    assert!(
+        !state.join("jobs").exists() || std::fs::read_dir(state.join("jobs")).unwrap().count() == 0
+    );
+    // Reads still work, and a stale lock (dead pid) does not block.
+    zeta(dir.path(), &["job", "list"]).assert().success();
+    std::fs::write(state.join("serve.lock"), "4194305").unwrap();
+    zeta(dir.path(), &start).assert().success();
 }

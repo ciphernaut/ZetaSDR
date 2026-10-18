@@ -21,7 +21,13 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 
 One-shot commands open the node, apply one operation, persist and exit; they do not resume jobs.
 `zeta serve` resumes persisted jobs and keeps them running until Ctrl-C. A one-shot `iq read` or
-`classify` waits (up to 5 s) for the source ring to cover the requested span.
+`classify` waits (up to 5 s) for the source ring to cover the requested span. File sources play in
+real time and loop. `--source-file` is not persisted: pass it on every invocation.
+
+While `zeta serve` runs it holds `serve.lock` (its pid) in the state directory, and the mutating
+one-shot commands (`job start`, `job stop`, `graph put`, `source ensure`) exit 2 with
+`{"error": "other", "message": "zeta serve (pid N) owns this state dir"}`. A lock whose pid is no
+longer alive is treated as stale. Liveness is checked through `/proc/<pid>`, so this is Linux only.
 
 ```bash
 cargo build -q -p zeta

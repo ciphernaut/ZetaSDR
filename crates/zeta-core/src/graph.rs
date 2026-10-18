@@ -60,8 +60,12 @@ pub struct Graph {
 #[serde(tag = "cause", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub enum GraphError {
-    #[error("unknown stage kind {kind:?} on node {node:?}")]
-    UnknownStage { node: NodeId, kind: String },
+    #[error("unknown stage kind {kind:?} on node {node:?}; known: {known:?}")]
+    UnknownStage {
+        node: NodeId,
+        kind: String,
+        known: Vec<String>,
+    },
     #[error("edge {edge} references a missing node")]
     DanglingEdge { edge: usize },
     #[error("edge {edge} carries {got:?} but {expected:?} was expected")]
@@ -82,6 +86,7 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
             .ok_or_else(|| GraphError::UnknownStage {
                 node: n.id.clone(),
                 kind: n.kind.clone(),
+                known: registry.kinds(),
             })?;
         let bad = |reason: String| GraphError::BadParams {
             node: n.id.clone(),
@@ -175,7 +180,10 @@ mod tests {
             edges: vec![],
         };
         match validate(&g, &registry()) {
-            Err(GraphError::UnknownStage { kind, .. }) => assert_eq!(kind, "nope"),
+            Err(GraphError::UnknownStage { kind, known, .. }) => {
+                assert_eq!(kind, "nope");
+                assert_eq!(known, vec!["passthrough".to_string()]);
+            }
             other => panic!("{other:?}"),
         }
     }

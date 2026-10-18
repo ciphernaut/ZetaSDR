@@ -3,12 +3,13 @@
 mod agents_md;
 mod cli;
 mod node_setup;
+mod serve_lock;
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use zeta_core::ops::Op;
+use zeta_core::ops::{Op, OpError};
 
 /// Time a one-shot `job start` keeps the node up so the first blocks flow.
 const JOB_START_GRACE: Duration = Duration::from_millis(150);
@@ -34,13 +35,29 @@ async fn main() -> ExitCode {
     if let cli::Command::AgentsMd { check } = cli.command {
         return agents_md::run(check);
     }
+    let state_dir = match cli.state_dir.map_or_else(node_setup::default_state_dir, Ok) {
+        Ok(d) => d,
+        Err(e) => return fail(&e),
+    };
+    if cli.command.mutates()
+        && let Some(pid) = serve_lock::owner(&state_dir)
+    {
+        let e = OpError::Other {
+            message: format!("zeta serve (pid {pid}) owns this state dir"),
+        };
+        return print(serde_json::to_string_pretty(&e), 2);
+    }
     let op = match cli.command.into_op() {
         Ok(op) => op,
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
     };
-    let state_dir = match cli.state_dir.map_or_else(node_setup::default_state_dir, Ok) {
-        Ok(d) => d,
-        Err(e) => return fail(&e),
+    // `serve` holds the state dir until it exits; the guard removes the lock.
+    let _lock = match op {
+        None => match serve_lock::acquire(&state_dir) {
+            Ok(l) => Some(l),
+            Err(e) => return fail(&e),
+        },
+        Some(_) => None,
     };
     // Only `serve` (op `None`) resumes jobs; a one-shot never launches or fails them.
     let node = match node_setup::open(state_dir, &cli.source_files, op.is_none()).await {

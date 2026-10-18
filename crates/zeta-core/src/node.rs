@@ -260,6 +260,14 @@ impl Node {
         &self.inner.state_dir
     }
 
+    /// [`crate::ops::schema`] plus `stages`: every registered stage kind with
+    /// its stream kinds and params schema (see [`StageRegistry::describe`]).
+    pub fn schema(&self) -> serde_json::Value {
+        let mut v = crate::ops::schema();
+        v["stages"] = self.inner.registry.describe();
+        v
+    }
+
     /// Apply one operation; see [`crate::ops`].
     pub async fn apply(&self, op: Op) -> Result<OpResult, OpError> {
         crate::ops::apply(self, op).await
@@ -461,6 +469,7 @@ impl Inner {
                 .ok_or_else(|| GraphError::UnknownStage {
                     node: n.id.clone(),
                     kind: n.kind.clone(),
+                    known: self.registry.kinds(),
                 })?;
             stages.push(stage);
         }

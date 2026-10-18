@@ -16,14 +16,40 @@ const RULES: &[&str] = &[
     "Call operations, do not explain.",
     "Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.",
     "Unknown signals are reported as unknown, never guessed.",
+    "Ids are never invented: `source` values come from `source list`, `job` values from `job list`.",
 ];
+
+const RUNNING: &str = "Every command takes two global flags:
+
+- `--state-dir PATH`: where jobs and captures persist (default `$XDG_STATE_HOME/zetasdr`, else `~/.local/state/zetasdr`). Pass the same directory on every invocation.
+- `--source-file ID=PATH.sigmf-meta`: attach a SigMF recording as source `ID`. Sources are not persisted: repeat the flag, with the same ids, on every invocation, `serve` included.
+
+There are two ways to run:
+
+- One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span.
+- `zeta serve`: resumes persisted jobs and keeps them running until Ctrl-C.
+
+While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job stop`, `graph put`, `source ensure`) are then refused with an `other` error naming the server's pid; read-only commands still work.";
 
 /// Hand-written sentence appended to an operation's section.
 fn note(op: &str) -> Option<&'static str> {
     match op {
         "graph_put" => Some(
-            "Fetch the current graph with `graph get`, edit it, and put it back; stage kinds and their params are listed by `schema`.",
+            "Fetch the current graph with `graph get`, edit it, and put it back; stage kinds and their params are listed under Stage kinds below and by `schema`.",
         ),
+        "knowledge_lookup" => Some(
+            "The built-in provider has signatures but no allocations, so an empty `allocations` list means no provider data, not nothing allocated.",
+        ),
+        _ => None,
+    }
+}
+
+/// Where a field's value comes from, when the type alone does not say.
+fn hint(field: &str) -> Option<&'static str> {
+    match field {
+        "source" => Some("an id from `source list`"),
+        "job" => Some("an id from `job list`"),
+        "region" => Some("free-text region code such as `AU`"),
         _ => None,
     }
 }
@@ -38,7 +64,8 @@ fn unit(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Render the guide from `schema()` and the field-craft text.
+/// Render the guide from the node schema (`op`, `result`, `error`, `stages`)
+/// and the field-craft text.
 pub fn render(schema: &Value, field_craft: &str) -> String {
     let op = &schema["op"];
     let defs = &op["$defs"];
@@ -46,6 +73,7 @@ pub fn render(schema: &Value, field_craft: &str) -> String {
     for r in RULES {
         out.push_str(&format!("- {r}\n"));
     }
+    out.push_str(&format!("\n## Running the node\n\n{RUNNING}\n"));
     out.push_str("\n## Operations\n");
     for variant in op["oneOf"].as_array().into_iter().flatten() {
         let name = variant["properties"]["op"]["const"].as_str().unwrap_or("?");
@@ -58,8 +86,12 @@ pub fn render(schema: &Value, field_craft: &str) -> String {
             .map(|f| (f, &variant["properties"][f]))
             .collect();
         out.push_str(&format!("\n### {name}\n\n"));
+        if let Some(d) = variant["description"].as_str() {
+            out.push_str(&format!("{}\n\n", d.replace('\n', " ")));
+        }
         for (f, s) in &fields {
-            out.push_str(&format!("- {f}: {}\n", type_of(s, defs)));
+            let h = hint(f).map(|h| format!("; {h}")).unwrap_or_default();
+            out.push_str(&format!("- {f}: {}{h}\n", type_of(s, defs)));
         }
         if !fields.is_empty() {
             out.push('\n');
@@ -75,6 +107,31 @@ pub fn render(schema: &Value, field_craft: &str) -> String {
         ));
         if let Some(n) = note(name) {
             out.push_str(&format!("\n{n}\n"));
+        }
+    }
+    out.push_str("\n## Stage kinds\n\nA graph node's `kind` names one of these; its `params` must match the listed fields.\n");
+    for st in schema["stages"].as_array().into_iter().flatten() {
+        let list = |k: &str| -> String {
+            let v: Vec<&str> = st[k]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            v.join(", ")
+        };
+        let ps = &st["params_schema"];
+        out.push_str(&format!(
+            "\n### {}\n\n- inputs: {}\n- outputs: {}\n",
+            st["kind"].as_str().unwrap_or("?"),
+            list("inputs"),
+            list("outputs")
+        ));
+        for p in required(ps) {
+            out.push_str(&format!(
+                "- params.{p}: {}\n",
+                type_of(&ps["properties"][p], &ps["$defs"])
+            ));
         }
     }
     out.push_str("\n## Field craft\n\n");
@@ -234,7 +291,9 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
 
 /// Print the rendering, or with `check` compare it to the committed `AGENTS.md`.
 pub fn run(check: bool) -> ExitCode {
-    let text = render(&zeta_core::ops::schema(), FIELD_CRAFT);
+    let mut schema = zeta_core::ops::schema();
+    schema["stages"] = crate::node_setup::registry().describe();
+    let text = render(&schema, FIELD_CRAFT);
     if !check {
         print!("{text}");
         return ExitCode::SUCCESS;

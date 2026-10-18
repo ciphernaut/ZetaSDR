@@ -205,6 +205,17 @@ fn parse_source_file(s: &str) -> Result<(String, PathBuf), String> {
 }
 
 impl Command {
+    /// Whether the subcommand changes persisted state or a source's tuning;
+    /// these are refused while `zeta serve` owns the state directory.
+    pub fn mutates(&self) -> bool {
+        matches!(
+            self,
+            Command::Source(SourceCmd::Ensure(_))
+                | Command::Job(JobCmd::Start { .. } | JobCmd::Stop(_))
+                | Command::Graph(GraphCmd::Put { .. })
+        )
+    }
+
     /// The operation this subcommand applies; `None` for `serve`. Fails only
     /// when `graph put` cannot read or parse its file.
     pub fn into_op(self) -> Result<Option<Op>, OpError> {

@@ -83,6 +83,33 @@ impl StageRegistry {
             .find(|s| s.kind == kind)
     }
 
+    /// Every registered stage kind, sorted, each once.
+    pub fn kinds(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.stages.iter().map(|s| s.spec().kind.into()).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// One `{kind, inputs, outputs, params_schema}` object per stage kind,
+    /// sorted by kind, from the first implementation registered for it.
+    pub fn describe(&self) -> serde_json::Value {
+        let stages = self
+            .kinds()
+            .iter()
+            .filter_map(|k| self.spec(k))
+            .map(|s| {
+                serde_json::json!({
+                    "kind": s.kind,
+                    "inputs": s.inputs,
+                    "outputs": s.outputs,
+                    "params_schema": s.params_schema,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(stages)
+    }
+
     /// Best implementation of `kind` on an available backend (Fpga > Gpu > Cpu);
     /// ties go to the first registered.
     pub fn select(&self, kind: &str, available: &[Backend]) -> Option<Arc<dyn Stage>> {

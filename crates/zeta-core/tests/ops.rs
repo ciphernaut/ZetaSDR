@@ -662,3 +662,26 @@ async fn conflict_reports_current_tuning_and_real_options() {
         other => panic!("expected Conflict, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn schema_op_lists_registered_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let v = match node.apply(Op::Schema {}).await {
+        Ok(OpResult::Schema(v)) => v,
+        other => panic!("expected Schema, got {other:?}"),
+    };
+    for key in ["op", "result", "error"] {
+        assert_eq!(v[key], schema()[key], "{key}");
+    }
+    let stages = v["stages"].as_array().expect("stages array");
+    assert_eq!(stages.len(), 1);
+    let p = &stages[0];
+    assert_eq!(p["kind"], "passthrough");
+    assert!(p["inputs"].as_array().unwrap().contains(&"iq".into()));
+    assert!(p["outputs"].as_array().unwrap().contains(&"iq".into()));
+    assert_eq!(p["params_schema"]["additionalProperties"], false);
+    assert!(p["params_schema"]["properties"]["kind"].is_object());
+}

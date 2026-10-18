@@ -26,6 +26,13 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is set; pass --state-dir".into())
 }
 
+/// The stages the CLI node runs.
+pub fn registry() -> StageRegistry {
+    let mut registry = StageRegistry::new();
+    registry.register(Arc::new(PassthroughStage::new()));
+    registry
+}
+
 /// Open the node on `state_dir` with one looping, real-time `FileSource` per `(id, meta path)`.
 /// Sources start after the node has subscribed to them: a source with no
 /// subscriber stops at once. `resume` relaunches persisted `Running` jobs
@@ -48,8 +55,6 @@ pub async fn open(
                 .map_err(|e| format!("--source-file {id}={}: {e}", path.display()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut registry = StageRegistry::new();
-    registry.register(Arc::new(PassthroughStage::new()));
     let cfg = NodeConfig {
         state_dir,
         ring_seconds: 10.0,
@@ -57,7 +62,7 @@ pub async fn open(
         resume,
     };
     let ports = sources.iter().map(|s| s.clone() as Arc<dyn Port>).collect();
-    let node = Node::open(cfg, registry, ports)
+    let node = Node::open(cfg, registry(), ports)
         .await
         .map_err(|e| e.to_string())?;
     for s in &sources {

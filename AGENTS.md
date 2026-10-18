@@ -9,6 +9,21 @@ ZetaSDR is an agentic SDR runtime. You drive it through a small typed operation 
 - Call operations, do not explain.
 - Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.
 - Unknown signals are reported as unknown, never guessed.
+- Ids are never invented: `source` values come from `source list`, `job` values from `job list`.
+
+## Running the node
+
+Every command takes two global flags:
+
+- `--state-dir PATH`: where jobs and captures persist (default `$XDG_STATE_HOME/zetasdr`, else `~/.local/state/zetasdr`). Pass the same directory on every invocation.
+- `--source-file ID=PATH.sigmf-meta`: attach a SigMF recording as source `ID`. Sources are not persisted: repeat the flag, with the same ids, on every invocation, `serve` included.
+
+There are two ways to run:
+
+- One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span.
+- `zeta serve`: resumes persisted jobs and keeps them running until Ctrl-C.
+
+While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job stop`, `graph put`, `source ensure`) are then refused with an `other` error naming the server's pid; read-only commands still work.
 
 ## Operations
 
@@ -20,7 +35,9 @@ CLI: `zeta source list`
 
 ### source_ensure
 
-- source: string
+Check a band against the source and tune it if no job holds it. Takes no lease: an unheld source is tuned directly (a later `job_start` may retune it); a held source is never retuned, and the request either fits the current band (`Tuning`) or is a `Conflict`. Runs under the lease manager's per-source gate, so it never interleaves with a job's lease-and-tune.
+
+- source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
 
@@ -31,7 +48,7 @@ CLI: `zeta source ensure --source <id> --center-hz 144800000 --bandwidth-hz 1250
 ### job_start
 
 - kind: string (JobKind: passthrough)
-- source: string
+- source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
 
@@ -47,7 +64,7 @@ CLI: `zeta job list`
 
 ### job_stop
 
-- job: string
+- job: string; an id from `job list`
 
 JSON: `{"op":"job_stop","job":"<id>"}`
 
@@ -55,13 +72,15 @@ CLI: `zeta job stop --job <id>`
 
 ### job_context
 
-- job: string
+- job: string; an id from `job list`
 
 JSON: `{"op":"job_context","job":"<id>"}`
 
 CLI: `zeta job context --job <id>`
 
 ### iq_read
+
+Save a selection under `state_dir/captures`: writes the whole ring bandwidth over the span as a SigMF pair; the selection band is recorded as an annotation. The capture is labelled with the ring's centre, and the selection band must lie inside the ring's band.
 
 - selection: object (Selection: source, span{start_ns,end_ns: integer (ns since epoch)}, center_hz, bandwidth_hz)
 
@@ -77,7 +96,7 @@ CLI: `zeta stream list`
 
 ### graph_get
 
-- job: string
+- job: string; an id from `job list`
 
 JSON: `{"op":"graph_get","job":"<id>"}`
 
@@ -85,18 +104,22 @@ CLI: `zeta graph get --job <id>`
 
 ### graph_put
 
-- job: string
+Replace a job's graph; restarts a running job under the same id with the new graph.
+
+- job: string; an id from `job list`
 - graph: object (Graph: id, nodes[Node: id, kind, params], edges[Edge: from, to, kind])
 
 JSON: `{"op":"graph_put","job":"<id>","graph":{"id":"<id>","nodes":[{"id":"<node-id>","kind":"passthrough","params":{"kind":"iq"}}],"edges":[]}}`
 
 CLI: `zeta graph put --job <id> --file graph.json`
 
-Fetch the current graph with `graph get`, edit it, and put it back; stage kinds and their params are listed by `schema`.
+Fetch the current graph with `graph get`, edit it, and put it back; stage kinds and their params are listed under Stage kinds below and by `schema`.
 
 ### knowledge_lookup
 
-- region: string
+Band-plan allocations in `region` and known signatures overlapping the band, from every registered knowledge provider.
+
+- region: string; free-text region code such as `AU`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
 
@@ -104,7 +127,11 @@ JSON: `{"op":"knowledge_lookup","region":"AU","center_hz":144800000,"bandwidth_h
 
 CLI: `zeta knowledge lookup --region AU --center-hz 144800000 --bandwidth-hz 12500`
 
+The built-in provider has signatures but no allocations, so an empty `allocations` list means no provider data, not nothing allocated.
+
 ### classify
+
+Run every registered classifier over the selection's span of the source ring (no upstream features).
 
 - selection: object (Selection: source, span{start_ns,end_ns: integer (ns since epoch)}, center_hz, bandwidth_hz)
 
@@ -117,6 +144,16 @@ CLI: `zeta classify --source <id> --start-ns 1760000000000000000 --end-ns 176000
 JSON: `{"op":"schema"}`
 
 CLI: `zeta schema`
+
+## Stage kinds
+
+A graph node's `kind` names one of these; its `params` must match the listed fields.
+
+### passthrough
+
+- inputs: iq, audio, video, text, event, sink
+- outputs: iq, audio, video, text, event, sink
+- params.kind: string (StreamKind: iq|audio|video|text|event|sink)
 
 ## Field craft
 

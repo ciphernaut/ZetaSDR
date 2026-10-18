@@ -54,10 +54,10 @@ pub enum Op {
     JobContext {
         job: JobId,
     },
-    /// Save the selection's span as a SigMF pair under `state_dir/captures`.
-    /// The whole ring bandwidth is written: frequency sub-selection is not
-    /// applied yet. The capture is labelled with the ring's centre; the
-    /// selection's band is recorded as an annotation labelled `selection`.
+    /// Save a selection under `state_dir/captures`: writes the whole ring
+    /// bandwidth over the span as a SigMF pair; the selection band is recorded
+    /// as an annotation. The capture is labelled with the ring's centre, and
+    /// the selection band must lie inside the ring's band.
     IqRead {
         selection: Selection,
     },
@@ -65,7 +65,8 @@ pub enum Op {
     GraphGet {
         job: JobId,
     },
-    /// Replace a job's graph; a running job is restarted on it, keeping its id.
+    /// Replace a job's graph; restarts a running job under the same id with
+    /// the new graph.
     GraphPut {
         job: JobId,
         graph: Graph,
@@ -269,7 +270,9 @@ pub fn suggest(value: u64, min: u64, max: u64) -> Option<u64> {
     })
 }
 
-/// JSON schemas of `Op`, `OpResult` and `OpError` under `op`, `result`, `error`.
+/// JSON schemas of `Op`, `OpResult` and `OpError` under `op`, `result`,
+/// `error`. The `schema` operation answers with [`Node::schema`], which adds
+/// the node's stage kinds under `stages`.
 pub fn schema() -> serde_json::Value {
     serde_json::json!({
         "op": schemars::schema_for!(Op),
@@ -483,7 +486,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             })
         }
         Op::Classify { selection } => classify(node, selection).await,
-        Op::Schema {} => Ok(OpResult::Schema(schema())),
+        Op::Schema {} => Ok(OpResult::Schema(node.schema())),
     }
 }
 
