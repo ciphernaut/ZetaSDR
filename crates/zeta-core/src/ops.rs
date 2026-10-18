@@ -496,6 +496,13 @@ fn ring_samples(node: &Node, sel: &Selection) -> Result<(Hz, Hz, Vec<Complex<f32
     if node.port(&sel.source).is_none() {
         return Err(unknown_source(node, &sel.source));
     }
+    let (start_ns, end_ns) = (sel.span.start_ns, sel.span.end_ns);
+    if end_ns.0 <= start_ns.0 {
+        // Reported even before the ring has data, as the ring itself would.
+        return Err(OpError::Ring {
+            detail: RingError::BadSpan { start_ns, end_ns },
+        });
+    }
     let empty = || OpError::Ring {
         detail: RingError::Empty,
     };

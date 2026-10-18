@@ -687,3 +687,30 @@ async fn schema_op_lists_registered_stages() {
     assert_eq!(p["params_schema"]["additionalProperties"], false);
     assert!(p["params_schema"]["properties"]["kind"].is_object());
 }
+
+#[tokio::test]
+async fn reversed_span_is_bad_span_even_before_ring_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    let selection = Selection {
+        source: SourceId("file0".into()),
+        span: Span {
+            start_ns: Timestamp(2),
+            end_ns: Timestamp(1),
+        },
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(48_000),
+    };
+    assert_eq!(
+        node.apply(Op::Classify { selection }).await,
+        Err(OpError::Ring {
+            detail: zeta_core::ring::RingError::BadSpan {
+                start_ns: Timestamp(2),
+                end_ns: Timestamp(1)
+            }
+        })
+    );
+}

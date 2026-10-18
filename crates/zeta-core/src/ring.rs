@@ -25,7 +25,12 @@ pub enum RingError {
         requested_ns: Timestamp,
         latest_ns: Timestamp,
     },
-    #[error("ring is empty or span is empty")]
+    #[error("span end {end_ns:?} is not after its start {start_ns:?}")]
+    BadSpan {
+        start_ns: Timestamp,
+        end_ns: Timestamp,
+    },
+    #[error("ring is empty")]
     Empty,
 }
 
@@ -127,15 +132,19 @@ impl IqRing {
             .then(|| Timestamp(self.time_of(self.dropped + self.buf.len() as u64 - 1)))
     }
 
-    /// Samples covering the half-open span `[start, end)`, or an error; never partial.
+    /// Samples covering the half-open span `[start_ns, end_ns)`, or an error;
+    /// never partial. A span whose end is not after its start is `BadSpan`.
     pub fn read(&self, span: Span) -> Result<Vec<Complex<f32>>, RingError> {
+        if span.end_ns.0 <= span.start_ns.0 {
+            return Err(RingError::BadSpan {
+                start_ns: span.start_ns,
+                end_ns: span.end_ns,
+            });
+        }
         let (earliest, latest) = match (self.earliest(), self.latest()) {
             (Some(e), Some(l)) => (e, l),
             _ => return Err(RingError::Empty),
         };
-        if span.end_ns.0 <= span.start_ns.0 {
-            return Err(RingError::Empty);
-        }
         if span.start_ns.0 < earliest.0 {
             return Err(RingError::TooOld {
                 requested_ns: span.start_ns,
@@ -218,6 +227,30 @@ mod tests {
                 requested_ns: Timestamp(2_000_000_000),
                 latest_ns: Timestamp(999_000_000)
             })
+        );
+    }
+
+    #[test]
+    fn reversed_or_empty_span_is_bad_span() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        ring.push(&block(0));
+        for (a, b) in [(500 * MS, 200 * MS), (300 * MS, 300 * MS)] {
+            assert_eq!(
+                ring.read(span_ns(a, b)),
+                Err(RingError::BadSpan {
+                    start_ns: Timestamp(a),
+                    end_ns: Timestamp(b)
+                })
+            );
+        }
+        let bad = serde_json::to_value(RingError::BadSpan {
+            start_ns: Timestamp(2),
+            end_ns: Timestamp(1),
+        })
+        .unwrap();
+        assert_eq!(
+            bad,
+            serde_json::json!({"cause": "bad_span", "start_ns": 2, "end_ns": 1})
         );
     }
 
