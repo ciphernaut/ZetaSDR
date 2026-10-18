@@ -8,8 +8,10 @@ use std::path::PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::classify::Label;
 use crate::graph::{Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::JobRecord;
+use crate::knowledge::{Allocation, Signature};
 use crate::lease::LeaseError;
 use crate::node::{Node, NodeError};
 use crate::port::{Port, PortError, Tuning};
@@ -47,6 +49,12 @@ pub enum Op {
     GraphGet { job: JobId },
     /// Replace a job's graph; a running job is restarted on it, keeping its id.
     GraphPut { job: JobId, graph: Graph },
+    /// Band-plan allocations in `region` and known signatures overlapping the
+    /// band, from every registered knowledge provider.
+    KnowledgeLookup { region: String, center_hz: Hz, bandwidth_hz: Hz },
+    /// Run every registered classifier over the selection's span of the
+    /// source ring (no upstream features).
+    Classify { selection: Selection },
     Schema {},
 }
 
@@ -106,6 +114,8 @@ pub enum OpResult {
     Iq { sample_rate_hz: Hz, center_hz: Hz, bandwidth_hz: Hz, samples: usize, path: PathBuf },
     Streams(Vec<StreamInfo>),
     Graph(Graph),
+    Knowledge { allocations: Vec<Allocation>, signatures: Vec<Signature> },
+    Labels(Vec<Label>),
     Ok,
     Schema(serde_json::Value),
 }
@@ -303,8 +313,31 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
         Op::GraphPut { job, graph } => {
             node.job_graph_put(&job, graph).await.map(|()| OpResult::Ok).map_err(|e| node_error(node, e))
         }
+        Op::KnowledgeLookup { region, center_hz, bandwidth_hz } => {
+            let (mut allocations, mut signatures) = (Vec::new(), Vec::new());
+            for p in node.knowledge() {
+                allocations.extend(p.allocations(&region, center_hz, bandwidth_hz).await);
+                signatures.extend(p.signatures(center_hz, bandwidth_hz).await);
+            }
+            Ok(OpResult::Knowledge { allocations, signatures })
+        }
+        Op::Classify { selection } => classify(node, selection).await,
         Op::Schema {} => Ok(OpResult::Schema(schema())),
     }
+}
+
+/// Run the classifier set over the selection's span of the source ring.
+async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
+    if node.port(&sel.source).is_none() {
+        return Err(unknown_source(node, &sel.source));
+    }
+    let ring = node.ring(&sel.source).ok_or(OpError::Ring { detail: RingError::Empty })?;
+    let (rate, samples) = {
+        let r = ring.read().unwrap();
+        let samples = r.read(sel.span).map_err(|detail| OpError::Ring { detail })?;
+        (r.sample_rate_hz(), samples)
+    };
+    Ok(OpResult::Labels(node.classifiers().run_all(&samples, rate, None).await))
 }
 
 /// Write the selection's span from the source ring as a cf32_le SigMF pair.

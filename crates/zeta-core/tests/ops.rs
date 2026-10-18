@@ -9,6 +9,8 @@ use serde_json::Value;
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, schema};
+use zeta_core::classify::StubClassifier;
+use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::types::JobId;
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
@@ -259,7 +261,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 11, "one schema per Op variant");
+    assert_eq!(vs.len(), 13, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"].as_object().expect("properties").keys().collect();
@@ -335,4 +337,54 @@ fn unit_fields_end_in_hz_or_baud() {
         assert!(s[key].is_object(), "schema has {key}");
     }
     check_units(&s, "schema");
+}
+
+struct TestProvider;
+
+#[async_trait]
+impl KnowledgeProvider for TestProvider {
+    fn name(&self) -> &str {
+        "test"
+    }
+    async fn allocations(&self, region: &str, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Allocation> {
+        vec![Allocation {
+            provider: "test".into(),
+            region: region.into(),
+            min_hz: Hz(144_000_000),
+            max_hz: Hz(148_000_000),
+            service: "amateur".into(),
+            note: None,
+        }]
+    }
+    async fn signatures(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Signature> {
+        vec![]
+    }
+}
+
+#[tokio::test]
+async fn knowledge_lookup_op_returns_allocations_from_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![]).await.unwrap();
+    node.add_knowledge(Arc::new(TestProvider));
+    let op = Op::KnowledgeLookup { region: "AU".into(), center_hz: Hz(144_800_000), bandwidth_hz: Hz(25_000) };
+    match node.apply(op).await {
+        Ok(OpResult::Knowledge { allocations, signatures }) => {
+            assert_eq!(allocations.len(), 1);
+            assert_eq!(allocations[0].provider, "test");
+            assert_eq!(allocations[0].region, "AU");
+            assert!(signatures.is_empty());
+        }
+        other => panic!("expected Knowledge, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn classify_op_runs_stub_and_returns_empty_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    node.add_classifier(Arc::new(StubClassifier));
+    src.start();
+    let selection = selection(&node, 100_000_000, 48_000).await;
+    assert_eq!(node.apply(Op::Classify { selection }).await, Ok(OpResult::Labels(vec![])));
 }

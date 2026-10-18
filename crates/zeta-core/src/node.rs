@@ -10,8 +10,10 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::classify::{Classifier, ClassifierSet};
 use crate::graph::{self, Graph, GraphError};
 use crate::job::{JobRecord, JobState};
+use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
 use crate::ops::{Op, OpError, OpResult};
 use crate::port::{IqReceiver, Port, Tuning};
@@ -60,6 +62,8 @@ struct Inner {
     ports: RwLock<HashMap<SourceId, Arc<dyn Port>>>,
     rings: Mutex<HashMap<SourceId, Arc<RwLock<IqRing>>>>,
     jobs: Mutex<HashMap<JobId, JobEntry>>,
+    knowledge: RwLock<Vec<Arc<dyn KnowledgeProvider>>>,
+    classifiers: RwLock<ClassifierSet>,
     /// Failures to persist a job's natural end; memory and disk disagree for these.
     persist_errors: Mutex<Vec<String>>,
     /// Cancelled when the `Node` is dropped; every job token is a child of it.
@@ -139,6 +143,8 @@ impl Node {
                 ports: RwLock::new(HashMap::new()),
                 rings: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
+                knowledge: RwLock::new(Vec::new()),
+                classifiers: RwLock::new(ClassifierSet::default()),
                 persist_errors: Mutex::new(Vec::new()),
                 shutdown: CancellationToken::new(),
             }),
@@ -179,6 +185,24 @@ impl Node {
         let rx = port.subscribe();
         inner.ports.write().unwrap().insert(source.clone(), port);
         tokio::spawn(feed_ring(inner.clone(), source, rx));
+    }
+
+    /// Register a knowledge provider; `KnowledgeLookup` queries all of them.
+    pub fn add_knowledge(&self, p: Arc<dyn KnowledgeProvider>) {
+        self.inner.knowledge.write().unwrap().push(p);
+    }
+
+    /// Register a classifier; `Classify` runs all of them in layer order.
+    pub fn add_classifier(&self, c: Arc<dyn Classifier>) {
+        self.inner.classifiers.write().unwrap().register(c);
+    }
+
+    pub(crate) fn knowledge(&self) -> Vec<Arc<dyn KnowledgeProvider>> {
+        self.inner.knowledge.read().unwrap().clone()
+    }
+
+    pub(crate) fn classifiers(&self) -> ClassifierSet {
+        self.inner.classifiers.read().unwrap().clone()
     }
 
     pub(crate) fn port(&self, id: &SourceId) -> Option<Arc<dyn Port>> {

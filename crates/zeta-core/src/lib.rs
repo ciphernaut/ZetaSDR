@@ -11,3 +11,5 @@ pub mod stage;
 pub mod job;
 pub mod node;
 pub mod ops;
+pub mod knowledge;
+pub mod classify;
