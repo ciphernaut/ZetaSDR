@@ -358,9 +358,9 @@ fn then_tail_malformed_value_is_usage_error() {
 #[test]
 fn then_tail_reports_failed_job() {
     let dir = tempfile::tempdir().unwrap();
-    // 44.1 kHz is not a multiple of fm_demod's 48 kHz channel rate.
-    let iq = zeta_dsp::util::nco(44_100, 1_000.0, 44_100.0);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 44_100, 100_000_000);
+    // A 1 kHz source channelises at 1 kHz, too slow for the AFSK1200 decoder.
+    let iq = zeta_dsp::util::nco(1_000, 100.0, 1_000.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 1_000, 100_000_000);
     let src = format!("cd={}", meta.display());
     let out = zeta(
         dir.path(),
@@ -370,13 +370,13 @@ fn then_tail_reports_failed_job() {
             "job",
             "start",
             "--kind",
-            "fm_demod",
+            "aprs_decode",
             "--source",
             "cd",
             "--center-hz",
             "100000000",
             "--bandwidth-hz",
-            "12500",
+            "500",
             "--then-tail",
             "1,2000",
         ],
@@ -389,5 +389,6 @@ fn then_tail_reports_failed_job() {
     let v = json(&out);
     assert_eq!(v[0]["result"], "job");
     assert_eq!(v[1]["state"]["status"], "failed", "{v}");
-    assert!(v[1]["state"]["reason"].is_string(), "{v}");
+    let reason = v[1]["state"]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("too low for afsk1200"), "{v}");
 }

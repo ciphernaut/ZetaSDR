@@ -100,9 +100,11 @@ pub enum Op {
     Schema {},
 }
 
-/// Built-in job kinds; each expands to a graph. `measure` and `spectrum`
-/// cover the whole source band; the job band is validated but not used to
-/// narrow the analysis in this release.
+/// Built-in job kinds; each expands to a graph. `fm_demod` and `aprs_decode`
+/// channelise the job band at the narrowest exact divisor of the source rate
+/// that is at least 48 kHz and at least the band; `spectrum` covers the whole
+/// capture band. `measure` covers the whole source band; the job band is
+/// validated but not used to narrow the analysis in this release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
@@ -125,8 +127,33 @@ impl JobKind {
         }
     }
 
-    pub fn expand(&self, _source: &SourceId, tuning: Tuning) -> Graph {
-        match self {
+    /// The kind's graph for `tuning` on a source sampling at `source_rate_hz`
+    /// (the port-returned `bandwidth_hz`). Kinds with a `channel` node refuse
+    /// an unknown (0) rate and a band wider than [`channel_rate_hz`].
+    pub fn expand(
+        &self,
+        _source: &SourceId,
+        tuning: Tuning,
+        source_rate_hz: Hz,
+    ) -> Result<Graph, OpError> {
+        let out = channel_rate_hz(source_rate_hz.0, tuning.bandwidth_hz.0);
+        if matches!(self, JobKind::FmDemod | JobKind::AprsDecode) {
+            if source_rate_hz.0 == 0 {
+                return Err(OpError::Other {
+                    message: "source rate unknown: tune returned bandwidth_hz 0".into(),
+                });
+            }
+            if tuning.bandwidth_hz.0 > out {
+                return Err(OpError::OutOfRange {
+                    field: "bandwidth_hz".into(),
+                    value: tuning.bandwidth_hz.0,
+                    min: 1,
+                    max: out,
+                    suggested: None,
+                });
+            }
+        }
+        Ok(match self {
             JobKind::Passthrough => Graph {
                 id: GraphId::new(),
                 nodes: vec![GraphNode {
@@ -165,13 +192,13 @@ impl JobKind {
                             params: serde_json::json!({
                                 "center_hz": tuning.center_hz.0,
                                 "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": 48_000,
+                                "out_rate_hz": out,
                             }),
                         },
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000}),
+                            params: serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": out}),
                         },
                     ],
                     edges: vec![Edge {
@@ -192,13 +219,13 @@ impl JobKind {
                             params: serde_json::json!({
                                 "center_hz": tuning.center_hz.0,
                                 "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": 48_000,
+                                "out_rate_hz": out,
                             }),
                         },
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({"deviation_hz": 3_000, "audio_rate_hz": 48_000}),
+                            params: serde_json::json!({"deviation_hz": 3_000, "audio_rate_hz": out}),
                         },
                         GraphNode {
                             id: decode.clone(),
@@ -220,8 +247,26 @@ impl JobKind {
                     ],
                 }
             }
-        }
+        })
     }
+}
+
+/// The lowest channel output rate a job is channelised at.
+pub const CHANNEL_RATE_MIN_HZ: u64 = 48_000;
+
+/// The narrowest exact divisor of `source_rate_hz` that is at least
+/// [`CHANNEL_RATE_MIN_HZ`] and at least `bandwidth_hz`; the source rate itself
+/// when it is no wider than that. Integer only: the channel stage decimates by
+/// an exact integer factor.
+pub fn channel_rate_hz(source_rate_hz: u64, bandwidth_hz: u64) -> u64 {
+    let target = bandwidth_hz.max(CHANNEL_RATE_MIN_HZ);
+    if target >= source_rate_hz {
+        return source_rate_hz;
+    }
+    (1..=source_rate_hz / target)
+        .rev()
+        .find(|d| source_rate_hz.is_multiple_of(*d))
+        .map_or(source_rate_hz, |d| source_rate_hz / d)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -604,8 +649,13 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 center_hz,
                 bandwidth_hz,
             };
-            checked_port(node, &source, &tuning)?;
-            let graph = kind.expand(&source, tuning);
+            let port = checked_port(node, &source, &tuning)?;
+            // The granted capture band: its width is the source rate (Port contract).
+            let granted = node
+                .tune_if_unheld(port.as_ref(), tuning)
+                .await
+                .map_err(lease_error)?;
+            let graph = kind.expand(&source, tuning, granted.bandwidth_hz)?;
             node.job_start(kind.name(), source, tuning, graph)
                 .await
                 .map(OpResult::Job)

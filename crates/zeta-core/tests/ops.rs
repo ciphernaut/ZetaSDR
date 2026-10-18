@@ -10,7 +10,7 @@ use zeta_core::classify::StubClassifier;
 use zeta_core::job::JobState;
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::node::{Node, NodeConfig};
-use zeta_core::ops::{JobKind, Op, OpError, OpResult, schema};
+use zeta_core::ops::{JobKind, Op, OpError, OpResult, channel_rate_hz, schema};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{
@@ -27,6 +27,8 @@ struct WidePort {
     tx: tokio::sync::broadcast::Sender<IqBlock>,
     /// Sleep inside `tune`, to widen the window a concurrent call could race into.
     slow: bool,
+    /// `tune` calls so far, counted on entry.
+    tunes: std::sync::atomic::AtomicUsize,
 }
 
 impl WidePort {
@@ -40,6 +42,7 @@ impl WidePort {
     fn new(id: &str) -> Self {
         Self {
             slow: false,
+            tunes: std::sync::atomic::AtomicUsize::new(0),
             id: SourceId(id.into()),
             caps: Capabilities {
                 tune_min_hz: Claim::Asserted(Hz(1_000_000)),
@@ -67,6 +70,7 @@ impl Port for WidePort {
         &self.caps
     }
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        self.tunes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.slow {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -317,8 +321,16 @@ async fn source_ensure_during_job_start_does_not_retune() {
         center_hz: Hz(433_000_000),
         bandwidth_hz: Hz(200_000),
     };
-    // `join!` polls `start` first, so the job is inside its slow tune when `ensure` runs.
-    let (started, ensured) = tokio::join!(node.apply(start), node.apply(ensure));
+    // `job_start` tunes twice: once (unheld) to learn the source rate, then
+    // under its lease. Send `ensure` once the second, slow tune has begun, so
+    // it lands inside the job's lease-and-tune.
+    let ensured = async {
+        while port.tunes.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        node.apply(ensure).await
+    };
+    let (started, ensured) = tokio::join!(node.apply(start), ensured);
     let job: JobId = match started {
         Ok(OpResult::Job(id)) => id,
         other => panic!("expected Job, got {other:?}"),
@@ -790,7 +802,9 @@ fn spectrum_kind_expands_to_single_fft_node() {
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(48_000),
     };
-    let g = JobKind::Spectrum.expand(&SourceId("file0".into()), tuning);
+    let g = JobKind::Spectrum
+        .expand(&SourceId("file0".into()), tuning, Hz(48_000))
+        .unwrap();
     assert_eq!(g.nodes.len(), 1);
     assert!(g.edges.is_empty());
     assert_eq!(g.nodes[0].kind, "fft");
@@ -811,7 +825,9 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
         center_hz: Hz(100_005_000),
         bandwidth_hz: Hz(12_500),
     };
-    let g = JobKind::FmDemod.expand(&SourceId("file0".into()), tuning);
+    let g = JobKind::FmDemod
+        .expand(&SourceId("file0".into()), tuning, Hz(48_000))
+        .unwrap();
     assert_eq!(g.nodes.len(), 2);
     assert_eq!(g.nodes[0].kind, "channel");
     assert_eq!(
@@ -840,11 +856,100 @@ fn measure_kind_expands_to_one_measure_node() {
         center_hz: Hz(144_800_000),
         bandwidth_hz: Hz(12_500),
     };
-    let g = JobKind::Measure.expand(&SourceId("file0".into()), tuning);
+    let g = JobKind::Measure
+        .expand(&SourceId("file0".into()), tuning, Hz(48_000))
+        .unwrap();
     assert_eq!(g.nodes.len(), 1);
     assert_eq!(g.nodes[0].kind, "measure");
     assert_eq!(g.nodes[0].params, serde_json::json!({}));
     assert!(g.edges.is_empty());
+}
+
+#[test]
+fn channel_rate_table() {
+    for (rate, bw, want) in [
+        (48_000, 12_500, 48_000),
+        (12_000, 10_000, 12_000),
+        (1_000_000, 12_500, 50_000),
+        (2_048_000, 12_500, 51_200),
+        (2_400_000, 12_500, 48_000),
+        (8_000_000, 12_500, 50_000),
+        (10_000_000, 12_500, 50_000),
+        (20_000_000, 200_000, 200_000),
+        (12_007, 5_000, 12_007),
+    ] {
+        assert_eq!(channel_rate_hz(rate, bw), want, "{rate} {bw}");
+    }
+}
+
+#[test]
+fn expand_uses_source_rate_for_channel_and_audio() {
+    let rates = |g: &zeta_core::graph::Graph| {
+        assert_eq!(g.nodes[0].kind, "channel");
+        assert_eq!(g.nodes[1].kind, "nbfm_demod");
+        (
+            g.nodes[0].params["out_rate_hz"].as_u64().unwrap(),
+            g.nodes[1].params["audio_rate_hz"].as_u64().unwrap(),
+        )
+    };
+    let src = SourceId("rtl0".into());
+    let tuning = Tuning {
+        center_hz: Hz(144_800_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let g = JobKind::FmDemod
+        .expand(&src, tuning, Hz(2_048_000))
+        .unwrap();
+    assert_eq!(rates(&g), (51_200, 51_200));
+    let tuning = Tuning {
+        center_hz: Hz(7_100_000),
+        bandwidth_hz: Hz(10_000),
+    };
+    let g = JobKind::FmDemod.expand(&src, tuning, Hz(12_000)).unwrap();
+    assert_eq!(rates(&g), (12_000, 12_000));
+    let g = JobKind::AprsDecode
+        .expand(&src, tuning, Hz(12_000))
+        .unwrap();
+    assert_eq!(rates(&g), (12_000, 12_000));
+    assert_eq!(g.nodes[1].params["deviation_hz"], 3_000);
+}
+
+#[test]
+fn expand_rejects_band_wider_than_channel_rate() {
+    let tuning = Tuning {
+        center_hz: Hz(7_100_000),
+        bandwidth_hz: Hz(20_000),
+    };
+    let err = JobKind::FmDemod
+        .expand(&SourceId("kiwi0".into()), tuning, Hz(12_000))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        OpError::OutOfRange {
+            field: "bandwidth_hz".into(),
+            value: 20_000,
+            min: 1,
+            max: 12_000,
+            suggested: None,
+        }
+    );
+}
+
+#[test]
+fn expand_rejects_unknown_source_rate() {
+    let tuning = Tuning {
+        center_hz: Hz(7_100_000),
+        bandwidth_hz: Hz(10_000),
+    };
+    let err = JobKind::AprsDecode
+        .expand(&SourceId("kiwi0".into()), tuning, Hz(0))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        OpError::Other {
+            message: "source rate unknown: tune returned bandwidth_hz 0".into(),
+        }
+    );
 }
 
 #[tokio::test]
