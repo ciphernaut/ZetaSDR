@@ -128,7 +128,9 @@ async fn aprs_decode_job_decodes_fixture_packet() {
     let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", RATE, 0.0);
     let meta = write_fixture(dir.path(), "aprs", &iq, RATE, CENTER);
     let opts = FileOpts {
-        realtime: false,
+        // Paced like a radio: an unpaced source outruns the debug-build pipeline,
+        // lagged frames are skipped and the packet is damaged.
+        realtime: true,
         block_samples: 4800,
         repeat: true,
     };
