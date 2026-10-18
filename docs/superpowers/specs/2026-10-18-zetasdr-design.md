@@ -510,6 +510,10 @@ thinking models when their reasoning could not be turned off.
 
 Consequences written into the design:
 
+- **First cut uses `field-host`** (RTX 4090, gemma-4-12b and larger, with
+  "-decide" variants) as the model host (user's decision). `orangepirv2`
+  remains the floor-model target; the user is looking for a fresher
+  small model for it.
 - **Floor model is smallthinker-4b-a06b class**: 4B, non-thinking, native
   tool calling. The in-process agent adapter must support disabling
   reasoning (`enable_thinking` style template flags) and raising
