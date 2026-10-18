@@ -2917,8 +2917,11 @@ dependencies = [
  "async-trait",
  "axum",
  "reqwest",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
+ "zeta-agent",
  "zeta-client",
  "zeta-core",
 ]
