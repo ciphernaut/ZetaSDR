@@ -51,8 +51,9 @@ The user's own words for the stories it must serve:
    consumer can subscribe to and that the UI can pin onto the waterfall.
 5. Knowledge (band plans, licences, signal signatures) is data from
    pluggable providers, never code in the core.
-6. Three classification layers (see section 6), with layer 3 driven by an
-   agent composing vetted DSP blocks.
+6. Four classification layers (see section 6): modulation, known
+   signatures, a learned SIGINT model slot, and an agent composing vetted
+   DSP blocks that feeds the model slot with labelled data.
 7. Acceleration is opportunistic: a stage can declare CPU, GPU or FPGA
    implementations and the scheduler picks.
 8. Runs on a Raspberry Pi at the antenna, a laptop, and a GPU/FPGA
@@ -65,7 +66,11 @@ The user's own words for the stories it must serve:
   such a model would need (section 6.4).
 - Hosting the stack on a PortaPack or phone. Those are sources and thin
   clients.
-- Transmit. Nothing in this document precludes it, nothing requires it.
+- Transmit is not built in v1, but it is designed for: ports carry rx and
+  tx capability flags, a sink stream type exists, and a job may produce IQ
+  destined for a transmitter. TX is disabled per port until explicitly
+  enabled, and the runtime consults the knowledge provider before keying
+  so it can refuse "you are not licensed for that".
 - A node-graph editor as the primary authoring surface. The graph is a
   document; a visual editor is one optional way to write it.
 
@@ -149,9 +154,12 @@ The user's own words for the stories it must serve:
          plugins (in-process) · external processes (socket)
 ```
 
-### 4.1 Sources
+### 4.1 Sources (ports)
 
-A source is anything that yields samples or pre-channelised data.
+A source is anything that yields samples or pre-channelised data. The
+abstraction is really a *port* with `rx` and `tx` capability flags; a
+transmit-capable port also accepts a sink stream. This document says
+"source" for the rx side, which is all v1 uses.
 
 - Declares a **capability record**: tuning range, instantaneous
   bandwidth, sample formats, channel count, gain controls, whether it is
@@ -215,6 +223,17 @@ channel, which time span):
 - text (decoded messages, speech-to-text)
 - events (structured: an ADS-B position, an ACARS message, a
   classification result, a job state change)
+- sink (IQ destined for a tx-capable port; designed for, not built, in v1)
+
+**Inter-node encoding (user's decision)**: IQ streams between nodes are
+carried as VITA 49.2 (DIFI profile where applicable): signal data packets
+with stream ids, and context packets carrying centre frequency, sample
+rate, gain, geolocation and picosecond-resolution timestamps. That is
+what phase-coherent multi-SDR setups need later, and USRPs and most FPGA
+front ends speak it natively, so those sources drop in without an
+adapter. The remaining stream types (audio, video, text, events, sink
+metadata) ride ZetaSDR's own typed envelope on the same transport; VRT
+extension packets would carry them but nobody else would understand them.
 
 Any stream can be overlaid on the waterfall pinned to its channel, or
 shipped out of the node. Add-on applications that do one thing very well
@@ -236,7 +255,8 @@ region" and "what does signal type X look like".
 ### 4.5 Classifier plugins
 
 Flat contract: input is IQ (primary) or a spectrogram (secondary), plus
-the layer-1 feature record; output is labels with confidence. Audio is
+the layer-1 feature record; output is labels with confidence. Layer 1
+measurement, layer 2 matching and the layer 3 model slot all use it. Audio is
 **not** a classifier input; it is a post-demod content stage (voice,
 Morse). Implementations are swappable as the research crop changes.
 
@@ -319,12 +339,15 @@ graph.get / graph.put(document)
   anywhere else.
 - ACP / A2A are deferred until there is a second agent to talk to.
 
-### 5.3 Companion skill
+### 5.3 Companion skill: AGENTS.md is the core (user's decision)
 
-A Claude Code skill (and equivalents for other harnesses) teaches an
-agent the vocabulary plus the field craft: where radiosondes live, what a
-POCSAG preamble looks like, how to work layer 3. The vocabulary makes
-commands precise; the skill makes the agent competent.
+The repository's AGENTS.md is the single teaching document: the
+vocabulary, the field craft (where radiosondes live, what a POCSAG
+preamble looks like, how to work layer 4), and the rules of engagement.
+The Claude Code skill, equivalents for other harnesses, the MCP tool
+descriptions and the CLI help are all generated from it, so they cannot
+drift. The vocabulary makes commands precise; the skill makes the agent
+competent.
 
 ### 5.4 Voice
 
@@ -355,29 +378,42 @@ broadcast FM, and so on. Two kinds of evidence, both reported:
   or framing passes. Exact, cheap, zero training. For digital protocols
   this is the most reliable classifier that exists today.
 
-### 6.3 Layer 3: the agentic loop
+### 6.3 Layer 3: the learned SIGINT model (slot)
 
-For anything layer 2 cannot name, an agent drives a job with a toolbox of
+A trained model that takes IQ or a spectrogram plus the layer-1 record
+and emits labels with confidence, through the classifier plugin
+contract. The slot exists from v1 with a stub. The model itself is the
+parked project (6.5); it is trained on what layer 4 produces.
+
+### 6.4 Layer 4: the agentic loop
+
+For anything layers 2 and 3 cannot name, an agent drives a job with a toolbox of
 **vetted DSP blocks with typed parameters** (filter, resample, clock
 recovery, symbol slicer, correlator, descrambler, bit viewer) and
 iterates: isolate the channel, recover symbols, inspect bits, hypothesise
 framing, attempt a decode, look again. Context is retained so it can
-resume. A successful outcome is written back as a new layer-2 signature.
-That write-back is the project's real flywheel.
+resume. Two things are written back:
+
+- a successful outcome becomes a new layer-2 signature
+- every session, successful or not, emits a labelled SigMF capture with
+  its feature record, the steps taken and the outcome: the training data
+  for layer 3
+
+That write-back is the project's real flywheel: layer 4 is the data
+generator for layer 3.
 
 Arbitrary user- or agent-written flowgraph code is **not** allowed in v1.
 It arrives later behind an explicit sandbox flag.
 
-### 6.4 The parked SIGINT model
+### 6.5 The parked SIGINT model
 
 No usable RF-native foundation model exists for the bands of interest as
-of this date. Verified: LWM-Spectro (weights released, spectrogram input,
+of this date. Layer 3 is a slot with a stub until that project delivers. Verified: LWM-Spectro (weights released, spectrogram input,
 knows LTE/WiFi/5G only); EMind (1.35 GB checkpoint, undocumented input,
 no licence); cvnet-rf (RadioML toy). Paper-only: IQFM, Radio-FM,
-SpectrumFM, RF-GPT, RFPrompt, WirelessJEPA. Layer 1 and 2 contracts leave
-a slot. ZetaSDR should be able to export labelled SigMF captures with
-feature records and layer-2 outcomes, which is the data shape that
-project will want. Nothing more is in scope here.
+SpectrumFM, RF-GPT, RFPrompt, WirelessJEPA. Layer 4 exports the labelled
+SigMF captures with feature records and outcomes that project will train
+on. Nothing more is in scope here.
 
 ## 7. The user interface
 
@@ -394,8 +430,13 @@ One runtime state, two renderers, chosen by footprint (user's decision):
   appear as channel-pinned ribbons, collapsible transcript, maximum
   spectrum.
 - **Context menu** on a selection: "What is this?", decode, start
-  background job, save as SigMF, send to layer-3 agent. It emits the same
+  background job, save as SigMF, send to layer-4 agent. It emits the same
   operations the agent does.
+
+- **Graph view** (user's decision): a ComfyUI-style rendering of a job's
+  graph document, readable and editable, for watching a layer-4 session
+  compose blocks and for inspecting a TX chain before enabling it. It is a
+  renderer of the document, never the only way to author one.
 
 The UI is a client of the node's websocket; nothing is "desktop only" by
 accident. Mockup: `/Projects/ham/.superpowers/brainstorm/*/content/waterfall-layout.html`.
