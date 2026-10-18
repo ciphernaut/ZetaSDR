@@ -1373,3 +1373,14 @@ fn job_start_schema_requires_nullable_deviation() {
     let ty = &v["properties"]["deviation_hz"]["type"];
     assert_eq!(ty, &serde_json::json!(["integer", "null"]), "{v}");
 }
+
+#[test]
+fn job_start_without_deviation_key_is_rejected() {
+    let v = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
+        "center_hz":100_000_000,"bandwidth_hz":48_000});
+    let e = serde_json::from_value::<Op>(v).unwrap_err().to_string();
+    assert!(e.contains("deviation_hz"), "{e}");
+    let ok = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
+        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null});
+    assert!(serde_json::from_value::<Op>(ok).is_ok());
+}

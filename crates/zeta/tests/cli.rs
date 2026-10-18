@@ -392,3 +392,44 @@ fn then_tail_reports_failed_job() {
     let reason = v[1]["state"]["reason"].as_str().unwrap_or_default();
     assert!(reason.contains("too low for afsk1200"), "{v}");
 }
+
+#[test]
+fn job_start_accepts_deviation_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "fm_demod",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "12500",
+            "--deviation-hz",
+            "3000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let id = json(&out)["value"].as_str().expect("job id").to_owned();
+    let out = zeta(dir.path(), &["graph", "get", "--job", &id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let g = json(&out);
+    let nodes = g["value"]["nodes"].as_array().expect("nodes");
+    let nbfm = nodes
+        .iter()
+        .find(|n| n["kind"] == "nbfm_demod")
+        .expect("nbfm node");
+    assert_eq!(nbfm["params"]["deviation_hz"], 3000);
+}

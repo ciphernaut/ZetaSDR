@@ -51,6 +51,7 @@ pub enum Op {
         bandwidth_hz: Hz,
         /// FM peak deviation in Hz (100..=75000) for `fm_demod`; `null` is the
         /// kind's default (5000). Any other kind must pass `null`.
+        #[serde(deserialize_with = "nullable_u64")]
         #[schemars(required, schema_with = "nullable_hz_u64")]
         deviation_hz: Option<u64>,
     },
@@ -102,6 +103,12 @@ pub enum Op {
         selection: Selection,
     },
     Schema {},
+}
+
+/// Deserialize a required `Option<u64>`: without `#[serde(default)]` a missing
+/// key is a "missing field" error, while an explicit `null` is `None`.
+fn nullable_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    <Option<u64> as Deserialize>::deserialize(d)
 }
 
 /// Schema of a required `Option<u64>`: `["integer","null"]`. (`required` alone
@@ -741,8 +748,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
         } => {
             let deviation = match deviation_hz {
                 None => None,
-                Some(d) if kind != JobKind::FmDemod => {
-                    let _ = d;
+                Some(_) if kind != JobKind::FmDemod => {
                     return Err(OpError::Other {
                         message: format!(
                             "deviation_hz applies only to kind fm_demod; pass null (kind is {})",
