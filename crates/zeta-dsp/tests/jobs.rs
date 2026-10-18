@@ -67,6 +67,7 @@ async fn fm_demod_job_produces_audio_with_tone() {
             source: SourceId("file0".into()),
             center_hz: Hz(100_005_000),
             bandwidth_hz: Hz(12_500),
+            deviation_hz: Some(2_500), // the fixture's deviation
         })
         .await
         .unwrap()
@@ -155,6 +156,7 @@ async fn aprs_decode_job_decodes_fixture_packet() {
             source: SourceId("file0".into()),
             center_hz: Hz(CENTER),
             bandwidth_hz: Hz(12_500),
+            deviation_hz: None,
         })
         .await
         .unwrap()
@@ -238,6 +240,7 @@ async fn start(node: &Node, kind: JobKind, center_hz: u64, bandwidth_hz: u64) ->
             source: SourceId("file0".into()),
             center_hz: Hz(center_hz),
             bandwidth_hz: Hz(bandwidth_hz),
+            deviation_hz: None,
         })
         .await
         .unwrap()

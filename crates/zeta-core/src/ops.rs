@@ -49,6 +49,10 @@ pub enum Op {
         source: SourceId,
         center_hz: Hz,
         bandwidth_hz: Hz,
+        /// FM peak deviation in Hz (100..=75000) for `fm_demod`; `null` is the
+        /// kind's default (5000). Any other kind must pass `null`.
+        #[schemars(required, schema_with = "nullable_hz_u64")]
+        deviation_hz: Option<u64>,
     },
     JobList {},
     JobStop {
@@ -100,6 +104,22 @@ pub enum Op {
     Schema {},
 }
 
+/// Schema of a required `Option<u64>`: `["integer","null"]`. (`required` alone
+/// would drop the `null`.)
+fn nullable_hz_u64(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint64",
+        "minimum": 0,
+        "description": "FM peak deviation in Hz (100..=75000) for `fm_demod`; `null` is the kind's default (5000). Any other kind must pass `null`."
+    })
+}
+
+/// `fm_demod` peak deviation when a job start passes `null`.
+pub const FM_DEVIATION_DEFAULT_HZ: u64 = 5_000;
+const FM_DEVIATION_MIN_HZ: u64 = 100;
+const FM_DEVIATION_MAX_HZ: u64 = 75_000;
+
 /// Built-in job kinds; each expands to a graph. `fm_demod` and `aprs_decode`
 /// channelise the job band at the narrowest exact divisor of the source rate
 /// that is at least 48 kHz and at least the band; `spectrum` covers the whole
@@ -140,6 +160,7 @@ impl JobKind {
         _source: &SourceId,
         tuning: Tuning,
         source_rate_hz: Hz,
+        deviation_hz: Option<Hz>,
     ) -> Result<Graph, OpError> {
         let out = channel_rate_hz(source_rate_hz.0, tuning.bandwidth_hz.0);
         if self.channelised() {
@@ -203,7 +224,7 @@ impl JobKind {
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": out}),
+                            params: serde_json::json!({"deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0), "audio_rate_hz": out}),
                         },
                     ],
                     edges: vec![Edge {
@@ -632,6 +653,7 @@ async fn reconcile_rate(
     id: &JobId,
     kind: JobKind,
     tuning: Tuning,
+    deviation_hz: Option<Hz>,
     mut expected: Hz,
 ) -> Result<(), OpError> {
     if !kind.channelised() {
@@ -660,7 +682,7 @@ async fn reconcile_rate(
                 options: vec!["retry job_start".into(), "stop one of the holders".into()],
             });
         }
-        let graph = match kind.expand(port.id(), tuning, leased.bandwidth_hz) {
+        let graph = match kind.expand(port.id(), tuning, leased.bandwidth_hz, deviation_hz) {
             Ok(g) => g,
             Err(e) => {
                 let _ = node.job_stop(id).await;
@@ -715,7 +737,24 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             source,
             center_hz,
             bandwidth_hz,
+            deviation_hz,
         } => {
+            let deviation = match deviation_hz {
+                None => None,
+                Some(d) if kind != JobKind::FmDemod => {
+                    let _ = d;
+                    return Err(OpError::Other {
+                        message: format!(
+                            "deviation_hz applies only to kind fm_demod; pass null (kind is {})",
+                            kind.name()
+                        ),
+                    });
+                }
+                Some(d) => {
+                    range("deviation_hz", d, FM_DEVIATION_MIN_HZ, FM_DEVIATION_MAX_HZ)?;
+                    Some(Hz(d))
+                }
+            };
             let tuning = Tuning {
                 center_hz,
                 bandwidth_hz,
@@ -726,12 +765,21 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 .tune_if_unheld(port.as_ref(), tuning)
                 .await
                 .map_err(lease_error)?;
-            let graph = kind.expand(&source, tuning, granted.bandwidth_hz)?;
+            let graph = kind.expand(&source, tuning, granted.bandwidth_hz, deviation)?;
             let id = node
                 .job_start(kind.name(), source, tuning, graph)
                 .await
                 .map_err(|e| node_error(node, e))?;
-            reconcile_rate(node, port.as_ref(), &id, kind, tuning, granted.bandwidth_hz).await?;
+            reconcile_rate(
+                node,
+                port.as_ref(),
+                &id,
+                kind,
+                tuning,
+                deviation,
+                granted.bandwidth_hz,
+            )
+            .await?;
             Ok(OpResult::Job(id))
         }
         Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),

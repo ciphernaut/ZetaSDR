@@ -38,6 +38,9 @@ fn note(op: &str) -> Option<&'static str> {
         "graph_put" => Some(
             "Fetch the current graph with `graph get`, edit it, and put it back; stage kinds and their params are listed under Stage kinds below and by `schema`.",
         ),
+        "job_start" => Some(
+            "`deviation_hz` is the FM peak deviation for `fm_demod` (100-75000 Hz; `null` means the default, 5000 Hz, right for standard voice FM; use 2500 for narrow 12.5 kHz channels). Every other kind takes `null`. On the CLI, omit `--deviation-hz` for `null`.",
+        ),
         "knowledge_lookup" => Some(
             "The built-in provider has signatures but no allocations, so an empty `allocations` list means no provider data, not nothing allocated.",
         ),
@@ -160,6 +163,11 @@ fn required(def: &Value) -> Vec<&str> {
 
 fn type_of(s: &Value, defs: &Value) -> String {
     let (name, def) = resolve(s, defs);
+    // A nullable scalar (`["integer","null"]`) reads as `integer or null`.
+    if let Some(a) = def["type"].as_array() {
+        let t: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+        return t.join(" or ");
+    }
     let ty = def["type"].as_str().unwrap_or("any");
     match (ty, name) {
         ("integer", Some(n)) => format!("integer ({})", unit(n).unwrap_or(n)),
@@ -285,6 +293,13 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     });
     let mut flags = vec![];
     for (f, s) in fields {
+        // A nullable field is an optional flag; the example omits it.
+        if s["type"]
+            .as_array()
+            .is_some_and(|a| a.contains(&"null".into()))
+        {
+            continue;
+        }
         cli_flags(f, s, defs, &mut flags);
     }
     for (flag, v) in flags {

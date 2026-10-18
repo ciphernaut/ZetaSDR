@@ -57,10 +57,13 @@ CLI: `zeta source ensure --source <id> --center-hz 144800000 --bandwidth-hz 1250
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
+- deviation_hz: integer or null
 
-JSON: `{"op":"job_start","kind":"passthrough","source":"<id>","center_hz":144800000,"bandwidth_hz":12500}`
+JSON: `{"op":"job_start","kind":"passthrough","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"deviation_hz":null}`
 
 CLI: `zeta job start --kind passthrough --source <id> --center-hz 144800000 --bandwidth-hz 12500`
+
+`deviation_hz` is the FM peak deviation for `fm_demod` (100-75000 Hz; `null` means the default, 5000 Hz, right for standard voice FM; use 2500 for narrow 12.5 kHz channels). Every other kind takes `null`. On the CLI, omit `--deviation-hz` for `null`.
 
 ### job_list
 

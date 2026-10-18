@@ -153,6 +153,10 @@ pub enum JobCmd {
         kind: Kind,
         #[command(flatten)]
         band: BandArgs,
+        /// FM peak deviation in Hz (100..=75000), fm_demod only; absent = the
+        /// kind's default (5000)
+        #[arg(long, value_name = "HZ")]
+        deviation_hz: Option<u64>,
         /// After starting, tail the job's first event (else audio) stream, stop
         /// the job and print `[job_result, frames_result, {"stopped": true}]`;
         /// a job that is not running prints `[job_result, job_record]` and
@@ -363,11 +367,17 @@ impl Command {
                 center_hz: Hz(b.center_hz),
                 bandwidth_hz: Hz(b.bandwidth_hz),
             },
-            Command::Job(JobCmd::Start { kind, band: b, .. }) => Op::JobStart {
+            Command::Job(JobCmd::Start {
+                kind,
+                band: b,
+                deviation_hz,
+                ..
+            }) => Op::JobStart {
                 kind: kind.into(),
                 source: SourceId(b.source),
                 center_hz: Hz(b.center_hz),
                 bandwidth_hz: Hz(b.bandwidth_hz),
+                deviation_hz,
             },
             Command::Job(JobCmd::List) => Op::JobList {},
             Command::Job(JobCmd::Stop(a)) => Op::JobStop { job: job(a) },

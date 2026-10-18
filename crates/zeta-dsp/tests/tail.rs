@@ -37,6 +37,7 @@ async fn stream_tail_returns_events_from_running_job() {
             source: SourceId("file0".into()),
             center_hz: Hz(100_000_000),
             bandwidth_hz: Hz(48_000),
+            deviation_hz: None,
         })
         .await
     {

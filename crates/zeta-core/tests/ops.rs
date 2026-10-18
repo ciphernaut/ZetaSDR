@@ -185,6 +185,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         source: SourceId("file0".into()),
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(48_000),
+        deviation_hz: None,
     };
     let id = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -315,6 +316,7 @@ async fn source_ensure_during_job_start_does_not_retune() {
         source: source.clone(),
         center_hz: job_tuning.center_hz,
         bandwidth_hz: job_tuning.bandwidth_hz,
+        deviation_hz: None,
     };
     let ensure = Op::SourceEnsure {
         source,
@@ -404,6 +406,7 @@ async fn job_start_reexpands_when_lease_rate_differs() {
         source: source.clone(),
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
     };
     // B: 2 MHz around A's band, leased while A's slow pre-tune holds the gate,
     // so B's lease is queued ahead of A's and A's lease shares B's 2 MS/s capture.
@@ -416,7 +419,7 @@ async fn job_start_reexpands_when_lease_rate_differs() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let g = JobKind::Passthrough
-            .expand(&source, wide, wide.bandwidth_hz)
+            .expand(&source, wide, wide.bandwidth_hz, None)
             .unwrap();
         node.job_start("passthrough", source.clone(), wide, g).await
     };
@@ -759,6 +762,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         source: source.clone(),
         center_hz: held.center_hz,
         bandwidth_hz: held.bandwidth_hz,
+        deviation_hz: None,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -852,6 +856,7 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         source: SourceId("file0".into()),
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(48_000),
+        deviation_hz: None,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -897,7 +902,7 @@ fn spectrum_kind_expands_to_single_fft_node() {
         bandwidth_hz: Hz(48_000),
     };
     let g = JobKind::Spectrum
-        .expand(&SourceId("file0".into()), tuning, Hz(48_000))
+        .expand(&SourceId("file0".into()), tuning, Hz(48_000), None)
         .unwrap();
     assert_eq!(g.nodes.len(), 1);
     assert!(g.edges.is_empty());
@@ -920,7 +925,7 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
         bandwidth_hz: Hz(12_500),
     };
     let g = JobKind::FmDemod
-        .expand(&SourceId("file0".into()), tuning, Hz(48_000))
+        .expand(&SourceId("file0".into()), tuning, Hz(48_000), None)
         .unwrap();
     assert_eq!(g.nodes.len(), 2);
     assert_eq!(g.nodes[0].kind, "channel");
@@ -931,7 +936,7 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
     assert_eq!(g.nodes[1].kind, "nbfm_demod");
     assert_eq!(
         g.nodes[1].params,
-        serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000})
+        serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000})
     );
     assert_eq!(g.edges.len(), 1);
     assert_eq!(g.edges[0].from, g.nodes[0].id);
@@ -951,7 +956,7 @@ fn measure_kind_expands_to_one_measure_node() {
         bandwidth_hz: Hz(12_500),
     };
     let g = JobKind::Measure
-        .expand(&SourceId("file0".into()), tuning, Hz(48_000))
+        .expand(&SourceId("file0".into()), tuning, Hz(48_000), None)
         .unwrap();
     assert_eq!(g.nodes.len(), 1);
     assert_eq!(g.nodes[0].kind, "measure");
@@ -992,17 +997,19 @@ fn expand_uses_source_rate_for_channel_and_audio() {
         bandwidth_hz: Hz(12_500),
     };
     let g = JobKind::FmDemod
-        .expand(&src, tuning, Hz(2_048_000))
+        .expand(&src, tuning, Hz(2_048_000), None)
         .unwrap();
     assert_eq!(rates(&g), (51_200, 51_200));
     let tuning = Tuning {
         center_hz: Hz(7_100_000),
         bandwidth_hz: Hz(10_000),
     };
-    let g = JobKind::FmDemod.expand(&src, tuning, Hz(12_000)).unwrap();
+    let g = JobKind::FmDemod
+        .expand(&src, tuning, Hz(12_000), None)
+        .unwrap();
     assert_eq!(rates(&g), (12_000, 12_000));
     let g = JobKind::AprsDecode
-        .expand(&src, tuning, Hz(12_000))
+        .expand(&src, tuning, Hz(12_000), None)
         .unwrap();
     assert_eq!(rates(&g), (12_000, 12_000));
     assert_eq!(g.nodes[1].params["deviation_hz"], 3_000);
@@ -1015,7 +1022,7 @@ fn expand_rejects_band_wider_than_channel_rate() {
         bandwidth_hz: Hz(20_000),
     };
     let err = JobKind::FmDemod
-        .expand(&SourceId("kiwi0".into()), tuning, Hz(12_000))
+        .expand(&SourceId("kiwi0".into()), tuning, Hz(12_000), None)
         .unwrap_err();
     assert_eq!(
         err,
@@ -1036,7 +1043,7 @@ fn expand_rejects_unknown_source_rate() {
         bandwidth_hz: Hz(10_000),
     };
     let err = JobKind::AprsDecode
-        .expand(&SourceId("kiwi0".into()), tuning, Hz(0))
+        .expand(&SourceId("kiwi0".into()), tuning, Hz(0), None)
         .unwrap_err();
     assert_eq!(
         err,
@@ -1258,4 +1265,111 @@ async fn stream_tail_validates_limits() {
             })
         );
     }
+}
+
+fn fm_tuning() -> Tuning {
+    Tuning {
+        center_hz: Hz(100_005_000),
+        bandwidth_hz: Hz(12_500),
+    }
+}
+
+#[test]
+fn fm_demod_default_deviation_is_5000() {
+    let g = JobKind::FmDemod
+        .expand(&SourceId("file0".into()), fm_tuning(), Hz(48_000), None)
+        .unwrap();
+    assert_eq!(g.nodes[1].params["deviation_hz"], 5_000);
+    assert_eq!(zeta_core::ops::FM_DEVIATION_DEFAULT_HZ, 5_000);
+}
+
+#[test]
+fn deviation_param_reaches_nbfm_node() {
+    let g = JobKind::FmDemod
+        .expand(
+            &SourceId("file0".into()),
+            fm_tuning(),
+            Hz(48_000),
+            Some(Hz(2_500)),
+        )
+        .unwrap();
+    assert_eq!(g.nodes[1].params["deviation_hz"], 2_500);
+}
+
+fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
+    Op::JobStart {
+        kind,
+        source: SourceId("hackrf0".into()),
+        center_hz: Hz(100_005_000),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz,
+    }
+}
+
+#[tokio::test]
+async fn deviation_out_of_range_names_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    // 5 Hz is below 100; the x1000 suggestion (5000 Hz) is in range.
+    match node.apply(start_with(JobKind::FmDemod, Some(5))).await {
+        Err(OpError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+            suggested,
+        }) => {
+            assert_eq!(field, "deviation_hz");
+            assert_eq!((value, min, max), (5, 100, 75_000));
+            assert_eq!(suggested, Some(5_000));
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+    assert!(matches!(
+        node.apply(start_with(JobKind::FmDemod, Some(75_001))).await,
+        Err(OpError::OutOfRange { .. })
+    ));
+}
+
+#[tokio::test]
+async fn deviation_on_other_kind_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    for kind in [JobKind::Measure, JobKind::AprsDecode] {
+        match node.apply(start_with(kind, Some(5_000))).await {
+            Err(OpError::Other { message }) => {
+                assert!(
+                    message.starts_with("deviation_hz applies only"),
+                    "{message}"
+                );
+                assert!(message.contains(kind.name()), "{message}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn job_start_schema_requires_nullable_deviation() {
+    let s = schema();
+    let v = variants(&s["op"])
+        .iter()
+        .find(|v| v["properties"]["op"]["const"] == "job_start")
+        .expect("job_start variant");
+    let req = v["required"].as_array().unwrap();
+    assert!(req.contains(&"deviation_hz".into()), "{v}");
+    let ty = &v["properties"]["deviation_hz"]["type"];
+    assert_eq!(ty, &serde_json::json!(["integer", "null"]), "{v}");
 }
