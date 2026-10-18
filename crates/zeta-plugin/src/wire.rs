@@ -96,7 +96,7 @@ pub enum WireError {
 }
 
 /// A kind's wire name (`iq`, `audio`, ...).
-fn kind_name(k: StreamKind) -> &'static str {
+pub(crate) fn kind_name(k: StreamKind) -> &'static str {
     match k {
         StreamKind::Iq => "iq",
         StreamKind::Audio => "audio",

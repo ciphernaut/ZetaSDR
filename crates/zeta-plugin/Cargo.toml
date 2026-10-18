@@ -6,13 +6,24 @@ license.workspace = true
 description = "External-process stages for ZetaSDR: the stdio plugin protocol"
 
 [dependencies]
+async-trait = "0.1.92"
 num-complex = "0.4.6"
+schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["io-util"] }
+tokio = { version = "1.53.3", features = ["io-util", "io-std", "macros", "process", "rt", "sync", "time"] }
+tokio-util = "0.7.20"
 zeta-core = { path = "../zeta-core" }
 
 [dev-dependencies]
-tokio = { version = "1.53.3", features = ["io-util", "macros", "rt"] }
+tempfile = "3.27.0"
 zeta-ws = { path = "../zeta-ws" }
+
+# A test double: a plugin whose `--mode` exercises each host failure path. Built with the
+# crate's tests (`CARGO_BIN_EXE_zeta-plugin-fake`); the crate is never installed.
+[[bin]]
+name = "zeta-plugin-fake"
+path = "src/bin/fake.rs"
+test = false
+doc = false

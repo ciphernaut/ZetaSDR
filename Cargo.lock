@@ -3754,11 +3754,15 @@ dependencies = [
 name = "zeta-plugin"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "num-complex",
+ "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "zeta-core",
  "zeta-ws",
 ]
