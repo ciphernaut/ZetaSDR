@@ -35,6 +35,11 @@ fn audio_rate(rate: u64) -> u64 {
 }
 
 /// Decodes APRS from the strongest occupied band of the block.
+///
+/// A caller-supplied `FeatureRecord.center_hz` must be measured with the block
+/// centre at `rate/2` (as `measure(iq, rate, rate / 2)` does); the channel
+/// offset taken from it is `center_hz - rate/2`. A record measured against the
+/// real RF centre would put the channel far outside the block.
 pub struct DecodeToIdentify;
 
 #[async_trait]

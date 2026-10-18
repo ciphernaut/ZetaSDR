@@ -1,4 +1,5 @@
-//! Build the node the CLI drives: stage registry, file sources, knowledge and classifiers.
+//! Build the node the CLI drives: stage registry (core plus `zeta-dsp`), file
+//! sources, knowledge and classifiers.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +31,7 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
 pub fn registry() -> StageRegistry {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
+    zeta_dsp::register_all(&mut registry);
     registry
 }
 
@@ -70,5 +72,8 @@ pub async fn open(
     }
     node.add_knowledge(Arc::new(StaticKnowledge::builtin()));
     node.add_classifier(Arc::new(StubClassifier));
+    for c in zeta_dsp::classifiers() {
+        node.add_classifier(c);
+    }
     Ok(node)
 }

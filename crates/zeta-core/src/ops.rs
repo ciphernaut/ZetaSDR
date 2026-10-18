@@ -18,8 +18,8 @@ use crate::lease::LeaseError;
 use crate::node::{Node, NodeError};
 use crate::port::{Port, PortError, Tuning};
 use crate::ring::RingError;
-use crate::stream::StreamInfo;
-use crate::types::{Capabilities, Hz, JobId, Selection, SourceId, StreamKind};
+use crate::stream::{Frame, Payload, StreamInfo};
+use crate::types::{Capabilities, Hz, JobId, Selection, SourceId, StreamId, StreamKind, Timestamp};
 
 /// One request to the node.
 ///
@@ -63,6 +63,14 @@ pub enum Op {
         selection: Selection,
     },
     StreamList {},
+    /// Collect frames from a stream until `max_frames` arrive or `timeout_ms`
+    /// passes, whichever is first; frames published before the call are not
+    /// seen. Frames skipped because the caller fell behind are dropped.
+    StreamTail {
+        stream: StreamId,
+        max_frames: u32,
+        timeout_ms: u32,
+    },
     GraphGet {
         job: JobId,
     },
@@ -220,6 +228,52 @@ pub struct SourceInfo {
     pub holders: Vec<JobId>,
 }
 
+/// One frame of a `stream_tail`, as JSON. `start_ns`/`end_ns` are the frame's
+/// provenance span. `payload` by kind: event, the event value; text, the
+/// string; audio, `{"sample_rate_hz", "samples", "peak"}` (count and largest
+/// absolute sample); iq, `{"sample_rate_hz", "center_hz", "samples"}`;
+/// video and sink, `{}`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct FrameSummary {
+    pub stream: StreamId,
+    pub kind: StreamKind,
+    pub start_ns: Timestamp,
+    pub end_ns: Timestamp,
+    pub payload: serde_json::Value,
+}
+
+impl FrameSummary {
+    pub fn from_frame(f: &Frame) -> Self {
+        let payload = match &f.payload {
+            Payload::Event(v) => v.clone(),
+            Payload::Text(t) => serde_json::Value::String(t.clone()),
+            Payload::Audio {
+                sample_rate_hz,
+                samples,
+            } => serde_json::json!({
+                "sample_rate_hz": sample_rate_hz.0,
+                "samples": samples.len(),
+                "peak": samples.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+            }),
+            Payload::Iq(b) => serde_json::json!({
+                "sample_rate_hz": b.sample_rate_hz.0,
+                "center_hz": b.center_hz.0,
+                "samples": b.samples.len(),
+            }),
+            Payload::Video | Payload::Sink(_) => serde_json::json!({}),
+        };
+        Self {
+            stream: f.stream.clone(),
+            kind: f.kind,
+            start_ns: f.provenance.span.start_ns,
+            end_ns: f.provenance.span.end_ns,
+            payload,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "result",
@@ -245,6 +299,7 @@ pub enum OpResult {
         path: PathBuf,
     },
     Streams(Vec<StreamInfo>),
+    Frames(Vec<FrameSummary>),
     Graph(Graph),
     Knowledge {
         allocations: Vec<Allocation>,
@@ -552,6 +607,11 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             v.sort_by(|a, b| a.id.0.cmp(&b.id.0));
             Ok(OpResult::Streams(v))
         }
+        Op::StreamTail {
+            stream,
+            max_frames,
+            timeout_ms,
+        } => stream_tail(node, stream, max_frames, timeout_ms).await,
         Op::GraphGet { job } => node
             .job_list()
             .into_iter()
@@ -628,6 +688,38 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     Ok(OpResult::Labels(
         node.classifiers().run_all(&samples, rate, None).await,
     ))
+}
+
+/// Subscribe to `stream` and collect up to `max` frames within `timeout_ms`.
+/// A lagged receiver keeps going; a closed stream returns what was collected.
+async fn stream_tail(
+    node: &Node,
+    stream: StreamId,
+    max: u32,
+    timeout_ms: u32,
+) -> Result<OpResult, OpError> {
+    let bus = node.bus();
+    let Some(mut rx) = bus.subscribe(&stream) else {
+        let mut known: Vec<String> = bus.list().into_iter().map(|s| s.id.0).collect();
+        known.sort();
+        return Err(OpError::Unknown {
+            field: "stream".into(),
+            value: stream.0,
+            known,
+        });
+    };
+    let mut out = Vec::new();
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    while out.len() < max as usize {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Err(_) => break,
+            Ok(Ok(f)) => out.push(FrameSummary::from_frame(&f)),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+        }
+    }
+    Ok(OpResult::Frames(out))
 }
 
 /// Write the selection's span from the source ring as a cf32_le SigMF pair.

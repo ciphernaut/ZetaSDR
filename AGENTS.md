@@ -4,7 +4,7 @@ ZetaSDR is an agentic SDR runtime. You drive it through a small typed operation 
 
 ## Rules
 
-- One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`, times are integer nanoseconds since the UNIX epoch in fields ending `_ns`.
+- One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`, times are integer nanoseconds since the UNIX epoch in fields ending `_ns`, durations are integer milliseconds in fields ending `_ms`.
 - Every field is required and unknown fields are rejected.
 - Call operations, do not explain.
 - Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.
@@ -20,7 +20,7 @@ Every command takes two global flags:
 
 There are two ways to run:
 
-- One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span.
+- One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. `job start --then-tail MAX_FRAMES,TIMEOUT_MS` keeps that one-shot node up after the start, tails the job's first event stream (else its audio stream) and prints `[job_result, frames_result]`; `stream tail` on its own only sees streams of jobs running in the same process. A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span.
 - `zeta serve`: resumes persisted jobs and keeps them running until Ctrl-C.
 
 While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job stop`, `graph put`, `source ensure`) are then refused with an `other` error naming the server's pid; read-only commands still work.
@@ -94,6 +94,18 @@ JSON: `{"op":"stream_list"}`
 
 CLI: `zeta stream list`
 
+### stream_tail
+
+Collect frames from a stream until `max_frames` arrive or `timeout_ms` passes, whichever is first; frames published before the call are not seen. Frames skipped because the caller fell behind are dropped.
+
+- stream: string; an id from `stream list`
+- max_frames: integer
+- timeout_ms: integer
+
+JSON: `{"op":"stream_tail","stream":"<id>","max_frames":0,"timeout_ms":0}`
+
+CLI: `zeta stream tail --stream <id> --max-frames 0 --timeout-ms 0`
+
 ### graph_get
 
 - job: string; an id from `job list`
@@ -149,6 +161,38 @@ CLI: `zeta schema`
 
 A graph node's `kind` names one of these; its `params` must match the listed fields.
 
+### aprs_decode
+
+- inputs: audio
+- outputs: event
+
+### channel
+
+- inputs: iq
+- outputs: iq
+- params.center_hz: integer
+- params.bandwidth_hz: integer
+- params.out_rate_hz: integer
+
+### fft
+
+- inputs: iq
+- outputs: event
+- params.size: integer
+- params.window: string (Window: hann|rect)
+
+### measure
+
+- inputs: iq
+- outputs: event
+
+### nbfm_demod
+
+- inputs: iq
+- outputs: audio
+- params.deviation_hz: integer
+- params.audio_rate_hz: integer
+
 ### passthrough
 
 - inputs: iq, audio, video, text, event, sink
@@ -166,6 +210,10 @@ Measured facts first, then method. Verify against the node's `knowledge lookup` 
 - POCSAG: the preamble is 576 bits of alternating 1/0, then the 32-bit sync word 0x7CD215D8. Common rates are 512, 1200 and 2400 baud.
 - ADS-B: 1090 MHz, PPM at 1 Mbaud, 112-bit extended squitter.
 - MeshCore: LoRa around 915 MHz in AU and 869 MHz in EU, 250 kHz wide. Not decodable without the network key; classify and report, do not try to decode.
+
+### Decoding APRS and reading measurements
+
+To decode APRS from a source, start the job and tail its events in one call: `zeta job start --kind aprs_decode --source S --center-hz 144800000 --bandwidth-hz 12500 --then-tail 1,5000`. It prints `[job_result, frames_result]`; each frame's `payload` is one decoded packet (`src`, `dst`, `info`, `fcs_ok`). An empty frame list means no packet arrived within the timeout, not that none exist. A `measure` job emits one event per second of IQ: `center_hz` and `bandwidth_hz` are the occupied band (spectrum bins at least 6 dB above the median noise floor), `snr_db` is the peak above that floor, `burst` is true when the loudest 10 ms is more than 3 times the median 10 ms power, `symbol_rate_baud` is the keying rate when a symbol-rate line stands out and `null` otherwise, and `label.name` is one of `noise` (SNR under 6 dB), `carrier` (steady envelope, no modulation), `fm` (steady envelope with deviation), `fsk` (two tones 500-3000 Hz apart, on RF or in FM audio) or `unknown`. Report `unknown` as unknown, with the measured fields.
 
 ### Working layer 4
 

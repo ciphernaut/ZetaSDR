@@ -13,10 +13,10 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, schema};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::JobId;
 use zeta_core::types::{
     Capabilities, Claim, Hz, SampleFormat, Selection, SourceId, Span, Timestamp,
 };
+use zeta_core::types::{JobId, StreamId, StreamKind};
 use zeta_source_file::{FileOpts, FileSource, fixtures, read_meta};
 
 /// A port tunable over 1 MHz..6 GHz that accepts any in-range request.
@@ -342,7 +342,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 13, "one schema per Op variant");
+    assert_eq!(vs.len(), 14, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -462,10 +462,14 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                     ]
                     .iter()
                     .any(|w| name.contains(w));
+                    // `_ns` is an instant; `_ms` a duration (a timeout), plain integer.
                     assert!(
-                        !time || name.ends_with("_ns"),
-                        "{path}.{name} is a time field without _ns"
+                        !time || name.ends_with("_ns") || name.ends_with("_ms"),
+                        "{path}.{name} is a time field without _ns/_ms"
                     );
+                    if name.ends_with("_ms") {
+                        assert_eq!(s["type"], "integer", "{path}.{name} is not an integer");
+                    }
                     if ["_hz", "_ns", "_baud"].iter().any(|u| name.ends_with(u)) {
                         assert!(unit_typed(s, defs), "{path}.{name} is not a unit type: {s}");
                     }
@@ -828,4 +832,95 @@ fn measure_kind_expands_to_one_measure_node() {
     assert_eq!(g.nodes[0].kind, "measure");
     assert_eq!(g.nodes[0].params, serde_json::json!({}));
     assert!(g.edges.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_tail_returns_events_from_running_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let mut reg = registry();
+    zeta_dsp::register_all(&mut reg);
+    let node = Node::open(cfg(dir.path()), reg, vec![port]).await.unwrap();
+    src.start();
+    let job = match node
+        .apply(Op::JobStart {
+            kind: JobKind::Spectrum,
+            source: SourceId("file0".into()),
+            center_hz: Hz(100_000_000),
+            bandwidth_hz: Hz(48_000),
+        })
+        .await
+    {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected Job, got {other:?}"),
+    };
+    let mut stream = None;
+    for _ in 0..200 {
+        stream = node
+            .bus()
+            .list()
+            .into_iter()
+            .find(|s| s.kind == StreamKind::Event && s.provenance.job.as_ref() == Some(&job))
+            .map(|s| s.id);
+        if stream.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let stream = stream.expect("the job's event stream");
+    let op = Op::StreamTail {
+        stream: stream.clone(),
+        max_frames: 3,
+        timeout_ms: 2000,
+    };
+    let frames = match node.apply(op).await {
+        Ok(OpResult::Frames(f)) => f,
+        other => panic!("expected Frames, got {other:?}"),
+    };
+    assert_eq!(frames.len(), 3);
+    for f in &frames {
+        assert_eq!(f.stream, stream);
+        assert_eq!(f.kind, StreamKind::Event);
+        assert!(f.end_ns.0 > f.start_ns.0, "{f:?}");
+        assert_eq!(f.payload["size"], 1024);
+    }
+}
+
+#[tokio::test]
+async fn stream_tail_unknown_stream_lists_known() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let span = Span {
+        start_ns: Timestamp(0),
+        end_ns: Timestamp(1),
+    };
+    let prov = |s: &str| zeta_core::types::Provenance {
+        source: SourceId(s.into()),
+        job: None,
+        channel: None,
+        span: span.clone(),
+    };
+    let a = node.bus().register(StreamKind::Event, prov("a"));
+    let b = node.bus().register(StreamKind::Audio, prov("b"));
+    let mut want = vec![a.0, b.0];
+    want.sort();
+    let op = Op::StreamTail {
+        stream: StreamId("nope".into()),
+        max_frames: 1,
+        timeout_ms: 10,
+    };
+    match node.apply(op).await {
+        Err(OpError::Unknown {
+            field,
+            value,
+            known,
+        }) => {
+            assert_eq!(field, "stream");
+            assert_eq!(value, "nope");
+            assert_eq!(known, want);
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
 }

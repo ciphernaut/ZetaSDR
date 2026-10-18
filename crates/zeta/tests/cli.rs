@@ -38,7 +38,22 @@ fn schema_prints_json_with_op_result_error() {
     for key in ["op", "result", "error", "stages"] {
         assert!(v["value"].get(key).is_some(), "schema missing {key}");
     }
-    assert_eq!(v["value"]["stages"][0]["kind"], "passthrough");
+    let kinds: Vec<&str> = v["value"]["stages"]
+        .as_array()
+        .expect("stages array")
+        .iter()
+        .filter_map(|s| s["kind"].as_str())
+        .collect();
+    for k in [
+        "passthrough",
+        "channel",
+        "fft",
+        "nbfm_demod",
+        "aprs_decode",
+        "measure",
+    ] {
+        assert!(kinds.contains(&k), "stages missing {k}: {kinds:?}");
+    }
 }
 
 #[test]
@@ -227,4 +242,45 @@ fn repeated_source_file_id_is_a_usage_error() {
         .code(1)
         .stderr(contains("tone"))
         .stderr(contains("more than once"));
+}
+
+#[test]
+fn job_start_then_tail_prints_aprs_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "aprs", &iq, 48_000, 144_800_000);
+    let out = Command::cargo_bin("zeta")
+        .unwrap()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--source-file")
+        .arg(format!("aprs={}", meta.display()))
+        .args([
+            "--json",
+            "job",
+            "start",
+            "--kind",
+            "aprs_decode",
+            "--source",
+            "aprs",
+            "--center-hz",
+            "144800000",
+            "--bandwidth-hz",
+            "12500",
+            "--then-tail",
+            "1,5000",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    eprintln!("{}", String::from_utf8_lossy(&out));
+    let v = json(&out);
+    assert_eq!(v[0]["result"], "job");
+    assert_eq!(v[1]["result"], "frames");
+    let frames = v[1]["value"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["kind"], "event");
+    assert_eq!(frames[0]["payload"]["src"], "VK3ABC");
 }

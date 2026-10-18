@@ -11,7 +11,7 @@ The CLI form and the JSON form of every operation are equivalent: `zeta <group> 
 and `{\"op\": \"<name>\", ...}` do the same thing.";
 
 const RULES: &[&str] = &[
-    "One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`, times are integer nanoseconds since the UNIX epoch in fields ending `_ns`.",
+    "One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`, times are integer nanoseconds since the UNIX epoch in fields ending `_ns`, durations are integer milliseconds in fields ending `_ms`.",
     "Every field is required and unknown fields are rejected.",
     "Call operations, do not explain.",
     "Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.",
@@ -26,7 +26,7 @@ const RUNNING: &str = "Every command takes two global flags:
 
 There are two ways to run:
 
-- One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span.
+- One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. `job start --then-tail MAX_FRAMES,TIMEOUT_MS` keeps that one-shot node up after the start, tails the job's first event stream (else its audio stream) and prints `[job_result, frames_result]`; `stream tail` on its own only sees streams of jobs running in the same process. A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span.
 - `zeta serve`: resumes persisted jobs and keeps them running until Ctrl-C.
 
 While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job stop`, `graph put`, `source ensure`) are then refused with an `other` error naming the server's pid; read-only commands still work.";
@@ -49,6 +49,7 @@ fn hint(field: &str) -> Option<&'static str> {
     match field {
         "source" => Some("an id from `source list`"),
         "job" => Some("an id from `job list`"),
+        "stream" => Some("an id from `stream list`"),
         "region" => Some("free-text region code such as `AU`"),
         _ => None,
     }

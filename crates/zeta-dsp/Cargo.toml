@@ -23,3 +23,7 @@ zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] 
 
 [features]
 test-fixtures = []
+
+[[example]]
+name = "gen_aprs"
+required-features = ["test-fixtures"]

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
 use zeta_core::ops::{JobKind, Op, OpError};
-use zeta_core::types::{Hz, JobId, Selection, SourceId, Span, Timestamp};
+use zeta_core::types::{Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -97,6 +97,10 @@ pub enum JobCmd {
         kind: Kind,
         #[command(flatten)]
         band: BandArgs,
+        /// After starting, tail the job's first event (else audio) stream and
+        /// print `[job_result, frames_result]` (one-shot only)
+        #[arg(long, value_name = "MAX_FRAMES,TIMEOUT_MS", value_parser = parse_then_tail)]
+        then_tail: Option<ThenTail>,
     },
     /// List jobs
     List,
@@ -116,6 +120,34 @@ pub enum IqCmd {
 pub enum StreamCmd {
     /// List streams
     List,
+    /// Collect frames from a stream until MAX_FRAMES arrive or TIMEOUT_MS passes
+    Tail {
+        /// Stream id from `stream list`
+        #[arg(long, value_name = "ID")]
+        stream: String,
+        /// Most frames to collect
+        #[arg(long, value_name = "N")]
+        max_frames: u32,
+        /// Longest wait, milliseconds
+        #[arg(long, value_name = "MS")]
+        timeout_ms: u32,
+    },
+}
+
+/// `--then-tail MAX_FRAMES,TIMEOUT_MS` on `job start`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThenTail {
+    pub max_frames: u32,
+    pub timeout_ms: u32,
+}
+
+fn parse_then_tail(s: &str) -> Result<ThenTail, String> {
+    let bad = || format!("expected MAX_FRAMES,TIMEOUT_MS, got {s:?}");
+    let (n, ms) = s.split_once(',').ok_or_else(bad)?;
+    Ok(ThenTail {
+        max_frames: n.trim().parse().map_err(|_| bad())?,
+        timeout_ms: ms.trim().parse().map_err(|_| bad())?,
+    })
 }
 
 #[derive(Debug, Subcommand)]
@@ -245,6 +277,14 @@ impl Command {
         )
     }
 
+    /// `--then-tail` of a `job start`, if given.
+    pub fn then_tail(&self) -> Option<ThenTail> {
+        match self {
+            Command::Job(JobCmd::Start { then_tail, .. }) => *then_tail,
+            _ => None,
+        }
+    }
+
     /// The operation this subcommand applies; `None` for `serve`. Fails only
     /// when `graph put` cannot read or parse its file.
     pub fn into_op(self) -> Result<Option<Op>, OpError> {
@@ -256,7 +296,7 @@ impl Command {
                 center_hz: Hz(b.center_hz),
                 bandwidth_hz: Hz(b.bandwidth_hz),
             },
-            Command::Job(JobCmd::Start { kind, band: b }) => Op::JobStart {
+            Command::Job(JobCmd::Start { kind, band: b, .. }) => Op::JobStart {
                 kind: kind.into(),
                 source: SourceId(b.source),
                 center_hz: Hz(b.center_hz),
@@ -269,6 +309,15 @@ impl Command {
                 selection: s.into(),
             },
             Command::Stream(StreamCmd::List) => Op::StreamList {},
+            Command::Stream(StreamCmd::Tail {
+                stream,
+                max_frames,
+                timeout_ms,
+            }) => Op::StreamTail {
+                stream: StreamId(stream),
+                max_frames,
+                timeout_ms,
+            },
             Command::Graph(GraphCmd::Get(a)) => Op::GraphGet { job: job(a) },
             Command::Graph(GraphCmd::Put { job: a, file }) => Op::GraphPut {
                 job: job(a),
