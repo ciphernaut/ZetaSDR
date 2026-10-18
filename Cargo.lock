@@ -3751,6 +3751,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeta-plugin"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zeta-core",
+ "zeta-ws",
+]
+
+[[package]]
 name = "zeta-source-file"
 version = "0.1.0"
 dependencies = [
