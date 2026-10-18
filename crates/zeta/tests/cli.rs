@@ -11,7 +11,9 @@ use zeta_source_file::fixtures::write_tone;
 fn zeta(dir: &Path, args: &[&str]) -> Command {
     let meta = write_tone(dir);
     let mut cmd = Command::cargo_bin("zeta").unwrap();
-    cmd.arg("--state-dir")
+    cmd.env_remove("ZETA_NODE")
+        .env_remove("ZETA_SECRET")
+        .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--source-file")
         .arg(format!("tone={}", meta.display()))

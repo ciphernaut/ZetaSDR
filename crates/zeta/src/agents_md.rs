@@ -289,11 +289,16 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     line
 }
 
-/// Print the rendering, or with `check` compare it to the committed `AGENTS.md`.
-pub fn run(check: bool) -> ExitCode {
+/// The full AGENTS.md text for this build.
+pub fn rendering() -> String {
     let mut schema = zeta_core::ops::schema();
     schema["stages"] = crate::node_setup::registry().describe();
-    let text = render(&schema, FIELD_CRAFT);
+    render(&schema, FIELD_CRAFT)
+}
+
+/// Print the rendering, or with `check` compare it to the committed `AGENTS.md`.
+pub fn run(check: bool) -> ExitCode {
+    let text = rendering();
     if !check {
         print!("{text}");
         return ExitCode::SUCCESS;

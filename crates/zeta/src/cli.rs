@@ -24,6 +24,19 @@ pub struct Cli {
     /// no human format exists yet, so output is always JSON)
     #[arg(long, global = true)]
     pub json: bool,
+    /// Send the operation to a running `zeta serve` at URL instead of opening a local node
+    #[arg(long, global = true, env = "ZETA_NODE", value_name = "URL")]
+    pub node: Option<String>,
+    /// Shared secret for --node and serve --listen. Visible in `ps` when given on the
+    /// command line; prefer the ZETA_SECRET environment variable
+    #[arg(
+        long,
+        global = true,
+        env = "ZETA_SECRET",
+        hide_env_values = true,
+        value_name = "SECRET"
+    )]
+    pub secret: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -77,7 +90,15 @@ pub enum Command {
         check: bool,
     },
     /// Run the node, resuming persisted jobs, until Ctrl-C
-    Serve,
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct ServeArgs {
+    /// Also serve the HTTP/WebSocket API on this address (a LAN ip:port, or a bare port on
+    /// 127.0.0.1); requires --secret or ZETA_SECRET
+    #[arg(long, value_name = "[ADDR:]PORT")]
+    pub listen: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -276,7 +297,7 @@ impl Command {
                 selection: s.into(),
             },
             Command::Schema => Op::Schema {},
-            Command::AgentsMd { .. } | Command::Serve => return Ok(None),
+            Command::AgentsMd { .. } | Command::Serve(_) => return Ok(None),
         }))
     }
 }

@@ -2903,8 +2903,11 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
+ "zeta-client",
  "zeta-core",
  "zeta-source-file",
+ "zeta-ws",
 ]
 
 [[package]]

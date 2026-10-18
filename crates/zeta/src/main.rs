@@ -4,6 +4,7 @@ mod agents_md;
 mod cli;
 mod node_setup;
 mod serve_lock;
+mod transport;
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -34,6 +35,10 @@ async fn main() -> ExitCode {
     if let cli::Command::AgentsMd { check } = cli.command {
         return agents_md::run(check);
     }
+    let cli = match transport::dispatch(cli).await {
+        Ok(code) => return code,
+        Err(cli) => cli,
+    };
     let state_dir = match cli.state_dir.map_or_else(node_setup::default_state_dir, Ok) {
         Ok(d) => d,
         Err(e) => return fail(&e),
@@ -46,6 +51,13 @@ async fn main() -> ExitCode {
         };
         return print(serde_json::to_string_pretty(&e), 2);
     }
+    let (serve_args, secret) = (
+        match &cli.command {
+            cli::Command::Serve(a) => a.clone(),
+            _ => Default::default(),
+        },
+        cli.secret.clone(),
+    );
     let op = match cli.command.into_op() {
         Ok(op) => op,
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
@@ -67,11 +79,7 @@ async fn main() -> ExitCode {
         eprintln!("zeta: warning: unreadable job record {name}");
     }
     let Some(op) = op else {
-        eprintln!("zeta: serving; Ctrl-C to stop");
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            return fail(&format!("waiting for Ctrl-C: {e}"));
-        }
-        return ExitCode::SUCCESS;
+        return transport::serve(node, &serve_args, secret.as_deref()).await;
     };
     let starts_job = matches!(op, Op::JobStart { .. });
     if let Op::IqRead { selection } | Op::Classify { selection } = &op {
