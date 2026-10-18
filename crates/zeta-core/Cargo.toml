@@ -20,5 +20,3 @@ ulid = "3.0.0"
 [dev-dependencies]
 tempfile = "3.27.0"
 zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] }
-# Real stages for end-to-end op tests (a dev-only cycle; integration tests share one zeta-core).
-zeta-dsp = { path = "../zeta-dsp" }

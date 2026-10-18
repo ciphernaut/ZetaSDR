@@ -102,9 +102,9 @@ Collect frames from a stream until `max_frames` arrive or `timeout_ms` passes, w
 - max_frames: integer
 - timeout_ms: integer
 
-JSON: `{"op":"stream_tail","stream":"<id>","max_frames":0,"timeout_ms":0}`
+JSON: `{"op":"stream_tail","stream":"<id>","max_frames":1,"timeout_ms":5000}`
 
-CLI: `zeta stream tail --stream <id> --max-frames 0 --timeout-ms 0`
+CLI: `zeta stream tail --stream <id> --max-frames 1 --timeout-ms 5000`
 
 ### graph_get
 

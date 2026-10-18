@@ -834,58 +834,6 @@ fn measure_kind_expands_to_one_measure_node() {
     assert!(g.edges.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_tail_returns_events_from_running_job() {
-    let dir = tempfile::tempdir().unwrap();
-    let (src, port) = file_source(dir.path());
-    let mut reg = registry();
-    zeta_dsp::register_all(&mut reg);
-    let node = Node::open(cfg(dir.path()), reg, vec![port]).await.unwrap();
-    src.start();
-    let job = match node
-        .apply(Op::JobStart {
-            kind: JobKind::Spectrum,
-            source: SourceId("file0".into()),
-            center_hz: Hz(100_000_000),
-            bandwidth_hz: Hz(48_000),
-        })
-        .await
-    {
-        Ok(OpResult::Job(id)) => id,
-        other => panic!("expected Job, got {other:?}"),
-    };
-    let mut stream = None;
-    for _ in 0..200 {
-        stream = node
-            .bus()
-            .list()
-            .into_iter()
-            .find(|s| s.kind == StreamKind::Event && s.provenance.job.as_ref() == Some(&job))
-            .map(|s| s.id);
-        if stream.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let stream = stream.expect("the job's event stream");
-    let op = Op::StreamTail {
-        stream: stream.clone(),
-        max_frames: 3,
-        timeout_ms: 2000,
-    };
-    let frames = match node.apply(op).await {
-        Ok(OpResult::Frames(f)) => f,
-        other => panic!("expected Frames, got {other:?}"),
-    };
-    assert_eq!(frames.len(), 3);
-    for f in &frames {
-        assert_eq!(f.stream, stream);
-        assert_eq!(f.kind, StreamKind::Event);
-        assert!(f.end_ns.0 > f.start_ns.0, "{f:?}");
-        assert_eq!(f.payload["size"], 1024);
-    }
-}
-
 #[tokio::test]
 async fn stream_tail_unknown_stream_lists_known() {
     let dir = tempfile::tempdir().unwrap();
@@ -922,5 +870,86 @@ async fn stream_tail_unknown_stream_lists_known() {
             assert_eq!(known, want);
         }
         other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+fn tail_prov() -> zeta_core::types::Provenance {
+    zeta_core::types::Provenance {
+        source: SourceId("s".into()),
+        job: None,
+        channel: None,
+        span: Span {
+            start_ns: Timestamp(10),
+            end_ns: Timestamp(20),
+        },
+    }
+}
+
+#[tokio::test]
+async fn stream_tail_times_out_with_empty_when_no_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let id = node.bus().register(StreamKind::Text, tail_prov());
+    let t0 = std::time::Instant::now();
+    let r = node
+        .apply(Op::StreamTail {
+            stream: id,
+            max_frames: 3,
+            timeout_ms: 100,
+        })
+        .await;
+    let took = t0.elapsed();
+    assert_eq!(r, Ok(OpResult::Frames(vec![])));
+    assert!(took >= Duration::from_millis(100), "{took:?}");
+    assert!(took < Duration::from_millis(300), "{took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_tail_returns_collected_when_stream_closes() {
+    use zeta_core::stream::{Frame, Payload};
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let bus = node.bus();
+    let id = bus.register(StreamKind::Text, tail_prov());
+    let (b, sid) = (bus.clone(), id.clone());
+    let publisher = tokio::spawn(async move {
+        // Give the tail time to subscribe before anything is sent.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for t in ["one", "two"] {
+            b.publish(Frame::new(
+                sid.clone(),
+                tail_prov(),
+                Payload::Text(t.into()),
+            ));
+        }
+        b.unregister(&sid);
+    });
+    let t0 = std::time::Instant::now();
+    let frames = match node
+        .apply(Op::StreamTail {
+            stream: id.clone(),
+            max_frames: 10,
+            timeout_ms: 5000,
+        })
+        .await
+    {
+        Ok(OpResult::Frames(f)) => f,
+        other => panic!("expected Frames, got {other:?}"),
+    };
+    publisher.await.unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "closed stream must end the tail"
+    );
+    assert_eq!(frames.len(), 2);
+    for (f, t) in frames.iter().zip(["one", "two"]) {
+        assert_eq!(f.stream, id);
+        assert_eq!(f.kind, StreamKind::Text);
+        assert_eq!((f.start_ns, f.end_ns), (Timestamp(10), Timestamp(20)));
+        assert_eq!(f.payload, Value::String(t.into()));
     }
 }

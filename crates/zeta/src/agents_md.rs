@@ -214,6 +214,8 @@ fn example(field: &str, s: &Value, defs: &Value) -> Value {
             (_, Some("Hz")) => 144800000u64.into(),
             ("start_ns", _) => 1760000000000000000u64.into(),
             ("end_ns", _) => 1760000001000000000u64.into(),
+            ("max_frames", _) => 1.into(),
+            ("timeout_ms", _) => 5000.into(),
             _ => 0.into(),
         },
         Some("string") => match def["enum"].as_array().and_then(|a| a.first()) {
