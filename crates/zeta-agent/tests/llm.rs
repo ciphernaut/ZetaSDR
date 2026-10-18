@@ -1,6 +1,9 @@
 //! The chat client against the fake OpenAI-compatible server over loopback.
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use zeta_agent::fake::{FakeLlm, text_response, tool_call_response};
 use zeta_agent::{AgentError, ChatMessage, LlmClient, LlmConfig};
 use zeta_client::ToolDef;
@@ -182,4 +185,100 @@ async fn http_400_is_llm_error_not_retried() {
         "{err:?}"
     );
     assert_eq!(fake.requests.lock().unwrap().len(), 1);
+}
+
+/// A server that accepts, reads the request and then hangs (`hang`) or closes
+/// without answering; returns its URL and how many connections it accepted.
+async fn silent_server(hang: bool) -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut sock, _)) = listener.accept().await {
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            if hang {
+                held.push(sock);
+            }
+        }
+    });
+    (url, accepted)
+}
+
+fn silent_cfg(url: &str, request_timeout: Duration, ready_timeout: Duration) -> LlmConfig {
+    let mut c = LlmConfig::new(url, "floor-model");
+    c.backoff_initial = Duration::from_millis(10);
+    c.backoff_max = Duration::from_millis(10);
+    c.request_timeout = request_timeout;
+    c.ready_timeout = ready_timeout;
+    c
+}
+
+#[tokio::test]
+async fn request_timeout_is_unreachable_not_retried() {
+    let (url, accepted) = silent_server(true).await;
+    let c = silent_cfg(&url, Duration::from_millis(200), Duration::from_secs(5));
+    let err = LlmClient::new(c)
+        .unwrap()
+        .complete(&msgs(), &tools())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AgentError::Unreachable { .. }), "{err:?}");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn closed_without_answer_is_unreachable_not_retried() {
+    let (url, accepted) = silent_server(false).await;
+    let c = silent_cfg(&url, Duration::from_secs(5), Duration::from_secs(5));
+    let err = LlmClient::new(c)
+        .unwrap()
+        .complete(&msgs(), &tools())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AgentError::Unreachable { .. }), "{err:?}");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn attempt_is_bounded_by_ready_timeout() {
+    let (url, accepted) = silent_server(true).await;
+    let c = silent_cfg(&url, Duration::from_secs(300), Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let err = LlmClient::new(c)
+        .unwrap()
+        .complete(&msgs(), &tools())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AgentError::NotReady { .. }), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn connection_refused_is_waited_out() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let c = silent_cfg(&url, Duration::from_secs(5), Duration::from_millis(100));
+    let err = LlmClient::new(c)
+        .unwrap()
+        .complete(&msgs(), &tools())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AgentError::NotReady { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn hung_status_poll_is_bounded_by_ready_timeout() {
+    let (url, _) = silent_server(true).await;
+    let mut c = silent_cfg(&url, Duration::from_secs(300), Duration::from_millis(200));
+    c.status_url = Some(format!("{url}/status"));
+    let started = std::time::Instant::now();
+    let err = LlmClient::new(c).unwrap().wait_ready().await.unwrap_err();
+    assert!(matches!(err, AgentError::NotReady { .. }), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
 }

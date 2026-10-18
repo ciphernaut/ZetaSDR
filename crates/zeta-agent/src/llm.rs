@@ -56,6 +56,9 @@ impl LlmConfig {
     }
 }
 
+/// Bound on one `status_url` poll, so a hung manager cannot stall readiness.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// One model turn.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Completion {
@@ -84,7 +87,7 @@ pub enum AgentError {
     NotReady { waited_s: u64, last: String },
     #[error("the model server answered HTTP {status}: {body}")]
     Llm { status: u16, body: String },
-    #[error("cannot reach the model server at {url}: {detail}")]
+    #[error("no usable answer from the model server at {url}: {detail}")]
     Unreachable { url: String, detail: String },
     #[error("the model server sent an unreadable response: {detail}")]
     BadResponse { detail: String },
@@ -100,7 +103,6 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(cfg: LlmConfig) -> Result<Self, AgentError> {
         let http = reqwest::Client::builder()
-            .timeout(cfg.request_timeout)
             .build()
             .map_err(|e| AgentError::Unreachable {
                 url: cfg.endpoint(),
@@ -134,15 +136,20 @@ impl LlmClient {
         body
     }
 
-    /// Poll `status_url` until it reports `"healthy": true`; anything else is
-    /// "not yet" (design 10: readiness is a sequence, not a flag).
+    /// Poll `status_url` until it reports `"healthy": true`; anything else,
+    /// a hung poll included, is "not yet" (design 10: readiness is a
+    /// sequence, not a flag).
     pub async fn wait_ready(&self) -> Result<(), AgentError> {
         let Some(url) = &self.cfg.status_url else {
             return Ok(());
         };
         let mut wait = Backoff::new(&self.cfg);
         loop {
-            let last = match self.http.get(url).send().await {
+            let poll = self
+                .http
+                .get(url)
+                .timeout(STATUS_TIMEOUT.min(wait.remaining()));
+            let last = match poll.send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     match resp.text().await {
@@ -163,7 +170,9 @@ impl LlmClient {
         }
     }
 
-    /// One chat completion, waiting out 503 and connection errors.
+    /// One chat completion, waiting out 503 and connection errors. Each
+    /// attempt is bounded by `request_timeout` and by what is left of
+    /// `ready_timeout`; any other transport failure is not retried.
     pub async fn complete(
         &self,
         messages: &[ChatMessage],
@@ -172,26 +181,49 @@ impl LlmClient {
         let body = self.request_body(messages, tools);
         let url = self.cfg.endpoint();
         let mut wait = Backoff::new(&self.cfg);
+        // The previous attempt's failure, kept when the deadline cuts the
+        // last attempt short, so `NotReady` names what the server said.
+        let mut last = String::new();
         loop {
-            let mut req = self.http.post(&url).json(&body);
+            let limit = self.cfg.request_timeout.min(wait.remaining());
+            let clipped = limit < self.cfg.request_timeout;
+            let mut req = self.http.post(&url).json(&body).timeout(limit);
             if let Some(key) = &self.cfg.key {
                 req = req.bearer_auth(key);
             }
-            let last = match req.send().await {
+            let fail = |e: reqwest::Error| {
+                if e.is_timeout() && clipped {
+                    let text = error_chain(&e);
+                    wait.not_ready(if last.is_empty() { text } else { last.clone() })
+                } else if e.is_timeout() {
+                    AgentError::Unreachable {
+                        url: url.clone(),
+                        detail: format!("no answer within {} s", limit.as_secs()),
+                    }
+                } else {
+                    AgentError::Unreachable {
+                        url: url.clone(),
+                        detail: error_chain(&e),
+                    }
+                }
+            };
+            last = match req.send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     match resp.text().await {
                         Ok(text) if status == 503 => text,
+                        Err(e) if status == 503 => error_chain(&e),
                         Ok(text) if !(200..300).contains(&status) => {
                             return Err(AgentError::Llm { status, body: text });
                         }
                         Ok(text) => return decode(&text, self.cfg.max_tokens),
-                        Err(e) => error_chain(&e),
+                        Err(e) => return Err(fail(e)),
                     }
                 }
-                Err(e) => error_chain(&e),
+                Err(e) if e.is_connect() => error_chain(&e),
+                Err(e) => return Err(fail(e)),
             };
-            wait.next(last).await?;
+            wait.next(last.clone()).await?;
         }
     }
 }
@@ -214,13 +246,22 @@ impl Backoff {
         }
     }
 
+    /// What is left of the readiness window.
+    fn remaining(&self) -> Duration {
+        self.timeout.saturating_sub(self.start.elapsed())
+    }
+
+    fn not_ready(&self, last: String) -> AgentError {
+        AgentError::NotReady {
+            waited_s: self.start.elapsed().as_secs(),
+            last,
+        }
+    }
+
     async fn next(&mut self, last: String) -> Result<(), AgentError> {
         let elapsed = self.start.elapsed();
         if elapsed >= self.timeout {
-            return Err(AgentError::NotReady {
-                waited_s: elapsed.as_secs(),
-                last,
-            });
+            return Err(self.not_ready(last));
         }
         tokio::time::sleep(self.delay.min(self.timeout - elapsed)).await;
         self.delay = (self.delay * 2).min(self.max);
