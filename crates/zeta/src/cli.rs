@@ -97,10 +97,16 @@ pub enum JobCmd {
         kind: Kind,
         #[command(flatten)]
         band: BandArgs,
-        /// After starting, tail the job's first event (else audio) stream and
-        /// print `[job_result, frames_result]` (one-shot only)
+        /// After starting, tail the job's first event (else audio) stream, stop
+        /// the job and print `[job_result, frames_result, {"stopped": true}]`;
+        /// a job that is not running prints `[job_result, job_record]` and
+        /// exits 2 (one-shot only)
         #[arg(long, value_name = "MAX_FRAMES,TIMEOUT_MS", value_parser = parse_then_tail)]
         then_tail: Option<ThenTail>,
+        /// With --then-tail: leave the job running after the tail
+        /// (prints `{"stopped": false}`)
+        #[arg(long, requires = "then_tail")]
+        keep: bool,
     },
     /// List jobs
     List,
@@ -283,6 +289,11 @@ impl Command {
             Command::Job(JobCmd::Start { then_tail, .. }) => *then_tail,
             _ => None,
         }
+    }
+
+    /// `job start --keep`: leave a `--then-tail` job running.
+    pub fn keep(&self) -> bool {
+        matches!(self, Command::Job(JobCmd::Start { keep: true, .. }))
     }
 
     /// The operation this subcommand applies; `None` for `serve`. Fails only

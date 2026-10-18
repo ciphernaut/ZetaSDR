@@ -50,6 +50,7 @@ async fn main() -> ExitCode {
         return print(serde_json::to_string_pretty(&e), 2);
     }
     let then_tail = cli.command.then_tail();
+    let keep = cli.command.keep();
     let op = match cli.command.into_op() {
         Ok(op) => op,
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
@@ -84,11 +85,7 @@ async fn main() -> ExitCode {
     match node.apply(op).await {
         Ok(zeta_core::ops::OpResult::Job(id)) if then_tail.is_some() => {
             let t = then_tail.expect("checked");
-            let job = zeta_core::ops::OpResult::Job(id.clone());
-            match tail_job(&node, &id, t).await {
-                Ok(f) => print(serde_json::to_string_pretty(&(job, f)), 0),
-                Err(e) => print(serde_json::to_string_pretty(&(job, e)), 2),
-            }
+            then_tail_job(&node, id, t, keep).await
         }
         Ok(r) => {
             if starts_job {
@@ -97,6 +94,52 @@ async fn main() -> ExitCode {
             print(serde_json::to_string_pretty(&r), 0)
         }
         Err(e) => print(serde_json::to_string_pretty(&e), 2),
+    }
+}
+
+/// `job start --then-tail`: report a job that is not running (before or
+/// after the tail) as `[job_result, job_record]` with exit 2; otherwise tail
+/// it, stop it unless `keep`, and print
+/// `[job_result, frames_result, {"stopped": bool}]`.
+async fn then_tail_job(
+    node: &zeta_core::node::Node,
+    id: zeta_core::types::JobId,
+    t: cli::ThenTail,
+    keep: bool,
+) -> ExitCode {
+    use zeta_core::job::JobState;
+    let job = zeta_core::ops::OpResult::Job(id.clone());
+    let not_running = || {
+        node.job_list()
+            .into_iter()
+            .find(|r| r.id == id)
+            .filter(|r| r.state != JobState::Running)
+    };
+    if let Some(rec) = not_running() {
+        return print(serde_json::to_string_pretty(&(job, rec)), 2);
+    }
+    let tail = tail_job(node, &id, t).await;
+    if let Some(rec) = not_running() {
+        return print(serde_json::to_string_pretty(&(job, rec)), 2);
+    }
+    let stopped = if keep {
+        Ok(false)
+    } else {
+        node.apply(Op::JobStop { job: id.clone() })
+            .await
+            .map(|_| true)
+    };
+    match (tail, stopped) {
+        (Ok(f), Ok(s)) => print(
+            serde_json::to_string_pretty(&(job, f, serde_json::json!({"stopped": s}))),
+            0,
+        ),
+        (Ok(f), Err(e)) => print(serde_json::to_string_pretty(&(job, f, e)), 2),
+        (Err(e), Ok(s)) => print(
+            serde_json::to_string_pretty(&(job, e, serde_json::json!({"stopped": s}))),
+            2,
+        ),
+        (Err(e), Err(e2)) => print(serde_json::to_string_pretty(&(job, e, e2)), 2),
     }
 }
 
