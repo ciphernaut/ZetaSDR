@@ -92,6 +92,7 @@ pub enum Op {
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     Passthrough,
+    Spectrum,
 }
 
 impl JobKind {
@@ -99,6 +100,7 @@ impl JobKind {
     pub fn name(&self) -> &'static str {
         match self {
             JobKind::Passthrough => "passthrough",
+            JobKind::Spectrum => "spectrum",
         }
     }
 
@@ -110,6 +112,15 @@ impl JobKind {
                     id: NodeId::new(),
                     kind: "passthrough".into(),
                     params: serde_json::json!({"kind": "iq"}),
+                }],
+                edges: vec![],
+            },
+            JobKind::Spectrum => Graph {
+                id: GraphId::new(),
+                nodes: vec![GraphNode {
+                    id: NodeId::new(),
+                    kind: "fft".into(),
+                    params: serde_json::json!({"size": 1024, "window": "hann"}),
                 }],
                 edges: vec![],
             },

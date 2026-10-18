@@ -765,3 +765,20 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
     assert_eq!(rec.graph, before);
     assert_eq!(node.lease_holders(&SourceId("file0".into())).len(), 1);
 }
+
+#[test]
+fn spectrum_kind_expands_to_single_fft_node() {
+    assert_eq!(JobKind::Spectrum.name(), "spectrum");
+    let tuning = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(48_000),
+    };
+    let g = JobKind::Spectrum.expand(&SourceId("file0".into()), tuning);
+    assert_eq!(g.nodes.len(), 1);
+    assert!(g.edges.is_empty());
+    assert_eq!(g.nodes[0].kind, "fft");
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"size": 1024, "window": "hann"})
+    );
+}

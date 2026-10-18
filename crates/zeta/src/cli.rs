@@ -152,12 +152,14 @@ pub enum KnowledgeCmd {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Kind {
     Passthrough,
+    Spectrum,
 }
 
 impl From<Kind> for JobKind {
     fn from(k: Kind) -> Self {
         match k {
             Kind::Passthrough => JobKind::Passthrough,
+            Kind::Spectrum => JobKind::Spectrum,
         }
     }
 }
