@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
-use zeta_core::port::{Port, Tuning};
+use zeta_core::port::Port;
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::stream::Payload;
 use zeta_core::types::{Hz, SourceId, StreamKind};
@@ -60,33 +60,18 @@ async fn fm_demod_job_produces_audio_with_tone() {
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     src.start();
 
-    // A file port tunes only to its own centre, so a spectrum job holds it
-    // there and the fm_demod job shares it as a sub-band of the recording.
-    let source = SourceId("file0".into());
-    let held = node
+    let OpResult::Job(id) = node
         .apply(Op::JobStart {
-            kind: JobKind::Spectrum,
-            source: source.clone(),
-            center_hz: Hz(CENTER),
-            bandwidth_hz: Hz(RATE as u64),
+            kind: JobKind::FmDemod,
+            source: SourceId("file0".into()),
+            center_hz: Hz(100_005_000),
+            bandwidth_hz: Hz(12_500),
         })
         .await
-        .unwrap();
-    assert!(matches!(held, OpResult::Job(_)));
-    let tuning = Tuning {
-        center_hz: Hz(100_005_000),
-        bandwidth_hz: Hz(12_500),
+        .unwrap()
+    else {
+        panic!("expected a job id")
     };
-    let kind = JobKind::FmDemod;
-    let id = node
-        .job_start(
-            kind.name(),
-            source.clone(),
-            tuning,
-            kind.expand(&source, tuning),
-        )
-        .await
-        .unwrap();
 
     let bus = node.bus();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
