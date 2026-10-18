@@ -57,7 +57,8 @@ pub struct Graph {
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "cause", rename_all = "snake_case")]
+#[serde(tag = "cause", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub enum GraphError {
     #[error("unknown stage kind {kind:?} on node {node:?}")]
     UnknownStage { node: NodeId, kind: String },
@@ -132,8 +133,8 @@ mod tests {
         let g = Graph {
             id: GraphId("g1".into()),
             nodes: vec![
-                node("a", "passthrough", serde_json::json!({"kind": "Iq"})),
-                node("b", "passthrough", serde_json::json!({"kind": "Iq"})),
+                node("a", "passthrough", serde_json::json!({"kind": "iq"})),
+                node("b", "passthrough", serde_json::json!({"kind": "iq"})),
             ],
             edges: vec![Edge { from: NodeId("a".into()), to: NodeId("b".into()), kind: StreamKind::Iq }],
         };
@@ -228,7 +229,7 @@ mod tests {
         let mk = |from: &str, to: &str| Graph {
             id: GraphId::new(),
             nodes: vec![
-                node("p", "passthrough", serde_json::json!({"kind": "Iq"})),
+                node("p", "passthrough", serde_json::json!({"kind": "iq"})),
                 n("s", "sink_only"),
             ],
             edges: vec![Edge { from: NodeId(from.into()), to: NodeId(to.into()), kind: StreamKind::Iq }],
@@ -249,7 +250,7 @@ mod tests {
         assert!(matches!(validate(&g, &r), Err(GraphError::BadParams { .. })));
         let g = Graph {
             id: GraphId::new(),
-            nodes: vec![node("a", "passthrough", serde_json::json!({"kind": "Iq"}))],
+            nodes: vec![node("a", "passthrough", serde_json::json!({"kind": "iq"}))],
             edges: vec![Edge { from: NodeId("a".into()), to: NodeId("z".into()), kind: StreamKind::Iq }],
         };
         assert_eq!(validate(&g, &r), Err(GraphError::DanglingEdge { edge: 0 }));

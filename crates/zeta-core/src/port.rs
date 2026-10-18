@@ -11,6 +11,8 @@ use crate::types::{Capabilities, Hz, SourceId, Timestamp};
 
 /// A centre frequency and the bandwidth captured around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct Tuning {
     pub center_hz: Hz,
     pub bandwidth_hz: Hz,

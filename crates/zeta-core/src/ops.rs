@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::JobRecord;
-use crate::lease::{LeaseError, conflict_options, fits};
+use crate::lease::LeaseError;
 use crate::node::{Node, NodeError};
 use crate::port::{Port, PortError, Tuning};
 use crate::ring::RingError;
@@ -30,16 +30,18 @@ pub enum Op {
     /// Check a band against the source and tune it if no job holds it. Takes
     /// no lease: an unheld source is tuned directly (a later `job_start` may
     /// retune it); a held source is never retuned, and the request either
-    /// fits the current band (`Tuning`) or is a `Conflict`.
+    /// fits the current band (`Tuning`) or is a `Conflict`. Runs under the
+    /// lease manager's per-source gate, so it never interleaves with a job's
+    /// lease-and-tune.
     SourceEnsure { source: SourceId, center_hz: Hz, bandwidth_hz: Hz },
     JobStart { kind: JobKind, source: SourceId, center_hz: Hz, bandwidth_hz: Hz },
     JobList {},
     JobStop { job: JobId },
     JobContext { job: JobId },
     /// Save the selection's span as a SigMF pair under `state_dir/captures`.
-    /// The whole ring bandwidth is written: frequency sub-selection
-    /// (`center_hz`/`bandwidth_hz` within the ring) is not applied yet, and
-    /// `center_hz` is recorded as the capture frequency.
+    /// The whole ring bandwidth is written: frequency sub-selection is not
+    /// applied yet. The capture is labelled with the ring's centre; the
+    /// selection's band is recorded as an annotation labelled `selection`.
     IqRead { selection: Selection },
     StreamList {},
     GraphGet { job: JobId },
@@ -70,8 +72,7 @@ impl JobKind {
                 nodes: vec![GraphNode {
                     id: NodeId::new(),
                     kind: "passthrough".into(),
-                    // `StreamKind` serialises as its variant name.
-                    params: serde_json::json!({"kind": "Iq"}),
+                    params: serde_json::json!({"kind": "iq"}),
                 }],
                 edges: vec![],
             },
@@ -85,12 +86,14 @@ impl JobKind {
 pub struct SourceInfo {
     pub id: SourceId,
     pub capabilities: Capabilities,
+    #[schemars(required)]
     pub current: Option<Tuning>,
     pub holders: Vec<JobId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "result", content = "value", rename_all = "snake_case")]
+#[serde(tag = "result", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub enum OpResult {
     Sources(Vec<SourceInfo>),
     Tuning(Tuning),
@@ -98,7 +101,9 @@ pub enum OpResult {
     Jobs(Vec<JobRecord>),
     Context(serde_json::Value),
     /// `path` is the `.sigmf-meta` file; the data file sits beside it.
-    Iq { sample_rate_hz: Hz, samples: usize, path: PathBuf },
+    /// `center_hz` and `bandwidth_hz` are the band actually written (the
+    /// ring's), not the selection's.
+    Iq { sample_rate_hz: Hz, center_hz: Hz, bandwidth_hz: Hz, samples: usize, path: PathBuf },
     Streams(Vec<StreamInfo>),
     Graph(Graph),
     Ok,
@@ -106,13 +111,23 @@ pub enum OpResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "error", rename_all = "snake_case")]
+#[serde(tag = "error", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub enum OpError {
-    OutOfRange { field: String, value: u64, min: u64, max: u64, suggested: Option<u64> },
+    OutOfRange {
+        field: String,
+        value: u64,
+        min: u64,
+        max: u64,
+        #[schemars(required)]
+        suggested: Option<u64>,
+    },
     Conflict { source: SourceId, holders: Vec<JobId>, options: Vec<String> },
     Unknown { field: String, value: String, known: Vec<String> },
-    Ring(RingError),
-    Graph(GraphError),
+    /// Struct variants, not `Ring(RingError)`: flattening a tagged enum into
+    /// this one makes a schema that cannot forbid extra fields.
+    Ring { detail: RingError },
+    Graph { detail: GraphError },
     /// A struct variant, not `Other(String)`: an internally tagged enum cannot
     /// carry a bare string.
     Other { message: String },
@@ -139,8 +154,8 @@ impl std::fmt::Display for OpError {
             OpError::Unknown { field, value, known } => {
                 write!(f, "unknown {field} {value:?}; known: {}", known.join(", "))
             }
-            OpError::Ring(e) => write!(f, "{e}"),
-            OpError::Graph(e) => write!(f, "{e}"),
+            OpError::Ring { detail } => write!(f, "{detail}"),
+            OpError::Graph { detail } => write!(f, "{detail}"),
             OpError::Other { message } => f.write_str(message),
         }
     }
@@ -213,15 +228,19 @@ fn port_error(e: PortError) -> OpError {
     }
 }
 
+fn lease_error(e: LeaseError) -> OpError {
+    match e {
+        LeaseError::Conflict { source, holders, options, .. } => OpError::Conflict { source, holders, options },
+        LeaseError::Port(p) => port_error(p),
+    }
+}
+
 fn node_error(node: &Node, e: NodeError) -> OpError {
     match e {
         NodeError::UnknownSource(s) => unknown_source(node, &s),
         NodeError::UnknownJob(j) => unknown_job(node, &j),
-        NodeError::Graph(g) => OpError::Graph(g),
-        NodeError::Lease(LeaseError::Conflict { source, holders, options, .. }) => {
-            OpError::Conflict { source, holders, options }
-        }
-        NodeError::Lease(LeaseError::Port(p)) => port_error(p),
+        NodeError::Graph(detail) => OpError::Graph { detail },
+        NodeError::Lease(l) => lease_error(l),
         e @ NodeError::Io(_) => other(e),
     }
 }
@@ -255,20 +274,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
         Op::SourceEnsure { source, center_hz, bandwidth_hz } => {
             let want = Tuning { center_hz, bandwidth_hz };
             let port = checked_port(node, &source, &want)?;
-            let holders: Vec<JobId> = node.lease_holders(&source).into_iter().map(|(j, _)| j).collect();
-            if holders.is_empty() {
-                return port.tune(want).await.map(OpResult::Tuning).map_err(port_error);
-            }
-            match port.current() {
-                Some(cur) if fits(&want, &cur) => Ok(OpResult::Tuning(cur)),
-                cur => {
-                    let options = cur.map_or_else(
-                        || vec!["stop one of the holders".to_string()],
-                        |c| conflict_options(port.as_ref(), &want, &c),
-                    );
-                    Err(OpError::Conflict { source, holders, options })
-                }
-            }
+            node.tune_if_unheld(port.as_ref(), want).await.map(OpResult::Tuning).map_err(lease_error)
         }
         Op::JobStart { kind, source, center_hz, bandwidth_hz } => {
             let tuning = Tuning { center_hz, bandwidth_hz };
@@ -306,10 +312,12 @@ fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     if node.port(&sel.source).is_none() {
         return Err(unknown_source(node, &sel.source));
     }
-    let ring = node.ring(&sel.source).ok_or(OpError::Ring(RingError::Empty))?;
-    let (rate, samples) = {
+    let empty = || OpError::Ring { detail: RingError::Empty };
+    let ring = node.ring(&sel.source).ok_or_else(empty)?;
+    let (rate, center, samples) = {
         let r = ring.read().unwrap();
-        (r.sample_rate_hz(), r.read(sel.span).map_err(OpError::Ring)?)
+        let samples = r.read(sel.span).map_err(|detail| OpError::Ring { detail })?;
+        (r.sample_rate_hz(), r.center_hz().ok_or_else(empty)?, samples)
     };
     let dir = node.state_dir().join("captures");
     std::fs::create_dir_all(&dir).map_err(other)?;
@@ -320,14 +328,22 @@ fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         bytes.extend_from_slice(&s.im.to_le_bytes());
     }
     std::fs::write(dir.join(format!("{name}.sigmf-data")), bytes).map_err(other)?;
+    let half = sel.bandwidth_hz.0 / 2;
     let meta = serde_json::json!({
         "global": {"core:datatype": "cf32_le", "core:sample_rate": rate.0, "core:version": "1.0.0"},
-        "captures": [{"core:sample_start": 0, "core:frequency": sel.center_hz.0}],
-        "annotations": [],
+        "captures": [{"core:sample_start": 0, "core:frequency": center.0}],
+        "annotations": [{
+            "core:sample_start": 0,
+            "core:sample_count": samples.len(),
+            "core:freq_lower_edge": sel.center_hz.0.saturating_sub(half),
+            "core:freq_upper_edge": sel.center_hz.0.saturating_add(half),
+            "core:label": "selection",
+        }],
     });
     let path = dir.join(format!("{name}.sigmf-meta"));
     std::fs::write(&path, serde_json::to_vec_pretty(&meta).map_err(other)?).map_err(other)?;
-    Ok(OpResult::Iq { sample_rate_hz: rate, samples: samples.len(), path })
+    // Complex baseband: the written band is as wide as the sample rate.
+    Ok(OpResult::Iq { sample_rate_hz: rate, center_hz: center, bandwidth_hz: rate, samples: samples.len(), path })
 }
 
 #[cfg(test)]
@@ -351,8 +367,9 @@ mod tests {
         assert_eq!(serde_json::to_value(&op).unwrap(), serde_json::json!({"op": "job_stop", "job": "j"}));
         assert_eq!(serde_json::to_value(Op::JobList {}).unwrap(), serde_json::json!({"op": "job_list"}));
         assert_eq!(serde_json::to_value(OpResult::Ok).unwrap(), serde_json::json!({"result": "ok"}));
-        let e = OpError::Ring(RingError::Empty);
-        assert_eq!(serde_json::to_value(&e).unwrap(), serde_json::json!({"error": "ring", "cause": "empty"}));
+        let e = OpError::Ring { detail: RingError::Empty };
+        let want = serde_json::json!({"error": "ring", "detail": {"cause": "empty"}});
+        assert_eq!(serde_json::to_value(&e).unwrap(), want);
         let e = OpError::Other { message: "m".into() };
         assert_eq!(serde_json::from_value::<OpError>(serde_json::to_value(&e).unwrap()).unwrap(), e);
     }

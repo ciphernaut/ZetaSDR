@@ -8,7 +8,8 @@ use crate::port::Tuning;
 use crate::types::{JobId, SourceId, Timestamp};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub enum JobState {
     Created,
     Running,
@@ -18,6 +19,8 @@ pub enum JobState {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct JobRecord {
     pub id: JobId,
     pub kind: String,

@@ -248,7 +248,7 @@ mod tests {
         let (b2, o2) = (bus.clone(), out.clone());
         let h = tokio::spawn(async move {
             PassthroughStage::new()
-                .run(serde_json::json!({"kind": "Text"}), vec![rx_in], vec![o2], b2, cancel)
+                .run(serde_json::json!({"kind": "text"}), vec![rx_in], vec![o2], b2, cancel)
                 .await
         });
         (tx, bus, out, rx_out, h)

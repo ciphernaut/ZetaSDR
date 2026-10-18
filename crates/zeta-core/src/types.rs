@@ -60,6 +60,7 @@ pub struct Selection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamKind {
     Iq,
     Audio,
@@ -112,7 +113,9 @@ pub struct Capabilities {
 #[schemars(deny_unknown_fields)]
 pub struct Provenance {
     pub source: SourceId,
+    #[schemars(required)]
     pub job: Option<JobId>,
+    #[schemars(required)]
     pub channel: Option<ChannelId>,
     pub span: Span,
 }

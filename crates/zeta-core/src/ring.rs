@@ -12,7 +12,8 @@ use crate::types::{Hz, Span, Timestamp};
 const NS: u128 = 1_000_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "cause", rename_all = "snake_case")]
+#[serde(tag = "cause", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub enum RingError {
     #[error("requested {requested:?} is older than earliest retained {earliest:?}")]
     TooOld { requested: Timestamp, earliest: Timestamp },
@@ -25,10 +26,13 @@ pub enum RingError {
 /// Sample history for one source, bounded to a number of seconds.
 ///
 /// Blocks are assumed contiguous; a block that does not start where the ring
-/// expects (within one sample) is treated as a gap and restarts the ring.
+/// expects (within one sample) is treated as a gap and restarts the ring, as
+/// is a change of sample rate or centre frequency.
 pub struct IqRing {
     capacity_seconds: f64,
     sample_rate_hz: u64,
+    /// Centre frequency of the retained samples; `None` until the first block.
+    center_hz: Option<Hz>,
     capacity: usize,
     buf: VecDeque<Complex<f32>>,
     /// Timestamp of the first sample of the current contiguous run.
@@ -42,6 +46,7 @@ impl IqRing {
         Self {
             capacity_seconds,
             sample_rate_hz: sample_rate_hz.0,
+            center_hz: None,
             capacity: Self::cap_for(capacity_seconds, sample_rate_hz.0),
             buf: VecDeque::new(),
             origin_ns: 0,
@@ -73,6 +78,10 @@ impl IqRing {
             self.capacity = Self::cap_for(self.capacity_seconds, self.sample_rate_hz);
             self.clear();
         }
+        if self.center_hz != Some(block.center_hz) {
+            self.center_hz = Some(block.center_hz);
+            self.clear();
+        }
         if !self.buf.is_empty() {
             let expected = self.time_of(self.dropped + self.buf.len() as u64);
             let tolerance = NS.div_ceil(self.sample_rate_hz.max(1) as u128) as u64;
@@ -94,6 +103,11 @@ impl IqRing {
 
     pub fn sample_rate_hz(&self) -> Hz {
         Hz(self.sample_rate_hz)
+    }
+
+    /// Centre frequency the retained samples were captured at.
+    pub fn center_hz(&self) -> Option<Hz> {
+        self.center_hz
     }
 
     /// Timestamp of the oldest retained sample.
@@ -275,6 +289,18 @@ mod tests {
         assert_eq!(ring.latest(), Some(Timestamp(5_999 * MS)));
         assert!(matches!(ring.read(span(0, 1)), Err(RingError::TooOld { .. })));
         assert_eq!(ring.read(span(5, 6)).unwrap().len(), 1000);
+    }
+
+    #[test]
+    fn centre_change_clears_ring_and_is_tracked() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        assert_eq!(ring.center_hz(), None);
+        ring.push(&block(0));
+        assert_eq!(ring.center_hz(), Some(Hz(100_000_000)));
+        let moved = IqBlock { center_hz: Hz(433_000_000), ..block(1) };
+        ring.push(&moved);
+        assert_eq!(ring.center_hz(), Some(Hz(433_000_000)));
+        assert_eq!(ring.earliest(), Some(Timestamp(1_000 * MS)));
     }
 
     #[test]

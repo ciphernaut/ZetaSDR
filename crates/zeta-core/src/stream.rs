@@ -43,6 +43,8 @@ pub struct Frame {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct StreamInfo {
     pub id: StreamId,
     pub kind: StreamKind,

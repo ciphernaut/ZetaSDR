@@ -37,7 +37,7 @@ fn registry() -> StageRegistry {
 fn graph(kind: &str) -> Graph {
     Graph {
         id: GraphId::new(),
-        nodes: vec![GraphNode { id: NodeId("p".into()), kind: kind.into(), params: serde_json::json!({"kind": "Iq"}) }],
+        nodes: vec![GraphNode { id: NodeId("p".into()), kind: kind.into(), params: serde_json::json!({"kind": "iq"}) }],
         edges: vec![],
     }
 }

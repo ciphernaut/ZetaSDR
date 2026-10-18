@@ -58,14 +58,14 @@ fn band(t: &Tuning) -> (u64, u64) {
 }
 
 /// Whether the band `want` lies inside the band `cur`.
-pub(crate) fn fits(want: &Tuning, cur: &Tuning) -> bool {
+fn fits(want: &Tuning, cur: &Tuning) -> bool {
     let (wl, wh) = band(want);
     let (cl, ch) = band(cur);
     wl >= cl && wh <= ch
 }
 
 /// Ways out of a conflict between `want` and the port's current band `cur`.
-pub(crate) fn conflict_options(port: &dyn Port, want: &Tuning, cur: &Tuning) -> Vec<String> {
+fn conflict_options(port: &dyn Port, want: &Tuning, cur: &Tuning) -> Vec<String> {
     let mut options = vec!["stop one of the holders".to_string()];
     let (wl, wh) = band(want);
     let (cl, ch) = band(cur);
@@ -115,6 +115,27 @@ impl LeaseManager {
         v.retain(|(j, _)| j != &holder);
         v.push((holder, got));
         Ok(got)
+    }
+
+    /// Tune `port` to `want` without taking a lease, under the same per-source
+    /// gate as `ensure`, so it cannot interleave with a job's lease-and-tune.
+    /// A held port is never retuned: the request either fits its current band
+    /// (which is returned) or is a conflict.
+    pub async fn tune_if_unheld(&self, port: &dyn Port, want: Tuning) -> Result<Tuning, LeaseError> {
+        let source = port.id().clone();
+        let gate = self.gates.lock().unwrap().entry(source.clone()).or_default().clone();
+        let _guard = gate.lock().await;
+        let held = self.holders(&source);
+        let Some((_, first)) = held.first() else {
+            return Ok(port.tune(want).await?);
+        };
+        let cur = port.current().unwrap_or(*first);
+        if fits(&want, &cur) {
+            return Ok(cur);
+        }
+        let options = conflict_options(port, &want, &cur);
+        let holders = held.into_iter().map(|(j, _)| j).collect();
+        Err(LeaseError::Conflict { source, holders, current: cur, options })
     }
 
     /// Drop every lease held by `holder`.

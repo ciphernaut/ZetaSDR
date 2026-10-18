@@ -323,6 +323,11 @@ impl Node {
         self.inner.persist_errors.lock().unwrap().clone()
     }
 
+    /// Tune `source` to `t` unless a job holds it; see [`LeaseManager::tune_if_unheld`].
+    pub(crate) async fn tune_if_unheld(&self, port: &dyn Port, t: Tuning) -> Result<Tuning, LeaseError> {
+        self.inner.leases.tune_if_unheld(port, t).await
+    }
+
     /// Jobs currently holding a lease on `source`, with the band each asked for.
     pub fn lease_holders(&self, source: &SourceId) -> Vec<(JobId, Tuning)> {
         self.inner.leases.holders(source)

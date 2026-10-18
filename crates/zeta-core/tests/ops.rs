@@ -9,6 +9,7 @@ use serde_json::Value;
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, schema};
+use zeta_core::types::JobId;
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, Selection, SourceId, Span, Timestamp};
@@ -20,11 +21,18 @@ struct WidePort {
     caps: Capabilities,
     cur: Mutex<Option<Tuning>>,
     tx: tokio::sync::broadcast::Sender<IqBlock>,
+    /// Sleep inside `tune`, to widen the window a concurrent call could race into.
+    slow: bool,
 }
 
 impl WidePort {
+    fn slow(id: &str) -> Self {
+        Self { slow: true, ..Self::new(id) }
+    }
+
     fn new(id: &str) -> Self {
         Self {
+            slow: false,
             id: SourceId(id.into()),
             caps: Capabilities {
                 tune_min_hz: Claim::Asserted(Hz(1_000_000)),
@@ -52,6 +60,9 @@ impl Port for WidePort {
         &self.caps
     }
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        if self.slow {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         *self.cur.lock().unwrap() = Some(t);
         Ok(t)
     }
@@ -145,12 +156,8 @@ async fn job_start_passthrough_then_list_then_stop() {
     assert!(node.lease_holders(&SourceId("file0".into())).is_empty());
 }
 
-#[tokio::test]
-async fn iq_read_writes_sigmf_pair() {
-    let dir = tempfile::tempdir().unwrap();
-    let (src, port) = file_source(dir.path());
-    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
-    src.start();
+/// Wait for the source's ring to fill, then return a 50 ms selection from its start.
+async fn selection(node: &Node, center_hz: u64, bandwidth_hz: u64) -> Selection {
     let source = SourceId("file0".into());
     let mut earliest = None;
     for _ in 0..40 {
@@ -161,14 +168,23 @@ async fn iq_read_writes_sigmf_pair() {
         }
     }
     let start = earliest.expect("ring has data").0;
-    let selection = Selection {
+    Selection {
         source,
         span: Span { start: Timestamp(start), end: Timestamp(start + 50_000_000) },
-        center_hz: Hz(100_000_000),
-        bandwidth_hz: Hz(48_000),
-    };
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(bandwidth_hz),
+    }
+}
+
+#[tokio::test]
+async fn iq_read_writes_sigmf_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    src.start();
+    let selection = selection(&node, 100_000_000, 48_000).await;
     let (rate, samples, path) = match node.apply(Op::IqRead { selection }).await {
-        Ok(OpResult::Iq { sample_rate_hz, samples, path }) => (sample_rate_hz, samples, path),
+        Ok(OpResult::Iq { sample_rate_hz, samples, path, .. }) => (sample_rate_hz, samples, path),
         other => panic!("expected Iq, got {other:?}"),
     };
     assert_eq!(rate, Hz(48_000));
@@ -182,6 +198,57 @@ async fn iq_read_writes_sigmf_pair() {
     assert_eq!(meta.center_hz, Hz(100_000_000));
     let data = std::fs::metadata(path.with_extension("sigmf-data")).unwrap();
     assert_eq!(data.len(), 2400 * 8);
+}
+
+#[tokio::test]
+async fn iq_read_labels_capture_centre_not_selection_centre() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port]).await.unwrap();
+    src.start();
+    // A 10 kHz band 10 kHz above the ring's 100 MHz centre.
+    let selection = selection(&node, 100_010_000, 10_000).await;
+    let (center, bandwidth, path) = match node.apply(Op::IqRead { selection }).await {
+        Ok(OpResult::Iq { center_hz, bandwidth_hz, path, .. }) => (center_hz, bandwidth_hz, path),
+        other => panic!("expected Iq, got {other:?}"),
+    };
+    assert_eq!((center, bandwidth), (Hz(100_000_000), Hz(48_000)));
+    assert_eq!(read_meta(&path).unwrap().center_hz, Hz(100_000_000));
+    let meta: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let a = &meta["annotations"][0];
+    assert_eq!(a["core:label"], "selection");
+    assert_eq!(a["core:sample_start"], 0);
+    assert_eq!(a["core:sample_count"], 2400);
+    assert_eq!(a["core:freq_lower_edge"], 100_005_000);
+    assert_eq!(a["core:freq_upper_edge"], 100_015_000);
+}
+
+#[tokio::test]
+async fn source_ensure_during_job_start_does_not_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = Arc::new(WidePort::slow("hackrf0"));
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()]).await.unwrap();
+    let source = SourceId("hackrf0".into());
+    let job_tuning = Tuning { center_hz: Hz(100_000_000), bandwidth_hz: Hz(200_000) };
+    let start = Op::JobStart {
+        kind: JobKind::Passthrough,
+        source: source.clone(),
+        center_hz: job_tuning.center_hz,
+        bandwidth_hz: job_tuning.bandwidth_hz,
+    };
+    let ensure = Op::SourceEnsure { source, center_hz: Hz(433_000_000), bandwidth_hz: Hz(200_000) };
+    // `join!` polls `start` first, so the job is inside its slow tune when `ensure` runs.
+    let (started, ensured) = tokio::join!(node.apply(start), node.apply(ensure));
+    let job: JobId = match started {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected Job, got {other:?}"),
+    };
+    match ensured {
+        Err(OpError::Conflict { holders, .. }) => assert_eq!(holders, vec![job]),
+        Ok(OpResult::Tuning(t)) => assert_eq!(t, job_tuning),
+        other => panic!("expected Conflict or the job's tuning, got {other:?}"),
+    }
+    assert_eq!(port.current(), Some(job_tuning));
 }
 
 fn variants(op: &Value) -> &Vec<Value> {
@@ -204,6 +271,40 @@ fn every_op_variant_denies_unknown_fields_and_requires_all() {
     }
     let bad = serde_json::json!({"op": "job_list", "extra": 1});
     assert!(serde_json::from_value::<Op>(bad).is_err());
+}
+
+/// Every object schema with properties, anywhere under `v` (including `$defs`),
+/// forbids extra fields and requires every property.
+fn check_strict(v: &Value, path: &str) {
+    match v {
+        Value::Object(m) => {
+            if let Some(Value::Object(props)) = m.get("properties") {
+                assert_eq!(m.get("additionalProperties"), Some(&Value::Bool(false)), "{path} allows extra fields");
+                let mut want: Vec<&str> = props.keys().map(String::as_str).collect();
+                let mut req: Vec<&str> = m
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                want.sort();
+                req.sort();
+                assert_eq!(req, want, "{path} does not require every property");
+            }
+            for (k, c) in m {
+                check_strict(c, &format!("{path}.{k}"));
+            }
+        }
+        Value::Array(a) => a.iter().enumerate().for_each(|(i, c)| check_strict(c, &format!("{path}[{i}]"))),
+        _ => {}
+    }
+}
+
+#[test]
+fn nested_schemas_are_strict() {
+    let s = schema();
+    for key in ["op", "result", "error"] {
+        check_strict(&s[key], key);
+    }
 }
 
 fn check_units(v: &Value, path: &str) {
