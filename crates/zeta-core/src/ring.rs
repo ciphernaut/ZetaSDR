@@ -175,12 +175,109 @@ mod tests {
     fn read_beyond_latest_is_future() {
         let mut ring = IqRing::new(10.0, Hz(RATE));
         ring.push(&block(0));
-        assert!(matches!(ring.read(span(0, 2)), Err(RingError::Future { .. })));
+        assert_eq!(
+            ring.read(span(0, 2)),
+            Err(RingError::Future {
+                requested: Timestamp(2_000_000_000),
+                latest: Timestamp(999_000_000)
+            })
+        );
     }
 
     #[test]
     fn empty_ring_is_empty_error() {
         let ring = IqRing::new(10.0, Hz(RATE));
         assert_eq!(ring.read(span(0, 1)), Err(RingError::Empty));
+    }
+
+    const MS: u64 = 1_000_000;
+
+    fn span_ns(a: u64, b: u64) -> Span {
+        Span { start: Timestamp(a), end: Timestamp(b) }
+    }
+
+    fn block_at(t0_ns: u64, first: u64, n: u64) -> IqBlock {
+        let samples: Vec<Complex<f32>> =
+            (0..n).map(|i| Complex::new((first + i) as f32, 0.0)).collect();
+        IqBlock {
+            t0: Timestamp(t0_ns),
+            sample_rate_hz: Hz(RATE),
+            center_hz: Hz(100_000_000),
+            samples: Arc::from(samples),
+        }
+    }
+
+    /// Capacity 2 s, 5 s pushed: retains samples 3000..=4999, earliest 3 s, latest 4.999 s.
+    fn wrapped() -> IqRing {
+        let mut ring = IqRing::new(2.0, Hz(RATE));
+        for i in 0..5 {
+            ring.push(&block(i));
+        }
+        ring
+    }
+
+    #[test]
+    fn read_at_earliest_edge_succeeds() {
+        let got = wrapped().read(span_ns(3000 * MS, 3001 * MS)).unwrap();
+        assert_eq!(got, vec![Complex::new(3000.0, 0.0)]);
+    }
+
+    #[test]
+    fn read_one_sample_before_earliest_is_too_old() {
+        assert_eq!(
+            wrapped().read(span_ns(2999 * MS, 3001 * MS)),
+            Err(RingError::TooOld {
+                requested: Timestamp(2999 * MS),
+                earliest: Timestamp(3000 * MS)
+            })
+        );
+    }
+
+    #[test]
+    fn read_to_one_past_latest_succeeds() {
+        let got = wrapped().read(span_ns(4000 * MS, 5000 * MS)).unwrap();
+        assert_eq!(got.len(), 1000);
+        assert_eq!(got.last(), Some(&Complex::new(4999.0, 0.0)));
+    }
+
+    #[test]
+    fn read_beyond_that_is_future() {
+        assert_eq!(
+            wrapped().read(span_ns(4000 * MS, 5001 * MS)),
+            Err(RingError::Future {
+                requested: Timestamp(5001 * MS),
+                latest: Timestamp(4999 * MS)
+            })
+        );
+    }
+
+    #[test]
+    fn read_after_wrap_straddles_blocks() {
+        let got = wrapped().read(span_ns(3500 * MS, 4500 * MS)).unwrap();
+        let want: Vec<Complex<f32>> = (3500..4500).map(|v| Complex::new(v as f32, 0.0)).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn gap_clears_ring() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        ring.push(&block(0));
+        ring.push(&block(1));
+        ring.push(&block_at(5_000 * MS, 5000, 1000));
+        assert_eq!(ring.earliest(), Some(Timestamp(5_000 * MS)));
+        assert_eq!(ring.latest(), Some(Timestamp(5_999 * MS)));
+        assert!(matches!(ring.read(span(0, 1)), Err(RingError::TooOld { .. })));
+        assert_eq!(ring.read(span(5, 6)).unwrap().len(), 1000);
+    }
+
+    #[test]
+    fn one_sample_jitter_is_tolerated() {
+        for t0 in [1_000 * MS - MS, 1_000 * MS + MS] {
+            let mut ring = IqRing::new(10.0, Hz(RATE));
+            ring.push(&block(0));
+            ring.push(&block_at(t0, 1000, 1000));
+            assert_eq!(ring.earliest(), Some(Timestamp(0)), "jitter at {t0} cleared the ring");
+            assert_eq!(ring.read(span_ns(0, 2_000 * MS)).unwrap().len(), 2000);
+        }
     }
 }
