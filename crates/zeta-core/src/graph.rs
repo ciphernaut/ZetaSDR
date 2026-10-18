@@ -76,9 +76,16 @@ pub enum GraphError {
     },
     #[error("bad params on node {node:?}: {reason}")]
     BadParams { node: NodeId, reason: String },
+    #[error("node id {node:?} is used more than once")]
+    DuplicateNode { node: NodeId },
+    #[error("graph has no nodes")]
+    Empty,
+    #[error("edges form a cycle")]
+    Cycle,
 }
 
-/// Check kinds, params, endpoints and edge types, in that order.
+/// Check kinds, params, endpoints, edge types, unique node ids, that there is
+/// at least one node, and that the edges form no cycle, in that order.
 pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphError> {
     for n in &graph.nodes {
         let spec = registry
@@ -127,7 +134,44 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
             got: e.kind,
         });
     }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(n) = graph.nodes.iter().find(|n| !seen.insert(&n.id)) {
+        return Err(GraphError::DuplicateNode { node: n.id.clone() });
+    }
+    if graph.nodes.is_empty() {
+        return Err(GraphError::Empty);
+    }
+    if has_cycle(graph) {
+        return Err(GraphError::Cycle);
+    }
     Ok(())
+}
+
+/// Kahn's algorithm: the edges form a cycle if some node never reaches
+/// in-degree zero. Node ids are unique and every edge endpoint exists.
+fn has_cycle(graph: &Graph) -> bool {
+    use std::collections::HashMap;
+    let mut indegree: HashMap<&NodeId, usize> = graph.nodes.iter().map(|n| (&n.id, 0)).collect();
+    for e in &graph.edges {
+        *indegree.entry(&e.to).or_default() += 1;
+    }
+    let mut ready: Vec<&NodeId> = indegree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(n, _)| *n)
+        .collect();
+    let mut done = 0;
+    while let Some(n) = ready.pop() {
+        done += 1;
+        for e in graph.edges.iter().filter(|e| &e.from == n) {
+            let d = indegree.get_mut(&e.to).expect("endpoint exists");
+            *d -= 1;
+            if *d == 0 {
+                ready.push(&e.to);
+            }
+        }
+    }
+    done < indegree.len()
 }
 
 #[cfg(test)]
@@ -319,5 +363,60 @@ mod tests {
             }],
         };
         assert_eq!(validate(&g, &r), Err(GraphError::DanglingEdge { edge: 0 }));
+    }
+
+    fn edge(from: &str, to: &str) -> Edge {
+        Edge {
+            from: NodeId(from.into()),
+            to: NodeId(to.into()),
+            kind: StreamKind::Iq,
+        }
+    }
+
+    fn iq(id: &str) -> Node {
+        node(id, "passthrough", serde_json::json!({"kind": "iq"}))
+    }
+
+    #[test]
+    fn duplicate_node_ids_are_rejected() {
+        let g = Graph {
+            id: GraphId::new(),
+            nodes: vec![iq("a"), iq("b"), iq("a")],
+            edges: vec![edge("a", "b")],
+        };
+        assert_eq!(
+            validate(&g, &registry()),
+            Err(GraphError::DuplicateNode {
+                node: NodeId("a".into())
+            })
+        );
+    }
+
+    #[test]
+    fn empty_graph_is_rejected() {
+        let g = Graph {
+            id: GraphId::new(),
+            nodes: vec![],
+            edges: vec![],
+        };
+        assert_eq!(validate(&g, &registry()), Err(GraphError::Empty));
+    }
+
+    #[test]
+    fn cycles_are_rejected() {
+        let r = registry();
+        let mk = |edges| Graph {
+            id: GraphId::new(),
+            nodes: vec![iq("a"), iq("b"), iq("c")],
+            edges,
+        };
+        let ring = mk(vec![edge("a", "b"), edge("b", "c"), edge("c", "b")]);
+        assert_eq!(validate(&ring, &r), Err(GraphError::Cycle));
+        assert_eq!(
+            validate(&mk(vec![edge("a", "a")]), &r),
+            Err(GraphError::Cycle)
+        );
+        let chain = mk(vec![edge("a", "b"), edge("b", "c"), edge("a", "c")]);
+        assert_eq!(validate(&chain, &r), Ok(()));
     }
 }
