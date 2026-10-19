@@ -217,19 +217,32 @@ fn score(
     (s > FREQ_SCORE).then_some((s, bw, modulation))
 }
 
+/// Width of the narrowest frequency range of `e` holding `center_hz`, the
+/// tie-break among equal scores: the more specific allocation first.
+fn narrowest_range(e: &CatalogueEntry, center_hz: u64) -> u64 {
+    e.frequency_ranges
+        .iter()
+        .filter(|&&(lo, hi)| (lo.0..=hi.0).contains(&center_hz))
+        .map(|&(lo, hi)| hi.0 - lo.0)
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
 /// Up to [`MAX_LABELS`] layer-2 labels naming catalogue entries for a signal
 /// centred at `center_hz`, `bandwidth_hz` wide and labelled `layer1` by layer
-/// 1, highest score first (catalogue order among equals). Score: 0.4 when a
-/// frequency range holds `center_hz` (required); 0.3 when `bandwidth_hz` lies
-/// in half the entry's minimum to 1.5 × its maximum bandwidth (required when
-/// that maximum is above 50 kHz); 0.3 when `layer1` maps to one of the entry's
-/// modulations. At least one of the last two must hold.
+/// 1, highest score first; among equal scores, the entry whose narrowest
+/// frequency range holding `center_hz` is narrower first (then catalogue
+/// order). Score: 0.4 when a frequency range holds `center_hz` (required);
+/// 0.3 when `bandwidth_hz` lies in half the entry's minimum to 1.5 × its
+/// maximum bandwidth (required when that maximum is above 50 kHz); 0.3 when
+/// `layer1` maps to one of the entry's modulations. At least one of the last
+/// two must hold.
 pub fn catalogue_labels(center_hz: u64, bandwidth_hz: u64, layer1: &str) -> Vec<Label> {
     let mut scored: Vec<(u32, &CatalogueEntry, Term, Term)> = catalogue()
         .iter()
         .filter_map(|e| score(e, center_hz, bandwidth_hz, layer1).map(|(s, b, m)| (s, e, b, m)))
         .collect();
-    scored.sort_by_key(|s| std::cmp::Reverse(s.0));
+    scored.sort_by_key(|s| (std::cmp::Reverse(s.0), narrowest_range(s.1, center_hz)));
     scored
         .into_iter()
         .take(MAX_LABELS)

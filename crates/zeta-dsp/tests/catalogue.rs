@@ -9,7 +9,7 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::types::Hz;
-use zeta_dsp::catalogue::{CatalogueClassifier, CatalogueKnowledge, catalogue};
+use zeta_dsp::catalogue::{CatalogueClassifier, CatalogueKnowledge, catalogue, catalogue_labels};
 use zeta_dsp::fixtures::{awgn, nbfm_modulate, tone, wfm_modulate};
 
 const WFM_RATE: u64 = 240_000;
@@ -107,4 +107,44 @@ async fn knowledge_lookup_returns_catalogue_signatures() {
     assert_eq!(fm.modulation, "WFM");
     assert_eq!((fm.min_hz, fm.max_hz), (Hz(87_500_000), Hz(108_000_000)));
     assert_eq!(fm.bandwidth_hz, Hz(250_000));
+}
+
+#[test]
+fn equal_scores_prefer_the_narrowest_containing_frequency_range() {
+    // At 144.8 MHz a 12.5 kHz fm channel scores 1.0 against both the 2 m
+    // amateur band (144-146 MHz) and POCSAG (138-175 MHz); the narrower
+    // allocation is the more specific answer.
+    let labels = catalogue_labels(144_800_000, 12_500, "fm");
+    eprintln!("labels: {labels:?}");
+    assert!(!labels.is_empty(), "{labels:?}");
+    assert_eq!(labels[0].name, "Amateur Radio (2m Band)", "{labels:?}");
+    assert!(labels.iter().all(|l| l.confidence <= labels[0].confidence));
+}
+
+#[test]
+fn equal_scores_are_not_left_in_catalogue_order() {
+    // At 433.92 MHz a 3 kHz am signal scores 0.7 against a Denso key fob
+    // (431.75-436.09 MHz, listed first) and the ISM weather sensors
+    // (430.84-435.17 MHz); among equal scores the narrower containing range
+    // comes first, whatever the catalogue order.
+    let labels = catalogue_labels(433_920_000, 3_000, "am");
+    eprintln!("labels: {labels:?}");
+    assert!(!labels.is_empty(), "{labels:?}");
+    let widths: Vec<u64> = labels
+        .iter()
+        .filter(|l| (l.confidence - labels[0].confidence).abs() < 1e-6)
+        .map(|l| {
+            let e = catalogue().iter().find(|e| e.name == l.name).unwrap();
+            e.frequency_ranges
+                .iter()
+                .filter(|&&(lo, hi)| (lo.0..=hi.0).contains(&433_920_000))
+                .map(|&(lo, hi)| hi.0 - lo.0)
+                .min()
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        widths.windows(2).all(|w| w[0] <= w[1]),
+        "{widths:?} {labels:?}"
+    );
 }
