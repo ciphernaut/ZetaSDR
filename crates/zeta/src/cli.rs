@@ -202,21 +202,23 @@ pub enum SoapyCmd {
     },
 }
 
+const LLM_MAX_TOKENS: u32 = 1024;
+const LLM_READY_TIMEOUT_S: u64 = 600;
+
+/// The model behind `zeta ask` and `zeta serve`'s `POST /ask`.
 #[derive(Debug, Clone, Args)]
-pub struct AskArgs {
-    /// The request; omit it or pass "-" to read it from stdin
-    pub request: Option<String>,
+pub struct LlmArgs {
     /// Base URL of an OpenAI-compatible endpoint
     #[arg(long, env = "ZETA_LLM_URL", value_name = "URL")]
-    pub llm_url: String,
+    pub llm_url: Option<String>,
     /// Model name sent to the endpoint
     #[arg(long, env = "ZETA_LLM_MODEL", value_name = "NAME")]
-    pub llm_model: String,
+    pub llm_model: Option<String>,
     /// API key for the endpoint, if it needs one
     #[arg(long, env = "ZETA_LLM_KEY", hide_env_values = true, value_name = "KEY")]
     pub llm_key: Option<String>,
     /// Token budget per model turn
-    #[arg(long, default_value_t = 1024, value_name = "N")]
+    #[arg(long, default_value_t = LLM_MAX_TOKENS, value_name = "N")]
     pub llm_max_tokens: u32,
     /// Enable model thinking (off by default)
     #[arg(long)]
@@ -225,8 +227,33 @@ pub struct AskArgs {
     #[arg(long, value_name = "URL")]
     pub llm_status_url: Option<String>,
     /// Longest wait for the model to become ready, seconds
-    #[arg(long, default_value_t = 600, value_name = "SECONDS")]
+    #[arg(long, default_value_t = LLM_READY_TIMEOUT_S, value_name = "SECONDS")]
     pub llm_ready_timeout_s: u64,
+}
+
+/// No model, the flags' defaults otherwise.
+impl Default for LlmArgs {
+    fn default() -> Self {
+        Self {
+            llm_url: None,
+            llm_model: None,
+            llm_key: None,
+            llm_max_tokens: LLM_MAX_TOKENS,
+            llm_thinking: false,
+            llm_status_url: None,
+            llm_ready_timeout_s: LLM_READY_TIMEOUT_S,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(mut_arg("llm_url", |a| a.required(true)))]
+#[command(mut_arg("llm_model", |a| a.required(true)))]
+pub struct AskArgs {
+    /// The request; omit it or pass "-" to read it from stdin
+    pub request: Option<String>,
+    #[command(flatten)]
+    pub llm: LlmArgs,
     /// Most model turns before giving up
     #[arg(long, default_value_t = 8, value_name = "N")]
     pub max_turns: u32,
@@ -238,6 +265,12 @@ pub struct ServeArgs {
     /// 127.0.0.1); requires --secret or ZETA_SECRET
     #[arg(long, value_name = "[ADDR:]PORT")]
     pub listen: Option<String>,
+    /// Unix socket of the `local-voice` speech daemon behind `POST /stt` [default:
+    /// $XDG_RUNTIME_DIR/voiced.sock when it exists]
+    #[arg(long, env = "ZETA_STT_SOCKET", value_name = "PATH")]
+    pub stt_socket: Option<PathBuf>,
+    #[command(flatten)]
+    pub llm: LlmArgs,
 }
 
 #[derive(Debug, Subcommand)]

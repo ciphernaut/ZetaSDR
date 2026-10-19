@@ -1098,7 +1098,8 @@ async fn stream_tail_unknown_stream_lists_known() {
     };
     let a = node.bus().register(StreamKind::Event, prov("a"));
     let b = node.bus().register(StreamKind::Audio, prov("b"));
-    let mut want = vec![a.0, b.0];
+    // The node's own `ops` stream is always known too.
+    let mut want = vec![a.0, b.0, node.ops_stream().0];
     want.sort();
     let op = Op::StreamTail {
         stream: StreamId("nope".into()),

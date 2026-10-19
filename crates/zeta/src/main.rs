@@ -83,16 +83,16 @@ async fn main() -> ExitCode {
         Some(_) => None,
     };
     // Only `serve` (op `None`) resumes jobs; a one-shot never launches or fails them.
-    let (node, remotes) = match node_setup::open(state_dir, &sources, &plugins, op.is_none()).await
-    {
-        Ok(n) => n,
-        Err(e) => return fail(&e),
-    };
+    let (node, remotes) =
+        match node_setup::open(state_dir.clone(), &sources, &plugins, op.is_none()).await {
+            Ok(n) => n,
+            Err(e) => return fail(&e),
+        };
     for name in node.load_errors() {
         eprintln!("zeta: warning: unreadable job record {name}");
     }
     let code = match op {
-        None => transport::serve(node, &serve_args, secret.as_deref()).await,
+        None => transport::serve(node, &serve_args, secret.as_deref(), state_dir).await,
         Some(op) => one_shot(&node, op, then_tail, keep).await,
     };
     // Remote nodes' `passthrough` jobs end with this process, not with the runtime.

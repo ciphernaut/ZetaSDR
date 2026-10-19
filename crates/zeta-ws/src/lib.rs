@@ -1,11 +1,14 @@
 //! WebSocket transport for a ZetaSDR node.
 
 pub mod addr;
+mod ask;
 pub mod auth;
 pub mod http;
 pub mod stream;
+mod stt;
 #[cfg(feature = "test-server")]
 pub mod testing;
+mod ui;
 pub mod wire;
 
 pub use http::{Health, Limits, Server, ServerConfig, ServerStats, StatsHandle, bind};

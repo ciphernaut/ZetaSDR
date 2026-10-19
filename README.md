@@ -6,15 +6,17 @@ script or an LLM can invoke. This branch is the core node (ports and leases, IQ 
 jobs, the operation set, a SigMF file source and the `zeta` CLI) and the DSP slice (channel
 extraction, spectrum, NBFM demodulation, APRS decoding, layer-1 measurement and classifiers),
 with the transports and agent of plan 3, the hardware and foreign sources of plan 4 (KiwiSDR,
-SoapySDR, external-process stages) and the federation of plan 5 (another node as a source, VITA
-49.2 over the websocket and UDP, a Pi 5 build).
+SoapySDR, external-process stages), the federation of plan 5 (another node as a source, VITA
+49.2 over the websocket and UDP, a Pi 5 build) and the web UI of plan 6 (waterfall, context
+menu, agent transcript, graph view).
 
 Design: [docs/superpowers/specs/2026-10-18-zetasdr-design.md](docs/superpowers/specs/2026-10-18-zetasdr-design.md).
 Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2026-10-18-core-node.md),
 [docs/superpowers/plans/2026-10-18-dsp-slice.md](docs/superpowers/plans/2026-10-18-dsp-slice.md),
 [docs/superpowers/plans/2026-10-18-transports-agent.md](docs/superpowers/plans/2026-10-18-transports-agent.md),
 [docs/superpowers/plans/2026-10-19-hardware-sources.md](docs/superpowers/plans/2026-10-19-hardware-sources.md),
-[docs/superpowers/plans/2026-10-19-federation.md](docs/superpowers/plans/2026-10-19-federation.md).
+[docs/superpowers/plans/2026-10-19-federation.md](docs/superpowers/plans/2026-10-19-federation.md),
+[docs/superpowers/plans/2026-10-19-ui.md](docs/superpowers/plans/2026-10-19-ui.md).
 
 ## Tests
 
@@ -277,6 +279,101 @@ OpenAI-compatible endpoint (thinking off, token budget per turn, bounded turns, 
 ```
 
 `zeta ask` reads its request from stdin, so a `local-voice` transcript can be piped in.
+
+## UI
+
+`zeta serve --listen` also serves a web app at `http://HOST:PORT/ui/` (`/` redirects there). It
+is plain JavaScript embedded in the binary, a client of the same HTTP and websocket API as
+everything else: no build step, nothing fetched from elsewhere. The page asks for the node's
+secret once and keeps it in the tab's `sessionStorage`; a wrong secret shows "secret rejected"
+and opens nothing, and a secret the node later rejects (a restart with a new one) returns to the
+box.
+
+```bash
+ZETA_SECRET=correct-horse-battery ./target/debug/zeta --state-dir scratch/state6 \
+    --source-file tone=scratch/fx/tone.sigmf-meta --source-file aprs=scratch/fx/aprs.sigmf-meta \
+    serve --listen 127.0.0.1:7979 --llm-url http://127.0.0.1:8080 --llm-model gemma-4-12b
+# then open http://127.0.0.1:7979/ui/ and paste the secret
+```
+
+The page picks its layout from the viewport width (`?footprint=wide|narrow` forces one):
+
+- Wide (700 px and up): source tabs along the top, one per `source_list` entry; the waterfall
+  for the selected source, newest column at the right, frequency vertical; on the side the
+  transcript and the job list; along the bottom the command line (Ctrl-K) and the microphone.
+- Narrow (under 700 px, a phone): the waterfall takes the screen. The transcript and job
+  list move into a drawer behind ☰, and the agent's answers also appear as ribbons on the
+  waterfall.
+
+The waterfall is the UI's own `spectrum` job on the selected source (it reuses a running one,
+and stops the one it started when the page closes). Overlays are pinned to their channel and
+scroll with it: a `measure` job's layer-1 label with its confidence, an `aprs_decode` packet as
+a ribbon (`VK3ABC > APRS: >hi` on the fixture), any other event as a short ribbon. The job list
+shows every job that is not stopped, with a live event counter, ■ to stop it, ▶ on an
+`fm_demod` row to play its audio in the browser (one job at a time) and `graph` to open the
+job's graph view.
+
+Drag across the waterfall to select a band and a time span; a context menu opens with:
+
+| Entry | Operation |
+|---|---|
+| What is this? | `classify` on the selection; the labels are drawn at the selection and listed in the transcript |
+| Decode › APRS | `job_start` `aprs_decode` on the selection's centre and bandwidth |
+| Decode › NBFM audio | `job_start` `fm_demod` (deviation 5000 Hz) |
+| Start background job › measure | `job_start` `measure` |
+| Save selection as SigMF | `iq_read` on the selection; the transcript shows the capture path |
+| Send to agent | `POST /ask` with "Look at C Hz, BW Hz wide, from START to END: what is it?" |
+
+These are the same operations an agent, the CLI or MCP would send, through the same
+`Node::apply`. The menu's footer shows the selection in the operations' own terms
+(`center_hz=… bandwidth_hz=… start_ns=… end_ns=…`); the span is clamped to the newest 8 s so it
+stays inside the source ring.
+
+The transcript is fed by the node's `ops` stream: one event per applied operation, from any
+client (the page, the CLI, MCP, the agent), with its outcome and elapsed time, so a call the
+agent makes shows there verbatim, as `job_start kind=measure source=tone center_hz=… → job …`,
+and an error shows its corrective detail. The page polls `job_list` every 2 s and the waterfall
+looks up sources and streams, so successful `job_list`, `stream_list` and `source_list` lines
+are hidden unless you typed that operation yourself (the agent's own list calls are hidden too,
+since the stream does not say who sent them); errors always show. The `ops` stream is an
+ordinary stream (`stream list` shows it with provenance source `node`), so a script can follow
+it too.
+
+The command line takes either an operation as JSON (`{"op":"source_list"}`, applied with
+`POST /op`) or free text, which goes to the agent. That needs `--llm-url` and `--llm-model` on
+`serve` (the other `--llm-*` flags of `zeta ask` apply), which enable `POST /ask`: the node runs
+the `zeta ask` agent against itself, so its calls appear in the transcript as they happen, and
+the answer follows when the run ends (one run at a time; 503 without `--llm-url`, 504 after
+300 s). The microphone records in the browser and sends a 16 kHz WAV to `POST /stt`, which hands
+it to a `local-voice` speech daemon on the node's host at `--stt-socket PATH` (default
+`$XDG_RUNTIME_DIR/voiced.sock` when that exists); the transcript is submitted as if typed.
+Without a daemon the button says "no speech daemon on this node". Browsers allow the
+microphone only on a secure origin: `localhost` qualifies, a LAN address over plain HTTP does
+not.
+
+Clicking `graph` on a job row draws its graph document (stages as boxes, streams as labelled
+edges). Clicking a stage shows its `params` as JSON; editing them and pressing Apply sends
+`graph_put` with that stage changed, which restarts the job under the same id.
+
+Only `/` and `/ui/*` (the static files, which hold no secret) are served without the secret.
+Everything else still needs `Authorization: Bearer <secret>`. A browser cannot set that header on
+a websocket, so `/stream/{id}` also accepts the secret as a subprotocol: offer
+`["zeta", "zeta.bearer." + base64url(secret)]` (base64url without padding). This works for any
+websocket client:
+
+```bash
+python3 - <<'PY'
+import base64, json, os, urllib.request
+from websockets.sync.client import connect   # pip install websockets
+node, secret = "127.0.0.1:7979", os.environ["ZETA_SECRET"]
+req = urllib.request.Request(f"http://{node}/streams", headers={"Authorization": "Bearer " + secret})
+ops = next(s["id"] for s in json.load(urllib.request.urlopen(req)) if s["provenance"]["source"] == "node")
+proto = "zeta.bearer." + base64.urlsafe_b64encode(secret.encode()).decode().rstrip("=")
+with connect(f"ws://{node}/stream/{ops}", subprotocols=["zeta", proto]) as ws:
+    for msg in ws:
+        print(msg)                                 # one {"type":"frame",...} per operation
+PY
+```
 
 ## Federation
 

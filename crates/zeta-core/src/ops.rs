@@ -73,6 +73,10 @@ pub enum Op {
     IqRead {
         selection: Selection,
     },
+    /// List the streams: id, kind and provenance. One is always the node's
+    /// own `ops` event stream (provenance source `node`): one event per
+    /// applied operation with its outcome and caller (`transport`: `local`,
+    /// `http`, `ui` or `agent`), logged after the operation completes.
     StreamList {},
     /// Collect frames from a stream until `max_frames` (1..=1000) arrive or
     /// `timeout_ms` (1..=10000) passes, whichever is first; frames published
@@ -443,6 +447,117 @@ pub enum OpResult {
     Schema(serde_json::Value),
 }
 
+impl Op {
+    /// The snake_case tag this variant serialises under `op`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Op::SourceList {} => "source_list",
+            Op::SourceEnsure { .. } => "source_ensure",
+            Op::JobStart { .. } => "job_start",
+            Op::JobList {} => "job_list",
+            Op::JobStop { .. } => "job_stop",
+            Op::JobContext { .. } => "job_context",
+            Op::IqRead { .. } => "iq_read",
+            Op::StreamList {} => "stream_list",
+            Op::StreamTail { .. } => "stream_tail",
+            Op::GraphGet { .. } => "graph_get",
+            Op::GraphPut { .. } => "graph_put",
+            Op::KnowledgeLookup { .. } => "knowledge_lookup",
+            Op::Classify { .. } => "classify",
+            Op::Schema {} => "schema",
+        }
+    }
+
+    /// The op as JSON for the `ops` stream: the full value when it fits in
+    /// [`OPS_RESULT_LIMIT_BYTES`], otherwise
+    /// `{"op": <name>, "truncated": true, "bytes": n}`. A value that fails to
+    /// serialise is summarised with `bytes: 0`.
+    pub fn summary_json(&self) -> serde_json::Value {
+        bounded_json(self, "op", self.name())
+    }
+}
+
+/// `value` as JSON when its serialisation fits in [`OPS_RESULT_LIMIT_BYTES`],
+/// else `{tag: name, "truncated": true, "bytes": n}`; a serde failure gives
+/// `bytes: 0`.
+fn bounded_json<T: Serialize>(value: &T, tag: &str, name: &str) -> serde_json::Value {
+    let summary = |bytes: usize| {
+        let mut m = serde_json::Map::new();
+        m.insert(tag.into(), name.into());
+        m.insert("truncated".into(), true.into());
+        m.insert("bytes".into(), bytes.into());
+        serde_json::Value::Object(m)
+    };
+    match serde_json::to_vec(value) {
+        Ok(buf) if buf.len() > OPS_RESULT_LIMIT_BYTES => summary(buf.len()),
+        Ok(buf) => serde_json::from_slice(&buf).unwrap_or_else(|_| summary(0)),
+        Err(_) => summary(0),
+    }
+}
+
+impl OpResult {
+    /// The snake_case tag this variant serialises under `result`.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            OpResult::Sources(_) => "sources",
+            OpResult::Tuning(_) => "tuning",
+            OpResult::Job(_) => "job",
+            OpResult::Jobs(_) => "jobs",
+            OpResult::Context(_) => "context",
+            OpResult::Iq { .. } => "iq",
+            OpResult::Streams(_) => "streams",
+            OpResult::Frames { .. } => "frames",
+            OpResult::Graph(_) => "graph",
+            OpResult::Knowledge { .. } => "knowledge",
+            OpResult::Labels(_) => "labels",
+            OpResult::Ok => "ok",
+            OpResult::Schema(_) => "schema",
+        }
+    }
+
+    /// The result as JSON for the `ops` stream: the full value when it fits
+    /// in [`OPS_RESULT_LIMIT_BYTES`], otherwise
+    /// `{"result": <variant>, "truncated": true, "bytes": n}`. A value that
+    /// fails to serialise is summarised with `bytes: 0`.
+    pub fn summary_json(&self) -> serde_json::Value {
+        bounded_json(self, "result", self.variant_name())
+    }
+}
+
+/// Largest result JSON, in bytes, carried whole on the `ops` stream.
+pub const OPS_RESULT_LIMIT_BYTES: usize = 8192;
+
+/// The `ops` stream's event payload for one applied operation:
+/// `{"op", "outcome": "ok"|"error", "result"|"error", "elapsed_ms",
+/// "transport"}` where `transport` names the caller (see
+/// [`crate::node::Node::apply_from`]); see [`Op::summary_json`] and
+/// [`OpResult::summary_json`] and [`OpError::summary_json`] for large ops,
+/// results and errors.
+pub fn ops_payload(
+    op: &Op,
+    outcome: &Result<OpResult, OpError>,
+    elapsed_ms: u64,
+    transport: &str,
+) -> serde_json::Value {
+    let op = op.summary_json();
+    let mut v = serde_json::json!({
+        "op": op,
+        "elapsed_ms": elapsed_ms,
+        "transport": transport,
+    });
+    match outcome {
+        Ok(r) => {
+            v["outcome"] = "ok".into();
+            v["result"] = r.summary_json();
+        }
+        Err(e) => {
+            v["outcome"] = "error".into();
+            v["error"] = e.summary_json();
+        }
+    }
+    v
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "error", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -481,6 +596,28 @@ pub enum OpError {
     Other {
         message: String,
     },
+}
+
+impl OpError {
+    /// The snake_case tag this variant serialises under `error`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            OpError::OutOfRange { .. } => "out_of_range",
+            OpError::Conflict { .. } => "conflict",
+            OpError::Unknown { .. } => "unknown",
+            OpError::Ring { .. } => "ring",
+            OpError::Graph { .. } => "graph",
+            OpError::Other { .. } => "other",
+        }
+    }
+
+    /// The error as JSON for the `ops` stream: the full value when it fits in
+    /// [`OPS_RESULT_LIMIT_BYTES`], otherwise
+    /// `{"error": <variant>, "truncated": true, "bytes": n}`. A value that
+    /// fails to serialise is summarised with `bytes: 0`.
+    pub fn summary_json(&self) -> serde_json::Value {
+        bounded_json(self, "error", self.name())
+    }
 }
 
 // Hand-written: thiserror treats a field named `source` as the error source.

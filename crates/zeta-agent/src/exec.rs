@@ -23,8 +23,24 @@ impl<E: Executor + ?Sized> Executor for &E {
     }
 }
 
-/// A node in this process.
-pub struct LocalExecutor(pub Arc<Node>);
+/// A node in this process. Its `ops` records carry `transport` (see
+/// `Node::apply_from`): `"local"` from [`LocalExecutor::new`].
+pub struct LocalExecutor {
+    node: Arc<Node>,
+    transport: &'static str,
+}
+
+impl LocalExecutor {
+    /// Calls logged as `"local"`.
+    pub fn new(node: Arc<Node>) -> Self {
+        Self::tagged(node, "local")
+    }
+
+    /// Calls logged with `transport`, e.g. `"agent"` for the server's `/ask`.
+    pub fn tagged(node: Arc<Node>, transport: &'static str) -> Self {
+        Self { node, transport }
+    }
+}
 
 #[async_trait]
 impl Executor for LocalExecutor {
@@ -33,7 +49,7 @@ impl Executor for LocalExecutor {
             Ok(op) => op,
             Err(e) => return Ok(Err(to_json(&e))),
         };
-        Ok(match self.0.apply(op).await {
+        Ok(match self.node.apply_from(op, self.transport).await {
             Ok(r) => match serde_json::to_value(&r) {
                 Ok(v) => Ok(v),
                 Err(e) => Err(

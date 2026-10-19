@@ -101,8 +101,16 @@ async fn shutdown_signal() -> std::io::Result<()> {
 }
 
 /// Run `serve`: wait for Ctrl-C or SIGTERM, also serving the API when `--listen` is given.
-pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCode {
+pub async fn serve(
+    node: Node,
+    args: &ServeArgs,
+    secret: Option<&str>,
+    state_dir: PathBuf,
+) -> ExitCode {
     let Some(listen) = &args.listen else {
+        if std::env::args().any(|a| a.starts_with("--llm-")) {
+            eprintln!("zeta: warning: --llm-url/--llm-model are ignored without --listen");
+        }
         eprintln!("zeta: serving; Ctrl-C to stop");
         if let Err(e) = shutdown_signal().await {
             return usage(&format!("waiting for Ctrl-C or SIGTERM: {e}"));
@@ -113,22 +121,37 @@ pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCo
         Ok(a) => a,
         Err(e) => return usage(&e),
     };
+    let llm = match crate::ask::llm_config(&args.llm) {
+        Ok(l) => l,
+        Err(e) => return usage(&e),
+    };
+    let ask_model = llm.as_ref().map(|l| l.model.clone());
     let secret_text = secret.unwrap_or_default();
     let secret = match Secret::new(secret_text) {
         Ok(s) => s,
         Err(e) => return usage(&e),
     };
+    let stt_socket = args.stt_socket.clone().or_else(default_stt_socket);
     let cfg = ServerConfig {
         listen,
         secret,
         agents_md: agents_md::rendering(),
         limits: Limits::default(),
+        llm,
+        state_dir,
+        stt_socket: stt_socket.clone(),
     };
     let server = match bind(Arc::new(node), cfg).await {
         Ok(s) => s,
         Err(e) => return usage(&e.to_string()),
     };
     eprintln!("zeta: listening on {}", server.local_addr());
+    if let Some(model) = &ask_model {
+        eprintln!("zeta: POST /ask runs model {model}");
+    }
+    if let Some(path) = &stt_socket {
+        eprintln!("zeta: speech daemon: {}", path.display());
+    }
     if secret_text.chars().count() < MIN_SECRET_LEN {
         eprintln!("zeta: warning: secret shorter than {MIN_SECRET_LEN} characters");
     }
@@ -144,6 +167,12 @@ pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCo
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => usage(&e.to_string()),
     }
+}
+
+/// `$XDG_RUNTIME_DIR/voiced.sock`, when it exists.
+fn default_stt_socket() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("voiced.sock");
+    path.exists().then_some(path)
 }
 
 /// Print serialised JSON on stdout and return `code`.

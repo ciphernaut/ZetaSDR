@@ -3,6 +3,13 @@
 
 use std::fmt;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+/// The `Sec-WebSocket-Protocol` entry prefix that carries the secret, base64url unpadded,
+/// for browsers, which cannot set an `Authorization` header on a websocket.
+pub const BEARER_SUBPROTOCOL_PREFIX: &str = "zeta.bearer.";
+
 /// The shared secret. `Debug` is redacted; there is no `Display` or `Serialize`.
 #[derive(Clone)]
 pub struct Secret(String);
@@ -44,6 +51,16 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(fold) == 0
 }
 
+/// The secret carried by a `zeta.bearer.<base64url>` entry of a comma-separated
+/// `Sec-WebSocket-Protocol` value, or `None` when no entry carries a decodable one. With
+/// several bearer entries the first decodable one wins; later ones are never consulted.
+pub fn subprotocol_secret(header: &str) -> Option<Vec<u8>> {
+    header
+        .split(',')
+        .filter_map(|p| p.trim().strip_prefix(BEARER_SUBPROTOCOL_PREFIX))
+        .find_map(|b64| URL_SAFE_NO_PAD.decode(b64).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,6 +71,36 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"abcd"));
         assert!(ct_eq(b"", b""));
+    }
+    #[test]
+    fn subprotocol_secret_cases() {
+        let enc = URL_SAFE_NO_PAD.encode("ui-secret-0123456789");
+        assert_eq!(
+            subprotocol_secret(&format!("zeta, zeta.bearer.{enc}")).as_deref(),
+            Some(&b"ui-secret-0123456789"[..])
+        );
+        assert_eq!(
+            subprotocol_secret(&format!("zeta.bearer.{enc},zeta")).as_deref(),
+            Some(&b"ui-secret-0123456789"[..])
+        );
+        assert_eq!(subprotocol_secret("zeta"), None);
+        assert_eq!(subprotocol_secret("zeta, zeta.bearer.!!!"), None);
+        // Padded base64 is not accepted.
+        assert_eq!(subprotocol_secret("zeta.bearer.YQ=="), None);
+        assert_eq!(subprotocol_secret(""), None);
+    }
+    #[test]
+    fn first_decodable_bearer_entry_wins() {
+        let a = URL_SAFE_NO_PAD.encode("first");
+        let b = URL_SAFE_NO_PAD.encode("second");
+        assert_eq!(
+            subprotocol_secret(&format!("zeta, zeta.bearer.{a}, zeta.bearer.{b}")).as_deref(),
+            Some(&b"first"[..])
+        );
+        assert_eq!(
+            subprotocol_secret(&format!("zeta.bearer.!!, zeta.bearer.{b}")).as_deref(),
+            Some(&b"second"[..])
+        );
     }
     #[test]
     fn empty_secret_rejected() {

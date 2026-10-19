@@ -1,11 +1,11 @@
 //! The agent loop: model turns, tool calls applied through an executor, errors fed back.
 
 use crate::exec::{Executor, to_json};
-use crate::llm::{AgentError, LlmClient};
+use crate::llm::{AgentError, LlmClient, LlmConfig};
 use crate::wire::{ChatMessage, ToolCall};
 use serde::Serialize;
 use serde_json::Value;
-use zeta_client::{ToolDef, op_from_call};
+use zeta_client::{ToolDef, op_from_call, op_tools, system_prompt};
 use zeta_core::ops::OpError;
 
 pub struct AgentConfig {
@@ -75,6 +75,21 @@ pub fn is_question(request: &str) -> bool {
         return false;
     }
     QUESTION_WORDS.contains(&word.as_str())
+}
+
+/// The agent `zeta ask` and the node's `POST /ask` both run: tools from the
+/// node's `schema`, the system prompt from its guide `agents_md`.
+pub fn build_agent<E: Executor>(
+    llm: LlmConfig,
+    exec: E,
+    schema: &Value,
+    agents_md: &str,
+    max_turns: u32,
+) -> Result<Agent<E>, AgentError> {
+    let llm = LlmClient::new(llm)?;
+    let mut cfg = AgentConfig::new(system_prompt(agents_md), op_tools(schema, agents_md));
+    cfg.max_turns = max_turns;
+    Ok(Agent::new(llm, exec, cfg))
 }
 
 pub struct Agent<E: Executor> {

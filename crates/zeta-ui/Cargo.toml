@@ -1,0 +1,8 @@
+[package]
+name = "zeta-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The ZetaSDR web app's static files, embedded"
+
+[dependencies]

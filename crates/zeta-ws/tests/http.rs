@@ -95,6 +95,40 @@ async fn op_ok_is_200_with_result() {
 }
 
 #[tokio::test]
+async fn op_records_carry_the_callers_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let mut ops = ts.node.bus().subscribe(&ts.node.ops_stream()).unwrap();
+    let send = |client_tag: Option<&'static str>| {
+        let mut req = client()
+            .post(format!("{}/op", ts.url))
+            .header("authorization", BEARER)
+            .json(&json!({"op": "source_list"}));
+        if let Some(t) = client_tag {
+            req = req.header("x-zeta-client", t);
+        }
+        req.send()
+    };
+    for (tag, want) in [
+        (Some("ui"), "ui"),
+        (None, "http"),
+        (Some("agent"), "http"),
+        (Some("local"), "http"),
+    ] {
+        assert_eq!(send(tag).await.unwrap().status(), StatusCode::OK);
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ops.recv())
+            .await
+            .expect("ops frame within 5 s")
+            .expect("ops stream open");
+        let zeta_core::stream::Payload::Event(p) = frame.payload else {
+            panic!("ops frame is not an Event");
+        };
+        assert_eq!(p["transport"], want, "header {tag:?}");
+    }
+    ts.stop().await;
+}
+
+#[tokio::test]
 async fn op_error_is_422_with_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let ts = spawn(dir.path()).await;
@@ -227,6 +261,9 @@ async fn bind_refuses_non_lan() {
         secret: Secret::new("s3cret").unwrap(),
         agents_md: String::new(),
         limits: Limits::default(),
+        llm: None,
+        state_dir: dir.path().join("state"),
+        stt_socket: None,
     };
     let err = bind(Arc::clone(&ts.node), cfg).await.err().unwrap();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
