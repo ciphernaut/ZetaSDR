@@ -9,6 +9,9 @@
 //   class OpError extends Error { json, status }: an error reply ({"error": name, ...}).
 //
 //   Api:
+//     api.onUnauthorized = fn   called (once per 401) before a request throws Unauthorized,
+//         and when a websocket that never opened is followed by a 401 from GET /health
+//         (browsers hide the refused upgrade's status, so /health is probed)
 //     api.op(obj) -> Promise<result JSON>              POST /op; throws OpError (with .json)
 //     api.ask(text, maxTurns = 8) -> Promise<Transcript>  POST /ask {request, max_turns};
 //         throws OpError (503 with {"error":"other","message":...} when serve has no LLM)
@@ -78,6 +81,7 @@ export class Api {
   constructor(base, secret) {
     this.base = base;
     this.secret = secret;
+    this.onUnauthorized = null;
   }
 
   async #request(method, path, body) {
@@ -89,7 +93,10 @@ export class Api {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const json = await replyJson(resp);
-    if (resp.status === 401) throw new Unauthorized();
+    if (resp.status === 401) {
+      if (this.onUnauthorized) this.onUnauthorized();
+      throw new Unauthorized();
+    }
     if (!resp.ok) throw new OpError(json, resp.status);
     return json;
   }
@@ -128,14 +135,18 @@ export class Api {
     const protocols = ["zeta", "zeta.bearer." + b64url(this.secret)];
     const open = () => {
       if (closed) return;
+      let opened = false;
       ws = new WebSocket(this.#wsUrl(id, query), protocols);
       if (binary) ws.binaryType = "arraybuffer";
       ws.onopen = () => {
+        opened = true;
         delay = BACKOFF_MIN_MS;
         handlers.open(ws);
       };
       ws.onmessage = (ev) => handlers.message(ev, ws);
       ws.onclose = (ev) => {
+        // A refused upgrade: find out whether the secret is the reason (fires onUnauthorized).
+        if (!opened && !closed) this.health().catch(() => {});
         const again = reconnect && !closed;
         if (onClose) onClose({ code: ev.code, reason: ev.reason, reconnecting: again });
         if (again) schedule();

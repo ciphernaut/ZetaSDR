@@ -24,7 +24,14 @@ export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
 const SOURCE_KEY = "zeta.source";
 
-export const state = { api: null, transcript: null, jobs: null, sources: [], selected: null };
+export const state = {
+  api: null,
+  transcript: null,
+  jobs: null,
+  ops: null,
+  sources: [],
+  selected: null,
+};
 const sourceListeners = [];
 
 export function onSourceChange(fn) {
@@ -76,7 +83,12 @@ function showLogin(message = "") {
   $("#secret").focus();
 }
 
+let connecting = false;
+
 async function login(secret, { remembered = false } = {}) {
+  if (connecting || state.api) return;
+  connecting = true;
+  $("#connect").disabled = true;
   let api;
   try {
     api = await connect(secret);
@@ -88,6 +100,9 @@ async function login(secret, { remembered = false } = {}) {
       showLogin(`cannot reach the node: ${e.message}`);
     }
     return;
+  } finally {
+    connecting = false;
+    $("#connect").disabled = false;
   }
   store(SECRET_KEY, secret);
   start(api);
@@ -184,6 +199,7 @@ function notApplied(e) {
 
 async function runCommand(text) {
   const t = state.transcript;
+  if (!state.api) return;
   const op = parseOp(text);
   t.user(text);
   if (op) {
@@ -192,7 +208,7 @@ async function runCommand(text) {
     } catch (e) {
       if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
     }
-    state.jobs.refresh();
+    state.jobs?.refresh();
     return;
   }
   try {
@@ -201,7 +217,7 @@ async function runCommand(text) {
   } catch (e) {
     t.assistant(e.message, true);
   }
-  state.jobs.refresh();
+  state.jobs?.refresh();
 }
 
 function wireCommandLine() {
@@ -235,18 +251,44 @@ function wireCommandLine() {
 // ---- start -----------------------------------------------------------------------------
 
 function start(api) {
+  if (state.api) return;
   state.api = api;
+  api.onUnauthorized = () => logout(api);
   $("#login").hidden = true;
   $("#app").hidden = false;
+  $("#transcript").replaceChildren();
   state.transcript = new Transcript($("#transcript"));
-  startOpsFeed(api, state.transcript);
+  state.ops = startOpsFeed(api, state.transcript);
   state.jobs = startJobs(api, $("#jobs"), state.transcript);
-  wireCommandLine();
   loadSources();
 }
 
+// The node rejected the secret after login: stop everything using it and ask again.
+function logout(api) {
+  if (state.api !== api) return;
+  state.api = null;
+  api.onUnauthorized = null;
+  if (state.ops) state.ops.close();
+  if (state.jobs) state.jobs.close();
+  state.ops = null;
+  state.jobs = null;
+  store(SECRET_KEY, null);
+  showLogin("secret rejected");
+}
+
+// Hooks for the e2e scenarios: simulate a changed secret and force a jobs poll.
+window.zetaTest = {
+  setSecret(s) {
+    if (state.api) state.api.secret = s;
+  },
+  poll() {
+    return state.jobs ? state.jobs.refresh() : Promise.resolve();
+  },
+};
+
 function boot() {
   applyFootprint();
+  wireCommandLine();
   window.addEventListener("resize", applyFootprint);
   $("#drawer-toggle").addEventListener("click", () => {
     const root = document.documentElement;

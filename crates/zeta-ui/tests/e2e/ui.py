@@ -53,6 +53,8 @@ def footprint(page):
 
 # ---- scenarios -------------------------------------------------------------------------
 
+# Must run first: it asserts the node has no websocket open at all, and the later scenarios
+# open the ops stream. `scenarios()` keeps definition order, so keep this one at the top.
 def scenario_wrong_secret_shows_error_and_starts_nothing(page, url, secret):
     page.goto(url + "/ui/")
     expect(page.locator("#login")).to_be_visible()
@@ -132,6 +134,44 @@ def scenario_narrow_hides_pane(page, url, secret):
     page.set_viewport_size(WIDE)
     page.wait_for_function("document.documentElement.dataset.footprint == 'wide'")
     expect(page.locator("#drawer-toggle")).to_be_hidden()
+
+
+def scenario_401_after_login_returns_to_login(page, url, secret):
+    page.set_viewport_size(WIDE)
+    login(page, url, secret)
+    expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
+    # The node now rejects the secret the page holds (as after a restart with a new one).
+    page.evaluate("window.zetaTest.setSecret('wrong'); window.zetaTest.poll()")
+    expect(page.locator("#login")).to_be_visible()
+    expect(page.locator("#login-error")).to_contain_text("secret rejected")
+    stored = page.evaluate("sessionStorage.getItem('zeta.secret')")
+    assert stored is None, f"rejected secret still stored: {stored!r}"
+    # Logging in again works and starts one shell, not two.
+    page.fill("#secret", secret)
+    page.click("#connect")
+    expect(page.locator("#login")).to_be_hidden()
+    page.fill("#cmd", '{"op":"source_list"}')
+    page.press("#cmd", "Enter")
+    expect(page.locator("#transcript .line.user")).to_have_count(1)
+
+
+def scenario_double_connect_starts_one_shell(page, url, secret):
+    page.set_viewport_size(WIDE)
+    page.goto(url + "/ui/")
+    page.fill("#secret", secret)
+    page.press("#secret", "Enter")
+    page.press("#secret", "Enter")
+    expect(page.locator("#login")).to_be_hidden()
+    expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
+    page.wait_for_timeout(500)
+    health = http_json(url, secret, "/health")
+    assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
+    page.fill("#cmd", '{"op":"source_list"}')
+    page.press("#cmd", "Enter")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (2 sources)")
+    page.wait_for_timeout(300)
+    expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
+    expect(page.locator("#transcript .line.user")).to_have_count(1)
 
 
 # ---- runner ----------------------------------------------------------------------------
