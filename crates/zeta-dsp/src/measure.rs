@@ -48,7 +48,7 @@ const FM_MAX_CV: f32 = 0.2;
 /// ... and occupied bandwidth at most this.
 const FM_MAX_BW_HZ: u64 = 25_000;
 /// Wideband (broadcast) FM: occupied band from this ...
-const WFM_MIN_BW_HZ: u64 = 100_000;
+const WFM_MIN_BW_HZ: u64 = 60_000;
 /// ... to this, ...
 const WFM_MAX_BW_HZ: u64 = 250_000;
 /// ... envelope coefficient of variation below this (looser than `FM_MAX_CV`:
@@ -424,7 +424,7 @@ fn tone_pair(
 ///    inside the occupied band 500–3000 Hz apart and within 6 dB of each
 ///    other, or, for a constant-envelope signal (CV below 0.2) with a keying
 ///    line, when its discriminator audio does (AFSK on FM).
-/// 3. `"wfm"` when the occupied band is 100–250 kHz, the envelope CV is below
+/// 3. `"wfm"` when the occupied band is 60–250 kHz, the envelope CV is below
 ///    0.35 and the discriminator audio deviates by more than 5 kHz RMS: 0.9
 ///    when [`pilot_line_db`] finds a 19 kHz pilot at least 10 dB above its
 ///    region, else 0.6.
@@ -512,7 +512,8 @@ pub fn pilot_line_db(iq: &[Complex<f32>], rate_hz: u64) -> Option<f32> {
 
 /// dB by which the strongest of the centre bin of `db` (a `SIZE`-bin
 /// fftshifted spectrum) and its two neighbours exceeds the mean power of the
-/// bins `AM_SIDEBAND_HZ` from the centre, either side.
+/// bins `AM_SIDEBAND_HZ` from the centre, either side. AM detection
+/// therefore assumes the carrier sits at the block centre.
 fn centre_line_db(db: &[f32], bin_hz: f64) -> f32 {
     let c = SIZE / 2;
     let centre = db[c - 1].max(db[c]).max(db[c + 1]);

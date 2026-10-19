@@ -26,10 +26,10 @@ fn label(what: &str, iq: &[Complex<f32>], rate_hz: u32) -> Label {
     l
 }
 
-/// One second of broadcast-style FM at 240 kHz: a 1 kHz tone at 0.9 (67.5 kHz
-/// of the 75 kHz deviation), with or without the pilot, at 20 dB SNR.
-fn wfm_fixture(pilot: bool) -> Vec<Complex<f32>> {
-    let audio = tone(48_000, 48_000, 1_000.0, 0.9);
+/// One second of broadcast-style FM at 240 kHz: a 1 kHz tone at `amp` (0.9 is
+/// 67.5 kHz of the 75 kHz deviation), with or without the pilot, at 20 dB SNR.
+fn wfm_fixture(amp: f32, pilot: bool) -> Vec<Complex<f32>> {
+    let audio = tone(48_000, 48_000, 1_000.0, amp);
     let mut iq = wfm_modulate(&audio, 48_000, WFM_RATE, 75_000.0, 0.0, pilot);
     awgn(&mut iq, 20.0, 21);
     iq
@@ -37,7 +37,7 @@ fn wfm_fixture(pilot: bool) -> Vec<Complex<f32>> {
 
 #[test]
 fn wfm_fixture_with_pilot_is_wfm_0_9() {
-    let l = label("wfm pilot", &wfm_fixture(true), WFM_RATE);
+    let l = label("wfm pilot", &wfm_fixture(0.9, true), WFM_RATE);
     assert_eq!(l.name, "wfm", "{l:?}");
     assert_eq!(l.confidence, 0.9, "{l:?}");
     assert!(l.evidence.contains("19 kHz pilot"), "{}", l.evidence);
@@ -45,10 +45,18 @@ fn wfm_fixture_with_pilot_is_wfm_0_9() {
 
 #[test]
 fn wfm_fixture_without_pilot_is_wfm_0_6() {
-    let l = label("wfm no pilot", &wfm_fixture(false), WFM_RATE);
+    let l = label("wfm no pilot", &wfm_fixture(0.9, false), WFM_RATE);
     assert_eq!(l.name, "wfm", "{l:?}");
     assert_eq!(l.confidence, 0.6, "{l:?}");
     assert!(!l.evidence.contains("pilot"), "{}", l.evidence);
+}
+
+#[test]
+fn wfm_fixture_quiet_audio_is_wfm() {
+    // 37.5 kHz deviation: about 80 kHz occupied, under a 100 kHz floor.
+    let l = label("wfm quiet", &wfm_fixture(0.5, true), WFM_RATE);
+    assert_eq!(l.name, "wfm", "{l:?}");
+    assert!(l.evidence.contains("19 kHz pilot"), "{}", l.evidence);
 }
 
 #[test]
@@ -59,6 +67,8 @@ fn nbfm_fixture_is_still_fm_not_wfm() {
     awgn(&mut iq, 20.0, 3);
     let l = label("nbfm", &iq, 48_000);
     assert_eq!(l.name, "fm", "{l:?}");
+    assert_eq!(l.confidence, 0.6, "{l:?}");
+    assert!(!l.evidence.contains("wideband"), "{}", l.evidence);
 }
 
 #[test]
@@ -69,6 +79,7 @@ fn am_fixture_is_am() {
     let l = label("am", &iq, 48_000);
     assert_eq!(l.name, "am", "{l:?}");
     assert_eq!(l.confidence, 0.6, "{l:?}");
+    assert!(l.evidence.contains("carrier line"), "{}", l.evidence);
 }
 
 #[test]
