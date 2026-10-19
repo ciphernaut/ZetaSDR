@@ -267,6 +267,7 @@ impl Node {
     /// Apply one operation; see [`crate::ops`]. Once it completes, success
     /// or failure, one [`crate::ops::ops_payload`] event is published on
     /// [`Node::ops_stream`] (so a tail of that stream never sees its own record).
+    /// A cancelled or dropped `apply` future logs nothing.
     pub async fn apply(&self, op: Op) -> Result<OpResult, OpError> {
         let logged = op.clone();
         let start_ns = now();

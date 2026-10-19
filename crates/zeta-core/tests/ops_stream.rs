@@ -159,6 +159,7 @@ fn variant_name_matches_the_serialised_tag() {
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(2_000_000),
     };
+    // Every OpResult variant: extend this list whenever the enum grows.
     let all = vec![
         OpResult::Sources(vec![]),
         OpResult::Tuning(tuning),
@@ -193,5 +194,112 @@ fn variant_name_matches_the_serialised_tag() {
     for r in &all {
         let v = serde_json::to_value(r).unwrap();
         assert_eq!(v["result"], r.variant_name(), "{r:?}");
+    }
+}
+
+#[tokio::test]
+async fn large_ops_are_summarised_on_the_ops_stream() {
+    use zeta_core::graph::{Graph, GraphId, Node as GraphNode, NodeId};
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let mut rx = node.bus().subscribe(&node.ops_stream()).unwrap();
+
+    let big = "x".repeat(1024);
+    let op = Op::GraphPut {
+        job: JobId("nope".into()),
+        graph: Graph {
+            id: GraphId("g".into()),
+            nodes: (0..16)
+                .map(|i| GraphNode {
+                    id: NodeId(format!("n{i}")),
+                    kind: "passthrough".into(),
+                    params: serde_json::json!({ "pad": big }),
+                })
+                .collect(),
+            edges: vec![],
+        },
+    };
+    let full = serde_json::to_vec(&op).unwrap().len();
+    assert!(full > OPS_RESULT_LIMIT_BYTES);
+    // Fails (unknown job); the record is logged either way.
+    let _ = node.apply(op).await;
+    let (_, p) = next(&mut rx).await;
+    assert_eq!(
+        p["op"],
+        serde_json::json!({"op": "graph_put", "truncated": true, "bytes": full})
+    );
+
+    node.apply(Op::SourceList {}).await.unwrap();
+    let (_, p) = next(&mut rx).await;
+    assert_eq!(p["op"], serde_json::json!({"op": "source_list"}));
+}
+
+#[test]
+fn op_name_matches_the_serialised_tag() {
+    use zeta_core::graph::{Graph, GraphId};
+    use zeta_core::ops::JobKind;
+    use zeta_core::types::{Hz, Selection, Span, StreamId, Timestamp};
+    let sel = Selection {
+        source: SourceId("s".into()),
+        span: Span {
+            start_ns: Timestamp(0),
+            end_ns: Timestamp(1),
+        },
+        center_hz: Hz(1),
+        bandwidth_hz: Hz(1),
+    };
+    // Every Op variant: extend this list whenever the enum grows.
+    let all = vec![
+        Op::SourceList {},
+        Op::SourceEnsure {
+            source: SourceId("s".into()),
+            center_hz: Hz(1),
+            bandwidth_hz: Hz(1),
+        },
+        Op::JobStart {
+            kind: JobKind::Spectrum,
+            source: SourceId("s".into()),
+            center_hz: Hz(1),
+            bandwidth_hz: Hz(1),
+            deviation_hz: None,
+        },
+        Op::JobList {},
+        Op::JobStop {
+            job: JobId("j".into()),
+        },
+        Op::JobContext {
+            job: JobId("j".into()),
+        },
+        Op::IqRead {
+            selection: sel.clone(),
+        },
+        Op::StreamList {},
+        Op::StreamTail {
+            stream: StreamId("x".into()),
+            max_frames: 1,
+            timeout_ms: 1,
+        },
+        Op::GraphGet {
+            job: JobId("j".into()),
+        },
+        Op::GraphPut {
+            job: JobId("j".into()),
+            graph: Graph {
+                id: GraphId("g".into()),
+                nodes: vec![],
+                edges: vec![],
+            },
+        },
+        Op::KnowledgeLookup {
+            region: "AU".into(),
+            center_hz: Hz(1),
+            bandwidth_hz: Hz(1),
+        },
+        Op::Classify { selection: sel },
+        Op::Schema {},
+    ];
+    for op in &all {
+        let v = serde_json::to_value(op).unwrap();
+        assert_eq!(v["op"], op.name(), "{op:?}");
     }
 }

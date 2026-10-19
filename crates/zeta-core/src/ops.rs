@@ -446,6 +446,54 @@ pub enum OpResult {
     Schema(serde_json::Value),
 }
 
+impl Op {
+    /// The snake_case tag this variant serialises under `op`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Op::SourceList {} => "source_list",
+            Op::SourceEnsure { .. } => "source_ensure",
+            Op::JobStart { .. } => "job_start",
+            Op::JobList {} => "job_list",
+            Op::JobStop { .. } => "job_stop",
+            Op::JobContext { .. } => "job_context",
+            Op::IqRead { .. } => "iq_read",
+            Op::StreamList {} => "stream_list",
+            Op::StreamTail { .. } => "stream_tail",
+            Op::GraphGet { .. } => "graph_get",
+            Op::GraphPut { .. } => "graph_put",
+            Op::KnowledgeLookup { .. } => "knowledge_lookup",
+            Op::Classify { .. } => "classify",
+            Op::Schema {} => "schema",
+        }
+    }
+
+    /// The op as JSON for the `ops` stream: the full value when it fits in
+    /// [`OPS_RESULT_LIMIT_BYTES`], otherwise
+    /// `{"op": <name>, "truncated": true, "bytes": n}`. A value that fails to
+    /// serialise is summarised with `bytes: 0`.
+    pub fn summary_json(&self) -> serde_json::Value {
+        bounded_json(self, "op", self.name())
+    }
+}
+
+/// `value` as JSON when its serialisation fits in [`OPS_RESULT_LIMIT_BYTES`],
+/// else `{tag: name, "truncated": true, "bytes": n}`; a serde failure gives
+/// `bytes: 0`.
+fn bounded_json<T: Serialize>(value: &T, tag: &str, name: &str) -> serde_json::Value {
+    let summary = |bytes: usize| {
+        let mut m = serde_json::Map::new();
+        m.insert(tag.into(), name.into());
+        m.insert("truncated".into(), true.into());
+        m.insert("bytes".into(), bytes.into());
+        serde_json::Value::Object(m)
+    };
+    match serde_json::to_vec(value) {
+        Ok(buf) if buf.len() > OPS_RESULT_LIMIT_BYTES => summary(buf.len()),
+        Ok(buf) => serde_json::from_slice(&buf).unwrap_or_else(|_| summary(0)),
+        Err(_) => summary(0),
+    }
+}
+
 impl OpResult {
     /// The snake_case tag this variant serialises under `result`.
     pub fn variant_name(&self) -> &'static str {
@@ -471,12 +519,7 @@ impl OpResult {
     /// `{"result": <variant>, "truncated": true, "bytes": n}`. A value that
     /// fails to serialise is summarised with `bytes: 0`.
     pub fn summary_json(&self) -> serde_json::Value {
-        let summary = |bytes: usize| serde_json::json!({"result": self.variant_name(), "truncated": true, "bytes": bytes});
-        match serde_json::to_vec(self) {
-            Ok(buf) if buf.len() > OPS_RESULT_LIMIT_BYTES => summary(buf.len()),
-            Ok(buf) => serde_json::from_slice(&buf).unwrap_or_else(|_| summary(0)),
-            Err(_) => summary(0),
-        }
+        bounded_json(self, "result", self.variant_name())
     }
 }
 
@@ -485,14 +528,14 @@ pub const OPS_RESULT_LIMIT_BYTES: usize = 8192;
 
 /// The `ops` stream's event payload for one applied operation:
 /// `{"op", "outcome": "ok"|"error", "result"|"error", "elapsed_ms",
-/// "transport": "local"}`; see [`OpResult::summary_json`] for large results.
+/// "transport": "local"}`; see [`Op::summary_json`] and
+/// [`OpResult::summary_json`] for large ops and results.
 pub fn ops_payload(
     op: &Op,
     outcome: &Result<OpResult, OpError>,
     elapsed_ms: u64,
 ) -> serde_json::Value {
-    let op = serde_json::to_value(op)
-        .unwrap_or_else(|e| serde_json::json!({"op": null, "serialise_error": e.to_string()}));
+    let op = op.summary_json();
     let mut v = serde_json::json!({
         "op": op,
         "elapsed_ms": elapsed_ms,
