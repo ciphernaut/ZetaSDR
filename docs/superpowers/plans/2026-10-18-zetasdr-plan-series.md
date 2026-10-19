@@ -173,6 +173,28 @@ successful list calls too (`source_list` for exactly this question), because the
 not say which client sent an operation; and in the narrow footprint the tab labels drop the tuning
 range.
 
+Follow-ups from the final review (fix wave on `ui`). Each `ops` record now names its caller in
+`transport`: `Node::apply_from(op, transport)` (`apply` is `"local"`), `"ui"` for `/op` with the
+allow-listed header `X-Zeta-Client: ui`, `"http"` for any other `/op` (MCP included, it is an HTTP
+client), `"agent"` for the calls of a `/ask` run (`LocalExecutor::tagged`). The transcript hides only
+the UI's own successful list polls and prefixes other callers' records (`[agent]`, `[http]`), so the
+agent's `source_list` now shows; a list op typed on the command line is shown from its `/op` reply
+(ruling R6, replacing R5's typed counter). Errors on the `ops` stream are bounded like ops and results
+(`{"error": <variant>, "truncated": true, "bytes": n}` over 8192 bytes). The overlays resolve event
+streams with one `GET /streams` per poll and remember jobs without one (`fm_demod`), which had cost
+about four lookups a second per job; at most four jobs per tab are watched (the rest show `—`), and a
+stream refused for want of slots (503, probed after a failed upgrade) is noted once in the
+transcript. Minors: the secret field is cleared after login; switching source stops the UI's own
+spectrum job; closing the menu erases the selection; ribbons are capped at 200; `/ui/` files carry a
+Content-Security-Policy (`blob:` is needed for the microphone's AudioWorklet) and `nosniff`; narrow
+tabs show a compact centre (`144.8`); the e2e run has a 300 s deadline. The aarch64 binaries were
+rebuilt with the UI (cross, release, built from 013ceea): `zeta` 23 148 104 bytes, sha256
+`be0e943b…09e9c0`; `zeta-mcp` 10 836 096 bytes, `acff40ff…2eb2e0861`; `deploy/pi/smoke.sh` PASS.
+
+Parked: stopped job records are never pruned (keep the last N; a core follow-up); speech-to-text
+ribbons for channels (spec §7) are deferred; the `window.zetaTest` hooks used by the e2e scenarios
+ship in the production bundle.
+
 Pending: the phone check. Start the node on the LAN address,
 `ZETA_SECRET=… zeta --state-dir … --source-file tone=… --source-file aprs=… serve --listen
 <wired-ip>:7979` (wired; <wifi-ip> on WiFi), open `http://<wired-ip>:7979/ui/` on the phone,
