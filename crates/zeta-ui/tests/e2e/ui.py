@@ -2,8 +2,8 @@
 
 Usage: python3 ui.py <node-url> <secret> [scenario]
 
-Runs every `scenario_*` function (or only the one named, with or without the `scenario_`
-prefix) against a running `zeta serve`, each in a fresh browser context. Prints `PASS <name>`
+Runs every `scenario_*` function (or only those named, comma-separated, with or without the
+`scenario_` prefix) against a running `zeta serve`, each in a fresh browser context. Prints `PASS <name>`
 or `FAIL <name>: <reason>` (plus the browser console errors) and exits 1 on the first failure.
 Run by `cargo test -p zeta --test ui`, which starts the node with the `tone` and `aprs` fixtures
 and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
@@ -668,6 +668,23 @@ def scenario_audio_play_opens_binary_socket(page, url, secret):
         stop_job(url, secret, job)
 
 
+def scenario_fm_demod_does_not_poll_streams(page, url, secret):
+    # An fm_demod job has no event stream: it is looked up once, not on every poll.
+    select_source(page, url, secret, "tone")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+    page.wait_for_timeout(500)
+    seen = []
+    page.on("request", lambda r: seen.append(r.url)
+            if r.method == "GET" and r.url.split("?")[0].endswith("/streams") else None)
+    job = start_job(url, secret, "fm_demod", "tone", 100_000_000, 10_000, deviation_hz=5000)
+    try:
+        job_row(page, job)
+        page.wait_for_timeout(6_000)
+        assert len(seen) <= 3, f"{len(seen)} GET /streams in 6 s: {seen}"
+    finally:
+        stop_job(url, secret, job)
+
+
 # ---- voice (Task 11) -----------------------------------------------------------------------
 
 SPOKEN = "what sources are there"
@@ -751,9 +768,9 @@ def main(argv):
     url, secret = argv[1].rstrip("/"), argv[2]
     todo = scenarios()
     if len(argv) > 3:
-        want = argv[3].removeprefix("scenario_")
-        todo = [(n, f) for n, f in todo if n == want]
-        if not todo:
+        want = {w.strip().removeprefix("scenario_") for w in argv[3].split(",")}
+        todo = [(n, f) for n, f in todo if n in want]
+        if len(todo) != len(want):
             print(f"no scenario {argv[3]!r}; known: {[n for n, _ in scenarios()]}",
                   file=sys.stderr)
             return 2

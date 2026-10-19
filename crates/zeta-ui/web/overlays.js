@@ -12,9 +12,15 @@
 //     ov.sync(jobs)          a `job_list` result (from the 2 s poll): watchJob for every
 //                            running job on the selected source, unwatch the rest, refresh
 //                            the job-row counters. `spectrum` jobs are skipped: their events
-//                            are the waterfall's and are ignored here anyway.
-//     ov.watchJob(job)       subscribes to the job's event stream (text mode, re-resolved by
-//                            provenance after a drop) and renders each event by payload shape:
+//                            are the waterfall's and are ignored here anyway. Event streams
+//                            of jobs not yet watched are resolved with one GET /streams per
+//                            poll; a job whose streams are listed but none is an `event`
+//                            stream (e.g. `fm_demod`) goes in `noEventStream` (job id ->
+//                            graph JSON) and is not looked up again until it leaves the
+//                            running list or its graph changes.
+//     ov.watchJob(job, streamId)  subscribes to the job's event stream (text mode,
+//                            re-resolved by provenance after a drop) and renders each event
+//                            by payload shape:
 //         - `db` array (spectrum): ignored; every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
@@ -38,15 +44,16 @@
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
 const EXPIRE_EVERY_MS = 1000;
-const STREAM_LOOKUPS = 20;
-const STREAM_LOOKUP_MS = 250;
 const RIBBON_GAP_PX = 2;
 const MAX_LANES = 8;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 export function mountOverlays(el, wf, api, opts = {}) {
   return new Overlays(el, wf, api, opts);
+}
+
+// What identifies a job's streams besides its id: `graph_put` restarts it with new ones.
+function graphKey(job) {
+  return JSON.stringify(job.graph ?? null);
 }
 
 function tuningCentre(job) {
@@ -62,6 +69,8 @@ class Overlays {
     this.jobsEl = jobsEl;
     this.sourceId = null;
     this.watched = new Map(); // job id -> {job, sub, closed}
+    this.noEventStream = new Map(); // job id -> JSON of the graph that has no event stream
+    this.resolving = false; // a GET /streams for unwatched jobs is in flight
     this.counters = new Map(); // job id -> non-spectrum events seen while watched
     this.labels = new Map(); // key -> {el, hz}
     this.ribbons = []; // {el, countEl, text, cls, hz, w, h, top, dy, right, born, count}
@@ -83,6 +92,7 @@ class Overlays {
     if (id === this.sourceId) return;
     this.sourceId = id;
     for (const jobId of [...this.watched.keys()]) this.unwatch(jobId);
+    this.noEventStream.clear();
     for (const r of this.ribbons) r.el.remove();
     this.ribbons = [];
     for (const l of this.labels.values()) l.el.remove();
@@ -100,11 +110,44 @@ class Overlays {
     );
     const ids = new Set(want.map((j) => j.id));
     for (const id of [...this.watched.keys()]) if (!ids.has(id)) this.unwatch(id);
-    for (const j of want) this.watchJob(j);
+    for (const [id, graph] of [...this.noEventStream]) {
+      const j = want.find((x) => x.id === id);
+      if (!j || graphKey(j) !== graph) this.noEventStream.delete(id);
+    }
+    for (const j of want) {
+      const known = this.watched.get(j.id);
+      if (known) known.job = j;
+    }
+    const fresh = want.filter((j) => !this.watched.has(j.id) && !this.noEventStream.has(j.id));
+    if (fresh.length > 0) this.resolve(fresh);
     for (const j of want) this.jobRow(j, this.counters.get(j.id) || 0);
   }
 
-  watchJob(job) {
+  // One GET /streams for the jobs not yet watched: watch those with an event stream, cache
+  // those whose streams are listed without one. A job with no stream listed yet (just
+  // started), or a failed request, is tried again on the next poll.
+  async resolve(jobs) {
+    if (this.resolving) return;
+    this.resolving = true;
+    let streams = null;
+    try {
+      streams = await this.api.streams();
+    } catch {
+      streams = null;
+    } finally {
+      this.resolving = false;
+    }
+    if (!streams || this.destroyed) return;
+    for (const j of jobs) {
+      if (j.source !== this.sourceId || this.watched.has(j.id)) continue;
+      const mine = streams.filter((x) => x.provenance && x.provenance.job === j.id);
+      const ev = mine.find((x) => x.kind === "event");
+      if (ev) this.watchJob(j, ev.id);
+      else if (mine.length > 0) this.noEventStream.set(j.id, graphKey(j));
+    }
+  }
+
+  watchJob(job, streamId) {
     if (this.destroyed || job.source !== this.sourceId) return;
     const known = this.watched.get(job.id);
     if (known) {
@@ -113,7 +156,7 @@ class Overlays {
     }
     const rec = { job, sub: null, closed: false };
     this.watched.set(job.id, rec);
-    this.subscribe(rec);
+    this.subscribe(rec, streamId);
   }
 
   unwatch(jobId) {
@@ -132,24 +175,8 @@ class Overlays {
     return s ? s.id : null;
   }
 
-  async subscribe(rec) {
+  subscribe(rec, streamId) {
     const jobId = rec.job.id;
-    let streamId = null;
-    for (let i = 0; i < STREAM_LOOKUPS && !rec.closed; i++) {
-      try {
-        streamId = await this.lookupStream(jobId);
-      } catch {
-        streamId = null;
-      }
-      if (streamId) break;
-      await sleep(STREAM_LOOKUP_MS);
-    }
-    if (rec.closed) return;
-    if (!streamId) {
-      // Forget it so the next poll tries again.
-      this.watched.delete(jobId);
-      return;
-    }
     rec.sub = this.api.streamText(
       streamId,
       (msg) => {
