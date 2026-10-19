@@ -39,6 +39,7 @@ impl Classifier for DecodeToIdentify {
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
+        _center_hz: Hz,
         band: Band,
         _features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
@@ -97,7 +98,13 @@ mod tests {
     async fn identifies_aprs_in_baseband_iq() {
         let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
         let labels = DecodeToIdentify
-            .classify(&iq, Hz(48_000), Band::whole(Hz(48_000)), None)
+            .classify(
+                &iq,
+                Hz(48_000),
+                Hz(144_800_000),
+                Band::whole(Hz(48_000)),
+                None,
+            )
             .await;
         assert_eq!(labels.len(), 1, "{labels:?}");
         assert_eq!(labels[0].layer, 2);
@@ -109,7 +116,13 @@ mod tests {
     async fn aprs_at(offset: f64) {
         let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, offset);
         let labels = DecodeToIdentify
-            .classify(&iq, Hz(48_000), Band::whole(Hz(48_000)), None)
+            .classify(
+                &iq,
+                Hz(48_000),
+                Hz(144_800_000),
+                Band::whole(Hz(48_000)),
+                None,
+            )
             .await;
         assert_eq!(labels.len(), 1, "offset {offset}: {labels:?}");
         assert_eq!(labels[0].name, "APRS");
@@ -131,13 +144,25 @@ mod tests {
         let iq = nbfm_modulate(&audio, 48_000, 48_000, 2_500.0, 0.0);
         assert!(
             DecodeToIdentify
-                .classify(&iq, Hz(48_000), Band::whole(Hz(48_000)), None)
+                .classify(
+                    &iq,
+                    Hz(48_000),
+                    Hz(144_800_000),
+                    Band::whole(Hz(48_000)),
+                    None
+                )
                 .await
                 .is_empty()
         );
         assert!(
             DecodeToIdentify
-                .classify(&iq[..100], Hz(48_000), Band::whole(Hz(48_000)), None)
+                .classify(
+                    &iq[..100],
+                    Hz(48_000),
+                    Hz(144_800_000),
+                    Band::whole(Hz(48_000)),
+                    None
+                )
                 .await
                 .is_empty()
         );
@@ -155,12 +180,12 @@ mod tests {
             bandwidth_hz: Hz(12_500),
         };
         let above = DecodeToIdentify
-            .classify(&iq, Hz(48_000), band(12_000), None)
+            .classify(&iq, Hz(48_000), Hz(144_800_000), band(12_000), None)
             .await;
         assert_eq!(above.len(), 1, "{above:?}");
         assert_eq!(above[0].name, "APRS");
         let below = DecodeToIdentify
-            .classify(&iq, Hz(48_000), band(-12_000), None)
+            .classify(&iq, Hz(48_000), Hz(144_800_000), band(-12_000), None)
             .await;
         assert!(below.is_empty(), "{below:?}");
     }

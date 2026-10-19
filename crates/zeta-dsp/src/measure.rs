@@ -435,7 +435,7 @@ fn tone_pair(
 /// 5. `"ssb"` (0.6) when there is no such centre line, the envelope CV is at
 ///    least 0.25, the occupied band is 1.5–4 kHz and at least 80 % of its
 ///    power lies on one side of centre; the evidence names `usb` (above) or
-///    `lsb` (below).
+///    `lsb` (below) and the dial frequency [`ssb_dial_hz`] gives.
 /// 6. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
 ///    25 kHz and the discriminator audio deviates by more than 100 Hz RMS;
 ///    `"carrier"` (0.7) under the same gate when it does not.
@@ -530,6 +530,20 @@ fn centre_line_db(db: &[f32], bin_hz: f64) -> f32 {
     centre - (10.0 * (sum / n as f64).log10()) as f32
 }
 
+/// Offset, in Hz, of an SSB voice band's centre from its suppressed carrier
+/// (the dial frequency).
+const SSB_DIAL_OFFSET_HZ: u64 = 1_500;
+
+/// The dial frequency of an SSB signal whose occupied band is centred at
+/// `center_hz`: [`SSB_DIAL_OFFSET_HZ`] below it for `usb`, above it for lsb.
+pub fn ssb_dial_hz(center_hz: u64, usb: bool) -> u64 {
+    if usb {
+        center_hz.saturating_sub(SSB_DIAL_OFFSET_HZ)
+    } else {
+        center_hz.saturating_add(SSB_DIAL_OFFSET_HZ)
+    }
+}
+
 fn classify_block(
     f: &FeatureRecord,
     iq: &[Complex<f32>],
@@ -598,8 +612,9 @@ fn classify_block(
                         "ssb",
                         0.6,
                         format!(
-                            "{side}: no carrier line ({carrier_db:.1} dB), {:.0} % of the occupied power on one side, cv {cv:.3}",
-                            100.0 * p / total
+                            "{side}: no carrier line ({carrier_db:.1} dB), {:.0} % of the occupied power on one side, cv {cv:.3}, dial \u{2248} {} Hz ({side})",
+                            100.0 * p / total,
+                            ssb_dial_hz(f.center_hz.0, side == "usb")
                         ),
                     );
                 }
@@ -763,9 +778,39 @@ impl Stage for MeasureStage {
     }
 }
 
-/// Layer-1 classifier: [`measure`] then [`layer1_label`] on the requested
-/// band, extracted at [`channel_rate_hz`] unless it is the whole block;
-/// upstream features are not used, the band is measured afresh.
+/// [`measure`] and [`layer1_label`] of `band` of `iq`, a block sampled at
+/// `rate_hz` and centred at `center_hz`: the whole block as it is, any other
+/// band extracted at [`channel_rate_hz`] and measured with [`measure_band`]
+/// around its own centre (`center_hz` plus the band's offset). `None` when the
+/// band cannot be extracted.
+pub fn measure_selection(
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    center_hz: u64,
+    band: Band,
+) -> Option<(FeatureRecord, Label)> {
+    if band.is_whole(Hz(rate_hz)) {
+        let f = measure(iq, rate_hz, center_hz);
+        let l = layer1_label(&f, iq, rate_hz);
+        return Some((f, l));
+    }
+    let bw = band.bandwidth_hz.0;
+    let (chan, out_rate) = extract_offset(
+        iq,
+        rate_hz,
+        band.offset_hz,
+        bw,
+        channel_rate_hz(rate_hz, bw),
+    )
+    .ok()?;
+    let band_center = (center_hz as i64).saturating_add(band.offset_hz).max(0) as u64;
+    let f = measure_band(&chan, out_rate, band_center, bw);
+    let l = layer1_label(&f, &chan, out_rate);
+    Some((f, l))
+}
+
+/// Layer-1 classifier: [`measure_selection`] on the requested band; upstream
+/// features are not used, the band is measured afresh.
 pub struct Layer1Classifier;
 
 #[async_trait]
@@ -780,22 +825,14 @@ impl Classifier for Layer1Classifier {
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
+        center_hz: Hz,
         band: Band,
         _features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
-        let rate = sample_rate_hz.0;
-        if band.is_whole(sample_rate_hz) {
-            let f = measure(iq, rate, 0);
-            return vec![layer1_label(&f, iq, rate)];
-        }
-        let bw = band.bandwidth_hz.0;
-        let Ok((chan, out_rate)) =
-            extract_offset(iq, rate, band.offset_hz, bw, channel_rate_hz(rate, bw))
-        else {
-            return Vec::new();
-        };
-        let f = measure_band(&chan, out_rate, 0, bw);
-        vec![layer1_label(&f, &chan, out_rate)]
+        measure_selection(iq, sample_rate_hz.0, center_hz.0, band)
+            .map(|(_, l)| l)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -842,7 +879,9 @@ mod tests {
             let chan = extract_offset(&iq, RATE, offset, 12_500, RATE).unwrap().0;
             let f = measure_band(&chan, RATE, CENTER, 12_500);
             eprintln!("offset {offset}: {f:?}");
-            let labels = Layer1Classifier.classify(&iq, Hz(RATE), band, None).await;
+            let labels = Layer1Classifier
+                .classify(&iq, Hz(RATE), Hz(CENTER), band, None)
+                .await;
             eprintln!("offset {offset}: {labels:?}");
             assert_eq!(labels.len(), 1, "{labels:?}");
             assert_eq!(labels[0].name, "fsk", "offset {offset}: {labels:?}");

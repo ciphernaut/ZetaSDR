@@ -1,6 +1,7 @@
 //! Build the node the CLI drives: stage registry (core plus `zeta-dsp`, plus `--plugin`
 //! stages), sources (SigMF files, KiwiSDRs, other ZetaSDR nodes, VRT senders over UDP,
-//! and SoapySDR devices when built with `--cfg soapy`), knowledge and classifiers.
+//! and SoapySDR devices when built with `--cfg soapy`), knowledge (the builtin
+//! signatures and the signal catalogue) and classifiers (`zeta_dsp::classifiers`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -216,6 +217,7 @@ pub async fn open(
         s.start();
     }
     node.add_knowledge(Arc::new(StaticKnowledge::builtin()));
+    node.add_knowledge(Arc::new(zeta_dsp::catalogue::CatalogueKnowledge));
     node.add_classifier(Arc::new(StubClassifier));
     for c in zeta_dsp::classifiers() {
         node.add_classifier(c);

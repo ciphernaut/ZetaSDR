@@ -111,5 +111,16 @@ async fn classify_honours_selection_band() {
     );
     let below = classify(&node, CENTER - 12_000, 12_500).await;
     assert!(below.iter().any(|l| l.layer == 1), "{below:?}");
-    assert!(!below.iter().any(|l| l.layer == 2), "{below:?}");
+    // The tone below decodes to nothing; only the catalogue names its band.
+    assert!(
+        !below.iter().any(|l| l.layer == 2 && l.name == "APRS"),
+        "{below:?}"
+    );
+    assert!(
+        below
+            .iter()
+            .filter(|l| l.layer == 2)
+            .all(|l| l.evidence.starts_with("catalogue ")),
+        "{below:?}"
+    );
 }

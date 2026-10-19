@@ -1102,6 +1102,48 @@ fn wfm_demod_job_streams_48k_audio_from_a_wfm_fixture() {
 }
 
 #[test]
+fn classify_names_the_wfm_fixture_fm_broadcast_radio() {
+    // The wfm_demod fixture: 1 s of 240 kHz broadcast FM with pilot at 104.9 MHz.
+    let dir = tempfile::tempdir().unwrap();
+    let audio = zeta_dsp::fixtures::tone(48_000, 48_000, 1_000.0, 0.5);
+    let iq = zeta_dsp::fixtures::wfm_modulate(&audio, 48_000, 240_000, 75_000.0, 0.0, true);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "wfm", &iq, 240_000, 104_900_000);
+    let src = format!("wfm={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "classify",
+            "--source",
+            "wfm",
+            "--start-ns",
+            "0",
+            "--end-ns",
+            "500000000",
+            "--center-hz",
+            "104900000",
+            "--bandwidth-hz",
+            "240000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "labels", "{v}");
+    let labels = v["value"].as_array().expect("labels array");
+    assert!(
+        labels
+            .iter()
+            .any(|l| l["layer"] == 2 && l["name"] == "FM Broadcast Radio"),
+        "{v}"
+    );
+}
+
+#[test]
 fn am_demod_job_streams_48k_audio() {
     let dir = tempfile::tempdir().unwrap();
     let audio = zeta_dsp::fixtures::tone(48_000, 48_000, 1_000.0, 0.5);

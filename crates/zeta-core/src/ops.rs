@@ -1218,7 +1218,9 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         bandwidth_hz: sel.bandwidth_hz,
     };
     Ok(OpResult::Labels(
-        node.classifiers().run_all(&samples, rate, band, None).await,
+        node.classifiers()
+            .run_all(&samples, rate, center, band, None)
+            .await,
     ))
 }
 

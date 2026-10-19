@@ -162,7 +162,7 @@ JSON: `{"op":"knowledge_lookup","region":"AU","center_hz":144800000,"bandwidth_h
 
 CLI: `zeta knowledge lookup --region AU --center-hz 144800000 --bandwidth-hz 12500`
 
-The built-in provider has signatures but no allocations, so an empty `allocations` list means no provider data, not nothing allocated.
+Two providers answer: the built-in seed signatures, and `catalogue`, the 594-signal iNTERCEPT catalogue (Apache-2.0; one signature per frequency range of each signal overlapping the band, `bandwidth_hz` its widest bandwidth, `modulation` the first it lists). Neither has allocations, so an empty `allocations` list means no provider data, not nothing allocated.
 
 ### classify
 
@@ -173,6 +173,8 @@ Run every registered classifier over the selection's band and span of the source
 JSON: `{"op":"classify","selection":{"source":"<id>","span":{"start_ns":1760000000000000000,"end_ns":1760000001000000000},"center_hz":144800000,"bandwidth_hz":12500}}`
 
 CLI: `zeta classify --source <id> --start-ns 1760000000000000000 --end-ns 1760000001000000000 --center-hz 144800000 --bandwidth-hz 12500`
+
+Layer 1 labels the measured band (`wfm`, `fm`, `am`, `ssb`, `fsk`, `carrier`, `noise` or `unknown`; an `ssb` label's evidence gives the dial frequency). Layer 2 adds `APRS` when a frame decodes, and up to three signal names from the catalogue (evidence `catalogue <id>: ...`), scored 0.4 for the measured centre lying in one of the signal's frequency ranges (required), 0.3 for a matching bandwidth (required for signals wider than 50 kHz) and 0.3 for a matching layer-1 modulation. Layer 3 is an empty slot.
 
 ### schema
 

@@ -14,6 +14,7 @@ pub mod afsk;
 pub mod am;
 pub mod aprs;
 pub mod ax25;
+pub mod catalogue;
 pub mod channel;
 pub mod fft;
 #[cfg(feature = "gpu")]
@@ -64,6 +65,7 @@ pub fn classifiers() -> Vec<Arc<dyn Classifier>> {
     vec![
         Arc::new(measure::Layer1Classifier),
         Arc::new(identify::DecodeToIdentify),
+        Arc::new(catalogue::CatalogueClassifier),
     ]
 }
 
