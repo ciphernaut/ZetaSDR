@@ -1,0 +1,10 @@
+[package]
+name = "zeta-vrt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VITA 49.2 signal data packet codec"
+
+[dependencies]
+num-complex = "0.4.6"
+thiserror = "2.0.21"

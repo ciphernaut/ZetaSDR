@@ -3845,6 +3845,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeta-vrt"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "thiserror",
+]
+
+[[package]]
 name = "zeta-ws"
 version = "0.1.0"
 dependencies = [
