@@ -14,10 +14,12 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use zeta_core::ops::FrameSummary;
 use zeta_core::types::{StreamId, StreamKind};
+use zeta_vrt::envelope::{MAX_BODY, MAX_HEADER};
 use zeta_vrt::{IqMeta, VrtDecoder, parse_envelope};
 
 use crate::remote::{ClientError, NodeClient, REQUEST_TIMEOUT};
@@ -108,7 +110,14 @@ impl NodeClient {
             url: self.url().to_string(),
             detail,
         };
-        let ws = match timeout(REQUEST_TIMEOUT, connect_async(req)).await {
+        // Large enough for the largest envelope (`u32 | header | u32 | body`); a VRT
+        // packet is far smaller.
+        let max = MAX_BODY + MAX_HEADER + 8;
+        let ws_cfg = WebSocketConfig::default()
+            .max_message_size(Some(max))
+            .max_frame_size(Some(max));
+        let connect = connect_async_with_config(req, Some(ws_cfg), false);
+        let ws = match timeout(REQUEST_TIMEOUT, connect).await {
             Err(_) => return Err(unreachable("websocket upgrade timed out".to_string())),
             Ok(Err(WsError::Http(resp))) => {
                 let status = resp.status().as_u16();

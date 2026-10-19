@@ -126,6 +126,7 @@ async fn tune_starts_remote_passthrough_and_streams_blocks() {
     }
     assert_eq!(blocks[1].t0.0 - blocks[0].t0.0, 100_000_000);
     assert_eq!(blocks[2].t0.0 - blocks[1].t0.0, 100_000_000);
+    assert_eq!(port.losses(), (0, 0));
     drop(rx);
     drop(port);
     srv.stop().await;

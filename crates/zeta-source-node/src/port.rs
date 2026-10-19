@@ -57,11 +57,18 @@ impl fmt::Debug for NodeSourceConfig {
     }
 }
 
+/// How often, at most, the pump logs stream losses.
+const LOSS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// State shared with the pump task.
 #[derive(Default)]
 struct Shared {
     fault: Mutex<Option<String>>,
     current: Mutex<Option<Tuning>>,
+    /// VRT data packets missing from the remote stream (count gaps).
+    lost_packets: AtomicU64,
+    /// `lagged` notices: the remote node skipped frames for this subscriber.
+    lag_events: AtomicU64,
 }
 
 /// The remote job feeding the port, the task forwarding its stream and the
@@ -92,6 +99,8 @@ pub struct NodePort {
 
 /// The connection to the remote node, shared with the idle timer.
 struct Remote {
+    /// The local id of the port, for log lines.
+    id: String,
     url: String,
     remote_source: SourceId,
     client: NodeClient,
@@ -140,9 +149,10 @@ impl NodePort {
             ..remote.capabilities.clone()
         };
         Ok(NodePort {
-            id: cfg.id,
+            id: cfg.id.clone(),
             caps,
             remote: Arc::new(Remote {
+                id: cfg.id.0.clone(),
                 url,
                 remote_source: cfg.remote_source,
                 client,
@@ -153,6 +163,16 @@ impl NodePort {
                 generation: AtomicU64::new(0),
             }),
         })
+    }
+
+    /// Stream losses since the port opened: (VRT packets lost in transit, `lagged`
+    /// notices from the remote node). Logged to stderr at most every 10 s too.
+    pub fn losses(&self) -> (u64, u64) {
+        let sh = &self.remote.shared;
+        (
+            sh.lost_packets.load(Ordering::Relaxed),
+            sh.lag_events.load(Ordering::Relaxed),
+        )
     }
 
     /// Stop the remote job now and wait for the remote node to confirm, instead of the
@@ -222,9 +242,17 @@ impl Remote {
             .streams()
             .await
             .map_err(|e| client_error(&self.url, e))?;
+        // A passthrough job has two IQ streams carrying the same samples: the
+        // source's IQ feeding the stage and the stage's output; neither carries a
+        // `channel`. Pick deterministically: a stream with a `channel` first, else
+        // the smallest id (ids are ULIDs, so normally the earlier registered).
         let Some(stream) = streams
             .into_iter()
-            .find(|s| s.kind == StreamKind::Iq && s.provenance.job.as_ref() == Some(job))
+            .filter(|s| s.kind == StreamKind::Iq && s.provenance.job.as_ref() == Some(job))
+            .min_by(|a, b| {
+                (a.provenance.channel.is_none(), &a.id.0)
+                    .cmp(&(b.provenance.channel.is_none(), &b.id.0))
+            })
         else {
             return Err(self.io(&format!("job {} has no iq stream", job.0)));
         };
@@ -238,7 +266,7 @@ impl Remote {
             sub,
             self.tx.clone(),
             self.shared.clone(),
-            self.url.clone(),
+            (self.id.clone(), self.url.clone()),
             first_tx,
         ));
         let meta = match tokio::time::timeout(TUNE_TIMEOUT, first).await {
@@ -382,30 +410,55 @@ impl Remote {
 /// Forward the subscription's IQ onto `tx`. The first packet's metadata goes
 /// to `first`. Ends when the subscription does (setting the fault) or when
 /// aborted by a retune or the port's drop; it keeps pumping without
-/// receivers so a later subscriber still gets blocks.
+/// receivers so a later subscriber still gets blocks. Lost packets and lag
+/// notices are counted in `shared` and logged at most every 10 s.
 async fn pump(
     mut sub: Subscription,
     tx: broadcast::Sender<IqBlock>,
     shared: Arc<Shared>,
-    url: String,
+    (id, url): (String, String),
     first: oneshot::Sender<IqMeta>,
 ) {
     let mut first = Some(first);
+    let mut logged: Option<(tokio::time::Instant, (u64, u64))> = None;
     while let Some(item) = sub.next().await {
         let (t0_ns, meta, samples) = match item {
             Ok(Received::Iq {
                 t0_ns,
                 meta,
                 samples,
-                ..
-            }) => (t0_ns, meta, samples),
-            // Lost packets show up as a forward jump in the next block's t0.
-            Ok(Received::Lagged { .. } | Received::Frame { .. }) => continue,
+                missed_packets,
+            }) => {
+                if missed_packets > 0 {
+                    shared
+                        .lost_packets
+                        .fetch_add(u64::from(missed_packets), Ordering::Relaxed);
+                }
+                (t0_ns, meta, samples)
+            }
+            // Lost frames also show up as a forward jump in the next block's t0.
+            Ok(Received::Lagged { .. }) => {
+                shared.lag_events.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            Ok(Received::Frame { .. }) => continue,
             Err(e) => {
                 eprintln!("remote node {url}: skipping undecodable message: {e}");
                 continue;
             }
         };
+        let now = (
+            shared.lost_packets.load(Ordering::Relaxed),
+            shared.lag_events.load(Ordering::Relaxed),
+        );
+        let due = logged.is_none_or(|(at, _)| at.elapsed() >= LOSS_LOG_INTERVAL);
+        if due && now != logged.map_or((0, 0), |(_, n)| n) {
+            eprintln!(
+                "zeta-source-node: {id}: {} packets lost, {} lag events",
+                now.0, now.1
+            );
+            logged = Some((tokio::time::Instant::now(), now));
+        }
         if let Some(f) = first.take() {
             // `tune` may have given up waiting; the block still goes out.
             let _ = f.send(meta);
