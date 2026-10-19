@@ -47,13 +47,17 @@ const FM_MIN_DEV_HZ: f64 = 100.0;
 const FM_MAX_CV: f32 = 0.2;
 /// ... and occupied bandwidth at most this.
 const FM_MAX_BW_HZ: u64 = 25_000;
-/// Wideband (broadcast) FM: occupied band from this ...
+/// Wideband FM with a 19 kHz pilot: occupied band from this (up to
+/// `WFM_MAX_BW_HZ`); narrowband FM (at most `FM_MAX_BW_HZ`) cannot reach it.
+const WFM_PILOT_MIN_BW_HZ: u64 = 40_000;
+/// Wideband (broadcast) FM without a pilot: occupied band from this ...
 const WFM_MIN_BW_HZ: u64 = 60_000;
 /// ... to this, ...
 const WFM_MAX_BW_HZ: u64 = 250_000;
 /// ... envelope coefficient of variation below this (looser than `FM_MAX_CV`:
-/// a wide band at a modest rate collects more noise) ...
-const WFM_MAX_CV: f32 = 0.35;
+/// a wide band at a modest rate collects more noise, and multipath on a real
+/// station ripples the envelope; one measured 0.33-0.36) ...
+const WFM_MAX_CV: f32 = 0.45;
 /// ... and discriminator audio deviating by more than this RMS.
 const WFM_MIN_DEV_HZ: f64 = 5_000.0;
 /// Broadcast FM stereo pilot frequency ...
@@ -424,10 +428,13 @@ fn tone_pair(
 ///    inside the occupied band 500–3000 Hz apart and within 6 dB of each
 ///    other, or, for a constant-envelope signal (CV below 0.2) with a keying
 ///    line, when its discriminator audio does (AFSK on FM).
-/// 3. `"wfm"` when the occupied band is 60–250 kHz, the envelope CV is below
-///    0.35 and the discriminator audio deviates by more than 5 kHz RMS: 0.9
-///    when [`pilot_line_db`] finds a 19 kHz pilot at least 10 dB above its
-///    region, else 0.6.
+/// 3. `"wfm"` (0.9) when the occupied band is 40–250 kHz and
+///    [`pilot_line_db`] finds a 19 kHz pilot at least 10 dB above its
+///    region, with no envelope or deviation gate (multipath and noise ripple
+///    a real station's envelope; the pilot is the stronger evidence).
+///    Otherwise `"wfm"` (0.6) when the occupied band is 60–250 kHz, the
+///    envelope CV is below 0.45 and the discriminator audio deviates by more
+///    than 5 kHz RMS.
 /// 4. `"am"` (0.6) when a carrier line sits at the block centre (the
 ///    strongest of the centre bin and its two neighbours at least 6 dB above
 ///    the mean power of the bins 1–5 kHz either side) and the envelope CV is
@@ -582,14 +589,24 @@ fn classify_block(
             }
         }
     }
-    if (WFM_MIN_BW_HZ..=WFM_MAX_BW_HZ).contains(&f.bandwidth_hz.0) && cv < WFM_MAX_CV {
-        let dev = audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0);
+    let bw = f.bandwidth_hz.0;
+    if (WFM_PILOT_MIN_BW_HZ..=WFM_MAX_BW_HZ).contains(&bw)
+        && let Some(d) = pilot_line_db(iq, rate_hz).filter(|&d| d >= LINE_DB)
+    {
+        return (
+            "wfm",
+            0.9,
+            format!("19 kHz pilot +{d:.1} dB, wideband {bw} Hz"),
+        );
+    }
+    if (WFM_MIN_BW_HZ..=WFM_MAX_BW_HZ).contains(&bw) && cv < WFM_MAX_CV {
+        let dev = audio_rms_hz(iq, rate_hz, bw);
         if dev > WFM_MIN_DEV_HZ {
-            let reason = format!("wideband constant envelope, rms deviation {dev:.0} Hz");
-            return match pilot_line_db(iq, rate_hz).filter(|&d| d >= LINE_DB) {
-                Some(d) => ("wfm", 0.9, format!("{reason}; 19 kHz pilot +{d:.1} dB")),
-                None => ("wfm", 0.6, reason),
-            };
+            return (
+                "wfm",
+                0.6,
+                format!("wideband constant envelope, rms deviation {dev:.0} Hz"),
+            );
         }
     }
     if cv >= AM_MIN_CV {

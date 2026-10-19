@@ -87,9 +87,10 @@ refuses them.
 
 Layer 1 (`measure`, and the first label of `classify`) names a band from its occupied bandwidth,
 envelope coefficient of variation (cv) and discriminator audio, and its evidence names the
-measurements it used. `wfm` is a band 60-250 kHz wide with cv below 0.35 and rms deviation above 5
-kHz; a 19 kHz pilot line at least 10 dB above the surrounding audio spectrum raises the confidence
-from 0.6 to 0.9 and is quoted ("19 kHz pilot +16.3 dB"). `am` is cv at least 0.25 with a carrier
+measurements it used. `wfm` at 0.9 is a band 40-250 kHz wide with a 19 kHz pilot line at least
+10 dB above the surrounding audio spectrum, quoted ("19 kHz pilot +16.3 dB"), whatever the envelope
+(multipath ripples a real station's); without a pilot, `wfm` at 0.6 is a band 60-250 kHz wide with
+cv below 0.45 and rms deviation above 5 kHz. `am` is cv at least 0.25 with a carrier
 line at the centre; `ssb` is cv at least 0.25, no carrier line, a 1.5-4 kHz band and 80 % of its
 power on one side of the centre, and its evidence gives the dial frequency to hand to `ssb_demod`.
 `fm` and `carrier` remain the narrowband rules (band at most 25 kHz, cv below 0.2), checked after

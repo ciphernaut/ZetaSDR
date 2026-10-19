@@ -118,3 +118,47 @@ fn ssb_fixture_is_ssb_with_sideband_evidence() {
         );
     }
 }
+
+/// The wfm fixture through a two-path channel (a 0.5x echo two samples late,
+/// 8.3 us at 240 kHz) at 15 dB SNR: the multipath ripples the envelope well
+/// past the clean fixture's cv, as on a real station. (A 0.3x one-sample echo
+/// only reaches cv 0.16 here: the paths stay nearly in phase.)
+fn wfm_multipath_fixture(pilot: bool) -> Vec<Complex<f32>> {
+    let audio = tone(48_000, 48_000, 1_000.0, 0.9);
+    let clean = wfm_modulate(&audio, 48_000, WFM_RATE, 75_000.0, 0.0, pilot);
+    let mut iq: Vec<Complex<f32>> = clean
+        .iter()
+        .enumerate()
+        .map(|(n, &s)| {
+            s + if n >= 2 {
+                clean[n - 2] * 0.5
+            } else {
+                Complex::new(0.0, 0.0)
+            }
+        })
+        .collect();
+    awgn(&mut iq, 15.0, 23);
+    iq
+}
+
+#[test]
+fn wfm_with_multipath_and_noise_is_still_wfm_by_pilot() {
+    let iq = wfm_multipath_fixture(true);
+    let cv = envelope_cv(&iq);
+    eprintln!("multipath wfm cv {cv:.3}");
+    assert!((0.38..=0.45).contains(&cv), "cv {cv}");
+    let l = label("wfm multipath pilot", &iq, WFM_RATE);
+    assert_eq!(l.name, "wfm", "{l:?}");
+    assert_eq!(l.confidence, 0.9, "{l:?}");
+    assert!(l.evidence.contains("19 kHz pilot"), "{}", l.evidence);
+}
+
+#[test]
+fn wfm_without_pilot_under_multipath_is_wfm_0_6() {
+    let iq = wfm_multipath_fixture(false);
+    eprintln!("multipath wfm (no pilot) cv {:.3}", envelope_cv(&iq));
+    let l = label("wfm multipath no pilot", &iq, WFM_RATE);
+    assert_eq!(l.name, "wfm", "{l:?}");
+    assert_eq!(l.confidence, 0.6, "{l:?}");
+    assert!(!l.evidence.contains("pilot"), "{}", l.evidence);
+}
