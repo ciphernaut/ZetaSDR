@@ -15,11 +15,12 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::timeout;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 use zeta_core::ops::{Op, OpError};
-use zeta_core::stream::{Frame, StreamBus};
+use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::StreamId;
+use zeta_vrt::{IqMeta, VrtEncoder, stream_id_of};
 
 use crate::http::{Shared, StatsHandle, error_response, other};
-use crate::wire::{WsMessage, ws_frame};
+use crate::wire::{CREDIT_CAP, CREDIT_MAX_GRANT, WsMessage, envelope, ws_frame};
 
 fn unknown_stream(bus: &StreamBus, id: &StreamId) -> OpError {
     let mut known: Vec<String> = bus.list().into_iter().map(|i| i.id.0).collect();
@@ -61,12 +62,33 @@ pub(crate) async fn tail_route(
     }
 }
 
-/// `GET /stream/{id}`: 404 and 503 are answered before upgrading.
+#[derive(Deserialize)]
+pub(crate) struct FormatQuery {
+    format: Option<String>,
+}
+
+/// `GET /stream/{id}?format=text|binary`: 400, 404 and 503 are answered before upgrading.
+/// `text` (or no `format`) pushes JSON text messages; `binary` pushes VRT packets for IQ and
+/// typed envelopes for the rest, paced by the client's credits.
 pub(crate) async fn ws(
     State(st): State<Shared>,
     Path(id): Path<String>,
+    query: Result<Query<FormatQuery>, QueryRejection>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
+    let binary = match query {
+        Ok(Query(q)) => match q.format.as_deref() {
+            None | Some("text") => false,
+            Some("binary") => true,
+            Some(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    other("format must be text or binary"),
+                );
+            }
+        },
+        Err(e) => return error_response(e.status(), other(e.body_text())),
+    };
     let bus = st.node.bus();
     let id = StreamId(id);
     let Some(rx) = bus.subscribe(&id) else {
@@ -86,7 +108,13 @@ pub(crate) async fn ws(
     };
     upgrade
         .max_message_size(st.limits.ws_max_message_bytes)
-        .on_upgrade(move |socket| connection(socket, rx, st, permit, tracked))
+        .on_upgrade(move |socket| async move {
+            if binary {
+                connection_binary(socket, rx, st, id, permit, tracked).await;
+            } else {
+                connection(socket, rx, st, permit, tracked).await;
+            }
+        })
 }
 
 /// Counts a live connection for as long as it is held.
@@ -166,6 +194,112 @@ async fn connection(
                 if !send_json(&mut socket, &msg, limit).await {
                     st.stats.ws_dropped_slow();
                     return;
+                }
+            }
+        }
+    }
+}
+
+/// `credit` after an inbound text message: a valid `{"type":"credit","packets":N}` with N in
+/// `1..=CREDIT_MAX_GRANT` adds N, capped at `CREDIT_CAP`; anything else changes nothing.
+fn granted(credit: u32, text: &str) -> u32 {
+    match serde_json::from_str(text) {
+        Ok(WsMessage::Credit { packets }) if (1..=CREDIT_MAX_GRANT).contains(&packets) => {
+            credit.saturating_add(packets).min(CREDIT_CAP)
+        }
+        _ => credit,
+    }
+}
+
+/// The binary messages for one frame: VRT packets for IQ (a context packet first when one is
+/// due), one typed envelope for anything else.
+fn binary_messages(encoder: &mut VrtEncoder, f: &Frame) -> Result<Vec<Vec<u8>>, String> {
+    match &f.payload {
+        Payload::Iq(b) => {
+            let meta = IqMeta {
+                center_hz: b.center_hz.0,
+                sample_rate_hz: b.sample_rate_hz.0,
+                bandwidth_hz: b.sample_rate_hz.0,
+            };
+            Ok(encoder.encode(b.t0.0, meta, &b.samples))
+        }
+        _ => envelope(f).map(|e| vec![e]),
+    }
+}
+
+/// The binary-mode loop. Credit starts at 0 and every binary message spends one. A frame
+/// that arrives with no credit is skipped and counted, as is one whose later packets found
+/// the credit spent, one that cannot be enveloped, and any broadcast lag; the count goes out
+/// as `{"type":"lagged","missed":K}` just before the next frame that is sent.
+async fn connection_binary(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<Frame>,
+    st: Shared,
+    id: StreamId,
+    _permit: OwnedSemaphorePermit,
+    _tracked: TaskTrackerToken,
+) {
+    let _live = Live::new(&st.stats);
+    let limit = st.limits.ws_send_timeout;
+    let mut encoder = VrtEncoder::new(stream_id_of(&id.0));
+    let mut credit: u32 = 0;
+    let mut missed: u64 = 0;
+    loop {
+        tokio::select! {
+            biased;
+            () = st.ws_shutdown.cancelled() => {
+                close(&mut socket, "node shutting down", close_code::AWAY, limit).await;
+                return;
+            }
+            inbound = socket.recv() => match inbound {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(Message::Text(t))) => credit = granted(credit, &t),
+                Some(Ok(_)) => {}
+            },
+            next = rx.recv() => {
+                let frame = match next {
+                    Ok(frame) => frame,
+                    Err(RecvError::Lagged(n)) => {
+                        missed = missed.saturating_add(n);
+                        continue;
+                    }
+                    Err(RecvError::Closed) => {
+                        close(&mut socket, "stream ended", close_code::NORMAL, limit).await;
+                        return;
+                    }
+                };
+                if credit == 0 {
+                    missed = missed.saturating_add(1);
+                    st.stats.ws_credit_skipped();
+                    continue;
+                }
+                let Ok(messages) = binary_messages(&mut encoder, &frame) else {
+                    missed = missed.saturating_add(1);
+                    continue;
+                };
+                if missed > 0 {
+                    if !send_json(&mut socket, &WsMessage::Lagged { missed }, limit).await {
+                        st.stats.ws_dropped_slow();
+                        return;
+                    }
+                    missed = 0;
+                }
+                let total = messages.len();
+                let mut sent = 0;
+                for m in messages {
+                    if credit == 0 {
+                        break;
+                    }
+                    if !send(&mut socket, Message::Binary(m.into()), limit).await {
+                        st.stats.ws_dropped_slow();
+                        return;
+                    }
+                    credit -= 1;
+                    sent += 1;
+                }
+                if sent < total {
+                    missed = missed.saturating_add(1);
+                    st.stats.ws_credit_skipped();
                 }
             }
         }

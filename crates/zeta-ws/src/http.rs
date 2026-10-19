@@ -66,12 +66,15 @@ pub struct ServerConfig {
 pub struct ServerStats {
     pub ws_connections: usize,
     pub ws_dropped_slow: u64,
+    /// Frames a binary-mode socket skipped because it had no credit.
+    pub ws_credit_skipped: u64,
 }
 
 #[derive(Default)]
 struct Counters {
     ws_connections: AtomicUsize,
     ws_dropped_slow: AtomicU64,
+    ws_credit_skipped: AtomicU64,
 }
 
 /// A cheap handle on the server's live counters.
@@ -83,6 +86,7 @@ impl StatsHandle {
         ServerStats {
             ws_connections: self.0.ws_connections.load(Ordering::Relaxed),
             ws_dropped_slow: self.0.ws_dropped_slow.load(Ordering::Relaxed),
+            ws_credit_skipped: self.0.ws_credit_skipped.load(Ordering::Relaxed),
         }
     }
 
@@ -96,6 +100,10 @@ impl StatsHandle {
 
     pub(crate) fn ws_dropped_slow(&self) {
         self.0.ws_dropped_slow.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn ws_credit_skipped(&self) {
+        self.0.ws_credit_skipped.fetch_add(1, Ordering::Relaxed);
     }
 }
 

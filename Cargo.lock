@@ -3849,7 +3849,9 @@ name = "zeta-vrt"
 version = "0.1.0"
 dependencies = [
  "num-complex",
+ "serde_json",
  "thiserror",
+ "zeta-core",
 ]
 
 [[package]]
@@ -3869,6 +3871,7 @@ dependencies = [
  "zeta-client",
  "zeta-core",
  "zeta-source-file",
+ "zeta-vrt",
  "zeta-ws",
 ]
 

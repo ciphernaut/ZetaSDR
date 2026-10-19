@@ -7,4 +7,6 @@ description = "VITA 49.2 signal data packet codec"
 
 [dependencies]
 num-complex = "0.4.6"
+serde_json = "1.0.154"
 thiserror = "2.0.21"
+zeta-core = { path = "../zeta-core" }

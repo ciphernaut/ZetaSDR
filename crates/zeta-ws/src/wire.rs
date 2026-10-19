@@ -1,4 +1,5 @@
 //! The websocket wire shapes: `WsMessage`, and `WsFrame`, which is core's `FrameSummary`.
+//! Binary mode adds the typed envelope (from `zeta_vrt::envelope`) and credits.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -8,13 +9,22 @@ use zeta_core::stream::Frame;
 /// shape as a `stream_tail` frame, so the websocket and the operation agree.
 pub type WsFrame = zeta_core::ops::FrameSummary;
 
-/// Every text message a stream websocket sends.
+pub use zeta_vrt::envelope::{envelope, parse_envelope};
+
+/// Most packets a binary-mode socket may hold credit for.
+pub const CREDIT_CAP: u32 = 65_536;
+/// Largest single `credit` grant; a grant outside `1..=CREDIT_MAX_GRANT` is ignored.
+pub const CREDIT_MAX_GRANT: u32 = 4_096;
+
+/// Every text message on a stream websocket. The server sends `Frame`, `Lagged` and
+/// `Closed`; `Credit` is inbound only, from a binary-mode client, and never sent.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsMessage {
     Frame(WsFrame),
     Lagged { missed: u64 },
     Closed { reason: String },
+    Credit { packets: u32 },
 }
 
 /// Summarise a bus frame for the wire; sample data does not cross it.
