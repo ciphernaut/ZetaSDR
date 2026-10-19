@@ -9,7 +9,7 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Hz, SourceId};
+use zeta_core::types::{Claim, Hz, SourceId};
 use zeta_source_soapy::SoapySource;
 use zeta_source_soapy::mock::{MockDevice, MockRead};
 
@@ -417,4 +417,25 @@ async fn measured_rate_is_reported() {
     }
     let r = src.measured_rate_hz().expect("a measured rate");
     assert!(r.is_finite() && r > 0.0, "{r}");
+}
+
+#[test]
+fn uhd_source_asserts_the_range_at_the_maximum_clock() {
+    let dev = Arc::new(
+        MockDevice::hackrf_like()
+            .with_driver("uhd")
+            .with_rate_follow(16e6, 61.44e6),
+    );
+    let src = source(&dev);
+    assert_eq!(
+        src.capabilities().max_bandwidth_hz,
+        Claim::Asserted(Hz(61_440_000))
+    );
+    let dev = Arc::new(MockDevice::hackrf_like().with_rate_follow(16e6, 61.44e6));
+    let src = source(&dev);
+    assert_eq!(
+        src.capabilities().max_bandwidth_hz,
+        Claim::Asserted(Hz(16_000_000))
+    );
+    assert_eq!(dev.range_reads(), 1, "a non-uhd device is probed once");
 }

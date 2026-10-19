@@ -195,6 +195,12 @@ they belong to the serving node and are rejected. Source ids are unique across t
 - **SoapySDR**, `--source-soapy ID=ARGS` (`ARGS` such as `driver=hackrf,serial=...`): a local
   device, `push` false (the node reads it). Gains are left at the driver's defaults (no gain
   operation yet), and a job centred exactly on the tuned frequency sees the device's DC spike.
+  A UHD device (`driver=uhd`) reports its rate range for its current master clock (a B210 opens
+  at 16 MHz), so at open the source asks for twice the reported maximum, re-reads the range
+  while it grows (at most three rounds) and restores the previous rate: a B210 asserts
+  `max_bandwidth_hz` 61440000 and a wide request raises its clock. `master_clock_rate=` in
+  `ARGS` (e.g. `driver=uhd,type=b200,master_clock_rate=30.72e6`) is an explicit override: it
+  fixes the clock, and with it the range and the rates a request can get.
 
 ```bash
 ./target/debug/zeta --source-kiwi kiwi0=kiwisdr.example:8073 source list   # remote true, current null

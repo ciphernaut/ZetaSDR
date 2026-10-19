@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, oneshot};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
 
-use crate::caps::{capabilities, pick_format, pick_rate};
+use crate::caps::{capabilities, pick_format, pick_rate, probe_rate_ranges};
 use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
 
 /// Blocks buffered per receiver.
@@ -107,9 +107,9 @@ impl SoapySource {
     /// Query the device's ranges and formats once; no streaming yet.
     pub fn with_device(id: SourceId, dev: Arc<dyn SoapyDevice>) -> Result<Self, PortError> {
         let io = |e: String| PortError::Io(format!("soapy {}: {e}", dev.driver_key()));
-        let caps = capabilities(dev.as_ref()).map_err(io)?;
+        let rates = probe_rate_ranges(dev.as_ref()).map_err(io)?;
+        let caps = capabilities(dev.as_ref(), &rates).map_err(io)?;
         let freq = dev.frequency_ranges().map_err(io)?;
-        let rates = dev.sample_rate_ranges().map_err(io)?;
         let (native, supported) = dev.formats().map_err(io)?;
         let format = pick_format(native, &supported).map_err(PortError::Unsupported)?;
         Ok(Self {

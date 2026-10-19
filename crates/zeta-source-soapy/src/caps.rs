@@ -6,23 +6,57 @@ use crate::device::{RangeHz, SoapyDevice, WireFormat};
 
 const RATE_QUANTUM_HZ: u64 = 100_000;
 
-/// Asserted capabilities from the device's reported ranges.
+/// Rounds of [`probe_rate_ranges`] on a UHD device.
+const UHD_PROBE_ROUNDS: usize = 3;
+
+fn max_rate(ranges: &[RangeHz]) -> f64 {
+    ranges
+        .iter()
+        .map(|r| r.max_hz)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// The device's sample-rate ranges. A UHD device reports them for its
+/// current master clock (a B210 opens at 16 MHz), so on driver `uhd` the
+/// range is re-read after asking for twice the reported maximum (errors
+/// ignored; the driver raises its clock as far as it can), while the maximum
+/// grows, at most three rounds; the rate in force before is then restored.
+/// Other drivers are read once. A `master_clock_rate=` device argument still
+/// fixes the clock, and with it the range.
+pub fn probe_rate_ranges(dev: &dyn SoapyDevice) -> Result<Vec<RangeHz>, String> {
+    let mut rates = dev.sample_rate_ranges()?;
+    if dev.driver_key() != "uhd" || rates.is_empty() {
+        return Ok(rates);
+    }
+    let saved = dev.sample_rate().ok().filter(|r| *r > 0.0);
+    for _ in 0..UHD_PROBE_ROUNDS {
+        let before = max_rate(&rates);
+        let _ = dev.set_sample_rate(2.0 * before);
+        match dev.sample_rate_ranges() {
+            Ok(r) if !r.is_empty() && max_rate(&r) > before => rates = r,
+            _ => break,
+        }
+    }
+    if let Some(r) = saved {
+        let _ = dev.set_sample_rate(r);
+    }
+    Ok(rates)
+}
+
+/// Asserted capabilities from the device's reported ranges, with `rates`
+/// from [`probe_rate_ranges`].
 ///
 /// Min-of-minimums / max-of-maximums overstates coverage on devices whose
 /// ranges have gaps; `tune` still validates against the real device.
-pub fn capabilities(dev: &dyn SoapyDevice) -> Result<Capabilities, String> {
+pub fn capabilities(dev: &dyn SoapyDevice, rates: &[RangeHz]) -> Result<Capabilities, String> {
     let freq = dev.frequency_ranges()?;
-    let rates = dev.sample_rate_ranges()?;
     let (_, formats) = dev.formats()?;
     let min = freq.iter().map(|r| r.min_hz).fold(f64::INFINITY, f64::min);
     let max = freq
         .iter()
         .map(|r| r.max_hz)
         .fold(f64::NEG_INFINITY, f64::max);
-    let bw = rates
-        .iter()
-        .map(|r| r.max_hz)
-        .fold(f64::NEG_INFINITY, f64::max);
+    let bw = max_rate(rates);
     if freq.is_empty() || rates.is_empty() {
         return Err("device reports no frequency or sample-rate range".into());
     }
@@ -132,7 +166,10 @@ mod tests {
 
     #[test]
     fn hackrf_like_capabilities() {
-        let c = capabilities(&MockDevice::hackrf_like()).unwrap();
+        let c = {
+            let d = MockDevice::hackrf_like();
+            capabilities(&d, &d.sample_rate_ranges().unwrap()).unwrap()
+        };
         assert_eq!(c.tune_min_hz, Claim::Asserted(Hz(1_000_000)));
         assert_eq!(c.tune_max_hz, Claim::Asserted(Hz(6_000_000_000)));
         assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(20_000_000)));
@@ -145,8 +182,46 @@ mod tests {
     }
 
     #[test]
+    fn uhd_rate_range_is_probed_at_the_maximum_clock() {
+        let dev = MockDevice::hackrf_like()
+            .with_driver("uhd")
+            .with_rate_follow(16e6, 61.44e6);
+        dev.set_sample_rate(8e6).unwrap();
+        let rates = probe_rate_ranges(&dev).unwrap();
+        let c = capabilities(&dev, &rates).unwrap();
+        assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(61_440_000)));
+        assert_eq!(pick_rate(&rates, 30_000_000), Some(30_000_000));
+        // Probed 32 M, then 64 M (clipped to 61.44 M), then 122.88 M: no growth.
+        assert_eq!(dev.range_reads(), 4);
+        assert_eq!(
+            dev.calls(),
+            [
+                "set_sample_rate(8000000)",
+                "set_sample_rate(32000000)",
+                "set_sample_rate(64000000)",
+                "set_sample_rate(122880000)",
+                "set_sample_rate(8000000)"
+            ]
+        );
+        assert_eq!(dev.sample_rate(), Ok(8e6), "rate restored");
+    }
+
+    #[test]
+    fn non_uhd_rate_range_is_read_once() {
+        let dev = MockDevice::hackrf_like().with_rate_follow(16e6, 61.44e6);
+        let rates = probe_rate_ranges(&dev).unwrap();
+        let c = capabilities(&dev, &rates).unwrap();
+        assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(16_000_000)));
+        assert_eq!(dev.range_reads(), 1);
+        assert!(dev.calls().is_empty(), "{:?}", dev.calls());
+    }
+
+    #[test]
     fn remote_driver_is_remote() {
-        let c = capabilities(&MockDevice::hackrf_like().with_driver("remote")).unwrap();
+        let c = {
+            let d = MockDevice::hackrf_like().with_driver("remote");
+            capabilities(&d, &d.sample_rate_ranges().unwrap()).unwrap()
+        };
         assert!(c.remote);
     }
 

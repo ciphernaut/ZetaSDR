@@ -27,6 +27,10 @@ pub struct MockDevice {
     rate: Mutex<f64>,
     fails: Arc<Mutex<Vec<(String, String)>>>,
     delays: Mutex<Vec<(String, u64)>>,
+    /// `(floor, ceiling)`: the reported rate range's maximum follows the last
+    /// set rate within these bounds, as a UHD device's follows its master clock.
+    follow: Option<(f64, f64)>,
+    range_reads: Mutex<usize>,
 }
 
 impl MockDevice {
@@ -51,7 +55,21 @@ impl MockDevice {
             rate: Mutex::new(0.0),
             fails: Arc::default(),
             delays: Mutex::default(),
+            follow: None,
+            range_reads: Mutex::new(0),
         }
+    }
+
+    /// Report a single continuous rate range whose maximum is the last set
+    /// rate clamped to `floor..=ceiling` (`floor` before any rate is set).
+    pub fn with_rate_follow(mut self, floor: f64, ceiling: f64) -> Self {
+        self.follow = Some((floor, ceiling));
+        self
+    }
+
+    /// Calls of `sample_rate_ranges` so far.
+    pub fn range_reads(&self) -> usize {
+        *self.range_reads.lock().unwrap()
     }
 
     pub fn with_driver(mut self, d: &str) -> Self {
@@ -120,6 +138,15 @@ impl SoapyDevice for MockDevice {
         Ok(self.freq.clone())
     }
     fn sample_rate_ranges(&self) -> Result<Vec<RangeHz>, String> {
+        *self.range_reads.lock().unwrap() += 1;
+        if let Some((floor, ceiling)) = self.follow {
+            let max = self.rate.lock().unwrap().clamp(floor, ceiling);
+            return Ok(vec![RangeHz {
+                min_hz: self.rates.first().map_or(1e6, |r| r.min_hz),
+                max_hz: max,
+                step_hz: 0.0,
+            }]);
+        }
         Ok(self.rates.clone())
     }
     fn formats(&self) -> Result<(Option<WireFormat>, Vec<WireFormat>), String> {
