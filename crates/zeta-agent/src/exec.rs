@@ -73,6 +73,22 @@ impl Executor for RemoteExecutor {
     }
 }
 
+/// Trim a result before the model sees it: a `job_list` loses each record's
+/// `graph` (a graph is several hundred bytes the model never needs; `graph_get`
+/// fetches one). Everything else passes unchanged.
+pub fn trim_result(op: &str, result: &mut Value) {
+    if op != "job_list" {
+        return;
+    }
+    if let Some(records) = result.get_mut("value").and_then(Value::as_array_mut) {
+        for r in records {
+            if let Some(o) = r.as_object_mut() {
+                o.remove("graph");
+            }
+        }
+    }
+}
+
 /// An operation error as JSON; one that cannot be serialised becomes `other`.
 pub(crate) fn to_json(e: &(impl Serialize + std::fmt::Display)) -> Value {
     serde_json::to_value(e).unwrap_or_else(|_| json!({"error": "other", "message": e.to_string()}))

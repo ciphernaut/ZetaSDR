@@ -1,6 +1,6 @@
 //! The agent loop: model turns, tool calls applied through an executor, errors fed back.
 
-use crate::exec::{Executor, to_json};
+use crate::exec::{Executor, to_json, trim_result};
 use crate::llm::{AgentError, LlmClient, LlmConfig};
 use crate::wire::{ChatMessage, ToolCall};
 use serde::Serialize;
@@ -174,11 +174,15 @@ impl<E: Executor> Agent<E> {
             Err(e) => Err(to_json(&e)),
         };
         let ok = result.is_ok();
+        let mut result = result.unwrap_or_else(|e| e);
+        if ok {
+            trim_result(&f.name, &mut result);
+        }
         Ok(CallRecord {
             tool: f.name.clone(),
             arguments,
             ok,
-            result: result.unwrap_or_else(|e| e),
+            result,
         })
     }
 }

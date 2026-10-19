@@ -462,3 +462,17 @@ async fn no_bank_is_made_per_step_while_a_scan_holds_the_source() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(makes(), 1);
 }
+
+/// A scan's context says how many steps a sweep takes, so a reader need not
+/// count rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_context_carries_its_step_count() {
+    let (_dir, node, _port) = open().await;
+    let (id, _rx) = start_scan(&node).await;
+    let ctx = node.job_context(&id).expect("the scan has a context");
+    assert_eq!(ctx["scan"]["steps"], 3, "{ctx}");
+    assert_eq!(ctx["scan"]["step_hz"], 16 * MHZ, "{ctx}");
+    // The harness opens the node with a 20 ms dwell.
+    assert_eq!(ctx["scan"]["dwell_ms"], 20, "{ctx}");
+    node.job_stop(&id).await.unwrap();
+}
