@@ -69,6 +69,9 @@ const PILOT_TOL_HZ: f64 = 300.0;
 const PILOT_REGION_HZ: (f64, f64) = (15_000.0, 23_000.0);
 /// AM and SSB: envelope coefficient of variation at least this.
 const AM_MIN_CV: f32 = 0.25;
+/// Low-index AM (below `AM_MIN_CV`): envelope coefficient of variation at
+/// least this, with a carrier line and less RMS phase deviation than cv.
+const AM_LOW_MIN_CV: f32 = 0.1;
 /// AM carrier line: the sideband level is the mean power of the bins this far
 /// from the centre, either side.
 const AM_SIDEBAND_HZ: (f64, f64) = (1_000.0, 5_000.0);
@@ -443,10 +446,15 @@ fn tone_pair(
 ///    least 0.25, the occupied band is 1.5–4 kHz and at least 80 % of its
 ///    power lies on one side of centre; the evidence names `usb` (above) or
 ///    `lsb` (below) and the dial frequency [`ssb_dial_hz`] gives.
-/// 6. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
+/// 6. `"am"` (0.6) for low-index AM: the same centre line, an envelope CV
+///    of at least 0.1 both whole-band and within half the occupied band (so
+///    wideband noise on a bare carrier does not pass), and an RMS phase
+///    deviation of the discriminator audio (radians per sample, band-limited
+///    as for `fm`) below the CV, so the envelope moves more than the phase.
+/// 7. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
 ///    25 kHz and the discriminator audio deviates by more than 100 Hz RMS;
 ///    `"carrier"` (0.7) under the same gate when it does not.
-/// 7. Otherwise `"unknown"` (0.5).
+/// 8. Otherwise `"unknown"` (0.5).
 pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Label {
     let cv = envelope_cv(iq);
     let (name, confidence, reason) = classify_block(f, iq, rate_hz, cv);
@@ -477,6 +485,22 @@ fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> f64 {
     }
     let ms = audio.iter().map(|a| (a.re as f64).powi(2)).sum::<f64>() / audio.len() as f64;
     ms.sqrt() * rate_hz as f64 / (2.0 * std::f64::consts::PI)
+}
+
+/// Envelope coefficient of variation band-limited like [`audio_rms_hz`]:
+/// the RMS of the envelope's variation within half the occupied band over
+/// its mean. Wideband noise on a bare carrier raises [`envelope_cv`] but not
+/// this; an AM tone inside the band raises both.
+fn envelope_band_cv(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> f32 {
+    let mut e: Vec<f32> = iq.iter().map(|s| s.norm()).collect();
+    let mean = e.iter().map(|&v| v as f64).sum::<f64>() / e.len().max(1) as f64;
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    e.iter_mut().for_each(|v| *v -= mean as f32);
+    let audio = analytic(&e, rate_hz, bandwidth_hz as f64 / 2.0);
+    let ms = audio.iter().map(|a| (a.re as f64).powi(2)).sum::<f64>() / audio.len().max(1) as f64;
+    (ms.sqrt() / mean) as f32
 }
 
 /// Strength, in dB, of a 19 kHz broadcast stereo pilot in the discriminator
@@ -635,6 +659,23 @@ fn classify_block(
                         ),
                     );
                 }
+            }
+        }
+    }
+    if cv >= AM_LOW_MIN_CV {
+        let carrier_db = centre_line_db(&db, bin_hz);
+        if carrier_db >= OCCUPIED_DB {
+            let phase_rms = (audio_rms_hz(iq, rate_hz, bw) * 2.0 * std::f64::consts::PI
+                / rate_hz as f64) as f32;
+            let band_cv = envelope_band_cv(iq, rate_hz, bw);
+            if phase_rms < cv && band_cv >= AM_LOW_MIN_CV {
+                return (
+                    "am",
+                    0.6,
+                    format!(
+                        "carrier line {carrier_db:.1} dB above the sidebands, cv {cv:.3} ({band_cv:.3} in band), phase rms {phase_rms:.4} rad below cv"
+                    ),
+                );
             }
         }
     }

@@ -87,14 +87,15 @@ refuses them.
 
 Layer 1 (`measure`, and the first label of `classify`) names a band from its occupied bandwidth,
 envelope coefficient of variation (cv) and discriminator audio, and its evidence names the
-measurements it used. `wfm` at 0.9 is a band 40-250 kHz wide with a 19 kHz pilot line at least
-10 dB above the surrounding audio spectrum, quoted ("19 kHz pilot +16.3 dB"), whatever the envelope
+measurements it used. `wfm` at 0.9 is a band 40-250 kHz wide with a 19 kHz pilot line at least 10 dB
+above the surrounding audio spectrum, quoted ("19 kHz pilot +16.3 dB"), whatever the envelope
 (multipath ripples a real station's); without a pilot, `wfm` at 0.6 is a band 60-250 kHz wide with
-cv below 0.45 and rms deviation above 5 kHz. `am` is cv at least 0.25 with a carrier
-line at the centre; `ssb` is cv at least 0.25, no carrier line, a 1.5-4 kHz band and 80 % of its
-power on one side of the centre, and its evidence gives the dial frequency to hand to `ssb_demod`.
-`fm` and `carrier` remain the narrowband rules (band at most 25 kHz, cv below 0.2), checked after
-these.
+cv below 0.45 and rms deviation above 5 kHz. `am` is cv at least 0.25 with a carrier line at the
+centre, or, for low-index AM, cv at least 0.1 (also within the occupied band) with that line and
+less rms phase deviation (rad per sample) than cv; `ssb` is cv at least 0.25, no carrier line, a
+1.5-4 kHz band and 80 % of its power on one side of the centre, and its evidence gives the dial
+frequency to hand to `ssb_demod`. `fm` and `carrier` remain the narrowband rules (band at most 25
+kHz, cv below 0.2), checked after these.
 
 Layer 2 adds a catalogue: iNTERCEPT's `signals.json` (594 known signals, Apache-2.0, copied
 unchanged into `crates/zeta-dsp/data` with its `NOTICE`). It is a knowledge provider, so

@@ -162,3 +162,30 @@ fn wfm_without_pilot_under_multipath_is_wfm_0_6() {
     assert_eq!(l.confidence, 0.6, "{l:?}");
     assert!(!l.evidence.contains("pilot"), "{}", l.evidence);
 }
+
+#[test]
+fn am_fixture_low_index_is_am() {
+    // Below AM_MIN_CV (0.25): m 0.2 and 0.3 give cv of about m / sqrt(2).
+    for m in [0.2f32, 0.3] {
+        let audio = tone(48_000, 48_000, 1_000.0, 1.0);
+        let mut iq = am_modulate(&audio, 48_000, 48_000, m, 0.0);
+        awgn(&mut iq, 20.0, 7);
+        let l = label(&format!("am m {m}"), &iq, 48_000);
+        assert_eq!(l.name, "am", "m {m}: {l:?}");
+        assert_eq!(l.confidence, 0.6, "{l:?}");
+        assert!(l.evidence.contains("carrier line"), "{}", l.evidence);
+        assert!(l.evidence.contains("phase rms"), "{}", l.evidence);
+    }
+}
+
+#[test]
+fn centred_carrier_is_still_carrier() {
+    // A bare carrier at the block centre has a carrier line; its noise
+    // envelope must not pass for low-index AM.
+    for (snr, seed) in [(20.0f32, 11u64), (12.0, 12)] {
+        let mut iq = vec![Complex::new(1.0f32, 0.0); 48_000];
+        awgn(&mut iq, snr, seed);
+        let l = label(&format!("carrier {snr} dB"), &iq, 48_000);
+        assert_eq!(l.name, "carrier", "snr {snr}: {l:?}");
+    }
+}
