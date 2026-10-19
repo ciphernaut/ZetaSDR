@@ -663,7 +663,10 @@ mod tests {
         let bytes = acars_block_bytes('2', "VH-ZET", "H1", 'A', TEXT);
         let mut audio = vec![0.0f32; 9_600];
         audio.extend(acars_modulate(&bytes, 48_000));
-        audio.extend(vec![0.0f32; 9_600]);
+        // acarsdec exits at end of file without waiting for its decoder
+        // thread; 2 s of trailing silence lets the block reach the output
+        // even on a loaded host (the test flaked under the full suite).
+        audio.extend(vec![0.0f32; 2 * 48_000]);
         let dir = tempfile::tempdir().unwrap();
         let wav_path = dir.path().join("acars.wav");
         let out_path = dir.path().join("acars.txt");

@@ -1,4 +1,4 @@
-//! RDS decode stage: IQ frames in, events as station data completes.
+//! ACARS decode stage: IQ frames in, events as station data completes.
 #![cfg(feature = "test-fixtures")]
 
 use std::sync::Arc;
