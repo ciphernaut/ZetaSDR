@@ -117,3 +117,15 @@ effect: in the first seconds after the remote node opens the B210, `measure` com
 windows (one event instead of two in the first run after a restart, none in the earlier runs that also went
 through an SSH tunnel with a debug build), and it is gone once the device has been streaming for a minute.
 A settle period after a device starts streaming, or a more tolerant measure window, is the follow-up.
+
+High-rate run over gigabit Ethernet (this box wired, the field host wired, release binaries both ends,
+`max_bandwidth_hz=` raised explicitly): `spectrum` over the federated B210 at 1 Msps (610 frames in
+10 s), 4 Msps (1000 frames in 3.3 s) and 16 Msps (10 000 frames over 10 s of signal through a local
+`serve`, about 64 MB/s on the wire) all arrived with `missed` 0, no lag or loss counted, and every frame's
+span accounted for. A request for 10 MHz with a 10 MHz cap was refused with `suggested` 16 000 000, because
+the B210 ships 16 Msps for that request: the shipped-rate cap check from the fix wave working as intended.
+Costs at 16 Msps: the local node ran at about 43 % of one core (VRT decode plus the spectrum FFT), the
+remote at about 9 %, and both held about 2.1 GB resident, almost all of it the 10 s IQ ring. That ring
+size is a follow-up for the Pi: `deploy/pi/zetasdr.service` caps memory at 1 GB, so a Pi node must keep a
+shorter ring or refuse caps that would not fit.
+
