@@ -115,6 +115,24 @@ impl Agc {
     }
 }
 
+/// `iq` with every non-finite sample mapped to 0, as `nbfm_demod` does, so
+/// one bad sample cannot poison the filter and AGC state of later blocks.
+fn finite(iq: &[Complex<f32>]) -> std::borrow::Cow<'_, [Complex<f32>]> {
+    if iq.iter().all(|x| x.re.is_finite() && x.im.is_finite()) {
+        return iq.into();
+    }
+    iq.iter()
+        .map(|&x| {
+            if x.re.is_finite() && x.im.is_finite() {
+                x
+            } else {
+                Complex::new(0.0, 0.0)
+            }
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
 #[derive(Clone, Copy, Debug, JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -146,11 +164,14 @@ impl AmDemod {
         })
     }
 
-    /// Demodulate one block of `iq` at `rate_hz` to audio at `audio_rate_hz`.
+    /// Demodulate one block of `iq` at `rate_hz` to audio at `audio_rate_hz`;
+    /// non-finite samples are taken as 0.
     pub fn process(&mut self, iq: &[Complex<f32>], rate_hz: u64) -> Result<Vec<f32>, String> {
         if rate_hz == 0 {
             return Err("am_demod: input sample rate is 0".into());
         }
+        let iq = finite(iq);
+        let iq = &iq[..];
         if self.rate_state.as_ref().is_none_or(|(r, ..)| *r != rate_hz) {
             let cutoff = AM_AUDIO_CUTOFF_HZ.min(0.45 * rate_hz as f64);
             let taps = lowpass_taps(cutoff, rate_hz as f64, AM_AUDIO_TAPS);
@@ -315,11 +336,14 @@ impl SsbDemod {
         })
     }
 
-    /// Demodulate one block of `iq` at `rate_hz` to audio at `audio_rate_hz`.
+    /// Demodulate one block of `iq` at `rate_hz` to audio at `audio_rate_hz`;
+    /// non-finite samples are taken as 0.
     pub fn process(&mut self, iq: &[Complex<f32>], rate_hz: u64) -> Result<Vec<f32>, String> {
         if rate_hz == 0 {
             return Err("ssb_demod: input sample rate is 0".into());
         }
+        let iq = finite(iq);
+        let iq = &iq[..];
         if self
             .rate_state
             .as_ref()

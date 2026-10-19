@@ -5,12 +5,13 @@ use num_complex::Complex;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use zeta_core::ops::Sideband;
 use zeta_core::stage::{Stage, StageError};
 use zeta_core::stream::StreamBus;
 use zeta_core::types::StreamId;
-use zeta_dsp::am::{AmDemod, AmDemodStage, AmParams, am_demod};
+use zeta_dsp::am::{AmDemod, AmDemodStage, AmParams, SsbDemod, SsbParams, am_demod};
 use zeta_dsp::fft::{Window, power_spectrum_db};
-use zeta_dsp::fixtures::{am_modulate, tone};
+use zeta_dsp::fixtures::{am_modulate, ssb_modulate, tone};
 
 #[test]
 fn am_demod_is_the_magnitude() {
@@ -66,5 +67,40 @@ async fn am_stage_rejects_zero_rate() {
     match r {
         Err(StageError::Failed(m)) => assert!(m.contains("audio_rate_hz"), "{m}"),
         r => panic!("expected Failed, got {r:?}"),
+    }
+}
+
+#[test]
+fn am_and_ssb_survive_a_nan_sample() {
+    let audio = tone(48_000, 48_000, 1_000.0, 1.0);
+    let am = am_modulate(&audio, 48_000, 48_000, 0.5, 0.0);
+    let ssb = ssb_modulate(&audio, 48_000, 48_000, true, 0.0);
+    let mut am_d = AmDemod::new(&AmParams {
+        audio_rate_hz: 48_000,
+    })
+    .unwrap();
+    let mut ssb_d = SsbDemod::new(&SsbParams {
+        sideband: Sideband::Usb,
+        audio_rate_hz: 48_000,
+        audio_bandwidth_hz: 2_700,
+    })
+    .unwrap();
+    type Run<'a> = Box<dyn FnMut(&[Complex<f32>]) -> Vec<f32> + 'a>;
+    let runs: [(&str, &[Complex<f32>], Run); 2] = [
+        ("am", &am, Box::new(|b| am_d.process(b, 48_000).unwrap())),
+        ("ssb", &ssb, Box::new(|b| ssb_d.process(b, 48_000).unwrap())),
+    ];
+    for (what, iq, mut demod) in runs {
+        // 480-sample blocks; one NaN in the middle of block 50.
+        let mut iq = iq.to_vec();
+        iq[50 * 480 + 240] = Complex::new(f32::NAN, f32::NAN);
+        let blocks: Vec<Vec<f32>> = iq.chunks(480).map(&mut demod).collect();
+        for (k, out) in blocks.iter().enumerate().skip(50).take(2) {
+            assert!(!out.is_empty(), "{what} block {k} empty");
+            assert!(
+                out.iter().all(|s| s.is_finite() && s.abs() <= 1.0),
+                "{what} block {k}: {out:?}"
+            );
+        }
     }
 }
