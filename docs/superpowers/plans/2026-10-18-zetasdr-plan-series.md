@@ -389,3 +389,15 @@ Live acceptance (to do, on the field host with dump1090, multimon-ng and acarsde
 12.5 kHz for 60 s, `acars_decode` on 131.550 MHz / 10 kHz for 120 s, `adsb_decode` on 1 090 MHz /
 2.4 MHz for 60 s (a clean run without events is a pass for the plumbing only). Outcomes are not yet
 recorded.
+
+Live acceptance on the field host's B210 (2026-10-20, 06:45-07:05 AEST, merged main 6063a2d, dump1090 at
+/usr/local/bin/dump1090 found at startup): `rds_decode` on 100.5 MHz / 200 kHz (the strongest station in a
+20 MHz spectrum row, 56 dB above the floor) produced within 40 s the events PI `1361`, PS `ZINC 96 `, RT
+`Wake up with Bilko & Jade`, PTY 11, from 2A then 0A groups. On 104.9 MHz (16.8 dB SNR, pilot +15.3 dB,
+84 kHz wide), 107.1 MHz and 94.5 MHz no RDS event arrived in 30 s: the decoder's 16-20 dB CNR floor, or
+no RDS carried; `classify` over the 104.9 MHz capture gave the layer-1 `wfm` label and the catalogue's
+`FM Broadcast Radio`, no `RDS`. `pocsag_decode` on 148.6375 MHz / 12.5 kHz (60 s), `acars_decode` on
+131.550 MHz / 10 kHz (120 s) and `adsb_decode` on 1090 MHz / 2.4 MHz (60 s) each ran without error
+(captures at 120 kHz, 120 kHz and 2.4576 MHz; dump1090 started with the SC16 float path and exited cleanly
+at the stop, no process left) but saw no events: plumbing pass, no signal verified at that hour with the
+antenna in use. The radio was left at 104.9 MHz / 1 MHz with no jobs.
