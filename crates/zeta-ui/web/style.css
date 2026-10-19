@@ -106,6 +106,24 @@ input:focus { border-color: var(--accent); }
 
 #main { grid-area: main; position: relative; min-width: 0; min-height: 0; }
 #waterfall { position: absolute; inset: 0; background: var(--bg); }
+#waterfall { --axis-w: 64px; }
+#waterfall .wf-axis {
+  position: absolute; left: 0; top: 0; bottom: 0; width: var(--axis-w);
+  border-right: 1px solid var(--border); color: var(--dim);
+}
+#waterfall .wf-axis .tick {
+  position: absolute; right: 6px; transform: translateY(-50%); font-size: 11px;
+}
+#waterfall .wf-axis .tick[data-edge="top"] { transform: none; }
+#waterfall .wf-axis .tick[data-edge="bottom"] { transform: translateY(-100%); }
+#waterfall .wf-canvas, #waterfall .wf-overlay {
+  position: absolute; left: var(--axis-w); top: 0; width: calc(100% - var(--axis-w)); height: 100%;
+}
+#waterfall .wf-overlay { cursor: crosshair; touch-action: none; }
+#wf-badge {
+  position: absolute; top: 8px; right: 8px; padding: 2px 8px;
+  background: var(--bar); border: 1px solid var(--border); color: var(--user);
+}
 
 #side {
   grid-area: side;

@@ -174,6 +174,78 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     expect(page.locator("#transcript .line.user")).to_have_count(1)
 
 
+def running_spectrum_jobs(url, secret, source):
+    jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+    return [j for j in jobs if j["kind"] == "spectrum" and j["source"] == source
+            and j["state"]["status"] == "running"]
+
+
+# Whether the right-most 10 columns of the waterfall canvas hold a pixel with G > 200.
+BRIGHT_AT_RIGHT_JS = """() => {
+  const c = document.querySelector('#waterfall canvas.wf-canvas');
+  if (!c || c.width < 10 || c.height < 1) return false;
+  const d = c.getContext('2d').getImageData(c.width - 10, 0, 10, c.height).data;
+  for (let i = 0; i < d.length; i += 4) if (d[i + 1] > 200) return true;
+  return false;
+}"""
+
+
+def show_tone_waterfall(page, url, secret):
+    page.set_viewport_size(WIDE)
+    login(page, url, secret)
+    page.click('.src-tab[data-id="tone"]')
+    expect(page.locator('.src-tab[data-id="tone"]')).to_have_attribute("aria-selected", "true")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+
+
+def wait_one_spectrum_job(url, secret, source, within_s=3.0):
+    deadline = time.monotonic() + within_s
+    while True:
+        jobs = running_spectrum_jobs(url, secret, source)
+        if len(jobs) == 1 or time.monotonic() > deadline:
+            return jobs
+        time.sleep(0.2)
+
+
+def scenario_waterfall_paints(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    jobs = wait_one_spectrum_job(url, secret, "tone")
+    assert len(jobs) == 1, f"spectrum jobs on tone: {jobs}"
+    # The frequency axis: 5 ticks in MHz with 3 decimals, inside the tone's band.
+    ticks = page.locator("#waterfall .wf-axis .tick").all_text_contents()
+    assert len(ticks) == 5, f"ticks {ticks}"
+    for t in ticks:
+        v = float(t)
+        assert 99.976 <= v <= 100.024 and t == f"{v:.3f}", f"tick {t!r} in {ticks}"
+
+
+def scenario_ui_spectrum_job_is_reused_not_duplicated(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    page.reload()
+    expect(page.locator("#login")).to_be_hidden()
+    page.wait_for_timeout(3_000)
+    jobs = running_spectrum_jobs(url, secret, "tone")
+    assert len(jobs) == 1, f"spectrum jobs on tone after reload: {jobs}"
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+
+
+def scenario_selection_reports_band(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
+    page.mouse.move(box["x"] + 300, box["y"] + 100)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 350, box["y"] + 120, steps=4)
+    page.mouse.move(box["x"] + 400, box["y"] + 140, steps=4)
+    page.mouse.up()
+    sel = page.evaluate("window.zetaLastSelection")
+    assert sel, f"no selection: {sel!r}"
+    for k in ("centerHz", "bandwidthHz", "startNs", "endNs"):
+        assert isinstance(sel.get(k), int), f"{k} not an integer: {sel}"
+    assert sel["bandwidthHz"] > 0, f"selection {sel}"
+    assert 99_976_000 <= sel["centerHz"] <= 100_024_000, f"selection {sel}"
+    assert sel["startNs"] <= sel["endNs"], f"selection {sel}"
+
+
 # ---- runner ----------------------------------------------------------------------------
 
 def scenarios():

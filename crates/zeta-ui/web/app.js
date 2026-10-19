@@ -14,11 +14,15 @@
 // that parses as a JSON object with an `op` key is applied with `api.op` (its outcome reaches
 // the transcript through the `ops` stream); anything else goes to `api.ask`.
 //
-// Exports `state` ({api, transcript, jobs, sources, selected}) and `onSourceChange(fn)` for
+// The waterfall (waterfall.js) is mounted in #waterfall at login and follows the selected
+// source; it is destroyed when the node rejects the secret.
+//
+// Exports `state` ({api, transcript, jobs, wf, sources, selected}) and `onSourceChange(fn)` for
 // the later views (waterfall, audio, voice).
 
 import { connect, Unauthorized } from "./api.js";
 import { Transcript, startJobs, startOpsFeed } from "./agent.js";
+import { mountWaterfall } from "./waterfall.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -29,6 +33,7 @@ export const state = {
   transcript: null,
   jobs: null,
   ops: null,
+  wf: null,
   sources: [],
   selected: null,
 };
@@ -260,6 +265,7 @@ function start(api) {
   state.transcript = new Transcript($("#transcript"));
   state.ops = startOpsFeed(api, state.transcript);
   state.jobs = startJobs(api, $("#jobs"), state.transcript);
+  state.wf = mountWaterfall($("#waterfall"), api);
   loadSources();
 }
 
@@ -270,8 +276,10 @@ function logout(api) {
   api.onUnauthorized = null;
   if (state.ops) state.ops.close();
   if (state.jobs) state.jobs.close();
+  if (state.wf) state.wf.destroy();
   state.ops = null;
   state.jobs = null;
+  state.wf = null;
   store(SECRET_KEY, null);
   showLogin("secret rejected");
 }
@@ -288,6 +296,9 @@ window.zetaTest = {
 
 function boot() {
   applyFootprint();
+  onSourceChange((src) => {
+    if (state.wf) state.wf.setSource(src);
+  });
   wireCommandLine();
   window.addEventListener("resize", applyFootprint);
   $("#drawer-toggle").addEventListener("click", () => {
