@@ -1,1 +1,45 @@
-<!doctype html><title>ZetaSDR</title><div id="app">loading</div>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZetaSDR</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<div id="login" hidden>
+  <form id="login-form" autocomplete="off">
+    <h1>ZetaSDR</h1>
+    <label for="secret">Node secret</label>
+    <input id="secret" type="password" spellcheck="false" autocomplete="current-password">
+    <button id="connect" type="submit">Connect</button>
+    <div id="login-error" role="alert"></div>
+  </form>
+</div>
+<div id="app" hidden>
+  <header id="top">
+    <span class="brand">ZetaSDR</span>
+    <nav id="tabs" role="tablist" aria-label="Sources"></nav>
+    <button id="drawer-toggle" type="button" aria-label="Transcript and jobs">☰</button>
+  </header>
+  <main id="main"><div id="waterfall"></div></main>
+  <aside id="side">
+    <section class="pane transcript">
+      <h2>Transcript</h2>
+      <div id="transcript" aria-live="polite"></div>
+    </section>
+    <section class="pane jobs">
+      <h2>Jobs</h2>
+      <div id="jobs"></div>
+    </section>
+  </aside>
+  <footer id="bar">
+    <span class="prompt">›</span>
+    <input id="cmd" type="text" spellcheck="false" autocomplete="off"
+           placeholder='ask, or an op as JSON: {"op":"source_list"}  (Ctrl-K)'>
+    <button id="mic" type="button" disabled title="voice input (not yet)">mic</button>
+  </footer>
+</div>
+</body>
+</html>

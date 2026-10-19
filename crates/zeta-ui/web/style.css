@@ -1,0 +1,188 @@
+/* ZetaSDR web app: palette from the mockup. */
+:root {
+  --bg: #0b0e14;
+  --bar: #141923;
+  --border: #2a3140;
+  --accent: #5ec8ff;
+  --text: #c9d1dc;
+  --dim: #7a8496;
+  --error: #ff6b6b;
+  --ok: #7ee787;
+  --user: #e6c07b;
+  --side-w: 360px;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.4 ui-monospace, "SFMono-Regular", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+}
+
+button, input { font: inherit; color: inherit; }
+button {
+  background: var(--bar);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: default; }
+input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  outline: none;
+}
+input:focus { border-color: var(--accent); }
+
+/* ---- login ---- */
+#login {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+#login-form {
+  display: grid;
+  gap: 8px;
+  width: min(320px, 100%);
+  background: var(--bar);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 16px;
+}
+#login h1 { margin: 0 0 4px; font-size: 14px; color: var(--accent); letter-spacing: 0.05em; }
+#login label { color: var(--dim); }
+#connect { border-color: var(--accent); color: var(--accent); }
+#login-error { color: var(--error); min-height: 1.4em; }
+
+/* ---- shell ---- */
+#app {
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--side-w);
+  grid-template-rows: 34px minmax(0, 1fr) 38px;
+  grid-template-areas: "top top" "main side" "bar bar";
+}
+
+#top {
+  grid-area: top;
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  background: var(--bar);
+  border-bottom: 1px solid var(--border);
+  padding: 0 8px;
+  min-width: 0;
+}
+.brand { align-self: center; color: var(--accent); font-weight: bold; letter-spacing: 0.05em; }
+#tabs { display: flex; gap: 2px; overflow-x: auto; min-width: 0; flex: 1; }
+.src-tab {
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  color: var(--dim);
+}
+.src-tab .range { font-size: 11px; opacity: 0.8; }
+.src-tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+.src-tab[aria-selected="true"] .name { color: var(--accent); }
+.src-tab.fault .name { color: var(--error); }
+#drawer-toggle { display: none; align-self: center; }
+
+#main { grid-area: main; position: relative; min-width: 0; min-height: 0; }
+#waterfall { position: absolute; inset: 0; background: var(--bg); }
+
+#side {
+  grid-area: side;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bar);
+  border-left: 1px solid var(--border);
+}
+.pane { display: flex; flex-direction: column; min-height: 0; }
+.pane.transcript { flex: 1; }
+.pane.jobs { flex: 0 0 auto; max-height: 40%; border-top: 1px solid var(--border); }
+.pane h2 {
+  margin: 0;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  border-bottom: 1px solid var(--border);
+}
+#transcript { flex: 1; overflow-y: auto; padding: 4px 8px; }
+#jobs { overflow-y: auto; padding: 4px 8px; }
+
+.line { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1px 0; }
+.line .count { color: var(--dim); }
+.line.op { color: var(--text); }
+.line.user { color: var(--user); word-break: break-all; }
+.line.user::before { content: "› "; color: var(--dim); }
+.line.assistant { color: var(--accent); }
+.line.assistant::before { content: "◆ "; }
+.line.note { color: var(--dim); font-style: italic; }
+.line.error { color: var(--error); }
+
+.job {
+  display: grid;
+  grid-template-columns: auto auto 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 2px 0;
+}
+.job .kind { color: var(--accent); }
+.job .state { color: var(--ok); }
+.job[data-state="failed"] .state { color: var(--error); }
+.job .id { color: var(--dim); }
+.job button.stop { padding: 0 6px; }
+#jobs .empty { color: var(--dim); }
+
+#bar {
+  grid-area: bar;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bar);
+  border-top: 1px solid var(--border);
+  padding: 0 8px;
+}
+.prompt { color: var(--accent); }
+#cmd { flex: 1; min-width: 0; }
+
+/* ---- narrow: the side pane becomes a drawer ---- */
+html[data-footprint="narrow"] #app {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "top" "main" "bar";
+}
+html[data-footprint="narrow"] .brand { display: none; }
+html[data-footprint="narrow"] .src-tab .range { display: none; }
+html[data-footprint="narrow"] #drawer-toggle { display: inline-block; }
+html[data-footprint="narrow"] #side { display: none; }
+html[data-footprint="narrow"][data-drawer="open"] #side {
+  display: flex;
+  position: fixed;
+  top: 34px;
+  bottom: 38px;
+  right: 0;
+  width: min(var(--side-w), 92vw);
+  z-index: 10;
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
+}
