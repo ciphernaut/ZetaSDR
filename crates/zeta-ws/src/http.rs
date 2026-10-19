@@ -358,7 +358,7 @@ pub async fn bind(node: Arc<Node>, cfg: ServerConfig) -> io::Result<Server> {
         agents_md: cfg.agents_md,
         llm: cfg.llm,
         ask_lock: tokio::sync::Mutex::new(()),
-        state_dir: cfg.state_dir,
+        state_dir: std::path::absolute(&cfg.state_dir)?,
         stt_socket: cfg.stt_socket,
     });
     Ok(Server {

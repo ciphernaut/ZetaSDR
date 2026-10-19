@@ -11,10 +11,13 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::http::{Shared, error_response, other};
+
+/// Longest daemon answer line accepted.
+const MAX_REPLY_BYTES: u64 = 64 * 1024;
 
 /// Removes the staged WAV file when dropped, on every path out of the handler.
 struct StagedFile(PathBuf);
@@ -109,8 +112,14 @@ async fn transcribe(socket: &Path, wav: &Path) -> Response {
         return bad_gateway(format!("speech daemon: sending the command: {e}"));
     }
     let mut line = String::new();
-    match BufReader::new(conn).read_line(&mut line).await {
+    match BufReader::new(conn.take(MAX_REPLY_BYTES))
+        .read_line(&mut line)
+        .await
+    {
         Ok(0) => return bad_gateway("speech daemon: closed the connection".into()),
+        Ok(_) if !line.ends_with('\n') && line.len() as u64 >= MAX_REPLY_BYTES => {
+            return bad_gateway("speech daemon: answer too long".into());
+        }
         Ok(_) => {}
         Err(e) => return bad_gateway(format!("speech daemon: reading the answer: {e}")),
     }

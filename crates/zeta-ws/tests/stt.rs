@@ -37,6 +37,19 @@ fn fake_daemon(sock: &Path, reply: &'static str) -> mpsc::UnboundedReceiver<(Pat
     rx
 }
 
+/// A daemon that answers `n` bytes with no newline.
+fn endless_daemon(sock: &Path, n: usize) {
+    let listener = UnixListener::bind(sock).unwrap();
+    tokio::spawn(async move {
+        let (conn, _) = listener.accept().await.unwrap();
+        let (r, mut w) = conn.into_split();
+        let mut line = String::new();
+        BufReader::new(r).read_line(&mut line).await.unwrap();
+        let _ = w.write_all(&vec![b'x'; n]).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    });
+}
+
 async fn with_socket(dir: &Path, sock: &Path, limits: Limits) -> TestServer {
     spawn_with(
         dir,
@@ -189,5 +202,40 @@ async fn stt_times_out_with_504() {
     let ts = with_socket(dir.path(), &sock, limits).await;
     let resp = stt(&ts, "audio/wav", wav(1)).await;
     assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    ts.stop().await;
+}
+
+#[tokio::test]
+async fn stt_bounds_the_daemon_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let socks = tempfile::tempdir().unwrap();
+    let sock = socks.path().join("v.sock");
+    endless_daemon(&sock, 70_000);
+    let ts = with_socket(dir.path(), &sock, Limits::default()).await;
+    let resp = stt(&ts, "audio/wav", wav(1)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["message"], "speech daemon: answer too long");
+    let left = std::fs::read_dir(dir.path().join("state").join("stt"))
+        .unwrap()
+        .count();
+    assert_eq!(left, 0, "no staged file left");
+    ts.stop().await;
+}
+
+#[tokio::test]
+async fn stt_sends_the_daemon_an_absolute_path_for_a_relative_state_dir() {
+    let cwd = std::env::current_dir().unwrap();
+    let held = tempfile::tempdir_in(&cwd).unwrap();
+    let rel = held.path().strip_prefix(&cwd).unwrap().to_path_buf();
+    assert!(rel.is_relative());
+    let socks = tempfile::tempdir().unwrap();
+    let sock = socks.path().join("v.sock");
+    let mut seen = fake_daemon(&sock, "ok:hi\n");
+    let ts = with_socket(&rel, &sock, Limits::default()).await;
+    assert_eq!(stt(&ts, "audio/wav", wav(1)).await.status(), StatusCode::OK);
+    let (path, existed) = seen.recv().await.unwrap();
+    assert!(path.is_absolute(), "{}", path.display());
+    assert!(existed);
     ts.stop().await;
 }
