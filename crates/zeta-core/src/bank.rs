@@ -39,8 +39,17 @@ pub trait ChannelBank: Send + Sync {
     ) -> Result<(IqReceiver, Hz, Hz), BankError>;
     /// Live subscribers across all bins.
     fn consumers(&self) -> usize;
-    /// Feed one block of the source (called by the node, in order).
+    /// Feed one block of the source (called by the node, in order). Must not
+    /// block: an implementation that cannot keep up drops the block and
+    /// counts it in [`ChannelBank::dropped`].
     fn push(&self, block: &IqBlock);
+    /// Input blocks dropped because the bank could not keep up.
+    fn dropped(&self) -> u64 {
+        0
+    }
+    /// Input was lost before reaching the bank (the node's feed lagged):
+    /// start the filter afresh rather than run it across the gap.
+    fn reset(&self) {}
 }
 
 /// Makes the bank for a capture band; `None` when it declines.

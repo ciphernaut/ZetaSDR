@@ -387,3 +387,187 @@ async fn an_out_rate_the_bin_rate_does_not_divide_uses_the_direct_path() {
         r.collect.abort();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bank_that_cannot_keep_up_drops_and_counts() {
+    let bank = bank();
+    let (mut rx, _, _) = bank.subscribe(CENTER, 200_000).unwrap();
+    // 400 blocks queued at once: far more than the 64-block input queue.
+    let b = block(0);
+    for _ in 0..400 {
+        bank.push(&b);
+    }
+    let dropped = bank.dropped();
+    assert!(dropped > 0, "nothing dropped");
+    // What was queued still comes out (the bin channel keeps the newest 64).
+    let mut got = 0u64;
+    let mut lagged = 0u64;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(_)) => got += 1,
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => lagged += n,
+            _ => break,
+        }
+        if got + lagged + dropped == 400 {
+            break;
+        }
+    }
+    assert_eq!(
+        got + lagged + dropped,
+        400,
+        "got {got} lagged {lagged} dropped {dropped}"
+    );
+}
+
+/// A port whose band the test changes behind the lease (as a remote node or
+/// a device could), sending blocks by hand.
+struct Retunable {
+    id: SourceId,
+    caps: zeta_core::types::Capabilities,
+    band: Mutex<zeta_core::port::Tuning>,
+    tx: broadcast::Sender<IqBlock>,
+}
+
+#[async_trait::async_trait]
+impl zeta_core::port::Port for Retunable {
+    fn id(&self) -> &SourceId {
+        &self.id
+    }
+    fn capabilities(&self) -> &zeta_core::types::Capabilities {
+        &self.caps
+    }
+    async fn tune(
+        &self,
+        _: zeta_core::port::Tuning,
+    ) -> Result<zeta_core::port::Tuning, zeta_core::port::PortError> {
+        Ok(*self.band.lock().unwrap())
+    }
+    fn current(&self) -> Option<zeta_core::port::Tuning> {
+        Some(*self.band.lock().unwrap())
+    }
+    fn subscribe(&self) -> zeta_core::port::IqReceiver {
+        self.tx.subscribe()
+    }
+}
+
+struct CountingPfb(std::sync::atomic::AtomicUsize);
+
+impl BankFactory for CountingPfb {
+    fn make(&self, rate_hz: Hz, center_hz: Hz) -> Option<Arc<dyn ChannelBank>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PfbBankFactory.make(rate_hz, center_hz)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
+    use zeta_core::graph::{Graph, GraphId, Node as GraphNode, NodeId};
+    use zeta_core::job::JobState;
+    use zeta_core::node::{Node, NodeConfig};
+    use zeta_core::port::Tuning;
+    use zeta_core::stage::{Backend, StageRegistry};
+    use zeta_core::types::{Capabilities, Claim, SampleFormat};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = StageRegistry::new();
+    zeta_dsp::register_all(&mut reg);
+    let cfg = NodeConfig {
+        state_dir: dir.path().join("state"),
+        ring_seconds: 1.0,
+        backends: vec![Backend::Cpu],
+        resume: true,
+    };
+    let node = Node::open(cfg, reg, vec![]).await.unwrap();
+    let factory = Arc::new(CountingPfb(Default::default()));
+    node.set_bank_factory(factory.clone());
+    let band = Tuning {
+        center_hz: Hz(CENTER),
+        bandwidth_hz: Hz(RATE),
+    };
+    let port = Arc::new(Retunable {
+        id: SourceId("wide".into()),
+        caps: Capabilities {
+            tune_min_hz: Claim::Asserted(Hz(1_000_000)),
+            tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
+            max_bandwidth_hz: Claim::Asserted(Hz(RATE)),
+            formats: vec![SampleFormat::Cf32],
+            channels: 1,
+            rx: true,
+            tx: false,
+            remote: false,
+            push: false,
+        },
+        band: Mutex::new(band),
+        tx: broadcast::channel(64).0,
+    });
+    node.add_port(port.clone()).unwrap();
+    let graph = Graph {
+        id: GraphId::new(),
+        nodes: vec![GraphNode {
+            id: NodeId("ch".into()),
+            kind: "channel".into(),
+            params: serde_json::json!({
+                "center_hz": CENTER + 500_000,
+                "bandwidth_hz": 200_000,
+                "out_rate_hz": OUT_RATE,
+            }),
+        }],
+        edges: vec![],
+    };
+    let job = node
+        .job_start(
+            "fm_demod",
+            port.id.clone(),
+            Tuning {
+                center_hz: Hz(CENTER + 500_000),
+                bandwidth_hz: Hz(200_000),
+            },
+            graph,
+        )
+        .await
+        .unwrap();
+    let bank = node.bank(&port.id).unwrap();
+    until("the stage on the bank", || bank.consumers() == 1).await;
+    for i in 0..4 {
+        let _ = port.tx.send(block(i));
+    }
+
+    // The band moves under the job: blocks now come at another centre.
+    let moved = Tuning {
+        center_hz: Hz(CENTER + 2_000_000),
+        bandwidth_hz: Hz(RATE),
+    };
+    *port.band.lock().unwrap() = moved;
+    let failed = |node: &Node| {
+        node.job_list()
+            .into_iter()
+            .find(|r| r.id == job)
+            .and_then(|r| match r.state {
+                JobState::Failed { reason } => Some(reason),
+                _ => None,
+            })
+    };
+    for i in 4..2000 {
+        let mut b = block(i);
+        b.center_hz = moved.center_hz;
+        let _ = port.tx.send(b);
+        if failed(&node).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let reason = failed(&node).expect("the job failed");
+    assert!(
+        reason.contains("capture band changed") && reason.contains("restart the job"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&(CENTER + 2_000_000).to_string()),
+        "{reason}"
+    );
+    until("the new bank", || {
+        factory.0.load(std::sync::atomic::Ordering::SeqCst) == 2
+    })
+    .await;
+    assert_eq!(node.bank(&port.id).unwrap().band(), moved);
+}

@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::port::{IqBlock, IqReceiver};
+use zeta_core::port::{IqBlock, IqReceiver, Tuning};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{ChannelId, Hz, Provenance, StreamId, StreamKind, Timestamp};
@@ -291,7 +291,7 @@ impl Stage for ChannelStage {
                     channel: None,
                     span: frame_span(Timestamp(0), 0, 0),
                 });
-            return run_bin(chan, base, bin, inputs, bus, cancel).await;
+            return run_bin(chan, base, bank.band(), bin, inputs, bus, cancel).await;
         }
         run_map(inputs, bus, cancel, move |input| {
             let frame = match input {
@@ -360,11 +360,15 @@ impl Channel {
     }
 }
 
-/// The bank path: filter the bin stream `bin`, ending cleanly when the job's
-/// IQ input or the bin closes. A lagging bin resets the filter state.
+/// The bank path: filter the bin stream `bin` of a bank over `band`, ending
+/// cleanly when the job's IQ input closes. A lagging bin resets the filter
+/// state. The stage fails when a job IQ block shows the capture has left
+/// `band` (the node then makes a new bank this stage is not on) or when the
+/// bin closes.
 async fn run_bin(
     mut chan: Channel,
     base: Provenance,
+    band: Tuning,
     mut bin: IqReceiver,
     inputs: Vec<broadcast::Receiver<Frame>>,
     bus: Arc<StreamBus>,
@@ -390,10 +394,24 @@ async fn run_bin(
                     eprintln!("zeta-dsp: channel lagged its bank bin, {n} blocks skipped");
                     chan.state = ChannelState::new();
                 }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(StageError::Failed(
+                        "channel bank bin closed; restart the job".into(),
+                    ));
+                }
             },
             r = root.recv() => match r {
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(frame) => {
+                    if let Payload::Iq(b) = &frame.payload
+                        && (b.center_hz, b.sample_rate_hz) != (band.center_hz, band.bandwidth_hz)
+                    {
+                        return Err(StageError::Failed(format!(
+                            "capture band changed from center {} Hz, rate {} Hz to center {} Hz, rate {} Hz; restart the job",
+                            band.center_hz.0, band.bandwidth_hz.0, b.center_hz.0, b.sample_rate_hz.0
+                        )));
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
         }

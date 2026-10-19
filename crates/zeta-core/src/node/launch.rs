@@ -292,15 +292,30 @@ pub(super) async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqRec
     }
 }
 
-/// Push a port's blocks into its channel bank. The first block of a new
-/// capture band (rate or centre) replaces the bank with one for that band.
+/// Forward a port's blocks to its channel bank, which does its filtering
+/// elsewhere ([`ChannelBank::push`] never blocks). The first block of a new
+/// capture band (rate or centre) replaces the bank with one for that band. A
+/// lag (blocks lost before the bank) resets the bank.
+///
+/// [`ChannelBank::push`]: crate::bank::ChannelBank::push
 pub(super) async fn feed_bank(inner: Arc<Inner>, source: SourceId, mut rx: IqReceiver) {
     loop {
         let block = tokio::select! {
             _ = inner.shutdown.cancelled() => return,
             r = rx.recv() => match r {
                 Ok(b) => b,
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(_)) => {
+                    let bank = inner
+                        .banks
+                        .lock()
+                        .unwrap()
+                        .get(&source)
+                        .and_then(|s| s.bank.clone());
+                    if let Some(bank) = bank {
+                        bank.reset();
+                    }
+                    continue;
+                }
                 Err(RecvError::Closed) => return,
             },
         };
