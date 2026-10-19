@@ -73,6 +73,9 @@ pub enum Op {
     IqRead {
         selection: Selection,
     },
+    /// List the streams: id, kind and provenance. One is always the node's
+    /// own `ops` event stream (provenance source `node`): one event per
+    /// applied operation with its outcome, logged after the operation completes.
     StreamList {},
     /// Collect frames from a stream until `max_frames` (1..=1000) arrive or
     /// `timeout_ms` (1..=10000) passes, whichever is first; frames published
@@ -441,6 +444,73 @@ pub enum OpResult {
     Labels(Vec<Label>),
     Ok,
     Schema(serde_json::Value),
+}
+
+impl OpResult {
+    /// The snake_case tag this variant serialises under `result`.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            OpResult::Sources(_) => "sources",
+            OpResult::Tuning(_) => "tuning",
+            OpResult::Job(_) => "job",
+            OpResult::Jobs(_) => "jobs",
+            OpResult::Context(_) => "context",
+            OpResult::Iq { .. } => "iq",
+            OpResult::Streams(_) => "streams",
+            OpResult::Frames { .. } => "frames",
+            OpResult::Graph(_) => "graph",
+            OpResult::Knowledge { .. } => "knowledge",
+            OpResult::Labels(_) => "labels",
+            OpResult::Ok => "ok",
+            OpResult::Schema(_) => "schema",
+        }
+    }
+
+    /// The result as JSON for the `ops` stream: the full value when it fits
+    /// in [`OPS_RESULT_LIMIT_BYTES`], otherwise
+    /// `{"result": <variant>, "truncated": true, "bytes": n}`. A value that
+    /// fails to serialise is summarised with `bytes: 0`.
+    pub fn summary_json(&self) -> serde_json::Value {
+        let summary = |bytes: usize| serde_json::json!({"result": self.variant_name(), "truncated": true, "bytes": bytes});
+        match serde_json::to_vec(self) {
+            Ok(buf) if buf.len() > OPS_RESULT_LIMIT_BYTES => summary(buf.len()),
+            Ok(buf) => serde_json::from_slice(&buf).unwrap_or_else(|_| summary(0)),
+            Err(_) => summary(0),
+        }
+    }
+}
+
+/// Largest result JSON, in bytes, carried whole on the `ops` stream.
+pub const OPS_RESULT_LIMIT_BYTES: usize = 8192;
+
+/// The `ops` stream's event payload for one applied operation:
+/// `{"op", "outcome": "ok"|"error", "result"|"error", "elapsed_ms",
+/// "transport": "local"}`; see [`OpResult::summary_json`] for large results.
+pub fn ops_payload(
+    op: &Op,
+    outcome: &Result<OpResult, OpError>,
+    elapsed_ms: u64,
+) -> serde_json::Value {
+    let op = serde_json::to_value(op)
+        .unwrap_or_else(|e| serde_json::json!({"op": null, "serialise_error": e.to_string()}));
+    let mut v = serde_json::json!({
+        "op": op,
+        "elapsed_ms": elapsed_ms,
+        "transport": "local",
+    });
+    match outcome {
+        Ok(r) => {
+            v["outcome"] = "ok".into();
+            v["result"] = r.summary_json();
+        }
+        Err(e) => {
+            v["outcome"] = "error".into();
+            v["error"] = serde_json::to_value(e).unwrap_or_else(
+                |_| serde_json::json!({"error": "other", "message": e.to_string()}),
+            );
+        }
+    }
+    v
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

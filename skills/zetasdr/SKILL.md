@@ -108,6 +108,8 @@ CLI: `zeta iq read --source <id> --start-ns 1760000000000000000 --end-ns 1760000
 
 ### stream_list
 
+List the streams: id, kind and provenance. One is always the node's own `ops` event stream (provenance source `node`): one event per applied operation with its outcome, logged after the operation completes.
+
 JSON: `{"op":"stream_list"}`
 
 CLI: `zeta stream list`

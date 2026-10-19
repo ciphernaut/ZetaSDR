@@ -20,13 +20,27 @@ use crate::ops::{Op, OpError, OpResult};
 use crate::port::{Port, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Backend, StageRegistry};
-use crate::stream::StreamBus;
-use crate::types::{Capabilities, JobId, SourceId};
+use crate::stream::{Frame, Payload, StreamBus};
+use crate::types::{Capabilities, JobId, Provenance, SourceId, Span, StreamId, StreamKind};
+
+pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
 
 use launch::feed_ring;
 use persist::{io, load, now, persist};
 
 const BUS_CAPACITY: usize = 256;
+
+/// Provenance source of the node's own streams (the `ops` stream).
+pub const NODE_SOURCE: &str = "node";
+
+fn node_provenance(span: Span) -> Provenance {
+    Provenance {
+        source: SourceId(NODE_SOURCE.into()),
+        job: None,
+        channel: None,
+        span,
+    }
+}
 
 pub struct NodeConfig {
     pub state_dir: PathBuf,
@@ -84,6 +98,8 @@ struct Inner {
 pub struct Node {
     inner: Arc<Inner>,
     load_errors: Vec<String>,
+    /// The `ops` event stream: one frame per [`Node::apply`].
+    ops_stream: StreamId,
 }
 
 impl Drop for Node {
@@ -110,6 +126,17 @@ impl Node {
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (records, load_errors) = load(&jobs_dir)?;
         let resume = cfg.resume;
+        let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
+        // Registered before jobs resume; their internal applies bypass
+        // `Node::apply` and are never logged.
+        let t = now();
+        let ops_stream = bus.register(
+            StreamKind::Event,
+            node_provenance(Span {
+                start_ns: t,
+                end_ns: t,
+            }),
+        );
         let node = Node {
             inner: Arc::new(Inner {
                 state_dir: cfg.state_dir.clone(),
@@ -118,7 +145,7 @@ impl Node {
                 backends: cfg.backends,
                 registry,
                 leases: LeaseManager::new(),
-                bus: Arc::new(StreamBus::new(BUS_CAPACITY)),
+                bus,
                 ports: RwLock::new(HashMap::new()),
                 rings: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
@@ -128,6 +155,7 @@ impl Node {
                 shutdown: CancellationToken::new(),
             }),
             load_errors,
+            ops_stream,
         };
         for port in ports {
             node.add_port(port)?;
@@ -236,9 +264,31 @@ impl Node {
         v
     }
 
-    /// Apply one operation; see [`crate::ops`].
+    /// Apply one operation; see [`crate::ops`]. Once it completes, success
+    /// or failure, one [`crate::ops::ops_payload`] event is published on
+    /// [`Node::ops_stream`] (so a tail of that stream never sees its own record).
     pub async fn apply(&self, op: Op) -> Result<OpResult, OpError> {
-        crate::ops::apply(self, op).await
+        let logged = op.clone();
+        let start_ns = now();
+        let started = std::time::Instant::now();
+        let outcome = crate::ops::apply(self, op).await;
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let payload = crate::ops::ops_payload(&logged, &outcome, elapsed_ms);
+        self.inner.bus.publish(Frame::new(
+            self.ops_stream.clone(),
+            node_provenance(Span {
+                start_ns,
+                end_ns: now(),
+            }),
+            Payload::Event(payload),
+        ));
+        outcome
+    }
+
+    /// The `ops` event stream: kind `Event`, provenance source
+    /// [`NODE_SOURCE`], one frame per [`Node::apply`].
+    pub fn ops_stream(&self) -> StreamId {
+        self.ops_stream.clone()
     }
 
     pub fn ports(&self) -> Vec<(SourceId, Capabilities)> {
