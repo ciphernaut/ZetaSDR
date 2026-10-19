@@ -303,7 +303,11 @@ impl JobKind {
                 nodes: vec![GraphNode {
                     id: NodeId::new(),
                     kind: "fft".into(),
-                    params: serde_json::json!({"size": 1024, "window": "hann"}),
+                    params: serde_json::json!({
+                        "size": spectrum_size(tuning.bandwidth_hz.0),
+                        "window": "hann",
+                        "rows_per_s": SPECTRUM_ROWS_PER_S,
+                    }),
                 }],
                 edges: vec![],
             },
@@ -469,6 +473,24 @@ impl JobKind {
 /// The audio rate every demodulating job kind outputs; the demod stage
 /// resamples from the channel rate to this.
 pub const AUDIO_RATE_HZ: u64 = 48_000;
+
+/// Target spectrum resolution: a job's FFT has about one bin per this many Hz of band.
+pub const SPECTRUM_BIN_TARGET_HZ: u64 = 6_000;
+/// Smallest and largest FFT size a `spectrum` (or `scan`) job uses.
+pub const SPECTRUM_SIZE_MIN: u32 = 1024;
+pub const SPECTRUM_SIZE_MAX: u32 = 8192;
+/// Spectrum rows per second of signal time.
+pub const SPECTRUM_ROWS_PER_S: u32 = 20;
+
+/// FFT size for a spectrum of `bandwidth_hz`: the smallest power of two at least
+/// `bandwidth_hz / SPECTRUM_BIN_TARGET_HZ`, clamped to
+/// `SPECTRUM_SIZE_MIN..=SPECTRUM_SIZE_MAX`.
+pub fn spectrum_size(bandwidth_hz: u64) -> u32 {
+    let want = bandwidth_hz.div_ceil(SPECTRUM_BIN_TARGET_HZ).max(1);
+    want.checked_next_power_of_two()
+        .unwrap_or(u64::MAX)
+        .clamp(SPECTRUM_SIZE_MIN as u64, SPECTRUM_SIZE_MAX as u64) as u32
+}
 
 /// The lowest channel output rate a job is channelised at.
 pub const CHANNEL_RATE_MIN_HZ: u64 = 48_000;

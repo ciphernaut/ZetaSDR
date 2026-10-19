@@ -243,6 +243,25 @@ def scenario_waterfall_paints(page, url, secret):
         assert 99.976 <= v <= 100.024 and t == f"{v:.3f}", f"tick {t!r} in {ticks}"
 
 
+def scenario_waterfall_decodes_quantised_rows(page, url, secret):
+    # The node sends spectrum event v2 (`q`, `floor_db`, `step_db`); the waterfall paints
+    # them straight from the u8 levels, and still decodes an older node's `db` rows.
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.lastRowFormat !== null", timeout=5_000)
+    fmt = page.evaluate("window.zetaTest.lastRowFormat")
+    assert fmt == "q", f"lastRowFormat {fmt!r}"
+    rows = page.evaluate("""async () => {
+      const m = await import('./waterfall.js');
+      const q = m.decodeRow({size: 4, q: [0, 2, 255, 7], floor_db: -120, step_db: 0.5});
+      const db = m.decodeRow({size: 2, db: [-90.5, -30]});
+      return {qType: q.q.constructor.name, q: Array.from(q.q), floor: q.floorDb,
+              step: q.stepDb, dbType: db.db.constructor.name, db: Array.from(db.db),
+              none: m.decodeRow({label: {name: 'x'}})};
+    }""")
+    assert rows == {"qType": "Uint8Array", "q": [0, 2, 255, 7], "floor": -120, "step": 0.5,
+                    "dbType": "Float32Array", "db": [-90.5, -30], "none": None}, rows
+
+
 def stop_spectrum_jobs(url, secret, source):
     """Stop every running spectrum job on `source` through the API."""
     for j in running_spectrum_jobs(url, secret, source):

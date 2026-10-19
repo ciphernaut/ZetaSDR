@@ -62,7 +62,7 @@ fails if the committed file has drifted.
 Eight job kinds, chosen with `job start --kind` (`zeta job start --help` lists them):
 
 - `passthrough` copies the channel IQ through unchanged.
-- `spectrum` emits one power-spectrum event per 100 ms frame (`size` 1024, `bin_hz`, `db` array).
+- `spectrum` emits spectrum rows at 20 per second of signal time, each the power average of every FFT since the previous row (spectrum event v2): `size` (the smallest power of two at least `bandwidth_hz / 6000`, 1024 to 8192), `bin_hz`, `rows_per_s`, `center_hz`, and the row quantised as `q` (one 0-255 level per bin, lowest frequency first) with `floor_db` and `step_db` (0.5): `db = floor_db + q * step_db`. `floor_db` is the row's 2nd-percentile bin minus 5 dB, so levels more than 127.5 dB above it clip at 255.
 - `fm_demod` channelises and demodulates narrowband FM to an audio stream (48 kHz, per-frame `peak`); `--deviation-hz` sets the peak deviation (default 5000).
 - `wfm_demod` does the same for wideband broadcast FM: `--deviation-hz` default 75000, 50 µs de-emphasis (the stage also takes 75 µs, set in its graph with `graph put`), 15 kHz mono audio at 48 kHz.
 - `am_demod` does the same for AM voice (envelope detector, 5 kHz audio at 48 kHz, slow AGC to a steady level; give it about 10 kHz of band).
@@ -124,7 +124,8 @@ $Z $S --source-file aprs=scratch/fx/aprs.sigmf-meta job start --kind aprs_decode
 $Z $S --source-file tone=scratch/fx/tone.sigmf-meta job start --kind fm_demod --source tone \
     --center-hz 100000000 --bandwidth-hz 12500 --then-tail 5,3000
 
-# spectrum: one event, "size": 1024, "bin_hz": 46.875, "db": [-180.99, -179.14, -181.65, ...]
+# spectrum: one event, "size": 1024, "bin_hz": 46.875, "rows_per_s": 20, "floor_db": -190.63,
+# "step_db": 0.5, "q": [18, 21, 15, ...] (the tone clips at 255 in the middle bins)
 $Z $S --source-file tone=scratch/fx/tone.sigmf-meta job start --kind spectrum --source tone \
     --center-hz 100000000 --bandwidth-hz 12500 --then-tail 1,3000
 

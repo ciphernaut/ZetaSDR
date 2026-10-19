@@ -14,6 +14,10 @@
 //     wf.sourceId   id of the source being shown (null when none, or after setSource failed)
 //     wf.jobId      the followed job's id (null until known)
 //     wf.painted    columns painted since mount (never reset; for tests)
+//     wf.lastRowFormat  "q" (spectrum event v2) or "db" (older nodes) for the last painted
+//         row; null before the first
+//     wf.rows       ring of RING_COLUMNS painted rows, slot = column % RING_COLUMNS: {q:
+//         Uint8Array, floorDb, stepDb} for v2 rows, {db: Float32Array} for older ones
 //     wf.onSelect(cb)   cb({centerHz, bandwidthHz, startNs, endNs}) after a drag; the same
 //         object is kept in window.zetaLastSelection.
 //     wf.onColumn(cb)   cb(shiftCssPx) after each painted column: everything painted moved
@@ -33,9 +37,13 @@
 // Layout: frequency is vertical (highest at the top), time runs right to left: each event
 // becomes one CSS-pixel column (Math.round(devicePixelRatio) backing pixels, at least 1) at
 // the right edge after the canvas is shifted left by that much with drawImage. At most
-// MAX_ROWS_PER_S columns per second are painted; extra events are dropped. Colour: dB
-// clamped to [floor - 10, floor + 60], floor being the 15th percentile of the column's own
-// dB values, through a 256-entry blue-yellow-white ramp. The frequency
+// MAX_ROWS_PER_S columns per second are painted; extra events are dropped. Rows: spectrum
+// event v2 (`q` of up to 8192 u8 levels with `floor_db` and `step_db`, db = floor_db +
+// q * step_db) is decoded straight into colour through a 256-entry lookup table, without a
+// float array; an older node's `db` array is still drawn. Each canvas pixel row shows the
+// strongest bin it covers (bins are mapped onto the canvas height across the band). Colour:
+// dB clamped to [floor - 10, floor + 60], floor being the 15th percentile of the row's own
+// values, through a 256-entry blue-yellow-white ramp. The frequency
 // band comes from each event (`center_hz`, `size * bin_hz`), falling back to the job's tuning.
 // Per-column start_ns/end_ns are kept in a ring of RING_COLUMNS for the selection's time span.
 //
@@ -106,6 +114,40 @@ function percentile(values, p) {
   return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
 }
 
+const toRamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+const COLOUR_SCALE = 255 / (BELOW_FLOOR_DB + ABOVE_FLOOR_DB);
+
+// Ramp index per level 0..255 of a v2 row: the 15th-percentile level found by counting.
+function qLut(q, floorDb, stepDb) {
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < q.length; i++) hist[q[i]]++;
+  const target = Math.min(q.length - 1, Math.floor(FLOOR_PERCENTILE * q.length));
+  let acc = 0;
+  let q15 = 0;
+  for (; q15 < 256; q15++) {
+    acc += hist[q15];
+    if (acc > target) break;
+  }
+  const lut = new Uint8Array(256);
+  for (let v = 0; v < 256; v++) lut[v] = toRamp((v - q15) * stepDb * COLOUR_SCALE + BELOW_FLOOR_DB * COLOUR_SCALE);
+  return lut;
+}
+
+// The row of a spectrum event: {q, floorDb, stepDb} (v2), {db} (older nodes) or null.
+export function decodeRow(p) {
+  if (!p || typeof p !== "object") return null;
+  if (
+    Array.isArray(p.q) &&
+    p.q.length &&
+    typeof p.floor_db === "number" &&
+    typeof p.step_db === "number"
+  ) {
+    return { q: Uint8Array.from(p.q), floorDb: p.floor_db, stepDb: p.step_db };
+  }
+  if (Array.isArray(p.db) && p.db.length) return { db: Float32Array.from(p.db) };
+  return null;
+}
+
 // ---- source band -----------------------------------------------------------------------
 
 function capHz(cap) {
@@ -157,6 +199,8 @@ class Waterfall {
     this.painted = 0; // columns painted since mount (never reset)
     this.ringStart = new Array(RING_COLUMNS).fill(0);
     this.ringEnd = new Array(RING_COLUMNS).fill(0);
+    this.rows = new Array(RING_COLUMNS).fill(null);
+    this.lastRowFormat = null;
     this.drag = null;
 
     this.axis = document.createElement("div");
@@ -428,18 +472,21 @@ class Waterfall {
 
   addEvent(msg) {
     const p = msg.payload;
-    if (!p || !Array.isArray(p.db) || !p.db.length) return;
+    const row = decodeRow(p);
+    if (!row) return;
     const now = performance.now();
     if (now - this.lastPaint < 1000 / MAX_ROWS_PER_S) return;
     this.lastPaint = now;
-    const size = p.db.length;
+    const size = row.q ? row.q.length : row.db.length;
     if (typeof p.center_hz === "number" && typeof p.bin_hz === "number") {
       this.setBand(p.center_hz, p.bin_hz * size);
     } else if (this.tuning) {
       this.setBand(this.tuning.center_hz, this.tuning.bandwidth_hz);
     }
-    this.paintColumn(p.db);
+    this.paintColumn(row);
+    this.lastRowFormat = row.q ? "q" : "db";
     const slot = this.columns % RING_COLUMNS;
+    this.rows[slot] = row;
     this.ringStart[slot] = Number(msg.start_ns) || 0;
     this.ringEnd[slot] = Number(msg.end_ns) || this.ringStart[slot];
     this.columns += 1;
@@ -455,23 +502,33 @@ class Waterfall {
     this.columnCbs.push(cb);
   }
 
-  paintColumn(db) {
+  // `row` from decodeRow. Levels are compared as stored (q is monotonic in dB) and turned
+  // into a ramp index only for the strongest bin of each pixel row.
+  paintColumn(row) {
     const w = this.canvas.width;
     const h = this.canvas.height;
     const cw = Math.min(this.column.width, w); // backing pixels per event
-    const size = db.length;
-    const floor = percentile(db, FLOOR_PERCENTILE);
-    const lo = floor - BELOW_FLOOR_DB;
-    const scale = 255 / (BELOW_FLOOR_DB + ABOVE_FLOOR_DB);
+    let levels;
+    let colour;
+    if (row.q) {
+      levels = row.q;
+      const lut = qLut(row.q, row.floorDb, row.stepDb);
+      colour = (v) => lut[v];
+    } else {
+      levels = row.db;
+      const lo = percentile(row.db, FLOOR_PERCENTILE) - BELOW_FLOOR_DB;
+      colour = (v) => toRamp((v - lo) * COLOUR_SCALE);
+    }
+    const size = levels.length;
     const px = this.column.data;
     for (let y = 0; y < h; y++) {
       // Row y covers bins [b0, b1) counted from the top (highest frequency, last bin);
       // the strongest bin wins so a narrow carrier stays visible when bins outnumber rows.
-      const b0 = Math.floor((1 - (y + 1) / h) * size);
+      const b0 = Math.min(size - 1, Math.floor((1 - (y + 1) / h) * size));
       const b1 = Math.max(b0 + 1, Math.floor((1 - y / h) * size));
-      let v = -Infinity;
-      for (let b = b0; b < b1 && b < size; b++) if (db[b] > v) v = db[b];
-      const idx = Math.max(0, Math.min(255, Math.round((v - lo) * scale))) * 3;
+      let v = levels[b0];
+      for (let b = b0 + 1; b < b1 && b < size; b++) if (levels[b] > v) v = levels[b];
+      const idx = colour(v) * 3;
       for (let x = 0; x < cw; x++) {
         const o = (y * this.column.width + x) * 4;
         px[o] = RAMP[idx];

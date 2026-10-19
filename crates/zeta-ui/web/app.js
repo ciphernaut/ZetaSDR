@@ -425,9 +425,13 @@ function answerRibbon(text) {
 }
 
 // Hooks for the e2e scenarios: simulate a changed secret, force a jobs poll, and read what
-// the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall), and
+// the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall), the
+// format of the last painted spectrum row (`lastRowFormat`: "q" or "db", null before one), and
 // draw the narrow-footprint answer ribbon for `text` without an LLM (ruling R3).
 window.zetaTest = {
+  get lastRowFormat() {
+    return state.wf ? state.wf.lastRowFormat : null;
+  },
   ribbon(text) {
     answerRibbon(text);
   },

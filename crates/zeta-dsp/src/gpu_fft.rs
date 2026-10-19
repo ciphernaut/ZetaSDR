@@ -1,6 +1,6 @@
 //! GPU FFT backend (feature `gpu`): the per-chunk `|X|^2` runs in a wgpu compute
-//! shader; windowing, averaging, normalisation, fftshift and dB stay in
-//! [`chunk_average`], shared with [`CpuFft`], so both backends have identical
+//! shader; windowing, summing, normalisation and fftshift stay in
+//! [`chunk_power`], shared with [`CpuFft`], so both backends have identical
 //! semantics.
 //!
 //! The shader is a direct O(N^2) DFT, one invocation per output bin. It proves
@@ -14,7 +14,7 @@ use num_complex::Complex;
 use wgpu::util::DeviceExt;
 use zeta_core::stage::Backend;
 
-use crate::fft::{CpuFft, FftBackend, Window, chunk_average};
+use crate::fft::{CpuFft, FftBackend, PowerSum, Window, chunk_power};
 
 const WORKGROUP: u32 = 64;
 
@@ -67,7 +67,7 @@ impl GpuFft {
         &self.shared.adapter
     }
 
-    /// How many `power_spectrum_db` calls fell back to the CPU after a GPU failure.
+    /// How many `power_sum` calls fell back to the CPU after a GPU failure.
     pub fn fallbacks(&self) -> u64 {
         self.fallbacks.load(Ordering::Relaxed)
     }
@@ -198,10 +198,10 @@ impl GpuFft {
         x: &[Complex<f32>],
         size: usize,
         window: Window,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<PowerSum, String> {
         let twiddles = self.twiddles(size)?;
         let failure = std::cell::RefCell::new(None);
-        let db = chunk_average(x, size, window, |chunk| {
+        let sum = chunk_power(x, size, window, |chunk| {
             if failure.borrow().is_some() {
                 return vec![0.0; size];
             }
@@ -212,7 +212,7 @@ impl GpuFft {
         });
         match failure.into_inner() {
             Some(e) => Err(e),
-            None => Ok(db),
+            None => Ok(sum),
         }
     }
 }
@@ -269,11 +269,11 @@ impl FftBackend for GpuFft {
         Backend::Gpu
     }
 
-    fn power_spectrum_db(&self, x: &[Complex<f32>], size: usize, window: Window) -> Vec<f32> {
+    fn power_sum(&self, x: &[Complex<f32>], size: usize, window: Window) -> PowerSum {
         self.try_spectrum(x, size, window).unwrap_or_else(|reason| {
             self.fallbacks.fetch_add(1, Ordering::Relaxed);
             eprintln!("zeta-dsp: gpu fft failed ({reason}); computed on cpu");
-            self.cpu.power_spectrum_db(x, size, window)
+            self.cpu.power_sum(x, size, window)
         })
     }
 }

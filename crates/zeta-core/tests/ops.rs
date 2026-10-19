@@ -934,8 +934,33 @@ fn spectrum_kind_expands_to_single_fft_node() {
     assert_eq!(g.nodes[0].kind, "fft");
     assert_eq!(
         g.nodes[0].params,
-        serde_json::json!({"size": 1024, "window": "hann"})
+        serde_json::json!({"size": 1024, "window": "hann", "rows_per_s": 20})
     );
+}
+
+#[test]
+fn spectrum_expansion_picks_size_from_the_band() {
+    let size = |bw: u64| {
+        let g = JobKind::Spectrum
+            .expand(
+                &SourceId("file0".into()),
+                Tuning {
+                    center_hz: Hz(100_000_000),
+                    bandwidth_hz: Hz(bw),
+                },
+                Hz(bw),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(g.nodes[0].params["rows_per_s"], 20);
+        assert_eq!(g.nodes[0].params["window"], "hann");
+        g.nodes[0].params["size"].as_u64().unwrap()
+    };
+    assert_eq!(size(48_000), 1024);
+    assert_eq!(size(24_000_000), 4096);
+    assert_eq!(size(50_000_000), 8192);
 }
 
 #[test]

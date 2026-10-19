@@ -207,7 +207,7 @@ class Overlays {
   render(rec, p) {
     const job = rec.job;
     const obj = p && typeof p === "object" && !Array.isArray(p);
-    if (obj && Array.isArray(p.db)) return;
+    if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
     // Every non-spectrum event counts in the job row, whatever its shape.
     const n = (this.counters.get(job.id) || 0) + 1;
     this.counters.set(job.id, n);
