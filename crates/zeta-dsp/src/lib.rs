@@ -200,7 +200,8 @@ mod tests {
     }
 
     /// Every object schema with properties denies unknown fields and requires
-    /// every property (optional values are required-nullable).
+    /// every property (optional values are required-nullable), except one
+    /// with a schema `default`, which older persisted graphs may lack.
     fn check_strict(v: &Value, path: &str) {
         match v {
             Value::Object(m) => {
@@ -210,7 +211,11 @@ mod tests {
                         Some(&Value::Bool(false)),
                         "{path} allows extra fields"
                     );
-                    let mut want: Vec<&str> = props.keys().map(String::as_str).collect();
+                    let mut want: Vec<&str> = props
+                        .iter()
+                        .filter(|(_, p)| p.get("default").is_none())
+                        .map(|(k, _)| k.as_str())
+                        .collect();
                     let mut req: Vec<&str> = m
                         .get("required")
                         .and_then(Value::as_array)

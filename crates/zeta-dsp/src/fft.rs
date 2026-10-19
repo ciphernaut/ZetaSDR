@@ -176,9 +176,14 @@ pub struct FftParams {
     #[schemars(schema_with = "size_schema")]
     pub size: u32,
     pub window: Window,
-    /// Rows per second of signal time.
-    #[schemars(range(min = 1, max = 60))]
+    /// Rows per second of signal time; graphs persisted before it existed get 20.
+    #[serde(default = "rows_per_s_default")]
+    #[schemars(range(min = 1, max = 60), default = "rows_per_s_default")]
     pub rows_per_s: u32,
+}
+
+fn rows_per_s_default() -> u32 {
+    zeta_core::ops::SPECTRUM_ROWS_PER_S
 }
 
 /// Quantisation step of a row's `q` values.

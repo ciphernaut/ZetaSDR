@@ -212,7 +212,6 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - outputs: event
 - params.size: integer
 - params.window: string (Window: hann|rect)
-- params.rows_per_s: integer
 
 ### measure
 
