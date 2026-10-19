@@ -5,14 +5,16 @@ spectrum and exposes "what is there, what is it, decode it" as typed operations 
 script or an LLM can invoke. This branch is the core node (ports and leases, IQ ring, stream bus,
 jobs, the operation set, a SigMF file source and the `zeta` CLI) and the DSP slice (channel
 extraction, spectrum, NBFM demodulation, APRS decoding, layer-1 measurement and classifiers),
-with the transports and agent of plan 3 and the hardware and foreign sources of plan 4 (KiwiSDR,
-SoapySDR, external-process stages).
+with the transports and agent of plan 3, the hardware and foreign sources of plan 4 (KiwiSDR,
+SoapySDR, external-process stages) and the federation of plan 5 (another node as a source, VITA
+49.2 over the websocket and UDP, a Pi 5 build).
 
 Design: [docs/superpowers/specs/2026-10-18-zetasdr-design.md](docs/superpowers/specs/2026-10-18-zetasdr-design.md).
 Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2026-10-18-core-node.md),
 [docs/superpowers/plans/2026-10-18-dsp-slice.md](docs/superpowers/plans/2026-10-18-dsp-slice.md),
 [docs/superpowers/plans/2026-10-18-transports-agent.md](docs/superpowers/plans/2026-10-18-transports-agent.md),
-[docs/superpowers/plans/2026-10-19-hardware-sources.md](docs/superpowers/plans/2026-10-19-hardware-sources.md).
+[docs/superpowers/plans/2026-10-19-hardware-sources.md](docs/superpowers/plans/2026-10-19-hardware-sources.md),
+[docs/superpowers/plans/2026-10-19-federation.md](docs/superpowers/plans/2026-10-19-federation.md).
 
 ## Tests
 
@@ -118,7 +120,8 @@ GPU failure at run time is logged to stderr and that spectrum is computed on the
 ## Sources
 
 Every command takes the source flags of the node it opens (`zeta serve` included); with `--node`
-they belong to the serving node and are rejected. Source ids are unique across the three flags.
+they belong to the serving node and are rejected. Source ids are unique across the source flags
+(the two federation flags, `--source-node` and `--source-vrt`, are under [Federation](#federation)).
 `source list` shows each source's capability record: tuning range, `max_bandwidth_hz`, formats,
 `remote` and `push`, all `asserted` (taken from the device or the protocol, not measured).
 
@@ -231,7 +234,8 @@ bounded by the operation's own 10 s, well inside the 30 s.
 
 The websocket sends text messages tagged by `type`: `{"type":"frame", ...}` carries one frame in
 the same shape as a `stream_tail` frame (`stream`, `kind`, `source`, `job`, `channel`, `start_ns`,
-`end_ns` and a `payload` summary; sample data does not cross the wire),
+`end_ns` and a `payload` summary; sample data does not cross the wire in this mode, see
+[Federation](#federation) for `?format=binary`),
 `{"type":"lagged","missed":N}` reports dropped frames and `{"type":"closed","reason":...}` ends
 the stream.
 
@@ -273,3 +277,68 @@ OpenAI-compatible endpoint (thinking off, token budget per turn, bounded turns, 
 ```
 
 `zeta ask` reads its request from stdin, so a `local-voice` transcript can be piped in.
+
+## Federation
+
+A node can use a source of another node. `--source-node ID=SOURCE@URL` (URL is
+`http://HOST:PORT` of the other node's `serve --listen`) registers source `SOURCE` of that node
+as local source `ID`. The other node's secret comes from `ZETA_NODE_SECRET_<ID>` (`ID`
+upper-cased, other characters as `_`, so `pi-0` reads `ZETA_NODE_SECRET_PI_0`); there is no flag
+for it, so it never shows in `ps`. The source is `remote` and `push`, with the remote's
+capabilities except `max_bandwidth_hz`, which is capped at 250 kHz so that a node on WiFi ships
+narrowband by default. Append `,max_bandwidth_hz=N` (1-20000000) to widen it; the remote's own
+limit still applies, so a 48 kHz file source stays 48 kHz.
+
+Each tune starts a `passthrough` job on the remote source, centred and as wide as the local
+request, and subscribes to its IQ stream; layer 1 runs on the local node, the remote only
+channelises. A retune stops the previous remote job first, and the remote job holds the
+remote source's lease, so the remote's `source list` shows the `passthrough` job as a holder.
+Stopping the local job does not stop the remote one: it runs until the next tune or until the
+federating node exits. On exit (Ctrl-C on `serve`, or the end of a one-shot command) the remote
+job is stopped and the exit waits for the remote node to confirm.
+
+```bash
+A="--state-dir scratch/A --source-file tone=scratch/fx/tone.sigmf-meta"
+ZETA_SECRET=correct-horse-battery ./target/debug/zeta $A serve --listen 127.0.0.1:7979
+
+# second terminal: node B uses node A's tone as its source a
+ZETA_SECRET=correct-horse-battery ZETA_NODE_SECRET_A=correct-horse-battery ./target/debug/zeta \
+    --state-dir scratch/B --source-node a=tone@http://127.0.0.1:7979 serve --listen 127.0.0.1:7980
+
+# third terminal
+export ZETA_NODE=http://127.0.0.1:7980 ZETA_SECRET=correct-horse-battery
+./target/debug/zeta source list       # a: remote true, push true, max_bandwidth_hz 48000 (the file's rate)
+./target/debug/zeta job start --kind measure --source a --center-hz 100000000 --bandwidth-hz 12500
+./target/debug/zeta stream list       # the job's event stream; `stream tail` shows "carrier" records
+./target/debug/zeta --node http://127.0.0.1:7979 source list   # tone held by a passthrough job
+```
+
+What crosses the wire is the plan-3 websocket in binary mode, `GET /stream/{id}?format=binary`
+(the default `format=text` is unchanged). IQ goes as VITA 49.2 signal-data packets (`ci16`
+samples, at most 16 384 per packet) with a context packet first and then about once a second
+carrying the RF centre, sample rate and bandwidth; each packet is one binary websocket message.
+Audio, text and events go as the typed envelope, the plugin wire's data-frame framing
+(`u32LE header_len | frame summary JSON | u32LE body_len | body`, the body `f32` LE PCM for
+audio, UTF-8 for text, empty for events). The server sends nothing until the client grants
+credit with a text message `{"type":"credit","packets":N}` (N in 1..=4096; at most 65 536
+outstanding); each binary message spends one. A frame that finds no credit is skipped, not
+queued, and the count goes out as `{"type":"lagged","missed":K}` before the next frame sent.
+`--source-node` grants 256 at open and 128 more every 128 messages consumed.
+
+`--source-vrt ID=udp://ADDR:PORT` receives VITA 49.2 packets on UDP, one packet per datagram,
+from any sender that speaks it (the packets `--source-node` receives are the same encoding).
+`ADDR` must be a LAN address (`0.0.0.0` listens on every interface). The sender sets the
+frequency and rate from its context packets, so a job's band must lie inside the band last
+announced; before the first context packet a tune waits up to 1.5 s for one. There is no
+authentication on this path: use it on a trusted LAN segment.
+
+A Raspberry Pi 5 at the antenna is the intended remote: [deploy/pi/README.md](deploy/pi/README.md)
+cross-builds `zeta` for aarch64, smoke-tests it under qemu and installs it as a systemd service
+that refuses to start without a real secret. The laptop then federates it with `--source-node`.
+
+Two caveats. A federating `serve` killed with SIGTERM (`kill PID`, `systemctl stop`) exits
+without stopping its remote `passthrough` jobs; the remote's `job list` shows them running and
+`job stop` there clears them. Stop it with Ctrl-C (SIGINT) instead. And in a two-host test
+against a USRP B210, the one-shot form (`job start ... --then-tail`) on a remote source streamed
+for 10 s but produced no events in two runs while the same job under `serve` did; on one machine
+with a file source the one-shot form works. Prefer a federating `serve` until that is resolved.
