@@ -106,7 +106,10 @@ pub(crate) async fn ws(
         Ok(u) => u,
         Err(e) => return error_response(e.status(), other(e.body_text())),
     };
+    // A browser offers `zeta` beside its bearer subprotocol and closes the socket unless the
+    // server picks one of the offered protocols.
     upgrade
+        .protocols(["zeta"])
         .max_message_size(st.limits.ws_max_message_bytes)
         .on_upgrade(move |socket| async move {
             if binary {

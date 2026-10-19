@@ -6,6 +6,7 @@ pub mod http;
 pub mod stream;
 #[cfg(feature = "test-server")]
 pub mod testing;
+mod ui;
 pub mod wire;
 
 pub use http::{Health, Limits, Server, ServerConfig, ServerStats, StatsHandle, bind};

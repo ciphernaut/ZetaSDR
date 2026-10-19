@@ -9,6 +9,7 @@ description = "WebSocket transport for a ZetaSDR node"
 test-server = ["zeta-source-file/test-fixtures"]
 
 [dependencies]
+base64 = "0.22"
 axum = { version = "0.8.9", features = ["ws"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -18,6 +19,7 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 zeta-client = { path = "../zeta-client" }
 zeta-core = { path = "../zeta-core" }
 zeta-source-file = { path = "../zeta-source-file", optional = true }
+zeta-ui = { path = "../zeta-ui" }
 zeta-vrt = { path = "../zeta-vrt" }
 
 [dev-dependencies]

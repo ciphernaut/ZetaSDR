@@ -10,8 +10,10 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::header::{
+    AUTHORIZATION, CONTENT_TYPE, SEC_WEBSOCKET_PROTOCOL, UPGRADE, WWW_AUTHENTICATE,
+};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -25,8 +27,8 @@ use zeta_core::node::Node;
 use zeta_core::ops::OpError;
 
 use crate::addr::is_lan;
-use crate::auth::Secret;
-use crate::stream;
+use crate::auth::{Secret, subprotocol_secret};
+use crate::{stream, ui};
 
 /// Resource limits sized for a Raspberry Pi.
 #[derive(Clone, Copy, Debug)]
@@ -145,7 +147,31 @@ pub(crate) fn other(message: impl Into<String>) -> OpError {
     }
 }
 
-/// Refuse non-LAN peers (403), then require `Authorization: Bearer <secret>` (401 after a delay).
+/// Whether `headers` carry the secret: as `Authorization: Bearer <secret>`, or, on a websocket
+/// upgrade only, as the `zeta.bearer.<base64url>` entry of `Sec-WebSocket-Protocol`.
+fn authenticated(secret: &Secret, method: &Method, headers: &HeaderMap) -> bool {
+    let by_header = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
+        .is_some_and(|presented| secret.matches(presented));
+    if by_header {
+        return true;
+    }
+    let upgrade = method == Method::GET
+        && headers
+            .get(UPGRADE)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    upgrade
+        && headers
+            .get_all(SEC_WEBSOCKET_PROTOCOL)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter_map(subprotocol_secret)
+            .any(|presented| secret.matches(&presented))
+}
+
+/// Refuse non-LAN peers (403), then require the secret (401 after a delay): as
+/// `Authorization: Bearer <secret>`, or for a websocket upgrade as the bearer subprotocol.
 async fn require_auth(
     State(st): State<Shared>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -158,12 +184,7 @@ async fn require_auth(
             other(format!("peer {} is not a LAN address", peer.ip())),
         );
     }
-    let ok = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
-        .is_some_and(|presented| st.secret.matches(presented));
-    if !ok {
+    if !authenticated(&st.secret, req.method(), req.headers()) {
         tokio::time::sleep(st.limits.auth_fail_delay).await;
         let mut resp = error_response(
             StatusCode::UNAUTHORIZED,
@@ -252,8 +273,9 @@ async fn method_not_allowed() -> Response {
     )
 }
 
+/// Every route requires auth except the static UI (`/`, `/ui/`, `/ui/{*path}`).
 fn router(state: Shared) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/health", get(health))
         .route("/op", post(op))
         .route("/schema", get(schema))
@@ -263,7 +285,10 @@ fn router(state: Shared) -> Router {
         .route("/streams/{id}/tail", get(stream::tail_route))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
-        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
+    ui::router()
+        .method_not_allowed_fallback(method_not_allowed)
+        .merge(api)
         .with_state(state)
 }
 
