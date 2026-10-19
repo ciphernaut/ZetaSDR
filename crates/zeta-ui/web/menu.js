@@ -32,6 +32,12 @@
 //   ssb_lsb    Decode › SSB (LSB)             likewise, sideband lsb, centre + 1500
 //   measure    Start background job › measure job_start kind=measure, deviation_hz null
 //                                             (every job_start sends sideband: null unless SSB)
+//   scan       Scan this span                 wf.release() (stops the page's own spectrum job
+//                                             unless another job holds the source: then a
+//                                             `conflict: …` line and nothing more), job_start
+//                                             kind=scan on the selection's centre and
+//                                             bandwidth, then wf.resume() (scan mode when the
+//                                             scan runs, else the spectrum job again)
 //   iq_read    Save selection as SigMF        iq_read {selection}; the transcript shows the path
 //   ask        Send to agent                  /ask "Look at <c> Hz, <bw> Hz wide, from <start>
 //                                             to <end>: what is it?"
@@ -72,6 +78,7 @@ const ENTRIES = [
   ["ssb_usb", "Decode › SSB (USB)"],
   ["ssb_lsb", "Decode › SSB (LSB)"],
   ["measure", "Start background job › measure"],
+  ["scan", "Scan this span"],
   ["iq_read", "Save selection as SigMF"],
   ["ask", "Send to agent"],
 ];
@@ -246,6 +253,8 @@ class Menu {
         `Look at ${s.centerHz} Hz, ${s.bandwidthHz} Hz wide, ` +
           `from ${s.startNs} to ${s.endNs}: what is it?`,
       );
+    } else if (action === "scan") {
+      await this.scan(s);
     } else if (action in JOBS) {
       const job = JOBS[action];
       const t = jobTuning(action, s);
@@ -259,6 +268,29 @@ class Menu {
         sideband: job.sideband,
       });
     }
+  }
+
+  // A scan time-shares the radio, so it cannot start while the waterfall's own spectrum job
+  // holds the source: that job is let go first and the waterfall follows the scan after.
+  async scan(s) {
+    if (this.wf.sourceId !== s.sourceId) return;
+    let released = false;
+    try {
+      released = await this.wf.release(this.wf.src);
+    } catch (e) {
+      this.t.note(`scan: ${e.message}`, true);
+    }
+    if (!released) return;
+    await this.applyOp({
+      op: "job_start",
+      kind: "scan",
+      source: s.sourceId,
+      center_hz: s.centerHz,
+      bandwidth_hz: s.bandwidthHz,
+      deviation_hz: null,
+      sideband: null,
+    });
+    this.wf.resume();
   }
 
   // Draws the layer-1 labels at the selection's centre, stacked downwards, and the top
