@@ -1009,3 +1009,49 @@ fn serve_sigterm_releases_remote_lease() {
     assert!(status.success(), "serve exit status {status:?}");
     assert_remote_passthrough_stopped(&node_a.url, "tone");
 }
+
+/// Run `zeta serve` (no `--listen`) until it says it is serving; return what it printed on stderr.
+fn serve_banner(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("zeta"));
+    cmd.arg("--state-dir")
+        .arg(dir.join("state"))
+        .arg("serve")
+        .args(args)
+        .env_remove("ZETA_NODE")
+        .env_remove("ZETA_SECRET")
+        .env_remove("ZETA_LLM_URL")
+        .env_remove("ZETA_LLM_MODEL")
+        .envs(env.iter().copied())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let mut seen = String::new();
+    for line in lines.by_ref() {
+        let line = line.unwrap();
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains("serving; Ctrl-C") {
+            break;
+        }
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    seen
+}
+
+#[test]
+fn serve_warns_when_llm_flags_are_given_without_listen() {
+    let dir = tempfile::tempdir().unwrap();
+    let flags = ["--llm-url", "http://127.0.0.1:1", "--llm-model", "m"];
+    let seen = serve_banner(dir.path(), &flags, &[]);
+    assert!(seen.contains("ignored without --listen"), "{seen}");
+    let dir = tempfile::tempdir().unwrap();
+    let env = [
+        ("ZETA_LLM_URL", "http://127.0.0.1:1"),
+        ("ZETA_LLM_MODEL", "m"),
+    ];
+    let seen = serve_banner(dir.path(), &[], &env);
+    assert!(!seen.contains("ignored without --listen"), "{seen}");
+}

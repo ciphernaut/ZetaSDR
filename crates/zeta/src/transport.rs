@@ -103,6 +103,9 @@ async fn shutdown_signal() -> std::io::Result<()> {
 /// Run `serve`: wait for Ctrl-C or SIGTERM, also serving the API when `--listen` is given.
 pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCode {
     let Some(listen) = &args.listen else {
+        if std::env::args().any(|a| a.starts_with("--llm-")) {
+            eprintln!("zeta: warning: --llm-url/--llm-model are ignored without --listen");
+        }
         eprintln!("zeta: serving; Ctrl-C to stop");
         if let Err(e) = shutdown_signal().await {
             return usage(&format!("waiting for Ctrl-C or SIGTERM: {e}"));
