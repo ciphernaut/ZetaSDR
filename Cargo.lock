@@ -3830,9 +3830,7 @@ name = "zeta-source-node"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "num-complex",
  "tempfile",
- "thiserror",
  "tokio",
  "zeta-client",
  "zeta-core",

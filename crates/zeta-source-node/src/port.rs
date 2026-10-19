@@ -70,9 +70,9 @@ struct Live {
 /// previous one first) and subscribes to its IQ stream in binary mode. The
 /// broadcast lives as long as the port, so receivers taken before a retune or
 /// a fault keep receiving afterwards. The pump exits when the remote stream
-/// ends (reported through [`Port::fault`]) or when every receiver that
-/// subscribed has gone; the remote job is stopped on the next `tune` or when
-/// the port is dropped.
+/// ends (reported through [`Port::fault`]), on the next `tune` or when the
+/// port is dropped, which also stop the remote job. It keeps pumping with no
+/// receivers, so a later subscriber still gets blocks.
 pub struct NodePort {
     id: SourceId,
     caps: Capabilities,
@@ -212,6 +212,8 @@ impl NodePort {
             }
             Err(_) => {
                 pump.abort();
+                // A cancelled task's JoinError is expected; nothing to report.
+                let _ = pump.await;
                 return Err(self.io(&format!("no iq within {} s", TUNE_TIMEOUT.as_secs())));
             }
         };
@@ -286,7 +288,8 @@ impl Port for NodePort {
 
 /// Forward the subscription's IQ onto `tx`. The first packet's metadata goes
 /// to `first`. Ends when the subscription does (setting the fault) or when
-/// the broadcast, having had receivers, has none left.
+/// aborted by a retune or the port's drop; it keeps pumping without
+/// receivers so a later subscriber still gets blocks.
 async fn pump(
     mut sub: Subscription,
     tx: broadcast::Sender<IqBlock>,
@@ -295,7 +298,6 @@ async fn pump(
     first: oneshot::Sender<IqMeta>,
 ) {
     let mut first = Some(first);
-    let mut had_receivers = false;
     while let Some(item) = sub.next().await {
         let (t0_ns, meta, samples) = match item {
             Ok(Received::Iq {
@@ -321,13 +323,9 @@ async fn pump(
             center_hz: Hz(meta.center_hz),
             samples: samples.into(),
         };
-        match tx.send(block) {
-            Ok(_) => had_receivers = true,
-            // Nobody left listening: free the remote stream.
-            Err(_) if had_receivers => return,
-            // Nobody has subscribed yet (the port was just tuned).
-            Err(_) => {}
-        }
+        // With no receivers the block is dropped; the pump keeps going so a
+        // later subscriber gets blocks (it ends on retune, drop or remote close).
+        let _ = tx.send(block);
     }
     let reason = sub.close_reason().unwrap_or("ended");
     *shared.fault.lock().unwrap() = Some(format!("remote node {url}: stream closed: {reason}"));

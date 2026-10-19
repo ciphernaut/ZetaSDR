@@ -256,3 +256,28 @@ fn config_debug_hides_secret() {
     assert!(s.contains(r#"secret: "***""#), "{s}");
     assert!(!s.contains("s3cret"), "{s}");
 }
+
+#[tokio::test]
+async fn late_subscriber_after_all_left_still_gets_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn(dir.path()).await;
+    let port = open_tone(&srv).await;
+    port.tune(tone_band()).await.expect("tunes");
+    let mut rx = port.subscribe();
+    timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a block within 5 s")
+        .expect("receives");
+    drop(rx);
+    // Several 100 ms blocks go out with no receiver.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut rx = port.subscribe();
+    timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("a block within 2 s after resubscribing")
+        .expect("receives");
+    assert_eq!(port.fault(), None);
+    drop(rx);
+    drop(port);
+    srv.stop().await;
+}
