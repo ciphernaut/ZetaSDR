@@ -102,5 +102,19 @@ fn ssb_fixture_is_ssb_with_sideband_evidence() {
         assert_eq!(l.name, "ssb", "{l:?}");
         assert_eq!(l.confidence, 0.6, "{l:?}");
         assert!(l.evidence.contains(side), "{}", l.evidence);
+        // The dial hint lands near the suppressed carrier at the block centre.
+        let dial: u64 = l
+            .evidence
+            .split("dial \u{2248} ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no dial hint: {}", l.evidence));
+        assert!(dial.abs_diff(CENTER) <= 500, "dial {dial}: {}", l.evidence);
+        assert!(
+            l.evidence.contains(&format!("Hz ({side})")),
+            "{}",
+            l.evidence
+        );
     }
 }
