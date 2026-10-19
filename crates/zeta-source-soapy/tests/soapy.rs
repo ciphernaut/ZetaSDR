@@ -9,7 +9,7 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Hz, SourceId};
+use zeta_core::types::{Claim, Hz, SourceId};
 use zeta_source_soapy::SoapySource;
 use zeta_source_soapy::mock::{MockDevice, MockRead};
 
@@ -274,6 +274,8 @@ async fn node_with(src: Arc<SoapySource>) -> (Node, tempfile::TempDir) {
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
         ring_seconds: 2.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
     };
@@ -415,4 +417,40 @@ async fn measured_rate_is_reported() {
     }
     let r = src.measured_rate_hz().expect("a measured rate");
     assert!(r.is_finite() && r > 0.0, "{r}");
+}
+
+#[test]
+fn uhd_source_asserts_the_range_at_the_maximum_clock() {
+    // A B210's driver key is its device type, and it refuses rates past its clock.
+    let dev = Arc::new(
+        MockDevice::hackrf_like()
+            .with_driver("b200")
+            .with_rate_follow(16e6, 61.44e6)
+            .refusing_above_ceiling(),
+    );
+    let src = source(&dev);
+    assert_eq!(
+        src.capabilities().max_bandwidth_hz,
+        Claim::Asserted(Hz(61_440_000))
+    );
+    // Or the args say uhd whatever the key.
+    let dev = Arc::new(
+        MockDevice::hackrf_like()
+            .with_driver("custom")
+            .with_rate_follow(16e6, 61.44e6),
+    );
+    let src =
+        SoapySource::with_device_args(SourceId("sdr0".into()), dev.clone(), "driver=uhd,type=b200")
+            .unwrap();
+    assert_eq!(
+        src.capabilities().max_bandwidth_hz,
+        Claim::Asserted(Hz(61_440_000))
+    );
+    let dev = Arc::new(MockDevice::hackrf_like().with_rate_follow(16e6, 61.44e6));
+    let src = source(&dev);
+    assert_eq!(
+        src.capabilities().max_bandwidth_hz,
+        Claim::Asserted(Hz(16_000_000))
+    );
+    assert_eq!(dev.range_reads(), 1, "a non-uhd device is probed once");
 }

@@ -2,6 +2,7 @@
 //
 // Exports:
 //   AUDIO_KINDS                 job kinds with an audio stream (their rows get ▶)
+//   errorText(error) -> the text of an op error JSON as formatOp shows it after `→`
 //   formatOp(payload) -> {text, error}
 //       One `ops` stream payload ({op, outcome, result|error, elapsed_ms, transport}) as a
 //       transcript line: `source_list → ok (2 sources)`,
@@ -104,7 +105,7 @@ function resultText(r) {
   }
 }
 
-function errorText(e) {
+export function errorText(e) {
   if (!e || typeof e !== "object") return "error";
   const parts = [e.error ?? "error"];
   if (e.field !== undefined) parts.push(`field=${e.field}`);

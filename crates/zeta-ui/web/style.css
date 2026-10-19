@@ -121,6 +121,17 @@ input:focus { border-color: var(--accent); }
   position: absolute; left: var(--axis-w); top: 0; width: calc(100% - var(--axis-w)); height: 100%;
 }
 #waterfall .wf-overlay { cursor: crosshair; touch-action: none; }
+#waterfall .wf-axis { cursor: ns-resize; touch-action: none; user-select: none; }
+/* waterfall.js band control: centre (MHz), width (kHz), Apply */
+#band {
+  position: absolute; right: 8px; bottom: 8px; z-index: 2; display: flex; gap: 4px;
+  align-items: center; padding: 3px 4px; font-size: 12px;
+  background: var(--bar); border: 1px solid var(--border); opacity: 0.9;
+}
+#band label { display: flex; align-items: center; gap: 2px; color: var(--dim); }
+#band input { width: 8ch; padding: 1px 3px; font-size: 12px; }
+#band input[name="center"] { width: 11ch; }
+#band button { padding: 1px 6px; font-size: 12px; }
 /* overlays.js: labels at the left edge, ribbons entering at the right and scrolling left */
 #waterfall .ov-layer {
   position: absolute; left: var(--axis-w); top: 0; width: calc(100% - var(--axis-w)); height: 100%;

@@ -17,6 +17,8 @@ fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
     }

@@ -87,7 +87,11 @@ impl IqRing {
         if block.sample_rate_hz.0 != self.sample_rate_hz {
             self.sample_rate_hz = block.sample_rate_hz.0;
             self.capacity = Self::cap_for(self.capacity_seconds, self.sample_rate_hz);
-            self.clear();
+            // Drop the old allocation first, then grow: assigning a new buffer in one
+            // expression would allocate the new one while the old one is still live.
+            self.buf = VecDeque::new();
+            self.buf.reserve(self.capacity);
+            self.dropped = 0;
         }
         if self.center_hz != Some(block.center_hz) {
             self.center_hz = Some(block.center_hz);
@@ -110,6 +114,39 @@ impl IqRing {
             self.buf.drain(..excess);
             self.dropped += excess as u64;
         }
+    }
+
+    /// Change the history length to `seconds` at the current rate, keeping the
+    /// newest samples when it shrinks and releasing the freed memory; a block
+    /// with a new rate recomputes the capacity (from `seconds`) and restarts
+    /// the ring. Before a rate change use [`IqRing::set_capacity_seconds`].
+    pub fn resize(&mut self, seconds: f64) {
+        self.capacity_seconds = seconds;
+        self.capacity = Self::cap_for(seconds, self.sample_rate_hz);
+        if self.buf.len() > self.capacity {
+            let excess = self.buf.len() - self.capacity;
+            self.buf.drain(..excess);
+            self.dropped += excess as u64;
+        }
+        self.buf.shrink_to_fit();
+    }
+
+    /// Set the history length a block with a new rate sizes the ring to,
+    /// touching nothing now: for a retune, where [`IqRing::push`] restarts
+    /// the ring at the new rate anyway (and [`IqRing::resize`] would trim
+    /// and reallocate the old rate's samples first, for nothing).
+    pub fn set_capacity_seconds(&mut self, seconds: f64) {
+        self.capacity_seconds = seconds;
+    }
+
+    /// Bytes currently allocated for samples.
+    pub fn capacity_bytes(&self) -> usize {
+        self.buf.capacity() * std::mem::size_of::<Complex<f32>>()
+    }
+
+    /// Most samples the ring retains at its current rate.
+    pub fn capacity_samples(&self) -> usize {
+        self.capacity
     }
 
     pub fn sample_rate_hz(&self) -> Hz {
@@ -189,6 +226,42 @@ mod tests {
             start_ns: Timestamp(a * 1_000_000_000),
             end_ns: Timestamp(b * 1_000_000_000),
         }
+    }
+
+    #[test]
+    fn capacity_seconds_apply_at_the_next_rate() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        for i in 0..3 {
+            ring.push(&block(i));
+        }
+        let bytes = ring.capacity_bytes();
+        ring.set_capacity_seconds(2.0);
+        // Nothing trimmed or reallocated at the old rate.
+        assert_eq!(ring.capacity_samples(), 10_000);
+        assert_eq!(ring.capacity_bytes(), bytes);
+        assert_eq!(ring.read(span(0, 3)).unwrap().len(), 3000);
+        let mut b = block(3);
+        b.sample_rate_hz = Hz(2 * RATE);
+        ring.push(&b);
+        assert_eq!(ring.capacity_samples(), 4000);
+        assert_eq!(ring.earliest(), Some(Timestamp(3_000 * MS)));
+    }
+
+    #[test]
+    fn ring_resize_keeps_newest() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        for i in 0..3 {
+            ring.push(&block(i));
+        }
+        ring.resize(1.0);
+        assert_eq!(ring.capacity_samples(), 1000);
+        assert_eq!(ring.earliest(), Some(Timestamp(2_000 * MS)));
+        assert_eq!(ring.latest(), Some(Timestamp(2_999 * MS)));
+        assert_eq!(ring.read(span(2, 3)).unwrap(), block(2).samples.to_vec());
+        ring.resize(5.0);
+        ring.push(&block(3));
+        assert_eq!(ring.earliest(), Some(Timestamp(2_000 * MS)));
+        assert_eq!(ring.read(span(2, 4)).unwrap().len(), 2000);
     }
 
     #[test]

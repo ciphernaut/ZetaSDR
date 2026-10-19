@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, oneshot};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
 
-use crate::caps::{capabilities, pick_format, pick_rate};
+use crate::caps::{capabilities, is_uhd, pick_format, pick_rate, probe_rate_ranges};
 use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
 
 /// Blocks buffered per receiver.
@@ -104,12 +104,34 @@ pub struct SoapySource {
 }
 
 impl SoapySource {
-    /// Query the device's ranges and formats once; no streaming yet.
+    /// Query the device's ranges and formats once; no streaming yet. As
+    /// [`SoapySource::with_device_args`] with no device arguments.
     pub fn with_device(id: SourceId, dev: Arc<dyn SoapyDevice>) -> Result<Self, PortError> {
+        Self::with_device_args(id, dev, "")
+    }
+
+    /// Query the device's ranges and formats once; no streaming yet. `args`
+    /// (the SoapySDR device arguments it was opened with) and its driver key
+    /// decide whether it is a UHD device, whose rate range is probed at its
+    /// maximum clock (see [`probe_rate_ranges`]).
+    pub fn with_device_args(
+        id: SourceId,
+        dev: Arc<dyn SoapyDevice>,
+        args: &str,
+    ) -> Result<Self, PortError> {
         let io = |e: String| PortError::Io(format!("soapy {}: {e}", dev.driver_key()));
-        let caps = capabilities(dev.as_ref()).map_err(io)?;
+        let probe = is_uhd(args, &dev.driver_key());
+        let rates = probe_rate_ranges(dev.as_ref(), probe).map_err(io)?;
+        if probe {
+            let max = rates.iter().map(|r| r.max_hz).fold(0.0, f64::max);
+            eprintln!(
+                "zeta-source-soapy: {}: sample-rate range max {} Hz after probe",
+                id.0,
+                max.round() as u64
+            );
+        }
+        let caps = capabilities(dev.as_ref(), &rates).map_err(io)?;
         let freq = dev.frequency_ranges().map_err(io)?;
-        let rates = dev.sample_rate_ranges().map_err(io)?;
         let (native, supported) = dev.formats().map_err(io)?;
         let format = pick_format(native, &supported).map_err(PortError::Unsupported)?;
         Ok(Self {

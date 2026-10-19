@@ -127,6 +127,23 @@ impl RemotePorts {
     }
 }
 
+/// Default ring budget: a quarter of `MemTotal` capped at 4 GiB, 1 GiB when
+/// `/proc/meminfo` cannot be read.
+fn default_ring_budget() -> u64 {
+    const GIB: u64 = 1 << 30;
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| parse_meminfo(&s))
+        .unwrap_or(GIB)
+}
+
+/// A quarter of the `MemTotal` line (kB) of `/proc/meminfo`, capped at 4 GiB.
+fn parse_meminfo(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some((kb.saturating_mul(1024) / 4).min(4 << 30))
+}
+
 /// Open the node on `state_dir` with the given sources and plugin stages. File sources
 /// loop in real time and start after the node has subscribed to them (a source with no
 /// subscriber stops at once); a KiwiSDR connects on its first tune; a remote node is asked
@@ -140,6 +157,7 @@ pub async fn open(
     sources: &[SourceSpec],
     plugins: &[PluginSpec],
     resume: bool,
+    ring_budget_mb: Option<u64>,
 ) -> Result<(Node, RemotePorts), String> {
     let opts = FileOpts {
         realtime: true,
@@ -207,12 +225,17 @@ pub async fn open(
     let cfg = NodeConfig {
         state_dir,
         ring_seconds: 10.0,
+        ring_budget_bytes: ring_budget_mb
+            .map_or_else(default_ring_budget, |mb| mb.saturating_mul(1 << 20)),
         backends,
         resume,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
     };
     let node = Node::open(cfg, registry, ports)
         .await
         .map_err(|e| e.to_string())?;
+    // Jobs resumed by `open` predate the factory and run without a bank.
+    node.set_bank_factory(Arc::new(zeta_dsp::bank::PfbBankFactory));
     for s in &files {
         s.start();
     }
@@ -223,6 +246,22 @@ pub async fn open(
         node.add_classifier(c);
     }
     Ok((node, remotes))
+}
+
+#[cfg(test)]
+mod meminfo_tests {
+    use super::parse_meminfo;
+
+    #[test]
+    fn quarter_of_memtotal_capped_at_4_gib() {
+        assert_eq!(
+            parse_meminfo("MemTotal:  4194304 kB\nMemFree: 1 kB\n"),
+            Some(1 << 30)
+        );
+        assert_eq!(parse_meminfo("MemTotal: 67108864 kB\n"), Some(4 << 30));
+        assert_eq!(parse_meminfo("MemFree: 1 kB\n"), None);
+        assert_eq!(parse_meminfo("MemTotal: lots kB\n"), None);
+    }
 }
 
 #[cfg(test)]
@@ -259,9 +298,13 @@ mod tests {
                         center_hz: Hz(7_100_000),
                         bandwidth_hz: Hz(bw),
                     };
-                    match kind.expand(&src, tuning, Hz(rate), None, None) {
+                    match kind.expand(&src, tuning, Hz(rate), None, None, None) {
                         Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
                             assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
+                        }
+                        // A scan runs no graph: the node steps the source itself.
+                        Ok(g) if kind == JobKind::Scan => {
+                            assert!(g.nodes.is_empty() && g.edges.is_empty(), "{g:?}");
                         }
                         Ok(g) => {
                             validate(&g, &registry)

@@ -1,6 +1,7 @@
 //! Channel stage: shift a channel to baseband, low-pass it and decimate.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use num_complex::Complex;
@@ -8,13 +9,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::port::IqBlock;
-use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
+use zeta_core::port::{IqBlock, IqReceiver, Tuning};
+use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::{ChannelId, Hz, StreamId, StreamKind, Timestamp};
+use zeta_core::types::{ChannelId, Hz, Provenance, StreamId, StreamKind, Timestamp};
 
 use crate::util::lowpass_taps;
-use crate::{Input, frame_span, run_map};
+use crate::{Input, LAGGED_FRAMES, frame_span, run_map};
 
 /// Fewest and most taps of the channel low-pass filter.
 const MIN_TAPS: usize = 63;
@@ -244,6 +245,13 @@ impl Stage for ChannelStage {
         Backend::Cpu
     }
 
+    /// With a bank in `ctx` whose bins are at least `bandwidth_hz` wide and
+    /// whose band holds the channel, the stage subscribes to the nearest bin
+    /// and filters that bin's stream, provided `out_rate_hz` divides the bin
+    /// rate; the job's IQ input is then only watched for its end and band.
+    /// Otherwise (no bank, too wide, out of band, or a rate the bin rate does
+    /// not divide, as in graphs written for the source rate) it filters the
+    /// job's IQ input directly.
     async fn run(
         &self,
         params: serde_json::Value,
@@ -251,58 +259,162 @@ impl Stage for ChannelStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let p: ChannelParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("channel params: {e}")))?;
         let Some(out) = outputs.first().cloned() else {
             return Err(StageError::Failed("expected 1 output".into()));
         };
-        let channel = ChannelId(format!("{}/{}", p.center_hz, p.bandwidth_hz));
-        let mut state = ChannelState::new();
+        let mut chan = Channel {
+            channel: ChannelId(format!("{}/{}", p.center_hz, p.bandwidth_hz)),
+            p,
+            out,
+            state: ChannelState::new(),
+        };
+        // Checked before subscribing, so a declined bank keeps no receiver.
+        if let Some(bank) = &ctx.bank
+            && chan.p.bandwidth_hz <= bank.bin_hz()
+            && chan.p.out_rate_hz > 0
+            && (2 * bank.bin_hz()).is_multiple_of(chan.p.out_rate_hz)
+            && let Ok((bin, _, _)) = bank.subscribe(chan.p.center_hz, chan.p.bandwidth_hz)
+        {
+            // The job's provenance, as registered for the output stream.
+            let base = bus
+                .list()
+                .into_iter()
+                .find(|i| i.id == chan.out)
+                .map(|i| i.provenance)
+                .unwrap_or_else(|| Provenance {
+                    source: ctx.source.clone(),
+                    job: None,
+                    channel: None,
+                    span: frame_span(Timestamp(0), 0, 0),
+                });
+            return run_bin(chan, base, bank.band(), bin, inputs, bus, cancel).await;
+        }
         run_map(inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {
-                    state = ChannelState::new();
+                    chan.state = ChannelState::new();
                     return Ok(Vec::new());
                 }
             };
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed("channel stage expects iq frames".into()));
             };
-            let rate = block.sample_rate_hz.0;
-            check_in_band(rate, block.center_hz.0, p.center_hz, p.bandwidth_hz)
-                .map_err(|e| StageError::Failed(e.to_string()))?;
-            // Time of the first output sample: the decimation phase carried in.
-            let lead = state.next;
-            let (samples, out_rate) = extract_offset_streaming(
-                &mut state,
-                &block.samples,
-                rate,
-                p.center_hz as i64 - block.center_hz.0 as i64,
-                p.bandwidth_hz,
-                p.out_rate_hz,
-            )
-            .map_err(|e| StageError::Failed(e.to_string()))?;
-            if samples.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut prov = frame.provenance.clone();
-            prov.channel = Some(channel.clone());
-            prov.span = frame_span(block.t0, block.samples.len(), rate);
-            let t0 = Timestamp(frame_span(block.t0, lead, rate).end_ns.0);
-            Ok(vec![Frame::new(
-                out.clone(),
-                prov,
-                Payload::Iq(IqBlock {
-                    t0,
-                    sample_rate_hz: Hz(out_rate),
-                    center_hz: Hz(p.center_hz),
-                    samples: samples.into(),
-                }),
-            )])
+            Ok(chan
+                .process(block, &frame.provenance)?
+                .into_iter()
+                .collect())
         })
         .await
+    }
+}
+
+/// One channel's params, output and streaming state.
+struct Channel {
+    p: ChannelParams,
+    channel: ChannelId,
+    out: StreamId,
+    state: ChannelState,
+}
+
+impl Channel {
+    /// Filter one input block (the source's, or a bank bin's) into an output
+    /// frame with `prov`'s source and job; `None` when it yields no sample.
+    fn process(&mut self, block: &IqBlock, prov: &Provenance) -> Result<Option<Frame>, StageError> {
+        let p = &self.p;
+        let rate = block.sample_rate_hz.0;
+        check_in_band(rate, block.center_hz.0, p.center_hz, p.bandwidth_hz)
+            .map_err(|e| StageError::Failed(e.to_string()))?;
+        // Time of the first output sample: the decimation phase carried in.
+        let lead = self.state.next;
+        let (samples, out_rate) = extract_offset_streaming(
+            &mut self.state,
+            &block.samples,
+            rate,
+            p.center_hz as i64 - block.center_hz.0 as i64,
+            p.bandwidth_hz,
+            p.out_rate_hz,
+        )
+        .map_err(|e| StageError::Failed(e.to_string()))?;
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        let mut prov = prov.clone();
+        prov.channel = Some(self.channel.clone());
+        prov.span = frame_span(block.t0, block.samples.len(), rate);
+        let t0 = Timestamp(frame_span(block.t0, lead, rate).end_ns.0);
+        Ok(Some(Frame::new(
+            self.out.clone(),
+            prov,
+            Payload::Iq(IqBlock {
+                t0,
+                sample_rate_hz: Hz(out_rate),
+                center_hz: Hz(p.center_hz),
+                samples: samples.into(),
+            }),
+        )))
+    }
+}
+
+/// The bank path: filter the bin stream `bin` of a bank over `band`, ending
+/// cleanly when the job's IQ input closes. A lagging bin resets the filter
+/// state. The stage fails when a job IQ block shows the capture has left
+/// `band` (the node then makes a new bank this stage is not on) or when the
+/// bin closes.
+async fn run_bin(
+    mut chan: Channel,
+    base: Provenance,
+    band: Tuning,
+    mut bin: IqReceiver,
+    inputs: Vec<broadcast::Receiver<Frame>>,
+    bus: Arc<StreamBus>,
+    cancel: CancellationToken,
+) -> Result<(), StageError> {
+    let mut inputs = inputs;
+    if inputs.len() != 1 {
+        return Err(StageError::Failed("expected 1 input".into()));
+    }
+    let root = &mut inputs[0];
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(StageError::Cancelled),
+            r = bin.recv() => match r {
+                Ok(block) => {
+                    if let Some(f) = chan.process(&block, &base)? {
+                        bus.publish(f);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    LAGGED_FRAMES.fetch_add(n, Ordering::Relaxed);
+                    eprintln!("zeta-dsp: channel lagged its bank bin, {n} blocks skipped");
+                    chan.state = ChannelState::new();
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(StageError::Failed(
+                        "channel bank bin closed; restart the job".into(),
+                    ));
+                }
+            },
+            r = root.recv() => match r {
+                Ok(frame) => {
+                    if let Payload::Iq(b) = &frame.payload
+                        && (b.center_hz, b.sample_rate_hz) != (band.center_hz, band.bandwidth_hz)
+                    {
+                        return Err(StageError::Failed(format!(
+                            "capture band changed from center {} Hz, rate {} Hz to center {} Hz, rate {} Hz; restart the job",
+                            band.center_hz.0, band.bandwidth_hz.0, b.center_hz.0, b.sample_rate_hz.0
+                        )));
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+        }
     }
 }
 
@@ -464,7 +576,14 @@ mod tests {
         let o2 = out.clone();
         let h = tokio::spawn(async move {
             ChannelStage::new()
-                .run(params, vec![rx_in], vec![o2], bus, cancel)
+                .run(
+                    params,
+                    vec![rx_in],
+                    vec![o2],
+                    bus,
+                    cancel,
+                    StageContext::new(SourceId("s".into())),
+                )
                 .await
         });
         (tx, out, rx_out, h)

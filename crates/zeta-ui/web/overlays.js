@@ -31,7 +31,8 @@
 //         - anything else: ov.ribbon(tuning centre, first OTHER_EVENT_CHARS chars of the
 //           payload's JSON, "event").
 //     ov.ribbon(hz, text, cls) -> element
-//         A text ribbon at wf.yForHz(hz) (the band's middle when hz or the band is unknown),
+//         A text ribbon at wf.yForHz(hz) (the band's middle when hz or the band is unknown;
+//         ribbons and labels are placed again when the waterfall's view changes, wf.onView),
 //         entering at the right edge and moving left with the waterfall's columns
 //         (wf.onColumn); removed when it leaves the left edge or RIBBON_TTL_MS after it was
 //         last refreshed. The same text and class still at the right edge is refreshed with a
@@ -90,6 +91,7 @@ class Overlays {
     el.append(this.layer);
 
     wf.onColumn((shift) => this.scroll(shift));
+    wf.onView(() => this.layout());
     this.timer = setInterval(() => this.expire(), EXPIRE_EVERY_MS);
     this.ro = new ResizeObserver(() => this.layout());
     this.ro.observe(this.layer);
@@ -207,7 +209,7 @@ class Overlays {
   render(rec, p) {
     const job = rec.job;
     const obj = p && typeof p === "object" && !Array.isArray(p);
-    if (obj && Array.isArray(p.db)) return;
+    if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
     // Every non-spectrum event counts in the job row, whatever its shape.
     const n = (this.counters.get(job.id) || 0) + 1;
     this.counters.set(job.id, n);

@@ -14,6 +14,7 @@ pub mod afsk;
 pub mod am;
 pub mod aprs;
 pub mod ax25;
+pub mod bank;
 pub mod catalogue;
 pub mod channel;
 pub mod fft;
@@ -22,6 +23,7 @@ pub mod gpu_fft;
 pub mod identify;
 pub mod measure;
 pub mod nbfm;
+pub mod pfb;
 pub mod resample;
 pub mod util;
 pub mod wfm;
@@ -198,7 +200,8 @@ mod tests {
     }
 
     /// Every object schema with properties denies unknown fields and requires
-    /// every property (optional values are required-nullable).
+    /// every property (optional values are required-nullable), except one
+    /// with a schema `default`, which older persisted graphs may lack.
     fn check_strict(v: &Value, path: &str) {
         match v {
             Value::Object(m) => {
@@ -208,7 +211,11 @@ mod tests {
                         Some(&Value::Bool(false)),
                         "{path} allows extra fields"
                     );
-                    let mut want: Vec<&str> = props.keys().map(String::as_str).collect();
+                    let mut want: Vec<&str> = props
+                        .iter()
+                        .filter(|(_, p)| p.get("default").is_none())
+                        .map(|(k, _)| k.as_str())
+                        .collect();
                     let mut req: Vec<&str> = m
                         .get("required")
                         .and_then(Value::as_array)

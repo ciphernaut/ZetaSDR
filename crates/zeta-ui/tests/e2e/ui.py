@@ -243,6 +243,25 @@ def scenario_waterfall_paints(page, url, secret):
         assert 99.976 <= v <= 100.024 and t == f"{v:.3f}", f"tick {t!r} in {ticks}"
 
 
+def scenario_waterfall_decodes_quantised_rows(page, url, secret):
+    # The node sends spectrum event v2 (`q`, `floor_db`, `step_db`); the waterfall paints
+    # them straight from the u8 levels, and still decodes an older node's `db` rows.
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.lastRowFormat !== null", timeout=5_000)
+    fmt = page.evaluate("window.zetaTest.lastRowFormat")
+    assert fmt == "q", f"lastRowFormat {fmt!r}"
+    rows = page.evaluate("""async () => {
+      const m = await import('./waterfall.js');
+      const q = m.decodeRow({size: 4, q: [0, 2, 255, 7], floor_db: -120, step_db: 0.5});
+      const db = m.decodeRow({size: 2, db: [-90.5, -30]});
+      return {qType: q.q.constructor.name, q: Array.from(q.q), floor: q.floorDb,
+              step: q.stepDb, dbType: db.db.constructor.name, db: Array.from(db.db),
+              none: m.decodeRow({label: {name: 'x'}})};
+    }""")
+    assert rows == {"qType": "Uint8Array", "q": [0, 2, 255, 7], "floor": -120, "step": 0.5,
+                    "dbType": "Float32Array", "db": [-90.5, -30], "none": None}, rows
+
+
 def stop_spectrum_jobs(url, secret, source):
     """Stop every running spectrum job on `source` through the API."""
     for j in running_spectrum_jobs(url, secret, source):
@@ -588,6 +607,226 @@ def scenario_save_sigmf(page, url, secret):
     assert os.path.realpath(path).startswith(os.path.realpath(state) + os.sep), \
         f"{path} not under {state}"
     assert os.path.isfile(path[:-len(".sigmf-meta")] + ".sigmf-data"), f"no data beside {path}"
+
+
+# ---- band control and scan view (plan 8, Task 6) -------------------------------------------
+# Ruling R2: zoom/pan inside the capture only re-renders; leaving the capture checks the
+# source's holders before any retune. Each stops the jobs it starts.
+
+TICKS_JS = "() => [...document.querySelectorAll('#waterfall .wf-axis .tick')].map(t => t.textContent)"
+
+
+def ticks(page):
+    return page.evaluate(TICKS_JS)
+
+
+def wait_ticks(page, top, bottom, what):
+    """Wait until the axis' top and bottom ticks read `top` and `bottom` (MHz, 3 dp)."""
+    try:
+        page.wait_for_function(
+            f"""() => {{
+              const t = ({TICKS_JS})();
+              return t.length === 5 && t[0] === {json.dumps(top)} && t[4] === {json.dumps(bottom)};
+            }}""", timeout=10_000)
+    except Exception as e:
+        raise AssertionError(f"{what}: ticks {ticks(page)}, want {top}..{bottom}") from e
+
+
+# The backing-pixel rows with G > 200 in the canvas column `arg` CSS px left of the right edge.
+BRIGHT_ROWS_AT_JS = """(off) => {
+  const c = document.querySelector('#waterfall canvas.wf-canvas');
+  const dpr = c.width / c.clientWidth;
+  const x = Math.max(0, c.width - 1 - Math.round(off * dpr));
+  const d = c.getContext('2d').getImageData(x, 0, 1, c.height).data;
+  const rows = [];
+  for (let y = 0; y < c.height; y++) if (d[y * 4 + 1] > 200) rows.push(y);
+  return rows;
+}"""
+
+
+def wheel_at_centre(page, delta_y):
+    box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.mouse.wheel(0, delta_y)
+
+
+def ensure_lines(page):
+    return page.locator("#transcript .line", has_text="source_ensure").count()
+
+
+def scenario_zoom_inside_capture_is_render_only(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    wait_ticks(page, "100.024", "99.976", "before zooming")
+    job = page.evaluate(WF_STATE_JS)["jobId"]
+    # Wheel up at the centre: x2 in, about the pointer (the band's centre).
+    wheel_at_centre(page, -100)
+    wait_ticks(page, "100.012", "99.988", "after zooming in")
+    assert ticks(page)[2] == "100.000", f"ticks {ticks(page)}"
+    # The stored columns are drawn again on the narrower band: the tone (+1 kHz) shows in
+    # columns painted before the zoom, its row at the new scale.
+    page.wait_for_timeout(100)
+    rows = page.evaluate(BRIGHT_ROWS_AT_JS, 40)
+    assert rows, "no bright pixel 40 px from the right edge after the zoom"
+    h = page.evaluate("document.querySelector('#waterfall canvas.wf-canvas').height")
+    tone_y = h * (100_012_000 - 100_001_000) / 24_000
+    assert min(rows) <= tone_y <= max(rows), f"tone row {tone_y:.0f} not in bright rows {rows[:3]}..{rows[-3:]}"
+    expect(page.locator("#band")).to_be_visible()
+    # Painting continues on the same job, with no operation issued.
+    wait_waterfall_follows(page, f"w.jobId === {json.dumps(job)}", "after zooming in")
+    page.wait_for_timeout(1_000)
+    assert ensure_lines(page) == 0, "a source_ensure was issued for a zoom inside the capture"
+    jobs = running_spectrum_jobs(url, secret, "tone")
+    assert [j["id"] for j in jobs] == [job], f"spectrum jobs on tone (followed {job}): {jobs}"
+    if os.environ.get("ZETA_UI_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "zoom.png"))
+    # A drag down the axis by a quarter of its height pans a quarter of the view up.
+    axis = page.locator("#waterfall .wf-axis").bounding_box()
+    x, y = axis["x"] + axis["width"] / 2, axis["y"] + axis["height"] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x, y + axis["height"] / 4, steps=4)
+    page.mouse.up()
+    wait_ticks(page, "100.018", "99.994", "after panning")
+    # The band control: centre and width typed in, Apply.
+    page.fill('#band input[name="center"]', "100.001")
+    page.fill('#band input[name="width"]', "4")
+    page.click("#band button")
+    wait_ticks(page, "100.003", "99.999", "after Apply")
+    assert ensure_lines(page) == 0, "a source_ensure was issued for a pan inside the capture"
+    # Wheel down: back to the whole capture, still without an operation.
+    page.fill('#band input[name="center"]', "100")
+    page.fill('#band input[name="width"]', "24")
+    page.click("#band button")
+    wait_ticks(page, "100.012", "99.988", "after Apply")
+    wheel_at_centre(page, 100)
+    wait_ticks(page, "100.024", "99.976", "after zooming back out")
+    page.wait_for_timeout(500)
+    assert ensure_lines(page) == 0, "a source_ensure was issued for the capture's own band"
+
+
+def scenario_zoom_beyond_capture_on_a_file_source_shows_out_of_range(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.wf().painted > 5")
+    wait_ticks(page, "100.024", "99.976", "before zooming")
+    wheel_at_centre(page, 100)
+    line = page.locator("#transcript .line", has_text="out_of_range")
+    expect(line.first).to_be_visible()
+    wait_ticks(page, "100.024", "99.976", "view not reverted")
+    wait_waterfall_follows(page, "!!w.jobId", "after the refused retune")
+    jobs = wait_one_spectrum_job(url, secret, "tone")
+    assert len(jobs) == 1, f"spectrum jobs on tone: {jobs}"
+
+
+def scenario_zoom_on_held_source_shows_conflict(page, url, secret):
+    fresh_spectrum_jobs(url, secret)
+    job = start_job(url, secret, "measure", "wfm", 104_900_000, 10_000)
+    try:
+        select_source(page, url, secret, "wfm")
+        page.wait_for_function("() => window.zetaTest.wf() && window.zetaTest.wf().painted > 5",
+                               timeout=15_000)
+        before = ticks(page)
+        wheel_at_centre(page, 100)
+        line = page.locator("#transcript .line", has_text="conflict: source wfm held by")
+        expect(line.first).to_be_visible()
+        expect(line.first).to_contain_text(job)
+        wait_ticks(page, before[0], before[4], "view not reverted")
+        page.wait_for_timeout(1_000)
+        assert ensure_lines(page) == 0, "source_ensure issued on a source held by another job"
+        jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+        mine = [j for j in jobs if j["id"] == job]
+        assert mine and mine[0]["state"]["status"] == "running", f"measure job: {mine}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def running_scan_jobs(url, secret, source):
+    jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+    return [j for j in jobs if j["kind"] == "scan" and j["source"] == source
+            and j["state"]["status"] == "running"]
+
+
+def scenario_scan_entry_starts_a_scan_job(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    # The whole height: the file source's own band, which a scan covers in one step.
+    menu = drag_menu(page, 0.0, 1.05)
+    expect(page.locator('#ctx .ctx-item[data-action="scan"]')).to_have_text("Scan this span")
+    page.click('#ctx .ctx-item[data-action="scan"]')
+    expect(menu).to_be_hidden()
+    scans = []
+    try:
+        deadline = time.monotonic() + 5.0
+        while not scans and time.monotonic() < deadline:
+            scans = running_scan_jobs(url, secret, "tone")
+            time.sleep(0.2)
+        assert len(scans) == 1, f"scan jobs on tone: {scans}"
+        page.wait_for_function("() => window.zetaTest.waterfallMode === 'scan'", timeout=10_000)
+        wait_waterfall_follows(page, f"w.jobId === {json.dumps(scans[0]['id'])}", "scan mode")
+        assert running_spectrum_jobs(url, secret, "tone") == [], "a spectrum job runs beside the scan"
+        if os.environ.get("ZETA_UI_SHOTS"):
+            page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "scan.png"))
+    finally:
+        for j in scans:
+            stop_job(url, secret, j["id"])
+    # The scan gone, the waterfall goes back to its own spectrum job.
+    page.wait_for_function("() => window.zetaTest.waterfallMode === 'spectrum'", timeout=10_000)
+    wait_waterfall_follows(page, "!!w.jobId", "back to spectrum")
+
+
+def scenario_scan_of_a_sub_band_scans_just_that_band(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    # The upper fifth of the capture, off centre: one step of that width, kept inside the
+    # recording (a capture-wide step centred there would leave it and fail the scan).
+    drag_menu(page, 0.10, 0.30)
+    footer = page.locator("#ctx-footer").text_content()
+    bw = int(re.search(r"bandwidth_hz=(\d+)", footer).group(1))
+    page.click('#ctx .ctx-item[data-action="scan"]')
+    scans = []
+    try:
+        deadline = time.monotonic() + 5.0
+        while not scans and time.monotonic() < deadline:
+            scans = running_scan_jobs(url, secret, "tone")
+            time.sleep(0.2)
+        assert len(scans) == 1, f"scan jobs on tone: {scans}"
+        assert scans[0]["tuning"]["bandwidth_hz"] == bw, f"scan tuning {scans[0]['tuning']}, drag {bw}"
+        wait_waterfall_follows(page, f"w.jobId === {json.dumps(scans[0]['id'])}", "scan mode")
+        before = page.evaluate("window.zetaTest.wf().painted")
+        page.wait_for_function(f"() => window.zetaTest.wf().painted > {before + 3}", timeout=10_000)
+        # Its rows cover the capture the file source answers with: the band widens to them.
+        wait_ticks(page, "100.024", "99.976", "scan band widened to its rows")
+        now = running_scan_jobs(url, secret, "tone")
+        assert [j["id"] for j in now] == [scans[0]["id"]], f"the scan stopped: {now}"
+    finally:
+        for j in scans:
+            stop_job(url, secret, j["id"])
+    page.wait_for_function("() => window.zetaTest.waterfallMode === 'spectrum'", timeout=10_000)
+
+
+def scenario_overlays_follow_a_zoom(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.wf().painted > 5", timeout=15_000)
+    wait_ticks(page, "100.024", "99.976", "before zooming")
+    # A label 12 kHz above the centre: a quarter of the way down from the top.
+    top = page.evaluate("""() => {
+      const el = window.zetaTest.label(100012000, "probe");
+      return parseFloat(el.style.top) + el.offsetHeight / 2;
+    }""")
+    h = page.evaluate("document.querySelector('#waterfall canvas.wf-canvas').clientHeight")
+    assert abs(top - h / 4) < 2, f"label at {top}, want {h / 4}"
+    # A wheel notch x2 in about the centre, and the label read in the same task: it is at the
+    # top edge at once, not only when the next column scrolls the overlays.
+    moved = page.evaluate("""() => {
+      const o = document.querySelector('#waterfall canvas.wf-overlay');
+      const r = o.getBoundingClientRect();
+      o.dispatchEvent(new WheelEvent('wheel', {deltaY: -100, deltaMode: 0, bubbles: true,
+        cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2}));
+      const el = document.querySelector('.ov-label');
+      return parseFloat(el.style.top) + el.offsetHeight / 2;
+    }""")
+    assert abs(moved) < 2, f"label at {moved} right after the zoom, want 0"
+    wait_ticks(page, "100.012", "99.988", "after zooming in")
 
 
 # ---- graph view and audio (Task 10) --------------------------------------------------------

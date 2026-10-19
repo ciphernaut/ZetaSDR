@@ -6,23 +6,102 @@ use crate::device::{RangeHz, SoapyDevice, WireFormat};
 
 const RATE_QUANTUM_HZ: u64 = 100_000;
 
-/// Asserted capabilities from the device's reported ranges.
+/// Doubling rounds of [`probe_rate_ranges`] on a UHD device.
+const UHD_PROBE_ROUNDS: usize = 3;
+/// UHD master-clock ceilings, descending (N3xx, X3xx, B2xx, B2xx alternate,
+/// B1xx): tried once when doubling the rate stops widening the range.
+const UHD_CLOCK_CEILINGS_HZ: [f64; 5] = [250e6, 200e6, 61.44e6, 56e6, 32e6];
+
+fn max_rate(ranges: &[RangeHz]) -> f64 {
+    ranges
+        .iter()
+        .map(|r| r.max_hz)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// Driver keys a UHD device reports (SoapyUHD gives the device type, `b200`
+/// for a B210, rather than `uhd`); matched as case-insensitive prefixes.
+const UHD_DRIVER_KEYS: [&str; 7] = ["uhd", "b200", "b100", "x300", "n3xx", "e3xx", "usrp2"];
+
+/// Whether a device opened with `args` reporting `driver_key` is a UHD device,
+/// whose rate range depends on its master clock: `driver=uhd` in the args, or
+/// a UHD driver key.
+pub fn is_uhd(args: &str, driver_key: &str) -> bool {
+    let by_args = args.split(',').any(|kv| {
+        kv.split_once('=').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("driver") && v.trim().eq_ignore_ascii_case("uhd")
+        })
+    });
+    let key = driver_key.to_ascii_lowercase();
+    by_args || UHD_DRIVER_KEYS.iter().any(|k| key.starts_with(k))
+}
+
+/// The device's sample-rate ranges. A UHD device reports them for its
+/// current master clock (a B210 opens at 16 MHz), so with `probe` (see
+/// [`is_uhd`]) the range is re-read after asking for twice the reported
+/// maximum (errors ignored; the driver raises its clock as far as it can),
+/// while the maximum grows, at most three rounds. When a doubling does not
+/// widen it (UHD refuses a rate above its clock's reach), the known clock
+/// ceilings above the current maximum are tried once, highest first, and
+/// doubling continues from the first that widens it. The rate in force
+/// before is then restored. Without `probe` the ranges are read once. A
+/// `master_clock_rate=` device argument still fixes the clock, and with it
+/// the range.
+pub fn probe_rate_ranges(dev: &dyn SoapyDevice, probe: bool) -> Result<Vec<RangeHz>, String> {
+    let mut rates = dev.sample_rate_ranges()?;
+    if !probe || rates.is_empty() {
+        return Ok(rates);
+    }
+    let saved = dev.sample_rate().ok().filter(|r| *r > 0.0);
+    // The range after asking for `hz`, when it reaches higher than `than`.
+    let grown = |hz: f64, than: f64| -> Option<Vec<RangeHz>> {
+        let _ = dev.set_sample_rate(hz);
+        dev.sample_rate_ranges()
+            .ok()
+            .filter(|r| !r.is_empty() && max_rate(r) > than)
+    };
+    let mut ceilings_tried = false;
+    for _ in 0..UHD_PROBE_ROUNDS {
+        let before = max_rate(&rates);
+        if let Some(r) = grown(2.0 * before, before) {
+            rates = r;
+            continue;
+        }
+        // UHD refuses a rate its clock cannot reach rather than clamping it:
+        // try the known clock ceilings above the current maximum, once.
+        if ceilings_tried {
+            break;
+        }
+        ceilings_tried = true;
+        match UHD_CLOCK_CEILINGS_HZ
+            .iter()
+            .filter(|&&c| c > before)
+            .find_map(|&c| grown(c, before))
+        {
+            Some(r) => rates = r,
+            None => break,
+        }
+    }
+    if let Some(r) = saved {
+        let _ = dev.set_sample_rate(r);
+    }
+    Ok(rates)
+}
+
+/// Asserted capabilities from the device's reported ranges, with `rates`
+/// from [`probe_rate_ranges`].
 ///
 /// Min-of-minimums / max-of-maximums overstates coverage on devices whose
 /// ranges have gaps; `tune` still validates against the real device.
-pub fn capabilities(dev: &dyn SoapyDevice) -> Result<Capabilities, String> {
+pub fn capabilities(dev: &dyn SoapyDevice, rates: &[RangeHz]) -> Result<Capabilities, String> {
     let freq = dev.frequency_ranges()?;
-    let rates = dev.sample_rate_ranges()?;
     let (_, formats) = dev.formats()?;
     let min = freq.iter().map(|r| r.min_hz).fold(f64::INFINITY, f64::min);
     let max = freq
         .iter()
         .map(|r| r.max_hz)
         .fold(f64::NEG_INFINITY, f64::max);
-    let bw = rates
-        .iter()
-        .map(|r| r.max_hz)
-        .fold(f64::NEG_INFINITY, f64::max);
+    let bw = max_rate(rates);
     if freq.is_empty() || rates.is_empty() {
         return Err("device reports no frequency or sample-rate range".into());
     }
@@ -132,7 +211,10 @@ mod tests {
 
     #[test]
     fn hackrf_like_capabilities() {
-        let c = capabilities(&MockDevice::hackrf_like()).unwrap();
+        let c = {
+            let d = MockDevice::hackrf_like();
+            capabilities(&d, &d.sample_rate_ranges().unwrap()).unwrap()
+        };
         assert_eq!(c.tune_min_hz, Claim::Asserted(Hz(1_000_000)));
         assert_eq!(c.tune_max_hz, Claim::Asserted(Hz(6_000_000_000)));
         assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(20_000_000)));
@@ -145,8 +227,91 @@ mod tests {
     }
 
     #[test]
+    fn uhd_rate_range_is_probed_at_the_maximum_clock() {
+        // SoapyUHD reports the device type as the driver key.
+        let dev = MockDevice::hackrf_like()
+            .with_driver("b200")
+            .with_rate_follow(16e6, 61.44e6);
+        dev.set_sample_rate(8e6).unwrap();
+        let rates = probe_rate_ranges(&dev, is_uhd("", &dev.driver_key())).unwrap();
+        let c = capabilities(&dev, &rates).unwrap();
+        assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(61_440_000)));
+        assert_eq!(pick_rate(&rates, 30_000_000), Some(30_000_000));
+        // Probed 32 M, then 64 M (clipped to 61.44 M), then 122.88 M: no
+        // growth, nor from the ceilings above 61.44 M.
+        assert_eq!(dev.range_reads(), 6);
+        assert_eq!(
+            dev.calls(),
+            [
+                "set_sample_rate(8000000)",
+                "set_sample_rate(32000000)",
+                "set_sample_rate(64000000)",
+                "set_sample_rate(122880000)",
+                "set_sample_rate(250000000)",
+                "set_sample_rate(200000000)",
+                "set_sample_rate(8000000)"
+            ]
+        );
+        assert_eq!(dev.sample_rate(), Ok(8e6), "rate restored");
+    }
+
+    #[test]
+    fn uhd_probe_tries_clock_ceilings_when_a_doubling_is_refused() {
+        // A B210 refuses 64 M outright: 32 M, then the ceilings reach 61.44 M.
+        let dev = MockDevice::hackrf_like()
+            .with_driver("b200")
+            .with_rate_follow(16e6, 61.44e6)
+            .refusing_above_ceiling();
+        dev.set_sample_rate(8e6).unwrap();
+        let rates = probe_rate_ranges(&dev, is_uhd("", &dev.driver_key())).unwrap();
+        let c = capabilities(&dev, &rates).unwrap();
+        assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(61_440_000)));
+        assert_eq!(
+            dev.calls(),
+            [
+                "set_sample_rate(8000000)",
+                "set_sample_rate(32000000)",
+                "set_sample_rate(64000000)",
+                "set_sample_rate(250000000)",
+                "set_sample_rate(200000000)",
+                "set_sample_rate(61440000)",
+                "set_sample_rate(122880000)",
+                "set_sample_rate(8000000)"
+            ]
+        );
+        assert_eq!(dev.sample_rate(), Ok(8e6), "rate restored");
+    }
+
+    #[test]
+    fn non_uhd_rate_range_is_read_once() {
+        let dev = MockDevice::hackrf_like().with_rate_follow(16e6, 61.44e6);
+        let rates = probe_rate_ranges(&dev, is_uhd("driver=hackrf", &dev.driver_key())).unwrap();
+        let c = capabilities(&dev, &rates).unwrap();
+        assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(16_000_000)));
+        assert_eq!(dev.range_reads(), 1);
+        assert!(dev.calls().is_empty(), "{:?}", dev.calls());
+    }
+
+    #[test]
+    fn uhd_gate_matches_args_and_real_driver_keys() {
+        for key in [
+            "uhd", "b200", "B200", "b100", "x300", "n3xx", "e3xx", "usrp2",
+        ] {
+            assert!(is_uhd("", key), "{key}");
+        }
+        assert!(is_uhd("driver=uhd,type=b200", "something"));
+        assert!(is_uhd("serial=1, driver = UHD", ""));
+        assert!(!is_uhd("driver=hackrf", "hackrf"));
+        assert!(!is_uhd("driver=rtlsdr", "RTLSDR"));
+        assert!(!is_uhd("driver=remote,remote:driver=uhd", "remote"));
+    }
+
+    #[test]
     fn remote_driver_is_remote() {
-        let c = capabilities(&MockDevice::hackrf_like().with_driver("remote")).unwrap();
+        let c = {
+            let d = MockDevice::hackrf_like().with_driver("remote");
+            capabilities(&d, &d.sample_rate_ranges().unwrap()).unwrap()
+        };
         assert!(c.remote);
     }
 

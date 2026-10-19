@@ -55,9 +55,29 @@ impl From<PortError> for LeaseError {
     }
 }
 
+/// One holder's lease on a source. A `time_shared` lease (a scan) covers a
+/// band wider than any one capture: its holder retunes the port across it,
+/// so no other request fits while it is held.
+#[derive(Clone, Debug)]
+struct Lease {
+    job: JobId,
+    band: Tuning,
+    time_shared: bool,
+}
+
+impl Lease {
+    fn new(job: JobId, band: Tuning) -> Self {
+        Self {
+            job,
+            band,
+            time_shared: false,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct LeaseManager {
-    leases: Mutex<HashMap<SourceId, Vec<(JobId, Tuning)>>>,
+    leases: Mutex<HashMap<SourceId, Vec<Lease>>>,
     /// Per-source gate held for the whole of `ensure`, across `port.tune().await`.
     gates: Mutex<HashMap<SourceId, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -79,8 +99,12 @@ fn fits(want: &Tuning, cur: &Tuning) -> bool {
 
 /// Ways out of a conflict between `want` and the port's current band `cur`
 /// that the caller can act on. Widening is listed only when the port could
-/// capture both bands at once; no operation performs it yet.
-fn conflict_options(port: &dyn Port, want: &Tuning, cur: &Tuning) -> Vec<String> {
+/// capture both bands at once; no operation performs it yet. A port under a
+/// time-shared lease (a scan) is freed only by stopping that holder.
+fn conflict_options(port: &dyn Port, want: &Tuning, cur: &Tuning, shared: bool) -> Vec<String> {
+    if shared {
+        return vec!["stop the scan holding the source".to_string()];
+    }
     let mut options = vec![
         "stop one of the holders".to_string(),
         "choose a band inside current".to_string(),
@@ -133,16 +157,17 @@ impl LeaseManager {
             let mut leases = self.leases.lock().unwrap();
             // A held port lacking a current tuning is taken to be at its
             // first holder's band, as in `tune_if_unheld`; it is never retuned.
-            let first = leases.get(&source).and_then(|v| v.first()).map(|(_, t)| *t);
+            let first = leases.get(&source).and_then(|v| v.first()).map(|l| l.band);
             if let Some(cur) = first.map(|f| port.current().unwrap_or(f)) {
-                if fits(&want, &cur) {
+                let shared = leases[&source].iter().any(|l| l.time_shared);
+                if !shared && fits(&want, &cur) {
                     let v = leases.get_mut(&source).unwrap();
-                    v.retain(|(j, _)| j != &holder);
-                    v.push((holder, want));
+                    v.retain(|l| l.job != holder);
+                    v.push(Lease::new(holder, want));
                     return Ok(cur);
                 }
-                let holders = leases[&source].iter().map(|(j, _)| j.clone()).collect();
-                let options = conflict_options(port, &want, &cur);
+                let holders = leases[&source].iter().map(|l| l.job.clone()).collect();
+                let options = conflict_options(port, &want, &cur, shared);
                 return Err(LeaseError::Conflict {
                     source,
                     holders,
@@ -154,9 +179,66 @@ impl LeaseManager {
         let got = port.tune(want).await?;
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source).or_default();
-        v.retain(|(j, _)| j != &holder);
-        v.push((holder, got));
+        v.retain(|l| l.job != holder);
+        v.push(Lease::new(holder, got));
         Ok(got)
+    }
+
+    /// Grant `holder` a time-shared lease on the whole `span` of `port`
+    /// without tuning it (see [`LeaseManager::retune_shared`]). The port must
+    /// be unheld; while the lease is held every other `ensure` and
+    /// `tune_if_unheld` is a conflict naming `holder`.
+    pub async fn acquire_shared(
+        &self,
+        port: &dyn Port,
+        holder: JobId,
+        span: Tuning,
+    ) -> Result<(), LeaseError> {
+        let source = port.id().clone();
+        let gate = self.gate(&source);
+        let _guard = gate.lock().await;
+        let mut leases = self.leases.lock().unwrap();
+        let v = leases.entry(source.clone()).or_default();
+        v.retain(|l| l.job != holder);
+        if let Some(first) = v.first() {
+            let cur = port.current().unwrap_or(first.band);
+            let shared = v.iter().any(|l| l.time_shared);
+            return Err(LeaseError::Conflict {
+                holders: v.iter().map(|l| l.job.clone()).collect(),
+                options: conflict_options(port, &span, &cur, shared),
+                source,
+                current: cur,
+            });
+        }
+        v.push(Lease {
+            job: holder,
+            band: span,
+            time_shared: true,
+        });
+        Ok(())
+    }
+
+    /// Tune `port` to `step` for the holder of a time-shared lease, under
+    /// the source's gate. `None` (and no tune) once `holder` holds no
+    /// time-shared lease on `port`.
+    pub async fn retune_shared(
+        &self,
+        port: &dyn Port,
+        holder: &JobId,
+        step: Tuning,
+    ) -> Result<Option<Tuning>, PortError> {
+        let gate = self.gate(port.id());
+        let _guard = gate.lock().await;
+        let held = self
+            .leases
+            .lock()
+            .unwrap()
+            .get(port.id())
+            .is_some_and(|v| v.iter().any(|l| &l.job == holder && l.time_shared));
+        if !held {
+            return Ok(None);
+        }
+        port.tune(step).await.map(Some)
     }
 
     /// Tune `port` to `want` without taking a lease, under the same per-source
@@ -171,16 +253,18 @@ impl LeaseManager {
         let source = port.id().clone();
         let gate = self.gate(&source);
         let _guard = gate.lock().await;
-        let held = self.holders(&source);
-        let Some((_, first)) = held.first() else {
+        let held = self.leases.lock().unwrap().get(&source).cloned();
+        let Some(first) = held.as_ref().and_then(|v| v.first()) else {
             return Ok(port.tune(want).await?);
         };
-        let cur = port.current().unwrap_or(*first);
-        if fits(&want, &cur) {
+        let cur = port.current().unwrap_or(first.band);
+        let held = held.unwrap_or_default();
+        let shared = held.iter().any(|l| l.time_shared);
+        if !shared && fits(&want, &cur) {
             return Ok(cur);
         }
-        let options = conflict_options(port, &want, &cur);
-        let holders = held.into_iter().map(|(j, _)| j).collect();
+        let options = conflict_options(port, &want, &cur, shared);
+        let holders = held.into_iter().map(|l| l.job).collect();
         Err(LeaseError::Conflict {
             source,
             holders,
@@ -193,18 +277,28 @@ impl LeaseManager {
     pub fn release(&self, holder: &JobId) {
         let mut leases = self.leases.lock().unwrap();
         leases.retain(|_, v| {
-            v.retain(|(j, _)| j != holder);
+            v.retain(|l| &l.job != holder);
             !v.is_empty()
         });
     }
 
-    /// Current holders of `source`, in insertion order.
+    /// Whether `source` is held by a time-shared lease (a scan).
+    pub fn time_shared(&self, source: &SourceId) -> bool {
+        self.leases
+            .lock()
+            .unwrap()
+            .get(source)
+            .is_some_and(|v| v.iter().any(|l| l.time_shared))
+    }
+
+    /// Current holders of `source`, in insertion order, with the band each
+    /// leased (a time-shared holder's is its whole span).
     pub fn holders(&self, source: &SourceId) -> Vec<(JobId, Tuning)> {
         self.leases
             .lock()
             .unwrap()
             .get(source)
-            .cloned()
+            .map(|v| v.iter().map(|l| (l.job.clone(), l.band)).collect())
             .unwrap_or_default()
     }
 }

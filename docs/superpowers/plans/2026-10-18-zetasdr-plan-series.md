@@ -15,6 +15,7 @@ interfaces rather than guessed ones.
 | 5 | Federation | Node-to-node: VITA 49.2 for IQ, typed envelope for the rest, back-pressure, shared secret, Pi 5 build and deployment, remote node as a source. **Delivered** on branch `federation`, 2026-10-19. Pending: deployment on Pi hardware (no Pi is set up yet), the one-shot `--then-tail` finding against the B210, and releasing the remote job when the local job stops. | 3, 4 |
 | 6 | UI | Wide renderer (waterfall, ribbons, context menu, agent pane, jobs), narrow renderer, graph view. All clients of the plan-3 websocket. **Delivered** on branch `ui`, 2026-10-19. Pending: the phone check of the narrow renderer, the microphone against a real `voiced`, the HackRF walk, and a live `/ask` answer from the field host. | 3 |
 | 7 | Audio path and wideband FM | Rational resampler so every demod outputs 48 kHz audio; `wfm_demod`, `am_demod` and `ssb_demod` job kinds (`--sideband`); layer-1 rules for `wfm` (19 kHz pilot as evidence), `am` and `ssb`; iNTERCEPT signal catalogue (Apache-2.0, 594 entries) as knowledge provider and layer-2 classifier; UI decode entries and playback of any audio job. **Delivered** on branch `audio-wfm`, 2026-10-19. Pending: AM and SSB playback in a browser. | 2, 6 |
+| 8 | Wideband | Polyphase filter bank shared by every job on a wide capture (a channel that fits one bin is bank-served, wider ones take the direct path); spectrum rows v2 (fixed `rows_per_s`, u8-quantised `q`, up to 8192 bins); UI band control (zoom and pan inside the capture render only, beyond it retune); `scan` job that time-shares a radio across a span wider than one capture and holds the lease on it; IQ ring sized from a memory budget (`--ring-budget-mb`); `wfm_demod` decimates before its audio filter. **Delivered** on branch `wideband`, 2026-10-20. Pending: the fix wave (sub-band scan clamp, overlays and scan redraw), the B210 at 24 Msps (its asserted `max_bandwidth_hz` is 16 MHz), and the bank's 20 % cost target (33 % measured at 16 Msps). | 2, 6, 7 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
@@ -37,6 +38,8 @@ direct 5-token `curl` POST to `/v1/chat/completions` returned no bytes within 20
 cause is unknown and server-side. The live result is therefore unconfirmed and needs a rerun.
 Deferred to later plans: browser websocket authentication and the operation log stream (plan 6),
 binary audio and IQ over the websocket (plans 5 and 6), federation authentication (plan 5).
+On 2026-10-19 in the evening the field host's chat completions answered again: the live test
+`field_host_gemma_tunes_hackrf0` passed (1.2 s) and `zeta ask` against the B210 node answered correctly.
 
 ## Plan 4 status
 
@@ -204,6 +207,8 @@ menu by touch, Decode › APRS and its ribbon. The mic will not work there over 
 allow it only on a secure origin). Also pending: the microphone against a real `voiced`, the
 HackRF walk (`--source-soapy` in the release `--cfg soapy` build, 104.9 MHz, Decode › NBFM audio;
 the HackRF was unplugged), and a live `/ask` once the field host's chat completions answer.
+The live `/ask` is no longer pending: on 2026-10-19 in the evening gemma-4-12b answered again, and the
+UI's agent pane works live against the field host (calls in the transcript, then the answer).
 
 ## Plan 7 status
 
@@ -252,3 +257,75 @@ the catalogue; AM and SSB playback has not been tried in a browser; stereo and R
 The wfm rule's cv limit has little margin on a real station (one span in 20 missed it); letting a
 strong 19 kHz pilot carry a marginal band is a candidate fix. `knowledge lookup --region AU` returned no
 allocation covering 104.9 MHz.
+
+## Plan 8 status
+
+Plan 8 is delivered on `wideband` (ff919fb..14f1df7 plus this docs commit): `PfbBank` in
+`zeta-dsp` (2x-oversampled polyphase analysis, bins at least 750 kHz wide, 8..=256 of them,
+Blackman prototype at 0.75 bin with 16·bins taps, at least 60 dB down in every bin whose span
+excludes a tone) behind core's `ChannelBank`/`BankFactory`, one bank per source at 2 Msps or more on
+its own thread; the `channel` stage draws from the nearest bin when the request fits one bin width
+and the output rate divides the bin rate, and takes the direct path otherwise, with the same
+semantics either way (`StageContext` passes the bank to every stage); spectrum rows v2 at a fixed
+`rows_per_s`, quantised to u8 at 0.5 dB with `floor_db`, `size` up to 8192 and following the band;
+the IQ ring sized from `--ring-budget-mb` (default a quarter of `MemTotal`, at most 4 GiB; 1..10 s,
+recomputed on retune, released on shrink); `JobKind::Scan` (16 MHz steps at most, 250 ms dwell,
+the lease on the whole span, `conflict` naming the scan for anything else on the source); and in
+the UI, `#band`, pan and wheel zoom (render-only inside the capture, a retune beyond it) and the
+stitched scan waterfall with "Scan this span". `wfm_demod` now decimates before its audio filter.
+
+The workspace gates passed on 2026-10-20 at 14f1df7: fmt; clippy with `--all-targets
+--all-features -D warnings`; `cargo test --workspace --all-features` 588 passed, 0 failed, 3 ignored
+(live Kiwi, live the field host model, and the release-only PFB timing test) over 86 test binaries;
+`zeta agents-md --check` and `--skill --check`; `cargo test -p zeta --test ui`: all 35 Playwright
+scenarios passed in headless Chromium (144.6 s, no skip line). The release timing test
+(`cargo test -p zeta-dsp --release --test pfb pfb_runs -- --include-ignored`) pushed 2 s of 24 Msps
+through 32 bins in 1.39 s on this laptop: 0.694 of one core.
+
+By hand on 2026-10-20 against the field host's B210 (release `--cfg soapy` build of 14f1df7, 12 cores),
+driven from this box with the debug `zeta --node`. The B210 asserts `max_bandwidth_hz` 16 MHz:
+the SoapySDR capability probe runs while UHD's automatic master clock sits at 16 MHz, so
+`source ensure --bandwidth-hz 24000000` is refused `out_of_range` (max 16000000) although the
+radio, on USB 3, can do more; the acceptance ran at 16 Msps. At 98 MHz / 16 MHz the node logged
+`ring for b210: 10.00 s at 16000000 Hz (1280.0 MB)`; the spectrum job's rows had `size` 4096
+(3906.25 Hz bins), `q` present, `rows_per_s` 20 and `start_ns` 50 ms apart. Four `wfm_demod`
+jobs (100.5, 94.5, 101.3 and 93.7 MHz, 200 kHz each, bank-served) and a `measure` (95.3 MHz:
+`wfm` 0.9, pilot +40.9 dB, snr 29 dB) ran together beside the spectrum job; each audio stream
+gave 48 000 Hz frames with peaks above 0.05 (2 s medians 0.20, 0.46, 0.84, 0.16). A fifth
+candidate, 102.5 MHz (40 dB above the floor), demodulated to peaks near 0.008 and was replaced:
+a carrier with little or no program audio there, not investigated. CPU over 10 s from
+`/proc/<pid>/task/*/stat`: the node 121 % of one core in all (`top` agreed, 120 %), of which the
+bank thread `pfb-98000000` 33 %, the SoapySDR reader 9 %, the tokio workers 72 % for the six jobs,
+and 7 % another node thread; with the spectrum job alone the node used 23 %. So each job is far
+under one core (about 13 % per channel job on average), but the bank at 16 Msps costs 33 % of one
+core, over the 20 % target (it would be about 50 % at 24 Msps). `scan` over 0-1 GHz started at
+the B210's 42 MHz floor and stepped 56, 72, ... 1000 MHz: 61 distinct `center_hz` values, four rows
+per step about 270 ms apart, one sweep in 19.2 s (two full sweeps seen in 60 s). During the scan
+`job start --kind measure` and `--kind wfm_demod` on b210 were both refused `conflict` with the
+scan as holder and the option "stop the scan holding the source"; `source list` showed the scan
+as the only holder and `current` 712 MHz / 16 MHz; after the stop, no holders and `current` at
+the last step (232 MHz / 16 MHz). Headless Chromium against the live UI during a second scan
+switched to scan mode and painted the stitched view (84 columns in 25 s; `scratch/ui/scan-live.png`),
+with the FM band bright near 100 MHz. The B210 was left at 104.9 MHz / 1 MHz with no jobs. Not
+done: the `--ring-budget-mb 1024` restart (the node was not restarted); the sizing line above is
+the default budget's. A UI tab open elsewhere kept restarting its own 1 MHz spectrum job on the
+B210 and had to be stopped before the wide retune.
+
+Parked: the scan runs its FFT inline on a worker (spawn_blocking it); the dwell does not skip
+the PLL settling time at its start; each dwell copies 32 MB from the ring; a remote node's
+`current` is cleared when idle; the bank's cost is over its 20 % target on the field host (above); the
+overlays do not reposition on a view change; the scan view does not redraw a full sweep from the
+ring rows on zoom; core does not clamp a scan step to a sub-band span (min(step, span), centre
+inside the span) pending the fix wave; and the Soapy capability probe should read the rate range
+after the master clock is raised (or assert the device's real maximum).
+
+After the plan-8 fix wave (2026-10-20): the Soapy source probes a UHD device's sample-rate range at its
+maximum clock, so the B210 reports 61.44 MHz with no device argument and a 24 MHz request becomes a 30.72
+Msps capture (ring 10 s, 2.46 GB on the field host). With a spectrum job, four `wfm_demod` jobs and a `measure`
+on that capture the node used about 173 % of a core: the bank thread 30 % (down from 50 % before the PFB
+optimisations), the decoders 12-20 % each, audio clean. The plan's 20 % bank target holds at 16 Msps and is
+missed by ten points at 30.72 Msps; `target-cpu`/multiversioning and a partial DFT for few bins are the
+parked next steps. The scan, lease conflicts and stitched view were exercised live at 16 Msps earlier the
+same night (0-1 GHz in 61 steps, 19.2 s per sweep). The plan's Conventions block says Hann for the PFB
+prototype; the code uses Blackman (ruling R4) with a 0.75-bin cutoff and 16 × bins taps (ruling R5).
+

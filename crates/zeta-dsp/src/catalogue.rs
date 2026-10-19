@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use async_trait::async_trait;
 use num_complex::Complex;
 use serde::Deserialize;
-use zeta_core::classify::{Band, Classifier, FeatureRecord, Label};
+use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement};
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::types::Hz;
 
@@ -266,11 +266,13 @@ pub fn catalogue_labels(center_hz: u64, bandwidth_hz: u64, layer1: &str) -> Vec<
         .collect()
 }
 
-/// Layer-2 classifier naming signals from the catalogue: measures the band
-/// with [`measure_selection`] (its centre, bandwidth and layer-1 label; with
-/// `features`, their centre and bandwidth are used instead of the measured
-/// ones) and scores every entry with [`catalogue_labels`]. Nothing for a
-/// band layer 1 calls noise.
+/// Layer-2 classifier naming signals from the catalogue: takes the band's
+/// centre, bandwidth and layer-1 label from an earlier classifier's
+/// [`Measurement`] when [`Classifier::classify_measured`] is handed one, and
+/// otherwise measures the band with [`measure_selection`]; with `features`,
+/// their centre and bandwidth are used instead of the measured ones. Scores
+/// every entry with [`catalogue_labels`]. Nothing for a band layer 1 calls
+/// noise.
 pub struct CatalogueClassifier;
 
 #[async_trait]
@@ -289,14 +291,37 @@ impl Classifier for CatalogueClassifier {
         band: Band,
         features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
-        let Some((measured, label)) = measure_selection(iq, sample_rate_hz.0, center_hz.0, band)
-        else {
-            return Vec::new();
+        self.classify_measured(iq, sample_rate_hz, center_hz, band, features, None)
+            .await
+            .0
+    }
+    async fn classify_measured(
+        &self,
+        iq: &[Complex<f32>],
+        sample_rate_hz: Hz,
+        center_hz: Hz,
+        band: Band,
+        features: Option<&FeatureRecord>,
+        measured: Option<&Measurement>,
+    ) -> (Vec<Label>, Option<Measurement>) {
+        let own;
+        let m = match measured {
+            Some(m) => m,
+            None => match measure_selection(iq, sample_rate_hz.0, center_hz.0, band) {
+                Some((features, label)) => {
+                    own = Measurement { features, label };
+                    &own
+                }
+                None => return (Vec::new(), None),
+            },
         };
-        if label.name == "noise" {
-            return Vec::new();
+        if m.label.name == "noise" {
+            return (Vec::new(), None);
         }
-        let f = features.unwrap_or(&measured);
-        catalogue_labels(f.center_hz.0, f.bandwidth_hz.0, &label.name)
+        let f = features.unwrap_or(&m.features);
+        (
+            catalogue_labels(f.center_hz.0, f.bandwidth_hz.0, &m.label.name),
+            None,
+        )
     }
 }

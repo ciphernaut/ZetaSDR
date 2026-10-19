@@ -57,6 +57,15 @@ impl Band {
     }
 }
 
+/// A band's layer-1 measurement: its features and the label read from them.
+/// [`ClassifierSet::run_all`] hands the first one a classifier produces to
+/// the classifiers after it, so the band is measured once per run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Measurement {
+    pub features: FeatureRecord,
+    pub label: Label,
+}
+
 #[async_trait]
 pub trait Classifier: Send + Sync {
     fn name(&self) -> &str;
@@ -71,6 +80,28 @@ pub trait Classifier: Send + Sync {
         band: Band,
         features: Option<&FeatureRecord>,
     ) -> Vec<Label>;
+
+    /// [`Classifier::classify`] given `measured`, an earlier classifier's
+    /// measurement of the same band, and returning the classifier's own
+    /// measurement when it made one. The default ignores `measured` and
+    /// measures nothing; a classifier that measures the band overrides this
+    /// to return it, and one that needs a measurement overrides it to use
+    /// `measured` instead of measuring again.
+    async fn classify_measured(
+        &self,
+        iq: &[Complex<f32>],
+        sample_rate_hz: Hz,
+        center_hz: Hz,
+        band: Band,
+        features: Option<&FeatureRecord>,
+        _measured: Option<&Measurement>,
+    ) -> (Vec<Label>, Option<Measurement>) {
+        (
+            self.classify(iq, sample_rate_hz, center_hz, band, features)
+                .await,
+            None,
+        )
+    }
 }
 
 /// The layer-3 slot, proving a SIGINT classifier can plug in; labels nothing.
@@ -108,6 +139,8 @@ impl ClassifierSet {
 
     /// Every classifier's labels for `band` of `iq` (a block centred at
     /// `center_hz`), lowest layer first; registration order within a layer.
+    /// The first [`Measurement`] a classifier returns is passed to every
+    /// classifier after it.
     pub async fn run_all(
         &self,
         iq: &[Complex<f32>],
@@ -119,11 +152,22 @@ impl ClassifierSet {
         let mut ordered: Vec<&Arc<dyn Classifier>> = self.classifiers.iter().collect();
         ordered.sort_by_key(|c| c.layer());
         let mut labels = Vec::new();
+        let mut measured: Option<Measurement> = None;
         for c in ordered {
-            labels.extend(
-                c.classify(iq, sample_rate_hz, center_hz, band, features)
-                    .await,
-            );
+            let (l, m) = c
+                .classify_measured(
+                    iq,
+                    sample_rate_hz,
+                    center_hz,
+                    band,
+                    features,
+                    measured.as_ref(),
+                )
+                .await;
+            labels.extend(l);
+            if measured.is_none() {
+                measured = m;
+            }
         }
         labels
     }
@@ -165,6 +209,116 @@ mod tests {
                 evidence: String::new(),
             }]
         }
+    }
+
+    /// Layer 1 that measures (returning `marker` as its record), and layer 2
+    /// that records the measurement it was handed.
+    struct Measures(FeatureRecord);
+    struct Uses(Mutex<Vec<Option<Measurement>>>);
+
+    fn label(layer: u8, name: &str) -> Label {
+        Label {
+            layer,
+            name: name.into(),
+            confidence: 1.0,
+            evidence: String::new(),
+        }
+    }
+
+    #[async_trait]
+    impl Classifier for Measures {
+        fn name(&self) -> &str {
+            "measures"
+        }
+        fn layer(&self) -> u8 {
+            1
+        }
+        async fn classify(
+            &self,
+            _: &[Complex<f32>],
+            _: Hz,
+            _: Hz,
+            _: Band,
+            _: Option<&FeatureRecord>,
+        ) -> Vec<Label> {
+            vec![label(1, "wfm")]
+        }
+        async fn classify_measured(
+            &self,
+            _: &[Complex<f32>],
+            _: Hz,
+            _: Hz,
+            _: Band,
+            _: Option<&FeatureRecord>,
+            _: Option<&Measurement>,
+        ) -> (Vec<Label>, Option<Measurement>) {
+            let l = label(1, "wfm");
+            (
+                vec![l.clone()],
+                Some(Measurement {
+                    features: self.0.clone(),
+                    label: l,
+                }),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Classifier for Uses {
+        fn name(&self) -> &str {
+            "uses"
+        }
+        fn layer(&self) -> u8 {
+            2
+        }
+        async fn classify(
+            &self,
+            _: &[Complex<f32>],
+            _: Hz,
+            _: Hz,
+            _: Band,
+            _: Option<&FeatureRecord>,
+        ) -> Vec<Label> {
+            Vec::new()
+        }
+        async fn classify_measured(
+            &self,
+            _: &[Complex<f32>],
+            _: Hz,
+            _: Hz,
+            _: Band,
+            _: Option<&FeatureRecord>,
+            measured: Option<&Measurement>,
+        ) -> (Vec<Label>, Option<Measurement>) {
+            self.0.lock().unwrap().push(measured.cloned());
+            (Vec::new(), None)
+        }
+    }
+
+    #[tokio::test]
+    async fn run_all_hands_the_layer1_measurement_to_later_layers() {
+        let marker = FeatureRecord {
+            bandwidth_hz: Hz(123_457),
+            center_hz: Hz(104_900_000),
+            symbol_rate_baud: None,
+            snr_db: 12.5,
+            burst: false,
+        };
+        let uses = Arc::new(Uses(Mutex::new(Vec::new())));
+        let mut set = ClassifierSet::default();
+        // Registered before layer 1: run_all orders by layer, not registration.
+        set.register(uses.clone());
+        set.register(Arc::new(Measures(marker.clone())));
+        set.register(Arc::new(StubClassifier));
+        let labels = set
+            .run_all(&[], Hz(240_000), Hz(0), Band::whole(Hz(240_000)), None)
+            .await;
+        assert_eq!(labels, [label(1, "wfm")]);
+        let seen = uses.0.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let m = seen[0].as_ref().expect("layer 2 was handed a measurement");
+        assert_eq!(m.features, marker);
+        assert_eq!(m.label.name, "wfm");
     }
 
     #[tokio::test]

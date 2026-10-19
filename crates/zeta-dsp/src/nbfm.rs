@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
+use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, StreamId, StreamKind};
 
@@ -125,6 +125,7 @@ impl Stage for NbfmDemodStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
+        _ctx: StageContext,
     ) -> Result<(), StageError> {
         let p: NbfmParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("nbfm_demod params: {e}")))?;
@@ -285,6 +286,7 @@ mod tests {
                     vec![out],
                     bus,
                     CancellationToken::new(),
+                    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
                 )
                 .await
         });

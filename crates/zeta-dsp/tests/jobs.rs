@@ -55,6 +55,8 @@ async fn fm_demod_job_produces_audio_with_tone() {
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
     };
@@ -144,6 +146,8 @@ async fn aprs_decode_job_decodes_fixture_packet() {
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
     };
@@ -227,6 +231,8 @@ async fn node_over(
     let cfg = NodeConfig {
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
     };
@@ -432,4 +438,71 @@ async fn measure_job_measures_only_its_band() {
     assert!(center.abs_diff(CENTER + 12_000) <= 200, "{ev}");
     assert!(ev["bandwidth_hz"].as_u64().unwrap() <= 12_500, "{ev}");
     assert_eq!(ev["label"]["name"], "fsk", "{ev}");
+}
+
+/// A spectrum job persisted before plan 8 has an `fft` node without `rows_per_s`;
+/// it still validates on resume (default 20) and emits v2 rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v1_spectrum_graph_without_rows_per_s_still_launches() {
+    const CENTER: u64 = 100_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let iq = tone(48_000, 48_000, 5_000.0, 0.5)
+        .into_iter()
+        .map(|v| num_complex::Complex::new(v, 0.0))
+        .collect::<Vec<_>>();
+    let opts = || FileOpts {
+        realtime: true,
+        block_samples: 4_800,
+        repeat: true,
+    };
+    let node = node_over(dir.path(), &iq, 48_000, CENTER, opts()).await;
+    let id = start(&node, JobKind::Spectrum, CENTER, 48_000).await;
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Rewrite the persisted record as a pre-plan-8 one: no rows_per_s on the fft node.
+    let path = dir
+        .path()
+        .join("state")
+        .join("jobs")
+        .join(format!("{}.json", id.0));
+    let mut rec: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let mut removed = 0;
+    for n in rec["graph"]["nodes"].as_array_mut().unwrap() {
+        if n["kind"] == "fft" {
+            removed += n["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("rows_per_s")
+                .is_some() as usize;
+        }
+    }
+    assert_eq!(removed, 1, "the spectrum graph has one fft node: {rec}");
+    std::fs::write(&path, serde_json::to_vec_pretty(&rec).unwrap()).unwrap();
+
+    let node = node_over(dir.path(), &iq, 48_000, CENTER, opts()).await;
+    assert!(node.load_errors().is_empty(), "{:?}", node.load_errors());
+    let job = node.job_list().into_iter().find(|j| j.id == id).unwrap();
+    assert_eq!(job.state, JobState::Running, "{job:?}");
+    let stream = job_stream(&node, &id, StreamKind::Event).await;
+    let mut rx = node.bus().subscribe(&stream).unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Ok(f) => {
+                    let Payload::Event(v) = f.payload.clone() else {
+                        panic!("expected an event payload")
+                    };
+                    break v;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("event stream ended: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a spectrum row within 10 s");
+    assert_eq!(ev["rows_per_s"], 20, "{ev}");
+    assert!(ev["q"].is_array(), "v2 row: {ev}");
+    assert!(ev.get("db").is_none(), "v2 rows carry no db key: {ev}");
 }

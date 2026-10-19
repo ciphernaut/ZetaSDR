@@ -1,4 +1,5 @@
-//! FFT stage: averaged power spectrum of an IQ stream, as `Event` frames.
+//! FFT stage: power-averaged spectrum rows of an IQ stream at a fixed rate of
+//! signal time, quantised, as `Event` frames (spectrum event v2).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -10,12 +11,13 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
+use zeta_core::port::IqBlock;
+use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::{StreamId, StreamKind};
+use zeta_core::types::{Span, StreamId, StreamKind, Timestamp};
 
 use crate::util::hann;
-use crate::{Input, frame_span, run_map};
+use crate::{Input, run_map};
 
 /// Floor added to linear power before the dB conversion.
 const DB_FLOOR: f32 = 1e-20;
@@ -45,24 +47,67 @@ impl Window {
 /// Computes spectra. Backends differ only in the per-chunk FFT.
 pub trait FftBackend: Send + Sync {
     fn backend(&self) -> Backend;
-    /// Power spectrum in dB relative to full scale, `size` bins fftshifted so
-    /// bin 0 is the lowest frequency, averaged over all complete `size`-sample
-    /// chunks of `x`.
-    fn power_spectrum_db(&self, x: &[Complex<f32>], size: usize, window: Window) -> Vec<f32>;
+    /// Linear power per bin, `size` bins fftshifted so bin 0 is the lowest
+    /// frequency, normalised by the window's power sum (a full-scale tone peaks
+    /// near 1) and summed over all complete `size`-sample chunks of `x`; with the
+    /// number of chunks summed.
+    fn power_sum(&self, x: &[Complex<f32>], size: usize, window: Window) -> PowerSum;
+    /// Power spectrum in dB relative to full scale: [`FftBackend::power_sum`]
+    /// averaged over its chunks.
+    fn power_spectrum_db(&self, x: &[Complex<f32>], size: usize, window: Window) -> Vec<f32> {
+        self.power_sum(x, size, window).db()
+    }
 }
 
-/// The shared windowing, averaging and dB path. `mag2` receives one windowed
+/// Linear power summed over `chunks` FFTs (see [`FftBackend::power_sum`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PowerSum {
+    pub sum: Vec<f64>,
+    pub chunks: usize,
+}
+
+impl PowerSum {
+    pub fn new(size: usize) -> Self {
+        Self {
+            sum: vec![0.0; size],
+            chunks: 0,
+        }
+    }
+
+    /// Adds `other`'s chunks (same size).
+    pub fn add(&mut self, other: &PowerSum) {
+        for (a, b) in self.sum.iter_mut().zip(&other.sum) {
+            *a += b;
+        }
+        self.chunks += other.chunks;
+    }
+
+    /// The average power per bin in dB (very low when no chunk was summed).
+    pub fn db(&self) -> Vec<f32> {
+        let scale = if self.chunks == 0 {
+            0.0
+        } else {
+            1.0 / self.chunks as f64
+        };
+        self.sum
+            .iter()
+            .map(|&p| 10.0 * ((p * scale) as f32 + DB_FLOOR).log10())
+            .collect()
+    }
+}
+
+/// The shared windowing and summing path. `mag2` receives one windowed
 /// `size`-sample chunk and returns `|FFT|^2` per bin in natural (unshifted) order.
-/// Linear power is averaged over chunks, normalised by the window's power sum
-/// (so a full-scale tone peaks near 0 dB), shifted and converted to dB.
-pub(crate) fn chunk_average(
+/// Linear power is summed over chunks, normalised by the window's power sum and
+/// fftshifted.
+pub(crate) fn chunk_power(
     x: &[Complex<f32>],
     size: usize,
     window: Window,
     mag2: impl Fn(&[Complex<f32>]) -> Vec<f32>,
-) -> Vec<f32> {
+) -> PowerSum {
     let w = window.coeffs(size);
-    let norm = w.iter().sum::<f32>().powi(2);
+    let norm = 1.0 / (w.iter().sum::<f32>() as f64).powi(2);
     let mut acc = vec![0.0f64; size];
     let mut chunks = 0usize;
     for chunk in x.chunks_exact(size) {
@@ -72,19 +117,12 @@ pub(crate) fn chunk_average(
         }
         chunks += 1;
     }
-    let scale = if chunks == 0 {
-        0.0
-    } else {
-        1.0 / (chunks as f64 * norm as f64)
-    };
     // fftshift: natural bins [0, size/2) are the non-negative frequencies.
     let half = size / 2;
-    (0..size)
-        .map(|k| {
-            let p = (acc[(k + half) % size] * scale) as f32;
-            10.0 * (p + DB_FLOOR).log10()
-        })
-        .collect()
+    PowerSum {
+        sum: (0..size).map(|k| acc[(k + half) % size] * norm).collect(),
+        chunks,
+    }
 }
 
 /// CPU backend: rustfft plans cached per size.
@@ -112,9 +150,9 @@ impl FftBackend for CpuFft {
         Backend::Cpu
     }
 
-    fn power_spectrum_db(&self, x: &[Complex<f32>], size: usize, window: Window) -> Vec<f32> {
+    fn power_sum(&self, x: &[Complex<f32>], size: usize, window: Window) -> PowerSum {
         let plan = self.plan(size);
-        chunk_average(x, size, window, |chunk| {
+        chunk_power(x, size, window, |chunk| {
             let mut buf = chunk.to_vec();
             plan.process(&mut buf);
             buf.iter().map(|c| c.norm_sqr()).collect()
@@ -138,11 +176,197 @@ pub struct FftParams {
     #[schemars(schema_with = "size_schema")]
     pub size: u32,
     pub window: Window,
+    /// Rows per second of signal time; graphs persisted before it existed get 20.
+    #[serde(default = "rows_per_s_default")]
+    #[schemars(range(min = 1, max = 60), default = "rows_per_s_default")]
+    pub rows_per_s: u32,
 }
 
-/// Turns each IQ block into one averaged power-spectrum event, averaging the
-/// block's complete `size`-sample chunks. A block shorter than `size` emits no
-/// event, and a trailing partial chunk of a longer block is dropped.
+fn rows_per_s_default() -> u32 {
+    zeta_core::ops::SPECTRUM_ROWS_PER_S
+}
+
+/// Quantisation step of a row's `q` values.
+pub const STEP_DB: f32 = 0.5;
+/// A row's `floor_db` is this percentile of its dB values ...
+const FLOOR_PERCENTILE: f32 = 0.02;
+/// ... minus this margin.
+const FLOOR_MARGIN_DB: f32 = 5.0;
+/// Accepted `rows_per_s`.
+const ROWS_PER_S: std::ops::RangeInclusive<u32> = 1..=60;
+
+/// `(floor_db, q)` for a row of dB values: `floor_db` is the row's 2nd-percentile
+/// value minus 5 dB and `q = clamp(round((db - floor_db) / STEP_DB), 0, 255)`, so
+/// `floor_db + q * STEP_DB` is within half a step of `db` over 127.5 dB above the floor.
+pub fn quantise_row(db: &[f32]) -> (f32, Vec<u8>) {
+    if db.is_empty() {
+        return (0.0, Vec::new());
+    }
+    let mut sorted = db.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let idx = (FLOOR_PERCENTILE * (sorted.len() - 1) as f32) as usize;
+    let floor = sorted[idx] - FLOOR_MARGIN_DB;
+    let q = db
+        .iter()
+        .map(|&v| ((v - floor) / STEP_DB).round().clamp(0.0, 255.0) as u8)
+        .collect();
+    (floor, q)
+}
+
+/// Nanoseconds of `n` samples at `rate_hz`.
+fn ns_of(n: usize, rate_hz: u64) -> u64 {
+    if rate_hz == 0 {
+        0
+    } else {
+        (n as u128 * 1_000_000_000 / rate_hz as u128) as u64
+    }
+}
+
+/// One completed row: its averaged power and the signal time it covers.
+struct Row {
+    power: PowerSum,
+    start_ns: u64,
+    end_ns: u64,
+    rate_hz: u64,
+    center_hz: u64,
+}
+
+/// Cuts a sample stream into consecutive `size`-sample chunks (across block
+/// boundaries) and groups their power into rows of `1 / rows_per_s` seconds of
+/// signal time, counted in samples. Row `k` closes at the first chunk ending at or
+/// after sample `ceil((k + 1) * rate / rows_per_s)` since the stream (re)started;
+/// a row shorter than one chunk therefore holds one chunk and the next rows catch up.
+/// A change of rate or centre, or lost frames, restarts the stream: the partial row
+/// is dropped and the next row starts at the next block's `t0`.
+struct RowCutter {
+    size: usize,
+    window: Window,
+    rows_per_s: u64,
+    rate_hz: u64,
+    center_hz: u64,
+    /// Samples of a chunk not yet complete, and the time of its first sample.
+    carry: Vec<Complex<f32>>,
+    carry_t0_ns: u64,
+    /// Samples in completed chunks since the stream (re)started.
+    consumed: u64,
+    /// Index of the row being filled.
+    row_index: u64,
+    row: PowerSum,
+    row_start_ns: Option<u64>,
+    row_end_ns: u64,
+}
+
+impl RowCutter {
+    fn new(size: usize, window: Window, rows_per_s: u32) -> Self {
+        Self {
+            size,
+            window,
+            rows_per_s: rows_per_s as u64,
+            rate_hz: 0,
+            center_hz: 0,
+            carry: Vec::with_capacity(size),
+            carry_t0_ns: 0,
+            consumed: 0,
+            row_index: 0,
+            row: PowerSum::new(size),
+            row_start_ns: None,
+            row_end_ns: 0,
+        }
+    }
+
+    fn restart(&mut self, rate_hz: u64, center_hz: u64) {
+        self.rate_hz = rate_hz;
+        self.center_hz = center_hz;
+        self.carry.clear();
+        self.consumed = 0;
+        self.row_index = 0;
+        self.row = PowerSum::new(self.size);
+        self.row_start_ns = None;
+    }
+
+    /// Samples since the restart at which the current row closes.
+    fn boundary(&self) -> u64 {
+        ((self.row_index + 1) * self.rate_hz).div_ceil(self.rows_per_s)
+    }
+
+    /// Frames were lost: drop the carry and the partial row, and re-anchor the
+    /// cadence so the next row starts at the next block's `t0` (lost samples are
+    /// never counted, so continuing the old counters would drift).
+    fn gap(&mut self) {
+        self.restart(self.rate_hz, self.center_hz);
+    }
+
+    /// Adds `p` (covering `[start_ns, end_ns)`); the row when this closes one.
+    fn add(&mut self, p: &PowerSum, start_ns: u64, end_ns: u64) -> Option<Row> {
+        self.row.add(p);
+        self.consumed += (p.chunks * self.size) as u64;
+        self.row_start_ns.get_or_insert(start_ns);
+        self.row_end_ns = end_ns;
+        if self.consumed < self.boundary() {
+            return None;
+        }
+        while self.boundary() <= self.consumed {
+            self.row_index += 1;
+        }
+        let power = std::mem::replace(&mut self.row, PowerSum::new(self.size));
+        Some(Row {
+            power,
+            start_ns: self.row_start_ns.take().unwrap_or(start_ns),
+            end_ns,
+            rate_hz: self.rate_hz,
+            center_hz: self.center_hz,
+        })
+    }
+
+    fn push(&mut self, block: &IqBlock, backend: &dyn FftBackend) -> Vec<Row> {
+        let (rate, center) = (block.sample_rate_hz.0, block.center_hz.0);
+        if rate != self.rate_hz || center != self.center_hz {
+            // A retune or a new rate: the partial row (and carry) mixes two bands or
+            // rates, so it is dropped and the cadence restarts at this block's `t0`.
+            self.restart(rate, center);
+        }
+        let (size, window) = (self.size, self.window);
+        let x = &block.samples[..];
+        let t = |i: usize| block.t0.0.saturating_add(ns_of(i, rate));
+        let mut rows = Vec::new();
+        let mut i = 0;
+        if !self.carry.is_empty() {
+            let need = size - self.carry.len();
+            if x.len() < need {
+                self.carry.extend_from_slice(x);
+                return rows;
+            }
+            self.carry.extend_from_slice(&x[..need]);
+            i = need;
+            let p = backend.power_sum(&self.carry, size, window);
+            let start = self.carry_t0_ns;
+            self.carry.clear();
+            rows.extend(self.add(&p, start, t(i)));
+        }
+        while x.len() - i >= size {
+            let avail = (x.len() - i) / size;
+            let to_boundary = (self.boundary().saturating_sub(self.consumed) as usize)
+                .div_ceil(size)
+                .max(1);
+            let n = avail.min(to_boundary);
+            let p = backend.power_sum(&x[i..i + n * size], size, window);
+            rows.extend(self.add(&p, t(i), t(i + n * size)));
+            i += n * size;
+        }
+        if i < x.len() {
+            self.carry.extend_from_slice(&x[i..]);
+            self.carry_t0_ns = t(i);
+        }
+        rows
+    }
+}
+
+/// Turns an IQ stream into spectrum rows at `rows_per_s` per second of signal
+/// time (spectrum event v2). Every FFT of consecutive `size`-sample chunks between
+/// two rows is power-averaged (linear power); each row is emitted as
+/// `{size, bin_hz, rows_per_s, center_hz, floor_db, step_db, q}` with
+/// `db = floor_db + q * step_db` (see [`quantise_row`]); the frame's provenance
+/// span covers the averaged chunks.
 pub struct FftStage {
     spec: StageSpec,
     backend: Arc<dyn FftBackend>,
@@ -179,6 +403,7 @@ impl Stage for FftStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
+        _ctx: StageContext,
     ) -> Result<(), StageError> {
         let p: FftParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("fft params: {e}")))?;
@@ -188,40 +413,55 @@ impl Stage for FftStage {
                 p.size
             )));
         }
+        if !ROWS_PER_S.contains(&p.rows_per_s) {
+            return Err(StageError::Failed(format!(
+                "fft params: rows_per_s {} must be in {ROWS_PER_S:?}",
+                p.rows_per_s
+            )));
+        }
         let Some(out) = outputs.first().cloned() else {
             return Err(StageError::Failed("expected 1 output".into()));
         };
         let size = p.size as usize;
+        let rows_per_s = p.rows_per_s;
         let backend = self.backend.clone();
+        let mut cutter = RowCutter::new(size, p.window, rows_per_s);
         run_map(inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {
+                    cutter.gap();
                     return Ok(Vec::new());
                 }
             };
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed("fft stage expects iq frames".into()));
             };
-            if block.samples.len() < size {
-                return Ok(Vec::new());
-            }
-            let rate = block.sample_rate_hz.0;
-            let db = backend.power_spectrum_db(&block.samples, size, p.window);
-            let mut prov = frame.provenance.clone();
-            prov.span = frame_span(block.t0, block.samples.len(), rate);
-            Ok(vec![Frame::new(
-                out.clone(),
-                prov,
-                Payload::Event(serde_json::json!({
-                    "t0_ns": block.t0.0,
-                    "center_hz": block.center_hz.0,
-                    "sample_rate_hz": rate,
-                    "size": size,
-                    "bin_hz": rate as f64 / size as f64,
-                    "db": db,
-                })),
-            )])
+            Ok(cutter
+                .push(block, backend.as_ref())
+                .into_iter()
+                .map(|row| {
+                    let (floor_db, q) = quantise_row(&row.power.db());
+                    let mut prov = frame.provenance.clone();
+                    prov.span = Span {
+                        start_ns: Timestamp(row.start_ns),
+                        end_ns: Timestamp(row.end_ns),
+                    };
+                    Frame::new(
+                        out.clone(),
+                        prov,
+                        Payload::Event(serde_json::json!({
+                            "size": size,
+                            "bin_hz": row.rate_hz as f64 / size as f64,
+                            "rows_per_s": rows_per_s,
+                            "center_hz": row.center_hz,
+                            "floor_db": floor_db,
+                            "step_db": STEP_DB,
+                            "q": q,
+                        })),
+                    )
+                })
+                .collect())
         })
         .await
     }
@@ -267,7 +507,7 @@ mod tests {
             nodes: vec![Node {
                 id: NodeId("a".into()),
                 kind: "fft".into(),
-                params: serde_json::json!({"size": size, "window": "hann"}),
+                params: serde_json::json!({"size": size, "window": "hann", "rows_per_s": 20}),
             }],
             edges: vec![],
         };
@@ -276,10 +516,21 @@ mod tests {
             Err(GraphError::BadParams { .. })
         ));
         assert_eq!(validate(&g(1024), &r), Ok(()));
+        assert_eq!(validate(&g(8192), &r), Ok(()));
+    }
+
+    #[test]
+    fn quantise_row_floor_is_2nd_percentile_minus_5() {
+        let db: Vec<f32> = (0..100).map(|i| -100.0 + 2.0 * i as f32).collect();
+        let (floor, q) = quantise_row(&db);
+        assert_eq!(floor, -98.0 - 5.0);
+        assert_eq!(q[0], 6);
+        assert_eq!(q[50], 206);
+        assert_eq!(q[99], 255); // 201 dB above the floor clamps at 127.5
     }
 
     #[tokio::test]
-    async fn fft_stage_emits_one_event_per_block() {
+    async fn fft_stage_emits_v2_rows() {
         let prov = Provenance {
             source: SourceId("s".into()),
             job: None,
@@ -297,11 +548,12 @@ mod tests {
         let h = tokio::spawn(async move {
             FftStage::new(Arc::new(CpuFft::new()))
                 .run(
-                    serde_json::json!({"size": 1024, "window": "hann"}),
+                    serde_json::json!({"size": 1024, "window": "hann", "rows_per_s": 20}),
                     vec![rx_in],
                     vec![o2],
                     bus,
                     CancellationToken::new(),
+                    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
                 )
                 .await
         });
@@ -320,13 +572,24 @@ mod tests {
         let Payload::Event(ev) = &f.payload else {
             panic!("expected an event")
         };
-        assert_eq!(ev["db"].as_array().unwrap().len(), 1024);
+        // 4800 samples at 48 kHz, 20 rows/s: one 50 ms row (3 chunks) closes in this block.
+        assert_eq!(ev["q"].as_array().unwrap().len(), 1024);
         assert_eq!(ev["bin_hz"].as_f64(), Some(46.875));
         assert_eq!(ev["size"], 1024);
-        assert_eq!(ev["t0_ns"], 5);
+        assert_eq!(ev["rows_per_s"], 20);
+        assert_eq!(ev["step_db"].as_f64(), Some(0.5));
+        assert!(ev["floor_db"].as_f64().is_some());
         assert_eq!(ev["center_hz"], 100_000_000u64);
-        assert_eq!(ev["sample_rate_hz"], RATE);
+        assert_eq!(f.provenance.span.start_ns, Timestamp(5));
+        assert_eq!(
+            f.provenance.span.end_ns,
+            Timestamp(5 + 3072 * 1_000_000_000 / RATE)
+        );
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
+        assert!(
+            rx_out.try_recv().is_err(),
+            "the rest of the block is a partial row"
+        );
     }
 }

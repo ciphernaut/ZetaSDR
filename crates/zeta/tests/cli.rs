@@ -350,6 +350,69 @@ fn then_tail_stops_job_unless_keep() {
 }
 
 #[test]
+fn scan_kind_is_accepted_and_lists_as_running() {
+    let dir = tempfile::tempdir().unwrap();
+    // A scan over the file source's own band is one step: rows from the
+    // registered `fft` stage, tagged with that step.
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "scan",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+            "--then-tail",
+            "2,5000",
+            "--keep",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let id = v[0]["value"].as_str().expect("job id").to_owned();
+    let frames = v[1]["value"]["frames"].as_array().expect("frames");
+    assert_eq!(frames.len(), 2, "{v}");
+    for f in frames {
+        assert_eq!(f["channel"], "scan/0", "{v}");
+        assert_eq!(f["payload"]["center_hz"], 100_000_000, "{v}");
+        assert_eq!(f["payload"]["size"], 1024, "{v}");
+    }
+    assert_eq!(v[2], serde_json::json!({"stopped": false}));
+
+    let listed = |dir: &Path| {
+        let out = zeta(dir, &["job", "list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        json(&out)["value"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .find(|j| j["id"] == id.as_str())
+            .expect("job listed")
+            .clone()
+    };
+    let job = listed(dir.path());
+    assert_eq!(job["kind"], "scan");
+    assert_eq!(job["state"]["status"], "running");
+    zeta(dir.path(), &["job", "stop", "--job", &id])
+        .assert()
+        .success();
+    assert_eq!(listed(dir.path())["state"]["status"], "stopped");
+}
+
+#[test]
 fn then_tail_malformed_value_is_usage_error() {
     let dir = tempfile::tempdir().unwrap();
     aprs_start(dir.path(), "1", &[])
@@ -1252,4 +1315,34 @@ fn ssb_demod_job_with_lsb_streams_audio() {
         v["message"], "sideband applies only to kind ssb_demod; pass null (kind is am_demod)",
         "{v}"
     );
+}
+
+#[test]
+fn ring_budget_flag_is_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    // 64 MB / (48 kHz * 8 B) = 174.76 s, capped at 10 s; a zero budget gives the 1 s floor.
+    for (mb, want) in [
+        ("64", "ring for tone: 10.00 s at "),
+        ("0", "ring for tone: 1.00 s at "),
+    ] {
+        let args = [
+            "--ring-budget-mb",
+            mb,
+            "iq",
+            "read",
+            "--source",
+            "tone",
+            "--start-ns",
+            "0",
+            "--end-ns",
+            "1000000000",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ];
+        let out = zeta(dir.path(), &args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(want), "{mb}: stderr was {err}");
+    }
 }

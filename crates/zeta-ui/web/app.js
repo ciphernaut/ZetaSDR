@@ -17,7 +17,9 @@
 //
 // The waterfall (waterfall.js) is mounted in #waterfall at login and follows the selected
 // source (selecting the source it already shows does nothing); it is destroyed when the node
-// rejects the secret. The overlays (overlays.js) sit on it: each jobs poll hands them the job
+// rejects the secret. Each jobs poll is handed to it too (wf.syncJobs: a scan starting or
+// ending on the shown source), and its notices (a refused retune) become transcript lines.
+// The overlays (overlays.js) sit on it: each jobs poll hands them the job
 // list (they watch the selected source's running jobs), and in the narrow footprint every
 // /ask answer also becomes an `agent` ribbon at the centre of the band shown.
 //
@@ -334,6 +336,7 @@ function start(api) {
     state.transcript?.note(`stream refused: ${message} (node out of stream slots)`, true);
   state.ops = startOpsFeed(api, state.transcript);
   state.wf = mountWaterfall($("#waterfall"), api);
+  state.wf.onNotice = (text) => state.transcript?.note(text, true);
   state.ov = mountOverlays($("#waterfall"), state.wf, api, { jobsEl: $("#jobs") });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
@@ -348,6 +351,7 @@ function start(api) {
   state.jobs = startJobs(api, $("#jobs"), state.transcript, {
     onJobs: (jobs) => {
       if (state.ov) state.ov.sync(jobs);
+      if (state.wf) state.wf.syncJobs(jobs);
       stopAudioUnlessRunning(jobs);
     },
     onPlay: toggleAudio,
@@ -425,11 +429,24 @@ function answerRibbon(text) {
 }
 
 // Hooks for the e2e scenarios: simulate a changed secret, force a jobs poll, and read what
-// the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall), and
-// draw the narrow-footprint answer ribbon for `text` without an LLM (ruling R3).
+// the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall), the
+// format of the last painted spectrum row (`lastRowFormat`: "q" or "db", null before one), its
+// mode (`waterfallMode`: "spectrum" or "scan", null without a waterfall),
+// draw the narrow-footprint answer ribbon for `text` without an LLM (ruling R3), and draw a
+// probe label at a frequency.
 window.zetaTest = {
+  get lastRowFormat() {
+    return state.wf ? state.wf.lastRowFormat : null;
+  },
+  get waterfallMode() {
+    return state.wf ? state.wf.mode : null;
+  },
   ribbon(text) {
     answerRibbon(text);
+  },
+  // A layer-1 overlay label `name` at `hz` (key "probe"); the element, or null without overlays.
+  label(hz, name) {
+    return state.ov ? state.ov.label(hz, { layer: 1, name }, "probe") : null;
   },
   setSecret(s) {
     if (state.api) state.api.secret = s;

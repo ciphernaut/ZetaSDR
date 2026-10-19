@@ -8,8 +8,10 @@ extraction, spectrum, NBFM demodulation, APRS decoding, layer-1 measurement and 
 with the transports and agent of plan 3, the hardware and foreign sources of plan 4 (KiwiSDR,
 SoapySDR, external-process stages), the federation of plan 5 (another node as a source, VITA
 49.2 over the websocket and UDP, a Pi 5 build), the web UI of plan 6 (waterfall, context
-menu, agent transcript, graph view) and the audio path of plan 7 (48 kHz audio from every
-demodulator, wideband FM, AM and SSB, a signal catalogue for layer 2).
+menu, agent transcript, graph view), the audio path of plan 7 (48 kHz audio from every
+demodulator, wideband FM, AM and SSB, a signal catalogue for layer 2) and the wideband work of
+plan 8 (a shared channel bank per wide capture, quantised spectrum rows, zoom and pan, the
+`scan` job, a memory-budgeted IQ ring).
 
 Design: [docs/superpowers/specs/2026-10-18-zetasdr-design.md](docs/superpowers/specs/2026-10-18-zetasdr-design.md).
 Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2026-10-18-core-node.md),
@@ -18,7 +20,8 @@ Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2
 [docs/superpowers/plans/2026-10-19-hardware-sources.md](docs/superpowers/plans/2026-10-19-hardware-sources.md),
 [docs/superpowers/plans/2026-10-19-federation.md](docs/superpowers/plans/2026-10-19-federation.md),
 [docs/superpowers/plans/2026-10-19-ui.md](docs/superpowers/plans/2026-10-19-ui.md),
-[docs/superpowers/plans/2026-10-19-audio-wfm.md](docs/superpowers/plans/2026-10-19-audio-wfm.md).
+[docs/superpowers/plans/2026-10-19-audio-wfm.md](docs/superpowers/plans/2026-10-19-audio-wfm.md),
+[docs/superpowers/plans/2026-10-19-wideband.md](docs/superpowers/plans/2026-10-19-wideband.md).
 
 ## Tests
 
@@ -62,7 +65,7 @@ fails if the committed file has drifted.
 Eight job kinds, chosen with `job start --kind` (`zeta job start --help` lists them):
 
 - `passthrough` copies the channel IQ through unchanged.
-- `spectrum` emits one power-spectrum event per 100 ms frame (`size` 1024, `bin_hz`, `db` array).
+- `spectrum` emits spectrum rows at 20 per second of signal time, each the power average of every FFT since the previous row (spectrum event v2): `size` (the smallest power of two at least `bandwidth_hz / 6000`, 1024 to 8192), `bin_hz`, `rows_per_s`, `center_hz`, and the row quantised as `q` (one 0-255 level per bin, lowest frequency first) with `floor_db` and `step_db` (0.5): `db = floor_db + q * step_db`. `floor_db` is the row's 2nd-percentile bin minus 5 dB, so levels more than 127.5 dB above it clip at 255.
 - `fm_demod` channelises and demodulates narrowband FM to an audio stream (48 kHz, per-frame `peak`); `--deviation-hz` sets the peak deviation (default 5000).
 - `wfm_demod` does the same for wideband broadcast FM: `--deviation-hz` default 75000, 50 µs de-emphasis (the stage also takes 75 µs, set in its graph with `graph put`), 15 kHz mono audio at 48 kHz.
 - `am_demod` does the same for AM voice (envelope detector, 5 kHz audio at 48 kHz, slow AGC to a steady level; give it about 10 kHz of band).
@@ -124,7 +127,8 @@ $Z $S --source-file aprs=scratch/fx/aprs.sigmf-meta job start --kind aprs_decode
 $Z $S --source-file tone=scratch/fx/tone.sigmf-meta job start --kind fm_demod --source tone \
     --center-hz 100000000 --bandwidth-hz 12500 --then-tail 5,3000
 
-# spectrum: one event, "size": 1024, "bin_hz": 46.875, "db": [-180.99, -179.14, -181.65, ...]
+# spectrum: one event, "size": 1024, "bin_hz": 46.875, "rows_per_s": 20, "floor_db": -190.63,
+# "step_db": 0.5, "q": [18, 21, 15, ...] (the tone clips at 255 in the middle bins)
 $Z $S --source-file tone=scratch/fx/tone.sigmf-meta job start --kind spectrum --source tone \
     --center-hz 100000000 --bandwidth-hz 12500 --then-tail 1,3000
 
@@ -191,6 +195,12 @@ they belong to the serving node and are rejected. Source ids are unique across t
 - **SoapySDR**, `--source-soapy ID=ARGS` (`ARGS` such as `driver=hackrf,serial=...`): a local
   device, `push` false (the node reads it). Gains are left at the driver's defaults (no gain
   operation yet), and a job centred exactly on the tuned frequency sees the device's DC spike.
+  A UHD device (`driver=uhd` in `ARGS`, or a driver key such as `b200`) reports its rate range for its current master clock (a B210 opens
+  at 16 MHz), so at open the source asks for twice the reported maximum, re-reads the range
+  while it grows (at most three rounds) and restores the previous rate: a B210 asserts
+  `max_bandwidth_hz` 61440000 and a wide request raises its clock. `master_clock_rate=` in
+  `ARGS` (e.g. `driver=uhd,type=b200,master_clock_rate=30.72e6`) is an explicit override: it
+  fixes the clock, and with it the range and the rates a request can get.
 
 ```bash
 ./target/debug/zeta --source-kiwi kiwi0=kiwisdr.example:8073 source list   # remote true, current null
@@ -425,6 +435,63 @@ with connect(f"ws://{node}/stream/{ops}", subprotocols=["zeta", proto]) as ws:
         print(msg)                                 # one {"type":"frame",...} per operation
 PY
 ```
+
+## Wideband
+
+A wide capture is shared, not copied per job. For every source running at 2 Msps or more
+(`PFB_MIN_RATE_HZ`) the node keeps one polyphase filter bank (`zeta-dsp` `PfbBank`, run on its
+own thread per source and fed like the ring). The bank splits the capture into `bins` coarse
+bins, the largest power of two that keeps each bin at least 750 kHz wide, clamped to 8..=256
+(16 bins of 1 MHz at 16 Msps, 16 of 1.5 MHz at 24 Msps); each bin's stream is 2x oversampled.
+A `channel` request whose `bandwidth_hz` fits in one bin width is **bank-served**: it reads the
+nearest bin and runs its usual fine filter on that bin's stream, so a broadcast FM station
+(200 kHz) costs a fine filter at a few Msps instead of a full-rate filter. A request wider than
+a bin, one on a source below 2 Msps, or one whose output rate does not divide the bin rate takes
+the direct path as before. Either way the job's graph, `center_hz`, `bandwidth_hz` and
+provenance are the same; only the filter response differs. Stopping one job leaves the bank and
+the other jobs on it untouched.
+
+Spectrum rows (`spectrum` events, v2) are averaged to a fixed `rows_per_s` (default 20 at any
+sample rate) and quantised: `{"size", "bin_hz", "rows_per_s", "center_hz", "floor_db",
+"step_db", "q": [u8 x size]}` with `dB = floor_db + q * step_db`, `step_db` 0.5 and `floor_db`
+the row's 2nd percentile minus 5 dB. A job's default `size` is the smallest power of two at
+least `bandwidth_hz / 6000`, clamped to 1024..=8192 (4096 bins of 3.9 kHz for a 16 MHz capture),
+so a row is at most 8 KB of JSON. The UI still draws an older node's float `db` rows.
+
+In the UI the waterfall's own `spectrum` job covers the whole capture. `#band` (centre in MHz,
+width in kHz, Apply), a drag on the frequency axis (pan) and the wheel (zoom x2 about the
+pointer) change the view. A view inside the capture is rendering only: no operation is sent.
+A view that leaves the capture retunes: if another job holds the source the transcript shows
+`conflict: source <id> held by <jobs>` and the view reverts; otherwise the page stops its own
+spectrum job, sends `source_ensure` for the new band and restarts the job on the capture it
+gets (a file source answers `out_of_range` and the view reverts).
+
+`scan` sweeps a span wider than one capture: `job start --kind scan --center-hz C
+--bandwidth-hz W` steps the source across `C ± W/2` in captures of `min(max_bandwidth_hz,
+16 MHz, W)` (a span narrower than one capture is one step of exactly that span), dwells 250 ms
+per step, and emits one v2 spectrum row per step (frame `channel` `scan/<step>`, the row's
+`center_hz` that step's), wrapping until stopped; a step is moved so its capture stays inside
+the radio's tuning range. A scan time-shares the radio, so it holds the lease on
+its whole span: while it runs every other `job_start` or `source_ensure` on that source is a
+`conflict` naming the scan (no silent pre-emption), and `source_list` shows the scan as holder
+and the step it is on as `current`. Stopping it frees the source and leaves `current` at the
+last step. The UI's context menu has "Scan this span"; in scan mode the waterfall's axis spans
+the scan and each row paints its step's segment of a new column, so a sweep fills in
+progressively.
+
+```bash
+Z="./target/release/zeta --node http://field-host:7979"   # ZETA_SECRET set
+$Z job start --kind scan --source b210 --center-hz 500000000 --bandwidth-hz 1000000000
+# 42 MHz (the B210's floor) to 1 GHz in 16 MHz steps: 61 steps, one sweep about 19 s
+$Z job start --kind measure --source b210 --center-hz 95300000 --bandwidth-hz 200000
+# {"error": "conflict", "holders": ["<scan job>"], "options": ["stop the scan holding the source"]}
+```
+
+The IQ ring is sized from a memory budget per source: seconds = budget / (rate x 8 B), clamped
+to 1..10 s and recomputed on every retune (a retune to a higher rate shrinks the ring before the
+first wide block arrives). The budget defaults to a quarter of `MemTotal` capped at 4 GiB (1 GiB
+when `/proc/meminfo` cannot be read); `--ring-budget-mb MB` (or `ZETA_RING_BUDGET_MB`) sets it.
+The node logs each sizing, e.g. `zeta: ring for b210: 10.00 s at 16000000 Hz (1280.0 MB)`.
 
 ## Federation
 
