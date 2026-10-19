@@ -88,6 +88,24 @@ fn overlaps(min: Hz, max: Hz, center: Hz, bandwidth: Hz) -> bool {
     min.0 <= center.0.saturating_add(half) && max.0 >= center.0.saturating_sub(half)
 }
 
+/// The job kind that proves catalogue entry `entry_id` by decoding it.
+pub fn decoder_for(entry_id: &str) -> Option<&'static str> {
+    if entry_id.starts_with("pocsag") || entry_id.starts_with("pager-pocsag") {
+        return Some("pocsag_decode");
+    }
+    if entry_id.starts_with("aprs") || entry_id.starts_with("automatic-packet-reporting-system") {
+        return Some("aprs_decode");
+    }
+    match entry_id {
+        "ads-b" | "automatic-dependent-surveillance-broadcast-ads-b" => Some("adsb_decode"),
+        "acars" | "aircraft-communications-addressing-and-reporting-system-acar" => {
+            Some("acars_decode")
+        }
+        "radio-data-system-rds" => Some("rds_decode"),
+        _ => None,
+    }
+}
+
 /// The catalogue as a knowledge provider: one signature per frequency range
 /// overlapping the queried band; no allocations.
 pub struct CatalogueKnowledge;
@@ -121,7 +139,7 @@ impl KnowledgeProvider for CatalogueKnowledge {
                         bandwidth_hz: e.bandwidth_max_hz.unwrap_or(Hz(0)),
                         modulation: e.modulations.first().cloned().unwrap_or_default(),
                         symbol_rate_baud: None,
-                        decoder: None,
+                        decoder: decoder_for(&e.id).map(str::to_string),
                     })
             })
             .collect()

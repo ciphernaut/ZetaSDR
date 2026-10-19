@@ -35,11 +35,21 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is set; pass --state-dir".into())
 }
 
-/// The stages the CLI node runs.
+/// The stages the CLI node runs. `adsb_decode` runs the dump1090 found by
+/// [`zeta_ext::find_dump1090`]; which one (or that there is none) goes to stderr.
 pub fn registry() -> StageRegistry {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
     zeta_dsp::register_all(&mut registry);
+    let dump1090 = zeta_ext::find_dump1090();
+    match &dump1090 {
+        Some(p) => eprintln!("zeta: adsb_decode via {}", p.display()),
+        None if std::env::var_os("ZETA_DUMP1090").is_some() => eprintln!(
+            "zeta: adsb_decode unavailable: ZETA_DUMP1090 is set but is not an absolute existing file"
+        ),
+        None => eprintln!("zeta: adsb_decode unavailable: no dump1090 on PATH"),
+    }
+    registry.register(Arc::new(zeta_ext::AdsbDecodeStage::new(dump1090)));
     registry
 }
 
@@ -299,6 +309,16 @@ mod tests {
                         bandwidth_hz: Hz(bw),
                     };
                     match kind.expand(&src, tuning, Hz(rate), None, None, None) {
+                        // dump1090 needs a band of 2 MHz or more (unless the band is
+                        // already wider than the source, refused as for every kind).
+                        Err(OpError::OutOfRange { field, min, .. })
+                            if kind == JobKind::AdsbDecode && field == "bandwidth_hz" =>
+                        {
+                            assert!(
+                                min == 2_000_000 || (rate == 12_000 && bw == 12_500),
+                                "{rate} {bw} {min}"
+                            );
+                        }
                         Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
                             assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
                         }
@@ -329,6 +349,18 @@ mod tests {
                     }
                 }
             }
+        }
+        // adsb_decode at its own band: a channel at 2.4 MHz into the decoder.
+        for rate in [2_400_000u64, 4_800_000, 9_600_000] {
+            let tuning = Tuning {
+                center_hz: Hz(1_090_000_000),
+                bandwidth_hz: Hz(2_400_000),
+            };
+            let g = JobKind::AdsbDecode
+                .expand(&src, tuning, Hz(rate), None, None, None)
+                .unwrap();
+            validate(&g, &registry).unwrap_or_else(|e| panic!("adsb_decode {rate}: {e}"));
+            assert_eq!(param(&g.nodes[0], "out_rate_hz"), 2_400_000);
         }
     }
 }

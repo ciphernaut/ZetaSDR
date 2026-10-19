@@ -1,6 +1,8 @@
 //! The web app's end-to-end scenarios (`crates/zeta-ui/tests/e2e/ui.py`, Playwright with
-//! headless Chromium) against a real `zeta serve` with the `tone`, `aprs` and `wfm` fixtures
-//! (`wfm`: a 1 kHz tone, wideband FM with pilot, 240 kHz, 2 s looping, at 104.9 MHz); the
+//! headless Chromium) against a real `zeta serve` with the `tone`, `aprs`, `wfm` and `pocsag`
+//! fixtures (`wfm`: a 1 kHz tone, wideband FM with pilot, 240 kHz, 2 s looping, at 104.9 MHz;
+//! `pocsag`: one 1200-baud alphanumeric page `HELLO ZETA` to address 1234567, function 3, at
+//! 48 kHz, looping, at 148.6375 MHz); the
 //! node's state directory is passed to ui.py in `ZETA_UI_STATE_DIR`. That node has a fake
 //! `voiced` (`--stt-socket`) answering `ok:what sources are there` to every `file:` line; a
 //! second node without a speech daemon is passed in `ZETA_UI_URL_NOSTT`.
@@ -213,6 +215,9 @@ fn ui_scenarios_pass_in_headless_chromium() {
         zeta_dsp::fixtures::wfm_modulate(&audio, WFM_AUDIO_RATE, WFM_RATE, 75_000.0, 0.0, true);
     let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "wfm", &iq, WFM_RATE, 104_900_000);
     let wfm = format!("wfm={}", meta.display());
+    let iq = zeta_dsp::fixtures::pocsag_packet_iq(1_234_567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "pocsag", &iq, 48_000, 148_637_500);
+    let pocsag = format!("pocsag={}", meta.display());
     let sock_dir = socket_dir();
     let sock = sock_dir.path().join("voiced.sock");
     fake_voiced(&sock);
@@ -220,7 +225,14 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let serve = ServeProc::start_full(
         dir.path(),
         SECRET,
-        &["--source-file", &aprs, "--source-file", &wfm],
+        &[
+            "--source-file",
+            &aprs,
+            "--source-file",
+            &wfm,
+            "--source-file",
+            &pocsag,
+        ],
         &["--stt-socket", sock],
         &[],
     );

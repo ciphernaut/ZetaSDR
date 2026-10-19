@@ -3682,6 +3682,7 @@ dependencies = [
  "zeta-client",
  "zeta-core",
  "zeta-dsp",
+ "zeta-ext",
  "zeta-plugin",
  "zeta-source-file",
  "zeta-source-kiwi",
@@ -3765,6 +3766,22 @@ dependencies = [
  "wgpu",
  "zeta-core",
  "zeta-source-file",
+]
+
+[[package]]
+name = "zeta-ext"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "num-complex",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "zeta-core",
+ "zeta-dsp",
 ]
 
 [[package]]

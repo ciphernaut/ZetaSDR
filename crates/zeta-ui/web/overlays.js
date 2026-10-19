@@ -26,6 +26,13 @@
 //         - `db` array (spectrum): ignored; every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
+//         - `protocol` (the decoders), at the tuning centre, class = the protocol:
+//             `pocsag`: "<address>: <text>" ("<address>: tone" for kind tone);
+//             `rds`:    "<ps ?? pi> · <rt ?? ''>", trimmed;
+//             `adsb`:   "<icao> <callsign> <altitude_ft> ft <lat>,<lon>", each absent (null)
+//                       field omitted ("ft" with the altitude, lat,lon only as a pair);
+//             `acars`:  "<reg> <label>: <text>";
+//           any other protocol falls through to the branches below;
 //         - `src` and `info` (APRS): ov.ribbon(tuning centre, "<src> > <dst>: <info>",
 //           "aprs");
 //         - anything else: ov.ribbon(tuning centre, first OTHER_EVENT_CHARS chars of the
@@ -64,6 +71,29 @@ export function mountOverlays(el, wf, api, opts = {}) {
 // What identifies a job's streams besides its id: `graph_put` restarts it with new ones.
 function graphKey(job) {
   return JSON.stringify(job.graph ?? null);
+}
+
+const present = (v) => v !== null && v !== undefined && v !== "";
+
+// The ribbon text for a decoder event by its `protocol` (null for a protocol not known here).
+export function protocolText(p) {
+  switch (p.protocol) {
+    case "pocsag":
+      return p.kind === "tone" ? `${p.address}: tone` : `${p.address}: ${p.text ?? ""}`;
+    case "rds":
+      return `${p.ps ?? p.pi} · ${p.rt ?? ""}`.trim();
+    case "adsb": {
+      const parts = [p.icao];
+      if (present(p.callsign)) parts.push(String(p.callsign).trim());
+      if (present(p.altitude_ft)) parts.push(`${p.altitude_ft} ft`);
+      if (present(p.lat) && present(p.lon)) parts.push(`${p.lat},${p.lon}`);
+      return parts.filter(present).join(" ");
+    }
+    case "acars":
+      return `${p.reg} ${p.label}: ${p.text ?? ""}`;
+    default:
+      return null;
+  }
 }
 
 function tuningCentre(job) {
@@ -218,6 +248,13 @@ class Overlays {
       if (p.label && typeof p.label === "object" && typeof p.center_hz === "number") {
         this.label(p.center_hz, p.label, job.id);
         return;
+      }
+      if (typeof p.protocol === "string") {
+        const text = protocolText(p);
+        if (text !== null) {
+          this.ribbon(tuningCentre(job), text, p.protocol);
+          return;
+        }
       }
       if ("src" in p && "info" in p) {
         this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}`, "aprs");

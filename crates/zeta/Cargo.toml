@@ -20,6 +20,7 @@ zeta-source-kiwi = { path = "../zeta-source-kiwi" }
 zeta-source-node = { path = "../zeta-source-node" }
 zeta-source-vrt = { path = "../zeta-source-vrt" }
 zeta-plugin = { path = "../zeta-plugin" }
+zeta-ext = { path = "../zeta-ext" }
 
 # The real SoapySDR driver links libSoapySDR (needs libsoapysdr-dev), so it is
 # behind a cfg, not a feature: `--all-features` must never build it. Build with

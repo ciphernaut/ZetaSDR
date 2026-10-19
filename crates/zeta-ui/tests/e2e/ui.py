@@ -5,8 +5,9 @@ Usage: python3 ui.py <node-url> <secret> [scenario]
 Runs every `scenario_*` function (or only those named, comma-separated, with or without the
 `scenario_` prefix) against a running `zeta serve`, each in a fresh browser context. Prints `PASS <name>`
 or `FAIL <name>: <reason>` (plus the browser console errors) and exits 1 on the first failure.
-Run by `cargo test -p zeta --test ui`, which starts the node with the `tone`, `aprs` and `wfm`
-(wideband FM, 1 kHz tone with pilot, 240 kHz at 104.9 MHz) fixtures and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
+Run by `cargo test -p zeta --test ui`, which starts the node with the `tone`, `aprs`, `wfm`
+(wideband FM, 1 kHz tone with pilot, 240 kHz at 104.9 MHz) and `pocsag` (a 1200-baud page
+`HELLO ZETA` to address 1234567, 48 kHz at 148.6375 MHz) fixtures and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
 state directory in ZETA_UI_STATE_DIR, and the URL of a second node started without a speech
 daemon in ZETA_UI_URL_NOSTT (for the "no daemon" scenario).
 """
@@ -108,7 +109,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (3 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (4 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -184,7 +185,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (3 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (4 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -448,6 +449,23 @@ def scenario_aprs_ribbon_appears(page, url, secret):
         stop_job(url, secret, job)
 
 
+def scenario_pocsag_ribbon_appears(page, url, secret):
+    select_source(page, url, secret, "pocsag")
+    job = start_job(url, secret, "pocsag_decode", "pocsag", 148_637_500, 12_500)
+    try:
+        page.evaluate("window.zetaTest.poll()")
+        ribbon = page.locator("#waterfall .ov-ribbon.pocsag", has_text="1234567")
+        expect(ribbon.first).to_be_visible(timeout=15_000)
+        expect(ribbon.first).to_contain_text("1234567: HELLO ZETA")
+        page.wait_for_function(
+            """(id) => {
+              const e = document.querySelector(`#jobs .job[data-id="${id}"] .events`);
+              return !!e && parseInt(e.textContent, 10) >= 1;
+            }""", arg=job, timeout=5_000)
+    finally:
+        stop_job(url, secret, job)
+
+
 def scenario_measure_label_appears(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_job(url, secret, "measure", "tone", 100_000_000, 10_000)
@@ -484,7 +502,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (3 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (4 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -1092,6 +1110,55 @@ def scenario_ssb_entry_tunes_the_dial(page, url, secret):
     finally:
         for j in jobs:
             stop_job(url, secret, j["id"])
+
+
+NEW_DECODE_ENTRIES = [
+    ("pocsag_decode", "Decode › POCSAG"),
+    ("rds_decode", "Decode › RDS (FM station data)"),
+    ("adsb_decode", "Decode › ADS-B (dump1090)"),
+    ("acars_decode", "Decode › ACARS"),
+]
+
+
+def scenario_decode_menu_lists_new_kinds(page, url, secret):
+    menu = open_menu_on_tone(page, url, secret)
+    items = menu.locator(".ctx-item").evaluate_all(
+        "els => els.map(e => [e.dataset.action, e.textContent])")
+    actions = [a for a, _ in items]
+    assert "aprs_decode" in actions, f"menu entries {items}"
+    at = actions.index("aprs_decode")
+    got = [tuple(i) for i in items[at + 1:at + 1 + len(NEW_DECODE_ENTRIES)]]
+    assert got == NEW_DECODE_ENTRIES, f"entries after APRS: {got}; menu {items}"
+    page.keyboard.press("Escape")
+    expect(menu).to_be_hidden()
+
+
+def scenario_adsb_entry_asks_for_2400_khz(page, url, secret):
+    # ADS-B always asks for 2.4 MHz, whatever was selected; the 48 kHz tone cannot serve it,
+    # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so.
+    open_menu_on_tone(page, url, secret)
+    def is_adsb_start(r):
+        if r.method != "POST" or not r.url.endswith("/op"):
+            return False
+        try:
+            body = json.loads(r.post_data or "")
+        except ValueError:
+            return False
+        return body.get("op") == "job_start" and body.get("kind") == "adsb_decode"
+    try:
+        with page.expect_request(is_adsb_start) as req:
+            page.click('#ctx .ctx-item[data-action="adsb_decode"]')
+        body = json.loads(req.value.post_data)
+        assert body["bandwidth_hz"] == 2_400_000, f"job_start {body}"
+        # The op's own head says bandwidth_hz=2400000: match the error after the arrow.
+        line = page.locator("#transcript .line", has_text="job_start kind=adsb_decode")
+        expect(line.first).to_contain_text(
+            re.compile(r"bandwidth_hz=2400000 .*→ out_of_range\b.*\bbandwidth_hz\b"))
+        expect(line.first).to_have_class(re.compile(r"\berror\b"))
+    finally:
+        for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]:
+            if j["kind"] == "adsb_decode" and j["state"]["status"] == "running":
+                stop_job(url, secret, j["id"])
 
 
 def open_menu_on_wfm(page, url, secret):

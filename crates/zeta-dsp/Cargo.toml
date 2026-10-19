@@ -31,3 +31,7 @@ gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 [[example]]
 name = "gen_aprs"
 required-features = ["test-fixtures"]
+
+[[example]]
+name = "gen_pocsag"
+required-features = ["test-fixtures"]

@@ -22,6 +22,16 @@
 //                                             label is listed in the transcript as
 //                                             `L<layer> <name> <confidence>`
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
+//   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
+//                                             bandwidth_hz at least POCSAG_MIN_BANDWIDTH_HZ
+//   rds_decode  Decode › RDS (FM station data)  job_start kind=rds_decode, deviation_hz null,
+//                                             bandwidth_hz at least WFM_MIN_BANDWIDTH_HZ
+//   adsb_decode  Decode › ADS-B (dump1090)    job_start kind=adsb_decode, deviation_hz null,
+//                                             bandwidth_hz always ADSB_BANDWIDTH_HZ (the node
+//                                             refuses under 2 MHz; a narrower source answers
+//                                             out_of_range, shown in the transcript)
+//   acars_decode  Decode › ACARS              job_start kind=acars_decode, deviation_hz null,
+//                                             bandwidth_hz at least ACARS_MIN_BANDWIDTH_HZ
 //   fm_demod   Decode › NBFM audio            job_start kind=fm_demod, deviation_hz 5000
 //   wfm_demod  Decode › FM broadcast audio    job_start kind=wfm_demod, deviation_hz 75000,
 //                                             bandwidth_hz at least WFM_MIN_BANDWIDTH_HZ
@@ -42,7 +52,8 @@
 //   ask        Send to agent                  /ask "Look at <c> Hz, <bw> Hz wide, from <start>
 //                                             to <end>: what is it?"
 // The jobs use the selection's centre and bandwidth on the source the waterfall shows (the
-// SSB entries their dial frequency and SSB_BANDWIDTH_HZ instead).
+// SSB entries their dial frequency and SSB_BANDWIDTH_HZ instead; FM broadcast and RDS widen
+// the bandwidth, ADS-B replaces it, see jobTuning).
 // #ctx-footer shows the selection in the vocabulary: center_hz=… bandwidth_hz=… start_ns=…
 // end_ns=…, with the span already clamped (see below); while an SSB entry is focused or
 // hovered it shows that entry's dial instead: center_hz=<dial> bandwidth_hz=6000
@@ -68,10 +79,22 @@ export const SSB_BANDWIDTH_HZ = 6000;
 // The FM broadcast entry asks for at least this bandwidth: a narrow drag over a station still
 // takes its whole 75 kHz-deviation band.
 export const WFM_MIN_BANDWIDTH_HZ = 200000;
+// The POCSAG and ACARS entries ask for at least these bandwidths: a narrow drag would make the
+// channel filter cut the signal (POCSAG's +-4.5 kHz deviation, ACARS's 2400 Hz MSK sidebands),
+// and the decode would silently never fire.
+export const POCSAG_MIN_BANDWIDTH_HZ = 12500;
+export const ACARS_MIN_BANDWIDTH_HZ = 10000;
+// The ADS-B entry always asks for this bandwidth (dump1090's 2.4 MHz; the node refuses
+// adsb_decode under 2 MHz), whatever was selected.
+export const ADSB_BANDWIDTH_HZ = 2_400_000;
 
 const ENTRIES = [
   ["classify", "What is this?"],
   ["aprs_decode", "Decode › APRS"],
+  ["pocsag_decode", "Decode › POCSAG"],
+  ["rds_decode", "Decode › RDS (FM station data)"],
+  ["adsb_decode", "Decode › ADS-B (dump1090)"],
+  ["acars_decode", "Decode › ACARS"],
   ["fm_demod", "Decode › NBFM audio"],
   ["wfm_demod", "Decode › FM broadcast audio"],
   ["am_demod", "Decode › AM"],
@@ -85,6 +108,10 @@ const ENTRIES = [
 // The job each decode entry starts: kind, deviation_hz and sideband.
 const JOBS = {
   aprs_decode: { kind: "aprs_decode", deviation: null, sideband: null },
+  pocsag_decode: { kind: "pocsag_decode", deviation: null, sideband: null },
+  rds_decode: { kind: "rds_decode", deviation: null, sideband: null },
+  adsb_decode: { kind: "adsb_decode", deviation: null, sideband: null },
+  acars_decode: { kind: "acars_decode", deviation: null, sideband: null },
   fm_demod: { kind: "fm_demod", deviation: 5000, sideband: null },
   wfm_demod: { kind: "wfm_demod", deviation: 75000, sideband: null },
   am_demod: { kind: "am_demod", deviation: null, sideband: null },
@@ -94,13 +121,22 @@ const JOBS = {
 };
 
 // The tuning a job entry uses for a selection: {centerHz, bandwidthHz}. SSB tunes the dial; FM
-// broadcast widens the band to at least WFM_MIN_BANDWIDTH_HZ.
+// broadcast and RDS widen the band to at least WFM_MIN_BANDWIDTH_HZ, POCSAG to at least
+// POCSAG_MIN_BANDWIDTH_HZ and ACARS to at least ACARS_MIN_BANDWIDTH_HZ; ADS-B always asks for
+// ADSB_BANDWIDTH_HZ; everything else uses the selection as is.
 export function jobTuning(action, s) {
   const sb = JOBS[action] ? JOBS[action].sideband : null;
   if (sb === "usb") return { centerHz: s.centerHz - SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
   if (sb === "lsb") return { centerHz: s.centerHz + SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
-  if (action === "wfm_demod") {
+  if (action === "adsb_decode") return { centerHz: s.centerHz, bandwidthHz: ADSB_BANDWIDTH_HZ };
+  if (action === "wfm_demod" || action === "rds_decode") {
     return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, WFM_MIN_BANDWIDTH_HZ) };
+  }
+  if (action === "pocsag_decode") {
+    return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, POCSAG_MIN_BANDWIDTH_HZ) };
+  }
+  if (action === "acars_decode") {
+    return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, ACARS_MIN_BANDWIDTH_HZ) };
   }
   return { centerHz: s.centerHz, bandwidthHz: s.bandwidthHz };
 }

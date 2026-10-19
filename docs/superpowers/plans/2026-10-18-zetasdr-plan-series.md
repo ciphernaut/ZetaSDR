@@ -16,6 +16,7 @@ interfaces rather than guessed ones.
 | 6 | UI | Wide renderer (waterfall, ribbons, context menu, agent pane, jobs), narrow renderer, graph view. All clients of the plan-3 websocket. **Delivered** on branch `ui`, 2026-10-19. Pending: the phone check of the narrow renderer, the microphone against a real `voiced`, the HackRF walk, and a live `/ask` answer from the field host. | 3 |
 | 7 | Audio path and wideband FM | Rational resampler so every demod outputs 48 kHz audio; `wfm_demod`, `am_demod` and `ssb_demod` job kinds (`--sideband`); layer-1 rules for `wfm` (19 kHz pilot as evidence), `am` and `ssb`; iNTERCEPT signal catalogue (Apache-2.0, 594 entries) as knowledge provider and layer-2 classifier; UI decode entries and playback of any audio job. **Delivered** on branch `audio-wfm`, 2026-10-19. Pending: AM and SSB playback in a browser. | 2, 6 |
 | 8 | Wideband | Polyphase filter bank shared by every job on a wide capture (a channel that fits one bin is bank-served, wider ones take the direct path); spectrum rows v2 (fixed `rows_per_s`, u8-quantised `q`, up to 8192 bins); UI band control (zoom and pan inside the capture render only, beyond it retune); `scan` job that time-shares a radio across a span wider than one capture and holds the lease on it; IQ ring sized from a memory budget (`--ring-budget-mb`); `wfm_demod` decimates before its audio filter. **Delivered** on branch `wideband`, 2026-10-20. Pending: the fix wave (sub-band scan clamp, overlays and scan redraw), the B210 at 24 Msps (its asserted `max_bandwidth_hz` is 16 MHz), and the bank's 20 % cost target (33 % measured at 16 Msps). | 2, 6, 7 |
+| 9 | Decoders | Four decode job kinds: `pocsag_decode` (12.5 kHz FM channel, 512/1200/2400 baud detected automatically), `rds_decode` (200 kHz FM broadcast band; `pi`, `ps`, `rt`), `adsb_decode` (1 090 MHz, 2.4 MHz band, dump1090 run on the node's host through the new crate `zeta-ext`) and `acars_decode` (10 kHz AM channel, 2400 baud MSK); decode-to-identify in `classify` (APRS, POCSAG and ACARS on narrow bands, RDS on wide ones); `decoder` on catalogue signatures; UI entries; field craft for pagers, aircraft and FM data. **Delivered** on branch `decoders`, 2026-10-20. Pending: live acceptance on the field host. | 2, 7, 8 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
@@ -329,3 +330,62 @@ parked next steps. The scan, lease conflicts and stitched view were exercised li
 same night (0-1 GHz in 61 steps, 19.2 s per sweep). The plan's Conventions block says Hann for the PFB
 prototype; the code uses Blackman (ruling R4) with a 0.75-bin cutoff and 16 × bins taps (ruling R5).
 
+## Plan 9 status
+
+Plan 9 is delivered on `decoders` (branch from main 857dbaa, tasks 1-10; the last implementation
+commit before this docs commit is fb84e51). Not yet tried live: the live acceptance on the field host (below)
+has not run, so nothing here was received off air.
+
+What each decoder is:
+
+- `pocsag_decode`: POCSAG from a 12.5 kHz FM channel; 512, 1200 and 2400 baud detected
+  automatically (BitSync tracks 1 % rate error); one event per message with `address`, `function`,
+  `kind`, `text`, `baud` and `protocol`.
+- `rds_decode`: RDS from a 200 kHz broadcast band (19 kHz pilot PLL, 57 kHz band-pass, mixed
+  to baseband); events `pi`, `ps`, `rt`. The first PI emits an event; a PI change clears PS and RT.
+  The sensitivity floor is about 16-20 dB carrier to noise over 240 kHz, measured on synthetic
+  fixtures only.
+- `adsb_decode`: 1 090 MHz with at least 2 MHz of band (2.4 MHz asked for); the stage in `zeta-ext`
+  feeds dump1090 (GPL, so an external process; `ZETA_DUMP1090` overrides the path) and parses its SBS
+  output into events (`icao`, `callsign`, `altitude_ft`, `lat`, `lon`, `ground_speed_kt`,
+  `track_deg`). The job fails naming dump1090 when the host has none.
+- `acars_decode`: ACARS from a 10 kHz AM channel, 2400 baud MSK; one event per CRC-clean block
+  (`reg`, `flight`, `label`, `text`, `crc_ok`).
+- `classify` tries APRS, POCSAG and ACARS on narrow bands and RDS on wide ones; the RDS attempt
+  uses a measured bandwidth threshold of 100 kHz (the fixture measures 138.5 kHz; ruling R5).
+  `knowledge_lookup` signatures carry `decoder` (a table in the catalogue module).
+- UI: decode menu entries and event ribbons for POCSAG, ACARS, RDS and ADS-B, and the ADS-B refusal
+  on a narrow band.
+
+Oracles, all installed on the dev host: multimon-ng decodes the POCSAG fixture (it needed the
+modulation resampled 48 kHz to 22 050 Hz first); acarsdec decided the ACARS details the plan had
+guessed: the tones are differential (2400 Hz keeps the bit, 1200 Hz inverts it), the CRC is
+CRC-16/KERMIT (0x8408 reflected, init 0, low byte first, over the parity-inclusive bytes from mode
+to ETX; vector 0x2189) and the pre-key is 128 bits (64 gave no sync); dump1090 (dump1090-fa 8.2-1)
+decodes the synthetic DF17 fixture (ICAO 4840D6, callsign ZETA1). The oracle tests skip with a
+printed line when the program is absent. The acarsdec oracle was flaky at about 50 % until its WAV
+was padded with 2 s of silence (62ea5b5); 3 of 3 full-suite runs were then green.
+
+Tests, as the task reports and ledger give them (the whole workspace at the branch head: 671 passed, 0 failed, 3 ignored, the 40 browser scenarios included): POCSAG 9 tests at task 1, RDS 12,
+ACARS 8 plus 3 framer tests added in task 7, zeta-ext 2 unit plus 11 integration (the real dump1090
+oracle among them), `zeta-core` ops 51, `zeta` cli 40, catalogue 10, and the UI suite 40 of 40
+Playwright scenarios (160 s of the 300 s deadline, no skip line).
+Task 10's README one-shot was run: `pocsag_decode` on the
+`gen_pocsag` fixture at 148 637 500 Hz gives one event, address 1234567, function 3, `alpha`,
+"HELLO ZETA", 1200 baud.
+
+Parked (from the ledger): `bch_failures` is not reset per batch in the POCSAG decoder; no tests for
+its BCH-failure and Tone branches; the POCSAG stage and `decode_pocsag_iq` duplicate the pipeline;
+no test for a mid-run rate change in POCSAG or ACARS, or for `Lagged` in POCSAG, RDS or ACARS; 38 kHz stereo content is
+untested against the RDS 57 kHz band-pass; an RDS PI change clears PS and RT without confirmation;
+`write_all` to dump1090 can block if a live child stops reading (cancel still ends it); `free_port`
+has a check-to-use race; the ADS-B clean-exit regression test could not reproduce the pre-fix race;
+`parity_error_drops_the_block` also fails the CRC, so it does not isolate parity; UI ribbon
+formatters print "null" or "undefined" for absent pocsag, acars and rds fields (partial events
+only).
+
+Live acceptance (to do, on the field host with dump1090, multimon-ng and acarsdec installed and the B210):
+`rds_decode` on 104.9 MHz / 200 kHz (expect PS within 10 s), `pocsag_decode` on 148.6375 MHz /
+12.5 kHz for 60 s, `acars_decode` on 131.550 MHz / 10 kHz for 120 s, `adsb_decode` on 1 090 MHz /
+2.4 MHz for 60 s (a clean run without events is a pass for the plumbing only). Outcomes are not yet
+recorded.
