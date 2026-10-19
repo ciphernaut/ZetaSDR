@@ -1,4 +1,4 @@
-//! Layer-2 decode-to-identify: run each protocol decoder (APRS, POCSAG, RDS) over
+//! Layer-2 decode-to-identify: run each protocol decoder (APRS, POCSAG, ACARS, RDS) over
 //! the channel and report only what passes its own check, the AX.25 FCS or
 //! the POCSAG BCH code (design 6.2).
 
@@ -8,6 +8,7 @@ use zeta_core::classify::{Band, Classifier, FeatureRecord, Label};
 use zeta_core::ops::channel_rate_hz;
 use zeta_core::types::Hz;
 
+use crate::acars::decode_acars_iq;
 use crate::afsk::Afsk1200Demod;
 use crate::ax25::{HdlcDeframer, parse_ax25_ui};
 use crate::channel::extract_offset;
@@ -33,7 +34,7 @@ const MIN_AUDIO_HZ: u64 = 9_600;
 /// FM deviation assumed for APRS.
 const DEVIATION_HZ: u64 = 3_000;
 
-/// Decodes APRS, POCSAG and RDS from the requested band, at least [`MIN_BW_HZ`] wide and
+/// Decodes APRS, POCSAG, ACARS and RDS from the requested band, at least [`MIN_BW_HZ`] wide and
 /// extracted at [`channel_rate_hz`]; for the whole block, from its strongest
 /// occupied band instead. Upstream features are not used.
 pub struct DecodeToIdentify;
@@ -94,7 +95,7 @@ impl Classifier for DecodeToIdentify {
 type Attempt = fn(&[Complex<f32>], u64) -> Option<Label>;
 
 /// Decoders tried on a narrow channel, all of them; labels come back in this order.
-const NARROW_ATTEMPTS: [Attempt; 2] = [aprs_attempt, pocsag_attempt];
+const NARROW_ATTEMPTS: [Attempt; 3] = [aprs_attempt, pocsag_attempt, acars_attempt];
 
 /// Decoders tried on a channel at least [`RDS_MIN_BW_HZ`] wide.
 const WIDE_ATTEMPTS: [Attempt; 1] = [rds_attempt];
@@ -109,6 +110,22 @@ fn rds_attempt(chan: &[Complex<f32>], rate: u64) -> Option<Label> {
         name: "RDS".into(),
         confidence: 1.0,
         evidence: format!("PI {}, PS {ps:?}", first.pi),
+    })
+}
+
+fn acars_attempt(chan: &[Complex<f32>], rate: u64) -> Option<Label> {
+    let blocks = decode_acars_iq(chan, rate);
+    let first = blocks.first()?;
+    Some(Label {
+        layer: 2,
+        name: "ACARS".into(),
+        confidence: 1.0,
+        evidence: format!(
+            "{} blocks CRC-clean; first {} label {}",
+            blocks.len(),
+            first.reg,
+            first.label
+        ),
     })
 }
 
@@ -161,7 +178,9 @@ fn pocsag_attempt(chan: &[Complex<f32>], rate: u64) -> Option<Label> {
 #[cfg(all(test, feature = "test-fixtures"))]
 mod tests {
     use super::*;
-    use crate::fixtures::{aprs_packet_iq, nbfm_modulate, pocsag_packet_iq, rds_station_iq, tone};
+    use crate::fixtures::{
+        acars_packet_iq, aprs_packet_iq, nbfm_modulate, pocsag_packet_iq, rds_station_iq, tone,
+    };
 
     #[tokio::test]
     async fn identifies_aprs_in_baseband_iq() {
@@ -235,6 +254,50 @@ mod tests {
             )
             .await;
         assert!(labels.iter().all(|l| l.name != "RDS"), "{labels:?}");
+    }
+
+    async fn whole(iq: &[Complex<f32>]) -> Vec<Label> {
+        DecodeToIdentify
+            .classify(
+                iq,
+                Hz(48_000),
+                Hz(131_550_000),
+                Band::whole(Hz(48_000)),
+                None,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn identifies_acars_in_baseband_iq() {
+        let iq = acars_packet_iq("VH-ZET", "H1", "#M1BPOS/ZETASDR TEST", 48_000, 0.0);
+        let labels = whole(&iq).await;
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert_eq!(labels[0].layer, 2);
+        assert_eq!(labels[0].name, "ACARS");
+        assert_eq!(labels[0].confidence, 1.0);
+        assert_eq!(
+            labels[0].evidence,
+            "1 blocks CRC-clean; first VH-ZET label H1"
+        );
+    }
+
+    #[tokio::test]
+    async fn aprs_and_pocsag_fixtures_have_no_acars_label_and_vice_versa() {
+        let aprs = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+        let pocsag = pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+        let acars = acars_packet_iq("VH-ZET", "H1", "#M1BPOS/ZETASDR TEST", 48_000, 0.0);
+        for iq in [&aprs, &pocsag] {
+            let labels = whole(iq).await;
+            assert!(labels.iter().all(|l| l.name != "ACARS"), "{labels:?}");
+        }
+        let labels = whole(&acars).await;
+        assert!(
+            labels
+                .iter()
+                .all(|l| l.name != "APRS" && l.name != "POCSAG"),
+            "{labels:?}"
+        );
     }
 
     async fn aprs_at(offset: f64) {

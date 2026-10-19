@@ -1871,3 +1871,23 @@ fn adsb_expand_refuses_narrow_band() {
         other => panic!("expected OutOfRange, got {other:?}"),
     }
 }
+
+#[test]
+fn acars_decode_expands_channel_to_decoder() {
+    let src = SourceId("b210".into());
+    let tuning = Tuning {
+        center_hz: Hz(131_550_000),
+        bandwidth_hz: Hz(10_000),
+    };
+    assert_eq!(JobKind::AcarsDecode.name(), "acars_decode");
+    let g = JobKind::AcarsDecode
+        .expand(&src, tuning, Hz(240_000), None, None, None)
+        .unwrap();
+    let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+    assert_eq!(kinds, ["channel", "acars_decode"]);
+    assert_eq!(g.nodes[1].params, serde_json::json!({}));
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!(g.edges[0].kind, StreamKind::Iq);
+    assert_eq!(g.edges[0].from, g.nodes[0].id);
+    assert_eq!(g.edges[0].to, g.nodes[1].id);
+}

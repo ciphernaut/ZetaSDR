@@ -63,6 +63,7 @@ fn schema_prints_json_with_op_result_error() {
         "aprs_decode",
         "pocsag_decode",
         "rds_decode",
+        "acars_decode",
         "adsb_decode",
         "measure",
     ] {
@@ -459,6 +460,46 @@ fn job_start_adsb_decode_prints_adsb_event() {
             .any(|f| f["payload"]["icao"] == "4840D6" && f["payload"]["callsign"] == "ZETA1"),
         "{v}"
     );
+}
+
+#[test]
+fn job_start_acars_decode_prints_acars_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq =
+        zeta_dsp::fixtures::acars_packet_iq("VH-ZET", "H1", "#M1BPOS/ZETASDR TEST", 48_000, 0.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "acars", &iq, 48_000, 131_550_000);
+    let src = format!("acars={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "acars_decode",
+            "--source",
+            "acars",
+            "--center-hz",
+            "131550000",
+            "--bandwidth-hz",
+            "10000",
+            "--then-tail",
+            "1,5000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 1, "{v}");
+    assert_eq!(frames[0]["payload"]["protocol"], "acars");
+    assert_eq!(frames[0]["payload"]["reg"], "VH-ZET");
+    assert_eq!(frames[0]["payload"]["label"], "H1");
+    assert_eq!(frames[0]["payload"]["crc_ok"], true);
 }
 
 #[test]

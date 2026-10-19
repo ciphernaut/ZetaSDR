@@ -9,10 +9,20 @@
 //! mode, address (7), technical acknowledgement, label (2), block id, STX,
 //! text, ETX or ETB, two CRC bytes, DEL.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use num_complex::Complex;
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
+use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::types::{StreamId, StreamKind};
 
 use crate::am::{DcBlock, am_demod};
+use crate::{Input, run_map};
 
 /// Bit rate.
 pub const BAUD: u32 = 2_400;
@@ -351,6 +361,7 @@ fn parse_block(body: &[u8]) -> Option<AcarsBlock> {
 /// [`MskDemod`] and [`AcarsFramer`], with every piece's state carried
 /// across [`feed`](Self::feed) calls.
 pub struct AcarsPipeline {
+    rate_hz: u64,
     dc: DcBlock,
     demod: MskDemod,
     framer: AcarsFramer,
@@ -360,6 +371,7 @@ impl AcarsPipeline {
     /// Pipeline for baseband at `rate_hz`; an error below [`MIN_RATE_HZ`].
     pub fn new(rate_hz: u64) -> Result<Self, String> {
         Ok(Self {
+            rate_hz,
             dc: DcBlock::new(rate_hz),
             demod: MskDemod::new(rate_hz)?,
             framer: AcarsFramer::new(),
@@ -382,6 +394,100 @@ pub fn decode_acars_iq(iq: &[Complex<f32>], rate_hz: u64) -> Vec<AcarsBlock> {
     match AcarsPipeline::new(rate_hz) {
         Ok(mut p) => p.feed(iq),
         Err(_) => Vec::new(),
+    }
+}
+
+/// `acars_decode` takes no parameters.
+#[derive(JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct AcarsParams {}
+
+/// Decodes ACARS from an AM channel's IQ (give it about 10 kHz), one Event
+/// per CRC-clean [`AcarsBlock`]. The input sample rate is fixed by the first
+/// frame: a later frame at another rate fails the stage, since the
+/// demodulator is built for one rate.
+pub struct AcarsDecodeStage {
+    spec: StageSpec,
+}
+
+impl AcarsDecodeStage {
+    pub fn new() -> Self {
+        Self {
+            spec: StageSpec {
+                kind: "acars_decode",
+                inputs: vec![StreamKind::Iq],
+                outputs: vec![StreamKind::Event],
+                params_schema: schemars::schema_for!(AcarsParams),
+            },
+        }
+    }
+}
+
+impl Default for AcarsDecodeStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Stage for AcarsDecodeStage {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+
+    async fn run(
+        &self,
+        params: serde_json::Value,
+        inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let _: AcarsParams = serde_json::from_value(params)
+            .map_err(|e| StageError::Failed(format!("acars_decode params: {e}")))?;
+        let Some(out) = outputs.first().cloned() else {
+            return Err(StageError::Failed("expected 1 output".into()));
+        };
+        let mut pipeline: Option<AcarsPipeline> = None;
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    pipeline = None;
+                    return Ok(Vec::new());
+                }
+            };
+            let Payload::Iq(block) = &frame.payload else {
+                return Err(StageError::Failed("acars_decode expects iq frames".into()));
+            };
+            let rate = block.sample_rate_hz.0;
+            let p = match &mut pipeline {
+                Some(p) if p.rate_hz != rate => {
+                    return Err(StageError::Failed(format!(
+                        "sample_rate_hz changed from {} to {rate}",
+                        p.rate_hz
+                    )));
+                }
+                Some(p) => p,
+                None => pipeline.insert(AcarsPipeline::new(rate).map_err(StageError::Failed)?),
+            };
+            Ok(p.feed(&block.samples)
+                .into_iter()
+                .map(|b| {
+                    let mut v = serde_json::to_value(&b).expect("AcarsBlock serialises");
+                    v["protocol"] = "acars".into();
+                    v["crc_ok"] = true.into();
+                    Frame::new(out.clone(), frame.provenance.clone(), Payload::Event(v))
+                })
+                .collect())
+        })
+        .await
     }
 }
 
@@ -467,6 +573,57 @@ mod tests {
         assert_eq!(got[0].msg_no.as_deref(), Some("M01A"));
         assert_eq!(got[0].flight.as_deref(), Some("ZT0042"));
         assert_eq!(got[0].text, "HELLO");
+    }
+
+    fn iq_of(blocks: &[Vec<u8>]) -> Vec<Complex<f32>> {
+        let mut audio = vec![0.0f32; 9_600];
+        for b in blocks {
+            audio.extend(acars_modulate(b, 48_000));
+            audio.extend(vec![0.0f32; 4_800]);
+        }
+        audio.extend(vec![0.0f32; 9_600]);
+        am_modulate(&audio, 48_000, 48_000, 0.9, 0.0)
+    }
+
+    #[test]
+    fn parity_error_drops_the_block() {
+        let mut bytes = acars_block_bytes('2', "VH-ZET", "H1", 'A', TEXT);
+        // Flip the parity bit of a text character.
+        bytes[20] ^= 0x80;
+        assert_eq!(decode_acars_iq(&iq_of(&[bytes]), 48_000), vec![]);
+    }
+
+    #[test]
+    fn two_blocks_back_to_back_both_decode() {
+        let a = acars_block_bytes('2', "VH-ZET", "H1", 'A', TEXT);
+        let b = acars_block_bytes('2', "VH-ZEU", "Q0", 'B', "SECOND");
+        let got = decode_acars_iq(&iq_of(&[a, b]), 48_000);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(
+            (got[0].reg.as_str(), got[0].text.as_str()),
+            ("VH-ZET", TEXT)
+        );
+        assert_eq!(
+            (got[1].reg.as_str(), got[1].text.as_str()),
+            ("VH-ZEU", "SECOND")
+        );
+    }
+
+    #[test]
+    fn framer_resyncs_after_garbage_bits() {
+        let bytes = acars_block_bytes('2', "VH-ZET", "H1", 'A', TEXT);
+        let mut bits: Vec<u8> = (0..1_000u32)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 13) & 1) as u8)
+            .collect();
+        bits.extend(std::iter::repeat_n(1u8, 128));
+        bits.extend(
+            bytes
+                .iter()
+                .flat_map(|&b| (0..8).map(move |i| (b >> i) & 1)),
+        );
+        bits.extend([1u8; 64]);
+        let mut framer = AcarsFramer::new();
+        assert_eq!(framer.feed(&bits), vec![expected()]);
     }
 
     /// 44-byte canonical PCM WAV header: mono, s16le, `rate` Hz.

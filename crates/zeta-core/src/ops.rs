@@ -204,6 +204,7 @@ pub enum JobKind {
     AprsDecode,
     PocsagDecode,
     RdsDecode,
+    AcarsDecode,
     AdsbDecode,
     Measure,
     Scan,
@@ -222,6 +223,7 @@ impl JobKind {
             JobKind::AprsDecode => "aprs_decode",
             JobKind::PocsagDecode => "pocsag_decode",
             JobKind::RdsDecode => "rds_decode",
+            JobKind::AcarsDecode => "acars_decode",
             JobKind::AdsbDecode => "adsb_decode",
             JobKind::Measure => "measure",
             JobKind::Scan => "scan",
@@ -239,6 +241,7 @@ impl JobKind {
                 | JobKind::AprsDecode
                 | JobKind::PocsagDecode
                 | JobKind::RdsDecode
+                | JobKind::AcarsDecode
                 | JobKind::AdsbDecode
                 | JobKind::Measure
         )
@@ -545,6 +548,33 @@ impl JobKind {
                         GraphNode {
                             id: decode.clone(),
                             kind: "rds_decode".into(),
+                            params: serde_json::json!({}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: decode,
+                        kind: StreamKind::Iq,
+                    }],
+                }
+            }
+            JobKind::AcarsDecode => {
+                let (channel, decode) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": out,
+                            }),
+                        },
+                        GraphNode {
+                            id: decode.clone(),
+                            kind: "acars_decode".into(),
                             params: serde_json::json!({}),
                         },
                     ],
