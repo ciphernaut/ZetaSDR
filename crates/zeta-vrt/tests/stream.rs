@@ -60,3 +60,56 @@ fn decoder_needs_context_counts_loss_and_recovers_after_bad_packet() {
     assert_eq!(got.missed_packets, 1);
     assert_eq!(got.t0_ns, 2_000_000);
 }
+
+#[test]
+fn decoder_counts_loss_across_mod16_wrap() {
+    let meta = IqMeta {
+        center_hz: 0,
+        sample_rate_hz: 48_000,
+        bandwidth_hz: 48_000,
+    };
+    let context = VrtEncoder::new(3).encode(0, meta, &[]);
+    assert_eq!(context.len(), 1);
+    let data = |count: u8| {
+        DataPacket {
+            stream_id: 3,
+            count,
+            t0_ns: 0,
+            samples: vec![Complex::new(0.0, 0.0); 4],
+        }
+        .encode()
+    };
+    let mut d = VrtDecoder::new();
+    assert!(d.feed(&context[0]).unwrap().is_none());
+    assert_eq!(d.feed(&data(15)).unwrap().unwrap().missed_packets, 0);
+    assert_eq!(d.feed(&data(0)).unwrap().unwrap().missed_packets, 0);
+    assert_eq!(d.feed(&data(15)).unwrap().unwrap().missed_packets, 14);
+    assert_eq!(d.feed(&data(2)).unwrap().unwrap().missed_packets, 2);
+}
+
+#[test]
+fn encoder_handles_rate_zero_and_empty_samples() {
+    let zero = IqMeta {
+        center_hz: 0,
+        sample_rate_hz: 0,
+        bandwidth_hz: 0,
+    };
+    let mut e = VrtEncoder::new(1);
+    let s = vec![Complex::new(0.5, -0.5); MAX_SAMPLES_PER_PACKET + 1];
+    let packets = e.encode(7, zero, &s);
+    assert_eq!(packets.len(), 3);
+    let second = DataPacket::decode(&packets[2]).unwrap();
+    assert_eq!(second.t0_ns, 7);
+
+    let meta = IqMeta {
+        center_hz: 1,
+        sample_rate_hz: 48_000,
+        bandwidth_hz: 48_000,
+    };
+    let mut e = VrtEncoder::new(2);
+    let first = e.encode(0, meta, &[]);
+    assert_eq!(first.len(), 1);
+    let mut d = VrtDecoder::new();
+    assert!(d.feed(&first[0]).unwrap().is_none());
+    assert!(e.encode(10, meta, &[]).is_empty());
+}
