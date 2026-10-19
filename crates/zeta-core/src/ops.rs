@@ -496,6 +496,7 @@ impl std::fmt::Display for OpError {
             } => {
                 write!(f, "{field} {value} out of range {min}..={max}")?;
                 match suggested {
+                    Some(s) if s > max => f.write_str(&crate::port::over_cap(Some(*s), *max)),
                     Some(s) => write!(f, "; did you mean {s}?"),
                     None => Ok(()),
                 }

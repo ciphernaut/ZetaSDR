@@ -297,3 +297,50 @@ async fn late_subscriber_after_all_left_still_gets_blocks() {
     drop(port);
     srv.stop().await;
 }
+
+#[tokio::test]
+async fn remote_rate_over_cap_is_rejected_and_job_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn(dir.path()).await;
+    // The tone ships 48 kHz whatever band is asked for; a 24 kHz cap must refuse it.
+    let port = open(NodeSourceConfig {
+        max_bandwidth_hz: 24_000,
+        ..cfg(&srv, "tone")
+    })
+    .await
+    .expect("opens");
+    assert_eq!(port.capabilities().max_bandwidth_hz.value().0, 24_000);
+    let err = port
+        .tune(Tuning {
+            center_hz: Hz(TONE_CENTER_HZ),
+            bandwidth_hz: Hz(24_000),
+        })
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    match err {
+        PortError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+            suggested,
+        } => {
+            assert_eq!(field, "bandwidth_hz");
+            assert_eq!(value, 24_000);
+            assert_eq!(min, 1);
+            assert_eq!(max, 24_000);
+            assert_eq!(suggested, Some(48_000));
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+    assert!(msg.contains("remote ships 48000 Hz"), "{msg}");
+    assert!(msg.contains("max_bandwidth_hz=48000"), "{msg}");
+    assert_eq!(port.current(), None);
+    let jobs = remote_jobs(&srv).await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0].kind, "passthrough");
+    assert_eq!(jobs[0].state, JobState::Stopped);
+    drop(port);
+    srv.stop().await;
+}

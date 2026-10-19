@@ -263,6 +263,8 @@ impl Port for NodePort {
     /// Checks the bandwidth against the cap without touching the network,
     /// stops the previous remote job, starts a `passthrough` job and returns
     /// the band of its first IQ packet (`bandwidth_hz` = its sample rate).
+    /// A remote that ships a rate above the cap is stopped again and the tune
+    /// is `OutOfRange` with the shipped rate as `suggested` (above `max`).
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let cap = self.caps.max_bandwidth_hz.value().0;
         let bw = t.bandwidth_hz.0;
@@ -279,6 +281,18 @@ impl Port for NodePort {
         self.stop_live().await;
         *self.shared.current.lock().unwrap() = None;
         let band = self.start(t).await?;
+        // The remote picks its own rate (a HackRF never goes below 1 Msps); the cap
+        // bounds what crosses the link, so a wider stream is stopped, not forwarded.
+        if band.bandwidth_hz.0 > cap {
+            self.stop_live().await;
+            return Err(PortError::OutOfRange {
+                field: "bandwidth_hz",
+                value: bw,
+                min: 1,
+                max: cap,
+                suggested: Some(band.bandwidth_hz.0),
+            });
+        }
         *self.shared.fault.lock().unwrap() = None;
         *self.shared.current.lock().unwrap() = Some(band);
         Ok(band)
