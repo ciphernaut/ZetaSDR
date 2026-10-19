@@ -87,8 +87,10 @@ impl IqRing {
         if block.sample_rate_hz.0 != self.sample_rate_hz {
             self.sample_rate_hz = block.sample_rate_hz.0;
             self.capacity = Self::cap_for(self.capacity_seconds, self.sample_rate_hz);
-            // A fresh buffer drops the old allocation before the new one grows.
-            self.buf = VecDeque::with_capacity(self.capacity);
+            // Drop the old allocation first, then grow: assigning a new buffer in one
+            // expression would allocate the new one while the old one is still live.
+            self.buf = VecDeque::new();
+            self.buf.reserve(self.capacity);
             self.dropped = 0;
         }
         if self.center_hz != Some(block.center_hz) {
