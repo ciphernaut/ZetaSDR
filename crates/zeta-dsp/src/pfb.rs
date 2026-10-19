@@ -72,6 +72,8 @@ pub struct PfbBank {
     /// Per-push transform buffer, `bins` samples per hop.
     rows: Vec<Complex<f32>>,
     scratch: Vec<Complex<f32>>,
+    /// Per-hop branch accumulator, `bins` samples, reused across hops.
+    acc: Vec<Complex<f32>>,
 }
 
 impl PfbBank {
@@ -97,6 +99,7 @@ impl PfbBank {
             fft,
             rows: Vec::new(),
             scratch,
+            acc: vec![Complex::default(); bins],
         }
     }
 
@@ -129,7 +132,7 @@ impl PfbBank {
         // transformed in one batched call.
         self.rows.clear();
         self.rows.resize(hops * m, Complex::default());
-        let mut acc = vec![Complex::<f32>::default(); m];
+        let acc = &mut self.acc;
         for (h, row) in self.rows.chunks_exact_mut(m).enumerate() {
             // Window of the newest `len` samples ending at this hop's last input.
             let start = h * hop + hop - 1;

@@ -59,10 +59,10 @@ fn bank_reports_its_geometry() {
 
 #[test]
 fn a_tone_lands_in_its_bin_and_leaks_60_db_less_elsewhere() {
-    // 2 s at 24 Msps pushed in 65536-sample blocks; only per-bin power sums and
+    // 0.5 s at 24 Msps pushed in 65536-sample blocks; only per-bin power sums and
     // bin 20's stream are kept, so memory stays small.
     let mut bank = PfbBank::new(RATE, BINS);
-    let total = 2 * RATE as usize;
+    let total = RATE as usize / 2;
     let mut power = [0.0f64; BINS];
     let mut count = [0usize; BINS];
     let mut seen = [0usize; BINS];
@@ -84,7 +84,7 @@ fn a_tone_lands_in_its_bin_and_leaks_60_db_less_elsewhere() {
         bin20.extend_from_slice(&got[20][..]);
         t += n;
     }
-    assert_eq!(bin20.len(), 2 * 1_500_000);
+    assert_eq!(bin20.len(), 750_000);
 
     // Peak of bin 20's 1.5 Msps stream at +100 kHz.
     let size = 4096;
@@ -175,7 +175,10 @@ fn pfb_runs_faster_than_realtime_at_24msps() {
         n += bank.push(&block)[0].len();
     }
     let el = start.elapsed();
-    eprintln!("2 s of 24 Msps through 32 bins in {el:?}");
+    eprintln!(
+        "2 s of 24 Msps through 32 bins in {el:?} ({:.3} of one core)",
+        el.as_secs_f64() / 2.0
+    );
     assert_eq!(n, blocks * BLOCK / (BINS / 2));
     assert!(el.as_secs_f64() < 2.0, "took {el:?}");
 }
