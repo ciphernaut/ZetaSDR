@@ -15,11 +15,11 @@
 //                            are the waterfall's and are ignored here anyway.
 //     ov.watchJob(job)       subscribes to the job's event stream (text mode, re-resolved by
 //                            provenance after a drop) and renders each event by payload shape:
-//         - `db` array (spectrum): ignored;
+//         - `db` array (spectrum): ignored; every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
 //         - `src` and `info` (APRS): ov.ribbon(tuning centre, "<src> > <dst>: <info>",
-//           "aprs") and the job row's counter +1;
+//           "aprs");
 //         - anything else: ov.ribbon(tuning centre, first OTHER_EVENT_CHARS chars of the
 //           payload's JSON, "event").
 //     ov.ribbon(hz, text, cls) -> element
@@ -61,7 +61,7 @@ class Overlays {
     this.jobsEl = jobsEl;
     this.sourceId = null;
     this.watched = new Map(); // job id -> {job, sub, closed}
-    this.counters = new Map(); // job id -> APRS events seen while watched
+    this.counters = new Map(); // job id -> non-spectrum events seen while watched
     this.labels = new Map(); // key -> {el, hz}
     this.ribbons = []; // {el, countEl, text, cls, hz, w, h, top, dy, right, born, count}
     this.destroyed = false;
@@ -165,17 +165,19 @@ class Overlays {
 
   render(rec, p) {
     const job = rec.job;
-    if (p && typeof p === "object" && !Array.isArray(p)) {
-      if (Array.isArray(p.db)) return;
+    const obj = p && typeof p === "object" && !Array.isArray(p);
+    if (obj && Array.isArray(p.db)) return;
+    // Every non-spectrum event counts in the job row, whatever its shape.
+    const n = (this.counters.get(job.id) || 0) + 1;
+    this.counters.set(job.id, n);
+    this.jobRow(job, n);
+    if (obj) {
       if (p.label && typeof p.label === "object" && typeof p.center_hz === "number") {
         this.label(p.center_hz, p.label, job.id);
         return;
       }
       if ("src" in p && "info" in p) {
         this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}`, "aprs");
-        const n = (this.counters.get(job.id) || 0) + 1;
-        this.counters.set(job.id, n);
-        this.jobRow(job, n);
         return;
       }
     }
@@ -189,7 +191,7 @@ class Overlays {
     const cell = row && row.querySelector(".events");
     if (!cell) return;
     cell.textContent = counter > 0 ? String(counter) : "";
-    cell.title = counter > 0 ? `${counter} decoded since this page started watching` : "";
+    cell.title = counter > 0 ? `${counter} events since this page started watching` : "";
   }
 
   // ---- drawing -------------------------------------------------------------------------
