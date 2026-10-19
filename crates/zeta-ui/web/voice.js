@@ -15,8 +15,9 @@
 //       mean as Float32 at the context rate; the button has class `recording` (a red dot)
 //       meanwhile. Second click, or MAX_RECORD_S later: stops the tracks and the context,
 //       downsamples to 16 kHz, encodes the WAV and calls api.stt. A transcript calls
-//       onText(text); a 503 shows "no speech daemon on this node" in `status`; other failures
-//       show their message there. The button is disabled only while the upload is in flight.
+//       onText(text) (a reply without a string `text` shows "speech daemon: bad reply"); a
+//       503 shows "no speech daemon on this node" in `status`; other failures show their
+//       message there. The button is disabled only while the upload is in flight.
 //       destroy() abandons any recording (nothing is sent) and disables the button.
 
 export const STT_RATE_HZ = 16000;
@@ -216,8 +217,13 @@ export function mountMic(button, api, onText, { status = document.getElementById
     let text = null;
     try {
       const wav = encodeWav(downsample(raw, r.rate), STT_RATE_HZ);
-      text = (await api.stt(wav)).text ?? "";
-      show(text.trim() ? "" : "nothing heard");
+      const reply = await api.stt(wav);
+      if (reply && typeof reply.text === "string") {
+        text = reply.text;
+        show(text.trim() ? "" : "nothing heard");
+      } else {
+        show("speech daemon: bad reply");
+      }
     } catch (e) {
       show(errorText(e));
     } finally {

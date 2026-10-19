@@ -698,7 +698,9 @@ def scenario_mic_round_trip(page, url, secret):
     assert data_len == len(wav) - 44 and struct.unpack("<I", wav[4:8])[0] == 36 + data_len
     seconds = data_len / 32_000
     assert 0.5 <= seconds <= 3.0, f"recorded {seconds:.2f} s for a 1 s hold"
-    assert any(wav[44:]), "the fake microphone's tone recorded as silence"
+    samples = struct.unpack(f"<{data_len // 2}h", wav[44:44 + data_len - data_len % 2])
+    peak = max((abs(x) for x in samples), default=0)
+    assert peak > 1000, f"the fake microphone's tone recorded as silence (peak {peak})"
     # The transcript went through the command line (it is in its history) to /ask.
     assert json.loads(ask_req.value.post_data)["request"] == SPOKEN, ask_req.value.post_data
     expect(page.locator("#transcript .line.user", has_text=SPOKEN)).to_be_visible()

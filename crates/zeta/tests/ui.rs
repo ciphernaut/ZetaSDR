@@ -23,8 +23,48 @@ const SPOKEN: &str = "what sources are there";
 /// Unix socket paths are limited to 108 bytes.
 const SOCKET_PATH_MAX: usize = 100;
 
-/// A fake `voiced` at `path`: answers `ok:<SPOKEN>` to each `file:` line, `error:` otherwise.
-/// The listener thread lives as long as the test process.
+/// Peak |sample| a recording of the fake microphone's tone must exceed.
+const MIN_PEAK: i32 = 1000;
+
+/// What the real daemon is handed: `file:<absolute path>` naming a 16 kHz mono s16le PCM WAV
+/// with the canonical 44-byte header. Also requires a non-silent recording.
+fn check_staged_wav(line: &str) -> Result<(), String> {
+    let line = line.trim_end_matches(['\n', '\r']);
+    let path = line
+        .strip_prefix("file:")
+        .ok_or_else(|| format!("unexpected command {line:?}"))?;
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(format!("staged path {} is not absolute", path.display()));
+    }
+    let wav = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    if wav.len() < 44 || &wav[0..4] != b"RIFF" || &wav[8..16] != b"WAVEfmt " {
+        return Err(format!("{} is not a RIFF/WAVE file", path.display()));
+    }
+    let u16_at = |at: usize| u16::from_le_bytes([wav[at], wav[at + 1]]);
+    let u32_at = |at: usize| u32::from_le_bytes(wav[at..at + 4].try_into().unwrap());
+    let fmt = (u32_at(16), u16_at(20), u16_at(22), u32_at(24), u16_at(34));
+    if fmt != (16, 1, 1, 16_000, 16) {
+        return Err(format!(
+            "fmt (chunk, format, channels, rate, bits) {fmt:?}, want (16, 1, 1, 16000, 16)"
+        ));
+    }
+    if &wav[36..40] != b"data" || u32_at(40) as usize != wav.len() - 44 {
+        return Err("data chunk missing or its length is wrong".to_string());
+    }
+    let peak = wav[44..]
+        .chunks_exact(2)
+        .map(|b| i32::from(i16::from_le_bytes([b[0], b[1]])).abs())
+        .max()
+        .unwrap_or(0);
+    if peak <= MIN_PEAK {
+        return Err(format!("recording is silent (peak {peak})"));
+    }
+    Ok(())
+}
+
+/// A fake `voiced` at `path`: answers `ok:<SPOKEN>` to a `file:` line naming a valid staged
+/// WAV ([`check_staged_wav`]), `error:<reason>` otherwise. Lives as long as the test process.
 fn fake_voiced(path: &Path) {
     let listener = UnixListener::bind(path).expect("bind fake voiced socket");
     std::thread::spawn(move || {
@@ -37,10 +77,9 @@ fn fake_voiced(path: &Path) {
             if BufReader::new(reader).read_line(&mut line).is_err() {
                 continue;
             }
-            let answer = if line.starts_with("file:") {
-                format!("ok:{SPOKEN}\n")
-            } else {
-                format!("error:unexpected command {line:?}\n")
+            let answer = match check_staged_wav(&line) {
+                Ok(()) => format!("ok:{SPOKEN}\n"),
+                Err(reason) => format!("error:{reason}\n"),
             };
             let _ = conn.write_all(answer.as_bytes());
         }
