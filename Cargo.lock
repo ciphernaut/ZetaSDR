@@ -3672,6 +3672,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "num-complex",
  "predicates",
  "serde_json",
  "tempfile",
@@ -3686,6 +3687,8 @@ dependencies = [
  "zeta-source-kiwi",
  "zeta-source-node",
  "zeta-source-soapy-driver",
+ "zeta-source-vrt",
+ "zeta-vrt",
  "zeta-ws",
 ]
 
@@ -3860,6 +3863,17 @@ dependencies = [
  "soapysdr",
  "zeta-core",
  "zeta-source-soapy",
+]
+
+[[package]]
+name = "zeta-source-vrt"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "num-complex",
+ "tokio",
+ "zeta-core",
+ "zeta-vrt",
 ]
 
 [[package]]

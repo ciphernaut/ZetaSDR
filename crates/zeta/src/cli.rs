@@ -46,10 +46,20 @@ pub struct Cli {
         value_parser = sources::parse_node
     )]
     source_node: Vec<SourceSpec>,
+    /// Receive VITA 49.2 (VRT) packets on UDP ADDR:PORT as source <ID> (repeatable). ADDR
+    /// must be a LAN address (0.0.0.0 listens on every interface); the sender sets the
+    /// frequency and rate, and a job's band must lie inside it
+    #[arg(
+        long = "source-vrt",
+        global = true,
+        value_name = "ID=udp://ADDR:PORT",
+        value_parser = sources::parse_vrt
+    )]
+    source_vrt: Vec<SourceSpec>,
     /// Register the program at absolute PATH as stage kind KIND (repeatable); probed at startup
     #[arg(long = "plugin", global = true, value_name = "KIND=PATH", value_parser = sources::parse_plugin)]
     pub plugins: Vec<PluginSpec>,
-    /// Every source flag parsed, file then soapy then kiwi then node (filled by
+    /// Every source flag parsed, file then soapy then kiwi then node then vrt (filled by
     /// `try_parse_checked`).
     #[arg(skip)]
     sources: Vec<SourceSpec>,
@@ -103,6 +113,7 @@ impl Cli {
             }
             sources.push(spec);
         }
+        sources.append(&mut self.source_vrt);
         let mut ids = std::collections::HashSet::new();
         for s in &sources {
             if !ids.insert(s.id()) {
@@ -128,7 +139,7 @@ impl Cli {
     }
 
     /// The sources to attach: `--source-file`, then `--source-soapy`, then `--source-kiwi`,
-    /// then `--source-node`, each in flag order.
+    /// then `--source-node`, then `--source-vrt`, each in flag order.
     pub fn sources(&self) -> Vec<SourceSpec> {
         self.sources.clone()
     }

@@ -1,5 +1,6 @@
 //! The source and plugin flags: `--source-file`, `--source-soapy`, `--source-kiwi`,
-//! `--source-node` parse to one [`SourceSpec`]; `--plugin` to a [`PluginSpec`].
+//! `--source-node`, `--source-vrt` parse to one [`SourceSpec`]; `--plugin` to a
+//! [`PluginSpec`].
 //!
 //! A Kiwi password never appears in a `SourceSpec`'s `Debug` or `Display`, nor in a parse
 //! error: everything after the `/` is replaced by `<redacted>`. Without a `/PASSWORD` part
@@ -10,6 +11,7 @@
 //! `ZETA_NODE_SECRET_<ID>` (see [`node_secret_env`]) when the port is opened.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use zeta_source_node::NODE_DEFAULT_MAX_BANDWIDTH_HZ;
@@ -36,6 +38,9 @@ pub enum SourceSpec {
         remote_source: String,
         max_bandwidth_hz: u64,
     },
+    /// `--source-vrt ID=udp://ADDR:PORT`: VITA 49.2 packets received on the LAN UDP
+    /// address `bind`.
+    Vrt { id: String, bind: SocketAddr },
 }
 
 impl SourceSpec {
@@ -44,7 +49,8 @@ impl SourceSpec {
             Self::File { id, .. }
             | Self::Soapy { id, .. }
             | Self::Kiwi { id, .. }
-            | Self::Node { id, .. } => id,
+            | Self::Node { id, .. }
+            | Self::Vrt { id, .. } => id,
         }
     }
 }
@@ -69,6 +75,7 @@ impl fmt::Display for SourceSpec {
                 }
                 Ok(())
             }
+            Self::Vrt { id, bind } => write!(f, "--source-vrt {id}=udp://{bind}"),
         }
     }
 }
@@ -244,6 +251,33 @@ pub fn parse_node(s: &str) -> Result<SourceSpec, String> {
         url: url.strip_suffix('/').unwrap_or(url).into(),
         remote_source: remote.into(),
         max_bandwidth_hz,
+    })
+}
+
+/// `ID=udp://ADDR:PORT`: `ADDR` an IP literal on the LAN (loopback, private, link-local,
+/// CGNAT or unspecified, as `serve --listen`), IPv6 in brackets; `PORT` not 0. Errors name
+/// the bad part and show the expected form.
+pub fn parse_vrt(s: &str) -> Result<SourceSpec, String> {
+    let bad = |part: String| format!("{part}; expected ID=udp://ADDR:PORT, got {s:?}");
+    let (id, url) = split_id(s).ok_or_else(|| bad("missing ID=".into()))?;
+    let Some(addr) = url.strip_prefix("udp://") else {
+        return Err(bad(format!("{url:?} must start with udp://")));
+    };
+    let bind: SocketAddr = addr
+        .parse()
+        .map_err(|_| bad(format!("{addr:?} is not an IP ADDR:PORT")))?;
+    if bind.port() == 0 {
+        return Err(bad("PORT must not be 0".into()));
+    }
+    if !zeta_ws::addr::is_lan(bind.ip()) {
+        return Err(bad(format!(
+            "{} is not a LAN address; ZetaSDR is LAN only",
+            bind.ip()
+        )));
+    }
+    Ok(SourceSpec::Vrt {
+        id: id.into(),
+        bind,
     })
 }
 
@@ -431,6 +465,46 @@ mod tests {
                 e.contains("ID=SOURCE@URL[,max_bandwidth_hz=N]"),
                 "{bad}: {e}"
             );
+        }
+    }
+
+    #[test]
+    fn vrt_spec_parses_lan_addresses_only() {
+        let s = parse_vrt("v=udp://127.0.0.1:4991").unwrap();
+        assert_eq!(
+            s,
+            SourceSpec::Vrt {
+                id: "v".into(),
+                bind: "127.0.0.1:4991".parse().unwrap()
+            }
+        );
+        assert_eq!(s.id(), "v");
+        assert_eq!(s.to_string(), "--source-vrt v=udp://127.0.0.1:4991");
+        for ok in [
+            "v=udp://0.0.0.0:4991",
+            "v=udp://192.168.1.5:4991",
+            "v=udp://10.0.0.1:1",
+            "v=udp://169.254.0.9:4991",
+            "v=udp://[::1]:4991",
+            "v=udp://[fe80::1]:4991",
+        ] {
+            assert!(parse_vrt(ok).is_ok(), "{ok}");
+        }
+        for (bad, part) in [
+            ("v", "ID="),
+            ("=udp://127.0.0.1:1", "ID="),
+            ("v=127.0.0.1:1", "udp://"),
+            ("v=tcp://127.0.0.1:1", "udp://"),
+            ("v=udp://127.0.0.1", "ADDR:PORT"),
+            ("v=udp://host.local:1", "ADDR:PORT"),
+            ("v=udp://127.0.0.1:x", "ADDR:PORT"),
+            ("v=udp://127.0.0.1:0", "PORT"),
+            ("v=udp://8.8.8.8:4991", "not a LAN address"),
+            ("v=udp://[2001:db8::1]:4991", "not a LAN address"),
+        ] {
+            let e = parse_vrt(bad).unwrap_err();
+            assert!(e.contains(part), "{bad}: {e}");
+            assert!(e.contains("ID=udp://ADDR:PORT"), "{bad}: {e}");
         }
     }
 

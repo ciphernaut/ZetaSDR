@@ -613,6 +613,7 @@ fn node_mode_rejects_source_and_plugin_flags() {
     for flags in [
         ["--source-kiwi", "k=h:1"],
         ["--source-node", "pi=tone@http://127.0.0.1:9"],
+        ["--source-vrt", "v=udp://127.0.0.1:4991"],
         ["--source-soapy", "h=driver=hackrf"],
         ["--plugin", "gain=/x"],
     ] {
@@ -863,4 +864,95 @@ fn source_node_is_rejected_with_node() {
         .assert()
         .code(1)
         .stderr(contains("configured on the serving node"));
+}
+
+/// Send a 1 kHz tone at 48 kHz centred on 1 MHz to `to` over UDP in real time, 10 ms
+/// blocks, context once a second as `VrtEncoder` does. Stops when `stop` is set or after
+/// 10 s.
+fn send_vrt_tone(to: std::net::SocketAddr, stop: &std::sync::atomic::AtomicBool) {
+    use num_complex::Complex;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    use zeta_vrt::{IqMeta, VrtEncoder};
+    const RATE: u64 = 48_000;
+    const BLOCK: u64 = 480;
+    let meta = IqMeta {
+        center_hz: 1_000_000,
+        sample_rate_hz: RATE,
+        bandwidth_hz: RATE,
+    };
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut enc = VrtEncoder::new(5);
+    let start = Instant::now();
+    for n in 0..1000u64 {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let t0_ns = n * BLOCK * 1_000_000_000 / RATE;
+        let samples: Vec<Complex<f32>> = (n * BLOCK..(n + 1) * BLOCK)
+            .map(|i| {
+                let ph = 2.0 * std::f64::consts::PI * 1_000.0 * i as f64 / RATE as f64;
+                Complex::new(0.5 * ph.cos() as f32, 0.5 * ph.sin() as f32)
+            })
+            .collect();
+        for p in enc.encode(t0_ns, meta, &samples) {
+            sock.send_to(&p, to).unwrap();
+        }
+        let due = start + Duration::from_millis((n + 1) * 10);
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+    }
+}
+
+#[test]
+fn source_vrt_measure_labels_sent_tone_as_carrier() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    // A free loopback UDP port for zeta to bind.
+    let to = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let stop = AtomicBool::new(false);
+    let out = std::thread::scope(|s| {
+        s.spawn(|| send_vrt_tone(to, &stop));
+        let out = zeta_bin()
+            .arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .arg("--source-vrt")
+            .arg(format!("t=udp://{to}"))
+            .args([
+                "--json", "job", "start", "--kind", "measure", "--source", "t",
+            ])
+            .args(["--center-hz", "1000000", "--bandwidth-hz", "48000"])
+            .args(["--then-tail", "1,8000"])
+            .timeout(std::time::Duration::from_secs(30))
+            .output()
+            .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        out
+    });
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json(&out.stdout);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames");
+    assert_eq!(frames.len(), 1, "{v}");
+    assert_eq!(frames[0]["source"], "t");
+    assert_eq!(frames[0]["payload"]["label"]["name"], "carrier", "{v}");
+    assert_eq!(v[2]["stopped"], true);
+}
+
+#[test]
+fn source_vrt_non_lan_address_is_usage_error() {
+    zeta_bin()
+        .args(["--source-vrt", "t=udp://8.8.8.8:4991", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("not a LAN address"))
+        .stderr(contains("ID=udp://ADDR:PORT"));
 }

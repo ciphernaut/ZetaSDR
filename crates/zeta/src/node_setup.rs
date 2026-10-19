@@ -1,6 +1,6 @@
 //! Build the node the CLI drives: stage registry (core plus `zeta-dsp`, plus `--plugin`
-//! stages), sources (SigMF files, KiwiSDRs, other ZetaSDR nodes, and SoapySDR devices
-//! when built with `--cfg soapy`), knowledge and classifiers.
+//! stages), sources (SigMF files, KiwiSDRs, other ZetaSDR nodes, VRT senders over UDP,
+//! and SoapySDR devices when built with `--cfg soapy`), knowledge and classifiers.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use zeta_plugin::host::PluginCommand;
 use zeta_source_file::{FileOpts, FileSource};
 use zeta_source_kiwi::{KiwiConfig, KiwiSource};
 use zeta_source_node::{NodePort, NodeSourceConfig};
+use zeta_source_vrt::VrtSourceConfig;
 
 use crate::sources::{PluginSpec, SourceSpec};
 
@@ -129,7 +130,8 @@ impl RemotePorts {
 /// loop in real time and start after the node has subscribed to them (a source with no
 /// subscriber stops at once); a KiwiSDR connects on its first tune; a remote node is asked
 /// for its source list here (with the secret from `ZETA_NODE_SECRET_<ID>`) and runs a
-/// `passthrough` job from each tune; a SoapySDR device is opened here. `resume` relaunches persisted `Running` jobs (`serve`); without it they
+/// `passthrough` job from each tune; a VRT source binds its UDP address here; a SoapySDR
+/// device is opened here. `resume` relaunches persisted `Running` jobs (`serve`); without it they
 /// are listed as persisted and left alone (one-shot). Errors name the flag, never a
 /// Kiwi password or a node secret. The node comes with its [`RemotePorts`].
 pub async fn open(
@@ -184,6 +186,11 @@ pub async fn open(
                 let p = Arc::new(NodePort::open(cfg).await.map_err(|e| flag(&e))?);
                 remotes.0.push(p.clone());
                 ports.push(p);
+            }
+            SourceSpec::Vrt { bind, .. } => {
+                let cfg = VrtSourceConfig { id, bind: *bind };
+                let p = zeta_source_vrt::open(cfg).await.map_err(|e| flag(&e))?;
+                ports.push(Arc::new(p));
             }
             SourceSpec::Soapy { args, .. } => {
                 ports.push(open_soapy(spec.id(), args).map_err(|e| flag(&e))?);
