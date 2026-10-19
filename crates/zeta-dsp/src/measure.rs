@@ -29,7 +29,8 @@ const OCCUPIED_DB: f32 = 6.0;
 const GAP_HZ: f64 = 1_500.0;
 /// `burst` when the loudest 10 ms chunk exceeds the median chunk power by this ratio.
 const BURST_RATIO: f64 = 3.0;
-/// A symbol-rate line must stand this far above the median of its spectrum.
+/// A line (symbol rate, or the 19 kHz broadcast pilot) must stand this far
+/// above the median of its spectrum.
 const LINE_DB: f32 = 10.0;
 /// Neighbourhood half-width, in bins, for a symbol-rate line's local median.
 const LOCAL_BINS: usize = 16;
@@ -46,6 +47,31 @@ const FM_MIN_DEV_HZ: f64 = 100.0;
 const FM_MAX_CV: f32 = 0.2;
 /// ... and occupied bandwidth at most this.
 const FM_MAX_BW_HZ: u64 = 25_000;
+/// Wideband (broadcast) FM: occupied band from this ...
+const WFM_MIN_BW_HZ: u64 = 100_000;
+/// ... to this, ...
+const WFM_MAX_BW_HZ: u64 = 250_000;
+/// ... envelope coefficient of variation below this (looser than `FM_MAX_CV`:
+/// a wide band at a modest rate collects more noise) ...
+const WFM_MAX_CV: f32 = 0.35;
+/// ... and discriminator audio deviating by more than this RMS.
+const WFM_MIN_DEV_HZ: f64 = 5_000.0;
+/// Broadcast FM stereo pilot frequency ...
+const PILOT_HZ: f64 = 19_000.0;
+/// ... and the half-width of the window it is searched in.
+const PILOT_TOL_HZ: f64 = 300.0;
+/// The pilot's line is measured against the median of the discriminator audio
+/// spectrum over this range, the pilot window excluded.
+const PILOT_REGION_HZ: (f64, f64) = (15_000.0, 23_000.0);
+/// AM and SSB: envelope coefficient of variation at least this.
+const AM_MIN_CV: f32 = 0.25;
+/// AM carrier line: the sideband level is the mean power of the bins this far
+/// from the centre, either side.
+const AM_SIDEBAND_HZ: (f64, f64) = (1_000.0, 5_000.0);
+/// SSB: occupied band range ...
+const SSB_BW_HZ: (u64, u64) = (1_500, 4_000);
+/// ... and the least fraction of the occupied-band power on one side of centre.
+const SSB_ONE_SIDE: f64 = 0.8;
 /// FSK: the two tones are within this many dB of each other, and every other
 /// peak is at least this far below the weaker tone.
 const FSK_PEAK_DB: f32 = 6.0;
@@ -391,15 +417,29 @@ fn tone_pair(
         .then_some((i1.min(i2) as f64 * bin_hz, i1.max(i2) as f64 * bin_hz))
 }
 
-/// Conservative layer-1 label for a measured block.
+/// Conservative layer-1 label for a measured block. Rules, first match wins:
 ///
-/// `"noise"` (0.5) when `snr_db < 6`; `"fsk"` (0.6) when the power spectrum
-/// has exactly two dominant peaks inside the occupied band 500–3000 Hz apart
-/// and within 6 dB of each other, or, for a constant-envelope signal, when
-/// its discriminator audio does (AFSK on FM); `"fm"` (0.6) when the envelope
-/// CV is below 0.2, the band is at most 25 kHz and the discriminator audio
-/// deviates by more than 100 Hz RMS, `"carrier"` (0.7) when it does not;
-/// otherwise `"unknown"` (0.5).
+/// 1. `"noise"` (0.5) when `snr_db < 6`.
+/// 2. `"fsk"` (0.6) when the power spectrum has exactly two dominant peaks
+///    inside the occupied band 500–3000 Hz apart and within 6 dB of each
+///    other, or, for a constant-envelope signal (CV below 0.2) with a keying
+///    line, when its discriminator audio does (AFSK on FM).
+/// 3. `"wfm"` when the occupied band is 100–250 kHz, the envelope CV is below
+///    0.35 and the discriminator audio deviates by more than 5 kHz RMS: 0.9
+///    when [`pilot_line_db`] finds a 19 kHz pilot at least 10 dB above its
+///    region, else 0.6.
+/// 4. `"am"` (0.6) when a carrier line sits at the block centre (the
+///    strongest of the centre bin and its two neighbours at least 6 dB above
+///    the mean power of the bins 1–5 kHz either side) and the envelope CV is
+///    at least 0.25.
+/// 5. `"ssb"` (0.6) when there is no such centre line, the envelope CV is at
+///    least 0.25, the occupied band is 1.5–4 kHz and at least 80 % of its
+///    power lies on one side of centre; the evidence names `usb` (above) or
+///    `lsb` (below).
+/// 6. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
+///    25 kHz and the discriminator audio deviates by more than 100 Hz RMS;
+///    `"carrier"` (0.7) under the same gate when it does not.
+/// 7. Otherwise `"unknown"` (0.5).
 pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Label {
     let cv = envelope_cv(iq);
     let (name, confidence, reason) = classify_block(f, iq, rate_hz, cv);
@@ -430,6 +470,63 @@ fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> f64 {
     }
     let ms = audio.iter().map(|a| (a.re as f64).powi(2)).sum::<f64>() / audio.len() as f64;
     ms.sqrt() * rate_hz as f64 / (2.0 * std::f64::consts::PI)
+}
+
+/// Strength, in dB, of a 19 kHz broadcast stereo pilot in the discriminator
+/// audio of `iq`: the largest bin of the audio's `SIZE`-bin spectrum within
+/// `PILOT_HZ ± PILOT_TOL_HZ` minus the median of the bins from 15 to 23 kHz
+/// outside that window. `None` when `rate_hz` is below
+/// `2 × (PILOT_HZ + PILOT_TOL_HZ)` (the window is not below Nyquist) or the
+/// block is shorter than `SIZE + 1` samples.
+pub fn pilot_line_db(iq: &[Complex<f32>], rate_hz: u64) -> Option<f32> {
+    if (rate_hz as f64) < 2.0 * (PILOT_HZ + PILOT_TOL_HZ) {
+        return None;
+    }
+    let db = real_spectrum(&discriminator(iq))?;
+    let bin_hz = rate_hz as f64 / SIZE as f64;
+    let last = db.len() - 1;
+    let bin = |hz: f64| ((hz / bin_hz).round() as usize).min(last);
+    let (p_lo, p_hi) = (
+        ((PILOT_HZ - PILOT_TOL_HZ) / bin_hz).ceil() as usize,
+        (((PILOT_HZ + PILOT_TOL_HZ) / bin_hz).floor() as usize).min(last),
+    );
+    // A window narrower than one bin still holds the bin nearest the pilot.
+    let (p_lo, p_hi) = if p_lo > p_hi {
+        (bin(PILOT_HZ), bin(PILOT_HZ))
+    } else {
+        (p_lo, p_hi)
+    };
+    let line = db[p_lo..=p_hi]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let region: Vec<f32> = (bin(PILOT_REGION_HZ.0)..=bin(PILOT_REGION_HZ.1))
+        .filter(|k| !(p_lo..=p_hi).contains(k))
+        .map(|k| db[k])
+        .collect();
+    if region.is_empty() {
+        return None;
+    }
+    Some(line - median(&region))
+}
+
+/// dB by which the strongest of the centre bin of `db` (a `SIZE`-bin
+/// fftshifted spectrum) and its two neighbours exceeds the mean power of the
+/// bins `AM_SIDEBAND_HZ` from the centre, either side.
+fn centre_line_db(db: &[f32], bin_hz: f64) -> f32 {
+    let c = SIZE / 2;
+    let centre = db[c - 1].max(db[c]).max(db[c + 1]);
+    let lo = ((AM_SIDEBAND_HZ.0 / bin_hz).ceil() as usize).max(2);
+    let hi = ((AM_SIDEBAND_HZ.1 / bin_hz).floor() as usize).min(c - 1);
+    if lo > hi {
+        return 0.0;
+    }
+    let (sum, n) = (lo..=hi)
+        .flat_map(|k| [db[c - k], db[c + k]])
+        .fold((0.0f64, 0usize), |(s, n), v| {
+            (s + 10f64.powf(v as f64 / 10.0), n + 1)
+        });
+    centre - (10.0 * (sum / n as f64).log10()) as f32
 }
 
 fn classify_block(
@@ -469,23 +566,61 @@ fn classify_block(
                 }
             }
         }
-        if f.bandwidth_hz.0 <= FM_MAX_BW_HZ {
-            let dev = audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0);
-            if dev < FM_MIN_DEV_HZ {
-                return (
-                    "carrier",
-                    0.7,
-                    format!(
-                        "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz)"
-                    ),
-                );
-            }
+    }
+    if (WFM_MIN_BW_HZ..=WFM_MAX_BW_HZ).contains(&f.bandwidth_hz.0) && cv < WFM_MAX_CV {
+        let dev = audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0);
+        if dev > WFM_MIN_DEV_HZ {
+            let reason = format!("wideband constant envelope, rms deviation {dev:.0} Hz");
+            return match pilot_line_db(iq, rate_hz).filter(|&d| d >= LINE_DB) {
+                Some(d) => ("wfm", 0.9, format!("{reason}; 19 kHz pilot +{d:.1} dB")),
+                None => ("wfm", 0.6, reason),
+            };
+        }
+    }
+    if cv >= AM_MIN_CV {
+        let carrier_db = centre_line_db(&db, bin_hz);
+        if carrier_db >= OCCUPIED_DB {
             return (
-                "fm",
+                "am",
                 0.6,
-                format!("constant envelope, narrow band, rms deviation {dev:.0} Hz"),
+                format!("carrier line {carrier_db:.1} dB above the sidebands, cv {cv:.3}"),
             );
         }
+        if (SSB_BW_HZ.0..=SSB_BW_HZ.1).contains(&f.bandwidth_hz.0) {
+            let power = |k: usize| 10f64.powf(db[k] as f64 / 10.0);
+            let below: f64 = (lo..=hi).filter(|&k| k < SIZE / 2).map(power).sum();
+            let above: f64 = (lo..=hi).filter(|&k| k > SIZE / 2).map(power).sum();
+            let total: f64 = (lo..=hi).map(power).sum();
+            for (side, p) in [("usb", above), ("lsb", below)] {
+                if total > 0.0 && p / total >= SSB_ONE_SIDE {
+                    return (
+                        "ssb",
+                        0.6,
+                        format!(
+                            "{side}: no carrier line ({carrier_db:.1} dB), {:.0} % of the occupied power on one side, cv {cv:.3}",
+                            100.0 * p / total
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    if cv < FM_MAX_CV && f.bandwidth_hz.0 <= FM_MAX_BW_HZ {
+        let dev = audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0);
+        if dev < FM_MIN_DEV_HZ {
+            return (
+                "carrier",
+                0.7,
+                format!(
+                    "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz)"
+                ),
+            );
+        }
+        return (
+            "fm",
+            0.6,
+            format!("constant envelope, narrow band, rms deviation {dev:.0} Hz"),
+        );
     }
     ("unknown", 0.5, "no layer-1 rule matched".into())
 }
