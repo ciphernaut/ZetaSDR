@@ -13,9 +13,12 @@
 //     menu.destroy()
 //
 // Entries (`.ctx-item[data-action]`):
-//   classify   What is this?                  classify {selection}; the labels are drawn with
-//                                             ov.label at the selection's centre and listed in
-//                                             the transcript
+//   classify   What is this?                  notes "classify: running…", then classify
+//                                             {selection}; the labels are drawn with ov.label
+//                                             at the selection's centre (stacked
+//                                             LABEL_STEP_PX apart, or LABEL_FALLBACK_STEP_HZ
+//                                             while the band is unknown) and listed in the
+//                                             transcript
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
 //   fm_demod   Decode › NBFM audio            job_start kind=fm_demod, deviation_hz 5000
 //   measure    Start background job › measure job_start kind=measure, deviation_hz null
@@ -35,6 +38,8 @@
 
 export const SPAN_LIMIT_NS = 8_000_000_000;
 export const LABEL_STEP_PX = 18;
+// The label spacing in Hz while the waterfall cannot map Hz to pixels (band not known yet).
+export const LABEL_FALLBACK_STEP_HZ = 1000;
 
 const ENTRIES = [
   ["classify", "What is this?"],
@@ -168,6 +173,7 @@ class Menu {
       bandwidth_hz: s.bandwidthHz,
     };
     if (action === "classify") {
+      this.t.note("classify: running…");
       const r = await this.applyOp({ op: "classify", selection });
       if (r && r.result === "labels") this.showLabels(s, r.value || []);
     } else if (action === "iq_read") {
@@ -203,10 +209,13 @@ class Menu {
     }
     const y0 = this.wf.yForHz(s.centerHz);
     const y1 = this.wf.yForHz(s.centerHz + 1000);
-    const hzPerPx = y0 !== null && y1 !== null && y0 !== y1 ? 1000 / (y0 - y1) : 0;
+    const stepHz =
+      y0 !== null && y1 !== null && y0 !== y1
+        ? (LABEL_STEP_PX * 1000) / (y0 - y1)
+        : LABEL_FALLBACK_STEP_HZ;
     labels.forEach((l, i) => {
       const key = `classify:${i}`;
-      this.ov.label(s.centerHz - i * LABEL_STEP_PX * hzPerPx, l, key);
+      this.ov.label(s.centerHz - i * stepHz, l, key);
       this.labelKeys.push(key);
       const conf = typeof l.confidence === "number" ? ` ${l.confidence.toFixed(2)}` : "";
       this.t.note(`L${l.layer} ${l.name}${conf}${l.evidence ? ` (${l.evidence})` : ""}`);

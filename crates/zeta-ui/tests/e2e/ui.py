@@ -486,6 +486,7 @@ def scenario_what_is_this_classifies(page, url, secret):
     menu = drag_menu(page)
     page.click('#ctx .ctx-item[data-action="classify"]')
     expect(menu).to_be_hidden()
+    expect(page.locator("#transcript .line.note", has_text="classify: running…")).to_be_visible()
     line = page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
     expect(line.first).to_be_visible(timeout=15_000)
     label = page.locator("#waterfall .ov-label", has_text="carrier")
