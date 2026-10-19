@@ -1523,3 +1523,30 @@ fn wfm_expansion_is_channel_then_wfm_demod() {
         assert_eq!(g.edges[0].kind, StreamKind::Iq);
     }
 }
+
+#[test]
+fn am_expansion_is_channel_then_am_demod() {
+    assert_eq!(JobKind::AmDemod.name(), "am_demod");
+    assert_eq!(
+        serde_json::to_value(JobKind::AmDemod).unwrap(),
+        serde_json::json!("am_demod")
+    );
+    let tuning = Tuning {
+        center_hz: Hz(121_500_000),
+        bandwidth_hz: Hz(10_000),
+    };
+    let g = JobKind::AmDemod
+        .expand(&SourceId("b210".into()), tuning, Hz(48_000), None)
+        .unwrap();
+    assert_eq!(g.nodes.len(), 2);
+    assert_eq!(g.nodes[0].kind, "channel");
+    assert_eq!(g.nodes[1].kind, "am_demod");
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({"audio_rate_hz": 48_000})
+    );
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!(g.edges[0].from, g.nodes[0].id);
+    assert_eq!(g.edges[0].to, g.nodes[1].id);
+    assert_eq!(g.edges[0].kind, StreamKind::Iq);
+}

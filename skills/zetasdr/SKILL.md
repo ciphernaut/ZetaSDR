@@ -64,7 +64,7 @@ CLI: `zeta source ensure --source <id> --center-hz 144800000 --bandwidth-hz 1250
 
 ### job_start
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|aprs_decode|measure)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|aprs_decode|measure)
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
@@ -74,7 +74,7 @@ JSON: `{"op":"job_start","kind":"passthrough","source":"<id>","center_hz":144800
 
 CLI: `zeta job start --kind passthrough --source <id> --center-hz 144800000 --bandwidth-hz 12500`
 
-`fm_demod` is narrowband FM voice; `wfm_demod` is wideband broadcast FM (mono, 50 us de-emphasis, 15 kHz audio; give it a band of about 200000 Hz). Both output 48 kHz audio. `deviation_hz` is the FM peak deviation for `fm_demod` and `wfm_demod` (100-75000 Hz; `null` means the kind's default: 5000 Hz for `fm_demod`, right for standard voice FM, use 2500 for narrow 12.5 kHz channels; 75000 Hz for `wfm_demod`, right for broadcast FM). Every other kind takes `null`. On the CLI, omit `--deviation-hz` for `null`.
+`fm_demod` is narrowband FM voice; `wfm_demod` is wideband broadcast FM (mono, 50 us de-emphasis, 15 kHz audio; give it a band of about 200000 Hz). `am_demod` is AM voice (envelope detector, 5 kHz audio, slow AGC; give it a band of about 10000 Hz). All three output 48 kHz audio. `deviation_hz` is the FM peak deviation for `fm_demod` and `wfm_demod` (100-75000 Hz; `null` means the kind's default: 5000 Hz for `fm_demod`, right for standard voice FM, use 2500 for narrow 12.5 kHz channels; 75000 Hz for `wfm_demod`, right for broadcast FM). Every other kind takes `null`. On the CLI, omit `--deviation-hz` for `null`.
 
 ### job_list
 
@@ -182,6 +182,12 @@ CLI: `zeta schema`
 ## Stage kinds
 
 A graph node's `kind` names one of these; its `params` must match the listed fields.
+
+### am_demod
+
+- inputs: iq
+- outputs: audio
+- params.audio_rate_hz: integer
 
 ### aprs_decode
 

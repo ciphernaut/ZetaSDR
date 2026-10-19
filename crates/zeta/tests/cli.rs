@@ -1100,3 +1100,47 @@ fn wfm_demod_job_streams_48k_audio_from_a_wfm_fixture() {
         assert!(peak > 0.05 && peak <= 1.0, "peak {peak}");
     }
 }
+
+#[test]
+fn am_demod_job_streams_48k_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = zeta_dsp::fixtures::tone(48_000, 48_000, 1_000.0, 0.5);
+    let iq = zeta_dsp::fixtures::am_modulate(&audio, 48_000, 48_000, 0.5, 0.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "am", &iq, 48_000, 121_500_000);
+    let src = format!("am={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "am_demod",
+            "--source",
+            "am",
+            "--center-hz",
+            "121500000",
+            "--bandwidth-hz",
+            "10000",
+            "--then-tail",
+            "3,8000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v[0]["result"], "job", "{v}");
+    assert_eq!(v[1]["result"], "frames", "{v}");
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 3, "{v}");
+    for f in frames {
+        assert_eq!(f["kind"], "audio", "{f}");
+        assert_eq!(f["payload"]["sample_rate_hz"], 48_000, "{f}");
+        let peak = f["payload"]["peak"].as_f64().unwrap();
+        assert!(peak > 0.01 && peak <= 1.0, "peak {peak}");
+    }
+}

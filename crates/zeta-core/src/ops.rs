@@ -158,6 +158,7 @@ pub enum JobKind {
     Spectrum,
     FmDemod,
     WfmDemod,
+    AmDemod,
     AprsDecode,
     Measure,
 }
@@ -170,6 +171,7 @@ impl JobKind {
             JobKind::Spectrum => "spectrum",
             JobKind::FmDemod => "fm_demod",
             JobKind::WfmDemod => "wfm_demod",
+            JobKind::AmDemod => "am_demod",
             JobKind::AprsDecode => "aprs_decode",
             JobKind::Measure => "measure",
         }
@@ -179,7 +181,11 @@ impl JobKind {
     fn channelised(&self) -> bool {
         matches!(
             self,
-            JobKind::FmDemod | JobKind::WfmDemod | JobKind::AprsDecode | JobKind::Measure
+            JobKind::FmDemod
+                | JobKind::WfmDemod
+                | JobKind::AmDemod
+                | JobKind::AprsDecode
+                | JobKind::Measure
         )
     }
 
@@ -305,6 +311,33 @@ impl JobKind {
                                 "audio_rate_hz": AUDIO_RATE_HZ,
                                 "deemphasis_us": WFM_DEEMPHASIS_US,
                             }),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: demod,
+                        kind: StreamKind::Iq,
+                    }],
+                }
+            }
+            JobKind::AmDemod => {
+                let (channel, demod) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": out,
+                            }),
+                        },
+                        GraphNode {
+                            id: demod.clone(),
+                            kind: "am_demod".into(),
+                            params: serde_json::json!({"audio_rate_hz": AUDIO_RATE_HZ}),
                         },
                     ],
                     edges: vec![Edge {

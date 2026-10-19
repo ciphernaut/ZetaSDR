@@ -53,7 +53,7 @@ fn wfm_fixture_without_pilot_is_wfm_0_6() {
 
 #[test]
 fn wfm_fixture_quiet_audio_is_wfm() {
-    // 37.5 kHz deviation: about 80 kHz occupied, under a 100 kHz floor.
+    // 37.5 kHz deviation: about 80 kHz occupied, over the 60 kHz floor.
     let l = label("wfm quiet", &wfm_fixture(0.5, true), WFM_RATE);
     assert_eq!(l.name, "wfm", "{l:?}");
     assert!(l.evidence.contains("19 kHz pilot"), "{}", l.evidence);

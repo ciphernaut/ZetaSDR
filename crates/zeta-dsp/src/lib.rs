@@ -11,6 +11,7 @@ use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{Span, Timestamp};
 
 pub mod afsk;
+pub mod am;
 pub mod aprs;
 pub mod ax25;
 pub mod channel;
@@ -39,6 +40,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     }
     reg.register(Arc::new(nbfm::NbfmDemodStage::new()));
     reg.register(Arc::new(wfm::WfmDemodStage::new()));
+    reg.register(Arc::new(am::AmDemodStage::new()));
     reg.register(Arc::new(aprs::AprsDecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
 }
