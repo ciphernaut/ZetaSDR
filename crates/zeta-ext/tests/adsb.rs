@@ -294,3 +294,17 @@ async fn real_dump1090_decodes_identification() {
     assert_eq!(v["msg"], 1);
     assert!(matches!(res, Err(StageError::Cancelled)), "{res:?}");
 }
+
+/// The fake exits 0 the moment stdin reaches EOF, racing the stage's view of
+/// its own writer finishing: a clean input close is always `Ok(())`.
+#[tokio::test]
+async fn input_close_then_clean_exit_is_ok() {
+    for i in 0..20 {
+        let stage = AdsbDecodeStage::new(Some(fake())).with_env([("FAKE_SBS_LINE", FAKE_IDENT)]);
+        let r = start(stage);
+        r.tx.send(iq_frame(&noise(4_800), 2_400_000)).unwrap();
+        drop(r.tx);
+        let res = result_within(r.handle, 10).await;
+        assert!(matches!(res, Ok(())), "iteration {i}: {res:?}");
+    }
+}

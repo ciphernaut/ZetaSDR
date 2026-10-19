@@ -28,6 +28,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -234,7 +235,15 @@ impl Stage for AdsbDecodeStage {
         };
 
         let last_prov = Arc::new(Mutex::new(None));
-        let mut writer = AbortOnDrop(tokio::spawn(feed(rx, stdin, last_prov.clone())));
+        // Set by `feed` before it drops stdin, so a child exiting on that EOF
+        // is seen as a clean end even before the writer task's result is.
+        let input_done = Arc::new(AtomicBool::new(false));
+        let mut writer = AbortOnDrop(tokio::spawn(feed(
+            rx,
+            stdin,
+            last_prov.clone(),
+            input_done.clone(),
+        )));
         let publish = |line: &[u8]| {
             let Some(v) = crate::sbs::parse_line(&String::from_utf8_lossy(line)) else {
                 return;
@@ -272,16 +281,6 @@ impl Stage for AdsbDecodeStage {
                         sbs_open = false;
                     }
                 },
-                status = child.wait() => {
-                    if sbs_open {
-                        drain(&mut sbs, &mut line, &publish).await;
-                    }
-                    break match status {
-                        Ok(s) if input_closed && s.success() => Ok(()),
-                        Ok(s) => Err(fail(format!("{name} exited with {}", status_text(s)))),
-                        Err(e) => Err(fail(format!("waiting for {name}: {e}"))),
-                    };
-                }
                 end = &mut writer.0, if feeding => {
                     feeding = false;
                     match end {
@@ -294,6 +293,17 @@ impl Stage for AdsbDecodeStage {
                         Ok(FeedEnd::Failed(m)) => break Err(fail(m)),
                         Err(e) => break Err(fail(format!("input task: {e}"))),
                     }
+                }
+                status = child.wait() => {
+                    if sbs_open {
+                        drain(&mut sbs, &mut line, &publish).await;
+                    }
+                    let input_closed = input_closed || input_done.load(Ordering::SeqCst);
+                    break match status {
+                        Ok(s) if input_closed && s.success() => Ok(()),
+                        Ok(s) => Err(fail(format!("{name} exited with {}", status_text(s)))),
+                        Err(e) => Err(fail(format!("waiting for {name}: {e}"))),
+                    };
                 }
                 _ = sleep_until(exit_deadline), if exit_deadline.is_some() => {
                     eprintln!("[adsb_decode] {name} still running {} s after its input closed; killing it", EXIT_GRACE.as_secs());
@@ -523,11 +533,13 @@ impl Converter {
 
 /// The input side: convert each frame and write it to the child's stdin,
 /// recording the frame's provenance for the events. Lagged input is skipped;
-/// a rate change starts fresh resamplers.
+/// a rate change starts fresh resamplers. When the input closes, `input_done`
+/// is set before stdin is dropped.
 async fn feed(
     mut rx: broadcast::Receiver<Frame>,
     mut stdin: ChildStdin,
     last_prov: Arc<Mutex<Option<Provenance>>>,
+    input_done: Arc<AtomicBool>,
 ) -> FeedEnd {
     let mut conv: Option<Converter> = None;
     loop {
@@ -537,7 +549,11 @@ async fn feed(
                 eprintln!("[adsb_decode] input lagged, {n} frames skipped");
                 continue;
             }
-            Err(broadcast::error::RecvError::Closed) => return FeedEnd::InputClosed,
+            Err(broadcast::error::RecvError::Closed) => {
+                // Before returning drops stdin (the child's EOF).
+                input_done.store(true, Ordering::SeqCst);
+                return FeedEnd::InputClosed;
+            }
         };
         let Payload::Iq(block) = &frame.payload else {
             return FeedEnd::Failed("expects iq frames".into());
