@@ -113,12 +113,19 @@ impl Inner {
                 self.bus.clone(),
                 prov,
                 sid,
-                port,
+                port.clone(),
                 rx,
                 token.clone(),
             ));
         }
-        let h = tokio::spawn(supervise(self.clone(), id.clone(), set, token, streams));
+        let h = tokio::spawn(supervise(
+            self.clone(),
+            id.clone(),
+            port,
+            set,
+            token,
+            streams,
+        ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
             e.done = Some(h);
         }
@@ -147,10 +154,12 @@ impl Inner {
 
 /// Await a job's stages. The first to end for any reason other than
 /// cancellation stops the rest; `Failed` wins over a clean end. Then release
-/// the lease and unregister the job's streams.
+/// the lease, tell the port it is idle if that was its last holder, and
+/// unregister the job's streams.
 async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
+    port: Arc<dyn Port>,
     mut set: JoinSet<Result<(), StageError>>,
     token: CancellationToken,
     streams: Vec<StreamId>,
@@ -179,6 +188,7 @@ async fn supervise(
     }
     // The only place a started job's lease is released.
     inner.leases.release(&id);
+    inner.leases.idle_if_unheld(port.as_ref()).await;
     for s in &streams {
         inner.bus.unregister(s);
     }

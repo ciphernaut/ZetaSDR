@@ -736,8 +736,8 @@ fn federated_job(dir: &Path, url: &str, remote: &str, job: &[&str]) -> Value {
     json(&out.stdout)
 }
 
-/// Poll node A's `job list` for up to 3 s until every `passthrough` job on `remote` (one
-/// per tune of the node port; a local job start tunes twice) is stopped.
+/// Poll node A's `job list` for up to 3 s until the one `passthrough` job on `remote` is
+/// stopped (a local job start tunes twice with the same band; the second reuses the job).
 fn assert_remote_passthrough_stopped(url: &str, remote: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
@@ -754,7 +754,7 @@ fn assert_remote_passthrough_stopped(url: &str, remote: &str) {
             .iter()
             .filter(|j| j["kind"] == "passthrough" && j["source"] == remote)
             .collect();
-        assert!(!jobs.is_empty(), "no passthrough job on {remote}: {v}");
+        assert_eq!(jobs.len(), 1, "one passthrough job on {remote}: {v}");
         if jobs.iter().all(|j| j["state"]["status"] == "stopped") {
             return;
         }

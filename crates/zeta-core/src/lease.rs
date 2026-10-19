@@ -99,6 +99,26 @@ impl LeaseManager {
         Self::default()
     }
 
+    /// The per-source gate shared by `ensure`, `tune_if_unheld` and `idle_if_unheld`.
+    fn gate(&self, source: &SourceId) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.gates
+            .lock()
+            .unwrap()
+            .entry(source.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Call [`Port::idle`] under the source's gate when nobody holds `port`
+    /// (after a `release`). A lease taken meanwhile wins: no idle then.
+    pub async fn idle_if_unheld(&self, port: &dyn Port) {
+        let gate = self.gate(port.id());
+        let _guard = gate.lock().await;
+        if self.holders(port.id()).is_empty() {
+            port.idle().await;
+        }
+    }
+
     /// Grant `holder` the band `want` on `port`, tuning only if the port is unheld.
     pub async fn ensure(
         &self,
@@ -107,13 +127,7 @@ impl LeaseManager {
         want: Tuning,
     ) -> Result<Tuning, LeaseError> {
         let source = port.id().clone();
-        let gate = self
-            .gates
-            .lock()
-            .unwrap()
-            .entry(source.clone())
-            .or_default()
-            .clone();
+        let gate = self.gate(&source);
         let _guard = gate.lock().await;
         {
             let mut leases = self.leases.lock().unwrap();
@@ -155,13 +169,7 @@ impl LeaseManager {
         want: Tuning,
     ) -> Result<Tuning, LeaseError> {
         let source = port.id().clone();
-        let gate = self
-            .gates
-            .lock()
-            .unwrap()
-            .entry(source.clone())
-            .or_default()
-            .clone();
+        let gate = self.gate(&source);
         let _guard = gate.lock().await;
         let held = self.holders(&source);
         let Some((_, first)) = held.first() else {

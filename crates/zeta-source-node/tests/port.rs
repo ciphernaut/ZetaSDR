@@ -1,11 +1,15 @@
 //! `NodePort` against a loopback node serving the looping `tone` source.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::{Instant, timeout};
+use zeta_core::graph::{Graph, GraphId, Node as GraphNode, NodeId};
 use zeta_core::job::{JobRecord, JobState};
+use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::port::{Port, PortError, Tuning};
+use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{Hz, SampleFormat, SourceId};
 use zeta_source_node::{NodePort, NodeSourceConfig, open};
 use zeta_ws::testing::{TestServer, spawn};
@@ -170,7 +174,13 @@ async fn retune_stops_previous_remote_job() {
     let port = open_tone(&srv).await;
     port.tune(tone_band()).await.expect("first tune");
     let first = remote_jobs(&srv).await[0].id.clone();
-    port.tune(tone_band()).await.expect("second tune");
+    // A different request (an identical one is a no-op, see below).
+    port.tune(Tuning {
+        bandwidth_hz: Hz(24_000),
+        ..tone_band()
+    })
+    .await
+    .expect("second tune");
     let jobs = remote_jobs(&srv).await;
     assert_eq!(jobs.len(), 2, "{jobs:?}");
     let state =
@@ -342,5 +352,117 @@ async fn remote_rate_over_cap_is_rejected_and_job_stopped() {
     assert_eq!(jobs[0].kind, "passthrough");
     assert_eq!(jobs[0].state, JobState::Stopped);
     drop(port);
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn identical_tune_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn(dir.path()).await;
+    let port = open_tone(&srv).await;
+    let a = port.tune(tone_band()).await.expect("first tune");
+    let b = port.tune(tone_band()).await.expect("second tune");
+    assert_eq!(a, b);
+    let jobs = remote_jobs(&srv).await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0].state, JobState::Running);
+    drop(port);
+    srv.stop().await;
+}
+
+/// A local node whose only source is `port`, with the passthrough stage.
+async fn local_node(dir: &std::path::Path, port: Arc<dyn Port>) -> Node {
+    let mut registry = StageRegistry::new();
+    registry.register(Arc::new(PassthroughStage::new()));
+    let cfg = NodeConfig {
+        state_dir: dir.join("local"),
+        ring_seconds: 1.0,
+        backends: vec![Backend::Cpu],
+        resume: false,
+    };
+    Node::open(cfg, registry, vec![port]).await.expect("node")
+}
+
+fn passthrough_graph() -> Graph {
+    Graph {
+        id: GraphId::new(),
+        nodes: vec![GraphNode {
+            id: NodeId("p".into()),
+            kind: "passthrough".into(),
+            params: serde_json::json!({"kind": "iq"}),
+        }],
+        edges: vec![],
+    }
+}
+
+fn running_passthroughs(jobs: &[JobRecord]) -> usize {
+    jobs.iter()
+        .filter(|j| j.kind == "passthrough" && j.state == JobState::Running)
+        .count()
+}
+
+#[tokio::test]
+async fn job_stop_releases_remote_lease_after_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn(dir.path()).await;
+    let port = Arc::new(open_tone(&srv).await);
+    let node = local_node(dir.path(), port.clone()).await;
+    let far = SourceId("far".to_string());
+    let job = node
+        .job_start("monitor", far.clone(), tone_band(), passthrough_graph())
+        .await
+        .expect("job starts");
+    assert_eq!(running_passthroughs(&remote_jobs(&srv).await), 1);
+    node.job_stop(&job).await.expect("job stops");
+    // Inside the grace the remote job still runs; after it, it is released.
+    assert!(port.current().is_some(), "released before the grace");
+    wait_jobs(&srv, Duration::from_secs(4), |jobs| {
+        running_passthroughs(jobs) == 0
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while port.current().is_some() {
+        assert!(Instant::now() < deadline, "current not cleared");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A new job tunes from scratch and streams again.
+    let mut rx = port.subscribe();
+    node.job_start("monitor", far, tone_band(), passthrough_graph())
+        .await
+        .expect("second job starts");
+    assert_eq!(running_passthroughs(&remote_jobs(&srv).await), 1);
+    timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a block within 5 s")
+        .expect("receives");
+    assert!(port.current().is_some());
+    drop(rx);
+    drop(node);
+    port.close().await;
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn restart_within_grace_keeps_the_remote_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn(dir.path()).await;
+    let port = Arc::new(open_tone(&srv).await);
+    let node = local_node(dir.path(), port.clone()).await;
+    let far = SourceId("far".to_string());
+    let job = node
+        .job_start("monitor", far.clone(), tone_band(), passthrough_graph())
+        .await
+        .expect("job starts");
+    node.job_stop(&job).await.expect("job stops");
+    node.job_start("monitor", far, tone_band(), passthrough_graph())
+        .await
+        .expect("restarts within the grace");
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let jobs = remote_jobs(&srv).await;
+    assert_eq!(jobs.len(), 1, "one remote job across the restart: {jobs:?}");
+    assert_eq!(running_passthroughs(&jobs), 1);
+    assert!(port.current().is_some());
+    drop(node);
+    port.close().await;
     srv.stop().await;
 }

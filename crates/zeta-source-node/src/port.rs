@@ -2,6 +2,7 @@
 //! `passthrough` job running there.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +23,9 @@ pub const NODE_DEFAULT_MAX_BANDWIDTH_HZ: u64 = 250_000;
 pub const TUNE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long stopping the remote job may take before it is given up (and logged).
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the port keeps the remote job after its last local holder left, so a
+/// job restarted at once (a graph change, a re-plan) keeps the same remote stream.
+pub const IDLE_GRACE: Duration = Duration::from_secs(2);
 /// Blocks buffered per receiver.
 const BROADCAST_CAPACITY: usize = 64;
 
@@ -60,32 +64,45 @@ struct Shared {
     current: Mutex<Option<Tuning>>,
 }
 
-/// The remote job feeding the port and the task forwarding its stream.
+/// The remote job feeding the port, the task forwarding its stream and the
+/// request it was started for.
 struct Live {
     job: JobId,
     pump: JoinHandle<()>,
+    req: Tuning,
 }
 
 /// A source on another ZetaSDR node as a push [`Port`].
 ///
 /// Each `tune` starts a `passthrough` job on the remote source (stopping the
-/// previous one first) and subscribes to its IQ stream in binary mode. The
-/// broadcast lives as long as the port, so receivers taken before a retune or
-/// a fault keep receiving afterwards. The pump exits when the remote stream
-/// ends (reported through [`Port::fault`]), on the next `tune` or when the
-/// port is dropped, which also stop the remote job. It keeps pumping with no
-/// receivers, so a later subscriber still gets blocks.
+/// previous one first) and subscribes to its IQ stream in binary mode; a tune
+/// identical to the last one while the stream is live and unfaulted is a no-op.
+/// The broadcast lives as long as the port, so receivers taken before a retune
+/// or a fault keep receiving afterwards. The pump exits when the remote stream
+/// ends (reported through [`Port::fault`]), on the next `tune`, on
+/// [`NodePort::close`], [`IDLE_GRACE`] after [`Port::idle`] (the last local
+/// holder left) or when the port is dropped; all but the first also stop the
+/// remote job. It keeps pumping with no receivers, so a later subscriber still
+/// gets blocks.
 pub struct NodePort {
     id: SourceId,
     caps: Capabilities,
+    remote: Arc<Remote>,
+}
+
+/// The connection to the remote node, shared with the idle timer.
+struct Remote {
     url: String,
     remote_source: SourceId,
     client: NodeClient,
     tx: broadcast::Sender<IqBlock>,
     shared: Arc<Shared>,
     live: Mutex<Option<Live>>,
-    /// Serialises `tune`, which waits on the network.
+    /// Serialises `tune`, `close` and the idle release, which wait on the network.
     gate: tokio::sync::Mutex<()>,
+    /// Bumped by every `tune`, `idle`, `close` and drop; a pending idle release
+    /// whose generation is no longer current does nothing.
+    generation: AtomicU64,
 }
 
 /// Open `cfg.remote_source` on the node at `cfg.url`; see [`NodePort::open`].
@@ -125,33 +142,45 @@ impl NodePort {
         Ok(NodePort {
             id: cfg.id,
             caps,
-            url,
-            remote_source: cfg.remote_source,
-            client,
-            tx: broadcast::channel(BROADCAST_CAPACITY).0,
-            shared: Arc::new(Shared::default()),
-            live: Mutex::new(None),
-            gate: tokio::sync::Mutex::new(()),
+            remote: Arc::new(Remote {
+                url,
+                remote_source: cfg.remote_source,
+                client,
+                tx: broadcast::channel(BROADCAST_CAPACITY).0,
+                shared: Arc::new(Shared::default()),
+                live: Mutex::new(None),
+                gate: tokio::sync::Mutex::new(()),
+                generation: AtomicU64::new(0),
+            }),
         })
     }
 
-    fn io(&self, reason: &str) -> PortError {
-        PortError::Io(format!("remote node {}: {reason}", self.url))
-    }
-
-    /// Stop the pump, then the remote job; a failed `job_stop` is logged.
     /// Stop the remote job now and wait for the remote node to confirm, instead of the
     /// best-effort stop that `Drop` spawns (which a runtime shutting down never runs).
     /// The port stays usable: the next `tune` starts a new remote job.
     pub async fn close(&self) {
-        let _gate = self.gate.lock().await;
+        let r = &self.remote;
+        r.generation.fetch_add(1, Ordering::SeqCst);
+        let _gate = r.gate.lock().await;
+        r.release().await;
+    }
+}
+
+impl Remote {
+    fn io(&self, reason: &str) -> PortError {
+        PortError::Io(format!("remote node {}: {reason}", self.url))
+    }
+
+    /// Stop the pump and the remote job and forget the band. Call with the gate held.
+    async fn release(&self) {
         self.stop_live().await;
         *self.shared.current.lock().unwrap() = None;
     }
 
+    /// Stop the pump, then the remote job; a failed `job_stop` is logged.
     async fn stop_live(&self) {
         let live = self.live.lock().unwrap().take();
-        let Some(Live { job, pump }) = live else {
+        let Some(Live { job, pump, .. }) = live else {
             return;
         };
         pump.abort();
@@ -175,7 +204,7 @@ impl NodePort {
         };
         match self.follow(&job).await {
             Ok((band, pump)) => {
-                *self.live.lock().unwrap() = Some(Live { job, pump });
+                *self.live.lock().unwrap() = Some(Live { job, pump, req: t });
                 Ok(band)
             }
             Err(e) => {
@@ -238,13 +267,15 @@ impl NodePort {
 
 impl Drop for NodePort {
     fn drop(&mut self) {
-        let Some(Live { job, pump }) = self.live.get_mut().unwrap().take() else {
+        let r = &self.remote;
+        r.generation.fetch_add(1, Ordering::SeqCst);
+        let Some(Live { job, pump, .. }) = r.live.lock().unwrap().take() else {
             return;
         };
         pump.abort();
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let client = self.client.clone();
-            let url = self.url.clone();
+            let client = r.client.clone();
+            let url = r.url.clone();
             rt.spawn(async move { stop_job(&client, &url, job).await });
         }
     }
@@ -277,14 +308,19 @@ impl Port for NodePort {
                 suggested: Some(cap),
             });
         }
-        let _gate = self.gate.lock().await;
-        self.stop_live().await;
-        *self.shared.current.lock().unwrap() = None;
-        let band = self.start(t).await?;
+        let r = &self.remote;
+        // Cancels a pending idle release, even when this tune turns out a no-op.
+        r.generation.fetch_add(1, Ordering::SeqCst);
+        let _gate = r.gate.lock().await;
+        if let Some(band) = r.unchanged(t) {
+            return Ok(band);
+        }
+        r.release().await;
+        let band = r.start(t).await?;
         // The remote picks its own rate (a HackRF never goes below 1 Msps); the cap
         // bounds what crosses the link, so a wider stream is stopped, not forwarded.
         if band.bandwidth_hz.0 > cap {
-            self.stop_live().await;
+            r.stop_live().await;
             return Err(PortError::OutOfRange {
                 field: "bandwidth_hz",
                 value: bw,
@@ -293,21 +329,53 @@ impl Port for NodePort {
                 suggested: Some(band.bandwidth_hz.0),
             });
         }
-        *self.shared.fault.lock().unwrap() = None;
-        *self.shared.current.lock().unwrap() = Some(band);
+        *r.shared.fault.lock().unwrap() = None;
+        *r.shared.current.lock().unwrap() = Some(band);
         Ok(band)
     }
 
     fn current(&self) -> Option<Tuning> {
-        *self.shared.current.lock().unwrap()
+        *self.remote.shared.current.lock().unwrap()
     }
 
     fn subscribe(&self) -> IqReceiver {
-        self.tx.subscribe()
+        self.remote.tx.subscribe()
     }
 
     fn fault(&self) -> Option<String> {
-        self.shared.fault.lock().unwrap().clone()
+        self.remote.shared.fault.lock().unwrap().clone()
+    }
+
+    /// The last local holder left: after [`IDLE_GRACE`], unless a `tune` came
+    /// meanwhile, stop the remote job (bounded by [`STOP_TIMEOUT`]), end the
+    /// pump and clear `current`. Returns at once; the release runs on a task.
+    async fn idle(&self) {
+        let r = self.remote.clone();
+        let generation = r.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::spawn(async move {
+            tokio::time::sleep(IDLE_GRACE).await;
+            if r.generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let _gate = r.gate.lock().await;
+            // A tune that took the gate first has bumped the generation.
+            if r.generation.load(Ordering::SeqCst) == generation {
+                r.release().await;
+            }
+        });
+    }
+}
+
+impl Remote {
+    /// The current band when `t` is the request the live, unfaulted stream was
+    /// started for: re-tuning to it would only restart the remote job.
+    fn unchanged(&self, t: Tuning) -> Option<Tuning> {
+        let live = self.live.lock().unwrap();
+        let live = live.as_ref()?;
+        if live.req != t || live.pump.is_finished() || self.shared.fault.lock().unwrap().is_some() {
+            return None;
+        }
+        *self.shared.current.lock().unwrap()
     }
 }
 

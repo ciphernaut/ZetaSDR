@@ -81,4 +81,8 @@ pub trait Port: Send + Sync {
     fn fault(&self) -> Option<String> {
         None
     }
+    /// Called under the lease gate when the source's last holder released; a
+    /// port may stop upstream work and clear `current`. The next `tune` must
+    /// work as from scratch. Must not block for long: the gate is held.
+    async fn idle(&self) {}
 }
