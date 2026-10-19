@@ -62,7 +62,7 @@ fails if the committed file has drifted.
 
 ## DSP
 
-Eight job kinds, chosen with `job start --kind` (`zeta job start --help` lists them):
+Twelve job kinds, chosen with `job start --kind` (`zeta job start --help` lists them):
 
 - `passthrough` copies the channel IQ through unchanged.
 - `spectrum` emits spectrum rows at 20 per second of signal time, each the power average of every FFT since the previous row (spectrum event v2): `size` (the smallest power of two at least `bandwidth_hz / 6000`, 1024 to 8192), `bin_hz`, `rows_per_s`, `center_hz`, and the row quantised as `q` (one 0-255 level per bin, lowest frequency first) with `floor_db` and `step_db` (0.5): `db = floor_db + q * step_db`. `floor_db` is the row's 2nd-percentile bin minus 5 dB, so levels more than 127.5 dB above it clip at 255.
@@ -71,6 +71,10 @@ Eight job kinds, chosen with `job start --kind` (`zeta job start --help` lists t
 - `am_demod` does the same for AM voice (envelope detector, 5 kHz audio at 48 kHz, slow AGC to a steady level; give it about 10 kHz of band).
 - `ssb_demod` does the same for SSB voice (`--sideband usb|lsb`, default `usb`; 2.8 kHz audio at 48 kHz, slow AGC). `--center-hz` is the suppressed-carrier (dial) frequency; give it about 6 kHz of band so both sides of the carrier are kept.
 - `aprs_decode` demodulates AFSK 1200 and HDLC-deframes AX.25, emitting one event per CRC-valid packet.
+- `pocsag_decode` decodes POCSAG pagers (512, 1200 and 2400 baud, detected automatically) from a 12.5 kHz FM channel: one event per message (`address`, `function`, `kind`, `text`).
+- `rds_decode` reads the RDS data of a broadcast FM station from its 200 kHz band: events carrying `pi`, `ps` and `rt` as they complete.
+- `adsb_decode` decodes Mode S / ADS-B at 1 090 MHz from a band of 2.4 MHz (under 2 MHz is refused): one event per message (`icao`, `callsign`, `altitude_ft`, `lat`, `lon`, `ground_speed_kt`, `track_deg`). It runs dump1090 on the node's host (crate `zeta-ext`: GPL, so an external process, never linked; `ZETA_DUMP1090` overrides the program path); the job fails naming dump1090 when the host has none.
+- `acars_decode` decodes ACARS (AM, 2400 baud MSK) from a 10 kHz channel: one event per CRC-clean block (`reg`, `flight`, `label`, `text`).
 - `measure` emits one layer-1 feature record per second of IQ (occupied band, SNR, burst, symbol rate, label).
 
 `--then-tail N,MS` on `job start` starts the job, tails up to N frames from its event (else audio)
@@ -114,6 +118,7 @@ catalogue label.
 ```bash
 cargo build -q -p zeta
 cargo run -q -p zeta-dsp --features test-fixtures --example gen_aprs -- scratch/fx
+cargo run -q -p zeta-dsp --features test-fixtures --example gen_pocsag -- scratch/fx
 cargo run -q -p zeta-source-file --features test-fixtures --example gen_tone -- scratch/fx
 Z=./target/debug/zeta
 S="--state-dir scratch/state"
@@ -121,6 +126,10 @@ S="--state-dir scratch/state"
 # APRS: one event, src VK3ABC (dst APRS, info ">hi", fcs_ok true)
 $Z $S --source-file aprs=scratch/fx/aprs.sigmf-meta job start --kind aprs_decode --source aprs \
     --center-hz 144800000 --bandwidth-hz 12500 --then-tail 1,5000
+
+# POCSAG: one event, address 1234567, function 3, kind alpha, text "HELLO ZETA", baud 1200
+$Z $S --source-file pocsag=scratch/fx/pocsag.sigmf-meta job start --kind pocsag_decode --source pocsag \
+    --center-hz 148637500 --bandwidth-hz 12500 --then-tail 1,5000
 
 # NBFM audio from the tone: "kind": "audio" frames, 4800 samples at 48000 Hz each. The first
 # frame's peak is a filter start-up transient (1.07); later frames are 0.40 (between 0.3 and 1.0).
