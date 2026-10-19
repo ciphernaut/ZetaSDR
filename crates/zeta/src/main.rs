@@ -61,11 +61,12 @@ async fn main() -> ExitCode {
         };
         return print(serde_json::to_string_pretty(&e), 2);
     }
-    let (serve_args, secret) = (
+    let (serve_args, speech_args, secret) = (
         match &cli.command {
             cli::Command::Serve(a) => a.clone(),
             _ => Default::default(),
         },
+        cli.speech.clone(),
         cli.secret.clone(),
     );
     let then_tail = cli.command.then_tail();
@@ -99,7 +100,16 @@ async fn main() -> ExitCode {
         eprintln!("zeta: warning: unreadable job record {name}");
     }
     let code = match op {
-        None => transport::serve(node, &serve_args, secret.as_deref(), state_dir).await,
+        None => {
+            transport::serve(
+                node,
+                &serve_args,
+                &speech_args,
+                secret.as_deref(),
+                state_dir,
+            )
+            .await
+        }
         Some(op) => one_shot(&node, op, then_tail, keep).await,
     };
     // Remote nodes' `passthrough` jobs end with this process, not with the runtime.

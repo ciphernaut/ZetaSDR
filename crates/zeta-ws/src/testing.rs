@@ -1,7 +1,7 @@
 //! A test harness: a node on a temp dir with a looping `tone` source, served on loopback.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::task::JoinHandle;
@@ -13,6 +13,7 @@ use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::SourceId;
 use zeta_source_file::fixtures::write_tone;
 use zeta_source_file::{FileOpts, FileSource};
+use zeta_speech::SpeechBackend;
 
 use crate::auth::Secret;
 use crate::http::{Limits, ServerConfig, StatsHandle, bind};
@@ -25,8 +26,8 @@ pub struct TestOpts {
     pub agents_md: String,
     /// The model behind `POST /ask`; `None` (the default) answers 503.
     pub llm: Option<LlmConfig>,
-    /// The speech daemon's socket behind `POST /stt`; `None` (the default) answers 503.
-    pub stt_socket: Option<PathBuf>,
+    /// The speech backend behind `POST /stt`; `None` (the default) answers 503.
+    pub speech: Option<Arc<dyn SpeechBackend>>,
 }
 
 impl Default for TestOpts {
@@ -37,7 +38,7 @@ impl Default for TestOpts {
             addr: None,
             agents_md: "# test guide\n".to_string(),
             llm: None,
-            stt_socket: None,
+            speech: None,
         }
     }
 }
@@ -104,8 +105,7 @@ pub async fn spawn_with(dir: &Path, opts: TestOpts) -> TestServer {
             agents_md: opts.agents_md,
             limits: opts.limits,
             llm: opts.llm,
-            state_dir: dir.join("state"),
-            stt_socket: opts.stt_socket,
+            speech: opts.speech,
         },
     )
     .await

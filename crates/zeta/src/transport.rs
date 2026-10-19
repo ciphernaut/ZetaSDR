@@ -10,12 +10,17 @@ use zeta_ws::addr::parse_listen;
 use zeta_ws::auth::Secret;
 use zeta_ws::{Limits, ServerConfig, bind};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::cli::{Cli, Command, ServeArgs};
+use zeta_speech::{NodeBackend, SocketBackend, SpeechBackend};
+
+use crate::cli::{Cli, Command, ServeArgs, SpeechArgs};
 use crate::{agents_md, ask, node_setup};
 
 const MIN_SECRET_LEN: usize = 12;
+
+/// Where `--stt-node`'s secret comes from; never a flag, so it stays out of `ps`.
+const STT_NODE_SECRET_ENV: &str = "ZETA_STT_NODE_SECRET";
 
 /// Handle the commands that involve a network transport, returning the exit code;
 /// give `cli` back untouched for everything else.
@@ -112,6 +117,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
 pub async fn serve(
     node: Node,
     args: &ServeArgs,
+    speech_args: &SpeechArgs,
     secret: Option<&str>,
     state_dir: PathBuf,
 ) -> ExitCode {
@@ -139,15 +145,18 @@ pub async fn serve(
         Ok(s) => s,
         Err(e) => return usage(&e),
     };
-    let stt_socket = args.stt_socket.clone().or_else(default_stt_socket);
+    let speech = match speech_backend(speech_args, &state_dir).await {
+        Ok(s) => s,
+        Err(e) => return usage(&e),
+    };
+    let speech_name = speech.as_ref().map(|s| s.name().to_string());
     let cfg = ServerConfig {
         listen,
         secret,
         agents_md: agents_md::rendering(),
         limits: Limits::default(),
         llm,
-        state_dir,
-        stt_socket: stt_socket.clone(),
+        speech,
     };
     let server = match bind(Arc::new(node), cfg).await {
         Ok(s) => s,
@@ -157,8 +166,8 @@ pub async fn serve(
     if let Some(model) = &ask_model {
         eprintln!("zeta: POST /ask runs model {model}");
     }
-    if let Some(path) = &stt_socket {
-        eprintln!("zeta: speech daemon: {}", path.display());
+    if let Some(name) = &speech_name {
+        eprintln!("zeta: speech backend: {name}");
     }
     if secret_text.chars().count() < MIN_SECRET_LEN {
         eprintln!("zeta: warning: secret shorter than {MIN_SECRET_LEN} characters");
@@ -174,6 +183,36 @@ pub async fn serve(
     match server.run(stop).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => usage(&e.to_string()),
+    }
+}
+
+/// The speech backend the flags name: the node at `--stt-node` (its secret from
+/// `ZETA_STT_NODE_SECRET`), else the daemon at `--stt-socket` or the default socket, staging
+/// its WAVs in `<state_dir>/stt`; `None` when neither is given and no default socket exists.
+pub async fn speech_backend(
+    args: &SpeechArgs,
+    state_dir: &Path,
+) -> Result<Option<Arc<dyn SpeechBackend>>, String> {
+    match (&args.stt_socket, &args.stt_node) {
+        (Some(_), Some(_)) => Err("--stt-socket and --stt-node are exclusive".to_string()),
+        (None, Some(url)) => {
+            let secret = std::env::var(STT_NODE_SECRET_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("--stt-node requires {STT_NODE_SECRET_ENV}"))?;
+            let backend = NodeBackend::new(url, &secret)
+                .await
+                .map_err(|e| format!("--stt-node: {e}"))?;
+            Ok(Some(Arc::new(backend)))
+        }
+        (socket, None) => {
+            let Some(path) = socket.clone().or_else(default_stt_socket) else {
+                return Ok(None);
+            };
+            let timeout = Limits::default().stt_timeout;
+            let backend = SocketBackend::new(path, state_dir.join("stt"), timeout).await;
+            Ok(Some(Arc::new(backend)))
+        }
     }
 }
 

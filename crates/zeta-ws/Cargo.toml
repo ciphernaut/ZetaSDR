@@ -16,10 +16,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.3", features = ["fs", "net", "io-util", "rt-multi-thread", "macros", "time", "sync"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
-ulid = "3.0.0"
 zeta-agent = { path = "../zeta-agent" }
 zeta-client = { path = "../zeta-client" }
 zeta-core = { path = "../zeta-core" }
+zeta-speech = { path = "../zeta-speech" }
 zeta-source-file = { path = "../zeta-source-file", optional = true }
 zeta-ui = { path = "../zeta-ui" }
 zeta-vrt = { path = "../zeta-vrt" }
@@ -30,4 +30,5 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"
 zeta-agent = { path = "../zeta-agent", features = ["test-fake"] }
+zeta-speech = { path = "../zeta-speech", features = ["test-fake"] }
 zeta-ws = { path = ".", features = ["test-server"] }

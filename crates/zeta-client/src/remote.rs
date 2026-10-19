@@ -11,6 +11,9 @@ use zeta_core::types::StreamId;
 /// Longer than the server's 30 s operation timeout.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Marks a `POST /stt` one node already forwarded; its value is `1`.
+pub const STT_HOP_HEADER: &str = "x-zeta-stt-hop";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("node {url} unreachable: {detail}")]
@@ -135,6 +138,43 @@ impl NodeClient {
 
     pub async fn health(&self) -> Result<Value, ClientError> {
         self.get_json("/health").await
+    }
+
+    /// Transcribe a 16 kHz mono WAV with the node's speech backend (`POST /stt?lang=`).
+    /// `hop` marks the request as already forwarded once ([`STT_HOP_HEADER`]), so a node
+    /// that would forward it again refuses it instead.
+    pub async fn stt(
+        &self,
+        wav: Vec<u8>,
+        language: &str,
+        hop: bool,
+    ) -> Result<String, ClientError> {
+        let mut url = Url::parse(&self.endpoint("/stt"))
+            .map_err(|_| ClientError::BadUrl(self.url.clone()))?;
+        url.query_pairs_mut().append_pair("lang", language);
+        let mut req = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "audio/wav")
+            .body(wav);
+        if hop {
+            req = req.header(STT_HOP_HEADER, "1");
+        }
+        let (status, body) = self.send(req).await?;
+        self.require_ok(status, &body)?;
+        let v: Value =
+            serde_json::from_slice(&body).map_err(|e| ClientError::Decode(e.to_string()))?;
+        v.get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| ClientError::Decode("stt answer has no \"text\"".to_string()))
+    }
+
+    /// The languages the node's speech backend accepts (`GET /stt/languages`).
+    pub async fn stt_languages(&self) -> Result<Vec<String>, ClientError> {
+        let v = self.get_json("/stt/languages").await?;
+        serde_json::from_value(v.get("languages").cloned().unwrap_or(Value::Null))
+            .map_err(|e| ClientError::Decode(e.to_string()))
     }
 
     fn endpoint(&self, path: &str) -> String {

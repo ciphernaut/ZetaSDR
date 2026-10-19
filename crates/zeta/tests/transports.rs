@@ -233,6 +233,37 @@ async fn serve_serves_committed_agents_md() {
 }
 
 #[test]
+fn stt_socket_and_stt_node_are_exclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    plain()
+        .env_remove("ZETA_STT_SOCKET")
+        .env("ZETA_STT_NODE_SECRET", SECRET)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["serve", "--listen", "127.0.0.1:0", "--secret", SECRET])
+        .args(["--stt-socket", "/nonexistent/voiced.sock"])
+        .args(["--stt-node", "http://127.0.0.1:9"])
+        .assert()
+        .code(1)
+        .stderr(contains("--stt-socket and --stt-node are exclusive"));
+}
+
+#[test]
+fn stt_node_requires_its_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    plain()
+        .env_remove("ZETA_STT_SOCKET")
+        .env_remove("ZETA_STT_NODE_SECRET")
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["serve", "--listen", "127.0.0.1:0", "--secret", SECRET])
+        .args(["--stt-node", "http://127.0.0.1:9"])
+        .assert()
+        .code(1)
+        .stderr(contains("ZETA_STT_NODE_SECRET"));
+}
+
+#[test]
 fn then_tail_with_node_is_usage_error() {
     // Rejected before any request, so no node needs to be listening.
     plain()

@@ -12,6 +12,7 @@ tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "signal",
 zeta-core = { path = "../zeta-core" }
 zeta-client = { path = "../zeta-client" }
 zeta-ws = { path = "../zeta-ws" }
+zeta-speech = { path = "../zeta-speech" }
 tokio-util = "0.7.20"
 zeta-dsp = { path = "../zeta-dsp" }
 zeta-source-file = { version = "0.1.0", path = "../zeta-source-file" }

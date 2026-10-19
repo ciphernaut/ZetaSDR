@@ -3689,6 +3689,7 @@ dependencies = [
  "zeta-source-node",
  "zeta-source-soapy-driver",
  "zeta-source-vrt",
+ "zeta-speech",
  "zeta-vrt",
  "zeta-ws",
 ]
@@ -3895,6 +3896,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeta-speech"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "ulid",
+ "zeta-client",
+ "zeta-speech",
+ "zeta-ws",
+]
+
+[[package]]
 name = "zeta-ui"
 version = "0.1.0"
 
@@ -3923,11 +3939,11 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
- "ulid",
  "zeta-agent",
  "zeta-client",
  "zeta-core",
  "zeta-source-file",
+ "zeta-speech",
  "zeta-ui",
  "zeta-vrt",
  "zeta-ws",

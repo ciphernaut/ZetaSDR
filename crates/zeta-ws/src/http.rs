@@ -2,7 +2,6 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -27,6 +26,7 @@ use zeta_agent::LlmConfig;
 use zeta_client::parse_op;
 use zeta_core::node::Node;
 use zeta_core::ops::OpError;
+use zeta_speech::SpeechBackend;
 
 use crate::addr::is_lan;
 use crate::auth::{Secret, subprotocol_secret};
@@ -74,10 +74,8 @@ pub struct ServerConfig {
     pub limits: Limits,
     /// The model `POST /ask` runs; `None` answers 503.
     pub llm: Option<LlmConfig>,
-    /// The node's state directory; `POST /stt` stages its WAV files in `stt/` under it.
-    pub state_dir: PathBuf,
-    /// The `local-voice` daemon's Unix socket for `POST /stt`; `None` answers 503.
-    pub stt_socket: Option<PathBuf>,
+    /// The speech backend behind `POST /stt` and `GET /stt/languages`; `None` answers 503.
+    pub speech: Option<Arc<dyn SpeechBackend>>,
 }
 
 /// A snapshot of the server's counters.
@@ -152,8 +150,7 @@ pub(crate) struct AppState {
     pub(crate) llm: Option<LlmConfig>,
     /// Held for the length of one `POST /ask` run.
     pub(crate) ask_lock: tokio::sync::Mutex<()>,
-    pub(crate) state_dir: PathBuf,
-    pub(crate) stt_socket: Option<PathBuf>,
+    pub(crate) speech: Option<Arc<dyn SpeechBackend>>,
 }
 
 pub(crate) type Shared = Arc<AppState>;
@@ -321,6 +318,7 @@ fn router(state: Shared) -> Router {
         .route("/op", post(op))
         .route("/ask", post(ask::ask))
         .route("/stt", post(stt::stt))
+        .route("/stt/languages", get(stt::languages))
         .route("/schema", get(schema))
         .route("/streams", get(streams))
         .route("/agents-md", get(agents_md))
@@ -369,8 +367,7 @@ pub async fn bind(node: Arc<Node>, cfg: ServerConfig) -> io::Result<Server> {
         agents_md: cfg.agents_md,
         llm: cfg.llm,
         ask_lock: tokio::sync::Mutex::new(()),
-        state_dir: std::path::absolute(&cfg.state_dir)?,
-        stt_socket: cfg.stt_socket,
+        speech: cfg.speech,
     });
     Ok(Server {
         listener,

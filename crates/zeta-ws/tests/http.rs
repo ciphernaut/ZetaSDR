@@ -262,8 +262,7 @@ async fn bind_refuses_non_lan() {
         agents_md: String::new(),
         limits: Limits::default(),
         llm: None,
-        state_dir: dir.path().join("state"),
-        stt_socket: None,
+        speech: None,
     };
     let err = bind(Arc::clone(&ts.node), cfg).await.err().unwrap();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);

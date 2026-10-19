@@ -59,6 +59,8 @@ pub struct Cli {
     /// Register the program at absolute PATH as stage kind KIND (repeatable); probed at startup
     #[arg(long = "plugin", global = true, value_name = "KIND=PATH", value_parser = sources::parse_plugin)]
     pub plugins: Vec<PluginSpec>,
+    #[command(flatten)]
+    pub speech: SpeechArgs,
     /// Every source flag parsed, file then soapy then kiwi then node then vrt (filled by
     /// `try_parse_checked`).
     #[arg(skip)]
@@ -262,16 +264,27 @@ pub struct AskArgs {
     pub max_turns: u32,
 }
 
+/// The speech backend: a local daemon or another node.
+#[derive(Debug, Clone, Default, Args)]
+pub struct SpeechArgs {
+    /// Unix socket of the speech daemon (`local-voice`, or any daemon speaking its
+    /// `file:`/`languages` protocol) behind `POST /stt` [default:
+    /// $XDG_RUNTIME_DIR/voiced.sock when it exists]
+    #[arg(long, global = true, env = "ZETA_STT_SOCKET", value_name = "PATH")]
+    pub stt_socket: Option<PathBuf>,
+    /// Transcribe with the speech backend of the ZetaSDR node at URL (http://HOST:PORT)
+    /// instead of a local daemon. Its secret comes from ZETA_STT_NODE_SECRET and is never
+    /// printed. Excludes --stt-socket
+    #[arg(long, global = true, env = "ZETA_STT_NODE", value_name = "URL")]
+    pub stt_node: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Args)]
 pub struct ServeArgs {
     /// Also serve the HTTP/WebSocket API on this address (a LAN ip:port, or a bare port on
     /// 127.0.0.1); requires --secret or ZETA_SECRET
     #[arg(long, value_name = "[ADDR:]PORT")]
     pub listen: Option<String>,
-    /// Unix socket of the `local-voice` speech daemon behind `POST /stt` [default:
-    /// $XDG_RUNTIME_DIR/voiced.sock when it exists]
-    #[arg(long, env = "ZETA_STT_SOCKET", value_name = "PATH")]
-    pub stt_socket: Option<PathBuf>,
     #[command(flatten)]
     pub llm: LlmArgs,
 }
