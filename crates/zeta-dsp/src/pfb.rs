@@ -140,9 +140,20 @@ impl PfbBank {
     /// produced by this call: one per complete hop of `bins / 2` inputs, with
     /// a trailing partial hop kept for the next call.
     pub fn push(&mut self, iq: &[Complex<f32>]) -> Vec<Vec<Complex<f32>>> {
+        let all: Vec<usize> = (0..self.bins).collect();
+        self.push_bins(iq, &all)
+    }
+
+    /// As [`PfbBank::push`], but returns only the bins in `active` (natural
+    /// order indices, each `< bins`), one Vec per entry in `active`'s order.
+    /// Every bin is still filtered (the transform needs all branches); only
+    /// the gather is skipped for the others.
+    pub fn push_bins(&mut self, iq: &[Complex<f32>], active: &[usize]) -> Vec<Vec<Complex<f32>>> {
         let m = self.bins;
+        let mask = m - 1;
         let hop = m / 2;
         let len = self.taps_len();
+        let tw = 2 * m;
         self.buf.extend(iq.iter().flat_map(|c| [c.re, c.im]));
         let hops = (self.buf.len() / 2 + 1 - len) / hop;
         // Every hop's rotated branch outputs, one `m`-sample row per hop, then
@@ -157,6 +168,47 @@ impl PfbBank {
             // acc[r] sums reversed taps j = c*m + r. Tap index j in time order
             // is n = len - 1 - j samples back from the newest, i.e. polyphase
             // branch b = m - 1 - r.
+            mac(acc, &self.rev_taps, win, tw);
+            // Commutator rotation: the newest input index is t*hop + hop - 1;
+            // rotating the branches left by that index mod m gives each bin the
+            // absolute-time mixing phase, so odd bins are not frequency-flipped.
+            let shift = self.hop_parity * hop + hop - 1;
+            for (i, v) in row.iter_mut().enumerate() {
+                let r = mask - ((i + shift) & mask);
+                *v = Complex::new(acc[2 * r], acc[2 * r + 1]);
+            }
+            self.hop_parity ^= 1;
+        }
+        if hops > 0 {
+            self.fft
+                .process_with_scratch(&mut self.rows, &mut self.scratch);
+        }
+        self.buf.drain(..2 * hops * hop);
+        // fftshift: natural bin k is transform bin (k + m/2) mod m.
+        active
+            .iter()
+            .map(|&k| {
+                let col = (k + hop) & mask;
+                self.rows.iter().skip(col).step_by(m).copied().collect()
+            })
+            .collect()
+    }
+
+    /// The straightforward implementation [`PfbBank::push`] replaced, kept as
+    /// the reference its outputs are compared against.
+    #[cfg(test)]
+    fn push_reference(&mut self, iq: &[Complex<f32>]) -> Vec<Vec<Complex<f32>>> {
+        let m = self.bins;
+        let hop = m / 2;
+        let len = self.taps_len();
+        self.buf.extend(iq.iter().flat_map(|c| [c.re, c.im]));
+        let hops = (self.buf.len() / 2 + 1 - len) / hop;
+        self.rows.clear();
+        self.rows.resize(hops * m, Complex::default());
+        let acc = &mut self.acc;
+        for (h, row) in self.rows.chunks_exact_mut(m).enumerate() {
+            let start = h * hop + hop - 1;
+            let win = &self.buf[2 * start..2 * (start + len)];
             acc.fill(0.0);
             for (tc, xc) in self
                 .rev_taps
@@ -167,9 +219,6 @@ impl PfbBank {
                     *a += x * t;
                 }
             }
-            // Commutator rotation: the newest input index is t*hop + hop - 1;
-            // rotating the branches left by that index mod m gives each bin the
-            // absolute-time mixing phase, so odd bins are not frequency-flipped.
             let shift = (self.hop_parity * hop + hop - 1) % m;
             for (i, v) in row.iter_mut().enumerate() {
                 let r = m - 1 - (i + shift) % m;
@@ -182,12 +231,110 @@ impl PfbBank {
                 .process_with_scratch(&mut self.rows, &mut self.scratch);
         }
         self.buf.drain(..2 * hops * hop);
-        // fftshift: natural bin k is transform bin (k + m/2) mod m.
         (0..m)
             .map(|k| {
                 let col = (k + hop) % m;
                 self.rows.iter().skip(col).step_by(m).copied().collect()
             })
             .collect()
+    }
+}
+
+/// Floats summed per register block in [`mac`].
+const MAC_BLOCK: usize = 16;
+
+/// `acc[i] = sum over rows c of win[c*tw + i] * taps[c*tw + i]`, for `i < tw`.
+///
+/// Register-blocked: each 16-float slice of `acc` is summed across every tap
+/// row in a local array (registers) and stored once, instead of loading and
+/// storing the whole `acc` once per row. The per-element summation order is
+/// unchanged (row 0 first), so results are bit-identical to the plain loop.
+fn mac(acc: &mut [f32], taps: &[f32], win: &[f32], tw: usize) {
+    let full = tw - tw % MAC_BLOCK;
+    for ob in (0..full).step_by(MAC_BLOCK) {
+        let mut a = [0f32; MAC_BLOCK];
+        for (tc, xc) in taps.chunks_exact(tw).zip(win.chunks_exact(tw)) {
+            let t: &[f32; MAC_BLOCK] = tc[ob..ob + MAC_BLOCK].try_into().unwrap();
+            let x: &[f32; MAC_BLOCK] = xc[ob..ob + MAC_BLOCK].try_into().unwrap();
+            for i in 0..MAC_BLOCK {
+                a[i] += x[i] * t[i];
+            }
+        }
+        acc[ob..ob + MAC_BLOCK].copy_from_slice(&a);
+    }
+    // Fewer than 8 bins: a short tail the blocks do not cover.
+    if full < tw {
+        acc[full..tw].fill(0.0);
+        for (tc, xc) in taps.chunks_exact(tw).zip(win.chunks_exact(tw)) {
+            for ((a, &t), &x) in acc[full..tw].iter_mut().zip(&tc[full..]).zip(&xc[full..]) {
+                *a += x * t;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic broadband test signal: two tones plus LCG noise.
+    fn input(n: usize) -> Vec<Complex<f32>> {
+        let mut seed = 12345u32;
+        (0..n)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+                let p1 = 2.0 * PI * 0.0731 * i as f64;
+                let p2 = -2.0 * PI * 0.3117 * i as f64;
+                Complex::new(
+                    (p1.cos() + 0.3 * p2.cos()) as f32 + 0.1 * noise,
+                    (p1.sin() + 0.3 * p2.sin()) as f32 - 0.1 * noise,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn push_matches_the_reference_path() {
+        for bins in [2, 4, 8, 32, 256] {
+            let x = input(40 * bins * TAPS_PER_BIN + 17);
+            let mut new = PfbBank::new(24_000_000, bins);
+            let mut old = PfbBank::new(24_000_000, bins);
+            // Uneven blocks, so hops straddle pushes and parity alternates.
+            let mut got: Vec<Vec<Complex<f32>>> = vec![Vec::new(); bins];
+            let mut want: Vec<Vec<Complex<f32>>> = vec![Vec::new(); bins];
+            for c in x.chunks(3 * bins + 5) {
+                for (g, o) in got.iter_mut().zip(new.push(c)) {
+                    g.extend(o);
+                }
+                for (w, o) in want.iter_mut().zip(old.push_reference(c)) {
+                    w.extend(o);
+                }
+            }
+            assert!(!got[0].is_empty());
+            for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.len(), w.len(), "bins {bins} bin {k}");
+                for (a, b) in g.iter().zip(w) {
+                    assert!((a - b).norm() <= 1e-6, "bins {bins} bin {k}: {a} vs {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn push_bins_returns_only_the_active_bins_in_order() {
+        let bins = 32;
+        let x = input(20 * bins * TAPS_PER_BIN);
+        let mut all = PfbBank::new(24_000_000, bins);
+        let mut some = PfbBank::new(24_000_000, bins);
+        let active = [27, 3, 20];
+        for c in x.chunks(4096) {
+            let a = all.push(c);
+            let s = some.push_bins(c, &active);
+            assert_eq!(s.len(), active.len());
+            for (o, &k) in s.iter().zip(&active) {
+                assert_eq!(o, &a[k], "bin {k}");
+            }
+        }
     }
 }

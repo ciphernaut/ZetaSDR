@@ -188,7 +188,8 @@ fn process(sh: &Shared, run: &mut Running, block: &IqBlock) {
         run.active = true;
     }
     let (start, first_hop) = (run.inputs, run.hops);
-    let mut outs = run.pfb.push(&block.samples);
+    let ks: Vec<usize> = active.iter().map(|(k, _)| *k).collect();
+    let mut outs = run.pfb.push_bins(&block.samples, &ks);
     let n = outs[0].len();
     run.inputs += block.samples.len() as u64;
     run.hops += n as u64;
@@ -202,12 +203,12 @@ fn process(sh: &Shared, run: &mut Running, block: &IqBlock) {
     let newest = (first_hop * hop + hop - 1 - start) as u128;
     let delay_ns = ((run.pfb.taps_len() - 1) as u128 * 1_000_000_000 / (2 * rate)) as u64;
     let t0 = (block.t0.0 + (newest * 1_000_000_000 / rate) as u64).saturating_sub(delay_ns);
-    for (k, tx) in active {
+    for ((k, tx), out) in active.into_iter().zip(outs.iter_mut()) {
         let _ = tx.send(IqBlock {
             t0: Timestamp(t0),
             sample_rate_hz: Hz(sh.bin_rate_hz()),
             center_hz: Hz(sh.bin_center_hz(k)),
-            samples: std::mem::take(&mut outs[k]).into(),
+            samples: std::mem::take(out).into(),
         });
     }
 }

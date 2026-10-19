@@ -198,4 +198,16 @@ fn pfb_runs_faster_than_realtime_at_24msps() {
         el.as_secs_f64() < 4.0,
         "took {el:?} (portable floor; the 20 % budget is measured on the field host)"
     );
+    // The bank thread gathers only subscribed bins: four channels.
+    let mut bank = PfbBank::new(RATE, BINS);
+    let start = std::time::Instant::now();
+    for _ in 0..blocks {
+        n -= bank.push_bins(&block, &[3, 9, 20, 27])[0].len();
+    }
+    let el = start.elapsed();
+    eprintln!(
+        "  with 4 active bins: {el:?} ({:.3} of one core)",
+        el.as_secs_f64() / 2.0
+    );
+    assert_eq!(n, 0);
 }
