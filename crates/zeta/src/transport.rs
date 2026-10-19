@@ -82,12 +82,30 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
 }
 
-/// Run `serve`: wait for Ctrl-C, also serving the API when `--listen` is given.
+/// Resolve on Ctrl-C (SIGINT) or, on unix, SIGTERM (`systemctl stop`), so either one
+/// shuts `serve` down gracefully and the caller still closes remote nodes' jobs.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r,
+            _ = term.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+/// Run `serve`: wait for Ctrl-C or SIGTERM, also serving the API when `--listen` is given.
 pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCode {
     let Some(listen) = &args.listen else {
         eprintln!("zeta: serving; Ctrl-C to stop");
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            return usage(&format!("waiting for Ctrl-C: {e}"));
+        if let Err(e) = shutdown_signal().await {
+            return usage(&format!("waiting for Ctrl-C or SIGTERM: {e}"));
         }
         return ExitCode::SUCCESS;
     };
@@ -115,10 +133,12 @@ pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCo
         eprintln!("zeta: warning: secret shorter than {MIN_SECRET_LEN} characters");
     }
     let stop = CancellationToken::new();
-    let on_ctrl_c = stop.clone();
+    let on_signal = stop.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        on_ctrl_c.cancel();
+        if let Err(e) = shutdown_signal().await {
+            eprintln!("zeta: waiting for Ctrl-C or SIGTERM: {e}; stopping");
+        }
+        on_signal.cancel();
     });
     match server.run(stop).await {
         Ok(()) => ExitCode::SUCCESS,

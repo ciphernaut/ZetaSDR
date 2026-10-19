@@ -17,6 +17,8 @@ zeta-dsp = { path = "../zeta-dsp" }
 zeta-source-file = { version = "0.1.0", path = "../zeta-source-file" }
 zeta-agent = { path = "../zeta-agent" }
 zeta-source-kiwi = { path = "../zeta-source-kiwi" }
+zeta-source-node = { path = "../zeta-source-node" }
+zeta-source-vrt = { path = "../zeta-source-vrt" }
 zeta-plugin = { path = "../zeta-plugin" }
 
 # The real SoapySDR driver links libSoapySDR (needs libsoapysdr-dev), so it is
@@ -33,6 +35,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(soapy)'] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+num-complex = "0.4.6"
+zeta-vrt = { path = "../zeta-vrt" }
 predicates = "3.1.4"
 tempfile = "3.27.0"
 zeta-client = { path = "../zeta-client" }

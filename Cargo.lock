@@ -3672,6 +3672,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "num-complex",
  "predicates",
  "serde_json",
  "tempfile",
@@ -3684,7 +3685,10 @@ dependencies = [
  "zeta-plugin",
  "zeta-source-file",
  "zeta-source-kiwi",
+ "zeta-source-node",
  "zeta-source-soapy-driver",
+ "zeta-source-vrt",
+ "zeta-vrt",
  "zeta-ws",
 ]
 
@@ -3710,13 +3714,17 @@ dependencies = [
 name = "zeta-client"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
+ "num-complex",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "zeta-core",
+ "zeta-vrt",
  "zeta-ws",
 ]
 
@@ -3822,6 +3830,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeta-source-node"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeta-client",
+ "zeta-core",
+ "zeta-vrt",
+ "zeta-ws",
+]
+
+[[package]]
 name = "zeta-source-soapy"
 version = "0.1.0"
 dependencies = [
@@ -3845,6 +3867,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeta-source-vrt"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "num-complex",
+ "tokio",
+ "zeta-core",
+ "zeta-vrt",
+]
+
+[[package]]
+name = "zeta-vrt"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "serde_json",
+ "thiserror",
+ "zeta-core",
+]
+
+[[package]]
 name = "zeta-ws"
 version = "0.1.0"
 dependencies = [
@@ -3861,6 +3904,7 @@ dependencies = [
  "zeta-client",
  "zeta-core",
  "zeta-source-file",
+ "zeta-vrt",
  "zeta-ws",
 ]
 

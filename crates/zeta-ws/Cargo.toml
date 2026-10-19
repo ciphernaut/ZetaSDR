@@ -18,6 +18,7 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 zeta-client = { path = "../zeta-client" }
 zeta-core = { path = "../zeta-core" }
 zeta-source-file = { path = "../zeta-source-file", optional = true }
+zeta-vrt = { path = "../zeta-vrt" }
 
 [dev-dependencies]
 futures-util = "0.3"

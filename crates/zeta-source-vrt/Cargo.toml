@@ -1,0 +1,16 @@
+[package]
+name = "zeta-source-vrt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZetaSDR source: VITA 49.2 (VRT) packets over UDP as a push port"
+
+[dependencies]
+async-trait = "0.1.92"
+num-complex = "0.4.6"
+tokio = { version = "1.53.3", features = ["net", "sync", "rt", "macros", "time"] }
+zeta-core = { path = "../zeta-core" }
+zeta-vrt = { path = "../zeta-vrt" }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["net", "rt-multi-thread", "macros", "time"] }

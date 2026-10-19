@@ -1,6 +1,6 @@
 //! Build the node the CLI drives: stage registry (core plus `zeta-dsp`, plus `--plugin`
-//! stages), sources (SigMF files, KiwiSDRs, and SoapySDR devices when built with
-//! `--cfg soapy`), knowledge and classifiers.
+//! stages), sources (SigMF files, KiwiSDRs, other ZetaSDR nodes, VRT senders over UDP,
+//! and SoapySDR devices when built with `--cfg soapy`), knowledge and classifiers.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +14,8 @@ use zeta_core::types::SourceId;
 use zeta_plugin::host::PluginCommand;
 use zeta_source_file::{FileOpts, FileSource};
 use zeta_source_kiwi::{KiwiConfig, KiwiSource};
+use zeta_source_node::{NodePort, NodeSourceConfig};
+use zeta_source_vrt::VrtSourceConfig;
 
 use crate::sources::{PluginSpec, SourceSpec};
 
@@ -109,18 +111,35 @@ async fn with_plugins(plugins: &[PluginSpec]) -> Result<StageRegistry, String> {
     Ok(reg)
 }
 
+/// The `--source-node` ports of an opened node, kept to stop their remote jobs on exit.
+#[derive(Default)]
+pub struct RemotePorts(Vec<Arc<NodePort>>);
+
+impl RemotePorts {
+    /// Stop every remote `passthrough` job and wait for each node to confirm. Call before
+    /// the process exits: the stop a dropped port spawns never runs once the runtime is
+    /// shutting down.
+    pub async fn close(&self) {
+        for p in &self.0 {
+            p.close().await;
+        }
+    }
+}
+
 /// Open the node on `state_dir` with the given sources and plugin stages. File sources
 /// loop in real time and start after the node has subscribed to them (a source with no
-/// subscriber stops at once); a KiwiSDR connects on its first tune; a SoapySDR device is
-/// opened here. `resume` relaunches persisted `Running` jobs (`serve`); without it they
+/// subscriber stops at once); a KiwiSDR connects on its first tune; a remote node is asked
+/// for its source list here (with the secret from `ZETA_NODE_SECRET_<ID>`) and runs a
+/// `passthrough` job from each tune; a VRT source binds its UDP address here; a SoapySDR
+/// device is opened here. `resume` relaunches persisted `Running` jobs (`serve`); without it they
 /// are listed as persisted and left alone (one-shot). Errors name the flag, never a
-/// Kiwi password.
+/// Kiwi password or a node secret. The node comes with its [`RemotePorts`].
 pub async fn open(
     state_dir: PathBuf,
     sources: &[SourceSpec],
     plugins: &[PluginSpec],
     resume: bool,
-) -> Result<Node, String> {
+) -> Result<(Node, RemotePorts), String> {
     let opts = FileOpts {
         realtime: true,
         block_samples: 4800,
@@ -129,6 +148,7 @@ pub async fn open(
     let registry = with_plugins(plugins).await?;
     let mut files = Vec::new();
     let mut ports: Vec<Arc<dyn Port>> = Vec::new();
+    let mut remotes = RemotePorts::default();
     for spec in sources {
         let flag = |e: &dyn std::fmt::Display| format!("{spec}: {e}");
         let id = SourceId(spec.id().to_owned());
@@ -149,6 +169,28 @@ pub async fn open(
                 let cfg =
                     KiwiConfig::new(host.clone(), *port, password.clone()).map_err(|e| flag(&e))?;
                 ports.push(Arc::new(KiwiSource::new(id, cfg)));
+            }
+            SourceSpec::Node {
+                url,
+                remote_source,
+                max_bandwidth_hz,
+                ..
+            } => {
+                let cfg = NodeSourceConfig {
+                    id,
+                    url: url.clone(),
+                    secret: crate::sources::node_secret(spec.id())?,
+                    remote_source: SourceId(remote_source.clone()),
+                    max_bandwidth_hz: *max_bandwidth_hz,
+                };
+                let p = Arc::new(NodePort::open(cfg).await.map_err(|e| flag(&e))?);
+                remotes.0.push(p.clone());
+                ports.push(p);
+            }
+            SourceSpec::Vrt { bind, .. } => {
+                let cfg = VrtSourceConfig { id, bind: *bind };
+                let p = zeta_source_vrt::open(cfg).await.map_err(|e| flag(&e))?;
+                ports.push(Arc::new(p));
             }
             SourceSpec::Soapy { args, .. } => {
                 ports.push(open_soapy(spec.id(), args).map_err(|e| flag(&e))?);
@@ -178,7 +220,7 @@ pub async fn open(
     for c in zeta_dsp::classifiers() {
         node.add_classifier(c);
     }
-    Ok(node)
+    Ok((node, remotes))
 }
 
 #[cfg(test)]

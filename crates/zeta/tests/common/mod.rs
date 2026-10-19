@@ -1,4 +1,7 @@
 //! Helpers for tests that run a real `zeta serve --listen` process.
+//!
+//! Compiled into several test crates, each using a subset.
+#![allow(dead_code)]
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -20,14 +23,26 @@ pub struct ServeProc {
 
 impl ServeProc {
     pub fn start(dir: &Path, secret: &str) -> ServeProc {
+        ServeProc::start_with(dir, secret, &[])
+    }
+
+    /// [`ServeProc::start`] with `extra` global flags (e.g. more `--source-file`s).
+    pub fn start_with(dir: &Path, secret: &str, extra: &[&str]) -> ServeProc {
+        ServeProc::start_env(dir, secret, extra, &[])
+    }
+
+    /// [`ServeProc::start_with`] with extra environment variables.
+    pub fn start_env(dir: &Path, secret: &str, extra: &[&str], env: &[(&str, &str)]) -> ServeProc {
         let meta = write_tone(dir);
         let mut child = Command::new(env!("CARGO_BIN_EXE_zeta"))
             .env_remove("ZETA_NODE")
             .env_remove("ZETA_SECRET")
+            .envs(env.iter().copied())
             .arg("--state-dir")
             .arg(dir.join("state"))
             .arg("--source-file")
             .arg(format!("tone={}", meta.display()))
+            .args(extra)
             .args(["serve", "--listen", "127.0.0.1:0", "--secret", secret])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -64,6 +79,28 @@ impl ServeProc {
                     panic!("zeta serve not ready in 10 s; stderr so far: {seen:?}");
                 }
             }
+        }
+    }
+}
+
+impl ServeProc {
+    /// Send SIGTERM and wait up to `within` for the process to exit.
+    pub fn terminate(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let ok = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .expect("run kill")
+            .success();
+        assert!(ok, "kill -TERM failed");
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(st) = self.child.try_wait().expect("try_wait") {
+                return Some(st);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }

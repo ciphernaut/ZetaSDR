@@ -1,0 +1,16 @@
+#!/bin/sh
+# ExecStartPre check: refuse to start with an empty, short or placeholder secret.
+# Checks the expanded environment (EnvironmentFile is root-only; this runs as zetasdr).
+s="${ZETA_SECRET:-}"
+if [ -z "$s" ]; then
+  echo "zetasdr: ZETA_SECRET is empty; set 16+ random chars in /etc/zetasdr/env (openssl rand -hex 16)" >&2
+  exit 1
+fi
+if [ "$s" = "change-me-to-16-plus-chars" ]; then
+  echo "zetasdr: ZETA_SECRET is still the placeholder; set 16+ random chars in /etc/zetasdr/env (openssl rand -hex 16)" >&2
+  exit 1
+fi
+if [ "${#s}" -lt 16 ]; then
+  echo "zetasdr: ZETA_SECRET is shorter than 16 chars; use openssl rand -hex 16" >&2
+  exit 1
+fi

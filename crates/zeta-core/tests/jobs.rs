@@ -466,6 +466,7 @@ struct FaultyPort {
     tx: Mutex<Option<tokio::sync::broadcast::Sender<IqBlock>>>,
     rx: IqReceiver,
     fault: Mutex<Option<String>>,
+    idles: std::sync::atomic::AtomicUsize,
 }
 
 impl FaultyPort {
@@ -488,6 +489,7 @@ impl FaultyPort {
             tx: Mutex::new(Some(tx)),
             rx,
             fault: Mutex::new(None),
+            idles: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -531,6 +533,9 @@ impl Port for FaultyPort {
     }
     fn fault(&self) -> Option<String> {
         self.fault.lock().unwrap().clone()
+    }
+    async fn idle(&self) {
+        self.idles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -611,4 +616,26 @@ async fn closed_port_without_fault_still_drains_and_stops() {
     assert_eq!(frames, 3);
     assert_eq!(wait_not_running(&node, 1000).await, JobState::Stopped);
     assert!(node.lease_holders(&SourceId("flaky".into())).is_empty());
+}
+
+#[tokio::test]
+async fn idle_fires_only_when_the_last_holder_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let flaky = FaultyPort::new();
+    let port: Arc<dyn Port> = flaky.clone();
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    let idles = || flaky.idles.load(std::sync::atomic::Ordering::SeqCst);
+    let a = start_flaky(&node).await;
+    let b = start_flaky(&node).await;
+    assert_eq!(node.lease_holders(&SourceId("flaky".into())).len(), 2);
+    node.job_stop(&a).await.unwrap();
+    assert_eq!(idles(), 0, "one holder is left");
+    node.job_stop(&b).await.unwrap();
+    assert_eq!(idles(), 1, "the last holder left");
+    // Starting again and stopping idles once more.
+    let c = start_flaky(&node).await;
+    node.job_stop(&c).await.unwrap();
+    assert_eq!(idles(), 2);
 }

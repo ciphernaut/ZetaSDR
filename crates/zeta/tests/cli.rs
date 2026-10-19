@@ -1,5 +1,7 @@
 //! End-to-end tests of the `zeta` binary.
 
+mod common;
+
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -610,6 +612,8 @@ fn soapy_without_cfg_is_explained() {
 fn node_mode_rejects_source_and_plugin_flags() {
     for flags in [
         ["--source-kiwi", "k=h:1"],
+        ["--source-node", "pi=tone@http://127.0.0.1:9"],
+        ["--source-vrt", "v=udp://127.0.0.1:4991"],
         ["--source-soapy", "h=driver=hackrf"],
         ["--plugin", "gain=/x"],
     ] {
@@ -699,4 +703,309 @@ async fn kiwi_password_from_env_reaches_kiwi_and_is_never_printed() {
         "{:?}",
         fake.commands()
     );
+}
+
+/// Secret of the serving node in the federation tests (16+ characters: no short-secret warning).
+const NODE_SECRET: &str = "s3cret-long-enough";
+
+/// Node B: a one-shot `zeta --source-node pi=SOURCE@URL job start … --then-tail 1,8000`
+/// with `ZETA_NODE_SECRET_PI` set; returns stdout+stderr after asserting success and
+/// that neither contains the secret or a bearer header.
+fn federated_job(dir: &Path, url: &str, remote: &str, job: &[&str]) -> Value {
+    let out = zeta_bin()
+        .env("ZETA_NODE_SECRET_PI", NODE_SECRET)
+        .arg("--state-dir")
+        .arg(dir.join("state"))
+        .arg("--source-node")
+        .arg(format!("pi={remote}@{url}"))
+        .args(["--json", "job", "start", "--source", "pi"])
+        .args(job)
+        .args(["--then-tail", "1,8000"])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all.contains(NODE_SECRET), "secret printed: {all}");
+    assert!(!all.contains("Bearer"), "bearer printed: {all}");
+    json(&out.stdout)
+}
+
+/// Poll node A's `job list` for up to 3 s until the one `passthrough` job on `remote` is
+/// stopped (a local job start tunes twice with the same band; the second reuses the job).
+fn assert_remote_passthrough_stopped(url: &str, remote: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let out = common::zeta_remote(url, NODE_SECRET, &["job", "list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = json(&out);
+        let jobs: Vec<&Value> = v["value"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .filter(|j| j["kind"] == "passthrough" && j["source"] == remote)
+            .collect();
+        assert_eq!(jobs.len(), 1, "one passthrough job on {remote}: {v}");
+        if jobs.iter().all(|j| j["state"]["status"] == "stopped") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "remote passthrough job not stopped within 3 s: {v}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn measure_over_federation_labels_remote_tone_as_carrier() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let node_a = common::ServeProc::start(a.path(), NODE_SECRET);
+    let v = federated_job(
+        b.path(),
+        &node_a.url,
+        "tone",
+        &[
+            "--kind",
+            "measure",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ],
+    );
+    let frames = v[1]["value"]["frames"].as_array().expect("frames");
+    assert_eq!(frames.len(), 1, "{v}");
+    assert_eq!(frames[0]["source"], "pi");
+    assert_eq!(frames[0]["payload"]["label"]["name"], "carrier", "{v}");
+    assert_eq!(v[2]["stopped"], true);
+    assert_remote_passthrough_stopped(&node_a.url, "tone");
+}
+
+#[test]
+fn aprs_decode_over_federation_yields_the_packet() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let src = aprs_source(a.path());
+    let node_a = common::ServeProc::start_with(a.path(), NODE_SECRET, &["--source-file", &src]);
+    let v = federated_job(
+        b.path(),
+        &node_a.url,
+        "aprs",
+        &[
+            "--kind",
+            "aprs_decode",
+            "--center-hz",
+            "144800000",
+            "--bandwidth-hz",
+            "12500",
+        ],
+    );
+    let frames = v[1]["value"]["frames"].as_array().expect("frames");
+    assert_eq!(frames.len(), 1, "{v}");
+    assert_eq!(frames[0]["source"], "pi");
+    assert_eq!(frames[0]["payload"]["src"], "VK3ABC", "{v}");
+    assert_remote_passthrough_stopped(&node_a.url, "aprs");
+}
+
+#[test]
+fn source_node_without_secret_is_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    for empty in [None, Some("")] {
+        let mut cmd = zeta_bin();
+        cmd.env_remove("ZETA_NODE_SECRET_PI");
+        if let Some(v) = empty {
+            cmd.env("ZETA_NODE_SECRET_PI", v);
+        }
+        cmd.arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .args([
+                "--source-node",
+                "pi=tone@http://127.0.0.1:9",
+                "source",
+                "list",
+            ])
+            .assert()
+            .code(1)
+            .stderr(contains("--source-node pi: set ZETA_NODE_SECRET_PI"));
+    }
+}
+
+#[test]
+fn source_node_bad_flag_is_usage_error_naming_the_part() {
+    zeta_bin()
+        .env("ZETA_NODE_SECRET_PI", NODE_SECRET)
+        .args(["--source-node", "pi=tone@https://h:1", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("http://"))
+        .stderr(contains("ID=SOURCE@URL[,max_bandwidth_hz=N]"));
+}
+
+#[test]
+fn source_node_is_rejected_with_node() {
+    zeta_bin()
+        .env("ZETA_NODE_SECRET_PI", NODE_SECRET)
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
+        .args([
+            "--source-node",
+            "pi=tone@http://127.0.0.1:9",
+            "source",
+            "list",
+        ])
+        .assert()
+        .code(1)
+        .stderr(contains("configured on the serving node"));
+}
+
+/// Send a 1 kHz tone at 48 kHz centred on 1 MHz to `to` over UDP in real time, 10 ms
+/// blocks, context once a second as `VrtEncoder` does. Stops when `stop` is set or after
+/// 10 s.
+fn send_vrt_tone(to: std::net::SocketAddr, stop: &std::sync::atomic::AtomicBool) {
+    use num_complex::Complex;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    use zeta_vrt::{IqMeta, VrtEncoder};
+    const RATE: u64 = 48_000;
+    const BLOCK: u64 = 480;
+    let meta = IqMeta {
+        center_hz: 1_000_000,
+        sample_rate_hz: RATE,
+        bandwidth_hz: RATE,
+    };
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut enc = VrtEncoder::new(5);
+    let start = Instant::now();
+    for n in 0..1000u64 {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let t0_ns = n * BLOCK * 1_000_000_000 / RATE;
+        let samples: Vec<Complex<f32>> = (n * BLOCK..(n + 1) * BLOCK)
+            .map(|i| {
+                let ph = 2.0 * std::f64::consts::PI * 1_000.0 * i as f64 / RATE as f64;
+                Complex::new(0.5 * ph.cos() as f32, 0.5 * ph.sin() as f32)
+            })
+            .collect();
+        for p in enc.encode(t0_ns, meta, &samples) {
+            sock.send_to(&p, to).unwrap();
+        }
+        let due = start + Duration::from_millis((n + 1) * 10);
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+    }
+}
+
+#[test]
+fn source_vrt_measure_labels_sent_tone_as_carrier() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    // A free loopback UDP port for zeta to bind.
+    let to = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let stop = AtomicBool::new(false);
+    let out = std::thread::scope(|s| {
+        s.spawn(|| send_vrt_tone(to, &stop));
+        let out = zeta_bin()
+            .arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .arg("--source-vrt")
+            .arg(format!("t=udp://{to}"))
+            .args([
+                "--json", "job", "start", "--kind", "measure", "--source", "t",
+            ])
+            .args(["--center-hz", "1000000", "--bandwidth-hz", "48000"])
+            .args(["--then-tail", "1,8000"])
+            .timeout(std::time::Duration::from_secs(30))
+            .output()
+            .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        out
+    });
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json(&out.stdout);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames");
+    assert_eq!(frames.len(), 1, "{v}");
+    assert_eq!(frames[0]["source"], "t");
+    assert_eq!(frames[0]["payload"]["label"]["name"], "carrier", "{v}");
+    assert_eq!(v[2]["stopped"], true);
+}
+
+#[test]
+fn source_vrt_non_lan_address_is_usage_error() {
+    zeta_bin()
+        .args(["--source-vrt", "t=udp://8.8.8.8:4991", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("not a LAN address"))
+        .stderr(contains("ID=udp://ADDR:PORT"));
+}
+
+/// `serve` stopped by SIGTERM (systemd stop) shuts down like Ctrl-C: it exits 0 and
+/// releases the remote node's `passthrough` job.
+#[test]
+fn serve_sigterm_releases_remote_lease() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let node_a = common::ServeProc::start(a.path(), NODE_SECRET);
+    let mut node_b = common::ServeProc::start_env(
+        b.path(),
+        NODE_SECRET,
+        &["--source-node", &format!("pi=tone@{}", node_a.url)],
+        &[("ZETA_NODE_SECRET_PI", NODE_SECRET)],
+    );
+    common::zeta_remote(
+        &node_b.url,
+        NODE_SECRET,
+        &[
+            "job",
+            "start",
+            "--source",
+            "pi",
+            "--kind",
+            "measure",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ],
+    )
+    .timeout(std::time::Duration::from_secs(30))
+    .assert()
+    .success();
+    let running = common::zeta_remote(&node_a.url, NODE_SECRET, &["job", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&running);
+    assert!(
+        v["value"]
+            .as_array()
+            .expect("jobs")
+            .iter()
+            .any(|j| j["kind"] == "passthrough" && j["state"]["status"] == "running"),
+        "no running passthrough on node A: {v}"
+    );
+    let status = node_b
+        .terminate(std::time::Duration::from_secs(5))
+        .expect("serve exits within 5 s of SIGTERM");
+    assert!(status.success(), "serve exit status {status:?}");
+    assert_remote_passthrough_stopped(&node_a.url, "tone");
 }

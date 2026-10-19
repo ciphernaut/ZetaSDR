@@ -12,7 +12,7 @@ interfaces rather than guessed ones.
 | 2 | DSP slice | Channeliser, NBFM demod to an audio stream, AFSK1200/APRS decode-to-identify to an event stream, layer-1 classical measurement producing feature records, CPU and GPU FFT implementations of one stage. **Delivered** on branch `dsp-slice`, 2026-10-19. GPU hardware equivalence (`gpu_matches_cpu_within_0_1_db`) is pending on the field host. | 1 |
 | 3 | Transports and agent | Websocket+JSON server with shared secret, MCP server generated from the schema, OpenAI-compatible in-process agent adapter (thinking off, token budget, readiness sequence, prose-answer detection), skill and tool descriptions generated from AGENTS.md. **Delivered** on branch `transports-agent`, 2026-10-19. | 1 |
 | 4 | Hardware and foreign sources | HackRF via SoapySDR plugin crate, KiwiSDR websocket client, external-process plugin SDK (Python) speaking the typed envelope. **Delivered** on branch `hardware-sources`, 2026-10-19. The `cfg(soapy)` driver build and clippy passed against SoapySDR 0.8.1 once `libsoapysdr-dev` was installed later the same day. Pending: the HackRF hardware test; GPU equivalence on the field host is still pending from plan 2. | 1, 2 |
-| 5 | Federation | Node-to-node: VITA 49.2 for IQ, typed envelope for the rest, back-pressure, shared secret, Pi 5 build and deployment, remote node as a source. | 3, 4 |
+| 5 | Federation | Node-to-node: VITA 49.2 for IQ, typed envelope for the rest, back-pressure, shared secret, Pi 5 build and deployment, remote node as a source. **Delivered** on branch `federation`, 2026-10-19. Pending: deployment on Pi hardware (no Pi is set up yet), the one-shot `--then-tail` finding against the B210, and releasing the remote job when the local job stops. | 3, 4 |
 | 6 | UI | Wide renderer (waterfall, ribbons, context menu, agent pane, jobs), narrow renderer, graph view. All clients of the plan-3 websocket. | 3 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6 is
@@ -69,3 +69,42 @@ with 75 kHz deviation streamed audio frames. Layer-1 labels broadcast FM `unknow
 plan-2 `fm` rule is narrowband (band at most 25 kHz, envelope cv below 0.2), and the occupied-
 bandwidth estimate varies with the FFT bin width. A wideband-FM rule and a steadier bandwidth
 estimate are layer-1 follow-ups.
+
+## Plan 5 status
+
+Plan 5 is delivered on `federation`: VITA 49.2 signal-data and context packets (`zeta-vrt`, `ci16`
+on the wire, FNV-1a stream ids, a context packet about once a second), a binary mode of the stream
+websocket (`?format=binary`: VRT packets for IQ, the typed envelope for audio, text and events,
+paced by `{"type":"credit","packets":N}` with skipped frames reported as `lagged`), a binary
+subscription with credits in `zeta-client`, another node as a push source (`zeta-source-node`,
+`--source-node ID=SOURCE@URL`, secret from `ZETA_NODE_SECRET_<ID>`, 250 kHz default cap widened by
+`max_bandwidth_hz=`), VITA 49.2 over UDP as a push source (`zeta-source-vrt`, `--source-vrt`), and
+a Pi 5 cross-build, qemu smoke test and systemd deployment (`deploy/pi/`). Discovery is deferred:
+v1 nodes talk by URL. The workspace gates passed on 2026-10-19: fmt, clippy with `--all-targets
+--all-features -D warnings`, `cargo test --workspace --all-features` 456 passed, 0 failed, 2
+ignored (the live Kiwi and the field host model tests), `no_privileged_deps`, `zeta agents-md
+--check` and `--skill --check`, and `deploy/pi/smoke.sh` (the aarch64 release binary under
+qemu-aarch64). By hand on this box, node A served the tone fixture on 127.0.0.1:7979 and node B
+federated it with `--source-node a=tone@http://127.0.0.1:7979` under `serve --listen
+127.0.0.1:7980`: B's `source list` showed `a` with `remote` and `push` true and `max_bandwidth_hz`
+48000 (the remote file's own limit, below the 250 kHz cap); a 12.5 kHz `measure` job on `a` at 100
+MHz produced `carrier` records each second (snr 136.6 dB, as for the local tone), and A's `source
+list` showed `tone` held by a `passthrough` job. `job stop` on B did not release it: A still showed
+the holder 38 s later, because the port stays tuned until the next tune or exit; Ctrl-C on B
+stopped the remote job before the next poll (under 10 ms), and the one-shot form (`job start ...
+--then-tail 2,5000` with `--source-node`) returned two events and stopped its remote jobs. Each
+federated job start created two `passthrough` jobs on A, the first stopped at once (fixed in the
+fix wave: an identical re-tune reuses the remote job). On 2026-10-19 a second node on
+field-host (x86, USRP B210 through the SoapySDR UHD module, built with `--cfg soapy`) served
+`--source-soapy b210=driver=uhd,serial=31B92DD`; this box federated it with `--source-node
+falc=b210@…` through an SSH tunnel because port 7979 is firewalled on that host. The federated
+`source list` showed the B210 as a remote push source capped at 250 kHz; under a local `serve`, a
+`measure` job at 104.9 MHz with a 200 kHz band produced events each second (snr 16-17 dB) and
+`fm_demod` produced audio frames; the remote node showed the passthrough job as the lease holder. A
+local `job stop` did not release it then (only a retune, the port's close or its drop did); since
+the final-review fix wave the remote passthrough is released when the last local job on the source
+stops, after a 2 s grace, and an identical re-tune reuses it, so a federated job start makes one
+remote job. Open: the one-shot form (`job start … --then-tail`) streamed for 10 s but produced no
+events in two runs, while the same job under `serve` did; it is recorded for the final review. A
+federating `serve` stopped with SIGTERM now shuts down like Ctrl-C and stops its remote jobs (fix
+wave). The HackRF step of the by-hand plan did not run (the HackRF was unplugged).

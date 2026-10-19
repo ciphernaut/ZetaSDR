@@ -31,7 +31,9 @@ pub type IqReceiver = tokio::sync::broadcast::Receiver<IqBlock>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PortError {
-    #[error("{field} {value} out of range {min}..={max}")]
+    /// A `suggested` above `max` means the source itself ships more than the
+    /// configured cap allows (a remote node's fixed rate); the message says so.
+    #[error("{field} {value} out of range {min}..={max}{}", over_cap(*suggested, *max))]
     OutOfRange {
         field: &'static str,
         value: u64,
@@ -43,6 +45,17 @@ pub enum PortError {
     Unsupported(String),
     #[error("io: {0}")]
     Io(String),
+}
+
+/// The hint for an `OutOfRange` whose suggestion exceeds its maximum: the
+/// source ships that rate and only a larger cap admits it.
+pub fn over_cap(suggested: Option<u64>, max: u64) -> String {
+    match suggested {
+        Some(s) if s > max => {
+            format!("; remote ships {s} Hz; pass max_bandwidth_hz={s} to allow it")
+        }
+        _ => String::new(),
+    }
 }
 
 /// A signal source.
@@ -68,4 +81,8 @@ pub trait Port: Send + Sync {
     fn fault(&self) -> Option<String> {
         None
     }
+    /// Called under the lease gate when the source's last holder released; a
+    /// port may stop upstream work and clear `current`. The next `tune` must
+    /// work as from scratch. Must not block for long: the gate is held.
+    async fn idle(&self) {}
 }

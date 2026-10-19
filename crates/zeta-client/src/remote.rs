@@ -9,7 +9,7 @@ use zeta_core::stream::StreamInfo;
 use zeta_core::types::StreamId;
 
 /// Longer than the server's 30 s operation timeout.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -27,6 +27,8 @@ pub enum ClientError {
     BadUrl(String),
     #[error("decoding node response: {0}")]
     Decode(String),
+    #[error("stream {url}: {detail}")]
+    Stream { url: String, detail: String },
 }
 
 #[derive(Clone)]
@@ -70,6 +72,10 @@ impl NodeClient {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    pub(crate) fn secret(&self) -> &str {
+        &self.secret
     }
 
     pub async fn apply(&self, op: &Op) -> Result<Result<OpResult, OpError>, ClientError> {
