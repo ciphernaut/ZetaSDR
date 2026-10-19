@@ -116,8 +116,7 @@ impl DataPacket {
             // n <= 16_384, so this always fits in u16.
             size_words: words as u16,
         };
-        let secs = (self.t0_ns / 1_000_000_000) as u32;
-        let ps = (self.t0_ns % 1_000_000_000) * 1000;
+        let (secs, ps) = split_timestamp(self.t0_ns);
         let mut out = Vec::with_capacity(words * 4);
         out.extend_from_slice(&header.encode().to_be_bytes());
         out.extend_from_slice(&self.stream_id.to_be_bytes());
@@ -158,8 +157,7 @@ impl DataPacket {
         let word =
             |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
         let stream_id = word(4);
-        let secs = u64::from(word(8));
-        let ps = (u64::from(word(12)) << 32) | u64::from(word(16));
+        let t0_ns = join_timestamp(word(8), (u64::from(word(12)) << 32) | u64::from(word(16)));
         let samples = bytes[prefix..]
             .chunks_exact(4)
             .map(|c| {
@@ -172,8 +170,7 @@ impl DataPacket {
         Ok(DataPacket {
             stream_id,
             count: header.count,
-            // secs < 2^32 so secs * 1e9 < 4.3e18; ps / 1000 < 1.9e16: no overflow.
-            t0_ns: secs * 1_000_000_000 + ps / 1000,
+            t0_ns,
             samples,
         })
     }
@@ -193,4 +190,17 @@ pub fn f32_to_i16(x: f32) -> i16 {
 
 pub fn i16_to_f32(v: i16) -> f32 {
     f32::from(v) / 32767.0
+}
+
+/// Nanoseconds to (TSI seconds, TSF picoseconds). Seconds saturate at `u32::MAX`
+/// only for timestamps beyond year 2106.
+pub(crate) fn split_timestamp(ns: u64) -> (u32, u64) {
+    ((ns / 1_000_000_000) as u32, (ns % 1_000_000_000) * 1000)
+}
+
+/// (TSI seconds, TSF picoseconds) to nanoseconds, saturating.
+pub(crate) fn join_timestamp(secs: u32, ps: u64) -> u64 {
+    u64::from(secs)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ps / 1000)
 }
