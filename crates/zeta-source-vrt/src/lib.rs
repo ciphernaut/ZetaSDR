@@ -7,6 +7,16 @@
 //! context) are counted by [`VrtPort::errors`] and skipped; they are never a fault. The
 //! loop ends when the port is dropped.
 //!
+//! The port follows one sender: the stream id of the first context packet is pinned.
+//! Until the first data packet arrives a context with another id re-pins (a sender
+//! that restarted under a new id); after that, packets of any other stream id are
+//! dropped. A data packet whose `t0` is earlier than the end of the previous block
+//! (a duplicated or reordered datagram) is dropped too, so `t0` never goes backwards.
+//! Both kinds of drop are counted by [`VrtPort::dropped`], apart from decode errors.
+//!
+//! The ingest is unauthenticated: anyone who can reach the UDP port can feed it, so bind
+//! a specific LAN address.
+//!
 //! The sender decides the frequency and rate, so [`Port::tune`] only accepts a request
 //! that lies inside the band the sender is already on. Before the first context packet it
 //! waits up to [`CONTEXT_WAIT`] for one: senders repeat context about once a second, and a
@@ -24,7 +34,7 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId, Timestamp};
-use zeta_vrt::VrtDecoder;
+use zeta_vrt::{Header, PacketKind, VrtDecoder};
 
 /// Largest band advertised, in Hz.
 pub const VRT_MAX_BANDWIDTH_HZ: u64 = 20_000_000;
@@ -49,6 +59,7 @@ pub struct VrtSourceConfig {
 #[derive(Default)]
 struct Shared {
     errors: AtomicU64,
+    dropped: AtomicU64,
 }
 
 /// A VRT sender on UDP as a push [`Port`]; see the crate docs.
@@ -110,6 +121,12 @@ impl VrtPort {
     /// Datagrams that could not be received or decoded so far.
     pub fn errors(&self) -> u64 {
         self.shared.errors.load(Ordering::Relaxed)
+    }
+
+    /// Well-formed packets dropped so far: from a stream other than the pinned one,
+    /// or data whose `t0` runs backwards (duplicated or reordered datagrams).
+    pub fn dropped(&self) -> u64 {
+        self.shared.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -185,6 +202,10 @@ async fn receive(
 ) {
     let mut buf = vec![0u8; DATAGRAM_BYTES];
     let mut decoder = VrtDecoder::new();
+    // The pinned stream id, whether any data was forwarded, and where the last block ended.
+    let mut pinned: Option<u32> = None;
+    let mut seen_data = false;
+    let mut next_t0: Option<u64> = None;
     let fail = |what: &dyn std::fmt::Display| {
         if shared.errors.fetch_add(1, Ordering::Relaxed) == 0 {
             eprintln!("vrt source {id}: skipping datagram: {what} (further ones only counted)");
@@ -200,7 +221,17 @@ async fn receive(
                 continue;
             }
         };
-        let decoded = match decoder.feed(&buf[..n]) {
+        let packet = &buf[..n];
+        // Stream identity: drop other senders once data has flowed from the pinned one.
+        let head = peek(packet);
+        if let (Some(pin), Some((kind, sid))) = (pinned, head)
+            && sid != pin
+            && (kind == PacketKind::Data || seen_data)
+        {
+            drop_one(&shared, &id, "another stream id");
+            continue;
+        }
+        let decoded = match decoder.feed(packet) {
             Ok(d) => d,
             Err(e) => {
                 fail(&e);
@@ -208,7 +239,8 @@ async fn receive(
             }
         };
         let Some(d) = decoded else {
-            // A context packet: the sender's band, as a capture band.
+            // A context packet: pin its sender and report its band as the capture band.
+            pinned = head.map(|(_, sid)| sid);
             if let Some(meta) = decoder.meta() {
                 let new = Some(Tuning {
                     center_hz: Hz(meta.center_hz),
@@ -218,6 +250,18 @@ async fn receive(
             }
             continue;
         };
+        if next_t0.is_some_and(|end| d.t0_ns < end) {
+            drop_one(&shared, &id, "t0 before the previous block's end");
+            continue;
+        }
+        seen_data = true;
+        let step = (d.samples.len() as u128 * 1_000_000_000)
+            .checked_div(u128::from(d.meta.sample_rate_hz))
+            .unwrap_or(0);
+        next_t0 = Some(
+            d.t0_ns
+                .saturating_add(u64::try_from(step).unwrap_or(u64::MAX)),
+        );
         let samples: Arc<[Complex<f32>]> = d.samples.into();
         // No receivers: the block is dropped and the loop keeps going.
         let _ = tx.send(IqBlock {
@@ -226,6 +270,21 @@ async fn receive(
             center_hz: Hz(d.meta.center_hz),
             samples,
         });
+    }
+}
+
+/// The kind and stream id of a packet whose header decodes and that is long enough to
+/// carry a stream id (both packet kinds put it in word 1).
+fn peek(packet: &[u8]) -> Option<(PacketKind, u32)> {
+    let head = Header::decode(u32::from_be_bytes(*packet.first_chunk::<4>()?)).ok()?;
+    let sid = packet.get(4..8)?;
+    Some((head.kind, u32::from_be_bytes(sid.try_into().ok()?)))
+}
+
+/// Count a dropped packet; the first one is logged.
+fn drop_one(shared: &Shared, id: &str, why: &str) {
+    if shared.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
+        eprintln!("vrt source {id}: dropping packet: {why} (further ones only counted)");
     }
 }
 

@@ -64,6 +64,8 @@ impl ContextPacket {
         out
     }
 
+    /// Decode a context packet; a sample rate of 0 Hz is `Unsupported` (no
+    /// timing can be derived from it).
     pub fn decode(bytes: &[u8]) -> Result<ContextPacket, VrtError> {
         let Some(head) = bytes.first_chunk::<4>() else {
             return Err(VrtError::Truncated {
@@ -101,6 +103,10 @@ impl ContextPacket {
                 word(52)
             )));
         }
+        let sample_rate_hz = dword(40) >> RADIX;
+        if sample_rate_hz == 0 {
+            return Err(VrtError::Unsupported("sample rate 0 Hz".into()));
+        }
         Ok(ContextPacket {
             stream_id: word(4),
             count: header.count,
@@ -108,7 +114,7 @@ impl ContextPacket {
             changed: cif0 & CIF0_CHANGE != 0,
             bandwidth_hz: dword(24) >> RADIX,
             center_hz: dword(32) >> RADIX,
-            sample_rate_hz: dword(40) >> RADIX,
+            sample_rate_hz,
         })
     }
 }

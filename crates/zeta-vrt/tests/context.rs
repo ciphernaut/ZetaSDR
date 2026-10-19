@@ -46,3 +46,16 @@ fn context_with_other_cif0_bits_is_unsupported() {
         Err(VrtError::Unsupported(_))
     ));
 }
+
+#[test]
+fn context_with_zero_sample_rate_is_unsupported() {
+    let b = ContextPacket {
+        sample_rate_hz: 0,
+        ..sample()
+    }
+    .encode();
+    assert!(matches!(
+        ContextPacket::decode(&b),
+        Err(VrtError::Unsupported(m)) if m.contains("sample rate")
+    ));
+}

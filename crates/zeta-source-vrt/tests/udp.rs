@@ -124,3 +124,107 @@ async fn tune_before_any_context_is_unsupported_and_says_so() {
         other => panic!("expected Unsupported, got {other:?}"),
     }
 }
+
+/// Encode block `n` with `enc`, returning its packets (context first when due).
+fn packets(enc: &mut VrtEncoder, meta: IqMeta, n: u64) -> Vec<Vec<u8>> {
+    let samples = vec![Complex::new(0.5f32, 0.0); 480];
+    enc.encode(n * 10_000_000, meta, &samples)
+}
+
+/// Wait until `port.dropped()` reaches `n` or 5 s pass.
+async fn wait_dropped(port: &VrtPort, n: u64) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while port.dropped() < n {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dropped {} < {n}",
+            port.dropped()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn duplicate_and_reordered_packets_are_dropped() {
+    let port = port().await;
+    let mut rx = port.subscribe();
+    let to = port.local_addr();
+    let sock = sender().await;
+    let mut enc = VrtEncoder::new(7);
+    let b0 = packets(&mut enc, META, 0); // context + data
+    let b1 = packets(&mut enc, META, 1);
+    let b2 = packets(&mut enc, META, 2);
+    assert_eq!((b0.len(), b1.len(), b2.len()), (2, 1, 1));
+    // b1 twice (duplicate), then b0's data again (reordered), then b2.
+    for p in [&b0[0], &b0[1], &b1[0], &b1[0], &b0[1], &b2[0]] {
+        sock.send_to(p, to).await.unwrap();
+    }
+    let t0s: Vec<u64> = [
+        next_block(&mut rx).await,
+        next_block(&mut rx).await,
+        next_block(&mut rx).await,
+    ]
+    .iter()
+    .map(|b| b.t0.0)
+    .collect();
+    assert_eq!(t0s, vec![0, 10_000_000, 20_000_000]);
+    wait_dropped(&port, 2).await;
+    assert_eq!(port.dropped(), 2);
+    assert_eq!(port.errors(), 0);
+    assert!(rx.try_recv().is_err(), "no further block");
+}
+
+#[tokio::test]
+async fn second_sender_is_ignored() {
+    let port = port().await;
+    let mut rx = port.subscribe();
+    let to = port.local_addr();
+    let (a, b) = (sender().await, sender().await);
+    let mut enc_a = VrtEncoder::new(7);
+    let mut enc_b = VrtEncoder::new(9);
+    let other = IqMeta {
+        center_hz: 2_000_000,
+        ..META
+    };
+    for p in packets(&mut enc_a, META, 0) {
+        a.send_to(&p, to).await.unwrap();
+    }
+    assert_eq!(next_block(&mut rx).await.center_hz, Hz(1_000_000));
+    // Sender B: its context and its data (later t0, so only identity can reject it).
+    for p in packets(&mut enc_b, other, 5) {
+        b.send_to(&p, to).await.unwrap();
+    }
+    wait_dropped(&port, 2).await;
+    for p in packets(&mut enc_a, META, 1) {
+        a.send_to(&p, to).await.unwrap();
+    }
+    let blk = next_block(&mut rx).await;
+    assert_eq!(blk.center_hz, Hz(1_000_000));
+    assert_eq!(blk.t0.0, 10_000_000);
+    assert_eq!(port.current(), Some(tuning(1_000_000, 48_000)));
+    assert_eq!(port.dropped(), 2);
+    assert_eq!(port.errors(), 0);
+}
+
+#[tokio::test]
+async fn context_from_another_sender_before_any_data_repins() {
+    let port = port().await;
+    let mut rx = port.subscribe();
+    let to = port.local_addr();
+    let (a, b) = (sender().await, sender().await);
+    let mut enc_a = VrtEncoder::new(7);
+    let mut enc_b = VrtEncoder::new(9);
+    // A's context only, then B takes over before any data arrived.
+    let pa = packets(&mut enc_a, META, 0);
+    a.send_to(&pa[0], to).await.unwrap();
+    let other = IqMeta {
+        center_hz: 2_000_000,
+        ..META
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for p in packets(&mut enc_b, other, 1) {
+        b.send_to(&p, to).await.unwrap();
+    }
+    assert_eq!(next_block(&mut rx).await.center_hz, Hz(2_000_000));
+    assert_eq!(port.dropped(), 0);
+}
