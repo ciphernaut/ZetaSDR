@@ -23,7 +23,8 @@
 //                                             `L<layer> <name> <confidence>`
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
 //   fm_demod   Decode › NBFM audio            job_start kind=fm_demod, deviation_hz 5000
-//   wfm_demod  Decode › FM broadcast audio    job_start kind=wfm_demod, deviation_hz 75000
+//   wfm_demod  Decode › FM broadcast audio    job_start kind=wfm_demod, deviation_hz 75000,
+//                                             bandwidth_hz at least WFM_MIN_BANDWIDTH_HZ
 //   am_demod   Decode › AM                    job_start kind=am_demod, deviation_hz null
 //   ssb_usb    Decode › SSB (USB)             job_start kind=ssb_demod, sideband usb, at the
 //                                             dial: center_hz = selection centre − 1500,
@@ -58,6 +59,9 @@ export const LABEL_FALLBACK_STEP_HZ = 1000;
 export const SSB_DIAL_OFFSET_HZ = 1500;
 // ... and ask for this bandwidth.
 export const SSB_BANDWIDTH_HZ = 6000;
+// The FM broadcast entry asks for at least this bandwidth: a narrow drag over a station still
+// takes its whole 75 kHz-deviation band.
+export const WFM_MIN_BANDWIDTH_HZ = 200000;
 
 const ENTRIES = [
   ["classify", "What is this?"],
@@ -82,11 +86,15 @@ const JOBS = {
   measure: { kind: "measure", deviation: null, sideband: null },
 };
 
-// The tuning a job entry uses for a selection: {centerHz, bandwidthHz}. SSB tunes the dial.
+// The tuning a job entry uses for a selection: {centerHz, bandwidthHz}. SSB tunes the dial; FM
+// broadcast widens the band to at least WFM_MIN_BANDWIDTH_HZ.
 export function jobTuning(action, s) {
   const sb = JOBS[action] ? JOBS[action].sideband : null;
   if (sb === "usb") return { centerHz: s.centerHz - SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
   if (sb === "lsb") return { centerHz: s.centerHz + SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
+  if (action === "wfm_demod") {
+    return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, WFM_MIN_BANDWIDTH_HZ) };
+  }
   return { centerHz: s.centerHz, bandwidthHz: s.bandwidthHz };
 }
 

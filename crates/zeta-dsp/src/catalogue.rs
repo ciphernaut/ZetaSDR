@@ -208,7 +208,12 @@ fn score(
     } else {
         Term::Off
     };
-    if e.bandwidth_max_hz.is_some_and(|hi| hi.0 > WIDEBAND_HZ) && bw != Term::Ok {
+    // A broad entry needs its bandwidth to match; so does a wideband
+    // measurement against an entry whose bandwidth it is off (a 150 kHz
+    // broadcast station is not a 2 kHz tone entry sharing its band).
+    if (e.bandwidth_max_hz.is_some_and(|hi| hi.0 > WIDEBAND_HZ) && bw != Term::Ok)
+        || (bandwidth_hz > WIDEBAND_HZ && bw == Term::Off)
+    {
         return None;
     }
     let s = FREQ_SCORE
@@ -234,7 +239,8 @@ fn narrowest_range(e: &CatalogueEntry, center_hz: u64) -> u64 {
 /// frequency range holding `center_hz` is narrower first (then catalogue
 /// order). Score: 0.4 when a frequency range holds `center_hz` (required);
 /// 0.3 when `bandwidth_hz` lies in half the entry's minimum to 1.5 × its
-/// maximum bandwidth (required when that maximum is above 50 kHz); 0.3 when
+/// maximum bandwidth (required when that maximum is above 50 kHz, and when
+/// `bandwidth_hz` is above 50 kHz and the entry gives a bandwidth); 0.3 when
 /// `layer1` maps to one of the entry's modulations. At least one of the last
 /// two must hold.
 pub fn catalogue_labels(center_hz: u64, bandwidth_hz: u64, layer1: &str) -> Vec<Label> {

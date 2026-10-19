@@ -20,7 +20,9 @@ use crate::{Input, frame_span, run_map};
 /// Cutoff of the mono audio low-pass, Hz; above it sit the 19 kHz pilot and
 /// the stereo and RDS subcarriers.
 pub const WFM_AUDIO_CUTOFF_HZ: f64 = 15_000.0;
-/// Taps of the audio low-pass at the input rate.
+/// Least taps of the audio low-pass at the input rate; from 256 kHz the
+/// count is `rate / 2000` (odd), so the transition band (about
+/// `4 × rate / taps`) stays near 8 kHz and the 19 kHz pilot stays out.
 pub const WFM_AUDIO_TAPS: usize = 127;
 
 /// FM de-emphasis in place: the single-pole IIR `y[n] = a·x[n] + (1−a)·y[n−1]`
@@ -96,7 +98,8 @@ impl WfmDemod {
             // Above 2 × 15 kHz the cutoff stays put; below, the resampler's
             // own low-pass is what limits the band.
             let cutoff = WFM_AUDIO_CUTOFF_HZ.min(0.45 * rate_hz as f64);
-            let taps = lowpass_taps(cutoff, rate_hz as f64, WFM_AUDIO_TAPS);
+            let n = WFM_AUDIO_TAPS.max((rate_hz / 2_000) as usize | 1);
+            let taps = lowpass_taps(cutoff, rate_hz as f64, n);
             self.lpf = Some((rate_hz, StreamingFir::new(taps)));
         }
         let x = self

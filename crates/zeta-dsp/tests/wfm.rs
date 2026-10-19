@@ -140,3 +140,20 @@ fn streaming_fir_in_blocks_matches_one_shot() {
         assert!((a - b).abs() < 1e-6, "{a} vs {b}");
     }
 }
+
+#[test]
+fn wfm_demod_rejects_the_pilot_at_960k() {
+    // At 960 kHz a fixed 127-tap low-pass has a ~15 kHz transition band and
+    // passes the 19 kHz pilot; the taps scale with the rate. The tone is as
+    // loud as the pilot (0.1), so de-emphasis alone (~15 dB) is not enough.
+    let audio = tone(48_000, 48_000, 1_000.0, 0.1);
+    let iq = wfm_modulate(&audio, 48_000, 960_000, 75_000.0, 0.0, true);
+    let out = demod(&iq, 960_000, &params(75_000), 9_600);
+    assert!(out.len().abs_diff(48_000) <= 2, "len {}", out.len());
+    let tail = &out[4_800..4_800 + 43_200];
+    let a_tone = amplitude(tail, 48_000.0, 1_000.0);
+    let a_pilot = amplitude(tail, 48_000.0, 19_000.0);
+    let rejection = 20.0 * (a_tone / a_pilot).log10();
+    eprintln!("wfm at 960 kHz: pilot {rejection:.1} dB below the tone");
+    assert!(rejection >= 40.0, "pilot only {rejection} dB down");
+}

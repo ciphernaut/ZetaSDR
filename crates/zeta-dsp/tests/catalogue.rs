@@ -69,6 +69,29 @@ async fn wfm_fixture_at_104_9_mhz_is_fm_broadcast_radio() {
 }
 
 #[tokio::test]
+async fn wfm_fixture_at_104_9_mhz_is_not_cbet() {
+    // CBET is a 2 kHz entry in 88-108 MHz modulated FM: a 150 kHz band is
+    // far off its bandwidth, and the modulation match alone must not name it.
+    let audio = tone(48_000, 48_000, 1_000.0, 0.9);
+    let mut iq = wfm_modulate(&audio, 48_000, WFM_RATE as u32, 75_000.0, 0.0, true);
+    awgn(&mut iq, 20.0, 21);
+    let labels = run(&iq, WFM_RATE, 104_900_000).await;
+    assert!(
+        labels
+            .iter()
+            .all(|l| !l.evidence.contains("catalogue cbet")),
+        "{labels:?}"
+    );
+    for layer1 in ["wfm", "fm"] {
+        let direct = catalogue_labels(104_900_000, 150_000, layer1);
+        assert!(
+            direct.iter().all(|l| l.name != "CBET"),
+            "{layer1}: {direct:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn catalogue_does_not_match_nbfm_in_the_broadcast_band() {
     // The plan-2 12.5 kHz channel fixture: 1 kHz tone, 2.5 kHz deviation.
     let audio = tone(48_000, 48_000, 1_000.0, 1.0);
