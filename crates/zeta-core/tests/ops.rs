@@ -1490,3 +1490,36 @@ fn nullable_fields_have_null_in_schema_type() {
         "oneOf/0 is OutOfRange"
     );
 }
+
+#[test]
+fn wfm_expansion_is_channel_then_wfm_demod() {
+    assert_eq!(JobKind::WfmDemod.name(), "wfm_demod");
+    assert_eq!(
+        serde_json::to_value(JobKind::WfmDemod).unwrap(),
+        serde_json::json!("wfm_demod")
+    );
+    let tuning = Tuning {
+        center_hz: Hz(104_900_000),
+        bandwidth_hz: Hz(200_000),
+    };
+    for (deviation, want) in [(None, 75_000), (Some(Hz(50_000)), 50_000)] {
+        let g = JobKind::WfmDemod
+            .expand(&SourceId("b210".into()), tuning, Hz(1_000_000), deviation)
+            .unwrap();
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.nodes[0].kind, "channel");
+        assert_eq!(
+            g.nodes[0].params,
+            serde_json::json!({"center_hz": 104_900_000, "bandwidth_hz": 200_000, "out_rate_hz": 200_000})
+        );
+        assert_eq!(g.nodes[1].kind, "wfm_demod");
+        assert_eq!(
+            g.nodes[1].params,
+            serde_json::json!({"deviation_hz": want, "audio_rate_hz": 48_000, "deemphasis_us": 50})
+        );
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(g.edges[0].from, g.nodes[0].id);
+        assert_eq!(g.edges[0].to, g.nodes[1].id);
+        assert_eq!(g.edges[0].kind, StreamKind::Iq);
+    }
+}

@@ -290,8 +290,8 @@ pub enum JobCmd {
         kind: Kind,
         #[command(flatten)]
         band: BandArgs,
-        /// FM peak deviation in Hz (100..=75000), fm_demod only; absent = the
-        /// kind's default (5000)
+        /// FM peak deviation in Hz (100..=75000), fm_demod and wfm_demod only;
+        /// absent = the kind's default (5000 for fm_demod, 75000 for wfm_demod)
         #[arg(long, value_name = "HZ")]
         deviation_hz: Option<u64>,
         /// After starting, tail the job's first event (else audio) stream, stop
@@ -391,6 +391,8 @@ pub enum Kind {
     // Spelled as on the wire, not clap's default `fm-demod`.
     #[value(name = "fm_demod")]
     FmDemod,
+    #[value(name = "wfm_demod")]
+    WfmDemod,
     #[value(name = "aprs_decode")]
     AprsDecode,
     Measure,
@@ -402,6 +404,7 @@ impl From<Kind> for JobKind {
             Kind::Passthrough => JobKind::Passthrough,
             Kind::Spectrum => JobKind::Spectrum,
             Kind::FmDemod => JobKind::FmDemod,
+            Kind::WfmDemod => JobKind::WfmDemod,
             Kind::AprsDecode => JobKind::AprsDecode,
             Kind::Measure => JobKind::Measure,
         }

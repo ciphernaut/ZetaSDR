@@ -1,4 +1,4 @@
-//! Synthetic signal generators for tests: NBFM, AFSK1200 / AX.25 / APRS, AWGN.
+//! Synthetic signal generators for tests: NBFM, WFM, AFSK1200 / AX.25 / APRS, AWGN.
 //! Behind feature `test-fixtures`.
 
 use std::f64::consts::PI;
@@ -38,6 +38,29 @@ pub fn nbfm_modulate(
         phase = phase.rem_euclid(2.0 * PI);
     }
     out
+}
+
+/// Broadcast-style FM: [`nbfm_modulate`] of `audio` with, when `pilot`, a
+/// 19 kHz stereo pilot at amplitude 0.1 added to it first. `audio_rate_hz`
+/// must be at least 48 kHz so the pilot is below its Nyquist.
+pub fn wfm_modulate(
+    audio: &[f32],
+    audio_rate_hz: u32,
+    iq_rate_hz: u32,
+    deviation_hz: f64,
+    offset_hz: f64,
+    pilot: bool,
+) -> Vec<Complex<f32>> {
+    assert!(
+        audio_rate_hz >= 48_000,
+        "wfm_modulate: audio rate {audio_rate_hz} Hz is below 48 kHz"
+    );
+    if !pilot {
+        return nbfm_modulate(audio, audio_rate_hz, iq_rate_hz, deviation_hz, offset_hz);
+    }
+    let p = tone(audio_rate_hz, audio.len(), 19_000.0, 0.1);
+    let mixed: Vec<f32> = audio.iter().zip(&p).map(|(a, b)| a + b).collect();
+    nbfm_modulate(&mixed, audio_rate_hz, iq_rate_hz, deviation_hz, offset_hz)
 }
 
 /// `len` samples of `amp * sin(2 pi freq_hz n / rate_hz)`.

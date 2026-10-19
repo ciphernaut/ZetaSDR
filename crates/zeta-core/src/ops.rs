@@ -53,8 +53,9 @@ pub enum Op {
         source: SourceId,
         center_hz: Hz,
         bandwidth_hz: Hz,
-        /// FM peak deviation in Hz (100..=75000) for `fm_demod`; `null` is the
-        /// kind's default (5000). Any other kind must pass `null`.
+        /// FM peak deviation in Hz (100..=75000) for `fm_demod` and
+        /// `wfm_demod`; `null` is the kind's default (5000 for `fm_demod`,
+        /// 75000 for `wfm_demod`). Any other kind must pass `null`.
         #[serde(deserialize_with = "nullable_u64")]
         #[schemars(required, schema_with = "nullable_hz_u64")]
         deviation_hz: Option<u64>,
@@ -124,7 +125,7 @@ fn nullable_hz_u64(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         "type": ["integer", "null"],
         "format": "uint64",
         "minimum": 0,
-        "description": "FM peak deviation in Hz (100..=75000) for `fm_demod`; `null` is the kind's default (5000). Any other kind must pass `null`."
+        "description": "FM peak deviation in Hz (100..=75000) for `fm_demod` and `wfm_demod`; `null` is the kind's default (5000 for `fm_demod`, 75000 for `wfm_demod`). Any other kind must pass `null`."
     })
 }
 
@@ -138,11 +139,15 @@ fn nullable_string(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 
 /// `fm_demod` peak deviation when a job start passes `null`.
 pub const FM_DEVIATION_DEFAULT_HZ: u64 = 5_000;
+/// `wfm_demod` peak deviation when a job start passes `null` (broadcast FM).
+pub const WFM_DEVIATION_DEFAULT_HZ: u64 = 75_000;
+/// `wfm_demod` de-emphasis time constant, µs (Australia and Europe).
+pub const WFM_DEEMPHASIS_US: u64 = 50;
 const FM_DEVIATION_MIN_HZ: u64 = 100;
 const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 
-/// Built-in job kinds; each expands to a graph. `fm_demod` and `aprs_decode`
-/// channelise the job band at the narrowest exact divisor of the source rate
+/// Built-in job kinds; each expands to a graph. `fm_demod`, `wfm_demod` and
+/// `aprs_decode` channelise the job band at the narrowest exact divisor of the source rate
 /// that is at least 48 kHz and at least the band; `spectrum` covers the whole
 /// capture band. `measure` channelises the job band the same way and
 /// measures only that band, reporting its absolute `center_hz`.
@@ -152,6 +157,7 @@ pub enum JobKind {
     Passthrough,
     Spectrum,
     FmDemod,
+    WfmDemod,
     AprsDecode,
     Measure,
 }
@@ -163,6 +169,7 @@ impl JobKind {
             JobKind::Passthrough => "passthrough",
             JobKind::Spectrum => "spectrum",
             JobKind::FmDemod => "fm_demod",
+            JobKind::WfmDemod => "wfm_demod",
             JobKind::AprsDecode => "aprs_decode",
             JobKind::Measure => "measure",
         }
@@ -172,7 +179,7 @@ impl JobKind {
     fn channelised(&self) -> bool {
         matches!(
             self,
-            JobKind::FmDemod | JobKind::AprsDecode | JobKind::Measure
+            JobKind::FmDemod | JobKind::WfmDemod | JobKind::AprsDecode | JobKind::Measure
         )
     }
 
@@ -267,6 +274,37 @@ impl JobKind {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
                             params: serde_json::json!({"deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0), "audio_rate_hz": AUDIO_RATE_HZ}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: demod,
+                        kind: StreamKind::Iq,
+                    }],
+                }
+            }
+            JobKind::WfmDemod => {
+                let (channel, demod) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": out,
+                            }),
+                        },
+                        GraphNode {
+                            id: demod.clone(),
+                            kind: "wfm_demod".into(),
+                            params: serde_json::json!({
+                                "deviation_hz": deviation_hz.map_or(WFM_DEVIATION_DEFAULT_HZ, |d| d.0),
+                                "audio_rate_hz": AUDIO_RATE_HZ,
+                                "deemphasis_us": WFM_DEEMPHASIS_US,
+                            }),
                         },
                     ],
                     edges: vec![Edge {
@@ -926,10 +964,10 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
         } => {
             let deviation = match deviation_hz {
                 None => None,
-                Some(_) if kind != JobKind::FmDemod => {
+                Some(_) if !matches!(kind, JobKind::FmDemod | JobKind::WfmDemod) => {
                     return Err(OpError::Other {
                         message: format!(
-                            "deviation_hz applies only to kind fm_demod; pass null (kind is {})",
+                            "deviation_hz applies only to kinds fm_demod and wfm_demod; pass null (kind is {})",
                             kind.name()
                         ),
                     });

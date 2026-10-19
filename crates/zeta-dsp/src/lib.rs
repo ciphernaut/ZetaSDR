@@ -22,6 +22,7 @@ pub mod measure;
 pub mod nbfm;
 pub mod resample;
 pub mod util;
+pub mod wfm;
 
 #[cfg(feature = "test-fixtures")]
 pub mod fixtures;
@@ -37,6 +38,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
         reg.register(Arc::new(fft::FftStage::new(Arc::new(gpu))));
     }
     reg.register(Arc::new(nbfm::NbfmDemodStage::new()));
+    reg.register(Arc::new(wfm::WfmDemodStage::new()));
     reg.register(Arc::new(aprs::AprsDecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
 }

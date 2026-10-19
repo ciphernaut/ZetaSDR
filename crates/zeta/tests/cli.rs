@@ -1056,3 +1056,47 @@ fn serve_warns_when_llm_flags_are_given_without_listen() {
     let seen = serve_banner(dir.path(), &[], &env);
     assert!(!seen.contains("ignored without --listen"), "{seen}");
 }
+
+#[test]
+fn wfm_demod_job_streams_48k_audio_from_a_wfm_fixture() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = zeta_dsp::fixtures::tone(48_000, 48_000, 1_000.0, 0.5);
+    let iq = zeta_dsp::fixtures::wfm_modulate(&audio, 48_000, 240_000, 75_000.0, 0.0, true);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "wfm", &iq, 240_000, 104_900_000);
+    let src = format!("wfm={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "wfm_demod",
+            "--source",
+            "wfm",
+            "--center-hz",
+            "104900000",
+            "--bandwidth-hz",
+            "200000",
+            "--then-tail",
+            "3,8000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v[0]["result"], "job", "{v}");
+    assert_eq!(v[1]["result"], "frames", "{v}");
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 3, "{v}");
+    for f in frames {
+        assert_eq!(f["kind"], "audio", "{f}");
+        assert_eq!(f["payload"]["sample_rate_hz"], 48_000, "{f}");
+        let peak = f["payload"]["peak"].as_f64().unwrap();
+        assert!(peak > 0.05 && peak <= 1.0, "peak {peak}");
+    }
+}

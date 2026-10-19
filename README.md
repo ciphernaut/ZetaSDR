@@ -57,11 +57,12 @@ fails if the committed file has drifted.
 
 ## DSP
 
-Five job kinds, chosen with `job start --kind` (`zeta job start --help` lists them):
+Six job kinds, chosen with `job start --kind` (`zeta job start --help` lists them):
 
 - `passthrough` copies the channel IQ through unchanged.
 - `spectrum` emits one power-spectrum event per 100 ms frame (`size` 1024, `bin_hz`, `db` array).
 - `fm_demod` channelises and demodulates narrowband FM to an audio stream (48 kHz, per-frame `peak`).
+- `wfm_demod` does the same for wideband broadcast FM: 75 kHz deviation, 50 µs de-emphasis, 15 kHz mono audio at 48 kHz.
 - `aprs_decode` demodulates AFSK 1200 and HDLC-deframes AX.25, emitting one event per CRC-valid packet.
 - `measure` emits one layer-1 feature record per second of IQ (occupied band, SNR, burst, symbol rate, label).
 
