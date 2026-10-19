@@ -31,6 +31,7 @@
 //     ov.label(hz, {layer, name, confidence, evidence}, key = "") -> element
 //         "L<layer> <name> <confidence, 2 dp>" at the left edge at wf.yForHz(hz); one label
 //         per key (a job id), replaced on each call. `evidence` becomes its tooltip.
+//     ov.unlabel(key)        removes the label drawn under `key`, if any
 //     ov.jobRow(job, counter)  shows `counter` (when > 0) in that job's row `.events` cell
 //     ov.destroy()
 
@@ -122,11 +123,7 @@ class Overlays {
     if (rec.sub) rec.sub.close();
     this.watched.delete(jobId);
     this.counters.delete(jobId);
-    const label = this.labels.get(jobId);
-    if (label) {
-      label.el.remove();
-      this.labels.delete(jobId);
-    }
+    this.unlabel(jobId);
   }
 
   async lookupStream(jobId) {
@@ -264,6 +261,13 @@ class Overlays {
     l.h = l.el.offsetHeight;
     l.el.style.top = `${this.yFor(hz) - l.h / 2}px`;
     return l.el;
+  }
+
+  unlabel(key) {
+    const l = this.labels.get(key);
+    if (!l) return;
+    l.el.remove();
+    this.labels.delete(key);
   }
 
   // Re-places everything vertically (the band or the height changed).

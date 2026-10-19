@@ -1,5 +1,6 @@
 //! The web app's end-to-end scenarios (`crates/zeta-ui/tests/e2e/ui.py`, Playwright with
-//! headless Chromium) against a real `zeta serve` with the `tone` and `aprs` fixtures.
+//! headless Chromium) against a real `zeta serve` with the `tone` and `aprs` fixtures; the
+//! node's state directory is passed to ui.py in `ZETA_UI_STATE_DIR`.
 //!
 //! Skipped, with `ui e2e skipped: <reason>` on stdout, only when Playwright for `python3` or
 //! its Chromium is missing. `python3` runs without `-I`: Playwright is commonly installed in
@@ -64,6 +65,7 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let out = Command::new("python3")
         .arg("crates/zeta-ui/tests/e2e/ui.py")
         .args([&serve.url, SECRET])
+        .env("ZETA_UI_STATE_DIR", dir.path().join("state"))
         .current_dir(repo_root())
         .output()
         .expect("run ui.py");

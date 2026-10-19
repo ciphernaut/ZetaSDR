@@ -5,11 +5,13 @@ Usage: python3 ui.py <node-url> <secret> [scenario]
 Runs every `scenario_*` function (or only the one named, with or without the `scenario_`
 prefix) against a running `zeta serve`, each in a fresh browser context. Prints `PASS <name>`
 or `FAIL <name>: <reason>` (plus the browser console errors) and exits 1 on the first failure.
-Run by `cargo test -p zeta --test ui`, which starts the node with the `tone` and `aprs` fixtures.
+Run by `cargo test -p zeta --test ui`, which starts the node with the `tone` and `aprs` fixtures
+and passes the node's state directory in ZETA_UI_STATE_DIR.
 """
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -442,6 +444,91 @@ def scenario_transcript_hides_polls(page, url, secret):
     page.wait_for_timeout(2_500)
     expect(typed).to_have_count(1)
     expect(typed.locator(".count")).to_have_text("")
+
+
+# ---- context menu (Task 9) -----------------------------------------------------------------
+# Each stops the jobs it starts.
+
+def open_menu_on_tone(page, url, secret):
+    """Log in, show the tone and open the menu on a selection (see drag_menu)."""
+    show_tone_waterfall(page, url, secret)
+    # The layer-1 classifier needs about a second of a pure tone to call it a carrier
+    # (shorter spans read the discriminator's edge transients as FM deviation).
+    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    return drag_menu(page)
+
+
+def drag_menu(page):
+    """Drag a selection over the middle fifth of the shown band (about 10 kHz around the
+    tone, as the measure job uses) across every painted column; the menu opens at the
+    pointer. Asserts the footer and a span of at least 1 s. Returns the #ctx locator."""
+    box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
+    x0, x1 = box["x"] + 40, box["x"] + box["width"] - 20
+    y0, y1 = box["y"] + box["height"] * 0.40, box["y"] + box["height"] * 0.60
+    page.mouse.move(x0, y0)
+    page.mouse.down()
+    page.mouse.move(x1, y1, steps=6)
+    page.mouse.up()
+    menu = page.locator("#ctx")
+    expect(menu).to_be_visible()
+    footer = page.locator("#ctx-footer").text_content()
+    m = re.search(r"center_hz=\d+ bandwidth_hz=\d+ start_ns=(\d+) end_ns=(\d+)", footer)
+    assert m, f"footer {footer!r}"
+    assert int(m.group(2)) - int(m.group(1)) >= 1_000_000_000, f"span under 1 s: {footer!r}"
+    return menu
+
+
+def scenario_what_is_this_classifies(page, url, secret):
+    menu = open_menu_on_tone(page, url, secret)
+    # Escape closes it; a new drag opens it again.
+    page.keyboard.press("Escape")
+    expect(menu).to_be_hidden()
+    menu = drag_menu(page)
+    page.click('#ctx .ctx-item[data-action="classify"]')
+    expect(menu).to_be_hidden()
+    line = page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
+    expect(line.first).to_be_visible(timeout=15_000)
+    label = page.locator("#waterfall .ov-label", has_text="carrier")
+    expect(label.first).to_be_visible()
+    expect(page.locator("#transcript .line", has_text="carrier").first).to_be_visible()
+
+
+def scenario_decode_starts_job_and_logs_op(page, url, secret):
+    menu = open_menu_on_tone(page, url, secret)
+    if os.environ.get("ZETA_UI_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "menu.png"))
+    page.click('#ctx .ctx-item[data-action="fm_demod"]')
+    expect(menu).to_be_hidden()
+    jobs = []
+    try:
+        expect(page.locator("#transcript .line.op", has_text="job_start kind=fm_demod")
+               .first).to_be_visible()
+        jobs = [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+                if j["kind"] == "fm_demod" and j["source"] == "tone"
+                and j["state"]["status"] == "running"]
+        assert len(jobs) == 1, f"fm_demod jobs on tone: {jobs}"
+    finally:
+        for j in jobs:
+            stop_job(url, secret, j["id"])
+
+
+def scenario_save_sigmf(page, url, secret):
+    menu = open_menu_on_tone(page, url, secret)
+    # A click elsewhere closes it.
+    page.mouse.click(5, 5)
+    expect(menu).to_be_hidden()
+    menu = drag_menu(page)
+    page.click('#ctx .ctx-item[data-action="iq_read"]')
+    expect(menu).to_be_hidden()
+    line = page.locator("#transcript .line", has_text=re.compile(r"\.sigmf-meta$"))
+    expect(line.first).to_be_visible(timeout=15_000)
+    path = re.search(r"(/\S+\.sigmf-meta)$", line.first.text_content()).group(1)
+    assert os.path.isfile(path), f"{path} does not exist"
+    state = os.environ.get("ZETA_UI_STATE_DIR")
+    assert state, "ZETA_UI_STATE_DIR not set"
+    assert os.path.realpath(path).startswith(os.path.realpath(state) + os.sep), \
+        f"{path} not under {state}"
+    assert os.path.isfile(path[:-len(".sigmf-meta")] + ".sigmf-data"), f"no data beside {path}"
 
 
 # ---- runner ----------------------------------------------------------------------------

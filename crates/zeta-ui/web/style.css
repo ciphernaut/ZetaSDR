@@ -224,3 +224,37 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   z-index: 10;
   box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
 }
+
+/* Context menu on a waterfall selection (menu.js). */
+#ctx {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 240px;
+  max-width: calc(100vw - 16px);
+  padding: 4px;
+  background: var(--bar);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+}
+#ctx .ctx-item {
+  text-align: left;
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 4px 8px;
+}
+#ctx .ctx-item:hover, #ctx .ctx-item:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  outline: none;
+}
+#ctx-footer {
+  margin-top: 4px;
+  padding: 4px 8px 2px;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}

@@ -20,13 +20,17 @@
 // list (they watch the selected source's running jobs), and in the narrow footprint every
 // /ask answer also becomes an `agent` ribbon at the centre of the band shown.
 //
-// Exports `state` ({api, transcript, jobs, wf, ov, sources, selected}) and `onSourceChange(fn)` for
+// A drag on the waterfall opens the context menu (menu.js), whose entries go through the same
+// op and /ask paths as the command line.
+//
+// Exports `state` ({api, transcript, jobs, wf, ov, menu, sources, selected}) and `onSourceChange(fn)` for
 // the later views (waterfall, audio, voice).
 
 import { connect, Unauthorized } from "./api.js";
 import { Transcript, startJobs, startOpsFeed } from "./agent.js";
 import { mountWaterfall } from "./waterfall.js";
 import { mountOverlays } from "./overlays.js";
+import { mountMenu } from "./menu.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -39,6 +43,7 @@ export const state = {
   ops: null,
   wf: null,
   ov: null,
+  menu: null,
   sources: [],
   selected: null,
 };
@@ -207,25 +212,31 @@ function notApplied(e) {
   return e.json.error === "other" && /^invalid operation/.test(e.json.message || "");
 }
 
-async function runCommand(text) {
+// Applies `op` as typed by the user (command line or context menu); its outcome reaches the
+// transcript through the ops stream. The result JSON, or null when it failed.
+async function applyOp(op) {
+  const t = state.transcript;
+  if (!state.api) return null;
+  // Its ops-stream record shows even when it is one of the hidden polls (ruling R5).
+  t.typed(op.op);
+  let result = null;
+  try {
+    result = await state.api.op(op);
+  } catch (e) {
+    if (notApplied(e)) {
+      t.untyped(op.op);
+      t.note(`${op.op}: ${e.message}`, true);
+    }
+  }
+  state.jobs?.refresh();
+  return result;
+}
+
+// Sends `text` to /ask and shows the answer (or the error, e.g. no LLM configured).
+async function askAgent(text) {
   const t = state.transcript;
   if (!state.api) return;
-  const op = parseOp(text);
   t.user(text);
-  if (op) {
-    // Its ops-stream record shows even when it is one of the hidden polls (ruling R5).
-    t.typed(op.op);
-    try {
-      await state.api.op(op);
-    } catch (e) {
-      if (notApplied(e)) {
-        t.untyped(op.op);
-        t.note(`${op.op}: ${e.message}`, true);
-      }
-    }
-    state.jobs?.refresh();
-    return;
-  }
   try {
     const r = await state.api.ask(text);
     t.assistant(r.answer ?? "(no answer)");
@@ -233,6 +244,17 @@ async function runCommand(text) {
     t.assistant(e.message, true);
   }
   state.jobs?.refresh();
+}
+
+async function runCommand(text) {
+  if (!state.api) return;
+  const op = parseOp(text);
+  if (op) {
+    state.transcript.user(text);
+    await applyOp(op);
+  } else {
+    await askAgent(text);
+  }
 }
 
 function wireCommandLine() {
@@ -277,6 +299,12 @@ function start(api) {
   state.wf = mountWaterfall($("#waterfall"), api);
   state.ov = mountOverlays($("#waterfall"), state.wf, api, { jobsEl: $("#jobs") });
   state.ov.setSource(state.selected);
+  state.menu = mountMenu(state.wf, {
+    applyOp,
+    ask: askAgent,
+    transcript: state.transcript,
+    ov: state.ov,
+  });
   state.transcript.onAssistant((text, error) => {
     if (!error && footprint() === "narrow") answerRibbon(text);
   });
@@ -293,11 +321,13 @@ function logout(api) {
   api.onUnauthorized = null;
   if (state.ops) state.ops.close();
   if (state.jobs) state.jobs.close();
+  if (state.menu) state.menu.destroy();
   if (state.ov) state.ov.destroy();
   if (state.wf) state.wf.destroy();
   state.ops = null;
   state.jobs = null;
   state.ov = null;
+  state.menu = null;
   state.wf = null;
   store(SECRET_KEY, null);
   showLogin("secret rejected");

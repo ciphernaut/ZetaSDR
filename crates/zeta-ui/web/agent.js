@@ -5,7 +5,8 @@
 //       One `ops` stream payload ({op, outcome, result|error, elapsed_ms}) as a transcript
 //       line: `source_list → ok (2 sources)`,
 //       `job_start kind=measure source=tone center_hz=100000000 … → job 01…`,
-//       `job_start … → out_of_range field=center_hz …` (error: true).
+//       `job_start … → out_of_range field=center_hz … suggested=…` (error: true; the
+//       corrective `suggested` value when the node offers one).
 //   class Transcript(el)
 //       .op(payload)            append formatOp(payload); a line equal to the last one is
 //                               folded into it with a ×N count. Ok outcomes of the read-only
@@ -75,6 +76,10 @@ function resultText(r) {
       return `ok (${plural(v.length, "stream")})`;
     case "frames":
       return `ok (${plural((v && v.frames ? v.frames.length : 0), "frame")})`;
+    case "labels":
+      return `ok (${plural(Array.isArray(v) ? v.length : 0, "label")})`;
+    case "iq":
+      return `ok (${plural(v && v.samples ? v.samples : 0, "sample")})`;
     default:
       return `ok (${r.result})`;
   }
@@ -89,6 +94,7 @@ function errorText(e) {
   } else if (e.value !== undefined) {
     parts.push(`value=${e.value}`);
   }
+  if (e.suggested !== undefined && e.suggested !== null) parts.push(`suggested=${e.suggested}`);
   if (e.message) parts.push(e.message);
   if (e.detail !== undefined) parts.push(typeof e.detail === "string" ? e.detail : JSON.stringify(e.detail));
   return parts.join(" ");
