@@ -6,12 +6,15 @@ Runs every `scenario_*` function (or only the one named, with or without the `sc
 prefix) against a running `zeta serve`, each in a fresh browser context. Prints `PASS <name>`
 or `FAIL <name>: <reason>` (plus the browser console errors) and exits 1 on the first failure.
 Run by `cargo test -p zeta --test ui`, which starts the node with the `tone` and `aprs` fixtures
-and passes the node's state directory in ZETA_UI_STATE_DIR.
+and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
+state directory in ZETA_UI_STATE_DIR, and the URL of a second node started without a speech
+daemon in ZETA_UI_URL_NOSTT (for the "no daemon" scenario).
 """
 
 import json
 import os
 import re
+import struct
 import sys
 import time
 import urllib.request
@@ -657,6 +660,73 @@ def scenario_audio_play_opens_binary_socket(page, url, secret):
         assert page.evaluate("window.zetaAudio.playing") is None, "still playing after ■"
     finally:
         stop_job(url, secret, job)
+
+
+# ---- voice (Task 11) -----------------------------------------------------------------------
+
+SPOKEN = "what sources are there"
+
+
+def record_and_stop(page, hold_ms):
+    """Click #mic, check it records (red dot) for `hold_ms`, then click it again."""
+    mic = page.locator("#mic")
+    expect(mic).to_be_enabled()
+    mic.click()
+    expect(mic).to_have_class(re.compile(r"\brecording\b"))
+    page.wait_for_timeout(hold_ms)
+    mic.click()
+    expect(mic).not_to_have_class(re.compile(r"\brecording\b"))
+
+
+def scenario_mic_round_trip(page, url, secret):
+    page.set_viewport_size(WIDE)
+    login(page, url, secret)
+    expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
+    is_post = lambda path: lambda r: r.method == "POST" and r.url.endswith(path)  # noqa: E731
+    with page.expect_request(is_post("/stt")) as stt_req, \
+            page.expect_request(is_post("/ask")) as ask_req:
+        record_and_stop(page, 1000)
+    # The upload is a 16 kHz mono s16le WAV with a 44-byte header, about 1 s long.
+    wav = stt_req.value.post_data_buffer
+    assert stt_req.value.headers.get("content-type") == "audio/wav", stt_req.value.headers
+    assert wav[:4] == b"RIFF" and wav[8:16] == b"WAVEfmt ", f"header {wav[:16]!r}"
+    fmt, channels, rate, byte_rate, align, bits = struct.unpack("<HHIIHH", wav[20:36])
+    assert (fmt, channels, rate, byte_rate, align, bits) == (1, 1, 16_000, 32_000, 2, 16), \
+        f"fmt {(fmt, channels, rate, byte_rate, align, bits)}"
+    assert wav[36:40] == b"data", f"data tag {wav[36:40]!r}"
+    data_len = struct.unpack("<I", wav[40:44])[0]
+    assert data_len == len(wav) - 44 and struct.unpack("<I", wav[4:8])[0] == 36 + data_len
+    seconds = data_len / 32_000
+    assert 0.5 <= seconds <= 3.0, f"recorded {seconds:.2f} s for a 1 s hold"
+    assert any(wav[44:]), "the fake microphone's tone recorded as silence"
+    # The transcript went through the command line (it is in its history) to /ask.
+    assert json.loads(ask_req.value.post_data)["request"] == SPOKEN, ask_req.value.post_data
+    expect(page.locator("#transcript .line.user", has_text=SPOKEN)).to_be_visible()
+    expect(page.locator("#transcript .line.assistant.error")).to_contain_text("--llm-url")
+    page.focus("#cmd")
+    page.keyboard.press("ArrowUp")
+    expect(page.locator("#cmd")).to_have_value(SPOKEN)
+    expect(page.locator("#mic-status")).to_have_text("")
+    expect(page.locator("#mic")).to_be_enabled()
+
+
+def scenario_mic_without_daemon_shows_message(page, url, secret):
+    nostt = os.environ.get("ZETA_UI_URL_NOSTT")
+    assert nostt, "ZETA_UI_URL_NOSTT (a node without --stt-socket) is not set"
+    page.set_viewport_size(WIDE)
+    login(page, nostt.rstrip("/"), secret)
+    asks = []
+    page.on("request", lambda r: asks.append(r.url) if r.url.endswith("/ask") else None)
+    with page.expect_response(lambda r: r.url.endswith("/stt")) as stt_resp:
+        record_and_stop(page, 500)
+    assert stt_resp.value.status == 503, f"/stt answered {stt_resp.value.status}"
+    expect(page.locator("#mic-status")).to_have_text("no speech daemon on this node")
+    # The button stays usable for a retry, and nothing went to /ask.
+    expect(page.locator("#mic")).to_be_enabled()
+    page.wait_for_timeout(300)
+    assert not asks, f"/ask requested without a transcript: {asks}"
+    record_and_stop(page, 300)
+    expect(page.locator("#mic-status")).to_have_text("no speech daemon on this node")
 
 
 # ---- runner ----------------------------------------------------------------------------

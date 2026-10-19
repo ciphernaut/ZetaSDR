@@ -38,7 +38,9 @@
     <span class="prompt">›</span>
     <input id="cmd" type="text" spellcheck="false" autocomplete="off"
            placeholder='ask, or an op as JSON: {"op":"source_list"}  (Ctrl-K)'>
-    <button id="mic" type="button" disabled title="voice input (not yet)">mic</button>
+    <button id="mic" type="button" disabled aria-pressed="false"
+            title="voice input (local speech daemon)"><span class="dot"></span>mic</button>
+    <span id="mic-status" role="status"></span>
   </footer>
 </div>
 </body>

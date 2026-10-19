@@ -15,6 +15,8 @@
 //     api.op(obj) -> Promise<result JSON>              POST /op; throws OpError (with .json)
 //     api.ask(text, maxTurns = 8) -> Promise<Transcript>  POST /ask {request, max_turns};
 //         throws OpError (503 with {"error":"other","message":...} when serve has no LLM)
+//     api.stt(wav) -> Promise<{text}>   POST /stt with the WAV bytes (ArrayBuffer) as
+//         `Content-Type: audio/wav`; throws OpError (503 when serve has no speech daemon)
 //     api.health() -> Promise<{status, version, uptime_s, ws_connections}>
 //     api.streams() -> Promise<[{id, kind, provenance}]>   GET /streams (not an op)
 //     api.streamText(id, onMessage, onClose, {reconnect = true, onReconnect}) -> {close}
@@ -86,13 +88,14 @@ export class Api {
     this.onUnauthorized = null;
   }
 
-  async #request(method, path, body) {
+  // `body` is sent as JSON, or as is when `type` names its Content-Type.
+  async #request(method, path, body, type = null) {
     const headers = { Authorization: "Bearer " + this.secret };
-    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if (body !== undefined) headers["Content-Type"] = type || "application/json";
     const resp = await fetch(this.base + path, {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body === undefined || type ? body : JSON.stringify(body),
     });
     const json = await replyJson(resp);
     if (resp.status === 401) {
@@ -109,6 +112,10 @@ export class Api {
 
   ask(text, maxTurns = 8) {
     return this.#request("POST", "/ask", { request: text, max_turns: maxTurns });
+  }
+
+  stt(wav) {
+    return this.#request("POST", "/stt", wav, "audio/wav");
   }
 
   health() {

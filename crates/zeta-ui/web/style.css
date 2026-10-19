@@ -207,6 +207,18 @@ input:focus { border-color: var(--accent); }
 }
 .prompt { color: var(--accent); }
 #cmd { flex: 1; min-width: 0; }
+/* The mic button's dot turns red while recording (the mockup's `vox` dot). */
+#mic { display: inline-flex; align-items: center; gap: 5px; }
+#mic .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dim);
+}
+#mic.recording { border-color: var(--error); }
+#mic.recording .dot { background: var(--error); box-shadow: 0 0 6px var(--error); }
+#mic-status { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
+#mic-status:empty { display: none; }
 
 /* ---- narrow: the side pane becomes a drawer ---- */
 html[data-footprint="narrow"] #app {

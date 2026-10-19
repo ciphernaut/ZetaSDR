@@ -33,10 +33,22 @@ impl ServeProc {
 
     /// [`ServeProc::start_with`] with extra environment variables.
     pub fn start_env(dir: &Path, secret: &str, extra: &[&str], env: &[(&str, &str)]) -> ServeProc {
+        ServeProc::start_full(dir, secret, extra, &[], env)
+    }
+
+    /// [`ServeProc::start_env`] with `serve_extra` flags after `serve` (e.g. `--stt-socket`).
+    pub fn start_full(
+        dir: &Path,
+        secret: &str,
+        extra: &[&str],
+        serve_extra: &[&str],
+        env: &[(&str, &str)],
+    ) -> ServeProc {
         let meta = write_tone(dir);
         let mut child = Command::new(env!("CARGO_BIN_EXE_zeta"))
             .env_remove("ZETA_NODE")
             .env_remove("ZETA_SECRET")
+            .env_remove("ZETA_STT_SOCKET")
             .envs(env.iter().copied())
             .arg("--state-dir")
             .arg(dir.join("state"))
@@ -44,6 +56,7 @@ impl ServeProc {
             .arg(format!("tone={}", meta.display()))
             .args(extra)
             .args(["serve", "--listen", "127.0.0.1:0", "--secret", secret])
+            .args(serve_extra)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

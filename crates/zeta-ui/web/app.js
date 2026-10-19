@@ -27,7 +27,11 @@
 // and it stops when the job leaves the running list or the secret is rejected); `graph` opens
 // the job's graph view (graph.js).
 //
-// Exports `state` ({api, transcript, jobs, wf, ov, menu, audio, sources, selected}) and `onSourceChange(fn)` for
+// The mic button (#mic, voice.js) is mounted at login: its transcript is put in the command
+// line and submitted as if typed (so free text goes to /ask); #mic-status beside it shows
+// failures such as a node without a speech daemon.
+//
+// Exports `state` ({api, transcript, jobs, wf, ov, menu, audio, mic, sources, selected}) and `onSourceChange(fn)` for
 // the later views (waterfall, audio, voice).
 
 import { connect, Unauthorized } from "./api.js";
@@ -37,6 +41,7 @@ import { mountOverlays } from "./overlays.js";
 import { mountMenu } from "./menu.js";
 import { playJob } from "./audio.js";
 import { closeGraph, showGraph } from "./graph.js";
+import { mountMic } from "./voice.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -51,6 +56,7 @@ export const state = {
   ov: null,
   menu: null,
   audio: null, // {jobId, player}
+  mic: null,
   sources: [],
   selected: null,
 };
@@ -264,16 +270,22 @@ async function runCommand(text) {
   }
 }
 
+// Submits what the command line holds (Enter, or a voice transcript put there).
+function submitCommand() {
+  const cmd = $("#cmd");
+  const text = cmd.value.trim();
+  if (!text) return;
+  history.push(text);
+  historyAt = history.length;
+  cmd.value = "";
+  runCommand(text);
+}
+
 function wireCommandLine() {
   const cmd = $("#cmd");
   cmd.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
-      const text = cmd.value.trim();
-      if (!text) return;
-      history.push(text);
-      historyAt = history.length;
-      cmd.value = "";
-      runCommand(text);
+      submitCommand();
     } else if (ev.key === "ArrowUp" && historyAt > 0) {
       historyAt -= 1;
       cmd.value = history[historyAt];
@@ -324,6 +336,10 @@ function start(api) {
     onGraph: (job) => showGraph(api, job.id),
     playing: (id) => !!state.audio && state.audio.jobId === id,
   });
+  state.mic = mountMic($("#mic"), api, (text) => {
+    $("#cmd").value = text;
+    submitCommand();
+  });
   loadSources();
 }
 
@@ -334,6 +350,7 @@ function logout(api) {
   api.onUnauthorized = null;
   stopAudio();
   closeGraph();
+  if (state.mic) state.mic.destroy();
   if (state.ops) state.ops.close();
   if (state.jobs) state.jobs.close();
   if (state.menu) state.menu.destroy();
@@ -344,6 +361,7 @@ function logout(api) {
   state.ov = null;
   state.menu = null;
   state.wf = null;
+  state.mic = null;
   store(SECRET_KEY, null);
   showLogin("secret rejected");
 }
