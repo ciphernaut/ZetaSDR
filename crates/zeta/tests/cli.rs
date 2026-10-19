@@ -956,3 +956,56 @@ fn source_vrt_non_lan_address_is_usage_error() {
         .stderr(contains("not a LAN address"))
         .stderr(contains("ID=udp://ADDR:PORT"));
 }
+
+/// `serve` stopped by SIGTERM (systemd stop) shuts down like Ctrl-C: it exits 0 and
+/// releases the remote node's `passthrough` job.
+#[test]
+fn serve_sigterm_releases_remote_lease() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let node_a = common::ServeProc::start(a.path(), NODE_SECRET);
+    let mut node_b = common::ServeProc::start_env(
+        b.path(),
+        NODE_SECRET,
+        &["--source-node", &format!("pi=tone@{}", node_a.url)],
+        &[("ZETA_NODE_SECRET_PI", NODE_SECRET)],
+    );
+    common::zeta_remote(
+        &node_b.url,
+        NODE_SECRET,
+        &[
+            "job",
+            "start",
+            "--source",
+            "pi",
+            "--kind",
+            "measure",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ],
+    )
+    .timeout(std::time::Duration::from_secs(30))
+    .assert()
+    .success();
+    let running = common::zeta_remote(&node_a.url, NODE_SECRET, &["job", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&running);
+    assert!(
+        v["value"]
+            .as_array()
+            .expect("jobs")
+            .iter()
+            .any(|j| j["kind"] == "passthrough" && j["state"]["status"] == "running"),
+        "no running passthrough on node A: {v}"
+    );
+    let status = node_b
+        .terminate(std::time::Duration::from_secs(5))
+        .expect("serve exits within 5 s of SIGTERM");
+    assert!(status.success(), "serve exit status {status:?}");
+    assert_remote_passthrough_stopped(&node_a.url, "tone");
+}
