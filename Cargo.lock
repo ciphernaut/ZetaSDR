@@ -3906,6 +3906,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
+ "zeta-agent",
  "zeta-client",
  "zeta-core",
  "zeta-source-file",

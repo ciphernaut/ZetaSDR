@@ -6,12 +6,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zeta_agent::{
-    Agent, AgentConfig, Executor, LlmClient, LlmConfig, LocalExecutor, RemoteExecutor,
-};
-use zeta_client::{NodeClient, op_tools, system_prompt};
+use zeta_agent::{Executor, LlmConfig, LocalExecutor, RemoteExecutor, build_agent};
+use zeta_client::NodeClient;
 
-use crate::cli::AskArgs;
+use crate::cli::{AskArgs, LlmArgs};
 use crate::sources::{PluginSpec, SourceSpec};
 use crate::{agents_md, node_setup, serve_lock};
 
@@ -28,7 +26,11 @@ pub async fn run(
         Ok(r) => r,
         Err(e) => return fail(&e),
     };
-    let cfg = llm_config(&args);
+    let cfg = match llm_config(&args.llm) {
+        Ok(Some(c)) => c,
+        Ok(None) => return fail("--llm-url and --llm-model are required"),
+        Err(e) => return fail(&e),
+    };
     let max_turns = args.max_turns;
     match remote {
         Some(client) => {
@@ -73,26 +75,32 @@ async fn drive<E: Executor>(
     max_turns: u32,
     request: &str,
 ) -> ExitCode {
-    let llm = match LlmClient::new(cfg) {
-        Ok(l) => l,
+    let agent = match build_agent(cfg, exec, schema, md, max_turns) {
+        Ok(a) => a,
         Err(e) => return fail(&e.to_string()),
     };
-    let mut agent_cfg = AgentConfig::new(system_prompt(md), op_tools(schema, md));
-    agent_cfg.max_turns = max_turns;
-    match Agent::new(llm, exec, agent_cfg).run(request).await {
+    match agent.run(request).await {
         Ok(t) => print(serde_json::to_string_pretty(&t), 0),
         Err(f) => print(serde_json::to_string_pretty(&f), 1),
     }
 }
 
-fn llm_config(args: &AskArgs) -> LlmConfig {
-    let mut cfg = LlmConfig::new(args.llm_url.clone(), args.llm_model.clone());
+/// The model the flags name: `None` without `--llm-url` and `--llm-model`,
+/// an error with only one of them.
+pub fn llm_config(args: &LlmArgs) -> Result<Option<LlmConfig>, String> {
+    let (url, model) = match (&args.llm_url, &args.llm_model) {
+        (Some(url), Some(model)) => (url, model),
+        (None, None) => return Ok(None),
+        (Some(_), None) => return Err("--llm-url needs --llm-model".into()),
+        (None, Some(_)) => return Err("--llm-model needs --llm-url".into()),
+    };
+    let mut cfg = LlmConfig::new(url.clone(), model.clone());
     cfg.key = args.llm_key.clone();
     cfg.max_tokens = args.llm_max_tokens;
     cfg.thinking = args.llm_thinking;
     cfg.status_url = args.llm_status_url.clone();
     cfg.ready_timeout = Duration::from_secs(args.llm_ready_timeout_s);
-    cfg
+    Ok(Some(cfg))
 }
 
 /// The request text: the argument, or stdin when it is absent or `-`; trimmed, never empty.

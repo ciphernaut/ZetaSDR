@@ -227,6 +227,7 @@ async fn bind_refuses_non_lan() {
         secret: Secret::new("s3cret").unwrap(),
         agents_md: String::new(),
         limits: Limits::default(),
+        llm: None,
     };
     let err = bind(Arc::clone(&ts.node), cfg).await.err().unwrap();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);

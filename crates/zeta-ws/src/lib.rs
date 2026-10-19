@@ -1,6 +1,7 @@
 //! WebSocket transport for a ZetaSDR node.
 
 pub mod addr;
+mod ask;
 pub mod auth;
 pub mod http;
 pub mod stream;

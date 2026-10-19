@@ -22,13 +22,14 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use zeta_agent::LlmConfig;
 use zeta_client::parse_op;
 use zeta_core::node::Node;
 use zeta_core::ops::OpError;
 
 use crate::addr::is_lan;
 use crate::auth::{Secret, subprotocol_secret};
-use crate::{stream, ui};
+use crate::{ask, stream, ui};
 
 /// Resource limits sized for a Raspberry Pi.
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +41,8 @@ pub struct Limits {
     pub ws_send_timeout: Duration,
     pub auth_fail_delay: Duration,
     pub ws_max_message_bytes: usize,
+    /// Longest `POST /ask` agent run.
+    pub ask_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -52,6 +55,7 @@ impl Default for Limits {
             ws_send_timeout: Duration::from_secs(5),
             auth_fail_delay: Duration::from_millis(250),
             ws_max_message_bytes: 64 << 10,
+            ask_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -61,6 +65,8 @@ pub struct ServerConfig {
     pub secret: Secret,
     pub agents_md: String,
     pub limits: Limits,
+    /// The model `POST /ask` runs; `None` answers 503.
+    pub llm: Option<LlmConfig>,
 }
 
 /// A snapshot of the server's counters.
@@ -132,6 +138,9 @@ pub(crate) struct AppState {
     pub(crate) stats: StatsHandle,
     pub(crate) started: Instant,
     pub(crate) agents_md: String,
+    pub(crate) llm: Option<LlmConfig>,
+    /// Held for the length of one `POST /ask` run.
+    pub(crate) ask_lock: tokio::sync::Mutex<()>,
 }
 
 pub(crate) type Shared = Arc<AppState>;
@@ -286,6 +295,7 @@ fn router(state: Shared) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/op", post(op))
+        .route("/ask", post(ask::ask))
         .route("/schema", get(schema))
         .route("/streams", get(streams))
         .route("/agents-md", get(agents_md))
@@ -332,6 +342,8 @@ pub async fn bind(node: Arc<Node>, cfg: ServerConfig) -> io::Result<Server> {
         stats: StatsHandle::default(),
         started: Instant::now(),
         agents_md: cfg.agents_md,
+        llm: cfg.llm,
+        ask_lock: tokio::sync::Mutex::new(()),
     });
     Ok(Server {
         listener,

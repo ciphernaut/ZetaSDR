@@ -113,6 +113,11 @@ pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCo
         Ok(a) => a,
         Err(e) => return usage(&e),
     };
+    let llm = match crate::ask::llm_config(&args.llm) {
+        Ok(l) => l,
+        Err(e) => return usage(&e),
+    };
+    let ask_model = llm.as_ref().map(|l| l.model.clone());
     let secret_text = secret.unwrap_or_default();
     let secret = match Secret::new(secret_text) {
         Ok(s) => s,
@@ -123,12 +128,16 @@ pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCo
         secret,
         agents_md: agents_md::rendering(),
         limits: Limits::default(),
+        llm,
     };
     let server = match bind(Arc::new(node), cfg).await {
         Ok(s) => s,
         Err(e) => return usage(&e.to_string()),
     };
     eprintln!("zeta: listening on {}", server.local_addr());
+    if let Some(model) = &ask_model {
+        eprintln!("zeta: POST /ask runs model {model}");
+    }
     if secret_text.chars().count() < MIN_SECRET_LEN {
         eprintln!("zeta: warning: secret shorter than {MIN_SECRET_LEN} characters");
     }
