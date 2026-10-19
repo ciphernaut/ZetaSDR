@@ -218,9 +218,9 @@ async fn four_channels_from_one_bank_each_get_their_tone() {
         eprintln!(
             "tone {f} Hz: {power_db:.2} dB, peak at {rel} bins, strongest other {other:.1} dB"
         );
-        // A unit tone; one between two bins' centres sits at the prototype's
-        // half-amplitude crossover (-6 dB).
-        assert!((-7.0..=0.5).contains(&power_db), "tone {f}: {power_db} dB");
+        // A unit tone, also when centred on the boundary between two bins
+        // (+0.5 and +2.5 MHz): the prototype is flat to 0.75 bin widths.
+        assert!((-1.0..=0.5).contains(&power_db), "tone {f}: {power_db} dB");
         assert!(rel.abs() <= 1, "tone {f}: peak {rel} bins from 0 Hz");
         assert!(other <= -50.0, "tone {f}: other component at {other} dB");
     }
@@ -333,6 +333,57 @@ async fn stopping_one_bank_consumer_leaves_the_others_gapless() {
     for r in rest {
         r.cancel.cancel();
         let _ = r.stage.await;
+        r.collect.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_out_rate_the_bin_rate_does_not_divide_uses_the_direct_path() {
+    // 2.4 Msps: 8 bins of 300 kHz, bin rate 600 kHz, which 48 kHz does not
+    // divide (a graph expanded for the source rate). The direct path serves it.
+    const R: u64 = 2_400_000;
+    let bank = PfbBankFactory
+        .make(Hz(R), Hz(CENTER))
+        .expect("2.4 Msps gets a bank");
+    assert_eq!(bank.bin_hz(), 300_000);
+    let bus = Arc::new(StreamBus::new(256));
+    let root = broadcast::channel(256).0;
+    let center = CENTER + 100_000;
+    let with = spawn(&bus, &root, Some(bank.clone()), center, 12_500, 48_000);
+    let without = spawn(&bus, &root, None, center, 12_500, 48_000);
+    until("both stages subscribed", || root.receiver_count() == 2).await;
+    assert_eq!(bank.consumers(), 0, "no bin subscription for 48 kHz");
+    let n = 10;
+    for i in 0..n {
+        let samples: Vec<Complex<f32>> = (0..BLOCK as u64)
+            .map(|k| {
+                let t = (i as u64 * BLOCK as u64 + k) as f64;
+                let ph = 2.0 * std::f64::consts::PI * (t * 101_000.0 / R as f64).fract();
+                let (s, c) = ph.sin_cos();
+                Complex::new(c as f32, s as f32)
+            })
+            .collect();
+        let b = IqBlock {
+            t0: Timestamp(T0 + i as u64 * BLOCK as u64 * 1_000_000_000 / R),
+            sample_rate_hz: Hz(R),
+            center_hz: Hz(CENTER),
+            samples: samples.into(),
+        };
+        bank.push(&b);
+        root.send(Frame::new(StreamId::new(), prov(), Payload::Iq(b)))
+            .unwrap();
+    }
+    until("every block out", || {
+        with.count() == n && without.count() == n
+    })
+    .await;
+    let (a, b) = (with.samples(), without.samples());
+    assert_eq!(with.blocks.lock().unwrap()[0].sample_rate_hz, Hz(48_000));
+    assert_eq!(a.len(), (n * BLOCK).div_ceil(50));
+    assert_eq!(a, b);
+    for r in [with, without] {
+        r.cancel.cancel();
+        assert!(matches!(r.stage.await.unwrap(), Err(StageError::Cancelled)));
         r.collect.abort();
     }
 }

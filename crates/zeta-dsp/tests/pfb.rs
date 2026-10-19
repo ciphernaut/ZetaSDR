@@ -8,8 +8,8 @@ const RATE: u64 = 24_000_000;
 const BINS: usize = 32;
 const TONE_HZ: f64 = 3_100_000.0;
 const BLOCK: usize = 65_536;
-/// Bin outputs skipped at the start: the prototype spans 8 x bins inputs,
-/// i.e. 16 output hops; skip a comfortable multiple of that.
+/// Bin outputs skipped at the start: the prototype spans 16 x bins inputs,
+/// i.e. 32 output hops; skip twice that.
 const SETTLE: usize = 64;
 
 /// `len` samples of a unit tone at `freq_hz` starting at absolute sample `start`.
@@ -60,13 +60,21 @@ fn bank_reports_its_geometry() {
 #[test]
 fn a_tone_lands_in_its_bin_and_leaks_60_db_less_elsewhere() {
     // 0.5 s at 24 Msps pushed in 65536-sample blocks; only per-bin power sums and
-    // bin 20's stream are kept, so memory stays small.
+    // bins 20 and 21's streams are kept, so memory stays small.
+    //
+    // Bins overlap (2x oversampled, cutoff 0.75 bin widths): each bin's stream
+    // spans its centre +/- one bin width, and a tone inside that span passes
+    // at its true frequency, where the channel's fine filter removes it. The
+    // tone (3.1 MHz) is inside bin 20's span (+0.13 bin) and bin 21's (-0.87
+    // bin). Leakage is the tone reaching any bin whose span excludes it (it
+    // would alias there): that must be 60 dB down.
     let mut bank = PfbBank::new(RATE, BINS);
     let total = RATE as usize / 2;
     let mut power = [0.0f64; BINS];
     let mut count = [0usize; BINS];
     let mut seen = [0usize; BINS];
     let mut bin20 = Vec::new();
+    let mut bin21 = Vec::new();
     let mut t = 0usize;
     while t < total {
         let n = BLOCK.min(total - t);
@@ -82,38 +90,44 @@ fn a_tone_lands_in_its_bin_and_leaks_60_db_less_elsewhere() {
             }
         }
         bin20.extend_from_slice(&got[20][..]);
+        bin21.extend_from_slice(&got[21][..]);
         t += n;
     }
     assert_eq!(bin20.len(), 750_000);
 
-    // Peak of bin 20's 1.5 Msps stream at +100 kHz.
+    // Peak of bin 20's 1.5 Msps stream at +100 kHz; of bin 21's at its true
+    // offset, -650 kHz, not folded.
     let size = 4096;
-    let spec = power_spectrum_db(&bin20[SETTLE..], size, Window::Hann);
-    let (peak, _) = spec
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .unwrap();
     let res = 1_500_000.0 / size as f64;
-    let peak_hz = (peak as f64 - (size / 2) as f64) * res;
-    assert!(
-        (peak_hz - 100_000.0).abs() <= res,
-        "bin 20 peak at {peak_hz} Hz"
-    );
+    for (k, stream, want) in [(20, &bin20, 100_000.0), (21, &bin21, -650_000.0)] {
+        let spec = power_spectrum_db(&stream[SETTLE..], size, Window::Hann);
+        let (peak, _) = spec
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap();
+        let peak_hz = (peak as f64 - (size / 2) as f64) * res;
+        assert!(
+            (peak_hz - want).abs() <= res,
+            "bin {k} peak at {peak_hz} Hz"
+        );
+    }
 
     let db: Vec<f64> = (0..BINS)
         .map(|k| 10.0 * (power[k] / count[k] as f64).log10())
         .collect();
+    let outside = |k: &usize| *k != 20 && *k != 21;
     let worst = (0..BINS)
-        .filter(|&k| k != 20)
+        .filter(outside)
         .map(|k| db[k] - db[20])
         .fold(f64::MIN, f64::max);
     eprintln!(
-        "bin 20 power {:.2} dB, worst other bin {worst:.1} dB relative",
-        db[20]
+        "bin 20 power {:.2} dB, bin 21 {:.1} dB, worst bin not spanning the tone {worst:.1} dB relative",
+        db[20],
+        db[21] - db[20]
     );
     assert!(db[20].abs() < 1.0, "bin 20 power {} dB", db[20]);
-    for k in (0..BINS).filter(|&k| k != 20) {
+    for k in (0..BINS).filter(outside) {
         assert!(
             db[k] - db[20] <= -60.0,
             "bin {k} only {:.1} dB below bin 20",

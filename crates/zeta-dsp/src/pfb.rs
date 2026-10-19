@@ -14,7 +14,11 @@ pub const MIN_BINS: usize = 8;
 /// Most bins a bank uses.
 pub const MAX_BINS: usize = 256;
 /// Prototype filter length in multiples of `bins`.
-const TAPS_PER_BIN: usize = 8;
+const TAPS_PER_BIN: usize = 16;
+/// Prototype cutoff (half-amplitude point) in bin widths from the bin centre.
+/// Past the half-bin crossover, so a channel centred on a bin boundary with a
+/// half-width up to a quarter bin sits in the flat passband of the nearer bin.
+const CUTOFF_BINS: f64 = 0.75;
 
 /// Bin count for a source at `rate_hz`: the largest power of two with
 /// `rate_hz / bins >= BIN_MIN_HZ`, clamped to `MIN_BINS..=MAX_BINS`.
@@ -29,10 +33,11 @@ pub fn bins_for(rate_hz: u64) -> usize {
 /// Blackman-windowed sinc prototype low-pass: `len` taps, cutoff `fc`
 /// cycles/sample, unity DC gain.
 ///
-/// Blackman rather than Hann: at `8 x bins` taps a Hann prototype leaves a
-/// tone 0.87 bin widths from a neighbouring bin's centre only ~55 dB down
-/// (that bin's 2x-oversampled stream passes it), while Blackman keeps every
-/// other bin more than 75 dB down at the cost of slightly more passband droop.
+/// Blackman for its deep stopband: with the 0.75-bin cutoff and `16 x bins`
+/// taps, a tone reaches no bin whose span (centre +/- one bin width) excludes
+/// it by more than -80 dB, so nothing aliases into a bin's stream. Bins
+/// overlap: a tone inside a neighbour's span passes there at its true
+/// frequency, and the channel's fine filter removes it.
 fn prototype(len: usize, fc: f64) -> Vec<f32> {
     let mid = (len - 1) as f64 / 2.0;
     let m = (len - 1) as f64;
@@ -63,17 +68,21 @@ pub struct PfbBank {
     bins: usize,
     /// Prototype taps reversed, so a hop is a dot product with the newest
     /// `taps.len()` input samples in time order.
+    /// Each reversed tap twice (`[t, t]`), matching interleaved re/im input.
     rev_taps: Vec<f32>,
     /// The last `taps.len() - 1` consumed samples, then unconsumed input.
-    buf: Vec<Complex<f32>>,
+    /// Interleaved re/im, so the filter loop is plain `f32` multiply-adds
+    /// the compiler vectorises.
+    buf: Vec<f32>,
     /// Hops produced so far, modulo 2 (selects the commutator rotation).
     hop_parity: usize,
     fft: Arc<dyn Fft<f32>>,
     /// Per-push transform buffer, `bins` samples per hop.
     rows: Vec<Complex<f32>>,
     scratch: Vec<Complex<f32>>,
-    /// Per-hop branch accumulator, `bins` samples, reused across hops.
-    acc: Vec<Complex<f32>>,
+    /// Per-hop branch accumulator, `bins` samples interleaved re/im, reused
+    /// across hops.
+    acc: Vec<f32>,
 }
 
 impl PfbBank {
@@ -85,8 +94,9 @@ impl PfbBank {
             "PfbBank: bins must be a power of two >= 2, got {bins}"
         );
         let len = TAPS_PER_BIN * bins;
-        let mut rev_taps = prototype(len, 1.0 / (2.0 * bins as f64));
+        let mut rev_taps = prototype(len, CUTOFF_BINS / bins as f64);
         rev_taps.reverse();
+        let rev_taps: Vec<f32> = rev_taps.iter().flat_map(|&t| [t, t]).collect();
         // Inverse transform: bin k sums branch m with exp(+j 2 pi k m / bins).
         let fft = FftPlanner::new().plan_fft_inverse(bins);
         let scratch = vec![Complex::default(); fft.get_inplace_scratch_len()];
@@ -94,12 +104,12 @@ impl PfbBank {
             rate_hz,
             bins,
             rev_taps,
-            buf: vec![Complex::default(); len - 1],
+            buf: vec![0.0; 2 * (len - 1)],
             hop_parity: 0,
             fft,
             rows: Vec::new(),
             scratch,
-            acc: vec![Complex::default(); bins],
+            acc: vec![0.0; 2 * bins],
         }
     }
 
@@ -119,11 +129,11 @@ impl PfbBank {
         self.bins
     }
 
-    /// Prototype filter length in input samples (`8 x bins`). Bin output
+    /// Prototype filter length in input samples (`16 x bins`). Bin output
     /// `h` is produced with input `h x bins/2 + bins/2 - 1` as its newest
     /// sample; its group delay is `(taps_len - 1) / 2` input samples.
     pub fn taps_len(&self) -> usize {
-        self.rev_taps.len()
+        self.rev_taps.len() / 2
     }
 
     /// Feed `iq`; returns one Vec per bin (natural order) holding the samples
@@ -132,9 +142,9 @@ impl PfbBank {
     pub fn push(&mut self, iq: &[Complex<f32>]) -> Vec<Vec<Complex<f32>>> {
         let m = self.bins;
         let hop = m / 2;
-        let len = self.rev_taps.len();
-        self.buf.extend_from_slice(iq);
-        let hops = (self.buf.len() + 1 - len) / hop;
+        let len = self.taps_len();
+        self.buf.extend(iq.iter().flat_map(|c| [c.re, c.im]));
+        let hops = (self.buf.len() / 2 + 1 - len) / hop;
         // Every hop's rotated branch outputs, one `m`-sample row per hop, then
         // transformed in one batched call.
         self.rows.clear();
@@ -143,12 +153,16 @@ impl PfbBank {
         for (h, row) in self.rows.chunks_exact_mut(m).enumerate() {
             // Window of the newest `len` samples ending at this hop's last input.
             let start = h * hop + hop - 1;
-            let win = &self.buf[start..start + len];
+            let win = &self.buf[2 * start..2 * (start + len)];
             // acc[r] sums reversed taps j = c*m + r. Tap index j in time order
             // is n = len - 1 - j samples back from the newest, i.e. polyphase
             // branch b = m - 1 - r.
-            acc.fill(Complex::default());
-            for (tc, xc) in self.rev_taps.chunks_exact(m).zip(win.chunks_exact(m)) {
+            acc.fill(0.0);
+            for (tc, xc) in self
+                .rev_taps
+                .chunks_exact(2 * m)
+                .zip(win.chunks_exact(2 * m))
+            {
                 for ((a, &t), &x) in acc.iter_mut().zip(tc).zip(xc) {
                     *a += x * t;
                 }
@@ -158,7 +172,8 @@ impl PfbBank {
             // absolute-time mixing phase, so odd bins are not frequency-flipped.
             let shift = (self.hop_parity * hop + hop - 1) % m;
             for (i, v) in row.iter_mut().enumerate() {
-                *v = acc[m - 1 - (i + shift) % m];
+                let r = m - 1 - (i + shift) % m;
+                *v = Complex::new(acc[2 * r], acc[2 * r + 1]);
             }
             self.hop_parity ^= 1;
         }
@@ -166,7 +181,7 @@ impl PfbBank {
             self.fft
                 .process_with_scratch(&mut self.rows, &mut self.scratch);
         }
-        self.buf.drain(..hops * hop);
+        self.buf.drain(..2 * hops * hop);
         // fftshift: natural bin k is transform bin (k + m/2) mod m.
         (0..m)
             .map(|k| {

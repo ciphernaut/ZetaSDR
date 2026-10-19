@@ -33,7 +33,8 @@ struct Running {
 /// A bin block's `t0` is the input time of its first sample's content: the
 /// input block's `t0`, plus the time from that block's start to the newest
 /// input of the first hop, minus the prototype's group delay
-/// (`(8 x bins - 1) / 2` input samples, under 4 samples at the bin rate).
+/// (`(taps - 1) / 2` input samples, `taps` = [`PfbBank::taps_len`]; just
+/// under 8 samples at the bin rate).
 /// Its `center_hz` is the bin centre and its rate the bin rate.
 pub struct PfbChannelBank {
     band: Tuning,

@@ -247,9 +247,11 @@ impl Stage for ChannelStage {
 
     /// With a bank in `ctx` whose bins are at least `bandwidth_hz` wide and
     /// whose band holds the channel, the stage subscribes to the nearest bin
-    /// and filters that bin's stream (`out_rate_hz` must divide the bin rate);
-    /// the job's IQ input is then only watched for its end. Otherwise it
-    /// filters the job's IQ input directly.
+    /// and filters that bin's stream, provided `out_rate_hz` divides the bin
+    /// rate; the job's IQ input is then only watched for its end and band.
+    /// Otherwise (no bank, too wide, out of band, or a rate the bin rate does
+    /// not divide, as in graphs written for the source rate) it filters the
+    /// job's IQ input directly.
     async fn run(
         &self,
         params: serde_json::Value,
@@ -270,8 +272,11 @@ impl Stage for ChannelStage {
             out,
             state: ChannelState::new(),
         };
+        // Checked before subscribing, so a declined bank keeps no receiver.
         if let Some(bank) = &ctx.bank
             && chan.p.bandwidth_hz <= bank.bin_hz()
+            && chan.p.out_rate_hz > 0
+            && (2 * bank.bin_hz()).is_multiple_of(chan.p.out_rate_hz)
             && let Ok((bin, _, _)) = bank.subscribe(chan.p.center_hz, chan.p.bandwidth_hz)
         {
             // The job's provenance, as registered for the output stream.
