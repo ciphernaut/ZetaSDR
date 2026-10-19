@@ -9,7 +9,9 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::types::Hz;
-use zeta_dsp::catalogue::{CatalogueClassifier, CatalogueKnowledge, catalogue, catalogue_labels};
+use zeta_dsp::catalogue::{
+    CatalogueClassifier, CatalogueKnowledge, catalogue, catalogue_labels, decoder_for,
+};
 use zeta_dsp::fixtures::{awgn, nbfm_modulate, tone, wfm_modulate};
 
 const WFM_RATE: u64 = 240_000;
@@ -218,4 +220,69 @@ fn equal_scores_are_not_left_in_catalogue_order() {
         widths.windows(2).all(|w| w[0] <= w[1]),
         "{widths:?} {labels:?}"
     );
+}
+
+async fn lookup(center_hz: u64, bandwidth_hz: u64) -> Vec<zeta_core::knowledge::Signature> {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = NodeConfig {
+        state_dir: dir.path().join("state"),
+        ring_seconds: 10.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
+        backends: vec![Backend::Cpu],
+        resume: false,
+    };
+    let node = Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap();
+    node.add_knowledge(Arc::new(CatalogueKnowledge));
+    let op = Op::KnowledgeLookup {
+        region: "AU".into(),
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(bandwidth_hz),
+    };
+    let Ok(OpResult::Knowledge { signatures, .. }) = node.apply(op).await else {
+        panic!("expected knowledge");
+    };
+    signatures
+}
+
+#[tokio::test]
+async fn signatures_name_their_decoder_job_kind() {
+    for (center, bw, kind) in [
+        (1_090_000_000, 2_400_000, "adsb_decode"),
+        (144_800_000, 12_500, "aprs_decode"),
+        (131_550_000, 10_000, "acars_decode"),
+    ] {
+        let sigs = lookup(center, bw).await;
+        assert!(
+            sigs.iter().any(|s| s.decoder.as_deref() == Some(kind)),
+            "{kind}: {sigs:?}"
+        );
+    }
+    let sigs = lookup(104_900_000, 200_000).await;
+    let fm = sigs
+        .iter()
+        .find(|s| s.name == "FM Broadcast Radio")
+        .unwrap();
+    assert_eq!(fm.decoder, None);
+}
+
+#[test]
+fn decoder_table_covers_near_duplicate_ids() {
+    for id in ["pocsag", "pocsag-2", "pager-pocsag-1200"] {
+        assert_eq!(decoder_for(id), Some("pocsag_decode"), "{id}");
+    }
+    for id in ["ads-b", "automatic-dependent-surveillance-broadcast-ads-b"] {
+        assert_eq!(decoder_for(id), Some("adsb_decode"), "{id}");
+    }
+    for id in [
+        "acars",
+        "aircraft-communications-addressing-and-reporting-system-acar",
+    ] {
+        assert_eq!(decoder_for(id), Some("acars_decode"), "{id}");
+    }
+    assert_eq!(decoder_for("radio-data-system-rds"), Some("rds_decode"));
+    for id in ["aprs", "automatic-packet-reporting-system-aprs"] {
+        assert_eq!(decoder_for(id), Some("aprs_decode"), "{id}");
+    }
+    assert_eq!(decoder_for("fm-broadcast"), None);
 }
