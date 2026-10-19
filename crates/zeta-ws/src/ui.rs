@@ -9,6 +9,8 @@ use axum::routing::get;
 
 use crate::http::{Shared, error_response, other};
 
+/// Outside `require_auth`, so also outside its LAN-peer check: the assets hold no secret and
+/// the listener binds a LAN address only.
 pub(crate) fn router() -> Router<Shared> {
     Router::new()
         .route("/", get(root))
@@ -33,9 +35,6 @@ fn serve(path: &str) -> Response {
         Some((mime, bytes)) => {
             ([(CONTENT_TYPE, mime), (CACHE_CONTROL, "no-cache")], bytes).into_response()
         }
-        None => error_response(
-            StatusCode::NOT_FOUND,
-            other(format!("no such ui file: {path}")),
-        ),
+        None => error_response(StatusCode::NOT_FOUND, other("no such ui file")),
     }
 }

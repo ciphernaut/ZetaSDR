@@ -11,7 +11,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{
-    AUTHORIZATION, CONTENT_TYPE, SEC_WEBSOCKET_PROTOCOL, UPGRADE, WWW_AUTHENTICATE,
+    AUTHORIZATION, CONNECTION, CONTENT_TYPE, SEC_WEBSOCKET_PROTOCOL, UPGRADE, WWW_AUTHENTICATE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -147,9 +147,10 @@ pub(crate) fn other(message: impl Into<String>) -> OpError {
     }
 }
 
-/// Whether `headers` carry the secret: as `Authorization: Bearer <secret>`, or, on a websocket
-/// upgrade only, as the `zeta.bearer.<base64url>` entry of `Sec-WebSocket-Protocol`.
-fn authenticated(secret: &Secret, method: &Method, headers: &HeaderMap) -> bool {
+/// Whether the request carries the secret: as `Authorization: Bearer <secret>` on any route,
+/// or as the `zeta.bearer.<base64url>` entry of `Sec-WebSocket-Protocol` only on a websocket
+/// upgrade (`GET`, `Upgrade: websocket`, `Connection: upgrade`) of the `/stream/` route.
+fn authenticated(secret: &Secret, method: &Method, path: &str, headers: &HeaderMap) -> bool {
     let by_header = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
@@ -157,11 +158,18 @@ fn authenticated(secret: &Secret, method: &Method, headers: &HeaderMap) -> bool 
     if by_header {
         return true;
     }
-    let upgrade = method == Method::GET
+    let stream_upgrade = method == Method::GET
+        && path.starts_with("/stream/")
         && headers
             .get(UPGRADE)
-            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
-    upgrade
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        && headers
+            .get_all(CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    stream_upgrade
         && headers
             .get_all(SEC_WEBSOCKET_PROTOCOL)
             .iter()
@@ -184,7 +192,7 @@ async fn require_auth(
             other(format!("peer {} is not a LAN address", peer.ip())),
         );
     }
-    if !authenticated(&st.secret, req.method(), req.headers()) {
+    if !authenticated(&st.secret, req.method(), req.uri().path(), req.headers()) {
         tokio::time::sleep(st.limits.auth_fail_delay).await;
         let mut resp = error_response(
             StatusCode::UNAUTHORIZED,
@@ -287,6 +295,7 @@ fn router(state: Shared) -> Router {
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
     ui::router()
+        // Merged routers keep their own 405 fallback, so the unauthenticated one needs it too.
         .method_not_allowed_fallback(method_not_allowed)
         .merge(api)
         .with_state(state)

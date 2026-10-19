@@ -159,3 +159,19 @@ async fn op_route_still_requires_header_auth() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     ts.stop().await;
 }
+
+#[tokio::test]
+async fn subprotocol_is_not_accepted_on_plain_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/health", ts.url))
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-protocol", subprotocols(SECRET))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    ts.stop().await;
+}
