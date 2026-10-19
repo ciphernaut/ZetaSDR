@@ -23,7 +23,11 @@
 // A drag on the waterfall opens the context menu (menu.js), whose entries go through the same
 // op and /ask paths as the command line.
 //
-// Exports `state` ({api, transcript, jobs, wf, ov, menu, sources, selected}) and `onSourceChange(fn)` for
+// Job rows: ▶ on an `fm_demod` row plays its audio (audio.js; one job at a time, ■ stops it,
+// and it stops when the job leaves the running list or the secret is rejected); `graph` opens
+// the job's graph view (graph.js).
+//
+// Exports `state` ({api, transcript, jobs, wf, ov, menu, audio, sources, selected}) and `onSourceChange(fn)` for
 // the later views (waterfall, audio, voice).
 
 import { connect, Unauthorized } from "./api.js";
@@ -31,6 +35,8 @@ import { Transcript, startJobs, startOpsFeed } from "./agent.js";
 import { mountWaterfall } from "./waterfall.js";
 import { mountOverlays } from "./overlays.js";
 import { mountMenu } from "./menu.js";
+import { playJob } from "./audio.js";
+import { showGraph } from "./graph.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -44,6 +50,7 @@ export const state = {
   wf: null,
   ov: null,
   menu: null,
+  audio: null, // {jobId, player}
   sources: [],
   selected: null,
 };
@@ -309,7 +316,13 @@ function start(api) {
     if (!error && footprint() === "narrow") answerRibbon(text);
   });
   state.jobs = startJobs(api, $("#jobs"), state.transcript, {
-    onJobs: (jobs) => state.ov && state.ov.sync(jobs),
+    onJobs: (jobs) => {
+      if (state.ov) state.ov.sync(jobs);
+      stopAudioUnlessRunning(jobs);
+    },
+    onPlay: toggleAudio,
+    onGraph: (job) => showGraph(api, job.id),
+    playing: (id) => !!state.audio && state.audio.jobId === id,
   });
   loadSources();
 }
@@ -319,6 +332,7 @@ function logout(api) {
   if (state.api !== api) return;
   state.api = null;
   api.onUnauthorized = null;
+  stopAudio();
   if (state.ops) state.ops.close();
   if (state.jobs) state.jobs.close();
   if (state.menu) state.menu.destroy();
@@ -331,6 +345,39 @@ function logout(api) {
   state.wf = null;
   store(SECRET_KEY, null);
   showLogin("secret rejected");
+}
+
+// ---- audio -----------------------------------------------------------------------------
+
+function stopAudio() {
+  const a = state.audio;
+  state.audio = null;
+  if (a) a.player.stop();
+}
+
+// ▶ on a job row: plays that job (stopping any other); ■ on the playing row stops it.
+function toggleAudio(job) {
+  const same = state.audio && state.audio.jobId === job.id;
+  stopAudio();
+  if (!same && state.api) {
+    const entry = { jobId: job.id, player: null };
+    state.audio = entry;
+    entry.player = playJob(state.api, job, {
+      onError: (message) => state.transcript.note(message, true),
+      onEnd: () => {
+        if (state.audio === entry) state.audio = null;
+        state.jobs?.redraw();
+      },
+    });
+  }
+  state.jobs?.redraw();
+}
+
+function stopAudioUnlessRunning(jobs) {
+  const a = state.audio;
+  if (!a) return;
+  const j = jobs.find((x) => x.id === a.jobId);
+  if (!j || !j.state || j.state.status !== "running") stopAudio();
 }
 
 // An `agent` ribbon at the centre of the band the waterfall shows (the middle when unknown).

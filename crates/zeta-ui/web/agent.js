@@ -24,10 +24,14 @@
 //   startOpsFeed(api, transcript) -> {close}
 //       Finds the `ops` stream (the GET /streams entry whose provenance.source is "node")
 //       and appends one line per frame; reconnects and re-resolves the id when it drops.
-//   startJobs(api, el, transcript, {onJobs}) -> {close, refresh}
+//   startJobs(api, el, transcript, {onJobs, onPlay, onGraph, playing}) -> {close, refresh,
+//                                                                         redraw}
 //       Polls `job_list` every 2 s and renders the jobs that are not stopped: kind, source,
-//       state, id, an `.events` cell (filled by overlays.js) and a Stop button applying
-//       `job_stop`. onJobs(jobs) is called with the whole list after each render.
+//       state, id, an `.events` cell (filled by overlays.js), on `fm_demod` rows a
+//       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job), a
+//       `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
+//       onJobs(jobs) is called with the whole list after each render; redraw() renders the
+//       last list again (after the playing state changed).
 
 export const JOBS_POLL_MS = 2000;
 export const QUIET_OPS = new Set(["job_list", "stream_list", "source_list"]);
@@ -226,7 +230,7 @@ export function startOpsFeed(api, transcript) {
   };
 }
 
-function jobRow(job, onStop) {
+function jobRow(job, onStop, { onPlay, onGraph, playing }) {
   const row = document.createElement("div");
   row.className = "job";
   row.dataset.id = job.id;
@@ -246,19 +250,48 @@ function jobRow(job, onStop) {
     row.append(span);
   }
   if (job.state && job.state.reason) row.title = job.state.reason;
+  const actions = document.createElement("span");
+  actions.className = "actions";
+  if (job.kind === "fm_demod" && onPlay) {
+    const on = playing ? playing(job.id) : false;
+    const play = document.createElement("button");
+    play.className = "play";
+    play.textContent = on ? "■" : "▶";
+    play.title = on ? "stop the audio" : "play the audio";
+    play.setAttribute("aria-pressed", String(on));
+    play.onclick = () => onPlay(job);
+    actions.append(play);
+  }
+  if (onGraph) {
+    const graph = document.createElement("button");
+    graph.className = "graph";
+    graph.textContent = "graph";
+    graph.title = `graph_get ${job.id}`;
+    graph.onclick = () => onGraph(job);
+    actions.append(graph);
+  }
   const stop = document.createElement("button");
   stop.className = "stop";
   stop.textContent = "Stop";
   stop.title = `job_stop ${job.id}`;
   stop.onclick = () => onStop(job.id, stop);
-  row.append(stop);
+  actions.append(stop);
+  row.append(actions);
   return row;
 }
 
-export function startJobs(api, el, transcript, { onJobs = null } = {}) {
+export function startJobs(
+  api,
+  el,
+  transcript,
+  { onJobs = null, onPlay = null, onGraph = null, playing = null } = {},
+) {
   let timer = null;
   let stopped = false;
+  let last = null;
+  const buttons = { onPlay, onGraph, playing };
   const render = (jobs) => {
+    last = jobs;
     const shown = jobs.filter((j) => !(j.state && j.state.status === "stopped"));
     el.replaceChildren(
       ...shown.map((j) =>
@@ -270,7 +303,7 @@ export function startJobs(api, el, transcript, { onJobs = null } = {}) {
             if (!(e.json && e.status === 422)) transcript.note(`job_stop: ${e.message}`, true);
           }
           refresh();
-        }),
+        }, buttons),
       ),
     );
     if (shown.length === 0) {
@@ -296,6 +329,9 @@ export function startJobs(api, el, transcript, { onJobs = null } = {}) {
   loop();
   return {
     refresh,
+    redraw() {
+      if (last && !stopped) render(last);
+    },
     close() {
       stopped = true;
       clearTimeout(timer);

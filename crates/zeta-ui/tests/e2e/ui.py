@@ -352,10 +352,10 @@ def scenario_selection_reports_band(page, url, secret):
 # These run after the waterfall scenarios: they start decode jobs that the page watches (more
 # websockets), and each stops its own jobs at the end so later runs start clean.
 
-def start_job(url, secret, kind, source, center_hz, bandwidth_hz):
+def start_job(url, secret, kind, source, center_hz, bandwidth_hz, deviation_hz=None):
     return http_json(url, secret, "/op", {"op": "job_start", "kind": kind, "source": source,
                                           "center_hz": center_hz, "bandwidth_hz": bandwidth_hz,
-                                          "deviation_hz": None})["value"]
+                                          "deviation_hz": deviation_hz})["value"]
 
 
 def stop_job(url, secret, job):
@@ -530,6 +530,131 @@ def scenario_save_sigmf(page, url, secret):
     assert os.path.realpath(path).startswith(os.path.realpath(state) + os.sep), \
         f"{path} not under {state}"
     assert os.path.isfile(path[:-len(".sigmf-meta")] + ".sigmf-data"), f"no data beside {path}"
+
+
+# ---- graph view and audio (Task 10) --------------------------------------------------------
+# Last: they open more websockets (the audio socket) and each stops the job it starts.
+
+def job_row(page, job):
+    """Force a jobs poll and return the job's row once it shows."""
+    page.evaluate("window.zetaTest.poll()")
+    row = page.locator(f'#jobs .job[data-id="{job}"]')
+    expect(row).to_be_visible()
+    return row
+
+
+def open_graph(page, job):
+    job_row(page, job).locator("button.graph").click()
+    modal = page.locator("#graph")
+    expect(modal).to_be_visible()
+    return modal
+
+
+def stream_of(url, secret, job, kind):
+    for s in http_json(url, secret, "/streams"):
+        if s["kind"] == kind and s["provenance"].get("job") == job:
+            return s["id"]
+    return None
+
+
+def scenario_graph_view_renders_nodes(page, url, secret):
+    select_source(page, url, secret, "aprs")
+    job = start_job(url, secret, "aprs_decode", "aprs", 144_800_000, 12_500)
+    try:
+        modal = open_graph(page, job)
+        nodes = modal.locator("svg .graph-node")
+        page.wait_for_function(
+            "() => document.querySelectorAll('#graph svg .graph-node').length >= 3")
+        edges = modal.locator("svg .graph-edge")
+        assert edges.count() >= 2, f"{edges.count()} edges"
+        kinds = [nodes.nth(i).get_attribute("data-kind") for i in range(nodes.count())]
+        assert "channel" in kinds, f"node kinds {kinds}"
+        # Every edge is labelled with its stream kind.
+        labels = modal.locator("svg .graph-edge text").all_text_contents()
+        assert sorted(labels) == ["audio", "iq"], f"edge labels {labels}"
+        # Columns follow the edges: channel left of nbfm_demod left of aprs_decode.
+        xs = page.evaluate("""() => Object.fromEntries([...document.querySelectorAll(
+            '#graph svg .graph-node')].map((g) => [g.dataset.kind,
+            g.querySelector('rect').x.baseVal.value]))""")
+        assert xs["channel"] < xs["nbfm_demod"] < xs["aprs_decode"], f"columns {xs}"
+        if os.environ.get("ZETA_UI_SHOTS"):
+            modal.locator('svg .graph-node[data-kind="channel"]').click()
+            page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "graph.png"))
+        page.keyboard.press("Escape")
+        expect(modal).to_be_hidden()
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_graph_edit_puts(page, url, secret):
+    select_source(page, url, secret, "aprs")
+    job = start_job(url, secret, "aprs_decode", "aprs", 144_800_000, 12_500)
+    try:
+        before = stream_of(url, secret, job, "audio")
+        assert before, "no audio stream for the aprs_decode job"
+        modal = open_graph(page, job)
+        modal.locator('svg .graph-node[data-kind="channel"]').click()
+        params = modal.locator("#graph-params")
+        expect(params).to_be_visible()
+        current = json.loads(params.input_value())
+        assert "out_rate_hz" in current, f"channel params {current}"
+        # A rejected edit shows the node's corrective message in the modal.
+        params.fill(json.dumps({**current, "out_rate_hz": "x"}))
+        modal.locator("#graph-apply").click()
+        expect(modal.locator(".graph-error")).to_contain_text("integer")
+        params.fill("{")
+        modal.locator("#graph-apply").click()
+        expect(modal.locator(".graph-error")).to_contain_text("not valid JSON")
+        # A good one is put, restarts the job (new stream ids) and re-renders.
+        params.fill(json.dumps({**current, "out_rate_hz": 48000}, indent=2))
+        modal.locator("#graph-apply").click()
+        expect(modal.locator(".graph-status")).to_contain_text("applied")
+        expect(modal.locator(".graph-error")).to_have_text("")
+        expect(modal.locator("svg .graph-node")).to_have_count(3)
+        graph = http_json(url, secret, "/op", {"op": "graph_get", "job": job})["value"]
+        channel = [n for n in graph["nodes"] if n["kind"] == "channel"]
+        assert channel and channel[0]["params"]["out_rate_hz"] == 48000, f"graph {graph}"
+        after = stream_of(url, secret, job, "audio")
+        assert after and after != before, f"audio stream {before} -> {after}: job not restarted"
+        ok = page.locator("#transcript .line.op", has_text=re.compile(r"^graph_put .*→ ok"))
+        expect(ok).to_have_count(1)
+        page.keyboard.press("Escape")
+        expect(modal).to_be_hidden()
+    finally:
+        stop_job(url, secret, job)
+
+
+def ws_connections(url, secret):
+    return http_json(url, secret, "/health")["ws_connections"]
+
+
+def scenario_audio_play_opens_binary_socket(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_job(url, secret, "fm_demod", "tone", 100_000_000, 10_000, deviation_hz=5000)
+    try:
+        row = job_row(page, job)
+        play = row.locator("button.play")
+        expect(play).to_have_text("▶")
+        page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+        page.wait_for_timeout(500)
+        idle = ws_connections(url, secret)
+        play.click()
+        page.wait_for_function(
+            "() => window.zetaAudio && window.zetaAudio.framesPlayed > 0", timeout=3_000)
+        playing = ws_connections(url, secret)
+        assert playing >= 2 and playing > idle, f"ws_connections {idle} -> {playing}"
+        # The ▶ survives the 2 s jobs re-render as ■ while playing.
+        page.evaluate("window.zetaTest.poll()")
+        expect(row.locator("button.play")).to_have_text("■")
+        row.locator("button.play").click()
+        expect(row.locator("button.play")).to_have_text("▶")
+        deadline = time.monotonic() + 3.0
+        while ws_connections(url, secret) >= playing and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert ws_connections(url, secret) < playing, "audio socket still open after ■"
+        assert page.evaluate("window.zetaAudio.playing") is None, "still playing after ■"
+    finally:
+        stop_job(url, secret, job)
 
 
 # ---- runner ----------------------------------------------------------------------------
