@@ -111,6 +111,83 @@ async fn large_results_are_summarised_on_the_ops_stream() {
 }
 
 #[tokio::test]
+async fn large_errors_are_summarised_on_the_ops_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let mut rx = node.bus().subscribe(&node.ops_stream()).unwrap();
+
+    let err = node
+        .apply(Op::JobStop {
+            job: JobId("j".repeat(20_000)),
+        })
+        .await
+        .unwrap_err();
+    let full = serde_json::to_vec(&err).unwrap().len();
+    assert!(full > OPS_RESULT_LIMIT_BYTES);
+    let (_, p) = next(&mut rx).await;
+    assert_eq!(p["outcome"], "error");
+    assert_eq!(
+        p["error"],
+        serde_json::json!({"error": err.name(), "truncated": true, "bytes": full})
+    );
+
+    let err = node
+        .apply(Op::JobStop {
+            job: JobId("nope".into()),
+        })
+        .await
+        .unwrap_err();
+    let (_, p) = next(&mut rx).await;
+    assert_eq!(p["error"], serde_json::to_value(&err).unwrap());
+    assert!(p["error"].get("truncated").is_none());
+}
+
+#[test]
+fn op_error_name_matches_the_serialised_tag() {
+    use zeta_core::graph::GraphError;
+    use zeta_core::ops::OpError;
+    use zeta_core::port::Tuning;
+    use zeta_core::types::Hz;
+    // Every OpError variant: extend this list whenever the enum grows.
+    let all = vec![
+        OpError::OutOfRange {
+            field: "f".into(),
+            value: 1,
+            min: 0,
+            max: 0,
+            suggested: None,
+        },
+        OpError::Conflict {
+            source: SourceId("s".into()),
+            holders: vec![],
+            current: Tuning {
+                center_hz: Hz(1),
+                bandwidth_hz: Hz(1),
+            },
+            options: vec![],
+        },
+        OpError::Unknown {
+            field: "f".into(),
+            value: "v".into(),
+            known: vec![],
+        },
+        OpError::Ring {
+            detail: zeta_core::ring::RingError::Empty,
+        },
+        OpError::Graph {
+            detail: GraphError::Empty,
+        },
+        OpError::Other {
+            message: "m".into(),
+        },
+    ];
+    for e in &all {
+        let v = serde_json::to_value(e).unwrap();
+        assert_eq!(v["error"], e.name(), "{e:?}");
+    }
+}
+
+#[tokio::test]
 async fn ops_stream_is_listed_with_node_provenance() {
     let dir = tempfile::tempdir().unwrap();
     let node = open(dir.path()).await;

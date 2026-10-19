@@ -529,7 +529,8 @@ pub const OPS_RESULT_LIMIT_BYTES: usize = 8192;
 /// The `ops` stream's event payload for one applied operation:
 /// `{"op", "outcome": "ok"|"error", "result"|"error", "elapsed_ms",
 /// "transport": "local"}`; see [`Op::summary_json`] and
-/// [`OpResult::summary_json`] for large ops and results.
+/// [`OpResult::summary_json`] and [`OpError::summary_json`] for large ops,
+/// results and errors.
 pub fn ops_payload(
     op: &Op,
     outcome: &Result<OpResult, OpError>,
@@ -548,9 +549,7 @@ pub fn ops_payload(
         }
         Err(e) => {
             v["outcome"] = "error".into();
-            v["error"] = serde_json::to_value(e).unwrap_or_else(
-                |_| serde_json::json!({"error": "other", "message": e.to_string()}),
-            );
+            v["error"] = e.summary_json();
         }
     }
     v
@@ -594,6 +593,28 @@ pub enum OpError {
     Other {
         message: String,
     },
+}
+
+impl OpError {
+    /// The snake_case tag this variant serialises under `error`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            OpError::OutOfRange { .. } => "out_of_range",
+            OpError::Conflict { .. } => "conflict",
+            OpError::Unknown { .. } => "unknown",
+            OpError::Ring { .. } => "ring",
+            OpError::Graph { .. } => "graph",
+            OpError::Other { .. } => "other",
+        }
+    }
+
+    /// The error as JSON for the `ops` stream: the full value when it fits in
+    /// [`OPS_RESULT_LIMIT_BYTES`], otherwise
+    /// `{"error": <variant>, "truncated": true, "bytes": n}`. A value that
+    /// fails to serialise is summarised with `bytes: 0`.
+    pub fn summary_json(&self) -> serde_json::Value {
+        bounded_json(self, "error", self.name())
+    }
 }
 
 // Hand-written: thiserror treats a field named `source` as the error source.
