@@ -354,7 +354,7 @@ What each decoder is:
 - `classify` tries APRS, POCSAG and ACARS on narrow bands and RDS on wide ones; the RDS attempt
   uses a measured bandwidth threshold of 100 kHz (the fixture measures 138.5 kHz; ruling R5).
   `knowledge_lookup` signatures carry `decoder` (a table in the catalogue module).
-- UI: decode menu entries and event ribbons for POCSAG, ACARS and RDS, and the ADS-B refusal
+- UI: decode menu entries and event ribbons for POCSAG, ACARS, RDS and ADS-B, and the ADS-B refusal
   on a narrow band.
 
 Oracles, all installed on the dev host: multimon-ng decodes the POCSAG fixture (it needed the
@@ -369,14 +369,14 @@ was padded with 2 s of silence (62ea5b5); 3 of 3 full-suite runs were then green
 Tests, as the task reports and ledger give them (the whole workspace at the branch head: 671 passed, 0 failed, 3 ignored, the 40 browser scenarios included): POCSAG 9 tests at task 1, RDS 12,
 ACARS 8 plus 3 framer tests added in task 7, zeta-ext 2 unit plus 11 integration (the real dump1090
 oracle among them), `zeta-core` ops 51, `zeta` cli 40, catalogue 10, and the UI suite 40 of 40
-Playwright scenarios (160 s of the 300 s deadline, no skip line). No workspace-wide total was
-recorded in the ledger. Task 10's README one-shot was run: `pocsag_decode` on the
+Playwright scenarios (160 s of the 300 s deadline, no skip line).
+Task 10's README one-shot was run: `pocsag_decode` on the
 `gen_pocsag` fixture at 148 637 500 Hz gives one event, address 1234567, function 3, `alpha`,
 "HELLO ZETA", 1200 baud.
 
 Parked (from the ledger): `bch_failures` is not reset per batch in the POCSAG decoder; no tests for
 its BCH-failure and Tone branches; the POCSAG stage and `decode_pocsag_iq` duplicate the pipeline;
-no test for a mid-run rate change or `Lagged` in POCSAG, RDS or ACARS; 38 kHz stereo content is
+no test for a mid-run rate change in POCSAG or ACARS, or for `Lagged` in POCSAG, RDS or ACARS; 38 kHz stereo content is
 untested against the RDS 57 kHz band-pass; an RDS PI change clears PS and RT without confirmation;
 `write_all` to dump1090 can block if a live child stops reading (cancel still ends it); `free_port`
 has a check-to-use race; the ADS-B clean-exit regression test could not reproduce the pre-fix race;

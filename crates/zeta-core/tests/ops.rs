@@ -1865,7 +1865,7 @@ fn adsb_expand_refuses_narrow_band() {
             assert_eq!(field, "bandwidth_hz");
             assert_eq!(value, 1_000_000);
             assert_eq!(min, 2_000_000);
-            assert_eq!(max, 1_000_000);
+            assert_eq!(max, 8_000_000);
             assert_eq!(suggested, Some(2_400_000));
         }
         other => panic!("expected OutOfRange, got {other:?}"),

@@ -67,7 +67,7 @@ pub fn wfm_modulate(
 
 /// FM of a ready-made broadcast `composite` (nominally within ±1) already at
 /// the IQ rate: [`nbfm_modulate`] at equal rates and no offset, so no
-/// resampling and no further filtering. The modulator [`wfm_modulate`] uses.
+/// resampling and no further filtering. Used by [`rds_station_iq`]; [`wfm_modulate`] does not use it.
 pub fn wfm_modulate_composite(
     composite: &[f32],
     rate_hz: u32,

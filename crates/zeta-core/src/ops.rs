@@ -182,7 +182,7 @@ const ADSB_BANDWIDTH_MIN_HZ: u64 = 2_000_000;
 const ADSB_BANDWIDTH_HZ: u64 = 2_400_000;
 
 /// Built-in job kinds; each expands to a graph. `fm_demod`, `wfm_demod` and
-/// `aprs_decode`, `pocsag_decode`, `rds_decode` and `adsb_decode` channelise the job band at the narrowest exact divisor of the source rate
+/// `aprs_decode`, `pocsag_decode`, `rds_decode`, `acars_decode` and `adsb_decode` channelise the job band at the narrowest exact divisor of the source rate
 /// that is at least 48 kHz and at least the band; `spectrum` covers the whole
 /// capture band. `measure` channelises the job band the same way and
 /// measures only that band, reporting its absolute `center_hz`. `scan`
@@ -290,7 +290,7 @@ impl JobKind {
                 field: "bandwidth_hz".into(),
                 value: bw,
                 min: ADSB_BANDWIDTH_MIN_HZ,
-                max: out,
+                max: source_rate_hz.0,
                 suggested: Some(ADSB_BANDWIDTH_HZ),
             });
         }

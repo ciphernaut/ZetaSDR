@@ -1,6 +1,6 @@
 //! Layer-2 decode-to-identify: run each protocol decoder (APRS, POCSAG, ACARS, RDS) over
-//! the channel and report only what passes its own check, the AX.25 FCS or
-//! the POCSAG BCH code (design 6.2).
+//! the channel and report only what passes its own check: the AX.25 FCS, the
+//! POCSAG BCH code, the ACARS CRC-16 or the RDS checkwords (design 6.2).
 
 use async_trait::async_trait;
 use num_complex::Complex;

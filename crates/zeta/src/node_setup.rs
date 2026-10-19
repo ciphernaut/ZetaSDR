@@ -44,6 +44,9 @@ pub fn registry() -> StageRegistry {
     let dump1090 = zeta_ext::find_dump1090();
     match &dump1090 {
         Some(p) => eprintln!("zeta: adsb_decode via {}", p.display()),
+        None if std::env::var_os("ZETA_DUMP1090").is_some() => eprintln!(
+            "zeta: adsb_decode unavailable: ZETA_DUMP1090 is set but is not an absolute existing file"
+        ),
         None => eprintln!("zeta: adsb_decode unavailable: no dump1090 on PATH"),
     }
     registry.register(Arc::new(zeta_ext::AdsbDecodeStage::new(dump1090)));

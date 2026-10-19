@@ -165,7 +165,7 @@ JSON: `{"op":"knowledge_lookup","region":"AU","center_hz":144800000,"bandwidth_h
 
 CLI: `zeta knowledge lookup --region AU --center-hz 144800000 --bandwidth-hz 12500`
 
-Two providers answer: the built-in seed signatures, and `catalogue`, the 594-signal iNTERCEPT catalogue (Apache-2.0; one signature per frequency range of each signal overlapping the band, `bandwidth_hz` its widest bandwidth, `modulation` the first it lists). A signature's `decoder` names the job kind that proves it: start that kind on the band to decode it (and `classify` runs it as decode-to-identify). Neither has allocations, so an empty `allocations` list means no provider data, not nothing allocated.
+Two providers answer: the built-in seed signatures, and `catalogue`, the 594-signal iNTERCEPT catalogue (Apache-2.0; one signature per frequency range of each signal overlapping the band, `bandwidth_hz` its widest bandwidth, `modulation` the first it lists). A signature's `decoder` names the job kind that proves it: start that kind on the band to decode it; `classify` attempts only the APRS, POCSAG, ACARS and RDS ones as decode-to-identify. Neither has allocations, so an empty `allocations` list means no provider data, not nothing allocated.
 
 ### classify
 
@@ -177,7 +177,7 @@ JSON: `{"op":"classify","selection":{"source":"<id>","span":{"start_ns":17600000
 
 CLI: `zeta classify --source <id> --start-ns 1760000000000000000 --end-ns 1760000001000000000 --center-hz 144800000 --bandwidth-hz 12500`
 
-Layer 1 labels the measured band (`wfm`, `fm`, `am`, `ssb`, `fsk`, `carrier`, `noise` or `unknown`; an `ssb` label's evidence gives the dial frequency). Layer 2 adds `APRS` when a frame decodes, and up to three signal names from the catalogue (evidence `catalogue <id>: ...`), scored 0.4 for the measured centre lying in one of the signal's frequency ranges (required), 0.3 for a matching bandwidth (required for signals wider than 50 kHz) and 0.3 for a matching layer-1 modulation. Layer 3 is an empty slot.
+Layer 1 labels the measured band (`wfm`, `fm`, `am`, `ssb`, `fsk`, `carrier`, `noise` or `unknown`; an `ssb` label's evidence gives the dial frequency). Layer 2 first tries decode-to-identify: `APRS`, `POCSAG` and `ACARS` on a selection narrower than 150000 Hz (100000 Hz when the whole block is measured), `RDS` on a wider one, and labels a protocol only when its CRC/BCH-clean decode passes; ADS-B is never attempted by `classify` (use `adsb_decode`). Layer 2 also adds up to three signal names from the catalogue (evidence `catalogue <id>: ...`), scored 0.4 for the measured centre lying in one of the signal's frequency ranges (required), 0.3 for a matching bandwidth (required for signals wider than 50 kHz) and 0.3 for a matching layer-1 modulation. Layer 3 is an empty slot.
 
 ### schema
 

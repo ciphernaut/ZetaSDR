@@ -22,14 +22,16 @@
 //                                             label is listed in the transcript as
 //                                             `L<layer> <name> <confidence>`
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
-//   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null
+//   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
+//                                             bandwidth_hz at least POCSAG_MIN_BANDWIDTH_HZ
 //   rds_decode  Decode › RDS (FM station data)  job_start kind=rds_decode, deviation_hz null,
 //                                             bandwidth_hz at least WFM_MIN_BANDWIDTH_HZ
 //   adsb_decode  Decode › ADS-B (dump1090)    job_start kind=adsb_decode, deviation_hz null,
 //                                             bandwidth_hz always ADSB_BANDWIDTH_HZ (the node
 //                                             refuses under 2 MHz; a narrower source answers
 //                                             out_of_range, shown in the transcript)
-//   acars_decode  Decode › ACARS              job_start kind=acars_decode, deviation_hz null
+//   acars_decode  Decode › ACARS              job_start kind=acars_decode, deviation_hz null,
+//                                             bandwidth_hz at least ACARS_MIN_BANDWIDTH_HZ
 //   fm_demod   Decode › NBFM audio            job_start kind=fm_demod, deviation_hz 5000
 //   wfm_demod  Decode › FM broadcast audio    job_start kind=wfm_demod, deviation_hz 75000,
 //                                             bandwidth_hz at least WFM_MIN_BANDWIDTH_HZ
@@ -77,6 +79,11 @@ export const SSB_BANDWIDTH_HZ = 6000;
 // The FM broadcast entry asks for at least this bandwidth: a narrow drag over a station still
 // takes its whole 75 kHz-deviation band.
 export const WFM_MIN_BANDWIDTH_HZ = 200000;
+// The POCSAG and ACARS entries ask for at least these bandwidths: a narrow drag would make the
+// channel filter cut the signal (POCSAG's +-4.5 kHz deviation, ACARS's 2400 Hz MSK sidebands),
+// and the decode would silently never fire.
+export const POCSAG_MIN_BANDWIDTH_HZ = 12500;
+export const ACARS_MIN_BANDWIDTH_HZ = 10000;
 // The ADS-B entry always asks for this bandwidth (dump1090's 2.4 MHz; the node refuses
 // adsb_decode under 2 MHz), whatever was selected.
 export const ADSB_BANDWIDTH_HZ = 2_400_000;
@@ -114,8 +121,9 @@ const JOBS = {
 };
 
 // The tuning a job entry uses for a selection: {centerHz, bandwidthHz}. SSB tunes the dial; FM
-// broadcast and RDS widen the band to at least WFM_MIN_BANDWIDTH_HZ; ADS-B always asks for
-// ADSB_BANDWIDTH_HZ; everything else (POCSAG, ACARS included) uses the selection as is.
+// broadcast and RDS widen the band to at least WFM_MIN_BANDWIDTH_HZ, POCSAG to at least
+// POCSAG_MIN_BANDWIDTH_HZ and ACARS to at least ACARS_MIN_BANDWIDTH_HZ; ADS-B always asks for
+// ADSB_BANDWIDTH_HZ; everything else uses the selection as is.
 export function jobTuning(action, s) {
   const sb = JOBS[action] ? JOBS[action].sideband : null;
   if (sb === "usb") return { centerHz: s.centerHz - SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
@@ -123,6 +131,12 @@ export function jobTuning(action, s) {
   if (action === "adsb_decode") return { centerHz: s.centerHz, bandwidthHz: ADSB_BANDWIDTH_HZ };
   if (action === "wfm_demod" || action === "rds_decode") {
     return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, WFM_MIN_BANDWIDTH_HZ) };
+  }
+  if (action === "pocsag_decode") {
+    return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, POCSAG_MIN_BANDWIDTH_HZ) };
+  }
+  if (action === "acars_decode") {
+    return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, ACARS_MIN_BANDWIDTH_HZ) };
   }
   return { centerHz: s.centerHz, bandwidthHz: s.bandwidthHz };
 }
