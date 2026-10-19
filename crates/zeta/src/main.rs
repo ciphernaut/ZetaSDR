@@ -83,11 +83,18 @@ async fn main() -> ExitCode {
         Some(_) => None,
     };
     // Only `serve` (op `None`) resumes jobs; a one-shot never launches or fails them.
-    let (node, remotes) =
-        match node_setup::open(state_dir.clone(), &sources, &plugins, op.is_none()).await {
-            Ok(n) => n,
-            Err(e) => return fail(&e),
-        };
+    let (node, remotes) = match node_setup::open(
+        state_dir.clone(),
+        &sources,
+        &plugins,
+        op.is_none(),
+        cli.ring_budget_mb,
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => return fail(&e),
+    };
     for name in node.load_errors() {
         eprintln!("zeta: warning: unreadable job record {name}");
     }

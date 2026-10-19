@@ -1253,3 +1253,33 @@ fn ssb_demod_job_with_lsb_streams_audio() {
         "{v}"
     );
 }
+
+#[test]
+fn ring_budget_flag_is_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    // 64 MB / (48 kHz * 8 B) = 174.76 s, capped at 10 s; a zero budget gives the 1 s floor.
+    for (mb, want) in [
+        ("64", "ring for tone: 10.00 s at "),
+        ("0", "ring for tone: 1.00 s at "),
+    ] {
+        let args = [
+            "--ring-budget-mb",
+            mb,
+            "iq",
+            "read",
+            "--source",
+            "tone",
+            "--start-ns",
+            "0",
+            "--end-ns",
+            "1000000000",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ];
+        let out = zeta(dir.path(), &args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(want), "{mb}: stderr was {err}");
+    }
+}

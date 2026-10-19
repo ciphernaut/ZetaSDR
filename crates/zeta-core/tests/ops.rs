@@ -97,6 +97,7 @@ fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: true,
     }

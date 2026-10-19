@@ -34,6 +34,7 @@ async fn node_over(dir: &std::path::Path, iq: &[Complex<f32>]) -> Node {
     let cfg = NodeConfig {
         state_dir: dir.join("state"),
         ring_seconds: 600.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: true,
     };

@@ -274,6 +274,7 @@ async fn node_with(src: Arc<SoapySource>) -> (Node, tempfile::TempDir) {
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
         ring_seconds: 2.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: true,
     };

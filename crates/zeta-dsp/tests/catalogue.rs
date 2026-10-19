@@ -110,6 +110,7 @@ async fn knowledge_lookup_returns_catalogue_signatures() {
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
         ring_seconds: 10.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: false,
     };

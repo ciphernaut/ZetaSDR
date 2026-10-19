@@ -378,6 +378,7 @@ async fn local_node(dir: &std::path::Path, port: Arc<dyn Port>) -> Node {
     let cfg = NodeConfig {
         state_dir: dir.join("local"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: false,
     };

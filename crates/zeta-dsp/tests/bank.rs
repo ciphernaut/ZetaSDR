@@ -474,6 +474,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: true,
     };

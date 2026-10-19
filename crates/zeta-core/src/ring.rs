@@ -112,6 +112,23 @@ impl IqRing {
         }
     }
 
+    /// Change the history length to `seconds` (at the current rate), keeping
+    /// the newest samples when it shrinks.
+    pub fn resize(&mut self, seconds: f64) {
+        self.capacity_seconds = seconds;
+        self.capacity = Self::cap_for(seconds, self.sample_rate_hz);
+        if self.buf.len() > self.capacity {
+            let excess = self.buf.len() - self.capacity;
+            self.buf.drain(..excess);
+            self.dropped += excess as u64;
+        }
+    }
+
+    /// Most samples the ring retains at its current rate.
+    pub fn capacity_samples(&self) -> usize {
+        self.capacity
+    }
+
     pub fn sample_rate_hz(&self) -> Hz {
         Hz(self.sample_rate_hz)
     }
@@ -189,6 +206,23 @@ mod tests {
             start_ns: Timestamp(a * 1_000_000_000),
             end_ns: Timestamp(b * 1_000_000_000),
         }
+    }
+
+    #[test]
+    fn ring_resize_keeps_newest() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        for i in 0..3 {
+            ring.push(&block(i));
+        }
+        ring.resize(1.0);
+        assert_eq!(ring.capacity_samples(), 1000);
+        assert_eq!(ring.earliest(), Some(Timestamp(2_000 * MS)));
+        assert_eq!(ring.latest(), Some(Timestamp(2_999 * MS)));
+        assert_eq!(ring.read(span(2, 3)).unwrap(), block(2).samples.to_vec());
+        ring.resize(5.0);
+        ring.push(&block(3));
+        assert_eq!(ring.earliest(), Some(Timestamp(2_000 * MS)));
+        assert_eq!(ring.read(span(2, 4)).unwrap().len(), 2000);
     }
 
     #[test]

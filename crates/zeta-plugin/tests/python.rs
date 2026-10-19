@@ -161,6 +161,7 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: true,
     };

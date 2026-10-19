@@ -127,6 +127,19 @@ impl RemotePorts {
     }
 }
 
+/// Default ring budget: a quarter of `MemTotal` capped at 4 GiB, 1 GiB when
+/// `/proc/meminfo` cannot be read.
+fn default_ring_budget() -> u64 {
+    const GIB: u64 = 1 << 30;
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            let line = s.lines().find(|l| l.starts_with("MemTotal:"))?;
+            line.split_whitespace().nth(1)?.parse::<u64>().ok()
+        })
+        .map_or(GIB, |kb| (kb * 1024 / 4).min(4 * GIB))
+}
+
 /// Open the node on `state_dir` with the given sources and plugin stages. File sources
 /// loop in real time and start after the node has subscribed to them (a source with no
 /// subscriber stops at once); a KiwiSDR connects on its first tune; a remote node is asked
@@ -140,6 +153,7 @@ pub async fn open(
     sources: &[SourceSpec],
     plugins: &[PluginSpec],
     resume: bool,
+    ring_budget_mb: Option<u64>,
 ) -> Result<(Node, RemotePorts), String> {
     let opts = FileOpts {
         realtime: true,
@@ -207,6 +221,8 @@ pub async fn open(
     let cfg = NodeConfig {
         state_dir,
         ring_seconds: 10.0,
+        ring_budget_bytes: ring_budget_mb
+            .map_or_else(default_ring_budget, |mb| mb.saturating_mul(1 << 20)),
         backends,
         resume,
     };

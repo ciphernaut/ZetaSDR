@@ -42,7 +42,15 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             Ok(d) => d,
             Err(e) => return Ok(usage(&e)),
         };
-        return Ok(ask::run(args, None, state_dir, &sources, &plugins).await);
+        return Ok(ask::run(
+            args,
+            None,
+            state_dir,
+            &sources,
+            &plugins,
+            cli.ring_budget_mb,
+        )
+        .await);
     }
     Err(cli)
 }
@@ -68,7 +76,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
         Err(e) => return usage(&e.to_string()),
     };
     if let Command::Ask(args) = cli.command {
-        return ask::run(args, Some(client), PathBuf::new(), &[], &[]).await;
+        return ask::run(args, Some(client), PathBuf::new(), &[], &[], None).await;
     }
     let op = match cli.command.into_op() {
         Ok(Some(op)) => op,

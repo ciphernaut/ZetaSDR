@@ -43,9 +43,20 @@ fn node_provenance(span: Span) -> Provenance {
     }
 }
 
+/// Ring history in seconds for a source at `rate_hz` within `budget_bytes`
+/// (`Complex<f32>`, 8 bytes per sample): `budget / (rate * 8)` clamped to
+/// `1..=max_seconds`.
+pub fn ring_seconds_for(budget_bytes: u64, rate_hz: u64, max_seconds: f64) -> f64 {
+    let s = budget_bytes as f64 / (rate_hz.max(1) as f64 * 8.0);
+    s.max(1.0).min(max_seconds)
+}
+
 pub struct NodeConfig {
     pub state_dir: PathBuf,
+    /// Longest ring history in seconds; a fast source gets less, see [`ring_seconds_for`].
     pub ring_seconds: f64,
+    /// Memory budget for one source's IQ ring (8 bytes per sample).
+    pub ring_budget_bytes: u64,
     pub backends: Vec<Backend>,
     /// Relaunch `Running` jobs on `open` (a long-lived node). When false, records
     /// are loaded as persisted and nothing is launched, leased or rewritten.
@@ -86,6 +97,7 @@ struct Inner {
     state_dir: PathBuf,
     jobs_dir: PathBuf,
     ring_seconds: f64,
+    ring_budget_bytes: u64,
     backends: Vec<Backend>,
     registry: StageRegistry,
     leases: LeaseManager,
@@ -178,6 +190,7 @@ impl Node {
                 state_dir: cfg.state_dir.clone(),
                 jobs_dir,
                 ring_seconds: cfg.ring_seconds,
+                ring_budget_bytes: cfg.ring_budget_bytes,
                 backends: cfg.backends,
                 registry,
                 leases: LeaseManager::new(),

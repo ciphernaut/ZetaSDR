@@ -63,6 +63,9 @@ pub struct Cli {
     /// `try_parse_checked`).
     #[arg(skip)]
     sources: Vec<SourceSpec>,
+    /// Memory budget in MB for one source's IQ ring (default: a quarter of RAM, at most 4 GiB)
+    #[arg(long, global = true, env = "ZETA_RING_BUDGET_MB", value_name = "MB")]
+    pub ring_budget_mb: Option<u64>,
     /// Machine-readable JSON output (the default when stdout is not a terminal;
     /// no human format exists yet, so output is always JSON)
     #[arg(long, global = true)]

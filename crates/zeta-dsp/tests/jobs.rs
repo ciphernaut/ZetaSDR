@@ -55,6 +55,7 @@ async fn fm_demod_job_produces_audio_with_tone() {
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: true,
     };
@@ -144,6 +145,7 @@ async fn aprs_decode_job_decodes_fixture_packet() {
     let cfg = NodeConfig {
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: true,
     };
@@ -227,6 +229,7 @@ async fn node_over(
     let cfg = NodeConfig {
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
         backends: vec![Backend::Cpu],
         resume: true,
     };

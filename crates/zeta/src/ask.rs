@@ -21,6 +21,7 @@ pub async fn run(
     state_dir: PathBuf,
     sources: &[SourceSpec],
     plugins: &[PluginSpec],
+    ring_budget_mb: Option<u64>,
 ) -> ExitCode {
     let request = match read_request(args.request.as_deref()) {
         Ok(r) => r,
@@ -54,10 +55,11 @@ pub async fn run(
                     "zeta serve (pid {pid}) owns this state dir; use --node"
                 ));
             }
-            let (node, remotes) = match node_setup::open(state_dir, sources, plugins, false).await {
-                Ok((n, r)) => (Arc::new(n), r),
-                Err(e) => return fail(&e),
-            };
+            let (node, remotes) =
+                match node_setup::open(state_dir, sources, plugins, false, ring_budget_mb).await {
+                    Ok((n, r)) => (Arc::new(n), r),
+                    Err(e) => return fail(&e),
+                };
             let md = agents_md::rendering();
             let schema = node.schema();
             let code = drive(

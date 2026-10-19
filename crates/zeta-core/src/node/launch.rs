@@ -1,5 +1,6 @@
 //! Launching jobs: lease, spawn stages, supervise, and the IQ forwarders.
 
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::persist::{now, persist};
-use super::{Inner, JobEntry, NodeError};
+use super::{Inner, JobEntry, NodeError, ring_seconds_for};
 use crate::graph::{self, GraphError};
 use crate::job::{JobRecord, JobState};
 use crate::port::{IqReceiver, Port, Tuning};
@@ -265,8 +266,10 @@ async fn forward_iq(
     }
 }
 
-/// Push a port's blocks into its ring, creating the ring on the first block.
+/// Push a port's blocks into its ring, creating the ring on the first block
+/// and resizing it to the memory budget when the rate changes (a retune).
 pub(super) async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqReceiver) {
+    let mut logged: HashSet<u64> = HashSet::new();
     loop {
         let block = tokio::select! {
             _ = inner.shutdown.cancelled() => return,
@@ -276,19 +279,27 @@ pub(super) async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqRec
                 Err(RecvError::Closed) => return,
             },
         };
+        let rate = block.sample_rate_hz.0;
+        let seconds = ring_seconds_for(inner.ring_budget_bytes, rate, inner.ring_seconds);
+        if logged.insert(rate) {
+            eprintln!(
+                "zeta: ring for {}: {seconds:.2} s at {rate} Hz ({:.1} MB)",
+                source.0,
+                seconds * rate as f64 * 8.0 / 1e6
+            );
+        }
         let ring = inner
             .rings
             .lock()
             .unwrap()
             .entry(source.clone())
-            .or_insert_with(|| {
-                Arc::new(RwLock::new(IqRing::new(
-                    inner.ring_seconds,
-                    block.sample_rate_hz,
-                )))
-            })
+            .or_insert_with(|| Arc::new(RwLock::new(IqRing::new(seconds, block.sample_rate_hz))))
             .clone();
-        ring.write().unwrap().push(&block);
+        let mut ring = ring.write().unwrap();
+        if ring.sample_rate_hz() != block.sample_rate_hz {
+            ring.resize(seconds);
+        }
+        ring.push(&block);
     }
 }
 
