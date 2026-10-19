@@ -108,3 +108,12 @@ remote job. Open: the one-shot form (`job start … --then-tail`) streamed for 1
 events in two runs, while the same job under `serve` did; it is recorded for the final review. A
 federating `serve` stopped with SIGTERM now shuts down like Ctrl-C and stops its remote jobs (fix
 wave). The HackRF step of the by-hand plan did not run (the HackRF was unplugged).
+
+Later on 2026-10-19, with port 7979 opened on the field host's firewall, the two-host test ran directly over the
+LAN with the merged `main`: one remote passthrough per federated job (the idempotent tune), no packet loss
+or lag reported by the new counters, and `measure`, `spectrum` and `fm_demod` over the B210 all produced
+output in both one-shot and `serve` form. The one-shot no-events finding turned out to be a cold-start
+effect: in the first seconds after the remote node opens the B210, `measure` completes fewer or no 1 s
+windows (one event instead of two in the first run after a restart, none in the earlier runs that also went
+through an SSH tunnel with a debug build), and it is gone once the device has been streaming for a minute.
+A settle period after a device starts streaming, or a more tolerant measure window, is the follow-up.
