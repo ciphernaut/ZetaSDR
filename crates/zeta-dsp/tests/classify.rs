@@ -35,6 +35,7 @@ async fn node_over(dir: &std::path::Path, iq: &[Complex<f32>]) -> Node {
         state_dir: dir.join("state"),
         ring_seconds: 600.0,
         ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
     };

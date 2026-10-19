@@ -181,7 +181,12 @@ const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 /// `aprs_decode` channelise the job band at the narrowest exact divisor of the source rate
 /// that is at least 48 kHz and at least the band; `spectrum` covers the whole
 /// capture band. `measure` channelises the job band the same way and
-/// measures only that band, reporting its absolute `center_hz`.
+/// measures only that band, reporting its absolute `center_hz`. `scan`
+/// time-shares the radio across a band wider than one capture: it expands to
+/// no graph; the node steps the source across the band (see [`scan_steps`]),
+/// dwelling [`SCAN_DWELL_MS`] on each step, and emits spectrum rows tagged
+/// with each step's `center_hz` while holding the whole band, so every other
+/// request on the source is a conflict until the scan is stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
@@ -193,6 +198,7 @@ pub enum JobKind {
     SsbDemod,
     AprsDecode,
     Measure,
+    Scan,
 }
 
 impl JobKind {
@@ -207,6 +213,7 @@ impl JobKind {
             JobKind::SsbDemod => "ssb_demod",
             JobKind::AprsDecode => "aprs_decode",
             JobKind::Measure => "measure",
+            JobKind::Scan => "scan",
         }
     }
 
@@ -262,6 +269,11 @@ impl JobKind {
             }
         }
         Ok(match self {
+            JobKind::Scan => Graph {
+                id: GraphId::new(),
+                nodes: vec![],
+                edges: vec![],
+            },
             JobKind::Passthrough => Graph {
                 id: GraphId::new(),
                 nodes: vec![GraphNode {
@@ -490,6 +502,30 @@ pub fn spectrum_size(bandwidth_hz: u64) -> u32 {
     want.checked_next_power_of_two()
         .unwrap_or(u64::MAX)
         .clamp(SPECTRUM_SIZE_MIN as u64, SPECTRUM_SIZE_MAX as u64) as u32
+}
+
+/// Widest capture one scan step asks of the source.
+pub const SCAN_STEP_MAX_HZ: u64 = 16_000_000;
+/// How long a scan waits on each step before reading the ring (the node's
+/// default; `NodeConfig::scan_dwell_ms` overrides it).
+pub const SCAN_DWELL_MS: u64 = 250;
+
+/// The steps a scan of `span` takes on a source with `caps`: captures of
+/// `step = min(max_bandwidth_hz, SCAN_STEP_MAX_HZ)` centred at
+/// `start + step/2 + i·step` for `i < ceil(bandwidth_hz / step)`, where
+/// `start` is the span's lower edge. The last step may overrun the span;
+/// every centre is clamped into the source's tune range.
+pub fn scan_steps(span: Tuning, caps: &Capabilities) -> Vec<Tuning> {
+    let step = caps.max_bandwidth_hz.value().0.clamp(1, SCAN_STEP_MAX_HZ);
+    let n = span.bandwidth_hz.0.div_ceil(step).max(1);
+    let start = span.center_hz.0.saturating_sub(span.bandwidth_hz.0 / 2);
+    let (lo, hi) = (caps.tune_min_hz.value().0, caps.tune_max_hz.value().0);
+    (0..n)
+        .map(|i| Tuning {
+            center_hz: Hz((start + step / 2 + i * step).clamp(lo, hi.max(lo))),
+            bandwidth_hz: Hz(step),
+        })
+        .collect()
 }
 
 /// The lowest channel output rate a job is channelised at.
@@ -964,6 +1000,17 @@ fn checked_port(
     source: &SourceId,
     want: &Tuning,
 ) -> Result<std::sync::Arc<dyn Port>, OpError> {
+    checked_port_up_to(node, source, want, |caps| caps.max_bandwidth_hz.value().0)
+}
+
+/// [`checked_port`] with the widest band given by `max_band` of the
+/// capabilities: a scan's band may be as wide as the tune range plus one capture.
+fn checked_port_up_to(
+    node: &Node,
+    source: &SourceId,
+    want: &Tuning,
+    max_band: impl Fn(&Capabilities) -> u64,
+) -> Result<std::sync::Arc<dyn Port>, OpError> {
     let port = node
         .port(source)
         .ok_or_else(|| unknown_source(node, source))?;
@@ -974,12 +1021,7 @@ fn checked_port(
         caps.tune_min_hz.value().0,
         caps.tune_max_hz.value().0,
     )?;
-    range(
-        "bandwidth_hz",
-        want.bandwidth_hz.0,
-        1,
-        caps.max_bandwidth_hz.value().0,
-    )?;
+    range("bandwidth_hz", want.bandwidth_hz.0, 1, max_band(caps))?;
     Ok(port)
 }
 
@@ -1128,6 +1170,21 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 center_hz,
                 bandwidth_hz,
             };
+            if kind == JobKind::Scan {
+                // No tune here: the scan leases its whole band and steps the
+                // source itself; a held source is a conflict at the lease.
+                checked_port_up_to(node, &source, &tuning, |caps| {
+                    let tune =
+                        (caps.tune_max_hz.value().0).saturating_sub(caps.tune_min_hz.value().0);
+                    tune.saturating_add(caps.max_bandwidth_hz.value().0)
+                })?;
+                let graph = kind.expand(&source, tuning, Hz(0), None, None, None)?;
+                return node
+                    .job_start(kind.name(), source, tuning, graph)
+                    .await
+                    .map(OpResult::Job)
+                    .map_err(|e| node_error(node, e));
+            }
             let port = checked_port(node, &source, &tuning)?;
             // The granted capture band: its width is the source rate (Port contract).
             let granted = node

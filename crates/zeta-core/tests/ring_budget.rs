@@ -64,6 +64,7 @@ async fn retune_resizes_ring_within_budget() {
         state_dir: dir.path().join("state"),
         ring_seconds: 10.0,
         ring_budget_bytes: budget,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
     };

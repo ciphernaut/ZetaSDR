@@ -61,6 +61,9 @@ pub struct NodeConfig {
     /// Relaunch `Running` jobs on `open` (a long-lived node). When false, records
     /// are loaded as persisted and nothing is launched, leased or rewritten.
     pub resume: bool,
+    /// How long a `scan` job dwells on each step; normally
+    /// [`crate::ops::SCAN_DWELL_MS`], shorter in tests.
+    pub scan_dwell_ms: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +101,7 @@ struct Inner {
     jobs_dir: PathBuf,
     ring_seconds: f64,
     ring_budget_bytes: u64,
+    scan_dwell_ms: u64,
     backends: Vec<Backend>,
     registry: StageRegistry,
     leases: LeaseManager,
@@ -191,6 +195,7 @@ impl Node {
                 jobs_dir,
                 ring_seconds: cfg.ring_seconds,
                 ring_budget_bytes: cfg.ring_budget_bytes,
+                scan_dwell_ms: cfg.scan_dwell_ms,
                 backends: cfg.backends,
                 registry,
                 leases: LeaseManager::new(),

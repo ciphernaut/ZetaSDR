@@ -350,6 +350,69 @@ fn then_tail_stops_job_unless_keep() {
 }
 
 #[test]
+fn scan_kind_is_accepted_and_lists_as_running() {
+    let dir = tempfile::tempdir().unwrap();
+    // A scan over the file source's own band is one step: rows from the
+    // registered `fft` stage, tagged with that step.
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "scan",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+            "--then-tail",
+            "2,5000",
+            "--keep",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let id = v[0]["value"].as_str().expect("job id").to_owned();
+    let frames = v[1]["value"]["frames"].as_array().expect("frames");
+    assert_eq!(frames.len(), 2, "{v}");
+    for f in frames {
+        assert_eq!(f["channel"], "scan/0", "{v}");
+        assert_eq!(f["payload"]["center_hz"], 100_000_000, "{v}");
+        assert_eq!(f["payload"]["size"], 1024, "{v}");
+    }
+    assert_eq!(v[2], serde_json::json!({"stopped": false}));
+
+    let listed = |dir: &Path| {
+        let out = zeta(dir, &["job", "list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        json(&out)["value"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .find(|j| j["id"] == id.as_str())
+            .expect("job listed")
+            .clone()
+    };
+    let job = listed(dir.path());
+    assert_eq!(job["kind"], "scan");
+    assert_eq!(job["state"]["status"], "running");
+    zeta(dir.path(), &["job", "stop", "--job", &id])
+        .assert()
+        .success();
+    assert_eq!(listed(dir.path())["state"]["status"], "stopped");
+}
+
+#[test]
 fn then_tail_malformed_value_is_usage_error() {
     let dir = tempfile::tempdir().unwrap();
     aprs_start(dir.path(), "1", &[])

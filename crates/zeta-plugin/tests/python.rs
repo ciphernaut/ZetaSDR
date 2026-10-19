@@ -162,6 +162,7 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
     };

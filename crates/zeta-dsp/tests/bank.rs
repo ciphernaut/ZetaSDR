@@ -475,6 +475,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
     };

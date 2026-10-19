@@ -84,6 +84,7 @@ async fn node_with(src: Arc<KiwiSource>) -> (Node, tempfile::TempDir) {
         state_dir: dir.path().join("state"),
         ring_seconds: 2.0,
         ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
     };

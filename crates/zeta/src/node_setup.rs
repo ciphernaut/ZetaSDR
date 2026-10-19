@@ -229,6 +229,7 @@ pub async fn open(
             .map_or_else(default_ring_budget, |mb| mb.saturating_mul(1 << 20)),
         backends,
         resume,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
     };
     let node = Node::open(cfg, registry, ports)
         .await
@@ -300,6 +301,10 @@ mod tests {
                     match kind.expand(&src, tuning, Hz(rate), None, None, None) {
                         Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
                             assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
+                        }
+                        // A scan runs no graph: the node steps the source itself.
+                        Ok(g) if kind == JobKind::Scan => {
+                            assert!(g.nodes.is_empty() && g.edges.is_empty(), "{g:?}");
                         }
                         Ok(g) => {
                             validate(&g, &registry)
