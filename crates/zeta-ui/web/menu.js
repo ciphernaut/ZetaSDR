@@ -269,6 +269,7 @@ class Menu {
       y0 !== null && y1 !== null && y0 !== y1
         ? (LABEL_STEP_PX * 1000) / (y0 - y1)
         : LABEL_FALLBACK_STEP_HZ;
+    // Only the top layer-2 label is drawn; the others appear in the transcript.
     const l1 = labels.filter((l) => l.layer !== 2);
     const top2 = labels
       .filter((l) => l.layer === 2)
