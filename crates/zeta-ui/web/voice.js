@@ -108,6 +108,10 @@ function errorText(e) {
 // Starts capturing; resolves to {rate, stop() -> Float32Array} once audio flows. The context
 // is created first, synchronously inside the click, so browsers let it start.
 async function capture(onChunkLimit) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    // Browsers expose the microphone only in a secure context (https or localhost).
+    throw new Error("microphone needs a secure context: open the ui over https or localhost");
+  }
   const ctx = new AudioContext();
   let stream;
   try {
