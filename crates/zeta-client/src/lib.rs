@@ -3,9 +3,11 @@
 pub mod guide;
 pub mod remote;
 pub mod tools;
+pub mod ws;
 pub use guide::{op_sections, system_prompt};
 pub use remote::{ClientError, NodeClient};
 pub use tools::{ToolDef, op_from_call, op_tools};
+pub use ws::{CLIENT_INITIAL_CREDIT, CLIENT_TOPUP, Received, Subscription};
 
 use serde_json::Value;
 use zeta_core::ops::{Op, OpError};

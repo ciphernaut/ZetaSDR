@@ -3710,13 +3710,17 @@ dependencies = [
 name = "zeta-client"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
+ "num-complex",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "zeta-core",
+ "zeta-vrt",
  "zeta-ws",
 ]
 
