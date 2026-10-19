@@ -109,6 +109,7 @@ async fn python_gain_plugin_scales_iq() {
                 vec![o],
                 b,
                 Default::default(),
+                zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
             )
             .await
     });
@@ -314,7 +315,14 @@ async fn python_exception_becomes_stage_failure() {
     tx.send(iq_frame(&[Complex::new(1.0, 0.0)])).unwrap();
     let run = tokio::spawn(async move {
         stage
-            .run(json!({}), vec![rx_in], vec![out], bus, Default::default())
+            .run(
+                json!({}),
+                vec![rx_in],
+                vec![out],
+                bus,
+                Default::default(),
+                ctx(),
+            )
             .await
     });
     let r = tokio::time::timeout(Duration::from_secs(10), run)
@@ -418,4 +426,8 @@ fn python_sdk_fixtures_are_the_hosts_bytes() {
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(*t, hex);
     }
+}
+
+fn ctx() -> zeta_core::stage::StageContext {
+    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into()))
 }

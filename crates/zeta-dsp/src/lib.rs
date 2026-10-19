@@ -14,6 +14,7 @@ pub mod afsk;
 pub mod am;
 pub mod aprs;
 pub mod ax25;
+pub mod bank;
 pub mod catalogue;
 pub mod channel;
 pub mod fft;

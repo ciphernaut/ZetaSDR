@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::bank::ChannelBank;
 use crate::stream::{Frame, StreamBus};
-use crate::types::{StreamId, StreamKind};
+use crate::types::{SourceId, StreamId, StreamKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -43,6 +44,22 @@ pub struct StageSpec {
     pub params_schema: schemars::Schema,
 }
 
+/// What a stage knows of the job it runs in beyond its params and streams:
+/// the job's source and, when the node keeps one for it, the source's
+/// channel bank.
+#[derive(Clone)]
+pub struct StageContext {
+    pub source: SourceId,
+    pub bank: Option<Arc<dyn ChannelBank>>,
+}
+
+impl StageContext {
+    /// A context for `source` with no bank.
+    pub fn new(source: SourceId) -> Self {
+        Self { source, bank: None }
+    }
+}
+
 #[async_trait]
 pub trait Stage: Send + Sync {
     fn spec(&self) -> &StageSpec;
@@ -58,6 +75,7 @@ pub trait Stage: Send + Sync {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
+        ctx: StageContext,
     ) -> Result<(), StageError>;
 }
 
@@ -185,6 +203,7 @@ impl Stage for PassthroughStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
+        _ctx: StageContext,
     ) -> Result<(), StageError> {
         let (Some(rx), Some(out)) = (inputs.first_mut(), outputs.first()) else {
             return Err(StageError::Failed(
@@ -230,6 +249,7 @@ mod tests {
             _: Vec<StreamId>,
             _: Arc<StreamBus>,
             _: CancellationToken,
+            _: StageContext,
         ) -> Result<(), StageError> {
             Ok(())
         }
@@ -307,6 +327,7 @@ mod tests {
                     vec![o2],
                     b2,
                     cancel,
+                    StageContext::new(SourceId("s".into())),
                 )
                 .await
         });

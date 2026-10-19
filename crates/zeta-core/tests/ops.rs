@@ -385,6 +385,7 @@ impl zeta_core::stage::Stage for IdleStage {
         _outputs: Vec<StreamId>,
         _bus: Arc<zeta_core::stream::StreamBus>,
         cancel: tokio_util::sync::CancellationToken,
+        _ctx: zeta_core::stage::StageContext,
     ) -> Result<(), zeta_core::stage::StageError> {
         cancel.cancelled().await;
         Err(zeta_core::stage::StageError::Cancelled)
@@ -430,7 +431,7 @@ async fn job_start_reexpands_when_lease_rate_differs() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let g = JobKind::Passthrough
-            .expand(&source, wide, wide.bandwidth_hz, None, None)
+            .expand(&source, wide, wide.bandwidth_hz, None, None, None)
             .unwrap();
         node.job_start("passthrough", source.clone(), wide, g).await
     };
@@ -919,7 +920,14 @@ fn spectrum_kind_expands_to_single_fft_node() {
         bandwidth_hz: Hz(48_000),
     };
     let g = JobKind::Spectrum
-        .expand(&SourceId("file0".into()), tuning, Hz(48_000), None, None)
+        .expand(
+            &SourceId("file0".into()),
+            tuning,
+            Hz(48_000),
+            None,
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(g.nodes.len(), 1);
     assert!(g.edges.is_empty());
@@ -942,7 +950,14 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
         bandwidth_hz: Hz(12_500),
     };
     let g = JobKind::FmDemod
-        .expand(&SourceId("file0".into()), tuning, Hz(48_000), None, None)
+        .expand(
+            &SourceId("file0".into()),
+            tuning,
+            Hz(48_000),
+            None,
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(g.nodes.len(), 2);
     assert_eq!(g.nodes[0].kind, "channel");
@@ -973,7 +988,14 @@ fn measure_kind_expands_to_channel_then_measure() {
         bandwidth_hz: Hz(12_500),
     };
     let g = JobKind::Measure
-        .expand(&SourceId("file0".into()), tuning, Hz(2_048_000), None, None)
+        .expand(
+            &SourceId("file0".into()),
+            tuning,
+            Hz(2_048_000),
+            None,
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(g.nodes.len(), 2);
     assert_eq!(g.nodes[0].kind, "channel");
@@ -993,7 +1015,7 @@ fn measure_kind_expands_to_channel_then_measure() {
     // Channelised, so an unknown source rate is refused.
     assert!(
         JobKind::Measure
-            .expand(&SourceId("file0".into()), tuning, Hz(0), None, None)
+            .expand(&SourceId("file0".into()), tuning, Hz(0), None, None, None)
             .is_err()
     );
 }
@@ -1031,7 +1053,7 @@ fn expand_uses_source_rate_for_channel_and_audio() {
         bandwidth_hz: Hz(12_500),
     };
     let g = JobKind::FmDemod
-        .expand(&src, tuning, Hz(2_048_000), None, None)
+        .expand(&src, tuning, Hz(2_048_000), None, None, None)
         .unwrap();
     assert_eq!(rates(&g), (51_200, AUDIO_RATE_HZ));
     let tuning = Tuning {
@@ -1039,14 +1061,43 @@ fn expand_uses_source_rate_for_channel_and_audio() {
         bandwidth_hz: Hz(10_000),
     };
     let g = JobKind::FmDemod
-        .expand(&src, tuning, Hz(12_000), None, None)
+        .expand(&src, tuning, Hz(12_000), None, None, None)
         .unwrap();
     assert_eq!(rates(&g), (12_000, AUDIO_RATE_HZ));
     let g = JobKind::AprsDecode
-        .expand(&src, tuning, Hz(12_000), None, None)
+        .expand(&src, tuning, Hz(12_000), None, None, None)
         .unwrap();
     assert_eq!(rates(&g), (12_000, AUDIO_RATE_HZ));
     assert_eq!(g.nodes[1].params["deviation_hz"], 3_000);
+}
+
+#[test]
+fn bank_served_channel_rate_divides_the_bin_rate() {
+    let src = SourceId("b210".into());
+    let out = |source_rate: u64, bin_rate: Option<u64>, bw: u64| {
+        let tuning = Tuning {
+            center_hz: Hz(144_800_000),
+            bandwidth_hz: Hz(bw),
+        };
+        let g = JobKind::FmDemod
+            .expand(&src, tuning, Hz(source_rate), bin_rate, None, None)
+            .unwrap();
+        g.nodes[0].params["out_rate_hz"].as_u64().unwrap()
+    };
+    // 2.4 Msps, 8 bins: bin rate 600 kHz. Served by a bin, the channel rate
+    // divides the bin rate (50 kHz), not the source rate (48 kHz).
+    assert_eq!(out(2_400_000, None, 12_500), 48_000);
+    assert_eq!(out(2_400_000, Some(600_000), 12_500), 50_000);
+    assert!(600_000 % out(2_400_000, Some(600_000), 12_500) == 0);
+    // 8 Msps, 8 bins: bin 1 MHz, bin rate 2 MHz.
+    assert_eq!(out(8_000_000, Some(2_000_000), 200_000), 200_000);
+    assert_eq!(out(8_000_000, Some(2_000_000), 1_000_000), 1_000_000);
+    // Wider than a bin: the source rate decides, as without a bank.
+    assert_eq!(
+        out(8_000_000, Some(2_000_000), 1_500_000),
+        out(8_000_000, None, 1_500_000)
+    );
+    assert_eq!(out(8_000_000, Some(2_000_000), 1_500_000), 1_600_000);
 }
 
 #[test]
@@ -1057,7 +1108,14 @@ fn fm_demod_expansion_outputs_48k_audio() {
         bandwidth_hz: Hz(200_000),
     };
     let g = JobKind::FmDemod
-        .expand(&SourceId("rtl0".into()), tuning, Hz(1_000_000), None, None)
+        .expand(
+            &SourceId("rtl0".into()),
+            tuning,
+            Hz(1_000_000),
+            None,
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(g.nodes[0].kind, "channel");
     assert_eq!(g.nodes[0].params["out_rate_hz"], 200_000);
@@ -1072,7 +1130,14 @@ fn expand_rejects_band_wider_than_channel_rate() {
         bandwidth_hz: Hz(20_000),
     };
     let err = JobKind::FmDemod
-        .expand(&SourceId("kiwi0".into()), tuning, Hz(12_000), None, None)
+        .expand(
+            &SourceId("kiwi0".into()),
+            tuning,
+            Hz(12_000),
+            None,
+            None,
+            None,
+        )
         .unwrap_err();
     assert_eq!(
         err,
@@ -1093,7 +1158,7 @@ fn expand_rejects_unknown_source_rate() {
         bandwidth_hz: Hz(10_000),
     };
     let err = JobKind::AprsDecode
-        .expand(&SourceId("kiwi0".into()), tuning, Hz(0), None, None)
+        .expand(&SourceId("kiwi0".into()), tuning, Hz(0), None, None, None)
         .unwrap_err();
     assert_eq!(
         err,
@@ -1334,6 +1399,7 @@ fn fm_demod_default_deviation_is_5000() {
             Hz(48_000),
             None,
             None,
+            None,
         )
         .unwrap();
     assert_eq!(g.nodes[1].params["deviation_hz"], 5_000);
@@ -1347,6 +1413,7 @@ fn deviation_param_reaches_nbfm_node() {
             &SourceId("file0".into()),
             fm_tuning(),
             Hz(48_000),
+            None,
             Some(Hz(2_500)),
             None,
         )
@@ -1546,6 +1613,7 @@ fn wfm_expansion_is_channel_then_wfm_demod() {
                 &SourceId("b210".into()),
                 tuning,
                 Hz(1_000_000),
+                None,
                 deviation,
                 None,
             )
@@ -1580,7 +1648,14 @@ fn am_expansion_is_channel_then_am_demod() {
         bandwidth_hz: Hz(10_000),
     };
     let g = JobKind::AmDemod
-        .expand(&SourceId("b210".into()), tuning, Hz(48_000), None, None)
+        .expand(
+            &SourceId("b210".into()),
+            tuning,
+            Hz(48_000),
+            None,
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(g.nodes.len(), 2);
     assert_eq!(g.nodes[0].kind, "channel");
@@ -1612,7 +1687,14 @@ fn ssb_expansion_defaults_to_usb() {
         (Some(Sideband::Lsb), "lsb"),
     ] {
         let g = JobKind::SsbDemod
-            .expand(&SourceId("kiwi".into()), tuning, Hz(48_000), None, sideband)
+            .expand(
+                &SourceId("kiwi".into()),
+                tuning,
+                Hz(48_000),
+                None,
+                None,
+                sideband,
+            )
             .unwrap();
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.nodes[0].kind, "channel");

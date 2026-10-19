@@ -12,9 +12,9 @@ use super::persist::{now, persist};
 use super::{Inner, JobEntry, NodeError};
 use crate::graph::{self, GraphError};
 use crate::job::{JobRecord, JobState};
-use crate::port::{IqReceiver, Port};
+use crate::port::{IqReceiver, Port, Tuning};
 use crate::ring::IqRing;
-use crate::stage::StageError;
+use crate::stage::{StageContext, StageError};
 use crate::stream::{Frame, Payload, StreamBus};
 use crate::types::{JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 
@@ -40,6 +40,22 @@ impl Inner {
         self.leases
             .ensure(port.as_ref(), rec.id.clone(), rec.tuning)
             .await?;
+
+        // The bank for the band the lease left the port at, so the stages
+        // never subscribe to one made for a band the port has left.
+        let bank = match port.current() {
+            Some(band) => self.sync_bank(&rec.source, band),
+            None => self
+                .banks
+                .lock()
+                .unwrap()
+                .get(&rec.source)
+                .and_then(|s| s.bank.clone()),
+        };
+        let ctx = StageContext {
+            source: rec.source.clone(),
+            bank,
+        };
 
         let id = rec.id.clone();
         let token = self.shutdown.child_token();
@@ -105,7 +121,8 @@ impl Inner {
                 outputs.push(sid);
             }
             let (params, bus, cancel) = (n.params.clone(), self.bus.clone(), token.clone());
-            set.spawn(async move { stage.run(params, inputs, outputs, bus, cancel).await });
+            let ctx = ctx.clone();
+            set.spawn(async move { stage.run(params, inputs, outputs, bus, cancel, ctx).await });
         }
         if let Some(sid) = iq {
             let rx = port.subscribe();
@@ -272,5 +289,27 @@ pub(super) async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqRec
             })
             .clone();
         ring.write().unwrap().push(&block);
+    }
+}
+
+/// Push a port's blocks into its channel bank. The first block of a new
+/// capture band (rate or centre) replaces the bank with one for that band.
+pub(super) async fn feed_bank(inner: Arc<Inner>, source: SourceId, mut rx: IqReceiver) {
+    loop {
+        let block = tokio::select! {
+            _ = inner.shutdown.cancelled() => return,
+            r = rx.recv() => match r {
+                Ok(b) => b,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return,
+            },
+        };
+        let band = Tuning {
+            center_hz: block.center_hz,
+            bandwidth_hz: block.sample_rate_hz,
+        };
+        if let Some(bank) = inner.sync_bank(&source, band) {
+            bank.push(&block);
+        }
     }
 }

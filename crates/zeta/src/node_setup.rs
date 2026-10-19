@@ -213,6 +213,8 @@ pub async fn open(
     let node = Node::open(cfg, registry, ports)
         .await
         .map_err(|e| e.to_string())?;
+    // Jobs resumed by `open` predate the factory and run without a bank.
+    node.set_bank_factory(Arc::new(zeta_dsp::bank::PfbBankFactory));
     for s in &files {
         s.start();
     }
@@ -259,7 +261,7 @@ mod tests {
                         center_hz: Hz(7_100_000),
                         bandwidth_hz: Hz(bw),
                     };
-                    match kind.expand(&src, tuning, Hz(rate), None, None) {
+                    match kind.expand(&src, tuning, Hz(rate), None, None, None) {
                         Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
                             assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
                         }

@@ -10,7 +10,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
+use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{StreamId, StreamKind};
 
@@ -179,6 +179,7 @@ impl Stage for FftStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
+        _ctx: StageContext,
     ) -> Result<(), StageError> {
         let p: FftParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("fft params: {e}")))?;
@@ -302,6 +303,7 @@ mod tests {
                     vec![o2],
                     bus,
                     CancellationToken::new(),
+                    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
                 )
                 .await
         });

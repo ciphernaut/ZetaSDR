@@ -226,15 +226,25 @@ impl JobKind {
     /// The kind's graph for `tuning` on a source sampling at `source_rate_hz`
     /// (the port-returned `bandwidth_hz`). Kinds with a `channel` node refuse
     /// an unknown (0) rate and a band wider than [`channel_rate_hz`].
+    ///
+    /// `bank_bin_rate_hz` is the bin rate of the source's channel bank, if it
+    /// has one (twice the bin width). A band no wider than a bin is served by
+    /// the bank, so its channel rate is [`channel_rate_hz`] of the bin rate;
+    /// otherwise of the source rate.
     pub fn expand(
         &self,
         _source: &SourceId,
         tuning: Tuning,
         source_rate_hz: Hz,
+        bank_bin_rate_hz: Option<u64>,
         deviation_hz: Option<Hz>,
         sideband: Option<Sideband>,
     ) -> Result<Graph, OpError> {
-        let out = channel_rate_hz(source_rate_hz.0, tuning.bandwidth_hz.0);
+        let bw = tuning.bandwidth_hz.0;
+        let out = match bank_bin_rate_hz {
+            Some(bin_rate) if bw <= bin_rate / 2 => channel_rate_hz(bin_rate, bw),
+            _ => channel_rate_hz(source_rate_hz.0, bw),
+        };
         if self.channelised() {
             if source_rate_hz.0 == 0 {
                 return Err(OpError::Other {
@@ -1007,6 +1017,7 @@ async fn reconcile_rate(
             port.id(),
             tuning,
             leased.bandwidth_hz,
+            node.bank_bin_rate(port.id(), leased),
             deviation_hz,
             sideband,
         ) {
@@ -1101,7 +1112,15 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 .tune_if_unheld(port.as_ref(), tuning)
                 .await
                 .map_err(lease_error)?;
-            let graph = kind.expand(&source, tuning, granted.bandwidth_hz, deviation, sideband)?;
+            let bin_rate = node.bank_bin_rate(&source, granted);
+            let graph = kind.expand(
+                &source,
+                tuning,
+                granted.bandwidth_hz,
+                bin_rate,
+                deviation,
+                sideband,
+            )?;
             let id = node
                 .job_start(kind.name(), source, tuning, graph)
                 .await

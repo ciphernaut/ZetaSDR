@@ -261,6 +261,7 @@ mod tests {
             _: Vec<crate::types::StreamId>,
             _: Arc<crate::stream::StreamBus>,
             _: tokio_util::sync::CancellationToken,
+            _: crate::stage::StageContext,
         ) -> Result<(), crate::stage::StageError> {
             Ok(())
         }

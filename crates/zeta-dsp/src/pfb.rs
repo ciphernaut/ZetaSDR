@@ -119,6 +119,13 @@ impl PfbBank {
         self.bins
     }
 
+    /// Prototype filter length in input samples (`8 x bins`). Bin output
+    /// `h` is produced with input `h x bins/2 + bins/2 - 1` as its newest
+    /// sample; its group delay is `(taps_len - 1) / 2` input samples.
+    pub fn taps_len(&self) -> usize {
+        self.rev_taps.len()
+    }
+
     /// Feed `iq`; returns one Vec per bin (natural order) holding the samples
     /// produced by this call: one per complete hop of `bins / 2` inputs, with
     /// a trailing partial hop kept for the next call.

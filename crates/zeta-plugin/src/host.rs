@@ -42,7 +42,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
+use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{JobId, Provenance, SourceId, StreamId, StreamKind};
 
@@ -458,6 +458,7 @@ impl Stage for ExternalStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
+        _ctx: StageContext,
     ) -> Result<(), StageError> {
         let kind = self.spec.kind;
         let failed = |m: String| Err(StageError::Failed(m));

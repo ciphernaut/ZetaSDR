@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::bank::{BankFactory, ChannelBank, PFB_MIN_RATE_HZ};
 use crate::classify::{Classifier, ClassifierSet};
 use crate::graph::{self, Graph, GraphError};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
@@ -25,7 +26,7 @@ use crate::types::{Capabilities, JobId, Provenance, SourceId, Span, StreamId, St
 
 pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
 
-use launch::feed_ring;
+use launch::{feed_bank, feed_ring};
 use persist::{io, load, now, persist};
 
 const BUS_CAPACITY: usize = 256;
@@ -74,6 +75,13 @@ struct JobEntry {
     done: Option<JoinHandle<()>>,
 }
 
+/// A source's bank for the capture band it was made for; `bank` is `None`
+/// when that band is narrower than [`PFB_MIN_RATE_HZ`] or the factory declined.
+struct BankSlot {
+    band: Tuning,
+    bank: Option<Arc<dyn ChannelBank>>,
+}
+
 struct Inner {
     state_dir: PathBuf,
     jobs_dir: PathBuf,
@@ -84,6 +92,8 @@ struct Inner {
     bus: Arc<StreamBus>,
     ports: RwLock<HashMap<SourceId, Arc<dyn Port>>>,
     rings: Mutex<HashMap<SourceId, Arc<RwLock<IqRing>>>>,
+    bank_factory: RwLock<Option<Arc<dyn BankFactory>>>,
+    banks: Mutex<HashMap<SourceId, BankSlot>>,
     jobs: Mutex<HashMap<JobId, JobEntry>>,
     knowledge: RwLock<Vec<Arc<dyn KnowledgeProvider>>>,
     classifiers: RwLock<ClassifierSet>,
@@ -91,6 +101,32 @@ struct Inner {
     persist_errors: Mutex<Vec<String>>,
     /// Cancelled when the `Node` is dropped; every job token is a child of it.
     shutdown: CancellationToken,
+}
+
+impl Inner {
+    /// `source`'s bank for the capture `band`: the kept one when it was made
+    /// for that band, else a new one from the factory (none below
+    /// [`PFB_MIN_RATE_HZ`]) replacing it. Without a factory nothing is kept.
+    fn sync_bank(&self, source: &SourceId, band: Tuning) -> Option<Arc<dyn ChannelBank>> {
+        let mut banks = self.banks.lock().unwrap();
+        if let Some(slot) = banks.get(source)
+            && slot.band == band
+        {
+            return slot.bank.clone();
+        }
+        let factory = self.bank_factory.read().unwrap().clone()?;
+        let bank = (band.bandwidth_hz.0 >= PFB_MIN_RATE_HZ)
+            .then(|| factory.make(band.bandwidth_hz, band.center_hz))
+            .flatten();
+        banks.insert(
+            source.clone(),
+            BankSlot {
+                band,
+                bank: bank.clone(),
+            },
+        );
+        bank
+    }
 }
 
 /// Dropping the node cancels its tasks without touching persisted state, so
@@ -148,6 +184,8 @@ impl Node {
                 bus,
                 ports: RwLock::new(HashMap::new()),
                 rings: Mutex::new(HashMap::new()),
+                bank_factory: RwLock::new(None),
+                banks: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
                 knowledge: RwLock::new(Vec::new()),
                 classifiers: RwLock::new(ClassifierSet::default()),
@@ -213,9 +251,10 @@ impl Node {
         &self.load_errors
     }
 
-    /// Attach a port and start feeding its blocks into that source's ring.
-    /// A second port with an attached source's id is `DuplicateSource`.
-    /// Does not resume jobs.
+    /// Attach a port and start feeding its blocks into that source's ring and
+    /// channel bank (made now for the port's current band, if it has one, and
+    /// remade whenever its blocks show a new band). A second port with an
+    /// attached source's id is `DuplicateSource`. Does not resume jobs.
     pub fn add_port(&self, port: Arc<dyn Port>) -> Result<(), NodeError> {
         let inner = &self.inner;
         let source = port.id().clone();
@@ -226,8 +265,42 @@ impl Node {
             }
             ports.insert(source.clone(), port.clone());
         }
-        tokio::spawn(feed_ring(inner.clone(), source, port.subscribe()));
+        if let Some(band) = port.current() {
+            inner.sync_bank(&source, band);
+        }
+        tokio::spawn(feed_ring(inner.clone(), source.clone(), port.subscribe()));
+        tokio::spawn(feed_bank(inner.clone(), source, port.subscribe()));
         Ok(())
+    }
+
+    /// Use `factory` for the channel banks of wide sources (rate at least
+    /// [`PFB_MIN_RATE_HZ`]); existing banks are dropped and remade with it
+    /// for every port that has a current band.
+    pub fn set_bank_factory(&self, factory: Arc<dyn BankFactory>) {
+        *self.inner.bank_factory.write().unwrap() = Some(factory);
+        self.inner.banks.lock().unwrap().clear();
+        let ports: Vec<_> = self.inner.ports.read().unwrap().values().cloned().collect();
+        for p in ports {
+            if let Some(band) = p.current() {
+                self.inner.sync_bank(p.id(), band);
+            }
+        }
+    }
+
+    /// The channel bank the node keeps for `source`, if any.
+    pub fn bank(&self, source: &SourceId) -> Option<Arc<dyn ChannelBank>> {
+        self.inner
+            .banks
+            .lock()
+            .unwrap()
+            .get(source)
+            .and_then(|s| s.bank.clone())
+    }
+
+    /// The bin rate of `source`'s bank for the capture `band` (made now if
+    /// the band is new), or `None` when that band gets no bank.
+    pub(crate) fn bank_bin_rate(&self, source: &SourceId, band: Tuning) -> Option<u64> {
+        self.inner.sync_bank(source, band).map(|b| 2 * b.bin_hz())
     }
 
     /// Register a knowledge provider; `KnowledgeLookup` queries all of them.

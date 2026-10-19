@@ -101,6 +101,7 @@ async fn ssb_stage_rejects_bad_bandwidth() {
                 vec![StreamId::new()],
                 bus,
                 CancellationToken::new(),
+                zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
             )
             .await;
         match r {

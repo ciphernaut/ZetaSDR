@@ -123,7 +123,8 @@ fn start_with(
     }
     let cancel = CancellationToken::new();
     let (b, o, c) = (bus.clone(), out.clone(), cancel.clone());
-    let run = tokio::spawn(async move { stage.run(params, vec![rx_in], vec![o], b, c).await });
+    let run =
+        tokio::spawn(async move { stage.run(params, vec![rx_in], vec![o], b, c, ctx()).await });
     Rig {
         tx,
         bus,
@@ -544,4 +545,8 @@ async fn input_of_undeclared_kind_fails_stage() {
         rig.rx_out.try_recv(),
         Err(broadcast::error::TryRecvError::Empty)
     ));
+}
+
+fn ctx() -> zeta_core::stage::StageContext {
+    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into()))
 }
