@@ -8,7 +8,12 @@ const CUTOFF: f64 = 0.45;
 /// Prototype taps per unit of `max(L, M)`.
 const TAPS_PER_FACTOR: u64 = 8;
 
-/// Largest `max(L, M)` accepted: 800 001 prototype taps. Coprime rates (a
+/// Fewest prototype taps: small factors (96k→48k gives 17 by the formula)
+/// would otherwise leave a transition band too wide to stop aliasing.
+const MIN_TAPS: u64 = 63;
+
+/// Largest `max(L, M)` accepted, so at most 800 001 prototype taps (the
+/// 63-tap floor only applies below `max(L, M) = 8`). Coprime rates (a
 /// prime source rate, say) otherwise reduce to factors in the millions and a
 /// prototype of tens of megabytes.
 pub const MAX_FACTOR: u64 = 100_000;
@@ -23,7 +28,7 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// Streaming resampler from `in_rate_hz` to `out_rate_hz` by the reduced
 /// ratio L/M. The prototype is a Hann-windowed sinc low-pass at
 /// `0.45 × min(in, out)` designed at the upsampled rate `in × L`, with
-/// `8 × max(L, M) + 1` taps and gain L. Evaluation is polyphase: output `m`
+/// `max(8 × max(L, M) + 1, 63)` taps (odd either way) and gain L. Evaluation is polyphase: output `m`
 /// sits at upsampled index `m × M`, uses phase `p = m × M mod L` and the input
 /// samples ending at `m × M / L`, so the zero-stuffed signal never exists.
 /// Input history and the output phase carry across [`Resampler::process`]
@@ -66,7 +71,7 @@ impl Resampler {
                 "resampler {in_rate_hz} -> {out_rate_hz} Hz reduces to {l}/{m}, beyond the {MAX_FACTOR} limit"
             ));
         }
-        let n = (TAPS_PER_FACTOR * l.max(m) + 1) as usize;
+        let n = (TAPS_PER_FACTOR * l.max(m) + 1).max(MIN_TAPS) as usize;
         let cutoff = CUTOFF * in_rate_hz.min(out_rate_hz) as f64;
         let h = lowpass_taps(cutoff, in_rate_hz as f64 * l as f64, n);
         let lu = l as usize;
@@ -93,8 +98,9 @@ impl Resampler {
         (self.l, self.m)
     }
 
-    /// Resample the next block of input. Over a stream of N inputs the outputs
-    /// total `ceil(N × L / M)`.
+    /// Resample the next block of input. Over a stream of N inputs fed to a
+    /// fresh resampler the outputs total `ceil(N × L / M)`; a single block's
+    /// count varies by one because `next` carries the remainder between calls.
     pub fn process(&mut self, x: &[f32]) -> Vec<f32> {
         if self.l == 1 && self.m == 1 {
             return x.to_vec();

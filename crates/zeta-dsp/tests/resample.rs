@@ -57,8 +57,9 @@ fn resampler_handles_integer_and_identity_ratios() {
     for chunk in [&x[..1001], &x[1001..1002], &x[1002..]] {
         y.extend(r.process(chunk));
     }
-    // L = 1: polyphase reduces to a plain FIR-and-decimate with 8 × 2 + 1 taps.
-    let want = fir_decimate_real(&x, &lowpass_taps(21_600.0, 96_000.0, 17), 2);
+    // L = 1: polyphase reduces to a plain FIR-and-decimate; 8 × 2 + 1 = 17
+    // taps is raised to the 63-tap floor.
+    let want = fir_decimate_real(&x, &lowpass_taps(21_600.0, 96_000.0, 63), 2);
     assert_eq!(y.len(), want.len());
     assert_eq!(y.len(), 2_401);
     for (a, b) in y.iter().zip(&want) {
@@ -69,6 +70,22 @@ fn resampler_handles_integer_and_identity_ratios() {
     assert_eq!(id.ratio(), (1, 1));
     assert_eq!(id.process(&x[..1000]), x[..1000].to_vec());
     assert_eq!(id.process(&x[1000..1001]), x[1000..1001].to_vec());
+}
+
+#[test]
+fn resampler_attenuates_30_khz_by_40_db_at_96k_to_48k() {
+    // 30 kHz is above the 24 kHz output Nyquist and would alias to 18 kHz.
+    let rms_out = |freq_hz: f64| {
+        let x = tone(96_000.0, 96_000, freq_hz, 1.0);
+        let mut r = Resampler::new(96_000, 48_000).unwrap();
+        let y: Vec<f32> = x.chunks(1_000).flat_map(|c| r.process(c)).collect();
+        let tail = &y[1_000..];
+        (tail.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / tail.len() as f64).sqrt()
+    };
+    let (pass, stop) = (rms_out(1_000.0), rms_out(30_000.0));
+    let db = 20.0 * (pass / stop).log10();
+    eprintln!("96k->48k: 30 kHz down {db:.1} dB relative to 1 kHz");
+    assert!(db >= 40.0, "30 kHz only {db:.1} dB down");
 }
 
 #[test]

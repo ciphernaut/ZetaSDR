@@ -63,6 +63,9 @@ impl AudioFilter {
     ) -> Result<Vec<f32>, String> {
         let key = (in_rate_hz, audio_rate_hz);
         if self.key != Some(key) {
+            // Never keep streaming through the old pair's state if the new one fails.
+            self.resampler = None;
+            self.key = None;
             self.resampler = Some(Resampler::new(in_rate_hz, audio_rate_hz)?);
             self.key = Some(key);
         }
