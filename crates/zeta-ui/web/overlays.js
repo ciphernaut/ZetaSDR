@@ -9,9 +9,11 @@
 //   Overlays:
 //     ov.setSource(id)       the selected source: changing it drops every watch, label and
 //                            ribbon (they belong to the previous source's band)
-//     ov.sync(jobs)          a `job_list` result (from the 2 s poll): watchJob for every
-//                            running job on the selected source, unwatch the rest, refresh
-//                            the job-row counters. `spectrum` jobs are skipped: their events
+//     ov.sync(jobs)          a `job_list` result (from the 2 s poll): watchJob for the
+//                            MAX_WATCHED most recent (created_ns) running jobs on the
+//                            selected source, unwatch the rest, refresh the job-row counters
+//                            (`—`, tooltip "not watched (limit 4)", on the rows over the cap;
+//                            each watch holds one of the node's `max_ws` sockets). `spectrum` jobs are skipped: their events
 //                            are the waterfall's and are ignored here anyway. Event streams
 //                            of jobs not yet watched are resolved with one GET /streams per
 //                            poll; a job whose streams are listed but none is an `event`
@@ -38,11 +40,13 @@
 //         "L<layer> <name> <confidence, 2 dp>" at the left edge at wf.yForHz(hz); one label
 //         per key (a job id), replaced on each call. `evidence` becomes its tooltip.
 //     ov.unlabel(key)        removes the label drawn under `key`, if any
-//     ov.jobRow(job, counter)  shows `counter` (when > 0) in that job's row `.events` cell
+//     ov.jobRow(job, counter)  shows `counter` (when > 0, or the string `—` for a job over
+//                            the cap) in that job's row `.events` cell
 //     ov.destroy()
 
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
+export const MAX_WATCHED = 4;
 const EXPIRE_EVERY_MS = 1000;
 const RIBBON_GAP_PX = 2;
 const MAX_LANES = 8;
@@ -108,19 +112,27 @@ class Overlays {
         j.state &&
         j.state.status === "running",
     );
-    const ids = new Set(want.map((j) => j.id));
-    for (const id of [...this.watched.keys()]) if (!ids.has(id)) this.unwatch(id);
     for (const [id, graph] of [...this.noEventStream]) {
       const j = want.find((x) => x.id === id);
       if (!j || graphKey(j) !== graph) this.noEventStream.delete(id);
     }
-    for (const j of want) {
+    // Jobs known to have no event stream take no socket and so no place under the cap.
+    const capped = want
+      .filter((j) => !this.noEventStream.has(j.id))
+      .sort((a, b) => (b.created_ns ?? 0) - (a.created_ns ?? 0))
+      .slice(0, MAX_WATCHED);
+    const ids = new Set(capped.map((j) => j.id));
+    for (const id of [...this.watched.keys()]) if (!ids.has(id)) this.unwatch(id);
+    for (const j of capped) {
       const known = this.watched.get(j.id);
       if (known) known.job = j;
     }
-    const fresh = want.filter((j) => !this.watched.has(j.id) && !this.noEventStream.has(j.id));
+    const fresh = capped.filter((j) => !this.watched.has(j.id));
     if (fresh.length > 0) this.resolve(fresh);
-    for (const j of want) this.jobRow(j, this.counters.get(j.id) || 0);
+    for (const j of want) {
+      const over = !ids.has(j.id) && !this.noEventStream.has(j.id);
+      this.jobRow(j, over ? "—" : this.counters.get(j.id) || 0);
+    }
   }
 
   // One GET /streams for the jobs not yet watched: watch those with an event stream, cache
@@ -214,6 +226,11 @@ class Overlays {
     const row = this.jobsEl.querySelector(`.job[data-id="${CSS.escape(job.id)}"]`);
     const cell = row && row.querySelector(".events");
     if (!cell) return;
+    if (typeof counter === "string") {
+      cell.textContent = counter;
+      cell.title = `not watched (limit ${MAX_WATCHED})`;
+      return;
+    }
     cell.textContent = counter > 0 ? String(counter) : "";
     cell.title = counter > 0 ? `${counter} events since this page started watching` : "";
   }

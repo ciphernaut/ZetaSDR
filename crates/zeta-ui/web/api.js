@@ -10,8 +10,13 @@
 //
 //   Api:
 //     api.onUnauthorized = fn   called (once per 401) before a request throws Unauthorized,
-//         and when a websocket that never opened is followed by a 401 from GET /health
-//         (browsers hide the refused upgrade's status, so /health is probed)
+//         and when a websocket that never opened is followed by a 401 from the probe below
+//     api.onBusy = fn(message)  called when a websocket that never opened is followed by a 503
+//         from the probe (the node is out of stream connections, `max_ws`); once until a
+//         socket refused that way opens again. Browsers hide a refused upgrade's status, so
+//         a plain GET of the same /stream/{id} URL with the bearer is probed: the node answers
+//         401, 404 or 503 before it looks for an upgrade (otherwise 4xx, ignored). The
+//         subscription keeps its normal backoff either way.
 //     api.op(obj) -> Promise<result JSON>              POST /op with `X-Zeta-Client: ui` (its
 //         ops-stream record carries transport "ui"); throws OpError (with .json)
 //     api.ask(text, maxTurns = 8) -> Promise<Transcript>  POST /ask {request, max_turns};
@@ -87,6 +92,23 @@ export class Api {
     this.base = base;
     this.secret = secret;
     this.onUnauthorized = null;
+    this.onBusy = null;
+    this.busyNoted = false;
+  }
+
+  // Why a websocket to `path` was refused: fires onUnauthorized (401) or onBusy (503).
+  // Returns whether it was a 503.
+  async #probe(path) {
+    try {
+      await this.#request("GET", path);
+    } catch (e) {
+      if (e instanceof OpError && e.status === 503) {
+        if (!this.busyNoted && this.onBusy) this.onBusy(e.message);
+        this.busyNoted = true;
+        return true;
+      }
+    }
+    return false;
   }
 
   // `body` is sent as JSON, or as is when `type` names its Content-Type.
@@ -140,6 +162,7 @@ export class Api {
   #resilient(id, query, binary, handlers, { onClose, reconnect = true, onReconnect } = {}) {
     let ws = null;
     let closed = false;
+    let busy = false; // the last refusal was a 503
     let delay = BACKOFF_MIN_MS;
     let timer = null;
     const protocols = ["zeta", "zeta.bearer." + b64url(this.secret)];
@@ -151,12 +174,19 @@ export class Api {
       ws.onopen = () => {
         opened = true;
         delay = BACKOFF_MIN_MS;
+        if (busy) this.busyNoted = false;
+        busy = false;
         handlers.open(ws);
       };
       ws.onmessage = (ev) => handlers.message(ev, ws);
       ws.onclose = (ev) => {
-        // A refused upgrade: find out whether the secret is the reason (fires onUnauthorized).
-        if (!opened && !closed) this.health().catch(() => {});
+        // A refused upgrade: find out whether the secret or the slots are the reason.
+        if (!opened && !closed) {
+          const u = new URL(this.#wsUrl(id, query));
+          this.#probe(u.pathname + u.search).then((b) => {
+            busy = b;
+          });
+        }
         const again = reconnect && !closed;
         if (onClose) onClose({ code: ev.code, reason: ev.reason, reconnecting: again });
         if (again) schedule();

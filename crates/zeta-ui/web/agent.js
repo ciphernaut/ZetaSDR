@@ -27,7 +27,8 @@
 //   startJobs(api, el, transcript, {onJobs, onPlay, onGraph, playing}) -> {close, refresh,
 //                                                                         redraw}
 //       Polls `job_list` every 2 s and renders the jobs that are not stopped: kind, source,
-//       state, id, an `.events` cell (filled by overlays.js), on `fm_demod` rows a
+//       state, id, an `.events` cell (filled by overlays.js: a count, or `—` over its
+//       watch cap), on `fm_demod` rows a
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job), a
 //       `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the

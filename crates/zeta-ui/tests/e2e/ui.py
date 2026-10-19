@@ -11,6 +11,7 @@ state directory in ZETA_UI_STATE_DIR, and the URL of a second node started witho
 daemon in ZETA_UI_URL_NOSTT (for the "no daemon" scenario).
 """
 
+import base64
 import json
 import os
 import re
@@ -639,6 +640,18 @@ def ws_connections(url, secret):
     return http_json(url, secret, "/health")["ws_connections"]
 
 
+def stable_ws_connections(url, secret, within_s=5.0, samples=5):
+    """`ws_connections` read until `samples` consecutive reads 0.2 s apart agree (sockets
+    of earlier contexts may still be closing), or `within_s` passes; the last reads."""
+    deadline = time.monotonic() + within_s
+    reads = []
+    while True:
+        reads = (reads + [ws_connections(url, secret)])[-samples:]
+        if (len(reads) == samples and len(set(reads)) == 1) or time.monotonic() > deadline:
+            return reads
+        time.sleep(0.2)
+
+
 def scenario_audio_play_opens_binary_socket(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_job(url, secret, "fm_demod", "tone", 100_000_000, 10_000, deviation_hz=5000)
@@ -683,6 +696,89 @@ def scenario_fm_demod_does_not_poll_streams(page, url, secret):
         assert len(seen) <= 3, f"{len(seen)} GET /streams in 6 s: {seen}"
     finally:
         stop_job(url, secret, job)
+
+
+def scenario_watched_jobs_are_capped(page, url, secret):
+    # Six measure jobs: the four most recent are watched (one event socket each), the other
+    # two rows show "—" and open nothing, so this tab holds at most ops + waterfall + 4.
+    select_source(page, url, secret, "tone")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+    jobs = []
+    try:
+        for _ in range(6):
+            jobs.append(start_job(url, secret, "measure", "tone", 100_000_000, 10_000))
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator("#jobs .job", has_text="measure")).to_have_count(6)
+        for j in jobs[:2]:
+            cell = page.locator(f'#jobs .job[data-id="{j}"] .events')
+            expect(cell).to_have_text("—")
+            expect(cell).to_have_attribute("title", "not watched (limit 4)")
+        for j in jobs[2:]:
+            cell = page.locator(f'#jobs .job[data-id="{j}"] .events')
+            expect(cell).not_to_have_attribute("title", "not watched (limit 4)")
+        # The four watches open (measure events can take seconds to come, so sockets are
+        # counted rather than events), and no more than four.
+        deadline = time.monotonic() + 5.0
+        while ws_connections(url, secret) < 2 + 4 and time.monotonic() < deadline:
+            time.sleep(0.2)
+        counts = stable_ws_connections(url, secret)
+        assert max(counts) <= 2 + 4, f"ws_connections {counts}"
+    finally:
+        for j in jobs:
+            stop_job(url, secret, j)
+
+
+MAX_WS = 16  # zeta-ws Limits::default().max_ws
+
+HOG_JS = """async ([n, id, proto]) => {
+  window.hog = [];
+  const opened = [];
+  for (let i = 0; i < n; i++) {
+    const ws = new WebSocket(location.origin.replace(/^http/, 'ws') + '/stream/' + id,
+                             ['zeta', proto]);
+    window.hog.push(ws);
+    opened.push(new Promise((ok) => { ws.onopen = () => ok(true); ws.onclose = () => ok(false); }));
+  }
+  return (await Promise.all(opened)).filter(Boolean).length;
+}"""
+
+
+def scenario_ws_busy_is_noted_once(page, url, secret):
+    # With every stream slot taken (by another page), a new watch is refused with 503: one
+    # error line in the transcript, and the watch opens once a slot frees.
+    select_source(page, url, secret, "tone")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+    ops = [s for s in http_json(url, secret, "/streams")
+           if s["provenance"]["source"] == "node"][0]["id"]
+    proto = "zeta.bearer." + base64.urlsafe_b64encode(secret.encode()).decode().rstrip("=")
+    hog = page.context.new_page()
+    job = None
+    try:
+        hog.goto(url + "/ui/")
+        free = MAX_WS - stable_ws_connections(url, secret)[-1]
+        assert hog.evaluate(HOG_JS, [free, ops, proto]) == free, "hog sockets did not open"
+        job = start_job(url, secret, "measure", "tone", 100_000_000, 10_000)
+        page.evaluate("window.zetaTest.poll()")
+        busy = page.locator("#transcript .line.note.error", has_text="out of stream slots")
+        expect(busy).to_have_count(1)
+        # Retries keep the normal backoff and are not noted again.
+        page.wait_for_timeout(3_000)
+        expect(busy).to_have_count(1)
+        expect(busy.locator(".count")).to_have_text("")
+        hog.evaluate("window.hog.forEach((ws) => ws.close())")
+        # ops + waterfall + the watch, once the hog's sockets are gone and the backoff (at
+        # most 8 s) has run out.
+        deadline = time.monotonic() + 15.0
+        counts = []
+        while time.monotonic() < deadline:
+            counts = stable_ws_connections(url, secret)
+            if counts[-1] == 3 and len(set(counts)) == 1:
+                break
+        assert counts and counts[-1] == 3, f"the refused watch never opened: {counts}"
+    finally:
+        hog.close()
+        if job:
+            stop_job(url, secret, job)
 
 
 # ---- voice (Task 11) -----------------------------------------------------------------------

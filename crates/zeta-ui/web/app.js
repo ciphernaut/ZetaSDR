@@ -312,6 +312,8 @@ function start(api) {
   $("#app").hidden = false;
   $("#transcript").replaceChildren();
   state.transcript = new Transcript($("#transcript"));
+  api.onBusy = (message) =>
+    state.transcript?.note(`stream refused: ${message} (node out of stream slots)`, true);
   state.ops = startOpsFeed(api, state.transcript);
   state.wf = mountWaterfall($("#waterfall"), api);
   state.ov = mountOverlays($("#waterfall"), state.wf, api, { jobsEl: $("#jobs") });
@@ -346,6 +348,7 @@ function logout(api) {
   if (state.api !== api) return;
   state.api = null;
   api.onUnauthorized = null;
+  api.onBusy = null;
   stopAudio();
   closeGraph();
   if (state.mic) state.mic.destroy();
