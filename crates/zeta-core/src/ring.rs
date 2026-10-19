@@ -87,7 +87,9 @@ impl IqRing {
         if block.sample_rate_hz.0 != self.sample_rate_hz {
             self.sample_rate_hz = block.sample_rate_hz.0;
             self.capacity = Self::cap_for(self.capacity_seconds, self.sample_rate_hz);
-            self.clear();
+            // A fresh buffer drops the old allocation before the new one grows.
+            self.buf = VecDeque::with_capacity(self.capacity);
+            self.dropped = 0;
         }
         if self.center_hz != Some(block.center_hz) {
             self.center_hz = Some(block.center_hz);
@@ -112,8 +114,10 @@ impl IqRing {
         }
     }
 
-    /// Change the history length to `seconds` (at the current rate), keeping
-    /// the newest samples when it shrinks.
+    /// Change the history length to `seconds`, keeping the newest samples when
+    /// it shrinks and releasing the freed memory. The sample capacity is
+    /// computed at the current rate; a block with a new rate recomputes it
+    /// (from `seconds`) and restarts the ring.
     pub fn resize(&mut self, seconds: f64) {
         self.capacity_seconds = seconds;
         self.capacity = Self::cap_for(seconds, self.sample_rate_hz);
@@ -122,6 +126,12 @@ impl IqRing {
             self.buf.drain(..excess);
             self.dropped += excess as u64;
         }
+        self.buf.shrink_to_fit();
+    }
+
+    /// Bytes currently allocated for samples.
+    pub fn capacity_bytes(&self) -> usize {
+        self.buf.capacity() * std::mem::size_of::<Complex<f32>>()
     }
 
     /// Most samples the ring retains at its current rate.

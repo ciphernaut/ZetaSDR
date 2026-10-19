@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 use zeta_core::node::{Node, NodeConfig, ring_seconds_for};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, StageRegistry};
-use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId, Timestamp};
+use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId, Span, Timestamp};
 
 const GIB: u64 = 1 << 30;
 
@@ -105,8 +105,33 @@ async fn retune_resizes_ring_within_budget() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    {
+        let r = ring.read().unwrap();
+        assert_eq!(r.sample_rate_hz(), Hz(8_000_000));
+        assert!(r.capacity_samples() as u64 * 8 <= budget);
+        let t = r.latest().unwrap();
+        let got = r
+            .read(Span {
+                start_ns: r.earliest().unwrap(),
+                end_ns: Timestamp(t.0 + 1),
+            })
+            .unwrap();
+        assert!(got.iter().all(|c| c.re == 7.0), "the wide block survived");
+        assert!(r.capacity_bytes() as u64 <= budget);
+    }
+    // Retune back down: the wide allocation must be released.
+    let _ = port.tx.send(block(48_000, 48_000, 1.0));
+    for _ in 0..500 {
+        if ring.read().unwrap().sample_rate_hz() == Hz(48_000) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let r = ring.read().unwrap();
-    assert_eq!(r.sample_rate_hz(), Hz(8_000_000));
-    assert!(r.capacity_samples() as u64 * 8 <= budget);
-    assert!(r.latest().is_some(), "the wide block survived");
+    assert_eq!(r.sample_rate_hz(), Hz(48_000));
+    assert!(
+        r.capacity_bytes() as u64 <= budget,
+        "{} bytes",
+        r.capacity_bytes()
+    );
 }

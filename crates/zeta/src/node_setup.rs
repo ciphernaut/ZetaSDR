@@ -133,11 +133,15 @@ fn default_ring_budget() -> u64 {
     const GIB: u64 = 1 << 30;
     std::fs::read_to_string("/proc/meminfo")
         .ok()
-        .and_then(|s| {
-            let line = s.lines().find(|l| l.starts_with("MemTotal:"))?;
-            line.split_whitespace().nth(1)?.parse::<u64>().ok()
-        })
-        .map_or(GIB, |kb| (kb * 1024 / 4).min(4 * GIB))
+        .and_then(|s| parse_meminfo(&s))
+        .unwrap_or(GIB)
+}
+
+/// A quarter of the `MemTotal` line (kB) of `/proc/meminfo`, capped at 4 GiB.
+fn parse_meminfo(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some((kb.saturating_mul(1024) / 4).min(4 << 30))
 }
 
 /// Open the node on `state_dir` with the given sources and plugin stages. File sources
@@ -241,6 +245,22 @@ pub async fn open(
         node.add_classifier(c);
     }
     Ok((node, remotes))
+}
+
+#[cfg(test)]
+mod meminfo_tests {
+    use super::parse_meminfo;
+
+    #[test]
+    fn quarter_of_memtotal_capped_at_4_gib() {
+        assert_eq!(
+            parse_meminfo("MemTotal:  4194304 kB\nMemFree: 1 kB\n"),
+            Some(1 << 30)
+        );
+        assert_eq!(parse_meminfo("MemTotal: 67108864 kB\n"), Some(4 << 30));
+        assert_eq!(parse_meminfo("MemFree: 1 kB\n"), None);
+        assert_eq!(parse_meminfo("MemTotal: lots kB\n"), None);
+    }
 }
 
 #[cfg(test)]
