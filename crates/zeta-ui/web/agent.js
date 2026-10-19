@@ -43,7 +43,7 @@ function scalar(v) {
 }
 
 // The node serialises op fields alphabetically; these lead, in this order, then the rest.
-const LEADING = ["kind", "source", "job", "stream", "center_hz", "bandwidth_hz", "deviation_hz"];
+const LEADING = ["kind", "source", "job", "stream", "center_hz", "bandwidth_hz", "deviation_hz", "sideband"];
 
 function opText(op) {
   if (!op || typeof op !== "object") return String(op);

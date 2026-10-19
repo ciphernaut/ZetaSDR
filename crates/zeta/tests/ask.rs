@@ -188,7 +188,7 @@ async fn ask_remote_starts_job_on_serving_node() {
                 200,
                 tool_call_response(&[(
                     "job_start",
-                    json!({"kind":"passthrough","source":"tone","center_hz":100000000,"bandwidth_hz":48000,"deviation_hz":null}),
+                    json!({"kind":"passthrough","source":"tone","center_hz":100000000,"bandwidth_hz":48000,"deviation_hz":null,"sideband":null}),
                 )]),
             ),
             (200, text_response("Started.", "stop")),

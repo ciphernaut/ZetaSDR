@@ -257,7 +257,7 @@ mod tests {
                         center_hz: Hz(7_100_000),
                         bandwidth_hz: Hz(bw),
                     };
-                    match kind.expand(&src, tuning, Hz(rate), None) {
+                    match kind.expand(&src, tuning, Hz(rate), None, None) {
                         Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
                             assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
                         }

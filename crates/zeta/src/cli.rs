@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
-use zeta_core::ops::{JobKind, Op, OpError};
+use zeta_core::ops::{JobKind, Op, OpError, Sideband};
 use zeta_core::types::{Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
 
 use crate::sources::{self, PluginSpec, SourceSpec};
@@ -294,6 +294,9 @@ pub enum JobCmd {
         /// absent = the kind's default (5000 for fm_demod, 75000 for wfm_demod)
         #[arg(long, value_name = "HZ")]
         deviation_hz: Option<u64>,
+        /// Sideband for ssb_demod only; absent = usb
+        #[arg(long, value_enum)]
+        sideband: Option<SidebandArg>,
         /// After starting, tail the job's first event (else audio) stream, stop
         /// the job and print `[job_result, frames_result, {"stopped": true}]`;
         /// a job that is not running prints `[job_result, job_record]` and
@@ -395,6 +398,8 @@ pub enum Kind {
     WfmDemod,
     #[value(name = "am_demod")]
     AmDemod,
+    #[value(name = "ssb_demod")]
+    SsbDemod,
     #[value(name = "aprs_decode")]
     AprsDecode,
     Measure,
@@ -408,8 +413,25 @@ impl From<Kind> for JobKind {
             Kind::FmDemod => JobKind::FmDemod,
             Kind::WfmDemod => JobKind::WfmDemod,
             Kind::AmDemod => JobKind::AmDemod,
+            Kind::SsbDemod => JobKind::SsbDemod,
             Kind::AprsDecode => JobKind::AprsDecode,
             Kind::Measure => JobKind::Measure,
+        }
+    }
+}
+
+/// SSB sidebands, mirroring `Sideband`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum SidebandArg {
+    Usb,
+    Lsb,
+}
+
+impl From<SidebandArg> for Sideband {
+    fn from(s: SidebandArg) -> Self {
+        match s {
+            SidebandArg::Usb => Sideband::Usb,
+            SidebandArg::Lsb => Sideband::Lsb,
         }
     }
 }
@@ -507,6 +529,7 @@ impl Command {
                 kind,
                 band: b,
                 deviation_hz,
+                sideband,
                 ..
             }) => Op::JobStart {
                 kind: kind.into(),
@@ -514,6 +537,7 @@ impl Command {
                 center_hz: Hz(b.center_hz),
                 bandwidth_hz: Hz(b.bandwidth_hz),
                 deviation_hz,
+                sideband: sideband.map(Into::into),
             },
             Command::Job(JobCmd::List) => Op::JobList {},
             Command::Job(JobCmd::Stop(a)) => Op::JobStop { job: job(a) },

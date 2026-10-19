@@ -59,6 +59,11 @@ pub enum Op {
         #[serde(deserialize_with = "nullable_u64")]
         #[schemars(required, schema_with = "nullable_hz_u64")]
         deviation_hz: Option<u64>,
+        /// Sideband for `ssb_demod`: `usb` or `lsb`; `null` is `usb`. Any
+        /// other kind must pass `null`.
+        #[serde(deserialize_with = "nullable_sideband")]
+        #[schemars(required, schema_with = "nullable_sideband_schema")]
+        sideband: Option<Sideband>,
     },
     JobList {},
     JobStop {
@@ -129,6 +134,32 @@ fn nullable_hz_u64(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
+/// Deserialize a required `Option<Sideband>` (see [`nullable_u64`]).
+fn nullable_sideband<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Sideband>, D::Error> {
+    <Option<Sideband> as Deserialize>::deserialize(d)
+}
+
+/// Schema of a required `Option<Sideband>`: `["string","null"]`, enum
+/// `usb`, `lsb` or `null`.
+fn nullable_sideband_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "enum": ["usb", "lsb", null],
+        "description": "Sideband for `ssb_demod`: `usb` or `lsb`; `null` is `usb`. Any other kind must pass `null`."
+    })
+}
+
+/// An SSB sideband: upper (`usb`) or lower (`lsb`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Sideband {
+    Usb,
+    Lsb,
+}
+
+/// `ssb_demod` audio bandwidth, Hz, used by the `ssb_demod` job kind.
+pub const SSB_AUDIO_BANDWIDTH_HZ: u64 = 2_800;
+
 /// Schema of a required `Option<String>`: `["string","null"]`.
 fn nullable_string(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
@@ -159,6 +190,7 @@ pub enum JobKind {
     FmDemod,
     WfmDemod,
     AmDemod,
+    SsbDemod,
     AprsDecode,
     Measure,
 }
@@ -172,6 +204,7 @@ impl JobKind {
             JobKind::FmDemod => "fm_demod",
             JobKind::WfmDemod => "wfm_demod",
             JobKind::AmDemod => "am_demod",
+            JobKind::SsbDemod => "ssb_demod",
             JobKind::AprsDecode => "aprs_decode",
             JobKind::Measure => "measure",
         }
@@ -184,6 +217,7 @@ impl JobKind {
             JobKind::FmDemod
                 | JobKind::WfmDemod
                 | JobKind::AmDemod
+                | JobKind::SsbDemod
                 | JobKind::AprsDecode
                 | JobKind::Measure
         )
@@ -198,6 +232,7 @@ impl JobKind {
         tuning: Tuning,
         source_rate_hz: Hz,
         deviation_hz: Option<Hz>,
+        sideband: Option<Sideband>,
     ) -> Result<Graph, OpError> {
         let out = channel_rate_hz(source_rate_hz.0, tuning.bandwidth_hz.0);
         if self.channelised() {
@@ -338,6 +373,37 @@ impl JobKind {
                             id: demod.clone(),
                             kind: "am_demod".into(),
                             params: serde_json::json!({"audio_rate_hz": AUDIO_RATE_HZ}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: demod,
+                        kind: StreamKind::Iq,
+                    }],
+                }
+            }
+            JobKind::SsbDemod => {
+                let (channel, demod) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": out,
+                            }),
+                        },
+                        GraphNode {
+                            id: demod.clone(),
+                            kind: "ssb_demod".into(),
+                            params: serde_json::json!({
+                                "sideband": sideband.unwrap_or(Sideband::Usb),
+                                "audio_rate_hz": AUDIO_RATE_HZ,
+                                "audio_bandwidth_hz": SSB_AUDIO_BANDWIDTH_HZ,
+                            }),
                         },
                     ],
                     edges: vec![Edge {
@@ -908,7 +974,7 @@ async fn reconcile_rate(
     id: &JobId,
     kind: JobKind,
     tuning: Tuning,
-    deviation_hz: Option<Hz>,
+    (deviation_hz, sideband): (Option<Hz>, Option<Sideband>),
     mut expected: Hz,
 ) -> Result<(), OpError> {
     if !kind.channelised() {
@@ -937,7 +1003,13 @@ async fn reconcile_rate(
                 options: vec!["retry job_start".into(), "stop one of the holders".into()],
             });
         }
-        let graph = match kind.expand(port.id(), tuning, leased.bandwidth_hz, deviation_hz) {
+        let graph = match kind.expand(
+            port.id(),
+            tuning,
+            leased.bandwidth_hz,
+            deviation_hz,
+            sideband,
+        ) {
             Ok(g) => g,
             Err(e) => {
                 let _ = node.job_stop(id).await;
@@ -994,7 +1066,16 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             center_hz,
             bandwidth_hz,
             deviation_hz,
+            sideband,
         } => {
+            if sideband.is_some() && kind != JobKind::SsbDemod {
+                return Err(OpError::Other {
+                    message: format!(
+                        "sideband applies only to kind ssb_demod; pass null (kind is {})",
+                        kind.name()
+                    ),
+                });
+            }
             let deviation = match deviation_hz {
                 None => None,
                 Some(_) if !matches!(kind, JobKind::FmDemod | JobKind::WfmDemod) => {
@@ -1020,7 +1101,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 .tune_if_unheld(port.as_ref(), tuning)
                 .await
                 .map_err(lease_error)?;
-            let graph = kind.expand(&source, tuning, granted.bandwidth_hz, deviation)?;
+            let graph = kind.expand(&source, tuning, granted.bandwidth_hz, deviation, sideband)?;
             let id = node
                 .job_start(kind.name(), source, tuning, graph)
                 .await
@@ -1031,7 +1112,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 &id,
                 kind,
                 tuning,
-                deviation,
+                (deviation, sideband),
                 granted.bandwidth_hz,
             )
             .await?;

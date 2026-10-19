@@ -117,6 +117,43 @@ impl StreamingFir {
     }
 }
 
+/// Complex-input [`StreamingFir`]: real taps, complex samples, history
+/// carried across calls so block-wise filtering equals filtering whole.
+#[derive(Clone, Debug)]
+pub struct StreamingComplexFir {
+    taps: Vec<f32>,
+    history: Vec<Complex<f32>>,
+}
+
+impl StreamingComplexFir {
+    /// A filter with `taps` (at least one) and zero history.
+    pub fn new(taps: Vec<f32>) -> Self {
+        assert!(!taps.is_empty(), "StreamingComplexFir: no taps");
+        let history = vec![Complex::new(0.0, 0.0); taps.len() - 1];
+        Self { taps, history }
+    }
+
+    /// Filter `x`, one output per input.
+    pub fn process(&mut self, x: &[Complex<f32>]) -> Vec<Complex<f32>> {
+        let h = self.history.len();
+        let mut buf = std::mem::take(&mut self.history);
+        buf.extend_from_slice(x);
+        let out = (0..x.len())
+            .map(|n| {
+                // buf[h + n] is x[n]; tap j multiplies x[n - j].
+                self.taps
+                    .iter()
+                    .enumerate()
+                    .fold(Complex::new(0.0, 0.0), |acc, (j, &t)| {
+                        acc + buf[h + n - j] * t
+                    })
+            })
+            .collect();
+        self.history = buf.split_off(buf.len() - h);
+        out
+    }
+}
+
 /// Mean power of `x` in dB (`10 log10(mean |x|^2)`); negative infinity when
 /// `x` is empty or all zero.
 pub fn power_db(x: &[Complex<f32>]) -> f32 {

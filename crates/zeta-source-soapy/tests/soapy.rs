@@ -288,6 +288,7 @@ fn passthrough() -> Op {
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(1_000_000),
         deviation_hz: None,
+        sideband: None,
     }
 }
 

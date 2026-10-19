@@ -42,7 +42,7 @@ fn no_redirect() -> reqwest::Client {
 /// Start a passthrough job on `tone` at 48 kHz and return its IQ output stream.
 async fn iq_stream(ts: &TestServer) -> StreamId {
     let op: Op = serde_json::from_value(json!({"op":"job_start","kind":"passthrough",
-        "source":"tone","center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null}))
+        "source":"tone","center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null}))
     .unwrap();
     ts.node.apply(op).await.expect("job starts");
     ts.node

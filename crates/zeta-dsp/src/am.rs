@@ -1,6 +1,7 @@
-//! AM demodulator stage: envelope (magnitude), DC removal, 5 kHz audio
-//! low-pass, resampling to the audio rate and a slow AGC. The DC-removal and
-//! AGC helpers are shared with the SSB demodulator.
+//! AM and SSB demodulator stages. AM: envelope (magnitude), DC removal,
+//! 5 kHz audio low-pass, resampling to the audio rate and a slow AGC. SSB:
+//! Weaver-style sideband selection (shift the wanted sideband onto 0 Hz,
+//! complex low-pass, shift back, real part), resampling and the same AGC.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -15,8 +16,10 @@ use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, StreamId, StreamKind};
 
+use zeta_core::ops::Sideband;
+
 use crate::nbfm::AudioFilter;
-use crate::util::{StreamingFir, lowpass_taps};
+use crate::util::{StreamingComplexFir, StreamingFir, lowpass_taps, nco};
 use crate::{Input, frame_span, run_map};
 
 /// Cutoff of the AM audio low-pass, Hz.
@@ -224,6 +227,202 @@ impl Stage for AmDemodStage {
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed(
                     "am_demod stage expects iq frames".into(),
+                ));
+            };
+            let rate = block.sample_rate_hz.0;
+            let samples = demod
+                .process(&block.samples, rate)
+                .map_err(StageError::Failed)?;
+            if samples.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut prov = frame.provenance.clone();
+            prov.span = frame_span(block.t0, block.samples.len(), rate);
+            Ok(vec![Frame::new(
+                out.clone(),
+                prov,
+                Payload::Audio {
+                    sample_rate_hz: Hz(p.audio_rate_hz),
+                    samples: samples.into(),
+                },
+            )])
+        })
+        .await
+    }
+}
+
+/// Narrowest accepted `ssb_demod` audio bandwidth, Hz.
+pub const SSB_MIN_BANDWIDTH_HZ: u64 = 500;
+/// Widest accepted `ssb_demod` audio bandwidth, Hz.
+pub const SSB_MAX_BANDWIDTH_HZ: u64 = 6_000;
+/// Target transition width of the SSB sideband filter, Hz; sets its length.
+const SSB_TRANSITION_HZ: u64 = 300;
+/// Bounds on the SSB sideband filter length, taps.
+const SSB_MIN_TAPS: usize = 31;
+const SSB_MAX_TAPS: usize = 2_047;
+
+#[derive(Clone, Copy, Debug, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SsbParams {
+    pub sideband: Sideband,
+    pub audio_rate_hz: u64,
+    /// Audio bandwidth, Hz (500..=6000).
+    pub audio_bandwidth_hz: u64,
+}
+
+/// Per-input-rate state of [`SsbDemod`].
+#[derive(Debug)]
+struct SsbRateState {
+    rate_hz: u64,
+    lpf: StreamingComplexFir,
+    /// Phase of the shift oscillator, cycles in `[0, 1)`, carried across blocks.
+    phase: f64,
+}
+
+/// Streaming SSB demodulator (Weaver method). The input is shifted by
+/// `−bandwidth/2` (USB) or `+bandwidth/2` (LSB) so the wanted sideband is
+/// centred on 0 Hz, low-passed at `bandwidth/2` (which removes the other
+/// sideband), shifted back by the same oscillator and the real part taken,
+/// then resampled to `audio_rate_hz` and levelled by the AGC. State carries
+/// across blocks; the filter is rebuilt when the input rate changes.
+#[derive(Debug)]
+pub struct SsbDemod {
+    p: SsbParams,
+    rate_state: Option<SsbRateState>,
+    audio: AudioFilter,
+    agc: Agc,
+}
+
+impl SsbDemod {
+    /// Checks `p`: `audio_rate_hz` non-zero and `audio_bandwidth_hz` in
+    /// 500..=6000; the error names the parameter.
+    pub fn new(p: &SsbParams) -> Result<Self, String> {
+        if p.audio_rate_hz == 0 {
+            return Err("ssb_demod params: audio_rate_hz must be >= 1".into());
+        }
+        if !(SSB_MIN_BANDWIDTH_HZ..=SSB_MAX_BANDWIDTH_HZ).contains(&p.audio_bandwidth_hz) {
+            return Err(format!(
+                "ssb_demod params: audio_bandwidth_hz must be {SSB_MIN_BANDWIDTH_HZ}..={SSB_MAX_BANDWIDTH_HZ}, got {}",
+                p.audio_bandwidth_hz
+            ));
+        }
+        Ok(Self {
+            p: *p,
+            rate_state: None,
+            audio: AudioFilter::default(),
+            agc: Agc::new(p.audio_rate_hz),
+        })
+    }
+
+    /// Demodulate one block of `iq` at `rate_hz` to audio at `audio_rate_hz`.
+    pub fn process(&mut self, iq: &[Complex<f32>], rate_hz: u64) -> Result<Vec<f32>, String> {
+        if rate_hz == 0 {
+            return Err("ssb_demod: input sample rate is 0".into());
+        }
+        if self
+            .rate_state
+            .as_ref()
+            .is_none_or(|s| s.rate_hz != rate_hz)
+        {
+            let cutoff = (self.p.audio_bandwidth_hz as f64 / 2.0).min(0.45 * rate_hz as f64);
+            let taps =
+                ((4 * rate_hz / SSB_TRANSITION_HZ) as usize | 1).clamp(SSB_MIN_TAPS, SSB_MAX_TAPS);
+            self.rate_state = Some(SsbRateState {
+                rate_hz,
+                lpf: StreamingComplexFir::new(lowpass_taps(cutoff, rate_hz as f64, taps)),
+                phase: 0.0,
+            });
+        }
+        let Some(st) = self.rate_state.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let half = self.p.audio_bandwidth_hz as f64 / 2.0;
+        let shift_hz = match self.p.sideband {
+            Sideband::Usb => -half,
+            Sideband::Lsb => half,
+        };
+        let rot = {
+            let (s, c) = (2.0 * PI * st.phase).sin_cos();
+            Complex::new(c as f32, s as f32)
+        };
+        let osc: Vec<Complex<f32>> = nco(iq.len(), shift_hz, rate_hz as f64)
+            .into_iter()
+            .map(|o| o * rot)
+            .collect();
+        st.phase = (st.phase + iq.len() as f64 * shift_hz / rate_hz as f64).rem_euclid(1.0);
+        let centred: Vec<Complex<f32>> = iq.iter().zip(&osc).map(|(x, o)| x * o).collect();
+        let filtered = st.lpf.process(&centred);
+        let x: Vec<f32> = filtered
+            .iter()
+            .zip(&osc)
+            .map(|(y, o)| (y * o.conj()).re)
+            .collect();
+        let mut y = self.audio.process(&x, rate_hz, self.p.audio_rate_hz)?;
+        self.agc.process(&mut y);
+        Ok(y)
+    }
+}
+
+/// Demodulates an SSB IQ stream (upper or lower sideband) to audio at `audio_rate_hz`.
+pub struct SsbDemodStage {
+    spec: StageSpec,
+}
+
+impl SsbDemodStage {
+    pub fn new() -> Self {
+        Self {
+            spec: StageSpec {
+                kind: "ssb_demod",
+                inputs: vec![StreamKind::Iq],
+                outputs: vec![StreamKind::Audio],
+                params_schema: schemars::schema_for!(SsbParams),
+            },
+        }
+    }
+}
+
+impl Default for SsbDemodStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Stage for SsbDemodStage {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+
+    async fn run(
+        &self,
+        params: serde_json::Value,
+        inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+    ) -> Result<(), StageError> {
+        let p: SsbParams = serde_json::from_value(params)
+            .map_err(|e| StageError::Failed(format!("ssb_demod params: {e}")))?;
+        let mut demod = SsbDemod::new(&p).map_err(StageError::Failed)?;
+        let Some(out) = outputs.first().cloned() else {
+            return Err(StageError::Failed("expected 1 output".into()));
+        };
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    demod = SsbDemod::new(&p).map_err(StageError::Failed)?;
+                    return Ok(Vec::new());
+                }
+            };
+            let Payload::Iq(block) = &frame.payload else {
+                return Err(StageError::Failed(
+                    "ssb_demod stage expects iq frames".into(),
                 ));
             };
             let rate = block.sample_rate_hz.0;

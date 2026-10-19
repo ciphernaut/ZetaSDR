@@ -365,6 +365,7 @@ fn op_name_matches_the_serialised_tag() {
             center_hz: Hz(1),
             bandwidth_hz: Hz(1),
             deviation_hz: None,
+            sideband: None,
         },
         Op::JobList {},
         Op::JobStop {

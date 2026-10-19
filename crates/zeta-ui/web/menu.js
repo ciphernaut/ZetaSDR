@@ -19,9 +19,9 @@
 //                                             LABEL_STEP_PX apart, or LABEL_FALLBACK_STEP_HZ
 //                                             while the band is unknown) and listed in the
 //                                             transcript
-//   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
-//   fm_demod   Decode › NBFM audio            job_start kind=fm_demod, deviation_hz 5000
-//   measure    Start background job › measure job_start kind=measure, deviation_hz null
+//   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null, sideband null
+//   fm_demod   Decode › NBFM audio            job_start kind=fm_demod, deviation_hz 5000, sideband null
+//   measure    Start background job › measure job_start kind=measure, deviation_hz null, sideband null
 //   iq_read    Save selection as SigMF        iq_read {selection}; the transcript shows the path
 //   ask        Send to agent                  /ask "Look at <c> Hz, <bw> Hz wide, from <start>
 //                                             to <end>: what is it?"
@@ -195,6 +195,7 @@ class Menu {
         center_hz: s.centerHz,
         bandwidth_hz: s.bandwidthHz,
         deviation_hz: DEVIATION[action],
+        sideband: null,
       });
     }
   }

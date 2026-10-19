@@ -217,6 +217,7 @@ impl Remote {
             center_hz: t.center_hz,
             bandwidth_hz: t.bandwidth_hz,
             deviation_hz: None,
+            sideband: None,
         };
         let job = match apply(&self.client, &op).await? {
             OpResult::Job(id) => id,

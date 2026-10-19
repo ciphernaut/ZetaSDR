@@ -322,6 +322,7 @@ class Waterfall {
       center_hz: band.center_hz,
       bandwidth_hz: band.bandwidth_hz,
       deviation_hz: null,
+      sideband: null,
     });
     const id = r.value;
     storeIds(UI_JOBS_KEY, [...new Set([...loadIds(UI_JOBS_KEY), id])]);

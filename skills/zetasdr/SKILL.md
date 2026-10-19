@@ -64,17 +64,18 @@ CLI: `zeta source ensure --source <id> --center-hz 144800000 --bandwidth-hz 1250
 
 ### job_start
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|aprs_decode|measure)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|measure)
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
 - deviation_hz: integer or null
+- sideband: string or null
 
-JSON: `{"op":"job_start","kind":"passthrough","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"deviation_hz":null}`
+JSON: `{"op":"job_start","kind":"passthrough","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"deviation_hz":null,"sideband":null}`
 
 CLI: `zeta job start --kind passthrough --source <id> --center-hz 144800000 --bandwidth-hz 12500`
 
-`fm_demod` is narrowband FM voice; `wfm_demod` is wideband broadcast FM (mono, 50 us de-emphasis, 15 kHz audio; give it a band of about 200000 Hz). `am_demod` is AM voice (envelope detector, 5 kHz audio, slow AGC; give it a band of about 10000 Hz). All three output 48 kHz audio. `deviation_hz` is the FM peak deviation for `fm_demod` and `wfm_demod` (100-75000 Hz; `null` means the kind's default: 5000 Hz for `fm_demod`, right for standard voice FM, use 2500 for narrow 12.5 kHz channels; 75000 Hz for `wfm_demod`, right for broadcast FM). Every other kind takes `null`. On the CLI, omit `--deviation-hz` for `null`.
+`fm_demod` is narrowband FM voice; `wfm_demod` is wideband broadcast FM (mono, 50 us de-emphasis, 15 kHz audio; give it a band of about 200000 Hz). `am_demod` is AM voice (envelope detector, 5 kHz audio, slow AGC; give it a band of about 10000 Hz). `ssb_demod` is SSB voice (2800 Hz audio, slow AGC; `center_hz` is the suppressed-carrier (dial) frequency, not the middle of the voice band, and the band must cover both sides of it: give it about 6000 Hz). All four output 48 kHz audio. `deviation_hz` is the FM peak deviation for `fm_demod` and `wfm_demod` (100-75000 Hz; `null` means the kind's default: 5000 Hz for `fm_demod`, right for standard voice FM, use 2500 for narrow 12.5 kHz channels; 75000 Hz for `wfm_demod`, right for broadcast FM). Every other kind takes `null`. `sideband` is `usb` or `lsb` for `ssb_demod` (`null` means `usb`; amateur convention is `lsb` below 10 MHz, `usb` above); every other kind takes `null`. On the CLI, omit `--deviation-hz` and `--sideband` for `null`.
 
 ### job_list
 
@@ -227,6 +228,14 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: iq, audio, video, text, event, sink
 - outputs: iq, audio, video, text, event, sink
 - params.kind: string (StreamKind: iq|audio|video|text|event|sink)
+
+### ssb_demod
+
+- inputs: iq
+- outputs: audio
+- params.sideband: string (Sideband: usb|lsb)
+- params.audio_rate_hz: integer
+- params.audio_bandwidth_hz: integer
 
 ### wfm_demod
 
