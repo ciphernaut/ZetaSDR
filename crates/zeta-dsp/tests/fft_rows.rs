@@ -185,3 +185,97 @@ async fn quantised_row_reconstructs_within_half_a_step() {
     assert!(inside >= 1000, "{inside} bins inside the dynamic range");
     assert!(max_err <= 0.25 + 1e-3, "max error {max_err} dB");
 }
+
+#[tokio::test]
+async fn lagged_input_drops_the_partial_row_and_reanchors() {
+    // Current-thread runtime: the stage runs only while this task awaits, so sending more
+    // than CAP frames without awaiting makes its receiver lag.
+    const RATE: u64 = 1_000_000;
+    const BLOCK: usize = 1024;
+    const CAP: usize = 64; // a power of two: tokio keeps exactly CAP frames
+    const ROW_NS: u64 = 50_000_000;
+    const GAP_START: u64 = 5_000_000; // first sample after the gap (5 s)
+    let ns = |sample: u64| (sample as u128 * 1_000_000_000 / RATE as u128) as u64;
+    let bus = Arc::new(StreamBus::new(4096));
+    let out = bus.register(StreamKind::Event, prov());
+    let mut rx_out = bus.subscribe(&out).unwrap();
+    let (tx, rx_in) = broadcast::channel(CAP);
+    let o2 = out.clone();
+    let h = tokio::spawn(async move {
+        FftStage::new(Arc::new(CpuFft::new()))
+            .run(
+                serde_json::json!({"size": 1024, "window": "hann", "rows_per_s": 20}),
+                vec![rx_in],
+                vec![o2],
+                bus,
+                CancellationToken::new(),
+                StageContext::new(SourceId("s".into())),
+            )
+            .await
+    });
+    let mut seed = 3;
+    let mut send = |start: u64| {
+        tx.send(Frame::new(
+            StreamId::new(),
+            prov(),
+            Payload::Iq(IqBlock {
+                t0: Timestamp(ns(start)),
+                sample_rate_hz: Hz(RATE),
+                center_hz: Hz(CENTER_HZ),
+                samples: signal(start, BLOCK, 100_000.0, RATE as f64, &mut seed).into(),
+            }),
+        ))
+        .unwrap();
+    };
+    let drain = || tokio::time::sleep(std::time::Duration::from_millis(30));
+    // 0.725 s: 14 rows close, a partial row is left open.
+    let before = 725_000usize.div_ceil(BLOCK);
+    for i in 0..before {
+        send((i * BLOCK) as u64);
+        if i % 16 == 15 {
+            drain().await;
+        }
+    }
+    drain().await;
+    // Lost frames, then the first CAP blocks after the gap, all while the stage is idle:
+    // it sees Lagged(5) and then exactly the CAP post-gap blocks.
+    for i in 0..5 {
+        send(1_000_000 + (i * BLOCK) as u64);
+    }
+    let after = 1_000_000usize.div_ceil(BLOCK);
+    for i in 0..after {
+        send(GAP_START + (i * BLOCK) as u64);
+        if i + 1 >= CAP && (i + 1 - CAP).is_multiple_of(16) {
+            drain().await;
+        }
+    }
+    drop(tx);
+    h.await.unwrap().unwrap();
+    let mut spans = Vec::new();
+    while let Ok(f) = rx_out.try_recv() {
+        spans.push(f.provenance.span);
+    }
+    let gap_ns = ns(GAP_START);
+    assert!(
+        spans
+            .iter()
+            .all(|s| s.end_ns.0 <= ns(before as u64 * BLOCK as u64) || s.start_ns.0 >= gap_ns),
+        "a row spans the gap: {spans:?}"
+    );
+    let pre = spans.iter().filter(|s| s.end_ns.0 < gap_ns).count();
+    assert_eq!(pre, 14, "rows before the gap");
+    let post: Vec<_> = spans.iter().filter(|s| s.start_ns.0 >= gap_ns).collect();
+    assert_eq!(post.len(), 20, "rows after the gap: {post:?}");
+    for (k, s) in post.iter().enumerate() {
+        let want = gap_ns + k as u64 * ROW_NS;
+        let off = s.start_ns.0.abs_diff(want);
+        assert!(
+            off <= ns(BLOCK as u64),
+            "row {k} starts {off} ns off the new cadence: {s:?}"
+        );
+    }
+    assert_eq!(
+        post[0].start_ns.0, gap_ns,
+        "the first row after the gap starts at its t0"
+    );
+}

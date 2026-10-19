@@ -231,7 +231,8 @@ struct Row {
 /// signal time, counted in samples. Row `k` closes at the first chunk ending at or
 /// after sample `ceil((k + 1) * rate / rows_per_s)` since the stream (re)started;
 /// a row shorter than one chunk therefore holds one chunk and the next rows catch up.
-/// A change of rate or centre restarts the stream (the partial row is dropped).
+/// A change of rate or centre, or lost frames, restarts the stream: the partial row
+/// is dropped and the next row starts at the next block's `t0`.
 struct RowCutter {
     size: usize,
     window: Window,
@@ -283,9 +284,11 @@ impl RowCutter {
         ((self.row_index + 1) * self.rate_hz).div_ceil(self.rows_per_s)
     }
 
-    /// Frames were lost: the next chunk starts afresh (the row keeps its chunks).
+    /// Frames were lost: drop the carry and the partial row, and re-anchor the
+    /// cadence so the next row starts at the next block's `t0` (lost samples are
+    /// never counted, so continuing the old counters would drift).
     fn gap(&mut self) {
-        self.carry.clear();
+        self.restart(self.rate_hz, self.center_hz);
     }
 
     /// Adds `p` (covering `[start_ns, end_ns)`); the row when this closes one.
@@ -313,6 +316,8 @@ impl RowCutter {
     fn push(&mut self, block: &IqBlock, backend: &dyn FftBackend) -> Vec<Row> {
         let (rate, center) = (block.sample_rate_hz.0, block.center_hz.0);
         if rate != self.rate_hz || center != self.center_hz {
+            // A retune or a new rate: the partial row (and carry) mixes two bands or
+            // rates, so it is dropped and the cadence restarts at this block's `t0`.
             self.restart(rate, center);
         }
         let (size, window) = (self.size, self.window);
