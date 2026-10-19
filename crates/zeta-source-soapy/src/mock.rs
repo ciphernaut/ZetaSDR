@@ -30,6 +30,8 @@ pub struct MockDevice {
     /// `(floor, ceiling)`: the reported rate range's maximum follows the last
     /// set rate within these bounds, as a UHD device's follows its master clock.
     follow: Option<(f64, f64)>,
+    /// With `follow`: refuse a rate above the ceiling instead of clamping it.
+    refuse_above: bool,
     range_reads: Mutex<usize>,
 }
 
@@ -56,6 +58,7 @@ impl MockDevice {
             fails: Arc::default(),
             delays: Mutex::default(),
             follow: None,
+            refuse_above: false,
             range_reads: Mutex::new(0),
         }
     }
@@ -64,6 +67,14 @@ impl MockDevice {
     /// rate clamped to `floor..=ceiling` (`floor` before any rate is set).
     pub fn with_rate_follow(mut self, floor: f64, ceiling: f64) -> Self {
         self.follow = Some((floor, ceiling));
+        self
+    }
+
+    /// With [`MockDevice::with_rate_follow`]: `set_sample_rate` above the
+    /// ceiling fails and leaves the rate unchanged (as UHD refuses a rate its
+    /// clock cannot reach) instead of being clamped.
+    pub fn refusing_above_ceiling(mut self) -> Self {
+        self.refuse_above = true;
         self
     }
 
@@ -163,6 +174,12 @@ impl SoapyDevice for MockDevice {
     fn set_sample_rate(&self, hz: f64) -> Result<(), String> {
         self.rec(format!("set_sample_rate({hz})"));
         self.check("set_sample_rate")?;
+        if let Some((_, ceiling)) = self.follow
+            && self.refuse_above
+            && hz > ceiling
+        {
+            return Err(format!("rate {hz} above {ceiling}"));
+        }
         *self.rate.lock().unwrap() = hz;
         Ok(())
     }

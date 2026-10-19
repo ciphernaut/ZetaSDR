@@ -421,11 +421,12 @@ async fn measured_rate_is_reported() {
 
 #[test]
 fn uhd_source_asserts_the_range_at_the_maximum_clock() {
-    // A B210's driver key is its device type.
+    // A B210's driver key is its device type, and it refuses rates past its clock.
     let dev = Arc::new(
         MockDevice::hackrf_like()
             .with_driver("b200")
-            .with_rate_follow(16e6, 61.44e6),
+            .with_rate_follow(16e6, 61.44e6)
+            .refusing_above_ceiling(),
     );
     let src = source(&dev);
     assert_eq!(

@@ -6,8 +6,11 @@ use crate::device::{RangeHz, SoapyDevice, WireFormat};
 
 const RATE_QUANTUM_HZ: u64 = 100_000;
 
-/// Rounds of [`probe_rate_ranges`] on a UHD device.
+/// Doubling rounds of [`probe_rate_ranges`] on a UHD device.
 const UHD_PROBE_ROUNDS: usize = 3;
+/// UHD master-clock ceilings, descending (N3xx, X3xx, B2xx, B2xx alternate,
+/// B1xx): tried once when doubling the rate stops widening the range.
+const UHD_CLOCK_CEILINGS_HZ: [f64; 5] = [250e6, 200e6, 61.44e6, 56e6, 32e6];
 
 fn max_rate(ranges: &[RangeHz]) -> f64 {
     ranges
@@ -37,8 +40,11 @@ pub fn is_uhd(args: &str, driver_key: &str) -> bool {
 /// current master clock (a B210 opens at 16 MHz), so with `probe` (see
 /// [`is_uhd`]) the range is re-read after asking for twice the reported
 /// maximum (errors ignored; the driver raises its clock as far as it can),
-/// while the maximum grows, at most three rounds; the rate in force before is
-/// then restored. Without `probe` the ranges are read once. A
+/// while the maximum grows, at most three rounds. When a doubling does not
+/// widen it (UHD refuses a rate above its clock's reach), the known clock
+/// ceilings above the current maximum are tried once, highest first, and
+/// doubling continues from the first that widens it. The rate in force
+/// before is then restored. Without `probe` the ranges are read once. A
 /// `master_clock_rate=` device argument still fixes the clock, and with it
 /// the range.
 pub fn probe_rate_ranges(dev: &dyn SoapyDevice, probe: bool) -> Result<Vec<RangeHz>, String> {
@@ -47,12 +53,33 @@ pub fn probe_rate_ranges(dev: &dyn SoapyDevice, probe: bool) -> Result<Vec<Range
         return Ok(rates);
     }
     let saved = dev.sample_rate().ok().filter(|r| *r > 0.0);
+    // The range after asking for `hz`, when it reaches higher than `than`.
+    let grown = |hz: f64, than: f64| -> Option<Vec<RangeHz>> {
+        let _ = dev.set_sample_rate(hz);
+        dev.sample_rate_ranges()
+            .ok()
+            .filter(|r| !r.is_empty() && max_rate(r) > than)
+    };
+    let mut ceilings_tried = false;
     for _ in 0..UHD_PROBE_ROUNDS {
         let before = max_rate(&rates);
-        let _ = dev.set_sample_rate(2.0 * before);
-        match dev.sample_rate_ranges() {
-            Ok(r) if !r.is_empty() && max_rate(&r) > before => rates = r,
-            _ => break,
+        if let Some(r) = grown(2.0 * before, before) {
+            rates = r;
+            continue;
+        }
+        // UHD refuses a rate its clock cannot reach rather than clamping it:
+        // try the known clock ceilings above the current maximum, once.
+        if ceilings_tried {
+            break;
+        }
+        ceilings_tried = true;
+        match UHD_CLOCK_CEILINGS_HZ
+            .iter()
+            .filter(|&&c| c > before)
+            .find_map(|&c| grown(c, before))
+        {
+            Some(r) => rates = r,
+            None => break,
         }
     }
     if let Some(r) = saved {
@@ -210,14 +237,44 @@ mod tests {
         let c = capabilities(&dev, &rates).unwrap();
         assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(61_440_000)));
         assert_eq!(pick_rate(&rates, 30_000_000), Some(30_000_000));
-        // Probed 32 M, then 64 M (clipped to 61.44 M), then 122.88 M: no growth.
-        assert_eq!(dev.range_reads(), 4);
+        // Probed 32 M, then 64 M (clipped to 61.44 M), then 122.88 M: no
+        // growth, nor from the ceilings above 61.44 M.
+        assert_eq!(dev.range_reads(), 6);
         assert_eq!(
             dev.calls(),
             [
                 "set_sample_rate(8000000)",
                 "set_sample_rate(32000000)",
                 "set_sample_rate(64000000)",
+                "set_sample_rate(122880000)",
+                "set_sample_rate(250000000)",
+                "set_sample_rate(200000000)",
+                "set_sample_rate(8000000)"
+            ]
+        );
+        assert_eq!(dev.sample_rate(), Ok(8e6), "rate restored");
+    }
+
+    #[test]
+    fn uhd_probe_tries_clock_ceilings_when_a_doubling_is_refused() {
+        // A B210 refuses 64 M outright: 32 M, then the ceilings reach 61.44 M.
+        let dev = MockDevice::hackrf_like()
+            .with_driver("b200")
+            .with_rate_follow(16e6, 61.44e6)
+            .refusing_above_ceiling();
+        dev.set_sample_rate(8e6).unwrap();
+        let rates = probe_rate_ranges(&dev, is_uhd("", &dev.driver_key())).unwrap();
+        let c = capabilities(&dev, &rates).unwrap();
+        assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(61_440_000)));
+        assert_eq!(
+            dev.calls(),
+            [
+                "set_sample_rate(8000000)",
+                "set_sample_rate(32000000)",
+                "set_sample_rate(64000000)",
+                "set_sample_rate(250000000)",
+                "set_sample_rate(200000000)",
+                "set_sample_rate(61440000)",
                 "set_sample_rate(122880000)",
                 "set_sample_rate(8000000)"
             ]
