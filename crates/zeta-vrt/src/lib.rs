@@ -1,4 +1,5 @@
-//! VITA 49.2 (VRT) signal data packet codec. Big-endian, complex int16 payload.
+//! VITA 49.2 (VRT) signal data and context packet codec (big-endian, complex int16 payload),
+//! and the typed envelope that carries non-IQ frames on the same binary wire.
 
 mod context;
 pub mod envelope;
