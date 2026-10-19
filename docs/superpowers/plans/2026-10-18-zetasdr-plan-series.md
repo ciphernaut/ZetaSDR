@@ -62,4 +62,10 @@ open with no device exited 1 with a clear error. With a HackRF One (r9, firmware
 `source list` showed its capabilities (0-7.25 GHz, 20 MHz, ci8/ci16/cf32), and a `measure` job at
 100.1 MHz with a 200 kHz band produced two events a second apart (no antenna: snr 2.8 dB, label
 noise). A 1 MHz band in the debug build lagged continuously and produced no event in 8 s; the
-release build is the one to use for wide bands on real hardware.
+release build is the one to use for wide bands on real hardware. With an antenna, the release
+build measured a 1 MHz band at 1 Msps without lag, `measure` at 104.9 MHz showed a broadcast
+station (11-20 dB snr, occupied bandwidth 28-98 kHz between runs) and `fm_demod` at 104.9 MHz
+with 75 kHz deviation streamed audio frames. Layer-1 labels broadcast FM `unknown` by design: the
+plan-2 `fm` rule is narrowband (band at most 25 kHz, envelope cv below 0.2), and the occupied-
+bandwidth estimate varies with the FFT bin width. A wideband-FM rule and a steadier bandwidth
+estimate are layer-1 follow-ups.
