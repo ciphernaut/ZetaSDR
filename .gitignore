@@ -5,3 +5,4 @@
 /.claude/
 /crates/zeta-source-soapy-driver/target
 __pycache__/
+/deploy/pi/out/
