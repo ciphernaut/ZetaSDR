@@ -23,7 +23,9 @@
 //         onClose({code, reason, reconnecting}) after every socket close. While `reconnect`
 //         is true it reopens with backoff 0.5 s doubling to 8 s (reset on open); when
 //         `onReconnect(oldId) -> Promise<id|null>` is given the id is re-resolved first
-//         (null: try again after the next backoff).
+//         (null: try again after the next backoff; nothing more happens if the subscription
+//         was closed meanwhile). Stream ids change when a job restarts under `graph_put`, so
+//         callers re-resolve by provenance with `streams()`.
 //     api.streamBinary(id, onFrame, {credits = 256, topup = 128, onText, onClose,
 //                      reconnect = true, onReconnect}) -> {close}
 //         Binary websocket /stream/{id}?format=binary. Grants `credits` on open with
@@ -164,6 +166,7 @@ export class Api {
           } catch {
             next = null;
           }
+          if (closed) return; // onReconnect may close this subscription (e.g. to resubscribe)
           if (!next) return schedule();
           id = next;
         }

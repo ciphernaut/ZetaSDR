@@ -15,7 +15,8 @@
 // the transcript through the `ops` stream); anything else goes to `api.ask`.
 //
 // The waterfall (waterfall.js) is mounted in #waterfall at login and follows the selected
-// source; it is destroyed when the node rejects the secret.
+// source (selecting the source it already shows does nothing); it is destroyed when the node
+// rejects the secret.
 //
 // Exports `state` ({api, transcript, jobs, wf, sources, selected}) and `onSourceChange(fn)` for
 // the later views (waterfall, audio, voice).
@@ -284,7 +285,8 @@ function logout(api) {
   showLogin("secret rejected");
 }
 
-// Hooks for the e2e scenarios: simulate a changed secret and force a jobs poll.
+// Hooks for the e2e scenarios: simulate a changed secret, force a jobs poll, and read what
+// the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall).
 window.zetaTest = {
   setSecret(s) {
     if (state.api) state.api.secret = s;
@@ -292,12 +294,18 @@ window.zetaTest = {
   poll() {
     return state.jobs ? state.jobs.refresh() : Promise.resolve();
   },
+  wf() {
+    const wf = state.wf;
+    if (!wf) return null;
+    return { sourceId: wf.sourceId, jobId: wf.jobId, painted: wf.painted, badge: !wf.badge.hidden };
+  },
 };
 
 function boot() {
   applyFootprint();
   onSourceChange((src) => {
-    if (state.wf) state.wf.setSource(src);
+    // Re-selecting the shown source keeps its job and columns.
+    if (state.wf && state.wf.sourceId !== (src ? src.id : null)) state.wf.setSource(src);
   });
   wireCommandLine();
   window.addEventListener("resize", applyFootprint);

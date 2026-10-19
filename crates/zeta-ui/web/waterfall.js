@@ -10,22 +10,34 @@
 //         min(max_bandwidth_hz, 1 MHz). UI-started job ids go in sessionStorage[UI_JOBS_KEY];
 //         they are stopped on `pagehide` (fetch keepalive, with the bearer). The job's event
 //         stream is followed in text mode.
+//     wf.sourceId   id of the source being shown (null when none, or after setSource failed)
+//     wf.jobId      the followed job's id (null until known)
+//     wf.painted    columns painted since mount (never reset; for tests)
 //     wf.onSelect(cb)   cb({centerHz, bandwidthHz, startNs, endNs}) after a drag; the same
 //         object is kept in window.zetaLastSelection.
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
 //     wf.destroy()
 //
+// Reconnect: when the stream's socket closes (a `closed` message, an error) the #wf-badge
+// "reconnecting…" shows and api.streamText reopens with backoff, re-resolving the stream id
+// by provenance (event stream of the job) because it changes when the job restarts under
+// `graph_put`. If the job is no longer running (stopped by another tab, the CLI, a Stop
+// button), setSource runs again for the same source: it reuses another running spectrum job
+// or starts its own. The badge hides at the first frame after that.
+//
 // Layout: frequency is vertical (highest at the top), time runs right to left: each event
-// becomes one backing-pixel column at the right edge after the canvas is shifted left by one
-// column with drawImage. At most MAX_ROWS_PER_S columns per second are painted; extra events
-// are dropped. Colour: dB clamped to [floor - 10, floor + 60], floor being the 15th percentile
-// of the column's own dB values, through a 256-entry blue-yellow-white ramp. The frequency
+// becomes one CSS-pixel column (Math.round(devicePixelRatio) backing pixels, at least 1) at
+// the right edge after the canvas is shifted left by that much with drawImage. At most
+// MAX_ROWS_PER_S columns per second are painted; extra events are dropped. Colour: dB
+// clamped to [floor - 10, floor + 60], floor being the 15th percentile of the column's own
+// dB values, through a 256-entry blue-yellow-white ramp. The frequency
 // band comes from each event (`center_hz`, `size * bin_hz`), falling back to the job's tuning.
 // Per-column start_ns/end_ns are kept in a ring of RING_COLUMNS for the selection's time span.
 //
 // Reload: pagehide stops the UI's jobs and records their ids under STOPPING_KEY; the next page
 // in the tab never reuses those (their stop may still be in flight), stops them again in case
-// the keepalive request was lost, and starts a fresh job instead.
+// the keepalive request was lost, and starts a fresh job instead. A page restored from the
+// back/forward cache (`pageshow` with `persisted`) does the same and runs setSource again.
 
 export const MAX_ROWS_PER_S = 30;
 export const RING_COLUMNS = 2048;
@@ -131,9 +143,12 @@ class Waterfall {
     this.selectCbs = [];
     this.gen = 0;
     this.sub = null;
+    this.src = null; // the source record being shown
+    this.jobId = null;
     this.band = null; // {lo, hi} Hz
     this.lastPaint = -Infinity;
     this.columns = 0; // columns painted since the last clear
+    this.painted = 0; // columns painted since mount (never reset)
     this.ringStart = new Array(RING_COLUMNS).fill(0);
     this.ringEnd = new Array(RING_COLUMNS).fill(0);
     this.drag = null;
@@ -166,6 +181,12 @@ class Waterfall {
 
     this.onPageHide = () => this.stopUiJobs();
     window.addEventListener("pagehide", this.onPageHide);
+    this.onPageShow = (ev) => {
+      if (!ev.persisted) return;
+      this.cleanupStopping();
+      if (this.src) this.setSource(this.src);
+    };
+    window.addEventListener("pageshow", this.onPageShow);
 
     this.cleanupStopping();
     if (source) this.setSource(source);
@@ -176,9 +197,14 @@ class Waterfall {
   // Jobs a previous page in this tab asked to stop on its pagehide: never reused; stopped
   // again in case that keepalive request was lost.
   cleanupStopping() {
-    this.stopping = new Set(loadIds(STOPPING_KEY));
+    const ids = loadIds(STOPPING_KEY);
+    this.stopping = new Set([...(this.stopping || []), ...ids]);
     storeIds(STOPPING_KEY, []);
-    for (const id of this.stopping) this.api.op({ op: "job_stop", job: id }).catch(() => {});
+    for (const id of ids) this.api.op({ op: "job_stop", job: id }).catch(() => {});
+  }
+
+  get sourceId() {
+    return this.src ? this.src.id : null;
   }
 
   stopUiJobs() {
@@ -196,30 +222,59 @@ class Waterfall {
     }
   }
 
-  async setSource(src) {
+  // `restart`: the followed job went away; keep the badge up until frames flow again.
+  async setSource(src, { restart = false } = {}) {
     const gen = ++this.gen;
     if (this.sub) this.sub.close();
     this.sub = null;
     this.jobId = null;
+    this.src = src;
     this.clear();
+    if (!restart) this.badge.hidden = true;
     if (!src) return;
     try {
       const jobId = await this.findOrStartJob(src);
       if (gen !== this.gen || !jobId) return;
       this.jobId = jobId;
       const streamId = await this.findStream(jobId, gen);
-      if (gen !== this.gen || !streamId) return;
+      if (gen !== this.gen) return;
+      if (!streamId) throw new Error(`no event stream for job ${jobId}`);
       this.sub = this.api.streamText(
         streamId,
         (msg) => {
-          if (gen === this.gen && msg.type === "frame") this.addEvent(msg);
+          if (gen !== this.gen || msg.type !== "frame") return;
+          this.badge.hidden = true;
+          this.addEvent(msg);
         },
-        null,
-        { onReconnect: () => this.lookupStream(jobId) },
+        ({ reconnecting }) => {
+          if (gen === this.gen && reconnecting) this.badge.hidden = false;
+        },
+        { onReconnect: () => this.reresolve(src, jobId, gen) },
       );
     } catch (e) {
+      if (gen === this.gen) this.src = null; // selecting the source again retries
       console.warn(`waterfall ${src.id}: ${e.message}`);
     }
+  }
+
+  // The followed job's current event stream id; null to try again after the next backoff.
+  // When the job no longer runs, setSource starts over (closing this subscription).
+  async reresolve(src, jobId, gen) {
+    const id = await this.lookupStream(jobId);
+    if (gen !== this.gen) return null;
+    if (id) return id;
+    const jobs = (await this.api.op({ op: "job_list" })).value || [];
+    if (gen !== this.gen) return null;
+    const job = jobs.find((j) => j.id === jobId);
+    if (job && job.state && job.state.status === "running") return null; // restarting
+    this.forgetUiJob(jobId);
+    this.setSource(src, { restart: true });
+    return null;
+  }
+
+  forgetUiJob(id) {
+    const ids = loadIds(UI_JOBS_KEY);
+    if (ids.includes(id)) storeIds(UI_JOBS_KEY, ids.filter((x) => x !== id));
   }
 
   async findOrStartJob(src) {
@@ -233,8 +288,10 @@ class Waterfall {
         !this.stopping.has(j.id),
     );
     if (running) {
-      this.tuning = running.tuning;
-      this.setBand(running.tuning.center_hz, running.tuning.bandwidth_hz);
+      // Without a usable tuning the band comes from the first event.
+      const t = running.tuning;
+      this.tuning = t && t.center_hz && t.bandwidth_hz ? t : null;
+      if (this.tuning) this.setBand(this.tuning.center_hz, this.tuning.bandwidth_hz);
       return running.id;
     }
     const band = sourceBand(src);
@@ -314,7 +371,7 @@ class Waterfall {
     this.ctx.fillStyle = "#000030";
     this.ctx.fillRect(0, 0, w, h);
     if (old) this.ctx.drawImage(old, w - old.width, 0, old.width, h);
-    this.column = this.ctx.createImageData(1, h);
+    this.column = this.ctx.createImageData(Math.max(1, Math.round(dpr)), h);
     this.drawAxis();
   }
 
@@ -362,11 +419,13 @@ class Waterfall {
     this.ringStart[slot] = Number(msg.start_ns) || 0;
     this.ringEnd[slot] = Number(msg.end_ns) || this.ringStart[slot];
     this.columns += 1;
+    this.painted += 1;
   }
 
   paintColumn(db) {
     const w = this.canvas.width;
     const h = this.canvas.height;
+    const cw = Math.min(this.column.width, w); // backing pixels per event
     const size = db.length;
     const floor = percentile(db, FLOOR_PERCENTILE);
     const lo = floor - BELOW_FLOOR_DB;
@@ -380,14 +439,16 @@ class Waterfall {
       let v = -Infinity;
       for (let b = b0; b < b1 && b < size; b++) if (db[b] > v) v = db[b];
       const idx = Math.max(0, Math.min(255, Math.round((v - lo) * scale))) * 3;
-      const o = y * 4;
-      px[o] = RAMP[idx];
-      px[o + 1] = RAMP[idx + 1];
-      px[o + 2] = RAMP[idx + 2];
-      px[o + 3] = 255;
+      for (let x = 0; x < cw; x++) {
+        const o = (y * this.column.width + x) * 4;
+        px[o] = RAMP[idx];
+        px[o + 1] = RAMP[idx + 1];
+        px[o + 2] = RAMP[idx + 2];
+        px[o + 3] = 255;
+      }
     }
-    this.ctx.drawImage(this.canvas, 1, 0, w - 1, h, 0, 0, w - 1, h);
-    this.ctx.putImageData(this.column, w - 1, 0);
+    if (w > cw) this.ctx.drawImage(this.canvas, cw, 0, w - cw, h, 0, 0, w - cw, h);
+    this.ctx.putImageData(this.column, w - cw, 0);
   }
 
   // ---- selection -----------------------------------------------------------------------
@@ -455,11 +516,14 @@ class Waterfall {
   }
 
   // The column painted at CSS x (its ring slot), clamped to the painted columns; null if none.
+  // Each column is `this.column.width` backing pixels wide, the newest at the right edge.
   slotAt(x) {
     if (this.columns === 0) return null;
     const dpr = this.canvas.width / (this.canvas.clientWidth || 1);
-    const age = Math.max(0, this.canvas.width - 1 - Math.floor(x * dpr));
-    const oldest = Math.min(this.columns, RING_COLUMNS, this.canvas.width) - 1;
+    const cw = Math.max(1, Math.min(this.column.width, this.canvas.width));
+    const px = Math.max(0, this.canvas.width - 1 - Math.floor(x * dpr));
+    const age = Math.floor(px / cw);
+    const oldest = Math.min(this.columns, RING_COLUMNS, Math.ceil(this.canvas.width / cw)) - 1;
     return (this.columns - 1 - Math.min(age, oldest)) % RING_COLUMNS;
   }
 
@@ -484,6 +548,7 @@ class Waterfall {
     this.sub = null;
     this.ro.disconnect();
     window.removeEventListener("pagehide", this.onPageHide);
+    window.removeEventListener("pageshow", this.onPageShow);
     this.el.replaceChildren();
   }
 }

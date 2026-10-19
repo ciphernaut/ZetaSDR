@@ -219,14 +219,113 @@ def scenario_waterfall_paints(page, url, secret):
         assert 99.976 <= v <= 100.024 and t == f"{v:.3f}", f"tick {t!r} in {ticks}"
 
 
+def stop_spectrum_jobs(url, secret, source):
+    """Stop every running spectrum job on `source` through the API."""
+    for j in running_spectrum_jobs(url, secret, source):
+        http_json(url, secret, "/op", {"op": "job_stop", "job": j["id"]})
+    assert running_spectrum_jobs(url, secret, source) == [], "spectrum jobs survive job_stop"
+
+
+def wait_spectrum_jobs(url, secret, source, ok, within_s):
+    """Poll the running spectrum jobs on `source` until `ok(jobs)` or `within_s` passes."""
+    deadline = time.monotonic() + within_s
+    while True:
+        jobs = running_spectrum_jobs(url, secret, source)
+        if ok(jobs) or time.monotonic() > deadline:
+            return jobs
+        time.sleep(0.2)
+
+
 def scenario_ui_spectrum_job_is_reused_not_duplicated(page, url, secret):
+    # A reload stops the page's own job on pagehide and starts exactly one fresh one: no
+    # duplicate, and the stopped job is not picked up again.
+    stop_spectrum_jobs(url, secret, "tone")
     show_tone_waterfall(page, url, secret)
+    jobs = wait_one_spectrum_job(url, secret, "tone")
+    assert len(jobs) == 1, f"spectrum jobs on tone before reload: {jobs}"
+    old = jobs[0]["id"]
     page.reload()
     expect(page.locator("#login")).to_be_hidden()
-    page.wait_for_timeout(3_000)
+    jobs = wait_spectrum_jobs(url, secret, "tone",
+                              lambda js: len(js) == 1 and js[0]["id"] != old, 5.0)
+    assert len(jobs) == 1 and jobs[0]["id"] != old, \
+        f"spectrum jobs on tone after reload (old {old}): {jobs}"
+    page.wait_for_timeout(1_000)
     jobs = running_spectrum_jobs(url, secret, "tone")
-    assert len(jobs) == 1, f"spectrum jobs on tone after reload: {jobs}"
+    assert len(jobs) == 1 and jobs[0]["id"] != old, f"spectrum jobs settle to: {jobs}"
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+
+
+# Records on window.__badgeSeen whether #wf-badge was ever shown from now on.
+WATCH_BADGE_JS = """() => {
+  const b = document.querySelector('#wf-badge');
+  window.__badgeSeen = !b.hidden;
+  new MutationObserver(() => { if (!b.hidden) window.__badgeSeen = true; })
+    .observe(b, {attributes: true, attributeFilter: ['hidden']});
+}"""
+
+WF_STATE_JS = "() => window.zetaTest.wf()"
+
+
+def wait_waterfall_follows(page, pred_js, what):
+    """Wait until the waterfall's job satisfies `pred_js` (a JS expression over `w`), then
+    until it paints 3 more columns, the right edge is bright and #wf-badge is hidden."""
+    page.wait_for_function(
+        f"() => {{ const w = window.zetaTest.wf(); return !!w && ({pred_js}); }}", timeout=10_000)
+    p1 = page.evaluate(WF_STATE_JS)["painted"]
+    try:
+        page.wait_for_function(
+            f"""() => {{
+              const w = window.zetaTest.wf();
+              return w.painted > {p1} + 3 && !w.badge && ({BRIGHT_AT_RIGHT_JS})();
+            }}""", timeout=10_000)
+    except Exception as e:
+        state = page.evaluate(WF_STATE_JS)
+        raise AssertionError(f"{what}: waterfall not repainting: {state}") from e
+
+
+def scenario_waterfall_reconnects_after_socket_close(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.wf() && window.zetaTest.wf().jobId")
+    old = page.evaluate(WF_STATE_JS)["jobId"]
+    page.evaluate(WATCH_BADGE_JS)
+    # Another client replaces the job: the waterfall follows the new one.
+    http_json(url, secret, "/op", {"op": "job_stop", "job": old})
+    new = http_json(url, secret, "/op", {"op": "job_start", "kind": "spectrum", "source": "tone",
+                                         "center_hz": 100_000_000, "bandwidth_hz": 48_000,
+                                         "deviation_hz": None})["value"]
+    wait_waterfall_follows(page, f"w.jobId === {json.dumps(new)}", "after job_start")
+    assert page.evaluate("window.__badgeSeen"), "#wf-badge never shown while down"
+    jobs = running_spectrum_jobs(url, secret, "tone")
+    assert [j["id"] for j in jobs] == [new], f"spectrum jobs on tone: {jobs}"
+    # Nobody replaces it: the waterfall starts its own job within 10 s.
+    page.evaluate(WATCH_BADGE_JS)
+    http_json(url, secret, "/op", {"op": "job_stop", "job": new})
+    wait_waterfall_follows(page, f"w.jobId && w.jobId !== {json.dumps(new)}", "own job")
+    assert page.evaluate("window.__badgeSeen"), "#wf-badge never shown while down"
+    own = page.evaluate(WF_STATE_JS)["jobId"]
+    jobs = running_spectrum_jobs(url, secret, "tone")
+    assert [j["id"] for j in jobs] == [own], f"spectrum jobs on tone (own {own}): {jobs}"
+    ui_jobs = page.evaluate("JSON.parse(sessionStorage.getItem('zeta.uiJobs') || '[]')")
+    assert ui_jobs == [own], f"zeta.uiJobs {ui_jobs} (own {own})"
+
+
+def scenario_pagehide_stops_ui_jobs(page, url, secret):
+    # Its own context, so the page closing is the only thing that can stop the job.
+    stop_spectrum_jobs(url, secret, "tone")
+    ctx = page.context.browser.new_context(viewport=WIDE)
+    try:
+        tab = ctx.new_page()
+        show_tone_waterfall(tab, url, secret)
+        jobs = wait_one_spectrum_job(url, secret, "tone")
+        assert len(jobs) == 1, f"spectrum jobs on tone: {jobs}"
+        # page.close(run_before_unload=True) runs the unload steps, so `pagehide` fires;
+        # a plain ctx.close() in headless Chromium does not.
+        tab.close(run_before_unload=True)
+        jobs = wait_spectrum_jobs(url, secret, "tone", lambda js: js == [], 3.0)
+        assert jobs == [], f"spectrum jobs on tone 3 s after the page closed: {jobs}"
+    finally:
+        ctx.close()
 
 
 def scenario_selection_reports_band(page, url, secret):
