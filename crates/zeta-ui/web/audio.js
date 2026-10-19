@@ -18,8 +18,9 @@
 //       (graph_put restarts the job with new stream ids). onError(message) reports a failure
 //       (no audio stream, a bad envelope, an unplayable rate), after which playback stops and
 //       onEnd() is called; stop() closes the socket and the context (and calls onEnd).
-//   window.zetaAudio = {framesPlayed, playing}: frames scheduled since the last playJob and
-//       the job id being played (null when stopped); read by the e2e scenarios.
+//   window.zetaAudio = {framesPlayed, framesDropped, playing}: frames scheduled and frames
+//       dropped (beyond MAX_AHEAD_S) since the last playJob, and the job id being played (null
+//       when stopped); read by the e2e scenarios.
 
 export const LEAD_S = 0.1;
 export const MAX_AHEAD_S = 2.0;
@@ -28,7 +29,7 @@ const STREAM_LOOKUP_MS = 250;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-window.zetaAudio = { framesPlayed: 0, playing: null };
+window.zetaAudio = { framesPlayed: 0, framesDropped: 0, playing: null };
 
 export function parseEnvelope(buf) {
   const view = new DataView(buf);
@@ -58,7 +59,7 @@ export function playJob(api, job, { onError = () => {}, onEnd = () => {} } = {})
   let sub = null;
   let stopped = false;
   let nextStart = 0;
-  window.zetaAudio = { framesPlayed: 0, playing: job.id };
+  window.zetaAudio = { framesPlayed: 0, framesDropped: 0, playing: job.id };
 
   const stop = () => {
     if (stopped) return;
@@ -97,7 +98,10 @@ export function playJob(api, job, { onError = () => {}, onEnd = () => {} } = {})
     buffer.copyToChannel(frame.samples, 0);
     const now = ctx.currentTime;
     if (nextStart < now) nextStart = now + LEAD_S;
-    if (nextStart - now > MAX_AHEAD_S) return;
+    if (nextStart - now > MAX_AHEAD_S) {
+      window.zetaAudio.framesDropped += 1;
+      return;
+    }
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(ctx.destination);

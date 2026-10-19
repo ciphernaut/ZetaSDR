@@ -605,15 +605,17 @@ def scenario_graph_edit_puts(page, url, secret):
         params.fill("{")
         modal.locator("#graph-apply").click()
         expect(modal.locator(".graph-error")).to_contain_text("not valid JSON")
-        # A good one is put, restarts the job (new stream ids) and re-renders.
-        params.fill(json.dumps({**current, "out_rate_hz": 48000}, indent=2))
+        # A good one (a real change: bandwidth 12500 -> 12000) is put, restarts the job (new
+        # stream ids) and re-renders.
+        assert current.get("bandwidth_hz") == 12_500, f"channel params {current}"
+        params.fill(json.dumps({**current, "bandwidth_hz": 12_000}, indent=2))
         modal.locator("#graph-apply").click()
         expect(modal.locator(".graph-status")).to_contain_text("applied")
         expect(modal.locator(".graph-error")).to_have_text("")
         expect(modal.locator("svg .graph-node")).to_have_count(3)
         graph = http_json(url, secret, "/op", {"op": "graph_get", "job": job})["value"]
         channel = [n for n in graph["nodes"] if n["kind"] == "channel"]
-        assert channel and channel[0]["params"]["out_rate_hz"] == 48000, f"graph {graph}"
+        assert channel and channel[0]["params"]["bandwidth_hz"] == 12_000, f"graph {graph}"
         after = stream_of(url, secret, job, "audio")
         assert after and after != before, f"audio stream {before} -> {after}: job not restarted"
         ok = page.locator("#transcript .line.op", has_text=re.compile(r"^graph_put .*→ ok"))

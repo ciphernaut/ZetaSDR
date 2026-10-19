@@ -36,7 +36,7 @@ import { mountWaterfall } from "./waterfall.js";
 import { mountOverlays } from "./overlays.js";
 import { mountMenu } from "./menu.js";
 import { playJob } from "./audio.js";
-import { showGraph } from "./graph.js";
+import { closeGraph, showGraph } from "./graph.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -333,6 +333,7 @@ function logout(api) {
   state.api = null;
   api.onUnauthorized = null;
   stopAudio();
+  closeGraph();
   if (state.ops) state.ops.close();
   if (state.jobs) state.jobs.close();
   if (state.menu) state.menu.destroy();

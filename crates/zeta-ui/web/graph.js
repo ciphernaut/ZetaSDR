@@ -17,6 +17,8 @@
 //       still selected; `.graph-status` says "applied". Failures (bad JSON, the node's
 //       op error with its corrective detail) show in `.graph-error`. Escape or the × button
 //       closes it.
+//   closeGraph()
+//       Closes the open graph modal, if any (the app calls it when the secret is rejected).
 
 const NODE_W = 160;
 const NODE_H = 46;
@@ -306,6 +308,10 @@ class GraphModal {
       this.status.textContent = "applied; job restarted";
     }
   }
+}
+
+export function closeGraph() {
+  if (current) current.close();
 }
 
 export async function showGraph(api, jobId) {
