@@ -366,7 +366,7 @@ decodes the synthetic DF17 fixture (ICAO 4840D6, callsign ZETA1). The oracle tes
 printed line when the program is absent. The acarsdec oracle was flaky at about 50 % until its WAV
 was padded with 2 s of silence (62ea5b5); 3 of 3 full-suite runs were then green.
 
-Tests, as the task reports and ledger give them: POCSAG 9 tests at task 1 (11 plus 2 later), RDS 12,
+Tests, as the task reports and ledger give them (the whole workspace at the branch head: 671 passed, 0 failed, 3 ignored, the 40 browser scenarios included): POCSAG 9 tests at task 1, RDS 12,
 ACARS 8 plus 3 framer tests added in task 7, zeta-ext 2 unit plus 11 integration (the real dump1090
 oracle among them), `zeta-core` ops 51, `zeta` cli 40, catalogue 10, and the UI suite 40 of 40
 Playwright scenarios (160 s of the 300 s deadline, no skip line). No workspace-wide total was
