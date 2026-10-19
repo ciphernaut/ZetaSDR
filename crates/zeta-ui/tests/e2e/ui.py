@@ -5,8 +5,8 @@ Usage: python3 ui.py <node-url> <secret> [scenario]
 Runs every `scenario_*` function (or only those named, comma-separated, with or without the
 `scenario_` prefix) against a running `zeta serve`, each in a fresh browser context. Prints `PASS <name>`
 or `FAIL <name>: <reason>` (plus the browser console errors) and exits 1 on the first failure.
-Run by `cargo test -p zeta --test ui`, which starts the node with the `tone` and `aprs` fixtures
-and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
+Run by `cargo test -p zeta --test ui`, which starts the node with the `tone`, `aprs` and `wfm`
+(wideband FM, 1 kHz tone with pilot, 240 kHz at 104.9 MHz) fixtures and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
 state directory in ZETA_UI_STATE_DIR, and the URL of a second node started without a speech
 daemon in ZETA_UI_URL_NOSTT (for the "no daemon" scenario).
 """
@@ -108,7 +108,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (2 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (3 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -184,7 +184,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (2 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (3 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -209,7 +209,7 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    for source in ("tone", "aprs"):
+    for source in ("tone", "aprs", "wfm"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -465,7 +465,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (2 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (3 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -513,13 +513,14 @@ def open_menu_on_tone(page, url, secret):
     return drag_menu(page)
 
 
-def drag_menu(page):
-    """Drag a selection over the middle fifth of the shown band (about 10 kHz around the
-    tone, as the measure job uses) across every painted column; the menu opens at the
-    pointer. Asserts the footer and a span of at least 1 s. Returns the #ctx locator."""
+def drag_menu(page, lo=0.40, hi=0.60):
+    """Drag a selection over the band from fraction `lo` to `hi` of its height (by default
+    the middle fifth: about 10 kHz around the tone, as the measure job uses) across every
+    painted column; the menu opens at the pointer. Asserts the footer and a span of at least
+    1 s. Returns the #ctx locator."""
     box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
     x0, x1 = box["x"] + 40, box["x"] + box["width"] - 20
-    y0, y1 = box["y"] + box["height"] * 0.40, box["y"] + box["height"] * 0.60
+    y0, y1 = box["y"] + box["height"] * lo, box["y"] + box["height"] * hi
     page.mouse.move(x0, y0)
     page.mouse.down()
     page.mouse.move(x1, y1, steps=6)
@@ -824,6 +825,101 @@ def scenario_ws_busy_is_noted_once(page, url, secret):
         hog.close()
         if job:
             stop_job(url, secret, job)
+
+
+def scenario_ssb_entry_tunes_the_dial(page, url, secret):
+    # Ruling R6: SSB (USB) tunes the carrier 1.5 kHz below the selection's centre, 6 kHz wide,
+    # and the footer shows that dial frequency while the entry is focused.
+    open_menu_on_tone(page, url, secret)
+    footer = page.locator("#ctx-footer").text_content()
+    centre = int(re.search(r"center_hz=(\d+)", footer).group(1))
+    page.focus('#ctx .ctx-item[data-action="ssb_usb"]')
+    expect(page.locator("#ctx-footer")).to_contain_text(
+        f"center_hz={centre - 1500} bandwidth_hz=6000 sideband=usb")
+    page.focus('#ctx .ctx-item[data-action="ssb_lsb"]')
+    expect(page.locator("#ctx-footer")).to_contain_text(
+        f"center_hz={centre + 1500} bandwidth_hz=6000 sideband=lsb")
+    page.click('#ctx .ctx-item[data-action="ssb_usb"]')
+    jobs = []
+    try:
+        expect(page.locator("#transcript .line.op", has_text=re.compile(
+            rf"^job_start kind=ssb_demod source=tone center_hz={centre - 1500} "
+            r"bandwidth_hz=6000 sideband=usb → job ")).first).to_be_visible()
+        jobs = [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+                if j["kind"] == "ssb_demod" and j["source"] == "tone"
+                and j["state"]["status"] == "running"]
+        assert len(jobs) == 1, f"ssb_demod jobs on tone: {jobs}"
+        expect(job_row(page, jobs[0]["id"]).locator("button.play")).to_have_text("▶")
+    finally:
+        for j in jobs:
+            stop_job(url, secret, j["id"])
+
+
+def open_menu_on_wfm(page, url, secret):
+    """Show the `wfm` source and open the menu on a selection over most of its band (the
+    middle 80 %, about 190 kHz) and every painted column: about 1.5 s, at least 1 s (a
+    classification of 240 kHz IQ takes about 15 s a second of span in a debug build)."""
+    select_source(page, url, secret, "wfm")
+    page.wait_for_function("() => window.zetaTest.wf().painted > 55", timeout=15_000)
+    return drag_menu(page, 0.10, 0.90)
+
+
+def scenario_wfm_decode_plays_audio(page, url, secret):
+    menu = open_menu_on_wfm(page, url, secret)
+    page.click('#ctx .ctx-item[data-action="wfm_demod"]')
+    expect(menu).to_be_hidden()
+    jobs = []
+    try:
+        expect(page.locator("#transcript .line.op",
+                            has_text=re.compile(r"^job_start kind=wfm_demod source=wfm .*"
+                                                r"deviation_hz=75000 → job ")).first).to_be_visible()
+        jobs = [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+                if j["kind"] == "wfm_demod" and j["source"] == "wfm"
+                and j["state"]["status"] == "running"]
+        assert len(jobs) == 1, f"wfm_demod jobs on wfm: {jobs}"
+        row = job_row(page, jobs[0]["id"])
+        play = row.locator("button.play")
+        expect(play).to_have_text("▶")
+        play.click()
+        # The first frames of a demod on this 240 kHz source take 4-7 s in a debug build.
+        page.wait_for_function(
+            "() => window.zetaAudio && window.zetaAudio.framesPlayed > 0", timeout=15_000)
+        rate = page.evaluate("window.zetaAudio.lastRate")
+        assert rate == 48_000, f"audio header sample_rate_hz {rate!r}"
+        page.evaluate("window.zetaTest.poll()")
+        expect(row.locator("button.play")).to_have_text("■")
+        row.locator("button.play").click()
+        expect(row.locator("button.play")).to_have_text("▶")
+    finally:
+        for j in jobs:
+            stop_job(url, secret, j["id"])
+
+
+def scenario_what_is_this_names_fm_broadcast(page, url, secret):
+    menu = open_menu_on_wfm(page, url, secret)
+    page.click('#ctx .ctx-item[data-action="classify"]')
+    expect(menu).to_be_hidden()
+    line = page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
+    expect(line.first).to_be_visible(timeout=45_000)
+    expect(line.first).to_contain_text("L1 wfm ")
+    expect(line.first).to_contain_text("L2 FM Broadcast Radio ")
+    l1 = page.locator("#waterfall .ov-label", has_text=re.compile(r"^L1 wfm "))
+    l2 = page.locator("#waterfall .ov-label", has_text=re.compile(r"^L2 FM Broadcast Radio "))
+    expect(l1).to_have_count(1)
+    expect(l2).to_have_count(1)
+    expect(l1).to_be_visible()
+    expect(l2).to_be_visible()
+    # Only the top layer-2 name is drawn, one line under the layer-1 label.
+    expect(page.locator('#waterfall .ov-label[data-layer="2"]')).to_have_count(1)
+    b1, b2 = l1.bounding_box(), l2.bounding_box()
+    assert b1["y"] + b1["height"] <= b2["y"] + 1 and b2["y"] - b1["y"] < 2 * b1["height"] + 4, \
+        f"L2 label not one line under L1: {b1} {b2}"
+    expect(page.locator("#transcript .line.note", has_text=re.compile(r"^L1 wfm ")).first) \
+        .to_be_visible()
+    expect(page.locator("#transcript .line.note",
+                        has_text=re.compile(r"^L2 FM Broadcast Radio \d\.\d\d")).first).to_be_visible()
+    if os.environ.get("ZETA_UI_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "wfm.png"))
 
 
 # ---- voice (Task 11) -----------------------------------------------------------------------

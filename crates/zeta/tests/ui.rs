@@ -1,5 +1,6 @@
 //! The web app's end-to-end scenarios (`crates/zeta-ui/tests/e2e/ui.py`, Playwright with
-//! headless Chromium) against a real `zeta serve` with the `tone` and `aprs` fixtures; the
+//! headless Chromium) against a real `zeta serve` with the `tone`, `aprs` and `wfm` fixtures
+//! (`wfm`: a 1 kHz tone, wideband FM with pilot, 240 kHz, 2 s looping, at 104.9 MHz); the
 //! node's state directory is passed to ui.py in `ZETA_UI_STATE_DIR`. That node has a fake
 //! `voiced` (`--stt-socket`) answering `ok:what sources are there` to every `file:` line; a
 //! second node without a speech daemon is passed in `ZETA_UI_URL_NOSTT`.
@@ -26,6 +27,10 @@ const SECRET: &str = "ui-secret-0123456789";
 const SPOKEN: &str = "what sources are there";
 /// Unix socket paths are limited to 108 bytes.
 const SOCKET_PATH_MAX: usize = 100;
+
+/// The `wfm` fixture: its IQ rate and the rate of the tone it carries.
+const WFM_RATE: u32 = 240_000;
+const WFM_AUDIO_RATE: u32 = 48_000;
 
 /// Peak |sample| a recording of the fake microphone's tone must exceed.
 const MIN_PEAK: i32 = 1000;
@@ -203,6 +208,11 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
     let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "aprs", &iq, 48_000, 144_800_000);
     let aprs = format!("aprs={}", meta.display());
+    let audio = zeta_dsp::fixtures::tone(WFM_AUDIO_RATE, 2 * WFM_AUDIO_RATE as usize, 1_000.0, 0.9);
+    let iq =
+        zeta_dsp::fixtures::wfm_modulate(&audio, WFM_AUDIO_RATE, WFM_RATE, 75_000.0, 0.0, true);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "wfm", &iq, WFM_RATE, 104_900_000);
+    let wfm = format!("wfm={}", meta.display());
     let sock_dir = socket_dir();
     let sock = sock_dir.path().join("voiced.sock");
     fake_voiced(&sock);
@@ -210,7 +220,7 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let serve = ServeProc::start_full(
         dir.path(),
         SECRET,
-        &["--source-file", &aprs],
+        &["--source-file", &aprs, "--source-file", &wfm],
         &["--stt-socket", sock],
         &[],
     );
