@@ -20,6 +20,8 @@ use zeta_vrt::IqMeta;
 pub const NODE_DEFAULT_MAX_BANDWIDTH_HZ: u64 = 250_000;
 /// How long `tune` waits for the first IQ packet of the remote job's stream.
 pub const TUNE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long stopping the remote job may take before it is given up (and logged).
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Blocks buffered per receiver.
 const BROADCAST_CAPACITY: usize = 64;
 
@@ -340,12 +342,19 @@ async fn pump(
     *shared.fault.lock().unwrap() = Some(format!("remote node {url}: stream closed: {reason}"));
 }
 
-/// Best-effort `job_stop`; failures are logged to stderr.
+/// Best-effort `job_stop`, bounded by [`STOP_TIMEOUT`] so a dead remote never stalls
+/// exit; failures and the timeout are logged to stderr.
 async fn stop_job(client: &NodeClient, url: &str, job: JobId) {
-    match client.apply(&Op::JobStop { job: job.clone() }).await {
-        Ok(Ok(_)) => {}
+    let op = Op::JobStop { job: job.clone() };
+    match tokio::time::timeout(STOP_TIMEOUT, client.apply(&op)).await {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(e))) => eprintln!("remote node {url}: job_stop {}: {e}", job.0),
         Ok(Err(e)) => eprintln!("remote node {url}: job_stop {}: {e}", job.0),
-        Err(e) => eprintln!("remote node {url}: job_stop {}: {e}", job.0),
+        Err(_) => eprintln!(
+            "remote node {url}: job_stop {}: no answer within {} s; stop it there with `job stop`",
+            job.0,
+            STOP_TIMEOUT.as_secs()
+        ),
     }
 }
 

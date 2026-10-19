@@ -720,6 +720,7 @@ fn federated_job(dir: &Path, url: &str, remote: &str, job: &[&str]) -> Value {
         .args(["--json", "job", "start", "--source", "pi"])
         .args(job)
         .args(["--then-tail", "1,8000"])
+        .timeout(std::time::Duration::from_secs(30))
         .assert()
         .success()
         .get_output()
