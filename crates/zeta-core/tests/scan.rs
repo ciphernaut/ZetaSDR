@@ -9,6 +9,7 @@ use num_complex::Complex;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
@@ -25,19 +26,49 @@ fn tone_hz(center_hz: u64) -> f64 {
     (center_hz / 100) as f64
 }
 
-/// A 16 MHz-wide port that records every `tune` and, while tuned, sends an
-/// 8192-sample block every 5 ms at its current band carrying a tone at
-/// [`tone_hz`] of that band's centre.
+/// Cadence of the port's blocks.
+const BLOCK_MS: u64 = 5;
+
+/// Samples in one block at `rate_hz`: `BLOCK_MS` of them.
+fn block_len(rate_hz: u64) -> usize {
+    (rate_hz * BLOCK_MS / 1_000) as usize
+}
+
+/// A 16 MHz-wide port that records every `tune` and, while tuned, sends a
+/// block of `BLOCK_MS` of samples every `BLOCK_MS` at its current band,
+/// carrying a tone at [`tone_hz`] of that band's centre. Block timestamps
+/// advance by exactly `BLOCK_MS` from the first, so the ring sees one
+/// contiguous run per step and a dwell reads several blocks. With
+/// `fail_tune`, that tune (1-based) and every later one fails.
 struct ScanPort {
     id: SourceId,
     caps: Capabilities,
     cur: Mutex<Option<Tuning>>,
     tunes: Mutex<Vec<Tuning>>,
+    fail_tune: Option<usize>,
     tx: broadcast::Sender<IqBlock>,
+}
+
+/// One block's samples at `t`: a whole number of tone cycles for every step
+/// centre used here (8, 24 and 40 MHz at 16 MHz), so blocks join without a
+/// phase jump.
+fn block_samples(t: Tuning) -> Arc<[Complex<f32>]> {
+    let rate = t.bandwidth_hz.0;
+    let w = 2.0 * std::f64::consts::PI * tone_hz(t.center_hz.0) / rate as f64;
+    (0..block_len(rate))
+        .map(|n| {
+            let ph = w * n as f64;
+            Complex::new(ph.cos() as f32, ph.sin() as f32)
+        })
+        .collect()
 }
 
 impl ScanPort {
     fn new() -> Arc<Self> {
+        Self::with_fail_tune(None)
+    }
+
+    fn with_fail_tune(fail_tune: Option<usize>) -> Arc<Self> {
         let p = Arc::new(Self {
             id: SourceId("radio0".into()),
             caps: Capabilities {
@@ -53,31 +84,30 @@ impl ScanPort {
             },
             cur: Mutex::new(None),
             tunes: Mutex::new(Vec::new()),
+            fail_tune,
             tx: broadcast::channel(16).0,
         });
         let weak = Arc::downgrade(&p);
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            let base = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            let mut tick = tokio::time::interval(Duration::from_millis(BLOCK_MS));
+            let mut cache: Option<(Tuning, Arc<[Complex<f32>]>)> = None;
+            for k in 0u64.. {
+                tick.tick().await;
                 let Some(p) = weak.upgrade() else { return };
                 let Some(t) = p.current() else { continue };
-                let rate = t.bandwidth_hz.0 as f64;
-                let w = 2.0 * std::f64::consts::PI * tone_hz(t.center_hz.0) / rate;
-                let samples: Vec<Complex<f32>> = (0..8192)
-                    .map(|n| {
-                        let ph = w * n as f64;
-                        Complex::new(ph.cos() as f32, ph.sin() as f32)
-                    })
-                    .collect();
-                let t0 = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64;
+                if cache.as_ref().is_none_or(|(c, _)| *c != t) {
+                    cache = Some((t, block_samples(t)));
+                }
+                let samples = cache.as_ref().expect("filled").1.clone();
                 let _ = p.tx.send(IqBlock {
-                    t0: Timestamp(t0),
+                    t0: Timestamp(base + k * BLOCK_MS * 1_000_000),
                     sample_rate_hz: t.bandwidth_hz,
                     center_hz: t.center_hz,
-                    samples: samples.into(),
+                    samples,
                 });
             }
         });
@@ -98,6 +128,10 @@ impl Port for ScanPort {
         &self.caps
     }
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        let n = self.tunes.lock().unwrap().len() + 1;
+        if self.fail_tune.is_some_and(|f| n >= f) {
+            return Err(PortError::Io(format!("tune {n} refused")));
+        }
         self.tunes.lock().unwrap().push(t);
         *self.cur.lock().unwrap() = Some(t);
         Ok(t)
@@ -203,8 +237,11 @@ fn start(kind: JobKind, center_hz: u64, bandwidth_hz: u64) -> Op {
 }
 
 async fn open() -> (tempfile::TempDir, Node, Arc<ScanPort>) {
+    open_with(ScanPort::new()).await
+}
+
+async fn open_with(port: Arc<ScanPort>) -> (tempfile::TempDir, Node, Arc<ScanPort>) {
     let dir = tempfile::tempdir().unwrap();
-    let port = ScanPort::new();
     let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
         .await
         .unwrap();
@@ -239,6 +276,7 @@ async fn scan_steps_the_port_across_the_span_and_emits_rows() {
     let (id, mut rx) = start_scan(&node).await;
     let centres = [8 * MHZ, 24 * MHZ, 40 * MHZ];
     let mut seen = [0usize; 3];
+    let mut most = 0u64;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while let Ok(Ok(f)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         let Payload::Event(ev) = &f.payload else {
@@ -254,11 +292,19 @@ async fn scan_steps_the_port_across_the_span_and_emits_rows() {
         // spectrum_size(16 MHz) = 4096.
         assert_eq!(ev["size"], 4096);
         assert!(ev["samples"].as_u64().unwrap() >= 4096, "{ev}");
+        most = most.max(ev["samples"].as_u64().unwrap());
         let tone = ev["tone_hz"].as_f64().unwrap();
         assert!((tone - tone_hz(c)).abs() < 1_000.0, "step {i}: {ev}");
         seen[i] += 1;
     }
     assert!(seen.iter().all(|&n| n >= 2), "rows per step {seen:?}");
+    // The ring held a contiguous run, so a dwell read spanned several blocks.
+    let one = block_len(16 * MHZ) as u64;
+    eprintln!("largest dwell read {most} samples, one block {one}");
+    assert!(
+        most >= 2 * one,
+        "largest dwell read {most} samples, one block {one}"
+    );
 
     let tunes = port.tunes();
     assert!(tunes.len() >= 6, "{} tunes", tunes.len());
@@ -310,4 +356,57 @@ async fn scan_stop_mid_sweep_releases() {
         node.apply(start(JobKind::Spectrum, 100 * MHZ, MHZ)).await,
         Ok(OpResult::Job(_))
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tune_fault_releases_the_scan_lease() {
+    let (_dir, node, port) = open_with(ScanPort::with_fail_tune(Some(2))).await;
+    let (id, _rx) = start_scan(&node).await;
+    let mut state = JobState::Running;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        state = node.job_list()[0].state.clone();
+        if state != JobState::Running {
+            break;
+        }
+    }
+    match state {
+        JobState::Failed { reason } => {
+            assert!(reason.contains("tune 2 refused"), "{reason}");
+            assert!(reason.contains("radio0"), "{reason}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(port.tunes().len(), 1);
+    let (_, holders) = source_info(node.apply(Op::SourceList {}).await.unwrap());
+    assert!(holders.is_empty(), "{holders:?}");
+    assert!(node.lease_holders(&SourceId("radio0".into())).is_empty());
+    assert!(
+        node.bus()
+            .list()
+            .iter()
+            .all(|s| s.provenance.job.as_ref() != Some(&id)),
+        "the failed scan's streams are gone"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_list_stays_flat_across_sweeps() {
+    let (_dir, node, port) = open().await;
+    let (_id, _rx) = start_scan(&node).await;
+    // Both counts are taken just after a tune, inside the step's dwell, when
+    // no step's fft streams are live: after the first tune, and after the
+    // seventh (two sweeps of three steps done).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let count_after_tune = async |n: usize| {
+        while port.tunes().len() < n {
+            assert!(tokio::time::Instant::now() < deadline, "scan stalled");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        node.bus().list().len()
+    };
+    let before = count_after_tune(1).await;
+    let after = count_after_tune(7).await;
+    eprintln!("streams before {before}, after two sweeps {after}");
+    assert_eq!(before, after, "per-step fft streams must be unregistered");
 }

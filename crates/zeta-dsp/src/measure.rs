@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::classify::{Band, Classifier, FeatureRecord, Label};
+use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement};
 use zeta_core::ops::channel_rate_hz;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
@@ -837,6 +837,13 @@ impl Stage for MeasureStage {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`measure_selection`] calls on this thread, for tests that count them.
+    pub(crate) static MEASURE_SELECTION_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// [`measure`] and [`layer1_label`] of `band` of `iq`, a block sampled at
 /// `rate_hz` and centred at `center_hz`: the whole block as it is, any other
 /// band extracted at [`channel_rate_hz`] and measured with [`measure_band`]
@@ -848,6 +855,8 @@ pub fn measure_selection(
     center_hz: u64,
     band: Band,
 ) -> Option<(FeatureRecord, Label)> {
+    #[cfg(test)]
+    MEASURE_SELECTION_CALLS.with(|c| c.set(c.get() + 1));
     if band.is_whole(Hz(rate_hz)) {
         let f = measure(iq, rate_hz, center_hz);
         let l = layer1_label(&f, iq, rate_hz);
@@ -869,7 +878,9 @@ pub fn measure_selection(
 }
 
 /// Layer-1 classifier: [`measure_selection`] on the requested band; upstream
-/// features are not used, the band is measured afresh.
+/// features are not used, the band is measured afresh. Through
+/// [`Classifier::classify_measured`] it hands the measurement and its label on
+/// to later layers.
 pub struct Layer1Classifier;
 
 #[async_trait]
@@ -892,6 +903,20 @@ impl Classifier for Layer1Classifier {
             .map(|(_, l)| l)
             .into_iter()
             .collect()
+    }
+    async fn classify_measured(
+        &self,
+        iq: &[Complex<f32>],
+        sample_rate_hz: Hz,
+        center_hz: Hz,
+        band: Band,
+        _features: Option<&FeatureRecord>,
+        _measured: Option<&Measurement>,
+    ) -> (Vec<Label>, Option<Measurement>) {
+        match measure_selection(iq, sample_rate_hz.0, center_hz.0, band) {
+            Some((features, label)) => (vec![label.clone()], Some(Measurement { features, label })),
+            None => (Vec::new(), None),
+        }
     }
 }
 
@@ -1220,5 +1245,45 @@ mod tests {
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
         assert!(rx_out.try_recv().is_err(), "no event spans the lag");
+    }
+
+    /// [`measure_selection`] calls made by `f` on this thread.
+    async fn measures<T>(f: impl std::future::Future<Output = T>) -> (T, usize) {
+        let before = MEASURE_SELECTION_CALLS.with(|c| c.get());
+        let out = f.await;
+        (out, MEASURE_SELECTION_CALLS.with(|c| c.get()) - before)
+    }
+
+    #[tokio::test]
+    async fn run_all_measures_the_band_once_for_layers_1_and_2() {
+        use crate::catalogue::CatalogueClassifier;
+        use crate::fixtures::wfm_modulate;
+        use zeta_core::classify::ClassifierSet;
+
+        let audio = tone(48_000, 48_000, 1_000.0, 0.9);
+        let mut iq = wfm_modulate(&audio, 48_000, 240_000, 75_000.0, 0.0, true);
+        awgn(&mut iq, 20.0, 21);
+        let band = Band::whole(Hz(240_000));
+        let (center, rate) = (Hz(104_900_000), Hz(240_000));
+
+        // Alone, each classifier measures the band itself.
+        let (_, alone) =
+            measures(CatalogueClassifier.classify(&iq, rate, center, band, None)).await;
+        assert_eq!(alone, 1);
+
+        let mut set = ClassifierSet::default();
+        set.register(Arc::new(CatalogueClassifier));
+        set.register(Arc::new(Layer1Classifier));
+        let (labels, n) = measures(set.run_all(&iq, rate, center, band, None)).await;
+        eprintln!("run_all: {n} measure(s) -> {labels:?}");
+        assert_eq!(n, 1, "the band is measured once per run_all");
+        assert_eq!(labels[0].layer, 1);
+        assert_eq!(labels[0].name, "wfm", "{labels:?}");
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.layer == 2 && l.name == "FM Broadcast Radio"),
+            "{labels:?}"
+        );
     }
 }

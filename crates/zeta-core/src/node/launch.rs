@@ -451,14 +451,18 @@ struct Scan {
 /// over the step's last dwell of ring samples (skipped when the ring holds
 /// less than one FFT of the step's band), and re-publish its rows on the
 /// job's stream with channel `scan/<step index>` and the step's `center_hz`.
-/// A failed tune or a port fault fails the job; the port is left at the last
-/// step.
+/// Cancellation is checked before every tune. A failed tune or a port fault
+/// fails the job; the port is left at the last step.
 async fn scan_loop(inner: Arc<Inner>, s: Scan) -> Result<(), StageError> {
     let dwell = Duration::from_millis(inner.scan_dwell_ms);
     let faulted = |f: String| StageError::Failed(format!("source {}: {f}", s.port.id().0));
     let mut i = 0;
     loop {
-        // A tune is never abandoned half way: cancellation is checked after it.
+        // Checked before each tune, so a stopped scan never retunes again; a
+        // tune is never abandoned half way, so it is checked after it too.
+        if s.cancel.is_cancelled() {
+            return Err(StageError::Cancelled);
+        }
         let got = match inner
             .leases
             .retune_shared(s.port.as_ref(), &s.id, s.steps[i])

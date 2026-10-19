@@ -6,7 +6,7 @@ use std::f64::consts::PI;
 use num_complex::Complex;
 use zeta_dsp::fft::{Window, power_spectrum_db};
 use zeta_dsp::fixtures::{tone, wfm_modulate};
-use zeta_dsp::wfm::{WfmDemod, WfmParams, deemphasis};
+use zeta_dsp::wfm::{WFM_AUDIO_TAPS, WfmDemod, WfmParams, deemphasis};
 
 fn params(deviation_hz: u64) -> WfmParams {
     WfmParams {
@@ -155,5 +155,30 @@ fn wfm_demod_rejects_the_pilot_at_960k() {
     let a_pilot = amplitude(tail, 48_000.0, 19_000.0);
     let rejection = 20.0 * (a_tone / a_pilot).log10();
     eprintln!("wfm at 960 kHz: pilot {rejection:.1} dB below the tone");
+    assert!(rejection >= 40.0, "pilot only {rejection} dB down");
+}
+
+#[test]
+fn wfm_demod_at_2_msps_bounds_its_filter() {
+    // At 2 Msps the old rule would have built a 1001-tap low-pass at the
+    // input rate; resampling to 240 kHz first keeps it at the 240 kHz count.
+    let audio = tone(48_000, 48_000, 1_000.0, 0.1);
+    let iq = wfm_modulate(&audio, 48_000, 2_000_000, 75_000.0, 0.0, true);
+    let mut d = WfmDemod::new(&params(75_000)).unwrap();
+    let mut out = Vec::new();
+    for b in iq.chunks(20_000) {
+        out.extend(d.process(b, 2_000_000).unwrap());
+    }
+    let taps = d.audio_lpf_taps();
+    eprintln!("wfm at 2 Msps: audio low-pass {taps} taps");
+    assert!(taps > 0 && taps <= 1_025, "taps {taps}");
+    // The old rule's 1001 taps would also pass 1025; the 240 kHz count would not.
+    assert_eq!(taps, WFM_AUDIO_TAPS, "taps {taps}");
+    assert!(out.len().abs_diff(48_000) <= 2, "len {}", out.len());
+    let tail = &out[4_800..4_800 + 43_200];
+    let a_tone = amplitude(tail, 48_000.0, 1_000.0);
+    let a_pilot = amplitude(tail, 48_000.0, 19_000.0);
+    let rejection = 20.0 * (a_tone / a_pilot).log10();
+    eprintln!("wfm at 2 Msps: pilot {rejection:.1} dB below the tone");
     assert!(rejection >= 40.0, "pilot only {rejection} dB down");
 }

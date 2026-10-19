@@ -1,5 +1,6 @@
-//! Wideband (broadcast) FM demodulator stage: phase discriminator, de-emphasis,
-//! 15 kHz audio low-pass, then resampling to the audio rate.
+//! Wideband (broadcast) FM demodulator stage: phase discriminator, resampling
+//! to at most [`WFM_AUDIO_STAGE_RATE_HZ`], de-emphasis, 15 kHz audio low-pass,
+//! then resampling to the audio rate.
 
 use std::sync::Arc;
 
@@ -20,10 +21,15 @@ use crate::{Input, frame_span, run_map};
 /// Cutoff of the mono audio low-pass, Hz; above it sit the 19 kHz pilot and
 /// the stereo and RDS subcarriers.
 pub const WFM_AUDIO_CUTOFF_HZ: f64 = 15_000.0;
-/// Least taps of the audio low-pass at the input rate; from 256 kHz the
-/// count is `rate / 2000` (odd), so the transition band (about
-/// `4 × rate / taps`) stays near 8 kHz and the 19 kHz pilot stays out.
+/// Taps of the audio low-pass. It runs at no more than
+/// [`WFM_AUDIO_STAGE_RATE_HZ`], so the transition band (about
+/// `4 × rate / taps`) stays under 8 kHz and the 19 kHz pilot stays out.
 pub const WFM_AUDIO_TAPS: usize = 127;
+/// Highest rate the de-emphasis and audio low-pass run at, Hz: a faster
+/// discriminator output is first resampled to this rate, so the low-pass
+/// tap count does not grow with the input rate. 240 kHz still carries the
+/// whole MPX band (to 57 kHz RDS) and divides 48 kHz audio exactly.
+pub const WFM_AUDIO_STAGE_RATE_HZ: u64 = 240_000;
 
 /// FM de-emphasis in place: the single-pole IIR `y[n] = a·x[n] + (1−a)·y[n−1]`
 /// with `a = 1 − exp(−1/(rate_hz·τ))`, `τ = tau_us` µs. `state` is `y[−1]` on
@@ -49,16 +55,21 @@ pub struct WfmParams {
     pub deemphasis_us: u64,
 }
 
-/// Streaming WFM demodulator: per block, discriminator at `deviation_hz`,
-/// de-emphasis and a 15 kHz low-pass at the input rate, then a resampler to
-/// `audio_rate_hz`; output clamped to ±1.0. State carries across blocks; the
-/// low-pass and resampler are rebuilt when the input rate changes.
+/// Streaming WFM demodulator: per block, discriminator at `deviation_hz`, a
+/// resampler to the stage rate `min(input rate, WFM_AUDIO_STAGE_RATE_HZ)`
+/// (identity when equal), de-emphasis and a 15 kHz low-pass at the stage
+/// rate, then a resampler to `audio_rate_hz`; output clamped to ±1.0. State
+/// carries across blocks; the filters are rebuilt when the input rate changes.
 #[derive(Debug)]
 pub struct WfmDemod {
     p: WfmParams,
     prev: Complex<f32>,
     deemph: f32,
+    /// Discriminator output (input rate) to the stage rate.
+    stage: AudioFilter,
+    /// Audio low-pass keyed by the stage rate.
     lpf: Option<(u64, StreamingFir)>,
+    lpf_taps: usize,
     audio: AudioFilter,
 }
 
@@ -82,7 +93,9 @@ impl WfmDemod {
             p: *p,
             prev: Complex::new(0.0, 0.0),
             deemph: 0.0,
+            stage: AudioFilter::default(),
             lpf: None,
+            lpf_taps: 0,
             audio: AudioFilter::default(),
         })
     }
@@ -92,25 +105,33 @@ impl WfmDemod {
         if rate_hz == 0 {
             return Err("wfm_demod: input sample rate is 0".into());
         }
-        let mut x = nbfm_demod(iq, rate_hz, self.p.deviation_hz, &mut self.prev);
-        deemphasis(&mut x, rate_hz, self.p.deemphasis_us, &mut self.deemph);
-        if self.lpf.as_ref().is_none_or(|(r, _)| *r != rate_hz) {
+        let d = nbfm_demod(iq, rate_hz, self.p.deviation_hz, &mut self.prev);
+        let stage_hz = rate_hz.min(WFM_AUDIO_STAGE_RATE_HZ);
+        let mut x = self.stage.process(&d, rate_hz, stage_hz)?;
+        deemphasis(&mut x, stage_hz, self.p.deemphasis_us, &mut self.deemph);
+        if self.lpf.as_ref().is_none_or(|(r, _)| *r != stage_hz) {
             // Above 2 × 15 kHz the cutoff stays put; below, the resampler's
             // own low-pass is what limits the band.
-            let cutoff = WFM_AUDIO_CUTOFF_HZ.min(0.45 * rate_hz as f64);
-            let n = WFM_AUDIO_TAPS.max((rate_hz / 2_000) as usize | 1);
-            let taps = lowpass_taps(cutoff, rate_hz as f64, n);
-            self.lpf = Some((rate_hz, StreamingFir::new(taps)));
+            let cutoff = WFM_AUDIO_CUTOFF_HZ.min(0.45 * stage_hz as f64);
+            let taps = lowpass_taps(cutoff, stage_hz as f64, WFM_AUDIO_TAPS);
+            self.lpf_taps = taps.len();
+            self.lpf = Some((stage_hz, StreamingFir::new(taps)));
         }
         let x = self
             .lpf
             .as_mut()
             .map_or_else(Vec::new, |(_, f)| f.process(&x));
-        let mut y = self.audio.process(&x, rate_hz, self.p.audio_rate_hz)?;
+        let mut y = self.audio.process(&x, stage_hz, self.p.audio_rate_hz)?;
         for s in &mut y {
             *s = s.clamp(-1.0, 1.0);
         }
         Ok(y)
+    }
+
+    /// Taps in the current audio low-pass (0 before the first block):
+    /// [`WFM_AUDIO_TAPS`] whatever the input rate.
+    pub fn audio_lpf_taps(&self) -> usize {
+        self.lpf_taps
     }
 }
 

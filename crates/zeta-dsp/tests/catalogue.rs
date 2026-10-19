@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use num_complex::Complex;
-use zeta_core::classify::{Band, Classifier, Label};
+use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::stage::{Backend, StageRegistry};
@@ -66,6 +66,52 @@ async fn wfm_fixture_at_104_9_mhz_is_fm_broadcast_radio() {
         "{}",
         top.evidence
     );
+}
+
+#[tokio::test]
+async fn catalogue_uses_a_handed_measurement_without_measuring() {
+    // No IQ at all: measuring would find nothing to label, so labels whose
+    // evidence carries the marker bandwidth (123 457 Hz, never measured from
+    // a fixture) and the handed layer-1 name came from the measurement.
+    let m = Measurement {
+        features: FeatureRecord {
+            bandwidth_hz: Hz(123_457),
+            center_hz: Hz(104_900_000),
+            symbol_rate_baud: None,
+            snr_db: 20.0,
+            burst: false,
+        },
+        label: Label {
+            layer: 1,
+            name: "wfm".into(),
+            confidence: 0.9,
+            evidence: String::new(),
+        },
+    };
+    let band = Band::whole(Hz(WFM_RATE));
+    let (labels, own) = CatalogueClassifier
+        .classify_measured(&[], Hz(WFM_RATE), Hz(104_900_000), band, None, Some(&m))
+        .await;
+    assert!(own.is_none());
+    let top = labels.first().expect("labels from the handed measurement");
+    assert_eq!(top.name, "FM Broadcast Radio", "{labels:?}");
+    assert!(
+        top.evidence.contains("123457 Hz wide, layer-1 wfm"),
+        "{}",
+        top.evidence
+    );
+    // A handed noise label names nothing.
+    let noise = Measurement {
+        label: Label {
+            name: "noise".into(),
+            ..m.label.clone()
+        },
+        ..m
+    };
+    let (labels, _) = CatalogueClassifier
+        .classify_measured(&[], Hz(WFM_RATE), Hz(104_900_000), band, None, Some(&noise))
+        .await;
+    assert!(labels.is_empty(), "{labels:?}");
 }
 
 #[tokio::test]
