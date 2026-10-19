@@ -1,5 +1,5 @@
 //! Synthetic signal generators for tests: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 /
-//! APRS, AWGN.
+//! APRS, POCSAG, AWGN.
 //! Behind feature `test-fixtures`.
 
 use std::f64::consts::PI;
@@ -68,7 +68,7 @@ pub fn wfm_modulate(
 /// `audio` resampled from `audio_rate_hz` to `iq_rate_hz` by linear
 /// interpolation, as [`nbfm_modulate`] does: `audio.len() * iq_rate_hz /
 /// audio_rate_hz` samples.
-fn resample_linear(audio: &[f32], audio_rate_hz: u32, iq_rate_hz: u32) -> Vec<f32> {
+pub(crate) fn resample_linear(audio: &[f32], audio_rate_hz: u32, iq_rate_hz: u32) -> Vec<f32> {
     if audio.is_empty() {
         return Vec::new();
     }
@@ -351,4 +351,120 @@ pub fn awgn_real(x: &mut [f32], snr_db: f32, seed: u64) {
         let (u1, u2) = (uniform(), uniform());
         *s += (sigma * (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()) as f32;
     }
+}
+
+/// POCSAG codeword for 21 data bits (bit 20 the message flag): the bits, the
+/// 10 BCH(31,21) check bits (remainder modulo `x^10+x^9+x^8+x^6+x^5+x^3+1`),
+/// then an even-parity bit. Computed here rather than with the decoder's
+/// [`bch_ok`](crate::pocsag::bch_ok) so the two check each other.
+fn pocsag_codeword(data21: u32) -> u32 {
+    const POLY: u32 = 0x769;
+    let mut r = (data21 & 0x1F_FFFF) << 10;
+    for i in (10..31).rev() {
+        if r & (1 << i) != 0 {
+            r ^= POLY << (i - 10);
+        }
+    }
+    let w = ((data21 & 0x1F_FFFF) << 11) | (r << 1);
+    w | (w.count_ones() & 1)
+}
+
+/// Message codewords' 20-bit payloads for `text`: numeric (function 0) as
+/// bit-reversed BCD nibbles of `0123456789*U -)(`, padded with spaces; alpha
+/// otherwise, as 7-bit ASCII LSB first, then EOT and zero fill. Panics on a
+/// character the numeric set lacks (fixtures only).
+fn pocsag_payload(function: u8, text: &str) -> Vec<u32> {
+    let mut bits = Vec::new();
+    if function == 0 {
+        for c in text.chars() {
+            let v = "0123456789*U -)("
+                .find(c)
+                .unwrap_or_else(|| panic!("pocsag: {c:?} is not numeric"));
+            bits.extend((0..4).map(|i| ((v >> i) & 1) as u8));
+        }
+        while !bits.len().is_multiple_of(20) {
+            bits.extend([0, 0, 1, 1]); // space, 0xC bit-reversed
+        }
+    } else {
+        for b in text.bytes().chain([0x04]) {
+            bits.extend((0..7).map(|i| (b >> i) & 1));
+        }
+        bits.resize(bits.len().div_ceil(20) * 20, 0);
+    }
+    bits.chunks(20)
+        .map(|c| c.iter().fold(0u32, |a, &b| (a << 1) | b as u32))
+        .collect()
+}
+
+/// POCSAG bit stream for `messages` as `(address, function, text)`: 576
+/// preamble bits `1010…`, then batches of [`SYNC`](crate::pocsag::SYNC) and 8
+/// frames of 2 codewords. Each message's address codeword goes in the next
+/// frame numbered `address & 7` (idle codewords fill the gap), followed by its
+/// message codewords (numeric for function 0, alpha for 3, none for 1 or 2 with
+/// empty text) which may run on across batches. An idle codeword follows the
+/// last message and idles fill out its batch. One `u8` (0 or 1) per bit, the
+/// `baud` only checked to be a POCSAG rate.
+pub fn pocsag_encode(messages: &[(u32, u8, &str)], baud: u32) -> Vec<u8> {
+    use crate::pocsag::{BAUDS, IDLE, SYNC};
+    assert!(BAUDS.contains(&baud), "pocsag: {baud} baud is not standard");
+    let mut words: Vec<u32> = Vec::new();
+    for &(address, function, text) in messages {
+        assert!(function < 4, "pocsag: function {function} > 3");
+        while (words.len() % 16) / 2 != (address & 7) as usize {
+            words.push(IDLE);
+        }
+        words.push(pocsag_codeword(
+            (((address >> 3) & 0x3FFFF) << 2) | function as u32,
+        ));
+        if !(text.is_empty() && (function == 1 || function == 2)) {
+            words.extend(
+                pocsag_payload(function, text)
+                    .into_iter()
+                    .map(|d| pocsag_codeword((1 << 20) | d)),
+            );
+        }
+    }
+    words.push(IDLE);
+    while !words.len().is_multiple_of(16) {
+        words.push(IDLE);
+    }
+    let mut bits: Vec<u8> = (0..576).map(|i| u8::from(i % 2 == 0)).collect();
+    for batch in words.chunks(16) {
+        for &w in std::iter::once(&SYNC).chain(batch) {
+            bits.extend((0..32).rev().map(|i| ((w >> i) & 1) as u8));
+        }
+    }
+    bits
+}
+
+/// NRZ audio for POCSAG `bits`: `+0.8` for 1, `-0.8` for 0, each held for
+/// `audio_rate_hz / baud` samples rounded to nearest. At 48 kHz, 512 baud is
+/// 93.75 samples a bit, rounded to 94: the fixture then runs at 510.6 baud,
+/// 0.3 % slow, well inside what [`BitSync`](crate::pocsag::BitSync) tracks.
+pub fn pocsag_modulate(bits: &[u8], baud: u32, audio_rate_hz: u32) -> Vec<f32> {
+    let spb = (audio_rate_hz as f64 / baud as f64).round() as usize;
+    assert!(spb > 0, "pocsag_modulate: audio rate below the baud rate");
+    bits.iter()
+        .flat_map(|&b| std::iter::repeat_n(if b != 0 { 0.8 } else { -0.8 }, spb))
+        .collect()
+}
+
+/// A single POCSAG page as complex baseband: [`pocsag_encode`] →
+/// [`pocsag_modulate`] at 48 kHz with 0.3 s of silence before and after →
+/// NBFM, deviation 4500 Hz, at `offset_hz` from centre.
+pub fn pocsag_packet_iq(
+    address: u32,
+    function: u8,
+    text: &str,
+    baud: u32,
+    iq_rate_hz: u32,
+    offset_hz: f64,
+) -> Vec<Complex<f32>> {
+    const AUDIO_RATE: u32 = 48_000;
+    let bits = pocsag_encode(&[(address, function, text)], baud);
+    let silence = vec![0.0f32; AUDIO_RATE as usize * 3 / 10];
+    let mut audio = silence.clone();
+    audio.extend(pocsag_modulate(&bits, baud, AUDIO_RATE));
+    audio.extend_from_slice(&silence);
+    nbfm_modulate(&audio, AUDIO_RATE, iq_rate_hz, 4_500.0, offset_hz)
 }
