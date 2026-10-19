@@ -61,6 +61,7 @@ fn schema_prints_json_with_op_result_error() {
         "fft",
         "nbfm_demod",
         "aprs_decode",
+        "pocsag_decode",
         "measure",
     ] {
         assert!(kinds.contains(&k), "stages missing {k}: {kinds:?}");
@@ -325,6 +326,44 @@ fn job_start_then_tail_prints_aprs_event() {
     assert_eq!(frames[0]["job"], v[0]["value"]);
     assert_eq!(frames[0]["channel"], "144800000/12500");
     assert_eq!(frames[0]["payload"]["src"], "VK3ABC");
+}
+
+#[test]
+fn job_start_pocsag_decode_prints_pocsag_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = zeta_dsp::fixtures::pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "pager", &iq, 48_000, 152_000_000);
+    let src = format!("pager={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "pocsag_decode",
+            "--source",
+            "pager",
+            "--center-hz",
+            "152000000",
+            "--bandwidth-hz",
+            "12500",
+            "--then-tail",
+            "1,5000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 1, "{v}");
+    assert_eq!(frames[0]["payload"]["protocol"], "pocsag");
+    assert_eq!(frames[0]["payload"]["address"], 1234567);
+    assert_eq!(frames[0]["payload"]["text"], "HELLO ZETA");
 }
 
 #[test]

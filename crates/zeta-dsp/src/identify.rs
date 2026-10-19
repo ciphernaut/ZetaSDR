@@ -1,5 +1,6 @@
-//! Layer-2 decode-to-identify: run the APRS decoder and report only what
-//! passes the AX.25 FCS (design 6.2).
+//! Layer-2 decode-to-identify: run each protocol decoder (APRS, POCSAG) over
+//! the channel and report only what passes its own check, the AX.25 FCS or
+//! the POCSAG BCH code (design 6.2).
 
 use async_trait::async_trait;
 use num_complex::Complex;
@@ -12,6 +13,7 @@ use crate::ax25::{HdlcDeframer, parse_ax25_ui};
 use crate::channel::extract_offset;
 use crate::measure::measure;
 use crate::nbfm::nbfm_demod;
+use crate::pocsag::{BAUDS, decode_pocsag_iq};
 
 /// Shortest block worth decoding.
 const MIN_SAMPLES: usize = 1024;
@@ -22,7 +24,7 @@ const MIN_AUDIO_HZ: u64 = 9_600;
 /// FM deviation assumed for APRS.
 const DEVIATION_HZ: u64 = 3_000;
 
-/// Decodes APRS from the requested band, at least [`MIN_BW_HZ`] wide and
+/// Decodes APRS and POCSAG from the requested band, at least [`MIN_BW_HZ`] wide and
 /// extracted at [`channel_rate_hz`]; for the whole block, from its strongest
 /// occupied band instead. Upstream features are not used.
 pub struct DecodeToIdentify;
@@ -61,38 +63,69 @@ impl Classifier for DecodeToIdentify {
         let Ok((chan, out_rate)) = extract_offset(iq, rate, offset, bw, out_rate) else {
             return Vec::new();
         };
-        let mut prev = Complex::new(0.0, 0.0);
-        let audio = nbfm_demod(&chan, out_rate, DEVIATION_HZ, &mut prev);
-        let Some(mut demod) = Afsk1200Demod::new(out_rate as u32) else {
-            return Vec::new();
-        };
-        let bits = demod.feed(&audio);
-        let frames: Vec<_> = HdlcDeframer::new()
-            .feed(&bits)
+        ATTEMPTS
             .iter()
-            .filter_map(|b| parse_ax25_ui(b))
-            .collect();
-        let Some(first) = frames.first() else {
-            return Vec::new();
-        };
-        vec![Label {
-            layer: 2,
-            name: "APRS".into(),
-            confidence: 1.0,
-            evidence: format!(
-                "{} AX.25 frames with valid FCS; first {}>{}",
-                frames.len(),
-                first.src,
-                first.dst
-            ),
-        }]
+            .filter_map(|attempt| attempt(&chan, out_rate))
+            .collect()
     }
+}
+
+/// One decoder tried over the extracted channel (IQ at the given rate).
+type Attempt = fn(&[Complex<f32>], u64) -> Option<Label>;
+
+/// Decoders tried on every channel, all of them; labels come back in this order.
+const ATTEMPTS: [Attempt; 2] = [aprs_attempt, pocsag_attempt];
+
+fn aprs_attempt(chan: &[Complex<f32>], rate: u64) -> Option<Label> {
+    let mut prev = Complex::new(0.0, 0.0);
+    let audio = nbfm_demod(chan, rate, DEVIATION_HZ, &mut prev);
+    let mut demod = Afsk1200Demod::new(rate as u32)?;
+    let bits = demod.feed(&audio);
+    let frames: Vec<_> = HdlcDeframer::new()
+        .feed(&bits)
+        .iter()
+        .filter_map(|b| parse_ax25_ui(b))
+        .collect();
+    let first = frames.first()?;
+    Some(Label {
+        layer: 2,
+        name: "APRS".into(),
+        confidence: 1.0,
+        evidence: format!(
+            "{} AX.25 frames with valid FCS; first {}>{}",
+            frames.len(),
+            first.src,
+            first.dst
+        ),
+    })
+}
+
+fn pocsag_attempt(chan: &[Complex<f32>], rate: u64) -> Option<Label> {
+    let messages = decode_pocsag_iq(chan, rate);
+    // The baud with the most messages is the one the transmitter used.
+    let baud = BAUDS
+        .iter()
+        .copied()
+        .max_by_key(|&b| messages.iter().filter(|m| m.baud == b).count())?;
+    let at_baud: Vec<_> = messages.iter().filter(|m| m.baud == baud).collect();
+    let first = at_baud.first()?;
+    Some(Label {
+        layer: 2,
+        name: "POCSAG".into(),
+        confidence: 1.0,
+        evidence: format!(
+            "{} messages BCH-clean at {} baud; first address {}",
+            at_baud.len(),
+            baud,
+            first.address
+        ),
+    })
 }
 
 #[cfg(all(test, feature = "test-fixtures"))]
 mod tests {
     use super::*;
-    use crate::fixtures::{aprs_packet_iq, nbfm_modulate, tone};
+    use crate::fixtures::{aprs_packet_iq, nbfm_modulate, pocsag_packet_iq, tone};
 
     #[tokio::test]
     async fn identifies_aprs_in_baseband_iq() {
@@ -111,6 +144,26 @@ mod tests {
         assert_eq!(labels[0].name, "APRS");
         assert_eq!(labels[0].confidence, 1.0);
         assert!(labels[0].evidence.contains("VK3ABC>APRS"), "{labels:?}");
+    }
+
+    #[tokio::test]
+    async fn identifies_pocsag_in_baseband_iq() {
+        let iq = pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+        let labels = DecodeToIdentify
+            .classify(
+                &iq,
+                Hz(48_000),
+                Hz(152_000_000),
+                Band::whole(Hz(48_000)),
+                None,
+            )
+            .await;
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert_eq!(labels[0].layer, 2);
+        assert_eq!(labels[0].name, "POCSAG");
+        assert_eq!(labels[0].confidence, 1.0);
+        assert!(labels[0].evidence.contains("1234567"), "{labels:?}");
+        assert!(labels[0].evidence.contains("1200 baud"), "{labels:?}");
     }
 
     async fn aprs_at(offset: f64) {

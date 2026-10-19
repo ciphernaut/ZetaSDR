@@ -178,7 +178,7 @@ const FM_DEVIATION_MIN_HZ: u64 = 100;
 const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 
 /// Built-in job kinds; each expands to a graph. `fm_demod`, `wfm_demod` and
-/// `aprs_decode` channelise the job band at the narrowest exact divisor of the source rate
+/// `aprs_decode` and `pocsag_decode` channelise the job band at the narrowest exact divisor of the source rate
 /// that is at least 48 kHz and at least the band; `spectrum` covers the whole
 /// capture band. `measure` channelises the job band the same way and
 /// measures only that band, reporting its absolute `center_hz`. `scan`
@@ -197,6 +197,7 @@ pub enum JobKind {
     AmDemod,
     SsbDemod,
     AprsDecode,
+    PocsagDecode,
     Measure,
     Scan,
 }
@@ -212,6 +213,7 @@ impl JobKind {
             JobKind::AmDemod => "am_demod",
             JobKind::SsbDemod => "ssb_demod",
             JobKind::AprsDecode => "aprs_decode",
+            JobKind::PocsagDecode => "pocsag_decode",
             JobKind::Measure => "measure",
             JobKind::Scan => "scan",
         }
@@ -226,6 +228,7 @@ impl JobKind {
                 | JobKind::AmDemod
                 | JobKind::SsbDemod
                 | JobKind::AprsDecode
+                | JobKind::PocsagDecode
                 | JobKind::Measure
         )
     }
@@ -476,6 +479,33 @@ impl JobKind {
                             kind: StreamKind::Audio,
                         },
                     ],
+                }
+            }
+            JobKind::PocsagDecode => {
+                let (channel, decode) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": out,
+                            }),
+                        },
+                        GraphNode {
+                            id: decode.clone(),
+                            kind: "pocsag_decode".into(),
+                            params: serde_json::json!({}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: decode,
+                        kind: StreamKind::Iq,
+                    }],
                 }
             }
         })

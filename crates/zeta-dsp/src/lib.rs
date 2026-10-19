@@ -47,6 +47,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(am::AmDemodStage::new()));
     reg.register(Arc::new(am::SsbDemodStage::new()));
     reg.register(Arc::new(aprs::AprsDecodeStage::new()));
+    reg.register(Arc::new(pocsag::PocsagDecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
 }
 

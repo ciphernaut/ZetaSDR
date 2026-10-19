@@ -9,10 +9,20 @@
 //! frames of 2 codewords; a pager's address codeword sits in frame
 //! `address & 7`, which supplies the address's low 3 bits.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use num_complex::Complex;
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
+use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::types::{StreamId, StreamKind};
 
 use crate::nbfm::nbfm_demod;
+use crate::{Input, run_map};
 
 /// Frame synchronisation codeword, starting every batch.
 pub const SYNC: u32 = 0x7CD2_15D8;
@@ -344,6 +354,123 @@ pub fn decode_pocsag_iq(iq: &[Complex<f32>], rate_hz: u64) -> Vec<PocsagMessage>
             PocsagDecoder::new(baud).feed(&bits)
         })
         .collect()
+}
+
+/// `pocsag_decode` takes no parameters.
+#[derive(JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PocsagParams {}
+
+/// Decodes POCSAG pager messages from a channel's IQ into one Event per
+/// BCH-clean message, at 512, 1200 and 2400 baud at once.
+pub struct PocsagDecodeStage {
+    spec: StageSpec,
+}
+
+impl PocsagDecodeStage {
+    pub fn new() -> Self {
+        Self {
+            spec: StageSpec {
+                kind: "pocsag_decode",
+                inputs: vec![StreamKind::Iq],
+                outputs: vec![StreamKind::Event],
+                params_schema: schemars::schema_for!(PocsagParams),
+            },
+        }
+    }
+}
+
+impl Default for PocsagDecodeStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-run decoder state, built from the first frame's rate.
+struct StageState {
+    rate_hz: u64,
+    prev: Complex<f32>,
+    lanes: Vec<(BitSync, PocsagDecoder)>,
+}
+
+#[async_trait]
+impl Stage for PocsagDecodeStage {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+
+    async fn run(
+        &self,
+        params: serde_json::Value,
+        inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let _: PocsagParams = serde_json::from_value(params)
+            .map_err(|e| StageError::Failed(format!("pocsag_decode params: {e}")))?;
+        let Some(out) = outputs.first().cloned() else {
+            return Err(StageError::Failed("expected 1 output".into()));
+        };
+        let mut state: Option<StageState> = None;
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    state = None;
+                    return Ok(Vec::new());
+                }
+            };
+            let Payload::Iq(block) = &frame.payload else {
+                return Err(StageError::Failed("pocsag_decode expects iq frames".into()));
+            };
+            let rate = block.sample_rate_hz.0;
+            let st = match &mut state {
+                Some(s) if s.rate_hz != rate => {
+                    return Err(StageError::Failed(format!(
+                        "sample_rate_hz changed from {} to {rate}",
+                        s.rate_hz
+                    )));
+                }
+                Some(s) => s,
+                None => state.insert(StageState {
+                    rate_hz: rate,
+                    prev: Complex::new(0.0, 0.0),
+                    lanes: BAUDS
+                        .iter()
+                        .map(|&b| (BitSync::new(rate, b), PocsagDecoder::new(b)))
+                        .collect(),
+                }),
+            };
+            let audio = nbfm_demod(&block.samples, rate, DEVIATION_HZ, &mut st.prev);
+            let mut events = Vec::new();
+            for (sync, dec) in &mut st.lanes {
+                let bits = sync.feed(&audio);
+                for m in dec.feed(&bits) {
+                    events.push(Frame::new(
+                        out.clone(),
+                        frame.provenance.clone(),
+                        Payload::Event(serde_json::json!({
+                            "protocol": "pocsag",
+                            "address": m.address,
+                            "function": m.function,
+                            "baud": m.baud,
+                            "kind": m.kind,
+                            "text": m.text,
+                        })),
+                    ));
+                }
+            }
+            Ok(events)
+        })
+        .await
+    }
 }
 
 #[cfg(all(test, feature = "test-fixtures"))]
