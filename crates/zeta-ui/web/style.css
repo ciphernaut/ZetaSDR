@@ -149,6 +149,10 @@ input:focus { border-color: var(--accent); }
 }
 #waterfall .ov-ribbon .count { color: var(--dim); }
 #waterfall .ov-ribbon.aprs { color: var(--user); }
+#waterfall .ov-ribbon.pocsag { color: var(--user); border-left-color: var(--user); }
+#waterfall .ov-ribbon.rds { color: var(--ok); border-left-color: var(--ok); }
+#waterfall .ov-ribbon.adsb { color: var(--accent); border-left-color: var(--accent); }
+#waterfall .ov-ribbon.acars { color: var(--text); border-left-color: var(--accent); }
 #waterfall .ov-ribbon.agent {
   white-space: normal; overflow-wrap: anywhere; color: var(--accent); border-left-color: var(--accent);
 }
