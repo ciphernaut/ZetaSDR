@@ -71,7 +71,8 @@ impl DcBlock {
 /// time, is tracked (attack up, release down; smoothing first keeps the
 /// audio's own cycles from biasing the estimate toward its peaks) and the
 /// input is scaled by `target / rms`, gain capped at [`AGC_MAX_GAIN`]; output
-/// clamped to ±1.
+/// clamped to ±1. The estimate starts at the target level (unity gain), so
+/// the first block is not amplified by the maximum gain.
 #[derive(Clone, Debug)]
 pub(crate) struct Agc {
     attack: f32,
@@ -86,8 +87,8 @@ impl Agc {
         Self {
             attack: coef(AGC_ATTACK_S),
             release: coef(AGC_RELEASE_S),
-            smooth: 0.0,
-            ms: 0.0,
+            smooth: AGC_TARGET_RMS * AGC_TARGET_RMS,
+            ms: AGC_TARGET_RMS * AGC_TARGET_RMS,
         }
     }
 

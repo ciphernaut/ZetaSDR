@@ -1405,6 +1405,25 @@ async fn deviation_on_other_kind_rejected() {
     }
 }
 
+#[tokio::test]
+async fn am_demod_rejects_deviation_hz() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    match node.apply(start_with(JobKind::AmDemod, Some(5_000))).await {
+        Err(OpError::Other { message }) => assert_eq!(
+            message,
+            "deviation_hz applies only to kinds fm_demod and wfm_demod; pass null (kind is am_demod)"
+        ),
+        other => panic!("expected Other, got {other:?}"),
+    }
+}
+
 #[test]
 fn job_start_schema_requires_nullable_deviation() {
     let s = schema();
