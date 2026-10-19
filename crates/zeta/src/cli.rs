@@ -407,6 +407,8 @@ pub enum Kind {
     AprsDecode,
     #[value(name = "pocsag_decode")]
     PocsagDecode,
+    #[value(name = "rds_decode")]
+    RdsDecode,
     Measure,
     Scan,
 }
@@ -422,6 +424,7 @@ impl From<Kind> for JobKind {
             Kind::SsbDemod => JobKind::SsbDemod,
             Kind::AprsDecode => JobKind::AprsDecode,
             Kind::PocsagDecode => JobKind::PocsagDecode,
+            Kind::RdsDecode => JobKind::RdsDecode,
             Kind::Measure => JobKind::Measure,
             Kind::Scan => JobKind::Scan,
         }

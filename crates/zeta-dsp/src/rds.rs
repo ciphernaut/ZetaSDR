@@ -13,12 +13,21 @@
 //! [`decode_rds_iq`] runs the three on complex baseband.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use num_complex::Complex;
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
+use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::types::{StreamId, StreamKind};
 
 use crate::nbfm::nbfm_demod;
 use crate::resample::Resampler;
+use crate::{Input, run_map};
 
 /// Rate [`RdsDemod`] works at; other composite rates are resampled to it.
 pub const RDS_RATE_HZ: u64 = 240_000;
@@ -589,23 +598,144 @@ impl RdsState {
     }
 }
 
+/// The whole RDS chain on complex baseband: FM discriminator at 75 kHz
+/// deviation, [`RdsDemod`], [`RdsSync`] and [`RdsState`], with every piece's
+/// state carried across [`feed`](Self::feed) calls.
+pub struct RdsPipeline {
+    prev: Complex<f32>,
+    rate_hz: u64,
+    demod: RdsDemod,
+    sync: RdsSync,
+    state: RdsState,
+}
+
+impl RdsPipeline {
+    /// Pipeline for baseband at `rate_hz`; an error when the rate is too low
+    /// for the RDS band.
+    pub fn new(rate_hz: u64) -> Result<Self, String> {
+        Ok(RdsPipeline {
+            prev: Complex::new(0.0, 0.0),
+            rate_hz,
+            demod: RdsDemod::new(rate_hz)?,
+            sync: RdsSync::default(),
+            state: RdsState::default(),
+        })
+    }
+
+    /// The next block of baseband; the events it completed.
+    pub fn feed(&mut self, iq: &[Complex<f32>]) -> Vec<RdsEvent> {
+        let composite = nbfm_demod(iq, self.rate_hz, DEVIATION_HZ, &mut self.prev);
+        let bits = self.demod.feed(&composite);
+        let state = &mut self.state;
+        self.sync
+            .feed(&bits)
+            .into_iter()
+            .filter_map(|g| state.apply(g))
+            .collect()
+    }
+}
+
 /// Decode RDS from complex baseband at `rate_hz` (a broadcast FM channel,
-/// carrier at centre): discriminate at 75 kHz deviation, then [`RdsDemod`],
-/// [`RdsSync`] and [`RdsState`]; the events in order. Empty when the rate is
-/// too low for the RDS band.
+/// carrier at centre) with an [`RdsPipeline`]; the events in order. Empty
+/// when the rate is too low for the RDS band.
 pub fn decode_rds_iq(iq: &[Complex<f32>], rate_hz: u64) -> Vec<RdsEvent> {
-    let Ok(mut demod) = RdsDemod::new(rate_hz) else {
-        return Vec::new();
-    };
-    let mut prev = Complex::new(0.0, 0.0);
-    let composite = nbfm_demod(iq, rate_hz, DEVIATION_HZ, &mut prev);
-    let bits = demod.feed(&composite);
-    let mut state = RdsState::default();
-    RdsSync::default()
-        .feed(&bits)
-        .into_iter()
-        .filter_map(|g| state.apply(g))
-        .collect()
+    match RdsPipeline::new(rate_hz) {
+        Ok(mut p) => p.feed(iq),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `rds_decode` takes no parameters.
+#[derive(JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RdsParams {}
+
+/// Reads RDS from a broadcast FM channel's IQ (at least 118.8 kHz wide; give
+/// it the `wfm_demod` band), one Event per [`RdsEvent`]. The input sample
+/// rate is fixed by the first frame: a later frame at another rate fails the
+/// stage, since the demodulator's filters and loops are built for one rate.
+pub struct RdsDecodeStage {
+    spec: StageSpec,
+}
+
+impl RdsDecodeStage {
+    pub fn new() -> Self {
+        Self {
+            spec: StageSpec {
+                kind: "rds_decode",
+                inputs: vec![StreamKind::Iq],
+                outputs: vec![StreamKind::Event],
+                params_schema: schemars::schema_for!(RdsParams),
+            },
+        }
+    }
+}
+
+impl Default for RdsDecodeStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Stage for RdsDecodeStage {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+
+    async fn run(
+        &self,
+        params: serde_json::Value,
+        inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let _: RdsParams = serde_json::from_value(params)
+            .map_err(|e| StageError::Failed(format!("rds_decode params: {e}")))?;
+        let Some(out) = outputs.first().cloned() else {
+            return Err(StageError::Failed("expected 1 output".into()));
+        };
+        let mut pipeline: Option<RdsPipeline> = None;
+        run_map(inputs, bus, cancel, move |input| {
+            let frame = match input {
+                Input::Frame(f) => f,
+                Input::Lagged { .. } => {
+                    pipeline = None;
+                    return Ok(Vec::new());
+                }
+            };
+            let Payload::Iq(block) = &frame.payload else {
+                return Err(StageError::Failed("rds_decode expects iq frames".into()));
+            };
+            let rate = block.sample_rate_hz.0;
+            let p = match &mut pipeline {
+                Some(p) if p.rate_hz != rate => {
+                    return Err(StageError::Failed(format!(
+                        "sample_rate_hz changed from {} to {rate}",
+                        p.rate_hz
+                    )));
+                }
+                Some(p) => p,
+                None => pipeline.insert(RdsPipeline::new(rate).map_err(StageError::Failed)?),
+            };
+            Ok(p.feed(&block.samples)
+                .into_iter()
+                .map(|e| {
+                    let mut v = serde_json::to_value(&e).expect("RdsEvent serialises");
+                    v["protocol"] = "rds".into();
+                    Frame::new(out.clone(), frame.provenance.clone(), Payload::Event(v))
+                })
+                .collect())
+        })
+        .await
+    }
 }
 
 #[cfg(all(test, feature = "test-fixtures"))]
@@ -656,6 +786,23 @@ mod tests {
         // Data 0 has a zero CRC, so the check word is the offset word itself.
         assert_eq!(checkword(0, Offset::A), 0x0FC);
         assert_eq!(checkword(0, Offset::D), 0x1B4);
+    }
+
+    #[test]
+    fn checkword_nonzero_vector() {
+        // Computed independently by long division, generator 0x5B9.
+        let cases = [
+            (0x1234, [0x06A, 0x10E, 0x1FE, 0x3C6, 0x122]),
+            (0x2AB1, [0x11D, 0x079, 0x089, 0x2B1, 0x055]),
+        ];
+        for (data, want) in cases {
+            for (o, w) in [Offset::A, Offset::B, Offset::C, Offset::Cp, Offset::D]
+                .into_iter()
+                .zip(want)
+            {
+                assert_eq!(checkword(data, o), w, "{o:?} {data:04x}");
+            }
+        }
     }
 
     #[test]

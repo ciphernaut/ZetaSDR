@@ -62,6 +62,7 @@ fn schema_prints_json_with_op_result_error() {
         "nbfm_demod",
         "aprs_decode",
         "pocsag_decode",
+        "rds_decode",
         "measure",
     ] {
         assert!(kinds.contains(&k), "stages missing {k}: {kinds:?}");
@@ -364,6 +365,50 @@ fn job_start_pocsag_decode_prints_pocsag_event() {
     assert_eq!(frames[0]["payload"]["protocol"], "pocsag");
     assert_eq!(frames[0]["payload"]["address"], 1234567);
     assert_eq!(frames[0]["payload"]["text"], "HELLO ZETA");
+}
+
+#[test]
+fn job_start_rds_decode_prints_rds_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = zeta_dsp::fixtures::rds_station_iq(0x2AB1, "ZETA FM ", "HELLO FROM ZETASDR", 240_000);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "fm", &iq, 240_000, 100_000_000);
+    let src = format!("fm={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "rds_decode",
+            "--source",
+            "fm",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "200000",
+            "--then-tail",
+            "50,5000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert!(
+        frames.iter().all(|f| f["payload"]["protocol"] == "rds"),
+        "{v}"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["payload"]["ps"] == "ZETA FM " && f["payload"]["pi"] == "2AB1"),
+        "{v}"
+    );
 }
 
 #[test]

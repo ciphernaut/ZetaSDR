@@ -1805,3 +1805,23 @@ fn pocsag_decode_expands_channel_to_decoder() {
     assert_eq!(g.edges[0].from, g.nodes[0].id);
     assert_eq!(g.edges[0].to, g.nodes[1].id);
 }
+
+#[test]
+fn rds_decode_expands_channel_to_decoder() {
+    let src = SourceId("b210".into());
+    let tuning = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(200_000),
+    };
+    assert_eq!(JobKind::RdsDecode.name(), "rds_decode");
+    let g = JobKind::RdsDecode
+        .expand(&src, tuning, Hz(240_000), None, None, None)
+        .unwrap();
+    let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+    assert_eq!(kinds, ["channel", "rds_decode"]);
+    assert_eq!(g.nodes[1].params, serde_json::json!({}));
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!(g.edges[0].kind, StreamKind::Iq);
+    assert_eq!(g.edges[0].from, g.nodes[0].id);
+    assert_eq!(g.edges[0].to, g.nodes[1].id);
+}
