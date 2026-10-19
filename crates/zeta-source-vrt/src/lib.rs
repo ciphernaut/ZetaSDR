@@ -195,7 +195,8 @@ async fn receive(
             Ok((n, _from)) => n,
             Err(e) => {
                 fail(&e);
-                tokio::task::yield_now().await;
+                // Back off so a persistent socket error cannot spin the core.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 continue;
             }
         };
@@ -225,5 +226,51 @@ async fn receive(
             center_hz: Hz(d.meta.center_hz),
             samples,
         });
+    }
+}
+
+#[cfg(test)]
+mod contains_tests {
+    use super::*;
+    use zeta_core::types::Hz;
+
+    fn t(c: u64, w: u64) -> Tuning {
+        Tuning {
+            center_hz: Hz(c),
+            bandwidth_hz: Hz(w),
+        }
+    }
+
+    #[test]
+    fn exact_edge_fit() {
+        assert!(contains(t(1000, 100), t(1000, 100)));
+        assert!(contains(t(1000, 100), t(1025, 50)));
+        assert!(contains(t(1000, 100), t(975, 50)));
+    }
+
+    #[test]
+    fn odd_widths_on_both_sides() {
+        // width 99 means half-width 49.5 on each side
+        assert!(contains(t(1000, 99), t(1000, 99)));
+        assert!(contains(t(1000, 100), t(1000, 99)));
+        assert!(!contains(t(1000, 99), t(1000, 100)));
+        // odd request touching the low edge of an even band
+        assert!(contains(t(1000, 100), t(976, 49)));
+        assert!(!contains(t(1000, 100), t(975, 51)));
+    }
+
+    #[test]
+    fn one_hz_over_the_edge() {
+        assert!(!contains(t(1000, 100), t(1025, 51)));
+        assert!(!contains(t(1000, 100), t(1026, 50)));
+        assert!(!contains(t(1000, 100), t(974, 50)));
+    }
+
+    #[test]
+    fn centre_near_u64_max() {
+        let m = u64::MAX;
+        assert!(contains(t(m - 10, 20), t(m - 10, 20)));
+        assert!(!contains(t(m - 10, 20), t(m - 10, 22)));
+        assert!(!contains(t(m - 10, 20), t(m, 2)));
     }
 }
