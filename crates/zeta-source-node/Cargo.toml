@@ -1,0 +1,20 @@
+[package]
+name = "zeta-source-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZetaSDR source: another ZetaSDR node's source as a push port"
+
+[dependencies]
+async-trait = "0.1.92"
+num-complex = "0.4.6"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["sync", "time", "rt", "macros"] }
+zeta-client = { path = "../zeta-client" }
+zeta-core = { path = "../zeta-core" }
+zeta-vrt = { path = "../zeta-vrt" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros"] }
+zeta-ws = { path = "../zeta-ws", features = ["test-server"] }
