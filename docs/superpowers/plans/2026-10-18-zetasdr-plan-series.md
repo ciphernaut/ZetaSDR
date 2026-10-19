@@ -318,3 +318,14 @@ overlays do not reposition on a view change; the scan view does not redraw a ful
 ring rows on zoom; core does not clamp a scan step to a sub-band span (min(step, span), centre
 inside the span) pending the fix wave; and the Soapy capability probe should read the rate range
 after the master clock is raised (or assert the device's real maximum).
+
+After the plan-8 fix wave (2026-10-20): the Soapy source probes a UHD device's sample-rate range at its
+maximum clock, so the B210 reports 61.44 MHz with no device argument and a 24 MHz request becomes a 30.72
+Msps capture (ring 10 s, 2.46 GB on the field host). With a spectrum job, four `wfm_demod` jobs and a `measure`
+on that capture the node used about 173 % of a core: the bank thread 30 % (down from 50 % before the PFB
+optimisations), the decoders 12-20 % each, audio clean. The plan's 20 % bank target holds at 16 Msps and is
+missed by ten points at 30.72 Msps; `target-cpu`/multiversioning and a partial DFT for few bins are the
+parked next steps. The scan, lease conflicts and stitched view were exercised live at 16 Msps earlier the
+same night (0-1 GHz in 61 steps, 19.2 s per sweep). The plan's Conventions block says Hann for the PFB
+prototype; the code uses Blackman (ruling R4) with a 0.75-bin cutoff and 16 × bins taps (ruling R5).
+
