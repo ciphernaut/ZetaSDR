@@ -1825,3 +1825,49 @@ fn rds_decode_expands_channel_to_decoder() {
     assert_eq!(g.edges[0].from, g.nodes[0].id);
     assert_eq!(g.edges[0].to, g.nodes[1].id);
 }
+
+#[test]
+fn adsb_decode_expands_channel_to_decoder() {
+    let src = SourceId("b210".into());
+    let tuning = Tuning {
+        center_hz: Hz(1_090_000_000),
+        bandwidth_hz: Hz(2_400_000),
+    };
+    assert_eq!(JobKind::AdsbDecode.name(), "adsb_decode");
+    let g = JobKind::AdsbDecode
+        .expand(&src, tuning, Hz(2_400_000), None, None, None)
+        .unwrap();
+    let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+    assert_eq!(kinds, ["channel", "adsb_decode"]);
+    assert_eq!(g.nodes[0].params["out_rate_hz"], 2_400_000);
+    assert_eq!(g.nodes[1].params, serde_json::json!({}));
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!(g.edges[0].kind, StreamKind::Iq);
+    assert_eq!(g.edges[0].from, g.nodes[0].id);
+    assert_eq!(g.edges[0].to, g.nodes[1].id);
+}
+
+#[test]
+fn adsb_expand_refuses_narrow_band() {
+    let src = SourceId("b210".into());
+    let tuning = Tuning {
+        center_hz: Hz(1_090_000_000),
+        bandwidth_hz: Hz(1_000_000),
+    };
+    match JobKind::AdsbDecode.expand(&src, tuning, Hz(8_000_000), None, None, None) {
+        Err(OpError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+            suggested,
+        }) => {
+            assert_eq!(field, "bandwidth_hz");
+            assert_eq!(value, 1_000_000);
+            assert_eq!(min, 2_000_000);
+            assert_eq!(max, 1_000_000);
+            assert_eq!(suggested, Some(2_400_000));
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+}

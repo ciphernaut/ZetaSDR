@@ -63,6 +63,7 @@ fn schema_prints_json_with_op_result_error() {
         "aprs_decode",
         "pocsag_decode",
         "rds_decode",
+        "adsb_decode",
         "measure",
     ] {
         assert!(kinds.contains(&k), "stages missing {k}: {kinds:?}");
@@ -407,6 +408,55 @@ fn job_start_rds_decode_prints_rds_event() {
         frames
             .iter()
             .any(|f| f["payload"]["ps"] == "ZETA FM " && f["payload"]["pi"] == "2AB1"),
+        "{v}"
+    );
+}
+
+#[test]
+fn job_start_adsb_decode_prints_adsb_event() {
+    if zeta_ext::find_dump1090().is_none() {
+        eprintln!("skipped: no dump1090");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let iq = zeta_dsp::fixtures::modes_frame_iq(0x4840D6, "ZETA1", 200, 2_400_000);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "adsb", &iq, 2_400_000, 1_090_000_000);
+    let src = format!("adsb={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "adsb_decode",
+            "--source",
+            "adsb",
+            "--center-hz",
+            "1090000000",
+            "--bandwidth-hz",
+            "2400000",
+            "--then-tail",
+            "1,10000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert!(!frames.is_empty(), "{v}");
+    assert!(
+        frames.iter().all(|f| f["payload"]["protocol"] == "adsb"),
+        "{v}"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["payload"]["icao"] == "4840D6" && f["payload"]["callsign"] == "ZETA1"),
         "{v}"
     );
 }

@@ -176,9 +176,13 @@ pub const WFM_DEVIATION_DEFAULT_HZ: u64 = 75_000;
 pub const WFM_DEEMPHASIS_US: u64 = 50;
 const FM_DEVIATION_MIN_HZ: u64 = 100;
 const FM_DEVIATION_MAX_HZ: u64 = 75_000;
+/// `adsb_decode` needs most of dump1090's 2.4 MHz: narrower bands are refused.
+const ADSB_BANDWIDTH_MIN_HZ: u64 = 2_000_000;
+/// The band `adsb_decode` is meant to be given (dump1090's sample rate).
+const ADSB_BANDWIDTH_HZ: u64 = 2_400_000;
 
 /// Built-in job kinds; each expands to a graph. `fm_demod`, `wfm_demod` and
-/// `aprs_decode`, `pocsag_decode` and `rds_decode` channelise the job band at the narrowest exact divisor of the source rate
+/// `aprs_decode`, `pocsag_decode`, `rds_decode` and `adsb_decode` channelise the job band at the narrowest exact divisor of the source rate
 /// that is at least 48 kHz and at least the band; `spectrum` covers the whole
 /// capture band. `measure` channelises the job band the same way and
 /// measures only that band, reporting its absolute `center_hz`. `scan`
@@ -187,6 +191,7 @@ const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 /// dwelling [`SCAN_DWELL_MS`] on each step, and emits spectrum rows tagged
 /// with each step's `center_hz` while holding the whole band, so every other
 /// request on the source is a conflict until the scan is stopped.
+/// `adsb_decode` refuses a band under 2 MHz (dump1090 needs most of its 2.4 MHz).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
@@ -199,6 +204,7 @@ pub enum JobKind {
     AprsDecode,
     PocsagDecode,
     RdsDecode,
+    AdsbDecode,
     Measure,
     Scan,
 }
@@ -216,6 +222,7 @@ impl JobKind {
             JobKind::AprsDecode => "aprs_decode",
             JobKind::PocsagDecode => "pocsag_decode",
             JobKind::RdsDecode => "rds_decode",
+            JobKind::AdsbDecode => "adsb_decode",
             JobKind::Measure => "measure",
             JobKind::Scan => "scan",
         }
@@ -232,6 +239,7 @@ impl JobKind {
                 | JobKind::AprsDecode
                 | JobKind::PocsagDecode
                 | JobKind::RdsDecode
+                | JobKind::AdsbDecode
                 | JobKind::Measure
         )
     }
@@ -273,6 +281,15 @@ impl JobKind {
                     suggested: None,
                 });
             }
+        }
+        if *self == JobKind::AdsbDecode && bw < ADSB_BANDWIDTH_MIN_HZ {
+            return Err(OpError::OutOfRange {
+                field: "bandwidth_hz".into(),
+                value: bw,
+                min: ADSB_BANDWIDTH_MIN_HZ,
+                max: out,
+                suggested: Some(ADSB_BANDWIDTH_HZ),
+            });
         }
         Ok(match self {
             JobKind::Scan => Graph {
@@ -528,6 +545,33 @@ impl JobKind {
                         GraphNode {
                             id: decode.clone(),
                             kind: "rds_decode".into(),
+                            params: serde_json::json!({}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: decode,
+                        kind: StreamKind::Iq,
+                    }],
+                }
+            }
+            JobKind::AdsbDecode => {
+                let (channel, decode) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": out,
+                            }),
+                        },
+                        GraphNode {
+                            id: decode.clone(),
+                            kind: "adsb_decode".into(),
                             params: serde_json::json!({}),
                         },
                     ],

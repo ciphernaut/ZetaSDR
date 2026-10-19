@@ -1,5 +1,5 @@
 //! Synthetic signal generators for tests: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 /
-//! APRS, POCSAG, RDS, AWGN.
+//! APRS, POCSAG, RDS, Mode S, AWGN.
 //! Behind feature `test-fixtures`.
 
 use std::f64::consts::PI;
@@ -573,4 +573,121 @@ pub fn rds_station_iq(pi: u16, ps: &str, rt: &str, iq_rate_hz: u32) -> Vec<Compl
     );
     let composite = rds_composite(&bits, iq_rate_hz, &audio);
     wfm_modulate_composite(&composite, iq_rate_hz, 75_000.0)
+}
+
+/// Mode S / ADS-B character set, indexed by 6-bit code (`#` = unused).
+const MODES_CHARS: &[u8; 64] = b"#ABCDEFGHIJKLMNOPQRSTUVWXYZ##### ###############0123456789######";
+
+/// Mode S CRC-24 (generator `0xFFF409`) over `bytes`.
+pub fn modes_crc24(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0;
+    for &b in bytes {
+        crc ^= u32::from(b) << 16;
+        for _ in 0..8 {
+            crc <<= 1;
+            if crc & 0x100_0000 != 0 {
+                crc ^= 0x1FF_F409;
+            }
+        }
+    }
+    crc & 0xFF_FFFF
+}
+
+/// The 112-bit DF17 (CA 5) aircraft identification message for `icao`
+/// (24 bits) and `callsign` (at most 8 characters from the Mode S set,
+/// space-padded): type code 4, category 0, CRC-24 parity in bytes 11..14.
+pub fn modes_ident_frame(icao: u32, callsign: &str) -> [u8; 14] {
+    assert!(icao <= 0xFF_FFFF, "icao is 24 bits");
+    assert!(callsign.len() <= 8, "callsign is at most 8 characters");
+    let mut f = [0u8; 14];
+    f[0] = (17 << 3) | 5;
+    f[1..4].copy_from_slice(&icao.to_be_bytes()[1..]);
+    f[4] = 4 << 3;
+    let mut chars: u64 = 0;
+    for i in 0..8 {
+        let c = callsign.as_bytes().get(i).copied().unwrap_or(b' ');
+        let code = MODES_CHARS
+            .iter()
+            .position(|&m| m == c && m != b'#')
+            .unwrap_or_else(|| panic!("{:?} is not in the Mode S character set", c as char));
+        chars = (chars << 6) | code as u64;
+    }
+    f[5..11].copy_from_slice(&chars.to_be_bytes()[2..]);
+    let crc = modes_crc24(&f[..11]);
+    f[11..14].copy_from_slice(&crc.to_be_bytes()[1..]);
+    f
+}
+
+/// [`modes_ident_frame`] as pulse-position-modulated baseband at `iq_rate_hz`:
+/// preamble pulses at 0, 1.0, 3.5 and 4.5 us, each 0.5 us; bit i at `8 + i` us,
+/// a 0.5 us pulse in the first half for 1 and the second half for 0. Pulses
+/// have amplitude 0.6 on the real axis; each sample holds the pulse energy
+/// falling within its interval (so pulses need not align with samples). The
+/// frame is sent `repeats` times, 1 ms apart, with 10 ms of silence before
+/// the first and after the last 1 ms slot.
+pub fn modes_frame_iq(
+    icao: u32,
+    callsign: &str,
+    repeats: usize,
+    iq_rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    let frame = modes_ident_frame(icao, callsign);
+    // Pulse start times in microseconds from the frame start.
+    let mut pulses: Vec<f64> = vec![0.0, 1.0, 3.5, 4.5];
+    for i in 0..112 {
+        let bit = frame[i / 8] >> (7 - i % 8) & 1;
+        pulses.push(8.0 + i as f64 + if bit == 1 { 0.0 } else { 0.5 });
+    }
+    let rate = f64::from(iq_rate_hz);
+    let us = rate / 1e6;
+    let lead = (rate * 0.010).round() as usize;
+    let slot = (rate * 0.001).round() as usize;
+    let mut out = vec![Complex::new(0.0f32, 0.0); 2 * lead + repeats * slot];
+    for r in 0..repeats {
+        let start = (lead + r * slot) as f64;
+        for &p in &pulses {
+            // The pulse spans [a, b) in samples; sample n covers [n, n + 1).
+            let (a, b) = (start + p * us, start + (p + 0.5) * us);
+            for n in a.floor() as usize..(b.ceil() as usize).min(out.len()) {
+                let overlap = (b.min(n as f64 + 1.0) - a.max(n as f64)).max(0.0);
+                out[n].re += (0.6 * overlap) as f32;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modes_ident_frame_matches_known_frame() {
+        // The well-known DF17 identification frame of KLM1023 (ICAO 4840D6).
+        let hex: String = modes_ident_frame(0x4840D6, "KLM1023")
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        assert_eq!(hex, "8D4840D6202CC371C32CE0576098");
+    }
+
+    #[test]
+    fn modes_frame_iq_layout() {
+        let rate = 2_400_000;
+        let iq = modes_frame_iq(0x4840D6, "ZETA1", 2, rate);
+        // 10 ms + 2 x 1 ms + 10 ms.
+        assert_eq!(iq.len(), 52_800);
+        assert!(
+            iq.iter()
+                .all(|s| s.im == 0.0 && (0.0..=0.6001).contains(&s.re))
+        );
+        // Silence up to 10 ms, then the first preamble pulse.
+        assert!(iq[..24_000].iter().all(|s| s.re == 0.0));
+        assert!(iq[24_000].re > 0.5);
+        // The second frame starts 1 ms (2400 samples) later.
+        assert!(iq[26_400 - 10..26_400].iter().all(|s| s.re == 0.0));
+        assert!(iq[26_400].re > 0.5);
+        // Trailing 10 ms of silence.
+        assert!(iq[iq.len() - 24_000..].iter().all(|s| s.re == 0.0));
+    }
 }
