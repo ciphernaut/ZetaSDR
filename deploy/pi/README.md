@@ -23,12 +23,12 @@ then `RUSTFLAGS="--cfg soapy" cargo build --release -p zeta` (see the main READM
 
 ## Install (Pi)
 
-    scp deploy/pi/out/zeta deploy/pi/out/zeta-mcp deploy/pi/install.sh \
+    scp deploy/pi/out/zeta deploy/pi/out/zeta-mcp deploy/pi/install.sh deploy/pi/zetasdr-check-env \
         deploy/pi/zetasdr.service deploy/pi/zetasdr.env.example pi@pi.local:
     ssh pi@pi.local
     sudo ./install.sh
-    sudo editor /etc/zetasdr/env        # set ZETA_SECRET (16+ chars) and ZETA_SOURCES
-    sudo systemctl restart zetasdr
+    sudo editor /etc/zetasdr/env        # set ZETA_SECRET (openssl rand -hex 16) and ZETA_SOURCES, e.g. --source-kiwi kiwi=HOST:8073
+    sudo systemctl start zetasdr       # refuses to start while the secret is empty or the placeholder
     systemctl status zetasdr
 
 `install.sh` puts the binaries in `/usr/local/bin`, creates the `zetasdr` user with state in

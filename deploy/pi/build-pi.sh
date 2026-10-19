@@ -6,6 +6,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 target=aarch64-unknown-linux-gnu
 
+command -v docker >/dev/null || { echo "docker required" >&2; exit 1; }
+
 export PATH="$HOME/.cargo/bin:$PATH"
 command -v cross >/dev/null || cargo install cross --locked
 cd "$root"

@@ -8,6 +8,7 @@ User=zetasdr
 EnvironmentFile=/etc/zetasdr/env
 # serve binds LAN addresses only; 0.0.0.0 (unspecified) passes the LAN check.
 # ZETA_SOURCES is deliberately unquoted so it splits into --source-* arguments.
+ExecStartPre=/usr/local/bin/zetasdr-check-env
 ExecStart=/usr/local/bin/zeta --state-dir /var/lib/zetasdr $ZETA_SOURCES serve --listen 0.0.0.0:7979
 Restart=on-failure
 RestartSec=3
