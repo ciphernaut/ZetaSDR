@@ -14,6 +14,7 @@ interfaces rather than guessed ones.
 | 4 | Hardware and foreign sources | HackRF via SoapySDR plugin crate, KiwiSDR websocket client, external-process plugin SDK (Python) speaking the typed envelope. **Delivered** on branch `hardware-sources`, 2026-10-19. The `cfg(soapy)` driver build and clippy passed against SoapySDR 0.8.1 once `libsoapysdr-dev` was installed later the same day. Pending: the HackRF hardware test; GPU equivalence on the field host is still pending from plan 2. | 1, 2 |
 | 5 | Federation | Node-to-node: VITA 49.2 for IQ, typed envelope for the rest, back-pressure, shared secret, Pi 5 build and deployment, remote node as a source. **Delivered** on branch `federation`, 2026-10-19. Pending: deployment on Pi hardware (no Pi is set up yet), the one-shot `--then-tail` finding against the B210, and releasing the remote job when the local job stops. | 3, 4 |
 | 6 | UI | Wide renderer (waterfall, ribbons, context menu, agent pane, jobs), narrow renderer, graph view. All clients of the plan-3 websocket. **Delivered** on branch `ui`, 2026-10-19. Pending: the phone check of the narrow renderer, the microphone against a real `voiced`, the HackRF walk, and a live `/ask` answer from the field host. | 3 |
+| 7 | Audio path and wideband FM | Rational resampler so every demod outputs 48 kHz audio; `wfm_demod`, `am_demod` and `ssb_demod` job kinds (`--sideband`); layer-1 rules for `wfm` (19 kHz pilot as evidence), `am` and `ssb`; iNTERCEPT signal catalogue (Apache-2.0, 594 entries) as knowledge provider and layer-2 classifier; UI decode entries and playback of any audio job. **Delivered** on branch `audio-wfm`, 2026-10-19. Pending: AM and SSB playback in a browser. | 2, 6 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
@@ -203,3 +204,51 @@ menu by touch, Decode › APRS and its ribbon. The mic will not work there over 
 allow it only on a secure origin). Also pending: the microphone against a real `voiced`, the
 HackRF walk (`--source-soapy` in the release `--cfg soapy` build, 104.9 MHz, Decode › NBFM audio;
 the HackRF was unplugged), and a live `/ask` once the field host's chat completions answer.
+
+## Plan 7 status
+
+Plan 7 is delivered on `audio-wfm`: a streaming rational resampler (`Resampler`, polyphase L/M,
+at least 63 taps) behind every demodulator, so all audio streams are 48 kHz mono in ±1 whatever
+the channel rate; `wfm_demod` (75 kHz deviation, 50 µs de-emphasis by default, 15 kHz mono),
+`am_demod` (envelope, slow AGC) and `ssb_demod` (Weaver form, `sideband` usb or lsb, `center_hz`
+is the dial frequency) as stages and job kinds, with `sideband` a required-nullable op field like
+`deviation_hz` and each refused on kinds that do not take it; layer-1 rules for `wfm` (60-250 kHz,
+cv below 0.35, rms deviation above 5 kHz, a 19 kHz pilot at least 10 dB up raising 0.6 to 0.9),
+`am` (carrier line) and `ssb` (one-sided, with the dial frequency in the evidence); the iNTERCEPT
+`signals.json` (594 entries, Apache-2.0, `data/NOTICE`) as a knowledge provider and a layer-2
+classifier scoring frequency 0.4, bandwidth 0.3 and modulation 0.3, with the bandwidth required for
+entries wider than 50 kHz and ties to the narrowest range; the `Classifier` trait takes the band
+centre; and in the UI, Decode entries for wideband FM, AM, USB and LSB, ▶ on any audio job, and
+the top layer-2 name drawn beside the layer-1 label. `rustfft` and `num-complex` are built at
+`opt-level = 3` in debug builds. The workspace gates passed on 2026-10-19: fmt, clippy with
+`--all-targets --all-features -D warnings`, `cargo test --workspace --all-features` 547 passed, 0
+failed, 2 ignored (the live Kiwi and the field host model tests) over 80 test binaries,
+`no_privileged_deps`, `zeta agents-md --check` and `--skill --check`, and `cargo test -p zeta
+--test ui`: all 30 Playwright scenarios passed in headless Chromium (125 s, no skip line; the two
+classify scenarios take 19 s and 28 s of it). The `opt-level` override did not move the e2e time
+(131.9 s before, 132.0 s after), so the FFT is not where that time goes.
+
+By hand on 2026-10-19 against the field host's B210 (release `--cfg soapy` build of this branch, 104.9
+MHz with a 1 MHz capture band), driven from this box with the debug `zeta --node`; one-shot
+`--then-tail` is not supported with `--node`, so each job was started, its stream found with
+`stream list`, tailed with `stream tail` and stopped. `wfm_demod` with a 200 kHz band streamed
+audio frames at 48 000 Hz (786-787 samples, peaks 0.32, 0.50, 0.42). `measure` labelled the
+station `wfm` at 0.9 with "19 kHz pilot +16.3 dB" (snr 18.8 dB, occupied 81-83 kHz, cv 0.34,
+rms deviation about 17.5 kHz): the station is stereo. `classify` over 2 s spans inside the ring's
+last 10 s, timed from fresh `measure` events, returned `L1 wfm` (0.9, pilot +16.1 to +16.7 dB),
+`L2 FM Broadcast Radio` (1.0) and `L2 CBET` (0.7, "bandwidth off") on 19 of 20 spans; the first
+span came back `unknown` (occupied 56 kHz, below the 60 kHz floor, and cv 0.356, above 0.35) and
+so carried no layer-2 label. On the spans that passed, cv sat at 0.333-0.345, close under the 0.35 limit.
+`knowledge lookup --region AU` at 104.9 MHz returned the catalogue signatures FM Broadcast Radio
+(87.5-108 MHz, 250 kHz, WFM), CBET and HD Radio (FM), and no allocations. `am_demod` (10 kHz) and
+`ssb_demod --sideband usb` (3 kHz) both started and streamed 48 kHz audio frames (peaks near
+0.0002: a constant-envelope FM carrier carries no AM). Every job started was stopped; the node's
+own spectrum job was left running.
+
+Parked: `classify` measures the band twice (once for layer 1, once in the catalogue classifier);
+broad catalogue entries such as CBET (88-108 MHz, 2.2 kHz) score 0.7 with the bandwidth off and
+show up beside the right answer; `fm` does not map to AFSK, so APRS is named by the decoder, not
+the catalogue; AM and SSB playback has not been tried in a browser; stereo and RDS are not built.
+The wfm rule's cv limit has little margin on a real station (one span in 20 missed it); letting a
+strong 19 kHz pilot carry a marginal band is a candidate fix. `knowledge lookup --region AU` returned no
+allocation covering 104.9 MHz.

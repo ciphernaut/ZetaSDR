@@ -7,8 +7,9 @@ jobs, the operation set, a SigMF file source and the `zeta` CLI) and the DSP sli
 extraction, spectrum, NBFM demodulation, APRS decoding, layer-1 measurement and classifiers),
 with the transports and agent of plan 3, the hardware and foreign sources of plan 4 (KiwiSDR,
 SoapySDR, external-process stages), the federation of plan 5 (another node as a source, VITA
-49.2 over the websocket and UDP, a Pi 5 build) and the web UI of plan 6 (waterfall, context
-menu, agent transcript, graph view).
+49.2 over the websocket and UDP, a Pi 5 build), the web UI of plan 6 (waterfall, context
+menu, agent transcript, graph view) and the audio path of plan 7 (48 kHz audio from every
+demodulator, wideband FM, AM and SSB, a signal catalogue for layer 2).
 
 Design: [docs/superpowers/specs/2026-10-18-zetasdr-design.md](docs/superpowers/specs/2026-10-18-zetasdr-design.md).
 Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2026-10-18-core-node.md),
@@ -16,7 +17,8 @@ Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2
 [docs/superpowers/plans/2026-10-18-transports-agent.md](docs/superpowers/plans/2026-10-18-transports-agent.md),
 [docs/superpowers/plans/2026-10-19-hardware-sources.md](docs/superpowers/plans/2026-10-19-hardware-sources.md),
 [docs/superpowers/plans/2026-10-19-federation.md](docs/superpowers/plans/2026-10-19-federation.md),
-[docs/superpowers/plans/2026-10-19-ui.md](docs/superpowers/plans/2026-10-19-ui.md).
+[docs/superpowers/plans/2026-10-19-ui.md](docs/superpowers/plans/2026-10-19-ui.md),
+[docs/superpowers/plans/2026-10-19-audio-wfm.md](docs/superpowers/plans/2026-10-19-audio-wfm.md).
 
 ## Tests
 
@@ -61,8 +63,8 @@ Eight job kinds, chosen with `job start --kind` (`zeta job start --help` lists t
 
 - `passthrough` copies the channel IQ through unchanged.
 - `spectrum` emits one power-spectrum event per 100 ms frame (`size` 1024, `bin_hz`, `db` array).
-- `fm_demod` channelises and demodulates narrowband FM to an audio stream (48 kHz, per-frame `peak`).
-- `wfm_demod` does the same for wideband broadcast FM: 75 kHz deviation, 50 µs de-emphasis, 15 kHz mono audio at 48 kHz.
+- `fm_demod` channelises and demodulates narrowband FM to an audio stream (48 kHz, per-frame `peak`); `--deviation-hz` sets the peak deviation (default 5000).
+- `wfm_demod` does the same for wideband broadcast FM: `--deviation-hz` default 75000, 50 µs de-emphasis (the stage also takes 75 µs, set in its graph with `graph put`), 15 kHz mono audio at 48 kHz.
 - `am_demod` does the same for AM voice (envelope detector, 5 kHz audio at 48 kHz, slow AGC to a steady level; give it about 10 kHz of band).
 - `ssb_demod` does the same for SSB voice (`--sideband usb|lsb`, default `usb`; 2.8 kHz audio at 48 kHz, slow AGC). `--center-hz` is the suppressed-carrier (dial) frequency; give it about 6 kHz of band so both sides of the carrier are kept.
 - `aprs_decode` demodulates AFSK 1200 and HDLC-deframes AX.25, emitting one event per CRC-valid packet.
@@ -75,6 +77,34 @@ stream, waiting up to MS ms, then stops the job unless `--keep` is given, and pr
 not supported with `--node` yet: start the job remotely, then `stream list` and `stream tail`.
 `zeta classify` runs every classifier (layer 1 measurement, layer 2 signature and
 decode-to-identify) over a span of a source ring. Outputs below are trimmed.
+
+Every demodulator outputs mono f32 audio at 48 kHz in ±1, whatever the channel rate: the channel
+stage picks its rate for the band, and a streaming rational resampler (polyphase, reduced ratio
+L/M, Hann-windowed sinc at 0.45 of the lower rate) takes the audio from there to 48 kHz, so 200
+kHz, 250 kHz or 1 Msps channels need no integer relation to the audio rate. `--deviation-hz` is
+accepted by `fm_demod` and `wfm_demod` only, `--sideband` by `ssb_demod` only; any other kind
+refuses them.
+
+Layer 1 (`measure`, and the first label of `classify`) names a band from its occupied bandwidth,
+envelope coefficient of variation (cv) and discriminator audio, and its evidence names the
+measurements it used. `wfm` is a band 60-250 kHz wide with cv below 0.35 and rms deviation above 5
+kHz; a 19 kHz pilot line at least 10 dB above the surrounding audio spectrum raises the confidence
+from 0.6 to 0.9 and is quoted ("19 kHz pilot +16.3 dB"). `am` is cv at least 0.25 with a carrier
+line at the centre; `ssb` is cv at least 0.25, no carrier line, a 1.5-4 kHz band and 80 % of its
+power on one side of the centre, and its evidence gives the dial frequency to hand to `ssb_demod`.
+`fm` and `carrier` remain the narrowband rules (band at most 25 kHz, cv below 0.2), checked after
+these.
+
+Layer 2 adds a catalogue: iNTERCEPT's `signals.json` (594 known signals, Apache-2.0, copied
+unchanged into `crates/zeta-dsp/data` with its `NOTICE`). It is a knowledge provider, so
+`knowledge lookup` returns the signatures whose frequency ranges overlap the band, and a
+classifier, so `classify` returns up to three layer-2 labels with catalogue names after the
+layer-1 label. An entry scores 0.4 when one of its frequency ranges holds the measured centre
+(required), 0.3 when the measured bandwidth lies within half its minimum to 1.5 times its maximum
+bandwidth (required when that maximum is above 50 kHz, so a 12.5 kHz channel in the broadcast
+band is not "FM Broadcast Radio"), and 0.3 when the layer-1 label maps to one of its modulations;
+ties go to the entry with the narrower frequency range. A band layer 1 calls noise gets no
+catalogue label.
 
 ```bash
 cargo build -q -p zeta
@@ -110,6 +140,22 @@ $Z $S --source-file aprs=scratch/fx/aprs.sigmf-meta job start --kind measure --s
 # classify: layer 1 "fm" (0.6) plus layer 2 "APRS" (1.0, "1 AX.25 frames with valid FCS; first VK3ABC>APRS")
 $Z $S --source-file aprs=scratch/fx/aprs.sigmf-meta classify --source aprs \
     --start-ns 0 --end-ns 2000000000 --center-hz 144800000 --bandwidth-hz 12500
+```
+
+A broadcast station on a B210 (104.9 MHz, a node on the field host serving it; outputs trimmed):
+
+```bash
+N="--node http://field-host:7979"   # ZETA_SECRET in the environment
+# audio frames at 48000 Hz, 786-787 samples each, peak 0.32-0.50
+$Z $N job start --kind wfm_demod --source b210 --center-hz 104900000 --bandwidth-hz 200000
+$Z $N stream list                        # the job's "audio" stream
+$Z $N stream tail --stream <id> --max-frames 3 --timeout-ms 8000
+$Z $N job stop --job <id>
+# classify a 2 s span inside the ring's last 10 s: L1 "wfm" (0.9, "... 19 kHz pilot +16.2 dB ..."),
+# L2 "FM Broadcast Radio" (1.0) and "CBET" (0.7, bandwidth off)
+$Z $N classify --source b210 --center-hz 104900000 --bandwidth-hz 200000 --start-ns <t-2s> --end-ns <t>
+# signatures: FM Broadcast Radio (87.5-108 MHz, 250 kHz, WFM), CBET, HD Radio (FM)
+$Z $N knowledge lookup --region AU --center-hz 104900000 --bandwidth-hz 200000
 ```
 
 ### GPU
