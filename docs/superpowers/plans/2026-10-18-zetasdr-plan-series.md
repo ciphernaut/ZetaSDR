@@ -58,4 +58,8 @@ streams, each tailed three 4800-sample frames, and after `job stop` and stopping
 `gain.py` process remained. Later on 2026-10-19, with `libsoapysdr-dev` installed, `RUSTFLAGS="--cfg soapy" cargo build -p zeta`
 and `cargo clippy -p zeta --all-targets -- -D warnings` passed against SoapySDR 0.8.1 (HackRF
 module 0.3.4); `zeta soapy find` printed `[]` with no device attached and a `--source-soapy`
-open with no device exited 1 with a clear error. Not run: the HackRF live test (no hardware yet).
+open with no device exited 1 with a clear error. With a HackRF One (r9, firmware v2.3.2) attached later that day, `zeta soapy find` listed it,
+`source list` showed its capabilities (0-7.25 GHz, 20 MHz, ci8/ci16/cf32), and a `measure` job at
+100.1 MHz with a 200 kHz band produced two events a second apart (no antenna: snr 2.8 dB, label
+noise). A 1 MHz band in the debug build lagged continuously and produced no event in 8 s; the
+release build is the one to use for wide bands on real hardware.
