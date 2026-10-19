@@ -282,6 +282,15 @@ impl LeaseManager {
         });
     }
 
+    /// Whether `source` is held by a time-shared lease (a scan).
+    pub fn time_shared(&self, source: &SourceId) -> bool {
+        self.leases
+            .lock()
+            .unwrap()
+            .get(source)
+            .is_some_and(|v| v.iter().any(|l| l.time_shared))
+    }
+
     /// Current holders of `source`, in insertion order, with the band each
     /// leased (a time-shared holder's is its whole span).
     pub fn holders(&self, source: &SourceId) -> Vec<(JobId, Tuning)> {

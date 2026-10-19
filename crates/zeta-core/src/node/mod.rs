@@ -123,12 +123,18 @@ impl Inner {
     /// `source`'s bank for the capture `band`: the kept one when it was made
     /// for that band, else a new one from the factory (none below
     /// [`PFB_MIN_RATE_HZ`]) replacing it. Without a factory nothing is kept.
+    /// While a scan holds the source (a time-shared lease) the band changes
+    /// every step and nothing can subscribe, so no bank is made or replaced:
+    /// the first block after the scan makes the one for the band it left.
     fn sync_bank(&self, source: &SourceId, band: Tuning) -> Option<Arc<dyn ChannelBank>> {
         let mut banks = self.banks.lock().unwrap();
         if let Some(slot) = banks.get(source)
             && slot.band == band
         {
             return slot.bank.clone();
+        }
+        if self.leases.time_shared(source) {
+            return None;
         }
         let factory = self.bank_factory.read().unwrap().clone()?;
         let bank = (band.bandwidth_hz.0 >= PFB_MIN_RATE_HZ)

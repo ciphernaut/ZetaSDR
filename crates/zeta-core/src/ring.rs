@@ -116,10 +116,10 @@ impl IqRing {
         }
     }
 
-    /// Change the history length to `seconds`, keeping the newest samples when
-    /// it shrinks and releasing the freed memory. The sample capacity is
-    /// computed at the current rate; a block with a new rate recomputes it
-    /// (from `seconds`) and restarts the ring.
+    /// Change the history length to `seconds` at the current rate, keeping the
+    /// newest samples when it shrinks and releasing the freed memory; a block
+    /// with a new rate recomputes the capacity (from `seconds`) and restarts
+    /// the ring. Before a rate change use [`IqRing::set_capacity_seconds`].
     pub fn resize(&mut self, seconds: f64) {
         self.capacity_seconds = seconds;
         self.capacity = Self::cap_for(seconds, self.sample_rate_hz);
@@ -129,6 +129,14 @@ impl IqRing {
             self.dropped += excess as u64;
         }
         self.buf.shrink_to_fit();
+    }
+
+    /// Set the history length a block with a new rate sizes the ring to,
+    /// touching nothing now: for a retune, where [`IqRing::push`] restarts
+    /// the ring at the new rate anyway (and [`IqRing::resize`] would trim
+    /// and reallocate the old rate's samples first, for nothing).
+    pub fn set_capacity_seconds(&mut self, seconds: f64) {
+        self.capacity_seconds = seconds;
     }
 
     /// Bytes currently allocated for samples.
@@ -218,6 +226,25 @@ mod tests {
             start_ns: Timestamp(a * 1_000_000_000),
             end_ns: Timestamp(b * 1_000_000_000),
         }
+    }
+
+    #[test]
+    fn capacity_seconds_apply_at_the_next_rate() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        for i in 0..3 {
+            ring.push(&block(i));
+        }
+        let bytes = ring.capacity_bytes();
+        ring.set_capacity_seconds(2.0);
+        // Nothing trimmed or reallocated at the old rate.
+        assert_eq!(ring.capacity_samples(), 10_000);
+        assert_eq!(ring.capacity_bytes(), bytes);
+        assert_eq!(ring.read(span(0, 3)).unwrap().len(), 3000);
+        let mut b = block(3);
+        b.sample_rate_hz = Hz(2 * RATE);
+        ring.push(&b);
+        assert_eq!(ring.capacity_samples(), 4000);
+        assert_eq!(ring.earliest(), Some(Timestamp(3_000 * MS)));
     }
 
     #[test]

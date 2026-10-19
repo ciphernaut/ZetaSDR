@@ -67,7 +67,8 @@ struct Running {
 /// (at most [`INPUT_CAPACITY`]; a full queue drops the block and counts it in
 /// [`ChannelBank::dropped`]); the thread runs the bank and sends to bins with
 /// subscribers only, and skips the filtering altogether while nobody
-/// subscribes. The thread ends when the bank is dropped.
+/// subscribes. A drop also resets the filter (the input has a gap), and the
+/// bank's first drop is logged. The thread ends when the bank is dropped.
 ///
 /// A bin block's `t0` is the input time of its first sample's content: the
 /// input block's `t0`, plus the time from that block's start to the newest
@@ -115,6 +116,17 @@ impl PfbChannelBank {
             tx,
             epoch: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Count a dropped input block; the bank's first drop is logged.
+    fn count_drop(&self, why: &str) {
+        if self.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
+            let band = self.shared.band;
+            eprintln!(
+                "zeta: channel bank at {} Hz ({} Hz wide) {why}; see dropped()",
+                band.center_hz.0, band.bandwidth_hz.0
+            );
         }
     }
 
@@ -260,12 +272,15 @@ impl ChannelBank for PfbChannelBank {
         let epoch = self.epoch.load(Ordering::Relaxed);
         match self.tx.try_send((epoch, block.clone())) {
             Ok(()) => {}
+            // The input now has a gap: the next accepted block starts the
+            // filter afresh rather than splicing across it.
             Err(TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.count_drop("cannot keep up; dropping input blocks");
+                self.reset();
             }
             // The thread is gone (it panicked); count rather than lose silently.
             Err(TrySendError::Disconnected(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.count_drop("thread has ended; dropping input blocks");
             }
         }
     }

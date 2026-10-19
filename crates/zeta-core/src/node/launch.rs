@@ -360,7 +360,8 @@ async fn forward_iq(
 }
 
 /// Push a port's blocks into its ring, creating the ring on the first block
-/// and resizing it to the memory budget when the rate changes (a retune).
+/// and sizing it to the memory budget at the new rate when the rate changes
+/// (a retune; the ring restarts, so the old rate's samples are not trimmed).
 pub(super) async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqReceiver) {
     let mut logged: HashSet<u64> = HashSet::new();
     loop {
@@ -390,7 +391,8 @@ pub(super) async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqRec
             .clone();
         let mut ring = ring.write().unwrap();
         if ring.sample_rate_hz() != block.sample_rate_hz {
-            ring.resize(seconds);
+            // `push` restarts the ring at the new rate with this length.
+            ring.set_capacity_seconds(seconds);
         }
         ring.push(&block);
     }

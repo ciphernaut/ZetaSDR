@@ -9,6 +9,7 @@ use num_complex::Complex;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use zeta_core::bank::{BankFactory, ChannelBank};
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult};
@@ -214,14 +215,14 @@ fn registry() -> StageRegistry {
     r
 }
 
-fn cfg(dir: &Path) -> NodeConfig {
+fn cfg_dwell(dir: &Path, scan_dwell_ms: u64) -> NodeConfig {
     NodeConfig {
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: 64 << 20,
         backends: vec![Backend::Cpu],
         resume: true,
-        scan_dwell_ms: 20,
+        scan_dwell_ms,
     }
 }
 
@@ -241,10 +242,21 @@ async fn open() -> (tempfile::TempDir, Node, Arc<ScanPort>) {
 }
 
 async fn open_with(port: Arc<ScanPort>) -> (tempfile::TempDir, Node, Arc<ScanPort>) {
+    open_dwell(port, 20).await
+}
+
+async fn open_dwell(
+    port: Arc<ScanPort>,
+    dwell_ms: u64,
+) -> (tempfile::TempDir, Node, Arc<ScanPort>) {
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
-        .await
-        .unwrap();
+    let node = Node::open(
+        cfg_dwell(dir.path(), dwell_ms),
+        registry(),
+        vec![port.clone()],
+    )
+    .await
+    .unwrap();
     (dir, node, port)
 }
 
@@ -409,4 +421,42 @@ async fn stream_list_stays_flat_across_sweeps() {
     let after = count_after_tune(7).await;
     eprintln!("streams before {before}, after two sweeps {after}");
     assert_eq!(before, after, "per-step fft streams must be unregistered");
+}
+
+/// Counts `make` calls and declines every band.
+#[derive(Default)]
+struct CountingFactory(std::sync::atomic::AtomicUsize);
+
+impl BankFactory for CountingFactory {
+    fn make(&self, _: Hz, _: Hz) -> Option<Arc<dyn ChannelBank>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_bank_is_made_per_step_while_a_scan_holds_the_source() {
+    let (_dir, node, port) = open().await;
+    let factory = Arc::new(CountingFactory::default());
+    node.set_bank_factory(factory.clone());
+    let makes = || factory.0.load(std::sync::atomic::Ordering::SeqCst);
+    let (id, _rx) = start_scan(&node).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while port.tunes().len() < 7 {
+        assert!(tokio::time::Instant::now() < deadline, "scan stalled");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(makes(), 0, "banks made during two sweeps");
+    node.job_stop(&id).await.unwrap();
+    // The port stays at the last step; its next block makes that band's bank.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while makes() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no bank after the scan"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(makes(), 1);
 }
