@@ -102,6 +102,9 @@ impl Cli {
         use clap::CommandFactory;
         use clap::error::ErrorKind;
         let err = |kind, msg: String| Err(Self::command().error(kind, msg));
+        if self.speech.stt_socket.is_some() && self.speech.stt_node.is_some() {
+            return err(ErrorKind::ArgumentConflict, SPEECH_EXCLUSIVE.to_string());
+        }
         let mut sources = std::mem::take(&mut self.source_files);
         sources.append(&mut self.source_soapy);
         for raw in std::mem::take(&mut self.source_kiwi) {
@@ -149,9 +152,14 @@ impl Cli {
         self.sources.clone()
     }
 
-    /// Whether any flag that configures the local node (sources, plugins, state dir) was given.
+    /// Whether any flag that configures the local node (sources, plugins, state dir, speech
+    /// backend) was given.
     pub fn configures_local_node(&self) -> bool {
-        !self.sources.is_empty() || !self.plugins.is_empty() || self.state_dir.is_some()
+        !self.sources.is_empty()
+            || !self.plugins.is_empty()
+            || self.state_dir.is_some()
+            || self.speech.stt_socket.is_some()
+            || self.speech.stt_node.is_some()
     }
 }
 
@@ -263,6 +271,9 @@ pub struct AskArgs {
     #[arg(long, default_value_t = 8, value_name = "N")]
     pub max_turns: u32,
 }
+
+/// The usage error for `--stt-socket` with `--stt-node`.
+pub const SPEECH_EXCLUSIVE: &str = "--stt-socket and --stt-node are exclusive";
 
 /// The speech backend: a local daemon or another node.
 #[derive(Debug, Clone, Default, Args)]

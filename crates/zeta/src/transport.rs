@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use zeta_speech::{NodeBackend, SocketBackend, SpeechBackend};
 
-use crate::cli::{Cli, Command, ServeArgs, SpeechArgs};
+use crate::cli::{Cli, Command, SPEECH_EXCLUSIVE, ServeArgs, SpeechArgs};
 use crate::{agents_md, ask, node_setup};
 
 const MIN_SECRET_LEN: usize = 12;
@@ -70,7 +70,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
     if cli.configures_local_node() {
         return usage(
-            "sources and plugins are configured on the serving node: drop --source-*, --plugin and --state-dir with --node",
+            "sources, plugins and the speech backend are configured on the serving node: drop --source-*, --plugin, --state-dir, --stt-socket and --stt-node with --node",
         );
     }
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {
@@ -194,7 +194,7 @@ pub async fn speech_backend(
     state_dir: &Path,
 ) -> Result<Option<Arc<dyn SpeechBackend>>, String> {
     match (&args.stt_socket, &args.stt_node) {
-        (Some(_), Some(_)) => Err("--stt-socket and --stt-node are exclusive".to_string()),
+        (Some(_), Some(_)) => Err(SPEECH_EXCLUSIVE.to_string()),
         (None, Some(url)) => {
             let secret = std::env::var(STT_NODE_SECRET_ENV)
                 .ok()

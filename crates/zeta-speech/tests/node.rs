@@ -3,6 +3,7 @@
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
+use zeta_client::{ClientError, NodeClient};
 use zeta_speech::testing::FakeBackend;
 use zeta_speech::{NodeBackend, SpeechBackend, SpeechError, wav_s16_mono};
 use zeta_ws::testing::{TestOpts, spawn_with};
@@ -87,12 +88,43 @@ async fn two_nodes_forwarding_to_each_other_refuse_the_loop() {
     )
     .await;
 
-    let client = NodeBackend::new(&a.url, SECRET).await.unwrap();
-    let err = client
-        .transcribe(&wav_s16_mono(&[0]), "en")
-        .await
-        .unwrap_err();
-    assert_eq!(err, SpeechError::Daemon("stt forwarding loop".to_string()));
+    // A request with no hop: A forwards it to B, B refuses the hop with 508, and A reports
+    // that as its backend's error.
+    assert_forwarding_loop(&a.url).await;
     b.stop().await;
     a.stop().await;
+}
+
+#[tokio::test]
+async fn a_node_forwarding_to_itself_refuses_the_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = free_addr();
+    let to_self = NodeBackend::new(&format!("http://{addr}"), SECRET)
+        .await
+        .unwrap();
+    let ts = spawn_with(
+        dir.path(),
+        TestOpts {
+            addr: Some(addr),
+            ..with_speech(Arc::new(to_self))
+        },
+    )
+    .await;
+    assert_forwarding_loop(&ts.url).await;
+    ts.stop().await;
+}
+
+/// A first-hand `POST /stt` to `url` fails 502 with the forwarding loop the next node saw.
+async fn assert_forwarding_loop(url: &str) {
+    let client = NodeClient::new(url, SECRET).unwrap();
+    let err = client
+        .stt(wav_s16_mono(&[0]), "en", false)
+        .await
+        .unwrap_err();
+    let ClientError::Http { status, body, .. } = &err else {
+        panic!("want an HTTP error, got {err:?}");
+    };
+    assert_eq!(*status, 502, "{body}");
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["message"], "speech daemon: stt forwarding loop");
 }

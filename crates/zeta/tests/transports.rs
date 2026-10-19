@@ -249,6 +249,46 @@ fn stt_socket_and_stt_node_are_exclusive() {
 }
 
 #[test]
+fn stt_socket_and_stt_node_are_exclusive_for_every_command() {
+    let dir = tempfile::tempdir().unwrap();
+    plain()
+        .env_remove("ZETA_STT_SOCKET")
+        .env_remove("ZETA_STT_NODE")
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["--stt-socket", "/nonexistent/voiced.sock"])
+        .args(["--stt-node", "http://127.0.0.1:9", "source", "list"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(contains("--stt-socket and --stt-node are exclusive"));
+    plain()
+        .env_remove("ZETA_STT_SOCKET")
+        .env_remove("ZETA_STT_NODE")
+        .args(["--node", "http://127.0.0.1:9", "--secret", SECRET])
+        .args(["--stt-socket", "/nonexistent/voiced.sock"])
+        .args(["--stt-node", "http://127.0.0.1:9", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("--stt-socket and --stt-node are exclusive"));
+}
+
+#[test]
+fn node_flag_rejects_speech_flags() {
+    for flag in ["--stt-socket", "--stt-node"] {
+        plain()
+            .env_remove("ZETA_STT_SOCKET")
+            .env_remove("ZETA_STT_NODE")
+            .args(["--node", "http://127.0.0.1:9", "--secret", SECRET])
+            .args([flag, "x", "source", "list"])
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(contains("--stt-socket and --stt-node with --node"));
+    }
+}
+
+#[test]
 fn stt_node_requires_its_secret() {
     let dir = tempfile::tempdir().unwrap();
     plain()
