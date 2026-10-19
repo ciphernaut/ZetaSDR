@@ -1,5 +1,5 @@
 //! Synthetic signal generators for tests: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 /
-//! APRS, POCSAG, RDS, Mode S, AWGN.
+//! APRS, POCSAG, RDS, Mode S, ACARS, AWGN.
 //! Behind feature `test-fixtures`.
 
 use std::f64::consts::PI;
@@ -655,6 +655,97 @@ pub fn modes_frame_iq(
         }
     }
     out
+}
+
+/// One ACARS character with odd parity in bit 7.
+fn acars_parity(c: u8) -> u8 {
+    let c = c & 0x7F;
+    if c.count_ones().is_multiple_of(2) {
+        c | 0x80
+    } else {
+        c
+    }
+}
+
+/// A whole ACARS block as transmitted (ARINC 618), each character with odd
+/// parity in bit 7: `+` `*` SYN SYN SOH, `mode`, `reg` left-padded with `.`
+/// to 7, NAK (no acknowledgement), `label` (2), `block_id`, STX, `text`, ETX,
+/// the [`crate::acars::crc16`] of mode..ETX as transmitted (parity bits
+/// included), low byte first, then DEL.
+pub fn acars_block_bytes(
+    mode: char,
+    reg: &str,
+    label: &str,
+    block_id: char,
+    text: &str,
+) -> Vec<u8> {
+    use crate::acars::{DEL, ETX, NAK, SOH, STX, SYN};
+    let mut body = vec![mode as u8];
+    body.extend(format!("{reg:.>7}").bytes());
+    body.push(NAK);
+    body.extend(label.bytes());
+    body.push(block_id as u8);
+    body.push(STX);
+    body.extend(text.bytes());
+    body.push(ETX);
+    let body: Vec<u8> = body.into_iter().map(acars_parity).collect();
+    let crc = crate::acars::crc16(&body);
+    let mut out: Vec<u8> = [b'+', b'*', SYN, SYN, SOH].map(acars_parity).to_vec();
+    out.extend_from_slice(&body);
+    out.extend(crc.to_le_bytes());
+    out.push(acars_parity(DEL));
+    out
+}
+
+/// ACARS audio: 128 pre-key ones then `bytes`, each LSB first, as 2400 bps
+/// MSK at amplitude 0.8, phase-continuous across bits; the tone of each bit
+/// from [`crate::acars::bit_tones`] (the pre-key is a steady
+/// [`MARK_HZ`](crate::acars::MARK_HZ) tone). Bit `k` covers samples
+/// `k * rate / 2400 .. (k + 1) * rate / 2400`. acarsdec needs at least 12
+/// whole bytes of pre-key after its loop locks, so 64 bits is too few.
+pub fn acars_modulate(bytes: &[u8], audio_rate_hz: u32) -> Vec<f32> {
+    use crate::acars::BAUD;
+    const PREKEY_BITS: usize = 128;
+    let mut bits = vec![1u8; PREKEY_BITS];
+    bits.extend(
+        bytes
+            .iter()
+            .flat_map(|&b| (0..8).map(move |i| (b >> i) & 1)),
+    );
+    let tones = crate::acars::bit_tones(&bits);
+    let rate = audio_rate_hz as u64;
+    let len = (bits.len() as u64 * rate / BAUD as u64) as usize;
+    let mut phase = 0.0f64;
+    (0..len)
+        .map(|n| {
+            let k = ((n as u64 * BAUD as u64) / rate) as usize;
+            let s = 0.8 * phase.sin() as f32;
+            phase = (phase + 2.0 * PI * tones[k] / rate as f64).rem_euclid(2.0 * PI);
+            s
+        })
+        .collect()
+}
+
+/// One ACARS uplink-style block (mode `2`, block id `A`, so the text is
+/// kept whole) as complex baseband: 0.2 s silence, [`acars_modulate`] at
+/// 48 kHz, 0.2 s silence, through [`am_modulate`] at index 0.9 and
+/// `offset_hz` from centre.
+pub fn acars_packet_iq(
+    reg: &str,
+    label: &str,
+    text: &str,
+    iq_rate_hz: u32,
+    offset_hz: f64,
+) -> Vec<Complex<f32>> {
+    const AUDIO_RATE: u32 = 48_000;
+    let silence = vec![0.0f32; AUDIO_RATE as usize / 5];
+    let mut audio = silence.clone();
+    audio.extend(acars_modulate(
+        &acars_block_bytes('2', reg, label, 'A', text),
+        AUDIO_RATE,
+    ));
+    audio.extend_from_slice(&silence);
+    am_modulate(&audio, AUDIO_RATE, iq_rate_hz, 0.9, offset_hz)
 }
 
 #[cfg(test)]

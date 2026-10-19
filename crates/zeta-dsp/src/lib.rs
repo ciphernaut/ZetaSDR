@@ -10,6 +10,7 @@ use zeta_core::stage::StageError;
 use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{Span, Timestamp};
 
+pub mod acars;
 pub mod afsk;
 pub mod am;
 pub mod aprs;
