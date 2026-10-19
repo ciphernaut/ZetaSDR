@@ -268,3 +268,40 @@ async fn turn_limit_stops_loop() {
 fn max_turns_defaults_to_eight() {
     assert_eq!(cfg().max_turns, 8);
 }
+
+/// A `job_list` result reaches the model without each record's `graph`
+/// (hundreds of bytes per job the model never needs); the transcript shows
+/// the same trimmed result.
+#[tokio::test]
+async fn job_list_reaches_the_model_without_graphs() {
+    let fake = fake(vec![
+        tool_call_response(&[("job_list", json!({}))]),
+        text_response("Two jobs.", "stop"),
+    ])
+    .await;
+    let record = |id: &str| {
+        json!({
+            "id": id, "kind": "spectrum", "source": "tone", "format": 1,
+            "graph": {"id": "g", "nodes": [{"id": "n", "kind": "fft", "params": {"size": 1024}}], "edges": []},
+            "tuning": {"center_hz": 100000000, "bandwidth_hz": 48000},
+            "state": {"status": "stopped"}, "context": {}, "created_ns": 1
+        })
+    };
+    let listed = json!({"result": "jobs", "value": [record("a"), record("b")]});
+    let exec = RecordingExecutor::new(vec![("job_list", Ok(listed))]);
+    let agent = Agent::new(llm(&fake), exec, cfg());
+
+    let t = agent.run("list the jobs").await.unwrap();
+    assert_eq!(t.calls.len(), 1);
+    let value = t.calls[0].result["value"].as_array().unwrap();
+    assert_eq!(value.len(), 2);
+    for r in value {
+        assert!(r.get("graph").is_none(), "{r}");
+        assert_eq!(r["kind"], "spectrum");
+        assert_eq!(r["state"]["status"], "stopped");
+    }
+    let reqs = requests(&fake);
+    let tool_msg = reqs[1]["messages"][3]["content"].as_str().unwrap();
+    assert!(!tool_msg.contains("graph"), "{tool_msg}");
+    assert!(tool_msg.contains("\"kind\":\"spectrum\""), "{tool_msg}");
+}

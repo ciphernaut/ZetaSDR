@@ -161,6 +161,7 @@ impl Inner {
         self.jobs.lock().unwrap().insert(
             rec.id.clone(),
             JobEntry {
+                ended_ns: rec.created_ns,
                 record: rec,
                 cancel: Some(token.clone()),
                 done: None,
@@ -189,12 +190,29 @@ impl Inner {
             .acquire_shared(port.as_ref(), rec.id.clone(), rec.tuning)
             .await?;
         let (id, span) = (rec.id.clone(), rec.tuning);
+        let steps = scan_steps(span, port.capabilities());
+        let mut rec = rec;
+        // `job_context` tells a reader (the agent above all) how many steps a
+        // sweep takes instead of leaving it to guess from the rows.
+        if !rec.context.is_object() {
+            rec.context = serde_json::json!({});
+        }
+        if let Some(ctx) = rec.context.as_object_mut() {
+            ctx.insert(
+                "scan".into(),
+                serde_json::json!({
+                    "steps": steps.len(),
+                    "step_hz": steps.first().map_or(0, |t| t.bandwidth_hz.0),
+                    "dwell_ms": self.scan_dwell_ms,
+                }),
+            );
+        }
         let token = self.shutdown.child_token();
         let prov = self.record_running(rec, &token)?;
         let out = self.bus.register(StreamKind::Event, prov.clone());
         let scan = Scan {
             id: id.clone(),
-            steps: scan_steps(span, port.capabilities()),
+            steps,
             port: port.clone(),
             ctx: StageContext::new(prov.source.clone()),
             stage,
@@ -252,6 +270,7 @@ impl Inner {
             && entry.record.state == JobState::Running
         {
             entry.record.state = state;
+            entry.ended_ns = now();
             entry.cancel = None;
             if let Err(e) = persist(&self.jobs_dir, &entry.record) {
                 self.persist_errors
@@ -259,6 +278,7 @@ impl Inner {
                     .unwrap()
                     .push(format!("job {}: {e}", id.0));
             }
+            Inner::prune_history(&mut jobs, &self.jobs_dir);
         }
     }
 }

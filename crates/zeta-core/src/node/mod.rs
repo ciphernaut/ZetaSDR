@@ -22,7 +22,9 @@ use crate::port::{Port, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Backend, StageRegistry};
 use crate::stream::{Frame, Payload, StreamBus};
-use crate::types::{Capabilities, JobId, Provenance, SourceId, Span, StreamId, StreamKind};
+use crate::types::{
+    Capabilities, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
+};
 
 pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
 
@@ -82,8 +84,16 @@ pub enum NodeError {
     Io(String),
 }
 
+/// How many stopped or failed job records the node keeps: when a job ends
+/// and more than this many are terminal, the oldest beyond the cap are
+/// forgotten and their files removed. Running jobs are never counted.
+pub const JOB_HISTORY_MAX: usize = 20;
+
 struct JobEntry {
     record: JobRecord,
+    /// When the record turned terminal in this process (its `created_ns` for
+    /// one loaded terminal from disk); history is pruned oldest-ended first.
+    ended_ns: Timestamp,
     cancel: Option<CancellationToken>,
     /// The supervisor; it releases the lease and unregisters the job's streams.
     done: Option<JoinHandle<()>>,
@@ -120,6 +130,26 @@ struct Inner {
 }
 
 impl Inner {
+    /// Forget the terminal records that ended earliest beyond
+    /// [`JOB_HISTORY_MAX`], removing their files (best effort: a file that
+    /// will not go is retried at the next prune). Called with `jobs` locked
+    /// after a record turns terminal; that record ended last, so it survives.
+    fn prune_history(jobs: &mut HashMap<JobId, JobEntry>, jobs_dir: &Path) {
+        let mut terminal: Vec<(Timestamp, JobId)> = jobs
+            .values()
+            .filter(|e| matches!(e.record.state, JobState::Stopped | JobState::Failed { .. }))
+            .map(|e| (e.ended_ns, e.record.id.clone()))
+            .collect();
+        if terminal.len() <= JOB_HISTORY_MAX {
+            return;
+        }
+        terminal.sort_by(|a, b| a.0.0.cmp(&b.0.0).then_with(|| a.1.0.cmp(&b.1.0)));
+        for (_, id) in terminal.iter().take(terminal.len() - JOB_HISTORY_MAX) {
+            jobs.remove(id);
+            let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", id.0)));
+        }
+    }
+
     /// `source`'s bank for the capture `band`: the kept one when it was made
     /// for that band, else a new one from the factory (none below
     /// [`PFB_MIN_RATE_HZ`]) replacing it. Without a factory nothing is kept.
@@ -227,6 +257,7 @@ impl Node {
                 node.inner.jobs.lock().unwrap().insert(
                     rec.id.clone(),
                     JobEntry {
+                        ended_ns: rec.created_ns,
                         record: rec,
                         cancel: None,
                         done: None,
@@ -245,12 +276,17 @@ impl Node {
                 node.inner.jobs.lock().unwrap().insert(
                     failed.id.clone(),
                     JobEntry {
+                        ended_ns: now(),
                         record: failed,
                         cancel: None,
                         done: None,
                     },
                 );
             }
+        }
+        {
+            let mut jobs = node.inner.jobs.lock().unwrap();
+            Inner::prune_history(&mut jobs, &node.inner.jobs_dir);
         }
         Ok(node)
     }
@@ -448,11 +484,14 @@ impl Node {
                 };
                 persist(&self.inner.jobs_dir, &rec)?;
                 entry.record = rec;
+                entry.ended_ns = now();
             }
             if let Some(c) = entry.cancel.take() {
                 c.cancel();
             }
-            entry.done.take()
+            let done = entry.done.take();
+            Inner::prune_history(&mut jobs, &self.inner.jobs_dir);
+            done
         };
         if let Some(h) = done {
             let _ = h.await;

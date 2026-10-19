@@ -641,3 +641,89 @@ async fn idle_fires_only_when_the_last_holder_stops() {
     node.job_stop(&c).await.unwrap();
     assert_eq!(idles(), 2);
 }
+
+/// Stopped jobs are history: only the newest `JOB_HISTORY_MAX` terminal
+/// records survive, in memory and on disk; a running job is never pruned.
+#[tokio::test]
+async fn stopped_jobs_beyond_the_history_cap_are_forgotten() {
+    use zeta_core::node::JOB_HISTORY_MAX;
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let keep = start_job(&node).await;
+    let mut stopped = Vec::new();
+    for _ in 0..JOB_HISTORY_MAX + 3 {
+        let id = start_job(&node).await;
+        node.job_stop(&id).await.unwrap();
+        stopped.push(id);
+    }
+    let list = node.job_list();
+    assert_eq!(list.len(), JOB_HISTORY_MAX + 1, "{list:?}");
+    assert!(
+        list.iter()
+            .any(|r| r.id == keep && r.state == JobState::Running)
+    );
+    // Replacing the oldest running job's graph stops and relaunches it: the
+    // stop must not prune it (history is ordered by when a job ended, not
+    // when it started).
+    node.job_graph_put(&keep, graph("passthrough"))
+        .await
+        .unwrap();
+    let list = node.job_list();
+    assert!(
+        list.iter()
+            .any(|r| r.id == keep && r.state == JobState::Running),
+        "{list:?}"
+    );
+    // While it was stopped the cap applied once more: one older record went.
+    assert_eq!(list.len(), JOB_HISTORY_MAX, "{list:?}");
+    let kept: Vec<_> = list
+        .iter()
+        .filter(|r| r.state == JobState::Stopped)
+        .map(|r| r.id.clone())
+        .collect();
+    assert_eq!(kept, stopped[4..].to_vec(), "the oldest four went");
+    let jobs_dir = dir.path().join("state").join("jobs");
+    for id in &stopped[..4] {
+        assert!(
+            !jobs_dir.join(format!("{}.json", id.0)).exists(),
+            "{id:?} still on disk"
+        );
+    }
+    assert!(jobs_dir.join(format!("{}.json", stopped[4].0)).exists());
+    // Reopening prunes too: write back four stale stopped records, older than
+    // everything kept, so the three oldest go and the fourth stays.
+    drop(node);
+    for (i, id) in stopped[..4].iter().enumerate() {
+        let rec = JobRecord {
+            id: id.clone(),
+            state: JobState::Stopped,
+            created_ns: Timestamp(i as u64 + 1),
+            ..on_disk(dir.path(), &stopped[4])
+        };
+        std::fs::write(
+            jobs_dir.join(format!("{}.json", id.0)),
+            serde_json::to_vec(&rec).unwrap(),
+        )
+        .unwrap();
+    }
+    let (_src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    let list = node.job_list();
+    assert_eq!(
+        list.iter().filter(|r| r.state == JobState::Stopped).count(),
+        JOB_HISTORY_MAX,
+        "{list:?}"
+    );
+    for id in &stopped[..3] {
+        assert!(!jobs_dir.join(format!("{}.json", id.0)).exists(), "{id:?}");
+        assert!(!list.iter().any(|r| &r.id == id), "{id:?} listed");
+    }
+    assert!(jobs_dir.join(format!("{}.json", stopped[3].0)).exists());
+    assert!(list.iter().any(|r| r.id == stopped[3]));
+}
