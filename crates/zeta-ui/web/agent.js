@@ -8,7 +8,13 @@
 //       `job_start … → out_of_range field=center_hz …` (error: true).
 //   class Transcript(el)
 //       .op(payload)            append formatOp(payload); a line equal to the last one is
-//                               folded into it with a ×N count (the jobs poll repeats)
+//                               folded into it with a ×N count. Ok outcomes of the read-only
+//                               polls (QUIET_OPS: job_list, stream_list, source_list) are
+//                               hidden unless this page typed that op: .typed(name) bumps a
+//                               per-op counter and the next frame of that op consumes one
+//                               and shows. Errors always show (ruling R5).
+//       .typed(opName)          the command line is about to apply an op of that name
+//       .untyped(opName)        it never reached the node (no frame will come): undo .typed
 //       .user(text)             a request typed by the user
 //       .assistant(text, error) an answer from /ask (error: an assistant-error line)
 //       .note(text, error)      a UI line (connection state, local errors)
@@ -17,11 +23,13 @@
 //   startOpsFeed(api, transcript) -> {close}
 //       Finds the `ops` stream (the GET /streams entry whose provenance.source is "node")
 //       and appends one line per frame; reconnects and re-resolves the id when it drops.
-//   startJobs(api, el, transcript) -> {close, refresh}
+//   startJobs(api, el, transcript, {onJobs}) -> {close, refresh}
 //       Polls `job_list` every 2 s and renders the jobs that are not stopped: kind, source,
-//       state and a Stop button applying `job_stop`.
+//       state, id, an `.events` cell (filled by overlays.js) and a Stop button applying
+//       `job_stop`. onJobs(jobs) is called with the whole list after each render.
 
 export const JOBS_POLL_MS = 2000;
+export const QUIET_OPS = new Set(["job_list", "stream_list", "source_list"]);
 const MAX_LINES = 500;
 
 function scalar(v) {
@@ -97,6 +105,26 @@ export class Transcript {
     this.el = el;
     this.last = null;
     this.listeners = [];
+    this.typedOps = new Map(); // op name -> typed and not yet seen on the ops stream
+  }
+
+  typed(name) {
+    this.typedOps.set(name, (this.typedOps.get(name) || 0) + 1);
+  }
+
+  untyped(name) {
+    const n = this.typedOps.get(name) || 0;
+    if (n <= 1) this.typedOps.delete(name);
+    else this.typedOps.set(name, n - 1);
+  }
+
+  // Whether an ops-stream payload is shown (consumes a typed count for a quiet op).
+  #shows(payload) {
+    const name = payload && payload.op && payload.op.op;
+    if (!QUIET_OPS.has(name)) return true;
+    const typed = (this.typedOps.get(name) || 0) > 0;
+    if (typed) this.untyped(name);
+    return typed || payload.outcome === "error";
   }
 
   #append(text, classes, title) {
@@ -123,6 +151,7 @@ export class Transcript {
   }
 
   op(payload) {
+    if (!this.#shows(payload)) return;
     const { text, error } = formatOp(payload);
     const ms = payload.elapsed_ms;
     this.#append(text, error ? "op error" : "op", ms === undefined ? "" : `${ms} ms`);
@@ -202,6 +231,7 @@ function jobRow(job, onStop) {
     ["source", job.source],
     ["state", status],
     ["id", job.id.slice(-6)],
+    ["events", ""],
   ];
   for (const [cls, text] of cells) {
     const span = document.createElement("span");
@@ -219,7 +249,7 @@ function jobRow(job, onStop) {
   return row;
 }
 
-export function startJobs(api, el, transcript) {
+export function startJobs(api, el, transcript, { onJobs = null } = {}) {
   let timer = null;
   let stopped = false;
   const render = (jobs) => {
@@ -243,6 +273,7 @@ export function startJobs(api, el, transcript) {
       empty.textContent = "no jobs";
       el.append(empty);
     }
+    if (onJobs) onJobs(jobs);
   };
   const refresh = async () => {
     try {

@@ -32,6 +32,11 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
         "text/javascript; charset=utf-8",
         include_bytes!("../web/waterfall.js"),
     ),
+    (
+        "overlays.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/overlays.js"),
+    ),
 ];
 
 /// The MIME type and bytes of the file at `path`; `""` is `index.html`.
@@ -70,6 +75,7 @@ mod tests {
             ("api.js", "text/javascript; charset=utf-8"),
             ("agent.js", "text/javascript; charset=utf-8"),
             ("waterfall.js", "text/javascript; charset=utf-8"),
+            ("overlays.js", "text/javascript; charset=utf-8"),
         ] {
             let (m, bytes) = asset(path).unwrap_or_else(|| panic!("{path} embedded"));
             assert_eq!(m, mime, "{path}");

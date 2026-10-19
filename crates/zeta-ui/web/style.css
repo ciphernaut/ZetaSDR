@@ -120,8 +120,27 @@ input:focus { border-color: var(--accent); }
   position: absolute; left: var(--axis-w); top: 0; width: calc(100% - var(--axis-w)); height: 100%;
 }
 #waterfall .wf-overlay { cursor: crosshair; touch-action: none; }
+/* overlays.js: labels at the left edge, ribbons entering at the right and scrolling left */
+#waterfall .ov-layer {
+  position: absolute; left: var(--axis-w); top: 0; width: calc(100% - var(--axis-w)); height: 100%;
+  overflow: hidden; pointer-events: none;
+}
+#waterfall .ov-label, #waterfall .ov-ribbon {
+  position: absolute; padding: 0 5px; border-radius: 2px; white-space: nowrap;
+  background: rgba(11, 14, 20, 0.78); border: 1px solid var(--border);
+}
+#waterfall .ov-label { left: 6px; color: var(--ok); border-color: var(--ok); }
+#waterfall .ov-ribbon {
+  max-width: 80%; overflow: hidden; text-overflow: ellipsis; color: var(--text);
+  border-left: 2px solid var(--user);
+}
+#waterfall .ov-ribbon .count { color: var(--dim); }
+#waterfall .ov-ribbon.aprs { color: var(--user); }
+#waterfall .ov-ribbon.agent {
+  white-space: normal; overflow-wrap: anywhere; color: var(--accent); border-left-color: var(--accent);
+}
 #wf-badge {
-  position: absolute; top: 8px; right: 8px; padding: 2px 8px;
+  position: absolute; top: 8px; right: 8px; padding: 2px 8px; z-index: 1;
   background: var(--bar); border: 1px solid var(--border); color: var(--user);
 }
 
@@ -161,7 +180,7 @@ input:focus { border-color: var(--accent); }
 
 .job {
   display: grid;
-  grid-template-columns: auto auto 1fr auto auto;
+  grid-template-columns: auto auto 1fr auto auto auto;
   gap: 8px;
   align-items: center;
   padding: 2px 0;
@@ -170,6 +189,7 @@ input:focus { border-color: var(--accent); }
 .job .state { color: var(--ok); }
 .job[data-state="failed"] .state { color: var(--error); }
 .job .id { color: var(--dim); }
+.job .events { color: var(--user); }
 .job button.stop { padding: 0 6px; }
 #jobs .empty { color: var(--dim); }
 

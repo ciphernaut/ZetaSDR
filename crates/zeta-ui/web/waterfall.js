@@ -15,6 +15,9 @@
 //     wf.painted    columns painted since mount (never reset; for tests)
 //     wf.onSelect(cb)   cb({centerHz, bandwidthHz, startNs, endNs}) after a drag; the same
 //         object is kept in window.zetaLastSelection.
+//     wf.onColumn(cb)   cb(shiftCssPx) after each painted column: everything painted moved
+//         left by that many CSS px (overlays.js scrolls its ribbons with it).
+//     wf.centerHz() -> the centre of the band shown (null before the band is known)
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
 //     wf.destroy()
 //
@@ -141,6 +144,7 @@ class Waterfall {
     this.el = el;
     this.api = api;
     this.selectCbs = [];
+    this.columnCbs = [];
     this.gen = 0;
     this.sub = null;
     this.src = null; // the source record being shown
@@ -342,6 +346,10 @@ class Waterfall {
     return this.canvas.clientHeight || 1;
   }
 
+  centerHz() {
+    return this.band ? (this.band.lo + this.band.hi) / 2 : null;
+  }
+
   yForHz(hz) {
     if (!this.band) return null;
     return ((this.band.hi - hz) / (this.band.hi - this.band.lo)) * this.cssHeight();
@@ -420,6 +428,15 @@ class Waterfall {
     this.ringEnd[slot] = Number(msg.end_ns) || this.ringStart[slot];
     this.columns += 1;
     this.painted += 1;
+    if (this.columnCbs.length) {
+      const dpr = this.canvas.width / (this.canvas.clientWidth || 1);
+      const shift = Math.min(this.column.width, this.canvas.width) / dpr;
+      for (const cb of this.columnCbs) cb(shift);
+    }
+  }
+
+  onColumn(cb) {
+    this.columnCbs.push(cb);
   }
 
   paintColumn(db) {

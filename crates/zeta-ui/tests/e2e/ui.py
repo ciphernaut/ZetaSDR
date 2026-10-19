@@ -9,6 +9,7 @@ Run by `cargo test -p zeta --test ui`, which starts the node with the `tone` and
 """
 
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -343,6 +344,104 @@ def scenario_selection_reports_band(page, url, secret):
     assert sel["bandwidthHz"] > 0, f"selection {sel}"
     assert 99_976_000 <= sel["centerHz"] <= 100_024_000, f"selection {sel}"
     assert sel["startNs"] <= sel["endNs"], f"selection {sel}"
+
+
+# ---- overlays and transcript (Task 8) ----------------------------------------------------
+# These run after the waterfall scenarios: they start decode jobs that the page watches (more
+# websockets), and each stops its own jobs at the end so later runs start clean.
+
+def start_job(url, secret, kind, source, center_hz, bandwidth_hz):
+    return http_json(url, secret, "/op", {"op": "job_start", "kind": kind, "source": source,
+                                          "center_hz": center_hz, "bandwidth_hz": bandwidth_hz,
+                                          "deviation_hz": None})["value"]
+
+
+def stop_job(url, secret, job):
+    try:
+        http_json(url, secret, "/op", {"op": "job_stop", "job": job})
+    except Exception:  # noqa: BLE001 - best-effort cleanup
+        pass
+
+
+def select_source(page, url, secret, source):
+    page.set_viewport_size(WIDE)
+    login(page, url, secret)
+    page.click(f'.src-tab[data-id="{source}"]')
+    expect(page.locator(f'.src-tab[data-id="{source}"]')).to_have_attribute(
+        "aria-selected", "true")
+
+
+def scenario_aprs_ribbon_appears(page, url, secret):
+    select_source(page, url, secret, "aprs")
+    job = start_job(url, secret, "aprs_decode", "aprs", 144_800_000, 12_500)
+    try:
+        page.evaluate("window.zetaTest.poll()")
+        ribbon = page.locator("#waterfall .ov-ribbon", has_text="VK3ABC")
+        expect(ribbon.first).to_be_visible(timeout=15_000)
+        expect(ribbon.first).to_contain_text("VK3ABC > APRS: >hi")
+        counter = page.locator(f'#jobs .job[data-id="{job}"] .events')
+        page.wait_for_function(
+            """(id) => {
+              const e = document.querySelector(`#jobs .job[data-id="${id}"] .events`);
+              return !!e && parseInt(e.textContent, 10) >= 1;
+            }""", arg=job, timeout=5_000)
+        expect(counter).to_be_visible()
+        if os.environ.get("ZETA_UI_SHOTS"):
+            page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "overlays.png"))
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_measure_label_appears(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_job(url, secret, "measure", "tone", 100_000_000, 10_000)
+    try:
+        page.evaluate("window.zetaTest.poll()")
+        label = page.locator("#waterfall .ov-label", has_text="carrier")
+        expect(label).to_be_visible(timeout=5_000)
+        text = label.text_content()
+        assert text.startswith("L1 carrier "), f"label text {text!r}"
+        conf = text.split()[-1]
+        assert len(conf.split(".")[-1]) == 2, f"confidence not 2 dp: {text!r}"
+        # One label per job: later events replace it.
+        page.wait_for_timeout(2_000)
+        expect(page.locator("#waterfall .ov-label")).to_have_count(1)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_narrow_answer_is_ribbon(page, url, secret):
+    page.set_viewport_size(NARROW)
+    login(page, url, secret)
+    assert footprint(page) == "narrow", f"footprint {footprint(page)!r}"
+    expect(page.locator(".src-tab").first).to_be_visible()
+    page.evaluate("window.zetaTest.ribbon('x')")
+    ribbon = page.locator("#waterfall .ov-ribbon.agent")
+    expect(ribbon).to_be_visible()
+    expect(ribbon).to_have_text("x")
+    # The drawer still carries the transcript.
+    page.click("#drawer-toggle")
+    page.fill("#cmd", '{"op":"source_list"}')
+    page.press("#cmd", "Enter")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (2 sources)")
+    expect(page.locator("#side")).to_be_visible()
+
+
+def scenario_transcript_hides_polls(page, url, secret):
+    page.set_viewport_size(WIDE)
+    login(page, url, secret)
+    expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
+    page.wait_for_timeout(5_000)
+    polls = page.locator("#transcript .line.op", has_text="job_list")
+    expect(polls).to_have_count(0)
+    page.fill("#cmd", '{"op":"job_list"}')
+    page.press("#cmd", "Enter")
+    typed = page.locator("#transcript .line.op", has_text="job_list → ok")
+    expect(typed).to_have_count(1)
+    # Later polls stay hidden and do not fold into the typed line.
+    page.wait_for_timeout(2_500)
+    expect(typed).to_have_count(1)
+    expect(typed.locator(".count")).to_have_text("")
 
 
 # ---- runner ----------------------------------------------------------------------------

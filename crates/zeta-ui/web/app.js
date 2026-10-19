@@ -16,14 +16,17 @@
 //
 // The waterfall (waterfall.js) is mounted in #waterfall at login and follows the selected
 // source (selecting the source it already shows does nothing); it is destroyed when the node
-// rejects the secret.
+// rejects the secret. The overlays (overlays.js) sit on it: each jobs poll hands them the job
+// list (they watch the selected source's running jobs), and in the narrow footprint every
+// /ask answer also becomes an `agent` ribbon at the centre of the band shown.
 //
-// Exports `state` ({api, transcript, jobs, wf, sources, selected}) and `onSourceChange(fn)` for
+// Exports `state` ({api, transcript, jobs, wf, ov, sources, selected}) and `onSourceChange(fn)` for
 // the later views (waterfall, audio, voice).
 
 import { connect, Unauthorized } from "./api.js";
 import { Transcript, startJobs, startOpsFeed } from "./agent.js";
 import { mountWaterfall } from "./waterfall.js";
+import { mountOverlays } from "./overlays.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -35,6 +38,7 @@ export const state = {
   jobs: null,
   ops: null,
   wf: null,
+  ov: null,
   sources: [],
   selected: null,
 };
@@ -209,10 +213,15 @@ async function runCommand(text) {
   const op = parseOp(text);
   t.user(text);
   if (op) {
+    // Its ops-stream record shows even when it is one of the hidden polls (ruling R5).
+    t.typed(op.op);
     try {
       await state.api.op(op);
     } catch (e) {
-      if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
+      if (notApplied(e)) {
+        t.untyped(op.op);
+        t.note(`${op.op}: ${e.message}`, true);
+      }
     }
     state.jobs?.refresh();
     return;
@@ -265,8 +274,15 @@ function start(api) {
   $("#transcript").replaceChildren();
   state.transcript = new Transcript($("#transcript"));
   state.ops = startOpsFeed(api, state.transcript);
-  state.jobs = startJobs(api, $("#jobs"), state.transcript);
   state.wf = mountWaterfall($("#waterfall"), api);
+  state.ov = mountOverlays($("#waterfall"), state.wf, api, { jobsEl: $("#jobs") });
+  state.ov.setSource(state.selected);
+  state.transcript.onAssistant((text, error) => {
+    if (!error && footprint() === "narrow") answerRibbon(text);
+  });
+  state.jobs = startJobs(api, $("#jobs"), state.transcript, {
+    onJobs: (jobs) => state.ov && state.ov.sync(jobs),
+  });
   loadSources();
 }
 
@@ -277,17 +293,29 @@ function logout(api) {
   api.onUnauthorized = null;
   if (state.ops) state.ops.close();
   if (state.jobs) state.jobs.close();
+  if (state.ov) state.ov.destroy();
   if (state.wf) state.wf.destroy();
   state.ops = null;
   state.jobs = null;
+  state.ov = null;
   state.wf = null;
   store(SECRET_KEY, null);
   showLogin("secret rejected");
 }
 
+// An `agent` ribbon at the centre of the band the waterfall shows (the middle when unknown).
+function answerRibbon(text) {
+  if (!state.ov) return null;
+  return state.ov.ribbon(state.wf ? state.wf.centerHz() : null, text, "agent");
+}
+
 // Hooks for the e2e scenarios: simulate a changed secret, force a jobs poll, and read what
-// the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall).
+// the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall), and
+// draw the narrow-footprint answer ribbon for `text` without an LLM (ruling R3).
 window.zetaTest = {
+  ribbon(text) {
+    answerRibbon(text);
+  },
   setSecret(s) {
     if (state.api) state.api.secret = s;
   },
@@ -306,6 +334,10 @@ function boot() {
   onSourceChange((src) => {
     // Re-selecting the shown source keeps its job and columns.
     if (state.wf && state.wf.sourceId !== (src ? src.id : null)) state.wf.setSource(src);
+    if (state.ov) {
+      state.ov.setSource(src ? src.id : null);
+      state.jobs?.refresh();
+    }
   });
   wireCommandLine();
   window.addEventListener("resize", applyFootprint);
