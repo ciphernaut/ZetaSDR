@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
-use zeta_core::ops::{JobKind, Op, OpResult};
+use zeta_core::ops::{AUDIO_RATE_HZ, JobKind, Op, OpResult};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::stream::Payload;
@@ -317,9 +317,10 @@ async fn fm_demod_job_on_12_khz_source() {
     let rec = node.job_list().into_iter().find(|r| r.id == id).unwrap();
     assert_eq!(rec.state, JobState::Running);
 
-    let samples = collect_audio(&node, &id, RATE as u64, RATE as usize).await;
-    // 1 200 samples: 10 Hz bins at 12 kHz.
-    let (peak, rms) = peak_and_rms(&samples[samples.len() - 1_200..], RATE as f64);
+    // Upsampled from the 12 kHz channel to 48 kHz audio.
+    let samples = collect_audio(&node, &id, AUDIO_RATE_HZ, AUDIO_RATE_HZ as usize).await;
+    // 4 800 samples: 10 Hz bins at 48 kHz.
+    let (peak, rms) = peak_and_rms(&samples[samples.len() - 4_800..], AUDIO_RATE_HZ as f64);
     eprintln!("fm_demod at 12 kHz: peak {peak} Hz, rms {rms:.4}");
     assert_eq!(peak, 1_000.0);
 }
@@ -328,7 +329,6 @@ async fn fm_demod_job_on_12_khz_source() {
 async fn fm_demod_job_at_2_048_msps() {
     const RATE: u32 = 2_048_000;
     const CENTER: u64 = 144_000_000;
-    const OUT: u64 = 51_200;
     let dir = tempfile::tempdir().unwrap();
     // 0.5 s of a 1 kHz tone (whole cycles, so the repeat is seamless) 100 kHz above centre.
     let audio = tone(48_000, 24_000, 1_000.0, 1.0);
@@ -341,9 +341,10 @@ async fn fm_demod_job_at_2_048_msps() {
     let node = node_over(dir.path(), &iq, RATE, CENTER, opts).await;
     let id = start(&node, JobKind::FmDemod, CENTER + 100_000, 12_500).await;
 
-    let samples = collect_audio(&node, &id, OUT, OUT as usize / 2).await;
-    // 5 120 samples: 10 Hz bins at 51.2 kHz.
-    let (peak, rms) = peak_and_rms(&samples[samples.len() - 5_120..], OUT as f64);
+    // Channelised at 51.2 kHz, resampled to 48 kHz audio.
+    let samples = collect_audio(&node, &id, AUDIO_RATE_HZ, AUDIO_RATE_HZ as usize / 2).await;
+    // 4 800 samples: 10 Hz bins at 48 kHz.
+    let (peak, rms) = peak_and_rms(&samples[samples.len() - 4_800..], AUDIO_RATE_HZ as f64);
     eprintln!("fm_demod at 2.048 MS/s: peak {peak} Hz, rms {rms:.4}");
     assert_eq!(peak, 1_000.0);
 }

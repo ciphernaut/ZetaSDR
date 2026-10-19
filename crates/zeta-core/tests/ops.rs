@@ -10,7 +10,7 @@ use zeta_core::classify::StubClassifier;
 use zeta_core::job::JobState;
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::node::{Node, NodeConfig};
-use zeta_core::ops::{JobKind, Op, OpError, OpResult, channel_rate_hz, schema};
+use zeta_core::ops::{AUDIO_RATE_HZ, JobKind, Op, OpError, OpResult, channel_rate_hz, schema};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{
@@ -441,7 +441,7 @@ async fn job_start_reexpands_when_lease_rate_differs() {
     let out = rec.graph.nodes[0].params["out_rate_hz"].as_u64().unwrap();
     assert_eq!(out, 50_000);
     assert_eq!(2_000_000 % out, 0);
-    assert_eq!(rec.graph.nodes[1].params["audio_rate_hz"], 50_000);
+    assert_eq!(rec.graph.nodes[1].params["audio_rate_hz"], 48_000);
     // Relaunched under the same id: no stray stopped record.
     assert_eq!(node.job_list().len(), 2);
 }
@@ -1026,7 +1026,7 @@ fn expand_uses_source_rate_for_channel_and_audio() {
     let g = JobKind::FmDemod
         .expand(&src, tuning, Hz(2_048_000), None)
         .unwrap();
-    assert_eq!(rates(&g), (51_200, 51_200));
+    assert_eq!(rates(&g), (51_200, AUDIO_RATE_HZ));
     let tuning = Tuning {
         center_hz: Hz(7_100_000),
         bandwidth_hz: Hz(10_000),
@@ -1034,12 +1034,28 @@ fn expand_uses_source_rate_for_channel_and_audio() {
     let g = JobKind::FmDemod
         .expand(&src, tuning, Hz(12_000), None)
         .unwrap();
-    assert_eq!(rates(&g), (12_000, 12_000));
+    assert_eq!(rates(&g), (12_000, AUDIO_RATE_HZ));
     let g = JobKind::AprsDecode
         .expand(&src, tuning, Hz(12_000), None)
         .unwrap();
-    assert_eq!(rates(&g), (12_000, 12_000));
+    assert_eq!(rates(&g), (12_000, AUDIO_RATE_HZ));
     assert_eq!(g.nodes[1].params["deviation_hz"], 3_000);
+}
+
+#[test]
+fn fm_demod_expansion_outputs_48k_audio() {
+    assert_eq!(AUDIO_RATE_HZ, 48_000);
+    let tuning = Tuning {
+        center_hz: Hz(98_100_000),
+        bandwidth_hz: Hz(200_000),
+    };
+    let g = JobKind::FmDemod
+        .expand(&SourceId("rtl0".into()), tuning, Hz(1_000_000), None)
+        .unwrap();
+    assert_eq!(g.nodes[0].kind, "channel");
+    assert_eq!(g.nodes[0].params["out_rate_hz"], 200_000);
+    assert_eq!(g.nodes[1].kind, "nbfm_demod");
+    assert_eq!(g.nodes[1].params["audio_rate_hz"], 48_000);
 }
 
 #[test]

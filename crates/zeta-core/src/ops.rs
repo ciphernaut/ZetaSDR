@@ -266,7 +266,7 @@ impl JobKind {
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({"deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0), "audio_rate_hz": out}),
+                            params: serde_json::json!({"deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0), "audio_rate_hz": AUDIO_RATE_HZ}),
                         },
                     ],
                     edges: vec![Edge {
@@ -293,7 +293,7 @@ impl JobKind {
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({"deviation_hz": 3_000, "audio_rate_hz": out}),
+                            params: serde_json::json!({"deviation_hz": 3_000, "audio_rate_hz": AUDIO_RATE_HZ}),
                         },
                         GraphNode {
                             id: decode.clone(),
@@ -318,6 +318,10 @@ impl JobKind {
         })
     }
 }
+
+/// The audio rate every demodulating job kind outputs; the demod stage
+/// resamples from the channel rate to this.
+pub const AUDIO_RATE_HZ: u64 = 48_000;
 
 /// The lowest channel output rate a job is channelised at.
 pub const CHANNEL_RATE_MIN_HZ: u64 = 48_000;

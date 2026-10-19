@@ -1,4 +1,4 @@
-//! NBFM demodulator stage: phase discriminator, audio low-pass and decimation.
+//! NBFM demodulator stage: phase discriminator, then resampling to the audio rate.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -13,14 +13,8 @@ use zeta_core::stage::{Backend, Stage, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, StreamId, StreamKind};
 
-use crate::util::lowpass_taps;
+use crate::resample::Resampler;
 use crate::{Input, frame_span, run_map};
-
-/// Taps of the audio low-pass filter.
-const TAPS: usize = 63;
-
-/// Audio low-pass cutoff as a fraction of the audio rate.
-const CUTOFF: f64 = 0.45;
 
 /// Phase-discriminator FM demodulation: `arg(x[n] · conj(x[n-1]))` scaled by
 /// `rate_hz / (2π · deviation_hz)`, so a tone at full deviation comes out at
@@ -49,65 +43,33 @@ pub fn nbfm_demod(
         .collect()
 }
 
-/// Streaming real low-pass at `0.45 × audio_rate` and decimation to the audio
-/// rate, carrying FIR history and decimation phase across blocks. Resets when
-/// the input or audio rate changes.
+/// Streaming resampler from the discriminator rate to the audio rate (a
+/// [`Resampler`], low-pass at `0.45 × min(in, audio)`), carrying history and
+/// phase across blocks. Rebuilt when the input or audio rate changes.
 #[derive(Debug, Default)]
 pub struct AudioFilter {
     key: Option<(u64, u64)>,
-    taps: Vec<f32>,
-    decim: usize,
-    /// Last `taps.len() - 1` input samples, oldest first.
-    history: Vec<f32>,
-    /// Index in the next block of the next sample to output.
-    next: usize,
+    resampler: Option<Resampler>,
 }
 
 impl AudioFilter {
-    /// Filter and decimate `x` at `in_rate_hz` to `audio_rate_hz`, which must
-    /// divide it by an integer >= 1.
+    /// Resample `x` at `in_rate_hz` to `audio_rate_hz`; any pair of non-zero
+    /// rates, up or down.
     pub fn process(
         &mut self,
         x: &[f32],
         in_rate_hz: u64,
         audio_rate_hz: u64,
     ) -> Result<Vec<f32>, String> {
-        if audio_rate_hz == 0
-            || audio_rate_hz > in_rate_hz
-            || !in_rate_hz.is_multiple_of(audio_rate_hz)
-        {
-            return Err(format!(
-                "audio_rate_hz {audio_rate_hz} does not divide input rate {in_rate_hz}"
-            ));
-        }
         let key = (in_rate_hz, audio_rate_hz);
         if self.key != Some(key) {
-            let taps = lowpass_taps(CUTOFF * audio_rate_hz as f64, in_rate_hz as f64, TAPS);
-            *self = AudioFilter {
-                key: Some(key),
-                history: vec![0.0; taps.len() - 1],
-                taps,
-                decim: (in_rate_hz / audio_rate_hz) as usize,
-                next: 0,
-            };
+            self.resampler = Some(Resampler::new(in_rate_hz, audio_rate_hz)?);
+            self.key = Some(key);
         }
-        let h = self.history.len();
-        let mut ext = Vec::with_capacity(h + x.len());
-        ext.extend_from_slice(&self.history);
-        ext.extend_from_slice(x);
-        let out: Vec<f32> = (self.next..x.len())
-            .step_by(self.decim)
-            .map(|n| {
-                self.taps
-                    .iter()
-                    .enumerate()
-                    .fold(0.0, |acc, (j, &t)| acc + ext[h + n - j] * t)
-            })
-            .collect();
-        // Outputs cover every index from `next` up to the block end, so this cannot underflow.
-        self.next = self.next + out.len() * self.decim - x.len();
-        self.history.copy_from_slice(&ext[ext.len() - h..]);
-        Ok(out)
+        Ok(self
+            .resampler
+            .as_mut()
+            .map_or_else(Vec::new, |r| r.process(x)))
     }
 }
 
@@ -166,6 +128,11 @@ impl Stage for NbfmDemodStage {
         if p.deviation_hz == 0 {
             return Err(StageError::Failed(
                 "nbfm_demod params: deviation_hz must be >= 1".into(),
+            ));
+        }
+        if p.audio_rate_hz == 0 {
+            return Err(StageError::Failed(
+                "nbfm_demod params: audio_rate_hz must be >= 1".into(),
             ));
         }
         let Some(out) = outputs.first().cloned() else {
@@ -268,19 +235,22 @@ mod tests {
     }
 
     #[test]
-    fn fir_decimate_real_streaming_matches_one_shot() {
-        let x = tone(96_000, 4_801, 1_000.0, 1.0);
-        let taps = crate::util::lowpass_taps(21_600.0, 96_000.0, 63);
-        let whole = crate::util::fir_decimate_real(&x, &taps, 2);
+    fn audio_filter_streaming_matches_one_shot_and_rebuilds_on_rate_change() {
+        let x = tone(200_000, 4_801, 1_000.0, 1.0);
+        let whole = Resampler::new(200_000, 48_000).unwrap().process(&x);
         let mut f = AudioFilter::default();
         let mut parts = Vec::new();
         for chunk in [&x[..1001], &x[1001..1002], &x[1002..]] {
-            parts.extend(f.process(chunk, 96_000, 48_000).unwrap());
+            parts.extend(f.process(chunk, 200_000, 48_000).unwrap());
         }
-        assert_eq!(parts.len(), whole.len());
-        for (a, b) in parts.iter().zip(&whole) {
-            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
-        }
+        assert_eq!(parts, whole);
+        // A new rate pair starts from a fresh resampler.
+        let y = f.process(&x[..960], 96_000, 48_000).unwrap();
+        assert_eq!(
+            y,
+            Resampler::new(96_000, 48_000).unwrap().process(&x[..960])
+        );
+        assert!(f.process(&x, 0, 48_000).is_err());
     }
 
     fn prov() -> Provenance {
@@ -358,14 +328,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nbfm_stage_rejects_non_integer_ratio_naming_audio_rate() {
-        let (tx, _rx, h) =
-            spawn(serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 20_000}));
-        tx.send(iq_frame(vec![Complex::new(1.0, 0.0); 480], 48_000))
+    async fn nbfm_stage_resamples_a_non_integer_ratio() {
+        let (tx, mut rx_out, h) =
+            spawn(serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000}));
+        tx.send(iq_frame(vec![Complex::new(1.0, 0.0); 2_000], 200_000))
             .unwrap();
+        let f = rx_out.recv().await.unwrap();
+        let Payload::Audio {
+            sample_rate_hz,
+            samples,
+        } = &f.payload
+        else {
+            panic!("expected an audio payload")
+        };
+        assert_eq!(*sample_rate_hz, Hz(48_000));
+        assert_eq!(samples.len(), 480);
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+    }
+
+    #[tokio::test]
+    async fn nbfm_stage_rejects_zero_audio_rate() {
+        let (_tx, _rx, h) = spawn(serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 0}));
         match h.await.unwrap() {
             Err(StageError::Failed(m)) => {
-                assert_eq!(m, "audio_rate_hz 20000 does not divide input rate 48000")
+                assert_eq!(m, "nbfm_demod params: audio_rate_hz must be >= 1")
             }
             r => panic!("expected Failed, got {r:?}"),
         }

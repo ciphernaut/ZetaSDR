@@ -227,7 +227,7 @@ pub async fn open(
 mod tests {
     use super::*;
     use zeta_core::graph::validate;
-    use zeta_core::ops::{JobKind, OpError, schema};
+    use zeta_core::ops::{AUDIO_RATE_HZ, JobKind, OpError, schema};
     use zeta_core::port::Tuning;
     use zeta_core::types::Hz;
 
@@ -272,8 +272,8 @@ mod tests {
                                     let to = g.nodes.iter().find(|m| m.id == e.to).unwrap();
                                     if to.kind == "nbfm_demod" {
                                         assert_eq!(
-                                            out % param(to, "audio_rate_hz"),
-                                            0,
+                                            param(to, "audio_rate_hz"),
+                                            AUDIO_RATE_HZ,
                                             "{kind:?} {rate} {bw}"
                                         );
                                     }

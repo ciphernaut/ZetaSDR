@@ -361,9 +361,10 @@ fn then_tail_malformed_value_is_usage_error() {
 #[test]
 fn then_tail_reports_failed_job() {
     let dir = tempfile::tempdir().unwrap();
-    // A 1 kHz source channelises at 1 kHz, too slow for the AFSK1200 decoder.
-    let iq = zeta_dsp::util::nco(1_000, 100.0, 1_000.0);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 1_000, 100_000_000);
+    // A prime source rate channelises at itself, and resampling 999 983 Hz to
+    // 48 kHz audio reduces to a ratio beyond the resampler's limit.
+    let iq = zeta_dsp::util::nco(2_000, 100.0, 999_983.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 999_983, 100_000_000);
     let src = format!("cd={}", meta.display());
     let out = zeta(
         dir.path(),
@@ -393,7 +394,7 @@ fn then_tail_reports_failed_job() {
     assert_eq!(v[0]["result"], "job");
     assert_eq!(v[1]["state"]["status"], "failed", "{v}");
     let reason = v[1]["state"]["reason"].as_str().unwrap_or_default();
-    assert!(reason.contains("too low for afsk1200"), "{v}");
+    assert!(reason.contains("beyond the 100000 limit"), "{v}");
 }
 
 #[test]

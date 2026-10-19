@@ -20,6 +20,7 @@ pub mod gpu_fft;
 pub mod identify;
 pub mod measure;
 pub mod nbfm;
+pub mod resample;
 pub mod util;
 
 #[cfg(feature = "test-fixtures")]
