@@ -236,7 +236,18 @@ async fn health(State(st): State<Shared>) -> Json<Health> {
     })
 }
 
-async fn op(State(st): State<Shared>, body: Body) -> Response {
+/// The `ops` record's `transport` for an `/op` call: `"ui"` when the
+/// `X-Zeta-Client` header names an allow-listed client, `"http"` otherwise
+/// (a caller cannot claim `"agent"` or `"local"`).
+fn op_transport(headers: &HeaderMap) -> &'static str {
+    match headers.get("x-zeta-client").map(HeaderValue::as_bytes) {
+        Some(b"ui") => "ui",
+        _ => "http",
+    }
+}
+
+async fn op(State(st): State<Shared>, headers: HeaderMap, body: Body) -> Response {
+    let transport = op_transport(&headers);
     let limit = st.limits.body_bytes;
     let Ok(bytes) = axum::body::to_bytes(body, limit).await else {
         return error_response(
@@ -261,7 +272,7 @@ async fn op(State(st): State<Shared>, body: Body) -> Response {
         Err(e) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, e),
     };
     let timeout = st.limits.op_timeout;
-    match tokio::time::timeout(timeout, st.node.apply(op)).await {
+    match tokio::time::timeout(timeout, st.node.apply_from(op, transport)).await {
         Ok(Ok(result)) => (StatusCode::OK, Json(result)).into_response(),
         Ok(Err(e)) => error_response(StatusCode::UNPROCESSABLE_ENTITY, e),
         Err(_) => error_response(

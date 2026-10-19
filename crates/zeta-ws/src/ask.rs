@@ -73,7 +73,7 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
     let schema = st.node.schema();
     let agent = match build_agent(
         llm,
-        LocalExecutor(st.node.clone()),
+        LocalExecutor::tagged(st.node.clone(), "agent"),
         &schema,
         &st.agents_md,
         max_turns,

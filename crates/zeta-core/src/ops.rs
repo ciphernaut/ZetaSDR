@@ -75,7 +75,8 @@ pub enum Op {
     },
     /// List the streams: id, kind and provenance. One is always the node's
     /// own `ops` event stream (provenance source `node`): one event per
-    /// applied operation with its outcome, logged after the operation completes.
+    /// applied operation with its outcome and caller (`transport`: `local`,
+    /// `http`, `ui` or `agent`), logged after the operation completes.
     StreamList {},
     /// Collect frames from a stream until `max_frames` (1..=1000) arrive or
     /// `timeout_ms` (1..=10000) passes, whichever is first; frames published
@@ -528,19 +529,21 @@ pub const OPS_RESULT_LIMIT_BYTES: usize = 8192;
 
 /// The `ops` stream's event payload for one applied operation:
 /// `{"op", "outcome": "ok"|"error", "result"|"error", "elapsed_ms",
-/// "transport": "local"}`; see [`Op::summary_json`] and
+/// "transport"}` where `transport` names the caller (see
+/// [`crate::node::Node::apply_from`]); see [`Op::summary_json`] and
 /// [`OpResult::summary_json`] and [`OpError::summary_json`] for large ops,
 /// results and errors.
 pub fn ops_payload(
     op: &Op,
     outcome: &Result<OpResult, OpError>,
     elapsed_ms: u64,
+    transport: &str,
 ) -> serde_json::Value {
     let op = op.summary_json();
     let mut v = serde_json::json!({
         "op": op,
         "elapsed_ms": elapsed_ms,
-        "transport": "local",
+        "transport": transport,
     });
     match outcome {
         Ok(r) => {

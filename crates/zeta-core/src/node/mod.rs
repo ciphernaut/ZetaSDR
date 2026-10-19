@@ -267,14 +267,22 @@ impl Node {
     /// Apply one operation; see [`crate::ops`]. Once it completes, success
     /// or failure, one [`crate::ops::ops_payload`] event is published on
     /// [`Node::ops_stream`] (so a tail of that stream never sees its own record).
-    /// A cancelled or dropped `apply` future logs nothing.
+    /// A cancelled or dropped `apply` future logs nothing. The record's
+    /// `transport` is `"local"`; see [`Node::apply_from`].
     pub async fn apply(&self, op: Op) -> Result<OpResult, OpError> {
+        self.apply_from(op, "local").await
+    }
+
+    /// [`Node::apply`] with the record's `transport` set to `transport`: who
+    /// asked (`"local"`, `"http"`, `"ui"`, `"agent"`), so a reader of the
+    /// `ops` stream can tell its own calls from others'.
+    pub async fn apply_from(&self, op: Op, transport: &'static str) -> Result<OpResult, OpError> {
         let logged = op.clone();
         let start_ns = now();
         let started = std::time::Instant::now();
         let outcome = crate::ops::apply(self, op).await;
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let payload = crate::ops::ops_payload(&logged, &outcome, elapsed_ms);
+        let payload = crate::ops::ops_payload(&logged, &outcome, elapsed_ms, transport);
         self.inner.bus.publish(Frame::new(
             self.ops_stream.clone(),
             node_provenance(Span {

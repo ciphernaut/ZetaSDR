@@ -443,10 +443,16 @@ def scenario_transcript_hides_polls(page, url, secret):
     page.press("#cmd", "Enter")
     typed = page.locator("#transcript .line.op", has_text="job_list → ok")
     expect(typed).to_have_count(1)
-    # Later polls stay hidden and do not fold into the typed line.
+    # Later polls stay hidden and do not fold into the typed line (the typed op's own "ui"
+    # record is hidden too: its one line comes from the /op reply).
     page.wait_for_timeout(2_500)
     expect(typed).to_have_count(1)
     expect(typed.locator(".count")).to_have_text("")
+    # Another caller's poll shows, tagged with its transport (ruling R6).
+    http_json(url, secret, "/op", {"op": "job_list"})
+    other = page.locator("#transcript .line.op", has_text="[http] job_list → ok")
+    expect(other).to_have_count(1)
+    expect(typed).to_have_count(2)
 
 
 # ---- context menu (Task 9) -----------------------------------------------------------------

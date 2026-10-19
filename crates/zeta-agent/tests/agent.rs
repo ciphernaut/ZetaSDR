@@ -129,7 +129,7 @@ async fn op_error_is_fed_back_so_model_can_correct() {
         text_response("Tuned.", "stop"),
     ])
     .await;
-    let agent = Agent::new(llm(&fake), LocalExecutor(node), cfg());
+    let agent = Agent::new(llm(&fake), LocalExecutor::new(node), cfg());
 
     let t = agent.run("tune tone to 100 MHz").await.unwrap();
     assert_eq!(t.calls.len(), 2);

@@ -12,7 +12,8 @@
 //     api.onUnauthorized = fn   called (once per 401) before a request throws Unauthorized,
 //         and when a websocket that never opened is followed by a 401 from GET /health
 //         (browsers hide the refused upgrade's status, so /health is probed)
-//     api.op(obj) -> Promise<result JSON>              POST /op; throws OpError (with .json)
+//     api.op(obj) -> Promise<result JSON>              POST /op with `X-Zeta-Client: ui` (its
+//         ops-stream record carries transport "ui"); throws OpError (with .json)
 //     api.ask(text, maxTurns = 8) -> Promise<Transcript>  POST /ask {request, max_turns};
 //         throws OpError (503 with {"error":"other","message":...} when serve has no LLM)
 //     api.stt(wav) -> Promise<{text}>   POST /stt with the WAV bytes (ArrayBuffer) as
@@ -89,8 +90,8 @@ export class Api {
   }
 
   // `body` is sent as JSON, or as is when `type` names its Content-Type.
-  async #request(method, path, body, type = null) {
-    const headers = { Authorization: "Bearer " + this.secret };
+  async #request(method, path, body, type = null, extra = {}) {
+    const headers = { Authorization: "Bearer " + this.secret, ...extra };
     if (body !== undefined) headers["Content-Type"] = type || "application/json";
     const resp = await fetch(this.base + path, {
       method,
@@ -107,7 +108,7 @@ export class Api {
   }
 
   op(obj) {
-    return this.#request("POST", "/op", obj);
+    return this.#request("POST", "/op", obj, null, { "X-Zeta-Client": "ui" });
   }
 
   ask(text, maxTurns = 8) {

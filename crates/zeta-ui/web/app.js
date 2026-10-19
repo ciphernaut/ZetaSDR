@@ -35,7 +35,7 @@
 // the later views (waterfall, audio, voice).
 
 import { connect, Unauthorized } from "./api.js";
-import { Transcript, startJobs, startOpsFeed } from "./agent.js";
+import { QUIET_OPS, Transcript, startJobs, startOpsFeed } from "./agent.js";
 import { mountWaterfall } from "./waterfall.js";
 import { mountOverlays } from "./overlays.js";
 import { mountMenu } from "./menu.js";
@@ -226,20 +226,18 @@ function notApplied(e) {
 }
 
 // Applies `op` as typed by the user (command line or context menu); its outcome reaches the
-// transcript through the ops stream. The result JSON, or null when it failed.
+// transcript through the ops stream, except a successful quiet op (job_list, stream_list,
+// source_list), whose "ui" record is hidden with the polls (ruling R6): that one is shown
+// from the /op reply. The result JSON, or null when it failed.
 async function applyOp(op) {
   const t = state.transcript;
   if (!state.api) return null;
-  // Its ops-stream record shows even when it is one of the hidden polls (ruling R5).
-  t.typed(op.op);
   let result = null;
   try {
     result = await state.api.op(op);
+    if (QUIET_OPS.has(op.op)) t.reply(op, result);
   } catch (e) {
-    if (notApplied(e)) {
-      t.untyped(op.op);
-      t.note(`${op.op}: ${e.message}`, true);
-    }
+    if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
   }
   state.jobs?.refresh();
   return result;

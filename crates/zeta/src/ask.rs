@@ -60,7 +60,15 @@ pub async fn run(
             };
             let md = agents_md::rendering();
             let schema = node.schema();
-            let code = drive(cfg, LocalExecutor(node), &schema, &md, max_turns, &request).await;
+            let code = drive(
+                cfg,
+                LocalExecutor::new(node),
+                &schema,
+                &md,
+                max_turns,
+                &request,
+            )
+            .await;
             remotes.close().await;
             code
         }

@@ -2,20 +2,20 @@
 //
 // Exports:
 //   formatOp(payload) -> {text, error}
-//       One `ops` stream payload ({op, outcome, result|error, elapsed_ms}) as a transcript
-//       line: `source_list → ok (2 sources)`,
+//       One `ops` stream payload ({op, outcome, result|error, elapsed_ms, transport}) as a
+//       transcript line: `source_list → ok (2 sources)`,
 //       `job_start kind=measure source=tone center_hz=100000000 … → job 01…`,
 //       `job_start … → out_of_range field=center_hz … suggested=…` (error: true; the
 //       corrective `suggested` value when the node offers one).
 //   class Transcript(el)
 //       .op(payload)            append formatOp(payload); a line equal to the last one is
 //                               folded into it with a ×N count. Ok outcomes of the read-only
-//                               polls (QUIET_OPS: job_list, stream_list, source_list) are
-//                               hidden unless this page typed that op: .typed(name) bumps a
-//                               per-op counter and the next frame of that op consumes one
-//                               and shows. Errors always show (ruling R5).
-//       .typed(opName)          the command line is about to apply an op of that name
-//       .untyped(opName)        it never reached the node (no frame will come): undo .typed
+//                               polls (QUIET_OPS: job_list, stream_list, source_list) whose
+//                               transport is "ui" (a UI's own calls) are hidden; errors and
+//                               other callers' records always show (ruling R6). Records from
+//                               another caller are prefixed `[agent]`, `[http]`, `[local]`.
+//       .reply(op, result)      a line for an op this page typed, from its /op reply (a
+//                               quiet op's ops-stream record is hidden)
 //       .user(text)             a request typed by the user
 //       .assistant(text, error) an answer from /ask (error: an assistant-error line)
 //       .note(text, error)      a UI line (connection state, local errors)
@@ -115,26 +115,12 @@ export class Transcript {
     this.el = el;
     this.last = null;
     this.listeners = [];
-    this.typedOps = new Map(); // op name -> typed and not yet seen on the ops stream
   }
 
-  typed(name) {
-    this.typedOps.set(name, (this.typedOps.get(name) || 0) + 1);
-  }
-
-  untyped(name) {
-    const n = this.typedOps.get(name) || 0;
-    if (n <= 1) this.typedOps.delete(name);
-    else this.typedOps.set(name, n - 1);
-  }
-
-  // Whether an ops-stream payload is shown (consumes a typed count for a quiet op).
+  // Whether an ops-stream payload is shown: everything but a UI's own successful polls.
   #shows(payload) {
     const name = payload && payload.op && payload.op.op;
-    if (!QUIET_OPS.has(name)) return true;
-    const typed = (this.typedOps.get(name) || 0) > 0;
-    if (typed) this.untyped(name);
-    return typed || payload.outcome === "error";
+    return !(QUIET_OPS.has(name) && payload.transport === "ui" && payload.outcome !== "error");
   }
 
   #append(text, classes, title) {
@@ -163,8 +149,14 @@ export class Transcript {
   op(payload) {
     if (!this.#shows(payload)) return;
     const { text, error } = formatOp(payload);
+    const who = payload.transport;
+    const prefix = who && who !== "ui" ? `[${who}] ` : "";
     const ms = payload.elapsed_ms;
-    this.#append(text, error ? "op error" : "op", ms === undefined ? "" : `${ms} ms`);
+    this.#append(prefix + text, error ? "op error" : "op", ms === undefined ? "" : `${ms} ms`);
+  }
+
+  reply(op, result) {
+    this.#append(formatOp({ op, outcome: "ok", result }).text, "op");
   }
 
   user(text) {

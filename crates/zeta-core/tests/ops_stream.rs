@@ -89,6 +89,32 @@ async fn every_apply_is_logged_with_outcome() {
 }
 
 #[tokio::test]
+async fn apply_from_tags_the_record_with_its_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let mut rx = node.bus().subscribe(&node.ops_stream()).unwrap();
+
+    node.apply_from(Op::SourceList {}, "ui").await.unwrap();
+    node.apply_from(
+        Op::JobStop {
+            job: JobId("nope".into()),
+        },
+        "agent",
+    )
+    .await
+    .unwrap_err();
+    node.apply(Op::SourceList {}).await.unwrap();
+
+    let (_, p) = next(&mut rx).await;
+    assert_eq!(p["transport"], "ui");
+    let (_, p) = next(&mut rx).await;
+    assert_eq!(p["outcome"], "error");
+    assert_eq!(p["transport"], "agent");
+    let (_, p) = next(&mut rx).await;
+    assert_eq!(p["transport"], "local");
+}
+
+#[tokio::test]
 async fn large_results_are_summarised_on_the_ops_stream() {
     let dir = tempfile::tempdir().unwrap();
     let node = open(dir.path()).await;

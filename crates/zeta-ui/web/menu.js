@@ -5,7 +5,7 @@
 // Exports:
 //   mountMenu(wf, {applyOp, ask, transcript, ov}) -> Menu
 //       Opens #ctx at the pointer after each wf.onSelect. `applyOp(op) -> Promise<result|null>`
-//       is app.js's command-line op path (marks the op as typed for ruling R5; null when it
+//       is app.js's command-line op path (shows its outcome per ruling R6; null when it
 //       failed, the failure already reported); `ask(text)` is its /ask path.
 //   Menu:
 //     menu.open(sel, x, y)  shows the menu for a waterfall selection at client (x, y)

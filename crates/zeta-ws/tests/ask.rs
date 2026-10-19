@@ -88,6 +88,7 @@ async fn ask_runs_the_agent_and_its_calls_appear_on_the_ops_stream() {
     };
     assert_eq!(p["op"]["op"], "source_list");
     assert_eq!(p["outcome"], "ok");
+    assert_eq!(p["transport"], "agent");
     ts.stop().await;
 }
 
