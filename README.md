@@ -287,15 +287,21 @@ upper-cased, other characters as `_`, so `pi-0` reads `ZETA_NODE_SECRET_PI_0`); 
 for it, so it never shows in `ps`. The source is `remote` and `push`, with the remote's
 capabilities except `max_bandwidth_hz`, which is capped at 250 kHz so that a node on WiFi ships
 narrowband by default. Append `,max_bandwidth_hz=N` (1-20000000) to widen it; the remote's own
-limit still applies, so a 48 kHz file source stays 48 kHz.
+limit still applies, so a 48 kHz file source stays 48 kHz. The cap also holds for the rate the
+remote actually ships: a remote that cannot go that low (a HackRF's minimum is 1 Msps) is stopped
+again and the tune fails `out_of_range`, saying the rate it ships and the `max_bandwidth_hz` that
+would admit it.
 
 Each tune starts a `passthrough` job on the remote source, centred and as wide as the local
 request, and subscribes to its IQ stream; layer 1 runs on the local node, the remote only
-channelises. A retune stops the previous remote job first, and the remote job holds the
-remote source's lease, so the remote's `source list` shows the `passthrough` job as a holder.
-Stopping the local job does not stop the remote one: it runs until the next tune or until the
-federating node exits. On exit (Ctrl-C on `serve`, or the end of a one-shot command) the remote
-job is stopped and the exit waits for the remote node to confirm.
+channelises. A retune to another band stops the previous remote job first (a tune to the same
+band while the stream is live reuses it), and the remote job holds the remote source's lease, so
+the remote's `source list` shows the `passthrough` job as a holder. When the last local job on
+the source stops, the remote job is stopped after a 2 s grace, so a job restarted within it
+keeps the same remote stream. On exit (Ctrl-C or SIGTERM on `serve`, so `systemctl stop` too, or
+the end of a one-shot command) the remote job is stopped and the exit waits for the remote node
+to confirm. Packets lost in transit and `lagged` notices are counted and logged to stderr at most
+every 10 s (`zeta-source-node: ID: N packets lost, M lag events`).
 
 ```bash
 A="--state-dir scratch/A --source-file tone=scratch/fx/tone.sigmf-meta"
@@ -329,16 +335,17 @@ queued, and the count goes out as `{"type":"lagged","missed":K}` before the next
 from any sender that speaks it (the packets `--source-node` receives are the same encoding).
 `ADDR` must be a LAN address (`0.0.0.0` listens on every interface). The sender sets the
 frequency and rate from its context packets, so a job's band must lie inside the band last
-announced; before the first context packet a tune waits up to 1.5 s for one. There is no
-authentication on this path: use it on a trusted LAN segment.
+announced; before the first context packet a tune waits up to 1.5 s for one. The port follows
+one sender: the stream id of the first context packet is pinned, packets of another stream id
+are dropped once data has arrived, and so is a data packet whose timestamp runs backwards (a
+duplicated or reordered datagram); both are counted. The `--source-vrt` ingest is
+unauthenticated: anyone who can reach the port can feed it, so bind a specific LAN address
+rather than `0.0.0.0`, on a trusted segment.
 
 A Raspberry Pi 5 at the antenna is the intended remote: [deploy/pi/README.md](deploy/pi/README.md)
 cross-builds `zeta` for aarch64, smoke-tests it under qemu and installs it as a systemd service
 that refuses to start without a real secret. The laptop then federates it with `--source-node`.
 
-Two caveats. A federating `serve` killed with SIGTERM (`kill PID`, `systemctl stop`) exits
-without stopping its remote `passthrough` jobs; the remote's `job list` shows them running and
-`job stop` there clears them. Stop it with Ctrl-C (SIGINT) instead. And in a two-host test
-against a USRP B210, the one-shot form (`job start ... --then-tail`) on a remote source streamed
+One caveat: in a two-host test against a USRP B210, the one-shot form (`job start ... --then-tail`) on a remote source streamed
 for 10 s but produced no events in two runs while the same job under `serve` did; on one machine
 with a file source the one-shot form works. Prefer a federating `serve` until that is resolved.
