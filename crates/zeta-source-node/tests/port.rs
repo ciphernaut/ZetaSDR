@@ -184,6 +184,22 @@ async fn retune_stops_previous_remote_job() {
 }
 
 #[tokio::test]
+async fn close_stops_remote_job_before_returning() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn(dir.path()).await;
+    let port = open_tone(&srv).await;
+    port.tune(tone_band()).await.expect("tunes");
+    port.close().await;
+    let jobs = remote_jobs(&srv).await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0].state, JobState::Stopped);
+    assert_eq!(port.current(), None);
+    port.close().await;
+    drop(port);
+    srv.stop().await;
+}
+
+#[tokio::test]
 async fn drop_stops_remote_job() {
     let dir = tempfile::tempdir().unwrap();
     let srv = spawn(dir.path()).await;

@@ -1,5 +1,7 @@
 //! End-to-end tests of the `zeta` binary.
 
+mod common;
+
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -610,6 +612,7 @@ fn soapy_without_cfg_is_explained() {
 fn node_mode_rejects_source_and_plugin_flags() {
     for flags in [
         ["--source-kiwi", "k=h:1"],
+        ["--source-node", "pi=tone@http://127.0.0.1:9"],
         ["--source-soapy", "h=driver=hackrf"],
         ["--plugin", "gain=/x"],
     ] {
@@ -699,4 +702,164 @@ async fn kiwi_password_from_env_reaches_kiwi_and_is_never_printed() {
         "{:?}",
         fake.commands()
     );
+}
+
+/// Secret of the serving node in the federation tests (16+ characters: no short-secret warning).
+const NODE_SECRET: &str = "s3cret-long-enough";
+
+/// Node B: a one-shot `zeta --source-node pi=SOURCE@URL job start … --then-tail 1,8000`
+/// with `ZETA_NODE_SECRET_PI` set; returns stdout+stderr after asserting success and
+/// that neither contains the secret or a bearer header.
+fn federated_job(dir: &Path, url: &str, remote: &str, job: &[&str]) -> Value {
+    let out = zeta_bin()
+        .env("ZETA_NODE_SECRET_PI", NODE_SECRET)
+        .arg("--state-dir")
+        .arg(dir.join("state"))
+        .arg("--source-node")
+        .arg(format!("pi={remote}@{url}"))
+        .args(["--json", "job", "start", "--source", "pi"])
+        .args(job)
+        .args(["--then-tail", "1,8000"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!all.contains(NODE_SECRET), "secret printed: {all}");
+    assert!(!all.contains("Bearer"), "bearer printed: {all}");
+    json(&out.stdout)
+}
+
+/// Poll node A's `job list` for up to 3 s until every `passthrough` job on `remote` (one
+/// per tune of the node port; a local job start tunes twice) is stopped.
+fn assert_remote_passthrough_stopped(url: &str, remote: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let out = common::zeta_remote(url, NODE_SECRET, &["job", "list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = json(&out);
+        let jobs: Vec<&Value> = v["value"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .filter(|j| j["kind"] == "passthrough" && j["source"] == remote)
+            .collect();
+        assert!(!jobs.is_empty(), "no passthrough job on {remote}: {v}");
+        if jobs.iter().all(|j| j["state"]["status"] == "stopped") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "remote passthrough job not stopped within 3 s: {v}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn measure_over_federation_labels_remote_tone_as_carrier() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let node_a = common::ServeProc::start(a.path(), NODE_SECRET);
+    let v = federated_job(
+        b.path(),
+        &node_a.url,
+        "tone",
+        &[
+            "--kind",
+            "measure",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ],
+    );
+    let frames = v[1]["value"]["frames"].as_array().expect("frames");
+    assert_eq!(frames.len(), 1, "{v}");
+    assert_eq!(frames[0]["source"], "pi");
+    assert_eq!(frames[0]["payload"]["label"]["name"], "carrier", "{v}");
+    assert_eq!(v[2]["stopped"], true);
+    assert_remote_passthrough_stopped(&node_a.url, "tone");
+}
+
+#[test]
+fn aprs_decode_over_federation_yields_the_packet() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let src = aprs_source(a.path());
+    let node_a = common::ServeProc::start_with(a.path(), NODE_SECRET, &["--source-file", &src]);
+    let v = federated_job(
+        b.path(),
+        &node_a.url,
+        "aprs",
+        &[
+            "--kind",
+            "aprs_decode",
+            "--center-hz",
+            "144800000",
+            "--bandwidth-hz",
+            "12500",
+        ],
+    );
+    let frames = v[1]["value"]["frames"].as_array().expect("frames");
+    assert_eq!(frames.len(), 1, "{v}");
+    assert_eq!(frames[0]["source"], "pi");
+    assert_eq!(frames[0]["payload"]["src"], "VK3ABC", "{v}");
+    assert_remote_passthrough_stopped(&node_a.url, "aprs");
+}
+
+#[test]
+fn source_node_without_secret_is_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    for empty in [None, Some("")] {
+        let mut cmd = zeta_bin();
+        cmd.env_remove("ZETA_NODE_SECRET_PI");
+        if let Some(v) = empty {
+            cmd.env("ZETA_NODE_SECRET_PI", v);
+        }
+        cmd.arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .args([
+                "--source-node",
+                "pi=tone@http://127.0.0.1:9",
+                "source",
+                "list",
+            ])
+            .assert()
+            .code(1)
+            .stderr(contains("--source-node pi: set ZETA_NODE_SECRET_PI"));
+    }
+}
+
+#[test]
+fn source_node_bad_flag_is_usage_error_naming_the_part() {
+    zeta_bin()
+        .env("ZETA_NODE_SECRET_PI", NODE_SECRET)
+        .args(["--source-node", "pi=tone@https://h:1", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("http://"))
+        .stderr(contains("ID=SOURCE@URL[,max_bandwidth_hz=N]"));
+}
+
+#[test]
+fn source_node_is_rejected_with_node() {
+    zeta_bin()
+        .env("ZETA_NODE_SECRET_PI", NODE_SECRET)
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
+        .args([
+            "--source-node",
+            "pi=tone@http://127.0.0.1:9",
+            "source",
+            "list",
+        ])
+        .assert()
+        .code(1)
+        .stderr(contains("configured on the serving node"));
 }

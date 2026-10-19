@@ -3684,6 +3684,7 @@ dependencies = [
  "zeta-plugin",
  "zeta-source-file",
  "zeta-source-kiwi",
+ "zeta-source-node",
  "zeta-source-soapy-driver",
  "zeta-ws",
 ]

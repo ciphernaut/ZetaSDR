@@ -138,6 +138,15 @@ impl NodePort {
     }
 
     /// Stop the pump, then the remote job; a failed `job_stop` is logged.
+    /// Stop the remote job now and wait for the remote node to confirm, instead of the
+    /// best-effort stop that `Drop` spawns (which a runtime shutting down never runs).
+    /// The port stays usable: the next `tune` starts a new remote job.
+    pub async fn close(&self) {
+        let _gate = self.gate.lock().await;
+        self.stop_live().await;
+        *self.shared.current.lock().unwrap() = None;
+    }
+
     async fn stop_live(&self) {
         let live = self.live.lock().unwrap().take();
         let Some(Live { job, pump }) = live else {

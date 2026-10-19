@@ -83,24 +83,38 @@ async fn main() -> ExitCode {
         Some(_) => None,
     };
     // Only `serve` (op `None`) resumes jobs; a one-shot never launches or fails them.
-    let node = match node_setup::open(state_dir, &sources, &plugins, op.is_none()).await {
+    let (node, remotes) = match node_setup::open(state_dir, &sources, &plugins, op.is_none()).await
+    {
         Ok(n) => n,
         Err(e) => return fail(&e),
     };
     for name in node.load_errors() {
         eprintln!("zeta: warning: unreadable job record {name}");
     }
-    let Some(op) = op else {
-        return transport::serve(node, &serve_args, secret.as_deref()).await;
+    let code = match op {
+        None => transport::serve(node, &serve_args, secret.as_deref()).await,
+        Some(op) => one_shot(&node, op, then_tail, keep).await,
     };
+    // Remote nodes' `passthrough` jobs end with this process, not with the runtime.
+    remotes.close().await;
+    code
+}
+
+/// Apply `op` on the local node and print its result (or tail the job it starts).
+async fn one_shot(
+    node: &zeta_core::node::Node,
+    op: Op,
+    then_tail: Option<cli::ThenTail>,
+    keep: bool,
+) -> ExitCode {
     let starts_job = matches!(op, Op::JobStart { .. });
     if let Op::IqRead { selection } | Op::Classify { selection } = &op {
-        wait_for_ring(&node, selection).await;
+        wait_for_ring(node, selection).await;
     }
     match node.apply(op).await {
         Ok(zeta_core::ops::OpResult::Job(id)) if then_tail.is_some() => {
             let t = then_tail.expect("checked");
-            then_tail_job(&node, id, t, keep).await
+            then_tail_job(node, id, t, keep).await
         }
         Ok(r) => {
             if starts_job {

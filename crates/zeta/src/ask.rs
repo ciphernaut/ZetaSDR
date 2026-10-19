@@ -52,13 +52,15 @@ pub async fn run(
                     "zeta serve (pid {pid}) owns this state dir; use --node"
                 ));
             }
-            let node = match node_setup::open(state_dir, sources, plugins, false).await {
-                Ok(n) => Arc::new(n),
+            let (node, remotes) = match node_setup::open(state_dir, sources, plugins, false).await {
+                Ok((n, r)) => (Arc::new(n), r),
                 Err(e) => return fail(&e),
             };
             let md = agents_md::rendering();
             let schema = node.schema();
-            drive(cfg, LocalExecutor(node), &schema, &md, max_turns, &request).await
+            let code = drive(cfg, LocalExecutor(node), &schema, &md, max_turns, &request).await;
+            remotes.close().await;
+            code
         }
     }
 }

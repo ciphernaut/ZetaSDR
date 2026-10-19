@@ -17,6 +17,7 @@ zeta-dsp = { path = "../zeta-dsp" }
 zeta-source-file = { version = "0.1.0", path = "../zeta-source-file" }
 zeta-agent = { path = "../zeta-agent" }
 zeta-source-kiwi = { path = "../zeta-source-kiwi" }
+zeta-source-node = { path = "../zeta-source-node" }
 zeta-plugin = { path = "../zeta-plugin" }
 
 # The real SoapySDR driver links libSoapySDR (needs libsoapysdr-dev), so it is

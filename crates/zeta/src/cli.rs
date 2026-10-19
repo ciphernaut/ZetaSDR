@@ -35,10 +35,22 @@ pub struct Cli {
         value_name = "ID=HOST:PORT[/PASSWORD]"
     )]
     source_kiwi: Vec<String>,
+    /// Use source SOURCE of the ZetaSDR node at URL (http://HOST:PORT) as source <ID>
+    /// (repeatable). Its secret comes from ZETA_NODE_SECRET_<ID> (ID upper-cased, other
+    /// characters as `_`) and is never printed. Requests are capped at 250000 Hz wide
+    /// unless max_bandwidth_hz=N (1-20000000) widens it
+    #[arg(
+        long = "source-node",
+        global = true,
+        value_name = "ID=SOURCE@URL[,max_bandwidth_hz=N]",
+        value_parser = sources::parse_node
+    )]
+    source_node: Vec<SourceSpec>,
     /// Register the program at absolute PATH as stage kind KIND (repeatable); probed at startup
     #[arg(long = "plugin", global = true, value_name = "KIND=PATH", value_parser = sources::parse_plugin)]
     pub plugins: Vec<PluginSpec>,
-    /// Every source flag parsed, file then soapy then kiwi (filled by `try_parse_checked`).
+    /// Every source flag parsed, file then soapy then kiwi then node (filled by
+    /// `try_parse_checked`).
     #[arg(skip)]
     sources: Vec<SourceSpec>,
     /// Machine-readable JSON output (the default when stdout is not a terminal;
@@ -64,8 +76,9 @@ pub struct Cli {
 
 impl Cli {
     /// Parse the command line, then check the source and plugin flags: `--source-kiwi`
-    /// values are parsed here (so clap never echoes a password), and a source id or a
-    /// plugin kind given twice is refused.
+    /// values are parsed here (so clap never echoes a password), each `--source-node`
+    /// needs its `ZETA_NODE_SECRET_<ID>` (unless `--node` rejects the flag anyway), and a
+    /// source id or a plugin kind given twice is refused.
     pub fn try_parse_checked() -> Result<Self, clap::Error> {
         Self::try_parse()?.checked()
     }
@@ -81,6 +94,14 @@ impl Cli {
                 Ok(s) => sources.push(s),
                 Err(e) => return err(ErrorKind::ValueValidation, format!("--source-kiwi: {e}")),
             }
+        }
+        for spec in std::mem::take(&mut self.source_node) {
+            if self.node.is_none()
+                && let Err(e) = sources::node_secret(spec.id())
+            {
+                return err(ErrorKind::MissingRequiredArgument, e);
+            }
+            sources.push(spec);
         }
         let mut ids = std::collections::HashSet::new();
         for s in &sources {
@@ -107,7 +128,7 @@ impl Cli {
     }
 
     /// The sources to attach: `--source-file`, then `--source-soapy`, then `--source-kiwi`,
-    /// each in flag order.
+    /// then `--source-node`, each in flag order.
     pub fn sources(&self) -> Vec<SourceSpec> {
         self.sources.clone()
     }
