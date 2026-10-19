@@ -1,5 +1,5 @@
 //! Synthetic signal generators for tests: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 /
-//! APRS, POCSAG, AWGN.
+//! APRS, POCSAG, RDS, AWGN.
 //! Behind feature `test-fixtures`.
 
 use std::f64::consts::PI;
@@ -63,6 +63,17 @@ pub fn wfm_modulate(
     let p = tone(audio_rate_hz, audio.len(), 19_000.0, 0.1);
     let mixed: Vec<f32> = audio.iter().zip(&p).map(|(a, b)| a + b).collect();
     nbfm_modulate(&mixed, audio_rate_hz, iq_rate_hz, deviation_hz, offset_hz)
+}
+
+/// FM of a ready-made broadcast `composite` (nominally within ±1) already at
+/// the IQ rate: [`nbfm_modulate`] at equal rates and no offset, so no
+/// resampling and no further filtering. The modulator [`wfm_modulate`] uses.
+pub fn wfm_modulate_composite(
+    composite: &[f32],
+    rate_hz: u32,
+    deviation_hz: f64,
+) -> Vec<Complex<f32>> {
+    nbfm_modulate(composite, rate_hz, rate_hz, deviation_hz, 0.0)
 }
 
 /// `audio` resampled from `audio_rate_hz` to `iq_rate_hz` by linear
@@ -467,4 +478,99 @@ pub fn pocsag_packet_iq(
     audio.extend(pocsag_modulate(&bits, baud, AUDIO_RATE));
     audio.extend_from_slice(&silence);
     nbfm_modulate(&audio, AUDIO_RATE, iq_rate_hz, 4_500.0, offset_hz)
+}
+
+/// One RDS block: `data` then its 10-bit check word with `offset` added,
+/// MSB first, as 26 bits.
+fn rds_block_bits(out: &mut Vec<u8>, data: u16, offset: crate::rds::Offset) {
+    let block = ((data as u32) << 10) | crate::rds::checkword(data, offset) as u32;
+    out.extend((0..26).rev().map(|i| ((block >> i) & 1) as u8));
+}
+
+/// RDS bit stream for a station: 4 type 0A groups (PS, PTY 10, TP set, no
+/// alternative frequencies) then 16 type 2A groups (radio text padded with
+/// spaces to 64, A/B flag 0), each block data plus check word with its offset
+/// (A, B, C, D), the 20 groups repeated 3 times; then differential-encoded
+/// (`tx = bit ^ prev_tx`, from 0). One `u8` per bit, 3 × 20 × 104 of them.
+/// `ps` and `rt` are space-padded or cut to 8 and 64 bytes.
+pub fn rds_group_bits(pi: u16, ps: &str, rt: &str) -> Vec<u8> {
+    use crate::rds::Offset;
+    const HEAD: u16 = (1 << 10) | (10 << 5); // TP, PTY 10
+    let ps = format!("{ps:<8}").into_bytes();
+    let rt = format!("{rt:<64}").into_bytes();
+    let mut groups: Vec<[u16; 4]> = Vec::with_capacity(20);
+    for seg in 0..4u16 {
+        let d = u16::from_be_bytes([ps[2 * seg as usize], ps[2 * seg as usize + 1]]);
+        groups.push([pi, HEAD | seg, 0xE0E0, d]);
+    }
+    for seg in 0..16u16 {
+        let c = &rt[4 * seg as usize..4 * seg as usize + 4];
+        groups.push([
+            pi,
+            (2 << 12) | HEAD | seg,
+            u16::from_be_bytes([c[0], c[1]]),
+            u16::from_be_bytes([c[2], c[3]]),
+        ]);
+    }
+    let mut bits = Vec::with_capacity(3 * 20 * 104);
+    for _ in 0..3 {
+        for g in &groups {
+            for (&w, o) in g.iter().zip([Offset::A, Offset::B, Offset::C, Offset::D]) {
+                rds_block_bits(&mut bits, w, o);
+            }
+        }
+    }
+    let mut prev = 0u8;
+    for b in bits.iter_mut() {
+        prev ^= *b;
+        *b = prev;
+    }
+    bits
+}
+
+/// Samples [`rds_composite`] makes for `n_bits` at `rate_hz`.
+fn rds_composite_len(n_bits: usize, rate_hz: u32) -> usize {
+    (n_bits as f64 * rate_hz as f64 / crate::rds::BAUD).ceil() as usize
+}
+
+/// Broadcast FM composite at `rate_hz` carrying RDS: `0.6 * audio[n]` (0 past
+/// its end) + a 19 kHz pilot `0.09 sin(theta)` + RDS at 0.03 on the carrier
+/// `sin(3 theta)`, 57 kHz phase-locked to the pilot. Each entry of `bits` is
+/// one biphase symbol at 1187.5 Bd: `+h -h` for 1, `-h +h` for 0, `h` a
+/// raised-cosine half-symbol (`sin^2` over its half, peak 1). The output covers
+/// the symbols exactly: `ceil(bits.len() * rate_hz / 1187.5)` samples.
+pub fn rds_composite(bits: &[u8], rate_hz: u32, audio: &[f32]) -> Vec<f32> {
+    use crate::rds::{BAUD, PILOT_HZ};
+    let len = rds_composite_len(bits.len(), rate_hz);
+    let sym_step = BAUD / rate_hz as f64;
+    let pilot_step = PILOT_HZ / rate_hz as f64;
+    (0..len)
+        .map(|n| {
+            let s = n as f64 * sym_step;
+            let k = (s as usize).min(bits.len().saturating_sub(1));
+            let u = (s - k as f64).clamp(0.0, 1.0);
+            let first = u < 0.5;
+            let h = (PI * (2.0 * u).fract()).sin().powi(2);
+            let bit = bits.get(k).copied().unwrap_or(0) != 0;
+            let level = if bit == first { h } else { -h };
+            let theta = 2.0 * PI * (n as f64 * pilot_step).fract();
+            let a = audio.get(n).copied().unwrap_or(0.0) as f64;
+            (0.6 * a + 0.09 * theta.sin() + 0.03 * level * (3.0 * theta).sin()) as f32
+        })
+        .collect()
+}
+
+/// A complete RDS station as complex baseband at `iq_rate_hz`:
+/// [`rds_group_bits`] → [`rds_composite`] with a 1 kHz unit tone as audio →
+/// [`wfm_modulate_composite`] at 75 kHz deviation, carrier at centre.
+pub fn rds_station_iq(pi: u16, ps: &str, rt: &str, iq_rate_hz: u32) -> Vec<Complex<f32>> {
+    let bits = rds_group_bits(pi, ps, rt);
+    let audio = tone(
+        iq_rate_hz,
+        rds_composite_len(bits.len(), iq_rate_hz),
+        1_000.0,
+        1.0,
+    );
+    let composite = rds_composite(&bits, iq_rate_hz, &audio);
+    wfm_modulate_composite(&composite, iq_rate_hz, 75_000.0)
 }

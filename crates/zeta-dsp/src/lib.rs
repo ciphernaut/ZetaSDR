@@ -25,6 +25,7 @@ pub mod measure;
 pub mod nbfm;
 pub mod pfb;
 pub mod pocsag;
+pub mod rds;
 pub mod resample;
 pub mod util;
 pub mod wfm;
