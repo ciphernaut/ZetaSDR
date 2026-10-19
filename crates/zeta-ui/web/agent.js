@@ -1,12 +1,15 @@
 // agent.js: the transcript pane and the jobs list.
 //
 // Exports:
+//   AUDIO_KINDS                 job kinds with an audio stream (their rows get ▶)
 //   formatOp(payload) -> {text, error}
 //       One `ops` stream payload ({op, outcome, result|error, elapsed_ms, transport}) as a
 //       transcript line: `source_list → ok (2 sources)`,
 //       `job_start kind=measure source=tone center_hz=100000000 … → job 01…`,
 //       `job_start … → out_of_range field=center_hz … suggested=…` (error: true; the
-//       corrective `suggested` value when the node offers one).
+//       corrective `suggested` value when the node offers one),
+//       `classify … → ok (2 labels: L1 wfm 0.90, L2 FM Broadcast Radio 1.00)` (every label,
+//       layer 1 and layer 2, as `L<layer> <name> <confidence, 2 dp>`).
 //   class Transcript(el)
 //       .op(payload)            append formatOp(payload); a line equal to the last one is
 //                               folded into it with a ×N count. Ok outcomes of the read-only
@@ -28,13 +31,14 @@
 //                                                                         redraw}
 //       Polls `job_list` every 2 s and renders the jobs that are not stopped: kind, source,
 //       state, id, an `.events` cell (filled by overlays.js: a count, or `—` over its
-//       watch cap), on `fm_demod` rows a
+//       watch cap), on rows of an AUDIO_KINDS kind a
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job), a
 //       `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 
 export const JOBS_POLL_MS = 2000;
+export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"];
 export const QUIET_OPS = new Set(["job_list", "stream_list", "source_list"]);
 const MAX_LINES = 500;
 
@@ -43,7 +47,7 @@ function scalar(v) {
 }
 
 // The node serialises op fields alphabetically; these lead, in this order, then the rest.
-const LEADING = ["kind", "source", "job", "stream", "center_hz", "bandwidth_hz", "deviation_hz"];
+const LEADING = ["kind", "source", "job", "stream", "center_hz", "bandwidth_hz", "deviation_hz", "sideband"];
 
 function opText(op) {
   if (!op || typeof op !== "object") return String(op);
@@ -64,6 +68,13 @@ function plural(n, word) {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
+// `L<layer> <name> <confidence, 2 dp>`, as the overlay labels read.
+function labelText(l) {
+  if (!l || typeof l !== "object") return String(l);
+  const conf = typeof l.confidence === "number" ? ` ${l.confidence.toFixed(2)}` : "";
+  return `L${l.layer ?? "?"} ${l.name ?? "?"}${conf}`;
+}
+
 function resultText(r) {
   if (!r || typeof r !== "object") return "ok";
   if (r.truncated) return `ok (${r.result}, ${r.bytes} bytes)`;
@@ -81,8 +92,11 @@ function resultText(r) {
       return `ok (${plural(v.length, "stream")})`;
     case "frames":
       return `ok (${plural((v && v.frames ? v.frames.length : 0), "frame")})`;
-    case "labels":
-      return `ok (${plural(Array.isArray(v) ? v.length : 0, "label")})`;
+    case "labels": {
+      const labels = Array.isArray(v) ? v : [];
+      const names = labels.map(labelText).join(", ");
+      return `ok (${plural(labels.length, "label")}${names ? `: ${names}` : ""})`;
+    }
     case "iq":
       return `ok (${plural(v && v.samples ? v.samples : 0, "sample")})`;
     default:
@@ -245,7 +259,7 @@ function jobRow(job, onStop, { onPlay, onGraph, playing }) {
   if (job.state && job.state.reason) row.title = job.state.reason;
   const actions = document.createElement("span");
   actions.className = "actions";
-  if (job.kind === "fm_demod" && onPlay) {
+  if (AUDIO_KINDS.includes(job.kind) && onPlay) {
     const on = playing ? playing(job.id) : false;
     const play = document.createElement("button");
     play.className = "play";

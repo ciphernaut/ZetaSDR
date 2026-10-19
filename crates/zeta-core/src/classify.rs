@@ -61,11 +61,13 @@ impl Band {
 pub trait Classifier: Send + Sync {
     fn name(&self) -> &str;
     fn layer(&self) -> u8;
-    /// Labels for `band` of `iq`, a block sampled at `sample_rate_hz`.
+    /// Labels for `band` of `iq`, a block sampled at `sample_rate_hz` whose
+    /// RF centre is `center_hz`.
     async fn classify(
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
+        center_hz: Hz,
         band: Band,
         features: Option<&FeatureRecord>,
     ) -> Vec<Label>;
@@ -86,6 +88,7 @@ impl Classifier for StubClassifier {
         &self,
         _iq: &[Complex<f32>],
         _sample_rate_hz: Hz,
+        _center_hz: Hz,
         _band: Band,
         _features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
@@ -103,12 +106,13 @@ impl ClassifierSet {
         self.classifiers.push(c);
     }
 
-    /// Every classifier's labels for `band` of `iq`, lowest layer first;
-    /// registration order within a layer.
+    /// Every classifier's labels for `band` of `iq` (a block centred at
+    /// `center_hz`), lowest layer first; registration order within a layer.
     pub async fn run_all(
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
+        center_hz: Hz,
         band: Band,
         features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
@@ -116,7 +120,10 @@ impl ClassifierSet {
         ordered.sort_by_key(|c| c.layer());
         let mut labels = Vec::new();
         for c in ordered {
-            labels.extend(c.classify(iq, sample_rate_hz, band, features).await);
+            labels.extend(
+                c.classify(iq, sample_rate_hz, center_hz, band, features)
+                    .await,
+            );
         }
         labels
     }
@@ -125,8 +132,14 @@ impl ClassifierSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    struct Fixed(u8, &'static str);
+    /// Labels `layer`/`name` and records the centre each call was given.
+    struct Fixed(u8, &'static str, Mutex<Vec<Hz>>);
+
+    fn fixed(layer: u8, name: &'static str) -> Fixed {
+        Fixed(layer, name, Mutex::new(Vec::new()))
+    }
 
     #[async_trait]
     impl Classifier for Fixed {
@@ -140,9 +153,11 @@ mod tests {
             &self,
             _: &[Complex<f32>],
             _: Hz,
+            center_hz: Hz,
             _: Band,
             _: Option<&FeatureRecord>,
         ) -> Vec<Label> {
+            self.2.lock().unwrap().push(center_hz);
             vec![Label {
                 layer: self.0,
                 name: self.1.into(),
@@ -155,16 +170,34 @@ mod tests {
     #[tokio::test]
     async fn run_all_orders_by_layer() {
         let mut set = ClassifierSet::default();
-        set.register(Arc::new(Fixed(3, "c")));
-        set.register(Arc::new(Fixed(1, "a")));
+        set.register(Arc::new(fixed(3, "c")));
+        set.register(Arc::new(fixed(1, "a")));
         set.register(Arc::new(StubClassifier));
-        set.register(Arc::new(Fixed(2, "b")));
+        set.register(Arc::new(fixed(2, "b")));
         let names: Vec<String> = set
-            .run_all(&[], Hz(48_000), Band::whole(Hz(48_000)), None)
+            .run_all(&[], Hz(48_000), Hz(0), Band::whole(Hz(48_000)), None)
             .await
             .into_iter()
             .map(|l| l.name)
             .collect();
         assert_eq!(names, ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn run_all_forwards_center_hz() {
+        let (a, b) = (Arc::new(fixed(1, "a")), Arc::new(fixed(2, "b")));
+        let mut set = ClassifierSet::default();
+        set.register(a.clone());
+        set.register(b.clone());
+        set.run_all(
+            &[],
+            Hz(48_000),
+            Hz(104_900_000),
+            Band::whole(Hz(48_000)),
+            None,
+        )
+        .await;
+        assert_eq!(*a.2.lock().unwrap(), [Hz(104_900_000)]);
+        assert_eq!(*b.2.lock().unwrap(), [Hz(104_900_000)]);
     }
 }

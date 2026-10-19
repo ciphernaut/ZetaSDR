@@ -38,8 +38,10 @@
 //         ×N count instead of drawn again; a different one overlapping it is moved below.
 //         At most MAX_RIBBONS are kept: the oldest goes first.
 //     ov.label(hz, {layer, name, confidence, evidence}, key = "") -> element
-//         "L<layer> <name> <confidence, 2 dp>" at the left edge at wf.yForHz(hz); one label
-//         per key (a job id), replaced on each call. `evidence` becomes its tooltip.
+//         "L<layer> <name> <confidence, 2 dp>" at the left edge at wf.yForHz(hz); a layer-2
+//         label one line (its height + LABEL_GAP_PX) lower, so it stacks under the layer-1
+//         label drawn at the same hz. One label per key (a job id, a classification slot),
+//         replaced on each call. `evidence` becomes its tooltip; `data-layer` the layer.
 //     ov.unlabel(key)        removes the label drawn under `key`, if any
 //     ov.jobRow(job, counter)  shows `counter` (when > 0, or the string `—` for a job over
 //                            the cap) in that job's row `.events` cell
@@ -51,6 +53,7 @@ export const MAX_WATCHED = 4;
 export const MAX_RIBBONS = 200;
 const EXPIRE_EVERY_MS = 1000;
 const RIBBON_GAP_PX = 2;
+const LABEL_GAP_PX = 2;
 const MAX_LANES = 8;
 
 export function mountOverlays(el, wf, api, opts = {}) {
@@ -306,7 +309,8 @@ class Overlays {
     l.el.title = evidence ? String(evidence) : "";
     l.el.dataset.layer = String(layer);
     l.h = l.el.offsetHeight;
-    l.el.style.top = `${this.yFor(hz) - l.h / 2}px`;
+    l.dy = layer === 2 ? l.h + LABEL_GAP_PX : 0;
+    l.el.style.top = `${this.yFor(hz) - l.h / 2 + l.dy}px`;
     return l.el;
   }
 
@@ -323,7 +327,9 @@ class Overlays {
       r.top = this.yFor(r.hz) - r.h / 2 + r.dy;
       r.el.style.top = `${r.top}px`;
     }
-    for (const l of this.labels.values()) l.el.style.top = `${this.yFor(l.hz) - l.h / 2}px`;
+    for (const l of this.labels.values()) {
+      l.el.style.top = `${this.yFor(l.hz) - l.h / 2 + (l.dy || 0)}px`;
+    }
   }
 
   scroll(shift) {

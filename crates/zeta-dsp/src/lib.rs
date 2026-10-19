@@ -11,8 +11,10 @@ use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{Span, Timestamp};
 
 pub mod afsk;
+pub mod am;
 pub mod aprs;
 pub mod ax25;
+pub mod catalogue;
 pub mod channel;
 pub mod fft;
 #[cfg(feature = "gpu")]
@@ -20,7 +22,9 @@ pub mod gpu_fft;
 pub mod identify;
 pub mod measure;
 pub mod nbfm;
+pub mod resample;
 pub mod util;
+pub mod wfm;
 
 #[cfg(feature = "test-fixtures")]
 pub mod fixtures;
@@ -36,6 +40,9 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
         reg.register(Arc::new(fft::FftStage::new(Arc::new(gpu))));
     }
     reg.register(Arc::new(nbfm::NbfmDemodStage::new()));
+    reg.register(Arc::new(wfm::WfmDemodStage::new()));
+    reg.register(Arc::new(am::AmDemodStage::new()));
+    reg.register(Arc::new(am::SsbDemodStage::new()));
     reg.register(Arc::new(aprs::AprsDecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
 }
@@ -58,6 +65,7 @@ pub fn classifiers() -> Vec<Arc<dyn Classifier>> {
     vec![
         Arc::new(measure::Layer1Classifier),
         Arc::new(identify::DecodeToIdentify),
+        Arc::new(catalogue::CatalogueClassifier),
     ]
 }
 

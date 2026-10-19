@@ -173,6 +173,7 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
             center_hz: Hz(100_000_000),
             bandwidth_hz: Hz(48_000),
             deviation_hz: None,
+            sideband: None,
         })
         .await
         .unwrap()

@@ -8,3 +8,10 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+
+# The e2e and DSP tests run debug builds; unoptimised FFTs dominate their time.
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.dev.package.num-complex]
+opt-level = 3

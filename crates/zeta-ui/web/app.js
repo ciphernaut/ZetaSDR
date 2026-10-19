@@ -24,9 +24,9 @@
 // A drag on the waterfall opens the context menu (menu.js), whose entries go through the same
 // op and /ask paths as the command line.
 //
-// Job rows: ▶ on an `fm_demod` row plays its audio (audio.js; one job at a time, ■ stops it,
-// and it stops when the job leaves the running list or the secret is rejected); `graph` opens
-// the job's graph view (graph.js).
+// Job rows: ▶ on a row of an audio kind (agent.js AUDIO_KINDS) plays its audio (audio.js; one
+// job at a time, ■ stops it, and it stops when the job leaves the running list or the secret
+// is rejected); `graph` opens the job's graph view (graph.js).
 //
 // The mic button (#mic, voice.js) is mounted at login: its transcript is put in the command
 // line and submitted as if typed (so free text goes to /ask); #mic-status beside it shows

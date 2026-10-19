@@ -361,9 +361,10 @@ fn then_tail_malformed_value_is_usage_error() {
 #[test]
 fn then_tail_reports_failed_job() {
     let dir = tempfile::tempdir().unwrap();
-    // A 1 kHz source channelises at 1 kHz, too slow for the AFSK1200 decoder.
-    let iq = zeta_dsp::util::nco(1_000, 100.0, 1_000.0);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 1_000, 100_000_000);
+    // A prime source rate channelises at itself, and resampling 999 983 Hz to
+    // 48 kHz audio reduces to a ratio beyond the resampler's limit.
+    let iq = zeta_dsp::util::nco(2_000, 100.0, 999_983.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 999_983, 100_000_000);
     let src = format!("cd={}", meta.display());
     let out = zeta(
         dir.path(),
@@ -393,7 +394,7 @@ fn then_tail_reports_failed_job() {
     assert_eq!(v[0]["result"], "job");
     assert_eq!(v[1]["state"]["status"], "failed", "{v}");
     let reason = v[1]["state"]["reason"].as_str().unwrap_or_default();
-    assert!(reason.contains("too low for afsk1200"), "{v}");
+    assert!(reason.contains("beyond the 100000 limit"), "{v}");
 }
 
 #[test]
@@ -1054,4 +1055,201 @@ fn serve_warns_when_llm_flags_are_given_without_listen() {
     ];
     let seen = serve_banner(dir.path(), &[], &env);
     assert!(!seen.contains("ignored without --listen"), "{seen}");
+}
+
+#[test]
+fn wfm_demod_job_streams_48k_audio_from_a_wfm_fixture() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = zeta_dsp::fixtures::tone(48_000, 48_000, 1_000.0, 0.5);
+    let iq = zeta_dsp::fixtures::wfm_modulate(&audio, 48_000, 240_000, 75_000.0, 0.0, true);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "wfm", &iq, 240_000, 104_900_000);
+    let src = format!("wfm={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "wfm_demod",
+            "--source",
+            "wfm",
+            "--center-hz",
+            "104900000",
+            "--bandwidth-hz",
+            "200000",
+            "--then-tail",
+            "3,8000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v[0]["result"], "job", "{v}");
+    assert_eq!(v[1]["result"], "frames", "{v}");
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 3, "{v}");
+    for f in frames {
+        assert_eq!(f["kind"], "audio", "{f}");
+        assert_eq!(f["payload"]["sample_rate_hz"], 48_000, "{f}");
+        let peak = f["payload"]["peak"].as_f64().unwrap();
+        assert!(peak > 0.05 && peak <= 1.0, "peak {peak}");
+    }
+}
+
+#[test]
+fn classify_names_the_wfm_fixture_fm_broadcast_radio() {
+    // The wfm_demod fixture: 1 s of 240 kHz broadcast FM with pilot at 104.9 MHz.
+    let dir = tempfile::tempdir().unwrap();
+    let audio = zeta_dsp::fixtures::tone(48_000, 48_000, 1_000.0, 0.5);
+    let iq = zeta_dsp::fixtures::wfm_modulate(&audio, 48_000, 240_000, 75_000.0, 0.0, true);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "wfm", &iq, 240_000, 104_900_000);
+    let src = format!("wfm={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "classify",
+            "--source",
+            "wfm",
+            "--start-ns",
+            "0",
+            "--end-ns",
+            "500000000",
+            "--center-hz",
+            "104900000",
+            "--bandwidth-hz",
+            "240000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "labels", "{v}");
+    let labels = v["value"].as_array().expect("labels array");
+    assert!(
+        labels
+            .iter()
+            .any(|l| l["layer"] == 2 && l["name"] == "FM Broadcast Radio"),
+        "{v}"
+    );
+}
+
+#[test]
+fn am_demod_job_streams_48k_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = zeta_dsp::fixtures::tone(48_000, 48_000, 1_000.0, 0.5);
+    let iq = zeta_dsp::fixtures::am_modulate(&audio, 48_000, 48_000, 0.5, 0.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "am", &iq, 48_000, 121_500_000);
+    let src = format!("am={}", meta.display());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "am_demod",
+            "--source",
+            "am",
+            "--center-hz",
+            "121500000",
+            "--bandwidth-hz",
+            "10000",
+            "--then-tail",
+            "3,8000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v[0]["result"], "job", "{v}");
+    assert_eq!(v[1]["result"], "frames", "{v}");
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 3, "{v}");
+    for f in frames {
+        assert_eq!(f["kind"], "audio", "{f}");
+        assert_eq!(f["payload"]["sample_rate_hz"], 48_000, "{f}");
+        let peak = f["payload"]["peak"].as_f64().unwrap();
+        assert!(peak > 0.01 && peak <= 1.0, "peak {peak}");
+    }
+}
+
+#[test]
+fn ssb_demod_job_with_lsb_streams_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio: Vec<f32> = zeta_dsp::fixtures::tone(48_000, 48_000, 700.0, 0.7)
+        .iter()
+        .zip(zeta_dsp::fixtures::tone(48_000, 48_000, 1_900.0, 0.3))
+        .map(|(a, b)| a + b)
+        .collect();
+    let iq = zeta_dsp::fixtures::ssb_modulate(&audio, 48_000, 48_000, false, 0.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "ssb", &iq, 48_000, 7_100_000);
+    let src = format!("ssb={}", meta.display());
+    let start = |kind: &str| {
+        vec![
+            "--source-file".to_owned(),
+            src.clone(),
+            "job".into(),
+            "start".into(),
+            "--kind".into(),
+            kind.into(),
+            "--source".into(),
+            "ssb".into(),
+            "--center-hz".into(),
+            "7100000".into(),
+            "--bandwidth-hz".into(),
+            "6000".into(),
+            "--sideband".into(),
+            "lsb".into(),
+        ]
+    };
+    let mut args = start("ssb_demod");
+    args.extend(["--then-tail".to_owned(), "3,8000".into()]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = zeta(dir.path(), &args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v[0]["result"], "job", "{v}");
+    assert_eq!(v[1]["result"], "frames", "{v}");
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 3, "{v}");
+    for f in frames {
+        assert_eq!(f["kind"], "audio", "{f}");
+        assert_eq!(f["payload"]["sample_rate_hz"], 48_000, "{f}");
+        let peak = f["payload"]["peak"].as_f64().unwrap();
+        assert!(peak > 0.01 && peak <= 1.0, "peak {peak}");
+    }
+
+    // `--sideband` with another kind is refused by the op's own check.
+    let args = start("am_demod");
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = zeta(dir.path(), &args)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    assert_eq!(
+        v["message"], "sideband applies only to kind ssb_demod; pass null (kind is am_demod)",
+        "{v}"
+    );
 }

@@ -1,6 +1,7 @@
 //! Build the node the CLI drives: stage registry (core plus `zeta-dsp`, plus `--plugin`
 //! stages), sources (SigMF files, KiwiSDRs, other ZetaSDR nodes, VRT senders over UDP,
-//! and SoapySDR devices when built with `--cfg soapy`), knowledge and classifiers.
+//! and SoapySDR devices when built with `--cfg soapy`), knowledge (the builtin
+//! signatures and the signal catalogue) and classifiers (`zeta_dsp::classifiers`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -216,6 +217,7 @@ pub async fn open(
         s.start();
     }
     node.add_knowledge(Arc::new(StaticKnowledge::builtin()));
+    node.add_knowledge(Arc::new(zeta_dsp::catalogue::CatalogueKnowledge));
     node.add_classifier(Arc::new(StubClassifier));
     for c in zeta_dsp::classifiers() {
         node.add_classifier(c);
@@ -227,7 +229,7 @@ pub async fn open(
 mod tests {
     use super::*;
     use zeta_core::graph::validate;
-    use zeta_core::ops::{JobKind, OpError, schema};
+    use zeta_core::ops::{AUDIO_RATE_HZ, JobKind, OpError, schema};
     use zeta_core::port::Tuning;
     use zeta_core::types::Hz;
 
@@ -257,7 +259,7 @@ mod tests {
                         center_hz: Hz(7_100_000),
                         bandwidth_hz: Hz(bw),
                     };
-                    match kind.expand(&src, tuning, Hz(rate), None) {
+                    match kind.expand(&src, tuning, Hz(rate), None, None) {
                         Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
                             assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
                         }
@@ -272,8 +274,8 @@ mod tests {
                                     let to = g.nodes.iter().find(|m| m.id == e.to).unwrap();
                                     if to.kind == "nbfm_demod" {
                                         assert_eq!(
-                                            out % param(to, "audio_rate_hz"),
-                                            0,
+                                            param(to, "audio_rate_hz"),
+                                            AUDIO_RATE_HZ,
                                             "{kind:?} {rate} {bw}"
                                         );
                                     }

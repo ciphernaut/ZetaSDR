@@ -1,10 +1,12 @@
-//! Synthetic signal generators for tests: NBFM, AFSK1200 / AX.25 / APRS, AWGN.
+//! Synthetic signal generators for tests: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 /
+//! APRS, AWGN.
 //! Behind feature `test-fixtures`.
 
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 
 use num_complex::Complex;
+use rustfft::FftPlanner;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::types::{Hz, Timestamp};
 
@@ -38,6 +40,118 @@ pub fn nbfm_modulate(
         phase = phase.rem_euclid(2.0 * PI);
     }
     out
+}
+
+/// Broadcast-style FM: [`nbfm_modulate`] of `audio` with, when `pilot`, a
+/// 19 kHz stereo pilot at amplitude 0.1 added to it first. `audio_rate_hz`
+/// must be at least 48 kHz so the pilot is below its Nyquist.
+pub fn wfm_modulate(
+    audio: &[f32],
+    audio_rate_hz: u32,
+    iq_rate_hz: u32,
+    deviation_hz: f64,
+    offset_hz: f64,
+    pilot: bool,
+) -> Vec<Complex<f32>> {
+    assert!(
+        audio_rate_hz >= 48_000,
+        "wfm_modulate: audio rate {audio_rate_hz} Hz is below 48 kHz"
+    );
+    if !pilot {
+        return nbfm_modulate(audio, audio_rate_hz, iq_rate_hz, deviation_hz, offset_hz);
+    }
+    let p = tone(audio_rate_hz, audio.len(), 19_000.0, 0.1);
+    let mixed: Vec<f32> = audio.iter().zip(&p).map(|(a, b)| a + b).collect();
+    nbfm_modulate(&mixed, audio_rate_hz, iq_rate_hz, deviation_hz, offset_hz)
+}
+
+/// `audio` resampled from `audio_rate_hz` to `iq_rate_hz` by linear
+/// interpolation, as [`nbfm_modulate`] does: `audio.len() * iq_rate_hz /
+/// audio_rate_hz` samples.
+fn resample_linear(audio: &[f32], audio_rate_hz: u32, iq_rate_hz: u32) -> Vec<f32> {
+    if audio.is_empty() {
+        return Vec::new();
+    }
+    let len = (audio.len() as u64 * iq_rate_hz as u64 / audio_rate_hz as u64) as usize;
+    let ratio = audio_rate_hz as f64 / iq_rate_hz as f64;
+    let last = audio.len() - 1;
+    (0..len)
+        .map(|n| {
+            let t = n as f64 * ratio;
+            let i = (t as usize).min(last);
+            let frac = (t - i as f64) as f32;
+            audio[i] * (1.0 - frac) + audio[(i + 1).min(last)] * frac
+        })
+        .collect()
+}
+
+/// `x[n]` times a unit carrier `exp(j 2 pi offset_hz n / rate_hz)`.
+fn shift(x: &mut [Complex<f32>], offset_hz: f64, rate_hz: u32) {
+    let step = offset_hz / rate_hz as f64;
+    for (n, s) in x.iter_mut().enumerate() {
+        let (sn, cs) = (2.0 * PI * (n as f64 * step).fract()).sin_cos();
+        *s *= Complex::new(cs as f32, sn as f32);
+    }
+}
+
+/// Double-sideband full-carrier AM: `(1 + modulation_index * a[n])` times a
+/// unit carrier at `offset_hz` from centre, `audio` (nominally within ±1)
+/// linearly resampled to `iq_rate_hz` as in [`nbfm_modulate`].
+pub fn am_modulate(
+    audio: &[f32],
+    audio_rate_hz: u32,
+    iq_rate_hz: u32,
+    modulation_index: f32,
+    offset_hz: f64,
+) -> Vec<Complex<f32>> {
+    let mut out: Vec<Complex<f32>> = resample_linear(audio, audio_rate_hz, iq_rate_hz)
+        .iter()
+        .map(|&a| Complex::new(1.0 + modulation_index * a, 0.0))
+        .collect();
+    shift(&mut out, offset_hz, iq_rate_hz);
+    out
+}
+
+/// Single-sideband suppressed-carrier: the analytic signal of `audio`
+/// (linearly resampled to `iq_rate_hz`), formed by FFT with the negative
+/// frequencies zeroed for the upper sideband (`usb`) or the positive ones for
+/// the lower, the kept side doubled so the amplitude matches the audio's; then
+/// shifted to `offset_hz` from centre.
+pub fn ssb_modulate(
+    audio: &[f32],
+    audio_rate_hz: u32,
+    iq_rate_hz: u32,
+    usb: bool,
+    offset_hz: f64,
+) -> Vec<Complex<f32>> {
+    let mut buf: Vec<Complex<f32>> = resample_linear(audio, audio_rate_hz, iq_rate_hz)
+        .iter()
+        .map(|&a| Complex::new(a, 0.0))
+        .collect();
+    let n = buf.len();
+    if n == 0 {
+        return buf;
+    }
+    let mut planner = FftPlanner::<f32>::new();
+    planner.plan_fft_forward(n).process(&mut buf);
+    for (k, b) in buf.iter_mut().enumerate().skip(1) {
+        // Bin k < n/2 is positive frequency, k > n/2 negative; DC and an even
+        // length's Nyquist bin are kept as they are.
+        let positive = 2 * k < n;
+        if 2 * k == n {
+            continue;
+        }
+        *b = if positive == usb {
+            *b * 2.0
+        } else {
+            Complex::new(0.0, 0.0)
+        };
+    }
+    planner.plan_fft_inverse(n).process(&mut buf);
+    let scale = 1.0 / n as f32;
+    buf.iter_mut().for_each(|c| *c *= scale);
+    shift(&mut buf, offset_hz, iq_rate_hz);
+    buf
 }
 
 /// `len` samples of `amp * sin(2 pi freq_hz n / rate_hz)`.

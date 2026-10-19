@@ -29,7 +29,8 @@ const OCCUPIED_DB: f32 = 6.0;
 const GAP_HZ: f64 = 1_500.0;
 /// `burst` when the loudest 10 ms chunk exceeds the median chunk power by this ratio.
 const BURST_RATIO: f64 = 3.0;
-/// A symbol-rate line must stand this far above the median of its spectrum.
+/// A line (symbol rate, or the 19 kHz broadcast pilot) must stand this far
+/// above the median of its spectrum.
 const LINE_DB: f32 = 10.0;
 /// Neighbourhood half-width, in bins, for a symbol-rate line's local median.
 const LOCAL_BINS: usize = 16;
@@ -46,6 +47,38 @@ const FM_MIN_DEV_HZ: f64 = 100.0;
 const FM_MAX_CV: f32 = 0.2;
 /// ... and occupied bandwidth at most this.
 const FM_MAX_BW_HZ: u64 = 25_000;
+/// Wideband FM with a 19 kHz pilot: occupied band from this (up to
+/// `WFM_MAX_BW_HZ`); narrowband FM (at most `FM_MAX_BW_HZ`) cannot reach it.
+const WFM_PILOT_MIN_BW_HZ: u64 = 40_000;
+/// Wideband (broadcast) FM without a pilot: occupied band from this ...
+const WFM_MIN_BW_HZ: u64 = 60_000;
+/// ... to this, ...
+const WFM_MAX_BW_HZ: u64 = 250_000;
+/// ... envelope coefficient of variation below this (looser than `FM_MAX_CV`:
+/// a wide band at a modest rate collects more noise, and multipath on a real
+/// station ripples the envelope; one measured 0.33-0.36) ...
+const WFM_MAX_CV: f32 = 0.45;
+/// ... and discriminator audio deviating by more than this RMS.
+const WFM_MIN_DEV_HZ: f64 = 5_000.0;
+/// Broadcast FM stereo pilot frequency ...
+const PILOT_HZ: f64 = 19_000.0;
+/// ... and the half-width of the window it is searched in.
+const PILOT_TOL_HZ: f64 = 300.0;
+/// The pilot's line is measured against the median of the discriminator audio
+/// spectrum over this range, the pilot window excluded.
+const PILOT_REGION_HZ: (f64, f64) = (15_000.0, 23_000.0);
+/// AM and SSB: envelope coefficient of variation at least this.
+const AM_MIN_CV: f32 = 0.25;
+/// Low-index AM (below `AM_MIN_CV`): envelope coefficient of variation at
+/// least this, with a carrier line and less RMS phase deviation than cv.
+const AM_LOW_MIN_CV: f32 = 0.1;
+/// AM carrier line: the sideband level is the mean power of the bins this far
+/// from the centre, either side.
+const AM_SIDEBAND_HZ: (f64, f64) = (1_000.0, 5_000.0);
+/// SSB: occupied band range ...
+const SSB_BW_HZ: (u64, u64) = (1_500, 4_000);
+/// ... and the least fraction of the occupied-band power on one side of centre.
+const SSB_ONE_SIDE: f64 = 0.8;
 /// FSK: the two tones are within this many dB of each other, and every other
 /// peak is at least this far below the weaker tone.
 const FSK_PEAK_DB: f32 = 6.0;
@@ -391,15 +424,37 @@ fn tone_pair(
         .then_some((i1.min(i2) as f64 * bin_hz, i1.max(i2) as f64 * bin_hz))
 }
 
-/// Conservative layer-1 label for a measured block.
+/// Conservative layer-1 label for a measured block. Rules, first match wins:
 ///
-/// `"noise"` (0.5) when `snr_db < 6`; `"fsk"` (0.6) when the power spectrum
-/// has exactly two dominant peaks inside the occupied band 500–3000 Hz apart
-/// and within 6 dB of each other, or, for a constant-envelope signal, when
-/// its discriminator audio does (AFSK on FM); `"fm"` (0.6) when the envelope
-/// CV is below 0.2, the band is at most 25 kHz and the discriminator audio
-/// deviates by more than 100 Hz RMS, `"carrier"` (0.7) when it does not;
-/// otherwise `"unknown"` (0.5).
+/// 1. `"noise"` (0.5) when `snr_db < 6`.
+/// 2. `"fsk"` (0.6) when the power spectrum has exactly two dominant peaks
+///    inside the occupied band 500–3000 Hz apart and within 6 dB of each
+///    other, or, for a constant-envelope signal (CV below 0.2) with a keying
+///    line, when its discriminator audio does (AFSK on FM).
+/// 3. `"wfm"` (0.9) when the occupied band is 40–250 kHz and
+///    [`pilot_line_db`] finds a 19 kHz pilot at least 10 dB above its
+///    region, with no envelope or deviation gate (multipath and noise ripple
+///    a real station's envelope; the pilot is the stronger evidence).
+///    Otherwise `"wfm"` (0.6) when the occupied band is 60–250 kHz, the
+///    envelope CV is below 0.45 and the discriminator audio deviates by more
+///    than 5 kHz RMS.
+/// 4. `"am"` (0.6) when a carrier line sits at the block centre (the
+///    strongest of the centre bin and its two neighbours at least 6 dB above
+///    the mean power of the bins 1–5 kHz either side) and the envelope CV is
+///    at least 0.25.
+/// 5. `"ssb"` (0.6) when there is no such centre line, the envelope CV is at
+///    least 0.25, the occupied band is 1.5–4 kHz and at least 80 % of its
+///    power lies on one side of centre; the evidence names `usb` (above) or
+///    `lsb` (below) and the dial frequency [`ssb_dial_hz`] gives.
+/// 6. `"am"` (0.6) for low-index AM: the same centre line, an envelope CV
+///    of at least 0.1 both whole-band and within half the occupied band (so
+///    wideband noise on a bare carrier does not pass), and an RMS phase
+///    deviation of the discriminator audio (radians per sample, band-limited
+///    as for `fm`) below the CV, so the envelope moves more than the phase.
+/// 7. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
+///    25 kHz and the discriminator audio deviates by more than 100 Hz RMS;
+///    `"carrier"` (0.7) under the same gate when it does not.
+/// 8. Otherwise `"unknown"` (0.5).
 pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Label {
     let cv = envelope_cv(iq);
     let (name, confidence, reason) = classify_block(f, iq, rate_hz, cv);
@@ -430,6 +485,94 @@ fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> f64 {
     }
     let ms = audio.iter().map(|a| (a.re as f64).powi(2)).sum::<f64>() / audio.len() as f64;
     ms.sqrt() * rate_hz as f64 / (2.0 * std::f64::consts::PI)
+}
+
+/// Envelope coefficient of variation band-limited like [`audio_rms_hz`]:
+/// the RMS of the envelope's variation within half the occupied band over
+/// its mean. Wideband noise on a bare carrier raises [`envelope_cv`] but not
+/// this; an AM tone inside the band raises both.
+fn envelope_band_cv(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> f32 {
+    let mut e: Vec<f32> = iq.iter().map(|s| s.norm()).collect();
+    let mean = e.iter().map(|&v| v as f64).sum::<f64>() / e.len().max(1) as f64;
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    e.iter_mut().for_each(|v| *v -= mean as f32);
+    let audio = analytic(&e, rate_hz, bandwidth_hz as f64 / 2.0);
+    let ms = audio.iter().map(|a| (a.re as f64).powi(2)).sum::<f64>() / audio.len().max(1) as f64;
+    (ms.sqrt() / mean) as f32
+}
+
+/// Strength, in dB, of a 19 kHz broadcast stereo pilot in the discriminator
+/// audio of `iq`: the largest bin of the audio's `SIZE`-bin spectrum within
+/// `PILOT_HZ ± PILOT_TOL_HZ` minus the median of the bins from 15 to 23 kHz
+/// outside that window. `None` when `rate_hz` is below
+/// `2 × (PILOT_HZ + PILOT_TOL_HZ)` (the window is not below Nyquist) or the
+/// block is shorter than `SIZE + 1` samples.
+pub fn pilot_line_db(iq: &[Complex<f32>], rate_hz: u64) -> Option<f32> {
+    if (rate_hz as f64) < 2.0 * (PILOT_HZ + PILOT_TOL_HZ) {
+        return None;
+    }
+    let db = real_spectrum(&discriminator(iq))?;
+    let bin_hz = rate_hz as f64 / SIZE as f64;
+    let last = db.len() - 1;
+    let bin = |hz: f64| ((hz / bin_hz).round() as usize).min(last);
+    let (p_lo, p_hi) = (
+        ((PILOT_HZ - PILOT_TOL_HZ) / bin_hz).ceil() as usize,
+        (((PILOT_HZ + PILOT_TOL_HZ) / bin_hz).floor() as usize).min(last),
+    );
+    // A window narrower than one bin still holds the bin nearest the pilot.
+    let (p_lo, p_hi) = if p_lo > p_hi {
+        (bin(PILOT_HZ), bin(PILOT_HZ))
+    } else {
+        (p_lo, p_hi)
+    };
+    let line = db[p_lo..=p_hi]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let region: Vec<f32> = (bin(PILOT_REGION_HZ.0)..=bin(PILOT_REGION_HZ.1))
+        .filter(|k| !(p_lo..=p_hi).contains(k))
+        .map(|k| db[k])
+        .collect();
+    if region.is_empty() {
+        return None;
+    }
+    Some(line - median(&region))
+}
+
+/// dB by which the strongest of the centre bin of `db` (a `SIZE`-bin
+/// fftshifted spectrum) and its two neighbours exceeds the mean power of the
+/// bins `AM_SIDEBAND_HZ` from the centre, either side. AM detection
+/// therefore assumes the carrier sits at the block centre.
+fn centre_line_db(db: &[f32], bin_hz: f64) -> f32 {
+    let c = SIZE / 2;
+    let centre = db[c - 1].max(db[c]).max(db[c + 1]);
+    let lo = ((AM_SIDEBAND_HZ.0 / bin_hz).ceil() as usize).max(2);
+    let hi = ((AM_SIDEBAND_HZ.1 / bin_hz).floor() as usize).min(c - 1);
+    if lo > hi {
+        return 0.0;
+    }
+    let (sum, n) = (lo..=hi)
+        .flat_map(|k| [db[c - k], db[c + k]])
+        .fold((0.0f64, 0usize), |(s, n), v| {
+            (s + 10f64.powf(v as f64 / 10.0), n + 1)
+        });
+    centre - (10.0 * (sum / n as f64).log10()) as f32
+}
+
+/// Offset, in Hz, of an SSB voice band's centre from its suppressed carrier
+/// (the dial frequency).
+const SSB_DIAL_OFFSET_HZ: u64 = 1_500;
+
+/// The dial frequency of an SSB signal whose occupied band is centred at
+/// `center_hz`: [`SSB_DIAL_OFFSET_HZ`] below it for `usb`, above it for lsb.
+pub fn ssb_dial_hz(center_hz: u64, usb: bool) -> u64 {
+    if usb {
+        center_hz.saturating_sub(SSB_DIAL_OFFSET_HZ)
+    } else {
+        center_hz.saturating_add(SSB_DIAL_OFFSET_HZ)
+    }
 }
 
 fn classify_block(
@@ -469,23 +612,89 @@ fn classify_block(
                 }
             }
         }
-        if f.bandwidth_hz.0 <= FM_MAX_BW_HZ {
-            let dev = audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0);
-            if dev < FM_MIN_DEV_HZ {
+    }
+    let bw = f.bandwidth_hz.0;
+    if (WFM_PILOT_MIN_BW_HZ..=WFM_MAX_BW_HZ).contains(&bw)
+        && let Some(d) = pilot_line_db(iq, rate_hz).filter(|&d| d >= LINE_DB)
+    {
+        return (
+            "wfm",
+            0.9,
+            format!("19 kHz pilot +{d:.1} dB, wideband {bw} Hz"),
+        );
+    }
+    if (WFM_MIN_BW_HZ..=WFM_MAX_BW_HZ).contains(&bw) && cv < WFM_MAX_CV {
+        let dev = audio_rms_hz(iq, rate_hz, bw);
+        if dev > WFM_MIN_DEV_HZ {
+            return (
+                "wfm",
+                0.6,
+                format!("wideband constant envelope, rms deviation {dev:.0} Hz"),
+            );
+        }
+    }
+    if cv >= AM_MIN_CV {
+        let carrier_db = centre_line_db(&db, bin_hz);
+        if carrier_db >= OCCUPIED_DB {
+            return (
+                "am",
+                0.6,
+                format!("carrier line {carrier_db:.1} dB above the sidebands, cv {cv:.3}"),
+            );
+        }
+        if (SSB_BW_HZ.0..=SSB_BW_HZ.1).contains(&f.bandwidth_hz.0) {
+            let power = |k: usize| 10f64.powf(db[k] as f64 / 10.0);
+            let below: f64 = (lo..=hi).filter(|&k| k < SIZE / 2).map(power).sum();
+            let above: f64 = (lo..=hi).filter(|&k| k > SIZE / 2).map(power).sum();
+            let total: f64 = (lo..=hi).map(power).sum();
+            for (side, p) in [("usb", above), ("lsb", below)] {
+                if total > 0.0 && p / total >= SSB_ONE_SIDE {
+                    return (
+                        "ssb",
+                        0.6,
+                        format!(
+                            "{side}: no carrier line ({carrier_db:.1} dB), {:.0} % of the occupied power on one side, cv {cv:.3}, dial \u{2248} {} Hz ({side})",
+                            100.0 * p / total,
+                            ssb_dial_hz(f.center_hz.0, side == "usb")
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    if cv >= AM_LOW_MIN_CV {
+        let carrier_db = centre_line_db(&db, bin_hz);
+        if carrier_db >= OCCUPIED_DB {
+            let phase_rms = (audio_rms_hz(iq, rate_hz, bw) * 2.0 * std::f64::consts::PI
+                / rate_hz as f64) as f32;
+            let band_cv = envelope_band_cv(iq, rate_hz, bw);
+            if phase_rms < cv && band_cv >= AM_LOW_MIN_CV {
                 return (
-                    "carrier",
-                    0.7,
+                    "am",
+                    0.6,
                     format!(
-                        "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz)"
+                        "carrier line {carrier_db:.1} dB above the sidebands, cv {cv:.3} ({band_cv:.3} in band), phase rms {phase_rms:.4} rad below cv"
                     ),
                 );
             }
+        }
+    }
+    if cv < FM_MAX_CV && f.bandwidth_hz.0 <= FM_MAX_BW_HZ {
+        let dev = audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0);
+        if dev < FM_MIN_DEV_HZ {
             return (
-                "fm",
-                0.6,
-                format!("constant envelope, narrow band, rms deviation {dev:.0} Hz"),
+                "carrier",
+                0.7,
+                format!(
+                    "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz)"
+                ),
             );
         }
+        return (
+            "fm",
+            0.6,
+            format!("constant envelope, narrow band, rms deviation {dev:.0} Hz"),
+        );
     }
     ("unknown", 0.5, "no layer-1 rule matched".into())
 }
@@ -627,9 +836,39 @@ impl Stage for MeasureStage {
     }
 }
 
-/// Layer-1 classifier: [`measure`] then [`layer1_label`] on the requested
-/// band, extracted at [`channel_rate_hz`] unless it is the whole block;
-/// upstream features are not used, the band is measured afresh.
+/// [`measure`] and [`layer1_label`] of `band` of `iq`, a block sampled at
+/// `rate_hz` and centred at `center_hz`: the whole block as it is, any other
+/// band extracted at [`channel_rate_hz`] and measured with [`measure_band`]
+/// around its own centre (`center_hz` plus the band's offset). `None` when the
+/// band cannot be extracted.
+pub fn measure_selection(
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    center_hz: u64,
+    band: Band,
+) -> Option<(FeatureRecord, Label)> {
+    if band.is_whole(Hz(rate_hz)) {
+        let f = measure(iq, rate_hz, center_hz);
+        let l = layer1_label(&f, iq, rate_hz);
+        return Some((f, l));
+    }
+    let bw = band.bandwidth_hz.0;
+    let (chan, out_rate) = extract_offset(
+        iq,
+        rate_hz,
+        band.offset_hz,
+        bw,
+        channel_rate_hz(rate_hz, bw),
+    )
+    .ok()?;
+    let band_center = (center_hz as i64).saturating_add(band.offset_hz).max(0) as u64;
+    let f = measure_band(&chan, out_rate, band_center, bw);
+    let l = layer1_label(&f, &chan, out_rate);
+    Some((f, l))
+}
+
+/// Layer-1 classifier: [`measure_selection`] on the requested band; upstream
+/// features are not used, the band is measured afresh.
 pub struct Layer1Classifier;
 
 #[async_trait]
@@ -644,22 +883,14 @@ impl Classifier for Layer1Classifier {
         &self,
         iq: &[Complex<f32>],
         sample_rate_hz: Hz,
+        center_hz: Hz,
         band: Band,
         _features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
-        let rate = sample_rate_hz.0;
-        if band.is_whole(sample_rate_hz) {
-            let f = measure(iq, rate, 0);
-            return vec![layer1_label(&f, iq, rate)];
-        }
-        let bw = band.bandwidth_hz.0;
-        let Ok((chan, out_rate)) =
-            extract_offset(iq, rate, band.offset_hz, bw, channel_rate_hz(rate, bw))
-        else {
-            return Vec::new();
-        };
-        let f = measure_band(&chan, out_rate, 0, bw);
-        vec![layer1_label(&f, &chan, out_rate)]
+        measure_selection(iq, sample_rate_hz.0, center_hz.0, band)
+            .map(|(_, l)| l)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -706,7 +937,9 @@ mod tests {
             let chan = extract_offset(&iq, RATE, offset, 12_500, RATE).unwrap().0;
             let f = measure_band(&chan, RATE, CENTER, 12_500);
             eprintln!("offset {offset}: {f:?}");
-            let labels = Layer1Classifier.classify(&iq, Hz(RATE), band, None).await;
+            let labels = Layer1Classifier
+                .classify(&iq, Hz(RATE), Hz(CENTER), band, None)
+                .await;
             eprintln!("offset {offset}: {labels:?}");
             assert_eq!(labels.len(), 1, "{labels:?}");
             assert_eq!(labels[0].name, "fsk", "offset {offset}: {labels:?}");
