@@ -161,6 +161,7 @@ impl Inner {
         self.jobs.lock().unwrap().insert(
             rec.id.clone(),
             JobEntry {
+                ended_ns: rec.created_ns,
                 record: rec,
                 cancel: Some(token.clone()),
                 done: None,
@@ -269,6 +270,7 @@ impl Inner {
             && entry.record.state == JobState::Running
         {
             entry.record.state = state;
+            entry.ended_ns = now();
             entry.cancel = None;
             if let Err(e) = persist(&self.jobs_dir, &entry.record) {
                 self.persist_errors

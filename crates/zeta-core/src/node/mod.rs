@@ -91,6 +91,9 @@ pub const JOB_HISTORY_MAX: usize = 20;
 
 struct JobEntry {
     record: JobRecord,
+    /// When the record turned terminal in this process (its `created_ns` for
+    /// one loaded terminal from disk); history is pruned oldest-ended first.
+    ended_ns: Timestamp,
     cancel: Option<CancellationToken>,
     /// The supervisor; it releases the lease and unregisters the job's streams.
     done: Option<JoinHandle<()>>,
@@ -127,14 +130,15 @@ struct Inner {
 }
 
 impl Inner {
-    /// Forget the oldest terminal records beyond [`JOB_HISTORY_MAX`], removing
-    /// their files (best effort: a file that will not go is retried at the
-    /// next prune). Called with `jobs` locked after a record turns terminal.
+    /// Forget the terminal records that ended earliest beyond
+    /// [`JOB_HISTORY_MAX`], removing their files (best effort: a file that
+    /// will not go is retried at the next prune). Called with `jobs` locked
+    /// after a record turns terminal; that record ended last, so it survives.
     fn prune_history(jobs: &mut HashMap<JobId, JobEntry>, jobs_dir: &Path) {
         let mut terminal: Vec<(Timestamp, JobId)> = jobs
             .values()
             .filter(|e| matches!(e.record.state, JobState::Stopped | JobState::Failed { .. }))
-            .map(|e| (e.record.created_ns, e.record.id.clone()))
+            .map(|e| (e.ended_ns, e.record.id.clone()))
             .collect();
         if terminal.len() <= JOB_HISTORY_MAX {
             return;
@@ -253,6 +257,7 @@ impl Node {
                 node.inner.jobs.lock().unwrap().insert(
                     rec.id.clone(),
                     JobEntry {
+                        ended_ns: rec.created_ns,
                         record: rec,
                         cancel: None,
                         done: None,
@@ -271,6 +276,7 @@ impl Node {
                 node.inner.jobs.lock().unwrap().insert(
                     failed.id.clone(),
                     JobEntry {
+                        ended_ns: now(),
                         record: failed,
                         cancel: None,
                         done: None,
@@ -478,6 +484,7 @@ impl Node {
                 };
                 persist(&self.inner.jobs_dir, &rec)?;
                 entry.record = rec;
+                entry.ended_ns = now();
             }
             if let Some(c) = entry.cancel.take() {
                 c.cancel();

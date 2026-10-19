@@ -666,27 +666,43 @@ async fn stopped_jobs_beyond_the_history_cap_are_forgotten() {
         list.iter()
             .any(|r| r.id == keep && r.state == JobState::Running)
     );
+    // Replacing the oldest running job's graph stops and relaunches it: the
+    // stop must not prune it (history is ordered by when a job ended, not
+    // when it started).
+    node.job_graph_put(&keep, graph("passthrough"))
+        .await
+        .unwrap();
+    let list = node.job_list();
+    assert!(
+        list.iter()
+            .any(|r| r.id == keep && r.state == JobState::Running),
+        "{list:?}"
+    );
+    // While it was stopped the cap applied once more: one older record went.
+    assert_eq!(list.len(), JOB_HISTORY_MAX, "{list:?}");
     let kept: Vec<_> = list
         .iter()
         .filter(|r| r.state == JobState::Stopped)
         .map(|r| r.id.clone())
         .collect();
-    assert_eq!(kept, stopped[3..].to_vec(), "the oldest three went");
+    assert_eq!(kept, stopped[4..].to_vec(), "the oldest four went");
     let jobs_dir = dir.path().join("state").join("jobs");
-    for id in &stopped[..3] {
+    for id in &stopped[..4] {
         assert!(
             !jobs_dir.join(format!("{}.json", id.0)).exists(),
             "{id:?} still on disk"
         );
     }
-    assert!(jobs_dir.join(format!("{}.json", stopped[3].0)).exists());
-    // Reopening prunes too: write back three stale stopped records first.
+    assert!(jobs_dir.join(format!("{}.json", stopped[4].0)).exists());
+    // Reopening prunes too: write back four stale stopped records, older than
+    // everything kept, so the three oldest go and the fourth stays.
     drop(node);
-    for id in &stopped[..3] {
+    for (i, id) in stopped[..4].iter().enumerate() {
         let rec = JobRecord {
             id: id.clone(),
             state: JobState::Stopped,
-            ..on_disk(dir.path(), &stopped[3])
+            created_ns: Timestamp(i as u64 + 1),
+            ..on_disk(dir.path(), &stopped[4])
         };
         std::fs::write(
             jobs_dir.join(format!("{}.json", id.0)),
@@ -704,5 +720,10 @@ async fn stopped_jobs_beyond_the_history_cap_are_forgotten() {
         JOB_HISTORY_MAX,
         "{list:?}"
     );
-    assert!(!jobs_dir.join(format!("{}.json", stopped[0].0)).exists());
+    for id in &stopped[..3] {
+        assert!(!jobs_dir.join(format!("{}.json", id.0)).exists(), "{id:?}");
+        assert!(!list.iter().any(|r| &r.id == id), "{id:?} listed");
+    }
+    assert!(jobs_dir.join(format!("{}.json", stopped[3].0)).exists());
+    assert!(list.iter().any(|r| r.id == stopped[3]));
 }
