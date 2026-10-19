@@ -13,11 +13,12 @@ interfaces rather than guessed ones.
 | 3 | Transports and agent | Websocket+JSON server with shared secret, MCP server generated from the schema, OpenAI-compatible in-process agent adapter (thinking off, token budget, readiness sequence, prose-answer detection), skill and tool descriptions generated from AGENTS.md. **Delivered** on branch `transports-agent`, 2026-10-19. | 1 |
 | 4 | Hardware and foreign sources | HackRF via SoapySDR plugin crate, KiwiSDR websocket client, external-process plugin SDK (Python) speaking the typed envelope. **Delivered** on branch `hardware-sources`, 2026-10-19. The `cfg(soapy)` driver build and clippy passed against SoapySDR 0.8.1 once `libsoapysdr-dev` was installed later the same day. Pending: the HackRF hardware test; GPU equivalence on the field host is still pending from plan 2. | 1, 2 |
 | 5 | Federation | Node-to-node: VITA 49.2 for IQ, typed envelope for the rest, back-pressure, shared secret, Pi 5 build and deployment, remote node as a source. **Delivered** on branch `federation`, 2026-10-19. Pending: deployment on Pi hardware (no Pi is set up yet), the one-shot `--then-tail` finding against the B210, and releasing the remote job when the local job stops. | 3, 4 |
-| 6 | UI | Wide renderer (waterfall, ribbons, context menu, agent pane, jobs), narrow renderer, graph view. All clients of the plan-3 websocket. | 3 |
+| 6 | UI | Wide renderer (waterfall, ribbons, context menu, agent pane, jobs), narrow renderer, graph view. All clients of the plan-3 websocket. **Delivered** on branch `ui`, 2026-10-19. Pending: the phone check of the narrow renderer, the microphone against a real `voiced`, the HackRF walk, and a live `/ask` answer from the field host. | 3 |
 
-Plan 5 completes the first vertical slice (design section 8). Plan 6 is
-required for the GUI half of slice item 4; until then that item is
-satisfied by CLI and MCP hitting the same code path.
+Plan 5 completes the first vertical slice (design section 8). Plan 6
+satisfies the GUI half of slice item 4: the context menu's entries and the
+MCP tools reach the same `Node::apply` code path, and the call shows in the
+UI's transcript pane through the node's `ops` stream.
 
 ## Plan 3 status
 
@@ -129,3 +130,54 @@ remote at about 9 %, and both held about 2.1 GB resident, almost all of it the 1
 size is a follow-up for the Pi: `deploy/pi/zetasdr.service` caps memory at 1 GB, so a Pi node must keep a
 shorter ring or refuse caps that would not fit.
 
+## Plan 6 status
+
+Plan 6 is delivered on `ui`: the node's `ops` event stream (one event per applied operation, from
+any transport), browser websocket authentication by the `zeta.bearer.<base64url(secret)>`
+subprotocol, `POST /ask` (`serve --llm-url/--llm-model`, the `zeta ask` agent run against the node
+itself) and `POST /stt` (`--stt-socket`, the `local-voice` daemon), and the web app (`zeta-ui`,
+plain JavaScript embedded in the binary and served without auth under `/ui/`): login with the
+node secret, source tabs, a right-to-left waterfall fed by the UI's own `spectrum` job,
+channel-pinned layer labels and decoded-text ribbons, the transcript fed by `ops` (successful
+list polls hidden unless typed, errors always shown), the job list with live counters, the
+six-entry context menu on a drag, audio playback of `fm_demod` jobs over the binary websocket, the
+editable graph view, the microphone, and a narrow footprint below 700 px with the side pane in a
+drawer and answers as ribbons. The workspace gates passed on 2026-10-19: fmt, clippy with
+`--all-targets --all-features -D warnings`, `cargo test --workspace --all-features` 500 passed, 0
+failed, 2 ignored (the live Kiwi and the field host model tests), `no_privileged_deps`, `zeta agents-md
+--check` and `--skill --check`, `deploy/pi/smoke.sh` (PASS, on the aarch64 binary built for plan 5;
+it was not rebuilt with the UI), and `cargo test -p zeta --test ui`: all 23 Playwright scenarios
+passed in headless Chromium (62 s, no skip line). The first test run filled the disk (22 GB of
+incremental cache under `target/debug`); deleting `target/debug/incremental` and running with
+`CARGO_INCREMENTAL=0` got it through.
+
+By hand on this box, headless Chromium against `serve --listen 127.0.0.1:7979` with the `tone` and
+`aprs` fixtures and `--llm-url http://field-host:8080 --llm-model gemma-4-12b`: both tabs
+showed with their tuning ranges; the waterfall painted on each; a drag on the tone opened the menu
+with the six entries and the footer `center_hz=100000000 bandwidth_hz=9600 start_ns=… end_ns=…`
+(clamped to the last 8 s when the span was longer); "What is this?" logged `classify selection=… →
+ok (1 label)` and drew `L1 carrier 0.70` at 100 MHz (snr 114 dB); Decode › NBFM audio started an
+`fm_demod` job whose ▶ played 30 frames in 3 s with none dropped; Decode › APRS on `aprs` drew the
+`VK3ABC > APRS: >hi` ribbon 2 s later, repeating with a ×N count as the fixture loops; the graph
+view of that job showed `channel → nbfm_demod → aprs_decode` with `iq` and `audio` edges and the
+channel's params as JSON; the mic, with no `voiced` for this user (no `--stt-socket`), showed "no
+speech daemon on this node" (the 503 from `/stt`); at 390×844 the page took the narrow footprint,
+the waterfall filled the screen with the ribbon on it, and ☰ opened the transcript and jobs
+drawer. The agent question "what sources do you have", typed on the command line, got no answer in
+120 s; a direct `POST /ask` under `timeout 120` also returned nothing, and a 5-token `curl` to
+the field host's `/v1/chat/completions` returned no bytes in 20 s while `/v1/models` listed
+`gemma-4-12b`: chat completions on that server still hang, as on 2026-10-18 and 2026-10-19, so the
+live `/ask` answer is unconfirmed. A `/ask` whose client goes away frees the one-run slot (the next
+request was not refused 409). Two observations for follow-up: the transcript hides the agent's own
+successful list calls too (`source_list` for exactly this question), because the `ops` stream does
+not say which client sent an operation; and in the narrow footprint the tab labels drop the tuning
+range.
+
+Pending: the phone check. Start the node on the LAN address,
+`ZETA_SECRET=… zeta --state-dir … --source-file tone=… --source-file aprs=… serve --listen
+<wired-ip>:7979` (wired; <wifi-ip> on WiFi), open `http://<wired-ip>:7979/ui/` on the phone,
+paste the secret, and check the narrow renderer: waterfall full width, ☰ drawer, a drag opening the
+menu by touch, Decode › APRS and its ribbon. The mic will not work there over plain HTTP (browsers
+allow it only on a secure origin). Also pending: the microphone against a real `voiced`, the
+HackRF walk (`--source-soapy` in the release `--cfg soapy` build, 104.9 MHz, Decode › NBFM audio;
+the HackRF was unplugged), and a live `/ask` once the field host's chat completions answer.
