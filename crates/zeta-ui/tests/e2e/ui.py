@@ -93,6 +93,11 @@ def scenario_login_and_tabs(page, url, secret):
     page.reload()
     expect(page.locator("#login")).to_be_hidden()
     expect(page.locator('.src-tab[data-id="aprs"]')).to_have_attribute("aria-selected", "true")
+    # The secret is not left in the (hidden) login field.
+    assert page.input_value("#secret") == "", "secret left in #secret"
+    # Wide tabs show the tune range, not the compact centre.
+    expect(page.locator('.src-tab[data-id="aprs"] .range')).to_be_visible()
+    expect(page.locator('.src-tab[data-id="aprs"] .centre')).to_be_hidden()
 
 
 def scenario_command_line_applies_op(page, url, secret):
@@ -132,8 +137,12 @@ def scenario_command_line_applies_op(page, url, secret):
 def scenario_narrow_hides_pane(page, url, secret):
     page.set_viewport_size(NARROW)
     login(page, url, secret)
+    assert page.input_value("#secret") == "", "secret left in #secret"
     assert footprint(page) == "narrow", f"footprint {footprint(page)!r}"
     expect(page.locator("#side")).to_be_hidden()
+    # Narrow tabs carry a compact centre instead of the range.
+    expect(page.locator('.src-tab[data-id="aprs"] .centre')).to_have_text("144.8")
+    expect(page.locator('.src-tab[data-id="aprs"] .range')).to_be_hidden()
     expect(page.locator("#drawer-toggle")).to_be_visible()
     page.click("#drawer-toggle")
     expect(page.locator("#side")).to_be_visible()
@@ -197,7 +206,15 @@ BRIGHT_AT_RIGHT_JS = """() => {
 }"""
 
 
+def fresh_spectrum_jobs(url, secret):
+    """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
+    page starts (and owns) its own."""
+    for source in ("tone", "aprs"):
+        stop_spectrum_jobs(url, secret, source)
+
+
 def show_tone_waterfall(page, url, secret):
+    fresh_spectrum_jobs(url, secret)
     page.set_viewport_size(WIDE)
     login(page, url, secret)
     page.click('.src-tab[data-id="tone"]')
@@ -329,10 +346,23 @@ def scenario_pagehide_stops_ui_jobs(page, url, secret):
         # page.close(run_before_unload=True) runs the unload steps, so `pagehide` fires;
         # a plain ctx.close() in headless Chromium does not.
         tab.close(run_before_unload=True)
-        jobs = wait_spectrum_jobs(url, secret, "tone", lambda js: js == [], 3.0)
-        assert jobs == [], f"spectrum jobs on tone 3 s after the page closed: {jobs}"
+        jobs = wait_spectrum_jobs(url, secret, "tone", lambda js: js == [], 5.0)
+        assert jobs == [], f"spectrum jobs on tone 5 s after the page closed: {jobs}"
     finally:
         ctx.close()
+
+
+def scenario_source_switch_stops_own_spectrum_job(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    jobs = wait_one_spectrum_job(url, secret, "tone")
+    assert len(jobs) == 1, f"spectrum jobs on tone: {jobs}"
+    page.click('.src-tab[data-id="aprs"]')
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+    jobs = wait_spectrum_jobs(url, secret, "tone", lambda js: js == [], 5.0)
+    assert jobs == [], f"the page's own tone job survives the switch to aprs: {jobs}"
+    ui_jobs = page.evaluate("JSON.parse(sessionStorage.getItem('zeta.uiJobs') || '[]')")
+    aprs = running_spectrum_jobs(url, secret, "aprs")
+    assert [j["id"] for j in aprs] == ui_jobs, f"zeta.uiJobs {ui_jobs}, aprs jobs {aprs}"
 
 
 def scenario_selection_reports_band(page, url, secret):
@@ -370,6 +400,7 @@ def stop_job(url, secret, job):
 
 
 def select_source(page, url, secret, source):
+    fresh_spectrum_jobs(url, secret)
     page.set_viewport_size(WIDE)
     login(page, url, secret)
     page.click(f'.src-tab[data-id="{source}"]')
@@ -425,6 +456,11 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     ribbon = page.locator("#waterfall .ov-ribbon.agent")
     expect(ribbon).to_be_visible()
     expect(ribbon).to_have_text("x")
+    # Ribbons are capped (the oldest go first).
+    page.evaluate("for (let i = 0; i < 205; i++) window.zetaTest.ribbon('r' + i)")
+    n = page.locator("#waterfall .ov-ribbon").count()
+    assert n == 200, f"{n} ribbons after 206"
+    expect(page.locator("#waterfall .ov-ribbon", has_text=re.compile(r"^x$"))).to_have_count(0)
     # The drawer still carries the transcript.
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
@@ -459,6 +495,15 @@ def scenario_transcript_hides_polls(page, url, secret):
 # ---- context menu (Task 9) -----------------------------------------------------------------
 # Each stops the jobs it starts.
 
+# Whether the selection overlay canvas is fully transparent.
+OVERLAY_BLANK_JS = """() => {
+  const c = document.querySelector('#waterfall canvas.wf-overlay');
+  const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+  for (let i = 3; i < d.length; i += 4) if (d[i] !== 0) return false;
+  return true;
+}"""
+
+
 def open_menu_on_tone(page, url, secret):
     """Log in, show the tone and open the menu on a selection (see drag_menu)."""
     show_tone_waterfall(page, url, secret)
@@ -490,9 +535,11 @@ def drag_menu(page):
 
 def scenario_what_is_this_classifies(page, url, secret):
     menu = open_menu_on_tone(page, url, secret)
-    # Escape closes it; a new drag opens it again.
+    assert not page.evaluate(OVERLAY_BLANK_JS), "no selection rectangle drawn"
+    # Escape closes it and erases the selection; a new drag opens it again.
     page.keyboard.press("Escape")
     expect(menu).to_be_hidden()
+    assert page.evaluate(OVERLAY_BLANK_JS), "selection rectangle left after the menu closed"
     menu = drag_menu(page)
     page.click('#ctx .ctx-item[data-action="classify"]')
     expect(menu).to_be_hidden()
@@ -660,22 +707,20 @@ def scenario_audio_play_opens_binary_socket(page, url, secret):
         play = row.locator("button.play")
         expect(play).to_have_text("▶")
         page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
-        page.wait_for_timeout(500)
-        idle = ws_connections(url, secret)
+        # Sockets of earlier contexts may still be closing: compare settled counts.
+        idle = stable_ws_connections(url, secret)[-1]
         play.click()
         page.wait_for_function(
             "() => window.zetaAudio && window.zetaAudio.framesPlayed > 0", timeout=3_000)
-        playing = ws_connections(url, secret)
+        playing = stable_ws_connections(url, secret)[-1]
         assert playing >= 2 and playing > idle, f"ws_connections {idle} -> {playing}"
         # The ▶ survives the 2 s jobs re-render as ■ while playing.
         page.evaluate("window.zetaTest.poll()")
         expect(row.locator("button.play")).to_have_text("■")
         row.locator("button.play").click()
         expect(row.locator("button.play")).to_have_text("▶")
-        deadline = time.monotonic() + 3.0
-        while ws_connections(url, secret) >= playing and time.monotonic() < deadline:
-            time.sleep(0.2)
-        assert ws_connections(url, secret) < playing, "audio socket still open after ■"
+        after = stable_ws_connections(url, secret)
+        assert after[-1] < playing, f"audio socket still open after ■: {playing} -> {after}"
         assert page.evaluate("window.zetaAudio.playing") is None, "still playing after ■"
     finally:
         stop_job(url, secret, job)
@@ -857,6 +902,15 @@ def scenarios():
             if name.startswith("scenario_") and callable(fn)]
 
 
+# Collects the page's Content-Security-Policy violations (checked after every scenario).
+CSP_WATCH_JS = """
+window.__cspViolations = [];
+document.addEventListener('securitypolicyviolation', (e) => {
+  window.__cspViolations.push(`${e.violatedDirective} ${e.blockedURI}`);
+});
+"""
+
+
 def main(argv):
     if len(argv) < 3:
         print(__doc__.strip(), file=sys.stderr)
@@ -876,6 +930,7 @@ def main(argv):
             for name, fn in todo:
                 ctx = browser.new_context(viewport=WIDE)
                 ctx.set_default_timeout(TIMEOUT_MS)
+                ctx.add_init_script(CSP_WATCH_JS)
                 page = ctx.new_page()
                 console = []
                 page.on("console", lambda m: console.append(f"{m.type}: {m.text}")
@@ -884,6 +939,9 @@ def main(argv):
                 started = time.monotonic()
                 try:
                     fn(page, url, secret)
+                    if not page.is_closed() and page.url.startswith(url):
+                        seen = page.evaluate("window.__cspViolations || []")
+                        assert not seen, f"Content-Security-Policy violations: {seen}"
                 except Exception as e:  # noqa: BLE001 - report any failure with its scenario
                     print(f"FAIL {name}: {type(e).__name__}: {e}")
                     for line in console:

@@ -8,8 +8,9 @@
 //         job on that source from `job_list`, else starts one on the source's `current` band
 //         or, when `current` is null, on the centre of its tune range with
 //         min(max_bandwidth_hz, 1 MHz). UI-started job ids go in sessionStorage[UI_JOBS_KEY];
-//         they are stopped on `pagehide` (fetch keepalive, with the bearer). The job's event
-//         stream is followed in text mode.
+//         they are stopped on `pagehide` (fetch keepalive, with the bearer), and when the
+//         waterfall moves to another source (a job it started for the source it leaves; one
+//         it reused is left running). The job's event stream is followed in text mode.
 //     wf.sourceId   id of the source being shown (null when none, or after setSource failed)
 //     wf.jobId      the followed job's id (null until known)
 //     wf.painted    columns painted since mount (never reset; for tests)
@@ -17,6 +18,7 @@
 //         object is kept in window.zetaLastSelection.
 //     wf.onColumn(cb)   cb(shiftCssPx) after each painted column: everything painted moved
 //         left by that many CSS px (overlays.js scrolls its ribbons with it).
+//     wf.clearSelection()   erases the drawn selection rectangle (the menu closed)
 //     wf.centerHz() -> the centre of the band shown (null before the band is known)
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
 //     wf.destroy()
@@ -229,6 +231,7 @@ class Waterfall {
   // `restart`: the followed job went away; keep the badge up until frames flow again.
   async setSource(src, { restart = false } = {}) {
     const gen = ++this.gen;
+    if (this.jobId && this.src && (!src || src.id !== this.src.id)) this.stopOwnJob(this.jobId);
     if (this.sub) this.sub.close();
     this.sub = null;
     this.jobId = null;
@@ -238,7 +241,12 @@ class Waterfall {
     if (!src) return;
     try {
       const jobId = await this.findOrStartJob(src);
-      if (gen !== this.gen || !jobId) return;
+      if (gen !== this.gen) {
+        // Moved to another source while this one's job was being found or started.
+        if (jobId && this.sourceId !== src.id) this.stopOwnJob(jobId);
+        return;
+      }
+      if (!jobId) return;
       this.jobId = jobId;
       const streamId = await this.findStream(jobId, gen);
       if (gen !== this.gen) return;
@@ -274,6 +282,13 @@ class Waterfall {
     this.forgetUiJob(jobId);
     this.setSource(src, { restart: true });
     return null;
+  }
+
+  // Stops `id` when this tab started it (UI_JOBS_KEY); a reused job is left alone.
+  stopOwnJob(id) {
+    if (!loadIds(UI_JOBS_KEY).includes(id)) return;
+    this.forgetUiJob(id);
+    this.api.op({ op: "job_stop", job: id }).catch(() => {});
   }
 
   forgetUiJob(id) {
@@ -511,6 +526,11 @@ class Waterfall {
     if (!sel) return;
     window.zetaLastSelection = sel;
     for (const cb of this.selectCbs) cb(sel);
+  }
+
+  clearSelection() {
+    if (this.drag) return; // a new drag is being drawn
+    this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
   }
 
   drawDrag() {

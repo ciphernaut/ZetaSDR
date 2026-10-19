@@ -9,7 +9,8 @@
 // viewport width; `?footprint=wide|narrow` forces it. Re-evaluated on resize. In narrow the
 // side pane is a drawer opened by #drawer-toggle (<html data-drawer="open">).
 //
-// Source tabs come from `source_list` (id and tuning range); the selection is kept in
+// Source tabs come from `source_list` (id and tuning range; in narrow, id and a compact
+// centre in MHz such as `144.8`); the selection is kept in
 // `sessionStorage["zeta.source"]`. The command line (#cmd, focused by Ctrl-K / ⌘K): text
 // that parses as a JSON object with an `op` key is applied with `api.op` (its outcome reaches
 // the transcript through the `ops` stream); anything else goes to `api.ask`.
@@ -133,6 +134,7 @@ async function login(secret, { remembered = false } = {}) {
     $("#connect").disabled = false;
   }
   store(SECRET_KEY, secret);
+  $("#secret").value = "";
   start(api);
 }
 
@@ -149,6 +151,19 @@ function hz(cap) {
 
 function mhz(v) {
   return (v / 1e6).toFixed(3);
+}
+
+// The centre shown on a narrow tab, in MHz without trailing zeros (`144.8`): the source's
+// current tuning, else the middle of its tune range; "" when neither is known.
+function centreText(src) {
+  const c = src.capabilities || {};
+  let v = src.current && typeof src.current.center_hz === "number" ? src.current.center_hz : null;
+  if (v === null) {
+    const lo = hz(c.tune_min_hz);
+    const hi = hz(c.tune_max_hz);
+    if (lo !== null && hi !== null) v = (lo + hi) / 2;
+  }
+  return v === null ? "" : mhz(v).replace(/\.?0+$/, "");
 }
 
 function rangeText(src) {
@@ -182,7 +197,10 @@ function renderTabs(sources) {
       const range = document.createElement("span");
       range.className = "range";
       range.textContent = rangeText(s);
-      tab.append(name, range);
+      const centre = document.createElement("span");
+      centre.className = "centre";
+      centre.textContent = centreText(s);
+      tab.append(name, range, centre);
       if (s.fault) tab.classList.add("fault");
       tab.title = s.fault ? `fault: ${JSON.stringify(s.fault)}` : rangeText(s);
       tab.onclick = () => select(s.id);

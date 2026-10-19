@@ -9,7 +9,7 @@
 //       failed, the failure already reported); `ask(text)` is its /ask path.
 //   Menu:
 //     menu.open(sel, x, y)  shows the menu for a waterfall selection at client (x, y)
-//     menu.close()
+//     menu.close()          hides it and erases the selection rectangle
 //     menu.destroy()
 //
 // Entries (`.ctx-item[data-action]`):
@@ -159,6 +159,7 @@ class Menu {
 
   close() {
     this.el.hidden = true;
+    this.wf.clearSelection();
   }
 
   async choose(action) {

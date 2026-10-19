@@ -36,6 +36,7 @@
 //         (wf.onColumn); removed when it leaves the left edge or RIBBON_TTL_MS after it was
 //         last refreshed. The same text and class still at the right edge is refreshed with a
 //         ×N count instead of drawn again; a different one overlapping it is moved below.
+//         At most MAX_RIBBONS are kept: the oldest goes first.
 //     ov.label(hz, {layer, name, confidence, evidence}, key = "") -> element
 //         "L<layer> <name> <confidence, 2 dp>" at the left edge at wf.yForHz(hz); one label
 //         per key (a job id), replaced on each call. `evidence` becomes its tooltip.
@@ -47,6 +48,7 @@
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
 export const MAX_WATCHED = 4;
+export const MAX_RIBBONS = 200;
 const EXPIRE_EVERY_MS = 1000;
 const RIBBON_GAP_PX = 2;
 const MAX_LANES = 8;
@@ -270,6 +272,7 @@ class Overlays {
     r.h = el.offsetHeight;
     this.place(r);
     this.ribbons.push(r);
+    while (this.ribbons.length > MAX_RIBBONS) this.ribbons.shift().el.remove();
     return el;
   }
 

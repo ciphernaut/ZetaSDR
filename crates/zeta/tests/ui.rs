@@ -4,16 +4,20 @@
 //! `voiced` (`--stt-socket`) answering `ok:what sources are there` to every `file:` line; a
 //! second node without a speech daemon is passed in `ZETA_UI_URL_NOSTT`.
 //!
+//! The run is killed and the test fails after 300 s of wall clock. `ZETA_UI_ONLY=a,b` runs only
+//! those scenarios.
+//!
 //! Skipped, with `ui e2e skipped: <reason>` on stdout, only when Playwright for `python3` or
 //! its Chromium is missing. `python3` runs without `-I`: Playwright is commonly installed in
 //! the user site-packages, which `-I` hides.
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use common::ServeProc;
 
@@ -132,6 +136,55 @@ fn skip_reason() -> Option<String> {
     None
 }
 
+/// Wall-clock limit on the whole ui.py run.
+const DEADLINE: Duration = Duration::from_secs(300);
+
+/// Waits for `child` until `deadline`, killing it then; its exit status (None when killed)
+/// and everything it wrote. Its pipes are drained on threads so it never blocks on them.
+fn wait_with_deadline(
+    mut child: Child,
+    deadline: Duration,
+) -> (Option<ExitStatus>, String, String) {
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll ui.py") {
+            break Some(status);
+        }
+        if started.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    (
+        status,
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    )
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -170,21 +223,31 @@ fn ui_scenarios_pass_in_headless_chromium() {
         &[],
         &[("XDG_RUNTIME_DIR", runtime)],
     );
-    let out = Command::new("python3")
-        .arg("crates/zeta-ui/tests/e2e/ui.py")
-        .args([&serve.url, SECRET])
+    let mut cmd = Command::new("python3");
+    cmd.arg("crates/zeta-ui/tests/e2e/ui.py")
+        .args([&serve.url, SECRET]);
+    if let Some(only) = std::env::var_os("ZETA_UI_ONLY") {
+        cmd.arg(only);
+    }
+    let child = cmd
         .env("ZETA_UI_STATE_DIR", dir.path().join("state"))
         .env("ZETA_UI_URL_NOSTT", &nostt.url)
         .current_dir(repo_root())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("run ui.py");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (status, stdout, stderr) = wait_with_deadline(child, DEADLINE);
     println!("{stdout}");
+    let Some(status) = status else {
+        panic!(
+            "ui.py still running after {} s; killed\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+            DEADLINE.as_secs()
+        );
+    };
     assert!(
-        out.status.success(),
-        "ui.py failed ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
-        out.status
+        status.success(),
+        "ui.py failed ({status}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}"
     );
     drop(serve);
     drop(nostt);

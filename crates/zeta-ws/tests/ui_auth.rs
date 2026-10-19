@@ -175,3 +175,32 @@ async fn subprotocol_is_not_accepted_on_plain_routes() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     ts.stop().await;
 }
+
+#[tokio::test]
+async fn ui_files_carry_a_content_security_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    for path in ["/ui/", "/ui/app.js", "/ui/style.css"] {
+        let resp = no_redirect()
+            .get(format!("{}{path}", ts.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let h = resp.headers();
+        let csp = h
+            .get("content-security-policy")
+            .unwrap_or_else(|| panic!("{path}: no CSP"))
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("connect-src 'self' ws: wss:"), "{csp}");
+        assert_eq!(
+            h.get("x-content-type-options").unwrap(),
+            "nosniff",
+            "{path}"
+        );
+    }
+    ts.stop().await;
+}

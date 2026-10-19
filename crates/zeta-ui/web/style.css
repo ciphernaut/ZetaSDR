@@ -98,7 +98,8 @@ input:focus { border-color: var(--accent); }
   white-space: nowrap;
   color: var(--dim);
 }
-.src-tab .range { font-size: 11px; opacity: 0.8; }
+.src-tab .range, .src-tab .centre { font-size: 11px; opacity: 0.8; }
+.src-tab .centre { display: none; }
 .src-tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 .src-tab[aria-selected="true"] .name { color: var(--accent); }
 .src-tab.fault .name { color: var(--error); }
@@ -227,6 +228,7 @@ html[data-footprint="narrow"] #app {
 }
 html[data-footprint="narrow"] .brand { display: none; }
 html[data-footprint="narrow"] .src-tab .range { display: none; }
+html[data-footprint="narrow"] .src-tab .centre { display: inline; }
 html[data-footprint="narrow"] #drawer-toggle { display: inline-block; }
 html[data-footprint="narrow"] #side { display: none; }
 html[data-footprint="narrow"][data-drawer="open"] #side {
