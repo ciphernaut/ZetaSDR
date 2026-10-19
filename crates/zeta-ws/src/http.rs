@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -29,7 +30,7 @@ use zeta_core::ops::OpError;
 
 use crate::addr::is_lan;
 use crate::auth::{Secret, subprotocol_secret};
-use crate::{ask, stream, ui};
+use crate::{ask, stream, stt, ui};
 
 /// Resource limits sized for a Raspberry Pi.
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +44,10 @@ pub struct Limits {
     pub ws_max_message_bytes: usize,
     /// Longest `POST /ask` agent run.
     pub ask_timeout: Duration,
+    /// Largest `POST /stt` WAV body.
+    pub stt_max_bytes: usize,
+    /// Longest wait for the speech daemon on `POST /stt`.
+    pub stt_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -56,6 +61,8 @@ impl Default for Limits {
             auth_fail_delay: Duration::from_millis(250),
             ws_max_message_bytes: 64 << 10,
             ask_timeout: Duration::from_secs(300),
+            stt_max_bytes: 4 << 20,
+            stt_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -67,6 +74,10 @@ pub struct ServerConfig {
     pub limits: Limits,
     /// The model `POST /ask` runs; `None` answers 503.
     pub llm: Option<LlmConfig>,
+    /// The node's state directory; `POST /stt` stages its WAV files in `stt/` under it.
+    pub state_dir: PathBuf,
+    /// The `local-voice` daemon's Unix socket for `POST /stt`; `None` answers 503.
+    pub stt_socket: Option<PathBuf>,
 }
 
 /// A snapshot of the server's counters.
@@ -141,6 +152,8 @@ pub(crate) struct AppState {
     pub(crate) llm: Option<LlmConfig>,
     /// Held for the length of one `POST /ask` run.
     pub(crate) ask_lock: tokio::sync::Mutex<()>,
+    pub(crate) state_dir: PathBuf,
+    pub(crate) stt_socket: Option<PathBuf>,
 }
 
 pub(crate) type Shared = Arc<AppState>;
@@ -296,6 +309,7 @@ fn router(state: Shared) -> Router {
         .route("/health", get(health))
         .route("/op", post(op))
         .route("/ask", post(ask::ask))
+        .route("/stt", post(stt::stt))
         .route("/schema", get(schema))
         .route("/streams", get(streams))
         .route("/agents-md", get(agents_md))
@@ -344,6 +358,8 @@ pub async fn bind(node: Arc<Node>, cfg: ServerConfig) -> io::Result<Server> {
         agents_md: cfg.agents_md,
         llm: cfg.llm,
         ask_lock: tokio::sync::Mutex::new(()),
+        state_dir: cfg.state_dir,
+        stt_socket: cfg.stt_socket,
     });
     Ok(Server {
         listener,

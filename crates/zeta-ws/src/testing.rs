@@ -1,7 +1,7 @@
 //! A test harness: a node on a temp dir with a looping `tone` source, served on loopback.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::task::JoinHandle;
@@ -25,6 +25,8 @@ pub struct TestOpts {
     pub agents_md: String,
     /// The model behind `POST /ask`; `None` (the default) answers 503.
     pub llm: Option<LlmConfig>,
+    /// The speech daemon's socket behind `POST /stt`; `None` (the default) answers 503.
+    pub stt_socket: Option<PathBuf>,
 }
 
 impl Default for TestOpts {
@@ -35,6 +37,7 @@ impl Default for TestOpts {
             addr: None,
             agents_md: "# test guide\n".to_string(),
             llm: None,
+            stt_socket: None,
         }
     }
 }
@@ -99,6 +102,8 @@ pub async fn spawn_with(dir: &Path, opts: TestOpts) -> TestServer {
             agents_md: opts.agents_md,
             limits: opts.limits,
             llm: opts.llm,
+            state_dir: dir.join("state"),
+            stt_socket: opts.stt_socket,
         },
     )
     .await

@@ -265,6 +265,10 @@ pub struct ServeArgs {
     /// 127.0.0.1); requires --secret or ZETA_SECRET
     #[arg(long, value_name = "[ADDR:]PORT")]
     pub listen: Option<String>,
+    /// Unix socket of the `local-voice` speech daemon behind `POST /stt` [default:
+    /// $XDG_RUNTIME_DIR/voiced.sock when it exists]
+    #[arg(long, env = "ZETA_STT_SOCKET", value_name = "PATH")]
+    pub stt_socket: Option<PathBuf>,
     #[command(flatten)]
     pub llm: LlmArgs,
 }

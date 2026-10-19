@@ -101,7 +101,12 @@ async fn shutdown_signal() -> std::io::Result<()> {
 }
 
 /// Run `serve`: wait for Ctrl-C or SIGTERM, also serving the API when `--listen` is given.
-pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCode {
+pub async fn serve(
+    node: Node,
+    args: &ServeArgs,
+    secret: Option<&str>,
+    state_dir: PathBuf,
+) -> ExitCode {
     let Some(listen) = &args.listen else {
         if std::env::args().any(|a| a.starts_with("--llm-")) {
             eprintln!("zeta: warning: --llm-url/--llm-model are ignored without --listen");
@@ -126,12 +131,15 @@ pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCo
         Ok(s) => s,
         Err(e) => return usage(&e),
     };
+    let stt_socket = args.stt_socket.clone().or_else(default_stt_socket);
     let cfg = ServerConfig {
         listen,
         secret,
         agents_md: agents_md::rendering(),
         limits: Limits::default(),
         llm,
+        state_dir,
+        stt_socket: stt_socket.clone(),
     };
     let server = match bind(Arc::new(node), cfg).await {
         Ok(s) => s,
@@ -140,6 +148,9 @@ pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCo
     eprintln!("zeta: listening on {}", server.local_addr());
     if let Some(model) = &ask_model {
         eprintln!("zeta: POST /ask runs model {model}");
+    }
+    if let Some(path) = &stt_socket {
+        eprintln!("zeta: speech daemon: {}", path.display());
     }
     if secret_text.chars().count() < MIN_SECRET_LEN {
         eprintln!("zeta: warning: secret shorter than {MIN_SECRET_LEN} characters");
@@ -156,6 +167,12 @@ pub async fn serve(node: Node, args: &ServeArgs, secret: Option<&str>) -> ExitCo
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => usage(&e.to_string()),
     }
+}
+
+/// `$XDG_RUNTIME_DIR/voiced.sock`, when it exists.
+fn default_stt_socket() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("voiced.sock");
+    path.exists().then_some(path)
 }
 
 /// Print serialised JSON on stdout and return `code`.

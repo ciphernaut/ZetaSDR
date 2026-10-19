@@ -5,6 +5,7 @@ mod ask;
 pub mod auth;
 pub mod http;
 pub mod stream;
+mod stt;
 #[cfg(feature = "test-server")]
 pub mod testing;
 mod ui;
