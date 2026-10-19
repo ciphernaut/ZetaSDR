@@ -16,16 +16,34 @@ fn max_rate(ranges: &[RangeHz]) -> f64 {
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
+/// Driver keys a UHD device reports (SoapyUHD gives the device type, `b200`
+/// for a B210, rather than `uhd`); matched as case-insensitive prefixes.
+const UHD_DRIVER_KEYS: [&str; 7] = ["uhd", "b200", "b100", "x300", "n3xx", "e3xx", "usrp2"];
+
+/// Whether a device opened with `args` reporting `driver_key` is a UHD device,
+/// whose rate range depends on its master clock: `driver=uhd` in the args, or
+/// a UHD driver key.
+pub fn is_uhd(args: &str, driver_key: &str) -> bool {
+    let by_args = args.split(',').any(|kv| {
+        kv.split_once('=').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("driver") && v.trim().eq_ignore_ascii_case("uhd")
+        })
+    });
+    let key = driver_key.to_ascii_lowercase();
+    by_args || UHD_DRIVER_KEYS.iter().any(|k| key.starts_with(k))
+}
+
 /// The device's sample-rate ranges. A UHD device reports them for its
-/// current master clock (a B210 opens at 16 MHz), so on driver `uhd` the
-/// range is re-read after asking for twice the reported maximum (errors
-/// ignored; the driver raises its clock as far as it can), while the maximum
-/// grows, at most three rounds; the rate in force before is then restored.
-/// Other drivers are read once. A `master_clock_rate=` device argument still
-/// fixes the clock, and with it the range.
-pub fn probe_rate_ranges(dev: &dyn SoapyDevice) -> Result<Vec<RangeHz>, String> {
+/// current master clock (a B210 opens at 16 MHz), so with `probe` (see
+/// [`is_uhd`]) the range is re-read after asking for twice the reported
+/// maximum (errors ignored; the driver raises its clock as far as it can),
+/// while the maximum grows, at most three rounds; the rate in force before is
+/// then restored. Without `probe` the ranges are read once. A
+/// `master_clock_rate=` device argument still fixes the clock, and with it
+/// the range.
+pub fn probe_rate_ranges(dev: &dyn SoapyDevice, probe: bool) -> Result<Vec<RangeHz>, String> {
     let mut rates = dev.sample_rate_ranges()?;
-    if dev.driver_key() != "uhd" || rates.is_empty() {
+    if !probe || rates.is_empty() {
         return Ok(rates);
     }
     let saved = dev.sample_rate().ok().filter(|r| *r > 0.0);
@@ -183,11 +201,12 @@ mod tests {
 
     #[test]
     fn uhd_rate_range_is_probed_at_the_maximum_clock() {
+        // SoapyUHD reports the device type as the driver key.
         let dev = MockDevice::hackrf_like()
-            .with_driver("uhd")
+            .with_driver("b200")
             .with_rate_follow(16e6, 61.44e6);
         dev.set_sample_rate(8e6).unwrap();
-        let rates = probe_rate_ranges(&dev).unwrap();
+        let rates = probe_rate_ranges(&dev, is_uhd("", &dev.driver_key())).unwrap();
         let c = capabilities(&dev, &rates).unwrap();
         assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(61_440_000)));
         assert_eq!(pick_rate(&rates, 30_000_000), Some(30_000_000));
@@ -209,11 +228,25 @@ mod tests {
     #[test]
     fn non_uhd_rate_range_is_read_once() {
         let dev = MockDevice::hackrf_like().with_rate_follow(16e6, 61.44e6);
-        let rates = probe_rate_ranges(&dev).unwrap();
+        let rates = probe_rate_ranges(&dev, is_uhd("driver=hackrf", &dev.driver_key())).unwrap();
         let c = capabilities(&dev, &rates).unwrap();
         assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(16_000_000)));
         assert_eq!(dev.range_reads(), 1);
         assert!(dev.calls().is_empty(), "{:?}", dev.calls());
+    }
+
+    #[test]
+    fn uhd_gate_matches_args_and_real_driver_keys() {
+        for key in [
+            "uhd", "b200", "B200", "b100", "x300", "n3xx", "e3xx", "usrp2",
+        ] {
+            assert!(is_uhd("", key), "{key}");
+        }
+        assert!(is_uhd("driver=uhd,type=b200", "something"));
+        assert!(is_uhd("serial=1, driver = UHD", ""));
+        assert!(!is_uhd("driver=hackrf", "hackrf"));
+        assert!(!is_uhd("driver=rtlsdr", "RTLSDR"));
+        assert!(!is_uhd("driver=remote,remote:driver=uhd", "remote"));
     }
 
     #[test]

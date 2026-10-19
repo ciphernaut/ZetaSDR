@@ -421,12 +421,26 @@ async fn measured_rate_is_reported() {
 
 #[test]
 fn uhd_source_asserts_the_range_at_the_maximum_clock() {
+    // A B210's driver key is its device type.
     let dev = Arc::new(
         MockDevice::hackrf_like()
-            .with_driver("uhd")
+            .with_driver("b200")
             .with_rate_follow(16e6, 61.44e6),
     );
     let src = source(&dev);
+    assert_eq!(
+        src.capabilities().max_bandwidth_hz,
+        Claim::Asserted(Hz(61_440_000))
+    );
+    // Or the args say uhd whatever the key.
+    let dev = Arc::new(
+        MockDevice::hackrf_like()
+            .with_driver("custom")
+            .with_rate_follow(16e6, 61.44e6),
+    );
+    let src =
+        SoapySource::with_device_args(SourceId("sdr0".into()), dev.clone(), "driver=uhd,type=b200")
+            .unwrap();
     assert_eq!(
         src.capabilities().max_bandwidth_hz,
         Claim::Asserted(Hz(61_440_000))

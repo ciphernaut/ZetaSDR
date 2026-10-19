@@ -34,7 +34,7 @@ impl Driver {
 /// Open the device matching `args` as a [`SoapySource`].
 pub fn open(id: SourceId, args: &str) -> Result<SoapySource, PortError> {
     let d = Driver::new(args).map_err(PortError::Io)?;
-    SoapySource::with_device(id, std::sync::Arc::new(d))
+    SoapySource::with_device_args(id, std::sync::Arc::new(d), args)
 }
 
 /// Devices matching `filter` (`""` for all): the `SoapySDRUtil --find`
