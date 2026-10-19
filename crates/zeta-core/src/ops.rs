@@ -511,19 +511,29 @@ pub const SCAN_STEP_MAX_HZ: u64 = 16_000_000;
 pub const SCAN_DWELL_MS: u64 = 250;
 
 /// The steps a scan of `span` takes on a source with `caps`: captures of
-/// `step = min(max_bandwidth_hz, SCAN_STEP_MAX_HZ)` centred at
-/// `start + step/2 + i·step` for `i < ceil(bandwidth_hz / step)`, where
-/// `start` is the span's lower edge. The last step may overrun the span;
-/// every centre is clamped into the source's tune range.
+/// `w = min(max_bandwidth_hz, SCAN_STEP_MAX_HZ, span width)` centred at
+/// `start + w/2 + i·w` for `i < ceil(bandwidth_hz / w)`, where `start` is the
+/// span's lower edge, so a span narrower than one capture is one step exactly
+/// as wide as the span. The last step may overrun the span; every centre is
+/// clamped to `[tune_min + w/2, tune_max - w/2]`, so no capture reaches
+/// outside the source's tune range (when that range is narrower than `w`,
+/// to `tune_min + w/2`).
 pub fn scan_steps(span: Tuning, caps: &Capabilities) -> Vec<Tuning> {
-    let step = caps.max_bandwidth_hz.value().0.clamp(1, SCAN_STEP_MAX_HZ);
-    let n = span.bandwidth_hz.0.div_ceil(step).max(1);
+    let w = caps
+        .max_bandwidth_hz
+        .value()
+        .0
+        .min(SCAN_STEP_MAX_HZ)
+        .min(span.bandwidth_hz.0)
+        .max(1);
+    let n = span.bandwidth_hz.0.div_ceil(w).max(1);
     let start = span.center_hz.0.saturating_sub(span.bandwidth_hz.0 / 2);
-    let (lo, hi) = (caps.tune_min_hz.value().0, caps.tune_max_hz.value().0);
+    let lo = caps.tune_min_hz.value().0.saturating_add(w / 2);
+    let hi = caps.tune_max_hz.value().0.saturating_sub(w / 2).max(lo);
     (0..n)
         .map(|i| Tuning {
-            center_hz: Hz((start + step / 2 + i * step).clamp(lo, hi.max(lo))),
-            bandwidth_hz: Hz(step),
+            center_hz: Hz((start + w / 2 + i * w).clamp(lo, hi)),
+            bandwidth_hz: Hz(w),
         })
         .collect()
 }
@@ -1437,6 +1447,58 @@ mod tests {
         );
         assert_eq!(suggest(7, 1_000_000_000, 6_000_000_000), None);
         assert_eq!(suggest(7_000_000_001, 1_000_000, 6_000_000_000), None);
+    }
+
+    fn caps_16m() -> Capabilities {
+        use crate::types::Claim;
+        Capabilities {
+            tune_min_hz: Claim::Asserted(Hz(1_000_000)),
+            tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
+            max_bandwidth_hz: Claim::Asserted(Hz(16_000_000)),
+            formats: vec![],
+            channels: 1,
+            rx: true,
+            tx: false,
+            remote: false,
+            push: false,
+        }
+    }
+
+    fn t(center_hz: u64, bandwidth_hz: u64) -> Tuning {
+        Tuning {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(bandwidth_hz),
+        }
+    }
+
+    #[test]
+    fn a_sub_band_scan_is_one_step_as_wide_as_the_span() {
+        assert_eq!(
+            scan_steps(t(100_000_000, 1_000_000), &caps_16m()),
+            [t(100_000_000, 1_000_000)]
+        );
+    }
+
+    #[test]
+    fn scan_steps_stay_inside_the_tune_range() {
+        // 0..40 MHz: steps of 16 MHz at 8, 24 and 40 MHz (the last overruns),
+        // the first moved up to keep its capture above the 1 MHz floor.
+        assert_eq!(
+            scan_steps(t(20_000_000, 40_000_000), &caps_16m()),
+            [
+                t(9_000_000, 16_000_000),
+                t(24_000_000, 16_000_000),
+                t(40_000_000, 16_000_000)
+            ]
+        );
+        // A span reaching past the tune ceiling: the last capture ends at it.
+        let steps = scan_steps(t(5_990_000_000, 30_000_000), &caps_16m());
+        assert_eq!(steps.last(), Some(&t(5_992_000_000, 16_000_000)));
+        // A span at the floor: the first capture starts at it.
+        assert_eq!(
+            scan_steps(t(2_000_000, 4_000_000), &caps_16m()),
+            [t(3_000_000, 4_000_000)]
+        );
     }
 
     #[test]

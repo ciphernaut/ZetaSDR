@@ -774,6 +774,61 @@ def scenario_scan_entry_starts_a_scan_job(page, url, secret):
     wait_waterfall_follows(page, "!!w.jobId", "back to spectrum")
 
 
+def scenario_scan_of_a_sub_band_scans_just_that_band(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    # The upper fifth of the capture, off centre: one step of that width, kept inside the
+    # recording (a capture-wide step centred there would leave it and fail the scan).
+    drag_menu(page, 0.10, 0.30)
+    footer = page.locator("#ctx-footer").text_content()
+    bw = int(re.search(r"bandwidth_hz=(\d+)", footer).group(1))
+    page.click('#ctx .ctx-item[data-action="scan"]')
+    scans = []
+    try:
+        deadline = time.monotonic() + 5.0
+        while not scans and time.monotonic() < deadline:
+            scans = running_scan_jobs(url, secret, "tone")
+            time.sleep(0.2)
+        assert len(scans) == 1, f"scan jobs on tone: {scans}"
+        assert scans[0]["tuning"]["bandwidth_hz"] == bw, f"scan tuning {scans[0]['tuning']}, drag {bw}"
+        wait_waterfall_follows(page, f"w.jobId === {json.dumps(scans[0]['id'])}", "scan mode")
+        before = page.evaluate("window.zetaTest.wf().painted")
+        page.wait_for_function(f"() => window.zetaTest.wf().painted > {before + 3}", timeout=10_000)
+        # Its rows cover the capture the file source answers with: the band widens to them.
+        wait_ticks(page, "100.024", "99.976", "scan band widened to its rows")
+        now = running_scan_jobs(url, secret, "tone")
+        assert [j["id"] for j in now] == [scans[0]["id"]], f"the scan stopped: {now}"
+    finally:
+        for j in scans:
+            stop_job(url, secret, j["id"])
+    page.wait_for_function("() => window.zetaTest.waterfallMode === 'spectrum'", timeout=10_000)
+
+
+def scenario_overlays_follow_a_zoom(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.wf().painted > 5", timeout=15_000)
+    wait_ticks(page, "100.024", "99.976", "before zooming")
+    # A label 12 kHz above the centre: a quarter of the way down from the top.
+    top = page.evaluate("""() => {
+      const el = window.zetaTest.label(100012000, "probe");
+      return parseFloat(el.style.top) + el.offsetHeight / 2;
+    }""")
+    h = page.evaluate("document.querySelector('#waterfall canvas.wf-canvas').clientHeight")
+    assert abs(top - h / 4) < 2, f"label at {top}, want {h / 4}"
+    # A wheel notch x2 in about the centre, and the label read in the same task: it is at the
+    # top edge at once, not only when the next column scrolls the overlays.
+    moved = page.evaluate("""() => {
+      const o = document.querySelector('#waterfall canvas.wf-overlay');
+      const r = o.getBoundingClientRect();
+      o.dispatchEvent(new WheelEvent('wheel', {deltaY: -100, deltaMode: 0, bubbles: true,
+        cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2}));
+      const el = document.querySelector('.ov-label');
+      return parseFloat(el.style.top) + el.offsetHeight / 2;
+    }""")
+    assert abs(moved) < 2, f"label at {moved} right after the zoom, want 0"
+    wait_ticks(page, "100.012", "99.988", "after zooming in")
+
+
 # ---- graph view and audio (Task 10) --------------------------------------------------------
 # Last: they open more websockets (the audio socket) and each stops the job it starts.
 

@@ -286,7 +286,8 @@ fn source_info(r: OpResult) -> (Option<Tuning>, Vec<JobId>) {
 async fn scan_steps_the_port_across_the_span_and_emits_rows() {
     let (_dir, node, port) = open().await;
     let (id, mut rx) = start_scan(&node).await;
-    let centres = [8 * MHZ, 24 * MHZ, 40 * MHZ];
+    // 0..40 MHz in 16 MHz steps; the first capture is kept above the 1 MHz tune floor.
+    let centres = [9 * MHZ, 24 * MHZ, 40 * MHZ];
     let mut seen = [0usize; 3];
     let mut most = 0u64;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -404,7 +405,8 @@ async fn tune_fault_releases_the_scan_lease() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_list_stays_flat_across_sweeps() {
-    let (_dir, node, port) = open().await;
+    // A 100 ms dwell leaves a wide margin between a tune and the step's fft.
+    let (_dir, node, port) = open_dwell(ScanPort::new(), 100).await;
     let (_id, _rx) = start_scan(&node).await;
     // Both counts are taken just after a tune, inside the step's dwell, when
     // no step's fft streams are live: after the first tune, and after the

@@ -468,9 +468,10 @@ gets (a file source answers `out_of_range` and the view reverts).
 
 `scan` sweeps a span wider than one capture: `job start --kind scan --center-hz C
 --bandwidth-hz W` steps the source across `C ± W/2` in captures of `min(max_bandwidth_hz,
-16 MHz)`, dwells 250 ms per step, and emits one v2 spectrum row per step (frame `channel`
-`scan/<step>`, the row's `center_hz` that step's), wrapping until stopped; steps below the
-radio's tuning floor are clamped to it. A scan time-shares the radio, so it holds the lease on
+16 MHz, W)` (a span narrower than one capture is one step of exactly that span), dwells 250 ms
+per step, and emits one v2 spectrum row per step (frame `channel` `scan/<step>`, the row's
+`center_hz` that step's), wrapping until stopped; a step is moved so its capture stays inside
+the radio's tuning range. A scan time-shares the radio, so it holds the lease on
 its whole span: while it runs every other `job_start` or `source_ensure` on that source is a
 `conflict` naming the scan (no silent pre-emption), and `source_list` shows the scan as holder
 and the step it is on as `current`. Stopping it frees the source and leaves `current` at the

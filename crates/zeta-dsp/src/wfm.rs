@@ -130,6 +130,7 @@ impl WfmDemod {
 
     /// Taps in the current audio low-pass (0 before the first block):
     /// [`WFM_AUDIO_TAPS`] whatever the input rate.
+    #[doc(hidden)]
     pub fn audio_lpf_taps(&self) -> usize {
         self.lpf_taps
     }

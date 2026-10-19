@@ -32,6 +32,8 @@
 //         object is kept in window.zetaLastSelection.
 //     wf.onColumn(cb)   cb(shiftCssPx) after each painted column: everything painted moved
 //         left by that many CSS px (overlays.js scrolls its ribbons with it).
+//     wf.onView(cb)     cb() after the band or the view changed (a zoom, a pan, a retune, a
+//         scan band widening): yForHz maps differently (overlays.js lays its items out again).
 //     wf.clearSelection()   erases the drawn selection rectangle (the menu closed)
 //     wf.centerHz() -> the centre of the band shown (null before the band is known)
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
@@ -73,9 +75,13 @@
 // on the old one, with `view reverted: <error>` in the transcript). In scan mode the view
 // stays inside the scan's span and never retunes.
 //
-// Scan mode: the axis spans the scan job's `tuning`; each row covers only its step's band
-// (`center_hz` ± size × bin_hz / 2) and paints that vertical segment of a new column, the rest
-// of the column repeating the previous one, so a sweep fills the columns progressively.
+// Scan mode: the axis spans the scan job's `tuning`, widened to the union of the rows (a step
+// can reach past it at the span's ends); each row covers only its step's band (`center_hz` ±
+// size × bin_hz / 2) and paints that vertical segment of a new column, the rest of the column
+// repeating the previous one, so a sweep fills the columns progressively. A redraw (a zoom or
+// pan) replays one sweep of older rows first, so its oldest column is not left partly blank.
+// When the page's own job_start is refused as a conflict and a scan now runs on the source,
+// the waterfall follows that scan instead.
 //
 // Reload: pagehide stops the UI's jobs and records their ids under STOPPING_KEY; the next page
 // in the tab never reuses those (their stop may still be in flight), stops them again in case
@@ -244,6 +250,7 @@ class Waterfall {
     this.api = api;
     this.selectCbs = [];
     this.columnCbs = [];
+    this.viewCbs = [];
     this.gen = 0;
     this.sub = null;
     this.src = null; // the source record being shown
@@ -467,7 +474,8 @@ class Waterfall {
     if (ids.includes(id)) storeIds(UI_JOBS_KEY, ids.filter((x) => x !== id));
   }
 
-  async findOrStartJob(src) {
+  // `retried`: a job_start conflict already sent us round once (a scan took the source).
+  async findOrStartJob(src, retried = false) {
     const jobs = (await this.api.op({ op: "job_list" })).value || [];
     const scan = runningScan(jobs, src.id);
     if (scan && !this.stopping.has(scan.id)) {
@@ -489,15 +497,26 @@ class Waterfall {
     }
     const band = sourceBand(src);
     if (!band) throw new Error("no tuning or tune range to show");
-    const r = await this.api.op({
-      op: "job_start",
-      kind: "spectrum",
-      source: src.id,
-      center_hz: band.center_hz,
-      bandwidth_hz: band.bandwidth_hz,
-      deviation_hz: null,
-      sideband: null,
-    });
+    let r;
+    try {
+      r = await this.api.op({
+        op: "job_start",
+        kind: "spectrum",
+        source: src.id,
+        center_hz: band.center_hz,
+        bandwidth_hz: band.bandwidth_hz,
+        deviation_hz: null,
+        sideband: null,
+      });
+    } catch (e) {
+      // A scan started on the source since job_list (or this page loaded while one was
+      // starting): follow it rather than fail.
+      if (!retried && e.json && e.json.error === "conflict") {
+        const now = (await this.api.op({ op: "job_list" })).value || [];
+        if (runningScan(now, src.id)) return this.findOrStartJob(src, true);
+      }
+      throw e;
+    }
     const id = r.value;
     storeIds(UI_JOBS_KEY, [...new Set([...loadIds(UI_JOBS_KEY), id])]);
     this.tuning = band;
@@ -534,6 +553,25 @@ class Waterfall {
     this.pendingView = null;
     this.drawAxis();
     this.showBandInputs();
+    this.fireView();
+  }
+
+  // Scan mode: the band grows to take in `row` (a step may reach past the scan's tuning),
+  // keeping what is painted: the stored rows are drawn again on the wider band.
+  widenBand(row) {
+    const b = this.band;
+    if (row.lo >= b.lo && row.hi <= b.hi) return;
+    this.band = { lo: Math.min(b.lo, row.lo), hi: Math.max(b.hi, row.hi) };
+    this.view = this.fitView(this.view);
+    this.viewChanged();
+  }
+
+  onView(cb) {
+    this.viewCbs.push(cb);
+  }
+
+  fireView() {
+    for (const cb of this.viewCbs) cb();
   }
 
   // The band shown: the view, else the whole capture.
@@ -711,6 +749,7 @@ class Waterfall {
     this.drawAxis();
     this.showBandInputs();
     this.scheduleRedraw();
+    this.fireView();
   }
 
   // lo..hi moved inside the capture; the whole capture when it is wider.
@@ -839,8 +878,10 @@ class Waterfall {
     } else {
       return;
     }
-    // A spectrum row is the capture; a scan row is one step of the span (the job's tuning).
+    // A spectrum row is the capture; a scan row is one step of the span (the job's tuning),
+    // the band widened to the union of the steps (one may reach past the tuning).
     if (this.mode !== "scan" || !this.band) this.setBand((row.lo + row.hi) / 2, row.hi - row.lo);
+    else this.widenBand(row);
     this.paintColumn(row);
     this.lastRowFormat = row.q ? "q" : "db";
     const slot = this.columns % RING_COLUMNS;
@@ -952,7 +993,9 @@ class Waterfall {
   }
 
   // Paints every stored column again on the band shown, oldest first (scan columns build
-  // on the one before, as when they arrived).
+  // on the one before, as when they arrived). In scan mode up to one sweep of the stored rows
+  // older than the oldest column shown is replayed into the column first (not painted), so
+  // that column starts with every step's band rather than background.
   redraw() {
     const w = this.canvas.width;
     const h = this.canvas.height;
@@ -961,13 +1004,29 @@ class Waterfall {
     this.blankColumn();
     if (!this.columns || !this.shown()) return;
     const cw = Math.max(1, Math.min(this.column.width, w));
-    const n = Math.min(this.columns, RING_COLUMNS, Math.ceil(w / cw));
+    const stored = Math.min(this.columns, RING_COLUMNS);
+    const n = Math.min(stored, Math.ceil(w / cw));
+    if (this.mode === "scan") {
+      const extra = Math.min(stored - n, this.sweepRows());
+      for (let k = n + extra - 1; k >= n; k--) {
+        const row = this.rows[(this.columns - 1 - k) % RING_COLUMNS];
+        if (row && row.lo !== undefined) this.fillColumn(row, false);
+      }
+    }
     for (let k = n - 1; k >= 0; k--) {
       const row = this.rows[(this.columns - 1 - k) % RING_COLUMNS];
       if (!row || row.lo === undefined) continue;
       this.fillColumn(row, this.mode !== "scan");
       this.ctx.putImageData(this.column, w - (k + 1) * cw, 0);
     }
+  }
+
+  // Rows in one scan sweep: the band over the newest row's width, rounded up (the steps
+  // overlap at most at the span's ends, so this is never fewer than the sweep).
+  sweepRows() {
+    const row = this.rows[(this.columns - 1) % RING_COLUMNS];
+    if (!row || !this.band || !(row.hi > row.lo)) return 0;
+    return Math.ceil((this.band.hi - this.band.lo) / (row.hi - row.lo)) + 1;
   }
 
   // ---- selection -----------------------------------------------------------------------

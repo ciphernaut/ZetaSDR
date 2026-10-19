@@ -431,8 +431,9 @@ function answerRibbon(text) {
 // Hooks for the e2e scenarios: simulate a changed secret, force a jobs poll, and read what
 // the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall), the
 // format of the last painted spectrum row (`lastRowFormat`: "q" or "db", null before one), its
-// mode (`waterfallMode`: "spectrum" or "scan", null without a waterfall), and
-// draw the narrow-footprint answer ribbon for `text` without an LLM (ruling R3).
+// mode (`waterfallMode`: "spectrum" or "scan", null without a waterfall),
+// draw the narrow-footprint answer ribbon for `text` without an LLM (ruling R3), and draw a
+// probe label at a frequency.
 window.zetaTest = {
   get lastRowFormat() {
     return state.wf ? state.wf.lastRowFormat : null;
@@ -442,6 +443,10 @@ window.zetaTest = {
   },
   ribbon(text) {
     answerRibbon(text);
+  },
+  // A layer-1 overlay label `name` at `hz` (key "probe"); the element, or null without overlays.
+  label(hz, name) {
+    return state.ov ? state.ov.label(hz, { layer: 1, name }, "probe") : null;
   },
   setSecret(s) {
     if (state.api) state.api.secret = s;
