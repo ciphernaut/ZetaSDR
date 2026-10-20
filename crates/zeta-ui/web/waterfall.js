@@ -2,6 +2,7 @@
 //
 // Exports:
 //   mountWaterfall(el, api, source = null) -> Waterfall
+//   capHz(claim) -> the Hz of a `source_list` capability claim, or null
 //       Builds the axis, the canvas, the selection overlay and the #wf-badge inside `el`.
 //   Waterfall:
 //     wf.setSource(sourceInfo)  a `source_list` record (or null). Reuses a running `spectrum`
@@ -216,7 +217,8 @@ export function decodeRow(p) {
 
 // ---- source band -----------------------------------------------------------------------
 
-function capHz(cap) {
+// The number in a capability claim (`{asserted: n}` or a bare n), or null.
+export function capHz(cap) {
   if (typeof cap === "number") return cap;
   if (cap && typeof cap === "object") {
     const v = Object.values(cap).find((x) => typeof x === "number");

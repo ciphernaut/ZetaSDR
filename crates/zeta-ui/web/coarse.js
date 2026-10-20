@@ -27,7 +27,10 @@
 //       own scan is stopped and the transcript gets `coarse layer: no free source can scan
 //       <lo>-<hi> MHz`, once per view. Back inside the capture under auto_scan_stop "inside",
 //       or under zoom_out "none", the own scan is stopped. A scan the page did not start is
-//       never stopped. While the waterfall itself follows the own scan (the shown-source
+//       never stopped. A failed stop of the own scan keeps its id (it stays the page's own,
+//       never mistaken for a manual one) and is retried on the next decision, STOP_RETRY_MS
+//       later at the latest; the id is forgotten only once a fresh job_list shows the scan
+//       no longer running. While the waterfall itself follows the own scan (the shown-source
 //       fallback, scan mode) nothing is decided.
 //       It also sets wf.coarseActive = () => zoom_out is "scan": the waterfall then lets the
 //       view leave the capture instead of clamping it or retuning past the source.
@@ -43,24 +46,18 @@
 //     coarse.destroy()
 
 import { AUTO_SCAN_KEY, errorText } from "./agent.js";
+import { capHz } from "./waterfall.js";
 
 export const SCAN_DEBOUNCE_MS = 300;
 export const SPAN_CHANGE = 0.05;
+// A stop of the own scan that failed (and the scan still runs) is tried again after this.
+export const STOP_RETRY_MS = 2000;
 const STREAM_LOOKUPS = 20;
 const STREAM_LOOKUP_MS = 250;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 const mhz = (hz) => (hz / 1e6).toFixed(3);
-
-function capHz(cap) {
-  if (typeof cap === "number") return cap;
-  if (cap && typeof cap === "object") {
-    const v = Object.values(cap).find((x) => typeof x === "number");
-    return v === undefined ? null : v;
-  }
-  return null;
-}
 
 // The {lo, hi} tune range of a `source_list` record, or null when it is not known.
 function tuneRange(src) {
@@ -108,6 +105,7 @@ class Coarse {
     this.rows = 0;
     this.rowCbs = [];
     this.timer = null;
+    this.retryTimer = null;
     this.busy = false;
     this.again = false;
     this.noted = null; // the view the last "no free source" line was for
@@ -161,21 +159,12 @@ class Coarse {
     }
   }
 
-  // The view {lo, hi} when it lies (partly) outside the fine capture, else null.
-  outsideView() {
-    const wf = this.wf;
-    if (!wf.band || !wf.view) return null;
-    const b = wf.band;
-    const v = wf.view;
-    const tol = wf.slackHz();
-    return v.lo < b.lo - tol || v.hi > b.hi + tol ? { lo: v.lo, hi: v.hi } : null;
-  }
-
-  async fetchList(op, fallback) {
+  // The `op` list fetched now, or null when the fetch failed.
+  async fetchList(op) {
     try {
       return (await this.api.op({ op })).value || [];
     } catch {
-      return fallback() || [];
+      return null;
     }
   }
 
@@ -188,15 +177,17 @@ class Coarse {
     if (wf.retuning || wf.pan) {
       return;
     }
-    const jobs = await this.fetchList("job_list", this.lastJobs);
+    const fresh = await this.fetchList("job_list");
     if (this.destroyed) return;
-    // The own scan ended elsewhere (its row's Stop, another client): forget it.
-    if (this.scanJobId && !isRunning(jobs.find((j) => j.id === this.scanJobId))) {
+    const jobs = fresh || this.lastJobs() || [];
+    // The own scan ended elsewhere (its row's Stop, another client): forget it. Only a fresh
+    // list says so (the last poll may predate the scan).
+    if (fresh && this.scanJobId && !isRunning(fresh.find((j) => j.id === this.scanJobId))) {
       this.forgetOwn();
     }
     // The shown-source fallback: the waterfall itself follows the own scan in scan mode.
     if (this.scanJobId && wf.jobId === this.scanJobId) return;
-    const v = this.outsideView();
+    const v = wf.isOutside() ? { lo: wf.view.lo, hi: wf.view.hi } : null;
     const scanning = this.view.get("zoom_out") === "scan";
     if (!v || !scanning) {
       this.noted = null;
@@ -206,14 +197,14 @@ class Coarse {
       if (!this.scanJobId) this.unfollow();
       return;
     }
-    const srcs = await this.fetchList("source_list", this.lastSources);
+    const srcs = (await this.fetchList("source_list")) || this.lastSources() || [];
     if (this.destroyed) return;
     const pick = this.chooseScanner(srcs, jobs, v);
     const range = pick && tuneRange(pick);
     const lo = range ? Math.max(v.lo, range.lo) : 0;
     const hi = range ? Math.min(v.hi, range.hi) : 0;
     if (!pick || !(hi > lo)) {
-      await this.stopOwn();
+      if (!(await this.stopOwn())) return;
       this.unfollow();
       const key = `${v.lo}-${v.hi}`;
       if (this.noted !== key) {
@@ -228,7 +219,7 @@ class Coarse {
     );
     if (manual) {
       // Someone else's scan on the scanner: shown, never stopped or retuned.
-      await this.stopOwn();
+      if (!(await this.stopOwn())) return;
       this.follow(manual.id, pick.id);
       return;
     }
@@ -237,7 +228,7 @@ class Coarse {
       this.follow(this.scanJobId, pick.id);
       return;
     }
-    await this.stopOwn();
+    if (!(await this.stopOwn())) return;
     await this.startOwn(pick.id, lo, hi);
   }
 
@@ -297,17 +288,35 @@ class Coarse {
     this.follow(r.value, source);
   }
 
-  // Stops the page's own scan (never another).
+  // Stops the page's own scan (never another); true once it no longer runs. The id is
+  // forgotten only then: when job_stop fails and job_list still shows the scan running (or
+  // cannot be read), the id is kept, the scan stays the page's own, and the next decision,
+  // STOP_RETRY_MS later at the latest, tries again (false).
   async stopOwn() {
     const id = this.scanJobId;
-    if (!id) return;
+    if (!id) return true;
     if (this.followed === id) this.unfollow();
-    this.forgetOwn();
+    let gone = false;
     try {
       await this.api.op({ op: "job_stop", job: id });
+      gone = true;
     } catch {
-      /* already gone */
+      try {
+        const jobs = (await this.api.op({ op: "job_list" })).value || [];
+        gone = !isRunning(jobs.find((j) => j.id === id));
+      } catch {
+        gone = false;
+      }
     }
+    if (this.scanJobId !== id) return true;
+    if (gone) {
+      this.forgetOwn();
+      return true;
+    }
+    console.warn(`coarse layer: stopping scan ${id} failed; retrying`);
+    clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => this.schedule(), STOP_RETRY_MS);
+    return false;
   }
 
   forgetOwn() {
@@ -384,6 +393,7 @@ class Coarse {
   destroy() {
     this.destroyed = true;
     clearTimeout(this.timer);
+    clearTimeout(this.retryTimer);
     this.unfollow();
     window.removeEventListener("pagehide", this.onPageHide);
     if (this.wf.coarseActive) this.wf.coarseActive = null;

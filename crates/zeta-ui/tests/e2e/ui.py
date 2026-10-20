@@ -1235,6 +1235,78 @@ def scenario_zoom_out_beyond_scanner_range_starts_nothing(page, url, secret):
         assert scans == [], f"scans started: {scans}"
         assert page.evaluate(AUTO_SCAN_JS) is None
         assert ensure_lines(page) == 0, "a source_ensure was issued for the coarse view"
+        # The coarse layer stays empty: nothing followed, no frame handed on.
+        coarse = page.evaluate("window.zetaTest.coarse()")
+        assert coarse["followed"] is None and coarse["rows"] == 0, f"coarse layer {coarse}"
+    finally:
+        stop_scans(url, secret)
+
+
+def scenario_failed_auto_scan_stop_is_retried(page, url, secret):
+    # A job_stop of the page's own scan that fails keeps the scan the page's own: the id stays
+    # in zeta.autoScan and the stop is retried until it lands.
+    stop_scans(url, secret)
+    failing = {"on": True, "seen": 0}
+
+    def route(r):
+        body = r.request.post_data or ""
+        if failing["on"] and '"job_stop"' in body:
+            failing["seen"] += 1
+            r.abort()
+        else:
+            r.continue_()
+    try:
+        zoom_tone_out(page, url, secret)
+        own = wait_until(lambda: running_scan_jobs(url, secret, "scanner"), 3.0,
+                         "an automatic scan on scanner")[0]["id"]
+        page.route("**/op", route)
+        zoom_tone_in(page)
+        # Waited on through the page: the sync API runs route handlers only inside its calls.
+        for _ in range(30):
+            if failing["seen"]:
+                break
+            page.wait_for_timeout(100)
+        assert failing["seen"], "the page did not try to stop its scan within 3 s"
+        page.wait_for_timeout(500)
+        assert job_record(url, secret, own)["state"]["status"] == "running"
+        assert page.evaluate(AUTO_SCAN_JS) == own, "the own scan's id was dropped on a failed stop"
+        assert page.evaluate("window.zetaTest.coarse().scanJobId") == own
+        tries = failing["seen"]
+        failing["on"] = False
+        page.wait_for_function("() => sessionStorage.getItem('zeta.autoScan') === null",
+                               timeout=5_000)
+        assert stopped(url, secret, own), f"own scan after the retried stop: {job_record(url, secret, own)}"
+        assert tries >= 1, tries
+        assert running_scan_jobs(url, secret, "scanner") == [], "a scan still runs on scanner"
+    finally:
+        failing["on"] = False
+        stop_scans(url, secret)
+
+
+def scenario_capturable_view_on_unheld_source_retunes_under_zoom_out_scan(page, url, secret):
+    # Ruling R6: under the default zoom_out scan, a view past the capture that the unheld shown
+    # source can capture (no wider than max_bandwidth_hz, inside its tune range) retunes it
+    # with source_ensure; the coarse layer starts nothing.
+    stop_scans(url, secret)
+    try:
+        select_source(page, url, secret, "retune")
+        page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+        cur = source_info(url, secret, "retune")["current"]["center_hz"]
+        want = cur + 100_000 if cur + 100_000 < 299_000_000 else cur - 100_000
+        page.fill('#band input[name="center"]', f"{want / 1e6:.6f}")
+        page.fill('#band input[name="width"]', "24")
+        page.click("#band button")
+        expect(page.locator("#transcript .line", has_text="source_ensure").first).to_be_visible()
+        wait_until(lambda: source_info(url, secret, "retune")["current"]["center_hz"] == want,
+                   5.0, f"retune's capture moved to {want}")
+        mid = f"{want / 1e6:.3f}"
+        page.wait_for_function(f"() => ({TICKS_JS})()[2] === {json.dumps(mid)}", timeout=10_000)
+        page.wait_for_timeout(1_000)
+        jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+        scans = [j for j in jobs if j["kind"] == "scan" and j["state"]["status"] == "running"]
+        assert scans == [], f"scans started: {scans}"
+        assert page.evaluate("window.zetaTest.coarse().scanJobId") is None
+        assert page.evaluate(AUTO_SCAN_JS) is None
     finally:
         stop_scans(url, secret)
 
