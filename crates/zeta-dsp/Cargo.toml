@@ -8,6 +8,7 @@ description = "ZetaSDR DSP stages"
 [dependencies]
 async-trait = "0.1.92"
 bytemuck = { version = "1.25.2", optional = true }
+nnnoiseless = { version = "0.5", default-features = false }
 num-complex = "0.4.6"
 pollster = { version = "1.0.1", optional = true }
 rustfft = "6.4.1"

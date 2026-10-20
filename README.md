@@ -76,6 +76,7 @@ Thirteen job kinds, chosen with `job start --kind` (`zeta job start --help` list
 - `adsb_decode` decodes Mode S / ADS-B at 1 090 MHz from a band of 2.4 MHz (under 2 MHz is refused): one event per message (`icao`, `callsign`, `altitude_ft`, `lat`, `lon`, `ground_speed_kt`, `track_deg`). It runs dump1090 on the node's host (crate `zeta-ext`: GPL, so an external process, never linked; `ZETA_DUMP1090` overrides the program path); the job fails naming dump1090 when the host has none.
 - `acars_decode` decodes ACARS (AM, 2400 baud MSK) from a 10 kHz channel: one event per CRC-clean block (`reg`, `flight`, `label`, `text`).
 - `measure` emits one layer-1 feature record per second of IQ (occupied band, SNR, burst, symbol rate, label).
+- `denoise` removes broadband noise from audio with RNNoise (the pure-Rust `nnnoiseless` crate, BSD-3-Clause, weights embedded); it downmixes to mono and resamples to 48 kHz.
 
 `--then-tail N,MS` on `job start` starts the job, tails up to N frames from its event (else audio)
 stream, waiting up to MS ms, then stops the job unless `--keep` is given, and prints

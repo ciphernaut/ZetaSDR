@@ -173,6 +173,30 @@ pub fn tone(rate_hz: u32, len: usize, freq_hz: f64, amp: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Speech-like test audio: 300 ms bursts of a 3-tone complex (220, 440 and
+/// 1 320 Hz, equal weight) with a 4 Hz amplitude tremolo, separated by 300 ms of
+/// silence, starting with a burst; peak amplitude 0.5.
+pub fn speech_like(rate_hz: u32, seconds: f32) -> Vec<f32> {
+    let len = (rate_hz as f64 * seconds as f64) as usize;
+    let period = rate_hz as usize * 600 / 1000;
+    let burst = rate_hz as usize * 300 / 1000;
+    (0..len)
+        .map(|n| {
+            if n % period >= burst {
+                return 0.0;
+            }
+            let t = n as f64 / rate_hz as f64;
+            let tones: f64 = [220.0, 440.0, 1320.0]
+                .iter()
+                .map(|f| (2.0 * PI * f * t).sin())
+                .sum::<f64>()
+                / 3.0;
+            let tremolo = 0.75 + 0.25 * (2.0 * PI * 4.0 * t).sin();
+            (0.5 * tremolo * tones) as f32
+        })
+        .collect()
+}
+
 /// Bell 202 AFSK at 1200 baud: one entry of `bits` per bit period, taken as the
 /// NRZI line level (1 → mark 1200 Hz, 0 → space 2200 Hz). Produces
 /// `audio_rate_hz / 1200` samples per bit with continuous phase, amplitude 1.

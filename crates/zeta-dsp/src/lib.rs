@@ -18,6 +18,7 @@ pub mod ax25;
 pub mod bank;
 pub mod catalogue;
 pub mod channel;
+pub mod denoise;
 pub mod fft;
 #[cfg(feature = "gpu")]
 pub mod gpu_fft;
@@ -53,6 +54,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(rds::RdsDecodeStage::new()));
     reg.register(Arc::new(acars::AcarsDecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
+    reg.register(Arc::new(denoise::DenoiseStage::new()));
 }
 
 /// Whether a hardware GPU adapter is usable for the GPU stages; always false
