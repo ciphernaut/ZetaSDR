@@ -53,6 +53,9 @@ async fn main() -> ExitCode {
         Ok(d) => d,
         Err(e) => return fail(&e),
     };
+    if let cli::Command::Ops(cli::OpsCmd::Tail { lines }) = cli.command {
+        return ops_tail(&state_dir, lines);
+    }
     if cli.command.mutates()
         && let Some(pid) = serve_lock::owner(&state_dir)
     {
@@ -241,6 +244,22 @@ async fn wait_for_ring(node: &zeta_core::node::Node, sel: &zeta_core::types::Sel
         }
         tokio::time::sleep(RING_POLL).await;
     }
+}
+
+/// `ops tail`: print the last `lines` lines of `ops.log.1` and `ops.log`, oldest first.
+fn ops_tail(state_dir: &std::path::Path, lines: usize) -> ExitCode {
+    let mut all = Vec::new();
+    for name in ["ops.log.1", "ops.log"] {
+        match std::fs::read_to_string(state_dir.join(name)) {
+            Ok(text) => all.extend(text.lines().map(str::to_owned)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return fail(&format!("{name}: {e}")),
+        }
+    }
+    for line in &all[all.len().saturating_sub(lines)..] {
+        println!("{line}");
+    }
+    ExitCode::SUCCESS
 }
 
 /// Print serialised JSON on stdout and return `code`.

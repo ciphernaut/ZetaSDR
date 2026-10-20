@@ -36,6 +36,8 @@ There are two ways to run:
 
 While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job stop`, `graph put`, `source ensure`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
 
+Every operation the node applies is appended to `ops.log` in the state directory (rotated at 8 MiB) with its caller's transport; `zeta ops tail --lines N` prints the last N (local only).
+
 ## Operations
 
 ### source_list

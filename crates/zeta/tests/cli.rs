@@ -1647,3 +1647,33 @@ fn job_attach_over_node_tails_a_transcript_event() {
         "{frames:?}"
     );
 }
+
+#[test]
+fn ops_tail_prints_the_last_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    zeta(dir.path(), &["source", "list"]).assert().success();
+    zeta(dir.path(), &["job", "list"]).assert().success();
+    let log = std::fs::read_to_string(dir.path().join("state").join("ops.log")).unwrap();
+    let last = log.lines().last().expect("two ops logged");
+    assert_eq!(log.lines().count(), 2);
+
+    let out = zeta_bin()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["ops", "tail", "--lines", "1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8(out).unwrap(), format!("{last}\n"));
+    assert!(last.contains("\"job_list\""));
+
+    zeta_bin()
+        .args(["--node", "http://127.0.0.1:1", "ops", "tail"])
+        .assert()
+        .code(1)
+        .stderr(contains(
+            "ops tail reads the state directory: not supported with --node",
+        ));
+}

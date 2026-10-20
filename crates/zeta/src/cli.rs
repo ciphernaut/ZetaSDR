@@ -191,6 +191,9 @@ pub enum Command {
         #[arg(long)]
         skill: bool,
     },
+    /// The ops log in the state directory (local; not an operation)
+    #[command(subcommand)]
+    Ops(OpsCmd),
     /// Run the node, resuming persisted jobs, until Ctrl-C
     Serve(ServeArgs),
     /// Let a local model call the node's operations to satisfy a request
@@ -198,6 +201,16 @@ pub enum Command {
     /// SoapySDR devices attached to this machine (local; not an operation)
     #[command(subcommand)]
     Soapy(SoapyCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OpsCmd {
+    /// Print the last operations the node applied, one JSON line each, oldest first
+    Tail {
+        /// How many lines
+        #[arg(long, value_name = "N", default_value_t = 50)]
+        lines: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -645,7 +658,11 @@ impl Command {
                 selection: s.into(),
             },
             Command::Schema => Op::Schema {},
-            Command::AgentsMd { .. } | Command::Serve(_) | Command::Ask(_) | Command::Soapy(_) => {
+            Command::AgentsMd { .. }
+            | Command::Serve(_)
+            | Command::Ask(_)
+            | Command::Soapy(_)
+            | Command::Ops(_) => {
                 return Ok(None);
             }
         }))

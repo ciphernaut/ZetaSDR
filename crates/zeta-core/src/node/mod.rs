@@ -2,6 +2,7 @@
 //! persistent jobs that resume after restart.
 
 mod launch;
+mod opslog;
 mod persist;
 
 use std::cmp::Reverse;
@@ -139,6 +140,10 @@ struct Inner {
     classifiers: RwLock<ClassifierSet>,
     /// Failures to persist a job's natural end; memory and disk disagree for these.
     persist_errors: Mutex<Vec<String>>,
+    /// Every applied op, one JSON line each; see [`opslog`].
+    ops_log: opslog::OpsLog,
+    /// Whether a failed ops-log write is already in `persist_errors`.
+    ops_log_failed: std::sync::atomic::AtomicBool,
     /// Cancelled when the `Node` is dropped; every job token is a child of it.
     shutdown: CancellationToken,
 }
@@ -299,6 +304,8 @@ impl Node {
                 knowledge: RwLock::new(Vec::new()),
                 classifiers: RwLock::new(ClassifierSet::default()),
                 persist_errors: Mutex::new(Vec::new()),
+                ops_log: opslog::OpsLog::new(&cfg.state_dir),
+                ops_log_failed: std::sync::atomic::AtomicBool::new(false),
                 shutdown: CancellationToken::new(),
             }),
             load_errors,
@@ -480,6 +487,7 @@ impl Node {
         let outcome = crate::ops::apply(self, op).await;
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let payload = crate::ops::ops_payload(&logged, &outcome, elapsed_ms, transport);
+        let mut line = payload.clone();
         self.inner.bus.publish(Frame::new(
             self.ops_stream.clone(),
             node_provenance(Span {
@@ -488,7 +496,26 @@ impl Node {
             }),
             Payload::Event(payload),
         ));
+        line["t_ns"] = start_ns.0.into();
+        self.log_op(&line);
         outcome
+    }
+
+    /// Append `line` to `ops.log`. A failure never fails the op; the first is
+    /// recorded in `persist_errors`, later ones are dropped.
+    fn log_op(&self, line: &serde_json::Value) {
+        if let Err(e) = self.inner.ops_log.append(line)
+            && !self
+                .inner
+                .ops_log_failed
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.inner
+                .persist_errors
+                .lock()
+                .unwrap()
+                .push(format!("ops.log: {e}"));
+        }
     }
 
     /// The `ops` event stream: kind `Event`, provenance source

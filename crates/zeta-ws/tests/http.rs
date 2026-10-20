@@ -150,6 +150,44 @@ async fn op_records_carry_the_callers_transport() {
 }
 
 #[tokio::test]
+async fn ops_log_records_the_callers_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let send = |body: Value| {
+        client()
+            .post(format!("{}/op", ts.url))
+            .header("authorization", BEARER)
+            .header("x-zeta-client", "ui")
+            .json(&body)
+            .send()
+    };
+    let resp = send(
+        json!({"op":"job_start","kind":"passthrough","source":"tone",
+        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let job: Value = resp.json().await.unwrap();
+    let stop = send(json!({"op":"job_stop","job":job["value"]}))
+        .await
+        .unwrap();
+    assert_eq!(stop.status(), StatusCode::OK);
+
+    let text = std::fs::read_to_string(dir.path().join("state").join("ops.log")).unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines.iter().all(|l| l["transport"] == "ui"));
+    assert_eq!(lines[0]["op"]["op"], "job_start");
+    assert_eq!(lines[1]["op"]["op"], "job_stop");
+    assert!(lines[0]["t_ns"].is_u64());
+    ts.stop().await;
+}
+
+#[tokio::test]
 async fn op_error_is_422_with_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let ts = spawn(dir.path()).await;

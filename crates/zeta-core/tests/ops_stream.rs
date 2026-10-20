@@ -409,3 +409,18 @@ fn op_name_matches_the_serialised_tag() {
         assert_eq!(v["op"], op.name(), "{op:?}");
     }
 }
+
+#[tokio::test]
+async fn unwritable_ops_log_does_not_fail_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory where the log file belongs: every append fails.
+    std::fs::create_dir_all(dir.path().join("state").join("ops.log")).unwrap();
+    let node = open(dir.path()).await;
+
+    node.apply(Op::SourceList {}).await.unwrap();
+    node.apply(Op::SourceList {}).await.unwrap();
+
+    let errors = node.persist_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("ops.log"), "{errors:?}");
+}

@@ -70,6 +70,9 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     if matches!(cli.command, Command::Serve(_)) {
         return usage("serve does not take --node");
     }
+    if matches!(cli.command, Command::Ops(_)) {
+        return usage("ops tail reads the state directory: not supported with --node");
+    }
     if cli.command.then_tail().is_some() {
         return usage("--then-tail is not supported with --node yet");
     }
