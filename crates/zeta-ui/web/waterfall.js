@@ -31,7 +31,8 @@
 //     wf.lastRowFormat  "q" (spectrum event v2) or "db" (older nodes) for the last painted
 //         row; null before the first
 //     wf.rows       ring of RING_COLUMNS painted rows, slot = column % RING_COLUMNS: {q:
-//         Uint8Array, floorDb, stepDb} for v2 rows, {db: Float32Array} for older ones
+//         Uint8Array, floorDb, stepDb} for v2 rows, {db: Float32Array} for older ones,
+//         {coarseOnly: true} for a column of the coarse layer alone (see Layers)
 //     wf.onSelect(cb)   cb({centerHz, bandwidthHz, startNs, endNs}) after a drag; the same
 //         object is kept in window.zetaLastSelection.
 //     wf.onColumn(cb)   cb(shiftCssPx) after each painted column: everything painted moved
@@ -47,7 +48,8 @@
 //     wf.addCoarseEvent(msg)  a frame of the coarse layer's scan (coarse.js onRow): stitched
 //         into the coarse column buffer (see Layers); ignored in scan mode, where the
 //         waterfall draws the shown source's scan itself, and before the band is known
-//     wf.coarsePainted  coarse rows stitched since mount (never reset; for tests)
+//     wf.coarsePainted  columns painted with the coarse layer in them since mount (composed
+//         over coarse rows, or the coarse layer alone; never reset; for tests)
 //     wf.clearCoarse()  forgets the coarse rows (the coarse layer went empty)
 //     wf.syncSources(sources)  a `source_list` result (app.js hands it every jobs poll); see
 //         Following the capture
@@ -113,7 +115,12 @@
 // fine row over its own band. Without coarse rows the coarse column is background, so the
 // fine column looks as before. Coarse rows are kept (RING_COLUMNS of them) with the column
 // they arrived before, so a redraw replays them between the fine columns, up to one sweep of
-// the older ones first. The axis spans the view, also when wider than the capture.
+// the older ones first. The axis spans the view, also when wider than the capture. When no
+// fine column has been painted for COARSE_ALONE_MS (the fine job stopped, its socket is
+// reconnecting, or its restart failed), each coarse row, at most MAX_ROWS_PER_S a second,
+// paints a column of the coarse layer alone (kept in the ring as such for redraws). A
+// restart on the same source keeps the band shown as the view while the band is unknown, so
+// the coarse layer goes on across it; the band, once known again, sets the view as before.
 //
 // Following the capture (spec 4.3 `follow`): the capture moved by someone else (the node
 // relaunched the page's elastic job on a new capture, seen as a fine row of another band, or
@@ -151,6 +158,11 @@ export const ZOOM_FACTOR = 2;
 export const MIN_VIEW_HZ = 100;
 // How long the view takes to ease to a new capture under `follow target`.
 export const EASE_MS = 400;
+// With no fine column painted for this long, each coarse row (at most MAX_ROWS_PER_S a second)
+// paints a column of the coarse layer alone.
+export const COARSE_ALONE_MS = 1000;
+// The ring entry of a column painted from the coarse layer alone.
+const COARSE_ONLY = Object.freeze({ coarseOnly: true });
 const BG = [0, 0, 48]; // #000030
 // Wheel deltas (px; a line counts WHEEL_LINE_PX, a page WHEEL_PAGE_PX) add up to one zoom
 // step per WHEEL_NOTCH_PX, so a touchpad's stream of small deltas does not zoom at every
@@ -349,6 +361,7 @@ class Waterfall {
     this.coarseRows = []; // {row, col}: a coarse row stitched before fine column `col`
     this.coarseSpan = null; // the union of the stored coarse rows' bands
     this.coarsePainted = 0;
+    this.lastCoarsePaint = -Infinity;
     this.easing = false;
     this.easeRaf = null;
     this.listed = null; // {id, lo, hi}: the shown source's `current` in the last source_list
@@ -459,8 +472,16 @@ class Waterfall {
       this.pendingView = null;
       this.listed = null;
     }
+    // A restart on the same source keeps the band shown as the view until the band is known
+    // again (or for good when the restart fails): the coarse layer goes on painting across it.
+    const keep = restart && src && this.src && src.id === this.src.id ? this.shown() : null;
     this.src = src;
     this.clear();
+    if (keep) {
+      this.view = { lo: keep.lo, hi: keep.hi };
+      this.drawAxis();
+      this.showBandInputs();
+    }
     if (!restart) this.badge.hidden = true;
     if (!src) return;
     try {
@@ -979,7 +1000,7 @@ class Waterfall {
   wheel(ev) {
     ev.preventDefault();
     const s = this.shown();
-    if (!s || this.retuning || this.drag) return;
+    if (!s || !this.band || this.retuning || this.drag) return;
     this.cancelEase();
     const now = performance.now();
     if (now - this.wheelAt > WHEEL_IDLE_MS) this.wheelAcc = 0;
@@ -1126,12 +1147,18 @@ class Waterfall {
     else this.widenBand(row);
     this.paintColumn(row);
     this.lastRowFormat = row.q ? "q" : "db";
+    this.painted += 1;
+    this.pushSlot(row, msg);
+  }
+
+  // Records the column just painted for `row` (a fine row, or COARSE_ONLY) and the time span
+  // of `msg` in the ring, and tells onColumn listeners that everything moved left.
+  pushSlot(row, msg) {
     const slot = this.columns % RING_COLUMNS;
     this.rows[slot] = row;
     this.ringStart[slot] = Number(msg.start_ns) || 0;
     this.ringEnd[slot] = Number(msg.end_ns) || this.ringStart[slot];
     this.columns += 1;
-    this.painted += 1;
     if (this.columnCbs.length) {
       const dpr = this.canvas.width / (this.canvas.clientWidth || 1);
       const shift = Math.min(this.column.width, this.canvas.width) / dpr;
@@ -1146,7 +1173,7 @@ class Waterfall {
   // A frame of the coarse layer's scan: stitched into the coarse column over its step's band
   // (as scan mode stitches its rows) and kept for redraws; the next fine column shows it.
   addCoarseEvent(msg) {
-    if (this.mode === "scan" || !this.band || !this.coarseColumn) return;
+    if (this.mode === "scan" || !this.shown() || !this.coarseColumn) return;
     const row = decodeRow(msg.payload);
     if (!row || !bandRow(row, msg.payload, null)) return;
     this.coarseRows.push({ row, col: this.columns });
@@ -1156,6 +1183,22 @@ class Waterfall {
       ? { lo: Math.min(sp.lo, row.lo), hi: Math.max(sp.hi, row.hi) }
       : { lo: row.lo, hi: row.hi };
     this.fillColumn(row, false, this.coarseColumn);
+    // The fine rows stopped (or never came): the coarse layer moves on its own.
+    const now = performance.now();
+    if (now - this.lastPaint < COARSE_ALONE_MS) return;
+    if (now - this.lastCoarsePaint < 1000 / MAX_ROWS_PER_S) return;
+    this.lastCoarsePaint = now;
+    this.paintCoarseColumn();
+    this.pushSlot(COARSE_ONLY, msg);
+  }
+
+  // Shifts the canvas left by one column and draws the coarse column alone at the right edge.
+  paintCoarseColumn() {
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    const cw = Math.min(this.coarseColumn.width, w);
+    if (w > cw) this.ctx.drawImage(this.canvas, cw, 0, w - cw, h, 0, 0, w - cw, h);
+    this.ctx.putImageData(this.coarseColumn, w - cw, 0);
     this.coarsePainted += 1;
   }
 
@@ -1210,6 +1253,7 @@ class Waterfall {
     this.composeColumn(row);
     if (w > cw) this.ctx.drawImage(this.canvas, cw, 0, w - cw, h, 0, 0, w - cw, h);
     this.ctx.putImageData(this.column, w - cw, 0);
+    if (this.mode !== "scan" && this.coarseRows.length) this.coarsePainted += 1;
   }
 
   // Writes `row` (bins spread over row.lo..row.hi Hz) into `buf` (this.column by default)
@@ -1316,6 +1360,10 @@ class Waterfall {
         this.fillColumn(coarse[ci].row, false, this.coarseColumn);
       }
       const row = this.rows[col % RING_COLUMNS];
+      if (row === COARSE_ONLY) {
+        this.ctx.putImageData(this.coarseColumn, w - (k + 1) * cw, 0);
+        continue;
+      }
       if (!row || row.lo === undefined) continue;
       this.composeColumn(row);
       this.ctx.putImageData(this.column, w - (k + 1) * cw, 0);

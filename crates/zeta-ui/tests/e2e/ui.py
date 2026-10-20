@@ -1343,6 +1343,39 @@ def scenario_coarse_layer_paints_outside_the_capture(page, url, secret):
         stop_scans(url, secret)
 
 
+def scenario_coarse_layer_moves_on_when_the_fine_stream_stops(page, url, secret):
+    # The fine job stops and cannot be restarted (its job_start aborted): the coarse layer
+    # goes on painting columns of its own across the zoomed-out view.
+    stop_scans(url, secret)
+    blocked = {"seen": 0}
+
+    def route(r):
+        body = r.request.post_data or ""
+        if '"job_start"' in body and '"kind":"spectrum"' in body:
+            blocked["seen"] += 1
+            r.abort()
+        else:
+            r.continue_()
+    try:
+        zoom_tone_out(page, url, secret)
+        page.wait_for_function("() => window.zetaTest.wf().coarsePainted > 0", timeout=5_000)
+        page.route("**/op", route)
+        stop_job(url, secret, page.evaluate(WF_STATE_JS)["jobId"])
+        page.wait_for_function("() => window.zetaTest.wf().sourceId === null", timeout=10_000)
+        assert blocked["seen"], "the waterfall did not try to restart its job"
+        w0 = page.evaluate(WF_STATE_JS)
+        page.wait_for_function(
+            f"() => window.zetaTest.wf().coarsePainted > {w0['coarsePainted']} + 10",
+            timeout=5_000)
+        w1 = page.evaluate(WF_STATE_JS)
+        assert w1["painted"] == w0["painted"], f"fine columns painted: {w0} -> {w1}"
+        assert ticks(page)[0] == "100.048" and ticks(page)[-1] == "99.952", ticks(page)
+        page.wait_for_function(f"() => ({TOP_QUARTER_LIT_JS})() > 0", timeout=5_000)
+    finally:
+        page.unroute("**/op")
+        stop_scans(url, secret)
+
+
 def outlines(page):
     page.evaluate("window.zetaTest.poll()")
     return page.locator("#waterfall .outline")
