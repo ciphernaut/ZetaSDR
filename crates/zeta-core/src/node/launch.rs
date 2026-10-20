@@ -1,5 +1,5 @@
 //! Launching jobs: lease, spawn stages, supervise, the IQ forwarders, and
-//! the `scan` job's step loop.
+//! the `scan` job's step loop. Attached jobs launch here too, without the radio.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
@@ -12,13 +12,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::persist::{now, persist};
 use super::{Inner, JobEntry, NodeError, ring_seconds_for};
-use crate::graph::{self, GraphError, NodeId};
+use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::ops::{JobKind, SPECTRUM_ROWS_PER_S, scan_steps, spectrum_size};
 use crate::port::{IqBlock, IqReceiver, Port, Tuning};
 use crate::ring::IqRing;
-use crate::stage::{Stage, StageContext, StageError};
+use crate::stage::{Stage, StageContext, StageError, StageSpec};
 use crate::stream::{Frame, Payload, StreamBus};
+use crate::stream_in::STREAM_IN_KIND;
 use crate::types::{
     ChannelId, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
 };
@@ -26,12 +27,27 @@ use crate::types::{
 impl Inner {
     /// Validate, lease, record as `Running`, persist, then spawn the job's tasks.
     /// On error nothing is recorded and no lease is held.
-    pub(super) async fn launch(self: &Arc<Self>, rec: JobRecord) -> Result<(), NodeError> {
-        let port = self.ports.read().unwrap().get(&rec.source).cloned();
-        let port = port.ok_or_else(|| NodeError::UnknownSource(rec.source.clone()))?;
-        if rec.kind == JobKind::Scan.name() {
-            return self.launch_scan(rec, port).await;
-        }
+    ///
+    /// An attached job (`rec.input`) never touches the radio: no port, lease, tune,
+    /// bank or IQ stream. Its `stream_in` nodes are first pointed at the input job's
+    /// current audio stream (`InputNotRunning` / `NoAudioStream` otherwise), so a
+    /// resumed attached job reads the resumed input.
+    pub(super) async fn launch(self: &Arc<Self>, mut rec: JobRecord) -> Result<(), NodeError> {
+        let port = match rec.input.clone() {
+            Some(input) => {
+                let stream = self.audio_stream(&input)?;
+                point_stream_in(&mut rec.graph, &input, &stream);
+                None
+            }
+            None => {
+                let port = self.ports.read().unwrap().get(&rec.source).cloned();
+                let port = port.ok_or_else(|| NodeError::UnknownSource(rec.source.clone()))?;
+                if rec.kind == JobKind::Scan.name() {
+                    return self.launch_scan(rec, port).await;
+                }
+                Some(port)
+            }
+        };
         graph::validate(&rec.graph, &self.registry)?;
         let mut stages = Vec::with_capacity(rec.graph.nodes.len());
         for n in &rec.graph.nodes {
@@ -45,21 +61,23 @@ impl Inner {
                 })?;
             stages.push(stage);
         }
-        self.leases
-            .ensure(port.as_ref(), rec.id.clone(), rec.tuning)
-            .await?;
-
-        // The bank for the band the lease left the port at, so the stages
-        // never subscribe to one made for a band the port has left.
-        let bank = match port.current() {
-            Some(band) => self.sync_bank(&rec.source, band),
-            None => self
-                .banks
-                .lock()
-                .unwrap()
-                .get(&rec.source)
-                .and_then(|s| s.bank.clone()),
-        };
+        let mut bank = None;
+        if let Some(port) = &port {
+            self.leases
+                .ensure(port.as_ref(), rec.id.clone(), rec.tuning)
+                .await?;
+            // The bank for the band the lease left the port at, so the stages
+            // never subscribe to one made for a band the port has left.
+            bank = match port.current() {
+                Some(band) => self.sync_bank(&rec.source, band),
+                None => self
+                    .banks
+                    .lock()
+                    .unwrap()
+                    .get(&rec.source)
+                    .and_then(|s| s.bank.clone()),
+            };
+        }
         let ctx = StageContext {
             source: rec.source.clone(),
             bank,
@@ -70,47 +88,52 @@ impl Inner {
         let graph = rec.graph.clone();
         let prov = self.record_running(rec, &token)?;
 
-        // One stream per edge; a node with no outgoing edge gets one job output
-        // stream of its stage's first output kind.
+        // One stream per edge; a node with no incoming edge whose stage takes input
+        // reads the job's IQ stream (a job on the radio only). Each node's outputs get
+        // streams by `node_outputs`.
         let edge_streams: Vec<_> = graph
             .edges
             .iter()
             .map(|e| self.bus.register(e.kind, prov.clone()))
             .collect();
-        let roots = graph
-            .nodes
-            .iter()
-            .any(|n| !graph.edges.iter().any(|e| e.to == n.id));
-        let iq = roots.then(|| self.bus.register(StreamKind::Iq, prov.clone()));
+        let roots = graph.nodes.iter().zip(&stages).any(|(n, st)| {
+            !st.spec().inputs.is_empty() && !graph.edges.iter().any(|e| e.to == n.id)
+        });
+        let iq = (roots && port.is_some()).then(|| self.bus.register(StreamKind::Iq, prov.clone()));
         let mut streams: Vec<StreamId> = edge_streams.iter().cloned().chain(iq.clone()).collect();
+        // The job's output streams (no edge consumes them), in graph order: what a job
+        // attached to this one can read.
+        let mut job_outputs = Vec::new();
         let mut set = JoinSet::new();
         for (n, stage) in graph.nodes.iter().zip(stages) {
             let mut inputs = Vec::new();
-            let mut outputs = Vec::new();
+            let mut leaving = Vec::new();
             for (e, sid) in graph.edges.iter().zip(&edge_streams) {
                 if e.to == n.id {
                     inputs.push(self.bus.subscribe(sid).expect("registered"));
                 }
                 if e.from == n.id {
-                    outputs.push(sid.clone());
+                    leaving.push((e.kind, sid.clone()));
                 }
             }
-            if inputs.is_empty() {
-                let sid = iq.as_ref().expect("root nodes have the IQ stream");
+            if inputs.is_empty()
+                && !stage.spec().inputs.is_empty()
+                && let Some(sid) = &iq
+            {
                 inputs.push(self.bus.subscribe(sid).expect("registered"));
             }
-            if outputs.is_empty()
-                && let Some(&k) = stage.spec().outputs.first()
-            {
+            let outputs = node_outputs(stage.spec(), leaving, |k| {
                 let sid = self.bus.register(k, prov.clone());
                 streams.push(sid.clone());
-                outputs.push(sid);
-            }
+                job_outputs.push((k, sid.clone()));
+                sid
+            });
+            let ids = outputs.into_iter().map(|(_, s)| s).collect();
             let (params, bus, cancel) = (n.params.clone(), self.bus.clone(), token.clone());
             let ctx = ctx.clone();
-            set.spawn(async move { stage.run(params, inputs, outputs, bus, cancel, ctx).await });
+            set.spawn(async move { stage.run(params, inputs, ids, bus, cancel, ctx).await });
         }
-        if let Some(sid) = iq {
+        if let (Some(sid), Some(port)) = (iq, &port) {
             let rx = port.subscribe();
             set.spawn(forward_iq(
                 self.bus.clone(),
@@ -131,6 +154,7 @@ impl Inner {
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
             e.done = Some(h);
+            e.outputs = job_outputs;
         }
         Ok(())
     }
@@ -165,6 +189,7 @@ impl Inner {
                 record: rec,
                 cancel: Some(token.clone()),
                 done: None,
+                outputs: Vec::new(),
             },
         );
         Ok(prov)
@@ -225,13 +250,14 @@ impl Inner {
         let h = tokio::spawn(supervise(
             self.clone(),
             id.clone(),
-            port,
+            Some(port),
             set,
             token,
-            vec![out],
+            vec![out.clone()],
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
             e.done = Some(h);
+            e.outputs = vec![(StreamKind::Event, out)];
         }
         Ok(())
     }
@@ -283,14 +309,55 @@ impl Inner {
     }
 }
 
+/// Point every `stream_in` node of an attached job's graph at `stream` of `input`.
+fn point_stream_in(graph: &mut Graph, input: &JobId, stream: &StreamId) {
+    for n in graph.nodes.iter_mut().filter(|n| n.kind == STREAM_IN_KIND) {
+        if let Some(p) = n.params.as_object_mut() {
+            p.insert("job".into(), input.0.clone().into());
+            p.insert("stream".into(), stream.0.clone().into());
+        }
+    }
+}
+
+/// The streams a node's stage outputs to, with their kinds, in the order the stage
+/// receives them. Each entry of the stage's `outputs`, in order, takes the first edge of
+/// its kind leaving the node not yet taken, else a job output stream from `fresh`; edges
+/// left over (a second edge of one kind) follow. A stage that
+/// [emits any kind](StageSpec::emits_any_kind) has one output: the edges leaving it, or
+/// one job output stream of its first kind. For a single-output stage both rules give
+/// the edges leaving it, or one job output stream when there is none.
+fn node_outputs(
+    spec: &StageSpec,
+    mut leaving: Vec<(StreamKind, StreamId)>,
+    mut fresh: impl FnMut(StreamKind) -> StreamId,
+) -> Vec<(StreamKind, StreamId)> {
+    if spec.emits_any_kind() {
+        if leaving.is_empty()
+            && let Some(&k) = spec.outputs.first()
+        {
+            leaving.push((k, fresh(k)));
+        }
+        return leaving;
+    }
+    let mut out = Vec::with_capacity(spec.outputs.len());
+    for &k in &spec.outputs {
+        match leaving.iter().position(|(ek, _)| *ek == k) {
+            Some(i) => out.push(leaving.remove(i)),
+            None => out.push((k, fresh(k))),
+        }
+    }
+    out.extend(leaving);
+    out
+}
+
 /// Await a job's stages. The first to end for any reason other than
 /// cancellation stops the rest; `Failed` wins over a clean end. Then release
-/// the lease, tell the port it is idle if that was its last holder, and
-/// unregister the job's streams.
+/// the lease, tell the port it is idle if that was its last holder (a job on
+/// the radio; an attached job has no port), and unregister the job's streams.
 async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
-    port: Arc<dyn Port>,
+    port: Option<Arc<dyn Port>>,
     mut set: JoinSet<Result<(), StageError>>,
     token: CancellationToken,
     streams: Vec<StreamId>,
@@ -318,8 +385,10 @@ async fn supervise(
         );
     }
     // The only place a started job's lease is released.
-    inner.leases.release(&id);
-    inner.leases.idle_if_unheld(port.as_ref()).await;
+    if let Some(port) = port {
+        inner.leases.release(&id);
+        inner.leases.idle_if_unheld(port.as_ref()).await;
+    }
     for s in &streams {
         inner.bus.unregister(s);
     }

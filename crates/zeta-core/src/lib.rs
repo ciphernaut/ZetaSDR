@@ -14,4 +14,5 @@ pub mod port;
 pub mod ring;
 pub mod stage;
 pub mod stream;
+pub mod stream_in;
 pub mod types;

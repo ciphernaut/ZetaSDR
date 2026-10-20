@@ -13,6 +13,7 @@ use zeta_core::knowledge::StaticKnowledge;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
+use zeta_core::stream_in::StreamInStage;
 use zeta_core::types::SourceId;
 use zeta_plugin::host::PluginCommand;
 use zeta_source_file::{FileOpts, FileSource};
@@ -48,6 +49,7 @@ const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
 pub fn registry(speech: Option<Arc<dyn SpeechBackend>>) -> StageRegistry {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
+    registry.register(Arc::new(StreamInStage::new()));
     zeta_dsp::register_all(&mut registry);
     registry.register(Arc::new(TranscribeStage::new(speech, TRANSCRIBE_TIMEOUT)));
     let dump1090 = zeta_ext::find_dump1090();
@@ -313,6 +315,25 @@ mod tests {
         let src = SourceId("src".into());
         let registry = registry(None);
         for kind in kinds {
+            // An attachable kind is never started on the radio: its graph reads a job.
+            if kind.attachable() {
+                let t = Tuning {
+                    center_hz: Hz(7_100_000),
+                    bandwidth_hz: Hz(10_000),
+                };
+                assert!(
+                    matches!(kind.expand(&src, t, Hz(48_000), None, None, None),
+                        Err(OpError::Other { message }) if message.ends_with("use job_attach")),
+                    "{kind:?}"
+                );
+                let (job, stream) = (
+                    zeta_core::types::JobId::new(),
+                    zeta_core::types::StreamId::new(),
+                );
+                let g = kind.expand_attached(&job, &stream, "en").unwrap();
+                validate(&g, &registry).unwrap_or_else(|e| panic!("{kind:?} attached: {e}"));
+                continue;
+            }
             for rate in [
                 12_000u64, 48_000, 1_000_000, 2_048_000, 2_400_000, 8_000_000, 10_000_000,
                 20_000_000,

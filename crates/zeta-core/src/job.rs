@@ -43,11 +43,16 @@ pub struct JobRecord {
     pub state: JobState,
     pub context: serde_json::Value,
     pub created_ns: Timestamp,
+    /// The job an attached job reads its stream from (`job_attach`); `null` for a job on
+    /// the radio. An attached job holds no lease and copies `source` and `tuning` from it.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<JobId>")]
+    pub input: Option<JobId>,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
-/// `format`, so the published schema requires it.
+/// `format` and `input`, so the published schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -55,7 +60,11 @@ fn require_format(schema: &mut schemars::Schema) {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
     {
-        req.push("format".into());
+        for f in ["format", "input"] {
+            if !req.iter().any(|r| r == f) {
+                req.push(f.into());
+            }
+        }
     }
 }
 
@@ -79,5 +88,26 @@ mod tests {
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v, serde_json::json!({"status": "failed", "reason": "x"}));
         assert_eq!(serde_json::from_value::<JobState>(v).unwrap(), f);
+    }
+
+    #[test]
+    fn a_record_without_input_loads_as_on_the_radio() {
+        let v = serde_json::json!({
+            "format": 1,
+            "id": "01J00000000000000000000000",
+            "kind": "passthrough",
+            "graph": {"id": "g", "nodes": [], "edges": []},
+            "source": "s",
+            "tuning": {"center_hz": 1, "bandwidth_hz": 1},
+            "state": {"status": "stopped"},
+            "context": {},
+            "created_ns": 0
+        });
+        let r: JobRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(r.input, None);
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["input"],
+            serde_json::Value::Null
+        );
     }
 }

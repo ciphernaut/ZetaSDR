@@ -82,6 +82,12 @@ pub enum NodeError {
     Lease(#[from] LeaseError),
     #[error("io: {0}")]
     Io(String),
+    /// An attached job's input job is not running in this node.
+    #[error("input job {} not running", .0.0)]
+    InputNotRunning(JobId),
+    /// An attached job's input job runs but has no audio stream to read.
+    #[error("input job {} has no audio stream", .0.0)]
+    NoAudioStream(JobId),
 }
 
 /// How many stopped or failed job records the node keeps: when a job ends
@@ -97,6 +103,10 @@ struct JobEntry {
     cancel: Option<CancellationToken>,
     /// The supervisor; it releases the lease and unregisters the job's streams.
     done: Option<JoinHandle<()>>,
+    /// The job's output streams (those no edge of its graph consumes), in graph order
+    /// (each node's in its stage's output order), set at launch; an attached job reads
+    /// one of these.
+    outputs: Vec<(StreamKind, StreamId)>,
 }
 
 /// A source's bank for the capture band it was made for; `bank` is `None`
@@ -150,6 +160,25 @@ impl Inner {
         }
     }
 
+    /// The audio stream an attached job reads from `job`: the last audio output stream
+    /// in its graph order (an audio edge between two of its stages does not count).
+    /// `InputNotRunning` unless `job` runs in this node (a record loaded without resume
+    /// does not), `NoAudioStream` when it outputs no audio.
+    fn audio_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
+        let jobs = self.jobs.lock().unwrap();
+        let entry = jobs
+            .get(job)
+            .filter(|e| e.record.state == JobState::Running && e.cancel.is_some())
+            .ok_or_else(|| NodeError::InputNotRunning(job.clone()))?;
+        entry
+            .outputs
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == StreamKind::Audio)
+            .map(|(_, s)| s.clone())
+            .ok_or_else(|| NodeError::NoAudioStream(job.clone()))
+    }
+
     /// `source`'s bank for the capture `band`: the kept one when it was made
     /// for that band, else a new one from the factory (none below
     /// [`PFB_MIN_RATE_HZ`]) replacing it. Without a factory nothing is kept.
@@ -201,7 +230,10 @@ impl Node {
     /// `cfg.resume`, resume every `Running` job and every job that `Failed`
     /// because its source was absent and is now attached (same id, context
     /// and creation time): one whose source is absent or cannot be resumed is
-    /// kept as `Failed`. Without `cfg.resume` every record
+    /// kept as `Failed`. Attached jobs resume after every job on the radio, so
+    /// their input runs first; one whose input does not run is kept as
+    /// `Failed` with `input job <id> not running`, and one that failed that way
+    /// resumes once its input runs. Without `cfg.resume` every record
     /// is loaded as persisted, untouched. `open` itself fails only on
     /// state-directory I/O and on two ports sharing a source id
     /// (`DuplicateSource`).
@@ -212,7 +244,9 @@ impl Node {
     ) -> Result<Self, NodeError> {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
-        let (records, load_errors) = load(&jobs_dir)?;
+        let (mut records, load_errors) = load(&jobs_dir)?;
+        // Jobs on the radio first: an attached job resumes on its input's streams.
+        records.sort_by_key(|r| r.input.is_some());
         let resume = cfg.resume;
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
@@ -261,6 +295,7 @@ impl Node {
                         record: rec,
                         cancel: None,
                         done: None,
+                        outputs: Vec::new(),
                     },
                 );
                 continue;
@@ -280,6 +315,7 @@ impl Node {
                         record: failed,
                         cancel: None,
                         done: None,
+                        outputs: Vec::new(),
                     },
                 );
             }
@@ -292,11 +328,19 @@ impl Node {
     }
 
     /// Whether `open` relaunches `rec`: it is `Running`, or it `Failed` only
-    /// because its source was absent and that source is now attached.
+    /// because its source was absent and that source is now attached, or (an
+    /// attached job) only because its input job was not running and it now runs.
     fn resumable(&self, rec: &JobRecord) -> bool {
-        match &rec.state {
-            JobState::Running => true,
-            JobState::Failed { reason } => {
+        match (&rec.state, &rec.input) {
+            (JobState::Running, _) => true,
+            (JobState::Failed { reason }, Some(input)) => {
+                *reason == NodeError::InputNotRunning(input.clone()).to_string()
+                    && !matches!(
+                        self.inner.audio_stream(input),
+                        Err(NodeError::InputNotRunning(_))
+                    )
+            }
+            (JobState::Failed { reason }, None) => {
                 reason.starts_with("source ")
                     && reason.ends_with(" not present")
                     && self.port(&rec.source).is_some()
@@ -458,10 +502,54 @@ impl Node {
             state: JobState::Running,
             context: serde_json::json!({}),
             created_ns: now(),
+            input: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
         Ok(id)
+    }
+
+    /// Start a job of `kind` on `graph` attached to the job `input`: recorded with
+    /// `input`, the input's `source` and `tuning`, and launched without a lease (see
+    /// [`crate::stream_in`]); the launch points every `stream_in` node at the input's
+    /// audio stream. `UnknownJob` for an unknown input; `InputNotRunning` and
+    /// `NoAudioStream` as [`Node::job_audio_stream`]; on error nothing is recorded.
+    pub async fn job_attach(
+        &self,
+        kind: &str,
+        input: &JobId,
+        graph: Graph,
+    ) -> Result<JobId, NodeError> {
+        let (source, tuning) = {
+            let jobs = self.inner.jobs.lock().unwrap();
+            let e = jobs
+                .get(input)
+                .ok_or_else(|| NodeError::UnknownJob(input.clone()))?;
+            (e.record.source.clone(), e.record.tuning)
+        };
+        let rec = JobRecord {
+            format: JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: kind.to_string(),
+            graph,
+            source,
+            tuning,
+            state: JobState::Running,
+            context: serde_json::json!({}),
+            created_ns: now(),
+            input: Some(input.clone()),
+        };
+        let id = rec.id.clone();
+        self.inner.launch(rec).await?;
+        Ok(id)
+    }
+
+    /// The audio stream a job attached to `job` would read: the last audio output stream
+    /// (not an edge between its stages) in `job`'s graph order. `InputNotRunning` unless
+    /// `job` runs in this node (a one-shot node runs only what it started),
+    /// `NoAudioStream` when it outputs no audio.
+    pub fn job_audio_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
+        self.inner.audio_stream(job)
     }
 
     /// Persist the job as `Stopped`, then cancel its stages and wait for its

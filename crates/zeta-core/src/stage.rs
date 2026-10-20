@@ -37,11 +37,23 @@ pub enum StageError {
     Failed(String),
 }
 
+/// A stage's ports. `outputs` lists one output per entry, in the order the stage
+/// receives their streams (a job gives each its own stream: see
+/// [`StageSpec::emits_any_kind`] for the exception).
 pub struct StageSpec {
     pub kind: &'static str,
     pub inputs: Vec<StreamKind>,
     pub outputs: Vec<StreamKind>,
     pub params_schema: schemars::Schema,
+}
+
+impl StageSpec {
+    /// Whether `outputs` lists every stream kind (`passthrough`): such a stage has one
+    /// output of whatever kind its edge carries, not one output per kind, so a job gives
+    /// it the streams of the edges leaving it, or one stream of its first kind.
+    pub fn emits_any_kind(&self) -> bool {
+        ALL_KINDS.iter().all(|k| self.outputs.contains(k))
+    }
 }
 
 /// What a stage knows of the job it runs in beyond its params and streams:

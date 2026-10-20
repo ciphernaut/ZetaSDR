@@ -43,6 +43,7 @@ predicates = "3.1.4"
 tempfile = "3.27.0"
 zeta-client = { path = "../zeta-client" }
 zeta-dsp = { path = "../zeta-dsp", features = ["test-fixtures"] }
+zeta-speech = { path = "../zeta-speech", features = ["test-fake"] }
 zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] }
 zeta-agent = { path = "../zeta-agent", features = ["test-fake"] }
 zeta-source-kiwi = { path = "../zeta-source-kiwi", features = ["test-fake"] }

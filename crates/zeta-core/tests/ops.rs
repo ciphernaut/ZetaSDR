@@ -465,7 +465,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 14, "one schema per Op variant");
+    assert_eq!(vs.len(), 15, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -528,7 +528,9 @@ fn nested_schemas_are_strict() {
         check_strict(&s[key], key);
     }
     // Stage params, as `node.schema()["stages"]` publishes them.
-    for st in registry().describe().as_array().unwrap() {
+    let mut reg = registry();
+    reg.register(Arc::new(zeta_core::stream_in::StreamInStage::new()));
+    for st in reg.describe().as_array().unwrap() {
         check_strict(&st["params_schema"], &format!("stages.{}", st["kind"]));
     }
     // stream_tail: provenance fields on every frame, and the missed count.
@@ -912,6 +914,84 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
     assert_eq!(rec.state, JobState::Running);
     assert_eq!(rec.graph, before);
     assert_eq!(node.lease_holders(&SourceId("file0".into())).len(), 1);
+}
+
+#[test]
+fn job_attach_schema_has_a_nullable_language() {
+    let s = schema();
+    let v = variants(&s["op"])
+        .iter()
+        .find(|v| v["properties"]["op"]["const"] == "job_attach")
+        .expect("job_attach variant");
+    let mut req: Vec<&str> = v["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    req.sort();
+    assert_eq!(req, ["job", "kind", "language", "op"]);
+    assert_eq!(
+        v["properties"]["language"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    let op: Op = serde_json::from_value(serde_json::json!({
+        "op": "job_attach", "kind": "transcribe", "job": "j", "language": null
+    }))
+    .unwrap();
+    assert_eq!(
+        op,
+        Op::JobAttach {
+            kind: JobKind::Transcribe,
+            job: JobId("j".into()),
+            language: None
+        }
+    );
+    // `language` is required, if only as null.
+    let missing = serde_json::json!({"op": "job_attach", "kind": "transcribe", "job": "j"});
+    assert!(serde_json::from_value::<Op>(missing).is_err());
+    assert!(JobKind::Transcribe.attachable());
+    assert!(!JobKind::WfmDemod.attachable());
+}
+
+#[test]
+fn transcribe_expands_attached_to_stream_in_denoise_vad_transcribe() {
+    let (job, stream) = (JobId("in".into()), StreamId("s".into()));
+    let g = JobKind::Transcribe
+        .expand_attached(&job, &stream, "de")
+        .unwrap();
+    let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+    assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"job": "in", "kind": "audio", "stream": "s"})
+    );
+    assert_eq!(g.nodes[1].params, serde_json::json!({}));
+    assert_eq!(g.nodes[2].params, serde_json::json!({}));
+    assert_eq!(g.nodes[3].params, serde_json::json!({"language": "de"}));
+    assert_eq!(g.edges.len(), 3);
+    for (i, e) in g.edges.iter().enumerate() {
+        assert_eq!(e.kind, StreamKind::Audio);
+        assert_eq!(e.from, g.nodes[i].id);
+        assert_eq!(e.to, g.nodes[i + 1].id);
+    }
+    assert_eq!(
+        JobKind::WfmDemod.expand_attached(&job, &stream, "en"),
+        Err(OpError::Other {
+            message: "wfm_demod is not attachable".into()
+        })
+    );
+    // A transcribe job is never expanded for the radio.
+    let t = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(48_000),
+    };
+    assert_eq!(
+        JobKind::Transcribe.expand(&SourceId("s".into()), t, Hz(48_000), None, None, None),
+        Err(OpError::Other {
+            message: "transcribe attaches to a job: use job_attach".into()
+        })
+    );
 }
 
 #[test]

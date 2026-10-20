@@ -65,6 +65,22 @@ pub enum Op {
         #[schemars(required, schema_with = "nullable_sideband_schema")]
         sideband: Option<Sideband>,
     },
+    /// Attach a job of an attachable `kind` (`transcribe`) to the running job `job`: it
+    /// reads that job's audio output stream (the last one in its graph order when it
+    /// has several; audio passed between two of its stages does not count) instead of
+    /// the radio, holds no lease, copies the job's `source` and `tuning`, and records
+    /// it as its `input`. It ends `stopped` when the input job's
+    /// stream closes for any reason, a restart by `graph_put` included (attach again to
+    /// follow the new graph). On a node restart it resumes after its input, or is
+    /// `failed` with `input job <id> not running` when the input does not run.
+    JobAttach {
+        kind: JobKind,
+        job: JobId,
+        /// BCP-47 language code of the speech (`en`, `de`, `pt-BR`); `null` is `en`.
+        #[serde(deserialize_with = "nullable_string_value")]
+        #[schemars(required, schema_with = "nullable_language")]
+        language: Option<String>,
+    },
     JobList {},
     JobStop {
         job: JobId,
@@ -157,6 +173,34 @@ pub enum Sideband {
     Lsb,
 }
 
+/// Deserialize a required `Option<String>` (see [`nullable_u64`]).
+fn nullable_string_value<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    <Option<String> as Deserialize>::deserialize(d)
+}
+
+/// Schema of `job_attach`'s `language`: `["string","null"]`.
+fn nullable_language(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "description": "BCP-47 language code of the speech (`en`, `de`, `pt-BR`); `null` is `en`."
+    })
+}
+
+/// The language a `job_attach` passing `null` transcribes.
+pub const ATTACH_LANGUAGE_DEFAULT: &str = "en";
+
+/// Whether `code` is a BCP-47 tag as `job_attach` takes it:
+/// `^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$`.
+pub fn is_bcp47(code: &str) -> bool {
+    let mut parts = code.split('-');
+    let primary = parts.next().unwrap_or("");
+    (2..=3).contains(&primary.len())
+        && primary.bytes().all(|b| b.is_ascii_lowercase())
+        && parts.all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
 /// `ssb_demod` audio bandwidth, Hz, used by the `ssb_demod` job kind.
 pub const SSB_AUDIO_BANDWIDTH_HZ: u64 = 2_800;
 
@@ -192,6 +236,8 @@ const ADSB_BANDWIDTH_HZ: u64 = 2_400_000;
 /// with each step's `center_hz` while holding the whole band, so every other
 /// request on the source is a conflict until the scan is stopped.
 /// `adsb_decode` refuses a band under 2 MHz (dump1090 needs most of its 2.4 MHz).
+/// `transcribe` is attachable, not started on the radio: `job_attach` runs it on another
+/// job's audio (see [`JobKind::expand_attached`]); `job_start` refuses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
@@ -208,6 +254,7 @@ pub enum JobKind {
     AdsbDecode,
     Measure,
     Scan,
+    Transcribe,
 }
 
 impl JobKind {
@@ -227,7 +274,72 @@ impl JobKind {
             JobKind::AdsbDecode => "adsb_decode",
             JobKind::Measure => "measure",
             JobKind::Scan => "scan",
+            JobKind::Transcribe => "transcribe",
         }
+    }
+
+    /// Whether the kind runs on another job's output (`job_attach`) rather than on the
+    /// radio (`job_start`).
+    pub fn attachable(&self) -> bool {
+        matches!(self, JobKind::Transcribe)
+    }
+
+    /// Why `job_start` refuses an attachable kind.
+    fn start_refusal(&self) -> OpError {
+        OpError::Other {
+            message: format!("{} attaches to a job: use job_attach", self.name()),
+        }
+    }
+
+    /// The graph of an attached job of this kind reading `input_stream` (an audio stream)
+    /// of `input_job`: `stream_in` then the kind's chain, joined by audio edges. For
+    /// `transcribe`: `stream_in -> denoise -> vad -> transcribe {"language"}`. A kind that
+    /// is not [`attachable`](Self::attachable) is `other("<kind> is not attachable")`.
+    pub fn expand_attached(
+        &self,
+        input_job: &JobId,
+        input_stream: &StreamId,
+        language: &str,
+    ) -> Result<Graph, OpError> {
+        let chain: Vec<(&str, serde_json::Value)> = match self {
+            JobKind::Transcribe => vec![
+                ("denoise", serde_json::json!({})),
+                ("vad", serde_json::json!({})),
+                ("transcribe", serde_json::json!({"language": language})),
+            ],
+            _ => {
+                return Err(OpError::Other {
+                    message: format!("{} is not attachable", self.name()),
+                });
+            }
+        };
+        let mut nodes = vec![GraphNode {
+            id: NodeId::new(),
+            kind: crate::stream_in::STREAM_IN_KIND.into(),
+            params: serde_json::json!({
+                "job": input_job.0,
+                "kind": "audio",
+                "stream": input_stream.0,
+            }),
+        }];
+        nodes.extend(chain.into_iter().map(|(kind, params)| GraphNode {
+            id: NodeId::new(),
+            kind: kind.into(),
+            params,
+        }));
+        let edges = nodes
+            .windows(2)
+            .map(|w| Edge {
+                from: w[0].id.clone(),
+                to: w[1].id.clone(),
+                kind: StreamKind::Audio,
+            })
+            .collect();
+        Ok(Graph {
+            id: GraphId::new(),
+            nodes,
+            edges,
+        })
     }
 
     /// Whether the kind's graph has a `channel` node, so depends on the source rate.
@@ -264,6 +376,9 @@ impl JobKind {
         deviation_hz: Option<Hz>,
         sideband: Option<Sideband>,
     ) -> Result<Graph, OpError> {
+        if self.attachable() {
+            return Err(self.start_refusal());
+        }
         let bw = tuning.bandwidth_hz.0;
         let out = match bank_bin_rate_hz {
             Some(bin_rate) if bw <= bin_rate / 2 => channel_rate_hz(bin_rate, bw),
@@ -295,6 +410,7 @@ impl JobKind {
             });
         }
         Ok(match self {
+            JobKind::Transcribe => unreachable!("refused above: attachable"),
             JobKind::Scan => Graph {
                 id: GraphId::new(),
                 nodes: vec![],
@@ -809,6 +925,7 @@ impl Op {
             Op::SourceList {} => "source_list",
             Op::SourceEnsure { .. } => "source_ensure",
             Op::JobStart { .. } => "job_start",
+            Op::JobAttach { .. } => "job_attach",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
             Op::JobContext { .. } => "job_context",
@@ -1135,6 +1252,12 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
         NodeError::UnknownJob(j) => unknown_job(node, &j),
         NodeError::Graph(detail) => OpError::Graph { detail },
         NodeError::Lease(l) => lease_error(l),
+        NodeError::InputNotRunning(j) => OpError::Other {
+            message: format!("job {} is not running", j.0),
+        },
+        NodeError::NoAudioStream(j) => OpError::Other {
+            message: format!("job {} has no audio stream", j.0),
+        },
         e @ (NodeError::Io(_) | NodeError::DuplicateSource(_)) => other(e),
     }
 }
@@ -1289,6 +1412,9 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             deviation_hz,
             sideband,
         } => {
+            if kind.attachable() {
+                return Err(kind.start_refusal());
+            }
             if sideband.is_some() && kind != JobKind::SsbDemod {
                 return Err(OpError::Other {
                     message: format!(
@@ -1362,6 +1488,11 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             .await?;
             Ok(OpResult::Job(id))
         }
+        Op::JobAttach {
+            kind,
+            job,
+            language,
+        } => job_attach(node, kind, job, language).await,
         Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),
         Op::JobStop { job } => node
             .job_stop(&job)
@@ -1412,6 +1543,35 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
         Op::Classify { selection } => classify(node, selection).await,
         Op::Schema {} => Ok(OpResult::Schema(node.schema())),
     }
+}
+
+/// `job_attach`: check the kind and language, then attach to `job`'s audio stream.
+async fn job_attach(
+    node: &Node,
+    kind: JobKind,
+    job: JobId,
+    language: Option<String>,
+) -> Result<OpResult, OpError> {
+    if !kind.attachable() {
+        return Err(other(format!("{} is not attachable", kind.name())));
+    }
+    let language = language.unwrap_or_else(|| ATTACH_LANGUAGE_DEFAULT.into());
+    if !is_bcp47(&language) {
+        return Err(other(format!(
+            "language {language:?} is not a BCP-47 code such as en, de or pt-BR; pass null for en"
+        )));
+    }
+    if !node.job_list().iter().any(|r| r.id == job) {
+        return Err(unknown_job(node, &job));
+    }
+    let stream = node
+        .job_audio_stream(&job)
+        .map_err(|e| node_error(node, e))?;
+    let graph = kind.expand_attached(&job, &stream, &language)?;
+    node.job_attach(kind.name(), &job, graph)
+        .await
+        .map(OpResult::Job)
+        .map_err(|e| node_error(node, e))
 }
 
 /// The ring's sample rate and centre and the selection's samples, once the

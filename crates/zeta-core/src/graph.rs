@@ -86,7 +86,8 @@ pub enum GraphError {
     Cycle,
 }
 
-/// Check kinds, params, endpoints, edge types, unique node ids, that every root accepts IQ, that there is
+/// Check kinds, params, endpoints, edge types, unique node ids, that every root accepts IQ
+/// (or takes no input at all, as `stream_in`, which reads the bus itself), that there is
 /// at least one node, and that the edges form no cycle, in that order.
 pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphError> {
     for n in &graph.nodes {
@@ -144,10 +145,10 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
         if graph.edges.iter().any(|e| e.to == n.id) {
             continue;
         }
-        let takes_iq = registry
+        let can_root = registry
             .spec(&n.kind)
-            .is_some_and(|s| s.inputs.contains(&StreamKind::Iq));
-        if !takes_iq {
+            .is_some_and(|s| s.inputs.is_empty() || s.inputs.contains(&StreamKind::Iq));
+        if !can_root {
             return Err(GraphError::RootNeedsIq { node: n.id.clone() });
         }
     }
@@ -421,6 +422,23 @@ mod tests {
                 node: NodeId("a".into())
             })
         );
+    }
+
+    #[test]
+    fn a_root_taking_no_input_is_accepted() {
+        let mut r = registry();
+        r.register(Arc::new(Fixed(StageSpec {
+            kind: "bus_reader",
+            inputs: vec![],
+            outputs: vec![StreamKind::Audio],
+            params_schema: schemars::json_schema!({"type": "object"}),
+        })));
+        let g = Graph {
+            id: GraphId::new(),
+            nodes: vec![node("a", "bus_reader", serde_json::json!({}))],
+            edges: vec![],
+        };
+        assert_eq!(validate(&g, &r), Ok(()));
     }
 
     #[test]

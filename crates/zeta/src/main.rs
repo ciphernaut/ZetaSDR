@@ -122,7 +122,7 @@ async fn one_shot(
     then_tail: Option<cli::ThenTail>,
     keep: bool,
 ) -> ExitCode {
-    let starts_job = matches!(op, Op::JobStart { .. });
+    let starts_job = matches!(op, Op::JobStart { .. } | Op::JobAttach { .. });
     if let Op::IqRead { selection } | Op::Classify { selection } = &op {
         wait_for_ring(node, selection).await;
     }

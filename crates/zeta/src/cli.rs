@@ -330,6 +330,19 @@ pub enum JobCmd {
         #[arg(long, requires = "then_tail")]
         keep: bool,
     },
+    /// Attach a processing chain to a running job's output instead of the radio (needs
+    /// that job running in the same node: use it against `zeta serve` with --node)
+    Attach {
+        /// Attached job kind
+        #[arg(long, value_enum)]
+        kind: AttachKind,
+        /// The running job to attach to (an id from `job list`)
+        #[arg(long, value_name = "ID")]
+        job: String,
+        /// BCP-47 language code of the speech (en, de, pt-BR); absent = en
+        #[arg(long, value_name = "CODE")]
+        language: Option<String>,
+    },
     /// List jobs
     List,
     /// Stop a job
@@ -456,6 +469,20 @@ impl From<Kind> for JobKind {
     }
 }
 
+/// Attachable job kinds (`JobKind::attachable`), for `job attach`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum AttachKind {
+    Transcribe,
+}
+
+impl From<AttachKind> for JobKind {
+    fn from(k: AttachKind) -> Self {
+        match k {
+            AttachKind::Transcribe => JobKind::Transcribe,
+        }
+    }
+}
+
 /// SSB sidebands, mirroring `Sideband`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum SidebandArg {
@@ -532,7 +559,7 @@ impl Command {
         matches!(
             self,
             Command::Source(SourceCmd::Ensure(_))
-                | Command::Job(JobCmd::Start { .. } | JobCmd::Stop(_))
+                | Command::Job(JobCmd::Start { .. } | JobCmd::Attach { .. } | JobCmd::Stop(_))
                 | Command::Graph(GraphCmd::Put { .. })
         )
     }
@@ -574,6 +601,15 @@ impl Command {
                 bandwidth_hz: Hz(b.bandwidth_hz),
                 deviation_hz,
                 sideband: sideband.map(Into::into),
+            },
+            Command::Job(JobCmd::Attach {
+                kind,
+                job,
+                language,
+            }) => Op::JobAttach {
+                kind: kind.into(),
+                job: JobId(job),
+                language,
             },
             Command::Job(JobCmd::List) => Op::JobList {},
             Command::Job(JobCmd::Stop(a)) => Op::JobStop { job: job(a) },

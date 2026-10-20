@@ -1521,3 +1521,132 @@ fn ring_budget_flag_is_logged() {
         assert!(err.contains(want), "{mb}: stderr was {err}");
     }
 }
+
+#[test]
+fn job_attach_one_shot_names_an_unknown_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(
+        dir.path(),
+        &["job", "attach", "--kind", "transcribe", "--job", "NOPE"],
+    )
+    .assert()
+    .code(2)
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "unknown", "{v}");
+    assert_eq!(v["field"], "job", "{v}");
+    assert_eq!(v["value"], "NOPE", "{v}");
+}
+
+/// `serve` with a speech daemon; over `--node`: `job start` a `wfm_demod` on a speech
+/// fixture, `job attach --kind transcribe` to it, then `stream tail` its event streams
+/// (`vad`'s and `transcribe`'s) until the daemon's text arrives as a `transcript` event.
+#[test]
+fn job_attach_over_node_tails_a_transcript_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut audio = zeta_dsp::fixtures::speech_like(48_000, 3.0);
+    audio.extend(std::iter::repeat_n(0.0, 2 * 48_000));
+    let iq = zeta_dsp::fixtures::wfm_modulate(&audio, 48_000, 240_000, 75_000.0, 0.0, true);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "speech", &iq, 240_000, 104_700_000);
+    let sock = dir.path().join("voiced.sock");
+    let _daemon = zeta_speech::testing::FakeDaemon::replying(&sock, "ok:hello from the daemon\n");
+    let src = format!("speech={}", meta.display());
+    let node = common::ServeProc::start_full(
+        dir.path(),
+        NODE_SECRET,
+        &["--source-file", &src],
+        &["--stt-socket", sock.to_str().unwrap()],
+        &[],
+    );
+    let remote = |args: &[&str]| {
+        json(
+            &common::zeta_remote(&node.url, NODE_SECRET, args)
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+    };
+    let wfm = remote(&[
+        "job",
+        "start",
+        "--kind",
+        "wfm_demod",
+        "--source",
+        "speech",
+        "--center-hz",
+        "104700000",
+        "--bandwidth-hz",
+        "200000",
+    ]);
+    let wfm = wfm["value"].as_str().expect("job id").to_string();
+    let att = remote(&["job", "attach", "--kind", "transcribe", "--job", &wfm]);
+    assert_eq!(att["result"], "job", "{att}");
+    let att = att["value"].as_str().expect("job id").to_string();
+    let jobs = remote(&["job", "list"]);
+    let rec = jobs["value"]
+        .as_array()
+        .and_then(|a| a.iter().find(|j| j["id"] == att.as_str()))
+        .unwrap_or_else(|| panic!("{att} not in {jobs}"))
+        .clone();
+    assert_eq!(rec["kind"], "transcribe", "{rec}");
+    assert_eq!(rec["input"], wfm.as_str(), "{rec}");
+    assert_eq!(rec["state"]["status"], "running", "{rec}");
+    let streams = remote(&["stream", "list"]);
+    let events: Vec<String> = streams["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["provenance"]["job"] == att.as_str() && s["kind"] == "event")
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(events.len(), 2, "{streams}");
+    let tails: Vec<_> = events
+        .into_iter()
+        .map(|s| {
+            let url = node.url.clone();
+            std::thread::spawn(move || {
+                let args = [
+                    "stream",
+                    "tail",
+                    "--stream",
+                    &s,
+                    "--max-frames",
+                    "1",
+                    "--timeout-ms",
+                    "10000",
+                ];
+                json(
+                    &common::zeta_remote(&url, NODE_SECRET, &args)
+                        .assert()
+                        .success()
+                        .get_output()
+                        .stdout
+                        .clone(),
+                )
+            })
+        })
+        .collect();
+    let frames: Vec<Value> = tails
+        .into_iter()
+        .flat_map(|t| {
+            t.join().unwrap()["value"]["frames"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    let t = frames
+        .iter()
+        .find(|f| f["payload"]["protocol"] == "transcript")
+        .unwrap_or_else(|| panic!("no transcript in {frames:?}"));
+    assert_eq!(t["payload"]["text"], "hello from the daemon", "{t}");
+    assert_eq!(t["job"], att.as_str(), "{t}");
+    assert!(
+        frames.iter().any(|f| f["payload"]["protocol"] == "vad"),
+        "{frames:?}"
+    );
+}
