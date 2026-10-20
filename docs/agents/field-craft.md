@@ -41,6 +41,21 @@ A `--source-node` source is a receiver attached to another ZetaSDR node, typical
 
 A plugin registered with `--plugin KIND=PATH` is a stage kind like any other: it is listed in `schema` under `stages` with its `params_schema`, and you use it by adding a node of that `kind` to a job's graph with `graph get`, edit, `graph put`. No job kind starts it on its own. A plugin that crashes or misbehaves fails its job with a reason naming the plugin.
 
+### Transcribing a channel
+
+Start the demodulator, then attach the transcription to it; the attached job reads the
+demodulator's audio, holds no radio lease and ends when that job stops:
+
+1. `job start --kind wfm_demod --source S --center-hz 100500000 --bandwidth-hz 200000` (`fm_demod`, `am_demod` or `ssb_demod` for voice channels). Note the job id.
+2. `job attach --kind transcribe --job THAT_ID`. Its chain is `stream_in → denoise → vad → transcribe`.
+3. `stream list` shows two event streams on the attached job (`vad`'s and `transcribe`'s); `stream tail` them. A `transcript` event is one utterance (`text`, `language`, `start_ns`, `end_ns`); `vad` events mark where speech starts and stops. An empty tail means no utterance ended in the window, not that nothing was said.
+
+The node needs a speech backend (`--stt-socket` or `--stt-node`); without one the attached job fails naming it, so report that and do not retry. Language: the attached job transcribes `en` unless it was attached with `language`; a language the backend does not list (see `GET /stt/languages`) fails the job naming the languages it has. Do not guess a language from the band.
+
+Music and noise are gated, not separated: `vad` passes any loud audio, so a music station or a broadcast with a bed under the voice yields poor or empty text. Say so rather than reporting the text as the speech. Separation is a slot: an external audio-to-audio plugin (`--plugin separate=PATH`, a Demucs wrapper for instance) replaces the `denoise` node with `graph get` of the attached job, edit, `graph put`. The job restarts on `graph put`. `docs/speech.md` has the daemon install and the plugin stub.
+
+Digital voice decoders (DMR, D-STAR, M17) will be transcribed the same way: they produce audio, so `job attach --kind transcribe` to them.
+
 ### Working layer 4
 
 When a signal has no known decoder, work it in this order:

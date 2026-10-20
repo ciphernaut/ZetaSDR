@@ -11,7 +11,8 @@ SoapySDR, external-process stages), the federation of plan 5 (another node as a 
 menu, agent transcript, graph view), the audio path of plan 7 (48 kHz audio from every
 demodulator, wideband FM, AM and SSB, a signal catalogue for layer 2) and the wideband work of
 plan 8 (a shared channel bank per wide capture, quantised spectrum rows, zoom and pan, the
-`scan` job, a memory-budgeted IQ ring).
+`scan` job, a memory-budgeted IQ ring) and the speech path of plan 10 (transcription of a
+channel: [docs/speech.md](docs/speech.md)).
 
 Design: [docs/superpowers/specs/2026-10-18-zetasdr-design.md](docs/superpowers/specs/2026-10-18-zetasdr-design.md).
 Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2026-10-18-core-node.md),
@@ -21,7 +22,8 @@ Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2
 [docs/superpowers/plans/2026-10-19-federation.md](docs/superpowers/plans/2026-10-19-federation.md),
 [docs/superpowers/plans/2026-10-19-ui.md](docs/superpowers/plans/2026-10-19-ui.md),
 [docs/superpowers/plans/2026-10-19-audio-wfm.md](docs/superpowers/plans/2026-10-19-audio-wfm.md),
-[docs/superpowers/plans/2026-10-19-wideband.md](docs/superpowers/plans/2026-10-19-wideband.md).
+[docs/superpowers/plans/2026-10-19-wideband.md](docs/superpowers/plans/2026-10-19-wideband.md),
+[docs/superpowers/plans/2026-10-20-speech.md](docs/superpowers/plans/2026-10-20-speech.md).
 
 ## Tests
 
@@ -183,6 +185,31 @@ scheduler then prefers it; without one the CPU FFT runs, so a missing GPU never 
 `gpu_matches_cpu_within_0_1_db` must be run on a GPU host to count as verification (hardware equivalence is pending on the field host): elsewhere it prints `skipped: no adapter` and passes. Software adapters (lavapipe, llvmpipe) are ignored unless `ZETA_GPU_ALLOW_SOFTWARE=1`;
 `software_adapter_allowed_by_env` sets it, so a GPU-less box with Mesa still runs the GPU path. A
 GPU failure at run time is logged to stderr and that spectrum is computed on the CPU.
+
+## Speech
+
+Transcription of a radio channel. The crate `zeta-speech` holds the speech backends
+(`SocketBackend` for a daemon on a Unix socket such as `local-voice`'s `voiced`, `NodeBackend`
+for another node's `POST /stt`) and the `transcribe` stage; `zeta-dsp` holds `denoise` and
+`vad`; `zeta-core` holds `stream_in`. The stages `stream_in`, `denoise`, `vad` and `transcribe`
+form the chain of an **attached job**, which reads another job's audio instead of the radio:
+
+```bash
+Z=./target/debug/zeta
+$Z --node http://field-host:7979 job start --kind wfm_demod --source b210 --center-hz 100500000 --bandwidth-hz 200000
+$Z --node http://field-host:7979 job attach --kind transcribe --job <wfm job id>
+$Z --node http://field-host:7979 stream list    # the attached job's two event streams
+```
+
+`zeta job attach --kind transcribe --job ID [--language CODE]` creates the attached job; the
+node needs a speech backend, chosen with the global flags `--stt-socket PATH` (default
+`$XDG_RUNTIME_DIR/voiced.sock` when it exists) or `--stt-node URL` (secret in
+`ZETA_STT_NODE_SECRET`), which are exclusive. `denoise` is RNNoise through `nnnoiseless`
+(BSD-3-Clause, weights embedded). Source separation, for music under speech, is a slot filled
+by an external audio plugin, for instance a Demucs wrapper on a GPU host:
+`examples/python/separate_stub.py` shows the contract and `docs/speech.md` ("Separation") how to
+swap it into the chain. [docs/speech.md](docs/speech.md) also covers installing `local-voice` on
+a node's host, writing your own daemon and sharing one daemon between nodes.
 
 ## Sources
 

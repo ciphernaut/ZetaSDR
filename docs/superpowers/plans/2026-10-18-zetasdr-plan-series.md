@@ -17,6 +17,7 @@ interfaces rather than guessed ones.
 | 7 | Audio path and wideband FM | Rational resampler so every demod outputs 48 kHz audio; `wfm_demod`, `am_demod` and `ssb_demod` job kinds (`--sideband`); layer-1 rules for `wfm` (19 kHz pilot as evidence), `am` and `ssb`; iNTERCEPT signal catalogue (Apache-2.0, 594 entries) as knowledge provider and layer-2 classifier; UI decode entries and playback of any audio job. **Delivered** on branch `audio-wfm`, 2026-10-19. Pending: AM and SSB playback in a browser. | 2, 6 |
 | 8 | Wideband | Polyphase filter bank shared by every job on a wide capture (a channel that fits one bin is bank-served, wider ones take the direct path); spectrum rows v2 (fixed `rows_per_s`, u8-quantised `q`, up to 8192 bins); UI band control (zoom and pan inside the capture render only, beyond it retune); `scan` job that time-shares a radio across a span wider than one capture and holds the lease on it; IQ ring sized from a memory budget (`--ring-budget-mb`); `wfm_demod` decimates before its audio filter. **Delivered** on branch `wideband`, 2026-10-20. Pending: the fix wave (sub-band scan clamp, overlays and scan redraw), the B210 at 24 Msps (its asserted `max_bandwidth_hz` is 16 MHz), and the bank's 20 % cost target (33 % measured at 16 Msps). | 2, 6, 7 |
 | 9 | Decoders | Four decode job kinds: `pocsag_decode` (12.5 kHz FM channel, 512/1200/2400 baud detected automatically), `rds_decode` (200 kHz FM broadcast band; `pi`, `ps`, `rt`), `adsb_decode` (1 090 MHz, 2.4 MHz band, dump1090 run on the node's host through the new crate `zeta-ext`) and `acars_decode` (10 kHz AM channel, 2400 baud MSK); decode-to-identify in `classify` (APRS, POCSAG and ACARS on narrow bands, RDS on wide ones); `decoder` on catalogue signatures; UI entries; field craft for pagers, aircraft and FM data. **Delivered** on branch `decoders`, 2026-10-20. Pending: live acceptance on the field host. | 2, 7, 8 |
+| 10 | Speech on a channel | Transcription of a radio channel: audio frames carry a channel count; stages `denoise` (RNNoise via `nnnoiseless`), `vad` (energy-over-floor voice gate) and `transcribe` (new crate `zeta-speech`, speech backends `SocketBackend` for a `local-voice`-protocol daemon and `NodeBackend` for another node's `/stt`, global flags `--stt-socket` and `--stt-node`); attached jobs (`stream_in` stage, `job_attach` op, `zeta job attach`) so any audio-producing job, demodulators now and digital voice decoders later, can be transcribed; UI entries and transcript ribbons; the source-separation slot proven with an external audio plugin (`examples/python/separate_stub.py`) swapped in with `graph put`; `docs/speech.md`. **Delivered** on branch `speech`, 2026-10-20. Pending: live acceptance on the field host (needs `local-voice` installed there, `docs/speech.md` section 1). | 2, 7, 9 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
@@ -401,3 +402,46 @@ no RDS carried; `classify` over the 104.9 MHz capture gave the layer-1 `wfm` lab
 (captures at 120 kHz, 120 kHz and 2.4576 MHz; dump1090 started with the SC16 float path and exited cleanly
 at the stop, no process left) but saw no events: plumbing pass, no signal verified at that hour with the
 antenna in use. The radio was left at 104.9 MHz / 1 MHz with no jobs.
+
+
+## Plan 10 status
+
+Plan 10 is delivered on `speech` (tasks 1-8). Not yet tried live: the live acceptance on the field host
+(below) has not run, so nothing here was transcribed off air.
+
+What was built:
+
+- Audio frames carry a channel count (interleaved; 1 today) on the bus, the plugin wire and the
+  websocket.
+- Stages: `denoise` (RNNoise through the pure-Rust `nnnoiseless`, BSD-3-Clause), `vad` (energy over a
+  tracked noise floor, with onset look-back and hangover; emits `vad` events and the speech segments)
+  and `transcribe` (crate `zeta-speech`: accumulates an utterance, downmixes and resamples to 16 kHz
+  mono, encodes WAV, calls a `SpeechBackend`, emits one `transcript` event per utterance).
+- Speech backends behind one trait: `SocketBackend` (the `local-voice` line protocol, `languages`
+  probe limited to 2 s) and `NodeBackend` (another node's `POST /stt`, one hop only); `/stt`,
+  `GET /stt/languages` and `?lang=` run on the same trait. Global flags `--stt-socket` and `--stt-node`
+  (exclusive; ignored with `--node`).
+- Attached jobs: the `stream_in` stage, the `job_attach` op and `zeta job attach`; `transcribe` is the
+  first attachable kind (graph `stream_in -> denoise -> vad -> transcribe`).
+- UI: transcribe entries, job attach and transcript ribbons.
+- The separation slot: `examples/python/separate_stub.py` (an external audio-to-audio plugin) replaces
+  `denoise` through `graph put`; `crates/zeta/tests/speech_chain.rs` proves it ends in a `transcript`.
+  `examples/python/stt_daemon_stub.py` is the bring-your-own daemon.
+- Docs: `docs/speech.md` (installing `local-voice` on a node's host, bring your own daemon, one daemon
+  for several nodes), "Transcribing a channel" in field craft, README.
+
+Gates at the branch head (`cargo test --workspace --all-features --no-fail-fast`): 757 passed, 0 failed,
+3 ignored. The run showed one failure, `zeta-dsp` `acars::tests::acarsdec_decodes_our_fixture` (the
+acarsdec oracle, flaky under load as in plan 9), which passed in 4 of 4 re-runs alone, so 756 passed in
+the run plus that test. Included: `zeta` `cli` 43, `attach` 5, `speech_chain` 1, and the UI suite
+(`ui_scenarios_pass_in_headless_chromium`) ok in 171 s with no `ui e2e skipped` line. `cargo fmt -p`
+for each of the 17 members, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`zeta agents-md --check` and `--skill --check` are clean.
+
+Finding: after a `graph put` on an attached job the restarted chain sometimes goes quiet (in one probe
+run `vad` gave two events and then none for 30 s; in three others `vad` events kept arriving for 40 s),
+so `speech_chain` puts up to three times. Not investigated.
+
+Live acceptance (to do, on the field host as the `sdr` user): install `local-voice` as in docs/speech.md
+section 1, `zeta serve --stt-socket`, `wfm_demod` on 100.5 MHz / 200 kHz, `job attach --kind transcribe`
+and expect `transcript` events with the programme's speech. Outcomes are not yet recorded.
