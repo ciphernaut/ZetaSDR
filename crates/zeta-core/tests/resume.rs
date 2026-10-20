@@ -257,6 +257,72 @@ async fn scan_resumes_first_and_names_itself_in_the_others_reason() {
     }
 }
 
+/// Narrow rigid jobs that shared one wide capture: resume tunes the source to the band
+/// bounding them all, so every one fits again.
+#[tokio::test]
+async fn resume_restores_a_capture_shared_by_narrow_rigid_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = |center_hz: u64| Tuning {
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(48_000),
+    };
+    let ids = [JobId::new(), JobId::new(), JobId::new()];
+    write_records(
+        dir.path(),
+        &[
+            running(&ids[0], "passthrough", at(99_200_000), 1),
+            running(&ids[1], "passthrough", at(100_000_000), 2),
+            running(&ids[2], "passthrough", at(101_000_000), 3),
+        ],
+    );
+    let node = Node::open(cfg(dir.path()), registry(), vec![Radio::new()])
+        .await
+        .unwrap();
+    for id in &ids {
+        assert_eq!(record(&node, id).state, JobState::Running, "{id:?}");
+    }
+    let sources = match node.apply(Op::SourceList {}).await.unwrap() {
+        OpResult::Sources(v) => v,
+        r => panic!("source_list: {r:?}"),
+    };
+    // 99_176_000 ..= 101_024_000 Hz.
+    assert_eq!(
+        sources[0].current,
+        Some(Tuning {
+            center_hz: Hz(100_100_000),
+            bandwidth_hz: Hz(1_848_000),
+        })
+    );
+    let mut holders = sources[0].holders.clone();
+    holders.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut want = ids.to_vec();
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(holders, want);
+}
+
+/// A scan resumes before every rigid record, even one wider than the scan's band.
+#[tokio::test]
+async fn a_narrow_scan_still_resumes_before_a_wider_rigid_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (demod, scan) = (JobId::new(), JobId::new());
+    write_records(
+        dir.path(),
+        &[
+            running(&demod, "passthrough", band(48_000), 1),
+            running(&scan, "scan", band(40_000), 2),
+        ],
+    );
+    let node = Node::open(cfg(dir.path()), registry(), vec![Radio::new()])
+        .await
+        .unwrap();
+    assert_eq!(record(&node, &scan).state, JobState::Running);
+    match record(&node, &demod).state {
+        JobState::Failed { reason } => assert!(reason.contains(&scan.0), "{reason}"),
+        s => panic!("demod resumed as {s:?}"),
+    }
+    node.job_stop(&scan).await.unwrap();
+}
+
 #[tokio::test]
 async fn job_start_records_the_capture_rate() {
     let dir = tempfile::tempdir().unwrap();

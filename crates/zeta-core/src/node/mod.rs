@@ -20,7 +20,7 @@ use crate::graph::{self, Graph, GraphError};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
-use crate::ops::{Op, OpError, OpResult};
+use crate::ops::{JobKind, Op, OpError, OpResult};
 use crate::port::{Port, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Backend, StageRegistry};
@@ -302,6 +302,48 @@ impl Inner {
     }
 }
 
+/// The capture a source's resumable rigid records shared: the widest one's band
+/// when it contains the others (the capture it tuned), else the band bounding them
+/// all when the port can capture it (no wider than `max_bandwidth_hz`, its centre in
+/// the tune range), else an elastic record's band that contains them all. `None`:
+/// no rigid record, or no such band (each launch then tunes as before).
+fn resume_capture(
+    caps: &Capabilities,
+    rigid: &[Tuning],
+    elastic: impl IntoIterator<Item = Tuning>,
+) -> Option<Tuning> {
+    let edges = |t: &Tuning| {
+        let half = t.bandwidth_hz.0 / 2;
+        (
+            t.center_hz.0.saturating_sub(half),
+            t.center_hz.0.saturating_add(half),
+        )
+    };
+    let contains = |outer: &Tuning| {
+        let (ol, oh) = edges(outer);
+        rigid.iter().all(|t| {
+            let (l, h) = edges(t);
+            l >= ol && h <= oh
+        })
+    };
+    let widest = rigid.iter().max_by_key(|t| t.bandwidth_hz.0)?;
+    if contains(widest) {
+        return Some(*widest);
+    }
+    let lo = rigid.iter().map(|t| edges(t).0).min()?;
+    let hi = rigid.iter().map(|t| edges(t).1).max()?;
+    let bounding = Tuning {
+        center_hz: Hz(lo + (hi - lo) / 2),
+        bandwidth_hz: Hz(hi - lo),
+    };
+    let tunable =
+        (caps.tune_min_hz.value().0..=caps.tune_max_hz.value().0).contains(&bounding.center_hz.0);
+    if tunable && bounding.bandwidth_hz.0 <= caps.max_bandwidth_hz.value().0 {
+        return Some(bounding);
+    }
+    elastic.into_iter().find(|t| contains(t))
+}
+
 /// Dropping the node cancels its tasks without touching persisted state, so
 /// `Running` jobs resume on the next `open`.
 pub struct Node {
@@ -322,8 +364,9 @@ impl Node {
     /// `cfg.resume`, resume every `Running` job and every job that `Failed`
     /// because its source was absent and is now attached (same id, context
     /// and creation time): one whose source is absent or cannot be resumed is
-    /// kept as `Failed`. A source's jobs resume widest band first (ties oldest
-    /// first), so the first tunes the capture the others shared; one that
+    /// kept as `Failed`. A source's capture is restored first (the band its
+    /// rigid jobs shared, see [`resume_capture`]), then its jobs resume, a scan
+    /// first of all, then widest band first (ties oldest first); one that
     /// still does not fit fails with the `conflict` reason. Elastic jobs
     /// resume after every rigid one and join the capture they left. Attached jobs
     /// resume after every job on the radio, so their input runs first; one
@@ -341,14 +384,16 @@ impl Node {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (mut records, load_errors) = load(&jobs_dir)?;
-        // Jobs on the radio first: an attached job resumes on its input's streams. Then
-        // the widest band first: it tunes the source to the capture the narrower jobs
-        // shared, so they fit inside it again (a scan's whole band comes first of all).
-        // Elastic jobs after every rigid one: they join whatever capture those left.
+        // Jobs on the radio first: an attached job resumes on its input's streams. A
+        // scan first of all, however narrow: it time-shares the source and the others
+        // fail naming it, as they would live. Then the widest band first, inside the
+        // capture `resume_captures` restores. Elastic jobs after every rigid one: they
+        // join whatever capture those left.
         records.sort_by_key(|r| {
             (
                 r.input.is_some(),
                 r.elastic,
+                r.kind != JobKind::Scan.name(),
                 Reverse(r.tuning.bandwidth_hz.0),
                 r.created_ns.0,
             )
@@ -395,6 +440,10 @@ impl Node {
         for port in ports {
             node.add_port(port)?;
         }
+        let restoring = match resume {
+            true => node.resume_captures(&records).await,
+            false => Vec::new(),
+        };
         for rec in records {
             if !resume || !node.resumable(&rec) {
                 node.inner.jobs.lock().unwrap().insert(
@@ -435,11 +484,63 @@ impl Node {
                 );
             }
         }
+        for (holder, port) in restoring {
+            node.inner.leases.release(&holder);
+            node.inner.leases.idle_if_unheld(port.as_ref()).await;
+        }
         {
             let mut jobs = node.inner.jobs.lock().unwrap();
             Inner::prune_history(&mut jobs, &node.inner.jobs_dir);
         }
         Ok(node)
+    }
+
+    /// Before resuming, hold each source at the capture its resumable rigid records
+    /// shared (see [`resume_capture`]) with a lease under a fresh id, so the first
+    /// launch does not tune it down to its own band and the narrower ones fit again.
+    /// The caller releases each returned lease once every record is launched. A
+    /// source with a resumable scan is left alone: the scan takes it first.
+    async fn resume_captures(&self, records: &[JobRecord]) -> Vec<(JobId, Arc<dyn Port>)> {
+        let mut sources: Vec<&SourceId> = records
+            .iter()
+            .filter(|r| r.input.is_none())
+            .map(|r| &r.source)
+            .collect();
+        sources.sort_by(|a, b| a.0.cmp(&b.0));
+        sources.dedup();
+        let mut held = Vec::new();
+        for source in sources {
+            let Some(port) = self.port(source) else {
+                continue;
+            };
+            let mine: Vec<&JobRecord> = records
+                .iter()
+                .filter(|r| &r.source == source && r.input.is_none() && self.resumable(r))
+                .collect();
+            if mine.iter().any(|r| r.kind == JobKind::Scan.name()) {
+                continue;
+            }
+            let rigid: Vec<Tuning> = mine
+                .iter()
+                .filter(|r| !r.elastic)
+                .map(|r| r.tuning)
+                .collect();
+            let elastic = mine.iter().filter(|r| r.elastic).map(|r| r.tuning);
+            let Some(capture) = resume_capture(port.capabilities(), &rigid, elastic) else {
+                continue;
+            };
+            let holder = JobId::new();
+            if self
+                .inner
+                .leases
+                .ensure(port.as_ref(), holder.clone(), capture, false)
+                .await
+                .is_ok()
+            {
+                held.push((holder, port));
+            }
+        }
+        held
     }
 
     /// Whether `open` relaunches `rec`: it is `Running`, or it `Failed` only

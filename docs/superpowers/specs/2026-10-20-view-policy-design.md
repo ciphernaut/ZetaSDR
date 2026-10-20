@@ -100,7 +100,10 @@ the new fields.
 
 At `Node::open` with `resume`, the running records of one source are launched widest band first (ties by
 `created_ns`), elastic records after every rigid one, and attached records after their inputs (as today).
-The first launch tunes the source to the widest band, so the narrower jobs that shared that capture fit
+Before the first launch the source is held at the capture its rigid records shared: the band bounding
+them when it is no wider than `max_bandwidth_hz` and its centre is in the tune range, else a resumable
+elastic record's band that contains them all (amended by the final review, ruling R21); a scan record
+launches first of all whatever its width. So the narrower jobs that shared that capture fit
 inside it again instead of conflicting; a job that still conflicts fails with the `conflict` reason as
 today (it never fitted the capture it was persisted under, or that capture's job is gone).
 
