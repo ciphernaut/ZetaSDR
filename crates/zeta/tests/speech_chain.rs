@@ -92,6 +92,8 @@ fn separate_plugin_replaces_denoise_in_an_attached_chain() {
     let file = dir.path().join("graph.json");
     std::fs::write(&file, graph.to_string()).unwrap();
     let mut frames: Vec<Value> = Vec::new();
+    // FIXME: remove the retry once vad lets digital silence lower its floor (plan 10 final fix
+    // wave); until then a chain restarted mid-burst can stall.
     for _attempt in 0..3 {
         let put = remote(&[
             "graph",
@@ -103,11 +105,10 @@ fn separate_plugin_replaces_denoise_in_an_attached_chain() {
         ]);
         assert_ne!(put["error"], "invalid", "{put}");
 
-        // Timing matters: the tails must start right after the `graph put`. Started a second
-        // later, or in later windows over the looping source, no transcript arrived within 40 s
-        // (see the task 8 report), so do not insert work between the put and the tails.
-        // The restarted chain also goes quiet now and then (about one run in three), so the
-        // put is tried up to three times.
+        // A failed attempt is the known restart stall (observed in about 2 of 7 runs): the
+        // restarted chain goes quiet, and the tails then see no transcript. Started a second
+        // after the put, or in later windows, they fare no better, so the tails start
+        // immediately after the put. Three failures in a row still fail the test.
         // Tail the restarted chain's event streams (`vad`'s and `transcribe`'s) at once, then
         // check the stored graph while they wait.
         let streams = remote(&["stream", "list"]);

@@ -430,17 +430,21 @@ What was built:
 - Docs: `docs/speech.md` (installing `local-voice` on a node's host, bring your own daemon, one daemon
   for several nodes), "Transcribing a channel" in field craft, README.
 
-Gates at the branch head (`cargo test --workspace --all-features --no-fail-fast`): 757 passed, 0 failed,
-3 ignored. The run showed one failure, `zeta-dsp` `acars::tests::acarsdec_decodes_our_fixture` (the
-acarsdec oracle, flaky under load as in plan 9), which passed in 4 of 4 re-runs alone, so 756 passed in
-the run plus that test. Included: `zeta` `cli` 43, `attach` 5, `speech_chain` 1, and the UI suite
-(`ui_scenarios_pass_in_headless_chromium`) ok in 171 s with no `ui e2e skipped` line. `cargo fmt -p`
-for each of the 17 members, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-`zeta agents-md --check` and `--skill --check` are clean.
+Gates at the branch head: `cargo test --workspace --all-features --no-fail-fast`: 756 passed, 1 failed,
+3 ignored. The failure was `zeta-dsp` `acars::tests::acarsdec_decodes_our_fixture` (an external-oracle
+test unrelated to this plan), which passed 4 of 4 when run alone under no load; so the plan's
+no-`FAILED` gate was not met on the full run. Included: `zeta` `cli` 43, `attach` 5, `speech_chain` 1,
+and the UI suite (`ui_scenarios_pass_in_headless_chromium`) ok in 171 s with no `ui e2e skipped` line.
+`cargo fmt -p` for each of the 17 members, `cargo clippy --workspace --all-targets --all-features -- -D
+warnings`, `zeta agents-md --check` and `--skill --check` are clean.
 
-Finding: after a `graph put` on an attached job the restarted chain sometimes goes quiet (in one probe
-run `vad` gave two events and then none for 30 s; in three others `vad` events kept arriving for 40 s),
-so `speech_chain` puts up to three times. Not investigated.
+Finding: after a `graph put` on an attached job the restarted chain sometimes goes quiet (observed in
+2 of 7 runs; in one probe run `vad` gave two events and then none for 30 s, in three others `vad` events
+kept arriving for 40 s), so `speech_chain` puts up to three times. The cause is the voice gate's noise
+floor: it seeds from the first frame and, under the current rule, is never lowered by exact-zero
+silence, so a chain restarted mid-burst on the clean fixture keeps its floor at speech level. A fix
+(digital silence lowers the floor to its -80 dB minimum) is scheduled in the final fix wave, after which
+the retry in `speech_chain.rs` is to be removed.
 
 Live acceptance (to do, on the field host as the `sdr` user): install `local-voice` as in docs/speech.md
 section 1, `zeta serve --stt-socket`, `wfm_demod` on 100.5 MHz / 200 kHz, `job attach --kind transcribe`
