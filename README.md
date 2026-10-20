@@ -63,15 +63,15 @@ Taking a source from other jobs, and the node's ops log:
 
 ```bash
 ./target/debug/zeta job start --kind adsb_decode --source b210 --center-hz 1090000000 \
-    --bandwidth-hz 2400000 --replace job-1,job-2   # stops the named holders and starts, atomically
+    --bandwidth-hz 2400000 --replace job-1,job-2   # stops the named holders, then starts (under the gate)
 ./target/debug/zeta job start --kind spectrum --source b210 --center-hz 100000000 \
     --bandwidth-hz 2000000 --elastic               # never conflicts, follows retunes (spectrum only)
 ./target/debug/zeta source ensure --source b210 --center-hz 100000000 --bandwidth-hz 2000000 --replace job-1
-./target/debug/zeta ops tail --lines 20            # last applied ops, local state dir only
+./target/debug/zeta ops tail --lines 20            # last applied ops (default 50), local state dir only
 ```
 
 A `conflict` error names the holders and offers `retry with replace: [<ids>]`; `--replace` ids
-must hold that source as rigid leases. Elastic jobs are listed under `elastic` in `source list`.
+must hold that source as rigid leases; naming an elastic job is the error `job <id> does not hold source <src>`, nothing is stopped and it keeps running. Replace is not transactional: if a holder you did not name still conflicts, the jobs you named stay stopped. Elastic jobs are listed under `elastic` in `source list`.
 Every applied op is appended as one JSON line (the op's payload plus `t_ns`) to `<state-dir>/ops.log`,
 rotated to `ops.log.1` past 8 MiB; `ops tail` reads it and is a usage error with `--node`. A restart
 resumes a source's jobs widest first, elastic after rigid, and re-expands a built-in graph if the

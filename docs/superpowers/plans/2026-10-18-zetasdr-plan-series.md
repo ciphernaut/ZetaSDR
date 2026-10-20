@@ -519,7 +519,7 @@ Gates at the branch head:
 
 - `cargo test --workspace --all-features --no-fail-fast`: 805 passed, 0 failed, 3 ignored (106 `test
   result` lines), no `FAILED`, no `ui e2e skipped`. The UI suite
-  (`ui_scenarios_pass_in_headless_chromium`, 61 scenarios) ran ok in 218.86 s.
+  (`ui_scenarios_pass_in_headless_chromium`, 61 scenarios) ran ok in 218.86 s in the final gate, up to 229 s in earlier runs.
 - `cargo fmt -p` for each workspace member (all but the excluded `zeta-source-soapy-driver`),
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `zeta agents-md --check`
   and `--skill --check` are clean.
