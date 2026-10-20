@@ -31,7 +31,11 @@
 //       never mistaken for a manual one) and is retried on the next decision, STOP_RETRY_MS
 //       later at the latest; the id is forgotten only once a fresh job_list shows the scan
 //       no longer running. While the waterfall itself follows the own scan (the shown-source
-//       fallback, scan mode) nothing is decided.
+//       fallback, scan mode) nothing else is decided: zoomed back in under auto_scan_stop
+//       "inside" to a band the shown source can capture, the own scan is stopped and the
+//       waterfall restores that view (wf.restoreView). A followed scan whose event stream
+//       is not found (STREAM_LOOKUPS tries) is no longer followed and a decision is
+//       scheduled, which follows it again.
 //       Nothing is decided while the waterfall eases to a new capture (wf.easing): its end
 //       fires onView again. Under zoom_out "none", or with no scanner for the view, the
 //       waterfall's coarse rows are dropped (wf.clearCoarse): the coarse layer is empty.
@@ -189,7 +193,10 @@ class Coarse {
       this.forgetOwn();
     }
     // The shown-source fallback: the waterfall itself follows the own scan in scan mode.
-    if (this.scanJobId && wf.jobId === this.scanJobId) return;
+    if (this.scanJobId && wf.jobId === this.scanJobId) {
+      await this.endFallback();
+      return;
+    }
     const v = wf.isOutside() ? { lo: wf.view.lo, hi: wf.view.hi } : null;
     const scanning = this.view.get("zoom_out") === "scan";
     if (!v || !scanning) {
@@ -235,6 +242,25 @@ class Coarse {
     }
     if (!(await this.stopOwn())) return;
     await this.startOwn(pick.id, lo, hi);
+  }
+
+  // The shown-source fallback scan (ruling R23): zoomed back in (narrower than the scan by
+  // more than SPAN_CHANGE) to a band the shown source can capture, under auto_scan_stop
+  // "inside", the scan is stopped and the waterfall asks for that band (wf.restoreView), so
+  // the page's elastic job comes back on it. The scan's span does not follow other zooms: in
+  // scan mode the waterfall keeps the view inside the scan, so only a zoom in can change it.
+  async endFallback() {
+    const wf = this.wf;
+    const v = wf.shown();
+    const s = this.span || wf.band;
+    if (!v || !s || this.view.get("auto_scan_stop") !== "inside") return;
+    if (!(v.hi - v.lo < (s.hi - s.lo) * (1 - SPAN_CHANGE))) return;
+    const srcs = (await this.fetchList("source_list")) || this.lastSources() || [];
+    if (this.destroyed || !this.scanJobId || wf.jobId !== this.scanJobId) return;
+    const info = srcs.find((x) => x.id === wf.sourceId);
+    if (!info || !wf.capturable(info, v.lo, v.hi)) return;
+    if (!(await this.stopOwn())) return;
+    wf.restoreView(v.lo, v.hi);
   }
 
   // Whether lo..hi differs from the running span by more than SPAN_CHANGE of its width.
@@ -373,7 +399,14 @@ class Coarse {
       }
       if (!streamId) await sleep(STREAM_LOOKUP_MS);
     }
-    if (gen !== this.subGen || !streamId) return;
+    if (gen !== this.subGen) return;
+    if (!streamId) {
+      // Not found: nothing is followed, and the next decision (now) follows it again.
+      this.followed = null;
+      this.source = null;
+      this.schedule();
+      return;
+    }
     this.sub = this.api.streamText(
       streamId,
       (msg) => {

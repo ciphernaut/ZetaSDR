@@ -1283,6 +1283,29 @@ def scenario_failed_auto_scan_stop_is_retried(page, url, secret):
         stop_scans(url, secret)
 
 
+def scenario_auto_scan_is_followed_after_failed_stream_lookups(page, url, secret):
+    # While GET /streams fails the coarse layer cannot find its scan's stream: once its lookups
+    # give up it follows nothing, and a later decision follows the scan when /streams answers.
+    stop_scans(url, secret)
+    try:
+        show_tone_waterfall(page, url, secret)
+        page.wait_for_function("() => window.zetaTest.wf().painted > 5")
+        page.route("**/streams", lambda r: r.abort())
+        wheel_at_centre(page, 100)
+        own = wait_until(lambda: running_scan_jobs(url, secret, "scanner"), 3.0,
+                         "an automatic scan on scanner")[0]["id"]
+        page.wait_for_function(
+            f"() => window.zetaTest.coarse().scanJobId === {json.dumps(own)}"
+            " && window.zetaTest.coarse().followed === null", timeout=10_000)
+        page.unroute("**/streams")
+        page.wait_for_function(
+            f"() => window.zetaTest.coarse().followed === {json.dumps(own)}"
+            " && window.zetaTest.coarse().rows > 0", timeout=10_000)
+    finally:
+        page.unroute("**/streams")
+        stop_scans(url, secret)
+
+
 def scenario_capturable_view_on_unheld_source_retunes_under_zoom_out_scan(page, url, secret):
     # Ruling R6: under the default zoom_out scan, a view past the capture that the unheld shown
     # source can capture (no wider than max_bandwidth_hz, inside its tune range) retunes it
@@ -1306,6 +1329,44 @@ def scenario_capturable_view_on_unheld_source_retunes_under_zoom_out_scan(page, 
         scans = [j for j in jobs if j["kind"] == "scan" and j["state"]["status"] == "running"]
         assert scans == [], f"scans started: {scans}"
         assert page.evaluate("window.zetaTest.coarse().scanJobId") is None
+        assert page.evaluate(AUTO_SCAN_JS) is None
+    finally:
+        stop_scans(url, secret)
+
+
+def set_band(page, center_hz, width_hz):
+    page.fill('#band input[name="center"]', f"{center_hz / 1e6:.6f}")
+    page.fill('#band input[name="width"]', f"{width_hz / 1e3:.3f}")
+    page.click("#band button")
+
+
+def scenario_zoom_in_stops_the_shown_source_scan(page, url, secret):
+    # Ruling R23: `retune` is the only source whose range holds its view, so a view wider than
+    # its 48 kHz max bandwidth is scanned on retune itself (the shown-source fallback). Zoomed
+    # back in to a band it can capture, that scan stops and the page's elastic job returns.
+    stop_scans(url, secret)
+    try:
+        select_source(page, url, secret, "retune")
+        page.wait_for_function("() => window.zetaTest.wf().painted > 5", timeout=10_000)
+        cur = source_info(url, secret, "retune")["current"]["center_hz"]
+        set_band(page, cur, 96_000)
+        own = wait_until(lambda: running_scan_jobs(url, secret, "retune"), 3.0,
+                         "the page's scan on retune")[0]["id"]
+        assert page.evaluate(AUTO_SCAN_JS) == own, page.evaluate(AUTO_SCAN_JS)
+        page.wait_for_function(
+            f"() => window.zetaTest.waterfallMode === 'scan'"
+            f" && window.zetaTest.wf().jobId === {json.dumps(own)}", timeout=5_000)
+        set_band(page, cur, 40_000)
+        wait_until(lambda: stopped(url, secret, own), 3.0, "the shown-source scan stopped")
+        jobs = wait_until(lambda: [j for j in running_spectrum_jobs(url, secret, "retune")
+                                   if j["elastic"]], 5.0, "an elastic spectrum job on retune")
+        page.wait_for_function(
+            f"() => window.zetaTest.waterfallMode === 'spectrum'"
+            f" && window.zetaTest.wf().jobId === {json.dumps(jobs[0]['id'])}", timeout=5_000)
+        w = page.evaluate("window.zetaTest.wf()")
+        assert w["band"]["lo"] <= w["view"]["lo"] and w["view"]["hi"] <= w["band"]["hi"], w
+        assert abs((w["view"]["lo"] + w["view"]["hi"]) / 2 - cur) <= 1_000, (w, cur)
+        assert abs(w["view"]["hi"] - w["view"]["lo"] - 40_000) <= 1_000, w
         assert page.evaluate(AUTO_SCAN_JS) is None
     finally:
         stop_scans(url, secret)

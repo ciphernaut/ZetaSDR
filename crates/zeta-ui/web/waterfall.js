@@ -65,6 +65,10 @@
 //         (and wider than it) only while wf.coarseActive() holds
 //     wf.isOutside() -> whether the view reaches past the capture
 //     wf.requestView(lo, hi)  shows lo..hi Hz (see Band control)
+//     wf.capturable(info, lo, hi) -> whether the source of `info` (a `source_list` record)
+//         can capture lo..hi in one tune
+//     wf.restoreView(lo, hi)  leaves scan mode for lo..hi: `source_ensure`, then the page's
+//         elastic job on the new capture (coarse.js, once it stopped its own scan there)
 //     wf.destroy()
 //
 // Reconnect: when the stream's socket closes (a `closed` message, an error) the #wf-badge
@@ -1114,6 +1118,40 @@ class Waterfall {
       // The view settled past the capture: tell the listeners (the coarse layer waits for it).
       if (coarse) this.fireView();
     }
+  }
+
+  // Leaves scan mode for lo..hi (coarse.js, ruling R23: the page's own scan on the shown
+  // source was just stopped): the scan's stream is let go, `source_ensure` asks for the band
+  // and the waterfall starts over on the source, the view lo..hi (refused: `view reverted:
+  // <error>` in the transcript and the source's whole capture).
+  async restoreView(lo, hi) {
+    const src = this.src;
+    if (!src) return;
+    this.cancelEase();
+    this.gen += 1; // no frames, reconnects or restarts from the scan being let go
+    if (this.sub) this.sub.close();
+    this.sub = null;
+    this.jobId = null;
+    const gen = this.gen;
+    this.retuning = true;
+    let current = null;
+    try {
+      const r = await this.api.op({
+        op: "source_ensure",
+        source: src.id,
+        center_hz: Math.round((lo + hi) / 2),
+        bandwidth_hz: Math.max(1, Math.round(hi - lo)),
+        replace: [],
+      });
+      current = usableTuning(r.value);
+    } catch (e) {
+      this.notice(`view reverted: ${e.json ? errorText(e.json) : e.message}`);
+    } finally {
+      this.retuning = false;
+    }
+    if (gen !== this.gen) return; // another source was selected meanwhile
+    this.pendingView = current ? { lo, hi } : null;
+    this.setSource(current ? { ...src, current } : src);
   }
 
   // Whether the source of `info` (a `source_list` record) can capture lo..hi in one tune: no
