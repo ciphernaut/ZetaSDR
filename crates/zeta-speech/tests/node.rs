@@ -37,6 +37,19 @@ async fn forwards_to_the_node_and_returns_its_text() {
 }
 
 #[tokio::test]
+async fn a_node_that_never_answers_languages_is_assumed_english_within_2_s() {
+    // Accepts connections (the backlog) and never reads or answers them.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let started = std::time::Instant::now();
+    let b = NodeBackend::new(&url, SECRET).await.unwrap();
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_millis(2_100), "{took:?}");
+    assert_eq!(b.languages(), ["en"]);
+    drop(listener);
+}
+
+#[tokio::test]
 async fn an_unreachable_node_assumes_english() {
     let b = NodeBackend::new("http://127.0.0.1:9", SECRET)
         .await

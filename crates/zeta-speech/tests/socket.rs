@@ -85,6 +85,21 @@ async fn no_socket_is_unreachable() {
 }
 
 #[tokio::test]
+async fn a_daemon_that_never_answers_languages_is_assumed_english_within_2_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, staging) = (dir.path().join("v.sock"), dir.path().join("stt"));
+    let daemon = FakeDaemon::silent(&sock);
+    let started = Instant::now();
+    // A long call timeout: the probe has its own 2 s bound.
+    let b = backend(&sock, &staging, Duration::from_secs(30)).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(2_100), "{took:?}");
+    assert!(took >= Duration::from_secs(2), "{took:?}");
+    assert_eq!(b.languages(), ["en"]);
+    assert_eq!(daemon.commands(), ["languages"]);
+}
+
+#[tokio::test]
 async fn a_daemon_that_never_answers_times_out() {
     let dir = tempfile::tempdir().unwrap();
     let (sock, staging) = (dir.path().join("v.sock"), dir.path().join("stt"));

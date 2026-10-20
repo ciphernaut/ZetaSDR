@@ -5,6 +5,7 @@ use serde_json::Value;
 use zeta_client::{ClientError, NodeClient};
 
 use crate::backend::{SpeechBackend, SpeechError, Transcript, default_languages, normalise};
+use crate::socket::PROBE_TIMEOUT;
 
 pub struct NodeBackend {
     name: String,
@@ -14,15 +15,24 @@ pub struct NodeBackend {
 
 impl NodeBackend {
     /// The node at `url` (`http://HOST:PORT`) with its `secret`. Asks it for its languages
-    /// once: `["en"]` when it cannot answer then (reported on stderr). Fails only on a bad
-    /// URL.
+    /// once, waiting at most [`PROBE_TIMEOUT`] (2 s): `["en"]` when it cannot answer then
+    /// (reported on stderr). Fails only on a bad URL.
     pub async fn new(url: &str, secret: &str) -> Result<Self, ClientError> {
         let client = NodeClient::new(url, secret)?;
-        let languages = match client.stt_languages().await {
-            Ok(langs) if !langs.is_empty() => langs.iter().map(|l| normalise(l)).collect(),
-            Ok(_) => default_languages(),
-            Err(e) => {
+        let probe = tokio::time::timeout(PROBE_TIMEOUT, client.stt_languages()).await;
+        let languages = match probe {
+            Ok(Ok(langs)) if !langs.is_empty() => langs.iter().map(|l| normalise(l)).collect(),
+            Ok(Ok(_)) => default_languages(),
+            Ok(Err(e)) => {
                 eprintln!("zeta: speech node: {e}; assuming languages [en]");
+                default_languages()
+            }
+            Err(_) => {
+                eprintln!(
+                    "zeta: speech node {}: no answer to languages within {} s; assuming languages [en]",
+                    client.url(),
+                    PROBE_TIMEOUT.as_secs()
+                );
                 default_languages()
             }
         };

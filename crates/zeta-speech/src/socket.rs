@@ -19,6 +19,11 @@ use crate::backend::{
 /// Longest daemon answer line accepted.
 const MAX_REPLY_BYTES: u64 = 64 * 1024;
 
+/// Longest the construction-time `languages` probe waits (or the call timeout, when that is
+/// shorter): every local command builds the backend, so a hung daemon must not stall it
+/// for a full call timeout.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct SocketBackend {
     name: String,
     path: PathBuf,
@@ -38,16 +43,26 @@ impl Drop for StagedFile {
 
 impl SocketBackend {
     /// The daemon at `path`, handed WAVs staged in `staging_dir`, given `timeout` to answer.
-    /// Asks the daemon for its languages once: `["en"]` when it lists none, answers
-    /// `error:` or cannot be reached.
+    /// Asks the daemon for its languages once, waiting at most [`PROBE_TIMEOUT`]: `["en"]`
+    /// when it lists none, answers `error:`, cannot be reached or does not answer in time
+    /// (that last one said on stderr).
     pub async fn new(path: PathBuf, staging_dir: PathBuf, timeout: Duration) -> Self {
         // The daemon may run in another directory: it is always handed an absolute path.
         let staging_dir = std::path::absolute(&staging_dir).unwrap_or(staging_dir);
-        let languages = match tokio::time::timeout(timeout, exchange(&path, "languages")).await {
+        let probe = timeout.min(PROBE_TIMEOUT);
+        let languages = match tokio::time::timeout(probe, exchange(&path, "languages")).await {
             Ok(Ok(line)) => line
                 .strip_prefix("ok:")
                 .map_or_else(default_languages, parse_languages),
-            _ => default_languages(),
+            Ok(Err(_)) => default_languages(),
+            Err(_) => {
+                eprintln!(
+                    "zeta: speech daemon at {}: no answer to languages within {} s; assuming en",
+                    path.display(),
+                    probe.as_secs_f64()
+                );
+                default_languages()
+            }
         };
         Self {
             name: format!("socket:{}", path.display()),

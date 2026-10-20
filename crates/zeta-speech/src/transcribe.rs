@@ -51,7 +51,8 @@ pub struct TranscribeParams {
     #[serde(default = "en")]
     pub language: String,
     /// A frame starting more than this after the previous frame's end closes the
-    /// utterance, ms.
+    /// utterance, ms; so does this much wall-clock silence after the last frame (`vad`
+    /// upstream forwards only speech, so after a transmission no frame may follow).
     #[serde(default = "d300")]
     pub gap_ms: u32,
     /// An utterance is closed when it reaches this length, s (0 counts as 1).
@@ -166,8 +167,13 @@ impl Accumulator {
         Ok(closed.into_iter().filter(long_enough).collect())
     }
 
-    /// Close the open utterance (the input ended or skipped frames); `None` when there is
-    /// none or it is under 500 ms.
+    /// Whether an utterance is open (audio taken in and not yet closed).
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Close the open utterance (the input ended, went quiet or skipped frames); `None`
+    /// when there is none or it is under 500 ms.
     pub fn flush(&mut self) -> Option<Utterance> {
         self.close().filter(long_enough)
     }
@@ -411,6 +417,12 @@ impl Stage for TranscribeStage {
             errors: 0,
         };
         let rx = &mut inputs[0];
+        // Wall-clock silence after the last frame closes the open utterance; armed only
+        // while one is open, reset by every frame. A frame already waiting wins over it
+        // (the branch order is biased), so a gap in `t0` is always judged on the audio.
+        let gap = Duration::from_millis(params.gap_ms as u64);
+        let mut quiet = std::pin::pin!(tokio::time::sleep(gap));
+        let mut armed = false;
         loop {
             tokio::select! {
                 biased;
@@ -431,15 +443,24 @@ impl Stage for TranscribeStage {
                         for u in closed {
                             w.offer(u);
                         }
+                        quiet.as_mut().reset(tokio::time::Instant::now() + gap);
+                        armed = acc.is_open();
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("zeta-speech: transcribe lagged, {n} frames skipped");
                         if let Some(u) = acc.flush() {
                             w.offer(u);
                         }
+                        armed = false;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
+                _ = &mut quiet, if armed => {
+                    armed = false;
+                    if let Some(u) = acc.flush() {
+                        w.offer(u);
+                    }
+                }
             }
         }
         // The input closed: transcribe what is still open or waiting.

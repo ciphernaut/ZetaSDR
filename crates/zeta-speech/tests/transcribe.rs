@@ -455,3 +455,30 @@ async fn rate_change_fails() {
     let (res, _) = finish(rig).await;
     assert_eq!(failure(res), "sample_rate_hz changed from 48000 to 16000");
 }
+
+#[tokio::test]
+async fn utterance_closes_after_gap_of_wall_clock_silence() {
+    // vad forwards only speech, so after a transmission no frame follows: the open
+    // utterance must close on wall-clock silence, its span still taken from the audio.
+    let fake = Arc::new(FakeBackend::new("over"));
+    let mut rig = start(&fake);
+    let end = send(&rig.tx, &speech_like(RATE as u32, 1.0), 1, T_BASE);
+    let sent = Instant::now();
+    let f = tokio::time::timeout(Duration::from_millis(300 + 500), rig.events.recv())
+        .await
+        .expect("closed within gap_ms + 500 ms of the last frame")
+        .unwrap();
+    let v = event(f);
+    assert!(
+        sent.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        sent.elapsed()
+    );
+    assert_eq!(v["text"], "over");
+    assert_eq!((u(&v, "start_ns"), u(&v, "end_ns")), (T_BASE, end));
+    // The input is still open; closing it sends nothing more.
+    let (res, rest) = finish(rig).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert!(rest.is_empty(), "{rest:?}");
+    assert_eq!(fake.calls().len(), 1);
+}
