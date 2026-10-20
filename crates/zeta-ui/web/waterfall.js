@@ -6,7 +6,7 @@
 //       Builds the axis, the canvas, the selection overlay and the #wf-badge inside `el`.
 //   Waterfall:
 //     wf.setSource(sourceInfo)  a `source_list` record (or null). Reuses a running `spectrum`
-//         job on that source from `job_list`, else starts one, `elastic: true` (spec 4.1: it
+//         job on that source from `job_list` (an elastic one first), else starts one, `elastic: true` (spec 4.1: it
 //         follows the capture, holds no lease, never conflicts and is relaunched by the node
 //         under the same id, with new streams, on every retune), on the source's `current`
 //         band (its whole capture) or, when `current` is null, on the centre of its tune range
@@ -604,10 +604,12 @@ class Waterfall {
       return scan.id;
     }
     this.mode = "spectrum";
-    const running = jobs.find(
+    // An elastic one first: a rigid one (an older page's, resumed rigid) holds the source.
+    const reusable = jobs.filter(
       (j) =>
         j.kind === "spectrum" && j.source === src.id && isRunning(j) && !this.stopping.has(j.id),
     );
+    const running = reusable.find((j) => j.elastic) || reusable[0];
     if (running) {
       // Without a usable tuning the band comes from the first event. An elastic job's tuning
       // is the capture, which `src.current` may know first (just after a retune).

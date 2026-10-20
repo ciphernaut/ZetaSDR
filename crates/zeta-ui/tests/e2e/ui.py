@@ -992,6 +992,26 @@ def scenario_stopping_the_page_job_starts_a_fresh_elastic_one(page, url, secret)
     assert [j["id"] for j in jobs] == [fresh], f"spectrum jobs on retune: {jobs}"
 
 
+def scenario_waterfall_reuses_an_elastic_spectrum_job_first(page, url, secret):
+    # A rigid spectrum job (an older page's, persisted before elastic jobs) listed first on the
+    # source: the waterfall reuses the elastic one beside it.
+    fresh_spectrum_jobs(url, secret)
+    rigid = start_job(url, secret, "spectrum", "aprs", 144_800_000, 48_000)
+    try:
+        elastic = http_json(url, secret, "/op", {
+            "op": "job_start", "kind": "spectrum", "source": "aprs", "center_hz": 144_800_000,
+            "bandwidth_hz": 48_000, "deviation_hz": None, "sideband": None, "elastic": True,
+            "replace": []})["value"]
+        page.set_viewport_size(WIDE)
+        login(page, url, secret)
+        page.click('.src-tab[data-id="aprs"]')
+        page.wait_for_function(
+            f"() => window.zetaTest.wf().jobId === {json.dumps(elastic)}", timeout=5_000)
+    finally:
+        stop_job(url, secret, rigid)
+        fresh_spectrum_jobs(url, secret)
+
+
 def scenario_view_set_show_reset(page, url, secret):
     page.set_viewport_size(WIDE)
     login(page, url, secret)
