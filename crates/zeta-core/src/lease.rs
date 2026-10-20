@@ -191,8 +191,10 @@ impl LeaseManager {
 
     /// Grant `holder` the band `want` on `port`, tuning only if the port is unheld.
     ///
-    /// A rigid request (`elastic` false) ignores elastic leases: when only those
-    /// hold the port it is tuned as if unheld. An elastic request on a held port
+    /// A rigid request (`elastic` false) is never refused by elastic leases:
+    /// when only those hold the port, a band inside the capture they follow
+    /// is leased without a tune, and any other band is tuned as if unheld
+    /// (the caller relaunches the elastic jobs on the new capture). An elastic request on a held port
     /// joins the current capture (its lease band, and the result, is that
     /// capture) without a tune and never conflicts, except with a time-shared
     /// lease (a scan), which no capture outlasts.
@@ -264,6 +266,19 @@ impl LeaseManager {
                     current: cur,
                     options,
                 });
+            }
+            // Only elastic leases (or none): a rigid request inside the
+            // capture they follow is leased on it untuned, so it never
+            // shrinks a shared capture; otherwise it tunes as if unheld.
+            if let Some(cur) = (!held.is_empty())
+                .then(|| port.current())
+                .flatten()
+                .filter(|c| fits(&want, c))
+            {
+                let v = leases.get_mut(&source).unwrap();
+                v.retain(|l| l.job != holder);
+                v.push(Lease::new(holder, want, false));
+                return Ok((cur, false));
             }
         }
         let got = port.tune(want).await?;
@@ -353,7 +368,8 @@ impl LeaseManager {
     /// Tune `port` to `want` without taking a lease, under the same per-source
     /// gate as `ensure`, so it cannot interleave with a job's lease-and-tune.
     /// A held port is never retuned: the request either fits its current band
-    /// (which is returned) or is a conflict. Elastic leases do not hold it.
+    /// (which is returned) or is a conflict. Elastic leases do not hold it, but
+    /// a band inside the capture they follow is returned untuned.
     pub async fn tune_if_unheld(
         &self,
         port: &dyn Port,
@@ -390,6 +406,15 @@ impl LeaseManager {
             .map(|v| v.iter().filter(|l| !l.elastic).cloned().collect())
             .unwrap_or_default();
         let Some(first) = held.first() else {
+            // Only elastic leases: a band inside their capture needs no tune.
+            let elastic = !self.elastic_holders(&source).is_empty();
+            if let Some(cur) = elastic
+                .then(|| port.current())
+                .flatten()
+                .filter(|c| fits(&want, c))
+            {
+                return Ok((cur, false));
+            }
             return Ok((port.tune(want).await?, true));
         };
         let cur = port.current().unwrap_or(first.band);
@@ -652,6 +677,35 @@ mod tests {
         );
         assert_eq!(p.current(), Some(want));
         assert_eq!(m.holders(p.id()), vec![(r, want)]);
+        assert_eq!(m.elastic_holders(p.id()), vec![e]);
+    }
+
+    #[tokio::test]
+    async fn rigid_request_inside_an_elastic_capture_is_leased_without_a_tune() {
+        let (p, m, e, r) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+        );
+        let wide = t(100_000_000, 10_000_000);
+        m.ensure(&p, e.clone(), wide, true).await.unwrap();
+        let narrow = t(102_000_000, 200_000);
+        assert_eq!(
+            m.ensure_tuned(&p, r.clone(), narrow, false).await.unwrap(),
+            (wide, false)
+        );
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(p.current(), Some(wide));
+        assert_eq!(m.holders(p.id()), vec![(r.clone(), narrow)]);
+        assert_eq!(m.elastic_holders(p.id()), vec![e.clone()]);
+        // The same for a lease-free tune: inside the elastic capture, no tune.
+        m.release(&r);
+        assert_eq!(
+            m.tune_if_unheld_tuned(&p, narrow).await.unwrap(),
+            (wide, false)
+        );
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(m.elastic_holders(p.id()), vec![e]);
     }
 

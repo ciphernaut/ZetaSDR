@@ -422,7 +422,9 @@ The page picks its layout from the viewport width (`?footprint=wide|narrow` forc
   waterfall.
 
 The page's own `spectrum` job is elastic: it never blocks another job from taking the radio and
-follows every retune, so the waterfall is never the reason a conflict appears. A conflict the page
+follows every retune, so the waterfall is never the reason a conflict appears. A job started inside
+the capture it shows runs on that capture without a retune, so a demodulator started from the page
+does not shrink the view; one outside it retunes the radio and the page's job follows. A conflict the page
 meets offers "stop <kind> <id> and retry". Finished rows leave the job list after a while.
 
 Two layers sit in the waterfall: the fine capture of the source, and, when the view is zoomed out

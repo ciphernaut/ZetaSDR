@@ -1594,8 +1594,8 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             // The granted capture band: its width is the source rate (Port contract).
             // An elastic job never tunes here: it joins the current capture (or tunes
             // an unheld source to `tuning`) at its lease, which also re-expands its
-            // graph for the capture. A rigid tune here relaunches nothing on success:
-            // the job's own lease relaunches the elastic jobs once the gate is let go.
+            // graph for the capture. A rigid tune here relaunches the elastic jobs once
+            // the gate is let go (the job's lease, inside the new capture, tunes nothing).
             let (granted, tuned) = match elastic {
                 true => (port.current().unwrap_or(tuning), false),
                 false => match node
@@ -1632,6 +1632,15 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                             guard.as_ref(),
                         )
                         .await;
+                    // The tune above moved the capture; the lease, inside it,
+                    // tuned nothing more, so the elastic jobs follow from here.
+                    let after = match after {
+                        AfterGate::Nothing if tuned && r.is_ok() => AfterGate::Relaunch {
+                            source: source.clone(),
+                            except: None,
+                        },
+                        after => after,
+                    };
                     (r.map_err(|e| node_error(node, e)), after)
                 }
                 Err(e) => (Err(e), AfterGate::Nothing),

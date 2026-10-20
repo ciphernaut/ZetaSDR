@@ -71,7 +71,9 @@ only, so existing clients keep their meaning).
 Rules, all under the existing per-source gate:
 
 - A rigid request (`job_start` without `elastic`, `source_ensure`) ignores elastic holders when deciding
-  conflicts. If only elastic jobs hold the port, the request tunes it as if unheld.
+  conflicts. If only elastic jobs hold the port, a request inside the current capture is leased on it
+  with no tune (so a demodulator never shrinks the page's capture); any other request tunes it as if
+  unheld (amended by the final review, ruling R20).
 - After any retune of a port, every elastic job on that source is relaunched on the new capture: same job
   id, new graph expanded for the capture, new stream ids, record `tuning` set to the capture and persisted.
   This reuses the restart path `graph_put` already has; the page already follows stream id changes.

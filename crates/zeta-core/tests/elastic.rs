@@ -261,6 +261,34 @@ async fn rigid_start_over_an_elastic_holder_tunes_and_relaunches_it() {
     assert!(!record(&node, &rigid).elastic);
 }
 
+/// A narrow rigid start inside the wide capture an elastic job follows is leased
+/// on that capture: no tune, so the page's view does not collapse, and the
+/// elastic job keeps its streams.
+#[tokio::test]
+async fn rigid_start_inside_an_elastic_capture_does_not_tune() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new();
+    let node = open(dir.path(), &radio).await;
+    let wide = band(100_000_000, 2_000_000);
+    let elastic = started(&node, start(JobKind::Spectrum, wide, true)).await;
+    let before = streams(&node, &elastic);
+    let tunes = radio.tunes();
+    assert_eq!(tunes, vec![wide]);
+
+    let rigid_band = band(100_500_000, 48_000);
+    let rigid = started(&node, start(JobKind::Passthrough, rigid_band, false)).await;
+    assert_eq!(radio.tunes(), tunes);
+    let s = source(&node).await;
+    assert_eq!(s.current, Some(wide));
+    assert_eq!(s.holders, vec![rigid.clone()]);
+    assert_eq!(s.elastic, vec![elastic.clone()]);
+    let rec = record(&node, &elastic);
+    assert_eq!(rec.state, JobState::Running);
+    assert_eq!(rec.tuning, wide);
+    assert_eq!(streams(&node, &elastic), before);
+    assert_eq!(record(&node, &rigid).state, JobState::Running);
+}
+
 #[tokio::test]
 async fn source_ensure_retune_relaunches_the_elastic_job() {
     let dir = tempfile::tempdir().unwrap();
