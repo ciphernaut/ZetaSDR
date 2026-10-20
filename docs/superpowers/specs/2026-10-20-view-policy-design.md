@@ -15,6 +15,15 @@ a chosen band) and a LimeSDR on a shared antenna for wideband scanning. Both cha
 local oscillator, so channels A and B cannot do this; two devices can, and the node already treats each
 `--source-*` flag as its own source with its own lease.
 
+A third driver appeared on 2026-10-20 when the node on the field host was restarted for an upgrade. Before
+the restart one 10.24 MHz capture held four broadcast demodulators and the page's spectrum job; resume
+replayed the persisted jobs one at a time in record order, so the first demodulator leased the radio
+200 kHz wide, every other running job on the source failed with `conflict`, and that first job failed
+too because its persisted graph had been expanded for the old capture rate (`out_rate_hz 256000 must
+divide rate_hz 202105`). Resume must restore the capture the jobs shared, not replay their leases
+blindly. And when jobs disappear nobody can say which client stopped them: the `ops` stream is not
+persisted.
+
 The user's words for the behaviour: stay on the decoder's viewport first; allow zooming out to observe
 the stitched rapid scan of the wider channel, with an overlay of the targeted receiver on top of that
 coarser wider view; when the targeted channel's parameters change, gracefully zoom back into the new
@@ -35,6 +44,10 @@ Goals:
 - The behaviours (what the view follows, what zooming out does, when an automatic scan stops, which
   device scans) are named policies with defaults, settable by a typed command, and adding a policy is
   adding one table entry.
+- A restart brings every running job back the way it was: the capture is restored before the jobs
+  that shared it, and a job whose graph was built for another capture rate is re-expanded, never failed.
+- Every operation applied to the node is on disk with its caller, so "who stopped that job" has an
+  answer after the fact.
 
 Non-goals (later work, not this design): widening a held capture so two rigid jobs coexist (the lease
 already names it as "not yet available"); exposing the B210's second chain as a second source; a settings
@@ -80,6 +93,39 @@ replacing and are not listed as holders.
 
 The guide gets a note on both fields; `AGENTS.md` and the skill are regenerated; the schema test covers
 the new fields.
+
+### 3.3 Resume restores the capture
+
+At `Node::open` with `resume`, the running records of one source are launched widest band first (ties by
+`created_ns`), elastic records after every rigid one, and attached records after their inputs (as today).
+The first launch tunes the source to the widest band, so the narrower jobs that shared that capture fit
+inside it again instead of conflicting; a job that still conflicts fails with the `conflict` reason as
+today (it never fitted the capture it was persisted under, or that capture's job is gone).
+
+Before launching a resumed record of a built-in kind, the node compares the capture rate the record's
+graph was expanded for with the source's actual rate after the tune; when they differ it re-expands the
+graph from the record's `kind` and parameters for the actual rate (`expand` already takes the source
+rate) and persists the new graph under the same job id and stream names. A graph the operator changed
+with `graph_put` is not re-expanded (the node cannot know its intent); it is launched as stored and
+fails with its own reason if the rate no longer fits. To know what a graph was expanded for,
+`JobRecord` gains `#[serde(default)] capture_rate_hz: Option<u64>` (format stays 1; records without it
+are treated as matching, which is today's behaviour).
+
+Tests (core, file sources): two records of different widths on one source resume in either on-disk
+order and both run; a record whose graph was expanded for one rate resumes on a source at another rate
+and runs with a re-expanded graph; a `graph_put` graph is left alone; an elastic record resumes after
+the rigid ones and follows their capture.
+
+### 3.4 The ops log
+
+Every operation the node applies (the records already on the `ops` stream: op, result or error,
+transport, `t_ns`) is appended as one JSON line to `<state_dir>/ops.log`, rotated to `ops.log.1` at
+8 MiB (two files at most). `zeta ops tail [--lines N]` prints the last N lines (default 50) from the
+state directory (one-shot, local; `--node` is a usage error), so an operator can see which client
+stopped a job after the fact. The log is written by the node, never read by it; nothing else changes.
+
+Test: a `job_start` then `job_stop` over `/op` with `X-Zeta-Client: ui` leave two lines whose
+`transport` is `ui`; rotation at the size limit; `zeta ops tail` prints them.
 
 ## 4. Page side
 
@@ -144,8 +190,11 @@ the page's elastic job is under `elastic`, never a holder, and needs no replacin
 
 ## 6. Constraints
 
-- `zeta-core` gains no dependency; records keep format 1 with defaulted new fields; the ws and plugin wires
-  are unchanged.
+- `zeta-core` gains no dependency; records keep format 1 with defaulted new fields (`elastic`,
+  `capture_rate_hz`); the ws and plugin wires are unchanged.
+- The page already reloads itself when the node's `build` (from `/health`) changes or its uptime goes
+  backwards (`main` at f7757cd), so a deployment of this work needs no manual reload of open pages.
+- `stream tail --timeout-ms` is capped at 10 000 by the node; scenarios that wait longer loop.
 - Gates as plan 10: fmt, clippy `-D warnings`, the crate tests, the Playwright UI suite with no skip line,
   the guide regenerated and checked.
 - Tests need a second source as the scanner. File sources step a scan today (the core scan tests use a
@@ -157,7 +206,9 @@ the page's elastic job is under `elastic`, never a holder, and needs no replacin
 
 The easing curve and exact durations; the debounce; how the elastic relaunch shares code with the
 `graph_put` restart; the schema shapes for `elastic`, `replace` and the `source_list` field; the overlay's
-drawing order and outline style; the Playwright scenarios (at least: a rigid start over the page's job
+drawing order and outline style; how the resume order and re-expansion share code with `Node::open`'s
+existing attached-after-input ordering; the ops log writer's place in `apply_from`; the Playwright
+scenarios (at least: a rigid start over the page's job
 succeeds without replace; replace hands over atomically against a competing start; zoom out starts a scan
 on the second source and zoom in stops it; a manual scan is left alone; `view set follow free` holds the
 view across a retune; the retune eases under `follow target`).
@@ -174,3 +225,8 @@ view across a retune; the retune eases under `follow target`).
 - The overlay outlines every rigid holder's band (a list), and the view follows the capture, not one job.
 - `follow` has no `scan` value: an automatic scan's span is derived from the view, so tracking it would be
   circular; a manual scan is displayed in the coarse layer and the view stays where the user put it.
+- Resume orders a source's records widest first and re-expands built-in graphs for the actual rate; a
+  `graph_put` graph is launched as stored. The capture rate is persisted per record rather than per
+  source, so a record carries what it needs on its own.
+- The ops log is a plain file with a one-shot reader, not a new op or stream: the smallest thing that
+  answers "who stopped that job".
