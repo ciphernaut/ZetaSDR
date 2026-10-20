@@ -447,8 +447,10 @@ View policies shape this, set from the command line and kept in the tab's `sessi
 | `finished_rows_s` | seconds a finished job stays listed, `60`; `0` never shows them |
 | `scanner` | `auto`, or a source id |
 
-`view set <key> <value>`, `view show`, `view reset` (one key) and `view clear` (all) are typed at
-the command line; an unknown key or value answers with the allowed values.
+`view set <key> <value>`, `view show`, `view reset` (every policy back to its default) and
+`view clear` (drops the finished job rows from the list) are typed at the command line; an
+unknown key or value answers with the allowed values. Other text starting with `view` (`view the
+strongest signal`) is a question for the agent.
 
 The waterfall is the UI's own `spectrum` job on the selected source (it reuses a running one,
 and stops the one it started when the page closes). Overlays are pinned to their channel and
@@ -578,6 +580,12 @@ when `/proc/meminfo` cannot be read); `--ring-budget-mb MB` (or `ZETA_RING_BUDGE
 The node logs each sizing, e.g. `zeta: ring for b210: 10.00 s at 16000000 Hz (1280.0 MB)`.
 
 ## Federation
+
+Upgrading: `job_start` now requires `elastic` and `replace`, and `--source-node` sends both, so
+an older node refuses this version's `job_start` and this version refuses an older one's. Upgrade
+both ends of a `--source-node` link together. A rigid page `spectrum` job persisted by an older
+version resumes rigid (it holds its source); the page reuses an elastic spectrum job before it,
+and stopping it from its row lets the page start an elastic one.
 
 A node can use a source of another node. `--source-node ID=SOURCE@URL` (URL is
 `http://HOST:PORT` of the other node's `serve --listen`) registers source `SOURCE` of that node

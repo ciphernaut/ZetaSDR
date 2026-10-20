@@ -498,14 +498,19 @@ about 20 s after the attach (the ~4 s late start was not isolated on air). The o
 
 ## Plan 11 status
 
-Plan 11 is delivered on `worktree-view-policy` (tasks 1-8, base `main` f7757cd), 2026-10-20. Live
+Plan 11 is delivered on `worktree-view-policy` (tasks 1-8 and the final-review fixes, base `main`
+f7757cd), 2026-10-20. Live
 acceptance on the field host is pending.
 
 What was built:
 
-- Resume restores the capture: a source's jobs launch widest first, elastic after rigid; a built-in
-  graph whose `capture_rate_hz` differs from the actual rate is re-expanded.
-- The ops log (`ops.log`, rotated at 8 MiB) and `zeta ops tail`.
+- Resume restores the capture: each source is first held at the band bounding its rigid jobs
+  (when the radio can capture it), then its jobs launch a scan first, then widest first, elastic
+  after rigid; a built-in graph whose `capture_rate_hz` differs from the actual rate is
+  re-expanded.
+- The ops log (`ops.log`, rotated at 8 MiB, appends serialised; successful read-only ops without
+  their result) and `zeta ops tail`.
+- A rigid start inside the capture elastic jobs follow is leased there without a retune.
 - Elastic leases (`job start --elastic`, `spectrum` only; `source_list.elastic`).
 - Atomic `replace` (`--replace ID[,ID]` on `job start` and `source ensure`; the conflict option
   `retry with replace: [...]`).
@@ -513,23 +518,29 @@ What was built:
 - UI: the page's own job is elastic; view policies (`follow`, `zoom_out`, `auto_scan_stop`,
   `finished_rows_s`, `scanner`) and `view set|show|reset|clear`; finished rows age out; the conflict
   offers "stop <kind> <id> and retry"; automatic scans on a scanner source when zoomed past the
-  capture; a coarse scan layer under the fine capture; rigid bands outlined; eased follow.
+  capture; a coarse scan layer under the fine capture; rigid bands outlined; eased follow; the
+  shown-source fallback scan stops on a zoom back in and the view returns.
+
+Upgrade: both ends of a `--source-node` link must run this version together (`job_start` gained
+the required `elastic` and `replace`, which an older node rejects, and the reverse). A rigid page
+`spectrum` job persisted by an older version resumes rigid; the page reuses an elastic one first.
 
 Gates at the branch head:
 
-- `cargo test --workspace --all-features --no-fail-fast`: 805 passed, 0 failed, 3 ignored (106 `test
+- `cargo test --workspace --all-features --no-fail-fast`: 811 passed, 0 failed, 3 ignored (106 `test
   result` lines), no `FAILED`, no `ui e2e skipped`. The UI suite
-  (`ui_scenarios_pass_in_headless_chromium`, 61 scenarios) ran ok in 218.86 s in the final gate, up to 229 s in earlier runs.
+  (`ui_scenarios_pass_in_headless_chromium`, 64 scenarios) ran ok in 233.93 s in the final gate
+  (233.04 s alone).
 - `cargo fmt -p` for each workspace member (all but the excluded `zeta-source-soapy-driver`),
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `zeta agents-md --check`
   and `--skill --check` are clean.
 
 Deferred:
 
-- The shown-source fallback scan (single-source nodes) is not stopped by zooming back in; stop it from its row. No scenario covers it.
-- The ops log rotation is not serialised; concurrent rotation can lose a line or overwrite `ops.log.1`.
+- The shown-source fallback scan's span does not follow later zooms (in scan mode the view stays
+  inside the scan; a zoom back in to a capturable band stops it).
 - A replace that times out (10 s) can leave the port tuned with no holder.
 - An ease started in a hidden tab keeps `wf.easing` true until the tab is visible, which pauses automatic scan decisions.
 - A source that faults before its first band shows no coarse layer.
 - `reconcile_rate` is redundant with resume's `fit_capture` and can restart a job once needlessly.
-- The UI suite runs at about 229 s of its 300 s deadline.
+- The UI suite runs at about 234 s of its 300 s deadline.
