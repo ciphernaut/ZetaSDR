@@ -360,6 +360,7 @@ fn op_name_matches_the_serialised_tag() {
             source: SourceId("s".into()),
             center_hz: Hz(1),
             bandwidth_hz: Hz(1),
+            replace: vec![],
         },
         Op::JobStart {
             kind: JobKind::Spectrum,
@@ -369,6 +370,7 @@ fn op_name_matches_the_serialised_tag() {
             deviation_hz: None,
             sideband: None,
             elastic: false,
+            replace: vec![],
         },
         Op::JobList {},
         Op::JobStop {

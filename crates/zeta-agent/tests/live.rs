@@ -52,6 +52,6 @@ async fn field_host_gemma_tunes_hackrf0() {
         .await;
     eprintln!("outcome: {outcome:#?}");
     let calls = exec.calls.lock().unwrap().clone();
-    let want = json!({"op":"source_ensure","source":"hackrf0","center_hz":101500000,"bandwidth_hz":200000});
+    let want = json!({"op":"source_ensure","source":"hackrf0","center_hz":101500000,"bandwidth_hz":200000,"replace":[]});
     assert!(calls.contains(&want), "executor calls: {calls:#?}");
 }

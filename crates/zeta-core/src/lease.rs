@@ -4,7 +4,10 @@
 //! rigid requests ignore it, and it never retunes a held port.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::OwnedMutexGuard;
+use tokio_util::sync::CancellationToken;
 
 use crate::port::{Port, PortError, Tuning};
 use crate::types::{JobId, SourceId};
@@ -105,8 +108,15 @@ fn fits(want: &Tuning, cur: &Tuning) -> bool {
 /// Ways out of a conflict between `want` and the port's current band `cur`
 /// that the caller can act on. Widening is listed only when the port could
 /// capture both bands at once; no operation performs it yet. A port under a
-/// time-shared lease (a scan) is freed only by stopping that holder.
-fn conflict_options(port: &dyn Port, want: &Tuning, cur: &Tuning, shared: bool) -> Vec<String> {
+/// time-shared lease (a scan) is freed only by stopping that holder. Last, the
+/// request again with `replace` naming the rigid `holders`, when there are any.
+fn conflict_options(
+    port: &dyn Port,
+    want: &Tuning,
+    cur: &Tuning,
+    shared: bool,
+    holders: &[JobId],
+) -> Vec<String> {
     if shared {
         return vec!["stop the scan holding the source".to_string()];
     }
@@ -119,6 +129,10 @@ fn conflict_options(port: &dyn Port, want: &Tuning, cur: &Tuning, shared: bool) 
     let n = wh.max(ch) - wl.min(cl);
     if n <= port.capabilities().max_bandwidth_hz.value().0 {
         options.push(format!("widen capture to {n} Hz (not yet available)"));
+    }
+    if !holders.is_empty() {
+        let ids: Vec<&str> = holders.iter().map(|j| j.0.as_str()).collect();
+        options.push(format!("retry with replace: [{}]", ids.join(", ")));
     }
     options
 }
@@ -138,13 +152,31 @@ impl LeaseManager {
     }
 
     /// The per-source gate shared by `ensure`, `tune_if_unheld` and `idle_if_unheld`.
-    fn gate(&self, source: &SourceId) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    fn gate(&self, source: &SourceId) -> Arc<tokio::sync::Mutex<()>> {
         self.gates
             .lock()
             .unwrap()
             .entry(source.clone())
             .or_default()
             .clone()
+    }
+
+    /// Hold `source`'s gate until the guard is dropped, so a caller can do several
+    /// things nothing interleaves with (stop holders, then lease), through the
+    /// `_locked` calls. Never call a gate-taking method while holding it: the
+    /// gate is not reentrant.
+    pub(crate) async fn gate_guard(&self, source: &SourceId) -> OwnedMutexGuard<()> {
+        self.gate(source).lock_owned().await
+    }
+
+    /// Panics unless `guard` is `source`'s gate: a `_locked` call under another
+    /// source's gate would interleave with this one's.
+    pub(crate) fn assert_gate(&self, source: &SourceId, guard: &OwnedMutexGuard<()>) {
+        assert!(
+            Arc::ptr_eq(OwnedMutexGuard::mutex(guard), &self.gate(source)),
+            "guard is not the gate of source {}",
+            source.0
+        );
     }
 
     /// Call [`Port::idle`] under the source's gate when nobody holds `port`
@@ -185,9 +217,23 @@ impl LeaseManager {
         want: Tuning,
         elastic: bool,
     ) -> Result<(Tuning, bool), LeaseError> {
+        let guard = self.gate_guard(port.id()).await;
+        self.ensure_locked(port, holder, want, elastic, &guard)
+            .await
+    }
+
+    /// [`LeaseManager::ensure_tuned`] under the source's gate the caller holds
+    /// (`guard`, from [`LeaseManager::gate_guard`]).
+    pub(crate) async fn ensure_locked(
+        &self,
+        port: &dyn Port,
+        holder: JobId,
+        want: Tuning,
+        elastic: bool,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(Tuning, bool), LeaseError> {
         let source = port.id().clone();
-        let gate = self.gate(&source);
-        let _guard = gate.lock().await;
+        self.assert_gate(&source, guard);
         {
             let mut leases = self.leases.lock().unwrap();
             let held = leases.get(&source).cloned().unwrap_or_default();
@@ -211,7 +257,7 @@ impl LeaseManager {
                     return Ok((cur, false));
                 }
                 let holders = rigid(&held);
-                let options = conflict_options(port, &want, &cur, shared);
+                let options = conflict_options(port, &want, &cur, shared, &holders);
                 return Err(LeaseError::Conflict {
                     source,
                     holders,
@@ -230,26 +276,39 @@ impl LeaseManager {
 
     /// Grant `holder` a time-shared lease on the whole `span` of `port`
     /// without tuning it (see [`LeaseManager::retune_shared`]). The port must
-    /// be unheld; while the lease is held every other `ensure` and
-    /// `tune_if_unheld` is a conflict naming `holder`.
+    /// be unheld by rigid leases (elastic ones are the caller's to stop: no
+    /// capture outlasts a step); while the lease is held every other `ensure`
+    /// and `tune_if_unheld` is a conflict naming `holder`.
     pub async fn acquire_shared(
         &self,
         port: &dyn Port,
         holder: JobId,
         span: Tuning,
     ) -> Result<(), LeaseError> {
+        let guard = self.gate_guard(port.id()).await;
+        self.acquire_shared_locked(port, holder, span, &guard)
+    }
+
+    /// [`LeaseManager::acquire_shared`] under the source's gate the caller holds.
+    pub(crate) fn acquire_shared_locked(
+        &self,
+        port: &dyn Port,
+        holder: JobId,
+        span: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(), LeaseError> {
         let source = port.id().clone();
-        let gate = self.gate(&source);
-        let _guard = gate.lock().await;
+        self.assert_gate(&source, guard);
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source.clone()).or_default();
         v.retain(|l| l.job != holder);
-        if let Some(first) = v.first() {
+        if let Some(first) = v.iter().find(|l| !l.elastic) {
             let cur = port.current().unwrap_or(first.band);
             let shared = v.iter().any(|l| l.time_shared);
+            let holders = rigid(v);
             return Err(LeaseError::Conflict {
-                holders: rigid(v),
-                options: conflict_options(port, &span, &cur, shared),
+                options: conflict_options(port, &span, &cur, shared, &holders),
+                holders,
                 source,
                 current: cur,
             });
@@ -265,15 +324,20 @@ impl LeaseManager {
 
     /// Tune `port` to `step` for the holder of a time-shared lease, under
     /// the source's gate. `None` (and no tune) once `holder` holds no
-    /// time-shared lease on `port`.
+    /// time-shared lease on `port`, or when `cancel` fires while it waits for
+    /// the gate (whoever holds it may be stopping the scan); once the gate is
+    /// taken the tune is never abandoned half way.
     pub async fn retune_shared(
         &self,
         port: &dyn Port,
         holder: &JobId,
         step: Tuning,
+        cancel: &CancellationToken,
     ) -> Result<Option<Tuning>, PortError> {
-        let gate = self.gate(port.id());
-        let _guard = gate.lock().await;
+        let _guard = tokio::select! {
+            _ = cancel.cancelled() => return Ok(None),
+            g = self.gate_guard(port.id()) => g,
+        };
         let held = self
             .leases
             .lock()
@@ -304,9 +368,20 @@ impl LeaseManager {
         port: &dyn Port,
         want: Tuning,
     ) -> Result<(Tuning, bool), LeaseError> {
+        let guard = self.gate_guard(port.id()).await;
+        self.tune_if_unheld_locked(port, want, &guard).await
+    }
+
+    /// [`LeaseManager::tune_if_unheld_tuned`] under the source's gate the caller
+    /// holds (`guard`, from [`LeaseManager::gate_guard`]).
+    pub(crate) async fn tune_if_unheld_locked(
+        &self,
+        port: &dyn Port,
+        want: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(Tuning, bool), LeaseError> {
         let source = port.id().clone();
-        let gate = self.gate(&source);
-        let _guard = gate.lock().await;
+        self.assert_gate(&source, guard);
         let held: Vec<Lease> = self
             .leases
             .lock()
@@ -322,8 +397,8 @@ impl LeaseManager {
         if !shared && fits(&want, &cur) {
             return Ok((cur, false));
         }
-        let options = conflict_options(port, &want, &cur, shared);
         let holders = rigid(&held);
+        let options = conflict_options(port, &want, &cur, shared, &holders);
         Err(LeaseError::Conflict {
             source,
             holders,
@@ -496,12 +571,16 @@ mod tests {
                 options,
                 ..
             }) => {
-                assert_eq!(holders, vec![j1]);
-                assert_eq!(current, first);
                 assert_eq!(
                     options,
-                    vec!["stop one of the holders", "choose a band inside current"]
+                    vec![
+                        "stop one of the holders".to_string(),
+                        "choose a band inside current".to_string(),
+                        format!("retry with replace: [{}]", j1.0),
+                    ]
                 );
+                assert_eq!(holders, vec![j1]);
+                assert_eq!(current, first);
             }
             other => panic!("expected conflict, got {other:?}"),
         }
@@ -510,8 +589,8 @@ mod tests {
 
     #[tokio::test]
     async fn conflict_offers_widening_only_when_the_port_can() {
-        let (p, m) = (FakePort::new(), LeaseManager::new());
-        m.ensure(&p, JobId::new(), t(100_000_000, 1_000_000), false)
+        let (p, m, j1) = (FakePort::new(), LeaseManager::new(), JobId::new());
+        m.ensure(&p, j1.clone(), t(100_000_000, 1_000_000), false)
             .await
             .unwrap();
         match m
@@ -521,9 +600,10 @@ mod tests {
             Err(LeaseError::Conflict { options, .. }) => assert_eq!(
                 options,
                 vec![
-                    "stop one of the holders",
-                    "choose a band inside current",
-                    "widen capture to 6000000 Hz (not yet available)",
+                    "stop one of the holders".to_string(),
+                    "choose a band inside current".to_string(),
+                    "widen capture to 6000000 Hz (not yet available)".to_string(),
+                    format!("retry with replace: [{}]", j1.0),
                 ]
             ),
             other => panic!("expected conflict, got {other:?}"),
@@ -597,6 +677,64 @@ mod tests {
         m.release(&r);
         assert_eq!(m.tune_if_unheld_tuned(&p, far).await.unwrap(), (far, true));
         assert_eq!(m.elastic_holders(p.id()), vec![e]);
+    }
+
+    #[tokio::test]
+    async fn locked_calls_run_under_a_held_gate_and_nothing_interleaves() {
+        let (p, m, j1, j2) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+        );
+        let first = t(100_000_000, 1_000_000);
+        let guard = m.gate_guard(p.id()).await;
+        assert_eq!(
+            m.tune_if_unheld_locked(&p, first, &guard).await.unwrap(),
+            (first, true)
+        );
+        // A competing request waits for the guard...
+        let other = m.ensure(&p, j2, t(433_000_000, 1_000_000), false);
+        tokio::pin!(other);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut other)
+                .await
+                .is_err()
+        );
+        // ...while the holder of the guard leases the band (an unheld port is
+        // tuned again, as by `ensure`).
+        assert_eq!(
+            m.ensure_locked(&p, j1.clone(), first, false, &guard)
+                .await
+                .unwrap(),
+            (first, true)
+        );
+        drop(guard);
+        match other.await {
+            Err(LeaseError::Conflict { holders, .. }) => assert_eq!(holders, vec![j1]),
+            r => panic!("expected conflict, got {r:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retune_shared_waiting_on_the_gate_gives_up_on_cancel() {
+        let (p, m, scan) = (FakePort::new(), LeaseManager::new(), JobId::new());
+        m.acquire_shared(&p, scan.clone(), t(100_000_000, 40_000_000))
+            .await
+            .unwrap();
+        let guard = m.gate_guard(p.id()).await;
+        let cancel = CancellationToken::new();
+        let step = m.retune_shared(&p, &scan, t(100_000_000, 10_000_000), &cancel);
+        tokio::pin!(step);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut step)
+                .await
+                .is_err()
+        );
+        cancel.cancel();
+        assert_eq!(step.await.unwrap(), None);
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(guard);
     }
 
     #[tokio::test]

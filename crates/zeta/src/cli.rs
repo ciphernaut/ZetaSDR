@@ -313,7 +313,42 @@ pub enum SourceCmd {
     /// List sources with capabilities, current tuning and holders
     List,
     /// Check a band against a source and tune it if no job holds it
-    Ensure(BandArgs),
+    Ensure {
+        #[command(flatten)]
+        band: BandArgs,
+        #[command(flatten)]
+        replace: ReplaceArg,
+    },
+}
+
+/// `--replace ID[,ID]` on `job start` and `source ensure`.
+#[derive(Debug, Args)]
+pub struct ReplaceArg {
+    /// Jobs holding the source that may be stopped to make room, comma-separated
+    /// (ids from `job list`); they are stopped right before the request.
+    /// Absent or empty = none
+    #[arg(long = "replace", value_name = "ID[,ID]", value_parser = parse_replace)]
+    ids: Option<ReplaceIds>,
+}
+
+impl ReplaceArg {
+    fn into_ids(self) -> Vec<JobId> {
+        self.ids.map_or_else(Vec::new, |r| r.0)
+    }
+}
+
+/// The ids of `--replace`, empty items dropped (so `--replace ''` is none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaceIds(Vec<JobId>);
+
+fn parse_replace(s: &str) -> Result<ReplaceIds, String> {
+    Ok(ReplaceIds(
+        s.split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| JobId(id.to_string()))
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Subcommand)]
@@ -336,6 +371,8 @@ pub enum JobCmd {
         /// (never conflicts; relaunched under the same id on every retune)
         #[arg(long)]
         elastic: bool,
+        #[command(flatten)]
+        replace: ReplaceArg,
         /// After starting, tail the job's first event (else audio) stream, stop
         /// the job and print `[job_result, frames_result, {"stopped": true}]`;
         /// a job that is not running prints `[job_result, job_record]` and
@@ -575,7 +612,7 @@ impl Command {
     pub fn mutates(&self) -> bool {
         matches!(
             self,
-            Command::Source(SourceCmd::Ensure(_))
+            Command::Source(SourceCmd::Ensure { .. })
                 | Command::Job(JobCmd::Start { .. } | JobCmd::Attach { .. } | JobCmd::Stop(_))
                 | Command::Graph(GraphCmd::Put { .. })
         )
@@ -600,10 +637,11 @@ impl Command {
         let job = |a: JobArg| JobId(a.job);
         Ok(Some(match self {
             Command::Source(SourceCmd::List) => Op::SourceList {},
-            Command::Source(SourceCmd::Ensure(b)) => Op::SourceEnsure {
+            Command::Source(SourceCmd::Ensure { band: b, replace }) => Op::SourceEnsure {
                 source: SourceId(b.source),
                 center_hz: Hz(b.center_hz),
                 bandwidth_hz: Hz(b.bandwidth_hz),
+                replace: replace.into_ids(),
             },
             Command::Job(JobCmd::Start {
                 kind,
@@ -611,6 +649,7 @@ impl Command {
                 deviation_hz,
                 sideband,
                 elastic,
+                replace,
                 ..
             }) => Op::JobStart {
                 kind: kind.into(),
@@ -620,6 +659,7 @@ impl Command {
                 deviation_hz,
                 sideband: sideband.map(Into::into),
                 elastic,
+                replace: replace.into_ids(),
             },
             Command::Job(JobCmd::Attach {
                 kind,

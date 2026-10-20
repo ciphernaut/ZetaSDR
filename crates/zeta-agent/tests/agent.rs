@@ -122,11 +122,11 @@ async fn op_error_is_fed_back_so_model_can_correct() {
     let fake = fake(vec![
         tool_call_response(&[(
             "source_ensure",
-            json!({"source": "tone", "center_hz": 100000, "bandwidth_hz": 48000}),
+            json!({"source": "tone", "center_hz": 100000, "bandwidth_hz": 48000, "replace": []}),
         )]),
         tool_call_response(&[(
             "source_ensure",
-            json!({"source": "tone", "center_hz": 100000000, "bandwidth_hz": 48000}),
+            json!({"source": "tone", "center_hz": 100000000, "bandwidth_hz": 48000, "replace": []}),
         )]),
         text_response("Tuned.", "stop"),
     ])

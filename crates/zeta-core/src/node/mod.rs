@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use tokio::sync::OwnedMutexGuard;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +31,7 @@ use crate::types::{
 
 pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
 
+pub(crate) use launch::AfterGate;
 use launch::{feed_bank, feed_ring};
 use persist::{io, load, now, persist};
 
@@ -96,6 +98,10 @@ pub enum NodeError {
     /// An elastic job's relaunch found it stopped meanwhile; it stays stopped.
     #[error("job {} was stopped", .0.0)]
     Stopped(JobId),
+    /// A request the node refuses, with the reason (a `replace` naming a job
+    /// that does not hold the source).
+    #[error("{0}")]
+    Other(String),
 }
 
 /// How many stopped or failed job records the node keeps: when a job ends
@@ -118,6 +124,12 @@ struct JobEntry {
     /// Set while an elastic job is relaunched on a new capture: its supervisor then
     /// leaves the record `Running` and the lease held for the relaunch.
     relaunch: bool,
+    /// Set by a stop under the source's gate ([`Inner::stop_gated`]): the
+    /// supervisor then does not idle the port, which would take that gate.
+    skip_idle: bool,
+    /// Set by the supervisor once the lease is released and the streams are
+    /// unregistered, when all that is left is the port's idle.
+    released: bool,
 }
 
 /// A source's bank for the capture band it was made for; `bank` is `None`
@@ -160,6 +172,20 @@ struct Inner {
 impl Inner {
     /// See [`Node::job_stop`].
     async fn stop(&self, id: &JobId) -> Result<(), NodeError> {
+        self.stop_with(id, false).await
+    }
+
+    /// [`Inner::stop`] while the caller holds the job's source gate: the port
+    /// is not idled (the caller's request is about to tune it, and the idle
+    /// would wait on that gate), and a supervisor already past its cleanup and
+    /// waiting on the gate to idle is not awaited. Either way the job's lease is
+    /// released and its streams unregistered when this returns, unless another
+    /// stop took the supervisor first (see [`Node::replace_holders`]).
+    async fn stop_gated(&self, id: &JobId) -> Result<(), NodeError> {
+        self.stop_with(id, true).await
+    }
+
+    async fn stop_with(&self, id: &JobId, gated: bool) -> Result<(), NodeError> {
         let done = {
             let mut jobs = self.jobs.lock().unwrap();
             let entry = jobs
@@ -177,10 +203,14 @@ impl Inner {
                 entry.record = rec;
                 entry.ended_ns = now();
             }
+            // Set before the cancel, under the jobs lock the supervisor reads it under.
+            entry.skip_idle |= gated;
             if let Some(c) = entry.cancel.take() {
                 c.cancel();
             }
             let done = entry.done.take();
+            // A supervisor that already released may be waiting on the gate to idle.
+            let done = done.filter(|_| !(gated && entry.released));
             Inner::prune_history(&mut jobs, &self.jobs_dir);
             done
         };
@@ -370,6 +400,8 @@ impl Node {
                         done: None,
                         outputs: Vec::new(),
                         relaunch: false,
+                        skip_idle: false,
+                        released: false,
                     },
                 );
                 continue;
@@ -391,6 +423,8 @@ impl Node {
                         done: None,
                         outputs: Vec::new(),
                         relaunch: false,
+                        skip_idle: false,
+                        released: false,
                     },
                 );
             }
@@ -666,6 +700,111 @@ impl Node {
         self.inner.stop(id).await
     }
 
+    /// Hold `source`'s gate until the guard drops when `replace` names jobs, so
+    /// stopping them and the request that follows happen under one hold (see
+    /// [`Node::replace_holders`]); `None` (each step takes the gate itself, as
+    /// without replace) when it names none. See [`LeaseManager::gate_guard`].
+    pub(crate) async fn gate_for_replace(
+        &self,
+        source: &SourceId,
+        replace: &[JobId],
+    ) -> Option<OwnedMutexGuard<()>> {
+        match replace.is_empty() {
+            true => None,
+            false => Some(self.inner.leases.gate_guard(source).await),
+        }
+    }
+
+    /// Stop the jobs `replace` names, under `source`'s gate (`guard`), so the
+    /// request that follows under the same guard finds the radio as they left
+    /// it. Every id is checked first, and nothing is stopped unless all pass:
+    /// `UnknownJob`, or `Other("job <id> does not hold source <src>")` for a job
+    /// without a rigid lease on `source` (an elastic job never holds one). Each is
+    /// then stopped as by [`Node::job_stop`] (persisted `Stopped`, streams
+    /// unregistered) but without idling the port, and its lease is gone when this
+    /// returns. A stop that cannot be persisted is `Io`, that job left running.
+    pub(crate) async fn replace_holders(
+        &self,
+        source: &SourceId,
+        replace: &[JobId],
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(), NodeError> {
+        let leases = &self.inner.leases;
+        leases.assert_gate(source, guard);
+        let holds = |id: &JobId| leases.holders(source).iter().any(|(j, _)| j == id);
+        for id in replace {
+            if !self.inner.jobs.lock().unwrap().contains_key(id) {
+                return Err(NodeError::UnknownJob(id.clone()));
+            }
+            if !holds(id) {
+                return Err(NodeError::Other(format!(
+                    "job {} does not hold source {}",
+                    id.0, source.0
+                )));
+            }
+        }
+        let mut seen = Vec::new();
+        for id in replace {
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            self.inner.stop_gated(id).await?;
+            // Another stop may have taken the supervisor; its release is near
+            // (nothing before it takes the gate), and the request must not see it.
+            while holds(id) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Node::job_start`], with `guard` under `source`'s gate: the lease is taken
+    /// without letting the gate go. What must wait for the gate to be released
+    /// (relaunching the elastic jobs a tune moved, stopping those a scan
+    /// displaces) is returned, for [`Node::after_gate`] once the guard is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn job_start_gated(
+        &self,
+        kind: &str,
+        source: SourceId,
+        tuning: Tuning,
+        graph: Graph,
+        capture_rate_hz: Option<Hz>,
+        elastic: bool,
+        guard: Option<&OwnedMutexGuard<()>>,
+    ) -> (Result<JobId, NodeError>, AfterGate) {
+        let rec = JobRecord {
+            format: JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: kind.to_string(),
+            graph,
+            source,
+            tuning,
+            state: JobState::Running,
+            context: serde_json::json!({}),
+            created_ns: now(),
+            input: None,
+            capture_rate_hz: capture_rate_hz.map(|r| r.0),
+            elastic,
+        };
+        let id = rec.id.clone();
+        let (r, after) = self.inner.launch_gated(rec, guard).await;
+        (r.map(|()| id), after)
+    }
+
+    /// Run what a gated call left for after the gate (see [`AfterGate`]). Call it
+    /// only once the guard is dropped.
+    pub(crate) async fn after_gate(&self, after: AfterGate) {
+        self.inner.after_gate(after).await;
+    }
+
+    /// Idle `port` if nobody holds it; see [`LeaseManager::idle_if_unheld`]. Not
+    /// under the source's gate (it takes it).
+    pub(crate) async fn idle_if_unheld(&self, port: &dyn Port) {
+        self.inner.leases.idle_if_unheld(port).await;
+    }
+
     /// Replace a job's graph, keeping its id. The graph is validated first. A
     /// `Running` job is stopped and relaunched on the new graph; any other job
     /// only has its record rewritten. If the relaunch fails (say, a lease
@@ -784,15 +923,20 @@ impl Node {
         self.inner.persist_errors.lock().unwrap().clone()
     }
 
-    /// Tune `source` to `t` unless a job holds it; see [`LeaseManager::tune_if_unheld`].
+    /// Tune `source` to `t` unless a job holds it, under the source's gate the
+    /// caller holds (`guard`) or taking it; see [`LeaseManager::tune_if_unheld`].
     /// Also whether it tuned the port: the caller then relaunches the elastic jobs
-    /// there ([`Node::relaunch_elastic`]).
+    /// there ([`Node::relaunch_elastic`]) once the gate is let go.
     pub(crate) async fn tune_if_unheld(
         &self,
         port: &dyn Port,
         t: Tuning,
+        guard: Option<&OwnedMutexGuard<()>>,
     ) -> Result<(Tuning, bool), LeaseError> {
-        self.inner.leases.tune_if_unheld_tuned(port, t).await
+        match guard {
+            Some(g) => self.inner.leases.tune_if_unheld_locked(port, t, g).await,
+            None => self.inner.leases.tune_if_unheld_tuned(port, t).await,
+        }
     }
 
     /// Relaunch every running elastic job on `source` on its current capture; see

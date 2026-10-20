@@ -66,6 +66,8 @@ function opText(op) {
     if (k === "op" || v === null || v === undefined) continue;
     // A rigid job_start (the usual case) reads as before; only `elastic=true` shows.
     if (k === "elastic" && v === false) continue;
+    // Likewise a request that replaces nothing; named ids show.
+    if (k === "replace" && Array.isArray(v) && v.length === 0) continue;
     parts.push(scalar(v) ? `${k}=${v}` : `${k}=…`);
   }
   return parts.join(" ");

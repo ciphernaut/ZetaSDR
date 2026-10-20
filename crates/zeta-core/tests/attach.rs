@@ -500,6 +500,7 @@ async fn job_start_with_transcribe_is_refused() {
             deviation_hz: None,
             sideband: None,
             elastic: false,
+            replace: vec![],
         })
         .await;
     assert_eq!(

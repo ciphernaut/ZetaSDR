@@ -272,6 +272,7 @@ async fn job_start_records_the_capture_rate() {
         deviation_hz: None,
         sideband: None,
         elastic: false,
+        replace: vec![],
     };
     let id = match node.apply(op).await.unwrap() {
         OpResult::Job(id) => id,

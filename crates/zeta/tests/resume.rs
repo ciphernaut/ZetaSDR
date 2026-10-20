@@ -156,6 +156,7 @@ async fn resume_leaves_a_graph_put_graph_alone() {
             deviation_hz: None,
             sideband: None,
             elastic: false,
+            replace: vec![],
         };
         let id = match node.apply(op).await.unwrap() {
             OpResult::Job(id) => id,

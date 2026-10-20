@@ -219,6 +219,7 @@ impl Remote {
             deviation_hz: None,
             sideband: None,
             elastic: false,
+            replace: vec![],
         };
         let job = match apply(&self.client, &op).await? {
             OpResult::Job(id) => id,

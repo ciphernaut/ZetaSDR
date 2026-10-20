@@ -292,6 +292,7 @@ fn passthrough() -> Op {
         deviation_hz: None,
         sideband: None,
         elastic: false,
+        replace: vec![],
     }
 }
 

@@ -15,7 +15,7 @@ use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::JobRecord;
 use crate::knowledge::{Allocation, Signature};
 use crate::lease::LeaseError;
-use crate::node::{Node, NodeError};
+use crate::node::{AfterGate, Node, NodeError};
 use crate::port::{Port, PortError, Tuning};
 use crate::ring::RingError;
 use crate::stream::{Frame, Payload, StreamInfo};
@@ -49,6 +49,9 @@ pub enum Op {
         source: SourceId,
         center_hz: Hz,
         bandwidth_hz: Hz,
+        /// Jobs holding the source that may be stopped to make room (`[]` for
+        /// none); see `job_start`.
+        replace: Vec<JobId>,
     },
     JobStart {
         kind: JobKind,
@@ -72,6 +75,13 @@ pub enum Op {
         /// relaunched under the same id on every retune, and is stopped by a scan
         /// on its source.
         elastic: bool,
+        /// Jobs holding a rigid lease on `source` that may be stopped to make room
+        /// (`[]` for none). Under the source's gate each is checked (`unknown`, or
+        /// `other` "job <id> does not hold source <src>", nothing stopped) and
+        /// stopped as by `job_stop` right before the request, so nothing can take
+        /// the radio in between. A conflict with a holder not named leaves them
+        /// stopped and names the rest.
+        replace: Vec<JobId>,
     },
     /// Attach a job of an attachable `kind` (`transcribe`) to the running job `job`: it
     /// reads that job's audio output stream (the last one in its graph order when it
@@ -1304,6 +1314,7 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
             message: format!("job {} has no audio stream", j.0),
         },
         NodeError::Expand(e) => e,
+        NodeError::Other(message) => OpError::Other { message },
         e @ (NodeError::Io(_) | NodeError::DuplicateSource(_) | NodeError::Stopped(_)) => other(e),
     }
 }
@@ -1414,6 +1425,32 @@ async fn reconcile_rate(
     Ok(())
 }
 
+/// Stop the `replace` holders under `guard` (see [`Node::replace_holders`]);
+/// nothing to do without a guard, which [`Node::gate_for_replace`] gives only
+/// when `replace` names jobs.
+async fn replace_under(
+    node: &Node,
+    source: &SourceId,
+    replace: &[JobId],
+    guard: Option<&tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<(), NodeError> {
+    match guard {
+        Some(g) => node.replace_holders(source, replace, g).await,
+        None => Ok(()),
+    }
+}
+
+/// After a request with `replace` failed with `e`, outside the source's gate:
+/// the named jobs were stopped without idling the port (their stop ran under
+/// the gate), so idle it now if nobody holds it. Nothing was stopped when `e`
+/// is the refusal of an id, and then nothing is idled.
+async fn idle_after_replace(node: &Node, port: &dyn Port, replace: &[JobId], e: &NodeError) {
+    if replace.is_empty() || matches!(e, NodeError::UnknownJob(_) | NodeError::Other(_)) {
+        return;
+    }
+    node.idle_if_unheld(port).await;
+}
+
 pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
     match op {
         Op::SourceList {} => {
@@ -1440,16 +1477,29 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             source,
             center_hz,
             bandwidth_hz,
+            replace,
         } => {
             let want = Tuning {
                 center_hz,
                 bandwidth_hz,
             };
             let port = checked_port(node, &source, &want)?;
-            let (got, tuned) = node
-                .tune_if_unheld(port.as_ref(), want)
-                .await
-                .map_err(lease_error)?;
+            let guard = node.gate_for_replace(&source, &replace).await;
+            let tuned = match replace_under(node, &source, &replace, guard.as_ref()).await {
+                Ok(()) => node
+                    .tune_if_unheld(port.as_ref(), want, guard.as_ref())
+                    .await
+                    .map_err(NodeError::Lease),
+                Err(e) => Err(e),
+            };
+            drop(guard);
+            let (got, tuned) = match tuned {
+                Ok(t) => t,
+                Err(e) => {
+                    idle_after_replace(node, port.as_ref(), &replace, &e).await;
+                    return Err(node_error(node, e));
+                }
+            };
             // Outside the gate: the relaunched jobs' leases take it.
             if tuned {
                 node.relaunch_elastic(&source).await;
@@ -1464,6 +1514,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             deviation_hz,
             sideband,
             elastic,
+            replace,
         } => {
             if kind.attachable() {
                 return Err(kind.start_refusal());
@@ -1503,33 +1554,65 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             if kind == JobKind::Scan {
                 // No tune here: the scan leases its whole band and steps the
                 // source itself; a held source is a conflict at the lease.
-                checked_port_up_to(node, &source, &tuning, |caps| {
+                let port = checked_port_up_to(node, &source, &tuning, |caps| {
                     let tune =
                         (caps.tune_max_hz.value().0).saturating_sub(caps.tune_min_hz.value().0);
                     tune.saturating_add(caps.max_bandwidth_hz.value().0)
                 })?;
                 let graph = kind.expand(&source, tuning, Hz(0), None, None, None)?;
-                return node
-                    .job_start(kind.name(), source, tuning, graph, None, false)
-                    .await
-                    .map(OpResult::Job)
-                    .map_err(|e| node_error(node, e));
+                // With `replace`, the named holders stop and the scan leases under
+                // one hold of the gate; the elastic jobs it displaces stop after.
+                let guard = node.gate_for_replace(&source, &replace).await;
+                let g = guard.as_ref();
+                let (started, after) = match replace_under(node, &source, &replace, g).await {
+                    Ok(()) => {
+                        node.job_start_gated(kind.name(), source, tuning, graph, None, false, g)
+                            .await
+                    }
+                    Err(e) => (Err(e), AfterGate::Nothing),
+                };
+                drop(guard);
+                node.after_gate(after).await;
+                return match started {
+                    Ok(id) => Ok(OpResult::Job(id)),
+                    Err(e) => {
+                        idle_after_replace(node, port.as_ref(), &replace, &e).await;
+                        Err(node_error(node, e))
+                    }
+                };
             }
             let port = checked_port(node, &source, &tuning)?;
+            // With `replace`, one hold of the source's gate covers stopping the named
+            // holders, the tune and the new job's lease: nothing takes the radio in
+            // between. Without it each step takes the gate itself.
+            let guard = node.gate_for_replace(&source, &replace).await;
+            if let Err(e) = replace_under(node, &source, &replace, guard.as_ref()).await {
+                drop(guard);
+                idle_after_replace(node, port.as_ref(), &replace, &e).await;
+                return Err(node_error(node, e));
+            }
             // The granted capture band: its width is the source rate (Port contract).
             // An elastic job never tunes here: it joins the current capture (or tunes
             // an unheld source to `tuning`) at its lease, which also re-expands its
             // graph for the capture. A rigid tune here relaunches nothing on success:
-            // the job's own lease tunes again and relaunches the elastic jobs then.
+            // the job's own lease relaunches the elastic jobs once the gate is let go.
             let (granted, tuned) = match elastic {
                 true => (port.current().unwrap_or(tuning), false),
-                false => node
-                    .tune_if_unheld(port.as_ref(), tuning)
+                false => match node
+                    .tune_if_unheld(port.as_ref(), tuning, guard.as_ref())
                     .await
-                    .map_err(lease_error)?,
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        drop(guard);
+                        let e = NodeError::Lease(e);
+                        idle_after_replace(node, port.as_ref(), &replace, &e).await;
+                        return Err(node_error(node, e));
+                    }
+                },
             };
             let bin_rate = node.bank_bin_rate(&source, granted);
-            let started = match kind.expand(
+            let (started, after) = match kind.expand(
                 &source,
                 tuning,
                 granted.bandwidth_hz,
@@ -1537,22 +1620,30 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 deviation,
                 sideband,
             ) {
-                Ok(graph) => node
-                    .job_start(
-                        kind.name(),
-                        source.clone(),
-                        tuning,
-                        graph,
-                        Some(granted.bandwidth_hz),
-                        elastic,
-                    )
-                    .await
-                    .map_err(|e| node_error(node, e)),
-                Err(e) => Err(e),
+                Ok(graph) => {
+                    let (r, after) = node
+                        .job_start_gated(
+                            kind.name(),
+                            source.clone(),
+                            tuning,
+                            graph,
+                            Some(granted.bandwidth_hz),
+                            elastic,
+                            guard.as_ref(),
+                        )
+                        .await;
+                    (r.map_err(|e| node_error(node, e)), after)
+                }
+                Err(e) => (Err(e), AfterGate::Nothing),
             };
+            drop(guard);
+            node.after_gate(after).await;
             let id = match started {
                 Ok(id) => id,
                 Err(e) => {
+                    if !replace.is_empty() {
+                        node.idle_if_unheld(port.as_ref()).await;
+                    }
                     // The tune above moved the capture and no lease followed it.
                     if tuned {
                         node.relaunch_elastic(&source).await;

@@ -184,6 +184,7 @@ fn start(kind: JobKind, t: Tuning, elastic: bool) -> Op {
         deviation_hz: None,
         sideband: None,
         elastic,
+        replace: vec![],
     }
 }
 
@@ -278,6 +279,7 @@ async fn source_ensure_retune_relaunches_the_elastic_job() {
             source: SourceId("radio0".into()),
             center_hz: want.center_hz,
             bandwidth_hz: want.bandwidth_hz,
+            replace: vec![],
         })
         .await
         .unwrap();
@@ -492,6 +494,7 @@ async fn stop_during_a_relaunch_is_not_undone() {
                 source: SourceId("radio0".into()),
                 center_hz: Hz(c),
                 bandwidth_hz: Hz(9_600),
+                replace: vec![],
             })
             .await
         })

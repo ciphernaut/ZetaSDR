@@ -136,6 +136,7 @@ async fn ensure_out_of_range_suggests_dropped_zeros() {
         source: SourceId("hackrf0".into()),
         center_hz: Hz(101_500),
         bandwidth_hz: Hz(200_000),
+        replace: vec![],
     };
     match node.apply(op).await {
         Err(OpError::OutOfRange {
@@ -167,6 +168,7 @@ async fn ensure_unknown_source_lists_known() {
         source: SourceId("nope".into()),
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(200_000),
+        replace: vec![],
     };
     match node.apply(op).await {
         Err(OpError::Unknown {
@@ -198,6 +200,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         deviation_hz: None,
         sideband: None,
         elastic: false,
+        replace: vec![],
     };
     let id = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -331,11 +334,13 @@ async fn source_ensure_during_job_start_does_not_retune() {
         deviation_hz: None,
         sideband: None,
         elastic: false,
+        replace: vec![],
     };
     let ensure = Op::SourceEnsure {
         source,
         center_hz: Hz(433_000_000),
         bandwidth_hz: Hz(200_000),
+        replace: vec![],
     };
     // `job_start` tunes twice: once (unheld) to learn the source rate, then
     // under its lease. Send `ensure` once the second, slow tune has begun, so
@@ -424,6 +429,7 @@ async fn job_start_reexpands_when_lease_rate_differs() {
         deviation_hz: None,
         sideband: None,
         elastic: false,
+        replace: vec![],
     };
     // B: 2 MHz around A's band, leased while A's slow pre-tune holds the gate,
     // so B's lease is queued ahead of A's and A's lease shares B's 2 MS/s capture.
@@ -789,6 +795,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         deviation_hz: None,
         sideband: None,
         elastic: false,
+        replace: vec![],
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -798,6 +805,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         source: source.clone(),
         center_hz: Hz(433_000_000),
         bandwidth_hz: Hz(200_000),
+        replace: vec![],
     };
     match node.apply(ensure).await {
         Err(OpError::Conflict {
@@ -807,12 +815,16 @@ async fn conflict_reports_current_tuning_and_real_options() {
             options,
         }) => {
             assert_eq!(s, source);
-            assert_eq!(holders, vec![job]);
-            assert_eq!(current, held);
             assert_eq!(
                 options,
-                vec!["stop one of the holders", "choose a band inside current"]
+                vec![
+                    "stop one of the holders".to_string(),
+                    "choose a band inside current".to_string(),
+                    format!("retry with replace: [{}]", job.0),
+                ]
             );
+            assert_eq!(holders, vec![job]);
+            assert_eq!(current, held);
         }
         other => panic!("expected Conflict, got {other:?}"),
     }
@@ -885,6 +897,7 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         deviation_hz: None,
         sideband: None,
         elastic: false,
+        replace: vec![],
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -1543,6 +1556,7 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         deviation_hz,
         sideband: None,
         elastic: false,
+        replace: vec![],
     }
 }
 
@@ -1663,6 +1677,29 @@ fn job_start_schema_requires_elastic_and_source_list_lists_it() {
 }
 
 #[test]
+fn job_start_and_source_ensure_schema_require_replace() {
+    let s = schema();
+    for op in ["job_start", "source_ensure"] {
+        let v = variants(&s["op"])
+            .iter()
+            .find(|v| v["properties"]["op"]["const"] == op)
+            .expect("variant");
+        let req = v["required"].as_array().unwrap();
+        assert!(req.contains(&"replace".into()), "{op}: {v}");
+        assert_eq!(v["properties"]["replace"]["type"], "array", "{op}: {v}");
+    }
+    let v = serde_json::json!({"op":"source_ensure","source":"s",
+        "center_hz":100_000_000,"bandwidth_hz":48_000});
+    let e = serde_json::from_value::<Op>(v).unwrap_err().to_string();
+    assert!(e.contains("replace"), "{e}");
+    let v = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
+        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null,
+        "elastic":false});
+    let e = serde_json::from_value::<Op>(v).unwrap_err().to_string();
+    assert!(e.contains("replace"), "{e}");
+}
+
+#[test]
 fn job_start_without_deviation_key_is_rejected() {
     let v = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
         "center_hz":100_000_000,"bandwidth_hz":48_000});
@@ -1678,7 +1715,7 @@ fn job_start_without_deviation_key_is_rejected() {
     assert!(e.contains("elastic"), "{e}");
     let ok = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
         "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null,
-        "elastic":false});
+        "elastic":false,"replace":[]});
     assert!(serde_json::from_value::<Op>(ok).is_ok());
 }
 
@@ -1903,7 +1940,7 @@ async fn job_start_rejects_sideband_on_other_kinds() {
     .unwrap();
     let op: Op = serde_json::from_value(serde_json::json!({"op":"job_start","kind":"fm_demod",
         "source":"hackrf0","center_hz":100_005_000,"bandwidth_hz":12_500,
-        "deviation_hz":null,"sideband":"usb","elastic":false}))
+        "deviation_hz":null,"sideband":"usb","elastic":false,"replace":[]}))
     .unwrap();
     match node.apply(op).await {
         Err(OpError::Other { message }) => assert_eq!(

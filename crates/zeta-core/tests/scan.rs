@@ -235,6 +235,7 @@ fn start(kind: JobKind, center_hz: u64, bandwidth_hz: u64) -> Op {
         deviation_hz: None,
         sideband: None,
         elastic: false,
+        replace: vec![],
     }
 }
 
@@ -340,6 +341,7 @@ async fn job_start_during_scan_is_a_conflict_naming_it() {
             source: SourceId("radio0".into()),
             center_hz: Hz(8 * MHZ),
             bandwidth_hz: Hz(MHZ),
+            replace: vec![],
         },
     ] {
         match node.apply(op).await {

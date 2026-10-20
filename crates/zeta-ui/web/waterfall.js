@@ -508,6 +508,7 @@ class Waterfall {
         deviation_hz: null,
         sideband: null,
         elastic: false,
+        replace: [],
       });
     } catch (e) {
       // A scan started on the source since job_list (or this page loaded while one was
@@ -846,6 +847,7 @@ class Waterfall {
           source: src.id,
           center_hz: Math.round((lo + hi) / 2),
           bandwidth_hz: Math.max(1, Math.round(hi - lo)),
+          replace: [],
         });
         current = usableTuning(r.value);
       } catch (e) {

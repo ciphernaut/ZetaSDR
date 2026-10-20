@@ -117,7 +117,7 @@ def scenario_command_line_applies_op(page, url, secret):
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
                                   "deviation_hz": None, "sideband": None,
-                                  "elastic": False}))
+                                  "elastic": False, "replace": []}))
     page.press("#cmd", "Enter")
     err = page.locator("#transcript .line.error", has_text="out_of_range")
     expect(err).to_contain_text("center_hz")
@@ -130,7 +130,7 @@ def scenario_command_line_applies_op(page, url, secret):
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 100_000_000, "bandwidth_hz": 10_000,
                                   "deviation_hz": None, "sideband": None,
-                                  "elastic": False}))
+                                  "elastic": False, "replace": []}))
     page.press("#cmd", "Enter")
     expect(page.locator("#transcript")).to_contain_text("job_start kind=measure source=tone")
     row = page.locator("#jobs .job", has_text="measure")
@@ -343,7 +343,7 @@ def scenario_waterfall_reconnects_after_socket_close(page, url, secret):
     new = http_json(url, secret, "/op", {"op": "job_start", "kind": "spectrum", "source": "tone",
                                          "center_hz": 100_000_000, "bandwidth_hz": 48_000,
                                          "deviation_hz": None, "sideband": None,
-                                         "elastic": False})["value"]
+                                         "elastic": False, "replace": []})["value"]
     wait_waterfall_follows(page, f"w.jobId === {json.dumps(new)}", "after job_start")
     assert page.evaluate("window.__badgeSeen"), "#wf-badge never shown while down"
     jobs = running_spectrum_jobs(url, secret, "tone")
@@ -416,7 +416,7 @@ def start_job(url, secret, kind, source, center_hz, bandwidth_hz, deviation_hz=N
     return http_json(url, secret, "/op", {"op": "job_start", "kind": kind, "source": source,
                                           "center_hz": center_hz, "bandwidth_hz": bandwidth_hz,
                                           "deviation_hz": deviation_hz, "sideband": None,
-                                          "elastic": False})["value"]
+                                          "elastic": False, "replace": []})["value"]
 
 
 def stop_job(url, secret, job):

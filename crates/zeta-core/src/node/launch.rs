@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use tokio::sync::OwnedMutexGuard;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -24,7 +25,39 @@ use crate::types::{
     ChannelId, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
 };
 
+/// What a launch under the source's gate leaves for once the gate is released
+/// (see [`Inner::launch_gated`]): each takes the gate itself.
+#[must_use]
+pub(crate) enum AfterGate {
+    Nothing,
+    /// Relaunch the elastic jobs on `source` but `except`: the launch tuned it.
+    Relaunch {
+        source: SourceId,
+        except: Option<JobId>,
+    },
+    /// Stop the elastic jobs on the source: a scan took it.
+    StopElastic(SourceId),
+}
+
 impl Inner {
+    /// [`Inner::launch_gated`] without a held gate, running its [`AfterGate`].
+    pub(super) async fn launch(self: &Arc<Self>, rec: JobRecord) -> Result<(), NodeError> {
+        let (r, after) = self.launch_gated(rec, None).await;
+        self.after_gate(after).await;
+        r
+    }
+
+    /// Run what a gated launch left for after the gate. Never under the gate.
+    pub(super) async fn after_gate(self: &Arc<Self>, after: AfterGate) {
+        match after {
+            AfterGate::Nothing => {}
+            AfterGate::Relaunch { source, except } => {
+                let _ = self.relaunch_elastic(&source, except.as_ref()).await;
+            }
+            AfterGate::StopElastic(source) => self.stop_elastic(&source).await,
+        }
+    }
+
     /// Validate, lease, record as `Running`, persist, then spawn the job's tasks.
     /// On error nothing is recorded and no lease is held. A built-in kind's graph
     /// expanded for another rate than the leased capture is re-expanded first
@@ -36,7 +69,33 @@ impl Inner {
     /// bank or IQ stream. Its `stream_in` nodes are first pointed at the input job's
     /// current audio stream (`InputNotRunning` / `NoAudioStream` otherwise), so a
     /// resumed attached job reads the resumed input.
-    pub(super) async fn launch(self: &Arc<Self>, mut rec: JobRecord) -> Result<(), NodeError> {
+    ///
+    /// With `gate` (the source's gate, held by the caller) the lease is taken
+    /// under it and nothing here takes the gate: the relaunch of the elastic jobs
+    /// a tune moved (or a scan's stop of them) is returned instead, for the
+    /// caller to run with [`Inner::after_gate`] once it drops the guard.
+    pub(super) async fn launch_gated(
+        self: &Arc<Self>,
+        rec: JobRecord,
+        gate: Option<&OwnedMutexGuard<()>>,
+    ) -> (Result<(), NodeError>, AfterGate) {
+        let mut after = AfterGate::Nothing;
+        let r = self.launch_inner(rec, gate, &mut after).await;
+        if let AfterGate::Relaunch { except, .. } = &mut after
+            && r.is_err()
+        {
+            // The port moved and the new job did not start: every elastic job follows.
+            *except = None;
+        }
+        (r, after)
+    }
+
+    async fn launch_inner(
+        self: &Arc<Self>,
+        mut rec: JobRecord,
+        gate: Option<&OwnedMutexGuard<()>>,
+        after: &mut AfterGate,
+    ) -> Result<(), NodeError> {
         let port = match rec.input.clone() {
             Some(input) => {
                 let stream = self.audio_stream(&input)?;
@@ -47,21 +106,35 @@ impl Inner {
                 let port = self.ports.read().unwrap().get(&rec.source).cloned();
                 let port = port.ok_or_else(|| NodeError::UnknownSource(rec.source.clone()))?;
                 if rec.kind == JobKind::Scan.name() {
-                    return self.launch_scan(rec, port).await;
+                    return self.launch_scan(rec, port, gate, after).await;
                 }
                 Some(port)
             }
         };
         let mut stages = self.stages(&rec.graph)?;
         let mut bank = None;
-        let mut tuned = false;
         if let Some(port) = &port {
-            let granted;
-            // The source's gate is held only inside `ensure_tuned`, never past it.
-            (granted, tuned) = self
-                .leases
-                .ensure_tuned(port.as_ref(), rec.id.clone(), rec.tuning, rec.elastic)
-                .await?;
+            // Without `gate` the source's gate is held only inside `ensure_tuned`.
+            let (granted, tuned) = match gate {
+                Some(g) => {
+                    self.leases
+                        .ensure_locked(port.as_ref(), rec.id.clone(), rec.tuning, rec.elastic, g)
+                        .await?
+                }
+                None => {
+                    self.leases
+                        .ensure_tuned(port.as_ref(), rec.id.clone(), rec.tuning, rec.elastic)
+                        .await?
+                }
+            };
+            // Only a rigid request tunes a port elastic jobs follow (an elastic one
+            // tunes only an unheld port), so a relaunch never relaunches again.
+            if tuned && !rec.elastic {
+                *after = AfterGate::Relaunch {
+                    source: rec.source.clone(),
+                    except: Some(rec.id.clone()),
+                };
+            }
             if rec.elastic
                 && let Err(e) =
                     self.follow_capture(&mut rec, port.current().unwrap_or(granted), &mut stages)
@@ -77,9 +150,6 @@ impl Inner {
                 && let Err(e) = self.fit_capture(&mut rec, band, &mut stages)
             {
                 self.leases.release(&rec.id);
-                if tuned && !rec.elastic {
-                    let _ = self.relaunch_elastic(&rec.source, None).await;
-                }
                 return Err(e);
             }
             // The bank for the band the lease left the port at, so the stages
@@ -100,20 +170,10 @@ impl Inner {
         };
 
         let id = rec.id.clone();
-        let relaunch = tuned && !rec.elastic;
-        let source = rec.source.clone();
         let token = self.shutdown.child_token();
         let graph = rec.graph.clone();
-        let prov = match self.record_running(rec, &token) {
-            Ok(prov) => prov,
-            Err(e) => {
-                // The port moved anyway: the elastic jobs follow it.
-                if relaunch {
-                    let _ = self.relaunch_elastic(&source, None).await;
-                }
-                return Err(e);
-            }
-        };
+        // On error the port moved anyway: `launch_gated` relaunches every elastic job.
+        let prov = self.record_running(rec, &token)?;
 
         // One stream per edge; a node with no incoming edge whose stage takes input
         // reads the job's IQ stream (a job on the radio only). Each node's outputs get
@@ -182,11 +242,6 @@ impl Inner {
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
             e.done = Some(h);
             e.outputs = job_outputs;
-        }
-        // Only a rigid request tunes a port elastic jobs follow (an elastic one
-        // tunes only an unheld port), so a relaunch never relaunches again.
-        if relaunch {
-            let _ = self.relaunch_elastic(&source, Some(&id)).await;
         }
         Ok(())
     }
@@ -275,8 +330,7 @@ impl Inner {
 
     /// Stop every elastic job on `source`, each `Stopped` as by `job_stop`: a scan
     /// is about to time-share the source, and no capture outlasts one of its steps.
-    /// A stop that cannot be persisted leaves that job running (the scan's lease
-    /// is then refused).
+    /// A stop that cannot be persisted leaves that job running.
     async fn stop_elastic(&self, source: &SourceId) {
         let _one = self.relaunching.lock().await;
         for id in self.leases.elastic_holders(source) {
@@ -401,6 +455,8 @@ impl Inner {
                 done: None,
                 outputs: Vec::new(),
                 relaunch: false,
+                skip_idle: false,
+                released: false,
             },
         );
         Ok(prov)
@@ -409,11 +465,15 @@ impl Inner {
     /// Launch a `scan` job: take a time-shared lease on its whole band
     /// (`rec.tuning`), then run [`scan_loop`] under [`supervise`] with one
     /// `Event` output stream. The graph is ignored; the registered `fft`
-    /// stage does the spectra.
+    /// stage does the spectra. The elastic jobs on the source are stopped:
+    /// first, or with `gate` (held by the caller, see [`Inner::launch_gated`])
+    /// once the lease is granted, through `after`.
     async fn launch_scan(
         self: &Arc<Self>,
         rec: JobRecord,
         port: Arc<dyn Port>,
+        gate: Option<&OwnedMutexGuard<()>>,
+        after: &mut AfterGate,
     ) -> Result<(), NodeError> {
         let stage = self.registry.select("fft", &self.backends).ok_or_else(|| {
             GraphError::UnknownStage {
@@ -422,10 +482,19 @@ impl Inner {
                 known: self.registry.kinds(),
             }
         })?;
-        self.stop_elastic(&rec.source).await;
-        self.leases
-            .acquire_shared(port.as_ref(), rec.id.clone(), rec.tuning)
-            .await?;
+        match gate {
+            Some(g) => {
+                self.leases
+                    .acquire_shared_locked(port.as_ref(), rec.id.clone(), rec.tuning, g)?;
+                *after = AfterGate::StopElastic(rec.source.clone());
+            }
+            None => {
+                self.stop_elastic(&rec.source).await;
+                self.leases
+                    .acquire_shared(port.as_ref(), rec.id.clone(), rec.tuning)
+                    .await?;
+            }
+        }
         let (id, span) = (rec.id.clone(), rec.tuning);
         let steps = scan_steps(span, port.capabilities());
         let mut rec = rec;
@@ -606,14 +675,30 @@ async fn supervise(
     }
     // The only place a started job's lease is released, but for a relaunch that
     // fails (`Inner::relaunch_elastic`).
-    if let Some(port) = port
-        && !relaunch
-    {
+    if port.is_some() && !relaunch {
         inner.leases.release(&id);
-        inner.leases.idle_if_unheld(port.as_ref()).await;
     }
     for s in &streams {
         inner.bus.unregister(s);
+    }
+    // Read under the lock a gated stop sets it under (`Inner::stop_gated`): that
+    // stop holds the source's gate, so the idle (which takes it) is left out.
+    let skip_idle = {
+        let mut jobs = inner.jobs.lock().unwrap();
+        match jobs.get_mut(&id) {
+            Some(e) => {
+                // A relaunch keeps the lease; nothing was released.
+                e.released = !relaunch;
+                e.skip_idle
+            }
+            None => false,
+        }
+    };
+    if let Some(port) = port
+        && !relaunch
+        && !skip_idle
+    {
+        inner.leases.idle_if_unheld(port.as_ref()).await;
     }
 }
 
@@ -779,7 +864,7 @@ async fn scan_loop(inner: Arc<Inner>, s: Scan) -> Result<(), StageError> {
         }
         let got = match inner
             .leases
-            .retune_shared(s.port.as_ref(), &s.id, s.steps[i])
+            .retune_shared(s.port.as_ref(), &s.id, s.steps[i], &s.cancel)
             .await
         {
             Ok(Some(t)) => t,

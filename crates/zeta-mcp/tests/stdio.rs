@@ -179,7 +179,8 @@ async fn tools_call_ok_and_corrective_error() {
     assert!(!is_error, "{v}");
     assert_eq!(v["result"], "sources");
 
-    let args = json!({"source": "tone", "center_hz": 100_000, "bandwidth_hz": 48_000});
+    let args =
+        json!({"source": "tone", "center_hz": 100_000, "bandwidth_hz": 48_000, "replace": []});
     let (is_error, v) = mcp.call(3, "source_ensure", args).await;
     assert!(is_error, "{v}");
     assert_eq!(v["error"], "out_of_range");

@@ -22,6 +22,7 @@ async fn apply_roundtrips_ok_and_error() {
         source: SourceId("tone".to_string()),
         center_hz: Hz(100_000),
         bandwidth_hz: Hz(48_000),
+        replace: vec![],
     };
     match c.apply(&ensure).await.unwrap() {
         Err(OpError::OutOfRange { suggested, .. }) => assert_eq!(suggested, Some(100_000_000)),

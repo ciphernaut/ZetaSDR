@@ -337,6 +337,7 @@ class Menu {
       deviation_hz: job.deviation,
       sideband: job.sideband,
       elastic: false,
+      replace: [],
     });
   }
 
@@ -360,6 +361,7 @@ class Menu {
       deviation_hz: null,
       sideband: null,
       elastic: false,
+      replace: [],
     });
     this.wf.resume();
   }

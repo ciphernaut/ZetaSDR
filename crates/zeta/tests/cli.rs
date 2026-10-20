@@ -193,6 +193,83 @@ fn job_start_elastic_flag_round_trips_to_job_list() {
     assert_eq!(job["kind"], "spectrum", "{job}");
 }
 
+/// The op of the last line of the state directory's `ops.log`.
+fn last_logged_op(dir: &Path) -> Value {
+    let log = std::fs::read_to_string(dir.join("state").join("ops.log")).unwrap();
+    let line = log.lines().last().expect("an op logged");
+    serde_json::from_str::<Value>(line).unwrap()["op"].clone()
+}
+
+#[test]
+fn job_start_replace_flag_round_trips_to_the_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = |replace: &str| {
+        let mut args = vec![
+            "job",
+            "start",
+            "--kind",
+            "passthrough",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+            "--replace",
+        ];
+        args.push(replace);
+        zeta(dir.path(), &args)
+    };
+    // Unknown ids: the request is refused naming the first, and nothing starts.
+    let out = start("01AAAAAAAAAAAAAAAAAAAAAAAA,01BBBBBBBBBBBBBBBBBBBBBBBB")
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "unknown", "{v}");
+    assert_eq!(v["value"], "01AAAAAAAAAAAAAAAAAAAAAAAA", "{v}");
+    let op = last_logged_op(dir.path());
+    assert_eq!(
+        op["replace"],
+        serde_json::json!(["01AAAAAAAAAAAAAAAAAAAAAAAA", "01BBBBBBBBBBBBBBBBBBBBBBBB"]),
+        "{op}"
+    );
+    // An empty list is none.
+    start("").assert().success();
+    assert_eq!(last_logged_op(dir.path())["replace"], serde_json::json!([]));
+}
+
+#[test]
+fn source_ensure_replace_flag_round_trips_to_the_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let ensure = |extra: &[&str]| {
+        let mut args = vec![
+            "source",
+            "ensure",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ];
+        args.extend_from_slice(extra);
+        zeta(dir.path(), &args)
+    };
+    ensure(&["--replace", "01AAAAAAAAAAAAAAAAAAAAAAAA"])
+        .assert()
+        .code(2)
+        .stdout(contains("\"unknown\""));
+    assert_eq!(
+        last_logged_op(dir.path())["replace"],
+        serde_json::json!(["01AAAAAAAAAAAAAAAAAAAAAAAA"])
+    );
+    ensure(&[]).assert().success();
+    assert_eq!(last_logged_op(dir.path())["replace"], serde_json::json!([]));
+}
+
 #[test]
 fn iq_read_one_shot_writes_capture() {
     let dir = tempfile::tempdir().unwrap();
