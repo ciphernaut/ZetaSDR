@@ -161,6 +161,7 @@ table, so a new behaviour is a new entry.
 | `follow` | `target`, `free` | `target` | `target`: the view tracks the shown source's capture, and when that capture changes (`source_list` `current` differs from the last poll) the view eases to the new region over about 400 ms instead of jumping; `free`: the view never moves on its own |
 | `zoom_out` | `scan`, `none` | `scan` | `scan`: zooming or panning past the fine capture starts an automatic scan over the visible span on the scanner, re-issued (debounced, about 300 ms after the last change) as the view grows or moves, capped to the scanner's tune range; `none`: the coarse layer stays empty |
 | `auto_scan_stop` | `inside`, `keep` | `inside` | `inside`: the page stops its automatic scan when the view returns inside the fine capture; `keep`: it keeps sweeping |
+| `finished_rows_s` | seconds, 0 for never shown | `60` | how long a stopped or failed job row stays in the list (4.5) |
 | `scanner` | `auto`, a source id | `auto` | which source scans: `auto` picks the first source that is not the shown one, has no rigid holder, and whose tune range contains the view's centre; with no such source it falls back to the shown source itself when nothing rigid holds it (today's scan mode: the scan stops the page's elastic job, which restarts when the scan ends); a source id pins it |
 
 Commands, typed in the command line: `view set <key> <value>`, `view show`, `view reset`. The page
@@ -177,7 +178,22 @@ zooming out shows an empty coarse layer and one transcript line saying why. An a
 over the visible span (capped to the device's range), and replaced by a new one when the span grows or
 moves (stop the old, start the new; the brief gap is acceptable).
 
-### 4.5 Visible state
+### 4.5 Conflicts and finished rows
+
+Seen on 2026-10-20: a `conflict` line named a holder id, the user stopped several rows that had already
+failed (which hold no lease, so nothing changed), and the request succeeded only once it happened to
+fit the holder's band. Two rules:
+
+- A `conflict` reply in the transcript names each holder by kind and tuning (looked up in the last job
+  list), not only by id, and offers one action per rigid holder: `stop <kind> <id> and retry`, which
+  issues the original request again with `replace: [<id>]` (3.2). The page's own elastic job is never a
+  holder, so the offer is only ever about someone's decoder.
+- Finished rows (`stopped`, `failed`) stay listed for `finished_rows_s` (a policy, default 60 s) and
+  then disappear; a failed row shows its reason inline, not only as a tooltip, and no Stop button. A
+  `view clear` command drops them at once. Records are not deleted by this (pruning stopped records is
+  a node-side follow-up noted in the plan-9 status).
+
+### 4.6 Visible state
 
 The page's own elastic job appears in the job list like any job, marked `elastic` (the current hiding
 goes away; the row needs no buttons beyond stop). The scan row shows whether it is the page's own.
@@ -230,3 +246,5 @@ view across a retune; the retune eases under `follow target`).
   source, so a record carries what it needs on its own.
 - The ops log is a plain file with a one-shot reader, not a new op or stream: the smallest thing that
   answers "who stopped that job".
+- A conflict's one-click answer is `replace` on the named rigid holder, offered per holder; finished rows
+  age out of the list on a page policy rather than being pruned on the node.
