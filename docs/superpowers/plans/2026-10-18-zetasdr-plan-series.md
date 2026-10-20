@@ -406,8 +406,8 @@ antenna in use. The radio was left at 104.9 MHz / 1 MHz with no jobs.
 
 ## Plan 10 status
 
-Plan 10 is delivered on `speech` (tasks 1-8). Not yet tried live: the live acceptance on the field host
-(below) has not run, so nothing here was transcribed off air.
+Plan 10 is delivered on `speech` (tasks 1-8), fast-forward merged into `main` at effb67d on
+2026-10-20, and tried live on the field host the same day (below).
 
 What was built:
 
@@ -474,6 +474,23 @@ Observation for live acceptance: in the in-process attach chain, the whole chain
 about 4 s late (seen in 1 of 5 unloaded probe runs: the `vad` and `transcript` events all arrive
 about 4 s later than usual). Watch the time to the first `transcript` on air.
 
-Live acceptance (to do, on the field host as the `sdr` user): install `local-voice` as in docs/speech.md
-section 1, `zeta serve --stt-socket`, `wfm_demod` on 100.5 MHz / 200 kHz, `job attach --kind transcribe`
-and expect `transcript` events with the programme's speech. Outcomes are not yet recorded.
+Live acceptance on the field host (2026-10-20, as the `sdr` user): `local-voice` installed per docs/speech.md
+section 1 (clone from a git bundle under `~/zetasdr/local-voice`, `uv python install 3.13`, `uv sync`,
+the Parakeet model copied, `voiced.service` as a user unit with linger; `languages` answers
+`error:unknown command`, `file:` answers a transcript). The field host's own source tree is on branch
+`wideband` with uncommitted work and no shared history with this repository, so the speech branch was
+delivered as `~/zetasdr/scratch/zetasdr-speech.bundle` and built in a separate clone
+(`~/zetasdr/speech-src`, `RUSTFLAGS="--cfg soapy"`, target `~/zetasdr/speech-target`); the node was
+restarted from that binary with its usual flags plus `--stt-socket $XDG_RUNTIME_DIR/voiced.sock`
+(the log shows `speech backend: socket:/run/user/1021/voiced.sock`). The running `spectrum` and
+`adsb_decode` jobs were stopped to free the B210, then `job start --kind wfm_demod --source b210
+--center-hz 100500000 --bandwidth-hz 200000` and `job attach --kind transcribe --job <id>` over
+`--node`. Within 40 s of tailing, the attached job's two event streams carried 18 `vad` transitions
+and 7 `transcript` events from the programme's audio, for example "There's nothing left inside"
+(3480 ms), "Maybe you can get down." (2160 ms) and "The storm is really bottom outside." (5080 ms),
+each `language` en, `backend` the socket. Observations: `stream tail --timeout-ms` is capped at
+10 000, so a tail loop is needed; on compressed broadcast audio the voice gate fragments speech into
+runs of 0.6-5 s ("Um", "Baby."), the floor-rise-rate effect the final review predicted, so a slower
+floor rise or a minimum-tracking floor is the first thing to try next; the first transcript arrived
+about 20 s after the attach (the ~4 s late start was not isolated on air). The old binary at
+`~/zetasdr/target/release/zeta` (the `wideband` tree) is untouched for rollback.
