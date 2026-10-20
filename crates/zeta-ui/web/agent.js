@@ -2,6 +2,7 @@
 //
 // Exports:
 //   AUDIO_KINDS                 job kinds with an audio stream (their rows get ▶)
+//   AUTO_SCAN_KEY               the sessionStorage key holding the page's automatic scan id
 //   errorText(error) -> the text of an op error JSON as formatOp shows it after `→`
 //   formatOp(payload) -> {text, error}
 //       One `ops` stream payload ({op, outcome, result|error, elapsed_ms, transport}) as a
@@ -41,7 +42,9 @@
 //       them finished (0: never; without `view`, 60 s); view.onClear drops the finished rows
 //       at once. A finished row shows `.reason` (the state's reason, or `stopped`) and no
 //       Stop, ▶ or Transcribe button. A row of an elastic job (the page's own spectrum job)
-//       reads `<kind> elastic` and has only Stop. Each row shows kind, source,
+//       reads `<kind> elastic` and has only Stop. The row of the page's own automatic scan
+//       (the id in sessionStorage[AUTO_SCAN_KEY], coarse.js) reads `scan auto`; a scan the
+//       page did not start reads `scan`. Each row shows kind, source,
 //       state, id, an `.events` cell (filled by overlays.js: a count, or `—` over its
 //       watch cap), on rows of an AUDIO_KINDS kind a
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job) and, while
@@ -56,6 +59,7 @@
 export const JOBS_POLL_MS = 2000;
 export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"];
 export const QUIET_OPS = new Set(["job_list", "stream_list", "source_list"]);
+export const AUTO_SCAN_KEY = "zeta.autoScan";
 const MAX_LINES = 500;
 
 function scalar(v) {
@@ -281,6 +285,14 @@ export function startOpsFeed(api, transcript, { onConflict = null } = {}) {
   };
 }
 
+function autoScanId() {
+  try {
+    return sessionStorage.getItem(AUTO_SCAN_KEY);
+  } catch {
+    return null;
+  }
+}
+
 const isFinished = (j) => !!(j.state && (j.state.status === "stopped" || j.state.status === "failed"));
 
 function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing }) {
@@ -307,6 +319,13 @@ function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing }) {
       tag.className = "tag elastic";
       tag.textContent = "elastic";
       tag.title = "follows the capture; holds no lease";
+      span.append(" ", tag);
+    }
+    if (cls === "kind" && job.kind === "scan" && job.id === autoScanId()) {
+      const tag = document.createElement("span");
+      tag.className = "tag auto";
+      tag.textContent = "auto";
+      tag.title = "the page's automatic scan of the view outside the capture";
       span.append(" ", tag);
     }
     row.append(span);

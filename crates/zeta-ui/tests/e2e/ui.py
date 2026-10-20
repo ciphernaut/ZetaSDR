@@ -8,8 +8,9 @@ or `FAIL <name>: <reason>` (plus the browser console errors) and exits 1 on the 
 Run by `cargo test -p zeta --test ui`, which starts the node with the `tone`, `aprs`, `wfm`
 (wideband FM, 1 kHz tone with pilot, 240 kHz at 104.9 MHz) and `pocsag` (a 1200-baud page
 `HELLO ZETA` to address 1234567, 48 kHz at 148.6375 MHz) and `speech` (speech-like bursts,
-wideband FM, 240 kHz at 104.7 MHz) fixtures, `retune` (the tone recording tunable over
-50-150 MHz: a tune moves its capture's centre), and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
+wideband FM, 240 kHz at 104.7 MHz) fixtures, `retune` (the tone recording at 250 MHz,
+tunable over 200-300 MHz: a tune moves its capture's centre), `scanner` (the tone recording
+tunable over 50-150 MHz: the source automatic scans around `tone` pick), and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
 state directory in ZETA_UI_STATE_DIR, and the URL of a second node started without a speech
 daemon (with the `speech` source) in ZETA_UI_URL_NOSTT (for the "no daemon" scenarios).
 """
@@ -113,7 +114,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (6 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (7 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -195,7 +196,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (6 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (7 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -220,7 +221,7 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    for source in ("tone", "aprs", "wfm", "speech", "retune"):
+    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -514,7 +515,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (6 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (7 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -736,7 +737,10 @@ def scenario_zoom_inside_capture_is_render_only(page, url, secret):
 
 
 def scenario_zoom_beyond_capture_on_a_file_source_shows_out_of_range(page, url, secret):
+    # Without the coarse layer (zoom_out none) a view past the capture asks the source.
     show_tone_waterfall(page, url, secret)
+    run_cmd(page, "view set zoom_out none")
+    expect(view_line(page, "zoom_out = none")).to_be_visible()
     page.wait_for_function("() => window.zetaTest.wf().painted > 5")
     wait_ticks(page, "100.024", "99.976", "before zooming")
     wheel_at_centre(page, 100)
@@ -749,6 +753,10 @@ def scenario_zoom_beyond_capture_on_a_file_source_shows_out_of_range(page, url, 
 
 
 def scenario_zoom_on_held_source_shows_conflict(page, url, secret):
+    # A rigid job holds the shown source: zooming out never retunes it. Under zoom_out scan the
+    # view leaves the capture and the coarse layer scans it on the scanner; under none the
+    # view stays inside the capture with a conflict line.
+    stop_scans(url, secret)
     fresh_spectrum_jobs(url, secret)
     job = start_job(url, secret, "measure", "wfm", 104_900_000, 10_000)
     try:
@@ -757,23 +765,49 @@ def scenario_zoom_on_held_source_shows_conflict(page, url, secret):
                                timeout=15_000)
         before = ticks(page)
         wheel_at_centre(page, 100)
+        wait_ticks(page, "105.140", "104.660", "the view leaves the held capture")
+        scans = wait_until(lambda: running_scan_jobs(url, secret, "scanner"), 3.0,
+                           "an automatic scan on scanner beside the held wfm")
+        assert page.evaluate(AUTO_SCAN_JS) == scans[0]["id"], scans
+        wheel_at_centre(page, -100)
+        wait_ticks(page, before[0], before[4], "back inside the held capture")
+        wait_until(lambda: not running_scan_jobs(url, secret, "scanner"), 3.0,
+                   "the automatic scan stopped")
+        assert page.locator("#transcript .line", has_text="conflict: source wfm").count() == 0
+        run_cmd(page, "view set zoom_out none")
+        expect(view_line(page, "zoom_out = none")).to_be_visible()
+        wheel_at_centre(page, 100)
         line = page.locator("#transcript .line", has_text="conflict: source wfm held by")
         expect(line.first).to_be_visible()
         expect(line.first).to_contain_text(job)
         wait_ticks(page, before[0], before[4], "view not reverted")
         page.wait_for_timeout(1_000)
         assert ensure_lines(page) == 0, "source_ensure issued on a source held by another job"
+        assert running_scan_jobs(url, secret, "scanner") == [], "a scan under zoom_out none"
         jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
         mine = [j for j in jobs if j["id"] == job]
         assert mine and mine[0]["state"]["status"] == "running", f"measure job: {mine}"
     finally:
         stop_job(url, secret, job)
+        stop_scans(url, secret)
 
 
 def running_scan_jobs(url, secret, source):
     jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
     return [j for j in jobs if j["kind"] == "scan" and j["source"] == source
             and j["state"]["status"] == "running"]
+
+
+def stop_scans(url, secret):
+    """Stop every running scan job, on any source, through the API."""
+    jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+    for j in jobs:
+        if j["kind"] == "scan" and j["state"]["status"] == "running":
+            stop_job(url, secret, j["id"])
+
+
+# The id of the page's automatic scan (sessionStorage["zeta.autoScan"]), or null.
+AUTO_SCAN_JS = "() => sessionStorage.getItem('zeta.autoScan')"
 
 
 def scenario_scan_entry_starts_a_scan_job(page, url, secret):
@@ -860,7 +894,8 @@ def scenario_overlays_follow_a_zoom(page, url, secret):
 
 
 # ---- view policy: the page yields (plan 11 Task 5) ------------------------------------------
-# `retune` is the tone recording tunable over 50-150 MHz: a tune moves its capture's centre.
+# `retune` is the tone recording at 250 MHz, tunable over 200-300 MHz: a tune moves its
+# capture's centre.
 
 def job_record(url, secret, job):
     jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
@@ -917,7 +952,7 @@ def scenario_page_job_is_elastic_and_a_rigid_start_needs_no_replace(page, url, s
     expect(row.locator("button")).to_have_count(1)
     expect(row.locator("button.stop")).to_have_count(1)
     cur = source_info(url, secret, "retune")["current"]["center_hz"]
-    band = cur + 1_000_000 if cur + 1_000_000 < 149_000_000 else cur - 1_000_000
+    band = cur + 1_000_000 if cur + 1_000_000 < 299_000_000 else cur - 1_000_000
     r = http_json(url, secret, "/op", {"op": "job_start", "kind": "passthrough",
                                        "source": "retune", "center_hz": band,
                                        "bandwidth_hz": 10_000, "deviation_hz": None,
@@ -1030,15 +1065,15 @@ def scenario_finished_rows_age_out(page, url, secret):
 def scenario_conflict_offers_replace(page, url, secret):
     select_source(page, url, secret, "retune")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
-    a = start_job(url, secret, "passthrough", "retune", 100_000_000, 10_000)
+    a = start_job(url, secret, "passthrough", "retune", 250_000_000, 10_000)
     new = None
     try:
         op = {"op": "job_start", "kind": "passthrough", "source": "retune",
-              "center_hz": 101_000_000, "bandwidth_hz": 10_000, "deviation_hz": None,
+              "center_hz": 251_000_000, "bandwidth_hz": 10_000, "deviation_hz": None,
               "sideband": None, "elastic": False, "replace": []}
         run_cmd(page, json.dumps(op))
         line = page.locator("#transcript .line.error",
-                            has_text=re.compile(rf"conflict.*held by passthrough {a} @ 100\.000"))
+                            has_text=re.compile(rf"conflict.*held by passthrough {a} @ 250\.000"))
         expect(line).to_have_count(1)
         button = line.locator("button", has_text=f"stop passthrough {a[-6:]} and retry")
         expect(button).to_have_count(1)
@@ -1049,17 +1084,159 @@ def scenario_conflict_offers_replace(page, url, secret):
             mine = next(j for j in jobs if j["id"] == a)
             news = [j for j in jobs if j["kind"] == "passthrough" and j["source"] == "retune"
                     and j["state"]["status"] == "running"
-                    and j["tuning"]["center_hz"] == 101_000_000]
+                    and j["tuning"]["center_hz"] == 251_000_000]
             return news[0]["id"] if mine["state"]["status"] == "stopped" and news else None
         new = wait_until(handed_over, 5.0, "A stopped and the new job running")
         cur = source_info(url, secret, "retune")["current"]
-        assert cur["center_hz"] == 101_000_000, f"current {cur}"
+        assert cur["center_hz"] == 251_000_000, f"current {cur}"
         expect(page.locator("#transcript .line.op",
                             has_text=re.compile(rf"replace=… → job {new}"))).to_have_count(1)
     finally:
         stop_job(url, secret, a)
         if new:
             stop_job(url, secret, new)
+
+
+# ---- automatic scans on the scanner source (plan 11 Task 6) ---------------------------------
+# A view past the fine capture starts the page's own scan on a free source (`scanner`, the only
+# free source whose range holds 100 MHz); a scan the page did not start is never touched.
+
+def zoom_tone_out(page, url, secret):
+    """Show `tone` and zoom x2 out past its capture (the caller stopped stray scans)."""
+    show_tone_waterfall(page, url, secret)
+    page.wait_for_function("() => window.zetaTest.wf().painted > 5")
+    wait_ticks(page, "100.024", "99.976", "before zooming")
+    wheel_at_centre(page, 100)
+    wait_ticks(page, "100.048", "99.952", "the view leaves the capture")
+
+
+def zoom_tone_in(page):
+    wheel_at_centre(page, -100)
+    wait_ticks(page, "100.024", "99.976", "back inside the capture")
+
+
+def stopped(url, secret, job):
+    rec = job_record(url, secret, job)
+    return rec is not None and rec["state"]["status"] != "running"
+
+
+def scenario_zoom_out_starts_and_stops_an_auto_scan(page, url, secret):
+    stop_scans(url, secret)
+    try:
+        zoom_tone_out(page, url, secret)
+        scans = wait_until(lambda: running_scan_jobs(url, secret, "scanner"), 3.0,
+                           "an automatic scan on scanner")
+        assert len(scans) == 1, f"scans on scanner: {scans}"
+        own = scans[0]
+        bw = own["tuning"]["bandwidth_hz"]
+        assert abs(bw - 96_000) <= 96_000 * 0.05, f"scan tuning {own['tuning']}, view 96 kHz"
+        assert abs(own["tuning"]["center_hz"] - 100_000_000) <= 2_000, own["tuning"]
+        assert page.evaluate(AUTO_SCAN_JS) == own["id"], page.evaluate(AUTO_SCAN_JS)
+        # The view left the capture without a retune: the shown source keeps its own job.
+        assert ensure_lines(page) == 0, "a source_ensure was issued for the coarse view"
+        assert running_scan_jobs(url, secret, "tone") == [], "a scan on the shown source"
+        # The coarse layer follows the scan's frames.
+        page.wait_for_function(
+            f"() => window.zetaTest.coarse().scanJobId === {json.dumps(own['id'])}"
+            " && window.zetaTest.coarse().rows > 0", timeout=5_000)
+        zoom_tone_in(page)
+        wait_until(lambda: stopped(url, secret, own["id"]), 3.0, "the automatic scan stopped")
+        assert running_scan_jobs(url, secret, "scanner") == [], "a scan still runs on scanner"
+    finally:
+        stop_scans(url, secret)
+
+
+def scenario_manual_scan_is_left_alone(page, url, secret):
+    stop_scans(url, secret)
+    manual = start_job(url, secret, "scan", "scanner", 100_000_000, 96_000)
+    try:
+        zoom_tone_out(page, url, secret)
+        # It is shown (followed read-only), and nothing else starts.
+        page.wait_for_function(
+            f"() => window.zetaTest.coarse().followed === {json.dumps(manual)}", timeout=5_000)
+        page.wait_for_timeout(1_000)
+        assert [j["id"] for j in running_scan_jobs(url, secret, "scanner")] == [manual]
+        assert running_scan_jobs(url, secret, "tone") == [], "a scan on the shown source"
+        assert page.evaluate(AUTO_SCAN_JS) is None, page.evaluate(AUTO_SCAN_JS)
+        zoom_tone_in(page)
+        page.wait_for_timeout(1_000)
+        rec = job_record(url, secret, manual)
+        assert rec["state"]["status"] == "running", f"manual scan after zooming in: {rec}"
+    finally:
+        stop_job(url, secret, manual)
+        stop_scans(url, secret)
+
+
+def scenario_scanner_policy_pins_source(page, url, secret):
+    try:
+        # Pinned to aprs (whose range is nowhere near the view): no scan, and auto's choice
+        # (scanner) is not used instead.
+        stop_scans(url, secret)
+        show_tone_waterfall(page, url, secret)
+        run_cmd(page, "view set scanner aprs")
+        expect(view_line(page, "scanner = aprs")).to_be_visible()
+        page.wait_for_function("() => window.zetaTest.wf().painted > 5")
+        wheel_at_centre(page, 100)
+        wait_ticks(page, "100.048", "99.952", "the view leaves the capture")
+        expect(page.locator("#transcript .line", has_text="no free source can scan")).to_have_count(1)
+        page.wait_for_timeout(700)
+        assert running_scan_jobs(url, secret, "scanner") == [], "auto's scanner used under a pin"
+        # Pinned to scanner: the view, still outside, is scanned there.
+        run_cmd(page, "view set scanner scanner")
+        scans = wait_until(lambda: running_scan_jobs(url, secret, "scanner"), 3.0,
+                           "a scan on the pinned scanner")
+        assert page.evaluate(AUTO_SCAN_JS) == scans[0]["id"]
+        zoom_tone_in(page)
+        wait_until(lambda: stopped(url, secret, scans[0]["id"]), 3.0, "the scan stopped")
+        # zoom_out none: zooming out starts nothing.
+        run_cmd(page, "view set zoom_out none")
+        expect(view_line(page, "zoom_out = none")).to_be_visible()
+        wheel_at_centre(page, 100)
+        expect(page.locator("#transcript .line", has_text="out_of_range").first).to_be_visible()
+        page.wait_for_timeout(1_000)
+        assert running_scan_jobs(url, secret, "scanner") == [], "a scan under zoom_out none"
+    finally:
+        stop_scans(url, secret)
+
+
+def scenario_own_scan_row_is_marked(page, url, secret):
+    stop_scans(url, secret)
+    manual = start_job(url, secret, "scan", "retune", 250_000_000, 96_000)
+    try:
+        zoom_tone_out(page, url, secret)
+        own = wait_until(lambda: running_scan_jobs(url, secret, "scanner"), 3.0,
+                         "an automatic scan on scanner")[0]["id"]
+        expect(job_row(page, own).locator(".kind")).to_have_text("scan auto")
+        manual_row = job_row(page, manual)
+        expect(manual_row).to_have_attribute("data-state", "running")
+        expect(manual_row.locator(".kind")).to_have_text("scan")
+    finally:
+        stop_job(url, secret, manual)
+        stop_scans(url, secret)
+
+
+def scenario_zoom_out_beyond_scanner_range_starts_nothing(page, url, secret):
+    try:
+        stop_scans(url, secret)
+        show_tone_waterfall(page, url, secret)
+        page.wait_for_function("() => window.zetaTest.wf().painted > 5")
+        # 174-176 MHz: above scanner's 50-150 MHz, below retune's 200-300 MHz, far from tone.
+        page.fill('#band input[name="center"]', "175")
+        page.fill('#band input[name="width"]', "2000")
+        page.click("#band button")
+        wait_ticks(page, "176.000", "174.000", "the view far above the capture")
+        line = page.locator("#transcript .line", has_text="no free source can scan")
+        expect(line).to_have_count(1)
+        expect(line).to_contain_text("174.000-176.000 MHz")
+        page.wait_for_timeout(1_500)
+        expect(line).to_have_count(1)
+        jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+        scans = [j for j in jobs if j["kind"] == "scan" and j["state"]["status"] == "running"]
+        assert scans == [], f"scans started: {scans}"
+        assert page.evaluate(AUTO_SCAN_JS) is None
+        assert ensure_lines(page) == 0, "a source_ensure was issued for the coarse view"
+    finally:
+        stop_scans(url, secret)
 
 
 # ---- graph view and audio (Task 10) --------------------------------------------------------

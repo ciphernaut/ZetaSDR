@@ -23,6 +23,10 @@
 // MHz`) with one button per holder, `stop <kind> <short id> and retry`, which applies the
 // same op again with `replace: [<id>]` (conflictActions).
 //
+// The coarse layer (coarse.js) is mounted on the waterfall at login: a view past the fine
+// capture starts the page's own scan on a free scanner source (view policies zoom_out,
+// auto_scan_stop, scanner); its notes become transcript lines.
+//
 // The waterfall (waterfall.js) is mounted in #waterfall at login and follows the selected
 // source (selecting the source it already shows does nothing); it is destroyed when the node
 // rejects the secret. Each jobs poll is handed to it too (wf.syncJobs: a scan starting or
@@ -49,9 +53,9 @@
 // line and submitted as if typed (so free text goes to /ask); #mic-status beside it shows
 // failures such as a node without a speech daemon.
 //
-// Exports `state` ({api, transcript, jobs, wf, ov, menu, audio, mic, sources, selected,
-// view, lastJobs}), `onSourceChange(fn)` for the later views (waterfall, audio, voice), and
-// `conflictActions(err, retry)`.
+// Exports `state` ({api, transcript, jobs, wf, coarse, ov, menu, audio, mic, sources,
+// selected, view, lastJobs}), `onSourceChange(fn)` for the later views (waterfall, audio,
+// voice), and `conflictActions(err, retry)`.
 
 import { connect, Unauthorized } from "./api.js";
 import { QUIET_OPS, Transcript, startJobs, startOpsFeed } from "./agent.js";
@@ -62,6 +66,7 @@ import { playJob } from "./audio.js";
 import { closeGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
 import { mountView, runViewCommand } from "./view.js";
+import { mountCoarse } from "./coarse.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -80,6 +85,7 @@ export const state = {
   sources: [],
   selected: null,
   view: null, // view.js policies
+  coarse: null, // coarse.js: the automatic scans of a view past the capture
   lastJobs: [], // the last job_list result
 };
 const sourceListeners = [];
@@ -415,6 +421,11 @@ function start(api) {
   });
   state.wf = mountWaterfall($("#waterfall"), api);
   state.wf.onNotice = (text) => state.transcript?.note(text, true);
+  state.coarse = mountCoarse(state.wf, api, state.view, {
+    transcript: state.transcript,
+    sources: () => state.sources,
+    jobs: () => state.lastJobs,
+  });
   state.ov = mountOverlays($("#waterfall"), state.wf, api, { jobsEl: $("#jobs") });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
@@ -508,10 +519,12 @@ function logout(api) {
   if (state.jobs) state.jobs.close();
   if (state.menu) state.menu.destroy();
   if (state.ov) state.ov.destroy();
+  if (state.coarse) state.coarse.destroy();
   if (state.wf) state.wf.destroy();
   state.ops = null;
   state.jobs = null;
   state.ov = null;
+  state.coarse = null;
   state.menu = null;
   state.wf = null;
   state.mic = null;
@@ -559,7 +572,8 @@ function answerRibbon(text) {
 }
 
 // Hooks for the e2e scenarios: simulate a changed secret, force a jobs poll, and read what
-// the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall), the
+// the waterfall follows ({sourceId, jobId, painted, badge}, or null without a waterfall),
+// what the coarse layer follows (`coarse()`: {scanJobId, followed, source, rows}), the
 // format of the last painted spectrum row (`lastRowFormat`: "q" or "db", null before one), its
 // mode (`waterfallMode`: "spectrum" or "scan", null without a waterfall),
 // draw the narrow-footprint answer ribbon for `text` without an LLM (ruling R3), and draw a
@@ -591,6 +605,12 @@ window.zetaTest = {
   // Run one node check now; resolves true when it started a reload.
   nodeCheck() {
     return state.nodeCheck ? state.nodeCheck.check() : Promise.resolve(false);
+  },
+  // The coarse layer: {scanJobId, followed, source, rows}, or null without one.
+  coarse() {
+    const c = state.coarse;
+    if (!c) return null;
+    return { scanJobId: c.scanJobId, followed: c.followed, source: c.source, rows: c.rows };
   },
   wf() {
     const wf = state.wf;

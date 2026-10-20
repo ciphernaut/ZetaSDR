@@ -35,13 +35,19 @@
 //         object is kept in window.zetaLastSelection.
 //     wf.onColumn(cb)   cb(shiftCssPx) after each painted column: everything painted moved
 //         left by that many CSS px (overlays.js scrolls its ribbons with it).
-//     wf.onView(cb)     cb() after the band or the view changed (a zoom, a pan, a retune, a
-//         scan band widening): yForHz maps differently (overlays.js lays its items out again).
+//     wf.onView(cb)     cb({lo, hi, outside}) after the band or the view changed (a zoom, a
+//         pan, a retune, a scan band widening): yForHz maps differently (overlays.js lays its
+//         items out again). lo..hi is the band shown (null before it is known); `outside` is
+//         true when the view reaches past the capture (the coarse layer's part, coarse.js).
+//     wf.coarseActive   null, or fn() -> bool set by coarse.js: true while the coarse layer
+//         scans views past the capture (zoom_out "scan"); see Band control.
 //     wf.clearSelection()   erases the drawn selection rectangle (the menu closed)
 //     wf.centerHz() -> the centre of the band shown (null before the band is known)
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
 //     wf.band       the capture {lo, hi} in Hz (a scan: its whole span); null before known
-//     wf.view       the sub-range {lo, hi} shown, or null for the whole capture
+//     wf.view       the range {lo, hi} shown, or null for the whole capture; past the capture
+//         (and wider than it) only while wf.coarseActive() holds
+//     wf.isOutside() -> whether the view reaches past the capture
 //     wf.requestView(lo, hi)  shows lo..hi Hz (see Band control)
 //     wf.destroy()
 //
@@ -73,14 +79,19 @@
 // it x2 about the pointer. A view inside the capture is rendering only: every stored row is
 // drawn again through the sub-range of its bins (the strongest bin per pixel row, or the
 // nearest bin when a bin spans several rows) and the axis is rescaled; no operation is issued.
-// A wheel step out that still fits the capture is shifted inside it. A view leaving the
-// capture: `source_list` first; while a rigid job holds the source the page never retunes
-// (spec 4.1): the view is clamped into the capture and the transcript shows `conflict: source
-// <id> held by <jobs>; the view stays inside its capture` (until the coarse layer, Task 6).
-// With no rigid holder `source_ensure` asks for the view's band; the node relaunches the
-// page's elastic job on the new capture, which the waterfall follows (refused, e.g.
-// `out_of_range` on a file source, the view reverts with `view reverted: <error>` in the
-// transcript). In scan mode the view stays inside the scan's span and never retunes.
+// A wheel step out that still fits the capture is shifted inside it (unless the view is
+// already past the capture). A view leaving the capture: `source_list` first. With no rigid
+// holder, and the view no wider than the source's max_bandwidth_hz and inside its tune range,
+// `source_ensure` asks for the view's band; the node relaunches the page's elastic job on the
+// new capture, which the waterfall follows (refused, e.g. `out_of_range` on a file source,
+// the view reverts with `view reverted: <error>` in the transcript). Otherwise (a rigid
+// holder, a view too wide, or past the tune range) the page never retunes (spec 4.1): while
+// wf.coarseActive() holds the view is left past the capture (outside: true) for the coarse
+// layer to scan, the fine rows painted over their own band only; without it (zoom_out
+// "none") a held source clamps the view into the capture with `conflict: source <id> held by
+// <jobs>; the view stays inside its capture` in the transcript, and an unheld one is asked
+// with `source_ensure` as above. In scan mode the view stays inside the scan's span and never
+// retunes.
 //
 // Scan mode: the axis spans the scan job's `tuning`, widened to the union of the rows (a step
 // can reach past it at the span's ends); each row covers only its step's band (`center_hz` ±
@@ -267,6 +278,7 @@ class Waterfall {
     this.view = null; // the sub-range shown {lo, hi}, null for the whole band
     this.pendingView = null; // the view to apply when the band is next set (a retune)
     this.retuning = false;
+    this.coarseActive = null;
     this.onNotice = null;
     this.lastPaint = -Infinity;
     this.columns = 0; // columns painted since the last clear
@@ -438,11 +450,17 @@ class Waterfall {
     }
   }
 
+  // The `source_list` record of `src` (null when it is not listed). Throws when
+  // `source_list` fails.
+  async sourceInfo(src) {
+    const sources = (await this.api.op({ op: "source_list" })).value || [];
+    return sources.find((s) => s.id === src.id) || null;
+  }
+
   // The rigid holders of `src` from `source_list` (the page's elastic job is never one).
   // Throws when `source_list` fails.
   async holders(src) {
-    const sources = (await this.api.op({ op: "source_list" })).value || [];
-    const info = sources.find((s) => s.id === src.id);
+    const info = await this.sourceInfo(src);
     return info && Array.isArray(info.holders) ? info.holders : [];
   }
 
@@ -574,7 +592,17 @@ class Waterfall {
   }
 
   fireView() {
-    for (const cb of this.viewCbs) cb();
+    const s = this.shown();
+    const v = { lo: s ? s.lo : null, hi: s ? s.hi : null, outside: this.isOutside() };
+    for (const cb of this.viewCbs) cb(v);
+  }
+
+  isOutside() {
+    const b = this.band;
+    const v = this.view;
+    if (!b || !v) return false;
+    const tol = this.slackHz();
+    return v.lo < b.lo - tol || v.hi > b.hi + tol;
   }
 
   // The band shown: the view, else the whole capture.
@@ -783,7 +811,8 @@ class Waterfall {
     let lo = f - (f - s.lo) * k;
     let hi = f + (s.hi - f) * k;
     if (hi - lo < MIN_VIEW_HZ) return;
-    if (hi - lo <= (this.band.hi - this.band.lo) * (1 + 1e-9)) [lo, hi] = this.clampToBand(lo, hi);
+    const fits = hi - lo <= (this.band.hi - this.band.lo) * (1 + 1e-9);
+    if (fits && !this.isOutside()) [lo, hi] = this.clampToBand(lo, hi);
     this.requestView(lo, hi);
   }
 
@@ -815,10 +844,12 @@ class Waterfall {
     else this.viewChanged();
   }
 
-  // A view outside the capture (ruling R2, spec 4.1): rigid holders first, and while one
-  // holds the source the view is clamped into the capture instead; else `source_ensure` asks
-  // for the view's band, the node relaunches the page's elastic job on what the source now
-  // captures and the waterfall follows it again. Refused: the view reverts.
+  // A view outside the capture (ruling R2, spec 4.1, ruling R6): `source_list` first. No
+  // rigid holder and a view the source can capture: `source_ensure` asks for it, the node
+  // relaunches the page's elastic job on what the source now captures and the waterfall
+  // follows it again (refused: the view reverts). Otherwise the view stays past the capture
+  // for the coarse layer while it is active; without it a held source clamps the view into
+  // the capture, and an unheld one is asked anyway (the refusal reverts the view).
   async retune(lo, hi) {
     const src = this.src;
     if (!src) return;
@@ -830,15 +861,21 @@ class Waterfall {
       this.view = prev;
       this.viewChanged();
     };
+    let coarse = false;
     try {
-      let holders = null;
+      let info;
       try {
-        holders = await this.holders(src);
+        info = await this.sourceInfo(src);
       } catch (e) {
         this.notice(`view reverted: source_list: ${e.message}`);
-      }
-      if (holders === null) {
         if (this.src === src) revert();
+        return;
+      }
+      const holders = info && Array.isArray(info.holders) ? info.holders : [];
+      const coarseOn = !!this.coarseActive && this.coarseActive();
+      if (coarseOn && (holders.length || !this.capturable(info, lo, hi))) {
+        // The coarse layer's view (spec 4.3 zoom_out scan): left past the capture.
+        coarse = this.src === src;
         return;
       }
       if (holders.length) {
@@ -870,7 +907,24 @@ class Waterfall {
       this.setSource(current ? { ...src, current } : src);
     } finally {
       this.retuning = false;
+      // The view settled past the capture: tell the listeners (the coarse layer waits for it).
+      if (coarse) this.fireView();
     }
+  }
+
+  // Whether the source of `info` (a `source_list` record) can capture lo..hi in one tune: no
+  // wider than its max_bandwidth_hz and inside its tune range (a capability not known counts
+  // as allowing it, as before; the node then decides).
+  capturable(info, lo, hi) {
+    const c = (info && info.capabilities) || {};
+    const bw = capHz(c.max_bandwidth_hz);
+    const min = capHz(c.tune_min_hz);
+    const max = capHz(c.tune_max_hz);
+    const tol = this.slackHz();
+    if (bw !== null && hi - lo > bw + tol) return false;
+    if (min !== null && lo < min - tol) return false;
+    if (max !== null && hi > max + tol) return false;
+    return true;
   }
 
   // ---- painting ------------------------------------------------------------------------

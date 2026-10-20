@@ -3,9 +3,12 @@
 //! fixtures (`wfm`: a 1 kHz tone, wideband FM with pilot, 240 kHz, 2 s looping, at 104.9 MHz;
 //! `pocsag`: one 1200-baud alphanumeric page `HELLO ZETA` to address 1234567, function 3, at
 //! 48 kHz, looping, at 148.6375 MHz) and `speech` fixtures (`speech`: a 2 s pause then 3 s of
-//! speech-like bursts, wideband FM with pilot, 240 kHz, looping, at 104.7 MHz) and `retune`
-//! (the `tone` recording tunable over 50-150 MHz: a tune moves its capture's centre); the
-//! node's state directory is passed to ui.py in `ZETA_UI_STATE_DIR`. That node has a fake
+//! speech-like bursts, wideband FM with pilot, 240 kHz, looping, at 104.7 MHz), `retune`
+//! (the `tone` recording relabelled at 250 MHz and tunable over 200-300 MHz: a tune moves its
+//! capture's centre) and `scanner` (the `tone` recording tunable over 50-150 MHz, the source
+//! the page's automatic scans pick for a view around `tone`: `retune` sorts first in
+//! `source_list` but its range does not contain 100 MHz); the node's state directory is passed
+//! to ui.py in `ZETA_UI_STATE_DIR`. That node has a fake
 //! `voiced` (`--stt-socket`, zeta-speech's `FakeDaemon`) answering `ok:what sources are there`
 //! to every valid staged WAV; a second node without a speech daemon, with only the `speech`
 //! fixture, is passed in `ZETA_UI_URL_NOSTT`.
@@ -139,6 +142,24 @@ fn skip_reason() -> Option<String> {
     None
 }
 
+/// The `tone` recording (zeta-source-file's fixture) as `<stem>.sigmf-{meta,data}` in `dir`,
+/// labelled at `center_hz`; the meta path.
+fn tone_at(dir: &Path, stem: &str, center_hz: u64) -> PathBuf {
+    let tone = zeta_source_file::fixtures::write_tone(dir);
+    let meta = std::fs::read_to_string(&tone).expect("read tone meta");
+    let field = "\"core:frequency\":100000000";
+    assert!(meta.contains(field), "tone meta without {field}: {meta}");
+    let meta = meta.replace(field, &format!("\"core:frequency\":{center_hz}"));
+    std::fs::copy(
+        tone.with_extension("sigmf-data"),
+        dir.join(format!("{stem}.sigmf-data")),
+    )
+    .expect("copy tone data");
+    let path = dir.join(format!("{stem}.sigmf-meta"));
+    std::fs::write(&path, meta).expect("write meta");
+    path
+}
+
 /// Wall-clock limit on the whole ui.py run.
 const DEADLINE: Duration = Duration::from_secs(300);
 
@@ -218,9 +239,15 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "pocsag", &iq, 48_000, 148_637_500);
     let pocsag = format!("pocsag={}", meta.display());
     let speech = format!("speech={}", speech_fixture(dir.path()).display());
-    // The tone recording played as a radio tunable over 50-150 MHz.
+    // The tone recording played as a radio tunable over 200-300 MHz (well away from `tone`, so
+    // the page's automatic scans around `tone` never pick it), and as one tunable over
+    // 50-150 MHz (the scanner).
     let retune = format!(
-        "retune={},tune_min_hz=50000000,tune_max_hz=150000000",
+        "retune={},tune_min_hz=200000000,tune_max_hz=300000000",
+        tone_at(dir.path(), "retune", 250_000_000).display()
+    );
+    let scanner = format!(
+        "scanner={},tune_min_hz=50000000,tune_max_hz=150000000",
         zeta_source_file::fixtures::write_tone(dir.path()).display()
     );
     let sock_dir = socket_dir();
@@ -241,6 +268,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
             &speech,
             "--source-file",
             &retune,
+            "--source-file",
+            &scanner,
         ],
         &["--stt-socket", sock],
         &[],
