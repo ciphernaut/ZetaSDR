@@ -1,7 +1,7 @@
 //! SigMF recording playback as a [`Port`].
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +25,12 @@ pub struct FileOpts {
     pub realtime: bool,
     pub block_samples: usize,
     pub repeat: bool,
+    /// `Some((min, max))`: the source tunes like a radio over `min..=max` Hz. A tune
+    /// whose band lies inside the range is accepted and its centre becomes the capture's
+    /// (`current`, and every block's `center_hz` from then on); the samples are the
+    /// recording's, unchanged, and the capture stays the recording's rate wide. The
+    /// capabilities' tune range is this range. `None`: the recording's own band only.
+    pub tune_range: Option<(Hz, Hz)>,
 }
 
 fn io(msg: impl Into<String>) -> PortError {
@@ -166,6 +172,8 @@ pub struct FileSource {
     caps: Capabilities,
     opts: FileOpts,
     samples: Arc<[Complex<f32>]>,
+    /// The capture's centre: the recording's, or the last tune's under `tune_range`.
+    center_hz: Arc<AtomicU64>,
     /// Taken (dropped) when a non-repeating playback ends, so subscribers see `Closed`.
     tx: Arc<Mutex<Option<broadcast::Sender<IqBlock>>>>,
     stopped: Arc<AtomicBool>,
@@ -202,17 +210,18 @@ impl FileSource {
             )));
         }
         let samples: Arc<[Complex<f32>]> = convert(fmt, &raw).into();
+        if let Some((min, max)) = opts.tune_range
+            && min.0 >= max.0
+        {
+            return Err(io("tune_range: min must be below max"));
+        }
+        let (tune_min, tune_max) = match opts.tune_range {
+            Some((min, max)) => (min.0, max.0),
+            None => recording_band(meta.center_hz.0, meta.sample_rate_hz.0),
+        };
         let caps = Capabilities {
-            tune_min_hz: Claim::Asserted(Hz(recording_band(
-                meta.center_hz.0,
-                meta.sample_rate_hz.0,
-            )
-            .0)),
-            tune_max_hz: Claim::Asserted(Hz(recording_band(
-                meta.center_hz.0,
-                meta.sample_rate_hz.0,
-            )
-            .1)),
+            tune_min_hz: Claim::Asserted(Hz(tune_min)),
+            tune_max_hz: Claim::Asserted(Hz(tune_max)),
             max_bandwidth_hz: Claim::Asserted(meta.sample_rate_hz),
             formats: vec![fmt],
             channels: 1,
@@ -225,6 +234,7 @@ impl FileSource {
         let tx = Arc::new(Mutex::new(Some(tx)));
         Ok(Self {
             id,
+            center_hz: Arc::new(AtomicU64::new(meta.center_hz.0)),
             meta,
             caps,
             opts,
@@ -243,6 +253,7 @@ impl FileSource {
         let samples = self.samples.clone();
         let (meta, opts) = (self.meta.clone(), self.opts);
         let stopped = self.stopped.clone();
+        let center = self.center_hz.clone();
         tokio::spawn(async move {
             let Some(tx) = tx else { return };
             let rate = meta.sample_rate_hz.0;
@@ -265,7 +276,7 @@ impl FileSource {
                     let _ = tx.send(IqBlock {
                         t0,
                         sample_rate_hz: meta.sample_rate_hz,
-                        center_hz: meta.center_hz,
+                        center_hz: Hz(center.load(Ordering::Relaxed)),
                         samples: chunk.into(),
                     });
                     if opts.realtime {
@@ -304,12 +315,18 @@ impl Port for FileSource {
         &self.caps
     }
 
-    /// Any band `t.center_hz ± t.bandwidth_hz / 2` (bandwidth >= 1) inside the
-    /// recording's band `file_center ± rate / 2` is accepted; the answer is the
-    /// recording's fixed band, never the request.
+    /// Any band `t.center_hz ± t.bandwidth_hz / 2` (bandwidth >= 1, at most the
+    /// rate) inside the recording's band `file_center ± rate / 2` is accepted; the
+    /// answer is the recording's fixed band, never the request. Under `tune_range`
+    /// the band must lie inside that range instead, and the answer is the request's
+    /// centre with the recording's rate (recorded as `current`).
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let (c, rate) = (self.meta.center_hz.0, self.meta.sample_rate_hz.0);
-        let (min, max) = recording_band(c, rate);
+        let ranged = self.opts.tune_range;
+        let (min, max) = match ranged {
+            Some((lo, hi)) => (lo.0, hi.0),
+            None => recording_band(c, rate),
+        };
         if t.bandwidth_hz.0 == 0 || t.bandwidth_hz.0 > rate {
             return Err(PortError::OutOfRange {
                 field: "bandwidth_hz",
@@ -326,7 +343,11 @@ impl Port for FileSource {
             c as i128,
             rate as i128,
         );
-        if 2 * tc - tb < 2 * fc - r || 2 * tc + tb > 2 * fc + r {
+        let (lo2, hi2) = match ranged {
+            Some(_) => (2 * min as i128, 2 * max as i128),
+            None => (2 * fc - r, 2 * fc + r),
+        };
+        if 2 * tc - tb < lo2 || 2 * tc + tb > hi2 {
             return Err(PortError::OutOfRange {
                 field: "center_hz",
                 value: t.center_hz.0,
@@ -335,16 +356,19 @@ impl Port for FileSource {
                 suggested: None,
             });
         }
-        // The recording's band is fixed: report it, not the request.
+        if ranged.is_some() {
+            self.center_hz.store(t.center_hz.0, Ordering::Relaxed);
+        }
+        // The width is the recording's rate: report it, not the request.
         Ok(Tuning {
-            center_hz: self.meta.center_hz,
+            center_hz: Hz(self.center_hz.load(Ordering::Relaxed)),
             bandwidth_hz: self.meta.sample_rate_hz,
         })
     }
 
     fn current(&self) -> Option<Tuning> {
         Some(Tuning {
-            center_hz: self.meta.center_hz,
+            center_hz: Hz(self.center_hz.load(Ordering::Relaxed)),
             bandwidth_hz: self.meta.sample_rate_hz,
         })
     }

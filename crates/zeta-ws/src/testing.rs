@@ -76,6 +76,7 @@ pub async fn spawn_with(dir: &Path, opts: TestOpts) -> TestServer {
         realtime: true,
         block_samples: 4800,
         repeat: true,
+        tune_range: None,
     };
     let source = Arc::new(
         FileSource::open(SourceId("tone".to_string()), &meta, file_opts).expect("open tone"),

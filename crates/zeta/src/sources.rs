@@ -19,8 +19,13 @@ use zeta_source_node::NODE_DEFAULT_MAX_BANDWIDTH_HZ;
 /// One source to attach to the node.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SourceSpec {
-    /// `--source-file ID=PATH.sigmf-meta`
-    File { id: String, path: PathBuf },
+    /// `--source-file ID=PATH.sigmf-meta[,tune_min_hz=N,tune_max_hz=M]`; with the range
+    /// the recording is played as a radio tunable over `N..=M` Hz.
+    File {
+        id: String,
+        path: PathBuf,
+        tune_range: Option<(u64, u64)>,
+    },
     /// `--source-soapy ID=ARGS`, `ARGS` a SoapySDR kwargs string (`driver=hackrf,serial=…`).
     Soapy { id: String, args: String },
     /// `--source-kiwi ID=HOST:PORT[/PASSWORD]`
@@ -60,7 +65,17 @@ impl SourceSpec {
 impl fmt::Display for SourceSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::File { id, path } => write!(f, "--source-file {id}={}", path.display()),
+            Self::File {
+                id,
+                path,
+                tune_range,
+            } => {
+                write!(f, "--source-file {id}={}", path.display())?;
+                if let Some((min, max)) = tune_range {
+                    write!(f, ",tune_min_hz={min},tune_max_hz={max}")?;
+                }
+                Ok(())
+            }
             Self::Soapy { id, args } => write!(f, "--source-soapy {id}={args}"),
             Self::Kiwi { id, host, port, .. } => write!(f, "--source-kiwi {id}={host}:{port}"),
             Self::Node {
@@ -103,13 +118,48 @@ fn split_id(s: &str) -> Option<(&str, &str)> {
         .filter(|(id, rest)| !id.is_empty() && !rest.is_empty())
 }
 
-/// `ID=PATH.sigmf-meta`.
+/// `ID=PATH.sigmf-meta[,tune_min_hz=N,tune_max_hz=M]`: the options start at the first
+/// `,tune_` (a path may hold commas otherwise); both bounds are required, integers in Hz,
+/// `N < M`. Errors name the bad part and show the expected form.
 pub fn parse_file(s: &str) -> Result<SourceSpec, String> {
-    let (id, path) =
-        split_id(s).ok_or_else(|| format!("expected ID=PATH.sigmf-meta, got {s:?}"))?;
+    let bad = |part: String| {
+        format!("{part}; expected ID=PATH.sigmf-meta[,tune_min_hz=N,tune_max_hz=M], got {s:?}")
+    };
+    let (id, rest) = split_id(s).ok_or_else(|| bad("missing ID=".into()))?;
+    let (path, opts) = match rest.find(",tune_") {
+        Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+        None => (rest, None),
+    };
+    if path.is_empty() {
+        return Err(bad("PATH is empty".into()));
+    }
+    let mut tune_range = None;
+    if let Some(opts) = opts {
+        let (mut min, mut max) = (None, None);
+        for opt in opts.split(',') {
+            let (key, n) = opt
+                .split_once('=')
+                .ok_or_else(|| bad(format!("unknown option {opt:?}")))?;
+            let slot = match key {
+                "tune_min_hz" => &mut min,
+                "tune_max_hz" => &mut max,
+                _ => return Err(bad(format!("unknown option {opt:?}"))),
+            };
+            *slot = Some(
+                n.parse::<u64>()
+                    .map_err(|_| bad(format!("{key} {n:?} is not an integer")))?,
+            );
+        }
+        match (min, max) {
+            (Some(min), Some(max)) if min < max => tune_range = Some((min, max)),
+            (Some(_), Some(_)) => return Err(bad("tune_min_hz must be below tune_max_hz".into())),
+            _ => return Err(bad("tune_min_hz and tune_max_hz go together".into())),
+        }
+    }
     Ok(SourceSpec::File {
         id: id.into(),
         path: path.into(),
+        tune_range,
     })
 }
 
@@ -359,7 +409,16 @@ mod tests {
             parse_file("tone=a=b.sigmf-meta"),
             Ok(SourceSpec::File {
                 id: "tone".into(),
-                path: "a=b.sigmf-meta".into()
+                path: "a=b.sigmf-meta".into(),
+                tune_range: None,
+            })
+        );
+        assert_eq!(
+            parse_file("r=a,b.sigmf-meta,tune_min_hz=5,tune_max_hz=9"),
+            Ok(SourceSpec::File {
+                id: "r".into(),
+                path: "a,b.sigmf-meta".into(),
+                tune_range: Some((5, 9)),
             })
         );
         assert_eq!(

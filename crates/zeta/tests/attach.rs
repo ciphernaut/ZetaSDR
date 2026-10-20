@@ -42,6 +42,7 @@ fn speech_port(dir: &Path) -> (Arc<FileSource>, Arc<dyn Port>) {
         realtime: true,
         block_samples: 4800,
         repeat: true,
+        tune_range: None,
     };
     let src = Arc::new(FileSource::open(SourceId("speech".into()), &meta, opts).unwrap());
     let port: Arc<dyn Port> = src.clone();

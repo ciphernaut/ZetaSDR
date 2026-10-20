@@ -3,7 +3,8 @@
 //! fixtures (`wfm`: a 1 kHz tone, wideband FM with pilot, 240 kHz, 2 s looping, at 104.9 MHz;
 //! `pocsag`: one 1200-baud alphanumeric page `HELLO ZETA` to address 1234567, function 3, at
 //! 48 kHz, looping, at 148.6375 MHz) and `speech` fixtures (`speech`: a 2 s pause then 3 s of
-//! speech-like bursts, wideband FM with pilot, 240 kHz, looping, at 104.7 MHz); the
+//! speech-like bursts, wideband FM with pilot, 240 kHz, looping, at 104.7 MHz) and `retune`
+//! (the `tone` recording tunable over 50-150 MHz: a tune moves its capture's centre); the
 //! node's state directory is passed to ui.py in `ZETA_UI_STATE_DIR`. That node has a fake
 //! `voiced` (`--stt-socket`, zeta-speech's `FakeDaemon`) answering `ok:what sources are there`
 //! to every valid staged WAV; a second node without a speech daemon, with only the `speech`
@@ -217,6 +218,11 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "pocsag", &iq, 48_000, 148_637_500);
     let pocsag = format!("pocsag={}", meta.display());
     let speech = format!("speech={}", speech_fixture(dir.path()).display());
+    // The tone recording played as a radio tunable over 50-150 MHz.
+    let retune = format!(
+        "retune={},tune_min_hz=50000000,tune_max_hz=150000000",
+        zeta_source_file::fixtures::write_tone(dir.path()).display()
+    );
     let sock_dir = socket_dir();
     let sock = sock_dir.path().join("voiced.sock");
     let _voiced = fake_voiced(&sock);
@@ -233,6 +239,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
             &pocsag,
             "--source-file",
             &speech,
+            "--source-file",
+            &retune,
         ],
         &["--stt-socket", sock],
         &[],

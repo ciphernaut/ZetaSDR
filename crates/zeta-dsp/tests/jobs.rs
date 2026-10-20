@@ -47,6 +47,7 @@ async fn fm_demod_job_produces_audio_with_tone() {
         realtime: false,
         block_samples: 4800,
         repeat: true,
+        tune_range: None,
     };
     let src = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
     let port: Arc<dyn Port> = src.clone();
@@ -141,6 +142,7 @@ async fn aprs_decode_job_decodes_fixture_packet() {
         realtime: true,
         block_samples: 4800,
         repeat: true,
+        tune_range: None,
     };
     let src = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
     let port: Arc<dyn Port> = src.clone();
@@ -327,6 +329,7 @@ async fn fm_demod_job_on_12_khz_source() {
         realtime: false,
         block_samples: 1_200,
         repeat: true,
+        tune_range: None,
     };
     let node = node_over(dir.path(), &iq, RATE, CENTER, opts).await;
     let id = start(&node, JobKind::FmDemod, CENTER, 10_000).await;
@@ -354,6 +357,7 @@ async fn fm_demod_job_at_2_048_msps() {
         realtime: false,
         block_samples: 20_480,
         repeat: true,
+        tune_range: None,
     };
     let node = node_over(dir.path(), &iq, RATE, CENTER, opts).await;
     let id = start(&node, JobKind::FmDemod, CENTER + 100_000, 12_500).await;
@@ -376,6 +380,7 @@ async fn aprs_decode_job_decodes_at_12_khz() {
         realtime: true,
         block_samples: 1_200,
         repeat: true,
+        tune_range: None,
     };
     let node = node_over(dir.path(), &iq, RATE, CENTER, opts).await;
     let started = tokio::time::Instant::now();
@@ -420,6 +425,7 @@ async fn measure_job_measures_only_its_band() {
         realtime: true,
         block_samples: 4_800,
         repeat: true,
+        tune_range: None,
     };
     let node = node_over(dir.path(), &iq, 48_000, CENTER, opts).await;
     let id = start(&node, JobKind::Measure, CENTER + 12_000, 12_500).await;
@@ -462,6 +468,7 @@ async fn v1_spectrum_graph_without_rows_per_s_still_launches() {
         realtime: true,
         block_samples: 4_800,
         repeat: true,
+        tune_range: None,
     };
     let node = node_over(dir.path(), &iq, 48_000, CENTER, opts()).await;
     let id = start(&node, JobKind::Spectrum, CENTER, 48_000).await;

@@ -44,6 +44,7 @@ async fn tone_node(dir: &std::path::Path) -> Arc<Node> {
         realtime: true,
         block_samples: 4800,
         repeat: true,
+        tune_range: None,
     };
     let source =
         Arc::new(FileSource::open(SourceId("tone".to_string()), &meta, opts).expect("open tone"));

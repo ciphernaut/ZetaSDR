@@ -37,6 +37,7 @@ async fn write_cf32_roundtrips_through_read_meta_and_file_source() {
             realtime: false,
             block_samples: 100,
             repeat: false,
+            tune_range: None,
         },
     )
     .unwrap();

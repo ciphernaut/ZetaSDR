@@ -14,7 +14,7 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::stream_in::StreamInStage;
-use zeta_core::types::SourceId;
+use zeta_core::types::{Hz, SourceId};
 use zeta_plugin::host::PluginCommand;
 use zeta_source_file::{FileOpts, FileSource};
 use zeta_source_kiwi::{KiwiConfig, KiwiSource};
@@ -189,6 +189,7 @@ pub async fn open(
         realtime: true,
         block_samples: 4800,
         repeat: true,
+        tune_range: None,
     };
     let registry = with_plugins(plugins, speech).await?;
     let mut files = Vec::new();
@@ -198,7 +199,13 @@ pub async fn open(
         let flag = |e: &dyn std::fmt::Display| format!("{spec}: {e}");
         let id = SourceId(spec.id().to_owned());
         match spec {
-            SourceSpec::File { path, .. } => {
+            SourceSpec::File {
+                path, tune_range, ..
+            } => {
+                let opts = FileOpts {
+                    tune_range: tune_range.map(|(min, max)| (Hz(min), Hz(max))),
+                    ..opts
+                };
                 let f = FileSource::open(id, Path::new(path), opts)
                     .map(Arc::new)
                     .map_err(|e| flag(&e))?;

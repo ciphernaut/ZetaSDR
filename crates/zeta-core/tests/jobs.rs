@@ -25,6 +25,7 @@ fn source_with(dir: &Path, repeat: bool) -> (Arc<FileSource>, Arc<dyn Port>) {
         realtime: false,
         block_samples: 4800,
         repeat,
+        tune_range: None,
     };
     let src = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
     let port: Arc<dyn Port> = src.clone();

@@ -5,9 +5,11 @@
 //       Builds the axis, the canvas, the selection overlay and the #wf-badge inside `el`.
 //   Waterfall:
 //     wf.setSource(sourceInfo)  a `source_list` record (or null). Reuses a running `spectrum`
-//         job on that source from `job_list`, else starts one on the source's `current` band
-//         (its whole capture) or, when `current` is null, on the centre of its tune range with
-//         its max_bandwidth_hz. While a `scan` job runs on the source, the waterfall follows
+//         job on that source from `job_list`, else starts one, `elastic: true` (spec 4.1: it
+//         follows the capture, holds no lease, never conflicts and is relaunched by the node
+//         under the same id, with new streams, on every retune), on the source's `current`
+//         band (its whole capture) or, when `current` is null, on the centre of its tune range
+//         with its max_bandwidth_hz. While a `scan` job runs on the source, the waterfall follows
 //         that job instead and starts none (scan mode, below). UI-started job ids go in
 //         sessionStorage[UI_JOBS_KEY]; they are stopped on `pagehide` (fetch keepalive, with
 //         the bearer), and when the waterfall moves to another source (a job it started for
@@ -19,10 +21,11 @@
 //     wf.syncJobs(jobs)  a `job_list` result (app.js hands it every poll): follows a scan job
 //         that started on the shown source, or goes back to a spectrum job when it ended
 //     wf.onNotice   fn(text) for transcript lines (a refused retune); set by app.js
-//     wf.release(src) -> Promise<bool>  checks `source_list` holders of `src` and, when
-//         nothing but this page's own spectrum job holds it, stops following and stops
-//         that job (false, with a `conflict: …` notice, when another job holds it). The
-//         caller then runs setSource(src) again (menu.js before a scan; retune below).
+//     wf.release(src) -> Promise<bool>  checks `source_list` holders of `src` (rigid jobs; the
+//         page's own elastic job is never one) and, when there are none, stops following
+//         (false, with a `conflict: …` notice, when a job holds it). The page's own job is
+//         left to the node: a scan on the source stops it. The caller then runs
+//         setSource(src) again (menu.js after starting a scan).
 //     wf.painted    columns painted since mount (never reset; for tests)
 //     wf.lastRowFormat  "q" (spectrum event v2) or "db" (older nodes) for the last painted
 //         row; null before the first
@@ -45,9 +48,12 @@
 // Reconnect: when the stream's socket closes (a `closed` message, an error) the #wf-badge
 // "reconnecting…" shows and api.streamText reopens with backoff, re-resolving the stream id
 // by provenance (event stream of the job) because it changes when the job restarts under
-// `graph_put`. If the job is no longer running (stopped by another tab, the CLI, a Stop
-// button), setSource runs again for the same source: it reuses another running spectrum job
-// or starts its own. The badge hides at the first frame after that.
+// `graph_put` or the node relaunches the elastic job on a new capture (same job id, new
+// streams). If the job is no longer running (stopped by another tab, the CLI, its own row's
+// Stop button), setSource runs again for the same source: it reuses another running spectrum
+// job or starts a fresh elastic one of its own (a scan running there is followed instead, and
+// the own job is started again only once it ended). The badge hides at the first frame after
+// that.
 //
 // Layout: frequency is vertical (highest at the top), time runs right to left: each event
 // becomes one CSS-pixel column (Math.round(devicePixelRatio) backing pixels, at least 1) at
@@ -68,12 +74,13 @@
 // drawn again through the sub-range of its bins (the strongest bin per pixel row, or the
 // nearest bin when a bin spans several rows) and the axis is rescaled; no operation is issued.
 // A wheel step out that still fits the capture is shifted inside it. A view leaving the
-// capture retunes: `source_list` first; when another job holds the source the transcript
-// shows `conflict: source <id> held by <jobs>` and the view reverts; else the page's own
-// spectrum job is stopped, `source_ensure` asks for the view's band, and the spectrum job is
-// started again on the capture it returns (or, refused, e.g. `out_of_range` on a file source,
-// on the old one, with `view reverted: <error>` in the transcript). In scan mode the view
-// stays inside the scan's span and never retunes.
+// capture: `source_list` first; while a rigid job holds the source the page never retunes
+// (spec 4.1): the view is clamped into the capture and the transcript shows `conflict: source
+// <id> held by <jobs>; the view stays inside its capture` (until the coarse layer, Task 6).
+// With no rigid holder `source_ensure` asks for the view's band; the node relaunches the
+// page's elastic job on the new capture, which the waterfall follows (refused, e.g.
+// `out_of_range` on a file source, the view reverts with `view reverted: <error>` in the
+// transcript). In scan mode the view stays inside the scan's span and never retunes.
 //
 // Scan mode: the axis spans the scan job's `tuning`, widened to the union of the rows (a step
 // can reach past it at the span's ends); each row covers only its step's band (`center_hz` ±
@@ -431,34 +438,27 @@ class Waterfall {
     }
   }
 
-  // Lets go of `src` for a retune or a scan: true once nothing follows it and this page's own
-  // spectrum job on it is stopped; false (with a `conflict: …` notice) when another job holds
-  // it. Throws when `source_list` fails (nothing released then).
-  async release(src) {
-    const own =
-      this.mode === "spectrum" && this.jobId && loadIds(UI_JOBS_KEY).includes(this.jobId)
-        ? this.jobId
-        : null;
+  // The rigid holders of `src` from `source_list` (the page's elastic job is never one).
+  // Throws when `source_list` fails.
+  async holders(src) {
     const sources = (await this.api.op({ op: "source_list" })).value || [];
     const info = sources.find((s) => s.id === src.id);
-    const holders = info && Array.isArray(info.holders) ? info.holders : [];
-    const others = holders.filter((h) => h !== own);
-    if (others.length) {
-      this.notice(`conflict: source ${src.id} held by ${others.join(", ")}`);
+    return info && Array.isArray(info.holders) ? info.holders : [];
+  }
+
+  // Lets go of `src` for a scan: true once nothing follows it; false (with a `conflict: …`
+  // notice) when a rigid job holds it. The page's own elastic job keeps running: the scan
+  // stops it on the node. Throws when `source_list` fails (nothing released then).
+  async release(src) {
+    const holders = await this.holders(src);
+    if (holders.length) {
+      this.notice(`conflict: source ${src.id} held by ${holders.join(", ")}`);
       return false;
     }
     this.gen += 1; // no frames, reconnects or restarts from the job being let go
     if (this.sub) this.sub.close();
     this.sub = null;
     this.jobId = null;
-    if (own) {
-      this.forgetUiJob(own);
-      try {
-        await this.api.op({ op: "job_stop", job: own });
-      } catch {
-        /* already gone */
-      }
-    }
     return true;
   }
 
@@ -490,8 +490,9 @@ class Waterfall {
         j.kind === "spectrum" && j.source === src.id && isRunning(j) && !this.stopping.has(j.id),
     );
     if (running) {
-      // Without a usable tuning the band comes from the first event.
-      this.tuning = usableTuning(running.tuning);
+      // Without a usable tuning the band comes from the first event. An elastic job's tuning
+      // is the capture, which `src.current` may know first (just after a retune).
+      this.tuning = (running.elastic && usableTuning(src.current)) || usableTuning(running.tuning);
       if (this.tuning) this.setBand(this.tuning.center_hz, this.tuning.bandwidth_hz);
       return running.id;
     }
@@ -507,7 +508,7 @@ class Waterfall {
         bandwidth_hz: band.bandwidth_hz,
         deviation_hz: null,
         sideband: null,
-        elastic: false,
+        elastic: true,
         replace: [],
       });
     } catch (e) {
@@ -814,9 +815,10 @@ class Waterfall {
     else this.viewChanged();
   }
 
-  // Retunes the source for a view outside the capture (ruling R2): holders first; then the
-  // page's own spectrum job stops, `source_ensure` asks for the view's band and the spectrum
-  // job starts again on what the source captures. Refused: the view reverts.
+  // A view outside the capture (ruling R2, spec 4.1): rigid holders first, and while one
+  // holds the source the view is clamped into the capture instead; else `source_ensure` asks
+  // for the view's band, the node relaunches the page's elastic job on what the source now
+  // captures and the waterfall follows it again. Refused: the view reverts.
   async retune(lo, hi) {
     const src = this.src;
     if (!src) return;
@@ -829,14 +831,24 @@ class Waterfall {
       this.viewChanged();
     };
     try {
-      let released = false;
+      let holders = null;
       try {
-        released = await this.release(src);
+        holders = await this.holders(src);
       } catch (e) {
         this.notice(`view reverted: source_list: ${e.message}`);
       }
-      if (!released) {
+      if (holders === null) {
         if (this.src === src) revert();
+        return;
+      }
+      if (holders.length) {
+        this.notice(
+          `conflict: source ${src.id} held by ${holders.join(", ")}; the view stays inside its capture`,
+        );
+        if (this.src === src && this.band) {
+          this.view = prev;
+          this.setView(...this.clampToBand(lo, hi));
+        }
         return;
       }
       const gen = this.gen;

@@ -341,8 +341,9 @@ class Menu {
     });
   }
 
-  // A scan time-shares the radio, so it cannot start while the waterfall's own spectrum job
-  // holds the source: that job is let go first and the waterfall follows the scan after.
+  // A scan time-shares the radio: the waterfall lets go of the source first (refused while a
+  // rigid job holds it), the scan stops the page's elastic spectrum job on the node, and the
+  // waterfall follows the scan after (and starts its own job again when the scan ends).
   async scan(s) {
     if (this.wf.sourceId !== s.sourceId) return;
     let released = false;

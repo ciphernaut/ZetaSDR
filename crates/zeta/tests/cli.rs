@@ -87,6 +87,97 @@ fn source_list_shows_file_source() {
 }
 
 #[test]
+fn source_file_flag_parses_a_tune_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = write_tone(dir.path());
+    let flag = format!(
+        "retune={},tune_min_hz=50000000,tune_max_hz=150000000",
+        meta.display()
+    );
+    let run = |args: &[&str]| {
+        let mut cmd = zeta_bin();
+        cmd.arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .arg("--source-file")
+            .arg(&flag)
+            .arg("--json")
+            .args(args);
+        cmd
+    };
+    let out = run(&["source", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let src = &v["value"][0];
+    assert_eq!(src["id"], "retune");
+    let caps = &src["capabilities"];
+    assert!(
+        caps["tune_min_hz"].to_string().contains("50000000"),
+        "{caps}"
+    );
+    assert!(
+        caps["tune_max_hz"].to_string().contains("150000000"),
+        "{caps}"
+    );
+    // A tune inside the range moves the capture's centre.
+    let out = run(&[
+        "source",
+        "ensure",
+        "--source",
+        "retune",
+        "--center-hz",
+        "120000000",
+        "--bandwidth-hz",
+        "12500",
+    ])
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["value"]["center_hz"], 120_000_000, "{v}");
+    assert_eq!(v["value"]["bandwidth_hz"], 48_000, "{v}");
+    // Outside it: out_of_range naming the range.
+    let out = run(&[
+        "source",
+        "ensure",
+        "--source",
+        "retune",
+        "--center-hz",
+        "160000000",
+        "--bandwidth-hz",
+        "12500",
+    ])
+    .assert()
+    .code(2)
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "out_of_range", "{v}");
+    assert_eq!(v["max"], 150_000_000, "{v}");
+    // A malformed or partial range is a usage error naming the form.
+    for bad in [
+        format!("r={},tune_min_hz=5", meta.display()),
+        format!("r={},tune_min_hz=x,tune_max_hz=9", meta.display()),
+        format!("r={},tune_min_hz=9,tune_max_hz=5", meta.display()),
+        format!("r={},tune_min_hz=5,tune_max_hz=9,gain=3", meta.display()),
+    ] {
+        zeta_bin()
+            .arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .args(["--source-file", &bad, "source", "list"])
+            .assert()
+            .code(1)
+            .stderr(contains("ID=PATH.sigmf-meta[,tune_min_hz=N,tune_max_hz=M]"));
+    }
+}
+
+#[test]
 fn ensure_dropped_zeros_exit_2_with_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let args = [

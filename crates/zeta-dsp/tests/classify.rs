@@ -25,6 +25,7 @@ async fn node_over(dir: &std::path::Path, iq: &[Complex<f32>]) -> Node {
         realtime: true,
         block_samples: 4800,
         repeat: true,
+        tune_range: None,
     };
     let source = SourceId("file0".into());
     let src = Arc::new(FileSource::open(source.clone(), &meta, opts).unwrap());

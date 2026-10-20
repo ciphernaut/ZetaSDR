@@ -13,7 +13,15 @@
 // centre in MHz such as `144.8`); the selection is kept in
 // `sessionStorage["zeta.source"]`. The command line (#cmd, focused by Ctrl-K / ⌘K): text
 // that parses as a JSON object with an `op` key is applied with `api.op` (its outcome reaches
-// the transcript through the `ops` stream); anything else goes to `api.ask`.
+// the transcript through the `ops` stream); text starting with `view ` is a view command
+// (view.js: `view set <key> <value>`, `view show`, `view reset`, `view clear`), handled
+// here before both, its answer a transcript line; anything else goes to `api.ask`.
+//
+// Conflicts (spec 4.5): a `conflict` reply to an op this page applied (command line, menu),
+// or one the ops stream shows for another caller, adds a line naming each holder by kind
+// and tuning from the last job list (`conflict: source S held by passthrough <id> @ 100.000
+// MHz`) with one button per holder, `stop <kind> <short id> and retry`, which applies the
+// same op again with `replace: [<id>]` (conflictActions).
 //
 // The waterfall (waterfall.js) is mounted in #waterfall at login and follows the selected
 // source (selecting the source it already shows does nothing); it is destroyed when the node
@@ -41,8 +49,9 @@
 // line and submitted as if typed (so free text goes to /ask); #mic-status beside it shows
 // failures such as a node without a speech daemon.
 //
-// Exports `state` ({api, transcript, jobs, wf, ov, menu, audio, mic, sources, selected}) and `onSourceChange(fn)` for
-// the later views (waterfall, audio, voice).
+// Exports `state` ({api, transcript, jobs, wf, ov, menu, audio, mic, sources, selected,
+// view, lastJobs}), `onSourceChange(fn)` for the later views (waterfall, audio, voice), and
+// `conflictActions(err, retry)`.
 
 import { connect, Unauthorized } from "./api.js";
 import { QUIET_OPS, Transcript, startJobs, startOpsFeed } from "./agent.js";
@@ -52,6 +61,7 @@ import { mountMenu } from "./menu.js";
 import { playJob } from "./audio.js";
 import { closeGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
+import { mountView, runViewCommand } from "./view.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -69,6 +79,8 @@ export const state = {
   mic: null,
   sources: [],
   selected: null,
+  view: null, // view.js policies
+  lastJobs: [], // the last job_list result
 };
 const sourceListeners = [];
 
@@ -255,7 +267,8 @@ function notApplied(e) {
 // Applies `op` as typed by the user (command line or context menu); its outcome reaches the
 // transcript through the ops stream, except a successful quiet op (job_list, stream_list,
 // source_list), whose "ui" record is hidden with the polls (ruling R6): that one is shown
-// from the /op reply. The result JSON, or null when it failed.
+// from the /op reply. A `conflict` also gets its offer line (offerReplace). The result
+// JSON, or null when it failed.
 async function applyOp(op) {
   const t = state.transcript;
   if (!state.api) return null;
@@ -265,9 +278,53 @@ async function applyOp(op) {
     if (QUIET_OPS.has(op.op)) t.reply(op, result);
   } catch (e) {
     if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
+    else if (e.json && e.json.error === "conflict") await offerReplace(op, e.json);
   }
   state.jobs?.refresh();
   return result;
+}
+
+// ---- conflicts -------------------------------------------------------------------------
+
+// Ops that take `replace` (a conflict on them can be retried with the holders named).
+const REPLACEABLE = new Set(["job_start", "source_ensure"]);
+
+// `<kind> <id> @ <centre MHz>` for holder `id`, from the last job list (the conflict's
+// `current` centre when the job is not in it).
+function holderText(id, err) {
+  const j = state.lastJobs.find((x) => x.id === id);
+  const t = (j && j.tuning) || err.current;
+  const at = t && typeof t.center_hz === "number" ? ` @ ${mhz(t.center_hz)} MHz` : "";
+  return `${j ? j.kind : "job"} ${id}${at}`;
+}
+
+function conflictText(err) {
+  const holders = Array.isArray(err.holders) ? err.holders : [];
+  const who = holders.length ? holders.map((h) => holderText(h, err)).join(", ") : "nobody";
+  return `conflict: source ${err.source ?? "?"} held by ${who}`;
+}
+
+// One action per holder of a `conflict` error: `stop <kind> <short id> and retry`, whose
+// run calls retry([id]) (the original op again with `replace: [id]`).
+export function conflictActions(err, retry) {
+  const holders = err && Array.isArray(err.holders) ? err.holders : [];
+  return holders.map((id) => {
+    const j = state.lastJobs.find((x) => x.id === id);
+    return {
+      label: `stop ${j ? j.kind : "job"} ${id.slice(-6)} and retry`,
+      run: () => retry([id]),
+    };
+  });
+}
+
+// The conflict line for `op` (refused with `err`), with its retry buttons when the op
+// takes `replace`. The job list is refreshed first so the holders' kinds are known.
+async function offerReplace(op, err) {
+  if (state.jobs) await state.jobs.refresh();
+  const actions = REPLACEABLE.has(op.op)
+    ? conflictActions(err, (replace) => applyOp({ ...op, replace }))
+    : [];
+  state.transcript?.note(conflictText(err), true, actions);
 }
 
 // The op attaching a transcription to job `id` (the language left to the backend).
@@ -291,6 +348,12 @@ async function askAgent(text) {
 
 async function runCommand(text) {
   if (!state.api) return;
+  if (text === "view" || text.startsWith("view ")) {
+    state.transcript.user(text);
+    const r = runViewCommand(state.view, text.split(/\s+/).slice(1));
+    state.transcript.note(r.text, r.error);
+    return;
+  }
   const op = parseOp(text);
   if (op) {
     state.transcript.user(text);
@@ -346,7 +409,10 @@ function start(api) {
   state.transcript = new Transcript($("#transcript"));
   api.onBusy = (message) =>
     state.transcript?.note(`stream refused: ${message} (node out of stream slots)`, true);
-  state.ops = startOpsFeed(api, state.transcript);
+  state.view = mountView();
+  state.ops = startOpsFeed(api, state.transcript, {
+    onConflict: (p) => offerReplace(p.op, p.error),
+  });
   state.wf = mountWaterfall($("#waterfall"), api);
   state.wf.onNotice = (text) => state.transcript?.note(text, true);
   state.ov = mountOverlays($("#waterfall"), state.wf, api, { jobsEl: $("#jobs") });
@@ -363,7 +429,9 @@ function start(api) {
   });
   state.nodeCheck = startNodeCheck(api);
   state.jobs = startJobs(api, $("#jobs"), state.transcript, {
+    view: state.view,
     onJobs: (jobs) => {
+      state.lastJobs = jobs;
       if (state.ov) state.ov.sync(jobs);
       if (state.wf) state.wf.syncJobs(jobs);
       stopAudioUnlessRunning(jobs);

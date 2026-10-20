@@ -22,15 +22,26 @@
 //                               quiet op's ops-stream record is hidden)
 //       .user(text)             a request typed by the user
 //       .assistant(text, error) an answer from /ask (error: an assistant-error line)
-//       .note(text, error)      a UI line (connection state, local errors)
+//       .note(text, error = false, actions = [])
+//                               a UI line (connection state, local errors); each action
+//                               {label, run} is a button after the text (`button.action`):
+//                               a click disables the line's buttons and calls run(). A line
+//                               with actions is never folded into the one before.
 //       .onAssistant(fn)        fn(text, error) is also called for every assistant line
 //                               (Task 8 hangs the narrow-footprint ribbons here)
-//   startOpsFeed(api, transcript) -> {close}
+//   startOpsFeed(api, transcript, {onConflict}) -> {close}
 //       Finds the `ops` stream (the GET /streams entry whose provenance.source is "node")
 //       and appends one line per frame; reconnects and re-resolves the id when it drops.
-//   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing})
+//       onConflict(payload) is called for a `conflict` error of another caller (transport
+//       not "ui"; this page's own typed ops are handled where it applies them).
+//   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, view})
 //                                                       -> {close, refresh, redraw}
-//       Polls `job_list` every 2 s and renders the jobs that are not stopped: kind, source,
+//       Polls `job_list` every 2 s and renders the running jobs, and the finished ones
+//       (stopped, failed) for view.get("finished_rows_s") seconds after this page first saw
+//       them finished (0: never; without `view`, 60 s); view.onClear drops the finished rows
+//       at once. A finished row shows `.reason` (the state's reason, or `stopped`) and no
+//       Stop, ▶ or Transcribe button. A row of an elastic job (the page's own spectrum job)
+//       reads `<kind> elastic` and has only Stop. Each row shows kind, source,
 //       state, id, an `.events` cell (filled by overlays.js: a count, or `—` over its
 //       watch cap), on rows of an AUDIO_KINDS kind a
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job) and, while
@@ -38,7 +49,7 @@
 //       `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
 //       An attached job (one with an `input` job) is a `.job.attached` row placed right
 //       under its input's row, its kind shown as `↳ <kind>`, with neither of the audio
-//       buttons. A job's `state.reason` (a failure) is the row's tooltip.
+//       buttons. A job's `state.reason` (a failure) is also the row's tooltip.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 
@@ -147,10 +158,10 @@ export class Transcript {
     return !(QUIET_OPS.has(name) && payload.transport === "ui" && payload.outcome !== "error");
   }
 
-  #append(text, classes, title) {
+  #append(text, classes, title, actions = []) {
     const stick = this.el.scrollTop + this.el.clientHeight >= this.el.scrollHeight - 4;
     const last = this.last;
-    if (last && last.text === text && last.classes === classes) {
+    if (!actions.length && last && !last.actions && last.text === text && last.classes === classes) {
       last.count += 1;
       last.countEl.textContent = ` ×${last.count}`;
       if (title) last.line.title = title;
@@ -162,9 +173,20 @@ export class Transcript {
       const countEl = document.createElement("span");
       countEl.className = "count";
       line.append(body, countEl);
+      const buttons = actions.map(({ label, run }) => {
+        const b = document.createElement("button");
+        b.className = "action";
+        b.textContent = label;
+        b.onclick = () => {
+          for (const x of buttons) x.disabled = true;
+          run();
+        };
+        return b;
+      });
+      line.append(...buttons);
       if (title) line.title = title;
       this.el.append(line);
-      this.last = { text, classes, count: 1, line, countEl };
+      this.last = { text, classes, count: 1, line, countEl, actions: buttons.length > 0 };
       while (this.el.childElementCount > MAX_LINES) this.el.firstElementChild.remove();
     }
     if (stick) this.el.scrollTop = this.el.scrollHeight;
@@ -192,8 +214,8 @@ export class Transcript {
     for (const fn of this.listeners) fn(text, error);
   }
 
-  note(text, error = false) {
-    this.#append(text, error ? "note error" : "note");
+  note(text, error = false, actions = []) {
+    this.#append(text, error ? "note error" : "note", "", actions);
   }
 
   onAssistant(fn) {
@@ -207,7 +229,7 @@ async function opsStreamId(api) {
   return s ? s.id : null;
 }
 
-export function startOpsFeed(api, transcript) {
+export function startOpsFeed(api, transcript, { onConflict = null } = {}) {
   let sub = null;
   let stopped = false;
   let retry = null;
@@ -227,7 +249,20 @@ export function startOpsFeed(api, transcript) {
     sub = api.streamText(
       id,
       (msg) => {
-        if (msg.type === "frame") transcript.op(msg.payload);
+        if (msg.type === "frame") {
+          transcript.op(msg.payload);
+          const p = msg.payload;
+          if (
+            onConflict &&
+            p &&
+            p.outcome === "error" &&
+            p.error &&
+            p.error.error === "conflict" &&
+            p.transport !== "ui"
+          ) {
+            onConflict(p);
+          }
+        }
         else if (msg.type === "lagged") transcript.note(`ops: ${msg.missed} missed`, true);
       },
       ({ reconnecting }) => {
@@ -246,10 +281,13 @@ export function startOpsFeed(api, transcript) {
   };
 }
 
+const isFinished = (j) => !!(j.state && (j.state.status === "stopped" || j.state.status === "failed"));
+
 function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing }) {
   const row = document.createElement("div");
   const attached = !!job.input;
-  row.className = attached ? "job attached" : "job";
+  const finished = isFinished(job);
+  row.className = ["job", attached && "attached", finished && "finished"].filter(Boolean).join(" ");
   row.dataset.id = job.id;
   const status = job.state && job.state.status ? job.state.status : "?";
   row.dataset.state = status;
@@ -264,11 +302,34 @@ function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing }) {
     const span = document.createElement("span");
     span.className = cls;
     span.textContent = text;
+    if (cls === "kind" && job.elastic) {
+      const tag = document.createElement("span");
+      tag.className = "tag elastic";
+      tag.textContent = "elastic";
+      tag.title = "follows the capture; holds no lease";
+      span.append(" ", tag);
+    }
     row.append(span);
   }
   if (job.state && job.state.reason) row.title = job.state.reason;
+  if (finished) {
+    const reason = document.createElement("span");
+    reason.className = "reason";
+    reason.textContent = (job.state && job.state.reason) || "stopped";
+    row.append(reason);
+  }
   const actions = document.createElement("span");
   actions.className = "actions";
+  if (finished) {
+    if (onGraph) actions.append(graphButton(job, onGraph));
+    row.append(actions);
+    return row;
+  }
+  if (job.elastic) {
+    actions.append(stopButton(job, onStop));
+    row.append(actions);
+    return row;
+  }
   const audio = !attached && AUDIO_KINDS.includes(job.kind);
   if (audio && onPlay) {
     const on = playing ? playing(job.id) : false;
@@ -288,22 +349,28 @@ function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing }) {
     tr.onclick = () => onTranscribe(job);
     actions.append(tr);
   }
-  if (onGraph) {
-    const graph = document.createElement("button");
-    graph.className = "graph";
-    graph.textContent = "graph";
-    graph.title = `graph_get ${job.id}`;
-    graph.onclick = () => onGraph(job);
-    actions.append(graph);
-  }
+  if (onGraph) actions.append(graphButton(job, onGraph));
+  actions.append(stopButton(job, onStop));
+  row.append(actions);
+  return row;
+}
+
+function graphButton(job, onGraph) {
+  const graph = document.createElement("button");
+  graph.className = "graph";
+  graph.textContent = "graph";
+  graph.title = `graph_get ${job.id}`;
+  graph.onclick = () => onGraph(job);
+  return graph;
+}
+
+function stopButton(job, onStop) {
   const stop = document.createElement("button");
   stop.className = "stop";
   stop.textContent = "Stop";
   stop.title = `job_stop ${job.id}`;
   stop.onclick = () => onStop(job.id, stop);
-  actions.append(stop);
-  row.append(actions);
-  return row;
+  return stop;
 }
 
 // `jobs` with each attached job moved right after its input (in list order); one whose input
@@ -322,15 +389,63 @@ export function startJobs(
   api,
   el,
   transcript,
-  { onJobs = null, onPlay = null, onTranscribe = null, onGraph = null, playing = null } = {},
+  {
+    onJobs = null,
+    onPlay = null,
+    onTranscribe = null,
+    onGraph = null,
+    playing = null,
+    view = null,
+  } = {},
 ) {
   let timer = null;
+  let ageTimer = null;
   let stopped = false;
   let last = null;
+  // id -> performance.now() when this page first saw the job finished (-Infinity: cleared).
+  const finishedAt = new Map();
   const buttons = { onPlay, onTranscribe, onGraph, playing };
+  const keepMs = () => {
+    const s = view ? Number(view.get("finished_rows_s")) : 60;
+    return Number.isFinite(s) && s > 0 ? s * 1000 : 0;
+  };
+  // The jobs listed now: running ones, and finished ones still inside finished_rows_s;
+  // schedules a redraw for when the next finished row ages out.
+  const visible = (jobs) => {
+    const now = performance.now();
+    const ids = new Set(jobs.map((j) => j.id));
+    for (const id of finishedAt.keys()) if (!ids.has(id)) finishedAt.delete(id);
+    const keep = keepMs();
+    let next = Infinity;
+    const out = jobs.filter((j) => {
+      if (!isFinished(j)) {
+        finishedAt.delete(j.id);
+        return true;
+      }
+      if (!finishedAt.has(j.id)) finishedAt.set(j.id, now);
+      const left = finishedAt.get(j.id) + keep - now;
+      if (left > 0) next = Math.min(next, left);
+      return left > 0;
+    });
+    clearTimeout(ageTimer);
+    ageTimer = next < Infinity && !stopped ? setTimeout(() => redraw(), next + 20) : null;
+    return out;
+  };
+  const redraw = () => {
+    if (last && !stopped) render(last);
+  };
+  if (view) {
+    view.onClear(() => {
+      for (const j of last || []) if (isFinished(j)) finishedAt.set(j.id, -Infinity);
+      redraw();
+    });
+    view.onChange((key) => {
+      if (key === "finished_rows_s") redraw();
+    });
+  }
   const render = (jobs) => {
     last = jobs;
-    const shown = underInputs(jobs.filter((j) => !(j.state && j.state.status === "stopped")));
+    const shown = underInputs(visible(jobs));
     el.replaceChildren(
       ...shown.map((j) =>
         jobRow(j, async (id, button) => {
@@ -367,12 +482,11 @@ export function startJobs(
   loop();
   return {
     refresh,
-    redraw() {
-      if (last && !stopped) render(last);
-    },
+    redraw,
     close() {
       stopped = true;
       clearTimeout(timer);
+      clearTimeout(ageTimer);
     },
   };
 }

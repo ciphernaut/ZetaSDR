@@ -215,6 +215,24 @@ input:focus { border-color: var(--accent); }
 .job button.play { min-width: 2.2em; }
 .job button.play[aria-pressed="true"] { border-color: var(--ok); color: var(--ok); }
 #jobs .empty { color: var(--dim); }
+.job .tag {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  color: var(--dim);
+  font-size: 11px;
+}
+/* A finished row (stopped, failed) is dimmed; its reason reads inline on a line of its own. */
+.job.finished { opacity: 0.7; }
+.job .reason {
+  grid-column: 1 / -1;
+  order: 10;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.job[data-state="failed"] .reason { color: var(--error); }
+/* Buttons offered after a transcript line (a conflict's "stop … and retry"). */
+.line button.action { margin-left: 6px; padding: 0 6px; font-style: normal; }
 
 #bar {
   grid-area: bar;

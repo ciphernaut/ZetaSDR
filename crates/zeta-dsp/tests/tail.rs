@@ -18,6 +18,7 @@ async fn stream_tail_returns_events_from_running_job() {
         realtime: false,
         block_samples: 4800,
         repeat: true,
+        tune_range: None,
     };
     let src = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
     let port: Arc<dyn Port> = src.clone();

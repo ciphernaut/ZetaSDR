@@ -20,7 +20,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub state_dir: Option<PathBuf>,
     /// Register a SigMF recording as source <ID> (repeatable)
-    #[arg(long = "source-file", global = true, value_name = "ID=PATH.sigmf-meta", value_parser = sources::parse_file)]
+    #[arg(long = "source-file", global = true, value_name = "ID=PATH.sigmf-meta[,tune_min_hz=N,tune_max_hz=M]", value_parser = sources::parse_file)]
     source_files: Vec<SourceSpec>,
     /// Register a SoapySDR device as source <ID>; ARGS are SoapySDR device arguments,
     /// e.g. driver=hackrf,serial=... (repeatable; needs a build with --cfg soapy)

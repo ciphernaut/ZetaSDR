@@ -36,6 +36,7 @@ async fn open(dir: &Path) -> Node {
         realtime: false,
         block_samples: 4800,
         repeat: true,
+        tune_range: None,
     };
     let src: Arc<dyn Port> =
         Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());

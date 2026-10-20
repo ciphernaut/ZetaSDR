@@ -8,7 +8,8 @@ or `FAIL <name>: <reason>` (plus the browser console errors) and exits 1 on the 
 Run by `cargo test -p zeta --test ui`, which starts the node with the `tone`, `aprs`, `wfm`
 (wideband FM, 1 kHz tone with pilot, 240 kHz at 104.9 MHz) and `pocsag` (a 1200-baud page
 `HELLO ZETA` to address 1234567, 48 kHz at 148.6375 MHz) and `speech` (speech-like bursts,
-wideband FM, 240 kHz at 104.7 MHz) fixtures and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
+wideband FM, 240 kHz at 104.7 MHz) fixtures, `retune` (the tone recording tunable over
+50-150 MHz: a tune moves its capture's centre), and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
 state directory in ZETA_UI_STATE_DIR, and the URL of a second node started without a speech
 daemon (with the `speech` source) in ZETA_UI_URL_NOSTT (for the "no daemon" scenarios).
 """
@@ -112,7 +113,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (5 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (6 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -133,11 +134,15 @@ def scenario_command_line_applies_op(page, url, secret):
                                   "elastic": False, "replace": []}))
     page.press("#cmd", "Enter")
     expect(page.locator("#transcript")).to_contain_text("job_start kind=measure source=tone")
-    row = page.locator("#jobs .job", has_text="measure")
-    expect(row).to_contain_text("running")
+    row = page.locator('#jobs .job[data-state="running"]', has_text="measure")
+    expect(row).to_have_count(1)
+    job = row.get_attribute("data-id")
     row.locator("button.stop").click()
     expect(page.locator("#transcript")).to_contain_text("job_stop")
-    expect(row).to_have_count(0)
+    # The finished row stays listed (finished_rows_s), stopped and without a Stop button.
+    row = page.locator(f'#jobs .job[data-id="{job}"]')
+    expect(row.locator(".state")).to_have_text("stopped")
+    expect(row.locator("button.stop")).to_have_count(0)
 
 
 def scenario_narrow_hides_pane(page, url, secret):
@@ -190,7 +195,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (5 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (6 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -215,7 +220,7 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    for source in ("tone", "aprs", "wfm", "speech"):
+    for source in ("tone", "aprs", "wfm", "speech", "retune"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -509,7 +514,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (5 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (6 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -854,6 +859,209 @@ def scenario_overlays_follow_a_zoom(page, url, secret):
     wait_ticks(page, "100.012", "99.988", "after zooming in")
 
 
+# ---- view policy: the page yields (plan 11 Task 5) ------------------------------------------
+# `retune` is the tone recording tunable over 50-150 MHz: a tune moves its capture's centre.
+
+def job_record(url, secret, job):
+    jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+    return next((j for j in jobs if j["id"] == job), None)
+
+
+def source_info(url, secret, source):
+    sources = http_json(url, secret, "/op", {"op": "source_list"})["value"]
+    return next(s for s in sources if s["id"] == source)
+
+
+def run_cmd(page, text):
+    page.fill("#cmd", text)
+    page.press("#cmd", "Enter")
+
+
+def view_line(page, text, error=False):
+    """The newest note line containing `text` (`.error` ones with `error`); the ops stream
+    keeps adding lines, so the newest line overall may be another."""
+    cls = "#transcript .line.note.error" if error else "#transcript .line.note:not(.error)"
+    return page.locator(cls, has_text=text).last
+
+
+def view_show(page):
+    """Run `view show` and return its text once a new answer line is there."""
+    before = page.locator("#transcript .line.note", has_text="(allowed").count()
+    run_cmd(page, "view show")
+    lines = page.locator("#transcript .line.note", has_text="(allowed")
+    expect(lines).to_have_count(before + 1)
+    return lines.last.text_content()
+
+
+def wait_until(pred, within_s, what, step_s=0.2):
+    """Poll `pred()` until it returns a truthy value or `within_s` passes; that value."""
+    deadline = time.monotonic() + within_s
+    while True:
+        v = pred()
+        if v or time.monotonic() > deadline:
+            assert v, f"{what} within {within_s} s"
+            return v
+        time.sleep(step_s)
+
+
+def scenario_page_job_is_elastic_and_a_rigid_start_needs_no_replace(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    page.wait_for_function("() => window.zetaTest.wf() && window.zetaTest.wf().jobId")
+    own = page.evaluate(WF_STATE_JS)["jobId"]
+    rec = job_record(url, secret, own)
+    assert rec and rec["kind"] == "spectrum" and rec["elastic"] is True, f"page job {rec}"
+    # Its row is listed, marked elastic, with nothing but Stop.
+    row = job_row(page, own)
+    expect(row.locator(".kind")).to_have_text("spectrum elastic")
+    expect(row.locator("button")).to_have_count(1)
+    expect(row.locator("button.stop")).to_have_count(1)
+    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    band = cur + 1_000_000 if cur + 1_000_000 < 149_000_000 else cur - 1_000_000
+    r = http_json(url, secret, "/op", {"op": "job_start", "kind": "passthrough",
+                                       "source": "retune", "center_hz": band,
+                                       "bandwidth_hz": 10_000, "deviation_hz": None,
+                                       "sideband": None, "elastic": False, "replace": []})
+    assert r["result"] == "job", f"rigid start over the page's job: {r}"
+    rigid = r["value"]
+    try:
+        def followed():
+            src = source_info(url, secret, "retune")
+            rec = job_record(url, secret, own)
+            ok = (src["current"]["center_hz"] == band and rec
+                  and rec["state"]["status"] == "running" and rec["tuning"] == src["current"])
+            return (src, rec) if ok else None
+        src, rec = wait_until(followed, 5.0, "the page's job follows the retune")
+        assert src["holders"] == [rigid], f"holders {src['holders']}"
+        assert own in src["elastic"], f"elastic {src['elastic']}"
+        assert page.evaluate(WF_STATE_JS)["jobId"] == own, page.evaluate(WF_STATE_JS)
+        # It keeps painting the new capture under the same job id.
+        wait_waterfall_follows(page, f"w.jobId === {json.dumps(own)}", "after the relaunch")
+        mid = f"{band / 1e6:.3f}"
+        page.wait_for_function(
+            f"() => ({TICKS_JS})()[2] === {json.dumps(mid)}", timeout=10_000)
+    finally:
+        stop_job(url, secret, rigid)
+
+
+def scenario_stopping_the_page_job_starts_a_fresh_elastic_one(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    own = page.evaluate(WF_STATE_JS)["jobId"]
+    job_row(page, own).locator("button.stop").click()
+    wait_waterfall_follows(page, f"w.jobId && w.jobId !== {json.dumps(own)}", "fresh own job")
+    fresh = page.evaluate(WF_STATE_JS)["jobId"]
+    rec = job_record(url, secret, fresh)
+    assert rec["elastic"] is True and rec["state"]["status"] == "running", f"fresh job {rec}"
+    jobs = running_spectrum_jobs(url, secret, "retune")
+    assert [j["id"] for j in jobs] == [fresh], f"spectrum jobs on retune: {jobs}"
+
+
+def scenario_view_set_show_reset(page, url, secret):
+    page.set_viewport_size(WIDE)
+    login(page, url, secret)
+    expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
+    run_cmd(page, "view set follow free")
+    expect(view_line(page, "follow = free")).to_have_text("follow = free")
+    shown = view_show(page)
+    for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
+                 "finished_rows_s 60", "scanner auto"):
+        assert text in shown, f"{text!r} not in view show: {shown!r}"
+    assert shown.count("\n") == 4, f"view show: {shown!r}"
+    run_cmd(page, "view set follow sideways")
+    expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
+    run_cmd(page, "view set finished_rows_s 5")
+    expect(view_line(page, "finished_rows_s = 5")).to_be_visible()
+    run_cmd(page, "view set finished_rows_s -1")
+    expect(view_line(page, '"-1"', error=True)).to_be_visible()
+    run_cmd(page, "view set nosuch 1")
+    expect(view_line(page, "nosuch", error=True)).to_contain_text(
+        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner")
+    run_cmd(page, "view reset")
+    expect(view_line(page, "view policies reset")).to_be_visible()
+    shown = view_show(page)
+    assert "follow target" in shown and "finished_rows_s 60" in shown, shown
+    # Nothing went to /ask.
+    expect(page.locator("#transcript .line.assistant")).to_have_count(0)
+    # The values live in sessionStorage and survive a reload.
+    run_cmd(page, "view set scanner aprs")
+    expect(view_line(page, "scanner = aprs")).to_be_visible()
+    page.reload()
+    expect(page.locator("#login")).to_be_hidden()
+    expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
+    assert "scanner aprs" in view_show(page)
+    stored = page.evaluate("JSON.parse(sessionStorage.getItem('zeta.view'))")
+    assert stored.get("scanner") == "aprs", f"zeta.view {stored}"
+
+
+def scenario_finished_rows_age_out(page, url, secret):
+    select_source(page, url, secret, "tone")
+    run_cmd(page, "view set finished_rows_s 1")
+    expect(view_line(page, "finished_rows_s = 1")).to_be_visible()
+    job = start_job(url, secret, "passthrough", "tone", 100_000_000, 10_000)
+    job_row(page, job)
+    stop_job(url, secret, job)
+    page.evaluate("window.zetaTest.poll()")
+    row = page.locator(f'#jobs .job[data-id="{job}"]')
+    expect(row.locator(".reason")).to_have_text("stopped")
+    expect(row.locator("button.stop")).to_have_count(0)
+    expect(row).to_have_count(0, timeout=3_000)
+    # 0: a stopped job is never listed.
+    run_cmd(page, "view set finished_rows_s 0")
+    job = start_job(url, secret, "passthrough", "tone", 100_000_000, 10_000)
+    stop_job(url, secret, job)
+    for _ in range(5):
+        page.evaluate("window.zetaTest.poll()")
+        page.wait_for_timeout(300)
+        expect(page.locator(f'#jobs .job[data-id="{job}"]')).to_have_count(0)
+    # view clear drops the finished rows at once.
+    run_cmd(page, "view set finished_rows_s 60")
+    job = start_job(url, secret, "passthrough", "tone", 100_000_000, 10_000)
+    stop_job(url, secret, job)
+    page.evaluate("window.zetaTest.poll()")
+    expect(page.locator(f'#jobs .job[data-id="{job}"] .reason')).to_have_text("stopped")
+    run_cmd(page, "view clear")
+    expect(page.locator(f'#jobs .job[data-id="{job}"]')).to_have_count(0)
+    page.evaluate("window.zetaTest.poll()")
+    page.wait_for_timeout(300)
+    expect(page.locator(f'#jobs .job[data-id="{job}"]')).to_have_count(0)
+
+
+def scenario_conflict_offers_replace(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    a = start_job(url, secret, "passthrough", "retune", 100_000_000, 10_000)
+    new = None
+    try:
+        op = {"op": "job_start", "kind": "passthrough", "source": "retune",
+              "center_hz": 101_000_000, "bandwidth_hz": 10_000, "deviation_hz": None,
+              "sideband": None, "elastic": False, "replace": []}
+        run_cmd(page, json.dumps(op))
+        line = page.locator("#transcript .line.error",
+                            has_text=re.compile(rf"conflict.*held by passthrough {a} @ 100\.000"))
+        expect(line).to_have_count(1)
+        button = line.locator("button", has_text=f"stop passthrough {a[-6:]} and retry")
+        expect(button).to_have_count(1)
+        button.click()
+
+        def handed_over():
+            jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            mine = next(j for j in jobs if j["id"] == a)
+            news = [j for j in jobs if j["kind"] == "passthrough" and j["source"] == "retune"
+                    and j["state"]["status"] == "running"
+                    and j["tuning"]["center_hz"] == 101_000_000]
+            return news[0]["id"] if mine["state"]["status"] == "stopped" and news else None
+        new = wait_until(handed_over, 5.0, "A stopped and the new job running")
+        cur = source_info(url, secret, "retune")["current"]
+        assert cur["center_hz"] == 101_000_000, f"current {cur}"
+        expect(page.locator("#transcript .line.op",
+                            has_text=re.compile(rf"replace=… → job {new}"))).to_have_count(1)
+    finally:
+        stop_job(url, secret, a)
+        if new:
+            stop_job(url, secret, new)
+
+
 # ---- graph view and audio (Task 10) --------------------------------------------------------
 # Last: they open more websockets (the audio socket) and each stops the job it starts.
 
@@ -1018,7 +1226,7 @@ def scenario_watched_jobs_are_capped(page, url, secret):
         for _ in range(6):
             jobs.append(start_job(url, secret, "measure", "tone", 100_000_000, 10_000))
         page.evaluate("window.zetaTest.poll()")
-        expect(page.locator("#jobs .job", has_text="measure")).to_have_count(6)
+        expect(page.locator('#jobs .job[data-state="running"]', has_text="measure")).to_have_count(6)
         for j in jobs[:2]:
             cell = page.locator(f'#jobs .job[data-id="{j}"] .events')
             expect(cell).to_have_text("—")
@@ -1331,12 +1539,12 @@ def scenario_transcript_ribbon_appears(page, url, secret):
         expect(page.locator("#waterfall .ov-ribbon", has_text='"vad"')).to_have_count(0)
         if os.environ.get("ZETA_UI_SHOTS"):
             page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "transcript.png"))
-        # Stopping the demodulator ends the attached job: both rows go.
+        # Stopping the demodulator ends the attached job: both rows finish.
         job_row(page, demod).locator("button.stop").click()
         page.evaluate("window.zetaTest.poll()")
-        expect(page.locator(f'#jobs .job[data-id="{demod}"]')).to_have_count(0)
+        expect(page.locator(f'#jobs .job[data-id="{demod}"] .state')).to_have_text("stopped")
         page.evaluate("window.zetaTest.poll()")
-        expect(page.locator(f'#jobs .job[data-id="{attached}"]')).to_have_count(0)
+        expect(page.locator(f'#jobs .job[data-id="{attached}"] .state')).to_have_text("stopped")
     finally:
         for j in (attached, demod):
             if j:

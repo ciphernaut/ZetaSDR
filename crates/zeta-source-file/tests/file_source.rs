@@ -33,6 +33,7 @@ fn unsupported_datatype_is_named() {
             realtime: false,
             block_samples: 4800,
             repeat: false,
+            tune_range: None,
         },
     ) {
         Err(PortError::Unsupported(s)) => assert!(s.contains("rf32_le")),
@@ -64,6 +65,7 @@ async fn streams_all_samples_in_blocks() {
             realtime: false,
             block_samples: 4800,
             repeat: false,
+            tune_range: None,
         },
     )
     .unwrap();
@@ -98,6 +100,7 @@ async fn tune_off_center_is_out_of_range() {
             realtime: false,
             block_samples: 4800,
             repeat: false,
+            tune_range: None,
         },
     )
     .unwrap();
@@ -136,6 +139,7 @@ async fn tune_sub_band_inside_recording_returns_capture_band() {
             realtime: false,
             block_samples: 4800,
             repeat: false,
+            tune_range: None,
         },
     )
     .unwrap();
@@ -207,6 +211,7 @@ fn opts(repeat: bool) -> FileOpts {
         realtime: false,
         block_samples: 4800,
         repeat,
+        tune_range: None,
     }
 }
 
@@ -286,5 +291,97 @@ async fn repeat_keeps_t0_monotonic() {
             assert_eq!(b.t0, Timestamp(1_000_000_000));
         }
         prev = Some(b.t0);
+    }
+}
+
+#[tokio::test]
+async fn tune_inside_tune_range_is_accepted_outside_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::tone(dir.path());
+    let src = FileSource::open(
+        SourceId("f".into()),
+        &path,
+        FileOpts {
+            realtime: false,
+            block_samples: 4800,
+            repeat: false,
+            tune_range: Some((Hz(50_000_000), Hz(150_000_000))),
+        },
+    )
+    .unwrap();
+    // The capabilities are the range, not the recording's band.
+    let caps = src.capabilities();
+    assert_eq!(*caps.tune_min_hz.value(), Hz(50_000_000));
+    assert_eq!(*caps.tune_max_hz.value(), Hz(150_000_000));
+    // Before any tune the recording's own band.
+    assert_eq!(
+        src.current(),
+        Some(Tuning {
+            center_hz: Hz(100_000_000),
+            bandwidth_hz: Hz(48_000),
+        })
+    );
+    // Inside the range: the centre is recorded, the width stays the recording's rate.
+    let mut rx = src.subscribe();
+    let h = src.start();
+    let moved = Tuning {
+        center_hz: Hz(120_000_000),
+        bandwidth_hz: Hz(48_000),
+    };
+    let t = Tuning {
+        center_hz: Hz(120_000_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    assert_eq!(src.tune(t).await.unwrap(), moved);
+    assert_eq!(src.current(), Some(moved));
+    // The samples are unchanged; the blocks carry the new centre.
+    let mut saw_moved = false;
+    while let Ok(b) = rx.recv().await {
+        if b.center_hz == Hz(120_000_000) {
+            saw_moved = true;
+            assert_eq!(b.sample_rate_hz, Hz(48_000));
+            break;
+        }
+    }
+    assert!(saw_moved, "no block labelled with the new centre");
+    drop(rx);
+    h.abort();
+    // Outside the range (or spilling over its edge): out_of_range naming the range.
+    for c in [40_000_000, 149_999_000] {
+        match src
+            .tune(Tuning {
+                center_hz: Hz(c),
+                bandwidth_hz: Hz(12_500),
+            })
+            .await
+        {
+            Err(PortError::OutOfRange {
+                field: "center_hz",
+                min: 50_000_000,
+                max: 150_000_000,
+                ..
+            }) => {}
+            other => panic!("{c}: got {other:?}"),
+        }
+    }
+    assert_eq!(
+        src.current(),
+        Some(moved),
+        "a refused tune moved the capture"
+    );
+    // Wider than the recording: out_of_range on bandwidth_hz as before.
+    match src
+        .tune(Tuning {
+            center_hz: Hz(120_000_000),
+            bandwidth_hz: Hz(48_001),
+        })
+        .await
+    {
+        Err(PortError::OutOfRange {
+            field: "bandwidth_hz",
+            max: 48_000,
+            ..
+        }) => {}
+        other => panic!("got {other:?}"),
     }
 }
