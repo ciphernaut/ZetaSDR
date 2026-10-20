@@ -19,10 +19,13 @@
 //                            poll; a job whose streams are listed but none is an `event`
 //                            stream (e.g. `fm_demod`) goes in `noEventStream` (job id ->
 //                            graph JSON) and is not looked up again until it leaves the
-//                            running list or its graph changes.
-//     ov.watchJob(job, streamId)  subscribes to the job's event stream (text mode,
-//                            re-resolved by provenance after a drop) and renders each event
-//                            by payload shape:
+//                            running list or its graph changes. An attached `transcribe`
+//                            job is watched like any other (its source is its input's).
+//     ov.watchJob(job, streamIds)  subscribes to the job's event streams (an id or an array:
+//                            an attached `transcribe` job has two, its `vad` and its
+//                            `transcript` stage's; text mode, each re-resolved by provenance
+//                            after a drop) and renders each event by payload shape (so by
+//                            `protocol`, whichever stream it came on):
 //         - `db` array (spectrum): ignored; every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
@@ -32,7 +35,12 @@
 //             `adsb`:   "<icao> <callsign> <altitude_ft> ft <lat>,<lon>", each absent (null)
 //                       field omitted ("ft" with the altitude, lat,lon only as a pair);
 //             `acars`:  "<reg> <label>: <text>";
-//           any other protocol falls through to the branches below;
+//             `transcript`: "<text>", class `transcript`, tooltip "<language> · <duration_ms>
+//                       ms"; a `dropped` one "[dropped]" and an `error` one
+//                       "[error] <error>", class `transcript-error`;
+//             `vad`:    counted only, never drawn;
+//           any other protocol falls through to the branches below. An attached job's
+//           ribbons sit at its own tuning, which equals its input's;
 //         - `src` and `info` (APRS): ov.ribbon(tuning centre, "<src> > <dst>: <info>",
 //           "aprs");
 //         - anything else: ov.ribbon(tuning centre, first OTHER_EVENT_CHARS chars of the
@@ -96,6 +104,14 @@ export function protocolText(p) {
   }
 }
 
+// The ribbon for a `transcript` event: {text, cls, title}.
+export function transcriptRibbon(p) {
+  if (p.dropped) return { text: "[dropped]", cls: "transcript-error", title: "segment dropped" };
+  if (present(p.error)) return { text: `[error] ${p.error}`, cls: "transcript-error", title: "" };
+  const ms = typeof p.duration_ms === "number" ? `${p.duration_ms} ms` : "? ms";
+  return { text: String(p.text ?? ""), cls: "transcript", title: `${p.language ?? "?"} · ${ms}` };
+}
+
 function tuningCentre(job) {
   return job && job.tuning && typeof job.tuning.center_hz === "number"
     ? job.tuning.center_hz
@@ -108,7 +124,7 @@ class Overlays {
     this.api = api;
     this.jobsEl = jobsEl;
     this.sourceId = null;
-    this.watched = new Map(); // job id -> {job, sub, closed}
+    this.watched = new Map(); // job id -> {job, ids, subs, closed}
     this.noEventStream = new Map(); // job id -> JSON of the graph that has no event stream
     this.resolving = false; // a GET /streams for unwatched jobs is in flight
     this.counters = new Map(); // job id -> non-spectrum events seen while watched
@@ -190,49 +206,57 @@ class Overlays {
     for (const j of jobs) {
       if (j.source !== this.sourceId || this.watched.has(j.id)) continue;
       const mine = streams.filter((x) => x.provenance && x.provenance.job === j.id);
-      const ev = mine.find((x) => x.kind === "event");
-      if (ev) this.watchJob(j, ev.id);
+      const ev = mine.filter((x) => x.kind === "event").map((x) => x.id);
+      if (ev.length > 0) this.watchJob(j, ev);
       else if (mine.length > 0) this.noEventStream.set(j.id, graphKey(j));
     }
   }
 
-  watchJob(job, streamId) {
+  watchJob(job, streamIds) {
     if (this.destroyed || job.source !== this.sourceId) return;
     const known = this.watched.get(job.id);
     if (known) {
       known.job = job;
       return;
     }
-    const rec = { job, sub: null, closed: false };
+    const ids = Array.isArray(streamIds) ? [...streamIds] : [streamIds];
+    const rec = { job, ids, subs: [], closed: false };
     this.watched.set(job.id, rec);
-    this.subscribe(rec, streamId);
+    ids.forEach((_, slot) => this.subscribe(rec, slot));
   }
 
   unwatch(jobId) {
     const rec = this.watched.get(jobId);
     if (!rec) return;
     rec.closed = true;
-    if (rec.sub) rec.sub.close();
+    for (const sub of rec.subs) sub.close();
     this.watched.delete(jobId);
     this.counters.delete(jobId);
     this.unlabel(jobId);
   }
 
-  async lookupStream(jobId) {
+  // The id for subscription `slot` of `rec` after a drop: its stream if still listed, else
+  // one of the job's event streams no other slot holds (the job restarted with new ids).
+  async lookupStream(rec, slot) {
     const streams = await this.api.streams();
-    const s = streams.find((x) => x.kind === "event" && x.provenance && x.provenance.job === jobId);
-    return s ? s.id : null;
+    const ev = streams
+      .filter((x) => x.kind === "event" && x.provenance && x.provenance.job === rec.job.id)
+      .map((x) => x.id);
+    if (ev.includes(rec.ids[slot])) return rec.ids[slot];
+    const held = new Set(rec.ids.filter((_, i) => i !== slot));
+    const id = ev.find((x) => !held.has(x)) ?? null;
+    if (id) rec.ids[slot] = id;
+    return id;
   }
 
-  subscribe(rec, streamId) {
-    const jobId = rec.job.id;
-    rec.sub = this.api.streamText(
-      streamId,
+  subscribe(rec, slot) {
+    rec.subs[slot] = this.api.streamText(
+      rec.ids[slot],
       (msg) => {
         if (!rec.closed && msg.type === "frame") this.render(rec, msg.payload);
       },
       null,
-      { onReconnect: () => this.lookupStream(jobId) },
+      { onReconnect: () => this.lookupStream(rec, slot) },
     );
   }
 
@@ -247,6 +271,13 @@ class Overlays {
     if (obj) {
       if (p.label && typeof p.label === "object" && typeof p.center_hz === "number") {
         this.label(p.center_hz, p.label, job.id);
+        return;
+      }
+      if (p.protocol === "vad") return;
+      if (p.protocol === "transcript") {
+        const t = transcriptRibbon(p);
+        const el = this.ribbon(tuningCentre(job), t.text, t.cls);
+        if (el && t.title) el.title = `${t.text}\n${t.title}`;
         return;
       }
       if (typeof p.protocol === "string") {

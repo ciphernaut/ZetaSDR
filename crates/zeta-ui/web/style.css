@@ -153,6 +153,8 @@ input:focus { border-color: var(--accent); }
 #waterfall .ov-ribbon.rds { color: var(--ok); border-left-color: var(--ok); }
 #waterfall .ov-ribbon.adsb { color: var(--accent); border-left-color: var(--accent); }
 #waterfall .ov-ribbon.acars { color: var(--text); border-left-color: var(--accent); }
+#waterfall .ov-ribbon.transcript { color: var(--text); border-left-color: var(--ok); }
+#waterfall .ov-ribbon.transcript-error { color: var(--error); border-left-color: var(--error); }
 #waterfall .ov-ribbon.agent {
   white-space: normal; overflow-wrap: anywhere; color: var(--accent); border-left-color: var(--accent);
 }
@@ -203,6 +205,7 @@ input:focus { border-color: var(--accent); }
   padding: 2px 0;
 }
 .job .kind { color: var(--accent); }
+.job.attached .kind { color: var(--dim); padding-left: 0.6em; }
 .job .state { color: var(--ok); }
 .job[data-state="failed"] .state { color: var(--error); }
 .job .id { color: var(--dim); }

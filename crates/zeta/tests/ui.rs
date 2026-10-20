@@ -2,10 +2,12 @@
 //! headless Chromium) against a real `zeta serve` with the `tone`, `aprs`, `wfm` and `pocsag`
 //! fixtures (`wfm`: a 1 kHz tone, wideband FM with pilot, 240 kHz, 2 s looping, at 104.9 MHz;
 //! `pocsag`: one 1200-baud alphanumeric page `HELLO ZETA` to address 1234567, function 3, at
-//! 48 kHz, looping, at 148.6375 MHz); the
+//! 48 kHz, looping, at 148.6375 MHz) and `speech` fixtures (`speech`: 3 s of speech-like
+//! bursts and a 2 s pause, wideband FM with pilot, 240 kHz, looping, at 104.7 MHz); the
 //! node's state directory is passed to ui.py in `ZETA_UI_STATE_DIR`. That node has a fake
-//! `voiced` (`--stt-socket`) answering `ok:what sources are there` to every `file:` line; a
-//! second node without a speech daemon is passed in `ZETA_UI_URL_NOSTT`.
+//! `voiced` (`--stt-socket`, zeta-speech's `FakeDaemon`) answering `ok:what sources are there`
+//! to every valid staged WAV; a second node without a speech daemon, with only the `speech`
+//! fixture, is passed in `ZETA_UI_URL_NOSTT`.
 //!
 //! The run is killed and the test fails after 300 s of wall clock. `ZETA_UI_ONLY=a,b` runs only
 //! those scenarios.
@@ -16,13 +18,13 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixListener;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use common::ServeProc;
+use zeta_speech::testing::FakeDaemon;
 
 const SECRET: &str = "ui-secret-0123456789";
 /// What the fake speech daemon "hears" in every recording.
@@ -33,6 +35,18 @@ const SOCKET_PATH_MAX: usize = 100;
 /// The `wfm` fixture: its IQ rate and the rate of the tone it carries.
 const WFM_RATE: u32 = 240_000;
 const WFM_AUDIO_RATE: u32 = 48_000;
+/// The `speech` fixture's centre (it shares the `wfm` rates).
+const SPEECH_HZ: u64 = 104_700_000;
+
+/// The `speech` fixture in `dir`: 3 s of speech-like bursts then a 2 s pause (so the looping
+/// source gives the voice gate an end of speech), wideband FM with pilot. Its meta path.
+fn speech_fixture(dir: &Path) -> PathBuf {
+    let mut audio = zeta_dsp::fixtures::speech_like(WFM_AUDIO_RATE, 3.0);
+    audio.extend(std::iter::repeat_n(0.0, 2 * WFM_AUDIO_RATE as usize));
+    let iq =
+        zeta_dsp::fixtures::wfm_modulate(&audio, WFM_AUDIO_RATE, WFM_RATE, 75_000.0, 0.0, true);
+    zeta_dsp::fixtures::write_fixture(dir, "speech", &iq, WFM_RATE, SPEECH_HZ)
+}
 
 /// Peak |sample| a recording of the fake microphone's tone must exceed.
 const MIN_PEAK: i32 = 1000;
@@ -74,27 +88,20 @@ fn check_staged_wav(line: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A fake `voiced` at `path`: answers `ok:<SPOKEN>` to a `file:` line naming a valid staged
-/// WAV ([`check_staged_wav`]), `error:<reason>` otherwise. Lives as long as the test process.
-fn fake_voiced(path: &Path) {
-    let listener = UnixListener::bind(path).expect("bind fake voiced socket");
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(mut conn) = conn else { continue };
-            let Ok(reader) = conn.try_clone() else {
-                continue;
-            };
-            let mut line = String::new();
-            if BufReader::new(reader).read_line(&mut line).is_err() {
-                continue;
-            }
-            let answer = match check_staged_wav(&line) {
+/// A fake `voiced` at `path` (zeta-speech's [`FakeDaemon`]): answers `ok:<SPOKEN>` to a
+/// `file:` line naming a valid staged WAV ([`check_staged_wav`]), `error:<reason>` to any
+/// other `file:` line, and `error:unknown command` to `languages` (as `local-voice` does).
+/// Serves as long as the test process lives.
+fn fake_voiced(path: &Path) -> FakeDaemon {
+    FakeDaemon::start(path, |line| {
+        Some(match line.strip_prefix("file:") {
+            None => "error:unknown command\n".to_string(),
+            Some(_) => match check_staged_wav(line) {
                 Ok(()) => format!("ok:{SPOKEN}\n"),
                 Err(reason) => format!("error:{reason}\n"),
-            };
-            let _ = conn.write_all(answer.as_bytes());
-        }
-    });
+            },
+        })
+    })
 }
 
 /// A directory short enough to hold a Unix socket: the usual temp dir, else cargo's target tmp.
@@ -218,9 +225,10 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let iq = zeta_dsp::fixtures::pocsag_packet_iq(1_234_567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
     let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "pocsag", &iq, 48_000, 148_637_500);
     let pocsag = format!("pocsag={}", meta.display());
+    let speech = format!("speech={}", speech_fixture(dir.path()).display());
     let sock_dir = socket_dir();
     let sock = sock_dir.path().join("voiced.sock");
-    fake_voiced(&sock);
+    let _voiced = fake_voiced(&sock);
     let sock = sock.to_str().expect("socket path is UTF-8");
     let serve = ServeProc::start_full(
         dir.path(),
@@ -232,6 +240,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
             &wfm,
             "--source-file",
             &pocsag,
+            "--source-file",
+            &speech,
         ],
         &["--stt-socket", sock],
         &[],
@@ -239,10 +249,11 @@ fn ui_scenarios_pass_in_headless_chromium() {
     // No speech daemon: XDG_RUNTIME_DIR points where no voiced.sock is, so no default applies.
     let nostt_dir = tempfile::tempdir().unwrap();
     let runtime = nostt_dir.path().to_str().expect("tempdir is UTF-8");
+    let nostt_speech = format!("speech={}", speech_fixture(nostt_dir.path()).display());
     let nostt = ServeProc::start_env(
         nostt_dir.path(),
         SECRET,
-        &[],
+        &["--source-file", &nostt_speech],
         &[("XDG_RUNTIME_DIR", runtime)],
     );
     let mut cmd = Command::new("python3");

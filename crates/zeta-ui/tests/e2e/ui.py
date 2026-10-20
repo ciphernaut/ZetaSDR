@@ -7,9 +7,10 @@ Runs every `scenario_*` function (or only those named, comma-separated, with or 
 or `FAIL <name>: <reason>` (plus the browser console errors) and exits 1 on the first failure.
 Run by `cargo test -p zeta --test ui`, which starts the node with the `tone`, `aprs`, `wfm`
 (wideband FM, 1 kHz tone with pilot, 240 kHz at 104.9 MHz) and `pocsag` (a 1200-baud page
-`HELLO ZETA` to address 1234567, 48 kHz at 148.6375 MHz) fixtures and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
+`HELLO ZETA` to address 1234567, 48 kHz at 148.6375 MHz) and `speech` (speech-like bursts,
+wideband FM, 240 kHz at 104.7 MHz) fixtures and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
 state directory in ZETA_UI_STATE_DIR, and the URL of a second node started without a speech
-daemon in ZETA_UI_URL_NOSTT (for the "no daemon" scenario).
+daemon (with the `speech` source) in ZETA_UI_URL_NOSTT (for the "no daemon" scenarios).
 """
 
 import base64
@@ -109,7 +110,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (4 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (5 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -185,7 +186,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (4 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (5 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -210,7 +211,7 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    for source in ("tone", "aprs", "wfm"):
+    for source in ("tone", "aprs", "wfm", "speech"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -502,7 +503,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (4 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (5 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -1112,6 +1113,14 @@ def scenario_ssb_entry_tunes_the_dial(page, url, secret):
             stop_job(url, secret, j["id"])
 
 
+TRANSCRIBE_ENTRIES = [
+    ("wfm_transcribe", "Transcribe › FM broadcast"),
+    ("fm_transcribe", "Transcribe › NBFM voice"),
+    ("am_transcribe", "Transcribe › AM"),
+    ("ssb_usb_transcribe", "Transcribe › SSB (USB)"),
+    ("ssb_lsb_transcribe", "Transcribe › SSB (LSB)"),
+]
+
 NEW_DECODE_ENTRIES = [
     ("pocsag_decode", "Decode › POCSAG"),
     ("rds_decode", "Decode › RDS (FM station data)"),
@@ -1228,9 +1237,152 @@ def scenario_what_is_this_names_fm_broadcast(page, url, secret):
         page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "wfm.png"))
 
 
-# ---- voice (Task 11) -----------------------------------------------------------------------
+# ---- transcription (speech Task 7) -------------------------------------------------------
+# The `speech` source: speech-like bursts, wideband FM, 240 kHz at 104.7 MHz, looping with a
+# 2 s pause. The fake daemon hears SPOKEN in every segment.
 
 SPOKEN = "what sources are there"
+SPEECH_HZ = 104_700_000
+TRANSCRIPT_WITHIN_MS = 20_000
+
+
+def attached_jobs(url, secret, demod):
+    return [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            if j.get("input") == demod]
+
+
+def wait_attached(url, secret, demod, within_s=10.0):
+    """The one job attached to `demod`, once job_list shows it."""
+    deadline = time.monotonic() + within_s
+    while True:
+        got = attached_jobs(url, secret, demod)
+        if got or time.monotonic() > deadline:
+            assert len(got) == 1, f"jobs attached to {demod}: {got}"
+            return got[0]
+        time.sleep(0.2)
+
+
+def assert_attached_row(page, demod, attached):
+    """The attached job's row reads `↳ transcribe`, sits right under its input's row and
+    has no play (or Transcribe) button."""
+    row = job_row(page, attached)
+    expect(row).to_have_class(re.compile(r"\battached\b"))
+    expect(row.locator(".kind")).to_have_text("↳ transcribe")
+    expect(row.locator("button.play")).to_have_count(0)
+    expect(row.locator("button.transcribe")).to_have_count(0)
+    under = page.evaluate(
+        """(id) => { const r = document.querySelector(`#jobs .job[data-id="${id}"]`);
+                     const p = r && r.previousElementSibling;
+                     return p ? p.dataset.id : null; }""", attached)
+    assert under == demod, f"attached row under {under!r}, want its input {demod!r}"
+    return row
+
+
+def scenario_transcript_ribbon_appears(page, url, secret):
+    select_source(page, url, secret, "speech")
+    page.wait_for_function("() => window.zetaTest.wf().painted > 55", timeout=15_000)
+    menu = drag_menu(page, 0.10, 0.90)
+    items = menu.locator(".ctx-item").evaluate_all(
+        "els => els.map(e => [e.dataset.action, e.textContent])")
+    for entry in TRANSCRIBE_ENTRIES:
+        assert list(entry) in items, f"{entry} not in the menu: {items}"
+    page.click('#ctx .ctx-item[data-action="wfm_transcribe"]')
+    clicked = time.monotonic()
+    expect(menu).to_be_hidden()
+    demod = None
+    attached = None
+    try:
+        expect(page.locator("#transcript .line.op",
+                            has_text=re.compile(r"^job_start kind=wfm_demod source=speech .*"
+                                                r"deviation_hz=75000 → job ")).first).to_be_visible()
+        demods = [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+                  if j["kind"] == "wfm_demod" and j["source"] == "speech"
+                  and j["state"]["status"] == "running"]
+        assert len(demods) == 1, f"wfm_demod jobs on speech: {demods}"
+        demod = demods[0]["id"]
+        job = wait_attached(url, secret, demod)
+        attached = job["id"]
+        assert job["kind"] == "transcribe", f"attached job {job}"
+        assert job["tuning"] == demods[0]["tuning"], f"tuning {job['tuning']} vs {demods[0]}"
+        expect(page.locator("#transcript .line.op",
+                            has_text=re.compile(r"^job_attach kind=transcribe job=" + demod
+                                                + r" .*→ job ")).first).to_be_visible()
+        assert_attached_row(page, demod, attached)
+        ribbon = page.locator("#waterfall .ov-ribbon.transcript", has_text=SPOKEN)
+        left_ms = max(1, int(TRANSCRIPT_WITHIN_MS - (time.monotonic() - clicked) * 1000))
+        expect(ribbon.first).to_be_visible(timeout=left_ms)
+        title = ribbon.first.get_attribute("title") or ""
+        assert re.search(r"\ben\b", title) and re.search(r"\d+ ms", title), \
+            f"ribbon title {title!r} lacks language and duration"
+        # The vad transitions are counted in the attached row, never drawn: the count runs
+        # ahead of the transcripts (an onset before each), and no ribbon carries one.
+        page.wait_for_function(
+            """(id) => {
+              const e = document.querySelector(`#jobs .job[data-id="${id}"] .events`);
+              const shown = document.querySelectorAll('#waterfall .ov-ribbon.transcript').length;
+              return !!e && parseInt(e.textContent, 10) > shown;
+            }""", arg=attached, timeout=5_000)
+        expect(page.locator("#waterfall .ov-ribbon", has_text='"vad"')).to_have_count(0)
+        if os.environ.get("ZETA_UI_SHOTS"):
+            page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "transcript.png"))
+        # Stopping the demodulator ends the attached job: both rows go.
+        job_row(page, demod).locator("button.stop").click()
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f'#jobs .job[data-id="{demod}"]')).to_have_count(0)
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f'#jobs .job[data-id="{attached}"]')).to_have_count(0)
+    finally:
+        for j in (attached, demod):
+            if j:
+                stop_job(url, secret, j)
+
+
+def scenario_job_row_transcribe_button(page, url, secret):
+    select_source(page, url, secret, "speech")
+    demod = start_job(url, secret, "wfm_demod", "speech", SPEECH_HZ, 200_000,
+                      deviation_hz=75_000)
+    attached = None
+    try:
+        row = job_row(page, demod)
+        button = row.locator("button.transcribe")
+        expect(button).to_have_text("Transcribe")
+        button.click()
+        attached = wait_attached(url, secret, demod)["id"]
+        assert_attached_row(page, demod, attached)
+        expect(page.locator("#transcript .line.op",
+                            has_text=re.compile(r"^job_attach kind=transcribe job=" + demod
+                                                + r" .*→ job ")).first).to_be_visible()
+    finally:
+        for j in (attached, demod):
+            if j:
+                stop_job(url, secret, j)
+
+
+def scenario_transcribe_without_backend_fails_visibly(page, url, secret):
+    nostt = os.environ.get("ZETA_UI_URL_NOSTT")
+    assert nostt, "ZETA_UI_URL_NOSTT (a node without --stt-socket) is not set"
+    nostt = nostt.rstrip("/")
+    page.set_viewport_size(WIDE)
+    login(page, nostt, secret)
+    page.click('.src-tab[data-id="speech"]')
+    demod = start_job(nostt, secret, "wfm_demod", "speech", SPEECH_HZ, 200_000,
+                      deviation_hz=75_000)
+    attached = None
+    try:
+        job_row(page, demod).locator("button.transcribe").click()
+        attached = wait_attached(nostt, secret, demod)["id"]
+        page.evaluate("window.zetaTest.poll()")
+        row = page.locator(f'#jobs .job[data-id="{attached}"]')
+        expect(row.locator(".state")).to_have_text("failed")
+        expect(row).to_have_attribute("title", re.compile("speech backend"))
+        expect(row.locator(".kind")).to_have_text("↳ transcribe")
+    finally:
+        for j in (attached, demod):
+            if j:
+                stop_job(nostt, secret, j)
+
+
+# ---- voice (Task 11) -----------------------------------------------------------------------
 
 
 def record_and_stop(page, hold_ms):

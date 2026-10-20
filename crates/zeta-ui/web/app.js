@@ -28,7 +28,9 @@
 //
 // Job rows: ▶ on a row of an audio kind (agent.js AUDIO_KINDS) plays its audio (audio.js; one
 // job at a time, ■ stops it, and it stops when the job leaves the running list or the secret
-// is rejected); `graph` opens the job's graph view (graph.js).
+// is rejected); Transcribe on a running one applies `job_attach {kind: "transcribe", job,
+// language: null}` through the command-line op path (its outcome, an error too, reaches the
+// transcript); `graph` opens the job's graph view (graph.js).
 //
 // The mic button (#mic, voice.js) is mounted at login: its transcript is put in the command
 // line and submitted as if typed (so free text goes to /ask); #mic-status beside it shows
@@ -263,6 +265,11 @@ async function applyOp(op) {
   return result;
 }
 
+// The op attaching a transcription to job `id` (the language left to the backend).
+function attachOp(id) {
+  return { op: "job_attach", kind: "transcribe", job: id, language: null };
+}
+
 // Sends `text` to /ask and shows the answer (or the error, e.g. no LLM configured).
 async function askAgent(text) {
   const t = state.transcript;
@@ -341,6 +348,7 @@ function start(api) {
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
     applyOp,
+    attachOp,
     ask: askAgent,
     transcript: state.transcript,
     ov: state.ov,
@@ -355,6 +363,7 @@ function start(api) {
       stopAudioUnlessRunning(jobs);
     },
     onPlay: toggleAudio,
+    onTranscribe: (job) => applyOp(attachOp(job.id)),
     onGraph: (job) => showGraph(api, job.id),
     playing: (id) => !!state.audio && state.audio.jobId === id,
   });

@@ -3,10 +3,12 @@
 // or asks the agent.
 //
 // Exports:
-//   mountMenu(wf, {applyOp, ask, transcript, ov}) -> Menu
+//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov}) -> Menu
 //       Opens #ctx at the pointer after each wf.onSelect. `applyOp(op) -> Promise<result|null>`
 //       is app.js's command-line op path (shows its outcome per ruling R6; null when it
-//       failed, the failure already reported); `ask(text)` is its /ask path.
+//       failed, the failure already reported); `attachOp(jobId)` the `job_attach` op that
+//       transcribes a job (as the job rows' Transcribe button applies it); `ask(text)` is
+//       its /ask path.
 //   Menu:
 //     menu.open(sel, x, y)  shows the menu for a waterfall selection at client (x, y)
 //     menu.close()          hides it and erases the selection rectangle
@@ -40,6 +42,11 @@
 //                                             dial: center_hz = selection centre − 1500,
 //                                             bandwidth_hz 6000 (ruling R6)
 //   ssb_lsb    Decode › SSB (LSB)             likewise, sideband lsb, centre + 1500
+//   wfm_transcribe  Transcribe › FM broadcast  the job_start of its Decode twin (wfm_demod,
+//   fm_transcribe   Transcribe › NBFM voice    fm_demod, am_demod, ssb_usb, ssb_lsb: same
+//   am_transcribe   Transcribe › AM            kind, deviation, sideband and tuning), then on
+//   ssb_usb_transcribe  Transcribe › SSB (USB) success attachOp(<its job>): a transcribe job
+//   ssb_lsb_transcribe  Transcribe › SSB (LSB) attached to that demodulator
 //   measure    Start background job › measure job_start kind=measure, deviation_hz null
 //                                             (every job_start sends sideband: null unless SSB)
 //   scan       Scan this span                 wf.release() (stops the page's own spectrum job
@@ -55,9 +62,9 @@
 // SSB entries their dial frequency and SSB_BANDWIDTH_HZ instead; FM broadcast and RDS widen
 // the bandwidth, ADS-B replaces it, see jobTuning).
 // #ctx-footer shows the selection in the vocabulary: center_hz=… bandwidth_hz=… start_ns=…
-// end_ns=…, with the span already clamped (see below); while an SSB entry is focused or
-// hovered it shows that entry's dial instead: center_hz=<dial> bandwidth_hz=6000
-// sideband=usb|lsb start_ns=… end_ns=….
+// end_ns=…, with the span already clamped (see below); while an SSB entry (Decode or
+// Transcribe) is focused or hovered it shows that entry's dial instead: center_hz=<dial>
+// bandwidth_hz=6000 sideband=usb|lsb start_ns=… end_ns=….
 //
 // Span: the node reads the selection from the source ring, which keeps RING_HISTORY_S. The
 // span is clamped to the newest SPAN_LIMIT_NS before the newest painted column (on opening
@@ -100,6 +107,11 @@ const ENTRIES = [
   ["am_demod", "Decode › AM"],
   ["ssb_usb", "Decode › SSB (USB)"],
   ["ssb_lsb", "Decode › SSB (LSB)"],
+  ["wfm_transcribe", "Transcribe › FM broadcast"],
+  ["fm_transcribe", "Transcribe › NBFM voice"],
+  ["am_transcribe", "Transcribe › AM"],
+  ["ssb_usb_transcribe", "Transcribe › SSB (USB)"],
+  ["ssb_lsb_transcribe", "Transcribe › SSB (LSB)"],
   ["measure", "Start background job › measure"],
   ["scan", "Scan this span"],
   ["iq_read", "Save selection as SigMF"],
@@ -119,12 +131,24 @@ const JOBS = {
   ssb_lsb: { kind: "ssb_demod", deviation: null, sideband: "lsb" },
   measure: { kind: "measure", deviation: null, sideband: null },
 };
+// Each Transcribe entry's Decode twin: the job it starts before attaching to it.
+const TRANSCRIBE = {
+  wfm_transcribe: "wfm_demod",
+  fm_transcribe: "fm_demod",
+  am_transcribe: "am_demod",
+  ssb_usb_transcribe: "ssb_usb",
+  ssb_lsb_transcribe: "ssb_lsb",
+};
+// The JOBS entry an action starts (a Transcribe entry's twin's), or undefined.
+const jobOf = (action) => JOBS[TRANSCRIBE[action] ?? action];
 
 // The tuning a job entry uses for a selection: {centerHz, bandwidthHz}. SSB tunes the dial; FM
 // broadcast and RDS widen the band to at least WFM_MIN_BANDWIDTH_HZ, POCSAG to at least
 // POCSAG_MIN_BANDWIDTH_HZ and ACARS to at least ACARS_MIN_BANDWIDTH_HZ; ADS-B always asks for
-// ADSB_BANDWIDTH_HZ; everything else uses the selection as is.
+// ADSB_BANDWIDTH_HZ; everything else uses the selection as is. A Transcribe entry tunes as
+// its Decode twin.
 export function jobTuning(action, s) {
+  action = TRANSCRIBE[action] ?? action;
   const sb = JOBS[action] ? JOBS[action].sideband : null;
   if (sb === "usb") return { centerHz: s.centerHz - SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
   if (sb === "lsb") return { centerHz: s.centerHz + SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
@@ -166,9 +190,10 @@ export function clampSpan(startNs, endNs, newest) {
 }
 
 class Menu {
-  constructor(wf, { applyOp, ask, transcript, ov }) {
+  constructor(wf, { applyOp, attachOp, ask, transcript, ov }) {
     this.wf = wf;
     this.applyOp = applyOp;
+    this.attachOp = attachOp;
     this.ask = ask;
     this.t = transcript;
     this.ov = ov;
@@ -187,7 +212,7 @@ class Menu {
       item.setAttribute("role", "menuitem");
       item.textContent = text;
       item.addEventListener("click", () => this.choose(action));
-      if (JOBS[action] && JOBS[action].sideband) {
+      if (jobOf(action) && jobOf(action).sideband) {
         const show = () => this.sel && this.showFooter(this.current(), action);
         const hide = () => this.sel && this.showFooter(this.current());
         item.addEventListener("focus", show);
@@ -238,7 +263,7 @@ class Menu {
   // The selection, or with an SSB `action` the dial that entry tunes.
   showFooter(s, action = null) {
     const t = jobTuning(action, s);
-    const sb = action && JOBS[action] ? JOBS[action].sideband : null;
+    const sb = action && jobOf(action) ? jobOf(action).sideband : null;
     this.footer.textContent =
       `center_hz=${t.centerHz} bandwidth_hz=${t.bandwidthHz} ` +
       (sb ? `sideband=${sb} ` : "") +
@@ -291,19 +316,27 @@ class Menu {
       );
     } else if (action === "scan") {
       await this.scan(s);
-    } else if (action in JOBS) {
-      const job = JOBS[action];
-      const t = jobTuning(action, s);
-      await this.applyOp({
-        op: "job_start",
-        kind: job.kind,
-        source: s.sourceId,
-        center_hz: t.centerHz,
-        bandwidth_hz: t.bandwidthHz,
-        deviation_hz: job.deviation,
-        sideband: job.sideband,
-      });
+    } else if (jobOf(action)) {
+      const r = await this.startJob(action, s);
+      if (action in TRANSCRIBE && r && r.result === "job" && r.value) {
+        await this.applyOp(this.attachOp(r.value));
+      }
     }
+  }
+
+  // The job_start of a job entry (a Transcribe entry: its Decode twin's); its result or null.
+  startJob(action, s) {
+    const job = jobOf(action);
+    const t = jobTuning(action, s);
+    return this.applyOp({
+      op: "job_start",
+      kind: job.kind,
+      source: s.sourceId,
+      center_hz: t.centerHz,
+      bandwidth_hz: t.bandwidthHz,
+      deviation_hz: job.deviation,
+      sideband: job.sideband,
+    });
   }
 
   // A scan time-shares the radio, so it cannot start while the waterfall's own spectrum job

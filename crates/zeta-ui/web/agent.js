@@ -28,13 +28,17 @@
 //   startOpsFeed(api, transcript) -> {close}
 //       Finds the `ops` stream (the GET /streams entry whose provenance.source is "node")
 //       and appends one line per frame; reconnects and re-resolves the id when it drops.
-//   startJobs(api, el, transcript, {onJobs, onPlay, onGraph, playing}) -> {close, refresh,
-//                                                                         redraw}
+//   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing})
+//                                                       -> {close, refresh, redraw}
 //       Polls `job_list` every 2 s and renders the jobs that are not stopped: kind, source,
 //       state, id, an `.events` cell (filled by overlays.js: a count, or `—` over its
 //       watch cap), on rows of an AUDIO_KINDS kind a
-//       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job), a
+//       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job) and, while
+//       running, a `button.transcribe` (Transcribe) calling onTranscribe(job) (ruling R14), a
 //       `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
+//       An attached job (one with an `input` job) is a `.job.attached` row placed right
+//       under its input's row, its kind shown as `↳ <kind>`, with neither of the audio
+//       buttons. A job's `state.reason` (a failure) is the row's tooltip.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 
@@ -238,14 +242,15 @@ export function startOpsFeed(api, transcript) {
   };
 }
 
-function jobRow(job, onStop, { onPlay, onGraph, playing }) {
+function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing }) {
   const row = document.createElement("div");
-  row.className = "job";
+  const attached = !!job.input;
+  row.className = attached ? "job attached" : "job";
   row.dataset.id = job.id;
   const status = job.state && job.state.status ? job.state.status : "?";
   row.dataset.state = status;
   const cells = [
-    ["kind", job.kind],
+    ["kind", attached ? `↳ ${job.kind}` : job.kind],
     ["source", job.source],
     ["state", status],
     ["id", job.id.slice(-6)],
@@ -260,7 +265,8 @@ function jobRow(job, onStop, { onPlay, onGraph, playing }) {
   if (job.state && job.state.reason) row.title = job.state.reason;
   const actions = document.createElement("span");
   actions.className = "actions";
-  if (AUDIO_KINDS.includes(job.kind) && onPlay) {
+  const audio = !attached && AUDIO_KINDS.includes(job.kind);
+  if (audio && onPlay) {
     const on = playing ? playing(job.id) : false;
     const play = document.createElement("button");
     play.className = "play";
@@ -269,6 +275,14 @@ function jobRow(job, onStop, { onPlay, onGraph, playing }) {
     play.setAttribute("aria-pressed", String(on));
     play.onclick = () => onPlay(job);
     actions.append(play);
+  }
+  if (audio && onTranscribe && status === "running") {
+    const tr = document.createElement("button");
+    tr.className = "transcribe";
+    tr.textContent = "Transcribe";
+    tr.title = `job_attach kind=transcribe job=${job.id}`;
+    tr.onclick = () => onTranscribe(job);
+    actions.append(tr);
   }
   if (onGraph) {
     const graph = document.createElement("button");
@@ -288,19 +302,31 @@ function jobRow(job, onStop, { onPlay, onGraph, playing }) {
   return row;
 }
 
+// `jobs` with each attached job moved right after its input (in list order); one whose input
+// is not in `jobs` keeps its place.
+function underInputs(jobs) {
+  const ids = new Set(jobs.map((j) => j.id));
+  const out = [];
+  for (const j of jobs) {
+    if (j.input && ids.has(j.input)) continue;
+    out.push(j, ...jobs.filter((a) => a.input === j.id));
+  }
+  return out;
+}
+
 export function startJobs(
   api,
   el,
   transcript,
-  { onJobs = null, onPlay = null, onGraph = null, playing = null } = {},
+  { onJobs = null, onPlay = null, onTranscribe = null, onGraph = null, playing = null } = {},
 ) {
   let timer = null;
   let stopped = false;
   let last = null;
-  const buttons = { onPlay, onGraph, playing };
+  const buttons = { onPlay, onTranscribe, onGraph, playing };
   const render = (jobs) => {
     last = jobs;
-    const shown = jobs.filter((j) => !(j.state && j.state.status === "stopped"));
+    const shown = underInputs(jobs.filter((j) => !(j.state && j.state.status === "stopped")));
     el.replaceChildren(
       ...shown.map((j) =>
         jobRow(j, async (id, button) => {
