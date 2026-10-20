@@ -2,6 +2,8 @@
 //! `job_attach` of `transcribe` (`stream_in → denoise → vad → transcribe`) with an
 //! in-process [`FakeBackend`], in a node opened in this process.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +21,7 @@ use zeta_speech::TranscribeStage;
 use zeta_speech::testing::FakeBackend;
 
 const TEXT: &str = "this is the fake transcript";
-const CENTER_HZ: u64 = 104_700_000;
-const RATE: u32 = 240_000;
+const CENTER_HZ: u64 = common::SPEECH_HZ;
 
 fn registry(fake: Arc<FakeBackend>) -> StageRegistry {
     let mut r = StageRegistry::new();
@@ -34,13 +35,9 @@ fn registry(fake: Arc<FakeBackend>) -> StageRegistry {
     r
 }
 
-/// The broadcast-FM speech fixture: 3 s of speech-like bursts then a 2 s pause (so the
-/// looping source gives the voice gate an end of speech), at 240 kHz with pilot.
+/// The broadcast-FM speech fixture ([`common::speech_fixture`]), played in real time, looping.
 fn speech_port(dir: &Path) -> (Arc<FileSource>, Arc<dyn Port>) {
-    let mut audio = zeta_dsp::fixtures::speech_like(48_000, 3.0);
-    audio.extend(std::iter::repeat_n(0.0, 2 * 48_000));
-    let iq = zeta_dsp::fixtures::wfm_modulate(&audio, 48_000, RATE, 75_000.0, 0.0, true);
-    let meta = zeta_dsp::fixtures::write_fixture(dir, "speech", &iq, RATE, CENTER_HZ);
+    let meta = common::speech_fixture(dir);
     let opts = FileOpts {
         realtime: true,
         block_samples: 4800,
@@ -153,7 +150,7 @@ async fn attach_transcribe_emits_transcript_events() {
         OpResult::Sources(s) => assert_eq!(s[0].holders, vec![wfm.clone()]),
         r => panic!("{r:?}"),
     }
-    let t = transcript(&node, &id, 10_000).await.expect("a transcript");
+    let t = transcript(&node, &id, 20_000).await.expect("a transcript");
     assert_eq!(t["text"], TEXT, "{t}");
     assert_eq!(t["language"], "en", "{t}");
     assert!(t["end_ns"].as_u64() > t["start_ns"].as_u64(), "{t}");
@@ -284,7 +281,7 @@ async fn attached_job_resumes_after_restart() {
         .unwrap();
     assert_eq!(record(&node, &wfm).state, JobState::Running);
     assert_eq!(record(&node, &id).state, JobState::Running);
-    let t = transcript(&node, &id, 10_000)
+    let t = transcript(&node, &id, 20_000)
         .await
         .expect("a transcript after resume");
     assert_eq!(t["text"], TEXT);

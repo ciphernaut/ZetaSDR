@@ -20,9 +20,10 @@ const FRAME_MS: u64 = 20;
 /// is eventually absorbed into the floor.
 const FLOOR_RISE_DB: f32 = 0.5;
 /// Digital silence: a frame with mean square below this (-80 dB) is quiet for
-/// the gate and neither seeds nor lowers the noise floor, so a squelch gap of
-/// exact zeros cannot pull the floor under the channel noise that follows it.
+/// the gate and lowers the noise floor to [`SILENCE_DB`], never more.
 const SILENCE_MEAN_SQUARE: f64 = 1e-8;
+/// The noise floor's minimum, dB (the level of [`SILENCE_MEAN_SQUARE`]).
+const SILENCE_DB: f32 = -80.0;
 
 fn d6() -> f32 {
     6.0
@@ -63,8 +64,16 @@ pub struct Segment {
 /// frame, not at the declaration. `feed` returns segments tiling the samples
 /// released so far, in order; `flush` releases what is still held. A run
 /// lasts from the first loud frame to `hangover_ms` after the last, so
-/// utterances closer together than the hangover merge into one run. The first
-/// non-silent frame seeds the noise floor, so a stream should open on noise.
+/// utterances closer together than the hangover merge into one run.
+///
+/// The noise floor follows frame energy down at once and up by 0.5 dB a frame;
+/// the first frame seeds it. A frame of digital silence (under -80 dB) is
+/// quiet and lowers the floor to -80 dB, its minimum, but never raises it, so a
+/// stream that opens (or restarts) inside speech is heard from its first gap
+/// on. The trade-off is squelch: after a gap of exact zeros, channel noise at
+/// -50 dB stands (noise + 80 - threshold) / 0.5 = 48 frames, about 1 s, over
+/// the floor and is forwarded as speech, plus the hangover, until the floor
+/// re-adapts.
 pub struct Vad {
     channels: usize,
     frame_len: usize,
@@ -130,11 +139,26 @@ impl Vad {
         self.release(0)
     }
 
+    /// The input skipped ahead (a lag): drop the held samples, the open frame
+    /// and the run or onset in progress, so the next sample starts a fresh
+    /// frame outside speech. The noise floor is kept.
+    pub fn skip(&mut self) {
+        self.acc = 0.0;
+        self.acc_n = 0;
+        self.speech = false;
+        self.loud_run = 0;
+        self.quiet_run = 0;
+        self.held.clear();
+        self.held_n = 0;
+    }
+
     fn end_frame(&mut self) {
         let mean_square = self.acc / self.acc_n as f64;
         self.acc = 0.0;
         self.acc_n = 0;
         let loud = if mean_square < SILENCE_MEAN_SQUARE {
+            // Quiet; down to the minimum, never up.
+            self.floor_db = Some(self.floor_db.map_or(SILENCE_DB, |f| f.min(SILENCE_DB)));
             false
         } else {
             let db = (10.0 * mean_square.log10()) as f32;
@@ -277,20 +301,7 @@ impl State {
         for seg in segs {
             let start = frame_span(self.pending_t0, offset, rate).end_ns;
             if seg.speech != self.speaking {
-                self.speaking = seg.speech;
-                if let Some(ev) = &self.event_out {
-                    let mut prov = base.clone();
-                    prov.span = frame_span(start, 0, rate);
-                    out.push(Frame::new(
-                        ev.clone(),
-                        prov,
-                        Payload::Event(serde_json::json!({
-                            "protocol": "vad",
-                            "speech": seg.speech,
-                            "t_ns": start.0,
-                        })),
-                    ));
-                }
+                out.extend(self.transition(&base, seg.speech, start, rate));
             }
             if seg.speech {
                 let mut prov = base.clone();
@@ -309,6 +320,51 @@ impl State {
         }
         self.pending_t0 = frame_span(self.pending_t0, offset, rate).end_ns;
         self.pending.drain(..offset * width);
+        out
+    }
+
+    /// Announce `speech` at `at`: records it and returns its event, if the
+    /// stage has an event output.
+    fn transition(
+        &mut self,
+        base: &Provenance,
+        speech: bool,
+        at: Timestamp,
+        rate: u64,
+    ) -> Option<Frame> {
+        self.speaking = speech;
+        let ev = self.event_out.as_ref()?;
+        let mut prov = base.clone();
+        prov.span = frame_span(at, 0, rate);
+        Some(Frame::new(
+            ev.clone(),
+            prov,
+            Payload::Event(serde_json::json!({
+                "protocol": "vad",
+                "speech": speech,
+                "t_ns": at.0,
+            })),
+        ))
+    }
+
+    /// The input lagged and frames were lost. The detector keeps its noise
+    /// floor (reseeding from whatever follows could seed it at speech level);
+    /// the run or onset in progress, the look-back it held and the matching
+    /// `pending` samples are dropped. A run already announced is closed with one
+    /// `speech: false` where its forwarded audio stopped (the start of the
+    /// dropped look-back), so the next run opens with a fresh `speech: true`.
+    fn lagged(&mut self) -> Vec<Frame> {
+        let mut out = Vec::new();
+        if let Some((rate, _, vad)) = &mut self.run {
+            let rate = *rate;
+            vad.skip();
+            if self.speaking
+                && let Some(base) = self.prov.clone()
+            {
+                out.extend(self.transition(&base, false, self.pending_t0, rate));
+            }
+        }
+        self.pending.clear();
         out
     }
 
@@ -401,11 +457,7 @@ impl Stage for VadStage {
             let mut st = st.lock().expect("vad state");
             match input {
                 Input::Frame(f) => st.process(&f, &params),
-                Input::Lagged { .. } => {
-                    st.run = None;
-                    st.pending.clear();
-                    Ok(Vec::new())
-                }
+                Input::Lagged { .. } => Ok(st.lagged()),
             }
         })
         .await?;
@@ -524,15 +576,95 @@ mod tests {
         assert!(segments(rate, 1, &n).iter().all(|s| !s.speech));
     }
 
+    /// Speech runs of `segs` as (start, end) sample positions.
+    fn runs(segs: &[Segment]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        for s in segs {
+            if s.speech {
+                out.push((pos, pos + s.frames));
+            }
+            pos += s.frames;
+        }
+        out
+    }
+
     #[test]
-    fn digital_silence_gap_does_not_lower_the_floor() {
+    fn digital_silence_gap_recovers_within_a_second() {
         let rate = 48_000usize;
+        let frame = rate / 50;
         // Channel noise at about -50 dB, a second of exact zeros, the noise again.
         let mut x = vec![0.0f32; 3 * rate];
         awgn_real(&mut x, 50.0, 11);
         x[rate..2 * rate].fill(0.0);
         let segs = segments(rate as u32, 1, &x);
-        assert!(segs.iter().all(|s| !s.speech), "{segs:?}");
+        // No speech before the gap. The gap lowers the floor to -80 dB, so the
+        // returning noise is forwarded as one run from the gap's end until the
+        // floor has climbed back within the threshold, (-50 + 80 - 6) / 0.5 = 48
+        // frames, plus the 300 ms hangover; then nothing.
+        let r = runs(&segs);
+        assert_eq!(r.len(), 1, "{segs:?}");
+        let (on, off) = r[0];
+        assert!(
+            on.abs_diff(2 * rate) <= frame,
+            "run starts at {on}: {segs:?}"
+        );
+        let bound = 2 * rate + 48 * frame + rate * 300 / 1000 + frame;
+        assert!(off <= bound, "run ends at {off}, after {bound}: {segs:?}");
+    }
+
+    /// The clean fixture (exact-zero gaps) from 150 ms inside its first burst,
+    /// optionally with -50 dB noise in place of the zero gaps; and its burst
+    /// count (the partial first burst and nine whole ones).
+    fn mid_burst(rate: u32, noisy_gaps: bool) -> (Vec<f32>, usize) {
+        let mut x = speech_like(rate, 6.0);
+        if noisy_gaps {
+            let mut noise = vec![0.0f32; x.len()];
+            awgn_real(&mut noise, 50.0, 13);
+            let period = rate as usize * 600 / 1000;
+            let burst = rate as usize * 300 / 1000;
+            for (i, s) in x.iter_mut().enumerate() {
+                if i % period >= burst {
+                    *s = noise[i];
+                }
+            }
+        }
+        (x.split_off(rate as usize * 150 / 1000), 10)
+    }
+
+    fn assert_recovers_from_mid_burst(noisy_gaps: bool) {
+        let rate = 48_000u32;
+        let (x, bursts) = mid_burst(rate, noisy_gaps);
+        // The 200 ms hangover keeps runs apart across the 300 ms gaps, which the
+        // 150 ms offset leaves straddling frame boundaries.
+        let segs = segments_with(&short_hangover(), rate, 1, &x);
+        assert_eq!(segs.iter().map(|s| s.frames).sum::<usize>(), x.len());
+        let r = runs(&segs);
+        assert!(r.len() >= bursts - 1, "{} runs: {segs:?}", r.len());
+        // The second burst starts 150 ms (rest of the first) + 300 ms (gap) in.
+        let second = rate as usize * 450 / 1000;
+        let frame = rate as usize / 50;
+        assert!(
+            r[0].0.abs_diff(second) <= frame,
+            "first run at {}: {segs:?}",
+            r[0].0
+        );
+    }
+
+    #[test]
+    fn mid_burst_start_recovers_after_first_gap() {
+        // The first frame seeds the floor at speech level; the first zero gap
+        // lowers it to the -80 dB minimum. Like the other burst-counting vad
+        // tests this uses the 200 ms hangover: with the default 300 ms the
+        // offset gaps hold only 14 whole quiet frames and every run merges.
+        assert_recovers_from_mid_burst(false);
+    }
+
+    #[test]
+    fn mid_burst_start_with_noisy_gaps_recovers_after_first_gap() {
+        // The floor follows the first quiet frame down. The 200 ms hangover, as
+        // in the other burst-counting vad tests, keeps the runs apart.
+        assert_recovers_from_mid_burst(true);
     }
 
     #[test]

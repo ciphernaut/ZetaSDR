@@ -156,6 +156,186 @@ async fn gates_audio_and_emits_transitions() {
     assert!(forwarded.abs_diff(6 * 24_000) <= 6 * 2 * 960, "{forwarded}");
 }
 
+/// 100 ms of 48 kHz mono: one input frame.
+const CHUNK: usize = 4_800;
+const FRAME_NS: u64 = 20_000_000;
+
+/// Speech transitions (speech, t_ns) and forwarded audio spans (start, end).
+type Outputs = (Vec<(bool, u64)>, Vec<(u64, u64)>);
+
+fn drain(rx_a: &mut broadcast::Receiver<Frame>, rx_e: &mut broadcast::Receiver<Frame>) -> Outputs {
+    let mut events = Vec::new();
+    while let Ok(f) = rx_e.try_recv() {
+        let Payload::Event(v) = f.payload else {
+            panic!("expected event")
+        };
+        events.push((v["speech"].as_bool().unwrap(), v["t_ns"].as_u64().unwrap()));
+    }
+    let mut audio = Vec::new();
+    while let Ok(f) = rx_a.try_recv() {
+        let span = f.provenance.span;
+        audio.push((span.start_ns.0, span.end_ns.0));
+    }
+    (events, audio)
+}
+
+/// About -50 dB of white noise.
+fn noise(n: usize, seed: u64) -> Vec<f32> {
+    let mut x = vec![0.0; n];
+    awgn_real(&mut x, 50.0, seed);
+    x
+}
+
+/// `x` plus -50 dB noise.
+fn noisy(mut x: Vec<f32>, seed: u64) -> Vec<f32> {
+    let n = noise(x.len(), seed);
+    for (s, n) in x.iter_mut().zip(n) {
+        *s += n;
+    }
+    x
+}
+
+/// Send `x` as 100 ms mono frames, numbering them from `*i`.
+fn send(tx: &broadcast::Sender<Frame>, x: &[f32], i: &mut u64) {
+    for c in x.chunks(CHUNK) {
+        tx.send(audio(c.to_vec(), 48_000, 1, T_BASE + *i * 100_000_000))
+            .unwrap();
+        *i += 1;
+    }
+}
+
+/// Wait until the stage has taken every queued frame.
+async fn drained(tx: &broadcast::Sender<Frame>) {
+    while !tx.is_empty() {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Input queue depth of the lag runs, in frames.
+const LAG_CAP: usize = 16;
+
+/// Run the stage (200 ms hangover) on `before`, then two frames it never sees
+/// (it lags), then `after` (exactly the queue depth, so only the two are lost),
+/// then `tail`. Also returns the t0 of `after`'s first frame.
+async fn run_with_lag(before: &[f32], after: &[f32], tail: &[f32]) -> (Outputs, u64) {
+    assert!(before.len() <= LAG_CAP * CHUNK && tail.len() <= LAG_CAP * CHUNK);
+    assert_eq!(after.len(), LAG_CAP * CHUNK);
+    let bus = Arc::new(StreamBus::new(256));
+    let a_out = bus.register(StreamKind::Audio, prov(0));
+    let e_out = bus.register(StreamKind::Event, prov(0));
+    let mut rx_a = bus.subscribe(&a_out).unwrap();
+    let mut rx_e = bus.subscribe(&e_out).unwrap();
+    let (tx, rx_in) = broadcast::channel(LAG_CAP);
+    let h = spawn_with(
+        serde_json::json!({"hangover_ms": 200}),
+        bus,
+        rx_in,
+        vec![a_out, e_out],
+    );
+    let mut i = 0;
+    send(&tx, before, &mut i);
+    drained(&tx).await;
+    send(&tx, &[0.0; 2 * CHUNK], &mut i);
+    let after_t0 = T_BASE + i * 100_000_000;
+    send(&tx, after, &mut i);
+    drained(&tx).await;
+    send(&tx, tail, &mut i);
+    drop(tx);
+    assert!(h.await.unwrap().is_ok());
+    (drain(&mut rx_a, &mut rx_e), after_t0)
+}
+
+#[tokio::test]
+async fn lag_in_noise_keeps_the_floor() {
+    // Noise, a lag, the same noise: still no speech.
+    let ((events, audio), _) =
+        run_with_lag(&noise(10 * CHUNK, 21), &noise(LAG_CAP * CHUNK, 22), &[]).await;
+    assert!(events.is_empty(), "{events:?}");
+    assert!(audio.is_empty(), "{audio:?}");
+}
+
+#[tokio::test]
+async fn burst_right_after_a_lag_is_detected() {
+    // The floor learnt from the noise before the lag survives it, so a burst in
+    // the first frame after the lag is speech. Bursts at 0, 600 and 1200 ms.
+    let after = noisy(speech_like(48_000, 1.6), 23);
+    let ((events, audio), after_t0) =
+        run_with_lag(&noise(10 * CHUNK, 21), &after, &noise(5 * CHUNK, 24)).await;
+    assert_eq!(events.len(), 6, "{events:?}");
+    for (k, w) in events.chunks(2).enumerate() {
+        let burst = after_t0 + k as u64 * 600_000_000;
+        assert!(w[0].0 && !w[1].0, "{events:?}");
+        assert!(w[0].1.abs_diff(burst) <= FRAME_NS, "burst {k}: {events:?}");
+    }
+    assert!(audio.iter().all(|&(s, _)| s >= after_t0), "{audio:?}");
+}
+
+#[tokio::test]
+async fn lag_closes_an_open_run_once() {
+    // 500 ms of noise, then a burst still open at the lag; noise after it.
+    let mut before = noise(5 * CHUNK, 21);
+    before.extend(noisy(speech_like(48_000, 0.3), 25));
+    let ((events, audio), after_t0) = run_with_lag(&before, &noise(LAG_CAP * CHUNK, 22), &[]).await;
+    // One run: opened at the burst, closed at the lag where its forwarded audio
+    // stops (the look-back it still held is dropped), and nothing after.
+    assert_eq!(events.len(), 2, "{events:?}");
+    let ((on, t_on), (off, t_off)) = (events[0], events[1]);
+    assert!(on && !off, "{events:?}");
+    assert!(
+        t_on.abs_diff(T_BASE + 500_000_000) <= FRAME_NS,
+        "{events:?}"
+    );
+    let end = audio.iter().map(|&(_, e)| e).max().expect("no audio");
+    assert!(
+        t_off.abs_diff(end) <= 1_000,
+        "closed at {t_off}, audio ends {end}"
+    );
+    assert!(t_off < after_t0, "{events:?}");
+}
+
+#[tokio::test]
+async fn first_frame_mid_burst_is_heard_from_the_second_burst() {
+    let rate = 48_000u64;
+    let bus = Arc::new(StreamBus::new(256));
+    let a_out = bus.register(StreamKind::Audio, prov(0));
+    let e_out = bus.register(StreamKind::Event, prov(0));
+    let mut rx_a = bus.subscribe(&a_out).unwrap();
+    let mut rx_e = bus.subscribe(&e_out).unwrap();
+    let (tx, rx_in) = broadcast::channel(256);
+    let h = spawn_with(
+        serde_json::json!({"hangover_ms": 200}),
+        bus,
+        rx_in,
+        vec![a_out, e_out],
+    );
+    // The clean fixture (exact-zero gaps) from 150 ms into its first burst:
+    // the first frame seeds the floor at speech level. Whole bursts follow at
+    // 450 ms + k * 600 ms, k = 0..6.
+    let mut x = speech_like(48_000, 4.2);
+    let x = x.split_off(7_200);
+    let mut i = 0;
+    send(&tx, &x, &mut i);
+    drop(tx);
+    assert!(h.await.unwrap().is_ok());
+    let (events, audio) = drain(&mut rx_a, &mut rx_e);
+    // The partial first burst is missed; the first zero gap lowers the floor,
+    // and every whole burst is one run.
+    assert_eq!(events.len(), 12, "{events:?}");
+    for (k, w) in events.chunks(2).enumerate() {
+        let burst = T_BASE + 450_000_000 + k as u64 * 600_000_000;
+        assert!(w[0].0 && !w[1].0, "{events:?}");
+        assert!(w[0].1.abs_diff(burst) <= FRAME_NS, "burst {k}: {events:?}");
+    }
+    let first = events[0].1;
+    assert!(audio.iter().all(|&(s, _)| s >= first), "{audio:?}");
+    let forwarded: u64 = audio.iter().map(|&(s, e)| e - s).sum();
+    let want = 6 * 500_000_000u64;
+    assert!(
+        forwarded.abs_diff(want) <= 6 * 2 * FRAME_NS,
+        "{forwarded} ns forwarded at {rate} Hz"
+    );
+}
+
 #[tokio::test]
 async fn single_output_skips_events() {
     let bus = Arc::new(StreamBus::new(8));

@@ -120,7 +120,10 @@ async fn stt_without_daemon_is_503() {
     let resp = stt(&ts, "audio/wav", wav(1)).await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let v: Value = resp.json().await.unwrap();
-    assert_eq!(v["message"], "serve has no speech daemon (--stt-socket)");
+    assert_eq!(
+        v["message"],
+        "serve has no speech backend (--stt-socket or --stt-node)"
+    );
     ts.stop().await;
 }
 

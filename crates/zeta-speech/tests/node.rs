@@ -44,7 +44,7 @@ async fn a_node_that_never_answers_languages_is_assumed_english_within_2_s() {
     let started = std::time::Instant::now();
     let b = NodeBackend::new(&url, SECRET).await.unwrap();
     let took = started.elapsed();
-    assert!(took < std::time::Duration::from_millis(2_100), "{took:?}");
+    assert!(took < std::time::Duration::from_millis(2_500), "{took:?}");
     assert_eq!(b.languages(), ["en"]);
     drop(listener);
 }

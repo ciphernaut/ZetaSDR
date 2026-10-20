@@ -39,10 +39,7 @@ fn separate_plugin_replaces_denoise_in_an_attached_chain() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let mut audio = zeta_dsp::fixtures::speech_like(48_000, 3.0);
-    audio.extend(std::iter::repeat_n(0.0, 2 * 48_000));
-    let iq = zeta_dsp::fixtures::wfm_modulate(&audio, 48_000, 240_000, 75_000.0, 0.0, true);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "speech", &iq, 240_000, 104_700_000);
+    let meta = common::speech_fixture(dir.path());
     let sock = dir.path().join("voiced.sock");
     let _daemon = zeta_speech::testing::FakeDaemon::replying(&sock, "ok:hello from the daemon\n");
     let src = format!("speech={}", meta.display());
@@ -91,89 +88,75 @@ fn separate_plugin_replaces_denoise_in_an_attached_chain() {
     denoise["params"] = json!({"model": "stub"});
     let file = dir.path().join("graph.json");
     std::fs::write(&file, graph.to_string()).unwrap();
-    let mut frames: Vec<Value> = Vec::new();
-    // FIXME: remove the retry once vad lets digital silence lower its floor (plan 10 final fix
-    // wave); until then a chain restarted mid-burst can stall.
-    for _attempt in 0..3 {
-        let put = remote(&[
-            "graph",
-            "put",
-            "--job",
-            &att,
-            "--file",
-            file.to_str().unwrap(),
-        ]);
-        assert_ne!(put["error"], "invalid", "{put}");
+    // One put; the tails follow it immediately.
+    let put = remote(&[
+        "graph",
+        "put",
+        "--job",
+        &att,
+        "--file",
+        file.to_str().unwrap(),
+    ]);
+    assert_ne!(put["error"], "invalid", "{put}");
 
-        // A failed attempt is the known restart stall (observed in about 2 of 7 runs): the
-        // restarted chain goes quiet, and the tails then see no transcript. Started a second
-        // after the put, or in later windows, they fare no better, so the tails start
-        // immediately after the put. Three failures in a row still fail the test.
-        // Tail the restarted chain's event streams (`vad`'s and `transcribe`'s) at once, then
-        // check the stored graph while they wait.
-        let streams = remote(&["stream", "list"]);
-        let events: Vec<String> = streams["value"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|s| s["provenance"]["job"] == att.as_str() && s["kind"] == "event")
-            .map(|s| s["id"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(events.len(), 2, "{streams}");
-        let tails: Vec<_> = events
-            .into_iter()
-            .map(|s| {
-                let url = node.url.clone();
-                std::thread::spawn(move || {
-                    let args = [
-                        "stream",
-                        "tail",
-                        "--stream",
-                        &s,
-                        "--max-frames",
-                        "1",
-                        "--timeout-ms",
-                        "10000",
-                    ];
-                    json_of(
-                        &common::zeta_remote(&url, NODE_SECRET, &args)
-                            .assert()
-                            .success()
-                            .get_output()
-                            .stdout
-                            .clone(),
-                    )
-                })
+    // Tail the restarted chain's event streams (`vad`'s and `transcribe`'s) at once, then
+    // check the stored graph while they wait.
+    let streams = remote(&["stream", "list"]);
+    let events: Vec<String> = streams["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["provenance"]["job"] == att.as_str() && s["kind"] == "event")
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(events.len(), 2, "{streams}");
+    let tails: Vec<_> = events
+        .into_iter()
+        .map(|s| {
+            let url = node.url.clone();
+            std::thread::spawn(move || {
+                let args = [
+                    "stream",
+                    "tail",
+                    "--stream",
+                    &s,
+                    "--max-frames",
+                    "1",
+                    "--timeout-ms",
+                    "10000",
+                ];
+                json_of(
+                    &common::zeta_remote(&url, NODE_SECRET, &args)
+                        .assert()
+                        .success()
+                        .get_output()
+                        .stdout
+                        .clone(),
+                )
             })
-            .collect();
-        let again = remote(&["graph", "get", "--job", &att]);
-        let kinds: Vec<&str> = again["value"]["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|n| n["kind"].as_str())
-            .collect();
-        assert_eq!(
-            kinds,
-            ["stream_in", "separate", "vad", "transcribe"],
-            "{again}"
-        );
-        frames = tails
-            .into_iter()
-            .flat_map(|t| {
-                t.join().unwrap()["value"]["frames"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .collect();
-        let found = frames
-            .iter()
-            .any(|f| f["payload"]["protocol"] == "transcript");
-        if found {
-            break;
-        }
-    }
+        })
+        .collect();
+    let again = remote(&["graph", "get", "--job", &att]);
+    let kinds: Vec<&str> = again["value"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["kind"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["stream_in", "separate", "vad", "transcribe"],
+        "{again}"
+    );
+    let frames: Vec<Value> = tails
+        .into_iter()
+        .flat_map(|t| {
+            t.join().unwrap()["value"]["frames"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
     let t = frames
         .iter()
         .find(|f| f["payload"]["protocol"] == "transcript")

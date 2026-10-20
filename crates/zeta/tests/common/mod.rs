@@ -134,3 +134,26 @@ pub fn zeta_remote(url: &str, secret: &str, args: &[&str]) -> assert_cmd::Comman
         .args(args);
     cmd
 }
+
+/// The `speech` fixture's IQ rate and centre, and the rate of the audio it carries.
+pub const SPEECH_RATE: u32 = 240_000;
+pub const SPEECH_HZ: u64 = 104_700_000;
+pub const SPEECH_AUDIO_RATE: u32 = 48_000;
+
+/// The `speech` fixture in `dir`: a 2 s pause then 3 s of speech-like bursts, wideband FM
+/// with pilot. The source loops, so the pause also ends each pass's speech for the voice
+/// gate; putting it first means a chain that starts with the file opens on digital silence
+/// rather than inside a burst. Its meta path.
+pub fn speech_fixture(dir: &Path) -> PathBuf {
+    let mut audio = vec![0.0; 2 * SPEECH_AUDIO_RATE as usize];
+    audio.extend(zeta_dsp::fixtures::speech_like(SPEECH_AUDIO_RATE, 3.0));
+    let iq = zeta_dsp::fixtures::wfm_modulate(
+        &audio,
+        SPEECH_AUDIO_RATE,
+        SPEECH_RATE,
+        75_000.0,
+        0.0,
+        true,
+    );
+    zeta_dsp::fixtures::write_fixture(dir, "speech", &iq, SPEECH_RATE, SPEECH_HZ)
+}

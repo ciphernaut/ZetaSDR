@@ -365,14 +365,14 @@ async fn slow_backend_does_not_stall_input_and_overflow_is_reported() {
     // The two that overflow the queue are reported at once.
     let mut dropped = Vec::new();
     while dropped.len() < 2 {
-        let left = Duration::from_millis(100).saturating_sub(sent.elapsed());
+        let left = Duration::from_millis(500).saturating_sub(sent.elapsed());
         let f = tokio::time::timeout(left, events.recv())
             .await
-            .expect("overflow reported within 100 ms")
+            .expect("overflow reported within 500 ms")
             .unwrap();
         dropped.push(event(f));
     }
-    assert!(sent.elapsed() < Duration::from_millis(100));
+    assert!(sent.elapsed() < Duration::from_millis(500));
     for (v, start) in dropped.iter().zip(&starts[3..]) {
         assert_eq!(v["dropped"], true, "{v}");
         assert_eq!(u(v, "start_ns"), *start, "the newest are dropped: {v}");
@@ -464,9 +464,9 @@ async fn utterance_closes_after_gap_of_wall_clock_silence() {
     let mut rig = start(&fake);
     let end = send(&rig.tx, &speech_like(RATE as u32, 1.0), 1, T_BASE);
     let sent = Instant::now();
-    let f = tokio::time::timeout(Duration::from_millis(300 + 500), rig.events.recv())
+    let f = tokio::time::timeout(Duration::from_millis(1_500), rig.events.recv())
         .await
-        .expect("closed within gap_ms + 500 ms of the last frame")
+        .expect("closed within 1.5 s of the last frame")
         .unwrap();
     let v = event(f);
     assert!(

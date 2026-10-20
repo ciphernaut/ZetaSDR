@@ -1546,10 +1546,7 @@ fn job_attach_one_shot_names_an_unknown_job() {
 #[test]
 fn job_attach_over_node_tails_a_transcript_event() {
     let dir = tempfile::tempdir().unwrap();
-    let mut audio = zeta_dsp::fixtures::speech_like(48_000, 3.0);
-    audio.extend(std::iter::repeat_n(0.0, 2 * 48_000));
-    let iq = zeta_dsp::fixtures::wfm_modulate(&audio, 48_000, 240_000, 75_000.0, 0.0, true);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "speech", &iq, 240_000, 104_700_000);
+    let meta = common::speech_fixture(dir.path());
     let sock = dir.path().join("voiced.sock");
     let _daemon = zeta_speech::testing::FakeDaemon::replying(&sock, "ok:hello from the daemon\n");
     let src = format!("speech={}", meta.display());

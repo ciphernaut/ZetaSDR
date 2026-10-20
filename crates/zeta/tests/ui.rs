@@ -2,8 +2,8 @@
 //! headless Chromium) against a real `zeta serve` with the `tone`, `aprs`, `wfm` and `pocsag`
 //! fixtures (`wfm`: a 1 kHz tone, wideband FM with pilot, 240 kHz, 2 s looping, at 104.9 MHz;
 //! `pocsag`: one 1200-baud alphanumeric page `HELLO ZETA` to address 1234567, function 3, at
-//! 48 kHz, looping, at 148.6375 MHz) and `speech` fixtures (`speech`: 3 s of speech-like
-//! bursts and a 2 s pause, wideband FM with pilot, 240 kHz, looping, at 104.7 MHz); the
+//! 48 kHz, looping, at 148.6375 MHz) and `speech` fixtures (`speech`: a 2 s pause then 3 s of
+//! speech-like bursts, wideband FM with pilot, 240 kHz, looping, at 104.7 MHz); the
 //! node's state directory is passed to ui.py in `ZETA_UI_STATE_DIR`. That node has a fake
 //! `voiced` (`--stt-socket`, zeta-speech's `FakeDaemon`) answering `ok:what sources are there`
 //! to every valid staged WAV; a second node without a speech daemon, with only the `speech`
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use common::ServeProc;
+use common::{ServeProc, speech_fixture};
 use zeta_speech::testing::FakeDaemon;
 
 const SECRET: &str = "ui-secret-0123456789";
@@ -35,18 +35,6 @@ const SOCKET_PATH_MAX: usize = 100;
 /// The `wfm` fixture: its IQ rate and the rate of the tone it carries.
 const WFM_RATE: u32 = 240_000;
 const WFM_AUDIO_RATE: u32 = 48_000;
-/// The `speech` fixture's centre (it shares the `wfm` rates).
-const SPEECH_HZ: u64 = 104_700_000;
-
-/// The `speech` fixture in `dir`: 3 s of speech-like bursts then a 2 s pause (so the looping
-/// source gives the voice gate an end of speech), wideband FM with pilot. Its meta path.
-fn speech_fixture(dir: &Path) -> PathBuf {
-    let mut audio = zeta_dsp::fixtures::speech_like(WFM_AUDIO_RATE, 3.0);
-    audio.extend(std::iter::repeat_n(0.0, 2 * WFM_AUDIO_RATE as usize));
-    let iq =
-        zeta_dsp::fixtures::wfm_modulate(&audio, WFM_AUDIO_RATE, WFM_RATE, 75_000.0, 0.0, true);
-    zeta_dsp::fixtures::write_fixture(dir, "speech", &iq, WFM_RATE, SPEECH_HZ)
-}
 
 /// Peak |sample| a recording of the fake microphone's tone must exceed.
 const MIN_PEAK: i32 = 1000;

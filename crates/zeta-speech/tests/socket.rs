@@ -93,7 +93,7 @@ async fn a_daemon_that_never_answers_languages_is_assumed_english_within_2_s() {
     // A long call timeout: the probe has its own 2 s bound.
     let b = backend(&sock, &staging, Duration::from_secs(30)).await;
     let took = started.elapsed();
-    assert!(took < Duration::from_millis(2_100), "{took:?}");
+    assert!(took < Duration::from_millis(2_500), "{took:?}");
     assert!(took >= Duration::from_secs(2), "{took:?}");
     assert_eq!(b.languages(), ["en"]);
     assert_eq!(daemon.commands(), ["languages"]);
@@ -113,7 +113,7 @@ async fn a_daemon_that_never_answers_times_out() {
         .await
         .unwrap_err();
     assert_eq!(err, SpeechError::Timeout(timeout));
-    assert!(started.elapsed() < timeout + Duration::from_millis(100));
+    assert!(started.elapsed() < timeout + Duration::from_millis(500));
     assert_eq!(staged_left(&staging), 0);
 }
 

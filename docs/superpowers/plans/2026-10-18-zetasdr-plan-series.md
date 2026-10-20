@@ -430,21 +430,49 @@ What was built:
 - Docs: `docs/speech.md` (installing `local-voice` on a node's host, bring your own daemon, one daemon
   for several nodes), "Transcribing a channel" in field craft, README.
 
-Gates at the branch head: `cargo test --workspace --all-features --no-fail-fast`: 756 passed, 1 failed,
-3 ignored. The failure was `zeta-dsp` `acars::tests::acarsdec_decodes_our_fixture` (an external-oracle
-test unrelated to this plan), which passed 4 of 4 when run alone under no load; so the plan's
-no-`FAILED` gate was not met on the full run. Included: `zeta` `cli` 43, `attach` 5, `speech_chain` 1,
-and the UI suite (`ui_scenarios_pass_in_headless_chromium`) ok in 171 s with no `ui e2e skipped` line.
-`cargo fmt -p` for each of the 17 members, `cargo clippy --workspace --all-targets --all-features -- -D
-warnings`, `zeta agents-md --check` and `--skill --check` are clean.
+Final fix wave (after the whole-branch review):
 
-Finding: after a `graph put` on an attached job the restarted chain sometimes goes quiet (observed in
-2 of 7 runs; in one probe run `vad` gave two events and then none for 30 s, in three others `vad` events
-kept arriving for 40 s), so `speech_chain` puts up to three times. The cause is the voice gate's noise
-floor: it seeds from the first frame and, under the current rule, is never lowered by exact-zero
-silence, so a chain restarted mid-burst on the clean fixture keeps its floor at speech level. A fix
-(digital silence lowers the floor to its -80 dB minimum) is scheduled in the final fix wave, after which
-the retry in `speech_chain.rs` is to be removed.
+- The voice gate's floor on digital silence (R15): a frame under -80 dB still counts as quiet and
+  never raises the floor, but now lowers it to -80 dB, its minimum (and seeds an unseeded floor
+  there). A chain that starts or restarts inside a burst therefore hears speech from the first gap
+  on. The trade-off, documented on `Vad`: after a gap of exact zeros, -50 dB channel noise is
+  forwarded for about 1 s plus the hangover until the floor re-adapts.
+- The floor across a lag (R16): a lagged input no longer recreates the detector. The floor is kept;
+  only the run in progress, its look-back and the stage's pending samples are dropped, and a run
+  already announced is closed with one `speech: false` where its forwarded audio stopped.
+- A deterministic speech fixture (R17): every test that builds the `speech` fixture uses one
+  helper (`crates/zeta/tests/common/mod.rs` `speech_fixture`), which puts the 2 s pause before the
+  3 s of bursts, so a chain starting with the file opens on silence. The retry in `speech_chain.rs`
+  is gone: one `graph put`, one tail.
+- Because the pause delays the first transcript by about 2.7 s of file time, the two `attach.rs`
+  transcript windows were widened from 10 s to 20 s (the UI ribbon scenario's bound).
+- Wider timing margins in the `zeta-speech` tests, and the `/stt` 503 text is now `serve has no
+  speech backend (--stt-socket or --stt-node)`.
+
+Gates at the branch head, `cargo test --workspace --all-features --no-fail-fast`:
+
+- Run 1: 763 passed, 0 failed, 3 ignored.
+- Run 2: 761 passed, 2 failed, 3 ignored. The failures were `attach`'s two transcript tests on
+  their 10 s windows, since widened.
+- Run 3, with the 20 s windows: 762 passed, 1 failed, 3 ignored. The failure was `zeta-dsp`
+  `acars::tests::acarsdec_decodes_our_fixture`, an external-oracle test unrelated to this plan,
+  which passed 3 of 3 when run alone.
+
+Each run included `zeta` `cli` 43, `attach` 5 (ok in runs 1 and 3), `speech_chain` 1, and the UI
+suite (`ui_scenarios_pass_in_headless_chromium`) ok in 171.65 s, 164.04 s and 171.61 s, with no
+`ui e2e skipped` line.
+
+Repeated runs, unloaded:
+
+- `cargo test -p zeta --test speech_chain`: 5 of 5 ok.
+- `cargo test -p zeta --test attach`: 3 of 3 ok before the window change and 3 of 3 after.
+
+`cargo fmt -p` for each of the 17 members, `cargo clippy --workspace --all-targets --all-features --
+-D warnings`, `zeta agents-md --check` and `--skill --check` are clean.
+
+Observation for live acceptance: in the in-process attach chain, the whole chain occasionally starts
+about 4 s late (seen in 1 of 5 unloaded probe runs: the `vad` and `transcript` events all arrive
+about 4 s later than usual). Watch the time to the first `transcript` on air.
 
 Live acceptance (to do, on the field host as the `sdr` user): install `local-voice` as in docs/speech.md
 section 1, `zeta serve --stt-socket`, `wfm_demod` on 100.5 MHz / 200 kHz, `job attach --kind transcribe`
