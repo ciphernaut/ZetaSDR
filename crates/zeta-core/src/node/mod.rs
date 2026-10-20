@@ -109,6 +109,10 @@ pub enum NodeError {
 /// forgotten and their files removed. Running jobs are never counted.
 pub const JOB_HISTORY_MAX: usize = 20;
 
+/// How long [`Node::replace_holders`] waits, holding the source's gate, for a
+/// stopped job's lease to go.
+const REPLACE_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 struct JobEntry {
     record: JobRecord,
     /// When the record turned terminal in this process (its `created_ns` for
@@ -124,9 +128,11 @@ struct JobEntry {
     /// Set while an elastic job is relaunched on a new capture: its supervisor then
     /// leaves the record `Running` and the lease held for the relaunch.
     relaunch: bool,
-    /// Set by a stop under the source's gate ([`Inner::stop_gated`]): the
-    /// supervisor then does not idle the port, which would take that gate.
-    skip_idle: bool,
+    /// Set by a stop under the source's gate ([`Inner::stop_gated`], a `replace`):
+    /// the supervisor then does not idle the port, which would take that gate, and
+    /// a launch of the job already past its lease (a `graph_put` restart) is
+    /// refused, so the replaced job stays stopped (see [`Inner::record_running`]).
+    gated_stop: bool,
     /// Set by the supervisor once the lease is released and the streams are
     /// unregistered, when all that is left is the port's idle.
     released: bool,
@@ -204,7 +210,7 @@ impl Inner {
                 entry.ended_ns = now();
             }
             // Set before the cancel, under the jobs lock the supervisor reads it under.
-            entry.skip_idle |= gated;
+            entry.gated_stop |= gated;
             if let Some(c) = entry.cancel.take() {
                 c.cancel();
             }
@@ -400,7 +406,7 @@ impl Node {
                         done: None,
                         outputs: Vec::new(),
                         relaunch: false,
-                        skip_idle: false,
+                        gated_stop: false,
                         released: false,
                     },
                 );
@@ -423,7 +429,7 @@ impl Node {
                         done: None,
                         outputs: Vec::new(),
                         relaunch: false,
-                        skip_idle: false,
+                        gated_stop: false,
                         released: false,
                     },
                 );
@@ -750,9 +756,19 @@ impl Node {
             }
             seen.push(id);
             self.inner.stop_gated(id).await?;
-            // Another stop may have taken the supervisor; its release is near
-            // (nothing before it takes the gate), and the request must not see it.
+            // Another stop may have taken the supervisor, or a restart (`graph_put`)
+            // may hold the new lease on its way to the launch `record_running`
+            // refuses: either release is near (nothing before it takes the gate),
+            // and the request must not see the lease. Bounded, so a stage that
+            // never ends cannot keep the source's gate.
+            let deadline = tokio::time::Instant::now() + REPLACE_RELEASE_TIMEOUT;
             while holds(id) {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(NodeError::Other(format!(
+                        "job {} did not release source {}",
+                        id.0, source.0
+                    )));
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         }

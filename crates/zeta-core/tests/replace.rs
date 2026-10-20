@@ -3,6 +3,7 @@
 //! before the request, so nothing can take the radio in between.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,12 +22,16 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::StreamKind;
 use zeta_core::types::{Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, StreamId};
 
-/// A radio that tunes to exactly the band asked for.
+/// A radio that tunes to exactly the band asked for. With `stall` set, the next
+/// `current()` blocks its thread for 50 ms with `stalling` set: a launch reads
+/// the port's band right after its lease, so a test can act in that window.
 struct Radio {
     id: SourceId,
     caps: Capabilities,
     cur: Mutex<Option<Tuning>>,
     tx: broadcast::Sender<IqBlock>,
+    stall: AtomicBool,
+    stalling: AtomicBool,
 }
 
 impl Radio {
@@ -46,6 +51,8 @@ impl Radio {
             },
             cur: Mutex::new(None),
             tx: broadcast::channel(1).0,
+            stall: AtomicBool::new(false),
+            stalling: AtomicBool::new(false),
         })
     }
 }
@@ -65,6 +72,11 @@ impl Port for Radio {
         Ok(t)
     }
     fn current(&self) -> Option<Tuning> {
+        if self.stall.swap(false, Ordering::SeqCst) {
+            self.stalling.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            self.stalling.store(false, Ordering::SeqCst);
+        }
         *self.cur.lock().unwrap()
     }
     fn subscribe(&self) -> IqReceiver {
@@ -72,8 +84,9 @@ impl Port for Radio {
     }
 }
 
-/// Stands in for the dsp `fft` stage a `spectrum` or `scan` job runs.
-struct FakeFft(StageSpec);
+/// Stands in for the dsp `fft` stage a `spectrum` or `scan` job runs; once
+/// cancelled it takes `.1` to end.
+struct FakeFft(StageSpec, Duration);
 
 #[async_trait]
 impl Stage for FakeFft {
@@ -94,7 +107,10 @@ impl Stage for FakeFft {
     ) -> Result<(), StageError> {
         loop {
             let frame = tokio::select! {
-                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                _ = cancel.cancelled() => {
+                    tokio::time::sleep(self.1).await;
+                    return Err(StageError::Cancelled);
+                }
                 r = inputs[0].recv() => match r {
                     Ok(f) => f,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -114,14 +130,22 @@ impl Stage for FakeFft {
 }
 
 fn registry() -> StageRegistry {
+    registry_lingering(Duration::ZERO)
+}
+
+/// [`registry`] whose `fft` stage takes `linger` to end once cancelled.
+fn registry_lingering(linger: Duration) -> StageRegistry {
     let mut r = StageRegistry::new();
     r.register(Arc::new(PassthroughStage::new()));
-    r.register(Arc::new(FakeFft(StageSpec {
-        kind: "fft",
-        inputs: vec![StreamKind::Iq],
-        outputs: vec![StreamKind::Event],
-        params_schema: schemars::json_schema!({}),
-    })));
+    r.register(Arc::new(FakeFft(
+        StageSpec {
+            kind: "fft",
+            inputs: vec![StreamKind::Iq],
+            outputs: vec![StreamKind::Event],
+            params_schema: schemars::json_schema!({}),
+        },
+        linger,
+    )));
     r
 }
 
@@ -472,25 +496,27 @@ async fn replace_by_a_scan_stops_the_holder_and_scans() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replace_and_a_competing_start_never_both_hold_incompatible_bands() {
-    for round in 0..20 {
+    for round in 0..5 {
         let dir = tempfile::tempdir().unwrap();
-        let node = Arc::new(open(dir.path(), &[Radio::new(RADIO)]).await);
+        // A's stage takes 50 ms to end once cancelled, so B's replace holds the
+        // source's gate that long, and D (sent 10 ms after B) is queued on the gate
+        // while A stops: were the gate let go between A's stop and B's tune and
+        // lease, D would take the radio first.
+        let reg = registry_lingering(Duration::from_millis(50));
+        let ports: Vec<Arc<dyn Port>> = vec![Radio::new(RADIO)];
+        let node = Arc::new(Node::open(cfg(dir.path()), reg, ports).await.unwrap());
         let a = started(
             &node,
-            start(JobKind::Passthrough, band(100_000_000, 48_000), &[]),
+            start(JobKind::Spectrum, band(100_000_000, 48_000), &[]),
         )
         .await;
         let (n1, n2) = (node.clone(), node.clone());
         let b_op = start(JobKind::Passthrough, band(433_000_000, 48_000), &[&a]);
         let d_op = start(JobKind::Passthrough, band(868_000_000, 48_000), &[]);
-        let (b, d) = within(async {
-            tokio::join!(
-                tokio::spawn(async move { n1.apply(b_op).await }),
-                tokio::spawn(async move { n2.apply(d_op).await }),
-            )
-        })
-        .await;
-        let (b, d) = (b.unwrap(), d.unwrap());
+        let b = tokio::spawn(async move { n1.apply(b_op).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let d = tokio::spawn(async move { n2.apply(d_op).await });
+        let (b, d) = within(async { (b.await.unwrap(), d.await.unwrap()) }).await;
         // The radio was never free between the stop and the replacing start.
         assert!(b.is_ok(), "round {round}: {b:?}");
         assert!(
@@ -501,7 +527,7 @@ async fn replace_and_a_competing_start_never_both_hold_incompatible_bands() {
         let s = source(&node, RADIO).await;
         let cur = s.current.expect("tuned");
         let holders = node.lease_holders(&SourceId(RADIO.into()));
-        assert!(!holders.is_empty(), "round {round}");
+        assert_eq!(holders.len(), 1, "round {round}: {holders:?}");
         for (j, t) in &holders {
             assert!(
                 fits(t, &cur),
@@ -510,4 +536,52 @@ async fn replace_and_a_competing_start_never_both_hold_incompatible_bands() {
             assert_eq!(record(&node, j).state, JobState::Running, "round {round}");
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replace_racing_a_graph_put_restart_leaves_the_job_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = Arc::new(open(dir.path(), std::slice::from_ref(&radio)).await);
+    let a = started(
+        &node,
+        start(JobKind::Passthrough, band(100_000_000, 48_000), &[]),
+    )
+    .await;
+    let graph = node
+        .job_list()
+        .into_iter()
+        .find(|r| r.id == a)
+        .unwrap()
+        .graph;
+    // The restart stops A, leases again and then reads the port's band: stalled
+    // there, its new lease is held but A is not yet recorded running.
+    radio.stall.store(true, Ordering::SeqCst);
+    let (n, id) = (node.clone(), a.clone());
+    let put = tokio::spawn(async move { n.job_graph_put(&id, graph).await });
+    within(async {
+        // Spinning, not sleeping: the stall blocks a worker thread, timers included.
+        while !radio.stalling.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        node.lease_holders(&SourceId(RADIO.into()))
+            .iter()
+            .any(|(j, _)| j == &a)
+    );
+    let want = band(433_000_000, 48_000);
+    let b = within(started(&node, start(JobKind::Passthrough, want, &[&a]))).await;
+    // The restart is refused: the replace stopped A first.
+    match within(put).await.unwrap() {
+        Err(zeta_core::node::NodeError::Stopped(id)) => assert_eq!(id, a),
+        other => panic!("expected stopped, got {other:?}"),
+    }
+    assert_eq!(record(&node, &a).state, JobState::Stopped);
+    assert_eq!(streams(&node, &a), 0);
+    assert_eq!(record(&node, &b).state, JobState::Running);
+    let s = source(&node, RADIO).await;
+    assert_eq!(s.holders, vec![b]);
+    assert_eq!(s.current, Some(want));
 }

@@ -524,3 +524,55 @@ async fn stop_during_a_relaunch_is_not_undone() {
     assert!(streams(&node, &elastic).is_empty());
     assert!(node.lease_elastic(&SourceId("radio0".into())).is_empty());
 }
+
+/// An elastic job that starts after a scan stopped the source's elastic jobs but
+/// before the scan's lease is stopped too: once the scan holds the source no
+/// elastic job can join, and the one that joined first does not outlive the scan's start.
+#[tokio::test]
+async fn elastic_start_while_a_scan_stops_the_others_is_stopped_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new();
+    // The first elastic job takes 100 ms to end, so the scan's first stop is still
+    // waiting on it when the second elastic job starts.
+    let node = Arc::new(
+        Node::open(
+            cfg(dir.path()),
+            registry_lingering(Duration::from_millis(100)),
+            vec![radio.clone()],
+        )
+        .await
+        .unwrap(),
+    );
+    let first = started(
+        &node,
+        start(JobKind::Spectrum, band(100_000_000, 9_600), true),
+    )
+    .await;
+    let n = node.clone();
+    let scan = tokio::spawn(async move {
+        n.apply(start(JobKind::Scan, band(100_000_000, 40_000_000), false))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !scan.is_finished(),
+        "the scan's stop of the first job lingers"
+    );
+    let second = started(
+        &node,
+        start(JobKind::Spectrum, band(100_000_000, 9_600), true),
+    )
+    .await;
+    let scan = match scan.await.unwrap() {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected the scan to start, got {other:?}"),
+    };
+    for id in [&first, &second] {
+        assert_eq!(record(&node, id).state, JobState::Stopped, "{id:?}");
+        assert!(streams(&node, id).is_empty(), "{id:?}");
+    }
+    let s = source(&node).await;
+    assert_eq!(s.holders, vec![scan.clone()]);
+    assert!(s.elastic.is_empty(), "{s:?}");
+    node.job_stop(&scan).await.unwrap();
+}

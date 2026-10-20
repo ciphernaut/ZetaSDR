@@ -81,11 +81,14 @@ impl Inner {
     ) -> (Result<(), NodeError>, AfterGate) {
         let mut after = AfterGate::Nothing;
         let r = self.launch_inner(rec, gate, &mut after).await;
-        if let AfterGate::Relaunch { except, .. } = &mut after
-            && r.is_err()
-        {
-            // The port moved and the new job did not start: every elastic job follows.
-            *except = None;
+        if r.is_err() {
+            match &mut after {
+                // The port moved and the new job did not start: every elastic job follows.
+                AfterGate::Relaunch { except, .. } => *except = None,
+                // No scan holds the source: the elastic jobs may stay.
+                AfterGate::StopElastic(_) => after = AfterGate::Nothing,
+                AfterGate::Nothing => {}
+            }
         }
         (r, after)
     }
@@ -415,7 +418,9 @@ impl Inner {
     /// is released and nothing is entered. The check, the write and the entry
     /// happen under the jobs lock, so a `job_stop` lands either before (an elastic
     /// relaunch is then refused with `Stopped`, its lease released) or after (it
-    /// cancels the new launch).
+    /// cancels the new launch). A launch of a job a `replace` stopped meanwhile (a
+    /// `graph_put` restart that took its lease before the replace took the gate)
+    /// is refused the same way, whatever the kind.
     fn record_running(
         &self,
         mut rec: JobRecord,
@@ -423,11 +428,12 @@ impl Inner {
     ) -> Result<Provenance, NodeError> {
         rec.state = JobState::Running;
         let mut jobs = self.jobs.lock().unwrap();
-        // An elastic job being relaunched that was stopped (or ended) meanwhile
-        // stays so: its stop already returned, so this launch must not undo it.
+        // An elastic job being relaunched, or any job a `replace` stopped, that was
+        // stopped (or ended) meanwhile stays so: its stop already returned, so this
+        // launch must not undo it.
         if jobs
             .get(&rec.id)
-            .is_some_and(|e| e.relaunch && e.record.state != JobState::Running)
+            .is_some_and(|e| (e.relaunch || e.gated_stop) && e.record.state != JobState::Running)
         {
             self.leases.release(&rec.id);
             return Err(NodeError::Stopped(rec.id));
@@ -455,7 +461,7 @@ impl Inner {
                 done: None,
                 outputs: Vec::new(),
                 relaunch: false,
-                skip_idle: false,
+                gated_stop: false,
                 released: false,
             },
         );
@@ -493,6 +499,10 @@ impl Inner {
                 self.leases
                     .acquire_shared(port.as_ref(), rec.id.clone(), rec.tuning)
                     .await?;
+                // An elastic start between the stop and the lease joined the port;
+                // none can join once the scan holds it (an elastic request on a
+                // time-shared source is a conflict), so stopping again after closes it.
+                *after = AfterGate::StopElastic(rec.source.clone());
             }
         }
         let (id, span) = (rec.id.clone(), rec.tuning);
@@ -683,20 +693,20 @@ async fn supervise(
     }
     // Read under the lock a gated stop sets it under (`Inner::stop_gated`): that
     // stop holds the source's gate, so the idle (which takes it) is left out.
-    let skip_idle = {
+    let gated_stop = {
         let mut jobs = inner.jobs.lock().unwrap();
         match jobs.get_mut(&id) {
             Some(e) => {
                 // A relaunch keeps the lease; nothing was released.
                 e.released = !relaunch;
-                e.skip_idle
+                e.gated_stop
             }
             None => false,
         }
     };
     if let Some(port) = port
         && !relaunch
-        && !skip_idle
+        && !gated_stop
     {
         inner.leases.idle_if_unheld(port.as_ref()).await;
     }
