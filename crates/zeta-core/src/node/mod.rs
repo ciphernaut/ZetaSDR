@@ -93,6 +93,9 @@ pub enum NodeError {
     /// A built-in job's graph could not be re-expanded for its leased capture's rate.
     #[error("{0}")]
     Expand(OpError),
+    /// An elastic job's relaunch found it stopped meanwhile; it stays stopped.
+    #[error("job {} was stopped", .0.0)]
+    Stopped(JobId),
 }
 
 /// How many stopped or failed job records the node keeps: when a job ends
@@ -795,7 +798,7 @@ impl Node {
     /// Relaunch every running elastic job on `source` on its current capture; see
     /// [`Inner::relaunch_elastic`].
     pub(crate) async fn relaunch_elastic(&self, source: &SourceId) {
-        self.inner.relaunch_elastic(source, None).await
+        let _ = self.inner.relaunch_elastic(source, None).await;
     }
 
     /// Jobs currently holding a rigid lease on `source`, with the band each asked for.

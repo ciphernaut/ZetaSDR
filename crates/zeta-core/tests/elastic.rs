@@ -23,13 +23,16 @@ use zeta_core::types::StreamKind;
 use zeta_core::types::{Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, StreamId};
 
 /// A radio that tunes to exactly the band asked for and records every tune; with
-/// `fail` set every tune is refused.
+/// `fail` set every tune is refused, with `hold` set every tune first waits for a
+/// permit from `permits` (so a test decides when the source's gate is let go).
 struct Radio {
     id: SourceId,
     caps: Capabilities,
     cur: Mutex<Option<Tuning>>,
     tunes: Mutex<Vec<Tuning>>,
     fail: AtomicBool,
+    hold: AtomicBool,
+    permits: tokio::sync::Semaphore,
     tx: broadcast::Sender<IqBlock>,
 }
 
@@ -51,6 +54,8 @@ impl Radio {
             cur: Mutex::new(None),
             tunes: Mutex::new(Vec::new()),
             fail: AtomicBool::new(false),
+            hold: AtomicBool::new(false),
+            permits: tokio::sync::Semaphore::new(0),
             tx: broadcast::channel(1).0,
         })
     }
@@ -72,6 +77,9 @@ impl Port for Radio {
         if self.fail.load(Ordering::SeqCst) {
             return Err(PortError::Io("tune refused".into()));
         }
+        if self.hold.load(Ordering::SeqCst) {
+            self.permits.acquire().await.expect("open").forget();
+        }
         self.tunes.lock().unwrap().push(t);
         *self.cur.lock().unwrap() = Some(t);
         Ok(t)
@@ -85,8 +93,8 @@ impl Port for Radio {
 }
 
 /// Stands in for the dsp `fft` stage a `spectrum` job runs (core cannot depend on it):
-/// one event per IQ frame, ending when its input closes or it is cancelled.
-struct FakeFft(StageSpec);
+/// one event per IQ frame, ending when its input closes or, `.1` after, it is cancelled.
+struct FakeFft(StageSpec, Duration);
 
 #[async_trait]
 impl Stage for FakeFft {
@@ -107,7 +115,10 @@ impl Stage for FakeFft {
     ) -> Result<(), StageError> {
         loop {
             let frame = tokio::select! {
-                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                _ = cancel.cancelled() => {
+                    tokio::time::sleep(self.1).await;
+                    return Err(StageError::Cancelled);
+                }
                 r = inputs[0].recv() => match r {
                     Ok(f) => f,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -127,14 +138,22 @@ impl Stage for FakeFft {
 }
 
 fn registry() -> StageRegistry {
+    registry_lingering(Duration::ZERO)
+}
+
+/// [`registry`] whose `fft` stage takes `linger` to end once cancelled.
+fn registry_lingering(linger: Duration) -> StageRegistry {
     let mut r = StageRegistry::new();
     r.register(Arc::new(PassthroughStage::new()));
-    r.register(Arc::new(FakeFft(StageSpec {
-        kind: "fft",
-        inputs: vec![StreamKind::Iq],
-        outputs: vec![StreamKind::Event],
-        params_schema: schemars::json_schema!({}),
-    })));
+    r.register(Arc::new(FakeFft(
+        StageSpec {
+            kind: "fft",
+            inputs: vec![StreamKind::Iq],
+            outputs: vec![StreamKind::Event],
+            params_schema: schemars::json_schema!({}),
+        },
+        linger,
+    )));
     r
 }
 
@@ -409,4 +428,96 @@ async fn elastic_records_resume_after_rigid_ones() {
     let s = source(&node).await;
     assert_eq!(s.holders, vec![rigid]);
     assert_eq!(s.elastic, vec![elastic]);
+}
+
+/// A rigid start whose op future is dropped while it relaunches the elastic job (an
+/// HTTP timeout, a client gone) still finishes the relaunch: the job runs on the new
+/// capture with a supervisor, so a stop ends it and releases its lease.
+#[tokio::test]
+async fn dropped_op_mid_relaunch_leaves_no_zombie() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry_lingering(Duration::from_millis(300)),
+        vec![radio.clone()],
+    )
+    .await
+    .unwrap();
+    let elastic = started(
+        &node,
+        start(JobKind::Spectrum, band(100_000_000, 9_600), true),
+    )
+    .await;
+    let before = streams(&node, &elastic);
+    let rigid_band = band(433_000_000, 9_600);
+    // The relaunch waits ~300 ms for the old stages; the op is dropped long before.
+    let r = tokio::time::timeout(
+        Duration::from_millis(50),
+        node.apply(start(JobKind::Passthrough, rigid_band, false)),
+    )
+    .await;
+    assert!(r.is_err(), "the start finished inside the timeout: {r:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while record(&node, &elastic).tuning != rigid_band || streams(&node, &elastic).is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "never relaunched");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(record(&node, &elastic).state, JobState::Running);
+    assert!(streams(&node, &elastic).iter().all(|s| !before.contains(s)));
+
+    node.job_stop(&elastic).await.unwrap();
+    assert_eq!(record(&node, &elastic).state, JobState::Stopped);
+    assert!(streams(&node, &elastic).is_empty());
+    assert!(node.lease_elastic(&SourceId("radio0".into())).is_empty());
+}
+
+/// A `job_stop` that lands while a relaunch waits on the source's gate wins: the job
+/// ends `Stopped` in the listing and on disk, and its lease is released.
+#[tokio::test]
+async fn stop_during_a_relaunch_is_not_undone() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new();
+    let node = Arc::new(open(dir.path(), &radio).await);
+    let elastic = started(
+        &node,
+        start(JobKind::Spectrum, band(100_000_000, 9_600), true),
+    )
+    .await;
+    radio.hold.store(true, Ordering::SeqCst);
+    let ensure = |c: u64| {
+        let node = node.clone();
+        tokio::spawn(async move {
+            node.apply(Op::SourceEnsure {
+                source: SourceId("radio0".into()),
+                center_hz: Hz(c),
+                bandwidth_hz: Hz(9_600),
+            })
+            .await
+        })
+    };
+    // The first tune holds the gate; the second queues behind it.
+    let first = ensure(200_000_000);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = ensure(300_000_000);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The first tune ends: the second takes the gate, and the first's relaunch of the
+    // elastic job queues on it.
+    radio.permits.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    node.job_stop(&elastic).await.unwrap();
+    radio.permits.add_permits(1);
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+
+    assert_eq!(record(&node, &elastic).state, JobState::Stopped);
+    let path = dir
+        .path()
+        .join("state")
+        .join("jobs")
+        .join(format!("{}.json", elastic.0));
+    let disk: JobRecord = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(disk.state, JobState::Stopped);
+    assert!(streams(&node, &elastic).is_empty());
+    assert!(node.lease_elastic(&SourceId("radio0".into())).is_empty());
 }

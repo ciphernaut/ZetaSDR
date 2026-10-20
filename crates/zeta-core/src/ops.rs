@@ -1304,7 +1304,7 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
             message: format!("job {} has no audio stream", j.0),
         },
         NodeError::Expand(e) => e,
-        e @ (NodeError::Io(_) | NodeError::DuplicateSource(_)) => other(e),
+        e @ (NodeError::Io(_) | NodeError::DuplicateSource(_) | NodeError::Stopped(_)) => other(e),
     }
 }
 

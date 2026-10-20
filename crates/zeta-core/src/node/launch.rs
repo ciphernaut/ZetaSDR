@@ -78,7 +78,7 @@ impl Inner {
             {
                 self.leases.release(&rec.id);
                 if tuned && !rec.elastic {
-                    self.relaunch_elastic(&rec.source, None).await;
+                    let _ = self.relaunch_elastic(&rec.source, None).await;
                 }
                 return Err(e);
             }
@@ -109,7 +109,7 @@ impl Inner {
             Err(e) => {
                 // The port moved anyway: the elastic jobs follow it.
                 if relaunch {
-                    self.relaunch_elastic(&source, None).await;
+                    let _ = self.relaunch_elastic(&source, None).await;
                 }
                 return Err(e);
             }
@@ -186,7 +186,7 @@ impl Inner {
         // Only a rigid request tunes a port elastic jobs follow (an elastic one
         // tunes only an unheld port), so a relaunch never relaunches again.
         if relaunch {
-            self.relaunch_elastic(&source, Some(&id)).await;
+            let _ = self.relaunch_elastic(&source, Some(&id)).await;
         }
         Ok(())
     }
@@ -197,12 +197,28 @@ impl Inner {
     /// sets the record's `tuning` to it, re-expands its graph for it and persists
     /// it, with new stream ids. Called after a tune of the port, never under the
     /// source's gate (the relaunch's own `ensure` takes it). A relaunch that fails
-    /// leaves the job `Failed` with the reason; a stop that lands meanwhile wins.
-    pub(super) async fn relaunch_elastic(
+    /// leaves the job `Failed` with the reason; a stop that lands meanwhile wins,
+    /// even one that lands while the relaunched launch waits on the gate (see
+    /// [`Inner::record_running`]).
+    ///
+    /// The relaunch runs in its own task, whose handle is returned for the caller
+    /// to await: it is cancel-safe, as dropping the op that awaits it (an HTTP
+    /// timeout, a client gone) never leaves a job half relaunched with its record
+    /// `Running`, its lease held and no supervisor. (A concrete handle, not an
+    /// `async fn`, also keeps `launch`'s future type from containing itself.)
+    pub(super) fn relaunch_elastic(
         self: &Arc<Self>,
         source: &SourceId,
         except: Option<&JobId>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
+        let (inner, source, except) = (self.clone(), source.clone(), except.cloned());
+        tokio::spawn(async move {
+            inner.relaunch_elastic_now(&source, except.as_ref()).await;
+        })
+    }
+
+    /// The body of [`Inner::relaunch_elastic`], in its task.
+    async fn relaunch_elastic_now(self: &Arc<Self>, source: &SourceId, except: Option<&JobId>) {
         let Some(port) = self.ports.read().unwrap().get(source).cloned() else {
             return;
         };
@@ -235,9 +251,8 @@ impl Inner {
                 .unwrap()
                 .get(&id)
                 .is_some_and(|e| e.record.state == JobState::Running);
-            // Boxed: `launch` itself calls this function.
             let result = match running {
-                true => Box::pin(self.launch(rec)).await,
+                true => self.launch(rec).await,
                 false => Ok(()),
             };
             if !running || result.is_err() {
@@ -343,13 +358,26 @@ impl Inner {
 
     /// Mark a leased job `Running`, persist it and enter it in the job table
     /// with `token`; the job's base provenance. On a failed write the lease
-    /// is released and nothing is entered.
+    /// is released and nothing is entered. The check, the write and the entry
+    /// happen under the jobs lock, so a `job_stop` lands either before (an elastic
+    /// relaunch is then refused with `Stopped`, its lease released) or after (it
+    /// cancels the new launch).
     fn record_running(
         &self,
         mut rec: JobRecord,
         token: &CancellationToken,
     ) -> Result<Provenance, NodeError> {
         rec.state = JobState::Running;
+        let mut jobs = self.jobs.lock().unwrap();
+        // An elastic job being relaunched that was stopped (or ended) meanwhile
+        // stays so: its stop already returned, so this launch must not undo it.
+        if jobs
+            .get(&rec.id)
+            .is_some_and(|e| e.relaunch && e.record.state != JobState::Running)
+        {
+            self.leases.release(&rec.id);
+            return Err(NodeError::Stopped(rec.id));
+        }
         if let Err(e) = persist(&self.jobs_dir, &rec) {
             self.leases.release(&rec.id);
             return Err(e);
@@ -364,7 +392,7 @@ impl Inner {
                 end_ns: t,
             },
         };
-        self.jobs.lock().unwrap().insert(
+        jobs.insert(
             rec.id.clone(),
             JobEntry {
                 ended_ns: rec.created_ns,
