@@ -3956,12 +3956,17 @@ name = "zeta-speech"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "schemars",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "ulid",
  "zeta-client",
+ "zeta-core",
+ "zeta-dsp",
  "zeta-speech",
  "zeta-ws",
 ]

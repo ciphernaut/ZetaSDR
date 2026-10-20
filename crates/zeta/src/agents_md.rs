@@ -327,7 +327,7 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
 /// The full AGENTS.md text for this build.
 pub fn rendering() -> String {
     let mut schema = zeta_core::ops::schema();
-    schema["stages"] = crate::node_setup::registry().describe();
+    schema["stages"] = crate::node_setup::registry(None).describe();
     render(&schema, FIELD_CRAFT)
 }
 

@@ -1,10 +1,12 @@
-//! Build the node the CLI drives: stage registry (core plus `zeta-dsp`, plus `--plugin`
-//! stages), sources (SigMF files, KiwiSDRs, other ZetaSDR nodes, VRT senders over UDP,
-//! and SoapySDR devices when built with `--cfg soapy`), knowledge (the builtin
-//! signatures and the signal catalogue) and classifiers (`zeta_dsp::classifiers`).
+//! Build the node the CLI drives: stage registry (core plus `zeta-dsp`, `transcribe` on the
+//! speech backend, plus `--plugin` stages), sources (SigMF files, KiwiSDRs, other ZetaSDR
+//! nodes, VRT senders over UDP, and SoapySDR devices when built with `--cfg soapy`),
+//! knowledge (the builtin signatures and the signal catalogue) and classifiers
+//! (`zeta_dsp::classifiers`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use zeta_core::classify::StubClassifier;
 use zeta_core::knowledge::StaticKnowledge;
@@ -17,6 +19,7 @@ use zeta_source_file::{FileOpts, FileSource};
 use zeta_source_kiwi::{KiwiConfig, KiwiSource};
 use zeta_source_node::{NodePort, NodeSourceConfig};
 use zeta_source_vrt::VrtSourceConfig;
+use zeta_speech::{SpeechBackend, TranscribeStage};
 
 use crate::sources::{PluginSpec, SourceSpec};
 
@@ -35,12 +38,18 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is set; pass --state-dir".into())
 }
 
+/// Longest a `transcribe` stage waits for the speech backend to answer one utterance.
+const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The stages the CLI node runs. `adsb_decode` runs the dump1090 found by
 /// [`zeta_ext::find_dump1090`]; which one (or that there is none) goes to stderr.
-pub fn registry() -> StageRegistry {
+/// `transcribe` runs on `speech`; without one it is still registered and its jobs fail
+/// saying the node has no speech backend.
+pub fn registry(speech: Option<Arc<dyn SpeechBackend>>) -> StageRegistry {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
     zeta_dsp::register_all(&mut registry);
+    registry.register(Arc::new(TranscribeStage::new(speech, TRANSCRIBE_TIMEOUT)));
     let dump1090 = zeta_ext::find_dump1090();
     match &dump1090 {
         Some(p) => eprintln!("zeta: adsb_decode via {}", p.display()),
@@ -101,8 +110,11 @@ fn open_soapy(_id: &str, _args: &str) -> Result<Arc<dyn Port>, String> {
 
 /// Probe each plugin and register it after the built-in stages. A kind that a built-in
 /// stage already has, or a failed probe, is an error naming the flag.
-async fn with_plugins(plugins: &[PluginSpec]) -> Result<StageRegistry, String> {
-    let mut reg = registry();
+async fn with_plugins(
+    plugins: &[PluginSpec],
+    speech: Option<Arc<dyn SpeechBackend>>,
+) -> Result<StageRegistry, String> {
+    let mut reg = registry(speech);
     for p in plugins {
         if reg.spec(&p.kind).is_some() {
             return Err(format!(
@@ -160,21 +172,23 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// for its source list here (with the secret from `ZETA_NODE_SECRET_<ID>`) and runs a
 /// `passthrough` job from each tune; a VRT source binds its UDP address here; a SoapySDR
 /// device is opened here. `resume` relaunches persisted `Running` jobs (`serve`); without it they
-/// are listed as persisted and left alone (one-shot). Errors name the flag, never a
-/// Kiwi password or a node secret. The node comes with its [`RemotePorts`].
+/// are listed as persisted and left alone (one-shot). `speech` is the backend `transcribe`
+/// jobs run on. Errors name the flag, never a Kiwi password or a node secret. The node
+/// comes with its [`RemotePorts`].
 pub async fn open(
     state_dir: PathBuf,
     sources: &[SourceSpec],
     plugins: &[PluginSpec],
     resume: bool,
     ring_budget_mb: Option<u64>,
+    speech: Option<Arc<dyn SpeechBackend>>,
 ) -> Result<(Node, RemotePorts), String> {
     let opts = FileOpts {
         realtime: true,
         block_samples: 4800,
         repeat: true,
     };
-    let registry = with_plugins(plugins).await?;
+    let registry = with_plugins(plugins, speech).await?;
     let mut files = Vec::new();
     let mut ports: Vec<Arc<dyn Port>> = Vec::new();
     let mut remotes = RemotePorts::default();
@@ -297,7 +311,7 @@ mod tests {
             .collect();
         assert!(kinds.len() >= 5, "kinds read from schema: {kinds:?}");
         let src = SourceId("src".into());
-        let registry = registry();
+        let registry = registry(None);
         for kind in kinds {
             for rate in [
                 12_000u64, 48_000, 1_000_000, 2_048_000, 2_400_000, 8_000_000, 10_000_000,

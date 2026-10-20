@@ -83,6 +83,12 @@ async fn main() -> ExitCode {
         },
         Some(_) => None,
     };
+    // One backend serves `transcribe` jobs (a one-shot can start or attach one) and, with
+    // `serve --listen`, `POST /stt`.
+    let speech = match transport::speech_backend(&speech_args, &state_dir).await {
+        Ok(s) => s,
+        Err(e) => return fail(&e),
+    };
     // Only `serve` (op `None`) resumes jobs; a one-shot never launches or fails them.
     let (node, remotes) = match node_setup::open(
         state_dir.clone(),
@@ -90,6 +96,7 @@ async fn main() -> ExitCode {
         &plugins,
         op.is_none(),
         cli.ring_budget_mb,
+        speech.clone(),
     )
     .await
     {
@@ -100,16 +107,7 @@ async fn main() -> ExitCode {
         eprintln!("zeta: warning: unreadable job record {name}");
     }
     let code = match op {
-        None => {
-            transport::serve(
-                node,
-                &serve_args,
-                &speech_args,
-                secret.as_deref(),
-                state_dir,
-            )
-            .await
-        }
+        None => transport::serve(node, &serve_args, speech, secret.as_deref()).await,
         Some(op) => one_shot(&node, op, then_tail, keep).await,
     };
     // Remote nodes' `passthrough` jobs end with this process, not with the runtime.

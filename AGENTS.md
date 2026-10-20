@@ -213,6 +213,11 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.bandwidth_hz: integer
 - params.out_rate_hz: integer
 
+### denoise
+
+- inputs: audio
+- outputs: audio
+
 ### fft
 
 - inputs: iq
@@ -256,6 +261,16 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.sideband: string (Sideband: usb|lsb)
 - params.audio_rate_hz: integer
 - params.audio_bandwidth_hz: integer
+
+### transcribe
+
+- inputs: audio
+- outputs: event
+
+### vad
+
+- inputs: audio
+- outputs: audio, event
 
 ### wfm_demod
 

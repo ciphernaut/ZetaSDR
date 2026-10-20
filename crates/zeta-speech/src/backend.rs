@@ -26,7 +26,7 @@ pub enum SpeechError {
     Unreachable(String),
     #[error("speech daemon: {0}")]
     Daemon(String),
-    #[error("the speech daemon did not answer within {} s", .0.as_secs())]
+    #[error("the speech daemon did not answer within {} s", .0.as_secs_f64())]
     Timeout(Duration),
 }
 

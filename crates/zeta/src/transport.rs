@@ -47,6 +47,10 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             Ok(d) => d,
             Err(e) => return Ok(usage(&e)),
         };
+        let speech = match speech_backend(&cli.speech, &state_dir).await {
+            Ok(s) => s,
+            Err(e) => return Ok(usage(&e)),
+        };
         return Ok(ask::run(
             args,
             None,
@@ -54,6 +58,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             &sources,
             &plugins,
             cli.ring_budget_mb,
+            speech,
         )
         .await);
     }
@@ -81,7 +86,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
         Err(e) => return usage(&e.to_string()),
     };
     if let Command::Ask(args) = cli.command {
-        return ask::run(args, Some(client), PathBuf::new(), &[], &[], None).await;
+        return ask::run(args, Some(client), PathBuf::new(), &[], &[], None, None).await;
     }
     let op = match cli.command.into_op() {
         Ok(Some(op)) => op,
@@ -113,13 +118,13 @@ async fn shutdown_signal() -> std::io::Result<()> {
     }
 }
 
-/// Run `serve`: wait for Ctrl-C or SIGTERM, also serving the API when `--listen` is given.
+/// Run `serve`: wait for Ctrl-C or SIGTERM, also serving the API when `--listen` is given
+/// (`POST /stt` on `speech`).
 pub async fn serve(
     node: Node,
     args: &ServeArgs,
-    speech_args: &SpeechArgs,
+    speech: Option<Arc<dyn SpeechBackend>>,
     secret: Option<&str>,
-    state_dir: PathBuf,
 ) -> ExitCode {
     let Some(listen) = &args.listen else {
         if std::env::args().any(|a| a.starts_with("--llm-")) {
@@ -142,10 +147,6 @@ pub async fn serve(
     let ask_model = llm.as_ref().map(|l| l.model.clone());
     let secret_text = secret.unwrap_or_default();
     let secret = match Secret::new(secret_text) {
-        Ok(s) => s,
-        Err(e) => return usage(&e),
-    };
-    let speech = match speech_backend(speech_args, &state_dir).await {
         Ok(s) => s,
         Err(e) => return usage(&e),
     };
