@@ -125,7 +125,9 @@ the rigid ones and follows their capture.
 
 Every operation the node applies (the records already on the `ops` stream: op, result or error,
 transport, `t_ns`) is appended as one JSON line to `<state_dir>/ops.log`, rotated to `ops.log.1` at
-8 MiB (two files at most). `zeta ops tail [--lines N]` prints the last N lines (default 50) from the
+8 MiB (two files at most); a successful read-only op (`source_list`, `job_list`, `stream_list`,
+`stream_tail`, `schema`, `job_context`, `graph_get`, `knowledge_lookup`) is logged without its result
+(amended by the final review, ruling R22). `zeta ops tail [--lines N]` prints the last N lines (default 50) from the
 state directory (one-shot, local; `--node` is a usage error), so an operator can see which client
 stopped a job after the fact. The log is written by the node, never read by it; nothing else changes.
 

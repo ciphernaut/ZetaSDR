@@ -428,3 +428,59 @@ async fn unwritable_ops_log_does_not_fail_ops() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("ops.log"), "{errors:?}");
 }
+
+/// The lines of the state directory's `ops.log`, as JSON.
+fn log_lines(dir: &Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("state").join("ops.log"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn read_only_ops_are_logged_without_their_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    node.apply(Op::JobList {}).await.unwrap();
+    let id = match node
+        .apply(Op::JobStart {
+            kind: zeta_core::ops::JobKind::Passthrough,
+            source: SourceId("file0".into()),
+            center_hz: zeta_core::types::Hz(100_000_000),
+            bandwidth_hz: zeta_core::types::Hz(48_000),
+            deviation_hz: None,
+            sideband: None,
+            elastic: false,
+            replace: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        OpResult::Job(id) => id,
+        r => panic!("job_start: {r:?}"),
+    };
+    node.apply(Op::JobContext {
+        job: JobId("nope".into()),
+    })
+    .await
+    .unwrap_err();
+    node.apply(Op::JobStop { job: id }).await.unwrap();
+
+    let lines = log_lines(dir.path());
+    let ops: Vec<&str> = lines
+        .iter()
+        .map(|l| l["op"]["op"].as_str().unwrap())
+        .collect();
+    assert_eq!(ops, ["job_list", "job_start", "job_context", "job_stop"]);
+    // A successful read: op, outcome, transport and time, no result.
+    assert!(lines[0].get("result").is_none(), "{}", lines[0]);
+    assert_eq!(lines[0]["outcome"], "ok");
+    assert_eq!(lines[0]["transport"], "local");
+    assert!(lines[0]["t_ns"].is_u64());
+    // A mutating op keeps its result; a failed read keeps its error.
+    assert_eq!(lines[1]["result"]["result"], "job");
+    assert_eq!(lines[2]["outcome"], "error");
+    assert_eq!(lines[2]["error"]["error"], "unknown");
+    assert!(lines[3].get("result").is_some(), "{}", lines[3]);
+}

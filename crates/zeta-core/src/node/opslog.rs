@@ -10,6 +10,9 @@ const MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub(super) struct OpsLog {
     path: PathBuf,
     max_bytes: u64,
+    /// Held across the rotate and the write, so two appends never both rotate
+    /// (the second renaming the fresh file over `ops.log.1`, or failing).
+    lock: std::sync::Mutex<()>,
 }
 
 impl OpsLog {
@@ -18,12 +21,18 @@ impl OpsLog {
     }
 
     pub(super) fn with_max_bytes(path: PathBuf, max_bytes: u64) -> Self {
-        Self { path, max_bytes }
+        Self {
+            path,
+            max_bytes,
+            lock: std::sync::Mutex::new(()),
+        }
     }
 
     /// Append `line` as one `\n`-terminated line. A file already longer than
     /// `max_bytes` is first renamed to `<path>.1`, replacing any older one.
+    /// Concurrent appends are serialised.
     pub(super) fn append(&self, line: &serde_json::Value) -> std::io::Result<()> {
+        let _held = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         if std::fs::metadata(&self.path).is_ok_and(|m| m.len() > self.max_bytes) {
             let mut old = self.path.clone().into_os_string();
             old.push(".1");
@@ -52,6 +61,39 @@ mod tests {
         log.append(&json!({"n": 2})).unwrap();
         let text = std::fs::read_to_string(dir.path().join("ops.log")).unwrap();
         assert_eq!(text, "{\"n\":1}\n{\"n\":2}\n");
+    }
+
+    #[test]
+    fn concurrent_appends_rotate_once_and_lose_no_line() {
+        // 8 threads x 25 lines of 40 bytes = 8000 bytes: past 5000 the log rotates
+        // exactly once, so every line is in `ops.log.1` or `ops.log`. Repeated, as
+        // a race between two rotations needs luck to show.
+        for round in 0..50 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ops.log");
+            let log = std::sync::Arc::new(OpsLog::with_max_bytes(path.clone(), 5000));
+            let threads: Vec<_> = (0..8)
+                .map(|t| {
+                    let log = log.clone();
+                    std::thread::spawn(move || {
+                        for n in 0..25 {
+                            log.append(&json!({"n": format!("{t:02}-{n:02}-{}", "x".repeat(23))}))
+                                .unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            let old = std::fs::read_to_string(dir.path().join("ops.log.1")).unwrap_or_default();
+            let cur = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                old.lines().count() + cur.lines().count(),
+                200,
+                "round {round}"
+            );
+        }
     }
 
     #[test]

@@ -995,6 +995,22 @@ impl Op {
         }
     }
 
+    /// Whether the op only reads the node's state: its result is left out of
+    /// `ops.log` when it succeeds (a page polls these several times a second).
+    pub fn read_only(&self) -> bool {
+        matches!(
+            self,
+            Op::SourceList {}
+                | Op::JobList {}
+                | Op::StreamList {}
+                | Op::StreamTail { .. }
+                | Op::Schema {}
+                | Op::JobContext { .. }
+                | Op::GraphGet { .. }
+                | Op::KnowledgeLookup { .. }
+        )
+    }
+
     /// The op as JSON for the `ops` stream: the full value when it fits in
     /// [`OPS_RESULT_LIMIT_BYTES`], otherwise
     /// `{"op": <name>, "truncated": true, "bytes": n}`. A value that fails to

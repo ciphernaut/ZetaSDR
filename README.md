@@ -72,7 +72,8 @@ Taking a source from other jobs, and the node's ops log:
 
 A `conflict` error names the holders and offers `retry with replace: [<ids>]`; `--replace` ids
 must hold that source as rigid leases; naming an elastic job is the error `job <id> does not hold source <src>`, nothing is stopped and it keeps running. Replace is not transactional: if a holder you did not name still conflicts, the jobs you named stay stopped. Elastic jobs are listed under `elastic` in `source list`.
-Every applied op is appended as one JSON line (the op's payload plus `t_ns`) to `<state-dir>/ops.log`,
+Every applied op is appended as one JSON line (the op's payload plus `t_ns`) to `<state-dir>/ops.log`
+(a read-only op that succeeds, such as `source list` or `stream tail`, without its result),
 rotated to `ops.log.1` past 8 MiB; `ops tail` reads it and is a usage error with `--node`. A restart
 restores a source's capture (the band bounding its rigid jobs, when the radio can capture it),
 resumes its jobs a scan first, then widest first, elastic after rigid, and re-expands a built-in graph if the

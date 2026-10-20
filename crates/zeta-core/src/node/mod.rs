@@ -685,6 +685,13 @@ impl Node {
             Payload::Event(payload),
         ));
         line["t_ns"] = start_ns.0.into();
+        // A successful read is logged without its result: who asked, and when.
+        if outcome.is_ok()
+            && logged.read_only()
+            && let Some(m) = line.as_object_mut()
+        {
+            m.remove("result");
+        }
         self.log_op(&line);
         outcome
     }
