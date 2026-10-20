@@ -173,6 +173,7 @@ impl Stage for NbfmDemodStage {
                 prov,
                 Payload::Audio {
                     sample_rate_hz: Hz(p.audio_rate_hz),
+                    channels: 1,
                     samples: samples.into(),
                 },
             )])
@@ -319,6 +320,7 @@ mod tests {
         let Payload::Audio {
             sample_rate_hz,
             samples,
+            ..
         } = &f.payload
         else {
             panic!("expected an audio payload")
@@ -342,6 +344,7 @@ mod tests {
         let Payload::Audio {
             sample_rate_hz,
             samples,
+            ..
         } = &f.payload
         else {
             panic!("expected an audio payload")

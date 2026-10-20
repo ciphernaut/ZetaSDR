@@ -45,6 +45,7 @@ fn header_is_plan3_ws_frame_json() {
         })),
         frame(Payload::Audio {
             sample_rate_hz: Hz(12_000),
+            channels: 1,
             samples: Arc::from(vec![0.25f32, -0.5]),
         }),
         frame(Payload::Event(json!({"label":"ft8","freq_hz":7_074_000}))),

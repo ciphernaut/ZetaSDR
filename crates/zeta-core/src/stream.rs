@@ -14,8 +14,11 @@ use crate::types::{Hz, Provenance, StreamId, StreamKind};
 #[derive(Clone, Debug)]
 pub enum Payload {
     Iq(IqBlock),
+    /// PCM audio. `samples` is interleaved (`frames × channels` values); `channels` is at
+    /// least 1, and the bus refuses a frame that says 0.
     Audio {
         sample_rate_hz: Hz,
+        channels: u16,
         samples: Arc<[f32]>,
     },
     /// Deferred: no video payload is carried yet.
@@ -103,11 +106,16 @@ impl StreamBus {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            if matches!(frame.payload, Payload::Audio { channels: 0, .. }) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let _ = tx.send(frame);
         }
     }
 
-    /// Number of frames dropped for carrying the wrong kind for their stream.
+    /// Number of frames dropped for carrying the wrong kind for their stream, or an audio
+    /// frame with 0 channels.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -185,6 +193,31 @@ mod tests {
         let got = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(got.is_err(), "mismatched frame must not be delivered");
         assert_eq!(bus.dropped(), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_audio_with_zero_channels() {
+        let bus = StreamBus::new(8);
+        let p = prov("s");
+        let id = bus.register(StreamKind::Audio, p.clone());
+        let mut rx = bus.subscribe(&id).unwrap();
+        let audio = |channels| {
+            Frame::new(
+                id.clone(),
+                p.clone(),
+                Payload::Audio {
+                    sample_rate_hz: Hz(8_000),
+                    channels,
+                    samples: Arc::from(vec![0.0f32; 4]),
+                },
+            )
+        };
+        bus.publish(audio(0));
+        let got = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(got.is_err(), "a 0-channel frame must not be delivered");
+        assert_eq!(bus.dropped(), 1);
+        bus.publish(audio(2));
+        assert!(rx.recv().await.is_ok());
     }
 
     #[tokio::test]

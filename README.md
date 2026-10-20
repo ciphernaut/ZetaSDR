@@ -549,7 +549,7 @@ samples, at most 16 384 per packet) with a context packet first and then about o
 carrying the RF centre, sample rate and bandwidth; each packet is one binary websocket message.
 Audio, text and events go as the typed envelope, the plugin wire's data-frame framing
 (`u32LE header_len | frame summary JSON | u32LE body_len | body`, the body `f32` LE PCM for
-audio, UTF-8 for text, empty for events). The server sends nothing until the client grants
+audio (interleaved; the header payload's `channels`, 1 when absent, and `samples` per channel, so the body is `samples × channels × 4` bytes), UTF-8 for text, empty for events). The server sends nothing until the client grants
 credit with a text message `{"type":"credit","packets":N}` (N in 1..=4096; at most 65 536
 outstanding); each binary message spends one. A frame that finds no credit is skipped, not
 queued, and the count goes out as `{"type":"lagged","missed":K}` before the next frame sent.

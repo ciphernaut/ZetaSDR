@@ -68,12 +68,13 @@ mod tests {
             StreamKind::Audio,
             Payload::Audio {
                 sample_rate_hz: Hz(48_000),
+                channels: 1,
                 samples: Arc::from(vec![0.5f32, -0.75]),
             },
         ));
         assert_eq!(
             audio.payload,
-            json!({"sample_rate_hz":48000,"samples":2,"peak":0.75})
+            json!({"sample_rate_hz":48000,"channels":1,"samples":2,"peak":0.75})
         );
         assert_eq!(audio.kind, StreamKind::Audio);
         assert_eq!(audio.channel, Some(ChannelId("c1".into())));
@@ -98,6 +99,31 @@ mod tests {
 
         let event = ws_frame(&frame(StreamKind::Event, Payload::Event(json!({"n":1}))));
         assert_eq!(event.payload, json!({"n":1}));
+    }
+
+    #[test]
+    fn stereo_audio_counts_samples_per_channel() {
+        let audio = ws_frame(&frame(
+            StreamKind::Audio,
+            Payload::Audio {
+                sample_rate_hz: Hz(48_000),
+                channels: 2,
+                samples: Arc::from(vec![0.5f32, -0.75, 0.25, 0.0]),
+            },
+        ));
+        assert_eq!(
+            audio.payload,
+            json!({"sample_rate_hz":48000,"channels":2,"samples":2,"peak":0.75})
+        );
+        // A header from an older node has no `channels`: it still parses, and means mono.
+        let old = json!({"type":"frame","stream":"s1","kind":"audio","source":"src",
+            "job":null,"channel":null,"start_ns":1,"end_ns":2,
+            "payload":{"sample_rate_hz":48000,"samples":2,"peak":0.75}});
+        let WsMessage::Frame(f) = serde_json::from_value(old).unwrap() else {
+            panic!("expected a frame");
+        };
+        assert_eq!(f.payload.get("channels"), None);
+        assert_eq!(f.payload["channels"].as_u64().unwrap_or(1), 1);
     }
 
     #[test]

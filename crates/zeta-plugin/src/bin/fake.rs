@@ -200,6 +200,7 @@ async fn main() {
                         prov(),
                         Payload::Audio {
                             sample_rate_hz: zeta_core::types::Hz(48_000),
+                            channels: 1,
                             samples: vec![0.5f32; 4].into(),
                         },
                     )),

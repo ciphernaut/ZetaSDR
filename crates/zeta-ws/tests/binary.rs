@@ -204,9 +204,10 @@ async fn audio_binary_frames_are_envelopes() {
     ts.node.bus().publish(Frame {
         stream: id.clone(),
         kind: StreamKind::Audio,
-        provenance: prov,
+        provenance: prov.clone(),
         payload: Payload::Audio {
             sample_rate_hz: Hz(48_000),
+            channels: 1,
             samples: Arc::from(samples.clone()),
         },
     });
@@ -216,12 +217,38 @@ async fn audio_binary_frames_are_envelopes() {
     assert_eq!(header.stream, id);
     assert_eq!(header.payload["samples"], 5);
     assert_eq!(header.payload["sample_rate_hz"], 48_000);
+    assert_eq!(header.payload["channels"], 1);
     assert_eq!(body.len(), samples.len() * 4);
     let back: Vec<f32> = body
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
     assert_eq!(back, samples);
+
+    // Two interleaved channels: `samples` stays per channel, the body holds both.
+    credit(&mut ws, 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stereo: Vec<f32> = vec![0.5, -0.5, 0.25, -0.25, 0.125, -0.125];
+    ts.node.bus().publish(Frame {
+        stream: id.clone(),
+        kind: StreamKind::Audio,
+        provenance: prov,
+        payload: Payload::Audio {
+            sample_rate_hz: Hz(48_000),
+            channels: 2,
+            samples: Arc::from(stereo.clone()),
+        },
+    });
+    let bytes = binary(&mut ws).await;
+    let (header, body) = parse_envelope(&bytes).unwrap();
+    assert_eq!(header.payload["channels"], 2);
+    assert_eq!(header.payload["samples"], 3);
+    assert_eq!(body.len(), 3 * 2 * 4);
+    let back: Vec<f32> = body
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(back, stereo);
     drop(ws);
     ts.stop().await;
 }

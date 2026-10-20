@@ -88,6 +88,7 @@ impl Stage for AprsDecodeStage {
             };
             let Payload::Audio {
                 sample_rate_hz,
+                channels,
                 samples,
             } = &frame.payload
             else {
@@ -95,6 +96,11 @@ impl Stage for AprsDecodeStage {
                     "aprs_decode expects audio frames".into(),
                 ));
             };
+            if *channels != 1 {
+                return Err(StageError::Failed(format!(
+                    "aprs_decode expects mono audio, got {channels} channels"
+                )));
+            }
             let rate = sample_rate_hz.0;
             let d = match &mut dec {
                 Some(d) if d.rate_hz != rate => {
@@ -174,6 +180,7 @@ mod tests {
             prov(),
             Payload::Audio {
                 sample_rate_hz: Hz(rate_hz),
+                channels: 1,
                 samples: samples.into(),
             },
         )

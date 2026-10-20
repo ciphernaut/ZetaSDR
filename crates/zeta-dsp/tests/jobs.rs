@@ -103,6 +103,7 @@ async fn fm_demod_job_produces_audio_with_tone() {
                 Ok(f) => {
                     let Payload::Audio {
                         sample_rate_hz,
+                        channels: _,
                         samples: s,
                     } = &f.payload
                     else {
@@ -290,6 +291,7 @@ async fn collect_audio(node: &Node, id: &JobId, rate_hz: u64, want: usize) -> Ve
                 Ok(f) => {
                     let Payload::Audio {
                         sample_rate_hz,
+                        channels: _,
                         samples: s,
                     } = &f.payload
                     else {

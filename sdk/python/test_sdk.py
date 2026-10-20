@@ -38,9 +38,19 @@ IQ = data_frame(IQ_HEADER, IQ_BODY)
 
 AUDIO_HEADER = (
     b'{"type":"frame","stream":"s1","kind":"audio","source":"src","job":"j1","channel":null,'
-    b'"start_ns":10,"end_ns":20,"payload":{"peak":0.5,"sample_rate_hz":12000,"samples":2}}'
+    b'"start_ns":10,"end_ns":20,"payload":{"channels":1,"peak":0.5,"sample_rate_hz":12000,"samples":2}}'
 )
 AUDIO = data_frame(AUDIO_HEADER, bytes.fromhex("0000803e" "000000bf"))  # 0.25, -0.5
+
+# An old host or plugin sends no `channels`: that means 1.
+AUDIO_LEGACY_HEADER = AUDIO_HEADER.replace(b'"channels":1,', b"")
+AUDIO_LEGACY = data_frame(AUDIO_LEGACY_HEADER, bytes.fromhex("0000803e" "000000bf"))
+
+# Two channels, interleaved: samples is the per-channel count, so 2 x 2 x 4 body bytes.
+AUDIO_STEREO_HEADER = AUDIO_HEADER.replace(b'"channels":1', b'"channels":2')
+AUDIO_STEREO = data_frame(
+    AUDIO_STEREO_HEADER, bytes.fromhex("0000803e" "000000bf" "0000003f" "0000803e")
+)  # L0 0.25, R0 -0.5, L1 0.5, R1 0.25
 
 EVENT = data_frame(
     b'{"type":"frame","stream":"s1","kind":"event","source":"src","job":null,"channel":null,'
@@ -76,6 +86,20 @@ class Codec(unittest.TestCase):
         self.assertEqual(f.samples, [0.25, -0.5])
         self.assertEqual(encode_frame(f), AUDIO)
 
+    def test_audio_without_channels_means_mono(self):
+        f = decode(AUDIO_LEGACY)
+        self.assertEqual(f.channels, 1)
+        self.assertEqual(f.samples, [0.25, -0.5])
+        self.assertEqual(encode_frame(f), AUDIO_LEGACY)
+        self.assertEqual(decode(AUDIO).channels, 1)
+
+    def test_stereo_audio_round_trips(self):
+        f = decode(AUDIO_STEREO)
+        self.assertEqual(f.channels, 2)
+        self.assertEqual(f.payload["samples"], 2)
+        self.assertEqual(f.samples, [0.25, -0.5, 0.5, 0.25])
+        self.assertEqual(encode_frame(f), AUDIO_STEREO)
+
     def test_event_round_trips(self):
         f = decode(EVENT)
         self.assertIsNone(f.samples)
@@ -98,6 +122,14 @@ class Codec(unittest.TestCase):
     def test_with_samples_updates_audio_peak(self):
         g = decode(AUDIO).with_samples([0.1, -0.75])
         self.assertEqual(g.payload["peak"], 0.75)
+
+    def test_with_samples_counts_audio_per_channel(self):
+        g = decode(AUDIO_STEREO).with_samples([0.1, 0.2, 0.3, -0.75, 0.0, 0.0])
+        self.assertEqual(g.payload["samples"], 3)
+        self.assertEqual(g.payload["channels"], 2)
+        self.assertEqual(g.payload["peak"], 0.75)
+        with self.assertRaises(ValueError):
+            decode(AUDIO_STEREO).with_samples([0.1, 0.2, 0.3])
 
     def test_control_lines(self):
         hello = encode_control(
@@ -123,6 +155,8 @@ class Codec(unittest.TestCase):
             (b"A", "unexpected byte 0x41"),
             (IQ[:-3], "inside the body"),
             (data_frame(IQ_HEADER, IQ_BODY[:8]), "2 samples has a 8-byte body"),
+            (data_frame(AUDIO_STEREO_HEADER, bytes(8)), "2 samples has a 8-byte body"),
+            (data_frame(AUDIO_HEADER.replace(b'"channels":1', b'"channels":0'), bytes(8)), "channels"),
             (b"\x00" + u32(0), "header length 0"),
             (b'{"type":"stop"}', "inside the control line"),
             (b"{" + b" " * zeta_plugin.MAX_CONTROL + b"}\n", "limit"),

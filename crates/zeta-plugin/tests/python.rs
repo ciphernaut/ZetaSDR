@@ -374,7 +374,7 @@ fn python_sdk_fixtures_are_the_hosts_bytes() {
         .args(["-I", "-c"])
         .arg(format!(
             "import sys; sys.path.insert(0, {sdk:?}); import test_sdk as t; \
-             print(t.IQ.hex(), t.AUDIO.hex(), t.EVENT.hex())",
+             print(t.IQ.hex(), t.AUDIO.hex(), t.AUDIO_STEREO.hex(), t.EVENT.hex())",
             sdk = sdk.display().to_string()
         ))
         .output()
@@ -413,7 +413,17 @@ fn python_sdk_fixtures_are_the_hosts_bytes() {
             prov(Some("j1"), None),
             Payload::Audio {
                 sample_rate_hz: Hz(12_000),
+                channels: 1,
                 samples: [0.25f32, -0.5].into_iter().collect(),
+            },
+        ),
+        Frame::new(
+            StreamId("s1".into()),
+            prov(Some("j1"), None),
+            Payload::Audio {
+                sample_rate_hz: Hz(12_000),
+                channels: 2,
+                samples: [0.25f32, -0.5, 0.5, 0.25].into_iter().collect(),
             },
         ),
         Frame::new(

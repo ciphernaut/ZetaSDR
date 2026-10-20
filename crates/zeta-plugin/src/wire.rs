@@ -27,7 +27,9 @@
 //! - `iq`: payload `{"sample_rate_hz","center_hz","samples":N}`, body `N × 8` bytes,
 //!   interleaved `f32` little-endian I then Q (SigMF `cf32_le`); the block's `t0` is
 //!   `start_ns`.
-//! - `audio`: payload `{"sample_rate_hz","samples":N,"peak"}`, body `N × 4` bytes `f32` LE.
+//! - `audio`: payload `{"sample_rate_hz","channels":C,"samples":N,"peak"}`, body `N × C × 4`
+//!   bytes `f32` LE, interleaved (`N` is the per-channel count). A frame without `channels`
+//!   has `C = 1`; `C` must not be 0.
 //! - `event`: payload is the event, `B = 0`.
 //! - `text`: payload is the string, `B = 0`.
 //! - `video` and `sink` are refused in protocol 1.
@@ -89,6 +91,9 @@ pub enum WireError {
     KindNotCarried(StreamKind),
     #[error("{} frame has sample_rate_hz 0", kind_name(*.0))]
     ZeroRate(StreamKind),
+    /// An audio frame that says it has 0 channels.
+    #[error("audio frame with 0 channels")]
+    ZeroChannels,
     #[error("bad json: {0}")]
     Json(String),
     #[error("i/o: {0}")]
@@ -234,9 +239,17 @@ struct IqSummary {
 #[serde(deny_unknown_fields)]
 struct AudioSummary {
     sample_rate_hz: u64,
+    /// Absent from an old sender's header: one channel.
+    #[serde(default = "one_channel")]
+    channels: u16,
+    /// Frames, not values: the body holds `samples × channels` of them.
     samples: usize,
     #[allow(dead_code)]
     peak: Option<f64>,
+}
+
+fn one_channel() -> u16 {
+    1
 }
 
 fn json_err(e: serde_json::Error) -> WireError {
@@ -412,8 +425,11 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, WireError>
             if p.sample_rate_hz == 0 {
                 return Err(WireError::ZeroRate(StreamKind::Audio));
             }
-            let n = p.samples;
-            (Shape::Audio(p), n, 4)
+            if p.channels == 0 {
+                return Err(WireError::ZeroChannels);
+            }
+            let (n, w) = (p.samples, 4 * usize::from(p.channels));
+            (Shape::Audio(p), n, w)
         }
         StreamKind::Text => {
             let t: String = serde_json::from_value(s.payload).map_err(json_err)?;
@@ -458,6 +474,7 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, WireError>
         }),
         Shape::Audio(p) => Payload::Audio {
             sample_rate_hz: Hz(p.sample_rate_hz),
+            channels: p.channels,
             samples: body
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -581,6 +598,12 @@ mod tests {
                "payload":{"sample_rate_hz":48000,"center_hz":100000000,"samples":samples}})
     }
 
+    fn audio_header(payload: &str) -> Value {
+        json!({"type":"frame","stream":"s1","kind":"audio","source":"src","job":null,
+               "channel":null,"start_ns":7,"end_ns":8,
+               "payload":serde_json::from_str::<Value>(payload).unwrap()})
+    }
+
     async fn read_all(mut bytes: &[u8]) -> Result<Option<Message>, WireError> {
         read_message(&mut bytes).await
     }
@@ -633,13 +656,14 @@ mod tests {
     async fn audio_event_text_roundtrip() {
         let audio = frame(Payload::Audio {
             sample_rate_hz: Hz(48_000),
+            channels: 1,
             samples: Arc::from(vec![0.5f32, -0.75, 0.125]),
         });
         let bytes = encode_frame(&audio).unwrap();
         let (header, body) = header_of(&bytes);
         assert_eq!(
             header["payload"],
-            json!({"sample_rate_hz":48000,"samples":3,"peak":0.75})
+            json!({"sample_rate_hz":48000,"channels":1,"samples":3,"peak":0.75})
         );
         assert_eq!(body.len(), 12);
         assert_eq!(&body[4..8], &(-0.75f32).to_le_bytes());
@@ -648,14 +672,77 @@ mod tests {
         };
         let Payload::Audio {
             sample_rate_hz,
+            channels,
             samples,
         } = &back.payload
         else {
             panic!("expected audio");
         };
         assert_eq!(*sample_rate_hz, Hz(48_000));
+        assert_eq!(*channels, 1);
         assert_eq!(&samples[..], &[0.5f32, -0.75, 0.125]);
         assert_eq!(back.provenance, audio.provenance);
+
+        // Two channels: `samples` counts frames, the body is samples x channels x 4 bytes.
+        let stereo = frame(Payload::Audio {
+            sample_rate_hz: Hz(48_000),
+            channels: 2,
+            samples: Arc::from(vec![0.5f32, -0.5, 0.25, -0.25, 0.125, -0.125]),
+        });
+        let bytes = encode_frame(&stereo).unwrap();
+        let (header, body) = header_of(&bytes);
+        assert_eq!(header["payload"]["channels"], 2);
+        assert_eq!(header["payload"]["samples"], 3);
+        assert_eq!(body.len(), 24);
+        let Some(Message::Frame(back)) = read_all(&bytes).await.unwrap() else {
+            panic!("expected a frame");
+        };
+        let (
+            Payload::Audio {
+                channels, samples, ..
+            },
+            Payload::Audio { samples: want, .. },
+        ) = (&back.payload, &stereo.payload)
+        else {
+            panic!("expected audio");
+        };
+        assert_eq!(*channels, 2);
+        assert_eq!(samples, want);
+        assert_eq!(encode_frame(&back).unwrap(), bytes);
+
+        // A header without `channels` (an old sender) is mono.
+        let old = raw_frame(
+            &audio_header(r#"{"sample_rate_hz":48000,"samples":2,"peak":0.5}"#),
+            8,
+            &[0u8; 8],
+        );
+        let Some(Message::Frame(back)) = read_all(&old).await.unwrap() else {
+            panic!("expected a frame");
+        };
+        assert!(
+            matches!(&back.payload, Payload::Audio { channels: 1, samples, .. } if samples.len() == 2)
+        );
+
+        // The body must be samples x channels x 4 bytes, and channels must not be 0.
+        let short = raw_frame(
+            &audio_header(r#"{"sample_rate_hz":48000,"channels":2,"samples":2,"peak":0.5}"#),
+            8,
+            &[0u8; 8],
+        );
+        assert_eq!(
+            read_all(&short).await.unwrap_err(),
+            WireError::BodyMismatch {
+                kind: StreamKind::Audio,
+                samples: 2,
+                bytes: 8
+            }
+        );
+        let zero = raw_frame(
+            &audio_header(r#"{"sample_rate_hz":48000,"channels":0,"samples":0,"peak":0}"#),
+            0,
+            &[],
+        );
+        assert_eq!(read_all(&zero).await.unwrap_err(), WireError::ZeroChannels);
 
         let event = frame(Payload::Event(json!({"label":"fsk","snr_db":12.5})));
         let bytes = encode_frame(&event).unwrap();

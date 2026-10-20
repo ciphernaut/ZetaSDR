@@ -734,10 +734,12 @@ impl FrameSummary {
             Payload::Text(t) => serde_json::Value::String(t.clone()),
             Payload::Audio {
                 sample_rate_hz,
+                channels,
                 samples,
             } => serde_json::json!({
                 "sample_rate_hz": sample_rate_hz.0,
-                "samples": samples.len(),
+                "channels": channels,
+                "samples": samples.len() / usize::from((*channels).max(1)),
                 "peak": samples.iter().fold(0.0f32, |m, s| m.max(s.abs())),
             }),
             Payload::Iq(b) | Payload::Sink(b) => serde_json::json!({

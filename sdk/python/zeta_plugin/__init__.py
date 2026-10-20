@@ -27,12 +27,14 @@ with `payload` the frame summary for the kind. Body by kind:
 - `iq`: payload `{"sample_rate_hz","center_hz","samples":N}`, body `N × 8` bytes,
   interleaved `f32` little-endian I then Q (SigMF `cf32_le`); the block's `t0` is
   `start_ns`.
-- `audio`: payload `{"sample_rate_hz","samples":N,"peak"}`, body `N × 4` bytes `f32` LE.
+- `audio`: payload `{"sample_rate_hz","channels":C,"samples":N,"peak"}`, body `N × C × 4`
+  bytes `f32` LE, interleaved (`N` is the per-channel count). A frame without `channels`
+  has `C = 1`; `C` must not be 0.
 - `event`: payload is the event, `B = 0`.
 - `text`: payload is the string, `B = 0`.
 - `video` and `sink` are refused in protocol 1.
 
-`B` must match `N`, and an `iq` or `audio` `sample_rate_hz` must not be 0. Every length is checked before anything is allocated or indexed: a
+`B` must match `N` (times `C` for audio), and an `iq` or `audio` `sample_rate_hz` must not be 0. Every length is checked before anything is allocated or indexed: a
 malformed message is a [`WireError`] naming what was wrong, never a panic.
 """
 
@@ -102,11 +104,28 @@ class Frame:
         self.samples = samples
         self.payload = header.get("payload") if payload is None else payload
 
+    @property
+    def channels(self):
+        """An audio frame's interleaved channel count (1 when the header carries none)."""
+        return _channels(self.payload)
+
     def with_samples(self, samples):
-        """A copy carrying `samples`, with `payload["samples"]` (and audio's `peak`) updated."""
+        """A copy carrying `samples`, with `payload["samples"]` (and audio's `peak`) updated.
+
+        An audio frame's `samples` are interleaved; the count is per channel, so the list
+        length must be a multiple of `channels`."""
         samples = list(samples)
         payload = dict(self.payload)
-        payload["samples"] = len(samples)
+        if self.kind == "audio":
+            channels = self.channels
+            if len(samples) % channels:
+                raise ValueError(
+                    "%d audio samples are not a whole number of %d-channel frames"
+                    % (len(samples), channels)
+                )
+            payload["samples"] = len(samples) // channels
+        else:
+            payload["samples"] = len(samples)
         if self.kind == "audio":
             peak = 0.0
             for s in samples:
@@ -202,7 +221,7 @@ def read_message(stream):
     if kind == "iq":
         width = 8
     elif kind == "audio":
-        width = 4
+        width = 4 * _channels(payload)
     elif kind in ("event", "text"):
         width = 0
     else:
@@ -215,10 +234,18 @@ def read_message(stream):
         flat = struct.unpack("<%df" % (2 * n), body)
         samples = [complex(flat[2 * i], flat[2 * i + 1]) for i in range(n)]
     elif kind == "audio":
-        samples = list(struct.unpack("<%df" % n, body))
+        samples = list(struct.unpack("<%df" % (n * width // 4), body))
     else:
         samples = None
     return Frame(kind, header, samples, payload)
+
+
+def _channels(payload):
+    """An audio payload's channel count: 1 when absent, a positive integer otherwise."""
+    c = payload.get("channels", 1)
+    if isinstance(c, bool) or not isinstance(c, int) or c < 1:
+        raise ProtocolError("audio channels %r is not a positive integer" % (c,))
+    return c
 
 
 def run(kind, inputs, outputs, params_schema, on_frame, on_lagged=None):

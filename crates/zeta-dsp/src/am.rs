@@ -265,6 +265,7 @@ impl Stage for AmDemodStage {
                 prov,
                 Payload::Audio {
                     sample_rate_hz: Hz(p.audio_rate_hz),
+                    channels: 1,
                     samples: samples.into(),
                 },
             )])
@@ -465,6 +466,7 @@ impl Stage for SsbDemodStage {
                 prov,
                 Payload::Audio {
                     sample_rate_hz: Hz(p.audio_rate_hz),
+                    channels: 1,
                     samples: samples.into(),
                 },
             )])
