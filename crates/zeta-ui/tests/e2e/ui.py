@@ -18,7 +18,9 @@ import json
 import os
 import re
 import struct
+import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -1394,6 +1396,60 @@ def record_and_stop(page, hold_ms):
     page.wait_for_timeout(hold_ms)
     mic.click()
     expect(mic).not_to_have_class(re.compile(r"\brecording\b"))
+
+
+def start_node(build, state_dir, meta, secret, port=0):
+    """Start `zeta serve` (ZETA_BIN) on 127.0.0.1:`port` with build id `build`; (proc, url)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ZETA_")}
+    env["ZETA_BUILD_ID"] = build
+    proc = subprocess.Popen(
+        [os.environ["ZETA_BIN"], "--state-dir", state_dir, "--source-file", f"tone={meta}",
+         "serve", "--listen", f"127.0.0.1:{port}", "--secret", secret],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 20
+    while True:
+        line = proc.stderr.readline()
+        if not line or time.monotonic() > deadline:
+            proc.kill()
+            raise AssertionError(f"node with build {build!r} did not report a listen address")
+        m = re.search(r"listening on 127\.0\.0\.1:(\d+)", line)
+        if m:
+            break
+    threading.Thread(target=lambda: [None for _ in proc.stderr], daemon=True).start()
+    return proc, f"http://127.0.0.1:{m.group(1)}"
+
+
+def stop_node(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def scenario_page_reloads_when_the_node_is_rebuilt(page, url, secret):
+    """A node restarted under an open page with another build id: the page reloads itself
+    (a single-page app otherwise keeps the old code running against the new node)."""
+    meta = os.environ["ZETA_UI_REBUILD_META"]
+    state_dir = os.path.join(os.path.dirname(os.environ["ZETA_UI_STATE_DIR"]), "rebuild-state")
+    proc, node = start_node("test-build-a", state_dir, meta, secret)
+    try:
+        login(page, node, secret)
+        assert http_json(node, secret, "/health")["build"] == "test-build-a"
+        page.evaluate("window.__beforeRebuild = 1")
+        port = node.rsplit(":", 1)[1]
+        stop_node(proc)
+        proc, node2 = start_node("test-build-b", state_dir, meta, secret, port=port)
+        assert node2 == node, f"restarted on {node2}, wanted {node}"
+        # The page notices the new build on its next node check and reloads: the marker set on
+        # the old document is gone, and the stored secret logs the new document in again.
+        page.wait_for_function("() => window.__beforeRebuild === undefined", timeout=20_000)
+        expect(page.locator("#login")).to_be_hidden(timeout=10_000)
+        expect(page.locator("#app")).to_be_visible()
+        assert page.evaluate("window.zetaTest.build()") == "test-build-b"
+    finally:
+        stop_node(proc)
 
 
 def scenario_mic_round_trip(page, url, secret):

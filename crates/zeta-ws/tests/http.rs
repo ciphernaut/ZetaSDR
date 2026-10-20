@@ -56,6 +56,27 @@ async fn health_with_secret_is_ok() {
     ts.stop().await;
 }
 
+/// `/health` names the build the node runs, so a page can notice an upgrade and reload
+/// (the crate version alone does not change between builds).
+#[tokio::test]
+async fn health_reports_the_build_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let h: Health = get(&ts, "/health").await.json().await.unwrap();
+    assert!(!h.build.is_empty(), "build id is empty");
+    assert_eq!(h.build, zeta_ws::build_id());
+    // Without ZETA_BUILD_ID the id is `<version>+<executable mtime>`; with it, the override.
+    match std::env::var("ZETA_BUILD_ID") {
+        Ok(id) if !id.trim().is_empty() => assert_eq!(h.build, id.trim()),
+        _ => assert!(
+            h.build.starts_with(&format!("{}+", zeta_core::VERSION)),
+            "build id {:?} does not start with the version",
+            h.build
+        ),
+    }
+    ts.stop().await;
+}
+
 #[tokio::test]
 async fn wrong_secret_is_401_and_op_not_applied() {
     let dir = tempfile::tempdir().unwrap();

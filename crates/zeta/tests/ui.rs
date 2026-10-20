@@ -205,6 +205,9 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
     let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "aprs", &iq, 48_000, 144_800_000);
     let aprs = format!("aprs={}", meta.display());
+    // A fixture for the node the rebuild scenario starts and restarts by itself.
+    let rebuild_meta =
+        zeta_dsp::fixtures::write_fixture(dir.path(), "rebuild", &iq, 48_000, 144_800_000);
     let audio = zeta_dsp::fixtures::tone(WFM_AUDIO_RATE, 2 * WFM_AUDIO_RATE as usize, 1_000.0, 0.9);
     let iq =
         zeta_dsp::fixtures::wfm_modulate(&audio, WFM_AUDIO_RATE, WFM_RATE, 75_000.0, 0.0, true);
@@ -253,6 +256,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let child = cmd
         .env("ZETA_UI_STATE_DIR", dir.path().join("state"))
         .env("ZETA_UI_URL_NOSTT", &nostt.url)
+        .env("ZETA_BIN", env!("CARGO_BIN_EXE_zeta"))
+        .env("ZETA_UI_REBUILD_META", &rebuild_meta)
         .current_dir(repo_root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

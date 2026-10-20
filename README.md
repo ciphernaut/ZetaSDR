@@ -319,7 +319,7 @@ else it gets 401.
 
 | Route | |
 |---|---|
-| `GET /health` | status, version, uptime, websocket connections |
+| `GET /health` | status, version, `build` (the build the node runs: `ZETA_BUILD_ID` if set, else version plus the executable's modification time; the web page reloads itself when it changes or the uptime goes backwards), uptime, websocket connections |
 | `POST /op` | apply one operation (`{"op": ...}` JSON) |
 | `GET /schema` | the operation schema |
 | `GET /streams` | live streams |

@@ -26,6 +26,11 @@
 // A drag on the waterfall opens the context menu (menu.js), whose entries go through the same
 // op and /ask paths as the command line.
 //
+// Node check: every NODE_CHECK_MS the page polls GET /health and reloads itself once when the
+// node's `build` is not the one it connected to, or its `uptime_s` went backwards (a restart):
+// this document would otherwise keep running old code against the new node (its stored secret
+// logs the new document in again).
+//
 // Job rows: ▶ on a row of an audio kind (agent.js AUDIO_KINDS) plays its audio (audio.js; one
 // job at a time, ■ stops it, and it stops when the job leaves the running list or the secret
 // is rejected); Transcribe on a running one applies `job_attach {kind: "transcribe", job,
@@ -356,6 +361,7 @@ function start(api) {
   state.transcript.onAssistant((text, error) => {
     if (!error && footprint() === "narrow") answerRibbon(text);
   });
+  state.nodeCheck = startNodeCheck(api);
   state.jobs = startJobs(api, $("#jobs"), state.transcript, {
     onJobs: (jobs) => {
       if (state.ov) state.ov.sync(jobs);
@@ -375,11 +381,58 @@ function start(api) {
 }
 
 // The node rejected the secret after login: stop everything using it and ask again.
+// ---- node check ------------------------------------------------------------------------
+
+export const NODE_CHECK_MS = 5000;
+
+// Every NODE_CHECK_MS, GET /health: when the node's `build` differs from the one connect()
+// saw, or its `uptime_s` went backwards (a restart), this document is stale code talking to
+// a new node, so it reloads itself once (the stored secret logs the new document in again).
+// A node that cannot be reached is the waterfall badge's business, not this check's; an
+// older node without `build` is only checked for a restart. Returns {check, close}: check()
+// runs one check now (the e2e hook) and resolves true when a reload was started.
+function startNodeCheck(api) {
+  let timer = null;
+  let reloading = false;
+  async function check() {
+    if (reloading || state.api !== api) return false;
+    let h;
+    try {
+      h = await api.health();
+    } catch {
+      return false;
+    }
+    if (state.api !== api) return false;
+    const upgraded = api.build !== null && typeof h.build === "string" && h.build !== api.build;
+    const restarted =
+      api.uptimeS !== null && typeof h.uptime_s === "number" && h.uptime_s < api.uptimeS;
+    if (typeof h.uptime_s === "number") api.uptimeS = h.uptime_s;
+    if (!upgraded && !restarted) return false;
+    reloading = true;
+    state.transcript?.note(
+      upgraded ? `node upgraded (build ${h.build}): reloading` : "node restarted: reloading",
+      true,
+    );
+    location.reload();
+    return true;
+  }
+  timer = setInterval(check, NODE_CHECK_MS);
+  return {
+    check,
+    close() {
+      clearInterval(timer);
+      timer = null;
+    },
+  };
+}
+
 function logout(api) {
   if (state.api !== api) return;
   state.api = null;
   api.onUnauthorized = null;
   api.onBusy = null;
+  if (state.nodeCheck) state.nodeCheck.close();
+  state.nodeCheck = null;
   stopAudio();
   closeGraph();
   if (state.mic) state.mic.destroy();
@@ -462,6 +515,14 @@ window.zetaTest = {
   },
   poll() {
     return state.jobs ? state.jobs.refresh() : Promise.resolve();
+  },
+  // The node build this document connected to (null before login or on an older node).
+  build() {
+    return state.api ? state.api.build : null;
+  },
+  // Run one node check now; resolves true when it started a reload.
+  nodeCheck() {
+    return state.nodeCheck ? state.nodeCheck.check() : Promise.resolve(false);
   },
   wf() {
     const wf = state.wf;

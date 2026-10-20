@@ -23,7 +23,8 @@
 //         throws OpError (503 with {"error":"other","message":...} when serve has no LLM)
 //     api.stt(wav) -> Promise<{text}>   POST /stt with the WAV bytes (ArrayBuffer) as
 //         `Content-Type: audio/wav`; throws OpError (503 when serve has no speech daemon)
-//     api.health() -> Promise<{status, version, uptime_s, ws_connections}>
+//     api.health() -> Promise<{status, version, build, uptime_s, ws_connections}>
+//     api.build, api.uptimeS  the `build` and `uptime_s` connect() saw (null on an older node)
 //     api.streams() -> Promise<[{id, kind, provenance}]>   GET /streams (not an op)
 //     api.streamText(id, onMessage, onClose, {reconnect = true, onReconnect}) -> {close}
 //         Text websocket /stream/{id}; onMessage(msg) per parsed message
@@ -84,13 +85,25 @@ export async function connect(secret, base = location.origin) {
   });
   if (resp.status === 401) throw new Unauthorized();
   if (!resp.ok) throw new Error(`health: HTTP ${resp.status}`);
-  return new Api(base, secret);
+  const api = new Api(base, secret);
+  try {
+    const h = await resp.json();
+    api.build = typeof h.build === "string" ? h.build : null;
+    api.uptimeS = typeof h.uptime_s === "number" ? h.uptime_s : null;
+  } catch {
+    // An older node without the fields: the page cannot tell an upgrade apart; see app.js.
+  }
+  return api;
 }
 
 export class Api {
   constructor(base, secret) {
     this.base = base;
     this.secret = secret;
+    // The node's `build` and `uptime_s` from the /health that connect() answered (null on an
+    // older node); app.js compares later polls against them to notice a restart or upgrade.
+    this.build = null;
+    this.uptimeS = null;
     this.onUnauthorized = null;
     this.onBusy = null;
     this.busyNoted = false;

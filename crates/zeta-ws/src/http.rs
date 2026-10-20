@@ -129,6 +129,8 @@ impl StatsHandle {
 pub struct Health {
     pub status: String,
     pub version: String,
+    /// The build this node runs ([`crate::build_id`]); a page reloads when it changes.
+    pub build: String,
     pub uptime_s: u64,
     pub ws_connections: usize,
 }
@@ -228,6 +230,7 @@ async fn health(State(st): State<Shared>) -> Json<Health> {
     Json(Health {
         status: "ok".to_string(),
         version: zeta_core::VERSION.to_string(),
+        build: crate::build_id().to_string(),
         uptime_s: st.started.elapsed().as_secs(),
         ws_connections: st.stats.get().ws_connections,
     })
