@@ -42,6 +42,19 @@
 //         true when the view reaches past the capture (the coarse layer's part, coarse.js).
 //     wf.coarseActive   null, or fn() -> bool set by coarse.js: true while the coarse layer
 //         scans views past the capture (zoom_out "scan"); see Band control.
+//     wf.follow     null, or fn() -> "target" | "free" set by app.js (the `follow` policy;
+//         null counts as "target"); see Following the capture.
+//     wf.addCoarseEvent(msg)  a frame of the coarse layer's scan (coarse.js onRow): stitched
+//         into the coarse column buffer (see Layers); ignored in scan mode, where the
+//         waterfall draws the shown source's scan itself, and before the band is known
+//     wf.coarsePainted  coarse rows stitched since mount (never reset; for tests)
+//     wf.clearCoarse()  forgets the coarse rows (the coarse layer went empty)
+//     wf.syncSources(sources)  a `source_list` result (app.js hands it every jobs poll); see
+//         Following the capture
+//     wf.easeTo(lo, hi, ms = EASE_MS)  moves the view to lo..hi over `ms`, one step per
+//         animation frame (requestAnimationFrame, ease-in-out); a second call, a zoom, a pan
+//         or another source cancels the running one, which stops where it was
+//     wf.easing     true while an easeTo runs
 //     wf.clearSelection()   erases the drawn selection rectangle (the menu closed)
 //     wf.centerHz() -> the centre of the band shown (null before the band is known)
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
@@ -94,6 +107,22 @@
 // with `source_ensure` as above. In scan mode the view stays inside the scan's span and never
 // retunes.
 //
+// Layers (spec 4.2): outside scan mode each column is composed from two buffers: the coarse
+// column, into which every coarse row is stitched over its own step's band exactly as scan
+// mode stitches its rows (the rest keeps what earlier rows left there), and on top of it the
+// fine row over its own band. Without coarse rows the coarse column is background, so the
+// fine column looks as before. Coarse rows are kept (RING_COLUMNS of them) with the column
+// they arrived before, so a redraw replays them between the fine columns, up to one sweep of
+// the older ones first. The axis spans the view, also when wider than the capture.
+//
+// Following the capture (spec 4.3 `follow`): the capture moved by someone else (the node
+// relaunched the page's elastic job on a new capture, seen as a fine row of another band, or
+// a `source_list` whose `current` for the shown source differs from the previous poll's and
+// from the band) moves the band; under "target" the view eases to the new capture
+// (easeTo, EASE_MS), under "free" the band shown stays exactly where it was. The page's own
+// retune (source_ensure) is not such a move: it restarts the waterfall on the new band. Rows
+// still arriving for the band left behind by a `source_list` move do not move it back.
+//
 // Scan mode: the axis spans the scan job's `tuning`, widened to the union of the rows (a step
 // can reach past it at the span's ends); each row covers only its step's band (`center_hz` ±
 // size × bin_hz / 2) and paints that vertical segment of a new column, the rest of the column
@@ -120,6 +149,8 @@ const FLOOR_PERCENTILE = 0.15;
 export const ZOOM_FACTOR = 2;
 // The narrowest view the wheel zooms to.
 export const MIN_VIEW_HZ = 100;
+// How long the view takes to ease to a new capture under `follow target`.
+export const EASE_MS = 400;
 const BG = [0, 0, 48]; // #000030
 // Wheel deltas (px; a line counts WHEEL_LINE_PX, a page WHEEL_PAGE_PX) add up to one zoom
 // step per WHEEL_NOTCH_PX, so a touchpad's stream of small deltas does not zoom at every
@@ -258,6 +289,38 @@ function usableTuning(t) {
   return t && t.center_hz && t.bandwidth_hz ? t : null;
 }
 
+// Whether bands a and b ({lo, hi}) are the same up to a thousandth of a's width (a capture
+// from `source_list` and one from a row's bins may differ by rounding).
+function sameBand(a, b) {
+  if (!a || !b) return false;
+  const tol = Math.max(1, (a.hi - a.lo) * 1e-3);
+  return Math.abs(a.lo - b.lo) <= tol && Math.abs(a.hi - b.hi) <= tol;
+}
+
+// Sets row.lo..row.hi, the band the bins of `row` (decoded from event payload `p`) cover:
+// from the event, else `tuning` ({center_hz, bandwidth_hz}); false when neither gives one.
+function bandRow(row, p, tuning) {
+  const size = row.q ? row.q.length : row.db.length;
+  if (typeof p.center_hz === "number" && typeof p.bin_hz === "number") {
+    row.lo = p.center_hz - (p.bin_hz * size) / 2;
+    row.hi = p.center_hz + (p.bin_hz * size) / 2;
+  } else if (tuning) {
+    row.lo = tuning.center_hz - tuning.bandwidth_hz / 2;
+    row.hi = tuning.center_hz + tuning.bandwidth_hz / 2;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+// Rows in one sweep of a scan over `span` ({lo, hi}) whose newest row is `row`: the span over
+// the row's width, rounded up (the steps overlap at most at the span's ends, so this is never
+// fewer than the sweep); 0 without either.
+function sweepCount(row, span) {
+  if (!row || !span || !(row.hi > row.lo)) return 0;
+  return Math.ceil((span.hi - span.lo) / (row.hi - row.lo)) + 1;
+}
+
 // ---- the waterfall ---------------------------------------------------------------------
 
 export function mountWaterfall(el, api, source = null) {
@@ -281,7 +344,15 @@ class Waterfall {
     this.pendingView = null; // the view to apply when the band is next set (a retune)
     this.retuning = false;
     this.coarseActive = null;
+    this.follow = null;
     this.onNotice = null;
+    this.coarseRows = []; // {row, col}: a coarse row stitched before fine column `col`
+    this.coarseSpan = null; // the union of the stored coarse rows' bands
+    this.coarsePainted = 0;
+    this.easing = false;
+    this.easeRaf = null;
+    this.listed = null; // {id, lo, hi}: the shown source's `current` in the last source_list
+    this.staleBand = null; // the band a source_list move left; its late rows do not move back
     this.lastPaint = -Infinity;
     this.columns = 0; // columns painted since the last clear
     this.painted = 0; // columns painted since mount (never reset)
@@ -384,7 +455,10 @@ class Waterfall {
     this.sub = null;
     this.jobId = null;
     // A pending view (a retune) only carries over to the same source.
-    if (!src || !this.src || src.id !== this.src.id) this.pendingView = null;
+    if (!src || !this.src || src.id !== this.src.id) {
+      this.pendingView = null;
+      this.listed = null;
+    }
     this.src = src;
     this.clear();
     if (!restart) this.badge.hidden = true;
@@ -565,10 +639,23 @@ class Waterfall {
 
   // ---- geometry ------------------------------------------------------------------------
 
-  // The capture band; the view kept for it is `pendingView` when that fits inside.
+  // The capture band; the view kept for it is `pendingView` when that fits inside. A band
+  // already known that changes outside scan mode is the capture moving (captureMoved), unless
+  // it is the band a `source_list` move left behind (late rows of the old capture).
   setBand(centerHz, spanHz) {
     const lo = centerHz - spanHz / 2;
     const hi = centerHz + spanHz / 2;
+    const next = { lo, hi };
+    // (No row painted yet: the band was the job's tuning, which the rows' bins correct.)
+    if (this.band && this.mode !== "scan" && this.columns > 0) {
+      if (sameBand(this.band, next)) {
+        this.staleBand = null;
+        return;
+      }
+      if (sameBand(this.staleBand, next)) return;
+      this.captureMoved(next);
+      return;
+    }
     if (this.band && this.band.lo === lo && this.band.hi === hi) return;
     if (this.band) this.clear();
     this.band = { lo, hi };
@@ -587,6 +674,91 @@ class Waterfall {
     this.band = { lo: Math.min(b.lo, row.lo), hi: Math.max(b.hi, row.hi) };
     this.view = this.fitView(this.view);
     this.viewChanged();
+  }
+
+  // A `source_list` result: the shown source's `current` differing from the previous poll's
+  // and from the band is the capture moving (captureMoved). Not in scan mode (a scan's
+  // `current` is its step) nor during the page's own retune.
+  syncSources(sources) {
+    const info = this.src && (sources || []).find((s) => s.id === this.src.id);
+    const cur = info && usableTuning(info.current);
+    if (!cur) return;
+    const listed = {
+      id: info.id,
+      lo: cur.center_hz - cur.bandwidth_hz / 2,
+      hi: cur.center_hz + cur.bandwidth_hz / 2,
+    };
+    const prev = this.listed;
+    this.listed = listed;
+    if (!prev || prev.id !== listed.id || sameBand(prev, listed)) return;
+    if (this.mode !== "spectrum" || !this.band || this.retuning || sameBand(this.band, listed)) {
+      return;
+    }
+    this.staleBand = this.band;
+    this.captureMoved({ lo: listed.lo, hi: listed.hi });
+  }
+
+  // The capture is now `band` (moved by someone else): what is painted stays (each row keeps
+  // its own band); under `follow` "target" the view eases to the new capture, under "free"
+  // the band shown stays where it was.
+  captureMoved(band) {
+    const prev = this.shown();
+    this.band = { lo: band.lo, hi: band.hi };
+    if (sameBand(this.band, this.staleBand)) this.staleBand = null;
+    // The band shown so far, explicitly: the view no longer defaults to the old capture.
+    this.view = { lo: prev.lo, hi: prev.hi };
+    const follow = this.follow ? this.follow() : "target";
+    if (follow === "free") {
+      this.cancelEase();
+      this.view = this.keptView(prev);
+      this.viewChanged();
+      return;
+    }
+    this.easeTo(band.lo, band.hi);
+  }
+
+  // The view for band shown `v` on the current band: kept as given past the band, else
+  // limited to it (null when it covers about all of it).
+  keptView(v) {
+    const b = this.band;
+    if (!v || !b) return null;
+    const tol = this.slackHz();
+    if (v.lo < b.lo - tol || v.hi > b.hi + tol) return { lo: v.lo, hi: v.hi };
+    return this.fitView(v);
+  }
+
+  easeTo(lo, hi, ms = EASE_MS) {
+    this.cancelEase();
+    const from = this.shown();
+    if (!from || !(ms > 0)) {
+      this.view = this.keptView({ lo, hi });
+      this.viewChanged();
+      return;
+    }
+    const start = { lo: from.lo, hi: from.hi };
+    const t0 = performance.now();
+    this.easing = true;
+    const step = (now) => {
+      const f = Math.min(1, Math.max(0, (now - t0) / ms));
+      if (f >= 1) {
+        this.easeRaf = null;
+        this.easing = false;
+        this.view = this.keptView({ lo, hi });
+      } else {
+        const e = f < 0.5 ? 2 * f * f : 1 - (2 - 2 * f) ** 2 / 2;
+        this.view = { lo: start.lo + (lo - start.lo) * e, hi: start.hi + (hi - start.hi) * e };
+        this.easeRaf = requestAnimationFrame(step);
+      }
+      this.viewChanged();
+    };
+    this.easeRaf = requestAnimationFrame(step);
+  }
+
+  // Stops a running easeTo where it is.
+  cancelEase() {
+    if (this.easeRaf !== null) cancelAnimationFrame(this.easeRaf);
+    this.easeRaf = null;
+    this.easing = false;
   }
 
   onView(cb) {
@@ -669,14 +841,20 @@ class Waterfall {
     this.ctx.fillRect(0, 0, w, h);
     if (old) this.ctx.drawImage(old, w - old.width, 0, old.width, h);
     this.column = this.ctx.createImageData(Math.max(1, Math.round(dpr)), h);
+    this.coarseColumn = this.ctx.createImageData(this.column.width, h);
     this.blankColumn();
+    this.replayCoarse(this.coarseRows.length);
     this.drawAxis();
   }
 
   clear() {
+    this.cancelEase();
     this.columns = 0;
     this.band = null;
     this.view = null;
+    this.staleBand = null;
+    this.coarseRows = [];
+    this.coarseSpan = null;
     this.ctx.fillStyle = "#000030";
     this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
@@ -762,6 +940,7 @@ class Waterfall {
   // retune (ruling R2).
   requestView(lo, hi) {
     if (!this.band || this.retuning || !(hi > lo)) return;
+    this.cancelEase();
     const b = this.band;
     const tol = this.slackHz();
     if (lo >= b.lo - tol && hi <= b.hi + tol) {
@@ -801,6 +980,7 @@ class Waterfall {
     ev.preventDefault();
     const s = this.shown();
     if (!s || this.retuning || this.drag) return;
+    this.cancelEase();
     const now = performance.now();
     if (now - this.wheelAt > WHEEL_IDLE_MS) this.wheelAcc = 0;
     this.wheelAt = now;
@@ -823,6 +1003,7 @@ class Waterfall {
   panStart(ev) {
     const s = this.shown();
     if (ev.button !== 0 || !s || this.retuning) return;
+    this.cancelEase();
     this.axis.setPointerCapture(ev.pointerId);
     this.pan = { y0: ev.clientY, from: { ...s }, prev: this.view, target: null };
   }
@@ -932,23 +1113,13 @@ class Waterfall {
   // ---- painting ------------------------------------------------------------------------
 
   addEvent(msg) {
-    const p = msg.payload;
-    const row = decodeRow(p);
+    const row = decodeRow(msg.payload);
     if (!row) return;
     const now = performance.now();
     if (now - this.lastPaint < 1000 / MAX_ROWS_PER_S) return;
     this.lastPaint = now;
     // The band the row's bins cover: from the event, else the job's tuning.
-    const size = row.q ? row.q.length : row.db.length;
-    if (typeof p.center_hz === "number" && typeof p.bin_hz === "number") {
-      row.lo = p.center_hz - (p.bin_hz * size) / 2;
-      row.hi = p.center_hz + (p.bin_hz * size) / 2;
-    } else if (this.tuning) {
-      row.lo = this.tuning.center_hz - this.tuning.bandwidth_hz / 2;
-      row.hi = this.tuning.center_hz + this.tuning.bandwidth_hz / 2;
-    } else {
-      return;
-    }
+    if (!bandRow(row, msg.payload, this.tuning)) return;
     // A spectrum row is the capture; a scan row is one step of the span (the job's tuning),
     // the band widened to the union of the steps (one may reach past the tuning).
     if (this.mode !== "scan" || !this.band) this.setBand((row.lo + row.hi) / 2, row.hi - row.lo);
@@ -972,9 +1143,50 @@ class Waterfall {
     this.columnCbs.push(cb);
   }
 
+  // A frame of the coarse layer's scan: stitched into the coarse column over its step's band
+  // (as scan mode stitches its rows) and kept for redraws; the next fine column shows it.
+  addCoarseEvent(msg) {
+    if (this.mode === "scan" || !this.band || !this.coarseColumn) return;
+    const row = decodeRow(msg.payload);
+    if (!row || !bandRow(row, msg.payload, null)) return;
+    this.coarseRows.push({ row, col: this.columns });
+    if (this.coarseRows.length > RING_COLUMNS) this.coarseRows.shift();
+    const sp = this.coarseSpan;
+    this.coarseSpan = sp
+      ? { lo: Math.min(sp.lo, row.lo), hi: Math.max(sp.hi, row.hi) }
+      : { lo: row.lo, hi: row.hi };
+    this.fillColumn(row, false, this.coarseColumn);
+    this.coarsePainted += 1;
+  }
+
+  clearCoarse() {
+    if (!this.coarseRows.length) return;
+    this.coarseRows = [];
+    this.coarseSpan = null;
+    this.blankBuffer(this.coarseColumn);
+    this.scheduleRedraw();
+  }
+
+  // Stitches up to one sweep of the coarse rows before index `end` (exclusive) into a blank
+  // coarse column, on the band shown.
+  replayCoarse(end) {
+    if (!this.coarseColumn) return;
+    this.blankBuffer(this.coarseColumn);
+    const newest = end > 0 ? this.coarseRows[end - 1].row : null;
+    const from = Math.max(0, end - sweepCount(newest, this.coarseSpan));
+    for (let i = from; i < end; i++) {
+      this.fillColumn(this.coarseRows[i].row, false, this.coarseColumn);
+    }
+  }
+
   blankColumn() {
-    if (!this.column) return;
-    const px = this.column.data;
+    this.blankBuffer(this.column);
+    this.blankBuffer(this.coarseColumn);
+  }
+
+  blankBuffer(buf) {
+    if (!buf) return;
+    const px = buf.data;
     for (let o = 0; o < px.length; o += 4) {
       px[o] = BG[0];
       px[o + 1] = BG[1];
@@ -983,23 +1195,29 @@ class Waterfall {
     }
   }
 
-  // Shifts the canvas left by one column and draws `row` at the right edge: in scan mode
-  // over the previous column (only the row's band changes), else on its own.
+  // Writes the fine `row` into this.column: in scan mode over the previous column (only the
+  // row's band changes), else over the coarse column (see Layers).
+  composeColumn(row) {
+    if (this.mode !== "scan") this.column.data.set(this.coarseColumn.data);
+    this.fillColumn(row, false);
+  }
+
+  // Shifts the canvas left by one column and draws `row` at the right edge (composeColumn).
   paintColumn(row) {
     const w = this.canvas.width;
     const h = this.canvas.height;
     const cw = Math.min(this.column.width, w); // backing pixels per event
-    this.fillColumn(row, this.mode !== "scan");
+    this.composeColumn(row);
     if (w > cw) this.ctx.drawImage(this.canvas, cw, 0, w - cw, h, 0, 0, w - cw, h);
     this.ctx.putImageData(this.column, w - cw, 0);
   }
 
-  // Writes `row` (bins spread over row.lo..row.hi Hz) into this.column on the band shown.
-  // Levels are compared as stored (q is monotonic in dB) and turned into a ramp index only
-  // for the strongest bin of each pixel row, or the nearest bin when a bin spans several
-  // rows. Pixel rows outside the row's band get the background with `fill`, else keep
-  // their value.
-  fillColumn(row, fill) {
+  // Writes `row` (bins spread over row.lo..row.hi Hz) into `buf` (this.column by default)
+  // on the band shown. Levels are compared as stored (q is monotonic in dB) and turned into
+  // a ramp index only for the strongest bin of each pixel row, or the nearest bin when a bin
+  // spans several rows. Pixel rows outside the row's band get the background with `fill`,
+  // else keep their value.
+  fillColumn(row, fill, buf = this.column) {
     const s = this.shown() || { lo: row.lo, hi: row.hi };
     let levels;
     let colour;
@@ -1017,9 +1235,9 @@ class Waterfall {
     const size = levels.length;
     const perBin = (row.hi - row.lo) / size;
     const span = s.hi - s.lo;
-    const h = this.column.height;
-    const cw = this.column.width;
-    const px = this.column.data;
+    const h = buf.height;
+    const cw = buf.width;
+    const px = buf.data;
     for (let y = 0; y < h; y++) {
       // Pixel row y covers bins x0..x1 (fractional, counted from the band's bottom).
       const x0 = (s.hi - ((y + 1) / h) * span - row.lo) / perBin;
@@ -1066,38 +1284,51 @@ class Waterfall {
   // Paints every stored column again on the band shown, oldest first (scan columns build
   // on the one before, as when they arrived). In scan mode up to one sweep of the stored rows
   // older than the oldest column shown is replayed into the column first (not painted), so
-  // that column starts with every step's band rather than background.
+  // that column starts with every step's band rather than background; outside it the coarse
+  // rows are replayed the same way into the coarse column, and each later one before the
+  // fine column it arrived before.
   redraw() {
     const w = this.canvas.width;
     const h = this.canvas.height;
     this.ctx.fillStyle = "#000030";
     this.ctx.fillRect(0, 0, w, h);
     this.blankColumn();
-    if (!this.columns || !this.shown()) return;
+    if (!this.shown()) return;
     const cw = Math.max(1, Math.min(this.column.width, w));
     const stored = Math.min(this.columns, RING_COLUMNS);
     const n = Math.min(stored, Math.ceil(w / cw));
+    const coarse = this.coarseRows;
+    let ci = 0; // the next coarse row to stitch
     if (this.mode === "scan") {
       const extra = Math.min(stored - n, this.sweepRows());
       for (let k = n + extra - 1; k >= n; k--) {
         const row = this.rows[(this.columns - 1 - k) % RING_COLUMNS];
         if (row && row.lo !== undefined) this.fillColumn(row, false);
       }
+    } else {
+      const first = this.columns - n; // the oldest column shown
+      while (ci < coarse.length && coarse[ci].col <= first) ci++;
+      this.replayCoarse(ci);
     }
     for (let k = n - 1; k >= 0; k--) {
-      const row = this.rows[(this.columns - 1 - k) % RING_COLUMNS];
+      const col = this.columns - 1 - k;
+      for (; ci < coarse.length && coarse[ci].col <= col; ci++) {
+        this.fillColumn(coarse[ci].row, false, this.coarseColumn);
+      }
+      const row = this.rows[col % RING_COLUMNS];
       if (!row || row.lo === undefined) continue;
-      this.fillColumn(row, this.mode !== "scan");
+      this.composeColumn(row);
       this.ctx.putImageData(this.column, w - (k + 1) * cw, 0);
+    }
+    // Coarse rows newer than the newest column: in the coarse column for the next one.
+    if (this.mode !== "scan") {
+      for (; ci < coarse.length; ci++) this.fillColumn(coarse[ci].row, false, this.coarseColumn);
     }
   }
 
-  // Rows in one scan sweep: the band over the newest row's width, rounded up (the steps
-  // overlap at most at the span's ends, so this is never fewer than the sweep).
+  // Rows in one scan sweep of the band (sweepCount over the newest row).
   sweepRows() {
-    const row = this.rows[(this.columns - 1) % RING_COLUMNS];
-    if (!row || !this.band || !(row.hi > row.lo)) return 0;
-    return Math.ceil((this.band.hi - this.band.lo) / (row.hi - row.lo)) + 1;
+    return sweepCount(this.rows[(this.columns - 1) % RING_COLUMNS], this.band);
   }
 
   // ---- selection -----------------------------------------------------------------------
@@ -1197,6 +1428,7 @@ class Waterfall {
   }
 
   destroy() {
+    this.cancelEase();
     this.gen += 1;
     if (this.sub) this.sub.close();
     this.sub = null;

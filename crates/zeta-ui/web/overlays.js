@@ -1,5 +1,5 @@
-// overlays.js: channel-pinned overlays on the waterfall: layer labels, text ribbons and the
-// decoded-event counters of the job rows.
+// overlays.js: channel-pinned overlays on the waterfall: layer labels, text ribbons, the
+// outlined bands of the rigid holders and the decoded-event counters of the job rows.
 //
 // Exports:
 //   mountOverlays(el, wf, api, {jobsEl}) -> Overlays
@@ -7,9 +7,15 @@
 //       #waterfall element `wf` was mounted in). `jobsEl` (default #jobs) holds the job rows
 //       agent.js renders; their `.events` cell carries the counters.
 //   Overlays:
-//     ov.setSource(id)       the selected source: changing it drops every watch, label and
-//                            ribbon (they belong to the previous source's band)
-//     ov.sync(jobs)          a `job_list` result (from the 2 s poll): watchJob for the
+//     ov.setSource(id)       the selected source: changing it drops every watch, label,
+//                            ribbon and outline (they belong to the previous source's band)
+//     ov.sync(jobs)          a `job_list` result (from the 2 s poll): outlines (ov.outline,
+//                            key = job id, text = kind) the tuning of every running rigid job
+//                            on the selected source (spec 4.2: not elastic, not attached to
+//                            another job's output, not a time-shared `scan`) and unoutlines
+//                            the rest; with none the capture itself (wf.band, key
+//                            "capture", text "capture"; not in scan mode) is outlined,
+//                            following the band as it changes. Then watchJob for the
 //                            MAX_WATCHED most recent (created_ns) running jobs on the
 //                            selected source, unwatch the rest, refresh the job-row counters
 //                            (`—`, tooltip "not watched (limit 4)", on the rows over the cap;
@@ -59,6 +65,11 @@
 //         label drawn at the same hz. One label per key (a job id, a classification slot),
 //         replaced on each call. `evidence` becomes its tooltip; `data-layer` the layer.
 //     ov.unlabel(key)        removes the label drawn under `key`, if any
+//     ov.outline(lo, hi, text, key) -> element
+//         A band lo..hi Hz across the waterfall (`.outline`, data-key = key) bordered at its
+//         edges, `text` its label (`.outline-label`) at its top right; one per key, replaced
+//         on each call, placed again when the view changes. Drawn under labels and ribbons.
+//     ov.unoutline(key)      removes the outline drawn under `key`, if any
 //     ov.jobRow(job, counter)  shows `counter` (when > 0, or the string `—` for a job over
 //                            the cap) in that job's row `.events` cell
 //     ov.destroy()
@@ -71,6 +82,23 @@ const EXPIRE_EVERY_MS = 1000;
 const RIBBON_GAP_PX = 2;
 const LABEL_GAP_PX = 2;
 const MAX_LANES = 8;
+const CAPTURE_KEY = "capture";
+
+const isRunning = (j) => !!(j && j.state && j.state.status === "running");
+
+// Whether `job` (a running `job_list` record) holds its source rigidly with a usable tuning.
+function rigidBand(job) {
+  const t = job.tuning;
+  return (
+    !job.elastic &&
+    !job.input &&
+    job.kind !== "scan" &&
+    !!t &&
+    typeof t.center_hz === "number" &&
+    typeof t.bandwidth_hz === "number" &&
+    t.bandwidth_hz > 0
+  );
+}
 
 export function mountOverlays(el, wf, api, opts = {}) {
   return new Overlays(el, wf, api, opts);
@@ -129,6 +157,8 @@ class Overlays {
     this.resolving = false; // a GET /streams for unwatched jobs is in flight
     this.counters = new Map(); // job id -> non-spectrum events seen while watched
     this.labels = new Map(); // key -> {el, hz}
+    this.outlines = new Map(); // key -> {el, labelEl, lo, hi}
+    this.captureOutlined = false; // the capture is outlined (no rigid holder)
     this.ribbons = []; // {el, countEl, text, cls, hz, w, h, top, dy, right, born, count}
     this.destroyed = false;
 
@@ -154,10 +184,13 @@ class Overlays {
     this.ribbons = [];
     for (const l of this.labels.values()) l.el.remove();
     this.labels.clear();
+    for (const key of [...this.outlines.keys()]) this.unoutline(key);
+    this.captureOutlined = false;
   }
 
   sync(jobs) {
     if (this.destroyed) return;
+    this.syncOutlines(jobs);
     const want = jobs.filter(
       (j) =>
         j.source === this.sourceId &&
@@ -185,6 +218,32 @@ class Overlays {
     for (const j of want) {
       const over = !ids.has(j.id) && !this.noEventStream.has(j.id);
       this.jobRow(j, over ? "—" : this.counters.get(j.id) || 0);
+    }
+  }
+
+  // The rigid holders' bands outlined, or the capture when there is none.
+  syncOutlines(jobs) {
+    const rigid = jobs.filter((j) => j.source === this.sourceId && isRunning(j) && rigidBand(j));
+    const keys = new Set(rigid.map((j) => j.id));
+    for (const key of [...this.outlines.keys()]) {
+      if (key !== CAPTURE_KEY && !keys.has(key)) this.unoutline(key);
+    }
+    for (const j of rigid) {
+      const { center_hz: c, bandwidth_hz: bw } = j.tuning;
+      this.outline(c - bw / 2, c + bw / 2, j.kind, j.id);
+    }
+    this.captureOutlined = rigid.length === 0;
+    this.outlineCapture();
+  }
+
+  // The capture's outline follows wf.band while no rigid holder is outlined.
+  outlineCapture() {
+    const b = this.wf.band;
+    if (this.captureOutlined && b && this.wf.mode !== "scan") {
+      const o = this.outlines.get(CAPTURE_KEY);
+      if (!o || o.lo !== b.lo || o.hi !== b.hi) this.outline(b.lo, b.hi, "capture", CAPTURE_KEY);
+    } else {
+      this.unoutline(CAPTURE_KEY);
     }
   }
 
@@ -391,8 +450,51 @@ class Overlays {
     this.labels.delete(key);
   }
 
+  outline(lo, hi, text, key) {
+    if (this.destroyed) return null;
+    let o = this.outlines.get(key);
+    if (!o) {
+      const el = document.createElement("div");
+      el.className = "outline";
+      el.dataset.key = key;
+      const labelEl = document.createElement("span");
+      labelEl.className = "outline-label";
+      el.append(labelEl);
+      this.layer.prepend(el); // under the labels and ribbons
+      o = { el, labelEl, lo, hi };
+      this.outlines.set(key, o);
+    }
+    o.lo = lo;
+    o.hi = hi;
+    o.labelEl.textContent = String(text);
+    o.el.title = `${text} ${(lo / 1e6).toFixed(3)}-${(hi / 1e6).toFixed(3)} MHz`;
+    this.placeOutline(o);
+    return o.el;
+  }
+
+  unoutline(key) {
+    const o = this.outlines.get(key);
+    if (!o) return;
+    o.el.remove();
+    this.outlines.delete(key);
+  }
+
+  placeOutline(o) {
+    const top = this.wf.yForHz(o.hi);
+    const bottom = this.wf.yForHz(o.lo);
+    if (top === null || bottom === null || !Number.isFinite(top) || !Number.isFinite(bottom)) {
+      o.el.hidden = true;
+      return;
+    }
+    o.el.hidden = false;
+    o.el.style.top = `${top}px`;
+    o.el.style.height = `${Math.max(1, bottom - top)}px`;
+  }
+
   // Re-places everything vertically (the band or the height changed).
   layout() {
+    this.outlineCapture();
+    for (const o of this.outlines.values()) this.placeOutline(o);
     for (const r of this.ribbons) {
       r.top = this.yFor(r.hz) - r.h / 2 + r.dy;
       r.el.style.top = `${r.top}px`;

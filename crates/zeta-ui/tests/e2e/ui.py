@@ -1311,6 +1311,133 @@ def scenario_capturable_view_on_unheld_source_retunes_under_zoom_out_scan(page, 
         stop_scans(url, secret)
 
 
+# ---- two layers, outlines, easing (plan 11 Task 7) -----------------------------------------
+# The coarse scan's rows are painted across the whole view under the fine capture; every rigid
+# holder's band is outlined with its kind (the capture itself with none); under `follow
+# target` the view eases to a new capture, under `free` it stays.
+
+# Non-background pixels (BG #000030) in the top quarter of the canvas's right-most column.
+TOP_QUARTER_LIT_JS = """() => {
+  const c = document.querySelector('#waterfall canvas.wf-canvas');
+  if (!c || c.width < 2 || c.height < 8) return 0;
+  const d = c.getContext('2d').getImageData(c.width - 1, 0, 1, Math.floor(c.height / 4)).data;
+  let n = 0;
+  for (let i = 0; i < d.length; i += 4) if (d[i] !== 0 || d[i + 1] !== 0 || d[i + 2] !== 48) n++;
+  return n;
+}"""
+
+
+def scenario_coarse_layer_paints_outside_the_capture(page, url, secret):
+    stop_scans(url, secret)
+    try:
+        zoom_tone_out(page, url, secret)
+        # The view's top quarter (100.024-100.048 MHz) lies past the 48 kHz capture: only the
+        # coarse layer paints there.
+        page.wait_for_function("() => window.zetaTest.wf().coarsePainted > 0", timeout=5_000)
+        p0 = page.evaluate(WF_STATE_JS)["painted"]
+        page.wait_for_function(f"() => window.zetaTest.wf().painted > {p0} + 5", timeout=5_000)
+        page.wait_for_function(f"() => ({TOP_QUARTER_LIT_JS})() > 0", timeout=5_000)
+        # Still the coarse view: the axis spans it, not the capture.
+        assert ticks(page)[0] == "100.048" and ticks(page)[-1] == "99.952", ticks(page)
+    finally:
+        stop_scans(url, secret)
+
+
+def outlines(page):
+    page.evaluate("window.zetaTest.poll()")
+    return page.locator("#waterfall .outline")
+
+
+def scenario_rigid_bands_are_outlined(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    # No rigid holder: the capture itself is outlined.
+    expect(outlines(page)).to_have_count(1)
+    expect(outlines(page).first).to_contain_text("capture")
+    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    lo = start_job(url, secret, "passthrough", "retune", cur - 8_000, 4_000)
+    hi = None
+    try:
+        hi = start_job(url, secret, "passthrough", "retune", cur + 8_000, 4_000)
+        ol = outlines(page)
+        expect(ol).to_have_count(2)
+        for job in (lo, hi):
+            el = page.locator(f'#waterfall .outline[data-key="{job}"]')
+            expect(el).to_have_count(1)
+            expect(el).to_contain_text("passthrough")
+        top = {j: page.locator(f'#waterfall .outline[data-key="{j}"]').bounding_box()["y"]
+               for j in (lo, hi)}
+        assert top[hi] < top[lo], f"the higher band is not drawn above the lower one: {top}"
+        stop_job(url, secret, hi)
+        expect(outlines(page)).to_have_count(1)
+        expect(page.locator(f'#waterfall .outline[data-key="{lo}"]')).to_have_count(1)
+    finally:
+        stop_job(url, secret, lo)
+        if hi:
+            stop_job(url, secret, hi)
+
+
+def move_retune_capture(url, secret):
+    """Hold `retune` with a rigid passthrough on its capture, then move the capture 1 MHz with
+    a rigid start that replaces it; (the new job's id, the old centre, the new centre)."""
+    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    held = start_job(url, secret, "passthrough", "retune", cur, 10_000)
+    band = cur + 1_000_000 if cur + 1_000_000 < 299_000_000 else cur - 1_000_000
+    r = http_json(url, secret, "/op", {"op": "job_start", "kind": "passthrough",
+                                       "source": "retune", "center_hz": band,
+                                       "bandwidth_hz": 10_000, "deviation_hz": None,
+                                       "sideband": None, "elastic": False, "replace": [held]})
+    assert r["result"] == "job", f"replacing start: {r}"
+    return r["value"], cur, band
+
+
+def capture_of(url, secret):
+    c = source_info(url, secret, "retune")["current"]
+    return c["center_hz"] - c["bandwidth_hz"] / 2, c["center_hz"] + c["bandwidth_hz"] / 2
+
+
+def near(a, b, width):
+    return abs(a - b) <= width * 0.01
+
+
+def scenario_follow_target_eases_on_a_capture_change(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    job, _, band = move_retune_capture(url, secret)
+    try:
+        page.wait_for_function("() => window.zetaTest.wf().easing", polling="raf", timeout=2_000)
+        page.wait_for_function("() => !window.zetaTest.wf().easing", timeout=2_000)
+        lo, hi = capture_of(url, secret)
+        assert near((lo + hi) / 2, band, hi - lo), f"capture {lo}-{hi}, wanted {band}"
+        v = page.evaluate(WF_STATE_JS)["view"]
+        assert near(v["lo"], lo, hi - lo) and near(v["hi"], hi, hi - lo), \
+            f"view {v} after easing, capture {lo}-{hi}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_follow_free_holds_the_view(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    run_cmd(page, "view set follow free")
+    expect(view_line(page, "follow = free")).to_have_text("follow = free")
+    before = page.evaluate(WF_STATE_JS)["view"]
+    page.evaluate("window.__eased = false; setInterval(() => {"
+                  " if (window.zetaTest.wf().easing) window.__eased = true; }, 10)")
+    job, _, band = move_retune_capture(url, secret)
+    try:
+        # The fine layer follows the new capture; the view does not.
+        page.wait_for_function(
+            f"() => {{ const b = window.zetaTest.wf().band;"
+            f" return !!b && Math.abs((b.lo + b.hi) / 2 - {band}) < 1000; }}", timeout=5_000)
+        page.wait_for_timeout(2_000)
+        after = page.evaluate(WF_STATE_JS)["view"]
+        assert after == before, f"view moved under follow free: {before} -> {after}"
+        assert page.evaluate("window.__eased") is False, "the view eased under follow free"
+    finally:
+        stop_job(url, secret, job)
+
+
 # ---- graph view and audio (Task 10) --------------------------------------------------------
 # Last: they open more websockets (the audio socket) and each stops the job it starts.
 

@@ -25,14 +25,20 @@
 //
 // The coarse layer (coarse.js) is mounted on the waterfall at login: a view past the fine
 // capture starts the page's own scan on a free scanner source (view policies zoom_out,
-// auto_scan_stop, scanner); its notes become transcript lines.
+// auto_scan_stop, scanner); its notes become transcript lines, and each frame of the scan it
+// follows is handed to the waterfall's coarse layer (wf.addCoarseEvent).
+//
+// Following the capture: the waterfall's `follow` policy is the view's (wf.follow), and each
+// jobs poll is followed by a `source_list` (state.sources, then wf.syncSources): a shown
+// source whose `current` moved eases the view there under `follow target`.
 //
 // The waterfall (waterfall.js) is mounted in #waterfall at login and follows the selected
 // source (selecting the source it already shows does nothing); it is destroyed when the node
 // rejects the secret. Each jobs poll is handed to it too (wf.syncJobs: a scan starting or
 // ending on the shown source), and its notices (a refused retune) become transcript lines.
 // The overlays (overlays.js) sit on it: each jobs poll hands them the job
-// list (they watch the selected source's running jobs), and in the narrow footprint every
+// list (they watch the selected source's running jobs and outline its rigid holders' bands),
+// and in the narrow footprint every
 // /ask answer also becomes an `agent` ribbon at the centre of the band shown.
 //
 // A drag on the waterfall opens the context menu (menu.js), whose entries go through the same
@@ -421,11 +427,13 @@ function start(api) {
   });
   state.wf = mountWaterfall($("#waterfall"), api);
   state.wf.onNotice = (text) => state.transcript?.note(text, true);
+  state.wf.follow = () => state.view.get("follow");
   state.coarse = mountCoarse(state.wf, api, state.view, {
     transcript: state.transcript,
     sources: () => state.sources,
     jobs: () => state.lastJobs,
   });
+  state.coarse.onRow((msg) => state.wf?.addCoarseEvent(msg));
   state.ov = mountOverlays($("#waterfall"), state.wf, api, { jobsEl: $("#jobs") });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
@@ -445,6 +453,7 @@ function start(api) {
       state.lastJobs = jobs;
       if (state.ov) state.ov.sync(jobs);
       if (state.wf) state.wf.syncJobs(jobs);
+      pollSources(api);
       stopAudioUnlessRunning(jobs);
     },
     onPlay: toggleAudio,
@@ -459,7 +468,25 @@ function start(api) {
   loadSources();
 }
 
-// The node rejected the secret after login: stop everything using it and ask again.
+// After each jobs poll: `source_list` into state.sources and the waterfall (a moved capture),
+// one at a time; a failure waits for the next poll.
+let sourcesPolling = false;
+
+async function pollSources(api) {
+  if (sourcesPolling) return;
+  sourcesPolling = true;
+  try {
+    const sources = (await api.op({ op: "source_list" })).value || [];
+    if (state.api !== api) return;
+    state.sources = sources;
+    if (state.wf) state.wf.syncSources(sources);
+  } catch {
+    /* the next poll retries */
+  } finally {
+    sourcesPolling = false;
+  }
+}
+
 // ---- node check ------------------------------------------------------------------------
 
 export const NODE_CHECK_MS = 5000;
@@ -505,6 +532,7 @@ function startNodeCheck(api) {
   };
 }
 
+// The node rejected the secret after login: stop everything using it and ask again.
 function logout(api) {
   if (state.api !== api) return;
   state.api = null;
@@ -612,10 +640,22 @@ window.zetaTest = {
     if (!c) return null;
     return { scanJobId: c.scanJobId, followed: c.followed, source: c.source, rows: c.rows };
   },
+  // The waterfall: {sourceId, jobId, painted, badge, coarsePainted, easing, view (the band
+  // shown, {lo, hi} or null), band (the capture)}, or null without one.
   wf() {
     const wf = state.wf;
     if (!wf) return null;
-    return { sourceId: wf.sourceId, jobId: wf.jobId, painted: wf.painted, badge: !wf.badge.hidden };
+    const box = (b) => (b ? { lo: b.lo, hi: b.hi } : null);
+    return {
+      sourceId: wf.sourceId,
+      jobId: wf.jobId,
+      painted: wf.painted,
+      badge: !wf.badge.hidden,
+      coarsePainted: wf.coarsePainted,
+      easing: wf.easing,
+      view: box(wf.shown()),
+      band: box(wf.band),
+    };
   },
 };
 

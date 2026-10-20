@@ -32,6 +32,9 @@
 //       later at the latest; the id is forgotten only once a fresh job_list shows the scan
 //       no longer running. While the waterfall itself follows the own scan (the shown-source
 //       fallback, scan mode) nothing is decided.
+//       Nothing is decided while the waterfall eases to a new capture (wf.easing): its end
+//       fires onView again. Under zoom_out "none", or with no scanner for the view, the
+//       waterfall's coarse rows are dropped (wf.clearCoarse): the coarse layer is empty.
 //       It also sets wf.coarseActive = () => zoom_out is "scan": the waterfall then lets the
 //       view leave the capture instead of clamping it or retuning past the source.
 //       The followed scan's (own or manual) event stream is subscribed in text mode and each
@@ -172,9 +175,9 @@ class Coarse {
     const wf = this.wf;
     if (this.destroyed) return;
     // No capture known (a source being selected): wait for its band, which fires onView.
-    // A retune or an axis drag in progress: its end fires onView again.
+    // A retune, an axis drag or an ease in progress: its end fires onView again.
     if (!wf.band) return;
-    if (wf.retuning || wf.pan) {
+    if (wf.retuning || wf.pan || wf.easing) {
       return;
     }
     const fresh = await this.fetchList("job_list");
@@ -191,6 +194,7 @@ class Coarse {
     const scanning = this.view.get("zoom_out") === "scan";
     if (!v || !scanning) {
       this.noted = null;
+      if (!scanning) wf.clearCoarse();
       if (this.scanJobId && (!scanning || this.view.get("auto_scan_stop") === "inside")) {
         await this.stopOwn();
       }
@@ -206,6 +210,7 @@ class Coarse {
     if (!pick || !(hi > lo)) {
       if (!(await this.stopOwn())) return;
       this.unfollow();
+      wf.clearCoarse();
       const key = `${v.lo}-${v.hi}`;
       if (this.noted !== key) {
         this.noted = key;

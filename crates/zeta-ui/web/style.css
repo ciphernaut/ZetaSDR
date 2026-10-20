@@ -141,6 +141,16 @@ input:focus { border-color: var(--accent); }
   position: absolute; padding: 0 5px; border-radius: 2px; white-space: nowrap;
   background: rgba(11, 14, 20, 0.78); border: 1px solid var(--border);
 }
+/* overlays.js: a rigid holder's band (or the capture), bordered, its kind at the top right */
+#waterfall .outline {
+  position: absolute; left: 0; right: 0; box-sizing: border-box;
+  border-top: 1px dashed var(--accent); border-bottom: 1px dashed var(--accent);
+  background: rgba(255, 255, 255, 0.03);
+}
+#waterfall .outline-label {
+  position: absolute; right: 6px; top: 1px; padding: 0 4px; font-size: 11px; border-radius: 2px;
+  color: var(--accent); background: rgba(11, 14, 20, 0.78); white-space: nowrap;
+}
 #waterfall .ov-label { left: 6px; color: var(--ok); border-color: var(--ok); }
 #waterfall .ov-label[data-layer="2"] { color: var(--accent); border-color: var(--accent); }
 #waterfall .ov-ribbon {
