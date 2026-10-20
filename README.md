@@ -59,6 +59,24 @@ ls scratch/state/captures               # a .sigmf-meta / .sigmf-data pair
 ./target/debug/zeta agents-md            # the agent guide, rendered from the operation schema
 ```
 
+Taking a source from other jobs, and the node's ops log:
+
+```bash
+./target/debug/zeta job start --kind adsb_decode --source b210 --center-hz 1090000000 \
+    --bandwidth-hz 2400000 --replace job-1,job-2   # stops the named holders and starts, atomically
+./target/debug/zeta job start --kind spectrum --source b210 --center-hz 100000000 \
+    --bandwidth-hz 2000000 --elastic               # never conflicts, follows retunes (spectrum only)
+./target/debug/zeta source ensure --source b210 --center-hz 100000000 --bandwidth-hz 2000000 --replace job-1
+./target/debug/zeta ops tail --lines 20            # last applied ops, local state dir only
+```
+
+A `conflict` error names the holders and offers `retry with replace: [<ids>]`; `--replace` ids
+must hold that source as rigid leases. Elastic jobs are listed under `elastic` in `source list`.
+Every applied op is appended as one JSON line (the op's payload plus `t_ns`) to `<state-dir>/ops.log`,
+rotated to `ops.log.1` past 8 MiB; `ops tail` reads it and is a usage error with `--node`. A restart
+resumes a source's jobs widest first, elastic after rigid, and re-expands a built-in graph if the
+capture rate differs from the one recorded (`capture_rate_hz`).
+
 `AGENTS.md` is generated from the operation schema by `zeta agents-md`; `zeta agents-md --check`
 fails if the committed file has drifted.
 
@@ -402,6 +420,31 @@ The page picks its layout from the viewport width (`?footprint=wide|narrow` forc
 - Narrow (under 700 px, a phone): the waterfall takes the screen. The transcript and job
   list move into a drawer behind ☰, and the agent's answers also appear as ribbons on the
   waterfall.
+
+The page's own `spectrum` job is elastic: it never blocks another job from taking the radio and
+follows every retune, so the waterfall is never the reason a conflict appears. A conflict the page
+meets offers "stop <kind> <id> and retry". Finished rows leave the job list after a while.
+
+Two layers sit in the waterfall: the fine capture of the source, and, when the view is zoomed out
+past it on a source with a scanner (a second source with a wider tune range, or a file source with
+`--source-file ID=PATH,tune_min_hz=N,tune_max_hz=M`), a coarse layer from an automatic `scan`
+drawn underneath. Rigid bands are outlined. The scan is started about 300 ms after the last zoom
+or pan, spans the visible range clamped to the scanner's tune range, is replaced when the span
+changes and stopped when the view returns inside the fine capture. A scan the page did not start
+is never touched.
+
+View policies shape this, set from the command line and kept in the tab's `sessionStorage`:
+
+| Key | Values (default first) |
+|---|---|
+| `follow` | `target` (ease to a new capture over about 400 ms), `free` |
+| `zoom_out` | `scan`, `none` |
+| `auto_scan_stop` | `inside` (stop when back inside the capture), `keep` |
+| `finished_rows_s` | seconds a finished job stays listed, `60`; `0` never shows them |
+| `scanner` | `auto`, or a source id |
+
+`view set <key> <value>`, `view show`, `view reset` (one key) and `view clear` (all) are typed at
+the command line; an unknown key or value answers with the allowed values.
 
 The waterfall is the UI's own `spectrum` job on the selected source (it reuses a running one,
 and stops the one it started when the page closes). Overlays are pinned to their channel and

@@ -56,6 +56,12 @@ Music and noise are gated, not separated: `vad` passes any loud audio, so a musi
 
 Digital voice decoders (DMR, D-STAR, M17) will be transcribed the same way: they produce audio, so `job attach --kind transcribe` to them.
 
+### Taking the radio from another job
+
+A source holds one tuning, and a second job that needs a different one gets a `conflict` error. Read it before acting: it names the holders (job ids, kinds and what each is doing) and lists options, the last being `retry with replace: [<ids>]`. Decide whether the holders matter. If they do not, or the user asked for the new job, retry the same request with `--replace ID[,ID]` (`job start`, `source ensure`; `replace` is an array in the op). The named jobs are stopped and the new job started in one step under the source's gate, so nothing else can slip in between. Every id must hold that source (`unknown_job` or `job <id> does not hold source <src>` otherwise), and a holder you did not name still blocks the start and is named in the new conflict. Never replace a holder you have not read, and say in the report what you stopped.
+
+The web page's own `spectrum` job is elastic (`job start --elastic`, `spectrum` only): it never conflicts, never blocks a retune and follows each retune of its source, so it is not a holder to wait for or replace. `source list` shows such jobs under `elastic`, not `holders`. A scan on the source stops it, and the page restarts its view afterwards. After a restart of the node, jobs resume widest first and their capture is restored. `zeta ops tail --lines N` shows the last applied ops with the transport that sent them (`local`, `http`, `ui`, `agent`): use it to see who changed the radio.
+
 ### Working layer 4
 
 When a signal has no known decoder, work it in this order:

@@ -18,6 +18,7 @@ interfaces rather than guessed ones.
 | 8 | Wideband | Polyphase filter bank shared by every job on a wide capture (a channel that fits one bin is bank-served, wider ones take the direct path); spectrum rows v2 (fixed `rows_per_s`, u8-quantised `q`, up to 8192 bins); UI band control (zoom and pan inside the capture render only, beyond it retune); `scan` job that time-shares a radio across a span wider than one capture and holds the lease on it; IQ ring sized from a memory budget (`--ring-budget-mb`); `wfm_demod` decimates before its audio filter. **Delivered** on branch `wideband`, 2026-10-20. Pending: the fix wave (sub-band scan clamp, overlays and scan redraw), the B210 at 24 Msps (its asserted `max_bandwidth_hz` is 16 MHz), and the bank's 20 % cost target (33 % measured at 16 Msps). | 2, 6, 7 |
 | 9 | Decoders | Four decode job kinds: `pocsag_decode` (12.5 kHz FM channel, 512/1200/2400 baud detected automatically), `rds_decode` (200 kHz FM broadcast band; `pi`, `ps`, `rt`), `adsb_decode` (1 090 MHz, 2.4 MHz band, dump1090 run on the node's host through the new crate `zeta-ext`) and `acars_decode` (10 kHz AM channel, 2400 baud MSK); decode-to-identify in `classify` (APRS, POCSAG and ACARS on narrow bands, RDS on wide ones); `decoder` on catalogue signatures; UI entries; field craft for pagers, aircraft and FM data. **Delivered** on branch `decoders`, 2026-10-20. Pending: live acceptance on the field host. | 2, 7, 8 |
 | 10 | Speech on a channel | Transcription of a radio channel: audio frames carry a channel count; stages `denoise` (RNNoise via `nnnoiseless`), `vad` (energy-over-floor voice gate) and `transcribe` (new crate `zeta-speech`, speech backends `SocketBackend` for a `local-voice`-protocol daemon and `NodeBackend` for another node's `/stt`, global flags `--stt-socket` and `--stt-node`); attached jobs (`stream_in` stage, `job_attach` op, `zeta job attach`) so any audio-producing job, demodulators now and digital voice decoders later, can be transcribed; UI entries and transcript ribbons; the source-separation slot proven with an external audio plugin (`examples/python/separate_stub.py`) swapped in with `graph put`; `docs/speech.md`. **Delivered** on branch `speech`, 2026-10-20. Pending: live acceptance on the field host (needs `local-voice` installed there, `docs/speech.md` section 1). | 2, 7, 9 |
+| 11 | View policy | Resume restores the capture (widest first, built-in graphs re-expanded, `capture_rate_hz`); the ops log (`ops.log`, `zeta ops tail`); elastic leases (`job start --elastic`); atomic `replace` (`--replace` on `job start` and `source ensure`); a file-source `tune_range`; UI view policies (`follow`, `zoom_out`, `auto_scan_stop`, `finished_rows_s`, `scanner`) and `view set\|show\|reset\|clear`, automatic scans on a scanner source, a coarse scan layer, eased follow. **Delivered** on branch `worktree-view-policy`, 2026-10-20. Pending: live acceptance on the field host. | 3, 10 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
@@ -494,3 +495,41 @@ runs of 0.6-5 s ("Um", "Baby."), the floor-rise-rate effect the final review pre
 floor rise or a minimum-tracking floor is the first thing to try next; the first transcript arrived
 about 20 s after the attach (the ~4 s late start was not isolated on air). The old binary at
 `~/zetasdr/target/release/zeta` (the `wideband` tree) is untouched for rollback.
+
+## Plan 11 status
+
+Plan 11 is delivered on `worktree-view-policy` (tasks 1-8, base `main` f7757cd), 2026-10-20. Live
+acceptance on the field host is pending.
+
+What was built:
+
+- Resume restores the capture: a source's jobs launch widest first, elastic after rigid; a built-in
+  graph whose `capture_rate_hz` differs from the actual rate is re-expanded.
+- The ops log (`ops.log`, rotated at 8 MiB) and `zeta ops tail`.
+- Elastic leases (`job start --elastic`, `spectrum` only; `source_list.elastic`).
+- Atomic `replace` (`--replace ID[,ID]` on `job start` and `source ensure`; the conflict option
+  `retry with replace: [...]`).
+- The file-source `tune_range` (`--source-file ID=PATH,tune_min_hz=N,tune_max_hz=M`).
+- UI: the page's own job is elastic; view policies (`follow`, `zoom_out`, `auto_scan_stop`,
+  `finished_rows_s`, `scanner`) and `view set|show|reset|clear`; finished rows age out; the conflict
+  offers "stop <kind> <id> and retry"; automatic scans on a scanner source when zoomed past the
+  capture; a coarse scan layer under the fine capture; rigid bands outlined; eased follow.
+
+Gates at the branch head:
+
+- `cargo test --workspace --all-features --no-fail-fast`: 805 passed, 0 failed, 3 ignored (106 `test
+  result` lines), no `FAILED`, no `ui e2e skipped`. The UI suite
+  (`ui_scenarios_pass_in_headless_chromium`, 61 scenarios) ran ok in 218.86 s.
+- `cargo fmt -p` for each workspace member (all but the excluded `zeta-source-soapy-driver`),
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `zeta agents-md --check`
+  and `--skill --check` are clean.
+
+Deferred:
+
+- The shown-source fallback scan (single-source nodes) is not stopped by zooming back in; stop it from its row. No scenario covers it.
+- The ops log rotation is not serialised; concurrent rotation can lose a line or overwrite `ops.log.1`.
+- A replace that times out (10 s) can leave the port tuned with no holder.
+- An ease started in a hidden tab keeps `wf.easing` true until the tab is visible, which pauses automatic scan decisions.
+- A source that faults before its first band shows no coarse layer.
+- `reconcile_rate` is redundant with resume's `fit_capture` and can restart a job once needlessly.
+- The UI suite runs at about 229 s of its 300 s deadline.
