@@ -51,13 +51,13 @@ pub fn open(id: SourceId, args: &str) -> Result<SoapySource, PortError> {
     let d = Driver::new(&args).map_err(PortError::Io)?;
     if let Some(db) = gain {
         d.set_rx_gain(db)
-            .map_err(|e| PortError::Io(format!("soapy {id}: gain={db}: {e}")))?;
+            .map_err(|e| PortError::Io(format!("soapy {}: gain={db}: {e}", id.0)))?;
         let range = d
             .dev
             .gain_range(Direction::Rx, CH)
             .map(|r| format!(" (range {} to {} dB)", r.minimum, r.maximum))
             .unwrap_or_default();
-        eprintln!("zeta: gain for {id}: {db} dB{range}");
+        eprintln!("zeta: gain for {}: {db} dB{range}", id.0);
     }
     SoapySource::with_device_args(id, std::sync::Arc::new(d), &args)
 }
