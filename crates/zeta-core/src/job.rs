@@ -48,11 +48,17 @@ pub struct JobRecord {
     #[serde(default)]
     #[schemars(schema_with = "crate::types::nullable::<JobId>")]
     pub input: Option<JobId>,
+    /// The capture rate (the source's `bandwidth_hz`) the node expanded `graph` for, so a
+    /// resume at another rate re-expands a built-in kind; `null` for a graph the node did
+    /// not expand for a rate (`graph_put`, `scan`, attached jobs), which launches as stored.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<u64>")]
+    pub capture_rate_hz: Option<u64>,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
-/// `format` and `input`, so the published schema requires them.
+/// `format`, `input` and `capture_rate_hz`, so the published schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -60,7 +66,7 @@ fn require_format(schema: &mut schemars::Schema) {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
     {
-        for f in ["format", "input"] {
+        for f in ["format", "input", "capture_rate_hz"] {
             if !req.iter().any(|r| r == f) {
                 req.push(f.into());
             }

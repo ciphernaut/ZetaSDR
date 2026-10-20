@@ -342,6 +342,35 @@ impl JobKind {
         })
     }
 
+    /// The built-in kind recorded as `name` (see [`JobKind::name`]), if any.
+    pub fn from_name(name: &str) -> Option<JobKind> {
+        serde_json::from_value(serde_json::Value::from(name)).ok()
+    }
+
+    /// [`JobKind::expand`] again for a resumed job whose `stored` graph was expanded for
+    /// another source rate: its `deviation_hz` and `sideband` are read back from the
+    /// stored graph's node params (absent: the kind's default).
+    pub fn reexpand(
+        &self,
+        source: &SourceId,
+        tuning: Tuning,
+        source_rate_hz: Hz,
+        bank_bin_rate_hz: Option<u64>,
+        stored: &Graph,
+    ) -> Result<Graph, OpError> {
+        let param = |key: &str| stored.nodes.iter().find_map(|n| n.params.get(key).cloned());
+        let deviation_hz = param("deviation_hz").and_then(|v| v.as_u64()).map(Hz);
+        let sideband = param("sideband").and_then(|v| serde_json::from_value(v).ok());
+        self.expand(
+            source,
+            tuning,
+            source_rate_hz,
+            bank_bin_rate_hz,
+            deviation_hz,
+            sideband,
+        )
+    }
+
     /// Whether the kind's graph has a `channel` node, so depends on the source rate.
     fn channelised(&self) -> bool {
         matches!(
@@ -1258,6 +1287,7 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
         NodeError::NoAudioStream(j) => OpError::Other {
             message: format!("job {} has no audio stream", j.0),
         },
+        NodeError::Expand(e) => e,
         e @ (NodeError::Io(_) | NodeError::DuplicateSource(_)) => other(e),
     }
 }
@@ -1360,7 +1390,7 @@ async fn reconcile_rate(
                 return Err(e);
             }
         };
-        node.job_graph_put(id, graph)
+        node.job_graph_set(id, graph, Some(leased.bandwidth_hz))
             .await
             .map_err(|e| node_error(node, e))?;
         expected = leased.bandwidth_hz;
@@ -1452,7 +1482,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 })?;
                 let graph = kind.expand(&source, tuning, Hz(0), None, None, None)?;
                 return node
-                    .job_start(kind.name(), source, tuning, graph)
+                    .job_start(kind.name(), source, tuning, graph, None)
                     .await
                     .map(OpResult::Job)
                     .map_err(|e| node_error(node, e));
@@ -1473,7 +1503,13 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 sideband,
             )?;
             let id = node
-                .job_start(kind.name(), source, tuning, graph)
+                .job_start(
+                    kind.name(),
+                    source,
+                    tuning,
+                    graph,
+                    Some(granted.bandwidth_hz),
+                )
                 .await
                 .map_err(|e| node_error(node, e))?;
             reconcile_rate(

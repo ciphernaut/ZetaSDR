@@ -4,6 +4,7 @@
 mod launch;
 mod persist;
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -23,7 +24,7 @@ use crate::ring::IqRing;
 use crate::stage::{Backend, StageRegistry};
 use crate::stream::{Frame, Payload, StreamBus};
 use crate::types::{
-    Capabilities, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
+    Capabilities, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
 };
 
 pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
@@ -88,6 +89,9 @@ pub enum NodeError {
     /// An attached job's input job runs but has no audio stream to read.
     #[error("input job {} has no audio stream", .0.0)]
     NoAudioStream(JobId),
+    /// A built-in job's graph could not be re-expanded for its leased capture's rate.
+    #[error("{0}")]
+    Expand(OpError),
 }
 
 /// How many stopped or failed job records the node keeps: when a job ends
@@ -179,6 +183,12 @@ impl Inner {
             .ok_or_else(|| NodeError::NoAudioStream(job.clone()))
     }
 
+    /// The bin rate of `source`'s bank for the capture `band` (made now if
+    /// the band is new), or `None` when that band gets no bank.
+    fn bank_bin_rate(&self, source: &SourceId, band: Tuning) -> Option<u64> {
+        self.sync_bank(source, band).map(|b| 2 * b.bin_hz())
+    }
+
     /// `source`'s bank for the capture `band`: the kept one when it was made
     /// for that band, else a new one from the factory (none below
     /// [`PFB_MIN_RATE_HZ`]) replacing it. Without a factory nothing is kept.
@@ -230,11 +240,14 @@ impl Node {
     /// `cfg.resume`, resume every `Running` job and every job that `Failed`
     /// because its source was absent and is now attached (same id, context
     /// and creation time): one whose source is absent or cannot be resumed is
-    /// kept as `Failed`. Attached jobs resume after every job on the radio, so
-    /// their input runs first; one whose input does not run is kept as
-    /// `Failed` with `input job <id> not running`, and one that failed that way
-    /// resumes once its input runs. Without `cfg.resume` every record
-    /// is loaded as persisted, untouched. `open` itself fails only on
+    /// kept as `Failed`. A source's jobs resume widest band first (ties oldest
+    /// first), so the first tunes the capture the others shared; one that
+    /// still does not fit fails with the `conflict` reason. Attached jobs
+    /// resume after every job on the radio, so their input runs first; one
+    /// whose input does not run is kept as `Failed` with `input job <id> not
+    /// running`, and one that failed that way resumes once its input runs.
+    /// Without `cfg.resume` every record is loaded as persisted, untouched.
+    /// `open` itself fails only on
     /// state-directory I/O and on two ports sharing a source id
     /// (`DuplicateSource`).
     pub async fn open(
@@ -245,8 +258,16 @@ impl Node {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (mut records, load_errors) = load(&jobs_dir)?;
-        // Jobs on the radio first: an attached job resumes on its input's streams.
-        records.sort_by_key(|r| r.input.is_some());
+        // Jobs on the radio first: an attached job resumes on its input's streams. Then
+        // the widest band first: it tunes the source to the capture the narrower jobs
+        // shared, so they fit inside it again (a scan's whole band comes first of all).
+        records.sort_by_key(|r| {
+            (
+                r.input.is_some(),
+                Reverse(r.tuning.bandwidth_hz.0),
+                r.created_ns.0,
+            )
+        });
         let resume = cfg.resume;
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
@@ -401,10 +422,9 @@ impl Node {
             .and_then(|s| s.bank.clone())
     }
 
-    /// The bin rate of `source`'s bank for the capture `band` (made now if
-    /// the band is new), or `None` when that band gets no bank.
+    /// See [`Inner::bank_bin_rate`].
     pub(crate) fn bank_bin_rate(&self, source: &SourceId, band: Tuning) -> Option<u64> {
-        self.inner.sync_bank(source, band).map(|b| 2 * b.bin_hz())
+        self.inner.bank_bin_rate(source, band)
     }
 
     /// Register a knowledge provider; `KnowledgeLookup` queries all of them.
@@ -485,12 +505,16 @@ impl Node {
             .collect()
     }
 
+    /// Start a job of `kind` on `graph`, leasing `tuning` on `source`. `capture_rate_hz`
+    /// is the source rate `graph` was expanded for (recorded, so a resume at another
+    /// rate re-expands it), `None` for a graph that does not depend on it.
     pub async fn job_start(
         &self,
         kind: &str,
         source: SourceId,
         tuning: Tuning,
         graph: Graph,
+        capture_rate_hz: Option<Hz>,
     ) -> Result<JobId, NodeError> {
         let rec = JobRecord {
             format: JOB_RECORD_FORMAT,
@@ -503,6 +527,7 @@ impl Node {
             context: serde_json::json!({}),
             created_ns: now(),
             input: None,
+            capture_rate_hz: capture_rate_hz.map(|r| r.0),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -538,6 +563,7 @@ impl Node {
             context: serde_json::json!({}),
             created_ns: now(),
             input: Some(input.clone()),
+            capture_rate_hz: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -591,7 +617,20 @@ impl Node {
     /// `Running` job is stopped and relaunched on the new graph; any other job
     /// only has its record rewritten. If the relaunch fails (say, a lease
     /// conflict after the stop) the job is left `Stopped` with the new graph.
+    /// The record's `capture_rate_hz` is cleared: the node cannot know what an
+    /// operator's graph intends, so a resume launches it as stored.
     pub async fn job_graph_put(&self, id: &JobId, graph: Graph) -> Result<(), NodeError> {
+        self.job_graph_set(id, graph, None).await
+    }
+
+    /// [`Node::job_graph_put`] recording `capture_rate_hz` as the rate `graph` was
+    /// expanded for (the node's own re-expansion of a built-in kind).
+    pub(crate) async fn job_graph_set(
+        &self,
+        id: &JobId,
+        graph: Graph,
+        capture_rate_hz: Option<Hz>,
+    ) -> Result<(), NodeError> {
         graph::validate(&graph, &self.inner.registry)?;
         let running = {
             let jobs = self.inner.jobs.lock().unwrap();
@@ -610,6 +649,7 @@ impl Node {
                 .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
             let rec = JobRecord {
                 graph,
+                capture_rate_hz: capture_rate_hz.map(|r| r.0),
                 ..entry.record.clone()
             };
             persist(&self.inner.jobs_dir, &rec)?;

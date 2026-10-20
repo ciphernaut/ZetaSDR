@@ -525,6 +525,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
                 bandwidth_hz: Hz(200_000),
             },
             graph,
+            None,
         )
         .await
         .unwrap();

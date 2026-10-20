@@ -26,7 +26,9 @@ use crate::types::{
 
 impl Inner {
     /// Validate, lease, record as `Running`, persist, then spawn the job's tasks.
-    /// On error nothing is recorded and no lease is held.
+    /// On error nothing is recorded and no lease is held. A built-in kind's graph
+    /// expanded for another rate than the leased capture is re-expanded first
+    /// (see [`Inner::fit_capture`]).
     ///
     /// An attached job (`rec.input`) never touches the radio: no port, lease, tune,
     /// bank or IQ stream. Its `stream_in` nodes are first pointed at the input job's
@@ -48,27 +50,25 @@ impl Inner {
                 Some(port)
             }
         };
-        graph::validate(&rec.graph, &self.registry)?;
-        let mut stages = Vec::with_capacity(rec.graph.nodes.len());
-        for n in &rec.graph.nodes {
-            let stage = self
-                .registry
-                .select(&n.kind, &self.backends)
-                .ok_or_else(|| GraphError::UnknownStage {
-                    node: n.id.clone(),
-                    kind: n.kind.clone(),
-                    known: self.registry.kinds(),
-                })?;
-            stages.push(stage);
-        }
+        let mut stages = self.stages(&rec.graph)?;
         let mut bank = None;
         if let Some(port) = &port {
             self.leases
                 .ensure(port.as_ref(), rec.id.clone(), rec.tuning)
                 .await?;
+            let capture = port.current();
+            // A built-in graph expanded for another rate than the capture the lease
+            // left the port at (a resume, or a rate change since the expand) is
+            // expanded again for this one; the record below persists it.
+            if let Some(band) = capture
+                && let Err(e) = self.fit_capture(&mut rec, band, &mut stages)
+            {
+                self.leases.release(&rec.id);
+                return Err(e);
+            }
             // The bank for the band the lease left the port at, so the stages
             // never subscribe to one made for a band the port has left.
-            bank = match port.current() {
+            bank = match capture {
                 Some(band) => self.sync_bank(&rec.source, band),
                 None => self
                     .banks
@@ -156,6 +156,51 @@ impl Inner {
             e.done = Some(h);
             e.outputs = job_outputs;
         }
+        Ok(())
+    }
+
+    /// Validate `graph` and select a stage for each of its nodes, in graph order.
+    fn stages(&self, graph: &Graph) -> Result<Vec<Arc<dyn Stage>>, NodeError> {
+        graph::validate(graph, &self.registry)?;
+        let mut stages = Vec::with_capacity(graph.nodes.len());
+        for n in &graph.nodes {
+            let stage = self
+                .registry
+                .select(&n.kind, &self.backends)
+                .ok_or_else(|| GraphError::UnknownStage {
+                    node: n.id.clone(),
+                    kind: n.kind.clone(),
+                    known: self.registry.kinds(),
+                })?;
+            stages.push(stage);
+        }
+        Ok(stages)
+    }
+
+    /// Re-expand `rec`'s graph for the capture `band` when it is of a built-in kind
+    /// and was expanded for another rate (`capture_rate_hz`), recording the new rate
+    /// and reselecting `stages`. A record without a rate (`graph_put`, or written
+    /// before the field) is left as stored.
+    fn fit_capture(
+        &self,
+        rec: &mut JobRecord,
+        band: Tuning,
+        stages: &mut Vec<Arc<dyn Stage>>,
+    ) -> Result<(), NodeError> {
+        let rate = band.bandwidth_hz;
+        let Some(kind) = JobKind::from_name(&rec.kind) else {
+            return Ok(());
+        };
+        if rec.capture_rate_hz.is_none_or(|r| r == rate.0) {
+            return Ok(());
+        }
+        let bin_rate = self.bank_bin_rate(&rec.source, band);
+        let graph = kind
+            .reexpand(&rec.source, rec.tuning, rate, bin_rate, &rec.graph)
+            .map_err(NodeError::Expand)?;
+        *stages = self.stages(&graph)?;
+        rec.graph = graph;
+        rec.capture_rate_hz = Some(rate.0);
         Ok(())
     }
 

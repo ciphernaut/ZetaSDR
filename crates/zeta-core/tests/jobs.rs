@@ -81,6 +81,7 @@ async fn start_job(node: &Node) -> JobId {
         SourceId("file0".into()),
         tuning(),
         graph("passthrough"),
+        None,
     )
     .await
     .unwrap()
@@ -216,7 +217,13 @@ async fn unknown_stage_rejected_before_start() {
         .await
         .unwrap();
     match node
-        .job_start("monitor", SourceId("file0".into()), tuning(), graph("nope"))
+        .job_start(
+            "monitor",
+            SourceId("file0".into()),
+            tuning(),
+            graph("nope"),
+            None,
+        )
         .await
     {
         Err(NodeError::Graph(GraphError::UnknownStage { kind, .. })) => assert_eq!(kind, "nope"),
@@ -547,6 +554,7 @@ async fn start_flaky(node: &Node) -> JobId {
         SourceId("flaky".into()),
         tuning(),
         graph("passthrough"),
+        None,
     )
     .await
     .unwrap()

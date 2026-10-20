@@ -435,7 +435,8 @@ async fn job_start_reexpands_when_lease_rate_differs() {
         let g = JobKind::Passthrough
             .expand(&source, wide, wide.bandwidth_hz, None, None, None)
             .unwrap();
-        node.job_start("passthrough", source.clone(), wide, g).await
+        node.job_start("passthrough", source.clone(), wide, g, None)
+            .await
     };
     let (a, b) = tokio::join!(node.apply(a), b);
     let a = match a {
@@ -1701,6 +1702,39 @@ fn nullable_fields_have_null_in_schema_type() {
         Some(&Value::from("out_of_range")),
         "oneOf/0 is OutOfRange"
     );
+}
+
+/// `capture_rate_hz` is always written, so required and nullable like `input`; a record
+/// written before it existed loads with `None`.
+#[test]
+fn job_record_capture_rate_is_required_nullable_and_defaults_to_none() {
+    let rec = &schema()["result"]["$defs"]["JobRecord"];
+    assert!(
+        rec["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"capture_rate_hz".into()),
+        "{rec}"
+    );
+    let ty = rec["properties"]["capture_rate_hz"]["type"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{rec}"));
+    assert!(ty.contains(&Value::from("integer")), "{rec}");
+    assert!(ty.contains(&Value::from("null")), "{rec}");
+    let v = serde_json::json!({
+        "format": 1,
+        "id": "01J00000000000000000000000",
+        "kind": "passthrough",
+        "graph": {"id": "g", "nodes": [], "edges": []},
+        "source": "s",
+        "tuning": {"center_hz": 1, "bandwidth_hz": 1},
+        "state": {"status": "running"},
+        "context": {},
+        "created_ns": 0,
+        "input": null
+    });
+    let r: zeta_core::job::JobRecord = serde_json::from_value(v).unwrap();
+    assert_eq!(r.capture_rate_hz, None);
 }
 
 #[test]

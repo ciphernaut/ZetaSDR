@@ -258,7 +258,7 @@ async fn stage_context_carries_source_and_bank() {
             edges: vec![],
         };
         let job = node
-            .job_start("rec", port.id.clone(), port.band, graph)
+            .job_start("rec", port.id.clone(), port.band, graph, None)
             .await
             .unwrap();
         until("the stage to run", || seen.lock().unwrap().is_some()).await;

@@ -210,6 +210,7 @@ async fn start_audio(node: &Node) -> JobId {
         file0(),
         tuning(),
         node_graph("audio_src", serde_json::json!({})),
+        None,
     )
     .await
     .unwrap()
@@ -417,6 +418,7 @@ async fn attach_refuses_non_running_or_audio_less_input() {
             file0(),
             tuning(),
             node_graph("passthrough", serde_json::json!({"kind": "iq"})),
+            None,
         )
         .await
         .unwrap();
@@ -589,6 +591,7 @@ async fn launch_registers_every_output_of_a_multi_output_stage() {
             file0(),
             tuning(),
             node_graph("two_out", serde_json::json!({})),
+            None,
         )
         .await
         .unwrap();
@@ -624,7 +627,10 @@ async fn launch_registers_every_output_of_a_multi_output_stage() {
             kind: StreamKind::Audio,
         }],
     };
-    let chained = node.job_start("two", file0(), tuning(), g).await.unwrap();
+    let chained = node
+        .job_start("two", file0(), tuning(), g, None)
+        .await
+        .unwrap();
     let mut kinds: Vec<_> = streams_of(&node, &chained)
         .iter()
         .map(|s| format!("{:?}", s.kind))
