@@ -34,6 +34,7 @@ async fn field_host_gemma_tunes_hackrf0() {
         },
         current: None,
         holders: vec![],
+        elastic: vec![],
         fault: None,
     }]);
     let tuning = OpResult::Tuning(Tuning {

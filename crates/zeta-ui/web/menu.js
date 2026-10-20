@@ -336,6 +336,7 @@ class Menu {
       bandwidth_hz: t.bandwidthHz,
       deviation_hz: job.deviation,
       sideband: job.sideband,
+      elastic: false,
     });
   }
 
@@ -358,6 +359,7 @@ class Menu {
       bandwidth_hz: s.bandwidthHz,
       deviation_hz: null,
       sideband: null,
+      elastic: false,
     });
     this.wf.resume();
   }

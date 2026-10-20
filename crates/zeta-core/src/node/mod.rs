@@ -112,6 +112,9 @@ struct JobEntry {
     /// (each node's in its stage's output order), set at launch; an attached job reads
     /// one of these.
     outputs: Vec<(StreamKind, StreamId)>,
+    /// Set while an elastic job is relaunched on a new capture: its supervisor then
+    /// leaves the record `Running` and the lease held for the relaunch.
+    relaunch: bool,
 }
 
 /// A source's bank for the capture band it was made for; `bank` is `None`
@@ -144,11 +147,46 @@ struct Inner {
     ops_log: opslog::OpsLog,
     /// Whether a failed ops-log write is already in `persist_errors`.
     ops_log_failed: std::sync::atomic::AtomicBool,
+    /// Held across [`Inner::relaunch_elastic`], so two retunes never relaunch one
+    /// elastic job at once.
+    relaunching: tokio::sync::Mutex<()>,
     /// Cancelled when the `Node` is dropped; every job token is a child of it.
     shutdown: CancellationToken,
 }
 
 impl Inner {
+    /// See [`Node::job_stop`].
+    async fn stop(&self, id: &JobId) -> Result<(), NodeError> {
+        let done = {
+            let mut jobs = self.jobs.lock().unwrap();
+            let entry = jobs
+                .get_mut(id)
+                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            if !matches!(
+                entry.record.state,
+                JobState::Failed { .. } | JobState::Stopped
+            ) {
+                let rec = JobRecord {
+                    state: JobState::Stopped,
+                    ..entry.record.clone()
+                };
+                persist(&self.jobs_dir, &rec)?;
+                entry.record = rec;
+                entry.ended_ns = now();
+            }
+            if let Some(c) = entry.cancel.take() {
+                c.cancel();
+            }
+            let done = entry.done.take();
+            Inner::prune_history(&mut jobs, &self.jobs_dir);
+            done
+        };
+        if let Some(h) = done {
+            let _ = h.await;
+        }
+        Ok(())
+    }
+
     /// Forget the terminal records that ended earliest beyond
     /// [`JOB_HISTORY_MAX`], removing their files (best effort: a file that
     /// will not go is retried at the next prune). Called with `jobs` locked
@@ -247,7 +285,8 @@ impl Node {
     /// and creation time): one whose source is absent or cannot be resumed is
     /// kept as `Failed`. A source's jobs resume widest band first (ties oldest
     /// first), so the first tunes the capture the others shared; one that
-    /// still does not fit fails with the `conflict` reason. Attached jobs
+    /// still does not fit fails with the `conflict` reason. Elastic jobs
+    /// resume after every rigid one and join the capture they left. Attached jobs
     /// resume after every job on the radio, so their input runs first; one
     /// whose input does not run is kept as `Failed` with `input job <id> not
     /// running`, and one that failed that way resumes once its input runs.
@@ -266,9 +305,11 @@ impl Node {
         // Jobs on the radio first: an attached job resumes on its input's streams. Then
         // the widest band first: it tunes the source to the capture the narrower jobs
         // shared, so they fit inside it again (a scan's whole band comes first of all).
+        // Elastic jobs after every rigid one: they join whatever capture those left.
         records.sort_by_key(|r| {
             (
                 r.input.is_some(),
+                r.elastic,
                 Reverse(r.tuning.bandwidth_hz.0),
                 r.created_ns.0,
             )
@@ -306,6 +347,7 @@ impl Node {
                 persist_errors: Mutex::new(Vec::new()),
                 ops_log: opslog::OpsLog::new(&cfg.state_dir),
                 ops_log_failed: std::sync::atomic::AtomicBool::new(false),
+                relaunching: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
             }),
             load_errors,
@@ -324,6 +366,7 @@ impl Node {
                         cancel: None,
                         done: None,
                         outputs: Vec::new(),
+                        relaunch: false,
                     },
                 );
                 continue;
@@ -344,6 +387,7 @@ impl Node {
                         cancel: None,
                         done: None,
                         outputs: Vec::new(),
+                        relaunch: false,
                     },
                 );
             }
@@ -534,7 +578,10 @@ impl Node {
 
     /// Start a job of `kind` on `graph`, leasing `tuning` on `source`. `capture_rate_hz`
     /// is the source rate `graph` was expanded for (recorded, so a resume at another
-    /// rate re-expands it), `None` for a graph that does not depend on it.
+    /// rate re-expands it), `None` for a graph that does not depend on it. An
+    /// `elastic` job (a built-in kind) takes an elastic lease: it joins the source's
+    /// capture, its `tuning` becomes that capture, and it is relaunched under the same
+    /// id on every retune (see [`crate::lease::LeaseManager::ensure`]).
     pub async fn job_start(
         &self,
         kind: &str,
@@ -542,6 +589,7 @@ impl Node {
         tuning: Tuning,
         graph: Graph,
         capture_rate_hz: Option<Hz>,
+        elastic: bool,
     ) -> Result<JobId, NodeError> {
         let rec = JobRecord {
             format: JOB_RECORD_FORMAT,
@@ -555,6 +603,7 @@ impl Node {
             created_ns: now(),
             input: None,
             capture_rate_hz: capture_rate_hz.map(|r| r.0),
+            elastic,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -591,6 +640,7 @@ impl Node {
             created_ns: now(),
             input: Some(input.clone()),
             capture_rate_hz: None,
+            elastic: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -610,34 +660,7 @@ impl Node {
     /// record cannot be written the job is left running and `Io` is returned.
     /// A `Failed` job keeps its state and reason.
     pub async fn job_stop(&self, id: &JobId) -> Result<(), NodeError> {
-        let done = {
-            let mut jobs = self.inner.jobs.lock().unwrap();
-            let entry = jobs
-                .get_mut(id)
-                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
-            if !matches!(
-                entry.record.state,
-                JobState::Failed { .. } | JobState::Stopped
-            ) {
-                let rec = JobRecord {
-                    state: JobState::Stopped,
-                    ..entry.record.clone()
-                };
-                persist(&self.inner.jobs_dir, &rec)?;
-                entry.record = rec;
-                entry.ended_ns = now();
-            }
-            if let Some(c) = entry.cancel.take() {
-                c.cancel();
-            }
-            let done = entry.done.take();
-            Inner::prune_history(&mut jobs, &self.inner.jobs_dir);
-            done
-        };
-        if let Some(h) = done {
-            let _ = h.await;
-        }
-        Ok(())
+        self.inner.stop(id).await
     }
 
     /// Replace a job's graph, keeping its id. The graph is validated first. A
@@ -759,16 +782,29 @@ impl Node {
     }
 
     /// Tune `source` to `t` unless a job holds it; see [`LeaseManager::tune_if_unheld`].
+    /// Also whether it tuned the port: the caller then relaunches the elastic jobs
+    /// there ([`Node::relaunch_elastic`]).
     pub(crate) async fn tune_if_unheld(
         &self,
         port: &dyn Port,
         t: Tuning,
-    ) -> Result<Tuning, LeaseError> {
-        self.inner.leases.tune_if_unheld(port, t).await
+    ) -> Result<(Tuning, bool), LeaseError> {
+        self.inner.leases.tune_if_unheld_tuned(port, t).await
     }
 
-    /// Jobs currently holding a lease on `source`, with the band each asked for.
+    /// Relaunch every running elastic job on `source` on its current capture; see
+    /// [`Inner::relaunch_elastic`].
+    pub(crate) async fn relaunch_elastic(&self, source: &SourceId) {
+        self.inner.relaunch_elastic(source, None).await
+    }
+
+    /// Jobs currently holding a rigid lease on `source`, with the band each asked for.
     pub fn lease_holders(&self, source: &SourceId) -> Vec<(JobId, Tuning)> {
         self.inner.leases.holders(source)
+    }
+
+    /// Jobs currently following `source`'s capture on an elastic lease.
+    pub fn lease_elastic(&self, source: &SourceId) -> Vec<JobId> {
+        self.inner.leases.elastic_holders(source)
     }
 }

@@ -291,6 +291,7 @@ fn passthrough() -> Op {
         bandwidth_hz: Hz(1_000_000),
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     }
 }
 

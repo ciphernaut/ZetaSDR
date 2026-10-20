@@ -28,7 +28,9 @@ impl Inner {
     /// Validate, lease, record as `Running`, persist, then spawn the job's tasks.
     /// On error nothing is recorded and no lease is held. A built-in kind's graph
     /// expanded for another rate than the leased capture is re-expanded first
-    /// (see [`Inner::fit_capture`]).
+    /// (see [`Inner::fit_capture`]). An elastic job joins the capture and follows
+    /// it (see [`Inner::follow_capture`]); a rigid one that tuned the port then
+    /// relaunches the elastic jobs there ([`Inner::relaunch_elastic`]).
     ///
     /// An attached job (`rec.input`) never touches the radio: no port, lease, tune,
     /// bank or IQ stream. Its `stream_in` nodes are first pointed at the input job's
@@ -52,10 +54,21 @@ impl Inner {
         };
         let mut stages = self.stages(&rec.graph)?;
         let mut bank = None;
+        let mut tuned = false;
         if let Some(port) = &port {
-            self.leases
-                .ensure(port.as_ref(), rec.id.clone(), rec.tuning)
+            let granted;
+            // The source's gate is held only inside `ensure_tuned`, never past it.
+            (granted, tuned) = self
+                .leases
+                .ensure_tuned(port.as_ref(), rec.id.clone(), rec.tuning, rec.elastic)
                 .await?;
+            if rec.elastic
+                && let Err(e) =
+                    self.follow_capture(&mut rec, port.current().unwrap_or(granted), &mut stages)
+            {
+                self.leases.release(&rec.id);
+                return Err(e);
+            }
             let capture = port.current();
             // A built-in graph expanded for another rate than the capture the lease
             // left the port at (a resume, or a rate change since the expand) is
@@ -64,6 +77,9 @@ impl Inner {
                 && let Err(e) = self.fit_capture(&mut rec, band, &mut stages)
             {
                 self.leases.release(&rec.id);
+                if tuned && !rec.elastic {
+                    self.relaunch_elastic(&rec.source, None).await;
+                }
                 return Err(e);
             }
             // The bank for the band the lease left the port at, so the stages
@@ -84,9 +100,20 @@ impl Inner {
         };
 
         let id = rec.id.clone();
+        let relaunch = tuned && !rec.elastic;
+        let source = rec.source.clone();
         let token = self.shutdown.child_token();
         let graph = rec.graph.clone();
-        let prov = self.record_running(rec, &token)?;
+        let prov = match self.record_running(rec, &token) {
+            Ok(prov) => prov,
+            Err(e) => {
+                // The port moved anyway: the elastic jobs follow it.
+                if relaunch {
+                    self.relaunch_elastic(&source, None).await;
+                }
+                return Err(e);
+            }
+        };
 
         // One stream per edge; a node with no incoming edge whose stage takes input
         // reads the job's IQ stream (a job on the radio only). Each node's outputs get
@@ -156,7 +183,90 @@ impl Inner {
             e.done = Some(h);
             e.outputs = job_outputs;
         }
+        // Only a rigid request tunes a port elastic jobs follow (an elastic one
+        // tunes only an unheld port), so a relaunch never relaunches again.
+        if relaunch {
+            self.relaunch_elastic(&source, Some(&id)).await;
+        }
         Ok(())
+    }
+
+    /// Relaunch every running elastic job on `source` but `except` under the same
+    /// id, on the source's current capture: its stages are stopped (the record
+    /// stays `Running`, the lease held), then [`Inner::launch`] joins the capture,
+    /// sets the record's `tuning` to it, re-expands its graph for it and persists
+    /// it, with new stream ids. Called after a tune of the port, never under the
+    /// source's gate (the relaunch's own `ensure` takes it). A relaunch that fails
+    /// leaves the job `Failed` with the reason; a stop that lands meanwhile wins.
+    pub(super) async fn relaunch_elastic(
+        self: &Arc<Self>,
+        source: &SourceId,
+        except: Option<&JobId>,
+    ) {
+        let Some(port) = self.ports.read().unwrap().get(source).cloned() else {
+            return;
+        };
+        let _one = self.relaunching.lock().await;
+        for id in self.leases.elastic_holders(source) {
+            if except == Some(&id) || self.shutdown.is_cancelled() {
+                continue;
+            }
+            let (rec, done) = {
+                let mut jobs = self.jobs.lock().unwrap();
+                let Some(e) = jobs.get_mut(&id) else {
+                    continue;
+                };
+                if e.record.state != JobState::Running {
+                    continue;
+                }
+                let Some(cancel) = e.cancel.take() else {
+                    continue;
+                };
+                e.relaunch = true;
+                cancel.cancel();
+                (e.record.clone(), e.done.take())
+            };
+            if let Some(h) = done {
+                let _ = h.await;
+            }
+            let running = self
+                .jobs
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|e| e.record.state == JobState::Running);
+            // Boxed: `launch` itself calls this function.
+            let result = match running {
+                true => Box::pin(self.launch(rec)).await,
+                false => Ok(()),
+            };
+            if !running || result.is_err() {
+                if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
+                    e.relaunch = false;
+                }
+                self.leases.release(&id);
+                self.leases.idle_if_unheld(port.as_ref()).await;
+            }
+            if let Err(e) = result {
+                self.finish(
+                    &id,
+                    JobState::Failed {
+                        reason: e.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Stop every elastic job on `source`, each `Stopped` as by `job_stop`: a scan
+    /// is about to time-share the source, and no capture outlasts one of its steps.
+    /// A stop that cannot be persisted leaves that job running (the scan's lease
+    /// is then refused).
+    async fn stop_elastic(&self, source: &SourceId) {
+        let _one = self.relaunching.lock().await;
+        for id in self.leases.elastic_holders(source) {
+            let _ = self.stop(&id).await;
+        }
     }
 
     /// Validate `graph` and select a stage for each of its nodes, in graph order.
@@ -204,6 +314,33 @@ impl Inner {
         Ok(())
     }
 
+    /// Point an elastic `rec` at the capture `band` it joined: its `tuning` becomes
+    /// the capture and a built-in kind's graph is expanded again for it (whatever
+    /// rate it was expanded for), reselecting `stages`. Unchanged when it is
+    /// already there.
+    fn follow_capture(
+        &self,
+        rec: &mut JobRecord,
+        band: Tuning,
+        stages: &mut Vec<Arc<dyn Stage>>,
+    ) -> Result<(), NodeError> {
+        if rec.tuning == band {
+            return Ok(());
+        }
+        rec.tuning = band;
+        let Some(kind) = JobKind::from_name(&rec.kind) else {
+            return Ok(());
+        };
+        let bin_rate = self.bank_bin_rate(&rec.source, band);
+        let graph = kind
+            .reexpand(&rec.source, band, band.bandwidth_hz, bin_rate, &rec.graph)
+            .map_err(NodeError::Expand)?;
+        *stages = self.stages(&graph)?;
+        rec.graph = graph;
+        rec.capture_rate_hz = Some(band.bandwidth_hz.0);
+        Ok(())
+    }
+
     /// Mark a leased job `Running`, persist it and enter it in the job table
     /// with `token`; the job's base provenance. On a failed write the lease
     /// is released and nothing is entered.
@@ -235,6 +372,7 @@ impl Inner {
                 cancel: Some(token.clone()),
                 done: None,
                 outputs: Vec::new(),
+                relaunch: false,
             },
         );
         Ok(prov)
@@ -256,6 +394,7 @@ impl Inner {
                 known: self.registry.kinds(),
             }
         })?;
+        self.stop_elastic(&rec.source).await;
         self.leases
             .acquire_shared(port.as_ref(), rec.id.clone(), rec.tuning)
             .await?;
@@ -422,15 +561,26 @@ async fn supervise(
             }
         }
     }
+    // An elastic job being relaunched keeps its record `Running` and its lease
+    // for the relaunch (see `Inner::relaunch_elastic`).
+    let relaunch = inner
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&id)
+        .is_some_and(|e| e.relaunch);
     // After node shutdown the record must stay `Running` so the job resumes.
-    if !inner.shutdown.is_cancelled() {
+    if !inner.shutdown.is_cancelled() && !relaunch {
         inner.finish(
             &id,
             failure.map_or(JobState::Stopped, |reason| JobState::Failed { reason }),
         );
     }
-    // The only place a started job's lease is released.
-    if let Some(port) = port {
+    // The only place a started job's lease is released, but for a relaunch that
+    // fails (`Inner::relaunch_elastic`).
+    if let Some(port) = port
+        && !relaunch
+    {
         inner.leases.release(&id);
         inner.leases.idle_if_unheld(port.as_ref()).await;
     }

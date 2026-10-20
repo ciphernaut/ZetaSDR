@@ -54,11 +54,15 @@ pub struct JobRecord {
     #[serde(default)]
     #[schemars(schema_with = "crate::types::nullable::<u64>")]
     pub capture_rate_hz: Option<u64>,
+    /// Started with `elastic` (a `spectrum` job only): it follows the source's capture
+    /// instead of holding it, so `tuning` is the capture it last joined.
+    #[serde(default)]
+    pub elastic: bool,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
-/// `format`, `input` and `capture_rate_hz`, so the published schema requires them.
+/// `format`, `input`, `capture_rate_hz` and `elastic`, so the published schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -66,7 +70,7 @@ fn require_format(schema: &mut schemars::Schema) {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
     {
-        for f in ["format", "input", "capture_rate_hz"] {
+        for f in ["format", "input", "capture_rate_hz", "elastic"] {
             if !req.iter().any(|r| r == f) {
                 req.push(f.into());
             }

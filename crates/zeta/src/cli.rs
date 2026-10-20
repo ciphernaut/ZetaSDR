@@ -332,6 +332,10 @@ pub enum JobCmd {
         /// Sideband for ssb_demod only; absent = usb
         #[arg(long, value_enum)]
         sideband: Option<SidebandArg>,
+        /// spectrum only: follow the source's capture instead of holding it
+        /// (never conflicts; relaunched under the same id on every retune)
+        #[arg(long)]
+        elastic: bool,
         /// After starting, tail the job's first event (else audio) stream, stop
         /// the job and print `[job_result, frames_result, {"stopped": true}]`;
         /// a job that is not running prints `[job_result, job_record]` and
@@ -606,6 +610,7 @@ impl Command {
                 band: b,
                 deviation_hz,
                 sideband,
+                elastic,
                 ..
             }) => Op::JobStart {
                 kind: kind.into(),
@@ -614,6 +619,7 @@ impl Command {
                 bandwidth_hz: Hz(b.bandwidth_hz),
                 deviation_hz,
                 sideband: sideband.map(Into::into),
+                elastic,
             },
             Command::Job(JobCmd::Attach {
                 kind,

@@ -153,6 +153,47 @@ fn job_start_persists_and_list_sees_it_in_new_process() {
 }
 
 #[test]
+fn job_start_elastic_flag_round_trips_to_job_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = [
+        "job",
+        "start",
+        "--kind",
+        "spectrum",
+        "--elastic",
+        "--source",
+        "tone",
+        "--center-hz",
+        "100000000",
+        "--bandwidth-hz",
+        "48000",
+    ];
+    let out = zeta(dir.path(), &start)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let id = json(&out)["value"].as_str().expect("job id").to_owned();
+    let out = zeta(dir.path(), &["job", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let job = v["value"]
+        .as_array()
+        .expect("jobs array")
+        .iter()
+        .find(|j| j["id"] == id.as_str())
+        .expect("started job listed")
+        .clone();
+    assert_eq!(job["elastic"], true, "{job}");
+    assert_eq!(job["kind"], "spectrum", "{job}");
+}
+
+#[test]
 fn iq_read_one_shot_writes_capture() {
     let dir = tempfile::tempdir().unwrap();
     let out = zeta(

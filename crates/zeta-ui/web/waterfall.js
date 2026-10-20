@@ -507,6 +507,7 @@ class Waterfall {
         bandwidth_hz: band.bandwidth_hz,
         deviation_hz: null,
         sideband: null,
+        elastic: false,
       });
     } catch (e) {
       // A scan started on the source since job_list (or this page loaded while one was

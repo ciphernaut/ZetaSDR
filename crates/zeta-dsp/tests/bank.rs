@@ -526,6 +526,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
             },
             graph,
             None,
+            false,
         )
         .await
         .unwrap();

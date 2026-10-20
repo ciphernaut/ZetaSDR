@@ -234,6 +234,7 @@ fn start(kind: JobKind, center_hz: u64, bandwidth_hz: u64) -> Op {
         bandwidth_hz: Hz(bandwidth_hz),
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     }
 }
 

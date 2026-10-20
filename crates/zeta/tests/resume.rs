@@ -105,6 +105,7 @@ async fn resume_reexpands_a_builtin_graph_for_the_actual_rate() {
         created_ns: Timestamp(1),
         input: None,
         capture_rate_hz: Some(480_000),
+        elastic: false,
     };
     let jobs = dir.path().join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();
@@ -154,6 +155,7 @@ async fn resume_leaves_a_graph_put_graph_alone() {
             bandwidth_hz: Hz(BANDWIDTH_HZ),
             deviation_hz: None,
             sideband: None,
+            elastic: false,
         };
         let id = match node.apply(op).await.unwrap() {
             OpResult::Job(id) => id,

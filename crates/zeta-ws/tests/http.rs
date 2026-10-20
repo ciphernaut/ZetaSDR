@@ -82,7 +82,7 @@ async fn wrong_secret_is_401_and_op_not_applied() {
     let dir = tempfile::tempdir().unwrap();
     let ts = spawn(dir.path()).await;
     let start = json!({"op":"job_start","kind":"passthrough","source":"tone",
-        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null});
+        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null,"elastic":false});
     for auth in [Some("Bearer wrong"), None, Some("Basic s3cret")] {
         let resp = post_op(&ts, auth, &start).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{auth:?}");
@@ -163,7 +163,7 @@ async fn ops_log_records_the_callers_transport() {
     };
     let resp = send(
         json!({"op":"job_start","kind":"passthrough","source":"tone",
-        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null}),
+        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null,"elastic":false}),
     )
     .await
     .unwrap();

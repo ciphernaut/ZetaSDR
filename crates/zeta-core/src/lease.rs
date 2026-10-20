@@ -1,5 +1,7 @@
 //! Lease manager: decides who may retune a port. A held port is never
 //! retuned; a request that does not fit is a conflict naming the holders.
+//! An elastic lease (a `spectrum` job following the capture) holds nothing:
+//! rigid requests ignore it, and it never retunes a held port.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -57,20 +59,23 @@ impl From<PortError> for LeaseError {
 
 /// One holder's lease on a source. A `time_shared` lease (a scan) covers a
 /// band wider than any one capture: its holder retunes the port across it,
-/// so no other request fits while it is held.
+/// so no other request fits while it is held. An `elastic` lease's band is
+/// the capture it joined; it is never a holder for a rigid request.
 #[derive(Clone, Debug)]
 struct Lease {
     job: JobId,
     band: Tuning,
     time_shared: bool,
+    elastic: bool,
 }
 
 impl Lease {
-    fn new(job: JobId, band: Tuning) -> Self {
+    fn new(job: JobId, band: Tuning, elastic: bool) -> Self {
         Self {
             job,
             band,
             time_shared: false,
+            elastic,
         }
     }
 }
@@ -118,6 +123,15 @@ fn conflict_options(port: &dyn Port, want: &Tuning, cur: &Tuning, shared: bool) 
     options
 }
 
+/// The rigid holders among `leases`: those a conflict names.
+fn rigid(leases: &[Lease]) -> Vec<JobId> {
+    leases
+        .iter()
+        .filter(|l| !l.elastic)
+        .map(|l| l.job.clone())
+        .collect()
+}
+
 impl LeaseManager {
     pub fn new() -> Self {
         Self::default()
@@ -138,35 +152,65 @@ impl LeaseManager {
     pub async fn idle_if_unheld(&self, port: &dyn Port) {
         let gate = self.gate(port.id());
         let _guard = gate.lock().await;
-        if self.holders(port.id()).is_empty() {
+        if !self.leases.lock().unwrap().contains_key(port.id()) {
             port.idle().await;
         }
     }
 
     /// Grant `holder` the band `want` on `port`, tuning only if the port is unheld.
+    ///
+    /// A rigid request (`elastic` false) ignores elastic leases: when only those
+    /// hold the port it is tuned as if unheld. An elastic request on a held port
+    /// joins the current capture (its lease band, and the result, is that
+    /// capture) without a tune and never conflicts, except with a time-shared
+    /// lease (a scan), which no capture outlasts.
     pub async fn ensure(
         &self,
         port: &dyn Port,
         holder: JobId,
         want: Tuning,
+        elastic: bool,
     ) -> Result<Tuning, LeaseError> {
+        self.ensure_tuned(port, holder, want, elastic)
+            .await
+            .map(|(t, _)| t)
+    }
+
+    /// [`LeaseManager::ensure`], also saying whether it tuned the port (so the
+    /// caller relaunches the elastic jobs that followed the old capture).
+    pub(crate) async fn ensure_tuned(
+        &self,
+        port: &dyn Port,
+        holder: JobId,
+        want: Tuning,
+        elastic: bool,
+    ) -> Result<(Tuning, bool), LeaseError> {
         let source = port.id().clone();
         let gate = self.gate(&source);
         let _guard = gate.lock().await;
         {
             let mut leases = self.leases.lock().unwrap();
+            let held = leases.get(&source).cloned().unwrap_or_default();
+            let shared = held.iter().any(|l| l.time_shared);
+            // The leases this request must respect: every one for an elastic
+            // request, the rigid ones for a rigid request.
+            let first = held.iter().find(|l| elastic || !l.elastic).map(|l| l.band);
             // A held port lacking a current tuning is taken to be at its
             // first holder's band, as in `tune_if_unheld`; it is never retuned.
-            let first = leases.get(&source).and_then(|v| v.first()).map(|l| l.band);
             if let Some(cur) = first.map(|f| port.current().unwrap_or(f)) {
-                let shared = leases[&source].iter().any(|l| l.time_shared);
-                if !shared && fits(&want, &cur) {
+                if elastic && !shared {
                     let v = leases.get_mut(&source).unwrap();
                     v.retain(|l| l.job != holder);
-                    v.push(Lease::new(holder, want));
-                    return Ok(cur);
+                    v.push(Lease::new(holder, cur, true));
+                    return Ok((cur, false));
                 }
-                let holders = leases[&source].iter().map(|l| l.job.clone()).collect();
+                if !elastic && !shared && fits(&want, &cur) {
+                    let v = leases.get_mut(&source).unwrap();
+                    v.retain(|l| l.job != holder);
+                    v.push(Lease::new(holder, want, false));
+                    return Ok((cur, false));
+                }
+                let holders = rigid(&held);
                 let options = conflict_options(port, &want, &cur, shared);
                 return Err(LeaseError::Conflict {
                     source,
@@ -180,8 +224,8 @@ impl LeaseManager {
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source).or_default();
         v.retain(|l| l.job != holder);
-        v.push(Lease::new(holder, got));
-        Ok(got)
+        v.push(Lease::new(holder, got, elastic));
+        Ok((got, true))
     }
 
     /// Grant `holder` a time-shared lease on the whole `span` of `port`
@@ -204,7 +248,7 @@ impl LeaseManager {
             let cur = port.current().unwrap_or(first.band);
             let shared = v.iter().any(|l| l.time_shared);
             return Err(LeaseError::Conflict {
-                holders: v.iter().map(|l| l.job.clone()).collect(),
+                holders: rigid(v),
                 options: conflict_options(port, &span, &cur, shared),
                 source,
                 current: cur,
@@ -214,6 +258,7 @@ impl LeaseManager {
             job: holder,
             band: span,
             time_shared: true,
+            elastic: false,
         });
         Ok(())
     }
@@ -244,27 +289,41 @@ impl LeaseManager {
     /// Tune `port` to `want` without taking a lease, under the same per-source
     /// gate as `ensure`, so it cannot interleave with a job's lease-and-tune.
     /// A held port is never retuned: the request either fits its current band
-    /// (which is returned) or is a conflict.
+    /// (which is returned) or is a conflict. Elastic leases do not hold it.
     pub async fn tune_if_unheld(
         &self,
         port: &dyn Port,
         want: Tuning,
     ) -> Result<Tuning, LeaseError> {
+        self.tune_if_unheld_tuned(port, want).await.map(|(t, _)| t)
+    }
+
+    /// [`LeaseManager::tune_if_unheld`], also saying whether it tuned the port.
+    pub(crate) async fn tune_if_unheld_tuned(
+        &self,
+        port: &dyn Port,
+        want: Tuning,
+    ) -> Result<(Tuning, bool), LeaseError> {
         let source = port.id().clone();
         let gate = self.gate(&source);
         let _guard = gate.lock().await;
-        let held = self.leases.lock().unwrap().get(&source).cloned();
-        let Some(first) = held.as_ref().and_then(|v| v.first()) else {
-            return Ok(port.tune(want).await?);
+        let held: Vec<Lease> = self
+            .leases
+            .lock()
+            .unwrap()
+            .get(&source)
+            .map(|v| v.iter().filter(|l| !l.elastic).cloned().collect())
+            .unwrap_or_default();
+        let Some(first) = held.first() else {
+            return Ok((port.tune(want).await?, true));
         };
         let cur = port.current().unwrap_or(first.band);
-        let held = held.unwrap_or_default();
         let shared = held.iter().any(|l| l.time_shared);
         if !shared && fits(&want, &cur) {
-            return Ok(cur);
+            return Ok((cur, false));
         }
         let options = conflict_options(port, &want, &cur, shared);
-        let holders = held.into_iter().map(|l| l.job).collect();
+        let holders = rigid(&held);
         Err(LeaseError::Conflict {
             source,
             holders,
@@ -291,14 +350,35 @@ impl LeaseManager {
             .is_some_and(|v| v.iter().any(|l| l.time_shared))
     }
 
-    /// Current holders of `source`, in insertion order, with the band each
-    /// leased (a time-shared holder's is its whole span).
+    /// Current rigid holders of `source`, in insertion order, with the band
+    /// each leased (a time-shared holder's is its whole span). Elastic leases
+    /// are not holders; see [`LeaseManager::elastic_holders`].
     pub fn holders(&self, source: &SourceId) -> Vec<(JobId, Tuning)> {
         self.leases
             .lock()
             .unwrap()
             .get(source)
-            .map(|v| v.iter().map(|l| (l.job.clone(), l.band)).collect())
+            .map(|v| {
+                v.iter()
+                    .filter(|l| !l.elastic)
+                    .map(|l| (l.job.clone(), l.band))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The jobs holding an elastic lease on `source`, in insertion order.
+    pub fn elastic_holders(&self, source: &SourceId) -> Vec<JobId> {
+        self.leases
+            .lock()
+            .unwrap()
+            .get(source)
+            .map(|v| {
+                v.iter()
+                    .filter(|l| l.elastic)
+                    .map(|l| l.job.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -377,7 +457,7 @@ mod tests {
     async fn unheld_port_is_tuned() {
         let (p, m, j1) = (FakePort::new(), LeaseManager::new(), JobId::new());
         let want = t(100_000_000, 1_000_000);
-        assert_eq!(m.ensure(&p, j1, want).await.unwrap(), want);
+        assert_eq!(m.ensure(&p, j1, want, false).await.unwrap(), want);
         assert_eq!(p.current(), Some(want));
     }
 
@@ -390,8 +470,8 @@ mod tests {
             JobId::new(),
         );
         let first = t(100_000_000, 10_000_000);
-        m.ensure(&p, j1.clone(), first).await.unwrap();
-        m.ensure(&p, j2.clone(), t(102_000_000, 1_000_000))
+        m.ensure(&p, j1.clone(), first, false).await.unwrap();
+        m.ensure(&p, j2.clone(), t(102_000_000, 1_000_000), false)
             .await
             .unwrap();
         assert_eq!(p.current(), Some(first));
@@ -408,8 +488,8 @@ mod tests {
             JobId::new(),
         );
         let first = t(100_000_000, 1_000_000);
-        m.ensure(&p, j1.clone(), first).await.unwrap();
-        match m.ensure(&p, j2, t(433_000_000, 1_000_000)).await {
+        m.ensure(&p, j1.clone(), first, false).await.unwrap();
+        match m.ensure(&p, j2, t(433_000_000, 1_000_000), false).await {
             Err(LeaseError::Conflict {
                 holders,
                 current,
@@ -431,10 +511,13 @@ mod tests {
     #[tokio::test]
     async fn conflict_offers_widening_only_when_the_port_can() {
         let (p, m) = (FakePort::new(), LeaseManager::new());
-        m.ensure(&p, JobId::new(), t(100_000_000, 1_000_000))
+        m.ensure(&p, JobId::new(), t(100_000_000, 1_000_000), false)
             .await
             .unwrap();
-        match m.ensure(&p, JobId::new(), t(105_000_000, 1_000_000)).await {
+        match m
+            .ensure(&p, JobId::new(), t(105_000_000, 1_000_000), false)
+            .await
+        {
             Err(LeaseError::Conflict { options, .. }) => assert_eq!(
                 options,
                 vec![
@@ -451,16 +534,69 @@ mod tests {
     async fn held_port_without_current_is_not_retuned() {
         let (p, m) = (FakePort::new(), LeaseManager::new());
         let first = t(100_000_000, 1_000_000);
-        m.ensure(&p, JobId::new(), first).await.unwrap();
+        m.ensure(&p, JobId::new(), first, false).await.unwrap();
         *p.cur.lock().unwrap() = None;
-        match m.ensure(&p, JobId::new(), t(433_000_000, 1_000_000)).await {
+        match m
+            .ensure(&p, JobId::new(), t(433_000_000, 1_000_000), false)
+            .await
+        {
             Err(LeaseError::Conflict { current, .. }) => assert_eq!(current, first),
             other => panic!("expected conflict, got {other:?}"),
         }
         let inside = t(100_100_000, 100_000);
-        assert_eq!(m.ensure(&p, JobId::new(), inside).await.unwrap(), first);
+        assert_eq!(
+            m.ensure(&p, JobId::new(), inside, false).await.unwrap(),
+            first
+        );
         assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(m.holders(p.id()).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rigid_request_tunes_over_elastic_leases() {
+        let (p, m, e, r) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+        );
+        let first = t(100_000_000, 1_000_000);
+        assert_eq!(
+            m.ensure_tuned(&p, e.clone(), first, true).await.unwrap(),
+            (first, true)
+        );
+        let want = t(433_000_000, 1_000_000);
+        assert_eq!(
+            m.ensure_tuned(&p, r.clone(), want, false).await.unwrap(),
+            (want, true)
+        );
+        assert_eq!(p.current(), Some(want));
+        assert_eq!(m.holders(p.id()), vec![(r, want)]);
+        assert_eq!(m.elastic_holders(p.id()), vec![e]);
+    }
+
+    #[tokio::test]
+    async fn elastic_request_joins_a_held_capture() {
+        let (p, m, r, e) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+        );
+        let first = t(100_000_000, 1_000_000);
+        m.ensure(&p, r.clone(), first, false).await.unwrap();
+        let far = t(433_000_000, 1_000_000);
+        assert_eq!(
+            m.ensure_tuned(&p, e.clone(), far, true).await.unwrap(),
+            (first, false)
+        );
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(m.holders(p.id()), vec![(r.clone(), first)]);
+        assert_eq!(m.elastic_holders(p.id()), vec![e.clone()]);
+        // Only the elastic lease left: unheld for a rigid tune, and still not idle.
+        m.release(&r);
+        assert_eq!(m.tune_if_unheld_tuned(&p, far).await.unwrap(), (far, true));
+        assert_eq!(m.elastic_holders(p.id()), vec![e]);
     }
 
     #[tokio::test]
@@ -471,12 +607,12 @@ mod tests {
             JobId::new(),
             JobId::new(),
         );
-        m.ensure(&p, j1.clone(), t(100_000_000, 1_000_000))
+        m.ensure(&p, j1.clone(), t(100_000_000, 1_000_000), false)
             .await
             .unwrap();
         m.release(&j1);
         let want = t(433_000_000, 1_000_000);
-        assert_eq!(m.ensure(&p, j2, want).await.unwrap(), want);
+        assert_eq!(m.ensure(&p, j2, want, false).await.unwrap(), want);
     }
 
     #[tokio::test]
@@ -486,8 +622,8 @@ mod tests {
         let m = LeaseManager::new();
         let (j1, j2) = (JobId::new(), JobId::new());
         let (a, b) = tokio::join!(
-            m.ensure(&p, j1, t(100_000_000, 1_000_000)),
-            m.ensure(&p, j2, t(433_000_000, 1_000_000)),
+            m.ensure(&p, j1, t(100_000_000, 1_000_000), false),
+            m.ensure(&p, j2, t(433_000_000, 1_000_000), false),
         );
         let conflicts = [&a, &b]
             .iter()

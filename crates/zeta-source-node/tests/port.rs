@@ -418,6 +418,7 @@ async fn job_stop_releases_remote_lease_after_grace() {
             tone_band(),
             passthrough_graph(),
             None,
+            false,
         )
         .await
         .expect("job starts");
@@ -436,9 +437,16 @@ async fn job_stop_releases_remote_lease_after_grace() {
     }
     // A new job tunes from scratch and streams again.
     let mut rx = port.subscribe();
-    node.job_start("monitor", far, tone_band(), passthrough_graph(), None)
-        .await
-        .expect("second job starts");
+    node.job_start(
+        "monitor",
+        far,
+        tone_band(),
+        passthrough_graph(),
+        None,
+        false,
+    )
+    .await
+    .expect("second job starts");
     assert_eq!(running_passthroughs(&remote_jobs(&srv).await), 1);
     timeout(Duration::from_secs(5), rx.recv())
         .await
@@ -465,13 +473,21 @@ async fn restart_within_grace_keeps_the_remote_job() {
             tone_band(),
             passthrough_graph(),
             None,
+            false,
         )
         .await
         .expect("job starts");
     node.job_stop(&job).await.expect("job stops");
-    node.job_start("monitor", far, tone_band(), passthrough_graph(), None)
-        .await
-        .expect("restarts within the grace");
+    node.job_start(
+        "monitor",
+        far,
+        tone_band(),
+        passthrough_graph(),
+        None,
+        false,
+    )
+    .await
+    .expect("restarts within the grace");
     tokio::time::sleep(Duration::from_millis(2_500)).await;
     let jobs = remote_jobs(&srv).await;
     assert_eq!(jobs.len(), 1, "one remote job across the restart: {jobs:?}");

@@ -178,6 +178,7 @@ fn running(id: &JobId, kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord
         created_ns: Timestamp(created_ns),
         input: None,
         capture_rate_hz: None,
+        elastic: false,
     }
 }
 
@@ -270,6 +271,7 @@ async fn job_start_records_the_capture_rate() {
         bandwidth_hz: Hz(9_600),
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     };
     let id = match node.apply(op).await.unwrap() {
         OpResult::Job(id) => id,

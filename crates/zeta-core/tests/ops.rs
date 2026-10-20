@@ -197,6 +197,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         bandwidth_hz: Hz(48_000),
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     };
     let id = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -329,6 +330,7 @@ async fn source_ensure_during_job_start_does_not_retune() {
         bandwidth_hz: job_tuning.bandwidth_hz,
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     };
     let ensure = Op::SourceEnsure {
         source,
@@ -421,6 +423,7 @@ async fn job_start_reexpands_when_lease_rate_differs() {
         bandwidth_hz: Hz(12_500),
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     };
     // B: 2 MHz around A's band, leased while A's slow pre-tune holds the gate,
     // so B's lease is queued ahead of A's and A's lease shares B's 2 MS/s capture.
@@ -435,7 +438,7 @@ async fn job_start_reexpands_when_lease_rate_differs() {
         let g = JobKind::Passthrough
             .expand(&source, wide, wide.bandwidth_hz, None, None, None)
             .unwrap();
-        node.job_start("passthrough", source.clone(), wide, g, None)
+        node.job_start("passthrough", source.clone(), wide, g, None, false)
             .await
     };
     let (a, b) = tokio::join!(node.apply(a), b);
@@ -785,6 +788,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         bandwidth_hz: held.bandwidth_hz,
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -880,6 +884,7 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         bandwidth_hz: Hz(48_000),
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -1537,6 +1542,7 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         bandwidth_hz: Hz(12_500),
         deviation_hz,
         sideband: None,
+        elastic: false,
     }
 }
 
@@ -1628,6 +1634,35 @@ fn job_start_schema_requires_nullable_deviation() {
 }
 
 #[test]
+fn job_start_schema_requires_elastic_and_source_list_lists_it() {
+    let s = schema();
+    let v = variants(&s["op"])
+        .iter()
+        .find(|v| v["properties"]["op"]["const"] == "job_start")
+        .expect("job_start variant");
+    let req = v["required"].as_array().unwrap();
+    assert!(req.contains(&"elastic".into()), "{v}");
+    assert_eq!(v["properties"]["elastic"]["type"], "boolean", "{v}");
+    let si = &s["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"elastic".into()),
+        "{si}"
+    );
+    assert_eq!(si["properties"]["elastic"]["type"], "array", "{si}");
+    let rec = &s["result"]["$defs"]["JobRecord"];
+    assert!(
+        rec["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"elastic".into()),
+        "{rec}"
+    );
+}
+
+#[test]
 fn job_start_without_deviation_key_is_rejected() {
     let v = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
         "center_hz":100_000_000,"bandwidth_hz":48_000});
@@ -1637,8 +1672,13 @@ fn job_start_without_deviation_key_is_rejected() {
         "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null});
     let e = serde_json::from_value::<Op>(v).unwrap_err().to_string();
     assert!(e.contains("sideband"), "{e}");
-    let ok = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
+    let v = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
         "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null});
+    let e = serde_json::from_value::<Op>(v).unwrap_err().to_string();
+    assert!(e.contains("elastic"), "{e}");
+    let ok = serde_json::json!({"op":"job_start","kind":"passthrough","source":"s",
+        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null,
+        "elastic":false});
     assert!(serde_json::from_value::<Op>(ok).is_ok());
 }
 
@@ -1863,7 +1903,7 @@ async fn job_start_rejects_sideband_on_other_kinds() {
     .unwrap();
     let op: Op = serde_json::from_value(serde_json::json!({"op":"job_start","kind":"fm_demod",
         "source":"hackrf0","center_hz":100_005_000,"bandwidth_hz":12_500,
-        "deviation_hz":null,"sideband":"usb"}))
+        "deviation_hz":null,"sideband":"usb","elastic":false}))
     .unwrap();
     match node.apply(op).await {
         Err(OpError::Other { message }) => assert_eq!(

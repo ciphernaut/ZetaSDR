@@ -32,8 +32,9 @@ use crate::types::{
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub enum Op {
-    /// List the sources: id, capabilities, `current` band, `holders` (job
-    /// ids) and `fault`, the source's unrecoverable failure (`null` when
+    /// List the sources: id, capabilities, `current` band, `holders` (the
+    /// rigid lease holders' job ids), `elastic` (the jobs following the
+    /// capture, see `job_start`) and `fault`, the source's unrecoverable failure (`null` when
     /// healthy). Jobs on a faulted source fail with `source ID: FAULT` as
     /// their reason; a successful tune (`source_ensure`, `job_start`) clears it.
     SourceList {},
@@ -42,7 +43,8 @@ pub enum Op {
     /// retune it); a held source is never retuned, and the request either
     /// fits the current band (`Tuning`) or is a `Conflict`. Runs under the
     /// lease manager's per-source gate, so it never interleaves with a job's
-    /// lease-and-tune.
+    /// lease-and-tune. Elastic jobs do not hold the source: a tune relaunches
+    /// them on the new capture.
     SourceEnsure {
         source: SourceId,
         center_hz: Hz,
@@ -64,6 +66,12 @@ pub enum Op {
         #[serde(deserialize_with = "nullable_sideband")]
         #[schemars(required, schema_with = "nullable_sideband_schema")]
         sideband: Option<Sideband>,
+        /// `spectrum` only (`false` for any other kind): the job follows the
+        /// source's capture instead of holding it. It never conflicts, never
+        /// retunes a held source (its `tuning` is the capture it joins), is
+        /// relaunched under the same id on every retune, and is stopped by a scan
+        /// on its source.
+        elastic: bool,
     },
     /// Attach a job of an attachable `kind` (`transcribe`) to the running job `job`: it
     /// reads that job's audio output stream (the last one in its graph order when it
@@ -276,6 +284,11 @@ impl JobKind {
             JobKind::Scan => "scan",
             JobKind::Transcribe => "transcribe",
         }
+    }
+
+    /// Whether `job_start` may start the kind `elastic` (following the capture).
+    pub fn elastic_capable(&self) -> bool {
+        matches!(self, JobKind::Spectrum)
     }
 
     /// Whether the kind runs on another job's output (`job_attach`) rather than on the
@@ -843,7 +856,10 @@ pub struct SourceInfo {
     pub capabilities: Capabilities,
     #[schemars(required, schema_with = "crate::types::nullable::<Tuning>")]
     pub current: Option<Tuning>,
+    /// The jobs holding a rigid lease (never an elastic job).
     pub holders: Vec<JobId>,
+    /// The elastic jobs following the source's capture.
+    pub elastic: Vec<JobId>,
     /// The port's unrecoverable failure (`Port::fault`); `null` when healthy.
     /// Jobs on a faulted source fail with it; a successful tune clears it.
     #[schemars(required, schema_with = "nullable_string")]
@@ -1411,6 +1427,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                         .into_iter()
                         .map(|(j, _)| j)
                         .collect(),
+                    elastic: node.lease_elastic(&id),
                     fault: node.port(&id).and_then(|p| p.fault()),
                     id,
                     capabilities,
@@ -1429,10 +1446,15 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 bandwidth_hz,
             };
             let port = checked_port(node, &source, &want)?;
-            node.tune_if_unheld(port.as_ref(), want)
+            let (got, tuned) = node
+                .tune_if_unheld(port.as_ref(), want)
                 .await
-                .map(OpResult::Tuning)
-                .map_err(lease_error)
+                .map_err(lease_error)?;
+            // Outside the gate: the relaunched jobs' leases take it.
+            if tuned {
+                node.relaunch_elastic(&source).await;
+            }
+            Ok(OpResult::Tuning(got))
         }
         Op::JobStart {
             kind,
@@ -1441,9 +1463,15 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             bandwidth_hz,
             deviation_hz,
             sideband,
+            elastic,
         } => {
             if kind.attachable() {
                 return Err(kind.start_refusal());
+            }
+            if elastic && !kind.elastic_capable() {
+                return Err(OpError::Other {
+                    message: format!("{} cannot be elastic", kind.name()),
+                });
             }
             if sideband.is_some() && kind != JobKind::SsbDemod {
                 return Err(OpError::Other {
@@ -1482,36 +1510,56 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 })?;
                 let graph = kind.expand(&source, tuning, Hz(0), None, None, None)?;
                 return node
-                    .job_start(kind.name(), source, tuning, graph, None)
+                    .job_start(kind.name(), source, tuning, graph, None, false)
                     .await
                     .map(OpResult::Job)
                     .map_err(|e| node_error(node, e));
             }
             let port = checked_port(node, &source, &tuning)?;
             // The granted capture band: its width is the source rate (Port contract).
-            let granted = node
-                .tune_if_unheld(port.as_ref(), tuning)
-                .await
-                .map_err(lease_error)?;
+            // An elastic job never tunes here: it joins the current capture (or tunes
+            // an unheld source to `tuning`) at its lease, which also re-expands its
+            // graph for the capture. A rigid tune here relaunches nothing on success:
+            // the job's own lease tunes again and relaunches the elastic jobs then.
+            let (granted, tuned) = match elastic {
+                true => (port.current().unwrap_or(tuning), false),
+                false => node
+                    .tune_if_unheld(port.as_ref(), tuning)
+                    .await
+                    .map_err(lease_error)?,
+            };
             let bin_rate = node.bank_bin_rate(&source, granted);
-            let graph = kind.expand(
+            let started = match kind.expand(
                 &source,
                 tuning,
                 granted.bandwidth_hz,
                 bin_rate,
                 deviation,
                 sideband,
-            )?;
-            let id = node
-                .job_start(
-                    kind.name(),
-                    source,
-                    tuning,
-                    graph,
-                    Some(granted.bandwidth_hz),
-                )
-                .await
-                .map_err(|e| node_error(node, e))?;
+            ) {
+                Ok(graph) => node
+                    .job_start(
+                        kind.name(),
+                        source.clone(),
+                        tuning,
+                        graph,
+                        Some(granted.bandwidth_hz),
+                        elastic,
+                    )
+                    .await
+                    .map_err(|e| node_error(node, e)),
+                Err(e) => Err(e),
+            };
+            let id = match started {
+                Ok(id) => id,
+                Err(e) => {
+                    // The tune above moved the capture and no lease followed it.
+                    if tuned {
+                        node.relaunch_elastic(&source).await;
+                    }
+                    return Err(e);
+                }
+            };
             reconcile_rate(
                 node,
                 port.as_ref(),

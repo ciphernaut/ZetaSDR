@@ -67,6 +67,7 @@ async fn start(node: &Node, kind: JobKind, bandwidth_hz: u64) -> JobId {
         bandwidth_hz: Hz(bandwidth_hz),
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -244,6 +245,7 @@ async fn job_start_with_transcribe_is_refused() {
             bandwidth_hz: Hz(200_000),
             deviation_hz: None,
             sideband: None,
+            elastic: false,
         })
         .await;
     assert_eq!(

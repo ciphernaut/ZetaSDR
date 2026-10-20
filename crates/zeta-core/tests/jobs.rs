@@ -82,6 +82,7 @@ async fn start_job(node: &Node) -> JobId {
         tuning(),
         graph("passthrough"),
         None,
+        false,
     )
     .await
     .unwrap()
@@ -223,6 +224,7 @@ async fn unknown_stage_rejected_before_start() {
             tuning(),
             graph("nope"),
             None,
+            false,
         )
         .await
     {
@@ -555,6 +557,7 @@ async fn start_flaky(node: &Node) -> JobId {
         tuning(),
         graph("passthrough"),
         None,
+        false,
     )
     .await
     .unwrap()

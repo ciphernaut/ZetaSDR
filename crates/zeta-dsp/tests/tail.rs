@@ -41,6 +41,7 @@ async fn stream_tail_returns_events_from_running_job() {
             bandwidth_hz: Hz(48_000),
             deviation_hz: None,
             sideband: None,
+            elastic: false,
         })
         .await
     {

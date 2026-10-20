@@ -64,6 +64,8 @@ function opText(op) {
   for (const k of ordered) {
     const v = op[k];
     if (k === "op" || v === null || v === undefined) continue;
+    // A rigid job_start (the usual case) reads as before; only `elastic=true` shows.
+    if (k === "elastic" && v === false) continue;
     parts.push(scalar(v) ? `${k}=${v}` : `${k}=…`);
   }
   return parts.join(" ");

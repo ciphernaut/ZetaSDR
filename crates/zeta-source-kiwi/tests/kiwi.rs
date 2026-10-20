@@ -100,6 +100,7 @@ fn measure(center: u64, bw: u64) -> Op {
         bandwidth_hz: Hz(bw),
         deviation_hz: None,
         sideband: None,
+        elastic: false,
     }
 }
 
