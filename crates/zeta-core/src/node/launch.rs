@@ -361,8 +361,9 @@ impl Inner {
 
     /// Re-expand `rec`'s graph for the capture `band` when it is of a built-in kind
     /// and was expanded for another rate (`capture_rate_hz`), recording the new rate
-    /// and reselecting `stages`. A record without a rate (`graph_put`, or written
-    /// before the field) is left as stored.
+    /// and reselecting `stages`. A record without a rate that the node expanded
+    /// (written before the field existed) is re-expanded too; an operator's graph
+    /// (`operator_graph`, from `graph_put`) is left as stored.
     fn fit_capture(
         &self,
         rec: &mut JobRecord,
@@ -373,7 +374,7 @@ impl Inner {
         let Some(kind) = JobKind::from_name(&rec.kind) else {
             return Ok(());
         };
-        if rec.capture_rate_hz.is_none_or(|r| r == rate.0) {
+        if rec.operator_graph || rec.capture_rate_hz == Some(rate.0) {
             return Ok(());
         }
         let bin_rate = self.bank_bin_rate(&rec.source, band);
@@ -388,8 +389,8 @@ impl Inner {
 
     /// Point an elastic `rec` at the capture `band` it joined: its `tuning` becomes
     /// the capture and a built-in kind's graph is expanded again for it (whatever
-    /// rate it was expanded for), reselecting `stages`. Unchanged when it is
-    /// already there.
+    /// rate it was expanded for), reselecting `stages`; an operator's graph
+    /// (`operator_graph`) keeps its graph. Unchanged when it is already there.
     fn follow_capture(
         &self,
         rec: &mut JobRecord,
@@ -400,6 +401,9 @@ impl Inner {
             return Ok(());
         }
         rec.tuning = band;
+        if rec.operator_graph {
+            return Ok(());
+        }
         let Some(kind) = JobKind::from_name(&rec.kind) else {
             return Ok(());
         };

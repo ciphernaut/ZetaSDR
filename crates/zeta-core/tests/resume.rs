@@ -180,6 +180,7 @@ fn running(id: &JobId, kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord
         input: None,
         capture_rate_hz: None,
         elastic: false,
+        operator_graph: false,
     }
 }
 

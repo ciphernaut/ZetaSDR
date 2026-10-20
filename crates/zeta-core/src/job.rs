@@ -58,11 +58,17 @@ pub struct JobRecord {
     /// instead of holding it, so `tuning` is the capture it last joined.
     #[serde(default)]
     pub elastic: bool,
+    /// The graph was set by an operator (`graph_put`), not expanded by the node: it is
+    /// launched as stored and never re-expanded. Lets a record without
+    /// `capture_rate_hz` written before that field existed (whose graph the node did
+    /// expand) be told apart from an operator's graph.
+    #[serde(default)]
+    pub operator_graph: bool,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
-/// `format`, `input`, `capture_rate_hz` and `elastic`, so the published schema requires them.
+/// `format`, `input`, `capture_rate_hz`, `elastic` and `operator_graph`, so the published schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -70,7 +76,13 @@ fn require_format(schema: &mut schemars::Schema) {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
     {
-        for f in ["format", "input", "capture_rate_hz", "elastic"] {
+        for f in [
+            "format",
+            "input",
+            "capture_rate_hz",
+            "elastic",
+            "operator_graph",
+        ] {
             if !req.iter().any(|r| r == f) {
                 req.push(f.into());
             }

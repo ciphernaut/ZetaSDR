@@ -107,6 +107,7 @@ async fn resume_reexpands_a_builtin_graph_for_the_actual_rate() {
         input: None,
         capture_rate_hz: Some(480_000),
         elastic: false,
+        operator_graph: false,
     };
     let jobs = dir.path().join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();
@@ -138,6 +139,49 @@ async fn resume_reexpands_a_builtin_graph_for_the_actual_rate() {
             .clone()
     };
     assert_eq!(demod(&disk.graph), demod(&rec.graph));
+}
+
+/// A record written before `capture_rate_hz` existed (an upgrade) carries no rate, but its
+/// graph was still expanded by the node: it is re-expanded for the actual rate, not failed.
+#[tokio::test]
+async fn resume_reexpands_a_record_written_before_the_rate_was_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = SourceId("speech".into());
+    let graph = JobKind::WfmDemod
+        .expand(&source, tuning(), Hz(480_000), None, None, None)
+        .unwrap();
+    assert_ne!(240_000 % out_rate(&graph), 0);
+    let id = JobId::new();
+    let legacy = serde_json::json!({
+        "format": 1,
+        "id": id.0,
+        "kind": "wfm_demod",
+        "graph": graph,
+        "source": source,
+        "tuning": tuning(),
+        "state": {"status": "running"},
+        "context": {},
+        "created_ns": 1,
+        "input": null
+    });
+    let jobs = dir.path().join("state").join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(
+        jobs.join(format!("{}.json", id.0)),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let (src, port) = wfm_port(dir.path(), 240_000);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(record(&node, &id).state, JobState::Running);
+    let disk = on_disk(dir.path(), &id);
+    assert_eq!(disk.capture_rate_hz, Some(240_000));
+    assert_eq!(240_000 % out_rate(&disk.graph), 0, "{:?}", disk.graph);
 }
 
 #[tokio::test]
@@ -172,6 +216,7 @@ async fn resume_leaves_a_graph_put_graph_alone() {
         .await
         .unwrap();
         assert_eq!(on_disk(dir.path(), &id).capture_rate_hz, None);
+        assert!(on_disk(dir.path(), &id).operator_graph);
         id
     };
     let put = on_disk(dir.path(), &id);

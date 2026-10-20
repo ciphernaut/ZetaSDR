@@ -755,6 +755,7 @@ impl Node {
             input: None,
             capture_rate_hz: capture_rate_hz.map(|r| r.0),
             elastic,
+            operator_graph: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -792,6 +793,7 @@ impl Node {
             input: Some(input.clone()),
             capture_rate_hz: None,
             elastic: false,
+            operator_graph: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -911,6 +913,7 @@ impl Node {
             input: None,
             capture_rate_hz: capture_rate_hz.map(|r| r.0),
             elastic,
+            operator_graph: false,
         };
         let id = rec.id.clone();
         let (r, after) = self.inner.launch_gated(rec, guard).await;
@@ -933,8 +936,8 @@ impl Node {
     /// `Running` job is stopped and relaunched on the new graph; any other job
     /// only has its record rewritten. If the relaunch fails (say, a lease
     /// conflict after the stop) the job is left `Stopped` with the new graph.
-    /// The record's `capture_rate_hz` is cleared: the node cannot know what an
-    /// operator's graph intends, so a resume launches it as stored.
+    /// The record's `capture_rate_hz` is cleared and `operator_graph` set: the node
+    /// cannot know what an operator's graph intends, so a resume launches it as stored.
     pub async fn job_graph_put(&self, id: &JobId, graph: Graph) -> Result<(), NodeError> {
         self.job_graph_set(id, graph, None).await
     }
@@ -966,6 +969,7 @@ impl Node {
             let rec = JobRecord {
                 graph,
                 capture_rate_hz: capture_rate_hz.map(|r| r.0),
+                operator_graph: capture_rate_hz.is_none(),
                 ..entry.record.clone()
             };
             persist(&self.inner.jobs_dir, &rec)?;
