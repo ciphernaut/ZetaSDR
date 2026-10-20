@@ -13,9 +13,10 @@
 // centre in MHz such as `144.8`); the selection is kept in
 // `sessionStorage["zeta.source"]`. The command line (#cmd, focused by Ctrl-K / ⌘K): text
 // that parses as a JSON object with an `op` key is applied with `api.op` (its outcome reaches
-// the transcript through the `ops` stream); text starting with `view ` is a view command
-// (view.js: `view set <key> <value>`, `view show`, `view reset`, `view clear`), handled
-// here before both, its answer a transcript line; anything else goes to `api.ask`.
+// the transcript through the `ops` stream); `view` alone or followed by `set`, `show`,
+// `reset` or `clear` is a view command (view.js: `view set <key> <value>`, `view show`,
+// `view reset`, `view clear`), handled here before both, its answer a transcript line;
+// anything else (other text starting "view " included) goes to `api.ask`.
 //
 // Conflicts (spec 4.5): a `conflict` reply to an op this page applied (command line, menu),
 // or one the ops stream shows for another caller, adds a line naming each holder by kind
@@ -360,7 +361,9 @@ async function askAgent(text) {
 
 async function runCommand(text) {
   if (!state.api) return;
-  if (text === "view" || text.startsWith("view ")) {
+  // Only `view` and `view set|show|reset|clear …` are view commands (ruling R24): other text
+  // starting "view " ("view the strongest signal") is a question for the agent.
+  if (/^view(\s+(set|show|reset|clear)\b.*)?$/.test(text)) {
     state.transcript.user(text);
     const r = runViewCommand(state.view, text.split(/\s+/).slice(1));
     state.transcript.note(r.text, r.error);

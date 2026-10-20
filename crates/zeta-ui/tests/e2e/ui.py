@@ -1018,6 +1018,10 @@ def scenario_view_set_show_reset(page, url, secret):
     assert "follow target" in shown and "finished_rows_s 60" in shown, shown
     # Nothing went to /ask.
     expect(page.locator("#transcript .line.assistant")).to_have_count(0)
+    # Ruling R24: other text starting "view " is a question for the agent, not a view command.
+    run_cmd(page, "view the strongest signal")
+    expect(page.locator("#transcript .line.assistant")).to_have_count(1)
+    expect(page.locator("#transcript .line", has_text='view: expected')).to_have_count(0)
     # The values live in sessionStorage and survive a reload.
     run_cmd(page, "view set scanner aprs")
     expect(view_line(page, "scanner = aprs")).to_be_visible()
