@@ -30,6 +30,7 @@ pub mod pocsag;
 pub mod rds;
 pub mod resample;
 pub mod util;
+pub mod vad;
 pub mod wfm;
 
 #[cfg(feature = "test-fixtures")]
@@ -55,6 +56,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(acars::AcarsDecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));
+    reg.register(Arc::new(vad::VadStage::new()));
 }
 
 /// Whether a hardware GPU adapter is usable for the GPU stages; always false
