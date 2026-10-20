@@ -152,14 +152,9 @@ impl Cli {
         self.sources.clone()
     }
 
-    /// Whether any flag that configures the local node (sources, plugins, state dir, speech
-    /// backend) was given.
+    /// Whether any flag that configures the local node (sources, plugins, state dir) was given.
     pub fn configures_local_node(&self) -> bool {
-        !self.sources.is_empty()
-            || !self.plugins.is_empty()
-            || self.state_dir.is_some()
-            || self.speech.stt_socket.is_some()
-            || self.speech.stt_node.is_some()
+        !self.sources.is_empty() || !self.plugins.is_empty() || self.state_dir.is_some()
     }
 }
 

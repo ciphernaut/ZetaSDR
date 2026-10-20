@@ -70,7 +70,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
     if cli.configures_local_node() {
         return usage(
-            "sources, plugins and the speech backend are configured on the serving node: drop --source-*, --plugin, --state-dir, --stt-socket and --stt-node with --node",
+            "sources and plugins are configured on the serving node: drop --source-*, --plugin and --state-dir with --node",
         );
     }
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {

@@ -4,6 +4,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::{ServeProc, zeta_remote};
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value;
 
@@ -274,7 +275,8 @@ fn stt_socket_and_stt_node_are_exclusive_for_every_command() {
 }
 
 #[test]
-fn node_flag_rejects_speech_flags() {
+fn node_flag_ignores_speech_flags() {
+    // Nothing listens on the node, so the request itself fails: the flags were let through.
     for flag in ["--stt-socket", "--stt-node"] {
         plain()
             .env_remove("ZETA_STT_SOCKET")
@@ -284,7 +286,8 @@ fn node_flag_rejects_speech_flags() {
             .assert()
             .code(1)
             .stdout("")
-            .stderr(contains("--stt-socket and --stt-node with --node"));
+            .stderr(contains("unreachable"))
+            .stderr(contains("with --node").not());
     }
 }
 
