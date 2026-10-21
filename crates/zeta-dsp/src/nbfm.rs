@@ -357,6 +357,10 @@ impl Stage for NbfmDemodStage {
             ));
         }
         let (out, events) = squelch_streams(&outputs, squelch.is_some())?;
+        if squelch.is_none() {
+            // No gate this run: clear one an earlier run (before a `graph_put`) latched.
+            ctx.note(serde_json::json!({ "squelch": null }));
+        }
         let mut prev = Complex::new(0.0f32, 0.0);
         let mut filter = AudioFilter::default();
         let mut guard: Option<Guard> = None;
@@ -773,6 +777,7 @@ mod tests {
         rate_hz: u64,
     ) -> (Vec<u64>, Vec<serde_json::Value>) {
         let n = blocks.len();
+        let params_squelch_off = params["squelch"] == false;
         let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = notes.clone();
         let ctx = zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into()))
@@ -800,10 +805,15 @@ mod tests {
             };
             events.push(v);
         }
-        let noted: Vec<_> = events
-            .iter()
-            .map(|e| serde_json::json!({ "squelch": e }))
-            .collect();
+        // With the squelch off, a gate latched by an earlier run is cleared instead.
+        let noted: Vec<_> = if params_squelch_off {
+            vec![serde_json::json!({ "squelch": null })]
+        } else {
+            events
+                .iter()
+                .map(|e| serde_json::json!({ "squelch": e }))
+                .collect()
+        };
         assert_eq!(*notes.lock().unwrap(), noted);
         (audio, events)
     }

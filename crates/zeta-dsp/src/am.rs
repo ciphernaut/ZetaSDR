@@ -254,6 +254,10 @@ impl Stage for AmDemodStage {
         let mut squelch =
             stage_squelch("am_demod", p.squelch, p.squelch_db).map_err(StageError::Failed)?;
         let (out, events) = squelch_streams(&outputs, squelch.is_some())?;
+        if squelch.is_none() {
+            // No gate this run: clear one an earlier run (before a `graph_put`) latched.
+            ctx.note(serde_json::json!({ "squelch": null }));
+        }
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
