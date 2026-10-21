@@ -635,6 +635,14 @@ async fn gain_and_retune_keep_their_order_on_the_reader() {
     assert_eq!(gain.db, Some(30.0));
     assert!(!gain.automatic);
     assert_eq!(src.gain().unwrap().db, Some(30.0));
+    // Applied by the reader thread, not on the caller's.
+    let gain_threads: Vec<String> = dev
+        .call_threads()
+        .into_iter()
+        .filter(|(c, _)| c.starts_with("set_gain"))
+        .map(|(_, t)| t)
+        .collect();
+    assert_eq!(gain_threads, ["soapy-sdr0", "soapy-sdr0"]);
     // Automatic gain through the live reader too.
     let auto = src.set_gain(None).await.unwrap();
     assert_eq!((auto.db, auto.automatic), (None, true));
@@ -642,20 +650,91 @@ async fn gain_and_retune_keep_their_order_on_the_reader() {
     assert_eq!(src.gain(), Some(auto));
 }
 
+fn slow_source(dev: &Arc<MockDevice>, timeout_ms: u64) -> Arc<SoapySource> {
+    Arc::new(
+        SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
+            .unwrap()
+            .with_retune_timeout(Duration::from_millis(timeout_ms)),
+    )
+}
+
+/// A faulted reader still inside a device call (a retune that timed out): the
+/// gain waits for it to end, then goes straight to the device, never
+/// overlapping the reader's call.
 #[tokio::test]
 async fn gain_on_a_faulted_reader_goes_straight_to_the_device() {
-    let dev = Arc::new(
-        MockDevice::hackrf_like().with_reads(vec![MockRead::Fatal("LIBUSB_ERROR_IO".into())]),
-    );
-    let src = source(&dev);
-    let _rx = src.subscribe();
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(samples(400)));
+    let src = slow_source(&dev, 200);
+    let mut rx = src.subscribe();
     src.tune(tuning(100_000_000, 12_500)).await.unwrap();
-    assert!(wait_until(1000, || src.fault().is_some()).await);
-    assert_deactivated(&dev).await;
+    next_block(&mut rx).await;
+    dev.delay_next("set_frequency", 300);
+    let e = src.tune(tuning(101_000_000, 12_500)).await.unwrap_err();
+    assert!(e.to_string().contains("retune timed out"), "{e}");
+    assert!(src.fault().is_some());
     let g = src.set_gain(Some(20.0)).await.unwrap();
     assert_eq!(g.db, Some(20.0));
-    assert_eq!(dev.calls().last().unwrap(), "set_gain(20)");
+    assert_eq!(dev.overlaps(), 0, "{:?}", dev.call_threads());
+    let calls: Vec<(String, String)> = dev.call_threads();
+    let n = calls.len();
+    assert_eq!(calls[n - 3].0, "set_frequency(101000000)");
+    assert_eq!(calls[n - 3].1, "soapy-sdr0");
+    assert_eq!(calls[n - 1].0, "set_gain(20)");
+    assert_ne!(calls[n - 1].1, "soapy-sdr0", "applied directly");
     assert_eq!(src.gain().unwrap().db, Some(20.0));
+    // The reader has ended (it deactivated before the gain): direct at once.
+    let deactivated = dev.calls().iter().position(|c| c == "deactivate");
+    assert!(deactivated.is_some_and(|i| i < dev.calls().len() - 2));
+    src.set_gain(Some(21.0)).await.unwrap();
+    assert_eq!(dev.calls().last().unwrap(), "set_gain(21)");
+}
+
+/// A faulted reader that stays inside its device call past `retune_timeout`:
+/// the gain is refused and nothing touches the device.
+#[tokio::test]
+async fn gain_waiting_on_a_stuck_reader_is_refused() {
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(samples(400)));
+    let src = slow_source(&dev, 100);
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    next_block(&mut rx).await;
+    dev.delay_next("set_frequency", 600);
+    src.tune(tuning(101_000_000, 12_500)).await.unwrap_err();
+    let e = src.set_gain(Some(20.0)).await.unwrap_err();
+    assert!(
+        matches!(&e, PortError::Io(m) if m == "soapy set_gain: the reader thread has not stopped"),
+        "{e}"
+    );
+    assert!(!dev.calls().iter().any(|c| c.starts_with("set_gain")));
+    assert_deactivated(&dev).await;
+    assert_eq!(dev.overlaps(), 0);
+}
+
+/// A reader that does not ack within `retune_timeout` (stuck in a slow read):
+/// the caller gets `Io` and the reader drops the command instead of applying a
+/// gain the node never persisted.
+#[tokio::test]
+async fn an_unacked_gain_is_not_applied_later() {
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(samples(1)));
+    let src = slow_source(&dev, 100);
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    next_block(&mut rx).await;
+    dev.push_reads(vec![MockRead::Slow(16_384, 400)]);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let e = src.set_gain(Some(30.0)).await.unwrap_err();
+    assert!(
+        matches!(&e, PortError::Io(m) if m == "soapy set_gain timed out"),
+        "{e}"
+    );
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert!(src.fault().is_none(), "{:?}", src.fault());
+    assert!(
+        !dev.calls().iter().any(|c| c.starts_with("set_gain")),
+        "{:?}",
+        dev.calls()
+    );
+    assert_eq!(src.gain().unwrap().db, Some(0.0));
 }
 
 /// `gain=` in the device args is applied at open by the same call as the op's,

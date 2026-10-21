@@ -1,6 +1,7 @@
 //! Scriptable in-memory device for tests (feature `test-mock`).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use num_complex::Complex;
@@ -10,6 +11,8 @@ use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
 #[derive(Clone, Debug, PartialEq)]
 pub enum MockRead {
     Samples(usize),
+    /// `n` samples after blocking for `ms` (a read that holds the reader).
+    Slow(usize, u64),
     Timeout,
     Overflow,
     Fatal(String),
@@ -24,6 +27,11 @@ pub struct MockDevice {
     channels: usize,
     reads: Arc<Mutex<VecDeque<MockRead>>>,
     calls: Arc<Mutex<Vec<String>>>,
+    /// `(call, thread name)` of each control call, in order.
+    threads: Mutex<Vec<(String, String)>>,
+    /// Control calls in progress, and how often one started while another ran.
+    in_flight: AtomicUsize,
+    overlaps: AtomicUsize,
     rate: Mutex<f64>,
     fails: Arc<Mutex<Vec<(String, String)>>>,
     delays: Mutex<Vec<(String, u64)>>,
@@ -63,6 +71,9 @@ impl MockDevice {
             channels: 1,
             reads: Arc::default(),
             calls: Arc::default(),
+            threads: Mutex::default(),
+            in_flight: AtomicUsize::new(0),
+            overlaps: AtomicUsize::new(0),
             rate: Mutex::new(0.0),
             fails: Arc::default(),
             delays: Mutex::default(),
@@ -167,8 +178,32 @@ impl MockDevice {
         self.calls.lock().unwrap().clone()
     }
 
+    /// `(call, thread name)` of each control call (`set_frequency`,
+    /// `set_sample_rate`, `set_gain`, `set_gain_mode`), in order.
+    pub fn call_threads(&self) -> Vec<(String, String)> {
+        self.threads.lock().unwrap().clone()
+    }
+
+    /// How many control calls started while another was still running.
+    pub fn overlaps(&self) -> usize {
+        self.overlaps.load(Ordering::SeqCst)
+    }
+
     fn rec(&self, s: String) {
         self.calls.lock().unwrap().push(s);
+    }
+
+    /// Record a control call and run `f` as its body, counting overlaps.
+    fn control<T>(&self, s: String, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let name = std::thread::current().name().unwrap_or("?").to_string();
+        self.threads.lock().unwrap().push((s.clone(), name));
+        self.rec(s);
+        if self.in_flight.fetch_add(1, Ordering::SeqCst) > 0 {
+            self.overlaps.fetch_add(1, Ordering::SeqCst);
+        }
+        let r = f();
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        r
     }
 
     fn check(&self, op: &str) -> Result<(), String> {
@@ -216,24 +251,25 @@ impl SoapyDevice for MockDevice {
         Ok(self.channels)
     }
     fn set_frequency(&self, hz: f64) -> Result<(), String> {
-        self.rec(format!("set_frequency({hz})"));
-        self.check("set_frequency")?;
-        Ok(())
+        self.control(format!("set_frequency({hz})"), || {
+            self.check("set_frequency")
+        })
     }
     fn set_sample_rate(&self, hz: f64) -> Result<(), String> {
-        self.rec(format!("set_sample_rate({hz})"));
-        self.check("set_sample_rate")?;
-        if let Some((_, ceiling)) = self.follow
-            && self.refuse_above
-            && hz > ceiling
-        {
-            return Err(format!("rate {hz} above {ceiling}"));
-        }
-        *self.rate.lock().unwrap() = match self.decimation {
-            Some(mcr) => mcr / (mcr / hz).round().max(1.0),
-            None => hz,
-        };
-        Ok(())
+        self.control(format!("set_sample_rate({hz})"), || {
+            self.check("set_sample_rate")?;
+            if let Some((_, ceiling)) = self.follow
+                && self.refuse_above
+                && hz > ceiling
+            {
+                return Err(format!("rate {hz} above {ceiling}"));
+            }
+            *self.rate.lock().unwrap() = match self.decimation {
+                Some(mcr) => mcr / (mcr / hz).round().max(1.0),
+                None => hz,
+            };
+            Ok(())
+        })
     }
     fn sample_rate(&self) -> Result<f64, String> {
         let rate = *self.rate.lock().unwrap();
@@ -263,10 +299,11 @@ impl SoapyDevice for MockDevice {
         Ok(self.gain.lock().unwrap().0)
     }
     fn set_gain(&self, db: f64) -> Result<(), String> {
-        self.rec(format!("set_gain({db})"));
-        self.check("set_gain")?;
-        self.gain.lock().unwrap().0 = db;
-        Ok(())
+        self.control(format!("set_gain({db})"), || {
+            self.check("set_gain")?;
+            self.gain.lock().unwrap().0 = db;
+            Ok(())
+        })
     }
     fn has_gain_mode(&self) -> Result<bool, String> {
         Ok(self.gain_mode_available)
@@ -275,13 +312,14 @@ impl SoapyDevice for MockDevice {
         Ok(self.gain.lock().unwrap().1)
     }
     fn set_gain_mode(&self, automatic: bool) -> Result<(), String> {
-        self.rec(format!("set_gain_mode({automatic})"));
-        self.check("set_gain_mode")?;
-        if !self.gain_mode_available {
-            return Err("no automatic gain".into());
-        }
-        self.gain.lock().unwrap().1 = automatic;
-        Ok(())
+        self.control(format!("set_gain_mode({automatic})"), || {
+            self.check("set_gain_mode")?;
+            if !self.gain_mode_available {
+                return Err("no automatic gain".into());
+            }
+            self.gain.lock().unwrap().1 = automatic;
+            Ok(())
+        })
     }
 }
 
@@ -320,6 +358,11 @@ impl SoapyRx for MockRx {
             .pop_front()
             .unwrap_or(MockRead::Timeout);
         match step {
+            MockRead::Slow(n, ms) => {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                self.reads.lock().unwrap().push_front(MockRead::Samples(n));
+                self.read(out, timeout_us)
+            }
             MockRead::Samples(n) => {
                 let n = n.min(out.len());
                 for o in &mut out[..n] {

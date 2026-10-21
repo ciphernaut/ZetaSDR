@@ -561,8 +561,13 @@ impl Port for SoapySource {
 
     /// Checked against the range read at open (refusals are `Unsupported` with
     /// the op's texts), then applied by the live, unfaulted reader between
-    /// reads, after any retune queued before it; on the device directly when no
-    /// reader runs. A failed device call is `Io` and does not fault the port.
+    /// reads, after any retune queued before it. Otherwise on the device
+    /// directly, once a reader that is still running (faulted, or stopped after
+    /// a retune timeout, and maybe inside a device call) has ended: past
+    /// `retune_timeout` that is `Io` and nothing is applied. A reader that does
+    /// not ack within `retune_timeout` is `Io` too, and drops the change if it
+    /// has not started it (the ack is gone). A failed device call is `Io` and
+    /// does not fault the port.
     async fn set_gain(&self, db: Option<f64>) -> Result<GainInfo, PortError> {
         self.check_gain(db)?;
         let _gate = self.gate.lock().await;
@@ -582,10 +587,39 @@ impl Port for SoapySource {
                 Ok(Ok(r)) => return r.map_err(PortError::Io),
                 // The reader ended before applying it: the device is free.
                 Ok(Err(_)) => {}
+                // Dropping `done` closes the ack: the reader skips the command.
                 Err(_) => return Err(PortError::Io("soapy set_gain timed out".into())),
             }
         }
+        self.reader_ended().await?;
         apply_gain(self.dev.as_ref(), &self.status, db).map_err(PortError::Io)
+    }
+}
+
+impl SoapySource {
+    /// Wait up to `retune_timeout` for a reader thread that is still running to
+    /// end, so a direct device call never overlaps one of its own. The reader
+    /// is left in place (a later `tune` joins and replaces it).
+    async fn reader_ended(&self) -> Result<(), PortError> {
+        let deadline = Instant::now() + self.retune_timeout;
+        loop {
+            let running = self
+                .reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|r| r.handle.as_ref())
+                .is_some_and(|h| !h.is_finished());
+            if !running {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(PortError::Io(
+                    "soapy set_gain: the reader thread has not stopped".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 
@@ -698,6 +732,9 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
         if let Ok(cmd) = ctx.cmds.try_recv() {
             let cmd = match cmd {
                 Cmd::Retune(cmd) => cmd,
+                // A closed ack: the caller timed out and reported the change
+                // as failed, so it is not applied.
+                Cmd::Gain { ack, .. } if ack.is_closed() => continue,
                 Cmd::Gain { db, ack } => {
                     let _ = ack.send(apply_gain(ctx.dev.as_ref(), &ctx.status, db));
                     continue;
