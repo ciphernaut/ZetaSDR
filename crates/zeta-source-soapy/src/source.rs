@@ -243,6 +243,7 @@ pub struct SoapySource {
     status: Arc<Mutex<Status>>,
     reader: Mutex<Option<Reader>>,
     retune_timeout: Duration,
+    ppm: f64,
     /// Serialises `tune`, which may wait on the reader thread.
     gate: tokio::sync::Mutex<()>,
 }
@@ -299,8 +300,17 @@ impl SoapySource {
             status: Arc::new(Mutex::new(status)),
             reader: Mutex::new(None),
             retune_timeout: RETUNE_ACK,
+            ppm: 0.0,
             gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Correct a device that reads `ppm` parts per million high: the hardware
+    /// is tuned that much higher than every frequency this source reports
+    /// (`current`, blocks, the band keep the requested centre).
+    pub fn with_ppm(mut self, ppm: f64) -> Self {
+        self.ppm = ppm;
+        self
     }
 
     /// How long `tune` waits for the reader thread to apply a retune
@@ -433,8 +443,9 @@ impl SoapySource {
                 RateError::Narrow(m) => PortError::Unsupported(m),
             })?;
         let actual = rate.actual;
-        dev.set_frequency(center_hz as f64)
-            .map_err(|e| self.fail(format!("soapy set_frequency({center_hz}): {e}")))?;
+        let hw = hw_hz(center_hz, self.ppm);
+        dev.set_frequency(hw as f64)
+            .map_err(|e| self.fail(format!("soapy set_frequency({hw}): {e}")))?;
         let mut rx = dev
             .open_rx(self.format)
             .map_err(|e| self.fail(format!("soapy open_rx({:?}): {e}", self.format)))?;
@@ -461,6 +472,7 @@ impl SoapySource {
             status: self.status.clone(),
             stop: stop.clone(),
             cmds: cmds_rx,
+            ppm: self.ppm,
         };
         let handle = std::thread::Builder::new()
             .name(format!("soapy-{}", self.id.0))
@@ -473,6 +485,12 @@ impl SoapySource {
         });
         Ok(cur)
     }
+}
+
+/// The frequency to ask the hardware for: `center_hz` raised by `ppm` parts per
+/// million.
+fn hw_hz(center_hz: u64, ppm: f64) -> u64 {
+    (center_hz as f64 * (1.0 + ppm / 1e6)).round() as u64
 }
 
 fn out_of_range(field: &'static str, value: u64, min: u64, max: u64) -> PortError {
@@ -631,6 +649,7 @@ struct Ctx {
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
     cmds: std_mpsc::Receiver<Cmd>,
+    ppm: f64,
 }
 
 impl Ctx {
@@ -682,10 +701,11 @@ fn apply(
     rate: Rate,
 ) -> Result<Rate, RateError> {
     let io = RateError::Io;
+    let hw = hw_hz(cmd.center_hz, ctx.ppm);
     if cmd.rate_hz == picked && rate.actual >= cmd.bandwidth_hz {
         ctx.dev
-            .set_frequency(cmd.center_hz as f64)
-            .map_err(|e| io(format!("soapy set_frequency({}): {e}", cmd.center_hz)))?;
+            .set_frequency(hw as f64)
+            .map_err(|e| io(format!("soapy set_frequency({hw}): {e}")))?;
         return Ok(rate);
     }
     rx.deactivate()
@@ -706,8 +726,8 @@ fn apply(
         r => r?,
     };
     ctx.dev
-        .set_frequency(cmd.center_hz as f64)
-        .map_err(|e| io(format!("soapy set_frequency({}): {e}", cmd.center_hz)))?;
+        .set_frequency(hw as f64)
+        .map_err(|e| io(format!("soapy set_frequency({hw}): {e}")))?;
     rx.activate()
         .map_err(|e| io(format!("soapy activate: {e}")))?;
     Ok(got)

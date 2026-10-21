@@ -85,6 +85,36 @@ async fn tune_sets_frequency_and_smallest_rate() {
 }
 
 #[tokio::test]
+async fn tune_applies_ppm_to_the_hardware_and_reports_the_requested_centre() {
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(samples(2)));
+    let src = Arc::new(
+        SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
+            .unwrap()
+            .with_ppm(3.4),
+    );
+    let mut rx = src.subscribe();
+    let got = src.tune(tuning(146_975_000, 12_500)).await.unwrap();
+    assert_eq!(got.center_hz, Hz(146_975_000));
+    assert!(
+        dev.calls()
+            .contains(&"set_frequency(146975500)".to_string())
+    );
+    assert_eq!(src.current().unwrap().center_hz, Hz(146_975_000));
+    let b = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.center_hz, Hz(146_975_000));
+    // A live retune applies the same correction.
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    assert!(
+        dev.calls()
+            .contains(&"set_frequency(100000340)".to_string())
+    );
+    assert_eq!(src.current().unwrap().center_hz, Hz(100_000_000));
+}
+
+#[tokio::test]
 async fn tune_out_of_range_names_field() {
     let dev = Arc::new(MockDevice::hackrf_like());
     let src = source(&dev);
@@ -741,7 +771,8 @@ async fn an_unacked_gain_is_not_applied_later() {
 /// and that call's refusals carry the op's texts.
 #[tokio::test]
 async fn the_gain_arg_at_open_uses_the_same_path() {
-    let (args, gain) = zeta_source_soapy::split_gain("driver=hackrf,gain=40").unwrap();
+    let (args, gain) = zeta_source_soapy::split_zeta_args("driver=hackrf,gain=40").unwrap();
+    let gain = gain.gain;
     let dev = Arc::new(MockDevice::hackrf_like());
     let src = SoapySource::with_device_args(SourceId("sdr0".into()), dev.clone(), &args).unwrap();
     let opened = src.gain().unwrap();

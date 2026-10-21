@@ -36,12 +36,16 @@ impl Driver {
 /// zeta's own: it is removed before the driver sees the args, and once the source
 /// is open it is applied as `source_set_gain` applies a gain
 /// ([`SoapySource::set_gain_now`]: automatic gain off, the overall receive gain
-/// set to it, a value outside the device's range refused).
+/// set to it, a value outside the device's range refused). A `ppm=N` key is
+/// zeta's too: [`SoapySource::with_ppm`].
 pub fn open(id: SourceId, args: &str) -> Result<SoapySource, PortError> {
-    let (args, gain) = zeta_source_soapy::split_gain(args).map_err(PortError::Io)?;
+    let (args, zeta) = zeta_source_soapy::split_zeta_args(args).map_err(PortError::Io)?;
     let d = Driver::new(&args).map_err(PortError::Io)?;
-    let src = SoapySource::with_device_args(id.clone(), std::sync::Arc::new(d), &args)?;
-    if let Some(db) = gain {
+    let mut src = SoapySource::with_device_args(id.clone(), std::sync::Arc::new(d), &args)?;
+    if let Some(ppm) = zeta.ppm {
+        src = src.with_ppm(ppm);
+    }
+    if let Some(db) = zeta.gain {
         let g = src.set_gain_now(Some(db)).map_err(|e| {
             let e = match e {
                 PortError::Unsupported(m) | PortError::Io(m) => m,
