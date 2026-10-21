@@ -81,7 +81,7 @@ JSON: `{"op":"source_pin","source":"<id>","center_hz":144800000,"bandwidth_hz":1
 
 CLI: `zeta source pin --source <id> --center-hz 144800000 --bandwidth-hz 12500`
 
-Hold the source at a band without a job: a rigid holder that is not a job, so `replace` cannot name it and a `conflict` offers `unpin source <id> (source_unpin)`. Persisted; restored before anything else on a restart. Put `center_hz` between two channels of the grid you listen to so the receiver's DC spike falls in a guard band (the UHF CB plan's midpoint 476918750 Hz with 1000000 Hz holds all 80 channels).
+Hold the source at a band without a job: a rigid holder that is not a job, so `replace` cannot name it and a `conflict` offers `unpin source <id> (source_unpin)`. A pin retunes the source to its band (the page's spectrum follows) unless a decoder holds the source inside that band, when it joins the current capture. Persisted; restored before anything else on a restart. Put `center_hz` between two channels of the grid you listen to so the receiver's DC spike falls in a guard band (the UHF CB plan's midpoint 476918750 Hz with 1000000 Hz holds all 80 channels).
 
 ### source_unpin
 
@@ -439,7 +439,7 @@ The web page's own `spectrum` job is elastic (`job start --elastic`, `spectrum` 
 
 ### Holding a band
 
-To keep many channels running on one radio, pin the capture instead of letting each job retune it: `source pin --source S --center-hz C --bandwidth-hz B` (add `--replace ID` for the jobs in the way). Centre the pin between the channels you want, not on one of them, so no channel sits on the DC spike. Example: UHF CB (80 channels) is held by `--center-hz 476918750 --bandwidth-hz 1000000`; the lease may round up (1 024 000 Hz) and every channel fits. Jobs started inside the pin run on it without a retune; the pin and the gain (`source gain --source S --db N`, or `--auto`) are saved and come back after a restart, and one-shot commands, read-only ones included, restore the pins and the gain of the sources they attach.
+To keep many channels running on one radio, pin the capture instead of letting each job retune it: `source pin --source S --center-hz C --bandwidth-hz B` (add `--replace ID` for the jobs in the way). Centre the pin between the channels you want, not on one of them, so no channel sits on the DC spike. Example: UHF CB (80 channels) is held by `--center-hz 476918750 --bandwidth-hz 1000000`; the lease may round up (1 024 000 Hz) and every channel fits. The pin retunes the radio to its band, even one inside a wider capture the page's spectrum holds (the spectrum follows); only when a decoder already holds the source inside the band does the pin join the current capture instead. Jobs started inside the pin run on it without a retune; the pin and the gain (`source gain --source S --db N`, or `--auto`) are saved and come back after a restart, and one-shot commands, read-only ones included, restore the pins and the gain of the sources they attach.
 
 A start outside the pin is a `conflict` offering `unpin source S (source_unpin)` (and `stop one of the holders` only when jobs hold the source). A pin is not a holder and is not in `--replace`. Unpinning frees the radio for other work and does not stop the jobs that were inside it; they conflict with the next retune. Read the conflict, and unpin only when the user wants the pinned channels given up.
 

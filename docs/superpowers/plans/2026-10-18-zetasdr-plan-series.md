@@ -577,6 +577,9 @@ What was built:
   and the 1 000 ppm bound; the tee drains past a lag at cancel; the guide lists optional stage
   params (`squelch`, `squelch_db` among them) and documents the squelch, gain and one-shot
   restores.
+- Live-acceptance fix (R13): a pin retunes an unheld or elastic-only source to its band, even
+  one inside the current capture (the elastic jobs follow); under decoders inside the band it joins
+  their capture as before.
 
 Upgrade: `source_list` items carry `pin`, `gain` and `bank`, so an older node using this node as a
 `--source-node` fails its `source_list` round trip; both ends of a link move together (as plan 11).

@@ -310,8 +310,10 @@ impl LeaseManager {
             }
             // Only elastic leases (or none): a rigid request inside the
             // capture they follow is leased on it untuned, so it never
-            // shrinks a shared capture; otherwise it tunes as if unheld.
-            if let Some(cur) = (!held.is_empty())
+            // shrinks a shared capture; otherwise it tunes as if unheld. A
+            // pin always tunes here (R13): its purpose is the capture itself,
+            // and the elastic jobs follow it.
+            if let Some(cur) = (!pin && !held.is_empty())
                 .then(|| port.current())
                 .flatten()
                 .filter(|c| fits(&want, c))
@@ -333,8 +335,12 @@ impl LeaseManager {
 
     /// Pin `port` at `want` (see [`pin_holder`]) under the source's gate the
     /// caller holds: any existing pin on the source is set aside, then the band
-    /// is leased as a rigid request (`ensure_locked`), the lease marked `pin`. On
-    /// an error the old pin, if any, is put back. Also whether it tuned the port.
+    /// is leased as a rigid request (`ensure_locked`), the lease marked `pin`,
+    /// except that with no rigid job holding the source (only elastic leases, or
+    /// none) the port is always tuned to the band, even one inside the current
+    /// capture (R13; the caller relaunches the elastic jobs). Under rigid job
+    /// holders a band inside their capture joins it untuned. On an error the old
+    /// pin, if any, is put back. Also whether it tuned the port.
     pub(crate) async fn pin_locked(
         &self,
         port: &dyn Port,

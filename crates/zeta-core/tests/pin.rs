@@ -393,6 +393,43 @@ async fn elastic_jobs_join_the_pin_and_follow_a_repin() {
     assert_eq!(s.elastic, vec![elastic]);
 }
 
+/// R13: a pin is about the capture itself, so with only elastic jobs on the
+/// source it retunes to its band even when that band fits the current capture
+/// (a decoder inside the capture would not); the elastic jobs follow it.
+#[tokio::test]
+async fn pin_inside_an_elastic_only_capture_retunes_to_the_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new();
+    let node = open(dir.path(), &radio).await;
+    let wide = band(476_920_350, 4_096_000);
+    let elastic = started(&node, start(JobKind::Spectrum, wide, true, vec![])).await;
+    assert_eq!(radio.current(), Some(wide));
+    let before = streams(&node, &elastic);
+    assert!(!before.is_empty());
+    let tunes = radio.tunes();
+
+    let want = band(476_918_750, 1_000_000);
+    assert_eq!(
+        node.apply(pin(want, vec![])).await.unwrap(),
+        OpResult::Tuning(want)
+    );
+    assert_eq!(radio.tunes(), tunes + 1);
+    assert_eq!(radio.current(), Some(want));
+    let s = source(&node).await;
+    assert_eq!(s.pin, Some(want));
+    assert_eq!(s.current, Some(want));
+    assert_eq!(s.elastic, vec![elastic.clone()]);
+    let rec = record(&node, &elastic);
+    assert_eq!(rec.state, JobState::Running);
+    assert_eq!(rec.tuning, want);
+    let after = streams(&node, &elastic);
+    assert!(!after.is_empty());
+    assert!(
+        after.iter().all(|s| !before.contains(s)),
+        "{before:?} {after:?}"
+    );
+}
+
 #[tokio::test]
 async fn repin_over_job_holders_outside_their_capture_is_a_conflict_and_keeps_the_old_pin() {
     let dir = tempfile::tempdir().unwrap();
