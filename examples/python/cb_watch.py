@@ -3,7 +3,13 @@
 
 Watches a source's capture with one elastic `spectrum` job. A plan channel whose peak rises
 `--open-db` dB over the row's noise floor gets an `fm_demod` plus an attached `transcribe`;
-a channel idle for `--idle-s` seconds loses both. Standard library only; talks to a node's
+a channel idle for `--idle-s` seconds loses both. Before the transcriber is attached the
+demodulator's squelch is fixed (`graph_put` of `squelch_db`) at the measured noise floor in the
+channel + `--squelch-margin-db` (6): a demodulator started mid-transmission would otherwise
+seed its automatic floor on the signal. The row's floor is a per-bin power (Hann window,
+dBFS of a full-scale tone); the squelch measures the whole channel's power in dBFS, so the
+floor is converted by 10*log10(channel bandwidth / (1.5 * bin_hz)), 1.5 bins being the Hann
+window's noise bandwidth. Standard library only; talks to a node's
 `POST /op` with the shared secret read from the environment variable named by `--secret-env`.
 
     export ZETA_SECRET=...
@@ -12,12 +18,12 @@ a channel idle for `--idle-s` seconds loses both. Standard library only; talks t
 `--dry-run` prints the plan channels inside the source's capture and starts nothing. The jobs
 this script starts are ordinary persisted jobs: it stops them on SIGINT/SIGTERM, and a restart
 adopts running `fm_demod` jobs already on plan channels (it times them out, it does not stop
-them on exit). A demodulator started mid-transmission seeds its automatic squelch floor on the
-signal; it settles when the channel next goes quiet.
+them on exit, and leaves their squelch as it is).
 """
 
 import argparse
 import json
+import math
 import signal
 import sys
 import time
@@ -25,6 +31,10 @@ import urllib.error
 import urllib.request
 
 CHANNEL_MATCH_HZ = 1_000
+# Noise bandwidth of the spectrum job's Hann window, in bins.
+HANN_ENBW_BINS = 1.5
+# The demodulator's accepted squelch_db.
+SQUELCH_DB_RANGE = (-120, 0)
 
 
 class OpError(Exception):
@@ -90,6 +100,18 @@ def channel_loads(row, channels, bandwidth_hz):
     return out
 
 
+def channel_floor_dbfs(row, bandwidth_hz):
+    """The row's noise floor (its 15th percentile, as channel_loads takes it) as the power of
+    noise filling a `bandwidth_hz` channel, dBFS: the scale of a demodulator's squelch_db."""
+    bin_db = row["floor_db"] + percentile(row["q"], 15) * row["step_db"]
+    return bin_db + 10.0 * math.log10(bandwidth_hz / (HANN_ENBW_BINS * row["bin_hz"]))
+
+
+def squelch_db_for(floor_dbfs, margin_db):
+    lo, hi = SQUELCH_DB_RANGE
+    return int(max(lo, min(hi, round(floor_dbfs + margin_db))))
+
+
 class Watcher:
     def __init__(self, node, args, plan, channels, current):
         self.node, self.args, self.plan, self.channels = node, args, plan, channels
@@ -142,20 +164,35 @@ class Watcher:
         rows = [f["payload"] for f in frames if "q" in f.get("payload", {})]
         return rows[-1] if rows else None
 
-    def open_channel(self, c):
+    def fix_squelch(self, demod, squelch_db):
+        """Set the demodulator's fixed squelch; `graph_put` restarts the job with it."""
+        graph = self.node.op({"op": "graph_get", "job": demod})
+        for n in graph["nodes"]:
+            if n["kind"] == "nbfm_demod":
+                n["params"]["squelch_db"] = squelch_db
+        self.node.op({"op": "graph_put", "job": demod, "graph": graph})
+
+    def open_channel(self, c, floor_dbfs):
         a = self.args
         demod = self.node.op({
             "op": "job_start", "kind": "fm_demod", "source": a.source, "center_hz": c["center_hz"],
             "bandwidth_hz": self.plan["bandwidth_hz"], "deviation_hz": None, "sideband": None,
             "elastic": False, "replace": [],
         })
+        squelch_db = squelch_db_for(floor_dbfs, a.squelch_margin_db)
+        try:
+            self.fix_squelch(demod, squelch_db)
+        except OpError as e:
+            self.log("ch%d: squelch left automatic: %s" % (c["number"], e))
+            squelch_db = None
         stt = None
         try:
             stt = self.node.op({"op": "job_attach", "kind": "transcribe", "job": demod, "language": None})
         except OpError as e:
             self.log("ch%d: transcribe not attached: %s" % (c["number"], e))
         self.active[c["number"]] = {"demod": demod, "stt": stt, "last": time.time(), "mine": True}
-        self.log("ch%d active: fm_demod %s, transcribe %s" % (c["number"], demod, stt))
+        self.log("ch%d active: fm_demod %s (squelch_db %s), transcribe %s"
+                 % (c["number"], demod, squelch_db, stt))
 
     def close_channel(self, number, why):
         st = self.active.pop(number)
@@ -173,13 +210,14 @@ class Watcher:
             return
         now = time.time()
         loads = channel_loads(row, self.channels, self.plan["bandwidth_hz"])
+        floor_dbfs = channel_floor_dbfs(row, self.plan["bandwidth_hz"])
         for number, over in loads.items():
             if over >= self.args.open_db:
                 if number in self.active:
                     self.active[number]["last"] = now
                 elif len([s for s in self.active.values() if s["mine"]]) < self.args.max_tuners:
                     try:
-                        self.open_channel(self.by_number[number])
+                        self.open_channel(self.by_number[number], floor_dbfs)
                     except OpError as e:
                         self.log("ch%d: could not start: %s" % (number, e))
         for number in list(self.active):
@@ -215,6 +253,10 @@ def main():
     ap.add_argument("--source", required=True, help="source id")
     ap.add_argument("--plan", default="uhf_cb_au")
     ap.add_argument("--open-db", type=float, default=10.0, help="dB over the floor that opens a channel")
+    ap.add_argument("--squelch-margin-db", type=float, default=6.0,
+                    help="dB over the channel's measured noise floor (converted from the spectrum "
+                         "row's per-bin dB to the channel's dBFS) the opened demodulator's fixed "
+                         "squelch_db sits at")
     ap.add_argument("--idle-s", type=float, default=60.0, help="seconds idle before a channel's jobs stop")
     ap.add_argument("--max-tuners", type=int, default=8)
     ap.add_argument("--dry-run", action="store_true", help="list the channels in the capture, start nothing")
