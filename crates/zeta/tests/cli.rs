@@ -808,10 +808,10 @@ fn then_tail_malformed_value_is_usage_error() {
 #[test]
 fn then_tail_reports_failed_job() {
     let dir = tempfile::tempdir().unwrap();
-    // A prime source rate channelises at itself, and resampling 999 983 Hz to
-    // 48 kHz audio reduces to a ratio beyond the resampler's limit.
-    let iq = zeta_dsp::util::nco(2_000, 100.0, 999_983.0);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 999_983, 100_000_000);
+    // A 1 003 Hz source (17 x 59) channelises at itself, and no rate within
+    // 1000 ppm of it resamples to 48 kHz audio under the snap factor.
+    let iq = zeta_dsp::util::nco(2_000, 100.0, 1_003.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "cd", &iq, 1_003, 100_000_000);
     let src = format!("cd={}", meta.display());
     let out = zeta(
         dir.path(),

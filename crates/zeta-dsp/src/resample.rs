@@ -18,6 +18,12 @@ const MIN_TAPS: u64 = 63;
 /// prototype of tens of megabytes.
 pub const MAX_FACTOR: u64 = 100_000;
 
+/// Largest `max(L, M)` kept exact; above it the input rate is snapped.
+pub const SNAP_FACTOR: u64 = 2_048;
+
+/// Furthest the input rate may move when snapping, in parts per million.
+pub const SNAP_MAX_PPM: u64 = 1_000;
+
 fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         (a, b) = (b, a % b);
@@ -44,19 +50,46 @@ pub struct Resampler {
     history: Vec<f32>,
     /// Upsampled index of the next output, relative to the next block's first sample.
     next: u64,
+    /// The input rate the ratio was built for: the requested rate, or the snapped one.
+    input_rate_hz: u64,
 }
 
 impl Resampler {
-    /// Resampler from `in_rate_hz` to `out_rate_hz`; both must be at least 1
-    /// and the reduced ratio's larger term at most [`MAX_FACTOR`].
+    /// Resampler from `in_rate_hz` to `out_rate_hz`; both must be at least 1.
+    /// The ratio is exact when its reduced larger term is at most
+    /// [`SNAP_FACTOR`]; above that the input rate snaps to the nearest rate
+    /// within [`SNAP_MAX_PPM`] (searching `in + 1`, `in - 1`, `in + 2`, ...)
+    /// whose ratio qualifies, and it is an error only when none does.
     pub fn new(in_rate_hz: u64, out_rate_hz: u64) -> Result<Resampler, String> {
         if in_rate_hz == 0 || out_rate_hz == 0 {
             return Err(format!(
                 "resampler rates must be >= 1, got {in_rate_hz} -> {out_rate_hz}"
             ));
         }
-        let g = gcd(in_rate_hz, out_rate_hz);
-        let (l, m) = (out_rate_hz / g, in_rate_hz / g);
+        let reduce = |i: u64| {
+            let g = gcd(i, out_rate_hz);
+            (out_rate_hz / g, i / g)
+        };
+        let (mut l, mut m) = reduce(in_rate_hz);
+        let mut in_rate_hz_used = in_rate_hz;
+        if l.max(m) > SNAP_FACTOR {
+            let reach = in_rate_hz * SNAP_MAX_PPM / 1_000_000;
+            let found = (1..=reach)
+                .flat_map(|k| [in_rate_hz.checked_add(k), in_rate_hz.checked_sub(k)])
+                .flatten()
+                .filter(|&c| c != 0)
+                .map(|c| (c, reduce(c)))
+                .find(|&(_, (cl, cm))| cl.max(cm) <= SNAP_FACTOR);
+            if let Some((c, (cl, cm))) = found {
+                let ppm = c.abs_diff(in_rate_hz) as f64 * 1e6 / in_rate_hz as f64;
+                eprintln!(
+                    "zeta-dsp: resampler {in_rate_hz} -> {out_rate_hz} Hz snapped to {c} ({ppm:.0} ppm)"
+                );
+                (l, m) = (cl, cm);
+                in_rate_hz_used = c;
+            }
+        }
+        let in_rate_hz = in_rate_hz_used;
         if l == 1 && m == 1 {
             return Ok(Resampler {
                 l,
@@ -64,9 +97,10 @@ impl Resampler {
                 phases: Vec::new(),
                 history: Vec::new(),
                 next: 0,
+                input_rate_hz: in_rate_hz,
             });
         }
-        if l.max(m) > MAX_FACTOR {
+        if l.max(m) > SNAP_FACTOR {
             return Err(format!(
                 "resampler {in_rate_hz} -> {out_rate_hz} Hz reduces to {l}/{m}, beyond the {MAX_FACTOR} limit"
             ));
@@ -90,12 +124,19 @@ impl Resampler {
             history: vec![0.0; k - 1],
             phases,
             next: 0,
+            input_rate_hz: in_rate_hz,
         })
     }
 
     /// The reduced ratio `(L, M)`: output rate / input rate = L / M.
     pub fn ratio(&self) -> (u64, u64) {
         (self.l, self.m)
+    }
+
+    /// The input rate the ratio was built for: the requested rate when exact,
+    /// the snapped rate otherwise.
+    pub fn input_rate_hz(&self) -> u64 {
+        self.input_rate_hz
     }
 
     /// Resample the next block of input. Over a stream of N inputs fed to a

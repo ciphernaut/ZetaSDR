@@ -108,15 +108,57 @@ fn resampler_rejects_zero_rates() {
 }
 
 #[test]
-fn resampler_rejects_ratios_beyond_the_limit() {
-    // 12 007 Hz is prime: 48 000 / 12 007 is within the limit, 999 983 Hz (prime) is not.
-    assert_eq!(
-        Resampler::new(12_007, 48_000).unwrap().ratio(),
-        (48_000, 12_007)
-    );
-    let e = Resampler::new(999_983, 48_000).unwrap_err();
+fn exact_ratios_below_the_factor_are_unchanged() {
+    for (i, o, ratio) in [
+        (96_000, 48_000, (1, 2)),
+        (200_000, 48_000, (6, 25)),
+        (2_048_000, 2_400_000, (75, 64)),
+        (204_800, 48_000, (15, 64)),
+    ] {
+        let r = Resampler::new(i, o).unwrap();
+        assert_eq!(r.ratio(), ratio, "{i} -> {o}");
+        assert_eq!(r.input_rate_hz(), i, "{i} -> {o}");
+    }
+}
+
+#[test]
+fn the_live_rates_snap_within_the_bound() {
+    for (i, o, snapped, ratio) in [
+        (398_961u64, 48_000u64, 398_976u64, (125u64, 1039u64)),
+        (260_339, 48_000, 260_352, (125, 678)),
+        (398_961, 240_000, 398_976, (625, 1039)),
+    ] {
+        let r = Resampler::new(i, o).unwrap();
+        assert_eq!(r.input_rate_hz(), snapped, "{i} -> {o}");
+        assert_eq!(r.ratio(), ratio, "{i} -> {o}");
+        let ppm = i.abs_diff(snapped) as f64 * 1e6 / i as f64;
+        assert!(ppm < 300.0, "{i} -> {o}: {ppm} ppm");
+    }
+}
+
+#[test]
+fn a_snapped_resampler_streams_like_the_exact_one_at_the_snapped_rate() {
+    let x = tone(398_976.0, 398_976, 1_000.0, 0.5);
+    let a = Resampler::new(398_961, 48_000).unwrap().process(&x);
+    let b = Resampler::new(398_976, 48_000).unwrap().process(&x);
+    assert!(!a.is_empty());
+    assert_eq!(a, b);
+}
+
+#[test]
+fn zero_rates_still_error() {
+    for (i, o) in [(0, 48_000), (48_000, 0)] {
+        let e = Resampler::new(i, o).unwrap_err();
+        assert!(e.contains("resampler rates must be >= 1"), "{e}");
+    }
+}
+
+#[test]
+fn a_rate_with_no_snap_in_reach_still_errors() {
+    // 6857 divides 47 999; no multiple of it lies within 999 Hz of 999 983.
+    let e = Resampler::new(999_983, 47_999).unwrap_err();
     assert_eq!(
         e,
-        "resampler 999983 -> 48000 Hz reduces to 48000/999983, beyond the 100000 limit"
+        "resampler 999983 -> 47999 Hz reduces to 47999/999983, beyond the 100000 limit"
     );
 }
