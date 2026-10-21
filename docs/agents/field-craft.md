@@ -76,6 +76,12 @@ To keep many channels running on one radio, pin the capture instead of letting e
 
 A start outside the pin is a `conflict` offering `unpin source S (source_unpin)` (and `stop one of the holders` only when jobs hold the source). A pin is not a holder and is not in `--replace`. Unpinning frees the radio for other work and does not stop the jobs that were inside it; they conflict with the next retune. Read the conflict, and unpin only when the user wants the pinned channels given up.
 
+### Channel plans
+
+`channel_plans` (CLI `zeta plans`) returns the plans the node knows with every channel's `number` and `center_hz`. Name a channel to the user by its number ("ch20", not 476.9 MHz) and start jobs at its `center_hz` with the plan's `bandwidth_hz`. The AU UHF CB plan interleaves two rasters: ch1-40 sit 25 kHz apart and ch41-80 fall halfway between them, so every channel has neighbours 12.5 kHz either side. A strong ch20 transmission leaks into ch59 and ch60 and used to open both squelches and echo the same words three times. An `fm_demod` on a plan channel therefore carries a guard: its squelch stays closed while a neighbour `guard_hz` away is more than `guard_db` stronger, and the `squelch` event says so with `guarded: true` and `adjacent_db`. When a quiet channel shows `squelch` and no transcripts, read `guarded` before concluding it is broken. The guard needs the squelch on (it is inert with `squelch: false`) and `graph put` with `guard_hz: null` turns it off. `transcribe` ignores utterances under `min_utterance_ms` (700) and a busy speech daemon drops with `reason` `queue` or `busy`; `queued_ms` on a transcript is the time it waited.
+
+To run demodulators on active channels only, not on all 80, use `examples/python/cb_watch.py` (`--dry-run` shows which channels the capture holds): it keeps one elastic `spectrum` job, starts `fm_demod` plus `transcribe` on a channel that stands 10 dB over the floor and stops them after 60 s of quiet.
+
 ### Working layer 4
 
 When a signal has no known decoder, work it in this order:

@@ -20,7 +20,7 @@ interfaces rather than guessed ones.
 | 10 | Speech on a channel | Transcription of a radio channel: audio frames carry a channel count; stages `denoise` (RNNoise via `nnnoiseless`), `vad` (energy-over-floor voice gate) and `transcribe` (new crate `zeta-speech`, speech backends `SocketBackend` for a `local-voice`-protocol daemon and `NodeBackend` for another node's `/stt`, global flags `--stt-socket` and `--stt-node`); attached jobs (`stream_in` stage, `job_attach` op, `zeta job attach`) so any audio-producing job, demodulators now and digital voice decoders later, can be transcribed; UI entries and transcript ribbons; the source-separation slot proven with an external audio plugin (`examples/python/separate_stub.py`) swapped in with `graph put`; `docs/speech.md`. **Delivered** on branch `speech`, 2026-10-20. Pending: live acceptance on the field host (needs `local-voice` installed there, `docs/speech.md` section 1). | 2, 7, 9 |
 | 11 | View policy | Resume restores the capture (widest first, built-in graphs re-expanded, `capture_rate_hz`); the ops log (`ops.log`, `zeta ops tail`); elastic leases (`job start --elastic`); atomic `replace` (`--replace` on `job start` and `source ensure`); a file-source `tune_range`; UI view policies (`follow`, `zoom_out`, `auto_scan_stop`, `finished_rows_s`, `scanner`) and `view set\|show\|reset\|clear`, automatic scans on a scanner source, a coarse scan layer, eased follow. **Delivered** on branch `worktree-view-policy`, 2026-10-20. Pending: live acceptance on the field host. | 3, 10 |
 | 12 | Capture and transcripts | Resumed channels take the shared bank (the bank factory reaches `Node::open`; the channel's path in `job_context`, `bank` in `source_list`, lag lines by stage kind); rates the resampler accepts (a UHD ladder of exact master-clock divisors in the Soapy source, a snapping `Resampler`); the transcript log (`transcripts.log`, `zeta transcripts tail`); pinned captures (`source_pin`/`source_unpin`, `sources/<id>.json`, restored first on resume); live receive gain (`source_set_gain`, `source_list.gain`, persisted); UI pins and `source pin\|unpin\|gain` commands; `ppm=` correction and an automatic squelch in `fm_demod`/`am_demod`. Spec `docs/superpowers/specs/2026-10-21-capture-and-transcripts-design.md`, plan `docs/superpowers/plans/2026-10-21-capture-and-transcripts.md`. Delivered on branch `worktree-view-policy`, 2026-10-21. Pending: live acceptance on the field host. | 8, 10, 11 |
-| 13 | Channel plans | A table-driven channel-plan registry in `zeta-core` (`uhf_cb_au`, 80 channels; `channel_plans` op, `zeta plans`); the page names channels on job rows, outlines and the axis (`view set plan auto\|<id>\|none`); an adjacent-channel guard in `nbfm_demod` for plan channels (a widened channel, the centre filtered in the stage, the gate held closed under a stronger neighbour; `guard_hz`/`guard_db` node params, `adjacent_db`/`guarded` on `squelch` events); `transcribe`'s `min_utterance_ms` (700); a bounded speech-daemon queue (4 connections, `queued_ms`, `busy`/`queue` drop reasons, one EAGAIN retry); optionally `examples/python/cb_watch.py` (demodulators only on active channels). Spec `docs/superpowers/specs/2026-10-21-channel-plans-design.md`, plan `docs/superpowers/plans/2026-10-21-channel-plans.md`. | 10, 11, 12 |
+| 13 | Channel plans | A table-driven channel-plan registry in `zeta-core` (`uhf_cb_au`, 80 channels; `channel_plans` op, `zeta plans`); the page names channels on job rows, outlines and the axis (`view set plan auto\|<id>\|none`); an adjacent-channel guard in `nbfm_demod` for plan channels (a widened channel, the centre filtered in the stage, the gate held closed under a stronger neighbour; `guard_hz`/`guard_db` node params, `adjacent_db`/`guarded` on `squelch` events); `transcribe`'s `min_utterance_ms` (700); a bounded speech-daemon queue (4 connections, `queued_ms`, `busy`/`queue` drop reasons, one EAGAIN retry); optionally `examples/python/cb_watch.py` (demodulators only on active channels). Spec `docs/superpowers/specs/2026-10-21-channel-plans-design.md`, plan `docs/superpowers/plans/2026-10-21-channel-plans.md`. Delivered on branch `plan-13`, 2026-10-21 (tasks 1-5, base plan 12). Pending: live acceptance on the field host. | 10, 11, 12 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
@@ -607,3 +607,57 @@ Deferred:
   public constant.
 - Plan 11's leftovers are still open: the fallback-scan span does not follow later zooms; the UI
   suite runs near its deadline (234 s of 300 s).
+
+## Plan 13 status
+
+Plan 13 is delivered on `plan-13` (tasks 1-5, base plan 12), 2026-10-21. Live acceptance on
+the field host is pending.
+
+What was built:
+
+- Task 1: the `channel_plans` op (`zeta plans [--plan ID]`) and the `uhf_cb_au` registry (80
+  channels, two rasters 12.5 kHz apart) in `zeta-core`.
+- Task 2: the adjacent-channel guard in `fm_demod`: a plan channel's `channel` node carries
+  `wide_hz`, the demod `guard_hz`/`guard_db`/`channel_hz`; `squelch` events carry `adjacent_db` and
+  `guarded`; `graph put` with `guard_hz: null` turns it off; a job off every plan has the same graph.
+- Task 3: `transcribe`'s `min_utterance_ms` (700) and the 4-slot speech-daemon queue (`queued_ms`,
+  `dropped` reasons `queue`/`busy`, one EAGAIN retry).
+- Task 4: the page: `ch20` tags on job rows and outlines, axis channel ticks, `view set plan
+  auto|<id>|none`; the `cb` fixture source and one scenario.
+- Task 5: `examples/python/cb_watch.py` (demodulators only on active channels, `--dry-run`),
+  README, field-craft ("Channel plans"), this status.
+
+Gates at the branch head:
+
+- `cargo test --workspace --all-features --no-fail-fast`: 900 passed, 1 failed, 3 ignored (111
+  `test result` lines) in the last of three runs; the failure was `acarsdec_decodes_our_fixture`
+  (known flake), 3 of 3 reruns alone passed. No `ui e2e skipped`. The UI suite
+  (`ui_scenarios_pass_in_headless_chromium`) ran ok in 225.68 s in that gate (234-240 s alone).
+- The other two full runs each failed one test that passed alone: `child_exit_fails_the_stage`
+  (`zeta-ext --test adsb`, 10 s timeout; 3 of 3 alone ok) and the UI scenario
+  `quiet_channel_row_is_tagged_squelch` (also failed 1 of 3 UI runs alone; "squelch tag not found"
+  within 3 s, a timing flake to fix).
+- `cargo fmt -p` for each of the 17 workspace members, `rustfmt --edition 2024 --check` on the
+  driver, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  `zeta agents-md --check` and `--skill --check` are clean.
+
+Deferred:
+
+- `Segment` and `ChannelPlan` derive nothing; `channel_at` re-sorts per call.
+- A same-rate re-expansion error at resume is silent; a bank-served record resumed with no bank is
+  re-expanded onto the direct path (untested).
+- A closed-state `squelch` event can carry a stale `guarded`; the guard is inert with the squelch
+  off.
+- The speech concurrency test should assert `max_concurrent() == 4`.
+- The connect retry also delays the startup probe by 200 ms when the daemon is unreachable.
+- A stored non-builtin `plan` id is dropped at page mount; the plan list is cached for the page's
+  lifetime; multi-plan axis ticks are unsorted.
+- The UI scenario `quiet_channel_row_is_tagged_squelch` is flaky (see the gates); the adsb
+  `child_exit_fails_the_stage` test timed out once under full-suite load.
+- `cb_watch.py` does not fix `squelch_db` at floor + 6 (spec 3.4): a demodulator started
+  mid-transmission seeds its automatic floor on the signal.
+- Plan 12's leftovers are still open: two Soapy gain tests have 50-100 ms timing margins and
+  `set_gain` may hold the tune gate up to 2x `retune_timeout`; the squelch's floor window (100
+  blocks, about 1 s live) is untuned; `ops.log` and `transcripts.log` writes are synchronous on
+  runtime threads; `zeta_dsp::resample::MAX_FACTOR` is an unused public constant. Plan 11's: the
+  fallback-scan span does not follow later zooms; the UI suite runs near its deadline.

@@ -86,6 +86,7 @@ Holding a capture, receive gain and transcripts:
 ./target/debug/zeta source unpin --source b210
 ./target/debug/zeta source gain --source b210 --db 45     # or --auto
 ./target/debug/zeta transcripts tail --lines 20 --job job-7   # default 50 lines, local state dir only
+./target/debug/zeta plans [--plan uhf_cb_au]     # channel plans with their channels expanded
 ```
 
 `source pin` holds a source at a band (the leased bandwidth may round up to what the radio can
@@ -117,6 +118,30 @@ with `squelch_db <v> out of range -120..=0`), and `squelch: false` turns it off.
 demodulator runs with the squelch off. A put that changes only these (or `deviation_hz`,
 `sideband`) keeps the job re-expandable for a later capture rate; any other `graph put` is
 launched as stored from then on.
+
+Channel plans. `zeta plans` (op `channel_plans`) lists the plans the node knows; `uhf_cb_au` is
+Australian UHF CB, 80 channels on two rasters 12.5 kHz apart (the 40 channels of 25 kHz spacing
+and the 40 interleaved ones, ch41-80, between them). An `fm_demod` whose centre is within 1 kHz of a
+plan channel gets an adjacent-channel guard: its channel is widened to 37.5 kHz, the centre is
+filtered in the stage, and its squelch stays closed while a channel `guard_hz` (12.5 kHz) away is
+more than `guard_db` (12) stronger; the `squelch` event adds `adjacent_db` and `guarded`, and a
+`graph put` with `guard_hz: null` on the demod turns it off. A job off every plan is unchanged.
+The page tags plan channels (`ch20`) on job rows and outlines and numbers them on the axis when
+zoomed; `view set plan auto|<id>|none` picks the plan. `transcribe` drops utterances shorter than
+`min_utterance_ms` (default 700, counted in the job context as `transcribe.short`), and the speech
+daemon queue holds 4 requests: a transcript event carries `queued_ms`, and a dropped one a `reason`
+(`queue` or `busy`).
+
+`examples/python/cb_watch.py` (standard library only) runs demodulators only on the channels in
+use: one elastic `spectrum` job on the source, a channel whose peak is `--open-db` (10) over the
+row's floor gets `fm_demod` plus `transcribe`, up to `--max-tuners` (8), and both stop after
+`--idle-s` (60) quiet seconds or at SIGINT/SIGTERM. `--dry-run` lists the channels inside the
+capture and starts nothing:
+
+```bash
+ZETA_SECRET=... python3 -I examples/python/cb_watch.py --node http://field-host:7979 \
+  --secret-env ZETA_SECRET --source b210 --dry-run
+```
 
 `AGENTS.md` is generated from the operation schema by `zeta agents-md`; `zeta agents-md --check`
 fails if the committed file has drifted.
