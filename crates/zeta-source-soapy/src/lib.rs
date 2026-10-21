@@ -4,8 +4,9 @@
 //! This crate never links SoapySDR: the real driver adapter lives in the
 //! separate `zeta-source-soapy-driver` crate (excluded from the workspace, it
 //! needs `libsoapysdr-dev`). The receive gain is the driver's default unless the
-//! device args carry `gain=DB` ([`split_gain`]); a `source.set_gain` operation
-//! is future work.
+//! device args carry `gain=DB` ([`split_gain`], applied at open by
+//! [`SoapySource::set_gain_now`]) or `source_set_gain` sets it
+//! ([`zeta_core::port::Port::set_gain`]).
 
 pub mod caps;
 pub mod convert;

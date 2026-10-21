@@ -348,6 +348,24 @@ pub enum SourceCmd {
         #[arg(long)]
         source: String,
     },
+    /// Set a source's overall receive gain (persisted; re-applied on restart)
+    Gain {
+        /// Source id
+        #[arg(long)]
+        source: String,
+        /// Gain in dB, within `source list`'s gain.min_db..=max_db
+        #[arg(
+            long,
+            value_name = "DB",
+            allow_negative_numbers = true,
+            required_unless_present = "auto",
+            conflicts_with = "auto"
+        )]
+        db: Option<f64>,
+        /// The driver's automatic gain instead of a value
+        #[arg(long)]
+        auto: bool,
+    },
 }
 
 /// `--replace ID[,ID]` on `job start`, `source ensure` and `source pin`.
@@ -642,7 +660,10 @@ impl Command {
         matches!(
             self,
             Command::Source(
-                SourceCmd::Ensure { .. } | SourceCmd::Pin { .. } | SourceCmd::Unpin { .. }
+                SourceCmd::Ensure { .. }
+                    | SourceCmd::Pin { .. }
+                    | SourceCmd::Unpin { .. }
+                    | SourceCmd::Gain { .. }
             ) | Command::Job(JobCmd::Start { .. } | JobCmd::Attach { .. } | JobCmd::Stop(_))
                 | Command::Graph(GraphCmd::Put { .. })
         )
@@ -681,6 +702,15 @@ impl Command {
             },
             Command::Source(SourceCmd::Unpin { source }) => Op::SourceUnpin {
                 source: SourceId(source),
+            },
+            // clap admits exactly one of `--db` and `--auto`.
+            Command::Source(SourceCmd::Gain {
+                source,
+                db,
+                auto: _,
+            }) => Op::SourceSetGain {
+                source: SourceId(source),
+                gain_db: db,
             },
             Command::Job(JobCmd::Start {
                 kind,

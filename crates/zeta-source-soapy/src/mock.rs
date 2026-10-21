@@ -38,6 +38,10 @@ pub struct MockDevice {
     /// back `fraction` short of the rate set.
     shortfall: Mutex<(f64, usize)>,
     range_reads: Mutex<usize>,
+    /// Whether the device has automatic gain (default true).
+    gain_mode_available: bool,
+    /// `(db, automatic)`: the gain set and whether automatic gain is on.
+    gain: Mutex<(f64, bool)>,
 }
 
 impl MockDevice {
@@ -67,7 +71,16 @@ impl MockDevice {
             decimation: None,
             shortfall: Mutex::new((0.0, 0)),
             range_reads: Mutex::new(0),
+            gain_mode_available: true,
+            gain: Mutex::new((0.0, false)),
         }
+    }
+
+    /// Whether the device has automatic gain (`has_gain_mode`); the default is
+    /// true. The gain range is always 0 to 76 dB.
+    pub fn with_gain_mode(mut self, available: bool) -> Self {
+        self.gain_mode_available = available;
+        self
     }
 
     /// Report a single continuous rate range whose maximum is the last set
@@ -132,7 +145,8 @@ impl MockDevice {
     }
 
     /// Make the named call (`set_frequency`, `set_sample_rate`, `open_rx`,
-    /// `activate`) fail once with `msg`; calls are still recorded.
+    /// `activate`, `set_gain`, `set_gain_mode`) fail once with `msg`; calls are
+    /// still recorded.
     pub fn fail_on(self, op: &str, msg: &str) -> Self {
         self.fails.lock().unwrap().push((op.into(), msg.into()));
         self
@@ -241,6 +255,33 @@ impl SoapyDevice for MockDevice {
             fails: self.fails.clone(),
             next: 0,
         }))
+    }
+    fn gain_range(&self) -> Result<(f64, f64), String> {
+        Ok((0.0, 76.0))
+    }
+    fn gain(&self) -> Result<f64, String> {
+        Ok(self.gain.lock().unwrap().0)
+    }
+    fn set_gain(&self, db: f64) -> Result<(), String> {
+        self.rec(format!("set_gain({db})"));
+        self.check("set_gain")?;
+        self.gain.lock().unwrap().0 = db;
+        Ok(())
+    }
+    fn has_gain_mode(&self) -> Result<bool, String> {
+        Ok(self.gain_mode_available)
+    }
+    fn gain_mode(&self) -> Result<bool, String> {
+        Ok(self.gain.lock().unwrap().1)
+    }
+    fn set_gain_mode(&self, automatic: bool) -> Result<(), String> {
+        self.rec(format!("set_gain_mode({automatic})"));
+        self.check("set_gain_mode")?;
+        if !self.gain_mode_available {
+            return Err("no automatic gain".into());
+        }
+        self.gain.lock().unwrap().1 = automatic;
+        Ok(())
     }
 }
 

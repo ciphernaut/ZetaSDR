@@ -18,3 +18,7 @@ zeta-source-soapy = { path = "../zeta-source-soapy" }
 
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+# A workspace of its own, so `cargo check` here does not resolve to the parent
+# manifest (from a nested worktree too).
+[workspace]

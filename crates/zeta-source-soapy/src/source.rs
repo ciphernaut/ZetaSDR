@@ -8,8 +8,10 @@
 //! overflow (samples lost in the driver), a retune or a reopen anchors at
 //! `max(now, end of the last block)`, so `t0` jumps forward and never back.
 //!
-//! Device gains are left at the driver's defaults; a `source.set_gain`
-//! operation is future work.
+//! The overall receive gain is read when the source opens and set by
+//! [`Port::set_gain`]: through the reader thread between reads while a stream
+//! runs (so a gain change and a retune keep their order), on the device
+//! directly otherwise.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use num_complex::Complex;
 use tokio::sync::{broadcast, oneshot};
-use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
+use zeta_core::port::{GainInfo, IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
 
 use crate::caps::{
@@ -56,11 +58,86 @@ struct Status {
     timeouts: u64,
     /// `(when, samples)` per block over the last [`RATE_WINDOW`].
     window: VecDeque<(Instant, u64)>,
+    /// The overall receive gain as last applied (read at open); `None` for a
+    /// device that reports no gain range.
+    gain: Option<GainInfo>,
 }
 
 /// A command handed to the reader thread, applied between reads.
 enum Cmd {
     Retune(Retune),
+    /// A checked gain (see [`apply_gain`]), acknowledged with the gain after it
+    /// or the failed device call.
+    Gain {
+        db: Option<f64>,
+        ack: oneshot::Sender<Result<GainInfo, String>>,
+    },
+}
+
+/// The device's gain as read now: `None` when it reports no usable range.
+fn read_gain(dev: &dyn SoapyDevice) -> Option<GainInfo> {
+    let (min_db, max_db) = dev.gain_range().ok()?;
+    if !(min_db.is_finite() && max_db.is_finite() && min_db <= max_db) {
+        return None;
+    }
+    let automatic_available = dev.has_gain_mode().unwrap_or(false);
+    let automatic = automatic_available && dev.gain_mode().unwrap_or(false);
+    let db = match automatic {
+        true => None,
+        false => dev.gain().ok(),
+    };
+    Some(GainInfo {
+        db,
+        min_db,
+        max_db,
+        automatic,
+        automatic_available,
+    })
+}
+
+/// Apply a gain [`SoapySource::check_gain`] accepted: `None` turns automatic
+/// gain on; a value turns it off (where the device has it) and sets the overall
+/// gain, read back. The result is recorded in `status`; after a failed call the
+/// device is read again so `status` says what it runs at.
+fn apply_gain(
+    dev: &dyn SoapyDevice,
+    status: &Mutex<Status>,
+    db: Option<f64>,
+) -> Result<GainInfo, String> {
+    let Some(mut info) = status.lock().unwrap().gain else {
+        return Err("source has no adjustable gain".into());
+    };
+    let applied = match db {
+        None => dev
+            .set_gain_mode(true)
+            .map_err(|e| format!("soapy set_gain_mode(true): {e}"))
+            .map(|()| {
+                info.automatic = true;
+                info.db = None;
+            }),
+        Some(d) => (|| {
+            if info.automatic_available {
+                dev.set_gain_mode(false)
+                    .map_err(|e| format!("soapy set_gain_mode(false): {e}"))?;
+            }
+            dev.set_gain(d)
+                .map_err(|e| format!("soapy set_gain({d}): {e}"))?;
+            info.automatic = false;
+            info.db = Some(dev.gain().unwrap_or(d));
+            Ok(())
+        })(),
+    };
+    let mut st = status.lock().unwrap();
+    match applied {
+        Ok(()) => {
+            st.gain = Some(info);
+            Ok(info)
+        }
+        Err(e) => {
+            st.gain = read_gain(dev).or(st.gain);
+            Err(e)
+        }
+    }
 }
 
 /// A retune: acknowledged once applied and recorded in [`Status`], or with
@@ -207,6 +284,10 @@ impl SoapySource {
         let freq = dev.frequency_ranges().map_err(io)?;
         let (native, supported) = dev.formats().map_err(io)?;
         let format = pick_format(native, &supported).map_err(PortError::Unsupported)?;
+        let status = Status {
+            gain: read_gain(dev.as_ref()),
+            ..Status::default()
+        };
         Ok(Self {
             id,
             caps,
@@ -215,7 +296,7 @@ impl SoapySource {
             rates,
             format,
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
-            status: Arc::default(),
+            status: Arc::new(Mutex::new(status)),
             reader: Mutex::new(None),
             retune_timeout: RETUNE_ACK,
             gate: tokio::sync::Mutex::new(()),
@@ -247,6 +328,36 @@ impl SoapySource {
         let secs = last.0.duration_since(first.0).as_secs_f64();
         let n: u64 = st.window.iter().skip(1).map(|(_, n)| n).sum();
         (secs > 0.0).then(|| n as f64 / secs)
+    }
+
+    /// Refuse a gain the device cannot take: `None` without automatic gain, a
+    /// value outside the range, any gain on a device without a gain range.
+    fn check_gain(&self, db: Option<f64>) -> Result<(), PortError> {
+        let Some(g) = self.status.lock().unwrap().gain else {
+            return Err(PortError::Unsupported(
+                "source has no adjustable gain".into(),
+            ));
+        };
+        match db {
+            None if !g.automatic_available => Err(PortError::Unsupported(format!(
+                "source {} has no automatic gain",
+                self.id.0
+            ))),
+            Some(d) if !(g.min_db..=g.max_db).contains(&d) => Err(PortError::Unsupported(format!(
+                "gain_db {d} out of range {}..={} dB for source {}",
+                g.min_db, g.max_db, self.id.0
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Port::set_gain`] on the device directly, for a source nothing streams
+    /// from yet (the driver's `gain=` at open): the same checks, texts and
+    /// device calls. Once the source is shared, use [`Port::set_gain`], which
+    /// orders the change with retunes.
+    pub fn set_gain_now(&self, db: Option<f64>) -> Result<GainInfo, PortError> {
+        self.check_gain(db)?;
+        apply_gain(self.dev.as_ref(), &self.status, db).map_err(PortError::Io)
     }
 
     fn fail(&self, msg: String) -> PortError {
@@ -443,6 +554,39 @@ impl Port for SoapySource {
     fn fault(&self) -> Option<String> {
         self.status.lock().unwrap().fault.clone()
     }
+
+    fn gain(&self) -> Option<GainInfo> {
+        self.status.lock().unwrap().gain
+    }
+
+    /// Checked against the range read at open (refusals are `Unsupported` with
+    /// the op's texts), then applied by the live, unfaulted reader between
+    /// reads, after any retune queued before it; on the device directly when no
+    /// reader runs. A failed device call is `Io` and does not fault the port.
+    async fn set_gain(&self, db: Option<f64>) -> Result<GainInfo, PortError> {
+        self.check_gain(db)?;
+        let _gate = self.gate.lock().await;
+        let ack = {
+            let reader = self.reader.lock().unwrap();
+            let live = reader.as_ref().filter(|r| r.alive());
+            match live {
+                Some(r) if self.status.lock().unwrap().fault.is_none() => {
+                    let (ack, done) = oneshot::channel();
+                    r.cmds.send(Cmd::Gain { db, ack }).ok().map(|()| done)
+                }
+                _ => None,
+            }
+        };
+        if let Some(done) = ack {
+            match tokio::time::timeout(self.retune_timeout, done).await {
+                Ok(Ok(r)) => return r.map_err(PortError::Io),
+                // The reader ended before applying it: the device is free.
+                Ok(Err(_)) => {}
+                Err(_) => return Err(PortError::Io("soapy set_gain timed out".into())),
+            }
+        }
+        apply_gain(self.dev.as_ref(), &self.status, db).map_err(PortError::Io)
+    }
 }
 
 /// What the reader thread shares with the source.
@@ -552,8 +696,13 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
             break;
         }
         if let Ok(cmd) = ctx.cmds.try_recv() {
-            // A new command kind makes this a `match`.
-            let Cmd::Retune(cmd) = cmd;
+            let cmd = match cmd {
+                Cmd::Retune(cmd) => cmd,
+                Cmd::Gain { db, ack } => {
+                    let _ = ack.send(apply_gain(ctx.dev.as_ref(), &ctx.status, db));
+                    continue;
+                }
+            };
             match apply(&ctx, rx.as_mut(), &cmd, picked, rate) {
                 Ok(got) => {
                     let actual = got.actual;

@@ -16,7 +16,7 @@ use crate::job::JobRecord;
 use crate::knowledge::{Allocation, Signature};
 use crate::lease::LeaseError;
 use crate::node::{AfterGate, Node, NodeError};
-use crate::port::{Port, PortError, Tuning};
+use crate::port::{GainInfo, Port, PortError, Tuning};
 use crate::ring::RingError;
 use crate::stream::{Frame, Payload, StreamInfo};
 use crate::types::{
@@ -36,8 +36,10 @@ pub enum Op {
     /// rigid lease holders' job ids), `elastic` (the jobs following the
     /// capture, see `job_start`), `pin` (the band `source_pin` holds the source
     /// at, `null` for none), `fault`, the source's unrecoverable failure (`null` when
-    /// healthy), and `bank`, the channel bank shared by the capture's channels
-    /// (`bin_hz`, `consumers`; `null` for none). Jobs on a faulted source fail with
+    /// healthy), `bank`, the channel bank shared by the capture's channels
+    /// (`bin_hz`, `consumers`; `null` for none), and `gain`, the overall receive
+    /// gain (`db`, `null` while automatic; `min_db`, `max_db`, `automatic`,
+    /// `automatic_available`; `null` for a source without adjustable gain). Jobs on a faulted source fail with
     /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,
     /// `job_start`) clears it. A channelised job's `job_context` holds `channel.path`:
     /// `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
@@ -75,6 +77,17 @@ pub enum Op {
     /// Release the source's pin (see `source_pin`).
     SourceUnpin {
         source: SourceId,
+    },
+    /// Set the source's overall receive gain live; the result is the gain after
+    /// the change (`source_list` shows it as `gain`). Persisted in the state
+    /// directory and re-applied when the node opens.
+    SourceSetGain {
+        source: SourceId,
+        /// The gain in dB, within `source_list`'s `gain.min_db..=max_db`; `null`
+        /// turns the driver's automatic gain on (where `gain.automatic_available`).
+        #[serde(deserialize_with = "crate::port::nullable_f64")]
+        #[schemars(required, schema_with = "nullable_gain_db")]
+        gain_db: Option<f64>,
     },
     JobStart {
         kind: JobKind,
@@ -219,6 +232,14 @@ fn nullable_string_value<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<String>, D::Error> {
     <Option<String> as Deserialize>::deserialize(d)
+}
+
+/// Schema of `source_set_gain`'s `gain_db`: `["number","null"]`.
+fn nullable_gain_db(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["number", "null"],
+        "description": "The gain in dB, within `source_list`'s `gain.min_db..=max_db`; `null` turns the driver's automatic gain on (where `gain.automatic_available`)."
+    })
 }
 
 /// Schema of `job_attach`'s `language`: `["string","null"]`.
@@ -904,6 +925,10 @@ pub struct SourceInfo {
     /// keeps none (a narrow capture, or no bank factory).
     #[schemars(required, schema_with = "crate::types::nullable::<BankInfo>")]
     pub bank: Option<BankInfo>,
+    /// The overall receive gain (`source_set_gain`); `null` for a source without
+    /// adjustable gain (a recording, a KiwiSDR, another node, a VRT stream).
+    #[schemars(required, schema_with = "crate::types::nullable::<GainInfo>")]
+    pub gain: Option<GainInfo>,
 }
 
 /// A source's channel bank: its bin spacing and live subscribers.
@@ -1008,6 +1033,8 @@ pub enum OpResult {
         signatures: Vec<Signature>,
     },
     Labels(Vec<Label>),
+    /// A source's gain after `source_set_gain`.
+    Gain(GainInfo),
     Ok,
     Schema(serde_json::Value),
 }
@@ -1020,6 +1047,7 @@ impl Op {
             Op::SourceEnsure { .. } => "source_ensure",
             Op::SourcePin { .. } => "source_pin",
             Op::SourceUnpin { .. } => "source_unpin",
+            Op::SourceSetGain { .. } => "source_set_gain",
             Op::JobStart { .. } => "job_start",
             Op::JobAttach { .. } => "job_attach",
             Op::JobList {} => "job_list",
@@ -1094,6 +1122,7 @@ impl OpResult {
             OpResult::Graph(_) => "graph",
             OpResult::Knowledge { .. } => "knowledge",
             OpResult::Labels(_) => "labels",
+            OpResult::Gain(_) => "gain",
             OpResult::Ok => "ok",
             OpResult::Schema(_) => "schema",
         }
@@ -1528,6 +1557,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                         bin_hz: b.bin_hz(),
                         consumers: b.consumers(),
                     }),
+                    gain: node.port(&id).and_then(|p| p.gain()),
                     id,
                     capabilities,
                 })
@@ -1591,6 +1621,15 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             node.source_unpin(&source)
                 .await
                 .map(|()| OpResult::Ok)
+                .map_err(|e| node_error(node, e))
+        }
+        Op::SourceSetGain { source, gain_db } => {
+            if node.port(&source).is_none() {
+                return Err(unknown_source(node, &source));
+            }
+            node.source_set_gain(&source, gain_db)
+                .await
+                .map(OpResult::Gain)
                 .map_err(|e| node_error(node, e))
         }
         Op::JobStart {

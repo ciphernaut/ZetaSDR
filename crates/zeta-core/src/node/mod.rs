@@ -22,7 +22,7 @@ use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
 use crate::ops::{JobKind, Op, OpError, OpResult};
-use crate::port::{Port, Tuning};
+use crate::port::{GainInfo, Port, PortError, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Backend, StageRegistry};
 use crate::stream::{Frame, Payload, StreamBus};
@@ -421,6 +421,16 @@ fn resume_capture(
     elastic.into_iter().find(|t| contains(t))
 }
 
+/// A port's refusal of a gain as the node reports it: an `Unsupported` text
+/// verbatim (it names the source and the range), an I/O failure as `Io`.
+fn gain_error(e: PortError) -> NodeError {
+    match e {
+        PortError::Unsupported(m) => NodeError::Other(m),
+        PortError::Io(m) => NodeError::Io(m),
+        e => NodeError::Other(e.to_string()),
+    }
+}
+
 /// Dropping the node cancels its tasks without touching persisted state, so
 /// `Running` jobs resume on the next `open`.
 pub struct Node {
@@ -527,8 +537,10 @@ impl Node {
         for port in ports {
             node.add_port(port)?;
         }
-        // Pins first: each pinned source is held at its band before any record
-        // resumes, so the records fit inside it or conflict as they would live.
+        // Gains before anything tunes, then pins: each pinned source is held at
+        // its band before any record resumes, so the records fit inside it or
+        // conflict as they would live.
+        node.restore_gains().await;
         node.restore_pins().await;
         let restoring = match resume {
             true => node.resume_captures(&records).await,
@@ -583,6 +595,30 @@ impl Node {
             Inner::prune_history(&mut jobs, &node.inner.jobs_dir);
         }
         Ok(node)
+    }
+
+    /// Set each attached source whose record has a gain to it (see
+    /// [`Node::source_set_gain`]); a refusal is an entry `source <id>: gain:
+    /// <reason>` in `load_errors`, the record left on disk as it was.
+    async fn restore_gains(&mut self) {
+        let mut gains: Vec<(SourceId, Option<f64>)> = self
+            .inner
+            .sources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, r)| r.gain.as_ref().map(|g| (id.clone(), g.db)))
+            .collect();
+        gains.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        for (id, db) in gains {
+            let Some(port) = self.port(&id) else {
+                continue;
+            };
+            if let Err(e) = port.set_gain(db).await {
+                self.load_errors
+                    .push(format!("source {}: gain: {}", id.0, gain_error(e)));
+            }
+        }
     }
 
     /// Lease each attached source whose record has a pin at that band (see
@@ -1235,6 +1271,23 @@ impl Node {
         let written = self.set_source_record(source, |r| r.pin = None);
         self.idle_if_unheld(port.as_ref()).await;
         written
+    }
+
+    /// Set `source`'s overall receive gain (`None`: automatic gain) through
+    /// [`Port::set_gain`] and persist it in `sources/<id>.json`, to be re-applied
+    /// when the node opens. A refusal is `Other` with the port's text; a write
+    /// that fails is `Io`, the gain applied all the same.
+    pub async fn source_set_gain(
+        &self,
+        source: &SourceId,
+        db: Option<f64>,
+    ) -> Result<GainInfo, NodeError> {
+        let port = self
+            .port(source)
+            .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
+        let got = port.set_gain(db).await.map_err(gain_error)?;
+        self.set_source_record(source, |r| r.gain = Some(GainSetting { db }))?;
+        Ok(got)
     }
 
     /// The band `source` is pinned at, if it is.

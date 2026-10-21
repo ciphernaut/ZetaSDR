@@ -18,6 +18,32 @@ pub struct Tuning {
     pub bandwidth_hz: Hz,
 }
 
+/// A source's overall receive gain: `db` in decibels (`null` while automatic
+/// gain is on), the range a value may take, and whether automatic gain is on and
+/// available at all.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct GainInfo {
+    /// The gain in dB; `null` while automatic gain is on.
+    #[serde(deserialize_with = "nullable_f64")]
+    #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
+    pub db: Option<f64>,
+    pub min_db: f64,
+    pub max_db: f64,
+    /// Whether the driver's automatic gain is on.
+    pub automatic: bool,
+    /// Whether the device has automatic gain (`gain_db: null` is accepted).
+    pub automatic_available: bool,
+}
+
+/// Deserialize a required `Option<f64>`: present, a number or `null`.
+pub(crate) fn nullable_f64<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<f64>, D::Error> {
+    <Option<f64> as Deserialize>::deserialize(d)
+}
+
 /// A block of complex baseband samples.
 #[derive(Clone, Debug)]
 pub struct IqBlock {
@@ -85,4 +111,18 @@ pub trait Port: Send + Sync {
     /// port may stop upstream work and clear `current`. The next `tune` must
     /// work as from scratch. Must not block for long: the gate is held.
     async fn idle(&self) {}
+    /// The overall receive gain, if the source has an adjustable one.
+    fn gain(&self) -> Option<GainInfo> {
+        None
+    }
+    /// Set the overall receive gain to `db` dB, or turn the driver's automatic
+    /// gain on with `None`; the result is the gain after the change. A refusal
+    /// (no adjustable gain, no automatic gain, a value out of range) is
+    /// `Unsupported` with the text the caller sees.
+    async fn set_gain(&self, db: Option<f64>) -> Result<GainInfo, PortError> {
+        let _ = db;
+        Err(PortError::Unsupported(
+            "source has no adjustable gain".into(),
+        ))
+    }
 }

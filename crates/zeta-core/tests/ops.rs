@@ -477,7 +477,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 17, "one schema per Op variant");
+    assert_eq!(vs.len(), 18, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -591,6 +591,7 @@ fn unit_typed(s: &Value, defs: &Value) -> bool {
 struct UnitsSeen {
     hz: usize,
     ns: usize,
+    db: usize,
 }
 
 fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
@@ -627,8 +628,18 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                     if ["_hz", "_ns", "_baud"].iter().any(|u| name.ends_with(u)) {
                         assert!(unit_typed(s, defs), "{path}.{name} is not a unit type: {s}");
                     }
+                    // `_db` (and a gain's own `db`) is decibels: a number, maybe null.
+                    let db = name == "db" || name.ends_with("_db");
+                    if db {
+                        let number = s["type"] == "number"
+                            || s["type"]
+                                .as_array()
+                                .is_some_and(|a| a.contains(&Value::from("number")));
+                        assert!(number, "{path}.{name} is not a number: {s}");
+                    }
                     seen.hz += name.ends_with("_hz") as usize;
                     seen.ns += name.ends_with("_ns") as usize;
+                    seen.db += db as usize;
                 }
             }
             for (k, c) in m {
@@ -653,6 +664,7 @@ fn unit_fields_carry_their_unit() {
     }
     assert!(seen.hz > 0, "no _hz field seen");
     assert!(seen.ns > 0, "no _ns field seen");
+    assert!(seen.db > 0, "no _db field seen");
 }
 
 struct TestProvider;
@@ -1825,6 +1837,80 @@ fn source_pin_and_unpin_schema_require_every_field_and_source_list_has_a_nullabl
     assert!(ty.contains(&Value::from("object")), "{si}");
 }
 
+/// `source_set_gain` requires `source` and `gain_db` (a number or `null`);
+/// `GainInfo`'s fields are all required, `db` nullable; `source_list` items carry
+/// a nullable `gain`.
+#[test]
+fn source_set_gain_schema_requires_every_field_and_gain_info_is_nullable_db() {
+    let s = schema();
+    let v = variants(&s["op"])
+        .iter()
+        .find(|v| v["properties"]["op"]["const"] == "source_set_gain")
+        .expect("source_set_gain variant")
+        .clone();
+    let mut req: Vec<&str> = v["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    req.sort();
+    assert_eq!(req, ["gain_db", "op", "source"]);
+    let ty = v["properties"]["gain_db"]["type"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{v}"));
+    assert!(ty.contains(&Value::from("number")), "{v}");
+    assert!(ty.contains(&Value::from("null")), "{v}");
+    let e = serde_json::from_value::<Op>(serde_json::json!({"op":"source_set_gain","source":"s"}))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("gain_db"), "{e}");
+    let op: Op = serde_json::from_value(
+        serde_json::json!({"op":"source_set_gain","source":"s","gain_db":null}),
+    )
+    .unwrap();
+    assert_eq!(
+        op,
+        Op::SourceSetGain {
+            source: SourceId("s".into()),
+            gain_db: None
+        }
+    );
+    let e = serde_json::from_value::<Op>(
+        serde_json::json!({"op":"source_set_gain","source":"s","gain_db":1,"db":1}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("db"), "{e}");
+
+    let gi = &s["result"]["$defs"]["GainInfo"];
+    let mut req: Vec<&str> = gi["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{gi}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    req.sort();
+    assert_eq!(
+        req,
+        ["automatic", "automatic_available", "db", "max_db", "min_db"]
+    );
+    assert_eq!(gi["additionalProperties"], Value::Bool(false), "{gi}");
+    let ty = gi["properties"]["db"]["type"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{gi}"));
+    assert!(ty.contains(&Value::from("null")), "{gi}");
+    let si = &s["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"].as_array().unwrap().contains(&"gain".into()),
+        "{si}"
+    );
+    let ty = si["properties"]["gain"]["type"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{si}"));
+    assert!(ty.contains(&Value::from("null")), "{si}");
+}
+
 /// Fields that serialize `null` say so in their schema: `"null"` is in the
 /// `type` of each.
 #[test]
@@ -1838,6 +1924,8 @@ fn nullable_fields_have_null_in_schema_type() {
         "/result/$defs/FrameSummary/properties/channel",
         "/result/$defs/SourceInfo/properties/current",
         "/result/$defs/SourceInfo/properties/pin",
+        "/result/$defs/SourceInfo/properties/gain",
+        "/result/$defs/GainInfo/properties/db",
         "/result/$defs/SourceInfo/properties/fault",
         "/error/oneOf/0/properties/suggested",
     ];

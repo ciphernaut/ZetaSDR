@@ -2008,3 +2008,54 @@ fn transcripts_tail_prints_the_last_lines_filtered_by_job() {
             "transcripts tail reads the state directory: not supported with --node",
         ));
 }
+
+/// `source gain` takes exactly one of `--db N` and `--auto` (a usage error, exit
+/// 1, otherwise); a file source has no adjustable gain (`other`, exit 2).
+#[test]
+fn source_gain_cli_requires_db_or_auto() {
+    let dir = tempfile::tempdir().unwrap();
+    zeta(dir.path(), &["source", "gain", "--source", "tone"])
+        .assert()
+        .code(1);
+    zeta(
+        dir.path(),
+        &["source", "gain", "--source", "tone", "--db", "20", "--auto"],
+    )
+    .assert()
+    .code(1);
+    let out = zeta(
+        dir.path(),
+        &["source", "gain", "--source", "tone", "--auto"],
+    )
+    .assert()
+    .code(2)
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("source has no adjustable gain"),
+        "{v}"
+    );
+    let out = zeta(
+        dir.path(),
+        &["source", "gain", "--source", "tone", "--db", "-5.5"],
+    )
+    .assert()
+    .code(2)
+    .get_output()
+    .stdout
+    .clone();
+    assert_eq!(json(&out)["message"], "source has no adjustable gain");
+    let out = zeta(dir.path(), &["source", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(json(&out)["value"][0]["gain"].is_null());
+}

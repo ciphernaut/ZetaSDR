@@ -607,3 +607,90 @@ async fn non_uhd_rates_keep_the_quantum() {
         ["set_sample_rate(2000000)", "set_sample_rate(2400000)"]
     );
 }
+
+/// A gain change and a retune issued back to back reach the device in order
+/// through the reader, and the ack carries the new gain.
+#[tokio::test]
+async fn gain_and_retune_keep_their_order_on_the_reader() {
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(samples(400)));
+    let src = source(&dev);
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    next_block(&mut rx).await;
+    let from = dev.calls().len();
+    let (gain, tuned) = tokio::join!(
+        src.set_gain(Some(30.0)),
+        src.tune(tuning(101_000_000, 12_500))
+    );
+    let gain = gain.unwrap();
+    tuned.unwrap();
+    assert_eq!(
+        dev.calls()[from..],
+        [
+            "set_gain_mode(false)",
+            "set_gain(30)",
+            "set_frequency(101000000)"
+        ]
+    );
+    assert_eq!(gain.db, Some(30.0));
+    assert!(!gain.automatic);
+    assert_eq!(src.gain().unwrap().db, Some(30.0));
+    // Automatic gain through the live reader too.
+    let auto = src.set_gain(None).await.unwrap();
+    assert_eq!((auto.db, auto.automatic), (None, true));
+    assert_eq!(dev.calls().last().unwrap(), "set_gain_mode(true)");
+    assert_eq!(src.gain(), Some(auto));
+}
+
+#[tokio::test]
+async fn gain_on_a_faulted_reader_goes_straight_to_the_device() {
+    let dev = Arc::new(
+        MockDevice::hackrf_like().with_reads(vec![MockRead::Fatal("LIBUSB_ERROR_IO".into())]),
+    );
+    let src = source(&dev);
+    let _rx = src.subscribe();
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    assert!(wait_until(1000, || src.fault().is_some()).await);
+    assert_deactivated(&dev).await;
+    let g = src.set_gain(Some(20.0)).await.unwrap();
+    assert_eq!(g.db, Some(20.0));
+    assert_eq!(dev.calls().last().unwrap(), "set_gain(20)");
+    assert_eq!(src.gain().unwrap().db, Some(20.0));
+}
+
+/// `gain=` in the device args is applied at open by the same call as the op's,
+/// and that call's refusals carry the op's texts.
+#[tokio::test]
+async fn the_gain_arg_at_open_uses_the_same_path() {
+    let (args, gain) = zeta_source_soapy::split_gain("driver=hackrf,gain=40").unwrap();
+    let dev = Arc::new(MockDevice::hackrf_like());
+    let src = SoapySource::with_device_args(SourceId("sdr0".into()), dev.clone(), &args).unwrap();
+    let opened = src.gain().unwrap();
+    assert_eq!(
+        (opened.min_db, opened.max_db, opened.automatic_available),
+        (0.0, 76.0, true)
+    );
+    let g = src.set_gain_now(gain).unwrap();
+    assert_eq!(dev.calls(), ["set_gain_mode(false)", "set_gain(40)"]);
+    assert_eq!(g.db, Some(40.0));
+    // The port's call takes the same path while nothing streams.
+    src.set_gain(Some(41.0)).await.unwrap();
+    assert_eq!(dev.calls()[2..], ["set_gain_mode(false)", "set_gain(41)"]);
+    let e = src.set_gain(Some(90.0)).await.unwrap_err();
+    assert!(
+        matches!(&e, PortError::Unsupported(m) if m == "gain_db 90 out of range 0..=76 dB for source sdr0"),
+        "{e}"
+    );
+    assert_eq!(dev.calls().len(), 4, "a refused gain touches nothing");
+
+    let dev = Arc::new(MockDevice::hackrf_like().with_gain_mode(false));
+    let src = source(&dev);
+    assert!(!src.gain().unwrap().automatic_available);
+    let e = src.set_gain(None).await.unwrap_err();
+    assert!(
+        matches!(&e, PortError::Unsupported(m) if m == "source sdr0 has no automatic gain"),
+        "{e}"
+    );
+    src.set_gain(Some(10.0)).await.unwrap();
+    assert_eq!(dev.calls(), ["set_gain(10)"]);
+}

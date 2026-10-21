@@ -4,7 +4,7 @@
 //! logic (reader thread, timestamps, faults) lives in `zeta-source-soapy` and
 //! is tested there against its mock. Only channel 0 of the receive direction
 //! is used. The receive gain is the driver's default unless the args carry
-//! `gain=DB` (see [`zeta_source_soapy::split_gain`]).
+//! `gain=DB` (see [`zeta_source_soapy::split_gain`]) or `source_set_gain` sets it.
 
 use std::collections::BTreeMap;
 
@@ -30,36 +30,34 @@ impl Driver {
             .map(|dev| Self { dev })
             .map_err(|e| format!("soapy open {args:?}: {e}"))
     }
-
-    /// Manual gain: automatic gain off (where the driver has it), then the
-    /// overall receive gain of channel 0 set to `db`.
-    fn set_rx_gain(&self, db: f64) -> Result<(), String> {
-        if self.dev.has_gain_mode(Direction::Rx, CH).unwrap_or(false) {
-            self.dev
-                .set_gain_mode(Direction::Rx, CH, false)
-                .map_err(s)?;
-        }
-        self.dev.set_gain(Direction::Rx, CH, db).map_err(s)
-    }
 }
 
 /// Open the device matching `args` as a [`SoapySource`]. A `gain=DB` key is
-/// zeta's own: it is removed before the driver sees the args, and once the device
-/// is open automatic gain is turned off and the overall receive gain set to it.
+/// zeta's own: it is removed before the driver sees the args, and once the source
+/// is open it is applied as `source_set_gain` applies a gain
+/// ([`SoapySource::set_gain_now`]: automatic gain off, the overall receive gain
+/// set to it, a value outside the device's range refused).
 pub fn open(id: SourceId, args: &str) -> Result<SoapySource, PortError> {
     let (args, gain) = zeta_source_soapy::split_gain(args).map_err(PortError::Io)?;
     let d = Driver::new(&args).map_err(PortError::Io)?;
+    let src = SoapySource::with_device_args(id.clone(), std::sync::Arc::new(d), &args)?;
     if let Some(db) = gain {
-        d.set_rx_gain(db)
-            .map_err(|e| PortError::Io(format!("soapy {}: gain={db}: {e}", id.0)))?;
-        let range = d
-            .dev
-            .gain_range(Direction::Rx, CH)
-            .map(|r| format!(" (range {} to {} dB)", r.minimum, r.maximum))
-            .unwrap_or_default();
-        eprintln!("zeta: gain for {}: {db} dB{range}", id.0);
+        let g = src.set_gain_now(Some(db)).map_err(|e| {
+            let e = match e {
+                PortError::Unsupported(m) | PortError::Io(m) => m,
+                e => e.to_string(),
+            };
+            PortError::Io(format!("soapy {}: gain={db}: {e}", id.0))
+        })?;
+        eprintln!(
+            "zeta: gain for {}: {} dB (range {} to {} dB)",
+            id.0,
+            g.db.unwrap_or(db),
+            g.min_db,
+            g.max_db
+        );
     }
-    SoapySource::with_device_args(id, std::sync::Arc::new(d), &args)
+    Ok(src)
 }
 
 /// Devices matching `filter` (`""` for all): the `SoapySDRUtil --find`
@@ -141,6 +139,29 @@ impl SoapyDevice for Driver {
     }
     fn sample_rate(&self) -> Result<f64, String> {
         self.dev.sample_rate(Direction::Rx, CH).map_err(s)
+    }
+    fn gain_range(&self) -> Result<(f64, f64), String> {
+        self.dev
+            .gain_range(Direction::Rx, CH)
+            .map(|r| (r.minimum, r.maximum))
+            .map_err(s)
+    }
+    fn gain(&self) -> Result<f64, String> {
+        self.dev.gain(Direction::Rx, CH).map_err(s)
+    }
+    fn set_gain(&self, db: f64) -> Result<(), String> {
+        self.dev.set_gain(Direction::Rx, CH, db).map_err(s)
+    }
+    fn has_gain_mode(&self) -> Result<bool, String> {
+        self.dev.has_gain_mode(Direction::Rx, CH).map_err(s)
+    }
+    fn gain_mode(&self) -> Result<bool, String> {
+        self.dev.gain_mode(Direction::Rx, CH).map_err(s)
+    }
+    fn set_gain_mode(&self, automatic: bool) -> Result<(), String> {
+        self.dev
+            .set_gain_mode(Direction::Rx, CH, automatic)
+            .map_err(s)
     }
     fn open_rx(&self, format: WireFormat) -> Result<Box<dyn SoapyRx>, String> {
         Ok(match format {

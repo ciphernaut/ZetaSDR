@@ -39,6 +39,18 @@ pub trait SoapyDevice: Send + Sync {
     fn set_sample_rate(&self, hz: f64) -> Result<(), String>;
     fn sample_rate(&self) -> Result<f64, String>;
     fn open_rx(&self, format: WireFormat) -> Result<Box<dyn SoapyRx>, String>;
+    /// The overall receive gain's range in dB, `(min, max)`.
+    fn gain_range(&self) -> Result<(f64, f64), String>;
+    /// The overall receive gain in dB.
+    fn gain(&self) -> Result<f64, String>;
+    /// Set the overall receive gain in dB.
+    fn set_gain(&self, db: f64) -> Result<(), String>;
+    /// Whether the driver has automatic gain.
+    fn has_gain_mode(&self) -> Result<bool, String>;
+    /// Whether automatic gain is on.
+    fn gain_mode(&self) -> Result<bool, String>;
+    /// Turn automatic gain on or off.
+    fn set_gain_mode(&self, automatic: bool) -> Result<(), String>;
 }
 
 pub trait SoapyRx: Send {

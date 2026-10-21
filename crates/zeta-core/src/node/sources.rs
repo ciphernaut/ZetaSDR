@@ -1,5 +1,5 @@
 //! Source records on disk: `<state_dir>/sources/<source id>.json`, what the node
-//! keeps about a source across restarts (its pin, later its gain). Written
+//! keeps about a source across restarts (its pin and its gain). Written
 //! atomically as job records are; a record for a source that is not attached is
 //! kept untouched (sources are not persisted, the flags may return).
 
@@ -29,8 +29,8 @@ pub struct SourceRecord {
     /// The band `source_pin` holds the source at; `None` when unpinned.
     #[serde(default)]
     pub pin: Option<Tuning>,
-    /// The receive gain the op set; `None` when never set (the flag or the
-    /// driver's default applies).
+    /// The receive gain `source_set_gain` set, re-applied when the node opens;
+    /// `None` when never set (the flag or the driver's default applies).
     #[serde(default)]
     pub gain: Option<GainSetting>,
 }
