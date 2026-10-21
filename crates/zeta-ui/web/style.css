@@ -241,6 +241,8 @@ input:focus { border-color: var(--accent); }
   color: var(--dim);
   font-size: 11px;
 }
+.job .tag.ch { color: var(--ok); }
+#waterfall .wf-axis .tick.ch { color: var(--ok); font-size: 10px; }
 /* A closed squelch: the channel is quiet, not dead. */
 .job .tag.squelch { font-style: italic; }
 /* A finished row (stopped, failed) is dimmed; its reason reads inline on a line of its own. */

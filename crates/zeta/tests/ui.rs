@@ -7,7 +7,8 @@
 //! (the `tone` recording relabelled at 250 MHz and tunable over 200-300 MHz: a tune moves its
 //! capture's centre) and `scanner` (the `tone` recording tunable over 50-150 MHz, the source
 //! the page's automatic scans pick for a view around `tone`: `retune` sorts first in
-//! `source_list` but its range does not contain 100 MHz); the node's state directory is passed
+//! `source_list` but its range does not contain 100 MHz) and `cb` (the `tone` recording
+//! relabelled at 476.9 MHz, channel 20 of the CB plan, last); the node's state directory is passed
 //! to ui.py in `ZETA_UI_STATE_DIR`. That node has a fake
 //! `voiced` (`--stt-socket`, zeta-speech's `FakeDaemon`) answering `ok:what sources are there`
 //! to every valid staged WAV; a second node without a speech daemon, with only the `speech`
@@ -250,6 +251,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
         "scanner={},tune_min_hz=50000000,tune_max_hz=150000000",
         zeta_source_file::fixtures::write_tone(dir.path()).display()
     );
+    // The tone recording labelled at 476.9 MHz, channel 20 of the node's CB plan.
+    let cb = format!("cb={}", tone_at(dir.path(), "cb", 476_900_000).display());
     let sock_dir = socket_dir();
     let sock = sock_dir.path().join("voiced.sock");
     let _voiced = fake_voiced(&sock);
@@ -270,6 +273,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
             &retune,
             "--source-file",
             &scanner,
+            "--source-file",
+            &cb,
         ],
         &["--stt-socket", sock],
         &[],

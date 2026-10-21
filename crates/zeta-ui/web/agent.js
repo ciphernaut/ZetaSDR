@@ -64,6 +64,8 @@
 //       has `open: false`.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
+import { channelLabel } from "./plans.js";
+
 
 export const JOBS_POLL_MS = 2000;
 export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"];
@@ -326,7 +328,7 @@ export function setSquelchTag(row, event) {
   tag.title = `squelch closed: no audio (power ${db(event.power_db)}, floor ${db(event.floor_db)})`;
 }
 
-function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch }) {
+function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch, plan }) {
   const row = document.createElement("div");
   const attached = !!job.input;
   const finished = isFinished(job);
@@ -351,6 +353,16 @@ function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch }
       tag.textContent = "elastic";
       tag.title = "follows the capture; holds no lease";
       span.append(" ", tag);
+    }
+    if (cls === "kind" && plan && job.tuning) {
+      const ch = channelLabel(job.tuning.center_hz, plan());
+      if (ch) {
+        const tag = document.createElement("span");
+        tag.className = "tag ch";
+        tag.textContent = ch.text;
+        tag.title = ch.title;
+        span.append(" ", tag);
+      }
     }
     if (cls === "kind" && job.kind === "scan" && job.id === autoScanId()) {
       const tag = document.createElement("span");
@@ -458,7 +470,14 @@ export function startJobs(
   let last = null;
   // id -> performance.now() when this page first saw the job finished (-Infinity: cleared).
   const finishedAt = new Map();
-  const buttons = { onPlay, onTranscribe, onGraph, playing, squelch };
+  const buttons = {
+    onPlay,
+    onTranscribe,
+    onGraph,
+    playing,
+    squelch,
+    plan: view ? () => view.get("plan") : null,
+  };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;
     return Number.isFinite(s) && s > 0 ? s * 1000 : 0;
@@ -494,7 +513,7 @@ export function startJobs(
       redraw();
     });
     view.onChange((key) => {
-      if (key === "finished_rows_s") redraw();
+      if (key === "finished_rows_s" || key === "plan") redraw();
     });
   }
   const render = (jobs) => {

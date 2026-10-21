@@ -38,6 +38,8 @@
 //         object is kept in window.zetaLastSelection.
 //     wf.onColumn(cb)   cb(shiftCssPx) after each painted column: everything painted moved
 //         left by that many CSS px (overlays.js scrolls its ribbons with it).
+//     wf.plan       () -> the `plan` view policy (default auto); the axis marks the channels
+//         of plans.js in view, when at least 14 px apart; wf.drawAxis() redraws it.
 //     wf.onView(cb)     cb({lo, hi, outside}) after the band or the view changed (a zoom, a
 //         pan, a retune, a scan band widening): yForHz maps differently (overlays.js lays its
 //         items out again). lo..hi is the band shown (null before it is known); `outside` is
@@ -150,6 +152,10 @@
 // back/forward cache (`pageshow` with `persisted`) does the same and runs setSource again.
 
 import { errorText } from "./agent.js";
+import { channelsIn } from "./plans.js";
+
+// The least spacing, in pixels, of the channel ticks on the axis (fewer are not drawn).
+const CHANNEL_TICK_MIN_PX = 14;
 
 export const MAX_ROWS_PER_S = 30;
 export const RING_COLUMNS = 2048;
@@ -360,6 +366,7 @@ class Waterfall {
     this.selectCbs = [];
     this.columnCbs = [];
     this.viewCbs = [];
+    this.plan = () => "auto"; // the view's `plan` policy (app.js sets it)
     this.gen = 0;
     this.sub = null;
     this.src = null; // the source record being shown
@@ -912,6 +919,24 @@ class Waterfall {
       t.style.top = `${(i / (AXIS_TICKS - 1)) * h}px`;
       t.dataset.edge = i === 0 ? "top" : i === AXIS_TICKS - 1 ? "bottom" : "";
       ticks.push(t);
+    }
+    // Channel ticks (plans.js, the `plan` policy via wf.plan) when they are far enough apart.
+    const chans = channelsIn(s.lo, s.hi, this.plan());
+    const span = s.hi - s.lo;
+    const minGap = chans.reduce(
+      (m, c, i) => (i ? Math.min(m, ((c.center_hz - chans[i - 1].center_hz) / span) * h) : m),
+      Infinity,
+    );
+    if (chans.length && minGap >= CHANNEL_TICK_MIN_PX) {
+      for (const c of chans) {
+        const t = document.createElement("span");
+        t.className = "tick ch";
+        t.textContent = String(c.number);
+        t.style.top = `${((s.hi - c.center_hz) / span) * h}px`;
+        t.style.right = "auto";
+        t.style.left = "2px";
+        ticks.push(t);
+      }
     }
     this.axis.replaceChildren(...ticks);
   }

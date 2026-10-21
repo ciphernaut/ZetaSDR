@@ -11,6 +11,7 @@
 //         auto_scan_stop   inside | keep (default inside)
 //         finished_rows_s  a non-negative integer of seconds, 0 = never shown (default 60)
 //         scanner          auto | a source id (default auto)
+//         plan             auto | none | a loaded channel plan id (default auto; plans.js)
 //   VIEW_KEY   the sessionStorage key holding the values set ({key: value}, defaults left out)
 //   mountView() -> View
 //     view.get(key)             the value (the default when not set)
@@ -26,6 +27,8 @@
 //       The transcript line for `view <words…>`: `set <key> <value>` → `<key> = <value>`,
 //       `show`, `reset` → `view policies reset`, `clear` → `finished rows cleared`;
 //       anything else an error naming the commands.
+
+import { planIds } from "./plans.js";
 
 export const VIEW_KEY = "zeta.view";
 
@@ -51,6 +54,14 @@ export const POLICIES = [
     parse: (t) => (SOURCE_ID.test(t) ? t : undefined),
     default_: "auto",
     describe: "auto, a source id",
+  },
+  {
+    key: "plan",
+    parse: (t) => (t === "auto" || t === "none" || planIds().includes(t) ? t : undefined),
+    default_: "auto",
+    get describe() {
+      return ["auto", "none", ...planIds()].join(", ");
+    },
   },
 ];
 

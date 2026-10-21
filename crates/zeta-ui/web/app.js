@@ -82,6 +82,7 @@ import { playJob } from "./audio.js";
 import { closeGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
 import { mountView, runViewCommand } from "./view.js";
+import { loadPlans } from "./plans.js";
 import { mountCoarse } from "./coarse.js";
 
 export const NARROW_MAX_PX = 700;
@@ -572,19 +573,32 @@ function start(api) {
   api.onBusy = (message) =>
     state.transcript?.note(`stream refused: ${message} (node out of stream slots)`, true);
   state.view = mountView();
+  // The channel plans load once; the rows, outlines and axis are drawn again when they are in.
+  loadPlans(api).then(() => {
+    if (state.api !== api) return;
+    redrawPlan();
+    state.jobs?.redraw();
+  });
   state.ops = startOpsFeed(api, state.transcript, {
     onConflict: (p) => offerReplace(p.op, p.error),
   });
   state.wf = mountWaterfall($("#waterfall"), api);
   state.wf.onNotice = (text) => state.transcript?.note(text, true);
   state.wf.follow = () => state.view.get("follow");
+  state.wf.plan = () => state.view.get("plan");
   state.coarse = mountCoarse(state.wf, api, state.view, {
     transcript: state.transcript,
     sources: () => state.sources,
     jobs: () => state.lastJobs,
   });
   state.coarse.onRow((msg) => state.wf?.addCoarseEvent(msg));
-  state.ov = mountOverlays($("#waterfall"), state.wf, api, { jobsEl: $("#jobs") });
+  state.ov = mountOverlays($("#waterfall"), state.wf, api, {
+    jobsEl: $("#jobs"),
+    plan: () => state.view.get("plan"),
+  });
+  state.view.onChange((key) => {
+    if (key === "plan") redrawPlan();
+  });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
     applyOp,
@@ -617,6 +631,13 @@ function start(api) {
     submitCommand();
   });
   loadSources();
+}
+
+// The channel names drawn again: the outlines and the axis (the job rows redraw themselves
+// on the view's change).
+function redrawPlan() {
+  if (state.ov) state.ov.syncOutlines(state.ov.lastJobs, shown());
+  if (state.wf) state.wf.drawAxis();
 }
 
 // The shown source's last `source_list` record (null when unknown).

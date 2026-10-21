@@ -3,10 +3,12 @@
 // squelch tags.
 //
 // Exports:
-//   mountOverlays(el, wf, api, {jobsEl}) -> Overlays
+//   mountOverlays(el, wf, api, {jobsEl, plan}) -> Overlays
 //       Adds a pointer-transparent layer over the waterfall canvas inside `el` (the
 //       #waterfall element `wf` was mounted in). `jobsEl` (default #jobs) holds the job rows
-//       agent.js renders; their `.events` cell carries the counters.
+//       agent.js renders; their `.events` cell carries the counters. `plan` (default `auto`)
+//       returns the view's `plan` policy: an outline on a plan channel reads `ch20 fm_demod`
+//       (plans.js); `ov.syncOutlines` is called again when the policy changes.
 //   Overlays:
 //     ov.syncOutlines(jobs, source)  the outline half of ov.sync alone (app.js calls it after
 //                            each `source_list` poll, so a pin shows without waiting for jobs)
@@ -89,6 +91,7 @@
 //     ov.destroy()
 
 import { SQUELCH_KINDS, setSquelchTag } from "./agent.js";
+import { channelLabel } from "./plans.js";
 
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
@@ -164,7 +167,14 @@ function tuningCentre(job) {
 }
 
 class Overlays {
-  constructor(el, wf, api, { jobsEl = document.getElementById("jobs") } = {}) {
+  constructor(
+    el,
+    wf,
+    api,
+    { jobsEl = document.getElementById("jobs"), plan = () => "auto" } = {},
+  ) {
+    this.plan = plan;
+    this.lastJobs = [];
     this.wf = wf;
     this.api = api;
     this.jobsEl = jobsEl;
@@ -255,6 +265,7 @@ class Overlays {
   syncOutlines(jobs, source) {
     if (this.destroyed) return;
     if (source !== undefined) this.sourceRec = source;
+    this.lastJobs = jobs;
     const rec = this.sourceRec && this.sourceRec.id === this.sourceId ? this.sourceRec : null;
     const pin = rec && rec.pin && typeof rec.pin.center_hz === "number" ? rec.pin : null;
     const rigid = jobs.filter((j) => j.source === this.sourceId && isRunning(j) && rigidBand(j));
@@ -265,7 +276,8 @@ class Overlays {
     }
     for (const j of rigid) {
       const { center_hz: c, bandwidth_hz: bw } = j.tuning;
-      this.outline(c - bw / 2, c + bw / 2, j.kind, j.id);
+      const ch = channelLabel(c, this.plan());
+      this.outline(c - bw / 2, c + bw / 2, ch ? `${ch.text} ${j.kind}` : j.kind, j.id);
     }
     if (pin) {
       const { center_hz: c, bandwidth_hz: bw } = pin;

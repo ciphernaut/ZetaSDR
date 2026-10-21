@@ -115,7 +115,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (7 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (8 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -197,7 +197,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (7 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (8 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -222,7 +222,7 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner"):
+    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -516,7 +516,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (7 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (8 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -1021,9 +1021,9 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, "follow = free")).to_have_text("follow = free")
     shown = view_show(page)
     for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
-                 "finished_rows_s 60", "scanner auto"):
+                 "finished_rows_s 60", "scanner auto", "plan auto"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 4, f"view show: {shown!r}"
+    assert shown.count("\n") == 5, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -1032,7 +1032,7 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, '"-1"', error=True)).to_be_visible()
     run_cmd(page, "view set nosuch 1")
     expect(view_line(page, "nosuch", error=True)).to_contain_text(
-        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner")
+        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner, plan")
     run_cmd(page, "view reset")
     expect(view_line(page, "view policies reset")).to_be_visible()
     shown = view_show(page)
@@ -2324,6 +2324,37 @@ def scenario_mic_without_daemon_shows_message(page, url, secret):
     assert not asks, f"/ask requested without a transcript: {asks}"
     record_and_stop(page, 300)
     expect(page.locator("#mic-status")).to_have_text("no speech daemon on this node")
+
+
+# ---- channel plans (plan 13 Task 4) ---------------------------------------------------------
+# `cb` is the tone recording labelled at 476.9 MHz, channel 20 of uhf_cb_au.
+
+def scenario_channel_plan_labels(page, url, secret):
+    select_source(page, url, secret, "cb")
+    job = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+    try:
+        row = job_row(page, job)
+        expect(row.locator(".tag.ch")).to_have_text("ch20", timeout=3_000)
+        label = page.locator(f'#waterfall .outline[data-key="{job}"] .outline-label')
+        expect(label).to_contain_text("ch20 fm_demod")
+        set_band(page, 476_900_000, 40_000)
+        ticks = page.locator("#waterfall .wf-axis .tick.ch")
+        expect(ticks.first).to_be_visible()
+        texts = ticks.all_text_contents()
+        for n in ("20", "59", "60"):
+            assert n in texts, f"channel {n} not on the axis: {texts}"
+        run_cmd(page, "view set plan none")
+        expect(view_line(page, "plan = none")).to_be_visible()
+        expect(job_row(page, job).locator(".tag.ch")).to_have_count(0)
+        expect(ticks).to_have_count(0)
+        expect(label).to_have_text("fm_demod")
+        run_cmd(page, "view set plan bogus")
+        expect(view_line(page, "auto, none, uhf_cb_au", error=True)).to_be_visible()
+        run_cmd(page, "view reset")
+        expect(job_row(page, job).locator(".tag.ch")).to_have_text("ch20")
+        expect(label).to_contain_text("ch20 fm_demod")
+    finally:
+        stop_job(url, secret, job)
 
 
 # ---- runner ----------------------------------------------------------------------------
