@@ -126,8 +126,59 @@ pub fn capabilities(dev: &dyn SoapyDevice, rates: &[RangeHz]) -> Result<Capabili
     })
 }
 
-/// Smallest supported rate that is at least `bandwidth_hz`.
-pub fn pick_rate(ranges: &[RangeHz], bandwidth_hz: u64) -> Option<u64> {
+/// Deepest decimation of a UHD ladder.
+const UHD_MAX_DECIMATION: u64 = 512;
+
+/// The rates a source asks its device for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RateModel {
+    /// The device's reported ranges: discrete rates, stepped ranges, or a
+    /// continuous range on the 100 kHz quantum.
+    Ranges(Vec<RangeHz>),
+    /// A UHD device divides its master clock `mcr_hz` by an integer: the
+    /// exact divisors `rungs` (ascending), each an integer number of hertz.
+    Ladder { mcr_hz: u64, rungs: Vec<u64> },
+}
+
+/// The UHD ladder from the probed `rates` (see [`probe_rate_ranges`]): with
+/// `mcr` the range's maximum (the master clock) and `min` its smallest
+/// minimum, every `mcr / N` for `N` in `1..=min(512, mcr / min)` that divides
+/// `mcr` exactly. Odd `N` is allowed. 61.44 MHz = 2^15 * 3 * 5^4, so every
+/// B210 rung reduces against 48 kHz to a factor of at most 1 280.
+pub fn uhd_ladder(rates: &[RangeHz]) -> RateModel {
+    let mcr = max_rate(rates).round().max(0.0) as u64;
+    let min = rates
+        .iter()
+        .map(|r| r.min_hz)
+        .fold(f64::INFINITY, f64::min)
+        .round()
+        .max(1.0) as u64;
+    let deepest = UHD_MAX_DECIMATION.min(mcr / min);
+    let mut rungs: Vec<u64> = (1..=deepest)
+        .filter(|n| mcr.is_multiple_of(*n))
+        .map(|n| mcr / n)
+        .collect();
+    rungs.reverse();
+    RateModel::Ladder { mcr_hz: mcr, rungs }
+}
+
+/// Smallest supported rate that is at least `bandwidth_hz`: on a ladder the
+/// smallest rung (`None` above the clock); otherwise as the ranges allow.
+pub fn pick_rate(model: &RateModel, bandwidth_hz: u64) -> Option<u64> {
+    match model {
+        RateModel::Ranges(ranges) => pick_range_rate(ranges, bandwidth_hz),
+        RateModel::Ladder { rungs, .. } => rungs.iter().copied().find(|&r| r >= bandwidth_hz),
+    }
+}
+
+/// The smallest rate strictly above `actual_hz`: the next rung, or the next
+/// supported rate of the ranges (on a continuous range the next 100 kHz
+/// quantum). Asked once when a device gives less than the band.
+pub fn next_rate_above(model: &RateModel, actual_hz: u64) -> Option<u64> {
+    pick_rate(model, actual_hz.checked_add(1)?)
+}
+
+fn pick_range_rate(ranges: &[RangeHz], bandwidth_hz: u64) -> Option<u64> {
     let bw = bandwidth_hz as f64;
     ranges
         .iter()
@@ -187,26 +238,138 @@ mod tests {
         }
     }
 
+    fn ladder() -> RateModel {
+        uhd_ladder(&[RangeHz {
+            min_hz: 120_000.0,
+            max_hz: 61_440_000.0,
+            step_hz: 0.0,
+        }])
+    }
+
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+
+    #[test]
+    fn uhd_ladder_picks_exact_divisors_of_the_master_clock() {
+        let m = ladder();
+        for (bw, want) in [
+            (12_500, Some(120_000)),
+            (200_000, Some(204_800)),
+            (1_000_000, Some(1_024_000)),
+            (2_400_000, Some(2_457_600)),
+            (4_000_000, Some(4_096_000)),
+            (10_240_000, Some(10_240_000)),
+            (16_000_000, Some(20_480_000)),
+            (61_440_000, Some(61_440_000)),
+            (61_440_001, None),
+        ] {
+            assert_eq!(pick_rate(&m, bw), want, "{bw}");
+        }
+        let RateModel::Ladder { mcr_hz, rungs } = &m else {
+            panic!("expected a ladder")
+        };
+        assert_eq!(*mcr_hz, 61_440_000);
+        assert_eq!(rungs.first(), Some(&120_000));
+        assert_eq!(rungs.last(), Some(&61_440_000));
+        assert!(rungs.windows(2).all(|w| w[0] < w[1]), "ascending");
+        for &r in rungs {
+            assert!(mcr_hz.is_multiple_of(r), "{r} divides the clock");
+            let g = gcd(r, 48_000);
+            assert!((r / g).max(48_000 / g) <= 1_280, "{r}");
+        }
+    }
+
+    #[test]
+    fn the_mock_reproduces_the_live_rates() {
+        let dev = MockDevice::hackrf_like()
+            .with_driver("b200")
+            .with_uhd_decimation(61.44e6);
+        let rate = |hz: f64| {
+            dev.set_sample_rate(hz).unwrap();
+            dev.sample_rate().unwrap().round() as u64
+        };
+        assert_eq!(rate(400_000.0), 398_961);
+        assert_eq!(rate(1_040_000.0), 1_041_356);
+        // The live 260 339 Hz was a channel rate (`channel_rate_hz`), not the device's.
+        assert_eq!(1_041_356 / 4, 260_339);
+        assert_eq!(rate(4_000_000.0), 4_096_000);
+        let rates = dev.sample_rate_ranges().unwrap();
+        assert_eq!(
+            rates,
+            [RangeHz {
+                min_hz: 120_000.0,
+                max_hz: 61.44e6,
+                step_hz: 0.0
+            }]
+        );
+    }
+
+    #[test]
+    fn next_rate_above_steps_one_rung_or_quantum() {
+        assert_eq!(next_rate_above(&ladder(), 398_961), Some(409_600));
+        // N 150 -> 128: no N in 129..150 divides 2^15 * 3 * 5^4.
+        assert_eq!(next_rate_above(&ladder(), 409_600), Some(480_000));
+        assert_eq!(next_rate_above(&ladder(), 61_440_000), None);
+        let ranges = RateModel::Ranges(vec![RangeHz {
+            min_hz: 1e6,
+            max_hz: 20e6,
+            step_hz: 0.0,
+        }]);
+        assert_eq!(
+            next_rate_above(
+                &RateModel::Ranges(vec![RangeHz {
+                    min_hz: 100e3,
+                    max_hz: 20e6,
+                    step_hz: 0.0,
+                }]),
+                398_961
+            ),
+            Some(400_000)
+        );
+        assert_eq!(next_rate_above(&ranges, 398_961), Some(1_000_000));
+        assert_eq!(next_rate_above(&ranges, 1_000_000), Some(1_100_000));
+        assert_eq!(next_rate_above(&ranges, 20_000_000), None);
+    }
+
     #[test]
     fn pick_rate_table() {
         let disc = [d(250e3), d(1.024e6), d(2.048e6), d(2.4e6)];
-        assert_eq!(pick_rate(&disc, 1_500_000), Some(2_048_000));
-        assert_eq!(pick_rate(&disc, 3_000_000), None);
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(disc.to_vec()), 1_500_000),
+            Some(2_048_000)
+        );
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(disc.to_vec()), 3_000_000),
+            None
+        );
         let c = [RangeHz {
             min_hz: 1e6,
             max_hz: 20e6,
             step_hz: 0.0,
         }];
-        assert_eq!(pick_rate(&c, 12_500), Some(1_000_000));
-        assert_eq!(pick_rate(&c, 2_345_678), Some(2_400_000));
-        assert_eq!(pick_rate(&c, 19_950_000), Some(20_000_000));
-        assert_eq!(pick_rate(&c, 21_000_000), None);
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(c.to_vec()), 12_500),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(c.to_vec()), 2_345_678),
+            Some(2_400_000)
+        );
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(c.to_vec()), 19_950_000),
+            Some(20_000_000)
+        );
+        assert_eq!(pick_rate(&RateModel::Ranges(c.to_vec()), 21_000_000), None);
         let s = [RangeHz {
             min_hz: 1e6,
             max_hz: 1e7,
             step_hz: 5e5,
         }];
-        assert_eq!(pick_rate(&s, 1_200_000), Some(1_500_000));
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(s.to_vec()), 1_200_000),
+            Some(1_500_000)
+        );
     }
 
     #[test]
@@ -236,7 +399,10 @@ mod tests {
         let rates = probe_rate_ranges(&dev, is_uhd("", &dev.driver_key())).unwrap();
         let c = capabilities(&dev, &rates).unwrap();
         assert_eq!(c.max_bandwidth_hz, Claim::Asserted(Hz(61_440_000)));
-        assert_eq!(pick_rate(&rates, 30_000_000), Some(30_000_000));
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(rates.clone()), 30_000_000),
+            Some(30_000_000)
+        );
         // Probed 32 M, then 64 M (clipped to 61.44 M), then 122.88 M: no
         // growth, nor from the ceilings above 61.44 M.
         assert_eq!(dev.range_reads(), 6);
@@ -347,23 +513,44 @@ mod tests {
     #[test]
     fn pick_rate_edges() {
         let unsorted = [d(2.4e6), d(250e3), d(2.048e6)];
-        assert_eq!(pick_rate(&unsorted, 300_000), Some(2_048_000));
-        assert_eq!(pick_rate(&unsorted, 2_048_000), Some(2_048_000));
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(unsorted.to_vec()), 300_000),
+            Some(2_048_000)
+        );
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(unsorted.to_vec()), 2_048_000),
+            Some(2_048_000)
+        );
         let c = [RangeHz {
             min_hz: 1e6,
             max_hz: 20e6,
             step_hz: 0.0,
         }];
-        assert_eq!(pick_rate(&c, 500_000), Some(1_000_000));
-        assert_eq!(pick_rate(&c, 2_000_000), Some(2_000_000));
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(c.to_vec()), 500_000),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(c.to_vec()), 2_000_000),
+            Some(2_000_000)
+        );
         let s = [RangeHz {
             min_hz: 1e6,
             max_hz: 1e7,
             step_hz: 5e5,
         }];
-        assert_eq!(pick_rate(&s, 500_000), Some(1_000_000));
-        assert_eq!(pick_rate(&s, 1_500_000), Some(1_500_000));
-        assert_eq!(pick_rate(&s, 1_500_001), Some(2_000_000));
-        assert_eq!(pick_rate(&s, 10_000_001), None);
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(s.to_vec()), 500_000),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(s.to_vec()), 1_500_000),
+            Some(1_500_000)
+        );
+        assert_eq!(
+            pick_rate(&RateModel::Ranges(s.to_vec()), 1_500_001),
+            Some(2_000_000)
+        );
+        assert_eq!(pick_rate(&RateModel::Ranges(s.to_vec()), 10_000_001), None);
     }
 }

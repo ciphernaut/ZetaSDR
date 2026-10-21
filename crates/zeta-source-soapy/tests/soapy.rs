@@ -457,3 +457,125 @@ fn uhd_source_asserts_the_range_at_the_maximum_clock() {
     );
     assert_eq!(dev.range_reads(), 1, "a non-uhd device is probed once");
 }
+
+/// A B210 at its 61.44 MHz master clock: the device divides the clock by an
+/// integer, so only the ladder's rungs come back as asked.
+fn b210() -> MockDevice {
+    MockDevice::hackrf_like()
+        .with_driver("b200")
+        .with_uhd_decimation(61.44e6)
+}
+
+fn rate_calls(dev: &MockDevice, from: usize) -> Vec<String> {
+    dev.calls()[from..]
+        .iter()
+        .filter(|c| c.starts_with("set_sample_rate"))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn uhd_tune_asks_only_for_ladder_rates() {
+    let dev = Arc::new(b210().with_reads(samples(1)));
+    let src = source(&dev);
+    let mut rx = src.subscribe();
+    let probed = dev.calls().len();
+    let got = src.tune(tuning(100_000_000, 200_000)).await.unwrap();
+    assert_eq!(got, tuning(100_000_000, 204_800));
+    assert_eq!(src.current(), Some(got));
+    assert_eq!(rate_calls(&dev, probed), ["set_sample_rate(204800)"]);
+    assert_eq!(next_block(&mut rx).await.sample_rate_hz, Hz(204_800));
+}
+
+#[tokio::test]
+async fn actual_rate_below_the_band_retries_once_then_refuses() {
+    // 204 800 reads 184 320; the next rung above that is 192 000 (N 320),
+    // which reads 172 800.
+    let want = "soapy: device gives 172800 Hz for 192000 Hz, below the 200000 Hz band";
+    let dev = Arc::new(b210().with_rate_shortfall(0.1));
+    let src = source(&dev);
+    let probed = dev.calls().len();
+    let Err(PortError::Unsupported(m)) = src.tune(tuning(100_000_000, 200_000)).await else {
+        panic!("expected Unsupported")
+    };
+    assert_eq!(m, want);
+    assert_eq!(
+        rate_calls(&dev, probed),
+        ["set_sample_rate(204800)", "set_sample_rate(192000)"]
+    );
+    assert_eq!(src.current(), None);
+    assert_eq!(src.fault(), None, "a refused rate is not a device fault");
+
+    let (node, _dir) = node_with(src.clone()).await;
+    let mut op = passthrough();
+    if let Op::JobStart { bandwidth_hz, .. } = &mut op {
+        *bandwidth_hz = Hz(200_000);
+    }
+    let err = node.apply(op).await.expect_err("the job cannot start");
+    assert!(err.to_string().contains(want), "{err}");
+    assert_eq!(src.current(), None);
+}
+
+#[tokio::test]
+async fn a_refused_retune_keeps_the_capture_it_had() {
+    let mut reads = samples(1);
+    reads.extend([MockRead::Timeout, MockRead::Timeout]);
+    reads.extend(samples(2));
+    let dev = Arc::new(b210().with_reads(reads));
+    let src = source(&dev);
+    let mut rx = src.subscribe();
+    let was = src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    assert_eq!(was, tuning(100_000_000, 1_024_000));
+    next_block(&mut rx).await;
+    // The next two reads of the rate come back 10 % short: 2 457 600 reads
+    // 2 211 840, whose next rung up is 2 457 600 again (N 25).
+    dev.shortfall_next(0.1, 2);
+    let from = dev.calls().len();
+    let Err(PortError::Unsupported(m)) = src.tune(tuning(101_000_000, 2_400_000)).await else {
+        panic!("expected Unsupported")
+    };
+    assert_eq!(
+        m,
+        "soapy: device gives 2211840 Hz for 2457600 Hz, below the 2400000 Hz band"
+    );
+    assert_eq!(src.current(), Some(was));
+    assert_eq!(src.fault(), None);
+    assert_eq!(
+        dev.calls()[from..],
+        [
+            "deactivate",
+            "set_sample_rate(2457600)",
+            "set_sample_rate(2457600)",
+            "set_sample_rate(1024000)",
+            "activate"
+        ]
+    );
+    let b = next_block(&mut rx).await;
+    assert_eq!(
+        (b.sample_rate_hz, b.center_hz),
+        (Hz(1_024_000), Hz(100_000_000))
+    );
+}
+
+#[tokio::test]
+async fn non_uhd_rates_keep_the_quantum() {
+    // A HackRF's range starts at 2 MHz; its rates stay on the 100 kHz quantum.
+    let dev =
+        Arc::new(
+            MockDevice::hackrf_like().with_rates(vec![zeta_source_soapy::device::RangeHz {
+                min_hz: 2e6,
+                max_hz: 20e6,
+                step_hz: 0.0,
+            }]),
+        );
+    let src = source(&dev);
+    let _rx = src.subscribe();
+    let got = src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    assert_eq!(got, tuning(100_000_000, 2_000_000));
+    let got = src.tune(tuning(100_000_000, 2_345_678)).await.unwrap();
+    assert_eq!(got, tuning(100_000_000, 2_400_000));
+    assert_eq!(
+        rate_calls(&dev, 0),
+        ["set_sample_rate(2000000)", "set_sample_rate(2400000)"]
+    );
+}

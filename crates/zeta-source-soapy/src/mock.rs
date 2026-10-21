@@ -32,6 +32,11 @@ pub struct MockDevice {
     follow: Option<(f64, f64)>,
     /// With `follow`: refuse a rate above the ceiling instead of clamping it.
     refuse_above: bool,
+    /// A UHD master clock: rates are the clock over an integer.
+    decimation: Option<f64>,
+    /// `(fraction, reads)`: the next `reads` answers of `sample_rate` come
+    /// back `fraction` short of the rate set.
+    shortfall: Mutex<(f64, usize)>,
     range_reads: Mutex<usize>,
 }
 
@@ -59,6 +64,8 @@ impl MockDevice {
             delays: Mutex::default(),
             follow: None,
             refuse_above: false,
+            decimation: None,
+            shortfall: Mutex::new((0.0, 0)),
             range_reads: Mutex::new(0),
         }
     }
@@ -76,6 +83,27 @@ impl MockDevice {
     pub fn refusing_above_ceiling(mut self) -> Self {
         self.refuse_above = true;
         self
+    }
+
+    /// A UHD device at master clock `mcr_hz`: `set_sample_rate(r)` sets
+    /// `mcr / round(mcr / r)` (at least one), as UHD divides its clock by an
+    /// integer, and the range reads `[mcr / 512, mcr]`, continuous.
+    pub fn with_uhd_decimation(mut self, mcr_hz: f64) -> Self {
+        self.decimation = Some(mcr_hz);
+        self
+    }
+
+    /// Every read of `sample_rate` answers `fraction` short of the rate set,
+    /// as a device that rounds down.
+    pub fn with_rate_shortfall(self, fraction: f64) -> Self {
+        *self.shortfall.lock().unwrap() = (fraction, usize::MAX);
+        self
+    }
+
+    /// The next `reads` answers of `sample_rate` come back `fraction` short,
+    /// on a device already shared.
+    pub fn shortfall_next(&self, fraction: f64, reads: usize) {
+        *self.shortfall.lock().unwrap() = (fraction, reads);
     }
 
     /// Calls of `sample_rate_ranges` so far.
@@ -150,6 +178,13 @@ impl SoapyDevice for MockDevice {
     }
     fn sample_rate_ranges(&self) -> Result<Vec<RangeHz>, String> {
         *self.range_reads.lock().unwrap() += 1;
+        if let Some(mcr) = self.decimation {
+            return Ok(vec![RangeHz {
+                min_hz: mcr / 512.0,
+                max_hz: mcr,
+                step_hz: 0.0,
+            }]);
+        }
         if let Some((floor, ceiling)) = self.follow {
             let max = self.rate.lock().unwrap().clamp(floor, ceiling);
             return Ok(vec![RangeHz {
@@ -180,11 +215,22 @@ impl SoapyDevice for MockDevice {
         {
             return Err(format!("rate {hz} above {ceiling}"));
         }
-        *self.rate.lock().unwrap() = hz;
+        *self.rate.lock().unwrap() = match self.decimation {
+            Some(mcr) => mcr / (mcr / hz).round().max(1.0),
+            None => hz,
+        };
         Ok(())
     }
     fn sample_rate(&self) -> Result<f64, String> {
-        Ok(*self.rate.lock().unwrap())
+        let rate = *self.rate.lock().unwrap();
+        let mut short = self.shortfall.lock().unwrap();
+        if short.1 == 0 {
+            return Ok(rate);
+        }
+        if short.1 != usize::MAX {
+            short.1 -= 1;
+        }
+        Ok(rate * (1.0 - short.0))
     }
     fn open_rx(&self, format: WireFormat) -> Result<Box<dyn SoapyRx>, String> {
         self.rec(format!("open_rx({format:?})"));

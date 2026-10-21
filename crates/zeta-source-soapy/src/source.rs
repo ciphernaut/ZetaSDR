@@ -24,7 +24,10 @@ use tokio::sync::{broadcast, oneshot};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
 
-use crate::caps::{capabilities, is_uhd, pick_format, pick_rate, probe_rate_ranges};
+use crate::caps::{
+    RateModel, capabilities, is_uhd, next_rate_above, pick_format, pick_rate, probe_rate_ranges,
+    uhd_ladder,
+};
 use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
 
 /// Blocks buffered per receiver.
@@ -55,18 +58,81 @@ struct Status {
     window: VecDeque<(Instant, u64)>,
 }
 
-/// A retune handed to the reader thread; acknowledged once applied and
-/// recorded in [`Status`].
+/// A command handed to the reader thread, applied between reads.
+enum Cmd {
+    Retune(Retune),
+}
+
+/// A retune: acknowledged once applied and recorded in [`Status`], or with
+/// the reason it was not.
 struct Retune {
     center_hz: u64,
+    /// The rate picked for `bandwidth_hz`.
     rate_hz: u64,
-    ack: oneshot::Sender<Result<(), String>>,
+    /// The band the capture must cover: an actual rate below it is refused.
+    bandwidth_hz: u64,
+    ack: oneshot::Sender<Result<(), RateError>>,
+}
+
+/// Why a rate could not be applied.
+#[derive(Debug)]
+enum RateError {
+    /// A device call failed: the port faults.
+    Io(String),
+    /// The device gives less than the band: refused, the capture unchanged.
+    Narrow(String),
+}
+
+/// A rate the device runs at: `asked` is what was set (the picked rate, or
+/// the one retried above it), `actual` what the device reads back.
+#[derive(Clone, Copy)]
+struct Rate {
+    asked: u64,
+    actual: u64,
+}
+
+/// Set `rate_hz` and read the actual rate back. An actual rate below
+/// `bandwidth_hz` (a device that rounded down) is asked once more at the next
+/// rate above it (see [`next_rate_above`]); still short, it is refused.
+fn set_rate(
+    dev: &dyn SoapyDevice,
+    rates: &RateModel,
+    rate_hz: u64,
+    bandwidth_hz: u64,
+) -> Result<Rate, RateError> {
+    let set = |hz: u64| -> Result<Rate, RateError> {
+        dev.set_sample_rate(hz as f64)
+            .map_err(|e| RateError::Io(format!("soapy set_sample_rate({hz}): {e}")))?;
+        let actual = dev
+            .sample_rate()
+            .map_err(|e| RateError::Io(format!("soapy sample_rate: {e}")))?
+            .round() as u64;
+        if actual == 0 {
+            return Err(RateError::Io(
+                "soapy sample_rate: device reports 0 Hz".into(),
+            ));
+        }
+        Ok(Rate { asked: hz, actual })
+    };
+    let mut got = set(rate_hz)?;
+    if got.actual < bandwidth_hz
+        && let Some(next) = next_rate_above(rates, got.actual)
+    {
+        got = set(next)?;
+    }
+    if got.actual < bandwidth_hz {
+        return Err(RateError::Narrow(format!(
+            "soapy: device gives {} Hz for {} Hz, below the {bandwidth_hz} Hz band",
+            got.actual, got.asked
+        )));
+    }
+    Ok(got)
 }
 
 /// A running reader thread; dropping it asks the thread to stop (it exits
 /// after the read in progress, at most 100 ms, and deactivates the stream).
 struct Reader {
-    cmds: std_mpsc::Sender<Retune>,
+    cmds: std_mpsc::Sender<Cmd>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -93,7 +159,7 @@ pub struct SoapySource {
     caps: Capabilities,
     dev: Arc<dyn SoapyDevice>,
     freq: Vec<RangeHz>,
-    rates: Vec<RangeHz>,
+    rates: Arc<RateModel>,
     format: WireFormat,
     tx: broadcast::Sender<IqBlock>,
     status: Arc<Mutex<Status>>,
@@ -113,7 +179,8 @@ impl SoapySource {
     /// Query the device's ranges and formats once; no streaming yet. `args`
     /// (the SoapySDR device arguments it was opened with) and its driver key
     /// decide whether it is a UHD device, whose rate range is probed at its
-    /// maximum clock (see [`probe_rate_ranges`]).
+    /// maximum clock (see [`probe_rate_ranges`]) and whose rates are exact
+    /// divisors of that clock (see [`uhd_ladder`]).
     pub fn with_device_args(
         id: SourceId,
         dev: Arc<dyn SoapyDevice>,
@@ -131,6 +198,11 @@ impl SoapySource {
             );
         }
         let caps = capabilities(dev.as_ref(), &rates).map_err(io)?;
+        let rates = Arc::new(if probe {
+            uhd_ladder(&rates)
+        } else {
+            RateModel::Ranges(rates)
+        });
         let freq = dev.frequency_ranges().map_err(io)?;
         let (native, supported) = dev.formats().map_err(io)?;
         let format = pick_format(native, &supported).map_err(PortError::Unsupported)?;
@@ -183,7 +255,12 @@ impl SoapySource {
 
     /// The answer on the live, unfaulted reader, retuning it when the band
     /// changed; `Ok(None)` when a new stream is needed.
-    async fn retune_live(&self, center_hz: u64, rate_hz: u64) -> Result<Option<Tuning>, PortError> {
+    async fn retune_live(
+        &self,
+        center_hz: u64,
+        rate_hz: u64,
+        bandwidth_hz: u64,
+    ) -> Result<Option<Tuning>, PortError> {
         let ack = {
             let reader = self.reader.lock().unwrap();
             let Some(r) = reader.as_ref().filter(|r| r.alive()) else {
@@ -193,15 +270,17 @@ impl SoapySource {
             if st.fault.is_some() {
                 return Ok(None);
             }
-            if st.band == Some((center_hz, rate_hz)) {
+            let covers = st.current.is_some_and(|c| c.bandwidth_hz.0 >= bandwidth_hz);
+            if st.band == Some((center_hz, rate_hz)) && covers {
                 return Ok(st.current);
             }
             let (ack, done) = oneshot::channel();
-            let cmd = Retune {
+            let cmd = Cmd::Retune(Retune {
                 center_hz,
                 rate_hz,
+                bandwidth_hz,
                 ack,
-            };
+            });
             if r.cmds.send(cmd).is_err() {
                 return Ok(None);
             }
@@ -210,7 +289,9 @@ impl SoapySource {
         match tokio::time::timeout(self.retune_timeout, ack).await {
             // The reader recorded the applied band in `status` before acking.
             Ok(Ok(Ok(()))) => Ok(self.status.lock().unwrap().current),
-            Ok(Ok(Err(m))) => Err(PortError::Io(m)),
+            Ok(Ok(Err(RateError::Io(m)))) => Err(PortError::Io(m)),
+            // Refused: the reader kept the capture it had.
+            Ok(Ok(Err(RateError::Narrow(m)))) => Err(PortError::Unsupported(m)),
             Ok(Err(_)) => Ok(None),
             Err(_) => {
                 // The device is mid-retune and the reader may still apply it
@@ -225,19 +306,23 @@ impl SoapySource {
     }
 
     /// Configure and activate a new stream, then start its reader thread.
-    fn open_stream(&self, center_hz: u64, rate_hz: u64) -> Result<Tuning, PortError> {
+    /// A rate the device gives below `bandwidth_hz` is refused
+    /// (`Unsupported`) before the stream opens; `current` stays `None`.
+    fn open_stream(
+        &self,
+        center_hz: u64,
+        rate_hz: u64,
+        bandwidth_hz: u64,
+    ) -> Result<Tuning, PortError> {
         let dev = &self.dev;
-        dev.set_sample_rate(rate_hz as f64)
-            .map_err(|e| self.fail(format!("soapy set_sample_rate({rate_hz}): {e}")))?;
+        let rate =
+            set_rate(dev.as_ref(), &self.rates, rate_hz, bandwidth_hz).map_err(|e| match e {
+                RateError::Io(m) => self.fail(m),
+                RateError::Narrow(m) => PortError::Unsupported(m),
+            })?;
+        let actual = rate.actual;
         dev.set_frequency(center_hz as f64)
             .map_err(|e| self.fail(format!("soapy set_frequency({center_hz}): {e}")))?;
-        let actual = dev
-            .sample_rate()
-            .map_err(|e| self.fail(format!("soapy sample_rate: {e}")))?
-            .round() as u64;
-        if actual == 0 {
-            return Err(self.fail("soapy sample_rate: device reports 0 Hz".into()));
-        }
         let mut rx = dev
             .open_rx(self.format)
             .map_err(|e| self.fail(format!("soapy open_rx({:?}): {e}", self.format)))?;
@@ -259,6 +344,7 @@ impl SoapySource {
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = Ctx {
             dev: self.dev.clone(),
+            rates: self.rates.clone(),
             tx: self.tx.clone(),
             status: self.status.clone(),
             stop: stop.clone(),
@@ -266,7 +352,7 @@ impl SoapySource {
         };
         let handle = std::thread::Builder::new()
             .name(format!("soapy-{}", self.id.0))
-            .spawn(move || run(ctx, rx, center_hz, actual))
+            .spawn(move || run(ctx, rx, center_hz, rate_hz, rate))
             .map_err(|e| self.fail(format!("soapy reader thread: {e}")))?;
         *self.reader.lock().unwrap() = Some(Reader {
             cmds,
@@ -302,7 +388,10 @@ impl Port for SoapySource {
     }
 
     /// Validates the centre against the device's ranges and picks the smallest
-    /// supported rate at least `bandwidth_hz` wide. An unchanged band on a
+    /// supported rate at least `bandwidth_hz` wide (on a UHD device the
+    /// smallest exact divisor of its master clock). A device that gives less
+    /// than the band is asked once for the next rate above what it gave, then
+    /// refused with `Unsupported`, the capture as it was. An unchanged band on a
     /// live, unfaulted reader is a no-op; a changed one is applied by the
     /// reader between reads; otherwise (first tune, fault, reader gone) the
     /// stream is (re)opened, which clears the fault. Returns the capture band:
@@ -321,7 +410,7 @@ impl Port for SoapySource {
             .ok_or_else(|| out_of_range("bandwidth_hz", bw, 1, max_rate))?;
 
         let _gate = self.gate.lock().await;
-        if let Some(cur) = self.retune_live(center, rate).await? {
+        if let Some(cur) = self.retune_live(center, rate, bw).await? {
             return Ok(cur);
         }
         // A new stream: stop the old reader (finished or faulted) and wait for
@@ -339,7 +428,7 @@ impl Port for SoapySource {
             st.current = None;
             st.band = None;
         }
-        self.open_stream(center, rate)
+        self.open_stream(center, rate, bw)
     }
 
     fn current(&self) -> Option<Tuning> {
@@ -358,10 +447,11 @@ impl Port for SoapySource {
 /// What the reader thread shares with the source.
 struct Ctx {
     dev: Arc<dyn SoapyDevice>,
+    rates: Arc<RateModel>,
     tx: broadcast::Sender<IqBlock>,
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
-    cmds: std_mpsc::Receiver<Retune>,
+    cmds: std_mpsc::Receiver<Cmd>,
 }
 
 impl Ctx {
@@ -400,53 +490,75 @@ impl Clock {
     }
 }
 
-/// Apply a retune between reads: a rate change restarts the stream.
-fn apply(ctx: &Ctx, rx: &mut dyn SoapyRx, cmd: &Retune, rate: u64) -> Result<u64, String> {
-    if cmd.rate_hz != rate {
-        rx.deactivate()
-            .map_err(|e| format!("soapy deactivate: {e}"))?;
+/// Apply a retune between reads: a rate change (or a rate short of the band)
+/// restarts the stream. `picked` is the rate picked for the stream running at
+/// `rate`. A refused rate restores `rate.asked` and reactivates the stream on
+/// the old centre (the frequency is set only once the rate holds); a device
+/// error leaves the stream to fault.
+fn apply(
+    ctx: &Ctx,
+    rx: &mut dyn SoapyRx,
+    cmd: &Retune,
+    picked: u64,
+    rate: Rate,
+) -> Result<Rate, RateError> {
+    let io = RateError::Io;
+    if cmd.rate_hz == picked && rate.actual >= cmd.bandwidth_hz {
         ctx.dev
-            .set_sample_rate(cmd.rate_hz as f64)
-            .map_err(|e| format!("soapy set_sample_rate({}): {e}", cmd.rate_hz))?;
-    }
-    ctx.dev
-        .set_frequency(cmd.center_hz as f64)
-        .map_err(|e| format!("soapy set_frequency({}): {e}", cmd.center_hz))?;
-    if cmd.rate_hz == rate {
+            .set_frequency(cmd.center_hz as f64)
+            .map_err(|e| io(format!("soapy set_frequency({}): {e}", cmd.center_hz)))?;
         return Ok(rate);
     }
-    let actual = ctx
-        .dev
-        .sample_rate()
-        .map_err(|e| format!("soapy sample_rate: {e}"))?
-        .round() as u64;
-    if actual == 0 {
-        return Err("soapy sample_rate: device reports 0 Hz".into());
-    }
-    rx.activate().map_err(|e| format!("soapy activate: {e}"))?;
-    Ok(actual)
+    rx.deactivate()
+        .map_err(|e| io(format!("soapy deactivate: {e}")))?;
+    let got = match set_rate(ctx.dev.as_ref(), &ctx.rates, cmd.rate_hz, cmd.bandwidth_hz) {
+        Err(RateError::Narrow(m)) => {
+            let back = set_rate(ctx.dev.as_ref(), &ctx.rates, rate.asked, 0)?;
+            if back.actual != rate.actual {
+                return Err(io(format!(
+                    "soapy: restoring {} Hz gave {} Hz, not {} Hz",
+                    rate.asked, back.actual, rate.actual
+                )));
+            }
+            rx.activate()
+                .map_err(|e| io(format!("soapy activate: {e}")))?;
+            return Err(RateError::Narrow(m));
+        }
+        r => r?,
+    };
+    ctx.dev
+        .set_frequency(cmd.center_hz as f64)
+        .map_err(|e| io(format!("soapy set_frequency({}): {e}", cmd.center_hz)))?;
+    rx.activate()
+        .map_err(|e| io(format!("soapy activate: {e}")))?;
+    Ok(got)
 }
 
 /// The reader thread. Exits on stop, on no receivers, or with a fault (set
 /// before the stream is deactivated); always deactivates on exit.
-fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, rate: u64) {
+fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut rate: Rate) {
     // A reopen continues after the previous stream's last block.
     let last_end = ctx.status.lock().unwrap().last_end;
     let mut clock = Clock {
         anchor: now_ns().max(last_end),
         count: 0,
-        rate,
+        rate: rate.actual,
     };
-    let mut buf = vec![Complex::new(0.0f32, 0.0); block_len(rate)];
+    let mut buf = vec![Complex::new(0.0f32, 0.0); block_len(rate.actual)];
     let mut quiet = 0u32;
     loop {
         if ctx.stop.load(Ordering::Relaxed) || ctx.tx.receiver_count() == 0 {
             break;
         }
         if let Ok(cmd) = ctx.cmds.try_recv() {
-            match apply(&ctx, rx.as_mut(), &cmd, clock.rate) {
-                Ok(actual) => {
+            // A new command kind makes this a `match`.
+            let Cmd::Retune(cmd) = cmd;
+            match apply(&ctx, rx.as_mut(), &cmd, picked, rate) {
+                Ok(got) => {
+                    let actual = got.actual;
                     center = cmd.center_hz;
+                    picked = cmd.rate_hz;
+                    rate = got;
                     clock.reanchor(actual);
                     buf.resize(block_len(actual), Complex::new(0.0, 0.0));
                     {
@@ -460,9 +572,14 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, rate: u64) {
                     }
                     let _ = cmd.ack.send(Ok(()));
                 }
-                Err(m) => {
+                Err(RateError::Narrow(m)) => {
+                    // The old capture runs on; it restarts after the gap.
+                    clock.reanchor(clock.rate);
+                    let _ = cmd.ack.send(Err(RateError::Narrow(m)));
+                }
+                Err(RateError::Io(m)) => {
                     ctx.fault(m.clone());
-                    let _ = cmd.ack.send(Err(m));
+                    let _ = cmd.ack.send(Err(RateError::Io(m)));
                     break;
                 }
             }
