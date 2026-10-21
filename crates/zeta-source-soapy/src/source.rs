@@ -93,7 +93,8 @@ struct Rate {
 
 /// Set `rate_hz` and read the actual rate back. An actual rate below
 /// `bandwidth_hz` (a device that rounded down) is asked once more at the next
-/// rate above it (see [`next_rate_above`]); still short, it is refused.
+/// rate above both it and the request (see [`next_rate_above`]): asking
+/// below the request cannot help. Still short, it is refused.
 fn set_rate(
     dev: &dyn SoapyDevice,
     rates: &RateModel,
@@ -116,7 +117,7 @@ fn set_rate(
     };
     let mut got = set(rate_hz)?;
     if got.actual < bandwidth_hz
-        && let Some(next) = next_rate_above(rates, got.actual)
+        && let Some(next) = next_rate_above(rates, got.actual.max(got.asked))
     {
         got = set(next)?;
     }
@@ -390,7 +391,7 @@ impl Port for SoapySource {
     /// Validates the centre against the device's ranges and picks the smallest
     /// supported rate at least `bandwidth_hz` wide (on a UHD device the
     /// smallest exact divisor of its master clock). A device that gives less
-    /// than the band is asked once for the next rate above what it gave, then
+    /// than the band is asked once for the next rate above the request, then
     /// refused with `Unsupported`, the capture as it was. An unchanged band on a
     /// live, unfaulted reader is a no-op; a changed one is applied by the
     /// reader between reads; otherwise (first tune, fault, reader gone) the

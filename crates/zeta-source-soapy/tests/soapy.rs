@@ -489,10 +489,11 @@ async fn uhd_tune_asks_only_for_ladder_rates() {
 
 #[tokio::test]
 async fn actual_rate_below_the_band_retries_once_then_refuses() {
-    // 204 800 reads 184 320; the next rung above that is 192 000 (N 320),
-    // which reads 172 800.
-    let want = "soapy: device gives 172800 Hz for 192000 Hz, below the 200000 Hz band";
-    let dev = Arc::new(b210().with_rate_shortfall(0.1));
+    // 25 % short: 204 800 reads 153 600; the retry asks the next rung above
+    // the request, 240 000 (N 256: no N in 257..300 divides 2^15 * 3 * 5^4),
+    // which reads 180 000.
+    let want = "soapy: device gives 180000 Hz for 240000 Hz, below the 200000 Hz band";
+    let dev = Arc::new(b210().with_rate_shortfall(0.25));
     let src = source(&dev);
     let probed = dev.calls().len();
     let Err(PortError::Unsupported(m)) = src.tune(tuning(100_000_000, 200_000)).await else {
@@ -501,7 +502,7 @@ async fn actual_rate_below_the_band_retries_once_then_refuses() {
     assert_eq!(m, want);
     assert_eq!(
         rate_calls(&dev, probed),
-        ["set_sample_rate(204800)", "set_sample_rate(192000)"]
+        ["set_sample_rate(204800)", "set_sample_rate(240000)"]
     );
     assert_eq!(src.current(), None);
     assert_eq!(src.fault(), None, "a refused rate is not a device fault");
@@ -514,6 +515,32 @@ async fn actual_rate_below_the_band_retries_once_then_refuses() {
     let err = node.apply(op).await.expect_err("the job cannot start");
     assert!(err.to_string().contains(want), "{err}");
     assert_eq!(src.current(), None);
+    // Refused before the stream opens: the device was never tuned or opened.
+    let calls = dev.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("set_frequency") || c.starts_with("open_rx")),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_a_rung_up_rescues_the_tune() {
+    // 10 % short: 204 800 reads 184 320; the retry at 240 000 reads 216 000,
+    // which covers the 200 000 Hz band.
+    let dev = Arc::new(b210().with_rate_shortfall(0.1).with_reads(samples(1)));
+    let src = source(&dev);
+    let _rx = src.subscribe();
+    let probed = dev.calls().len();
+    let got = src.tune(tuning(100_000_000, 200_000)).await.unwrap();
+    assert_eq!(got, tuning(100_000_000, 216_000));
+    assert_eq!(src.current().map(|c| c.bandwidth_hz), Some(Hz(216_000)));
+    assert_eq!(src.fault(), None);
+    assert_eq!(
+        rate_calls(&dev, probed),
+        ["set_sample_rate(204800)", "set_sample_rate(240000)"]
+    );
 }
 
 #[tokio::test]
@@ -528,7 +555,8 @@ async fn a_refused_retune_keeps_the_capture_it_had() {
     assert_eq!(was, tuning(100_000_000, 1_024_000));
     next_block(&mut rx).await;
     // The next two reads of the rate come back 10 % short: 2 457 600 reads
-    // 2 211 840, whose next rung up is 2 457 600 again (N 25).
+    // 2 211 840; the retry, the next rung above the request (N 24), asks
+    // 2 560 000 and reads 2 304 000, still short of 2 400 000.
     dev.shortfall_next(0.1, 2);
     let from = dev.calls().len();
     let Err(PortError::Unsupported(m)) = src.tune(tuning(101_000_000, 2_400_000)).await else {
@@ -536,7 +564,7 @@ async fn a_refused_retune_keeps_the_capture_it_had() {
     };
     assert_eq!(
         m,
-        "soapy: device gives 2211840 Hz for 2457600 Hz, below the 2400000 Hz band"
+        "soapy: device gives 2304000 Hz for 2560000 Hz, below the 2400000 Hz band"
     );
     assert_eq!(src.current(), Some(was));
     assert_eq!(src.fault(), None);
@@ -545,7 +573,7 @@ async fn a_refused_retune_keeps_the_capture_it_had() {
         [
             "deactivate",
             "set_sample_rate(2457600)",
-            "set_sample_rate(2457600)",
+            "set_sample_rate(2560000)",
             "set_sample_rate(1024000)",
             "activate"
         ]
