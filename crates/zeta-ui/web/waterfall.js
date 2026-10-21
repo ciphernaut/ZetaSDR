@@ -23,7 +23,8 @@
 //         that started on the shown source, or goes back to a spectrum job when it ended
 //     wf.onNotice   fn(text) for transcript lines (a refused retune); set by app.js
 //     wf.release(src) -> Promise<bool>  checks `source_list` holders of `src` (rigid jobs; the
-//         page's own elastic job is never one) and, when there are none, stops following
+//         page's own elastic job is never one; a `pin` is one, see rigidHolders) and, when
+//         there are none, stops following
 //         (false, with a `conflict: …` notice, when a job holds it). The page's own job is
 //         left to the node: a scan on the source stops it. The caller then runs
 //         setSource(src) again (menu.js after starting a scan).
@@ -101,7 +102,8 @@
 // nearest bin when a bin spans several rows) and the axis is rescaled; no operation is issued.
 // A wheel step out that still fits the capture is shifted inside it (unless the view is
 // already past the capture). A view leaving the capture: `source_list` first. With no rigid
-// holder, and the view no wider than the source's max_bandwidth_hz and inside its tune range,
+// holder (a pin counts as one, rigidHolders), and the view no wider than the source's
+// max_bandwidth_hz and inside its tune range,
 // `source_ensure` asks for the view's band; the node relaunches the page's elastic job on the
 // new capture, which the waterfall follows (refused, e.g. `out_of_range` on a file source,
 // the view reverts with `view reverted: <error>` in the transcript). Otherwise (a rigid
@@ -298,6 +300,14 @@ const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 // The running `scan` job on `sourceId` in a `job_list` result, or null.
 function runningScan(jobs, sourceId) {
   return jobs.find((j) => j.kind === "scan" && j.source === sourceId && isRunning(j)) || null;
+}
+
+// The rigid holders of a `source_list` record: its `holders` (job ids), then `pin` when the
+// source is pinned (plan 12 spec 4.1: a pin holds the source like a rigid job).
+export function rigidHolders(info) {
+  const holders = info && Array.isArray(info.holders) ? [...info.holders] : [];
+  if (info && info.pin) holders.push("pin");
+  return holders;
 }
 
 // `t` when it is a {center_hz, bandwidth_hz} with both set, else null.
@@ -558,11 +568,10 @@ class Waterfall {
     return sources.find((s) => s.id === src.id) || null;
   }
 
-  // The rigid holders of `src` from `source_list` (the page's elastic job is never one).
-  // Throws when `source_list` fails.
+  // The rigid holders of `src` from `source_list` (the page's elastic job is never one; a
+  // pin counts as one, named `pin`). Throws when `source_list` fails.
   async holders(src) {
-    const info = await this.sourceInfo(src);
-    return info && Array.isArray(info.holders) ? info.holders : [];
+    return rigidHolders(await this.sourceInfo(src));
   }
 
   // Lets go of `src` for a scan: true once nothing follows it; false (with a `conflict: …`
@@ -1081,7 +1090,7 @@ class Waterfall {
         if (this.src === src) revert();
         return;
       }
-      const holders = info && Array.isArray(info.holders) ? info.holders : [];
+      const holders = rigidHolders(info);
       const coarseOn = !!this.coarseActive && this.coarseActive();
       if (coarseOn && (holders.length || !this.capturable(info, lo, hi))) {
         // The coarse layer's view (spec 4.3 zoom_out scan): left past the capture.

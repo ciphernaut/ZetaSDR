@@ -16,13 +16,22 @@
 // the transcript through the `ops` stream); `view` alone or followed by `set`, `show`,
 // `reset` or `clear` is a view command (view.js: `view set <key> <value>`, `view show`,
 // `view reset`, `view clear`), handled here before both, its answer a transcript line;
-// anything else (other text starting "view " included) goes to `api.ask`.
+// `source pin [<center_hz> <bandwidth_hz>]`, `source unpin` and `source gain <db>|auto` act
+// on the shown source the same way (runSourceCommand: `source_pin` at its `current` capture or
+// the band given, `source_unpin`, `source_set_gain`), their reply or error a transcript line;
+// anything else (other text starting "view " or "source " included) goes to `api.ask`.
 //
 // Conflicts (spec 4.5): a `conflict` reply to an op this page applied (command line, menu),
 // or one the ops stream shows for another caller, adds a line naming each holder by kind
 // and tuning from the last job list (`conflict: source S held by passthrough <id> @ 100.000
 // MHz`) with one button per holder, `stop <kind> <short id> and retry`, which applies the
-// same op again with `replace: [<id>]` (conflictActions).
+// same op again with `replace: [<id>]` (conflictActions). A pin is never a holder: a conflict
+// with none on a pinned source names the node's `unpin source S (source_unpin)` option and
+// offers `unpin S and retry` (`source_unpin`, then the same op).
+//
+// Tabs: a pinned source's tab carries a `pin` tag after its range and the title `pin
+// <lo>–<hi> MHz; gain <db> dB` (`gain automatic`; no gain part without adjustable gain),
+// kept up to date by each `source_list` poll.
 //
 // The coarse layer (coarse.js) is mounted on the waterfall at login: a view past the fine
 // capture starts the page's own scan on a free scanner source (view policies zoom_out,
@@ -62,7 +71,7 @@
 //
 // Exports `state` ({api, transcript, jobs, wf, coarse, ov, menu, audio, mic, sources,
 // selected, view, lastJobs}), `onSourceChange(fn)` for the later views (waterfall, audio,
-// voice), and `conflictActions(err, retry)`.
+// voice), `conflictActions(err, retry)` and `runSourceCommand(state, words)`.
 
 import { connect, Unauthorized } from "./api.js";
 import { QUIET_OPS, Transcript, startJobs, startOpsFeed } from "./agent.js";
@@ -217,6 +226,34 @@ function select(id) {
   for (const fn of sourceListeners) fn(src);
 }
 
+// A pinned source's tab title (spec 4.1): `pin <lo>–<hi> MHz`, then `; gain <db> dB` (or
+// `gain automatic`) when the source has adjustable gain.
+function pinTitle(src) {
+  const p = src.pin;
+  const half = p.bandwidth_hz / 2;
+  let text = `pin ${mhz(p.center_hz - half)}–${mhz(p.center_hz + half)} MHz`;
+  const g = src.gain;
+  if (g) text += g.automatic || g.db === null ? "; gain automatic" : `; gain ${g.db} dB`;
+  return text;
+}
+
+// The parts of a tab that follow the source's state: the fault, the `pin` tag and the title.
+function decorateTab(tab, s) {
+  tab.classList.toggle("fault", !!s.fault);
+  let tag = tab.querySelector(".tag.pin");
+  if (s.pin && !tag) {
+    tag = document.createElement("span");
+    tag.className = "tag pin";
+    tag.textContent = "pin";
+    tab.querySelector(".range").after(tag);
+  } else if (!s.pin && tag) {
+    tag.remove();
+  }
+  if (s.fault) tab.title = `fault: ${JSON.stringify(s.fault)}`;
+  else if (s.pin) tab.title = pinTitle(s);
+  else tab.title = rangeText(s);
+}
+
 function renderTabs(sources) {
   const tabs = $("#tabs");
   tabs.replaceChildren(
@@ -235,8 +272,7 @@ function renderTabs(sources) {
       centre.className = "centre";
       centre.textContent = centreText(s);
       tab.append(name, range, centre);
-      if (s.fault) tab.classList.add("fault");
-      tab.title = s.fault ? `fault: ${JSON.stringify(s.fault)}` : rangeText(s);
+      decorateTab(tab, s);
       tab.onclick = () => select(s.id);
       return tab;
     }),
@@ -300,7 +336,7 @@ async function applyOp(op) {
 // ---- conflicts -------------------------------------------------------------------------
 
 // Ops that take `replace` (a conflict on them can be retried with the holders named).
-const REPLACEABLE = new Set(["job_start", "source_ensure"]);
+const REPLACEABLE = new Set(["job_start", "source_ensure", "source_pin"]);
 
 // `<kind> <id> @ <centre MHz>` for holder `id`, from the last job list (the conflict's
 // `current` centre when the job is not in it).
@@ -311,23 +347,46 @@ function holderText(id, err) {
   return `${j ? j.kind : "job"} ${id}${at}`;
 }
 
+// `conflict: source S held by …`, with the node's `unpin source S (source_unpin)` option
+// after it when the source is pinned (a pin is never among the holders).
 function conflictText(err) {
   const holders = Array.isArray(err.holders) ? err.holders : [];
   const who = holders.length ? holders.map((h) => holderText(h, err)).join(", ") : "nobody";
-  return `conflict: source ${err.source ?? "?"} held by ${who}`;
+  const options = Array.isArray(err.options) ? err.options : [];
+  const unpin = options.find((o) => typeof o === "string" && o.startsWith("unpin source "));
+  return `conflict: source ${err.source ?? "?"} held by ${who}${unpin ? `; ${unpin}` : ""}`;
+}
+
+// Whether the last `source_list` shows a pin on source `id`.
+function pinned(id) {
+  const s = state.sources.find((x) => x.id === id);
+  return !!(s && s.pin);
 }
 
 // One action per holder of a `conflict` error: `stop <kind> <short id> and retry`, whose
-// run calls retry([id]) (the original op again with `replace: [id]`).
+// run calls retry([id]) (the original op again with `replace: [id]`). With no holders on a
+// pinned source (spec 4.1) one action `unpin <source> and retry`: `source_unpin`, then
+// retry([]).
 export function conflictActions(err, retry) {
   const holders = err && Array.isArray(err.holders) ? err.holders : [];
-  return holders.map((id) => {
+  const actions = holders.map((id) => {
     const j = state.lastJobs.find((x) => x.id === id);
     return {
       label: `stop ${j ? j.kind : "job"} ${id.slice(-6)} and retry`,
       run: () => retry([id]),
     };
   });
+  if (err && holders.length === 0 && typeof err.source === "string" && pinned(err.source)) {
+    const source = err.source;
+    actions.push({
+      label: `unpin ${source} and retry`,
+      run: async () => {
+        await applyOp({ op: "source_unpin", source });
+        return retry([]);
+      },
+    });
+  }
+  return actions;
 }
 
 // The conflict line for `op` (refused with `err`), with its retry buttons when the op
@@ -343,6 +402,88 @@ async function offerReplace(op, err) {
 // The op attaching a transcription to job `id` (the language left to the backend).
 function attachOp(id) {
   return { op: "job_attach", kind: "transcribe", job: id, language: null };
+}
+
+// ---- source commands (spec 4.2) -------------------------------------------------------
+
+const INT_RE = /^\d+$/;
+
+// The shown source's `source_list` record, fetched now (null when it is not listed).
+async function shownSource() {
+  const sources = (await state.api.op({ op: "source_list" })).value || [];
+  state.sources = sources;
+  return sources.find((s) => s.id === state.selected) || null;
+}
+
+// The op a source command asks for, or {error} when the words do not parse.
+function sourceOp(src, words) {
+  const [verb, ...args] = words;
+  if (verb === "pin") {
+    if (args.length === 0) {
+      const c = src.current;
+      if (!c || typeof c.center_hz !== "number" || typeof c.bandwidth_hz !== "number") {
+        return { error: `${src.id} has no capture to pin` };
+      }
+      const { center_hz, bandwidth_hz } = c;
+      return { op: { op: "source_pin", source: src.id, center_hz, bandwidth_hz, replace: [] } };
+    }
+    if (args.length !== 2 || !args.every((a) => INT_RE.test(a))) {
+      return { error: "source pin: expected <center_hz> <bandwidth_hz>" };
+    }
+    const [center_hz, bandwidth_hz] = args.map(Number);
+    return { op: { op: "source_pin", source: src.id, center_hz, bandwidth_hz, replace: [] } };
+  }
+  if (verb === "unpin") {
+    if (args.length) return { error: "source unpin: expected no arguments" };
+    return { op: { op: "source_unpin", source: src.id } };
+  }
+  // gain
+  if (args.length === 1 && args[0] === "auto") {
+    return { op: { op: "source_set_gain", source: src.id, gain_db: null } };
+  }
+  if (args.length !== 1 || !/^-?\d+(\.\d+)?$/.test(args[0])) {
+    return { error: "source gain: expected <db> or auto" };
+  }
+  return { op: { op: "source_set_gain", source: src.id, gain_db: Number(args[0]) } };
+}
+
+// The reply line for a successful source op.
+function sourceReply(op, result) {
+  if (op.op === "source_pin") {
+    return `pinned ${op.source} at ${op.center_hz} Hz, ${op.bandwidth_hz} Hz`;
+  }
+  if (op.op === "source_unpin") return `unpinned ${op.source}`;
+  const g = (result && result.value) || {};
+  if (g.automatic || g.db === null || g.db === undefined) return `gain ${op.source}: automatic`;
+  return `gain ${op.source}: ${g.db} dB (${g.min_db}..=${g.max_db})`;
+}
+
+// `source pin [<center_hz> <bandwidth_hz>]`, `source unpin`, `source gain <db>|auto` on the
+// shown source: {text, error} for the transcript, or {text: null} when a conflict was
+// offered its retry line instead (offerReplace).
+export async function runSourceCommand(st, words) {
+  let src;
+  try {
+    src = await shownSource();
+  } catch (e) {
+    return { text: `source_list: ${e.message}`, error: true };
+  }
+  if (!src) return { text: `no source shown`, error: true };
+  const parsed = sourceOp(src, words);
+  if (parsed.error) return { text: parsed.error, error: true };
+  const op = parsed.op;
+  try {
+    const result = await st.api.op(op);
+    return { text: sourceReply(op, result), error: false };
+  } catch (e) {
+    if (e.json && e.json.error === "conflict") {
+      await offerReplace(op, e.json);
+      return { text: null, error: true };
+    }
+    return { text: e.message, error: true };
+  } finally {
+    st.jobs?.refresh();
+  }
 }
 
 // Sends `text` to /ask and shows the answer (or the error, e.g. no LLM configured).
@@ -367,6 +508,12 @@ async function runCommand(text) {
     state.transcript.user(text);
     const r = runViewCommand(state.view, text.split(/\s+/).slice(1));
     state.transcript.note(r.text, r.error);
+    return;
+  }
+  if (/^source\s+(pin|unpin|gain)\b/.test(text)) {
+    state.transcript.user(text);
+    const r = await runSourceCommand(state, text.split(/\s+/).slice(1));
+    if (r.text !== null) state.transcript.note(r.text, r.error);
     return;
   }
   const op = parseOp(text);
@@ -454,7 +601,7 @@ function start(api) {
     view: state.view,
     onJobs: (jobs) => {
       state.lastJobs = jobs;
-      if (state.ov) state.ov.sync(jobs);
+      if (state.ov) state.ov.sync(jobs, shown());
       if (state.wf) state.wf.syncJobs(jobs);
       pollSources(api);
       stopAudioUnlessRunning(jobs);
@@ -471,6 +618,19 @@ function start(api) {
   loadSources();
 }
 
+// The shown source's last `source_list` record (null when unknown).
+function shown() {
+  return state.sources.find((s) => s.id === state.selected) || null;
+}
+
+// The tabs follow each `source_list` poll (pin tag, title, fault) without re-selecting.
+function syncTabs(sources) {
+  for (const tab of document.querySelectorAll(".src-tab")) {
+    const s = sources.find((x) => x.id === tab.dataset.id);
+    if (s) decorateTab(tab, s);
+  }
+}
+
 // After each jobs poll: `source_list` into state.sources and the waterfall (a moved capture),
 // one at a time; a failure waits for the next poll.
 let sourcesPolling = false;
@@ -483,6 +643,8 @@ async function pollSources(api) {
     if (state.api !== api) return;
     state.sources = sources;
     if (state.wf) state.wf.syncSources(sources);
+    syncTabs(sources);
+    if (state.ov) state.ov.syncOutlines(state.lastJobs, shown());
   } catch {
     /* the next poll retries */
   } finally {

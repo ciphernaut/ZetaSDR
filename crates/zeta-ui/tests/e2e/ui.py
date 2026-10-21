@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 from playwright.sync_api import expect, sync_playwright
@@ -1119,6 +1120,70 @@ def scenario_conflict_offers_replace(page, url, secret):
         stop_job(url, secret, a)
         if new:
             stop_job(url, secret, new)
+
+
+# ---- pins and gain from the command line (plan 12 Task 7) ------------------------------------
+
+def try_op(url, secret, body):
+    """POST `body` to /op; the decoded reply, or the decoded error JSON of a 4xx answer."""
+    try:
+        return http_json(url, secret, "/op", body)
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read())
+
+
+def scenario_source_pin_unpin_and_gain_commands(page, url, secret):
+    select_source(page, url, secret, "retune")
+    tab = page.locator('.src-tab[data-id="retune"]')
+    cur = wait_until(lambda: source_info(url, secret, "retune")["current"], 5.0,
+                     "retune has a capture")
+    other = 260_000_000 if abs(cur["center_hz"] - 260_000_000) > 2_000_000 else 240_000_000
+    job = None
+    try:
+        run_cmd(page, "source pin")
+        expect(page.locator("#transcript .line.note:not(.error)", has_text=(
+            f"pinned retune at {cur['center_hz']} Hz, {cur['bandwidth_hz']} Hz"))).to_have_count(1)
+        assert source_info(url, secret, "retune")["pin"] is not None, "no pin after source pin"
+        page.evaluate("window.zetaTest.poll()")
+        expect(tab.locator(".tag.pin")).to_have_count(1)
+        expect(page.locator('#waterfall .outline[data-key="pin"]')).to_be_visible()
+        expect(page.locator('#waterfall .outline[data-key="capture"]')).to_have_count(0)
+        # A rigid start elsewhere: the pin holds the source, and nobody else does.
+        r = try_op(url, secret, {"op": "job_start", "kind": "passthrough", "source": "retune",
+                                 "center_hz": other, "bandwidth_hz": 10_000,
+                                 "deviation_hz": None, "sideband": None, "elastic": False,
+                                 "replace": []})
+        assert r.get("error") == "conflict", f"job_start on the pinned source: {r}"
+        line = page.locator("#transcript .line.error", has_text="held by nobody").filter(
+            has_text="unpin source retune (source_unpin)")
+        expect(line).to_have_count(1)
+        button = line.locator("button", has_text="unpin retune and retry")
+        expect(button).to_have_count(1)
+        button.click()
+
+        def started():
+            jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            run = [j for j in jobs if j["kind"] == "passthrough" and j["source"] == "retune"
+                   and j["state"]["status"] == "running" and j["tuning"]["center_hz"] == other]
+            return run[0]["id"] if run else None
+        job = wait_until(started, 3.0, "the retried job running")
+        assert source_info(url, secret, "retune")["pin"] is None, "still pinned after unpin"
+        expect(tab.locator(".tag.pin")).to_have_count(0, timeout=3_000)
+        # A recording has no adjustable gain: the op's error text.
+        run_cmd(page, "source gain 20")
+        expect(page.locator("#transcript .line.note.error",
+                            has_text="source has no adjustable gain")).to_have_count(1)
+        run_cmd(page, "source pin 999")
+        expect(page.locator("#transcript .line.note.error",
+                            has_text="source pin: expected <center_hz> <bandwidth_hz>")
+               ).to_have_count(1)
+        # Any other text starting "source " is a question for the agent.
+        run_cmd(page, "source of the noise")
+        expect(page.locator("#transcript .line.assistant")).to_have_count(1)
+    finally:
+        if job:
+            stop_job(url, secret, job)
+        try_op(url, secret, {"op": "source_unpin", "source": "retune"})
 
 
 # ---- automatic scans on the scanner source (plan 11 Task 6) ---------------------------------

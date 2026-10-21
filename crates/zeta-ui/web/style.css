@@ -103,6 +103,15 @@ input:focus { border-color: var(--accent); }
 .src-tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 .src-tab[aria-selected="true"] .name { color: var(--accent); }
 .src-tab.fault .name { color: var(--error); }
+/* A pinned source (plan 12 spec 4.1): `pin` after the range; the title names the band. */
+.src-tab .tag.pin {
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0 3px;
+  margin-left: 4px;
+  color: var(--accent);
+  font-size: 10px;
+}
 #drawer-toggle { display: none; align-self: center; }
 
 #main { grid-area: main; position: relative; min-width: 0; min-height: 0; }

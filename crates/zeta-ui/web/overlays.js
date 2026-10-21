@@ -7,12 +7,16 @@
 //       #waterfall element `wf` was mounted in). `jobsEl` (default #jobs) holds the job rows
 //       agent.js renders; their `.events` cell carries the counters.
 //   Overlays:
+//     ov.syncOutlines(jobs, source)  the outline half of ov.sync alone (app.js calls it after
+//                            each `source_list` poll, so a pin shows without waiting for jobs)
 //     ov.setSource(id)       the selected source: changing it drops every watch, label,
 //                            ribbon and outline (they belong to the previous source's band)
-//     ov.sync(jobs)          a `job_list` result (from the 2 s poll): outlines (ov.outline,
+//     ov.sync(jobs, source)  a `job_list` result (from the 2 s poll) and the selected
+//                            source's `source_list` record: outlines (ov.outline,
 //                            key = job id, text = kind) the tuning of every running rigid job
 //                            on the selected source (spec 4.2: not elastic, not attached to
-//                            another job's output, not a time-shared `scan`) and unoutlines
+//                            another job's output, not a time-shared `scan`) and the source's
+//                            `pin` (key "pin", text "pin"; plan 12 spec 4.1), and unoutlines
 //                            the rest; with none the capture itself (wf.band, key
 //                            "capture", text "capture"; not in scan mode) is outlined,
 //                            following the band as it changes. Then watchJob for the
@@ -83,6 +87,7 @@ const RIBBON_GAP_PX = 2;
 const LABEL_GAP_PX = 2;
 const MAX_LANES = 8;
 const CAPTURE_KEY = "capture";
+const PIN_KEY = "pin";
 
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 
@@ -158,7 +163,8 @@ class Overlays {
     this.counters = new Map(); // job id -> non-spectrum events seen while watched
     this.labels = new Map(); // key -> {el, hz}
     this.outlines = new Map(); // key -> {el, labelEl, lo, hi}
-    this.captureOutlined = false; // the capture is outlined (no rigid holder)
+    this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
+    this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
     this.ribbons = []; // {el, countEl, text, cls, hz, w, h, top, dy, right, born, count}
     this.destroyed = false;
 
@@ -188,9 +194,9 @@ class Overlays {
     this.captureOutlined = false;
   }
 
-  sync(jobs) {
+  sync(jobs, source) {
     if (this.destroyed) return;
-    this.syncOutlines(jobs);
+    this.syncOutlines(jobs, source);
     const want = jobs.filter(
       (j) =>
         j.source === this.sourceId &&
@@ -221,10 +227,17 @@ class Overlays {
     }
   }
 
-  // The rigid holders' bands outlined, or the capture when there is none.
-  syncOutlines(jobs) {
+  // The rigid holders' bands (the source's pin among them) outlined, or the capture when
+  // there is none. `source` is the selected source's `source_list` record; without one (or
+  // another source's) the last one given is kept.
+  syncOutlines(jobs, source) {
+    if (this.destroyed) return;
+    if (source !== undefined) this.sourceRec = source;
+    const rec = this.sourceRec && this.sourceRec.id === this.sourceId ? this.sourceRec : null;
+    const pin = rec && rec.pin && typeof rec.pin.center_hz === "number" ? rec.pin : null;
     const rigid = jobs.filter((j) => j.source === this.sourceId && isRunning(j) && rigidBand(j));
     const keys = new Set(rigid.map((j) => j.id));
+    if (pin) keys.add(PIN_KEY);
     for (const key of [...this.outlines.keys()]) {
       if (key !== CAPTURE_KEY && !keys.has(key)) this.unoutline(key);
     }
@@ -232,7 +245,11 @@ class Overlays {
       const { center_hz: c, bandwidth_hz: bw } = j.tuning;
       this.outline(c - bw / 2, c + bw / 2, j.kind, j.id);
     }
-    this.captureOutlined = rigid.length === 0;
+    if (pin) {
+      const { center_hz: c, bandwidth_hz: bw } = pin;
+      this.outline(c - bw / 2, c + bw / 2, "pin", PIN_KEY);
+    }
+    this.captureOutlined = rigid.length === 0 && !pin;
     this.outlineCapture();
   }
 

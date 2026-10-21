@@ -13,9 +13,10 @@
 //       capture and zoom_out "scan", it chooses the scanner (view.get("scanner")):
 //         auto   the first source in `source_list` order that is not the shown one, is not
 //                faulted, has no rigid holder (a running scan holding it, the page's own or a
-//                manual one, is not rigid) and whose tune range contains the view's centre;
-//                else the shown source itself when it has no holder at all (today's scan
-//                mode: the scan stops the page's elastic job, which restarts when it ends)
+//                manual one, is not rigid; a `pin` is) and whose tune range contains the
+//                view's centre; else the shown source itself when it has no holder at all
+//                and no pin (today's scan mode: the scan stops the page's elastic job,
+//                which restarts when it ends)
 //         <id>   that source, as given
 //       The span is the view clamped to the scanner's tune_min_hz..tune_max_hz. A manual scan
 //       (one not in sessionStorage[AUTO_SCAN_KEY]) running on the scanner is followed
@@ -53,7 +54,7 @@
 //     coarse.destroy()
 
 import { AUTO_SCAN_KEY, errorText } from "./agent.js";
-import { capHz } from "./waterfall.js";
+import { capHz, rigidHolders } from "./waterfall.js";
 
 export const SCAN_DEBOUNCE_MS = 300;
 export const SPAN_CHANGE = 0.05;
@@ -276,7 +277,7 @@ class Coarse {
     const shown = this.wf.sourceId;
     const scans = new Set(jobs.filter((j) => j.kind === "scan" && isRunning(j)).map((j) => j.id));
     if (this.scanJobId) scans.add(this.scanJobId);
-    const rigid = (s) => (Array.isArray(s.holders) ? s.holders : []).filter((h) => !scans.has(h));
+    const rigid = (s) => rigidHolders(s).filter((h) => !scans.has(h));
     const centre = (v.lo + v.hi) / 2;
     const other = srcs.find((s) => {
       if (s.id === shown || s.fault || rigid(s).length) return false;
@@ -285,7 +286,7 @@ class Coarse {
     });
     if (other) return other;
     const self = srcs.find((s) => s.id === shown);
-    if (self && !self.fault && (!Array.isArray(self.holders) || self.holders.length === 0)) {
+    if (self && !self.fault && rigidHolders(self).length === 0) {
       return self;
     }
     return null;
