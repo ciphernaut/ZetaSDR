@@ -63,13 +63,16 @@ impl From<PortError> for LeaseError {
 /// One holder's lease on a source. A `time_shared` lease (a scan) covers a
 /// band wider than any one capture: its holder retunes the port across it,
 /// so no other request fits while it is held. An `elastic` lease's band is
-/// the capture it joined; it is never a holder for a rigid request.
+/// the capture it joined; it is never a holder for a rigid request. A `pin`
+/// lease (under [`pin_holder`]) is rigid but not a job: it holds the source like
+/// one and is never listed among the holders.
 #[derive(Clone, Debug)]
 struct Lease {
     job: JobId,
     band: Tuning,
     time_shared: bool,
     elastic: bool,
+    pin: bool,
 }
 
 impl Lease {
@@ -79,8 +82,14 @@ impl Lease {
             band,
             time_shared: false,
             elastic,
+            pin: false,
         }
     }
+}
+
+/// The holder id of `source`'s pin: `pin:<source id>`, never a job's (a ULID).
+pub fn pin_holder(source: &SourceId) -> JobId {
+    JobId(format!("pin:{}", source.0))
 }
 
 #[derive(Default)]
@@ -108,14 +117,16 @@ fn fits(want: &Tuning, cur: &Tuning) -> bool {
 /// Ways out of a conflict between `want` and the port's current band `cur`
 /// that the caller can act on. Widening is listed only when the port could
 /// capture both bands at once; no operation performs it yet. A port under a
-/// time-shared lease (a scan) is freed only by stopping that holder. Last, the
-/// request again with `replace` naming the rigid `holders`, when there are any.
+/// time-shared lease (a scan) is freed only by stopping that holder. Then, on a
+/// `pinned` source, its unpin; last, the request again with `replace` naming the
+/// rigid `holders`, when there are any.
 fn conflict_options(
     port: &dyn Port,
     want: &Tuning,
     cur: &Tuning,
     shared: bool,
     holders: &[JobId],
+    pinned: Option<&SourceId>,
 ) -> Vec<String> {
     if shared {
         return vec!["stop the scan holding the source".to_string()];
@@ -130,6 +141,9 @@ fn conflict_options(
     if n <= port.capabilities().max_bandwidth_hz.value().0 {
         options.push(format!("widen capture to {n} Hz (not yet available)"));
     }
+    if let Some(id) = pinned {
+        options.push(format!("unpin source {} (source_unpin)", id.0));
+    }
     if !holders.is_empty() {
         let ids: Vec<&str> = holders.iter().map(|j| j.0.as_str()).collect();
         options.push(format!("retry with replace: [{}]", ids.join(", ")));
@@ -137,13 +151,18 @@ fn conflict_options(
     options
 }
 
-/// The rigid holders among `leases`: those a conflict names.
+/// The rigid holders among `leases`: those a conflict names (never a pin).
 fn rigid(leases: &[Lease]) -> Vec<JobId> {
     leases
         .iter()
-        .filter(|l| !l.elastic)
+        .filter(|l| !l.elastic && !l.pin)
         .map(|l| l.job.clone())
         .collect()
+}
+
+/// `source` when `leases` hold a pin on it, for [`conflict_options`].
+fn pinned_in<'a>(leases: &[Lease], source: &'a SourceId) -> Option<&'a SourceId> {
+    leases.iter().any(|l| l.pin).then_some(source)
 }
 
 impl LeaseManager {
@@ -234,6 +253,25 @@ impl LeaseManager {
         elastic: bool,
         guard: &OwnedMutexGuard<()>,
     ) -> Result<(Tuning, bool), LeaseError> {
+        self.ensure_as(port, holder, want, elastic, false, guard)
+            .await
+    }
+
+    /// [`LeaseManager::ensure_locked`], the lease marked `pin` when asked (so it
+    /// is never listed among the holders, not even for an instant).
+    async fn ensure_as(
+        &self,
+        port: &dyn Port,
+        holder: JobId,
+        want: Tuning,
+        elastic: bool,
+        pin: bool,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(Tuning, bool), LeaseError> {
+        let lease = |band: Tuning| Lease {
+            pin,
+            ..Lease::new(holder.clone(), band, elastic)
+        };
         let source = port.id().clone();
         self.assert_gate(&source, guard);
         {
@@ -249,17 +287,18 @@ impl LeaseManager {
                 if elastic && !shared {
                     let v = leases.get_mut(&source).unwrap();
                     v.retain(|l| l.job != holder);
-                    v.push(Lease::new(holder, cur, true));
+                    v.push(lease(cur));
                     return Ok((cur, false));
                 }
                 if !elastic && !shared && fits(&want, &cur) {
                     let v = leases.get_mut(&source).unwrap();
                     v.retain(|l| l.job != holder);
-                    v.push(Lease::new(holder, want, false));
+                    v.push(lease(want));
                     return Ok((cur, false));
                 }
                 let holders = rigid(&held);
-                let options = conflict_options(port, &want, &cur, shared, &holders);
+                let pinned = pinned_in(&held, &source);
+                let options = conflict_options(port, &want, &cur, shared, &holders, pinned);
                 return Err(LeaseError::Conflict {
                     source,
                     holders,
@@ -277,7 +316,7 @@ impl LeaseManager {
             {
                 let v = leases.get_mut(&source).unwrap();
                 v.retain(|l| l.job != holder);
-                v.push(Lease::new(holder, want, false));
+                v.push(lease(want));
                 return Ok((cur, false));
             }
         }
@@ -285,8 +324,67 @@ impl LeaseManager {
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source).or_default();
         v.retain(|l| l.job != holder);
-        v.push(Lease::new(holder, got, elastic));
+        // A pin's band is the one asked for: the capture may be wider.
+        v.push(lease(if pin { want } else { got }));
         Ok((got, true))
+    }
+
+    /// Pin `port` at `want` (see [`pin_holder`]) under the source's gate the
+    /// caller holds: any existing pin on the source is set aside, then the band
+    /// is leased as a rigid request (`ensure_locked`), the lease marked `pin`. On
+    /// an error the old pin, if any, is put back. Also whether it tuned the port.
+    pub(crate) async fn pin_locked(
+        &self,
+        port: &dyn Port,
+        want: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(Tuning, bool), LeaseError> {
+        let source = port.id().clone();
+        self.assert_gate(&source, guard);
+        let holder = pin_holder(&source);
+        let old: Vec<Lease> = {
+            let mut leases = self.leases.lock().unwrap();
+            let v = leases.entry(source.clone()).or_default();
+            let old = v.iter().filter(|l| l.pin).cloned().collect();
+            v.retain(|l| !l.pin);
+            if v.is_empty() {
+                leases.remove(&source);
+            }
+            old
+        };
+        let r = self.ensure_as(port, holder, want, false, true, guard).await;
+        if r.is_err() && !old.is_empty() {
+            self.leases
+                .lock()
+                .unwrap()
+                .entry(source)
+                .or_default()
+                .extend(old);
+        }
+        r
+    }
+
+    /// [`LeaseManager::pin_locked`], taking the source's gate.
+    pub async fn pin(&self, port: &dyn Port, want: Tuning) -> Result<(Tuning, bool), LeaseError> {
+        let guard = self.gate_guard(port.id()).await;
+        self.pin_locked(port, want, &guard).await
+    }
+
+    /// Drop `source`'s pin; the pinned band, or `None` when it had none. The
+    /// caller idles the port if nothing else holds it.
+    pub fn unpin(&self, source: &SourceId) -> Option<Tuning> {
+        let pinned = self.pinned(source)?;
+        self.release(&pin_holder(source));
+        Some(pinned)
+    }
+
+    /// The band `source` is pinned at, if it is.
+    pub fn pinned(&self, source: &SourceId) -> Option<Tuning> {
+        self.leases
+            .lock()
+            .unwrap()
+            .get(source)
+            .and_then(|v| v.iter().find(|l| l.pin).map(|l| l.band))
     }
 
     /// Grant `holder` a time-shared lease on the whole `span` of `port`
@@ -321,8 +419,9 @@ impl LeaseManager {
             let cur = port.current().unwrap_or(first.band);
             let shared = v.iter().any(|l| l.time_shared);
             let holders = rigid(v);
+            let pinned = pinned_in(v, &source);
             return Err(LeaseError::Conflict {
-                options: conflict_options(port, &span, &cur, shared, &holders),
+                options: conflict_options(port, &span, &cur, shared, &holders, pinned),
                 holders,
                 source,
                 current: cur,
@@ -333,6 +432,7 @@ impl LeaseManager {
             band: span,
             time_shared: true,
             elastic: false,
+            pin: false,
         });
         Ok(())
     }
@@ -423,7 +523,8 @@ impl LeaseManager {
             return Ok((cur, false));
         }
         let holders = rigid(&held);
-        let options = conflict_options(port, &want, &cur, shared, &holders);
+        let pinned = pinned_in(&held, &source);
+        let options = conflict_options(port, &want, &cur, shared, &holders, pinned);
         Err(LeaseError::Conflict {
             source,
             holders,
@@ -452,7 +553,8 @@ impl LeaseManager {
 
     /// Current rigid holders of `source`, in insertion order, with the band
     /// each leased (a time-shared holder's is its whole span). Elastic leases
-    /// are not holders; see [`LeaseManager::elastic_holders`].
+    /// are not holders (see [`LeaseManager::elastic_holders`]), nor is a pin
+    /// ([`LeaseManager::pinned`]).
     pub fn holders(&self, source: &SourceId) -> Vec<(JobId, Tuning)> {
         self.leases
             .lock()
@@ -460,7 +562,7 @@ impl LeaseManager {
             .get(source)
             .map(|v| {
                 v.iter()
-                    .filter(|l| !l.elastic)
+                    .filter(|l| !l.elastic && !l.pin)
                     .map(|l| (l.job.clone(), l.band))
                     .collect()
             })

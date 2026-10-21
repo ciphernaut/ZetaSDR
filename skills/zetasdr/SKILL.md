@@ -39,7 +39,7 @@ There are two ways to run:
 - `zeta serve --listen PORT --llm-url URL --llm-model NAME` (the other `--llm-*` flags of `zeta ask` apply too) enables `POST /ask` with `{"request": "TEXT", "max_turns": 8}` (`max_turns` 1-32, default 8): the node runs the agent against itself, so every operation it applies appears on the `ops` stream, and answers the transcript (`request`, `answer`, `calls`, `turns`) as `zeta ask` prints it. One run at a time (409 while one is in progress); 503 when serve has no `--llm-url`; a failed run is 502 with the error and the transcript so far; 504 after 300 s.
 - `zeta serve --listen PORT --stt-socket PATH` (env `ZETA_STT_SOCKET`; default `$XDG_RUNTIME_DIR/voiced.sock` when that file exists) enables `POST /stt?lang=CODE` (`lang` defaults to `en`): the body is a 16 kHz mono `audio/wav` (at most 4 MiB), the node hands it to the speech daemon at that Unix socket and answers `{"text": "TRANSCRIPT"}`. The daemon is `local-voice` or any daemon speaking its protocol: one line per connection, `file:<absolute wav path>` answered `ok:<text>` or `error:<message>`, and `languages` answered `ok:en,de,...` (a daemon answering `error:` there is taken to know English only). Instead of a daemon, `--stt-node URL` (env `ZETA_STT_NODE`, secret in `ZETA_STT_NODE_SECRET`, never printed) forwards each request to that node's `POST /stt`; the two flags are exclusive, for every command (exit 1). A forwarded request carries `X-Zeta-Stt-Hop: 1`, and a node that would forward it again answers 508 (`stt forwarding loop`). `GET /stt/languages` answers `{"backend": NAME, "languages": [CODES]}` (503 without a backend). 415 when the body is not WAV, 413 when too large, 422 `{"error": "unsupported", "language", "supported"}` for a language the backend lacks, 502 when the daemon reports an error, 503 when serve has no backend or cannot reach it, 504 after 30 s.
 
-While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job stop`, `graph put`, `source ensure`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
+While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job stop`, `graph put`, `source ensure`, `source pin`, `source unpin`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
 
 Every operation the node applies is appended to `ops.log` in the state directory (rotated at 8 MiB) with its caller's transport (read-only operations are logged without their result); `zeta ops tail --lines N` prints the last N (local only). Every `transcript` event of a `transcribe` job is appended to `transcripts.log` in the state directory (rotated at 8 MiB) with the job, its input, the source and the channel's centre; `zeta transcripts tail --lines N [--job ID]` prints the last N (local only).
 
@@ -47,7 +47,7 @@ Every operation the node applies is appended to `ops.log` in the state directory
 
 ### source_list
 
-List the sources: id, capabilities, `current` band, `holders` (the rigid lease holders' job ids), `elastic` (the jobs following the capture, see `job_start`), `fault`, the source's unrecoverable failure (`null` when healthy), and `bank`, the channel bank shared by the capture's channels (`bin_hz`, `consumers`; `null` for none). Jobs on a faulted source fail with `source ID: FAULT` as their reason; a successful tune (`source_ensure`, `job_start`) clears it. A channelised job's `job_context` holds `channel.path`: `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
+List the sources: id, capabilities, `current` band, `holders` (the rigid lease holders' job ids), `elastic` (the jobs following the capture, see `job_start`), `pin` (the band `source_pin` holds the source at, `null` for none), `fault`, the source's unrecoverable failure (`null` when healthy), and `bank`, the channel bank shared by the capture's channels (`bin_hz`, `consumers`; `null` for none). Jobs on a faulted source fail with `source ID: FAULT` as their reason; a successful tune (`source_ensure`, `job_start`) clears it. A channelised job's `job_context` holds `channel.path`: `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
 
 JSON: `{"op":"source_list"}`
 
@@ -67,6 +67,33 @@ JSON: `{"op":"source_ensure","source":"<id>","center_hz":144800000,"bandwidth_hz
 CLI: `zeta source ensure --source <id> --center-hz 144800000 --bandwidth-hz 12500`
 
 `replace`: job ids that hold the source and may be stopped to make room; they are stopped under the source's gate right before the request, so nothing can take the radio in between. A `conflict` lists the holders; decide whether those jobs may stop, then retry with `replace`. The page's elastic job is never a holder.
+
+### source_pin
+
+Pin the source at a band: a rigid lease held by no job (`source_list` shows it as `pin`, never among `holders`), granted like a rigid `job_start`: inside the capture other rigid jobs hold it is leased without a tune, elsewhere it tunes when only elastic jobs hold the source (they are relaunched on the new capture), else it is a `conflict`. Replaces any pin the source had (a conflict keeps the old one). Persisted in the state directory and restored before any job resumes. The result is the capture.
+
+- source: string; an id from `source list`
+- center_hz: integer (Hz)
+- bandwidth_hz: integer (Hz)
+- replace: array; ids from `job list` (strings), `[]` for none
+
+JSON: `{"op":"source_pin","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"replace":[]}`
+
+CLI: `zeta source pin --source <id> --center-hz 144800000 --bandwidth-hz 12500`
+
+Hold the source at a band without a job: a rigid holder that is not a job, so `replace` cannot name it and a `conflict` offers `unpin source <id> (source_unpin)`. Persisted; restored before anything else on a restart. Put `center_hz` between two channels of the grid you listen to so the receiver's DC spike falls in a guard band (the UHF CB plan's midpoint 476918750 Hz with 1000000 Hz holds all 80 channels).
+
+### source_unpin
+
+Release the source's pin (see `source_pin`).
+
+- source: string; an id from `source list`
+
+JSON: `{"op":"source_unpin","source":"<id>"}`
+
+CLI: `zeta source unpin --source <id>`
+
+Release the pin; the source idles if nothing else holds it.
 
 ### job_start
 

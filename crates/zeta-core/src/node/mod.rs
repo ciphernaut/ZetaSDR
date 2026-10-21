@@ -4,6 +4,7 @@
 mod jsonlog;
 mod launch;
 mod persist;
+mod sources;
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -34,6 +35,8 @@ pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
 pub(crate) use launch::AfterGate;
 use launch::{feed_bank, feed_ring};
 use persist::{io, load, now, persist};
+pub use sources::{GainSetting, SOURCE_RECORD_FORMAT, SourceRecord};
+use sources::{load_sources, persist_source};
 
 const BUS_CAPACITY: usize = 256;
 
@@ -168,6 +171,11 @@ impl LogFile {
 struct Inner {
     state_dir: PathBuf,
     jobs_dir: PathBuf,
+    /// `state_dir/sources`, one [`SourceRecord`] per source.
+    sources_dir: PathBuf,
+    /// The source records, loaded at `open` (those of absent sources included,
+    /// kept untouched) and written through on every change.
+    sources: Mutex<HashMap<SourceId, SourceRecord>>,
     ring_seconds: f64,
     ring_budget_bytes: u64,
     scan_dwell_ms: u64,
@@ -442,6 +450,9 @@ impl Node {
     /// whose input does not run is kept as `Failed` with `input job <id> not
     /// running`, and one that failed that way resumes once its input runs.
     /// Without `cfg.resume` every record is loaded as persisted, untouched.
+    /// Either way, before any of that, each attached source pinned in its record
+    /// (`state_dir/sources`) is held at its pin (see [`Node::source_pin`]), so a
+    /// one-shot node honours the pins too.
     /// `open` itself fails only on
     /// state-directory I/O and on two ports sharing a source id
     /// (`DuplicateSource`).
@@ -452,7 +463,10 @@ impl Node {
     ) -> Result<Self, NodeError> {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
-        let (mut records, load_errors) = load(&jobs_dir)?;
+        let (mut records, mut load_errors) = load(&jobs_dir)?;
+        let sources_dir = cfg.state_dir.join("sources");
+        let (source_records, source_errors) = load_sources(&sources_dir);
+        load_errors.extend(source_errors);
         // Jobs on the radio first: an attached job resumes on its input's streams. A
         // scan first of all, however narrow: it time-shares the source and the others
         // fail naming it, as they would live. Then the widest band first, inside the
@@ -479,10 +493,12 @@ impl Node {
                 end_ns: t,
             }),
         );
-        let node = Node {
+        let mut node = Node {
             inner: Arc::new(Inner {
                 state_dir: cfg.state_dir.clone(),
                 jobs_dir,
+                sources_dir,
+                sources: Mutex::new(source_records),
                 ring_seconds: cfg.ring_seconds,
                 ring_budget_bytes: cfg.ring_budget_bytes,
                 scan_dwell_ms: cfg.scan_dwell_ms,
@@ -511,6 +527,9 @@ impl Node {
         for port in ports {
             node.add_port(port)?;
         }
+        // Pins first: each pinned source is held at its band before any record
+        // resumes, so the records fit inside it or conflict as they would live.
+        node.restore_pins().await;
         let restoring = match resume {
             true => node.resume_captures(&records).await,
             false => Vec::new(),
@@ -566,11 +585,39 @@ impl Node {
         Ok(node)
     }
 
+    /// Lease each attached source whose record has a pin at that band (see
+    /// [`Node::source_pin`]). A pin that cannot be taken (its tune fails) is an
+    /// entry `source <id>: pin <center_hz>/<bandwidth_hz> Hz: <reason>` in
+    /// `load_errors`; the record stays on disk as it was.
+    async fn restore_pins(&mut self) {
+        let mut pins: Vec<(SourceId, Tuning)> = self
+            .inner
+            .sources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, r)| r.pin.map(|t| (id.clone(), t)))
+            .collect();
+        pins.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        for (id, t) in pins {
+            let Some(port) = self.port(&id) else {
+                continue;
+            };
+            if let Err(e) = self.inner.leases.pin(port.as_ref(), t).await {
+                self.load_errors.push(format!(
+                    "source {}: pin {}/{} Hz: {e}",
+                    id.0, t.center_hz.0, t.bandwidth_hz.0
+                ));
+            }
+        }
+    }
+
     /// Before resuming, hold each source at the capture its resumable rigid records
     /// shared (see [`resume_capture`]) with a lease under a fresh id, so the first
     /// launch does not tune it down to its own band and the narrower ones fit again.
     /// The caller releases each returned lease once every record is launched. A
-    /// source with a resumable scan is left alone: the scan takes it first.
+    /// source with a resumable scan is left alone: the scan takes it first; so is a
+    /// pinned source: the pin is its capture.
     async fn resume_captures(&self, records: &[JobRecord]) -> Vec<(JobId, Arc<dyn Port>)> {
         let mut sources: Vec<&SourceId> = records
             .iter()
@@ -584,6 +631,9 @@ impl Node {
             let Some(port) = self.port(source) else {
                 continue;
             };
+            if self.inner.leases.pinned(source).is_some() {
+                continue;
+            }
             let mine: Vec<&JobRecord> = records
                 .iter()
                 .filter(|r| &r.source == source && r.input.is_none() && self.resumable(r))
@@ -637,7 +687,9 @@ impl Node {
     }
 
     /// Files in `state_dir/jobs` that could not be read as a `JobRecord`, or
-    /// whose record id is not a ULID matching the file name.
+    /// whose record id is not a ULID matching the file name; files in
+    /// `state_dir/sources` that could not be read as a [`SourceRecord`]; and the
+    /// pins `open` could not restore.
     pub fn load_errors(&self) -> &[String] {
         &self.load_errors
     }
@@ -1110,6 +1162,103 @@ impl Node {
     /// [`Inner::relaunch_elastic`].
     pub(crate) async fn relaunch_elastic(&self, source: &SourceId) {
         let _ = self.inner.relaunch_elastic(source, None).await;
+    }
+
+    /// Hold `source` at `want` without a job: a rigid lease under
+    /// [`crate::lease::pin_holder`] that is never listed among the holders. Under
+    /// one hold of the source's gate the `replace` jobs are stopped (see
+    /// [`Node::replace_holders`]), any existing pin is set aside and the band is
+    /// leased as a rigid request; a conflict keeps the old pin. The pin is then
+    /// persisted in `sources/<id>.json`; a write that fails releases it and is
+    /// `Io`. A tune relaunches the elastic jobs there once the gate is let go.
+    /// The result is the capture, as `source_ensure`'s.
+    pub async fn source_pin(
+        &self,
+        source: &SourceId,
+        want: Tuning,
+        replace: &[JobId],
+    ) -> Result<Tuning, NodeError> {
+        let port = self
+            .port(source)
+            .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
+        let guard = self.inner.leases.gate_guard(source).await;
+        let leased = match self.replace_holders(source, replace, &guard).await {
+            Ok(()) => self
+                .inner
+                .leases
+                .pin_locked(port.as_ref(), want, &guard)
+                .await
+                .map_err(NodeError::Lease),
+            Err(e) => Err(e),
+        };
+        let (result, tuned) = match leased {
+            Ok((got, tuned)) => match self.set_source_record(source, |r| r.pin = Some(want)) {
+                Ok(()) => (Ok(got), tuned),
+                Err(e) => {
+                    self.inner.leases.unpin(source);
+                    (Err(e), tuned)
+                }
+            },
+            Err(e) => (Err(e), false),
+        };
+        drop(guard);
+        // Outside the gate: the relaunched jobs' leases and the idle take it.
+        if tuned {
+            self.relaunch_elastic(source).await;
+        }
+        if let Err(e) = &result {
+            // The `replace` jobs were stopped without idling the port (as for
+            // `job_start`), and a pin released on a failed write held it: idle it
+            // if nobody holds it now. A refused id stopped nothing.
+            let stopped =
+                !replace.is_empty() && !matches!(e, NodeError::UnknownJob(_) | NodeError::Other(_));
+            if stopped || matches!(e, NodeError::Io(_)) {
+                self.idle_if_unheld(port.as_ref()).await;
+            }
+        }
+        result
+    }
+
+    /// Release `source`'s pin, persist `pin: null` and idle the port if nothing
+    /// else holds it. `Other("source <id> is not pinned")` when it has none; a
+    /// write that fails is `Io`, the pin released all the same.
+    pub async fn source_unpin(&self, source: &SourceId) -> Result<(), NodeError> {
+        let port = self
+            .port(source)
+            .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
+        if self.inner.leases.unpin(source).is_none() {
+            return Err(NodeError::Other(format!(
+                "source {} is not pinned",
+                source.0
+            )));
+        }
+        let written = self.set_source_record(source, |r| r.pin = None);
+        self.idle_if_unheld(port.as_ref()).await;
+        written
+    }
+
+    /// The band `source` is pinned at, if it is.
+    pub fn pinned(&self, source: &SourceId) -> Option<Tuning> {
+        self.inner.leases.pinned(source)
+    }
+
+    /// Change `source`'s record with `change` and write it; on a failed write the
+    /// record in memory is left as it was.
+    fn set_source_record(
+        &self,
+        source: &SourceId,
+        change: impl FnOnce(&mut SourceRecord),
+    ) -> Result<(), NodeError> {
+        let mut sources = self.inner.sources.lock().unwrap();
+        let mut rec = sources
+            .get(source)
+            .cloned()
+            .unwrap_or_else(SourceRecord::new);
+        rec.format = SOURCE_RECORD_FORMAT;
+        change(&mut rec);
+        persist_source(&self.inner.sources_dir, source, &rec)?;
+        sources.insert(source.clone(), rec);
+        Ok(())
     }
 
     /// Jobs currently holding a rigid lease on `source`, with the band each asked for.

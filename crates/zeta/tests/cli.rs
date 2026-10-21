@@ -177,6 +177,80 @@ fn source_file_flag_parses_a_tune_range() {
     }
 }
 
+/// `source pin` holds a file source with a tune range at a band across one-shot
+/// processes: `source list` shows it, `source unpin` releases it, and a second
+/// unpin is `other`.
+#[test]
+fn source_pin_and_unpin_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = write_tone(dir.path());
+    let flag = format!(
+        "retune={},tune_min_hz=50000000,tune_max_hz=150000000",
+        meta.display()
+    );
+    let run = |args: &[&str]| {
+        let mut cmd = zeta_bin();
+        cmd.arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .arg("--source-file")
+            .arg(&flag)
+            .arg("--json")
+            .args(args);
+        cmd
+    };
+    let out = run(&[
+        "source",
+        "pin",
+        "--source",
+        "retune",
+        "--center-hz",
+        "120000000",
+        "--bandwidth-hz",
+        "12500",
+    ])
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "tuning", "{v}");
+    assert_eq!(v["value"]["center_hz"], 120_000_000, "{v}");
+    let out = run(&["source", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let pin = &v["value"][0]["pin"];
+    assert_eq!(pin["center_hz"], 120_000_000, "{v}");
+    assert_eq!(pin["bandwidth_hz"], 12_500, "{v}");
+    let out = run(&["source", "unpin", "--source", "retune"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(json(&out), serde_json::json!({"result": "ok"}));
+    let out = run(&["source", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(json(&out)["value"][0]["pin"].is_null());
+    let out = run(&["source", "unpin", "--source", "retune"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    assert_eq!(v["message"], "source retune is not pinned", "{v}");
+}
+
 #[test]
 fn ensure_dropped_zeros_exit_2_with_suggestion() {
     let dir = tempfile::tempdir().unwrap();
@@ -413,6 +487,8 @@ fn mutating_one_shot_refused_while_serve_lock_held() {
         .chain(band)
         .collect();
     let ensure: Vec<&str> = ["source", "ensure"].into_iter().chain(band).collect();
+    let pin: Vec<&str> = ["source", "pin"].into_iter().chain(band).collect();
+    let unpin = ["source", "unpin", "--source", "tone"];
     let graph = dir.path().join("g.json");
     std::fs::write(&graph, "{}").unwrap();
     let put = [
@@ -425,7 +501,14 @@ fn mutating_one_shot_refused_while_serve_lock_held() {
     ];
     let stop = ["job", "stop", "--job", "j"];
     let want = format!("zeta serve (pid {pid}) owns this state dir");
-    for args in [&start[..], &ensure[..], &put[..], &stop[..]] {
+    for args in [
+        &start[..],
+        &ensure[..],
+        &pin[..],
+        &unpin[..],
+        &put[..],
+        &stop[..],
+    ] {
         let out = zeta(dir.path(), args)
             .assert()
             .code(2)

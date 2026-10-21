@@ -477,7 +477,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 15, "one schema per Op variant");
+    assert_eq!(vs.len(), 17, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -1780,6 +1780,51 @@ fn source_list_schema_has_a_nullable_bank() {
     assert_eq!(bank["additionalProperties"], Value::Bool(false), "{bank}");
 }
 
+/// `source_pin` requires `source`, `center_hz`, `bandwidth_hz` and `replace`;
+/// `source_unpin` requires `source`; `source_list` items carry a nullable `pin`.
+#[test]
+fn source_pin_and_unpin_schema_require_every_field_and_source_list_has_a_nullable_pin() {
+    let s = schema();
+    let fields = |op: &str| {
+        let v = variants(&s["op"])
+            .iter()
+            .find(|v| v["properties"]["op"]["const"] == op)
+            .unwrap_or_else(|| panic!("{op} variant"))
+            .clone();
+        let mut req: Vec<String> = v["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect();
+        req.sort();
+        req
+    };
+    assert_eq!(
+        fields("source_pin"),
+        ["bandwidth_hz", "center_hz", "op", "replace", "source"]
+    );
+    assert_eq!(fields("source_unpin"), ["op", "source"]);
+    let v = serde_json::json!({"op":"source_pin","source":"s",
+        "center_hz":100_000_000,"bandwidth_hz":48_000});
+    let e = serde_json::from_value::<Op>(v).unwrap_err().to_string();
+    assert!(e.contains("replace"), "{e}");
+    let v = serde_json::json!({"op":"source_unpin"});
+    let e = serde_json::from_value::<Op>(v).unwrap_err().to_string();
+    assert!(e.contains("source"), "{e}");
+    let si = &s["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"].as_array().unwrap().contains(&"pin".into()),
+        "{si}"
+    );
+    let ty = si["properties"]["pin"]["type"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{si}"));
+    assert!(ty.contains(&Value::from("null")), "{si}");
+    assert!(ty.contains(&Value::from("object")), "{si}");
+}
+
 /// Fields that serialize `null` say so in their schema: `"null"` is in the
 /// `type` of each.
 #[test]
@@ -1792,6 +1837,7 @@ fn nullable_fields_have_null_in_schema_type() {
         "/result/$defs/FrameSummary/properties/job",
         "/result/$defs/FrameSummary/properties/channel",
         "/result/$defs/SourceInfo/properties/current",
+        "/result/$defs/SourceInfo/properties/pin",
         "/result/$defs/SourceInfo/properties/fault",
         "/error/oneOf/0/properties/suggested",
     ];

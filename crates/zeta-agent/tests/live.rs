@@ -35,6 +35,7 @@ async fn field_host_gemma_tunes_hackrf0() {
         current: None,
         holders: vec![],
         elastic: vec![],
+        pin: None,
         fault: None,
         bank: None,
     }]);

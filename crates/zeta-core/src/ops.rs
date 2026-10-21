@@ -34,7 +34,8 @@ use crate::types::{
 pub enum Op {
     /// List the sources: id, capabilities, `current` band, `holders` (the
     /// rigid lease holders' job ids), `elastic` (the jobs following the
-    /// capture, see `job_start`), `fault`, the source's unrecoverable failure (`null` when
+    /// capture, see `job_start`), `pin` (the band `source_pin` holds the source
+    /// at, `null` for none), `fault`, the source's unrecoverable failure (`null` when
     /// healthy), and `bank`, the channel bank shared by the capture's channels
     /// (`bin_hz`, `consumers`; `null` for none). Jobs on a faulted source fail with
     /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,
@@ -55,6 +56,25 @@ pub enum Op {
         /// Jobs holding the source that may be stopped to make room (`[]` for
         /// none); see `job_start`.
         replace: Vec<JobId>,
+    },
+    /// Pin the source at a band: a rigid lease held by no job (`source_list`
+    /// shows it as `pin`, never among `holders`), granted like a rigid
+    /// `job_start`: inside the capture other rigid jobs hold it is leased without
+    /// a tune, elsewhere it tunes when only elastic jobs hold the source (they are
+    /// relaunched on the new capture), else it is a `conflict`. Replaces any pin
+    /// the source had (a conflict keeps the old one). Persisted in the state
+    /// directory and restored before any job resumes. The result is the capture.
+    SourcePin {
+        source: SourceId,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+        /// Jobs holding the source that may be stopped to make room (`[]` for
+        /// none); see `job_start`.
+        replace: Vec<JobId>,
+    },
+    /// Release the source's pin (see `source_pin`).
+    SourceUnpin {
+        source: SourceId,
     },
     JobStart {
         kind: JobKind,
@@ -873,6 +893,9 @@ pub struct SourceInfo {
     pub holders: Vec<JobId>,
     /// The elastic jobs following the source's capture.
     pub elastic: Vec<JobId>,
+    /// The band `source_pin` holds the source at; `null` when unpinned.
+    #[schemars(required, schema_with = "crate::types::nullable::<Tuning>")]
+    pub pin: Option<Tuning>,
     /// The port's unrecoverable failure (`Port::fault`); `null` when healthy.
     /// Jobs on a faulted source fail with it; a successful tune clears it.
     #[schemars(required, schema_with = "nullable_string")]
@@ -995,6 +1018,8 @@ impl Op {
         match self {
             Op::SourceList {} => "source_list",
             Op::SourceEnsure { .. } => "source_ensure",
+            Op::SourcePin { .. } => "source_pin",
+            Op::SourceUnpin { .. } => "source_unpin",
             Op::JobStart { .. } => "job_start",
             Op::JobAttach { .. } => "job_attach",
             Op::JobList {} => "job_list",
@@ -1497,6 +1522,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                         .map(|(j, _)| j)
                         .collect(),
                     elastic: node.lease_elastic(&id),
+                    pin: node.pinned(&id),
                     fault: node.port(&id).and_then(|p| p.fault()),
                     bank: node.bank(&id).map(|b| BankInfo {
                         bin_hz: b.bin_hz(),
@@ -1541,6 +1567,31 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 node.relaunch_elastic(&source).await;
             }
             Ok(OpResult::Tuning(got))
+        }
+        Op::SourcePin {
+            source,
+            center_hz,
+            bandwidth_hz,
+            replace,
+        } => {
+            let want = Tuning {
+                center_hz,
+                bandwidth_hz,
+            };
+            checked_port(node, &source, &want)?;
+            node.source_pin(&source, want, &replace)
+                .await
+                .map(OpResult::Tuning)
+                .map_err(|e| node_error(node, e))
+        }
+        Op::SourceUnpin { source } => {
+            if node.port(&source).is_none() {
+                return Err(unknown_source(node, &source));
+            }
+            node.source_unpin(&source)
+                .await
+                .map(|()| OpResult::Ok)
+                .map_err(|e| node_error(node, e))
         }
         Op::JobStart {
             kind,

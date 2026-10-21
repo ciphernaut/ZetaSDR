@@ -335,9 +335,22 @@ pub enum SourceCmd {
         #[command(flatten)]
         replace: ReplaceArg,
     },
+    /// Hold a source at a band without a job (persisted; restored on restart)
+    Pin {
+        #[command(flatten)]
+        band: BandArgs,
+        #[command(flatten)]
+        replace: ReplaceArg,
+    },
+    /// Release a source's pin
+    Unpin {
+        /// Source id
+        #[arg(long)]
+        source: String,
+    },
 }
 
-/// `--replace ID[,ID]` on `job start` and `source ensure`.
+/// `--replace ID[,ID]` on `job start`, `source ensure` and `source pin`.
 #[derive(Debug, Args)]
 pub struct ReplaceArg {
     /// Jobs holding the source that may be stopped to make room, comma-separated
@@ -628,8 +641,9 @@ impl Command {
     pub fn mutates(&self) -> bool {
         matches!(
             self,
-            Command::Source(SourceCmd::Ensure { .. })
-                | Command::Job(JobCmd::Start { .. } | JobCmd::Attach { .. } | JobCmd::Stop(_))
+            Command::Source(
+                SourceCmd::Ensure { .. } | SourceCmd::Pin { .. } | SourceCmd::Unpin { .. }
+            ) | Command::Job(JobCmd::Start { .. } | JobCmd::Attach { .. } | JobCmd::Stop(_))
                 | Command::Graph(GraphCmd::Put { .. })
         )
     }
@@ -658,6 +672,15 @@ impl Command {
                 center_hz: Hz(b.center_hz),
                 bandwidth_hz: Hz(b.bandwidth_hz),
                 replace: replace.into_ids(),
+            },
+            Command::Source(SourceCmd::Pin { band: b, replace }) => Op::SourcePin {
+                source: SourceId(b.source),
+                center_hz: Hz(b.center_hz),
+                bandwidth_hz: Hz(b.bandwidth_hz),
+                replace: replace.into_ids(),
+            },
+            Command::Source(SourceCmd::Unpin { source }) => Op::SourceUnpin {
+                source: SourceId(source),
             },
             Command::Job(JobCmd::Start {
                 kind,
