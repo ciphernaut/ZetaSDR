@@ -453,13 +453,19 @@ impl Stage for VadStage {
             speaking: false,
         }));
         let st = state.clone();
-        run_map(inputs, bus.clone(), cancel, move |input| {
-            let mut st = st.lock().expect("vad state");
-            match input {
-                Input::Frame(f) => st.process(&f, &params),
-                Input::Lagged { .. } => Ok(st.lagged()),
-            }
-        })
+        run_map(
+            self.spec().kind,
+            inputs,
+            bus.clone(),
+            cancel,
+            move |input| {
+                let mut st = st.lock().expect("vad state");
+                match input {
+                    Input::Frame(f) => st.process(&f, &params),
+                    Input::Lagged { .. } => Ok(st.lagged()),
+                }
+            },
+        )
         .await?;
         let tail = state.lock().expect("vad state").flush();
         for f in tail {

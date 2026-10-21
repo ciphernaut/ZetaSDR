@@ -56,19 +56,43 @@ impl StageSpec {
     }
 }
 
+/// A stage's note to its job: merged into the job's context (shallow, as
+/// `job_context_merge`).
+pub type StageNote = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
+
 /// What a stage knows of the job it runs in beyond its params and streams:
-/// the job's source and, when the node keeps one for it, the source's
-/// channel bank.
+/// the job's source, when the node keeps one for it, the source's channel
+/// bank, and the job's [`StageNote`] when it runs in a node.
 #[derive(Clone)]
 pub struct StageContext {
     pub source: SourceId,
     pub bank: Option<Arc<dyn ChannelBank>>,
+    pub note: Option<StageNote>,
 }
 
 impl StageContext {
-    /// A context for `source` with no bank.
+    /// A context for `source` with no bank and no note.
     pub fn new(source: SourceId) -> Self {
-        Self { source, bank: None }
+        Self {
+            source,
+            bank: None,
+            note: None,
+        }
+    }
+
+    /// This context with `note`.
+    pub fn with_note(self, note: StageNote) -> Self {
+        Self {
+            note: Some(note),
+            ..self
+        }
+    }
+
+    /// Merge `value` into the job's context; nothing without a note.
+    pub fn note(&self, value: serde_json::Value) {
+        if let Some(n) = &self.note {
+            n(value);
+        }
     }
 }
 

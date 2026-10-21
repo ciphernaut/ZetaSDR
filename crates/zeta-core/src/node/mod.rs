@@ -70,6 +70,10 @@ pub struct NodeConfig {
     /// How long a `scan` job dwells on each step; normally
     /// [`crate::ops::SCAN_DWELL_MS`], shorter in tests.
     pub scan_dwell_ms: u64,
+    /// Makes the channel banks of wide sources; installed before any port is
+    /// added, so resumed jobs get a bank as fresh ones do. `None`: no banks
+    /// (until [`Node::set_bank_factory`]).
+    pub bank_factory: Option<Arc<dyn BankFactory>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -244,6 +248,32 @@ impl Inner {
             jobs.remove(id);
             let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", id.0)));
         }
+    }
+
+    /// See [`Node::job_context_merge`].
+    fn context_merge(&self, id: &JobId, patch: serde_json::Value) -> Result<(), NodeError> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let entry = jobs
+            .get_mut(id)
+            .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        let ctx = &mut entry.record.context;
+        match patch {
+            serde_json::Value::Object(p) => {
+                if !ctx.is_object() {
+                    *ctx = serde_json::json!({});
+                }
+                let obj = ctx.as_object_mut().expect("context is an object");
+                for (k, v) in p {
+                    if v.is_null() {
+                        obj.remove(&k);
+                    } else {
+                        obj.insert(k, v);
+                    }
+                }
+            }
+            other => *ctx = other,
+        }
+        persist(&self.jobs_dir, &entry.record)
     }
 
     /// The audio stream an attached job reads from `job`: the last audio output stream
@@ -423,7 +453,7 @@ impl Node {
                 bus,
                 ports: RwLock::new(HashMap::new()),
                 rings: Mutex::new(HashMap::new()),
-                bank_factory: RwLock::new(None),
+                bank_factory: RwLock::new(cfg.bank_factory),
                 banks: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
                 knowledge: RwLock::new(Vec::new()),
@@ -1013,28 +1043,7 @@ impl Node {
     /// Shallow JSON merge patch: each top-level key of an object `patch` is set,
     /// or removed when its value is `null`; a non-object `patch` replaces the context.
     pub fn job_context_merge(&self, id: &JobId, patch: serde_json::Value) -> Result<(), NodeError> {
-        let mut jobs = self.inner.jobs.lock().unwrap();
-        let entry = jobs
-            .get_mut(id)
-            .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
-        let ctx = &mut entry.record.context;
-        match patch {
-            serde_json::Value::Object(p) => {
-                if !ctx.is_object() {
-                    *ctx = serde_json::json!({});
-                }
-                let obj = ctx.as_object_mut().expect("context is an object");
-                for (k, v) in p {
-                    if v.is_null() {
-                        obj.remove(&k);
-                    } else {
-                        obj.insert(k, v);
-                    }
-                }
-            }
-            other => *ctx = other,
-        }
-        persist(&self.inner.jobs_dir, &entry.record)
+        self.inner.context_merge(id, patch)
     }
 
     /// The source's IQ history; `None` until its first block arrives.

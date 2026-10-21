@@ -144,7 +144,7 @@ impl Stage for NbfmDemodStage {
         };
         let mut prev = Complex::new(0.0f32, 0.0);
         let mut filter = AudioFilter::default();
-        run_map(inputs, bus, cancel, move |input| {
+        run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {

@@ -223,6 +223,7 @@ fn cfg_dwell(dir: &Path, scan_dwell_ms: u64) -> NodeConfig {
         backends: vec![Backend::Cpu],
         resume: true,
         scan_dwell_ms,
+        bank_factory: None,
     }
 }
 

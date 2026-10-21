@@ -165,6 +165,7 @@ fn cfg(dir: &Path) -> NodeConfig {
         scan_dwell_ms: 20,
         backends: vec![Backend::Cpu],
         resume: true,
+        bank_factory: None,
     }
 }
 

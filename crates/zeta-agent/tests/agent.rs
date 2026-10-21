@@ -57,6 +57,7 @@ async fn tone_node(dir: &std::path::Path) -> Arc<Node> {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        bank_factory: None,
     };
     let ports = vec![source.clone() as Arc<dyn Port>];
     let node = Arc::new(Node::open(cfg, registry, ports).await.expect("open node"));

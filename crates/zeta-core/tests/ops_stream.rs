@@ -21,6 +21,7 @@ fn cfg(dir: &Path) -> NodeConfig {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        bank_factory: None,
     }
 }
 

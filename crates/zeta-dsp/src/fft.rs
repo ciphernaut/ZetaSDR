@@ -426,7 +426,7 @@ impl Stage for FftStage {
         let rows_per_s = p.rows_per_s;
         let backend = self.backend.clone();
         let mut cutter = RowCutter::new(size, p.window, rows_per_s);
-        run_map(inputs, bus, cancel, move |input| {
+        run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {

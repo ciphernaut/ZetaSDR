@@ -67,6 +67,7 @@ async fn retune_resizes_ring_within_budget() {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        bank_factory: None,
     };
     let node = Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap();
     let port = Arc::new(Wide {

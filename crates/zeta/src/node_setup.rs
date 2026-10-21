@@ -263,12 +263,11 @@ pub async fn open(
         backends,
         resume,
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
+        bank_factory: Some(Arc::new(zeta_dsp::bank::PfbBankFactory)),
     };
     let node = Node::open(cfg, registry, ports)
         .await
         .map_err(|e| e.to_string())?;
-    // Jobs resumed by `open` predate the factory and run without a bank.
-    node.set_bank_factory(Arc::new(zeta_dsp::bank::PfbBankFactory));
     for s in &files {
         s.start();
     }

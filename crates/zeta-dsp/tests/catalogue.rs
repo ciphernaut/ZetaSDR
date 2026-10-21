@@ -162,6 +162,7 @@ async fn knowledge_lookup_returns_catalogue_signatures() {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        bank_factory: None,
     };
     let node = Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap();
     node.add_knowledge(Arc::new(CatalogueKnowledge));
@@ -231,6 +232,7 @@ async fn lookup(center_hz: u64, bandwidth_hz: u64) -> Vec<zeta_core::knowledge::
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        bank_factory: None,
     };
     let node = Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap();
     node.add_knowledge(Arc::new(CatalogueKnowledge));

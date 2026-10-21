@@ -78,7 +78,7 @@ impl Stage for AprsDecodeStage {
             return Err(StageError::Failed("expected 1 output".into()));
         };
         let mut dec: Option<Decoder> = None;
-        run_map(inputs, bus, cancel, move |input| {
+        run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {

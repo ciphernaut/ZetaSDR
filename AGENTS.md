@@ -42,7 +42,7 @@ Every operation the node applies is appended to `ops.log` in the state directory
 
 ### source_list
 
-List the sources: id, capabilities, `current` band, `holders` (the rigid lease holders' job ids), `elastic` (the jobs following the capture, see `job_start`) and `fault`, the source's unrecoverable failure (`null` when healthy). Jobs on a faulted source fail with `source ID: FAULT` as their reason; a successful tune (`source_ensure`, `job_start`) clears it.
+List the sources: id, capabilities, `current` band, `holders` (the rigid lease holders' job ids), `elastic` (the jobs following the capture, see `job_start`), `fault`, the source's unrecoverable failure (`null` when healthy), and `bank`, the channel bank shared by the capture's channels (`bin_hz`, `consumers`; `null` for none). Jobs on a faulted source fail with `source ID: FAULT` as their reason; a successful tune (`source_ensure`, `job_start`) clears it. A channelised job's `job_context` holds `channel.path`: `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
 
 JSON: `{"op":"source_list"}`
 

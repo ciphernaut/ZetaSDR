@@ -382,6 +382,7 @@ async fn local_node(dir: &std::path::Path, port: Arc<dyn Port>) -> Node {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        bank_factory: None,
     };
     Node::open(cfg, registry, vec![port]).await.expect("node")
 }

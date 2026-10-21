@@ -785,7 +785,7 @@ impl Stage for MeasureStage {
         // Window under construction: first frame's provenance, t0, rate, centre.
         let mut window: Option<(Provenance, Timestamp, u64, u64)> = None;
         let mut buf: Vec<Complex<f32>> = Vec::new();
-        run_map(inputs, bus, cancel, move |input| {
+        run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {

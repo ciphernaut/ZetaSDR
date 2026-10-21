@@ -1,7 +1,6 @@
 //! Channel stage: shift a channel to baseband, low-pass it and decimate.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use num_complex::Complex;
@@ -15,7 +14,7 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{ChannelId, Hz, Provenance, StreamId, StreamKind, Timestamp};
 
 use crate::util::lowpass_taps;
-use crate::{Input, LAGGED_FRAMES, frame_span, run_map};
+use crate::{Input, frame_span, note_lag, run_map};
 
 /// Fewest and most taps of the channel low-pass filter.
 const MIN_TAPS: usize = 63;
@@ -251,7 +250,9 @@ impl Stage for ChannelStage {
     /// rate; the job's IQ input is then only watched for its end and band.
     /// Otherwise (no bank, too wide, out of band, or a rate the bin rate does
     /// not divide, as in graphs written for the source rate) it filters the
-    /// job's IQ input directly.
+    /// job's IQ input directly. Either way it notes the path in the job's
+    /// context: `{"channel": {"path": "bank", "bin_hz": N}}`, or
+    /// `{"channel": {"path": "direct", "reason": R}}` saying why not the bank.
     async fn run(
         &self,
         params: serde_json::Value,
@@ -273,27 +274,53 @@ impl Stage for ChannelStage {
             state: ChannelState::new(),
         };
         // Checked before subscribing, so a declined bank keeps no receiver.
-        if let Some(bank) = &ctx.bank
-            && chan.p.bandwidth_hz <= bank.bin_hz()
-            && chan.p.out_rate_hz > 0
-            && (2 * bank.bin_hz()).is_multiple_of(chan.p.out_rate_hz)
-            && let Ok((bin, _, _)) = bank.subscribe(chan.p.center_hz, chan.p.bandwidth_hz)
-        {
-            // The job's provenance, as registered for the output stream.
-            let base = bus
-                .list()
-                .into_iter()
-                .find(|i| i.id == chan.out)
-                .map(|i| i.provenance)
-                .unwrap_or_else(|| Provenance {
-                    source: ctx.source.clone(),
-                    job: None,
-                    channel: None,
-                    span: frame_span(Timestamp(0), 0, 0),
-                });
-            return run_bin(chan, base, bank.band(), bin, inputs, bus, cancel).await;
+        let bin = match &ctx.bank {
+            None => Err("no bank".to_string()),
+            Some(bank) => {
+                let (bin_hz, p) = (bank.bin_hz(), &chan.p);
+                if p.bandwidth_hz > bin_hz {
+                    Err(format!(
+                        "band {} Hz wider than a bin ({bin_hz} Hz)",
+                        p.bandwidth_hz
+                    ))
+                } else if p.out_rate_hz == 0 || !(2 * bin_hz).is_multiple_of(p.out_rate_hz) {
+                    Err(format!(
+                        "bin rate {} Hz not a multiple of out_rate_hz {}",
+                        2 * bin_hz,
+                        p.out_rate_hz
+                    ))
+                } else {
+                    bank.subscribe(p.center_hz, p.bandwidth_hz)
+                        .map(|(bin, _, _)| (bank, bin))
+                        .map_err(|e| e.to_string())
+                }
+            }
+        };
+        let kind = self.spec().kind;
+        match bin {
+            Ok((bank, bin)) => {
+                ctx.note(serde_json::json!({
+                    "channel": {"path": "bank", "bin_hz": bank.bin_hz()},
+                }));
+                // The job's provenance, as registered for the output stream.
+                let base = bus
+                    .list()
+                    .into_iter()
+                    .find(|i| i.id == chan.out)
+                    .map(|i| i.provenance)
+                    .unwrap_or_else(|| Provenance {
+                        source: ctx.source.clone(),
+                        job: None,
+                        channel: None,
+                        span: frame_span(Timestamp(0), 0, 0),
+                    });
+                return run_bin(kind, chan, base, bank.band(), bin, inputs, bus, cancel).await;
+            }
+            Err(reason) => ctx.note(serde_json::json!({
+                "channel": {"path": "direct", "reason": reason},
+            })),
         }
-        run_map(inputs, bus, cancel, move |input| {
+        run_map(kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {
@@ -362,10 +389,12 @@ impl Channel {
 
 /// The bank path: filter the bin stream `bin` of a bank over `band`, ending
 /// cleanly when the job's IQ input closes. A lagging bin resets the filter
-/// state. The stage fails when a job IQ block shows the capture has left
+/// state, counted under `kind` as [`run_map`] counts. The stage fails when a job IQ block shows the capture has left
 /// `band` (the node then makes a new bank this stage is not on) or when the
 /// bin closes.
+#[allow(clippy::too_many_arguments)]
 async fn run_bin(
+    kind: &'static str,
     mut chan: Channel,
     base: Provenance,
     band: Tuning,
@@ -390,8 +419,7 @@ async fn run_bin(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    LAGGED_FRAMES.fetch_add(n, Ordering::Relaxed);
-                    eprintln!("zeta-dsp: channel lagged its bank bin, {n} blocks skipped");
+                    note_lag(kind, n);
                     chan.state = ChannelState::new();
                 }
                 Err(broadcast::error::RecvError::Closed) => {

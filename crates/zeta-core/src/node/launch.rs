@@ -167,12 +167,19 @@ impl Inner {
                     .and_then(|s| s.bank.clone()),
             };
         }
-        let ctx = StageContext {
-            source: rec.source.clone(),
-            bank,
-        };
-
         let id = rec.id.clone();
+        // Weak: a running stage's note never keeps the node alive.
+        let (inner, job) = (Arc::downgrade(self), id.clone());
+        let ctx = StageContext {
+            bank,
+            ..StageContext::new(rec.source.clone())
+        }
+        .with_note(Arc::new(move |v| {
+            if let Some(inner) = inner.upgrade() {
+                let _ = inner.context_merge(&job, v);
+            }
+        }));
+
         let token = self.shutdown.child_token();
         let graph = rec.graph.clone();
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.

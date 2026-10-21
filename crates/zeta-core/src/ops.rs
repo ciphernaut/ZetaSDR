@@ -34,9 +34,12 @@ use crate::types::{
 pub enum Op {
     /// List the sources: id, capabilities, `current` band, `holders` (the
     /// rigid lease holders' job ids), `elastic` (the jobs following the
-    /// capture, see `job_start`) and `fault`, the source's unrecoverable failure (`null` when
-    /// healthy). Jobs on a faulted source fail with `source ID: FAULT` as
-    /// their reason; a successful tune (`source_ensure`, `job_start`) clears it.
+    /// capture, see `job_start`), `fault`, the source's unrecoverable failure (`null` when
+    /// healthy), and `bank`, the channel bank shared by the capture's channels
+    /// (`bin_hz`, `consumers`; `null` for none). Jobs on a faulted source fail with
+    /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,
+    /// `job_start`) clears it. A channelised job's `job_context` holds `channel.path`:
+    /// `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
     SourceList {},
     /// Check a band against the source and tune it if no job holds it. Takes
     /// no lease: an unheld source is tuned directly (a later `job_start` may
@@ -874,6 +877,19 @@ pub struct SourceInfo {
     /// Jobs on a faulted source fail with it; a successful tune clears it.
     #[schemars(required, schema_with = "nullable_string")]
     pub fault: Option<String>,
+    /// The channel bank the node keeps for the source's capture; `null` when it
+    /// keeps none (a narrow capture, or no bank factory).
+    #[schemars(required, schema_with = "crate::types::nullable::<BankInfo>")]
+    pub bank: Option<BankInfo>,
+}
+
+/// A source's channel bank: its bin spacing and live subscribers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct BankInfo {
+    pub bin_hz: u64,
+    pub consumers: usize,
 }
 
 /// One frame of a `stream_tail`, as JSON. `source`, `job`, `channel` and
@@ -1482,6 +1498,10 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                         .collect(),
                     elastic: node.lease_elastic(&id),
                     fault: node.port(&id).and_then(|p| p.fault()),
+                    bank: node.bank(&id).map(|b| BankInfo {
+                        bin_hz: b.bin_hz(),
+                        consumers: b.consumers(),
+                    }),
                     id,
                     capabilities,
                 })

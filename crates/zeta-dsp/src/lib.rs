@@ -1,7 +1,7 @@
 //! ZetaSDR DSP stages.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -103,6 +103,28 @@ pub fn lagged_frames() -> u64 {
     LAGGED_FRAMES.load(Ordering::Relaxed)
 }
 
+/// [`LAGGED_FRAMES`] by stage kind, in the order each kind first lagged.
+static LAGGED_BY_KIND: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+/// Input frames skipped since start-up, per stage kind that ever lagged.
+pub fn lagged_frames_by_kind() -> Vec<(&'static str, u64)> {
+    LAGGED_BY_KIND.lock().unwrap().clone()
+}
+
+/// A `kind` stage skipped `n` input frames: count them in [`LAGGED_FRAMES`] and
+/// [`lagged_frames_by_kind`], and say so on stderr.
+pub(crate) fn note_lag(kind: &'static str, n: u64) {
+    LAGGED_FRAMES.fetch_add(n, Ordering::Relaxed);
+    {
+        let mut by_kind = LAGGED_BY_KIND.lock().unwrap();
+        match by_kind.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, c)) => *c += n,
+            None => by_kind.push((kind, n)),
+        }
+    }
+    eprintln!("zeta-dsp: {kind} stage lagged, {n} frames skipped");
+}
+
 /// What a stage's closure sees: a frame, or a marker that `missed` frames were
 /// skipped before the next one, so stateful stages must reset.
 pub(crate) enum Input {
@@ -115,11 +137,12 @@ pub(crate) enum Input {
 
 /// The loop every single-input stage runs: map each frame on `inputs[0]` through
 /// `f` and publish what it returns. Cancellation wins over pending input and
-/// returns `Cancelled`; lagged input is counted in [`LAGGED_FRAMES`], logged to
-/// stderr once per lag event and passed to `f` as [`Input::Lagged`] so the
+/// returns `Cancelled`; lagged input is counted under `kind` (see [`note_lag`]),
+/// logged to stderr once per lag event and passed to `f` as [`Input::Lagged`] so the
 /// stage can drop its streaming state; a closed input returns `Ok(())`; an
 /// error from `f` ends the stage with that error.
 pub(crate) async fn run_map<F>(
+    kind: &'static str,
     mut inputs: Vec<broadcast::Receiver<Frame>>,
     bus: Arc<StreamBus>,
     cancel: CancellationToken,
@@ -143,8 +166,7 @@ where
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    LAGGED_FRAMES.fetch_add(n, Ordering::Relaxed);
-                    eprintln!("zeta-dsp: stage lagged, {n} frames skipped");
+                    note_lag(kind, n);
                     for out in f(Input::Lagged { missed: n })? {
                         bus.publish(out);
                     }
@@ -190,6 +212,7 @@ mod tests {
         drop(tx);
         let mut seen = Vec::new();
         run_map(
+            "marker",
             vec![rx],
             Arc::new(StreamBus::new(4)),
             CancellationToken::new(),
@@ -207,6 +230,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(seen, ["lag2", "2", "3"]);
+    }
+
+    #[tokio::test]
+    async fn lag_line_names_the_kind() {
+        let prov = Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(1),
+            },
+        };
+        let (tx, rx) = broadcast::channel(2);
+        for i in 0..5 {
+            tx.send(Frame::new(
+                StreamId::new(),
+                prov.clone(),
+                Payload::Event(serde_json::json!(i)),
+            ))
+            .unwrap();
+        }
+        drop(tx);
+        run_map(
+            "passthrough",
+            vec![rx],
+            Arc::new(StreamBus::new(4)),
+            CancellationToken::new(),
+            |_| Ok(Vec::new()),
+        )
+        .await
+        .unwrap();
+        let by_kind = super::lagged_frames_by_kind();
+        assert!(
+            by_kind.iter().any(|&(k, n)| k == "passthrough" && n > 0),
+            "{by_kind:?}"
+        );
     }
 
     /// Every object schema with properties denies unknown fields and requires

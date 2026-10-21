@@ -114,6 +114,7 @@ fn spawn(
     let ctx = StageContext {
         source: SourceId("wide".into()),
         bank,
+        note: None,
     };
     let (bus2, rx_in, c2) = (bus.clone(), root.subscribe(), cancel.clone());
     let stage = tokio::spawn(async move {
@@ -478,6 +479,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        bank_factory: None,
     };
     let node = Node::open(cfg, reg, vec![]).await.unwrap();
     let factory = Arc::new(CountingPfb(Default::default()));

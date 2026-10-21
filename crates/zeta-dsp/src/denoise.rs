@@ -137,7 +137,7 @@ impl Stage for DenoiseStage {
         };
         // Timing comes from the first frame: (rate, channels, denoiser).
         let mut run: Option<(u64, u16, Denoiser)> = None;
-        run_map(inputs, bus, cancel, move |input| {
+        run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {

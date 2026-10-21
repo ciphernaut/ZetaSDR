@@ -101,6 +101,7 @@ fn cfg(dir: &Path) -> NodeConfig {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        bank_factory: None,
     }
 }
 
@@ -1753,6 +1754,30 @@ async fn source_list_reports_fault() {
         serde_json::json!(["string", "null"]),
         "{si}"
     );
+}
+
+/// `source_list` items carry `bank`: required, nullable, and when present an object
+/// with `bin_hz` and `consumers` required and nothing else.
+#[test]
+fn source_list_schema_has_a_nullable_bank() {
+    let si = &schema()["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"].as_array().unwrap().contains(&"bank".into()),
+        "{si}"
+    );
+    let bank = &si["properties"]["bank"];
+    let ty = bank["type"].as_array().unwrap_or_else(|| panic!("{bank}"));
+    assert!(ty.contains(&Value::from("null")), "{bank}");
+    assert!(ty.contains(&Value::from("object")), "{bank}");
+    let mut req: Vec<&str> = bank["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    req.sort();
+    assert_eq!(req, ["bin_hz", "consumers"], "{bank}");
+    assert_eq!(bank["additionalProperties"], Value::Bool(false), "{bank}");
 }
 
 /// Fields that serialize `null` say so in their schema: `"null"` is in the

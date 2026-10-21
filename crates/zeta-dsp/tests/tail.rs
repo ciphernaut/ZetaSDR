@@ -31,6 +31,7 @@ async fn stream_tail_returns_events_from_running_job() {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        bank_factory: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     src.start();

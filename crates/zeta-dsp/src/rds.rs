@@ -703,7 +703,7 @@ impl Stage for RdsDecodeStage {
             return Err(StageError::Failed("expected 1 output".into()));
         };
         let mut pipeline: Option<RdsPipeline> = None;
-        run_map(inputs, bus, cancel, move |input| {
+        run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {
