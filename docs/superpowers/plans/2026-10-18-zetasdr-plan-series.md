@@ -583,9 +583,11 @@ Upgrade: `source_list` items carry `pin`, `gain` and `bank`, so an older node us
 
 Gates at the branch head:
 
-- `cargo test --workspace --all-features --no-fail-fast`: 873 passed, 0 failed, 3 ignored (110 `test
-  result` lines), no `FAILED`, no `ui e2e skipped`. The UI suite
-  (`ui_scenarios_pass_in_headless_chromium`) ran ok in 234.32 s.
+- `cargo test --workspace --all-features --no-fail-fast` (after the final-review fixes): 878
+  passed, 0 failed, 3 ignored (110 `test result` lines), no `FAILED`, no `ui e2e skipped`. The UI
+  suite (`ui_scenarios_pass_in_headless_chromium`) ran ok in 239.10 s in that gate (233.28 s
+  alone).
+- `RUSTFLAGS="--cfg soapy" cargo build -p zeta --release` builds and links the driver.
 - `cargo fmt -p` for each workspace member, `rustfmt --edition 2024 --check` on the driver,
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `zeta agents-md --check`,
   `--skill --check` and `cargo check` in the driver crate are clean.
