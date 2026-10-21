@@ -329,6 +329,10 @@ Note the squelch does not save the `channel` stage's cost, which dominates a dir
 1 025 taps per output sample, `crates/zeta-dsp/src/channel.rs:21-33`); the bank path is what saves
 that (3.8).
 
+Decision (2026-10-21, the user): alternative (a). The squelch is always on and automatic; `job_start`
+gains no field and no caller changes. `expand` writes `squelch_db: null, squelch: true` into the demod
+node's params so `graph_get` shows them and `graph_put` sets a fixed threshold or turns the squelch off.
+
 ### 3.8 Resumed jobs and the channel bank
 
 **Cause.** `crates/zeta/src/node_setup.rs:267-271` opens the node and only then installs the bank
@@ -458,14 +462,14 @@ scenarios); whether the `sources/` loader shares `persist::load`'s shape.
    simpler but loses the setting on every restart, which is what the user complained of.
 3. **LO placement.** Recommendation: the caller places the centre between channels (3.3), documented
    with the UHF CB example; no LO offset. Revisit if a band has no guard band to put the spike in.
-4. **Frequency correction `ppm=`.** Recommendation: build it as the small optional task it is (a
+4. **Frequency correction `ppm=`.** Decided 2026-10-21: build it. Recommendation: build it as the small optional task it is (a
    multiply in `tune`), since the error is measured and affects every reported frequency; the user
    measures the value (2.7 or 3.4 ppm) and may strike the task.
 5. **Squelch.** Recommendation: build it; the CPU case is strong and the idle hiss is a defect. Two
    sub-questions: (a) `job_start` gaining `squelch_db` changes a required field, so every caller and
    both ends of a `--source-node` link must move together (as plan 11's `elastic`): the cheaper
    alternative is automatic squelch always on with no field, and `graph_put` for a fixed threshold or
-   off; (b) the 6 dB / 3 dB / 300 ms constants are a first guess the live acceptance tunes.
+   off — decided: this alternative (2026-10-21); (b) the 6 dB / 3 dB / 300 ms constants are a first guess the live acceptance tunes.
 6. **Transcript lines for errors and drops.** Recommendation: log them (with `text: null`), so a gap in
    a channel's transcript is explained in the same file; strike if the log should hold only speech.
 7. **Resampler snap bound.** Recommendation: `SNAP_FACTOR` 2 048 and `SNAP_MAX_PPM` 1 000; the error is
