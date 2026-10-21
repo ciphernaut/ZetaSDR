@@ -1092,6 +1092,8 @@ impl Node {
         graph: Graph,
         capture_rate_hz: Option<Hz>,
     ) -> Result<(), NodeError> {
+        let mut graph = graph;
+        crate::ops::fill_squelch_params(&mut graph);
         graph::validate(&graph, &self.inner.registry)?;
         let running = {
             let jobs = self.inner.jobs.lock().unwrap();

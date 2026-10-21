@@ -114,6 +114,8 @@ impl Inner {
                 Some(port)
             }
         };
+        // A graph stored before the squelch gets its params (persisted with the record).
+        crate::ops::fill_squelch_params(&mut rec.graph);
         let mut stages = self.stages(&rec.graph)?;
         let mut bank = None;
         if let Some(port) = &port {

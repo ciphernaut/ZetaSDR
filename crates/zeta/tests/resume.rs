@@ -234,3 +234,106 @@ async fn resume_leaves_a_graph_put_graph_alone() {
     assert_eq!(disk.capture_rate_hz, None);
     assert_eq!(record(&node, &id).graph, put.graph);
 }
+
+/// Records written before the squelch: their demodulator nodes carry no `squelch` param.
+/// On resume an `aprs_decode` graph (its demodulator feeds the decoder) gets `squelch:
+/// false` and so one event stream; an `fm_demod` graph gets `squelch: true` and `squelch_db:
+/// null`, both persisted and shown in the record (`graph_get`).
+#[tokio::test]
+async fn resume_fills_in_the_squelch_params_of_a_pre_squelch_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = SourceId("speech".into());
+    let narrow = Tuning {
+        center_hz: Hz(CENTER_HZ),
+        bandwidth_hz: Hz(12_500),
+    };
+    let jobs = dir.path().join("state").join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    let mut ids = Vec::new();
+    for kind in [JobKind::AprsDecode, JobKind::FmDemod] {
+        let mut graph = kind
+            .expand(&source, narrow, Hz(240_000), None, None, None)
+            .unwrap();
+        for n in graph.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
+            let p = n.params.as_object_mut().unwrap();
+            p.remove("squelch");
+            p.remove("squelch_db");
+        }
+        let rec = JobRecord {
+            format: JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: kind.name().into(),
+            graph,
+            source: source.clone(),
+            tuning: narrow,
+            state: JobState::Running,
+            context: serde_json::json!({}),
+            created_ns: Timestamp(1),
+            input: None,
+            // The rate the source runs at: no re-expansion, the stored graph runs as is.
+            capture_rate_hz: Some(240_000),
+            elastic: false,
+            operator_graph: false,
+        };
+        std::fs::write(
+            jobs.join(format!("{}.json", rec.id.0)),
+            serde_json::to_vec(&rec).unwrap(),
+        )
+        .unwrap();
+        ids.push(rec.id);
+    }
+    let (src, port) = wfm_port(dir.path(), 240_000);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let nbfm = |g: &Graph| {
+        g.nodes
+            .iter()
+            .find(|n| n.kind == "nbfm_demod")
+            .unwrap()
+            .params
+            .clone()
+    };
+    let events = |id: &JobId| {
+        node.bus()
+            .list()
+            .into_iter()
+            .filter(|s| {
+                s.kind == zeta_core::types::StreamKind::Event
+                    && s.provenance.job.as_ref() == Some(id)
+            })
+            .count()
+    };
+    let (aprs, fm) = (&ids[0], &ids[1]);
+    for id in [aprs, fm] {
+        assert_eq!(record(&node, id).state, JobState::Running, "{id:?}");
+    }
+    let p = nbfm(&on_disk(dir.path(), aprs).graph);
+    assert_eq!(p["squelch"], false, "{p}");
+    assert!(p.get("squelch_db").is_some_and(|v| v.is_null()), "{p}");
+    assert_eq!(nbfm(&record(&node, aprs).graph), p);
+    assert_eq!(
+        events(aprs),
+        1,
+        "aprs_decode: the decoder's event stream only"
+    );
+    let p = nbfm(&on_disk(dir.path(), fm).graph);
+    assert_eq!(p["squelch"], true, "{p}");
+    assert!(p.get("squelch_db").is_some_and(|v| v.is_null()), "{p}");
+    assert_eq!(nbfm(&record(&node, fm).graph), p);
+    assert_eq!(events(fm), 1, "fm_demod: its squelch events");
+    // `graph_put` of a graph without the params fills them in the same way.
+    let mut g = record(&node, aprs).graph;
+    for n in g.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
+        n.params.as_object_mut().unwrap().remove("squelch");
+    }
+    node.apply(Op::GraphPut {
+        job: aprs.clone(),
+        graph: g,
+    })
+    .await
+    .unwrap();
+    assert_eq!(nbfm(&on_disk(dir.path(), aprs).graph)["squelch"], false);
+}

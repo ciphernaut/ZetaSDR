@@ -38,7 +38,8 @@
 //                            after a drop) and renders each event by payload shape (so by
 //                            `protocol`, whichever stream it came on):
 //         - `db` array (spectrum): ignored;
-//         - `protocol: squelch` (fm_demod, am_demod): not counted, never drawn; kept as the
+//         - `protocol: squelch`: not counted, never drawn; on an fm_demod or am_demod job
+//           (agent.js SQUELCH_KINDS; any other job's is ignored) kept as the
 //           job's last squelch event (ov.squelch, forgotten when the job's graph changes)
 //           and the row's tag set from it at once (agent.js setSquelchTag; the 2 s
 //           re-render keeps it through agent.js);
@@ -85,7 +86,7 @@
 //                            the cap) in that job's row `.events` cell
 //     ov.destroy()
 
-import { setSquelchTag } from "./agent.js";
+import { SQUELCH_KINDS, setSquelchTag } from "./agent.js";
 
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
@@ -358,8 +359,11 @@ class Overlays {
     const obj = p && typeof p === "object" && !Array.isArray(p);
     if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
     if (obj && p.protocol === "squelch") {
-      this.squelches.set(job.id, { event: p, graph: graphKey(job) });
-      setSquelchTag(this.jobRowEl(job), p);
+      // Only a demodulator job's own squelch tags its row (never, say, a decoder's demod).
+      if (SQUELCH_KINDS.includes(job.kind)) {
+        this.squelches.set(job.id, { event: p, graph: graphKey(job) });
+        setSquelchTag(this.jobRowEl(job), p);
+      }
       return;
     }
     // Every non-spectrum event counts in the job row, whatever its shape.

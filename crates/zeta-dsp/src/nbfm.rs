@@ -161,6 +161,7 @@ impl Stage for NbfmDemodStage {
         let (out, events) = squelch_streams(&outputs, squelch.is_some())?;
         let mut prev = Complex::new(0.0f32, 0.0);
         let mut filter = AudioFilter::default();
+        let mut was_open = false;
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
@@ -188,7 +189,22 @@ impl Stage for NbfmDemodStage {
                     ));
                 }
                 if !sq.is_open() {
+                    // Skipped, but the discriminator's reference follows the channel, so a
+                    // reopening block differences against the sample just before it.
+                    if let Some(&x) = block
+                        .samples
+                        .iter()
+                        .rev()
+                        .find(|x| x.re.is_finite() && x.im.is_finite())
+                    {
+                        prev = x;
+                    }
+                    was_open = false;
                     return Ok(published);
+                }
+                if !std::mem::replace(&mut was_open, true) {
+                    // Audio from before the close is not resampled into the reopening block.
+                    filter = AudioFilter::default();
                 }
             }
             let demod = nbfm_demod(&block.samples, rate, p.deviation_hz, &mut prev);
@@ -554,6 +570,64 @@ mod tests {
         let off =
             serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000, "squelch": false});
         assert_eq!(st.outputs_for(&off), [StreamKind::Audio]);
+    }
+
+    #[tokio::test]
+    async fn a_reopened_squelch_demodulates_from_the_last_closed_block() {
+        // Open on an FM tone, closed by 1.2 s of noise, reopened by the tone: the reopening
+        // block is demodulated against the sample just before it (not one from before the
+        // close) through a fresh audio filter, so no stale-phase spike starts it.
+        let mut blocks = blocks(0.0, -60.0, 50, -20.0);
+        let quiet = super::tests::blocks(1.2, -60.0, 0, 0.0);
+        let last_quiet = *quiet.last().unwrap().last().unwrap();
+        blocks.extend(quiet);
+        let tone_blocks = super::tests::blocks(0.0, -60.0, 50, -20.0);
+        // The second tone starts 90 degrees on: a stale `prev` would clamp to +-1.
+        let reopen: Vec<Complex<f32>> = tone_blocks[17]
+            .iter()
+            .map(|c| c * Complex::new(0.0, 1.0))
+            .collect();
+        blocks.push(reopen.clone());
+        let (tx, mut rx_out, _rx_ev, h) = spawn_with(
+            serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000}),
+            1_024,
+        );
+        let n = blocks.len();
+        for (i, b) in blocks.into_iter().enumerate() {
+            tx.send(iq_frame_at(
+                b,
+                48_000,
+                1_000_000_000 + i as u64 * 20_000_000,
+            ))
+            .unwrap();
+        }
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        let mut last = None;
+        while let Ok(f) = rx_out.try_recv() {
+            last = Some(f);
+        }
+        let f = last.expect("audio");
+        assert_eq!(
+            f.provenance.span.start_ns.0,
+            1_000_000_000 + (n as u64 - 1) * 20_000_000,
+            "the reopening block's audio is the last frame"
+        );
+        let Payload::Audio { samples, .. } = &f.payload else {
+            panic!("expected audio")
+        };
+        let mut prev = last_quiet;
+        let want = AudioFilter::default()
+            .process(
+                &nbfm_demod(&reopen, 48_000, 2_500, &mut prev),
+                48_000,
+                48_000,
+            )
+            .unwrap();
+        assert_eq!(samples.len(), want.len());
+        for (g, w) in samples.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-6, "{g} vs {w}");
+        }
     }
 
     #[tokio::test]

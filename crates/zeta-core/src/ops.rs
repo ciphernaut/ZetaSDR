@@ -917,6 +917,39 @@ pub fn scan_steps(span: Tuning, caps: &Capabilities) -> Vec<Tuning> {
 /// The lowest channel output rate a job is channelised at.
 pub const CHANNEL_RATE_MIN_HZ: u64 = 48_000;
 
+/// Stage kinds that carry the demodulator squelch (`squelch_db`, `squelch` params).
+pub const SQUELCH_STAGES: [&str; 2] = ["nbfm_demod", "am_demod"];
+
+/// Fill in the squelch params of every [`SQUELCH_STAGES`] node of `graph` that lacks
+/// them (a graph stored before the squelch, or an operator's): `squelch_db: null`, and
+/// `squelch: false` when the node's audio feeds another node of the graph (a decoder, as
+/// in `aprs_decode`), else `true` (the job's own audio, as in `fm_demod`). Params
+/// already there are kept. Whether anything was filled in.
+pub fn fill_squelch_params(graph: &mut Graph) -> bool {
+    let mut filled = false;
+    for n in &mut graph.nodes {
+        if !SQUELCH_STAGES.contains(&n.kind.as_str()) {
+            continue;
+        }
+        let feeds = graph
+            .edges
+            .iter()
+            .any(|e| e.from == n.id && e.kind == StreamKind::Audio);
+        let Some(p) = n.params.as_object_mut() else {
+            continue;
+        };
+        if !p.contains_key("squelch") {
+            p.insert("squelch".into(), (!feeds).into());
+            filled = true;
+        }
+        if !p.contains_key("squelch_db") {
+            p.insert("squelch_db".into(), serde_json::Value::Null);
+            filled = true;
+        }
+    }
+    filled
+}
+
 /// The narrowest exact divisor of `source_rate_hz` that is at least
 /// [`CHANNEL_RATE_MIN_HZ`] and at least `bandwidth_hz`; the source rate itself
 /// when it is no wider than that. Integer only: the channel stage decimates by
