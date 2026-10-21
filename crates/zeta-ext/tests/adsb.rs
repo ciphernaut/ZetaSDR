@@ -214,7 +214,8 @@ async fn child_exit_fails_the_stage() {
     for _ in 0..4 {
         r.tx.send(iq_frame(&frame, 2_400_000)).unwrap();
     }
-    match result_within(r.handle, 10).await {
+    // 30 s: under a full workspace run the fake child can take its time to start and exit.
+    match result_within(r.handle, 30).await {
         Err(StageError::Failed(m)) => {
             assert!(m.contains("exited"), "{m}");
             assert!(m.contains('3'), "{m}");

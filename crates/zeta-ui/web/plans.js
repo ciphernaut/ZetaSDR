@@ -23,6 +23,7 @@ export function loadPlans(api) {
       })
       .catch(() => {
         plans = [];
+        loading = null; // a failed call is asked again on the next loadPlans
       });
   }
   return loading;
