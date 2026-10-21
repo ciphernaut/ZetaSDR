@@ -90,24 +90,33 @@ Holding a capture, receive gain and transcripts:
 
 `source pin` holds a source at a band (the leased bandwidth may round up to what the radio can
 capture) as a rigid lease `pin:<source id>` that is never a holder and is not named in `--replace`.
-Jobs inside the band run without a retune; a start outside it is a `conflict` whose options begin
-with `unpin source <id> (source_unpin)`. The pin is saved in `<state-dir>/sources/<id>.json`,
-restored first on resume (and applied by one-shot commands too). `source unpin` on an unpinned
-source is an error. `source gain` sets the receive gain in dB within the source's range
-(`source_list.gain` reports `db`, `min_db`, `max_db`, `automatic`, `automatic_available`);
-`--auto` turns automatic gain on where the device has it; the setting is saved with the pin and
-restored. A resumed channel takes the shared bank (`job_context` names its `channel.path`;
+Jobs inside the band run without a retune; a start outside it is a `conflict` whose options include
+`unpin source <id> (source_unpin)` (and "stop one of the holders" only when jobs hold the source).
+The pin is saved in `<state-dir>/sources/<id>.json` and restored first on resume. One-shot
+commands, read-only ones included, restore the pins and the gain of the sources they attach, so
+even a one-shot `source list` tunes a pinned radio. `source unpin` on an unpinned source is an
+error. `source gain` (the op `source_set_gain { source, gain_db: number | null }`) sets the
+receive gain in dB within the source's range (`source_list.gain` reports `db`, `min_db`,
+`max_db`, `automatic`, `automatic_available`); `--auto` (`gain_db: null`) turns automatic gain
+on where the device has it. The setting is saved in the source record (`sources/<id>.json`,
+beside the pin) and re-applied at the next start, where it wins over `gain=` in the device args. A resumed channel takes the shared bank (`job_context` names its `channel.path`;
 `source_list.bank` shows `bin_hz` and `consumers`). Every transcript event of an attached
 `transcribe` job is also appended as one JSON line to `<state-dir>/transcripts.log` (`t_ns`, `job`,
 `input`, `source`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns`, `text`, `language`,
 `dropped`, `error`; rotated to `transcripts.log.1` past 8 MiB); `transcripts tail` reads it and is a
 usage error with `--node`.
 
-`fm_demod` and `am_demod` carry an automatic squelch, always on: while the channel is idle (no
-signal above the noise floor it tracks) the stage publishes no audio and emits a `squelch` event
-saying why. To fix the threshold or turn it off, edit the stage's params with `graph get`,
-`graph put`: `squelch_db` (a number of dB above the floor; `null` is automatic) and `squelch`
-(`false` is off).
+`fm_demod` and `am_demod` carry an automatic squelch, always on: it opens 6 dB over the noise
+floor it tracks (the automatic floor is never taken above -40 dBFS) and closes after 300 ms under
+it. While closed the stage publishes no audio; it emits a `squelch` event (`open`, `power_db`,
+`floor_db`) on the first block and on each transition. `--then-tail` tails the audio output
+first, so an idle squelched demodulator gives an empty tail. To fix the threshold or turn it
+off, edit the stage's params with `graph get`, `graph put`: `squelch_db` is an absolute threshold
+in dBFS, -120..=0 (`null`, the default, is automatic; a value outside the range fails the job
+with `squelch_db <v> out of range -120..=0`), and `squelch: false` turns it off. `aprs_decode`'s
+demodulator runs with the squelch off. A put that changes only these (or `deviation_hz`,
+`sideband`) keeps the job re-expandable for a later capture rate; any other `graph put` is
+launched as stored from then on.
 
 `AGENTS.md` is generated from the operation schema by `zeta agents-md`; `zeta agents-md --check`
 fails if the committed file has drifted.
@@ -281,7 +290,9 @@ they belong to the serving node and are rejected. Source ids are unique across t
   are given.
 - **SoapySDR**, `--source-soapy ID=ARGS` (`ARGS` such as `driver=hackrf,serial=...`): a local
   device, `push` false (the node reads it). Gain starts at the driver's default and is changed
-  live with `source gain` (below); `gain=DB` in `ARGS` sets the opening gain, and `ppm=N`
+  live with `source gain` (below); `gain=DB` in `ARGS` sets the opening gain (a `DB` outside the
+  device's range refuses to attach the source, exit 1; a gain set with `source gain` is persisted
+  and wins over `gain=` at the next start), and `ppm=N`
   (e.g. `driver=uhd,ppm=3.4`) corrects the device's frequency error by shifting the tuning (the
   frequencies you read stay true). A job centred exactly on the tuned frequency sees the device's
   DC spike.
@@ -466,7 +477,7 @@ The page's own `spectrum` job is elastic: it never blocks another job from takin
 follows every retune, so the waterfall is never the reason a conflict appears. A job started inside
 the capture it shows runs on that capture without a retune, so a demodulator started from the page
 does not shrink the view; one outside it retunes the radio and the page's job follows. A conflict the page
-meets offers "stop <kind> <id> and retry" (on a pinned source, "unpin and retry"). Finished rows leave the job list after a while.
+meets offers "stop <kind> <id> and retry" (on a pinned source, `unpin <src> and retry`). Finished rows leave the job list after a while.
 
 Two layers sit in the waterfall: the fine capture of the source, and, when the view is zoomed out
 past it on a source with a scanner (a second source with a wider tune range, or a file source with
@@ -476,7 +487,8 @@ or pan, spans the visible range clamped to the scanner's tune range, is replaced
 changes and stopped when the view returns inside the fine capture. A scan the page did not start
 is never touched.
 
-A pinned source's band is outlined and counted as a holder in the page's source tab. The command
+A pinned source's band is outlined, its source tab carries a `pin` tag (`.tag.pin`) and the pin is
+counted as a holder there. The command
 line takes `source pin --center-hz N --bandwidth-hz N [--replace ID]`, `source unpin` and `source
 gain DB|auto` for the selected source. A `fm_demod`/`am_demod` row whose channel is idle shows a
 `squelch` tag.
@@ -627,7 +639,9 @@ The node logs each sizing, e.g. `zeta: ring for b210: 10.00 s at 16000000 Hz (12
 
 Upgrading: `job_start` now requires `elastic` and `replace`, and `--source-node` sends both, so
 an older node refuses this version's `job_start` and this version refuses an older one's. Upgrade
-both ends of a `--source-node` link together. A rigid page `spectrum` job persisted by an older
+both ends of a `--source-node` link together. Plan 12 adds `pin`, `gain` and `bank` to every
+`source_list` item, so an older node using this node as a `--source-node` fails its `source_list`
+round trip too: both ends still move together. A rigid page `spectrum` job persisted by an older
 version resumes rigid (it holds its source); the page reuses an elastic spectrum job before it,
 and stopping it from its row lets the page start an elastic one.
 

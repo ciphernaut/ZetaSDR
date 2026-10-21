@@ -569,6 +569,17 @@ What was built:
   params, `squelch` events, the page's `squelch` tag); no `job_start` field.
 - Task 10: README, field-craft ("Holding a band", "Reading transcripts", the squelch line), this
   status.
+- Final-review fixes: a `graph_put` that changes only a demodulator's carried params (`squelch`,
+  `squelch_db`, `deviation_hz`, `sideband`) keeps the job re-expandable; the page watches decoders
+  before fm/am squelch streams; a holder-less pin conflict no longer offers "stop one of the
+  holders"; `source_unpin` releases and writes under the source's gate; load warnings name what
+  they are about; `transcribe` lag is counted by kind; the resampler refusal names the 2 048 limit
+  and the 1 000 ppm bound; the tee drains past a lag at cancel; the guide lists optional stage
+  params (`squelch`, `squelch_db` among them) and documents the squelch, gain and one-shot
+  restores.
+
+Upgrade: `source_list` items carry `pin`, `gain` and `bank`, so an older node using this node as a
+`--source-node` fails its `source_list` round trip; both ends of a link move together (as plan 11).
 
 Gates at the branch head:
 
@@ -581,17 +592,12 @@ Gates at the branch head:
 
 Deferred:
 
-- The resampler refusal text still names the old 100 000 limit though the threshold is 2 048.
-- A conflict on a pinned source with no job holders still lists "stop one of the holders" (fix:
-  only when holders is non-empty); the guide should say one-shot commands restore and apply pins
-  too.
 - Two Soapy gain tests have 50-100 ms timing margins (tighten); `set_gain` may hold the tune gate
   up to 2x `retune_timeout`.
 - The squelch's floor window is 100 blocks, about 1 s live (10 ms blocks): tune at live
-  acceptance. The guide's stage-params list omits `squelch`/`squelch_db`. The squelch tag shows
-  only on watched rows.
-- The driver crate's doc link still names the removed `split_gain`.
-- The transcript tee's cancel-branch drain stops on a `Lagged` error; `ops.log` and
-  `transcripts.log` writes are synchronous on runtime threads.
+  acceptance. The squelch tag shows only on watched rows (decoders take the watch slots first).
+- `ops.log` and `transcripts.log` writes are synchronous on runtime threads.
+- `zeta_dsp::resample::MAX_FACTOR` (100 000) is no longer the limit anywhere; it is kept as a
+  public constant.
 - Plan 11's leftovers are still open: the fallback-scan span does not follow later zooms; the UI
   suite runs near its deadline (234 s of 300 s).

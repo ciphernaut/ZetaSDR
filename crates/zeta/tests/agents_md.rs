@@ -70,6 +70,9 @@ fn guide_covers_running_the_node_stages_and_descriptions() {
         "`job list`",
         "`AU`",
         "no provider data",
+        // A param with a default is listed too, as optional.
+        "- params.squelch: boolean (optional, default true)\n",
+        "- params.squelch_db: integer or null (optional, default null)\n",
     ] {
         assert!(md.contains(needle), "guide lacks {needle:?}");
     }
