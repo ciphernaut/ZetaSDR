@@ -115,7 +115,8 @@ fn fits(want: &Tuning, cur: &Tuning) -> bool {
 }
 
 /// Ways out of a conflict between `want` and the port's current band `cur`
-/// that the caller can act on. Widening is listed only when the port could
+/// that the caller can act on. Stopping a holder is listed only when a job
+/// holds the source (a pin alone is no holder). Widening is listed only when the port could
 /// capture both bands at once; no operation performs it yet. A port under a
 /// time-shared lease (a scan) is freed only by stopping that holder. Then, on a
 /// `pinned` source, its unpin; last, the request again with `replace` naming the
@@ -131,10 +132,11 @@ fn conflict_options(
     if shared {
         return vec!["stop the scan holding the source".to_string()];
     }
-    let mut options = vec![
-        "stop one of the holders".to_string(),
-        "choose a band inside current".to_string(),
-    ];
+    let mut options = Vec::new();
+    if !holders.is_empty() {
+        options.push("stop one of the holders".to_string());
+    }
+    options.push("choose a band inside current".to_string());
     let (wl, wh) = band(want);
     let (cl, ch) = band(cur);
     let n = wh.max(ch) - wl.min(cl);

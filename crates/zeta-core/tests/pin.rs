@@ -307,6 +307,11 @@ async fn pin_is_a_rigid_holder_without_an_id() {
         !options.iter().any(|o| o.starts_with("retry with replace")),
         "{options:?}"
     );
+    // No job holds it: there is no holder to stop.
+    assert!(
+        !options.iter().any(|o| o == "stop one of the holders"),
+        "{options:?}"
+    );
 
     let (holders, options) = conflict(
         node.apply(Op::SourceEnsure {
@@ -333,6 +338,7 @@ async fn pin_is_a_rigid_holder_without_an_id() {
             .await,
     );
     assert_eq!(holders, vec![job.clone()]);
+    assert_eq!(options[0], "stop one of the holders", "{options:?}");
     let unpin_at = options.iter().position(|o| o == UNPIN).expect("unpin");
     let replace_at = options
         .iter()
@@ -437,6 +443,32 @@ async fn unpin_releases_and_idles() {
         Err(OpError::Other { message }) => assert_eq!(message, "source radio0 is not pinned"),
         other => panic!("expected other, got {other:?}"),
     }
+}
+
+/// The unpin waits for the source's gate: the lease release and the record write land
+/// together, so a `source_pin` racing it cannot leave disk and memory disagreeing.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn unpin_waits_for_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new();
+    let node = Arc::new(open(dir.path(), &radio).await);
+    let pinned = band(100_000_000, 48_000);
+    node.apply(pin(pinned, vec![])).await.unwrap();
+    let gate = node.debug_gate(&radio0()).await;
+    let n = node.clone();
+    let unpin = tokio::spawn(async move { n.apply(unpin()).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        node.pinned(&radio0()),
+        Some(pinned),
+        "released under the gate"
+    );
+    assert_eq!(on_disk(dir.path())["pin"], tuning_json(pinned));
+    drop(gate);
+    assert_eq!(unpin.await.unwrap().unwrap(), OpResult::Ok);
+    assert_eq!(node.pinned(&radio0()), None);
+    assert_eq!(on_disk(dir.path())["pin"], serde_json::Value::Null);
 }
 
 /// A `Running` record on `radio0`, as a node persists one.

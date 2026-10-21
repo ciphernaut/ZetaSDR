@@ -1226,6 +1226,12 @@ impl Node {
         self.inner.tees.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Hold `source`'s gate, for tests of what waits on it.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn debug_gate(&self, source: &SourceId) -> OwnedMutexGuard<()> {
+        self.inner.leases.gate_guard(source).await
+    }
+
     /// Tune `source` to `t` unless a job holds it, under the source's gate the
     /// caller holds (`guard`) or taking it; see [`LeaseManager::tune_if_unheld`].
     /// Also whether it tuned the port: the caller then relaunches the elastic jobs
@@ -1303,13 +1309,16 @@ impl Node {
         result
     }
 
-    /// Release `source`'s pin, persist `pin: null` and idle the port if nothing
-    /// else holds it. `Other("source <id> is not pinned")` when it has none; a
+    /// Release `source`'s pin and persist `pin: null` under the source's gate, then
+    /// idle the port if nothing else holds it. `Other("source <id> is not pinned")` when it has none; a
     /// write that fails is `Io`, the pin released all the same.
     pub async fn source_unpin(&self, source: &SourceId) -> Result<(), NodeError> {
         let port = self
             .port(source)
             .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
+        // The release and the write under one hold of the gate, as `source_pin`'s
+        // lease and write, so a racing pin cannot leave disk and memory disagreeing.
+        let guard = self.inner.leases.gate_guard(source).await;
         if self.inner.leases.unpin(source).is_none() {
             return Err(NodeError::Other(format!(
                 "source {} is not pinned",
@@ -1317,6 +1326,8 @@ impl Node {
             )));
         }
         let written = self.set_source_record(source, |r| r.pin = None);
+        drop(guard);
+        // Outside the gate: the idle takes it.
         self.idle_if_unheld(port.as_ref()).await;
         written
     }
