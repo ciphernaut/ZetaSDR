@@ -420,7 +420,7 @@ pub enum JobCmd {
         elastic: bool,
         #[command(flatten)]
         replace: ReplaceArg,
-        /// After starting, tail the job's first event (else audio) stream, stop
+        /// After starting, tail the job's audio output (else its first event) stream, stop
         /// the job and print `[job_result, frames_result, {"stopped": true}]`;
         /// a job that is not running prints `[job_result, job_record]` and
         /// exits 2 (one-shot only)

@@ -92,7 +92,7 @@ const FLOOR_PERCENTILE: usize = 15;
 
 /// The `pct`th percentile of `v` (the value at index `len · pct / 100` when
 /// sorted); 0 when empty.
-fn percentile(v: &[f32], pct: usize) -> f32 {
+pub(crate) fn percentile(v: &[f32], pct: usize) -> f32 {
     if v.is_empty() {
         return 0.0;
     }

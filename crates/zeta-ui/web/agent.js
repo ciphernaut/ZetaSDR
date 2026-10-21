@@ -35,7 +35,13 @@
 //       and appends one line per frame; reconnects and re-resolves the id when it drops.
 //       onConflict(payload) is called for a `conflict` error of another caller (transport
 //       not "ui"; this page's own typed ops are handled where it applies them).
-//   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, view})
+//   SQUELCH_KINDS               job kinds whose demodulator carries the automatic squelch
+//   setSquelchTag(row, event)   adds the `.tag.squelch` tag to a job row's `.kind` cell while
+//                               `event` (the job's last `squelch` event) has `open: false`
+//                               (tooltip: its power and floor), removes it otherwise (null:
+//                               none seen)
+//   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, squelch,
+//                                   view})
 //                                                       -> {close, refresh, redraw}
 //       Polls `job_list` every 2 s and renders the running jobs, and the finished ones
 //       (stopped, failed) for view.get("finished_rows_s") seconds after this page first saw
@@ -53,11 +59,15 @@
 //       An attached job (one with an `input` job) is a `.job.attached` row placed right
 //       under its input's row, its kind shown as `↳ <kind>`, with neither of the audio
 //       buttons. A job's `state.reason` (a failure) is also the row's tooltip.
+//       A running row of a SQUELCH_KINDS kind is tagged `squelch` (setSquelchTag) while
+//       squelch(id) (overlays.js: the last `squelch` event seen on the job's event stream)
+//       has `open: false`.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 
 export const JOBS_POLL_MS = 2000;
 export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"];
+export const SQUELCH_KINDS = ["fm_demod", "am_demod"];
 export const QUIET_OPS = new Set(["job_list", "stream_list", "source_list"]);
 export const AUTO_SCAN_KEY = "zeta.autoScan";
 const MAX_LINES = 500;
@@ -295,7 +305,28 @@ function autoScanId() {
 
 const isFinished = (j) => !!(j.state && (j.state.status === "stopped" || j.state.status === "failed"));
 
-function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing }) {
+export function setSquelchTag(row, event) {
+  const cell = row && row.querySelector(".kind");
+  if (!cell) return;
+  let tag = cell.querySelector(".tag.squelch");
+  if (!event || event.open !== false) {
+    if (tag) {
+      tag.previousSibling?.remove(); // the space before it
+      tag.remove();
+    }
+    return;
+  }
+  if (!tag) {
+    tag = document.createElement("span");
+    tag.className = "tag squelch";
+    tag.textContent = "squelch";
+    cell.append(" ", tag);
+  }
+  const db = (v) => (typeof v === "number" ? `${v.toFixed(1)} dBFS` : "?");
+  tag.title = `squelch closed: no audio (power ${db(event.power_db)}, floor ${db(event.floor_db)})`;
+}
+
+function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch }) {
   const row = document.createElement("div");
   const attached = !!job.input;
   const finished = isFinished(job);
@@ -329,6 +360,9 @@ function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing }) {
       span.append(" ", tag);
     }
     row.append(span);
+  }
+  if (squelch && status === "running" && SQUELCH_KINDS.includes(job.kind)) {
+    setSquelchTag(row, squelch(job.id));
   }
   if (job.state && job.state.reason) row.title = job.state.reason;
   if (finished) {
@@ -414,6 +448,7 @@ export function startJobs(
     onTranscribe = null,
     onGraph = null,
     playing = null,
+    squelch = null,
     view = null,
   } = {},
 ) {
@@ -423,7 +458,7 @@ export function startJobs(
   let last = null;
   // id -> performance.now() when this page first saw the job finished (-Infinity: cleared).
   const finishedAt = new Map();
-  const buttons = { onPlay, onTranscribe, onGraph, playing };
+  const buttons = { onPlay, onTranscribe, onGraph, playing, squelch };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;
     return Number.isFinite(s) && s > 0 ? s * 1000 : 0;

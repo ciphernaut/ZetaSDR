@@ -416,7 +416,9 @@ impl JobKind {
 
     /// [`JobKind::expand`] again for a resumed job whose `stored` graph was expanded for
     /// another source rate: its `deviation_hz` and `sideband` are read back from the
-    /// stored graph's node params (absent: the kind's default).
+    /// stored graph's node params (absent: the kind's default), and a demodulator's
+    /// `squelch_db` and `squelch` (as `graph_put` may have set them) are carried to the
+    /// node of the same stage kind (absent: the defaults `expand` writes).
     pub fn reexpand(
         &self,
         source: &SourceId,
@@ -428,14 +430,27 @@ impl JobKind {
         let param = |key: &str| stored.nodes.iter().find_map(|n| n.params.get(key).cloned());
         let deviation_hz = param("deviation_hz").and_then(|v| v.as_u64()).map(Hz);
         let sideband = param("sideband").and_then(|v| serde_json::from_value(v).ok());
-        self.expand(
+        let mut g = self.expand(
             source,
             tuning,
             source_rate_hz,
             bank_bin_rate_hz,
             deviation_hz,
             sideband,
-        )
+        )?;
+        for n in &mut g.nodes {
+            let Some(old) = stored.nodes.iter().find(|o| o.kind == n.kind) else {
+                continue;
+            };
+            for key in ["squelch_db", "squelch"] {
+                if let (Some(v), Some(p)) = (old.params.get(key), n.params.as_object_mut())
+                    && p.contains_key(key)
+                {
+                    p.insert(key.into(), v.clone());
+                }
+            }
+        }
+        Ok(g)
     }
 
     /// Whether the kind's graph has a `channel` node, so depends on the source rate.
@@ -578,7 +593,12 @@ impl JobKind {
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({"deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0), "audio_rate_hz": AUDIO_RATE_HZ}),
+                            params: serde_json::json!({
+                                "deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0),
+                                "audio_rate_hz": AUDIO_RATE_HZ,
+                                "squelch_db": null,
+                                "squelch": true,
+                            }),
                         },
                     ],
                     edges: vec![Edge {
@@ -636,7 +656,11 @@ impl JobKind {
                         GraphNode {
                             id: demod.clone(),
                             kind: "am_demod".into(),
-                            params: serde_json::json!({"audio_rate_hz": AUDIO_RATE_HZ}),
+                            params: serde_json::json!({
+                                "audio_rate_hz": AUDIO_RATE_HZ,
+                                "squelch_db": null,
+                                "squelch": true,
+                            }),
                         },
                     ],
                     edges: vec![Edge {
@@ -694,7 +718,13 @@ impl JobKind {
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({"deviation_hz": 3_000, "audio_rate_hz": AUDIO_RATE_HZ}),
+                            // The decoder reads every block, however weak: no squelch.
+                            params: serde_json::json!({
+                                "deviation_hz": 3_000,
+                                "audio_rate_hz": AUDIO_RATE_HZ,
+                                "squelch_db": null,
+                                "squelch": false,
+                            }),
                         },
                         GraphNode {
                             id: decode.clone(),

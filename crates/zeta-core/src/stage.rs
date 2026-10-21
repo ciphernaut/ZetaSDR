@@ -100,6 +100,13 @@ impl StageContext {
 pub trait Stage: Send + Sync {
     fn spec(&self) -> &StageSpec;
     fn backend(&self) -> Backend;
+    /// The outputs a node of this stage with `params` is given streams for, in order: by
+    /// default every one in `spec().outputs`. A stage whose trailing output stays silent
+    /// under some params (a squelch turned off) leaves it out, so its job lists no stream
+    /// that never carries a frame.
+    fn outputs_for(&self, _params: &serde_json::Value) -> Vec<StreamKind> {
+        self.spec().outputs.clone()
+    }
     /// Run until the inputs close or `cancel` fires.
     ///
     /// Cancellation returns `Err(StageError::Cancelled)`; the runtime treats it as a clean

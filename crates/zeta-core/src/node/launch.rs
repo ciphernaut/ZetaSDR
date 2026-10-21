@@ -222,7 +222,8 @@ impl Inner {
                 inputs.push(self.bus.subscribe(sid).expect("registered"));
             }
             let before = job_outputs.len();
-            let outputs = node_outputs(stage.spec(), leaving, |k| {
+            let kinds = stage.outputs_for(&n.params);
+            let outputs = node_outputs(stage.spec(), &kinds, leaving, |k| {
                 let sid = self.bus.register(k, prov.clone());
                 streams.push(sid.clone());
                 job_outputs.push((k, sid.clone()));
@@ -694,7 +695,8 @@ fn point_stream_in(graph: &mut Graph, input: &JobId, stream: &StreamId) {
 }
 
 /// The streams a node's stage outputs to, with their kinds, in the order the stage
-/// receives them. Each entry of the stage's `outputs`, in order, takes the first edge of
+/// receives them. Each of `kinds` (the stage's [`outputs_for`](Stage::outputs_for) the
+/// node's params), in order, takes the first edge of
 /// its kind leaving the node not yet taken, else a job output stream from `fresh`; edges
 /// left over (a second edge of one kind) follow. A stage that
 /// [emits any kind](StageSpec::emits_any_kind) has one output: the edges leaving it, or
@@ -702,6 +704,7 @@ fn point_stream_in(graph: &mut Graph, input: &JobId, stream: &StreamId) {
 /// the edges leaving it, or one job output stream when there is none.
 fn node_outputs(
     spec: &StageSpec,
+    kinds: &[StreamKind],
     mut leaving: Vec<(StreamKind, StreamId)>,
     mut fresh: impl FnMut(StreamKind) -> StreamId,
 ) -> Vec<(StreamKind, StreamId)> {
@@ -713,8 +716,8 @@ fn node_outputs(
         }
         return leaving;
     }
-    let mut out = Vec::with_capacity(spec.outputs.len());
-    for &k in &spec.outputs {
+    let mut out = Vec::with_capacity(kinds.len());
+    for &k in kinds {
         match leaving.iter().position(|(ek, _)| *ek == k) {
             Some(i) => out.push(leaving.remove(i)),
             None => out.push((k, fresh(k))),

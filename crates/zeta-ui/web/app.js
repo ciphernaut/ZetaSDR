@@ -610,6 +610,7 @@ function start(api) {
     onTranscribe: (job) => applyOp(attachOp(job.id)),
     onGraph: (job) => showGraph(api, job.id),
     playing: (id) => !!state.audio && state.audio.jobId === id,
+    squelch: (id) => (state.ov ? state.ov.squelch(id) : null),
   });
   state.mic = mountMic($("#mic"), api, (text) => {
     $("#cmd").value = text;

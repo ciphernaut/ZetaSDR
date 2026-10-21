@@ -1108,7 +1108,7 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
     assert_eq!(g.nodes[1].kind, "nbfm_demod");
     assert_eq!(
         g.nodes[1].params,
-        serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000})
+        serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true})
     );
     assert_eq!(g.edges.len(), 1);
     assert_eq!(g.edges[0].from, g.nodes[0].id);
@@ -1649,6 +1649,57 @@ async fn am_demod_rejects_deviation_hz() {
 }
 
 #[test]
+fn demod_graphs_carry_the_squelch_params() {
+    let tuning = Tuning {
+        center_hz: Hz(100_005_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let src = SourceId("file0".into());
+    for (kind, demod) in [
+        (JobKind::FmDemod, "nbfm_demod"),
+        (JobKind::AmDemod, "am_demod"),
+    ] {
+        let g = kind
+            .expand(&src, tuning, Hz(48_000), None, None, None)
+            .unwrap();
+        let n = g.nodes.iter().find(|n| n.kind == demod).expect(demod);
+        assert_eq!(n.params["squelch_db"], serde_json::Value::Null, "{kind:?}");
+        assert!(n.params.get("squelch_db").is_some(), "{kind:?}");
+        assert_eq!(n.params["squelch"], true, "{kind:?}");
+        // A resumed job expanded again keeps what `graph_put` set.
+        let mut stored = g.clone();
+        for m in stored.nodes.iter_mut().filter(|m| m.kind == demod) {
+            m.params["squelch_db"] = (-70).into();
+            m.params["squelch"] = false.into();
+        }
+        let again = kind
+            .reexpand(&src, tuning, Hz(96_000), None, &stored)
+            .unwrap();
+        let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
+        assert_eq!(n.params["squelch_db"], -70, "{kind:?}");
+        assert_eq!(n.params["squelch"], false, "{kind:?}");
+        // A graph stored before the squelch (no such params) expands with the defaults.
+        let mut old = g.clone();
+        for m in old.nodes.iter_mut().filter(|m| m.kind == demod) {
+            let o = m.params.as_object_mut().unwrap();
+            o.remove("squelch_db");
+            o.remove("squelch");
+        }
+        let again = kind.reexpand(&src, tuning, Hz(96_000), None, &old).unwrap();
+        let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
+        assert_eq!(n.params["squelch"], true, "{kind:?}");
+    }
+    // job_start carries no squelch field (the user's call: always on, automatic).
+    let s = schema();
+    let v = variants(&s["op"])
+        .iter()
+        .find(|v| v["properties"]["op"]["const"] == "job_start")
+        .expect("job_start variant");
+    assert!(v["properties"].get("squelch_db").is_none(), "{v}");
+    assert!(v["properties"].get("squelch").is_none(), "{v}");
+}
+
+#[test]
 fn job_start_schema_requires_nullable_deviation() {
     let s = schema();
     let v = variants(&s["op"])
@@ -2040,7 +2091,7 @@ fn am_expansion_is_channel_then_am_demod() {
     assert_eq!(g.nodes[1].kind, "am_demod");
     assert_eq!(
         g.nodes[1].params,
-        serde_json::json!({"audio_rate_hz": 48_000})
+        serde_json::json!({"audio_rate_hz": 48_000, "squelch_db": null, "squelch": true})
     );
     assert_eq!(g.edges.len(), 1);
     assert_eq!(g.edges[0].from, g.nodes[0].id);

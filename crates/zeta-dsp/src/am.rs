@@ -19,6 +19,9 @@ use zeta_core::types::{Hz, StreamId, StreamKind};
 use zeta_core::ops::Sideband;
 
 use crate::nbfm::AudioFilter;
+use crate::squelch::{
+    default_true, squelch_event, squelch_outputs, squelch_streams, stage_squelch,
+};
 use crate::util::{StreamingComplexFir, StreamingFir, lowpass_taps, nco};
 use crate::{Input, frame_span, run_map};
 
@@ -138,6 +141,12 @@ fn finite(iq: &[Complex<f32>]) -> std::borrow::Cow<'_, [Complex<f32>]> {
 #[schemars(deny_unknown_fields)]
 pub struct AmParams {
     pub audio_rate_hz: u64,
+    /// Fixed squelch threshold, dBFS (-120..=0); `null` tracks the noise floor.
+    #[serde(default)]
+    pub squelch_db: Option<i64>,
+    /// The squelch is on (the default); `false` passes every block.
+    #[serde(default = "default_true")]
+    pub squelch: bool,
 }
 
 /// Streaming AM demodulator. State carries across blocks; the filters are
@@ -189,7 +198,9 @@ impl AmDemod {
     }
 }
 
-/// Demodulates an AM IQ stream to audio at `audio_rate_hz`.
+/// Demodulates an AM IQ stream to audio at `audio_rate_hz`, behind the same
+/// squelch as `nbfm_demod`: no audio while closed, a `squelch` event per
+/// transition (and for the first block) on the second output.
 pub struct AmDemodStage {
     spec: StageSpec,
 }
@@ -200,7 +211,7 @@ impl AmDemodStage {
             spec: StageSpec {
                 kind: "am_demod",
                 inputs: vec![StreamKind::Iq],
-                outputs: vec![StreamKind::Audio],
+                outputs: vec![StreamKind::Audio, StreamKind::Event],
                 params_schema: schemars::schema_for!(AmParams),
             },
         }
@@ -223,6 +234,11 @@ impl Stage for AmDemodStage {
         Backend::Cpu
     }
 
+    /// No event output with the squelch off: it would stay silent.
+    fn outputs_for(&self, params: &serde_json::Value) -> Vec<StreamKind> {
+        squelch_outputs(params)
+    }
+
     async fn run(
         &self,
         params: serde_json::Value,
@@ -235,9 +251,9 @@ impl Stage for AmDemodStage {
         let p: AmParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("am_demod params: {e}")))?;
         let mut demod = AmDemod::new(&p).map_err(StageError::Failed)?;
-        let Some(out) = outputs.first().cloned() else {
-            return Err(StageError::Failed("expected 1 output".into()));
-        };
+        let mut squelch =
+            stage_squelch("am_demod", p.squelch, p.squelch_db).map_err(StageError::Failed)?;
+        let (out, events) = squelch_streams(&outputs, squelch.is_some())?;
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
@@ -252,23 +268,36 @@ impl Stage for AmDemodStage {
                 ));
             };
             let rate = block.sample_rate_hz.0;
+            let mut prov = frame.provenance.clone();
+            prov.span = frame_span(block.t0, block.samples.len(), rate);
+            let mut published = Vec::new();
+            if let (Some(sq), Some(events)) = (squelch.as_mut(), &events) {
+                if let Some(open) = sq.feed(&block.samples, rate) {
+                    published.push(Frame::new(
+                        events.clone(),
+                        prov.clone(),
+                        Payload::Event(squelch_event(sq, open)),
+                    ));
+                }
+                if !sq.is_open() {
+                    return Ok(published);
+                }
+            }
             let samples = demod
                 .process(&block.samples, rate)
                 .map_err(StageError::Failed)?;
-            if samples.is_empty() {
-                return Ok(Vec::new());
+            if !samples.is_empty() {
+                published.push(Frame::new(
+                    out.clone(),
+                    prov,
+                    Payload::Audio {
+                        sample_rate_hz: Hz(p.audio_rate_hz),
+                        channels: 1,
+                        samples: samples.into(),
+                    },
+                ));
             }
-            let mut prov = frame.provenance.clone();
-            prov.span = frame_span(block.t0, block.samples.len(), rate);
-            Ok(vec![Frame::new(
-                out.clone(),
-                prov,
-                Payload::Audio {
-                    sample_rate_hz: Hz(p.audio_rate_hz),
-                    channels: 1,
-                    samples: samples.into(),
-                },
-            )])
+            Ok(published)
         })
         .await
     }

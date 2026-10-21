@@ -1759,7 +1759,8 @@ def scenario_audio_play_opens_binary_socket(page, url, secret):
 
 
 def scenario_fm_demod_does_not_poll_streams(page, url, secret):
-    # An fm_demod job has no event stream: it is looked up once, not on every poll.
+    # An fm_demod job's event stream (its squelch events) is looked up once and watched, not
+    # looked up on every poll.
     select_source(page, url, secret, "tone")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
     page.wait_for_timeout(500)
@@ -1773,6 +1774,44 @@ def scenario_fm_demod_does_not_poll_streams(page, url, secret):
         assert len(seen) <= 3, f"{len(seen)} GET /streams in 6 s: {seen}"
     finally:
         stop_job(url, secret, job)
+
+
+def frames_in(url, secret, stream, within_ms, max_frames=5):
+    """The frames `stream_tail` returns from `stream` within `within_ms`."""
+    r = http_json(url, secret, "/op", {"op": "stream_tail", "stream": stream,
+                                       "max_frames": max_frames, "timeout_ms": within_ms})
+    return r["value"]["frames"]
+
+
+def scenario_quiet_channel_row_is_tagged_squelch(page, url, secret):
+    # Inside the tone recording (99.976-100.024 MHz) but off the tone: the squelch closes, the
+    # row is tagged and the audio stream is silent. On the tone: open, untagged, audio flows.
+    select_source(page, url, secret, "tone")
+    quiet = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500)
+    loud = None
+    try:
+        loud = start_job(url, secret, "fm_demod", "tone", 100_000_000, 12_500)
+        page.evaluate("window.zetaTest.poll()")
+        tag = job_row(page, quiet).locator(".kind .tag.squelch")
+        expect(tag).to_be_visible(timeout=3_000)
+        expect(tag).to_have_text("squelch")
+        assert "closed" in (tag.get_attribute("title") or ""), tag.get_attribute("title")
+        audio = stream_of(url, secret, quiet, "audio")
+        assert audio, "no audio stream for the quiet fm_demod job"
+        got = frames_in(url, secret, audio, 1_000)
+        assert got == [], f"{len(got)} audio frames from a squelched channel"
+        audio = stream_of(url, secret, loud, "audio")
+        assert audio, "no audio stream for the fm_demod job on the tone"
+        assert len(frames_in(url, secret, audio, 1_000, max_frames=2)) == 2, \
+            "no audio from the fm_demod job on the tone"
+        expect(job_row(page, loud).locator(".tag.squelch")).to_have_count(0)
+        # The squelch events are not decoded events: neither row counts them.
+        for j in (quiet, loud):
+            expect(job_row(page, j).locator(".events")).to_have_text("")
+    finally:
+        for j in (loud, quiet):
+            if j:
+                stop_job(url, secret, j)
 
 
 def scenario_watched_jobs_are_capped(page, url, secret):

@@ -198,8 +198,9 @@ async fn then_tail_job(
     }
 }
 
-/// `--then-tail`: wait up to `STREAM_WAIT` for the job's first event (else
-/// audio) stream, then apply `StreamTail` to it.
+/// `--then-tail`: wait up to `STREAM_WAIT` for the job's audio output (a
+/// demodulator's; its `squelch` events are not what a tail is for), else its
+/// first event stream, then apply `StreamTail` to it.
 async fn tail_job(
     node: &zeta_core::node::Node,
     job: &zeta_core::types::JobId,
@@ -215,10 +216,10 @@ async fn tail_job(
             .filter(|s| s.provenance.job.as_ref() == Some(job))
             .collect();
         mine.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-        let pick = [StreamKind::Event, StreamKind::Audio]
-            .into_iter()
-            .find_map(|k| mine.iter().find(|s| s.kind == k));
-        if let Some(s) = pick {
+        if let Ok(s) = node.job_audio_stream(job) {
+            break s;
+        }
+        if let Some(s) = mine.iter().find(|s| s.kind == StreamKind::Event) {
             break s.id.clone();
         }
         if tokio::time::Instant::now() >= deadline {

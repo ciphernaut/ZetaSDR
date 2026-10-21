@@ -14,6 +14,9 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, StreamId, StreamKind};
 
 use crate::resample::Resampler;
+use crate::squelch::{
+    default_true, squelch_event, squelch_outputs, squelch_streams, stage_squelch,
+};
 use crate::{Input, frame_span, run_map};
 
 /// Phase-discriminator FM demodulation: `arg(x[n] · conj(x[n-1]))` scaled by
@@ -82,9 +85,18 @@ impl AudioFilter {
 pub struct NbfmParams {
     pub deviation_hz: u64,
     pub audio_rate_hz: u64,
+    /// Fixed squelch threshold, dBFS (-120..=0); `null` tracks the noise floor.
+    #[serde(default)]
+    pub squelch_db: Option<i64>,
+    /// The squelch is on (the default); `false` passes every block.
+    #[serde(default = "default_true")]
+    pub squelch: bool,
 }
 
-/// Demodulates an NBFM IQ stream to audio at `audio_rate_hz`.
+/// Demodulates an NBFM IQ stream to audio at `audio_rate_hz`, behind a
+/// [`Squelch`](crate::squelch::Squelch): while it is closed no audio frame is
+/// published, and each transition (and the first block) publishes a `squelch`
+/// event on the second output.
 pub struct NbfmDemodStage {
     spec: StageSpec,
 }
@@ -95,7 +107,7 @@ impl NbfmDemodStage {
             spec: StageSpec {
                 kind: "nbfm_demod",
                 inputs: vec![StreamKind::Iq],
-                outputs: vec![StreamKind::Audio],
+                outputs: vec![StreamKind::Audio, StreamKind::Event],
                 params_schema: schemars::schema_for!(NbfmParams),
             },
         }
@@ -116,6 +128,11 @@ impl Stage for NbfmDemodStage {
 
     fn backend(&self) -> Backend {
         Backend::Cpu
+    }
+
+    /// No event output with the squelch off: it would stay silent.
+    fn outputs_for(&self, params: &serde_json::Value) -> Vec<StreamKind> {
+        squelch_outputs(params)
     }
 
     async fn run(
@@ -139,9 +156,9 @@ impl Stage for NbfmDemodStage {
                 "nbfm_demod params: audio_rate_hz must be >= 1".into(),
             ));
         }
-        let Some(out) = outputs.first().cloned() else {
-            return Err(StageError::Failed("expected 1 output".into()));
-        };
+        let mut squelch =
+            stage_squelch("nbfm_demod", p.squelch, p.squelch_db).map_err(StageError::Failed)?;
+        let (out, events) = squelch_streams(&outputs, squelch.is_some())?;
         let mut prev = Complex::new(0.0f32, 0.0);
         let mut filter = AudioFilter::default();
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
@@ -159,24 +176,37 @@ impl Stage for NbfmDemodStage {
                 ));
             };
             let rate = block.sample_rate_hz.0;
+            let mut prov = frame.provenance.clone();
+            prov.span = frame_span(block.t0, block.samples.len(), rate);
+            let mut published = Vec::new();
+            if let (Some(sq), Some(events)) = (squelch.as_mut(), &events) {
+                if let Some(open) = sq.feed(&block.samples, rate) {
+                    published.push(Frame::new(
+                        events.clone(),
+                        prov.clone(),
+                        Payload::Event(squelch_event(sq, open)),
+                    ));
+                }
+                if !sq.is_open() {
+                    return Ok(published);
+                }
+            }
             let demod = nbfm_demod(&block.samples, rate, p.deviation_hz, &mut prev);
             let samples = filter
                 .process(&demod, rate, p.audio_rate_hz)
                 .map_err(StageError::Failed)?;
-            if samples.is_empty() {
-                return Ok(Vec::new());
+            if !samples.is_empty() {
+                published.push(Frame::new(
+                    out.clone(),
+                    prov,
+                    Payload::Audio {
+                        sample_rate_hz: Hz(p.audio_rate_hz),
+                        channels: 1,
+                        samples: samples.into(),
+                    },
+                ));
             }
-            let mut prov = frame.provenance.clone();
-            prov.span = frame_span(block.t0, block.samples.len(), rate);
-            Ok(vec![Frame::new(
-                out.clone(),
-                prov,
-                Payload::Audio {
-                    sample_rate_hz: Hz(p.audio_rate_hz),
-                    channels: 1,
-                    samples: samples.into(),
-                },
-            )])
+            Ok(published)
         })
         .await
     }
@@ -275,31 +305,52 @@ mod tests {
     fn spawn(
         params: serde_json::Value,
     ) -> (broadcast::Sender<Frame>, broadcast::Receiver<Frame>, Run) {
-        let bus = Arc::new(StreamBus::new(8));
+        let (tx, rx_out, _rx_ev, h) = spawn_with(params, 8);
+        (tx, rx_out, h)
+    }
+
+    /// The stage with `cap`-deep input and output channels: its input sender, its audio
+    /// and event receivers and its task.
+    fn spawn_with(
+        params: serde_json::Value,
+        cap: usize,
+    ) -> (
+        broadcast::Sender<Frame>,
+        broadcast::Receiver<Frame>,
+        broadcast::Receiver<Frame>,
+        Run,
+    ) {
+        let bus = Arc::new(StreamBus::new(cap));
         let out = bus.register(StreamKind::Audio, prov());
+        let ev = bus.register(StreamKind::Event, prov());
         let rx_out = bus.subscribe(&out).unwrap();
-        let (tx, rx_in) = broadcast::channel(8);
+        let rx_ev = bus.subscribe(&ev).unwrap();
+        let (tx, rx_in) = broadcast::channel(cap);
         let h = tokio::spawn(async move {
             NbfmDemodStage::new()
                 .run(
                     params,
                     vec![rx_in],
-                    vec![out],
+                    vec![out, ev],
                     bus,
                     CancellationToken::new(),
                     zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
                 )
                 .await
         });
-        (tx, rx_out, h)
+        (tx, rx_out, rx_ev, h)
     }
 
     fn iq_frame(samples: Vec<Complex<f32>>, rate_hz: u64) -> Frame {
+        iq_frame_at(samples, rate_hz, 1_000_000_000)
+    }
+
+    fn iq_frame_at(samples: Vec<Complex<f32>>, rate_hz: u64, t0_ns: u64) -> Frame {
         Frame::new(
             StreamId::new(),
             prov(),
             Payload::Iq(IqBlock {
-                t0: Timestamp(1_000_000_000),
+                t0: Timestamp(t0_ns),
                 sample_rate_hz: Hz(rate_hz),
                 center_hz: Hz(100_000_000),
                 samples: samples.into(),
@@ -406,5 +457,129 @@ mod tests {
         }
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
+    }
+
+    /// 20 ms blocks of `secs` seconds of complex noise at `db` dBFS, at 48 kHz, then
+    /// `tail` (blocks of a carrier at `tail_db` dBFS frequency-modulated by a 1 kHz tone).
+    fn blocks(secs: f32, db: f32, tail: usize, tail_db: f32) -> Vec<Vec<Complex<f32>>> {
+        const BLOCK: usize = 960;
+        let n = (secs * 50.0) as usize;
+        let mut out: Vec<Vec<Complex<f32>>> = (0..n)
+            .map(|i| {
+                let mut x = vec![Complex::new(0.0f32, 0.0); BLOCK];
+                awgn(&mut x, -db, 100 + i as u64);
+                x
+            })
+            .collect();
+        let audio = tone(48_000, BLOCK * tail.max(1), 1_000.0, 0.5);
+        let a = 10f32.powf(tail_db / 20.0);
+        let iq: Vec<Complex<f32>> = nbfm_modulate(&audio, 48_000, 48_000, 2_500.0, 0.0)
+            .into_iter()
+            .map(|c| c * a)
+            .collect();
+        out.extend(iq.chunks(BLOCK).take(tail).map(|c| c.to_vec()));
+        out
+    }
+
+    /// Feed `blocks` (20 ms apart) to a stage with `params`, end its input and return
+    /// the audio frames and the event payloads it published.
+    async fn run_blocks(
+        params: serde_json::Value,
+        blocks: Vec<Vec<Complex<f32>>>,
+    ) -> (usize, Vec<serde_json::Value>) {
+        let (tx, mut rx_out, mut rx_ev, h) = spawn_with(params, 1_024);
+        for (i, b) in blocks.into_iter().enumerate() {
+            tx.send(iq_frame_at(
+                b,
+                48_000,
+                1_000_000_000 + i as u64 * 20_000_000,
+            ))
+            .unwrap();
+        }
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        let mut audio = 0;
+        while let Ok(f) = rx_out.try_recv() {
+            assert!(matches!(f.payload, Payload::Audio { .. }));
+            audio += 1;
+        }
+        let mut events = Vec::new();
+        while let Ok(f) = rx_ev.try_recv() {
+            let Payload::Event(v) = f.payload else {
+                panic!("expected an event payload")
+            };
+            events.push(v);
+        }
+        (audio, events)
+    }
+
+    #[tokio::test]
+    async fn closed_squelch_publishes_no_audio_and_a_squelch_event() {
+        let p = serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000});
+        let (audio, events) = run_blocks(p.clone(), blocks(1.0, -60.0, 0, 0.0)).await;
+        assert_eq!(audio, 0);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let e = &events[0];
+        assert_eq!(e["protocol"], "squelch");
+        assert_eq!(e["open"], false);
+        assert!((e["power_db"].as_f64().unwrap() + 60.0).abs() < 1.0, "{e}");
+        assert!((e["floor_db"].as_f64().unwrap() + 60.0).abs() < 1.0, "{e}");
+        let keys: Vec<_> = e.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys.len(), 4, "{e}");
+
+        // Off: audio frames as before, and no squelch events.
+        let off =
+            serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000, "squelch": false});
+        let (audio, events) = run_blocks(off, blocks(1.0, -60.0, 0, 0.0)).await;
+        assert_eq!(audio, 50);
+        assert!(events.is_empty(), "{events:?}");
+
+        // A -50 dBFS FM tone after 2 s of noise opens it: audio, and an open event.
+        let (audio, events) = run_blocks(p, blocks(2.0, -60.0, 10, -50.0)).await;
+        assert!(audio >= 9, "{audio} audio frames");
+        let opens: Vec<_> = events.iter().map(|e| e["open"].clone()).collect();
+        assert_eq!(opens, [false, true], "{events:?}");
+        assert!(
+            events[1]["power_db"].as_f64().unwrap() > -51.0,
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_event_output_goes_with_the_squelch() {
+        let st = NbfmDemodStage::new();
+        assert_eq!(st.spec().outputs, [StreamKind::Audio, StreamKind::Event]);
+        let on = serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000});
+        assert_eq!(st.outputs_for(&on), [StreamKind::Audio, StreamKind::Event]);
+        let off =
+            serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000, "squelch": false});
+        assert_eq!(st.outputs_for(&off), [StreamKind::Audio]);
+    }
+
+    #[tokio::test]
+    async fn squelch_db_out_of_range_fails_the_stage() {
+        for v in [-121, 1] {
+            let (_tx, _rx, h) = spawn(serde_json::json!({
+                "deviation_hz": 2_500, "audio_rate_hz": 48_000, "squelch_db": v
+            }));
+            match h.await.unwrap() {
+                Err(StageError::Failed(m)) => assert_eq!(
+                    m,
+                    format!("nbfm_demod params: squelch_db {v} out of range -120..=0")
+                ),
+                r => panic!("expected Failed, got {r:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fixed_squelch_db_opens_over_it() {
+        // -30 dBFS fixed: 1 s of -60 dBFS noise stays closed, a -20 dBFS tone opens.
+        let p =
+            serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000, "squelch_db": -30});
+        let (audio, events) = run_blocks(p, blocks(1.0, -60.0, 5, -20.0)).await;
+        assert!(audio >= 4, "{audio}");
+        let opens: Vec<_> = events.iter().map(|e| e["open"].clone()).collect();
+        assert_eq!(opens, [false, true], "{events:?}");
     }
 }

@@ -6,12 +6,13 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::ops::Sideband;
+use zeta_core::port::IqBlock;
 use zeta_core::stage::{Stage, StageError};
-use zeta_core::stream::StreamBus;
-use zeta_core::types::StreamId;
+use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::types::{Hz, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 use zeta_dsp::am::{AmDemod, AmDemodStage, AmParams, SsbDemod, SsbParams, am_demod};
 use zeta_dsp::fft::{Window, power_spectrum_db};
-use zeta_dsp::fixtures::{am_modulate, ssb_modulate, tone};
+use zeta_dsp::fixtures::{am_modulate, awgn, ssb_modulate, tone};
 
 #[test]
 fn am_demod_is_the_magnitude() {
@@ -25,6 +26,8 @@ fn am_demod_recovers_tone() {
     let iq = am_modulate(&audio, 48_000, 48_000, 0.5, 0.0);
     let mut d = AmDemod::new(&AmParams {
         audio_rate_hz: 48_000,
+        squelch_db: None,
+        squelch: true,
     })
     .unwrap();
     let mut out = Vec::new();
@@ -78,6 +81,8 @@ fn am_and_ssb_survive_a_nan_sample() {
     let ssb = ssb_modulate(&audio, 48_000, 48_000, true, 0.0);
     let mut am_d = AmDemod::new(&AmParams {
         audio_rate_hz: 48_000,
+        squelch_db: None,
+        squelch: true,
     })
     .unwrap();
     let mut ssb_d = SsbDemod::new(&SsbParams {
@@ -104,4 +109,80 @@ fn am_and_ssb_survive_a_nan_sample() {
             );
         }
     }
+}
+
+/// The audio frame count and the `squelch` events of an `am_demod` stage fed `blocks`.
+async fn am_stage_run(blocks: Vec<Vec<Complex<f32>>>) -> (usize, Vec<serde_json::Value>) {
+    let prov = Provenance {
+        source: SourceId("s".into()),
+        job: None,
+        channel: None,
+        span: Span {
+            start_ns: Timestamp(0),
+            end_ns: Timestamp(1),
+        },
+    };
+    let bus = Arc::new(StreamBus::new(1_024));
+    let (out, ev) = (
+        bus.register(StreamKind::Audio, prov.clone()),
+        bus.register(StreamKind::Event, prov.clone()),
+    );
+    let (mut rx_out, mut rx_ev) = (bus.subscribe(&out).unwrap(), bus.subscribe(&ev).unwrap());
+    let (tx, rx) = broadcast::channel(1_024);
+    for (i, b) in blocks.into_iter().enumerate() {
+        let iq = IqBlock {
+            t0: Timestamp(i as u64 * 20_000_000),
+            sample_rate_hz: Hz(48_000),
+            center_hz: Hz(100_000_000),
+            samples: b.into(),
+        };
+        tx.send(Frame::new(StreamId::new(), prov.clone(), Payload::Iq(iq)))
+            .unwrap();
+    }
+    drop(tx);
+    AmDemodStage::new()
+        .run(
+            serde_json::json!({"audio_rate_hz": 48_000}),
+            vec![rx],
+            vec![out, ev],
+            bus,
+            CancellationToken::new(),
+            zeta_core::stage::StageContext::new(SourceId("s".into())),
+        )
+        .await
+        .unwrap();
+    let mut audio = 0;
+    while rx_out.try_recv().is_ok() {
+        audio += 1;
+    }
+    let mut events = Vec::new();
+    while let Ok(f) = rx_ev.try_recv() {
+        let Payload::Event(v) = f.payload else {
+            panic!("expected an event")
+        };
+        events.push(v);
+    }
+    (audio, events)
+}
+
+#[tokio::test]
+async fn am_squelch_closes_on_noise_and_opens_on_a_carrier() {
+    let noise = |seed: u64| {
+        let mut x = vec![Complex::new(0.0f32, 0.0); 960];
+        awgn(&mut x, 60.0, seed);
+        x
+    };
+    let (audio, events) = am_stage_run((0..50).map(noise).collect()).await;
+    assert_eq!(audio, 0);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["protocol"], "squelch");
+    assert_eq!(events[0]["open"], false);
+    // 2 s of noise, then a -40 dBFS AM tone.
+    let am = am_modulate(&tone(48_000, 9_600, 1_000.0, 1.0), 48_000, 48_000, 0.3, 0.0);
+    let mut blocks: Vec<_> = (0..100).map(noise).collect();
+    blocks.extend(am.chunks(960).map(|c| c.iter().map(|x| x * 0.01).collect()));
+    let (audio, events) = am_stage_run(blocks).await;
+    assert!(audio >= 9, "{audio} audio frames");
+    let opens: Vec<_> = events.iter().map(|e| e["open"].clone()).collect();
+    assert_eq!(opens, [false, true], "{events:?}");
 }

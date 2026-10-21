@@ -1,5 +1,6 @@
 // overlays.js: channel-pinned overlays on the waterfall: layer labels, text ribbons, the
-// outlined bands of the rigid holders and the decoded-event counters of the job rows.
+// outlined bands of the rigid holders, the decoded-event counters of the job rows and their
+// squelch tags.
 //
 // Exports:
 //   mountOverlays(el, wf, api, {jobsEl}) -> Overlays
@@ -27,7 +28,7 @@
 //                            are the waterfall's and are ignored here anyway. Event streams
 //                            of jobs not yet watched are resolved with one GET /streams per
 //                            poll; a job whose streams are listed but none is an `event`
-//                            stream (e.g. `fm_demod`) goes in `noEventStream` (job id ->
+//                            stream (e.g. `wfm_demod`) goes in `noEventStream` (job id ->
 //                            graph JSON) and is not looked up again until it leaves the
 //                            running list or its graph changes. An attached `transcribe`
 //                            job is watched like any other (its source is its input's).
@@ -36,7 +37,12 @@
 //                            `transcript` stage's; text mode, each re-resolved by provenance
 //                            after a drop) and renders each event by payload shape (so by
 //                            `protocol`, whichever stream it came on):
-//         - `db` array (spectrum): ignored; every other event bumps the job row's counter;
+//         - `db` array (spectrum): ignored;
+//         - `protocol: squelch` (fm_demod, am_demod): not counted, never drawn; kept as the
+//           job's last squelch event (ov.squelch, forgotten when the job's graph changes)
+//           and the row's tag set from it at once (agent.js setSquelchTag; the 2 s
+//           re-render keeps it through agent.js);
+//         - every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
 //         - `protocol` (the decoders), at the tuning centre, class = the protocol:
@@ -74,9 +80,12 @@
 //         edges, `text` its label (`.outline-label`) at its top right; one per key, replaced
 //         on each call, placed again when the view changes. Drawn under labels and ribbons.
 //     ov.unoutline(key)      removes the outline drawn under `key`, if any
+//     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a watched job
 //     ov.jobRow(job, counter)  shows `counter` (when > 0, or the string `—` for a job over
 //                            the cap) in that job's row `.events` cell
 //     ov.destroy()
+
+import { setSquelchTag } from "./agent.js";
 
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
@@ -161,6 +170,7 @@ class Overlays {
     this.noEventStream = new Map(); // job id -> JSON of the graph that has no event stream
     this.resolving = false; // a GET /streams for unwatched jobs is in flight
     this.counters = new Map(); // job id -> non-spectrum events seen while watched
+    this.squelches = new Map(); // job id -> {event: the last `squelch` event seen, graph}
     this.labels = new Map(); // key -> {el, hz}
     this.outlines = new Map(); // key -> {el, labelEl, lo, hi}
     this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
@@ -222,6 +232,12 @@ class Overlays {
     const fresh = capped.filter((j) => !this.watched.has(j.id));
     if (fresh.length > 0) this.resolve(fresh);
     for (const j of want) {
+      // A `graph_put` restarted the job (perhaps with its squelch off): forget the old state.
+      const sq = this.squelches.get(j.id);
+      if (sq && sq.graph !== graphKey(j)) {
+        this.squelches.delete(j.id);
+        setSquelchTag(this.jobRowEl(j), null);
+      }
       const over = !ids.has(j.id) && !this.noEventStream.has(j.id);
       this.jobRow(j, over ? "—" : this.counters.get(j.id) || 0);
     }
@@ -308,6 +324,7 @@ class Overlays {
     for (const sub of rec.subs) sub.close();
     this.watched.delete(jobId);
     this.counters.delete(jobId);
+    this.squelches.delete(jobId);
     this.unlabel(jobId);
   }
 
@@ -340,6 +357,11 @@ class Overlays {
     const job = rec.job;
     const obj = p && typeof p === "object" && !Array.isArray(p);
     if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
+    if (obj && p.protocol === "squelch") {
+      this.squelches.set(job.id, { event: p, graph: graphKey(job) });
+      setSquelchTag(this.jobRowEl(job), p);
+      return;
+    }
     // Every non-spectrum event counts in the job row, whatever its shape.
     const n = (this.counters.get(job.id) || 0) + 1;
     this.counters.set(job.id, n);
@@ -372,9 +394,19 @@ class Overlays {
     this.ribbon(tuningCentre(job), json.slice(0, OTHER_EVENT_CHARS), "event");
   }
 
+  squelch(jobId) {
+    const s = this.squelches.get(jobId);
+    return s ? s.event : null;
+  }
+
+  jobRowEl(job) {
+    return this.jobsEl
+      ? this.jobsEl.querySelector(`.job[data-id="${CSS.escape(job.id)}"]`)
+      : null;
+  }
+
   jobRow(job, counter) {
-    if (!this.jobsEl) return;
-    const row = this.jobsEl.querySelector(`.job[data-id="${CSS.escape(job.id)}"]`);
+    const row = this.jobRowEl(job);
     const cell = row && row.querySelector(".events");
     if (!cell) return;
     if (typeof counter === "string") {
