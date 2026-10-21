@@ -246,7 +246,7 @@ impl Stage for AmDemodStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let p: AmParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("am_demod params: {e}")))?;
@@ -273,10 +273,13 @@ impl Stage for AmDemodStage {
             let mut published = Vec::new();
             if let (Some(sq), Some(events)) = (squelch.as_mut(), &events) {
                 if let Some(open) = sq.feed(&block.samples, rate) {
+                    let event = squelch_event(sq, open, None, false);
+                    // Latched in the job's context too: a late subscriber reads the gate there.
+                    ctx.note(serde_json::json!({ "squelch": event.clone() }));
                     published.push(Frame::new(
                         events.clone(),
                         prov.clone(),
-                        Payload::Event(squelch_event(sq, open, None, false)),
+                        Payload::Event(event),
                     ));
                 }
                 if !sq.is_open() {

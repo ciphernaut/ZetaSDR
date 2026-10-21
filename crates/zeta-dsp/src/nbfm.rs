@@ -259,6 +259,21 @@ impl Guard {
     }
 }
 
+/// How far under `guard_db` a neighbour must fall before a guard holding the gate lets go,
+/// dB: a neighbour wavering at the threshold does not flap the gate block by block.
+pub const GUARD_HYSTERESIS_DB: f32 = 2.0;
+
+/// Whether the guard holds the gate, a neighbour `excess_db` over the centre, given whether
+/// it held it (`was`): it takes hold over `guard_db` and lets go only under
+/// `guard_db - GUARD_HYSTERESIS_DB`.
+fn guard_holds(was: bool, excess_db: f32, guard_db: f32) -> bool {
+    if was {
+        excess_db >= guard_db - GUARD_HYSTERESIS_DB
+    } else {
+        excess_db > guard_db
+    }
+}
+
 const GUARD_NEEDS: &str =
     "nbfm_demod params: guard_hz needs channel_hz with channel_hz + 2 guard_hz <= the channel rate";
 
@@ -311,7 +326,7 @@ impl Stage for NbfmDemodStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let p: NbfmParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("nbfm_demod params: {e}")))?;
@@ -393,7 +408,8 @@ impl Stage for NbfmDemodStage {
                 if sq.is_open() {
                     adjacent = guard.as_mut().and_then(|g| g.adjacent_db(&block.samples));
                     guarded = adjacent.is_some_and(|a| {
-                        a - sq.power_db() > guard.as_ref().map_or(f32::INFINITY, |g| g.db)
+                        let db = guard.as_ref().map_or(f32::INFINITY, |g| g.db);
+                        guard_holds(guarded, a - sq.power_db(), db)
                     });
                 }
                 let gate = sq.is_open() && !guarded;
@@ -401,10 +417,13 @@ impl Stage for NbfmDemodStage {
                     if adjacent.is_none() {
                         adjacent = guard.as_mut().and_then(|g| g.adjacent_db(&block.samples));
                     }
+                    let event = squelch_event(sq, gate, adjacent, guarded);
+                    // Latched in the job's context too: a late subscriber reads the gate there.
+                    ctx.note(serde_json::json!({ "squelch": event.clone() }));
                     published.push(Frame::new(
                         events.clone(),
                         prov.clone(),
-                        Payload::Event(squelch_event(sq, gate, adjacent, guarded)),
+                        Payload::Event(event),
                     ));
                 }
                 if adjacent.is_none()
@@ -560,6 +579,21 @@ mod tests {
         broadcast::Receiver<Frame>,
         Run,
     ) {
+        let ctx = zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into()));
+        spawn_ctx(params, cap, ctx)
+    }
+
+    /// [`spawn_with`] in `ctx`.
+    fn spawn_ctx(
+        params: serde_json::Value,
+        cap: usize,
+        ctx: zeta_core::stage::StageContext,
+    ) -> (
+        broadcast::Sender<Frame>,
+        broadcast::Receiver<Frame>,
+        broadcast::Receiver<Frame>,
+        Run,
+    ) {
         let bus = Arc::new(StreamBus::new(cap));
         let out = bus.register(StreamKind::Audio, prov());
         let ev = bus.register(StreamKind::Event, prov());
@@ -574,7 +608,7 @@ mod tests {
                     vec![out, ev],
                     bus,
                     CancellationToken::new(),
-                    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
+                    ctx,
                 )
                 .await
         });
@@ -731,14 +765,19 @@ mod tests {
         (audio.len(), events)
     }
 
-    /// [`run_blocks`] at `rate_hz`: the audio frames' start times and the events.
+    /// [`run_blocks`] at `rate_hz`: the audio frames' start times and the events. Every
+    /// event is also noted to the job as `{"squelch": event}` (the latched gate state).
     async fn run_blocks_at(
         params: serde_json::Value,
         blocks: Vec<Vec<Complex<f32>>>,
         rate_hz: u64,
     ) -> (Vec<u64>, Vec<serde_json::Value>) {
         let n = blocks.len();
-        let (tx, mut rx_out, mut rx_ev, h) = spawn_with(params, n.max(8) * 2);
+        let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = notes.clone();
+        let ctx = zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into()))
+            .with_note(Arc::new(move |v| sink.lock().unwrap().push(v)));
+        let (tx, mut rx_out, mut rx_ev, h) = spawn_ctx(params, n.max(8) * 2, ctx);
         for (i, b) in blocks.into_iter().enumerate() {
             tx.send(iq_frame_at(
                 b,
@@ -761,6 +800,11 @@ mod tests {
             };
             events.push(v);
         }
+        let noted: Vec<_> = events
+            .iter()
+            .map(|e| serde_json::json!({ "squelch": e }))
+            .collect();
+        assert_eq!(*notes.lock().unwrap(), noted);
         (audio, events)
     }
 
@@ -1009,6 +1053,43 @@ mod tests {
         );
         assert!(!guarded.is_empty());
         assert!(events.iter().any(|e| e["guarded"] == true), "{events:?}");
+    }
+
+    #[test]
+    fn the_guard_lets_go_only_under_its_hysteresis() {
+        // A neighbour 12 dB over the centre, give or take 1 dB, block by block.
+        let mut held = false;
+        let mut flips = 0;
+        for i in 0..50 {
+            let excess = if i % 2 == 0 { 13.0 } else { 11.0 };
+            let now = guard_holds(held, excess, 12.0);
+            flips += usize::from(now != held);
+            held = now;
+        }
+        assert_eq!((held, flips), (true, 1));
+        // It lets go under guard_db - GUARD_HYSTERESIS_DB, and stays off until over guard_db.
+        assert!(guard_holds(true, 12.0 - GUARD_HYSTERESIS_DB, 12.0));
+        assert!(!guard_holds(true, 12.0 - GUARD_HYSTERESIS_DB - 0.1, 12.0));
+        assert!(!guard_holds(false, 11.0, 12.0));
+        assert!(!guard_holds(false, 12.0, 12.0));
+        assert!(guard_holds(false, 12.1, 12.0));
+    }
+
+    #[tokio::test]
+    async fn a_neighbour_wavering_at_the_threshold_does_not_flap_the_gate() {
+        // A centre carrier and a neighbour about 12 dB over it, alternating 1 dB up and
+        // down every 20 ms block: the gate changes at most once after the first event.
+        let mut blocks = cb_blocks(0.5, &[], 40);
+        for i in 0..50u64 {
+            let db = if i % 2 == 0 { -17.0 } else { -19.0 };
+            blocks.extend(cb_blocks(
+                0.02,
+                &[(0.0, -30.0, 2_500.0), (12_500.0, db, 5_000.0)],
+                41 + i,
+            ));
+        }
+        let (_, events) = run_blocks_at(cb_params(Some(12_500)), blocks, 51_200).await;
+        assert!(events.len() <= 3, "{} events: {events:?}", events.len());
     }
 
     #[tokio::test]

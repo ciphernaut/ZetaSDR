@@ -140,6 +140,10 @@ async fn am_stage_run(blocks: Vec<Vec<Complex<f32>>>) -> (usize, Vec<serde_json:
             .unwrap();
     }
     drop(tx);
+    let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = notes.clone();
+    let ctx = zeta_core::stage::StageContext::new(SourceId("s".into()))
+        .with_note(Arc::new(move |v| sink.lock().unwrap().push(v)));
     AmDemodStage::new()
         .run(
             serde_json::json!({"audio_rate_hz": 48_000}),
@@ -147,7 +151,7 @@ async fn am_stage_run(blocks: Vec<Vec<Complex<f32>>>) -> (usize, Vec<serde_json:
             vec![out, ev],
             bus,
             CancellationToken::new(),
-            zeta_core::stage::StageContext::new(SourceId("s".into())),
+            ctx,
         )
         .await
         .unwrap();
@@ -162,6 +166,12 @@ async fn am_stage_run(blocks: Vec<Vec<Complex<f32>>>) -> (usize, Vec<serde_json:
         };
         events.push(v);
     }
+    // Each gate event is also latched in the job's context, for late subscribers.
+    let noted: Vec<_> = events
+        .iter()
+        .map(|e| serde_json::json!({ "squelch": e }))
+        .collect();
+    assert_eq!(*notes.lock().unwrap(), noted);
     (audio, events)
 }
 
