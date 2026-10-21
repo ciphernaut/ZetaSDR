@@ -618,6 +618,63 @@ async fn concurrency_is_bounded_and_busy_is_a_drop() {
     }
 }
 
+/// A backend whose every call finds no free slot.
+struct AlwaysBusy;
+
+#[async_trait::async_trait]
+impl SpeechBackend for AlwaysBusy {
+    fn name(&self) -> &str {
+        "busy"
+    }
+    fn languages(&self) -> &[String] {
+        static EN: std::sync::LazyLock<Vec<String>> =
+            std::sync::LazyLock::new(|| vec!["en".to_string()]);
+        &EN
+    }
+    async fn transcribe(
+        &self,
+        _: &[u8],
+        _: &str,
+    ) -> Result<zeta_speech::Transcript, zeta_speech::SpeechError> {
+        Err(zeta_speech::SpeechError::Busy(Duration::from_secs(30)))
+    }
+}
+
+#[tokio::test]
+async fn a_busy_peer_node_is_a_drop_not_an_error() {
+    // The peer's own backend is full: its 503 busy crosses --stt-node as a `busy` drop, and
+    // the stage keeps running past MAX_ERRORS of them.
+    let dir = tempfile::tempdir().unwrap();
+    let peer = zeta_ws::testing::spawn_with(
+        dir.path(),
+        zeta_ws::testing::TestOpts {
+            speech: Some(Arc::new(AlwaysBusy)),
+            ..zeta_ws::testing::TestOpts::default()
+        },
+    )
+    .await;
+    let node: Arc<dyn SpeechBackend> = Arc::new(
+        zeta_speech::NodeBackend::new(&peer.url, "s3cret")
+            .await
+            .unwrap(),
+    );
+    let mut rig = start_with(Some(node), Duration::from_secs(30), serde_json::json!({}));
+    let mut t = T_BASE;
+    for _ in 0..3 {
+        t = send_at(&rig.tx, &one_second(), 16_000, 1, t) + SEC;
+        let v = next_event(&mut rig.events).await;
+        assert_eq!(
+            (v["dropped"].clone(), v["reason"].clone()),
+            (true.into(), "busy".into()),
+            "{v}"
+        );
+    }
+    assert!(!rig.run.is_finished());
+    let (res, _) = finish(rig).await;
+    assert!(res.is_ok(), "{res:?}");
+    peer.stop().await;
+}
+
 #[tokio::test]
 async fn short_utterances_are_noted_in_the_job_context() {
     let notes = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));

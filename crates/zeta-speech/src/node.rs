@@ -1,11 +1,13 @@
 //! Another ZetaSDR node's speech backend, over its `POST /stt`.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use zeta_client::{ClientError, NodeClient};
 
 use crate::backend::{SpeechBackend, SpeechError, Transcript, default_languages, normalise};
-use crate::socket::PROBE_TIMEOUT;
+use crate::socket::{PROBE_TIMEOUT, STT_QUEUE_WAIT};
 
 pub struct NodeBackend {
     name: String,
@@ -69,6 +71,12 @@ impl SpeechBackend for NodeBackend {
     fn forwards(&self) -> bool {
         true
     }
+
+    /// The peer's own queue: a call there may wait this long for a slot before its daemon
+    /// is asked (a peer with a longer wait answers busy only after it, past our bound).
+    fn queue_wait(&self) -> Duration {
+        STT_QUEUE_WAIT
+    }
 }
 
 /// The node's refusal as the error its own backend gave, as far as its answer tells.
@@ -86,6 +94,13 @@ fn speech_error(e: ClientError, language: &str) -> SpeechError {
             language: language.to_string(),
             supported,
         };
+    }
+    if *status == 503 && v["error"] == "busy" {
+        // The peer's daemon is full: a drop for the job, as a local busy is.
+        let wait = v["wait_ms"]
+            .as_u64()
+            .map_or(STT_QUEUE_WAIT, Duration::from_millis);
+        return SpeechError::Busy(wait);
     }
     let Some(message) = v["message"].as_str() else {
         return SpeechError::Daemon(e.to_string());

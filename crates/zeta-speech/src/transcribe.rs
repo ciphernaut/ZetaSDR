@@ -33,6 +33,8 @@ const QUEUE: usize = 4;
 const NOTE_EVERY: Duration = Duration::from_secs(1);
 /// Consecutive backend errors that fail the stage.
 const MAX_ERRORS: u32 = 2;
+/// Slack on the worker's outer bound past the backend's own (call timeout + queue wait).
+const OUTER_SLACK: Duration = Duration::from_secs(1);
 
 fn en() -> String {
     DEFAULT_LANGUAGE.to_string()
@@ -330,8 +332,9 @@ impl Worker {
         let (backend, language, timeout) =
             (self.backend.clone(), self.language.clone(), self.timeout);
         self.in_flight = Some(InFlight(tokio::spawn(async move {
-            // The backend bounds its own call; this outer bound also covers its queue.
-            let bound = timeout + backend.queue_wait();
+            // The backend bounds its own call; this outer bound also covers its queue, with a
+            // second's slack so the backend's own busy or timeout answer arrives first.
+            let bound = timeout + backend.queue_wait() + OUTER_SLACK;
             let r = tokio::time::timeout(bound, backend.transcribe(&job.wav, &language))
                 .await
                 .unwrap_or(Err(SpeechError::Timeout(timeout)));

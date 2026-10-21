@@ -141,3 +141,35 @@ async fn assert_forwarding_loop(url: &str) {
     let v: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(v["message"], "speech daemon: stt forwarding loop");
 }
+
+/// A backend whose every call finds no free slot.
+struct Busy;
+
+#[async_trait::async_trait]
+impl SpeechBackend for Busy {
+    fn name(&self) -> &str {
+        "busy"
+    }
+    fn languages(&self) -> &[String] {
+        static EN: std::sync::LazyLock<Vec<String>> =
+            std::sync::LazyLock::new(|| vec!["en".to_string()]);
+        &EN
+    }
+    async fn transcribe(&self, _: &[u8], _: &str) -> Result<zeta_speech::Transcript, SpeechError> {
+        Err(SpeechError::Busy(std::time::Duration::from_millis(1_500)))
+    }
+}
+
+#[tokio::test]
+async fn a_busy_node_comes_back_as_busy_and_the_queue_wait_is_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn_with(dir.path(), with_speech(Arc::new(Busy))).await;
+    let b = NodeBackend::new(&ts.url, SECRET).await.unwrap();
+    assert_eq!(b.queue_wait(), std::time::Duration::from_secs(30));
+    let err = b.transcribe(&wav_s16_mono(&[0]), "en").await.unwrap_err();
+    assert_eq!(
+        err,
+        SpeechError::Busy(std::time::Duration::from_millis(1_500))
+    );
+    ts.stop().await;
+}

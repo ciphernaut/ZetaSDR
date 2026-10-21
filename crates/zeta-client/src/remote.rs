@@ -11,6 +11,10 @@ use zeta_core::types::StreamId;
 /// Longer than the server's 30 s operation timeout.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// A `POST /stt` call's limit: longer than serve's bound on one (its 30 s call timeout plus
+/// up to 30 s waiting for a slot at its daemon).
+pub(crate) const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
+
 /// Marks a `POST /stt` one node already forwarded; its value is `1`.
 pub const STT_HOP_HEADER: &str = "x-zeta-stt-hop";
 
@@ -155,6 +159,7 @@ impl NodeClient {
         let mut req = self
             .http
             .post(url)
+            .timeout(STT_REQUEST_TIMEOUT)
             .header(reqwest::header::CONTENT_TYPE, "audio/wav")
             .body(wav);
         if hop {
