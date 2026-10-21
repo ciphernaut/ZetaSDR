@@ -448,43 +448,7 @@ fn cb_port(dir: &Path, rate_hz: u32) -> (Arc<FileSource>, Arc<dyn Port>) {
 #[tokio::test]
 async fn a_resumed_cb_job_gains_the_guard_and_keeps_it_off_once_put_off() {
     let dir = tempfile::tempdir().unwrap();
-    let source = SourceId("speech".into());
-    let ch59 = Tuning {
-        center_hz: Hz(CH59_HZ),
-        bandwidth_hz: Hz(12_500),
-    };
-    let mut graph = JobKind::FmDemod
-        .expand(&source, ch59, Hz(480_000), None, None, None)
-        .unwrap();
-    for n in &mut graph.nodes {
-        let p = n.params.as_object_mut().unwrap();
-        for k in ["wide_hz", "guard_hz", "guard_db", "channel_hz"] {
-            p.remove(k);
-        }
-    }
-    let rec = JobRecord {
-        format: JOB_RECORD_FORMAT,
-        id: JobId::new(),
-        kind: JobKind::FmDemod.name().into(),
-        graph,
-        source: source.clone(),
-        tuning: ch59,
-        state: JobState::Running,
-        context: serde_json::json!({}),
-        created_ns: Timestamp(1),
-        input: None,
-        capture_rate_hz: Some(480_000),
-        elastic: false,
-        operator_graph: false,
-    };
-    let jobs = dir.path().join("state").join("jobs");
-    std::fs::create_dir_all(&jobs).unwrap();
-    std::fs::write(
-        jobs.join(format!("{}.json", rec.id.0)),
-        serde_json::to_vec(&rec).unwrap(),
-    )
-    .unwrap();
-    let id = rec.id;
+    let id = write_plan12_ch59(dir.path(), 480_000);
     let channel = |g: &Graph| {
         g.nodes
             .iter()
@@ -539,4 +503,84 @@ async fn a_resumed_cb_job_gains_the_guard_and_keeps_it_off_once_put_off() {
     let p = nbfm(&disk.graph);
     assert!(p.get("guard_hz").is_some_and(|v| v.is_null()), "{p}");
     assert_eq!(p["channel_hz"], 12_500, "{p}");
+}
+
+/// Write a running `fm_demod` record on ch59 as plan 12 left it (no guard params), expanded
+/// for `rate_hz`; its id.
+fn write_plan12_ch59(dir: &Path, rate_hz: u64) -> JobId {
+    let source = SourceId("speech".into());
+    let ch59 = Tuning {
+        center_hz: Hz(CH59_HZ),
+        bandwidth_hz: Hz(12_500),
+    };
+    let mut graph = JobKind::FmDemod
+        .expand(&source, ch59, Hz(rate_hz), None, None, None)
+        .unwrap();
+    for n in &mut graph.nodes {
+        let p = n.params.as_object_mut().unwrap();
+        for k in ["wide_hz", "guard_hz", "guard_db", "channel_hz"] {
+            p.remove(k);
+        }
+    }
+    let rec = JobRecord {
+        format: JOB_RECORD_FORMAT,
+        id: JobId::new(),
+        kind: JobKind::FmDemod.name().into(),
+        graph,
+        source,
+        tuning: ch59,
+        state: JobState::Running,
+        context: serde_json::json!({}),
+        created_ns: Timestamp(1),
+        input: None,
+        capture_rate_hz: Some(rate_hz),
+        elastic: false,
+        operator_graph: false,
+    };
+    let jobs = dir.join("state").join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(
+        jobs.join(format!("{}.json", rec.id.0)),
+        serde_json::to_vec(&rec).unwrap(),
+    )
+    .unwrap();
+    rec.id
+}
+
+/// A plan-12 CB record resumed at the rate it was expanded for gains the guard too, and a
+/// later squelch-only `graph_put` keeps it the node's.
+#[tokio::test]
+async fn a_cb_job_resumed_at_its_own_rate_gains_the_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = write_plan12_ch59(dir.path(), 240_000);
+    let (src, port) = cb_port(dir.path(), 240_000);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(record(&node, &id).state, JobState::Running);
+    let disk = on_disk(dir.path(), &id);
+    assert_eq!(nbfm(&disk.graph)["guard_hz"], 12_500, "{:?}", disk.graph);
+    let ch = disk
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "channel")
+        .unwrap();
+    assert_eq!(ch.params["wide_hz"], 37_500);
+
+    let mut graph = record(&node, &id).graph;
+    for n in graph.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
+        n.params["squelch_db"] = serde_json::json!(-50);
+    }
+    node.apply(Op::GraphPut {
+        job: id.clone(),
+        graph,
+    })
+    .await
+    .unwrap();
+    let disk = on_disk(dir.path(), &id);
+    assert!(!disk.operator_graph);
+    assert_eq!(nbfm(&disk.graph)["squelch_db"], -50);
 }

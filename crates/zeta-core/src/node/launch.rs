@@ -448,7 +448,9 @@ impl Inner {
     /// Re-expand `rec`'s graph for the capture `band` when it is of a built-in kind
     /// and was expanded for another rate (`capture_rate_hz`), recording the new rate
     /// and reselecting `stages`. A record without a rate that the node expanded
-    /// (written before the field existed) is re-expanded too; an operator's graph
+    /// (written before the field existed) is re-expanded too, and so is one expanded
+    /// for this rate that no expansion at it reproduces (an older expansion: a plan
+    /// channel recorded before the adjacent-channel guard); an operator's graph
     /// (`operator_graph`, from `graph_put`) is left as stored.
     fn fit_capture(
         &self,
@@ -460,13 +462,24 @@ impl Inner {
         let Some(kind) = JobKind::from_name(&rec.kind) else {
             return Ok(());
         };
-        if rec.operator_graph || rec.capture_rate_hz == Some(rate.0) {
+        if rec.operator_graph {
             return Ok(());
         }
         let bin_rate = self.bank_bin_rate(&rec.source, band);
-        let graph = kind
-            .reexpand(&rec.source, rec.tuning, rate, bin_rate, &rec.graph)
-            .map_err(NodeError::Expand)?;
+        let graph = kind.reexpand(&rec.source, rec.tuning, rate, bin_rate, &rec.graph);
+        // At the same rate the stored graph stands while one of today's expansions (on
+        // the bank or the source rate) still gives it, or when none can be made.
+        if rec.capture_rate_hz == Some(rate.0) {
+            let unbanked = || kind.reexpand(&rec.source, rec.tuning, rate, None, &rec.graph);
+            let current = |g: &Result<Graph, _>| {
+                g.as_ref()
+                    .is_ok_and(|g| graph::same_pipeline(g, &rec.graph))
+            };
+            if graph.is_err() || current(&graph) || current(&unbanked()) {
+                return Ok(());
+            }
+        }
+        let graph = graph.map_err(NodeError::Expand)?;
         *stages = self.stages(&graph)?;
         rec.graph = graph;
         rec.capture_rate_hz = Some(rate.0);

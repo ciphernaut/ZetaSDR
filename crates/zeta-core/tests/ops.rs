@@ -2388,15 +2388,31 @@ fn plan_channels_carry_the_guard() {
 
 #[test]
 fn off_plan_graphs_are_unchanged() {
+    use zeta_core::graph::{Edge, Graph, GraphId, Node as GraphNode, NodeId, same_pipeline};
+    // Plan 12's graph, literally.
+    let (channel, demod) = (NodeId::new(), NodeId::new());
+    let plan12 = Graph {
+        id: GraphId::new(),
+        nodes: vec![
+            GraphNode {
+                id: channel.clone(),
+                kind: "channel".into(),
+                params: serde_json::json!({"center_hz": 147_050_000, "bandwidth_hz": 12_500, "out_rate_hz": 51_200}),
+            },
+            GraphNode {
+                id: demod.clone(),
+                kind: "nbfm_demod".into(),
+                params: serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true}),
+            },
+        ],
+        edges: vec![Edge {
+            from: channel,
+            to: demod,
+            kind: zeta_core::types::StreamKind::Iq,
+        }],
+    };
     let g = cb_graph(147_050_000);
-    assert_eq!(
-        g.nodes[0].params,
-        serde_json::json!({"center_hz": 147_050_000, "bandwidth_hz": 12_500, "out_rate_hz": 51_200})
-    );
-    assert_eq!(
-        g.nodes[1].params,
-        serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true})
-    );
+    assert!(same_pipeline(&g, &plan12), "{g:?}");
 }
 
 #[test]

@@ -346,9 +346,10 @@ impl Stage for NbfmDemodStage {
         let mut filter = AudioFilter::default();
         let mut guard: Option<Guard> = None;
         // Whether the last block measured with the squelch open had a neighbour over
-        // `guard_db`; the gate (open and not guarded) and that, as last published.
+        // `guard_db`; the gate (open and not guarded) as last published, `None` before the
+        // first block.
         let mut guarded = false;
-        let mut was = (false, false);
+        let mut was: Option<bool> = None;
         let mut was_open = false;
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
@@ -385,7 +386,7 @@ impl Stage for NbfmDemodStage {
             };
             let mut published = Vec::new();
             if let (Some(sq), Some(events)) = (squelch.as_mut(), &events) {
-                let first = sq.feed(iq, rate).is_some();
+                sq.feed(iq, rate);
                 // The neighbours are measured while the squelch is open (`guarded` holds the
                 // last finding while it is closed), and for an event.
                 let mut adjacent = None;
@@ -395,15 +396,15 @@ impl Stage for NbfmDemodStage {
                         a - sq.power_db() > guard.as_ref().map_or(f32::INFINITY, |g| g.db)
                     });
                 }
-                let gate = (sq.is_open() && !guarded, guarded);
-                if first || gate != was {
+                let gate = sq.is_open() && !guarded;
+                if was != Some(gate) {
                     if adjacent.is_none() {
                         adjacent = guard.as_mut().and_then(|g| g.adjacent_db(&block.samples));
                     }
                     published.push(Frame::new(
                         events.clone(),
                         prov.clone(),
-                        Payload::Event(squelch_event(sq, gate.0, adjacent, guarded)),
+                        Payload::Event(squelch_event(sq, gate, adjacent, guarded)),
                     ));
                 }
                 if adjacent.is_none()
@@ -411,8 +412,8 @@ impl Stage for NbfmDemodStage {
                 {
                     g.skip(&block.samples);
                 }
-                was = gate;
-                if !gate.0 {
+                was = Some(gate);
+                if !gate {
                     // Skipped, but the discriminator's reference follows the channel, so a
                     // reopening block differences against the sample just before it.
                     if let Some(&x) = iq
@@ -935,16 +936,8 @@ mod tests {
         assert!(audio.is_empty(), "{} audio frames", audio.len());
         assert_eq!(events[0]["open"], false, "{events:?}");
         assert!(events.iter().all(|e| e["open"] == false), "{events:?}");
-        assert!(
-            events[1..].iter().all(|e| e["guarded"] == true),
-            "{events:?}"
-        );
-        assert!(events.len() >= 2, "{events:?}");
-        let g = &events[1];
-        assert!(
-            g["adjacent_db"].as_f64().unwrap() - g["power_db"].as_f64().unwrap() > 12.0,
-            "{g}"
-        );
+        // The gate never changes: the first block's event only.
+        assert_eq!(events.len(), 1, "{events:?}");
         // Without the guard the same channel opens.
         let (unguarded, _) = run_blocks_at(cb_params(None), blocks, 51_200).await;
         assert!(!unguarded.is_empty());
@@ -989,7 +982,7 @@ mod tests {
         let scenes: [&[(f64, f32, f64)]; 10] = [
             &[],
             &[(0.0, -30.0, 2_500.0)],
-            &[(12_500.0, -20.0, 5_000.0)],
+            &[(0.0, -30.0, 2_500.0), (12_500.0, -5.0, 5_000.0)],
             &[],
             &[(0.0, -45.0, 2_500.0), (-12_500.0, -20.0, 5_000.0)],
             &[(0.0, -30.0, 2_500.0), (12_500.0, -35.0, 5_000.0)],
