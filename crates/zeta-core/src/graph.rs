@@ -161,6 +161,32 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
     Ok(())
 }
 
+/// Whether `a` and `b` are the same pipeline whatever their graph and node ids: the same
+/// node kinds and params in the same order, and the same edges (by node position and
+/// stream kind, in any order).
+pub fn same_pipeline(a: &Graph, b: &Graph) -> bool {
+    if a.nodes.len() != b.nodes.len()
+        || a.edges.len() != b.edges.len()
+        || a.nodes
+            .iter()
+            .zip(&b.nodes)
+            .any(|(x, y)| x.kind != y.kind || x.params != y.params)
+    {
+        return false;
+    }
+    let edges = |g: &Graph| {
+        let at = |id: &NodeId| g.nodes.iter().position(|n| &n.id == id);
+        let mut v: Vec<_> = g
+            .edges
+            .iter()
+            .map(|e| (at(&e.from), at(&e.to), format!("{:?}", e.kind)))
+            .collect();
+        v.sort();
+        v
+    };
+    edges(a) == edges(b)
+}
+
 /// Kahn's algorithm: the edges form a cycle if some node never reaches
 /// in-degree zero. Node ids are unique and every edge endpoint exists.
 fn has_cycle(graph: &Graph) -> bool {
@@ -207,6 +233,46 @@ mod tests {
             kind: kind.into(),
             params,
         }
+    }
+
+    #[test]
+    fn same_pipeline_ignores_ids_only() {
+        let g = |ids: [&str; 3], kind: &str, edge_kind: StreamKind| Graph {
+            id: GraphId(ids[0].into()),
+            nodes: vec![
+                node(ids[1], "passthrough", serde_json::json!({"kind": kind})),
+                node(ids[2], "passthrough", serde_json::json!({"kind": kind})),
+            ],
+            edges: vec![Edge {
+                from: NodeId(ids[1].into()),
+                to: NodeId(ids[2].into()),
+                kind: edge_kind,
+            }],
+        };
+        let a = g(["g1", "a", "b"], "iq", StreamKind::Iq);
+        assert!(same_pipeline(
+            &a,
+            &g(["g2", "x", "y"], "iq", StreamKind::Iq)
+        ));
+        assert!(!same_pipeline(
+            &a,
+            &g(["g1", "a", "b"], "audio", StreamKind::Iq)
+        ));
+        assert!(!same_pipeline(
+            &a,
+            &g(["g1", "a", "b"], "iq", StreamKind::Audio)
+        ));
+        let mut reversed = a.clone();
+        reversed.edges[0] = Edge {
+            from: NodeId("b".into()),
+            to: NodeId("a".into()),
+            kind: StreamKind::Iq,
+        };
+        assert!(!same_pipeline(&a, &reversed));
+        let mut more = a.clone();
+        more.nodes
+            .push(node("c", "passthrough", serde_json::json!({"kind": "iq"})));
+        assert!(!same_pipeline(&a, &more));
     }
 
     #[test]

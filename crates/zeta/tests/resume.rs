@@ -1,17 +1,18 @@
 //! Resume on the real chain: a built-in graph persisted for one capture rate is
-//! re-expanded for the rate the source actually runs at; a `job_graph_put` graph is not.
+//! re-expanded for the rate the source actually runs at; a `job_graph_put` graph is not,
+//! unless the put changed only a demodulator's carried params.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zeta_core::graph::Graph;
+use zeta_core::graph::{Edge, Graph, Node as GraphNode, NodeId};
 use zeta_core::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::port::{Port, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Hz, JobId, SourceId, Timestamp};
+use zeta_core::types::{Hz, JobId, SourceId, StreamKind, Timestamp};
 use zeta_source_file::{FileOpts, FileSource};
 
 const CENTER_HZ: u64 = 104_700_000;
@@ -75,6 +76,34 @@ fn record(node: &Node, id: &JobId) -> JobRecord {
         .into_iter()
         .find(|r| &r.id == id)
         .expect("job listed")
+}
+
+fn nbfm(graph: &Graph) -> serde_json::Value {
+    graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "nbfm_demod")
+        .unwrap()
+        .params
+        .clone()
+}
+
+/// Start a `kind` job on `speech` at [`tuning`].
+async fn start(node: &Node, kind: JobKind) -> JobId {
+    let op = Op::JobStart {
+        kind,
+        source: SourceId("speech".into()),
+        center_hz: Hz(CENTER_HZ),
+        bandwidth_hz: Hz(BANDWIDTH_HZ),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![],
+    };
+    match node.apply(op).await.unwrap() {
+        OpResult::Job(id) => id,
+        r => panic!("job_start: {r:?}"),
+    }
 }
 
 fn out_rate(graph: &Graph) -> u64 {
@@ -185,8 +214,10 @@ async fn resume_reexpands_a_record_written_before_the_rate_was_kept() {
     assert_eq!(240_000 % out_rate(&disk.graph), 0, "{:?}", disk.graph);
 }
 
+/// A `graph_put` that changes the topology (a node added) is the operator's graph: it is
+/// launched as stored, never re-expanded.
 #[tokio::test]
-async fn resume_leaves_a_graph_put_graph_alone() {
+async fn graph_put_that_changes_the_topology_is_an_operator_graph() {
     let dir = tempfile::tempdir().unwrap();
     let id = {
         let (src, port) = wfm_port(dir.path(), 240_000);
@@ -194,22 +225,27 @@ async fn resume_leaves_a_graph_put_graph_alone() {
             .await
             .unwrap();
         src.start();
-        let op = Op::JobStart {
-            kind: JobKind::WfmDemod,
-            source: SourceId("speech".into()),
-            center_hz: Hz(CENTER_HZ),
-            bandwidth_hz: Hz(BANDWIDTH_HZ),
-            deviation_hz: None,
-            sideband: None,
-            elastic: false,
-            replace: vec![],
-        };
-        let id = match node.apply(op).await.unwrap() {
-            OpResult::Job(id) => id,
-            r => panic!("job_start: {r:?}"),
-        };
+        let id = start(&node, JobKind::WfmDemod).await;
         assert_eq!(on_disk(dir.path(), &id).capture_rate_hz, Some(240_000));
-        let graph = record(&node, &id).graph;
+        let mut graph = record(&node, &id).graph;
+        let demod = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == "wfm_demod")
+            .unwrap()
+            .id
+            .clone();
+        let tap = NodeId::new();
+        graph.nodes.push(GraphNode {
+            id: tap.clone(),
+            kind: "passthrough".into(),
+            params: serde_json::json!({"kind": "audio"}),
+        });
+        graph.edges.push(Edge {
+            from: demod,
+            to: tap,
+            kind: StreamKind::Audio,
+        });
         node.apply(Op::GraphPut {
             job: id.clone(),
             graph,
@@ -233,6 +269,52 @@ async fn resume_leaves_a_graph_put_graph_alone() {
     assert_eq!(disk.graph, put.graph, "launched as stored");
     assert_eq!(disk.capture_rate_hz, None);
     assert_eq!(record(&node, &id).graph, put.graph);
+}
+
+/// A `graph_put` that changes only a demodulator's carried params (here `squelch_db`) keeps
+/// the job the node's: a resume at another capture rate re-expands it, carrying the value.
+#[tokio::test]
+async fn graph_put_of_only_the_squelch_keeps_the_graph_reexpandable() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = {
+        let (src, port) = wfm_port(dir.path(), 480_000);
+        let node = Node::open(cfg(dir.path()), registry(), vec![port])
+            .await
+            .unwrap();
+        src.start();
+        let id = start(&node, JobKind::FmDemod).await;
+        let mut graph = record(&node, &id).graph;
+        assert_eq!(out_rate(&graph), 160_000);
+        for n in graph.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
+            n.params["squelch_db"] = serde_json::json!(-50);
+        }
+        node.apply(Op::GraphPut {
+            job: id.clone(),
+            graph,
+        })
+        .await
+        .unwrap();
+        let disk = on_disk(dir.path(), &id);
+        assert!(!disk.operator_graph);
+        assert_eq!(disk.capture_rate_hz, Some(480_000));
+        assert_eq!(nbfm(&disk.graph)["squelch_db"], -50);
+        id
+    };
+
+    let (src, port) = wfm_port(dir.path(), 240_000);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    // Long enough for the channel stage to have seen blocks: a graph it cannot run fails.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(record(&node, &id).state, JobState::Running);
+    let disk = on_disk(dir.path(), &id);
+    assert!(!disk.operator_graph);
+    assert_eq!(disk.capture_rate_hz, Some(240_000));
+    assert_eq!(240_000 % out_rate(&disk.graph), 0, "{:?}", disk.graph);
+    assert_eq!(nbfm(&disk.graph)["squelch_db"], -50);
+    assert_eq!(nbfm(&disk.graph)["squelch"], true);
 }
 
 /// Records written before the squelch: their demodulator nodes carry no `squelch` param.

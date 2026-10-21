@@ -1080,8 +1080,44 @@ impl Node {
     /// conflict after the stop) the job is left `Stopped` with the new graph.
     /// The record's `capture_rate_hz` is cleared and `operator_graph` set: the node
     /// cannot know what an operator's graph intends, so a resume launches it as stored.
+    /// Except when the job is of a built-in kind the node expanded and `graph` is its
+    /// graph with only the params [`JobKind::reexpand`] carries changed (a demodulator's
+    /// `squelch`, `squelch_db`, `deviation_hz`, `sideband`): the record then keeps its
+    /// rate and stays the node's to re-expand at a later capture.
     pub async fn job_graph_put(&self, id: &JobId, graph: Graph) -> Result<(), NodeError> {
         self.job_graph_set(id, graph, None).await
+    }
+
+    /// Whether `graph` is what re-expanding the job `rec` would give, carrying `graph`'s
+    /// params: so only carried params differ from the node's graph. Tried at the rate the
+    /// record was expanded for (else the source's kept capture) with the source's kept
+    /// bank, and without a bank. Makes no bank.
+    fn only_carried_params_differ(&self, rec: &JobRecord, graph: &Graph) -> bool {
+        let Some(kind) = JobKind::from_name(&rec.kind) else {
+            return false;
+        };
+        if rec.operator_graph || rec.input.is_some() {
+            return false;
+        }
+        let kept = self
+            .inner
+            .banks
+            .lock()
+            .unwrap()
+            .get(&rec.source)
+            .map(|slot| (slot.band, slot.bank.as_ref().map(|b| 2 * b.bin_hz())));
+        let Some(rate) = rec
+            .capture_rate_hz
+            .map(Hz)
+            .or(kept.map(|(band, _)| band.bandwidth_hz))
+        else {
+            return false;
+        };
+        let bin_rates = [kept.and_then(|(_, b)| b), None];
+        bin_rates.into_iter().any(|bin_rate| {
+            kind.reexpand(&rec.source, rec.tuning, rate, bin_rate, graph)
+                .is_ok_and(|g| graph::same_pipeline(&g, graph))
+        })
     }
 
     /// [`Node::job_graph_put`] recording `capture_rate_hz` as the rate `graph` was
@@ -1095,12 +1131,22 @@ impl Node {
         let mut graph = graph;
         crate::ops::fill_squelch_params(&mut graph);
         graph::validate(&graph, &self.inner.registry)?;
-        let running = {
+        let current = {
             let jobs = self.inner.jobs.lock().unwrap();
             let entry = jobs
                 .get(id)
                 .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
-            entry.record.state == JobState::Running
+            entry.record.clone()
+        };
+        let running = current.state == JobState::Running;
+        // An operator's put of the node's graph with only carried params changed keeps
+        // the record's rate (and so stays re-expandable).
+        let capture_rate_hz = match capture_rate_hz {
+            None if self.only_carried_params_differ(&current, &graph) => {
+                Some(current.capture_rate_hz)
+            }
+            None => None,
+            Some(r) => Some(Some(r.0)),
         };
         if running {
             self.job_stop(id).await?;
@@ -1112,7 +1158,7 @@ impl Node {
                 .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
             let rec = JobRecord {
                 graph,
-                capture_rate_hz: capture_rate_hz.map(|r| r.0),
+                capture_rate_hz: capture_rate_hz.flatten(),
                 operator_graph: capture_rate_hz.is_none(),
                 ..entry.record.clone()
             };
