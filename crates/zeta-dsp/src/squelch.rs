@@ -32,7 +32,7 @@ pub const SQUELCH_HYSTERESIS_DB: f32 = 3.0;
 pub const SQUELCH_HANG_MS: u64 = 300;
 /// The noise floor is this percentile of the recent block powers ...
 pub const SQUELCH_FLOOR_PERCENTILE: usize = 15;
-/// ... over this many blocks (about 2 s at 20 ms blocks).
+/// ... over this many blocks (about 1 s at the live 10 ms blocks).
 pub const SQUELCH_FLOOR_BLOCKS: usize = 100;
 /// The automatic floor is never taken above this, dBFS: a channel whose power
 /// is over it by [`SQUELCH_OPEN_DB`] is open even with no quiet block seen.

@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::OwnedMutexGuard;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -306,10 +306,14 @@ impl Inner {
                     tokio::select! {
                         biased;
                         _ = token.cancelled() => {
-                            while let Ok(frame) = rx.try_recv() {
-                                log(frame);
+                            // What is still buffered, past any lag, until empty.
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(frame) => log(frame),
+                                    Err(TryRecvError::Lagged(_)) => continue,
+                                    Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+                                }
                             }
-                            return;
                         }
                         r = rx.recv() => match r {
                             Ok(frame) => log(frame),

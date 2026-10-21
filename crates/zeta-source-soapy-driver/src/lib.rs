@@ -4,7 +4,7 @@
 //! logic (reader thread, timestamps, faults) lives in `zeta-source-soapy` and
 //! is tested there against its mock. Only channel 0 of the receive direction
 //! is used. The receive gain is the driver's default unless the args carry
-//! `gain=DB` (see [`zeta_source_soapy::split_gain`]) or `source_set_gain` sets it.
+//! `gain=DB` (see [`zeta_source_soapy::split_zeta_args`]) or `source_set_gain` sets it.
 
 use std::collections::BTreeMap;
 

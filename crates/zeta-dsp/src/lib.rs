@@ -113,8 +113,9 @@ pub fn lagged_frames_by_kind() -> Vec<(&'static str, u64)> {
 }
 
 /// A `kind` stage skipped `n` input frames: count them in [`LAGGED_FRAMES`] and
-/// [`lagged_frames_by_kind`], and say so on stderr.
-pub(crate) fn note_lag(kind: &'static str, n: u64) {
+/// [`lagged_frames_by_kind`], and say so on stderr. Public for stages of other
+/// crates (`transcribe`), so every lag is counted by kind in one place.
+pub fn note_lag(kind: &'static str, n: u64) {
     LAGGED_FRAMES.fetch_add(n, Ordering::Relaxed);
     {
         let mut by_kind = LAGGED_BY_KIND.lock().unwrap();

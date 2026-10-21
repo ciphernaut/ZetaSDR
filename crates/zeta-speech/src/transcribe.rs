@@ -447,7 +447,7 @@ impl Stage for TranscribeStage {
                         armed = acc.is_open();
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("zeta-speech: transcribe lagged, {n} frames skipped");
+                        zeta_dsp::note_lag("transcribe", n);
                         if let Some(u) = acc.flush() {
                             w.offer(u);
                         }

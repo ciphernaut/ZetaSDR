@@ -159,6 +159,6 @@ fn a_rate_with_no_snap_in_reach_still_errors() {
     let e = Resampler::new(999_983, 47_999).unwrap_err();
     assert_eq!(
         e,
-        "resampler 999983 -> 47999 Hz reduces to 47999/999983, beyond the 100000 limit"
+        "resampler 999983 -> 47999 Hz reduces to 47999/999983, beyond the 2048 limit and no rate within 1000 ppm snaps"
     );
 }

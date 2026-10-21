@@ -102,7 +102,7 @@ impl Resampler {
         }
         if l.max(m) > SNAP_FACTOR {
             return Err(format!(
-                "resampler {in_rate_hz} -> {out_rate_hz} Hz reduces to {l}/{m}, beyond the {MAX_FACTOR} limit"
+                "resampler {in_rate_hz} -> {out_rate_hz} Hz reduces to {l}/{m}, beyond the {SNAP_FACTOR} limit and no rate within {SNAP_MAX_PPM} ppm snaps"
             ));
         }
         let n = (TAPS_PER_FACTOR * l.max(m) + 1).max(MIN_TAPS) as usize;

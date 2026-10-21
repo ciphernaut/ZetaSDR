@@ -482,3 +482,38 @@ async fn utterance_closes_after_gap_of_wall_clock_silence() {
     assert!(rest.is_empty(), "{rest:?}");
     assert_eq!(fake.calls().len(), 1);
 }
+
+/// Skipped input is counted under `transcribe` in `zeta_dsp`'s per-kind lag counter.
+#[tokio::test]
+async fn lagged_input_is_counted_by_kind() {
+    let fake = Arc::new(FakeBackend::new("hello"));
+    let bus = Arc::new(StreamBus::new(64));
+    let out = bus.register(StreamKind::Event, prov(0));
+    let events = bus.subscribe(&out).unwrap();
+    // A 4-frame input sent 10 frames before the stage runs: it starts 6 behind.
+    let (tx, rx) = broadcast::channel(4);
+    send(&tx, &speech_like(RATE as u32, 1.0), 1, T_BASE);
+    drop(tx);
+    let run = tokio::spawn(async move {
+        TranscribeStage::new(
+            Some(fake as Arc<dyn SpeechBackend>),
+            Duration::from_secs(30),
+        )
+        .run(
+            serde_json::json!({}),
+            vec![rx],
+            vec![out],
+            bus,
+            CancellationToken::new(),
+            StageContext::new(SourceId("s".into())),
+        )
+        .await
+    });
+    let (res, _) = wait(run, events).await;
+    assert!(res.is_ok(), "{res:?}");
+    let by_kind = zeta_dsp::lagged_frames_by_kind();
+    assert!(
+        by_kind.iter().any(|&(k, n)| k == "transcribe" && n >= 6),
+        "{by_kind:?}"
+    );
+}

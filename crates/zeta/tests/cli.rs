@@ -947,7 +947,10 @@ fn then_tail_reports_failed_job() {
     assert_eq!(v[0]["result"], "job");
     assert_eq!(v[1]["state"]["status"], "failed", "{v}");
     let reason = v[1]["state"]["reason"].as_str().unwrap_or_default();
-    assert!(reason.contains("beyond the 100000 limit"), "{v}");
+    assert!(
+        reason.contains("beyond the 2048 limit and no rate within 1000 ppm snaps"),
+        "{v}"
+    );
 }
 
 #[test]
