@@ -79,6 +79,36 @@ restores a source's capture (the band bounding its rigid jobs, when the radio ca
 resumes its jobs a scan first, then widest first, elastic after rigid, and re-expands a built-in graph if the
 capture rate differs from the one recorded (`capture_rate_hz`).
 
+Holding a capture, receive gain and transcripts:
+
+```bash
+./target/debug/zeta source pin --source b210 --center-hz 476918750 --bandwidth-hz 1000000 --replace job-1
+./target/debug/zeta source unpin --source b210
+./target/debug/zeta source gain --source b210 --db 45     # or --auto
+./target/debug/zeta transcripts tail --lines 20 --job job-7   # default 50 lines, local state dir only
+```
+
+`source pin` holds a source at a band (the leased bandwidth may round up to what the radio can
+capture) as a rigid lease `pin:<source id>` that is never a holder and is not named in `--replace`.
+Jobs inside the band run without a retune; a start outside it is a `conflict` whose options begin
+with `unpin source <id> (source_unpin)`. The pin is saved in `<state-dir>/sources/<id>.json`,
+restored first on resume (and applied by one-shot commands too). `source unpin` on an unpinned
+source is an error. `source gain` sets the receive gain in dB within the source's range
+(`source_list.gain` reports `db`, `min_db`, `max_db`, `automatic`, `automatic_available`);
+`--auto` turns automatic gain on where the device has it; the setting is saved with the pin and
+restored. A resumed channel takes the shared bank (`job_context` names its `channel.path`;
+`source_list.bank` shows `bin_hz` and `consumers`). Every transcript event of an attached
+`transcribe` job is also appended as one JSON line to `<state-dir>/transcripts.log` (`t_ns`, `job`,
+`input`, `source`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns`, `text`, `language`,
+`dropped`, `error`; rotated to `transcripts.log.1` past 8 MiB); `transcripts tail` reads it and is a
+usage error with `--node`.
+
+`fm_demod` and `am_demod` carry an automatic squelch, always on: while the channel is idle (no
+signal above the noise floor it tracks) the stage publishes no audio and emits a `squelch` event
+saying why. To fix the threshold or turn it off, edit the stage's params with `graph get`,
+`graph put`: `squelch_db` (a number of dB above the floor; `null` is automatic) and `squelch`
+(`false` is off).
+
 `AGENTS.md` is generated from the operation schema by `zeta agents-md`; `zeta agents-md --check`
 fails if the committed file has drifted.
 
@@ -250,14 +280,23 @@ they belong to the serving node and are rejected. Source ids are unique across t
   characters as `_`, so `kiwi-0` reads `ZETA_KIWI_PASSWORD_KIWI_0`). The flag wins when both
   are given.
 - **SoapySDR**, `--source-soapy ID=ARGS` (`ARGS` such as `driver=hackrf,serial=...`): a local
-  device, `push` false (the node reads it). Gains are left at the driver's defaults (no gain
-  operation yet), and a job centred exactly on the tuned frequency sees the device's DC spike.
+  device, `push` false (the node reads it). Gain starts at the driver's default and is changed
+  live with `source gain` (below); `gain=DB` in `ARGS` sets the opening gain, and `ppm=N`
+  (e.g. `driver=uhd,ppm=3.4`) corrects the device's frequency error by shifting the tuning (the
+  frequencies you read stay true). A job centred exactly on the tuned frequency sees the device's
+  DC spike.
   A UHD device (`driver=uhd` in `ARGS`, or a driver key such as `b200`) reports its rate range for its current master clock (a B210 opens
   at 16 MHz), so at open the source asks for twice the reported maximum, re-reads the range
   while it grows (at most three rounds) and restores the previous rate: a B210 asserts
   `max_bandwidth_hz` 61440000 and a wide request raises its clock. `master_clock_rate=` in
   `ARGS` (e.g. `driver=uhd,type=b200,master_clock_rate=30.72e6`) is an explicit override: it
-  fixes the clock, and with it the range and the rates a request can get.
+  fixes the clock, and with it the range and the rates a request can get. Rates: the source asks
+  for the smallest exact divisor of the master clock (`mcr / N`, `N` up to 512) at least the
+  requested bandwidth, so the rate is an exact fraction of the clock; an actual rate below the
+  band is retried once at the next rate up, then refused (`soapy: device gives <actual> Hz for
+  <requested> Hz, below the <bandwidth_hz> Hz band`). The resampler is exact up to a reduced
+  ratio of 2 048 and above that snaps the input rate to the nearest one within 1 000 ppm that
+  reduces under it (one stderr line per snap); past that it refuses.
 
 ```bash
 ./target/debug/zeta --source-kiwi kiwi0=kiwisdr.example:8073 source list   # remote true, current null
@@ -427,7 +466,7 @@ The page's own `spectrum` job is elastic: it never blocks another job from takin
 follows every retune, so the waterfall is never the reason a conflict appears. A job started inside
 the capture it shows runs on that capture without a retune, so a demodulator started from the page
 does not shrink the view; one outside it retunes the radio and the page's job follows. A conflict the page
-meets offers "stop <kind> <id> and retry". Finished rows leave the job list after a while.
+meets offers "stop <kind> <id> and retry" (on a pinned source, "unpin and retry"). Finished rows leave the job list after a while.
 
 Two layers sit in the waterfall: the fine capture of the source, and, when the view is zoomed out
 past it on a source with a scanner (a second source with a wider tune range, or a file source with
@@ -436,6 +475,11 @@ drawn underneath. Rigid bands are outlined. The scan is started about 300 ms aft
 or pan, spans the visible range clamped to the scanner's tune range, is replaced when the span
 changes and stopped when the view returns inside the fine capture. A scan the page did not start
 is never touched.
+
+A pinned source's band is outlined and counted as a holder in the page's source tab. The command
+line takes `source pin --center-hz N --bandwidth-hz N [--replace ID]`, `source unpin` and `source
+gain DB|auto` for the selected source. A `fm_demod`/`am_demod` row whose channel is idle shows a
+`squelch` tag.
 
 View policies shape this, set from the command line and kept in the tab's `sessionStorage`:
 

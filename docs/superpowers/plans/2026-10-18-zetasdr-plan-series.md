@@ -19,7 +19,7 @@ interfaces rather than guessed ones.
 | 9 | Decoders | Four decode job kinds: `pocsag_decode` (12.5 kHz FM channel, 512/1200/2400 baud detected automatically), `rds_decode` (200 kHz FM broadcast band; `pi`, `ps`, `rt`), `adsb_decode` (1 090 MHz, 2.4 MHz band, dump1090 run on the node's host through the new crate `zeta-ext`) and `acars_decode` (10 kHz AM channel, 2400 baud MSK); decode-to-identify in `classify` (APRS, POCSAG and ACARS on narrow bands, RDS on wide ones); `decoder` on catalogue signatures; UI entries; field craft for pagers, aircraft and FM data. **Delivered** on branch `decoders`, 2026-10-20. Pending: live acceptance on the field host. | 2, 7, 8 |
 | 10 | Speech on a channel | Transcription of a radio channel: audio frames carry a channel count; stages `denoise` (RNNoise via `nnnoiseless`), `vad` (energy-over-floor voice gate) and `transcribe` (new crate `zeta-speech`, speech backends `SocketBackend` for a `local-voice`-protocol daemon and `NodeBackend` for another node's `/stt`, global flags `--stt-socket` and `--stt-node`); attached jobs (`stream_in` stage, `job_attach` op, `zeta job attach`) so any audio-producing job, demodulators now and digital voice decoders later, can be transcribed; UI entries and transcript ribbons; the source-separation slot proven with an external audio plugin (`examples/python/separate_stub.py`) swapped in with `graph put`; `docs/speech.md`. **Delivered** on branch `speech`, 2026-10-20. Pending: live acceptance on the field host (needs `local-voice` installed there, `docs/speech.md` section 1). | 2, 7, 9 |
 | 11 | View policy | Resume restores the capture (widest first, built-in graphs re-expanded, `capture_rate_hz`); the ops log (`ops.log`, `zeta ops tail`); elastic leases (`job start --elastic`); atomic `replace` (`--replace` on `job start` and `source ensure`); a file-source `tune_range`; UI view policies (`follow`, `zoom_out`, `auto_scan_stop`, `finished_rows_s`, `scanner`) and `view set\|show\|reset\|clear`, automatic scans on a scanner source, a coarse scan layer, eased follow. **Delivered** on branch `worktree-view-policy`, 2026-10-20. Pending: live acceptance on the field host. | 3, 10 |
-| 12 | Capture and transcripts | Resumed channels take the shared bank (the bank factory reaches `Node::open`; the channel's path in `job_context`, `bank` in `source_list`, lag lines by stage kind); rates the resampler accepts (a UHD ladder of exact master-clock divisors in the Soapy source, a snapping `Resampler`); the transcript log (`transcripts.log`, `zeta transcripts tail`); pinned captures (`source_pin`/`source_unpin`, `sources/<id>.json`, restored first on resume); live receive gain (`source_set_gain`, `source_list.gain`, persisted); UI pins and `source pin\|unpin\|gain` commands; optional `ppm=` correction and a squelch in `fm_demod`/`am_demod`. Spec `docs/superpowers/specs/2026-10-21-capture-and-transcripts-design.md`, plan `docs/superpowers/plans/2026-10-21-capture-and-transcripts.md`. | 8, 10, 11 |
+| 12 | Capture and transcripts | Resumed channels take the shared bank (the bank factory reaches `Node::open`; the channel's path in `job_context`, `bank` in `source_list`, lag lines by stage kind); rates the resampler accepts (a UHD ladder of exact master-clock divisors in the Soapy source, a snapping `Resampler`); the transcript log (`transcripts.log`, `zeta transcripts tail`); pinned captures (`source_pin`/`source_unpin`, `sources/<id>.json`, restored first on resume); live receive gain (`source_set_gain`, `source_list.gain`, persisted); UI pins and `source pin\|unpin\|gain` commands; `ppm=` correction and an automatic squelch in `fm_demod`/`am_demod`. Spec `docs/superpowers/specs/2026-10-21-capture-and-transcripts-design.md`, plan `docs/superpowers/plans/2026-10-21-capture-and-transcripts.md`. Delivered on branch `worktree-view-policy`, 2026-10-21. Pending: live acceptance on the field host. | 8, 10, 11 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
@@ -545,3 +545,53 @@ Deferred:
 - A source that faults before its first band shows no coarse layer.
 - `reconcile_rate` is redundant with resume's `fit_capture` and can restart a job once needlessly.
 - The UI suite runs at about 234 s of its 300 s deadline.
+
+## Plan 12 status
+
+Plan 12 is delivered on `worktree-view-policy` (tasks 1-10, base plan 11), 2026-10-21. Live
+acceptance on the field host is pending.
+
+What was built:
+
+- Task 1: resumed channels take the shared bank; the channel path is in `job_context`,
+  `source_list.bank` shows `bin_hz` and `consumers`, lag lines name the stage kind.
+- Task 2: the resampler is exact up to a reduced ratio of 2 048 and snaps within 1 000 ppm above it.
+- Task 3: UHD sources ask for exact master-clock divisors; an actual rate below the band is retried
+  once, then refused.
+- Task 4: `transcripts.log` and `zeta transcripts tail [--lines N] [--job ID]`.
+- Task 5: pinned captures (`source_pin`/`source_unpin`, `sources/<id>.json`), restored first on
+  resume; conflicts offer `unpin source <id> (source_unpin)`.
+- Task 6: live receive gain (`source_set_gain`, `source_list.gain`, persisted, `zeta source gain`).
+- Task 7: the page: pins outlined and counted as holders, `source pin|unpin|gain` commands,
+  "unpin and retry".
+- Task 8: `ppm=N` in `--source-soapy` args.
+- Task 9: an always-on automatic squelch in `fm_demod`/`am_demod` (`squelch_db`/`squelch` node
+  params, `squelch` events, the page's `squelch` tag); no `job_start` field.
+- Task 10: README, field-craft ("Holding a band", "Reading transcripts", the squelch line), this
+  status.
+
+Gates at the branch head:
+
+- `cargo test --workspace --all-features --no-fail-fast`: 873 passed, 0 failed, 3 ignored (110 `test
+  result` lines), no `FAILED`, no `ui e2e skipped`. The UI suite
+  (`ui_scenarios_pass_in_headless_chromium`) ran ok in 234.32 s.
+- `cargo fmt -p` for each workspace member, `rustfmt --edition 2024 --check` on the driver,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `zeta agents-md --check`,
+  `--skill --check` and `cargo check` in the driver crate are clean.
+
+Deferred:
+
+- The resampler refusal text still names the old 100 000 limit though the threshold is 2 048.
+- A conflict on a pinned source with no job holders still lists "stop one of the holders" (fix:
+  only when holders is non-empty); the guide should say one-shot commands restore and apply pins
+  too.
+- Two Soapy gain tests have 50-100 ms timing margins (tighten); `set_gain` may hold the tune gate
+  up to 2x `retune_timeout`.
+- The squelch's floor window is 100 blocks, about 1 s live (10 ms blocks): tune at live
+  acceptance. The guide's stage-params list omits `squelch`/`squelch_db`. The squelch tag shows
+  only on watched rows.
+- The driver crate's doc link still names the removed `split_gain`.
+- The transcript tee's cancel-branch drain stops on a `Lagged` error; `ops.log` and
+  `transcripts.log` writes are synchronous on runtime threads.
+- Plan 11's leftovers are still open: the fallback-scan span does not follow later zooms; the UI
+  suite runs near its deadline (234 s of 300 s).

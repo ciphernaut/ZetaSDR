@@ -412,6 +412,12 @@ The node needs a speech backend (`--stt-socket` or `--stt-node`); without one th
 
 Music and noise are gated, not separated: `vad` passes any loud audio, so a music station or a broadcast with a bed under the voice yields poor or empty text. Say so rather than reporting the text as the speech. Separation is a slot: an external audio-to-audio plugin (`--plugin separate=PATH`, a Demucs wrapper for instance) replaces the `denoise` node with `graph get` of the attached job, edit, `graph put`. The job restarts on `graph put`. `docs/speech.md` has the daemon install and the plugin stub.
 
+A `fm_demod` or `am_demod` has an automatic squelch: an idle channel publishes no audio, so a quiet transcript is normal. `squelch` events say why a row is quiet (idle, or open). To fix or disable it, `graph get`, set `squelch_db` (dB above the floor) or `squelch: false` on the demodulator's node, `graph put`.
+
+### Reading transcripts
+
+Every transcript event of an attached job is also written to the node's `transcripts.log`. `zeta transcripts tail --lines N --job ID` reads the last lines (default 50, one JSON line each: `job`, `source`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns`, `text`, `language`, `dropped`, `error`), so you can answer "what was said on 476.4 MHz" after the fact without a live `stream tail`. It reads the state directory, so it does not work with `--node`. A line with `error` set is a failed utterance, not silence.
+
 Digital voice decoders (DMR, D-STAR, M17) will be transcribed the same way: they produce audio, so `job attach --kind transcribe` to them.
 
 ### Taking the radio from another job
@@ -419,6 +425,12 @@ Digital voice decoders (DMR, D-STAR, M17) will be transcribed the same way: they
 A source holds one tuning, and a second job that needs a different one gets a `conflict` error. Read it before acting: it names the holders (job ids, kinds and what each is doing) and lists options, the last being `retry with replace: [<ids>]`. Decide whether the holders matter. If they do not, or the user asked for the new job, retry the same request with `--replace ID[,ID]` (`job start`, `source ensure`; `replace` is an array in the op). The named jobs are stopped and the new job started in one step under the source's gate, so nothing else can slip in between. Replace is not transactional: if a holder you did not name still conflicts, the jobs you named stay stopped and the new conflict names the remaining holders. Every id must hold that source as a rigid lease (`unknown_job` or `job <id> does not hold source <src>` otherwise); naming an elastic job is that error and nothing is stopped, the elastic job keeps running. Never replace a holder you have not read, and say in the report what you stopped.
 
 The web page's own `spectrum` job is elastic (`job start --elastic`, `spectrum` only): it never conflicts, never blocks a retune and follows each retune of its source, so it is not a holder to wait for or replace. `source list` shows such jobs under `elastic`, not `holders`. A scan on the source stops it, and the page restarts its view afterwards. After a restart of the node the capture is restored (the band bounding a source's rigid jobs, when the radio can capture it) and the jobs resume in it, a scan first, then widest first. `zeta ops tail --lines N` (default 50) shows the last applied ops with the transport that sent them (`local`, `http`, `ui`, `agent`): use it to see who changed the radio.
+
+### Holding a band
+
+To keep many channels running on one radio, pin the capture instead of letting each job retune it: `source pin --source S --center-hz C --bandwidth-hz B` (add `--replace ID` for the jobs in the way). Centre the pin between the channels you want, not on one of them, so no channel sits on the DC spike. Example: UHF CB (80 channels) is held by `--center-hz 476918750 --bandwidth-hz 1000000`; the lease may round up (1 024 000 Hz) and every channel fits. Jobs started inside the pin run on it without a retune; the pin and the gain (`source gain --source S --db N`, or `--auto`) are saved and come back after a restart, and one-shot commands restore and apply pins too.
+
+A start outside the pin is a `conflict` whose first option is `unpin source S (source_unpin)`. A pin is not a holder and is not in `--replace`. Unpinning frees the radio for other work and does not stop the jobs that were inside it; they conflict with the next retune. Read the conflict, and unpin only when the user wants the pinned channels given up.
 
 ### Working layer 4
 
