@@ -73,9 +73,11 @@ pub(crate) async fn stt(
         .map(String::as_str)
         .filter(|l| !l.is_empty())
         .unwrap_or(DEFAULT_LANGUAGE);
-    // The backend bounds its own wait; this bounds a backend that does not.
+    // The backend bounds its own wait; this bounds a backend that does not, leaving room for
+    // its queue so a queued call answers or is told busy rather than cut off here.
     let timeout = st.limits.stt_timeout;
-    let result = tokio::time::timeout(timeout, speech.transcribe(&bytes, language))
+    let bound = timeout + speech.queue_wait();
+    let result = tokio::time::timeout(bound, speech.transcribe(&bytes, language))
         .await
         .unwrap_or(Err(SpeechError::Timeout(timeout)));
     match result {
@@ -85,7 +87,9 @@ pub(crate) async fn stt(
 }
 
 /// A backend's failure as the answer: 422 for a language it lacks, 503 when it cannot be
-/// reached or has no free slot, 502 when it reports an error, 504 when it does not answer in time.
+/// reached or has no free slot (`{"error": "busy", "message", "wait_ms"}` for the latter, so a
+/// forwarding node can tell it apart), 502 when it reports an error, 504 when it does not
+/// answer in time.
 fn speech_error(e: SpeechError) -> Response {
     let status = match &e {
         SpeechError::Unsupported {
@@ -96,7 +100,15 @@ fn speech_error(e: SpeechError) -> Response {
                 json!({"error": "unsupported", "language": language, "supported": supported});
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
         }
-        SpeechError::Unreachable(_) | SpeechError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+        SpeechError::Busy(wait) => {
+            let body = json!({
+                "error": "busy",
+                "message": e.to_string(),
+                "wait_ms": wait.as_millis() as u64,
+            });
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+        }
+        SpeechError::Unreachable(_) => StatusCode::SERVICE_UNAVAILABLE,
         SpeechError::Daemon(_) => StatusCode::BAD_GATEWAY,
         SpeechError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
     };

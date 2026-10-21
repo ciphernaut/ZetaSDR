@@ -341,3 +341,33 @@ async fn stt_hop_to_a_local_backend_is_served() {
     assert_eq!(resp.status(), StatusCode::OK);
     ts.stop().await;
 }
+
+#[tokio::test]
+async fn stt_queued_calls_get_their_queue_wait_and_busy_is_503() {
+    // One slot, a 300 ms daemon, and a call timeout equal to the queue wait (as serve has
+    // them): the second call waits for the first and still answers; the third waits past
+    // the queue wait and is told busy. None is cut off at the call timeout (504).
+    let dir = tempfile::tempdir().unwrap();
+    let socks = tempfile::tempdir().unwrap();
+    let sock = socks.path().join("v.sock");
+    let _daemon = FakeDaemon::with_delay(&sock, "ok:hi\n", std::time::Duration::from_millis(300));
+    let wait = std::time::Duration::from_millis(450);
+    let limits = Limits {
+        stt_timeout: wait,
+        ..Limits::default()
+    };
+    let staging = dir.path().join("state").join("stt");
+    let backend = SocketBackend::with_limits(sock.clone(), staging, wait, 1, wait).await;
+    let ts = with_speech(dir.path(), Arc::new(backend), limits).await;
+    let calls = (0..3).map(|_| async {
+        let resp = stt(&ts, "audio/wav", wav(1)).await;
+        let status = resp.status();
+        (status, resp.json::<Value>().await.unwrap())
+    });
+    let mut answers = futures_util::future::join_all(calls).await;
+    answers.sort_by_key(|(s, _)| s.as_u16());
+    let statuses: Vec<u16> = answers.iter().map(|(s, _)| s.as_u16()).collect();
+    assert_eq!(statuses, [200, 200, 503], "{answers:?}");
+    assert_eq!(answers[2].1["error"], "busy", "{answers:?}");
+    ts.stop().await;
+}
