@@ -1839,6 +1839,17 @@ def scenario_watched_jobs_are_capped(page, url, secret):
             time.sleep(0.2)
         counts = stable_ws_connections(url, secret)
         assert max(counts) <= 2 + 4, f"ws_connections {counts}"
+        # Four newer fm_demods (squelch streams only) take no decoder's slot: they go
+        # unwatched and the four measures keep theirs.
+        for _ in range(4):
+            jobs.append(start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500))
+        page.evaluate("window.zetaTest.poll()")
+        for j in jobs[6:]:
+            expect(page.locator(f'#jobs .job[data-id="{j}"] .events')).to_have_attribute(
+                "title", "not watched (limit 4)")
+        for j in jobs[2:6]:
+            cell = page.locator(f'#jobs .job[data-id="{j}"] .events')
+            expect(cell).not_to_have_attribute("title", "not watched (limit 4)")
     finally:
         for j in jobs:
             stop_job(url, secret, j)

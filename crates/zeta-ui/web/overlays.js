@@ -22,7 +22,9 @@
 //                            "capture", text "capture"; not in scan mode) is outlined,
 //                            following the band as it changes. Then watchJob for the
 //                            MAX_WATCHED most recent (created_ns) running jobs on the
-//                            selected source, unwatch the rest, refresh the job-row counters
+//                            selected source, those of agent.js SQUELCH_KINDS (fm/am
+//                            rows, squelch tag only) only in slots no other job takes,
+//                            unwatch the rest, refresh the job-row counters
 //                            (`—`, tooltip "not watched (limit 4)", on the rows over the cap;
 //                            each watch holds one of the node's `max_ws` sockets). `spectrum` jobs are skipped: their events
 //                            are the waterfall's and are ignored here anyway. Event streams
@@ -220,9 +222,12 @@ class Overlays {
       if (!j || graphKey(j) !== graph) this.noEventStream.delete(id);
     }
     // Jobs known to have no event stream take no socket and so no place under the cap.
+    // Decoders first, then the SQUELCH_KINDS jobs (whose stream only tags their row), each
+    // newest first: a squelch tag never crowds a decoder's ribbons and counter out.
+    const squelchOnly = (j) => (SQUELCH_KINDS.includes(j.kind) ? 1 : 0);
     const capped = want
       .filter((j) => !this.noEventStream.has(j.id))
-      .sort((a, b) => (b.created_ns ?? 0) - (a.created_ns ?? 0))
+      .sort((a, b) => squelchOnly(a) - squelchOnly(b) || (b.created_ns ?? 0) - (a.created_ns ?? 0))
       .slice(0, MAX_WATCHED);
     const ids = new Set(capped.map((j) => j.id));
     for (const id of [...this.watched.keys()]) if (!ids.has(id)) this.unwatch(id);
