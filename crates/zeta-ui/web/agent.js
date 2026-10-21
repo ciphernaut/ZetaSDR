@@ -38,8 +38,9 @@
 //   SQUELCH_KINDS               job kinds whose demodulator carries the automatic squelch
 //   setSquelchTag(row, event)   adds the `.tag.squelch` tag to a job row's `.kind` cell while
 //                               `event` (the job's last `squelch` event) has `open: false`
-//                               (tooltip: its power and floor), removes it otherwise (null:
-//                               none seen)
+//                               (tooltip: its power and floor, the neighbour's `adjacent_db`
+//                               when measured, and whether the guard holds it), removes it
+//                               otherwise (null: none seen)
 //   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, squelch,
 //                                   view})
 //                                                       -> {close, refresh, redraw}
@@ -325,7 +326,10 @@ export function setSquelchTag(row, event) {
     cell.append(" ", tag);
   }
   const db = (v) => (typeof v === "number" ? `${v.toFixed(1)} dBFS` : "?");
-  tag.title = `squelch closed: no audio (power ${db(event.power_db)}, floor ${db(event.floor_db)})`;
+  let title = `squelch closed: no audio (power ${db(event.power_db)}, floor ${db(event.floor_db)})`;
+  if (typeof event.adjacent_db === "number") title += `; neighbour ${db(event.adjacent_db)}`;
+  if (event.guarded) title += "; held by the adjacent-channel guard";
+  tag.title = title;
 }
 
 function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch, plan }) {

@@ -1786,11 +1786,20 @@ def frames_in(url, secret, stream, within_ms, max_frames=5):
 def scenario_quiet_channel_row_is_tagged_squelch(page, url, secret):
     # Inside the tone recording (99.976-100.024 MHz) but off the tone: the squelch closes, the
     # row is tagged and the audio stream is silent. On the tone: open, untagged, audio flows.
-    select_source(page, url, secret, "tone")
+    # The page opens only after the quiet job's single `open: false` event: the tag comes
+    # from the gate latched in its job_context, not the (missed) live event.
     quiet = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500)
     loud = None
     try:
         loud = start_job(url, secret, "fm_demod", "tone", 100_000_000, 12_500)
+        deadline = time.monotonic() + 5.0
+        while True:
+            ctx = http_json(url, secret, "/op", {"op": "job_context", "job": quiet})["value"]
+            if (ctx.get("squelch") or {}).get("open") is False:
+                break
+            assert time.monotonic() < deadline, f"no latched squelch in {ctx}"
+            time.sleep(0.1)
+        select_source(page, url, secret, "tone")
         page.evaluate("window.zetaTest.poll()")
         tag = job_row(page, quiet).locator(".kind .tag.squelch")
         expect(tag).to_be_visible(timeout=3_000)

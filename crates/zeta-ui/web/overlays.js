@@ -46,7 +46,10 @@
 //           (agent.js SQUELCH_KINDS; any other job's is ignored) kept as the
 //           job's last squelch event (ov.squelch, forgotten when the job's graph changes)
 //           and the row's tag set from it at once (agent.js setSquelchTag; the 2 s
-//           re-render keeps it through agent.js);
+//           re-render keeps it through agent.js); when such a job's watch starts, its
+//           `job_context` is asked once and its latched `squelch` event seeds that state
+//           unless a live one came first (the gate changes rarely, so a late watch would
+//           otherwise miss it);
 //         - every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
@@ -333,6 +336,25 @@ class Overlays {
     const rec = { job, ids, subs: [], closed: false };
     this.watched.set(job.id, rec);
     ids.forEach((_, slot) => this.subscribe(rec, slot));
+    if (SQUELCH_KINDS.includes(job.kind)) this.seedSquelch(rec);
+  }
+
+  // The gate the job's context latched (its last `squelch` event), asked once the
+  // subscriptions are open: a job whose only event came before this watch is still tagged.
+  // A live event seen meanwhile is newer and wins; a failed request leaves the live path.
+  async seedSquelch(rec) {
+    const job = rec.job;
+    let r = null;
+    try {
+      r = await this.api.op({ op: "job_context", job: job.id });
+    } catch {
+      return;
+    }
+    const p = r && r.value && r.value.squelch;
+    if (rec.closed || this.destroyed || this.watched.get(job.id) !== rec) return;
+    if (!p || p.protocol !== "squelch" || this.squelches.has(job.id)) return;
+    this.squelches.set(job.id, { event: p, graph: graphKey(rec.job) });
+    setSquelchTag(this.jobRowEl(rec.job), p);
   }
 
   unwatch(jobId) {
