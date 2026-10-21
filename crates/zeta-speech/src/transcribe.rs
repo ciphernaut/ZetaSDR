@@ -25,10 +25,12 @@ pub const NO_BACKEND: &str =
 
 /// The rate every backend is handed.
 const RATE_16K: u64 = 16_000;
-/// Utterances shorter than this (500 ms at 16 kHz) never reach the backend.
-const MIN_SAMPLES: usize = RATE_16K as usize / 2;
+/// Default `min_utterance_ms`.
+const MIN_UTTERANCE_MS_DEFAULT: u32 = 700;
 /// Closed utterances waiting for the backend; one more arriving is dropped.
-const QUEUE: usize = 2;
+const QUEUE: usize = 4;
+/// The `short` count is noted to the job at most this often.
+const NOTE_EVERY: Duration = Duration::from_secs(1);
 /// Consecutive backend errors that fail the stage.
 const MAX_ERRORS: u32 = 2;
 
@@ -40,6 +42,9 @@ fn d300() -> u32 {
 }
 fn d15() -> u32 {
     15
+}
+fn d700() -> u32 {
+    MIN_UTTERANCE_MS_DEFAULT
 }
 
 /// `transcribe` parameters.
@@ -58,6 +63,12 @@ pub struct TranscribeParams {
     /// An utterance is closed when it reaches this length, s (0 counts as 1).
     #[serde(default = "d15")]
     pub max_utterance_s: u32,
+    /// Utterances shorter than this, ms (700), are not sent: noise bursts behind an opening
+    /// squelch. The job's context counts them under `transcribe.short`. A transcript that is
+    /// `dropped` has a `reason`: `queue` (the stage's own queue of 4 was full) or `busy` (the
+    /// speech daemon had no free slot for 30 s).
+    #[serde(default = "d700")]
+    pub min_utterance_ms: u32,
 }
 
 /// A closed utterance: 16 kHz mono samples and the time they span.
@@ -80,24 +91,34 @@ struct Open {
 /// Cuts timed audio frames into utterances, downmixed (channel mean) and resampled to
 /// 16 kHz. A frame starting more than `gap_ms` after the previous frame's end closes the
 /// open utterance; so does reaching `max_utterance_s`, the rest of the audio starting the
-/// next one at that instant. Closed utterances under 500 ms are discarded. The first frame
+/// next one at that instant. Closed utterances under `min_utterance_ms` are discarded and
+/// counted ([`Accumulator::short`]). The first frame
 /// fixes the rate and channel count; a change later is an error.
 pub struct Accumulator {
     gap_ns: u64,
     max_samples: usize,
+    min_samples: usize,
+    short: u32,
     /// (rate, channels, a fresh resampler from the rate), fixed by the first frame.
     format: Option<(u64, u16, Resampler)>,
     open: Option<Open>,
 }
 
 impl Accumulator {
-    pub fn new(gap_ms: u32, max_utterance_s: u32) -> Self {
+    pub fn new(gap_ms: u32, max_utterance_s: u32, min_utterance_ms: u32) -> Self {
         Self {
             gap_ns: gap_ms as u64 * 1_000_000,
             max_samples: max_utterance_s.max(1) as usize * RATE_16K as usize,
+            min_samples: min_utterance_ms as usize * RATE_16K as usize / 1_000,
+            short: 0,
             format: None,
             open: None,
         }
+    }
+
+    /// Utterances discarded so far for being under `min_utterance_ms`.
+    pub fn short(&self) -> u32 {
+        self.short
     }
 
     /// Take in `interleaved` samples at `rate_hz` / `channels` starting at `t0_ns`;
@@ -164,7 +185,7 @@ impl Accumulator {
             });
             open.start_ns = cut;
         }
-        Ok(closed.into_iter().filter(long_enough).collect())
+        Ok(closed.into_iter().filter(|u| self.long_enough(u)).collect())
     }
 
     /// Whether an utterance is open (audio taken in and not yet closed).
@@ -173,9 +194,18 @@ impl Accumulator {
     }
 
     /// Close the open utterance (the input ended, went quiet or skipped frames); `None`
-    /// when there is none or it is under 500 ms.
+    /// when there is none or it is under `min_utterance_ms`.
     pub fn flush(&mut self) -> Option<Utterance> {
-        self.close().filter(long_enough)
+        self.close().filter(|u| self.long_enough(u))
+    }
+
+    /// Whether `u` reaches the backend; a shorter one is counted.
+    fn long_enough(&mut self, u: &Utterance) -> bool {
+        let ok = u.samples.len() >= self.min_samples;
+        if !ok {
+            self.short += 1;
+        }
+        ok
     }
 
     fn close(&mut self) -> Option<Utterance> {
@@ -186,10 +216,6 @@ impl Accumulator {
             samples: to_s16(&o.samples),
         })
     }
-}
-
-fn long_enough(u: &Utterance) -> bool {
-    u.samples.len() >= MIN_SAMPLES
 }
 
 /// Nanoseconds spanned by `n` samples at `rate_hz`.
@@ -292,6 +318,7 @@ impl Worker {
                 serde_json::json!({
                     "protocol": "transcript",
                     "dropped": true,
+                    "reason": "queue",
                     "start_ns": span.start_ns.0,
                     "end_ns": span.end_ns.0,
                 }),
@@ -303,7 +330,9 @@ impl Worker {
         let (backend, language, timeout) =
             (self.backend.clone(), self.language.clone(), self.timeout);
         self.in_flight = Some(InFlight(tokio::spawn(async move {
-            let r = tokio::time::timeout(timeout, backend.transcribe(&job.wav, &language))
+            // The backend bounds its own call; this outer bound also covers its queue.
+            let bound = timeout + backend.queue_wait();
+            let r = tokio::time::timeout(bound, backend.transcribe(&job.wav, &language))
                 .await
                 .unwrap_or(Err(SpeechError::Timeout(timeout)));
             (job.span, job.duration_ms, r)
@@ -331,6 +360,20 @@ impl Worker {
                         "end_ns": span.end_ns.0,
                         "backend": self.backend.name(),
                         "duration_ms": duration_ms,
+                        "queued_ms": t.queued_ms,
+                    }),
+                );
+            }
+            Err(SpeechError::Busy(_)) => {
+                // The daemon is shared and full: a drop, not a fault of this job.
+                self.publish(
+                    &span,
+                    serde_json::json!({
+                        "protocol": "transcript",
+                        "dropped": true,
+                        "reason": "busy",
+                        "start_ns": span.start_ns.0,
+                        "end_ns": span.end_ns.0,
                     }),
                 );
             }
@@ -383,7 +426,7 @@ impl Stage for TranscribeStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let params: TranscribeParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("transcribe params: {e}")))?;
@@ -404,7 +447,11 @@ impl Stage for TranscribeStage {
         let Some(out) = outputs.first().cloned() else {
             return Err(StageError::Failed("expected 1 output".into()));
         };
-        let mut acc = Accumulator::new(params.gap_ms, params.max_utterance_s);
+        let mut acc = Accumulator::new(
+            params.gap_ms,
+            params.max_utterance_s,
+            params.min_utterance_ms,
+        );
         let mut w = Worker {
             backend,
             language,
@@ -423,6 +470,10 @@ impl Stage for TranscribeStage {
         let gap = Duration::from_millis(params.gap_ms as u64);
         let mut quiet = std::pin::pin!(tokio::time::sleep(gap));
         let mut armed = false;
+        // The `short` count last noted, and when it may next be (set while one is held back).
+        let mut noted = 0;
+        let mut note_at = tokio::time::Instant::now();
+        let mut note_held = false;
         loop {
             tokio::select! {
                 biased;
@@ -461,11 +512,23 @@ impl Stage for TranscribeStage {
                         w.offer(u);
                     }
                 }
+                _ = tokio::time::sleep_until(note_at), if note_held => {}
+            }
+            if acc.short() > noted && tokio::time::Instant::now() >= note_at {
+                noted = acc.short();
+                ctx.note(serde_json::json!({"transcribe": {"short": noted}}));
+                note_at = tokio::time::Instant::now() + NOTE_EVERY;
+                note_held = false;
+            } else {
+                note_held = acc.short() > noted;
             }
         }
         // The input closed: transcribe what is still open or waiting.
         if let Some(u) = acc.flush() {
             w.offer(u);
+        }
+        if acc.short() > noted {
+            ctx.note(serde_json::json!({"transcribe": {"short": acc.short()}}));
         }
         while w.in_flight.is_some() {
             tokio::select! {
@@ -509,8 +572,13 @@ mod tests {
     fn params_default_and_are_strict() {
         let p: TranscribeParams = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(
-            (p.language.as_str(), p.gap_ms, p.max_utterance_s),
-            ("en", 300, 15)
+            (
+                p.language.as_str(),
+                p.gap_ms,
+                p.max_utterance_s,
+                p.min_utterance_ms
+            ),
+            ("en", 300, 15, 700)
         );
         assert!(serde_json::from_value::<TranscribeParams>(serde_json::json!({"gap": 1})).is_err());
         let schema = serde_json::to_value(schemars::schema_for!(TranscribeParams)).unwrap();
@@ -521,8 +589,19 @@ mod tests {
     }
 
     #[test]
+    fn utterances_under_min_utterance_ms_are_discarded() {
+        let mut acc = Accumulator::new(300, 15, 700);
+        let (_, end) = feed(&mut acc, &tone(0.6), 0);
+        assert_eq!(acc.flush(), None);
+        assert_eq!(acc.short(), 1);
+        let (_, end) = feed(&mut acc, &tone(0.8), end + SEC);
+        assert!(acc.flush().is_some_and(|u| u.end_ns <= end));
+        assert_eq!(acc.short(), 1);
+    }
+
+    #[test]
     fn gap_closes_and_short_is_discarded() {
-        let mut acc = Accumulator::new(300, 15);
+        let mut acc = Accumulator::new(300, 15, 500);
         let (none, end) = feed(&mut acc, &tone(1.0), 0);
         assert!(none.is_empty());
         // 300 ms after the end is not yet a gap; 301 ms is.
@@ -538,7 +617,7 @@ mod tests {
 
     #[test]
     fn max_length_splits_contiguous_audio() {
-        let mut acc = Accumulator::new(300, 2);
+        let mut acc = Accumulator::new(300, 2, 500);
         let (closed, end) = feed(&mut acc, &tone(5.0), 0);
         let spans: Vec<(u64, u64, usize)> = closed
             .iter()
@@ -557,12 +636,12 @@ mod tests {
 
     #[test]
     fn downmix_and_format_changes() {
-        let mut acc = Accumulator::new(300, 15);
+        let mut acc = Accumulator::new(300, 15, 500);
         let x = tone(1.0);
         let stereo: Vec<f32> = x.iter().flat_map(|&s| [s, 0.0]).collect();
         acc.push(0, RATE, 2, &stereo).unwrap();
         let half = acc.flush().unwrap();
-        let mut mono = Accumulator::new(300, 15);
+        let mut mono = Accumulator::new(300, 15, 500);
         let quiet: Vec<f32> = x.iter().map(|s| s / 2.0).collect();
         mono.push(0, RATE, 1, &quiet).unwrap();
         assert_eq!(half, mono.flush().unwrap());

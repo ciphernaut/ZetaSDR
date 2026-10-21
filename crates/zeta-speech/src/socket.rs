@@ -6,11 +6,13 @@
 //! speaks it; so can any other daemon.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::sync::Semaphore;
 
 use crate::backend::{
     SpeechBackend, SpeechError, Transcript, check_language, default_languages, parse_languages,
@@ -24,12 +26,21 @@ const MAX_REPLY_BYTES: u64 = 64 * 1024;
 /// for a full call timeout.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Calls the daemon is handed at once; the rest wait for a slot.
+pub const STT_CONCURRENCY: usize = 4;
+/// Longest a call waits for a slot before it is given up as busy.
+pub const STT_QUEUE_WAIT: Duration = Duration::from_secs(30);
+/// Pause before the one retry of a connect the daemon answered with EAGAIN or refused.
+pub const STT_RETRY_DELAY: Duration = Duration::from_millis(200);
+
 pub struct SocketBackend {
     name: String,
     path: PathBuf,
     staging_dir: PathBuf,
     timeout: Duration,
     languages: Vec<String>,
+    slots: Arc<Semaphore>,
+    queue_wait: Duration,
 }
 
 /// Removes the staged WAV file when dropped, on every path out of `transcribe`.
@@ -47,6 +58,18 @@ impl SocketBackend {
     /// when it lists none, answers `error:`, cannot be reached or does not answer in time
     /// (that last one said on stderr).
     pub async fn new(path: PathBuf, staging_dir: PathBuf, timeout: Duration) -> Self {
+        Self::with_limits(path, staging_dir, timeout, STT_CONCURRENCY, STT_QUEUE_WAIT).await
+    }
+
+    /// [`SocketBackend::new`] with `concurrency` calls at once and a wait of at most
+    /// `queue_wait` for a slot (tests shorten the wait).
+    pub async fn with_limits(
+        path: PathBuf,
+        staging_dir: PathBuf,
+        timeout: Duration,
+        concurrency: usize,
+        queue_wait: Duration,
+    ) -> Self {
         // The daemon may run in another directory: it is always handed an absolute path.
         let staging_dir = std::path::absolute(&staging_dir).unwrap_or(staging_dir);
         let probe = timeout.min(PROBE_TIMEOUT);
@@ -70,6 +93,8 @@ impl SocketBackend {
             staging_dir,
             timeout,
             languages,
+            slots: Arc::new(Semaphore::new(concurrency.max(1))),
+            queue_wait,
         }
     }
 }
@@ -84,8 +109,18 @@ impl SpeechBackend for SocketBackend {
         &self.languages
     }
 
+    fn queue_wait(&self) -> Duration {
+        self.queue_wait
+    }
+
     async fn transcribe(&self, wav: &[u8], language: &str) -> Result<Transcript, SpeechError> {
         let language = check_language(&self.languages, language)?;
+        let asked = Instant::now();
+        let _slot = tokio::time::timeout(self.queue_wait, self.slots.acquire())
+            .await
+            .map_err(|_| SpeechError::Busy(self.queue_wait))?
+            .map_err(|_| SpeechError::Daemon("the speech queue closed".into()))?;
+        let queued_ms = asked.elapsed().as_millis() as u64;
         let dir = &self.staging_dir;
         tokio::fs::create_dir_all(dir)
             .await
@@ -102,6 +137,7 @@ impl SpeechBackend for SocketBackend {
             Ok(Transcript {
                 text: text.to_string(),
                 language,
+                queued_ms,
             })
         } else if let Some(msg) = line.strip_prefix("error:") {
             Err(SpeechError::Daemon(msg.to_string()))
@@ -113,9 +149,14 @@ impl SpeechBackend for SocketBackend {
 
 /// Send `command` and a newline to the daemon at `path`; its answer line, without the newline.
 async fn exchange(path: &Path, command: &str) -> Result<String, SpeechError> {
-    let mut conn = UnixStream::connect(path).await.map_err(|e| {
-        SpeechError::Unreachable(format!("speech daemon at {}: {e}", path.display()))
-    })?;
+    let mut conn = match UnixStream::connect(path).await {
+        Err(e) if retryable(&e) => {
+            tokio::time::sleep(STT_RETRY_DELAY).await;
+            UnixStream::connect(path).await
+        }
+        r => r,
+    }
+    .map_err(|e| SpeechError::Unreachable(format!("speech daemon at {}: {e}", path.display())))?;
     conn.write_all(format!("{command}\n").as_bytes())
         .await
         .map_err(|e| SpeechError::Daemon(format!("sending the command: {e}")))?;
@@ -132,4 +173,13 @@ async fn exchange(path: &Path, command: &str) -> Result<String, SpeechError> {
         Err(e) => return Err(SpeechError::Daemon(format!("reading the answer: {e}"))),
     }
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// A connect failure worth one more try: the daemon's backlog is full (EAGAIN) or it is
+/// between accepting sockets.
+fn retryable(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionRefused
+    )
 }

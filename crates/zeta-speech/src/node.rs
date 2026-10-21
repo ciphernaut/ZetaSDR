@@ -57,7 +57,11 @@ impl SpeechBackend for NodeBackend {
     async fn transcribe(&self, wav: &[u8], language: &str) -> Result<Transcript, SpeechError> {
         let language = normalise(language);
         match self.client.stt(wav.to_vec(), &language, true).await {
-            Ok(text) => Ok(Transcript { text, language }),
+            Ok(text) => Ok(Transcript {
+                text,
+                language,
+                queued_ms: 0,
+            }),
             Err(e) => Err(speech_error(e, &language)),
         }
     }

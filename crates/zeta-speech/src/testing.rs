@@ -26,6 +26,8 @@ struct Seen {
     connections: AtomicUsize,
     commands: Mutex<Vec<String>>,
     files: Mutex<Vec<StagedSeen>>,
+    active: AtomicUsize,
+    peak: AtomicUsize,
 }
 
 /// A fake daemon speaking the bring-your-own contract on a Unix socket: one command line per
@@ -77,6 +79,22 @@ impl FakeDaemon {
         )
     }
 
+    /// [`FakeDaemon::replying`], holding each `file:` answer back for `delay`.
+    pub fn with_delay(path: &Path, reply: &str, delay: Duration) -> Self {
+        let reply = reply.to_string();
+        Self::spawn(
+            path,
+            Arc::new(move |line: &str| {
+                Some(if line == "languages" {
+                    "error:unknown command\n".to_string()
+                } else {
+                    std::thread::sleep(delay);
+                    reply.clone()
+                })
+            }),
+        )
+    }
+
     /// Accept connections and read their command, but never answer.
     pub fn silent(path: &Path) -> Self {
         Self::spawn(path, Arc::new(|_: &str| None))
@@ -89,6 +107,11 @@ impl FakeDaemon {
     /// Connections accepted so far.
     pub fn connections(&self) -> usize {
         self.seen.connections.load(Ordering::SeqCst)
+    }
+
+    /// The most commands being answered at once so far.
+    pub fn max_concurrent(&self) -> usize {
+        self.seen.peak.load(Ordering::SeqCst)
     }
 
     /// Every command line received, without its newline, in order.
@@ -136,7 +159,11 @@ fn serve_one(mut conn: std::os::unix::net::UnixStream, seen: &Seen, answer: &Ans
             .push(StagedSeen { path, existed });
     }
     seen.commands.lock().unwrap().push(line.clone());
-    match answer(&line) {
+    let now = seen.active.fetch_add(1, Ordering::SeqCst) + 1;
+    seen.peak.fetch_max(now, Ordering::SeqCst);
+    let reply = answer(&line);
+    seen.active.fetch_sub(1, Ordering::SeqCst);
+    match reply {
         Some(reply) => {
             let _ = conn.write_all(reply.as_bytes());
         }
@@ -219,6 +246,7 @@ impl SpeechBackend for FakeBackend {
         Ok(Transcript {
             text: self.text.clone(),
             language,
+            queued_ms: 0,
         })
     }
 }

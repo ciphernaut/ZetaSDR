@@ -85,7 +85,7 @@ pub(crate) async fn stt(
 }
 
 /// A backend's failure as the answer: 422 for a language it lacks, 503 when it cannot be
-/// reached, 502 when it reports an error, 504 when it does not answer in time.
+/// reached or has no free slot, 502 when it reports an error, 504 when it does not answer in time.
 fn speech_error(e: SpeechError) -> Response {
     let status = match &e {
         SpeechError::Unsupported {
@@ -96,7 +96,7 @@ fn speech_error(e: SpeechError) -> Response {
                 json!({"error": "unsupported", "language": language, "supported": supported});
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
         }
-        SpeechError::Unreachable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        SpeechError::Unreachable(_) | SpeechError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
         SpeechError::Daemon(_) => StatusCode::BAD_GATEWAY,
         SpeechError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
     };

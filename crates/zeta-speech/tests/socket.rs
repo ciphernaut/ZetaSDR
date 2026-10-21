@@ -162,3 +162,21 @@ async fn an_overlong_answer_is_a_daemon_error() {
     assert_eq!(err, SpeechError::Daemon("answer too long".to_string()));
     assert_eq!(staged_left(&staging), 0);
 }
+
+#[tokio::test]
+async fn eagain_on_connect_is_retried_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, staging) = (dir.path().join("v.sock"), dir.path().join("stt"));
+    // A socket file nobody listens on refuses the connect; the daemon appears 100 ms later.
+    drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+    let b = backend(&sock, &staging, TIMEOUT).await;
+    let path = sock.clone();
+    let starter = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::remove_file(&path).unwrap();
+        FakeDaemon::replying(&path, "ok:back\n")
+    });
+    let t = b.transcribe(&wav_s16_mono(&[0; 160]), "en").await.unwrap();
+    assert_eq!(t.text, "back");
+    let _daemon = starter.join().unwrap();
+}

@@ -12,6 +12,8 @@ pub const DEFAULT_LANGUAGE: &str = "en";
 pub struct Transcript {
     pub text: String,
     pub language: String,
+    /// How long the call waited for a slot at the backend, ms; 0 for a backend with no queue.
+    pub queued_ms: u64,
 }
 
 /// Why a transcription failed; the `Display` texts are the reasons a job reports.
@@ -28,6 +30,8 @@ pub enum SpeechError {
     Daemon(String),
     #[error("the speech daemon did not answer within {} s", .0.as_secs_f64())]
     Timeout(Duration),
+    #[error("the speech daemon is busy: no slot within {} s", .0.as_secs_f64())]
+    Busy(Duration),
 }
 
 /// Something that turns a 16 kHz mono WAV into text.
@@ -42,6 +46,11 @@ pub trait SpeechBackend: Send + Sync {
     /// forwarded must not reach it (that would be a forwarding loop).
     fn forwards(&self) -> bool {
         false
+    }
+    /// The longest a call may wait for a slot before it is attempted (on top of the call
+    /// timeout); zero for a backend with no queue.
+    fn queue_wait(&self) -> Duration {
+        Duration::ZERO
     }
 }
 

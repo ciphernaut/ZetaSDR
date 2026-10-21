@@ -362,6 +362,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.gap_ms: integer (optional, default 300)
 - params.language: string (optional, default "en")
 - params.max_utterance_s: integer (optional, default 15)
+- params.min_utterance_ms: integer (optional, default 700)
 
 ### vad
 
@@ -436,6 +437,8 @@ demodulator's audio, holds no radio lease and ends when that job stops:
 The node needs a speech backend (`--stt-socket` or `--stt-node`); without one the attached job fails naming it, so report that and do not retry. Language: the attached job transcribes `en` unless it was attached with `language`; a language the backend does not list (see `GET /stt/languages`) fails the job naming the languages it has. Do not guess a language from the band.
 
 Music and noise are gated, not separated: `vad` passes any loud audio, so a music station or a broadcast with a bed under the voice yields poor or empty text. Say so rather than reporting the text as the speech. Separation is a slot: an external audio-to-audio plugin (`--plugin separate=PATH`, a Demucs wrapper for instance) replaces the `denoise` node with `graph get` of the attached job, edit, `graph put`. The job restarts on `graph put`. `docs/speech.md` has the daemon install and the plugin stub.
+
+`queued_ms` on a transcript is how long it waited for the speech daemon (at most 4 calls at once); `dropped` with `reason: busy` means the daemon had no slot for 30 s, `reason: queue` that the job's own queue of 4 was full. Utterances under `min_utterance_ms` (700) are not sent at all; the job's context counts them under `transcribe.short`.
 
 A `fm_demod` or `am_demod` has an automatic squelch: an idle channel publishes no audio, so a quiet transcript is normal. `squelch` events say why a row is quiet (idle, or open). It opens 6 dB over the tracked noise floor (`squelch_db: null`, the default) and closes after 300 ms under it. To fix or disable it, `graph get`, set `squelch_db` (an absolute threshold in dBFS, -120..=0, not dB above the floor) or `squelch: false` on the demodulator's node, `graph put`; such a put keeps the job re-expandable at later capture changes. A `--then-tail` of an idle squelched channel is empty: that is the squelch, not a fault.
 

@@ -10,8 +10,8 @@ use zeta_core::stage::{Stage, StageContext, StageError};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 use zeta_dsp::fixtures::speech_like;
-use zeta_speech::testing::FakeBackend;
-use zeta_speech::{SpeechBackend, TranscribeStage};
+use zeta_speech::testing::{FakeBackend, FakeDaemon};
+use zeta_speech::{SocketBackend, SpeechBackend, TranscribeStage};
 
 const RATE: u64 = 48_000;
 /// Input frames are 100 ms long.
@@ -78,6 +78,20 @@ struct Rig {
 }
 
 fn start_with(backend: Option<Arc<dyn SpeechBackend>>, timeout: Duration, params: Value) -> Rig {
+    start_ctx(
+        backend,
+        timeout,
+        params,
+        StageContext::new(SourceId("s".into())),
+    )
+}
+
+fn start_ctx(
+    backend: Option<Arc<dyn SpeechBackend>>,
+    timeout: Duration,
+    params: Value,
+    ctx: StageContext,
+) -> Rig {
     let bus = Arc::new(StreamBus::new(1_024));
     let out = bus.register(StreamKind::Event, prov(0));
     let events = bus.subscribe(&out).unwrap();
@@ -86,14 +100,7 @@ fn start_with(backend: Option<Arc<dyn SpeechBackend>>, timeout: Duration, params
     let c = cancel.clone();
     let run = tokio::spawn(async move {
         TranscribeStage::new(backend, timeout)
-            .run(
-                params,
-                vec![rx],
-                vec![out],
-                bus,
-                c,
-                StageContext::new(SourceId("s".into())),
-            )
+            .run(params, vec![rx], vec![out], bus, c, ctx)
             .await
     });
     Rig {
@@ -350,21 +357,21 @@ async fn slow_backend_does_not_stall_input_and_overflow_is_reported() {
         run,
         cancel: _cancel,
     } = start(&fake);
-    // Five 600 ms utterances, 1 s apart, all at once. At 16 kHz the stage does not
+    // Eight 800 ms utterances, 1 s apart, all at once. At 16 kHz the stage does not
     // resample, so the 100 ms bound measures the queueing, not an unoptimised build's FIR.
-    let burst = speech_like(16_000, 0.6);
+    let burst = speech_like(16_000, 0.8);
     let mut starts = Vec::new();
     let mut t = T_BASE;
-    for _ in 0..5 {
+    for _ in 0..8 {
         starts.push(t);
         t = send_at(&tx, &burst, 16_000, 1, t) + SEC;
     }
     let sent = Instant::now();
     // The last utterance closes when the input does.
     drop(tx);
-    // The two that overflow the queue are reported at once.
+    // The three that overflow the queue are reported at once.
     let mut dropped = Vec::new();
-    while dropped.len() < 2 {
+    while dropped.len() < 3 {
         let left = Duration::from_millis(500).saturating_sub(sent.elapsed());
         let f = tokio::time::timeout(left, events.recv())
             .await
@@ -373,8 +380,9 @@ async fn slow_backend_does_not_stall_input_and_overflow_is_reported() {
         dropped.push(event(f));
     }
     assert!(sent.elapsed() < Duration::from_millis(500));
-    for (v, start) in dropped.iter().zip(&starts[3..]) {
+    for (v, start) in dropped.iter().zip(&starts[5..]) {
         assert_eq!(v["dropped"], true, "{v}");
+        assert_eq!(v["reason"], "queue", "{v}");
         assert_eq!(u(v, "start_ns"), *start, "the newest are dropped: {v}");
         assert!(u(v, "end_ns") > *start);
     }
@@ -382,12 +390,12 @@ async fn slow_backend_does_not_stall_input_and_overflow_is_reported() {
     assert_eq!(fake.calls().len(), 1);
     let (res, events) = wait(run, events).await;
     assert!(res.is_ok(), "{res:?}");
-    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events.len(), 5, "{events:?}");
     for (v, start) in events.iter().zip(&starts) {
         assert_eq!(v["text"], "slow", "{v}");
         assert_eq!(u(v, "start_ns"), *start);
     }
-    assert_eq!(fake.calls().len(), 3);
+    assert_eq!(fake.calls().len(), 5);
 }
 
 #[tokio::test]
@@ -515,5 +523,127 @@ async fn lagged_input_is_counted_by_kind() {
     assert!(
         by_kind.iter().any(|&(k, n)| k == "transcribe" && n >= 6),
         "{by_kind:?}"
+    );
+}
+
+/// Receive the next event of `events` within 5 s.
+async fn next_event(events: &mut broadcast::Receiver<Frame>) -> Value {
+    let f = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("an event within 5 s")
+        .unwrap();
+    event(f)
+}
+
+fn one_second() -> Vec<f32> {
+    speech_like(16_000, 1.0)
+}
+
+#[tokio::test]
+async fn concurrency_is_bounded_and_busy_is_a_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, staging) = (dir.path().join("v.sock"), dir.path().join("stt"));
+    let daemon = FakeDaemon::with_delay(&sock, "ok:hi\n", Duration::from_millis(300));
+    let backend: Arc<dyn SpeechBackend> =
+        Arc::new(SocketBackend::new(sock.clone(), staging.clone(), Duration::from_secs(30)).await);
+    // Six stages share one backend, each handed one 1 s utterance at once.
+    let mut rigs: Vec<Rig> = (0..6)
+        .map(|_| {
+            start_with(
+                Some(backend.clone()),
+                Duration::from_secs(30),
+                serde_json::json!({}),
+            )
+        })
+        .collect();
+    for rig in &rigs {
+        send_at(&rig.tx, &one_second(), 16_000, 1, T_BASE);
+    }
+    let mut queued = Vec::new();
+    for rig in &mut rigs {
+        let v = next_event(&mut rig.events).await;
+        assert_eq!(v["text"], "hi", "{v}");
+        queued.push(u(&v, "queued_ms"));
+    }
+    assert!(daemon.max_concurrent() <= 4, "{}", daemon.max_concurrent());
+    queued.sort();
+    assert!(queued[..4].iter().all(|&q| q < 250), "{queued:?}");
+    assert!(queued[4..].iter().all(|&q| q >= 250), "{queued:?}");
+    for rig in rigs {
+        let (res, events) = finish(rig).await;
+        assert!(res.is_ok(), "{res:?}");
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    // A wait past the (shortened) limit is a dropped event, and the stage runs on.
+    let one = Arc::new(
+        SocketBackend::with_limits(
+            sock.clone(),
+            staging,
+            Duration::from_secs(30),
+            1,
+            Duration::from_millis(100),
+        )
+        .await,
+    );
+    let params = serde_json::json!({"gap_ms": 100});
+    let mut a = start_with(
+        Some(one.clone() as Arc<dyn SpeechBackend>),
+        Duration::from_secs(30),
+        params.clone(),
+    );
+    let mut b = start_with(
+        Some(one as Arc<dyn SpeechBackend>),
+        Duration::from_secs(30),
+        params,
+    );
+    let end = send_at(&a.tx, &one_second(), 16_000, 1, T_BASE);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    send_at(&b.tx, &one_second(), 16_000, 1, T_BASE);
+    let v = next_event(&mut b.events).await;
+    assert_eq!(
+        (v["dropped"].clone(), v["reason"].clone()),
+        (true.into(), "busy".into()),
+        "{v}"
+    );
+    assert_eq!(next_event(&mut a.events).await["text"], "hi");
+    // Not counted as an error: b is still running and transcribes the next one.
+    send_at(&b.tx, &one_second(), 16_000, 1, end + SEC);
+    let v = next_event(&mut b.events).await;
+    assert_eq!(v["text"], "hi", "{v}");
+    assert!(!b.run.is_finished());
+    for rig in [a, b] {
+        let (res, _) = finish(rig).await;
+        assert!(res.is_ok(), "{res:?}");
+    }
+}
+
+#[tokio::test]
+async fn short_utterances_are_noted_in_the_job_context() {
+    let notes = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let sink = notes.clone();
+    let ctx = StageContext::new(SourceId("s".into()))
+        .with_note(Arc::new(move |v| sink.lock().unwrap().push(v)));
+    let fake = Arc::new(FakeBackend::new("x"));
+    let rig = start_ctx(
+        Some(fake.clone() as Arc<dyn SpeechBackend>),
+        Duration::from_secs(30),
+        serde_json::json!({}),
+        ctx,
+    );
+    // Two 600 ms bursts and a 1 s utterance, a gap apart.
+    let mut t = T_BASE;
+    for len in [0.6, 0.6, 1.0] {
+        t = send_at(&rig.tx, &speech_like(16_000, len), 16_000, 1, t) + SEC;
+    }
+    let (res, events) = finish(rig).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(fake.calls().len(), 1);
+    let notes = notes.lock().unwrap();
+    assert_eq!(
+        notes.last().unwrap(),
+        &serde_json::json!({"transcribe": {"short": 2}}),
+        "{notes:?}"
     );
 }
