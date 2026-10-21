@@ -12,7 +12,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::persist::{now, persist};
-use super::{Inner, JobEntry, NodeError, ring_seconds_for};
+use super::{Inner, JobEntry, LogFile, NodeError, ring_seconds_for};
 use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::ops::{JobKind, SPECTRUM_ROWS_PER_S, scan_steps, spectrum_size};
@@ -182,6 +182,8 @@ impl Inner {
 
         let token = self.shutdown.child_token();
         let graph = rec.graph.clone();
+        // A `transcribe` job's record for its transcript tees (see `tee_transcripts`).
+        let tee = (rec.kind == JobKind::Transcribe.name()).then(|| rec.clone());
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.
         let prov = self.record_running(rec, &token)?;
 
@@ -219,12 +221,17 @@ impl Inner {
             {
                 inputs.push(self.bus.subscribe(sid).expect("registered"));
             }
+            let before = job_outputs.len();
             let outputs = node_outputs(stage.spec(), leaving, |k| {
                 let sid = self.bus.register(k, prov.clone());
                 streams.push(sid.clone());
                 job_outputs.push((k, sid.clone()));
                 sid
             });
+            // Subscribed before the stage runs, so its first event is not missed.
+            if let Some(rec) = &tee {
+                self.tee_transcripts(rec, &job_outputs[before..], &token);
+            }
             let ids = outputs.into_iter().map(|(_, s)| s).collect();
             let (params, bus, cancel) = (n.params.clone(), self.bus.clone(), token.clone());
             let ctx = ctx.clone();
@@ -254,6 +261,71 @@ impl Inner {
             e.outputs = job_outputs;
         }
         Ok(())
+    }
+
+    /// Append every `transcript` event of `rec`'s `Event` outputs among `outputs`
+    /// to `transcripts.log`, one task per output, each subscribed before this
+    /// returns. A tee ends when its stream is unregistered at the job's end or on
+    /// `token` (draining what is buffered); it is not one of the job's stages, so
+    /// it never ends the job. A lag is recorded once per tee in `persist_errors`.
+    pub(super) fn tee_transcripts(
+        self: &Arc<Self>,
+        rec: &JobRecord,
+        outputs: &[(StreamKind, StreamId)],
+        token: &CancellationToken,
+    ) {
+        for (_, sid) in outputs.iter().filter(|(k, _)| *k == StreamKind::Event) {
+            let Some(mut rx) = self.bus.subscribe(sid) else {
+                continue;
+            };
+            let job = serde_json::json!({
+                "job": rec.id.0,
+                "input": rec.input.as_ref().map(|j| j.0.clone()),
+                "source": rec.source.0,
+                "center_hz": rec.tuning.center_hz.0,
+                "bandwidth_hz": rec.tuning.bandwidth_hz.0,
+            });
+            let (id, token) = (rec.id.clone(), token.clone());
+            // Weak: a tee never keeps the node alive.
+            let inner = Arc::downgrade(self);
+            let running = TeeRunning::new(self.tees.clone());
+            tokio::spawn(async move {
+                let _running = running;
+                let mut lagged = false;
+                let log = |frame: Frame| {
+                    if let (Some(inner), Some(line)) =
+                        (inner.upgrade(), transcript_line(&job, &frame))
+                    {
+                        inner.log_line(LogFile::Transcripts, &line);
+                    }
+                };
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            while let Ok(frame) = rx.try_recv() {
+                                log(frame);
+                            }
+                            return;
+                        }
+                        r = rx.recv() => match r {
+                            Ok(frame) => log(frame),
+                            Err(RecvError::Lagged(n)) => {
+                                if !std::mem::replace(&mut lagged, true)
+                                    && let Some(inner) = inner.upgrade()
+                                {
+                                    inner.persist_errors.lock().unwrap().push(format!(
+                                        "transcripts.log: job {}: {n} events skipped",
+                                        id.0
+                                    ));
+                                }
+                            }
+                            Err(RecvError::Closed) => return,
+                        },
+                    }
+                }
+            });
+        }
     }
 
     /// Relaunch every running elastic job on `source` but `except` under the same
@@ -975,4 +1047,43 @@ async fn fft_step(
         };
         bus.publish(Frame::new(s.out.clone(), p, Payload::Event(v)));
     }
+}
+
+/// Counts a running transcript tee in `Inner::tees` while it lives.
+struct TeeRunning(Arc<std::sync::atomic::AtomicUsize>);
+
+impl TeeRunning {
+    fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for TeeRunning {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The `transcripts.log` line for `frame` (`None` unless it is a `transcript`
+/// event): `job`'s fields, the frame's span, and the event's `text`,
+/// `language`, `dropped` and `error` (`null`/`false` when absent).
+fn transcript_line(job: &serde_json::Value, frame: &Frame) -> Option<serde_json::Value> {
+    let Payload::Event(v) = &frame.payload else {
+        return None;
+    };
+    if v["protocol"] != "transcript" {
+        return None;
+    }
+    let text = |k: &str| v.get(k).filter(|x| x.is_string()).cloned();
+    let mut line = job.clone();
+    let m = line.as_object_mut()?;
+    m.insert("t_ns".into(), now().0.into());
+    m.insert("start_ns".into(), frame.provenance.span.start_ns.0.into());
+    m.insert("end_ns".into(), frame.provenance.span.end_ns.0.into());
+    m.insert("text".into(), text("text").into());
+    m.insert("language".into(), text("language").into());
+    m.insert("dropped".into(), (v["dropped"] == true).into());
+    m.insert("error".into(), text("error").into());
+    Some(line)
 }

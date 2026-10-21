@@ -54,7 +54,15 @@ async fn main() -> ExitCode {
         Err(e) => return fail(&e),
     };
     if let cli::Command::Ops(cli::OpsCmd::Tail { lines }) = cli.command {
-        return ops_tail(&state_dir, lines);
+        return tail_log(&state_dir, "ops.log", lines, |_| true);
+    }
+    if let cli::Command::Transcripts(cli::TranscriptsCmd::Tail { lines, job }) = cli.command {
+        return tail_log(&state_dir, "transcripts.log", lines, |line| {
+            job.as_deref().is_none_or(|id| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .is_ok_and(|v| v["job"] == id || v["input"] == id)
+            })
+        });
     }
     if cli.command.mutates()
         && let Some(pid) = serve_lock::owner(&state_dir)
@@ -246,12 +254,18 @@ async fn wait_for_ring(node: &zeta_core::node::Node, sel: &zeta_core::types::Sel
     }
 }
 
-/// `ops tail`: print the last `lines` lines of `ops.log.1` and `ops.log`, oldest first.
-fn ops_tail(state_dir: &std::path::Path, lines: usize) -> ExitCode {
+/// `ops tail`, `transcripts tail`: print the last `lines` lines of `<stem>.1` and
+/// `<stem>` that `filter` keeps, oldest first.
+fn tail_log(
+    state_dir: &std::path::Path,
+    stem: &str,
+    lines: usize,
+    filter: impl Fn(&str) -> bool,
+) -> ExitCode {
     let mut all = Vec::new();
-    for name in ["ops.log.1", "ops.log"] {
-        match std::fs::read_to_string(state_dir.join(name)) {
-            Ok(text) => all.extend(text.lines().map(str::to_owned)),
+    for name in [format!("{stem}.1"), stem.to_owned()] {
+        match std::fs::read_to_string(state_dir.join(&name)) {
+            Ok(text) => all.extend(text.lines().filter(|l| filter(l)).map(str::to_owned)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return fail(&format!("{name}: {e}")),
         }

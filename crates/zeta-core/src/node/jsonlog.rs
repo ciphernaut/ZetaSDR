@@ -1,23 +1,25 @@
-//! The ops log: one JSON line per applied op, in `<state_dir>/ops.log`.
+//! Rotating JSON-lines files in the state directory: `ops.log` (one line per
+//! applied op) and `transcripts.log` (one line per transcript event).
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Size past which the log is rotated to `ops.log.1`.
+/// Size past which a log is rotated to `<name>.1`.
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-/// An append-only JSON-lines file; at most two files (`ops.log`, `ops.log.1`) exist.
-pub(super) struct OpsLog {
+/// An append-only JSON-lines file; at most two files (`<name>`, `<name>.1`) exist.
+pub(super) struct JsonLog {
     path: PathBuf,
     max_bytes: u64,
     /// Held across the rotate and the write, so two appends never both rotate
-    /// (the second renaming the fresh file over `ops.log.1`, or failing).
+    /// (the second renaming the fresh file over `<name>.1`, or failing).
     lock: std::sync::Mutex<()>,
 }
 
-impl OpsLog {
-    pub(super) fn new(state_dir: &Path) -> Self {
-        Self::with_max_bytes(state_dir.join("ops.log"), MAX_BYTES)
+impl JsonLog {
+    /// A log at `path`, rotated past 8 MiB.
+    pub(super) fn new(path: PathBuf) -> Self {
+        Self::with_max_bytes(path, MAX_BYTES)
     }
 
     pub(super) fn with_max_bytes(path: PathBuf, max_bytes: u64) -> Self {
@@ -56,7 +58,7 @@ mod tests {
     #[test]
     fn append_writes_one_line_per_call() {
         let dir = tempfile::tempdir().unwrap();
-        let log = OpsLog::new(dir.path());
+        let log = JsonLog::new(dir.path().join("ops.log"));
         log.append(&json!({"n": 1})).unwrap();
         log.append(&json!({"n": 2})).unwrap();
         let text = std::fs::read_to_string(dir.path().join("ops.log")).unwrap();
@@ -71,7 +73,7 @@ mod tests {
         for round in 0..50 {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("ops.log");
-            let log = std::sync::Arc::new(OpsLog::with_max_bytes(path.clone(), 5000));
+            let log = std::sync::Arc::new(JsonLog::with_max_bytes(path.clone(), 5000));
             let threads: Vec<_> = (0..8)
                 .map(|t| {
                     let log = log.clone();
@@ -100,7 +102,7 @@ mod tests {
     fn rotates_when_over_max_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ops.log");
-        let log = OpsLog::with_max_bytes(path.clone(), 64);
+        let log = JsonLog::with_max_bytes(path.clone(), 64);
         // `{"n":"…"}` plus the newline is exactly 40 bytes.
         let line = |c: char| json!({"n": c.to_string().repeat(31)});
         for c in ['a', 'b', 'c'] {
@@ -112,5 +114,30 @@ mod tests {
         let cur = std::fs::read_to_string(&path).unwrap();
         assert_eq!(cur.lines().count(), 1);
         assert!(cur.contains('c'));
+    }
+
+    #[test]
+    fn two_logs_rotate_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = JsonLog::with_max_bytes(dir.path().join("ops.log"), 64);
+        let transcripts = JsonLog::with_max_bytes(dir.path().join("transcripts.log"), 64);
+        let line = |c: char| json!({"n": c.to_string().repeat(31)});
+        // Three 40-byte lines rotate `ops.log` once; one leaves `transcripts.log` alone.
+        for c in ['a', 'b', 'c'] {
+            ops.append(&line(c)).unwrap();
+        }
+        transcripts.append(&line('t')).unwrap();
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).ok();
+        assert_eq!(read("ops.log.1").unwrap().lines().count(), 2);
+        assert_eq!(read("ops.log").unwrap().lines().count(), 1);
+        assert_eq!(read("transcripts.log").unwrap().lines().count(), 1);
+        assert_eq!(read("transcripts.log.1"), None);
+        // And past its own size, `transcripts.log` rotates without touching `ops.log.1`.
+        for c in ['u', 'v'] {
+            transcripts.append(&line(c)).unwrap();
+        }
+        assert_eq!(read("transcripts.log.1").unwrap().lines().count(), 2);
+        assert_eq!(read("transcripts.log").unwrap().lines().count(), 1);
+        assert!(read("ops.log.1").unwrap().contains('a'));
     }
 }

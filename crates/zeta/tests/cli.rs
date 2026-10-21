@@ -1886,3 +1886,42 @@ fn ops_tail_prints_the_last_lines() {
             "ops tail reads the state directory: not supported with --node",
         ));
 }
+
+#[test]
+fn transcripts_tail_prints_the_last_lines_filtered_by_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let first = r#"{"t_ns":1,"job":"J1","input":"A1","source":"tone","center_hz":100000000,"bandwidth_hz":48000,"start_ns":10,"end_ns":20,"text":"one","language":"en","dropped":false,"error":null}"#;
+    let second = r#"{"t_ns":2,"job":"J2","input":"A2","source":"tone","center_hz":100000000,"bandwidth_hz":48000,"start_ns":30,"end_ns":40,"text":"two","language":"en","dropped":false,"error":null}"#;
+    std::fs::write(
+        state.join("transcripts.log"),
+        format!("{first}\n{second}\n"),
+    )
+    .unwrap();
+    let tail = |args: &[&str]| {
+        let out = zeta_bin()
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["transcripts", "tail"])
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    assert_eq!(tail(&["--lines", "1"]), format!("{second}\n"));
+    assert_eq!(tail(&["--job", "J1"]), format!("{first}\n"));
+    assert_eq!(tail(&["--job", "A1"]), format!("{first}\n"));
+    assert_eq!(tail(&[]), format!("{first}\n{second}\n"));
+
+    zeta_bin()
+        .args(["--node", "http://127.0.0.1:1", "transcripts", "tail"])
+        .assert()
+        .code(1)
+        .stderr(contains(
+            "transcripts tail reads the state directory: not supported with --node",
+        ));
+}

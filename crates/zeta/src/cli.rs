@@ -194,6 +194,9 @@ pub enum Command {
     /// The ops log in the state directory (local; not an operation)
     #[command(subcommand)]
     Ops(OpsCmd),
+    /// The transcript log in the state directory (local; not an operation)
+    #[command(subcommand)]
+    Transcripts(TranscriptsCmd),
     /// Run the node, resuming persisted jobs, until Ctrl-C
     Serve(ServeArgs),
     /// Let a local model call the node's operations to satisfy a request
@@ -210,6 +213,19 @@ pub enum OpsCmd {
         /// How many lines
         #[arg(long, value_name = "N", default_value_t = 50)]
         lines: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TranscriptsCmd {
+    /// Print the last transcript lines of `transcribe` jobs, one JSON line each, oldest first
+    Tail {
+        /// How many lines
+        #[arg(long, value_name = "N", default_value_t = 50)]
+        lines: usize,
+        /// Only lines whose `job` or `input` is this job id
+        #[arg(long, value_name = "ID")]
+        job: Option<String>,
     },
 }
 
@@ -708,7 +724,8 @@ impl Command {
             | Command::Serve(_)
             | Command::Ask(_)
             | Command::Soapy(_)
-            | Command::Ops(_) => {
+            | Command::Ops(_)
+            | Command::Transcripts(_) => {
                 return Ok(None);
             }
         }))

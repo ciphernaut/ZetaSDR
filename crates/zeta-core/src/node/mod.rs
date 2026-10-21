@@ -1,8 +1,8 @@
 //! The node: owns ports, leases, rings and the stream bus, and runs graphs as
 //! persistent jobs that resume after restart.
 
+mod jsonlog;
 mod launch;
-mod opslog;
 mod persist;
 
 use std::cmp::Reverse;
@@ -149,6 +149,22 @@ struct BankSlot {
     bank: Option<Arc<dyn ChannelBank>>,
 }
 
+/// The node's two JSON-lines logs in the state directory.
+#[derive(Clone, Copy)]
+enum LogFile {
+    Ops,
+    Transcripts,
+}
+
+impl LogFile {
+    fn name(self) -> &'static str {
+        match self {
+            LogFile::Ops => "ops.log",
+            LogFile::Transcripts => "transcripts.log",
+        }
+    }
+}
+
 struct Inner {
     state_dir: PathBuf,
     jobs_dir: PathBuf,
@@ -168,10 +184,15 @@ struct Inner {
     classifiers: RwLock<ClassifierSet>,
     /// Failures to persist a job's natural end; memory and disk disagree for these.
     persist_errors: Mutex<Vec<String>>,
-    /// Every applied op, one JSON line each; see [`opslog`].
-    ops_log: opslog::OpsLog,
-    /// Whether a failed ops-log write is already in `persist_errors`.
-    ops_log_failed: std::sync::atomic::AtomicBool,
+    /// Every applied op, one JSON line each; see [`jsonlog`].
+    ops_log: jsonlog::JsonLog,
+    /// Every `transcript` event of a `transcribe` job, one JSON line each; see
+    /// [`Inner::tee_transcripts`].
+    transcripts_log: jsonlog::JsonLog,
+    /// Per [`LogFile`]: whether a failed write is already in `persist_errors`.
+    log_failed: [std::sync::atomic::AtomicBool; 2],
+    /// Running transcript tees (see [`Inner::tee_transcripts`]).
+    tees: Arc<std::sync::atomic::AtomicUsize>,
     /// Held across [`Inner::relaunch_elastic`], so two retunes never relaunch one
     /// elastic job at once.
     relaunching: tokio::sync::Mutex<()>,
@@ -180,6 +201,24 @@ struct Inner {
 }
 
 impl Inner {
+    /// Append `line` to the log `which`. A failure never fails anything; the
+    /// first per log is recorded in `persist_errors` as `<name>: <e>`, later
+    /// ones are dropped.
+    fn log_line(&self, which: LogFile, line: &serde_json::Value) {
+        let log = match which {
+            LogFile::Ops => &self.ops_log,
+            LogFile::Transcripts => &self.transcripts_log,
+        };
+        if let Err(e) = log.append(line)
+            && !self.log_failed[which as usize].swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.persist_errors
+                .lock()
+                .unwrap()
+                .push(format!("{}: {e}", which.name()));
+        }
+    }
+
     /// See [`Node::job_stop`].
     async fn stop(&self, id: &JobId) -> Result<(), NodeError> {
         self.stop_with(id, false).await
@@ -459,8 +498,10 @@ impl Node {
                 knowledge: RwLock::new(Vec::new()),
                 classifiers: RwLock::new(ClassifierSet::default()),
                 persist_errors: Mutex::new(Vec::new()),
-                ops_log: opslog::OpsLog::new(&cfg.state_dir),
-                ops_log_failed: std::sync::atomic::AtomicBool::new(false),
+                ops_log: jsonlog::JsonLog::new(cfg.state_dir.join("ops.log")),
+                transcripts_log: jsonlog::JsonLog::new(cfg.state_dir.join("transcripts.log")),
+                log_failed: Default::default(),
+                tees: Arc::default(),
                 relaunching: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
             }),
@@ -722,25 +763,8 @@ impl Node {
         {
             m.remove("result");
         }
-        self.log_op(&line);
+        self.inner.log_line(LogFile::Ops, &line);
         outcome
-    }
-
-    /// Append `line` to `ops.log`. A failure never fails the op; the first is
-    /// recorded in `persist_errors`, later ones are dropped.
-    fn log_op(&self, line: &serde_json::Value) {
-        if let Err(e) = self.inner.ops_log.append(line)
-            && !self
-                .inner
-                .ops_log_failed
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            self.inner
-                .persist_errors
-                .lock()
-                .unwrap()
-                .push(format!("ops.log: {e}"));
-        }
     }
 
     /// The `ops` event stream: kind `Event`, provenance source
@@ -1058,6 +1082,12 @@ impl Node {
     /// Natural job ends that could not be written to disk, one message each.
     pub fn persist_errors(&self) -> Vec<String> {
         self.inner.persist_errors.lock().unwrap().clone()
+    }
+
+    /// Transcript tees running (see `Inner::tee_transcripts`), for tests.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn debug_tee_count(&self) -> usize {
+        self.inner.tees.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Tune `source` to `t` unless a job holds it, under the source's gate the
