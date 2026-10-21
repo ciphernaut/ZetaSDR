@@ -35,6 +35,29 @@ fn json(out: &[u8]) -> Value {
     serde_json::from_slice(out).expect("stdout is JSON")
 }
 
+/// An unreadable job record and an unreadable source record are warned about, each as
+/// what it is.
+#[test]
+fn unreadable_records_are_warned_about_by_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    for sub in ["jobs", "sources"] {
+        std::fs::create_dir_all(state.join(sub)).unwrap();
+    }
+    std::fs::write(state.join("jobs").join("garbage.json"), "nope").unwrap();
+    std::fs::write(state.join("sources").join("tone.json"), "nope").unwrap();
+    zeta(dir.path(), &["source", "list"])
+        .assert()
+        .success()
+        .stderr(
+            contains("zeta: warning: unreadable job record garbage.json")
+                .and(contains(
+                    "zeta: warning: unreadable source record tone.json",
+                ))
+                .and(contains("job record tone.json").not()),
+        );
+}
+
 #[test]
 fn schema_prints_json_with_op_result_error() {
     let dir = tempfile::tempdir().unwrap();

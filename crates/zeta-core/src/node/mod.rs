@@ -436,6 +436,8 @@ fn gain_error(e: PortError) -> NodeError {
 pub struct Node {
     inner: Arc<Inner>,
     load_errors: Vec<String>,
+    /// How many of `load_errors` (the first) are job-record files.
+    job_load_errors: usize,
     /// The `ops` event stream: one frame per [`Node::apply`].
     ops_stream: StreamId,
 }
@@ -474,6 +476,7 @@ impl Node {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (mut records, mut load_errors) = load(&jobs_dir)?;
+        let job_load_errors = load_errors.len();
         let sources_dir = cfg.state_dir.join("sources");
         let (source_records, source_errors) = load_sources(&sources_dir);
         load_errors.extend(source_errors);
@@ -532,6 +535,7 @@ impl Node {
                 shutdown: CancellationToken::new(),
             }),
             load_errors,
+            job_load_errors,
             ops_stream,
         };
         for port in ports {
@@ -728,6 +732,13 @@ impl Node {
     /// pins `open` could not restore.
     pub fn load_errors(&self) -> &[String] {
         &self.load_errors
+    }
+
+    /// [`Node::load_errors`] split into the job-record files that could not be read
+    /// (by file name, or `<file>: format ...`) and the rest (source records, pins
+    /// and gains, each entry saying what it is about).
+    pub fn load_errors_by_origin(&self) -> (&[String], &[String]) {
+        self.load_errors.split_at(self.job_load_errors)
     }
 
     /// Attach a port and start feeding its blocks into that source's ring and

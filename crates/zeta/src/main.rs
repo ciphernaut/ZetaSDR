@@ -114,8 +114,12 @@ async fn main() -> ExitCode {
         Ok(n) => n,
         Err(e) => return fail(&e),
     };
-    for name in node.load_errors() {
+    let (jobs, others) = node.load_errors_by_origin();
+    for name in jobs {
         eprintln!("zeta: warning: unreadable job record {name}");
+    }
+    for entry in others {
+        eprintln!("zeta: warning: {entry}");
     }
     let code = match op {
         None => transport::serve(node, &serve_args, speech, secret.as_deref()).await,

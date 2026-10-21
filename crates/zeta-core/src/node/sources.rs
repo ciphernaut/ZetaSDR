@@ -55,7 +55,8 @@ pub struct GainSetting {
 /// Load every `<id>.json` record in `dir` (none when `dir` does not exist),
 /// deleting leftover `*.json.tmp` files from an interrupted write. A file that
 /// cannot be read or parsed, or whose format is newer than
-/// [`SOURCE_RECORD_FORMAT`], is skipped and reported by name.
+/// [`SOURCE_RECORD_FORMAT`], is skipped and reported by name (`unreadable source
+/// record <file>`, `source record <file>: format ...`).
 pub fn load_sources(dir: &Path) -> (HashMap<SourceId, SourceRecord>, Vec<String>) {
     let (mut records, mut errors) = (HashMap::new(), Vec::new());
     let entries = match std::fs::read_dir(dir) {
@@ -97,7 +98,7 @@ pub fn load_sources(dir: &Path) -> (HashMap<SourceId, SourceRecord>, Vec<String>
             .unwrap_or(u64::from(SOURCE_RECORD_FORMAT));
         if format > u64::from(SOURCE_RECORD_FORMAT) {
             errors.push(format!(
-                "{name}: format {format} newer than supported {SOURCE_RECORD_FORMAT}"
+                "source record {name}: format {format} newer than supported {SOURCE_RECORD_FORMAT}"
             ));
             continue;
         }
@@ -105,7 +106,7 @@ pub fn load_sources(dir: &Path) -> (HashMap<SourceId, SourceRecord>, Vec<String>
             Some(r) if !stem.is_empty() => {
                 records.insert(SourceId(stem.to_string()), r);
             }
-            _ => errors.push(name),
+            _ => errors.push(format!("unreadable source record {name}")),
         }
     }
     (records, errors)
