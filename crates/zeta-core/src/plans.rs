@@ -46,13 +46,14 @@ pub const UHF_CB_AU: ChannelPlan = ChannelPlan {
             step_hz: 25_000,
         },
     ],
+    // 5, 35, 11, 22, 23 are ACMA designations; 40 "road" is the highway convention.
     notes: &[
         (5, "emergency"),
         (11, "calling"),
         (22, "data, no voice"),
         (23, "data, no voice"),
         (35, "emergency"),
-        (40, "road"),
+        (40, "road (convention)"),
     ],
 };
 

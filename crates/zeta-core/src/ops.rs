@@ -1096,7 +1096,7 @@ pub struct PlanChannel {
 fn nullable_plan_note(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": ["string", "null"],
-        "description": "What the channel is reserved for (`emergency`, `calling`, `data, no voice`, `road`); `null` for an ordinary channel."
+        "description": "What the channel is reserved for (`emergency`, `calling`, `data, no voice`, `road (convention)`); `null` for an ordinary channel."
     })
 }
 

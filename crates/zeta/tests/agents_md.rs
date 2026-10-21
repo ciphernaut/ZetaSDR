@@ -77,3 +77,21 @@ fn guide_covers_running_the_node_stages_and_descriptions() {
         assert!(md.contains(needle), "guide lacks {needle:?}");
     }
 }
+
+#[test]
+fn channel_plans_cli_line_is_the_real_command() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    let section = &md[md.find("## channel_plans\n").expect("section")..];
+    let line = section
+        .lines()
+        .find(|l| l.starts_with("CLI: "))
+        .expect("CLI line");
+    assert!(line.starts_with("CLI: `zeta plans"), "{line}");
+}

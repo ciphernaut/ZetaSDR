@@ -350,6 +350,9 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     if op == "source_set_gain" {
         return "zeta source gain --source <id> --db 40".into();
     }
+    if op == "channel_plans" {
+        return "zeta plans [--plan ID]".into();
+    }
     let mut line = String::from("zeta ");
     line.push_str(&match op.split_once('_') {
         Some((g, v)) => format!("{g} {v}"),
