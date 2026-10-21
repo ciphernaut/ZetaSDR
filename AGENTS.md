@@ -223,6 +223,16 @@ CLI: `zeta knowledge lookup --region AU --center-hz 144800000 --bandwidth-hz 125
 
 Two providers answer: the built-in seed signatures, and `catalogue`, the 594-signal iNTERCEPT catalogue (Apache-2.0; one signature per frequency range of each signal overlapping the band, `bandwidth_hz` its widest bandwidth, `modulation` the first it lists). A signature's `decoder` names the job kind that proves it: start that kind on the band to decode it; `classify` attempts only the APRS, POCSAG, ACARS and RDS ones as decode-to-identify. Neither has allocations, so an empty `allocations` list means no provider data, not nothing allocated.
 
+### channel_plans
+
+The channel plans the node knows, each with its channels expanded and sorted by frequency.
+
+JSON: `{"op":"channel_plans"}`
+
+CLI: `zeta channel plans`
+
+`channel_plans` lists the channel plans the node knows (`uhf_cb_au`: Australian UHF CB, 80 channels, two rasters 12.5 kHz apart). Name a channel by its number to the user ("ch20") and start jobs at its `center_hz` with the plan's `bandwidth_hz`.
+
 ### classify
 
 Run every registered classifier over the selection's band and span of the source ring (no upstream features).

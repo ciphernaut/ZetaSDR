@@ -10,6 +10,7 @@ pub mod knowledge;
 pub mod lease;
 pub mod node;
 pub mod ops;
+pub mod plans;
 pub mod port;
 pub mod ring;
 pub mod stage;

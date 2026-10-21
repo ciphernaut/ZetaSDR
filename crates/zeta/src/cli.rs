@@ -178,6 +178,12 @@ pub enum Command {
     /// Band plans and known signal signatures
     #[command(subcommand)]
     Knowledge(KnowledgeCmd),
+    /// The channel plans the node knows (e.g. uhf_cb_au) with their channels
+    Plans {
+        /// Only this plan
+        #[arg(long, value_name = "ID")]
+        plan: Option<String>,
+    },
     /// Run every classifier over a selection of a source ring
     Classify(SelectionArgs),
     /// JSON schemas of operations, results and errors
@@ -669,6 +675,14 @@ impl Command {
         )
     }
 
+    /// `plans --plan ID`: the plan the printed result is narrowed to.
+    pub fn plan_filter(&self) -> Option<String> {
+        match self {
+            Command::Plans { plan } => plan.clone(),
+            _ => None,
+        }
+    }
+
     /// `--then-tail` of a `job start`, if given.
     pub fn then_tail(&self) -> Option<ThenTail> {
         match self {
@@ -769,6 +783,17 @@ impl Command {
                 center_hz: Hz(center_hz),
                 bandwidth_hz: Hz(bandwidth_hz),
             },
+            Command::Plans { plan } => {
+                if let Some(id) = plan
+                    && !zeta_core::plans::PLANS.iter().any(|p| p.id == id)
+                {
+                    let known: Vec<&str> = zeta_core::plans::PLANS.iter().map(|p| p.id).collect();
+                    return Err(OpError::Other {
+                        message: format!("unknown plan {id} (known: {})", known.join(", ")),
+                    });
+                }
+                Op::ChannelPlans {}
+            }
             Command::Classify(s) => Op::Classify {
                 selection: s.into(),
             },
@@ -782,6 +807,13 @@ impl Command {
                 return Ok(None);
             }
         }))
+    }
+}
+
+/// Keep only plan `id` in a `channel_plans` result.
+pub fn narrow_plans(result: &mut zeta_core::ops::OpResult, id: Option<&str>) {
+    if let (Some(id), zeta_core::ops::OpResult::ChannelPlans { plans }) = (id, result) {
+        plans.retain(|p| p.id == id);
     }
 }
 

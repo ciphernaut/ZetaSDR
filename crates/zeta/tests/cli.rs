@@ -95,6 +95,39 @@ fn schema_prints_json_with_op_result_error() {
 }
 
 #[test]
+fn plans_prints_the_table_and_refuses_an_unknown_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(dir.path(), &["plans"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "channel_plans");
+    let plans = v["value"]["plans"].as_array().expect("plans array");
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0]["id"], "uhf_cb_au");
+    assert_eq!(plans[0]["channels"].as_array().unwrap().len(), 80);
+    let out = zeta(dir.path(), &["plans", "--plan", "uhf_cb_au"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(json(&out)["value"]["plans"][0]["id"], "uhf_cb_au");
+    let out = zeta(dir.path(), &["plans", "--plan", "nope"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other");
+    assert_eq!(v["message"], "unknown plan nope (known: uhf_cb_au)");
+}
+
+#[test]
 fn source_list_shows_file_source() {
     let dir = tempfile::tempdir().unwrap();
     let out = zeta(dir.path(), &["source", "list"])

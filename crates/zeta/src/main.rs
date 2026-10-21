@@ -82,6 +82,7 @@ async fn main() -> ExitCode {
     );
     let then_tail = cli.command.then_tail();
     let keep = cli.command.keep();
+    let plan = cli.command.plan_filter();
     let op = match cli.command.into_op() {
         Ok(op) => op,
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
@@ -123,7 +124,7 @@ async fn main() -> ExitCode {
     }
     let code = match op {
         None => transport::serve(node, &serve_args, speech, secret.as_deref()).await,
-        Some(op) => one_shot(&node, op, then_tail, keep).await,
+        Some(op) => one_shot(&node, op, then_tail, keep, plan.as_deref()).await,
     };
     // Remote nodes' `passthrough` jobs end with this process, not with the runtime.
     remotes.close().await;
@@ -136,6 +137,7 @@ async fn one_shot(
     op: Op,
     then_tail: Option<cli::ThenTail>,
     keep: bool,
+    plan: Option<&str>,
 ) -> ExitCode {
     let starts_job = matches!(op, Op::JobStart { .. } | Op::JobAttach { .. });
     if let Op::IqRead { selection } | Op::Classify { selection } = &op {
@@ -146,7 +148,8 @@ async fn one_shot(
             let t = then_tail.expect("checked");
             then_tail_job(node, id, t, keep).await
         }
-        Ok(r) => {
+        Ok(mut r) => {
+            cli::narrow_plans(&mut r, plan);
             if starts_job {
                 tokio::time::sleep(JOB_START_GRACE).await;
             }

@@ -179,6 +179,9 @@ pub enum Op {
         center_hz: Hz,
         bandwidth_hz: Hz,
     },
+    /// The channel plans the node knows, each with its channels expanded
+    /// and sorted by frequency.
+    ChannelPlans {},
     /// Run every registered classifier over the selection's band and span of
     /// the source ring (no upstream features).
     Classify {
@@ -1060,6 +1063,69 @@ impl FrameSummary {
     }
 }
 
+/// One channel plan as `channel_plans` reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PlanInfo {
+    pub id: String,
+    pub name: String,
+    pub region: String,
+    /// The width of one channel.
+    pub bandwidth_hz: Hz,
+    /// The smallest spacing between two channel centres.
+    pub adjacent_hz: Hz,
+    /// Sorted by frequency.
+    pub channels: Vec<PlanChannel>,
+}
+
+/// One channel of a plan.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PlanChannel {
+    pub number: u32,
+    pub center_hz: Hz,
+    /// What the channel is reserved for; `null` for an ordinary channel.
+    #[schemars(required, schema_with = "nullable_plan_note")]
+    #[serde(deserialize_with = "nullable_string_value")]
+    pub note: Option<String>,
+}
+
+/// Schema of `PlanChannel.note`: `["string","null"]`.
+fn nullable_plan_note(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "description": "What the channel is reserved for (`emergency`, `calling`, `data, no voice`, `road`); `null` for an ordinary channel."
+    })
+}
+
+impl From<&crate::plans::ChannelPlan> for PlanInfo {
+    fn from(p: &crate::plans::ChannelPlan) -> Self {
+        let note = |n| {
+            p.notes
+                .iter()
+                .find(|(c, _)| *c == n)
+                .map(|(_, t)| (*t).to_string())
+        };
+        PlanInfo {
+            id: p.id.into(),
+            name: p.name.into(),
+            region: p.region.into(),
+            bandwidth_hz: Hz(p.bandwidth_hz),
+            adjacent_hz: Hz(crate::plans::adjacent_hz(p)),
+            channels: crate::plans::channels(p)
+                .into_iter()
+                .map(|(number, hz)| PlanChannel {
+                    number,
+                    center_hz: Hz(hz),
+                    note: note(number),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "result",
@@ -1095,6 +1161,9 @@ pub enum OpResult {
         allocations: Vec<Allocation>,
         signatures: Vec<Signature>,
     },
+    ChannelPlans {
+        plans: Vec<PlanInfo>,
+    },
     Labels(Vec<Label>),
     /// A source's gain after `source_set_gain`.
     Gain(GainInfo),
@@ -1122,6 +1191,7 @@ impl Op {
             Op::GraphGet { .. } => "graph_get",
             Op::GraphPut { .. } => "graph_put",
             Op::KnowledgeLookup { .. } => "knowledge_lookup",
+            Op::ChannelPlans {} => "channel_plans",
             Op::Classify { .. } => "classify",
             Op::Schema {} => "schema",
         }
@@ -1140,6 +1210,7 @@ impl Op {
                 | Op::JobContext { .. }
                 | Op::GraphGet { .. }
                 | Op::KnowledgeLookup { .. }
+                | Op::ChannelPlans {}
         )
     }
 
@@ -1184,6 +1255,7 @@ impl OpResult {
             OpResult::Frames { .. } => "frames",
             OpResult::Graph(_) => "graph",
             OpResult::Knowledge { .. } => "knowledge",
+            OpResult::ChannelPlans { .. } => "channel_plans",
             OpResult::Labels(_) => "labels",
             OpResult::Gain(_) => "gain",
             OpResult::Ok => "ok",
@@ -1913,6 +1985,9 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 signatures,
             })
         }
+        Op::ChannelPlans {} => Ok(OpResult::ChannelPlans {
+            plans: crate::plans::PLANS.iter().map(PlanInfo::from).collect(),
+        }),
         Op::Classify { selection } => classify(node, selection).await,
         Op::Schema {} => Ok(OpResult::Schema(node.schema())),
     }

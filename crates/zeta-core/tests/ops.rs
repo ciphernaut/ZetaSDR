@@ -477,7 +477,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 18, "one schema per Op variant");
+    assert_eq!(vs.len(), 19, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -718,6 +718,46 @@ async fn knowledge_lookup_op_returns_allocations_from_provider() {
         }
         other => panic!("expected Knowledge, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn channel_plans_lists_uhf_cb_au() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let Ok(OpResult::ChannelPlans { plans }) = node.apply(Op::ChannelPlans {}).await else {
+        panic!("expected ChannelPlans");
+    };
+    assert_eq!(plans.len(), 1);
+    let p = &plans[0];
+    assert_eq!((p.id.as_str(), p.region.as_str()), ("uhf_cb_au", "au"));
+    assert_eq!((p.bandwidth_hz, p.adjacent_hz), (Hz(12_500), Hz(12_500)));
+    assert_eq!(p.channels.len(), 80);
+    let ch = |n| p.channels.iter().find(|c| c.number == n).unwrap();
+    assert_eq!(ch(22).note.as_deref(), Some("data, no voice"));
+    assert_eq!(ch(20).note, None);
+    assert_eq!(ch(20).center_hz, Hz(476_900_000));
+    assert!(
+        p.channels
+            .windows(2)
+            .all(|w| w[0].center_hz.0 < w[1].center_hz.0)
+    );
+    // Wire shape: `note` is required and nullable.
+    let v = serde_json::to_value(&plans).unwrap();
+    assert!(v[0]["channels"][0].get("note").is_some_and(Value::is_null));
+    let s = schema();
+    let op = variants(&s["op"])
+        .iter()
+        .find(|v| v["properties"]["op"]["const"] == "channel_plans")
+        .expect("channel_plans variant");
+    assert_eq!(op["properties"].as_object().unwrap().len(), 1);
+    let note = &s["result"]["$defs"]["PlanChannel"]["properties"]["note"];
+    assert_eq!(note["type"], serde_json::json!(["string", "null"]));
+    let req = s["result"]["$defs"]["PlanChannel"]["required"]
+        .as_array()
+        .unwrap();
+    assert!(req.contains(&"note".into()));
 }
 
 #[tokio::test]

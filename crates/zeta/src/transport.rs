@@ -94,13 +94,17 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     if let Command::Ask(args) = cli.command {
         return ask::run(args, Some(client), PathBuf::new(), &[], &[], None, None).await;
     }
+    let plan = cli.command.plan_filter();
     let op = match cli.command.into_op() {
         Ok(Some(op)) => op,
         Ok(None) => return usage("this command cannot run on a remote node"),
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
     };
     match client.apply(&op).await {
-        Ok(Ok(r)) => print(serde_json::to_string_pretty(&r), 0),
+        Ok(Ok(mut r)) => {
+            crate::cli::narrow_plans(&mut r, plan.as_deref());
+            print(serde_json::to_string_pretty(&r), 0)
+        }
         Ok(Err(e)) => print(serde_json::to_string_pretty(&e), 2),
         Err(e) => usage(&e.to_string()),
     }

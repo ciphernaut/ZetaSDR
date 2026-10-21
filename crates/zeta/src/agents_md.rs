@@ -72,6 +72,9 @@ fn note(op: &str) -> Option<&'static str> {
         "knowledge_lookup" => Some(
             "Two providers answer: the built-in seed signatures, and `catalogue`, the 594-signal iNTERCEPT catalogue (Apache-2.0; one signature per frequency range of each signal overlapping the band, `bandwidth_hz` its widest bandwidth, `modulation` the first it lists). A signature's `decoder` names the job kind that proves it: start that kind on the band to decode it; `classify` attempts only the APRS, POCSAG, ACARS and RDS ones as decode-to-identify. Neither has allocations, so an empty `allocations` list means no provider data, not nothing allocated.",
         ),
+        "channel_plans" => Some(
+            "`channel_plans` lists the channel plans the node knows (`uhf_cb_au`: Australian UHF CB, 80 channels, two rasters 12.5 kHz apart). Name a channel by its number to the user (\"ch20\") and start jobs at its `center_hz` with the plan's `bandwidth_hz`.",
+        ),
         "classify" => Some(
             "Layer 1 labels the measured band (`wfm`, `fm`, `am`, `ssb`, `fsk`, `carrier`, `noise` or `unknown`; an `ssb` label's evidence gives the dial frequency). Layer 2 first tries decode-to-identify: `APRS`, `POCSAG` and `ACARS` on a selection narrower than 150000 Hz (100000 Hz when the whole block is measured), `RDS` on a wider one, and labels a protocol only when its CRC/BCH-clean decode passes; ADS-B is never attempted by `classify` (use `adsb_decode`). Layer 2 also adds up to three signal names from the catalogue (evidence `catalogue <id>: ...`), scored 0.4 for the measured centre lying in one of the signal's frequency ranges (required), 0.3 for a matching bandwidth (required for signals wider than 50 kHz) and 0.3 for a matching layer-1 modulation. Layer 3 is an empty slot.",
         ),
