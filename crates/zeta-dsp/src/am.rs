@@ -276,7 +276,7 @@ impl Stage for AmDemodStage {
                     published.push(Frame::new(
                         events.clone(),
                         prov.clone(),
-                        Payload::Event(squelch_event(sq, open)),
+                        Payload::Event(squelch_event(sq, open, None, false)),
                     ));
                 }
                 if !sq.is_open() {

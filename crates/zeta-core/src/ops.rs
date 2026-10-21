@@ -420,8 +420,10 @@ impl JobKind {
     /// [`JobKind::expand`] again for a resumed job whose `stored` graph was expanded for
     /// another source rate: its `deviation_hz` and `sideband` are read back from the
     /// stored graph's node params (absent: the kind's default), and a demodulator's
-    /// `squelch_db` and `squelch` (as `graph_put` may have set them) are carried to the
-    /// node of the same stage kind (absent: the defaults `expand` writes).
+    /// `squelch_db` and `squelch`, its adjacent-channel guard's `guard_hz`, `guard_db` and
+    /// `channel_hz`, and a channel's `wide_hz` (as `graph_put` may have set them) are
+    /// carried to the node of the same stage kind when `expand` writes the key (absent
+    /// from `stored`: the defaults `expand` writes).
     pub fn reexpand(
         &self,
         source: &SourceId,
@@ -445,7 +447,7 @@ impl JobKind {
             let Some(old) = stored.nodes.iter().find(|o| o.kind == n.kind) else {
                 continue;
             };
-            for key in ["squelch_db", "squelch"] {
+            for key in CARRIED_PARAMS {
                 if let (Some(v), Some(p)) = (old.params.get(key), n.params.as_object_mut())
                     && p.contains_key(key)
                 {
@@ -581,27 +583,40 @@ impl JobKind {
             },
             JobKind::FmDemod => {
                 let (channel, demod) = (NodeId::new(), NodeId::new());
+                let mut channel_params = serde_json::json!({
+                    "center_hz": tuning.center_hz.0,
+                    "bandwidth_hz": bw,
+                    "out_rate_hz": out,
+                });
+                let mut demod_params = serde_json::json!({
+                    "deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0),
+                    "audio_rate_hz": AUDIO_RATE_HZ,
+                    "squelch_db": null,
+                    "squelch": true,
+                });
+                // On a plan channel, with room for both neighbours at the channel rate: the
+                // adjacent-channel guard (the channel cut three raster steps wide).
+                if let Some((plan, _)) = crate::plans::channel_at(tuning.center_hz.0) {
+                    let g = crate::plans::adjacent_hz(plan);
+                    if bw + 2 * g <= out {
+                        channel_params["wide_hz"] = (bw + 2 * g).into();
+                        demod_params["guard_hz"] = g.into();
+                        demod_params["guard_db"] = crate::plans::GUARD_DB_DEFAULT.into();
+                        demod_params["channel_hz"] = bw.into();
+                    }
+                }
                 Graph {
                     id: GraphId::new(),
                     nodes: vec![
                         GraphNode {
                             id: channel.clone(),
                             kind: "channel".into(),
-                            params: serde_json::json!({
-                                "center_hz": tuning.center_hz.0,
-                                "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": out,
-                            }),
+                            params: channel_params,
                         },
                         GraphNode {
                             id: demod.clone(),
                             kind: "nbfm_demod".into(),
-                            params: serde_json::json!({
-                                "deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0),
-                                "audio_rate_hz": AUDIO_RATE_HZ,
-                                "squelch_db": null,
-                                "squelch": true,
-                            }),
+                            params: demod_params,
                         },
                     ],
                     edges: vec![Edge {
@@ -952,6 +967,17 @@ pub fn fill_squelch_params(graph: &mut Graph) -> bool {
     }
     filled
 }
+
+/// The params [`JobKind::reexpand`] carries from a stored graph to the node of the same
+/// stage kind: what an operator may set with `graph_put` and still have the node's graph.
+const CARRIED_PARAMS: [&str; 6] = [
+    "squelch_db",
+    "squelch",
+    "guard_hz",
+    "guard_db",
+    "channel_hz",
+    "wide_hz",
+];
 
 /// The narrowest exact divisor of `source_rate_hz` that is at least
 /// [`CHANNEL_RATE_MIN_HZ`] and at least `bandwidth_hz`; the source rate itself

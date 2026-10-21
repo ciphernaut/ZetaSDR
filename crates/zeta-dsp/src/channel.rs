@@ -208,6 +208,12 @@ pub struct ChannelParams {
     pub center_hz: u64,
     pub bandwidth_hz: u64,
     pub out_rate_hz: u64,
+    /// Cut this wide instead (an adjacent-channel guard's three raster steps, the
+    /// demodulator filtering the channel itself) when `center_hz ± wide_hz/2` lies inside
+    /// the block and `wide_hz <= out_rate_hz`; otherwise `bandwidth_hz`, noted as
+    /// `"wide": "off: <why>"` in the job's `channel` context.
+    #[serde(default)]
+    pub wide_hz: Option<u64>,
 }
 
 /// Extracts one channel from an IQ stream: shift, low-pass, decimate.
@@ -252,7 +258,10 @@ impl Stage for ChannelStage {
     /// not divide, as in graphs written for the source rate) it filters the
     /// job's IQ input directly. Either way it notes the path in the job's
     /// context: `{"channel": {"path": "bank", "bin_hz": N}}`, or
-    /// `{"channel": {"path": "direct", "reason": R}}` saying why not the bank.
+    /// `{"channel": {"path": "direct", "reason": R}}` saying why not the bank. A `wide_hz`
+    /// is judged first (on the bank's band, or on each block of the direct path) and the
+    /// bank's width rule on the band actually cut; a `wide_hz` not cut adds `"wide": "off:
+    /// <why>"` to that object.
     async fn run(
         &self,
         params: serde_json::Value,
@@ -272,17 +281,23 @@ impl Stage for ChannelStage {
             p,
             out,
             state: ChannelState::new(),
+            path: serde_json::Value::Null,
+            within: None,
+            wide_off: None,
+            ctx: ctx.clone(),
         };
         // Checked before subscribing, so a declined bank keeps no receiver.
         let bin = match &ctx.bank {
             None => Err("no bank".to_string()),
             Some(bank) => {
-                let (bin_hz, p) = (bank.bin_hz(), &chan.p);
-                if p.bandwidth_hz > bin_hz {
-                    Err(format!(
-                        "band {} Hz wider than a bin ({bin_hz} Hz)",
-                        p.bandwidth_hz
-                    ))
+                let band = bank.band();
+                let (bin_hz, cut) = (
+                    bank.bin_hz(),
+                    chan.wide_cut(band.bandwidth_hz.0, band.center_hz.0).0,
+                );
+                let p = &chan.p;
+                if cut > bin_hz {
+                    Err(format!("band {cut} Hz wider than a bin ({bin_hz} Hz)"))
                 } else if p.out_rate_hz == 0 || !(2 * bin_hz).is_multiple_of(p.out_rate_hz) {
                     Err(format!(
                         "bin rate {} Hz not a multiple of out_rate_hz {}",
@@ -290,18 +305,18 @@ impl Stage for ChannelStage {
                         p.out_rate_hz
                     ))
                 } else {
-                    bank.subscribe(p.center_hz, p.bandwidth_hz)
-                        .map(|(bin, _, _)| (bank, bin))
+                    bank.subscribe(p.center_hz, cut)
+                        .map(|(bin, _, _)| (bank, bin, band))
                         .map_err(|e| e.to_string())
                 }
             }
         };
         let kind = self.spec().kind;
         match bin {
-            Ok((bank, bin)) => {
-                ctx.note(serde_json::json!({
-                    "channel": {"path": "bank", "bin_hz": bank.bin_hz()},
-                }));
+            Ok((bank, bin, band)) => {
+                // The wide band is judged on the capture's band, not on the bin's block.
+                chan.within = Some((band.bandwidth_hz.0, band.center_hz.0));
+                chan.set_path(serde_json::json!({"path": "bank", "bin_hz": bank.bin_hz()}));
                 // The job's provenance, as registered for the output stream.
                 let base = bus
                     .list()
@@ -316,9 +331,7 @@ impl Stage for ChannelStage {
                     });
                 return run_bin(kind, chan, base, bank.band(), bin, inputs, bus, cancel).await;
             }
-            Err(reason) => ctx.note(serde_json::json!({
-                "channel": {"path": "direct", "reason": reason},
-            })),
+            Err(reason) => chan.set_path(serde_json::json!({"path": "direct", "reason": reason})),
         }
         run_map(kind, inputs, bus, cancel, move |input| {
             let frame = match input {
@@ -346,14 +359,72 @@ struct Channel {
     channel: ChannelId,
     out: StreamId,
     state: ChannelState,
+    /// The path fields of the job's `channel` context, as last noted.
+    path: serde_json::Value,
+    /// `(rate, center)` of the band `wide_hz` is judged on; `None`: each block's own.
+    within: Option<(u64, u64)>,
+    /// Why `wide_hz` is not cut, as last noted.
+    wide_off: Option<String>,
+    ctx: StageContext,
 }
 
 impl Channel {
+    /// Note `path` as the job's `channel` context, with the wide band's state.
+    fn set_path(&mut self, path: serde_json::Value) {
+        self.path = path;
+        self.note();
+    }
+
+    fn note(&self) {
+        let mut v = self.path.clone();
+        if let (Some(why), Some(o)) = (&self.wide_off, v.as_object_mut()) {
+            o.insert("wide".into(), format!("off: {why}").into());
+        }
+        self.ctx.note(serde_json::json!({"channel": v}));
+    }
+
+    /// The band to cut from a block at `rate` centred on `block_center` (or from
+    /// [`Channel::within`]): `wide_hz` when it fits, else `bandwidth_hz`, with why not.
+    fn wide_cut(&self, rate: u64, block_center: u64) -> (u64, Option<String>) {
+        let p = &self.p;
+        let Some(wide) = p.wide_hz else {
+            return (p.bandwidth_hz, None);
+        };
+        let (rate, block_center) = self.within.unwrap_or((rate, block_center));
+        let off = if wide > p.out_rate_hz {
+            Some(format!("wider than out_rate_hz {}", p.out_rate_hz))
+        } else {
+            check_in_band(rate, block_center, p.center_hz, wide)
+                .err()
+                .map(|e| match e {
+                    ChannelError::OutOfBand { min_hz, max_hz, .. } => {
+                        format!("leaves the block {min_hz}..={max_hz}")
+                    }
+                    e => e.to_string(),
+                })
+        };
+        match off {
+            None => (wide, None),
+            off => (p.bandwidth_hz, off),
+        }
+    }
+
+    /// [`Channel::wide_cut`] for a block, noting a change in why `wide_hz` is not cut.
+    fn cut(&mut self, rate: u64, block_center: u64) -> u64 {
+        let (cut, off) = self.wide_cut(rate, block_center);
+        if off != self.wide_off {
+            self.wide_off = off;
+            self.note();
+        }
+        cut
+    }
+
     /// Filter one input block (the source's, or a bank bin's) into an output
     /// frame with `prov`'s source and job; `None` when it yields no sample.
     fn process(&mut self, block: &IqBlock, prov: &Provenance) -> Result<Option<Frame>, StageError> {
-        let p = &self.p;
         let rate = block.sample_rate_hz.0;
+        let cut = self.cut(rate, block.center_hz.0);
+        let p = &self.p;
         check_in_band(rate, block.center_hz.0, p.center_hz, p.bandwidth_hz)
             .map_err(|e| StageError::Failed(e.to_string()))?;
         // Time of the first output sample: the decimation phase carried in.
@@ -363,7 +434,7 @@ impl Channel {
             &block.samples,
             rate,
             p.center_hz as i64 - block.center_hz.0 as i64,
-            p.bandwidth_hz,
+            cut,
             p.out_rate_hz,
         )
         .map_err(|e| StageError::Failed(e.to_string()))?;
@@ -703,5 +774,108 @@ mod tests {
         }
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
+    }
+
+    /// Run the stage with `params` over `frames`, noting into a list: its output samples
+    /// and the notes.
+    async fn run_noted(
+        params: serde_json::Value,
+        frames: Vec<Frame>,
+    ) -> (Vec<Complex<f32>>, Vec<serde_json::Value>) {
+        let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let n2 = notes.clone();
+        let ctx = StageContext::new(SourceId("s".into()))
+            .with_note(Arc::new(move |v| n2.lock().unwrap().push(v)));
+        let bus = Arc::new(StreamBus::new(1_024));
+        let out = bus.register(StreamKind::Iq, prov());
+        let mut rx_out = bus.subscribe(&out).unwrap();
+        let (tx, rx_in) = broadcast::channel(1_024);
+        for f in frames {
+            tx.send(f).unwrap();
+        }
+        drop(tx);
+        let r = ChannelStage::new()
+            .run(
+                params,
+                vec![rx_in],
+                vec![out],
+                bus,
+                CancellationToken::new(),
+                ctx,
+            )
+            .await;
+        assert!(matches!(r, Ok(())), "{r:?}");
+        let mut samples = Vec::new();
+        while let Ok(f) = rx_out.try_recv() {
+            let Payload::Iq(b) = &f.payload else {
+                panic!("expected an iq payload")
+            };
+            samples.extend_from_slice(&b.samples);
+        }
+        let notes = notes.lock().unwrap().clone();
+        (samples, notes)
+    }
+
+    fn frame_at(samples: Vec<Complex<f32>>, rate_hz: u64, center_hz: u64) -> Frame {
+        Frame::new(
+            StreamId::new(),
+            prov(),
+            Payload::Iq(IqBlock {
+                t0: Timestamp(1_000_000_000),
+                sample_rate_hz: Hz(rate_hz),
+                center_hz: Hz(center_hz),
+                samples: samples.into(),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn wide_band_off_the_block_falls_back_and_says_so() {
+        // ch1 widened reaches 476 406 250 Hz, below the block's 476 406 750 Hz.
+        const WIDE_RATE: u64 = 1_024_000;
+        let iq = crate::util::nco(10_240, -493_750.0 + 2_000.0, WIDE_RATE as f64);
+        let p = serde_json::json!({
+            "center_hz": 476_425_000, "bandwidth_hz": 12_500, "out_rate_hz": 51_200,
+        });
+        let mut wide = p.clone();
+        wide["wide_hz"] = 37_500.into();
+        let frames = || vec![frame_at(iq.clone(), WIDE_RATE, 476_918_750)];
+        let (plain, _) = run_noted(p, frames()).await;
+        let (got, notes) = run_noted(wide, frames()).await;
+        assert!(!plain.is_empty());
+        assert_eq!(got, plain);
+        assert_eq!(
+            notes.last().unwrap(),
+            &serde_json::json!({"channel": {
+                "path": "direct",
+                "reason": "no bank",
+                "wide": "off: leaves the block 476406750..=477430750",
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn wide_hz_passes_the_neighbour() {
+        // A unit tone 12.5 kHz off the channel centre, at a 256 000 Hz bin rate.
+        const BIN_RATE: u64 = 256_000;
+        let iq = crate::util::nco(25_600, 12_500.0, BIN_RATE as f64);
+        let p = serde_json::json!({
+            "center_hz": BLOCK_CENTER, "bandwidth_hz": 12_500, "out_rate_hz": 51_200,
+        });
+        let mut wide = p.clone();
+        wide["wide_hz"] = 37_500.into();
+        let power_db = |x: &[Complex<f32>]| {
+            let w = &x[100..];
+            10.0 * (w.iter().map(|v| v.norm_sqr() as f64).sum::<f64>() / w.len() as f64).log10()
+        };
+        let frames = || vec![frame_at(iq.clone(), BIN_RATE, BLOCK_CENTER)];
+        let (narrow, _) = run_noted(p, frames()).await;
+        let (got, notes) = run_noted(wide, frames()).await;
+        assert!(power_db(&got).abs() <= 1.0, "{} dB", power_db(&got));
+        assert!(power_db(&narrow) <= -10.0, "{} dB", power_db(&narrow));
+        assert_eq!(
+            notes.last().unwrap(),
+            &serde_json::json!({"channel": {"path": "direct", "reason": "no bank"}})
+        );
     }
 }

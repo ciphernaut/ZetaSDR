@@ -419,3 +419,124 @@ async fn resume_fills_in_the_squelch_params_of_a_pre_squelch_record() {
     .unwrap();
     assert_eq!(nbfm(&on_disk(dir.path(), aprs).graph)["squelch"], false);
 }
+
+/// ch20 of the AU UHF CB plan, where the [`cb_port`] capture is centred.
+const CB_CENTER_HZ: u64 = 476_900_000;
+/// ch59, the CB channel the guard tests listen on.
+const CH59_HZ: u64 = 476_887_500;
+
+/// A looping, real-time file source `speech` centred on ch20 at `rate_hz`: an FM tone on ch20.
+fn cb_port(dir: &Path, rate_hz: u32) -> (Arc<FileSource>, Arc<dyn Port>) {
+    let audio = zeta_dsp::fixtures::tone(48_000, 48_000, 1_000.0, 0.5);
+    let iq = zeta_dsp::fixtures::nbfm_modulate(&audio, 48_000, rate_hz, 5_000.0, 0.0);
+    let meta =
+        zeta_dsp::fixtures::write_fixture(dir, &format!("cb{rate_hz}"), &iq, rate_hz, CB_CENTER_HZ);
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: None,
+    };
+    let src = Arc::new(FileSource::open(SourceId("speech".into()), &meta, opts).unwrap());
+    let port: Arc<dyn Port> = src.clone();
+    (src, port)
+}
+
+/// A CB `fm_demod` recorded before the adjacent-channel guard gains it when resumed at
+/// another rate; a `graph_put` that turns it off (`guard_hz: null`) keeps the job the
+/// node's, and the `null` survives the next resume.
+#[tokio::test]
+async fn a_resumed_cb_job_gains_the_guard_and_keeps_it_off_once_put_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = SourceId("speech".into());
+    let ch59 = Tuning {
+        center_hz: Hz(CH59_HZ),
+        bandwidth_hz: Hz(12_500),
+    };
+    let mut graph = JobKind::FmDemod
+        .expand(&source, ch59, Hz(480_000), None, None, None)
+        .unwrap();
+    for n in &mut graph.nodes {
+        let p = n.params.as_object_mut().unwrap();
+        for k in ["wide_hz", "guard_hz", "guard_db", "channel_hz"] {
+            p.remove(k);
+        }
+    }
+    let rec = JobRecord {
+        format: JOB_RECORD_FORMAT,
+        id: JobId::new(),
+        kind: JobKind::FmDemod.name().into(),
+        graph,
+        source: source.clone(),
+        tuning: ch59,
+        state: JobState::Running,
+        context: serde_json::json!({}),
+        created_ns: Timestamp(1),
+        input: None,
+        capture_rate_hz: Some(480_000),
+        elastic: false,
+        operator_graph: false,
+    };
+    let jobs = dir.path().join("state").join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(
+        jobs.join(format!("{}.json", rec.id.0)),
+        serde_json::to_vec(&rec).unwrap(),
+    )
+    .unwrap();
+    let id = rec.id;
+    let channel = |g: &Graph| {
+        g.nodes
+            .iter()
+            .find(|n| n.kind == "channel")
+            .unwrap()
+            .params
+            .clone()
+    };
+    {
+        let (src, port) = cb_port(dir.path(), 240_000);
+        let node = Node::open(cfg(dir.path()), registry(), vec![port])
+            .await
+            .unwrap();
+        src.start();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(record(&node, &id).state, JobState::Running);
+        let disk = on_disk(dir.path(), &id);
+        assert_eq!(disk.capture_rate_hz, Some(240_000));
+        let p = nbfm(&disk.graph);
+        assert_eq!(
+            (&p["guard_hz"], &p["guard_db"], &p["channel_hz"]),
+            (&12_500.into(), &12.into(), &12_500.into()),
+            "{p}"
+        );
+        assert_eq!(channel(&disk.graph)["wide_hz"], 37_500);
+
+        let mut graph = record(&node, &id).graph;
+        for n in graph.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
+            n.params["guard_hz"] = serde_json::Value::Null;
+        }
+        node.apply(Op::GraphPut {
+            job: id.clone(),
+            graph,
+        })
+        .await
+        .unwrap();
+        let disk = on_disk(dir.path(), &id);
+        assert!(!disk.operator_graph);
+        assert!(nbfm(&disk.graph)["guard_hz"].is_null());
+    }
+
+    let (src, port) = cb_port(dir.path(), 480_000);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(record(&node, &id).state, JobState::Running);
+    let disk = on_disk(dir.path(), &id);
+    assert!(!disk.operator_graph);
+    assert_eq!(disk.capture_rate_hz, Some(480_000));
+    let p = nbfm(&disk.graph);
+    assert!(p.get("guard_hz").is_some_and(|v| v.is_null()), "{p}");
+    assert_eq!(p["channel_hz"], 12_500, "{p}");
+}

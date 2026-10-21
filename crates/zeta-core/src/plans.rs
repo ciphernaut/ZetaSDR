@@ -25,6 +25,10 @@ pub struct ChannelPlan {
 /// A frequency within this many Hz of a channel centre is on the channel.
 pub const CHANNEL_MATCH_HZ: u64 = 1_000;
 
+/// How much stronger (dB) a neighbouring channel must be for the adjacent-channel
+/// guard of an `nbfm_demod` on a plan channel to hold its squelch closed.
+pub const GUARD_DB_DEFAULT: i64 = 12;
+
 /// Australian UHF CB (ACMA class licence): 80 channels on two 25 kHz rasters
 /// 12.5 kHz apart, 1-40 and 41-80.
 pub const UHF_CB_AU: ChannelPlan = ChannelPlan {

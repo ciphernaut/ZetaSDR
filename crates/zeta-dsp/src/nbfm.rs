@@ -9,15 +9,23 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use zeta_core::plans::GUARD_DB_DEFAULT;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, StreamId, StreamKind};
 
 use crate::resample::Resampler;
 use crate::squelch::{
-    default_true, squelch_event, squelch_outputs, squelch_streams, stage_squelch,
+    db, default_true, squelch_event, squelch_outputs, squelch_streams, stage_squelch,
 };
+use crate::util::lowpass_taps;
 use crate::{Input, frame_span, run_map};
+
+/// Taps of the adjacent-channel guard's channel filter (a Hann low-pass at
+/// `channel_hz / 2`), on the centre and on each neighbour.
+pub const GUARD_TAPS: usize = 63;
+/// Lowest and highest accepted `guard_db`, dB.
+pub const GUARD_DB_RANGE: (i64, i64) = (0, 60);
 
 /// Phase-discriminator FM demodulation: `arg(x[n] · conj(x[n-1]))` scaled by
 /// `rate_hz / (2π · deviation_hz)`, so a tone at full deviation comes out at
@@ -91,7 +99,168 @@ pub struct NbfmParams {
     /// The squelch is on (the default); `false` passes every block.
     #[serde(default = "default_true")]
     pub squelch: bool,
+    /// Adjacent-channel guard: the neighbours this far either side of the channel are
+    /// measured, and the squelch held closed while the stronger is over `guard_db`
+    /// above the channel; `null`: no guard. Needs `channel_hz`.
+    #[serde(default)]
+    pub guard_hz: Option<u64>,
+    /// How much stronger a neighbour holds the squelch closed, dB (0..=60); `null`: 12.
+    #[serde(default)]
+    pub guard_db: Option<i64>,
+    /// The channel's own width, Hz: when set the stage low-pass filters its input at
+    /// `channel_hz / 2` (a channel cut wider for the guard), then squelches and
+    /// demodulates that.
+    #[serde(default)]
+    pub channel_hz: Option<u64>,
 }
+
+/// A streaming FIR filter without decimation: history carried across blocks.
+struct Fir {
+    /// The taps, last first, so a window of the input dots with them in order.
+    reversed: Vec<f32>,
+    /// The last `taps - 1` input samples, oldest first.
+    history: Vec<Complex<f32>>,
+}
+
+impl Fir {
+    fn new(taps: Vec<f32>) -> Self {
+        Self {
+            history: vec![Complex::new(0.0, 0.0); taps.len() - 1],
+            reversed: taps.into_iter().rev().collect(),
+        }
+    }
+
+    fn filter(&mut self, x: &[Complex<f32>]) -> Vec<Complex<f32>> {
+        let h = self.history.len();
+        let mut ext = Vec::with_capacity(h + x.len());
+        ext.extend_from_slice(&self.history);
+        ext.extend_from_slice(x);
+        let out = ext
+            .windows(h + 1)
+            .map(|w| {
+                let (mut re, mut im) = (0.0f32, 0.0f32);
+                for (v, &t) in w.iter().zip(&self.reversed) {
+                    re += v.re * t;
+                    im += v.im * t;
+                }
+                Complex::new(re, im)
+            })
+            .collect();
+        self.history.copy_from_slice(&ext[ext.len() - h..]);
+        out
+    }
+
+    /// Follow `x` without filtering it: the history the next block needs.
+    fn skip(&mut self, x: &[Complex<f32>]) {
+        let h = self.history.len();
+        if x.len() >= h {
+            self.history.copy_from_slice(&x[x.len() - h..]);
+        } else {
+            self.history.rotate_left(x.len());
+            self.history[h - x.len()..].copy_from_slice(x);
+        }
+    }
+}
+
+/// One neighbour of a guarded channel: an NCO bringing it to baseband (phase carried
+/// across blocks) and the channel filter.
+struct Side {
+    /// Cycles per sample, the neighbour's offset negated.
+    step: f64,
+    /// NCO phase in cycles, in `[0, 1)`.
+    phase: f64,
+    fir: Fir,
+}
+
+impl Side {
+    /// `x[skip..]` mixed (the NCO at `phase` on `x[0]`), the phase left at the end of
+    /// `x`. A phasor stepped by one rotation per sample, restarted from the phase each
+    /// block, so its rounding never builds up past a block.
+    fn mix(&mut self, x: &[Complex<f32>], skip: usize) -> Vec<Complex<f32>> {
+        let at = |cycles: f64| {
+            let (s, c) = (2.0 * PI * cycles.rem_euclid(1.0)).sin_cos();
+            Complex::new(c, s)
+        };
+        let (mut z, rot) = (at(self.phase + skip as f64 * self.step), at(self.step));
+        let out = x[skip..]
+            .iter()
+            .map(|&v| {
+                let y = v * Complex::new(z.re as f32, z.im as f32);
+                z *= rot;
+                y
+            })
+            .collect();
+        self.phase = (self.phase + x.len() as f64 * self.step).rem_euclid(1.0);
+        out
+    }
+
+    /// The neighbour's mean power in block `x`, dBFS.
+    fn power_db(&mut self, x: &[Complex<f32>]) -> f32 {
+        let mixed = self.mix(x, 0);
+        let y = self.fir.filter(&mixed);
+        db(y.iter().map(|v| v.norm_sqr() as f64).sum::<f64>() / y.len().max(1) as f64)
+    }
+
+    /// Follow block `x` unmeasured: only its tail is mixed, for the filter's history.
+    fn skip(&mut self, x: &[Complex<f32>]) {
+        let tail = x.len().saturating_sub(self.fir.history.len());
+        let mixed = self.mix(x, tail);
+        self.fir.skip(&mixed);
+    }
+}
+
+/// The channel filter of an `nbfm_demod` with `channel_hz`, and its adjacent-channel
+/// guard's neighbours when it has `guard_hz`, built for one channel rate.
+struct Guard {
+    rate_hz: u64,
+    centre: Fir,
+    sides: Option<[Side; 2]>,
+    db: f32,
+}
+
+impl Guard {
+    /// For `p` (its `channel_hz` set) at `rate_hz`; a band that does not fit the rate
+    /// fails.
+    fn new(p: &NbfmParams, channel_hz: u64, rate_hz: u64) -> Result<Self, String> {
+        let taps = || lowpass_taps(channel_hz as f64 / 2.0, rate_hz as f64, GUARD_TAPS);
+        let sides = match p.guard_hz {
+            None if channel_hz > rate_hz => {
+                return Err(format!(
+                    "nbfm_demod params: channel_hz {channel_hz} wider than the channel rate {rate_hz}"
+                ));
+            }
+            None => None,
+            Some(g) if channel_hz + 2 * g > rate_hz => return Err(GUARD_NEEDS.into()),
+            Some(g) => Some([1.0, -1.0].map(|sign| Side {
+                step: -sign * g as f64 / rate_hz as f64,
+                phase: 0.0,
+                fir: Fir::new(taps()),
+            })),
+        };
+        Ok(Self {
+            rate_hz,
+            centre: Fir::new(taps()),
+            sides,
+            db: p.guard_db.unwrap_or(GUARD_DB_DEFAULT) as f32,
+        })
+    }
+
+    /// The stronger neighbour's power in raw block `x`, dBFS; `None` without a guard.
+    fn adjacent_db(&mut self, x: &[Complex<f32>]) -> Option<f32> {
+        let sides = self.sides.as_mut()?;
+        Some(sides[0].power_db(x).max(sides[1].power_db(x)))
+    }
+
+    /// Follow raw block `x` without measuring the neighbours.
+    fn skip(&mut self, x: &[Complex<f32>]) {
+        for s in self.sides.iter_mut().flatten() {
+            s.skip(x);
+        }
+    }
+}
+
+const GUARD_NEEDS: &str =
+    "nbfm_demod params: guard_hz needs channel_hz with channel_hz + 2 guard_hz <= the channel rate";
 
 /// Demodulates an NBFM IQ stream to audio at `audio_rate_hz`, behind a
 /// [`Squelch`](crate::squelch::Squelch): while it is closed no audio frame is
@@ -158,9 +327,28 @@ impl Stage for NbfmDemodStage {
         }
         let mut squelch =
             stage_squelch("nbfm_demod", p.squelch, p.squelch_db).map_err(StageError::Failed)?;
+        let (lo, hi) = GUARD_DB_RANGE;
+        if let Some(v) = p.guard_db.filter(|v| !(lo..=hi).contains(v)) {
+            return Err(StageError::Failed(format!(
+                "nbfm_demod params: guard_db {v} out of range {lo}..={hi}"
+            )));
+        }
+        if p.guard_hz.is_some() && p.channel_hz.is_none() {
+            return Err(StageError::Failed(GUARD_NEEDS.into()));
+        }
+        if p.channel_hz == Some(0) {
+            return Err(StageError::Failed(
+                "nbfm_demod params: channel_hz must be >= 1".into(),
+            ));
+        }
         let (out, events) = squelch_streams(&outputs, squelch.is_some())?;
         let mut prev = Complex::new(0.0f32, 0.0);
         let mut filter = AudioFilter::default();
+        let mut guard: Option<Guard> = None;
+        // Whether the last block measured with the squelch open had a neighbour over
+        // `guard_db`; the gate (open and not guarded) and that, as last published.
+        let mut guarded = false;
+        let mut was = (false, false);
         let mut was_open = false;
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
@@ -168,6 +356,7 @@ impl Stage for NbfmDemodStage {
                 Input::Lagged { .. } => {
                     prev = Complex::new(0.0, 0.0);
                     filter = AudioFilter::default();
+                    guard = None;
                     return Ok(Vec::new());
                 }
             };
@@ -179,20 +368,54 @@ impl Stage for NbfmDemodStage {
             let rate = block.sample_rate_hz.0;
             let mut prov = frame.provenance.clone();
             prov.span = frame_span(block.t0, block.samples.len(), rate);
+            if let Some(c) = p.channel_hz
+                && guard.as_ref().is_none_or(|g| g.rate_hz != rate)
+            {
+                guard = Some(Guard::new(&p, c, rate).map_err(StageError::Failed)?);
+            }
+            // With `channel_hz`, the channel filtered out of the wider cut: what the squelch
+            // and the discriminator see.
+            let centred;
+            let iq: &[Complex<f32>] = match guard.as_mut() {
+                Some(g) => {
+                    centred = g.centre.filter(&block.samples);
+                    &centred
+                }
+                None => &block.samples,
+            };
             let mut published = Vec::new();
             if let (Some(sq), Some(events)) = (squelch.as_mut(), &events) {
-                if let Some(open) = sq.feed(&block.samples, rate) {
+                let first = sq.feed(iq, rate).is_some();
+                // The neighbours are measured while the squelch is open (`guarded` holds the
+                // last finding while it is closed), and for an event.
+                let mut adjacent = None;
+                if sq.is_open() {
+                    adjacent = guard.as_mut().and_then(|g| g.adjacent_db(&block.samples));
+                    guarded = adjacent.is_some_and(|a| {
+                        a - sq.power_db() > guard.as_ref().map_or(f32::INFINITY, |g| g.db)
+                    });
+                }
+                let gate = (sq.is_open() && !guarded, guarded);
+                if first || gate != was {
+                    if adjacent.is_none() {
+                        adjacent = guard.as_mut().and_then(|g| g.adjacent_db(&block.samples));
+                    }
                     published.push(Frame::new(
                         events.clone(),
                         prov.clone(),
-                        Payload::Event(squelch_event(sq, open)),
+                        Payload::Event(squelch_event(sq, gate.0, adjacent, guarded)),
                     ));
                 }
-                if !sq.is_open() {
+                if adjacent.is_none()
+                    && let Some(g) = guard.as_mut()
+                {
+                    g.skip(&block.samples);
+                }
+                was = gate;
+                if !gate.0 {
                     // Skipped, but the discriminator's reference follows the channel, so a
                     // reopening block differences against the sample just before it.
-                    if let Some(&x) = block
-                        .samples
+                    if let Some(&x) = iq
                         .iter()
                         .rev()
                         .find(|x| x.re.is_finite() && x.im.is_finite())
@@ -207,7 +430,7 @@ impl Stage for NbfmDemodStage {
                     filter = AudioFilter::default();
                 }
             }
-            let demod = nbfm_demod(&block.samples, rate, p.deviation_hz, &mut prev);
+            let demod = nbfm_demod(iq, rate, p.deviation_hz, &mut prev);
             let samples = filter
                 .process(&demod, rate, p.audio_rate_hz)
                 .map_err(StageError::Failed)?;
@@ -503,21 +726,32 @@ mod tests {
         params: serde_json::Value,
         blocks: Vec<Vec<Complex<f32>>>,
     ) -> (usize, Vec<serde_json::Value>) {
-        let (tx, mut rx_out, mut rx_ev, h) = spawn_with(params, 1_024);
+        let (audio, events) = run_blocks_at(params, blocks, 48_000).await;
+        (audio.len(), events)
+    }
+
+    /// [`run_blocks`] at `rate_hz`: the audio frames' start times and the events.
+    async fn run_blocks_at(
+        params: serde_json::Value,
+        blocks: Vec<Vec<Complex<f32>>>,
+        rate_hz: u64,
+    ) -> (Vec<u64>, Vec<serde_json::Value>) {
+        let n = blocks.len();
+        let (tx, mut rx_out, mut rx_ev, h) = spawn_with(params, n.max(8) * 2);
         for (i, b) in blocks.into_iter().enumerate() {
             tx.send(iq_frame_at(
                 b,
-                48_000,
+                rate_hz,
                 1_000_000_000 + i as u64 * 20_000_000,
             ))
             .unwrap();
         }
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
-        let mut audio = 0;
+        let mut audio = Vec::new();
         while let Ok(f) = rx_out.try_recv() {
             assert!(matches!(f.payload, Payload::Audio { .. }));
-            audio += 1;
+            audio.push(f.provenance.span.start_ns.0);
         }
         let mut events = Vec::new();
         while let Ok(f) = rx_ev.try_recv() {
@@ -541,7 +775,10 @@ mod tests {
         assert!((e["power_db"].as_f64().unwrap() + 60.0).abs() < 1.0, "{e}");
         assert!((e["floor_db"].as_f64().unwrap() + 60.0).abs() < 1.0, "{e}");
         let keys: Vec<_> = e.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 4, "{e}");
+        assert_eq!(keys.len(), 6, "{e}");
+        // No guard: no neighbour measured, never guarded.
+        assert_eq!(e["adjacent_db"], serde_json::Value::Null, "{e}");
+        assert_eq!(e["guarded"], false, "{e}");
 
         // Off: audio frames as before, and no squelch events.
         let off =
@@ -655,5 +892,160 @@ mod tests {
         assert!(audio >= 4, "{audio}");
         let opens: Vec<_> = events.iter().map(|e| e["open"].clone()).collect();
         assert_eq!(opens, [false, true], "{events:?}");
+    }
+
+    /// The CB channel rate on a 256 000 Hz bin rate, and its 20 ms block.
+    const CB_RATE: u32 = 51_200;
+    const CB_BLOCK: usize = 1_024;
+
+    /// `secs` of 20 ms blocks at [`CB_RATE`]: complex noise at -60 dBFS (seeded by `seed`)
+    /// plus, for each `(offset_hz, db, deviation_hz)`, a carrier at `db` dBFS `offset_hz`
+    /// from the centre, frequency-modulated by a 1 kHz tone.
+    fn cb_blocks(secs: f32, signals: &[(f64, f32, f64)], seed: u64) -> Vec<Vec<Complex<f32>>> {
+        let len = (secs * 50.0) as usize * CB_BLOCK;
+        let mut x = vec![Complex::new(0.0f32, 0.0); len];
+        awgn(&mut x, 60.0, seed);
+        let audio = tone(CB_RATE, len, 1_000.0, 1.0);
+        for &(offset_hz, db, deviation_hz) in signals {
+            let a = 10f32.powf(db / 20.0);
+            let s = nbfm_modulate(&audio, CB_RATE, CB_RATE, deviation_hz, offset_hz);
+            for (v, s) in x.iter_mut().zip(s) {
+                *v += s * a;
+            }
+        }
+        x.chunks(CB_BLOCK).map(|c| c.to_vec()).collect()
+    }
+
+    /// `nbfm_demod` params with the guard a CB channel's graph carries (`guard_hz`
+    /// `Some`), or only its centre filter (`None`: the guard turned off).
+    fn cb_params(guard_hz: Option<u64>) -> serde_json::Value {
+        serde_json::json!({
+            "deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true,
+            "guard_hz": guard_hz, "guard_db": 12, "channel_hz": 12_500,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_strong_neighbour_holds_the_gate_closed() {
+        // 1 s of noise, then 2 s of a carrier 12.5 kHz up, 40 dB over the noise. Its tail
+        // through the centre filter opens the centre's squelch; the guard holds it shut.
+        let mut blocks = cb_blocks(1.0, &[], 1);
+        blocks.extend(cb_blocks(2.0, &[(12_500.0, -20.0, 5_000.0)], 2));
+        let (audio, events) = run_blocks_at(cb_params(Some(12_500)), blocks.clone(), 51_200).await;
+        assert!(audio.is_empty(), "{} audio frames", audio.len());
+        assert_eq!(events[0]["open"], false, "{events:?}");
+        assert!(events.iter().all(|e| e["open"] == false), "{events:?}");
+        assert!(
+            events[1..].iter().all(|e| e["guarded"] == true),
+            "{events:?}"
+        );
+        assert!(events.len() >= 2, "{events:?}");
+        let g = &events[1];
+        assert!(
+            g["adjacent_db"].as_f64().unwrap() - g["power_db"].as_f64().unwrap() > 12.0,
+            "{g}"
+        );
+        // Without the guard the same channel opens.
+        let (unguarded, _) = run_blocks_at(cb_params(None), blocks, 51_200).await;
+        assert!(!unguarded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_centre_signal_opens_with_a_quiet_neighbour() {
+        let mut blocks = cb_blocks(1.0, &[], 3);
+        blocks.extend(cb_blocks(1.0, &[(0.0, -30.0, 2_500.0)], 4));
+        let (audio, events) = run_blocks_at(cb_params(Some(12_500)), blocks, 51_200).await;
+        assert!(audio.len() >= 45, "{} audio frames", audio.len());
+        let opens: Vec<_> = events.iter().map(|e| e["open"].clone()).collect();
+        assert_eq!(opens, [false, true], "{events:?}");
+        let e = &events[1];
+        assert_eq!(e["guarded"], false, "{e}");
+        assert!(
+            e["adjacent_db"].as_f64().unwrap() < e["power_db"].as_f64().unwrap() - 12.0,
+            "{e}"
+        );
+        assert!(events[0]["adjacent_db"].is_number(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn equal_neighbours_do_not_guard() {
+        // Signals on both neighbours and the centre, the centre 3 dB weaker.
+        let mut blocks = cb_blocks(1.0, &[], 5);
+        let busy = [
+            (0.0, -23.0, 2_500.0),
+            (12_500.0, -20.0, 5_000.0),
+            (-12_500.0, -20.0, 5_000.0),
+        ];
+        blocks.extend(cb_blocks(1.0, &busy, 6));
+        let (audio, events) = run_blocks_at(cb_params(Some(12_500)), blocks, 51_200).await;
+        assert!(audio.len() >= 45, "{} audio frames", audio.len());
+        assert!(events.iter().all(|e| e["guarded"] == false), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn the_guard_only_closes() {
+        // 5 s of half-second scenes: every block the guarded stage passes, the same
+        // stage without the guard passes too, and the guard closes some it would pass.
+        let scenes: [&[(f64, f32, f64)]; 10] = [
+            &[],
+            &[(0.0, -30.0, 2_500.0)],
+            &[(12_500.0, -20.0, 5_000.0)],
+            &[],
+            &[(0.0, -45.0, 2_500.0), (-12_500.0, -20.0, 5_000.0)],
+            &[(0.0, -30.0, 2_500.0), (12_500.0, -35.0, 5_000.0)],
+            &[(-12_500.0, -15.0, 5_000.0)],
+            &[(0.0, -25.0, 2_500.0), (12_500.0, -25.0, 5_000.0)],
+            &[],
+            &[(12_500.0, -20.0, 5_000.0), (-12_500.0, -20.0, 5_000.0)],
+        ];
+        let blocks: Vec<_> = scenes
+            .iter()
+            .enumerate()
+            .flat_map(|(i, s)| cb_blocks(0.5, s, 10 + i as u64))
+            .collect();
+        let (guarded, events) =
+            run_blocks_at(cb_params(Some(12_500)), blocks.clone(), 51_200).await;
+        let (unguarded, _) = run_blocks_at(cb_params(None), blocks, 51_200).await;
+        let open: std::collections::HashSet<_> = unguarded.iter().collect();
+        assert!(guarded.iter().all(|t| open.contains(t)));
+        assert!(
+            guarded.len() < unguarded.len(),
+            "{} vs {}",
+            guarded.len(),
+            unguarded.len()
+        );
+        assert!(!guarded.is_empty());
+        assert!(events.iter().any(|e| e["guarded"] == true), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn guard_params_out_of_range_fail_the_stage() {
+        let fails = |p: serde_json::Value, block: bool, want: String| async move {
+            let (tx, _rx, h) = spawn(p);
+            if block {
+                tx.send(iq_frame(vec![Complex::new(1.0, 0.0); CB_BLOCK], 51_200))
+                    .unwrap();
+            }
+            match h.await.unwrap() {
+                Err(StageError::Failed(m)) => assert_eq!(m, want),
+                r => panic!("expected Failed, got {r:?}"),
+            }
+        };
+        for v in [-1, 61] {
+            let mut p = cb_params(Some(12_500));
+            p["guard_db"] = v.into();
+            fails(
+                p,
+                false,
+                format!("nbfm_demod params: guard_db {v} out of range 0..=60"),
+            )
+            .await;
+        }
+        let need = "nbfm_demod params: guard_hz needs channel_hz with channel_hz + 2 guard_hz <= the channel rate";
+        let mut p = cb_params(Some(12_500));
+        p["channel_hz"] = serde_json::Value::Null;
+        fails(p, false, need.into()).await;
+        // 12 500 + 2 · 25 000 > 51 200.
+        fails(cb_params(Some(25_000)), true, need.into()).await;
     }
 }

@@ -42,7 +42,8 @@ pub const SQUELCH_MOMENT_BLOCKS: usize = 10;
 /// The power reported for an all-zero block, dBFS.
 const POWER_MIN_DB: f32 = -200.0;
 
-fn db(p: f64) -> f32 {
+/// `p` (a mean `|x|²`) in dBFS, at least the floor reported for an all-zero block.
+pub(crate) fn db(p: f64) -> f32 {
     if p > 0.0 {
         ((10.0 * p.log10()) as f32).max(POWER_MIN_DB)
     } else {
@@ -224,14 +225,23 @@ pub(crate) fn squelch_streams(
     }
 }
 
-/// The `squelch` event for a transition of `sq` to `open`; powers to 0.1 dB.
-pub(crate) fn squelch_event(sq: &Squelch, open: bool) -> serde_json::Value {
+/// The `squelch` event for a transition of the gate to `open` (the squelch `sq` open and
+/// not `guarded`): `adjacent_db` the stronger neighbour's power under an adjacent-channel
+/// guard (`None` without one); powers to 0.1 dB.
+pub(crate) fn squelch_event(
+    sq: &Squelch,
+    open: bool,
+    adjacent_db: Option<f32>,
+    guarded: bool,
+) -> serde_json::Value {
     let tenth = |v: f32| (v as f64 * 10.0).round() / 10.0;
     serde_json::json!({
         "protocol": "squelch",
         "open": open,
         "power_db": tenth(sq.power_db()),
         "floor_db": tenth(sq.floor_db()),
+        "adjacent_db": adjacent_db.map(tenth),
+        "guarded": guarded,
     })
 }
 

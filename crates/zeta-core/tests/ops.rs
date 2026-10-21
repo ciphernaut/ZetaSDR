@@ -2333,3 +2333,108 @@ fn acars_decode_expands_channel_to_decoder() {
     assert_eq!(g.edges[0].from, g.nodes[0].id);
     assert_eq!(g.edges[0].to, g.nodes[1].id);
 }
+
+/// An `fm_demod` at `center_hz` on a 1 024 000 Hz capture whose bank has 256 000 Hz bins.
+fn cb_graph(center_hz: u64) -> zeta_core::graph::Graph {
+    let tuning = Tuning {
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(12_500),
+    };
+    JobKind::FmDemod
+        .expand(
+            &SourceId("b210".into()),
+            tuning,
+            Hz(1_024_000),
+            Some(256_000),
+            None,
+            None,
+        )
+        .unwrap()
+}
+
+#[test]
+fn plan_channels_carry_the_guard() {
+    let g = cb_graph(476_887_500);
+    assert_eq!(g.nodes[0].kind, "channel");
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"center_hz": 476_887_500, "bandwidth_hz": 12_500, "out_rate_hz": 51_200, "wide_hz": 37_500})
+    );
+    assert_eq!(g.nodes[1].kind, "nbfm_demod");
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({
+            "deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true,
+            "guard_hz": 12_500, "guard_db": 12, "channel_hz": 12_500,
+        })
+    );
+    // Too narrow a channel rate for three raster steps: no guard.
+    let narrow = JobKind::FmDemod
+        .expand(
+            &SourceId("b210".into()),
+            Tuning {
+                center_hz: Hz(476_887_500),
+                bandwidth_hz: Hz(12_500),
+            },
+            Hz(25_000),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(narrow.nodes[0].params.get("wide_hz").is_none());
+    assert!(narrow.nodes[1].params.get("guard_hz").is_none());
+}
+
+#[test]
+fn off_plan_graphs_are_unchanged() {
+    let g = cb_graph(147_050_000);
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"center_hz": 147_050_000, "bandwidth_hz": 12_500, "out_rate_hz": 51_200})
+    );
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true})
+    );
+}
+
+#[test]
+fn reexpand_carries_the_guard_params() {
+    let src = SourceId("b210".into());
+    let tuning = Tuning {
+        center_hz: Hz(476_887_500),
+        bandwidth_hz: Hz(12_500),
+    };
+    let mut stored = cb_graph(476_887_500);
+    for n in stored.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
+        n.params["guard_hz"] = serde_json::Value::Null;
+        n.params["guard_db"] = 20.into();
+    }
+    let again = JobKind::FmDemod
+        .reexpand(&src, tuning, Hz(512_000), None, &stored)
+        .unwrap();
+    let demod = &again.nodes[1].params;
+    assert!(
+        demod.get("guard_hz").is_some_and(|v| v.is_null()),
+        "{demod}"
+    );
+    assert_eq!(demod["guard_db"], 20, "{demod}");
+    assert_eq!(demod["channel_hz"], 12_500, "{demod}");
+    assert_eq!(again.nodes[0].params["wide_hz"], 37_500);
+    // A graph stored before the guard (plan 12) gains it on re-expansion.
+    let mut old = cb_graph(476_887_500);
+    old.nodes[0]
+        .params
+        .as_object_mut()
+        .unwrap()
+        .remove("wide_hz");
+    for k in ["guard_hz", "guard_db", "channel_hz"] {
+        old.nodes[1].params.as_object_mut().unwrap().remove(k);
+    }
+    let again = JobKind::FmDemod
+        .reexpand(&src, tuning, Hz(512_000), None, &old)
+        .unwrap();
+    assert_eq!(again.nodes[1].params["guard_hz"], 12_500);
+    assert_eq!(again.nodes[0].params["wide_hz"], 37_500);
+}
