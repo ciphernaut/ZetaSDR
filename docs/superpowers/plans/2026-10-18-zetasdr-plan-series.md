@@ -641,6 +641,27 @@ Gates at the branch head:
   driver, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
   `zeta agents-md --check` and `--skill --check` are clean.
 
+Final-review fix wave (on `plan-13`, after 014013d):
+
+- `/stt` bounds a call at `stt_timeout` + the backend's queue wait, so a queued call answers or
+  is told busy: 503 `{"error": "busy", "message", "wait_ms"}`, never a 504 at 30 s.
+- `--stt-node`: a peer's busy 503 is `SpeechError::Busy` (a `dropped` `busy` event, not an
+  error toward the job's limit), `NodeBackend::queue_wait()` is `STT_QUEUE_WAIT`, and its `/stt`
+  request timeout is 75 s; `transcribe`'s outer bound has 1 s of slack.
+- `cb_watch.py` fixes an opened channel's `squelch_db` at its measured floor + 6 dB (the row's
+  per-bin dB converted to the channel's dBFS, `--squelch-margin-db`) with `graph_put` before it
+  attaches `transcribe`.
+- `fm_demod`/`am_demod` latch their last `squelch` event in `job_context` (`squelch`; cleared by
+  a run with the squelch off), and the page seeds a watched job's tag from it, so the
+  `quiet_channel_row_is_tagged_squelch` scenario is deterministic (it now opens the page after
+  the gate event on purpose).
+- The guard has 2 dB of hysteresis (`GUARD_HYSTERESIS_DB`); the squelch tag's title names the
+  neighbour's `adjacent_db` and the guard; a failed `channel_plans` call is retried; the adsb
+  `child_exit_fails_the_stage` bound is 30 s.
+- Gate after the wave: `cargo test --workspace --all-features --no-fail-fast` 907 passed,
+  0 failed, 3 ignored (111 `test result` lines), no `ui e2e skipped`; the UI suite 230.83 s
+  alone, 235.63 s in the gate.
+
 Deferred:
 
 - `Segment` and `ChannelPlan` derive nothing; `channel_at` re-sorts per call.
@@ -650,12 +671,10 @@ Deferred:
   off.
 - The speech concurrency test should assert `max_concurrent() == 4`.
 - The connect retry also delays the startup probe by 200 ms when the daemon is unreachable.
-- A stored non-builtin `plan` id is dropped at page mount; the plan list is cached for the page's
-  lifetime; multi-plan axis ticks are unsorted.
-- The UI scenario `quiet_channel_row_is_tagged_squelch` is flaky (see the gates); the adsb
-  `child_exit_fails_the_stage` test timed out once under full-suite load.
-- `cb_watch.py` does not fix `squelch_db` at floor + 6 (spec 3.4): a demodulator started
-  mid-transmission seeds its automatic floor on the signal.
+- A stored non-builtin `plan` id is dropped at page mount; a loaded plan list is cached for the
+  page's lifetime; multi-plan axis ticks are unsorted.
+- `cb_watch.py`'s floor is the row's 15th percentile, which reads a few dB low when a row
+  averages few FFTs (about 4 dB on the 48 kHz test fixture; under 1 dB at live rates).
 - Plan 12's leftovers are still open: two Soapy gain tests have 50-100 ms timing margins and
   `set_gain` may hold the tune gate up to 2x `retune_timeout`; the squelch's floor window (100
   blocks, about 1 s live) is untuned; `ops.log` and `transcripts.log` writes are synchronous on
