@@ -122,6 +122,14 @@ const REPLACE_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 struct JobEntry {
     record: JobRecord,
+    /// The run this entry is for: each launch of the job (a start, a resume, a
+    /// `graph_put` restart, an elastic relaunch) records a new one. Two launches of
+    /// one id can overlap (two `graph_put`s at once: the second's stop finds the job
+    /// already `Stopped` and returns while the first's old run is still ending), so
+    /// a supervisor ends, releases and records only the run it was spawned for and
+    /// never a later run that took the id meanwhile. 0 for a record loaded from disk
+    /// and not launched.
+    run: u64,
     /// When the record turned terminal in this process (its `created_ns` for
     /// one loaded terminal from disk); history is pruned oldest-ended first.
     ended_ns: Timestamp,
@@ -201,6 +209,11 @@ struct Inner {
     log_failed: [std::sync::atomic::AtomicBool; 2],
     /// Running transcript tees (see [`Inner::tee_transcripts`]).
     tees: Arc<std::sync::atomic::AtomicUsize>,
+    /// Running tasks of every job's stage set (its stages, its IQ forwarder, a
+    /// scan's step loop), so a run left behind by a launch shows (see `StageRunning`).
+    stages: Arc<std::sync::atomic::AtomicUsize>,
+    /// The last run handed out (see [`JobEntry::run`]).
+    runs: std::sync::atomic::AtomicU64,
     /// Held across [`Inner::relaunch_elastic`], so two retunes never relaunch one
     /// elastic job at once.
     relaunching: tokio::sync::Mutex<()>,
@@ -531,6 +544,8 @@ impl Node {
                 transcripts_log: jsonlog::JsonLog::new(cfg.state_dir.join("transcripts.log")),
                 log_failed: Default::default(),
                 tees: Arc::default(),
+                stages: Arc::default(),
+                runs: std::sync::atomic::AtomicU64::new(0),
                 relaunching: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
             }),
@@ -557,6 +572,7 @@ impl Node {
                     JobEntry {
                         ended_ns: rec.created_ns,
                         record: rec,
+                        run: 0,
                         cancel: None,
                         done: None,
                         outputs: Vec::new(),
@@ -580,6 +596,7 @@ impl Node {
                     JobEntry {
                         ended_ns: now(),
                         record: failed,
+                        run: 0,
                         cancel: None,
                         done: None,
                         outputs: Vec::new(),
@@ -1235,6 +1252,12 @@ impl Node {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn debug_tee_count(&self) -> usize {
         self.inner.tees.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Tasks running for jobs' stages (each stage, IQ forwarder and scan loop);
+    /// 0 when no job runs. `GET /health` reports it as `stages_running`.
+    pub fn debug_stage_count(&self) -> usize {
+        self.inner.stages.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Hold `source`'s gate, for tests of what waits on it.

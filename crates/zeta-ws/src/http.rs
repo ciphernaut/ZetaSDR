@@ -133,6 +133,9 @@ pub struct Health {
     pub build: String,
     pub uptime_s: u64,
     pub ws_connections: usize,
+    /// Tasks running for jobs' stages ([`Node::debug_stage_count`]): it falls back
+    /// when jobs stop, so one that only grows is a run left behind.
+    pub stages_running: usize,
 }
 
 /// State shared by every route and middleware.
@@ -233,6 +236,7 @@ async fn health(State(st): State<Shared>) -> Json<Health> {
         build: crate::build_id().to_string(),
         uptime_s: st.started.elapsed().as_secs(),
         ws_connections: st.stats.get().ws_connections,
+        stages_running: st.node.debug_stage_count(),
     })
 }
 

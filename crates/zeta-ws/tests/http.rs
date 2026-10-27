@@ -77,6 +77,31 @@ async fn health_reports_the_build_id() {
     ts.stop().await;
 }
 
+/// `/health` counts the running jobs' stage tasks, back to 0 once they stop.
+#[tokio::test]
+async fn health_reports_running_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let start = json!({"op":"job_start","kind":"passthrough","source":"tone",
+        "center_hz":100_000_000,"bandwidth_hz":48_000,"deviation_hz":null,"sideband":null,"elastic":false,"replace":[]});
+    let body: Value = post_op(&ts, Some(BEARER), &start)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let job = body["value"].as_str().expect("a job id").to_string();
+    let h: Health = get(&ts, "/health").await.json().await.unwrap();
+    assert!(h.stages_running >= 1, "{h:?}");
+    let stop = json!({"op":"job_stop","job":job});
+    assert_eq!(
+        post_op(&ts, Some(BEARER), &stop).await.status(),
+        StatusCode::OK
+    );
+    let h: Health = get(&ts, "/health").await.json().await.unwrap();
+    assert_eq!(h.stages_running, 0, "{h:?}");
+    ts.stop().await;
+}
+
 #[tokio::test]
 async fn wrong_secret_is_401_and_op_not_applied() {
     let dir = tempfile::tempdir().unwrap();

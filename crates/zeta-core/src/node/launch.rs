@@ -187,7 +187,7 @@ impl Inner {
         // A `transcribe` job's record for its transcript tees (see `tee_transcripts`).
         let tee = (rec.kind == JobKind::Transcribe.name()).then(|| rec.clone());
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.
-        let prov = self.record_running(rec, &token)?;
+        let (prov, run) = self.record_running(rec, &token)?;
 
         // One stream per edge; a node with no incoming edge whose stage takes input
         // reads the job's IQ stream (a job on the radio only). Each node's outputs get
@@ -238,28 +238,33 @@ impl Inner {
             let ids = outputs.into_iter().map(|(_, s)| s).collect();
             let (params, bus, cancel) = (n.params.clone(), self.bus.clone(), token.clone());
             let ctx = ctx.clone();
-            set.spawn(async move { stage.run(params, inputs, ids, bus, cancel, ctx).await });
+            let running = StageRunning::new(self.stages.clone());
+            set.spawn(async move {
+                let _running = running;
+                stage.run(params, inputs, ids, bus, cancel, ctx).await
+            });
         }
         if let (Some(sid), Some(port)) = (iq, &port) {
             let rx = port.subscribe();
-            set.spawn(forward_iq(
-                self.bus.clone(),
-                prov,
-                sid,
-                port.clone(),
-                rx,
-                token.clone(),
-            ));
+            let running = StageRunning::new(self.stages.clone());
+            let forward = forward_iq(self.bus.clone(), prov, sid, port.clone(), rx, token.clone());
+            set.spawn(async move {
+                let _running = running;
+                forward.await
+            });
         }
         let h = tokio::spawn(supervise(
             self.clone(),
             id.clone(),
+            run,
             port,
             set,
             token,
             streams,
         ));
-        if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
+        if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
+            && e.run == run
+        {
             e.done = Some(h);
             e.outputs = job_outputs;
         }
@@ -371,12 +376,14 @@ impl Inner {
             if except == Some(&id) || self.shutdown.is_cancelled() {
                 continue;
             }
-            let (rec, done) = {
+            let (rec, run, done) = {
                 let mut jobs = self.jobs.lock().unwrap();
                 let Some(e) = jobs.get_mut(&id) else {
                     continue;
                 };
-                if e.record.state != JobState::Running {
+                // A launch in progress (recorded, its supervisor not yet set) is left
+                // to finish: it joined the capture its lease was granted on.
+                if e.record.state != JobState::Running || e.done.is_none() {
                     continue;
                 }
                 let Some(cancel) = e.cancel.take() else {
@@ -384,7 +391,7 @@ impl Inner {
                 };
                 e.relaunch = true;
                 cancel.cancel();
-                (e.record.clone(), e.done.take())
+                (e.record.clone(), e.run, e.done.take())
             };
             if let Some(h) = done {
                 let _ = h.await;
@@ -409,6 +416,7 @@ impl Inner {
             if let Err(e) = result {
                 self.finish(
                     &id,
+                    run,
                     JobState::Failed {
                         reason: e.to_string(),
                     },
@@ -524,13 +532,25 @@ impl Inner {
     /// cancels the new launch). A launch of a job a `replace` stopped meanwhile (a
     /// `graph_put` restart that took its lease before the replace took the gate)
     /// is refused the same way, whatever the kind.
+    ///
+    /// Also the run's generation (see [`JobEntry::run`]). A launch of a job whose
+    /// entry still holds a live run's token (another launch of the id recorded
+    /// first: two overlapping `graph_put`s) is refused, its lease left to that run,
+    /// which holds the same id's lease; replacing the entry would drop that run's
+    /// token uncancelled and leave its stages running.
     fn record_running(
         &self,
         mut rec: JobRecord,
         token: &CancellationToken,
-    ) -> Result<Provenance, NodeError> {
+    ) -> Result<(Provenance, u64), NodeError> {
         rec.state = JobState::Running;
         let mut jobs = self.jobs.lock().unwrap();
+        if jobs.get(&rec.id).is_some_and(|e| e.cancel.is_some()) {
+            return Err(NodeError::Other(format!(
+                "job {} is already running a launch",
+                rec.id.0
+            )));
+        }
         // An elastic job being relaunched, or any job a `replace` stopped, that was
         // stopped (or ended) meanwhile stays so: its stop already returned, so this
         // launch must not undo it.
@@ -555,11 +575,13 @@ impl Inner {
                 end_ns: t,
             },
         };
+        let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         jobs.insert(
             rec.id.clone(),
             JobEntry {
                 ended_ns: rec.created_ns,
                 record: rec,
+                run,
                 cancel: Some(token.clone()),
                 done: None,
                 outputs: Vec::new(),
@@ -568,7 +590,7 @@ impl Inner {
                 released: false,
             },
         );
-        Ok(prov)
+        Ok((prov, run))
     }
 
     /// Launch a `scan` job: take a time-shared lease on its whole band
@@ -627,7 +649,7 @@ impl Inner {
             );
         }
         let token = self.shutdown.child_token();
-        let prov = self.record_running(rec, &token)?;
+        let (prov, run) = self.record_running(rec, &token)?;
         let out = self.bus.register(StreamKind::Event, prov.clone());
         let scan = Scan {
             id: id.clone(),
@@ -640,16 +662,26 @@ impl Inner {
             cancel: token.clone(),
         };
         let mut set = JoinSet::new();
-        set.spawn(scan_loop(self.clone(), scan));
+        let (running, scan) = (
+            StageRunning::new(self.stages.clone()),
+            scan_loop(self.clone(), scan),
+        );
+        set.spawn(async move {
+            let _running = running;
+            scan.await
+        });
         let h = tokio::spawn(supervise(
             self.clone(),
             id.clone(),
+            run,
             Some(port),
             set,
             token,
             vec![out.clone()],
         ));
-        if let Some(e) = self.jobs.lock().unwrap().get_mut(&id) {
+        if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
+            && e.run == run
+        {
             e.done = Some(h);
             e.outputs = vec![(StreamKind::Event, out)];
         }
@@ -681,12 +713,14 @@ impl Inner {
         })
     }
 
-    /// Record how a job ended on its own, unless it was stopped meanwhile.
+    /// Record how run `run` of a job ended on its own, unless it was stopped
+    /// meanwhile or a later run took the job's entry (see [`JobEntry::run`]).
     /// A failed write keeps the new state in memory and is reported through
     /// `persist_errors`; the job will be resumed on the next `open`.
-    fn finish(&self, id: &JobId, state: JobState) {
+    fn finish(&self, id: &JobId, run: u64, state: JobState) {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(entry) = jobs.get_mut(id)
+            && entry.run == run
             && entry.record.state == JobState::Running
         {
             entry.record.state = state;
@@ -750,9 +784,12 @@ fn node_outputs(
 /// cancellation stops the rest; `Failed` wins over a clean end. Then release
 /// the lease, tell the port it is idle if that was its last holder (a job on
 /// the radio; an attached job has no port), and unregister the job's streams.
+/// All but the streams (this run's own) only while the job's entry is still
+/// for `run`: a later run of the id holds the record, the lease and the port.
 async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
+    run: u64,
     port: Option<Arc<dyn Port>>,
     mut set: JoinSet<Result<(), StageError>>,
     token: CancellationToken,
@@ -774,23 +811,26 @@ async fn supervise(
         }
     }
     // An elastic job being relaunched keeps its record `Running` and its lease
-    // for the relaunch (see `Inner::relaunch_elastic`).
-    let relaunch = inner
+    // for the relaunch (see `Inner::relaunch_elastic`). A run whose entry a later
+    // run took leaves the record, the lease and the port to that run.
+    let (ours, relaunch) = inner
         .jobs
         .lock()
         .unwrap()
         .get(&id)
-        .is_some_and(|e| e.relaunch);
+        .map_or((true, false), |e| (e.run == run, e.relaunch));
+    let keep = relaunch || !ours;
     // After node shutdown the record must stay `Running` so the job resumes.
-    if !inner.shutdown.is_cancelled() && !relaunch {
+    if !inner.shutdown.is_cancelled() && !keep {
         inner.finish(
             &id,
+            run,
             failure.map_or(JobState::Stopped, |reason| JobState::Failed { reason }),
         );
     }
     // The only place a started job's lease is released, but for a relaunch that
     // fails (`Inner::relaunch_elastic`).
-    if port.is_some() && !relaunch {
+    if port.is_some() && !keep {
         inner.leases.release(&id);
     }
     for s in &streams {
@@ -801,16 +841,16 @@ async fn supervise(
     let gated_stop = {
         let mut jobs = inner.jobs.lock().unwrap();
         match jobs.get_mut(&id) {
-            Some(e) => {
+            Some(e) if e.run == run => {
                 // A relaunch keeps the lease; nothing was released.
                 e.released = !relaunch;
                 e.gated_stop
             }
-            None => false,
+            _ => false,
         }
     };
     if let Some(port) = port
-        && !relaunch
+        && !keep
         && !gated_stop
     {
         inner.leases.idle_if_unheld(port.as_ref()).await;
@@ -1082,6 +1122,24 @@ impl TeeRunning {
 }
 
 impl Drop for TeeRunning {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Counts a running task of a job's stage set in `Inner::stages` while it lives:
+/// made before the task is spawned and moved into it, so the count drops however
+/// the task ends, an abort included.
+struct StageRunning(Arc<std::sync::atomic::AtomicUsize>);
+
+impl StageRunning {
+    fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for StageRunning {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
