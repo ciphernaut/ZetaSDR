@@ -739,3 +739,11 @@ that refuses to start without a real secret. The laptop then federates it with `
 One caveat: in a two-host test against a USRP B210, the one-shot form (`job start ... --then-tail`) on a remote source streamed
 for 10 s but produced no events in two runs while the same job under `serve` did; on one machine
 with a file source the one-shot form works. Prefer a federating `serve` until that is resolved.
+
+### Reading a source's health
+
+`source list` shows a Soapy source's `stats` (`measured_rate_hz`, `overflows`, `timeouts`, `restarts`; `null` for a recording or a KiwiSDR) and the bank's `dropped` count. A measured rate within 1 % of the pinned rate is healthy; `restarts` counts clock-guard stream restarts, each logged as `zeta: soapy <id>: samples ran <n> ms ahead of the clock; stream restarted`, and more than 5 in 60 s fault the source. `GET /health` carries `stages_running`, the live stage tasks; it should equal the running jobs' stage counts plus one forwarder per job, and a number that climbs after jobs stop is a leak. A `measure` event with `partial: true` covers a window cut short by a gap, lag or retune, and `job context` shows `measure.discarded`, `partial` and `last`.
+
+### A radio in its own process
+
+A lost device in-process ends with `device lost: ...; restart the node`, and a driver crash ends the node. To keep the node up, run the HackRF in a child (`zeta serve --listen 7374 --state-dir other --source-soapy hackrf=driver=hackrf,gain=32`) and attach it to the main node with `--source-node hackrf=hackrf@http://127.0.0.1:7374`, its secret in `ZETA_NODE_SECRET_HACKRF`. A crash then faults the source (`remote node http://127.0.0.1:7374: stream closed ...`) and the main node survives; restart the child and re-pin. A source faulted during a retune is held until its node restarts.

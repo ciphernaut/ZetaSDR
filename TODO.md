@@ -34,39 +34,24 @@ The waterfall and any survey built on scan rows inherit all of this.
 
 ## Bug: stopped jobs leave work running (CPU leak, "channel stage lagged")
 
-Seen 2026-10-23 (HackRF, `zeta serve`, about 2 h of uptime). During the session dozens of jobs were started and stopped: `measure`, `fm_demod` + `transcribe` from `cb_watch.py`, spectrum, scan, and several pins.
-- Load: the node ended up at 430-470% CPU with only three light jobs running (page spectrum, one 12.5 kHz `fm_demod`, `transcribe`).
-- Busy threads: tokio workers, not the channel bank.
-- Log: about 100-360 `zeta-dsp: channel stage lagged, 1 frames skipped` per second, about 96k in total. Demodulated audio crackled.
-- Restart: after a restart with the same jobs, 9% CPU and zero lag warnings.
-
-Suspect: stages or bus subscribers of stopped jobs, or of relaunched elastic jobs on a retune, that never exit.
-- Related symptom: `measure` jobs started late in the session emitted no events within 15 s.
-- Repro idea: start/stop N `measure` or `fm_demod` jobs in a loop (or re-pin repeatedly), then watch the thread count and CPU.
+Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.
 
 ## Bug: a USB drop of a SoapySDR device segfaults the node
 
-HackRF on a flaky micro-USB cable: the device re-enumerated and `zeta serve` exited with 139. Expected: the source faults (`source list` `fault`) and its jobs fail with that reason, as the docs promise for an unplugged device.
+Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.
+In-process hardening only; the node survives a driver crash only with the radio in its own process (plan 20, Soapy worker process).
 
 ## Bug: sample timestamps run ahead of wall-clock time (HackRF)
 
-2026-10-23, HackRF via SoapySDR:
-- Transcript `start_ns` values ran 17-20 min ahead of the log write time (`t_ns`); one ran 40 min ahead.
-- An `iq read` SigMF capture taken at 19:57 AEST was stamped `core:datetime` 2026-10-23T11:18:01Z, i.e. 21:18 AEST: 81 min ahead.
-- The ring's `earliest_ns` (from `too_old` errors) advanced about 3.4 s in about 1 s of wall time, so `iq read` and `classify` spans picked from wall-clock time miss the ring.
-
-Suspect: block timestamps advanced by a nominal or stale sample rate (e.g. after a retune or rate change between pins of 1/2/3/6/12/16/20 MHz), not by the device's actual rate, or not re-anchored to the clock.
-
-Workaround used: read `earliest_ns` from a deliberate `too_old` error, then request a span from the newer half of the ring.
+Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.
 
 ## Bug: `measure` jobs emit no events
 
-2026-10-23:
-- Worked early in the session: 16 jobs on a 12 MHz pin, about 1 event/s each.
-- Later it returned zero events within 6-15 s, on 1, 2, 3 and 20 MHz pins (`bank` path), and still did after a node restart.
-- `fm_demod` squelch events and `spectrum` rows on the same captures were fine.
+Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.
 
-Possibly related to the channel bank path (`job_context` `channel.path: bank`) or to the timestamp drift above (a stage waiting for a span that never closes).
+## Bug: a refused `graph_put` persists its graph
+
+A `graph_put` that loses a race with another put on the same job returns an error, but its graph is already in the record (`graph_get` and a restart use it). Found in plan 14 review, pre-existing. Fix: persist after a successful launch.
 
 ## Feature: stereo for `wfm_demod`
 
@@ -158,6 +143,8 @@ Also to consider:
 - **Test signals.** Extend `zeta-dsp` `fixtures.rs` into a per-mode synthesiser (offset, noise, clock error), OnAir-style, so every mode has a fixture before a capture exists.
 - **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback. Fits the Okudagram restyle.
 - **Wideband modes** (DVB-T 8 MHz, DAB 1.5 MHz, LTE) run the direct path at full rate and want the GPU FFT; park them behind the HackRF-first set.
+- **Soapy worker process** (plan 20). A `zeta soapy-worker` child owns the `Driver` behind a Port that faults when the child exits, so a driver crash never ends the node. Plan 14 only hardens in-process loss; the two-node pattern in field craft is the interim.
+- **`sync_bank` flapping** (from the 2026-10-27 investigation, not reproduced). A bank replaced while `feed_bank` still drains old-band blocks can swap back and forth, stalling a channel stage silently.
 
 ## UI: staircase transcript ribbons on the waterfall
 

@@ -461,6 +461,18 @@ A start outside the pin is a `conflict` offering `unpin source S (source_unpin)`
 
 To run demodulators on active channels only, not on all 80, use `examples/python/cb_watch.py` (`--dry-run` shows which channels the capture holds): it keeps one elastic `spectrum` job, starts `fm_demod` plus `transcribe` on a channel that stands 10 dB over the floor and stops them after 60 s of quiet.
 
+### Reading a source's health
+
+`source list` gives each Soapy source a `stats` record (`null` for a recording or a KiwiSDR): `measured_rate_hz`, the samples per second the device actually delivered (an integer, `null` before the first block), and `overflows`, `timeouts` and `restarts`. Compare `measured_rate_hz` with the pinned rate: within 1 % is healthy. `restarts` counts clock-guard stream restarts, each logged as `zeta: soapy <id>: samples ran <n> ms ahead of the clock; stream restarted`; more than 5 in 60 s fault the source with `soapy: samples arrive faster than <rate> Hz`. `overflows` and `timeouts` are the device's own counts. `bank.dropped` in the same record counts input blocks the shared channel bank dropped under load; a number that climbs means the node cannot keep up, so drop jobs or narrow the pin.
+
+`GET /health` carries `stages_running`, the live stage tasks: every graph stage plus one IQ forwarder (or scan loop) per job. It should equal the sum over the running jobs of the `graph get` node count plus one per rigid or elastic job. A number that keeps climbing after jobs are stopped is a leak: report it with the job history, do not restart quietly.
+
+A `measure` job's `job context` carries `measure: {discarded, partial, last}`: windows discarded, windows emitted short, and the last cause (`gap`, `lag` or `retune`). A `measure` event with `partial: true` spans only the samples it held (at least 250 ms); read its fields with that in mind.
+
+### A radio in its own process
+
+A driver crash ends the process that loads it, and a lost device in-process ends with `device lost: <fault>; restart the node`: the source stays faulted and `tune` and `source gain` answer the same until the node restarts. This includes a device call that fails during a retune (a driver rejecting a rate too): it is indistinguishable from a lost device, so a source faulted during a retune is held until the node restarts. To keep a crash from ending the node, run the HackRF in a child node and attach it to the main one: `zeta serve --listen 7374 --state-dir <other dir> --source-soapy hackrf=driver=hackrf,gain=32` (with its own secret), then on the main node `--source-node hackrf=hackrf@http://127.0.0.1:7374` with the child's secret in `ZETA_NODE_SECRET_HACKRF`. A driver crash then faults the source (`remote node http://127.0.0.1:7374: stream closed ...`) and fails its jobs with that reason; the main node stays up. Restart the child, then re-pin. The remote link ships 250 kHz at most unless `max_bandwidth_hz=N` widens it, and a HackRF cannot go that low (its minimum is 1 Msps), so widen it to the pin's width.
+
 ### Working layer 4
 
 When a signal has no known decoder, work it in this order:

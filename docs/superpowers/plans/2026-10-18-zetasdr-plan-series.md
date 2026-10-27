@@ -21,7 +21,7 @@ interfaces rather than guessed ones.
 | 11 | View policy | Resume restores the capture (widest first, built-in graphs re-expanded, `capture_rate_hz`); the ops log (`ops.log`, `zeta ops tail`); elastic leases (`job start --elastic`); atomic `replace` (`--replace` on `job start` and `source ensure`); a file-source `tune_range`; UI view policies (`follow`, `zoom_out`, `auto_scan_stop`, `finished_rows_s`, `scanner`) and `view set\|show\|reset\|clear`, automatic scans on a scanner source, a coarse scan layer, eased follow. **Delivered** on branch `worktree-view-policy`, 2026-10-20. Pending: live acceptance on the field host. | 3, 10 |
 | 12 | Capture and transcripts | Resumed channels take the shared bank (the bank factory reaches `Node::open`; the channel's path in `job_context`, `bank` in `source_list`, lag lines by stage kind); rates the resampler accepts (a UHD ladder of exact master-clock divisors in the Soapy source, a snapping `Resampler`); the transcript log (`transcripts.log`, `zeta transcripts tail`); pinned captures (`source_pin`/`source_unpin`, `sources/<id>.json`, restored first on resume); live receive gain (`source_set_gain`, `source_list.gain`, persisted); UI pins and `source pin\|unpin\|gain` commands; `ppm=` correction and an automatic squelch in `fm_demod`/`am_demod`. Spec `docs/superpowers/specs/2026-10-21-capture-and-transcripts-design.md`, plan `docs/superpowers/plans/2026-10-21-capture-and-transcripts.md`. Delivered on branch `worktree-view-policy`, 2026-10-21. Pending: live acceptance on the field host. | 8, 10, 11 |
 | 13 | Channel plans | A table-driven channel-plan registry in `zeta-core` (`uhf_cb_au`, 80 channels; `channel_plans` op, `zeta plans`); the page names channels on job rows, outlines and the axis (`view set plan auto\|<id>\|none`); an adjacent-channel guard in `nbfm_demod` for plan channels (a widened channel, the centre filtered in the stage, the gate held closed under a stronger neighbour; `guard_hz`/`guard_db` node params, `adjacent_db`/`guarded` on `squelch` events); `transcribe`'s `min_utterance_ms` (700); a bounded speech-daemon queue (4 connections, `queued_ms`, `busy`/`queue` drop reasons, one EAGAIN retry); optionally `examples/python/cb_watch.py` (demodulators only on active channels). Spec `docs/superpowers/specs/2026-10-21-channel-plans-design.md`, plan `docs/superpowers/plans/2026-10-21-channel-plans.md`. Delivered on branch `plan-13`, 2026-10-21 (tasks 1-5, base plan 12). Pending: live acceptance on the field host. | 10, 11, 12 |
-| 14 | Field fix wave | The four defects of the 2026-10-23 HackRF session: the Soapy clock guard and stream reopen on a rate change (`source_list.stats`), a run generation on job entries so a stopped run cannot outlive its job (`/health` `stages_running`), `measure` partial windows and discard notes (`BankInfo.dropped`), device loss ending in `abandon` and an overflow-storm fault; field craft for a radio in its own process. Plan `docs/superpowers/plans/2026-10-27-field-fix-wave.md`. **Planned** 2026-10-27, branch `plan-14`. | 8, 11, 12 |
+| 14 | Field fix wave | The four defects of the 2026-10-23 HackRF session: the Soapy clock guard and stream reopen on a rate change (`source_list.stats`), a run generation on job entries so a stopped run cannot outlive its job (`/health` `stages_running`), `measure` partial windows and discard notes (`BankInfo.dropped`), device loss ending in `abandon` and an overflow-storm fault; field craft for a radio in its own process. Plan `docs/superpowers/plans/2026-10-27-field-fix-wave.md`. **Delivered** on branch `worktree-plan-14`, 2026-10-27 (tasks 1-5). Pending: live acceptance on the HackRF laptop (plan section "Live acceptance"). | 8, 11, 12 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
@@ -43,6 +43,72 @@ specs are written in a brainstorming session before the plan, as before.
 | 19 | Layer 4 stages | Generic FSK/PSK/OOK demods, clock recovery, slicer, bit viewer with framing and CRC hypotheses, correlator, signature write-back; `measure` symbol-rate and modulation-order upgrades. Two or three plans. | 16 (bits payload) |
 | 20 | Soapy worker process | A `zeta soapy-worker` child owning the driver behind a Port that faults when the child exits, so a driver crash never ends the node. Moves up if plan 14's live acceptance shows the node still dying in-process. | 14 |
 
+
+## Plan 14 status
+
+Plan 14 is delivered on `worktree-plan-14` (tasks 1-5), 2026-10-27. Live acceptance on the HackRF
+laptop is pending (plan section "Live acceptance").
+
+What was built:
+
+- Task 1: the Soapy clock guard: the reader restarts its stream when stamps run 2 s ahead of the
+  wall clock (`MAX_AHEAD_NS`), logs `zeta: soapy <id>: samples ran <n> ms ahead of the clock;
+  stream restarted`, waits out the lead, and faults with `soapy: samples arrive faster than <rate>
+  Hz (<n> stream restarts in 60s)` after more than 5 restarts in 60 s; a rate change reopens the
+  stream; `source_list` items carry `stats` (`PortStats`: `measured_rate_hz`, `overflows`,
+  `timeouts`, `restarts`; `null` without stream statistics).
+- Task 2: a run generation on job entries so a stopped run never outlives its job and every stop
+  waits for its run to release; `GET /health` carries `stages_running`.
+- Task 3: `measure` emits `partial: true` events for a window cut short by a gap, lag or retune
+  (at least 250 ms held, `MIN_PARTIAL_S`); `job_context` carries `measure: {discarded, partial,
+  last}`; `source_list.bank.dropped` counts input blocks the bank dropped.
+- Task 4: a lost device (fatal read, 1 s without samples, a device call failing during a retune,
+  100 consecutive overflows with no samples) ends the reader with no further native call on the
+  dead handle; the source stays faulted and `tune`/`source gain` answer `device lost: <fault>;
+  restart the node`.
+- Task 5: field craft ("Reading a source's health", "A radio in its own process"), README, the
+  four `TODO.md` bug sections closed, this status.
+
+Decision made (ruling R4): a device-call failure during a retune, a driver rejecting a rate
+included, is treated as device loss, because it is indistinguishable from one and the native call
+it avoids is the crash. Zeta picks rates from the device's advertised ranges, so a rejection is
+rare; the cost if wrong is a node restart. Field craft says a source faulted during a retune is
+held until the node restarts.
+
+Gates at the branch head:
+
+- `cargo test --workspace --all-features --no-fail-fast`: 923 passed, 1 failed, 3 ignored (114
+  `test result` lines). The failure was `fake_program_round_trip` (`zeta-ext --test adsb`, event
+  timeout; the same file's `child_exit_fails_the_stage` flaked in plan 13): 6 of 7 reruns alone
+  passed (11 tests in 2.3 s), one failed on a 30 s bound. No `ui e2e skipped`. The UI suite
+  (`ui_scenarios_pass_in_headless_chromium`) ran ok in 238.71 s. The first gate attempt died on a
+  full disk (the shared target dir holds 86 GB); its incremental cache was deleted and the run
+  repeated with `CARGO_INCREMENTAL=0`.
+- `cargo fmt -p` for each of the 17 workspace members, `cargo fmt` on the driver,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`, the driver's clippy with
+  `RUSTFLAGS="--cfg soapy"`, `zeta agents-md --check` and `--skill --check` are clean.
+
+Deferred:
+
+- Task 1: the faulting trip counts as a restart (`restarts` reads 6 for 5 reopens); `restart_times`
+  is not cleared when a tune clears the fault; the unit gate exempts the names restarts/timeouts;
+  the `too_many_restarts` test takes about 12 s; a comment gap on activate failure after open.
+- Task 2: a refused `graph_put` has already persisted its graph (in `TODO.md`); the `done.is_none()`
+  skip can leave a mid-launch elastic job on a stale fit until the next retune; `stages_running`
+  counts forwarders and scan loops and `debug_stage_count` backs a production field (rename);
+  the soak test is sequential and was never shown failing; about 230 lines of helpers are copied
+  into `runs.rs`; a stop inside the record-to-done window returns before release; a stop during an
+  elastic relaunch returns while the relaunch task still holds the lease (a `graph_put` in that
+  window is refused `Stopped`).
+- Task 3: a rate 0 window of 1024 or more samples can reach `measure_band` when cut; the gap test
+  does not assert span >= 0.25 s; the `measure_bank.rs` module doc is stale; `futures_script`'s
+  test module is oddly named.
+- Task 4: the clock-guard reopen failure is not classed as lost while the same failure inside
+  apply is; `interleaved_overflows_never_fault` takes about 6 s; no RED run captured;
+  `source.rs` is about 1010 lines; a reader that loses the device after the post-gate re-check
+  while a tune is past the guard can still reach the new-stream path; the race test does not
+  assert `calls_after_gone()` empty.
+- Plan 13's leftovers stay open.
 
 ## Plan 3 status
 
