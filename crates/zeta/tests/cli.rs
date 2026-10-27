@@ -11,10 +11,14 @@ use serde_json::Value;
 use zeta_source_file::fixtures::write_tone;
 
 /// The `zeta` binary with `ZETA_NODE` and `ZETA_SECRET` removed, so a caller's environment
-/// cannot send a test to a remote node. Every test here starts from this.
+/// cannot send a test to a remote node, and `XDG_CONFIG_HOME` pointed at a directory with
+/// no mode rows, so the developer's own (`~/.config/zetasdr/modes`) never reach a test.
+/// Every test here starts from this.
 fn zeta_bin() -> Command {
     let mut cmd = Command::cargo_bin("zeta").unwrap();
-    cmd.env_remove("ZETA_NODE").env_remove("ZETA_SECRET");
+    cmd.env_remove("ZETA_NODE")
+        .env_remove("ZETA_SECRET")
+        .env("XDG_CONFIG_HOME", common::no_xdg_config());
     cmd
 }
 
@@ -2278,4 +2282,54 @@ fn a_broken_operator_row_is_logged_and_the_node_runs() {
         .assert()
         .success()
         .stderr(contains("zeta: mode pocsag_decode"));
+}
+
+/// `job start --kind` takes a built-in kind's name or any mode id: the node refuses an
+/// id no row has; a kind that is neither is a usage error.
+#[test]
+fn job_start_accepts_a_mode_id_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = |kind: &str| {
+        zeta(
+            dir.path(),
+            &[
+                "job",
+                "start",
+                "--kind",
+                kind,
+                "--source",
+                "tone",
+                "--center-hz",
+                "100000000",
+                "--bandwidth-hz",
+                "12500",
+            ],
+        )
+    };
+    let out = start("pocsag_decode")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(json(&out)["result"], "job");
+    let out = start("flex_decode")
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("unknown mode flex_decode (known: acars_decode, "),
+        "{v}"
+    );
+    start("Nope")
+        .assert()
+        .code(1)
+        .stderr(contains("Nope").and(contains("mode id")));
 }

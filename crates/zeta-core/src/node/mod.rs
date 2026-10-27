@@ -236,6 +236,14 @@ struct Inner {
 }
 
 impl Inner {
+    /// The kind a job recorded as `kind` was expanded from, when the node expands its
+    /// graph: a built-in kind, or a `Mode` the registry has a row for. A record of any
+    /// other kind (a [`Node::job_start`] caller's own name) keeps its graph as stored.
+    pub(crate) fn expandable_kind(&self, kind: &str) -> Option<JobKind> {
+        JobKind::from_name(kind)
+            .filter(|k| !matches!(k, JobKind::Mode(id) if self.modes.get(&id.0).is_none()))
+    }
+
     /// Append `line` to the log `which`. A failure never fails anything; the
     /// first per log is recorded in `persist_errors` as `<name>: <e>`, later
     /// ones are dropped.
@@ -1151,7 +1159,7 @@ impl Node {
     /// record was expanded for (else the source's kept capture) with the source's kept
     /// bank, and without a bank. Makes no bank.
     fn only_carried_params_differ(&self, rec: &JobRecord, graph: &Graph) -> bool {
-        let Some(kind) = JobKind::from_name(&rec.kind) else {
+        let Some(kind) = self.inner.expandable_kind(&rec.kind) else {
             return false;
         };
         if rec.operator_graph || rec.input.is_some() {
@@ -1173,8 +1181,15 @@ impl Node {
         };
         let bin_rates = [kept.and_then(|(_, b)| b), None];
         bin_rates.into_iter().any(|bin_rate| {
-            kind.reexpand(&rec.source, rec.tuning, rate, bin_rate, graph)
-                .is_ok_and(|g| graph::same_pipeline(&g, graph))
+            kind.reexpand(
+                &rec.source,
+                rec.tuning,
+                rate,
+                bin_rate,
+                graph,
+                &self.inner.modes,
+            )
+            .is_ok_and(|g| graph::same_pipeline(&g, graph))
         })
     }
 

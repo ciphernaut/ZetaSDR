@@ -447,11 +447,12 @@ fn parse_replace(s: &str) -> Result<ReplaceIds, String> {
 
 #[derive(Debug, Subcommand)]
 pub enum JobCmd {
-    /// Start a job of a built-in kind on a source
+    /// Start a job of a built-in kind or a mode on a source
     Start {
-        /// Job kind
-        #[arg(long, value_enum)]
-        kind: Kind,
+        /// Job kind: a built-in kind (passthrough, spectrum, fm_demod, wfm_demod,
+        /// am_demod, ssb_demod, measure, scan, or a decoder) or a mode id (`modes list`)
+        #[arg(long, value_name = "KIND", value_parser = parse_job_kind)]
+        kind: JobKind,
         #[command(flatten)]
         band: BandArgs,
         /// FM peak deviation in Hz (100..=75000), fm_demod and wfm_demod only;
@@ -569,52 +570,20 @@ pub enum KnowledgeCmd {
     },
 }
 
-/// Built-in job kinds, mirroring `JobKind`.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum Kind {
-    Passthrough,
-    Spectrum,
-    // Spelled as on the wire, not clap's default `fm-demod`.
-    #[value(name = "fm_demod")]
-    FmDemod,
-    #[value(name = "wfm_demod")]
-    WfmDemod,
-    #[value(name = "am_demod")]
-    AmDemod,
-    #[value(name = "ssb_demod")]
-    SsbDemod,
-    #[value(name = "aprs_decode")]
-    AprsDecode,
-    #[value(name = "pocsag_decode")]
-    PocsagDecode,
-    #[value(name = "rds_decode")]
-    RdsDecode,
-    #[value(name = "acars_decode")]
-    AcarsDecode,
-    #[value(name = "adsb_decode")]
-    AdsbDecode,
-    Measure,
-    Scan,
-}
-
-impl From<Kind> for JobKind {
-    fn from(k: Kind) -> Self {
-        match k {
-            Kind::Passthrough => JobKind::Passthrough,
-            Kind::Spectrum => JobKind::Spectrum,
-            Kind::FmDemod => JobKind::FmDemod,
-            Kind::WfmDemod => JobKind::WfmDemod,
-            Kind::AmDemod => JobKind::AmDemod,
-            Kind::SsbDemod => JobKind::SsbDemod,
-            Kind::AprsDecode => JobKind::AprsDecode,
-            Kind::PocsagDecode => JobKind::PocsagDecode,
-            Kind::RdsDecode => JobKind::RdsDecode,
-            Kind::AcarsDecode => JobKind::AcarsDecode,
-            Kind::AdsbDecode => JobKind::AdsbDecode,
-            Kind::Measure => JobKind::Measure,
-            Kind::Scan => JobKind::Scan,
-        }
-    }
+/// `job start --kind`: a built-in kind's name, or any mode id (`^[a-z][a-z0-9_]*$`; the
+/// node says when it has no such row).
+fn parse_job_kind(s: &str) -> Result<JobKind, String> {
+    JobKind::from_name(s).ok_or_else(|| {
+        let builtins: Vec<&str> = zeta_core::ops::BUILTIN_KINDS
+            .iter()
+            .filter(|k| !k.attachable())
+            .map(JobKind::name)
+            .collect();
+        format!(
+            "expected a built-in kind ({}) or a mode id matching ^[a-z][a-z0-9_]*$",
+            builtins.join(", ")
+        )
+    })
 }
 
 /// Attachable job kinds (`JobKind::attachable`), for `job attach`.
@@ -776,7 +745,7 @@ impl Command {
                 replace,
                 ..
             }) => Op::JobStart {
-                kind: kind.into(),
+                kind,
                 source: SourceId(b.source),
                 center_hz: Hz(b.center_hz),
                 bandwidth_hz: Hz(b.bandwidth_hz),

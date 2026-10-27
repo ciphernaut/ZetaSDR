@@ -413,7 +413,7 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
 }
 
 /// `^[a-z][a-z0-9_]*$`.
-fn is_mode_id(id: &str) -> bool {
+pub fn is_mode_id(id: &str) -> bool {
     let mut b = id.bytes();
     b.next().is_some_and(|c| c.is_ascii_lowercase())
         && b.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')

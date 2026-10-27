@@ -318,6 +318,7 @@ mod tests {
     #[test]
     fn every_job_kind_expands_to_a_valid_graph() {
         let schema = schema();
+        // The patched enum: the built-in kinds and the embedded mode rows' ids.
         let kinds: Vec<JobKind> = schema["op"]["$defs"]["JobKind"]["enum"]
             .as_array()
             .expect("JobKind enum in the schema")
@@ -325,8 +326,21 @@ mod tests {
             .map(|v| serde_json::from_value(v.clone()).unwrap())
             .collect();
         assert!(kinds.len() >= 5, "kinds read from schema: {kinds:?}");
+        for id in [
+            "aprs_decode",
+            "pocsag_decode",
+            "rds_decode",
+            "acars_decode",
+            "adsb_decode",
+        ] {
+            assert!(
+                kinds.iter().any(|k| k.name() == id),
+                "{id} in the schema's kinds: {kinds:?}"
+            );
+        }
         let src = SourceId("src".into());
         let registry = registry(None);
+        let modes = zeta_core::modes::ModeRegistry::load(&registry, None);
         for kind in kinds {
             // An attachable kind is never started on the radio: its graph reads a job.
             if kind.attachable() {
@@ -335,7 +349,7 @@ mod tests {
                     bandwidth_hz: Hz(10_000),
                 };
                 assert!(
-                    matches!(kind.expand(&src, t, Hz(48_000), None, None, None),
+                    matches!(kind.expand(&src, t, Hz(48_000), None, None, None, &modes),
                         Err(OpError::Other { message }) if message.ends_with("use job_attach")),
                     "{kind:?}"
                 );
@@ -356,7 +370,7 @@ mod tests {
                         center_hz: Hz(7_100_000),
                         bandwidth_hz: Hz(bw),
                     };
-                    match kind.expand(&src, tuning, Hz(rate), None, None, None) {
+                    match kind.expand(&src, tuning, Hz(rate), None, None, None, &modes) {
                         // dump1090 needs a band of 2 MHz or more (unless the band is
                         // already wider than the source, refused as for every kind).
                         Err(OpError::OutOfRange { field, min, .. })
@@ -405,9 +419,12 @@ mod tests {
                 bandwidth_hz: Hz(2_400_000),
             };
             let g = JobKind::AdsbDecode
-                .expand(&src, tuning, Hz(rate), None, None, None)
+                .expand(&src, tuning, Hz(rate), None, None, None, &modes)
                 .unwrap();
-            validate(&g, &registry).unwrap_or_else(|e| panic!("adsb_decode {rate}: {e}"));
+            // `external_decode` is registered with the adaptor (plan 16 task 4): the
+            // graph's shape until then.
+            let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+            assert_eq!(kinds, ["channel", "external_decode"], "adsb_decode {rate}");
             assert_eq!(param(&g.nodes[0], "out_rate_hz"), 2_400_000);
         }
     }

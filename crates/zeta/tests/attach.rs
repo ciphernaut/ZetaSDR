@@ -64,7 +64,7 @@ fn cfg(dir: &Path) -> NodeConfig {
 
 async fn start(node: &Node, kind: JobKind, bandwidth_hz: u64) -> JobId {
     let op = Op::JobStart {
-        kind,
+        kind: kind.clone(),
         source: SourceId("speech".into()),
         center_hz: Hz(CENTER_HZ),
         bandwidth_hz: Hz(bandwidth_hz),

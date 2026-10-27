@@ -49,6 +49,7 @@ impl ServeProc {
             .env_remove("ZETA_NODE")
             .env_remove("ZETA_SECRET")
             .env_remove("ZETA_STT_SOCKET")
+            .env("XDG_CONFIG_HOME", no_xdg_config())
             .envs(env.iter().copied())
             .arg("--state-dir")
             .arg(dir.join("state"))
@@ -123,6 +124,12 @@ impl Drop for ServeProc {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// An `XDG_CONFIG_HOME` that holds no mode rows (it does not exist), so a node a test
+/// starts reads only the embedded rows, never the developer's `~/.config/zetasdr/modes`.
+pub fn no_xdg_config() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("zeta-no-xdg-config")
 }
 
 /// `zeta --node <url> --secret <secret> --json <args…>` with the environment cleared of both variables.

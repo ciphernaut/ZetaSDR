@@ -8,6 +8,7 @@
 //! force), so a bad row never stops the node.
 
 mod row;
+pub mod template;
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +20,7 @@ use crate::stage::StageRegistry;
 pub use row::{
     Band, Decoder, DecoderKind, Event, Family, Identify, InputStream, InputVia, Install, ModeId,
     ModeRow, OutputVia, Parser, ProgramBlock, ProgramInput, ProgramOutput, Proof, QUICK_ATTEMPTS,
-    RowError, RowTest, SampleFormat, TestSpec, parse, validate,
+    RowError, RowTest, SampleFormat, TestSpec, is_mode_id, parse, validate,
 };
 
 /// Where a loaded row stands: `ready` (parsed, validated and, for a program row, its

@@ -445,7 +445,7 @@ async fn job_start_reexpands_when_lease_rate_differs() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let g = JobKind::Passthrough
-            .expand(&source, wide, wide.bandwidth_hz, None, None, None)
+            .expand(&source, wide, wide.bandwidth_hz, None, None, None, &modes())
             .unwrap();
         node.job_start("passthrough", source.clone(), wide, g, None, false)
             .await
@@ -1067,7 +1067,15 @@ fn transcribe_expands_attached_to_stream_in_denoise_vad_transcribe() {
         bandwidth_hz: Hz(48_000),
     };
     assert_eq!(
-        JobKind::Transcribe.expand(&SourceId("s".into()), t, Hz(48_000), None, None, None),
+        JobKind::Transcribe.expand(
+            &SourceId("s".into()),
+            t,
+            Hz(48_000),
+            None,
+            None,
+            None,
+            &modes()
+        ),
         Err(OpError::Other {
             message: "transcribe attaches to a job: use job_attach".into()
         })
@@ -1089,6 +1097,7 @@ fn spectrum_kind_expands_to_single_fft_node() {
             None,
             None,
             None,
+            &modes(),
         )
         .unwrap();
     assert_eq!(g.nodes.len(), 1);
@@ -1114,6 +1123,7 @@ fn spectrum_expansion_picks_size_from_the_band() {
                 None,
                 None,
                 None,
+                &modes(),
             )
             .unwrap();
         assert_eq!(g.nodes[0].params["rows_per_s"], 20);
@@ -1144,6 +1154,7 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
             None,
             None,
             None,
+            &modes(),
         )
         .unwrap();
     assert_eq!(g.nodes.len(), 2);
@@ -1182,6 +1193,7 @@ fn measure_kind_expands_to_channel_then_measure() {
             None,
             None,
             None,
+            &modes(),
         )
         .unwrap();
     assert_eq!(g.nodes.len(), 2);
@@ -1202,7 +1214,15 @@ fn measure_kind_expands_to_channel_then_measure() {
     // Channelised, so an unknown source rate is refused.
     assert!(
         JobKind::Measure
-            .expand(&SourceId("file0".into()), tuning, Hz(0), None, None, None)
+            .expand(
+                &SourceId("file0".into()),
+                tuning,
+                Hz(0),
+                None,
+                None,
+                None,
+                &modes()
+            )
             .is_err()
     );
 }
@@ -1240,7 +1260,7 @@ fn expand_uses_source_rate_for_channel_and_audio() {
         bandwidth_hz: Hz(12_500),
     };
     let g = JobKind::FmDemod
-        .expand(&src, tuning, Hz(2_048_000), None, None, None)
+        .expand(&src, tuning, Hz(2_048_000), None, None, None, &modes())
         .unwrap();
     assert_eq!(rates(&g), (51_200, AUDIO_RATE_HZ));
     let tuning = Tuning {
@@ -1248,11 +1268,11 @@ fn expand_uses_source_rate_for_channel_and_audio() {
         bandwidth_hz: Hz(10_000),
     };
     let g = JobKind::FmDemod
-        .expand(&src, tuning, Hz(12_000), None, None, None)
+        .expand(&src, tuning, Hz(12_000), None, None, None, &modes())
         .unwrap();
     assert_eq!(rates(&g), (12_000, AUDIO_RATE_HZ));
     let g = JobKind::AprsDecode
-        .expand(&src, tuning, Hz(12_000), None, None, None)
+        .expand(&src, tuning, Hz(12_000), None, None, None, &modes())
         .unwrap();
     assert_eq!(rates(&g), (12_000, AUDIO_RATE_HZ));
     assert_eq!(g.nodes[1].params["deviation_hz"], 3_000);
@@ -1267,7 +1287,15 @@ fn bank_served_channel_rate_divides_the_bin_rate() {
             bandwidth_hz: Hz(bw),
         };
         let g = JobKind::FmDemod
-            .expand(&src, tuning, Hz(source_rate), bin_rate, None, None)
+            .expand(
+                &src,
+                tuning,
+                Hz(source_rate),
+                bin_rate,
+                None,
+                None,
+                &modes(),
+            )
             .unwrap();
         g.nodes[0].params["out_rate_hz"].as_u64().unwrap()
     };
@@ -1302,6 +1330,7 @@ fn fm_demod_expansion_outputs_48k_audio() {
             None,
             None,
             None,
+            &modes(),
         )
         .unwrap();
     assert_eq!(g.nodes[0].kind, "channel");
@@ -1324,6 +1353,7 @@ fn expand_rejects_band_wider_than_channel_rate() {
             None,
             None,
             None,
+            &modes(),
         )
         .unwrap_err();
     assert_eq!(
@@ -1345,7 +1375,15 @@ fn expand_rejects_unknown_source_rate() {
         bandwidth_hz: Hz(10_000),
     };
     let err = JobKind::AprsDecode
-        .expand(&SourceId("kiwi0".into()), tuning, Hz(0), None, None, None)
+        .expand(
+            &SourceId("kiwi0".into()),
+            tuning,
+            Hz(0),
+            None,
+            None,
+            None,
+            &modes(),
+        )
         .unwrap_err();
     assert_eq!(
         err,
@@ -1587,6 +1625,7 @@ fn fm_demod_default_deviation_is_5000() {
             None,
             None,
             None,
+            &modes(),
         )
         .unwrap();
     assert_eq!(g.nodes[1].params["deviation_hz"], 5_000);
@@ -1603,6 +1642,7 @@ fn deviation_param_reaches_nbfm_node() {
             None,
             Some(Hz(2_500)),
             None,
+            &modes(),
         )
         .unwrap();
     assert_eq!(g.nodes[1].params["deviation_hz"], 2_500);
@@ -1663,7 +1703,7 @@ async fn deviation_on_other_kind_rejected() {
     .await
     .unwrap();
     for kind in [JobKind::Measure, JobKind::AprsDecode] {
-        match node.apply(start_with(kind, Some(5_000))).await {
+        match node.apply(start_with(kind.clone(), Some(5_000))).await {
             Err(OpError::Other { message }) => {
                 assert!(
                     message.starts_with("deviation_hz applies only"),
@@ -1707,7 +1747,7 @@ fn demod_graphs_carry_the_squelch_params() {
         (JobKind::AmDemod, "am_demod"),
     ] {
         let g = kind
-            .expand(&src, tuning, Hz(48_000), None, None, None)
+            .expand(&src, tuning, Hz(48_000), None, None, None, &modes())
             .unwrap();
         let n = g.nodes.iter().find(|n| n.kind == demod).expect(demod);
         assert_eq!(n.params["squelch_db"], serde_json::Value::Null, "{kind:?}");
@@ -1720,7 +1760,7 @@ fn demod_graphs_carry_the_squelch_params() {
             m.params["squelch"] = false.into();
         }
         let again = kind
-            .reexpand(&src, tuning, Hz(96_000), None, &stored)
+            .reexpand(&src, tuning, Hz(96_000), None, &stored, &modes())
             .unwrap();
         let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
         assert_eq!(n.params["squelch_db"], -70, "{kind:?}");
@@ -1732,7 +1772,9 @@ fn demod_graphs_carry_the_squelch_params() {
             o.remove("squelch_db");
             o.remove("squelch");
         }
-        let again = kind.reexpand(&src, tuning, Hz(96_000), None, &old).unwrap();
+        let again = kind
+            .reexpand(&src, tuning, Hz(96_000), None, &old, &modes())
+            .unwrap();
         let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
         assert_eq!(n.params["squelch"], true, "{kind:?}");
     }
@@ -2137,6 +2179,7 @@ fn wfm_expansion_is_channel_then_wfm_demod() {
                 None,
                 deviation,
                 None,
+                &modes(),
             )
             .unwrap();
         assert_eq!(g.nodes.len(), 2);
@@ -2176,6 +2219,7 @@ fn am_expansion_is_channel_then_am_demod() {
             None,
             None,
             None,
+            &modes(),
         )
         .unwrap();
     assert_eq!(g.nodes.len(), 2);
@@ -2215,6 +2259,7 @@ fn ssb_expansion_defaults_to_usb() {
                 None,
                 None,
                 sideband,
+                &modes(),
             )
             .unwrap();
         assert_eq!(g.nodes.len(), 2);
@@ -2289,7 +2334,7 @@ fn pocsag_decode_expands_channel_to_decoder() {
     };
     assert_eq!(JobKind::PocsagDecode.name(), "pocsag_decode");
     let g = JobKind::PocsagDecode
-        .expand(&src, tuning, Hz(48_000), None, None, None)
+        .expand(&src, tuning, Hz(48_000), None, None, None, &modes())
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["channel", "pocsag_decode"]);
@@ -2309,7 +2354,7 @@ fn rds_decode_expands_channel_to_decoder() {
     };
     assert_eq!(JobKind::RdsDecode.name(), "rds_decode");
     let g = JobKind::RdsDecode
-        .expand(&src, tuning, Hz(240_000), None, None, None)
+        .expand(&src, tuning, Hz(240_000), None, None, None, &modes())
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["channel", "rds_decode"]);
@@ -2321,7 +2366,7 @@ fn rds_decode_expands_channel_to_decoder() {
 }
 
 #[test]
-fn adsb_decode_expands_channel_to_decoder() {
+fn adsb_row_expands_to_channel_then_external_decode() {
     let src = SourceId("b210".into());
     let tuning = Tuning {
         center_hz: Hz(1_090_000_000),
@@ -2329,12 +2374,18 @@ fn adsb_decode_expands_channel_to_decoder() {
     };
     assert_eq!(JobKind::AdsbDecode.name(), "adsb_decode");
     let g = JobKind::AdsbDecode
-        .expand(&src, tuning, Hz(2_400_000), None, None, None)
+        .expand(&src, tuning, Hz(2_400_000), None, None, None, &modes())
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
-    assert_eq!(kinds, ["channel", "adsb_decode"]);
-    assert_eq!(g.nodes[0].params["out_rate_hz"], 2_400_000);
-    assert_eq!(g.nodes[1].params, serde_json::json!({}));
+    assert_eq!(kinds, ["channel", "external_decode"]);
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"center_hz": 1_090_000_000, "bandwidth_hz": 2_400_000, "out_rate_hz": 2_400_000})
+    );
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({"mode": "adsb_decode"})
+    );
     assert_eq!(g.edges.len(), 1);
     assert_eq!(g.edges[0].kind, StreamKind::Iq);
     assert_eq!(g.edges[0].from, g.nodes[0].id);
@@ -2348,7 +2399,7 @@ fn adsb_expand_refuses_narrow_band() {
         center_hz: Hz(1_090_000_000),
         bandwidth_hz: Hz(1_000_000),
     };
-    match JobKind::AdsbDecode.expand(&src, tuning, Hz(8_000_000), None, None, None) {
+    match JobKind::AdsbDecode.expand(&src, tuning, Hz(8_000_000), None, None, None, &modes()) {
         Err(OpError::OutOfRange {
             field,
             value,
@@ -2375,7 +2426,7 @@ fn acars_decode_expands_channel_to_decoder() {
     };
     assert_eq!(JobKind::AcarsDecode.name(), "acars_decode");
     let g = JobKind::AcarsDecode
-        .expand(&src, tuning, Hz(240_000), None, None, None)
+        .expand(&src, tuning, Hz(240_000), None, None, None, &modes())
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["channel", "acars_decode"]);
@@ -2400,6 +2451,7 @@ fn cb_graph(center_hz: u64) -> zeta_core::graph::Graph {
             Some(256_000),
             None,
             None,
+            &modes(),
         )
         .unwrap()
 }
@@ -2432,6 +2484,7 @@ fn plan_channels_carry_the_guard() {
             None,
             None,
             None,
+            &modes(),
         )
         .unwrap();
     assert!(narrow.nodes[0].params.get("wide_hz").is_none());
@@ -2480,7 +2533,7 @@ fn reexpand_carries_the_guard_params() {
         n.params["guard_db"] = 20.into();
     }
     let again = JobKind::FmDemod
-        .reexpand(&src, tuning, Hz(512_000), None, &stored)
+        .reexpand(&src, tuning, Hz(512_000), None, &stored, &modes())
         .unwrap();
     let demod = &again.nodes[1].params;
     assert!(
@@ -2501,8 +2554,251 @@ fn reexpand_carries_the_guard_params() {
         old.nodes[1].params.as_object_mut().unwrap().remove(k);
     }
     let again = JobKind::FmDemod
-        .reexpand(&src, tuning, Hz(512_000), None, &old)
+        .reexpand(&src, tuning, Hz(512_000), None, &old, &modes())
         .unwrap();
     assert_eq!(again.nodes[1].params["guard_hz"], 12_500);
     assert_eq!(again.nodes[0].params["wide_hz"], 37_500);
+}
+
+/// The mode registry a node with the DSP stages loads: every embedded row ready.
+fn modes() -> zeta_core::modes::ModeRegistry {
+    let mut stages = StageRegistry::new();
+    zeta_dsp::register_all(&mut stages);
+    zeta_core::modes::ModeRegistry::load(&stages, None)
+}
+
+/// Plan 15's `aprs_decode`, `pocsag_decode`, `rds_decode` and `acars_decode` arms of
+/// `JobKind::expand`, verbatim, at the channel rate `out` that `expand` picks.
+fn legacy_expand(kind: &JobKind, tuning: Tuning, out: u64) -> zeta_core::graph::Graph {
+    use zeta_core::graph::{Edge, Graph, GraphId, Node as GraphNode, NodeId};
+    match kind {
+        JobKind::AprsDecode => {
+            let (channel, demod, decode) = (NodeId::new(), NodeId::new(), NodeId::new());
+            Graph {
+                id: GraphId::new(),
+                nodes: vec![
+                    GraphNode {
+                        id: channel.clone(),
+                        kind: "channel".into(),
+                        params: serde_json::json!({
+                            "center_hz": tuning.center_hz.0,
+                            "bandwidth_hz": tuning.bandwidth_hz.0,
+                            "out_rate_hz": out,
+                        }),
+                    },
+                    GraphNode {
+                        id: demod.clone(),
+                        kind: "nbfm_demod".into(),
+                        // The decoder reads every block, however weak: no squelch.
+                        params: serde_json::json!({
+                            "deviation_hz": 3_000,
+                            "audio_rate_hz": AUDIO_RATE_HZ,
+                            "squelch_db": null,
+                            "squelch": false,
+                        }),
+                    },
+                    GraphNode {
+                        id: decode.clone(),
+                        kind: "aprs_decode".into(),
+                        params: serde_json::json!({}),
+                    },
+                ],
+                edges: vec![
+                    Edge {
+                        from: channel,
+                        to: demod.clone(),
+                        kind: StreamKind::Iq,
+                    },
+                    Edge {
+                        from: demod,
+                        to: decode,
+                        kind: StreamKind::Audio,
+                    },
+                ],
+            }
+        }
+        JobKind::PocsagDecode => {
+            let (channel, decode) = (NodeId::new(), NodeId::new());
+            Graph {
+                id: GraphId::new(),
+                nodes: vec![
+                    GraphNode {
+                        id: channel.clone(),
+                        kind: "channel".into(),
+                        params: serde_json::json!({
+                            "center_hz": tuning.center_hz.0,
+                            "bandwidth_hz": tuning.bandwidth_hz.0,
+                            "out_rate_hz": out,
+                        }),
+                    },
+                    GraphNode {
+                        id: decode.clone(),
+                        kind: "pocsag_decode".into(),
+                        params: serde_json::json!({}),
+                    },
+                ],
+                edges: vec![Edge {
+                    from: channel,
+                    to: decode,
+                    kind: StreamKind::Iq,
+                }],
+            }
+        }
+        JobKind::RdsDecode => {
+            let (channel, decode) = (NodeId::new(), NodeId::new());
+            Graph {
+                id: GraphId::new(),
+                nodes: vec![
+                    GraphNode {
+                        id: channel.clone(),
+                        kind: "channel".into(),
+                        params: serde_json::json!({
+                            "center_hz": tuning.center_hz.0,
+                            "bandwidth_hz": tuning.bandwidth_hz.0,
+                            "out_rate_hz": out,
+                        }),
+                    },
+                    GraphNode {
+                        id: decode.clone(),
+                        kind: "rds_decode".into(),
+                        params: serde_json::json!({}),
+                    },
+                ],
+                edges: vec![Edge {
+                    from: channel,
+                    to: decode,
+                    kind: StreamKind::Iq,
+                }],
+            }
+        }
+        JobKind::AcarsDecode => {
+            let (channel, decode) = (NodeId::new(), NodeId::new());
+            Graph {
+                id: GraphId::new(),
+                nodes: vec![
+                    GraphNode {
+                        id: channel.clone(),
+                        kind: "channel".into(),
+                        params: serde_json::json!({
+                            "center_hz": tuning.center_hz.0,
+                            "bandwidth_hz": tuning.bandwidth_hz.0,
+                            "out_rate_hz": out,
+                        }),
+                    },
+                    GraphNode {
+                        id: decode.clone(),
+                        kind: "acars_decode".into(),
+                        params: serde_json::json!({}),
+                    },
+                ],
+                edges: vec![Edge {
+                    from: channel,
+                    to: decode,
+                    kind: StreamKind::Iq,
+                }],
+            }
+        }
+        other => panic!("no legacy arm for {other:?}"),
+    }
+}
+
+/// The four in-crate decoder kinds expand from their rows to exactly plan 15's graphs,
+/// on a bank bin and on the source rate.
+#[test]
+fn decoder_rows_expand_to_todays_graphs() {
+    let src = SourceId("b210".into());
+    let modes = modes();
+    let cases = [
+        (144_800_000u64, 12_500u64, 2_048_000u64, Some(256_000u64)),
+        (104_900_000, 200_000, 2_048_000, None),
+    ];
+    for kind in [
+        JobKind::AprsDecode,
+        JobKind::PocsagDecode,
+        JobKind::RdsDecode,
+        JobKind::AcarsDecode,
+    ] {
+        for (center, bw, rate, bin_rate) in cases {
+            let tuning = Tuning {
+                center_hz: Hz(center),
+                bandwidth_hz: Hz(bw),
+            };
+            let out = match bin_rate {
+                Some(b) if bw <= b / 2 => channel_rate_hz(b, bw),
+                _ => channel_rate_hz(rate, bw),
+            };
+            let g = kind
+                .expand(&src, tuning, Hz(rate), bin_rate, None, None, &modes)
+                .unwrap();
+            let want = legacy_expand(&kind, tuning, out);
+            assert!(
+                zeta_core::graph::same_pipeline(&g, &want),
+                "{kind:?} {center} {bw}: {g:?}\nwant {want:?}"
+            );
+            // Fresh ids, as the arms gave: no template id leaks into the job's graph.
+            for n in &g.nodes {
+                assert!(!["channel", "demod", "decode"].contains(&n.id.0.as_str()));
+            }
+        }
+    }
+}
+
+/// `job_start` of an id no row has names the ids the registry has, and tunes nothing.
+#[tokio::test]
+async fn an_unknown_mode_id_names_the_known_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stages = registry();
+    zeta_dsp::register_all(&mut stages);
+    let port = Arc::new(WidePort::new("rtl0"));
+    let node = Node::open(cfg(dir.path()), stages, vec![port.clone() as Arc<dyn Port>])
+        .await
+        .unwrap();
+    let op: Op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "flex_decode", "source": "rtl0",
+        "center_hz": 929_612_500u64, "bandwidth_hz": 25_000, "deviation_hz": null,
+        "sideband": null, "elastic": false, "replace": [],
+    }))
+    .unwrap();
+    match node.apply(op).await {
+        Err(OpError::Other { message }) => {
+            assert!(
+                message.starts_with("unknown mode flex_decode (known: "),
+                "{message}"
+            );
+            assert!(message.contains("pocsag_decode"), "{message}");
+        }
+        other => panic!("expected other, got {other:?}"),
+    }
+    assert!(node.job_list().is_empty());
+    assert_eq!(port.current(), None);
+}
+
+/// Built-in kinds keep their wire names; any other lowercase id is a mode; anything
+/// else does not deserialise.
+#[test]
+fn job_kind_roundtrips_built_ins_and_mode_ids() {
+    use zeta_core::modes::ModeId;
+    for (wire, kind) in [
+        ("passthrough", JobKind::Passthrough),
+        ("fm_demod", JobKind::FmDemod),
+        ("pocsag_decode", JobKind::PocsagDecode),
+        ("adsb_decode", JobKind::AdsbDecode),
+        ("transcribe", JobKind::Transcribe),
+        ("flex_decode", JobKind::Mode(ModeId("flex_decode".into()))),
+        ("m17", JobKind::Mode(ModeId("m17".into()))),
+    ] {
+        let v = serde_json::Value::from(wire);
+        assert_eq!(serde_json::from_value::<JobKind>(v.clone()).unwrap(), kind);
+        assert_eq!(serde_json::to_value(&kind).unwrap(), v);
+        assert_eq!(kind.name(), wire);
+        assert_eq!(JobKind::from_name(wire), Some(kind));
+    }
+    for bad in ["Nope", "", "9lives", "flex-decode", "a b"] {
+        assert!(
+            serde_json::from_value::<JobKind>(bad.into()).is_err(),
+            "{bad:?}"
+        );
+        assert_eq!(JobKind::from_name(bad), None, "{bad:?}");
+    }
+    assert!(serde_json::from_value::<JobKind>(serde_json::json!(3)).is_err());
 }

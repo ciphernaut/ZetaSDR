@@ -15,7 +15,10 @@ use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::JobRecord;
 use crate::knowledge::{Allocation, Signature};
 use crate::lease::LeaseError;
-use crate::modes::{Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeState};
+use crate::modes::{
+    Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow, ModeState,
+    is_mode_id, template,
+};
 use crate::node::{AfterGate, Node, NodeError};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning};
 use crate::ring::RingError;
@@ -306,10 +309,6 @@ pub const WFM_DEVIATION_DEFAULT_HZ: u64 = 75_000;
 pub const WFM_DEEMPHASIS_US: u64 = 50;
 const FM_DEVIATION_MIN_HZ: u64 = 100;
 const FM_DEVIATION_MAX_HZ: u64 = 75_000;
-/// `adsb_decode` needs most of dump1090's 2.4 MHz: narrower bands are refused.
-const ADSB_BANDWIDTH_MIN_HZ: u64 = 2_000_000;
-/// The band `adsb_decode` is meant to be given (dump1090's sample rate).
-const ADSB_BANDWIDTH_HZ: u64 = 2_400_000;
 
 /// Built-in job kinds; each expands to a graph. `fm_demod`, `wfm_demod` and
 /// `aprs_decode`, `pocsag_decode`, `rds_decode`, `acars_decode` and `adsb_decode` channelise the job band at the narrowest exact divisor of the source rate
@@ -321,11 +320,15 @@ const ADSB_BANDWIDTH_HZ: u64 = 2_400_000;
 /// dwelling [`SCAN_DWELL_MS`] on each step, and emits spectrum rows tagged
 /// with each step's `center_hz` while holding the whole band, so every other
 /// request on the source is a conflict until the scan is stopped.
-/// `adsb_decode` refuses a band under 2 MHz (dump1090 needs most of its 2.4 MHz).
 /// `transcribe` is attachable, not started on the radio: `job_attach` runs it on another
 /// job's audio (see [`JobKind::expand_attached`]); `job_start` refuses it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+///
+/// The decoder kinds (`aprs_decode`, `pocsag_decode`, `rds_decode`, `acars_decode`,
+/// `adsb_decode`) and [`JobKind::Mode`] expand from their mode rows (see
+/// [`crate::modes`]); `adsb_decode`'s row refuses a band under 2 MHz (dump1090 needs most
+/// of its 2.4 MHz). On the wire a kind is its name: a built-in one (see [`BUILTIN_KINDS`])
+/// or any other id matching `^[a-z][a-z0-9_]*$`, which is a `Mode`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobKind {
     Passthrough,
     Spectrum,
@@ -341,11 +344,62 @@ pub enum JobKind {
     Measure,
     Scan,
     Transcribe,
+    /// A mode row's id that is not a built-in kind's name (an operator's row).
+    Mode(ModeId),
+}
+
+/// The built-in kinds, in the order `schema` lists them: every kind but [`JobKind::Mode`].
+pub static BUILTIN_KINDS: [JobKind; 14] = [
+    JobKind::Passthrough,
+    JobKind::Spectrum,
+    JobKind::FmDemod,
+    JobKind::WfmDemod,
+    JobKind::AmDemod,
+    JobKind::SsbDemod,
+    JobKind::AprsDecode,
+    JobKind::PocsagDecode,
+    JobKind::RdsDecode,
+    JobKind::AcarsDecode,
+    JobKind::AdsbDecode,
+    JobKind::Measure,
+    JobKind::Scan,
+    JobKind::Transcribe,
+];
+
+impl Serialize for JobKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for JobKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let name = std::borrow::Cow::<str>::deserialize(d)?;
+        JobKind::from_name(&name).ok_or_else(|| {
+            let builtins: Vec<&str> = BUILTIN_KINDS.iter().map(JobKind::name).collect();
+            serde::de::Error::custom(format!(
+                "unknown job kind {name:?}: expected one of {} or a mode id matching ^[a-z][a-z0-9_]*$",
+                builtins.join(", ")
+            ))
+        })
+    }
+}
+
+/// The built-in names only; [`schema`] adds the embedded mode rows' ids.
+impl JsonSchema for JobKind {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "JobKind".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let names: Vec<&str> = BUILTIN_KINDS.iter().map(JobKind::name).collect();
+        schemars::json_schema!({ "type": "string", "enum": names })
+    }
 }
 
 impl JobKind {
     /// The kind's wire name, also recorded as the job's `kind`.
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             JobKind::Passthrough => "passthrough",
             JobKind::Spectrum => "spectrum",
@@ -361,7 +415,46 @@ impl JobKind {
             JobKind::Measure => "measure",
             JobKind::Scan => "scan",
             JobKind::Transcribe => "transcribe",
+            JobKind::Mode(id) => &id.0,
         }
+    }
+
+    /// The id of the mode row the kind expands from: a decoder kind's own name, a
+    /// `Mode`'s id; `None` for the other built-in kinds.
+    fn mode_id(&self) -> Option<&str> {
+        match self {
+            JobKind::AprsDecode
+            | JobKind::PocsagDecode
+            | JobKind::RdsDecode
+            | JobKind::AcarsDecode
+            | JobKind::AdsbDecode => Some(self.name()),
+            JobKind::Mode(id) => Some(&id.0),
+            _ => None,
+        }
+    }
+
+    /// The ready row of `modes` the kind expands from (`None` for a kind without one).
+    /// A missing row is `other("unknown mode <id> (known: ...)")`, a row that is not
+    /// ready `other("mode <id> is <state>: <reason>")`.
+    pub fn mode_row<'a>(&self, modes: &'a ModeRegistry) -> Result<Option<&'a ModeRow>, OpError> {
+        let Some(id) = self.mode_id() else {
+            return Ok(None);
+        };
+        let m = modes.get(id).ok_or_else(|| {
+            other(format!(
+                "unknown mode {id} (known: {})",
+                modes.ids().join(", ")
+            ))
+        })?;
+        let state = match m.state {
+            ModeState::Ready => return Ok(Some(&m.row)),
+            ModeState::Broken => "broken",
+            ModeState::Unavailable => "unavailable",
+        };
+        Err(other(format!(
+            "mode {id} is {state}: {}",
+            m.reason.as_deref().unwrap_or_default()
+        )))
     }
 
     /// Whether `job_start` may start the kind `elastic` (following the capture).
@@ -433,9 +526,14 @@ impl JobKind {
         })
     }
 
-    /// The built-in kind recorded as `name` (see [`JobKind::name`]), if any.
+    /// The kind recorded as `name` (see [`JobKind::name`]): a built-in kind, else a
+    /// `Mode` when `name` is a mode id (`^[a-z][a-z0-9_]*$`), else `None`.
     pub fn from_name(name: &str) -> Option<JobKind> {
-        serde_json::from_value(serde_json::Value::from(name)).ok()
+        BUILTIN_KINDS
+            .iter()
+            .find(|k| k.name() == name)
+            .cloned()
+            .or_else(|| is_mode_id(name).then(|| JobKind::Mode(ModeId(name.into()))))
     }
 
     /// [`JobKind::expand`] again for a resumed job whose `stored` graph was expanded for
@@ -452,6 +550,7 @@ impl JobKind {
         source_rate_hz: Hz,
         bank_bin_rate_hz: Option<u64>,
         stored: &Graph,
+        modes: &ModeRegistry,
     ) -> Result<Graph, OpError> {
         let param = |key: &str| stored.nodes.iter().find_map(|n| n.params.get(key).cloned());
         let deviation_hz = param("deviation_hz").and_then(|v| v.as_u64()).map(Hz);
@@ -463,6 +562,7 @@ impl JobKind {
             bank_bin_rate_hz,
             deviation_hz,
             sideband,
+            modes,
         )?;
         for n in &mut g.nodes {
             let Some(old) = stored.nodes.iter().find(|o| o.kind == n.kind) else {
@@ -493,6 +593,7 @@ impl JobKind {
                 | JobKind::AcarsDecode
                 | JobKind::AdsbDecode
                 | JobKind::Measure
+                | JobKind::Mode(_)
         )
     }
 
@@ -504,6 +605,10 @@ impl JobKind {
     /// has one (twice the bin width). A band no wider than a bin is served by
     /// the bank, so its channel rate is [`channel_rate_hz`] of the bin rate;
     /// otherwise of the source rate.
+    ///
+    /// A decoder kind or a `Mode` expands from its ready row of `modes` (see
+    /// [`JobKind::mode_row`] and [`template::expand`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn expand(
         &self,
         _source: &SourceId,
@@ -512,10 +617,12 @@ impl JobKind {
         bank_bin_rate_hz: Option<u64>,
         deviation_hz: Option<Hz>,
         sideband: Option<Sideband>,
+        modes: &ModeRegistry,
     ) -> Result<Graph, OpError> {
         if self.attachable() {
             return Err(self.start_refusal());
         }
+        let row = self.mode_row(modes)?;
         let bw = tuning.bandwidth_hz.0;
         let out = match bank_bin_rate_hz {
             Some(bin_rate) if bw <= bin_rate / 2 => channel_rate_hz(bin_rate, bw),
@@ -537,17 +644,18 @@ impl JobKind {
                 });
             }
         }
-        if *self == JobKind::AdsbDecode && bw < ADSB_BANDWIDTH_MIN_HZ {
-            return Err(OpError::OutOfRange {
-                field: "bandwidth_hz".into(),
-                value: bw,
-                min: ADSB_BANDWIDTH_MIN_HZ,
-                max: source_rate_hz.0,
-                suggested: Some(ADSB_BANDWIDTH_HZ),
-            });
+        if let Some(row) = row {
+            template::check_band(row, tuning, source_rate_hz.0)?;
+            return template::expand(row, tuning, out);
         }
         Ok(match self {
             JobKind::Transcribe => unreachable!("refused above: attachable"),
+            JobKind::AprsDecode
+            | JobKind::PocsagDecode
+            | JobKind::RdsDecode
+            | JobKind::AcarsDecode
+            | JobKind::AdsbDecode
+            | JobKind::Mode(_) => unreachable!("expanded above from the row"),
             JobKind::Scan => Graph {
                 id: GraphId::new(),
                 nodes: vec![],
@@ -736,159 +844,6 @@ impl JobKind {
                     edges: vec![Edge {
                         from: channel,
                         to: demod,
-                        kind: StreamKind::Iq,
-                    }],
-                }
-            }
-            JobKind::AprsDecode => {
-                let (channel, demod, decode) = (NodeId::new(), NodeId::new(), NodeId::new());
-                Graph {
-                    id: GraphId::new(),
-                    nodes: vec![
-                        GraphNode {
-                            id: channel.clone(),
-                            kind: "channel".into(),
-                            params: serde_json::json!({
-                                "center_hz": tuning.center_hz.0,
-                                "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": out,
-                            }),
-                        },
-                        GraphNode {
-                            id: demod.clone(),
-                            kind: "nbfm_demod".into(),
-                            // The decoder reads every block, however weak: no squelch.
-                            params: serde_json::json!({
-                                "deviation_hz": 3_000,
-                                "audio_rate_hz": AUDIO_RATE_HZ,
-                                "squelch_db": null,
-                                "squelch": false,
-                            }),
-                        },
-                        GraphNode {
-                            id: decode.clone(),
-                            kind: "aprs_decode".into(),
-                            params: serde_json::json!({}),
-                        },
-                    ],
-                    edges: vec![
-                        Edge {
-                            from: channel,
-                            to: demod.clone(),
-                            kind: StreamKind::Iq,
-                        },
-                        Edge {
-                            from: demod,
-                            to: decode,
-                            kind: StreamKind::Audio,
-                        },
-                    ],
-                }
-            }
-            JobKind::PocsagDecode => {
-                let (channel, decode) = (NodeId::new(), NodeId::new());
-                Graph {
-                    id: GraphId::new(),
-                    nodes: vec![
-                        GraphNode {
-                            id: channel.clone(),
-                            kind: "channel".into(),
-                            params: serde_json::json!({
-                                "center_hz": tuning.center_hz.0,
-                                "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": out,
-                            }),
-                        },
-                        GraphNode {
-                            id: decode.clone(),
-                            kind: "pocsag_decode".into(),
-                            params: serde_json::json!({}),
-                        },
-                    ],
-                    edges: vec![Edge {
-                        from: channel,
-                        to: decode,
-                        kind: StreamKind::Iq,
-                    }],
-                }
-            }
-            JobKind::RdsDecode => {
-                let (channel, decode) = (NodeId::new(), NodeId::new());
-                Graph {
-                    id: GraphId::new(),
-                    nodes: vec![
-                        GraphNode {
-                            id: channel.clone(),
-                            kind: "channel".into(),
-                            params: serde_json::json!({
-                                "center_hz": tuning.center_hz.0,
-                                "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": out,
-                            }),
-                        },
-                        GraphNode {
-                            id: decode.clone(),
-                            kind: "rds_decode".into(),
-                            params: serde_json::json!({}),
-                        },
-                    ],
-                    edges: vec![Edge {
-                        from: channel,
-                        to: decode,
-                        kind: StreamKind::Iq,
-                    }],
-                }
-            }
-            JobKind::AcarsDecode => {
-                let (channel, decode) = (NodeId::new(), NodeId::new());
-                Graph {
-                    id: GraphId::new(),
-                    nodes: vec![
-                        GraphNode {
-                            id: channel.clone(),
-                            kind: "channel".into(),
-                            params: serde_json::json!({
-                                "center_hz": tuning.center_hz.0,
-                                "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": out,
-                            }),
-                        },
-                        GraphNode {
-                            id: decode.clone(),
-                            kind: "acars_decode".into(),
-                            params: serde_json::json!({}),
-                        },
-                    ],
-                    edges: vec![Edge {
-                        from: channel,
-                        to: decode,
-                        kind: StreamKind::Iq,
-                    }],
-                }
-            }
-            JobKind::AdsbDecode => {
-                let (channel, decode) = (NodeId::new(), NodeId::new());
-                Graph {
-                    id: GraphId::new(),
-                    nodes: vec![
-                        GraphNode {
-                            id: channel.clone(),
-                            kind: "channel".into(),
-                            params: serde_json::json!({
-                                "center_hz": tuning.center_hz.0,
-                                "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": out,
-                            }),
-                        },
-                        GraphNode {
-                            id: decode.clone(),
-                            kind: "adsb_decode".into(),
-                            params: serde_json::json!({}),
-                        },
-                    ],
-                    edges: vec![Edge {
-                        from: channel,
-                        to: decode,
                         kind: StreamKind::Iq,
                     }],
                 }
@@ -1554,12 +1509,37 @@ pub fn suggest(value: u64, min: u64, max: u64) -> Option<u64> {
 /// JSON schemas of `Op`, `OpResult` and `OpError` under `op`, `result`,
 /// `error`. The `schema` operation answers with [`Node::schema`], which adds
 /// the node's stage kinds under `stages`.
+///
+/// `$defs.JobKind` lists the built-in kinds and the embedded mode rows' ids (read from
+/// the row files alone, without a stage registry); an operator row's id is accepted too.
 pub fn schema() -> serde_json::Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "op": schemars::schema_for!(Op),
         "result": schemars::schema_for!(OpResult),
         "error": schemars::schema_for!(OpError),
-    })
+    });
+    let mut kinds: Vec<String> = BUILTIN_KINDS.iter().map(|k| k.name().into()).collect();
+    for (_, text) in ModeRegistry::embedded() {
+        let id = serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|row| row["id"].as_str().map(String::from));
+        if let Some(id) = id.filter(|id| !kinds.contains(id)) {
+            kinds.push(id);
+        }
+    }
+    let job_kind = serde_json::json!({
+        "type": "string",
+        "enum": kinds,
+        "description": "A built-in job kind or an embedded mode's id, or the id of an operator mode (modes_list)",
+    });
+    for part in ["op", "result", "error"] {
+        if let Some(defs) = v[part]["$defs"].as_object_mut()
+            && defs.contains_key("JobKind")
+        {
+            defs.insert("JobKind".into(), job_kind.clone());
+        }
+    }
+    v
 }
 
 fn other(e: impl std::fmt::Display) -> OpError {
@@ -1745,6 +1725,7 @@ async fn reconcile_rate(
             node.bank_bin_rate(port.id(), leased),
             deviation_hz,
             sideband,
+            &node.modes(),
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -1924,6 +1905,8 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                     Some(Hz(d))
                 }
             };
+            // An unknown or unready mode is refused before anything is tuned.
+            kind.mode_row(&node.modes())?;
             let tuning = Tuning {
                 center_hz,
                 bandwidth_hz,
@@ -1936,7 +1919,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                         (caps.tune_max_hz.value().0).saturating_sub(caps.tune_min_hz.value().0);
                     tune.saturating_add(caps.max_bandwidth_hz.value().0)
                 })?;
-                let graph = kind.expand(&source, tuning, Hz(0), None, None, None)?;
+                let graph = kind.expand(&source, tuning, Hz(0), None, None, None, &node.modes())?;
                 // With `replace`, the named holders stop and the scan leases under
                 // one hold of the gate; the elastic jobs it displaces stop after.
                 let guard = node.gate_for_replace(&source, &replace).await;
@@ -1996,6 +1979,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 bin_rate,
                 deviation,
                 sideband,
+                &node.modes(),
             ) {
                 Ok(graph) => {
                     let (r, after) = node

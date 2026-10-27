@@ -467,18 +467,19 @@ impl Inner {
         stages: &mut Vec<Arc<dyn Stage>>,
     ) -> Result<(), NodeError> {
         let rate = band.bandwidth_hz;
-        let Some(kind) = JobKind::from_name(&rec.kind) else {
+        let Some(kind) = self.expandable_kind(&rec.kind) else {
             return Ok(());
         };
         if rec.operator_graph {
             return Ok(());
         }
         let bin_rate = self.bank_bin_rate(&rec.source, band);
-        let graph = kind.reexpand(&rec.source, rec.tuning, rate, bin_rate, &rec.graph);
+        let modes = &self.modes;
+        let graph = kind.reexpand(&rec.source, rec.tuning, rate, bin_rate, &rec.graph, modes);
         // At the same rate the stored graph stands while one of today's expansions (on
         // the bank or the source rate) still gives it, or when none can be made.
         if rec.capture_rate_hz == Some(rate.0) {
-            let unbanked = || kind.reexpand(&rec.source, rec.tuning, rate, None, &rec.graph);
+            let unbanked = || kind.reexpand(&rec.source, rec.tuning, rate, None, &rec.graph, modes);
             let current = |g: &Result<Graph, _>| {
                 g.as_ref()
                     .is_ok_and(|g| graph::same_pipeline(g, &rec.graph))
@@ -511,12 +512,19 @@ impl Inner {
         if rec.operator_graph {
             return Ok(());
         }
-        let Some(kind) = JobKind::from_name(&rec.kind) else {
+        let Some(kind) = self.expandable_kind(&rec.kind) else {
             return Ok(());
         };
         let bin_rate = self.bank_bin_rate(&rec.source, band);
         let graph = kind
-            .reexpand(&rec.source, band, band.bandwidth_hz, bin_rate, &rec.graph)
+            .reexpand(
+                &rec.source,
+                band,
+                band.bandwidth_hz,
+                bin_rate,
+                &rec.graph,
+                &self.modes,
+            )
             .map_err(NodeError::Expand)?;
         *stages = self.stages(&graph)?;
         rec.graph = graph;

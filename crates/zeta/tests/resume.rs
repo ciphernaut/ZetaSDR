@@ -27,6 +27,11 @@ fn registry() -> StageRegistry {
     r
 }
 
+/// The mode rows a node with [`registry`] loads.
+fn modes() -> zeta_core::modes::ModeRegistry {
+    zeta_core::modes::ModeRegistry::load(&registry(), None)
+}
+
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
         state_dir: dir.join("state"),
@@ -117,7 +122,7 @@ async fn resume_reexpands_a_builtin_graph_for_the_actual_rate() {
     let dir = tempfile::tempdir().unwrap();
     let source = SourceId("speech".into());
     let graph = JobKind::WfmDemod
-        .expand(&source, tuning(), Hz(480_000), None, None, None)
+        .expand(&source, tuning(), Hz(480_000), None, None, None, &modes())
         .unwrap();
     assert_eq!(out_rate(&graph), 160_000);
     assert_ne!(
@@ -179,7 +184,7 @@ async fn resume_reexpands_a_record_written_before_the_rate_was_kept() {
     let dir = tempfile::tempdir().unwrap();
     let source = SourceId("speech".into());
     let graph = JobKind::WfmDemod
-        .expand(&source, tuning(), Hz(480_000), None, None, None)
+        .expand(&source, tuning(), Hz(480_000), None, None, None, &modes())
         .unwrap();
     assert_ne!(240_000 % out_rate(&graph), 0);
     let id = JobId::new();
@@ -335,7 +340,7 @@ async fn resume_fills_in_the_squelch_params_of_a_pre_squelch_record() {
     let mut ids = Vec::new();
     for kind in [JobKind::AprsDecode, JobKind::FmDemod] {
         let mut graph = kind
-            .expand(&source, narrow, Hz(240_000), None, None, None)
+            .expand(&source, narrow, Hz(240_000), None, None, None, &modes())
             .unwrap();
         for n in graph.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
             let p = n.params.as_object_mut().unwrap();
@@ -515,7 +520,7 @@ fn write_plan12_ch59(dir: &Path, rate_hz: u64) -> JobId {
         bandwidth_hz: Hz(12_500),
     };
     let mut graph = JobKind::FmDemod
-        .expand(&source, ch59, Hz(rate_hz), None, None, None)
+        .expand(&source, ch59, Hz(rate_hz), None, None, None, &modes())
         .unwrap();
     for n in &mut graph.nodes {
         let p = n.params.as_object_mut().unwrap();
