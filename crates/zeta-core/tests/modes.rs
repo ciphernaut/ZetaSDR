@@ -141,6 +141,11 @@ async fn modes_list_filters_by_family_and_state() {
     assert_eq!(broken.len(), 1);
     assert_eq!(broken[0].id.0, "junk_mode");
     assert!(broken[0].reason.as_deref().unwrap().contains("bogus"));
+    // The file to fix: an operator row's path, a built-in row's `modes/<id>.json`.
+    assert_eq!(
+        broken[0].file,
+        modes.join("junk.json").display().to_string()
+    );
     let pagers = list(Some(Family::Pagers), Some(ModeState::Ready)).await;
     assert_eq!(pagers.len(), 1);
     assert_eq!(pagers[0].id.0, "pocsag_decode");
@@ -149,6 +154,7 @@ async fn modes_list_filters_by_family_and_state() {
     assert_eq!(v["state"], "ready");
     assert_eq!(v["family"], "pagers");
     assert_eq!(v["decoder_kind"], "graph");
+    assert_eq!(v["file"], "modes/pocsag_decode.json");
     let adsb = list(Some(Family::Aviation), Some(ModeState::Ready)).await;
     let v = serde_json::to_value(&adsb[1]).unwrap();
     assert_eq!(v["id"], "adsb_decode");
@@ -163,6 +169,23 @@ async fn modes_list_filters_by_family_and_state() {
         serde_json::json!({"op": "modes_list", "family": null, "state": "ready"}),
     );
     assert!(ok.is_ok(), "{ok:?}");
+}
+
+/// `modes_dir: None` reads no operator directory (the CLI resolves the default): the
+/// node lists exactly the built-in rows.
+#[tokio::test]
+async fn a_node_without_a_modes_dir_lists_only_the_embedded_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = NodeConfig {
+        modes_dir: None,
+        ..cfg(dir.path(), dir.path())
+    };
+    let node = Node::open(cfg, stages(), vec![]).await.unwrap();
+    assert_eq!(node.modes().ids(), EMBEDDED);
+    for m in node.modes().all() {
+        assert_eq!(m.state, ModeState::Ready);
+        assert_eq!(m.file, format!("modes/{}.json", m.row.id.0));
+    }
 }
 
 #[tokio::test]

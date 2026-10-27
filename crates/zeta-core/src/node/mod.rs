@@ -79,7 +79,8 @@ pub struct NodeConfig {
     /// (until [`Node::set_bank_factory`]).
     pub bank_factory: Option<Arc<dyn BankFactory>>,
     /// The operator's mode rows (`--modes-dir`), read after the embedded ones; `None`
-    /// is [`crate::modes::default_operator_dir`]. A missing directory reads as empty.
+    /// reads none (the CLI resolves the default, [`crate::modes::default_operator_dir`]).
+    /// A missing directory reads as empty.
     pub modes_dir: Option<PathBuf>,
 }
 
@@ -528,11 +529,7 @@ impl Node {
             )
         });
         let resume = cfg.resume;
-        let modes_dir = cfg
-            .modes_dir
-            .clone()
-            .or_else(crate::modes::default_operator_dir);
-        let modes = Arc::new(ModeRegistry::load(&registry, modes_dir.as_deref()));
+        let modes = Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref()));
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
         // `Node::apply` and are never logged.

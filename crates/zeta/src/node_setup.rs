@@ -175,8 +175,8 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// `passthrough` job from each tune; a VRT source binds its UDP address here; a SoapySDR
 /// device is opened here. `resume` relaunches persisted `Running` jobs (`serve`); without it they
 /// are listed as persisted and left alone (one-shot). `speech` is the backend `transcribe`
-/// jobs run on. `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for the
-/// default); each broken row is reported on stderr, one line each, and never fails the
+/// jobs run on. `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for
+/// [`zeta_core::modes::default_operator_dir`]); each broken row is reported on stderr, one line each, and never fails the
 /// node. Errors name the flag, never a Kiwi password or a node secret. The node comes with
 /// its [`RemotePorts`].
 pub async fn open(
@@ -267,7 +267,7 @@ pub async fn open(
         resume,
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         bank_factory: Some(Arc::new(zeta_dsp::bank::PfbBankFactory)),
-        modes_dir,
+        modes_dir: modes_dir.or_else(zeta_core::modes::default_operator_dir),
     };
     let node = Node::open(cfg, registry, ports)
         .await

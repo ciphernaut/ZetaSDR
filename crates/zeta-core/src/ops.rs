@@ -1195,6 +1195,9 @@ pub struct ModeInfo {
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub reason: Option<String>,
     pub decoder_kind: DecoderKind,
+    /// The file the row came from: `modes/<id>.json` for a built-in row, the path for an
+    /// operator row (the file to fix when the row is broken).
+    pub file: String,
     /// The program a program row runs; `null` for a graph row or one not yet probed.
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
@@ -1216,6 +1219,7 @@ impl From<&LoadedMode> for ModeInfo {
             state: m.state,
             reason: m.reason.clone(),
             decoder_kind: m.row.decoder.kind(),
+            file: m.file.clone(),
             program: m.program.as_ref().map(|p| p.display().to_string()),
             checked: m.checked,
         }

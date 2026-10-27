@@ -2199,6 +2199,45 @@ fn modes_list_prints_the_five_rows() {
     );
 }
 
+/// Without `--modes-dir` the CLI reads `$XDG_CONFIG_HOME/zetasdr/modes`; with it, only
+/// the directory given.
+#[test]
+fn the_default_modes_dir_is_the_xdg_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let xdg = dir.path().join("xdg");
+    let modes = xdg.join("zetasdr").join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut row: Value =
+        serde_json::from_str(include_str!("../../../modes/pocsag_decode.json")).unwrap();
+    row["name"] = "Local pagers".into();
+    std::fs::write(modes.join("my_pocsag.json"), row.to_string()).unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let show = |extra: &[&str]| {
+        let mut args = extra.to_vec();
+        args.extend(["modes", "show", "pocsag_decode"]);
+        let out = zeta(dir.path(), &args)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        json(&out)["value"]["mode"].clone()
+    };
+    let m = show(&[]);
+    assert_eq!(m["row"]["name"], "Local pagers", "{m}");
+    assert_eq!(
+        m["file"],
+        modes.join("my_pocsag.json").display().to_string(),
+        "{m}"
+    );
+    let empty = empty.display().to_string();
+    let m = show(&["--modes-dir", &empty]);
+    assert_eq!(m["row"]["name"], "POCSAG pagers", "{m}");
+    assert_eq!(m["file"], "modes/pocsag_decode.json", "{m}");
+}
+
 /// A row file that does not parse is logged at startup and listed as broken; the node runs.
 #[test]
 fn a_broken_operator_row_is_logged_and_the_node_runs() {
@@ -2231,6 +2270,10 @@ fn a_broken_operator_row_is_logged_and_the_node_runs() {
     let rows = json(&out)["value"]["modes"].as_array().unwrap().clone();
     assert_eq!(rows.len(), 1);
     assert!(rows[0]["reason"].as_str().unwrap().contains("bogus"));
+    assert_eq!(
+        rows[0]["file"],
+        modes.join("pocsag_decode.json").display().to_string()
+    );
     zeta(dir.path(), &["--modes-dir", &modes_dir, "source", "list"])
         .assert()
         .success()
