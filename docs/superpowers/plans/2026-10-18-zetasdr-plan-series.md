@@ -101,11 +101,14 @@ Deferred:
 - Task 3: a rate 0 window of 1024 or more samples can reach `measure_band` when cut; the gap test
   does not assert span >= 0.25 s; the `measure_bank.rs` module doc is stale; `futures_script`'s
   test module is oddly named.
-- Task 4: the clock-guard reopen failure is not classed as lost while the same failure inside
-  apply is; `interleaved_overflows_never_fault` takes about 6 s; no RED run captured;
-  `source.rs` is about 1010 lines; a reader that loses the device after the post-gate re-check
-  while a tune is past the guard can still reach the new-stream path; the race test does not
-  assert `calls_after_gone()` empty.
+- Task 4: `interleaved_overflows_never_fault` takes about 6 s; no RED run captured;
+  `source.rs` is about 1010 lines; the race test does not assert `calls_after_gone()` empty.
+  (The final-review fix wave closed two more: a failed clock-guard reopen now loses the device,
+  and `tune`/`set_gain` re-check `lost` after the reader is joined, so a loss racing a queued
+  command never reaches `open_stream`.) Trade-off accepted in that wave: `apply` now closes the
+  stream before reconfiguring (no device call under an active stream, for UHD), so a USB pull in
+  the second before `QUIET_READS` fires can still close the stream on a dead handle; the same
+  exposure exists in the guard's reopen and the stop path's deactivate.
 - Plan 13's leftovers stay open.
 
 ## Plan 3 status
