@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use crate::util::event;
 use async_trait::async_trait;
 use num_complex::Complex;
 use schemars::JsonSchema;
@@ -411,7 +412,7 @@ impl Stage for PocsagDecodeStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let _: PocsagParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("pocsag_decode params: {e}")))?;
@@ -456,14 +457,23 @@ impl Stage for PocsagDecodeStage {
                     events.push(Frame::new(
                         out.clone(),
                         frame.provenance.clone(),
-                        Payload::Event(serde_json::json!({
-                            "protocol": "pocsag",
-                            "address": m.address,
-                            "function": m.function,
-                            "baud": m.baud,
-                            "kind": m.kind,
-                            "text": m.text,
-                        })),
+                        Payload::Event(event(
+                            &ctx,
+                            frame.provenance.span.start_ns.0,
+                            "pocsag",
+                            serde_json::json!({
+                                "address": m.address,
+                                "function": m.function,
+                                "baud": m.baud,
+                                "kind": m.kind,
+                                // A tone page has no text; the summary says so.
+                                "text": if m.kind == PocsagKind::Tone && ctx.mode.is_some() {
+                                    "tone"
+                                } else {
+                                    m.text.as_str()
+                                },
+                            }),
+                        )),
                     ));
                 }
             }

@@ -24,6 +24,16 @@ fn prov() -> Provenance {
     }
 }
 
+fn mode(id: &str) -> Arc<zeta_core::modes::ModeRow> {
+    let mut stages = zeta_core::stage::StageRegistry::new();
+    zeta_dsp::register_all(&mut stages);
+    let loaded = zeta_core::modes::ModeRegistry::load(&stages, None)
+        .get(id)
+        .expect("row")
+        .clone();
+    Arc::new(loaded.row)
+}
+
 type Run = tokio::task::JoinHandle<Result<(), StageError>>;
 
 fn spawn(params: serde_json::Value) -> (broadcast::Sender<Frame>, broadcast::Receiver<Frame>, Run) {
@@ -39,7 +49,7 @@ fn spawn(params: serde_json::Value) -> (broadcast::Sender<Frame>, broadcast::Rec
                 vec![out],
                 bus,
                 CancellationToken::new(),
-                StageContext::new(SourceId("s".into())),
+                StageContext::new(SourceId("s".into())).with_mode(mode("pocsag_decode")),
             )
             .await
     });
@@ -78,6 +88,7 @@ async fn pocsag_stage_emits_one_event_per_message() {
         serde_json::json!({
             "protocol": "pocsag", "address": 1234567, "function": 3, "baud": 1200,
             "kind": "alpha", "text": "HELLO ZETA",
+            "summary": "1234567: HELLO ZETA", "t_ns": 5,
         })
     );
     assert!(rx_out.try_recv().is_err(), "exactly one event");

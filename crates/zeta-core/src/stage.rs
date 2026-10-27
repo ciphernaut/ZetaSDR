@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::bank::ChannelBank;
+use crate::modes::ModeRow;
 use crate::stream::{Frame, StreamBus};
 use crate::types::{SourceId, StreamId, StreamKind};
 
@@ -68,6 +69,9 @@ pub struct StageContext {
     pub source: SourceId,
     pub bank: Option<Arc<dyn ChannelBank>>,
     pub note: Option<StageNote>,
+    /// The mode row the job runs, when its kind resolves to one: a decoder stage then
+    /// publishes its events in the row's envelope (`protocol`, `summary`, `t_ns`).
+    pub mode: Option<Arc<ModeRow>>,
 }
 
 impl StageContext {
@@ -77,6 +81,7 @@ impl StageContext {
             source,
             bank: None,
             note: None,
+            mode: None,
         }
     }
 
@@ -84,6 +89,14 @@ impl StageContext {
     pub fn with_note(self, note: StageNote) -> Self {
         Self {
             note: Some(note),
+            ..self
+        }
+    }
+
+    /// This context with the mode `row`.
+    pub fn with_mode(self, row: Arc<ModeRow>) -> Self {
+        Self {
+            mode: Some(row),
             ..self
         }
     }

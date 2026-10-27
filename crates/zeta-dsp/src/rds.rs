@@ -15,6 +15,7 @@
 use std::f64::consts::PI;
 use std::sync::Arc;
 
+use crate::util::event;
 use async_trait::async_trait;
 use num_complex::Complex;
 use schemars::JsonSchema;
@@ -695,7 +696,7 @@ impl Stage for RdsDecodeStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let _: RdsParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("rds_decode params: {e}")))?;
@@ -728,8 +729,8 @@ impl Stage for RdsDecodeStage {
             Ok(p.feed(&block.samples)
                 .into_iter()
                 .map(|e| {
-                    let mut v = serde_json::to_value(&e).expect("RdsEvent serialises");
-                    v["protocol"] = "rds".into();
+                    let v = serde_json::to_value(&e).expect("RdsEvent serialises");
+                    let v = event(&ctx, frame.provenance.span.start_ns.0, "rds", v);
                     Frame::new(out.clone(), frame.provenance.clone(), Payload::Event(v))
                 })
                 .collect())

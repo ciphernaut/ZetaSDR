@@ -172,8 +172,15 @@ impl Inner {
         let id = rec.id.clone();
         // Weak: a running stage's note never keeps the node alive.
         let (inner, job) = (Arc::downgrade(self), id.clone());
+        // The row the job's kind expands from, for the events' envelope; a row that is
+        // not ready never got this far (the expand refused it).
+        let mode = self
+            .expandable_kind(&rec.kind)
+            .and_then(|k| k.mode_row(&self.modes).ok().flatten())
+            .map(|row| Arc::new(row.clone()));
         let ctx = StageContext {
             bank,
+            mode,
             ..StageContext::new(rec.source.clone())
         }
         .with_note(Arc::new(move |v| {

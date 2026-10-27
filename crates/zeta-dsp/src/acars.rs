@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use crate::util::event;
 use async_trait::async_trait;
 use num_complex::Complex;
 use schemars::JsonSchema;
@@ -447,7 +448,7 @@ impl Stage for AcarsDecodeStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let _: AcarsParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("acars_decode params: {e}")))?;
@@ -481,8 +482,8 @@ impl Stage for AcarsDecodeStage {
                 .into_iter()
                 .map(|b| {
                     let mut v = serde_json::to_value(&b).expect("AcarsBlock serialises");
-                    v["protocol"] = "acars".into();
                     v["crc_ok"] = true.into();
+                    let v = event(&ctx, frame.provenance.span.start_ns.0, "acars", v);
                     Frame::new(out.clone(), frame.provenance.clone(), Payload::Event(v))
                 })
                 .collect())

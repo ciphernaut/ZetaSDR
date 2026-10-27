@@ -53,7 +53,11 @@
 //         - every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
-//         - `protocol` (the decoders), at the tuning centre, class = the protocol:
+//         - `summary` (a string; every decoder event the node envelopes from its mode
+//           row, with `protocol` and `t_ns`): ov.ribbon(tuning centre, summary, class =
+//           `protocol`); the node filled it, the page renders it as is;
+//         - `protocol` (an event without a `summary`: a stage with no mode row; the
+//           fallback texts below), at the tuning centre, class = the protocol:
 //             `pocsag`: "<address>: <text>" ("<address>: tone" for kind tone);
 //             `rds`:    "<ps ?? pi> · <rt ?? ''>", trimmed;
 //             `adsb`:   "<icao> <callsign> <altitude_ft> ft <lat>,<lon>", each absent (null)
@@ -419,6 +423,10 @@ class Overlays {
         const t = transcriptRibbon(p);
         const el = this.ribbon(tuningCentre(job), t.text, t.cls);
         if (el && t.title) el.title = `${t.text}\n${t.title}`;
+        return;
+      }
+      if (typeof p.summary === "string") {
+        this.ribbon(tuningCentre(job), p.summary, typeof p.protocol === "string" ? p.protocol : "event");
         return;
       }
       if (typeof p.protocol === "string") {

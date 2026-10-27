@@ -8,6 +8,7 @@
 //! force), so a bad row never stops the node.
 
 mod row;
+pub mod summary;
 pub mod template;
 
 use std::path::{Path, PathBuf};

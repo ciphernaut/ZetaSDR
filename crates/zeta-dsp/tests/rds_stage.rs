@@ -24,6 +24,16 @@ fn prov() -> Provenance {
     }
 }
 
+fn mode(id: &str) -> Arc<zeta_core::modes::ModeRow> {
+    let mut stages = zeta_core::stage::StageRegistry::new();
+    zeta_dsp::register_all(&mut stages);
+    let loaded = zeta_core::modes::ModeRegistry::load(&stages, None)
+        .get(id)
+        .expect("row")
+        .clone();
+    Arc::new(loaded.row)
+}
+
 type Run = tokio::task::JoinHandle<Result<(), StageError>>;
 
 fn spawn(params: serde_json::Value) -> (broadcast::Sender<Frame>, broadcast::Receiver<Frame>, Run) {
@@ -39,7 +49,7 @@ fn spawn(params: serde_json::Value) -> (broadcast::Sender<Frame>, broadcast::Rec
                 vec![out],
                 bus,
                 CancellationToken::new(),
-                StageContext::new(SourceId("s".into())),
+                StageContext::new(SourceId("s".into())).with_mode(mode("rds_decode")),
             )
             .await
     });
@@ -76,6 +86,16 @@ async fn rds_stage_emits_ps_event() {
         };
         assert_eq!(v["protocol"], "rds");
         assert_eq!(v["pi"], "2AB1");
+        assert_eq!(v["t_ns"], 5);
+        let (ps, pi) = (v["ps"].as_str(), v["pi"].as_str().unwrap());
+        let rt = v["rt"].as_str();
+        let want = match (ps, rt) {
+            (Some(ps), Some(rt)) => format!("{ps} · {rt}"),
+            (Some(ps), None) => ps.to_string(),
+            (None, Some(rt)) => format!("{pi} · {rt}"),
+            (None, None) => pi.to_string(),
+        };
+        assert_eq!(v["summary"], want.trim_end());
         found |= v["ps"] == "ZETA FM ";
     }
     assert!(found, "no event with the PS");

@@ -24,6 +24,16 @@ fn prov() -> Provenance {
     }
 }
 
+fn mode(id: &str) -> Arc<zeta_core::modes::ModeRow> {
+    let mut stages = zeta_core::stage::StageRegistry::new();
+    zeta_dsp::register_all(&mut stages);
+    let loaded = zeta_core::modes::ModeRegistry::load(&stages, None)
+        .get(id)
+        .expect("row")
+        .clone();
+    Arc::new(loaded.row)
+}
+
 type Run = tokio::task::JoinHandle<Result<(), StageError>>;
 
 fn spawn(params: serde_json::Value) -> (broadcast::Sender<Frame>, broadcast::Receiver<Frame>, Run) {
@@ -39,7 +49,7 @@ fn spawn(params: serde_json::Value) -> (broadcast::Sender<Frame>, broadcast::Rec
                 vec![out],
                 bus,
                 CancellationToken::new(),
-                StageContext::new(SourceId("s".into())),
+                StageContext::new(SourceId("s".into())).with_mode(mode("acars_decode")),
             )
             .await
     });
@@ -82,6 +92,8 @@ async fn acars_stage_emits_block_event() {
     assert_eq!(events.len(), 1, "{events:?}");
     let v = &events[0];
     assert_eq!(v["protocol"], "acars");
+    assert_eq!(v["summary"], "VH-ZET H1: #M1BPOS/ZETASDR TEST");
+    assert_eq!(v["t_ns"], 5);
     assert_eq!(v["reg"], "VH-ZET");
     assert_eq!(v["label"], "H1");
     assert_eq!(v["text"], "#M1BPOS/ZETASDR TEST");

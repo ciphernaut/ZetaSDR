@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use crate::util::event;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -70,7 +71,7 @@ impl Stage for AprsDecodeStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let _: AprsParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("aprs_decode params: {e}")))?;
@@ -138,15 +139,19 @@ impl Stage for AprsDecodeStage {
                 events.push(Frame::new(
                     out.clone(),
                     frame.provenance.clone(),
-                    Payload::Event(serde_json::json!({
-                        "protocol": "aprs",
-                        "src": f.src,
-                        "dst": f.dst,
-                        "path": f.path,
-                        "info": String::from_utf8_lossy(&f.info),
-                        "info_hex": info_hex,
-                        "fcs_ok": true,
-                    })),
+                    Payload::Event(event(
+                        &ctx,
+                        frame.provenance.span.start_ns.0,
+                        "aprs",
+                        serde_json::json!({
+                            "src": f.src,
+                            "dst": f.dst,
+                            "path": f.path,
+                            "info": String::from_utf8_lossy(&f.info),
+                            "info_hex": info_hex,
+                            "fcs_ok": true,
+                        }),
+                    )),
                 ));
             }
             Ok(events)
@@ -188,6 +193,16 @@ mod tests {
 
     type Run = tokio::task::JoinHandle<Result<(), StageError>>;
 
+    fn mode() -> Arc<zeta_core::modes::ModeRow> {
+        let mut stages = zeta_core::stage::StageRegistry::new();
+        crate::register_all(&mut stages);
+        let loaded = zeta_core::modes::ModeRegistry::load(&stages, None)
+            .get("aprs_decode")
+            .expect("row")
+            .clone();
+        Arc::new(loaded.row)
+    }
+
     fn spawn(
         params: serde_json::Value,
     ) -> (broadcast::Sender<Frame>, broadcast::Receiver<Frame>, Run) {
@@ -203,7 +218,8 @@ mod tests {
                     vec![out],
                     bus,
                     CancellationToken::new(),
-                    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
+                    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into()))
+                        .with_mode(mode()),
                 )
                 .await
         });
@@ -236,6 +252,7 @@ mod tests {
             serde_json::json!({
                 "protocol": "aprs", "src": "VK3ABC", "dst": "APRS", "path": ["WIDE1-1"],
                 "info": ">hi", "info_hex": "3e6869", "fcs_ok": true,
+                "summary": "VK3ABC > APRS: >hi", "t_ns": 5,
             })
         );
         assert!(rx_out.try_recv().is_err(), "exactly one event");

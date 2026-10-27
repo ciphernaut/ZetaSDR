@@ -3,6 +3,24 @@
 use std::f64::consts::PI;
 
 use num_complex::Complex;
+use zeta_core::stage::StageContext;
+
+/// A decoder stage's event payload: `fields` in the job's mode-row envelope (`protocol`,
+/// `summary`, `t_ns`) when the context has the row, else `fields` with `protocol` alone.
+pub fn event(
+    ctx: &StageContext,
+    start_ns: u64,
+    protocol: &str,
+    mut fields: serde_json::Value,
+) -> serde_json::Value {
+    match &ctx.mode {
+        Some(row) => zeta_core::modes::summary::envelope(row, start_ns, fields),
+        None => {
+            fields["protocol"] = protocol.into();
+            fields
+        }
+    }
+}
 
 /// `len` samples of the unit-magnitude complex exponential `exp(j 2 pi f n / rate)`.
 /// `freq_hz` may be negative.
