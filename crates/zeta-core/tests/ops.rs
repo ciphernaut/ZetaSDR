@@ -616,7 +616,9 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                         "time",
                     ]
                     .iter()
-                    .any(|w| name.contains(w));
+                    .any(|w| name.contains(w))
+                        // Counts of stream restarts and read timeouts, not times.
+                        && !["restarts", "timeouts"].contains(&name.as_str());
                     // `_ns` is an instant; `_ms` a duration (a timeout), plain integer.
                     assert!(
                         !time || name.ends_with("_ns") || name.ends_with("_ms"),
@@ -1857,6 +1859,51 @@ async fn source_list_reports_fault() {
         serde_json::json!(["string", "null"]),
         "{si}"
     );
+}
+
+/// `source_list` items carry `stats`: required, nullable (`null` for a source
+/// that keeps no stream statistics, such as a recording), and when present an
+/// object with every field required and `measured_rate_hz` nullable.
+#[tokio::test]
+async fn source_list_carries_nullable_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, file) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![file])
+        .await
+        .unwrap();
+    let Ok(OpResult::Sources(v)) = node.apply(Op::SourceList {}).await else {
+        panic!("expected sources");
+    };
+    assert_eq!(v[0].stats, None);
+    let json = serde_json::to_value(&v).unwrap();
+    assert!(json[0].get("stats").is_some_and(Value::is_null), "{json}");
+    let si = &schema()["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"].as_array().unwrap().contains(&"stats".into()),
+        "{si}"
+    );
+    let stats = &si["properties"]["stats"];
+    let ty = stats["type"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{stats}"));
+    assert!(ty.contains(&Value::from("null")), "{stats}");
+    assert!(ty.contains(&Value::from("object")), "{stats}");
+    let mut req: Vec<&str> = stats["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{stats}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    req.sort();
+    assert_eq!(
+        req,
+        ["measured_rate_hz", "overflows", "restarts", "timeouts"],
+        "{stats}"
+    );
+    let rate = stats["properties"]["measured_rate_hz"]["type"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{stats}"));
+    assert!(rate.contains(&Value::from("null")), "{stats}");
 }
 
 /// `source_list` items carry `bank`: required, nullable, and when present an object

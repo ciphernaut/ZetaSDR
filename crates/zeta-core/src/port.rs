@@ -44,6 +44,22 @@ pub(crate) fn nullable_f64<'de, D: serde::Deserializer<'de>>(
     <Option<f64> as Deserialize>::deserialize(d)
 }
 
+/// A streaming source's health counters since it opened: the sample rate
+/// actually delivered over the last 10 s, to the hertz (`null` before two
+/// blocks arrived), reads that overflowed (samples lost in the driver), reads
+/// that timed out, and stream restarts (a stream whose stamps ran ahead of the
+/// wall clock).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PortStats {
+    #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
+    pub measured_rate_hz: Option<u64>,
+    pub overflows: u64,
+    pub timeouts: u64,
+    pub restarts: u64,
+}
+
 /// A block of complex baseband samples.
 #[derive(Clone, Debug)]
 pub struct IqBlock {
@@ -113,6 +129,11 @@ pub trait Port: Send + Sync {
     async fn idle(&self) {}
     /// The overall receive gain, if the source has an adjustable one.
     fn gain(&self) -> Option<GainInfo> {
+        None
+    }
+    /// The port's stream statistics, if it keeps any (a device stream does; a
+    /// recording or a remote receiver does not).
+    fn stats(&self) -> Option<PortStats> {
         None
     }
     /// Set the overall receive gain to `db` dB, or turn the driver's automatic

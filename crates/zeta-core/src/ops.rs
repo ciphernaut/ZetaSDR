@@ -16,7 +16,7 @@ use crate::job::JobRecord;
 use crate::knowledge::{Allocation, Signature};
 use crate::lease::LeaseError;
 use crate::node::{AfterGate, Node, NodeError};
-use crate::port::{GainInfo, Port, PortError, Tuning};
+use crate::port::{GainInfo, Port, PortError, PortStats, Tuning};
 use crate::ring::RingError;
 use crate::stream::{Frame, Payload, StreamInfo};
 use crate::types::{
@@ -37,9 +37,13 @@ pub enum Op {
     /// capture, see `job_start`), `pin` (the band `source_pin` holds the source
     /// at, `null` for none), `fault`, the source's unrecoverable failure (`null` when
     /// healthy), `bank`, the channel bank shared by the capture's channels
-    /// (`bin_hz`, `consumers`; `null` for none), and `gain`, the overall receive
+    /// (`bin_hz`, `consumers`; `null` for none), `gain`, the overall receive
     /// gain (`db`, `null` while automatic; `min_db`, `max_db`, `automatic`,
-    /// `automatic_available`; `null` for a source without adjustable gain). Jobs on a faulted source fail with
+    /// `automatic_available`; `null` for a source without adjustable gain), and
+    /// `stats`, the stream's counters since it opened (`measured_rate_hz`, the
+    /// rate delivered over the last 10 s, `null` before any; `overflows`,
+    /// `timeouts`, `restarts`, streams reopened because their samples ran ahead
+    /// of the clock; `null` for a source that keeps none). Jobs on a faulted source fail with
     /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,
     /// `job_start`) clears it. A channelised job's `job_context` holds `channel.path`:
     /// `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
@@ -1021,6 +1025,10 @@ pub struct SourceInfo {
     /// adjustable gain (a recording, a KiwiSDR, another node, a VRT stream).
     #[schemars(required, schema_with = "crate::types::nullable::<GainInfo>")]
     pub gain: Option<GainInfo>,
+    /// The stream's health counters (`Port::stats`): measured rate, overflows,
+    /// read timeouts, stream restarts; `null` for a source that keeps none.
+    #[schemars(required, schema_with = "crate::types::nullable::<PortStats>")]
+    pub stats: Option<PortStats>,
 }
 
 /// A source's channel bank: its bin spacing and live subscribers.
@@ -1719,6 +1727,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                         consumers: b.consumers(),
                     }),
                     gain: node.port(&id).and_then(|p| p.gain()),
+                    stats: node.port(&id).and_then(|p| p.stats()),
                     id,
                     capabilities,
                 })

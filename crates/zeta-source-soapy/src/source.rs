@@ -8,6 +8,15 @@
 //! overflow (samples lost in the driver), a retune or a reopen anchors at
 //! `max(now, end of the last block)`, so `t0` jumps forward and never back.
 //!
+//! A stream is never ahead of the wall clock (a buffered sample is stamped
+//! when it was captured, before it is read), so a block ending more than
+//! [`MAX_AHEAD_NS`] after now means the driver hands back buffers faster than
+//! the rate (SoapyHackRF replaying a stale buffer after a rate change): the
+//! stream is closed and reopened, and reads are discarded until the wall clock
+//! has passed the end of the last block sent. More than [`MAX_RESTARTS`]
+//! restarts within a minute fault the source. A rate change reopens the stream
+//! for the same reason, instead of reactivating it in place.
+//!
 //! The overall receive gain is read when the source opens and set by
 //! [`Port::set_gain`]: through the reader thread between reads while a stream
 //! runs (so a gain change and a retune keep their order), on the device
@@ -23,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use num_complex::Complex;
 use tokio::sync::{broadcast, oneshot};
-use zeta_core::port::{GainInfo, IqBlock, IqReceiver, Port, PortError, Tuning};
+use zeta_core::port::{GainInfo, IqBlock, IqReceiver, Port, PortError, PortStats, Tuning};
 use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
 
 use crate::caps::{
@@ -44,6 +53,14 @@ const QUIET_READS: u32 = 10;
 const RETUNE_ACK: Duration = Duration::from_secs(2);
 /// Window of [`SoapySource::measured_rate_hz`].
 const RATE_WINDOW: Duration = Duration::from_secs(10);
+/// How far (ns) a block's end may run ahead of the wall clock before the
+/// stream is restarted.
+pub const MAX_AHEAD_NS: u64 = 2_000_000_000;
+/// Stream restarts within [`RESTART_WINDOW`] the source survives; one more
+/// faults it.
+pub const MAX_RESTARTS: u32 = 5;
+/// Window of [`MAX_RESTARTS`].
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct Status {
@@ -56,6 +73,10 @@ struct Status {
     last_end: u64,
     overflows: u64,
     timeouts: u64,
+    /// Streams restarted because their stamps ran ahead of the wall clock.
+    restarts: u64,
+    /// When each restart within the last [`RESTART_WINDOW`] happened.
+    restart_times: VecDeque<Instant>,
     /// `(when, samples)` per block over the last [`RATE_WINDOW`].
     window: VecDeque<(Instant, u64)>,
     /// The overall receive gain as last applied (read at open); `None` for a
@@ -466,7 +487,9 @@ impl SoapySource {
         let (cmds, cmds_rx) = std_mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = Ctx {
+            id: self.id.0.clone(),
             dev: self.dev.clone(),
+            format: self.format,
             rates: self.rates.clone(),
             tx: self.tx.clone(),
             status: self.status.clone(),
@@ -577,6 +600,17 @@ impl Port for SoapySource {
         self.status.lock().unwrap().gain
     }
 
+    fn stats(&self) -> Option<PortStats> {
+        let measured_rate_hz = self.measured_rate_hz().map(|r| r.round() as u64);
+        let st = self.status.lock().unwrap();
+        Some(PortStats {
+            measured_rate_hz,
+            overflows: st.overflows,
+            timeouts: st.timeouts,
+            restarts: st.restarts,
+        })
+    }
+
     /// Checked against the range read at open (refusals are `Unsupported` with
     /// the op's texts), then applied by the live, unfaulted reader between
     /// reads, after any retune queued before it. Otherwise on the device
@@ -643,7 +677,10 @@ impl SoapySource {
 
 /// What the reader thread shares with the source.
 struct Ctx {
+    id: String,
     dev: Arc<dyn SoapyDevice>,
+    /// The wire format the stream was opened with, for [`reopen`].
+    format: WireFormat,
     rates: Arc<RateModel>,
     tx: broadcast::Sender<IqBlock>,
     status: Arc<Mutex<Status>>,
@@ -688,14 +725,43 @@ impl Clock {
     }
 }
 
+/// A stream that is gone: what `rx` holds between closing the old stream and
+/// opening the new one in [`reopen`] (and after a failed open, until the
+/// reader exits).
+struct Closed;
+
+impl SoapyRx for Closed {
+    fn activate(&mut self) -> Result<(), String> {
+        Err("stream closed".into())
+    }
+    fn deactivate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn read(&mut self, _: &mut [Complex<f32>], _: i64) -> Result<usize, ReadError> {
+        Err(ReadError::Fatal("stream closed".into()))
+    }
+}
+
+/// Close the stream and open and activate a new one in the same format. The
+/// old one is closed first, so the driver drops any buffer it still held
+/// (SoapyHackRF keeps a half-read one across `activateStream`).
+fn reopen(ctx: &Ctx, rx: &mut Box<dyn SoapyRx>) -> Result<(), String> {
+    *rx = Box::new(Closed);
+    *rx = ctx
+        .dev
+        .open_rx(ctx.format)
+        .map_err(|e| format!("soapy open_rx({:?}): {e}", ctx.format))?;
+    rx.activate().map_err(|e| format!("soapy activate: {e}"))
+}
+
 /// Apply a retune between reads: a rate change (or a rate short of the band)
-/// restarts the stream. `picked` is the rate picked for the stream running at
-/// `rate`. A refused rate restores `rate.asked` and reactivates the stream on
-/// the old centre (the frequency is set only once the rate holds); a device
-/// error leaves the stream to fault.
+/// reopens the stream. `picked` is the rate picked for the stream running at
+/// `rate`. A refused rate restores `rate.asked` and reopens the stream on the
+/// old centre (the frequency is set only once the rate holds); a device error
+/// leaves the stream to fault.
 fn apply(
     ctx: &Ctx,
-    rx: &mut dyn SoapyRx,
+    rx: &mut Box<dyn SoapyRx>,
     cmd: &Retune,
     picked: u64,
     rate: Rate,
@@ -708,8 +774,6 @@ fn apply(
             .map_err(|e| io(format!("soapy set_frequency({hw}): {e}")))?;
         return Ok(rate);
     }
-    rx.deactivate()
-        .map_err(|e| io(format!("soapy deactivate: {e}")))?;
     let got = match set_rate(ctx.dev.as_ref(), &ctx.rates, cmd.rate_hz, cmd.bandwidth_hz) {
         Err(RateError::Narrow(m)) => {
             let back = set_rate(ctx.dev.as_ref(), &ctx.rates, rate.asked, 0)?;
@@ -719,8 +783,7 @@ fn apply(
                     rate.asked, back.actual, rate.actual
                 )));
             }
-            rx.activate()
-                .map_err(|e| io(format!("soapy activate: {e}")))?;
+            reopen(ctx, rx).map_err(io)?;
             return Err(RateError::Narrow(m));
         }
         r => r?,
@@ -728,13 +791,15 @@ fn apply(
     ctx.dev
         .set_frequency(hw as f64)
         .map_err(|e| io(format!("soapy set_frequency({hw}): {e}")))?;
-    rx.activate()
-        .map_err(|e| io(format!("soapy activate: {e}")))?;
+    reopen(ctx, rx).map_err(io)?;
     Ok(got)
 }
 
 /// The reader thread. Exits on stop, on no receivers, or with a fault (set
-/// before the stream is deactivated); always deactivates on exit.
+/// before the stream is deactivated); always deactivates on exit. A block
+/// that would end more than [`MAX_AHEAD_NS`] after now is not sent: the
+/// stream is reopened and reads are discarded until the wall clock passes the
+/// last block sent (`catch_up`), then the clock anchors there.
 fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut rate: Rate) {
     // A reopen continues after the previous stream's last block.
     let last_end = ctx.status.lock().unwrap().last_end;
@@ -745,6 +810,9 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
     };
     let mut buf = vec![Complex::new(0.0f32, 0.0); block_len(rate.actual)];
     let mut quiet = 0u32;
+    // After a restart: the end of the last block sent, which the wall clock
+    // must pass before a block is sent again.
+    let mut catch_up: Option<u64> = None;
     loop {
         if ctx.stop.load(Ordering::Relaxed) || ctx.tx.receiver_count() == 0 {
             break;
@@ -760,7 +828,7 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                     continue;
                 }
             };
-            match apply(&ctx, rx.as_mut(), &cmd, picked, rate) {
+            match apply(&ctx, &mut rx, &cmd, picked, rate) {
                 Ok(got) => {
                     let actual = got.actual;
                     center = cmd.center_hz;
@@ -795,12 +863,57 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
         match rx.read(&mut buf, READ_TIMEOUT_US) {
             Ok(n) if n > 0 => {
                 quiet = 0;
+                if let Some(t) = catch_up {
+                    let now = now_ns();
+                    if now < t {
+                        continue;
+                    }
+                    clock.anchor = now.max(t);
+                    clock.count = 0;
+                    catch_up = None;
+                }
+                let end = clock.at(clock.count + n as u64);
+                let now = now_ns();
+                if end > now + MAX_AHEAD_NS {
+                    let lead_ms = (end - now) / 1_000_000;
+                    let (restarts, last_end) = {
+                        let mut st = ctx.status.lock().unwrap();
+                        st.restarts += 1;
+                        let at = Instant::now();
+                        st.restart_times.push_back(at);
+                        while st
+                            .restart_times
+                            .front()
+                            .is_some_and(|t| at.duration_since(*t) > RESTART_WINDOW)
+                        {
+                            st.restart_times.pop_front();
+                        }
+                        (st.restart_times.len(), st.last_end)
+                    };
+                    if restarts > MAX_RESTARTS as usize {
+                        ctx.fault(format!(
+                            "soapy: samples arrive faster than {} Hz ({restarts} stream restarts in {RESTART_WINDOW:?})",
+                            clock.rate
+                        ));
+                        break;
+                    }
+                    eprintln!(
+                        "zeta: soapy {}: samples ran {lead_ms} ms ahead of the clock; stream restarted",
+                        ctx.id
+                    );
+                    if let Err(m) = reopen(&ctx, &mut rx) {
+                        ctx.fault(m);
+                        break;
+                    }
+                    catch_up = Some(last_end);
+                    continue;
+                }
                 let t0 = clock.at(clock.count);
                 clock.count += n as u64;
                 {
                     let mut st = ctx.status.lock().unwrap();
                     let now = Instant::now();
-                    st.last_end = clock.at(clock.count);
+                    st.last_end = end;
                     st.window.push_back((now, n as u64));
                     while st
                         .window

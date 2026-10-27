@@ -12,6 +12,7 @@ use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{Claim, Hz, SourceId};
 use zeta_source_soapy::SoapySource;
 use zeta_source_soapy::mock::{MockDevice, MockRead};
+use zeta_source_soapy::source::{MAX_AHEAD_NS, MAX_RESTARTS};
 
 fn tuning(center: u64, bw: u64) -> Tuning {
     Tuning {
@@ -63,6 +64,25 @@ async fn assert_deactivated(dev: &MockDevice) {
 
 fn end_ns(b: &IqBlock) -> u64 {
     b.t0.0 + (b.samples.len() as u128 * 1_000_000_000 / u128::from(b.sample_rate_hz.0)) as u64
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+/// The device calls so far, without the `drop` a dropped stream may record.
+fn calls_without_drops(dev: &MockDevice) -> Vec<String> {
+    dev.calls().into_iter().filter(|c| c != "drop").collect()
+}
+
+fn open_rx_count(dev: &MockDevice) -> usize {
+    dev.calls()
+        .iter()
+        .filter(|c| c.starts_with("open_rx"))
+        .count()
 }
 
 #[tokio::test]
@@ -184,7 +204,7 @@ async fn overflow_reanchors_without_going_backwards() {
 }
 
 #[tokio::test]
-async fn retune_rate_change_reactivates_stream() {
+async fn retune_rate_change_reopens_the_stream() {
     // Timeouts keep the reader alive (but not faulted) while the test retunes.
     let mut reads = samples(1);
     reads.extend([MockRead::Timeout, MockRead::Timeout]);
@@ -197,16 +217,17 @@ async fn retune_rate_change_reactivates_stream() {
     assert_eq!(first.sample_rate_hz, Hz(1_000_000));
     let got = src.tune(tuning(101_000_000, 2_000_000)).await.unwrap();
     assert_eq!(got, tuning(101_000_000, 2_000_000));
-    let calls = dev.calls();
+    let calls = calls_without_drops(&dev);
     assert_eq!(
         calls[calls.len() - 4..],
         [
-            "deactivate",
             "set_sample_rate(2000000)",
             "set_frequency(101000000)",
+            "open_rx(Cs8)",
             "activate"
         ]
     );
+    assert!(!calls.contains(&"deactivate".to_string()), "{calls:?}");
     let next = next_block(&mut rx).await;
     assert_eq!(next.sample_rate_hz, Hz(2_000_000));
     assert_eq!(next.center_hz, Hz(101_000_000));
@@ -214,9 +235,94 @@ async fn retune_rate_change_reactivates_stream() {
 
     // Centre only: one set_frequency, no stream restart.
     src.tune(tuning(102_000_000, 2_000_000)).await.unwrap();
-    let calls = dev.calls();
+    let calls = calls_without_drops(&dev);
     assert_eq!(calls.last().unwrap(), "set_frequency(102000000)");
     assert_eq!(calls.iter().filter(|c| *c == "activate").count(), 2);
+    assert_eq!(open_rx_count(&dev), 2);
+}
+
+#[tokio::test]
+async fn fast_blocks_restart_the_stream_and_stay_near_the_clock() {
+    // 1 MHz, block_len 16 384: 150 instant blocks = 2.46 s of samples in ~0 s.
+    // Then 120 Slow(16384, 20) blocks: about real time, while the clock catches up.
+    let mut reads = samples(150);
+    reads.extend(std::iter::repeat_n(MockRead::Slow(16_384, 20), 120));
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
+    let src = source(&dev);
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    let mut blocks = Vec::new();
+    // When each block arrived: the catch-up shows as a pause of about 2 s.
+    let mut arrived = Vec::new();
+    // The burst may outrun the broadcast; lagged blocks were sent all the same.
+    let mut lagged = 0u64;
+    // The catch-up after the restart sends nothing for about 2 s.
+    loop {
+        match tokio::time::timeout(Duration::from_millis(3000), rx.recv()).await {
+            Ok(Ok(b)) => {
+                let now = now_ns();
+                assert!(
+                    end_ns(&b) <= now + MAX_AHEAD_NS + 100_000_000,
+                    "block {} ms ahead",
+                    (end_ns(&b) - now) / 1_000_000
+                );
+                assert_eq!(src.fault(), None);
+                blocks.push(b);
+                arrived.push(std::time::Instant::now());
+            }
+            Ok(Err(RecvError::Lagged(n))) => lagged += n,
+            _ => break,
+        }
+    }
+    // The burst stopped at the guard (about 122 blocks, 2 s of samples); the
+    // slow blocks after the catch-up came through.
+    let pause = arrived
+        .windows(2)
+        .position(|w| w[1].duration_since(w[0]) > Duration::from_secs(1))
+        .expect("a catch-up pause");
+    let burst = pause as u64 + 1 + lagged;
+    assert!(
+        (100..150).contains(&burst),
+        "{burst} burst blocks ({lagged} lagged)"
+    );
+    assert!(blocks.len() > pause + 1, "no block after the restart");
+    assert_eq!(open_rx_count(&dev), 2);
+    assert_eq!(src.stats().unwrap().restarts, 1);
+    // Monotonic across the restart.
+    assert!(blocks.windows(2).all(|w| w[1].t0.0 >= end_ns(&w[0])));
+}
+
+#[tokio::test]
+async fn slow_reads_never_restart_the_stream() {
+    // 40 blocks of 16 384 at 1 MHz delivered every 30 ms: behind the clock, never ahead.
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(vec![MockRead::Slow(16_384, 30); 40]));
+    let src = source(&dev);
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    for _ in 0..40 {
+        next_block(&mut rx).await;
+    }
+    assert_eq!(src.stats().unwrap().restarts, 0);
+    assert_eq!(open_rx_count(&dev), 1);
+}
+
+#[tokio::test]
+async fn too_many_restarts_fault_the_source() {
+    // Reads of 16.4 ms of samples every ~1 ms run ahead of the clock again
+    // after every catch-up (about 2 s of discarded reads), so the guard trips
+    // once per ~2.1 s until the restarts in the window fault the source.
+    let dev =
+        Arc::new(MockDevice::hackrf_like().with_reads(vec![MockRead::Slow(16_384, 1); 30_000]));
+    let src = source(&dev);
+    let _rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    assert!(
+        wait_until(20_000, || src.fault().is_some()).await,
+        "no fault"
+    );
+    let fault = src.fault().unwrap();
+    assert!(fault.contains("faster than"), "{fault}");
+    assert!(src.stats().unwrap().restarts > MAX_RESTARTS as u64);
 }
 
 #[tokio::test]
@@ -588,7 +694,7 @@ async fn a_refused_retune_keeps_the_capture_it_had() {
     // 2 211 840; the retry, the next rung above the request (N 24), asks
     // 2 560 000 and reads 2 304 000, still short of 2 400 000.
     dev.shortfall_next(0.1, 2);
-    let from = dev.calls().len();
+    let from = calls_without_drops(&dev).len();
     let Err(PortError::Unsupported(m)) = src.tune(tuning(101_000_000, 2_400_000)).await else {
         panic!("expected Unsupported")
     };
@@ -599,12 +705,12 @@ async fn a_refused_retune_keeps_the_capture_it_had() {
     assert_eq!(src.current(), Some(was));
     assert_eq!(src.fault(), None);
     assert_eq!(
-        dev.calls()[from..],
+        calls_without_drops(&dev)[from..],
         [
-            "deactivate",
             "set_sample_rate(2457600)",
             "set_sample_rate(2560000)",
             "set_sample_rate(1024000)",
+            "open_rx(Cs8)",
             "activate"
         ]
     );
