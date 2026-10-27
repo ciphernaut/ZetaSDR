@@ -15,3 +15,12 @@ opt-level = 3
 
 [profile.dev.package.num-complex]
 opt-level = 3
+
+# Tests run sources in real time through debug builds: unoptimised, a wfm_demod and
+# transcribe chain at 240 kHz (channel, wfm_demod, nnnoiseless denoise) costs about 1.3
+# CPU-seconds per second and falls behind real time on a loaded host; optimised, 0.13.
+[profile.dev.package.zeta-dsp]
+opt-level = 3
+
+[profile.dev.package.nnnoiseless]
+opt-level = 3
