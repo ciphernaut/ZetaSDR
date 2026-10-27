@@ -39,6 +39,7 @@ fn cfg(dir: &Path, bank_factory: Option<Arc<dyn BankFactory>>) -> NodeConfig {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory,
+        modes_dir: None,
     }
 }
 

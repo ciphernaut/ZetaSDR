@@ -1,0 +1,724 @@
+//! One mode's row: the schema of a `modes/*.json` file and its validation.
+//!
+//! A row names a decoder mode (`job_start --kind <id>`): its band, the layer-1 labels it
+//! presents as, the decoder (a graph template or an external program), its event schema
+//! and one-line summary, and the decode-to-identify rule. Every struct rejects unknown
+//! fields; [`parse`] names the offending field, [`validate`] checks what serde cannot.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::graph::{Edge, Graph, GraphId, Node};
+use crate::stage::StageRegistry;
+
+/// A mode id: lowercase snake case, the string `job_start --kind` takes.
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(transparent)]
+pub struct ModeId(pub String);
+
+/// The group a mode is listed under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "ModeFamily")]
+pub enum Family {
+    Tv,
+    Broadcast,
+    Aviation,
+    Maritime,
+    Satellite,
+    TwoWay,
+    CellularRail,
+    Pagers,
+    Iot,
+    WeatherScience,
+    AmateurDigital,
+    AmateurVoice,
+    HfUtility,
+    General,
+}
+
+/// One decoder mode as its row file states it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
+pub struct ModeRow {
+    pub id: ModeId,
+    /// A short human name ("POCSAG pagers").
+    pub name: String,
+    pub family: Family,
+    pub band: Band,
+    /// The layer-1 labels this mode presents as (`fm`, `fsk`, `am`, `wfm`, `ssb`, `carrier`).
+    pub modulation: Vec<String>,
+    /// The layer-2 label a proof produces (`APRS`, `POCSAG`, ...).
+    pub label: String,
+    /// The `protocol` value of the mode's events (`aprs`, `pocsag`, ...).
+    pub protocol: String,
+    pub decoder: Decoder,
+    pub event: Event,
+    pub identify: Identify,
+    /// The iNTERCEPT catalogue entry ids this mode proves.
+    pub catalogue: Vec<String>,
+    /// How the row is checked (`zeta modes check`); `null` for none.
+    #[serde(default)]
+    #[schemars(schema_with = "row_test_schema")]
+    pub test: Option<RowTest>,
+    /// Free text the generated AGENTS.md carries for the mode; `null` for none.
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// The channel a mode's decoder expects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeBand", transform = require_all)]
+pub struct Band {
+    /// The channel width the decoder expects.
+    pub bandwidth_hz: u64,
+    /// The well-known centres; empty for "anywhere".
+    pub centers_hz: Vec<u64>,
+    /// The narrowest `bandwidth_hz` a job may give the mode; `null` for no minimum.
+    #[serde(default)]
+    pub min_hz: Option<u64>,
+}
+
+/// The decoder: a graph template, or an external program.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeDecoder")]
+pub enum Decoder {
+    /// Today's `Graph` shape without its id; the channel node's `center_hz`,
+    /// `bandwidth_hz` and `out_rate_hz` are written `"$center_hz"`, `"$bandwidth_hz"`,
+    /// `"$out_rate_hz"` for the expander to fill.
+    Graph {
+        nodes: Vec<Node>,
+        edges: Vec<Edge>,
+    },
+    Program(ProgramBlock),
+}
+
+/// Which kind of decoder a row has, as `modes_list` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecoderKind {
+    Graph,
+    Program,
+}
+
+impl Decoder {
+    pub fn kind(&self) -> DecoderKind {
+        match self {
+            Decoder::Graph { .. } => DecoderKind::Graph,
+            Decoder::Program(_) => DecoderKind::Program,
+        }
+    }
+}
+
+/// The mode's events: their JSON Schema and the one-line summary template.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeEvent")]
+pub struct Event {
+    /// The event payload's JSON Schema; `properties` names every field.
+    pub schema: serde_json::Value,
+    /// `{field}` substituted, `{field?}` omitted with its separator when null,
+    /// `{a?b}` the first of `a`, `b` that is not null.
+    pub summary: String,
+}
+
+/// The decode-to-identify rule.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeIdentify", transform = require_all)]
+pub struct Identify {
+    pub proof: Proof,
+    /// With `proof: field`, the boolean event field that must be true.
+    #[serde(default)]
+    pub field: Option<String>,
+    pub min_events: u32,
+    /// How long the `identify` job waits for proof.
+    pub dwell_ms: u64,
+    /// The shortest selection `classify` tries the row on.
+    pub min_span_ms: u64,
+    /// The in-crate attempt `classify` runs on a buffered span (`aprs`, `pocsag`,
+    /// `acars`, `rds`); `null` for rows tried only by the `identify` job.
+    #[serde(default)]
+    pub quick: Option<String>,
+}
+
+/// What counts as proof: any event, or an event whose `identify.field` is true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "ModeProof")]
+pub enum Proof {
+    Event,
+    Field,
+}
+
+/// An external decoder program.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct ProgramBlock {
+    /// Names tried on `PATH` in order (or an absolute path), the first found used.
+    pub programs: Vec<String>,
+    /// Arguments, with `$port`, `$rate_hz` and `$center_hz` substituted.
+    pub args: Vec<String>,
+    pub input: ProgramInput,
+    pub output: ProgramOutput,
+    pub install: Install,
+}
+
+/// What the program reads.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct ProgramInput {
+    pub stream: InputStream,
+    pub format: SampleFormat,
+    /// The rate the program expects; the channel node resamples to it.
+    pub rate_hz: u64,
+    pub via: InputVia,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InputStream {
+    Iq,
+    Audio,
+}
+
+/// A program's input sample format: `cu8`, `cs8`, `cs16`, `cf32` for IQ, `s16`, `f32`
+/// for audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "ProgramSampleFormat")]
+pub enum SampleFormat {
+    Cu8,
+    Cs8,
+    Cs16,
+    Cf32,
+    S16,
+    F32,
+}
+
+impl SampleFormat {
+    fn is_iq(self) -> bool {
+        matches!(self, Self::Cu8 | Self::Cs8 | Self::Cs16 | Self::Cf32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InputVia {
+    Stdin,
+    Fifo,
+}
+
+/// What the program writes and how zeta reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
+pub struct ProgramOutput {
+    pub via: OutputVia,
+    /// With `via: tcp`, the port (`"$port"`, the one zeta picks); `null` otherwise.
+    #[serde(default)]
+    pub port: Option<String>,
+    pub parser: Parser,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputVia {
+    Stdout,
+    Tcp,
+}
+
+/// How a program's output lines become events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "ProgramParser")]
+pub enum Parser {
+    JsonLines,
+    Sbs,
+    Nmea,
+    Kiss,
+    Text,
+    Multimon,
+}
+
+/// Where to get a missing program.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
+pub struct Install {
+    /// Package names; each optional in a row file, `null` when absent.
+    #[serde(default)]
+    pub debian: Option<String>,
+    #[serde(default)]
+    pub fedora: Option<String>,
+    #[serde(default)]
+    pub brew: Option<String>,
+    pub url: String,
+}
+
+/// A row's check: the signal (`kind`) plus the event it must produce.
+/// JSON: `{"kind": "synth"|"fixture", ..., "expect": {...}, "within_ms": N}`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RowTest {
+    #[serde(flatten)]
+    pub kind: TestSpec,
+    /// The event (or the subset of its fields) the decoder must emit.
+    pub expect: serde_json::Value,
+    pub within_ms: u64,
+}
+
+/// Make every property of an object schema required, without a `default`: a field a row
+/// file may leave out (`#[serde(default)]`) is always present, `null` when absent, in
+/// what the node reports.
+fn require_all(schema: &mut schemars::Schema) {
+    let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) else {
+        return;
+    };
+    for p in props.values_mut() {
+        if let Some(p) = p.as_object_mut() {
+            p.remove("default");
+        }
+    }
+    let names: Vec<serde_json::Value> = props.keys().map(|k| k.as_str().into()).collect();
+    schema.insert("required".into(), names.into());
+}
+
+/// Schema of `ModeRow.test`: an object (`kind`, the signal's parameters, `expect`,
+/// `within_ms`) whose parameters depend on the mode, or `null`.
+fn row_test_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["object", "null"],
+        "description": "How the row is checked: `{\"kind\": \"synth\"|\"fixture\", ..., \"expect\": {...}, \"within_ms\": N}`; `null` for none."
+    })
+}
+
+/// The signal a row's check runs on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TestSpec {
+    /// Parameters for the registry's synthesiser.
+    Synth(serde_json::Map<String, serde_json::Value>),
+    /// A SigMF pair: under the repo's fixtures for embedded rows, absolute for operator rows.
+    Fixture { path: String },
+}
+
+/// Why a row is broken: the offending field and what is wrong with it.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{field}: {error}")]
+pub struct RowError {
+    pub field: String,
+    pub error: String,
+}
+
+impl RowError {
+    fn new(field: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            error: error.into(),
+        }
+    }
+}
+
+/// The placeholders a graph template may use, each with the dummy value it is checked with.
+const GRAPH_PLACEHOLDERS: [(&str, u64); 3] = [
+    ("$center_hz", 100_000_000),
+    ("$bandwidth_hz", 12_500),
+    ("$out_rate_hz", 48_000),
+];
+/// The placeholders a program's `args` may use.
+const PROGRAM_PLACEHOLDERS: [&str; 3] = ["$port", "$rate_hz", "$center_hz"];
+/// The in-crate attempts `identify.quick` may name.
+pub const QUICK_ATTEMPTS: [&str; 4] = ["aprs", "pocsag", "acars", "rds"];
+/// Name suffixes of fields that hold an integer in their unit.
+const UNIT_SUFFIXES: [&str; 4] = ["_hz", "_ms", "_ns", "_baud"];
+
+/// Parse one row file. A serde failure names the unknown or missing field when serde
+/// says which (`row` otherwise).
+pub fn parse(text: &str) -> Result<ModeRow, RowError> {
+    serde_json::from_str(text).map_err(|e| {
+        let msg = e.to_string();
+        let named = ["unknown field `", "missing field `"]
+            .iter()
+            .find_map(|p| msg.split_once(p))
+            .and_then(|(_, rest)| rest.split_once('`'))
+            .map(|(name, _)| name.to_string());
+        RowError::new(named.unwrap_or_else(|| "row".into()), msg)
+    })
+}
+
+/// Check what serde cannot: the id's spelling, unit-suffixed fields holding integers,
+/// the summary naming only schema fields, the identify rule, and the decoder (a graph
+/// template type-checks against `stages` with its placeholders filled; a program's
+/// placeholders, port and input are consistent).
+pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
+    if !is_mode_id(&row.id.0) {
+        return Err(RowError::new(
+            "id",
+            format!("{:?} must match ^[a-z][a-z0-9_]*$", row.id.0),
+        ));
+    }
+    let properties = row.event.schema["properties"]
+        .as_object()
+        .ok_or_else(|| RowError::new("event.schema", "must be an object with `properties`"))?;
+    for (name, prop) in properties {
+        if has_unit_suffix(name) && !declares_integer(prop) {
+            return Err(RowError::new(
+                format!("event.schema.properties.{name}"),
+                "a field named for its unit must be an integer",
+            ));
+        }
+    }
+    for name in summary_fields(&row.event.summary)? {
+        if !properties.contains_key(&name) {
+            let mut known: Vec<&str> = properties.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            return Err(RowError::new(
+                "event.summary",
+                format!(
+                    "names {name:?}, which the event schema lacks (fields: {})",
+                    known.join(", ")
+                ),
+            ));
+        }
+    }
+    let id = &row.identify;
+    if id.proof == Proof::Field && id.field.is_none() {
+        return Err(RowError::new(
+            "identify.field",
+            "required with proof: field (the boolean event field that must be true)",
+        ));
+    }
+    if let Some(q) = &id.quick
+        && !QUICK_ATTEMPTS.contains(&q.as_str())
+    {
+        return Err(RowError::new(
+            "identify.quick",
+            format!(
+                "{q:?} is not one of {} (or null)",
+                QUICK_ATTEMPTS.join(", ")
+            ),
+        ));
+    }
+    match &row.decoder {
+        Decoder::Graph { nodes, edges } => validate_graph(nodes, edges, stages),
+        Decoder::Program(p) => validate_program(p),
+    }
+}
+
+/// `^[a-z][a-z0-9_]*$`.
+fn is_mode_id(id: &str) -> bool {
+    let mut b = id.bytes();
+    b.next().is_some_and(|c| c.is_ascii_lowercase())
+        && b.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+}
+
+fn has_unit_suffix(name: &str) -> bool {
+    UNIT_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// Whether a JSON Schema's `type` is `integer`, or `integer` and `null`.
+fn declares_integer(schema: &serde_json::Value) -> bool {
+    match &schema["type"] {
+        serde_json::Value::String(t) => t == "integer",
+        serde_json::Value::Array(a) => {
+            a.contains(&"integer".into()) && a.iter().all(|t| t == "integer" || t == "null")
+        }
+        _ => false,
+    }
+}
+
+/// The field names a summary template uses: every name inside `{...}`, the
+/// alternatives of `{a?b}` and the optional `{a?}` included.
+fn summary_fields(summary: &str) -> Result<Vec<String>, RowError> {
+    let bad = |e: &str| RowError::new("event.summary", e.to_string());
+    let mut names = Vec::new();
+    let mut rest = summary;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let close = after
+            .find('}')
+            .ok_or_else(|| bad("a `{` is never closed"))?;
+        let inner = &after[..close];
+        let parts: Vec<&str> = inner.split('?').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() || inner.contains('{') {
+            return Err(bad(&format!("`{{{inner}}}` names no field")));
+        }
+        names.extend(parts.into_iter().map(String::from));
+        rest = &after[close + 1..];
+    }
+    Ok(names)
+}
+
+fn validate_graph(nodes: &[Node], edges: &[Edge], stages: &StageRegistry) -> Result<(), RowError> {
+    let mut filled = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let field = format!("decoder.nodes[{}].params", n.id.0);
+        let mut params = n.params.clone();
+        fill(&mut params, &field)?;
+        filled.push(Node {
+            params,
+            ..n.clone()
+        });
+    }
+    let graph = Graph {
+        id: GraphId("template".into()),
+        nodes: filled,
+        edges: edges.to_vec(),
+    };
+    crate::graph::validate(&graph, stages).map_err(|e| RowError::new("decoder", e.to_string()))
+}
+
+/// Replace each graph placeholder in `v` by its dummy value, checking that every field
+/// named for its unit holds an integer, `null` or a placeholder.
+fn fill(v: &mut serde_json::Value, field: &str) -> Result<(), RowError> {
+    use serde_json::Value;
+    match v {
+        Value::String(s) if s.starts_with('$') => {
+            let (_, dummy) = GRAPH_PLACEHOLDERS
+                .iter()
+                .find(|(p, _)| p == s)
+                .ok_or_else(|| {
+                    let known: Vec<&str> = GRAPH_PLACEHOLDERS.iter().map(|(p, _)| *p).collect();
+                    RowError::new(
+                        field,
+                        format!("unknown placeholder {s} (known: {})", known.join(", ")),
+                    )
+                })?;
+            *v = (*dummy).into();
+        }
+        Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                let f = format!("{field}.{k}");
+                let unit_ok = matches!(x, Value::Null)
+                    || x.is_u64()
+                    || x.is_i64()
+                    || x.as_str().is_some_and(|s| s.starts_with('$'));
+                if has_unit_suffix(k) && !unit_ok {
+                    return Err(RowError::new(
+                        f,
+                        "a field named for its unit must be an integer",
+                    ));
+                }
+                fill(x, &f)?;
+            }
+        }
+        Value::Array(a) => {
+            for (i, x) in a.iter_mut().enumerate() {
+                fill(x, &format!("{field}[{i}]"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_program(p: &ProgramBlock) -> Result<(), RowError> {
+    if p.programs.is_empty() {
+        return Err(RowError::new(
+            "decoder.programs",
+            "names no program (give at least one name or absolute path)",
+        ));
+    }
+    if p.input.stream == InputStream::Audio {
+        return Err(RowError::new(
+            "decoder.input.stream",
+            "audio input programs arrive in plan 17",
+        ));
+    }
+    if !p.input.format.is_iq() {
+        return Err(RowError::new(
+            "decoder.input.format",
+            "an iq input takes cu8, cs8, cs16 or cf32",
+        ));
+    }
+    for (i, arg) in p.args.iter().enumerate() {
+        for name in placeholders(arg) {
+            if !PROGRAM_PLACEHOLDERS.contains(&name) {
+                return Err(RowError::new(
+                    format!("decoder.args[{i}]"),
+                    format!(
+                        "unknown placeholder {name} (known: {})",
+                        PROGRAM_PLACEHOLDERS.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    if p.output.via == OutputVia::Tcp && p.output.port.is_none() {
+        return Err(RowError::new(
+            "decoder.output.port",
+            "required with via: tcp (\"$port\" for the port zeta picks)",
+        ));
+    }
+    Ok(())
+}
+
+/// Every `$name` in `arg` (`name` of lowercase letters, digits and `_`), `$` included.
+fn placeholders(arg: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for (i, _) in arg.match_indices('$') {
+        let len = arg[i + 1..]
+            .bytes()
+            .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
+            .count();
+        out.push(&arg[i..i + 1 + len]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POCSAG: &str = include_str!("../../../../modes/pocsag_decode.json");
+    const ADSB: &str = include_str!("../../../../modes/adsb_decode.json");
+
+    /// `text` with `edit` applied to its JSON.
+    fn edited(text: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(text).unwrap();
+        edit(&mut v);
+        v.to_string()
+    }
+
+    /// The stages the rows of these tests need: none (a program row has no graph, and
+    /// a graph row's earlier checks fail before its graph is reached).
+    fn no_stages() -> StageRegistry {
+        StageRegistry::new()
+    }
+
+    /// Every embedded row parses, and the program row validates with no stages at all.
+    /// (`tests/modes.rs` validates every row against zeta-dsp's stages: a unit test
+    /// cannot, since zeta-dsp links its own copy of this crate.)
+    #[test]
+    fn embedded_rows_parse() {
+        for (file, text) in super::super::ModeRegistry::embedded() {
+            parse(text).unwrap_or_else(|e| panic!("{file}: {e}"));
+        }
+        validate(&parse(ADSB).unwrap(), &no_stages()).unwrap();
+    }
+
+    #[test]
+    fn unknown_field_is_rejected_naming_it() {
+        let text = edited(POCSAG, |v| v["bogus"] = 1.into());
+        let e = parse(&text).unwrap_err();
+        assert_eq!(e.field, "bogus", "{e}");
+        assert!(
+            e.to_string().starts_with("bogus: unknown field `bogus`"),
+            "{e}"
+        );
+        let text = edited(ADSB, |v| v["decoder"]["input"]["extra"] = 1.into());
+        assert_eq!(parse(&text).unwrap_err().field, "extra");
+        let text = edited(POCSAG, |v| {
+            v.as_object_mut().unwrap().remove("label");
+        });
+        assert_eq!(parse(&text).unwrap_err().field, "label");
+    }
+
+    #[test]
+    fn summary_naming_a_missing_field_is_broken() {
+        let row = parse(&edited(ADSB, |v| {
+            v["event"]["summary"] = "{icao} {heading?}".into()
+        }))
+        .unwrap();
+        let e = validate(&row, &no_stages()).unwrap_err();
+        assert_eq!(e.field, "event.summary");
+        assert!(e.error.contains("\"heading\""), "{e}");
+        let row = parse(&edited(ADSB, |v| v["event"]["summary"] = "{icao".into())).unwrap();
+        assert_eq!(
+            validate(&row, &no_stages()).unwrap_err().field,
+            "event.summary"
+        );
+    }
+
+    #[test]
+    fn bad_id_is_broken() {
+        for id in ["Pocsag", "9pocsag", "pocsag-decode", ""] {
+            let row = parse(&edited(ADSB, |v| v["id"] = id.into())).unwrap();
+            let e = validate(&row, &no_stages()).unwrap_err();
+            assert_eq!(e.field, "id", "{id}: {e}");
+        }
+    }
+
+    #[test]
+    fn identify_and_program_rules() {
+        let check = |edit: fn(&mut serde_json::Value)| {
+            validate(&parse(&edited(ADSB, edit)).unwrap(), &no_stages())
+                .unwrap_err()
+                .field
+        };
+        assert_eq!(
+            check(|v| v["identify"]["proof"] = "field".into()),
+            "identify.field"
+        );
+        assert_eq!(
+            check(|v| v["identify"]["quick"] = "adsb".into()),
+            "identify.quick"
+        );
+        assert_eq!(
+            check(|v| v["decoder"]["input"]["stream"] = "audio".into()),
+            "decoder.input.stream"
+        );
+        assert_eq!(
+            check(|v| v["decoder"]["args"][0] = "--freq=$freq_hz".into()),
+            "decoder.args[0]"
+        );
+        assert_eq!(
+            check(|v| v["decoder"]["output"]["port"] = serde_json::Value::Null),
+            "decoder.output.port"
+        );
+        assert_eq!(
+            check(|v| v["event"]["schema"]["properties"]["delay_ms"] =
+                serde_json::json!({"type": "number"})),
+            "event.schema.properties.delay_ms"
+        );
+        let e = validate(
+            &parse(&edited(ADSB, |v| {
+                v["decoder"]["input"]["stream"] = "audio".into()
+            }))
+            .unwrap(),
+            &no_stages(),
+        )
+        .unwrap_err();
+        assert_eq!(e.error, "audio input programs arrive in plan 17");
+    }
+
+    #[test]
+    fn graph_params_named_for_a_unit_hold_integers() {
+        let row = parse(&edited(POCSAG, |v| {
+            v["decoder"]["nodes"][0]["params"]["out_rate_hz"] = 48000.5.into()
+        }))
+        .unwrap();
+        let e = validate(&row, &no_stages()).unwrap_err();
+        assert_eq!(e.field, "decoder.nodes[channel].params.out_rate_hz");
+        let row = parse(&edited(POCSAG, |v| {
+            v["decoder"]["nodes"][0]["params"]["center_hz"] = "$centre".into()
+        }))
+        .unwrap();
+        let e = validate(&row, &no_stages()).unwrap_err();
+        assert_eq!(e.field, "decoder.nodes[channel].params.center_hz");
+        // With every placeholder known, the graph itself is checked (no stages: unknown kind).
+        let e = validate(&parse(POCSAG).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "decoder");
+        assert!(e.error.contains("unknown stage kind"), "{e}");
+    }
+
+    #[test]
+    fn summary_fields_reads_optional_and_alternative_names() {
+        assert_eq!(
+            summary_fields("{ps?pi} · {rt?}").unwrap(),
+            ["ps", "pi", "rt"]
+        );
+        assert_eq!(
+            summary_fields("{icao} {callsign?} {lat?},{lon?}").unwrap(),
+            ["icao", "callsign", "lat", "lon"]
+        );
+        assert!(summary_fields("{}").is_err());
+    }
+}

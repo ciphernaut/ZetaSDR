@@ -91,6 +91,7 @@ pub async fn spawn_with(dir: &Path, opts: TestOpts) -> TestServer {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory: None,
+        modes_dir: None,
     };
     let ports = vec![source.clone() as Arc<dyn Port>];
     let node = Arc::new(Node::open(cfg, registry, ports).await.expect("open node"));

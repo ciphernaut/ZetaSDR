@@ -1,0 +1,58 @@
+{
+  "id": "rds_decode",
+  "name": "RDS broadcast data",
+  "family": "broadcast",
+  "band": {
+    "bandwidth_hz": 200000,
+    "centers_hz": [],
+    "min_hz": 150000
+  },
+  "modulation": ["wfm"],
+  "label": "RDS",
+  "protocol": "rds",
+  "decoder": {
+    "kind": "graph",
+    "nodes": [
+      {
+        "id": "channel",
+        "kind": "channel",
+        "params": {
+          "center_hz": "$center_hz",
+          "bandwidth_hz": "$bandwidth_hz",
+          "out_rate_hz": "$out_rate_hz"
+        }
+      },
+      {
+        "id": "decode",
+        "kind": "rds_decode",
+        "params": {}
+      }
+    ],
+    "edges": [
+      { "from": "channel", "to": "decode", "kind": "iq" }
+    ]
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "pi": { "type": "string" },
+        "pty": { "type": "integer" },
+        "tp": { "type": "boolean" },
+        "ps": { "type": ["string", "null"] },
+        "rt": { "type": ["string", "null"] },
+        "group": { "type": "string" }
+      }
+    },
+    "summary": "{ps?pi} · {rt?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 10000,
+    "min_span_ms": 1000,
+    "quick": "rds"
+  },
+  "catalogue": ["radio-data-system-rds"]
+}

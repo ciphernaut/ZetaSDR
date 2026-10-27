@@ -167,6 +167,7 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory: None,
+        modes_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     src.start();

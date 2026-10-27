@@ -23,6 +23,7 @@ Every command takes these global flags:
 - `--source-soapy ID=ARGS`: attach a SoapySDR device as source `ID`, `ARGS` being SoapySDR device arguments such as `driver=hackrf,serial=...`. A `gain=DB` item in `ARGS` is zeta's own: automatic gain is turned off and the overall receive gain set to `DB` dB when the device opens (logged with the device's range as `zeta: gain for <id>: ...`), and a `DB` outside that range refuses to attach the source (exit 1); without it the driver's default gain is used, which on a USRP is its minimum. A gain set live with `source_set_gain` is persisted and wins over `gain=` on the next start. `ppm=N` corrects the device's frequency error: the hardware is tuned `N` parts per million higher than every frequency zeta reports, so a device that reads high by `N` ppm (a carrier on 146.975 MHz seen at 146.9754) reads true. `zeta soapy find [--filter ARGS]` lists the devices attached to this machine as JSON. Only in a zeta built with `RUSTFLAGS="--cfg soapy"` (needs libsoapysdr-dev); otherwise both exit 1 saying so.
 - `--ring-budget-mb N` (env `ZETA_RING_BUDGET_MB`): memory budget for one source's IQ history (default a quarter of RAM, at most 4 GiB). The ring keeps 10 s at narrow rates and shrinks to as little as 1 s at wide ones (a ring holds 8 bytes per sample, so 16 Msps gets 8 s of a 1 GiB budget); `iq read` and `classify` spans older than that fail `too_old`. The size chosen is logged to stderr as `zeta: ring for <source>: <s> s at <rate> Hz (<MB> MB)`.
 - `--plugin KIND=PATH`: register the program at absolute `PATH` as stage kind `KIND` (lowercase, not a built-in kind). It is probed at startup; a failed probe exits 1 naming the kind and the reason. A plugin runs with a cleared environment: only `PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM` and `PYTHONPATH` pass through, and each `ZETA_PLUGIN_ENV_<NAME>` variable reaches it as `<NAME>`; nothing else (no `ZETA_SECRET`) does.
+- `--modes-dir PATH`: the operator's decoder mode rows, one `*.json` file each, read after the built-in ones (default `$XDG_CONFIG_HOME/zetasdr/modes`, else `~/.config/zetasdr/modes`; a missing directory is no error). A row with a built-in mode's `id` replaces it. A row that does not parse or validate never stops the node: it is listed `broken` by `modes list` and reported at startup as `zeta: mode <id> (<file>): <field>: <error>`, and a broken file that meant to replace a built-in row leaves that row in force.
 
 Sources and plugins are not persisted: repeat the flags, with the same ids and kinds, on every invocation, `serve` included. A source id may be used once across all the source flags. `source list` shows each source's capability record: `remote` is true for a KiwiSDR, a `--source-node` and a `--source-vrt` source, `push` false for SoapySDR devices, and `fault` names a source that has failed (a full Kiwi, an unplugged device); a job on a faulted source fails with that reason.
 
@@ -232,6 +233,31 @@ JSON: `{"op":"channel_plans"}`
 CLI: `zeta plans [--plan ID]`
 
 `channel_plans` lists the channel plans the node knows (`uhf_cb_au`: Australian UHF CB, 80 channels, two rasters 12.5 kHz apart). Name a channel by its number to the user ("ch20") and start jobs at its `center_hz` with the plan's `bandwidth_hz`.
+
+### modes_list
+
+The decoder modes the node knows, one row each (`modes/*.json` built in, then the operator's `--modes-dir`), sorted by id, narrowed to `family` and `state` when given (`null` for any).
+
+- family: string or null
+- state: string or null
+
+JSON: `{"op":"modes_list","family":null,"state":null}`
+
+CLI: `zeta modes list [--family F] [--state S]`
+
+The decoder modes the node knows, one row each: `id` (the `kind` a decoder job starts with), `name`, `family`, `band` (`bandwidth_hz` the decoder expects, well-known `centers_hz`, `min_hz` the narrowest band it accepts or `null`), `modulation` (the layer-1 labels it presents as), `decoder_kind` (`graph`, run in-process, or `program`, an external decoder), `program`, `checked`, and `state` ready|broken|unavailable with `reason` (`null` when ready). A broken row names its file and field in `reason` (`<field>: <error>`); an unavailable one names the program it lacks. `family` (and the `family` filter) is one of `tv`, `broadcast`, `aviation`, `maritime`, `satellite`, `two_way`, `cellular_rail`, `pagers`, `iot`, `weather_science`, `amateur_digital`, `amateur_voice`, `hf_utility`, `general`. On the CLI, `--family` and `--state` narrow the list.
+
+### modes_show
+
+One mode's row as loaded, with its `state` and `reason`.
+
+- id: string; an id from `modes list`
+
+JSON: `{"op":"modes_show","id":"<id>"}`
+
+CLI: `zeta modes show <id>`
+
+One mode's full row as loaded (`row`: band, decoder graph or program block, event schema and `summary` template, `identify` rule, catalogue ids) with its `state`, `reason`, `file`, `program` and `checked`. An unknown id is an `other` error listing the known ids; take ids from `modes list`, never invent them.
 
 ### classify
 

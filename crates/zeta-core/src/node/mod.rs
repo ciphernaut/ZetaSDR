@@ -21,6 +21,7 @@ use crate::graph::{self, Graph, GraphError};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
+use crate::modes::ModeRegistry;
 use crate::ops::{JobKind, Op, OpError, OpResult};
 use crate::port::{GainInfo, Port, PortError, Tuning};
 use crate::ring::IqRing;
@@ -77,6 +78,9 @@ pub struct NodeConfig {
     /// added, so resumed jobs get a bank as fresh ones do. `None`: no banks
     /// (until [`Node::set_bank_factory`]).
     pub bank_factory: Option<Arc<dyn BankFactory>>,
+    /// The operator's mode rows (`--modes-dir`), read after the embedded ones; `None`
+    /// is [`crate::modes::default_operator_dir`]. A missing directory reads as empty.
+    pub modes_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -196,6 +200,8 @@ struct Inner {
     scan_dwell_ms: u64,
     backends: Vec<Backend>,
     registry: StageRegistry,
+    /// The decoder modes, loaded at `open` against `registry`.
+    modes: Arc<ModeRegistry>,
     leases: LeaseManager,
     bus: Arc<StreamBus>,
     ports: RwLock<HashMap<SourceId, Arc<dyn Port>>>,
@@ -522,6 +528,11 @@ impl Node {
             )
         });
         let resume = cfg.resume;
+        let modes_dir = cfg
+            .modes_dir
+            .clone()
+            .or_else(crate::modes::default_operator_dir);
+        let modes = Arc::new(ModeRegistry::load(&registry, modes_dir.as_deref()));
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
         // `Node::apply` and are never logged.
@@ -544,6 +555,7 @@ impl Node {
                 scan_dwell_ms: cfg.scan_dwell_ms,
                 backends: cfg.backends,
                 registry,
+                modes,
                 leases: LeaseManager::new(),
                 bus,
                 ports: RwLock::new(HashMap::new()),
@@ -833,6 +845,11 @@ impl Node {
     /// Register a classifier; `Classify` runs all of them in layer order.
     pub fn add_classifier(&self, c: Arc<dyn Classifier>) {
         self.inner.classifiers.write().unwrap().register(c);
+    }
+
+    /// The decoder modes loaded at `open` (see [`crate::modes`]).
+    pub fn modes(&self) -> Arc<ModeRegistry> {
+        self.inner.modes.clone()
     }
 
     pub(crate) fn knowledge(&self) -> Vec<Arc<dyn KnowledgeProvider>> {

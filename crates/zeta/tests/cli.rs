@@ -967,8 +967,11 @@ fn then_tail_reports_failed_job() {
             "100000000",
             "--bandwidth-hz",
             "500",
+            // The job's first block is the source's second, about 2 s in (2000 samples
+            // at 1003 Hz): the tail outlasts it, and ends when the failed job's stream
+            // closes.
             "--then-tail",
-            "1,2000",
+            "1,5000",
         ],
     )
     .assert()
@@ -2117,4 +2120,119 @@ fn source_gain_cli_requires_db_or_auto() {
         .stdout
         .clone();
     assert!(json(&out)["value"][0]["gain"].is_null());
+}
+
+/// `zeta modes list` (one-shot) prints the five embedded rows, all ready; `--family`
+/// narrows it and `modes show` prints one row.
+#[test]
+fn modes_list_prints_the_five_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let modes_dir = modes.display().to_string();
+    let out = zeta(dir.path(), &["--modes-dir", &modes_dir, "modes", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "modes", "{v}");
+    let rows = v["value"]["modes"].as_array().expect("modes array");
+    let ids: Vec<&str> = rows.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "acars_decode",
+            "adsb_decode",
+            "aprs_decode",
+            "pocsag_decode",
+            "rds_decode"
+        ]
+    );
+    assert!(rows.iter().all(|m| m["state"] == "ready"), "{v}");
+    let out = zeta(
+        dir.path(),
+        &[
+            "--modes-dir",
+            &modes_dir,
+            "modes",
+            "list",
+            "--family",
+            "aviation",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    assert_eq!(json(&out)["value"]["modes"].as_array().unwrap().len(), 2);
+    let out = zeta(
+        dir.path(),
+        &["--modes-dir", &modes_dir, "modes", "show", "rds_decode"],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "mode", "{v}");
+    assert_eq!(v["value"]["mode"]["row"]["label"], "RDS", "{v}");
+    let out = zeta(
+        dir.path(),
+        &["--modes-dir", &modes_dir, "modes", "show", "nope"],
+    )
+    .assert()
+    .code(2)
+    .get_output()
+    .stdout
+    .clone();
+    assert!(
+        json(&out)["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("unknown mode nope (known: acars_decode, "),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// A row file that does not parse is logged at startup and listed as broken; the node runs.
+#[test]
+fn a_broken_operator_row_is_logged_and_the_node_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    std::fs::write(
+        modes.join("pocsag_decode.json"),
+        r#"{"id":"pocsag_decode","bogus":1}"#,
+    )
+    .unwrap();
+    let modes_dir = modes.display().to_string();
+    let out = zeta(
+        dir.path(),
+        &[
+            "--modes-dir",
+            &modes_dir,
+            "modes",
+            "list",
+            "--state",
+            "broken",
+        ],
+    )
+    .assert()
+    .success()
+    .stderr(contains("zeta: mode pocsag_decode").and(contains("bogus")))
+    .get_output()
+    .stdout
+    .clone();
+    let rows = json(&out)["value"]["modes"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["reason"].as_str().unwrap().contains("bogus"));
+    zeta(dir.path(), &["--modes-dir", &modes_dir, "source", "list"])
+        .assert()
+        .success()
+        .stderr(contains("zeta: mode pocsag_decode"));
 }

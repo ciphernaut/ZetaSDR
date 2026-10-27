@@ -1,0 +1,56 @@
+{
+  "id": "pocsag_decode",
+  "name": "POCSAG pagers",
+  "family": "pagers",
+  "band": {
+    "bandwidth_hz": 12500,
+    "centers_hz": [148637500, 466075000]
+  },
+  "modulation": ["fm", "fsk"],
+  "label": "POCSAG",
+  "protocol": "pocsag",
+  "decoder": {
+    "kind": "graph",
+    "nodes": [
+      {
+        "id": "channel",
+        "kind": "channel",
+        "params": {
+          "center_hz": "$center_hz",
+          "bandwidth_hz": "$bandwidth_hz",
+          "out_rate_hz": "$out_rate_hz"
+        }
+      },
+      {
+        "id": "decode",
+        "kind": "pocsag_decode",
+        "params": {}
+      }
+    ],
+    "edges": [
+      { "from": "channel", "to": "decode", "kind": "iq" }
+    ]
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "address": { "type": "integer" },
+        "function": { "type": "integer" },
+        "baud": { "type": "integer" },
+        "kind": { "type": "string", "enum": ["numeric", "alpha", "tone"] },
+        "text": { "type": "string" }
+      }
+    },
+    "summary": "{address}: {text?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 5000,
+    "min_span_ms": 1000,
+    "quick": "pocsag"
+  },
+  "catalogue": ["pocsag", "pocsag-2", "pager-pocsag-1200"]
+}

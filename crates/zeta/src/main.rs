@@ -108,6 +108,7 @@ async fn main() -> ExitCode {
         &plugins,
         op.is_none(),
         cli.ring_budget_mb,
+        cli.modes_dir.clone(),
         speech.clone(),
     )
     .await

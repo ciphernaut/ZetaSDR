@@ -19,6 +19,7 @@ ulid = "3.0.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+zeta-dsp = { path = "../zeta-dsp" }
 zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] }
 
 [features]

@@ -58,6 +58,7 @@ async fn tone_node(dir: &std::path::Path) -> Arc<Node> {
         backends: vec![Backend::Cpu],
         resume: false,
         bank_factory: None,
+        modes_dir: None,
     };
     let ports = vec![source.clone() as Arc<dyn Port>];
     let node = Arc::new(Node::open(cfg, registry, ports).await.expect("open node"));

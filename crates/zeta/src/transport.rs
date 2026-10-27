@@ -58,6 +58,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             &sources,
             &plugins,
             cli.ring_budget_mb,
+            cli.modes_dir,
             speech,
         )
         .await);
@@ -81,7 +82,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
     if cli.configures_local_node() {
         return usage(
-            "sources and plugins are configured on the serving node: drop --source-*, --plugin and --state-dir with --node",
+            "sources, plugins and modes are configured on the serving node: drop --source-*, --plugin, --state-dir and --modes-dir with --node",
         );
     }
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {
@@ -92,7 +93,17 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
         Err(e) => return usage(&e.to_string()),
     };
     if let Command::Ask(args) = cli.command {
-        return ask::run(args, Some(client), PathBuf::new(), &[], &[], None, None).await;
+        return ask::run(
+            args,
+            Some(client),
+            PathBuf::new(),
+            &[],
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await;
     }
     let plan = cli.command.plan_filter();
     let op = match cli.command.into_op() {

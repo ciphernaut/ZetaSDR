@@ -15,6 +15,7 @@ use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::JobRecord;
 use crate::knowledge::{Allocation, Signature};
 use crate::lease::LeaseError;
+use crate::modes::{Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeState};
 use crate::node::{AfterGate, Node, NodeError};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning};
 use crate::ring::RingError;
@@ -187,6 +188,21 @@ pub enum Op {
     /// The channel plans the node knows, each with its channels expanded
     /// and sorted by frequency.
     ChannelPlans {},
+    /// The decoder modes the node knows, one row each (`modes/*.json` built in, then the
+    /// operator's `--modes-dir`), sorted by id, narrowed to `family` and `state` when
+    /// given (`null` for any).
+    ModesList {
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::modes::nullable_enum::<Family>")]
+        family: Option<Family>,
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::modes::nullable_enum::<ModeState>")]
+        state: Option<ModeState>,
+    },
+    /// One mode's row as loaded, with its `state` and `reason`.
+    ModesShow {
+        id: String,
+    },
     /// Run every registered classifier over the selection's band and span of
     /// the source ring (no upstream features).
     Classify {
@@ -1163,6 +1179,49 @@ impl From<&crate::plans::ChannelPlan> for PlanInfo {
     }
 }
 
+/// One mode as `modes_list` reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct ModeInfo {
+    pub id: ModeId,
+    pub name: String,
+    pub family: Family,
+    pub band: ModeBand,
+    pub modulation: Vec<String>,
+    pub state: ModeState,
+    /// Why the row is not ready (a broken row names its file's field); `null` when ready.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub reason: Option<String>,
+    pub decoder_kind: DecoderKind,
+    /// The program a program row runs; `null` for a graph row or one not yet probed.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub program: Option<String>,
+    /// When the row's check last passed with `--strict` on this host; `null` if never.
+    #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub checked: Option<u64>,
+}
+
+impl From<&LoadedMode> for ModeInfo {
+    fn from(m: &LoadedMode) -> Self {
+        ModeInfo {
+            id: m.row.id.clone(),
+            name: m.row.name.clone(),
+            family: m.row.family,
+            band: m.row.band.clone(),
+            modulation: m.row.modulation.clone(),
+            state: m.state,
+            reason: m.reason.clone(),
+            decoder_kind: m.row.decoder.kind(),
+            program: m.program.as_ref().map(|p| p.display().to_string()),
+            checked: m.checked,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "result",
@@ -1201,6 +1260,14 @@ pub enum OpResult {
     ChannelPlans {
         plans: Vec<PlanInfo>,
     },
+    /// `modes_list`: one entry per row, sorted by id.
+    Modes {
+        modes: Vec<ModeInfo>,
+    },
+    /// `modes_show`: the row as loaded.
+    Mode {
+        mode: Box<LoadedMode>,
+    },
     Labels(Vec<Label>),
     /// A source's gain after `source_set_gain`.
     Gain(GainInfo),
@@ -1229,6 +1296,8 @@ impl Op {
             Op::GraphPut { .. } => "graph_put",
             Op::KnowledgeLookup { .. } => "knowledge_lookup",
             Op::ChannelPlans {} => "channel_plans",
+            Op::ModesList { .. } => "modes_list",
+            Op::ModesShow { .. } => "modes_show",
             Op::Classify { .. } => "classify",
             Op::Schema {} => "schema",
         }
@@ -1248,6 +1317,8 @@ impl Op {
                 | Op::GraphGet { .. }
                 | Op::KnowledgeLookup { .. }
                 | Op::ChannelPlans {}
+                | Op::ModesList { .. }
+                | Op::ModesShow { .. }
         )
     }
 
@@ -1293,6 +1364,8 @@ impl OpResult {
             OpResult::Graph(_) => "graph",
             OpResult::Knowledge { .. } => "knowledge",
             OpResult::ChannelPlans { .. } => "channel_plans",
+            OpResult::Modes { .. } => "modes",
+            OpResult::Mode { .. } => "mode",
             OpResult::Labels(_) => "labels",
             OpResult::Gain(_) => "gain",
             OpResult::Ok => "ok",
@@ -2027,6 +2100,28 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
         Op::ChannelPlans {} => Ok(OpResult::ChannelPlans {
             plans: crate::plans::PLANS.iter().map(PlanInfo::from).collect(),
         }),
+        Op::ModesList { family, state } => Ok(OpResult::Modes {
+            modes: node
+                .modes()
+                .all()
+                .iter()
+                .filter(|m| family.is_none_or(|f| m.row.family == f))
+                .filter(|m| state.is_none_or(|s| m.state == s))
+                .map(ModeInfo::from)
+                .collect(),
+        }),
+        Op::ModesShow { id } => {
+            let modes = node.modes();
+            match modes.get(&id) {
+                Some(m) => Ok(OpResult::Mode {
+                    mode: Box::new(m.clone()),
+                }),
+                None => Err(other(format!(
+                    "unknown mode {id} (known: {})",
+                    modes.ids().join(", ")
+                ))),
+            }
+        }
         Op::Classify { selection } => classify(node, selection).await,
         Op::Schema {} => Ok(OpResult::Schema(node.schema())),
     }

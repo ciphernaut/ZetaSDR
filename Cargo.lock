@@ -3800,6 +3800,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ulid",
+ "zeta-dsp",
  "zeta-source-file",
 ]
 

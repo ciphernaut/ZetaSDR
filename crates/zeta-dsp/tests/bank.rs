@@ -480,6 +480,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory: None,
+        modes_dir: None,
     };
     let node = Node::open(cfg, reg, vec![]).await.unwrap();
     let factory = Arc::new(CountingPfb(Default::default()));
@@ -602,6 +603,7 @@ async fn measure_emits_partials_when_the_input_gaps_every_400_ms() {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory: Some(Arc::new(PfbBankFactory)),
+        modes_dir: None,
     };
     let node = Node::open(cfg, reg, vec![]).await.unwrap();
     let port = Arc::new(Retunable {

@@ -1,0 +1,69 @@
+{
+  "id": "aprs_decode",
+  "name": "APRS packet radio",
+  "family": "amateur_digital",
+  "band": {
+    "bandwidth_hz": 12500,
+    "centers_hz": [144800000, 144390000]
+  },
+  "modulation": ["fm", "fsk"],
+  "label": "APRS",
+  "protocol": "aprs",
+  "decoder": {
+    "kind": "graph",
+    "nodes": [
+      {
+        "id": "channel",
+        "kind": "channel",
+        "params": {
+          "center_hz": "$center_hz",
+          "bandwidth_hz": "$bandwidth_hz",
+          "out_rate_hz": "$out_rate_hz"
+        }
+      },
+      {
+        "id": "demod",
+        "kind": "nbfm_demod",
+        "params": {
+          "deviation_hz": 3000,
+          "audio_rate_hz": 48000,
+          "squelch_db": null,
+          "squelch": false
+        }
+      },
+      {
+        "id": "decode",
+        "kind": "aprs_decode",
+        "params": {}
+      }
+    ],
+    "edges": [
+      { "from": "channel", "to": "demod", "kind": "iq" },
+      { "from": "demod", "to": "decode", "kind": "audio" }
+    ]
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "src": { "type": "string" },
+        "dst": { "type": "string" },
+        "path": { "type": "array", "items": { "type": "string" } },
+        "info": { "type": "string" },
+        "info_hex": { "type": "string" },
+        "fcs_ok": { "type": "boolean" }
+      }
+    },
+    "summary": "{src} > {dst}: {info}"
+  },
+  "identify": {
+    "proof": "field",
+    "field": "fcs_ok",
+    "min_events": 1,
+    "dwell_ms": 5000,
+    "min_span_ms": 1000,
+    "quick": "aprs"
+  },
+  "catalogue": ["aprs", "automatic-packet-reporting-system-aprs"]
+}

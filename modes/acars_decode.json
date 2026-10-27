@@ -1,0 +1,60 @@
+{
+  "id": "acars_decode",
+  "name": "ACARS aircraft messages",
+  "family": "aviation",
+  "band": {
+    "bandwidth_hz": 10000,
+    "centers_hz": [131550000, 131725000, 131825000, 130025000, 130450000, 131125000, 131450000]
+  },
+  "modulation": ["am"],
+  "label": "ACARS",
+  "protocol": "acars",
+  "decoder": {
+    "kind": "graph",
+    "nodes": [
+      {
+        "id": "channel",
+        "kind": "channel",
+        "params": {
+          "center_hz": "$center_hz",
+          "bandwidth_hz": "$bandwidth_hz",
+          "out_rate_hz": "$out_rate_hz"
+        }
+      },
+      {
+        "id": "decode",
+        "kind": "acars_decode",
+        "params": {}
+      }
+    ],
+    "edges": [
+      { "from": "channel", "to": "decode", "kind": "iq" }
+    ]
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "mode": { "type": "string" },
+        "reg": { "type": "string" },
+        "ack": { "type": ["string", "null"] },
+        "label": { "type": "string" },
+        "block_id": { "type": ["string", "null"] },
+        "msg_no": { "type": ["string", "null"] },
+        "flight": { "type": ["string", "null"] },
+        "text": { "type": "string" },
+        "crc_ok": { "type": "boolean" }
+      }
+    },
+    "summary": "{reg} {label}: {text?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 10000,
+    "min_span_ms": 1000,
+    "quick": "acars"
+  },
+  "catalogue": ["acars", "aircraft-communications-addressing-and-reporting-system-acar"]
+}

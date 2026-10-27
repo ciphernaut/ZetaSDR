@@ -644,6 +644,7 @@ async fn node_with(src: Arc<SoapySource>) -> (Node, tempfile::TempDir) {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory: None,
+        modes_dir: None,
     };
     let port: Arc<dyn Port> = src;
     (Node::open(cfg, reg, vec![port]).await.unwrap(), dir)

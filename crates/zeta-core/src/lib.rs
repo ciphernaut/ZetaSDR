@@ -8,6 +8,7 @@ pub mod graph;
 pub mod job;
 pub mod knowledge;
 pub mod lease;
+pub mod modes;
 pub mod node;
 pub mod ops;
 pub mod plans;

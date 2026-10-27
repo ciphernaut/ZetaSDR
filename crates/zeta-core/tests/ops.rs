@@ -102,6 +102,7 @@ fn cfg(dir: &Path) -> NodeConfig {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory: None,
+        modes_dir: None,
     }
 }
 
@@ -477,7 +478,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 19, "one schema per Op variant");
+    assert_eq!(vs.len(), 21, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -568,6 +569,10 @@ fn unit_typed(s: &Value, defs: &Value) -> bool {
         |t: &Value| t == "integer" || t.as_array().is_some_and(|a| a.contains(&"integer".into()));
     if is_int(&s["type"]) {
         return true;
+    }
+    // A list of unit values (`centers_hz`).
+    if s["type"] == "array" {
+        return unit_typed(&s["items"], defs);
     }
     if let Some(alts) = s["anyOf"].as_array() {
         return alts

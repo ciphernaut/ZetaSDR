@@ -383,6 +383,7 @@ async fn local_node(dir: &std::path::Path, port: Arc<dyn Port>) -> Node {
         backends: vec![Backend::Cpu],
         resume: false,
         bank_factory: None,
+        modes_dir: None,
     };
     Node::open(cfg, registry, vec![port]).await.expect("node")
 }

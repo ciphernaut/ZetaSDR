@@ -179,6 +179,7 @@ fn cfg(dir: &Path) -> NodeConfig {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory: None,
+        modes_dir: None,
     }
 }
 

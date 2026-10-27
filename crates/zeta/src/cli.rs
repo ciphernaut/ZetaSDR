@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
+use zeta_core::modes::{Family, ModeState};
 use zeta_core::ops::{JobKind, Op, OpError, Sideband};
 use zeta_core::types::{Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
 
@@ -59,6 +60,11 @@ pub struct Cli {
     /// Register the program at absolute PATH as stage kind KIND (repeatable); probed at startup
     #[arg(long = "plugin", global = true, value_name = "KIND=PATH", value_parser = sources::parse_plugin)]
     pub plugins: Vec<PluginSpec>,
+    /// Directory of the operator's mode rows (*.json), read after the built-in ones; a row
+    /// with a built-in id replaces it [default: $XDG_CONFIG_HOME/zetasdr/modes or
+    /// ~/.config/zetasdr/modes]
+    #[arg(long, global = true, value_name = "PATH")]
+    pub modes_dir: Option<PathBuf>,
     #[command(flatten)]
     pub speech: SpeechArgs,
     /// Every source flag parsed, file then soapy then kiwi then node then vrt (filled by
@@ -152,9 +158,13 @@ impl Cli {
         self.sources.clone()
     }
 
-    /// Whether any flag that configures the local node (sources, plugins, state dir) was given.
+    /// Whether any flag that configures the local node (sources, plugins, state dir, modes
+    /// dir) was given.
     pub fn configures_local_node(&self) -> bool {
-        !self.sources.is_empty() || !self.plugins.is_empty() || self.state_dir.is_some()
+        !self.sources.is_empty()
+            || !self.plugins.is_empty()
+            || self.state_dir.is_some()
+            || self.modes_dir.is_some()
     }
 }
 
@@ -184,6 +194,9 @@ pub enum Command {
         #[arg(long, value_name = "ID")]
         plan: Option<String>,
     },
+    /// The decoder modes the node knows
+    #[command(subcommand)]
+    Modes(ModesCmd),
     /// Run every classifier over a selection of a source ring
     Classify(SelectionArgs),
     /// JSON schemas of operations, results and errors
@@ -210,6 +223,34 @@ pub enum Command {
     /// SoapySDR devices attached to this machine (local; not an operation)
     #[command(subcommand)]
     Soapy(SoapyCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModesCmd {
+    /// List the modes with their state (ready, broken, unavailable)
+    List {
+        /// Only this family (e.g. aviation, pagers, amateur_digital)
+        #[arg(long, value_name = "F", value_parser = parse_family)]
+        family: Option<Family>,
+        /// Only this state: ready, broken or unavailable
+        #[arg(long, value_name = "S", value_parser = parse_mode_state)]
+        state: Option<ModeState>,
+    },
+    /// Print one mode's row as loaded
+    Show {
+        /// The mode id (from `modes list`)
+        id: String,
+    },
+}
+
+/// `--family`, spelled as the operation set spells it (`amateur_digital`).
+fn parse_family(s: &str) -> Result<Family, String> {
+    serde_json::from_value(s.into()).map_err(|e| e.to_string())
+}
+
+/// `--state`: `ready`, `broken` or `unavailable`.
+fn parse_mode_state(s: &str) -> Result<ModeState, String> {
+    serde_json::from_value(s.into()).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Subcommand)]
@@ -794,6 +835,8 @@ impl Command {
                 }
                 Op::ChannelPlans {}
             }
+            Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
+            Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Classify(s) => Op::Classify {
                 selection: s.into(),
             },

@@ -32,6 +32,7 @@ async fn stream_tail_returns_events_from_running_job() {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory: None,
+        modes_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     src.start();

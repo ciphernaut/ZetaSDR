@@ -1,0 +1,54 @@
+{
+  "id": "adsb_decode",
+  "name": "ADS-B aircraft positions",
+  "family": "aviation",
+  "band": {
+    "bandwidth_hz": 2400000,
+    "centers_hz": [1090000000],
+    "min_hz": 2000000
+  },
+  "modulation": [],
+  "label": "ADS-B",
+  "protocol": "adsb",
+  "decoder": {
+    "kind": "program",
+    "programs": ["dump1090", "dump1090-fa", "dump1090-mutability", "readsb"],
+    "args": [
+      "--ifile", "-", "--iformat", "SC16", "--net",
+      "--net-bind-address", "127.0.0.1", "--net-sbs-port", "$port",
+      "--net-ri-port", "0", "--net-ro-port", "0",
+      "--net-bi-port", "0", "--net-bo-port", "0", "--quiet"
+    ],
+    "input": { "stream": "iq", "format": "cs16", "rate_hz": 2400000, "via": "stdin" },
+    "output": { "via": "tcp", "port": "$port", "parser": "sbs" },
+    "install": { "debian": "dump1090-fa", "url": "https://github.com/flightaware/dump1090" }
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "icao": { "type": "string" },
+        "msg": { "type": "integer" },
+        "callsign": { "type": ["string", "null"] },
+        "altitude_ft": { "type": ["integer", "null"] },
+        "ground_speed_kt": { "type": ["number", "null"] },
+        "track_deg": { "type": ["number", "null"] },
+        "lat": { "type": ["number", "null"] },
+        "lon": { "type": ["number", "null"] },
+        "vertical_rate_fpm": { "type": ["integer", "null"] },
+        "squawk": { "type": ["string", "null"] },
+        "on_ground": { "type": ["boolean", "null"] }
+      }
+    },
+    "summary": "{icao} {callsign?} {altitude_ft?} {lat?},{lon?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 15000,
+    "min_span_ms": 1000,
+    "quick": null
+  },
+  "catalogue": ["ads-b", "automatic-dependent-surveillance-broadcast-ads-b"]
+}

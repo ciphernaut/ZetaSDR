@@ -15,7 +15,9 @@ use crate::sources::{PluginSpec, SourceSpec};
 use crate::{agents_md, node_setup, serve_lock};
 
 /// Run the request against the remote node, or against a local node on `state_dir`
-/// with `sources`, `plugins` and the speech backend `speech`.
+/// with `sources`, `plugins`, the operator's mode rows in `modes_dir` and the speech
+/// backend `speech`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     args: AskArgs,
     remote: Option<NodeClient>,
@@ -23,6 +25,7 @@ pub async fn run(
     sources: &[SourceSpec],
     plugins: &[PluginSpec],
     ring_budget_mb: Option<u64>,
+    modes_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
 ) -> ExitCode {
     let request = match read_request(args.request.as_deref()) {
@@ -57,8 +60,15 @@ pub async fn run(
                     "zeta serve (pid {pid}) owns this state dir; use --node"
                 ));
             }
-            let opened =
-                node_setup::open(state_dir, sources, plugins, false, ring_budget_mb, speech);
+            let opened = node_setup::open(
+                state_dir,
+                sources,
+                plugins,
+                false,
+                ring_budget_mb,
+                modes_dir,
+                speech,
+            );
             let (node, remotes) = match opened.await {
                 Ok((n, r)) => (Arc::new(n), r),
                 Err(e) => return fail(&e),
