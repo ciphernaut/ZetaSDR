@@ -241,6 +241,14 @@ pub enum ModesCmd {
         /// The mode id (from `modes list`)
         id: String,
     },
+    /// Run each mode's test on a node over a synthesised capture (local only)
+    Check {
+        /// Only this mode (from `modes list`)
+        id: Option<String>,
+        /// A mode whose program is missing fails instead of being skipped
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 /// `--family`, spelled as the operation set spells it (`amateur_digital`).
@@ -815,6 +823,7 @@ impl Command {
             | Command::Ask(_)
             | Command::Soapy(_)
             | Command::Ops(_)
+            | Command::Modes(ModesCmd::Check { .. })
             | Command::Transcripts(_) => {
                 return Ok(None);
             }

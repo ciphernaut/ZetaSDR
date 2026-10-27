@@ -1,0 +1,180 @@
+//! `zeta modes check [ID] [--strict]`: each row's `test` run on a node over a synthesised or
+//! fixture capture.
+
+mod common;
+
+use std::path::Path;
+
+use assert_cmd::Command;
+use zeta_dsp::fixtures::{aprs_packet_iq, write_fixture};
+
+/// A path no dump1090 lives at: the adsb row is missing here whatever the host has.
+const NO_DUMP1090: &str = "/nonexistent/zeta-test/dump1090";
+
+/// `zeta --state-dir <dir>/state --modes-dir <dir>/modes modes check <args>` with no
+/// remote node, no operator rows but the test's own, and dump1090 missing.
+fn check(dir: &Path, args: &[&str]) -> Command {
+    let modes = dir.join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut cmd = Command::cargo_bin("zeta").unwrap();
+    cmd.env_remove("ZETA_NODE")
+        .env_remove("ZETA_SECRET")
+        .env("XDG_CONFIG_HOME", common::no_xdg_config())
+        .env("ZETA_HANDLER_DUMP1090", NO_DUMP1090)
+        .arg("--state-dir")
+        .arg(dir.join("state"))
+        .arg("--modes-dir")
+        .arg(&modes)
+        .args(["modes", "check"])
+        .args(args);
+    cmd
+}
+
+fn stdout(cmd: &mut Command) -> (String, i32) {
+    let out = cmd.output().unwrap();
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        out.status.code().unwrap(),
+    )
+}
+
+#[test]
+fn modes_check_passes_the_four_in_crate_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) = stdout(&mut check(dir.path(), &[]));
+    for id in ["acars_decode", "aprs_decode", "pocsag_decode", "rds_decode"] {
+        assert!(out.lines().any(|l| l == format!("{id}: ok")), "{out}");
+    }
+    assert!(
+        out.lines()
+            .any(|l| l == "adsb_decode: skipped: dump1090 missing"),
+        "{out}"
+    );
+    assert_eq!(code, 0, "{out}");
+}
+
+#[test]
+fn modes_check_strict_fails_on_a_missing_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) = stdout(&mut check(dir.path(), &["--strict", "adsb_decode"]));
+    assert_eq!(out.trim(), "adsb_decode: fail: dump1090 missing", "{out}");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn an_unknown_id_lists_the_known_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = check(dir.path(), &["nope"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        err.contains("unknown mode nope (known: acars_decode, adsb_decode, aprs_decode"),
+        "{err}"
+    );
+}
+
+/// An operator row: `aprs_decode` under `id` with `test`, in `<dir>/modes`.
+fn write_row(dir: &Path, id: &str, test: serde_json::Value) {
+    let mut row: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/aprs_decode.json")).unwrap();
+    row["id"] = id.into();
+    row["test"] = test;
+    let modes = dir.join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    std::fs::write(
+        modes.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&row).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_fixture_test_row_is_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let meta = write_fixture(dir.path(), "aprs", &iq, 48_000, 144_800_000);
+    write_row(
+        dir.path(),
+        "aprs_fixture",
+        serde_json::json!({
+            "kind": "fixture",
+            "path": meta.display().to_string(),
+            "expect": {"src": "VK3ABC", "fcs_ok": true},
+            "within_ms": 5000
+        }),
+    );
+    let (out, code) = stdout(&mut check(dir.path(), &["aprs_fixture"]));
+    assert_eq!(out.trim(), "aprs_fixture: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_failing_expect_prints_the_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    write_row(
+        dir.path(),
+        "aprs_wrong",
+        serde_json::json!({
+            "kind": "synth", "family": "aprs", "src": "VK3ABC", "dst": "APRS", "info": ">hi",
+            "expect": {"src": "VK9XYZ", "fcs_ok": true},
+            "within_ms": 5000
+        }),
+    );
+    let (out, code) = stdout(&mut check(dir.path(), &["aprs_wrong"]));
+    let line = out.trim();
+    assert!(line.starts_with("aprs_wrong: fail: "), "{out}");
+    assert!(
+        line.contains("src: expected \"VK9XYZ\", got \"VK3ABC\""),
+        "{out}"
+    );
+    assert!(!line.contains("fcs_ok"), "{out}");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn a_test_block_that_does_not_parse_fails_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    write_row(
+        dir.path(),
+        "aprs_bogus",
+        serde_json::json!({
+            "kind": "synth", "family": "aprs", "src": "VK3ABC", "dst": "APRS", "info": ">hi",
+            "colour": "red", "expect": {}, "within_ms": 1000
+        }),
+    );
+    let (out, code) = stdout(&mut check(dir.path(), &["aprs_bogus"]));
+    assert!(out.starts_with("aprs_bogus: fail: "), "{out}");
+    assert!(out.contains("colour"), "{out}");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn a_row_without_a_test_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    write_row(dir.path(), "aprs_untested", serde_json::Value::Null);
+    let (out, code) = stdout(&mut check(dir.path(), &["aprs_untested"]));
+    assert_eq!(out.trim(), "aprs_untested: skipped: no test", "{out}");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn check_is_local_only() {
+    let out = Command::cargo_bin("zeta")
+        .unwrap()
+        .args([
+            "--node",
+            "http://127.0.0.1:1",
+            "--secret",
+            "0123456789abcdef",
+            "modes",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("modes check"),
+    );
+}

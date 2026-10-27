@@ -30,6 +30,7 @@ pub mod pocsag;
 pub mod rds;
 pub mod resample;
 pub mod squelch;
+pub mod synth;
 pub mod util;
 pub mod vad;
 pub mod wfm;

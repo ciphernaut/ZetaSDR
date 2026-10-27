@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use zeta_speech::{NodeBackend, SocketBackend, SpeechBackend};
 
-use crate::cli::{Cli, Command, SPEECH_EXCLUSIVE, ServeArgs, SpeechArgs};
+use crate::cli::{Cli, Command, ModesCmd, SPEECH_EXCLUSIVE, ServeArgs, SpeechArgs};
 use crate::{agents_md, ask, node_setup};
 
 const MIN_SECRET_LEN: usize = 12;
@@ -73,6 +73,11 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
     if matches!(cli.command, Command::Ops(_)) {
         return usage("ops tail reads the state directory: not supported with --node");
+    }
+    if matches!(cli.command, Command::Modes(ModesCmd::Check { .. })) {
+        return usage(
+            "modes check runs the rows' tests on its own node: not supported with --node",
+        );
     }
     if matches!(cli.command, Command::Transcripts(_)) {
         return usage("transcripts tail reads the state directory: not supported with --node");

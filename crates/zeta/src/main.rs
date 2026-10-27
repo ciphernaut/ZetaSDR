@@ -3,6 +3,7 @@
 mod agents_md;
 mod ask;
 mod cli;
+mod modes_check;
 mod node_setup;
 mod serve_lock;
 mod sources;
@@ -55,6 +56,9 @@ async fn main() -> ExitCode {
     };
     if let cli::Command::Ops(cli::OpsCmd::Tail { lines }) = cli.command {
         return tail_log(&state_dir, "ops.log", lines, |_| true);
+    }
+    if let cli::Command::Modes(cli::ModesCmd::Check { id, strict }) = cli.command {
+        return modes_check::run(state_dir, cli.modes_dir, id, strict).await;
     }
     if let cli::Command::Transcripts(cli::TranscriptsCmd::Tail { lines, job }) = cli.command {
         return tail_log(&state_dir, "transcripts.log", lines, |line| {

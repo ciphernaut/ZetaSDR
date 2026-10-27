@@ -50,5 +50,14 @@
     "min_span_ms": 1000,
     "quick": null
   },
-  "catalogue": ["ads-b", "automatic-dependent-surveillance-broadcast-ads-b"]
+  "catalogue": ["ads-b", "automatic-dependent-surveillance-broadcast-ads-b"],
+  "test": {
+    "kind": "synth",
+    "family": "modes_ident",
+    "icao": 8153896,
+    "callsign": "ZETA01  ",
+    "repeats": 20,
+    "expect": {"icao": "7C6B28"},
+    "within_ms": 5000
+  }
 }

@@ -41,6 +41,11 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is set; pass --state-dir".into())
 }
 
+/// `modes-checked.json` in `state_dir`: when each program row last passed `zeta modes check`.
+pub fn checked_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("modes-checked.json")
+}
+
 /// Longest a `transcribe` stage waits for the speech backend to answer one utterance.
 const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -270,6 +275,7 @@ pub async fn open(
     // before the stages and the node share it.
     let modes_dir = modes_dir.or_else(zeta_core::modes::default_operator_dir);
     let mut modes = ModeRegistry::load(&registry, modes_dir.as_deref());
+    modes.load_checked(&checked_path(&state_dir));
     for line in modes.startup_lines() {
         eprintln!("{line}");
     }

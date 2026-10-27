@@ -57,7 +57,8 @@ pub struct LoadedMode {
     #[schemars(required, schema_with = "crate::types::nullable::<PathBuf>")]
     #[serde(deserialize_with = "nullable")]
     pub program: Option<PathBuf>,
-    /// When the row's check last passed with `--strict` on this host; `null` if never.
+    /// When `zeta modes check` last passed this program row on this host (UNIX seconds,
+    /// from `modes-checked.json` in the state directory); `null` if never.
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     #[serde(deserialize_with = "nullable")]
     pub checked: Option<u64>,
@@ -260,6 +261,25 @@ impl ModeRegistry {
         m.reason = reason;
     }
 
+    /// Read `path` (`modes-checked.json` in the state directory: an object of UNIX
+    /// seconds by mode id) into each row's `checked`. A missing, unreadable or
+    /// malformed file, and ids no row has, are ignored: `checked` stays `None`.
+    pub fn load_checked(&mut self, path: &Path) {
+        let checked = read_checked(path);
+        for m in &mut self.modes {
+            m.checked = checked.get(&m.row.id.0).copied();
+        }
+    }
+
+    /// Record in `path` (see [`ModeRegistry::load_checked`]) that `id`'s check passed at
+    /// `at` (UNIX seconds), keeping the other entries.
+    pub fn record_checked(path: &Path, id: &str, at: u64) -> std::io::Result<()> {
+        let mut checked = read_checked(path);
+        checked.insert(id.to_string(), at);
+        let json = serde_json::to_vec_pretty(&checked).map_err(std::io::Error::other)?;
+        std::fs::write(path, json)
+    }
+
     /// One stderr line per broken row: `zeta: mode <id> (<file>): <field>: <error>`.
     pub fn startup_lines(&self) -> Vec<String> {
         self.modes
@@ -272,6 +292,14 @@ impl ModeRegistry {
             })
             .collect()
     }
+}
+
+/// The UNIX seconds by mode id in `path`; empty when it cannot be read or parsed.
+fn read_checked(path: &Path) -> std::collections::BTreeMap<String, u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
 }
 
 /// A file's name without its extension.
@@ -313,5 +341,33 @@ fn placeholder(id: &str) -> ModeRow {
         catalogue: vec![],
         test: None,
         notes: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_times_round_trip_through_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("modes-checked.json");
+        let stages = crate::stage::StageRegistry::new();
+        let mut modes = ModeRegistry::load(&stages, None);
+        modes.load_checked(&path);
+        assert!(modes.all().iter().all(|m| m.checked.is_none()), "no file");
+        ModeRegistry::record_checked(&path, "adsb_decode", 100).unwrap();
+        ModeRegistry::record_checked(&path, "nope", 7).unwrap();
+        ModeRegistry::record_checked(&path, "adsb_decode", 200).unwrap();
+        modes.load_checked(&path);
+        let seen: Vec<_> = modes
+            .all()
+            .iter()
+            .filter_map(|m| m.checked.map(|t| (m.row.id.0.clone(), t)))
+            .collect();
+        assert_eq!(seen, [("adsb_decode".to_string(), 200)]);
+        std::fs::write(&path, "garbage").unwrap();
+        modes.load_checked(&path);
+        assert!(modes.all().iter().all(|m| m.checked.is_none()), "bad file");
     }
 }

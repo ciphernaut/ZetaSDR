@@ -54,5 +54,14 @@
     "min_span_ms": 1000,
     "quick": "rds"
   },
-  "catalogue": ["radio-data-system-rds"]
+  "catalogue": ["radio-data-system-rds"],
+  "test": {
+    "kind": "synth",
+    "family": "rds",
+    "pi": 10929,
+    "ps": "ZETA FM ",
+    "rt": "HELLO FROM ZETASDR",
+    "expect": {"pi": "2AB1"},
+    "within_ms": 10000
+  }
 }

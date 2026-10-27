@@ -56,5 +56,14 @@
     "min_span_ms": 1000,
     "quick": "acars"
   },
-  "catalogue": ["acars", "aircraft-communications-addressing-and-reporting-system-acar"]
+  "catalogue": ["acars", "aircraft-communications-addressing-and-reporting-system-acar"],
+  "test": {
+    "kind": "synth",
+    "family": "acars",
+    "reg": "VH-ZET",
+    "label": "H1",
+    "text": "#M1BPOS/ZETASDR TEST",
+    "expect": {"reg": "VH-ZET", "label": "H1"},
+    "within_ms": 5000
+  }
 }

@@ -1157,7 +1157,7 @@ pub struct ModeInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub program: Option<String>,
-    /// When the row's check last passed with `--strict` on this host; `null` if never.
+    /// When `zeta modes check` last passed this program row on this host (UNIX seconds); `null` if never.
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub checked: Option<u64>,

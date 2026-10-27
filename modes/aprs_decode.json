@@ -65,5 +65,14 @@
     "min_span_ms": 1000,
     "quick": "aprs"
   },
-  "catalogue": ["aprs", "automatic-packet-reporting-system-aprs"]
+  "catalogue": ["aprs", "automatic-packet-reporting-system-aprs"],
+  "test": {
+    "kind": "synth",
+    "family": "aprs",
+    "src": "VK3ABC",
+    "dst": "APRS",
+    "info": ">hi",
+    "expect": {"protocol": "aprs", "src": "VK3ABC", "fcs_ok": true},
+    "within_ms": 5000
+  }
 }

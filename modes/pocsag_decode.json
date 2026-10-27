@@ -52,5 +52,15 @@
     "min_span_ms": 1000,
     "quick": "pocsag"
   },
-  "catalogue": ["pocsag", "pocsag-2", "pager-pocsag-1200"]
+  "catalogue": ["pocsag", "pocsag-2", "pager-pocsag-1200"],
+  "test": {
+    "kind": "synth",
+    "family": "pocsag",
+    "address": 1234567,
+    "function": 3,
+    "text": "HELLO ZETA",
+    "baud": 1200,
+    "expect": {"address": 1234567, "text": "HELLO ZETA"},
+    "within_ms": 5000
+  }
 }
