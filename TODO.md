@@ -171,3 +171,12 @@ From the operator, 2026-10-27. Digital voice (DMR, P25, NXDN, D-STAR, Yaesu Fusi
 Adopt the same shape: `tools/install-vocoders.sh` that clones `mbelib`, `codecserver` and `codecserver-softmbe` at pinned tags, builds, installs under a prefix the node finds, and prints what it did; `zeta doctor` (or the decoder's job failure reason) names the script when the library is missing, the way `adsb_decode` names dump1090. Codec 2 (M17, FreeDV) is free and goes in-crate or as a normal dependency instead. Note the legal position in `docs/` once, as OnAir does in "Good to know".
 
 Scope estimate: 100-150 lines of shell plus a doc section; depends on the external-decoder adaptor for the voice decoders that consume it.
+
+## Packaging: the run directory and install hints for handlers
+
+From the operator, 2026-10-28, on two plan 16 review rulings. Today a program row's fifo lives under `<state_dir>/run/<unique>` (ruling 14) and a missing handler's hint falls through `apt install` → `dnf install` → `brew install` (ruling 15; the built-in row only names the Debian package).
+
+- **Run directory.** A packaged install may put it in the system temp directory (`/tmp`), `/usr/local/var/run` or `/opt/ZetaSDR/var/run`: one `--run-dir PATH` (env `ZETA_RUN_DIR`) whose default follows the install layout (the state directory for a checkout, the package's `var/run` for a package), created with mode 0700, and the fifo stays one unique subdirectory per run.
+- **Install hints.** Extend the row's install map to `snap` and `flatpak` where the handler ships that way (`snap install <pkg>`, `flatpak install <ref>`), and name an AppImage by URL in `url` (it is a download, not a package manager). The report line keeps one command and one URL; the order of fallbacks follows what the host has (`which apt dnf brew snap flatpak`).
+
+Scope estimate: 50-100 lines in `crates/zeta-ext/src/proc.rs` and `node_setup.rs`, a row-schema field, two tests.

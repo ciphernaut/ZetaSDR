@@ -37,7 +37,7 @@ specs are written in a brainstorming session before the plan, as before.
 |---|---|---|---|
 | 14 | Field fix wave (planned, above) | The timestamp bug blocks every UTC-slotted mode (FT8/FT4/WSPR) and TDMA (DMR, TETRA); the run leak would surface in minutes under a span of decoders; `measure` silence blocks layer 4 and `cb_watch.py`. | - |
 | 15 | Scan: alternate the step grid and mask the centre and edge bins | Spec gist in `TODO.md`; the survey tooling built on scan rows inherits the DC spike and edges today. Spec first. | 14 (`stats`, no leaks under repeated retunes) |
-| 16 | Mode registry and external-decoder adaptor | Design spec first (brainstorm): a table-driven mode registry replacing the `JobKind` match for decoders, a declarative stdio wrapper for external decoders, the `video`/`text`/bits payload envelopes, a common decoded-event envelope and feed sinks, `tools/install-vocoders.sh`. No new mode ships here; `adsb_decode` is re-expressed as the first adaptor row. **Delivered** on branch `worktree-plan-16`, 2026-10-28. Pending: live acceptance on hardware (see "Plan 16 status"). | 14 |
+| 16 | Mode registry and external-decoder adaptor | Design spec first (brainstorm): a table-driven mode registry replacing the `JobKind` match for decoders, a declarative stdio wrapper for external decoders, the `video`/`text`/bits payload envelopes, a common decoded-event envelope and feed sinks, `tools/install-vocoders.sh`. No new mode ships here; `adsb_decode` is re-expressed as the first adaptor row. **Merged** to `main` (91886bc), 2026-10-28. Pending: live acceptance on hardware (see "Plan 16 status"). | 14 |
 | 17 | Decoder wave 1 | HackRF-reachable, AU-relevant, grouped by OnAir's families: M17 and DMR voice (Codec 2 in-crate, AMBE via the install script) feeding `transcribe`; RS41 radiosondes; AIS; FLEX; POCSAG and APRS over a whole span; `rds_decode` stereo pilot report and `wfm_demod` stereo. Each mode a registry row with a generated test signal and a `classify` decode-to-identify hook. | 16 |
 | 18 | UI wave | Box a signal, demod it, refine it on the graph (no channel-grid assumptions); staircase transcript ribbons; mode picking by band through `knowledge_lookup`; the Okudagram (LCARS) theme behind `view set theme`. UI-only; can run beside 16/17. | 13 |
 | 19 | Layer 4 stages | Generic FSK/PSK/OOK demods, clock recovery, slicer, bit viewer with framing and CRC hypotheses, correlator, signature write-back; `measure` symbol-rate and modulation-order upgrades. Two or three plans. | 16 (bits payload) |
@@ -46,8 +46,17 @@ specs are written in a brainstorming session before the plan, as before.
 
 ## Plan 16 status
 
-Plan 16 is delivered on `worktree-plan-16` (tasks 1-9), 2026-10-28. Live acceptance on hardware
-(the HackRF laptop or the field host with the B210 and dump1090) is pending.
+Plan 16 is merged to `main` at 91886bc (tasks 1-9, a final fix wave and a flake fix, 18 commits
+from 8e3d1bf), 2026-10-28. Live acceptance on hardware (the HackRF laptop or the field host with the
+B210 and dump1090) is pending.
+
+Operator rulings on the review's calls (2026-10-28), carried as a gist in `TODO.md`:
+
+- The fifo directory (`<state_dir>/run`, ruling 14) may also live in the system temp directory
+  (`/tmp`), `/usr/local/var/run` or `/opt/ZetaSDR/var/run` once zeta is packaged; the state
+  directory was the conservative choice, not a requirement.
+- The install hint (`apt` → `dnf` → `brew`, ruling 15) may extend to snap, flatpak and AppImage
+  where a handler ships that way.
 
 What was built (spec `docs/superpowers/specs/2026-10-27-mode-registry-design.md`):
 
@@ -69,7 +78,11 @@ What was built (spec `docs/superpowers/specs/2026-10-27-mode-registry-design.md`
   compiles without features; `every_job_kind_expands_to_a_valid_graph` (zeta bin) treats `identify`
   like `scan` (no graph), which the first gate run caught failing.
 
-Gates at the branch head:
+Gates at the branch head (task 9), then on the final tree and on the merged `main`:
+
+- Final tree 91886bc on a clean target, and `main` after the fast-forward merge: `cargo test
+  --workspace --all-features` 1023 passed, 0 failed, 3 ignored (118 `test result` lines), UI e2e ok
+  (213.91 s on the branch), exit 0.
 
 - `cargo test --workspace --all-features --no-fail-fast`: 1016 passed, 0 failed, 3 ignored (118
   `test result` lines). The one failure of the first run, `every_job_kind_expands_to_a_valid_graph`,

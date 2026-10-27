@@ -34,6 +34,13 @@ The toolchain is pinned by `rust-toolchain.toml` (1.97); install `rustfmt` and `
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
+The dev profile optimises `rustfft`, `num-complex`, `zeta-dsp` and `nnnoiseless` (see `Cargo.toml`):
+the tests run sources in real time, and an unoptimised demodulate-and-transcribe chain falls behind
+on a loaded host. A profile change rebuilds every dependant, and `target/debug` grows to 20-80 GB
+across the workspace's test binaries: delete it when the disk fills (`target/release` is small and
+worth keeping). With one `CARGO_TARGET_DIR` shared between worktrees cargo can serve a stale artifact
+of a path crate; `touch crates/*/src/lib.rs` forces the rebuild.
+
 ## CLI walkthrough
 
 One-shot commands open the node, apply one operation, persist and exit; they do not resume jobs.
