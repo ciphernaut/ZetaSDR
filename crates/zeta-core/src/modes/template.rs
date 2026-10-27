@@ -2,9 +2,9 @@
 //!
 //! A `graph` row's template has its placeholders (`"$center_hz"`, `"$bandwidth_hz"`,
 //! `"$out_rate_hz"`) filled with the job's integers; a `program` row becomes a `channel`
-//! at the program's input rate into [`EXTERNAL_DECODE_KIND`]. Every node and the graph
-//! get fresh ids, as the built-in kinds' graphs do: a re-expansion carries params by
-//! stage kind, never by node id.
+//! at the same rate into [`EXTERNAL_DECODE_KIND`], which resamples to the program's
+//! `input.rate_hz`. Every node and the graph get fresh ids, as the built-in kinds'
+//! graphs do: a re-expansion carries params by stage kind, never by node id.
 
 use std::collections::HashMap;
 
@@ -17,8 +17,10 @@ use crate::types::StreamKind;
 /// The stage kind that runs a program row's decoder; its params are `{"mode": <id>}`.
 pub const EXTERNAL_DECODE_KIND: &str = "external_decode";
 
-/// `row`'s graph for `tuning` with its channel output at `out_rate_hz` (a `graph` row;
-/// a `program` row's channel runs at its `input.rate_hz`).
+/// `row`'s graph for `tuning` with its channel output at `out_rate_hz`, the narrowest
+/// exact divisor of the source rate that `expand` picks, for both kinds of row (the
+/// `channel` stage decimates by an integer only; a program row's adaptor resamples from
+/// it to the program's `input.rate_hz`).
 pub fn expand(row: &ModeRow, tuning: Tuning, out_rate_hz: u64) -> Result<Graph, OpError> {
     let values = [
         ("$center_hz", tuning.center_hz.0),
@@ -65,7 +67,7 @@ pub fn expand(row: &ModeRow, tuning: Tuning, out_rate_hz: u64) -> Result<Graph, 
                 edges,
             })
         }
-        Decoder::Program(block) => {
+        Decoder::Program(_) => {
             let (channel, decode) = (NodeId::new(), NodeId::new());
             Ok(Graph {
                 id: GraphId::new(),
@@ -76,7 +78,7 @@ pub fn expand(row: &ModeRow, tuning: Tuning, out_rate_hz: u64) -> Result<Graph, 
                         params: serde_json::json!({
                             "center_hz": tuning.center_hz.0,
                             "bandwidth_hz": tuning.bandwidth_hz.0,
-                            "out_rate_hz": block.input.rate_hz,
+                            "out_rate_hz": out_rate_hz,
                         }),
                     },
                     Node {

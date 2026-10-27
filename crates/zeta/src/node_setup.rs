@@ -412,20 +412,34 @@ mod tests {
                 }
             }
         }
-        // adsb_decode at its own band: a channel at 2.4 MHz into the decoder.
-        for rate in [2_400_000u64, 4_800_000, 9_600_000] {
+        // adsb_decode at its own band on the radios' rates: a channel at an exact divisor
+        // of the source rate (the adaptor resamples to 2.4 MHz) into the decoder.
+        for (rate, bw) in [
+            (2_048_000u64, 2_000_000u64),
+            (2_400_000, 2_400_000),
+            (4_800_000, 2_400_000),
+            (8_000_000, 2_400_000),
+            (9_600_000, 2_400_000),
+            (10_000_000, 2_400_000),
+            (20_000_000, 2_400_000),
+        ] {
             let tuning = Tuning {
                 center_hz: Hz(1_090_000_000),
-                bandwidth_hz: Hz(2_400_000),
+                bandwidth_hz: Hz(bw),
             };
-            let g = JobKind::AdsbDecode
+            let mut g = JobKind::AdsbDecode
                 .expand(&src, tuning, Hz(rate), None, None, None, &modes)
                 .unwrap();
-            // `external_decode` is registered with the adaptor (plan 16 task 4): the
-            // graph's shape until then.
             let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
             assert_eq!(kinds, ["channel", "external_decode"], "adsb_decode {rate}");
-            assert_eq!(param(&g.nodes[0], "out_rate_hz"), 2_400_000);
+            let out = param(&g.nodes[0], "out_rate_hz");
+            assert_eq!(rate % out, 0, "adsb_decode {rate} {bw}: {out}");
+            assert!(out >= bw, "adsb_decode {rate} {bw}: {out}");
+            // `external_decode` is registered with the adaptor (plan 16 task 4): until
+            // then the channel alone is validated against the stages.
+            g.nodes.truncate(1);
+            g.edges.clear();
+            validate(&g, &registry).unwrap_or_else(|e| panic!("adsb_decode {rate}: {e}"));
         }
     }
 }

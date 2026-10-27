@@ -2365,31 +2365,48 @@ fn rds_decode_expands_channel_to_decoder() {
     assert_eq!(g.edges[0].to, g.nodes[1].id);
 }
 
+/// `adsb_decode`'s program row: a channel at the narrowest exact divisor of the source
+/// rate (the adaptor resamples to dump1090's 2.4 MHz) into `external_decode`.
 #[test]
 fn adsb_row_expands_to_channel_then_external_decode() {
     let src = SourceId("b210".into());
-    let tuning = Tuning {
-        center_hz: Hz(1_090_000_000),
-        bandwidth_hz: Hz(2_400_000),
-    };
     assert_eq!(JobKind::AdsbDecode.name(), "adsb_decode");
-    let g = JobKind::AdsbDecode
-        .expand(&src, tuning, Hz(2_400_000), None, None, None, &modes())
-        .unwrap();
-    let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
-    assert_eq!(kinds, ["channel", "external_decode"]);
-    assert_eq!(
-        g.nodes[0].params,
-        serde_json::json!({"center_hz": 1_090_000_000, "bandwidth_hz": 2_400_000, "out_rate_hz": 2_400_000})
-    );
-    assert_eq!(
-        g.nodes[1].params,
-        serde_json::json!({"mode": "adsb_decode"})
-    );
-    assert_eq!(g.edges.len(), 1);
-    assert_eq!(g.edges[0].kind, StreamKind::Iq);
-    assert_eq!(g.edges[0].from, g.nodes[0].id);
-    assert_eq!(g.edges[0].to, g.nodes[1].id);
+    let modes = modes();
+    // (source rate, band, the channel's out_rate_hz)
+    for (rate, bw, want) in [
+        (2_400_000u64, 2_400_000u64, Some(2_400_000u64)),
+        (2_048_000, 2_000_000, Some(2_048_000)),
+        (8_000_000, 2_400_000, None),
+    ] {
+        let tuning = Tuning {
+            center_hz: Hz(1_090_000_000),
+            bandwidth_hz: Hz(bw),
+        };
+        let g = JobKind::AdsbDecode
+            .expand(&src, tuning, Hz(rate), None, None, None, &modes)
+            .unwrap();
+        let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+        assert_eq!(kinds, ["channel", "external_decode"]);
+        let out = g.nodes[0].params["out_rate_hz"].as_u64().unwrap();
+        assert_eq!(out, channel_rate_hz(rate, bw), "{rate} {bw}");
+        if let Some(want) = want {
+            assert_eq!(out, want, "{rate} {bw}");
+        }
+        assert_eq!(rate % out, 0, "{rate} {bw}: {out} divides the source rate");
+        assert!(out >= bw, "{rate} {bw}: {out}");
+        assert_eq!(
+            g.nodes[0].params,
+            serde_json::json!({"center_hz": 1_090_000_000, "bandwidth_hz": bw, "out_rate_hz": out})
+        );
+        assert_eq!(
+            g.nodes[1].params,
+            serde_json::json!({"mode": "adsb_decode"})
+        );
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(g.edges[0].kind, StreamKind::Iq);
+        assert_eq!(g.edges[0].from, g.nodes[0].id);
+        assert_eq!(g.edges[0].to, g.nodes[1].id);
+    }
 }
 
 #[test]
