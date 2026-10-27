@@ -21,11 +21,28 @@ interfaces rather than guessed ones.
 | 11 | View policy | Resume restores the capture (widest first, built-in graphs re-expanded, `capture_rate_hz`); the ops log (`ops.log`, `zeta ops tail`); elastic leases (`job start --elastic`); atomic `replace` (`--replace` on `job start` and `source ensure`); a file-source `tune_range`; UI view policies (`follow`, `zoom_out`, `auto_scan_stop`, `finished_rows_s`, `scanner`) and `view set\|show\|reset\|clear`, automatic scans on a scanner source, a coarse scan layer, eased follow. **Delivered** on branch `worktree-view-policy`, 2026-10-20. Pending: live acceptance on the field host. | 3, 10 |
 | 12 | Capture and transcripts | Resumed channels take the shared bank (the bank factory reaches `Node::open`; the channel's path in `job_context`, `bank` in `source_list`, lag lines by stage kind); rates the resampler accepts (a UHD ladder of exact master-clock divisors in the Soapy source, a snapping `Resampler`); the transcript log (`transcripts.log`, `zeta transcripts tail`); pinned captures (`source_pin`/`source_unpin`, `sources/<id>.json`, restored first on resume); live receive gain (`source_set_gain`, `source_list.gain`, persisted); UI pins and `source pin\|unpin\|gain` commands; `ppm=` correction and an automatic squelch in `fm_demod`/`am_demod`. Spec `docs/superpowers/specs/2026-10-21-capture-and-transcripts-design.md`, plan `docs/superpowers/plans/2026-10-21-capture-and-transcripts.md`. Delivered on branch `worktree-view-policy`, 2026-10-21. Pending: live acceptance on the field host. | 8, 10, 11 |
 | 13 | Channel plans | A table-driven channel-plan registry in `zeta-core` (`uhf_cb_au`, 80 channels; `channel_plans` op, `zeta plans`); the page names channels on job rows, outlines and the axis (`view set plan auto\|<id>\|none`); an adjacent-channel guard in `nbfm_demod` for plan channels (a widened channel, the centre filtered in the stage, the gate held closed under a stronger neighbour; `guard_hz`/`guard_db` node params, `adjacent_db`/`guarded` on `squelch` events); `transcribe`'s `min_utterance_ms` (700); a bounded speech-daemon queue (4 connections, `queued_ms`, `busy`/`queue` drop reasons, one EAGAIN retry); optionally `examples/python/cb_watch.py` (demodulators only on active channels). Spec `docs/superpowers/specs/2026-10-21-channel-plans-design.md`, plan `docs/superpowers/plans/2026-10-21-channel-plans.md`. Delivered on branch `plan-13`, 2026-10-21 (tasks 1-5, base plan 12). Pending: live acceptance on the field host. | 10, 11, 12 |
+| 14 | Field fix wave | The four defects of the 2026-10-23 HackRF session: the Soapy clock guard and stream reopen on a rate change (`source_list.stats`), a run generation on job entries so a stopped run cannot outlive its job (`/health` `stages_running`), `measure` partial windows and discard notes (`BankInfo.dropped`), device loss ending in `abandon` and an overflow-storm fault; field craft for a radio in its own process. Plan `docs/superpowers/plans/2026-10-27-field-fix-wave.md`. **Planned** 2026-10-27, branch `plan-14`. | 8, 11, 12 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
 MCP tools reach the same `Node::apply` code path, and the call shows in the
 UI's transcript pane through the node's `ops` stream.
+
+## Sprint 2026-10-27
+
+Ordered from `TODO.md` on 2026-10-27, after plan 13's live acceptance on the field host. Each row is one plan;
+specs are written in a brainstorming session before the plan, as before.
+
+| Order | Plan | Why here | Depends on |
+|---|---|---|---|
+| 14 | Field fix wave (planned, above) | The timestamp bug blocks every UTC-slotted mode (FT8/FT4/WSPR) and TDMA (DMR, TETRA); the run leak would surface in minutes under a span of decoders; `measure` silence blocks layer 4 and `cb_watch.py`. | - |
+| 15 | Scan: alternate the step grid and mask the centre and edge bins | Spec gist in `TODO.md`; the survey tooling built on scan rows inherits the DC spike and edges today. Spec first. | 14 (`stats`, no leaks under repeated retunes) |
+| 16 | Mode registry and external-decoder adaptor | Design spec first (brainstorm): a table-driven mode registry replacing the `JobKind` match for decoders, a declarative stdio wrapper for external decoders, the `video`/`text`/bits payload envelopes, a common decoded-event envelope and feed sinks, `tools/install-vocoders.sh`. No new mode ships here; `adsb_decode` is re-expressed as the first adaptor row. | 14 |
+| 17 | Decoder wave 1 | HackRF-reachable, AU-relevant, grouped by OnAir's families: M17 and DMR voice (Codec 2 in-crate, AMBE via the install script) feeding `transcribe`; RS41 radiosondes; AIS; FLEX; POCSAG and APRS over a whole span; `rds_decode` stereo pilot report and `wfm_demod` stereo. Each mode a registry row with a generated test signal and a `classify` decode-to-identify hook. | 16 |
+| 18 | UI wave | Box a signal, demod it, refine it on the graph (no channel-grid assumptions); staircase transcript ribbons; mode picking by band through `knowledge_lookup`; the Okudagram (LCARS) theme behind `view set theme`. UI-only; can run beside 16/17. | 13 |
+| 19 | Layer 4 stages | Generic FSK/PSK/OOK demods, clock recovery, slicer, bit viewer with framing and CRC hypotheses, correlator, signature write-back; `measure` symbol-rate and modulation-order upgrades. Two or three plans. | 16 (bits payload) |
+| 20 | Soapy worker process | A `zeta soapy-worker` child owning the driver behind a Port that faults when the child exits, so a driver crash never ends the node. Moves up if plan 14's live acceptance shows the node still dying in-process. | 14 |
+
 
 ## Plan 3 status
 
