@@ -56,6 +56,38 @@ async fn next(rx: &mut tokio::sync::broadcast::Receiver<Frame>) -> (Frame, Value
     (f, v)
 }
 
+#[test]
+fn frame_summary_for_video_carries_dimensions() {
+    use zeta_core::ops::FrameSummary;
+    use zeta_core::stream::VideoFormat;
+    use zeta_core::types::{Provenance, Span, StreamId, Timestamp};
+
+    let frame = Frame::new(
+        StreamId("s1".into()),
+        Provenance {
+            source: SourceId("file0".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(1),
+                end_ns: Timestamp(2),
+            },
+        },
+        Payload::Video {
+            width: 4,
+            height: 2,
+            format: VideoFormat::Rgb8,
+            frame: Arc::from(vec![0u8; 24]),
+        },
+    );
+    let s = FrameSummary::from_frame(&frame);
+    assert_eq!(s.kind, StreamKind::Video);
+    assert_eq!(
+        s.payload,
+        serde_json::json!({"width": 4, "height": 2, "format": "rgb8", "bytes": 24})
+    );
+}
+
 #[tokio::test]
 async fn every_apply_is_logged_with_outcome() {
     let dir = tempfile::tempdir().unwrap();

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use zeta_core::port::IqBlock;
 use zeta_core::stream::{Frame, Payload};
 use zeta_core::types::{ChannelId, Hz, Provenance, SourceId, Span, StreamId, Timestamp};
-use zeta_plugin::wire::{Control, encode_control, encode_frame};
+use zeta_plugin::wire::{Control, PROTOCOL_MIN, encode_control, encode_frame};
 use zeta_ws::wire::{WsMessage, ws_frame};
 
 fn frame(payload: Payload) -> Frame {
@@ -52,7 +52,7 @@ fn header_is_plan3_ws_frame_json() {
         frame(Payload::Text("hello".into())),
     ];
     for f in &frames {
-        let bytes = encode_frame(f).unwrap();
+        let bytes = encode_frame(f, PROTOCOL_MIN).unwrap();
         let ws = WsMessage::Frame(ws_frame(f));
         let ours: Value = serde_json::from_slice(header(&bytes)).unwrap();
         assert_eq!(ours, serde_json::to_value(&ws).unwrap());

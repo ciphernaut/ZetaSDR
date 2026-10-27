@@ -30,7 +30,7 @@ use tokio::io::BufReader;
 use zeta_core::stream::{Frame, Payload};
 use zeta_core::types::{Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 use zeta_plugin::wire::{
-    Control, Hello, Message, PROTOCOL, encode_control, encode_frame, read_message,
+    Control, Hello, Message, PROTOCOL_MIN, encode_control, encode_frame, read_message,
 };
 
 fn send(bytes: &[u8]) {
@@ -40,7 +40,7 @@ fn send(bytes: &[u8]) {
 }
 
 fn send_frame(f: &Frame) {
-    send(&encode_frame(f).expect("fake frames encode"));
+    send(&encode_frame(f, PROTOCOL_MIN).expect("fake frames encode"));
 }
 
 fn prov() -> Provenance {
@@ -103,7 +103,7 @@ async fn main() {
         json!({"type": "object", "additionalProperties": false})
     };
     send(&encode_control(&Control::Hello(Hello {
-        protocol: PROTOCOL,
+        protocol: PROTOCOL_MIN,
         kind: "fake".into(),
         inputs: if mode == "multi-input" {
             vec![StreamKind::Iq, StreamKind::Audio]
@@ -117,7 +117,7 @@ async fn main() {
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut out: Option<StreamId> = None;
     loop {
-        let msg = match read_message(&mut stdin).await {
+        let msg = match read_message(&mut stdin, PROTOCOL_MIN).await {
             Ok(Some(m)) => m,
             Ok(None) | Err(_) if mode == "ignore-stop" => {
                 tokio::time::sleep(Duration::from_secs(60)).await;

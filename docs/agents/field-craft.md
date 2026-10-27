@@ -41,6 +41,12 @@ A `--source-node` source is a receiver attached to another ZetaSDR node, typical
 
 A plugin registered with `--plugin KIND=PATH` is a stage kind like any other: it is listed in `schema` under `stages` with its `params_schema`, and you use it by adding a node of that `kind` to a job's graph with `graph get`, edit, `graph put`. No job kind starts it on its own. A plugin that crashes or misbehaves fails its job with a reason naming the plugin.
 
+A plugin speaks wire protocol 1 or 2; its `hello` names the version and the node answers `run` with the same one. Protocol 2 adds the `video` stream: a frame carries one image, `{"width", "height", "format", "frame": N}` in its header (`format` `rgb8`, `gray8` or `png`, `N` the body's byte count) and the raw bytes as its body, `width x height x 3` for `rgb8`, `width x height` for `gray8`, any non-zero length for `png`. A body that does not fit its format is refused. A protocol-1 plugin that declares a `video` port is refused at startup; a `stream tail` of a video stream shows each frame as `{"width", "height", "format", "bytes": N}`. `sink` is carried by neither protocol.
+
+### Bit streams
+
+A layer-4 decoder (a signal with no known decoder, worked by hand) reports the bits it sliced as `event` frames of this shape: `{"protocol": "bits", "rate_baud": N, "bits": "<hex>", "count": N, "t_ns": N}`. `bits` is the sliced bits packed most significant bit first and written in hex, `count` how many bits it holds (the last byte is padded with zeros), `rate_baud` the symbol rate it was sliced at, `t_ns` the time of the first bit. An event is at most 64 KiB. No stage emits it yet; it is the shape a layer-4 stage will.
+
 ### Transcribing a channel
 
 Start the demodulator, then attach the transcription to it; the attached job reads the

@@ -439,7 +439,7 @@ fn python_sdk_fixtures_are_the_hosts_bytes() {
     ];
     assert_eq!(theirs.len(), ours.len());
     for (t, f) in theirs.iter().zip(&ours) {
-        let bytes = zeta_plugin::wire::encode_frame(f).unwrap();
+        let bytes = zeta_plugin::wire::encode_frame(f, zeta_plugin::wire::PROTOCOL_MIN).unwrap();
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(*t, hex);
     }

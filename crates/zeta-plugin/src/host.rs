@@ -1,4 +1,4 @@
-//! The host side of plugin protocol 1 ([`crate::wire`]): an [`ExternalStage`] is a `Stage`
+//! The host side of plugin protocols 1 and 2 ([`crate::wire`]): an [`ExternalStage`] is a `Stage`
 //! whose work is done by a child process.
 //!
 //! **Lifecycle.** [`probe`] spawns the program once at registration, reads its `hello`
@@ -47,8 +47,8 @@ use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{JobId, Provenance, SourceId, StreamId, StreamKind};
 
 use crate::wire::{
-    Control, Hello, MAX_CONTROL, Message, OutPort, PROTOCOL, PortKind, Run, WireError,
-    check_strict_schema, encode_control, encode_frame, kind_name, read_message,
+    Control, Hello, MAX_CONTROL, Message, OutPort, PROTOCOL_MAX, PROTOCOL_MIN, PortKind, Run,
+    WireError, check_strict_schema, encode_control, encode_frame, kind_name, read_message,
 };
 
 /// How long a plugin has to send `hello` after it is spawned.
@@ -118,9 +118,11 @@ impl ExternalStage {
 /// Start `cmd` once, read and check its `hello`, stop it, and build the stage it describes,
 /// registered as `kind`.
 ///
-/// `cmd.program` must be an absolute path. The `hello` must arrive within [`HELLO_TIMEOUT`] and have `protocol` [`PROTOCOL`], `kind`
-/// equal to `kind`, at least one input, only `iq`, `audio`, `text` or `event` ports, and a
-/// `params_schema` passing [`check_strict_schema`].
+/// `cmd.program` must be an absolute path. The `hello` must arrive within [`HELLO_TIMEOUT`]
+/// and have `protocol` [`PROTOCOL_MIN`] to [`PROTOCOL_MAX`] (the version the session
+/// speaks: `run` echoes it), `kind` equal to `kind`, at least one input, only `iq`, `audio`,
+/// `text` or `event` ports (and `video` ports under protocol 2), and a `params_schema`
+/// passing [`check_strict_schema`].
 ///
 /// `StageSpec::kind` is `&'static str`, so the kind string is leaked: one small allocation per
 /// registered plugin, made once at startup.
@@ -170,9 +172,9 @@ pub async fn probe(kind: &str, cmd: PluginCommand) -> Result<ExternalStage, Plug
 
 /// The stage spec's schema if `h` is acceptable for `kind`, otherwise why not.
 fn check_hello(kind: &str, h: &Hello) -> Result<schemars::Schema, String> {
-    if h.protocol != PROTOCOL {
+    if !(PROTOCOL_MIN..=PROTOCOL_MAX).contains(&h.protocol) {
         return Err(format!(
-            "it speaks protocol {}, the host speaks {PROTOCOL}",
+            "it speaks protocol {}, the host speaks {PROTOCOL_MIN} to {PROTOCOL_MAX}",
             h.protocol
         ));
     }
@@ -191,13 +193,20 @@ fn check_hello(kind: &str, h: &Hello) -> Result<schemars::Schema, String> {
         return Err("multiple input kinds are not supported yet".into());
     }
     for (side, kinds) in [("input", &h.inputs), ("output", &h.outputs)] {
-        if let Some(k) = kinds
-            .iter()
-            .find(|k| matches!(k, StreamKind::Video | StreamKind::Sink))
-        {
+        if let Some(k) = kinds.iter().find(|k| match k {
+            StreamKind::Sink => true,
+            StreamKind::Video => h.protocol < 2,
+            _ => false,
+        }) {
             return Err(format!(
-                "it declares a {} {side}; protocol 1 carries iq, audio, text and event",
-                kind_name(*k)
+                "it declares a {} {side}; protocol {} carries {}",
+                kind_name(*k),
+                h.protocol,
+                if h.protocol < 2 {
+                    "iq, audio, text and event"
+                } else {
+                    "iq, audio, video, text and event"
+                }
             ));
         }
     }
@@ -284,7 +293,7 @@ async fn copy_stderr(kind: String, stderr: ChildStderr) {
 /// The plugin's first message, which must be `hello`, within [`HELLO_TIMEOUT`].
 async fn read_hello(stdout: &mut BufReader<ChildStdout>) -> Result<Hello, String> {
     let ms = HELLO_TIMEOUT.as_millis();
-    match tokio::time::timeout(HELLO_TIMEOUT, read_message(stdout)).await {
+    match tokio::time::timeout(HELLO_TIMEOUT, read_message(stdout, PROTOCOL_MIN)).await {
         Err(_) => Err(format!("no hello within {ms} ms")),
         Ok(Ok(Some(Message::Control(Control::Hello(h))))) => Ok(h),
         Ok(Ok(Some(Message::Control(Control::Error { message })))) => {
@@ -496,8 +505,10 @@ impl Stage for ExternalStage {
                 info.provenance.clone(),
             ));
         }
+        // The version the plugin's hello named (and probe accepted) is the session's.
+        let protocol = self.hello.protocol;
         let run = encode_control(&Control::Run(Run {
-            protocol: PROTOCOL,
+            protocol,
             params,
             // `inputs` has exactly one kind (checked by probe): the kind in use.
             inputs: vec![PortKind {
@@ -560,7 +571,7 @@ impl Stage for ExternalStage {
             // Forwards every message, then the end (EOF or error), then stops.
             tokio::spawn(async move {
                 loop {
-                    let m = read_message(&mut stdout).await;
+                    let m = read_message(&mut stdout, protocol).await;
                     let last = !matches!(m, Ok(Some(_)));
                     if reader_tx.send(m).await.is_err() || last {
                         break;
@@ -657,7 +668,7 @@ impl Stage for ExternalStage {
                                 frame.provenance.job.clone(),
                             ));
                         }
-                        let bytes = match encode_frame(&frame) {
+                        let bytes = match encode_frame(&frame, protocol) {
                             Ok(b) => b,
                             Err(e) => break End::Fail(format!(
                                 "plugin {kind}: cannot send an input frame: {e}"
@@ -725,5 +736,45 @@ impl Stage for ExternalStage {
                 failed(format!("plugin {kind}: {e} (exit status {})", describe(&s)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello(protocol: u32, inputs: Vec<StreamKind>, outputs: Vec<StreamKind>) -> Hello {
+        Hello {
+            protocol,
+            kind: "k".into(),
+            inputs,
+            outputs,
+            params_schema: serde_json::json!({"type":"object","additionalProperties":false}),
+        }
+    }
+
+    #[test]
+    fn hello_protocol_3_is_refused() {
+        let h = hello(3, vec![StreamKind::Iq], vec![StreamKind::Iq]);
+        assert_eq!(
+            check_hello("k", &h).unwrap_err(),
+            "it speaks protocol 3, the host speaks 1 to 2"
+        );
+        let h = hello(0, vec![StreamKind::Iq], vec![StreamKind::Iq]);
+        assert!(check_hello("k", &h).is_err());
+    }
+
+    #[test]
+    fn video_ports_need_protocol_2() {
+        let v = |p| hello(p, vec![StreamKind::Iq], vec![StreamKind::Video]);
+        assert_eq!(
+            check_hello("k", &v(1)).unwrap_err(),
+            "it declares a video output; protocol 1 carries iq, audio, text and event"
+        );
+        assert!(check_hello("k", &v(2)).is_ok());
+        assert!(check_hello("k", &hello(1, vec![StreamKind::Iq], vec![StreamKind::Iq])).is_ok());
+        // `sink` stays refused under both.
+        let s = hello(2, vec![StreamKind::Iq], vec![StreamKind::Sink]);
+        assert!(check_hello("k", &s).unwrap_err().contains("sink output"));
     }
 }

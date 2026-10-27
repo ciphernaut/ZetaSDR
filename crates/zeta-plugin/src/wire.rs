@@ -1,5 +1,5 @@
-//! Plugin protocol 1: the byte stream between the host and an external stage. Pure codec,
-//! no processes.
+//! Plugin protocols 1 and 2: the byte stream between the host and an external stage. Pure
+//! codec, no processes.
 //!
 //! A child process speaks it on stdin (host to plugin) and stdout (plugin to host); stderr
 //! is free text that the host copies to its own stderr prefixed `[plugin <kind>] `. Each
@@ -13,13 +13,18 @@
 //! - any other byte: protocol error `unexpected byte 0x<hh> at message start`.
 //!
 //! Control messages are tagged by `"type"` (snake_case), the tag the websocket's
-//! `WsMessage` uses. Plugin to host: `{"type":"hello","protocol":1,"kind":"<k>",
+//! `WsMessage` uses. Plugin to host: `{"type":"hello","protocol":P,"kind":"<k>",
 //! "inputs":["iq"],"outputs":["iq"],"params_schema":{…}}` (the first message, within
 //! 5000 ms of spawn) and `{"type":"error","message":"<m>"}`. Host to plugin:
-//! `{"type":"run","protocol":1,"params":{…},"inputs":[{"kind":"iq"}],
+//! `{"type":"run","protocol":P,"params":{…},"inputs":[{"kind":"iq"}],
 //! "outputs":[{"stream":"<id>","kind":"iq"}]}`, `{"type":"lagged","missed":N}` and
 //! `{"type":"closed","reason":"<r>"}` (byte-identical to the websocket's), and
 //! `{"type":"stop"}`. Unknown fields are refused.
+//!
+//! `P` is the protocol version, [`PROTOCOL_MIN`] (1) or [`PROTOCOL_MAX`] (2). The plugin's
+//! `hello` names the version it speaks, the host accepts either, and the `run` echoes it:
+//! it is the version of the whole session. Protocol 2 is protocol 1 plus the `video` frame;
+//! every protocol-1 message is unchanged.
 //!
 //! A data frame's header is exactly the websocket's frame message:
 //! `{"type":"frame","stream","kind","source","job","channel","start_ns","end_ns","payload"}`
@@ -32,10 +37,15 @@
 //!   has `C = 1`; `C` must not be 0.
 //! - `event`: payload is the event, `B = 0`.
 //! - `text`: payload is the string, `B = 0`.
-//! - `video` and `sink` are refused in protocol 1.
+//! - `video` (protocol 2 only): payload `{"width","height","format","frame":N}` with
+//!   `format` `rgb8`, `gray8` or `png` and `N` the body's byte count; the body is the raw
+//!   bytes: `width × height × 3` for `rgb8`, `width × height` for `gray8`, any non-zero
+//!   length for `png` (a PNG file). Under protocol 1 `video` is refused.
+//! - `sink` is refused under both protocols.
 //!
-//! `B` must match `N`, and an `iq` or `audio` `sample_rate_hz` must not be 0. Every length is checked before anything is allocated or indexed: a
-//! malformed message is a [`WireError`] naming what was wrong, never a panic.
+//! `B` must match `N` (for `video`, also the format), and an `iq` or `audio`
+//! `sample_rate_hz` must not be 0. Every length is checked before anything is allocated or
+//! indexed: a malformed message is a [`WireError`] naming what was wrong, never a panic.
 
 use std::sync::Arc;
 
@@ -44,11 +54,13 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use zeta_core::ops::FrameSummary;
 use zeta_core::port::IqBlock;
-use zeta_core::stream::{Frame, Payload};
+use zeta_core::stream::{Frame, Payload, VideoFormat};
 use zeta_core::types::{Hz, Provenance, Span, StreamId, StreamKind};
 
-/// The protocol version a `hello` and a `run` carry.
-pub const PROTOCOL: u32 = 1;
+/// The newest protocol version the host speaks.
+pub const PROTOCOL_MAX: u32 = 2;
+/// The oldest protocol version the host speaks.
+pub const PROTOCOL_MIN: u32 = 1;
 /// Longest control message, newline included, in bytes.
 pub const MAX_CONTROL: usize = 65_536;
 /// Longest data-frame header, in bytes.
@@ -89,6 +101,9 @@ pub enum WireError {
     },
     #[error("{} frames are not carried by plugin protocol 1", kind_name(*.0))]
     KindNotCarried(StreamKind),
+    /// A video frame whose body does not fit its width, height and format.
+    #[error("{0}")]
+    VideoMismatch(String),
     #[error("{} frame has sample_rate_hz 0", kind_name(*.0))]
     ZeroRate(StreamKind),
     /// An audio frame that says it has 0 channels.
@@ -248,6 +263,16 @@ struct AudioSummary {
     peak: Option<f64>,
 }
 
+/// A `video` header's payload (protocol 2): `frame` is the body's byte count.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VideoSummary {
+    width: u32,
+    height: u32,
+    format: VideoFormat,
+    frame: usize,
+}
+
 fn one_channel() -> u16 {
     1
 }
@@ -260,10 +285,11 @@ fn io_err(e: std::io::Error) -> WireError {
     WireError::Io(e.to_string())
 }
 
-/// Encode a data frame. The header's `kind` is the payload's; `video` and `sink` are
-/// refused, as are a header or body over their limits. An iq block's `t0` is not sent:
-/// the receiver takes it from `start_ns`.
-pub fn encode_frame(f: &Frame) -> Result<Vec<u8>, WireError> {
+/// Encode a data frame under the negotiated `protocol`. The header's `kind` is the
+/// payload's; `sink` is refused, and `video` under protocol 1, as are a header or body
+/// over their limits and a video body that does not fit its format. An iq block's `t0` is
+/// not sent: the receiver takes it from `start_ns`.
+pub fn encode_frame(f: &Frame, protocol: u32) -> Result<Vec<u8>, WireError> {
     let kind = f.payload.kind();
     let body: Vec<u8> = match &f.payload {
         Payload::Iq(b) => b
@@ -276,10 +302,39 @@ pub fn encode_frame(f: &Frame) -> Result<Vec<u8>, WireError> {
             .collect(),
         Payload::Audio { samples, .. } => samples.iter().flat_map(|s| s.to_le_bytes()).collect(),
         Payload::Text(_) | Payload::Event(_) => Vec::new(),
-        Payload::Video | Payload::Sink(_) => return Err(WireError::KindNotCarried(kind)),
+        Payload::Video {
+            width,
+            height,
+            format,
+            frame,
+        } => {
+            if protocol < 2 {
+                return Err(WireError::KindNotCarried(kind));
+            }
+            format
+                .check_body(*width, *height, frame.len())
+                .map_err(WireError::VideoMismatch)?;
+            frame.to_vec()
+        }
+        Payload::Sink(_) => return Err(WireError::KindNotCarried(kind)),
     };
     let mut summary = FrameSummary::from_frame(f);
     summary.kind = kind;
+    if let Payload::Video {
+        width,
+        height,
+        format,
+        frame,
+    } = &f.payload
+    {
+        // The wire's video payload names the body length `frame`; the summary's is `bytes`.
+        summary.payload = serde_json::json!({
+            "width": width,
+            "height": height,
+            "format": format.name(),
+            "frame": frame.len(),
+        });
+    }
     let header = serde_json::to_vec(&Header::Frame(summary)).map_err(json_err)?;
     if header.len() > MAX_HEADER {
         return Err(WireError::TooLong {
@@ -346,14 +401,21 @@ async fn read_u32<R: AsyncRead + Unpin>(r: &mut R, what: &'static str) -> Result
 /// message is [`WireError::Truncated`]. Control lines are read a byte at a time, so give it
 /// a buffered reader (`tokio::io::BufReader`) over a pipe. Lengths are checked before any
 /// buffer is allocated, so at most [`MAX_HEADER`] + [`MAX_BODY`] bytes are held per frame.
-pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Message>, WireError> {
+/// `protocol` is the negotiated version: a `video` frame is read under 2 and refused under
+/// 1 (read the `hello`, before any version is known, under [`PROTOCOL_MIN`]).
+pub async fn read_message<R: AsyncRead + Unpin>(
+    r: &mut R,
+    protocol: u32,
+) -> Result<Option<Message>, WireError> {
     let mut first = [0u8; 1];
     if read_full(r, &mut first).await? == 0 {
         return Ok(None);
     }
     match first[0] {
         CONTROL_START => read_control(r).await.map(|c| Some(Message::Control(c))),
-        FRAME_START => read_frame(r).await.map(|f| Some(Message::Frame(f))),
+        FRAME_START => read_frame(r, protocol)
+            .await
+            .map(|f| Some(Message::Frame(f))),
         b => Err(WireError::UnexpectedByte(b)),
     }
 }
@@ -388,7 +450,7 @@ async fn read_control<R: AsyncRead + Unpin>(r: &mut R) -> Result<Control, WireEr
 }
 
 /// The rest of a data frame, whose `0x00` has been read.
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, WireError> {
+async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, protocol: u32) -> Result<Frame, WireError> {
     let h = read_u32(r, "header length").await?;
     if h > MAX_HEADER {
         return Err(WireError::TooLong {
@@ -410,6 +472,7 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, WireError>
         Audio(AudioSummary),
         Text(String),
         Event(serde_json::Value),
+        Video(VideoSummary),
     }
     let (shape, samples, width) = match s.kind {
         StreamKind::Iq => {
@@ -436,6 +499,11 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, WireError>
             (Shape::Text(t), 0, 0)
         }
         StreamKind::Event => (Shape::Event(s.payload), 0, 0),
+        StreamKind::Video if protocol >= 2 => {
+            let p: VideoSummary = serde_json::from_value(s.payload).map_err(json_err)?;
+            let n = p.frame;
+            (Shape::Video(p), n, 1)
+        }
         k @ (StreamKind::Video | StreamKind::Sink) => return Err(WireError::KindNotCarried(k)),
     };
 
@@ -453,6 +521,11 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, WireError>
             samples,
             bytes: b,
         });
+    }
+    if let Shape::Video(p) = &shape {
+        p.format
+            .check_body(p.width, p.height, b)
+            .map_err(WireError::VideoMismatch)?;
     }
     let mut body = vec![0u8; b];
     read_exact(r, &mut body, "body").await?;
@@ -482,6 +555,12 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, WireError>
         },
         Shape::Text(t) => Payload::Text(t),
         Shape::Event(v) => Payload::Event(v),
+        Shape::Video(p) => Payload::Video {
+            width: p.width,
+            height: p.height,
+            format: p.format,
+            frame: body.into(),
+        },
     };
     Ok(Frame::new(
         s.stream,
@@ -605,7 +684,7 @@ mod tests {
     }
 
     async fn read_all(mut bytes: &[u8]) -> Result<Option<Message>, WireError> {
-        read_message(&mut bytes).await
+        read_message(&mut bytes, PROTOCOL_MIN).await
     }
 
     fn header_of(bytes: &[u8]) -> (Value, &[u8]) {
@@ -620,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn iq_frame_roundtrips_bytes_exactly() {
         let f = frame(iq(vec![Complex::new(1.0, 2.0), Complex::new(-0.5, 0.25)]));
-        let bytes = encode_frame(&f).unwrap();
+        let bytes = encode_frame(&f, PROTOCOL_MIN).unwrap();
         assert_eq!(bytes[0], 0x00);
         let (header, body) = header_of(&bytes);
         assert_eq!(
@@ -649,7 +728,7 @@ mod tests {
         assert_eq!(a.center_hz, b.center_hz);
         assert_eq!(a.samples, b.samples);
         // Re-encoding the decoded frame gives the same bytes.
-        assert_eq!(encode_frame(&back).unwrap(), bytes);
+        assert_eq!(encode_frame(&back, PROTOCOL_MIN).unwrap(), bytes);
     }
 
     #[tokio::test]
@@ -659,7 +738,7 @@ mod tests {
             channels: 1,
             samples: Arc::from(vec![0.5f32, -0.75, 0.125]),
         });
-        let bytes = encode_frame(&audio).unwrap();
+        let bytes = encode_frame(&audio, PROTOCOL_MIN).unwrap();
         let (header, body) = header_of(&bytes);
         assert_eq!(
             header["payload"],
@@ -689,7 +768,7 @@ mod tests {
             channels: 2,
             samples: Arc::from(vec![0.5f32, -0.5, 0.25, -0.25, 0.125, -0.125]),
         });
-        let bytes = encode_frame(&stereo).unwrap();
+        let bytes = encode_frame(&stereo, PROTOCOL_MIN).unwrap();
         let (header, body) = header_of(&bytes);
         assert_eq!(header["payload"]["channels"], 2);
         assert_eq!(header["payload"]["samples"], 3);
@@ -708,7 +787,7 @@ mod tests {
         };
         assert_eq!(*channels, 2);
         assert_eq!(samples, want);
-        assert_eq!(encode_frame(&back).unwrap(), bytes);
+        assert_eq!(encode_frame(&back, PROTOCOL_MIN).unwrap(), bytes);
 
         // A header without `channels` (an old sender) is mono.
         let old = raw_frame(
@@ -745,7 +824,7 @@ mod tests {
         assert_eq!(read_all(&zero).await.unwrap_err(), WireError::ZeroChannels);
 
         let event = frame(Payload::Event(json!({"label":"fsk","snr_db":12.5})));
-        let bytes = encode_frame(&event).unwrap();
+        let bytes = encode_frame(&event, PROTOCOL_MIN).unwrap();
         let (header, body) = header_of(&bytes);
         assert_eq!(header["kind"], "event");
         assert_eq!(header["payload"], json!({"label":"fsk","snr_db":12.5}));
@@ -757,7 +836,7 @@ mod tests {
         assert_eq!(back.kind, StreamKind::Event);
 
         let text = frame(Payload::Text("CQ CQ DE VK2".into()));
-        let bytes = encode_frame(&text).unwrap();
+        let bytes = encode_frame(&text, PROTOCOL_MIN).unwrap();
         let (header, body) = header_of(&bytes);
         assert_eq!(header["payload"], "CQ CQ DE VK2");
         assert!(body.is_empty());
@@ -777,7 +856,7 @@ mod tests {
         assert_eq!(encode_control(&Control::Stop), b"{\"type\":\"stop\"}\n");
         let all = [
             Control::Hello(Hello {
-                protocol: PROTOCOL,
+                protocol: PROTOCOL_MIN,
                 kind: "fake".into(),
                 inputs: vec![StreamKind::Iq],
                 outputs: vec![StreamKind::Iq, StreamKind::Event],
@@ -789,7 +868,7 @@ mod tests {
                 message: "boom\nwith a newline".into(),
             },
             Control::Run(Run {
-                protocol: PROTOCOL,
+                protocol: PROTOCOL_MIN,
                 params: json!({"gain":2.0}),
                 inputs: vec![PortKind {
                     kind: StreamKind::Iq,
@@ -824,12 +903,13 @@ mod tests {
         // Back to back on one stream, then a clean EOF at a message boundary.
         let mut r = &stream[..];
         for c in &all {
-            let Some(Message::Control(back)) = read_message(&mut r).await.unwrap() else {
+            let Some(Message::Control(back)) = read_message(&mut r, PROTOCOL_MIN).await.unwrap()
+            else {
                 panic!("expected a control message");
             };
             assert_eq!(&back, c);
         }
-        assert!(read_message(&mut r).await.unwrap().is_none());
+        assert!(read_message(&mut r, PROTOCOL_MIN).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -868,7 +948,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncation_anywhere_is_an_error_not_a_panic() {
-        let full = encode_frame(&frame(iq(vec![Complex::new(1.0, 2.0); 4]))).unwrap();
+        let full = encode_frame(&frame(iq(vec![Complex::new(1.0, 2.0); 4])), PROTOCOL_MIN).unwrap();
         // Every proper prefix past the first byte is a truncation.
         for n in 1..full.len() {
             let err = read_all(&full[..n]).await.unwrap_err();
@@ -923,7 +1003,16 @@ mod tests {
         );
 
         assert_eq!(
-            encode_frame(&frame(Payload::Video)).unwrap_err(),
+            encode_frame(
+                &frame(Payload::Video {
+                    width: 1,
+                    height: 1,
+                    format: VideoFormat::Gray8,
+                    frame: Arc::from(vec![0u8])
+                }),
+                PROTOCOL_MIN
+            )
+            .unwrap_err(),
             WireError::KindNotCarried(StreamKind::Video)
         );
         let sink = frame(Payload::Sink(IqBlock {
@@ -933,7 +1022,7 @@ mod tests {
             samples: Arc::from(vec![]),
         }));
         assert_eq!(
-            encode_frame(&sink).unwrap_err(),
+            encode_frame(&sink, PROTOCOL_MIN).unwrap_err(),
             WireError::KindNotCarried(StreamKind::Sink)
         );
         let mut video = iq_header(0);
@@ -943,6 +1032,145 @@ mod tests {
             read_all(&raw_frame(&video, 0, &[])).await.unwrap_err(),
             WireError::KindNotCarried(StreamKind::Video)
         );
+    }
+
+    fn video(width: u32, height: u32, format: VideoFormat, bytes: Vec<u8>) -> Frame {
+        frame(Payload::Video {
+            width,
+            height,
+            format,
+            frame: bytes.into(),
+        })
+    }
+
+    async fn read_v(mut bytes: &[u8], protocol: u32) -> Result<Option<Message>, WireError> {
+        read_message(&mut bytes, protocol).await
+    }
+
+    #[tokio::test]
+    async fn video_frame_round_trips_under_protocol_2() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0".to_vec();
+        assert_eq!(png.len(), 10);
+        let rgb: Vec<u8> = (0..24).collect();
+        for (f, name, n) in [
+            (video(4, 2, VideoFormat::Rgb8, rgb.clone()), "rgb8", 24),
+            (
+                video(4, 2, VideoFormat::Gray8, rgb[..8].to_vec()),
+                "gray8",
+                8,
+            ),
+            (video(4, 2, VideoFormat::Png, png.clone()), "png", 10),
+        ] {
+            let bytes = encode_frame(&f, PROTOCOL_MAX).unwrap();
+            let (header, body) = header_of(&bytes);
+            assert_eq!(header["kind"], "video");
+            assert_eq!(
+                header["payload"],
+                json!({"width":4,"height":2,"format":name,"frame":n})
+            );
+            let Payload::Video { frame: sent, .. } = &f.payload else {
+                unreachable!()
+            };
+            assert_eq!(body, &sent[..]);
+            let Some(Message::Frame(back)) = read_v(&bytes, PROTOCOL_MAX).await.unwrap() else {
+                panic!("expected a frame");
+            };
+            assert_eq!(back.kind, StreamKind::Video);
+            assert_eq!(back.provenance, f.provenance);
+            let Payload::Video {
+                width,
+                height,
+                format,
+                frame: got,
+            } = &back.payload
+            else {
+                panic!("expected a video payload");
+            };
+            assert_eq!((*width, *height), (4, 2));
+            assert_eq!(format.name(), name);
+            assert_eq!(&got[..], &sent[..]);
+            assert_eq!(encode_frame(&back, PROTOCOL_MAX).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn video_is_refused_under_protocol_1() {
+        let f = video(4, 2, VideoFormat::Rgb8, vec![0; 24]);
+        let e = encode_frame(&f, PROTOCOL_MIN).unwrap_err();
+        assert_eq!(e, WireError::KindNotCarried(StreamKind::Video));
+        assert_eq!(
+            e.to_string(),
+            "video frames are not carried by plugin protocol 1"
+        );
+        // The same bytes a protocol-2 sender writes are refused by a protocol-1 reader.
+        let bytes = encode_frame(&f, PROTOCOL_MAX).unwrap();
+        assert_eq!(
+            read_v(&bytes, PROTOCOL_MIN).await.unwrap_err(),
+            WireError::KindNotCarried(StreamKind::Video)
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_is_refused_under_both_protocols() {
+        let sink = frame(Payload::Sink(IqBlock {
+            t0: Timestamp(0),
+            sample_rate_hz: Hz(1),
+            center_hz: Hz(1),
+            samples: Arc::from(vec![]),
+        }));
+        for p in [PROTOCOL_MIN, PROTOCOL_MAX] {
+            assert_eq!(
+                encode_frame(&sink, p).unwrap_err(),
+                WireError::KindNotCarried(StreamKind::Sink)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn video_body_that_does_not_fit_its_format_is_refused() {
+        // Encoding.
+        for f in [
+            video(4, 2, VideoFormat::Rgb8, vec![0; 8]),
+            video(4, 2, VideoFormat::Gray8, vec![0; 24]),
+            video(4, 2, VideoFormat::Png, vec![]),
+        ] {
+            assert!(matches!(
+                encode_frame(&f, PROTOCOL_MAX).unwrap_err(),
+                WireError::VideoMismatch(_)
+            ));
+        }
+        let e =
+            encode_frame(&video(4, 2, VideoFormat::Rgb8, vec![0; 8]), PROTOCOL_MAX).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "rgb8 video frame of 4x2 needs a 24-byte body, got 8"
+        );
+        // Reading: the header's `frame` count agrees with the body, the format does not.
+        let mut h = iq_header(0);
+        h["kind"] = json!("video");
+        h["payload"] = json!({"width":4,"height":2,"format":"rgb8","frame":8});
+        assert!(matches!(
+            read_v(&raw_frame(&h, 8, &[0; 8]), PROTOCOL_MAX)
+                .await
+                .unwrap_err(),
+            WireError::VideoMismatch(_)
+        ));
+        // The header's count disagrees with the body.
+        h["payload"] = json!({"width":4,"height":2,"format":"rgb8","frame":24});
+        assert!(matches!(
+            read_v(&raw_frame(&h, 8, &[0; 8]), PROTOCOL_MAX)
+                .await
+                .unwrap_err(),
+            WireError::BodyMismatch { .. }
+        ));
+        // Dimensions whose product overflows 32 bits are checked in 64.
+        h["payload"] = json!({"width":u32::MAX,"height":u32::MAX,"format":"gray8","frame":8});
+        assert!(matches!(
+            read_v(&raw_frame(&h, 8, &[0; 8]), PROTOCOL_MAX)
+                .await
+                .unwrap_err(),
+            WireError::VideoMismatch(_)
+        ));
     }
 
     #[tokio::test]
@@ -1056,7 +1284,7 @@ mod tests {
         // Encoding refuses a header over the limit.
         let huge = frame(Payload::Text("x".repeat(MAX_HEADER)));
         assert!(matches!(
-            encode_frame(&huge).unwrap_err(),
+            encode_frame(&huge, PROTOCOL_MIN).unwrap_err(),
             WireError::TooLong { what: "header", .. }
         ));
     }

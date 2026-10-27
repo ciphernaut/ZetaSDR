@@ -1030,7 +1030,8 @@ pub struct BankInfo {
 /// absent). `payload` by kind: event, the event value; text, the string;
 /// audio, `{"sample_rate_hz", "samples", "peak"}` (count and largest absolute
 /// sample); iq and sink, `{"sample_rate_hz", "center_hz", "samples"}`;
-/// video, `{}`.
+/// video, `{"width", "height", "format", "bytes"}` (`format` `rgb8`, `gray8` or `png`;
+/// `bytes` the frame's byte count).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -1067,7 +1068,17 @@ impl FrameSummary {
                 "center_hz": b.center_hz.0,
                 "samples": b.samples.len(),
             }),
-            Payload::Video => serde_json::json!({}),
+            Payload::Video {
+                width,
+                height,
+                format,
+                frame,
+            } => serde_json::json!({
+                "width": width,
+                "height": height,
+                "format": format.name(),
+                "bytes": frame.len(),
+            }),
         };
         Self {
             stream: f.stream.clone(),

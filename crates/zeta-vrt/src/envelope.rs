@@ -17,7 +17,7 @@ pub fn envelope(f: &Frame) -> Result<Vec<u8>, String> {
         Payload::Iq(_) => return Err("iq frames are sent as vrt packets".to_string()),
         Payload::Audio { samples, .. } => samples.iter().flat_map(|s| s.to_le_bytes()).collect(),
         Payload::Text(t) => t.as_bytes().to_vec(),
-        Payload::Event(_) | Payload::Sink(_) | Payload::Video => Vec::new(),
+        Payload::Event(_) | Payload::Sink(_) | Payload::Video { .. } => Vec::new(),
     };
     let header = serde_json::to_vec(&FrameSummary::from_frame(f)).map_err(|e| e.to_string())?;
     if header.len() > MAX_HEADER {

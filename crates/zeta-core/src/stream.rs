@@ -21,11 +21,66 @@ pub enum Payload {
         channels: u16,
         samples: Arc<[f32]>,
     },
-    /// Deferred: no video payload is carried yet.
-    Video,
+    /// One image. `frame` holds `width × height × 3` bytes for `rgb8`, `width × height` for
+    /// `gray8`, or a PNG file (any non-zero length) for `png`; the bus refuses a frame whose
+    /// body does not fit (see [`VideoFormat::check_body`]).
+    Video {
+        width: u32,
+        height: u32,
+        format: VideoFormat,
+        frame: Arc<[u8]>,
+    },
     Text(String),
     Event(serde_json::Value),
     Sink(IqBlock),
+}
+
+/// How a [`Payload::Video`] frame's bytes are laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoFormat {
+    /// Row-major, 3 bytes per pixel.
+    Rgb8,
+    /// Row-major, 1 byte per pixel.
+    Gray8,
+    /// A PNG file; the header's dimensions are the frame's.
+    Png,
+}
+
+impl VideoFormat {
+    /// The wire name: `rgb8`, `gray8` or `png`.
+    pub fn name(self) -> &'static str {
+        match self {
+            VideoFormat::Rgb8 => "rgb8",
+            VideoFormat::Gray8 => "gray8",
+            VideoFormat::Png => "png",
+        }
+    }
+
+    /// Check that a body of `len` bytes fits `width × height` in this format: exactly
+    /// `width × height × 3` (rgb8) or `width × height` (gray8), any non-zero length for png.
+    pub fn check_body(self, width: u32, height: u32, len: usize) -> Result<(), String> {
+        let pixels = u64::from(width) * u64::from(height);
+        let want = match self {
+            VideoFormat::Rgb8 => pixels * 3,
+            VideoFormat::Gray8 => pixels,
+            VideoFormat::Png => {
+                return if len > 0 {
+                    Ok(())
+                } else {
+                    Err("png video frame has an empty body".into())
+                };
+            }
+        };
+        if len as u64 == want {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} video frame of {width}x{height} needs a {want}-byte body, got {len}",
+                self.name()
+            ))
+        }
+    }
 }
 
 impl Payload {
@@ -33,7 +88,7 @@ impl Payload {
         match self {
             Payload::Iq(_) => StreamKind::Iq,
             Payload::Audio { .. } => StreamKind::Audio,
-            Payload::Video => StreamKind::Video,
+            Payload::Video { .. } => StreamKind::Video,
             Payload::Text(_) => StreamKind::Text,
             Payload::Event(_) => StreamKind::Event,
             Payload::Sink(_) => StreamKind::Sink,
@@ -110,12 +165,23 @@ impl StreamBus {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            if let Payload::Video {
+                width,
+                height,
+                format,
+                frame: body,
+            } = &frame.payload
+                && format.check_body(*width, *height, body.len()).is_err()
+            {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let _ = tx.send(frame);
         }
     }
 
     /// Number of frames dropped for carrying the wrong kind for their stream, or an audio
-    /// frame with 0 channels.
+    /// frame with 0 channels, or a video frame whose body does not fit its format.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -218,6 +284,41 @@ mod tests {
         assert_eq!(bus.dropped(), 1);
         bus.publish(audio(2));
         assert!(rx.recv().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_a_video_body_that_does_not_fit_its_format() {
+        let bus = StreamBus::new(8);
+        let p = prov("s");
+        let id = bus.register(StreamKind::Video, p.clone());
+        let mut rx = bus.subscribe(&id).unwrap();
+        let video = |format, len| {
+            Frame::new(
+                id.clone(),
+                p.clone(),
+                Payload::Video {
+                    width: 4,
+                    height: 2,
+                    format,
+                    frame: Arc::from(vec![0u8; len]),
+                },
+            )
+        };
+        bus.publish(video(VideoFormat::Rgb8, 23));
+        bus.publish(video(VideoFormat::Gray8, 24));
+        bus.publish(video(VideoFormat::Png, 0));
+        let got = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            got.is_err(),
+            "a mismatched video frame must not be delivered"
+        );
+        assert_eq!(bus.dropped(), 3);
+        bus.publish(video(VideoFormat::Rgb8, 24));
+        bus.publish(video(VideoFormat::Gray8, 8));
+        bus.publish(video(VideoFormat::Png, 10));
+        for _ in 0..3 {
+            assert!(rx.recv().await.is_ok());
+        }
     }
 
     #[tokio::test]
