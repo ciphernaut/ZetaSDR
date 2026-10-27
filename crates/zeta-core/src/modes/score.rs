@@ -116,7 +116,6 @@ mod tests {
     fn aprs_at_144_800_scores_highest_and_wide_rows_do_not_fit() {
         let modes = registry();
         let got = ids(&score_rows(&modes, 144_800_000, 12_500, "fm", &|_| 0.0));
-        eprintln!("{got:?}");
         assert_eq!(got[0].0, "aprs_decode");
         assert!((got[0].1 - 1.0).abs() < 1e-6, "{got:?}");
         assert!(got[0].2, "{got:?}");

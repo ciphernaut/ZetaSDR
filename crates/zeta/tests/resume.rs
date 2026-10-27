@@ -2,6 +2,8 @@
 //! re-expanded for the rate the source actually runs at; a `job_graph_put` graph is not,
 //! unless the put changed only a demodulator's carried params.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -589,4 +591,215 @@ async fn a_cb_job_resumed_at_its_own_rate_gains_the_guard() {
     let disk = on_disk(dir.path(), &id);
     assert!(!disk.operator_graph);
     assert_eq!(nbfm(&disk.graph)["squelch_db"], -50);
+}
+
+const ADSB_HZ: u64 = 1_090_000_000;
+const ADSB_RATE_HZ: u64 = 2_400_000;
+const ADSB_SECRET: &str = "adsb-resume-secret";
+/// What the fake dump1090 says (an identification message).
+const FAKE_IDENT: &str =
+    "MSG,1,1,1,ABCDEF,1,2026/10/20,12:00:00.000,2026/10/20,12:00:00.000,ZETA1   ,,,,,,,,,,,0\r";
+
+/// Write a running `adsb_decode` record as a node before plan 16 left it on source
+/// `adsb`: the graph `channel -> adsb_decode {}` at 2.4 MHz, the node's own (expanded
+/// for that rate) or, with `operator_graph`, as a `graph_put` left it (no rate; resume
+/// launches it as stored); its id.
+fn write_old_adsb(dir: &Path, operator_graph: bool) -> JobId {
+    use zeta_core::graph::GraphId;
+    let tuning = Tuning {
+        center_hz: Hz(ADSB_HZ),
+        bandwidth_hz: Hz(ADSB_RATE_HZ),
+    };
+    let (channel, decode) = (NodeId::new(), NodeId::new());
+    let graph = Graph {
+        id: GraphId::new(),
+        nodes: vec![
+            GraphNode {
+                id: channel.clone(),
+                kind: "channel".into(),
+                params: serde_json::json!({
+                    "center_hz": ADSB_HZ,
+                    "bandwidth_hz": ADSB_RATE_HZ,
+                    "out_rate_hz": ADSB_RATE_HZ,
+                }),
+            },
+            GraphNode {
+                id: decode.clone(),
+                kind: "adsb_decode".into(),
+                params: serde_json::json!({}),
+            },
+        ],
+        edges: vec![Edge {
+            from: channel,
+            to: decode,
+            kind: StreamKind::Iq,
+        }],
+    };
+    let rec = JobRecord {
+        format: JOB_RECORD_FORMAT,
+        id: JobId::new(),
+        kind: "adsb_decode".into(),
+        graph,
+        source: SourceId("adsb".into()),
+        tuning,
+        state: JobState::Running,
+        context: serde_json::json!({}),
+        created_ns: Timestamp(1 + u64::from(operator_graph)),
+        input: None,
+        capture_rate_hz: (!operator_graph).then_some(ADSB_RATE_HZ),
+        elastic: false,
+        operator_graph,
+    };
+    let jobs = dir.join("state").join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(
+        jobs.join(format!("{}.json", rec.id.0)),
+        serde_json::to_vec(&rec).unwrap(),
+    )
+    .unwrap();
+    rec.id
+}
+
+/// `zeta serve` on `dir` with the 2.4 MHz Mode S fixture as source `adsb` and dump1090
+/// pinned to the fake (repeating its line, so a late tail still sees one).
+fn adsb_serve(dir: &Path) -> common::ServeProc {
+    let iq = zeta_dsp::fixtures::modes_frame_iq(0x4840D6, "ZETA1", 200, ADSB_RATE_HZ as u32);
+    let meta = zeta_dsp::fixtures::write_fixture(dir, "adsb", &iq, ADSB_RATE_HZ as u32, ADSB_HZ);
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../zeta-ext/tests/fake_dump1090")
+        .canonicalize()
+        .unwrap();
+    let src = format!("adsb={}", meta.display());
+    common::ServeProc::start_env(
+        dir,
+        ADSB_SECRET,
+        &["--source-file", &src],
+        &[
+            ("ZETA_HANDLER_DUMP1090", fake.to_str().unwrap()),
+            ("ZETA_PLUGIN_ENV_FAKE_SBS_LINE", FAKE_IDENT),
+            ("ZETA_PLUGIN_ENV_FAKE_REPEAT_MS", "200"),
+        ],
+    )
+}
+
+fn adsb_remote(serve: &common::ServeProc, args: &[&str]) -> serde_json::Value {
+    let out = common::zeta_remote(&serve.url, ADSB_SECRET, args)
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&out.stderr)))
+}
+
+/// `id`'s state on the node.
+fn adsb_status(serve: &common::ServeProc, id: &JobId) -> serde_json::Value {
+    let jobs = adsb_remote(serve, &["job", "list"]);
+    jobs["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == id.0.as_str())
+        .unwrap_or_else(|| panic!("{} not listed: {jobs}", id.0))["state"]
+        .clone()
+}
+
+/// The first `adsb` event on `id`'s event stream within 10 s.
+fn adsb_event(serve: &common::ServeProc, id: &JobId) -> serde_json::Value {
+    let streams = adsb_remote(serve, &["stream", "list"]);
+    let stream = streams["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["provenance"]["job"] == id.0.as_str() && s["kind"] == "event")
+        .unwrap_or_else(|| panic!("no event stream of {}: {streams}", id.0))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let args = [
+        "stream",
+        "tail",
+        "--stream",
+        &stream,
+        "--max-frames",
+        "1",
+        "--timeout-ms",
+        "10000",
+    ];
+    let tail = adsb_remote(serve, &args);
+    let frames = tail["value"]["frames"].as_array().expect("frames");
+    assert!(!frames.is_empty(), "no adsb event: {tail}");
+    frames[0]["payload"].clone()
+}
+
+/// The stage kinds of `id`'s graph, in node order.
+fn adsb_kinds(serve: &common::ServeProc, id: &JobId) -> Vec<String> {
+    let graph = adsb_remote(serve, &["graph", "get", "--job", &id.0]);
+    graph["value"]["nodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{graph}"))
+        .iter()
+        .filter_map(|n| n["kind"].as_str().map(String::from))
+        .collect()
+}
+
+/// Pre-plan-16 `adsb_decode` records (`channel -> adsb_decode`) resume on `zeta serve`
+/// and decode: the node's own is re-expanded to today's `channel -> external_decode`,
+/// an operator's (`graph_put`) runs as stored through the `adsb_decode` alias stage,
+/// which runs the registry's row.
+#[test]
+fn an_old_adsb_graph_resumes_through_the_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_own = write_old_adsb(dir.path(), false);
+    let operator = write_old_adsb(dir.path(), true);
+    let serve = adsb_serve(dir.path());
+    for id in [&node_own, &operator] {
+        assert_eq!(adsb_status(&serve, id)["status"], "running", "{}", id.0);
+    }
+    assert_eq!(
+        adsb_kinds(&serve, &node_own),
+        ["channel", "external_decode"]
+    );
+    assert_eq!(adsb_kinds(&serve, &operator), ["channel", "adsb_decode"]);
+    for id in [&node_own, &operator] {
+        let ev = adsb_event(&serve, id);
+        assert_eq!(ev["protocol"], "adsb", "{ev}");
+        assert_eq!(ev["summary"], "ABCDEF ZETA1", "{ev}");
+        assert_eq!(adsb_status(&serve, id)["status"], "running", "{}", id.0);
+    }
+}
+
+/// A `graph_put` naming the `adsb_decode` alias loads: today's graph with its decoder
+/// node put back as `adsb_decode {}` restarts the job on the alias, and it decodes.
+#[test]
+fn graph_put_naming_adsb_decode_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = write_old_adsb(dir.path(), false);
+    let serve = adsb_serve(dir.path());
+    assert_eq!(adsb_status(&serve, &id)["status"], "running");
+    let mut graph = adsb_remote(&serve, &["graph", "get", "--job", &id.0])["value"].clone();
+    for n in graph["nodes"].as_array_mut().unwrap() {
+        if n["kind"] == "external_decode" {
+            n["kind"] = "adsb_decode".into();
+            n["params"] = serde_json::json!({});
+        }
+    }
+    let file = dir.path().join("graph.json");
+    std::fs::write(&file, graph.to_string()).unwrap();
+    let put = adsb_remote(
+        &serve,
+        &[
+            "graph",
+            "put",
+            "--job",
+            &id.0,
+            "--file",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert!(put.get("error").is_none(), "{put}");
+    assert_eq!(adsb_status(&serve, &id)["status"], "running");
+    assert_eq!(adsb_kinds(&serve, &id), ["channel", "adsb_decode"]);
+    let ev = adsb_event(&serve, &id);
+    assert_eq!(ev["protocol"], "adsb", "{ev}");
+    assert_eq!(ev["summary"], "ABCDEF ZETA1", "{ev}");
+    assert_eq!(adsb_status(&serve, &id)["status"], "running");
 }

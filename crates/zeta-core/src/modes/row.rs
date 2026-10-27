@@ -375,6 +375,25 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             format!("{:?} must match ^[a-z][a-z0-9_]*$", row.id.0),
         ));
     }
+    // A built-in kind's name maps to that kind, never to the row: only the five decoder
+    // kinds expand from rows under their own names.
+    const DECODERS: [&str; 5] = [
+        "aprs_decode",
+        "pocsag_decode",
+        "rds_decode",
+        "acars_decode",
+        "adsb_decode",
+    ];
+    if !DECODERS.contains(&row.id.0.as_str())
+        && crate::ops::BUILTIN_KINDS
+            .iter()
+            .any(|k| k.name() == row.id.0)
+    {
+        return Err(RowError::new(
+            "id",
+            format!("{} is a built-in job kind", row.id.0),
+        ));
+    }
     let properties = row.event.schema["properties"]
         .as_object()
         .ok_or_else(|| RowError::new("event.schema", "must be an object with `properties`"))?;

@@ -4,12 +4,15 @@ Parses --net-sbs-port, listens on 127.0.0.1 at that port and accepts one
 connection, then reads SC16 samples from stdin. Once 19 200 bytes have
 arrived it writes $FAKE_SBS_LINE plus a newline to the connection and keeps
 reading stdin until EOF. FAKE_EXIT_AFTER=1 makes it exit 3 right after
-writing the line; FAKE_PIDFILE names a file to write its pid to at start.
+writing the line; FAKE_REPEAT_MS=N writes the line again every N ms of
+input read (for a reader that subscribes late); FAKE_PIDFILE names a file to
+write its pid to at start.
 """
 
 import os
 import socket
 import sys
+import time
 
 THRESHOLD = 19_200
 
@@ -23,6 +26,7 @@ def main() -> int:
             f.write(str(os.getpid()))
     line = os.environ.get("FAKE_SBS_LINE", "")
     exit_after = os.environ.get("FAKE_EXIT_AFTER") == "1"
+    repeat_ms = int(os.environ.get("FAKE_REPEAT_MS", "0"))
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -32,6 +36,7 @@ def main() -> int:
 
     total = 0
     sent = False
+    last = 0.0
     stdin = sys.stdin.buffer
     while True:
         chunk = stdin.read1(65536)
@@ -41,9 +46,13 @@ def main() -> int:
         if not sent and total >= THRESHOLD:
             conn.sendall((line + "\n").encode())
             sent = True
+            last = time.monotonic()
             sys.stderr.write(f"fake_dump1090: sent line after {total} bytes\n")
             if exit_after:
                 return 3
+        elif sent and repeat_ms > 0 and time.monotonic() - last >= repeat_ms / 1000:
+            conn.sendall((line + "\n").encode())
+            last = time.monotonic()
     sys.stderr.write(f"fake_dump1090: stdin closed after {total} bytes\n")
     conn.close()
     return 0

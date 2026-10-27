@@ -207,17 +207,17 @@ pub fn find_handler(programs: &[String]) -> Option<PathBuf> {
     find_program(programs, over, std::env::var_os("PATH"))
 }
 
-/// The program to run: the override `over` when set (it must be an absolute path to a
-/// file, else there is none: a set override is never passed over for `PATH`), else the
-/// first of `programs` that is an absolute path to an executable or an executable in a
-/// `path` directory.
+/// The program to run: the override `over` when set (it must be an absolute path to an
+/// executable file, else there is none: a set override is never passed over for
+/// `PATH`), else the first of `programs` that is an absolute path to an executable or
+/// an executable in a `path` directory.
 pub fn find_program(
     programs: &[String],
     over: Option<OsString>,
     path: Option<OsString>,
 ) -> Option<PathBuf> {
     if let Some(p) = over.map(PathBuf::from) {
-        return (p.is_absolute() && p.is_file()).then_some(p);
+        return (p.is_absolute() && is_executable(&p)).then_some(p);
     }
     programs.iter().find_map(|name| {
         let p = Path::new(name);
@@ -358,6 +358,28 @@ mod tests {
             None
         );
         assert_eq!(find_program(&progs, None, None), None);
+    }
+
+    /// An override naming a file that is not executable is missing, as a `PATH`
+    /// candidate would be (and is never passed over for `PATH`).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_override_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("dump1090");
+        std::fs::write(&plain, "#!/bin/sh\n").unwrap();
+        let progs = names(&["dump1090"]);
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(
+            find_program(&progs, Some(plain.clone().into()), Some(path)),
+            None
+        );
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            find_program(&progs, Some(plain.clone().into()), None),
+            Some(plain)
+        );
     }
 
     #[test]

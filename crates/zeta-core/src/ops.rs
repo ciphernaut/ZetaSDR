@@ -441,17 +441,29 @@ impl JobKind {
     }
 
     /// The ready row of `modes` the kind expands from (`None` for a kind without one).
-    /// A missing row is `other("unknown mode <id> (known: ...)")`, a row that is not
-    /// ready `other("mode <id> is <state>: <reason>")`.
+    /// A missing row is `unknown { field: "kind", value: <id>, known }`, `known` the
+    /// startable built-in kinds and every row id (ready or not); a row that is not ready
+    /// is `other("mode <id> is <state>: <reason>")`.
     pub fn mode_row<'a>(&self, modes: &'a ModeRegistry) -> Result<Option<&'a ModeRow>, OpError> {
         let Some(id) = self.mode_id() else {
             return Ok(None);
         };
         let m = modes.get(id).ok_or_else(|| {
-            other(format!(
-                "unknown mode {id} (known: {})",
-                modes.ids().join(", ")
-            ))
+            let mut known: Vec<String> = BUILTIN_KINDS
+                .iter()
+                .filter(|k| !k.attachable())
+                .map(|k| k.name().to_string())
+                .collect();
+            for row in modes.ids() {
+                if !known.contains(&row) {
+                    known.push(row);
+                }
+            }
+            OpError::Unknown {
+                field: "kind".into(),
+                value: id.to_string(),
+                known,
+            }
         })?;
         let state = match m.state {
             ModeState::Ready => return Ok(Some(&m.row)),
@@ -2131,10 +2143,11 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 Some(m) => Ok(OpResult::Mode {
                     mode: Box::new(m.clone()),
                 }),
-                None => Err(other(format!(
-                    "unknown mode {id} (known: {})",
-                    modes.ids().join(", ")
-                ))),
+                None => Err(OpError::Unknown {
+                    field: "id".into(),
+                    value: id,
+                    known: modes.ids(),
+                }),
             }
         }
         Op::Classify { selection } => classify(node, selection).await,

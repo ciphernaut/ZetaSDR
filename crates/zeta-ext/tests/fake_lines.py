@@ -8,9 +8,12 @@ input path (`-` for stdin), then keeps
 reading until EOF and exits 0. $FAKE_VIA is `stdout` (the default) or
 `tcp:<flag>`: listen on 127.0.0.1 at the port after <flag> in the arguments,
 accept one connection and write the lines there. FAKE_EXIT_AFTER=1 makes it
-exit 3 right after writing the lines.
+exit 3 right after writing the lines. FAKE_PRINT_ENV=1 writes, instead of
+$FAKE_LINES, one JSON line `{"text": <the sorted names of its environment,
+space-separated>, "n": <how many>}`.
 """
 
+import json
 import os
 import socket
 import sys
@@ -19,6 +22,9 @@ import sys
 def main() -> int:
     args = sys.argv[1:]
     lines = os.environ.get("FAKE_LINES", "")
+    if os.environ.get("FAKE_PRINT_ENV") == "1":
+        names = sorted(os.environ)
+        lines = json.dumps({"text": " ".join(names), "n": len(names)})
     after = int(os.environ.get("FAKE_AFTER_BYTES", "1024"))
     via = os.environ.get("FAKE_VIA", "stdout")
     exit_after = os.environ.get("FAKE_EXIT_AFTER") == "1"

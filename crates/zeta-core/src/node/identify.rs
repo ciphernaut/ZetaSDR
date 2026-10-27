@@ -140,6 +140,25 @@ impl Inner {
         tokio::spawn(async move { inner.launch(rec).await })
     }
 
+    /// Stop `stale`, the child a run before a restart was trying, gated. A resume
+    /// launches identify before its child (the same band, the older record), so the
+    /// child may not be listed yet: wait up to [`MEASURE_WAIT`] for its entry (a record
+    /// that never appears has nothing to stop). `false` when the job is cancelled first.
+    async fn stop_stale(&self, r: &Run, stale: &JobId) -> bool {
+        let deadline = tokio::time::Instant::now() + MEASURE_WAIT;
+        while !self.jobs.lock().unwrap().contains_key(stale) {
+            if tokio::time::Instant::now() >= deadline {
+                return true;
+            }
+            tokio::select! {
+                _ = r.cancel.cancelled() => return false,
+                _ = tokio::time::sleep(POLL) => {}
+            }
+        }
+        let _ = self.stop_gated(stale).await;
+        true
+    }
+
     /// Whether the job's stop came under the source's gate (a `replace`).
     fn gated(&self, id: &JobId) -> bool {
         self.jobs
@@ -397,14 +416,17 @@ impl Inner {
 /// `proved` leaves it running and ends the job with the verdict; (4) an exhausted list
 /// ends the job with `mode: null`, the layer-1 label and features.
 async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
+    // A child the run before a restart was trying (resumed as an ordinary job): stopped
+    // first, needing no samples, so a measurement that fails cannot orphan it.
+    if let Some(stale) = &r.stale
+        && !inner.stop_stale(&r, stale).await
+    {
+        return Err(StageError::Cancelled);
+    }
     let capture = r.port.current().unwrap_or(r.tuning);
     let Some((iq, rate, center)) = inner.measure_samples(&r, capture).await? else {
         return Err(StageError::Cancelled);
     };
-    // A child the run before a restart was trying (resumed as an ordinary job).
-    if let Some(stale) = &r.stale {
-        let _ = inner.stop_gated(stale).await;
-    }
     let band = Band {
         offset_hz: r.tuning.center_hz.0 as i64 - center.0 as i64,
         bandwidth_hz: Hz(r.tuning.bandwidth_hz.0.min(rate.0)),

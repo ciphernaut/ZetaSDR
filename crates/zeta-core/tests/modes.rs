@@ -213,11 +213,86 @@ async fn modes_show_unknown_names_the_known_ids() {
         .apply(Op::ModesShow { id: "nope".into() })
         .await
         .unwrap_err();
-    let OpError::Other { message } = e else {
-        panic!("expected other, got {e:?}");
+    let OpError::Unknown {
+        field,
+        value,
+        known,
+    } = e
+    else {
+        panic!("expected unknown, got {e:?}");
     };
+    assert_eq!(field, "id");
+    assert_eq!(value, "nope");
     assert_eq!(
-        message,
-        "unknown mode nope (known: acars_decode, adsb_decode, aprs_decode, pocsag_decode, rds_decode)"
+        known,
+        [
+            "acars_decode",
+            "adsb_decode",
+            "aprs_decode",
+            "pocsag_decode",
+            "rds_decode"
+        ]
     );
+}
+
+/// A node's own `schema` lists its operator rows in the `kind` enumeration (MCP and
+/// `ask` inline `$defs` into each tool's input schema).
+#[tokio::test]
+async fn node_schema_lists_operator_rows_as_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut row: serde_json::Value = serde_json::from_str(&renamed_pocsag("Local")).unwrap();
+    row["id"] = "pocsag_local".into();
+    std::fs::write(modes.join("pocsag_local.json"), row.to_string()).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let Ok(OpResult::Schema(v)) = node.apply(Op::Schema {}).await else {
+        panic!("expected schema");
+    };
+    let mut seen = 0;
+    for part in ["op", "result", "error"] {
+        let Some(def) = v[part]["$defs"].get("JobKind") else {
+            continue;
+        };
+        seen += 1;
+        let kinds: Vec<&str> = def["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|k| k.as_str())
+            .collect();
+        assert!(kinds.contains(&"pocsag_local"), "{part}: {kinds:?}");
+        assert!(kinds.contains(&"fm_demod"), "{part}: {kinds:?}");
+        let mut dedup = kinds.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), kinds.len(), "{part}: {kinds:?}");
+    }
+    assert!(seen > 0, "no JobKind in {v}");
+}
+
+/// A row named for a built-in job kind other than the five decoders would be listed
+/// ready and never started (the name maps to the built-in): it loads broken.
+#[test]
+fn a_built_in_kind_name_is_refused_as_a_row_id() {
+    let dir = tempfile::tempdir().unwrap();
+    for id in ["fm_demod", "scan", "identify"] {
+        let mut row: serde_json::Value = serde_json::from_str(&renamed_pocsag("x")).unwrap();
+        row["id"] = id.into();
+        std::fs::write(dir.path().join(format!("{id}.json")), row.to_string()).unwrap();
+    }
+    let reg = ModeRegistry::load(&stages(), Some(dir.path()));
+    for id in ["fm_demod", "scan", "identify"] {
+        let m = reg.get(id).unwrap_or_else(|| panic!("{id} listed"));
+        assert_eq!(m.state, ModeState::Broken, "{id}");
+        assert_eq!(
+            m.reason.as_deref(),
+            Some(format!("id: {id} is a built-in job kind").as_str()),
+            "{id}"
+        );
+    }
+    // The decoder kinds' own names stay operator-replaceable.
+    assert_eq!(reg.get("pocsag_decode").unwrap().state, ModeState::Ready);
 }

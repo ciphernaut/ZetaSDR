@@ -37,7 +37,7 @@ A decoder is a row, not code. `zeta modes list [--family F] [--state S]` shows e
 - `unavailable`: the row is fine but its program is not on this host. `reason` names the program.
 - `broken`: the row did not parse or validate. `file` is the file to fix and `reason` is `<field>: <error>`. A broken row never stops the node: it is reported at startup as `zeta: mode <id> (<file>): <field>: <error>` and starts nothing.
 
-Never invent an id: `job_start` with an id no row has fails `unknown mode <id> (known: ...)`, and a row that is not ready fails `mode <id> is <state>: <reason>`.
+Never invent an id: `job_start` with a kind that is neither a built-in nor a row's id fails with an `unknown` error (`field: "kind"`, `known` the built-in kinds and every row id), and a row that is not ready fails `mode <id> is <state>: <reason>`.
 
 **Handlers.** A program row (today `adsb_decode`, running dump1090) needs an external program. At startup the node prints one line per program: `zeta: handlers: <program>: found <path> (<version>)`, or `zeta: handlers: <program>: missing (apt install <pkg>; <url>) — modes: <ids>`. A missing handler is not an error and is never fetched or built by zeta. To install it, run the package command from the line (`apt install dump1090-fa` for dump1090), then restart the node: the row turns `ready`. A program outside `PATH` is named with `ZETA_HANDLER_<PROGRAM>` (`ZETA_HANDLER_DUMP1090`; `ZETA_DUMP1090` still works). Programs run with a cleared environment, as plugins do.
 

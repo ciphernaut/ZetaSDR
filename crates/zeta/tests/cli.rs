@@ -2356,14 +2356,11 @@ fn modes_list_prints_the_five_rows() {
     .get_output()
     .stdout
     .clone();
-    assert!(
-        json(&out)["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("unknown mode nope (known: acars_decode, "),
-        "{}",
-        String::from_utf8_lossy(&out)
-    );
+    let v = json(&out);
+    assert_eq!(v["error"], "unknown", "{v}");
+    assert_eq!(v["field"], "id", "{v}");
+    assert_eq!(v["value"], "nope", "{v}");
+    assert_eq!(v["known"][0], "acars_decode", "{v}");
 }
 
 /// The handler report: with no dump1090 on `PATH` the startup line says so with the
@@ -2531,12 +2528,17 @@ fn job_start_accepts_a_mode_id_string() {
         .stdout
         .clone();
     let v = json(&out);
-    assert_eq!(v["error"], "other", "{v}");
+    assert_eq!(v["error"], "unknown", "{v}");
+    assert_eq!(v["field"], "kind", "{v}");
+    assert_eq!(v["value"], "flex_decode", "{v}");
+    let known: Vec<&str> = v["known"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
     assert!(
-        v["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("unknown mode flex_decode (known: acars_decode, "),
+        known.contains(&"fm_demod") && known.contains(&"pocsag_decode"),
         "{v}"
     );
     start("Nope")

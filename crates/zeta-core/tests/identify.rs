@@ -93,6 +93,18 @@ async fn node_with(
     meta: &Path,
     wrap: impl FnOnce(Arc<dyn Port>) -> Arc<dyn Port>,
 ) -> Node {
+    let (node, src) = node_unstarted(dir, meta, wrap).await;
+    src.start();
+    node
+}
+
+/// [`node_with`] with the file source not yet started: it delivers nothing until the
+/// caller starts it.
+async fn node_unstarted(
+    dir: &Path,
+    meta: &Path,
+    wrap: impl FnOnce(Arc<dyn Port>) -> Arc<dyn Port>,
+) -> (Node, Arc<FileSource>) {
     let cfg = NodeConfig {
         state_dir: dir.join("state"),
         ring_seconds: 4.0,
@@ -114,12 +126,11 @@ async fn node_with(
     let src = Arc::new(FileSource::open(SourceId("rx".into()), meta, opts).unwrap());
     let port: Arc<dyn Port> = wrap(src.clone());
     let node = Node::open(cfg, registry(), vec![port]).await.unwrap();
-    // The node subscribed (ring, bank) when the port was added.
-    src.start();
+    // The node subscribed (ring, bank) when the port was added: the caller starts it.
     for c in zeta_dsp::classifiers(node.modes()) {
         node.add_classifier(c);
     }
-    node
+    (node, src)
 }
 
 /// A port that is the file source but for a fault the test sets.
@@ -554,4 +565,74 @@ async fn a_fault_fails_identify_with_the_source_fault() {
         node.lease_holders(&rx()).is_empty()
     })
     .await;
+}
+
+/// A node killed while identify tries a child leaves both records `running`; on the
+/// restart the resumed identify stops that stale child before it measures (here with a
+/// source that delivers nothing yet, so a stop after the measurement would come too
+/// late), then runs on as usual once samples arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identify_resumed_after_a_restart_stops_its_stale_child() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let jobs = dir.path().join("state").join("jobs");
+    let file = |id: &JobId| jobs.join(format!("{}.json", id.0));
+    let node = node_over(dir.path(), &fixtures().pocsag_on_aprs).await;
+    let (id, _events) = identify(&node, APRS_HZ).await;
+    let (child, _) = first_child(&node, "aprs_decode").await;
+    // The records as a kill mid-dwell leaves them: both running, identify naming its child.
+    let identify_rec = std::fs::read_to_string(file(&id)).unwrap();
+    let child_rec = std::fs::read_to_string(file(&child)).unwrap();
+    let v: Value = serde_json::from_str(&identify_rec).unwrap();
+    assert_eq!(v["context"]["identify"]["current"], child.0.as_str(), "{v}");
+    assert_eq!(v["state"]["status"], "running", "{v}");
+    let v: Value = serde_json::from_str(&child_rec).unwrap();
+    assert_eq!(v["state"]["status"], "running", "{v}");
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::write(file(&id), &identify_rec).unwrap();
+    std::fs::write(file(&child), &child_rec).unwrap();
+
+    let (node, src) = node_unstarted(dir.path(), &fixtures().pocsag_on_aprs, |p| p).await;
+    assert_eq!(state(&node, &id), JobState::Running);
+    let stream = node
+        .bus()
+        .list()
+        .into_iter()
+        .find(|s| s.provenance.job.as_ref() == Some(&id) && s.kind == StreamKind::Event)
+        .expect("identify's event stream")
+        .id;
+    let mut events = node.bus().subscribe(&stream).expect("subscribed");
+    // No samples yet: the stale child ends all the same, and its lease with it.
+    until("the stale child ends", Duration::from_secs(3), || {
+        state(&node, &child) != JobState::Running
+    })
+    .await;
+    let holders: Vec<JobId> = node
+        .lease_holders(&rx())
+        .into_iter()
+        .map(|(j, _)| j)
+        .collect();
+    assert_eq!(holders, std::slice::from_ref(&id));
+    assert_eq!(state(&node, &id), JobState::Running);
+    // Samples arrive: the run measures and publishes its candidates.
+    src.start();
+    let first = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match events.recv().await {
+                Ok(f) => {
+                    if let Payload::Event(v) = f.payload {
+                        return v;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("identify's stream closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a candidate from the resumed identify");
+    assert_eq!(first["protocol"], "candidate", "{first}");
+    assert_ne!(state(&node, &child), JobState::Running);
+    stop_all(&node).await;
 }

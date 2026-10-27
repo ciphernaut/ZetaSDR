@@ -2780,14 +2780,18 @@ async fn an_unknown_mode_id_names_the_known_ids() {
     }))
     .unwrap();
     match node.apply(op).await {
-        Err(OpError::Other { message }) => {
-            assert!(
-                message.starts_with("unknown mode flex_decode (known: "),
-                "{message}"
-            );
-            assert!(message.contains("pocsag_decode"), "{message}");
+        Err(OpError::Unknown {
+            field,
+            value,
+            known,
+        }) => {
+            assert_eq!(field, "kind");
+            assert_eq!(value, "flex_decode");
+            assert!(known.iter().any(|k| k == "fm_demod"), "{known:?}");
+            assert!(known.iter().any(|k| k == "pocsag_decode"), "{known:?}");
+            assert!(!known.iter().any(|k| k == "transcribe"), "{known:?}");
         }
-        other => panic!("expected other, got {other:?}"),
+        other => panic!("expected unknown, got {other:?}"),
     }
     assert!(node.job_list().is_empty());
     assert_eq!(port.current(), None);

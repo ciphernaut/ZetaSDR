@@ -213,6 +213,59 @@ async fn json_lines_rows_publish_enveloped_events() {
     assert!(next_event(&mut r.rx_out, 0).await.is_none());
 }
 
+/// Set in the re-run of this test binary that carries the secrets in its environment.
+const LEAK_CHILD: &str = "ZETA_EXTERNAL_ENV_LEAK_CHILD";
+/// The variables of ours a program must never see.
+const SECRETS: [&str; 3] = ["ZETA_SECRET", "ZETA_NODE_SECRET_X", "ZETA_KIWI_PASSWORD_Y"];
+
+/// The program runs with the cleared environment: secrets in the node's own environment
+/// never reach it, `PATH` and `PYTHONUNBUFFERED` do. The secrets are put in the parent's
+/// environment by re-running this one test in a child process that has them (no
+/// `set_var` in a threaded test binary).
+#[tokio::test]
+async fn the_child_sees_only_the_pass_through_environment() {
+    if std::env::var_os(LEAK_CHILD).is_none() {
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "the_child_sees_only_the_pass_through_environment",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(LEAK_CHILD, "1");
+        for s in SECRETS {
+            cmd.env(s, "hunter2");
+        }
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{text}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(text.contains("1 passed"), "{text}");
+        return;
+    }
+    for s in SECRETS {
+        assert_eq!(std::env::var(s).as_deref(), Ok("hunter2"), "{s} set");
+    }
+    let reg = registry(&[json_row("fake_env", "cs16", "stdin", &[])]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([("FAKE_PRINT_ENV", "1")]);
+    let mut r = start(stage, "fake_env");
+    send(&r.tx, 4, 480, 48_000);
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    let names: Vec<&str> = v["text"].as_str().unwrap().split(' ').collect();
+    for s in SECRETS {
+        assert!(!names.contains(&s), "{s} reached the program: {names:?}");
+    }
+    assert!(!names.iter().any(|n| n.starts_with("ZETA_")), "{names:?}");
+    assert!(names.contains(&"PATH"), "{names:?}");
+    assert!(names.contains(&"PYTHONUNBUFFERED"), "{names:?}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
 #[tokio::test]
 async fn unparsable_lines_are_counted_not_fatal() {
     let reg = registry(&[json_row("fake_json", "cs16", "stdin", &[])]);

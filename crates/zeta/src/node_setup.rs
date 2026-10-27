@@ -79,7 +79,7 @@ pub fn registry(
 /// in id order), and record it in `modes` (`set_program`): found, the rows are ready
 /// with it; missing, they are unavailable with the report line as their reason. The
 /// lookup honours `ZETA_HANDLER_<PROGRAM>` (and `ZETA_DUMP1090` for dump1090), an
-/// override naming no file being missing. Returns the handler report, one line per
+/// override naming no executable file being missing. Returns the handler report, one line per
 /// list (spec 5.3): `zeta: handlers: <programs[0]>: found <path> (<version>)` or
 /// `zeta: handlers: <programs[0]>: missing (<hint>; <url>) — modes: <ids>`, the hint
 /// `apt install <debian>`, else `dnf install <fedora>`, else `brew install <brew>`,

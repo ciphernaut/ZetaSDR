@@ -888,10 +888,27 @@ impl Node {
     }
 
     /// [`crate::ops::schema`] plus `stages`: every registered stage kind with
-    /// its stream kinds and params schema (see [`StageRegistry::describe`]).
+    /// its stream kinds and params schema (see [`StageRegistry::describe`]), with
+    /// `$defs.JobKind.enum` (in the op, result and error schemas) extended by this
+    /// node's mode rows, its operator rows included.
     pub fn schema(&self) -> serde_json::Value {
         let mut v = crate::ops::schema();
         v["stages"] = self.inner.registry.describe();
+        let ids = self.inner.modes.ids();
+        for part in ["op", "result", "error"] {
+            let Some(kinds) = v[part]["$defs"]
+                .get_mut("JobKind")
+                .and_then(|k| k.get_mut("enum"))
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            for id in ids.iter().filter(|id| crate::modes::is_mode_id(id)) {
+                if !kinds.iter().any(|k| k == id.as_str()) {
+                    kinds.push(id.as_str().into());
+                }
+            }
+        }
         v
     }
 
