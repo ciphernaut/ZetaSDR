@@ -1974,6 +1974,25 @@ def scenario_decode_menu_lists_new_kinds(page, url, secret):
     expect(menu).to_be_hidden()
 
 
+def scenario_identify_from_a_box_shows_candidates(page, url, secret):
+    # Identify on the POCSAG page: the box (widened to 12.5 kHz) sits on a POCSAG centre, so
+    # pocsag_decode is tried first and its proof shows as a candidate ribbon; the proved
+    # child keeps running and is stopped here.
+    select_source(page, url, secret, "pocsag")
+    page.wait_for_function("() => window.zetaTest.wf().painted > 30", timeout=15_000)
+    menu = drag_menu(page)
+    try:
+        page.click('#ctx .ctx-item[data-action="identify"]')
+        expect(menu).to_be_hidden()
+        ribbon = page.locator("#waterfall .ov-ribbon.candidate", has_text="pocsag_decode: proved")
+        expect(ribbon.first).to_be_visible(timeout=10_000)
+    finally:
+        for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]:
+            if (j["source"] == "pocsag" and j["kind"] in ("identify", "pocsag_decode")
+                    and j["state"]["status"] == "running"):
+                stop_job(url, secret, j["id"])
+
+
 def scenario_adsb_entry_asks_for_2400_khz(page, url, secret):
     # ADS-B always asks for 2.4 MHz, whatever was selected; the 48 kHz tone cannot serve it,
     # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so.

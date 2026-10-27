@@ -1,6 +1,7 @@
 //! The node: owns ports, leases, rings and the stream bus, and runs graphs as
 //! persistent jobs that resume after restart.
 
+mod identify;
 mod jsonlog;
 mod launch;
 mod persist;

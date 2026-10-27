@@ -1,5 +1,6 @@
 //! Launching jobs: lease, spawn stages, supervise, the IQ forwarders, and
-//! the `scan` job's step loop. Attached jobs launch here too, without the radio.
+//! the `scan` job's step loop. Attached jobs launch here too, without the radio; the
+//! `identify` job's controller is in [`super::identify`].
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
@@ -110,6 +111,9 @@ impl Inner {
                 let port = port.ok_or_else(|| NodeError::UnknownSource(rec.source.clone()))?;
                 if rec.kind == JobKind::Scan.name() {
                     return self.launch_scan(rec, port, gate, after).await;
+                }
+                if rec.kind == JobKind::Identify.name() {
+                    return self.launch_identify(rec, port, gate, after).await;
                 }
                 Some(port)
             }
@@ -554,7 +558,7 @@ impl Inner {
     /// first: two overlapping `graph_put`s) is refused, its lease left to that run,
     /// which holds the same id's lease; replacing the entry would drop that run's
     /// token uncancelled and leave its stages running.
-    fn record_running(
+    pub(super) fn record_running(
         &self,
         mut rec: JobRecord,
         token: &CancellationToken,
@@ -820,7 +824,7 @@ fn node_outputs(
 /// All but the streams (this run's own) only while the job's entry is still
 /// for `run`: a later run of the id holds the record, the lease and the port.
 /// `ended` is dropped once released, before the idle (see [`JobEntry::ended`]).
-async fn supervise(
+pub(super) async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
     (run, ended): (u64, tokio::sync::watch::Sender<()>),
@@ -1165,10 +1169,10 @@ impl Drop for TeeRunning {
 /// Counts a running task of a job's stage set in `Inner::stages` while it lives:
 /// made before the task is spawned and moved into it, so the count drops however
 /// the task ends, an abort included.
-struct StageRunning(Arc<std::sync::atomic::AtomicUsize>);
+pub(super) struct StageRunning(Arc<std::sync::atomic::AtomicUsize>);
 
 impl StageRunning {
-    fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    pub(super) fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
         count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self(count)
     }

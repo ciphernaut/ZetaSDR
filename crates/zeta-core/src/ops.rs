@@ -320,6 +320,10 @@ const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 /// dwelling [`SCAN_DWELL_MS`] on each step, and emits spectrum rows tagged
 /// with each step's `center_hz` while holding the whole band, so every other
 /// request on the source is a conflict until the scan is stopped.
+/// `identify` also expands to no graph: it holds a rigid lease on its band like a
+/// decoder, measures it for [`IDENTIFY_MEASURE_MS`], then tries every plausible mode
+/// row as a child job, in score order, publishing one `candidate` event per row and
+/// ending with a verdict (see `node::identify`).
 /// `transcribe` is attachable, not started on the radio: `job_attach` runs it on another
 /// job's audio (see [`JobKind::expand_attached`]); `job_start` refuses it.
 ///
@@ -343,13 +347,14 @@ pub enum JobKind {
     AdsbDecode,
     Measure,
     Scan,
+    Identify,
     Transcribe,
     /// A mode row's id that is not a built-in kind's name (an operator's row).
     Mode(ModeId),
 }
 
 /// The built-in kinds, in the order `schema` lists them: every kind but [`JobKind::Mode`].
-pub static BUILTIN_KINDS: [JobKind; 14] = [
+pub static BUILTIN_KINDS: [JobKind; 15] = [
     JobKind::Passthrough,
     JobKind::Spectrum,
     JobKind::FmDemod,
@@ -363,6 +368,7 @@ pub static BUILTIN_KINDS: [JobKind; 14] = [
     JobKind::AdsbDecode,
     JobKind::Measure,
     JobKind::Scan,
+    JobKind::Identify,
     JobKind::Transcribe,
 ];
 
@@ -414,6 +420,7 @@ impl JobKind {
             JobKind::AdsbDecode => "adsb_decode",
             JobKind::Measure => "measure",
             JobKind::Scan => "scan",
+            JobKind::Identify => "identify",
             JobKind::Transcribe => "transcribe",
             JobKind::Mode(id) => &id.0,
         }
@@ -656,7 +663,7 @@ impl JobKind {
             | JobKind::AcarsDecode
             | JobKind::AdsbDecode
             | JobKind::Mode(_) => unreachable!("expanded above from the row"),
-            JobKind::Scan => Graph {
+            JobKind::Scan | JobKind::Identify => Graph {
                 id: GraphId::new(),
                 nodes: vec![],
                 edges: vec![],
@@ -879,6 +886,10 @@ pub const SCAN_STEP_MAX_HZ: u64 = 16_000_000;
 /// How long a scan waits on each step before reading the ring (the node's
 /// default; `NodeConfig::scan_dwell_ms` overrides it).
 pub const SCAN_DWELL_MS: u64 = 250;
+
+/// How much of the ring, in ms, an `identify` job measures (layer 1) before it scores
+/// the mode rows.
+pub const IDENTIFY_MEASURE_MS: u64 = 1_000;
 
 /// The steps a scan of `span` takes on a source with `caps`: captures of
 /// `w = min(max_bandwidth_hz, SCAN_STEP_MAX_HZ, span width)` centred at

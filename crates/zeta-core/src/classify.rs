@@ -210,6 +210,27 @@ impl ClassifierSet {
         }
         out
     }
+
+    /// Layer 1 alone: the first [`Measurement`] a layer-1 classifier returns for
+    /// `band` of `iq` (registration order), or `None` when none measures it. The
+    /// `identify` job reads its band's label and features from it.
+    pub async fn measure(
+        &self,
+        iq: &[Complex<f32>],
+        sample_rate_hz: Hz,
+        center_hz: Hz,
+        band: Band,
+    ) -> Option<Measurement> {
+        for c in self.classifiers.iter().filter(|c| c.layer() == 1) {
+            let (_, m, _) = c
+                .classify_measured(iq, sample_rate_hz, center_hz, band, None, None)
+                .await;
+            if m.is_some() {
+                return m;
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

@@ -939,6 +939,79 @@ fn scan_kind_is_accepted_and_lists_as_running() {
     assert_eq!(listed(dir.path())["state"]["status"], "stopped");
 }
 
+/// `identify` on the tone: the two rows wider than 12.5 kHz are `skipped_band` at once,
+/// then the first row tried is `no_frame` after its dwell; the job is still trying the
+/// next when the tail ends, so it is stopped (and its child with it).
+#[test]
+fn job_start_identify_then_tail_prints_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "identify",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "12500",
+            // `stream_tail` waits at most 10 000 ms: one second's measure and a 5 s dwell.
+            "--then-tail",
+            "3,10000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 3, "{v}");
+    for f in frames {
+        let p = &f["payload"];
+        assert_eq!(p["protocol"], "candidate", "{v}");
+        let summary = format!(
+            "{}: {}",
+            p["mode"].as_str().unwrap(),
+            p["outcome"].as_str().unwrap()
+        );
+        assert_eq!(p["summary"], summary.as_str(), "{v}");
+    }
+    let outcomes: Vec<(&str, &str)> = frames
+        .iter()
+        .map(|f| {
+            (
+                f["payload"]["mode"].as_str().unwrap(),
+                f["payload"]["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert!(outcomes.contains(&("rds_decode", "skipped_band")), "{v}");
+    assert!(outcomes.contains(&("adsb_decode", "skipped_band")), "{v}");
+    assert_eq!(outcomes[2].1, "no_frame", "{v}");
+    assert!(frames[2]["payload"]["job"].is_string(), "{v}");
+    assert_eq!(v[2], serde_json::json!({"stopped": true}));
+    let id = v[0]["value"].as_str().expect("job id");
+    let jobs = zeta(dir.path(), &["job", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let jobs = json(&jobs);
+    let running: Vec<&Value> = jobs["value"]
+        .as_array()
+        .expect("jobs array")
+        .iter()
+        .filter(|j| j["state"]["status"] == "running")
+        .collect();
+    assert!(running.is_empty(), "identify {id} left {running:?}");
+}
+
 #[test]
 fn then_tail_malformed_value_is_usage_error() {
     let dir = tempfile::tempdir().unwrap();

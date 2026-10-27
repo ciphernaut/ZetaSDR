@@ -25,6 +25,12 @@
 //                                             `L<layer> <name> <confidence>`, then each
 //                                             mode decode-to-identify considered as
 //                                             `tried <mode> <score> <outcome>`
+//   identify   Identify (thorough)            job_start kind=identify, bandwidth_hz at least
+//                                             IDENTIFY_MIN_BANDWIDTH_HZ; its event stream is
+//                                             watched at once (ov.watchJob: it may prove and
+//                                             end before the 2 s job poll would), so each
+//                                             `candidate` event shows as a ribbon (its
+//                                             `summary`, class `candidate`)
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
 //   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
 //                                             bandwidth_hz at least POCSAG_MIN_BANDWIDTH_HZ
@@ -96,9 +102,13 @@ export const ACARS_MIN_BANDWIDTH_HZ = 10000;
 // The ADS-B entry always asks for this bandwidth (dump1090's 2.4 MHz; the node refuses
 // adsb_decode under 2 MHz), whatever was selected.
 export const ADSB_BANDWIDTH_HZ = 2_400_000;
+// The identify entry asks for at least this bandwidth, the narrowest box classify fits the
+// mode rows to: a narrow drag would skip every row as wider than the box.
+export const IDENTIFY_MIN_BANDWIDTH_HZ = 12500;
 
 const ENTRIES = [
   ["classify", "What is this?"],
+  ["identify", "Identify (thorough)"],
   ["aprs_decode", "Decode › APRS"],
   ["pocsag_decode", "Decode › POCSAG"],
   ["rds_decode", "Decode › RDS (FM station data)"],
@@ -121,6 +131,7 @@ const ENTRIES = [
 ];
 // The job each decode entry starts: kind, deviation_hz and sideband.
 const JOBS = {
+  identify: { kind: "identify", deviation: null, sideband: null },
   aprs_decode: { kind: "aprs_decode", deviation: null, sideband: null },
   pocsag_decode: { kind: "pocsag_decode", deviation: null, sideband: null },
   rds_decode: { kind: "rds_decode", deviation: null, sideband: null },
@@ -160,6 +171,9 @@ export function jobTuning(action, s) {
   }
   if (action === "pocsag_decode") {
     return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, POCSAG_MIN_BANDWIDTH_HZ) };
+  }
+  if (action === "identify") {
+    return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, IDENTIFY_MIN_BANDWIDTH_HZ) };
   }
   if (action === "acars_decode") {
     return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, ACARS_MIN_BANDWIDTH_HZ) };
@@ -328,6 +342,9 @@ class Menu {
       if (action in TRANSCRIBE && r && r.result === "job" && r.value) {
         await this.applyOp(this.attachOp(r.value));
       }
+      if (action === "identify" && r && r.result === "job" && r.value) {
+        await this.watchIdentify(r.value, s);
+      }
     }
   }
 
@@ -346,6 +363,34 @@ class Menu {
       elastic: false,
       replace: [],
     });
+  }
+
+  // Watch identify job `id`'s event stream now: its candidates come within seconds and a
+  // proof ends it, possibly before the 2 s job poll would have watched it.
+  async watchIdentify(id, s) {
+    if (!this.ov || !this.ov.api) return;
+    let streams = [];
+    try {
+      streams = await this.ov.api.streams();
+    } catch {
+      return;
+    }
+    const ids = streams
+      .filter((x) => x.kind === "event" && x.provenance && x.provenance.job === id)
+      .map((x) => x.id);
+    if (ids.length === 0) return;
+    const t = jobTuning("identify", s);
+    this.ov.watchJob(
+      {
+        id,
+        kind: "identify",
+        source: s.sourceId,
+        elastic: false,
+        tuning: { center_hz: t.centerHz, bandwidth_hz: t.bandwidthHz },
+        state: { status: "running" },
+      },
+      ids,
+    );
   }
 
   // A scan time-shares the radio: the waterfall lets go of the source first (refused while a
