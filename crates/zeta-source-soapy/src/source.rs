@@ -586,6 +586,10 @@ impl Port for SoapySource {
             return Err(e);
         }
         let _gate = self.gate.lock().await;
+        // A call ahead of this one may have lost the device while it waited.
+        if let Some(e) = self.lost_error() {
+            return Err(e);
+        }
         if let Some(cur) = self.retune_live(center, rate, bw).await? {
             return Ok(cur);
         }
@@ -649,6 +653,9 @@ impl Port for SoapySource {
             return Err(e);
         }
         let _gate = self.gate.lock().await;
+        if let Some(e) = self.lost_error() {
+            return Err(e);
+        }
         let ack = {
             let reader = self.reader.lock().unwrap();
             let live = reader.as_ref().filter(|r| r.alive());

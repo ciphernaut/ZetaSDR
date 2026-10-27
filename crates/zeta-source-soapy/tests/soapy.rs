@@ -490,32 +490,84 @@ async fn retune_timeout_faults_and_next_tune_reopens() {
 
 #[tokio::test]
 async fn t0_monotonic_across_reopen() {
-    // Ten instant blocks run 164 ms ahead of the wall clock, then a retune
-    // times out (a fault that is not a device loss), and the next tune reopens.
-    let mut reads = samples(10);
-    reads.extend(vec![MockRead::Timeout; 3]);
+    // Forty instant blocks run 655 ms ahead of the wall clock, then a retune
+    // times out (a fault that is not a device loss), and the next tune reopens
+    // while the lead is still ahead: the new anchor must carry `last_end`.
+    let mut reads = samples(40);
+    reads.extend(vec![MockRead::Timeout; 5]);
     let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
     let src = Arc::new(
         SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
             .unwrap()
-            .with_retune_timeout(Duration::from_millis(100)),
+            .with_retune_timeout(Duration::from_millis(20)),
     );
     let mut rx = src.subscribe();
     src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
     let mut last = None;
-    for _ in 0..10 {
+    for _ in 0..40 {
         last = Some(next_block(&mut rx).await);
     }
     let last = last.unwrap();
-    dev.delay_next("set_frequency", 300);
+    dev.delay_next("set_frequency", 30);
     assert!(src.tune(tuning(101_000_000, 1_000_000)).await.is_err());
     assert!(src.fault().is_some());
     dev.push_reads(samples(1));
-    // Wait out the late retune so the reader has ended before the reopen.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The tune joins the stopped reader itself, so no wait is added.
     src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    assert!(
+        now_ns() < end_ns(&last),
+        "the reopen must happen inside the lead window"
+    );
     let b = next_block(&mut rx).await;
     assert!(b.t0.0 >= end_ns(&last), "{} < {}", b.t0.0, end_ns(&last));
+}
+
+#[tokio::test]
+async fn a_call_waiting_on_the_gate_does_not_touch_a_device_lost_meanwhile() {
+    let mut reads = samples(1);
+    reads.extend(vec![MockRead::Timeout; 5]);
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
+    let src = source(&dev);
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    next_block(&mut rx).await;
+    // The first retune holds the gate while the reader is in a slow device
+    // call that then fails; the second tune and a gain wait on the gate.
+    dev.delay_next("set_sample_rate", 200);
+    dev.fail_next("set_sample_rate", "LIBUSB_ERROR_NO_DEVICE");
+    let first = {
+        let src = src.clone();
+        tokio::spawn(async move { src.tune(tuning(100_000_000, 2_000_000)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = {
+        let src = src.clone();
+        tokio::spawn(async move { src.tune(tuning(100_000_000, 1_000_000)).await })
+    };
+    let gain = {
+        let src = src.clone();
+        tokio::spawn(async move { src.set_gain(Some(10.0)).await })
+    };
+    assert!(first.await.unwrap().is_err());
+    let e = second.await.unwrap().unwrap_err();
+    assert!(
+        e.to_string().contains("device lost") && e.to_string().contains("NO_DEVICE"),
+        "{e}"
+    );
+    let e = gain.await.unwrap().unwrap_err();
+    assert!(e.to_string().contains("device lost"), "{e}");
+    assert!(src.fault().is_some(), "the fault is kept");
+    assert_abandoned(&dev).await;
+    let calls = dev.calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("set_gain")),
+        "{calls:?}"
+    );
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("open_rx")).count(),
+        1,
+        "{calls:?}"
+    );
 }
 
 async fn node_with(src: Arc<SoapySource>) -> (Node, tempfile::TempDir) {
