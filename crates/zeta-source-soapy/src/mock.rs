@@ -16,6 +16,30 @@ pub enum MockRead {
     Timeout,
     Overflow,
     Fatal(String),
+    /// The device vanishes (an unplug): from this read on every read is
+    /// `Fatal(msg)` (the rest of the script is not consumed), and every later
+    /// device or stream call is recorded by [`MockDevice::calls_after_gone`]
+    /// and fails with `device gone`.
+    Gone(String),
+}
+
+/// The unplug state shared by a device and its streams: the message once
+/// gone, and the calls made after.
+#[derive(Default)]
+struct Gone {
+    msg: Mutex<Option<String>>,
+    after: Mutex<Vec<String>>,
+}
+
+impl Gone {
+    /// Record `op` and fail when the device is gone.
+    fn touch(&self, op: &str) -> Result<(), String> {
+        if self.msg.lock().unwrap().is_some() {
+            self.after.lock().unwrap().push(op.into());
+            return Err("device gone".into());
+        }
+        Ok(())
+    }
 }
 
 pub struct MockDevice {
@@ -50,6 +74,7 @@ pub struct MockDevice {
     gain_mode_available: bool,
     /// `(db, automatic)`: the gain set and whether automatic gain is on.
     gain: Mutex<(f64, bool)>,
+    gone: Arc<Gone>,
 }
 
 impl MockDevice {
@@ -84,6 +109,7 @@ impl MockDevice {
             range_reads: Mutex::new(0),
             gain_mode_available: true,
             gain: Mutex::new((0.0, false)),
+            gone: Arc::default(),
         }
     }
 
@@ -178,6 +204,12 @@ impl MockDevice {
         self.calls.lock().unwrap().clone()
     }
 
+    /// The device and stream calls made after a [`MockRead::Gone`] read; empty
+    /// when nothing touched the vanished device (`abandon` and drops excluded).
+    pub fn calls_after_gone(&self) -> Vec<String> {
+        self.gone.after.lock().unwrap().clone()
+    }
+
     /// `(call, thread name)` of each control call (`set_frequency`,
     /// `set_sample_rate`, `set_gain`, `set_gain_mode`), in order.
     pub fn call_threads(&self) -> Vec<(String, String)> {
@@ -195,6 +227,7 @@ impl MockDevice {
 
     /// Record a control call and run `f` as its body, counting overlaps.
     fn control<T>(&self, s: String, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        self.gone.touch(&s)?;
         let name = std::thread::current().name().unwrap_or("?").to_string();
         self.threads.lock().unwrap().push((s.clone(), name));
         self.rec(s);
@@ -223,9 +256,11 @@ impl SoapyDevice for MockDevice {
         self.driver.clone()
     }
     fn frequency_ranges(&self) -> Result<Vec<RangeHz>, String> {
+        self.gone.touch("frequency_ranges")?;
         Ok(self.freq.clone())
     }
     fn sample_rate_ranges(&self) -> Result<Vec<RangeHz>, String> {
+        self.gone.touch("sample_rate_ranges")?;
         *self.range_reads.lock().unwrap() += 1;
         if let Some(mcr) = self.decimation {
             return Ok(vec![RangeHz {
@@ -245,9 +280,11 @@ impl SoapyDevice for MockDevice {
         Ok(self.rates.clone())
     }
     fn formats(&self) -> Result<(Option<WireFormat>, Vec<WireFormat>), String> {
+        self.gone.touch("formats")?;
         Ok((self.native, self.formats.clone()))
     }
     fn rx_channels(&self) -> Result<usize, String> {
+        self.gone.touch("rx_channels")?;
         Ok(self.channels)
     }
     fn set_frequency(&self, hz: f64) -> Result<(), String> {
@@ -272,6 +309,7 @@ impl SoapyDevice for MockDevice {
         })
     }
     fn sample_rate(&self) -> Result<f64, String> {
+        self.gone.touch("sample_rate")?;
         let rate = *self.rate.lock().unwrap();
         let mut short = self.shortfall.lock().unwrap();
         if short.1 == 0 {
@@ -283,19 +321,23 @@ impl SoapyDevice for MockDevice {
         Ok(rate * (1.0 - short.0))
     }
     fn open_rx(&self, format: WireFormat) -> Result<Box<dyn SoapyRx>, String> {
+        self.gone.touch("open_rx")?;
         self.rec(format!("open_rx({format:?})"));
         self.check("open_rx")?;
         Ok(Box::new(MockRx {
             reads: self.reads.clone(),
             calls: self.calls.clone(),
             fails: self.fails.clone(),
+            gone: self.gone.clone(),
             next: 0,
         }))
     }
     fn gain_range(&self) -> Result<(f64, f64), String> {
+        self.gone.touch("gain_range")?;
         Ok((0.0, 76.0))
     }
     fn gain(&self) -> Result<f64, String> {
+        self.gone.touch("gain")?;
         Ok(self.gain.lock().unwrap().0)
     }
     fn set_gain(&self, db: f64) -> Result<(), String> {
@@ -306,9 +348,11 @@ impl SoapyDevice for MockDevice {
         })
     }
     fn has_gain_mode(&self) -> Result<bool, String> {
+        self.gone.touch("has_gain_mode")?;
         Ok(self.gain_mode_available)
     }
     fn gain_mode(&self) -> Result<bool, String> {
+        self.gone.touch("gain_mode")?;
         Ok(self.gain.lock().unwrap().1)
     }
     fn set_gain_mode(&self, automatic: bool) -> Result<(), String> {
@@ -335,22 +379,38 @@ struct MockRx {
     reads: Arc<Mutex<VecDeque<MockRead>>>,
     calls: Arc<Mutex<Vec<String>>>,
     fails: Arc<Mutex<Vec<(String, String)>>>,
+    gone: Arc<Gone>,
     next: u64,
+}
+
+impl Drop for MockRx {
+    fn drop(&mut self) {
+        self.calls.lock().unwrap().push("drop".into());
+    }
 }
 
 impl SoapyRx for MockRx {
     fn activate(&mut self) -> Result<(), String> {
         self.calls.lock().unwrap().push("activate".into());
+        self.gone.touch("activate")?;
         take_fail(&self.fails, "activate")?;
         Ok(())
     }
     fn deactivate(&mut self) -> Result<(), String> {
         self.calls.lock().unwrap().push("deactivate".into());
+        self.gone.touch("deactivate")?;
         Ok(())
+    }
+    fn abandon(self: Box<Self>) {
+        self.calls.lock().unwrap().push("abandon".into());
     }
     /// An empty script reads as `Timeout` forever. A `Timeout` step blocks for
     /// `timeout_us`, as a real device does.
     fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError> {
+        if let Some(m) = self.gone.msg.lock().unwrap().clone() {
+            self.gone.after.lock().unwrap().push("read".into());
+            return Err(ReadError::Fatal(m));
+        }
         let step = self
             .reads
             .lock()
@@ -379,6 +439,10 @@ impl SoapyRx for MockRx {
             }
             MockRead::Overflow => Err(ReadError::Overflow),
             MockRead::Fatal(m) => Err(ReadError::Fatal(m)),
+            MockRead::Gone(m) => {
+                *self.gone.msg.lock().unwrap() = Some(m.clone());
+                Err(ReadError::Fatal(m))
+            }
         }
     }
 }

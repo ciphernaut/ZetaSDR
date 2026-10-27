@@ -56,6 +56,10 @@ pub trait SoapyDevice: Send + Sync {
 pub trait SoapyRx: Send {
     fn activate(&mut self) -> Result<(), String>;
     fn deactivate(&mut self) -> Result<(), String>;
+    /// End a stream of a device that is gone (unplugged): make no further
+    /// native call on it, neither deactivate nor close. The handle may be
+    /// leaked; one per unplug is the accepted cost.
+    fn abandon(self: Box<Self>);
     /// Implementations convert to cf32 inside `read`.
     fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError>;
 }

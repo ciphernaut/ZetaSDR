@@ -49,6 +49,9 @@ const MIN_BLOCK: usize = 16_384;
 const READ_TIMEOUT_US: i64 = 100_000;
 /// Consecutive read timeouts (1 s without samples) that fault the port.
 const QUIET_READS: u32 = 10;
+/// Consecutive overflows with no successful read in between that fault the
+/// source: a driver that overflows forever delivers nothing.
+pub const MAX_OVERFLOW_RUN: u32 = 100;
 /// Default wait of `tune` for the reader thread to apply a retune.
 const RETUNE_ACK: Duration = Duration::from_secs(2);
 /// Window of [`SoapySource::measured_rate_hz`].
@@ -265,6 +268,9 @@ pub struct SoapySource {
     reader: Mutex<Option<Reader>>,
     retune_timeout: Duration,
     ppm: f64,
+    /// Set with the fault when the reader gave the device up as lost: the
+    /// device is never called again and `tune` refuses.
+    lost: Arc<AtomicBool>,
     /// Serialises `tune`, which may wait on the reader thread.
     gate: tokio::sync::Mutex<()>,
 }
@@ -322,6 +328,7 @@ impl SoapySource {
             reader: Mutex::new(None),
             retune_timeout: RETUNE_ACK,
             ppm: 0.0,
+            lost: Arc::new(AtomicBool::new(false)),
             gate: tokio::sync::Mutex::new(()),
         })
     }
@@ -388,7 +395,19 @@ impl SoapySource {
     /// orders the change with retunes.
     pub fn set_gain_now(&self, db: Option<f64>) -> Result<GainInfo, PortError> {
         self.check_gain(db)?;
+        if let Some(e) = self.lost_error() {
+            return Err(e);
+        }
         apply_gain(self.dev.as_ref(), &self.status, db).map_err(PortError::Io)
+    }
+
+    /// The error of a call on a source whose device was given up as lost; no
+    /// device call has been made.
+    fn lost_error(&self) -> Option<PortError> {
+        self.lost.load(Ordering::SeqCst).then(|| {
+            let fault = self.fault().unwrap_or_default();
+            PortError::Io(format!("device lost: {fault}; restart the node"))
+        })
     }
 
     fn fail(&self, msg: String) -> PortError {
@@ -496,6 +515,7 @@ impl SoapySource {
             stop: stop.clone(),
             cmds: cmds_rx,
             ppm: self.ppm,
+            lost: self.lost.clone(),
         };
         let handle = std::thread::Builder::new()
             .name(format!("soapy-{}", self.id.0))
@@ -562,6 +582,9 @@ impl Port for SoapySource {
             .flatten()
             .ok_or_else(|| out_of_range("bandwidth_hz", bw, 1, max_rate))?;
 
+        if let Some(e) = self.lost_error() {
+            return Err(e);
+        }
         let _gate = self.gate.lock().await;
         if let Some(cur) = self.retune_live(center, rate, bw).await? {
             return Ok(cur);
@@ -622,6 +645,9 @@ impl Port for SoapySource {
     /// does not fault the port.
     async fn set_gain(&self, db: Option<f64>) -> Result<GainInfo, PortError> {
         self.check_gain(db)?;
+        if let Some(e) = self.lost_error() {
+            return Err(e);
+        }
         let _gate = self.gate.lock().await;
         let ack = {
             let reader = self.reader.lock().unwrap();
@@ -687,11 +713,19 @@ struct Ctx {
     stop: Arc<AtomicBool>,
     cmds: std_mpsc::Receiver<Cmd>,
     ppm: f64,
+    lost: Arc<AtomicBool>,
 }
 
 impl Ctx {
     fn fault(&self, m: String) {
         self.status.lock().unwrap().fault = Some(m);
+    }
+
+    /// Fault the source and mark its device lost (set after the fault, so a
+    /// refused `tune` can name it).
+    fn lose(&self, m: String) {
+        self.fault(m);
+        self.lost.store(true, Ordering::SeqCst);
     }
 }
 
@@ -737,6 +771,7 @@ impl SoapyRx for Closed {
     fn deactivate(&mut self) -> Result<(), String> {
         Ok(())
     }
+    fn abandon(self: Box<Self>) {}
     fn read(&mut self, _: &mut [Complex<f32>], _: i64) -> Result<usize, ReadError> {
         Err(ReadError::Fatal("stream closed".into()))
     }
@@ -796,7 +831,10 @@ fn apply(
 }
 
 /// The reader thread. Exits on stop, on no receivers, or with a fault (set
-/// before the stream is deactivated); always deactivates on exit. A block
+/// before the stream is deactivated). A fatal read, a device call failing in a
+/// retune, [`QUIET_READS`] timeouts or [`MAX_OVERFLOW_RUN`] overflows mean the
+/// device is lost: the fault and `lost` are set and the stream is abandoned,
+/// with no further native call on it. Every other exit deactivates. A block
 /// that would end more than [`MAX_AHEAD_NS`] after now is not sent: the
 /// stream is reopened and reads are discarded until the wall clock passes the
 /// last block sent (`catch_up`), then the clock anchors there.
@@ -810,6 +848,9 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
     };
     let mut buf = vec![Complex::new(0.0f32, 0.0); block_len(rate.actual)];
     let mut quiet = 0u32;
+    let mut overflow_run = 0u32;
+    // Whether the device is lost, so the exit abandons the stream.
+    let mut lost = false;
     // After a restart: the end of the last block sent, which the wall clock
     // must pass before a block is sent again.
     let mut catch_up: Option<u64> = None;
@@ -853,7 +894,8 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                     let _ = cmd.ack.send(Err(RateError::Narrow(m)));
                 }
                 Err(RateError::Io(m)) => {
-                    ctx.fault(m.clone());
+                    ctx.lose(m.clone());
+                    lost = true;
                     let _ = cmd.ack.send(Err(RateError::Io(m)));
                     break;
                 }
@@ -863,6 +905,7 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
         match rx.read(&mut buf, READ_TIMEOUT_US) {
             Ok(n) if n > 0 => {
                 quiet = 0;
+                overflow_run = 0;
                 if let Some(t) = catch_up {
                     let now = now_ns();
                     if now < t {
@@ -938,19 +981,33 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                 quiet += 1;
                 ctx.status.lock().unwrap().timeouts += 1;
                 if quiet >= QUIET_READS {
-                    ctx.fault("no samples for 1000 ms (device unplugged?)".into());
+                    ctx.lose("no samples for 1000 ms (device unplugged?)".into());
+                    lost = true;
                     break;
                 }
             }
             Err(ReadError::Overflow) => {
                 ctx.status.lock().unwrap().overflows += 1;
+                overflow_run += 1;
+                if overflow_run >= MAX_OVERFLOW_RUN {
+                    ctx.lose(format!(
+                        "overflow storm: {MAX_OVERFLOW_RUN} overflows with no samples"
+                    ));
+                    lost = true;
+                    break;
+                }
                 clock.reanchor(clock.rate);
             }
             Err(ReadError::Fatal(m)) => {
-                ctx.fault(format!("read failed: {m}"));
+                ctx.lose(format!("read failed: {m}"));
+                lost = true;
                 break;
             }
         }
     }
-    let _ = rx.deactivate();
+    if lost {
+        rx.abandon();
+    } else {
+        let _ = rx.deactivate();
+    }
 }

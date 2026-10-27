@@ -12,7 +12,7 @@ use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{Claim, Hz, SourceId};
 use zeta_source_soapy::SoapySource;
 use zeta_source_soapy::mock::{MockDevice, MockRead};
-use zeta_source_soapy::source::{MAX_AHEAD_NS, MAX_RESTARTS};
+use zeta_source_soapy::source::{MAX_AHEAD_NS, MAX_OVERFLOW_RUN, MAX_RESTARTS};
 
 fn tuning(center: u64, bw: u64) -> Tuning {
     Tuning {
@@ -56,7 +56,24 @@ async fn next_block(rx: &mut IqReceiver) -> IqBlock {
 /// The reader thread's last act is `deactivate`; wait up to 500 ms for it.
 async fn assert_deactivated(dev: &MockDevice) {
     let done = wait_until(500, || {
-        dev.calls().last().map(String::as_str) == Some("deactivate")
+        dev.calls()
+            .iter()
+            .rfind(|c| *c != "drop")
+            .map(String::as_str)
+            == Some("deactivate")
+    })
+    .await;
+    assert!(done, "{:?}", dev.calls());
+}
+
+/// The reader thread's last act on a lost device is `abandon`; wait for it.
+async fn assert_abandoned(dev: &MockDevice) {
+    let done = wait_until(500, || {
+        dev.calls()
+            .iter()
+            .rfind(|c| *c != "drop")
+            .map(String::as_str)
+            == Some("abandon")
     })
     .await;
     assert!(done, "{:?}", dev.calls());
@@ -343,7 +360,96 @@ async fn retune_failure_names_the_call_and_faults() {
         "{m}"
     );
     assert!(src.fault().unwrap().contains("rate rejected"));
-    assert_deactivated(&dev).await;
+    // A failed device call in a retune is a lost device: abandon, not deactivate.
+    assert_abandoned(&dev).await;
+    assert!(!dev.calls().contains(&"deactivate".to_string()));
+}
+
+#[tokio::test]
+async fn device_loss_during_a_retune_abandons_the_stream() {
+    let mut reads = samples(1);
+    reads.extend([MockRead::Timeout, MockRead::Timeout]);
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
+    let src = source(&dev);
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    next_block(&mut rx).await;
+    dev.fail_next("set_sample_rate", "LIBUSB_ERROR_NO_DEVICE");
+    let e = src.tune(tuning(100_000_000, 2_000_000)).await.unwrap_err();
+    assert!(e.to_string().contains("LIBUSB_ERROR_NO_DEVICE"), "{e}");
+    let fault = src.fault().unwrap();
+    assert!(fault.contains("set_sample_rate"), "{fault}");
+    assert_abandoned(&dev).await;
+    assert!(!dev.calls().contains(&"deactivate".to_string()));
+    let calls = dev.calls().len();
+    let e = src.tune(tuning(100_000_000, 1_000_000)).await.unwrap_err();
+    assert!(e.to_string().contains("device lost"), "{e}");
+    assert_eq!(dev.calls().len(), calls, "no device call after the loss");
+}
+
+#[tokio::test]
+async fn vanished_device_faults_source_fails_jobs_and_is_never_touched_again() {
+    let dev = Arc::new(MockDevice::hackrf_like());
+    let src = source(&dev);
+    let (node, _dir) = node_with(src.clone()).await;
+    node.apply(passthrough()).await.unwrap();
+    let mut reads = samples(3);
+    reads.push(MockRead::Gone("LIBUSB_ERROR_NO_DEVICE".into()));
+    dev.push_reads(reads);
+    let reason = wait_failed(&node, 1_000).await;
+    assert!(
+        reason.starts_with("source sdr0: read failed") && reason.contains("NO_DEVICE"),
+        "{reason}"
+    );
+    assert_abandoned(&dev).await;
+    assert!(!dev.calls().contains(&"deactivate".to_string()));
+    assert!(
+        dev.calls_after_gone().is_empty(),
+        "{:?}",
+        dev.calls_after_gone()
+    );
+    let e = src.tune(tuning(100_000_000, 1_000_000)).await.unwrap_err();
+    assert!(e.to_string().contains("device lost"), "{e}");
+    let e = src.set_gain(Some(10.0)).await.unwrap_err();
+    assert!(e.to_string().contains("device lost"), "{e}");
+    assert!(src.fault().unwrap().contains("NO_DEVICE"));
+    assert!(dev.calls_after_gone().is_empty());
+}
+
+#[tokio::test]
+async fn an_overflow_storm_faults_the_source() {
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(vec![MockRead::Overflow; 1_000]));
+    let src = source(&dev);
+    let _rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    assert!(
+        wait_until(2_000, || src
+            .fault()
+            .is_some_and(|f| f.contains("overflow storm")))
+        .await
+    );
+    assert_eq!(src.stats().unwrap().overflows, u64::from(MAX_OVERFLOW_RUN));
+    assert_abandoned(&dev).await;
+    let e = src.tune(tuning(100_000_000, 1_000_000)).await.unwrap_err();
+    assert!(e.to_string().contains("device lost"), "{e}");
+}
+
+#[tokio::test]
+async fn interleaved_overflows_never_fault() {
+    let mut reads = Vec::new();
+    for _ in 0..300 {
+        // Paced at the 1 MHz rate so the clock guard never trips.
+        reads.extend([MockRead::Overflow, MockRead::Slow(16_384, 20)]);
+    }
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
+    let src = source(&dev);
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    for _ in 0..300 {
+        next_block(&mut rx).await;
+    }
+    assert_eq!(src.stats().unwrap().overflows, 300);
+    assert_eq!(src.fault(), None);
 }
 
 #[tokio::test]
@@ -384,11 +490,16 @@ async fn retune_timeout_faults_and_next_tune_reopens() {
 
 #[tokio::test]
 async fn t0_monotonic_across_reopen() {
-    // Ten instant blocks run 164 ms ahead of the wall clock, then the unplug.
+    // Ten instant blocks run 164 ms ahead of the wall clock, then a retune
+    // times out (a fault that is not a device loss), and the next tune reopens.
     let mut reads = samples(10);
-    reads.push(MockRead::Fatal("LIBUSB_ERROR_IO".into()));
+    reads.extend(vec![MockRead::Timeout; 3]);
     let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
-    let src = source(&dev);
+    let src = Arc::new(
+        SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
+            .unwrap()
+            .with_retune_timeout(Duration::from_millis(100)),
+    );
     let mut rx = src.subscribe();
     src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
     let mut last = None;
@@ -396,8 +507,12 @@ async fn t0_monotonic_across_reopen() {
         last = Some(next_block(&mut rx).await);
     }
     let last = last.unwrap();
-    assert!(wait_until(500, || src.fault().is_some()).await);
+    dev.delay_next("set_frequency", 300);
+    assert!(src.tune(tuning(101_000_000, 1_000_000)).await.is_err());
+    assert!(src.fault().is_some());
     dev.push_reads(samples(1));
+    // Wait out the late retune so the reader has ended before the reopen.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
     let b = next_block(&mut rx).await;
     assert!(b.t0.0 >= end_ns(&last), "{} < {}", b.t0.0, end_ns(&last));
@@ -462,6 +577,8 @@ async fn unplug_mid_stream_fails_job() {
         reason.contains("source sdr0: read failed") && reason.contains("LIBUSB_ERROR_NO_DEVICE"),
         "{reason}"
     );
+    assert_abandoned(&dev).await;
+    assert!(!dev.calls().contains(&"deactivate".to_string()));
 
     // No samples after two blocks: the mock times out (100 ms each) forever.
     let dev = Arc::new(MockDevice::hackrf_like().with_reads(samples(2)));
@@ -472,24 +589,24 @@ async fn unplug_mid_stream_fails_job() {
     assert!(reason.contains("no samples for 1000 ms"), "{reason}");
 }
 
-/// Ruling R5: the fault is set before the stream is deactivated, and a tune of
-/// the same band on a faulted port re-opens the device and clears it.
+/// Ruling R5: the fault is set before the stream is abandoned, and a lost
+/// device is not reopened by a tune: the fault stays and the tune says why.
 #[tokio::test]
-async fn fault_is_set_before_close_and_same_band_tune_recovers() {
+async fn fault_is_set_before_abandon_and_a_tune_on_a_lost_device_is_refused() {
     let dev = Arc::new(
         MockDevice::hackrf_like().with_reads(vec![MockRead::Fatal("LIBUSB_ERROR_IO".into())]),
     );
     let src = source(&dev);
-    let mut rx = src.subscribe();
+    let _rx = src.subscribe();
     src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
     let probe = src.clone();
     let dev2 = dev.clone();
-    // Whenever `deactivate` is visible, the fault must already be.
+    // Whenever `abandon` is visible, the fault must already be.
     assert!(
         wait_until(1_000, || {
-            let closed = dev2.calls().iter().any(|c| c == "deactivate");
+            let closed = dev2.calls().iter().any(|c| c == "abandon");
             if closed {
-                assert!(probe.fault().is_some(), "deactivated before the fault");
+                assert!(probe.fault().is_some(), "abandoned before the fault");
             }
             closed
         })
@@ -500,11 +617,14 @@ async fn fault_is_set_before_close_and_same_band_tune_recovers() {
             .unwrap()
             .contains("read failed: LIBUSB_ERROR_IO")
     );
-    dev.push_reads(samples(1));
-    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
-    assert_eq!(src.fault(), None);
-    let b = next_block(&mut rx).await;
-    assert_eq!(b.sample_rate_hz, Hz(1_000_000));
+    let calls = dev.calls().len();
+    let e = src.tune(tuning(100_000_000, 1_000_000)).await.unwrap_err();
+    assert!(
+        e.to_string().contains("device lost") && e.to_string().contains("LIBUSB_ERROR_IO"),
+        "{e}"
+    );
+    assert!(src.fault().is_some(), "a refused tune keeps the fault");
+    assert_eq!(dev.calls().len(), calls);
 }
 
 #[tokio::test]

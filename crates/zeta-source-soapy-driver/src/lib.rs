@@ -208,6 +208,13 @@ impl<E: StreamSample + Default + Copy + Send> SoapyRx for Rx<E> {
         }
         self.stream.deactivate(None).map_err(s)
     }
+    /// The device is gone: dropping the `RxStream` would call
+    /// `deactivateStream` and `closeStream` on a dead handle, which segfaults
+    /// in libusb. Leak it instead; one stream and device clone per unplug is
+    /// the accepted cost.
+    fn abandon(self: Box<Self>) {
+        std::mem::forget(self.stream);
+    }
     fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError> {
         if self.scratch.len() < out.len() {
             self.scratch.resize(out.len(), E::default());
