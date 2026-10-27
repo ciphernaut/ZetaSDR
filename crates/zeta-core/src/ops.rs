@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{CaptureMeta, write_cf32};
-use crate::classify::{Band, Label};
+use crate::classify::{Band, Classification, Label, Tried};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::JobRecord;
 use crate::knowledge::{Allocation, Signature};
@@ -1227,7 +1227,12 @@ pub enum OpResult {
     Mode {
         mode: Box<LoadedMode>,
     },
-    Labels(Vec<Label>),
+    /// `classify`: every classifier's labels, and the modes decode-to-identify
+    /// considered with their score and outcome.
+    Classification {
+        labels: Vec<Label>,
+        tried: Vec<Tried>,
+    },
     /// A source's gain after `source_set_gain`.
     Gain(GainInfo),
     Ok,
@@ -1325,7 +1330,7 @@ impl OpResult {
             OpResult::ChannelPlans { .. } => "channel_plans",
             OpResult::Modes { .. } => "modes",
             OpResult::Mode { .. } => "mode",
-            OpResult::Labels(_) => "labels",
+            OpResult::Classification { .. } => "classification",
             OpResult::Gain(_) => "gain",
             OpResult::Ok => "ok",
             OpResult::Schema(_) => "schema",
@@ -2191,11 +2196,11 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         offset_hz: sel.center_hz.0 as i64 - center.0 as i64,
         bandwidth_hz: sel.bandwidth_hz,
     };
-    Ok(OpResult::Labels(
-        node.classifiers()
-            .run_all(&samples, rate, center, band, None)
-            .await,
-    ))
+    let Classification { labels, tried } = node
+        .classifiers()
+        .run_all(&samples, rate, center, band, None)
+        .await;
+    Ok(OpResult::Classification { labels, tried })
 }
 
 /// Most frames and longest wait one `stream_tail` takes.

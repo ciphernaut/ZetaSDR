@@ -129,8 +129,8 @@ function resultText(r) {
       return `ok (${plural(v.length, "stream")})`;
     case "frames":
       return `ok (${plural((v && v.frames ? v.frames.length : 0), "frame")})`;
-    case "labels": {
-      const labels = Array.isArray(v) ? v : [];
+    case "classification": {
+      const labels = v && Array.isArray(v.labels) ? v.labels : [];
       const names = labels.map(labelText).join(", ");
       return `ok (${plural(labels.length, "label")}${names ? `: ${names}` : ""})`;
     }

@@ -779,7 +779,10 @@ async fn classify_op_runs_stub_and_returns_empty_labels() {
     let selection = selection(&node, 100_000_000, 48_000).await;
     assert_eq!(
         node.apply(Op::Classify { selection }).await,
-        Ok(OpResult::Labels(vec![]))
+        Ok(OpResult::Classification {
+            labels: vec![],
+            tried: vec![]
+        })
     );
 }
 

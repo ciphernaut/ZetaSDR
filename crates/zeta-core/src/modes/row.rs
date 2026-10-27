@@ -18,8 +18,10 @@ use crate::stage::StageRegistry;
 #[serde(transparent)]
 pub struct ModeId(pub String);
 
-/// The group a mode is listed under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// The group a mode is listed under; ordered as declared (the tie-break of equal scores).
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[schemars(rename = "ModeFamily")]
 pub enum Family {
@@ -81,6 +83,14 @@ pub struct Band {
     /// The narrowest `bandwidth_hz` a job may give the mode; `null` for no minimum.
     #[serde(default)]
     pub min_hz: Option<u64>,
+}
+
+impl Band {
+    /// Whether a box `bandwidth_hz` wide is wide enough for this mode: its `min_hz`,
+    /// else its `bandwidth_hz`, is no wider.
+    pub fn fits(&self, bandwidth_hz: u64) -> bool {
+        self.min_hz.unwrap_or(self.bandwidth_hz) <= bandwidth_hz
+    }
 }
 
 /// The decoder: a graph template, or an external program.

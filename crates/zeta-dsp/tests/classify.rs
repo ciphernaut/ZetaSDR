@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use num_complex::Complex;
-use zeta_core::classify::Label;
+use zeta_core::classify::{Classification, Label, Outcome};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::port::Port;
@@ -43,7 +43,7 @@ async fn node_over(dir: &std::path::Path, iq: &[Complex<f32>]) -> Node {
         modes_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
-    for c in zeta_dsp::classifiers() {
+    for c in zeta_dsp::classifiers(node.modes()) {
         node.add_classifier(c);
     }
     src.start();
@@ -64,21 +64,112 @@ async fn node_over(dir: &std::path::Path, iq: &[Complex<f32>]) -> Node {
 
 /// `Op::Classify` over the first 2 s of `file0`, band `center_hz ± bandwidth_hz/2`.
 async fn classify(node: &Node, center_hz: u64, bandwidth_hz: u64) -> Vec<Label> {
+    classify_span(node, center_hz, bandwidth_hz, 2_000_000_000)
+        .await
+        .labels
+}
+
+/// `Op::Classify` over the first `span_ns` of `file0`: the labels and what was tried.
+async fn classify_span(
+    node: &Node,
+    center_hz: u64,
+    bandwidth_hz: u64,
+    span_ns: u64,
+) -> Classification {
     let selection = Selection {
         source: SourceId("file0".into()),
         span: Span {
             start_ns: Timestamp(0),
-            end_ns: Timestamp(2_000_000_000),
+            end_ns: Timestamp(span_ns),
         },
         center_hz: Hz(center_hz),
         bandwidth_hz: Hz(bandwidth_hz),
     };
-    let labels = match node.apply(Op::Classify { selection }).await {
-        Ok(OpResult::Labels(labels)) => labels,
-        other => panic!("expected labels, got {other:?}"),
+    let c = match node.apply(Op::Classify { selection }).await {
+        Ok(OpResult::Classification { labels, tried }) => Classification { labels, tried },
+        other => panic!("expected a classification, got {other:?}"),
     };
-    eprintln!("labels at {center_hz}: {labels:?}");
-    labels
+    eprintln!("classification at {center_hz}: {c:?}");
+    c
+}
+
+/// The outcome `tried` lists for `mode`, if it lists it.
+fn outcome(c: &Classification, mode: &str) -> Option<Outcome> {
+    c.tried.iter().find(|t| t.mode == mode).map(|t| t.outcome)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classify_reports_what_it_tried() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
+    assert_eq!(outcome(&c, "aprs_decode"), Some(Outcome::Proved), "{c:?}");
+    assert_eq!(
+        outcome(&c, "pocsag_decode"),
+        Some(Outcome::NoFrame),
+        "{c:?}"
+    );
+    let aprs = c
+        .labels
+        .iter()
+        .find(|l| l.layer == 2 && l.name == "APRS")
+        .unwrap_or_else(|| panic!("{c:?}"));
+    assert_eq!(aprs.confidence, 1.0);
+    assert!(
+        aprs.evidence.starts_with("decode aprs_decode: "),
+        "{aprs:?}"
+    );
+    // Highest score first.
+    assert!(
+        c.tried.windows(2).all(|w| w[0].score >= w[1].score),
+        "{c:?}"
+    );
+    assert_eq!(c.tried[0].mode, "aprs_decode", "{c:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_short_selection_reports_skipped_span_and_a_layer1_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 12_500, 500_000_000).await;
+    assert!(!c.tried.is_empty(), "{c:?}");
+    assert!(
+        c.tried.iter().all(|t| t.outcome == Outcome::SkippedSpan),
+        "{c:?}"
+    );
+    assert_eq!(c.labels.iter().filter(|l| l.layer == 1).count(), 1, "{c:?}");
+    assert!(
+        !c.labels.iter().any(|l| l.evidence.starts_with("decode ")),
+        "{c:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn program_rows_are_skipped_quick() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
+    let adsb = outcome(&c, "adsb_decode");
+    assert!(
+        matches!(adsb, Some(Outcome::SkippedQuick | Outcome::SkippedBand)),
+        "{c:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wide_rows_are_skipped_on_a_narrow_box() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
+    assert_eq!(
+        outcome(&c, "rds_decode"),
+        Some(Outcome::SkippedBand),
+        "{c:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -135,7 +135,7 @@ mod tests {
             .iter()
             .find(|s| s.name == "APRS")
             .expect("APRS present");
-        assert_eq!(aprs.decoder.as_deref(), Some("aprs"));
+        assert_eq!(aprs.decoder.as_deref(), Some("aprs_decode"));
         assert!(k.signatures(Hz(100_000_000), Hz(25_000)).await.is_empty());
     }
 

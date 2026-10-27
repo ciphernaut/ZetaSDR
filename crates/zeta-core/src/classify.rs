@@ -34,6 +34,43 @@ pub struct Label {
     pub evidence: String,
 }
 
+/// What became of one mode a decode classifier considered: `proved` (its quick
+/// decode passed its own check), `no_frame` (tried, nothing decoded), or why it was
+/// not tried: `skipped_band` (the mode needs a wider band than the selection),
+/// `skipped_span` (the selection is shorter than the mode's `min_span_ms`),
+/// `skipped_quick` (the mode has no quick in-process attempt; `identify` tries it),
+/// `unavailable` (its program is not on this host).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Proved,
+    NoFrame,
+    SkippedBand,
+    SkippedSpan,
+    SkippedQuick,
+    Unavailable,
+}
+
+/// One mode a decode classifier considered, with its score and outcome.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct Tried {
+    pub mode: String,
+    pub score: f32,
+    pub outcome: Outcome,
+}
+
+/// A classifier run's result: every label, and the modes decode-to-identify
+/// considered in the order it considered them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct Classification {
+    pub labels: Vec<Label>,
+    pub tried: Vec<Tried>,
+}
+
 /// The band a classifier analyses within an IQ block: its centre's offset
 /// from the block centre (negative below) and its width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,10 +120,10 @@ pub trait Classifier: Send + Sync {
 
     /// [`Classifier::classify`] given `measured`, an earlier classifier's
     /// measurement of the same band, and returning the classifier's own
-    /// measurement when it made one. The default ignores `measured` and
-    /// measures nothing; a classifier that measures the band overrides this
-    /// to return it, and one that needs a measurement overrides it to use
-    /// `measured` instead of measuring again.
+    /// measurement when it made one and the modes it tried. The default
+    /// ignores `measured`, measures nothing and tries nothing; a classifier
+    /// that measures the band overrides this to return it, and one that needs
+    /// a measurement overrides it to use `measured` instead of measuring again.
     async fn classify_measured(
         &self,
         iq: &[Complex<f32>],
@@ -95,11 +132,12 @@ pub trait Classifier: Send + Sync {
         band: Band,
         features: Option<&FeatureRecord>,
         _measured: Option<&Measurement>,
-    ) -> (Vec<Label>, Option<Measurement>) {
+    ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
         (
             self.classify(iq, sample_rate_hz, center_hz, band, features)
                 .await,
             None,
+            Vec::new(),
         )
     }
 }
@@ -140,7 +178,7 @@ impl ClassifierSet {
     /// Every classifier's labels for `band` of `iq` (a block centred at
     /// `center_hz`), lowest layer first; registration order within a layer.
     /// The first [`Measurement`] a classifier returns is passed to every
-    /// classifier after it.
+    /// classifier after it; the modes each tried are listed in the same order.
     pub async fn run_all(
         &self,
         iq: &[Complex<f32>],
@@ -148,13 +186,13 @@ impl ClassifierSet {
         center_hz: Hz,
         band: Band,
         features: Option<&FeatureRecord>,
-    ) -> Vec<Label> {
+    ) -> Classification {
         let mut ordered: Vec<&Arc<dyn Classifier>> = self.classifiers.iter().collect();
         ordered.sort_by_key(|c| c.layer());
-        let mut labels = Vec::new();
+        let mut out = Classification::default();
         let mut measured: Option<Measurement> = None;
         for c in ordered {
-            let (l, m) = c
+            let (l, m, t) = c
                 .classify_measured(
                     iq,
                     sample_rate_hz,
@@ -164,12 +202,13 @@ impl ClassifierSet {
                     measured.as_ref(),
                 )
                 .await;
-            labels.extend(l);
+            out.labels.extend(l);
+            out.tried.extend(t);
             if measured.is_none() {
                 measured = m;
             }
         }
-        labels
+        out
     }
 }
 
@@ -251,7 +290,7 @@ mod tests {
             _: Band,
             _: Option<&FeatureRecord>,
             _: Option<&Measurement>,
-        ) -> (Vec<Label>, Option<Measurement>) {
+        ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
             let l = label(1, "wfm");
             (
                 vec![l.clone()],
@@ -259,6 +298,7 @@ mod tests {
                     features: self.0.clone(),
                     label: l,
                 }),
+                Vec::new(),
             )
         }
     }
@@ -289,9 +329,14 @@ mod tests {
             _: Band,
             _: Option<&FeatureRecord>,
             measured: Option<&Measurement>,
-        ) -> (Vec<Label>, Option<Measurement>) {
+        ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
             self.0.lock().unwrap().push(measured.cloned());
-            (Vec::new(), None)
+            let tried = Tried {
+                mode: "uses_decode".into(),
+                score: 0.5,
+                outcome: Outcome::NoFrame,
+            };
+            (Vec::new(), None, vec![tried])
         }
     }
 
@@ -310,10 +355,17 @@ mod tests {
         set.register(uses.clone());
         set.register(Arc::new(Measures(marker.clone())));
         set.register(Arc::new(StubClassifier));
-        let labels = set
+        let c = set
             .run_all(&[], Hz(240_000), Hz(0), Band::whole(Hz(240_000)), None)
             .await;
-        assert_eq!(labels, [label(1, "wfm")]);
+        assert_eq!(c.labels, [label(1, "wfm")]);
+        // The modes a classifier tried are collected beside the labels.
+        assert_eq!(c.tried.len(), 1);
+        assert_eq!(c.tried[0].mode, "uses_decode");
+        assert_eq!(
+            serde_json::to_value(&c.tried[0]).unwrap()["outcome"],
+            "no_frame"
+        );
         let seen = uses.0.lock().unwrap();
         assert_eq!(seen.len(), 1);
         let m = seen[0].as_ref().expect("layer 2 was handed a measurement");
@@ -331,6 +383,7 @@ mod tests {
         let names: Vec<String> = set
             .run_all(&[], Hz(48_000), Hz(0), Band::whole(Hz(48_000)), None)
             .await
+            .labels
             .into_iter()
             .map(|l| l.name)
             .collect();

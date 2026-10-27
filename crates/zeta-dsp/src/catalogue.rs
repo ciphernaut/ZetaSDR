@@ -3,13 +3,14 @@
 //! and modulations, served as a knowledge provider and used by a layer-2
 //! classifier that names a measured signal.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use num_complex::Complex;
 use serde::Deserialize;
-use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement};
+use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, Tried};
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
+use zeta_core::modes::{ModeRegistry, ModeState};
 use zeta_core::types::Hz;
 
 use crate::measure::measure_selection;
@@ -88,27 +89,29 @@ fn overlaps(min: Hz, max: Hz, center: Hz, bandwidth: Hz) -> bool {
     min.0 <= center.0.saturating_add(half) && max.0 >= center.0.saturating_sub(half)
 }
 
-/// The job kind that proves catalogue entry `entry_id` by decoding it.
-pub fn decoder_for(entry_id: &str) -> Option<&'static str> {
-    if entry_id.starts_with("pocsag") || entry_id.starts_with("pager-pocsag") {
-        return Some("pocsag_decode");
-    }
-    if entry_id.starts_with("aprs") || entry_id.starts_with("automatic-packet-reporting-system") {
-        return Some("aprs_decode");
-    }
-    match entry_id {
-        "ads-b" | "automatic-dependent-surveillance-broadcast-ads-b" => Some("adsb_decode"),
-        "acars" | "aircraft-communications-addressing-and-reporting-system-acar" => {
-            Some("acars_decode")
-        }
-        "radio-data-system-rds" => Some("rds_decode"),
-        _ => None,
-    }
+/// The catalogue as a knowledge provider: one signature per frequency range
+/// overlapping the queried band; no allocations. A signature's `decoder` is the
+/// mode that proves the entry: the `ready` or `unavailable` row of `modes` whose
+/// `catalogue` lists the entry's id (`None` when no row does).
+pub struct CatalogueKnowledge {
+    modes: Arc<ModeRegistry>,
 }
 
-/// The catalogue as a knowledge provider: one signature per frequency range
-/// overlapping the queried band; no allocations.
-pub struct CatalogueKnowledge;
+impl CatalogueKnowledge {
+    pub fn new(modes: Arc<ModeRegistry>) -> CatalogueKnowledge {
+        CatalogueKnowledge { modes }
+    }
+
+    /// The id of the row that proves catalogue entry `entry_id`.
+    fn decoder(&self, entry_id: &str) -> Option<String> {
+        self.modes
+            .all()
+            .iter()
+            .filter(|m| matches!(m.state, ModeState::Ready | ModeState::Unavailable))
+            .find(|m| m.row.catalogue.iter().any(|c| c == entry_id))
+            .map(|m| m.row.id.0.clone())
+    }
+}
 
 #[async_trait]
 impl KnowledgeProvider for CatalogueKnowledge {
@@ -139,7 +142,7 @@ impl KnowledgeProvider for CatalogueKnowledge {
                         bandwidth_hz: e.bandwidth_max_hz.unwrap_or(Hz(0)),
                         modulation: e.modulations.first().cloned().unwrap_or_default(),
                         symbol_rate_baud: None,
-                        decoder: decoder_for(&e.id).map(str::to_string),
+                        decoder: self.decoder(&e.id),
                     })
             })
             .collect()
@@ -240,6 +243,17 @@ fn score(
     (s > FREQ_SCORE).then_some((s, bw, modulation))
 }
 
+/// Catalogue entry `entry_id`'s score (0-1) for a signal centred at `center_hz`,
+/// `bandwidth_hz` wide and labelled `layer1`, as [`catalogue_labels`] scores it; 0
+/// for an entry that does not qualify or is not in the catalogue.
+pub fn catalogue_score(entry_id: &str, center_hz: u64, bandwidth_hz: u64, layer1: &str) -> f32 {
+    catalogue()
+        .iter()
+        .find(|e| e.id == entry_id)
+        .and_then(|e| score(e, center_hz, bandwidth_hz, layer1))
+        .map_or(0.0, |(s, _, _)| (s as f32 / 10.0).min(1.0))
+}
+
 /// Width of the narrowest frequency range of `e` holding `center_hz`, the
 /// tie-break among equal scores: the more specific allocation first.
 fn narrowest_range(e: &CatalogueEntry, center_hz: u64) -> u64 {
@@ -321,7 +335,7 @@ impl Classifier for CatalogueClassifier {
         band: Band,
         features: Option<&FeatureRecord>,
         measured: Option<&Measurement>,
-    ) -> (Vec<Label>, Option<Measurement>) {
+    ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
         let own;
         let m = match measured {
             Some(m) => m,
@@ -330,16 +344,17 @@ impl Classifier for CatalogueClassifier {
                     own = Measurement { features, label };
                     &own
                 }
-                None => return (Vec::new(), None),
+                None => return (Vec::new(), None, Vec::new()),
             },
         };
         if m.label.name == "noise" {
-            return (Vec::new(), None);
+            return (Vec::new(), None, Vec::new());
         }
         let f = features.unwrap_or(&m.features);
         (
             catalogue_labels(f.center_hz.0, f.bandwidth_hz.0, &m.label.name),
             None,
+            Vec::new(),
         )
     }
 }

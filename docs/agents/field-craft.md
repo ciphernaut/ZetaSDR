@@ -27,7 +27,7 @@ Where to find them:
 2. Start one `acars_decode` per channel inside it. They share the capture.
 3. Start `adsb_decode` on a second source. A radio serves one band at a time, so on one radio it must wait until the ACARS jobs are stopped.
 
-`knowledge_lookup` says which decoder proves a band's signature (`decoder` names the job kind). `classify` tries APRS, POCSAG and ACARS on narrow bands and RDS on wide ones, as decode-to-identify; it never attempts ADS-B (use `adsb_decode`). A CRC-clean decode is the strongest layer 2 evidence there is. A signature match without one is a guess: say so.
+`knowledge_lookup` says which decoder proves a band's signature (`decoder` names the mode id, the job kind; `null` when no mode proves it yet). `classify` tries the best-scoring modes with a quick attempt (APRS, POCSAG, ACARS, RDS) as decode-to-identify and lists each under `tried` with its outcome; it never runs a program row such as ADS-B (`skipped_quick`: use `adsb_decode`). A CRC-clean decode is the strongest layer 2 evidence there is. A signature match without one is a guess: say so.
 
 ### Remote HF receivers (KiwiSDR)
 

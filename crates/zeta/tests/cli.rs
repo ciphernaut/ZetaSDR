@@ -1729,8 +1729,12 @@ fn classify_names_the_wfm_fixture_fm_broadcast_radio() {
     .stdout
     .clone();
     let v = json(&out);
-    assert_eq!(v["result"], "labels", "{v}");
-    let labels = v["value"].as_array().expect("labels array");
+    assert_eq!(v["result"], "classification", "{v}");
+    let labels = v["value"]["labels"].as_array().expect("labels array");
+    // A 0.5 s span is shorter than every row's `min_span_ms`.
+    let tried = v["value"]["tried"].as_array().expect("tried array");
+    assert!(!tried.is_empty(), "{v}");
+    assert!(tried.iter().all(|t| t["outcome"] == "skipped_span"), "{v}");
     assert!(
         labels
             .iter()

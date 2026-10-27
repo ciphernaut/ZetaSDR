@@ -1,9 +1,9 @@
 [
-  {"name": "APRS", "min_hz": 144800000, "max_hz": 144800000, "bandwidth_hz": 12500, "modulation": "AFSK", "symbol_rate_baud": 1200, "decoder": "aprs"},
-  {"name": "APRS-US", "min_hz": 144390000, "max_hz": 144390000, "bandwidth_hz": 12500, "modulation": "AFSK", "symbol_rate_baud": 1200, "decoder": "aprs"},
-  {"name": "POCSAG", "min_hz": 148000000, "max_hz": 149000000, "bandwidth_hz": 12500, "modulation": "2-FSK", "symbol_rate_baud": 1200, "decoder": "pocsag"},
-  {"name": "ADS-B", "min_hz": 1090000000, "max_hz": 1090000000, "bandwidth_hz": 2000000, "modulation": "PPM", "symbol_rate_baud": 1000000, "decoder": "adsb"},
-  {"name": "RS41", "min_hz": 400000000, "max_hz": 406000000, "bandwidth_hz": 10000, "modulation": "GFSK", "symbol_rate_baud": 4800, "decoder": "rs41"},
+  {"name": "APRS", "min_hz": 144800000, "max_hz": 144800000, "bandwidth_hz": 12500, "modulation": "AFSK", "symbol_rate_baud": 1200, "decoder": "aprs_decode"},
+  {"name": "APRS-US", "min_hz": 144390000, "max_hz": 144390000, "bandwidth_hz": 12500, "modulation": "AFSK", "symbol_rate_baud": 1200, "decoder": "aprs_decode"},
+  {"name": "POCSAG", "min_hz": 148000000, "max_hz": 149000000, "bandwidth_hz": 12500, "modulation": "2-FSK", "symbol_rate_baud": 1200, "decoder": "pocsag_decode"},
+  {"name": "ADS-B", "min_hz": 1090000000, "max_hz": 1090000000, "bandwidth_hz": 2000000, "modulation": "PPM", "symbol_rate_baud": 1000000, "decoder": "adsb_decode"},
+  {"name": "RS41", "min_hz": 400000000, "max_hz": 406000000, "bandwidth_hz": 10000, "modulation": "GFSK", "symbol_rate_baud": 4800, "decoder": null},
   {"name": "MeshCore-AU", "min_hz": 915000000, "max_hz": 928000000, "bandwidth_hz": 250000, "modulation": "LoRa", "symbol_rate_baud": null, "decoder": null},
   {"name": "MeshCore-EU", "min_hz": 869400000, "max_hz": 869650000, "bandwidth_hz": 250000, "modulation": "LoRa", "symbol_rate_baud": null, "decoder": null}
 ]

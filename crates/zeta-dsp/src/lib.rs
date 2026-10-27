@@ -74,11 +74,12 @@ pub fn gpu_available() -> bool {
     }
 }
 
-/// This crate's classifiers, lowest layer first.
-pub fn classifiers() -> Vec<Arc<dyn Classifier>> {
+/// This crate's classifiers, lowest layer first; decode-to-identify tries the rows of
+/// `modes`.
+pub fn classifiers(modes: Arc<zeta_core::modes::ModeRegistry>) -> Vec<Arc<dyn Classifier>> {
     vec![
         Arc::new(measure::Layer1Classifier),
-        Arc::new(identify::DecodeToIdentify),
+        Arc::new(identify::DecodeToIdentify::new(modes)),
         Arc::new(catalogue::CatalogueClassifier),
     ]
 }

@@ -22,7 +22,9 @@
 //                                             while the band is unknown), the top layer-2
 //                                             label one line under the last of them; every
 //                                             label is listed in the transcript as
-//                                             `L<layer> <name> <confidence>`
+//                                             `L<layer> <name> <confidence>`, then each
+//                                             mode decode-to-identify considered as
+//                                             `tried <mode> <score> <outcome>`
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
 //   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
 //                                             bandwidth_hz at least POCSAG_MIN_BANDWIDTH_HZ
@@ -303,7 +305,12 @@ class Menu {
     if (action === "classify") {
       this.t.note("classify: running…");
       const r = await this.applyOp({ op: "classify", selection });
-      if (r && r.result === "labels") this.showLabels(s, r.value || []);
+      if (r && r.result === "classification" && r.value) {
+        this.showLabels(s, r.value.labels || []);
+        for (const t of r.value.tried || []) {
+          this.t.note(`tried ${t.mode} ${Number(t.score).toFixed(2)} ${t.outcome}`);
+        }
+      }
     } else if (action === "iq_read") {
       const r = await this.applyOp({ op: "iq_read", selection });
       if (r && r.result === "iq" && r.value) {

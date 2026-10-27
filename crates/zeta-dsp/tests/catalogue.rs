@@ -9,9 +9,7 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::types::Hz;
-use zeta_dsp::catalogue::{
-    CatalogueClassifier, CatalogueKnowledge, catalogue, catalogue_labels, decoder_for,
-};
+use zeta_dsp::catalogue::{CatalogueClassifier, CatalogueKnowledge, catalogue, catalogue_labels};
 use zeta_dsp::fixtures::{awgn, nbfm_modulate, tone, wfm_modulate};
 
 const WFM_RATE: u64 = 240_000;
@@ -91,7 +89,7 @@ async fn catalogue_uses_a_handed_measurement_without_measuring() {
         },
     };
     let band = Band::whole(Hz(WFM_RATE));
-    let (labels, own) = CatalogueClassifier
+    let (labels, own, _) = CatalogueClassifier
         .classify_measured(&[], Hz(WFM_RATE), Hz(104_900_000), band, None, Some(&m))
         .await;
     assert!(own.is_none());
@@ -110,7 +108,7 @@ async fn catalogue_uses_a_handed_measurement_without_measuring() {
         },
         ..m
     };
-    let (labels, _) = CatalogueClassifier
+    let (labels, _, _) = CatalogueClassifier
         .classify_measured(&[], Hz(WFM_RATE), Hz(104_900_000), band, None, Some(&noise))
         .await;
     assert!(labels.is_empty(), "{labels:?}");
@@ -165,8 +163,8 @@ async fn knowledge_lookup_returns_catalogue_signatures() {
         bank_factory: None,
         modes_dir: None,
     };
-    let node = Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap();
-    node.add_knowledge(Arc::new(CatalogueKnowledge));
+    let node = Node::open(cfg, stages(), vec![]).await.unwrap();
+    node.add_knowledge(Arc::new(CatalogueKnowledge::new(node.modes())));
     let op = Op::KnowledgeLookup {
         region: "AU".into(),
         center_hz: Hz(104_900_000),
@@ -236,8 +234,8 @@ async fn lookup(center_hz: u64, bandwidth_hz: u64) -> Vec<zeta_core::knowledge::
         bank_factory: None,
         modes_dir: None,
     };
-    let node = Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap();
-    node.add_knowledge(Arc::new(CatalogueKnowledge));
+    let node = Node::open(cfg, stages(), vec![]).await.unwrap();
+    node.add_knowledge(Arc::new(CatalogueKnowledge::new(node.modes())));
     let op = Op::KnowledgeLookup {
         region: "AU".into(),
         center_hz: Hz(center_hz),
@@ -270,23 +268,48 @@ async fn signatures_name_their_decoder_job_kind() {
     assert_eq!(fm.decoder, None);
 }
 
+/// The DSP stages, so the graph rows validate.
+fn stages() -> StageRegistry {
+    let mut reg = StageRegistry::new();
+    zeta_dsp::register_all(&mut reg);
+    reg
+}
+
 #[test]
-fn decoder_table_covers_near_duplicate_ids() {
-    for id in ["pocsag", "pocsag-2", "pager-pocsag-1200"] {
-        assert_eq!(decoder_for(id), Some("pocsag_decode"), "{id}");
-    }
-    for id in ["ads-b", "automatic-dependent-surveillance-broadcast-ads-b"] {
-        assert_eq!(decoder_for(id), Some("adsb_decode"), "{id}");
-    }
-    for id in [
-        "acars",
-        "aircraft-communications-addressing-and-reporting-system-acar",
+fn rows_cover_every_catalogue_id_the_old_table_did() {
+    let modes = zeta_core::modes::ModeRegistry::load(&stages(), None);
+    let row_for = |id: &str| {
+        modes
+            .all()
+            .iter()
+            .find(|m| m.row.catalogue.iter().any(|c| c == id))
+            .map(|m| m.row.id.0.clone())
+    };
+    for (ids, mode) in [
+        (
+            &["pocsag", "pocsag-2", "pager-pocsag-1200"][..],
+            "pocsag_decode",
+        ),
+        (
+            &["ads-b", "automatic-dependent-surveillance-broadcast-ads-b"][..],
+            "adsb_decode",
+        ),
+        (
+            &[
+                "acars",
+                "aircraft-communications-addressing-and-reporting-system-acar",
+            ][..],
+            "acars_decode",
+        ),
+        (&["radio-data-system-rds"][..], "rds_decode"),
+        (
+            &["aprs", "automatic-packet-reporting-system-aprs"][..],
+            "aprs_decode",
+        ),
     ] {
-        assert_eq!(decoder_for(id), Some("acars_decode"), "{id}");
+        for id in ids {
+            assert_eq!(row_for(id).as_deref(), Some(mode), "{id}");
+        }
     }
-    assert_eq!(decoder_for("radio-data-system-rds"), Some("rds_decode"));
-    for id in ["aprs", "automatic-packet-reporting-system-aprs"] {
-        assert_eq!(decoder_for(id), Some("aprs_decode"), "{id}");
-    }
-    assert_eq!(decoder_for("fm-broadcast"), None);
+    assert_eq!(row_for("fm-broadcast"), None);
 }

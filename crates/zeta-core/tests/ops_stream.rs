@@ -295,7 +295,10 @@ fn variant_name_matches_the_serialised_tag() {
             allocations: vec![],
             signatures: vec![],
         },
-        OpResult::Labels(vec![]),
+        OpResult::Classification {
+            labels: vec![],
+            tried: vec![],
+        },
         OpResult::Ok,
         OpResult::Schema(serde_json::json!({})),
     ];

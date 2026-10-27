@@ -404,9 +404,11 @@ pub async fn open_with(
         s.start();
     }
     node.add_knowledge(Arc::new(StaticKnowledge::builtin()));
-    node.add_knowledge(Arc::new(zeta_dsp::catalogue::CatalogueKnowledge));
+    node.add_knowledge(Arc::new(zeta_dsp::catalogue::CatalogueKnowledge::new(
+        node.modes(),
+    )));
     node.add_classifier(Arc::new(StubClassifier));
-    for c in zeta_dsp::classifiers() {
+    for c in zeta_dsp::classifiers(node.modes()) {
         node.add_classifier(c);
     }
     Ok((node, remotes))
