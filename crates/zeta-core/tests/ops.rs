@@ -1926,7 +1926,7 @@ fn source_list_schema_has_a_nullable_bank() {
         .filter_map(Value::as_str)
         .collect();
     req.sort();
-    assert_eq!(req, ["bin_hz", "consumers"], "{bank}");
+    assert_eq!(req, ["bin_hz", "consumers", "dropped"], "{bank}");
     assert_eq!(bank["additionalProperties"], Value::Bool(false), "{bank}");
 }
 

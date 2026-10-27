@@ -37,7 +37,8 @@ pub enum Op {
     /// capture, see `job_start`), `pin` (the band `source_pin` holds the source
     /// at, `null` for none), `fault`, the source's unrecoverable failure (`null` when
     /// healthy), `bank`, the channel bank shared by the capture's channels
-    /// (`bin_hz`, `consumers`; `null` for none), `gain`, the overall receive
+    /// (`bin_hz`, `consumers`, `dropped`, the input blocks it dropped because it could
+    /// not keep up; `null` for none), `gain`, the overall receive
     /// gain (`db`, `null` while automatic; `min_db`, `max_db`, `automatic`,
     /// `automatic_available`; `null` for a source without adjustable gain), and
     /// `stats`, the stream's counters since it opened (`measured_rate_hz`, the
@@ -1038,6 +1039,8 @@ pub struct SourceInfo {
 pub struct BankInfo {
     pub bin_hz: u64,
     pub consumers: usize,
+    /// Input blocks the bank dropped at its full queue, cumulative.
+    pub dropped: u64,
 }
 
 /// One frame of a `stream_tail`, as JSON. `source`, `job`, `channel` and
@@ -1725,6 +1728,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                     bank: node.bank(&id).map(|b| BankInfo {
                         bin_hz: b.bin_hz(),
                         consumers: b.consumers(),
+                        dropped: b.dropped(),
                     }),
                     gain: node.port(&id).and_then(|p| p.gain()),
                     stats: node.port(&id).and_then(|p| p.stats()),

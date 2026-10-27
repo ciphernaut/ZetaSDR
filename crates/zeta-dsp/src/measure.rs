@@ -726,15 +726,23 @@ fn nullable_bandwidth(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
+/// A window cut short is emitted as `partial: true` when it holds at least
+/// this many seconds of samples (and at least [`SIZE`] samples).
+pub const MIN_PARTIAL_S: f64 = 0.25;
+
 /// Accumulates IQ until it holds at least one second (`rate_hz` samples),
 /// then emits one Event for that window: its [`FeatureRecord`] fields plus
-/// `"label"`, its [`layer1_label`], with the provenance span covering the
-/// window. A change of sample rate or centre frequency, or a discontinuity in
-/// time (a block whose `t0` is more than one sample away from where the window
-/// expects it, e.g. after the stage lagged and frames were skipped), discards
-/// the partial window without an event and starts a new window from that
-/// block, so a window never stitches across a gap; a partial window left when
-/// the input closes is not measured.
+/// `"label"`, its [`layer1_label`], and `"partial": false`, with the
+/// provenance span covering the window. A change of sample rate or centre
+/// frequency, a discontinuity in time (a block whose `t0` is more than one
+/// sample away from where the window expects it) or a lag of the input cuts
+/// the window short: it is emitted with `"partial": true` and a span of just
+/// its samples when it holds at least [`MIN_PARTIAL_S`] of them (and
+/// [`SIZE`] samples), else discarded, and a new window starts from the next
+/// block, so a window never stitches across a gap. Each discard and partial is
+/// noted to the job as `{"measure": {"discarded", "partial", "last"}}`
+/// (`last`: `gap`, `lag` or `retune`; counts cumulative for the run). A window
+/// left when the input closes is not measured.
 pub struct MeasureStage {
     spec: StageSpec,
 }
@@ -775,7 +783,7 @@ impl Stage for MeasureStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let p: MeasureParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("measure params: {e}")))?;
@@ -785,14 +793,34 @@ impl Stage for MeasureStage {
         // Window under construction: first frame's provenance, t0, rate, centre.
         let mut window: Option<(Provenance, Timestamp, u64, u64)> = None;
         let mut buf: Vec<Complex<f32>> = Vec::new();
+        let (mut discarded, mut partials) = (0u64, 0u64);
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
+            // Cut the window short for `why`: a partial event, or a discard.
+            let mut cut = |window: &mut Option<(Provenance, Timestamp, u64, u64)>,
+                           buf: &mut Vec<Complex<f32>>,
+                           why: &str|
+             -> Result<Vec<Frame>, StageError> {
+                let taken = window.take();
+                let held = std::mem::take(buf);
+                let Some((prov, t0, rate, center)) = taken else {
+                    return Ok(Vec::new());
+                };
+                let enough =
+                    held.len() >= (rate as f64 * MIN_PARTIAL_S) as usize && held.len() >= SIZE;
+                let event = if enough {
+                    partials += 1;
+                    Some(window_event(&held, &p, &out, prov, t0, rate, center, true)?)
+                } else {
+                    discarded += 1;
+                    None
+                };
+                ctx.note(serde_json::json!({"measure": {
+                    "discarded": discarded, "partial": partials, "last": why}}));
+                Ok(event.into_iter().collect())
+            };
             let frame = match input {
                 Input::Frame(f) => f,
-                Input::Lagged { .. } => {
-                    window = None;
-                    buf.clear();
-                    return Ok(Vec::new());
-                }
+                Input::Lagged { .. } => return cut(&mut window, &mut buf, "lag"),
             };
             let Payload::Iq(block) = &frame.payload else {
                 return Err(StageError::Failed("measure stage expects iq frames".into()));
@@ -806,35 +834,54 @@ impl Stage for MeasureStage {
                 let tolerance = 1_000_000_000u128.div_ceil(rate.max(1) as u128);
                 (block.t0.0 as u128).abs_diff(expected) > tolerance
             });
-            if gap
-                || window
-                    .as_ref()
-                    .is_some_and(|w| (w.2, w.3) != (rate, center))
-            {
-                window = None;
-                buf.clear();
-            }
+            let retune = window
+                .as_ref()
+                .is_some_and(|w| (w.2, w.3) != (rate, center));
+            let mut events = if retune {
+                cut(&mut window, &mut buf, "retune")?
+            } else if gap {
+                cut(&mut window, &mut buf, "gap")?
+            } else {
+                Vec::new()
+            };
             let (prov, t0, _, _) = window
                 .get_or_insert_with(|| (frame.provenance.clone(), block.t0, rate, center))
                 .clone();
             buf.extend_from_slice(&block.samples);
             if rate == 0 || (buf.len() as u64) < rate {
-                return Ok(Vec::new());
+                return Ok(events);
             }
-            let f = measure_band(&buf, rate, center, p.bandwidth_hz.unwrap_or(rate));
-            let label = layer1_label(&f, &buf, rate);
-            let mut ev = serde_json::to_value(&f)
-                .map_err(|e| StageError::Failed(format!("measure: {e}")))?;
-            ev["label"] = serde_json::to_value(&label)
-                .map_err(|e| StageError::Failed(format!("measure: {e}")))?;
-            let mut prov = prov;
-            prov.span = frame_span(t0, buf.len(), rate);
+            events.push(window_event(&buf, &p, &out, prov, t0, rate, center, false)?);
             window = None;
             buf.clear();
-            Ok(vec![Frame::new(out.clone(), prov, Payload::Event(ev))])
+            Ok(events)
         })
         .await
     }
+}
+
+/// The event for the window `buf` (first sample at `t0`): measured band,
+/// layer-1 label and `partial`, spanning exactly its samples.
+#[allow(clippy::too_many_arguments)]
+fn window_event(
+    buf: &[Complex<f32>],
+    p: &MeasureParams,
+    out: &StreamId,
+    mut prov: Provenance,
+    t0: Timestamp,
+    rate: u64,
+    center: u64,
+    partial: bool,
+) -> Result<Frame, StageError> {
+    let f = measure_band(buf, rate, center, p.bandwidth_hz.unwrap_or(rate));
+    let label = layer1_label(&f, buf, rate);
+    let mut ev =
+        serde_json::to_value(&f).map_err(|e| StageError::Failed(format!("measure: {e}")))?;
+    ev["label"] =
+        serde_json::to_value(&label).map_err(|e| StageError::Failed(format!("measure: {e}")))?;
+    ev["partial"] = partial.into();
+    prov.span = frame_span(t0, buf.len(), rate);
+    Ok(Frame::new(out.clone(), prov, Payload::Event(ev)))
 }
 
 #[cfg(test)]
@@ -1112,6 +1159,8 @@ mod tests {
         let mut ev = ev.clone();
         let label: Label = serde_json::from_value(ev["label"].take()).unwrap();
         ev.as_object_mut().unwrap().remove("label");
+        assert_eq!(ev["partial"], false);
+        ev.as_object_mut().unwrap().remove("partial");
         assert_eq!(ev["symbol_rate_baud"], serde_json::Value::Null);
         let rec: FeatureRecord = serde_json::from_value(ev).unwrap();
         eprintln!(
@@ -1127,10 +1176,13 @@ mod tests {
         assert!(matches!(h.await.unwrap(), Ok(())));
     }
 
-    #[tokio::test]
-    async fn measure_stage_discards_window_on_gap() {
-        use zeta_core::port::IqBlock;
-        use zeta_core::types::{Provenance, SourceId, Span, Timestamp};
+    /// Run a measure stage over `sends` (a script of frames and pauses) with a
+    /// broadcast input of `cap`; its events and the notes it made.
+    async fn run_stage(
+        cap: usize,
+        script: impl FnOnce(broadcast::Sender<Frame>, Provenance) -> futures_script::Script,
+    ) -> (Vec<Frame>, Vec<serde_json::Value>) {
+        use zeta_core::types::{SourceId, Span, Timestamp};
         let prov = Provenance {
             source: SourceId("s".into()),
             job: None,
@@ -1140,10 +1192,14 @@ mod tests {
                 end_ns: Timestamp(1),
             },
         };
-        let bus = Arc::new(StreamBus::new(8));
+        let bus = Arc::new(StreamBus::new(16));
         let out = bus.register(StreamKind::Event, prov.clone());
         let mut rx_out = bus.subscribe(&out).unwrap();
-        let (tx, rx_in) = broadcast::channel(32);
+        let (tx, rx_in) = broadcast::channel(cap);
+        let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = notes.clone();
+        let ctx = zeta_core::stage::StageContext::new(SourceId("s".into()))
+            .with_note(Arc::new(move |v| sink.lock().unwrap().push(v)));
         let h = tokio::spawn(async move {
             MeasureStage::new()
                 .run(
@@ -1152,99 +1208,130 @@ mod tests {
                     vec![out],
                     bus,
                     CancellationToken::new(),
-                    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
+                    ctx,
                 )
                 .await
         });
-        let mut iq = vec![Complex::new(0.0f32, 0.0); 16 * 4_800];
-        awgn(&mut iq, 0.0, 2);
-        // 5 contiguous 100 ms blocks from 1 s, then a block 1 s late, then
-        // 10 contiguous blocks after it.
-        let pre_gap = 1_000_000_000u64;
-        let post_gap = pre_gap + 5 * 100_000_000 + 1_000_000_000;
-        let t0s = (0..5)
-            .map(|i| pre_gap + i * 100_000_000)
-            .chain((0..11).map(|i| post_gap + i * 100_000_000));
-        for (block, t0) in iq.chunks(4_800).zip(t0s) {
-            tx.send(Frame::new(
-                StreamId::new(),
-                prov.clone(),
-                Payload::Iq(IqBlock {
-                    t0: Timestamp(t0),
-                    sample_rate_hz: Hz(RATE),
-                    center_hz: Hz(CENTER),
-                    samples: block.to_vec().into(),
-                }),
-            ))
-            .unwrap();
-        }
-        let f = rx_out.recv().await.unwrap();
-        assert_eq!(f.provenance.span.start_ns, Timestamp(post_gap));
-        assert_eq!(
-            f.provenance.span.end_ns,
-            Timestamp(post_gap + 1_000_000_000)
-        );
-        drop(tx);
+        script(tx, prov).await;
         assert!(matches!(h.await.unwrap(), Ok(())));
+        let mut events = Vec::new();
+        while let Ok(f) = rx_out.try_recv() {
+            events.push(f);
+        }
+        let notes = notes.lock().unwrap().clone();
+        (events, notes)
+    }
+
+    mod futures_script {
+        pub type Script = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    }
+
+    fn iq_frame(prov: &Provenance, t0: u64, block: &[Complex<f32>]) -> Frame {
+        use zeta_core::port::IqBlock;
+        use zeta_core::types::Timestamp;
+        Frame::new(
+            StreamId::new(),
+            prov.clone(),
+            Payload::Iq(IqBlock {
+                t0: Timestamp(t0),
+                sample_rate_hz: Hz(RATE),
+                center_hz: Hz(CENTER),
+                samples: block.to_vec().into(),
+            }),
+        )
+    }
+
+    fn tone_blocks(n: usize) -> Vec<Vec<Complex<f32>>> {
+        let mut iq = crate::util::nco(n * 4_800, 5_000.0, RATE as f64);
+        awgn(&mut iq, 20.0, 2);
+        iq.chunks(4_800).map(|c| c.to_vec()).collect()
+    }
+
+    fn span_ns(f: &Frame) -> u64 {
+        f.provenance.span.end_ns.0 - f.provenance.span.start_ns.0
     }
 
     #[tokio::test]
-    async fn measure_stage_discards_window_on_lag() {
-        use zeta_core::port::IqBlock;
-        use zeta_core::types::{Provenance, SourceId, Span, Timestamp};
-        let prov = Provenance {
-            source: SourceId("s".into()),
-            job: None,
-            channel: None,
-            span: Span {
-                start_ns: Timestamp(0),
-                end_ns: Timestamp(1),
-            },
+    async fn measure_stage_emits_a_partial_on_gap() {
+        let blocks = tone_blocks(16);
+        let pre = 1_000_000_000u64;
+        // 5 blocks (0.5 s), a 10 ms gap, then 10 blocks (1 s).
+        let post = pre + 500_000_000 + 10_000_000;
+        let (events, notes) = run_stage(32, |tx, prov| {
+            Box::pin(async move {
+                for (i, b) in blocks.iter().take(5).enumerate() {
+                    tx.send(iq_frame(&prov, pre + i as u64 * 100_000_000, b))
+                        .unwrap();
+                }
+                for (i, b) in blocks.iter().skip(5).take(10).enumerate() {
+                    tx.send(iq_frame(&prov, post + i as u64 * 100_000_000, b))
+                        .unwrap();
+                }
+            })
+        })
+        .await;
+        assert_eq!(events.len(), 2);
+        let Payload::Event(first) = &events[0].payload else {
+            panic!("event")
         };
-        let bus = Arc::new(StreamBus::new(8));
-        let out = bus.register(StreamKind::Event, prov.clone());
-        let mut rx_out = bus.subscribe(&out).unwrap();
-        let (tx, rx_in) = broadcast::channel(8);
-        let h = tokio::spawn(async move {
-            MeasureStage::new()
-                .run(
-                    serde_json::json!({"bandwidth_hz": null}),
-                    vec![rx_in],
-                    vec![out],
-                    bus,
-                    CancellationToken::new(),
-                    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
-                )
-                .await
-        });
-        let mut iq = vec![Complex::new(0.0f32, 0.0); 14 * 4_800];
-        awgn(&mut iq, 0.0, 3);
-        let mk = |i: u64, block: &[Complex<f32>]| {
-            Frame::new(
-                StreamId::new(),
-                prov.clone(),
-                Payload::Iq(IqBlock {
-                    t0: Timestamp(1_000_000_000 + i * 100_000_000),
-                    sample_rate_hz: Hz(RATE),
-                    center_hz: Hz(CENTER),
-                    samples: block.to_vec().into(),
-                }),
-            )
+        assert_eq!(first["partial"], true);
+        assert!(span_ns(&events[0]).abs_diff(500_000_000) <= 100_000_000);
+        let Payload::Event(second) = &events[1].payload else {
+            panic!("event")
         };
-        let blocks: Vec<_> = iq.chunks(4_800).collect();
-        // 0.5 s held, then a lag, then 0.8 s more with contiguous timestamps:
-        // 1.3 s in total, but only if the lag did not discard the window.
-        for (i, b) in blocks.iter().enumerate().take(5) {
-            tx.send(mk(i as u64, b)).unwrap();
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        tx.send(mk(5, blocks[5])).unwrap(); // overwritten
-        for i in 5..13 {
-            tx.send(mk(i, blocks[i as usize])).unwrap();
-        }
-        drop(tx);
-        assert!(matches!(h.await.unwrap(), Ok(())));
-        assert!(rx_out.try_recv().is_err(), "no event spans the lag");
+        assert_eq!(second["partial"], false);
+        assert_eq!(events[1].provenance.span.start_ns.0, post);
+        assert_eq!(span_ns(&events[1]), 1_000_000_000);
+        assert_eq!(
+            notes.last().unwrap(),
+            &serde_json::json!({"measure": {"discarded": 0, "partial": 1, "last": "gap"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn measure_stage_drops_a_short_remainder_on_lag() {
+        let blocks = tone_blocks(10);
+        let (events, notes) = run_stage(8, |tx, prov| {
+            Box::pin(async move {
+                tx.send(iq_frame(&prov, 1_000_000_000, &blocks[0])).unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Nine sends into a queue of 8: the receiver lags by one.
+                for (i, b) in blocks.iter().skip(1).take(9).enumerate() {
+                    tx.send(iq_frame(&prov, 2_000_000_000 + i as u64 * 100_000_000, b))
+                        .unwrap();
+                }
+            })
+        })
+        .await;
+        assert!(events.is_empty(), "0.1 s is under MIN_PARTIAL_S");
+        assert_eq!(
+            notes.last().unwrap(),
+            &serde_json::json!({"measure": {"discarded": 1, "partial": 0, "last": "lag"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_window_spans_its_samples() {
+        let blocks = tone_blocks(4);
+        // 0.3 s, then a block 1 s late: the 0.3 s remainder is a partial.
+        let (events, _) = run_stage(16, |tx, prov| {
+            Box::pin(async move {
+                for (i, b) in blocks.iter().take(3).enumerate() {
+                    tx.send(iq_frame(&prov, 1_000_000_000 + i as u64 * 100_000_000, b))
+                        .unwrap();
+                }
+                tx.send(iq_frame(&prov, 3_000_000_000, &blocks[3])).unwrap();
+            })
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(span_ns(&events[0]), 300_000_000);
+        assert_eq!(events[0].provenance.span.start_ns.0, 1_000_000_000);
+        let Payload::Event(ev) = &events[0].payload else {
+            panic!("event")
+        };
+        assert_eq!(ev["partial"], true);
+        assert!(ev["snr_db"].as_f64().is_some());
     }
 
     /// [`measure_selection`] calls made by `f` on this thread.

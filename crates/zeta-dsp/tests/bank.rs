@@ -577,3 +577,125 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
     .await;
     assert_eq!(node.bank(&port.id).unwrap().band(), moved);
 }
+
+/// A measure job on a bank whose input skips one block of time every 400 ms
+/// (no unbroken second ever arrives) still emits, as partial windows, and
+/// notes them in its context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn measure_emits_partials_when_the_input_gaps_every_400_ms() {
+    use zeta_core::node::{Node, NodeConfig};
+    use zeta_core::ops::{JobKind, Op, OpResult};
+    use zeta_core::port::Tuning;
+    use zeta_core::stage::{Backend, StageRegistry};
+    use zeta_core::types::{Capabilities, Claim, SampleFormat};
+
+    const RATE_HZ: u64 = 2_048_000;
+    const CENTER_HZ: u64 = 27_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = StageRegistry::new();
+    zeta_dsp::register_all(&mut reg);
+    let cfg = NodeConfig {
+        state_dir: dir.path().join("state"),
+        ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
+        backends: vec![Backend::Cpu],
+        resume: true,
+        bank_factory: Some(Arc::new(PfbBankFactory)),
+    };
+    let node = Node::open(cfg, reg, vec![]).await.unwrap();
+    let port = Arc::new(Retunable {
+        id: SourceId("cb".into()),
+        caps: Capabilities {
+            tune_min_hz: Claim::Asserted(Hz(1_000_000)),
+            tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
+            max_bandwidth_hz: Claim::Asserted(Hz(RATE_HZ)),
+            formats: vec![SampleFormat::Cf32],
+            channels: 1,
+            rx: true,
+            tx: false,
+            remote: false,
+            push: false,
+        },
+        band: Mutex::new(Tuning {
+            center_hz: Hz(CENTER_HZ),
+            bandwidth_hz: Hz(RATE_HZ),
+        }),
+        tx: broadcast::channel(64).0,
+    });
+    node.add_port(port.clone()).unwrap();
+    let tone_hz = CENTER_HZ + 100_000;
+    let tx = port.tx.clone();
+    tokio::spawn(async move {
+        let block_ns = BLOCK as u64 * 1_000_000_000 / RATE_HZ;
+        let per_400ms = (400_000_000 / block_ns) as usize;
+        let mut tick = tokio::time::interval(Duration::from_nanos(block_ns));
+        let mut skipped = 0u64;
+        for n in 0usize.. {
+            tick.tick().await;
+            if n > 0 && n % per_400ms == 0 {
+                skipped += 1;
+            }
+            let samples: Vec<Complex<f32>> = (0..BLOCK as u64)
+                .map(|k| {
+                    let i = (n * BLOCK) as u64 + k;
+                    let ph = 2.0
+                        * std::f64::consts::PI
+                        * ((i as f64) * 100_000.0 / RATE_HZ as f64).fract();
+                    Complex::from_polar(0.5, ph as f32)
+                })
+                .collect();
+            let _ = tx.send(IqBlock {
+                t0: Timestamp(T0 + (n as u64 + skipped) * block_ns),
+                sample_rate_hz: Hz(RATE_HZ),
+                center_hz: Hz(CENTER_HZ),
+                samples: samples.into(),
+            });
+        }
+    });
+    let id = match node
+        .apply(Op::JobStart {
+            kind: JobKind::Measure,
+            source: port.id.clone(),
+            center_hz: Hz(tone_hz),
+            bandwidth_hz: Hz(12_500),
+            deviation_hz: None,
+            sideband: None,
+            elastic: false,
+            replace: vec![],
+        })
+        .await
+    {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("job_start: {r:?}"),
+    };
+    let stream = node
+        .bus()
+        .list()
+        .into_iter()
+        .find(|s| s.kind == StreamKind::Event && s.provenance.job.as_ref() == Some(&id))
+        .expect("the job's event stream");
+    let mut rx = node.bus().subscribe(&stream.id).unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match rx.recv().await {
+                Ok(f) => return f,
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("event stream: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a measure event within 4 s despite the gaps");
+    let Payload::Event(ev) = &frame.payload else {
+        panic!("expected an event")
+    };
+    assert_eq!(ev["partial"], true);
+    let span = frame.provenance.span;
+    assert!(span.end_ns.0 - span.start_ns.0 < 1_000_000_000);
+    let ctx = node.job_context(&id).expect("job listed");
+    assert!(
+        ctx["measure"]["partial"].as_u64().unwrap_or(0) >= 1,
+        "context {ctx}"
+    );
+}

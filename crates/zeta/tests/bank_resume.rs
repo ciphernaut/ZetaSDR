@@ -158,6 +158,7 @@ async fn fresh_channels_take_the_bank() {
         Some(BankInfo {
             bin_hz: 256_000,
             consumers: CHANNELS,
+            dropped: 0,
         })
     );
     tokio::time::sleep(Duration::from_secs(3)).await;
