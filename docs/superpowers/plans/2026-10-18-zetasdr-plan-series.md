@@ -95,7 +95,7 @@ Deferred:
   skip can leave a mid-launch elastic job on a stale fit until the next retune; `stages_running`
   counts forwarders and scan loops and `debug_stage_count` backs a production field (rename);
   the soak test is sequential and was never shown failing; about 230 lines of helpers are copied
-  into `runs.rs`; a stop inside the record-to-done window returns before release; a stop during an
+  into `runs.rs`; a stop during an
   elastic relaunch returns while the relaunch task still holds the lease (a `graph_put` in that
   window is refused `Stopped`).
 - Task 3: a rate 0 window of 1024 or more samples can reach `measure_band` when cut; the gap test

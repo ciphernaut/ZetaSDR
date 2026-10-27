@@ -51,7 +51,7 @@ Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acc
 
 ## Bug: a refused `graph_put` persists its graph
 
-A `graph_put` that loses a race with another put on the same job returns an error, but its graph is already in the record (`graph_get` and a restart use it). Found in plan 14 review, pre-existing. Fix: persist after a successful launch.
+A `graph_put` that loses a race with another put on the same job returns an error, but its graph is already in the record (`graph_get` and a restart use it). Found in plan 14 review, pre-existing. Fix: under the jobs lock, refuse before persisting when the entry is `Running` again after this put's stop.
 
 ## Feature: stereo for `wfm_demod`
 
