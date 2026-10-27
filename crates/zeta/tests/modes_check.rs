@@ -178,3 +178,65 @@ fn check_is_local_only() {
             .contains("modes check"),
     );
 }
+
+/// A malformed synth block (a pocsag function-0 page with alphabetic text, an ICAO over 24
+/// bits) is that row's `fail`, not a crash: the other rows are still checked and no
+/// scratch directory is left in the state dir.
+#[test]
+fn a_bad_synth_block_fails_its_row_and_the_rest_still_run() {
+    let dir = tempfile::tempdir().unwrap();
+    write_row(
+        dir.path(),
+        "aprs_badpage",
+        serde_json::json!({
+            "kind": "synth", "family": "pocsag", "address": 1, "function": 0,
+            "text": "HELLO", "baud": 1200,
+            "expect": {}, "within_ms": 1000
+        }),
+    );
+    write_row(
+        dir.path(),
+        "aprs_badicao",
+        serde_json::json!({
+            "kind": "synth", "family": "modes_ident", "icao": 16777216, "callsign": "ZETA01",
+            "repeats": 1, "expect": {}, "within_ms": 1000
+        }),
+    );
+    let (out, code) = stdout(&mut check(dir.path(), &[]));
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("aprs_badpage: fail: ") && l.contains("not numeric")),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("aprs_badicao: fail: ") && l.contains("24 bits")),
+        "{out}"
+    );
+    assert!(out.lines().any(|l| l == "aprs_decode: ok"), "{out}");
+    assert_eq!(code, 1);
+    let left: Vec<_> = std::fs::read_dir(dir.path().join("state"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("check-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// `modes check` writes the state dir, so a running `zeta serve` refuses it like any
+/// mutating one-shot.
+#[test]
+fn check_is_refused_while_serve_owns_the_state_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let pid = std::process::id();
+    std::fs::write(state.join("serve.lock"), pid.to_string()).unwrap();
+    let out = check(dir.path(), &[]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains(&format!("zeta serve (pid {pid}) owns this state dir")),
+        "{text}"
+    );
+}

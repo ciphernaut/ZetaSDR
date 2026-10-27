@@ -57,9 +57,6 @@ async fn main() -> ExitCode {
     if let cli::Command::Ops(cli::OpsCmd::Tail { lines }) = cli.command {
         return tail_log(&state_dir, "ops.log", lines, |_| true);
     }
-    if let cli::Command::Modes(cli::ModesCmd::Check { id, strict }) = cli.command {
-        return modes_check::run(state_dir, cli.modes_dir, id, strict).await;
-    }
     if let cli::Command::Transcripts(cli::TranscriptsCmd::Tail { lines, job }) = cli.command {
         return tail_log(&state_dir, "transcripts.log", lines, |line| {
             job.as_deref().is_none_or(|id| {
@@ -68,13 +65,20 @@ async fn main() -> ExitCode {
             })
         });
     }
-    if cli.command.mutates()
+    if (cli.command.mutates()
+        || matches!(
+            cli.command,
+            cli::Command::Modes(cli::ModesCmd::Check { .. })
+        ))
         && let Some(pid) = serve_lock::owner(&state_dir)
     {
         let e = OpError::Other {
             message: format!("zeta serve (pid {pid}) owns this state dir"),
         };
         return print(serde_json::to_string_pretty(&e), 2);
+    }
+    if let cli::Command::Modes(cli::ModesCmd::Check { id, strict }) = cli.command {
+        return modes_check::run(state_dir, cli.modes_dir, &plugins, id, strict).await;
     }
     let (serve_args, speech_args, secret) = (
         match &cli.command {

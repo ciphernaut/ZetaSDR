@@ -277,7 +277,12 @@ impl ModeRegistry {
         let mut checked = read_checked(path);
         checked.insert(id.to_string(), at);
         let json = serde_json::to_vec_pretty(&checked).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        // Write beside it, then rename: a reader sees the old file or the new one whole.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)
     }
 
     /// One stderr line per broken row: `zeta: mode <id> (<file>): <field>: <error>`.
@@ -366,6 +371,11 @@ mod tests {
             .filter_map(|m| m.checked.map(|t| (m.row.id.0.clone(), t)))
             .collect();
         assert_eq!(seen, [("adsb_decode".to_string(), 200)]);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["modes-checked.json"], "no temp file left behind");
         std::fs::write(&path, "garbage").unwrap();
         modes.load_checked(&path);
         assert!(modes.all().iter().all(|m| m.checked.is_none()), "bad file");

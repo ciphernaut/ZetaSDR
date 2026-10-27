@@ -192,18 +192,28 @@ pub fn afsk1200_modulate(bits: &[u8], audio_rate_hz: u32) -> Vec<f32> {
     out
 }
 
-/// Split `CALL` or `CALL-SSID`; panics on an invalid call (fixtures only).
-fn parse_call(s: &str) -> (&str, u8) {
+/// Split `CALL` or `CALL-SSID`; the reason when it is not a valid AX.25 call.
+fn check_call(s: &str) -> Result<(&str, u8), String> {
     let (call, ssid) = match s.split_once('-') {
-        Some((c, n)) => (c, n.parse::<u8>().expect("ax25: bad SSID")),
+        Some((c, n)) => (
+            c,
+            n.parse::<u8>()
+                .map_err(|_| format!("ax25: bad SSID in {s:?}"))?,
+        ),
         None => (s, 0),
     };
-    assert!(
-        !call.is_empty() && call.len() <= 6 && call.is_ascii(),
-        "ax25: bad callsign {s:?}"
-    );
-    assert!(ssid <= 15, "ax25: SSID {ssid} > 15");
-    (call, ssid)
+    if call.is_empty() || call.len() > 6 || !call.is_ascii() {
+        return Err(format!("ax25: bad callsign {s:?}"));
+    }
+    if ssid > 15 {
+        return Err(format!("ax25: SSID {ssid} > 15"));
+    }
+    Ok((call, ssid))
+}
+
+/// [`check_call`]; panics on an invalid call (fixtures only).
+fn parse_call(s: &str) -> (&str, u8) {
+    check_call(s).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// An AX.25 UI frame: destination, source, then digipeaters (each 6 space-padded
@@ -767,6 +777,57 @@ pub struct Impairments {
 const NOISE_SEED: u64 = 0x5EED;
 
 impl SynthSpec {
+    /// Check the parameters the generators assert on, so a bad row reads as an error,
+    /// not a panic: AX.25 calls, POCSAG baud, function and numeric text, the Mode S
+    /// ICAO (24 bits) and callsign (at most 8 characters of the Mode S set).
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            SynthSpec::Aprs { src, dst, .. } => {
+                check_call(src)?;
+                check_call(dst)?;
+            }
+            SynthSpec::Pocsag {
+                function,
+                text,
+                baud,
+                ..
+            } => {
+                if !crate::pocsag::BAUDS.contains(baud) {
+                    return Err(format!("pocsag: {baud} baud is not standard"));
+                }
+                if *function > 3 {
+                    return Err(format!("pocsag: function {function} > 3"));
+                }
+                if *function == 0
+                    && let Some(c) = text.chars().find(|c| !"0123456789*U -)(".contains(*c))
+                {
+                    return Err(format!(
+                        "pocsag: {c:?} is not numeric (function 0 is numeric; use 3 for text)"
+                    ));
+                }
+            }
+            SynthSpec::ModesIdent { icao, callsign, .. } => {
+                if *icao > 0xFF_FFFF {
+                    return Err(format!("icao {icao} is over 24 bits"));
+                }
+                if callsign.len() > 8 {
+                    return Err("callsign is at most 8 characters".into());
+                }
+                if let Some(c) = callsign
+                    .bytes()
+                    .find(|c| *c == b'#' || !MODES_CHARS.contains(c))
+                {
+                    return Err(format!(
+                        "{:?} is not in the Mode S character set",
+                        c as char
+                    ));
+                }
+            }
+            SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
+        }
+        Ok(())
+    }
+
     /// The sample rate the family's capture is synthesised at: the one each decoder is
     /// proven at (APRS, POCSAG and ACARS at 48 kHz, which the `channel` stage divides
     /// down; RDS at 240 kHz; Mode S at 2.4 MHz; a bare NBFM tone at 48 kHz).
@@ -793,7 +854,8 @@ pub fn parse_params(
         }
     }
     let imp = serde_json::from_value(imp.into()).map_err(|e| e.to_string())?;
-    let spec = serde_json::from_value(params.into()).map_err(|e| e.to_string())?;
+    let spec: SynthSpec = serde_json::from_value(params.into()).map_err(|e| e.to_string())?;
+    spec.validate()?;
     Ok((spec, imp))
 }
 

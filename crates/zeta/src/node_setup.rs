@@ -262,12 +262,31 @@ pub async fn open(
     modes_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
 ) -> Result<(Node, RemotePorts), String> {
-    let opts = FileOpts {
-        realtime: true,
-        block_samples: 4800,
-        repeat: true,
-        tune_range: None,
-    };
+    let (registry, modes, modes_dir) = load_modes(&state_dir, plugins, speech, modes_dir).await?;
+    open_with(
+        state_dir,
+        registry,
+        modes,
+        modes_dir,
+        sources,
+        resume,
+        ring_budget_mb,
+    )
+    .await
+}
+
+/// The stage registry (built-ins, `transcribe` on `speech`, each probed `--plugin`) and
+/// the mode rows validated against it: `load`, the checked times of `state_dir`, one
+/// stderr line per broken row, the handler report ([`probe_handlers`]), and the registry
+/// handle `external_decode` reads the rows through filled. Also the operator directory
+/// used (`modes_dir`, else the default). Used by [`open`] and by `zeta modes check`,
+/// which opens many nodes on one loading.
+pub async fn load_modes(
+    state_dir: &Path,
+    plugins: &[PluginSpec],
+    speech: Option<Arc<dyn SpeechBackend>>,
+    modes_dir: Option<PathBuf>,
+) -> Result<(StageRegistry, Arc<ModeRegistry>, Option<PathBuf>), String> {
     let handle = ModesHandle::default();
     let registry = with_plugins(plugins, speech, &handle, &state_dir.join("run")).await?;
     // The rows validate against every stage (`external_decode` and the plugins
@@ -275,7 +294,7 @@ pub async fn open(
     // before the stages and the node share it.
     let modes_dir = modes_dir.or_else(zeta_core::modes::default_operator_dir);
     let mut modes = ModeRegistry::load(&registry, modes_dir.as_deref());
-    modes.load_checked(&checked_path(&state_dir));
+    modes.load_checked(&checked_path(state_dir));
     for line in modes.startup_lines() {
         eprintln!("{line}");
     }
@@ -284,6 +303,26 @@ pub async fn open(
     }
     let modes = Arc::new(modes);
     let _ = handle.set(modes.clone());
+    Ok((registry, modes, modes_dir))
+}
+
+/// [`open`] on rows already loaded by [`load_modes`] (their registry and the operator
+/// directory it used).
+pub async fn open_with(
+    state_dir: PathBuf,
+    registry: StageRegistry,
+    modes: Arc<ModeRegistry>,
+    modes_dir: Option<PathBuf>,
+    sources: &[SourceSpec],
+    resume: bool,
+    ring_budget_mb: Option<u64>,
+) -> Result<(Node, RemotePorts), String> {
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: None,
+    };
     let mut files = Vec::new();
     let mut ports: Vec<Arc<dyn Port>> = Vec::new();
     let mut remotes = RemotePorts::default();

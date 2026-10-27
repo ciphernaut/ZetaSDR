@@ -135,7 +135,7 @@ pub trait Stage: Send + Sync {
     ) -> Result<(), StageError>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StageRegistry {
     stages: Vec<Arc<dyn Stage>>,
 }

@@ -2,8 +2,10 @@
 //! synthesised (or fixture) capture and print one line per row. Local only: it opens its
 //! own nodes, one per row, in a scratch directory under the state directory.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -12,10 +14,9 @@ use zeta_core::job::JobState;
 use zeta_core::modes::{Decoder, LoadedMode, ModeRegistry, ModeState, RowTest, TestSpec};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::types::{Hz, SourceId, StreamKind, Timestamp};
-use zeta_ext::ModesHandle;
 
 use crate::node_setup;
-use crate::sources::SourceSpec;
+use crate::sources::{PluginSpec, SourceSpec};
 
 /// The source id every check's node attaches the capture as.
 const SOURCE: &str = "check";
@@ -29,6 +30,15 @@ const STREAM_WAIT: Duration = Duration::from_secs(2);
 
 /// The longest one `stream_tail` waits (`TAIL_MAX_TIMEOUT_MS`).
 const TAIL_MAX_MS: u64 = 10_000;
+
+/// What every row's check shares: the rows and stage registry one loading produced
+/// (plugins probed once), cloned into each row's node.
+struct Ctx {
+    state_dir: PathBuf,
+    registry: zeta_core::stage::StageRegistry,
+    modes: Arc<ModeRegistry>,
+    modes_dir: Option<PathBuf>,
+}
 
 /// How one row's check ended.
 enum Outcome {
@@ -44,11 +54,18 @@ enum Outcome {
 pub async fn run(
     state_dir: PathBuf,
     modes_dir: Option<PathBuf>,
+    plugins: &[PluginSpec],
     only: Option<String>,
     strict: bool,
 ) -> ExitCode {
-    let modes_dir = modes_dir.or_else(zeta_core::modes::default_operator_dir);
-    let modes = load(&state_dir, modes_dir.as_deref()).await;
+    let (registry, modes, modes_dir) =
+        match node_setup::load_modes(&state_dir, plugins, None, modes_dir).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("zeta: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
     if let Some(id) = &only
         && modes.get(id).is_none()
     {
@@ -58,13 +75,20 @@ pub async fn run(
         );
         return ExitCode::FAILURE;
     }
+    let ctx = Ctx {
+        state_dir,
+        registry,
+        modes: modes.clone(),
+        modes_dir,
+    };
+    let state_dir = &ctx.state_dir;
     let mut failed = false;
     for m in modes.all() {
         let id = &m.row.id.0;
         if only.as_ref().is_some_and(|o| o != id) {
             continue;
         }
-        let outcome = check_row(m, &state_dir, modes_dir.as_deref(), strict).await;
+        let outcome = check_row(m, &ctx, strict).await;
         let line = match &outcome {
             Outcome::Ok => format!("{id}: ok"),
             Outcome::Fail(why) => format!("{id}: fail: {why}"),
@@ -77,8 +101,8 @@ pub async fn run(
                     let at = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
-                    let recorded = std::fs::create_dir_all(&state_dir).and_then(|()| {
-                        ModeRegistry::record_checked(&node_setup::checked_path(&state_dir), id, at)
+                    let recorded = std::fs::create_dir_all(state_dir).and_then(|()| {
+                        ModeRegistry::record_checked(&node_setup::checked_path(state_dir), id, at)
                     });
                     if let Err(e) = recorded {
                         eprintln!("zeta: modes-checked.json: {e}");
@@ -96,24 +120,8 @@ pub async fn run(
     }
 }
 
-/// The rows as a node would hold them, programs probed: the stage registry the rows
-/// validate against, `load`, the checked times, and [`node_setup::probe_handlers`].
-async fn load(state_dir: &Path, modes_dir: Option<&Path>) -> ModeRegistry {
-    let handle = ModesHandle::default();
-    let stages = node_setup::registry(None, &handle, None);
-    let mut modes = ModeRegistry::load(&stages, modes_dir);
-    modes.load_checked(&node_setup::checked_path(state_dir));
-    node_setup::probe_handlers(&mut modes).await;
-    modes
-}
-
 /// One row's outcome: refused or skipped before any node is opened, else run.
-async fn check_row(
-    m: &LoadedMode,
-    state_dir: &Path,
-    modes_dir: Option<&Path>,
-    strict: bool,
-) -> Outcome {
+async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
     if m.state == ModeState::Broken {
         return Outcome::Fail(m.reason.clone().unwrap_or_default());
     }
@@ -131,9 +139,11 @@ async fn check_row(
             Outcome::Skipped(why)
         };
     }
-    let scratch = state_dir.join(format!("check-{}-{}", std::process::id(), m.row.id.0));
+    let scratch = ctx
+        .state_dir
+        .join(format!("check-{}-{}", std::process::id(), m.row.id.0));
     let outcome = match std::fs::create_dir_all(&scratch) {
-        Ok(()) => run_test(m, test, &scratch, modes_dir).await,
+        Ok(()) => run_test(m, test, &scratch, ctx).await,
         Err(e) => Outcome::Fail(format!("{}: {e}", scratch.display())),
     };
     let _ = std::fs::remove_dir_all(&scratch);
@@ -142,12 +152,7 @@ async fn check_row(
 
 /// Run `test` of row `m` on a node over its capture, with `scratch` as the node's state
 /// directory parent.
-async fn run_test(
-    m: &LoadedMode,
-    test: &RowTest,
-    scratch: &Path,
-    modes_dir: Option<&Path>,
-) -> Outcome {
+async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> Outcome {
     let (capture, center_hz) = match capture(m, test, scratch) {
         Ok(c) => c,
         Err(why) => return Outcome::Fail(why),
@@ -157,13 +162,13 @@ async fn run_test(
         path: capture,
         tune_range: None,
     };
-    let opened = node_setup::open(
+    let opened = node_setup::open_with(
         scratch.join("state"),
+        ctx.registry.clone(),
+        ctx.modes.clone(),
+        ctx.modes_dir.clone(),
         &[source],
-        &[],
         false,
-        None,
-        modes_dir.map(Path::to_path_buf),
         None,
     )
     .await;
@@ -218,7 +223,19 @@ fn capture(m: &LoadedMode, test: &RowTest, scratch: &Path) -> Result<(PathBuf, u
                     .copied()
                     .unwrap_or(DEFAULT_CENTER_HZ),
             );
-            let iq = zeta_dsp::synth::synthesise(&spec, &imp, rate, center);
+            // The generators assert on what `parse_params` does not catch: a panic is a
+            // failed row, not a dead check.
+            let iq = catch_unwind(AssertUnwindSafe(|| {
+                zeta_dsp::synth::synthesise(&spec, &imp, rate, center)
+            }))
+            .map_err(|p| {
+                let why = p
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| p.downcast_ref::<&str>().copied())
+                    .unwrap_or("panic");
+                format!("synthesis failed: {why}")
+            })?;
             let meta = CaptureMeta {
                 sample_rate_hz: Hz(u64::from(rate)),
                 center_hz: Hz(center),
