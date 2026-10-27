@@ -34,7 +34,11 @@ struct Radio {
     hold: AtomicBool,
     permits: tokio::sync::Semaphore,
     tx: broadcast::Sender<IqBlock>,
+    /// Called on every `idle` (under the source's gate), when set.
+    on_idle: OnIdle,
 }
+
+type OnIdle = Mutex<Option<Box<dyn Fn() + Send + Sync>>>;
 
 impl Radio {
     fn new() -> Arc<Self> {
@@ -57,6 +61,7 @@ impl Radio {
             hold: AtomicBool::new(false),
             permits: tokio::sync::Semaphore::new(0),
             tx: broadcast::channel(1).0,
+            on_idle: Mutex::new(None),
         })
     }
 }
@@ -85,6 +90,11 @@ impl Port for Radio {
     }
     fn subscribe(&self) -> IqReceiver {
         self.tx.subscribe()
+    }
+    async fn idle(&self) {
+        if let Some(f) = &*self.on_idle.lock().unwrap() {
+            f();
+        }
     }
 }
 
@@ -243,7 +253,9 @@ async fn wait_until(ms: u64, mut f: impl FnMut() -> bool) -> bool {
 /// Two `graph_put`s of one running job at once, over and over: the stages linger
 /// after cancel, so while one put's stop waits on the old run the other's stop
 /// finds the job already `Stopped`, returns at once and launches. Once the job
-/// stops, no run is left: no stage task, no stream, no lease.
+/// stops, no run is left: no stage task, no stream, no lease. Throughout, an old run's
+/// supervisor never takes the radio from the new one: the port is never idled while
+/// the job is recorded `Running`, and each round ends with the job holding its lease.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_graph_puts_leave_one_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -266,6 +278,19 @@ async fn concurrent_graph_puts_leave_one_run() {
         OpResult::Graph(g) => g,
         r => panic!("graph_get: {r:?}"),
     };
+    // Idled under the gate, so no lease can be granted meanwhile: a `Running` record
+    // then is a run whose lease another run's supervisor released.
+    let idled_under_a_run = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let (node, id, n) = (Arc::downgrade(&node), id.clone(), idled_under_a_run.clone());
+        *radio.on_idle.lock().unwrap() = Some(Box::new(move || {
+            if let Some(node) = node.upgrade()
+                && record(&node, &id).state == JobState::Running
+            {
+                n.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+    }
     let rt = tokio::runtime::Handle::current();
     for round in 0..ROUNDS {
         // Two OS threads released together by a spin barrier, so both puts read the
@@ -294,7 +319,19 @@ async fn concurrent_graph_puts_leave_one_run() {
         // One wins; the other may be refused while the winner's run is live.
         assert!(a.is_ok() || b.is_ok(), "round {round}: {a:?} {b:?}");
         assert_eq!(record(&node, &id).state, JobState::Running, "round {round}");
+        let holders: Vec<JobId> = node
+            .lease_holders(&radio.id)
+            .into_iter()
+            .map(|(j, _)| j)
+            .collect();
+        assert_eq!(holders, vec![id.clone()], "round {round}");
     }
+    assert_eq!(
+        idled_under_a_run.load(Ordering::SeqCst),
+        0,
+        "the port was idled while the job was recorded running"
+    );
+    radio.on_idle.lock().unwrap().take();
     node.apply(Op::JobStop { job: id.clone() }).await.unwrap();
     assert!(
         wait_until(1_000, || node.debug_stage_count() == 0).await,
@@ -349,4 +386,39 @@ async fn stop_during_a_relaunch_leaves_no_stage() {
     assert!(streams(&node, &elastic).is_empty());
     assert!(node.lease_elastic(&SourceId("radio0".into())).is_empty());
     assert!(wait_until(1_000, || node.debug_stage_count() == 0).await);
+}
+
+/// A second stop of a job whose first stop is still waiting on its lingering stages
+/// waits too: when either returns, the run's lease is released and its stages are
+/// gone, so a launch that follows (a `graph_put`'s restart) never meets the old run's
+/// supervisor releasing the new lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_stop_returns_after_the_run_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new();
+    let node = Arc::new(
+        Node::open(
+            cfg(dir.path()),
+            registry_lingering(Duration::from_millis(200)),
+            vec![radio.clone()],
+        )
+        .await
+        .unwrap(),
+    );
+    let id = started(
+        &node,
+        start(JobKind::Spectrum, band(100_000_000, 1_000_000), false),
+    )
+    .await;
+    let first = {
+        let (node, id) = (node.clone(), id.clone());
+        tokio::spawn(async move { node.job_stop(&id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!first.is_finished(), "the first stop waits on the stages");
+    node.job_stop(&id).await.unwrap();
+    assert!(node.lease_holders(&radio.id).is_empty());
+    assert_eq!(node.debug_stage_count(), 0);
+    assert!(streams(&node, &id).is_empty());
+    first.await.unwrap().unwrap();
 }

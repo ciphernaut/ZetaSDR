@@ -144,7 +144,7 @@ impl Inner {
                 && let Err(e) =
                     self.follow_capture(&mut rec, port.current().unwrap_or(granted), &mut stages)
             {
-                self.leases.release(&rec.id);
+                self.release_unless_live(&rec.id);
                 return Err(e);
             }
             let capture = port.current();
@@ -154,7 +154,7 @@ impl Inner {
             if let Some(band) = capture
                 && let Err(e) = self.fit_capture(&mut rec, band, &mut stages)
             {
-                self.leases.release(&rec.id);
+                self.release_unless_live(&rec.id);
                 return Err(e);
             }
             // The bank for the band the lease left the port at, so the stages
@@ -187,7 +187,7 @@ impl Inner {
         // A `transcribe` job's record for its transcript tees (see `tee_transcripts`).
         let tee = (rec.kind == JobKind::Transcribe.name()).then(|| rec.clone());
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.
-        let (prov, run) = self.record_running(rec, &token)?;
+        let (prov, run, ended) = self.record_running(rec, &token)?;
 
         // One stream per edge; a node with no incoming edge whose stage takes input
         // reads the job's IQ stream (a job on the radio only). Each node's outputs get
@@ -256,7 +256,7 @@ impl Inner {
         let h = tokio::spawn(supervise(
             self.clone(),
             id.clone(),
-            run,
+            (run, ended),
             port,
             set,
             token,
@@ -533,7 +533,8 @@ impl Inner {
     /// `graph_put` restart that took its lease before the replace took the gate)
     /// is refused the same way, whatever the kind.
     ///
-    /// Also the run's generation (see [`JobEntry::run`]). A launch of a job whose
+    /// Also the run's generation (see [`JobEntry::run`]) and the sender whose drop
+    /// closes the entry's `ended` (see [`JobEntry::ended`]). A launch of a job whose
     /// entry still holds a live run's token (another launch of the id recorded
     /// first: two overlapping `graph_put`s) is refused, its lease left to that run,
     /// which holds the same id's lease; replacing the entry would drop that run's
@@ -542,7 +543,7 @@ impl Inner {
         &self,
         mut rec: JobRecord,
         token: &CancellationToken,
-    ) -> Result<(Provenance, u64), NodeError> {
+    ) -> Result<(Provenance, u64, tokio::sync::watch::Sender<()>), NodeError> {
         rec.state = JobState::Running;
         let mut jobs = self.jobs.lock().unwrap();
         if jobs.get(&rec.id).is_some_and(|e| e.cancel.is_some()) {
@@ -576,6 +577,7 @@ impl Inner {
             },
         };
         let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let (ended, ended_rx) = tokio::sync::watch::channel(());
         jobs.insert(
             rec.id.clone(),
             JobEntry {
@@ -584,13 +586,14 @@ impl Inner {
                 run,
                 cancel: Some(token.clone()),
                 done: None,
+                ended: Some(ended_rx),
                 outputs: Vec::new(),
                 relaunch: false,
                 gated_stop: false,
                 released: false,
             },
         );
-        Ok((prov, run))
+        Ok((prov, run, ended))
     }
 
     /// Launch a `scan` job: take a time-shared lease on its whole band
@@ -649,7 +652,7 @@ impl Inner {
             );
         }
         let token = self.shutdown.child_token();
-        let (prov, run) = self.record_running(rec, &token)?;
+        let (prov, run, ended) = self.record_running(rec, &token)?;
         let out = self.bus.register(StreamKind::Event, prov.clone());
         let scan = Scan {
             id: id.clone(),
@@ -673,7 +676,7 @@ impl Inner {
         let h = tokio::spawn(supervise(
             self.clone(),
             id.clone(),
-            run,
+            (run, ended),
             Some(port),
             set,
             token,
@@ -711,6 +714,21 @@ impl Inner {
             center_hz: center,
             samples: samples.into(),
         })
+    }
+
+    /// Release `id`'s lease after a launch failed past its grant, unless a live run
+    /// of the id (another launch that recorded first) holds it: the lease is keyed
+    /// by the id, and that run's supervisor releases it.
+    fn release_unless_live(&self, id: &JobId) {
+        let live = self
+            .jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|e| e.cancel.is_some());
+        if !live {
+            self.leases.release(id);
+        }
     }
 
     /// Record how run `run` of a job ended on its own, unless it was stopped
@@ -786,10 +804,11 @@ fn node_outputs(
 /// the radio; an attached job has no port), and unregister the job's streams.
 /// All but the streams (this run's own) only while the job's entry is still
 /// for `run`: a later run of the id holds the record, the lease and the port.
+/// `ended` is dropped once released, before the idle (see [`JobEntry::ended`]).
 async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
-    run: u64,
+    (run, ended): (u64, tokio::sync::watch::Sender<()>),
     port: Option<Arc<dyn Port>>,
     mut set: JoinSet<Result<(), StageError>>,
     token: CancellationToken,
@@ -849,6 +868,7 @@ async fn supervise(
             _ => false,
         }
     };
+    drop(ended);
     if let Some(port) = port
         && !keep
         && !gated_stop

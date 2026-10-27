@@ -136,6 +136,13 @@ struct JobEntry {
     cancel: Option<CancellationToken>,
     /// The supervisor; it releases the lease and unregisters the job's streams.
     done: Option<JoinHandle<()>>,
+    /// Closes when run `run`'s supervisor has released the lease and unregistered
+    /// the streams (or kept them for a relaunch), before it idles the port. A stop
+    /// that finds `done` already taken by another stop waits on this instead, so
+    /// every stop returns with the run released and a launch that follows never
+    /// meets the old run's supervisor releasing the new lease (both are keyed by
+    /// the job id). `None` for a record loaded from disk and not launched.
+    ended: Option<tokio::sync::watch::Receiver<()>>,
     /// The job's output streams (those no edge of its graph consumes), in graph order
     /// (each node's in its stage's output order), set at launch; an attached job reads
     /// one of these.
@@ -281,11 +288,18 @@ impl Inner {
             let done = entry.done.take();
             // A supervisor that already released may be waiting on the gate to idle.
             let done = done.filter(|_| !(gated && entry.released));
+            let ended = entry.ended.clone();
             Inner::prune_history(&mut jobs, &self.jobs_dir);
-            done
+            (done, ended)
         };
-        if let Some(h) = done {
+        if let Some(h) = done.0 {
             let _ = h.await;
+        }
+        // Another stop (or a relaunch) took the supervisor: wait for the run to
+        // release all the same. Closed already once it has, so a gated stop never
+        // waits here on a supervisor that waits on the gate to idle.
+        if let Some(mut ended) = done.1 {
+            let _ = ended.changed().await;
         }
         Ok(())
     }
@@ -575,6 +589,7 @@ impl Node {
                         run: 0,
                         cancel: None,
                         done: None,
+                        ended: None,
                         outputs: Vec::new(),
                         relaunch: false,
                         gated_stop: false,
@@ -599,6 +614,7 @@ impl Node {
                         run: 0,
                         cancel: None,
                         done: None,
+                        ended: None,
                         outputs: Vec::new(),
                         relaunch: false,
                         gated_stop: false,
