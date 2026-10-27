@@ -78,9 +78,7 @@ held until the node restarts.
 Gates at the branch head:
 
 - `cargo test --workspace --all-features --no-fail-fast`: 923 passed, 1 failed, 3 ignored (114
-  `test result` lines). The failure was `fake_program_round_trip` (`zeta-ext --test adsb`, event
-  timeout; the same file's `child_exit_fails_the_stage` flaked in plan 13): 6 of 7 reruns alone
-  passed (11 tests in 2.3 s), one failed on a 30 s bound. No `ui e2e skipped`. The UI suite
+  `test result` lines). The failure was `fake_program_round_trip` (`zeta-ext --test adsb`, event timeout); it passed alone on every rerun. Across 7 reruns of the whole `adsb` file, 6 passed all 11 tests and 1 failed `child_exit_fails_the_stage` on its 30 s bound (the test plan 13 recorded as a flake). No `ui e2e skipped`. The UI suite
   (`ui_scenarios_pass_in_headless_chromium`) ran ok in 238.71 s. The first gate attempt died on a
   full disk (the shared target dir holds 86 GB); its incremental cache was deleted and the run
   repeated with `CARGO_INCREMENTAL=0`.
