@@ -163,7 +163,8 @@ pub enum Proof {
 pub struct ProgramBlock {
     /// Names tried on `PATH` in order (or an absolute path), the first found used.
     pub programs: Vec<String>,
-    /// Arguments, with `$port`, `$rate_hz` and `$center_hz` substituted.
+    /// Arguments, with `$port`, `$rate_hz`, `$center_hz` and `$fifo` (the named pipe of
+    /// `input.via: fifo`) substituted.
     pub args: Vec<String>,
     pub input: ProgramInput,
     pub output: ProgramOutput,
@@ -333,7 +334,7 @@ const GRAPH_PLACEHOLDERS: [(&str, u64); 3] = [
     ("$out_rate_hz", 48_000),
 ];
 /// The placeholders a program's `args` may use.
-const PROGRAM_PLACEHOLDERS: [&str; 3] = ["$port", "$rate_hz", "$center_hz"];
+const PROGRAM_PLACEHOLDERS: [&str; 4] = ["$port", "$rate_hz", "$center_hz", "$fifo"];
 /// The in-crate attempts `identify.quick` may name.
 pub const QUICK_ATTEMPTS: [&str; 4] = ["aprs", "pocsag", "acars", "rds"];
 /// Name suffixes of fields that hold an integer in their unit.
@@ -557,6 +558,13 @@ fn validate_program(p: &ProgramBlock) -> Result<(), RowError> {
             "required with via: tcp (\"$port\" for the port zeta picks)",
         ));
     }
+    let names_fifo = p.args.iter().any(|a| placeholders(a).contains(&"$fifo"));
+    if p.input.via == InputVia::Fifo && !names_fifo {
+        return Err(RowError::new(
+            "decoder.args",
+            "with input.via: fifo, an argument must name \"$fifo\" (the pipe zeta makes)",
+        ));
+    }
     Ok(())
 }
 
@@ -673,6 +681,15 @@ mod tests {
             check(|v| v["decoder"]["output"]["port"] = serde_json::Value::Null),
             "decoder.output.port"
         );
+        assert_eq!(
+            check(|v| v["decoder"]["input"]["via"] = "fifo".into()),
+            "decoder.args"
+        );
+        let fifo = edited(ADSB, |v| {
+            v["decoder"]["input"]["via"] = "fifo".into();
+            v["decoder"]["args"][1] = "$fifo".into();
+        });
+        validate(&parse(&fifo).unwrap(), &no_stages()).unwrap();
         assert_eq!(
             check(|v| v["event"]["schema"]["properties"]["delay_ms"] =
                 serde_json::json!({"type": "number"})),

@@ -25,7 +25,8 @@ const FAKE_IDENT: &str =
 #[test]
 fn parse_sbs_position_line() {
     let v = parse_line(POSITION).expect("an MSG line");
-    assert_eq!(v["protocol"], "adsb");
+    // `protocol` comes with the envelope the stage adds, not from the parser.
+    assert!(v.get("protocol").is_none(), "{v}");
     assert_eq!(v["icao"], "4840D6");
     assert_eq!(v["msg"], 3);
     assert_eq!(v["altitude_ft"], 38000);
@@ -167,6 +168,8 @@ async fn round_trip(rate_hz: u64, samples_per_frame: usize) {
     }
     let v = next_event(&mut r.rx_out, 10).await.expect("an event");
     assert_eq!(v["protocol"], "adsb");
+    assert_eq!(v["summary"], "ABCDEF ZETA1", "{v}");
+    assert_eq!(v["t_ns"], 5, "{v}");
     assert_eq!(v["icao"], "ABCDEF");
     assert_eq!(v["callsign"], "ZETA1");
     drop(r.tx);

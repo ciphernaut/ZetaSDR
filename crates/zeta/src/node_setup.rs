@@ -10,11 +10,13 @@ use std::time::Duration;
 
 use zeta_core::classify::StubClassifier;
 use zeta_core::knowledge::StaticKnowledge;
+use zeta_core::modes::{Decoder, ModeRegistry, ModeState, ProgramBlock};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::stream_in::StreamInStage;
 use zeta_core::types::{Hz, SourceId};
+use zeta_ext::{ExternalDecodeStage, ModesHandle};
 use zeta_plugin::host::PluginCommand;
 use zeta_source_file::{FileOpts, FileSource};
 use zeta_source_kiwi::{KiwiConfig, KiwiSource};
@@ -42,26 +44,79 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
 /// Longest a `transcribe` stage waits for the speech backend to answer one utterance.
 const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The stages the CLI node runs. `adsb_decode` runs the dump1090 found by
-/// [`zeta_ext::find_dump1090`]; which one (or that there is none) goes to stderr.
-/// `transcribe` runs on `speech`; without one it is still registered and its jobs fail
-/// saying the node has no speech backend.
-pub fn registry(speech: Option<Arc<dyn SpeechBackend>>) -> StageRegistry {
+/// The stages the CLI node runs. `external_decode` and its `adsb_decode` alias run the
+/// mode rows of the registry `modes` will hold (set once the rows are loaded against this
+/// registry: see [`open`]). `transcribe` runs on `speech`; without one it is still
+/// registered and its jobs fail saying the node has no speech backend.
+pub fn registry(speech: Option<Arc<dyn SpeechBackend>>, modes: &ModesHandle) -> StageRegistry {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
     registry.register(Arc::new(StreamInStage::new()));
     zeta_dsp::register_all(&mut registry);
     registry.register(Arc::new(TranscribeStage::new(speech, TRANSCRIBE_TIMEOUT)));
-    let dump1090 = zeta_ext::find_dump1090();
-    match &dump1090 {
-        Some(p) => eprintln!("zeta: adsb_decode via {}", p.display()),
-        None if std::env::var_os("ZETA_DUMP1090").is_some() => eprintln!(
-            "zeta: adsb_decode unavailable: ZETA_DUMP1090 is set but is not an absolute existing file"
-        ),
-        None => eprintln!("zeta: adsb_decode unavailable: no dump1090 on PATH"),
-    }
-    registry.register(Arc::new(zeta_ext::AdsbDecodeStage::new(dump1090)));
+    registry.register(Arc::new(ExternalDecodeStage::deferred(modes.clone())));
+    registry.register(Arc::new(zeta_ext::AdsbDecodeStage::deferred(modes.clone())));
     registry
+}
+
+/// Find the program of every program row, one probe per distinct `programs` list (rows
+/// in id order), and record it in `modes` (`set_program`): found, the rows are ready
+/// with it; missing, they are unavailable with the report line as their reason. The
+/// lookup honours `ZETA_HANDLER_<PROGRAM>` (and `ZETA_DUMP1090` for dump1090), an
+/// override naming no file being missing. Returns the handler report, one line per
+/// list (spec 5.3): `zeta: handlers: <programs[0]>: found <path> (<version>)` or
+/// `zeta: handlers: <programs[0]>: missing (<hint>; <url>) — modes: <ids>`, the hint
+/// `apt install <debian>`, else `dnf install <fedora>`, else `brew install <brew>`,
+/// left out (with its `; `) when the row names no package.
+pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
+    let mut groups: Vec<(ProgramBlock, Vec<String>)> = Vec::new();
+    for m in modes.all().iter().filter(|m| m.state != ModeState::Broken) {
+        let Decoder::Program(b) = &m.row.decoder else {
+            continue;
+        };
+        match groups.iter_mut().find(|(g, _)| g.programs == b.programs) {
+            Some((_, ids)) => ids.push(m.row.id.0.clone()),
+            None => groups.push((b.clone(), vec![m.row.id.0.clone()])),
+        }
+    }
+    let mut lines = Vec::new();
+    for (block, ids) in groups {
+        let first = block.programs.first().cloned().unwrap_or_default();
+        match zeta_ext::proc::find_handler(&block.programs) {
+            Some(path) => {
+                let version = zeta_ext::proc::handler_version(&path).await;
+                let version = if version.is_empty() {
+                    "version unknown".to_string()
+                } else {
+                    version
+                };
+                lines.push(format!(
+                    "zeta: handlers: {first}: found {} ({version})",
+                    path.display()
+                ));
+                for id in &ids {
+                    modes.set_program(id, Some(path.clone()), None);
+                }
+            }
+            None => {
+                let i = &block.install;
+                let hint = [("apt", &i.debian), ("dnf", &i.fedora), ("brew", &i.brew)]
+                    .into_iter()
+                    .find_map(|(tool, pkg)| pkg.as_ref().map(|p| format!("{tool} install {p}; ")))
+                    .unwrap_or_default();
+                let reason = format!(
+                    "{first}: missing ({hint}{}) — modes: {}",
+                    i.url,
+                    ids.join(", ")
+                );
+                lines.push(format!("zeta: handlers: {reason}"));
+                for id in &ids {
+                    modes.set_program(id, None, Some(reason.clone()));
+                }
+            }
+        }
+    }
+    lines
 }
 
 /// Why a `--source-soapy` or `zeta soapy find` cannot run in this build.
@@ -115,8 +170,9 @@ fn open_soapy(_id: &str, _args: &str) -> Result<Arc<dyn Port>, String> {
 async fn with_plugins(
     plugins: &[PluginSpec],
     speech: Option<Arc<dyn SpeechBackend>>,
+    modes: &ModesHandle,
 ) -> Result<StageRegistry, String> {
-    let mut reg = registry(speech);
+    let mut reg = registry(speech, modes);
     for p in plugins {
         if reg.spec(&p.kind).is_some() {
             return Err(format!(
@@ -176,9 +232,10 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// device is opened here. `resume` relaunches persisted `Running` jobs (`serve`); without it they
 /// are listed as persisted and left alone (one-shot). `speech` is the backend `transcribe`
 /// jobs run on. `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for
-/// [`zeta_core::modes::default_operator_dir`]); each broken row is reported on stderr, one line each, and never fails the
-/// node. Errors name the flag, never a Kiwi password or a node secret. The node comes with
-/// its [`RemotePorts`].
+/// [`zeta_core::modes::default_operator_dir`]); each broken row is reported on stderr, one
+/// line each, then the handler report of the program rows ([`probe_handlers`]); neither
+/// fails the node. Errors name the flag, never a Kiwi password or a node secret. The node
+/// comes with its [`RemotePorts`].
 pub async fn open(
     state_dir: PathBuf,
     sources: &[SourceSpec],
@@ -194,7 +251,21 @@ pub async fn open(
         repeat: true,
         tune_range: None,
     };
-    let registry = with_plugins(plugins, speech).await?;
+    let handle = ModesHandle::default();
+    let registry = with_plugins(plugins, speech, &handle).await?;
+    // The rows validate against every stage (`external_decode` and the plugins
+    // included); program rows are probed after the plugins, and the registry is finished
+    // before the stages and the node share it.
+    let modes_dir = modes_dir.or_else(zeta_core::modes::default_operator_dir);
+    let mut modes = ModeRegistry::load(&registry, modes_dir.as_deref());
+    for line in modes.startup_lines() {
+        eprintln!("{line}");
+    }
+    for line in probe_handlers(&mut modes).await {
+        eprintln!("{line}");
+    }
+    let modes = Arc::new(modes);
+    let _ = handle.set(modes.clone());
     let mut files = Vec::new();
     let mut ports: Vec<Arc<dyn Port>> = Vec::new();
     let mut remotes = RemotePorts::default();
@@ -267,14 +338,11 @@ pub async fn open(
         resume,
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         bank_factory: Some(Arc::new(zeta_dsp::bank::PfbBankFactory)),
-        modes_dir: modes_dir.or_else(zeta_core::modes::default_operator_dir),
+        modes_dir,
     };
-    let node = Node::open(cfg, registry, ports)
+    let node = Node::open_with_modes(cfg, registry, ports, Some(modes))
         .await
         .map_err(|e| e.to_string())?;
-    for line in node.modes().startup_lines() {
-        eprintln!("{line}");
-    }
     for s in &files {
         s.start();
     }
@@ -339,7 +407,7 @@ mod tests {
             );
         }
         let src = SourceId("src".into());
-        let registry = registry(None);
+        let registry = registry(None, &ModesHandle::default());
         let modes = zeta_core::modes::ModeRegistry::load(&registry, None);
         for kind in kinds {
             // An attachable kind is never started on the radio: its graph reads a job.
@@ -427,7 +495,7 @@ mod tests {
                 center_hz: Hz(1_090_000_000),
                 bandwidth_hz: Hz(bw),
             };
-            let mut g = JobKind::AdsbDecode
+            let g = JobKind::AdsbDecode
                 .expand(&src, tuning, Hz(rate), None, None, None, &modes)
                 .unwrap();
             let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
@@ -435,10 +503,6 @@ mod tests {
             let out = param(&g.nodes[0], "out_rate_hz");
             assert_eq!(rate % out, 0, "adsb_decode {rate} {bw}: {out}");
             assert!(out >= bw, "adsb_decode {rate} {bw}: {out}");
-            // `external_decode` is registered with the adaptor (plan 16 task 4): until
-            // then the channel alone is validated against the stages.
-            g.nodes.truncate(1);
-            g.edges.clear();
             validate(&g, &registry).unwrap_or_else(|e| panic!("adsb_decode {rate}: {e}"));
         }
     }

@@ -297,7 +297,7 @@ async fn read_hello(stdout: &mut BufReader<ChildStdout>) -> Result<Hello, String
 }
 
 /// An exit status as text: the code, or `signal <n>`.
-fn status_text(s: ExitStatus) -> String {
+pub fn status_text(s: ExitStatus) -> String {
     if let Some(c) = s.code() {
         return c.to_string();
     }
@@ -314,7 +314,7 @@ fn status_text(s: ExitStatus) -> String {
 /// The environment a plugin gets from the host's `vars`: [`PASS_ENV`] as is,
 /// `ZETA_PLUGIN_ENV_<NAME>` as `<NAME>`, and `PYTHONUNBUFFERED=1` (so a Python plugin's
 /// frames are not held in its stdout buffer). Nothing else.
-fn plugin_env(
+pub fn plugin_env(
     vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut env: Vec<_> = vars
@@ -335,7 +335,7 @@ fn plugin_env(
 /// The plugin's process group; `SIGKILL`ed whole when dropped, so nothing the plugin
 /// started outlives the `probe` or `run` that spawned it. `None` if the plugin had exited
 /// before its id was read.
-struct Group(Option<u32>);
+pub struct Group(pub Option<u32>);
 
 #[cfg(unix)]
 mod sys {
@@ -361,7 +361,8 @@ mod sys {
 }
 
 impl Group {
-    fn kill(&self) {
+    /// `SIGKILL` the whole group (nothing when its id was never read).
+    pub fn kill(&self) {
         #[cfg(unix)]
         if let Some(g) = self.0 {
             sys::kill_group(g);

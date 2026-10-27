@@ -515,6 +515,18 @@ impl Node {
         registry: StageRegistry,
         ports: Vec<Arc<dyn Port>>,
     ) -> Result<Self, NodeError> {
+        Self::open_with_modes(cfg, registry, ports, None).await
+    }
+
+    /// [`Node::open`] with the mode registry `modes` already loaded (and its program rows
+    /// probed) by the caller; `None` loads it from `cfg.modes_dir` against `registry`, as
+    /// `open` does.
+    pub async fn open_with_modes(
+        cfg: NodeConfig,
+        registry: StageRegistry,
+        ports: Vec<Arc<dyn Port>>,
+        modes: Option<Arc<ModeRegistry>>,
+    ) -> Result<Self, NodeError> {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (mut records, mut load_errors) = load(&jobs_dir)?;
@@ -537,7 +549,8 @@ impl Node {
             )
         });
         let resume = cfg.resume;
-        let modes = Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref()));
+        let modes = modes
+            .unwrap_or_else(|| Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref())));
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
         // `Node::apply` and are never logged.

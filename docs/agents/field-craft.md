@@ -19,7 +19,7 @@ Where to find them:
 - POCSAG: 148-149 MHz in AU (Telstra at 148 637 500 Hz among them), 466 075 000 Hz in much of Europe, 929-932 MHz in the US. Use `pocsag_decode` on a 12 500 Hz band.
 - ACARS: 131 550 000 Hz (worldwide primary), 131 725 000 and 131 825 000 Hz (Europe), 130 025 000, 130 450 000 and 131 125 000 Hz (North America), 131 450 000 Hz (Asia). Use `acars_decode`, 10 000 Hz each.
 - RDS: any FM broadcast station. Use `rds_decode` with the station's frequency and a 200 000 Hz band. The first event takes a few seconds.
-- ADS-B: 1 090 000 000 Hz with a 2 400 000 Hz band. Use `adsb_decode`. It needs dump1090 on the node's host; the job fails naming dump1090 when it is missing. A band under 2 000 000 Hz is refused.
+- ADS-B: 1 090 000 000 Hz with a 2 400 000 Hz band. Use `adsb_decode`. It needs dump1090 on the node's host: when it is missing, the startup handler report names it with its package and `modes_list` shows `adsb_decode` `unavailable` with the reason. A band under 2 000 000 Hz is refused.
 
 "Set up a background decoder for all ACARS and ADS-B activity":
 

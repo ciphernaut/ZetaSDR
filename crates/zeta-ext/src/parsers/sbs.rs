@@ -1,4 +1,4 @@
-//! SBS ("BaseStation") output of dump1090: one comma-separated line per
+//! `sbs`: the SBS ("BaseStation") output of dump1090: one comma-separated line per
 //! decoded message, 22 fields, of which `MSG` lines carry aircraft data.
 //!
 //! Fields, numbered from 1 as in the format's description: 1 message type
@@ -9,7 +9,7 @@
 
 use serde_json::{Value, json};
 
-/// The event for one SBS line: `{"protocol":"adsb","icao","msg","callsign",
+/// The fields of one SBS line: `{"icao","msg","callsign",
 /// "altitude_ft","ground_speed_kt","track_deg","lat","lon",
 /// "vertical_rate_fpm","squawk","on_ground"}`, every field the message does
 /// not carry `null`. `None` for anything but a well-formed `MSG` line (any
@@ -42,7 +42,6 @@ pub fn parse_line(line: &str) -> Option<Value> {
         _ => None,
     });
     Some(json!({
-        "protocol": "adsb",
         "icao": icao,
         "msg": msg,
         "callsign": field(11),

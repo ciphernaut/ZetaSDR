@@ -2203,6 +2203,55 @@ fn modes_list_prints_the_five_rows() {
     );
 }
 
+/// The handler report: with no dump1090 on `PATH` the startup line says so with the
+/// package and URL, and `modes list` shows `adsb_decode` unavailable with that reason;
+/// `ZETA_HANDLER_DUMP1090` naming a program makes it found and ready.
+#[test]
+fn handler_report_lists_missing_programs_with_suggestions() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let missing = "zeta: handlers: dump1090: missing (apt install dump1090-fa; https://github.com/flightaware/dump1090) — modes: adsb_decode";
+    let out = zeta(dir.path(), &["modes", "list"])
+        .env("PATH", &empty)
+        .env_remove("ZETA_HANDLER_DUMP1090")
+        .env_remove("ZETA_DUMP1090")
+        .assert()
+        .success()
+        .stderr(contains(missing))
+        .get_output()
+        .clone();
+    let v = json(&out.stdout);
+    let rows = v["value"]["modes"].as_array().expect("modes array");
+    let adsb = rows.iter().find(|m| m["id"] == "adsb_decode").unwrap();
+    assert_eq!(adsb["state"], "unavailable", "{v}");
+    let reason = adsb["reason"].as_str().unwrap();
+    assert!(reason.contains("apt install dump1090-fa"), "{reason}");
+    // The graph rows need no program and stay ready.
+    let aprs = rows.iter().find(|m| m["id"] == "aprs_decode").unwrap();
+    assert_eq!(aprs["state"], "ready", "{v}");
+
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("../zeta-ext/tests/fake_dump1090");
+    let fake = fake.canonicalize().unwrap();
+    let out = zeta(dir.path(), &["modes", "list"])
+        .env("PATH", &empty)
+        .env("ZETA_HANDLER_DUMP1090", &fake)
+        .assert()
+        .success()
+        .stderr(contains(format!(
+            "zeta: handlers: dump1090: found {} (",
+            fake.display()
+        )))
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let rows = v["value"]["modes"].as_array().expect("modes array");
+    let adsb = rows.iter().find(|m| m["id"] == "adsb_decode").unwrap();
+    assert_eq!(adsb["state"], "ready", "{v}");
+    assert_eq!(adsb["program"], fake.display().to_string(), "{v}");
+}
+
 /// Without `--modes-dir` the CLI reads `$XDG_CONFIG_HOME/zetasdr/modes`; with it, only
 /// the directory given.
 #[test]
