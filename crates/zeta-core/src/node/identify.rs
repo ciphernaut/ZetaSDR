@@ -5,9 +5,11 @@
 //! ends the job `Stopped` with the verdict in `job_context.identify`; an exhausted list
 //! ends it the same way with `mode: null` and the layer-1 label and features.
 //!
-//! A stop of the job stops the child it is trying (never a proved one: the job has
-//! ended by then). The child is stopped under the source's gate when the job was (a
-//! `replace`), so the request that replaced it finds the radio free.
+//! A stop of the job, or any other end of its loop (a fault fails it with the source's
+//! fault, as any job on a faulted source), stops the child it is trying (never a proved
+//! one: the job has ended by then). Children are always stopped gated: the job's own lease
+//! is held meanwhile, so there is nothing to idle, and a `replace` of the job holding the
+//! source's gate never waits on a child that waits on that gate.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -145,14 +147,6 @@ impl Inner {
             .unwrap()
             .get(id)
             .is_some_and(|e| e.gated_stop)
-    }
-
-    /// Stop `child` as the cancelled job `id` was stopped: under the gate when it was.
-    async fn stop_child(&self, id: &JobId, child: &JobId) {
-        let _ = match self.gated(id) {
-            true => self.stop_gated(child).await,
-            false => self.stop(child).await,
-        };
     }
 
     /// The last [`IDENTIFY_MEASURE_MS`] of the source's ring at the capture `capture`,
@@ -296,7 +290,9 @@ impl Inner {
                         }
                     });
                 } else if matches!(launch.await, Ok(Ok(()))) {
-                    let _ = self.stop(&child).await;
+                    // Gated: the job's own lease is still held, so there is nothing to
+                    // idle, and the stop never waits on the source's gate.
+                    let _ = self.stop_gated(&child).await;
                 }
                 Ok(None)
             }
@@ -407,7 +403,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     };
     // A child the run before a restart was trying (resumed as an ordinary job).
     if let Some(stale) = &r.stale {
-        let _ = inner.stop(stale).await;
+        let _ = inner.stop_gated(stale).await;
     }
     let band = Band {
         offset_hz: r.tuning.center_hz.0 as i64 - center.0 as i64,
@@ -444,10 +440,19 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             tries.push((s.mode, s.score));
         }
     }
+    let faulted = |f: String| StageError::Failed(format!("source {}: {f}", r.port.id().0));
+    let mut current = ChildGuard {
+        inner: inner.clone(),
+        port: r.port.clone(),
+        child: None,
+    };
     let mut attempts = 0;
     for (mode, score) in tries {
         if r.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
+        }
+        if let Some(f) = r.port.fault() {
+            return Err(faulted(f));
         }
         let id = mode.row.id.0.as_str();
         let child = match inner.start_child(&r, mode).await {
@@ -459,16 +464,23 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             }
         };
         attempts += 1;
+        current.child = Some(child.clone());
         match inner.await_proof(&r, mode, &child).await {
             Attempt::Cancelled => {
-                inner.stop_child(&r.id, &child).await;
+                current.stop().await;
                 return Err(StageError::Cancelled);
             }
             Attempt::NoFrame(evidence) => {
-                let _ = inner.stop(&child).await;
+                current.stop().await;
+                // A child the fault failed is no answer about the mode: the job fails.
+                if let Some(f) = r.port.fault() {
+                    return Err(faulted(f));
+                }
                 inner.candidate(&r, id, score, Outcome::NoFrame, &evidence, Some(&child));
             }
             Attempt::Proved { evidence, summary } => {
+                // The proved child outlives the job.
+                current.child = None;
                 inner.candidate(&r, id, score, Outcome::Proved, &evidence, Some(&child));
                 let verdict = serde_json::json!({"identify": {
                     "verdict": {
@@ -485,6 +497,9 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             }
         }
     }
+    if let Some(f) = r.port.fault() {
+        return Err(faulted(f));
+    }
     let verdict = serde_json::json!({"identify": {
         "verdict": {
             "mode": null,
@@ -495,4 +510,40 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     }});
     let _ = inner.context_merge(&r.id, verdict);
     Ok(())
+}
+
+/// The child the loop is trying. Stopped by [`ChildGuard::stop`], or, on any other exit
+/// of the loop with one set (an error, a panic), from a task the drop spawns: a gated
+/// stop (its lease goes without waiting on the source's gate), then the port's idle.
+/// A proved child is cleared from it first, so it outlives the job.
+struct ChildGuard {
+    inner: Arc<Inner>,
+    port: Arc<dyn Port>,
+    child: Option<JobId>,
+}
+
+impl ChildGuard {
+    /// Stop the child, if any, under the job's own lease: a gated stop, never waiting on
+    /// the source's gate (a `replace` of the job may hold it while it waits for the job).
+    async fn stop(&mut self) {
+        if let Some(child) = self.child.take() {
+            let _ = self.inner.stop_gated(&child).await;
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (inner, port) = (self.inner.clone(), self.port.clone());
+        rt.spawn(async move {
+            let _ = inner.stop_gated(&child).await;
+            inner.leases.idle_if_unheld(port.as_ref()).await;
+        });
+    }
 }

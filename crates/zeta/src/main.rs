@@ -171,7 +171,9 @@ async fn one_shot(
 /// `job start --then-tail`: report a job that is not running (before or
 /// after the tail) as `[job_result, job_record]` with exit 2; otherwise tail
 /// it, stop it unless `keep`, and print
-/// `[job_result, frames_result, {"stopped": bool}]`.
+/// `[job_result, frames_result, {"stopped": bool}]`. A job that ended during the tail
+/// `stopped` with a verdict (`identify`) is a success too: the job its verdict names
+/// (the proved mode's) is what is stopped unless `keep`.
 async fn then_tail_job(
     node: &zeta_core::node::Node,
     id: zeta_core::types::JobId,
@@ -190,16 +192,30 @@ async fn then_tail_job(
         return print(serde_json::to_string_pretty(&(job, rec)), 2);
     }
     let tail = tail_job(node, &id, t).await;
+    // A controller job (`identify`) that ended `stopped` with a verdict succeeded: what
+    // is left to stop is the job its verdict names (a proof's), if any.
+    let mut to_stop = Some(id.clone());
     if let Some(rec) = not_running() {
-        return print(serde_json::to_string_pretty(&(job, rec)), 2);
+        match verdict_job(&rec) {
+            Some(child) => to_stop = child,
+            None => return print(serde_json::to_string_pretty(&(job, rec)), 2),
+        }
     }
-    let stopped = if keep {
-        Ok(false)
-    } else {
-        node.apply(Op::JobStop { job: id.clone() })
-            .await
-            .map(|_| true)
+    let stopped = match (keep, to_stop) {
+        (true, _) => Ok(false),
+        (false, None) => Ok(true),
+        (false, Some(j)) => node.apply(Op::JobStop { job: j }).await.map(|_| true),
     };
+    // A proof that landed between the check and the stop left its job running.
+    if !keep
+        && let Some(Some(child)) = node
+            .job_list()
+            .into_iter()
+            .find(|r| r.id == id)
+            .and_then(|r| verdict_job(&r))
+    {
+        let _ = node.apply(Op::JobStop { job: child }).await;
+    }
     match (tail, stopped) {
         (Ok(f), Ok(s)) => print(
             serde_json::to_string_pretty(&(job, f, serde_json::json!({"stopped": s}))),
@@ -212,6 +228,21 @@ async fn then_tail_job(
         ),
         (Err(e), Err(e2)) => print(serde_json::to_string_pretty(&(job, e, e2)), 2),
     }
+}
+
+/// For a job that ended `stopped` with a verdict in `job_context.identify`, the job the
+/// verdict names (`Some(None)` when it names none: an unknown); `None` for any other
+/// record.
+fn verdict_job(rec: &zeta_core::job::JobRecord) -> Option<Option<zeta_core::types::JobId>> {
+    let verdict = &rec.context["identify"]["verdict"];
+    if rec.state != zeta_core::job::JobState::Stopped || !verdict.is_object() {
+        return None;
+    }
+    Some(
+        verdict["job"]
+            .as_str()
+            .map(|j| zeta_core::types::JobId(j.into())),
+    )
 }
 
 /// `--then-tail`: wait up to `STREAM_WAIT` for the job's audio output (a

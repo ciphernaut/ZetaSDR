@@ -3,7 +3,9 @@
 //! over a 2.048 MHz file source of the 1200-baud POCSAG fixture and of a plain tone.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use async_trait::async_trait;
 use std::time::Duration;
 
 use num_complex::Complex;
@@ -12,10 +14,10 @@ use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
-use zeta_core::port::Port;
+use zeta_core::port::{IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::stream::Payload;
-use zeta_core::types::{Hz, JobId, SourceId, StreamKind, Timestamp};
+use zeta_core::types::{Capabilities, Hz, JobId, SourceId, StreamKind, Timestamp};
 use zeta_source_file::{FileOpts, FileSource};
 
 const RATE_HZ: u32 = 2_048_000;
@@ -82,6 +84,15 @@ fn registry() -> StageRegistry {
 /// A node over a looping, real-time file source `rx` on `meta`, with the node's
 /// classifiers (as `zeta`'s setup registers them).
 async fn node_over(dir: &Path, meta: &Path) -> Node {
+    node_with(dir, meta, |src| src).await
+}
+
+/// [`node_over`] with the port `wrap` makes of the file source.
+async fn node_with(
+    dir: &Path,
+    meta: &Path,
+    wrap: impl FnOnce(Arc<dyn Port>) -> Arc<dyn Port>,
+) -> Node {
     let cfg = NodeConfig {
         state_dir: dir.join("state"),
         ring_seconds: 4.0,
@@ -101,7 +112,7 @@ async fn node_over(dir: &Path, meta: &Path) -> Node {
         tune_range: None,
     };
     let src = Arc::new(FileSource::open(SourceId("rx".into()), meta, opts).unwrap());
-    let port: Arc<dyn Port> = src.clone();
+    let port: Arc<dyn Port> = wrap(src.clone());
     let node = Node::open(cfg, registry(), vec![port]).await.unwrap();
     // The node subscribed (ring, bank) when the port was added.
     src.start();
@@ -109,6 +120,37 @@ async fn node_over(dir: &Path, meta: &Path) -> Node {
         node.add_classifier(c);
     }
     node
+}
+
+/// A port that is the file source but for a fault the test sets.
+struct Faulty {
+    inner: Arc<dyn Port>,
+    fault: Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl Port for Faulty {
+    fn id(&self) -> &SourceId {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> &Capabilities {
+        self.inner.capabilities()
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        self.inner.tune(t).await
+    }
+    fn current(&self) -> Option<Tuning> {
+        self.inner.current()
+    }
+    fn subscribe(&self) -> IqReceiver {
+        self.inner.subscribe()
+    }
+    fn fault(&self) -> Option<String> {
+        self.fault.lock().unwrap().clone()
+    }
+    async fn idle(&self) {
+        self.inner.idle().await
+    }
 }
 
 fn rx() -> SourceId {
@@ -390,4 +432,126 @@ async fn identify_is_neither_elastic_nor_attachable() {
     let e = node.apply(op).await.unwrap_err();
     assert!(e.to_string().contains("identify is not attachable"), "{e}");
     assert!(node.job_list().is_empty());
+}
+
+/// The first child's start, once it runs: its id and `created_ns`.
+async fn first_child(node: &Node, kind: &str) -> (JobId, u64) {
+    until("the first child runs", Duration::from_secs(10), || {
+        running(node).iter().any(|(_, k)| k == kind)
+    })
+    .await;
+    let rec = node
+        .job_list()
+        .into_iter()
+        .find(|r| r.kind == kind && r.state == JobState::Running)
+        .expect("child listed");
+    (rec.id, rec.created_ns.0)
+}
+
+/// A `replace` of identify that takes the source's gate before the first child's dwell
+/// ends: identify then stops that child while the replace holds the gate and waits for
+/// identify. The child is stopped gated, so the replace completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replace_of_identify_completes_while_a_child_is_stopped() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().pocsag_on_aprs).await;
+    let (id, events) = identify(&node, APRS_HZ).await;
+    let (child, created_ns) = first_child(&node, "aprs_decode").await;
+    let at = |ms: u64| {
+        let wall = std::time::UNIX_EPOCH + Duration::from_nanos(created_ns + ms * 1_000_000);
+        let left = wall
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default();
+        tokio::time::Instant::now() + left
+    };
+    // The APRS dwell is 5000 ms from about `created_ns`: the gate is held across its end.
+    tokio::time::sleep_until(at(4_300)).await;
+    let gate = node.debug_gate(&rx()).await;
+    let op = Op::JobStart {
+        kind: JobKind::Measure,
+        source: rx(),
+        center_hz: Hz(APRS_HZ + 100_000),
+        bandwidth_hz: Hz(BANDWIDTH_HZ),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![id.clone()],
+    };
+    let replace = node.apply(op);
+    tokio::pin!(replace);
+    // Queued on the gate before the dwell ends and identify stops the child.
+    let early = tokio::time::timeout_at(at(5_800), &mut replace).await;
+    assert!(
+        early.is_err(),
+        "the replace ran while the gate was held: {early:?}"
+    );
+    drop(gate);
+    let measure = match tokio::time::timeout(Duration::from_secs(10), replace).await {
+        Ok(Ok(OpResult::Job(j))) => j,
+        r => panic!("replace of identify: {r:?}"),
+    };
+    assert_eq!(state(&node, &id), JobState::Stopped);
+    assert_ne!(state(&node, &child), JobState::Running);
+    // The next child's launch was queued on the gate behind the replace: identify cannot
+    // wait for it under that gate, so a task stops it once it is up.
+    let only_measure = [(measure.0.clone(), "measure".to_string())];
+    until("only the measure job runs", Duration::from_secs(5), || {
+        running(&node) == only_measure
+    })
+    .await;
+    let holders: Vec<JobId> = node
+        .lease_holders(&rx())
+        .into_iter()
+        .map(|(j, _)| j)
+        .collect();
+    assert_eq!(holders, [measure]);
+    let events = events.await.unwrap();
+    assert!(
+        events.iter().all(|e| e["outcome"] != "proved"),
+        "{events:#?}"
+    );
+    stop_all(&node).await;
+}
+
+/// A source that faults while a child is tried fails identify with the fault, as any
+/// job on a faulted source; no child or lease is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fault_fails_identify_with_the_source_fault() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = Arc::new(Mutex::new(None::<Arc<Faulty>>));
+    let keep = faulty.clone();
+    let node = node_with(dir.path(), &fixtures().pocsag_on_aprs, move |inner| {
+        let p = Arc::new(Faulty {
+            inner,
+            fault: Mutex::new(None),
+        });
+        *keep.lock().unwrap() = Some(p.clone());
+        p
+    })
+    .await;
+    let port = faulty.lock().unwrap().clone().expect("wrapped");
+    let (id, _events) = identify(&node, APRS_HZ).await;
+    first_child(&node, "aprs_decode").await;
+    *port.fault.lock().unwrap() = Some("device gone".into());
+    until("identify ends", Duration::from_secs(10), || {
+        state(&node, &id) != JobState::Running
+    })
+    .await;
+    assert_eq!(
+        state(&node, &id),
+        JobState::Failed {
+            reason: "source rx: device gone".into()
+        }
+    );
+    assert!(node.job_context(&id).unwrap()["identify"]["verdict"].is_null());
+    until("the child ends", Duration::from_secs(5), || {
+        running(&node).is_empty()
+    })
+    .await;
+    until("no lease", Duration::from_secs(5), || {
+        node.lease_holders(&rx()).is_empty()
+    })
+    .await;
 }

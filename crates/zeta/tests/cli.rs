@@ -1012,6 +1012,82 @@ fn job_start_identify_then_tail_prints_candidates() {
     assert!(running.is_empty(), "identify {id} left {running:?}");
 }
 
+/// `identify` with `--then-tail` on the POCSAG page at a POCSAG centre: it proves within
+/// the tail and ends `stopped`, which is a success; the proved `pocsag_decode` job is
+/// stopped, or with `--keep` left running. Returns the printed JSON and the jobs listed after.
+fn identify_on_pocsag(dir: &Path, keep: bool) -> (Value, Vec<Value>) {
+    let iq = zeta_dsp::fixtures::pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+    let meta = zeta_dsp::fixtures::write_fixture(dir, "pager", &iq, 48_000, 148_637_500);
+    let src = format!("pager={}", meta.display());
+    let mut args = vec![
+        "--source-file",
+        &src,
+        "job",
+        "start",
+        "--kind",
+        "identify",
+        "--source",
+        "pager",
+        "--center-hz",
+        "148637500",
+        "--bandwidth-hz",
+        "12500",
+        "--then-tail",
+        "3,10000",
+    ];
+    if keep {
+        args.push("--keep");
+    }
+    let out = zeta(dir, &args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let jobs = zeta(dir, &["--source-file", &src, "job", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let jobs = json(&jobs)["value"].as_array().expect("jobs array").clone();
+    (v, jobs)
+}
+
+fn running_kinds(jobs: &[Value]) -> Vec<String> {
+    jobs.iter()
+        .filter(|j| j["state"]["status"] == "running")
+        .map(|j| j["kind"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn then_tail_on_a_proving_identify_prints_frames_and_stops_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let (v, jobs) = identify_on_pocsag(dir.path(), false);
+    assert_eq!(v[1]["result"], "frames", "{v}");
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["payload"]["protocol"] == "candidate"
+                && f["payload"]["summary"] == "pocsag_decode: proved"),
+        "{v}"
+    );
+    assert_eq!(v[2], serde_json::json!({"stopped": true}));
+    assert!(running_kinds(&jobs).is_empty(), "{jobs:?}");
+}
+
+#[test]
+fn then_tail_on_a_proving_identify_with_keep_leaves_the_child_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let (v, jobs) = identify_on_pocsag(dir.path(), true);
+    assert_eq!(v[1]["result"], "frames", "{v}");
+    assert_eq!(v[2], serde_json::json!({"stopped": false}));
+    assert_eq!(running_kinds(&jobs), ["pocsag_decode"], "{jobs:?}");
+}
+
 #[test]
 fn then_tail_malformed_value_is_usage_error() {
     let dir = tempfile::tempdir().unwrap();
