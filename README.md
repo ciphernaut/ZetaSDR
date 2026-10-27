@@ -148,7 +148,7 @@ fails if the committed file has drifted.
 
 ## DSP
 
-Thirteen job kinds, chosen with `job start --kind` (`zeta job start --help` lists them):
+Fifteen built-in job kinds (`transcribe` is attached with `job attach`, not started; `identify` is described under "Decoder modes"; mode rows add more), chosen with `job start --kind` (`zeta job start --help` lists them):
 
 - `passthrough` copies the channel IQ through unchanged.
 - `spectrum` emits spectrum rows at 20 per second of signal time, each the power average of every FFT since the previous row (spectrum event v2): `size` (the smallest power of two at least `bandwidth_hz / 6000`, 1024 to 8192), `bin_hz`, `rows_per_s`, `center_hz`, and the row quantised as `q` (one 0-255 level per bin, lowest frequency first) with `floor_db` and `step_db` (0.5): `db = floor_db + q * step_db`. `floor_db` is the row's 2nd-percentile bin minus 5 dB, so levels more than 127.5 dB above it clip at 255.
