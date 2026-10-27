@@ -53,9 +53,10 @@ const DEVIATION_HZ: u64 = 3_000;
 /// than the box `skipped_band`, one not ready `unavailable`; the rest run
 /// their quick attempt on one channel extracted from the requested band, at
 /// least [`MIN_BW_HZ`] wide at [`channel_rate_hz`] (for the whole block, the
-/// measured occupied band), or, for a row whose own `band.bandwidth_hz` is
-/// narrower than that, on a channel of the row's width around the measured
-/// centre: `proved` or `no_frame`. Every row is considered;
+/// measured occupied band), or, on a band over the RDS gate, for a row whose
+/// own `band.bandwidth_hz` is narrower, on a channel of the row's width
+/// around the measured centre: `proved` or `no_frame`. A box narrower than
+/// [`MIN_BW_HZ`] is fitted as [`MIN_BW_HZ`] wide. Every row is considered;
 /// a proof does not stop the sweep. Upstream features are not used.
 pub struct DecodeToIdentify {
     modes: Arc<ModeRegistry>,
@@ -118,16 +119,19 @@ impl Classifier for DecodeToIdentify {
         );
         // The band decoded, and the box a row must fit: the requested band, or for the
         // whole block its measured occupied band, read as at least `RDS_MIN_BW_HZ`
-        // once it reaches `RDS_MIN_MEASURED_BW_HZ`.
-        let (offset, bw, box_hz) = if band.is_whole(sample_rate_hz) {
-            let box_hz = match m_bw >= RDS_MIN_MEASURED_BW_HZ {
-                true => m_bw.max(RDS_MIN_BW_HZ),
-                false => m_bw.max(MIN_BW_HZ),
+        // once it reaches `RDS_MIN_MEASURED_BW_HZ`; either at least `MIN_BW_HZ`, as
+        // the channel extracted is. `wide`: the band is over the RDS gate.
+        let (offset, bw, box_hz, wide) = if band.is_whole(sample_rate_hz) {
+            let wide = m_bw >= RDS_MIN_MEASURED_BW_HZ;
+            let box_hz = match wide {
+                true => m_bw.max(RDS_MIN_BW_HZ).min(band.bandwidth_hz.0),
+                false => m_bw,
             };
             let offset = m_center as i64 - center_hz.0 as i64;
-            (offset, m_bw, box_hz.min(band.bandwidth_hz.0))
+            (offset, m_bw, box_hz.max(MIN_BW_HZ), wide)
         } else {
-            (band.offset_hz, band.bandwidth_hz.0, band.bandwidth_hz.0)
+            let bw = band.bandwidth_hz.0;
+            (band.offset_hz, bw, bw.max(MIN_BW_HZ), bw >= RDS_MIN_BW_HZ)
         };
         let span_ms = iq.len() as u64 * 1000 / rate;
         let catalogue = |id: &str| catalogue_score(id, m_center, m_bw, layer1);
@@ -148,10 +152,11 @@ impl Classifier for DecodeToIdentify {
             } else if s.mode.state != ModeState::Ready {
                 Outcome::Unavailable
             } else {
-                // A row narrower than the band runs on its own width around the
-                // measured centre, not on the whole band.
+                // Under the RDS gate every row runs on the band's own channel. Over
+                // it, a row narrower than the band runs on its own width around the
+                // measured centre, not on the whole broadcast-wide band.
                 let row_bw = row.band.bandwidth_hz.max(MIN_BW_HZ);
-                let key = match row_bw < bw.max(MIN_BW_HZ) {
+                let key = match wide && row_bw < bw.max(MIN_BW_HZ) {
                     true => (m_center as i64 - center_hz.0 as i64, row_bw),
                     false => (offset, bw),
                 };

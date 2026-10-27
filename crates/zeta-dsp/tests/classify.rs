@@ -220,3 +220,29 @@ async fn classify_honours_selection_band() {
         "{below:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ten_khz_box_still_tries_aprs() {
+    // Narrower than the row's 12 500 Hz: fitted, and extracted, as 12 500 Hz.
+    let dir = tempfile::tempdir().unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 10_000, 2_000_000_000).await;
+    assert_eq!(outcome(&c, "aprs_decode"), Some(Outcome::Proved), "{c:?}");
+    assert_eq!(
+        outcome(&c, "pocsag_decode"),
+        Some(Outcome::NoFrame),
+        "{c:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_40_khz_box_decodes_on_its_own_channel() {
+    // A box between 12 500 Hz and the RDS gate runs the quick attempts on the
+    // selection's own 40 kHz channel, as before the rows.
+    let dir = tempfile::tempdir().unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 40_000, 2_000_000_000).await;
+    assert_eq!(outcome(&c, "aprs_decode"), Some(Outcome::Proved), "{c:?}");
+}
