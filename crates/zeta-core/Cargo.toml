@@ -28,3 +28,7 @@ test-fixtures = []
 [[test]]
 name = "transcripts_log"
 required-features = ["test-fixtures"]
+
+[[test]]
+name = "identify"
+required-features = ["test-fixtures"]

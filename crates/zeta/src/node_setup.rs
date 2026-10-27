@@ -511,8 +511,9 @@ mod tests {
                         Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
                             assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
                         }
-                        // A scan runs no graph: the node steps the source itself.
-                        Ok(g) if kind == JobKind::Scan => {
+                        // A scan or an identify runs no graph: the node drives the source
+                        // (and, for identify, its child jobs) itself.
+                        Ok(g) if matches!(kind, JobKind::Scan | JobKind::Identify) => {
                             assert!(g.nodes.is_empty() && g.edges.is_empty(), "{g:?}");
                         }
                         Ok(g) => {

@@ -37,12 +37,89 @@ specs are written in a brainstorming session before the plan, as before.
 |---|---|---|---|
 | 14 | Field fix wave (planned, above) | The timestamp bug blocks every UTC-slotted mode (FT8/FT4/WSPR) and TDMA (DMR, TETRA); the run leak would surface in minutes under a span of decoders; `measure` silence blocks layer 4 and `cb_watch.py`. | - |
 | 15 | Scan: alternate the step grid and mask the centre and edge bins | Spec gist in `TODO.md`; the survey tooling built on scan rows inherits the DC spike and edges today. Spec first. | 14 (`stats`, no leaks under repeated retunes) |
-| 16 | Mode registry and external-decoder adaptor | Design spec first (brainstorm): a table-driven mode registry replacing the `JobKind` match for decoders, a declarative stdio wrapper for external decoders, the `video`/`text`/bits payload envelopes, a common decoded-event envelope and feed sinks, `tools/install-vocoders.sh`. No new mode ships here; `adsb_decode` is re-expressed as the first adaptor row. | 14 |
+| 16 | Mode registry and external-decoder adaptor | Design spec first (brainstorm): a table-driven mode registry replacing the `JobKind` match for decoders, a declarative stdio wrapper for external decoders, the `video`/`text`/bits payload envelopes, a common decoded-event envelope and feed sinks, `tools/install-vocoders.sh`. No new mode ships here; `adsb_decode` is re-expressed as the first adaptor row. **Delivered** on branch `worktree-plan-16`, 2026-10-28. Pending: live acceptance on hardware (see "Plan 16 status"). | 14 |
 | 17 | Decoder wave 1 | HackRF-reachable, AU-relevant, grouped by OnAir's families: M17 and DMR voice (Codec 2 in-crate, AMBE via the install script) feeding `transcribe`; RS41 radiosondes; AIS; FLEX; POCSAG and APRS over a whole span; `rds_decode` stereo pilot report and `wfm_demod` stereo. Each mode a registry row with a generated test signal and a `classify` decode-to-identify hook. | 16 |
 | 18 | UI wave | Box a signal, demod it, refine it on the graph (no channel-grid assumptions); staircase transcript ribbons; mode picking by band through `knowledge_lookup`; the Okudagram (LCARS) theme behind `view set theme`. UI-only; can run beside 16/17. | 13 |
 | 19 | Layer 4 stages | Generic FSK/PSK/OOK demods, clock recovery, slicer, bit viewer with framing and CRC hypotheses, correlator, signature write-back; `measure` symbol-rate and modulation-order upgrades. Two or three plans. | 16 (bits payload) |
 | 20 | Soapy worker process | A `zeta soapy-worker` child owning the driver behind a Port that faults when the child exits, so a driver crash never ends the node. Moves up if plan 14's live acceptance shows the node still dying in-process. | 14 |
 
+
+## Plan 16 status
+
+Plan 16 is delivered on `worktree-plan-16` (tasks 1-9), 2026-10-28. Live acceptance on hardware
+(the HackRF laptop or the field host with the B210 and dump1090) is pending.
+
+What was built (spec `docs/superpowers/specs/2026-10-27-mode-registry-design.md`):
+
+- Mode rows: `modes/*.json` embedded, operator rows in `--modes-dir`, states `ready|broken|unavailable`,
+  `modes_list`/`modes_show`, `zeta modes list|show|check`; a broken row is logged and never fatal.
+- The four in-crate decoders expand from their rows, pinned to today's graphs; `adsb_decode` is a
+  program row (`channel` then `external_decode`); `JobKind::Mode(id)` takes any operator row.
+- `external_decode`: a row's program under the cleared environment and a process group, parsers
+  `json_lines|sbs|nmea|kiss|text|multimon`, the startup handler report, `ZETA_HANDLER_<PROGRAM>`.
+- Events carry `protocol`, `summary`, `t_ns`; the page renders `summary`.
+- `zeta modes check [ID] [--strict]` with a synthesiser (`aprs|pocsag|rds|acars|modes_ident|nbfm_tone`,
+  impairments `snr_db|offset_hz|ppm`) and `checked` in `modes-checked.json`.
+- `classify` returns `classification { labels, tried }` (top 5 rows by score, six outcomes);
+  `knowledge_lookup` signatures name a mode id; the `identify` job tries every fitting ready row
+  as a child job in score order, with `candidate` events and a verdict in `job_context.identify`.
+- A `video` payload (`rgb8|gray8|png`) under plugin protocol 2 and the documented bits event shape.
+- Task 9: field craft ("Decoding modes"), README, this status, `TODO.md`, and a carried fix:
+  `tests/identify.rs` now has `required-features = ["test-fixtures"]` so `cargo test -p zeta-core`
+  compiles without features; `every_job_kind_expands_to_a_valid_graph` (zeta bin) treats `identify`
+  like `scan` (no graph), which the first gate run caught failing.
+
+Gates at the branch head:
+
+- `cargo test --workspace --all-features --no-fail-fast`: 1016 passed, 0 failed, 3 ignored (118
+  `test result` lines). The one failure of the first run, `every_job_kind_expands_to_a_valid_graph`,
+  was the test fix above and passes (the zeta bin's 11 tests re-run ok); no flake fired. No
+  `ui e2e skipped`; the UI suite (`ui_scenarios_pass_in_headless_chromium`) ran ok in 248.78 s.
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  the driver's clippy with `RUSTFLAGS="--cfg soapy"`, `cargo test -p zeta-core --no-run` (no
+  features), `zeta agents-md --check` and `--skill --check` are clean; `zeta modes check` prints
+  `ok` for the four in-crate rows and `adsb_decode` (dump1090 present on this host).
+
+Live acceptance still pending on hardware: `zeta modes list` shows the five rows `ready` (or
+`adsb_decode` `unavailable` with its suggestion where dump1090 is absent); `zeta modes check --strict`
+passes every row the host can run; `job start --kind pocsag_decode --then-tail` on 148.6375 MHz
+behaves as before and its events carry `summary`; `classify` on an APRS burst lists `tried` with
+`aprs_decode` `proved`; `identify` on a UHF CB voice channel ends `unknown` with an `fm` label and no
+child left; `identify` on 148.6375 MHz ends with a POCSAG verdict and one running `pocsag_decode`
+child; a deliberately broken operator row shows `broken` with its field while the node runs; the
+startup handler report names dump1090 found or missing with the Debian package.
+
+Deferred (ledger summary):
+
+- Rows and registry: duplicate ids in the operator dir (last file wins, a broken entry can be
+  overwritten); an unreadable operator dir is skipped silently; `parse` reports serde's bare field
+  name and unknown enum variants fall back to `row`; operator ids equal to a non-decoder built-in
+  (`fm_demod`, `scan`) load ready but are unreachable from `job_start`; `Mode("pocsag_decode")` built
+  programmatically does not round-trip; `template::expand` ignores `input.stream`; the
+  `nullable` helpers sit in `modes`, not `types`; no CLI test of `--modes-dir` with `--node`.
+- Events and adaptor: the RDS `ps` trailing space doubles in the summary; a leading empty optional
+  keeps a stray separator; `envelope` leaves a non-object `fields` un-enveloped; the adsb summary
+  has no ` ft`; `external.unparsed` can lag until the run ends; an override naming a
+  non-executable file is reported `found`; the KISS parser always sets `fcs_ok`; a mid-stream rate
+  change resets the resampler silently; `external.rs` is 855 lines (split `convert.rs`/`proc.rs`).
+- Check and synthesiser: `within_ms` is clamped to 10 000 (0 to 1); subset comparison is top-level
+  value equality; a relative fixture path resolves against the cwd; startup lines reprint per row;
+  RDS has no margin at 10 000 ms; the echo impairment is deferred to plan 17.
+- Classify: `fits_band` is computed against the measured width but the sweep uses `Band::fits`;
+  the catalogue lift applies on a `noise` layer 1; the whole-block cap drops RDS on 100-150 kHz
+  blocks the old code tried; no test of the `unavailable` outcome or of the `tried` notes; a box
+  between 12.5 and 150 kHz misses an off-centre packet (ruling 21; gist in `TODO.md`).
+- Identify: core tests run without the bank (a plain `pocsag_decode` never decodes on the
+  debug-build bank at 2.048 MHz, in `TODO.md`); stale-child cleanup after a killed process only
+  runs after a successful measure; `launch_identify` repeats `launch_scan`'s scaffolding; identify
+  scores with a zero catalogue term so its order can differ from classify's; a `source_ensure` with
+  `replace: [identify]` racing a queued child launch can retune the source back (`source_ensure`
+  takes no lease).
+- Plugin protocol: `KindNotCarried` says "protocol 1" for a sink refused under 2; the 16 MiB
+  `MAX_BODY` caps video quietly (a 4K `rgb8` frame is refused as too long, undocumented); the
+  Python SDK stays on protocol 1.
+- Plan 17 inputs (in `TODO.md`): generic `fsk`/`psk`/`ook` synthesiser families, the echo
+  impairment, audio-input program rows.
 
 ## Plan 14 status
 

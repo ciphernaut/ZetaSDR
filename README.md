@@ -359,6 +359,21 @@ port logic is tested without hardware (`cargo test -p zeta-source-soapy --featur
 (`cargo test -p zeta-source-kiwi --test live -- --ignored` needs a reachable Kiwi; the HackRF
 test lives in the driver crate, see its README).
 
+## Decoder modes
+
+A decoder is a data row, not code. The built-in rows live in `modes/*.json` (embedded in the binary); your own go in `--modes-dir PATH` (default `$XDG_CONFIG_HOME/zetasdr/modes`, else `~/.config/zetasdr/modes`), and a row with a built-in `id` replaces it. A row that does not parse or validate is listed `broken` (with its `file` and the offending field) and logged at startup as `zeta: mode <id> (<file>): <field>: <error>`; it never stops the node.
+
+```bash
+zeta modes list [--family F] [--state ready|broken|unavailable]   # every row, with its state
+zeta modes show pocsag_decode                                      # one row in full
+zeta modes check [ID] [--strict]                                   # run each row's test on a synthesised capture
+zeta job start --kind <mode id> --source S --center-hz C --bandwidth-hz B
+```
+
+`job start --kind` takes any ready row's id. A program row (`adsb_decode` runs dump1090) is `unavailable` when its program is missing; the startup handler report says so, `zeta: handlers: dump1090: missing (apt install dump1090-fa; <url>) — modes: adsb_decode`, and install it with the command shown (zeta never fetches or builds programs; `ZETA_HANDLER_<PROGRAM>` names one outside `PATH`). `zeta modes check` prints `<id>: ok`, `fail: <reason>` or `skipped: <reason>` per row (`--strict` fails a skip), is local only and is refused while `zeta serve` owns the state directory.
+
+Every decoded event carries `protocol`, `t_ns` and a one-line `summary` (the page shows it). `zeta classify` is the quick answer to "what is this": it tries the best five rows with a short decode and lists them under `tried`. `zeta job start --kind identify` is the thorough one: it measures the band, then runs each fitting row as a child job in score order, publishing a `candidate` event for each, and ends with a verdict in `job_context.identify`; a proof leaves that decoder running. `docs/agents/field-craft.md` ("Decoding modes") has the details and a worked operator row.
+
 ## External stages
 
 `--plugin KIND=/abs/path` registers a program as stage kind `KIND`, usable in any graph

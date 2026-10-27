@@ -430,12 +430,12 @@ To decode APRS from a source, start the job and tail its events in one call: `ze
 
 ### Decoding pagers, aircraft and FM data
 
-Where to find them:
+Each of these is a mode row: `zeta modes list` gives its id (the `kind` to start), the `band` it expects with well-known `centers_hz`, and whether it is `ready`. `zeta modes show ID` prints the whole row. Read the band from the row, not from memory; the built-in rows say:
 
-- POCSAG: 148-149 MHz in AU (Telstra at 148 637 500 Hz among them), 466 075 000 Hz in much of Europe, 929-932 MHz in the US. Use `pocsag_decode` on a 12 500 Hz band.
-- ACARS: 131 550 000 Hz (worldwide primary), 131 725 000 and 131 825 000 Hz (Europe), 130 025 000, 130 450 000 and 131 125 000 Hz (North America), 131 450 000 Hz (Asia). Use `acars_decode`, 10 000 Hz each.
-- RDS: any FM broadcast station. Use `rds_decode` with the station's frequency and a 200 000 Hz band. The first event takes a few seconds.
-- ADS-B: 1 090 000 000 Hz with a 2 400 000 Hz band. Use `adsb_decode`. It needs dump1090 on the node's host: when it is missing, the startup handler report names it with its package and `modes_list` shows `adsb_decode` `unavailable` with the reason. A band under 2 000 000 Hz is refused.
+- POCSAG (`pocsag_decode`): 148-149 MHz in AU (Telstra at 148 637 500 Hz among them), 466 075 000 Hz in much of Europe, 929-932 MHz in the US. 12 500 Hz band.
+- ACARS (`acars_decode`): 131 550 000 Hz (worldwide primary), 131 725 000 and 131 825 000 Hz (Europe), 130 025 000, 130 450 000 and 131 125 000 Hz (North America), 131 450 000 Hz (Asia). 10 000 Hz each.
+- RDS (`rds_decode`): any FM broadcast station, 200 000 Hz band. The first event takes a few seconds.
+- ADS-B (`adsb_decode`): 1 090 000 000 Hz with a 2 400 000 Hz band; under 2 000 000 Hz is refused. It needs dump1090 on the node's host: when it is missing, the startup handler report names it with its package and `modes_list` shows `adsb_decode` `unavailable` with the reason.
 
 "Set up a background decoder for all ACARS and ADS-B activity":
 
@@ -444,6 +444,38 @@ Where to find them:
 3. Start `adsb_decode` on a second source. A radio serves one band at a time, so on one radio it must wait until the ACARS jobs are stopped.
 
 `knowledge_lookup` says which decoder proves a band's signature (`decoder` names the mode id, the job kind; `null` when no mode proves it yet). `classify` tries the best-scoring modes with a quick attempt (APRS, POCSAG, ACARS, RDS) as decode-to-identify and lists each under `tried` with its outcome; it never runs a program row such as ADS-B (`skipped_quick`: use `adsb_decode`). A CRC-clean decode is the strongest layer 2 evidence there is. A signature match without one is a guess: say so.
+
+### Decoding modes
+
+A decoder is a row, not code. `zeta modes list [--family F] [--state S]` shows every row with its `state`:
+
+- `ready`: the node can start it. `job_start --kind <id>` takes the row's id.
+- `unavailable`: the row is fine but its program is not on this host. `reason` names the program.
+- `broken`: the row did not parse or validate. `file` is the file to fix and `reason` is `<field>: <error>`. A broken row never stops the node: it is reported at startup as `zeta: mode <id> (<file>): <field>: <error>` and starts nothing.
+
+Never invent an id: `job_start` with an id no row has fails `unknown mode <id> (known: ...)`, and a row that is not ready fails `mode <id> is <state>: <reason>`.
+
+**Handlers.** A program row (today `adsb_decode`, running dump1090) needs an external program. At startup the node prints one line per program: `zeta: handlers: <program>: found <path> (<version>)`, or `zeta: handlers: <program>: missing (apt install <pkg>; <url>) — modes: <ids>`. A missing handler is not an error and is never fetched or built by zeta. To install it, run the package command from the line (`apt install dump1090-fa` for dump1090), then restart the node: the row turns `ready`. A program outside `PATH` is named with `ZETA_HANDLER_<PROGRAM>` (`ZETA_HANDLER_DUMP1090`; `ZETA_DUMP1090` still works). Programs run with a cleared environment, as plugins do.
+
+**Checking a row.** `zeta modes check [ID] [--strict]` runs each row's test on a local node over a synthesised capture (APRS, POCSAG, RDS, ACARS, mode S identity, NBFM tone families; impairments `snr_db`, `offset_hz`, `ppm`) and prints `<id>: ok`, `<id>: fail: <reason>` or `<id>: skipped: <reason>`. Skipped means no test, or the program is missing; `--strict` makes that a fail. It exits 0 when no row failed. A pass is recorded (`checked` in `modes list`) for program rows. It is local only: it is refused with `--node` and while `zeta serve` owns the state directory. Run it after writing a row and before trusting it.
+
+**Writing a row.** Put one `*.json` file in the operator directory (`--modes-dir PATH`, default `$XDG_CONFIG_HOME/zetasdr/modes`, else `~/.config/zetasdr/modes`; the node reads it at startup). A row whose `id` matches a built-in replaces it; a new `id` adds a mode. Every field is required unless the schema marks it optional, and unknown fields are rejected. The simplest row is a copy of a built-in with a changed centre. Take `zeta modes show pocsag_decode`, keep the whole row, give it a new `id` and `name`, and put the centre you measured in `centers_hz` (148 812 500 Hz below is only a placeholder):
+
+```json
+{
+  "id": "pocsag_local",
+  "name": "POCSAG, local pager channel",
+  "family": "pagers",
+  "band": { "bandwidth_hz": 12500, "centers_hz": [148812500] },
+  ...every other field of pocsag_decode unchanged...
+}
+```
+
+Then `zeta modes list --state broken` must not list it, and `zeta modes check pocsag_local` must print `ok`. Centre the row on the measured signal, not on a raster. A graph row like this one reuses a built-in decoder at another centre; a program row declares its program, input format and output parser (`json_lines`, `sbs`, `nmea`, `kiss`, `text`, `multimon`); read `adsb_decode`'s row for the shape.
+
+**What the events look like.** Every decoded event carries `protocol`, `t_ns` and `summary`, the row's one-line rendering (`{address}: {text?}` for POCSAG). Report `summary`; the other fields are the decoder's own.
+
+**Quick answer or thorough.** `classify` is the quick answer: it scores every row against the layer-1 measurement and tries the best 5 with a short decode, listing each under `tried` with `proved`, `no_frame`, `skipped_band`, `skipped_span`, `skipped_quick` or `unavailable`. It never runs a program row. A `no_frame` means nothing decoded in that span, not that the protocol is absent. When `classify` leaves the answer open, or the signal may be ADS-B, use `identify`: `job_start --kind identify` on the box, or `zeta job start --kind identify ... --then-tail MAX_FRAMES,TIMEOUT_MS` (a timeout longer than the dwells it may run). It holds the radio, measures 1 s, then runs each fitting ready row as a child job in score order for the row's dwell. Read its `candidate` events in order: each has `mode`, `score`, `outcome`, `evidence`, `summary` and the child's `job`. A `proved` candidate ends the job with the verdict in `job_context.identify` and leaves that decoder running under `verdict.job`; stop it when done. An exhausted list ends with `verdict.mode: null` and the layer-1 features: report that as unknown, with those features. Do not guess a protocol from a `no_frame` list.
 
 ### Remote HF receivers (KiwiSDR)
 

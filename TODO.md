@@ -89,7 +89,9 @@ Gaps, roughly in order of field value on a HackRF with a 2 m / 70 cm antenna in 
 - HF digital via KiwiSDR: RTTY, PSK31, FT8/FT4 (`wsjtx` externally), WSPR, Olivia, CW.
 - Trunking: control-channel following (P25, DMR Tier III) needs a second lease model: a voice channel hop per call. Big; out of scope for a first wave.
 
-Shape: one job kind per mode, graph-expanded like the plan-9 decoders; external decoders through `zeta-ext` where a mature tool exists (dsd-fme / DSD+, radiosonde_auto_rx, wsjtx), in-crate `zeta-dsp` where the mode is small (M17, AIS, FLEX, RTTY). `classify` gains each mode's decode-to-identify (CRC/sync-word pass) and the catalogue entries gain their `decoder`.
+Status (plan 16): modes are now rows (`modes/*.json`, operator rows in `--modes-dir`), so a new mode is a row plus its decoder, not an enum variant; in-crate decoders are graph rows, external ones program rows through `external_decode`, and each row carries its `classify`/`identify` hook and synthesiser test. Plan 17 needs from the synthesiser (`zeta-dsp` `fixtures.rs`, `zeta modes check`): generic `fsk`/`psk`/`ook` families (symbol rate, deviation or order, framing) so a row declares its test signal without new Rust, and the deferred echo impairment (multipath). Rows with audio-input programs also arrive then (`decoder.input.stream: audio` is refused today).
+
+Original shape, now carried by rows: one job kind per mode, graph-expanded like the plan-9 decoders; external decoders through `zeta-ext` where a mature tool exists (dsd-fme / DSD+, radiosonde_auto_rx, wsjtx), in-crate `zeta-dsp` where the mode is small (M17, AIS, FLEX, RTTY). `classify` gains each mode's decode-to-identify (CRC/sync-word pass) and the catalogue entries gain their `decoder`.
 
 Scope estimate: 300-600 lines per in-crate mode including fixtures and tests; 150-250 per external wrapper. A first wave of M17 + DMR voice + RS41 + AIS is a plan on its own.
 
@@ -129,22 +131,24 @@ Scope estimate: 300-500 lines CSS, 100-200 lines JS for the theme hooks and canv
 
 ## Architecture: a mode registry and a generic external-decoder adaptor
 
-From the operator's decoder question, 2026-10-27. Before a decoder wave, four shapes to settle:
+Delivered by plan 16 (`docs/superpowers/specs/2026-10-27-mode-registry-design.md`, `docs/superpowers/plans/2026-10-27-mode-registry.md`, status in the plan series): mode rows, the `external_decode` adaptor, the event envelope, the `video` and bits payloads, `classify` sweeps and `identify`. Still open from the same note:
 
-- **Mode registry.** `JobKind` is a closed enum of 14 variants with its graph expansion in one `match` (`crates/zeta-core/src/ops.rs`). A hundred modes cannot be enum variants. Make a mode a table row, like `channel_plans`: id, family, default `bandwidth_hz`, graph template, event payload schema, decode-to-identify hook for `classify`, catalogue `decoder` link, test-signal generator. `job_start --kind` takes a mode id; `schema` and the UI list the registry.
-- **External-decoder adaptor.** `zeta-ext` is bespoke for dump1090 (~700 lines). Replace with a declarative wrapper: binary, args, input (IQ cu8/cs16/cf32 or audio s16 at a stated rate, via pipe), output parser (line JSON, SBS, NMEA, KISS, text). Then direwolf, multimon-ng, dsd-fme, dumpvdl2, dumphfdl, acarsdec, rtl_433, radiosonde_auto_rx, AIS-catcher, wsjtx `jt9`, satdump plug in with a row each. This is how OpenWebRX+ gets its breadth. Decide whether it is the existing `--plugin` envelope or a plain stdio contract.
-- **Stream payloads.** `video` and `text` stream kinds exist but nothing emits them. Image modes (SSTV, APT, LRPT, fax) need an image frame payload; layer 4 needs a `bits`/symbols payload. Fix the envelopes before the first producer.
-- **Event envelope and feeds.** Every decoder has its own payload. A common envelope (mode, `t_ns`, source, channel, `fields`) plus `sink` stage kinds for the standard feeds (APRS-IS, SBS/Beast, AIS NMEA, PSK Reporter, WSPRnet, KISS TNC) so results leave the node the way other tools expect.
-
-Also to consider:
+- **Feeds.** `sink` stage kinds for the standard feeds (APRS-IS, SBS/Beast, AIS NMEA, PSK Reporter, WSPRnet, KISS TNC) so results leave the node the way other tools expect.
 - **Time.** UTC-slotted modes (FT8/FT4 15 s, WSPR 2 min, JT65 1 min) and TDMA (DMR, TETRA) need true block timestamps. The HackRF drift bug above blocks the whole WSJT family.
 - **Span decoders and trunking.** OnAir and OpenWebRX+ decode every POCSAG/APRS/VDL2 channel in a capture at once. On a pin that is one job per channel on the bank today; a decoder that finds its own channels would take the whole capture. Trunking (P25, DMR Tier III, MPT1327) needs a follower that starts voice jobs from control-channel events inside the pin.
 - **Vocoders.** Codec 2 (M17, FreeDV) in-crate; AMBE/IMBE only through an external `mbelib` build, never shipped; HD Radio HDC off.
-- **Test signals.** Extend `zeta-dsp` `fixtures.rs` into a per-mode synthesiser (offset, noise, clock error), OnAir-style, so every mode has a fixture before a capture exists.
 - **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback. Fits the Okudagram restyle.
 - **Wideband modes** (DVB-T 8 MHz, DAB 1.5 MHz, LTE) run the direct path at full rate and want the GPU FFT; park them behind the HackRF-first set.
 - **Soapy worker process** (plan 20). A `zeta soapy-worker` child owns the `Driver` behind a Port that faults when the child exits, so a driver crash never ends the node. Plan 14 only hardens in-process loss; the two-node pattern in field craft is the interim.
 - **`sync_bank` flapping** (from the 2026-10-27 investigation, not reproduced). A bank replaced while `feed_bank` still drains old-band blocks can swap back and forth, stalling a channel stage silently.
+
+## Feature: classify on a 12.5-150 kHz box tries a row-width slice at the measured centre
+
+On a box between `MIN_BW_HZ` and the RDS gate, after a `no_frame` also try the row-width slice at the measured centre when layer 1 is not `noise` (plan 16 ruling 21): a packet 10 kHz off a 40 kHz box's centre is missed today and decodes on that slice. Fits the "centre on the measured signal" rule.
+
+## Bug: a plain `pocsag_decode` never decodes on the debug-build bank at 2.048 MHz
+
+Found in plan 16 task 7 (pre-existing): the debug-build bank path at 2.048 MHz does not deliver a decodable channel for a plain `pocsag_decode`, so the core identify tests run without the bank. Reproduce with the POCSAG fixture on a 2.048 MHz capture in a debug build, then check the release build before fixing.
 
 ## UI: staircase transcript ribbons on the waterfall
 
