@@ -386,6 +386,8 @@ struct MockRx {
 impl Drop for MockRx {
     fn drop(&mut self) {
         self.calls.lock().unwrap().push("drop".into());
+        // Dropping a stream of a vanished device is a native call on it.
+        let _ = self.gone.touch("drop");
     }
 }
 
@@ -403,6 +405,8 @@ impl SoapyRx for MockRx {
     }
     fn abandon(self: Box<Self>) {
         self.calls.lock().unwrap().push("abandon".into());
+        // As the driver: leak the stream, so its drop never runs.
+        std::mem::forget(self);
     }
     /// An empty script reads as `Timeout` forever. A `Timeout` step blocks for
     /// `timeout_us`, as a real device does.

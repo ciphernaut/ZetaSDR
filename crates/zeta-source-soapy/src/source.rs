@@ -603,6 +603,11 @@ impl Port for SoapySource {
                 let _ = tokio::task::spawn_blocking(move || h.join()).await;
             }
         }
+        // The reader has exited, so `lost` is final: a retune that was queued
+        // when it lost the device was dropped, not applied.
+        if let Some(e) = self.lost_error() {
+            return Err(e);
+        }
         {
             let mut st = self.status.lock().unwrap();
             st.current = None;
@@ -677,6 +682,9 @@ impl Port for SoapySource {
             }
         }
         self.reader_ended().await?;
+        if let Some(e) = self.lost_error() {
+            return Err(e);
+        }
         apply_gain(self.dev.as_ref(), &self.status, db).map_err(PortError::Io)
     }
 }
@@ -789,6 +797,11 @@ impl SoapyRx for Closed {
 /// (SoapyHackRF keeps a half-read one across `activateStream`).
 fn reopen(ctx: &Ctx, rx: &mut Box<dyn SoapyRx>) -> Result<(), String> {
     *rx = Box::new(Closed);
+    open(ctx, rx)
+}
+
+/// Open and activate a new stream in `rx`'s place (which holds [`Closed`]).
+fn open(ctx: &Ctx, rx: &mut Box<dyn SoapyRx>) -> Result<(), String> {
     *rx = ctx
         .dev
         .open_rx(ctx.format)
@@ -797,7 +810,8 @@ fn reopen(ctx: &Ctx, rx: &mut Box<dyn SoapyRx>) -> Result<(), String> {
 }
 
 /// Apply a retune between reads: a rate change (or a rate short of the band)
-/// reopens the stream. `picked` is the rate picked for the stream running at
+/// closes the stream before the rate and frequency are set, then opens a new
+/// one, so the device is never reconfigured under an active stream. `picked` is the rate picked for the stream running at
 /// `rate`. A refused rate restores `rate.asked` and reopens the stream on the
 /// old centre (the frequency is set only once the rate holds); a device error
 /// leaves the stream to fault.
@@ -816,6 +830,7 @@ fn apply(
             .map_err(|e| io(format!("soapy set_frequency({hw}): {e}")))?;
         return Ok(rate);
     }
+    *rx = Box::new(Closed);
     let got = match set_rate(ctx.dev.as_ref(), &ctx.rates, cmd.rate_hz, cmd.bandwidth_hz) {
         Err(RateError::Narrow(m)) => {
             let back = set_rate(ctx.dev.as_ref(), &ctx.rates, rate.asked, 0)?;
@@ -825,7 +840,7 @@ fn apply(
                     rate.asked, back.actual, rate.actual
                 )));
             }
-            reopen(ctx, rx).map_err(io)?;
+            open(ctx, rx).map_err(io)?;
             return Err(RateError::Narrow(m));
         }
         r => r?,
@@ -833,7 +848,7 @@ fn apply(
     ctx.dev
         .set_frequency(hw as f64)
         .map_err(|e| io(format!("soapy set_frequency({hw}): {e}")))?;
-    reopen(ctx, rx).map_err(io)?;
+    open(ctx, rx).map_err(io)?;
     Ok(got)
 }
 
@@ -952,7 +967,8 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                         ctx.id
                     );
                     if let Err(m) = reopen(&ctx, &mut rx) {
-                        ctx.fault(m);
+                        ctx.lose(m);
+                        lost = true;
                         break;
                     }
                     catch_up = Some(last_end);

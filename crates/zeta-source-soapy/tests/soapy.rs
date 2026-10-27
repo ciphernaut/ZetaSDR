@@ -66,6 +66,20 @@ async fn assert_deactivated(dev: &MockDevice) {
     assert!(done, "{:?}", dev.calls());
 }
 
+/// A retune that fails has closed the stream already, so there is nothing to
+/// abandon: the reader's last device call is `last`, and none follows.
+async fn assert_ended_at(dev: &MockDevice, last: &str) {
+    let done = wait_until(500, || {
+        dev.calls()
+            .iter()
+            .rfind(|c| *c != "drop")
+            .is_some_and(|c| c == last)
+    })
+    .await;
+    assert!(done, "{:?}", dev.calls());
+    assert!(!dev.calls().contains(&"deactivate".to_string()));
+}
+
 /// The reader thread's last act on a lost device is `abandon`; wait for it.
 async fn assert_abandoned(dev: &MockDevice) {
     let done = wait_until(500, || {
@@ -245,6 +259,13 @@ async fn retune_rate_change_reopens_the_stream() {
         ]
     );
     assert!(!calls.contains(&"deactivate".to_string()), "{calls:?}");
+    // The old stream is closed before the device is reconfigured.
+    let all = dev.calls();
+    let at = |c: &str| all.iter().rposition(|x| x == c).unwrap();
+    assert!(
+        at("drop") < at("set_sample_rate(2000000)"),
+        "stream closed first: {all:?}"
+    );
     let next = next_block(&mut rx).await;
     assert_eq!(next.sample_rate_hz, Hz(2_000_000));
     assert_eq!(next.center_hz, Hz(101_000_000));
@@ -361,7 +382,7 @@ async fn retune_failure_names_the_call_and_faults() {
     );
     assert!(src.fault().unwrap().contains("rate rejected"));
     // A failed device call in a retune is a lost device: abandon, not deactivate.
-    assert_abandoned(&dev).await;
+    assert_ended_at(&dev, "set_sample_rate(2000000)").await;
     assert!(!dev.calls().contains(&"deactivate".to_string()));
 }
 
@@ -379,7 +400,7 @@ async fn device_loss_during_a_retune_abandons_the_stream() {
     assert!(e.to_string().contains("LIBUSB_ERROR_NO_DEVICE"), "{e}");
     let fault = src.fault().unwrap();
     assert!(fault.contains("set_sample_rate"), "{fault}");
-    assert_abandoned(&dev).await;
+    assert_ended_at(&dev, "set_sample_rate(2000000)").await;
     assert!(!dev.calls().contains(&"deactivate".to_string()));
     let calls = dev.calls().len();
     let e = src.tune(tuning(100_000_000, 1_000_000)).await.unwrap_err();
@@ -414,6 +435,47 @@ async fn vanished_device_faults_source_fails_jobs_and_is_never_touched_again() {
     assert!(e.to_string().contains("device lost"), "{e}");
     assert!(src.fault().unwrap().contains("NO_DEVICE"));
     assert!(dev.calls_after_gone().is_empty());
+}
+
+#[tokio::test]
+async fn a_tune_queued_when_the_reader_loses_the_device_never_touches_it() {
+    // One block, then timeouts: nine reads in, the tenth read's timeout would
+    // fault the source as quiet. A rate-changing tune sent now is queued as the
+    // reader exits lost, and its command is dropped, not applied.
+    let mut reads = samples(1);
+    reads.extend(vec![MockRead::Timeout; 20]);
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
+    let src = source(&dev);
+    let _rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    assert!(wait_until(2_000, || src.read_timeouts() == 9).await);
+    let r = src.tune(tuning(100_000_000, 2_000_000)).await;
+    assert!(r.is_err());
+    assert!(wait_until(2_000, || src.fault().is_some()).await);
+    let e = src.tune(tuning(100_000_000, 2_000_000)).await.unwrap_err();
+    assert!(e.to_string().contains("device lost"), "{e}");
+    assert!(src.fault().is_some(), "the fault is kept");
+    let opens = dev
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("open_rx"))
+        .count();
+    assert_eq!(opens, 1, "{:?}", dev.calls());
+}
+
+#[tokio::test]
+async fn a_failed_guard_restart_loses_the_device() {
+    let dev = Arc::new(MockDevice::hackrf_like());
+    let src = source(&dev);
+    let _rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    // 150 instant blocks run 2.4 s ahead: the guard reopens, and that fails.
+    dev.fail_next("open_rx", "LIBUSB_ERROR_NO_DEVICE");
+    dev.push_reads(samples(150));
+    assert!(wait_until(2_000, || src.fault().is_some_and(|f| f.contains("open_rx"))).await);
+    assert_ended_at(&dev, "open_rx(Cs8)").await;
+    let e = src.tune(tuning(100_000_000, 1_000_000)).await.unwrap_err();
+    assert!(e.to_string().contains("device lost"), "{e}");
 }
 
 #[tokio::test]
@@ -557,7 +619,7 @@ async fn a_call_waiting_on_the_gate_does_not_touch_a_device_lost_meanwhile() {
     let e = gain.await.unwrap().unwrap_err();
     assert!(e.to_string().contains("device lost"), "{e}");
     assert!(src.fault().is_some(), "the fault is kept");
-    assert_abandoned(&dev).await;
+    assert_ended_at(&dev, "set_sample_rate(2000000)").await;
     let calls = dev.calls();
     assert!(
         !calls.iter().any(|c| c.starts_with("set_gain")),
