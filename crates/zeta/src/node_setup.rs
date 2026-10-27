@@ -46,16 +46,27 @@ const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The stages the CLI node runs. `external_decode` and its `adsb_decode` alias run the
 /// mode rows of the registry `modes` will hold (set once the rows are loaded against this
-/// registry: see [`open`]). `transcribe` runs on `speech`; without one it is still
+/// registry: see [`open`]), their fifos under `run_dir` (`<state_dir>/run`; `None`, as
+/// for a schema listing, fails a fifo row). `transcribe` runs on `speech`; without one it is still
 /// registered and its jobs fail saying the node has no speech backend.
-pub fn registry(speech: Option<Arc<dyn SpeechBackend>>, modes: &ModesHandle) -> StageRegistry {
+pub fn registry(
+    speech: Option<Arc<dyn SpeechBackend>>,
+    modes: &ModesHandle,
+    run_dir: Option<&Path>,
+) -> StageRegistry {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
     registry.register(Arc::new(StreamInStage::new()));
     zeta_dsp::register_all(&mut registry);
     registry.register(Arc::new(TranscribeStage::new(speech, TRANSCRIBE_TIMEOUT)));
-    registry.register(Arc::new(ExternalDecodeStage::deferred(modes.clone())));
-    registry.register(Arc::new(zeta_ext::AdsbDecodeStage::deferred(modes.clone())));
+    let mut external = ExternalDecodeStage::deferred(modes.clone());
+    let mut adsb = zeta_ext::AdsbDecodeStage::deferred(modes.clone());
+    if let Some(dir) = run_dir {
+        external = external.with_run_dir(dir);
+        adsb = adsb.with_run_dir(dir);
+    }
+    registry.register(Arc::new(external));
+    registry.register(Arc::new(adsb));
     registry
 }
 
@@ -171,8 +182,9 @@ async fn with_plugins(
     plugins: &[PluginSpec],
     speech: Option<Arc<dyn SpeechBackend>>,
     modes: &ModesHandle,
+    run_dir: &Path,
 ) -> Result<StageRegistry, String> {
-    let mut reg = registry(speech, modes);
+    let mut reg = registry(speech, modes, Some(run_dir));
     for p in plugins {
         if reg.spec(&p.kind).is_some() {
             return Err(format!(
@@ -252,7 +264,7 @@ pub async fn open(
         tune_range: None,
     };
     let handle = ModesHandle::default();
-    let registry = with_plugins(plugins, speech, &handle).await?;
+    let registry = with_plugins(plugins, speech, &handle, &state_dir.join("run")).await?;
     // The rows validate against every stage (`external_decode` and the plugins
     // included); program rows are probed after the plugins, and the registry is finished
     // before the stages and the node share it.
@@ -407,7 +419,7 @@ mod tests {
             );
         }
         let src = SourceId("src".into());
-        let registry = registry(None, &ModesHandle::default());
+        let registry = registry(None, &ModesHandle::default(), None);
         let modes = zeta_core::modes::ModeRegistry::load(&registry, None);
         for kind in kinds {
             // An attachable kind is never started on the radio: its graph reads a job.

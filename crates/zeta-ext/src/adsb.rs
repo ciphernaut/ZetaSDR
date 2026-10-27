@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::modes::{Decoder, ModeRow, ModeState};
+use zeta_core::modes::{Decoder, ModeRow};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{StreamId, StreamKind};
@@ -66,6 +66,7 @@ pub struct AdsbDecodeStage {
     spec: StageSpec,
     runs: Runs,
     env: Vec<(OsString, OsString)>,
+    run_dir: Option<PathBuf>,
 }
 
 impl AdsbDecodeStage {
@@ -79,6 +80,7 @@ impl AdsbDecodeStage {
             },
             runs,
             env: Vec::new(),
+            run_dir: None,
         }
     }
 
@@ -112,34 +114,18 @@ impl AdsbDecodeStage {
         self
     }
 
+    /// The directory a fifo input would go under (the row uses stdin; kept for a row an
+    /// operator points at a fifo).
+    pub fn with_run_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.run_dir = Some(dir.into());
+        self
+    }
+
     fn resolve(&self) -> Result<(ModeRow, PathBuf), StageError> {
-        let failed = |m: String| StageError::Failed(m);
         match &self.runs {
-            Runs::Fixed(None) => Err(failed(NO_PROGRAM.into())),
+            Runs::Fixed(None) => Err(StageError::Failed(NO_PROGRAM.into())),
             Runs::Fixed(Some(p)) => Ok((embedded_row(), p.clone())),
-            Runs::Registry(handle) => {
-                let reg = handle
-                    .get()
-                    .ok_or_else(|| failed("adsb_decode: no mode registry".into()))?;
-                let m = reg
-                    .get(ADSB_MODE)
-                    .ok_or_else(|| failed("adsb_decode: unknown mode adsb_decode".into()))?;
-                if m.state != ModeState::Ready {
-                    return Err(failed(format!(
-                        "adsb_decode: {}",
-                        m.reason.as_deref().unwrap_or("not ready")
-                    )));
-                }
-                let Decoder::Program(block) = &m.row.decoder else {
-                    return Err(failed("adsb_decode: the row is not a program row".into()));
-                };
-                let program = m
-                    .program
-                    .clone()
-                    .or_else(|| crate::proc::find_handler(&block.programs))
-                    .ok_or_else(|| failed(NO_PROGRAM.into()))?;
-                Ok((m.row.clone(), program))
-            }
+            Runs::Registry(handle) => crate::external::resolve(handle, ADSB_MODE, ADSB_MODE),
         }
     }
 }
@@ -166,6 +152,10 @@ impl Stage for AdsbDecodeStage {
         let (row, program) = self.resolve()?;
         let _: AdsbParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("adsb_decode params: {e}")))?;
-        crate::external::run_row(&row, &program, &self.env, inputs, outputs, bus, cancel, ctx).await
+        let run_dir = self.run_dir.as_deref();
+        crate::external::run_row(
+            &row, &program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
+        )
+        .await
     }
 }

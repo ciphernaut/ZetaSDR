@@ -298,22 +298,57 @@ async fn cu8_input_is_converted() {
     assert!(matches!(result_within(r.handle, 10).await, Ok(())));
 }
 
-/// `via: fifo`: the input goes to a named pipe the program is given as `$fifo`.
+/// `via: fifo`: the input goes to a named pipe the program is given as `$fifo`, in a
+/// directory of the run's own under the stage's run directory (made when missing),
+/// removed when the run ends.
 #[tokio::test]
 async fn fifo_input_is_fed() {
-    let reg = registry(&[json_row("fake_fifo", "cs8", "fifo", &["--in", "$fifo"])]);
-    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
-        ("FAKE_LINES", r#"{"text":"{head}","n":{bytes}}"#),
-        ("FAKE_AFTER_BYTES", "960"),
-    ]);
+    let reg = Arc::new(registry(&[json_row(
+        "fake_fifo",
+        "cs8",
+        "fifo",
+        &["--in", "$fifo"],
+    )]));
+    let dir = tempfile::tempdir().unwrap();
+    let run_dir = dir.path().join("state").join("run");
+    let stage = ExternalDecodeStage::new(reg.clone())
+        .with_run_dir(&run_dir)
+        .with_env([
+            (
+                "FAKE_LINES",
+                r#"{"text":"{head}","n":{bytes},"path":"{in}"}"#,
+            ),
+            ("FAKE_AFTER_BYTES", "960"),
+        ]);
     let mut r = start(stage, "fake_fifo");
     send(&r.tx, 1, 480, 48_000);
     let v = next_event(&mut r.rx_out, 10).await.expect("an event");
     // cs8: 0.5 * 127 rounds to 64 (0x40), -0.5 to -64 (0xc0).
     assert_eq!(v["text"], "40c040c040c040c0", "{v}");
     assert_eq!(v["n"], 960, "{v}");
+    let fifo = PathBuf::from(v["path"].as_str().unwrap());
+    assert!(
+        fifo.starts_with(&run_dir),
+        "{} not under {}",
+        fifo.display(),
+        run_dir.display()
+    );
     drop(r.tx);
     assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+    assert_eq!(
+        std::fs::read_dir(&run_dir).unwrap().count(),
+        0,
+        "fifo dir left behind"
+    );
+
+    // Without a run directory a fifo row fails naming the mode, never guessing a place.
+    let r = start(ExternalDecodeStage::new(reg), "fake_fifo");
+    match result_within(r.handle, 5).await {
+        Err(StageError::Failed(m)) => {
+            assert_eq!(m, "fake_fifo: fifo input needs a run directory")
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
 }
 
 #[tokio::test]

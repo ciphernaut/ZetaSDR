@@ -3,7 +3,8 @@
 Reads its input from stdin, or from the file after `--in` (a fifo). Once
 $FAKE_AFTER_BYTES bytes (default 1024; 0 for at once) have arrived it writes
 the lines of $FAKE_LINES (newline-separated), `{bytes}` in them replaced by the
-byte count so far and `{head}` by the first 8 input bytes in hex, then keeps
+byte count so far, `{head}` by the first 8 input bytes in hex and `{in}` by the
+input path (`-` for stdin), then keeps
 reading until EOF and exits 0. $FAKE_VIA is `stdout` (the default) or
 `tcp:<flag>`: listen on 127.0.0.1 at the port after <flag> in the arguments,
 accept one connection and write the lines there. FAKE_EXIT_AFTER=1 makes it
@@ -32,13 +33,14 @@ def main() -> int:
         conn, _ = srv.accept()
         out = conn.makefile("wb")
 
-    src = open(args[args.index("--in") + 1], "rb") if "--in" in args else sys.stdin.buffer
+    in_path = args[args.index("--in") + 1] if "--in" in args else "-"
+    src = open(in_path, "rb") if in_path != "-" else sys.stdin.buffer
     total = 0
     head = b""
     sent = False
 
     def send() -> None:
-        text = lines.replace("{bytes}", str(total)).replace("{head}", head.hex())
+        text = lines.replace("{bytes}", str(total)).replace("{head}", head.hex()).replace("{in}", in_path)
         out.write((text + "\n").encode())
         out.flush()
         sys.stderr.write(f"fake_lines: sent lines after {total} bytes\n")

@@ -10,7 +10,9 @@
 //! **A run.** Pick a free loopback port when the args or output use `$port`; substitute
 //! `$port`, `$rate_hz` (the row's `input.rate_hz`), `$center_hz` (the first IQ frame's
 //! centre, waited for only when used) and `$fifo` (the named pipe the input goes to with
-//! `via: fifo`, in a directory this run owns); spawn ([`crate::proc`]); feed the IQ
+//! `via: fifo`, in a directory of its own under the stage's run directory,
+//! `<state_dir>/run` on a node, removed when the run ends; a stage without one fails a
+//! fifo row); spawn ([`crate::proc`]); feed the IQ
 //! frames resampled from the rate each frame carries to `input.rate_hz` and written as
 //! `input.format` (`cu8`, `cs8`, `cs16`, `cf32`, interleaved I/Q, little-endian) to stdin
 //! or the fifo; read output lines from stdout or the TCP port (connecting with retries
@@ -81,6 +83,7 @@ pub struct ExternalDecodeStage {
     spec: StageSpec,
     modes: ModesHandle,
     env: Vec<(OsString, OsString)>,
+    run_dir: Option<PathBuf>,
 }
 
 impl ExternalDecodeStage {
@@ -103,7 +106,15 @@ impl ExternalDecodeStage {
             },
             modes: handle,
             env: Vec::new(),
+            run_dir: None,
         }
+    }
+
+    /// The directory fifo rows make their pipes in (`<state_dir>/run` on a node), made
+    /// when first needed. Without one a fifo row fails.
+    pub fn with_run_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.run_dir = Some(dir.into());
+        self
     }
 
     /// Extra variables for the child, on top of the cleared environment (tests).
@@ -117,42 +128,46 @@ impl ExternalDecodeStage {
             .extend(vars.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
     }
+}
 
-    /// The ready program row `id` and the program it runs. The registry's probed
-    /// program, else (a registry nobody probed, as in tests) the row's `programs`
-    /// looked up now.
-    fn resolve(&self, id: &str) -> Result<(ModeRow, PathBuf), StageError> {
-        let failed = |m: String| StageError::Failed(m);
-        let reg = self
-            .modes
-            .get()
-            .ok_or_else(|| failed("external_decode: no mode registry".into()))?;
-        let m = reg
-            .get(id)
-            .ok_or_else(|| failed(format!("external_decode: unknown mode {id}")))?;
-        if m.state != ModeState::Ready {
-            return Err(failed(format!(
-                "{id}: {}",
-                m.reason.as_deref().unwrap_or("not ready")
-            )));
-        }
-        let Decoder::Program(block) = &m.row.decoder else {
-            return Err(failed(format!(
-                "external_decode: mode {id} is not a program row"
-            )));
-        };
-        let program = m
-            .program
-            .clone()
-            .or_else(|| proc::find_handler(&block.programs))
-            .ok_or_else(|| {
-                failed(format!(
-                    "{id}: no program found (tried {})",
-                    block.programs.join(", ")
-                ))
-            })?;
-        Ok((m.row.clone(), program))
+/// The ready program row `id` of the registry `handle` holds and the program it runs:
+/// the registry's probed program, else (a registry nobody probed, as in tests) the row's
+/// `programs` looked up now. Shared by `external_decode` and the `adsb_decode` alias so
+/// both apply the same readiness rules. Failures: `<prefix>: no mode registry`,
+/// `<prefix>: unknown mode <id>`, `<id>: <reason>` for a row that is not ready,
+/// `<prefix>: mode <id> is not a program row`, `<id>: no program found (tried ...)`.
+pub(crate) fn resolve(
+    handle: &ModesHandle,
+    id: &str,
+    prefix: &str,
+) -> Result<(ModeRow, PathBuf), StageError> {
+    let failed = |m: String| StageError::Failed(m);
+    let reg = handle
+        .get()
+        .ok_or_else(|| failed(format!("{prefix}: no mode registry")))?;
+    let m = reg
+        .get(id)
+        .ok_or_else(|| failed(format!("{prefix}: unknown mode {id}")))?;
+    if m.state != ModeState::Ready {
+        return Err(failed(format!(
+            "{id}: {}",
+            m.reason.as_deref().unwrap_or("not ready")
+        )));
     }
+    let Decoder::Program(block) = &m.row.decoder else {
+        return Err(failed(format!("{prefix}: mode {id} is not a program row")));
+    };
+    let program = m
+        .program
+        .clone()
+        .or_else(|| proc::find_handler(&block.programs))
+        .ok_or_else(|| {
+            failed(format!(
+                "{id}: no program found (tried {})",
+                block.programs.join(", ")
+            ))
+        })?;
+    Ok((m.row.clone(), program))
 }
 
 #[async_trait]
@@ -176,18 +191,23 @@ impl Stage for ExternalDecodeStage {
     ) -> Result<(), StageError> {
         let p: ExternalParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("external_decode params: {e}")))?;
-        let (row, program) = self.resolve(&p.mode)?;
-        run_row(&row, &program, &self.env, inputs, outputs, bus, cancel, ctx).await
+        let (row, program) = resolve(&self.modes, &p.mode, EXTERNAL_DECODE_KIND)?;
+        let run_dir = self.run_dir.as_deref();
+        run_row(
+            &row, &program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
+        )
+        .await
     }
 }
 
-/// Run `program` as program row `row`'s decoder (see the module docs). `row` must be a
-/// program row.
+/// Run `program` as program row `row`'s decoder (see the module docs), a fifo input in
+/// a directory of its own under `run_dir`. `row` must be a program row.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_row(
     row: &ModeRow,
     program: &Path,
     env: &[(OsString, OsString)],
+    run_dir: Option<&Path>,
     mut inputs: Vec<broadcast::Receiver<Frame>>,
     outputs: Vec<StreamId>,
     bus: Arc<StreamBus>,
@@ -232,7 +252,17 @@ pub async fn run_row(
     };
     // The fifo's directory lives as long as the run.
     let fifo_dir = match block.input.via {
-        InputVia::Fifo => Some(fifo_dir().map_err(|e| fail(format!("no fifo directory: {e}")))?),
+        InputVia::Fifo => {
+            let Some(run_dir) = run_dir else {
+                return Err(fail("fifo input needs a run directory".into()));
+            };
+            Some(fifo_dir(run_dir).map_err(|e| {
+                fail(format!(
+                    "no fifo directory under {}: {e}",
+                    run_dir.display()
+                ))
+            })?)
+        }
         InputVia::Stdin => None,
     };
     let fifo = fifo_dir.as_ref().map(|d| d.path().join("input"));
@@ -584,15 +614,13 @@ async fn connect(
     }
 }
 
-/// A directory for this run's fifo, removed when dropped: under `$XDG_RUNTIME_DIR` when
-/// set, else the system's temporary directory.
-fn fifo_dir() -> io::Result<tempfile::TempDir> {
-    let mut b = tempfile::Builder::new();
-    b.prefix("zeta-external-");
-    match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
-        Some(d) => b.tempdir_in(d),
-        None => b.tempdir(),
-    }
+/// A directory of this run's own under `run_dir` (made when missing) for its fifo,
+/// removed with the fifo when dropped.
+fn fifo_dir(run_dir: &Path) -> io::Result<tempfile::TempDir> {
+    std::fs::create_dir_all(run_dir)?;
+    tempfile::Builder::new()
+        .prefix("external-")
+        .tempdir_in(run_dir)
 }
 
 #[cfg(unix)]

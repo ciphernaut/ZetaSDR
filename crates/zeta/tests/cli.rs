@@ -2126,6 +2126,14 @@ fn source_gain_cli_requires_db_or_auto() {
     assert!(json(&out)["value"][0]["gain"].is_null());
 }
 
+/// The test stand-in for dump1090 (`crates/zeta-ext/tests/fake_dump1090`), absolute.
+fn fake_dump1090() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../zeta-ext/tests/fake_dump1090")
+        .canonicalize()
+        .unwrap()
+}
+
 /// `zeta modes list` (one-shot) prints the five embedded rows, all ready; `--family`
 /// narrows it and `modes show` prints one row.
 #[test]
@@ -2134,7 +2142,9 @@ fn modes_list_prints_the_five_rows() {
     let modes = dir.path().join("modes");
     std::fs::create_dir_all(&modes).unwrap();
     let modes_dir = modes.display().to_string();
+    // adsb_decode is ready only with a dump1090: pin it to the fake, whatever the host has.
     let out = zeta(dir.path(), &["--modes-dir", &modes_dir, "modes", "list"])
+        .env("ZETA_HANDLER_DUMP1090", fake_dump1090())
         .assert()
         .success()
         .get_output()
@@ -2231,8 +2241,7 @@ fn handler_report_lists_missing_programs_with_suggestions() {
     let aprs = rows.iter().find(|m| m["id"] == "aprs_decode").unwrap();
     assert_eq!(aprs["state"], "ready", "{v}");
 
-    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("../zeta-ext/tests/fake_dump1090");
-    let fake = fake.canonicalize().unwrap();
+    let fake = fake_dump1090();
     let out = zeta(dir.path(), &["modes", "list"])
         .env("PATH", &empty)
         .env("ZETA_HANDLER_DUMP1090", &fake)
