@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::Inner;
 use super::persist::now;
-use crate::graph::Graph;
+use crate::graph::{self, Edge, Graph, Node as GraphNode, NodeId};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::modes::ModeState;
 use crate::modes::score::score_rows;
@@ -154,7 +154,13 @@ pub(super) struct Policy {
     free: bool,
     prefer: Vec<SourceId>,
     gone_ms: u64,
+    /// The `sink_sondehub` params every decoder graph the watch starts gets a sink with
+    /// (`sondehub` in the `detect` node's params; none appends nothing).
+    sondehub: Option<serde_json::Value>,
 }
+
+/// The sonde feed's stage kind (registered by `zeta-ext`).
+const SONDEHUB_STAGE: &str = "sink_sondehub";
 
 impl Policy {
     /// The policy in `graph`'s `detect` node: `decode_on` (`capture`, default, or
@@ -177,6 +183,7 @@ impl Policy {
                 })
                 .unwrap_or_default(),
             gone_ms: p["gone_ms"].as_u64().unwrap_or(DETECT_GONE_MS_DEFAULT),
+            sondehub: Some(p["sondehub"].clone()).filter(|v| !v.is_null()),
         }
     }
 }
@@ -600,6 +607,7 @@ impl Inner {
         source: &SourceId,
         mode: &str,
         tuning: Tuning,
+        sondehub: Option<&serde_json::Value>,
     ) -> Result<JobId, String> {
         let port = self
             .ports
@@ -625,7 +633,13 @@ impl Inner {
             &self.modes,
         );
         let started = match graph {
-            Ok(graph) => {
+            Ok(mut graph) => {
+                let before = graph.nodes.len();
+                if let Some(p) = sondehub {
+                    self.append_sink(&mut graph, p);
+                }
+                // A graph with the sink is launched as stored: a re-expansion would drop it.
+                let with_sink = graph.nodes.len() > before;
                 let rec = JobRecord {
                     format: JOB_RECORD_FORMAT,
                     id: JobId::new(),
@@ -639,7 +653,7 @@ impl Inner {
                     input: None,
                     capture_rate_hz: Some(granted.bandwidth_hz.0),
                     elastic: false,
-                    operator_graph: false,
+                    operator_graph: with_sink,
                     owner: None,
                 };
                 let id = rec.id.clone();
@@ -677,6 +691,8 @@ impl Inner {
     ) -> (JobId, SourceId, Placed, Option<String>) {
         let kept = (proved.clone(), r.prov.source.clone(), Placed::Capture);
         if !r.seed.policy.free {
+            self.sink_into(proved, r.seed.policy.sondehub.as_ref())
+                .await;
             return (kept.0, kept.1, kept.2, None);
         }
         let width = self
@@ -708,7 +724,10 @@ impl Inner {
         };
         let mut refused = Vec::new();
         for source in free {
-            match self.start_on(&source, mode, tuning).await {
+            match self
+                .start_on(&source, mode, tuning, r.seed.policy.sondehub.as_ref())
+                .await
+            {
                 Ok(job) => {
                     self.stop_started(r, proved, &r.prov.source).await;
                     return (job, source, Placed::Free, None);
@@ -720,7 +739,70 @@ impl Inner {
             true => "no free source".to_string(),
             false => format!("no free source took it ({})", refused.join("; ")),
         };
+        self.sink_into(proved, r.seed.policy.sondehub.as_ref())
+            .await;
         (kept.0, kept.1, kept.2, Some(why))
+    }
+
+    /// Append a `sink_sondehub` node with params `sondehub` to `graph`, fed by the event
+    /// output of its last event-producing node. Left as it is when the graph has no such
+    /// node, already has a sink, or the graph with the sink would not validate (the
+    /// decoder runs without the feed rather than not at all).
+    fn append_sink(&self, graph: &mut Graph, sondehub: &serde_json::Value) {
+        if graph.nodes.iter().any(|n| n.kind == SONDEHUB_STAGE) {
+            return;
+        }
+        let from = graph.nodes.iter().rev().find(|n| {
+            self.registry
+                .spec(&n.kind)
+                .is_some_and(|s| s.outputs.contains(&StreamKind::Event))
+                && !graph
+                    .edges
+                    .iter()
+                    .any(|e| e.from == n.id && e.kind == StreamKind::Event)
+        });
+        let Some(from) = from.map(|n| n.id.clone()) else {
+            return;
+        };
+        let to = NodeId("sondehub".into());
+        let mut with = graph.clone();
+        with.nodes.push(GraphNode {
+            id: to.clone(),
+            kind: SONDEHUB_STAGE.into(),
+            params: sondehub.clone(),
+        });
+        with.edges.push(Edge {
+            from,
+            to,
+            kind: StreamKind::Event,
+        });
+        if graph::validate(&with, &self.registry).is_ok() {
+            *graph = with;
+        }
+    }
+
+    /// Give the running decoder `job` the sink (`graph_put`'s restart under the same id).
+    async fn sink_into(self: &Arc<Self>, job: &JobId, sondehub: Option<&serde_json::Value>) {
+        let Some(sondehub) = sondehub else {
+            return;
+        };
+        let Some(mut graph) = self
+            .jobs
+            .lock()
+            .unwrap()
+            .get(job)
+            .map(|e| e.record.graph.clone())
+        else {
+            return;
+        };
+        let before = graph.nodes.len();
+        self.append_sink(&mut graph, sondehub);
+        if graph.nodes.len() > before {
+            // Stopping an owned job forgets its record: it is the watch's ordinary decoder
+            // from here on (the caller disowns it too).
+            self.disown(job);
+            let _ = self.swap_graph(job, graph, None, true).await;
+        }
     }
 
     /// Subscribe to `job`'s event outputs, for its silence.

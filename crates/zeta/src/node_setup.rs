@@ -72,6 +72,7 @@ pub fn registry(
     }
     registry.register(Arc::new(external));
     registry.register(Arc::new(adsb));
+    registry.register(Arc::new(zeta_ext::SondehubStage::new()));
     registry
 }
 

@@ -219,6 +219,16 @@ impl Inner {
         // The job's output streams (no edge consumes them), in graph order: what a job
         // attached to this one can read.
         let mut job_outputs = Vec::new();
+        // The nodes with no outputs (a sink): an edge into one is still an output of
+        // the job, so the sink does not hide the events it is fed from `stream tail`
+        // and from the watch's silence check.
+        let sinks: HashSet<&NodeId> = graph
+            .nodes
+            .iter()
+            .zip(&stages)
+            .filter(|(_, st)| st.spec().outputs.is_empty())
+            .map(|(n, _)| &n.id)
+            .collect();
         let mut set = JoinSet::new();
         for (n, stage) in graph.nodes.iter().zip(stages) {
             let mut inputs = Vec::new();
@@ -229,6 +239,9 @@ impl Inner {
                 }
                 if e.from == n.id {
                     leaving.push((e.kind, sid.clone()));
+                    if sinks.contains(&e.to) {
+                        job_outputs.push((e.kind, sid.clone()));
+                    }
                 }
             }
             if inputs.is_empty()

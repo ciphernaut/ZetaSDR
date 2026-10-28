@@ -277,6 +277,50 @@ impl Inner {
         self.stop_with(id, false).await
     }
 
+    /// Store `graph` as job `id`'s (`capture_rate_hz` as in [`Node::job_graph_set`]) and,
+    /// when it `running`, restart it under the same id.
+    pub(crate) async fn swap_graph(
+        self: &Arc<Self>,
+        id: &JobId,
+        graph: Graph,
+        capture_rate_hz: Option<Option<u64>>,
+        running: bool,
+    ) -> Result<(), NodeError> {
+        if running {
+            // A controller's run tells this restart from a `job_stop` by the flag.
+            if let Some(e) = self.jobs.lock().unwrap().get_mut(id) {
+                e.restarting = true;
+            }
+            if let Err(e) = self.stop(id).await {
+                if let Some(e) = self.jobs.lock().unwrap().get_mut(id) {
+                    e.restarting = false;
+                }
+                return Err(e);
+            }
+        }
+        let rec = {
+            let mut jobs = self.jobs.lock().unwrap();
+            let entry = jobs
+                .get_mut(id)
+                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            let rec = JobRecord {
+                graph,
+                capture_rate_hz: capture_rate_hz.flatten(),
+                operator_graph: capture_rate_hz.is_none(),
+                ..entry.record.clone()
+            };
+            persist(&self.jobs_dir, &rec)?;
+            entry.record = rec.clone();
+            rec
+        };
+        if running {
+            self.launch_task(rec)
+                .await
+                .map_err(|e| NodeError::Other(format!("launch task: {e}")))??;
+        }
+        Ok(())
+    }
+
     /// [`Inner::stop`] while the caller holds the job's source gate: the port
     /// is not idled (the caller's request is about to tune it, and the idle
     /// would wait on that gate), and a supervisor already past its cleanup and
@@ -1297,37 +1341,9 @@ impl Node {
             None => None,
             Some(r) => Some(Some(r.0)),
         };
-        if running {
-            // A controller's run tells this restart from a `job_stop` by the flag.
-            if let Some(e) = self.inner.jobs.lock().unwrap().get_mut(id) {
-                e.restarting = true;
-            }
-            if let Err(e) = self.job_stop(id).await {
-                if let Some(e) = self.inner.jobs.lock().unwrap().get_mut(id) {
-                    e.restarting = false;
-                }
-                return Err(e);
-            }
-        }
-        let rec = {
-            let mut jobs = self.inner.jobs.lock().unwrap();
-            let entry = jobs
-                .get_mut(id)
-                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
-            let rec = JobRecord {
-                graph,
-                capture_rate_hz: capture_rate_hz.flatten(),
-                operator_graph: capture_rate_hz.is_none(),
-                ..entry.record.clone()
-            };
-            persist(&self.inner.jobs_dir, &rec)?;
-            entry.record = rec.clone();
-            rec
-        };
-        if running {
-            self.inner.launch(rec).await?;
-        }
-        Ok(())
+        self.inner
+            .swap_graph(id, graph, capture_rate_hz, running)
+            .await
     }
 
     /// Every job record, oldest first.

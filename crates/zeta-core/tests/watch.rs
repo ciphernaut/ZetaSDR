@@ -14,13 +14,15 @@ use num_complex::Complex;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use zeta_core::capture::{CaptureMeta, write_cf32};
-use zeta_core::graph::Graph;
+use zeta_core::graph::{Edge, Graph, Node as GraphNode, NodeId};
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
-use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::stream::Payload;
+use zeta_core::stage::{
+    Backend, PassthroughStage, Stage, StageContext, StageError, StageRegistry, StageSpec,
+};
+use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Capabilities, Hz, JobId, SourceId, StreamKind, Timestamp};
 use zeta_source_file::{FileOpts, FileSource};
 
@@ -123,9 +125,49 @@ fn write(dir: &Path, stem: &str, iq: &[Complex<f32>], center_hz: u64) -> PathBuf
     write_cf32(dir, stem, &meta, iq).expect("write fixture")
 }
 
+/// Stands in for `zeta-ext`'s `sink_sondehub`: an event input and no outputs, reading
+/// until its input closes.
+struct FakeSink(StageSpec);
+
+#[async_trait]
+impl Stage for FakeSink {
+    fn spec(&self) -> &StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        mut inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<zeta_core::types::StreamId>,
+        _bus: Arc<StreamBus>,
+        cancel: tokio_util::sync::CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        assert!(outputs.is_empty(), "a sink has no output streams");
+        let mut rx = inputs.remove(0);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                r = rx.recv() => if let Err(broadcast::error::RecvError::Closed) = r {
+                    return Ok(());
+                },
+            }
+        }
+    }
+}
+
 fn registry() -> StageRegistry {
     let mut r = StageRegistry::new();
     r.register(Arc::new(PassthroughStage::new()));
+    r.register(Arc::new(FakeSink(StageSpec {
+        kind: "sink_sondehub",
+        inputs: vec![StreamKind::Event],
+        outputs: vec![],
+        params_schema: schemars::json_schema!({"type": "object"}),
+    })));
     zeta_dsp::register_all(&mut r);
     r
 }
@@ -1011,5 +1053,126 @@ async fn graph_put_with_bad_detect_params_is_refused() {
     assert_eq!(state(&node, &watch), Some(JobState::Running));
     assert_eq!(state(&node, &job), Some(JobState::Running));
     assert_eq!(decoding(&node, &watch)[0]["job"], job.0.as_str());
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_with_sondehub_appends_the_sink() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let sondehub = serde_json::json!({
+        "callsign": "TEST", "lat": -27.5, "lon": 153.0, "alt_m": 10, "batch_ms": 5000,
+        "url": "http://127.0.0.1:1/"
+    });
+    let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub })).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let graph = match node.apply(Op::GraphGet { job: job.clone() }).await {
+        Ok(OpResult::Graph(g)) => g,
+        r => panic!("graph_get: {r:?}"),
+    };
+    let sink = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "sink_sondehub")
+        .unwrap_or_else(|| panic!("no sink in {graph:#?}"));
+    assert_eq!(sink.params, sondehub);
+    let edge = graph.edges.iter().find(|e| e.to == sink.id).expect("fed");
+    assert_eq!(edge.kind, StreamKind::Event);
+    let from = graph.nodes.iter().find(|n| n.id == edge.from).unwrap();
+    assert_eq!(from.kind, "pocsag_decode", "{graph:#?}");
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    // The sink adds no stream: the decoder's own event output is still the job's.
+    assert!(
+        node.job_outputs(&job)
+            .iter()
+            .any(|(k, _)| *k == StreamKind::Event)
+    );
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_without_sondehub_appends_nothing() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let rec = record(&node, &job).unwrap();
+    assert!(rec.graph.nodes.iter().all(|n| n.kind != "sink_sondehub"));
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stage_with_no_outputs_launches_and_stops_cleanly() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let n = |id: &str, kind: &str, params: Value| GraphNode {
+        id: NodeId(id.into()),
+        kind: kind.into(),
+        params,
+    };
+    let graph = Graph {
+        id: zeta_core::graph::GraphId("sink".into()),
+        nodes: vec![
+            n("in", "passthrough", serde_json::json!({"kind": "event"})),
+            n("out", "sink_sondehub", serde_json::json!({})),
+        ],
+        edges: vec![Edge {
+            from: NodeId("in".into()),
+            to: NodeId("out".into()),
+            kind: StreamKind::Event,
+        }],
+    };
+    // A built-in kind's graph is re-expanded at launch; a put one is launched as stored.
+    let first = JobKind::Passthrough
+        .expand(
+            &rx(),
+            capture(),
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    let job = node
+        .job_start(
+            "passthrough",
+            rx(),
+            capture(),
+            first,
+            Some(Hz(RATE_HZ as u64)),
+            false,
+        )
+        .await
+        .unwrap();
+    node.job_graph_put(&job, graph).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    assert!(
+        node.debug_stage_count() >= 2,
+        "{}",
+        node.debug_stage_count()
+    );
+    // The edge into the sink is still an output of the job, so its events stay tailable.
+    assert!(
+        node.job_outputs(&job)
+            .iter()
+            .any(|(k, _)| *k == StreamKind::Event)
+    );
+    node.job_stop(&job).await.unwrap();
+    until("no stages", Duration::from_secs(5), || {
+        node.debug_stage_count() == 0
+    })
+    .await;
+    assert_eq!(state(&node, &job), Some(JobState::Stopped));
     stop_all(&node).await;
 }
