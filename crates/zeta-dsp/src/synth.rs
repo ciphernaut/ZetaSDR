@@ -718,9 +718,184 @@ pub fn acars_packet_iq(
     am_modulate(&audio, AUDIO_RATE, iq_rate_hz, 0.9, offset_hz)
 }
 
+/// Gap between the bursts of a generic family's `repeat`, in milliseconds.
+const BURST_GAP_MS: u64 = 50;
+
+/// The sample rate of the generic `fsk`/`psk`/`ook` families: 48 kHz up to 4800
+/// baud, 240 kHz up to 24 000 baud, else 2.4 MHz.
+fn generic_rate_hz(symbol_rate_baud: u32) -> u32 {
+    match symbol_rate_baud {
+        0..=4800 => 48_000,
+        4801..=24_000 => 240_000,
+        _ => 2_400_000,
+    }
+}
+
+/// Hex digits as bits, most significant first; `None` for an empty string, an odd
+/// length or a non-hex character.
+fn hex_bits(hex: &str) -> Option<Vec<u8>> {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() * 4);
+    for c in hex.chars() {
+        let v = c.to_digit(16)?;
+        out.extend((0..4).rev().map(|b| ((v >> b) & 1) as u8));
+    }
+    Some(out)
+}
+
+/// A generic family's `bits` as symbols `0..order`: a plain hex string is the exact
+/// bit pattern, `pattern:<hex>` repeats it until one second of symbols; `order` 4
+/// consumes bit pairs (a lone last bit is padded with 0).
+fn generic_symbols(bits: &str, order: u8, symbol_rate_baud: u32) -> Result<Vec<u8>, String> {
+    const ERR: &str = "bits: hex or pattern:<hex>";
+    let per_symbol = if order == 4 { 2 } else { 1 };
+    let mut b: Vec<u8> = match bits.strip_prefix("pattern:") {
+        Some(hex) => {
+            let one = hex_bits(hex).ok_or(ERR)?;
+            let want = (symbol_rate_baud as usize * per_symbol).max(one.len());
+            one.iter().copied().cycle().take(want).collect()
+        }
+        None => hex_bits(bits).ok_or(ERR)?,
+    };
+    if !b.len().is_multiple_of(per_symbol) {
+        b.push(0);
+    }
+    Ok(b.chunks(per_symbol)
+        .map(|c| c.iter().fold(0, |a, &x| a << 1 | x))
+        .collect())
+}
+
+/// Gaussian-filtered FSK (BT 0.5, the pulse spanning 2 symbol periods) of `symbols`
+/// (each `0..order`) at `symbol_rate_baud`, sampled at `rate_hz`. Order 2 maps 0/1 to
+/// -`deviation_hz`/+`deviation_hz`; order 4 maps 0..3 to -3d, -d, +d, +3d with
+/// `d = deviation_hz / 3`, so the outer tones sit at ±`deviation_hz`. The Gaussian has
+/// unit DC gain, so a run of one symbol reaches its tone.
+pub fn gfsk_modulate(
+    symbols: &[u8],
+    order: u8,
+    symbol_rate_baud: u32,
+    deviation_hz: f64,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    if symbols.is_empty() {
+        return Vec::new();
+    }
+    let sps = f64::from(rate_hz) / f64::from(symbol_rate_baud);
+    let freq_of = |s: u8| match order {
+        4 => (f64::from(s) * 2.0 - 3.0) * deviation_hz / 3.0,
+        _ => f64::from(s) * 2.0 * deviation_hz - deviation_hz,
+    };
+    let n = (symbols.len() as f64 * sps) as usize;
+    let raw: Vec<f64> = (0..n)
+        .map(|i| freq_of(symbols[((i as f64 / sps) as usize).min(symbols.len() - 1)]))
+        .collect();
+    let sigma = 2f64.ln().sqrt() / (2.0 * PI * 0.5) * sps;
+    let half = sps.round() as isize;
+    let mut kernel: Vec<f64> = (-half..=half)
+        .map(|k| (-0.5 * (k as f64 / sigma).powi(2)).exp())
+        .collect();
+    let norm: f64 = kernel.iter().sum();
+    kernel.iter_mut().for_each(|k| *k /= norm);
+    let mut phase = 0.0f64;
+    (0..n)
+        .map(|i| {
+            let f: f64 = kernel
+                .iter()
+                .enumerate()
+                .map(|(j, k)| {
+                    let idx = (i as isize + j as isize - half).clamp(0, n as isize - 1);
+                    k * raw[idx as usize]
+                })
+                .sum();
+            phase += 2.0 * PI * f / f64::from(rate_hz);
+            let (sn, cs) = phase.sin_cos();
+            Complex::new(cs as f32, sn as f32)
+        })
+        .collect()
+}
+
+/// PSK of `symbols` with a raised-cosine pulse (roll-off 0.35, ±3 symbols): BPSK for
+/// order 2 (±1), QPSK for order 4 (phase pi/4 + k pi/2).
+fn psk_modulate(
+    symbols: &[u8],
+    order: u8,
+    symbol_rate_baud: u32,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    const BETA: f64 = 0.35;
+    let sps = f64::from(rate_hz) / f64::from(symbol_rate_baud);
+    let point = |s: u8| match order {
+        4 => Complex::from_polar(1.0, PI / 4.0 + f64::from(s) * PI / 2.0),
+        _ => Complex::new(f64::from(s) * 2.0 - 1.0, 0.0),
+    };
+    let pulse = |t: f64| {
+        let sinc = if t == 0.0 {
+            1.0
+        } else {
+            (PI * t).sin() / (PI * t)
+        };
+        let d = 1.0 - (2.0 * BETA * t).powi(2);
+        if d.abs() < 1e-9 {
+            PI / 4.0 * sinc
+        } else {
+            sinc * (PI * BETA * t).cos() / d
+        }
+    };
+    let n = (symbols.len() as f64 * sps) as usize;
+    (0..n)
+        .map(|i| {
+            let c = (i as f64 / sps - 0.5).round() as isize;
+            let mut acc = Complex::new(0.0f64, 0.0);
+            for k in (c - 3).max(0)..=(c + 3).min(symbols.len() as isize - 1) {
+                acc += point(symbols[k as usize]) * pulse(i as f64 / sps - k as f64 - 0.5);
+            }
+            Complex::new(acc.re as f32, acc.im as f32)
+        })
+        .collect()
+}
+
+/// On-off keying: full amplitude for a 1, silence for a 0.
+fn ook_modulate(symbols: &[u8], symbol_rate_baud: u32, rate_hz: u32) -> Vec<Complex<f32>> {
+    if symbols.is_empty() {
+        return Vec::new();
+    }
+    let sps = f64::from(rate_hz) / f64::from(symbol_rate_baud);
+    let n = (symbols.len() as f64 * sps) as usize;
+    (0..n)
+        .map(|i| {
+            let s = symbols[((i as f64 / sps) as usize).min(symbols.len() - 1)];
+            Complex::new(f32::from(s), 0.0)
+        })
+        .collect()
+}
+
+/// `repeat` copies of `burst` with [`BURST_GAP_MS`] of silence between them.
+fn repeat_bursts(burst: Vec<Complex<f32>>, repeat: u32, rate_hz: u32) -> Vec<Complex<f32>> {
+    let gap = (u64::from(rate_hz) * BURST_GAP_MS / 1000) as usize;
+    let mut out = Vec::with_capacity((burst.len() + gap) * repeat as usize);
+    for r in 0..repeat {
+        if r > 0 {
+            out.resize(out.len() + gap, Complex::new(0.0, 0.0));
+        }
+        out.extend_from_slice(&burst);
+    }
+    out
+}
+
+fn generic_params(symbol_rate_baud: u32, repeat: u32) -> Result<(), String> {
+    if symbol_rate_baud == 0 {
+        return Err("symbol_rate_baud: at least 1".into());
+    }
+    if repeat == 0 {
+        return Err("repeat: at least 1".into());
+    }
+    Ok(())
+}
+
 /// What a mode row's `test` block synthesises (`family` names the variant); the
-/// parameters of [`synthesise`]'s signal. Echo and other multipath impairments are
-/// deferred to plan 17.
+/// parameters of [`synthesise`]'s signal.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "family", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -754,6 +929,28 @@ pub enum SynthSpec {
     },
     /// A tone frequency-modulated onto a carrier: one second of `tone_hz`.
     NbfmTone { tone_hz: f64, deviation_hz: f64 },
+    /// Gaussian FSK (BT 0.5) of `bits` (hex, or `pattern:<hex>` repeated to one
+    /// second), `order` 2 or 4, in `repeat` bursts 50 ms apart.
+    Fsk {
+        symbol_rate_baud: u32,
+        deviation_hz: f64,
+        order: u8,
+        bits: String,
+        repeat: u32,
+    },
+    /// PSK (raised cosine, roll-off 0.35) of `bits`, `order` 2 (BPSK) or 4 (QPSK).
+    Psk {
+        symbol_rate_baud: u32,
+        order: u8,
+        bits: String,
+        repeat: u32,
+    },
+    /// On-off keying of `bits`.
+    Ook {
+        symbol_rate_baud: u32,
+        bits: String,
+        repeat: u32,
+    },
 }
 
 /// Impairments applied to a synthesised signal; each defaults to none.
@@ -771,6 +968,19 @@ pub struct Impairments {
     /// `1 + ppm / 1e6` ([`resample_linear`]), so its length changes by that ratio.
     #[serde(default)]
     pub ppm: f64,
+    /// A delayed copy of the signal added to it (multipath); `None` for none.
+    #[serde(default)]
+    pub echo: Option<Echo>,
+}
+
+/// An echo: the signal delayed by `delay_us` (rounded to whole samples) and added at
+/// `gain_db` relative to it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct Echo {
+    pub delay_us: u32,
+    pub gain_db: f32,
 }
 
 /// Seed of the noise [`Impairments::snr_db`] adds, so a check is repeatable.
@@ -823,6 +1033,33 @@ impl SynthSpec {
                     ));
                 }
             }
+            SynthSpec::Fsk {
+                symbol_rate_baud,
+                order,
+                bits,
+                repeat,
+                ..
+            }
+            | SynthSpec::Psk {
+                symbol_rate_baud,
+                order,
+                bits,
+                repeat,
+            } => {
+                if !matches!(order, 2 | 4) {
+                    return Err("order: 2 or 4".into());
+                }
+                generic_params(*symbol_rate_baud, *repeat)?;
+                generic_symbols(bits, *order, *symbol_rate_baud)?;
+            }
+            SynthSpec::Ook {
+                symbol_rate_baud,
+                bits,
+                repeat,
+            } => {
+                generic_params(*symbol_rate_baud, *repeat)?;
+                generic_symbols(bits, 2, *symbol_rate_baud)?;
+            }
             SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
         }
         Ok(())
@@ -837,18 +1074,27 @@ impl SynthSpec {
             SynthSpec::Rds { .. } => 240_000,
             SynthSpec::ModesIdent { .. } => 2_400_000,
             SynthSpec::NbfmTone { .. } => 48_000,
+            SynthSpec::Fsk {
+                symbol_rate_baud, ..
+            }
+            | SynthSpec::Psk {
+                symbol_rate_baud, ..
+            }
+            | SynthSpec::Ook {
+                symbol_rate_baud, ..
+            } => generic_rate_hz(*symbol_rate_baud),
         }
     }
 }
 
 /// Split a row test block's synthesiser parameters (everything but `kind`, `expect` and
 /// `within_ms`) into the [`SynthSpec`] and the [`Impairments`] (`snr_db`, `offset_hz`,
-/// `ppm`, each optional). A block that does not parse is the error text.
+/// `ppm`, `echo`, each optional). A block that does not parse is the error text.
 pub fn parse_params(
     mut params: serde_json::Map<String, serde_json::Value>,
 ) -> Result<(SynthSpec, Impairments), String> {
     let mut imp = serde_json::Map::new();
-    for key in ["snr_db", "offset_hz", "ppm"] {
+    for key in ["snr_db", "offset_hz", "ppm", "echo"] {
         if let Some(v) = params.remove(key) {
             imp.insert(key.into(), v);
         }
@@ -900,7 +1146,52 @@ pub fn synthesise(
             let audio = tone(48_000, 48_000, *tone_hz, 1.0);
             nbfm_modulate(&audio, 48_000, rate_hz, *deviation_hz, off)
         }
+        SynthSpec::Fsk {
+            symbol_rate_baud,
+            deviation_hz,
+            order,
+            bits,
+            repeat,
+        } => {
+            let sym = generic_symbols(bits, *order, *symbol_rate_baud).unwrap_or_default();
+            let burst = gfsk_modulate(&sym, *order, *symbol_rate_baud, *deviation_hz, rate_hz);
+            let mut iq = repeat_bursts(burst, *repeat, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Psk {
+            symbol_rate_baud,
+            order,
+            bits,
+            repeat,
+        } => {
+            let sym = generic_symbols(bits, *order, *symbol_rate_baud).unwrap_or_default();
+            let burst = psk_modulate(&sym, *order, *symbol_rate_baud, rate_hz);
+            let mut iq = repeat_bursts(burst, *repeat, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Ook {
+            symbol_rate_baud,
+            bits,
+            repeat,
+        } => {
+            let sym = generic_symbols(bits, 2, *symbol_rate_baud).unwrap_or_default();
+            let burst = ook_modulate(&sym, *symbol_rate_baud, rate_hz);
+            let mut iq = repeat_bursts(burst, *repeat, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
     };
+    if let Some(echo) = imp.echo {
+        let delay = (f64::from(echo.delay_us) * f64::from(rate_hz) / 1e6).round() as usize;
+        let gain = 10f32.powf(echo.gain_db / 20.0);
+        let clean = iq.clone();
+        iq.resize(clean.len() + delay, Complex::new(0.0, 0.0));
+        for (n, s) in clean.iter().enumerate() {
+            iq[n + delay] += *s * gain;
+        }
+    }
     if imp.ppm != 0.0 {
         let from = 1_000_000_000u32;
         let to = (f64::from(from) * (1.0 + imp.ppm / 1e6)).round() as u32;
@@ -954,6 +1245,155 @@ mod tests {
         assert!(iq[26_400].re > 0.5);
         // Trailing 10 ms of silence.
         assert!(iq[iq.len() - 24_000..].iter().all(|s| s.re == 0.0));
+    }
+
+    fn fsk(rate: u32, dev: f64, order: u8, bits: &str) -> SynthSpec {
+        SynthSpec::Fsk {
+            symbol_rate_baud: rate,
+            deviation_hz: dev,
+            order,
+            bits: bits.into(),
+            repeat: 1,
+        }
+    }
+
+    /// Power spectrum (positive and negative bins, DC at `n / 2`) of the first
+    /// `n` samples, and the bin width.
+    fn spectrum(iq: &[Complex<f32>], rate_hz: u32, n: usize) -> (Vec<f32>, f64) {
+        let mut buf: Vec<Complex<f32>> = iq[..n].to_vec();
+        FftPlanner::new().plan_fft_forward(n).process(&mut buf);
+        let mut shifted = vec![0.0; n];
+        for (k, v) in buf.iter().enumerate() {
+            shifted[(k + n / 2) % n] = v.norm_sqr();
+        }
+        (shifted, f64::from(rate_hz) / n as f64)
+    }
+
+    fn peak_hz(p: &[f32], bin: f64, lo: usize, hi: usize) -> f64 {
+        let k = (lo..hi).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
+        (k as f64 - (p.len() / 2) as f64) * bin
+    }
+
+    #[test]
+    fn fsk_tones_sit_at_plus_minus_deviation() {
+        let spec = fsk(4800, 2400.0, 2, "pattern:f0f0");
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 0);
+        let (p, bin) = spectrum(&iq, 48_000, 4096);
+        let (neg, pos) = (peak_hz(&p, bin, 0, 2048), peak_hz(&p, bin, 2048, 4096));
+        assert!((pos - 2400.0).abs() <= 2.0 * bin, "{pos}");
+        assert!((neg + 2400.0).abs() <= 2.0 * bin, "{neg}");
+    }
+
+    #[test]
+    fn fsk4_has_four_tones() {
+        // Each of the four symbols held for 16 symbol periods.
+        let spec = fsk(4800, 3000.0, 4, "pattern:0000000055555555aaaaaaaaffffffff");
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 0);
+        let (p, bin) = spectrum(&iq, 48_000, 4096);
+        let at = |hz: f64| {
+            let k = (2048.0 + hz / bin).round() as usize;
+            p[k - 2..=k + 2].iter().cloned().fold(0.0, f32::max)
+        };
+        let mut sorted = p.clone();
+        sorted.sort_by(f32::total_cmp);
+        let floor = sorted[sorted.len() / 2];
+        for hz in [-3000.0, -1000.0, 1000.0, 3000.0] {
+            assert!(
+                at(hz) > 20.0 * floor,
+                "no tone at {hz}: {} vs floor {floor}",
+                at(hz)
+            );
+        }
+        assert!(at(0.0) < at(1000.0) / 4.0);
+    }
+
+    #[test]
+    fn psk_has_a_carrier_null_and_the_symbol_rate_line() {
+        let spec = SynthSpec::Psk {
+            symbol_rate_baud: 4800,
+            order: 2,
+            bits: "pattern:aa".into(),
+            repeat: 1,
+        };
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 0);
+        let (p, bin) = spectrum(&iq[1000..], 48_000, 4096);
+        let line = p[2048 + (2400.0 / bin).round() as usize];
+        let mirror = p[2048 - (2400.0 / bin).round() as usize];
+        assert!(p[2048] < line / 1000.0, "carrier not nulled");
+        assert!((line / mirror - 1.0).abs() < 0.2, "spectrum not symmetric");
+        // Squared, the BPSK signal's envelope carries the symbol rate.
+        let sq: Vec<Complex<f32>> = iq[1000..].iter().map(|s| s * s).collect();
+        let (q, qbin) = spectrum(&sq, 48_000, 4096);
+        let at_rate = q[2048 + (4800.0 / qbin).round() as usize];
+        assert!(at_rate > 100.0 * q[2048 + (1000.0 / qbin).round() as usize]);
+    }
+
+    #[test]
+    fn ook_is_silent_between_ones() {
+        // 80 = 1 then seven 0s, 4800 baud at 48 kHz: 10 samples per symbol.
+        let spec = SynthSpec::Ook {
+            symbol_rate_baud: 4800,
+            bits: "80".into(),
+            repeat: 1,
+        };
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 0);
+        assert_eq!(iq.len(), 80);
+        assert!(iq[..10].iter().all(|s| s.re == 1.0));
+        assert!(iq[10..].iter().all(|s| s.norm() == 0.0));
+    }
+
+    #[test]
+    fn echo_adds_a_delayed_copy() {
+        // 100 kbaud synthesises at 2.4 MHz: a 24-sample pulse, echo 240 samples later.
+        let spec = SynthSpec::Ook {
+            symbol_rate_baud: 100_000,
+            bits: "80".into(),
+            repeat: 1,
+        };
+        let imp = Impairments {
+            echo: Some(Echo {
+                delay_us: 100,
+                gain_db: -6.0,
+            }),
+            ..Default::default()
+        };
+        let iq = synthesise(&spec, &imp, 2_400_000, 0);
+        assert!((iq[0].re - 1.0).abs() < 1e-6);
+        assert!((iq[240].re - 0.5012).abs() < 1e-3);
+        assert!(iq[100].norm() == 0.0 && iq[300].norm() == 0.0);
+    }
+
+    #[test]
+    fn rates_follow_the_symbol_rate() {
+        let rate = |b| fsk(b, 1000.0, 2, "aa").rate_hz();
+        assert_eq!(rate(4800), 48_000);
+        assert_eq!(rate(9600), 240_000);
+        assert_eq!(rate(100_000), 2_400_000);
+    }
+
+    #[test]
+    fn validate_rejects_bad_order_and_bits() {
+        assert_eq!(
+            fsk(4800, 2400.0, 3, "aa").validate(),
+            Err("order: 2 or 4".into())
+        );
+        for bits in ["a", "zz", "", "pattern:", "pattern:abc"] {
+            assert_eq!(
+                fsk(4800, 2400.0, 2, bits).validate(),
+                Err("bits: hex or pattern:<hex>".into()),
+                "{bits}"
+            );
+        }
+        assert!(fsk(4800, 2400.0, 4, "pattern:1b").validate().is_ok());
+    }
+
+    #[test]
+    fn parse_params_takes_the_echo() {
+        let v = serde_json::json!({"family": "ook", "symbol_rate_baud": 1000,
+            "bits": "80", "repeat": 2, "echo": {"delay_us": 10, "gain_db": -6.0}});
+        let (spec, imp) = parse_params(v.as_object().unwrap().clone()).unwrap();
+        assert!(matches!(spec, SynthSpec::Ook { repeat: 2, .. }));
+        assert_eq!(imp.echo.unwrap().delay_us, 10);
     }
 
     fn aprs() -> SynthSpec {

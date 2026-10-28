@@ -242,6 +242,27 @@ fn a_bad_synth_block_fails_its_row_and_the_rest_still_run() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// A row's synth block may name the generic `fsk` family: it parses, the signal is
+/// produced and the row's decoder runs (the verdict is the decoder's, not a parse error).
+#[test]
+fn a_row_test_may_name_the_fsk_family() {
+    let dir = tempfile::tempdir().unwrap();
+    write_row(
+        dir.path(),
+        "fsk_probe",
+        serde_json::json!({
+            "kind": "synth", "family": "fsk", "symbol_rate_baud": 1200, "deviation_hz": 4500,
+            "order": 2, "bits": "pattern:aa", "repeat": 1,
+            "expect": {}, "within_ms": 2000
+        }),
+    );
+    let (out, _) = stdout(&mut check(dir.path(), &["fsk_probe"]));
+    let line = out.trim();
+    assert!(line.starts_with("fsk_probe: "), "{out}");
+    assert!(!line.starts_with("fsk_probe: fail: row:"), "{out}");
+    assert!(!line.contains("unknown variant"), "{out}");
+}
+
 /// `modes check` writes the state dir, so a running `zeta serve` refuses it like any
 /// mutating one-shot.
 #[test]

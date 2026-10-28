@@ -60,6 +60,7 @@
     "function": 3,
     "text": "HELLO ZETA",
     "baud": 1200,
+    "echo": {"delay_us": 10, "gain_db": -6},
     "expect": {"address": 1234567, "text": "HELLO ZETA"},
     "within_ms": 5000
   }
