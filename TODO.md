@@ -41,6 +41,13 @@ Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acc
 Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.
 In-process hardening only; the node survives a driver crash only with the radio in its own process (plan 20, Soapy worker process).
 
+
+## Bug: a node that loses its only device stays up faulted, so a restart loop never restarts it
+
+Found in plan 14's live acceptance (2026-10-28, HackRF One, two-node form). The in-process hardening works: on a cable pull the child `zeta serve` no longer dies, its source faults `no samples for 1000 ms (device unplugged?)` and every tune answers `device lost ...; restart the node`. But `scratch/serve-hackrf-child.sh` (and any systemd `Restart=on-failure` unit) only restarts a process that exits, so the radio stays dead until an operator kills the child. Wanted: either reopen the device when it reappears on USB (poll `SoapySDR::enumerate` for the same serial every few seconds after a fault, then clear the fault and re-tune the pin) or a `--exit-on-device-loss` (default on for a node whose only sources are Soapy devices) that exits with a distinct code so the loop restarts it. The main node's side already recovers: a re-pin after the child is back restores the capture and the jobs can be restarted.
+
+Scope estimate: 50-100 lines in `zeta-source-soapy` (reopen) or 20 in `node_setup` (exit), one test with the fake driver.
+
 ## Bug: sample timestamps run ahead of wall-clock time (HackRF)
 
 Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.

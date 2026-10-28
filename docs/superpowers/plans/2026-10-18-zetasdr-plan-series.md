@@ -21,7 +21,7 @@ interfaces rather than guessed ones.
 | 11 | View policy | Resume restores the capture (widest first, built-in graphs re-expanded, `capture_rate_hz`); the ops log (`ops.log`, `zeta ops tail`); elastic leases (`job start --elastic`); atomic `replace` (`--replace` on `job start` and `source ensure`); a file-source `tune_range`; UI view policies (`follow`, `zoom_out`, `auto_scan_stop`, `finished_rows_s`, `scanner`) and `view set\|show\|reset\|clear`, automatic scans on a scanner source, a coarse scan layer, eased follow. **Delivered** on branch `worktree-view-policy`, 2026-10-20. Pending: live acceptance on the field host. | 3, 10 |
 | 12 | Capture and transcripts | Resumed channels take the shared bank (the bank factory reaches `Node::open`; the channel's path in `job_context`, `bank` in `source_list`, lag lines by stage kind); rates the resampler accepts (a UHD ladder of exact master-clock divisors in the Soapy source, a snapping `Resampler`); the transcript log (`transcripts.log`, `zeta transcripts tail`); pinned captures (`source_pin`/`source_unpin`, `sources/<id>.json`, restored first on resume); live receive gain (`source_set_gain`, `source_list.gain`, persisted); UI pins and `source pin\|unpin\|gain` commands; `ppm=` correction and an automatic squelch in `fm_demod`/`am_demod`. Spec `docs/superpowers/specs/2026-10-21-capture-and-transcripts-design.md`, plan `docs/superpowers/plans/2026-10-21-capture-and-transcripts.md`. Delivered on branch `worktree-view-policy`, 2026-10-21. Pending: live acceptance on the field host. | 8, 10, 11 |
 | 13 | Channel plans | A table-driven channel-plan registry in `zeta-core` (`uhf_cb_au`, 80 channels; `channel_plans` op, `zeta plans`); the page names channels on job rows, outlines and the axis (`view set plan auto\|<id>\|none`); an adjacent-channel guard in `nbfm_demod` for plan channels (a widened channel, the centre filtered in the stage, the gate held closed under a stronger neighbour; `guard_hz`/`guard_db` node params, `adjacent_db`/`guarded` on `squelch` events); `transcribe`'s `min_utterance_ms` (700); a bounded speech-daemon queue (4 connections, `queued_ms`, `busy`/`queue` drop reasons, one EAGAIN retry); optionally `examples/python/cb_watch.py` (demodulators only on active channels). Spec `docs/superpowers/specs/2026-10-21-channel-plans-design.md`, plan `docs/superpowers/plans/2026-10-21-channel-plans.md`. Delivered on branch `plan-13`, 2026-10-21 (tasks 1-5, base plan 12). Pending: live acceptance on the field host. | 10, 11, 12 |
-| 14 | Field fix wave | The four defects of the 2026-10-23 HackRF session: the Soapy clock guard and stream reopen on a rate change (`source_list.stats`), a run generation on job entries so a stopped run cannot outlive its job (`/health` `stages_running`), `measure` partial windows and discard notes (`BankInfo.dropped`), device loss ending in `abandon` and an overflow-storm fault; field craft for a radio in its own process. Plan `docs/superpowers/plans/2026-10-27-field-fix-wave.md`. **Delivered** on branch `worktree-plan-14`, 2026-10-27 (tasks 1-5). Pending: live acceptance on the HackRF laptop (plan section "Live acceptance"). | 8, 11, 12 |
+| 14 | Field fix wave | The four defects of the 2026-10-23 HackRF session: the Soapy clock guard and stream reopen on a rate change (`source_list.stats`), a run generation on job entries so a stopped run cannot outlive its job (`/health` `stages_running`), `measure` partial windows and discard notes (`BankInfo.dropped`), device loss ending in `abandon` and an overflow-storm fault; field craft for a radio in its own process. Plan `docs/superpowers/plans/2026-10-27-field-fix-wave.md`. **Delivered** on branch `worktree-plan-14`, 2026-10-27 (tasks 1-5), merged to `main`. Live acceptance on the HackRF 2026-10-28 (short form, see "Plan 14 status"): clock, leak, measure and device loss pass; the child node survives a cable pull but must be restarted by hand. | 8, 11, 12 |
 
 Plan 5 completes the first vertical slice (design section 8). Plan 6
 satisfies the GUI half of slice item 4: the context menu's entries and the
@@ -37,7 +37,7 @@ specs are written in a brainstorming session before the plan, as before.
 |---|---|---|---|
 | 14 | Field fix wave (planned, above) | The timestamp bug blocks every UTC-slotted mode (FT8/FT4/WSPR) and TDMA (DMR, TETRA); the run leak would surface in minutes under a span of decoders; `measure` silence blocks layer 4 and `cb_watch.py`. | - |
 | 15 | Scan: alternate the step grid and mask the centre and edge bins | Spec gist in `TODO.md`; the survey tooling built on scan rows inherits the DC spike and edges today. Spec first. | 14 (`stats`, no leaks under repeated retunes) |
-| 16 | Mode registry and external-decoder adaptor | Design spec first (brainstorm): a table-driven mode registry replacing the `JobKind` match for decoders, a declarative stdio wrapper for external decoders, the `video`/`text`/bits payload envelopes, a common decoded-event envelope and feed sinks, `tools/install-vocoders.sh`. No new mode ships here; `adsb_decode` is re-expressed as the first adaptor row. **Merged** to `main` (91886bc), 2026-10-28. Pending: live acceptance on hardware (see "Plan 16 status"). | 14 |
+| 16 | Mode registry and external-decoder adaptor | Design spec first (brainstorm): a table-driven mode registry replacing the `JobKind` match for decoders, a declarative stdio wrapper for external decoders, the `video`/`text`/bits payload envelopes, a common decoded-event envelope and feed sinks, `tools/install-vocoders.sh`. No new mode ships here; `adsb_decode` is re-expressed as the first adaptor row. **Merged** to `main` (91886bc), 2026-10-28. Live acceptance on the HackRF 2026-10-28: registry, check, broken row, handlers, unknown kinds and `identify`'s unknown path pass; the on-air decode proofs await an antenna (see "Plan 16 status"). | 14 |
 | 17 | Decoder wave 1 | HackRF-reachable, AU-relevant, grouped by OnAir's families: M17 and DMR voice (Codec 2 in-crate, AMBE via the install script) feeding `transcribe`; RS41 radiosondes; AIS; FLEX; POCSAG and APRS over a whole span; `rds_decode` stereo pilot report and `wfm_demod` stereo. Each mode a registry row with a generated test signal and a `classify` decode-to-identify hook. | 16 |
 | 18 | UI wave | Box a signal, demod it, refine it on the graph (no channel-grid assumptions); staircase transcript ribbons; mode picking by band through `knowledge_lookup`; the Okudagram (LCARS) theme behind `view set theme`. UI-only; can run beside 16/17. | 13 |
 | 19 | Layer 4 stages | Generic FSK/PSK/OOK demods, clock recovery, slicer, bit viewer with framing and CRC hypotheses, correlator, signature write-back; `measure` symbol-rate and modulation-order upgrades. Two or three plans. | 16 (bits payload) |
@@ -93,14 +93,21 @@ Gates at the branch head (task 9), then on the final tree and on the merged `mai
   features), `zeta agents-md --check` and `--skill --check` are clean; `zeta modes check` prints
   `ok` for the four in-crate rows and `adsb_decode` (dump1090 present on this host).
 
-Live acceptance still pending on hardware: `zeta modes list` shows the five rows `ready` (or
-`adsb_decode` `unavailable` with its suggestion where dump1090 is absent); `zeta modes check --strict`
-passes every row the host can run; `job start --kind pocsag_decode --then-tail` on 148.6375 MHz
-behaves as before and its events carry `summary`; `classify` on an APRS burst lists `tried` with
-`aprs_decode` `proved`; `identify` on a UHF CB voice channel ends `unknown` with an `fm` label and no
-child left; `identify` on 148.6375 MHz ends with a POCSAG verdict and one running `pocsag_decode`
-child; a deliberately broken operator row shows `broken` with its field while the node runs; the
-startup handler report names dump1090 found or missing with the Debian package.
+Live acceptance, 2026-10-28, on the desktop with the HackRF One (release build from `main`
+126765e, operator rows in `scratch/modes`): `zeta modes check --strict` passes the five built-in rows
+and a copied operator row, and fails the deliberately broken row; the node starts with that row,
+logs `zeta: mode pocsag_broken (<file>): row: invalid type ...` and runs; `modes list` shows it
+`broken` with its file and reason, the six others `ready`; the handler report names dump1090 found
+(dump1090-fa 8.2); `job start --kind bogus_mode` answers `unknown` with `field: kind` and the known
+list; `identify` on a UHF CB channel ends `unknown` (label `noise`, 4 attempts, 28 s) with no child
+left and no holder; `adsb_decode` runs dump1090 on the node's feed. Not provable that day: the roof
+discones were disconnected for a storm and the indoor log periodic delivered no decodable signal on
+any band (broadcast FM, 2 m, UHF CB, 1090 MHz: only the DC spike and the spur comb, confirmed with
+`hackrf_sweep`), so the POCSAG `--then-tail` with `summary`, the APRS `classify` proof, the POCSAG
+`identify` verdict and an ADS-B frame remain pending for a day with the antennas back (the synthesised
+`modes check` passes stand in for them). Notes: a broken row's `reason` names `row`, not the field
+(the deferred serde-name minor); `checked` is per state directory, so a check run elsewhere does not
+show on the serving node.
 
 Deferred (ledger summary):
 
@@ -136,8 +143,29 @@ Deferred (ledger summary):
 
 ## Plan 14 status
 
-Plan 14 is delivered on `worktree-plan-14` (tasks 1-5), 2026-10-27. Live acceptance on the HackRF
-laptop is pending (plan section "Live acceptance").
+Plan 14 is delivered on `worktree-plan-14` (tasks 1-5), 2026-10-27, merged to `main` the same day.
+
+Live acceptance, 2026-10-28, on the desktop with the HackRF One (short form; the 2 h clock run and
+the transcript timing check need a day with the roof antennas back):
+
+1. Clock: pins cycled 1, 2, 3, 6, 12, 16 and 20 MHz, 12 s each: `stats.measured_rate_hz` within
+   0.6 % from 2 MHz up (+1.1 % at 1 MHz, below the HackRF's 2 Msps spec), `restarts` 0, `overflows`
+   0, `bank.dropped` 0, and `iq read` of the last 5 s succeeded at every pin.
+2. Leak: `stages_running` 4 with two elastic spectrum jobs, 23 with eight more spectrum jobs and a
+   `measure` (channel, measure, forwarder), back to 4 after the stops; no `lagged` line.
+3. `measure` on a 12.5 kHz channel of a 12 MHz pin: first event after 1.0 s, `partial: false`; under
+   the eight-job spike eight events in 9 s, none partial, `missed` 0 (the release build keeps up, so
+   `measure.partial` had nothing to count; `stats.timeouts` rose to 93 with no overflow).
+4. Device loss, two-node form (child `zeta serve` on 7374 owning the HackRF under a restart loop,
+   main on 7373 with `--source-node ... max_bandwidth_hz=3000000`, a 3 MHz pin and an `fm_demod`):
+   on the cable pull the main stayed up, its source faulted `remote node http://127.0.0.1:7374:
+   stream closed: stream ended`, the job failed with that reason and `stages_running` fell to 0.
+   The child also stayed up (the in-process hardening works): its fault read `no samples for 1000 ms
+   (device unplugged?)` and a tune answered `device lost ...; restart the node`. Because it did not
+   exit, the launcher loop did not restart it; after a manual kill the loop restarted it and a re-pin
+   plus a new `fm_demod` from the main node recovered everything. Finding (in `TODO.md`): a node
+   whose only device is lost should exit, or reopen the device when it reappears, so the launcher
+   pattern recovers unattended. Plan 20 keeps its place: the node no longer dies in-process.
 
 What was built:
 
