@@ -2525,6 +2525,34 @@ def scenario_map_marker_draws_without_tiles(page, url, secret):
         stop_job(url, secret, job)
 
 
+def scenario_map_follows_a_positioned_job_on_another_source(page, url, secret):
+    # Spec 7.2: every running positioned job gets a marker, not only the shown source's (the
+    # two-radio form: the page shows the watching radio, the decoder runs on the other).
+    page.route(OSM_TILES, lambda r: r.abort())
+    errors = page_errors(page)
+    select_source(page, url, secret, "aprs")
+    run_cmd(page, "view set map on")
+    mp = page.locator("#map")
+    expect(mp).to_be_visible()
+    job = start_fake_pos(page, url, secret)
+    try:
+        expect(mp.locator(".leaflet-interactive")).to_have_count(1, timeout=10_000)
+        page.wait_for_function(
+            """() => {
+              const d = document.querySelector('#map path.map-track')?.getAttribute('d') || '';
+              return (d.match(/[ML]/g) || []).length === 2;
+            }""", timeout=5_000)
+        # Map only: the other source's job draws no ribbon on the shown waterfall.
+        expect(page.locator(".ov-ribbon.fake_pos")).to_have_count(0)
+        stop_job(url, secret, job)
+        page.evaluate("window.zetaTest.poll()")
+        expect(mp.locator(".leaflet-interactive")).to_have_count(0)
+        run_cmd(page, "view set map off")
+        assert not errors, f"console errors: {errors}"
+    finally:
+        stop_job(url, secret, job)
+
+
 def scenario_home_gives_distance_and_bearing(page, url, secret):
     page.route(OSM_TILES, lambda r: r.abort())
     errors = page_errors(page)

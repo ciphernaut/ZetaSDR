@@ -517,8 +517,8 @@ mod tests {
                         Ok(g) if matches!(kind, JobKind::Scan | JobKind::Identify) => {
                             assert!(g.nodes.is_empty() && g.edges.is_empty(), "{g:?}");
                         }
-                        // A watch: `fft → detect` over the capture, the fft sized as a
-                        // spectrum of the capture is.
+                        // A watch: `fft → detect` over the capture, the fft at about one
+                        // bin per WATCH_BIN_TARGET_HZ (1500 Hz) of it.
                         Ok(g) if kind == JobKind::Watch => {
                             validate(&g, &registry)
                                 .unwrap_or_else(|e| panic!("{kind:?} {rate} {bw}: {e}"));
@@ -526,8 +526,16 @@ mod tests {
                                 g.nodes.iter().map(|n| n.kind.as_str()).collect();
                             assert_eq!(kinds, ["fft", "detect"], "{g:?}");
                             let size = param(&g.nodes[0], "size");
-                            let want = zeta_core::ops::spectrum_size(rate.max(bw));
-                            assert_eq!(size, u64::from(want), "{rate} {bw}");
+                            let want = rate
+                                .max(bw)
+                                .div_ceil(1_500)
+                                .next_power_of_two()
+                                .clamp(1024, 8192);
+                            assert_eq!(size, want, "{rate} {bw}");
+                            assert_eq!(
+                                size,
+                                u64::from(zeta_core::ops::watch_fft_size(rate.max(bw)))
+                            );
                         }
                         Ok(g) => {
                             validate(&g, &registry)

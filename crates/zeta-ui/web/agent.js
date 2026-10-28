@@ -15,7 +15,9 @@
 //   class Transcript(el)
 //       .op(payload)            append formatOp(payload); a line equal to the last one is
 //                               folded into it with a ×N count. Ok outcomes of the read-only
-//                               polls (QUIET_OPS: job_list, stream_list, source_list) whose
+//                               polls and lookups (QUIET_OPS: job_list, stream_list,
+//                               source_list, and modes_list and modes_show, which the overlays
+//                               ask to find positioned jobs) whose
 //                               transport is "ui" (a UI's own calls) are hidden; errors and
 //                               other callers' records always show (ruling R6). Records from
 //                               another caller are prefixed `[agent]`, `[http]`, `[local]`.
@@ -73,7 +75,13 @@ import { channelLabel } from "./plans.js";
 export const JOBS_POLL_MS = 2000;
 export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"];
 export const SQUELCH_KINDS = ["fm_demod", "am_demod"];
-export const QUIET_OPS = new Set(["job_list", "stream_list", "source_list"]);
+export const QUIET_OPS = new Set([
+  "job_list",
+  "stream_list",
+  "source_list",
+  "modes_list",
+  "modes_show",
+]);
 export const AUTO_SCAN_KEY = "zeta.autoScan";
 const MAX_LINES = 500;
 

@@ -66,7 +66,7 @@
 // transcript); `graph` opens the job's graph view (graph.js).
 //
 // The map (map.js) is mounted in #map at login: the overlays hand it every event of the jobs
-// they watch (ov.onEvent), each jobs poll drops the tracks of jobs that ended (map.sync), and
+// they watch and of the positioned jobs on the other sources (ov.onEvent), each jobs poll drops the tracks of jobs that ended (map.sync), and
 // a job row with a fix shows its distance and bearing from the view's `home` (map.rowText).
 // With view `map on` <html data-map="on"> is set: in the wide footprint the map is a pane
 // beside the waterfall; in the narrow one #map-toggle (`map`, beside the source tabs) shows
@@ -325,7 +325,7 @@ function notApplied(e) {
 
 // Applies `op` as typed by the user (command line or context menu); its outcome reaches the
 // transcript through the ops stream, except a successful quiet op (job_list, stream_list,
-// source_list), whose "ui" record is hidden with the polls (ruling R6): that one is shown
+// source_list, modes_list, modes_show), whose "ui" record is hidden with the polls (ruling R6): that one is shown
 // from the /op reply. A `conflict` also gets its offer line (offerReplace). The result
 // JSON, or null when it failed.
 async function applyOp(op) {

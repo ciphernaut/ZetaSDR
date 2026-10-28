@@ -36,6 +36,17 @@
 //                            graph JSON) and is not looked up again until it leaves the
 //                            running list or its graph changes. An attached `transcribe`
 //                            job is watched like any other (its source is its input's).
+//                            Then the positioned jobs: the MAX_POSITIONED most recent
+//                            running jobs on the other sources whose kind is a mode row
+//                            with a `position` map (spec 7.2: the map follows every
+//                            positioned job, e.g. a decoder on a second radio while this
+//                            page shows the watching one) are subscribed too, for
+//                            ov.onEvent only: no outline, ribbon, label, mark or counter.
+//                            The row ids come from one `modes_list` per login (this
+//                            Overlays' life) and each running kind's `position` from one
+//                            `modes_show`, both cached; a failed lookup is tried again on
+//                            the next poll. A positioned job whose source becomes the
+//                            selected one is handed to the ordinary watch.
 //     ov.watchJob(job, streamIds)  subscribes to the job's event streams (an id or an array:
 //                            an attached `transcribe` job has two, its `vad` and its
 //                            `transcript` stage's; text mode, each re-resolved by provenance
@@ -94,7 +105,8 @@
 //     ov.unoutline(key)      removes the outline drawn under `key`, if any
 //     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a watched job
 //     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a watched job,
-//                            before it is drawn (the map reads `position` from them)
+//                            before it is drawn, and of a positioned job on another source
+//                            (the map reads `position` from them)
 //     ov.jobRow(job, counter)  shows `counter` (when > 0, or the string `—` for a job over
 //                            the cap) in that job's row `.events` cell
 //     ov.destroy()
@@ -105,6 +117,7 @@ import { channelLabel } from "./plans.js";
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
 export const MAX_WATCHED = 4;
+export const MAX_POSITIONED = 4;
 export const MAX_RIBBONS = 200;
 const EXPIRE_EVERY_MS = 1000;
 const RIBBON_GAP_PX = 2;
@@ -201,6 +214,11 @@ class Overlays {
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
     this.ribbons = []; // {el, countEl, text, cls, hz, w, h, top, dy, right, born, count}
     this.eventFns = []; // ov.onEvent listeners
+    this.positioned = new Map(); // job id -> {job, ids, subs, closed, positionOnly: true}
+    this.resolvingPositioned = false; // a GET /streams for unwatched positioned jobs
+    this.rowIds = null; // the mode-row ids (`modes_list`), once looked up
+    this.positionKinds = new Map(); // job kind -> whether its mode row has a `position`
+    this.lookingUp = false; // a `modes_list`/`modes_show` lookup is in flight
     this.destroyed = false;
 
     this.layer = document.createElement("div");
@@ -220,6 +238,9 @@ class Overlays {
     if (id === this.sourceId) return;
     this.sourceId = id;
     for (const jobId of [...this.watched.keys()]) this.unwatch(jobId);
+    for (const [jobId, rec] of [...this.positioned]) {
+      if (rec.job.source === id) this.unwatchPositioned(jobId);
+    }
     this.noEventStream.clear();
     for (const r of this.ribbons) r.el.remove();
     this.ribbons = [];
@@ -271,6 +292,97 @@ class Overlays {
       const over = !ids.has(j.id) && !this.noEventStream.has(j.id);
       this.jobRow(j, over ? "—" : this.counters.get(j.id) || 0);
     }
+    this.syncPositioned(jobs);
+  }
+
+  // The running jobs on the other sources whose mode row carries a `position`, newest first,
+  // up to MAX_POSITIONED: subscribed for ov.onEvent (the map) only.
+  syncPositioned(jobs) {
+    if (this.destroyed) return;
+    const others = jobs.filter(
+      (j) => j.source !== this.sourceId && j.kind !== "spectrum" && isRunning(j),
+    );
+    const unknown = others.filter((j) => !this.positionKinds.has(j.kind));
+    if (unknown.length > 0) this.lookupKinds(unknown.map((j) => j.kind));
+    const want = others
+      .filter((j) => this.positionKinds.get(j.kind) === true)
+      .sort((a, b) => (b.created_ns ?? 0) - (a.created_ns ?? 0))
+      .slice(0, MAX_POSITIONED);
+    const ids = new Set(want.map((j) => j.id));
+    for (const id of [...this.positioned.keys()]) if (!ids.has(id)) this.unwatchPositioned(id);
+    for (const j of want) {
+      const known = this.positioned.get(j.id);
+      if (known) known.job = j;
+    }
+    const fresh = want.filter((j) => !this.positioned.has(j.id));
+    if (fresh.length > 0) this.resolvePositioned(fresh);
+  }
+
+  // Whether each of `kinds` is a mode row with a `position` map: the row ids once
+  // (`modes_list`), then one `modes_show` per row kind not yet known (a kind that is no row
+  // is false without asking). Every answer is cached; a failure leaves the rest unknown,
+  // tried again on the next poll. What was learned is applied at once.
+  async lookupKinds(kinds) {
+    if (this.lookingUp) return;
+    this.lookingUp = true;
+    let learned = false;
+    try {
+      if (!this.rowIds) {
+        const r = await this.api.op({ op: "modes_list", family: null, state: null });
+        const modes = (r && r.value && r.value.modes) || [];
+        this.rowIds = new Set(modes.map((m) => m.id));
+      }
+      for (const kind of new Set(kinds)) {
+        if (this.destroyed) return;
+        if (this.positionKinds.has(kind)) continue;
+        if (!this.rowIds.has(kind)) {
+          this.positionKinds.set(kind, false);
+        } else {
+          const r = await this.api.op({ op: "modes_show", id: kind });
+          const row = r && r.value && r.value.mode && r.value.mode.row;
+          this.positionKinds.set(kind, !!(row && row.position));
+        }
+        learned = true;
+      }
+    } catch {
+      // Tried again on the next poll.
+    } finally {
+      this.lookingUp = false;
+    }
+    if (learned && !this.destroyed) this.syncPositioned(this.lastJobs);
+  }
+
+  // One GET /streams for the positioned jobs not yet subscribed.
+  async resolvePositioned(jobs) {
+    if (this.resolvingPositioned) return;
+    this.resolvingPositioned = true;
+    let streams = null;
+    try {
+      streams = await this.api.streams();
+    } catch {
+      streams = null;
+    } finally {
+      this.resolvingPositioned = false;
+    }
+    if (!streams || this.destroyed) return;
+    for (const j of jobs) {
+      if (j.source === this.sourceId || this.positioned.has(j.id)) continue;
+      const ids = streams
+        .filter((x) => x.kind === "event" && x.provenance && x.provenance.job === j.id)
+        .map((x) => x.id);
+      if (ids.length === 0) continue;
+      const rec = { job: j, ids, subs: [], closed: false, positionOnly: true };
+      this.positioned.set(j.id, rec);
+      ids.forEach((_, slot) => this.subscribe(rec, slot));
+    }
+  }
+
+  unwatchPositioned(jobId) {
+    const rec = this.positioned.get(jobId);
+    if (!rec) return;
+    rec.closed = true;
+    for (const sub of rec.subs) sub.close();
+    this.positioned.delete(jobId);
   }
 
   // The rigid holders' bands (the source's pin among them) outlined, or the capture when
@@ -410,6 +522,7 @@ class Overlays {
     const obj = p && typeof p === "object" && !Array.isArray(p);
     if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
     for (const fn of this.eventFns) fn(job, p);
+    if (rec.positionOnly) return; // another source's job: the map's alone
     if (obj && p.protocol === "squelch") {
       // Only a demodulator job's own squelch tags its row (never, say, a decoder's demod).
       if (SQUELCH_KINDS.includes(job.kind)) {
@@ -693,6 +806,7 @@ class Overlays {
     clearInterval(this.timer);
     this.ro.disconnect();
     for (const id of [...this.watched.keys()]) this.unwatch(id);
+    for (const id of [...this.positioned.keys()]) this.unwatchPositioned(id);
     this.layer.remove();
   }
 }

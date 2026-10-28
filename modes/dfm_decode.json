@@ -9,7 +9,7 @@
   "decoder": {
     "kind": "program",
     "programs": ["dfm09mod"],
-    "args": ["--json", "--ecc", "--crc"],
+    "args": ["--json", "--ecc"],
     "demod": {"kind": "nbfm", "deviation_hz": 5000, "audio_rate_hz": 48000},
     "input": {"stream": "audio", "format": "s16", "rate_hz": 48000, "via": "stdin", "container": "wav"},
     "output": {"via": "stdout", "port": null, "parser": "json_lines"},
@@ -52,5 +52,5 @@
     "graw-dfm-17-radiosonde"
   ],
   "test": null,
-  "notes": "Graw DFM-06/09/17 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde."
+  "notes": "Graw DFM-06/09/17 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. dfm09mod 1.8.1 (sonde-decoders) takes --json and --ecc (Hamming ECC on the frames, wanted); it has no --crc (an unknown option is read as the input file, error: open), and no --dist/--auto, so the id comes from the frames as decoded."
 }

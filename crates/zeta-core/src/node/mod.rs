@@ -1071,6 +1071,7 @@ impl Node {
         capture_rate_hz: Option<Hz>,
         elastic: bool,
     ) -> Result<JobId, NodeError> {
+        self.check_prefer(&graph)?;
         let rec = JobRecord {
             format: JOB_RECORD_FORMAT,
             id: JobId::new(),
@@ -1230,6 +1231,34 @@ impl Node {
         Ok(())
     }
 
+    /// A watch's `detect` node names only this node's sources in `prefer`:
+    /// `bad params on node <id>: prefer[<i>]: unknown source <id>` otherwise. Checked
+    /// at `job_start` and `graph_put` only, so a resume on a node started without one of
+    /// them still runs (the watch then skips it).
+    fn check_prefer(&self, graph: &Graph) -> Result<(), NodeError> {
+        let ports = self.inner.ports.read().unwrap();
+        for n in graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == crate::ops::DETECT_STAGE)
+        {
+            let Some(prefer) = n.params.get("prefer").and_then(|p| p.as_array()) else {
+                continue;
+            };
+            for (i, id) in prefer.iter().enumerate() {
+                let Some(id) = id.as_str() else { continue };
+                if !ports.contains_key(&SourceId(id.into())) {
+                    return Err(GraphError::BadParams {
+                        node: n.id.clone(),
+                        reason: format!("prefer[{i}]: unknown source {id}"),
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// [`Node::job_start`], with `guard` under `source`'s gate: the lease is taken
     /// without letting the gate go. What must wait for the gate to be released
     /// (relaunching the elastic jobs a tune moved, stopping those a scan
@@ -1245,6 +1274,9 @@ impl Node {
         elastic: bool,
         guard: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<JobId, NodeError>, AfterGate) {
+        if let Err(e) = self.check_prefer(&graph) {
+            return (Err(e), AfterGate::Nothing);
+        }
         let rec = JobRecord {
             format: JOB_RECORD_FORMAT,
             id: JobId::new(),
@@ -1342,6 +1374,7 @@ impl Node {
         let mut graph = graph;
         crate::ops::fill_squelch_params(&mut graph);
         graph::validate(&graph, &self.inner.registry)?;
+        self.check_prefer(&graph)?;
         let current = {
             let jobs = self.inner.jobs.lock().unwrap();
             let entry = jobs

@@ -9,7 +9,7 @@
   "decoder": {
     "kind": "program",
     "programs": ["m20mod"],
-    "args": ["--json", "--ecc", "--crc"],
+    "args": ["--json"],
     "demod": {"kind": "nbfm", "deviation_hz": 5000, "audio_rate_hz": 48000},
     "input": {"stream": "audio", "format": "s16", "rate_hz": 48000, "via": "stdin", "container": "wav"},
     "output": {"via": "stdout", "port": null, "parser": "json_lines"},
@@ -47,5 +47,5 @@
   },
   "catalogue": ["m20-radiosonde"],
   "test": null,
-  "notes": "Meteomodem M20 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde."
+  "notes": "Meteomodem M20 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. m20mod 1.8.1 (sonde-decoders) takes --json only: it has no --ecc or --crc (an unknown option is read as the input file, error: open)."
 }

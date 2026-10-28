@@ -7,7 +7,9 @@
 //! It has no outputs. After every batch the job's context holds
 //! `sondehub = {sent, failed, last_error}`: a non-2xx answer or a transport error counts
 //! `failed` once (the batch is dropped, never retried) and sets `last_error`; the next
-//! batch still goes. Events of any other protocol, or without a position, are skipped.
+//! batch still goes. Events of any other protocol, or without a position, a `datetime`, a
+//! `frame` or a numeric altitude (SondeHub rejects those), are skipped, so `failed` counts
+//! transport trouble only.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -126,11 +128,15 @@ fn now_ns() -> u64 {
 }
 
 /// The telemetry object for sonde event `ev` as `p`'s station received it at
-/// `received`, or `None` for an event that is not sonde telemetry with a position.
+/// `received`, or `None` for an event that is not sonde telemetry SondeHub accepts: one
+/// with a position (a numeric altitude included), a `datetime` and a `frame`.
 fn telemetry(p: &SondehubParams, ev: &Value, received: &str) -> Option<Value> {
     let (manufacturer, kind) = sonde_type(ev["protocol"].as_str()?)?;
     let pos = ev.get("position")?;
     let serial = ev["id"].as_str()?;
+    pos["alt_m"].as_f64()?;
+    ev["datetime"].as_str()?;
+    ev["frame"].as_u64()?;
     let mut t = json!({
         "software_name": "zetasdr",
         "software_version": env!("CARGO_PKG_VERSION"),

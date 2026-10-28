@@ -748,7 +748,7 @@ impl JobKind {
                             id: fft.clone(),
                             kind: "fft".into(),
                             params: serde_json::json!({
-                                "size": spectrum_size(source_rate_hz.0.max(bw)),
+                                "size": watch_fft_size(source_rate_hz.0.max(bw)),
                                 "window": "hann",
                                 "rows_per_s": SPECTRUM_ROWS_PER_S,
                             }),
@@ -938,6 +938,21 @@ pub const SPECTRUM_ROWS_PER_S: u32 = 20;
 /// `SPECTRUM_SIZE_MIN..=SPECTRUM_SIZE_MAX`.
 pub fn spectrum_size(bandwidth_hz: u64) -> u32 {
     let want = bandwidth_hz.div_ceil(SPECTRUM_BIN_TARGET_HZ).max(1);
+    want.checked_next_power_of_two()
+        .unwrap_or(u64::MAX)
+        .clamp(SPECTRUM_SIZE_MIN as u64, SPECTRUM_SIZE_MAX as u64) as u32
+}
+
+/// Target resolution of a `watch` job's FFT: finer than a spectrum's, so a ~10 kHz sonde is
+/// several bins wide and the detector's centre estimate (the identify child's tuning) is
+/// within a bin or so of the signal's.
+pub const WATCH_BIN_TARGET_HZ: u64 = 1_500;
+
+/// FFT size for a watch over a capture of `capture_hz`: the smallest power of two at least
+/// `capture_hz / WATCH_BIN_TARGET_HZ`, clamped to `SPECTRUM_SIZE_MIN..=SPECTRUM_SIZE_MAX`
+/// (4096 bins, about 1.46 kHz each, at 6 MHz).
+pub fn watch_fft_size(capture_hz: u64) -> u32 {
+    let want = capture_hz.div_ceil(WATCH_BIN_TARGET_HZ).max(1);
     want.checked_next_power_of_two()
         .unwrap_or(u64::MAX)
         .clamp(SPECTRUM_SIZE_MIN as u64, SPECTRUM_SIZE_MAX as u64) as u32

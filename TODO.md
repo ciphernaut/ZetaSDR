@@ -212,3 +212,15 @@ Found in plan 17 task 10. A decoder with a `sink_sondehub` node (added by the wa
 ## Bug: `gated_stop` is cleared unconditionally by a sink restart
 
 Found in plan 17 task 10. `store_graph` clears `gated_stop` before relaunching the same id so the relaunch is not suppressed; a `replace` that names only the decoder during the sink restart's teardown can therefore let it relaunch after being stopped. Clear only the entry the restart itself set (a token compare), and make `replace_during_a_sink_restart` deterministic (it can flake when the proof lands before the gate is taken).
+
+## Architecture: a generic `sink` param on the watch
+
+Found in plan 17's final review. The watch's feed out is wired for one sink: `DetectParams` carries a `sondehub` field (zeta-dsp `detect.rs`), `graph.rs` checks it against the `SONDEHUB_STAGE` stage's schema, and `watch.rs` appends a node of that kind to every decoder it keeps under the same name. A second feed (AIS NMEA or APRS-IS for the wave-2 rows, SBS for aircraft) would copy all three places and add another field the detect stage only passes through.
+
+Replace it with `sink: {kind, params}` (or a list of them) on the detect node: `graph::validate` checks `params` against the named stage's `params_schema` and requires an `event` input and no outputs, the watch appends `kind` with `params` fed by the decoder's events, and `sondehub: {...}` stays accepted as shorthand for `sink: {kind: "sink_sondehub", params: {...}}` so existing watches resume. The `sondehub.<field>` error naming becomes `sink.params.<field>`, and the sink-restart path (`place_decoder`, the sink-less fallback) works on any kind.
+
+## Feature: the watch re-centres before it identifies
+
+Found in plan 17's final review. The watch tunes its identify run on the detector's run centre, good to about one fft bin (1.46 kHz at a 6 MHz capture with `WATCH_BIN_TARGET_HZ` 1500), while `rs41mod` over NBFM audio decodes only within about ±1000 Hz of the sonde's centre (it slices the audio around zero, and an off-centre FM signal shifts that level); synthesised frames decode at ±1000 Hz and not at ±1500 Hz. A sonde at the wrong end of a bin is then reported `unknown` and retried on the same centre.
+
+Measure before identifying: a short `measure` (or a power-weighted centroid over the run's bins in `detect`, which the spectrum rows already carry) gives the occupied band's centre to a few hundred hertz, and the identify run starts there. Alternatively the audio rows could remove the demodulated DC (a slow high-pass ahead of the WAV feed), which makes the decoders tolerant of a few kilohertz of mis-tune; measure both against the RS41 generator with the job held off the signal.

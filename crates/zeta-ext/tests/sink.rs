@@ -218,6 +218,24 @@ async fn events_without_a_position_are_skipped() {
     no_pos.as_object_mut().unwrap().remove("position");
     r.send(no_pos);
     r.send(json!({"protocol": "pocsag", "position": {"lat": 1.0, "lon": 2.0, "alt_m": 3.0}}));
+    // SondeHub rejects telemetry without a datetime, a frame or a numeric altitude.
+    for (key, value) in [
+        ("datetime", None),
+        ("frame", None),
+        (
+            "position",
+            Some(json!({"lat": -27.5, "lon": 153.0, "alt_m": null})),
+        ),
+        ("position", Some(json!({"lat": -27.5, "lon": 153.0}))),
+    ] {
+        let mut ev = rs41("R3", 3);
+        let o = ev.as_object_mut().unwrap();
+        match value {
+            None => o.remove(key),
+            Some(v) => o.insert(key.into(), v),
+        };
+        r.send(ev);
+    }
     r.send(rs41("R2", 2));
     until("a request", || !seen.lock().unwrap().is_empty()).await;
     {
@@ -226,6 +244,9 @@ async fn events_without_a_position_are_skipped() {
         assert_eq!(a.len(), 1, "{a:?}");
         assert_eq!(a[0]["serial"], "R2");
     }
+    // Skipped, not failed.
+    until("the batch counted", || r.sondehub()["sent"] == 1).await;
+    assert_eq!(r.sondehub()["failed"], 0);
     // A batch of only skipped events sends nothing.
     r.send(json!({"protocol": "dfm", "id": "D1"}));
     tokio::time::sleep(Duration::from_millis(800)).await;

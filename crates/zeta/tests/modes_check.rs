@@ -286,14 +286,53 @@ fn check_is_refused_while_serve_owns_the_state_dir() {
     );
 }
 
-/// Where `rs41mod` lives on this host, if anywhere on `PATH`.
-fn rs41mod() -> Option<String> {
+/// Where `program` lives on this host, if anywhere on `PATH`.
+fn which(program: &str) -> Option<String> {
     let out = std::process::Command::new("which")
-        .arg("rs41mod")
+        .arg(program)
         .output()
         .ok()?;
     let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
     (out.status.success() && !path.is_empty()).then_some(path)
+}
+
+/// Where `rs41mod` lives on this host, if anywhere on `PATH`.
+fn rs41mod() -> Option<String> {
+    which("rs41mod")
+}
+
+/// Each sonde row's `args` are flags its program takes: rs1729's decoders read an unknown
+/// option as the input file (`error: open <flag>`), which `modes check` cannot see on a
+/// row whose `test` is null. On empty stdin a program that took its flags stops at the
+/// missing WAV header instead.
+#[test]
+fn sonde_programs_accept_their_rows_args() {
+    let modes = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modes");
+    for id in ["rs41_decode", "dfm_decode", "m20_decode"] {
+        let text = std::fs::read_to_string(modes.join(format!("{id}.json"))).unwrap();
+        let row: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let program = row["decoder"]["programs"][0].as_str().unwrap();
+        let Some(path) = which(program) else {
+            eprintln!("{program} not on this host");
+            continue;
+        };
+        let args: Vec<&str> = row["decoder"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        let out = std::process::Command::new(&path)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("error: open"),
+            "{id}: {program} {args:?} refused a flag: {stderr}"
+        );
+    }
 }
 
 /// The RS41 row proves itself against the real `rs41mod`: the synthesised frames pass

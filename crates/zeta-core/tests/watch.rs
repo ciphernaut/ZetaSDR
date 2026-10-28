@@ -37,6 +37,9 @@ const CYCLE: usize = 2 * RATE_HZ as usize;
 /// The detector's timing for the tests' time scale: a 2 s cycle stays one signal.
 const PERSIST_MS: u64 = 1_500;
 const GONE_MS: u64 = 4_000;
+/// The re-adoption tests' `gone_ms`: a wider margin for a re-adopted decoder's signal to be
+/// seen again on a loaded host (the semantics are those of [`GONE_MS`]).
+const READOPT_GONE_MS: u64 = 6_000;
 
 /// Each node runs real-time sources and the watch timing is process-wide: one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -682,6 +685,65 @@ async fn a_lost_signal_stops_its_decoder() {
     zeta_core::node::watch::test_timing(0, 0);
 }
 
+/// A signal whose `gone` came while identify ran sends no other `gone`: its proved
+/// decoder still counts its silence from the verdict and is dropped once silent. The
+/// detector here holds a signal for a minute (`gone_ms`), so only the `gone` the test
+/// injects on the watch's stream during identify can start that count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_gone_during_identify_still_times_out() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 2_000);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({"gone_ms": 60_000})).await;
+    let events = Events::of(&node, &watch);
+    until("an identifying event", Duration::from_secs(20), || {
+        !events.watch("identifying").is_empty()
+    })
+    .await;
+    let signal = events.watch("identifying")[0]["signal"].clone();
+    let out = node
+        .job_outputs(&watch)
+        .into_iter()
+        .find(|(k, _)| *k == StreamKind::Event)
+        .unwrap()
+        .1;
+    let prov = node
+        .bus()
+        .list()
+        .into_iter()
+        .find(|i| i.id == out)
+        .unwrap()
+        .provenance;
+    let gone = serde_json::json!({
+        "protocol": "signal",
+        "state": "gone",
+        "center_hz": signal["center_hz"],
+        "bandwidth_hz": signal["bandwidth_hz"],
+    });
+    node.bus()
+        .publish(Frame::new(out, prov, Payload::Event(gone)));
+    let job = decoded(&node, &events, &watch).await;
+    port.mute();
+    until("a lost event", Duration::from_secs(20), || {
+        !events.watch("lost").is_empty()
+    })
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert!(
+        lost["summary"]
+            .as_str()
+            .unwrap()
+            .contains("gone and silent"),
+        "{lost}"
+    );
+    assert_eq!(state(&node, &job), Some(JobState::Stopped));
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn owned_jobs_never_take_a_history_slot() {
     let _one = SERIAL.lock().await;
@@ -756,7 +818,7 @@ async fn graph_put_on_the_watch_readopts_its_decoders() {
     let dir = tempfile::tempdir().unwrap();
     let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
     let node = Arc::new(node);
-    let watch = start_watch(&node, serde_json::json!({})).await;
+    let watch = start_watch(&node, serde_json::json!({"gone_ms": READOPT_GONE_MS})).await;
     let events = Events::of(&node, &watch);
     let job = decoded(&node, &events, &watch).await;
     let mut graph = match node.apply(Op::GraphGet { job: watch.clone() }).await {
@@ -778,7 +840,7 @@ async fn graph_put_on_the_watch_readopts_its_decoders() {
         "a detect put keeps the watch re-expandable"
     );
     // Re-adopted, and kept once its signal is seen again (past `gone_ms`).
-    tokio::time::sleep(Duration::from_millis(GONE_MS + 3_000)).await;
+    tokio::time::sleep(Duration::from_millis(READOPT_GONE_MS + 3_000)).await;
     let listed = decoding(&node, &watch);
     assert_eq!(listed.len(), 1, "{listed:#?}");
     assert_eq!(listed[0]["job"], job.0.as_str());
@@ -798,7 +860,7 @@ async fn a_restart_readopts_or_drops() {
     let file = |id: &JobId| jobs.join(format!("{}.json", id.0));
     let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
     let node = Arc::new(node);
-    let watch = start_watch(&node, serde_json::json!({})).await;
+    let watch = start_watch(&node, serde_json::json!({"gone_ms": READOPT_GONE_MS})).await;
     let events = Events::of(&node, &watch);
     let job = decoded(&node, &events, &watch).await;
     drop(events);
@@ -821,7 +883,7 @@ async fn a_restart_readopts_or_drops() {
     let events = Events::of(&node, &watch);
     assert_eq!(state(&node, &watch), Some(JobState::Running));
     assert_eq!(state(&node, &job), Some(JobState::Running));
-    tokio::time::sleep(Duration::from_millis(GONE_MS + 3_000)).await;
+    tokio::time::sleep(Duration::from_millis(READOPT_GONE_MS + 3_000)).await;
     let listed = decoding(&node, &watch);
     assert_eq!(listed.len(), 1, "{listed:#?}");
     assert_eq!(listed[0]["job"], job.0.as_str());
@@ -1186,6 +1248,46 @@ fn sondehub_params() -> Value {
         "callsign": "TEST", "lat": -27.5, "lon": 153.0, "alt_m": 10, "batch_ms": 5000,
         "url": "http://127.0.0.1:1/"
     })
+}
+
+/// `prefer` names this node's sources: an unknown id is refused at start and at a put,
+/// naming its index, before anything starts or restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_preferring_an_unknown_source_is_refused() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let g = watch_graph(&node, serde_json::json!({"prefer": ["rx", "b210"]}));
+    let e = node
+        .job_start("watch", rx(), capture(), g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("prefer[1]: unknown source b210"),
+        "{e}"
+    );
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    let watch = start_watch(&node, serde_json::json!({"prefer": ["rx"]})).await;
+    let stream = node.job_outputs(&watch);
+    let mut graph = record(&node, &watch).unwrap().graph;
+    let detect = graph.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params["prefer"] = serde_json::json!(["b210"]);
+    let e = node
+        .apply(Op::GraphPut {
+            job: watch.clone(),
+            graph,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("prefer[0]: unknown source b210"),
+        "{e}"
+    );
+    assert_eq!(node.job_outputs(&watch), stream, "nothing restarted");
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    stop_all(&node).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

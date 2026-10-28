@@ -1142,6 +1142,33 @@ fn spectrum_expansion_picks_size_from_the_band() {
     assert_eq!(size(50_000_000), 8192);
 }
 
+/// A watch's fft targets 1.5 kHz bins (a ~10 kHz sonde spans several), four times a
+/// spectrum's resolution: 4096 bins at 6 MHz where a spectrum has 1024.
+#[test]
+fn watch_expansion_sizes_its_fft_finer_than_a_spectrum() {
+    let size = |rate: u64| {
+        let g = JobKind::Watch
+            .expand(
+                &SourceId("file0".into()),
+                Tuning {
+                    center_hz: Hz(403_000_000),
+                    bandwidth_hz: Hz(rate),
+                },
+                Hz(rate),
+                None,
+                None,
+                None,
+                &modes(),
+            )
+            .unwrap();
+        assert_eq!(g.nodes[0].kind, "fft");
+        g.nodes[0].params["size"].as_u64().unwrap()
+    };
+    assert_eq!(size(6_000_000), 4096);
+    assert_eq!(size(48_000), 1024);
+    assert_eq!(size(20_000_000), 8192);
+}
+
 #[test]
 fn fm_demod_kind_expands_to_channel_then_nbfm() {
     assert_eq!(JobKind::FmDemod.name(), "fm_demod");

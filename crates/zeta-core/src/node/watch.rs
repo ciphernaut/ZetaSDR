@@ -1207,6 +1207,9 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             SinkOutcome::Off | SinkOutcome::On => None,
         };
         let t = now().0;
+        // A signal that went while identify ran sends no further `gone`: count its
+        // silence from now, so the decoder is still dropped after SILENCE_MS.
+        let gone_since_ns = (!w.signals[i].present).then_some(t);
         w.subs.insert(job.clone(), inner.decoder_subs(&job));
         w.decoding.push(Decoding {
             mode: mode.clone(),
@@ -1217,7 +1220,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             placed,
             sink_error: sink_error.clone(),
             last_event_ns: t,
-            gone_since_ns: None,
+            gone_since_ns,
             confirm_by_ns: None,
         });
         w.pending = None;

@@ -18,8 +18,10 @@
 //       so a page that never shows it never loads it. `jobs()` returns the last `job_list`
 //       result. `api` is the node's client (unused so far: every fix arrives by event).
 //   MapPane:
-//     map.event(job, payload)   one event of a watched job (overlays.js onEvent): one with a
-//                               `position` is that job's newest fix. Fixes are kept while the
+//     map.event(job, payload)   one event of a job the overlays follow (overlays.js onEvent:
+//                               the selected source's watched jobs and the positioned jobs on
+//                               every other source): one with a `position` is that job's
+//                               newest fix, whichever source the page shows. Fixes are kept while the
 //                               map is hidden, so the track is whole when it shows.
 //     map.sync()                after each jobs poll: the tracks of jobs no longer running
 //                               (stopped, failed, forgotten) are dropped with their marker
