@@ -214,13 +214,20 @@ fn wait_with_deadline(
 
 /// The `fake_pos` mode row: a `json_lines` program row run by zeta-ext's `fake_lines` (pinned
 /// with `ZETA_HANDLER_FAKE_LINES`), whose events carry a `position`.
+///
+/// The row is `ready` on this node, so identify, watch and classify see it in every scenario,
+/// and with `proof: event` it would "prove" itself on any signal (`fake_lines` prints its lines
+/// whatever the input). It is shaped so those sweeps never try it on the suite's boxes: a
+/// 40 kHz `min_hz` does not fit the ~12.5 kHz boxes they draw (`skipped_band`), the far centre
+/// (999 MHz) takes away the score's centre term and an empty `modulation` its layer-1 term.
+/// The map scenarios start it explicitly at its own 40 kHz width on `tone`.
 fn fake_pos_row() -> serde_json::Value {
     serde_json::json!({
         "id": "fake_pos",
         "name": "Fake positions (UI tests)",
         "family": "general",
-        "band": {"bandwidth_hz": 12500, "centers_hz": [], "min_hz": null},
-        "modulation": ["fm"],
+        "band": {"bandwidth_hz": 40000, "centers_hz": [999000000], "min_hz": 40000},
+        "modulation": [],
         "label": "FAKE",
         "protocol": "fake_pos",
         "decoder": {

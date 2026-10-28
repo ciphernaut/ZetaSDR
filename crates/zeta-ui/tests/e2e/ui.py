@@ -1986,6 +1986,10 @@ def scenario_identify_from_a_box_shows_candidates(page, url, secret):
         expect(menu).to_be_hidden()
         ribbon = page.locator("#waterfall .ov-ribbon.candidate", has_text="pocsag_decode: proved")
         expect(ribbon.first).to_be_visible(timeout=10_000)
+        # The suite's `fake_pos` row (ui.rs) is too wide for this box: never tried here.
+        cands = page.locator("#waterfall .ov-ribbon.candidate").all_text_contents()
+        tried = [c for c in cands if c.startswith("fake_pos:") and "skipped_band" not in c]
+        assert not tried, f"fake_pos tried by identify: {cands}"
     finally:
         for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]:
             if (j["source"] == "pocsag" and j["kind"] in ("identify", "pocsag_decode")
@@ -2474,9 +2478,10 @@ def page_errors(page):
 
 
 def start_fake_pos(page, url, secret):
-    """Start `fake_pos` on the tone source and have the page watch it at once (its two fixes
-    come 2 s in); the job id."""
-    job = start_job(url, secret, "fake_pos", "tone", 100_000_000, 12_500)
+    """Start `fake_pos` on the tone source at the row's own 40 kHz width (ui.rs shapes the row
+    so no identify, watch or classify sweep tries it) and have the page watch it at once (its
+    two fixes come 2 s in); the job id."""
+    job = start_job(url, secret, "fake_pos", "tone", 100_000_000, 40_000)
     job_row(page, job)
     return job
 
