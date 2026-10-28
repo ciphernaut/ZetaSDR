@@ -745,11 +745,17 @@ fn hex_bits(hex: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The longest `bits` hex string a row may give.
+const MAX_BITS_HEX: usize = 65_536;
+
 /// A generic family's `bits` as symbols `0..order`: a plain hex string is the exact
 /// bit pattern, `pattern:<hex>` repeats it until one second of symbols; `order` 4
 /// consumes bit pairs (a lone last bit is padded with 0).
 fn generic_symbols(bits: &str, order: u8, symbol_rate_baud: u32) -> Result<Vec<u8>, String> {
     const ERR: &str = "bits: hex or pattern:<hex>";
+    if bits.strip_prefix("pattern:").unwrap_or(bits).len() > MAX_BITS_HEX {
+        return Err(format!("bits: at most {MAX_BITS_HEX} hex characters"));
+    }
     let per_symbol = if order == 4 { 2 } else { 1 };
     let mut b: Vec<u8> = match bits.strip_prefix("pattern:") {
         Some(hex) => {
@@ -884,12 +890,24 @@ fn repeat_bursts(burst: Vec<Complex<f32>>, repeat: u32, rate_hz: u32) -> Vec<Com
     out
 }
 
-fn generic_params(symbol_rate_baud: u32, repeat: u32) -> Result<(), String> {
-    if symbol_rate_baud == 0 {
-        return Err("symbol_rate_baud: at least 1".into());
+/// Bounds on the generic families' numbers, so a bad row is an error, not an abort or
+/// a huge allocation. `deviation_hz` is given for `fsk`, whose tones must fit the rate.
+fn generic_params(
+    symbol_rate_baud: u32,
+    repeat: u32,
+    deviation_hz: Option<f64>,
+) -> Result<(), String> {
+    if !(1..=600_000).contains(&symbol_rate_baud) {
+        return Err("symbol_rate_baud: 1..=600000".into());
     }
-    if repeat == 0 {
-        return Err("repeat: at least 1".into());
+    if !(1..=100).contains(&repeat) {
+        return Err("repeat: 1..=100".into());
+    }
+    if let Some(d) = deviation_hz {
+        let half = f64::from(generic_rate_hz(symbol_rate_baud)) / 2.0;
+        if !(d.is_finite() && d > 0.0 && d < half) {
+            return Err("deviation_hz: finite, 0 < d < rate/2".into());
+        }
     }
     Ok(())
 }
@@ -983,6 +1001,28 @@ pub struct Echo {
     pub gain_db: f32,
 }
 
+impl Impairments {
+    /// Bound the echo so a bad row is an error: `delay_us` 1..=100000 and at least one
+    /// sample at `rate_hz`, `gain_db` finite in -60..=0.
+    pub fn validate(&self, rate_hz: u32) -> Result<(), String> {
+        let Some(echo) = self.echo else {
+            return Ok(());
+        };
+        if !(1..=100_000).contains(&echo.delay_us) {
+            return Err("echo.delay_us: 1..=100000".into());
+        }
+        if (f64::from(echo.delay_us) * f64::from(rate_hz) / 1e6).round() < 1.0 {
+            return Err(format!(
+                "echo.delay_us: at least one sample at {rate_hz} Hz"
+            ));
+        }
+        if !(echo.gain_db.is_finite() && (-60.0..=0.0).contains(&echo.gain_db)) {
+            return Err("echo.gain_db: -60..=0".into());
+        }
+        Ok(())
+    }
+}
+
 /// Seed of the noise [`Impairments::snr_db`] adds, so a check is repeatable.
 const NOISE_SEED: u64 = 0x5EED;
 
@@ -1035,12 +1075,18 @@ impl SynthSpec {
             }
             SynthSpec::Fsk {
                 symbol_rate_baud,
+                deviation_hz,
                 order,
                 bits,
                 repeat,
-                ..
+            } => {
+                if !matches!(order, 2 | 4) {
+                    return Err("order: 2 or 4".into());
+                }
+                generic_params(*symbol_rate_baud, *repeat, Some(*deviation_hz))?;
+                generic_symbols(bits, *order, *symbol_rate_baud)?;
             }
-            | SynthSpec::Psk {
+            SynthSpec::Psk {
                 symbol_rate_baud,
                 order,
                 bits,
@@ -1049,7 +1095,7 @@ impl SynthSpec {
                 if !matches!(order, 2 | 4) {
                     return Err("order: 2 or 4".into());
                 }
-                generic_params(*symbol_rate_baud, *repeat)?;
+                generic_params(*symbol_rate_baud, *repeat, None)?;
                 generic_symbols(bits, *order, *symbol_rate_baud)?;
             }
             SynthSpec::Ook {
@@ -1057,7 +1103,7 @@ impl SynthSpec {
                 bits,
                 repeat,
             } => {
-                generic_params(*symbol_rate_baud, *repeat)?;
+                generic_params(*symbol_rate_baud, *repeat, None)?;
                 generic_symbols(bits, 2, *symbol_rate_baud)?;
             }
             SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
@@ -1099,9 +1145,10 @@ pub fn parse_params(
             imp.insert(key.into(), v);
         }
     }
-    let imp = serde_json::from_value(imp.into()).map_err(|e| e.to_string())?;
+    let imp: Impairments = serde_json::from_value(imp.into()).map_err(|e| e.to_string())?;
     let spec: SynthSpec = serde_json::from_value(params.into()).map_err(|e| e.to_string())?;
     spec.validate()?;
+    imp.validate(spec.rate_hz())?;
     Ok((spec, imp))
 }
 
@@ -1153,7 +1200,8 @@ pub fn synthesise(
             bits,
             repeat,
         } => {
-            let sym = generic_symbols(bits, *order, *symbol_rate_baud).unwrap_or_default();
+            let sym = generic_symbols(bits, *order, *symbol_rate_baud)
+                .expect("synth spec validated before synthesise");
             let burst = gfsk_modulate(&sym, *order, *symbol_rate_baud, *deviation_hz, rate_hz);
             let mut iq = repeat_bursts(burst, *repeat, rate_hz);
             shift(&mut iq, off, rate_hz);
@@ -1165,7 +1213,8 @@ pub fn synthesise(
             bits,
             repeat,
         } => {
-            let sym = generic_symbols(bits, *order, *symbol_rate_baud).unwrap_or_default();
+            let sym = generic_symbols(bits, *order, *symbol_rate_baud)
+                .expect("synth spec validated before synthesise");
             let burst = psk_modulate(&sym, *order, *symbol_rate_baud, rate_hz);
             let mut iq = repeat_bursts(burst, *repeat, rate_hz);
             shift(&mut iq, off, rate_hz);
@@ -1176,7 +1225,8 @@ pub fn synthesise(
             bits,
             repeat,
         } => {
-            let sym = generic_symbols(bits, 2, *symbol_rate_baud).unwrap_or_default();
+            let sym = generic_symbols(bits, 2, *symbol_rate_baud)
+                .expect("synth spec validated before synthesise");
             let burst = ook_modulate(&sym, *symbol_rate_baud, rate_hz);
             let mut iq = repeat_bursts(burst, *repeat, rate_hz);
             shift(&mut iq, off, rate_hz);
@@ -1388,12 +1438,73 @@ mod tests {
     }
 
     #[test]
+    fn bounds_are_errors_naming_the_field() {
+        let base = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"family": "fsk", "symbol_rate_baud": 4800,
+                "deviation_hz": 2400.0, "order": 2, "bits": "aa", "repeat": 1});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse_params(v.as_object().unwrap().clone()).map(|_| ())
+        };
+        let long = "a".repeat(65_538);
+        let cases = [
+            (serde_json::json!({"repeat": 0}), "repeat: 1..=100"),
+            (serde_json::json!({"repeat": 101}), "repeat: 1..=100"),
+            (
+                serde_json::json!({"symbol_rate_baud": 0}),
+                "symbol_rate_baud: 1..=600000",
+            ),
+            (
+                serde_json::json!({"symbol_rate_baud": 600_001}),
+                "symbol_rate_baud: 1..=600000",
+            ),
+            (
+                serde_json::json!({"deviation_hz": 0.0}),
+                "deviation_hz: finite, 0 < d < rate/2",
+            ),
+            (
+                serde_json::json!({"deviation_hz": 24_000.0}),
+                "deviation_hz: finite, 0 < d < rate/2",
+            ),
+            (
+                serde_json::json!({"echo": {"delay_us": 0, "gain_db": -6.0}}),
+                "echo.delay_us: 1..=100000",
+            ),
+            (
+                serde_json::json!({"echo": {"delay_us": 100_001, "gain_db": -6.0}}),
+                "echo.delay_us: 1..=100000",
+            ),
+            (
+                serde_json::json!({"echo": {"delay_us": 10, "gain_db": -6.0}}),
+                "echo.delay_us: at least one sample at 48000 Hz",
+            ),
+            (
+                serde_json::json!({"echo": {"delay_us": 100, "gain_db": 3.0}}),
+                "echo.gain_db: -60..=0",
+            ),
+            (
+                serde_json::json!({"echo": {"delay_us": 100, "gain_db": -61.0}}),
+                "echo.gain_db: -60..=0",
+            ),
+            (
+                serde_json::json!({"bits": long}),
+                "bits: at most 65536 hex characters",
+            ),
+        ];
+        for (extra, want) in cases {
+            assert_eq!(base(extra.clone()), Err(want.into()), "{extra}");
+        }
+        assert!(base(serde_json::json!({"echo": {"delay_us": 100, "gain_db": -6.0}})).is_ok());
+    }
+
+    #[test]
     fn parse_params_takes_the_echo() {
         let v = serde_json::json!({"family": "ook", "symbol_rate_baud": 1000,
-            "bits": "80", "repeat": 2, "echo": {"delay_us": 10, "gain_db": -6.0}});
+            "bits": "80", "repeat": 2, "echo": {"delay_us": 100, "gain_db": -6.0}});
         let (spec, imp) = parse_params(v.as_object().unwrap().clone()).unwrap();
         assert!(matches!(spec, SynthSpec::Ook { repeat: 2, .. }));
-        assert_eq!(imp.echo.unwrap().delay_us, 10);
+        assert_eq!(imp.echo.unwrap().delay_us, 100);
     }
 
     fn aprs() -> SynthSpec {
