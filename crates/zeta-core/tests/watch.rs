@@ -1,0 +1,893 @@
+//! The `watch` job: a controller over `fft → detect` that identifies each new signal in
+//! its band, keeps the proved decoder (in its capture, or on a free source) and owns
+//! what it starts. Run over 1.024 MHz file sources (under the channel bank's 2 Msps
+//! threshold) carrying a 1200-baud POCSAG page, an FSK burst no row proves, or noise,
+//! 300 kHz above the capture's centre and repeating every 2 s.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use num_complex::Complex;
+use serde_json::Value;
+use tokio::sync::broadcast;
+use zeta_core::capture::{CaptureMeta, write_cf32};
+use zeta_core::graph::Graph;
+use zeta_core::job::JobState;
+use zeta_core::node::{Node, NodeConfig};
+use zeta_core::ops::{JobKind, Op, OpResult};
+use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
+use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
+use zeta_core::stream::Payload;
+use zeta_core::types::{Capabilities, Hz, JobId, SourceId, StreamKind, Timestamp};
+use zeta_source_file::{FileOpts, FileSource};
+
+const RATE_HZ: u32 = 1_024_000;
+/// A well-known POCSAG centre: the burst sits here, so `pocsag_decode` is tried first.
+const POCSAG_HZ: u64 = 148_637_500;
+const OFFSET_HZ: u64 = 300_000;
+/// The capture's centre: the burst is [`OFFSET_HZ`] above it.
+const CENTER_HZ: u64 = POCSAG_HZ - OFFSET_HZ;
+/// One burst per this many samples (2 s).
+const CYCLE: usize = 2 * RATE_HZ as usize;
+/// The detector's timing for the tests' time scale: a 2 s cycle stays one signal.
+const PERSIST_MS: u64 = 1_500;
+const GONE_MS: u64 = 4_000;
+
+/// Each node runs real-time sources and the watch timing is process-wide: one at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct Fixtures {
+    _dir: tempfile::TempDir,
+    /// The POCSAG page every 2 s.
+    pocsag: PathBuf,
+    /// A random 2400-baud GFSK burst every 2 s: no row proves it.
+    fsk: PathBuf,
+    /// The rows of the in-crate decoders with a 1500 ms dwell, for the FSK test's pace.
+    quick_modes: PathBuf,
+}
+
+fn fixtures() -> &'static Fixtures {
+    static F: OnceLock<Fixtures> = OnceLock::new();
+    F.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let page = zeta_dsp::synth::pocsag_packet_iq(
+            1_234_567,
+            3,
+            "HELLO ZETA",
+            1200,
+            RATE_HZ,
+            OFFSET_HZ as f64,
+        );
+        let pocsag = write(dir.path(), "pocsag", &cycle(page, 1), CENTER_HZ);
+        let mut state = 0x5eed_u64;
+        let symbols: Vec<u8> = (0..2400)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 63) as u8
+            })
+            .collect();
+        let mut burst = zeta_dsp::synth::gfsk_modulate(&symbols, 2, 2400, 3_000.0, RATE_HZ);
+        mix(&mut burst, OFFSET_HZ as f64);
+        let fsk = write(dir.path(), "fsk", &cycle(burst, 2), CENTER_HZ);
+        let quick_modes = dir.path().join("modes");
+        std::fs::create_dir_all(&quick_modes).unwrap();
+        for (file, text) in zeta_core::modes::ModeRegistry::embedded() {
+            let mut row: Value = serde_json::from_str(text).unwrap();
+            if row["decoder"]["kind"] != "graph"
+                || row["band"]["bandwidth_hz"].as_u64() > Some(12_500)
+            {
+                continue;
+            }
+            row["identify"]["dwell_ms"] = 1_500.into();
+            let name = Path::new(&file).file_name().unwrap().to_owned();
+            std::fs::write(quick_modes.join(name), row.to_string()).unwrap();
+        }
+        Fixtures {
+            _dir: dir,
+            pocsag,
+            fsk,
+            quick_modes,
+        }
+    })
+}
+
+/// `burst` at the start of a [`CYCLE`], the rest silence, with white noise over all.
+fn cycle(mut burst: Vec<Complex<f32>>, seed: u64) -> Vec<Complex<f32>> {
+    assert!(burst.len() < CYCLE, "burst {} samples", burst.len());
+    burst.resize(CYCLE, Complex::new(0.0, 0.0));
+    zeta_dsp::synth::awgn(&mut burst, 20.0, seed);
+    burst
+}
+
+/// Shift `iq` up by `offset_hz`.
+fn mix(iq: &mut [Complex<f32>], offset_hz: f64) {
+    for (n, s) in iq.iter_mut().enumerate() {
+        let cycles = offset_hz * n as f64 / RATE_HZ as f64;
+        let ph = 2.0 * std::f64::consts::PI * cycles.fract();
+        *s *= Complex::from_polar(1.0, ph as f32);
+    }
+}
+
+fn write(dir: &Path, stem: &str, iq: &[Complex<f32>], center_hz: u64) -> PathBuf {
+    let meta = CaptureMeta {
+        sample_rate_hz: Hz(RATE_HZ as u64),
+        center_hz: Hz(center_hz),
+        start: Timestamp(0),
+        annotations: Vec::new(),
+    };
+    write_cf32(dir, stem, &meta, iq).expect("write fixture")
+}
+
+fn registry() -> StageRegistry {
+    let mut r = StageRegistry::new();
+    r.register(Arc::new(PassthroughStage::new()));
+    zeta_dsp::register_all(&mut r);
+    r
+}
+
+/// A port that is a file source but for a switch replacing its samples with noise
+/// (the burst stops; the noise floor stays).
+struct Muting {
+    inner: Arc<FileSource>,
+    tx: broadcast::Sender<IqBlock>,
+    muted: Arc<AtomicBool>,
+}
+
+impl Muting {
+    fn new(inner: Arc<FileSource>, muted: bool) -> Arc<Self> {
+        let (tx, _) = broadcast::channel(64);
+        let flag = Arc::new(AtomicBool::new(muted));
+        let mut rx = inner.subscribe();
+        let (out, on) = (tx.clone(), flag.clone());
+        tokio::spawn(async move {
+            let mut seed = 7;
+            loop {
+                match rx.recv().await {
+                    Ok(mut b) => {
+                        if on.load(Ordering::Relaxed) {
+                            let mut v = vec![Complex::new(0.0f32, 0.0); b.samples.len()];
+                            seed += 1;
+                            zeta_dsp::synth::awgn(&mut v, 21.0, seed);
+                            b.samples = v.into();
+                        }
+                        let _ = out.send(b);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Arc::new(Muting {
+            inner,
+            tx,
+            muted: flag,
+        })
+    }
+
+    fn mute(&self) {
+        self.muted.store(true, Ordering::Relaxed);
+    }
+}
+
+#[async_trait]
+impl Port for Muting {
+    fn id(&self) -> &SourceId {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> &Capabilities {
+        self.inner.capabilities()
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        self.inner.tune(t).await
+    }
+    fn current(&self) -> Option<Tuning> {
+        self.inner.current()
+    }
+    fn subscribe(&self) -> IqReceiver {
+        self.tx.subscribe()
+    }
+    fn fault(&self) -> Option<String> {
+        self.inner.fault()
+    }
+    async fn idle(&self) {
+        self.inner.idle().await
+    }
+}
+
+/// A looping, real-time, tunable (±2 MHz) file source `id` of `meta`, not yet started.
+fn file_source(id: &str, meta: &Path) -> Arc<FileSource> {
+    file_source_with(id, meta, true)
+}
+
+/// [`file_source`], tunable or not: an untunable one answers every tune with the
+/// recording's own band, so a job on another band inside it decodes the burst.
+fn file_source_with(id: &str, meta: &Path, tunable: bool) -> Arc<FileSource> {
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 16_384,
+        repeat: true,
+        tune_range: tunable.then_some((Hz(CENTER_HZ - 2_000_000), Hz(CENTER_HZ + 2_000_000))),
+    };
+    Arc::new(FileSource::open(SourceId(id.into()), meta, opts).unwrap())
+}
+
+/// A node over `ports` (each source started once the node subscribed), with the node's
+/// classifiers and `modes_dir`'s rows.
+async fn node_over(
+    dir: &Path,
+    ports: Vec<(Arc<dyn Port>, Arc<FileSource>)>,
+    modes_dir: Option<&Path>,
+) -> Node {
+    let cfg = NodeConfig {
+        state_dir: dir.join("state"),
+        ring_seconds: 4.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
+        backends: vec![Backend::Cpu],
+        resume: true,
+        bank_factory: None,
+        modes_dir: modes_dir.map(Path::to_path_buf),
+    };
+    let srcs: Vec<Arc<FileSource>> = ports.iter().map(|(_, s)| s.clone()).collect();
+    let node = Node::open(cfg, registry(), ports.into_iter().map(|(p, _)| p).collect())
+        .await
+        .unwrap();
+    for c in zeta_dsp::classifiers(node.modes()) {
+        node.add_classifier(c);
+    }
+    for s in srcs {
+        s.start();
+    }
+    node
+}
+
+/// A node over one source `rx` of `meta`, muted from the start when `muted`.
+async fn node_on(dir: &Path, meta: &Path, muted: bool) -> (Node, Arc<Muting>) {
+    let src = file_source("rx", meta);
+    let port = Muting::new(src.clone(), muted);
+    let node = node_over(dir, vec![(port.clone(), src)], None).await;
+    (node, port)
+}
+
+fn rx() -> SourceId {
+    SourceId("rx".into())
+}
+
+fn capture() -> Tuning {
+    Tuning {
+        center_hz: Hz(CENTER_HZ),
+        bandwidth_hz: Hz(RATE_HZ as u64),
+    }
+}
+
+/// The watch's graph for the capture with `detect` params `params` (persist and gone
+/// timing for the tests unless given).
+fn watch_graph(node: &Node, mut params: Value) -> Graph {
+    let mut g = JobKind::Watch
+        .expand(
+            &rx(),
+            capture(),
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    for (k, v) in [("persist_ms", PERSIST_MS), ("gone_ms", GONE_MS)] {
+        if params.get(k).is_none() {
+            params[k] = v.into();
+        }
+    }
+    let detect = g.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params = params;
+    g
+}
+
+/// Start a watch over the whole capture of `rx` with `detect` params `params`.
+async fn start_watch(node: &Node, params: Value) -> JobId {
+    let g = watch_graph(node, params);
+    node.job_start("watch", rx(), capture(), g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap()
+}
+
+/// Every event the watch's event stream carries from now on, across restarts.
+struct Events {
+    seen: Arc<Mutex<Vec<Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Events {
+    /// Collect `job`'s events on `node` (re-subscribing after a restart of the job).
+    fn of(node: &Arc<Node>, job: &JobId) -> Events {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (node, job, out) = (Arc::downgrade(node), job.clone(), seen.clone());
+        let task = tokio::spawn(async move {
+            loop {
+                let rx = node.upgrade().and_then(|n| {
+                    let s = n
+                        .job_outputs(&job)
+                        .into_iter()
+                        .find(|(k, _)| *k == StreamKind::Event)?
+                        .1;
+                    n.bus().subscribe(&s)
+                });
+                let Some(mut rx) = rx else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                loop {
+                    match rx.recv().await {
+                        Ok(f) => {
+                            if let Payload::Event(v) = f.payload {
+                                out.lock().unwrap().push(v);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        Events { seen, task }
+    }
+
+    /// The `watch` events in `state` so far.
+    fn watch(&self, state: &str) -> Vec<Value> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e["protocol"] == "watch" && e["state"] == state)
+            .cloned()
+            .collect()
+    }
+
+    fn signals(&self) -> Vec<Value> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e["protocol"] == "signal")
+            .cloned()
+            .collect()
+    }
+
+    fn all(&self) -> Vec<Value> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+/// Poll `f` every 20 ms until it holds, panicking with `what` after `within`.
+async fn until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn record(node: &Node, id: &JobId) -> Option<zeta_core::job::JobRecord> {
+    node.job_list().into_iter().find(|r| &r.id == id)
+}
+
+fn state(node: &Node, id: &JobId) -> Option<JobState> {
+    record(node, id).map(|r| r.state)
+}
+
+fn running(node: &Node) -> Vec<(String, String)> {
+    node.job_list()
+        .into_iter()
+        .filter(|r| r.state == JobState::Running)
+        .map(|r| (r.id.0, r.kind))
+        .collect()
+}
+
+/// The decoders `watch.decoding` lists.
+fn decoding(node: &Node, watch: &JobId) -> Vec<Value> {
+    node.job_context(watch)
+        .and_then(|c| c["watch"]["decoding"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// Wait for the watch's `decoding` event and return the decoder's id.
+async fn decoded(node: &Node, events: &Events, watch: &JobId) -> JobId {
+    until("a decoding event", Duration::from_secs(40), || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    let e = &events.watch("decoding")[0];
+    let job = JobId(e["job"].as_str().unwrap().into());
+    until("watch.decoding lists it", Duration::from_secs(5), || {
+        decoding(node, watch)
+            .iter()
+            .any(|d| d["job"] == job.0.as_str())
+    })
+    .await;
+    job
+}
+
+/// Stop every running job, then check the node holds nothing on `rx`.
+async fn stop_all(node: &Node) {
+    for (id, _) in running(node) {
+        let _ = node.job_stop(&JobId(id)).await;
+    }
+    until("no lease on rx", Duration::from_secs(5), || {
+        node.lease_holders(&rx()).is_empty()
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_signal_is_identified_and_the_proved_decoder_kept() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let all = events.all();
+    eprintln!("{all:#?}");
+    let identifying = events.watch("identifying");
+    assert_eq!(identifying.len(), 1, "{all:#?}");
+    let d = &events.watch("decoding")[0];
+    let at = |e: &Value| all.iter().position(|x| x == e).unwrap();
+    assert!(at(&identifying[0]) < at(d), "{all:#?}");
+    assert_eq!(d["mode"], "pocsag_decode", "{d}");
+    assert_eq!(d["placed"], "capture", "{d}");
+    assert_eq!(d["source"], "rx", "{d}");
+    assert!(d["signal"]["center_hz"].is_u64(), "{d}");
+    assert!(
+        d["summary"].as_str().unwrap().contains("pocsag_decode"),
+        "{d}"
+    );
+    // The detector's own announcement came first, on the same stream.
+    let new = events.signals();
+    assert!(new.iter().any(|s| s["state"] == "new"), "{all:#?}");
+
+    let rec = record(&node, &job).expect("decoder listed");
+    assert_eq!(rec.kind, "pocsag_decode");
+    assert_eq!(rec.state, JobState::Running);
+    assert_eq!(rec.owner, None, "a kept decoder is an ordinary job");
+    assert!(
+        rec.tuning.center_hz.0.abs_diff(POCSAG_HZ) <= 6_000,
+        "{:?}",
+        rec.tuning
+    );
+    let ctx = node.job_context(&watch).unwrap();
+    let d0 = &ctx["watch"]["decoding"][0];
+    assert_eq!(d0["job"], job.0.as_str(), "{ctx}");
+    assert_eq!(d0["mode"], "pocsag_decode", "{ctx}");
+    assert_eq!(d0["source"], "rx", "{ctx}");
+    assert!(d0["since_ns"].is_u64(), "{ctx}");
+    assert!(ctx["watch"]["current"].is_null(), "{ctx}");
+    let signals = ctx["watch"]["signals"].as_array().unwrap();
+    assert_eq!(signals.len(), 1, "{ctx}");
+    assert_eq!(signals[0]["handled"], true, "{ctx}");
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_inside_another_jobs_band_is_ignored() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    // An operator's job on the burst's band, inside the watch's capture.
+    let op = Op::JobStart {
+        kind: JobKind::Measure,
+        source: rx(),
+        center_hz: Hz(POCSAG_HZ),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![],
+    };
+    assert!(matches!(node.apply(op).await, Ok(OpResult::Job(_))));
+    until(
+        "the detector announces the burst",
+        Duration::from_secs(15),
+        || events.signals().iter().any(|s| s["state"] == "new"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let all = events.all();
+    assert!(events.watch("identifying").is_empty(), "{all:#?}");
+    let ctx = node.job_context(&watch).unwrap();
+    assert!(
+        ctx["watch"]["signals"].as_array().unwrap().is_empty(),
+        "{ctx}"
+    );
+    assert!(ctx["watch"]["current"].is_null(), "{ctx}");
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_children_run_inside_the_watch_capture() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let inside = |t: &Tuning| {
+        let half = t.bandwidth_hz.0 / 2;
+        t.center_hz.0 - half >= CENTER_HZ - RATE_HZ as u64 / 2
+            && t.center_hz.0 + half <= CENTER_HZ + RATE_HZ as u64 / 2
+    };
+    let mut saw_identify = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    while events.watch("decoding").is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "no decoding event");
+        assert_eq!(port.current(), Some(capture()), "the capture moved");
+        let holders = node.lease_holders(&rx());
+        assert!(holders.iter().all(|(_, t)| inside(t)), "{holders:?}");
+        let identify = node
+            .job_list()
+            .into_iter()
+            .find(|r| r.kind == "identify" && r.state == JobState::Running);
+        if let Some(i) = identify {
+            assert_eq!(i.owner.as_ref(), Some(&watch), "{i:?}");
+            assert!(holders.iter().any(|(j, _)| *j == i.id), "{holders:?}");
+            assert!(holders.iter().any(|(j, _)| *j == watch), "{holders:?}");
+            saw_identify = true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(saw_identify, "the identify run was never seen");
+    let job = decoded(&node, &events, &watch).await;
+    assert_eq!(port.current(), Some(capture()), "the capture moved");
+    let holders = node.lease_holders(&rx());
+    let ids: Vec<&JobId> = holders.iter().map(|(j, _)| j).collect();
+    assert!(ids.contains(&&watch) && ids.contains(&&job), "{holders:?}");
+    assert!(holders.iter().all(|(_, t)| inside(t)), "{holders:?}");
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_signal_is_retried_at_most_three_times() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(1_000, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let src = file_source("rx", &fixtures().fsk);
+    let node = node_over(
+        dir.path(),
+        vec![(src.clone() as Arc<dyn Port>, src)],
+        Some(&fixtures().quick_modes),
+    )
+    .await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let tries = 1 + zeta_core::node::watch::RETRY_MAX as usize;
+    until("every try ends unknown", Duration::from_secs(90), || {
+        events.watch("unknown").len() >= tries
+    })
+    .await;
+    // Left alone from then on while it persists.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let all = events.all();
+    let unknown = events.watch("unknown");
+    assert_eq!(unknown.len(), tries, "{all:#?}");
+    assert_eq!(events.watch("identifying").len(), tries, "{all:#?}");
+    assert!(events.watch("decoding").is_empty(), "{all:#?}");
+    for e in &unknown {
+        assert!(e["features"]["bandwidth_hz"].is_u64(), "{e}");
+        assert!(e["signal"]["center_hz"].is_u64(), "{e}");
+        assert!(e["job"].is_string(), "{e}");
+    }
+    let ctx = node.job_context(&watch).unwrap();
+    let s = &ctx["watch"]["signals"][0];
+    assert_eq!(s["tries"], tries as u64, "{ctx}");
+    assert_eq!(s["handled"], true, "{ctx}");
+    // The identify runs and their children are gone with no trace in the history.
+    let owned: Vec<_> = node
+        .job_list()
+        .into_iter()
+        .filter(|r| r.owner.is_some())
+        .collect();
+    assert!(owned.is_empty(), "{owned:#?}");
+    assert_eq!(running(&node), [(watch.0.clone(), "watch".to_string())]);
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_signal_stops_its_decoder() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 2_000);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    port.mute();
+    until("a lost event", Duration::from_secs(20), || {
+        !events.watch("lost").is_empty()
+    })
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert_eq!(lost["mode"], "pocsag_decode", "{lost}");
+    assert_eq!(state(&node, &job), Some(JobState::Stopped));
+    assert!(decoding(&node, &watch).is_empty());
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owned_jobs_never_take_a_history_slot() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    // A full history of the operator's own stopped jobs.
+    let mut mine = Vec::new();
+    for _ in 0..zeta_core::node::JOB_HISTORY_MAX {
+        let g = JobKind::Passthrough
+            .expand(&rx(), capture(), Hz(0), None, None, None, &node.modes())
+            .unwrap();
+        let id = node
+            .job_start("passthrough", rx(), capture(), g, None, false)
+            .await
+            .unwrap();
+        node.job_stop(&id).await.unwrap();
+        mine.push(id);
+    }
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let identify = JobId(
+        events.watch("identifying")[0]["job"]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    until("the identify run is gone", Duration::from_secs(5), || {
+        record(&node, &identify).is_none()
+    })
+    .await;
+    let list = node.job_list();
+    for id in &mine {
+        assert_eq!(state(&node, id), Some(JobState::Stopped), "{list:#?}");
+    }
+    let owned: Vec<_> = list.iter().filter(|r| r.owner.is_some()).collect();
+    assert!(owned.is_empty(), "{owned:#?}");
+    assert!(
+        !dir.path()
+            .join("state/jobs")
+            .join(format!("{}.json", identify.0))
+            .exists()
+    );
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_the_watch_stops_its_decoders() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    node.job_stop(&watch).await.unwrap();
+    assert_eq!(state(&node, &watch), Some(JobState::Stopped));
+    assert_eq!(state(&node, &job), Some(JobState::Stopped));
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    assert!(node.lease_holders(&rx()).is_empty());
+    assert!(decoding(&node, &watch).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_put_on_the_watch_readopts_its_decoders() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let mut graph = match node.apply(Op::GraphGet { job: watch.clone() }).await {
+        Ok(OpResult::Graph(g)) => g,
+        r => panic!("graph_get: {r:?}"),
+    };
+    let detect = graph.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params["threshold_db"] = 12.into();
+    let op = Op::GraphPut {
+        job: watch.clone(),
+        graph,
+    };
+    assert!(matches!(node.apply(op).await, Ok(OpResult::Ok)));
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    let rec = record(&node, &watch).unwrap();
+    assert!(
+        rec.capture_rate_hz.is_some(),
+        "a detect put keeps the watch re-expandable"
+    );
+    // Re-adopted, and kept once its signal is seen again (past `gone_ms`).
+    tokio::time::sleep(Duration::from_millis(GONE_MS + 3_000)).await;
+    let listed = decoding(&node, &watch);
+    assert_eq!(listed.len(), 1, "{listed:#?}");
+    assert_eq!(listed[0]["job"], job.0.as_str());
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    assert!(events.watch("lost").is_empty(), "{:#?}", events.all());
+    // No second identify: the decoder's signal is its own.
+    assert_eq!(events.watch("identifying").len(), 1, "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_readopts_or_drops() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let jobs = dir.path().join("state").join("jobs");
+    let file = |id: &JobId| jobs.join(format!("{}.json", id.0));
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    drop(events);
+    // The records as a kill mid-decode leaves them: both running, the watch naming it.
+    let watch_rec = std::fs::read_to_string(file(&watch)).unwrap();
+    let job_rec = std::fs::read_to_string(file(&job)).unwrap();
+    let v: Value = serde_json::from_str(&watch_rec).unwrap();
+    assert_eq!(v["context"]["watch"]["decoding"][0]["job"], job.0.as_str());
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let restore = || {
+        std::fs::write(file(&watch), &watch_rec).unwrap();
+        std::fs::write(file(&job), &job_rec).unwrap();
+    };
+    restore();
+
+    // The burst is still there: the decoder resumes and the watch keeps it.
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let events = Events::of(&node, &watch);
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    tokio::time::sleep(Duration::from_millis(GONE_MS + 3_000)).await;
+    let listed = decoding(&node, &watch);
+    assert_eq!(listed.len(), 1, "{listed:#?}");
+    assert_eq!(listed[0]["job"], job.0.as_str());
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    assert!(events.watch("lost").is_empty(), "{:#?}", events.all());
+    drop(events);
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    restore();
+
+    // The burst is gone: the decoder resumes, its signal never reappears, it is dropped.
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, true).await;
+    let node = Arc::new(node);
+    let events = Events::of(&node, &watch);
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    until("the decoder is dropped", Duration::from_secs(15), || {
+        state(&node, &job) == Some(JobState::Stopped)
+    })
+    .await;
+    until("watch.decoding is empty", Duration::from_secs(5), || {
+        decoding(&node, &watch).is_empty()
+    })
+    .await;
+    let lost = events.watch("lost");
+    assert_eq!(lost.len(), 1, "{:#?}", events.all());
+    assert_eq!(lost[0]["job"], job.0.as_str());
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn decode_on_free_moves_the_decoder_to_a_free_source() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let a = file_source("rx", &fixtures().pocsag);
+    let b = file_source_with("rx2", &fixtures().pocsag, false);
+    let ports: Vec<(Arc<dyn Port>, Arc<FileSource>)> = vec![(a.clone(), a), (b.clone(), b)];
+    let node = node_over(dir.path(), ports, None).await;
+    let node = Arc::new(node);
+    let params = serde_json::json!({"decode_on": "free", "prefer": ["rx2"]});
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let d = &events.watch("decoding")[0];
+    assert_eq!(d["placed"], "free", "{d}");
+    assert_eq!(d["source"], "rx2", "{d}");
+    let rec = record(&node, &job).unwrap();
+    assert_eq!(rec.source, SourceId("rx2".into()));
+    assert_eq!(rec.kind, "pocsag_decode");
+    assert_eq!(rec.state, JobState::Running);
+    // The child identify proved on the watch's own radio is gone; only the watch holds it.
+    let holders: Vec<JobId> = node
+        .lease_holders(&rx())
+        .into_iter()
+        .map(|(j, _)| j)
+        .collect();
+    assert_eq!(holders, std::slice::from_ref(&watch));
+    let holders: Vec<JobId> = node
+        .lease_holders(&SourceId("rx2".into()))
+        .into_iter()
+        .map(|(j, _)| j)
+        .collect();
+    assert_eq!(holders, std::slice::from_ref(&job));
+    // The moved decoder decodes: its own events arrive.
+    let stream = node
+        .job_outputs(&job)
+        .into_iter()
+        .find(|(k, _)| *k == StreamKind::Event)
+        .unwrap()
+        .1;
+    let mut rx2 = node.bus().subscribe(&stream).unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(f) = rx2.recv().await
+                && let Payload::Event(v) = f.payload
+                && v["protocol"] == "pocsag"
+            {
+                return v;
+            }
+        }
+    })
+    .await
+    .expect("a page decoded on rx2");
+    assert_eq!(got["address"], 1_234_567, "{got}");
+    node.job_stop(&watch).await.unwrap();
+    assert_eq!(state(&node, &job), Some(JobState::Stopped));
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_is_neither_elastic_nor_attachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let op = Op::JobStart {
+        kind: JobKind::Watch,
+        source: rx(),
+        center_hz: Hz(CENTER_HZ),
+        bandwidth_hz: Hz(RATE_HZ as u64),
+        deviation_hz: None,
+        sideband: None,
+        elastic: true,
+        replace: vec![],
+    };
+    let e = node.apply(op).await.unwrap_err();
+    assert!(e.to_string().contains("watch cannot be elastic"), "{e}");
+    let op = Op::JobAttach {
+        kind: JobKind::Watch,
+        job: JobId::new(),
+        language: None,
+    };
+    let e = node.apply(op).await.unwrap_err();
+    assert!(e.to_string().contains("watch is not attachable"), "{e}");
+    assert!(node.job_list().is_empty());
+}

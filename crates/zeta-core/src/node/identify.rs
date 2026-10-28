@@ -49,6 +49,9 @@ struct Run {
     cancel: CancellationToken,
     /// The child a previous run of the job (before a node restart) was trying.
     stale: Option<JobId>,
+    /// The controller that owns this run (a `watch`): set on the children it starts,
+    /// and handed the verdict (see [`Inner::verdict`]).
+    owner: Option<JobId>,
 }
 
 /// How one attempt ended.
@@ -90,7 +93,7 @@ impl Inner {
         let stale = rec.context["identify"]["current"]
             .as_str()
             .map(|s| JobId(s.into()));
-        let (id, tuning) = (rec.id.clone(), rec.tuning);
+        let (id, tuning, owner) = (rec.id.clone(), rec.tuning, rec.owner.clone());
         let token = self.shutdown.child_token();
         let (prov, run, ended) = self.record_running(rec, &token)?;
         let out = self.bus.register(StreamKind::Event, prov.clone());
@@ -102,6 +105,7 @@ impl Inner {
             out: out.clone(),
             cancel: token.clone(),
             stale,
+            owner,
         };
         let mut set = JoinSet::new();
         let (running, body) = (
@@ -132,7 +136,7 @@ impl Inner {
 
     /// [`Inner::launch`] of `rec` in its own task. A concrete handle, not an `async fn`,
     /// keeps `launch`'s future type (which runs this job's loop) from containing itself.
-    fn launch_task(
+    pub(super) fn launch_task(
         self: &Arc<Self>,
         rec: JobRecord,
     ) -> tokio::task::JoinHandle<Result<(), NodeError>> {
@@ -159,8 +163,20 @@ impl Inner {
         true
     }
 
+    /// Record the run's verdict (`{"identify": ...}`) in its context and, for an owned
+    /// run, hand it to the owner too: the owned record goes as soon as the run ends.
+    fn verdict(&self, r: &Run, verdict: serde_json::Value) {
+        if r.owner.is_some() {
+            self.verdicts
+                .lock()
+                .unwrap()
+                .insert(r.id.clone(), verdict["identify"].clone());
+        }
+        let _ = self.context_merge(&r.id, verdict);
+    }
+
     /// Whether the job's stop came under the source's gate (a `replace`).
-    fn gated(&self, id: &JobId) -> bool {
+    pub(super) fn gated(&self, id: &JobId) -> bool {
         self.jobs
             .lock()
             .unwrap()
@@ -289,6 +305,7 @@ impl Inner {
             capture_rate_hz: Some(capture.bandwidth_hz.0),
             elastic: false,
             operator_graph: false,
+            owner: r.owner.clone(),
         };
         let child = rec.id.clone();
         // Recorded first, so a run resumed after a restart can stop it (see `stale`).
@@ -514,7 +531,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                     },
                     "attempts": attempts,
                 }});
-                let _ = inner.context_merge(&r.id, verdict);
+                inner.verdict(&r, verdict);
                 return Ok(());
             }
         }
@@ -530,7 +547,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         },
         "attempts": attempts,
     }});
-    let _ = inner.context_merge(&r.id, verdict);
+    inner.verdict(&r, verdict);
     Ok(())
 }
 

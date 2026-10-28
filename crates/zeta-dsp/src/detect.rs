@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::{StreamId, StreamKind};
+use zeta_core::types::{SourceId, StreamId, StreamKind};
 
 use crate::{Input, run_map};
 
@@ -36,6 +36,23 @@ pub struct DetectParams {
     pub spurs_hz: Vec<u64>,
     /// An announced signal unmatched for this long is reported `gone`.
     pub gone_ms: u64,
+    /// Watch policy, ignored by the stage: where a `watch` keeps a proved decoder,
+    /// `capture` (inside its own capture) or `free` (on a free source, else `capture`).
+    pub decode_on: DecodeOn,
+    /// Watch policy, ignored by the stage: the source ids a `watch` with
+    /// `decode_on: free` tries first, in order.
+    pub prefer: Vec<SourceId>,
+    /// Watch policy, ignored by the stage: the feed sink's settings, kept as given.
+    pub sondehub: Option<serde_json::Value>,
+}
+
+/// Where a `watch` keeps a decoder it proved (see [`DetectParams::decode_on`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodeOn {
+    #[default]
+    Capture,
+    Free,
 }
 
 /// The schema's `edge_mask` default, written as the decimal it is (the `f32` 0.05
@@ -53,7 +70,10 @@ impl Default for DetectParams {
             dc_mask_hz: 25000,
             edge_mask: 0.05,
             spurs_hz: Vec::new(),
-            gone_ms: 30000,
+            gone_ms: zeta_core::ops::DETECT_GONE_MS_DEFAULT,
+            decode_on: DecodeOn::Capture,
+            prefer: Vec::new(),
+            sondehub: None,
         }
     }
 }

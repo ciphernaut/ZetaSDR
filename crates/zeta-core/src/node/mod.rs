@@ -6,6 +6,7 @@ mod jsonlog;
 mod launch;
 mod persist;
 mod sources;
+pub mod watch;
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -164,6 +165,10 @@ struct JobEntry {
     /// Set by the supervisor once the lease is released and the streams are
     /// unregistered, when all that is left is the port's idle.
     released: bool,
+    /// Set by a `graph_put` before it stops the run to relaunch it under the same id:
+    /// a controller (`watch`) then leaves what it started for the next run to re-adopt
+    /// instead of stopping it as a `job_stop` does.
+    restarting: bool,
 }
 
 /// A source's bank for the capture band it was made for; `bank` is `None`
@@ -234,6 +239,10 @@ struct Inner {
     relaunching: tokio::sync::Mutex<()>,
     /// Cancelled when the `Node` is dropped; every job token is a child of it.
     shutdown: CancellationToken,
+    /// The verdicts of owned `identify` runs, by identify id, until their owner (a
+    /// `watch`) takes them: an owned record is dropped as soon as it ends, context and
+    /// all (see [`Inner::prune_history`]).
+    verdicts: Mutex<HashMap<JobId, serde_json::Value>>,
 }
 
 impl Inner {
@@ -325,9 +334,25 @@ impl Inner {
     /// will not go is retried at the next prune). Called with `jobs` locked
     /// after a record turns terminal; that record ended last, so it survives.
     fn prune_history(jobs: &mut HashMap<JobId, JobEntry>, jobs_dir: &Path) {
+        let is_terminal =
+            |e: &JobEntry| matches!(e.record.state, JobState::Stopped | JobState::Failed { .. });
+        // An owned record (a watch's identify runs and their children) goes as soon as
+        // it ends: it never takes one of the kept slots. Once its run has released (or
+        // it was loaded, never launched), so its supervisor still finds the entry and
+        // honours a gated stop (no idle under a gate the stopper holds).
+        let owned: Vec<JobId> = jobs
+            .values()
+            .filter(|e| e.record.owner.is_some() && is_terminal(e))
+            .filter(|e| e.cancel.is_none() && (e.released || e.run == 0))
+            .map(|e| e.record.id.clone())
+            .collect();
+        for id in owned {
+            jobs.remove(&id);
+            let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", id.0)));
+        }
         let mut terminal: Vec<(Timestamp, JobId)> = jobs
             .values()
-            .filter(|e| matches!(e.record.state, JobState::Stopped | JobState::Failed { .. }))
+            .filter(|e| is_terminal(e) && e.record.owner.is_none())
             .map(|e| (e.ended_ns, e.record.id.clone()))
             .collect();
         if terminal.len() <= JOB_HISTORY_MAX {
@@ -593,6 +618,7 @@ impl Node {
                 runs: std::sync::atomic::AtomicU64::new(0),
                 relaunching: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
+                verdicts: Mutex::new(HashMap::new()),
             }),
             load_errors,
             job_load_errors,
@@ -625,6 +651,7 @@ impl Node {
                         relaunch: false,
                         gated_stop: false,
                         released: false,
+                        restarting: false,
                     },
                 );
                 continue;
@@ -650,6 +677,7 @@ impl Node {
                         relaunch: false,
                         gated_stop: false,
                         released: false,
+                        restarting: false,
                     },
                 );
             }
@@ -995,6 +1023,7 @@ impl Node {
             capture_rate_hz: capture_rate_hz.map(|r| r.0),
             elastic,
             operator_graph: false,
+            owner: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -1033,6 +1062,7 @@ impl Node {
             capture_rate_hz: None,
             elastic: false,
             operator_graph: false,
+            owner: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -1045,6 +1075,20 @@ impl Node {
     /// `NoAudioStream` when it outputs no audio.
     pub fn job_audio_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
         self.inner.audio_stream(job)
+    }
+
+    /// The output streams (those no edge of its graph consumes) of `job`'s current run,
+    /// in graph order; empty for a job that does not run here. A `watch`'s one event
+    /// output carries `detect`'s `signal` events and the watch's own.
+    pub fn job_outputs(&self, job: &JobId) -> Vec<(StreamKind, StreamId)> {
+        self.inner
+            .jobs
+            .lock()
+            .unwrap()
+            .get(job)
+            .filter(|e| e.cancel.is_some())
+            .map(|e| e.outputs.clone())
+            .unwrap_or_default()
     }
 
     /// Persist the job as `Stopped`, then cancel its stages and wait for its
@@ -1153,6 +1197,7 @@ impl Node {
             capture_rate_hz: capture_rate_hz.map(|r| r.0),
             elastic,
             operator_graph: false,
+            owner: None,
         };
         let id = rec.id.clone();
         let (r, after) = self.inner.launch_gated(rec, guard).await;
@@ -1253,7 +1298,16 @@ impl Node {
             Some(r) => Some(Some(r.0)),
         };
         if running {
-            self.job_stop(id).await?;
+            // A controller's run tells this restart from a `job_stop` by the flag.
+            if let Some(e) = self.inner.jobs.lock().unwrap().get_mut(id) {
+                e.restarting = true;
+            }
+            if let Err(e) = self.job_stop(id).await {
+                if let Some(e) = self.inner.jobs.lock().unwrap().get_mut(id) {
+                    e.restarting = false;
+                }
+                return Err(e);
+            }
         }
         let rec = {
             let mut jobs = self.inner.jobs.lock().unwrap();

@@ -247,7 +247,8 @@ fn verdict_job(rec: &zeta_core::job::JobRecord) -> Option<Option<zeta_core::type
 
 /// `--then-tail`: wait up to `STREAM_WAIT` for the job's audio output (a
 /// demodulator's; its `squelch` events are not what a tail is for), else its
-/// first event stream, then apply `StreamTail` to it.
+/// first event output stream (an edge between its stages never), then apply
+/// `StreamTail` to it.
 async fn tail_job(
     node: &zeta_core::node::Node,
     job: &zeta_core::types::JobId,
@@ -256,18 +257,16 @@ async fn tail_job(
     use zeta_core::types::StreamKind;
     let deadline = tokio::time::Instant::now() + STREAM_WAIT;
     let stream = loop {
-        let mut mine: Vec<_> = node
-            .bus()
-            .list()
-            .into_iter()
-            .filter(|s| s.provenance.job.as_ref() == Some(job))
-            .collect();
-        mine.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         if let Ok(s) = node.job_audio_stream(job) {
             break s;
         }
-        if let Some(s) = mine.iter().find(|s| s.kind == StreamKind::Event) {
-            break s.id.clone();
+        // An output, never an edge between two of its stages (a watch's spectrum rows).
+        if let Some((_, s)) = node
+            .job_outputs(job)
+            .into_iter()
+            .find(|(k, _)| *k == StreamKind::Event)
+        {
+            break s;
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(OpError::Other {

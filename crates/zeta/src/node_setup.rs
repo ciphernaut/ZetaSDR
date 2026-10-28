@@ -516,6 +516,18 @@ mod tests {
                         Ok(g) if matches!(kind, JobKind::Scan | JobKind::Identify) => {
                             assert!(g.nodes.is_empty() && g.edges.is_empty(), "{g:?}");
                         }
+                        // A watch: `fft → detect` over the capture, the fft sized as a
+                        // spectrum of the capture is.
+                        Ok(g) if kind == JobKind::Watch => {
+                            validate(&g, &registry)
+                                .unwrap_or_else(|e| panic!("{kind:?} {rate} {bw}: {e}"));
+                            let kinds: Vec<&str> =
+                                g.nodes.iter().map(|n| n.kind.as_str()).collect();
+                            assert_eq!(kinds, ["fft", "detect"], "{g:?}");
+                            let size = param(&g.nodes[0], "size");
+                            let want = zeta_core::ops::spectrum_size(rate.max(bw));
+                            assert_eq!(size, u64::from(want), "{rate} {bw}");
+                        }
                         Ok(g) => {
                             validate(&g, &registry)
                                 .unwrap_or_else(|e| panic!("{kind:?} {rate} {bw}: {e}"));

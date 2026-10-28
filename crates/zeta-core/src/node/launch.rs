@@ -13,7 +13,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::persist::{now, persist};
-use super::{Inner, JobEntry, LogFile, NodeError, ring_seconds_for};
+use super::{Inner, JobEntry, LogFile, NodeError, ring_seconds_for, watch};
 use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::ops::{JobKind, SPECTRUM_ROWS_PER_S, scan_steps, spectrum_size};
@@ -197,6 +197,9 @@ impl Inner {
         let graph = rec.graph.clone();
         // A `transcribe` job's record for its transcript tees (see `tee_transcripts`).
         let tee = (rec.kind == JobKind::Transcribe.name()).then(|| rec.clone());
+        // A `watch`'s controller runs beside its stages (see `super::watch`).
+        let watch =
+            (rec.kind == JobKind::Watch.name()).then(|| (watch::Seed::of(&rec), rec.tuning));
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.
         let (prov, run, ended) = self.record_running(rec, &token)?;
 
@@ -254,6 +257,32 @@ impl Inner {
                 let _running = running;
                 stage.run(params, inputs, ids, bus, cancel, ctx).await
             });
+        }
+        if let (Some((seed, tuning)), Some(port)) = (watch, &port) {
+            // The controller reads `detect`'s events and publishes its own beside them.
+            let out = job_outputs
+                .iter()
+                .find(|(k, _)| *k == StreamKind::Event)
+                .map(|(_, s)| s.clone());
+            let rx = out.as_ref().and_then(|s| self.bus.subscribe(s));
+            if let (Some(out), Some(rx)) = (out, rx) {
+                let run = watch::Run::new(
+                    id.clone(),
+                    port.clone(),
+                    tuning,
+                    prov.clone(),
+                    out,
+                    rx,
+                    token.clone(),
+                    seed,
+                );
+                let running = StageRunning::new(self.stages.clone());
+                let body = watch::watch_loop(self.clone(), run);
+                set.spawn(async move {
+                    let _running = running;
+                    body.await
+                });
+            }
         }
         if let (Some(sid), Some(port)) = (iq, &port) {
             let rx = port.subscribe();
@@ -610,6 +639,7 @@ impl Inner {
                 relaunch: false,
                 gated_stop: false,
                 released: false,
+                restarting: false,
             },
         );
         Ok((prov, run, ended))
@@ -882,7 +912,12 @@ pub(super) async fn supervise(
             Some(e) if e.run == run => {
                 // A relaunch keeps the lease; nothing was released.
                 e.released = !relaunch;
-                e.gated_stop
+                let gated = e.gated_stop;
+                // An owned record that ended goes now (see `Inner::prune_history`).
+                if e.record.owner.is_some() {
+                    Inner::prune_history(&mut jobs, &inner.jobs_dir);
+                }
+                gated
             }
             _ => false,
         }

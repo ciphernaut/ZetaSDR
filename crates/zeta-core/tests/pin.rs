@@ -541,6 +541,7 @@ fn running(kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord {
         capture_rate_hz: None,
         elastic: false,
         operator_graph: false,
+        owner: None,
     }
 }
 

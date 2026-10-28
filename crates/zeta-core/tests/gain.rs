@@ -272,6 +272,7 @@ fn running() -> JobRecord {
         capture_rate_hz: None,
         elastic: false,
         operator_graph: false,
+        owner: None,
     }
 }
 

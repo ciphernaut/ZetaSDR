@@ -1088,6 +1088,69 @@ fn then_tail_on_a_proving_identify_with_keep_leaves_the_child_running() {
     assert_eq!(running_kinds(&jobs), ["pocsag_decode"], "{jobs:?}");
 }
 
+/// A one-shot `watch` with `--then-tail` over a 1.024 MHz recording carrying the POCSAG
+/// page 300 kHz above its centre every 2 s: the tail is its event stream (never the
+/// spectrum rows between its stages), holding `detect`'s announcement and the watch's
+/// `identifying` event; the watch is stopped after and leaves no job running.
+#[test]
+fn watch_then_tail_prints_signal_events() {
+    const RATE: u32 = 1_024_000;
+    const CENTER: u64 = 148_337_500;
+    let dir = tempfile::tempdir().unwrap();
+    let mut iq = zeta_dsp::synth::pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, RATE, 300_000.0);
+    iq.resize(2 * RATE as usize, num_complex::Complex::new(0.0, 0.0));
+    zeta_dsp::synth::awgn(&mut iq, 20.0, 1);
+    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "band", &iq, RATE, CENTER);
+    let src = format!("band={}", meta.display());
+    let (center, width) = (CENTER.to_string(), RATE.to_string());
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-file",
+            &src,
+            "job",
+            "start",
+            "--kind",
+            "watch",
+            "--source",
+            "band",
+            "--center-hz",
+            &center,
+            "--bandwidth-hz",
+            &width,
+            "--then-tail",
+            "2,10000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v[1]["result"], "frames", "{v}");
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 2, "{v}");
+    let signal = &frames[0]["payload"];
+    assert_eq!(signal["protocol"], "signal", "{v}");
+    assert_eq!(signal["state"], "new", "{v}");
+    let at = signal["center_hz"].as_u64().unwrap();
+    assert!(at.abs_diff(CENTER + 300_000) <= 6_000, "{v}");
+    let watch = &frames[1]["payload"];
+    assert_eq!(watch["protocol"], "watch", "{v}");
+    assert_eq!(watch["state"], "identifying", "{v}");
+    assert_eq!(watch["signal"]["center_hz"], at, "{v}");
+    assert_eq!(v[2], serde_json::json!({"stopped": true}));
+    let jobs = zeta(dir.path(), &["--source-file", &src, "job", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let jobs = json(&jobs)["value"].as_array().expect("jobs array").clone();
+    assert!(running_kinds(&jobs).is_empty(), "{jobs:?}");
+}
+
 #[test]
 fn then_tail_malformed_value_is_usage_error() {
     let dir = tempfile::tempdir().unwrap();

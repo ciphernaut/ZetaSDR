@@ -64,11 +64,19 @@ pub struct JobRecord {
     /// expand) be told apart from an operator's graph.
     #[serde(default)]
     pub operator_graph: bool,
+    /// The controller job that started this one and owns it (a `watch` owns the
+    /// `identify` runs it starts and their children); `null` for an operator's job. An
+    /// owned record is dropped from the history as soon as it stops or fails, so it
+    /// never takes one of the kept slots.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<JobId>")]
+    pub owner: Option<JobId>,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
-/// `format`, `input`, `capture_rate_hz`, `elastic` and `operator_graph`, so the published schema requires them.
+/// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph` and `owner`, so the
+/// published schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -82,6 +90,7 @@ fn require_format(schema: &mut schemars::Schema) {
             "capture_rate_hz",
             "elastic",
             "operator_graph",
+            "owner",
         ] {
             if !req.iter().any(|r| r == f) {
                 req.push(f.into());

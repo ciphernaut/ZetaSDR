@@ -334,6 +334,10 @@ const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 /// decoder, measures it for [`IDENTIFY_MEASURE_MS`], then tries every plausible mode
 /// row as a child job, in score order, publishing one `candidate` event per row and
 /// ending with a verdict (see `node::identify`).
+/// `watch` holds a rigid lease on its band and expands to `fft → detect` over the
+/// capture (the `fft` sized as `spectrum`'s); the node runs a controller beside it that
+/// identifies each signal `detect` announces and keeps the proved decoder running
+/// (see `node::watch`).
 /// `transcribe` is attachable, not started on the radio: `job_attach` runs it on another
 /// job's audio (see [`JobKind::expand_attached`]); `job_start` refuses it.
 ///
@@ -358,13 +362,14 @@ pub enum JobKind {
     Measure,
     Scan,
     Identify,
+    Watch,
     Transcribe,
     /// A mode row's id that is not a built-in kind's name (an operator's row).
     Mode(ModeId),
 }
 
 /// The built-in kinds, in the order `schema` lists them: every kind but [`JobKind::Mode`].
-pub static BUILTIN_KINDS: [JobKind; 15] = [
+pub static BUILTIN_KINDS: [JobKind; 16] = [
     JobKind::Passthrough,
     JobKind::Spectrum,
     JobKind::FmDemod,
@@ -379,6 +384,7 @@ pub static BUILTIN_KINDS: [JobKind; 15] = [
     JobKind::Measure,
     JobKind::Scan,
     JobKind::Identify,
+    JobKind::Watch,
     JobKind::Transcribe,
 ];
 
@@ -431,6 +437,7 @@ impl JobKind {
             JobKind::Measure => "measure",
             JobKind::Scan => "scan",
             JobKind::Identify => "identify",
+            JobKind::Watch => "watch",
             JobKind::Transcribe => "transcribe",
             JobKind::Mode(id) => &id.0,
         }
@@ -571,7 +578,8 @@ impl JobKind {
     /// `squelch_db` and `squelch`, its adjacent-channel guard's `guard_hz`, `guard_db` and
     /// `channel_hz`, and a channel's `wide_hz` (as `graph_put` may have set them) are
     /// carried to the node of the same stage kind when `expand` writes the key (absent
-    /// from `stored`: the defaults `expand` writes).
+    /// from `stored`: the defaults `expand` writes). A `watch`'s `detect` node keeps its
+    /// stored params whole.
     pub fn reexpand(
         &self,
         source: &SourceId,
@@ -597,6 +605,11 @@ impl JobKind {
             let Some(old) = stored.nodes.iter().find(|o| o.kind == n.kind) else {
                 continue;
             };
+            // A watch's `detect` params (thresholds and policy) are the operator's whole.
+            if n.kind == DETECT_STAGE {
+                n.params = old.params.clone();
+                continue;
+            }
             for key in CARRIED_PARAMS {
                 if let (Some(v), Some(p)) = (old.params.get(key), n.params.as_object_mut())
                     && p.contains_key(key)
@@ -723,6 +736,33 @@ impl JobKind {
                         from: channel,
                         to: measure,
                         kind: StreamKind::Iq,
+                    }],
+                }
+            }
+            JobKind::Watch => {
+                let (fft, detect) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: fft.clone(),
+                            kind: "fft".into(),
+                            params: serde_json::json!({
+                                "size": spectrum_size(source_rate_hz.0.max(bw)),
+                                "window": "hann",
+                                "rows_per_s": SPECTRUM_ROWS_PER_S,
+                            }),
+                        },
+                        GraphNode {
+                            id: detect.clone(),
+                            kind: DETECT_STAGE.into(),
+                            params: serde_json::json!({}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: fft,
+                        to: detect,
+                        kind: StreamKind::Event,
                     }],
                 }
             }
@@ -976,6 +1016,14 @@ pub fn fill_squelch_params(graph: &mut Graph) -> bool {
     }
     filled
 }
+
+/// The stage kind of a `watch`'s detector (registered by `zeta-dsp`); its params carry
+/// the watch's policy too (`decode_on`, `prefer`, `sondehub`), see `node::watch`.
+pub const DETECT_STAGE: &str = "detect";
+
+/// The `detect` stage's default `gone_ms`: an announced signal unmatched this long is
+/// `gone`. The watch re-adopts a decoder only when its signal reappears within it.
+pub const DETECT_GONE_MS_DEFAULT: u64 = 30_000;
 
 /// The params [`JobKind::reexpand`] carries from a stored graph to the node of the same
 /// stage kind: what an operator may set with `graph_put` and still have the node's graph.
