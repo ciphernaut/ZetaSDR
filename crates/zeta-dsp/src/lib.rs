@@ -29,6 +29,7 @@ pub mod pfb;
 pub mod pocsag;
 pub mod rds;
 pub mod resample;
+pub mod rs41_frame;
 pub mod squelch;
 pub mod synth;
 pub mod util;

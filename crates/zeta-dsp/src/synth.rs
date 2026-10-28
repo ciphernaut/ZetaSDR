@@ -890,6 +890,44 @@ fn repeat_bursts(burst: Vec<Complex<f32>>, repeat: u32, rate_hz: u32) -> Vec<Com
     out
 }
 
+/// The RS41's line: 4800 baud GFSK at 2400 Hz deviation.
+const RS41_BAUD: u32 = 4800;
+const RS41_DEVIATION_HZ: f64 = 2400.0;
+
+/// `frames` RS41 frames (numbered from 1), each starting a second after the last with
+/// silence between, at `rate_hz`.
+fn rs41_iq(
+    serial: &str,
+    lat: f64,
+    lon: f64,
+    alt_m: f64,
+    vel_v: f64,
+    frames: u32,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    let second = rate_hz as usize;
+    let mut out = Vec::with_capacity(second * frames as usize);
+    for n in 0..frames {
+        let p = crate::rs41_frame::Rs41Params {
+            serial: serial.into(),
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frame_no: n + 1,
+        };
+        let bits = crate::rs41_frame::rs41_frame_bits(&p);
+        let burst = gfsk_modulate(&bits, 2, RS41_BAUD, RS41_DEVIATION_HZ, rate_hz);
+        let start = out.len();
+        out.extend(burst);
+        out.resize(
+            start + second.max(out.len() - start),
+            Complex::new(0.0, 0.0),
+        );
+    }
+    out
+}
+
 /// Bounds on the generic families' numbers, so a bad row is an error, not an abort or
 /// a huge allocation. `deviation_hz` is given for `fsk`, whose tones must fit the rate.
 fn generic_params(
@@ -968,6 +1006,16 @@ pub enum SynthSpec {
         symbol_rate_baud: u32,
         bits: String,
         repeat: u32,
+    },
+    /// `frames` Vaisala RS41 frames one second apart ([`crate::rs41_frame`]): GFSK at
+    /// 4800 baud and 2400 Hz deviation carrying `serial`, the position and the climb.
+    Rs41 {
+        serial: String,
+        lat: f64,
+        lon: f64,
+        alt_m: f64,
+        vel_v: f64,
+        frames: u32,
     },
 }
 
@@ -1106,6 +1154,37 @@ impl SynthSpec {
                 generic_params(*symbol_rate_baud, *repeat, None)?;
                 generic_symbols(bits, 2, *symbol_rate_baud)?;
             }
+            SynthSpec::Rs41 {
+                serial,
+                lat,
+                lon,
+                alt_m,
+                vel_v,
+                frames,
+            } => {
+                if !(1..=60).contains(frames) {
+                    return Err("frames: 1..=60".into());
+                }
+                if serial.len() != 8
+                    || !serial
+                        .bytes()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                {
+                    return Err("serial: 8 characters of A-Z and 0-9".into());
+                }
+                if !(lat.is_finite() && (-90.0..=90.0).contains(lat)) {
+                    return Err("lat: -90..=90".into());
+                }
+                if !(lon.is_finite() && (-180.0..=180.0).contains(lon)) {
+                    return Err("lon: -180..=180".into());
+                }
+                if !(alt_m.is_finite() && (-1000.0..=60_000.0).contains(alt_m)) {
+                    return Err("alt_m: -1000..=60000".into());
+                }
+                if !(vel_v.is_finite() && (-100.0..=100.0).contains(vel_v)) {
+                    return Err("vel_v: -100..=100".into());
+                }
+            }
             SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
         }
         Ok(())
@@ -1119,7 +1198,7 @@ impl SynthSpec {
             SynthSpec::Aprs { .. } | SynthSpec::Pocsag { .. } | SynthSpec::Acars { .. } => 48_000,
             SynthSpec::Rds { .. } => 240_000,
             SynthSpec::ModesIdent { .. } => 2_400_000,
-            SynthSpec::NbfmTone { .. } => 48_000,
+            SynthSpec::NbfmTone { .. } | SynthSpec::Rs41 { .. } => 48_000,
             SynthSpec::Fsk {
                 symbol_rate_baud, ..
             }
@@ -1229,6 +1308,18 @@ pub fn synthesise(
                 .expect("synth spec validated before synthesise");
             let burst = ook_modulate(&sym, *symbol_rate_baud, rate_hz);
             let mut iq = repeat_bursts(burst, *repeat, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Rs41 {
+            serial,
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frames,
+        } => {
+            let mut iq = rs41_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -1435,6 +1526,45 @@ mod tests {
             );
         }
         assert!(fsk(4800, 2400.0, 4, "pattern:1b").validate().is_ok());
+    }
+
+    #[test]
+    fn rs41_family_is_bounded_and_one_frame_a_second() {
+        let parse = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"family": "rs41", "serial": "S1234567",
+                "lat": -27.4, "lon": 153.1, "alt_m": 12000, "vel_v": 5.0, "frames": 2});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse_params(v.as_object().unwrap().clone()).map(|(s, _)| s)
+        };
+        let cases = [
+            (serde_json::json!({"frames": 0}), "frames: 1..=60"),
+            (serde_json::json!({"frames": 61}), "frames: 1..=60"),
+            (
+                serde_json::json!({"serial": "s1234567"}),
+                "serial: 8 characters of A-Z and 0-9",
+            ),
+            (
+                serde_json::json!({"serial": "S123456"}),
+                "serial: 8 characters of A-Z and 0-9",
+            ),
+            (serde_json::json!({"lat": 91.0}), "lat: -90..=90"),
+            (serde_json::json!({"lon": -181.0}), "lon: -180..=180"),
+            (serde_json::json!({"alt_m": 70000}), "alt_m: -1000..=60000"),
+            (serde_json::json!({"vel_v": 500.0}), "vel_v: -100..=100"),
+        ];
+        for (extra, err) in cases {
+            assert_eq!(parse(extra.clone()), Err(err.into()), "{extra}");
+        }
+        let spec = parse(serde_json::json!({})).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 403_000_000);
+        // Two frames, each padded with silence to a second; a frame is 2880 bits at
+        // 4800 baud, 0.6 s.
+        assert_eq!(iq.len(), 96_000);
+        assert!(iq[28_000].norm() > 0.99 && iq[30_000].norm() == 0.0);
+        assert!(iq[48_000].norm() > 0.99);
     }
 
     #[test]

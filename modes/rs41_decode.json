@@ -46,6 +46,6 @@
     "priority": 1
   },
   "catalogue": ["vaisala-rs41-sg-weather-balloon-radiosonde"],
-  "test": null,
+  "test": {"kind": "synth", "family": "rs41", "serial": "S1234567", "lat": -27.4, "lon": 153.1, "alt_m": 12000, "vel_v": 5.0, "frames": 6, "snr_db": 20, "offset_hz": 0, "ppm": 0, "expect": {"id": "S1234567"}, "within_ms": 8000},
   "notes": "Vaisala RS41 radiosondes (GFSK, 4800 baud, one frame a second) anywhere in 400.05-406 MHz; the frequency varies by flight, so start the job on the measured centre, not a raster. One job decodes one sonde."
 }

@@ -58,13 +58,18 @@ fn modes_check_passes_the_four_in_crate_rows() {
             .any(|l| l == "adsb_decode: skipped: dump1090 missing"),
         "{out}"
     );
-    // The sonde rows have no test yet.
-    for id in ["dfm_decode", "m20_decode", "rs41_decode"] {
+    // DFM and M20 have no test yet; RS41's decoder is pinned missing here.
+    for id in ["dfm_decode", "m20_decode"] {
         assert!(
             out.lines().any(|l| l == format!("{id}: skipped: no test")),
             "{out}"
         );
     }
+    assert!(
+        out.lines()
+            .any(|l| l == "rs41_decode: skipped: rs41mod missing"),
+        "{out}"
+    );
     assert_eq!(code, 0, "{out}");
 }
 
@@ -171,8 +176,8 @@ fn a_row_without_a_test_is_skipped() {
     assert_eq!(out.trim(), "aprs_untested: skipped: no test", "{out}");
     assert_eq!(code, 0);
     // `--strict` makes a skip a fail, a missing test as much as a missing program.
-    let (out, code) = stdout(&mut check(dir.path(), &["--strict", "rs41_decode"]));
-    assert_eq!(out.trim(), "rs41_decode: fail: no test", "{out}");
+    let (out, code) = stdout(&mut check(dir.path(), &["--strict", "dfm_decode"]));
+    assert_eq!(out.trim(), "dfm_decode: fail: no test", "{out}");
     assert_eq!(code, 1);
 }
 
@@ -279,4 +284,29 @@ fn check_is_refused_while_serve_owns_the_state_dir() {
         text.contains(&format!("zeta serve (pid {pid}) owns this state dir")),
         "{text}"
     );
+}
+
+/// Where `rs41mod` lives on this host, if anywhere on `PATH`.
+fn rs41mod() -> Option<String> {
+    let out = std::process::Command::new("which")
+        .arg("rs41mod")
+        .output()
+        .ok()?;
+    let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !path.is_empty()).then_some(path)
+}
+
+/// The RS41 row proves itself against the real `rs41mod`: the synthesised frames pass
+/// through the row's own chain and the decoder reports the serial.
+#[test]
+fn rs41_decode_passes_its_synthesised_check() {
+    let Some(rs41mod) = rs41mod() else {
+        eprintln!("rs41mod not on this host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) =
+        stdout(check(dir.path(), &["rs41_decode"]).env("ZETA_HANDLER_RS41MOD", rs41mod));
+    assert_eq!(out.trim(), "rs41_decode: ok", "{out}");
+    assert_eq!(code, 0);
 }
