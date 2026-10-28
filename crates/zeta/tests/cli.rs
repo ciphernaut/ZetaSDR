@@ -2279,6 +2279,70 @@ fn source_gain_cli_requires_db_or_auto() {
     assert!(json(&out)["value"][0]["gain"].is_null());
 }
 
+/// `source free` against a serving node (`--node`) lists the idle sources that cover the
+/// band as `free` and the held one under `busy` with its holder; the recording that
+/// cannot cover it is in neither. A one-shot `source free` reads while `serve` owns the
+/// state directory.
+#[test]
+fn source_free_prints_free_and_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = write_tone(dir.path());
+    let ranged = |id: &str| {
+        format!(
+            "{id}={},tune_min_hz=400000000,tune_max_hz=406000000",
+            meta.display()
+        )
+    };
+    let (held, idle) = (ranged("held"), ranged("idle"));
+    let flags = ["--source-file", &held, "--source-file", &idle];
+    let node = common::ServeProc::start_with(dir.path(), NODE_SECRET, &flags);
+    let band = ["--center-hz", "403000000", "--bandwidth-hz", "20000"];
+    let start: Vec<&str> = ["job", "start", "--kind", "passthrough", "--source", "held"]
+        .into_iter()
+        .chain(band)
+        .collect();
+    let out = common::zeta_remote(&node.url, NODE_SECRET, &start)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let job = json(&out)["value"].clone();
+    let free: Vec<&str> = ["source", "free"].into_iter().chain(band).collect();
+    let out = common::zeta_remote(&node.url, NODE_SECRET, &free)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "source_free", "{v}");
+    assert_eq!(v["value"]["free"], serde_json::json!(["idle"]), "{v}");
+    assert_eq!(
+        v["value"]["busy"],
+        serde_json::json!([{
+            "id": "held", "holders": [job], "elastic": [], "pin": null, "fault": null
+        }]),
+        "{v}"
+    );
+    // The same state directory, owned by the serving node: a read still runs one-shot.
+    let mut local = free.clone();
+    local.splice(0..0, flags);
+    let out = zeta(dir.path(), &local)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(
+        v["value"]["free"],
+        serde_json::json!(["held", "idle"]),
+        "{v}"
+    );
+    assert_eq!(v["value"]["busy"], serde_json::json!([]), "{v}");
+}
+
 /// The test stand-in for dump1090 (`crates/zeta-ext/tests/fake_dump1090`), absolute.
 fn fake_dump1090() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

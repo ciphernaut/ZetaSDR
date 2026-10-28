@@ -403,6 +403,16 @@ pub enum SourceCmd {
         #[arg(long)]
         source: String,
     },
+    /// List the sources that could take a band now (free) and those held, pinned or
+    /// faulted (busy)
+    Free {
+        /// Centre frequency, Hz
+        #[arg(long, value_name = "HZ")]
+        center_hz: u64,
+        /// Bandwidth, Hz
+        #[arg(long, value_name = "HZ")]
+        bandwidth_hz: u64,
+    },
     /// Set a source's overall receive gain (persisted; re-applied on restart)
     Gain {
         /// Source id
@@ -734,6 +744,13 @@ impl Command {
             },
             Command::Source(SourceCmd::Unpin { source }) => Op::SourceUnpin {
                 source: SourceId(source),
+            },
+            Command::Source(SourceCmd::Free {
+                center_hz,
+                bandwidth_hz,
+            }) => Op::SourceFree {
+                center_hz: Hz(center_hz),
+                bandwidth_hz: Hz(bandwidth_hz),
             },
             // clap admits exactly one of `--db` and `--auto`.
             Command::Source(SourceCmd::Gain {

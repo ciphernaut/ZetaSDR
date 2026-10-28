@@ -91,6 +91,19 @@ CLI: `zeta source unpin --source <id>`
 
 Release the pin; the source idles if nothing else holds it.
 
+### source_free
+
+The sources that could take the band now: `free` lists, in id order, every source whose `tune_min_hz..=tune_max_hz` holds both edges of the band and whose `max_bandwidth_hz` its width, with no rigid holder, no pin and no fault (elastic jobs never make a source busy); `busy` lists every other source that covers the band with why: `holders`, `elastic`, `pin` and `fault` as `source_list` gives them. A source that cannot cover the band is in neither list. Takes no lease.
+
+- center_hz: integer (Hz)
+- bandwidth_hz: integer (Hz)
+
+JSON: `{"op":"source_free","center_hz":144800000,"bandwidth_hz":12500}`
+
+CLI: `zeta source free --center-hz 144800000 --bandwidth-hz 12500`
+
+Ask which radio could take a band before starting a job on it, then start the job on one of the `free` ids. A free source is a suggestion, not a reservation: nothing is leased, and the next `job_start` may still conflict. A source on another node (`--source-node`) can look free here while that node runs its own jobs on it; that surfaces as a `conflict` on `job_start`.
+
 ### source_set_gain
 
 Set the source's overall receive gain live; the result is the gain after the change (`source_list` shows it as `gain`). Persisted in the state directory and re-applied when the node opens.

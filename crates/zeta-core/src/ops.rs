@@ -87,6 +87,16 @@ pub enum Op {
     SourceUnpin {
         source: SourceId,
     },
+    /// The sources that could take the band now: `free` lists, in id order, every
+    /// source whose `tune_min_hz..=tune_max_hz` holds both edges of the band and whose
+    /// `max_bandwidth_hz` its width, with no rigid holder, no pin and no fault (elastic
+    /// jobs never make a source busy); `busy` lists every other source that covers the
+    /// band with why: `holders`, `elastic`, `pin` and `fault` as `source_list` gives
+    /// them. A source that cannot cover the band is in neither list. Takes no lease.
+    SourceFree {
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+    },
     /// Set the source's overall receive gain live; the result is the gain after
     /// the change (`source_list` shows it as `gain`). Persisted in the state
     /// directory and re-applied when the node opens.
@@ -1026,6 +1036,24 @@ pub struct SourceInfo {
     pub stats: Option<PortStats>,
 }
 
+/// A source of `source_free` that covers the band but cannot take it now, with why.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct BusySource {
+    pub id: SourceId,
+    /// The jobs holding a rigid lease.
+    pub holders: Vec<JobId>,
+    /// The elastic jobs following the capture (never what makes a source busy).
+    pub elastic: Vec<JobId>,
+    /// The band `source_pin` holds the source at; `null` when unpinned.
+    #[schemars(required, schema_with = "crate::types::nullable::<Tuning>")]
+    pub pin: Option<Tuning>,
+    /// The port's unrecoverable failure; `null` when healthy.
+    #[schemars(required, schema_with = "nullable_string")]
+    pub fault: Option<String>,
+}
+
 /// A source's channel bank: its bin spacing and live subscribers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1225,6 +1253,12 @@ impl From<&LoadedMode> for ModeInfo {
 #[schemars(deny_unknown_fields)]
 pub enum OpResult {
     Sources(Vec<SourceInfo>),
+    /// `source_free`: the sources that could take the band now, and those that
+    /// cover it but are held, pinned or faulted.
+    SourceFree {
+        free: Vec<SourceId>,
+        busy: Vec<BusySource>,
+    },
     Tuning(Tuning),
     Job(JobId),
     Jobs(Vec<JobRecord>),
@@ -1281,6 +1315,7 @@ impl Op {
             Op::SourceEnsure { .. } => "source_ensure",
             Op::SourcePin { .. } => "source_pin",
             Op::SourceUnpin { .. } => "source_unpin",
+            Op::SourceFree { .. } => "source_free",
             Op::SourceSetGain { .. } => "source_set_gain",
             Op::JobStart { .. } => "job_start",
             Op::JobAttach { .. } => "job_attach",
@@ -1307,6 +1342,7 @@ impl Op {
         matches!(
             self,
             Op::SourceList {}
+                | Op::SourceFree { .. }
                 | Op::JobList {}
                 | Op::StreamList {}
                 | Op::StreamTail { .. }
@@ -1352,6 +1388,7 @@ impl OpResult {
     pub fn variant_name(&self) -> &'static str {
         match self {
             OpResult::Sources(_) => "sources",
+            OpResult::SourceFree { .. } => "source_free",
             OpResult::Tuning(_) => "tuning",
             OpResult::Job(_) => "job",
             OpResult::Jobs(_) => "jobs",
@@ -1884,6 +1921,13 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 .await
                 .map(OpResult::Tuning)
                 .map_err(|e| node_error(node, e))
+        }
+        Op::SourceFree {
+            center_hz,
+            bandwidth_hz,
+        } => {
+            let (free, busy) = node.source_free(center_hz.0, bandwidth_hz.0);
+            Ok(OpResult::SourceFree { free, busy })
         }
         Op::SourceUnpin { source } => {
             if node.port(&source).is_none() {

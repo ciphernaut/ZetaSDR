@@ -1492,4 +1492,39 @@ impl Node {
     pub fn lease_elastic(&self, source: &SourceId) -> Vec<JobId> {
         self.inner.leases.elastic_holders(source)
     }
+
+    /// `source_free`: the sources, in id order, that could take the band now
+    /// ([`LeaseManager::free_sources`]), and every other source that covers it with
+    /// its holders, elastic jobs, pin and fault. Sources that cannot cover the band
+    /// are in neither list.
+    pub fn source_free(
+        &self,
+        center_hz: u64,
+        bandwidth_hz: u64,
+    ) -> (Vec<SourceId>, Vec<crate::ops::BusySource>) {
+        let mut ports: Vec<Arc<dyn Port>> =
+            self.inner.ports.read().unwrap().values().cloned().collect();
+        ports.sort_by(|a, b| a.id().0.cmp(&b.id().0));
+        let free = self
+            .inner
+            .leases
+            .free_sources(&ports, center_hz, bandwidth_hz);
+        let busy = ports
+            .iter()
+            .filter(|p| crate::lease::covers(p.capabilities(), center_hz, bandwidth_hz))
+            .filter(|p| !free.contains(p.id()))
+            .map(|p| crate::ops::BusySource {
+                id: p.id().clone(),
+                holders: self
+                    .lease_holders(p.id())
+                    .into_iter()
+                    .map(|(j, _)| j)
+                    .collect(),
+                elastic: self.lease_elastic(p.id()),
+                pin: self.pinned(p.id()),
+                fault: p.fault(),
+            })
+            .collect();
+        (free, busy)
+    }
 }

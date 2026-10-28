@@ -61,6 +61,9 @@ fn note(op: &str) -> Option<&'static str> {
             "Hold the source at a band without a job: a rigid holder that is not a job, so `replace` cannot name it and a `conflict` offers `unpin source <id> (source_unpin)`. A pin retunes the source to its band (the page's spectrum follows) unless a decoder holds the source inside that band, when it joins the current capture. Persisted; restored before anything else on a restart. Put `center_hz` between two channels of the grid you listen to so the receiver's DC spike falls in a guard band (the UHF CB plan's midpoint 476918750 Hz with 1000000 Hz holds all 80 channels).",
         ),
         "source_unpin" => Some("Release the pin; the source idles if nothing else holds it."),
+        "source_free" => Some(
+            "Ask which radio could take a band before starting a job on it, then start the job on one of the `free` ids. A free source is a suggestion, not a reservation: nothing is leased, and the next `job_start` may still conflict. A source on another node (`--source-node`) can look free here while that node runs its own jobs on it; that surfaces as a `conflict` on `job_start`.",
+        ),
         "source_set_gain" => Some(
             "Set the source's overall receive gain live (`gain_db` in dB within `source list`'s `gain.min_db..=max_db`), or `null` for the driver's automatic gain where `gain.automatic_available`. Persisted: it is re-applied when the node restarts and wins over `gain=` in the device args. A source without adjustable gain (a recording, a KiwiSDR, another node) answers `source has no adjustable gain`. On the CLI, `--auto` passes `null`.",
         ),

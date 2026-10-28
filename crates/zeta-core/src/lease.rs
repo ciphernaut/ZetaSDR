@@ -10,7 +10,7 @@ use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
 
 use crate::port::{Port, PortError, Tuning};
-use crate::types::{JobId, SourceId};
+use crate::types::{Capabilities, JobId, SourceId};
 
 #[derive(Debug)]
 pub enum LeaseError {
@@ -591,6 +591,42 @@ impl LeaseManager {
             })
             .unwrap_or_default()
     }
+
+    /// The ports of `ports`, in the given order, that could take the band now: each
+    /// [`covers`] it and has no rigid holder, no pin and no fault. Elastic jobs never
+    /// make a port busy. A suggestion, not a reservation: nothing is leased.
+    pub fn free_sources(
+        &self,
+        ports: &[Arc<dyn Port>],
+        center_hz: u64,
+        bandwidth_hz: u64,
+    ) -> Vec<SourceId> {
+        let leases = self.leases.lock().unwrap();
+        ports
+            .iter()
+            .filter(|p| covers(p.capabilities(), center_hz, bandwidth_hz))
+            .filter(|p| p.fault().is_none())
+            .filter(|p| {
+                leases
+                    .get(p.id())
+                    .is_none_or(|v| v.iter().all(|l| l.elastic))
+            })
+            .map(|p| p.id().clone())
+            .collect()
+    }
+}
+
+/// Whether a port with `caps` can capture the band `center_hz` ± `bandwidth_hz`/2:
+/// both edges inside `tune_min_hz..=tune_max_hz` and `bandwidth_hz` within
+/// `max_bandwidth_hz`.
+pub fn covers(caps: &Capabilities, center_hz: u64, bandwidth_hz: u64) -> bool {
+    let half = bandwidth_hz / 2;
+    let (Some(lo), Some(hi)) = (center_hz.checked_sub(half), center_hz.checked_add(half)) else {
+        return false;
+    };
+    caps.tune_min_hz.value().0 <= lo
+        && hi <= caps.tune_max_hz.value().0
+        && bandwidth_hz <= caps.max_bandwidth_hz.value().0
 }
 
 #[cfg(test)]
@@ -607,9 +643,17 @@ mod tests {
         tx: tokio::sync::broadcast::Sender<crate::port::IqBlock>,
         tunes: std::sync::atomic::AtomicUsize,
         delay: bool,
+        fault: Option<String>,
     }
 
     impl FakePort {
+        fn named(id: &str) -> Self {
+            Self {
+                id: SourceId(id.into()),
+                ..Self::new()
+            }
+        }
+
         fn new() -> Self {
             Self {
                 id: SourceId("fake".into()),
@@ -628,6 +672,7 @@ mod tests {
                 tx: tokio::sync::broadcast::channel(1).0,
                 tunes: std::sync::atomic::AtomicUsize::new(0),
                 delay: false,
+                fault: None,
             }
         }
     }
@@ -653,6 +698,9 @@ mod tests {
         }
         fn subscribe(&self) -> IqReceiver {
             self.tx.subscribe()
+        }
+        fn fault(&self) -> Option<String> {
+            self.fault.clone()
         }
     }
 
@@ -935,5 +983,42 @@ mod tests {
         assert_eq!([&a, &b].iter().filter(|r| r.is_ok()).count(), 1);
         assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(m.holders(p.id()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn free_sources_skips_held_pinned_faulted_and_uncovering_ports() {
+        let m = LeaseManager::new();
+        let held = Arc::new(FakePort::named("held"));
+        let pinned = Arc::new(FakePort::named("pinned"));
+        let faulted = Arc::new(FakePort {
+            fault: Some("gone".into()),
+            ..FakePort::named("faulted")
+        });
+        let elastic = Arc::new(FakePort::named("elastic"));
+        let idle = Arc::new(FakePort::named("idle"));
+        let want = t(403_000_000, 20_000);
+        m.ensure(held.as_ref(), JobId::new(), want, false)
+            .await
+            .unwrap();
+        m.pin(pinned.as_ref(), want).await.unwrap();
+        m.ensure(elastic.as_ref(), JobId::new(), want, true)
+            .await
+            .unwrap();
+        let ports: Vec<Arc<dyn Port>> = vec![idle, held, pinned, faulted, elastic];
+        let ids = |v: Vec<SourceId>| v.into_iter().map(|s| s.0).collect::<Vec<_>>();
+        assert_eq!(
+            ids(m.free_sources(&ports, 403_000_000, 20_000)),
+            ["idle", "elastic"]
+        );
+        // Edges outside 1 MHz..6 GHz, or wider than 20 MHz: no port covers it.
+        assert!(m.free_sources(&ports, 1_000_000, 20_000).is_empty());
+        assert!(m.free_sources(&ports, 6_000_000_000, 20_000).is_empty());
+        assert!(m.free_sources(&ports, 403_000_000, 20_000_002).is_empty());
+        assert!(m.free_sources(&ports, u64::MAX, 4).is_empty());
+        // Both edges on the range's ends, the band exactly the widest: covered.
+        assert_eq!(
+            ids(m.free_sources(&ports, 11_000_000, 20_000_000)),
+            ["idle", "elastic"]
+        );
     }
 }

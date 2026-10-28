@@ -478,7 +478,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 21, "one schema per Op variant");
+    assert_eq!(vs.len(), 22, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -2829,4 +2829,219 @@ fn job_kind_roundtrips_built_ins_and_mode_ids() {
         assert_eq!(JobKind::from_name(bad), None, "{bad:?}");
     }
     assert!(serde_json::from_value::<JobKind>(serde_json::json!(3)).is_err());
+}
+
+/// A recording as source `id`, tunable over `min_hz..=max_hz` (48 kHz wide at most).
+fn ranged_file(dir: &Path, id: &str, min_hz: u64, max_hz: u64) -> Arc<dyn Port> {
+    let meta = fixtures::write_tone(dir);
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: Some((Hz(min_hz), Hz(max_hz))),
+    };
+    Arc::new(FileSource::open(SourceId(id.into()), &meta, opts).unwrap())
+}
+
+/// `source_free` on `center_hz`/`bandwidth_hz`: the free ids and the busy entries.
+async fn source_free(
+    node: &Node,
+    center_hz: u64,
+    bandwidth_hz: u64,
+) -> (Vec<String>, Vec<zeta_core::ops::BusySource>) {
+    match node
+        .apply(Op::SourceFree {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(bandwidth_hz),
+        })
+        .await
+    {
+        Ok(OpResult::SourceFree { free, busy }) => (free.into_iter().map(|s| s.0).collect(), busy),
+        other => panic!("expected source_free, got {other:?}"),
+    }
+}
+
+/// Start a job of `kind` on `source` at 403 MHz, 20 kHz wide.
+async fn start_on(node: &Node, source: &str, kind: JobKind, elastic: bool) -> JobId {
+    let op = Op::JobStart {
+        kind,
+        source: SourceId(source.into()),
+        center_hz: Hz(403_000_000),
+        bandwidth_hz: Hz(20_000),
+        deviation_hz: None,
+        sideband: None,
+        elastic,
+        replace: vec![],
+    };
+    match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected Job, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn source_free_lists_idle_sources_that_cover_the_band() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = ranged_file(dir.path(), "sonde_a", 400_000_000, 406_000_000);
+    let b = ranged_file(dir.path(), "sonde_b", 400_000_000, 406_000_000);
+    let node = Node::open(cfg(dir.path()), registry(), vec![a, b])
+        .await
+        .unwrap();
+    let (free, busy) = source_free(&node, 403_000_000, 20_000).await;
+    assert_eq!(free, vec!["sonde_a", "sonde_b"]);
+    assert!(busy.is_empty(), "{busy:?}");
+    let job = start_on(&node, "sonde_a", JobKind::Passthrough, false).await;
+    let (free, busy) = source_free(&node, 403_000_000, 20_000).await;
+    assert_eq!(free, vec!["sonde_b"]);
+    assert_eq!(busy.len(), 1, "{busy:?}");
+    assert_eq!(busy[0].id.0, "sonde_a");
+    assert_eq!(busy[0].holders, vec![job]);
+    assert!(busy[0].elastic.is_empty());
+    assert_eq!(busy[0].pin, None);
+    assert_eq!(busy[0].fault, None);
+}
+
+/// Stands in for the dsp `fft` stage a `spectrum` job runs: idles until cancelled.
+struct IdleFft(zeta_core::stage::StageSpec);
+
+#[async_trait]
+impl zeta_core::stage::Stage for IdleFft {
+    fn spec(&self) -> &zeta_core::stage::StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        _inputs: Vec<tokio::sync::broadcast::Receiver<zeta_core::stream::Frame>>,
+        _outputs: Vec<StreamId>,
+        _bus: Arc<zeta_core::stream::StreamBus>,
+        cancel: tokio_util::sync::CancellationToken,
+        _ctx: zeta_core::stage::StageContext,
+    ) -> Result<(), zeta_core::stage::StageError> {
+        cancel.cancelled().await;
+        Err(zeta_core::stage::StageError::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn an_elastic_job_does_not_make_a_source_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = registry();
+    reg.register(Arc::new(IdleFft(zeta_core::stage::StageSpec {
+        kind: "fft",
+        inputs: vec![StreamKind::Iq],
+        outputs: vec![StreamKind::Event],
+        params_schema: schemars::json_schema!({}),
+    })));
+    let node = Node::open(
+        cfg(dir.path()),
+        reg,
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    start_on(&node, "hackrf0", JobKind::Spectrum, true).await;
+    assert_eq!(node.lease_elastic(&SourceId("hackrf0".into())).len(), 1);
+    let (free, busy) = source_free(&node, 403_000_000, 20_000).await;
+    assert_eq!(free, vec!["hackrf0"]);
+    assert!(busy.is_empty(), "{busy:?}");
+}
+
+#[tokio::test]
+async fn a_pinned_or_faulted_source_is_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let pinned = ranged_file(dir.path(), "file_pinned", 400_000_000, 406_000_000);
+    let faulted = Arc::new(WidePort::new("hackrf_faulted"));
+    *faulted.fault.lock().unwrap() = Some("device gone".into());
+    let idle = Arc::new(WidePort::new("hackrf_idle"));
+    let node = Node::open(cfg(dir.path()), registry(), vec![pinned, faulted, idle])
+        .await
+        .unwrap();
+    let op = Op::SourcePin {
+        source: SourceId("file_pinned".into()),
+        center_hz: Hz(401_000_000),
+        bandwidth_hz: Hz(40_000),
+        replace: vec![],
+    };
+    let Ok(OpResult::Tuning(_)) = node.apply(op).await else {
+        panic!("pin refused");
+    };
+    let pin = node.pinned(&SourceId("file_pinned".into()));
+    assert!(pin.is_some());
+    let (free, busy) = source_free(&node, 403_000_000, 20_000).await;
+    assert_eq!(free, vec!["hackrf_idle"]);
+    let ids: Vec<&str> = busy.iter().map(|b| b.id.0.as_str()).collect();
+    assert_eq!(ids, vec!["file_pinned", "hackrf_faulted"]);
+    assert_eq!(busy[0].pin, pin);
+    assert_eq!(busy[0].fault, None);
+    assert!(busy[0].holders.is_empty());
+    assert_eq!(busy[1].pin, None);
+    assert_eq!(busy[1].fault.as_deref(), Some("device gone"));
+    // Required, `pin` and `fault` nullable, in the result schema.
+    let bs = &schema()["result"]["$defs"]["BusySource"];
+    for field in ["id", "holders", "elastic", "pin", "fault"] {
+        assert!(
+            bs["required"].as_array().unwrap().contains(&field.into()),
+            "{field}: {bs}"
+        );
+    }
+    let json = serde_json::to_value(&busy).unwrap();
+    assert!(
+        json[0]["fault"].is_null() && json[1]["pin"].is_null(),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn a_source_that_cannot_cover_the_band_is_in_neither_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = ranged_file(dir.path(), "file0", 400_000_000, 406_000_000);
+    let wide = Arc::new(WidePort::new("hackrf0"));
+    let node = Node::open(cfg(dir.path()), registry(), vec![file, wide])
+        .await
+        .unwrap();
+    // Outside the range, straddling either edge, and wider than the recording's 48 kHz.
+    for (center_hz, bandwidth_hz) in [
+        (145_000_000, 20_000),
+        (400_005_000, 20_000),
+        (405_995_000, 20_000),
+        (403_000_000, 100_000),
+    ] {
+        let (free, busy) = source_free(&node, center_hz, bandwidth_hz).await;
+        assert_eq!(free, vec!["hackrf0"], "{center_hz} {bandwidth_hz}");
+        assert!(busy.is_empty(), "{center_hz} {bandwidth_hz}: {busy:?}");
+    }
+    // A band the range just holds is free.
+    let (free, _) = source_free(&node, 400_010_000, 20_000).await;
+    assert_eq!(free, vec!["file0", "hackrf0"]);
+}
+
+#[tokio::test]
+async fn source_free_is_read_only() {
+    let op = Op::SourceFree {
+        center_hz: Hz(403_000_000),
+        bandwidth_hz: Hz(20_000),
+    };
+    assert!(op.read_only());
+    assert_eq!(op.name(), "source_free");
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        node.apply(op).await,
+        Ok(OpResult::SourceFree { .. })
+    ));
+    let log = std::fs::read_to_string(dir.path().join("state").join("ops.log")).unwrap();
+    let line: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(line["op"]["op"], "source_free", "{line}");
+    assert_eq!(line["outcome"], "ok", "{line}");
+    assert!(line.get("result").is_none(), "{line}");
 }
