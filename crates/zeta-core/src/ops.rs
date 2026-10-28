@@ -1021,6 +1021,10 @@ pub fn fill_squelch_params(graph: &mut Graph) -> bool {
 /// the watch's policy too (`decode_on`, `prefer`, `sondehub`), see `node::watch`.
 pub const DETECT_STAGE: &str = "detect";
 
+/// The stage kind of the sonde feed a watch appends to its decoders when its `detect`
+/// params carry `sondehub` (registered by `zeta-ext`).
+pub const SONDEHUB_STAGE: &str = "sink_sondehub";
+
 /// The `detect` stage's default `gone_ms`: an announced signal unmatched this long is
 /// `gone`. The watch re-adopts a decoder only when its signal reappears within it.
 pub const DETECT_GONE_MS_DEFAULT: u64 = 30_000;

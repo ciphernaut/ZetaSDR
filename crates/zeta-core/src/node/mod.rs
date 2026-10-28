@@ -286,39 +286,57 @@ impl Inner {
         capture_rate_hz: Option<Option<u64>>,
         running: bool,
     ) -> Result<(), NodeError> {
-        if running {
-            // A controller's run tells this restart from a `job_stop` by the flag.
-            if let Some(e) = self.jobs.lock().unwrap().get_mut(id) {
-                e.restarting = true;
-            }
-            if let Err(e) = self.stop(id).await {
-                if let Some(e) = self.jobs.lock().unwrap().get_mut(id) {
-                    e.restarting = false;
-                }
-                return Err(e);
-            }
-        }
-        let rec = {
-            let mut jobs = self.jobs.lock().unwrap();
-            let entry = jobs
-                .get_mut(id)
-                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
-            let rec = JobRecord {
-                graph,
-                capture_rate_hz: capture_rate_hz.flatten(),
-                operator_graph: capture_rate_hz.is_none(),
-                ..entry.record.clone()
-            };
-            persist(&self.jobs_dir, &rec)?;
-            entry.record = rec.clone();
-            rec
-        };
+        let rec = self
+            .store_graph(id, graph, capture_rate_hz, running.then_some(false))
+            .await?;
         if running {
             self.launch_task(rec)
                 .await
                 .map_err(|e| NodeError::Other(format!("launch task: {e}")))??;
         }
         Ok(())
+    }
+
+    /// The first half of [`Inner::swap_graph`]: stop the job when `stop` is `Some`
+    /// (`Some(true)`: gated, see [`Inner::stop_gated`]; a controller's run tells this
+    /// restart from a `job_stop` by a flag), persist `graph` as its own and
+    /// return the record, for the caller to launch.
+    pub(crate) async fn store_graph(
+        self: &Arc<Self>,
+        id: &JobId,
+        graph: Graph,
+        capture_rate_hz: Option<Option<u64>>,
+        stop: Option<bool>,
+    ) -> Result<JobRecord, NodeError> {
+        if let Some(gated) = stop {
+            if let Some(e) = self.jobs.lock().unwrap().get_mut(id) {
+                e.restarting = true;
+            }
+            if let Err(e) = self.stop_with(id, gated).await {
+                if let Some(e) = self.jobs.lock().unwrap().get_mut(id) {
+                    e.restarting = false;
+                }
+                return Err(e);
+            }
+        }
+        let mut jobs = self.jobs.lock().unwrap();
+        let entry = jobs
+            .get_mut(id)
+            .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        let rec = JobRecord {
+            graph,
+            capture_rate_hz: capture_rate_hz.flatten(),
+            operator_graph: capture_rate_hz.is_none(),
+            ..entry.record.clone()
+        };
+        persist(&self.jobs_dir, &rec)?;
+        entry.record = rec.clone();
+        // The gated stop was this restart's own, not a `replace`'s: the launch that
+        // follows must not be refused as undoing it (see `record_running`).
+        if stop == Some(true) {
+            entry.gated_stop = false;
+        }
+        Ok(rec)
     }
 
     /// [`Inner::stop`] while the caller holds the job's source gate: the port

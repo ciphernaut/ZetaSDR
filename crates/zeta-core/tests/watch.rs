@@ -166,7 +166,11 @@ fn registry() -> StageRegistry {
         kind: "sink_sondehub",
         inputs: vec![StreamKind::Event],
         outputs: vec![],
-        params_schema: schemars::json_schema!({"type": "object"}),
+        params_schema: schemars::json_schema!({
+            "type": "object",
+            "required": ["callsign"],
+            "properties": {"callsign": {"type": "string"}}
+        }),
     })));
     zeta_dsp::register_all(&mut r);
     r
@@ -1123,7 +1127,7 @@ async fn a_stage_with_no_outputs_launches_and_stops_cleanly() {
         id: zeta_core::graph::GraphId("sink".into()),
         nodes: vec![
             n("in", "passthrough", serde_json::json!({"kind": "event"})),
-            n("out", "sink_sondehub", serde_json::json!({})),
+            n("out", "sink_sondehub", serde_json::json!({"callsign": "T"})),
         ],
         edges: vec![Edge {
             from: NodeId("in".into()),
@@ -1174,5 +1178,191 @@ async fn a_stage_with_no_outputs_launches_and_stops_cleanly() {
     })
     .await;
     assert_eq!(state(&node, &job), Some(JobState::Stopped));
+    stop_all(&node).await;
+}
+
+fn sondehub_params() -> Value {
+    serde_json::json!({
+        "callsign": "TEST", "lat": -27.5, "lon": 153.0, "alt_m": 10, "batch_ms": 5000,
+        "url": "http://127.0.0.1:1/"
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_with_a_bad_sondehub_is_refused() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    // At start: refused naming the field, nothing started.
+    let bad = serde_json::json!({ "sondehub": { "callsign": 5 } });
+    let g = watch_graph(&node, bad);
+    let e = node
+        .job_start("watch", rx(), capture(), g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("sondehub.callsign"), "{e}");
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    // At a put: refused before anything restarts.
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let stream = node.job_outputs(&watch);
+    let mut graph = record(&node, &watch).unwrap().graph;
+    let detect = graph.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params["sondehub"] = serde_json::json!({ "lat": 1 });
+    let e = node
+        .apply(Op::GraphPut {
+            job: watch.clone(),
+            graph: graph.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("sondehub"), "{e}");
+    assert_eq!(node.job_outputs(&watch), stream, "nothing restarted");
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    stop_all(&node).await;
+    // Without the sink stage registered the same params are refused as such.
+    let mut stages = StageRegistry::new();
+    stages.register(Arc::new(PassthroughStage::new()));
+    zeta_dsp::register_all(&mut stages);
+    let mut g = graph;
+    g.nodes
+        .iter_mut()
+        .find(|n| n.kind == "detect")
+        .unwrap()
+        .params["sondehub"] = sondehub_params();
+    let e = zeta_core::graph::validate(&g, &stages).unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("sondehub: sink_sondehub stage not registered"),
+        "{e}"
+    );
+    assert!(zeta_core::graph::validate(&g, &registry()).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_sink_restart_keeps_the_decoder_without_the_sink() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    zeta_core::node::watch::test_fail_sink_launch(1);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let d = &events.watch("decoding")[0];
+    let summary = d["summary"].as_str().unwrap();
+    assert!(summary.contains("sondehub sink refused"), "{summary}");
+    assert!(summary.contains("sink restart failed"), "{summary}");
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    let rec = record(&node, &job).unwrap();
+    assert!(rec.graph.nodes.iter().all(|n| n.kind != "sink_sondehub"));
+    let listed = decoding(&node, &watch);
+    assert!(listed[0]["sink_error"].is_string(), "{listed:?}");
+    assert!(events.watch("lost").is_empty(), "{:#?}", events.all());
+    zeta_core::node::watch::test_fail_sink_launch(0);
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decoder_that_cannot_be_relaunched_is_lost_not_decoding() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    zeta_core::node::watch::test_fail_sink_launch(2);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
+    let events = Events::of(&node, &watch);
+    until("a lost event", Duration::from_secs(40), || {
+        !events.watch("lost").is_empty()
+    })
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert!(
+        lost["summary"]
+            .as_str()
+            .unwrap()
+            .contains("relaunch without it failed"),
+        "{lost}"
+    );
+    assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+    assert!(decoding(&node, &watch).is_empty());
+    let job = JobId(lost["job"].as_str().unwrap().into());
+    assert_ne!(state(&node, &job), Some(JobState::Running));
+    zeta_core::node::watch::test_fail_sink_launch(0);
+    stop_all(&node).await;
+}
+
+/// A `replace` of the watch that takes the gate of the radio while the sink restart of a
+/// proved decoder waits for it: the restart is cancelled with the watch (a task finishes
+/// its launch and stops the decoder), so the replace completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
+    until("the identify child runs", Duration::from_secs(40), || {
+        owned(&node, &watch)
+            .iter()
+            .any(|r| r.kind == "pocsag_decode" && r.state == JobState::Running)
+    })
+    .await;
+    let child = owned(&node, &watch)
+        .into_iter()
+        .find(|r| r.kind == "pocsag_decode")
+        .unwrap()
+        .id;
+    // Held from before the proof: the decoder's relaunch with the sink queues on it.
+    let gate = node.debug_gate(&rx()).await;
+    let op = Op::JobStart {
+        kind: JobKind::Measure,
+        source: rx(),
+        center_hz: Hz(POCSAG_HZ),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![watch.clone()],
+    };
+    let replace = node.apply(op);
+    tokio::pin!(replace);
+    // Queued on the gate before the sink restart is: the proof comes, the decoder is
+    // stopped for the restart and its launch waits on the gate.
+    let early = tokio::time::timeout(Duration::from_millis(300), &mut replace).await;
+    assert!(early.is_err(), "the replace ran under the gate: {early:?}");
+    until("the decoder is stopped", Duration::from_secs(30), || {
+        state(&node, &child) != Some(JobState::Running)
+    })
+    .await;
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    drop(gate);
+    let measure = match tokio::time::timeout(Duration::from_secs(10), replace).await {
+        Ok(Ok(OpResult::Job(j))) => j,
+        r => panic!(
+            "replace of the watch: {r:?} {:?} {:?}",
+            node.job_list()
+                .iter()
+                .map(|r| (r.kind.clone(), r.state.clone(), r.owner.clone()))
+                .collect::<Vec<_>>(),
+            node.lease_holders(&rx())
+        ),
+    };
+    assert_eq!(state(&node, &watch), Some(JobState::Stopped));
+    let only_measure = [(measure.0.clone(), "measure".to_string())];
+    until("only the measure job runs", Duration::from_secs(10), || {
+        running(&node) == only_measure
+    })
+    .await;
+    let holders: Vec<JobId> = node
+        .lease_holders(&rx())
+        .into_iter()
+        .map(|(j, _)| j)
+        .collect();
+    assert_eq!(holders, [measure]);
     stop_all(&node).await;
 }

@@ -31,7 +31,7 @@ use crate::graph::{self, Edge, Graph, Node as GraphNode, NodeId};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::modes::ModeState;
 use crate::modes::score::score_rows;
-use crate::ops::{DETECT_GONE_MS_DEFAULT, DETECT_STAGE, JobKind};
+use crate::ops::{DETECT_GONE_MS_DEFAULT, DETECT_STAGE, JobKind, SONDEHUB_STAGE};
 use crate::port::{Port, Tuning};
 use crate::stage::StageError;
 use crate::stream::{Frame, Payload};
@@ -84,6 +84,24 @@ static TEST_FAIL_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 #[cfg(feature = "test-fixtures")]
 pub fn test_fault_after(state: &str, panic: bool) {
     *TEST_FAULT.lock().unwrap() = Some((state.to_string(), panic));
+}
+
+/// Tests only: how many of the next sink restarts fail to launch.
+#[cfg(feature = "test-fixtures")]
+static TEST_FAIL_SINK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Tests only: make the next `times` launches of a decoder graph with the sink fail.
+#[cfg(feature = "test-fixtures")]
+pub fn test_fail_sink_launch(times: u32) {
+    TEST_FAIL_SINK.store(times, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(feature = "test-fixtures")]
+fn sink_launch_fails() -> bool {
+    use std::sync::atomic::Ordering;
+    TEST_FAIL_SINK
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 #[cfg(feature = "test-fixtures")]
@@ -158,9 +176,6 @@ pub(super) struct Policy {
     /// (`sondehub` in the `detect` node's params; none appends nothing).
     sondehub: Option<serde_json::Value>,
 }
-
-/// The sonde feed's stage kind (registered by `zeta-ext`).
-const SONDEHUB_STAGE: &str = "sink_sondehub";
 
 impl Policy {
     /// The policy in `graph`'s `detect` node: `decode_on` (`capture`, default, or
@@ -239,6 +254,30 @@ struct Tracked {
     score: f32,
 }
 
+/// What came of giving a kept decoder the `sondehub` sink.
+enum SinkOutcome {
+    /// Not asked for, or nothing to attach it to.
+    Off,
+    /// The decoder runs with the sink.
+    On,
+    /// The decoder runs without it, for this reason.
+    Refused(String),
+    /// The decoder could not be relaunched at all.
+    Lost(String),
+    /// The watch was stopped meanwhile.
+    Cancelled,
+}
+
+/// Where a decoder was placed and what the sink made of it.
+struct Placement {
+    job: JobId,
+    source: SourceId,
+    placed: Placed,
+    /// Why it fell back to the capture, when it did.
+    why: Option<String>,
+    sink: SinkOutcome,
+}
+
 /// A decoder the watch keeps (`job_context.watch.decoding`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Decoding {
@@ -248,6 +287,9 @@ struct Decoding {
     signal: Signal,
     since_ns: u64,
     placed: Placed,
+    /// Why the decoder runs without the `sondehub` sink it was asked to have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sink_error: Option<String>,
     /// The last event of the decoder this run saw (else `since_ns`).
     #[serde(skip)]
     last_event_ns: u64,
@@ -608,7 +650,7 @@ impl Inner {
         mode: &str,
         tuning: Tuning,
         sondehub: Option<&serde_json::Value>,
-    ) -> Result<JobId, String> {
+    ) -> Result<(JobId, SinkOutcome), String> {
         let port = self
             .ports
             .read()
@@ -634,12 +676,13 @@ impl Inner {
         );
         let started = match graph {
             Ok(mut graph) => {
-                let before = graph.nodes.len();
-                if let Some(p) = sondehub {
-                    self.append_sink(&mut graph, p);
-                }
+                let sink = match sondehub.map(|p| self.append_sink(&mut graph, p)) {
+                    None | Some(Ok(false)) => SinkOutcome::Off,
+                    Some(Ok(true)) => SinkOutcome::On,
+                    Some(Err(why)) => SinkOutcome::Refused(why),
+                };
                 // A graph with the sink is launched as stored: a re-expansion would drop it.
-                let with_sink = graph.nodes.len() > before;
+                let with_sink = matches!(sink, SinkOutcome::On);
                 let rec = JobRecord {
                     format: JOB_RECORD_FORMAT,
                     id: JobId::new(),
@@ -659,7 +702,7 @@ impl Inner {
                 let id = rec.id.clone();
                 // In its own task, as identify's children: `launch`'s future runs this.
                 match self.launch_task(rec).await {
-                    Ok(Ok(())) => Ok(id),
+                    Ok(Ok(())) => Ok((id, sink)),
                     Ok(Err(e)) => Err(e.to_string()),
                     Err(e) => Err(format!("launch task: {e}")),
                 }
@@ -667,7 +710,7 @@ impl Inner {
             Err(e) => Err(e.to_string()),
         };
         if tuned {
-            let except = started.as_ref().ok().cloned();
+            let except = started.as_ref().ok().map(|(id, _)| id.clone());
             let _ = self.relaunch_elastic(source, except.as_ref()).await;
         }
         if started.is_err() {
@@ -681,19 +724,27 @@ impl Inner {
     /// the signal's centre and the row's width on a free source other than the watch's
     /// (`prefer` first, then `source list` order), trying the next on a refusal (a
     /// `conflict`: not free after all), then stops `proved`; with none it stays in the
-    /// capture. The decoder's job, source, placement and, when it fell back, why.
+    /// capture. The decoder's job, source, placement and, when it fell back, why, with
+    /// what came of giving it the sink.
     async fn place_decoder(
         self: &Arc<Self>,
         r: &Run,
         mode: &str,
         signal: &Signal,
         proved: &JobId,
-    ) -> (JobId, SourceId, Placed, Option<String>) {
-        let kept = (proved.clone(), r.prov.source.clone(), Placed::Capture);
+    ) -> Placement {
+        let kept = |why: Option<String>, sink: SinkOutcome| Placement {
+            job: proved.clone(),
+            source: r.prov.source.clone(),
+            placed: Placed::Capture,
+            why,
+            sink,
+        };
         if !r.seed.policy.free {
-            self.sink_into(proved, r.seed.policy.sondehub.as_ref())
+            let sink = self
+                .sink_into(r, proved, r.seed.policy.sondehub.as_ref())
                 .await;
-            return (kept.0, kept.1, kept.2, None);
+            return kept(None, sink);
         }
         let width = self
             .modes
@@ -728,9 +779,15 @@ impl Inner {
                 .start_on(&source, mode, tuning, r.seed.policy.sondehub.as_ref())
                 .await
             {
-                Ok(job) => {
+                Ok((job, sink)) => {
                     self.stop_started(r, proved, &r.prov.source).await;
-                    return (job, source, Placed::Free, None);
+                    return Placement {
+                        job,
+                        source,
+                        placed: Placed::Free,
+                        why: None,
+                        sink,
+                    };
                 }
                 Err(e) => refused.push(format!("{}: {e}", source.0)),
             }
@@ -739,18 +796,21 @@ impl Inner {
             true => "no free source".to_string(),
             false => format!("no free source took it ({})", refused.join("; ")),
         };
-        self.sink_into(proved, r.seed.policy.sondehub.as_ref())
+        let sink = self
+            .sink_into(r, proved, r.seed.policy.sondehub.as_ref())
             .await;
-        (kept.0, kept.1, kept.2, Some(why))
+        kept(Some(why), sink)
     }
 
     /// Append a `sink_sondehub` node with params `sondehub` to `graph`, fed by the event
-    /// output of its last event-producing node. Left as it is when the graph has no such
-    /// node, already has a sink, or the graph with the sink would not validate (the
-    /// decoder runs without the feed rather than not at all).
-    fn append_sink(&self, graph: &mut Graph, sondehub: &serde_json::Value) {
+    /// output of its last event-producing node. `Ok(false)` when there is nothing to do
+    /// (the graph has a sink already, or no node with an event output); `Err` with the
+    /// reason, the graph left as it was, when the graph with the sink would not validate
+    /// (the start and put of the watch check `sondehub` first, so this is the last line of
+    /// defence: the decoder runs without the feed and the caller says so).
+    fn append_sink(&self, graph: &mut Graph, sondehub: &serde_json::Value) -> Result<bool, String> {
         if graph.nodes.iter().any(|n| n.kind == SONDEHUB_STAGE) {
-            return;
+            return Ok(false);
         }
         let from = graph.nodes.iter().rev().find(|n| {
             self.registry
@@ -762,7 +822,7 @@ impl Inner {
                     .any(|e| e.from == n.id && e.kind == StreamKind::Event)
         });
         let Some(from) = from.map(|n| n.id.clone()) else {
-            return;
+            return Ok(false);
         };
         let to = NodeId("sondehub".into());
         let mut with = graph.clone();
@@ -776,32 +836,96 @@ impl Inner {
             to,
             kind: StreamKind::Event,
         });
-        if graph::validate(&with, &self.registry).is_ok() {
-            *graph = with;
-        }
+        graph::validate(&with, &self.registry).map_err(|e| e.to_string())?;
+        *graph = with;
+        Ok(true)
     }
 
     /// Give the running decoder `job` the sink (`graph_put`'s restart under the same id).
-    async fn sink_into(self: &Arc<Self>, job: &JobId, sondehub: Option<&serde_json::Value>) {
+    /// The restart is cancellable like identify's child launches: when the watch is
+    /// stopped meanwhile (a `replace` holds the gate of the radio and waits for the watch),
+    /// the launch is finished and the decoder stopped by a task. A launch that fails puts
+    /// the graph without the sink back ([`SinkOutcome::Refused`]); when that fails too the
+    /// decoder is [`SinkOutcome::Lost`].
+    async fn sink_into(
+        self: &Arc<Self>,
+        r: &Run,
+        job: &JobId,
+        sondehub: Option<&serde_json::Value>,
+    ) -> SinkOutcome {
         let Some(sondehub) = sondehub else {
-            return;
+            return SinkOutcome::Off;
         };
-        let Some(mut graph) = self
+        let Some(original) = self
             .jobs
             .lock()
             .unwrap()
             .get(job)
             .map(|e| e.record.graph.clone())
         else {
-            return;
+            return SinkOutcome::Off;
         };
-        let before = graph.nodes.len();
-        self.append_sink(&mut graph, sondehub);
-        if graph.nodes.len() > before {
-            // Stopping an owned job forgets its record: it is the watch's ordinary decoder
-            // from here on (the caller disowns it too).
-            self.disown(job);
-            let _ = self.swap_graph(job, graph, None, true).await;
+        let mut graph = original.clone();
+        match self.append_sink(&mut graph, sondehub) {
+            Ok(false) => return SinkOutcome::Off,
+            Err(why) => return SinkOutcome::Refused(why),
+            Ok(true) => {}
+        }
+        // Stopping an owned job forgets its record: it is the watch's ordinary decoder
+        // from here on (the caller disowns it too).
+        self.disown(job);
+        let error = match self.relaunch(r, job, graph, true).await {
+            Ok(true) => return SinkOutcome::On,
+            Ok(false) => return SinkOutcome::Cancelled,
+            Err(e) => format!("sink restart failed ({e})"),
+        };
+        // The stop happened and the sink graph would not launch: the decoder as it was.
+        match self.relaunch(r, job, original, false).await {
+            Ok(true) => SinkOutcome::Refused(error),
+            Ok(false) => SinkOutcome::Cancelled,
+            Err(e) => SinkOutcome::Lost(format!("{error}; relaunch without it failed ({e})")),
+        }
+    }
+
+    /// Store `graph` as `job`'s (stopping it first when `sink`, the restart that adds it)
+    /// and launch it, cancellable. `Ok(false)` when the watch was cancelled meanwhile (a
+    /// task then finishes the launch and stops the job).
+    async fn relaunch(
+        self: &Arc<Self>,
+        r: &Run,
+        job: &JobId,
+        graph: Graph,
+        sink: bool,
+    ) -> Result<bool, String> {
+        let rec = self
+            .store_graph(job, graph, None, sink.then_some(true))
+            .await
+            .map_err(|e| e.to_string())?;
+        #[cfg(feature = "test-fixtures")]
+        if sink_launch_fails() {
+            return Err("test: sink launch refused".into());
+        }
+        let mut launch = self.launch_task(rec);
+        tokio::select! {
+            res = &mut launch => match res {
+                Ok(Ok(())) => Ok(true),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("launch task: {e}")),
+            },
+            _ = r.cancel.cancelled() => {
+                let (inner, job) = (self.clone(), job.clone());
+                if self.gated(&r.id) {
+                    // The gate of the radio is not ours: finish and stop it from a task.
+                    tokio::spawn(async move {
+                        if matches!(launch.await, Ok(Ok(()))) {
+                            let _ = inner.stop(&job).await;
+                        }
+                    });
+                } else if matches!(launch.await, Ok(Ok(()))) {
+                    let _ = self.stop_gated(&job).await;
+                }
+                Ok(false)
+            }
         }
     }
 
@@ -1051,9 +1175,37 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         let signal = w.signals[i].signal.clone();
         // Neither `current` nor kept while it is placed: the guard stops it on a panic.
         w.pending = Some(job.clone());
-        let (job, source, placed, why) = inner.place_decoder(r, &mode, &signal, &job).await;
+        let Placement {
+            job,
+            source,
+            placed,
+            why,
+            sink,
+        } = inner.place_decoder(r, &mode, &signal, &job).await;
         inner.disown(&job);
         w.signals[i].handled = true;
+        let sink_error = match sink {
+            // Stopping: the loop's exit path stops what is pending.
+            SinkOutcome::Cancelled => return true,
+            SinkOutcome::Lost(why) => {
+                // Not listed as decoding: it is gone (left alone until its signal returns).
+                w.pending = None;
+                inner.stop_started(r, &job, &source).await;
+                let summary = format!("lost {mode} at {}: {why}", signal.mhz());
+                let e = Event {
+                    signal: Some(&signal),
+                    job: Some(&job),
+                    mode: Some(&mode),
+                    source: Some(&source),
+                    placed: Some(placed),
+                    ..Event::default()
+                };
+                inner.watch_event(r, "lost", summary, e);
+                return true;
+            }
+            SinkOutcome::Refused(why) => Some(why),
+            SinkOutcome::Off | SinkOutcome::On => None,
+        };
         let t = now().0;
         w.subs.insert(job.clone(), inner.decoder_subs(&job));
         w.decoding.push(Decoding {
@@ -1063,6 +1215,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             signal: signal.clone(),
             since_ns: t,
             placed,
+            sink_error: sink_error.clone(),
             last_event_ns: t,
             gone_since_ns: None,
             confirm_by_ns: None,
@@ -1076,6 +1229,9 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         );
         if let Some(why) = why {
             summary.push_str(&format!(": {why}"));
+        }
+        if let Some(why) = sink_error {
+            summary.push_str(&format!("; sondehub sink refused: {why}"));
         }
         let e = Event {
             signal: Some(&signal),

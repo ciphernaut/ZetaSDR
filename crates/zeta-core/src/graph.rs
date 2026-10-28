@@ -86,6 +86,40 @@ pub enum GraphError {
     Cycle,
 }
 
+/// The `sondehub` params of a watch's `detect` node, checked as the `sink_sondehub` stage
+/// would check its own: `sondehub.<field>: <error>` (or `sondehub: <error>` when no field
+/// is named), `sondehub: sink_sondehub stage not registered` without the stage.
+fn check_sondehub(params: &serde_json::Value, registry: &StageRegistry) -> Result<(), String> {
+    let kind = crate::ops::SONDEHUB_STAGE;
+    let Some(spec) = registry.spec(kind) else {
+        return Err(format!("sondehub: {kind} stage not registered"));
+    };
+    let named = |field: Option<String>, e: String| match field.filter(|f| !f.is_empty()) {
+        Some(f) => format!("sondehub.{f}: {e}"),
+        None => format!("sondehub: {e}"),
+    };
+    let schema =
+        serde_json::to_value(&spec.params_schema).map_err(|e| named(None, e.to_string()))?;
+    let validator = jsonschema::validator_for(&schema).map_err(|e| named(None, e.to_string()))?;
+    if let Some(e) = validator.iter_errors(params).next() {
+        let path = e.instance_path().to_string();
+        return Err(named(
+            Some(path.trim_start_matches('/').to_string()),
+            e.to_string(),
+        ));
+    }
+    registry.check_params(kind, params).map_err(|e| {
+        // The stage's own messages name the field first or in backticks.
+        let field = e
+            .split('`')
+            .nth(1)
+            .map(str::to_string)
+            .or_else(|| e.split_whitespace().next().map(str::to_string))
+            .filter(|f| f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        named(field, e)
+    })
+}
+
 /// Check kinds, params, endpoints, edge types, unique node ids, that every root accepts IQ
 /// (or takes no input at all, as `stream_in`, which reads the bus itself), that there is
 /// at least one node, and that the edges form no cycle, in that order.
@@ -108,6 +142,11 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
             return Err(bad(e.to_string()));
         }
         registry.check_params(&n.kind, &n.params).map_err(bad)?;
+        if n.kind == crate::ops::DETECT_STAGE
+            && let Some(p) = n.params.get("sondehub").filter(|p| !p.is_null())
+        {
+            check_sondehub(p, registry).map_err(bad)?;
+        }
     }
     let find = |id: &NodeId| graph.nodes.iter().find(|n| &n.id == id);
     let mut ends = Vec::with_capacity(graph.edges.len());
