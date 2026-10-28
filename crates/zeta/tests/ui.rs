@@ -8,8 +8,10 @@
 //! capture's centre) and `scanner` (the `tone` recording tunable over 50-150 MHz, the source
 //! the page's automatic scans pick for a view around `tone`: `retune` sorts first in
 //! `source_list` but its range does not contain 100 MHz) and `cb` (the `tone` recording
-//! relabelled at 476.9 MHz, channel 20 of the CB plan, last); the node's state directory is passed
-//! to ui.py in `ZETA_UI_STATE_DIR`. That node has a fake
+//! relabelled at 476.9 MHz, channel 20 of the CB plan, last), and `--modes-dir` holding the
+//! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
+//! job; see [`fake_pos_row`]); the node's state directory is passed to ui.py in
+//! `ZETA_UI_STATE_DIR`. That node has a fake
 //! `voiced` (`--stt-socket`, zeta-speech's `FakeDaemon`) answering `ok:what sources are there`
 //! to every valid staged WAV; a second node without a speech daemon, with only the `speech`
 //! fixture, is passed in `ZETA_UI_URL_NOSTT`.
@@ -210,6 +212,65 @@ fn wait_with_deadline(
     )
 }
 
+/// The `fake_pos` mode row: a `json_lines` program row run by zeta-ext's `fake_lines` (pinned
+/// with `ZETA_HANDLER_FAKE_LINES`), whose events carry a `position`.
+fn fake_pos_row() -> serde_json::Value {
+    serde_json::json!({
+        "id": "fake_pos",
+        "name": "Fake positions (UI tests)",
+        "family": "general",
+        "band": {"bandwidth_hz": 12500, "centers_hz": [], "min_hz": null},
+        "modulation": ["fm"],
+        "label": "FAKE",
+        "protocol": "fake_pos",
+        "decoder": {
+            "kind": "program",
+            "programs": ["fake_lines"],
+            "args": [],
+            "input": {"stream": "iq", "format": "cs16", "rate_hz": 48000, "via": "stdin",
+                      "container": "raw"},
+            "output": {"via": "stdout", "port": null, "parser": "json_lines"},
+            "install": {"url": "https://example.invalid/fake", "debian": null,
+                        "fedora": null, "brew": null}
+        },
+        "event": {
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "lat": {"type": "number"},
+                    "lon": {"type": "number"},
+                    "alt": {"type": "number"}
+                }
+            },
+            "summary": "{id} {lat:.2},{lon:.2}"
+        },
+        "position": {"lat": "lat", "lon": "lon", "alt_m": "alt"},
+        "identify": {"proof": "event", "min_events": 1, "dwell_ms": 3000,
+                     "min_span_ms": 1000, "quick": null},
+        "catalogue": [],
+        "test": null
+    })
+}
+
+/// What `fake_lines` prints for a `fake_pos` job: one sonde moving from -27.40,153.10 to
+/// -27.41,153.11.
+const FAKE_POS_LINES: &str = "{\"id\":\"S1\",\"lat\":-27.40,\"lon\":153.10,\"alt\":1000}\n\
+{\"id\":\"S1\",\"lat\":-27.41,\"lon\":153.11,\"alt\":1200}";
+
+/// `fake_lines` prints its lines after this many input bytes: 2 s of the 48 kHz cs16 IQ, so
+/// the page has subscribed to the job's events by then.
+const FAKE_POS_AFTER_BYTES: &str = "384000";
+
+/// A modes directory under `dir` holding `fake_pos.json`; its path.
+fn fake_pos_modes(dir: &Path) -> PathBuf {
+    let modes = dir.join("modes");
+    std::fs::create_dir_all(&modes).expect("create modes dir");
+    let row = serde_json::to_string_pretty(&fake_pos_row()).unwrap();
+    std::fs::write(modes.join("fake_pos.json"), row).expect("write fake_pos.json");
+    modes
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -257,10 +318,16 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let sock = sock_dir.path().join("voiced.sock");
     let _voiced = fake_voiced(&sock);
     let sock = sock.to_str().expect("socket path is UTF-8");
+    let modes = fake_pos_modes(dir.path());
+    let modes = modes.to_str().expect("modes path is UTF-8");
+    let fake_lines = repo_root().join("crates/zeta-ext/tests/fake_lines");
+    let fake_lines = fake_lines.to_str().expect("fake_lines path is UTF-8");
     let serve = ServeProc::start_full(
         dir.path(),
         SECRET,
         &[
+            "--modes-dir",
+            modes,
             "--source-file",
             &aprs,
             "--source-file",
@@ -277,7 +344,11 @@ fn ui_scenarios_pass_in_headless_chromium() {
             &cb,
         ],
         &["--stt-socket", sock],
-        &[],
+        &[
+            ("ZETA_HANDLER_FAKE_LINES", fake_lines),
+            ("ZETA_PLUGIN_ENV_FAKE_LINES", FAKE_POS_LINES),
+            ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", FAKE_POS_AFTER_BYTES),
+        ],
     );
     // No speech daemon: XDG_RUNTIME_DIR points where no voiced.sock is, so no default applies.
     let nostt_dir = tempfile::tempdir().unwrap();

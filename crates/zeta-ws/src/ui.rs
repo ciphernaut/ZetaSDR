@@ -33,11 +33,12 @@ async fn file(Path(path): Path<String>) -> Response {
 }
 
 /// The app loads only its own files; the microphone tap is an AudioWorklet module from a
-/// `blob:` URL; websockets go back to the node. Styles are set through the CSSOM only, but
-/// `'unsafe-inline'` is kept for style attributes a future change may add.
+/// `blob:` URL; websockets go back to the node; the map's tiles are images from
+/// OpenStreetMap's tile server, the one outside origin. Styles are set through the CSSOM
+/// only, but `'unsafe-inline'` is kept for style attributes a future change may add.
 const CSP: &str = "default-src 'self'; script-src 'self' blob:; worker-src 'self' blob:; \
-connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
-frame-ancestors 'none'";
+connect-src 'self' ws: wss:; img-src 'self' data: https://tile.openstreetmap.org; \
+style-src 'self' 'unsafe-inline'; frame-ancestors 'none'";
 
 fn serve(path: &str) -> Response {
     match zeta_ui::asset(path) {

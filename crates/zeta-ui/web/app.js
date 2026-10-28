@@ -65,11 +65,18 @@
 // language: null}` through the command-line op path (its outcome, an error too, reaches the
 // transcript); `graph` opens the job's graph view (graph.js).
 //
+// The map (map.js) is mounted in #map at login: the overlays hand it every event of the jobs
+// they watch (ov.onEvent), each jobs poll drops the tracks of jobs that ended (map.sync), and
+// a job row with a fix shows its distance and bearing from the view's `home` (map.rowText).
+// With view `map on` <html data-map="on"> is set: in the wide footprint the map is a pane
+// beside the waterfall; in the narrow one #map-toggle (`map`, beside the source tabs) shows
+// it in the waterfall's place (<html data-pane="map">) and back.
+//
 // The mic button (#mic, voice.js) is mounted at login: its transcript is put in the command
 // line and submitted as if typed (so free text goes to /ask); #mic-status beside it shows
 // failures such as a node without a speech daemon.
 //
-// Exports `state` ({api, transcript, jobs, wf, coarse, ov, menu, audio, mic, sources,
+// Exports `state` ({api, transcript, jobs, wf, coarse, ov, map, menu, audio, mic, sources,
 // selected, view, lastJobs}), `onSourceChange(fn)` for the later views (waterfall, audio,
 // voice), `conflictActions(err, retry)` and `runSourceCommand(state, words)`.
 
@@ -84,6 +91,7 @@ import { mountMic } from "./voice.js";
 import { mountView, runViewCommand } from "./view.js";
 import { loadPlans } from "./plans.js";
 import { mountCoarse } from "./coarse.js";
+import { mountMap } from "./map.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -96,6 +104,7 @@ export const state = {
   ops: null,
   wf: null,
   ov: null,
+  map: null, // map.js: the positions of decoded events
   menu: null,
   audio: null, // {jobId, player}
   mic: null,
@@ -596,8 +605,12 @@ function start(api) {
     jobsEl: $("#jobs"),
     plan: () => state.view.get("plan"),
   });
+  state.map = mountMap($("#map"), api, state.view, { jobs: () => state.lastJobs });
+  state.ov.onEvent((job, p) => state.map?.event(job, p));
+  applyMapPane();
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
+    if (key === "map") applyMapPane();
   });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
@@ -615,6 +628,7 @@ function start(api) {
     view: state.view,
     onJobs: (jobs) => {
       state.lastJobs = jobs;
+      if (state.map) state.map.sync();
       if (state.ov) state.ov.sync(jobs, shown());
       if (state.wf) state.wf.syncJobs(jobs);
       pollSources(api);
@@ -625,6 +639,7 @@ function start(api) {
     onGraph: (job) => showGraph(api, job.id),
     playing: (id) => !!state.audio && state.audio.jobId === id,
     squelch: (id) => (state.ov ? state.ov.squelch(id) : null),
+    position: (id) => (state.map ? state.map.rowText(id) : null),
   });
   state.mic = mountMic($("#mic"), api, (text) => {
     $("#cmd").value = text;
@@ -638,6 +653,19 @@ function start(api) {
 function redrawPlan() {
   if (state.ov) state.ov.syncOutlines(state.ov.lastJobs, shown());
   if (state.wf) state.wf.drawAxis();
+}
+
+// <html data-map="on"> while the view's `map` policy is on (style.css lays the pane out);
+// off also leaves the narrow footprint's map tab.
+function applyMapPane() {
+  const root = document.documentElement;
+  const on = !!state.view && state.view.get("map") === "on";
+  if (on) root.dataset.map = "on";
+  else {
+    delete root.dataset.map;
+    delete root.dataset.pane;
+  }
+  $("#map-toggle").setAttribute("aria-pressed", String(root.dataset.pane === "map"));
 }
 
 // The shown source's last `source_list` record (null when unknown).
@@ -734,11 +762,13 @@ function logout(api) {
   if (state.jobs) state.jobs.close();
   if (state.menu) state.menu.destroy();
   if (state.ov) state.ov.destroy();
+  if (state.map) state.map.destroy();
   if (state.coarse) state.coarse.destroy();
   if (state.wf) state.wf.destroy();
   state.ops = null;
   state.jobs = null;
   state.ov = null;
+  state.map = null;
   state.coarse = null;
   state.menu = null;
   state.wf = null;
@@ -862,6 +892,12 @@ function boot() {
     const root = document.documentElement;
     if (root.dataset.drawer === "open") delete root.dataset.drawer;
     else root.dataset.drawer = "open";
+  });
+  $("#map-toggle").addEventListener("click", () => {
+    const root = document.documentElement;
+    if (root.dataset.pane === "map") delete root.dataset.pane;
+    else root.dataset.pane = "map";
+    applyMapPane();
   });
   $("#login-form").addEventListener("submit", (ev) => {
     ev.preventDefault();

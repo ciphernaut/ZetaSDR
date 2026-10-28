@@ -12,6 +12,12 @@
 //         finished_rows_s  a non-negative integer of seconds, 0 = never shown (default 60)
 //         scanner          auto | a source id (default auto)
 //         plan             auto | none | a loaded channel plan id (default auto; plans.js)
+//         map              on | off (default off): the map pane (map.js)
+//         home             `LAT,LON` (lat -90..90, lon -180..180, decimal degrees) | none
+//                          (default none): where the map's home marker sits and the job rows'
+//                          distance and bearing count from; kept as `<lat>,<lon>` with the
+//                          numbers as JavaScript prints them (`-27.50,153.00` → `-27.5,153`)
+//   homePoint(value) -> {lat, lon} | null   the `home` policy's value as numbers (null: none)
 //   VIEW_KEY   the sessionStorage key holding the values set ({key: value}, defaults left out)
 //   mountView() -> View
 //     view.get(key)             the value (the default when not set)
@@ -33,6 +39,21 @@ import { planIds } from "./plans.js";
 export const VIEW_KEY = "zeta.view";
 
 const SOURCE_ID = /^[A-Za-z0-9_.:-]+$/;
+const DECIMAL = /^[+-]?(\d+(\.\d*)?|\.\d+)$/;
+
+// `LAT,LON` as two numbers in range, or null.
+function latLon(text) {
+  const parts = String(text).split(",");
+  if (parts.length !== 2 || !parts.every((x) => DECIMAL.test(x))) return null;
+  const [lat, lon] = parts.map(Number);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  return { lat, lon };
+}
+
+export function homePoint(value) {
+  return value === "none" ? null : latLon(value);
+}
 
 export const POLICIES = [
   { key: "follow", values: ["target", "free"], default_: "target", describe: "target, free" },
@@ -62,6 +83,17 @@ export const POLICIES = [
     get describe() {
       return ["auto", "none", ...planIds()].join(", ");
     },
+  },
+  { key: "map", values: ["on", "off"], default_: "off", describe: "on, off" },
+  {
+    key: "home",
+    parse: (t) => {
+      if (t === "none") return t;
+      const p = latLon(t);
+      return p ? `${p.lat},${p.lon}` : undefined;
+    },
+    default_: "none",
+    describe: "LAT,LON in decimal degrees (lat -90..90, lon -180..180), none",
   },
 ];
 

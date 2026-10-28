@@ -1021,9 +1021,9 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, "follow = free")).to_have_text("follow = free")
     shown = view_show(page)
     for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
-                 "finished_rows_s 60", "scanner auto", "plan auto"):
+                 "finished_rows_s 60", "scanner auto", "plan auto", "map off", "home none"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 5, f"view show: {shown!r}"
+    assert shown.count("\n") == 7, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -1032,7 +1032,7 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, '"-1"', error=True)).to_be_visible()
     run_cmd(page, "view set nosuch 1")
     expect(view_line(page, "nosuch", error=True)).to_contain_text(
-        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner, plan")
+        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner, plan, map, home")
     run_cmd(page, "view reset")
     expect(view_line(page, "view policies reset")).to_be_visible()
     shown = view_show(page)
@@ -2443,6 +2443,105 @@ def scenario_channel_plan_labels(page, url, secret):
         run_cmd(page, "view reset")
         expect(job_row(page, job).locator(".tag.ch")).to_have_text("ch20")
         expect(label).to_contain_text("ch20 fm_demod")
+    finally:
+        stop_job(url, secret, job)
+
+
+# ---- the map (plan 17 Task 9) -----------------------------------------------------------
+# The node's `fake_pos` mode row (ui.rs) runs zeta-ext's `fake_lines`, which prints two fixes
+# of sonde S1 (-27.40,153.10 then -27.41,153.11) 2 s into the job. The map's tiles come from
+# tile.openstreetmap.org, which every map scenario aborts: the map must still draw.
+
+OSM_TILES = "**/tile.openstreetmap.org/**"
+
+
+def page_errors(page):
+    """Collects the page's console errors and uncaught exceptions from now on, except the
+    load failures of the aborted map tiles (Chromium reports each as a console error)."""
+    seen = []
+
+    def on_console(m):
+        if m.type != "error":
+            return
+        where = (m.location or {}).get("url", "")
+        if "tile.openstreetmap.org" in where:
+            return
+        seen.append(f"{m.text} ({where})")
+
+    page.on("console", on_console)
+    page.on("pageerror", lambda e: seen.append(f"pageerror: {e}"))
+    return seen
+
+
+def start_fake_pos(page, url, secret):
+    """Start `fake_pos` on the tone source and have the page watch it at once (its two fixes
+    come 2 s in); the job id."""
+    job = start_job(url, secret, "fake_pos", "tone", 100_000_000, 12_500)
+    job_row(page, job)
+    return job
+
+
+def scenario_map_marker_draws_without_tiles(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    expect(page.locator("#map")).to_be_hidden()
+    run_cmd(page, "view set map on")
+    expect(view_line(page, "map = on")).to_be_visible()
+    mp = page.locator("#map")
+    expect(mp).to_be_visible()
+    expect(mp.locator(".leaflet-control-attribution")).to_contain_text(
+        "© OpenStreetMap contributors")
+    job = start_fake_pos(page, url, secret)
+    try:
+        expect(mp.locator(".leaflet-interactive")).to_have_count(1, timeout=10_000)
+        track = mp.locator("path.map-track")
+        expect(track).to_have_count(1)
+        # Both fixes drawn: the track's SVG path is a move and one line segment.
+        page.wait_for_function(
+            """() => {
+              const d = document.querySelector('#map path.map-track')?.getAttribute('d') || '';
+              return (d.match(/[ML]/g) || []).length === 2;
+            }""", timeout=5_000)
+        # The popup is the last summary and its age.
+        mp.locator(".leaflet-interactive").click()
+        popup = mp.locator(".leaflet-popup-content")
+        expect(popup).to_contain_text("S1 -27.41,153.11")
+        expect(popup).to_contain_text(re.compile(r"\d+ s ago"))
+        # Off hides the pane; the job's marker goes with the job.
+        stop_job(url, secret, job)
+        page.evaluate("window.zetaTest.poll()")
+        expect(mp.locator(".leaflet-interactive")).to_have_count(0)
+        expect(track).to_have_count(0)
+        run_cmd(page, "view set map off")
+        expect(mp).to_be_hidden()
+        assert not errors, f"console errors: {errors}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_home_gives_distance_and_bearing(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    run_cmd(page, "view set home -27.50,153.00")
+    expect(view_line(page, "home = -27.5,153")).to_be_visible()
+    run_cmd(page, "view set home 91,0")
+    expect(view_line(page, '"91,0"', error=True)).to_be_visible()
+    db = page.evaluate(
+        """() => import('./map.js').then((m) =>
+             m.distanceBearing({lat: -27.5, lon: 153.0}, {lat: -27.4, lon: 153.1}))""")
+    assert abs(db["km"] - 15.0) <= 0.3, f"distanceBearing {db}"
+    assert abs(db["deg"] - 42) <= 2, f"distanceBearing {db}"
+    job = start_fake_pos(page, url, secret)
+    try:
+        pos = page.locator(f'#jobs .job[data-id="{job}"] .pos')
+        expect(pos).to_have_text(re.compile(r"^\d+(\.\d+)? km, \d+°$"), timeout=10_000)
+        # The last fix, -27.41,153.11 from -27.50,153.00: 14.8 km at 48°.
+        expect(pos).to_have_text("14.8 km, 47°")
+        run_cmd(page, "view set home none")
+        expect(pos).to_have_count(0)
+        assert not errors, f"console errors: {errors}"
     finally:
         stop_job(url, secret, job)
 

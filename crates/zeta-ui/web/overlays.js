@@ -93,6 +93,8 @@
 //         on each call, placed again when the view changes. Drawn under labels and ribbons.
 //     ov.unoutline(key)      removes the outline drawn under `key`, if any
 //     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a watched job
+//     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a watched job,
+//                            before it is drawn (the map reads `position` from them)
 //     ov.jobRow(job, counter)  shows `counter` (when > 0, or the string `—` for a job over
 //                            the cap) in that job's row `.events` cell
 //     ov.destroy()
@@ -198,6 +200,7 @@ class Overlays {
     this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
     this.ribbons = []; // {el, countEl, text, cls, hz, w, h, top, dy, right, born, count}
+    this.eventFns = []; // ov.onEvent listeners
     this.destroyed = false;
 
     this.layer = document.createElement("div");
@@ -406,6 +409,7 @@ class Overlays {
     const job = rec.job;
     const obj = p && typeof p === "object" && !Array.isArray(p);
     if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
+    for (const fn of this.eventFns) fn(job, p);
     if (obj && p.protocol === "squelch") {
       // Only a demodulator job's own squelch tags its row (never, say, a decoder's demod).
       if (SQUELCH_KINDS.includes(job.kind)) {
@@ -453,6 +457,10 @@ class Overlays {
     }
     const json = JSON.stringify(p) ?? String(p);
     this.ribbon(tuningCentre(job), json.slice(0, OTHER_EVENT_CHARS), "event");
+  }
+
+  onEvent(fn) {
+    this.eventFns.push(fn);
   }
 
   squelch(jobId) {

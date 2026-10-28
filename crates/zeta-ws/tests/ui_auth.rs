@@ -196,6 +196,11 @@ async fn ui_files_carry_a_content_security_policy() {
         assert!(csp.contains("default-src 'self'"), "{csp}");
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
         assert!(csp.contains("connect-src 'self' ws: wss:"), "{csp}");
+        // The map's tiles, and nothing else, come from outside the node.
+        assert!(
+            csp.contains("img-src 'self' data: https://tile.openstreetmap.org;"),
+            "{csp}"
+        );
         assert_eq!(
             h.get("x-content-type-options").unwrap(),
             "nosniff",

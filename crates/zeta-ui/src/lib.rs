@@ -72,6 +72,27 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
         "text/javascript; charset=utf-8",
         include_bytes!("../web/plans.js"),
     ),
+    (
+        "map.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/map.js"),
+    ),
+    // Leaflet 1.9.4 (BSD-2-Clause), verbatim from its release; map.js loads it on first use.
+    (
+        "vendor/leaflet/leaflet.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/vendor/leaflet/leaflet.js"),
+    ),
+    (
+        "vendor/leaflet/leaflet.css",
+        "text/css; charset=utf-8",
+        include_bytes!("../web/vendor/leaflet/leaflet.css"),
+    ),
+    (
+        "vendor/leaflet/LICENSE",
+        "text/plain; charset=utf-8",
+        include_bytes!("../web/vendor/leaflet/LICENSE"),
+    ),
 ];
 
 /// The MIME type and bytes of the file at `path`; `""` is `index.html`.
@@ -118,17 +139,45 @@ mod tests {
             ("view.js", "text/javascript; charset=utf-8"),
             ("coarse.js", "text/javascript; charset=utf-8"),
             ("plans.js", "text/javascript; charset=utf-8"),
+            ("map.js", "text/javascript; charset=utf-8"),
+            (
+                "vendor/leaflet/leaflet.js",
+                "text/javascript; charset=utf-8",
+            ),
+            ("vendor/leaflet/leaflet.css", "text/css; charset=utf-8"),
+            ("vendor/leaflet/LICENSE", "text/plain; charset=utf-8"),
         ] {
             let (m, bytes) = asset(path).unwrap_or_else(|| panic!("{path} embedded"));
             assert_eq!(m, mime, "{path}");
             assert!(!bytes.is_empty(), "{path}");
         }
-        let on_disk = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/web"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .filter(|n| !n.starts_with('.'));
-        for name in on_disk {
+        for name in files_under(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/web"
+        ))) {
             assert!(paths().any(|p| p == name), "web/{name} is not in ASSETS");
         }
+    }
+
+    /// Every file under `dir` (dot files left out), as a `/`-separated path relative to it.
+    fn files_under(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            let name = e.file_name().into_string().unwrap();
+            if name.starts_with('.') {
+                continue;
+            }
+            if e.file_type().unwrap().is_dir() {
+                out.extend(
+                    files_under(&e.path())
+                        .into_iter()
+                        .map(|f| format!("{name}/{f}")),
+                );
+            } else {
+                out.push(name);
+            }
+        }
+        out
     }
 }

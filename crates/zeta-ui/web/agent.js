@@ -42,7 +42,7 @@
 //                               when measured, and whether the guard holds it), removes it
 //                               otherwise (null: none seen)
 //   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, squelch,
-//                                   view})
+//                                   view, position})
 //                                                       -> {close, refresh, redraw}
 //       Polls `job_list` every 2 s and renders the running jobs, and the finished ones
 //       (stopped, failed) for view.get("finished_rows_s") seconds after this page first saw
@@ -63,6 +63,8 @@
 //       A running row of a SQUELCH_KINDS kind is tagged `squelch` (setSquelchTag) while
 //       squelch(id) (overlays.js: the last `squelch` event seen on the job's event stream)
 //       has `open: false`.
+//       A running row whose position(id) (map.js rowText: the job's last fix from the view's
+//       `home`, `14.8 km, 47°`) is not null shows it in a `.pos` line under the row.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 import { channelLabel } from "./plans.js";
@@ -332,7 +334,7 @@ export function setSquelchTag(row, event) {
   tag.title = title;
 }
 
-function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch, plan }) {
+function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch, plan, position }) {
   const row = document.createElement("div");
   const attached = !!job.input;
   const finished = isFinished(job);
@@ -379,6 +381,14 @@ function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch, 
   }
   if (squelch && status === "running" && SQUELCH_KINDS.includes(job.kind)) {
     setSquelchTag(row, squelch(job.id));
+  }
+  const pos = position && status === "running" ? position(job.id) : null;
+  if (pos) {
+    const span = document.createElement("span");
+    span.className = "pos";
+    span.textContent = pos;
+    span.title = "the last position decoded, from the view's home";
+    row.append(span);
   }
   if (job.state && job.state.reason) row.title = job.state.reason;
   if (finished) {
@@ -466,6 +476,7 @@ export function startJobs(
     playing = null,
     squelch = null,
     view = null,
+    position = null,
   } = {},
 ) {
   let timer = null;
@@ -481,6 +492,7 @@ export function startJobs(
     playing,
     squelch,
     plan: view ? () => view.get("plan") : null,
+    position,
   };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;
@@ -517,7 +529,7 @@ export function startJobs(
       redraw();
     });
     view.onChange((key) => {
-      if (key === "finished_rows_s" || key === "plan") redraw();
+      if (key === "finished_rows_s" || key === "plan" || key === "home") redraw();
     });
   }
   const render = (jobs) => {
