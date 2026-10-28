@@ -153,6 +153,8 @@ Delivered by plan 16 (`docs/superpowers/specs/2026-10-27-mode-registry-design.md
 
 On a box between `MIN_BW_HZ` and the RDS gate, after a `no_frame` also try the row-width slice at the measured centre when layer 1 is not `noise` (plan 16 ruling 21): a packet 10 kHz off a 40 kHz box's centre is missed today and decodes on that slice. Fits the "centre on the measured signal" rule.
 
+Related, from plan 17 (ruling 6): what `CLASSIFY_TRIES` counts. `classify` takes the best five rows by score, and the three sonde rows score 0.6 on any narrow FM box (centre list empty, width fits, `fm` in `modulation`) even outside 400-406 MHz, so on a 2 m or UHF channel they can fill three of the five `tried` slots as `skipped_quick` and push a quick-attempt row (APRS, POCSAG) out of the list. Count only rows with a quick attempt against the five (or take the five after dropping `skipped_quick`/out-of-range rows), and let the range term in the score drop a row whose `range_hz` does not contain the measured centre. Tests in `tests/classify.rs` carry an operator override for it today.
+
 ## Bug: a plain `pocsag_decode` never decodes on the debug-build bank at 2.048 MHz
 
 Found in plan 16 task 7 (pre-existing): the debug-build bank path at 2.048 MHz does not deliver a decodable channel for a plain `pocsag_decode`, so the core identify tests run without the bank. Reproduce with the POCSAG fixture on a 2.048 MHz capture in a debug build, then check the release build before fixing.
@@ -187,3 +189,26 @@ From the operator, 2026-10-28, on two plan 16 review rulings. Today a program ro
 - **Install hints.** Extend the row's install map to `snap` and `flatpak` where the handler ships that way (`snap install <pkg>`, `flatpak install <ref>`), and name an AppImage by URL in `url` (it is a download, not a package manager). The report line keeps one command and one URL; the order of fallbacks follows what the host has (`which apt dnf brew snap flatpak`).
 
 Scope estimate: 50-100 lines in `crates/zeta-ext/src/proc.rs` and `node_setup.rs`, a row-schema field, two tests.
+
+## Feature: decoder wave 2 (rows on the sonde frameworks)
+
+From plan 17, 2026-10-29. Plan 17 shipped the frameworks (audio-input program rows, the generic `fsk`/`psk`/`ook` synthesiser families and the echo impairment, the `watch` job, `source_free`, `position` and the map, the SondeHub sink), so these are rows and small stages, not new machinery:
+
+- **Voice.** M17 (4FSK 4800 baud, Codec 2, open) and DMR (4FSK, AMBE+2 through the vocoder libraries, see the install-script gist above): audio-output rows whose audio feeds `job attach --kind transcribe` unchanged.
+- **AIS** (161.975 / 162.025 MHz, GMSK 9600, NMEA out; a `nmea` parser row, positions onto the map) and **FLEX** pagers (1600/3200/6400).
+- **Whole-span POCSAG and APRS** as a `watch` with `decode_on: capture`: the detect stage finds the channels in a pin and the watch starts one decoder per signal, instead of one hand-started job per channel.
+- **Stereo** for `wfm_demod` (see the stereo gist above) now that audio rows exist to consume it.
+- **DFM and M20 frame synthesis.** `dfm_decode` and `m20_decode` have no `test` (they print `skipped: no test`, and `--strict` fails them); an `rs41`-style generator for each, proven against `dfm09mod`/`m20mod`, writes them in. The RS41 generator is the template (public protocol descriptions only, never `rs41mod.c`).
+- **APRS positions on the map.** The APRS row has no `position` map; add one (the decoder's `info` carries it only after parsing, so a position field wants the parser) so APRS stations appear beside the sondes.
+
+## Bug: `--then-tail` on a program row with a squelched demod tails the squelch events first
+
+Found in plan 17 task 7. `--then-tail` now tails the first event output of the job; for an audio-input program row whose `nbfm_demod` keeps its squelch on, that is the demod's `squelch` event stream, which publishes before the decoder's events, so the tail shows `squelch` frames and the decode may land after `max_frames`. The sonde rows run the squelch off, so they are unaffected; an operator audio row that keeps it on is not. Tail the last event output (the decoder's) or the one whose frames carry `protocol`, and test it with a squelched audio row.
+
+## Bug: a sink-bearing decoder is frozen as an operator graph
+
+Found in plan 17 task 10. A decoder with a `sink_sondehub` node (added by the watch's `sondehub` param) is stored `operator_graph: true`, so it is not re-expanded at a different capture rate, and the sink-less fallback after a failed sink relaunch is stored the same way with no capture rate. Keep the row's expansion and re-append the sink on re-expansion (store the sink config beside the graph), so a retune does not leave the decoder at the old rate. Same area: decoders the watch re-adopts after a `graph put` keep their old sink config, and a batch buffered at a restart is lost.
+
+## Bug: `gated_stop` is cleared unconditionally by a sink restart
+
+Found in plan 17 task 10. `store_graph` clears `gated_stop` before relaunching the same id so the relaunch is not suppressed; a `replace` that names only the decoder during the sink restart's teardown can therefore let it relaunch after being stopped. Clear only the entry the restart itself set (a token compare), and make `replace_during_a_sink_restart` deterministic (it can flake when the proof lands before the gate is taken).
