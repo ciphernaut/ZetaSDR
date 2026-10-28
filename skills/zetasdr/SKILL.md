@@ -336,6 +336,18 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: audio
 - outputs: audio
 
+### detect
+
+- inputs: event
+- outputs: event
+- params.dc_mask_hz: integer (optional, default 25000)
+- params.edge_mask: number (optional, default 0.05)
+- params.gone_ms: integer (optional, default 30000)
+- params.persist_ms: integer (optional, default 3000)
+- params.spurs_hz: array (optional, default [])
+- params.threshold_db: number (optional, default 10.0)
+- params.width_hz: array (optional, default [5000,30000])
+
 ### external_decode
 
 - inputs: iq, audio

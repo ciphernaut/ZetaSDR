@@ -19,6 +19,7 @@ pub mod bank;
 pub mod catalogue;
 pub mod channel;
 pub mod denoise;
+pub mod detect;
 pub mod fft;
 #[cfg(feature = "gpu")]
 pub mod gpu_fft;
@@ -58,6 +59,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(rds::RdsDecodeStage::new()));
     reg.register(Arc::new(acars::AcarsDecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
+    reg.register(Arc::new(detect::DetectStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));
     reg.register(Arc::new(vad::VadStage::new()));
 }
