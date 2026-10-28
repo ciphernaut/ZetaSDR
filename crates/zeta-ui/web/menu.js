@@ -31,6 +31,7 @@
 //                                             end before the 2 s job poll would), so each
 //                                             `candidate` event shows as a ribbon (its
 //                                             `summary`, class `candidate`)
+//   watch      Watch this band                job_start kind=watch on the selection as is
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
 //   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
 //                                             bandwidth_hz at least POCSAG_MIN_BANDWIDTH_HZ
@@ -109,6 +110,7 @@ export const IDENTIFY_MIN_BANDWIDTH_HZ = 12500;
 const ENTRIES = [
   ["classify", "What is this?"],
   ["identify", "Identify (thorough)"],
+  ["watch", "Watch this band"],
   ["aprs_decode", "Decode › APRS"],
   ["pocsag_decode", "Decode › POCSAG"],
   ["rds_decode", "Decode › RDS (FM station data)"],
@@ -132,6 +134,7 @@ const ENTRIES = [
 // The job each decode entry starts: kind, deviation_hz and sideband.
 const JOBS = {
   identify: { kind: "identify", deviation: null, sideband: null },
+  watch: { kind: "watch", deviation: null, sideband: null },
   aprs_decode: { kind: "aprs_decode", deviation: null, sideband: null },
   pocsag_decode: { kind: "pocsag_decode", deviation: null, sideband: null },
   rds_decode: { kind: "rds_decode", deviation: null, sideband: null },

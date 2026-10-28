@@ -1993,6 +1993,68 @@ def scenario_identify_from_a_box_shows_candidates(page, url, secret):
                 stop_job(url, secret, j["id"])
 
 
+def running_watch_jobs(url, secret, source):
+    jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+    return [j for j in jobs if j["kind"] == "watch" and j["source"] == source
+            and j["state"]["status"] == "running"]
+
+
+def scenario_watch_entry_starts_a_watch_and_outlines_its_band(page, url, secret):
+    menu = open_menu_on_tone(page, url, secret)
+    expect(page.locator('#ctx .ctx-item[data-action="watch"]')).to_have_text("Watch this band")
+    footer = page.locator("#ctx-footer").text_content()
+    m = re.search(r"center_hz=(\d+) bandwidth_hz=(\d+)", footer)
+    page.click('#ctx .ctx-item[data-action="watch"]')
+    expect(menu).to_be_hidden()
+    watches = []
+    try:
+        wait_until(lambda: running_watch_jobs(url, secret, "tone"), 5.0, "a running watch")
+        watches = running_watch_jobs(url, secret, "tone")
+        assert len(watches) == 1, f"watch jobs on tone: {watches}"
+        t = watches[0]["tuning"]
+        assert (t["center_hz"], t["bandwidth_hz"]) == (int(m.group(1)), int(m.group(2))), \
+            f"tuning {t} for footer {footer!r}"
+        el = page.locator(f'#waterfall .outline[data-key="{watches[0]["id"]}"]')
+        page.evaluate("window.zetaTest.poll()")
+        expect(el).to_have_count(1)
+        expect(el).to_contain_text("watch")
+    finally:
+        for j in watches:
+            stop_job(url, secret, j["id"])
+
+
+def scenario_owned_jobs_are_hidden_from_the_jobs_pane(page, url, secret):
+    select_source(page, url, secret, "tone")
+    page.wait_for_function("() => window.zetaTest.wf().painted > 30", timeout=15_000)
+    cur = source_info(url, secret, "tone")["current"]
+    watch = start_job(url, secret, "watch", "tone", cur["center_hz"], cur["bandwidth_hz"])
+    try:
+        graph = http_json(url, secret, "/op", {"op": "graph_get", "job": watch})["value"]
+        detect = [n for n in graph["nodes"] if n["kind"] == "detect"]
+        assert len(detect) == 1, f"detect nodes: {graph['nodes']}"
+        detect[0]["params"].update({"width_hz": [0, 48000], "persist_ms": 500, "gone_ms": 60000,
+                                      "dc_mask_hz": 0})
+        http_json(url, secret, "/op", {"op": "graph_put", "job": watch, "graph": graph})
+
+        def owned():
+            jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            return [j for j in jobs if j.get("owner") == watch
+                    and j["state"]["status"] == "running"]
+
+        wait_until(owned, 20.0, "a running job owned by the watch")
+        child = owned()[0]["id"]
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f'#jobs .job[data-id="{watch}"]')).to_have_count(1)
+        expect(page.locator(f'#jobs .job[data-id="{child}"]')).to_have_count(0)
+        expect(page.locator(f'#waterfall .outline[data-key="{child}"]')).to_have_count(0)
+        expect(page.locator("#waterfall .ov-mark")).not_to_have_count(0)
+    finally:
+        stop_job(url, secret, watch)
+        for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]:
+            if j.get("owner") == watch and j["state"]["status"] == "running":
+                stop_job(url, secret, j["id"])
+
+
 def scenario_adsb_entry_asks_for_2400_khz(page, url, secret):
     # ADS-B always asks for 2.4 MHz, whatever was selected; the 48 kHz tone cannot serve it,
     # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so.

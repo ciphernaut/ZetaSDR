@@ -120,6 +120,7 @@ function rigidBand(job) {
     !job.elastic &&
     !job.input &&
     job.kind !== "scan" &&
+    !job.owner &&
     !!t &&
     typeof t.center_hz === "number" &&
     typeof t.bandwidth_hz === "number" &&
@@ -193,6 +194,7 @@ class Overlays {
     this.squelches = new Map(); // job id -> {event: the last `squelch` event seen, graph}
     this.labels = new Map(); // key -> {el, hz}
     this.outlines = new Map(); // key -> {el, labelEl, lo, hi}
+    this.marks = new Map(); // `${job id}:${rounded centre}` -> {el, hz}: a watch's `signal new`
     this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
     this.ribbons = []; // {el, countEl, text, cls, hz, w, h, top, dy, right, born, count}
@@ -220,6 +222,7 @@ class Overlays {
     this.ribbons = [];
     for (const l of this.labels.values()) l.el.remove();
     this.labels.clear();
+    for (const key of [...this.marks.keys()]) this.unmark(key);
     for (const key of [...this.outlines.keys()]) this.unoutline(key);
     this.captureOutlined = false;
   }
@@ -234,6 +237,7 @@ class Overlays {
         j.state &&
         j.state.status === "running",
     );
+    this.syncMarks(want);
     for (const [id, graph] of [...this.noEventStream]) {
       const j = want.find((x) => x.id === id);
       if (!j || graphKey(j) !== graph) this.noEventStream.delete(id);
@@ -370,6 +374,7 @@ class Overlays {
     this.counters.delete(jobId);
     this.squelches.delete(jobId);
     this.unlabel(jobId);
+    for (const key of [...this.marks.keys()]) if (key.startsWith(`${jobId}:`)) this.unmark(key);
   }
 
   // The id for subscription `slot` of `rec` after a drop: its stream if still listed, else
@@ -419,6 +424,11 @@ class Overlays {
         return;
       }
       if (p.protocol === "vad") return;
+      if (p.protocol === "signal" && typeof p.center_hz === "number") {
+        const key = `${job.id}:${Math.round(p.center_hz)}`;
+        if (p.state === "gone") this.unmark(key);
+        else if (p.state === "new") this.mark(p.center_hz, p.summary, key);
+      }
       if (p.protocol === "transcript") {
         const t = transcriptRibbon(p);
         const el = this.ribbon(tuningCentre(job), t.text, t.cls);
@@ -550,6 +560,48 @@ class Overlays {
     this.labels.delete(key);
   }
 
+  // A watch's markers follow its context (`watch.signals` still present), so a signal
+  // announced before this page watched the job is marked too; `signal` events keep them live
+  // between polls.
+  syncMarks(jobs) {
+    const keep = new Set();
+    for (const j of jobs) {
+      const sigs = j.kind === "watch" && j.context && j.context.watch && j.context.watch.signals;
+      if (!Array.isArray(sigs)) continue;
+      for (const s of sigs) {
+        if (!s || s.present === false || typeof s.center_hz !== "number") continue;
+        const key = `${j.id}:${Math.round(s.center_hz)}`;
+        keep.add(key);
+        this.mark(s.center_hz, `signal ${(s.center_hz / 1e6).toFixed(4)} MHz`, key);
+      }
+    }
+    for (const key of [...this.marks.keys()]) if (!keep.has(key)) this.unmark(key);
+  }
+
+  // A small marker at `hz` for a signal a watch announced; `unmark(key)` removes it.
+  mark(hz, text, key) {
+    if (this.destroyed) return null;
+    let m = this.marks.get(key);
+    if (!m) {
+      const el = document.createElement("div");
+      el.className = "ov-mark";
+      this.layer.append(el);
+      m = { el, hz };
+      this.marks.set(key, m);
+    }
+    m.hz = hz;
+    m.el.title = typeof text === "string" ? text : "";
+    m.el.style.top = `${this.yFor(hz)}px`;
+    return m.el;
+  }
+
+  unmark(key) {
+    const m = this.marks.get(key);
+    if (!m) return;
+    m.el.remove();
+    this.marks.delete(key);
+  }
+
   outline(lo, hi, text, key) {
     if (this.destroyed) return null;
     let o = this.outlines.get(key);
@@ -599,6 +651,7 @@ class Overlays {
       r.top = this.yFor(r.hz) - r.h / 2 + r.dy;
       r.el.style.top = `${r.top}px`;
     }
+    for (const m of this.marks.values()) m.el.style.top = `${this.yFor(m.hz)}px`;
     for (const l of this.labels.values()) {
       l.el.style.top = `${this.yFor(l.hz) - l.h / 2 + (l.dy || 0)}px`;
     }

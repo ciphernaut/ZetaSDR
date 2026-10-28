@@ -522,7 +522,8 @@ export function startJobs(
   }
   const render = (jobs) => {
     last = jobs;
-    const shown = underInputs(visible(jobs));
+    // A job a controller (a watch) started is shown through its owner, not on its own.
+    const shown = underInputs(visible(jobs)).filter((j) => !j.owner);
     el.replaceChildren(
       ...shown.map((j) =>
         jobRow(j, async (id, button) => {
