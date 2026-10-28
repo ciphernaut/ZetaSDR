@@ -10,13 +10,38 @@ reading until EOF and exits 0. $FAKE_VIA is `stdout` (the default) or
 accept one connection and write the lines there. FAKE_EXIT_AFTER=1 makes it
 exit 3 right after writing the lines. FAKE_PRINT_ENV=1 writes, instead of
 $FAKE_LINES, one JSON line `{"text": <the sorted names of its environment,
-space-separated>, "n": <how many>}`.
+space-separated>, "n": <how many>}`. FAKE_WAV=1 makes it read a 44-byte WAV
+header first (exiting 3 unless it starts `RIFF....WAVE`), print
+`{"wav": {"rate_hz": R, "bits": B, "channels": C}}` as its first line, then count
+only the bytes after the header and exit 3 should a second `RIFF` follow.
 """
 
 import json
 import os
 import socket
+import struct
 import sys
+
+WAV_HEADER_LEN = 44
+
+
+def read_wav_header(src, out) -> bool:
+    """Read the 44-byte header and print its line; False when it is no WAV header."""
+    hdr = b""
+    while len(hdr) < WAV_HEADER_LEN:
+        chunk = src.read(WAV_HEADER_LEN - len(hdr))
+        if not chunk:
+            break
+        hdr += chunk
+    if len(hdr) < WAV_HEADER_LEN or hdr[0:4] != b"RIFF" or hdr[8:12] != b"WAVE":
+        sys.stderr.write(f"fake_lines: error: wav header (got {hdr[:12].hex()})\n")
+        return False
+    channels, rate = struct.unpack_from("<HI", hdr, 22)
+    (bits,) = struct.unpack_from("<H", hdr, 34)
+    line = json.dumps({"wav": {"rate_hz": rate, "bits": bits, "channels": channels}})
+    out.write((line + "\n").encode())
+    out.flush()
+    return True
 
 
 def main() -> int:
@@ -41,9 +66,13 @@ def main() -> int:
 
     in_path = args[args.index("--in") + 1] if "--in" in args else "-"
     src = open(in_path, "rb") if in_path != "-" else sys.stdin.buffer
+    wav = os.environ.get("FAKE_WAV") == "1"
+    if wav and not read_wav_header(src, out):
+        return 3
     total = 0
     head = b""
     sent = False
+    tail = b""
 
     def send() -> None:
         text = lines.replace("{bytes}", str(total)).replace("{head}", head.hex()).replace("{in}", in_path)
@@ -61,6 +90,11 @@ def main() -> int:
         chunk = src.read1(65536)
         if not chunk:
             break
+        if wav:
+            if b"RIFF" in tail + chunk:
+                sys.stderr.write("fake_lines: error: a second wav header\n")
+                return 3
+            tail = (tail + chunk)[-3:]
         if len(head) < 8:
             head = (head + chunk)[:8]
         total += len(chunk)

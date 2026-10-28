@@ -274,7 +274,8 @@ pub enum SampleFormat {
 }
 
 impl SampleFormat {
-    fn is_iq(self) -> bool {
+    /// Whether this is an IQ format (`cu8`, `cs8`, `cs16`, `cf32`), not an audio one.
+    pub fn is_iq(self) -> bool {
         matches!(self, Self::Cu8 | Self::Cs8 | Self::Cs16 | Self::Cf32)
     }
 }

@@ -1,0 +1,51 @@
+{
+  "id": "rs41_decode",
+  "name": "Vaisala RS41 radiosonde",
+  "family": "weather_science",
+  "band": {"bandwidth_hz": 12500, "centers_hz": [], "range_hz": [400050000, 406000000], "min_hz": null},
+  "modulation": ["fsk", "fm"],
+  "label": "RS41",
+  "protocol": "rs41",
+  "decoder": {
+    "kind": "program",
+    "programs": ["rs41mod"],
+    "args": ["--json", "--ecc", "--crc"],
+    "demod": {"kind": "nbfm", "deviation_hz": 5000, "audio_rate_hz": 48000},
+    "input": {"stream": "audio", "format": "s16", "rate_hz": 48000, "via": "stdin", "container": "wav"},
+    "output": {"via": "stdout", "port": null, "parser": "json_lines"},
+    "install": {"debian": "sonde-decoders", "url": "https://github.com/rs1729/RS"}
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "frame": {"type": "integer"},
+        "id": {"type": "string"},
+        "datetime": {"type": "string"},
+        "lat": {"type": "number"},
+        "lon": {"type": "number"},
+        "alt": {"type": "number"},
+        "vel_h": {"type": "number"},
+        "heading": {"type": "number"},
+        "vel_v": {"type": "number"},
+        "sats": {"type": "integer"},
+        "bt": {"type": "integer"},
+        "batt": {"type": "number"}
+      }
+    },
+    "summary": "{id} {lat?:.4},{lon?:.4} {alt?:.0} m {vel_v?:+.1} m/s"
+  },
+  "position": {"lat": "lat", "lon": "lon", "alt_m": "alt"},
+  "time": "datetime",
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 5000,
+    "min_span_ms": 1000,
+    "quick": null,
+    "priority": 1
+  },
+  "catalogue": ["vaisala-rs41-sg-weather-balloon-radiosonde"],
+  "test": null,
+  "notes": "Vaisala RS41 radiosondes (GFSK, 4800 baud, one frame a second) anywhere in 400.05-406 MHz; the frequency varies by flight, so start the job on the measured centre, not a raster. One job decodes one sonde."
+}

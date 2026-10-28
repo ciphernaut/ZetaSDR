@@ -2287,22 +2287,38 @@ fn fake_dump1090() -> std::path::PathBuf {
         .unwrap()
 }
 
-/// `zeta modes list` (one-shot) prints the five embedded rows, all ready; `--family`
+/// The test stand-in for an external decoder (`crates/zeta-ext/tests/fake_lines`),
+/// absolute.
+fn fake_lines() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../zeta-ext/tests/fake_lines")
+        .canonicalize()
+        .unwrap()
+}
+
+/// The sonde rows' programs, each pinned to `path` whatever the host has.
+const SONDE_HANDLERS: [&str; 3] = [
+    "ZETA_HANDLER_RS41MOD",
+    "ZETA_HANDLER_DFM09MOD",
+    "ZETA_HANDLER_M20MOD",
+];
+
+/// `zeta modes list` (one-shot) prints the embedded rows, all ready; `--family`
 /// narrows it and `modes show` prints one row.
 #[test]
-fn modes_list_prints_the_five_rows() {
+fn modes_list_prints_the_embedded_rows() {
     let dir = tempfile::tempdir().unwrap();
     let modes = dir.path().join("modes");
     std::fs::create_dir_all(&modes).unwrap();
     let modes_dir = modes.display().to_string();
-    // adsb_decode is ready only with a dump1090: pin it to the fake, whatever the host has.
-    let out = zeta(dir.path(), &["--modes-dir", &modes_dir, "modes", "list"])
-        .env("ZETA_HANDLER_DUMP1090", fake_dump1090())
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
+    // The program rows are ready only with their programs: pin them to the fakes,
+    // whatever the host has.
+    let mut cmd = zeta(dir.path(), &["--modes-dir", &modes_dir, "modes", "list"]);
+    cmd.env("ZETA_HANDLER_DUMP1090", fake_dump1090());
+    for var in SONDE_HANDLERS {
+        cmd.env(var, fake_lines());
+    }
+    let out = cmd.assert().success().get_output().stdout.clone();
     let v = json(&out);
     assert_eq!(v["result"], "modes", "{v}");
     let rows = v["value"]["modes"].as_array().expect("modes array");
@@ -2313,8 +2329,11 @@ fn modes_list_prints_the_five_rows() {
             "acars_decode",
             "adsb_decode",
             "aprs_decode",
+            "dfm_decode",
+            "m20_decode",
             "pocsag_decode",
-            "rds_decode"
+            "rds_decode",
+            "rs41_decode"
         ]
     );
     assert!(rows.iter().all(|m| m["state"] == "ready"), "{v}");
@@ -2409,6 +2428,96 @@ fn handler_report_lists_missing_programs_with_suggestions() {
     let adsb = rows.iter().find(|m| m["id"] == "adsb_decode").unwrap();
     assert_eq!(adsb["state"], "ready", "{v}");
     assert_eq!(adsb["program"], fake.display().to_string(), "{v}");
+}
+
+/// The sonde rows' programs get a report line each, with the package and URL of the
+/// rows, and a row whose program is missing lists unavailable.
+#[test]
+fn the_handler_report_names_the_sonde_programs() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let nowhere = dir.path().join("no-such-program");
+    let mut cmd = zeta(dir.path(), &["modes", "list", "--state", "unavailable"]);
+    cmd.env("PATH", &empty);
+    for var in SONDE_HANDLERS {
+        cmd.env(var, &nowhere);
+    }
+    let out = cmd.assert().success().get_output().clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for (program, mode) in [
+        ("rs41mod", "rs41_decode"),
+        ("dfm09mod", "dfm_decode"),
+        ("m20mod", "m20_decode"),
+    ] {
+        let line = format!(
+            "zeta: handlers: {program}: missing (apt install sonde-decoders; https://github.com/rs1729/RS) — modes: {mode}"
+        );
+        assert!(stderr.contains(&line), "{line} not in {stderr}");
+    }
+    let v = json(&out.stdout);
+    let ids: Vec<&str> = v["value"]["modes"]
+        .as_array()
+        .expect("modes array")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"rs41_decode"), "{v}");
+}
+
+/// `rs41_decode` runs its handler on the NBFM demod's audio under a WAV header: the
+/// fake (pinned as `rs41mod`) reads the header, says what it held, then prints one
+/// rs1729-shaped line, published with the row's summary, position and GPS time.
+#[test]
+fn rs41_decode_runs_the_handler_on_demodulated_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = r#"{"frame": 4321, "id": "S1234567", "datetime": "2026-10-28T02:15:30.000Z", "lat": -27.4, "lon": 153.1, "alt": 12000.0, "vel_h": 3.2, "heading": 90.0, "vel_v": 5.0, "sats": 9, "bt": 65535, "batt": 2.9}"#;
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "rs41_decode",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "12500",
+            "--then-tail",
+            "2,5000",
+        ],
+    )
+    .env("ZETA_HANDLER_RS41MOD", fake_lines())
+    .env("ZETA_PLUGIN_ENV_FAKE_WAV", "1")
+    .env("ZETA_PLUGIN_ENV_FAKE_LINES", line)
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 2, "{v}");
+    assert_eq!(
+        frames[0]["payload"]["wav"],
+        serde_json::json!({"rate_hz": 48000, "bits": 16, "channels": 1}),
+        "{v}"
+    );
+    let p = &frames[1]["payload"];
+    assert_eq!(p["protocol"], "rs41", "{v}");
+    assert_eq!(
+        p["summary"], "S1234567 -27.4000,153.1000 12000 m +5.0 m/s",
+        "{v}"
+    );
+    assert_eq!(
+        p["position"],
+        serde_json::json!({"lat": -27.4, "lon": 153.1, "alt_m": 12000.0}),
+        "{v}"
+    );
+    assert_eq!(p["t_ns"], 1_793_153_730_000_000_000u64, "{v}");
+    assert_eq!(v[2]["stopped"], true, "{v}");
 }
 
 /// Without `--modes-dir` the CLI reads `$XDG_CONFIG_HOME/zetasdr/modes`; with it, only

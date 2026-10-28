@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use zeta_core::graph::NodeId;
-use zeta_core::modes::{Family, ModeRegistry, ModeState, parse, template, validate};
+use zeta_core::modes::{
+    Container, Decoder, Family, InputStream, ModeRegistry, ModeState, parse, template, validate,
+};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpError, OpResult};
 use zeta_core::port::Tuning;
@@ -18,12 +20,15 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 5] = [
+const EMBEDDED: [&str; 8] = [
     "acars_decode",
     "adsb_decode",
     "aprs_decode",
+    "dfm_decode",
+    "m20_decode",
     "pocsag_decode",
     "rds_decode",
+    "rs41_decode",
 ];
 
 fn cfg(dir: &Path, modes_dir: &Path) -> NodeConfig {
@@ -54,7 +59,7 @@ fn renamed_pocsag(name: &str) -> String {
 fn embedded_rows_parse_and_validate() {
     let stages = stages();
     let embedded = ModeRegistry::embedded();
-    assert_eq!(embedded.len(), 5);
+    assert_eq!(embedded.len(), 8);
     for (file, text) in &embedded {
         let row = parse(text).unwrap_or_else(|e| panic!("{file}: {e}"));
         validate(&row, &stages).unwrap_or_else(|e| panic!("{file}: {e}"));
@@ -133,7 +138,7 @@ async fn modes_list_filters_by_family_and_state() {
         other => panic!("expected modes, got {other:?}"),
     };
     let all = list(None, None).await;
-    assert_eq!(all.len(), 6, "{all:?}");
+    assert_eq!(all.len(), 9, "{all:?}");
     let aviation: Vec<String> = list(Some(Family::Aviation), None)
         .await
         .into_iter()
@@ -228,16 +233,7 @@ async fn modes_show_unknown_names_the_known_ids() {
     };
     assert_eq!(field, "id");
     assert_eq!(value, "nope");
-    assert_eq!(
-        known,
-        [
-            "acars_decode",
-            "adsb_decode",
-            "aprs_decode",
-            "pocsag_decode",
-            "rds_decode"
-        ]
-    );
+    assert_eq!(known, EMBEDDED);
 }
 
 /// A node's own `schema` lists its operator rows in the `kind` enumeration (MCP and
@@ -353,4 +349,33 @@ fn an_audio_program_row_expands_to_channel_nbfm_external() {
             (&g.nodes[1].id, &g.nodes[2].id, StreamKind::Audio),
         ]
     );
+}
+
+/// The RS41 row is an audio program row: `rs41mod` hears the NBFM demod's audio, its band
+/// a range rather than a raster, its events carrying a position.
+#[test]
+fn the_rs41_row_is_an_audio_program_row() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let m = reg.get("rs41_decode").expect("rs41_decode embedded");
+    assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
+    let Decoder::Program(block) = &m.row.decoder else {
+        panic!("a program row")
+    };
+    assert_eq!(block.input.stream, InputStream::Audio);
+    assert_eq!(block.input.container, Container::Wav);
+    assert_eq!(block.programs, ["rs41mod"]);
+    assert_eq!(m.row.position.as_ref().map(|p| p.lat.as_str()), Some("lat"));
+    assert_eq!(m.row.time.as_deref(), Some("datetime"));
+    assert_eq!(m.row.band.range_hz, Some([400_050_000, 406_000_000]));
+    assert!(m.row.band.centers_hz.is_empty());
+    assert_eq!(m.row.identify.priority, 1);
+    for (id, program) in [("dfm_decode", "dfm09mod"), ("m20_decode", "m20mod")] {
+        let m = reg.get(id).expect(id);
+        let Decoder::Program(block) = &m.row.decoder else {
+            panic!("{id}: a program row")
+        };
+        assert_eq!(block.programs, [program]);
+        assert_eq!(block.input.stream, InputStream::Audio);
+        assert_eq!(m.row.identify.priority, 0);
+    }
 }

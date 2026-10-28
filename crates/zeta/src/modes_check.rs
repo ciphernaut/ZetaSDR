@@ -48,8 +48,8 @@ enum Outcome {
 }
 
 /// Check the rows (only `only`, when given) and print `<id>: ok|fail|skipped: <reason>`
-/// for each. Exit 0 iff no row failed; with `strict` a program row whose program is
-/// missing fails instead of being skipped. A pass of a program row is recorded in
+/// for each. Exit 0 iff no row failed; with `strict` a row without a test, or a program
+/// row whose program is missing, fails instead of being skipped. A pass of a program row is recorded in
 /// `modes-checked.json` in `state_dir`.
 pub async fn run(
     state_dir: PathBuf,
@@ -125,19 +125,18 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
     if m.state == ModeState::Broken {
         return Outcome::Fail(m.reason.clone().unwrap_or_default());
     }
+    let skip = |why: String| match strict {
+        true => Outcome::Fail(why),
+        false => Outcome::Skipped(why),
+    };
     let Some(test) = &m.row.test else {
-        return Outcome::Skipped("no test".into());
+        return skip("no test".into());
     };
     if m.state == ModeState::Unavailable
         && let Decoder::Program(p) = &m.row.decoder
     {
         let handler = p.programs.first().map_or("program", String::as_str);
-        let why = format!("{handler} missing");
-        return if strict {
-            Outcome::Fail(why)
-        } else {
-            Outcome::Skipped(why)
-        };
+        return skip(format!("{handler} missing"));
     }
     let scratch = ctx
         .state_dir

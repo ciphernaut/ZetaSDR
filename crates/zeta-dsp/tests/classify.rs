@@ -20,6 +20,15 @@ const CENTER: u64 = 144_800_000;
 /// registered and at least 2 s in the ring. Played in real time, so the
 /// first 2 s are still in the ring for several `classify` calls.
 async fn node_over(dir: &std::path::Path, iq: &[Complex<f32>]) -> Node {
+    node_over_with(dir, iq, None).await
+}
+
+/// [`node_over`] with the operator rows in `modes_dir`.
+async fn node_over_with(
+    dir: &std::path::Path,
+    iq: &[Complex<f32>],
+    modes_dir: Option<std::path::PathBuf>,
+) -> Node {
     let meta = write_fixture(dir, "fixture", iq, 48_000, CENTER);
     let opts = FileOpts {
         realtime: true,
@@ -40,7 +49,7 @@ async fn node_over(dir: &std::path::Path, iq: &[Complex<f32>]) -> Node {
         backends: vec![Backend::Cpu],
         resume: true,
         bank_factory: None,
-        modes_dir: None,
+        modes_dir,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     for c in zeta_dsp::classifiers(node.modes()) {
@@ -152,9 +161,11 @@ async fn program_rows_are_skipped_quick() {
     let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
     let node = node_over(dir.path(), &iq).await;
     let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
-    let adsb = outcome(&c, "adsb_decode");
-    assert!(
-        matches!(adsb, Some(Outcome::SkippedQuick | Outcome::SkippedBand)),
+    // The sonde rows (program rows, 12.5 kHz FSK/FM) score among the best five on an FM
+    // box; a program row has no quick attempt.
+    assert_eq!(
+        outcome(&c, "rs41_decode"),
+        Some(Outcome::SkippedQuick),
         "{c:?}"
     );
 }
@@ -163,7 +174,19 @@ async fn program_rows_are_skipped_quick() {
 async fn wide_rows_are_skipped_on_a_narrow_box() {
     let dir = tempfile::tempdir().unwrap();
     let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
-    let node = node_over(dir.path(), &iq).await;
+    // The sonde rows (12.5 kHz FSK/FM) outscore rds on this FM box and would push it out
+    // of the five tried: the operator rows here present them as no modulation.
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    for (file, text) in zeta_core::modes::ModeRegistry::embedded() {
+        let mut row: serde_json::Value = serde_json::from_str(text).unwrap();
+        if row["family"] == "weather_science" {
+            row["modulation"] = serde_json::json!([]);
+            let name = std::path::Path::new(&file).file_name().unwrap();
+            std::fs::write(modes.join(name), row.to_string()).unwrap();
+        }
+    }
+    let node = node_over_with(dir.path(), &iq, Some(modes)).await;
     let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
     assert_eq!(
         outcome(&c, "rds_decode"),

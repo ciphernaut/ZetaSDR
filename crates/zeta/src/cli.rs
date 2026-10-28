@@ -245,7 +245,7 @@ pub enum ModesCmd {
     Check {
         /// Only this mode (from `modes list`)
         id: Option<String>,
-        /// A mode whose program is missing fails instead of being skipped
+        /// A mode without a test, or whose program is missing, fails instead of being skipped
         #[arg(long)]
         strict: bool,
     },

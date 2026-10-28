@@ -10,9 +10,16 @@ use zeta_dsp::fixtures::{aprs_packet_iq, write_fixture};
 
 /// A path no dump1090 lives at: the adsb row is missing here whatever the host has.
 const NO_DUMP1090: &str = "/nonexistent/zeta-test/dump1090";
+/// The sonde rows' programs, pinned to a path none lives at, whatever the host has.
+const NO_SONDE: [(&str, &str); 3] = [
+    ("ZETA_HANDLER_RS41MOD", "/nonexistent/zeta-test/rs41mod"),
+    ("ZETA_HANDLER_DFM09MOD", "/nonexistent/zeta-test/dfm09mod"),
+    ("ZETA_HANDLER_M20MOD", "/nonexistent/zeta-test/m20mod"),
+];
 
 /// `zeta --state-dir <dir>/state --modes-dir <dir>/modes modes check <args>` with no
-/// remote node, no operator rows but the test's own, and dump1090 missing.
+/// remote node, no operator rows but the test's own, and dump1090 and the sonde decoders
+/// missing.
 fn check(dir: &Path, args: &[&str]) -> Command {
     let modes = dir.join("modes");
     std::fs::create_dir_all(&modes).unwrap();
@@ -21,6 +28,7 @@ fn check(dir: &Path, args: &[&str]) -> Command {
         .env_remove("ZETA_SECRET")
         .env("XDG_CONFIG_HOME", common::no_xdg_config())
         .env("ZETA_HANDLER_DUMP1090", NO_DUMP1090)
+        .envs(NO_SONDE)
         .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--modes-dir")
@@ -50,6 +58,13 @@ fn modes_check_passes_the_four_in_crate_rows() {
             .any(|l| l == "adsb_decode: skipped: dump1090 missing"),
         "{out}"
     );
+    // The sonde rows have no test yet.
+    for id in ["dfm_decode", "m20_decode", "rs41_decode"] {
+        assert!(
+            out.lines().any(|l| l == format!("{id}: skipped: no test")),
+            "{out}"
+        );
+    }
     assert_eq!(code, 0, "{out}");
 }
 
@@ -155,6 +170,10 @@ fn a_row_without_a_test_is_skipped() {
     let (out, code) = stdout(&mut check(dir.path(), &["aprs_untested"]));
     assert_eq!(out.trim(), "aprs_untested: skipped: no test", "{out}");
     assert_eq!(code, 0);
+    // `--strict` makes a skip a fail, a missing test as much as a missing program.
+    let (out, code) = stdout(&mut check(dir.path(), &["--strict", "rs41_decode"]));
+    assert_eq!(out.trim(), "rs41_decode: fail: no test", "{out}");
+    assert_eq!(code, 1);
 }
 
 #[test]

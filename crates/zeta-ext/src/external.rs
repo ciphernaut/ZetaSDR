@@ -15,8 +15,10 @@
 //! fifo row); spawn ([`crate::proc`]); feed the IQ
 //! frames resampled from the rate each frame carries to `input.rate_hz` and written as
 //! `input.format` (`cu8`, `cs8`, `cs16`, `cf32`, interleaved I/Q, little-endian) to stdin
-//! or the fifo; read output lines from stdout or the TCP port (connecting with retries
-//! for [`CONNECT_TIMEOUT`]); parse each with the row's parser ([`crate::parsers`]) and
+//! or the fifo, or for an `input.stream: audio` row the audio frames of its demod mixed
+//! to mono, resampled and written `s16` or `f32`; with `container: wav` one WAV header
+//! ([`wav_header`]) goes first, once per run; read output lines from stdout or the TCP
+//! port (connecting with retries for [`CONNECT_TIMEOUT`]); parse each with the row's parser ([`crate::parsers`]) and
 //! publish it in the row's envelope (`protocol`, `summary`, `t_ns` the latest input
 //! frame's start). A line the parser cannot read is counted in the job's context as
 //! `external.unparsed`, never fatal; a program that prints nothing is not an error.
@@ -44,8 +46,8 @@ use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zeta_core::modes::{
-    Decoder, InputVia, ModeRegistry, ModeRow, ModeState, OutputVia, Parser, ProgramBlock,
-    SampleFormat,
+    Container, Decoder, InputStream, InputVia, ModeRegistry, ModeRow, ModeState, OutputVia, Parser,
+    ProgramBlock, SampleFormat,
 };
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
@@ -66,6 +68,11 @@ const NOTE_EVERY: Duration = Duration::from_secs(1);
 /// How often opening the fifo is retried while the child has not opened it to read.
 const FIFO_RETRY: Duration = Duration::from_millis(20);
 
+/// The length of the header [`wav_header`] writes.
+pub const WAV_HEADER_LEN: usize = 44;
+/// The RIFF and data sizes of a WAV header on a stream of unknown length.
+pub const WAV_STREAM_SIZE: u32 = 0xFFFF_FFFF;
+
 /// The loaded mode registry, filled once after the registry is loaded.
 pub type ModesHandle = Arc<OnceLock<Arc<ModeRegistry>>>;
 
@@ -78,7 +85,8 @@ pub struct ExternalParams {
     pub mode: String,
 }
 
-/// IQ in, one event per parsed output line of the row's program out.
+/// IQ or audio in (as the row's `input.stream` says), one event per parsed output line
+/// of the row's program out.
 pub struct ExternalDecodeStage {
     spec: StageSpec,
     modes: ModesHandle,
@@ -100,7 +108,7 @@ impl ExternalDecodeStage {
         Self {
             spec: StageSpec {
                 kind: EXTERNAL_DECODE_KIND,
-                inputs: vec![StreamKind::Iq],
+                inputs: vec![StreamKind::Iq, StreamKind::Audio],
                 outputs: vec![StreamKind::Event],
                 params_schema: schemars::schema_for!(ExternalParams),
             },
@@ -240,6 +248,14 @@ pub async fn run_row(
             },
         }
     }
+    let header = match block.input.container {
+        Container::Raw => None,
+        Container::Wav => {
+            let rate = u32::try_from(block.input.rate_hz)
+                .map_err(|_| fail(format!("rate {} too high for wav", block.input.rate_hz)))?;
+            Some(wav_header(rate, block.input.format))
+        }
+    };
     let center_hz = match first.as_ref().map(|f| &f.payload) {
         Some(Payload::Iq(b)) => b.center_hz.0,
         _ => 0,
@@ -305,6 +321,8 @@ pub async fn run_row(
         id: id.to_string(),
         rate_hz: block.input.rate_hz,
         format: block.input.format,
+        stream: block.input.stream,
+        header,
         rx,
         first,
         sink,
@@ -673,6 +691,9 @@ struct Feed {
     id: String,
     rate_hz: u64,
     format: SampleFormat,
+    stream: InputStream,
+    /// The WAV header still to write before the first sample bytes (`container: wav`).
+    header: Option<[u8; WAV_HEADER_LEN]>,
     rx: broadcast::Receiver<Frame>,
     /// A frame already taken off `rx` (for `$center_hz`), fed first.
     first: Option<Frame>,
@@ -708,23 +729,52 @@ impl Feed {
                     }
                 },
             };
-            let Payload::Iq(block) = &frame.payload else {
-                return FeedEnd::Failed("expects iq frames".into());
+            let (out_rate, format) = (self.rate_hz, self.format);
+            let bytes = match (&frame.payload, self.stream) {
+                (Payload::Iq(b), InputStream::Iq) => {
+                    converter(&mut conv, b.sample_rate_hz.0, out_rate, format)
+                        .map(|c| c.convert(&b.samples))
+                }
+                (
+                    Payload::Audio {
+                        sample_rate_hz,
+                        channels,
+                        samples,
+                    },
+                    InputStream::Audio,
+                ) => converter(&mut conv, sample_rate_hz.0, out_rate, format)
+                    .map(|c| c.convert_audio(samples, *channels)),
+                (_, InputStream::Iq) => Err("expects iq frames".into()),
+                (_, InputStream::Audio) => Err("expects audio frames".into()),
+            };
+            let bytes = match bytes {
+                Ok(b) => b,
+                Err(e) => return FeedEnd::Failed(e),
             };
             *lock(&self.last_prov) = Some(frame.provenance.clone());
-            let rate = block.sample_rate_hz.0;
-            let c = match &mut conv {
-                Some(c) if c.in_rate_hz == rate => c,
-                _ => match Converter::new(rate, self.rate_hz, self.format) {
-                    Ok(c) => conv.insert(c),
-                    Err(e) => return FeedEnd::Failed(e),
-                },
-            };
-            let bytes = c.convert(&block.samples);
+            if let Some(h) = self.header.take()
+                && w.write_all(&h).await.is_err()
+            {
+                return FeedEnd::WriterClosed;
+            }
             if w.write_all(&bytes).await.is_err() {
                 return FeedEnd::WriterClosed;
             }
         }
+    }
+}
+
+/// The converter for frames at `in_rate_hz`: `conv` when it already converts that rate,
+/// else a fresh one (a rate change starts fresh resamplers).
+fn converter(
+    conv: &mut Option<Converter>,
+    in_rate_hz: u64,
+    out_rate_hz: u64,
+    format: SampleFormat,
+) -> Result<&mut Converter, String> {
+    match conv.take() {
+        Some(c) if c.in_rate_hz == in_rate_hz => Ok(conv.insert(c)),
+        _ => Ok(conv.insert(Converter::new(in_rate_hz, out_rate_hz, format)?)),
     }
 }
 
@@ -763,24 +813,64 @@ async fn open_fifo(_path: &Path) -> io::Result<tokio::io::Sink> {
     ))
 }
 
-/// Per-rate conversion to the program's rate and sample format: one resampler for I,
-/// one for Q, none when the rates match.
+/// A RIFF/WAVE header for a stream of `format` samples at `rate_hz` whose length is not
+/// known: RIFF and data sizes [`WAV_STREAM_SIZE`], format tag 3 (IEEE float) for `f32`
+/// and `cf32`, else 1 (PCM), 2 channels for an IQ format, else 1. A row pairs `wav` with
+/// `s16`, `f32`, `cs16` or `cf32` only.
+pub fn wav_header(rate_hz: u32, format: SampleFormat) -> [u8; WAV_HEADER_LEN] {
+    use SampleFormat::{Cf32, Cs8, Cs16, Cu8, F32, S16};
+    let (tag, bits): (u16, u16) = match format {
+        F32 | Cf32 => (3, 32),
+        S16 | Cs16 => (1, 16),
+        Cu8 | Cs8 => (1, 8),
+    };
+    let channels: u16 = if format.is_iq() { 2 } else { 1 };
+    let align = channels * bits / 8;
+    let mut h = [0u8; WAV_HEADER_LEN];
+    let fields: [&[u8]; 13] = [
+        b"RIFF",
+        &WAV_STREAM_SIZE.to_le_bytes(),
+        b"WAVE",
+        b"fmt ",
+        &16u32.to_le_bytes(),
+        &tag.to_le_bytes(),
+        &channels.to_le_bytes(),
+        &rate_hz.to_le_bytes(),
+        &rate_hz.saturating_mul(u32::from(align)).to_le_bytes(),
+        &align.to_le_bytes(),
+        &bits.to_le_bytes(),
+        b"data",
+        &WAV_STREAM_SIZE.to_le_bytes(),
+    ];
+    let mut at = 0;
+    for f in fields {
+        h[at..at + f.len()].copy_from_slice(f);
+        at += f.len();
+    }
+    h
+}
+
+/// Per-rate conversion to the program's rate and sample format: one resampler per
+/// channel written (I and Q for an IQ format, one for audio), none when the rates match.
 pub struct Converter {
     in_rate_hz: u64,
     format: SampleFormat,
-    resample: Option<(Resampler, Resampler)>,
+    resample: Vec<Resampler>,
 }
 
 impl Converter {
-    /// Frames at `in_rate_hz` to `out_rate_hz` as `format`.
+    /// Frames at `in_rate_hz` to `out_rate_hz` as `format`, IQ (`cu8`, `cs8`, `cs16`,
+    /// `cf32`, through [`Self::convert`]) or audio (`s16`, `f32`, through
+    /// [`Self::convert_audio`]).
     pub fn new(in_rate_hz: u64, out_rate_hz: u64, format: SampleFormat) -> Result<Self, String> {
-        let resample = match in_rate_hz == out_rate_hz {
-            true => None,
-            false => Some((
-                Resampler::new(in_rate_hz, out_rate_hz)?,
-                Resampler::new(in_rate_hz, out_rate_hz)?,
-            )),
+        let n = match (in_rate_hz == out_rate_hz, format.is_iq()) {
+            (true, _) => 0,
+            (false, true) => 2,
+            (false, false) => 1,
         };
+        let resample = (0..n)
+            .map(|_| Resampler::new(in_rate_hz, out_rate_hz))
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             in_rate_hz,
             format,
@@ -792,16 +882,33 @@ impl Converter {
     /// `(x + 1) * 127.5`, `cs8` as `x * 127`, `cs16` as `x * 32 767` (each rounded and
     /// clamped), `cf32` as is.
     pub fn convert(&mut self, samples: &[Complex<f32>]) -> Vec<u8> {
-        let (re, im): (Vec<f32>, Vec<f32>) = match &mut self.resample {
-            None => samples.iter().map(|s| (s.re, s.im)).unzip(),
-            Some((ri, rq)) => {
-                let re: Vec<f32> = samples.iter().map(|s| s.re).collect();
-                let im: Vec<f32> = samples.iter().map(|s| s.im).collect();
-                (ri.process(&re), rq.process(&im))
-            }
+        let (mut re, mut im): (Vec<f32>, Vec<f32>) = samples.iter().map(|s| (s.re, s.im)).unzip();
+        if let [ri, rq] = self.resample.as_mut_slice() {
+            (re, im) = (ri.process(&re), rq.process(&im));
+        }
+        self.write(re.iter().zip(&im).flat_map(|(&i, &q)| [i, q]))
+    }
+
+    /// Interleaved audio of `channels` channels mixed to mono (their mean), resampled
+    /// and written as `s16` (`x * 32 767`, rounded and clamped) or `f32`, little-endian.
+    pub fn convert_audio(&mut self, samples: &[f32], channels: u16) -> Vec<u8> {
+        let n = usize::from(channels.max(1));
+        let mut mono: Vec<f32> = match n {
+            1 => samples.to_vec(),
+            _ => samples
+                .chunks_exact(n)
+                .map(|f| f.iter().sum::<f32>() / n as f32)
+                .collect(),
         };
-        let mut out = Vec::with_capacity(re.len() * 8);
-        for x in re.iter().zip(&im).flat_map(|(&i, &q)| [i, q]) {
+        if let [r] = self.resample.as_mut_slice() {
+            mono = r.process(&mono);
+        }
+        self.write(mono)
+    }
+
+    fn write(&self, values: impl IntoIterator<Item = f32>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for x in values {
             match self.format {
                 SampleFormat::Cu8 => out.push(((x + 1.0) * 127.5).round().clamp(0.0, 255.0) as u8),
                 SampleFormat::Cs8 => out.push((x * 127.0).round().clamp(-128.0, 127.0) as i8 as u8),
@@ -852,6 +959,49 @@ mod tests {
             .sum();
         // 21 330 samples at 2.56 MHz are 19 997 at 2.4 MHz, 4 bytes each.
         assert!((n / 4).abs_diff(19_997) <= 1, "{n}");
+    }
+
+    #[test]
+    fn audio_is_mixed_to_mono_and_resampled() {
+        let mut c = Converter::new(48_000, 48_000, SampleFormat::S16).unwrap();
+        let v: Vec<i16> = c
+            .convert_audio(&[0.5, -0.5, 1.0, 0.0], 2)
+            .chunks(2)
+            .map(|p| i16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        assert_eq!(v, [0, 16_384]);
+        let mut c = Converter::new(24_000, 48_000, SampleFormat::F32).unwrap();
+        let n: usize = (0..10).map(|_| c.convert_audio(&[0.1; 480], 1).len()).sum();
+        // 4 800 samples at 24 kHz are 9 600 at 48 kHz, 4 bytes each.
+        assert!((n / 4).abs_diff(9_600) <= 2, "{n}");
+    }
+
+    #[test]
+    fn wav_headers_name_rate_bits_and_channels() {
+        let u16_at = |h: &[u8], i: usize| u16::from_le_bytes([h[i], h[i + 1]]);
+        let u32_at = |h: &[u8], i: usize| u32::from_le_bytes([h[i], h[i + 1], h[i + 2], h[i + 3]]);
+        let h = wav_header(48_000, SampleFormat::S16);
+        assert_eq!(&h[0..4], b"RIFF");
+        assert_eq!(u32_at(&h, 4), WAV_STREAM_SIZE);
+        assert_eq!(&h[8..16], b"WAVEfmt ");
+        assert_eq!(u32_at(&h, 16), 16);
+        assert_eq!(
+            [
+                u16_at(&h, 20),
+                u16_at(&h, 22),
+                u16_at(&h, 32),
+                u16_at(&h, 34)
+            ],
+            [1, 1, 2, 16]
+        );
+        assert_eq!([u32_at(&h, 24), u32_at(&h, 28)], [48_000, 96_000]);
+        assert_eq!(&h[36..40], b"data");
+        assert_eq!(u32_at(&h, 40), WAV_STREAM_SIZE);
+        let h = wav_header(48_000, SampleFormat::F32);
+        assert_eq!([u16_at(&h, 20), u16_at(&h, 22), u16_at(&h, 34)], [3, 1, 32]);
+        let h = wav_header(2_400_000, SampleFormat::Cs16);
+        assert_eq!([u16_at(&h, 20), u16_at(&h, 22), u16_at(&h, 32)], [1, 2, 4]);
+        assert_eq!(u32_at(&h, 28), 9_600_000);
     }
 
     #[test]

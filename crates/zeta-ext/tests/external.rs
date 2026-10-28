@@ -78,6 +78,17 @@ fn json_row(id: &str, format: &str, via: &str, args: &[&str]) -> Value {
     )
 }
 
+/// `json_row` reading s16 audio at 48 kHz through an NBFM demod, under `container`.
+fn audio_row(id: &str, container: &str) -> Value {
+    let mut r = json_row(id, "s16", "stdin", &[]);
+    r["decoder"]["input"] = json!({
+        "stream": "audio", "format": "s16", "rate_hz": 48_000, "via": "stdin",
+        "container": container
+    });
+    r["decoder"]["demod"] = json!({"kind": "nbfm", "deviation_hz": 5000, "audio_rate_hz": 48_000});
+    r
+}
+
 /// The registry of the rows in a temp operator dir, validated against stages that
 /// include `external_decode`; every test row must load ready.
 fn registry(rows: &[Value]) -> ModeRegistry {
@@ -121,6 +132,18 @@ fn iq_frame(iq: &[Complex<f32>], rate_hz: u64) -> Frame {
             center_hz: Hz(144_800_000),
             samples: iq.to_vec().into(),
         }),
+    )
+}
+
+fn audio_frame(n: usize, rate_hz: u64) -> Frame {
+    Frame::new(
+        StreamId::new(),
+        prov(),
+        Payload::Audio {
+            sample_rate_hz: Hz(rate_hz),
+            channels: 1,
+            samples: vec![0.25f32; n].into(),
+        },
     )
 }
 
@@ -434,12 +457,103 @@ async fn an_unavailable_row_fails_naming_the_handler_and_suggestion() {
     }
 }
 
+/// An audio row hears 48 kHz audio frames under one WAV header: the fake reads the
+/// header (its first line names what it said), then the samples.
+#[tokio::test]
+async fn an_audio_row_feeds_wav_to_the_program() {
+    let reg = registry(&[audio_row("fake_wav", "wav")]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_WAV", "1"),
+        ("FAKE_LINES", r#"{"text":"sonde","n":{bytes}}"#),
+        ("FAKE_AFTER_BYTES", "1920"),
+    ]);
+    let mut r = start(stage, "fake_wav");
+    for _ in 0..2 {
+        r.tx.send(audio_frame(480, 48_000)).unwrap();
+    }
+    let v = next_event(&mut r.rx_out, 10).await.expect("the wav line");
+    assert_eq!(
+        v["wav"],
+        json!({"rate_hz": 48_000, "bits": 16, "channels": 1}),
+        "{v}"
+    );
+    let v = next_event(&mut r.rx_out, 10).await.expect("the fake line");
+    assert_eq!(v["protocol"], "fake_wav", "{v}");
+    assert_eq!(v["summary"], "sonde #1920", "{v}");
+    assert_eq!(v["t_ns"], 5, "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+/// A rate change restarts the converter, never the header: the fake exits 3 on a second
+/// `RIFF`, which would fail the stage.
+#[tokio::test]
+async fn a_wav_header_is_written_once_per_run() {
+    let reg = registry(&[audio_row("fake_wav", "wav")]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_WAV", "1"),
+        ("FAKE_LINES", r#"{"text":"done","n":{bytes}}"#),
+        ("FAKE_AFTER_BYTES", "2000"),
+    ]);
+    let mut r = start(stage, "fake_wav");
+    r.tx.send(audio_frame(480, 48_000)).unwrap();
+    r.tx.send(audio_frame(480, 24_000)).unwrap();
+    r.tx.send(audio_frame(480, 48_000)).unwrap();
+    let v = next_event(&mut r.rx_out, 10).await.expect("the wav line");
+    assert_eq!(v["wav"]["rate_hz"], 48_000, "{v}");
+    // More than the first frame's 960 bytes arrived: the samples after the restart too.
+    let v = next_event(&mut r.rx_out, 10).await.expect("the fake line");
+    assert_eq!(v["text"], "done", "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+/// `container: raw` writes bare samples: a program wanting a header refuses them.
+#[tokio::test]
+async fn raw_audio_has_no_header() {
+    let reg = registry(&[audio_row("fake_raw", "raw")]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([("FAKE_WAV", "1")]);
+    let r = start(stage, "fake_raw");
+    for _ in 0..2 {
+        r.tx.send(audio_frame(480, 48_000)).unwrap();
+    }
+    match result_within(r.handle, 30).await {
+        Err(StageError::Failed(m)) => {
+            assert!(m.starts_with("fake_raw: "), "{m}");
+            assert!(m.contains("fake_lines exited with 3"), "{m}");
+            assert!(m.contains("error: wav header"), "{m}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    drop(r.tx);
+}
+
+/// A row's frames must be the stream its input names.
+#[tokio::test]
+async fn frames_of_the_other_stream_fail_the_stage() {
+    let reg = registry(&[audio_row("fake_wav", "wav")]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([("FAKE_WAV", "1")]);
+    let r = start(stage, "fake_wav");
+    send(&r.tx, 1, 480, 48_000);
+    match result_within(r.handle, 30).await {
+        Err(StageError::Failed(m)) => assert_eq!(m, "fake_wav: expects audio frames"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let reg = registry(&[json_row("fake_json", "cs16", "stdin", &[])]);
+    let r = start(ExternalDecodeStage::new(Arc::new(reg)), "fake_json");
+    r.tx.send(audio_frame(480, 48_000)).unwrap();
+    match result_within(r.handle, 30).await {
+        Err(StageError::Failed(m)) => assert_eq!(m, "fake_json: expects iq frames"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
 #[test]
 fn params_take_the_mode_only() {
     let stage = ExternalDecodeStage::deferred(ModesHandle::default());
     let s = &stage.spec().params_schema;
     assert_eq!(stage.spec().kind, "external_decode");
-    assert_eq!(stage.spec().inputs, [StreamKind::Iq]);
+    assert_eq!(stage.spec().inputs, [StreamKind::Iq, StreamKind::Audio]);
     assert_eq!(stage.spec().outputs, [StreamKind::Event]);
     assert_eq!(s.get("additionalProperties"), Some(&json!(false)), "{s:?}");
     assert_eq!(s.get("required"), Some(&json!(["mode"])), "{s:?}");
