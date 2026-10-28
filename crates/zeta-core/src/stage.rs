@@ -120,6 +120,12 @@ pub trait Stage: Send + Sync {
     fn outputs_for(&self, _params: &serde_json::Value) -> Vec<StreamKind> {
         self.spec().outputs.clone()
     }
+    /// Check `params` (already valid against `spec().params_schema`) for what the schema
+    /// cannot say, so a bad node is refused when the graph is validated instead of
+    /// failing its job at run time; the error names the field. By default nothing more.
+    fn check_params(&self, _params: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
     /// Run until the inputs close or `cancel` fires.
     ///
     /// Cancellation returns `Err(StageError::Cancelled)`; the runtime treats it as a clean
@@ -155,6 +161,15 @@ impl StageRegistry {
             .iter()
             .map(|s| s.spec())
             .find(|s| s.kind == kind)
+    }
+
+    /// [`Stage::check_params`] of the first implementation registered for `kind` (`Ok` for
+    /// an unknown kind).
+    pub fn check_params(&self, kind: &str, params: &serde_json::Value) -> Result<(), String> {
+        self.stages
+            .iter()
+            .find(|s| s.spec().kind == kind)
+            .map_or(Ok(()), |s| s.check_params(params))
     }
 
     /// Every registered stage kind, sorted, each once.

@@ -107,6 +107,7 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
         if let Some(e) = validator.iter_errors(&n.params).next() {
             return Err(bad(e.to_string()));
         }
+        registry.check_params(&n.kind, &n.params).map_err(bad)?;
     }
     let find = |id: &NodeId| graph.nodes.iter().find(|n| &n.id == id);
     let mut ends = Vec::with_capacity(graph.edges.len());

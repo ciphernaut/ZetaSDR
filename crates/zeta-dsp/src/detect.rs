@@ -46,6 +46,23 @@ pub struct DetectParams {
     pub sondehub: Option<serde_json::Value>,
 }
 
+impl DetectParams {
+    /// What the schema cannot say: `threshold_db` finite, `edge_mask` in `0..0.5`,
+    /// `width_hz` ordered `[min, max]`. The error names the field.
+    pub fn check(&self) -> Result<(), String> {
+        if !self.threshold_db.is_finite() {
+            return Err("threshold_db must be finite".into());
+        }
+        if !(0.0..0.5).contains(&self.edge_mask) {
+            return Err("edge_mask must be in 0..0.5".into());
+        }
+        if self.width_hz[0] > self.width_hz[1] {
+            return Err("width_hz must be [min, max]".into());
+        }
+        Ok(())
+    }
+}
+
 /// Where a `watch` keeps a decoder it proved (see [`DetectParams::decode_on`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -381,6 +398,12 @@ impl Stage for DetectStage {
         Backend::Cpu
     }
 
+    fn check_params(&self, params: &serde_json::Value) -> Result<(), String> {
+        serde_json::from_value::<DetectParams>(params.clone())
+            .map_err(|e| e.to_string())?
+            .check()
+    }
+
     async fn run(
         &self,
         params: serde_json::Value,
@@ -392,21 +415,8 @@ impl Stage for DetectStage {
     ) -> Result<(), StageError> {
         let p: DetectParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("detect params: {e}")))?;
-        if !p.threshold_db.is_finite() {
-            return Err(StageError::Failed(
-                "detect params: threshold_db must be finite".into(),
-            ));
-        }
-        if !(0.0..0.5).contains(&p.edge_mask) {
-            return Err(StageError::Failed(
-                "detect params: edge_mask must be in 0..0.5".into(),
-            ));
-        }
-        if p.width_hz[0] > p.width_hz[1] {
-            return Err(StageError::Failed(
-                "detect params: width_hz must be [min, max]".into(),
-            ));
-        }
+        p.check()
+            .map_err(|e| StageError::Failed(format!("detect params: {e}")))?;
         let Some(out) = outputs.first().cloned() else {
             return Err(StageError::Failed("expected 1 output".into()));
         };

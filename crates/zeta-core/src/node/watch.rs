@@ -4,7 +4,8 @@
 //! leaves the decoder running (inside the capture, or moved to a free source under
 //! `decode_on: free`); the watch then owns it: it is listed in `job_context.watch`
 //! (`signals`, `decoding`, `current`), stopped once its signal has gone and it has been
-//! silent for [`SILENCE_MS`] (`lost`), and stopped with the watch on a `job_stop`. A
+//! silent for [`SILENCE_MS`] (`lost`), and stopped with the watch on a `job_stop`, a
+//! `replace` or a failure (a stage's, the loop's, a panic of the loop included). A
 //! `graph_put` restart or a node restart re-adopts the decoders from the persisted
 //! context instead: those whose job no longer runs are dropped, those whose signal does
 //! not reappear within the detector's `gone_ms` are stopped. An unknown signal is tried
@@ -68,6 +69,47 @@ fn retry_ms() -> u64 {
         }
     }
     RETRY_MS
+}
+
+/// Tests only: the watch event state after whose publication the next watch fails, and
+/// whether by a panic of its loop (else the loop ends `Failed` at its next tick).
+#[cfg(feature = "test-fixtures")]
+static TEST_FAULT: std::sync::Mutex<Option<(String, bool)>> = std::sync::Mutex::new(None);
+#[cfg(feature = "test-fixtures")]
+static TEST_FAIL_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tests only: make the first watch that publishes an event in `state` from now on fail
+/// right after it: its loop panics when `panic`, else it ends with the error
+/// `watch: test failure` at its next tick.
+#[cfg(feature = "test-fixtures")]
+pub fn test_fault_after(state: &str, panic: bool) {
+    *TEST_FAULT.lock().unwrap() = Some((state.to_string(), panic));
+}
+
+#[cfg(feature = "test-fixtures")]
+fn test_fault_at(state: &str) {
+    let hit = {
+        let mut f = TEST_FAULT.lock().unwrap();
+        match f.as_ref() {
+            Some((s, _)) if s == state => f.take(),
+            _ => None,
+        }
+    };
+    match hit {
+        Some((_, true)) => panic!("watch: test panic after {state}"),
+        Some((_, false)) => TEST_FAIL_NOW.store(true, std::sync::atomic::Ordering::SeqCst),
+        None => {}
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn test_fail_now() -> bool {
+    TEST_FAIL_NOW.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(feature = "test-fixtures"))]
+fn test_fail_now() -> bool {
+    false
 }
 
 fn silence_ms() -> u64 {
@@ -278,6 +320,73 @@ struct State {
     current: Option<(JobId, u64)>,
     /// The decoders' event streams, by job.
     subs: HashMap<JobId, Vec<Receiver<Frame>>>,
+    /// A proved decoder while it is placed: neither `current` nor in `decoding` yet.
+    pending: Option<JobId>,
+    /// Set until [`watch_loop`]'s exit path has run: any other end of the state (a panic
+    /// unwinding the loop) tears down what it started from a task the drop spawns.
+    guard: Option<Guard>,
+}
+
+/// What [`State`]'s drop needs to tear down without the loop.
+struct Guard {
+    inner: Arc<Inner>,
+    port: Arc<dyn Port>,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        let Some(Guard { inner, port }) = self.guard.take() else {
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let current = self.current.take().map(|(j, _)| j);
+        let pending = self.pending.take();
+        let decoders = std::mem::take(&mut self.decoding)
+            .into_iter()
+            .map(|d| (d.job, d.source))
+            .collect();
+        rt.spawn(async move {
+            let source = port.id().clone();
+            release(&inner, &source, current, pending, decoders).await;
+            inner.leases.idle_if_unheld(port.as_ref()).await;
+        });
+    }
+}
+
+/// Stop what a run of the watch on `source` started: the identify run `current` (and the
+/// decoder a proof it landed left, never adopted), a proved decoder being placed, and
+/// `decoders`. Gated on `source` (the watch's lease is held meanwhile, so there is
+/// nothing to idle, and a `replace` holding the gate never waits on it), plainly on
+/// another source.
+async fn release(
+    inner: &Arc<Inner>,
+    source: &SourceId,
+    current: Option<JobId>,
+    pending: Option<JobId>,
+    decoders: Vec<(JobId, SourceId)>,
+) {
+    if let Some(id) = current {
+        let _ = inner.stop_gated(&id).await;
+        let verdict = inner.verdicts.lock().unwrap().remove(&id);
+        if let Some(job) = verdict
+            .as_ref()
+            .and_then(|v| v["verdict"]["job"].as_str())
+            .map(|s| JobId(s.into()))
+        {
+            let _ = inner.stop_gated(&job).await;
+        }
+    }
+    if let Some(job) = pending {
+        let _ = inner.stop_gated(&job).await;
+    }
+    for (job, on) in decoders {
+        let _ = match on == *source {
+            true => inner.stop_gated(&job).await,
+            false => inner.stop(&job).await,
+        };
+    }
 }
 
 impl State {
@@ -331,6 +440,8 @@ impl Inner {
         };
         self.bus
             .publish(Frame::new(r.out.clone(), prov, Payload::Event(payload)));
+        #[cfg(feature = "test-fixtures")]
+        test_fault_at(state);
     }
 
     /// Whether `id` has a running record in this node.
@@ -624,18 +735,14 @@ impl Inner {
             .collect()
     }
 
-    /// Whether the watch's run ends for good (a `job_stop` or a `replace`), so it stops
-    /// what it started, rather than for a `graph_put` restart or the node's shutdown,
-    /// after which a run re-adopts it.
-    fn watch_torn_down(&self, id: &JobId) -> bool {
-        if self.shutdown.is_cancelled() {
-            return false;
-        }
+    /// Whether the watch's run is ending for a `graph_put` restart (set before its stop),
+    /// after which the next run re-adopts its decoders.
+    fn restarting(&self, id: &JobId) -> bool {
         self.jobs
             .lock()
             .unwrap()
             .get(id)
-            .is_some_and(|e| e.record.state != JobState::Running && !e.restarting)
+            .is_some_and(|e| e.restarting)
     }
 }
 
@@ -651,28 +758,33 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
         decoding: Vec::new(),
         current: None,
         subs: HashMap::new(),
+        pending: None,
+        guard: Some(Guard {
+            inner: inner.clone(),
+            port: r.port.clone(),
+        }),
     };
     let result = run(&inner, &mut r, &mut w).await;
-    // The identify in progress never outlives this run, but at the node's shutdown (its
-    // record resumes, and the next run stops it as stale).
-    if !inner.shutdown.is_cancelled()
-        && let Some((id, _)) = w.current.take()
-    {
-        let _ = inner.stop_gated(&id).await;
-        // A proof the loop had not taken yet: its decoder was never adopted.
-        let verdict = inner.verdicts.lock().unwrap().remove(&id);
-        if let Some(job) = verdict
-            .as_ref()
-            .and_then(|v| v["verdict"]["job"].as_str())
-            .map(|s| JobId(s.into()))
-        {
-            let _ = inner.stop_gated(&job).await;
-        }
-    }
-    if inner.watch_torn_down(&r.id) {
-        for d in std::mem::take(&mut w.decoding) {
-            inner.stop_started(&r, &d.job, &d.source).await;
-        }
+    w.guard = None;
+    // At the node's shutdown everything is left as it is: the records resume, the next
+    // run re-adopts the decoders and stops the identify run as stale. A `graph_put`
+    // restart keeps the decoders for the next run. Any other end (`job_stop`, a
+    // `replace`, a failure of the loop or of a stage) tears down all the run started.
+    let shutdown = inner.shutdown.is_cancelled();
+    let teardown = !shutdown && !inner.restarting(&r.id);
+    let (current, pending) = match shutdown {
+        true => (None, None),
+        false => (w.current.take().map(|(j, _)| j), w.pending.take()),
+    };
+    let decoders = match teardown {
+        true => std::mem::take(&mut w.decoding)
+            .into_iter()
+            .map(|d| (d.job, d.source))
+            .collect(),
+        false => Vec::new(),
+    };
+    release(&inner, &r.prov.source, current, pending, decoders).await;
+    if teardown {
         w.signals.clear();
     }
     inner.watch_save(&r, &w);
@@ -709,6 +821,9 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
         tokio::select! {
             _ = r.cancel.cancelled() => return cancelled(),
             _ = tokio::time::sleep(POLL) => {}
+        }
+        if test_fail_now() {
+            return Err(StageError::Failed("watch: test failure".into()));
         }
         if let Some(f) = r.port.fault() {
             return Err(StageError::Failed(format!("source {}: {f}", r.port.id().0)));
@@ -852,6 +967,8 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         && inner.runs(&job)
     {
         let signal = w.signals[i].signal.clone();
+        // Neither `current` nor kept while it is placed: the guard stops it on a panic.
+        w.pending = Some(job.clone());
         let (job, source, placed, why) = inner.place_decoder(r, &mode, &signal, &job).await;
         inner.disown(&job);
         w.signals[i].handled = true;
@@ -868,6 +985,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             gone_since_ns: None,
             confirm_by_ns: None,
         });
+        w.pending = None;
         let mut summary = format!(
             "decoding {mode} at {} on {} ({})",
             signal.mhz(),

@@ -891,3 +891,125 @@ async fn watch_is_neither_elastic_nor_attachable() {
     assert!(e.to_string().contains("watch is not attachable"), "{e}");
     assert!(node.job_list().is_empty());
 }
+
+/// The records a watch owns that are listed.
+fn owned(node: &Node, watch: &JobId) -> Vec<zeta_core::job::JobRecord> {
+    node.job_list()
+        .into_iter()
+        .filter(|r| r.owner.as_ref() == Some(watch))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_the_loop_leaves_no_owned_job_and_no_lease() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    zeta_core::node::watch::test_fault_after("identifying", true);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    until("the watch fails", Duration::from_secs(30), || {
+        matches!(state(&node, &watch), Some(JobState::Failed { .. }))
+    })
+    .await;
+    let reason = match state(&node, &watch) {
+        Some(JobState::Failed { reason }) => reason,
+        s => panic!("{s:?}"),
+    };
+    assert!(reason.contains("panic"), "{reason}");
+    until("nothing runs", Duration::from_secs(15), || {
+        running(&node).is_empty()
+    })
+    .await;
+    until("no lease", Duration::from_secs(5), || {
+        node.lease_holders(&rx()).is_empty()
+    })
+    .await;
+    // Past the identify run's dwell: nothing it would have proved is left running.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    assert!(node.lease_holders(&rx()).is_empty());
+    assert!(
+        owned(&node, &watch).is_empty(),
+        "{:#?}",
+        owned(&node, &watch)
+    );
+    zeta_core::node::watch::test_fault_after("", false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_watch_tears_down_its_decoders() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    zeta_core::node::watch::test_fault_after("decoding", false);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    until("a decoding event", Duration::from_secs(40), || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    let job = JobId(events.watch("decoding")[0]["job"].as_str().unwrap().into());
+    until("the watch fails", Duration::from_secs(10), || {
+        matches!(state(&node, &watch), Some(JobState::Failed { .. }))
+    })
+    .await;
+    assert_eq!(
+        state(&node, &watch),
+        Some(JobState::Failed {
+            reason: "watch: test failure".into()
+        })
+    );
+    until("the decoder stops", Duration::from_secs(10), || {
+        state(&node, &job) == Some(JobState::Stopped)
+    })
+    .await;
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    until("no lease", Duration::from_secs(5), || {
+        node.lease_holders(&rx()).is_empty()
+    })
+    .await;
+    assert!(decoding(&node, &watch).is_empty());
+    zeta_core::node::watch::test_fault_after("", false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_put_with_bad_detect_params_is_refused() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let stream = node.job_outputs(&watch);
+    let graph = match node.apply(Op::GraphGet { job: watch.clone() }).await {
+        Ok(OpResult::Graph(g)) => g,
+        r => panic!("graph_get: {r:?}"),
+    };
+    for (key, value) in [
+        ("edge_mask", serde_json::json!(0.6)),
+        ("width_hz", serde_json::json!([30000, 5000])),
+    ] {
+        let mut bad = graph.clone();
+        let detect = bad.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+        detect.params[key] = value;
+        let op = Op::GraphPut {
+            job: watch.clone(),
+            graph: bad,
+        };
+        let e = node.apply(op).await.unwrap_err();
+        assert!(e.to_string().contains(key), "{key}: {e}");
+    }
+    // Nothing restarted: the same run, its graph and its decoder.
+    assert_eq!(node.job_outputs(&watch), stream);
+    assert_eq!(record(&node, &watch).unwrap().graph, graph);
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    assert_eq!(decoding(&node, &watch)[0]["job"], job.0.as_str());
+    stop_all(&node).await;
+}
