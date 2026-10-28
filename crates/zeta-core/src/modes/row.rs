@@ -69,6 +69,26 @@ pub struct ModeRow {
     /// Free text the generated AGENTS.md carries for the mode; `null` for none.
     #[serde(default)]
     pub notes: Option<String>,
+    /// The event fields holding the fix, added to each event as `position`; `null` for
+    /// a mode whose events carry none.
+    #[serde(default)]
+    pub position: Option<PositionMap>,
+    /// The event field holding the event's own time, an ISO 8601 UTC time
+    /// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) that becomes `t_ns`; `null` for none.
+    #[serde(default)]
+    pub time: Option<String>,
+}
+
+/// Which event fields hold a fix: latitude and longitude in degrees, altitude in metres.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModePosition", transform = require_all)]
+pub struct PositionMap {
+    pub lat: String,
+    pub lon: String,
+    /// `null` for a mode whose events carry no altitude.
+    #[serde(default)]
+    pub alt_m: Option<String>,
 }
 
 /// The channel a mode's decoder expects.
@@ -83,6 +103,10 @@ pub struct Band {
     /// The narrowest `bandwidth_hz` a job may give the mode; `null` for no minimum.
     #[serde(default)]
     pub min_hz: Option<u64>,
+    /// The span `[lo, hi]` the mode is found anywhere in (radiosondes in 400-406 MHz);
+    /// `null` for none.
+    #[serde(default)]
+    pub range_hz: Option<[u64; 2]>,
 }
 
 impl Band {
@@ -133,7 +157,8 @@ pub struct Event {
     /// The event payload's JSON Schema; `properties` names every field.
     pub schema: serde_json::Value,
     /// `{field}` substituted, `{field?}` omitted with its separator when null,
-    /// `{a?b}` the first of `a`, `b` that is not null.
+    /// `{a?b}` the first of `a`, `b` that is not null; any of them may end in a number
+    /// format, `:.N` or `:+.N` (`N` 0-6 decimals, `{lat?:.4}`).
     pub summary: String,
 }
 
@@ -155,6 +180,9 @@ pub struct Identify {
     /// `acars`, `rds`); `null` for rows tried only by the `identify` job.
     #[serde(default)]
     pub quick: Option<String>,
+    /// Among rows of equal score, the higher priority is tried first (0 when absent).
+    #[serde(default)]
+    pub priority: i32,
 }
 
 /// What counts as proof: any event, or an event whose `identify.field` is true.
@@ -169,7 +197,7 @@ pub enum Proof {
 /// An external decoder program.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
 pub struct ProgramBlock {
     /// Names tried on `PATH` in order (or an absolute path), the first found used.
     pub programs: Vec<String>,
@@ -179,18 +207,49 @@ pub struct ProgramBlock {
     pub input: ProgramInput,
     pub output: ProgramOutput,
     pub install: Install,
+    /// The demodulator between the channel and an `input.stream: audio` program;
+    /// required for audio input, `null` for iq.
+    #[serde(default)]
+    pub demod: Option<Demod>,
+}
+
+/// The demodulator an audio program row's channel runs through.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeDemod")]
+pub enum Demod {
+    /// Narrowband FM (`nbfm_demod`, squelch off): peak deviation and audio rate.
+    Nbfm {
+        deviation_hz: u64,
+        audio_rate_hz: u64,
+    },
 }
 
 /// What the program reads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
 pub struct ProgramInput {
     pub stream: InputStream,
     pub format: SampleFormat,
     /// The rate the program expects; the channel node resamples to it.
     pub rate_hz: u64,
     pub via: InputVia,
+    /// `raw` samples (the default), or `wav`: a header first (PCM formats only).
+    #[serde(default)]
+    pub container: Container,
+}
+
+/// How the samples are framed on the program's input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "ProgramContainer")]
+pub enum Container {
+    /// Bare samples.
+    #[default]
+    Raw,
+    /// A WAV header, then the samples.
+    Wav,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -405,12 +464,31 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             ));
         }
     }
-    for name in summary_fields(&row.event.summary)? {
+    if let Some([lo, hi]) = row.band.range_hz
+        && lo >= hi
+    {
+        return Err(RowError::new(
+            "band.range_hz",
+            format!("[{lo}, {hi}] must be [lo, hi] with lo < hi"),
+        ));
+    }
+    // Every event field the row names: the summary's, the position map's, the time's.
+    let mut named: Vec<(String, String)> = summary_fields(&row.event.summary)?
+        .into_iter()
+        .map(|n| ("event.summary".to_string(), n))
+        .collect();
+    if let Some(p) = &row.position {
+        named.push(("position.lat".into(), p.lat.clone()));
+        named.push(("position.lon".into(), p.lon.clone()));
+        named.extend(p.alt_m.clone().map(|a| ("position.alt_m".into(), a)));
+    }
+    named.extend(row.time.clone().map(|t| ("time".into(), t)));
+    for (field, name) in named {
         if !properties.contains_key(&name) {
             let mut known: Vec<&str> = properties.keys().map(String::as_str).collect();
             known.sort_unstable();
             return Err(RowError::new(
-                "event.summary",
+                field,
                 format!(
                     "names {name:?}, which the event schema lacks (fields: {})",
                     known.join(", ")
@@ -465,7 +543,8 @@ fn declares_integer(schema: &serde_json::Value) -> bool {
 }
 
 /// The field names a summary template uses: every name inside `{...}`, the
-/// alternatives of `{a?b}` and the optional `{a?}` included.
+/// alternatives of `{a?b}` and the optional `{a?}` included, a number format
+/// (`:.N`, `:+.N`) stripped.
 fn summary_fields(summary: &str) -> Result<Vec<String>, RowError> {
     let bad = |e: &str| RowError::new("event.summary", e.to_string());
     let mut names = Vec::new();
@@ -476,7 +555,16 @@ fn summary_fields(summary: &str) -> Result<Vec<String>, RowError> {
             .find('}')
             .ok_or_else(|| bad("a `{` is never closed"))?;
         let inner = &after[..close];
-        let parts: Vec<&str> = inner.split('?').filter(|p| !p.is_empty()).collect();
+        let fields = match super::summary::split_format(inner) {
+            Some((fields, _)) => fields,
+            None if inner.contains(':') => {
+                return Err(bad(&format!(
+                    "`{{{inner}}}`: a number format is `:.N` or `:+.N` with N 0-6"
+                )));
+            }
+            None => inner,
+        };
+        let parts: Vec<&str> = fields.split('?').filter(|p| !p.is_empty()).collect();
         if parts.is_empty() || inner.contains('{') {
             return Err(bad(&format!("`{{{inner}}}` names no field")));
         }
@@ -556,13 +644,36 @@ fn validate_program(p: &ProgramBlock) -> Result<(), RowError> {
             "names no program (give at least one name or absolute path)",
         ));
     }
-    if p.input.stream == InputStream::Audio {
+    let audio = p.input.stream == InputStream::Audio;
+    match (audio, &p.demod) {
+        (true, None) => {
+            return Err(RowError::new("decoder.demod", "audio input needs a demod"));
+        }
+        (false, Some(_)) => {
+            return Err(RowError::new("decoder.demod", "an iq row takes no demod"));
+        }
+        _ => {}
+    }
+    use SampleFormat::{Cf32, Cs16, F32, S16};
+    if p.input.container == Container::Wav {
+        let (pcm, names) = match audio {
+            true => (matches!(p.input.format, S16 | F32), "s16 or f32"),
+            false => (matches!(p.input.format, Cs16 | Cf32), "cs16 or cf32"),
+        };
+        if !pcm {
+            return Err(RowError::new(
+                "decoder.input.container",
+                format!("wav carries PCM only: format {names}"),
+            ));
+        }
+    }
+    if audio && p.input.format.is_iq() {
         return Err(RowError::new(
-            "decoder.input.stream",
-            "audio input programs arrive in plan 17",
+            "decoder.input.format",
+            "an audio input takes s16 or f32",
         ));
     }
-    if !p.input.format.is_iq() {
+    if !audio && !p.input.format.is_iq() {
         return Err(RowError::new(
             "decoder.input.format",
             "an iq input takes cu8, cs8, cs16 or cf32",
@@ -699,10 +810,6 @@ mod tests {
             "identify.quick"
         );
         assert_eq!(
-            check(|v| v["decoder"]["input"]["stream"] = "audio".into()),
-            "decoder.input.stream"
-        );
-        assert_eq!(
             check(|v| v["decoder"]["args"][0] = "--freq=$freq_hz".into()),
             "decoder.args[0]"
         );
@@ -724,15 +831,160 @@ mod tests {
                 serde_json::json!({"type": "number"})),
             "event.schema.properties.delay_ms"
         );
-        let e = validate(
-            &parse(&edited(ADSB, |v| {
-                v["decoder"]["input"]["stream"] = "audio".into()
-            }))
-            .unwrap(),
-            &no_stages(),
-        )
-        .unwrap_err();
-        assert_eq!(e.error, "audio input programs arrive in plan 17");
+    }
+
+    /// `ADSB` as an audio program row: `s16` at 48 kHz, with `demod` when `demod` is set.
+    fn audio_row(demod: bool) -> String {
+        edited(ADSB, |v| {
+            let input = &mut v["decoder"]["input"];
+            input["stream"] = "audio".into();
+            input["format"] = "s16".into();
+            input["rate_hz"] = 48000.into();
+            if demod {
+                v["decoder"]["demod"] = serde_json::json!(
+                    {"kind": "nbfm", "deviation_hz": 5000, "audio_rate_hz": 48000}
+                );
+            }
+        })
+    }
+
+    #[test]
+    fn audio_row_needs_a_demod() {
+        let e = validate(&parse(&audio_row(false)).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("decoder.demod", "audio input needs a demod"),
+            "{e}"
+        );
+        let row = parse(&audio_row(true)).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        let Decoder::Program(p) = &row.decoder else {
+            panic!("a program row");
+        };
+        assert_eq!(
+            p.demod,
+            Some(Demod::Nbfm {
+                deviation_hz: 5000,
+                audio_rate_hz: 48000
+            })
+        );
+        assert_eq!(p.input.container, Container::Raw, "the default");
+        // An audio row's format is an audio one.
+        let text = edited(&audio_row(true), |v| {
+            v["decoder"]["input"]["format"] = "cs16".into()
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "decoder.input.format", "{e}");
+    }
+
+    #[test]
+    fn demod_on_an_iq_row_is_refused() {
+        let nbfm =
+            serde_json::json!({"kind": "nbfm", "deviation_hz": 5000, "audio_rate_hz": 48000});
+        let text = edited(ADSB, |v| v["decoder"]["demod"] = nbfm);
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("decoder.demod", "an iq row takes no demod"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn range_must_be_ordered() {
+        for range in [[406_000_000, 400_050_000], [400_000_000, 400_000_000]] {
+            let text = edited(ADSB, |v| v["band"]["range_hz"] = serde_json::json!(range));
+            let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+            assert_eq!(e.field, "band.range_hz", "{range:?}: {e}");
+            assert!(e.error.contains("[lo, hi] with lo < hi"), "{e}");
+        }
+        let text = edited(ADSB, |v| {
+            v["band"]["range_hz"] = serde_json::json!([400_050_000, 406_000_000])
+        });
+        let row = parse(&text).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        assert_eq!(row.band.range_hz, Some([400_050_000, 406_000_000]));
+    }
+
+    #[test]
+    fn position_names_schema_fields() {
+        let with = |position: serde_json::Value, time: serde_json::Value| {
+            edited(ADSB, |v| {
+                v["position"] = position;
+                v["time"] = time;
+            })
+        };
+        let row = parse(&with(
+            serde_json::json!({"lat": "lat", "lon": "lon", "alt_m": null}),
+            serde_json::Value::Null,
+        ))
+        .unwrap();
+        validate(&row, &no_stages()).unwrap();
+        assert_eq!(
+            row.position,
+            Some(PositionMap {
+                lat: "lat".into(),
+                lon: "lon".into(),
+                alt_m: None
+            })
+        );
+        for (position, field) in [
+            (
+                serde_json::json!({"lat": "latitude", "lon": "lon"}),
+                "position.lat",
+            ),
+            (
+                serde_json::json!({"lat": "lat", "lon": "longitude"}),
+                "position.lon",
+            ),
+            (
+                serde_json::json!({"lat": "lat", "lon": "lon", "alt_m": "alt"}),
+                "position.alt_m",
+            ),
+        ] {
+            let row = parse(&with(position, serde_json::Value::Null)).unwrap();
+            let e = validate(&row, &no_stages()).unwrap_err();
+            assert_eq!(e.field, field, "{e}");
+            assert!(e.error.contains("which the event schema lacks"), "{e}");
+        }
+        let row = parse(&with(serde_json::Value::Null, "datetime".into())).unwrap();
+        assert_eq!(validate(&row, &no_stages()).unwrap_err().field, "time");
+        let text = edited(ADSB, |v| v["position"] = serde_json::json!({"lat": "lat"}));
+        assert_eq!(parse(&text).unwrap_err().field, "lon");
+    }
+
+    #[test]
+    fn container_wav_needs_a_pcm_format() {
+        let wav = |format: &str| {
+            edited(&audio_row(true), |v| {
+                v["decoder"]["input"]["container"] = "wav".into();
+                v["decoder"]["input"]["format"] = format.into();
+            })
+        };
+        let row = parse(&wav("s16")).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        let Decoder::Program(p) = &row.decoder else {
+            panic!("a program row");
+        };
+        assert_eq!(p.input.container, Container::Wav);
+        validate(&parse(&wav("f32")).unwrap(), &no_stages()).unwrap();
+        for format in ["cf32", "cs16"] {
+            let e = validate(&parse(&wav(format)).unwrap(), &no_stages()).unwrap_err();
+            assert_eq!(e.field, "decoder.input.container", "{format}: {e}");
+        }
+        // On an iq row, `wav` takes the PCM iq formats only.
+        let iq_wav = |format: &str| {
+            edited(ADSB, |v| {
+                v["decoder"]["input"]["container"] = "wav".into();
+                v["decoder"]["input"]["format"] = format.into();
+            })
+        };
+        validate(&parse(&iq_wav("cs16")).unwrap(), &no_stages()).unwrap();
+        validate(&parse(&iq_wav("cf32")).unwrap(), &no_stages()).unwrap();
+        for format in ["cu8", "cs8"] {
+            let e = validate(&parse(&iq_wav(format)).unwrap(), &no_stages()).unwrap_err();
+            assert_eq!(e.field, "decoder.input.container", "{format}: {e}");
+        }
     }
 
     #[test]
@@ -766,5 +1018,12 @@ mod tests {
             ["icao", "callsign", "lat", "lon"]
         );
         assert!(summary_fields("{}").is_err());
+        assert_eq!(
+            summary_fields("{alt:.0} m {lat?:.4} {a?b:+.1}").unwrap(),
+            ["alt", "lat", "a", "b"]
+        );
+        for bad in ["{a:x}", "{a:.7}", "{a:.}", "{:.1}"] {
+            assert!(summary_fields(bad).is_err(), "{bad}");
+        }
     }
 }

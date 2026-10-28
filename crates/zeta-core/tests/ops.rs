@@ -570,8 +570,10 @@ fn unit_typed(s: &Value, defs: &Value) -> bool {
     if is_int(&s["type"]) {
         return true;
     }
-    // A list of unit values (`centers_hz`).
-    if s["type"] == "array" {
+    // A list of unit values (`centers_hz`), maybe null (`range_hz`).
+    let is_array =
+        |t: &Value| t == "array" || t.as_array().is_some_and(|a| a.contains(&"array".into()));
+    if is_array(&s["type"]) {
         return unit_typed(&s["items"], defs);
     }
     if let Some(alts) = s["anyOf"].as_array() {
@@ -623,7 +625,9 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                     .iter()
                     .any(|w| name.contains(w))
                         // Counts of stream restarts and read timeouts, not times.
-                        && !["restarts", "timeouts"].contains(&name.as_str());
+                        && !["restarts", "timeouts"].contains(&name.as_str())
+                        // A mode row's `time` names the event field holding a time.
+                        && !(name == "time" && path.ends_with(".ModeRow"));
                     // `_ns` is an instant; `_ms` a duration (a timeout), plain integer.
                     assert!(
                         !time || name.ends_with("_ns") || name.ends_with("_ms"),

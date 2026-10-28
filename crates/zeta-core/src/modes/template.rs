@@ -3,12 +3,13 @@
 //! A `graph` row's template has its placeholders (`"$center_hz"`, `"$bandwidth_hz"`,
 //! `"$out_rate_hz"`) filled with the job's integers; a `program` row becomes a `channel`
 //! at the same rate into [`EXTERNAL_DECODE_KIND`], which resamples to the program's
-//! `input.rate_hz`. Every node and the graph get fresh ids, as the built-in kinds'
+//! `input.rate_hz` (an audio row's channel runs through its `demod`, an `nbfm_demod`
+//! with the squelch off, first). Every node and the graph get fresh ids, as the built-in kinds'
 //! graphs do: a re-expansion carries params by stage kind, never by node id.
 
 use std::collections::HashMap;
 
-use super::{Decoder, InputStream, ModeRow};
+use super::{Decoder, Demod, InputStream, ModeRow};
 use crate::graph::{Edge, Graph, GraphId, Node, NodeId};
 use crate::ops::OpError;
 use crate::port::Tuning;
@@ -67,33 +68,74 @@ pub fn expand(row: &ModeRow, tuning: Tuning, out_rate_hz: u64) -> Result<Graph, 
                 edges,
             })
         }
-        Decoder::Program(_) => {
-            let (channel, decode) = (NodeId::new(), NodeId::new());
+        Decoder::Program(block) => {
+            let channel = Node {
+                id: NodeId::new(),
+                kind: "channel".into(),
+                params: serde_json::json!({
+                    "center_hz": tuning.center_hz.0,
+                    "bandwidth_hz": tuning.bandwidth_hz.0,
+                    "out_rate_hz": out_rate_hz,
+                }),
+            };
+            let decode = Node {
+                id: NodeId::new(),
+                kind: EXTERNAL_DECODE_KIND.into(),
+                params: serde_json::json!({ "mode": row.id.0 }),
+            };
+            // An audio program hears the channel through its demodulator.
+            let demod = match (block.input.stream, &block.demod) {
+                (InputStream::Iq, _) => None,
+                (InputStream::Audio, Some(d)) => Some(demod_node(d)),
+                (InputStream::Audio, None) => {
+                    return Err(OpError::Other {
+                        message: format!("mode {}: audio input needs a demod", row.id.0),
+                    });
+                }
+            };
+            let edge = |from: &Node, to: &Node, kind| Edge {
+                from: from.id.clone(),
+                to: to.id.clone(),
+                kind,
+            };
+            let (nodes, edges) = match demod {
+                None => {
+                    let edges = vec![edge(&channel, &decode, StreamKind::Iq)];
+                    (vec![channel, decode], edges)
+                }
+                Some(demod) => {
+                    let edges = vec![
+                        edge(&channel, &demod, StreamKind::Iq),
+                        edge(&demod, &decode, StreamKind::Audio),
+                    ];
+                    (vec![channel, demod, decode], edges)
+                }
+            };
             Ok(Graph {
                 id: GraphId::new(),
-                nodes: vec![
-                    Node {
-                        id: channel.clone(),
-                        kind: "channel".into(),
-                        params: serde_json::json!({
-                            "center_hz": tuning.center_hz.0,
-                            "bandwidth_hz": tuning.bandwidth_hz.0,
-                            "out_rate_hz": out_rate_hz,
-                        }),
-                    },
-                    Node {
-                        id: decode.clone(),
-                        kind: EXTERNAL_DECODE_KIND.into(),
-                        params: serde_json::json!({ "mode": row.id.0 }),
-                    },
-                ],
-                edges: vec![Edge {
-                    from: channel,
-                    to: decode,
-                    kind: StreamKind::Iq,
-                }],
+                nodes,
+                edges,
             })
         }
+    }
+}
+
+/// The node a program row's `demod` runs as, its squelch off: a decoder hears the
+/// channel's noise too.
+fn demod_node(demod: &Demod) -> Node {
+    match demod {
+        Demod::Nbfm {
+            deviation_hz,
+            audio_rate_hz,
+        } => Node {
+            id: NodeId::new(),
+            kind: "nbfm_demod".into(),
+            params: serde_json::json!({
+                "deviation_hz": deviation_hz,
+                "audio_rate_hz": audio_rate_hz,
+                "squelch": false,
+            }),
+        },
     }
 }
 

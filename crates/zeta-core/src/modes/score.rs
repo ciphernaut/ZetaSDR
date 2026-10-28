@@ -3,8 +3,8 @@
 
 use super::{LoadedMode, ModeRegistry, ModeState};
 
-/// Score for the measured centre lying near one of the row's well-known centres
-/// (granted when it lists none).
+/// Score for the measured centre lying near one of the row's well-known centres or in
+/// its `range_hz` (granted when it has neither).
 const CENTER_SCORE: f32 = 0.4;
 /// Score for the measured bandwidth lying within half to 1.5 times the row's.
 const BANDWIDTH_SCORE: f32 = 0.3;
@@ -23,11 +23,12 @@ pub struct Scored<'a> {
 
 /// The `ready` and `unavailable` rows of `modes` (a broken row is never tried) scored
 /// against a signal measured at `center_hz`, `bandwidth_hz` wide and labelled `layer1`:
-/// 0.4 when `center_hz` lies within `band.bandwidth_hz` of one of `band.centers_hz` (or
-/// the list is empty, "anywhere"); 0.3 when `bandwidth_hz` lies within 0.5-1.5 times
-/// `band.bandwidth_hz`; 0.3 when `layer1` is in `modulation` (never for an empty list);
-/// plus the best `catalogue(id)` among the row's `catalogue` ids, so a catalogue match
-/// can lift a row above 1. Highest score first; equal scores by `family`, then `id`.
+/// 0.4 when `center_hz` lies within `band.bandwidth_hz` of one of `band.centers_hz` or
+/// inside `band.range_hz` (or the row has neither, "anywhere"); 0.3 when `bandwidth_hz`
+/// lies within 0.5-1.5 times `band.bandwidth_hz`; 0.3 when `layer1` is in `modulation`
+/// (never for an empty list); plus the best `catalogue(id)` among the row's `catalogue`
+/// ids, so a catalogue match can lift a row above 1. Highest score first; equal scores
+/// by `identify.priority` (highest first), then `family`, then `id`.
 pub fn score_rows<'a>(
     modes: &'a ModeRegistry,
     center_hz: u64,
@@ -41,7 +42,11 @@ pub fn score_rows<'a>(
         .filter(|m| matches!(m.state, ModeState::Ready | ModeState::Unavailable))
         .map(|m| {
             let band = &m.row.band;
-            let center = band.centers_hz.is_empty()
+            let in_range = band
+                .range_hz
+                .is_some_and(|[lo, hi]| (lo..=hi).contains(&center_hz));
+            let center = (band.centers_hz.is_empty() && band.range_hz.is_none())
+                || in_range
                 || band
                     .centers_hz
                     .iter()
@@ -76,6 +81,13 @@ pub fn score_rows<'a>(
     scored.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
+            .then(
+                b.mode
+                    .row
+                    .identify
+                    .priority
+                    .cmp(&a.mode.row.identify.priority),
+            )
             .then(a.mode.row.family.cmp(&b.mode.row.family))
             .then(a.mode.row.id.cmp(&b.mode.row.id))
     });
@@ -149,6 +161,66 @@ mod tests {
         let got = ids(&score_rows(&modes, 104_900_000, 150_000, "wfm", &cat));
         assert!(got.iter().all(|g| g.0 != "rds_decode"), "{got:?}");
         assert!(got.iter().any(|g| g.0 == "adsb_decode"), "{got:?}");
+    }
+
+    /// A copy of `adsb_decode` (ready) under `id`, edited by `edit`.
+    fn add_row(modes: &mut ModeRegistry, id: &str, edit: impl FnOnce(&mut super::super::ModeRow)) {
+        let mut m = modes.get("adsb_decode").unwrap().clone();
+        m.row.id = super::super::ModeId(id.into());
+        edit(&mut m.row);
+        modes.modes.push(m);
+    }
+
+    #[test]
+    fn a_centre_inside_the_range_scores_the_centre_term() {
+        let mut modes = registry();
+        add_row(&mut modes, "sonde", |r| {
+            r.band.centers_hz = vec![];
+            r.band.range_hz = Some([400_050_000, 406_000_000]);
+            r.band.bandwidth_hz = 10_000;
+            r.modulation = vec![];
+            r.catalogue = vec![];
+        });
+        let sonde = |center_hz| {
+            score_rows(&modes, center_hz, 1, "noise", &|_| 0.0)
+                .iter()
+                .find(|s| s.mode.row.id.0 == "sonde")
+                .unwrap()
+                .score
+        };
+        assert!((sonde(402_500_000) - CENTER_SCORE).abs() < 1e-6);
+        assert!(
+            (sonde(400_050_000) - CENTER_SCORE).abs() < 1e-6,
+            "inclusive"
+        );
+        // An empty centre list with a range is not "anywhere".
+        assert_eq!(sonde(410_000_000), 0.0);
+        // A centre near a listed one still scores, range or not.
+        add_row(&mut modes, "both", |r| {
+            r.band.range_hz = Some([400_050_000, 406_000_000]);
+        });
+        let both = score_rows(&modes, 1_090_000_000, 1, "noise", &|_| 0.0);
+        let both = both.iter().find(|s| s.mode.row.id.0 == "both").unwrap();
+        assert!((both.score - CENTER_SCORE).abs() < 1e-6, "{}", both.score);
+    }
+
+    #[test]
+    fn priority_breaks_ties_first() {
+        let mut modes = registry();
+        // Equal score and family; the priority-1 row sorts first though its id is later.
+        add_row(&mut modes, "zz_sonde", |r| r.identify.priority = 1);
+        add_row(&mut modes, "aa_sonde", |r| r.identify.priority = 0);
+        let got = ids(&score_rows(&modes, 1_090_000_000, 1, "noise", &|_| 0.0));
+        let order: Vec<&str> = got
+            .iter()
+            .filter(|g| g.0.ends_with("_sonde") || g.0 == "adsb_decode")
+            .map(|g| g.0.as_str())
+            .collect();
+        assert_eq!(order, ["zz_sonde", "aa_sonde", "adsb_decode"], "{got:?}");
+        // A negative priority sorts after the default.
+        add_row(&mut modes, "a_low", |r| r.identify.priority = -1);
+        let got = ids(&score_rows(&modes, 1_090_000_000, 1, "noise", &|_| 0.0));
+        assert_eq!(got.iter().rev().find(|g| g.1 > 0.0).unwrap().0, "a_low");
     }
 
     #[test]

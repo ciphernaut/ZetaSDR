@@ -3,10 +3,13 @@
 
 use std::path::Path;
 
-use zeta_core::modes::{Family, ModeRegistry, ModeState, parse, validate};
+use zeta_core::graph::NodeId;
+use zeta_core::modes::{Family, ModeRegistry, ModeState, parse, template, validate};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpError, OpResult};
+use zeta_core::port::Tuning;
 use zeta_core::stage::{Backend, StageRegistry};
+use zeta_core::types::{Hz, StreamKind};
 
 /// The stages the embedded graph rows are written against.
 fn stages() -> StageRegistry {
@@ -155,6 +158,8 @@ async fn modes_list_filters_by_family_and_state() {
     assert_eq!(v["family"], "pagers");
     assert_eq!(v["decoder_kind"], "graph");
     assert_eq!(v["file"], "modes/pocsag_decode.json");
+    assert_eq!(v["band"]["range_hz"], serde_json::Value::Null);
+    assert_eq!(v["band"]["min_hz"], serde_json::Value::Null);
     let adsb = list(Some(Family::Aviation), Some(ModeState::Ready)).await;
     let v = serde_json::to_value(&adsb[1]).unwrap();
     assert_eq!(v["id"], "adsb_decode");
@@ -295,4 +300,57 @@ fn a_built_in_kind_name_is_refused_as_a_row_id() {
     }
     // The decoder kinds' own names stay operator-replaceable.
     assert_eq!(reg.get("pocsag_decode").unwrap().state, ModeState::Ready);
+}
+
+/// An operator program row reading audio (`adsb_decode`'s row with an audio input and an
+/// NBFM demod) expands to `channel → nbfm_demod → external_decode`, the demod's squelch off.
+#[test]
+fn an_audio_program_row_expands_to_channel_nbfm_external() {
+    let (_, text) = ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("adsb_decode.json"))
+        .expect("embedded adsb_decode");
+    let mut row: serde_json::Value = serde_json::from_str(text).unwrap();
+    row["id"] = "audio_sonde".into();
+    row["band"]["min_hz"] = serde_json::Value::Null;
+    row["decoder"]["input"] = serde_json::json!({
+        "stream": "audio", "format": "s16", "rate_hz": 48000, "via": "stdin", "container": "wav"
+    });
+    row["decoder"]["demod"] =
+        serde_json::json!({"kind": "nbfm", "deviation_hz": 5000, "audio_rate_hz": 48000});
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("audio_sonde.json"), row.to_string()).unwrap();
+    let reg = ModeRegistry::load(&stages(), Some(dir.path()));
+    let m = reg.get("audio_sonde").expect("audio_sonde listed");
+    assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
+    let tuning = Tuning {
+        center_hz: Hz(402_500_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    // An audio row takes any band its channel can cut.
+    template::check_band(&m.row, tuning, 2_400_000).unwrap();
+    let g = template::expand(&m.row, tuning, 48_000).unwrap();
+    let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+    assert_eq!(kinds, ["channel", "nbfm_demod", "external_decode"]);
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"center_hz": 402_500_000, "bandwidth_hz": 12_500, "out_rate_hz": 48_000})
+    );
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({"deviation_hz": 5000, "audio_rate_hz": 48000, "squelch": false})
+    );
+    assert_eq!(
+        g.nodes[2].params,
+        serde_json::json!({"mode": "audio_sonde"})
+    );
+    let edges: Vec<(&NodeId, &NodeId, StreamKind)> =
+        g.edges.iter().map(|e| (&e.from, &e.to, e.kind)).collect();
+    assert_eq!(
+        edges,
+        [
+            (&g.nodes[0].id, &g.nodes[1].id, StreamKind::Iq),
+            (&g.nodes[1].id, &g.nodes[2].id, StreamKind::Audio),
+        ]
+    );
 }
