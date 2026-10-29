@@ -219,6 +219,12 @@ Found in plan 17's final review. The watch's feed out is wired for one sink: `De
 
 Replace it with `sink: {kind, params}` (or a list of them) on the detect node: `graph::validate` checks `params` against the named stage's `params_schema` and requires an `event` input and no outputs, the watch appends `kind` with `params` fed by the decoder's events, and `sondehub: {...}` stays accepted as shorthand for `sink: {kind: "sink_sondehub", params: {...}}` so existing watches resume. The `sondehub.<field>` error naming becomes `sink.params.<field>`, and the sink-restart path (`place_decoder`, the sink-less fallback) works on any kind.
 
+## Bug: the watch's detect defaults fire on receiver noise
+
+Found at the first live run (2026-10-29, the field host's B210 at 65 dB on 400-406 MHz with the discone): with the defaults (`threshold_db` 10 over the row's `floor_db`, which already sits 5 dB under the 2nd-percentile bin, and `width_hz` `[5000, 30000]`) the detect stage reported about a hundred "signals" 6-9 kHz wide across the band and the watch identified noise one 20 s slot at a time. `threshold_db` 18, `persist_ms` 5000 and `width_hz` `[8000, 30000]` left one real signal. The defaults were tuned on synthesised captures whose noise is flat.
+
+Wanted: a threshold relative to the band's median (not the 2nd percentile), or a minimum run energy, so the defaults hold on a real receiver; a `signal` event rate limit; and `identify`'s candidate order on a 12.5 kHz FSK box should put the sonde rows before `acars_decode` (it tried ACARS first, then POCSAG, with the sonde rows after). Record the thresholds that worked in field craft meanwhile.
+
 ## Feature: the watch re-centres before it identifies
 
 Found in plan 17's final review. The watch tunes its identify run on the detector's run centre, good to about one fft bin (1.46 kHz at a 6 MHz capture with `WATCH_BIN_TARGET_HZ` 1500), while `rs41mod` over NBFM audio decodes only within about ±1000 Hz of the sonde's centre (it slices the audio around zero, and an off-centre FM signal shifts that level); synthesised frames decode at ±1000 Hz and not at ±1500 Hz. A sonde at the wrong end of a bin is then reported `unknown` and retried on the same centre.

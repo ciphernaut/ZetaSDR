@@ -88,6 +88,17 @@ Deferred (ledger summary):
 - UI: owned jobs are still subscribed for ribbons; `!j.owner` is duplicated in `agent.js` and `overlays.js`; poll-added markers use a built title rather than the event summary; the watch scenarios assert a marker exists, not its position; stale frozen markers for positioned jobs after a source switch; a throwing `onEvent` listener aborts the overlay render; the popup age freezes while open; the narrow `#map-toggle` tab has no scenario; the 2 s `FAKE_AFTER_BYTES` margin is thin on a loaded host; positioned jobs on other sources are looked up by kind (`modes_list` once, `modes_show` per kind; `modes_list` carries no `position`).
 - Watch, two radios: the watch's `held_elsewhere` reads holders on its own source only (spec 6.2 says any running job); documented as a limitation in field craft.
 
+First live run, 2026-10-29 10:45-11:20 on the field host's B210 (plan-17 binary under the `sdr`
+deployment, discone, 10:00 Brisbane launch): the node restarted on the new binary with every handler
+found; the watch on 403.025/5.95 MHz fired on receiver noise at the default detect params (about a
+hundred 6-9 kHz "signals"; `TODO.md` "the watch's detect defaults fire on receiver noise") and held one
+real but wrong signal at 404.02 MHz with `threshold_db` 18, `persist_ms` 5000, `width_hz` [8000,
+30000]; identify on it ended `unknown` (ACARS was tried before the sonde rows). SondeHub placed the
+sonde (RS41-SGE X1142834) on 401.4999 MHz, 15 km up and descending 120 km east at 10:52: a `measure`
+there read 8-13 dB SNR fading to noise by 11:15 and `rs41_decode` on the published frequency produced
+no frame before it faded. The on-air decode proof therefore still waits for the 22:00 launch, which
+ascends towards the station.
+
 ## Plan 16 status
 
 Plan 16 is merged to `main` at 91886bc (tasks 1-9, a final fix wave and a flake fix, 18 commits
