@@ -6,5 +6,5 @@
   {"name": "RS41", "min_hz": 400000000, "max_hz": 406000000, "bandwidth_hz": 10000, "modulation": "GFSK", "symbol_rate_baud": 4800, "decoder": "rs41_decode"},
   {"name": "MeshCore-AU", "min_hz": 915000000, "max_hz": 928000000, "bandwidth_hz": 250000, "modulation": "LoRa", "symbol_rate_baud": null, "decoder": null},
   {"name": "MeshCore-EU", "min_hz": 869400000, "max_hz": 869650000, "bandwidth_hz": 250000, "modulation": "LoRa", "symbol_rate_baud": null, "decoder": null},
-  {"name": "404.025-beacon", "min_hz": 404015000, "max_hz": 404035000, "bandwidth_hz": 22000, "modulation": "PSK", "symbol_rate_baud": 20000, "decoder": null}
+  {"name": "Unitywater-telemetry-404.025", "min_hz": 404015000, "max_hz": 404035000, "bandwidth_hz": 16000, "modulation": "FSK", "symbol_rate_baud": null, "decoder": null}
 ]
