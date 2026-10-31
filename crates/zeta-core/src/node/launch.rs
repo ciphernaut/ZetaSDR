@@ -140,7 +140,11 @@ impl Inner {
             // A tune the port refused is the source's failure: named after it, as a
             // job that failed on the faulted source is (a conflict stays a conflict).
             let (granted, tuned) = leased.map_err(|e| match e {
-                LeaseError::Port(e) => NodeError::SourcePort(rec.source.clone(), e),
+                LeaseError::Port(e) => {
+                    // Before the caller stamps the failure's end (a resume, a recovery).
+                    self.note_fault_if_faulted(&rec.source);
+                    NodeError::SourcePort(rec.source.clone(), e)
+                }
                 e => NodeError::Lease(e),
             })?;
             // Only a rigid request tunes a port elastic jobs follow (an elastic one
@@ -810,6 +814,15 @@ impl Inner {
             && entry.run == run
             && entry.record.state == JobState::Running
         {
+            // A job on the radio failed of its source's fault: the node has seen the
+            // fault, and the episode opens (if it is not open) before this end is
+            // stamped, so the heal finds the record inside it.
+            if let JobState::Failed { reason } = &state
+                && entry.record.input.is_none()
+                && reason.starts_with(&format!("source {}: ", entry.record.source.0))
+            {
+                self.note_fault(&entry.record.source);
+            }
             entry.record.state = state;
             entry.ended_ns = now();
             entry.cancel = None;
@@ -819,7 +832,7 @@ impl Inner {
                     .unwrap()
                     .push(format!("job {}: {e}", id.0));
             }
-            Inner::prune_history(&mut jobs, &self.jobs_dir);
+            self.prune_history(&mut jobs);
         }
     }
 }
@@ -940,7 +953,7 @@ pub(super) async fn supervise(
                 let gated = e.gated_stop;
                 // An owned record that ended goes now (see `Inner::prune_history`).
                 if e.record.owner.is_some() {
-                    Inner::prune_history(&mut jobs, &inner.jobs_dir);
+                    inner.prune_history(&mut jobs);
                 }
                 gated
             }

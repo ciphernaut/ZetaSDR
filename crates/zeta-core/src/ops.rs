@@ -1936,7 +1936,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                         .collect(),
                     elastic: node.lease_elastic(&id),
                     pin: node.pinned(&id),
-                    fault: node.port(&id).and_then(|p| p.fault()),
+                    fault: node.source_fault(&id),
                     bank: node.bank(&id).map(|b| BankInfo {
                         bin_hz: b.bin_hz(),
                         consumers: b.consumers(),

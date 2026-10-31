@@ -5,10 +5,10 @@ mod identify;
 mod jsonlog;
 mod launch;
 mod persist;
+mod recover;
 mod sources;
 pub mod watch;
 
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -177,6 +177,26 @@ struct JobEntry {
     restarting: bool,
 }
 
+impl JobEntry {
+    /// The entry of a record that is not running in this process (loaded from disk and
+    /// not launched, or whose launch failed), ended at `ended_ns` for the history prune.
+    fn loaded(record: JobRecord, ended_ns: Timestamp) -> JobEntry {
+        JobEntry {
+            ended_ns,
+            record,
+            run: 0,
+            cancel: None,
+            done: None,
+            ended: None,
+            outputs: Vec::new(),
+            relaunch: false,
+            gated_stop: false,
+            released: false,
+            restarting: false,
+        }
+    }
+}
+
 /// A source's bank for the capture band it was made for; `bank` is `None`
 /// when that band is narrower than [`PFB_MIN_RATE_HZ`] or the factory declined.
 struct BankSlot {
@@ -249,6 +269,10 @@ struct Inner {
     /// `watch`) takes them: an owned record is dropped as soon as it ends, context and
     /// all (see [`Inner::prune_history`]).
     verdicts: Mutex<HashMap<JobId, serde_json::Value>>,
+    /// The open fault episode of each source whose port the node has seen faulted and
+    /// not yet recovered (see [`recover::Episode`]). Locked after `jobs` when both are
+    /// held, never the other way round.
+    episodes: Mutex<HashMap<SourceId, recover::Episode>>,
 }
 
 impl Inner {
@@ -411,7 +435,7 @@ impl Inner {
             // A supervisor that already released may be waiting on the gate to idle.
             let done = done.filter(|_| !(gated && entry.released));
             let ended = entry.ended.clone();
-            Inner::prune_history(&mut jobs, &self.jobs_dir);
+            self.prune_history(&mut jobs);
             (done, ended)
         };
         if let Some(h) = done.0 {
@@ -430,7 +454,11 @@ impl Inner {
     /// [`JOB_HISTORY_MAX`], removing their files (best effort: a file that
     /// will not go is retried at the next prune). Called with `jobs` locked
     /// after a record turns terminal; that record ended last, so it survives.
-    fn prune_history(jobs: &mut HashMap<JobId, JobEntry>, jobs_dir: &Path) {
+    /// A record the heal of its source would relaunch (recoverable in the
+    /// source's open fault episode) is never forgotten while the episode lasts:
+    /// it still counts toward the cap, and older ones go in its place.
+    fn prune_history(&self, jobs: &mut HashMap<JobId, JobEntry>) {
+        let jobs_dir = &self.jobs_dir;
         let is_terminal =
             |e: &JobEntry| matches!(e.record.state, JobState::Stopped | JobState::Failed { .. });
         // An owned record (a watch's identify runs and their children) goes as soon as
@@ -447,16 +475,21 @@ impl Inner {
             jobs.remove(&id);
             let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", id.0)));
         }
-        let mut terminal: Vec<(Timestamp, JobId)> = jobs
+        let terminal: Vec<&JobEntry> = jobs
             .values()
             .filter(|e| is_terminal(e) && e.record.owner.is_none())
-            .map(|e| (e.ended_ns, e.record.id.clone()))
             .collect();
         if terminal.len() <= JOB_HISTORY_MAX {
             return;
         }
-        terminal.sort_by(|a, b| a.0.0.cmp(&b.0.0).then_with(|| a.1.0.cmp(&b.1.0)));
-        for (_, id) in terminal.iter().take(terminal.len() - JOB_HISTORY_MAX) {
+        let over = terminal.len() - JOB_HISTORY_MAX;
+        let mut candidates: Vec<(Timestamp, JobId)> = terminal
+            .into_iter()
+            .filter(|e| !self.keep_from_prune(jobs, e))
+            .map(|e| (e.ended_ns, e.record.id.clone()))
+            .collect();
+        candidates.sort_by(|a, b| a.0.0.cmp(&b.0.0).then_with(|| a.1.0.cmp(&b.1.0)));
+        for (_, id) in candidates.iter().take(over) {
             jobs.remove(id);
             let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", id.0)));
         }
@@ -659,25 +692,11 @@ impl Node {
     ) -> Result<Self, NodeError> {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
-        let (mut records, mut load_errors) = load(&jobs_dir)?;
+        let (records, mut load_errors) = load(&jobs_dir)?;
         let job_load_errors = load_errors.len();
         let sources_dir = cfg.state_dir.join("sources");
         let (source_records, source_errors) = load_sources(&sources_dir);
         load_errors.extend(source_errors);
-        // Jobs on the radio first: an attached job resumes on its input's streams. A
-        // scan first of all, however narrow: it time-shares the source and the others
-        // fail naming it, as they would live. Then the widest band first, inside the
-        // capture `resume_captures` restores. Elastic jobs after every rigid one: they
-        // join whatever capture those left.
-        records.sort_by_key(|r| {
-            (
-                r.input.is_some(),
-                r.elastic,
-                r.kind != JobKind::Scan.name(),
-                Reverse(r.tuning.bandwidth_hz.0),
-                r.created_ns.0,
-            )
-        });
         let resume = cfg.resume;
         let modes = modes
             .unwrap_or_else(|| Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref())));
@@ -723,6 +742,7 @@ impl Node {
                 relaunching: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
                 verdicts: Mutex::new(HashMap::new()),
+                episodes: Mutex::new(HashMap::new()),
             }),
             load_errors,
             job_load_errors,
@@ -736,65 +756,29 @@ impl Node {
         // conflict as they would live.
         node.restore_gains().await;
         node.restore_pins().await;
-        let restoring = match resume {
-            true => node.resume_captures(&records).await,
-            false => Vec::new(),
-        };
-        for rec in records {
-            if !resume || !node.resumable(&rec) {
-                node.inner.jobs.lock().unwrap().insert(
-                    rec.id.clone(),
-                    JobEntry {
-                        ended_ns: rec.created_ns,
-                        record: rec,
-                        run: 0,
-                        cancel: None,
-                        done: None,
-                        ended: None,
-                        outputs: Vec::new(),
-                        relaunch: false,
-                        gated_stop: false,
-                        released: false,
-                        restarting: false,
-                    },
-                );
-                continue;
-            }
-            let mut failed = rec.clone();
-            let rec_source = rec.source.clone();
-            if let Err(e) = node.inner.launch(rec).await {
-                let reason = match e {
-                    NodeError::UnknownSource(s) => format!("source {} not present", s.0),
-                    NodeError::Lease(LeaseError::Port(e)) => source_fault_reason(&rec_source, &e),
-                    e => e.to_string(),
-                };
-                failed.state = JobState::Failed { reason };
-                persist(&node.inner.jobs_dir, &failed)?;
-                node.inner.jobs.lock().unwrap().insert(
-                    failed.id.clone(),
-                    JobEntry {
-                        ended_ns: now(),
-                        record: failed,
-                        run: 0,
-                        cancel: None,
-                        done: None,
-                        ended: None,
-                        outputs: Vec::new(),
-                        relaunch: false,
-                        gated_stop: false,
-                        released: false,
-                        restarting: false,
-                    },
-                );
+        // The records in resume order (see `Inner::resume_records`); without `resume`
+        // none is launched and every one is loaded as persisted.
+        let resumed = node
+            .inner
+            .resume_records(records, None, |inner, rec| resume && inner.resumable(rec))
+            .await;
+        if let Some(e) = resumed.error {
+            return Err(e);
+        }
+        {
+            let mut jobs = node.inner.jobs.lock().unwrap();
+            for rec in resumed.skipped {
+                let created = rec.created_ns;
+                jobs.insert(rec.id.clone(), JobEntry::loaded(rec, created));
             }
         }
-        for (holder, port) in restoring {
+        for (holder, port) in resumed.holds {
             node.inner.leases.release(&holder);
             node.inner.leases.idle_if_unheld(port.as_ref()).await;
         }
         {
             let mut jobs = node.inner.jobs.lock().unwrap();
-            Inner::prune_history(&mut jobs, &node.inner.jobs_dir);
+            node.inner.prune_history(&mut jobs);
         }
         Ok(node)
     }
@@ -850,80 +834,6 @@ impl Node {
         }
     }
 
-    /// Before resuming, hold each source at the capture its resumable rigid records
-    /// shared (see [`resume_capture`]) with a lease under a fresh id, so the first
-    /// launch does not tune it down to its own band and the narrower ones fit again.
-    /// The caller releases each returned lease once every record is launched. A
-    /// source with a resumable scan is left alone: the scan takes it first; so is a
-    /// pinned source: the pin is its capture.
-    async fn resume_captures(&self, records: &[JobRecord]) -> Vec<(JobId, Arc<dyn Port>)> {
-        let mut sources: Vec<&SourceId> = records
-            .iter()
-            .filter(|r| r.input.is_none())
-            .map(|r| &r.source)
-            .collect();
-        sources.sort_by(|a, b| a.0.cmp(&b.0));
-        sources.dedup();
-        let mut held = Vec::new();
-        for source in sources {
-            let Some(port) = self.port(source) else {
-                continue;
-            };
-            if self.inner.leases.pinned(source).is_some() {
-                continue;
-            }
-            let mine: Vec<&JobRecord> = records
-                .iter()
-                .filter(|r| &r.source == source && r.input.is_none() && self.resumable(r))
-                .collect();
-            if mine.iter().any(|r| r.kind == JobKind::Scan.name()) {
-                continue;
-            }
-            let rigid: Vec<Tuning> = mine
-                .iter()
-                .filter(|r| !r.elastic)
-                .map(|r| r.tuning)
-                .collect();
-            let elastic = mine.iter().filter(|r| r.elastic).map(|r| r.tuning);
-            let Some(capture) = resume_capture(port.capabilities(), &rigid, elastic) else {
-                continue;
-            };
-            let holder = JobId::new();
-            if self
-                .inner
-                .leases
-                .ensure(port.as_ref(), holder.clone(), capture, false)
-                .await
-                .is_ok()
-            {
-                held.push((holder, port));
-            }
-        }
-        held
-    }
-
-    /// Whether `open` relaunches `rec`: it is `Running`, or it `Failed` only
-    /// because its source was absent and that source is now attached, or (an
-    /// attached job) only because its input job was not running and it now runs.
-    fn resumable(&self, rec: &JobRecord) -> bool {
-        match (&rec.state, &rec.input) {
-            (JobState::Running, _) => true,
-            (JobState::Failed { reason }, Some(input)) => {
-                *reason == NodeError::InputNotRunning(input.clone()).to_string()
-                    && !matches!(
-                        self.inner.audio_stream(input),
-                        Err(NodeError::InputNotRunning(_))
-                    )
-            }
-            (JobState::Failed { reason }, None) => {
-                reason.starts_with("source ")
-                    && reason.ends_with(" not present")
-                    && self.port(&rec.source).is_some()
-            }
-            _ => false,
-        }
-    }
-
     /// Files in `state_dir/jobs` that could not be read as a `JobRecord`, or
     /// whose record id is not a ULID matching the file name; files in
     /// `state_dir/sources` that could not be read as a [`SourceRecord`]; and the
@@ -942,7 +852,9 @@ impl Node {
     /// Attach a port and start feeding its blocks into that source's ring and
     /// channel bank (made now for the port's current band, if it has one, and
     /// remade whenever its blocks show a new band). A second port with an
-    /// attached source's id is `DuplicateSource`. Does not resume jobs.
+    /// attached source's id is `DuplicateSource`. Does not resume jobs. A port that
+    /// reports heals ([`Port::healed`], a supervised worker) is watched from now on:
+    /// each heal recovers the source (see [`Inner::recover_source`]).
     pub fn add_port(&self, port: Arc<dyn Port>) -> Result<(), NodeError> {
         let inner = &self.inner;
         let source = port.id().clone();
@@ -958,7 +870,10 @@ impl Node {
             inner.sync_bank(&source, band);
         }
         tokio::spawn(feed_ring(inner.clone(), source.clone(), port.subscribe()));
-        tokio::spawn(feed_bank(inner.clone(), source, port.subscribe()));
+        tokio::spawn(feed_bank(inner.clone(), source.clone(), port.subscribe()));
+        if let Some(rx) = port.healed() {
+            tokio::spawn(recover::watch_healed(inner.clone(), source, rx));
+        }
         Ok(())
     }
 
@@ -1015,7 +930,18 @@ impl Node {
     }
 
     pub(crate) fn port(&self, id: &SourceId) -> Option<Arc<dyn Port>> {
-        self.inner.ports.read().unwrap().get(id).cloned()
+        self.inner.port(id)
+    }
+
+    /// The fault `id`'s port reports, if any; reading one opens the source's fault
+    /// episode (see [`recover::Episode`]), so the jobs that fail of it from now on are
+    /// relaunched when the port heals.
+    pub(crate) fn source_fault(&self, id: &SourceId) -> Option<String> {
+        let fault = self.port(id).and_then(|p| p.fault());
+        if fault.is_some() {
+            self.inner.note_fault(id);
+        }
+        fault
     }
 
     pub(crate) fn state_dir(&self) -> &Path {
@@ -1518,10 +1444,15 @@ impl Node {
         t: Tuning,
         guard: Option<&OwnedMutexGuard<()>>,
     ) -> Result<(Tuning, bool), LeaseError> {
-        match guard {
+        let tuned = match guard {
             Some(g) => self.inner.leases.tune_if_unheld_locked(port, t, g).await,
             None => self.inner.leases.tune_if_unheld_tuned(port, t).await,
+        };
+        // A tune the faulted port refused: the node has seen the fault.
+        if let Err(LeaseError::Port(_)) = &tuned {
+            self.inner.note_fault_if_faulted(port.id());
         }
+        tuned
     }
 
     /// Relaunch every running elastic job on `source` on its current capture; see

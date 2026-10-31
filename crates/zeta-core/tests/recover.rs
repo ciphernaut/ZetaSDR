@@ -1,0 +1,802 @@
+//! Recovery of a source whose port heals: the node re-applies the source's gain and pin
+//! and relaunches, under their own ids, the jobs that failed with the source's fault
+//! during this fault episode (attached jobs and a watch's decoders included), leaving
+//! every other record alone. Run over a [`FaultablePort`] the tests fault and heal.
+
+#![cfg(feature = "test-fixtures")]
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use num_complex::Complex;
+use serde_json::Value;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+
+use zeta_core::capture::{CaptureMeta, write_cf32};
+use zeta_core::graph::{Graph, GraphId, Node as GraphNode, NodeId};
+use zeta_core::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
+use zeta_core::node::{Node, NodeConfig};
+use zeta_core::ops::{JobKind, Op, OpResult, SourceInfo};
+use zeta_core::port::{Port, Tuning};
+use zeta_core::stage::{
+    Backend, PassthroughStage, Stage, StageContext, StageError, StageRegistry, StageSpec,
+};
+use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::stream_in::StreamInStage;
+use zeta_core::test_fixtures::FaultablePort;
+use zeta_core::types::{Hz, JobId, SourceId, StreamId, StreamKind, Timestamp};
+use zeta_source_file::{FileOpts, FileSource, fixtures};
+
+/// What a `FaultablePort` reports while the device is away, as a worker port does.
+const UNPLUGGED: &str = "no samples for 1000 ms (device unplugged?)";
+/// The tone recording's centre and rate.
+const TONE_HZ: u64 = 100_000_000;
+const TONE_RATE_HZ: u64 = 48_000;
+
+/// What a stand-in stage emits for one input frame: (output index, payload) pairs.
+type MapFn = fn(&Frame) -> Vec<(usize, Payload)>;
+
+/// A stage that maps every frame of its one input through `f`, keeping its provenance.
+struct MapStage {
+    spec: StageSpec,
+    f: MapFn,
+}
+
+impl MapStage {
+    fn new(kind: &'static str, input: StreamKind, outputs: &[StreamKind], f: MapFn) -> Arc<Self> {
+        Arc::new(Self {
+            spec: StageSpec {
+                kind,
+                inputs: vec![input],
+                outputs: outputs.to_vec(),
+                params_schema: schemars::json_schema!({"type": "object"}),
+            },
+            f,
+        })
+    }
+}
+
+#[async_trait]
+impl Stage for MapStage {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        mut inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let Some(rx) = inputs.first_mut() else {
+            return Err(StageError::Failed("expected 1 input".into()));
+        };
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                r = rx.recv() => match r {
+                    Ok(frame) => {
+                        for (i, payload) in (self.f)(&frame) {
+                            if let Some(out) = outputs.get(i) {
+                                bus.publish(Frame::new(out.clone(), frame.provenance.clone(), payload));
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+            }
+        }
+    }
+}
+
+/// A stage that fails at once for its own reason, not the source's.
+struct FailStage(StageSpec);
+
+#[async_trait]
+impl Stage for FailStage {
+    fn spec(&self) -> &StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        _inputs: Vec<broadcast::Receiver<Frame>>,
+        _outputs: Vec<StreamId>,
+        _bus: Arc<StreamBus>,
+        _cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        Err(StageError::Failed("own reason".into()))
+    }
+}
+
+fn audio() -> Payload {
+    Payload::Audio {
+        sample_rate_hz: Hz(48_000),
+        channels: 1,
+        samples: Arc::from(vec![0.1f32; 480]),
+    }
+}
+
+fn same(f: &Frame) -> Vec<(usize, Payload)> {
+    vec![(0, f.payload.clone())]
+}
+
+/// The stand-ins (registered first, so they win over the dsp stages of the same kind),
+/// then the dsp stages (`measure`, and the watch's `fft`, `detect` and decoders).
+fn registry() -> StageRegistry {
+    let mut r = StageRegistry::new();
+    r.register(Arc::new(PassthroughStage::new()));
+    r.register(Arc::new(StreamInStage::new()));
+    r.register(MapStage::new(
+        "audio_src",
+        StreamKind::Iq,
+        &[StreamKind::Audio],
+        |_| vec![(0, audio())],
+    ));
+    r.register(MapStage::new(
+        "denoise",
+        StreamKind::Audio,
+        &[StreamKind::Audio],
+        same,
+    ));
+    r.register(MapStage::new(
+        "vad",
+        StreamKind::Audio,
+        &[StreamKind::Audio, StreamKind::Event],
+        |f| {
+            vec![
+                (0, f.payload.clone()),
+                (
+                    1,
+                    Payload::Event(serde_json::json!({"protocol": "vad", "speech": true})),
+                ),
+            ]
+        },
+    ));
+    r.register(MapStage::new(
+        "transcribe",
+        StreamKind::Audio,
+        &[StreamKind::Event],
+        |_| {
+            vec![(
+                0,
+                Payload::Event(serde_json::json!({"protocol": "transcript", "text": "stand-in"})),
+            )]
+        },
+    ));
+    r.register(Arc::new(FailStage(StageSpec {
+        kind: "fail_now",
+        inputs: vec![StreamKind::Iq],
+        outputs: vec![StreamKind::Event],
+        params_schema: schemars::json_schema!({"type": "object"}),
+    })));
+    zeta_dsp::register_all(&mut r);
+    r
+}
+
+fn cfg(dir: &Path, resume: bool) -> NodeConfig {
+    NodeConfig {
+        state_dir: dir.join("state"),
+        ring_seconds: 1.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
+        backends: vec![Backend::Cpu],
+        resume,
+        bank_factory: None,
+        modes_dir: None,
+    }
+}
+
+/// A looping, real-time tone source `id`, tunable 1 MHz either side of its centre.
+fn tone(dir: &Path, id: &str) -> Arc<FileSource> {
+    let meta = fixtures::write_tone(dir);
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: Some((Hz(TONE_HZ - 1_000_000), Hz(TONE_HZ + 1_000_000))),
+    };
+    Arc::new(FileSource::open(SourceId(id.into()), &meta, opts).unwrap())
+}
+
+/// A node over a faultable tone source `s` (and the plain sources `others`), started.
+async fn node_on(
+    dir: &Path,
+    resume: bool,
+    others: &[&str],
+) -> (Arc<Node>, Arc<FaultablePort>, Vec<Arc<FileSource>>) {
+    let src = tone(dir, "s");
+    let port = FaultablePort::new(src.clone());
+    let mut srcs = vec![src];
+    let mut ports: Vec<Arc<dyn Port>> = vec![port.clone()];
+    for id in others {
+        let s = tone(dir, id);
+        ports.push(s.clone());
+        srcs.push(s);
+    }
+    let node = Node::open(cfg(dir, resume), registry(), ports)
+        .await
+        .unwrap();
+    for s in &srcs {
+        s.start();
+    }
+    (Arc::new(node), port, srcs)
+}
+
+fn s() -> SourceId {
+    SourceId("s".into())
+}
+
+fn band(bandwidth_hz: u64) -> Tuning {
+    Tuning {
+        center_hz: Hz(TONE_HZ),
+        bandwidth_hz: Hz(bandwidth_hz),
+    }
+}
+
+fn one_node(kind: &str, params: Value) -> Graph {
+    Graph {
+        id: GraphId::new(),
+        nodes: vec![GraphNode {
+            id: NodeId("n".into()),
+            kind: kind.into(),
+            params,
+        }],
+        edges: vec![],
+    }
+}
+
+async fn start(node: &Node, source: &str, kind: &str, params: Value) -> JobId {
+    node.job_start(
+        kind,
+        SourceId(source.into()),
+        band(TONE_RATE_HZ),
+        one_node(kind, params),
+        None,
+        false,
+    )
+    .await
+    .unwrap()
+}
+
+async fn start_passthrough(node: &Node, source: &str) -> JobId {
+    start(
+        node,
+        source,
+        "passthrough",
+        serde_json::json!({"kind": "iq"}),
+    )
+    .await
+}
+
+/// A `measure` job through the op, so its graph is the node's expansion.
+async fn start_measure(node: &Node) -> JobId {
+    let op = Op::JobStart {
+        kind: JobKind::Measure,
+        source: s(),
+        center_hz: Hz(TONE_HZ),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![],
+    };
+    match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("job_start measure: {r:?}"),
+    }
+}
+
+fn state(node: &Node, id: &JobId) -> Option<JobState> {
+    node.job_list()
+        .into_iter()
+        .find(|r| &r.id == id)
+        .map(|r| r.state)
+}
+
+fn failed_unplugged() -> Option<JobState> {
+    Some(JobState::Failed {
+        reason: format!("source s: {UNPLUGGED}"),
+    })
+}
+
+async fn source(node: &Node) -> SourceInfo {
+    match node.apply(Op::SourceList {}).await {
+        Ok(OpResult::Sources(v)) => v.into_iter().find(|i| i.id == s()).unwrap(),
+        r => panic!("source_list: {r:?}"),
+    }
+}
+
+/// Poll `f` every 20 ms until it holds, panicking with `what` after `within`.
+async fn until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Fault `port` and wait for every one of `jobs` to fail with the fault.
+async fn fault(node: &Node, port: &FaultablePort, jobs: &[&JobId]) {
+    port.set_fault(Some(UNPLUGGED.into()));
+    for id in jobs {
+        until(
+            "the job fails with the fault",
+            Duration::from_secs(10),
+            || state(node, id) != Some(JobState::Running),
+        )
+        .await;
+        assert_eq!(state(node, id), failed_unplugged(), "job {}", id.0);
+    }
+}
+
+async fn stop_all(node: &Node) {
+    let running: Vec<JobId> = node
+        .job_list()
+        .into_iter()
+        .filter(|r| r.state == JobState::Running)
+        .map(|r| r.id)
+        .collect();
+    for id in running {
+        let _ = node.job_stop(&id).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_heal_restores_pin_gain_and_relaunches_the_failed_jobs_under_their_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port, _srcs) = node_on(dir.path(), true, &[]).await;
+    let pin = band(TONE_RATE_HZ);
+    let op = Op::SourcePin {
+        source: s(),
+        center_hz: pin.center_hz,
+        bandwidth_hz: pin.bandwidth_hz,
+        replace: vec![],
+    };
+    assert!(node.apply(op).await.is_ok());
+    let op = Op::SourceSetGain {
+        source: s(),
+        gain_db: Some(20.0),
+    };
+    assert!(node.apply(op).await.is_ok());
+    let a = start_passthrough(&node, "s").await;
+    let b = start_measure(&node).await;
+    // Let every stage get going before taking the count.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stages = node.debug_stage_count();
+    assert!(stages > 0);
+
+    fault(&node, &port, &[&a, &b]).await;
+    assert_eq!(source(&node).await.fault.as_deref(), Some(UNPLUGGED));
+    let gains_before = port.gain_calls().len();
+
+    port.heal();
+    until("both run again", Duration::from_secs(2), || {
+        state(&node, &a) == Some(JobState::Running) && state(&node, &b) == Some(JobState::Running)
+    })
+    .await;
+    let info = source(&node).await;
+    assert_eq!(info.pin, Some(pin));
+    assert_eq!(info.fault, None);
+    let gains = port.gain_calls();
+    assert_eq!(gains.len(), gains_before + 1, "{gains:?}");
+    assert_eq!(gains.last(), Some(&Some(20.0)));
+    until("the stages are back", Duration::from_secs(2), || {
+        node.debug_stage_count() == stages
+    })
+    .await;
+    // The same ids, no new records.
+    assert_eq!(node.job_list().len(), 2);
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_leaves_stopped_and_self_failed_jobs_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port, _srcs) = node_on(dir.path(), true, &[]).await;
+    let a = start_passthrough(&node, "s").await;
+    let c = start_passthrough(&node, "s").await;
+    node.job_stop(&c).await.unwrap();
+    let d = start(&node, "s", "fail_now", serde_json::json!({})).await;
+    until("d fails", Duration::from_secs(5), || {
+        state(&node, &d) != Some(JobState::Running)
+    })
+    .await;
+    let own = Some(JobState::Failed {
+        reason: "own reason".into(),
+    });
+    assert_eq!(state(&node, &d), own);
+
+    fault(&node, &port, &[&a]).await;
+    port.heal();
+    until("a runs again", Duration::from_secs(2), || {
+        state(&node, &a) == Some(JobState::Running)
+    })
+    .await;
+    // Give a wrong relaunch the time to show.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(state(&node, &c), Some(JobState::Stopped));
+    assert_eq!(state(&node, &d), own);
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_failed_in_an_earlier_episode_is_not_recovered() {
+    let dir = tempfile::tempdir().unwrap();
+    // A record a node before this one left failed with the source's fault.
+    let old = JobRecord {
+        format: JOB_RECORD_FORMAT,
+        id: JobId::new(),
+        kind: "passthrough".into(),
+        graph: one_node("passthrough", serde_json::json!({"kind": "iq"})),
+        source: s(),
+        tuning: band(TONE_RATE_HZ),
+        state: JobState::Failed {
+            reason: format!("source s: {UNPLUGGED}"),
+        },
+        context: serde_json::json!({}),
+        created_ns: Timestamp(1),
+        input: None,
+        capture_rate_hz: None,
+        elastic: false,
+        operator_graph: false,
+        owner: None,
+    };
+    let jobs = dir.path().join("state").join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(
+        jobs.join(format!("{}.json", old.id.0)),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    let (node, port, _srcs) = node_on(dir.path(), false, &[]).await;
+    assert_eq!(state(&node, &old.id), failed_unplugged());
+
+    let b = start_passthrough(&node, "s").await;
+    fault(&node, &port, &[&b]).await;
+    port.heal();
+    until("b runs again", Duration::from_secs(2), || {
+        state(&node, &b) == Some(JobState::Running)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(state(&node, &old.id), failed_unplugged());
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_pruning_keeps_recoverable_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port, _srcs) = node_on(dir.path(), true, &["t"]).await;
+    let a = start_passthrough(&node, "s").await;
+    let b = start_passthrough(&node, "s").await;
+    fault(&node, &port, &[&a, &b]).await;
+    // 23 more terminal records, each ending after the two recoverable ones.
+    for _ in 0..23 {
+        let id = start_passthrough(&node, "t").await;
+        node.job_stop(&id).await.unwrap();
+    }
+    let list = node.job_list();
+    let terminal = list
+        .iter()
+        .filter(|r| matches!(r.state, JobState::Stopped | JobState::Failed { .. }))
+        .count();
+    assert_eq!(terminal, zeta_core::node::JOB_HISTORY_MAX, "they count");
+    assert_eq!(state(&node, &a), failed_unplugged());
+    assert_eq!(state(&node, &b), failed_unplugged());
+
+    port.heal();
+    until("both run again", Duration::from_secs(2), || {
+        state(&node, &a) == Some(JobState::Running) && state(&node, &b) == Some(JobState::Running)
+    })
+    .await;
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attached_job_comes_back_with_its_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port, _srcs) = node_on(dir.path(), true, &[]).await;
+    let input = start(&node, "s", "audio_src", serde_json::json!({})).await;
+    let op = Op::JobAttach {
+        kind: JobKind::Transcribe,
+        job: input.clone(),
+        language: None,
+    };
+    let attached = match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("job_attach: {r:?}"),
+    };
+    fault(&node, &port, &[&input]).await;
+    until("the attached job ends", Duration::from_secs(5), || {
+        state(&node, &attached) != Some(JobState::Running)
+    })
+    .await;
+    assert_eq!(
+        state(&node, &attached),
+        Some(JobState::Failed {
+            reason: format!("input job {} not running", input.0)
+        })
+    );
+
+    port.heal();
+    until("both run again", Duration::from_secs(2), || {
+        state(&node, &input) == Some(JobState::Running)
+            && state(&node, &attached) == Some(JobState::Running)
+    })
+    .await;
+    // The attached job reads the relaunched input: its transcripts flow again.
+    let stream = node
+        .job_outputs(&attached)
+        .into_iter()
+        .rfind(|(k, _)| *k == StreamKind::Event)
+        .map(|(_, s)| s)
+        .unwrap();
+    let mut rx = node.bus().subscribe(&stream).unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+    assert!(matches!(frame, Ok(Ok(_))), "{frame:?}");
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_list_shows_the_episode_fault_then_clears() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port, _srcs) = node_on(dir.path(), true, &[]).await;
+    assert_eq!(source(&node).await.fault, None);
+    let a = start_passthrough(&node, "s").await;
+    port.set_fault(Some(UNPLUGGED.into()));
+    // Read before the job has seen the fault: the episode opens here.
+    assert_eq!(source(&node).await.fault.as_deref(), Some(UNPLUGGED));
+    until("a fails", Duration::from_secs(5), || {
+        state(&node, &a) != Some(JobState::Running)
+    })
+    .await;
+    assert_eq!(state(&node, &a), failed_unplugged());
+    port.heal();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let info = source(&node).await;
+        if info.fault.is_none() && state(&node, &a) == Some(JobState::Running) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{info:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop_all(&node).await;
+}
+
+// The watch: a 1.024 Msps recording carrying a 1200-baud POCSAG page every 2 s, 300 kHz
+// above the capture's centre (as `tests/watch.rs`'s fixture).
+
+const RATE_HZ: u32 = 1_024_000;
+const POCSAG_HZ: u64 = 148_637_500;
+const OFFSET_HZ: u64 = 300_000;
+const CENTER_HZ: u64 = POCSAG_HZ - OFFSET_HZ;
+const CYCLE: usize = 2 * RATE_HZ as usize;
+const PERSIST_MS: u64 = 1_500;
+/// A re-adopted decoder's signal must be seen again within this: a margin for a loaded
+/// host, as `tests/watch.rs`'s re-adoption tests use.
+const READOPT_GONE_MS: u64 = 6_000;
+
+struct Pocsag {
+    _dir: tempfile::TempDir,
+    meta: PathBuf,
+}
+
+fn pocsag() -> &'static Pocsag {
+    static F: OnceLock<Pocsag> = OnceLock::new();
+    F.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut iq = zeta_dsp::synth::pocsag_packet_iq(
+            1_234_567,
+            3,
+            "HELLO ZETA",
+            1200,
+            RATE_HZ,
+            OFFSET_HZ as f64,
+        );
+        assert!(iq.len() < CYCLE);
+        iq.resize(CYCLE, Complex::new(0.0, 0.0));
+        zeta_dsp::synth::awgn(&mut iq, 20.0, 1);
+        let meta = CaptureMeta {
+            sample_rate_hz: Hz(RATE_HZ as u64),
+            center_hz: Hz(CENTER_HZ),
+            start: Timestamp(0),
+            annotations: Vec::new(),
+        };
+        let meta = write_cf32(dir.path(), "pocsag", &meta, &iq).unwrap();
+        Pocsag { _dir: dir, meta }
+    })
+}
+
+fn rx() -> SourceId {
+    SourceId("rx".into())
+}
+
+fn capture() -> Tuning {
+    Tuning {
+        center_hz: Hz(CENTER_HZ),
+        bandwidth_hz: Hz(RATE_HZ as u64),
+    }
+}
+
+/// Every event `job`'s event stream carries from now on, across its relaunches.
+struct Events {
+    seen: Arc<Mutex<Vec<Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Events {
+    fn of(node: &Arc<Node>, job: &JobId) -> Events {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (node, job, out) = (Arc::downgrade(node), job.clone(), seen.clone());
+        let task = tokio::spawn(async move {
+            loop {
+                let rx = node.upgrade().and_then(|n| {
+                    let s = n
+                        .job_outputs(&job)
+                        .into_iter()
+                        .find(|(k, _)| *k == StreamKind::Event)?
+                        .1;
+                    n.bus().subscribe(&s)
+                });
+                let Some(mut rx) = rx else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                loop {
+                    match rx.recv().await {
+                        Ok(f) => {
+                            if let Payload::Event(v) = f.payload {
+                                out.lock().unwrap().push(v);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        Events { seen, task }
+    }
+
+    fn watch(&self, state: &str) -> Vec<Value> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e["protocol"] == "watch" && e["state"] == state)
+            .cloned()
+            .collect()
+    }
+
+    fn all(&self) -> Vec<Value> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+fn decoding(node: &Node, watch: &JobId) -> Vec<Value> {
+    node.job_context(watch)
+        .and_then(|c| c["watch"]["decoding"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_and_its_decoder_come_back_and_nothing_is_lost() {
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 16_384,
+        repeat: true,
+        tune_range: Some((Hz(CENTER_HZ - 2_000_000), Hz(CENTER_HZ + 2_000_000))),
+    };
+    let src = Arc::new(FileSource::open(rx(), &pocsag().meta, opts).unwrap());
+    let port = FaultablePort::new(src.clone());
+    let node = Node::open(cfg(dir.path(), true), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    for c in zeta_dsp::classifiers(node.modes()) {
+        node.add_classifier(c);
+    }
+    src.start();
+    let node = Arc::new(node);
+    let mut graph = JobKind::Watch
+        .expand(
+            &rx(),
+            capture(),
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    let detect = graph.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params = serde_json::json!({"persist_ms": PERSIST_MS, "gone_ms": READOPT_GONE_MS});
+    let watch = node
+        .job_start(
+            "watch",
+            rx(),
+            capture(),
+            graph,
+            Some(Hz(RATE_HZ as u64)),
+            false,
+        )
+        .await
+        .unwrap();
+    let events = Events::of(&node, &watch);
+    until("a decoding event", Duration::from_secs(40), || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    let job = JobId(events.watch("decoding")[0]["job"].as_str().unwrap().into());
+    until("watch.decoding lists it", Duration::from_secs(5), || {
+        decoding(&node, &watch)
+            .iter()
+            .any(|d| d["job"] == job.0.as_str())
+    })
+    .await;
+
+    port.set_fault(Some(UNPLUGGED.into()));
+    let failed = Some(JobState::Failed {
+        reason: format!("source rx: {UNPLUGGED}"),
+    });
+    for id in [&watch, &job] {
+        until("the job fails", Duration::from_secs(10), || {
+            state(&node, id) != Some(JobState::Running)
+        })
+        .await;
+        assert_eq!(state(&node, id), failed, "job {}", id.0);
+    }
+    let lost_before = events.watch("lost").len();
+    let identifying_before = events.watch("identifying").len();
+
+    port.heal();
+    until("both run again", Duration::from_secs(10), || {
+        state(&node, &watch) == Some(JobState::Running)
+            && state(&node, &job) == Some(JobState::Running)
+    })
+    .await;
+    // Re-adopted, and kept once its signal is seen again (past `gone_ms`).
+    tokio::time::sleep(Duration::from_millis(READOPT_GONE_MS + 3_000)).await;
+    let listed = decoding(&node, &watch);
+    assert_eq!(listed.len(), 1, "{listed:#?}");
+    assert_eq!(listed[0]["job"], job.0.as_str());
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    assert_eq!(
+        events.watch("lost").len(),
+        lost_before,
+        "{:#?}",
+        events.all()
+    );
+    // No second identify: the re-adopted decoder's signal is its own.
+    assert_eq!(
+        events.watch("identifying").len(),
+        identifying_before,
+        "{:#?}",
+        events.all()
+    );
+    stop_all(&node).await;
+}
