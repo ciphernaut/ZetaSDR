@@ -21,13 +21,14 @@
 // the band given, `source_unpin`, `source_set_gain`), their reply or error a transcript line;
 // anything else (other text starting "view " or "source " included) goes to `api.ask`.
 //
-// Conflicts (spec 4.5): a `conflict` reply to an op this page applied (command line, menu),
-// or one the ops stream shows for another caller, adds a line naming each holder by kind
-// and tuning from the last job list (`conflict: source S held by passthrough <id> @ 100.000
-// MHz`) with one button per holder, `stop <kind> <short id> and retry`, which applies the
-// same op again with `replace: [<id>]` (conflictActions). A pin is never a holder: a conflict
-// with none on a pinned source names the node's `unpin source S (source_unpin)` option and
-// offers `unpin S and retry` (`source_unpin`, then the same op).
+// Conflicts (spec 4.5): a `conflict` reply to an op this page applied (command line, menu,
+// a dragged outline's `job_retune`), or one the ops stream shows for another caller, adds a
+// line naming each holder by kind and tuning from the last job list (`conflict: source S
+// held by passthrough <id> @ 100.000 MHz`) with one button per holder, `stop <kind> <short
+// id> and retry`, which applies the same op again with `replace: [<id>]` (conflictActions).
+// A pin is never a holder: a conflict with none on a pinned source names the node's `unpin
+// source S (source_unpin)` option and offers `unpin S and retry` (`source_unpin`, then the
+// same op).
 //
 // Tabs: a pinned source's tab carries a `pin` tag after its range and the title `pin
 // <lo>–<hi> MHz; gain <db> dB` (`gain automatic`; no gain part without adjustable gain),
@@ -47,7 +48,8 @@
 // rejects the secret. Each jobs poll is handed to it too (wf.syncJobs: a scan starting or
 // ending on the shown source), and its notices (a refused retune) become transcript lines.
 // The overlays (overlays.js) sit on it: each jobs poll hands them the job
-// list (they watch the selected source's running jobs and outline its rigid holders' bands),
+// list (they watch the selected source's running jobs and outline its rigid holders' bands;
+// in the wide footprint a retunable job's outline is dragged to retune it through applyOp),
 // and in the narrow footprint every
 // /ask answer also becomes an `agent` ribbon at the centre of the band shown.
 //
@@ -346,7 +348,7 @@ async function applyOp(op) {
 // ---- conflicts -------------------------------------------------------------------------
 
 // Ops that take `replace` (a conflict on them can be retried with the holders named).
-const REPLACEABLE = new Set(["job_start", "source_ensure", "source_pin"]);
+const REPLACEABLE = new Set(["job_start", "job_retune", "source_ensure", "source_pin"]);
 
 // `<kind> <id> @ <centre MHz>` for holder `id`, from the last job list (the conflict's
 // `current` centre when the job is not in it).
@@ -604,6 +606,8 @@ function start(api) {
   state.ov = mountOverlays($("#waterfall"), state.wf, api, {
     jobsEl: $("#jobs"),
     plan: () => state.view.get("plan"),
+    applyOp,
+    footprint: () => document.documentElement.dataset.footprint || "wide",
   });
   state.map = mountMap($("#map"), api, state.view, { jobs: () => state.lastJobs });
   state.ov.onEvent((job, p) => state.map?.event(job, p));

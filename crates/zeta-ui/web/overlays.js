@@ -3,12 +3,16 @@
 // squelch tags.
 //
 // Exports:
-//   mountOverlays(el, wf, api, {jobsEl, plan}) -> Overlays
+//   mountOverlays(el, wf, api, {jobsEl, plan, applyOp, footprint}) -> Overlays
 //       Adds a pointer-transparent layer over the waterfall canvas inside `el` (the
 //       #waterfall element `wf` was mounted in). `jobsEl` (default #jobs) holds the job rows
 //       agent.js renders; their `.events` cell carries the counters. `plan` (default `auto`)
 //       returns the view's `plan` policy: an outline on a plan channel reads `ch20 fm_demod`
-//       (plans.js); `ov.syncOutlines` is called again when the policy changes.
+//       (plans.js); `ov.syncOutlines` is called again when the policy changes. `applyOp(op)
+//       -> Promise<result | null>` is app.js's (null: failed and already reported, a
+//       `conflict` with its retry buttons); a dragged outline's `job_retune` goes through it.
+//       `footprint()` returns "wide" or "narrow" (<html data-footprint>): only the wide
+//       footprint's outlines can be dragged.
 //   Overlays:
 //     ov.syncOutlines(jobs, source)  the outline half of ov.sync alone (app.js calls it after
 //                            each `source_list` poll, so a pin shows without waiting for jobs)
@@ -98,10 +102,30 @@
 //         label drawn at the same hz. One label per key (a job id, a classification slot),
 //         replaced on each call. `evidence` becomes its tooltip; `data-layer` the layer.
 //     ov.unlabel(key)        removes the label drawn under `key`, if any
-//     ov.outline(lo, hi, text, key) -> element
+//     ov.outline(lo, hi, text, key, job = null) -> element
 //         A band lo..hi Hz across the waterfall (`.outline`, data-key = key) bordered at its
 //         edges, `text` its label (`.outline-label`) at its top right; one per key, replaced
-//         on each call, placed again when the view changes. Drawn under labels and ribbons.
+//         on each call, placed again when the view changes. Drawn under labels and ribbons,
+//         pointer-transparent. With a `job` that ov.retunable allows, in the wide footprint,
+//         it is draggable (class `retunable`, cursor grab): two `.outline-handle` children
+//         (data-edge `hi` at the top edge, `lo` at the bottom, HANDLE_PX tall, centred on the
+//         edge, ns-resize) resize that edge, the body moves the band. A press (button 0)
+//         captures the pointer; each move maps the pointer's y through wf.hzForY: a move
+//         shifts both edges by the Hz travelled, an edge follows it, clamped so the band
+//         stays MIN_WIDTH_HZ wide (no snapping to any raster). Past DRAG_CLICK_PX of travel a
+//         `.outline-ghost` (dashed, no label) stays on the old band and a `.outline-readout`
+//         under the outline reads "<bandText> · release to retune". A release before that is
+//         a click and sends nothing; after it `job_retune` (the dragged centre and width,
+//         rounded to Hz, replace []) goes through applyOp: null (a refusal or a conflict,
+//         whose line offers "stop <kind> <id> and retry") snaps the outline back to the
+//         ghost's band, a result keeps the dragged band until the next `job_list`; ghost and
+//         readout go either way. `pointercancel` snaps back and sends nothing. While a drag
+//         runs (ov.drag) the polls and the view changes leave that outline where the pointer
+//         has it, and a wheel over a draggable outline still zooms the waterfall. In the
+//         narrow footprint no handles are made and the body stays pointer-transparent; pins,
+//         the capture, elastic jobs, scans, watches and identify runs are never draggable.
+//     ov.retunable(job) -> bool  a running rigid job (as outlined) the node can move with
+//                            `job_retune`: no operator graph, kind not in NOT_RETUNABLE
 //     ov.unoutline(key)      removes the outline drawn under `key`, if any
 //     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a watched job
 //     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a watched job,
@@ -113,6 +137,7 @@
 
 import { SQUELCH_KINDS, setSquelchTag } from "./agent.js";
 import { channelLabel } from "./plans.js";
+import { bandText } from "./units.js";
 
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
@@ -125,6 +150,11 @@ const LABEL_GAP_PX = 2;
 const MAX_LANES = 8;
 const CAPTURE_KEY = "capture";
 const PIN_KEY = "pin";
+// Kinds job_retune refuses (an attached `transcribe` follows its input instead).
+export const NOT_RETUNABLE = ["spectrum", "scan", "identify", "watch", "transcribe"];
+export const HANDLE_PX = 8; // an edge handle's height (style.css .outline-handle)
+export const DRAG_CLICK_PX = 3; // less pointer travel than this is a click, not a drag
+export const MIN_WIDTH_HZ = 1000; // the narrowest band an edge drag leaves
 
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 
@@ -194,9 +224,21 @@ class Overlays {
     el,
     wf,
     api,
-    { jobsEl = document.getElementById("jobs"), plan = () => "auto" } = {},
+    {
+      jobsEl = document.getElementById("jobs"),
+      plan = () => "auto",
+      applyOp = async () => null,
+      footprint = () => "wide",
+    } = {},
   ) {
     this.plan = plan;
+    this.applyOp = applyOp;
+    this.footprint = footprint;
+    // The outline drag in progress: {key, job, mode: "move"|"lo"|"hi", y0 (layer px), lo0,
+    // hi0 (the ghost's band), lo, hi (the dragged band), moved, sending (job_retune sent)}.
+    this.drag = null;
+    this.ghostEl = null; // the dragged outline's `.outline-ghost`, past DRAG_CLICK_PX
+    this.readoutEl = null; // its `.outline-readout`
     this.lastJobs = [];
     this.wf = wf;
     this.api = api;
@@ -208,7 +250,7 @@ class Overlays {
     this.counters = new Map(); // job id -> non-spectrum events seen while watched
     this.squelches = new Map(); // job id -> {event: the last `squelch` event seen, graph}
     this.labels = new Map(); // key -> {el, hz}
-    this.outlines = new Map(); // key -> {el, labelEl, lo, hi}
+    this.outlines = new Map(); // key -> {el, labelEl, lo, hi, job, handles}
     this.marks = new Map(); // `${job id}:${rounded centre}` -> {el, hz}: a watch's `signal new`
     this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
@@ -403,7 +445,7 @@ class Overlays {
     for (const j of rigid) {
       const { center_hz: c, bandwidth_hz: bw } = j.tuning;
       const ch = channelLabel(c, this.plan());
-      this.outline(c - bw / 2, c + bw / 2, ch ? `${ch.text} ${j.kind}` : j.kind, j.id);
+      this.outline(c - bw / 2, c + bw / 2, ch ? `${ch.text} ${j.kind}` : j.kind, j.id, j);
     }
     if (pin) {
       const { center_hz: c, bandwidth_hz: bw } = pin;
@@ -723,7 +765,7 @@ class Overlays {
     this.marks.delete(key);
   }
 
-  outline(lo, hi, text, key) {
+  outline(lo, hi, text, key, job = null) {
     if (this.destroyed) return null;
     let o = this.outlines.get(key);
     if (!o) {
@@ -734,12 +776,16 @@ class Overlays {
       labelEl.className = "outline-label";
       el.append(labelEl);
       this.layer.prepend(el); // under the labels and ribbons
-      o = { el, labelEl, lo, hi };
+      o = { el, labelEl, lo, hi, job: null, handles: null };
       this.outlines.set(key, o);
+      this.listenDrag(o, key);
     }
+    o.job = job;
+    this.setDraggable(o);
+    o.labelEl.textContent = String(text);
+    if (this.drag && this.drag.key === key) return o.el; // the pointer has it
     o.lo = lo;
     o.hi = hi;
-    o.labelEl.textContent = String(text);
     o.el.title = `${text} ${(lo / 1e6).toFixed(3)}-${(hi / 1e6).toFixed(3)} MHz`;
     this.placeOutline(o);
     return o.el;
@@ -748,8 +794,178 @@ class Overlays {
   unoutline(key) {
     const o = this.outlines.get(key);
     if (!o) return;
+    if (this.drag && this.drag.key === key) this.endDrag();
     o.el.remove();
     this.outlines.delete(key);
+  }
+
+  // ---- dragging an outline (retune) ----------------------------------------------------
+
+  retunable(job) {
+    return (
+      isRunning(job) &&
+      rigidBand(job) &&
+      !job.operator_graph &&
+      !NOT_RETUNABLE.includes(job.kind)
+    );
+  }
+
+  // Class `retunable` and the two edge handles on `o` when its job can be dragged here.
+  setDraggable(o) {
+    const on = !!o.job && this.footprint() === "wide" && this.retunable(o.job);
+    const d = this.drag;
+    if (!on && d && d.key === o.el.dataset.key && !d.sending) this.endDrag(true);
+    o.el.classList.toggle("retunable", on);
+    if (on && !o.handles) {
+      o.handles = ["hi", "lo"].map((edge) => {
+        const h = document.createElement("div");
+        h.className = "outline-handle";
+        h.dataset.edge = edge;
+        o.el.append(h);
+        return h;
+      });
+    } else if (!on && o.handles) {
+      for (const h of o.handles) h.remove();
+      o.handles = null;
+    }
+  }
+
+  listenDrag(o, key) {
+    const el = o.el;
+    el.addEventListener("pointerdown", (ev) => this.dragStart(ev, key));
+    el.addEventListener("pointermove", (ev) => this.dragMove(ev, key));
+    el.addEventListener("pointerup", () => this.dragUp(key));
+    el.addEventListener("pointercancel", () => this.dragCancel(key));
+    // A wheel over a draggable outline still zooms the waterfall under it.
+    el.addEventListener(
+      "wheel",
+      (ev) => {
+        const target = this.wf.overlay;
+        if (!target || !el.classList.contains("retunable")) return;
+        ev.preventDefault();
+        target.dispatchEvent(new WheelEvent("wheel", ev));
+      },
+      { passive: false },
+    );
+  }
+
+  layerY(ev) {
+    return ev.clientY - this.layer.getBoundingClientRect().top;
+  }
+
+  dragStart(ev, key) {
+    const o = this.outlines.get(key);
+    if (!o || ev.button !== 0 || this.drag || !o.el.classList.contains("retunable")) return;
+    ev.preventDefault();
+    const handle = ev.target.closest(".outline-handle");
+    const mode = handle ? handle.dataset.edge : "move";
+    try {
+      ev.target.setPointerCapture(ev.pointerId);
+    } catch {
+      // no capture (a synthetic event): the drag still runs while the pointer is over it
+    }
+    const { lo, hi } = o;
+    this.drag = {
+      key,
+      job: o.job,
+      mode,
+      y0: this.layerY(ev),
+      lo0: lo,
+      hi0: hi,
+      lo,
+      hi,
+      moved: false,
+    };
+  }
+
+  dragMove(ev, key) {
+    const d = this.drag;
+    const o = this.outlines.get(key);
+    if (!d || d.key !== key || d.sending || !o || this.wf.yForHz(d.lo0) === null) return;
+    const y = this.layerY(ev);
+    if (!d.moved && Math.abs(y - d.y0) < DRAG_CLICK_PX) return;
+    const delta = this.wf.hzForY(y) - this.wf.hzForY(d.y0);
+    if (!Number.isFinite(delta)) return;
+    if (d.mode === "move") {
+      d.lo = d.lo0 + delta;
+      d.hi = d.hi0 + delta;
+    } else if (d.mode === "hi") {
+      d.lo = d.lo0;
+      d.hi = Math.max(d.hi0 + delta, d.lo0 + MIN_WIDTH_HZ);
+    } else {
+      d.lo = Math.min(d.lo0 + delta, d.hi0 - MIN_WIDTH_HZ);
+      d.hi = d.hi0;
+    }
+    if (!d.moved) {
+      d.moved = true;
+      this.ghostEl = document.createElement("div");
+      this.ghostEl.className = "outline-ghost";
+      this.layer.prepend(this.ghostEl);
+      this.readoutEl = document.createElement("span");
+      this.readoutEl.className = "outline-readout";
+      o.el.append(this.readoutEl);
+      this.placeGhost();
+    }
+    o.lo = d.lo;
+    o.hi = d.hi;
+    this.placeOutline(o);
+    this.readoutEl.textContent = `${bandText((d.lo + d.hi) / 2, d.hi - d.lo)} · release to retune`;
+  }
+
+  // The release: a click (under DRAG_CLICK_PX) sends nothing; a drag retunes the job.
+  async dragUp(key) {
+    const d = this.drag;
+    if (!d || d.key !== key || d.sending) return;
+    if (!d.moved) {
+      this.drag = null;
+      return;
+    }
+    d.sending = true;
+    let result = null;
+    try {
+      result = await this.applyOp({
+        op: "job_retune",
+        job: d.job.id,
+        center_hz: Math.round((d.lo + d.hi) / 2),
+        bandwidth_hz: Math.round(d.hi - d.lo),
+        replace: [],
+      });
+    } catch {
+      result = null;
+    }
+    if (this.drag !== d) return; // the outline went meanwhile
+    this.endDrag(result === null);
+  }
+
+  dragCancel(key) {
+    const d = this.drag;
+    if (d && d.key === key && !d.sending) this.endDrag(true);
+  }
+
+  // Ends the drag, its outline back on the ghost's band with `snapBack`.
+  endDrag(snapBack = false) {
+    const d = this.drag;
+    this.drag = null;
+    if (this.ghostEl) this.ghostEl.remove();
+    if (this.readoutEl) this.readoutEl.remove();
+    this.ghostEl = null;
+    this.readoutEl = null;
+    const o = d && this.outlines.get(d.key);
+    if (o && snapBack) {
+      o.lo = d.lo0;
+      o.hi = d.hi0;
+      this.placeOutline(o);
+    }
+  }
+
+  placeGhost() {
+    const d = this.drag;
+    if (!d || !this.ghostEl) return;
+    const top = this.wf.yForHz(d.hi0);
+    const bottom = this.wf.yForHz(d.lo0);
+    if (top === null || bottom === null) return;
+    this.ghostEl.style.top = `${top}px`;
+    this.ghostEl.style.height = `${Math.max(1, bottom - top)}px`;
   }
 
   placeOutline(o) {
@@ -767,7 +983,10 @@ class Overlays {
   // Re-places everything vertically (the band or the height changed).
   layout() {
     this.outlineCapture();
-    for (const o of this.outlines.values()) this.placeOutline(o);
+    for (const [key, o] of this.outlines) {
+      if (!this.drag || this.drag.key !== key) this.placeOutline(o);
+    }
+    this.placeGhost();
     for (const r of this.ribbons) {
       r.top = this.yFor(r.hz) - r.h / 2 + r.dy;
       r.el.style.top = `${r.top}px`;

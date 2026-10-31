@@ -1730,6 +1730,183 @@ def scenario_rigid_bands_are_outlined(page, url, secret):
             stop_job(url, secret, hi)
 
 
+
+# ---- draggable outlines (plan 18 Task 6) -----------------------------------------------------
+# A running rigid job the node can retune is dragged by its outline: an edge handle resizes,
+# the body moves, release sends `job_retune`. `retune` shows its 48 kHz capture.
+
+def is_op(name):
+    def pred(r):
+        if r.method != "POST" or not r.url.endswith("/op"):
+            return False
+        try:
+            body = json.loads(r.post_data or "")
+        except ValueError:
+            return False
+        return body.get("op") == name
+    return pred
+
+
+def outline_box(page, job):
+    return page.locator(f'#waterfall .outline[data-key="{job}"]').bounding_box()
+
+
+def show_retune(page, url, secret):
+    """Show `retune`; (its capture's centre, Hz per CSS pixel of the waterfall)."""
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    hzpp = 48_000 / page.locator("#waterfall canvas.wf-canvas").bounding_box()["height"]
+    return cur, hzpp
+
+
+def centre_of(box):
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+
+def scenario_drag_handle_narrows_the_band_and_clamps_at_1_khz(page, url, secret):
+    cur, hzpp = show_retune(page, url, secret)
+    job = start_job(url, secret, "passthrough", "retune", cur, 10_000)
+    try:
+        ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
+        page.evaluate("window.zetaTest.poll()")
+        expect(ol.locator(".outline-handle")).to_have_count(2)
+        ghost = page.locator("#waterfall .outline-ghost")
+        readout = page.locator("#waterfall .outline-readout")
+        x, y = centre_of(ol.locator('.outline-handle[data-edge="hi"]').bounding_box())
+        with page.expect_request(is_op("job_retune")) as req:
+            page.mouse.move(x, y)
+            page.mouse.down()
+            page.mouse.move(x, y + 20, steps=5)
+            expect(ghost).to_have_count(1)
+            expect(readout).to_contain_text("release to retune")
+            top = ol.bounding_box()["y"]
+            page.evaluate("window.zetaTest.poll()")
+            page.wait_for_timeout(300)
+            assert abs(ol.bounding_box()["y"] - top) < 1, "a poll mid-drag moved the outline"
+            page.mouse.up()
+        body = json.loads(req.value.post_data)
+        assert body["job"] == job and body["replace"] == [], f"job_retune {body}"
+        assert abs(body["bandwidth_hz"] - (10_000 - 20 * hzpp)) <= 1.5 * hzpp, f"{body}"
+        assert abs(body["center_hz"] - (cur - 10 * hzpp)) <= 1.5 * hzpp, f"{body}"
+        expect(ghost).to_have_count(0)
+        expect(readout).to_have_count(0)
+        want = {"center_hz": body["center_hz"], "bandwidth_hz": body["bandwidth_hz"]}
+        wait_until(lambda: job_record(url, secret, job)["tuning"] == want, 5.0,
+                   "the record follows")
+        expect(page.locator("#transcript .line.op", has_text=re.compile(
+            rf"^job_retune job={job} .*→ job {job}"))).to_have_count(1)
+        # Clamp: drag the hi handle down past the lo edge.
+        page.evaluate("window.zetaTest.poll()")
+        h = ol.bounding_box()["height"]
+        x, y = centre_of(ol.locator('.outline-handle[data-edge="hi"]').bounding_box())
+        with page.expect_request(is_op("job_retune")) as req2:
+            page.mouse.move(x, y)
+            page.mouse.down()
+            page.mouse.move(x, y + h + 40, steps=5)
+            expect(readout).to_contain_text("1.0 kHz")
+            page.mouse.up()
+        body2 = json.loads(req2.value.post_data)
+        assert body2["bandwidth_hz"] == 1000, f"clamped job_retune {body2}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_drag_body_moves_the_centre_and_a_short_drag_is_a_click(page, url, secret):
+    cur, hzpp = show_retune(page, url, secret)
+    job = start_job(url, secret, "passthrough", "retune", cur, 10_000)
+    try:
+        ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
+        page.evaluate("window.zetaTest.poll()")
+        expect(ol.locator(".outline-handle")).to_have_count(2)
+        ghost = page.locator("#waterfall .outline-ghost")
+        x, y = centre_of(outline_box(page, job))
+        with page.expect_request(is_op("job_retune")) as req:
+            page.mouse.move(x, y)
+            page.mouse.down()
+            page.mouse.move(x, y + 30, steps=5)
+            page.mouse.up()
+        body = json.loads(req.value.post_data)
+        assert body["bandwidth_hz"] == 10_000, f"job_retune {body}"
+        assert abs(body["center_hz"] - (cur - 30 * hzpp)) <= 1.5 * hzpp, f"{body}"
+        wait_until(lambda: job_record(url, secret, job)["tuning"]["center_hz"]
+                   == body["center_hz"], 5.0, "the record follows")
+        page.evaluate("window.zetaTest.poll()")
+        # A 2 px drag sends nothing and leaves the outline where it is.
+        seen = []
+        page.on("request", lambda r: seen.append(r) if is_op("job_retune")(r) else None)
+        top = outline_box(page, job)["y"]
+        x, y = centre_of(outline_box(page, job))
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(x, y + 2, steps=2)
+        page.mouse.up()
+        page.wait_for_timeout(500)
+        assert seen == [], f"a 2 px drag sent {[r.post_data for r in seen]}"
+        expect(ghost).to_have_count(0)
+        assert abs(outline_box(page, job)["y"] - top) < 1, "a 2 px drag moved the outline"
+        # A pointercancel mid-drag snaps back and sends nothing.
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(x, y + 25, steps=5)
+        expect(ghost).to_have_count(1)
+        ol.dispatch_event("pointercancel")
+        page.wait_for_timeout(300)
+        assert seen == [], f"a cancelled drag sent {[r.post_data for r in seen]}"
+        expect(ghost).to_have_count(0)
+        assert abs(outline_box(page, job)["y"] - top) < 1, "a cancelled drag did not snap back"
+        page.mouse.up()
+        page.wait_for_timeout(200)
+        assert seen == [], f"the release after a cancel sent {[r.post_data for r in seen]}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_drag_outside_the_capture_conflicts_snaps_back_and_the_retry_moves_it(
+        page, url, secret):
+    cur, _ = show_retune(page, url, secret)
+    a = start_job(url, secret, "passthrough", "retune", cur, 10_000)
+    b = None
+    try:
+        b = start_job(url, secret, "passthrough", "retune", cur + 8_000, 4_000)
+        page.evaluate("window.zetaTest.poll()")
+        ol = page.locator(f'#waterfall .outline[data-key="{b}"]')
+        expect(ol.locator(".outline-handle")).to_have_count(2)
+        ob = outline_box(page, b)
+        top = ob["y"]
+        h = page.locator("#waterfall canvas.wf-canvas").bounding_box()["height"]
+        x, y = centre_of(ob)
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(x, y - h - 20, steps=8)  # pointer capture keeps the drag
+        page.mouse.up()
+        at = re.escape(f"{cur / 1e6:.3f}")
+        line = page.locator("#transcript .line.error",
+                            has_text=re.compile(rf"conflict.*held by passthrough {a} @ {at}"))
+        expect(line).to_have_count(1)
+        wait_until(lambda: abs(outline_box(page, b)["y"] - top) < 1, 3.0, "snap back")
+        assert job_record(url, secret, b)["tuning"]["center_hz"] == cur + 8_000
+        button = line.locator("button", has_text=f"stop passthrough {a[-6:]} and retry")
+        expect(button).to_have_count(1)
+        with page.expect_request(is_op("job_retune")) as req:
+            button.click()
+        body = json.loads(req.value.post_data)
+        assert body["replace"] == [a], f"retry {body}"
+
+        def moved():
+            ra, rb = job_record(url, secret, a), job_record(url, secret, b)
+            return (ra["state"]["status"] == "stopped"
+                    and rb["tuning"]["center_hz"] == body["center_hz"])
+        wait_until(moved, 5.0, "A stopped, B moved")
+        assert source_info(url, secret, "retune")["current"]["center_hz"] == body["center_hz"]
+        expect(page.locator("#transcript .line.op", has_text=re.compile(
+            rf"^job_retune job={b} .*replace=… → job {b}"))).to_have_count(1)
+    finally:
+        stop_job(url, secret, a)
+        if b:
+            stop_job(url, secret, b)
+
+
 def move_retune_capture(url, secret):
     """Hold `retune` with a rigid passthrough on its capture, then move the capture 1 MHz with
     a rigid start that replaces it; (the new job's id, the old centre, the new centre)."""
@@ -2192,6 +2369,8 @@ def scenario_watch_entry_starts_a_watch_and_outlines_its_band(page, url, secret)
         page.evaluate("window.zetaTest.poll()")
         expect(el).to_have_count(1)
         expect(el).to_contain_text("watch")
+        expect(el.locator(".outline-handle")).to_have_count(0)
+        assert "retunable" not in (el.get_attribute("class") or "")
     finally:
         for j in watches:
             stop_job(url, secret, j["id"])

@@ -169,6 +169,24 @@ html[data-map="on"] #waterfall { right: 50%; }
   position: absolute; right: 6px; top: 1px; padding: 0 4px; font-size: 11px; border-radius: 2px;
   color: var(--accent); background: rgba(11, 14, 20, 0.78); white-space: nowrap;
 }
+/* a retunable job's outline (wide footprint): the body moves it, the edge handles resize it */
+#waterfall .outline.retunable { pointer-events: auto; cursor: grab; touch-action: none; }
+#waterfall .outline.retunable:active { cursor: grabbing; }
+#waterfall .outline-handle {
+  position: absolute; left: 0; right: 0; height: 8px; cursor: ns-resize; pointer-events: auto;
+}
+#waterfall .outline-handle[data-edge="hi"] { top: -4px; }
+#waterfall .outline-handle[data-edge="lo"] { bottom: -4px; }
+/* the band a drag left (dimmer, dashed, no label) and the dragged band's readout under it */
+#waterfall .outline-ghost {
+  position: absolute; left: 0; right: 0; box-sizing: border-box;
+  border-top: 1px dashed var(--dim); border-bottom: 1px dashed var(--dim); opacity: 0.6;
+}
+#waterfall .outline-readout {
+  position: absolute; right: 6px; top: calc(100% + 2px); padding: 0 4px; font-size: 11px;
+  border-radius: 2px; color: var(--accent); background: rgba(11, 14, 20, 0.78);
+  white-space: nowrap; pointer-events: none;
+}
 #waterfall .ov-mark {
   position: absolute; right: 0; width: 10px; height: 0; margin-top: -1px;
   border-top: 2px solid var(--ok);
