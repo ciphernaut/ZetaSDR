@@ -58,13 +58,19 @@ impl Node {
             self.replace_holders(&rec.source, replace, &guard).await?;
         }
         let leases = &self.inner.leases;
-        let (capture, tuned) = leases
-            .retune_locked(port.as_ref(), id, want, &guard)
-            .await
-            .map_err(|e| match e {
-                LeaseError::Port(p) => NodeError::SourcePort(rec.source.clone(), p),
-                e => NodeError::Lease(e),
-            })?;
+        let (capture, tuned) = match leases.retune_locked(port.as_ref(), id, want, &guard).await {
+            Ok(r) => r,
+            Err(e) => {
+                // The old lease is back; but the run may have ended meanwhile (a port
+                // error took a while) and released a lease that was set aside then:
+                // the restored one must not outlive the job.
+                self.inner.release_unless_live(id);
+                return Err(match e {
+                    LeaseError::Port(p) => NodeError::SourcePort(rec.source.clone(), p),
+                    e => NodeError::Lease(e),
+                });
+            }
+        };
         let bin_rate = self.inner.bank_bin_rate(&rec.source, capture);
         let graph = match kind.reexpand_carrying(
             &rec.source,
@@ -81,6 +87,8 @@ impl Node {
                 let back = leases
                     .retune_locked(port.as_ref(), id, rec.tuning, &guard)
                     .await;
+                // As above: no lease outlives a run that ended meanwhile.
+                self.inner.release_unless_live(id);
                 drop(guard);
                 if tuned || back.is_ok_and(|(_, t)| t) {
                     let _ = self.inner.relaunch_elastic(&rec.source, Some(id)).await;

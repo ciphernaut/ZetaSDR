@@ -2588,7 +2588,12 @@ async fn job_retune(
         bandwidth_hz,
     };
     let port = checked_port(node, &rec.source, &want)?;
-    kind.mode_row(&node.modes())?;
+    // The row's own width rule (a program row's `min_hz`), before the gate: the
+    // expansion would refuse it only after the lease moved and the radio tuned.
+    if let Some(row) = kind.mode_row(&node.modes())? {
+        let max = port.capabilities().max_bandwidth_hz.value().0;
+        template::check_band(row, want, max)?;
+    }
     match node.job_retune(&job, &kind, want, &replace).await {
         Ok(()) => Ok(OpResult::Job(job)),
         Err(e) => {

@@ -127,6 +127,13 @@ fn registry() -> StageRegistry {
         outputs: vec![StreamKind::Event],
         params_schema: schemars::json_schema!({"type": "object"}),
     })));
+    // Stands in for the program rows' stage (zeta-ext's): `adsb_decode` starts on it.
+    r.register(Arc::new(Transcribe(StageSpec {
+        kind: "external_decode",
+        inputs: vec![StreamKind::Iq, StreamKind::Audio],
+        outputs: vec![StreamKind::Event],
+        params_schema: schemars::json_schema!({"type": "object"}),
+    })));
     r
 }
 
@@ -651,6 +658,36 @@ async fn an_out_of_range_band_is_refused_before_anything_moves() {
     assert_eq!(rec.tuning, before.tuning);
     assert_eq!(rec.graph, before.graph);
     assert_eq!(radio.tunes(), tunes, "nothing moved");
+}
+
+/// A program row's `min_hz` (`adsb_decode`: 2 MHz) is checked before the gate, as
+/// `job_start` checks it: a narrower band outside the capture is refused without the
+/// lease moving or the radio tuning.
+#[tokio::test]
+async fn a_band_under_the_rows_min_hz_is_refused_before_anything_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio) = open(dir.path()).await;
+    let id = start(&node, JobKind::AdsbDecode, t(1_090_000_000, 2_400_000)).await;
+    let before = record(&node, &id);
+    let tunes = radio.tunes();
+    match retune(&node, &id, 1_000_000_000, 1_000_000, &[]).await {
+        Err(OpError::OutOfRange {
+            field, value, min, ..
+        }) => {
+            assert_eq!(field, "bandwidth_hz");
+            assert_eq!((value, min), (1_000_000, 2_000_000));
+        }
+        r => panic!("expected out_of_range, got {r:?}"),
+    }
+    let rec = record(&node, &id);
+    assert_eq!(rec.state, JobState::Running);
+    assert_eq!(rec.tuning, before.tuning);
+    assert_eq!(rec.graph, before.graph);
+    assert_eq!(radio.tunes(), tunes, "nothing moved");
+    assert_eq!(
+        source(&node).await.current,
+        Some(t(1_090_000_000, 2_400_000))
+    );
 }
 
 #[tokio::test]

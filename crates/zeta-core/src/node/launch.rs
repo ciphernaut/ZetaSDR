@@ -855,10 +855,11 @@ impl Inner {
         })
     }
 
-    /// Release `id`'s lease after a launch failed past its grant, unless a live run
-    /// of the id (another launch that recorded first) holds it: the lease is keyed
-    /// by the id, and that run's supervisor releases it.
-    fn release_unless_live(&self, id: &JobId) {
+    /// Release `id`'s lease after a launch failed past its grant (or a retune put a
+    /// lease back after its move failed), unless a live run of the id (another launch
+    /// that recorded first, or the retuned job still running) holds it: the lease is
+    /// keyed by the id, and that run's supervisor releases it.
+    pub(super) fn release_unless_live(&self, id: &JobId) {
         let live = self
             .jobs
             .lock()
