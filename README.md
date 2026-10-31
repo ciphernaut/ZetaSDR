@@ -49,7 +49,7 @@ One-shot commands open the node, apply one operation, persist and exit; they do 
 real time and loop. `--source-file` is not persisted: pass it on every invocation.
 
 While `zeta serve` runs it holds `serve.lock` (its pid) in the state directory, and the mutating
-one-shot commands (`job start`, `job stop`, `graph put`, `source ensure`) exit 2 with
+one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `graph put`, `source ensure`) exit 2 with
 `{"error": "other", "message": "zeta serve (pid N) owns this state dir"}`. A lock whose pid is no
 longer alive is treated as stale. Liveness is checked through `/proc/<pid>`, so this is Linux only.
 
@@ -62,6 +62,7 @@ A="--state-dir scratch/state --source-file tone=scratch/fx/tone.sigmf-meta"
 ./target/debug/zeta $A job list
 ./target/debug/zeta $A iq read --source tone --start-ns 0 --end-ns 1000000000 --center-hz 100000000 --bandwidth-hz 48000
 ls scratch/state/captures               # a .sigmf-meta / .sigmf-data pair
+./target/debug/zeta $A job retune --job <id> --center-hz 100010000 --bandwidth-hz 10000   # same id; attached jobs follow
 ./target/debug/zeta $A job stop --job <id from job start>
 ./target/debug/zeta agents-md            # the agent guide, rendered from the operation schema
 ```

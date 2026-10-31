@@ -529,6 +529,20 @@ pub enum JobCmd {
         #[arg(long, value_name = "CODE")]
         language: Option<String>,
     },
+    /// Move a running job to another band under the same id (its attached jobs follow)
+    Retune {
+        /// The running job to move (an id from `job list`)
+        #[arg(long, value_name = "ID")]
+        job: String,
+        /// New centre frequency in Hz
+        #[arg(long, value_name = "HZ")]
+        center_hz: u64,
+        /// New bandwidth in Hz
+        #[arg(long, value_name = "HZ")]
+        bandwidth_hz: u64,
+        #[command(flatten)]
+        replace: ReplaceArg,
+    },
     /// List jobs
     List,
     /// Stop a job
@@ -717,8 +731,12 @@ impl Command {
                     | SourceCmd::Pin { .. }
                     | SourceCmd::Unpin { .. }
                     | SourceCmd::Gain { .. }
-            ) | Command::Job(JobCmd::Start { .. } | JobCmd::Attach { .. } | JobCmd::Stop(_))
-                | Command::Graph(GraphCmd::Put { .. })
+            ) | Command::Job(
+                JobCmd::Start { .. }
+                    | JobCmd::Attach { .. }
+                    | JobCmd::Retune { .. }
+                    | JobCmd::Stop(_)
+            ) | Command::Graph(GraphCmd::Put { .. })
         )
     }
 
@@ -806,6 +824,17 @@ impl Command {
                 kind: kind.into(),
                 job: JobId(job),
                 language,
+            },
+            Command::Job(JobCmd::Retune {
+                job,
+                center_hz,
+                bandwidth_hz,
+                replace,
+            }) => Op::JobRetune {
+                job: JobId(job),
+                center_hz: Hz(center_hz),
+                bandwidth_hz: Hz(bandwidth_hz),
+                replace: replace.into_ids(),
             },
             Command::Job(JobCmd::List) => Op::JobList {},
             Command::Job(JobCmd::Stop(a)) => Op::JobStop { job: job(a) },

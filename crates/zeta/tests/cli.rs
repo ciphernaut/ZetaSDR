@@ -496,6 +496,106 @@ fn source_ensure_replace_flag_round_trips_to_the_op() {
 }
 
 #[test]
+fn job_retune_one_shot_is_refused_for_a_job_not_running_here() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "passthrough",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let id = json(&out)["value"].as_str().expect("job id").to_string();
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "retune",
+            "--job",
+            &id,
+            "--center-hz",
+            "100010000",
+            "--bandwidth-hz",
+            "10000",
+        ],
+    )
+    .assert()
+    .code(2)
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("is not running in this node"),
+        "{v}"
+    );
+    let out = zeta(dir.path(), &["job", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let jobs = json(&out);
+    let rec = jobs["value"]
+        .as_array()
+        .and_then(|a| a.iter().find(|j| j["id"] == id.as_str()))
+        .unwrap_or_else(|| panic!("{jobs}"));
+    assert_eq!(rec["tuning"]["center_hz"], 100_000_000u64, "{rec}");
+    assert_eq!(rec["tuning"]["bandwidth_hz"], 48_000u64, "{rec}");
+}
+
+#[test]
+fn job_retune_replace_flag_round_trips_to_the_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let retune = |replace: &str| {
+        zeta(
+            dir.path(),
+            &[
+                "job",
+                "retune",
+                "--job",
+                "01AAAAAAAAAAAAAAAAAAAAAAAA",
+                "--center-hz",
+                "1",
+                "--bandwidth-hz",
+                "1",
+                "--replace",
+                replace,
+            ],
+        )
+    };
+    retune("01BBBBBBBBBBBBBBBBBBBBBBBB,01CCCCCCCCCCCCCCCCCCCCCCCC")
+        .assert()
+        .code(2);
+    let op = last_logged_op(dir.path());
+    assert_eq!(op["op"], "job_retune", "{op}");
+    assert_eq!(
+        op["replace"],
+        serde_json::json!(["01BBBBBBBBBBBBBBBBBBBBBBBB", "01CCCCCCCCCCCCCCCCCCCCCCCC"]),
+        "{op}"
+    );
+    retune("").assert().code(2);
+    assert_eq!(last_logged_op(dir.path())["replace"], serde_json::json!([]));
+}
+
+#[test]
 fn iq_read_one_shot_writes_capture() {
     let dir = tempfile::tempdir().unwrap();
     let out = zeta(
@@ -560,6 +660,16 @@ fn mutating_one_shot_refused_while_serve_lock_held() {
         graph.to_str().unwrap(),
     ];
     let stop = ["job", "stop", "--job", "j"];
+    let retune = [
+        "job",
+        "retune",
+        "--job",
+        "j",
+        "--center-hz",
+        "100000000",
+        "--bandwidth-hz",
+        "48000",
+    ];
     let want = format!("zeta serve (pid {pid}) owns this state dir");
     for args in [
         &start[..],
@@ -568,6 +678,7 @@ fn mutating_one_shot_refused_while_serve_lock_held() {
         &unpin[..],
         &put[..],
         &stop[..],
+        &retune[..],
     ] {
         let out = zeta(dir.path(), args)
             .assert()

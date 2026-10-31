@@ -76,6 +76,26 @@ fn source_ensure_tool_shape() {
 }
 
 #[test]
+fn job_retune_tool_shape() {
+    let t = op_tools(&schema(), MD)
+        .into_iter()
+        .find(|t| t.name == "job_retune")
+        .unwrap();
+    let required: BTreeSet<&str> = t.input_schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        required,
+        BTreeSet::from(["bandwidth_hz", "center_hz", "job", "replace"])
+    );
+    assert_eq!(t.input_schema["properties"]["replace"]["type"], "array");
+    assert!(t.description.contains("under the same id"));
+}
+
+#[test]
 fn job_start_kind_is_inlined_enum() {
     let tools = op_tools(&schema(), MD);
     let t = tools.iter().find(|t| t.name == "job_start").unwrap();

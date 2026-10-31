@@ -333,3 +333,52 @@ fn then_tail_with_node_is_usage_error() {
         .stdout("")
         .stderr(contains("--then-tail is not supported with --node yet"));
 }
+
+#[test]
+fn remote_job_retune_moves_a_running_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ServeProc::start(dir.path(), SECRET);
+    let remote = |args: &[&str]| {
+        json(
+            &zeta_remote(&p.url, SECRET, args)
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+    };
+    let started = remote(&[
+        "job",
+        "start",
+        "--kind",
+        "passthrough",
+        "--source",
+        "tone",
+        "--center-hz",
+        "100000000",
+        "--bandwidth-hz",
+        "48000",
+    ]);
+    let id = started["value"].as_str().expect("job id").to_string();
+    let moved = remote(&[
+        "job",
+        "retune",
+        "--job",
+        &id,
+        "--center-hz",
+        "100010000",
+        "--bandwidth-hz",
+        "10000",
+    ]);
+    assert_eq!(moved["value"], id.as_str(), "{moved}");
+    let jobs = remote(&["job", "list"]);
+    let all = jobs["value"].as_array().expect("jobs");
+    let pass: Vec<&Value> = all.iter().filter(|j| j["kind"] == "passthrough").collect();
+    assert_eq!(pass.len(), 1, "{jobs}");
+    let rec = pass[0];
+    assert_eq!(rec["id"], id.as_str(), "{rec}");
+    assert_eq!(rec["state"]["status"], "running", "{rec}");
+    assert_eq!(rec["tuning"]["center_hz"], 100_010_000u64, "{rec}");
+    assert_eq!(rec["tuning"]["bandwidth_hz"], 10_000u64, "{rec}");
+}
