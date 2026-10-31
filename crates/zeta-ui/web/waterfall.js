@@ -53,6 +53,8 @@
 //         waterfall draws the shown source's scan itself, and before the band is known
 //     wf.coarsePainted  columns painted with the coarse layer in them since mount (composed
 //         over coarse rows, or the coarse layer alone; never reset; for tests)
+//     wf.coarseMasked   coarse rows addCoarseEvent stored that carried `masked` (never
+//         reset; for tests)
 //     wf.clearCoarse()  forgets the coarse rows (the coarse layer went empty)
 //     wf.syncSources(sources)  a `source_list` result (app.js hands it every jobs poll); see
 //         Following the capture
@@ -91,7 +93,10 @@
 // event v2 (`q` of up to 8192 u8 levels with `floor_db` and `step_db`, db = floor_db +
 // q * step_db) is decoded straight into colour through a 256-entry lookup table, without a
 // float array; an older node's `db` array is still drawn. Each canvas pixel row shows the
-// strongest bin it covers (bins are mapped onto the canvas height across the band). Colour:
+// strongest bin it covers (bins are mapped onto the canvas height across the band). A row's
+// `masked` ([[lo, hi], ...], bin indices, hi exclusive: a scan's DC notch and band edges)
+// bins are never painted: a pixel row takes the strongest unmasked bin it covers, and one
+// whose bins are all masked keeps what the previous row left there. Colour:
 // dB clamped to [floor - 10, floor + 60], floor being the 15th percentile of the row's own
 // values, through a 256-entry blue-yellow-white ramp. The frequency
 // band comes from each event (`center_hz`, `size * bin_hz`), falling back to the job's tuning.
@@ -122,9 +127,10 @@
 // mode stitches its rows (the rest keeps what earlier rows left there), and on top of it the
 // fine row over its own band. Without coarse rows the coarse column is background, so the
 // fine column looks as before. Coarse rows are kept (RING_COLUMNS of them) with the column
-// they arrived before, so a redraw replays them between the fine columns, up to one sweep of
-// the older ones first. The axis spans the view, also when wider than the capture. When no
-// fine column has been painted for COARSE_ALONE_MS (the fine job stopped, its socket is
+// they arrived before, so a redraw replays them between the fine columns, up to two sweeps of
+// the older ones first (counted by steps, so both the even and the shifted odd grid fill
+// what the other's masks left). The axis spans the view, also when wider than the capture.
+// When no fine column has been painted for COARSE_ALONE_MS (the fine job stopped, its socket is
 // reconnecting, or its restart failed), each coarse row, at most MAX_ROWS_PER_S a second,
 // paints a column of the coarse layer alone (kept in the ring as such for redraws). A
 // restart on the same source keeps the band shown as the view while the band is unknown, so
@@ -142,7 +148,9 @@
 // can reach past it at the span's ends); each row covers only its step's band (`center_hz` ±
 // size × bin_hz / 2) and paints that vertical segment of a new column, the rest of the column
 // repeating the previous one, so a sweep fills the columns progressively. A redraw (a zoom or
-// pan) replays one sweep of older rows first, so its oldest column is not left partly blank.
+// pan) replays two sweeps of older rows first (counted by steps: the even and the shifted odd
+// grid, each filling what the other's masks left), so its oldest column is not left partly
+// blank.
 // When the page's own job_start is refused as a conflict and a scan now runs on the source,
 // the waterfall follows that scan instead.
 //
@@ -255,19 +263,40 @@ function qLut(q, floorDb, stepDb) {
   return lut;
 }
 
-// The row of a spectrum event: {q, floorDb, stepDb} (v2), {db} (older nodes) or null.
+// The row of a spectrum event: {q, floorDb, stepDb} (v2), {db} (older nodes) or null. A
+// `masked` array in the event adds `masked`, its [lo, hi] pairs of two numbers (when at
+// least one is).
 export function decodeRow(p) {
   if (!p || typeof p !== "object") return null;
+  let row = null;
   if (
     Array.isArray(p.q) &&
     p.q.length &&
     typeof p.floor_db === "number" &&
     typeof p.step_db === "number"
   ) {
-    return { q: Uint8Array.from(p.q), floorDb: p.floor_db, stepDb: p.step_db };
+    row = { q: Uint8Array.from(p.q), floorDb: p.floor_db, stepDb: p.step_db };
+  } else if (Array.isArray(p.db) && p.db.length) {
+    row = { db: Float32Array.from(p.db) };
   }
-  if (Array.isArray(p.db) && p.db.length) return { db: Float32Array.from(p.db) };
-  return null;
+  if (row && Array.isArray(p.masked)) {
+    const masked = p.masked
+      .filter((m) => Array.isArray(m) && m.length === 2 && m.every((x) => typeof x === "number"))
+      .map((m) => [m[0], m[1]]);
+    if (masked.length) row.masked = masked;
+  }
+  return row;
+}
+
+// Per-bin flags of `row.masked` (1: masked) over `size` bins.
+function maskBins(masked, size) {
+  const bins = new Uint8Array(size);
+  for (const [lo, hi] of masked) {
+    const a = Math.max(0, Math.ceil(lo));
+    const b = Math.min(size, Math.ceil(hi));
+    for (let k = a; k < b; k++) bins[k] = 1;
+  }
+  return bins;
 }
 
 // ---- source band -----------------------------------------------------------------------
@@ -345,12 +374,33 @@ function bandRow(row, p, tuning) {
   return true;
 }
 
-// Rows in one sweep of a scan over `span` ({lo, hi}) whose newest row is `row`: the span over
-// the row's width, rounded up (the steps overlap at most at the span's ends, so this is never
-// fewer than the sweep); 0 without either.
+// Steps in one sweep of a scan over `span` ({lo, hi}) whose newest row is `row`: the span over
+// the row's width, rounded up, plus one (never fewer than a sweep's steps, the odd sweep's
+// extra half-step one included); 0 without either.
 function sweepCount(row, span) {
   if (!row || !span || !(row.hi > row.lo)) return 0;
   return Math.ceil((span.hi - span.lo) / (row.hi - row.lo)) + 1;
+}
+
+// The first index from which the rows before `end` (exclusive) span at most `steps` scan
+// steps: walks i from end - 1 down to `floor` over rowAt(i) (anything without a numeric
+// lo/hi is skipped), counting a step each time a row's centre differs from the newer one's.
+// `end` when `steps` is 0, `floor` when the rows run out first.
+function stepsBack(rowAt, end, steps, floor = 0) {
+  if (!(steps > 0)) return end;
+  let count = 0;
+  let prev = null;
+  for (let i = end - 1; i >= floor; i--) {
+    const r = rowAt(i);
+    if (!r || typeof r.lo !== "number" || typeof r.hi !== "number") continue;
+    const c = (r.lo + r.hi) / 2;
+    if (c !== prev) {
+      if (count === steps) return i + 1;
+      count += 1;
+      prev = c;
+    }
+  }
+  return floor;
 }
 
 // ---- the waterfall ---------------------------------------------------------------------
@@ -382,6 +432,7 @@ class Waterfall {
     this.coarseRows = []; // {row, col}: a coarse row stitched before fine column `col`
     this.coarseSpan = null; // the union of the stored coarse rows' bands
     this.coarsePainted = 0;
+    this.coarseMasked = 0; // coarse rows stored that carried `masked` (for tests)
     this.lastCoarsePaint = -Infinity;
     this.easing = false;
     this.easeRaf = null;
@@ -1252,6 +1303,7 @@ class Waterfall {
     if (!row || !bandRow(row, msg.payload, null)) return;
     this.coarseRows.push({ row, col: this.columns });
     if (this.coarseRows.length > RING_COLUMNS) this.coarseRows.shift();
+    if (row.masked) this.coarseMasked += 1;
     const sp = this.coarseSpan;
     this.coarseSpan = sp
       ? { lo: Math.min(sp.lo, row.lo), hi: Math.max(sp.hi, row.hi) }
@@ -1284,13 +1336,14 @@ class Waterfall {
     this.scheduleRedraw();
   }
 
-  // Stitches up to one sweep of the coarse rows before index `end` (exclusive) into a blank
-  // coarse column, on the band shown.
+  // Stitches up to two sweeps (counted by steps, stepsBack) of the coarse rows before index
+  // `end` (exclusive) into a blank coarse column, on the band shown.
   replayCoarse(end) {
     if (!this.coarseColumn) return;
     this.blankBuffer(this.coarseColumn);
     const newest = end > 0 ? this.coarseRows[end - 1].row : null;
-    const from = Math.max(0, end - sweepCount(newest, this.coarseSpan));
+    const steps = 2 * sweepCount(newest, this.coarseSpan);
+    const from = stepsBack((i) => this.coarseRows[i].row, end, steps);
     for (let i = from; i < end; i++) {
       this.fillColumn(this.coarseRows[i].row, false, this.coarseColumn);
     }
@@ -1333,8 +1386,10 @@ class Waterfall {
   // Writes `row` (bins spread over row.lo..row.hi Hz) into `buf` (this.column by default)
   // on the band shown. Levels are compared as stored (q is monotonic in dB) and turned into
   // a ramp index only for the strongest bin of each pixel row, or the nearest bin when a bin
-  // spans several rows. Pixel rows outside the row's band get the background with `fill`,
-  // else keep their value.
+  // spans several rows. Masked bins (row.masked) take no part: a pixel row takes the strongest
+  // unmasked bin it covers, and one whose bins are all masked keeps its value (whatever
+  // `fill`). Pixel rows outside the row's band get the background with `fill`, else keep
+  // their value.
   fillColumn(row, fill, buf = this.column) {
     const s = this.shown() || { lo: row.lo, hi: row.hi };
     let levels;
@@ -1351,6 +1406,8 @@ class Waterfall {
       colour = (v) => toRamp((v - lo) * COLOUR_SCALE);
     }
     const size = levels.length;
+    if (row.masked && !row.maskBin) row.maskBin = maskBins(row.masked, size);
+    const mask = row.maskBin || null;
     const perBin = (row.hi - row.lo) / size;
     const span = s.hi - s.lo;
     const h = buf.height;
@@ -1370,7 +1427,15 @@ class Waterfall {
         const b0 = Math.max(0, Math.floor(x0));
         const b1 = Math.min(size, Math.floor(x1));
         if (b1 <= b0) {
-          v = levels[Math.min(size - 1, Math.max(0, Math.floor((x0 + x1) / 2)))];
+          const k = Math.min(size - 1, Math.max(0, Math.floor((x0 + x1) / 2)));
+          if (mask && mask[k]) continue;
+          v = levels[k];
+        } else if (mask) {
+          let k = b0;
+          while (k < b1 && mask[k]) k++;
+          if (k === b1) continue; // every bin covered is masked
+          v = levels[k];
+          for (k += 1; k < b1; k++) if (!mask[k] && levels[k] > v) v = levels[k];
         } else {
           v = levels[b0];
           for (let k = b0 + 1; k < b1; k++) if (levels[k] > v) v = levels[k];
@@ -1400,11 +1465,12 @@ class Waterfall {
   }
 
   // Paints every stored column again on the band shown, oldest first (scan columns build
-  // on the one before, as when they arrived). In scan mode up to one sweep of the stored rows
-  // older than the oldest column shown is replayed into the column first (not painted), so
-  // that column starts with every step's band rather than background; outside it the coarse
-  // rows are replayed the same way into the coarse column, and each later one before the
-  // fine column it arrived before.
+  // on the one before, as when they arrived). In scan mode up to two sweeps (counted by
+  // steps, stepsBack) of the stored rows older than the oldest column shown are replayed into
+  // the column first (not painted), so that column starts with every step's band, both
+  // grids filling each other's masks, rather than background; outside it the coarse rows
+  // are replayed the same way into the coarse column, and each later one before the fine
+  // column it arrived before.
   redraw() {
     const w = this.canvas.width;
     const h = this.canvas.height;
@@ -1418,9 +1484,11 @@ class Waterfall {
     const coarse = this.coarseRows;
     let ci = 0; // the next coarse row to stitch
     if (this.mode === "scan") {
-      const extra = Math.min(stored - n, this.sweepRows());
-      for (let k = n + extra - 1; k >= n; k--) {
-        const row = this.rows[(this.columns - 1 - k) % RING_COLUMNS];
+      const oldest = this.columns - n; // the oldest column shown
+      const rowAt = (c) => this.rows[c % RING_COLUMNS];
+      const from = stepsBack(rowAt, oldest, 2 * this.sweepRows(), this.columns - stored);
+      for (let c = from; c < oldest; c++) {
+        const row = rowAt(c);
         if (row && row.lo !== undefined) this.fillColumn(row, false);
       }
     } else {
@@ -1448,7 +1516,7 @@ class Waterfall {
     }
   }
 
-  // Rows in one scan sweep of the band (sweepCount over the newest row).
+  // Steps in one scan sweep of the band (sweepCount over the newest row).
   sweepRows() {
     return sweepCount(this.rows[(this.columns - 1) % RING_COLUMNS], this.band);
   }

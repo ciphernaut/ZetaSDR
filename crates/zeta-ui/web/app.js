@@ -857,8 +857,8 @@ window.zetaTest = {
     if (!c) return null;
     return { scanJobId: c.scanJobId, followed: c.followed, source: c.source, rows: c.rows };
   },
-  // The waterfall: {sourceId, jobId, painted, badge, coarsePainted, easing, view (the band
-  // shown, {lo, hi} or null), band (the capture)}, or null without one.
+  // The waterfall: {sourceId, jobId, painted, badge, coarsePainted, coarseMasked, easing, view
+  // (the band shown, {lo, hi} or null), band (the capture)}, or null without one.
   wf() {
     const wf = state.wf;
     if (!wf) return null;
@@ -869,10 +869,16 @@ window.zetaTest = {
       painted: wf.painted,
       badge: !wf.badge.hidden,
       coarsePainted: wf.coarsePainted,
+      coarseMasked: wf.coarseMasked,
       easing: wf.easing,
       view: box(wf.shown()),
       band: box(wf.band),
     };
+  },
+  // The Waterfall instance itself, or null without one: test-only, for e2e probes that call
+  // its methods inside the page (fillColumn, redraw); never used by the page.
+  waterfall() {
+    return state.wf || null;
   },
 };
 
