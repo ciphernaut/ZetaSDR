@@ -117,8 +117,9 @@ Under the source's gate, the node:
    id, after the input is running, as `recover.rs` does for a healed source. An attached job that
    cannot relaunch is `failed` with the reason, the retune still succeeds.
 
-The result is the job record (as `job_start` returns). The op is logged on the `ops` stream like
-the others.
+The result is the job's id, as `job_start` answers (its record is in `job_list`). The op is logged
+on the `ops` stream like the others. A one-shot node that loaded a `running` record it did not
+launch refuses with `job <id> is not running in this node (one-shot: use --node against zeta serve)`.
 
 Today an attached job ends `stopped` when its input's stream closes for any reason, a `graph_put`
 restart included; this plan narrows that: an input that is being retuned (or restarted by
@@ -187,7 +188,7 @@ Each running rigid job on the shown source gets a tag (`.job-tag[data-job]`) at 
 frequency, replacing the outline's bare kind label: `<kind> <short id> <squelch dot> <channel>
 <snippet>`:
 
-- `short id`: the last four characters of the job id, which is what the job list shows.
+- `short id`: the last six characters of the job id, which is what the job list shows.
 - the squelch dot: green while `job_context.squelch.open` is true, grey while false, absent for a
   kind without a squelch; the overlays already watch the job's event stream and see the `squelch`
   events, and read `job_context.squelch` once on first sight for a job whose gate changed before.
@@ -197,8 +198,8 @@ frequency, replacing the outline's bare kind label: `<kind> <short id> <squelch 
   route transcript events to ribbons), truncated to about 40 characters; absent until one arrives.
 
 Tags that would overlap stack like the layer-1 labels do. Hovering a tag or an outline adds `hot`
-to its job row in the list and the row's `data-job` is the hook; hovering a row adds `hot` to its
-tag and outline. Clicking a tag scrolls the row into view. Job rows gain the job's centre in MHz
+to its job row in the list (the row's `data-id`, with `data-job` added as an alias); hovering a row
+adds `hot` to its tag and outline. Clicking a tag scrolls the row into view. Job rows gain the job's centre in MHz
 and width in kHz if they do not show them today (the builder checks `agent.js`).
 
 ## 7. Documentation
@@ -235,7 +236,8 @@ Page (UI e2e, `crates/zeta-ui/tests/e2e/ui.py`, Playwright):
 
 - Fit first: a box drawn wide around the `tone` fixture's signal and "Decode › NBFM audio"
   produces an `fm_demod` whose `tuning` is the measured centre with a width well under the box;
-  a box on an empty part of the `retune` fixture's band starts at the box and the transcript says
+  a box on a new `quiet` white-noise fixture (the `retune` fixture is a pure tone, whose filter
+  leakage would not measure as `noise` deterministically) starts at the box and the transcript says
   so.
 - Drag: dragging the `hi` handle of the outline inwards sends `job_retune` (read from the ops
   stream) with the narrower band and the outline follows; dragging the body moves the centre; a
@@ -250,10 +252,9 @@ raises the harness deadline with the added scenarios' measured cost or splits th
 
 ## 9. Left to the builder
 
-- The exact pointer-event wiring and how the overlays map a pointer position back to Hz (the
-  waterfall owns the Hz-to-pixel mapping today; expose the inverse).
-- How the attached-job relaunch is factored between `job_graph_set`, the retune path and
-  `recover.rs` (one helper, three callers).
+- The exact pointer-event wiring; the waterfall's `hzForY` is the inverse mapping to use.
+- How the attached-job relaunch is factored between `job_graph_set` and the retune path (one
+  helper, two callers; `recover.rs` is record-driven and stays as it is).
 - Whether `job_retune` reuses `job_start`'s validation by constructing a `JobStart` op internally
   or by a shared function.
 - The tag stacking rule when more than three tags fall within one tag's width.
