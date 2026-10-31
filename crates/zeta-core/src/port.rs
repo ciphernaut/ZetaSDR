@@ -60,6 +60,22 @@ pub struct PortStats {
     pub restarts: u64,
 }
 
+/// The worker process behind a source, as `source_list` shows it: the live
+/// worker's pid (`null` while none is running: dead, respawning or waiting for
+/// the device), how many times a worker was spawned after the first, and when
+/// the live worker said hello, in ns since the UNIX epoch (`null` while none
+/// is running).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct WorkerInfo {
+    #[schemars(required, schema_with = "crate::types::nullable::<u32>")]
+    pub pid: Option<u32>,
+    pub restarts: u64,
+    #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
+    pub since_ns: Option<u64>,
+}
+
 /// A block of complex baseband samples.
 #[derive(Clone, Debug)]
 pub struct IqBlock {
@@ -235,5 +251,17 @@ pub trait Port: Send + Sync {
         Err(PortError::Unsupported(
             "source has no adjustable gain".into(),
         ))
+    }
+    /// A counter the port bumps each time it recovers from a fault on its own
+    /// (a respawned worker that found the device again), so the node can
+    /// restore the source's pin, gain and jobs. `None` for a port that never
+    /// heals by itself: its faults clear only on the operator's next tune.
+    fn healed(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+    /// The worker process behind the port, for a port that runs its device in
+    /// a child process; `None` for every other port.
+    fn worker(&self) -> Option<WorkerInfo> {
+        None
     }
 }
