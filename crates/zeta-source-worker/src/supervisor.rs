@@ -39,7 +39,7 @@ const BROADCAST_CAPACITY: usize = 64;
 /// status and stderr line are in before the fault is worked out. They end as
 /// soon as the pipes close, which a dead process does at once; the bound only
 /// matters when something the worker spawned still holds a pipe.
-const READER_JOIN: Duration = Duration::from_secs(1);
+pub(crate) const READER_JOIN: Duration = Duration::from_secs(1);
 /// A worker that keeps dying soon after each respawn is logged at most this
 /// often.
 const DYING_LOG_EVERY: Duration = Duration::from_secs(60);
@@ -101,6 +101,11 @@ type ReplyTx = oneshot::Sender<Result<Reply, PortError>>;
 pub(crate) struct Link {
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     pending: Mutex<HashMap<u64, ReplyTx>>,
+    /// Set once by [`Link::fail_all`], under the `pending` lock: after it, no
+    /// request is registered, so none can wait on a worker that has ended
+    /// (something the worker spawned may still hold its stdin, and a write
+    /// would then succeed into a pipe nobody answers).
+    closed: watch::Sender<bool>,
 }
 
 impl Link {
@@ -108,6 +113,7 @@ impl Link {
         Link {
             stdin: tokio::sync::Mutex::new(Some(stdin)),
             pending: Mutex::new(HashMap::new()),
+            closed: watch::channel(false).0,
         }
     }
 
@@ -123,7 +129,13 @@ impl Link {
         cmd: Cmd,
     ) -> std::io::Result<oneshot::Receiver<Result<Reply, PortError>>> {
         let (tx, rx) = oneshot::channel();
-        self.pending().insert(id, tx);
+        {
+            let mut pending = self.pending();
+            if *self.closed.borrow() {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            pending.insert(id, tx);
+        }
         let written = self.write(&Request { id, cmd }).await;
         if written.is_err() {
             self.forget(id);
@@ -146,9 +158,22 @@ impl Link {
         self.pending().remove(&id);
     }
 
-    /// Drop every waiting request, so each sees the worker's end.
+    /// Close the link: drop every waiting request, so each sees the worker's
+    /// end, and refuse any later one.
     fn fail_all(&self) {
-        self.pending().clear();
+        let mut pending = self.pending();
+        self.closed.send_replace(true);
+        pending.clear();
+    }
+
+    /// Wait up to `within` for the supervisor to close the link. A request
+    /// that found the worker gone (a failed write, a reply that never came)
+    /// waits here so it answers with the fault the worker's end leaves, which
+    /// is set before the link closes, rather than with what the snapshot said
+    /// while the death was not yet reaped.
+    pub(crate) async fn wait_closed(&self, within: Duration) {
+        let mut rx = self.closed.subscribe();
+        let _ = tokio::time::timeout(within, rx.wait_for(|c| *c)).await;
     }
 }
 
@@ -239,6 +264,17 @@ impl Supervisor {
 
     fn id(&self) -> &str {
         &self.cfg.id.0
+    }
+
+    /// `fault` as a log line names it: prefixed `soapy worker for <id>: `
+    /// unless the fault text already starts with the worker's name.
+    fn named(&self, fault: &str) -> String {
+        let name = format!("soapy worker for {}", self.id());
+        if fault.starts_with(&name) {
+            fault.to_string()
+        } else {
+            format!("{name}: {fault}")
+        }
     }
 
     /// Run until `cancel` fires or its sender is dropped (the port dropped),
@@ -547,11 +583,7 @@ impl Supervisor {
                 // most once a minute.
                 let logged = lived_long || may_log_dying;
                 if logged {
-                    eprintln!(
-                        "zeta: soapy worker for {}: {}; waiting for the device",
-                        self.id(),
-                        ended.fault
-                    );
+                    eprintln!("zeta: {}; waiting for the device", self.named(&ended.fault));
                     self.last_dying_log = Some(Instant::now());
                 }
                 self.episode = Some(Episode {
@@ -563,11 +595,7 @@ impl Supervisor {
             // Polling an absent device is the quiet wait the episode's line
             // announced; a respawn that died is worth a line now and then.
             Some(_) if ended.not_found.is_none() && may_log_dying => {
-                eprintln!(
-                    "zeta: soapy worker for {}: {}; respawning",
-                    self.id(),
-                    ended.fault
-                );
+                eprintln!("zeta: {}; respawning", self.named(&ended.fault));
                 self.last_dying_log = Some(Instant::now());
             }
             Some(_) => {}

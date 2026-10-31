@@ -129,6 +129,13 @@ fn starts(rec: &Path) -> Vec<u64> {
         .collect()
 }
 
+/// Whether a gap between two spawns fits a wait of `want` ms: never shorter
+/// than the wait (10 % for clock rounding between processes), and at most
+/// 250 ms longer, the process startup a loaded host adds on top.
+fn within(gap: u64, want: u64) -> bool {
+    gap * 10 >= want * 9 && gap <= want + 250
+}
+
 fn alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
@@ -216,10 +223,11 @@ async fn not_found_with_a_cache_attaches_faulted_and_polls_at_the_cap() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let s = starts(&rec);
     // At a 300 ms cap, 1.5 s holds about five polls.
+    // A loaded host stretches each poll by the fake's fork, exec and reap.
     let polls = s.len() - before;
-    assert!((3..=7).contains(&polls), "{polls} polls in 1.5 s: {s:?}");
+    assert!((2..=7).contains(&polls), "{polls} polls in 1.5 s: {s:?}");
     for g in s.windows(2).map(|w| w[1] - w[0]) {
-        assert!((150..=450).contains(&g), "gap {g} ms: {s:?}");
+        assert!(within(g, 300), "gap {g} ms: {s:?}");
     }
     assert_eq!(port.fault().as_deref(), Some("device not found: fake"));
     assert!(port.worker().unwrap().restarts >= polls as u64);
@@ -316,6 +324,43 @@ async fn tune_during_a_respawn_answers_the_fault_at_once() {
 }
 
 #[tokio::test]
+async fn a_tune_between_a_death_and_its_reap_answers_the_death() {
+    let dir = tempdir();
+    let pidfile = dir.path().join("pid");
+    // A grandchild keeps the worker's stdout open for 2 s after the worker
+    // dies, so the reap waits out its reader join (1 s) with the dead
+    // worker's link still in the snapshot. Its stdin has no reader left, so a
+    // tune in that window fails its write.
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        &format!(
+            "echo $$ > '{}'\nsleep 2 < /dev/null 2> /dev/null &\n\
+             ZETA_FAKE_CRASH_ONCE=1 exec \"$FAKE\" --script 'crash-after-ms 300' \"$@\"",
+            pidfile.display()
+        ),
+    );
+    let (port, _) = open(cfg, None).await;
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        wait_for(Duration::from_secs(3), || !alive(pid)).await,
+        "the worker did not die"
+    );
+    // Reaped, but the death is not yet the port's fault: the window is open.
+    assert_eq!(port.fault(), None);
+    let r = port.tune(tuning(100_000_000, 2_000_000)).await;
+    assert_eq!(
+        r,
+        Err(PortError::Io(
+            "soapy worker for f died: signal 6 (SIGABRT)".into()
+        ))
+    );
+}
+
+#[tokio::test]
 async fn backoff_doubles_to_the_cap_and_resets_after_alive() {
     let dir = tempdir();
     // Spawn 0 says hello and crashes at 300 ms; 1-3 fail to open at once
@@ -339,11 +384,8 @@ async fn backoff_doubles_to_the_cap_and_resets_after_alive() {
     );
     let s = starts(&rec);
     let gap = |i: usize| s[i] - s[i - 1];
-    // A gap is never shorter than its backoff (10 % for clock rounding
-    // between processes); a loaded host adds process startup on top, so the
-    // ceiling is loose and the schedule is pinned by the floors: 200 is not
-    // 100, 300 is not 200, and the cap is not a further doubling to 600.
-    let within = |g: u64, want: u64| g * 10 >= want * 9 && g <= want + 250;
+    // The schedule is pinned by the floors: 200 is not 100, 300 is not 200,
+    // and the cap is not a further doubling to 600.
     // Spawn 0 lived 300 ms from its start line, then 100 ms of backoff.
     let first = gap(1).saturating_sub(300);
     assert!(within(first, 100), "first backoff {first} ms: {s:?}");

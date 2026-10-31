@@ -20,7 +20,7 @@ use tokio::sync::{oneshot, watch};
 use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning, WorkerInfo};
 use zeta_core::types::{Capabilities, SourceId};
 
-use crate::supervisor::{Shared, Supervisor};
+use crate::supervisor::{Link, Shared, Supervisor};
 use crate::wire::{Cmd, Reply};
 
 /// How long a worker has to say hello after it is spawned: UHD loads a B210's
@@ -42,6 +42,11 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// the pipe and the worker. Copied rather than imported so this crate does not
 /// depend on the driver crate.
 pub const TUNE_TIMEOUT: Duration = Duration::from_secs(7);
+
+/// How long a request that lost its worker waits for the reap to close the
+/// link: the reap waits up to `READER_JOIN` for the reader threads, then
+/// closes it at once.
+const REAP_WAIT: Duration = crate::supervisor::READER_JOIN.saturating_add(Duration::from_secs(1));
 
 /// The supervisor's clock. The defaults are the production values; tests
 /// shorten them so a crash-and-respawn cycle takes milliseconds.
@@ -180,6 +185,15 @@ impl WorkerPort {
         )
     }
 
+    /// The fault for a request whose worker went away under it: the worker
+    /// may have died moments ago and not been reaped yet, so wait for the
+    /// supervisor to close the link (it sets the fault first) before reading
+    /// the fault. The bound covers the reap's wait for the reader threads.
+    async fn ended(&self, link: &Link) -> PortError {
+        link.wait_closed(REAP_WAIT).await;
+        self.down()
+    }
+
     /// Send `cmd` to the live worker and wait for its reply. No live worker
     /// answers at once with the current fault; a worker that ends before it
     /// replies answers with the fault its end left.
@@ -192,11 +206,11 @@ impl WorkerPort {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let reply = match link.send(id, cmd).await {
             Ok(rx) => rx,
-            Err(_) => return Err(self.down()),
+            Err(_) => return Err(self.ended(&link).await),
         };
         match tokio::time::timeout(TUNE_TIMEOUT, reply).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err(self.down()),
+            Ok(Err(_)) => Err(self.ended(&link).await),
             Err(_) => {
                 link.forget(id);
                 Err(PortError::Io(format!(
