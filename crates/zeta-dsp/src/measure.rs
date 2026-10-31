@@ -376,7 +376,9 @@ pub fn measure_band(
 /// The floor is the 15th percentile of the unmasked in-band bins; the masked bins
 /// are then set to that floor, so they are neither the peak nor occupied. When
 /// the mask covers every in-band bin, or `dc_hz` lies outside the band, it is not
-/// applied and the result is [`measure_band`]'s.
+/// applied and the result is [`measure_band`]'s. Nor is it when the DC sits at the
+/// band's centre (within one bin of `block_center_hz`): the radio was tuned for
+/// this band, its signal sits on the DC, and masking would hide what is measured.
 pub fn measure_band_masked(
     iq: &[Complex<f32>],
     rate_hz: u64,
@@ -398,12 +400,13 @@ pub fn measure_band_masked(
     let first = SIZE / 2 - half_bins;
     let mut db = spectrum(iq)[first..(SIZE / 2 + half_bins + 1).min(SIZE)].to_vec();
     // The in-band bins within the mask of the DC's offset in the block, when the
-    // DC lies inside the band.
+    // DC lies inside the band and off its centre (a capture centred on the band
+    // holds the measured signal on the DC).
     let masked: Vec<bool> = match dc {
         Some((dc_hz, half_width_hz)) => {
             let dc_off = dc_hz as f64 - block_center_hz as f64;
             let edge = (half_bins as f64 + 0.5) * bin_hz;
-            let inside = dc_off.abs() <= edge;
+            let inside = dc_off.abs() <= edge && dc_off.abs() > bin_hz;
             (0..db.len())
                 .map(|i| {
                     let off = ((i + first) as f64 - (SIZE / 2) as f64) * bin_hz;
@@ -1462,24 +1465,51 @@ mod tests {
         iq
     }
 
+    /// A tone 20 kHz above the block centre at 0.1 under a DC spike 20 kHz below it
+    /// (a 0.5 tone there: the receiver's DC in a block centred off it) and 20 dB noise.
+    fn offset_spike_and_tone(n: usize) -> Vec<Complex<f32>> {
+        let tone = crate::util::nco(n, 20_000.0, WIDE_RATE as f64);
+        let spike = crate::util::nco(n, -20_000.0, WIDE_RATE as f64);
+        let mut iq: Vec<Complex<f32>> = tone
+            .into_iter()
+            .zip(spike)
+            .map(|(t, d)| t * 0.1 + d * 0.5)
+            .collect();
+        awgn(&mut iq, 20.0, 7);
+        iq
+    }
+
     #[test]
     fn measure_band_masked_ignores_the_dc_spike() {
-        let iq = spike_and_tone(WIDE_RATE as usize);
+        // The block is centred at CENTER + 20 kHz, the receiver's DC at CENTER.
+        let iq = offset_spike_and_tone(WIDE_RATE as usize);
+        let block = CENTER + 20_000;
         let bin = WIDE_RATE as f64 / SIZE as f64; // 187.5 Hz
-        let plain = measure_band(&iq, WIDE_RATE, CENTER, WIDE_RATE);
+        let plain = measure_band(&iq, WIDE_RATE, block, WIDE_RATE);
         assert!(
             (plain.center_hz.0 as f64 - CENTER as f64).abs() <= bin,
             "{plain:?}"
         );
-        let masked = measure_band_masked(&iq, WIDE_RATE, CENTER, WIDE_RATE, Some((CENTER, 25_000)));
+        let masked = measure_band_masked(&iq, WIDE_RATE, block, WIDE_RATE, Some((CENTER, 25_000)));
         assert!(
             (masked.center_hz.0 as f64 - (CENTER + 40_000) as f64).abs() <= 2.0 * bin,
             "{masked:?}"
         );
         assert!(masked.snr_db > 10.0, "{masked:?}");
         assert_eq!(
-            measure_band_masked(&iq, WIDE_RATE, CENTER, WIDE_RATE, None),
+            measure_band_masked(&iq, WIDE_RATE, block, WIDE_RATE, None),
             plain
+        );
+    }
+
+    #[test]
+    fn measure_band_masked_with_the_dc_at_the_band_centre_measures_as_today() {
+        // A capture centred on the band: the DC is the band's centre, so the mask
+        // would hide the signal the radio was tuned for; it is not applied.
+        let iq = spike_and_tone(WIDE_RATE as usize);
+        assert_eq!(
+            measure_band_masked(&iq, WIDE_RATE, CENTER, WIDE_RATE, Some((CENTER, 25_000))),
+            measure_band(&iq, WIDE_RATE, CENTER, WIDE_RATE)
         );
     }
 
@@ -1505,10 +1535,11 @@ mod tests {
         );
     }
 
-    /// One full second of [`spike_and_tone`] at [`WIDE_RATE`] through a measure stage
+    /// One full second of [`offset_spike_and_tone`] at [`WIDE_RATE`] (blocks centred
+    /// at `CENTER`: the spike at `CENTER - 20_000`, the tone at `CENTER + 20_000`) through a measure stage
     /// whose context carries `dc_hz`: the one event and the notes.
     async fn spike_second(dc_hz: Option<u64>) -> (serde_json::Value, Vec<serde_json::Value>) {
-        let iq = spike_and_tone(WIDE_RATE as usize);
+        let iq = offset_spike_and_tone(WIDE_RATE as usize);
         let (events, notes) = run_stage(32, dc_hz, |tx, prov| {
             Box::pin(async move {
                 let block = WIDE_RATE as usize / 10;
@@ -1535,10 +1566,10 @@ mod tests {
     #[tokio::test]
     async fn measure_stage_masks_the_dc_only_with_a_dc_hz_in_its_context() {
         let bin = WIDE_RATE as f64 / SIZE as f64;
-        let (ev, notes) = spike_second(Some(CENTER)).await;
+        let (ev, notes) = spike_second(Some(CENTER - 20_000)).await;
         let center = ev["center_hz"].as_u64().unwrap() as f64;
         assert!(
-            (center - (CENTER + 40_000) as f64).abs() <= 2.0 * bin,
+            (center - (CENTER + 20_000) as f64).abs() <= 2.0 * bin,
             "{ev}"
         );
         assert_eq!(
@@ -1547,7 +1578,7 @@ mod tests {
         );
         let (ev, notes) = spike_second(None).await;
         let center = ev["center_hz"].as_u64().unwrap() as f64;
-        assert!((center - CENTER as f64).abs() <= bin, "{ev}");
+        assert!((center - (CENTER - 20_000) as f64).abs() <= bin, "{ev}");
         assert_eq!(notes[0]["measure"]["dc_mask_hz"], 0);
     }
 }

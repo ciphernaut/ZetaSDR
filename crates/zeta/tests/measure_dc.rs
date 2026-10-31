@@ -116,12 +116,15 @@ impl Port for LocalCaps {
     }
 }
 
-async fn start_measure(node: &Node) -> JobId {
+/// A measure on `bandwidth_hz` around `center_hz` of the recording's band (which a
+/// file source without a tune range accepts, keeping its capture at the recording's
+/// centre).
+async fn start_measure(node: &Node, center_hz: u64, bandwidth_hz: u64) -> JobId {
     let op = Op::JobStart {
         kind: JobKind::Measure,
         source: SourceId("dc".into()),
-        center_hz: Hz(CENTER_HZ),
-        bandwidth_hz: Hz(RATE_HZ as u64),
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(bandwidth_hz),
         deviation_hz: None,
         sideband: None,
         elastic: false,
@@ -159,12 +162,17 @@ async fn first_event(node: &Node, id: &JobId, within: Duration) -> Option<serde_
     Some(ev)
 }
 
-/// Start a measure on `port` (fed by `src`) and return its first event and its
-/// context's `measure.dc_mask_hz`.
-async fn measure_on(dir: &Path, src: Arc<FileSource>, port: Arc<dyn Port>) -> (u64, u64) {
+/// Start a measure on `band` (centre, width) of `port` (fed by `src`) and return its
+/// first event's `center_hz` and its context's `measure.dc_mask_hz`.
+async fn measure_on(
+    dir: &Path,
+    src: Arc<FileSource>,
+    port: Arc<dyn Port>,
+    (center_hz, bandwidth_hz): (u64, u64),
+) -> (u64, u64) {
     let node = Node::open(cfg(dir), registry(), vec![port]).await.unwrap();
     src.start();
-    let id = start_measure(&node).await;
+    let id = start_measure(&node, center_hz, bandwidth_hz).await;
     let ev = first_event(&node, &id, Duration::from_secs(4))
         .await
         .expect("a measure event");
@@ -179,7 +187,10 @@ async fn a_measure_on_a_local_device_ignores_the_dc_spike() {
     let dir = tempfile::tempdir().unwrap();
     let src = file_source(&fixture(dir.path()));
     let port: Arc<dyn Port> = Arc::new(LocalCaps::new(src.clone()));
-    let (center, mask) = measure_on(dir.path(), src, port).await;
+    // A 100 kHz box at 27.02 MHz: the spike (27.00) 20 kHz inside it and inside the
+    // mask, the tone (27.04) 20 kHz on the other side. The capture stays at the
+    // recording's 27 MHz, so the DC is off the box's centre and is masked.
+    let (center, mask) = measure_on(dir.path(), src, port, (CENTER_HZ + 20_000, 100_000)).await;
     // The label is not asserted: the DC offset wobbles the envelope and phase, so
     // layer 1 may say fm or carrier.
     assert!(
@@ -194,7 +205,7 @@ async fn a_measure_on_a_recording_measures_the_spike() {
     let dir = tempfile::tempdir().unwrap();
     let src = file_source(&fixture(dir.path()));
     let port: Arc<dyn Port> = src.clone();
-    let (center, mask) = measure_on(dir.path(), src, port).await;
+    let (center, mask) = measure_on(dir.path(), src, port, (CENTER_HZ, RATE_HZ as u64)).await;
     assert!(center.abs_diff(CENTER_HZ) <= 400, "center_hz {center}");
     assert_eq!(mask, 0);
 }
