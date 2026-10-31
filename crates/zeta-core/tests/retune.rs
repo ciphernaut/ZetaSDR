@@ -420,6 +420,85 @@ async fn graph_put_squelch_db_is_carried_through_a_retune() {
     assert!(rec.capture_rate_hz.is_some());
 }
 
+/// An `fm_demod` on ch20 (476 900 000 Hz) in the 476 918 750 / 1 024 000 Hz pin, its graph
+/// put back with the guard off and `squelch_db` -65 (carried params only).
+async fn ch20_with_operator_squelch(node: &Node) -> JobId {
+    pin(node, t(476_918_750, 1_024_000)).await;
+    let id = start(node, JobKind::FmDemod, t(476_900_000, 12_500)).await;
+    let mut graph = match node.apply(Op::GraphGet { job: id.clone() }).await {
+        Ok(OpResult::Graph(g)) => g,
+        r => panic!("graph_get: {r:?}"),
+    };
+    let demod = graph
+        .nodes
+        .iter_mut()
+        .find(|n| n.kind == "nbfm_demod")
+        .unwrap();
+    demod.params["guard_hz"] = serde_json::Value::Null;
+    demod.params["squelch_db"] = serde_json::json!(-65);
+    node.apply(Op::GraphPut {
+        job: id.clone(),
+        graph,
+    })
+    .await
+    .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn a_retune_onto_a_neighbouring_channel_rederives_the_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let id = ch20_with_operator_squelch(&node).await;
+    assert_eq!(
+        retune(&node, &id, 476_887_500, 12_500, &[]).await,
+        Ok(OpResult::Job(id.clone()))
+    );
+    let rec = record(&node, &id);
+    let demod = node_params(&rec, "nbfm_demod");
+    assert_eq!(demod["guard_hz"], 12_500, "{demod}");
+    assert_eq!(demod["guard_db"], 12);
+    assert_eq!(demod["channel_hz"], 12_500);
+    assert_eq!(demod["squelch_db"], -65);
+    let channel = node_params(&rec, "channel");
+    assert_eq!(channel["center_hz"], 476_887_500);
+    assert_eq!(channel["wide_hz"], 37_500);
+}
+
+#[tokio::test]
+async fn a_width_preset_retune_changes_the_channel_geometry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    pin(&node, t(476_918_750, 1_024_000)).await;
+    let id = start(&node, JobKind::FmDemod, t(476_900_000, 12_500)).await;
+    assert_eq!(
+        retune(&node, &id, 476_900_000, 25_000, &[]).await,
+        Ok(OpResult::Job(id.clone()))
+    );
+    let rec = record(&node, &id);
+    let channel = node_params(&rec, "channel");
+    assert_eq!(channel["bandwidth_hz"], 25_000);
+    assert_eq!(channel["wide_hz"], 50_000);
+    assert_eq!(node_params(&rec, "nbfm_demod")["channel_hz"], 25_000);
+}
+
+#[tokio::test]
+async fn a_retune_off_plan_drops_the_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let id = ch20_with_operator_squelch(&node).await;
+    assert_eq!(
+        retune(&node, &id, 476_905_000, 12_500, &[]).await,
+        Ok(OpResult::Job(id.clone()))
+    );
+    let rec = record(&node, &id);
+    let demod = node_params(&rec, "nbfm_demod");
+    for k in ["guard_hz", "guard_db", "channel_hz"] {
+        assert!(demod.get(k).is_none(), "{k}: {demod}");
+    }
+    assert!(node_params(&rec, "channel").get("wide_hz").is_none());
+}
+
 #[tokio::test]
 async fn refusals_name_the_kind_the_state_and_the_id() {
     let dir = tempfile::tempdir().unwrap();

@@ -2665,6 +2665,72 @@ fn reexpand_carries_the_guard_params() {
     assert_eq!(again.nodes[0].params["wide_hz"], 37_500);
 }
 
+/// `cb_graph(476_900_000)` as an operator put it: squelch -70 dB and no guard.
+fn operator_stored() -> zeta_core::graph::Graph {
+    let mut stored = cb_graph(476_900_000);
+    for n in stored.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
+        n.params["squelch_db"] = (-70).into();
+        n.params["guard_hz"] = serde_json::Value::Null;
+    }
+    stored
+}
+
+fn retune_expand(tuning: Tuning) -> zeta_core::graph::Graph {
+    JobKind::FmDemod
+        .reexpand_carrying(
+            &SourceId("b210".into()),
+            tuning,
+            Hz(1_024_000),
+            Some(256_000),
+            &operator_stored(),
+            &modes(),
+            &zeta_core::ops::RETUNE_CARRIED_PARAMS,
+        )
+        .unwrap()
+}
+
+fn plan_tuning(center_hz: u64, bandwidth_hz: u64) -> Tuning {
+    Tuning {
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(bandwidth_hz),
+    }
+}
+
+#[test]
+fn reexpand_carrying_squelch_only_rederives_the_guard_at_the_new_band() {
+    let g = retune_expand(plan_tuning(476_887_500, 12_500));
+    assert_eq!(
+        g.nodes[0].params,
+        serde_json::json!({"center_hz": 476_887_500, "bandwidth_hz": 12_500, "out_rate_hz": 51_200, "wide_hz": 37_500})
+    );
+    assert_eq!(
+        g.nodes[1].params,
+        serde_json::json!({
+            "deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": -70, "squelch": true,
+            "guard_hz": 12_500, "guard_db": 12, "channel_hz": 12_500,
+        })
+    );
+}
+
+#[test]
+fn reexpand_carrying_squelch_only_drops_the_guard_off_plan() {
+    let g = retune_expand(plan_tuning(476_905_000, 12_500));
+    assert!(g.nodes[0].params.get("wide_hz").is_none(), "{g:?}");
+    for k in ["guard_hz", "guard_db", "channel_hz"] {
+        assert!(g.nodes[1].params.get(k).is_none(), "{k}: {g:?}");
+    }
+    assert_eq!(g.nodes[1].params["squelch_db"], -70);
+}
+
+#[test]
+fn a_width_preset_on_a_plan_channel_changes_channel_hz_and_wide_hz() {
+    let g = retune_expand(plan_tuning(476_900_000, 25_000));
+    assert_eq!(g.nodes[0].params["bandwidth_hz"], 25_000);
+    assert_eq!(g.nodes[0].params["wide_hz"], 50_000);
+    assert_eq!(g.nodes[1].params["channel_hz"], 25_000);
+    assert_eq!(g.nodes[1].params["guard_hz"], 12_500);
+}
+
 /// The mode registry a node with the DSP stages loads: every embedded row ready.
 fn modes() -> zeta_core::modes::ModeRegistry {
     let mut stages = StageRegistry::new();

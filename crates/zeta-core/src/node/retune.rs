@@ -12,7 +12,7 @@ use super::launch::AfterGate;
 use super::{Inner, Node, NodeError};
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
-use crate::ops::JobKind;
+use crate::ops::{JobKind, RETUNE_CARRIED_PARAMS};
 use crate::port::Tuning;
 use crate::types::JobId;
 
@@ -66,13 +66,14 @@ impl Node {
                 e => NodeError::Lease(e),
             })?;
         let bin_rate = self.inner.bank_bin_rate(&rec.source, capture);
-        let graph = match kind.reexpand(
+        let graph = match kind.reexpand_carrying(
             &rec.source,
             want,
             capture.bandwidth_hz,
             bin_rate,
             &rec.graph,
             &self.inner.modes,
+            &RETUNE_CARRIED_PARAMS,
         ) {
             Ok(g) => g,
             Err(e) => {

@@ -636,6 +636,31 @@ impl JobKind {
         stored: &Graph,
         modes: &ModeRegistry,
     ) -> Result<Graph, OpError> {
+        self.reexpand_carrying(
+            source,
+            tuning,
+            source_rate_hz,
+            bank_bin_rate_hz,
+            stored,
+            modes,
+            &CARRIED_PARAMS,
+        )
+    }
+
+    /// [`JobKind::reexpand`] carrying only the params named in `carried` (a retune
+    /// passes [`RETUNE_CARRIED_PARAMS`]); the rest take the values `expand` derives.
+    /// `deviation_hz` and `sideband` are read back from `stored` whatever `carried` says.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reexpand_carrying(
+        &self,
+        source: &SourceId,
+        tuning: Tuning,
+        source_rate_hz: Hz,
+        bank_bin_rate_hz: Option<u64>,
+        stored: &Graph,
+        modes: &ModeRegistry,
+        carried: &[&str],
+    ) -> Result<Graph, OpError> {
         let param = |key: &str| stored.nodes.iter().find_map(|n| n.params.get(key).cloned());
         let deviation_hz = param("deviation_hz").and_then(|v| v.as_u64()).map(Hz);
         let sideband = param("sideband").and_then(|v| serde_json::from_value(v).ok());
@@ -657,7 +682,7 @@ impl JobKind {
                 n.params = old.params.clone();
                 continue;
             }
-            for key in CARRIED_PARAMS {
+            for &key in carried {
                 if let (Some(v), Some(p)) = (old.params.get(key), n.params.as_object_mut())
                     && p.contains_key(key)
                 {
@@ -1223,6 +1248,13 @@ const CARRIED_PARAMS: [&str; 6] = [
     "channel_hz",
     "wide_hz",
 ];
+
+/// The params a retune ([`JobKind::reexpand_carrying`]) carries from the stored graph:
+/// the squelch. The adjacent-channel guard (`guard_hz`, `guard_db`, `channel_hz`, and the
+/// channel node's `wide_hz`) is derived again from the channel plan at the new band, so a
+/// width preset changes the filter and a move to a neighbouring channel takes that
+/// channel's geometry.
+pub const RETUNE_CARRIED_PARAMS: [&str; 2] = ["squelch_db", "squelch"];
 
 /// The narrowest exact divisor of `source_rate_hz` that is at least
 /// [`CHANNEL_RATE_MIN_HZ`] and at least `bandwidth_hz`; the source rate itself
