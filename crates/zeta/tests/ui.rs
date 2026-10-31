@@ -220,8 +220,10 @@ fn quiet_fixture(dir: &Path) -> PathBuf {
     zeta_dsp::fixtures::write_fixture(dir, "quiet", &iq, 48_000, 20_000_000)
 }
 
-/// Wall-clock limit on the whole ui.py run.
-const DEADLINE: Duration = Duration::from_secs(300);
+/// Wall-clock limit on the whole ui.py run: measured 256.3 s and 256.9 s on 2026-11-01 (plan 18
+/// added 31 s), so 330 s. The margin covers the plan-15 scenario
+/// `coarse_layer_leaves_masked_bins_unpainted` (about 10 s) that joins on rebase.
+const DEADLINE: Duration = Duration::from_secs(330);
 
 /// Waits for `child` until `deadline`, killing it then; its exit status (None when killed)
 /// and everything it wrote. Its pipes are drained on threads so it never blocks on them.
