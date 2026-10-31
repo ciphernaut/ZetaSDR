@@ -46,7 +46,7 @@ specs are written in a brainstorming session before the plan, as before.
 
 ## Plan 20 status
 
-Plan 20 is built on the `plan-20` branch (tasks 1-8 and a final fix wave) and merges to `main` by fast-forward after the whole-branch review, 2026-10-31. Live acceptance (spec section 6) is pending.
+Plan 20 is merged to `main` at 3acbad4 (tasks 1-8, a final fix wave and one follow-up, 17 commits fast-forwarded from the `plan-20` branch), 2026-10-31. Deployed on the field host the same day (`~/zetasdr/plan20-zeta`, built from `~/zetasdr/src20`); live acceptance items 1 and 2 passed, 3 and 4 await the operator.
 
 What was built (spec `docs/superpowers/specs/2026-10-31-soapy-worker-design.md`):
 
@@ -68,8 +68,8 @@ Outcomes to record (live):
 
 Acceptance on the field host (spec section 6), for the live run (`RUSTFLAGS="--cfg soapy"`, `~/zetasdr/plan20-zeta`, the unit's `ExecStart` pointed at it):
 
-- [ ] 1. Restart the unit: `source list` shows `b210` with `worker.pid`, its pin and gain restored; `modes check --strict rs41_decode` still passes (local, unit stopped); the page loads.
-- [ ] 2. With the sonde watch running, `kill -SEGV <worker pid>`: within 1 s `source list` shows the fault naming the signal and the watch `Failed` with it; within 30 s the worker is back, `worker.restarts` is 1, the pin and gain are restored, the watch is `Running` under its id and `stages_running` is back to its pre-kill value.
+- [x] 1. Restart the unit (2026-10-31 17:56 AEST): `source list` shows `b210` with `worker.pid`, gain 65 dB applied, the ADS-B job and the page's spectrum resumed on it (no pin was set at the time). `modes check --strict rs41_decode` not re-run (the unit stayed up); the page loads.
+- [x] 2. Run with the ADS-B job and the page's spectrum job instead of the watch (the operator had re-tasked the radio), 2026-10-31 17:58 AEST: within 1.5 s `source list` showed `fault: soapy worker for b210 died: signal 11 (SIGSEGV)`, both jobs `failed` with `source b210: soapy worker for b210 died: signal 11 (SIGSEGV)`, `stages_running` 5 → 0; the worker was back after 4.2 s (`restarts` 1), the gain re-applied, both jobs `running` under their ids, `stages_running` 5 again; `journalctl` showed exactly one `waiting for the device`, one `back after 1 attempts, 4.2 s` and one `recovered: gain 65 dB, 2 jobs relaunched` line. Gotcha: the FIRST `kill -SEGV` is swallowed by the Rust runtime's stack-overflow SIGSEGV handler (it resets the disposition and returns); the second one kills. Use `kill -ABRT` for a one-shot simulation.
 - [ ] 3. With the operator at the machine: pull the B210's cable, wait 10 s, replug. The same outcome through the device-lost path (`no samples for 1000 ms (device unplugged?)`, exit 5, polling, heal), and `journalctl` shows exactly one "waiting" and one "back" line.
 - [ ] 4. The desktop HackRF form: one node with `--source-soapy hackrf=driver=hackrf,gain=32` replaces the two-node launchers; a cable pull and a `kill -SEGV` behave as in 2 and 3.
 
