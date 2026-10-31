@@ -44,15 +44,15 @@ Report the pilot's level (event or `job_context`), so "no pilot" (no station, or
 
 ## UI: box a signal, demod it, then refine it on the graph
 
-From the operator, 2026-10-23. Do not assume channels sit on a fixed grid: that assumption has bitten before.
+Done by plan 18 (`docs/superpowers/specs/2026-10-31-box-and-refine-design.md`): fit first, `job_retune`, draggable outlines, the width presets, tags linked to the rows. Left to plan 15's follow-on: a lone job's capture centre off its channel (the DC spike).
 
-Today a demod started from a box gets the box's width (114-137 kHz for a 12.5 kHz channel: about 10 dB of extra noise, crackly audio), and there is no quick way to fix it.
+## Jobs: serialise restarts of one input
 
-Wanted:
-- Box a frequency on the graph and create the demod (+ transcribe) from it.
-- "Centre this demod" on the graph view: snap the job's centre onto the signal's measured centre (e.g. from a `measure` event or the spectrum peak), not onto a raster.
-- "Shrink to 2.5 / 5 / 6.25 / 12.5 / 25 kHz" bandwidth presets on the demod.
-- Make it easy to see which job is on which frequency. With more than about 3 channels this is hard today. Ideas: a label on the graph at each job's frequency (job kind, short id, squelch state, last transcript snippet), and a job list that highlights its marker on hover or click, and vice versa. A keyed decoder's held ribbon (the ADS-B display gist below) is the same idea for subjects: one line per thing on the air, updated in place, not one per event.
+A per-input restart lock, so a `job_retune` or `graph_put` racing another restart of the same input cannot leave its attached job visibly `stopped`/`failed` for a few tens of ms. From plan 18's review, 2026-11-01.
+
+## Lease: job_start on an unheld radio tunes twice
+
+`tune_if_unheld` and then `ensure_as`'s empty-held path each tune the radio. Harmless, but one tune too many. From plan 18's review, 2026-11-01.
 
 ## Feature: more digital decoding modes
 

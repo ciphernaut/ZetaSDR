@@ -581,10 +581,19 @@ Drag across the waterfall to select a band and a time span; a context menu opens
 |---|---|
 | What is this? | `classify` on the selection; the labels are drawn at the selection and listed in the transcript |
 | Decode › APRS | `job_start` `aprs_decode` on the selection's centre and bandwidth |
-| Decode › NBFM audio | `job_start` `fm_demod` (deviation 5000 Hz) |
+| Decode › NBFM audio | `job_start` `fm_demod` (deviation 5000 Hz) on the box's measured centre and 1.25× its occupied width, floored at 5 kHz; a box with only noise starts as drawn |
 | Start background job › measure | `job_start` `measure` |
 | Save selection as SigMF | `iq_read` on the selection; the transcript shows the capture path |
 | Send to agent | `POST /ask` with "Look at C Hz, BW Hz wide, from START to END: what is it?" |
+
+A running demodulator's outline has a handle at each edge (resize) and a body (move). The
+dragged band is shown with a ghost and a readout and sent as `job_retune` on release, keeping
+the job id, the attached `transcribe` and the ribbons; a conflict snaps it back with the usual
+retry buttons. Right-click (long press on a phone) opens Fit to signal, the width presets and
+Stop. Every rigid job carries a tag (kind, short id, squelch dot, channel, last transcript
+snippet) linked by hover with its row in the job list, and rows show the band. A selection drag
+can no longer start inside a running retunable job's band (its outline takes the pointer): start
+the box outside it or on another part of the waterfall.
 
 These are the same operations an agent, the CLI or MCP would send, through the same
 `Node::apply`. The menu's footer shows the selection in the operations' own terms

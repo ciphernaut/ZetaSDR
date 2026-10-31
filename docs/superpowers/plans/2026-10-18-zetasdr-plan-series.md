@@ -39,7 +39,7 @@ specs are written in a brainstorming session before the plan, as before.
 | 15 | Scan: alternate the step grid (odd sweeps a quarter step lower) and mask the centre and edge bins | Spec gist in `TODO.md`; the survey tooling built on scan rows inherits the DC spike and edges today. Spec first. Spec `docs/superpowers/specs/2026-10-31-scan-grid-mask-design.md`, plan `docs/superpowers/plans/2026-10-31-scan-grid-mask.md`. **Merged** to `main` pending the session's fast-forward, 2026-10-31; live acceptance on the desktop HackRF is pending (see "Plan 15 status"). | 14 (`stats`, no leaks under repeated retunes) |
 | 16 | Mode registry and external-decoder adaptor | Design spec first (brainstorm): a table-driven mode registry replacing the `JobKind` match for decoders, a declarative stdio wrapper for external decoders, the `video`/`text`/bits payload envelopes, a common decoded-event envelope and feed sinks, `tools/install-vocoders.sh`. No new mode ships here; `adsb_decode` is re-expressed as the first adaptor row. **Merged** to `main` (91886bc), 2026-10-28. Live acceptance on the HackRF 2026-10-28: registry, check, broken row, handlers, unknown kinds and `identify`'s unknown path pass; the on-air decode proofs await an antenna (see "Plan 16 status"). | 14 |
 | 17 | Sonde frameworks (decoder wave 1) | Re-scoped 2026-10-28 with the operator: radiosondes as the proving mode for the generic frameworks, so that the later wave is rows only. Audio-input program rows (RS41 through `rs41mod`, DFM and M20 as rows), generic `fsk`/`psk`/`ook` synthesiser families plus an RS41 frame generator proven by the real decoder and the echo impairment, a `watch` job (spot a new signal in a pinned band, `identify` it, keep the proved decoder on a free radio or in the capture), `source_free`, `position` on events with a map layer (vendored Leaflet), a SondeHub sink last. Spec `docs/superpowers/specs/2026-10-28-sonde-frameworks-design.md`, plan `docs/superpowers/plans/2026-10-28-sonde-frameworks.md`. Voice (M17, DMR), AIS, FLEX, whole-span POCSAG/APRS and stereo move to the later wave (`TODO.md`). **Merged** to `main` (97383b0), 2026-10-29; live acceptance during a Brisbane launch window is pending (see "Plan 17 status"). | 16 |
-| 18 | UI wave | Box a signal, demod it, refine it on the graph (no channel-grid assumptions); staircase transcript ribbons; mode picking by band through `knowledge_lookup`; the Okudagram (LCARS) theme behind `view set theme`. UI-only; can run beside 16/17. | 13 |
+| 18 | UI wave | Box a signal, demod it, refine it on the graph (no channel-grid assumptions); staircase transcript ribbons; mode picking by band through `knowledge_lookup`; the Okudagram (LCARS) theme behind `view set theme`. UI-only; can run beside 16/17. **Merged** to `main` pending the session's fast-forward, 2026-11-01; live acceptance on the desktop HackRF is pending (see "Plan 18 status"). | 13 |
 | 19 | Layer 4 stages | Generic FSK/PSK/OOK demods, clock recovery, slicer, bit viewer with framing and CRC hypotheses, correlator, signature write-back; `measure` symbol-rate and modulation-order upgrades. Two or three plans. | 16 (bits payload) |
 | 20 | Soapy worker process | A `zeta soapy-worker` child owning the driver behind a Port that faults when the child exits, so a driver crash never ends the node, and a source that heals is recovered. Spec `docs/superpowers/specs/2026-10-31-soapy-worker-design.md`, plan `docs/superpowers/plans/2026-10-31-soapy-worker.md`. **Merged** to `main` pending the session's fast-forward, 2026-10-31; live acceptance on the field host is pending (see "Plan 20 status"). | 14 |
 
@@ -71,6 +71,38 @@ Live acceptance (desktop HackRF, `--source-soapy hackrf=driver=hackrf,gain=45`):
 - [ ] (2) With `notch_hz: 0` for one run, the hump's width at the floor at 2, 8 and 16 Msps read from the rows, `SCAN_NOTCH_HZ` set to the widest plus 20 %, the same for the edge roll-off and `SCAN_EDGE_MASK` (which must stay under 0.25 for the quarter-step grid), figures recorded here and in the TODO gist; the hump's width at the UHF CB pin's 1 Msps measured and recorded too. `MEASURE_DC_MASK_HZ` is not tuned from it: a 12.5 kHz box on ch20 (18 750 Hz from the pin centre) holds no DC and is measured unmasked, with the spike's skirt in it; a fit box wide enough to hold the DC has ch20 masked at any half-width of 13.75 kHz or more. Record what a fit on ch20 under the pin reads; the lease-offset follow-on is the fix.
 - [ ] (3) `zeta job context` on the scan shows `scan.alternate` and `scan.mask`, `zeta stream tail` shows rows with `masked`.
 - [ ] (4) The `detect` change is covered by its unit test only (no watch inside a scan step is started).
+
+## Plan 18 status
+
+Plan 18 (box and refine) is on the `plan-18` branch (tasks 1-10), merged to `main` pending the session's fast-forward, 2026-11-01. Live acceptance on the desktop HackRF is pending.
+
+What was built (spec `docs/superpowers/specs/2026-10-31-box-and-refine-design.md`):
+
+- Task 1, the op: `job_retune` in the node (same id, new centre and bandwidth). Known: `job_start` on an unheld radio tunes twice (`tune_if_unheld`, then `ensure_as`), a pre-existing inefficiency noted in `TODO.md`.
+- Task 2, the lease move: a retune moves the job's lease inside the current capture without retuning the radio, outside it when no other rigid job or pin holds it, else a `conflict` naming the holders.
+- Task 3, carried params and the re-derived guard: squelch settings are carried across a retune, the channel-plan guard is derived again at the new band. Known: two restarts of one input are not serialised (two retunes in the post-gate tail, or a `graph_put` racing a retune), so in a window of tens of ms the attached job can end `stopped`/`failed` visibly; nothing leaks; a per-input restart lock closes it (`TODO.md`).
+- Task 4, the attached relaunch: an attached `transcribe` follows its input through a retune or a `graph_put`.
+- Task 5, the fit (page): a demodulator started from a box is measured first and fitted. The fit waits about 3 s (`stream_tail` of 3 measure frames); on the noiseless `tone` fixture the fitted width is 6.0 kHz (a 4781 Hz leakage skirt x 1.25), so the e2e pins a range.
+- Task 6, the CLI and MCP: `zeta job retune` and the guide note.
+- Task 7, the drag: draggable outlines (edges resize, body moves), a ghost and readout, `job_retune` on release. Known: a `job_list` record carries no `sideband`, so "Fit to signal" on an `ssb_demod` job assumes USB.
+- Task 8, the menu: the outline menu (Fit to signal, the width presets, Stop).
+- Task 9, the tags: job tags linked by hover with the job rows; the e2e deadline raised to 330 s.
+- Task 10: field craft ("Fitting a demod to a signal"), README, this status, `TODO.md`, regenerated guides.
+
+Outcomes to record (live):
+
+- The fitted centre's error against the channel centre, and the fitted width.
+- Whether the DC spike ever wins a fit.
+- The drag's feel at 12.5 kHz on a 1 MHz capture.
+
+Live acceptance (spec section 10), on the desktop HackRF with the 2 m / 70 cm antenna, UHF CB pinned at 476 918 750 / 1 000 000 Hz:
+
+- [ ] Box a transmitting channel generously (about 100 kHz) and start "Transcribe › NBFM": the job lands within 500 Hz of the channel's centre with a width of 10-16 kHz, the audio is clean, the transcript arrives. The transcript pane shows the `fitted` line.
+- [ ] Drag the outline a channel over; the audio follows after the retune, the transcribe stays attached (same id in the job list), the ribbons keep scrolling.
+- [ ] Drag its edge to 25 kHz and back to 12.5 kHz with the presets; `zeta ops tail` shows each `job_retune`.
+- [ ] Unpin, then drag a job outside the capture while another demod holds the radio: the conflict shows in the transcript, the outline snaps back, and the retry button moves it.
+- [ ] With four demods running, each tag reads its kind, id, squelch dot and channel; hovering a row lights its tag.
+- [ ] `zeta job retune` from the CLI against the serving node moves a job the page shows.
 
 ## Plan 20 status
 

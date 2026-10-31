@@ -616,6 +616,19 @@ A start outside the pin is a `conflict` offering `unpin source S (source_unpin)`
 
 To run demodulators on active channels only, not on all 80, use `examples/python/cb_watch.py` (`--dry-run` shows which channels the capture holds): it keeps one elastic `spectrum` job, starts `fm_demod` plus `transcribe` on a channel that stands 10 dB over the floor and stops them after 60 s of quiet.
 
+### Fitting a demod to a signal
+
+A box drawn by hand over a 12.5 kHz channel is about 100 kHz wide: 10 dB of extra noise in the audio and a centre a little off the signal. Fit the band to the signal, never to a raster (channels do not sit on a grid; a plan's channel numbers are names, not truth):
+
+1. Measure the box: `job start --kind measure --source S --center-hz C --bandwidth-hz B --then-tail 1,3000`. Read `label.name`, `center_hz` (the occupied band's centre, absolute RF) and `bandwidth_hz` (the occupied width) from the event; an `ssb` label's `evidence` carries the dial frequency (`dial ≈ N Hz`).
+2. A `noise` label (or `unknown` under 6 dB SNR) means nothing to fit: start at the box as drawn and say so.
+3. Otherwise start the demodulator on the measured centre (the dial for `ssb_demod`) with the occupied width times 1.25, floored at 5000 Hz for `fm_demod` and `am_demod`, 3000 Hz for `ssb_demod`, 150000 Hz for `wfm_demod`, and never wider than the box.
+4. A job already running is moved the same way with `job retune --job ID --center-hz C --bandwidth-hz B`: same id, its attached `transcribe` relaunched with it, its squelch settings kept, its channel-plan guard derived again at the new band. Inside the current capture nothing retunes the radio; outside it the radio moves when no other rigid job or pin holds it, else the `conflict` names the holders and `--replace` is the answer when they may stop.
+
+The receiver's DC spike sits at the capture centre. On a local device `measure` ignores the bins within 25 kHz of it when the box holds the DC but is not centred on it (a box the radio was tuned for has its centre on the DC and is measured as today, spike included), so a box drawn beside the capture centre inside a pin fits the signal, not the spike; a lone box that contains the capture centre may still fit onto the spike when it outshines the signal, so pin the capture between channels (`source pin`) and box away from its centre.
+
+The web page does this on its own: a demodulator started from a box is fitted first (the transcript says `fitted <kind> to <centre> MHz, <width> kHz (<label>)`, or `no signal found in <lo>-<hi> MHz; started <kind> at the box as drawn`), a running job's outline is dragged by its edges or its body and retuned on release, and its tag's menu offers Fit to signal and the 2.5, 5, 6.25, 12.5 and 25 kHz widths about the current centre.
+
 ### Reading a source's health
 
 `source list` gives each Soapy source a `stats` record (`null` for a recording, a KiwiSDR, a `--source-node` and a `--source-vrt` source; `worker` shows the child that owns the device (`pid`, `restarts`, `since_ns`; `null` when the source runs in the node)): `measured_rate_hz`, the samples per second the device actually delivered (an integer, `null` until two blocks have arrived), and `overflows`, `timeouts` and `restarts`. Compare `measured_rate_hz` with the pinned rate: within 1 % is healthy. `restarts` counts clock-guard stream restarts, each logged as `zeta: soapy <id>: samples ran <n> ms ahead of the clock; stream restarted`; more than 5 in 60 s fault the source with `soapy: samples arrive faster than <rate> Hz`. `overflows` and `timeouts` are zeta's counts of the driver's read results, not the device's own. `bank.dropped` in the same record counts input blocks the shared channel bank dropped under load; a number that climbs means the node cannot keep up, so drop jobs or narrow the pin.
