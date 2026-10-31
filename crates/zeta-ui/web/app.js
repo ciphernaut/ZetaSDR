@@ -643,6 +643,7 @@ function start(api) {
     onTranscribe: (job) => applyOp(attachOp(job.id)),
     onGraph: (job) => showGraph(api, job.id),
     playing: (id) => !!state.audio && state.audio.jobId === id,
+    onHot: (id, on) => state.ov?.setHot(id, on),
     squelch: (id) => (state.ov ? state.ov.squelch(id) : null),
     position: (id) => (state.map ? state.map.rowText(id) : null),
   });

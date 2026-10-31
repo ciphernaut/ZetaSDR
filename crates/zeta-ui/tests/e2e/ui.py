@@ -1241,6 +1241,11 @@ def scenario_source_pin_unpin_and_gain_commands(page, url, secret):
         page.evaluate("window.zetaTest.poll()")
         expect(tab.locator(".tag.pin")).to_have_count(1)
         expect(page.locator('#waterfall .outline[data-key="pin"]')).to_be_visible()
+        expect(page.locator('#waterfall .outline[data-key="pin"] .outline-label')
+               ).to_have_text("pin")
+        expect(page.locator('#waterfall .outline[data-key="pin"] .job-tag')).to_have_count(0)
+        expect(page.locator('#waterfall .outline[data-key="pin"] .outline-handle')
+               ).to_have_count(0)
         expect(page.locator('#waterfall .outline[data-key="capture"]')).to_have_count(0)
         # A rigid start elsewhere: the pin holds the source, and nobody else does.
         r = try_op(url, secret, {"op": "job_start", "kind": "passthrough", "source": "retune",
@@ -1717,7 +1722,9 @@ def scenario_rigid_bands_are_outlined(page, url, secret):
         for job in (lo, hi):
             el = page.locator(f'#waterfall .outline[data-key="{job}"]')
             expect(el).to_have_count(1)
-            expect(el).to_contain_text("passthrough")
+            expect(el.locator(".job-tag .kind")).to_have_text("passthrough")
+            expect(page.locator(f'#waterfall .job-tag[data-job="{job}"] .kind')
+                   ).to_have_text("passthrough")
         top = {j: page.locator(f'#waterfall .outline[data-key="{j}"]').bounding_box()["y"]
                for j in (lo, hi)}
         assert top[hi] < top[lo], f"the higher band is not drawn above the lower one: {top}"
@@ -1728,6 +1735,41 @@ def scenario_rigid_bands_are_outlined(page, url, secret):
         stop_job(url, secret, lo)
         if hi:
             stop_job(url, secret, hi)
+
+
+def scenario_tags_show_kind_id_and_link_rows(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    a = b = None
+    hot = re.compile(r"\bhot\b")
+    try:
+        a = start_job(url, secret, "passthrough", "retune", cur, 10_000)
+        # Off the tone, so its squelch stays closed.
+        b = start_job(url, secret, "fm_demod", "retune", cur + 15_000, 12_500, deviation_hz=5000)
+        page.evaluate("window.zetaTest.poll()")
+        ta = page.locator(f'#waterfall .job-tag[data-job="{a}"]')
+        tb = page.locator(f'#waterfall .job-tag[data-job="{b}"]')
+        expect(ta.locator(".kind")).to_have_text("passthrough")
+        expect(ta.locator(".short")).to_have_text(a[-6:])
+        expect(ta.locator(".dot")).to_have_count(0)
+        expect(tb.locator(".dot.closed")).to_have_count(1, timeout=5_000)
+        row_a = job_row(page, a)
+        expect(row_a.locator(".band")).to_have_text(f"{cur / 1e6:.4f} MHz, 10.0 kHz")
+        ta.hover()
+        expect(page.locator(f'#jobs .job[data-id="{a}"]')).to_have_class(hot)
+        page.evaluate("window.zetaTest.poll()")
+        page.wait_for_timeout(300)
+        expect(page.locator(f'#jobs .job[data-id="{a}"]')).to_have_class(hot)  # survives a re-render
+        page.mouse.move(5, 5)
+        expect(page.locator(f'#jobs .job[data-id="{a}"]')).not_to_have_class(hot)
+        job_row(page, b).hover()
+        expect(tb).to_have_class(hot)
+        expect(page.locator(f'#waterfall .outline[data-key="{b}"]')).to_have_class(hot)
+    finally:
+        for j in (a, b):
+            if j:
+                stop_job(url, secret, j)
 
 
 
@@ -2001,8 +2043,7 @@ def scenario_narrow_long_press_opens_the_outline_menu(page, url, secret):
         ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
         expect(ol).to_have_count(1)
         expect(ol.locator(".outline-handle")).to_have_count(0)
-        # Task 8 replaces the label with the tag and moves this press onto it.
-        cx, cy = centre_of(ol.locator(".outline-label").bounding_box())
+        cx, cy = centre_of(ol.locator(".job-tag").bounding_box())
         page.mouse.move(cx, cy)
         page.mouse.down()
         page.wait_for_timeout(700)
@@ -2452,7 +2493,7 @@ def scenario_watch_entry_starts_a_watch_and_outlines_its_band(page, url, secret)
         el = page.locator(f'#waterfall .outline[data-key="{watches[0]["id"]}"]')
         page.evaluate("window.zetaTest.poll()")
         expect(el).to_have_count(1)
-        expect(el).to_contain_text("watch")
+        expect(el.locator(".job-tag .kind")).to_have_text("watch")
         expect(el.locator(".outline-handle")).to_have_count(0)
         assert "retunable" not in (el.get_attribute("class") or "")
     finally:
@@ -2661,6 +2702,8 @@ def scenario_transcript_ribbon_appears(page, url, secret):
         ribbon = page.locator("#waterfall .ov-ribbon.transcript", has_text=SPOKEN)
         left_ms = max(1, int(TRANSCRIPT_WITHIN_MS - (time.monotonic() - clicked) * 1000))
         expect(ribbon.first).to_be_visible(timeout=left_ms)
+        expect(page.locator(f'#waterfall .job-tag[data-job="{demod}"] .snippet')
+               ).to_contain_text(SPOKEN[:20])
         title = ribbon.first.get_attribute("title") or ""
         assert re.search(r"\ben\b", title) and re.search(r"\d+ ms", title), \
             f"ribbon title {title!r} lacks language and duration"
@@ -2862,8 +2905,8 @@ def scenario_channel_plan_labels(page, url, secret):
     try:
         row = job_row(page, job)
         expect(row.locator(".tag.ch")).to_have_text("ch20", timeout=3_000)
-        label = page.locator(f'#waterfall .outline[data-key="{job}"] .outline-label')
-        expect(label).to_contain_text("ch20 fm_demod")
+        label = page.locator(f'#waterfall .job-tag[data-job="{job}"] .channel')
+        expect(label).to_have_text("ch20")
         set_band(page, 476_900_000, 40_000)
         ticks = page.locator("#waterfall .wf-axis .tick.ch")
         expect(ticks.first).to_be_visible()
@@ -2874,12 +2917,12 @@ def scenario_channel_plan_labels(page, url, secret):
         expect(view_line(page, "plan = none")).to_be_visible()
         expect(job_row(page, job).locator(".tag.ch")).to_have_count(0)
         expect(ticks).to_have_count(0)
-        expect(label).to_have_text("fm_demod")
+        expect(label).to_have_text("")
         run_cmd(page, "view set plan bogus")
         expect(view_line(page, "auto, none, uhf_cb_au", error=True)).to_be_visible()
         run_cmd(page, "view reset")
         expect(job_row(page, job).locator(".tag.ch")).to_have_text("ch20")
-        expect(label).to_contain_text("ch20 fm_demod")
+        expect(label).to_have_text("ch20")
     finally:
         stop_job(url, secret, job)
 

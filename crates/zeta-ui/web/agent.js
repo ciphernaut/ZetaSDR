@@ -44,8 +44,12 @@
 //                               when measured, and whether the guard holds it), removes it
 //                               otherwise (null: none seen)
 //   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, squelch,
-//                                   view, position})
+//                                   view, position, onHot})
 //                                                       -> {close, refresh, redraw}
+//       Each row carries `data-job` (the id, beside `data-id`) and, when the tuning is
+//       usable, a `.band` cell (bandText) after the short id; with `onHot(id, on)` given,
+//       pointerenter/pointerleave on a row call it (overlays.js setHot puts `hot` on the
+//       job's outline and tag, and on the row).
 //       Polls `job_list` every 2 s and renders the running jobs, and the finished ones
 //       (stopped, failed) for view.get("finished_rows_s") seconds after this page first saw
 //       them finished (0: never; without `view`, 60 s); view.onClear drops the finished rows
@@ -70,6 +74,7 @@
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 import { channelLabel } from "./plans.js";
+import { bandText } from "./units.js";
 
 
 export const JOBS_POLL_MS = 2000;
@@ -342,12 +347,21 @@ export function setSquelchTag(row, event) {
   tag.title = title;
 }
 
-function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch, plan, position }) {
+function jobRow(
+  job,
+  onStop,
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot },
+) {
   const row = document.createElement("div");
   const attached = !!job.input;
   const finished = isFinished(job);
   row.className = ["job", attached && "attached", finished && "finished"].filter(Boolean).join(" ");
   row.dataset.id = job.id;
+  row.dataset.job = job.id;
+  if (onHot) {
+    row.addEventListener("pointerenter", () => onHot(job.id, true));
+    row.addEventListener("pointerleave", () => onHot(job.id, false));
+  }
   const status = job.state && job.state.status ? job.state.status : "?";
   row.dataset.state = status;
   const cells = [
@@ -357,6 +371,10 @@ function jobRow(job, onStop, { onPlay, onTranscribe, onGraph, playing, squelch, 
     ["id", job.id.slice(-6)],
     ["events", ""],
   ];
+  const t = job.tuning;
+  if (t && Number.isFinite(t.center_hz) && Number.isFinite(t.bandwidth_hz) && t.bandwidth_hz > 0) {
+    cells.splice(4, 0, ["band", bandText(t.center_hz, t.bandwidth_hz)]);
+  }
   for (const [cls, text] of cells) {
     const span = document.createElement("span");
     span.className = cls;
@@ -485,6 +503,7 @@ export function startJobs(
     squelch = null,
     view = null,
     position = null,
+    onHot = null,
   } = {},
 ) {
   let timer = null;
@@ -501,6 +520,7 @@ export function startJobs(
     squelch,
     plan: view ? () => view.get("plan") : null,
     position,
+    onHot,
   };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;

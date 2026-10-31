@@ -169,8 +169,21 @@ html[data-map="on"] #waterfall { right: 50%; }
   position: absolute; right: 6px; top: 1px; padding: 0 4px; font-size: 11px; border-radius: 2px;
   color: var(--accent); background: rgba(11, 14, 20, 0.78); white-space: nowrap;
 }
-/* narrow: the label is the long-press target of a retunable outline */
-html[data-footprint="narrow"] #waterfall .outline.pressable .outline-label { pointer-events: auto; touch-action: none; }
+/* a job's tag (overlays.js): kind, short id, squelch dot, channel, transcript snippet */
+#waterfall .job-tag { position: absolute; right: 6px; pointer-events: auto; }
+.job-tag {
+  padding: 0 4px; font-size: 11px; border-radius: 2px; color: var(--accent);
+  background: rgba(11, 14, 20, 0.78); white-space: nowrap; max-width: 60%;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.job-tag .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; }
+.job-tag .dot.open { background: var(--ok); }
+.job-tag .dot.closed { background: var(--dim); }
+.job-tag .short, .job-tag .snippet { color: var(--dim); }
+.job-tag.hot { color: var(--ok); }
+#waterfall .outline.hot { border-color: var(--ok); }
+/* narrow: the tag is the long-press target of a retunable outline */
+html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-action: none; }
 /* a retunable job's outline (wide footprint): the body moves it, the edge handles resize it */
 #waterfall .outline.retunable { pointer-events: auto; cursor: grab; touch-action: none; }
 #waterfall .outline.retunable:active { cursor: grabbing; }
@@ -251,7 +264,7 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .outline-label { poi
 
 .job {
   display: grid;
-  grid-template-columns: auto auto 1fr auto auto auto;
+  grid-template-columns: auto auto 1fr auto auto auto auto;
   gap: 8px;
   align-items: center;
   padding: 2px 0;
@@ -261,6 +274,8 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .outline-label { poi
 .job .state { color: var(--ok); }
 .job[data-state="failed"] .state { color: var(--error); }
 .job .id { color: var(--dim); }
+.job .band { color: var(--dim); font-size: 11px; }
+.job.hot { outline: 1px solid var(--accent); }
 .job .events { color: var(--user); }
 .job .actions { display: flex; gap: 4px; justify-content: flex-end; }
 .job .actions button { padding: 0 6px; }

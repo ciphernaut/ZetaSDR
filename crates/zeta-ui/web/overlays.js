@@ -14,8 +14,20 @@
 //       `footprint()` returns "wide" or "narrow" (<html data-footprint>): only the wide
 //       footprint's outlines can be dragged. `onOutlineMenu(job, x, y)` is called with a
 //       retunable outline's job and a client point: by `contextmenu` on the outline (wide), or
-//       by a LONG_PRESS_MS press on its `.outline-label` in the narrow footprint (cancelled by
+//       by a LONG_PRESS_MS press on its `.job-tag` in the narrow footprint (cancelled by
 //       pointerup/pointercancel or a move over LONG_PRESS_MOVE_PX).
+//   Job tags: each running rigid job's outline holds a `.job-tag[data-job]` (ov.tag/untag):
+//       `.kind`, `.short` (the last 6 characters of the id), a `.dot.open|closed` (only for a
+//       SQUELCH_KINDS job with a known squelch state; refreshed wherever the squelch is
+//       set), `.channel` (the plan channel, else empty) and `.snippet` (the last transcript
+//       text, SNIPPET_CHARS at most, of a `transcribe` job attached to it; absent until one
+//       arrives). Tags sit at their outline's vertical centre and ov.layoutTags stacks them
+//       (a tag under the previous one's bottom + TAG_GAP_PX is pushed down, MAX_LANES at
+//       most). Hovering a tag or its outline puts class `hot` on both and on the job's row;
+//       hovering the row (agent.js `onHot` -> ov.setHot(id, on)) does the same the other way,
+//       and `ov.hotJob` is re-applied after each sync, as agent.js re-renders the rows. A tag
+//       click scrolls the row into view. The pin, the capture and the ghost keep a plain
+//       `.outline-label`; job outlines have none.
 //   Overlays:
 //     ov.syncOutlines(jobs, source)  the outline half of ov.sync alone (app.js calls it after
 //                            each `source_list` poll, so a pin shows without waiting for jobs)
@@ -151,13 +163,15 @@ const EXPIRE_EVERY_MS = 1000;
 const RIBBON_GAP_PX = 2;
 const LABEL_GAP_PX = 2;
 const MAX_LANES = 8;
+const TAG_GAP_PX = 2;
+export const SNIPPET_CHARS = 40;
 const CAPTURE_KEY = "capture";
 const PIN_KEY = "pin";
 // Kinds job_retune refuses (an attached `transcribe` follows its input instead).
 export const NOT_RETUNABLE = ["spectrum", "scan", "identify", "watch", "transcribe"];
 export const HANDLE_PX = 8; // an edge handle's height (style.css .outline-handle)
 export const DRAG_CLICK_PX = 3; // less pointer travel than this is a click, not a drag
-export const LONG_PRESS_MS = 500; // a press this long on a narrow outline's label opens its menu
+export const LONG_PRESS_MS = 500; // a press this long on a narrow outline's tag opens its menu
 export const LONG_PRESS_MOVE_PX = 10; // a press that moves further than this is no long press
 export const MIN_WIDTH_HZ = 1000; // the narrowest band an edge drag leaves
 
@@ -256,9 +270,11 @@ class Overlays {
     this.noEventStream = new Map(); // job id -> JSON of the graph that has no event stream
     this.resolving = false; // a GET /streams for unwatched jobs is in flight
     this.counters = new Map(); // job id -> non-spectrum events seen while watched
+    this.hotJob = null; // the job id whose tag, outline and row show `hot`
+    this.snippets = new Map(); // input job id -> the last transcript text of its attached job
     this.squelches = new Map(); // job id -> {event: the last `squelch` event seen, graph}
     this.labels = new Map(); // key -> {el, hz}
-    this.outlines = new Map(); // key -> {el, labelEl, lo, hi, job, handles}
+    this.outlines = new Map(); // key -> {el, labelEl (pin, capture) or tag, lo, hi, job, handles}
     this.marks = new Map(); // `${job id}:${rounded centre}` -> {el, hz}: a watch's `signal new`
     this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
@@ -338,10 +354,13 @@ class Overlays {
       if (sq && sq.graph !== graphKey(j)) {
         this.squelches.delete(j.id);
         setSquelchTag(this.jobRowEl(j), null);
+        this.refreshTag(this.outlines.get(j.id));
       }
       const over = !ids.has(j.id) && !this.noEventStream.has(j.id);
       this.jobRow(j, over ? "—" : this.counters.get(j.id) || 0);
     }
+    // agent.js re-rendered the rows: the hovered job's row is hot again.
+    if (this.hotJob) this.setHot(this.hotJob, true);
     this.syncPositioned(jobs);
   }
 
@@ -528,6 +547,7 @@ class Overlays {
     if (!p || p.protocol !== "squelch" || this.squelches.has(job.id)) return;
     this.squelches.set(job.id, { event: p, graph: graphKey(rec.job) });
     setSquelchTag(this.jobRowEl(rec.job), p);
+    this.refreshTag(this.outlines.get(job.id));
   }
 
   unwatch(jobId) {
@@ -578,6 +598,7 @@ class Overlays {
       if (SQUELCH_KINDS.includes(job.kind)) {
         this.squelches.set(job.id, { event: p, graph: graphKey(job) });
         setSquelchTag(this.jobRowEl(job), p);
+        this.refreshTag(this.outlines.get(job.id));
       }
       return;
     }
@@ -597,6 +618,10 @@ class Overlays {
         else if (p.state === "new") this.mark(p.center_hz, p.summary, key);
       }
       if (p.protocol === "transcript") {
+        if (job.input && typeof p.text === "string" && !p.dropped && !present(p.error)) {
+          this.snippets.set(job.input, p.text.slice(0, SNIPPET_CHARS));
+          this.refreshTag(this.outlines.get(job.input));
+        }
         const t = transcriptRibbon(p);
         const el = this.ribbon(tuningCentre(job), t.text, t.cls);
         if (el && t.title) el.title = `${t.text}\n${t.title}`;
@@ -780,17 +805,22 @@ class Overlays {
       const el = document.createElement("div");
       el.className = "outline";
       el.dataset.key = key;
-      const labelEl = document.createElement("span");
-      labelEl.className = "outline-label";
-      el.append(labelEl);
+      o = { el, labelEl: null, tag: null, parts: null, lo, hi, job: null, handles: null };
+      if (job) {
+        this.tag(o, key);
+      } else {
+        o.labelEl = document.createElement("span");
+        o.labelEl.className = "outline-label";
+        el.append(o.labelEl);
+      }
       this.layer.prepend(el); // under the labels and ribbons
-      o = { el, labelEl, lo, hi, job: null, handles: null };
       this.outlines.set(key, o);
       this.listenDrag(o, key);
     }
     o.job = job;
     this.setDraggable(o);
-    o.labelEl.textContent = String(text);
+    if (o.labelEl) o.labelEl.textContent = String(text);
+    this.refreshTag(o);
     if (this.drag && this.drag.key === key) return o.el; // the pointer has it
     o.lo = lo;
     o.hi = hi;
@@ -803,8 +833,126 @@ class Overlays {
     const o = this.outlines.get(key);
     if (!o) return;
     if (this.drag && this.drag.key === key) this.endDrag();
+    this.untag(o, key);
     o.el.remove();
     this.outlines.delete(key);
+    this.layoutTags();
+  }
+
+  // ---- job tags ------------------------------------------------------------------------
+
+  // The tag of a job's outline `o`: kind, short id, [squelch dot], channel, [snippet].
+  tag(o, key) {
+    const el = document.createElement("div");
+    el.className = "job-tag";
+    el.dataset.job = key;
+    const span = (cls) => {
+      const s = document.createElement("span");
+      s.className = cls;
+      return s;
+    };
+    o.parts = { kind: span("kind"), short: span("short"), channel: span("channel"), dot: null, snippet: null };
+    el.append(o.parts.kind, " ", o.parts.short, " ", o.parts.channel, " ");
+    o.el.append(el);
+    o.tag = el;
+    el.addEventListener("click", () => {
+      const row = o.job && this.jobRowEl(o.job);
+      if (row) row.scrollIntoView({ block: "nearest" });
+    });
+    for (const target of [el, o.el]) {
+      target.addEventListener("pointerenter", () => this.hoverTag(o, true));
+      target.addEventListener("pointerleave", (ev) => {
+        // Moving between the tag and its outline is still hovering the job.
+        if (!ev.relatedTarget || !o.el.contains(ev.relatedTarget)) this.hoverTag(o, false);
+      });
+    }
+  }
+
+  untag(o, key) {
+    if (!o.tag) return;
+    this.snippets.delete(key);
+    if (this.hotJob === key) this.hotJob = null;
+    o.tag.remove();
+    o.tag = null;
+    o.parts = null;
+  }
+
+  // The text of `o`'s tag from its job, the squelch state, the plan and the last snippet.
+  refreshTag(o) {
+    if (!o || !o.tag || !o.job) return;
+    const job = o.job;
+    const parts = o.parts;
+    parts.kind.textContent = job.kind;
+    parts.short.textContent = job.id.slice(-6);
+    const sq = SQUELCH_KINDS.includes(job.kind) ? this.squelch(job.id) : null;
+    if (sq && typeof sq.open === "boolean") {
+      if (!parts.dot) {
+        parts.dot = document.createElement("span");
+        o.tag.insertBefore(parts.dot, parts.channel);
+        o.tag.insertBefore(document.createTextNode(" "), parts.channel);
+      }
+      parts.dot.className = `dot ${sq.open ? "open" : "closed"}`;
+    } else if (parts.dot) {
+      parts.dot.nextSibling.remove();
+      parts.dot.remove();
+      parts.dot = null;
+    }
+    const ch = job.tuning ? channelLabel(job.tuning.center_hz, this.plan()) : null;
+    parts.channel.textContent = ch ? ch.text : "";
+    const text = this.snippets.get(job.id);
+    if (text !== undefined) {
+      if (!parts.snippet) {
+        parts.snippet = document.createElement("span");
+        parts.snippet.className = "snippet";
+        o.tag.append(parts.snippet);
+      }
+      parts.snippet.textContent = text;
+    }
+    this.layoutTags();
+  }
+
+  // Tags at their outline's vertical centre, stacked: sorted by top, a tag under the
+  // previous one's bottom + TAG_GAP_PX is pushed down (at most MAX_LANES in a row).
+  layoutTags() {
+    const items = [];
+    for (const o of this.outlines.values()) {
+      if (!o.tag || o.el.hidden) continue;
+      const oTop = parseFloat(o.el.style.top) || 0;
+      const h = parseFloat(o.el.style.height) || 0;
+      const th = o.tag.offsetHeight;
+      items.push({ o, oTop, th, top: oTop + h / 2 - th / 2 });
+    }
+    items.sort((a, b) => a.top - b.top);
+    let prev = null;
+    let lane = 0;
+    for (const it of items) {
+      if (prev && it.top < prev.top + prev.th + TAG_GAP_PX && lane < MAX_LANES) {
+        it.top = prev.top + prev.th + TAG_GAP_PX;
+        lane++;
+      } else {
+        lane = 0;
+      }
+      it.o.tag.style.top = `${it.top - it.oTop}px`;
+      prev = it;
+    }
+  }
+
+  // `hot` on the job's outline, tag and row (agent.js calls it when its row is hovered).
+  setHot(jobId, on) {
+    this.hotJob = on ? jobId : this.hotJob === jobId ? null : this.hotJob;
+    const o = this.outlines.get(jobId);
+    if (o) {
+      o.el.classList.toggle("hot", on);
+      if (o.tag) o.tag.classList.toggle("hot", on);
+    }
+    const row = this.jobsEl && this.jobsEl.querySelector(`.job[data-id="${CSS.escape(jobId)}"]`);
+    if (row) row.classList.toggle("hot", on);
+  }
+
+  // The pointer entered or left a tag or outline: its row follows.
+  hoverTag(o, on) {
+    if (!o.job) return;
+    this.setHot(o.job.id, on);
   }
 
   // ---- dragging an outline (retune) ----------------------------------------------------
@@ -854,8 +1002,23 @@ class Overlays {
       ev.preventDefault();
       this.onOutlineMenu(o.job, ev.clientX, ev.clientY);
     });
-    // Narrow: a long press on the label opens the menu.
-    const label = o.labelEl;
+    // Narrow: a long press on the tag opens the menu.
+    const label = o.tag;
+    if (label) this.listenPress(o, label);
+    // A wheel over a draggable outline still zooms the waterfall under it.
+    el.addEventListener(
+      "wheel",
+      (ev) => {
+        const target = this.wf.overlay;
+        if (!target || !el.classList.contains("retunable")) return;
+        ev.preventDefault();
+        target.dispatchEvent(new WheelEvent("wheel", ev));
+      },
+      { passive: false },
+    );
+  }
+
+  listenPress(o, label) {
     label.addEventListener("pointerdown", (ev) => {
       if (this.footprint() !== "narrow" || !o.job || !this.retunable(o.job)) return;
       this.cancelPress();
@@ -881,17 +1044,6 @@ class Overlays {
       // A touch long press may raise contextmenu too: ours is the timer's.
       if (this.footprint() === "narrow") ev.preventDefault();
     });
-    // A wheel over a draggable outline still zooms the waterfall under it.
-    el.addEventListener(
-      "wheel",
-      (ev) => {
-        const target = this.wf.overlay;
-        if (!target || !el.classList.contains("retunable")) return;
-        ev.preventDefault();
-        target.dispatchEvent(new WheelEvent("wheel", ev));
-      },
-      { passive: false },
-    );
   }
 
   cancelPress() {
@@ -1028,6 +1180,7 @@ class Overlays {
     o.el.hidden = false;
     o.el.style.top = `${top}px`;
     o.el.style.height = `${Math.max(1, bottom - top)}px`;
+    this.layoutTags();
   }
 
   // Re-places everything vertically (the band or the height changed).
@@ -1045,6 +1198,7 @@ class Overlays {
     for (const l of this.labels.values()) {
       l.el.style.top = `${this.yFor(l.hz) - l.h / 2 + (l.dy || 0)}px`;
     }
+    this.layoutTags();
   }
 
   scroll(shift) {
