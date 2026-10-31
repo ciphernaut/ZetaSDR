@@ -78,22 +78,24 @@ Plan 18 (box and refine) is on the `plan-18` branch (tasks 1-10), merged to `mai
 
 What was built (spec `docs/superpowers/specs/2026-10-31-box-and-refine-design.md`):
 
-- Task 1, the op: `job_retune` in the node (same id, new centre and bandwidth). Known: `job_start` on an unheld radio tunes twice (`tune_if_unheld`, then `ensure_as`), a pre-existing inefficiency noted in `TODO.md`.
-- Task 2, the lease move: a retune moves the job's lease inside the current capture without retuning the radio, outside it when no other rigid job or pin holds it, else a `conflict` naming the holders.
-- Task 3, carried params and the re-derived guard: squelch settings are carried across a retune, the channel-plan guard is derived again at the new band. Known: two restarts of one input are not serialised (two retunes in the post-gate tail, or a `graph_put` racing a retune), so in a window of tens of ms the attached job can end `stopped`/`failed` visibly; nothing leaks; a per-input restart lock closes it (`TODO.md`).
-- Task 4, the attached relaunch: an attached `transcribe` follows its input through a retune or a `graph_put`.
-- Task 5, the fit (page): a demodulator started from a box is measured first and fitted. The fit waits about 3 s (`stream_tail` of 3 measure frames); on the noiseless `tone` fixture the fitted width is 6.0 kHz (a 4781 Hz leakage skirt x 1.25), so the e2e pins a range.
-- Task 6, the CLI and MCP: `zeta job retune` and the guide note.
-- Task 7, the drag: draggable outlines (edges resize, body moves), a ghost and readout, `job_retune` on release. Known: a `job_list` record carries no `sideband`, so "Fit to signal" on an `ssb_demod` job assumes USB.
-- Task 8, the menu: the outline menu (Fit to signal, the width presets, Stop).
-- Task 9, the tags: job tags linked by hover with the job rows; the e2e deadline raised to 330 s.
+- Task 1, the op, the lease move and the same-id relaunch: `job_retune` in the node (same id, new centre and bandwidth); the job's lease moves inside the current capture without retuning the radio, outside it when no other rigid job or pin holds it, else a `conflict` naming the holders with the old lease put back; the run is relaunched under its id without the record leaving `running`. Known: `job_start` on an unheld radio tunes twice (`tune_if_unheld`, then `ensure_as`), a pre-existing inefficiency noted in `TODO.md`.
+- Task 2, carried params and the re-derived guard: squelch settings are carried across a retune, the channel-plan guard is derived again at the new band.
+- Task 3, attached jobs: an attached `transcribe` follows its input through a retune or a `graph_put`, relaunched under its own id. Known: two restarts of one input are not serialised (two retunes in the post-gate tail, or a `graph_put` racing a retune), so in a window of tens of ms the attached job can end `stopped`/`failed` visibly; nothing leaks; a per-input restart lock closes it (`TODO.md`).
+- Task 4, the CLI and MCP: `zeta job retune` and the guide note.
+- Task 5, the fit first (page): a demodulator started from a box is measured first and fitted. The fit waits about 3 s (`stream_tail` of 3 measure frames); on the noiseless `tone` fixture the fitted width is 6.0 kHz (a 4781 Hz leakage skirt x 1.25), so the e2e pins a range.
+- Task 6, draggable outlines: edges resize, the body moves, a ghost and readout, `job_retune` on release.
+- Task 7, the outline menu: Fit to signal, the width presets, Stop.
+- Task 8, the tags: job tags linked by hover with the job rows; rows show the band.
+- Task 9, the e2e deadline raised to 330 s (measured 256.9 s).
 - Task 10: field craft ("Fitting a demod to a signal"), README, this status, `TODO.md`, regenerated guides.
+- Final fix wave (whole-branch review, 2026-11-01): an SSB fit moves the dial only and keeps its 6000 Hz band (spec section 4 amended); the field craft says what plan 15's measure DC mask hides from a box holding the capture centre, and the page's no-signal note names the capture centre when it was in the box on a local radio; a band shorter than three handles keeps its handles outside it; "Fit to signal" reads an `ssb_demod`'s sideband from its graph; the fitted/as-drawn notes follow a successful start only; the outline menu offers Fit and the presets on demodulators only; `job_retune` checks a program row's `min_hz` before the gate; a lease put back after a failed move is released when the run ended meanwhile.
 
 Outcomes to record (live):
 
 - The fitted centre's error against the channel centre, and the fitted width.
 - Whether the DC spike ever wins a fit.
 - The drag's feel at 12.5 kHz on a 1 MHz capture.
+- Whether the DC mask hid a channel near the pin centre from a wide box (ch20/21/60/61 under the UHF CB pin), and whether the outline menu's Fit on a 12.5 kHz band fitted it.
 
 Live acceptance (spec section 10), on the desktop HackRF with the 2 m / 70 cm antenna, UHF CB pinned at 476 918 750 / 1 000 000 Hz:
 

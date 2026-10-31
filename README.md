@@ -590,7 +590,8 @@ A running demodulator's outline has a handle at each edge (resize) and a body (m
 dragged band is shown with a ghost and a readout and sent as `job_retune` on release, keeping
 the job id, the attached `transcribe` and the ribbons; a conflict snaps it back with the usual
 retry buttons. Right-click (long press on a phone) opens Fit to signal, the width presets and
-Stop. Every rigid job carries a tag (kind, short id, squelch dot, channel, last transcript
+Stop (a decoder's or a passthrough's menu holds Stop only; an SSB fit moves the dial and keeps
+the band). Every rigid job carries a tag (kind, short id, squelch dot, channel, last transcript
 snippet) linked by hover with its row in the job list, and rows show the band. A selection drag
 can no longer start inside a running retunable job's band (its outline takes the pointer): start
 the box outside it or on another part of the waterfall.

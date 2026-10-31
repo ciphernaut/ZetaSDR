@@ -144,6 +144,13 @@ their Transcribe twins) fit before they start:
    (a box narrower than the signal is the operator's choice). The transcript gets `fitted <kind> to
    <centre> MHz, <width> kHz (<label>)`. The Transcribe twins attach as today once the demod runs.
 
+   *Amended 2026-11-01 (plan 18's review):* `ssb_demod` is not fitted in width. Its band is
+   centred on the dial and the `channel` stage low-passes at half the band, while USB voice
+   occupies about dial+300..dial+2700 Hz: a 3 000 Hz band about the dial would pass ±1.5 kHz
+   and cut the voice above 1.5 kHz. An SSB fit moves the dial only (the evidence's dial, else
+   the occupied centre ∓ 1 500 Hz) and keeps the width the entry uses today (6 000 Hz), or a
+   running job's own width for the outline menu's Fit.
+
 `deviation_hz` and `sideband` are as the entry sets them today. A `measure` on a band outside the
 capture retunes the radio like any rigid job; a conflict is reported as the entries report it
 today and nothing starts.
