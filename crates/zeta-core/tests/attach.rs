@@ -402,6 +402,30 @@ async fn attach_follows_graph_put_of_the_input() {
     assert_eq!(attached_to(&node, &input), vec![id]);
 }
 
+/// Two `graph_put`s of the input at once (one may be refused as `already running a
+/// launch`): the attached job ends up `Running` under its id on the input's stream,
+/// never stopped by the other restart's relaunch.
+#[tokio::test]
+async fn overlapping_graph_puts_of_the_input_keep_the_attached_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let input = start_audio(&node).await;
+    let id = attach_ok(&node, &input).await;
+    let (a, b) = tokio::join!(
+        node.job_graph_put(&input, node_graph("audio_src", serde_json::json!({}))),
+        node.job_graph_put(&input, node_graph("audio_src", serde_json::json!({}))),
+    );
+    assert!(a.is_ok() || b.is_ok(), "one restart lands: {a:?} {b:?}");
+    assert_eq!(record(&node, &input).state, JobState::Running);
+    assert_running_for(&node, &id, 1000).await;
+    assert!(event(&node, &id, "transcript", 2000).await.is_some());
+    assert_eq!(attached_to(&node, &input), vec![id]);
+}
+
 /// The ids of the records attached to `input`.
 fn attached_to(node: &Node, input: &JobId) -> Vec<JobId> {
     node.job_list()
