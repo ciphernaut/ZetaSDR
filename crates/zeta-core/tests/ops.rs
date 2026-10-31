@@ -1956,6 +1956,32 @@ async fn source_list_carries_nullable_stats() {
         panic!("expected sources");
     };
     assert_eq!(v[0].stats, None);
+    assert_eq!(v[0].worker, None);
+    let json = serde_json::to_value(&v).unwrap();
+    assert!(json[0].get("worker").is_some_and(Value::is_null), "{json}");
+    let si = &schema()["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"worker".into()),
+        "{si}"
+    );
+    let worker = &si["properties"]["worker"];
+    let ty = worker["type"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{worker}"));
+    assert!(ty.contains(&Value::from("null")), "{worker}");
+    assert!(ty.contains(&Value::from("object")), "{worker}");
+    let wi = worker;
+    let mut req: Vec<&str> = wi["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{wi}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    req.sort();
+    assert_eq!(req, ["pid", "restarts", "since_ns"], "{wi}");
     let json = serde_json::to_value(&v).unwrap();
     assert!(json[0].get("stats").is_some_and(Value::is_null), "{json}");
     let si = &schema()["result"]["$defs"]["SourceInfo"];

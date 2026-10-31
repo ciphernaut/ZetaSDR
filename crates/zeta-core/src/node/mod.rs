@@ -38,7 +38,7 @@ pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
 pub(crate) use launch::AfterGate;
 use launch::{feed_bank, feed_ring};
 use persist::{io, load, now, persist};
-pub use sources::{GainSetting, SOURCE_RECORD_FORMAT, SourceRecord};
+pub use sources::{GainSetting, SOURCE_RECORD_FORMAT, SourceRecord, load_source};
 use sources::{load_sources, persist_source};
 
 const BUS_CAPACITY: usize = 256;
@@ -269,6 +269,35 @@ impl Inner {
                 .lock()
                 .unwrap()
                 .push(format!("{}: {e}", which.name()));
+        }
+    }
+
+    /// Cache a worker port's capabilities in its source record, so a later start
+    /// with the device absent can still list the source. A port that runs in the
+    /// node (`Port::worker` is `None`) has nothing to cache and writes no record.
+    /// A failed write goes to `persist_errors`; the memory record is then left as
+    /// it was.
+    pub(crate) fn note_capabilities(&self, port: &dyn Port) {
+        if port.worker().is_none() {
+            return;
+        }
+        let source = port.id();
+        let mut sources = self.sources.lock().unwrap();
+        let mut rec = sources
+            .get(source)
+            .cloned()
+            .unwrap_or_else(SourceRecord::new);
+        rec.format = SOURCE_RECORD_FORMAT;
+        rec.capabilities = Some(port.capabilities().clone());
+        match persist_source(&self.sources_dir, source, &rec) {
+            Ok(()) => {
+                sources.insert(source.clone(), rec);
+            }
+            Err(e) => self
+                .persist_errors
+                .lock()
+                .unwrap()
+                .push(format!("source record {}: {e}", source.0)),
         }
     }
 
@@ -909,6 +938,7 @@ impl Node {
             }
             ports.insert(source.clone(), port.clone());
         }
+        inner.note_capabilities(port.as_ref());
         if let Some(band) = port.current() {
             inner.sync_bank(&source, band);
         }

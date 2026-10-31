@@ -20,7 +20,7 @@ use crate::modes::{
     is_mode_id, template,
 };
 use crate::node::{AfterGate, Node, NodeError};
-use crate::port::{GainInfo, Port, PortError, PortStats, Tuning};
+use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
 use crate::ring::RingError;
 use crate::stream::{Frame, Payload, StreamInfo};
 use crate::types::{
@@ -48,7 +48,9 @@ pub enum Op {
     /// `stats`, the stream's counters since it opened (`measured_rate_hz`, the
     /// rate delivered over the last 10 s, `null` before any; `overflows`,
     /// `timeouts`, `restarts`, streams reopened because their samples ran ahead
-    /// of the clock; `null` for a source that keeps none). Jobs on a faulted source fail with
+    /// of the clock; `null` for a source that keeps none), and `worker`, the child
+    /// process the source runs in (`pid`, `restarts`, `since_ns`; `null` for a
+    /// source that runs in the node). Jobs on a faulted source fail with
     /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,
     /// `job_start`) clears it. A channelised job's `job_context` holds `channel.path`:
     /// `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
@@ -1101,6 +1103,11 @@ pub struct SourceInfo {
     /// read timeouts, stream restarts; `null` for a source that keeps none.
     #[schemars(required, schema_with = "crate::types::nullable::<PortStats>")]
     pub stats: Option<PortStats>,
+    /// The child process the source runs in (`Port::worker`): its pid, how many
+    /// times it was respawned, when the live one said hello; `null` for a source
+    /// that runs in the node.
+    #[schemars(required, schema_with = "crate::types::nullable::<WorkerInfo>")]
+    pub worker: Option<WorkerInfo>,
 }
 
 /// A source of `source_free` that covers the band but cannot take it now, with why.
@@ -1933,6 +1940,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                     }),
                     gain: node.port(&id).and_then(|p| p.gain()),
                     stats: node.port(&id).and_then(|p| p.stats()),
+                    worker: node.port(&id).and_then(|p| p.worker()),
                     id,
                     capabilities,
                 })

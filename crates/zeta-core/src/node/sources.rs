@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::NodeError;
 use super::persist::io;
 use crate::port::Tuning;
-use crate::types::SourceId;
+use crate::types::{Capabilities, SourceId};
 
 /// The format a source record is written in; a newer one on disk is a load error.
 pub const SOURCE_RECORD_FORMAT: u32 = 1;
@@ -33,6 +33,11 @@ pub struct SourceRecord {
     /// `None` when never set (the flag or the driver's default applies).
     #[serde(default)]
     pub gain: Option<GainSetting>,
+    /// The capabilities a worker port reported the last time it was live, so a
+    /// node that starts while the device is absent can still list the source.
+    /// `None` for a source that runs in the node (nothing to cache).
+    #[serde(default)]
+    pub capabilities: Option<Capabilities>,
 }
 
 impl SourceRecord {
@@ -110,6 +115,14 @@ pub fn load_sources(dir: &Path) -> (HashMap<SourceId, SourceRecord>, Vec<String>
         }
     }
     (records, errors)
+}
+
+/// Load the one record `<dir>/<id>.json`; `None` when it is missing, unreadable,
+/// or in a newer format than [`SOURCE_RECORD_FORMAT`].
+pub fn load_source(dir: &Path, id: &SourceId) -> Option<SourceRecord> {
+    let text = std::fs::read_to_string(dir.join(format!("{}.json", id.0))).ok()?;
+    let rec: SourceRecord = serde_json::from_str(&text).ok()?;
+    (rec.format <= SOURCE_RECORD_FORMAT).then_some(rec)
 }
 
 /// Write `<dir>/<id>.json` atomically (temp file, then rename), making `dir` if
