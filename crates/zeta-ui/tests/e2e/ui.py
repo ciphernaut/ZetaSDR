@@ -637,10 +637,17 @@ def scenario_fit_first_lands_on_the_tone(page, url, secret):
     # then starts on the measured centre, 1.25x the occupied width floored at 5 kHz and
     # capped at the box. The noise-free tone's occupied width is the window's leakage skirt
     # (measured 4781 Hz in a fresh measure job's first window, 7359 Hz after), so the width
-    # is checked as fitted (at least the floor, under the box), not pinned.
+    # is checked as fitted (at least the floor, under the box), not pinned. A second click
+    # during the fit is ignored; Escape during a fit cancels its start.
     menu = open_menu_on_tone(page, url, secret)
     page.click('#ctx .ctx-item[data-action="fm_demod"]')
+    # The entries are aria-disabled during the fit (Playwright would wait): force the click
+    # a browser still delivers.
+    expect(page.locator('#ctx .ctx-item[data-action="fm_demod"]')).to_have_attribute(
+        "aria-disabled", "true")
+    page.click('#ctx .ctx-item[data-action="fm_demod"]', force=True)
     jobs = []
+    fitted = page.locator("#transcript .line.note", has_text=re.compile(r"^fitted fm_demod "))
     try:
         expect(page.locator("#ctx-footer")).to_have_text("measuring…")
         expect(menu).to_be_hidden(timeout=10_000)
@@ -656,8 +663,30 @@ def scenario_fit_first_lands_on_the_tone(page, url, secret):
         assert khz == f"{t['bandwidth_hz'] / 1e3:.1f}", f"note {khz} kHz for tuning {t}"
         left = running_jobs(url, secret, "measure", "tone")
         assert not left, f"measure jobs left on tone: {left}"
+        # A second box (dragged here, not with drag_menu: the menu may open with an SSB
+        # entry under the pointer, whose hover rewrites the footer), then Escape mid-fit.
+        box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
+        page.mouse.move(box["x"] + 40, box["y"] + box["height"] * 0.40)
+        page.mouse.down()
+        page.mouse.move(box["x"] + box["width"] - 20, box["y"] + box["height"] * 0.60, steps=6)
+        page.mouse.up()
+        expect(menu).to_be_visible()
+        page.click('#ctx .ctx-item[data-action="fm_demod"]')
+        expect(page.locator("#ctx-footer")).to_have_text("measuring…")
+        page.keyboard.press("Escape")
+        expect(menu).to_be_hidden()
+        cancelled = page.locator("#transcript .line.note", has_text=re.compile(
+            r"^fm_demod: fit cancelled$"))
+        expect(cancelled).to_have_count(1, timeout=10_000)
+        wait_until(lambda: not running_jobs(url, secret, "measure", "tone"), 5.0,
+                   "the cancelled fit's measure job stopped")
+        # By now a second fit from the double click would have started its job too.
+        after = running_jobs(url, secret, "fm_demod", "tone")
+        assert [j["id"] for j in after] == [jobs[0]["id"]], f"fm_demod jobs on tone: {after}"
+        expect(fitted).to_have_count(1)
+        expect(cancelled).to_have_count(1)
     finally:
-        for j in jobs:
+        for j in running_jobs(url, secret, "fm_demod", "tone"):
             stop_job(url, secret, j["id"])
 
 

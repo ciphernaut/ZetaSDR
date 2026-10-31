@@ -13,9 +13,9 @@
 //       the fit of a demodulator entry (see Fitting below)
 //   fitBand(api, source, centerHz, bandwidthHz)
 //       -> Promise<{centerHz, bandwidthHz, label, snrDb, dialHz} | null>
-//       Starts a `measure` job on the band (api.op, so an OpError propagates), tails one of
-//       its events from its `event` stream (stream_tail, max_frames 3, FIT_TIMEOUT_MS) and
-//       stops it (always). The frame used is the first whose payload has `partial: false`,
+//       Starts a `measure` job on the band (api.op, so an OpError propagates), tails its
+//       `event` stream (stream_tail, up to 3 frames within FIT_TIMEOUT_MS) and stops it
+//       (always). The frame used is the first whose payload has `partial: false`,
 //       else the last; null when no frame came, when its label is `noise`, or when it is
 //       `unknown` under FIT_NOISE_SNR_DB. `label` is the label's name, `snrDb` its `snr_db`,
 //       `dialHz` the integer of `dial ≈ <n> Hz` in the label's evidence (an SSB label's), else
@@ -108,6 +108,10 @@
 //   - a fit: the job starts with fitTuning(job, fit, jobTuning(...)) and the note reads
 //     `fitted <kind> to <bandText(centre, width)> (<label>)`, e.g. `fitted fm_demod to
 //     100.0011 MHz, 6.0 kHz (carrier)`.
+// While a fit runs the entries are aria-disabled and choosing again does nothing (a double
+// click starts one job). Closing the menu meanwhile (Escape, a press outside, a new box)
+// cancels the start: the measure job is stopped, nothing starts, and the transcript notes
+// `<kind>: fit cancelled`; the fit leaves any menu opened later alone.
 // Every other entry closes the menu first.
 //
 // Span: the node reads the selection from the source ring, which keeps RING_HISTORY_S. The
@@ -332,7 +336,9 @@ class Menu {
     this.t = transcript;
     this.ov = ov;
     this.sel = null;
-    this.fitting = false;
+    // The fit in progress (its generation token) or null; close() bumps fitGen.
+    this.fitting = null;
+    this.fitGen = 0;
     this.labelKeys = [];
     this.pointer = { x: 0, y: 0 };
 
@@ -348,8 +354,9 @@ class Menu {
       item.textContent = text;
       item.addEventListener("click", () => this.choose(action));
       if (jobOf(action) && jobOf(action).sideband) {
-        const show = () => this.sel && !this.fitting && this.showFooter(this.current(), action);
-        const hide = () => this.sel && !this.fitting && this.showFooter(this.current());
+        const idle = () => this.sel && this.fitting === null;
+        const show = () => idle() && this.showFooter(this.current(), action);
+        const hide = () => idle() && this.showFooter(this.current());
         item.addEventListener("focus", show);
         item.addEventListener("pointerenter", show);
         item.addEventListener("blur", hide);
@@ -408,6 +415,9 @@ class Menu {
 
   open(sel, x, y) {
     if (!this.wf.sourceId) return;
+    // A new box cancels a fit still running for the previous one.
+    this.fitGen += 1;
+    this.setFitting(null);
     this.sel = { ...sel, sourceId: this.wf.sourceId };
     this.showFooter(this.current());
     this.el.hidden = false;
@@ -422,10 +432,23 @@ class Menu {
   close() {
     this.el.hidden = true;
     this.wf.clearSelection();
+    // A fit in progress is cancelled: its result no longer belongs to an open menu.
+    this.fitGen += 1;
+    this.setFitting(null);
+  }
+
+  // Marks fit `token` in progress (null: none), the entries aria-disabled meanwhile.
+  setFitting(token) {
+    this.fitting = token;
+    for (const item of this.el.querySelectorAll(".ctx-item")) {
+      if (token === null) item.removeAttribute("aria-disabled");
+      else item.setAttribute("aria-disabled", "true");
+    }
   }
 
   async choose(action) {
-    if (!this.sel) return;
+    // A fit in progress ignores further choices (a double click starts one job).
+    if (!this.sel || this.fitting !== null) return;
     const s = this.current();
     this.showFooter(s, action);
     const job = jobOf(action);
@@ -476,18 +499,27 @@ class Menu {
   // entry attaches to the job after, as choose does.
   async fitAndStart(action, s, job) {
     this.footer.textContent = "measuring…";
-    // An SSB entry's hover no longer rewrites the footer.
-    this.fitting = true;
+    // While it runs, an SSB entry's hover no longer rewrites the footer and choose ignores
+    // further choices; a close() meanwhile (Escape, a press outside, a new box) bumps fitGen.
+    const token = ++this.fitGen;
+    this.setFitting(token);
     const kind = job.kind;
     let fit;
+    let error = null;
     try {
       fit = await fitBand(this.ov.api, s.sourceId, s.centerHz, s.bandwidthHz);
     } catch (e) {
-      this.t.note(`${kind}: ${e.message}`, true);
+      error = e;
+    }
+    if (token !== this.fitGen) {
+      // The menu was closed meanwhile: nothing starts, and a later menu is left alone.
+      this.t.note(`${kind}: fit cancelled`);
       return;
-    } finally {
-      this.fitting = false;
-      this.close();
+    }
+    this.close();
+    if (error) {
+      this.t.note(`${kind}: ${error.message}`, true);
+      return;
     }
     let r;
     if (fit === null) {
