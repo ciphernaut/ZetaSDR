@@ -1,0 +1,411 @@
+//! `zeta-fake-worker --id ID --script SCRIPT [--record PATH]`: a source worker
+//! for tests. Its stdout speaks the real protocol through [`serve`]; its port is
+//! a `SoapySource` over a scripted `MockDevice`, or a `FileSource` over a SigMF
+//! recording, chosen by `--script`:
+//!
+//! - `stream`: samples forever, paced at the tuned rate.
+//! - `gone-after-ms N`: samples, then after N ms the device vanishes, so the
+//!   port faults and the worker exits 5.
+//! - `not-found`: exits 3 after `device not found: fake` on stderr.
+//! - `open-fails`: exits 4 after `fake open: no such device` on stderr.
+//! - `crash-after-ms N`: `stream`, and N ms after start `abort()` (SIGABRT).
+//! - `hang-hello`: never writes a hello.
+//! - `file PATH[,crash-after-ms N]`: a looping real-time `FileSource` over the
+//!   recording `PATH`, tunable 2 MHz either side of its centre.
+//!
+//! `--record PATH` appends `start <unix_ms>` and one `env <NAME>` per
+//! environment variable at startup, then `tune <c> <bw>` and `gain <db|auto>`
+//! per call, so a test sees when the worker was spawned, what it inherited and
+//! what the node re-applied. `ZETA_FAKE_CRASH_ONCE=1` crashes only on the
+//! first spawn (the marker `<record>.crashed` says it has); `ZETA_FAKE_PRINT=1`
+//! prints `noise` to stdout after the redirect, which must land on stderr.
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::fd::FromRawFd;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::broadcast::error::TryRecvError;
+
+use async_trait::async_trait;
+use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning};
+use zeta_core::types::{Capabilities, Hz, SourceId};
+use zeta_source_file::{FileOpts, FileSource, read_meta};
+use zeta_source_soapy::SoapySource;
+use zeta_source_soapy::mock::{MockDevice, MockRead};
+use zeta_source_worker::serve::{
+    EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, serve,
+};
+
+/// Samples per scripted read.
+const READ_SAMPLES: usize = 16_384;
+/// How much the feeder keeps scripted ahead of the reader (at least
+/// [`FEED_QUEUE_MIN`] reads), so the reader never finds the script empty (an
+/// empty script reads as a 100 ms timeout).
+const FEED_QUEUE: Duration = Duration::from_millis(50);
+const FEED_QUEUE_MIN: u64 = 4;
+/// The feeder's wake-up interval.
+const FEED_TICK: Duration = Duration::from_millis(5);
+
+struct Args {
+    id: String,
+    script: String,
+    record: Option<PathBuf>,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut it = std::env::args().skip(1);
+    let (mut id, mut script, mut record) = (None, None, None);
+    while let Some(flag) = it.next() {
+        let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--id" => id = Some(value),
+            "--script" => script = Some(value),
+            "--record" => record = Some(PathBuf::from(value)),
+            _ => return Err(format!("unknown flag {flag}")),
+        }
+    }
+    Ok(Args {
+        id: id.ok_or("--id is required")?,
+        script: script.ok_or("--script is required")?,
+        record,
+    })
+}
+
+/// The `--record` file, appended one line at a time.
+#[derive(Clone)]
+struct Record(Option<Arc<Mutex<File>>>);
+
+impl Record {
+    fn open(path: Option<&Path>) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Record(None));
+        };
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Record(Some(Arc::new(Mutex::new(f)))))
+    }
+
+    fn line(&self, line: &str) {
+        if let Some(f) = &self.0 {
+            let mut f = f.lock().unwrap();
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// A port that records every `tune` and `set_gain` before handing it on.
+struct Recorded {
+    inner: Arc<dyn Port>,
+    record: Record,
+}
+
+#[async_trait]
+impl Port for Recorded {
+    fn id(&self) -> &SourceId {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> &Capabilities {
+        self.inner.capabilities()
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        self.record
+            .line(&format!("tune {} {}", t.center_hz.0, t.bandwidth_hz.0));
+        self.inner.tune(t).await
+    }
+    fn current(&self) -> Option<Tuning> {
+        self.inner.current()
+    }
+    fn subscribe(&self) -> IqReceiver {
+        self.inner.subscribe()
+    }
+    fn fault(&self) -> Option<String> {
+        self.inner.fault()
+    }
+    async fn idle(&self) {
+        self.inner.idle().await
+    }
+    fn gain(&self) -> Option<GainInfo> {
+        self.inner.gain()
+    }
+    fn stats(&self) -> Option<PortStats> {
+        self.inner.stats()
+    }
+    async fn set_gain(&self, db: Option<f64>) -> Result<GainInfo, PortError> {
+        let v = db.map_or("auto".to_string(), |d| d.to_string());
+        self.record.line(&format!("gain {v}"));
+        self.inner.set_gain(db).await
+    }
+}
+
+/// A `SoapySource` over a `MockDevice` whose reads a feeder thread scripts at
+/// the tuned rate: a mock read returns at once, and a stream that ran ahead of
+/// the wall clock would be restarted and in the end faulted by the source's
+/// clock guard. With `gone_after`, the feeder stops after that long from start
+/// and scripts `Gone("unplugged")`.
+fn mock_source(id: &str, gone_after: Option<Duration>) -> Result<Arc<SoapySource>, String> {
+    let dev = Arc::new(MockDevice::hackrf_like());
+    let src = Arc::new(
+        SoapySource::with_device(SourceId(id.into()), dev.clone()).map_err(|e| e.to_string())?,
+    );
+    let weak = Arc::downgrade(&src);
+    std::thread::Builder::new()
+        .name("fake-feeder".into())
+        .spawn(move || feed(&dev, &weak, gone_after))
+        .map_err(|e| e.to_string())?;
+    Ok(src)
+}
+
+/// Keep [`FEED_QUEUE`] of paced reads of [`READ_SAMPLES`] in the mock's script
+/// at the source's current rate. Each read is a `Slow` step: its sleep is the
+/// read's share of the rate, shortened while the samples actually delivered
+/// (counted on a receiver of the source's own broadcast) lag the wall clock
+/// and lengthened while they lead it, so thread wake-up overshoot does not
+/// add up to a slow stream. Whole milliseconds are carried from read to read.
+fn feed(dev: &MockDevice, src: &Weak<SoapySource>, gone_after: Option<Duration>) {
+    let start = Instant::now();
+    let Some(mut rx) = src.upgrade().map(|s| s.subscribe()) else {
+        return;
+    };
+    let mut pace: Option<Pace> = None;
+    loop {
+        std::thread::sleep(FEED_TICK);
+        if gone_after.is_some_and(|g| start.elapsed() >= g) {
+            dev.push_reads(vec![MockRead::Gone("unplugged".into())]);
+            return;
+        }
+        let mut delivered = 0u64;
+        loop {
+            match rx.try_recv() {
+                Ok(b) => delivered += b.samples.len() as u64,
+                Err(TryRecvError::Lagged(n)) => delivered += n * READ_SAMPLES as u64,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => {
+                    let Some(s) = src.upgrade() else { return };
+                    rx = s.subscribe();
+                    break;
+                }
+            }
+        }
+        let Some(src) = src.upgrade() else { return };
+        let Some(rate) = src.current().map(|t| t.bandwidth_hz.0).filter(|r| *r > 0) else {
+            continue;
+        };
+        let p = match pace.as_mut() {
+            Some(p) if p.rate == rate => p,
+            _ => pace.insert(Pace {
+                rate,
+                since: Instant::now(),
+                delivered: 0,
+                pushed: 0,
+                ideal_ms: 0.0,
+                whole_ms: 0,
+            }),
+        };
+        p.delivered += delivered;
+        let per_read_ms = READ_SAMPLES as f64 * 1e3 / rate as f64;
+        let due = p.since.elapsed().as_secs_f64() * rate as f64;
+        let lag_ms = (due - p.delivered as f64) * 1e3 / rate as f64;
+        let sleep_ms = (per_read_ms - lag_ms / 8.0).max(0.0);
+        let queued = p.pushed.saturating_sub(p.delivered / READ_SAMPLES as u64);
+        let target =
+            ((FEED_QUEUE.as_secs_f64() * 1e3 / per_read_ms).ceil() as u64).max(FEED_QUEUE_MIN);
+        let reads: Vec<MockRead> = (queued..target)
+            .map(|_| {
+                p.ideal_ms += sleep_ms;
+                let ms = (p.ideal_ms.round() as u64).saturating_sub(p.whole_ms);
+                p.whole_ms += ms;
+                p.pushed += 1;
+                MockRead::Slow(READ_SAMPLES, ms)
+            })
+            .collect();
+        if !reads.is_empty() {
+            dev.push_reads(reads);
+        }
+    }
+}
+
+/// The feeder's account of the current rate since it took effect.
+struct Pace {
+    rate: u64,
+    since: Instant,
+    /// Samples delivered and reads scripted at this rate.
+    delivered: u64,
+    pushed: u64,
+    /// Sleep scheduled, exact and in the whole milliseconds the mock takes.
+    ideal_ms: f64,
+    whole_ms: u64,
+}
+
+/// A looping, real-time `FileSource` over `meta`, tunable 2 MHz either side
+/// of the recording's centre.
+fn file_source(id: &str, meta: &Path) -> Result<Arc<FileSource>, String> {
+    let centre = read_meta(meta).map_err(|e| e.to_string())?.center_hz.0;
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: READ_SAMPLES,
+        repeat: true,
+        tune_range: Some((Hz(centre.saturating_sub(2_000_000)), Hz(centre + 2_000_000))),
+    };
+    FileSource::open(SourceId(id.into()), meta, opts)
+        .map(Arc::new)
+        .map_err(|e| e.to_string())
+}
+
+fn parse_ms(s: &str) -> Result<Duration, String> {
+    s.trim()
+        .parse()
+        .map(Duration::from_millis)
+        .map_err(|_| format!("{s:?}: not a number of milliseconds"))
+}
+
+/// Abort the process `after` from now, unless `ZETA_FAKE_CRASH_ONCE=1` and the
+/// marker beside the record file says an earlier spawn has crashed already.
+fn crash_after(after: Duration, record: Option<&Path>) {
+    let marker = record.map(|p| {
+        let mut m = p.as_os_str().to_owned();
+        m.push(".crashed");
+        PathBuf::from(m)
+    });
+    let once = std::env::var("ZETA_FAKE_CRASH_ONCE").is_ok_and(|v| v == "1");
+    if once && marker.as_ref().is_some_and(|m| m.exists()) {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(after);
+        if let Some(m) = marker {
+            let _ = File::create(m);
+        }
+        std::process::abort();
+    });
+}
+
+fn main() -> ExitCode {
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("zeta-fake-worker: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let record = match Record::open(args.record.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zeta-fake-worker: --record {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    record.line(&format!("start {now_ms}"));
+    for (name, _) in std::env::vars_os() {
+        record.line(&format!("env {}", name.to_string_lossy()));
+    }
+
+    let (name, arg) = args
+        .script
+        .split_once(' ')
+        .unwrap_or((args.script.as_str(), ""));
+    match name {
+        "not-found" => {
+            eprintln!("device not found: fake");
+            return ExitCode::from(EXIT_NOT_FOUND);
+        }
+        "open-fails" => {
+            eprintln!("fake open: no such device");
+            return ExitCode::from(EXIT_OPEN_FAILED);
+        }
+        "hang-hello" => loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        },
+        _ => {}
+    }
+
+    let frames = match redirect_stdout_to_stderr() {
+        // SAFETY: the descriptor was just duplicated for us and nothing else
+        // owns it.
+        Ok(fd) => unsafe { File::from_raw_fd(fd) },
+        Err(e) => {
+            eprintln!("zeta-fake-worker: redirect stdout: {e}");
+            return ExitCode::from(EXIT_OPEN_FAILED);
+        }
+    };
+    if std::env::var("ZETA_FAKE_PRINT").is_ok_and(|v| v == "1") {
+        println!("noise");
+    }
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("zeta-fake-worker: runtime: {e}");
+            return ExitCode::from(EXIT_OPEN_FAILED);
+        }
+    };
+    let code = rt.block_on(async {
+        // A receiver held for the life of the worker, see the `file` script.
+        let mut keep: Option<IqReceiver> = None;
+        let port: Result<Arc<dyn Port>, String> = match (name, arg) {
+            ("stream", _) => mock_source(&args.id, None).map(|s| s as Arc<dyn Port>),
+            ("gone-after-ms", ms) => parse_ms(ms)
+                .and_then(|g| mock_source(&args.id, Some(g)))
+                .map(|s| s as Arc<dyn Port>),
+            ("crash-after-ms", ms) => parse_ms(ms).and_then(|after| {
+                crash_after(after, args.record.as_deref());
+                mock_source(&args.id, None).map(|s| s as Arc<dyn Port>)
+            }),
+            ("file", spec) => {
+                let (path, crash) = match spec.split_once(',') {
+                    Some((p, c)) => (p, Some(c)),
+                    None => (spec, None),
+                };
+                let crash = match crash.map(|c| c.trim().strip_prefix("crash-after-ms ")) {
+                    None => Ok(None),
+                    Some(Some(ms)) => parse_ms(ms).map(Some),
+                    Some(None) => Err(format!("file {spec}: expected ,crash-after-ms N")),
+                };
+                crash.and_then(|crash| {
+                    let src = file_source(&args.id, Path::new(path))?;
+                    if let Some(after) = crash {
+                        crash_after(after, args.record.as_deref());
+                    }
+                    // Started once something holds a receiver: a FileSource
+                    // stops when its last subscriber goes, and `serve`
+                    // subscribes only when it runs.
+                    keep = Some(src.subscribe());
+                    src.start();
+                    Ok(src as Arc<dyn Port>)
+                })
+            }
+            _ => Err(format!("unknown script {:?}", args.script)),
+        };
+        let port = match port {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(EXIT_OPEN_FAILED);
+            }
+        };
+        let port: Arc<dyn Port> = Arc::new(Recorded {
+            inner: port,
+            record,
+        });
+        let code = serve(port, "fake", tokio::io::stdin(), frames).await;
+        drop(keep);
+        code
+    });
+    // Tokio's stdin read blocks a pool thread until a line arrives; after a
+    // `shutdown` there may be none, so the runtime is not waited for.
+    rt.shutdown_timeout(Duration::from_millis(100));
+    code
+}

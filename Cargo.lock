@@ -3958,12 +3958,18 @@ dependencies = [
 name = "zeta-source-worker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "libc",
  "num-complex",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "zeta-core",
+ "zeta-source-file",
+ "zeta-source-soapy",
+ "zeta-source-worker",
 ]
 
 [[package]]
