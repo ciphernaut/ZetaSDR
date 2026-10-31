@@ -32,8 +32,9 @@
 //       (FIT_MIN_HZ_DEFAULT for a kind without one), at most box.bandwidthHz. Integers.
 //   dcClause(rec, lo, hi, what) -> string
 //       ` (the capture centre <mhz> MHz is in the <what>: the 50 kHz around it are not
-//       measured)` when lo..hi Hz holds `rec`'s capture centre off its own centre and `rec` (a
-//       `source_list` record) is local hardware (capabilities remote and push false), else "".
+//       measured)` when lo..hi Hz is wider than 2 * MEASURE_DC_MASK_HZ, holds `rec`'s capture
+//       centre off its own centre and `rec` (a `source_list` record) is local hardware
+//       (capabilities remote and push false), else "".
 //   Menu:
 //     menu.open(sel, x, y)  shows the menu for a waterfall selection at client (x, y)
 //     menu.close()          hides it and erases the selection rectangle
@@ -374,6 +375,8 @@ export function dcClause(rec, lo, hi, what) {
   const dc = rec.current.center_hz;
   // A band centred on the DC (the band the radio was tuned for) is measured whole.
   if (dc < lo || dc > hi || Math.round(dc) === Math.round((lo + hi) / 2)) return "";
+  // A band no wider than the mask is measured unmasked (the mask would cover every bin).
+  if (hi - lo <= 2 * MEASURE_DC_MASK_HZ) return "";
   const khz = (2 * MEASURE_DC_MASK_HZ) / 1000;
   return ` (the capture centre ${mhzText(dc)} MHz is in the ${what}: the ${khz} kHz around it are not measured)`;
 }

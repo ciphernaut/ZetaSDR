@@ -2020,7 +2020,8 @@ def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
         menu = page.locator("#ctx-outline")
         expect(menu).to_be_visible()
         got = menu.locator(".ctx-item").evaluate_all(
-            "els => els.map(e => [e.dataset.action, e.textContent])")
+            "els => els.filter(e => e.offsetParent !== null)"
+            ".map(e => [e.dataset.action, e.textContent])")
         assert got == [["fit", "Fit to signal"], ["w2500", "2.5 kHz"], ["w5000", "5 kHz"],
                        ["w6250", "6.25 kHz"], ["w12500", "12.5 kHz"], ["w25000", "25 kHz"],
                        ["stop", "Stop"]], f"entries {got}"
