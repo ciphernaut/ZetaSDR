@@ -135,3 +135,25 @@ async fn source_list_shows_worker_for_a_worker_port_and_null_otherwise() {
     let json = serde_json::to_value(sources(&node).await).unwrap();
     assert!(json[0]["worker"].is_null(), "{json}");
 }
+
+#[test]
+fn a_format_1_record_from_before_capabilities_loads_with_none_and_its_pin() {
+    // As a node of plan 19 wrote it: format, pin and gain, no `capabilities`.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("b210.json"),
+        r#"{"format":1,"pin":{"center_hz":403025000,"bandwidth_hz":5950000},"gain":{"db":40.0}}"#,
+    )
+    .unwrap();
+    let rec = load_source(dir.path(), &SourceId("b210".into())).expect("the record loads");
+    assert_eq!(rec.format, 1);
+    assert_eq!(rec.capabilities, None);
+    assert_eq!(
+        rec.pin,
+        Some(Tuning {
+            center_hz: zeta_core::types::Hz(403_025_000),
+            bandwidth_hz: zeta_core::types::Hz(5_950_000),
+        })
+    );
+    assert_eq!(rec.gain.and_then(|g| g.db), Some(40.0));
+}

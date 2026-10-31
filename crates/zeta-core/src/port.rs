@@ -177,8 +177,8 @@ impl From<PortErrorWire> for PortError {
                 suggested,
             } => PortError::OutOfRange {
                 // The names ports use map back to their literals; any other
-                // is leaked (rare, and a few bytes once per distinct error
-                // received from a peer).
+                // is leaked, a few bytes each time such an error is received
+                // from a peer (rare: every port today uses those two names).
                 field: match field.as_str() {
                     "center_hz" => "center_hz",
                     "bandwidth_hz" => "bandwidth_hz",

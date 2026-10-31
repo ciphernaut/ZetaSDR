@@ -258,3 +258,23 @@ Found in plan 20's reviews. With `decode_on: free` the watch puts a decoder on a
 ## Bug: `source_ensure` and `source_pin` refusals from a faulted source lack the `source <id>: ` prefix
 
 Found in plan 20's reviews. `job_start` and a job's failure read `source <id>: <fault>`, but `source_ensure` and `source_pin` still answer bare `io: <fault>`. Route them through the same helper `job_start` uses.
+
+## Worker: a parent-side status-silence watchdog
+
+Found in plan 20's final review. The worker writes its status every second; the node never notices when it stops. A driver deadlocked under the worker's status task (or a worker wedged with its stdout open) stalls silently, as it did in-process. Wanted: the supervisor faults the source with `soapy worker for <id>: no status for 10 s` and kills the worker, which the respawn path then handles like any other end.
+
+## Sources: one helper for the source record update
+
+Found in plan 20's final review. `note_capabilities` duplicates `Node::set_source_record`'s body (load, change one field, write atomically, keep the in-memory copy). Fold both into one `Inner` helper that takes the change as a closure.
+
+## Tests: a shared fixture module for the node tests
+
+Found in plan 20's final review. `tests/recover.rs` copies about 150 lines of fixtures (ports, configs, registries, wait helpers) from `watch.rs` and `attach.rs`. Move them into a `tests/common` module the three share.
+
+## Node: `watch_healed` starts before `open` has resumed the jobs
+
+Found in plan 20's final review. `watch_healed` is spawned in `add_port`, before `open` runs its own resume, so a heal during `open` runs its recovery concurrently with that resume. The source's gate serialises the two, so it is harmless today; start the watcher after the resume (or have recovery skip what the resume relaunched) so the order does not depend on the gate.
+
+## Worker: control frames queue behind IQ blocks
+
+Found in plan 20's final review. The worker's writer thread takes frames in order, so a reply or a status can wait behind up to 64 queued IQ blocks (at 20 Msps, tens of milliseconds and megabytes). Give control frames priority (a second queue the writer drains first) or cap the block queue in bytes rather than blocks.

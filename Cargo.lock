@@ -3967,7 +3967,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
  "zeta-core",
  "zeta-dsp",
