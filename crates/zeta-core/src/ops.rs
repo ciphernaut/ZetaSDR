@@ -328,7 +328,7 @@ const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 /// capture band. `measure` channelises the job band the same way and
 /// measures only that band, reporting its absolute `center_hz`. `scan`
 /// time-shares the radio across a band wider than one capture: it expands to
-/// no graph; the node steps the source across the band (see [`scan_steps`]),
+/// one `fft` node whose mask params the node fills in; the node steps the source across the band (see [`scan_steps`]),
 /// dwelling [`SCAN_DWELL_MS`] on each step, and emits spectrum rows tagged
 /// with each step's `center_hz` while holding the whole band, so every other
 /// request on the source is a conflict until the scan is stopped.
@@ -700,7 +700,20 @@ impl JobKind {
             | JobKind::AcarsDecode
             | JobKind::AdsbDecode
             | JobKind::Mode(_) => unreachable!("expanded above from the row"),
-            JobKind::Scan | JobKind::Identify => Graph {
+            JobKind::Scan => Graph {
+                id: GraphId::new(),
+                nodes: vec![GraphNode {
+                    id: NodeId::new(),
+                    kind: "fft".into(),
+                    params: serde_json::json!({
+                        "size": spectrum_size(tuning.bandwidth_hz.0.min(SCAN_STEP_MAX_HZ)),
+                        "window": "hann",
+                        "rows_per_s": SPECTRUM_ROWS_PER_S,
+                    }),
+                }],
+                edges: vec![],
+            },
+            JobKind::Identify => Graph {
                 id: GraphId::new(),
                 nodes: vec![],
                 edges: vec![],
@@ -970,15 +983,80 @@ pub const SCAN_DWELL_MS: u64 = 250;
 /// the mode rows.
 pub const IDENTIFY_MEASURE_MS: u64 = 1_000;
 
-/// The steps a scan of `span` takes on a source with `caps`: captures of
-/// `w = min(max_bandwidth_hz, SCAN_STEP_MAX_HZ, span width)` centred at
-/// `start + w/2 + i·w` for `i < ceil(bandwidth_hz / w)`, where `start` is the
-/// span's lower edge, so a span narrower than one capture is one step exactly
-/// as wide as the span. The last step may overrun the span; every centre is
-/// clamped to `[tune_min + w/2, tune_max - w/2]`, so no capture reaches
-/// outside the source's tune range (when that range is narrower than `w`,
-/// to `tune_min + w/2`).
-pub fn scan_steps(span: Tuning, caps: &Capabilities) -> Vec<Tuning> {
+/// Half-width of the DC notch a scan masks on local hardware, in Hz: bins within
+/// this of each capture's centre are masked.
+pub const SCAN_NOTCH_HZ: u64 = 300_000;
+/// Fraction of each capture's bins masked at each edge on local hardware.
+pub const SCAN_EDGE_MASK: f64 = 0.10;
+/// Half-width of the DC mask a `measure` job applies, in Hz.
+pub const MEASURE_DC_MASK_HZ: u64 = 25_000;
+
+/// Whether the source is a local radio (a SoapySDR device): neither remote nor
+/// push. A recording has `push: true`; a Kiwi, a `--source-node` and a VRT
+/// sender are `remote`.
+pub fn local_hardware(caps: &Capabilities) -> bool {
+    !caps.remote && !caps.push
+}
+
+/// The scan mask `(notch_hz, edge_mask)` a source gets by default:
+/// [`SCAN_NOTCH_HZ`] and [`SCAN_EDGE_MASK`] on local hardware, `(0, 0.0)` else.
+pub fn scan_mask_default(caps: &Capabilities) -> (u64, f64) {
+    if local_hardware(caps) {
+        (SCAN_NOTCH_HZ, SCAN_EDGE_MASK)
+    } else {
+        (0, 0.0)
+    }
+}
+
+/// The notch actually applied for a scan step of `step_hz`: `0` when the step
+/// is under four notch half-widths (the notch would eat the capture), else
+/// `notch_hz`.
+pub fn scan_notch_in_force(step_hz: u64, notch_hz: u64) -> u64 {
+    if step_hz < 4 * notch_hz { 0 } else { notch_hz }
+}
+
+/// The two step lists a scan alternates between (see [`scan_grid`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanGrid {
+    /// Sweeps 0, 2, 4, ...
+    pub even: Vec<Tuning>,
+    /// Sweeps 1, 3, 5, ...: the even grid shifted down by half a step.
+    pub odd: Vec<Tuning>,
+}
+
+impl ScanGrid {
+    /// Whether the odd grid differs from the even one.
+    pub fn alternates(&self) -> bool {
+        self.odd != self.even
+    }
+
+    /// The steps of sweep number `sweep`.
+    pub fn steps(&self, sweep: u64) -> &[Tuning] {
+        if sweep.is_multiple_of(2) {
+            &self.even
+        } else {
+            &self.odd
+        }
+    }
+
+    /// How far the odd grid sits below the even one: half a step.
+    pub fn shift_hz(&self) -> u64 {
+        self.even[0].bandwidth_hz.0 / 2
+    }
+}
+
+/// The grids a scan of `span` takes on a source with `caps`: captures of
+/// `w = min(max_bandwidth_hz, SCAN_STEP_MAX_HZ, span width)`. The even grid is
+/// centred at `start + w/2 + i·w` for `i < n = ceil(bandwidth_hz / w)`, where
+/// `start` is the span's lower edge, so a span narrower than one capture is one
+/// step exactly as wide as the span. The odd grid is centred at `start + i·w`
+/// for `i <= n` (one more step, half a step lower) so a DC notch falls in a
+/// different place each sweep; a one-step span does not alternate and its odd
+/// grid is a copy of the even one. Every centre is clamped to
+/// `[tune_min + w/2, tune_max - w/2]`, so no capture reaches outside the
+/// source's tune range (when that range is narrower than `w`, to
+/// `tune_min + w/2`), and a centre equal to the one before it is dropped.
+pub fn scan_grid(span: Tuning, caps: &Capabilities) -> ScanGrid {
     let w = caps
         .max_bandwidth_hz
         .value()
@@ -990,12 +1068,31 @@ pub fn scan_steps(span: Tuning, caps: &Capabilities) -> Vec<Tuning> {
     let start = span.center_hz.0.saturating_sub(span.bandwidth_hz.0 / 2);
     let lo = caps.tune_min_hz.value().0.saturating_add(w / 2);
     let hi = caps.tune_max_hz.value().0.saturating_sub(w / 2).max(lo);
-    (0..n)
-        .map(|i| Tuning {
-            center_hz: Hz((start + w / 2 + i * w).clamp(lo, hi)),
-            bandwidth_hz: Hz(w),
-        })
-        .collect()
+    let build = |centres: &mut dyn Iterator<Item = u64>| -> Vec<Tuning> {
+        let mut steps: Vec<Tuning> = Vec::new();
+        for c in centres {
+            let step = Tuning {
+                center_hz: Hz(c.clamp(lo, hi)),
+                bandwidth_hz: Hz(w),
+            };
+            if steps.last() != Some(&step) {
+                steps.push(step);
+            }
+        }
+        steps
+    };
+    let even = build(&mut (0..n).map(|i| start + w / 2 + i * w));
+    let odd = if n > 1 {
+        build(&mut (0..=n).map(|i| start + i * w))
+    } else {
+        even.clone()
+    };
+    ScanGrid { even, odd }
+}
+
+/// The steps of a scan's even sweeps: [`scan_grid`]`.even`.
+pub fn scan_steps(span: Tuning, caps: &Capabilities) -> Vec<Tuning> {
+    scan_grid(span, caps).even
 }
 
 /// The lowest channel output rate a job is channelised at.
@@ -2553,6 +2650,127 @@ mod tests {
             scan_steps(t(2_000_000, 4_000_000), &caps_16m()),
             [t(3_000_000, 4_000_000)]
         );
+    }
+
+    fn caps_min(tune_min_hz: u64) -> Capabilities {
+        let mut c = caps_16m();
+        c.tune_min_hz = crate::types::Claim::Asserted(Hz(tune_min_hz));
+        c
+    }
+
+    fn caps_flags(remote: bool, push: bool) -> Capabilities {
+        let mut c = caps_16m();
+        c.remote = remote;
+        c.push = push;
+        c
+    }
+
+    #[test]
+    fn scan_grid_odd_sweep_shifts_by_half_a_step_with_one_more_step() {
+        let g = scan_grid(t(20_000_000, 40_000_000), &caps_16m());
+        assert_eq!(g.even, scan_steps(t(20_000_000, 40_000_000), &caps_16m()));
+        assert_eq!(
+            g.even,
+            [
+                t(9_000_000, 16_000_000),
+                t(24_000_000, 16_000_000),
+                t(40_000_000, 16_000_000)
+            ]
+        );
+        // 0, 16, 32, 48 MHz; the first clamped up to the 1 MHz floor + w/2.
+        assert_eq!(
+            g.odd,
+            [
+                t(9_000_000, 16_000_000),
+                t(16_000_000, 16_000_000),
+                t(32_000_000, 16_000_000),
+                t(48_000_000, 16_000_000)
+            ]
+        );
+        assert_eq!(g.shift_hz(), 8_000_000);
+        assert!(g.alternates());
+        assert_eq!(g.steps(0), &g.even[..]);
+        assert_eq!(g.steps(1), &g.odd[..]);
+        assert_eq!(g.steps(2), &g.even[..]);
+    }
+
+    #[test]
+    fn scan_grid_drops_a_clamped_duplicate_at_the_tune_floor() {
+        // Tune floor 20 MHz: lo = 28 MHz. Odd 0, 16, 32, 48 -> 28, 28, 32, 48; even 8, 24, 40 -> 28, 28, 40.
+        let g = scan_grid(t(20_000_000, 40_000_000), &caps_min(20_000_000));
+        assert_eq!(
+            g.odd,
+            [
+                t(28_000_000, 16_000_000),
+                t(32_000_000, 16_000_000),
+                t(48_000_000, 16_000_000)
+            ]
+        );
+        assert_eq!(
+            g.even,
+            [t(28_000_000, 16_000_000), t(40_000_000, 16_000_000)]
+        );
+    }
+
+    #[test]
+    fn scan_grid_of_one_step_does_not_alternate() {
+        let g = scan_grid(t(100_000_000, 1_000_000), &caps_16m());
+        assert_eq!(g.even, [t(100_000_000, 1_000_000)]);
+        assert_eq!(g.odd, g.even);
+        assert!(!g.alternates());
+    }
+
+    #[test]
+    fn scan_mask_default_follows_the_capabilities() {
+        assert!(local_hardware(&caps_flags(false, false)));
+        assert!(!local_hardware(&caps_flags(true, false)));
+        assert!(!local_hardware(&caps_flags(false, true)));
+        assert_eq!(
+            scan_mask_default(&caps_flags(false, false)),
+            (300_000, 0.10)
+        );
+        assert_eq!(scan_mask_default(&caps_flags(true, false)), (0, 0.0));
+        assert_eq!(scan_mask_default(&caps_flags(false, true)), (0, 0.0));
+        assert_eq!(scan_notch_in_force(16_000_000, 300_000), 300_000);
+        assert_eq!(scan_notch_in_force(1_200_000, 300_000), 300_000);
+        assert_eq!(scan_notch_in_force(1_000_000, 300_000), 0);
+        assert_eq!(scan_notch_in_force(48_000, 12_000), 12_000);
+    }
+
+    #[test]
+    fn scan_expands_to_one_fft_node_without_mask_params() {
+        // The embedded rows with no stages: Scan and Identify need no row.
+        let modes = ModeRegistry::load(&crate::stage::StageRegistry::new(), None);
+        let g = JobKind::Scan
+            .expand(
+                &SourceId("s".into()),
+                t(20_000_000, 40_000_000),
+                Hz(0),
+                None,
+                None,
+                None,
+                &modes,
+            )
+            .unwrap();
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].kind, "fft");
+        assert_eq!(
+            g.nodes[0].params,
+            serde_json::json!({"size": 4096, "window": "hann", "rows_per_s": 20})
+        );
+        assert!(g.edges.is_empty());
+        let id = JobKind::Identify
+            .expand(
+                &SourceId("s".into()),
+                t(100_000_000, 12_500),
+                Hz(0),
+                None,
+                None,
+                None,
+                &modes,
+            )
+            .unwrap();
+        assert!(id.nodes.is_empty());
     }
 
     #[test]
