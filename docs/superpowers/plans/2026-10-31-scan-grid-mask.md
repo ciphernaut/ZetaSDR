@@ -13,14 +13,14 @@
 ## Global Constraints
 
 - Branch `plan-15` from `main` 8053f43, in the main checkout (NOT a worktree: the worktree Bash hook refuses the word "source"). One commit per task.
-- This desktop has 14 GB RAM and runs another plan's build concurrently: every cargo command is run as `flock /Projects/ZetaSDR/target/.cargo.lock env CARGO_BUILD_JOBS=2 cargo <...>` and tests add `-- --test-threads=2`. Never `cargo clean`. If a build looks stale (shared `CARGO_TARGET_DIR`), `touch crates/*/src/lib.rs`.
+- Builds and gates run on the field host under the `claude` account in `/Projects/ZetaSDR` (125 GB RAM, 12 cores, rustc 1.97.1 per `rust-toolchain.toml`, `libsoapysdr-dev` 0.8.1 installed): plain `cargo` with its default job count; plan 18 builds there concurrently, so expect contention, not failure. If a build looks stale (shared `CARGO_TARGET_DIR` across worktrees), `touch crates/*/src/lib.rs`. The live acceptance (spec §9, "After the plan") runs on the desktop HackRF from a release build made there, after merge.
 - The spec's constants: `SCAN_NOTCH_HZ = 300_000`, `SCAN_EDGE_MASK = 0.10`, `MEASURE_DC_MASK_HZ = 25_000`; the `fft` params `notch_hz` (integer, default 0) and `edge_mask` (number, default 0.0, range 0..0.5, a value outside refused naming the field); the row field `masked: [[lo, hi], ...]` (lo inclusive, hi exclusive, sorted, non-overlapping, absent when empty); the mask default gate `remote == false && push == false`; a step narrower than `4 * notch_hz` gets no notch; `job_context.scan.alternate: {shift_hz, steps_shifted}` (null for a one-step span) and `scan.mask: {notch_hz, edge_mask}`; `job_context.measure.dc_mask_hz`.
 - Temp files under `$CLAUDE_JOB_DIR/tmp`, never /tmp. Python via `python3 -I`.
 - The UI e2e suite runs near its 300 s deadline: this plan adds exactly one scenario.
 - All three constants live in `crates/zeta-core/src/ops.rs` beside `SCAN_STEP_MAX_HZ`; `zeta-dsp` imports `MEASURE_DC_MASK_HZ` from there. No new third-party dependency.
 - A row without a masked bin is byte-for-byte today's row (spec §2 anti-goals): `masked` is present only when non-empty, and `q` is computed for every bin, masked ones included. Every existing `fft` node (`spectrum`, `watch`) keeps today's output: both params default to no mask.
-- Every task that changes an op result, a stage's params or field craft regenerates `AGENTS.md` (`flock ... cargo run -p zeta -- agents-md > AGENTS.md`) and `skills/zetasdr/SKILL.md` (`flock ... cargo run -p zeta -- agents-md --skill > skills/zetasdr/SKILL.md`) and runs `cargo test -p zeta --test agents_md --test transports`.
-- Gates per task: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, the touched crates' tests. Final gate: `cargo test --workspace --all-features --no-fail-fast -- --test-threads=2` (no `FAILED`, no `ui e2e skipped`), `agents-md --check`, `agents-md --skill --check`.
+- Every task that changes an op result, a stage's params or field craft regenerates `AGENTS.md` (`cargo run -p zeta -- agents-md > AGENTS.md`) and `skills/zetasdr/SKILL.md` (`cargo run -p zeta -- agents-md --skill > skills/zetasdr/SKILL.md`) and runs `cargo test -p zeta --test agents_md --test transports`.
+- Gates per task: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, the touched crates' tests. Final gate: `cargo test --workspace --all-features --no-fail-fast` (no `FAILED`, no `ui e2e skipped`), `agents-md --check`, `agents-md --skill --check`.
 - Commit messages in the repo's style (`Scan: ...`, `Fft: ...`, `Detect: ...`, `Measure: ...`, `UI: ...`, `Docs: ...`).
 
 ## Review Focus
@@ -118,7 +118,7 @@ fn scan_expands_to_one_fft_node_without_mask_params() {
 ```
   The two existing tests `a_sub_band_scan_is_one_step_as_wide_as_the_span` and `scan_steps_stay_inside_the_tune_range` stay as they are and must pass.
 
-- [ ] **Step 2: Run to verify they fail**: `flock /Projects/ZetaSDR/target/.cargo.lock env CARGO_BUILD_JOBS=2 cargo test -p zeta-core --lib scan_ -- --test-threads=2` → compile errors (`scan_grid`, `ScanGrid`, `local_hardware` undefined).
+- [ ] **Step 2: Run to verify they fail**: `cargo test -p zeta-core --lib scan_` → compile errors (`scan_grid`, `ScanGrid`, `local_hardware` undefined).
 - [ ] **Step 3: Implement** the constants, the four functions, `ScanGrid`, `scan_grid`, `scan_steps` as a delegate, and the `Scan` arm of `JobKind::expand` (split the `Scan | Identify` arm).
 - [ ] **Step 4: Run**: `cargo test -p zeta-core --lib` (all unit tests), `cargo test -p zeta-core --test scan --test resume` (the scan harness still runs today's even grid: `scan_loop` is untouched until Task 3; `launch_scan` ignores the graph today, so the one-node expansion changes nothing yet), clippy, fmt → green.
 - [ ] **Step 5: Commit**: `git commit -m "Scan: scan_grid gives the even grid and the half-step odd grid (one more step, clamped duplicates dropped, none for a one-step span); the mask constants and the local-hardware gate; a scan expands to one fft node"`.
@@ -215,7 +215,7 @@ async fn fft_stage_rows_carry_masked_only_when_a_bin_is_masked() {
 ```
   Pull the block-and-bus setup of `fft_stage_emits_v2_rows` into a helper `async fn one_row(params: serde_json::Value) -> serde_json::Value` both tests use.
 
-- [ ] **Step 2: Run to verify they fail**: `flock ... cargo test -p zeta-dsp --lib fft:: -- --test-threads=2` → compile errors.
+- [ ] **Step 2: Run to verify they fail**: `cargo test -p zeta-dsp --lib fft::` → compile errors.
 - [ ] **Step 3: Implement** the two params, `check`, `check_params`, `masked_ranges`, `quantise_row_masked`, the payload field. In `run`, keep `masked` beside the cutter: recompute when `row.rate_hz` differs from the last row's (the cutter restarts on a rate or centre change anyway).
 - [ ] **Step 4: Run**: `cargo test -p zeta-dsp` (unit and `tests/fft_rows.rs`, `tests/detect.rs`, `tests/gpu_fft_software.rs` unchanged), `cargo test -p zeta-core --test ops` (`nested_schemas_are_strict` sees the core registry only; still run it), clippy, fmt → green. Regenerate `AGENTS.md` and the skill (the `fft` stage kind now lists `params.notch_hz: integer (optional, default 0)` and `params.edge_mask: number (optional, default 0.0)`); `cargo test -p zeta --test agents_md --test transports` → green.
 - [ ] **Step 5: Commit**: `git commit -m "Fft: notch_hz and edge_mask params (default none, refused naming the field), rows carry masked: [[lo, hi], ...] when a bin is masked and the floor excludes masked bins"`.
@@ -353,7 +353,7 @@ async fn a_scan_record_with_an_empty_graph_resumes_with_the_default_mask() {
 ```
   Also update `scan_steps_the_port_across_the_span_and_emits_rows`: drop its `tunes[k].center_hz == centres[k % 3]` loop (the alternation test owns the tune order) and let a row's `center_hz` be any of `[9, 16, 24, 32, 40, 48]` MHz, keeping its other assertions (`size == 4096`, `samples >= 4096`, the tone within 1 kHz of `tone_hz(c)`, at least 2 rows per even centre, a dwell read of at least two blocks, `tunes.len() >= 6`, every bandwidth 16 MHz). `stream_list_stays_flat_across_sweeps` and `no_bank_is_made_per_step_while_a_scan_holds_the_source` count to 7 tunes = one even plus one odd sweep: unchanged. `scan_context_carries_its_step_count` unchanged.
 
-- [ ] **Step 2: Run to verify they fail**: `flock ... cargo test -p zeta-core --test scan --test resume -- --test-threads=2` → the new tests fail (`alternate`/`mask` missing, tunes in today's order, `GraphGet` shows the node without `notch_hz`), `FakeFft` compile error until it echoes.
+- [ ] **Step 2: Run to verify they fail**: `cargo test -p zeta-core --test scan --test resume` → the new tests fail (`alternate`/`mask` missing, tunes in today's order, `GraphGet` shows the node without `notch_hz`), `FakeFft` compile error until it echoes.
 - [ ] **Step 3: Implement** `Scan`, `launch_scan`, `scan_loop`, `fft_step` as the Interfaces say, and the harness changes in `tests/scan.rs`.
 - [ ] **Step 4: Run**: `cargo test -p zeta-core --test scan --test resume --test ops --test jobs`, then `cargo test -p zeta-core`, `cargo test -p zeta --test resume --test bank_resume --test cli` (the CLI's scan paths), clippy, fmt → green. Regenerate `AGENTS.md`/skill (no op schema change expected; confirm `agents-md --check` still passes).
 - [ ] **Step 5: Commit**: `git commit -m "Scan: sweeps alternate between the even and the half-step odd grid; the scan's fft node carries notch_hz and edge_mask, written from the capabilities on the first launch and honoured on every launch (graph put changes the mask); job_context.scan gains alternate and mask"`.
@@ -405,7 +405,7 @@ fn a_malformed_masked_field_is_ignored() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**: `flock ... cargo test -p zeta-dsp --lib detect:: -- --test-threads=2` → compile errors (`masked` field, `view_masked`, `row_masked`).
+- [ ] **Step 2: Run to verify they fail**: `cargo test -p zeta-dsp --lib detect::` → compile errors (`masked` field, `view_masked`, `row_masked`).
 - [ ] **Step 3: Implement** the field, `row_masked`, the `runs` closure, the stage's view.
 - [ ] **Step 4: Run**: `cargo test -p zeta-dsp` (unit, `tests/detect.rs`), `cargo test -p zeta-core --test watch` (the watch harness feeds rows without `masked`), clippy, fmt → green.
 - [ ] **Step 5: Commit**: `git commit -m "Detect: bins inside a row's masked ranges take no part in a run (a malformed masked field is ignored); SpectrumRowView carries the ranges"`.
@@ -477,7 +477,7 @@ async fn a_measure_on_a_recording_measures_the_spike() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**: `flock ... cargo test -p zeta-dsp --lib measure:: -- --test-threads=2` and `cargo test -p zeta --test measure_dc` → compile errors (`measure_band_masked`, `dc_hz`).
+- [ ] **Step 2: Run to verify they fail**: `cargo test -p zeta-dsp --lib measure::` and `cargo test -p zeta --test measure_dc` → compile errors (`measure_band_masked`, `dc_hz`).
 - [ ] **Step 3: Implement** `StageContext.dc_hz`/`with_dc_hz` (fix `tests/bank.rs:114`), the `launch_inner` gate, `measure_band_masked`, the stage's `dc` and notes.
 - [ ] **Step 4: Run**: `cargo test -p zeta-core` (the `StageContext` change), `cargo test -p zeta-dsp`, `cargo test -p zeta --test measure_dc --test measure_bank`, `cargo test -p zeta-plugin` (its tests build a `StageContext` through `new`), clippy, fmt → green. Regenerate `AGENTS.md`/skill: the `measure` paragraph of field craft is Task 7's; confirm `--check` passes (no schema change here).
 - [ ] **Step 5: Commit**: `git commit -m "Measure: on a local hardware receiver the bins within MEASURE_DC_MASK_HZ of the capture centre take no part in the floor, the peak or the occupied band; StageContext.dc_hz; job_context.measure.dc_mask_hz"`.
@@ -570,7 +570,7 @@ def scenario_coarse_layer_leaves_masked_bins_unpainted(page, url, secret):
 ```
   (`[[384, 641]]`: `spectrum_size(48000)` = 1024 bins of 46.875 Hz, `m = floor(6000 / 46.875) = 128`, so `[512 - 128, 512 + 128 + 1)`. A quiet bin 10 dB under the row's 15th percentile paints the background colour, so the test never asserts "no background outside the notch", only "all background inside it when painted alone" and "mostly filled after the redraw".)
 
-- [ ] **Step 2: Run to verify it fails**: `ZETA_UI_ONLY=coarse_layer_leaves_masked_bins_unpainted flock ... cargo test -p zeta --test ui -- --test-threads=2` → FAIL (`zetaTest.waterfall` is not a function; with Tasks 2-3 in place the node already emits `masked` rows).
+- [ ] **Step 2: Run to verify it fails**: `ZETA_UI_ONLY=coarse_layer_leaves_masked_bins_unpainted cargo test -p zeta --test ui` → FAIL (`zetaTest.waterfall` is not a function; with Tasks 2-3 in place the node already emits `masked` rows).
 - [ ] **Step 3: Implement** `decodeRow`, `fillColumn`, `stepsBack`, `replayCoarse`, `redraw`, `coarseMasked`, the header comment and the two `app.js` hooks.
 - [ ] **Step 4: Run**: the three scenarios with `ZETA_UI_ONLY`, then the whole `cargo test -p zeta --test ui` once (it must finish inside its 300 s deadline; note the wall time in the commit message), `cargo fmt`/clippy unaffected (JS) but run the workspace clippy anyway → green. Spec §5's last point, checked here: the other readers of `q` (`examples/python/cb_watch.py:91-106`, the harness's `scenario_waterfall_decodes_quantised_rows`) read fine `spectrum` rows, which carry no `masked` by default, so they need nothing; say so in the commit message.
 - [ ] **Step 5: Commit**: `git commit -m "UI: a masked bin paints nothing (the pixel keeps what the previous row left); redraws replay the last two sweeps counted by steps; coarseMasked and zetaTest.waterfall() for the e2e; one scenario"`.
@@ -589,8 +589,8 @@ def scenario_coarse_layer_leaves_masked_bins_unpainted(page, url, secret):
   - `README.md` scan paragraph: alternation, `masked`, `scan.alternate`/`scan.mask`, `graph put` on the scan's `fft` node.
   - Plan series row 15: "Spec `docs/superpowers/specs/2026-10-31-scan-grid-mask-design.md`, plan `docs/superpowers/plans/2026-10-31-scan-grid-mask.md`. **Merged** to `main` pending the session's fast-forward, 2026-10-31; live acceptance on the desktop HackRF is pending (see "Plan 15 status")." New "## Plan 15 status" (above "Plan 20 status"): what was built per task (one line each), the default constants and that they are to be corrected by the live run, then the acceptance checklist of spec §9 as unchecked items: (1) the 440-488 MHz survey at 45 dB with a 2 s dwell look shows no hump at any step centre and no 100 kHz grid of peaks moving with the parity; (2) with `notch_hz: 0` for one run, the hump's width at the floor at 2, 8 and 16 Msps read from the rows, `SCAN_NOTCH_HZ` set to the widest plus 20 %, the same for the edge roll-off and `SCAN_EDGE_MASK`, figures recorded here and in the TODO gist; (3) `zeta job context` on the scan shows `scan.alternate` and `scan.mask`, `zeta stream tail` shows rows with `masked`; (4) the `detect` change is covered by its unit test only (no watch inside a scan step is started).
   - `TODO.md`: replace the body of "## Scan: alternate the step grid and mask the centre and edge bins" (L3-33) with "Done in plan 15 (docs/superpowers/specs/2026-10-31-scan-grid-mask-design.md); live acceptance pending: the notch and edge widths it measures set `SCAN_NOTCH_HZ` and `SCAN_EDGE_MASK` (300 kHz and 0.10 to begin with)." Add, after it, "## Lease: keep a lone job's capture centre off its channel" with the spec's wording (§2, §6): "From plan 15's non-goals, 2026-10-31. A demodulator's or decoder's own capture centre sits on its channel, so the receiver's DC spike lands in the channel (the same problem the scan grid had; a one-off demod read it as a 59 dB carrier on 2026-10-23). Keeping the centre off the channel needs the lease manager to know the capture's minimum width before it tunes, which the capability record does not carry, and the offset depends on the notch width plan 15 measures (`SCAN_NOTCH_HZ`: its live acceptance's figure is this gist's input). Its own small plan after plan 15."
-- [ ] **Step 2: Regenerate** `AGENTS.md` and the skill; `flock ... cargo run -p zeta -- agents-md --check`, `--skill --check`, `cargo test -p zeta --test agents_md --test transports` → green.
-- [ ] **Step 3: Final gate**: `flock /Projects/ZetaSDR/target/.cargo.lock env CARGO_BUILD_JOBS=2 cargo test --workspace --all-features --no-fail-fast -- --test-threads=2` → no `FAILED`, no `ui e2e skipped`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo fmt --all -- --check`.
+- [ ] **Step 2: Regenerate** `AGENTS.md` and the skill; `cargo run -p zeta -- agents-md --check`, `--skill --check`, `cargo test -p zeta --test agents_md --test transports` → green.
+- [ ] **Step 3: Final gate**: `cargo test --workspace --all-features --no-fail-fast` → no `FAILED`, no `ui e2e skipped`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo fmt --all -- --check`.
 - [ ] **Step 4: Commit**: `git commit -m "Docs: plan 15 field craft (masked bins are no data, two sweeps make one look), README, plan series status with the live-acceptance checklist, TODO (scan gist closed, lease-offset gist added)"`.
 
 ---
