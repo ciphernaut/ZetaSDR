@@ -3955,6 +3955,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeta-source-worker"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zeta-core",
+]
+
+[[package]]
 name = "zeta-speech"
 version = "0.1.0"
 dependencies = [

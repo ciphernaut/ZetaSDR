@@ -71,7 +71,10 @@ pub struct IqBlock {
 
 pub type IqReceiver = tokio::sync::broadcast::Receiver<IqBlock>;
 
-#[derive(Debug, thiserror::Error)]
+/// A port's refusal. It serialises through [`PortErrorWire`] (`kind` names the
+/// variant) so a worker process can hand it to the node unchanged; `Display`
+/// is the same text after the trip.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PortError {
     /// A `suggested` above `max` means the source itself ships more than the
     /// configured cap allows (a remote node's fixed rate); the message says so.
@@ -87,6 +90,93 @@ pub enum PortError {
     Unsupported(String),
     #[error("io: {0}")]
     Io(String),
+}
+
+/// The JSON shape of a [`PortError`]: `{"kind": "out_of_range", "field", "value",
+/// "min", "max", "suggested"}`, `{"kind": "unsupported", "message"}` or
+/// `{"kind": "io", "message"}`. It exists because `OutOfRange::field` is a
+/// `&'static str`, which serde cannot fill from data without help.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PortErrorWire {
+    OutOfRange {
+        field: String,
+        value: u64,
+        min: u64,
+        max: u64,
+        suggested: Option<u64>,
+    },
+    Unsupported {
+        message: String,
+    },
+    Io {
+        message: String,
+    },
+}
+
+// Written by hand: a derive would see `&'static str` in `OutOfRange` and
+// demand input that lives for `'static`.
+impl Serialize for PortError {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        PortErrorWire::from(self.clone()).serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for PortError {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        PortErrorWire::deserialize(d).map(PortError::from)
+    }
+}
+
+impl From<PortError> for PortErrorWire {
+    fn from(e: PortError) -> Self {
+        match e {
+            PortError::OutOfRange {
+                field,
+                value,
+                min,
+                max,
+                suggested,
+            } => PortErrorWire::OutOfRange {
+                field: field.to_string(),
+                value,
+                min,
+                max,
+                suggested,
+            },
+            PortError::Unsupported(message) => PortErrorWire::Unsupported { message },
+            PortError::Io(message) => PortErrorWire::Io { message },
+        }
+    }
+}
+
+impl From<PortErrorWire> for PortError {
+    fn from(w: PortErrorWire) -> Self {
+        match w {
+            PortErrorWire::OutOfRange {
+                field,
+                value,
+                min,
+                max,
+                suggested,
+            } => PortError::OutOfRange {
+                // The names ports use map back to their literals; any other
+                // is leaked (rare, and a few bytes once per distinct error
+                // received from a peer).
+                field: match field.as_str() {
+                    "center_hz" => "center_hz",
+                    "bandwidth_hz" => "bandwidth_hz",
+                    _ => Box::leak(field.into_boxed_str()),
+                },
+                value,
+                min,
+                max,
+                suggested,
+            },
+            PortErrorWire::Unsupported { message } => PortError::Unsupported(message),
+            PortErrorWire::Io { message } => PortError::Io(message),
+        }
+    }
 }
 
 /// The hint for an `OutOfRange` whose suggestion exceeds its maximum: the
