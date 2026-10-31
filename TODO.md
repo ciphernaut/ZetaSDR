@@ -76,7 +76,7 @@ Wanted:
 - Box a frequency on the graph and create the demod (+ transcribe) from it.
 - "Centre this demod" on the graph view: snap the job's centre onto the signal's measured centre (e.g. from a `measure` event or the spectrum peak), not onto a raster.
 - "Shrink to 2.5 / 5 / 6.25 / 12.5 / 25 kHz" bandwidth presets on the demod.
-- Make it easy to see which job is on which frequency. With more than about 3 channels this is hard today. Ideas: a label on the graph at each job's frequency (job kind, short id, squelch state, last transcript snippet), and a job list that highlights its marker on hover or click, and vice versa.
+- Make it easy to see which job is on which frequency. With more than about 3 channels this is hard today. Ideas: a label on the graph at each job's frequency (job kind, short id, squelch state, last transcript snippet), and a job list that highlights its marker on hover or click, and vice versa. A keyed decoder's held ribbon (the ADS-B display gist below) is the same idea for subjects: one line per thing on the air, updated in place, not one per event.
 
 ## Feature: more digital decoding modes
 
@@ -179,6 +179,23 @@ Points to work out:
 
 Scope estimate: 100-200 lines in `overlays.js` plus CSS; one or two scenarios.
 
+Related: a state-stream decoder (ADS-B) does not want a staircase at all but one ribbon per subject, folded by key; see "UI: ADS-B (and any state-stream decoder) on the page" below. The two should share the lane budget: a staircase for packet-shaped rows, a held roster line for keyed rows.
+
+## UI: ADS-B (and any state-stream decoder) on the page
+
+From the operator, 2026-10-31, with a screenshot (`scratch/Screenshot From 2026-10-31 16-13-17.png`, local): an `adsb_decode` job on a HackRF at 1090 MHz fills the waterfall with dozens of boxes for one aircraft (`7C5309` / `QLK335D`): `7C5309 ×14`, `7C5309 21000 ×6`, `7C5309 QLK335D ×2`, `7C5309 21000 -27.39,152.43`, ... stacked down `MAX_LANES` and spilling over each other. Nothing on the page can be read.
+
+Cause (`crates/zeta-ui/web/overlays.js` `ribbon`): every decoder event is a ribbon at the job's tuning centre, folded into `×N` only when its text is identical and still at the right edge. The ADS-B row's summary is `{icao} {callsign?} {altitude_ft?} {lat?},{lon?}` and dump1090 delivers identity, altitude and position in separate messages, several a second per aircraft, with the position changing every time, so one aircraft yields four or five distinct texts that never fold. Ribbons were designed for packet-shaped rows (APRS, POCSAG: one readable thing per event); ADS-B is a state stream, and that is the mismatch. The map does not help: the `adsb_decode` row has no `position` block (the sonde rows do), and `map.js` keeps one marker and track per job, not per aircraft in a job.
+
+Wanted, in order of value:
+1. **Fold by key.** A mode row names the event field that identifies a subject (`icao`; `id` for the sondes, `src` for APRS, `reg` for ACARS, MMSI for AIS when it lands). The page keeps one ribbon per (job, key), merges each event's non-null fields into that subject's state, and re-renders the row's `summary` from the merged state: `7C5309 QLK335D 21000 -27.45,152.49 ×38`, updated in place, held at the right edge while the subject is heard and released to drift off after a silence (say 30 s). A row without a key keeps today's per-event ribbons. This alone fixes the screenshot and is generic. Suggested shape: `event.key: "<field>"` on the row (schema, `modes_show`, `AGENTS.md`); the node could do the merge too, so `job_context` carries a `subjects` map any client reads.
+2. **A subject table for the job.** A pane like dump1090's own view: ICAO, callsign, altitude, ground speed, track, position, distance and bearing from `view set home` (`map.js` `distanceBearing` already does the maths), last seen, message count; sorted by last seen or distance; one row per subject, from the same merged state as item 1. The waterfall then shows one line per aircraft, or none for a job that has a table. The same pane serves APRS stations, AIS vessels and a POCSAG address list.
+3. **Aircraft on the map.** Give the row a `position` block (`altitude_ft` needs a feet-to-metres factor the sonde rows never needed: a `scale` on the `alt_m` mapping, or an `alt_ft` alternative) and make `map.js` track per (job, key) rather than per job, so each aircraft gets a marker and a track and a job's popup names its subject. This is what the wave-2 "APRS positions on the map" item needs as well, since one APRS job hears many stations.
+
+Not wanted: a per-protocol special case in `overlays.js` (`protocolText` already carries one fallback for `adsb`; the row should drive it). Keep the UI e2e scenarios that find ribbons by text working for the unkeyed rows.
+
+Scope estimate: item 1 is a small change (a row field, 60-120 lines in `overlays.js`, a scenario); items 2 and 3 together are a plan of their own (a pane, the map rework, the row schema and the docs), roughly 400-700 lines.
+
 ## Build: an install script for the AMBE/IMBE vocoder libraries
 
 From the operator, 2026-10-27. Digital voice (DMR, P25, NXDN, D-STAR, Yaesu Fusion) needs AMBE/IMBE vocoders that cannot be shipped: `mbelib` is patent-encumbered and OpenWebRX+ builds it on the user's machine. Their `buildall.sh` (`/Projects/ham/openwebrxplus/openwebrx/buildall.sh`) clones and builds `jketterl/codecserver` (plus `codecserver-softmbe` and `mbelib`) into debs with an interactive prompt per component.
@@ -205,7 +222,7 @@ From plan 17, 2026-10-29. Plan 17 shipped the frameworks (audio-input program ro
 - **Whole-span POCSAG and APRS** as a `watch` with `decode_on: capture`: the detect stage finds the channels in a pin and the watch starts one decoder per signal, instead of one hand-started job per channel.
 - **Stereo** for `wfm_demod` (see the stereo gist above) now that audio rows exist to consume it.
 - **DFM and M20 frame synthesis.** `dfm_decode` and `m20_decode` have no `test` (they print `skipped: no test`, and `--strict` fails them); an `rs41`-style generator for each, proven against `dfm09mod`/`m20mod`, writes them in. The RS41 generator is the template (public protocol descriptions only, never `rs41mod.c`).
-- **APRS positions on the map.** The APRS row has no `position` map; add one (the decoder's `info` carries it only after parsing, so a position field wants the parser) so APRS stations appear beside the sondes.
+- **APRS positions on the map.** The APRS row has no `position` map; add one (the decoder's `info` carries it only after parsing, so a position field wants the parser) so APRS stations appear beside the sondes. One APRS job hears many stations, so this also needs the map's per-(job, key) tracks from the ADS-B display gist above; without them every station's fix lands on one marker.
 
 ## Bug: `--then-tail` on a program row with a squelched demod tails the squelch events first
 
