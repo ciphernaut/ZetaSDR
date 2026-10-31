@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::launch::{AfterGate, StageRunning, supervise};
 use super::persist::now;
-use super::{Inner, NodeError};
+use super::{Inner, NodeError, source_fault_reason};
 use crate::classify::{Band, Measurement, Outcome};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::modes::Proof;
@@ -196,7 +196,7 @@ impl Inner {
         let deadline = tokio::time::Instant::now() + MEASURE_WAIT;
         loop {
             if let Some(f) = r.port.fault() {
-                return Err(StageError::Failed(format!("source {}: {f}", r.port.id().0)));
+                return Err(StageError::Failed(source_fault_reason(r.port.id(), &f)));
             }
             let late = tokio::time::Instant::now() >= deadline;
             let ring = self.rings.lock().unwrap().get(&r.prov.source).cloned();
@@ -479,7 +479,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             tries.push((s.mode, s.score));
         }
     }
-    let faulted = |f: String| StageError::Failed(format!("source {}: {f}", r.port.id().0));
+    let faulted = |f: String| StageError::Failed(source_fault_reason(r.port.id(), &f));
     let mut current = ChildGuard {
         inner: inner.clone(),
         port: r.port.clone(),

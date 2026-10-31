@@ -3098,3 +3098,50 @@ async fn source_free_is_read_only() {
     assert_eq!(line["outcome"], "ok", "{line}");
     assert!(line.get("result").is_none(), "{line}");
 }
+
+/// A rigid `job_start` on an unheld source whose port cannot tune (a device that is not
+/// there) is refused under the source's name, as a job that failed on the faulted source
+/// reads; a range error on the same port keeps its corrective `field` and `suggested`.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = fixtures::write_tone(dir.path());
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: None,
+    };
+    let src = Arc::new(FileSource::open(SourceId("s".into()), &meta, opts).unwrap());
+    let port = zeta_core::test_fixtures::FaultablePort::new(src);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    port.set_fault(Some("device not found: x".into()));
+    let start = |center_hz: u64| Op::JobStart {
+        kind: JobKind::Passthrough,
+        source: SourceId("s".into()),
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(48_000),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![],
+    };
+    match node.apply(start(100_000_000)).await {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, "source s: io: device not found: x")
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    match node.apply(start(100_000)).await {
+        Err(OpError::OutOfRange {
+            field, suggested, ..
+        }) => {
+            assert_eq!(field, "center_hz");
+            assert_eq!(suggested, Some(100_000_000));
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+}

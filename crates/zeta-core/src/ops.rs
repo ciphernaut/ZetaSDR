@@ -2127,7 +2127,12 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                     Ok(t) => t,
                     Err(e) => {
                         drop(guard);
-                        let e = NodeError::Lease(e);
+                        // A tune the port refused reads as the source's failure, as
+                        // `launch_inner` words it (a conflict stays a conflict).
+                        let e = match e {
+                            LeaseError::Port(p) => NodeError::SourcePort(source.clone(), p),
+                            e => NodeError::Lease(e),
+                        };
                         idle_after_replace(node, port.as_ref(), &replace, &e).await;
                         return Err(node_error(node, e));
                     }
