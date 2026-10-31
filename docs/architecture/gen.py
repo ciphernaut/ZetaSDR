@@ -9,7 +9,9 @@ from __future__ import annotations
 import html, pathlib
 
 HERE = pathlib.Path(__file__).parent
-AS_OF = "2026-10-29, main 6d62460, v0.1.0"
+AS_OF = "2026-11-01, main 771ea93, v0.1.0"
+SHIPPED = "shipped (plans 1-18 and 20 merged to main)"
+PLANNED = "planned (plan 19, the rest of the UI wave, TODO gists)"
 AMBER = "#b7791f"
 FONT = "Inter, 'Segoe UI', Helvetica, Arial, sans-serif"
 W = 1660
@@ -58,7 +60,12 @@ def box(x, y, w, h, title, body="", planned=False, note=None, title_size=12.5, b
             emit(f'<tspan x="{x+8}" dy="{dy}">{esc(ln)}</tspan>')
         emit('</text>')
     if note is not None:
-        callout(x + w - (28 if planned or tag else 0) - 6, y, note) if False else callout(x + 0, y, note)
+        notes = note if isinstance(note, (list, tuple)) else [note]
+        callout(x, y, notes[0])
+        # further discs sit on the top edge just past the title, clear of its letters
+        tx = x + 8 + len(title) * title_size * 0.6 + 14
+        for k, n in enumerate(notes[1:]):
+            callout(tx + 22 * k, y, n)
     return (x, y, w, h)
 
 def need_h(title, body, w, body_size=10.5):
@@ -104,10 +111,10 @@ emit(f'<text x="18" y="34" font-size="22" font-weight="800">ZetaSDR architecture
 label(300, 34, f"as it stands {AS_OF}; planned work pencilled in amber", size=12, op=0.8)
 # legend
 emit(f'<rect x="18" y="48" width="26" height="12" rx="3" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>')
-label(50, 58, "shipped (plans 1-14, 16, 17 merged to main)", size=10.5)
+label(50, 58, SHIPPED, size=10.5)
 emit(f'<rect x="300" y="48" width="26" height="12" rx="3" fill="currentColor" fill-opacity="0.03" stroke="{AMBER}" stroke-width="1.6" stroke-dasharray="6 4"/>')
-label(332, 58, "planned (plan 15, 18-20, decoder wave 2, TODO gists)", size=10.5)
-callout(620, 54, "n"); label(634, 58, "see note n under the figure", size=10.5)
+label(332, 58, PLANNED, size=10.5)
+callout(660, 54, "n"); label(674, 58, "see note n under the figure", size=10.5)
 emit(f'<line x1="830" y1="54" x2="870" y2="54" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>'); label(876, 58, "data or control flow (label says which)", size=10.5)
 
 # ---- layout engine: measure first, then draw -------------------------------
@@ -130,7 +137,7 @@ GAPY = 14
 # ---- content ---------------------------------------------------------------
 clients = [
  dict(title="zeta CLI", note=1, body="crate zeta. zeta <group> <verb> --flag: one-shot (opens the node in-process, applies one op, exits) or --node URL --secret against a serving node. zeta serve runs the node (--listen, --llm-*, --stt-*). Local-only: ops tail, transcripts tail, modes check, soapy find. --then-tail starts a job and tails it."),
- dict(title="Web UI", note=10, body="crate zeta-ui: plain JS embedded in the binary, served at /ui/. Waterfall (fine capture + coarse scan layer), ribbons, job list, graph view, map (vendored Leaflet, OSM tiles when online), channel-plan axis, Ctrl-K command line, microphone to /stt, view policies. Its own spectrum job is elastic."),
+ dict(title="Web UI", note=10, body="crate zeta-ui: plain JS embedded in the binary, served at /ui/. Waterfall (fine capture + coarse scan layer, blank under a mask), ribbons, job list, graph view, map (vendored Leaflet), channel-plan axis, Ctrl-K command line, microphone to /stt. A boxed demod is fitted to the measured signal first; outlines drag to retune (job_retune) and have a menu (Fit, widths, Stop); job tags link to the rows. Its own spectrum job is elastic."),
  dict(title="MCP server", body="crate zeta-mcp: zeta-mcp --node URL. One MCP tool per operation, generated from the schema; tool text from AGENTS.md."),
  dict(title="Python SDK and scripts", body="sdk/python zeta_plugin (plugin protocol), examples/python (cb_watch.py: elastic spectrum, demod + transcribe on active CB channels; gain.py; stt_daemon_stub.py; separate_stub.py), skills/zetasdr (the agent skill), deploy/pi (systemd unit, Pi build)."),
  dict(title="Agent", body="crate zeta-agent: zeta ask \"REQUEST\" and POST /ask. OpenAI-compatible tool-calling loop over the operation set; tools and guide generated from AGENTS.md; its calls appear on the ops stream as transport agent."),
@@ -143,16 +150,16 @@ client = dict(title="zeta-client", body="Typed client of a node: remote.rs (HTTP
 peers = dict(title="Other ZetaSDR nodes", note=7, body="Federation peers: a node is a source for another (--source-node), forwards speech (--stt-node, X-Zeta-Stt-Hop loop guard), and is driven with --node. One secret per node.")
 
 core_a = [
- dict(title="Operation set", note=1, body="ops.rs: 22 typed ops (source_*, job_*, stream_*, graph_*, iq_read, classify, knowledge_lookup, channel_plans, modes_*, schema). JSON schema; every field required; corrective errors (field, range, suggested, conflict holders). CLI form and JSON form are the same op."),
- dict(title="Job runtime", note=6, body="job.rs, node/launch.rs, persist.rs: a job is a graph on a source band; persisted, resumed by serve (scan first, then widest first), run generation so a stopped run cannot outlive its job, history of 20. Attached jobs (transcribe) read another job's stream and hold no lease."),
- dict(title="Lease manager", note=2, body="lease.rs: one tuning per source. Rigid leases (decoders, identify, watch, scan), elastic followers (the page's spectrum), pins (a holder that is not a job). Per-source gate; replace stops named holders and tunes in one step; conflicts name the holders and the options."),
+ dict(title="Operation set", note=1, body="ops.rs: 23 typed ops (source_*, job_* with job_retune, stream_*, graph_*, iq_read, classify, knowledge_lookup, channel_plans, modes_*, schema). JSON schema; every field required; corrective errors (field, range, suggested, conflict holders). CLI form and JSON form are the same op."),
+ dict(title="Job runtime", note=(6, 10), body="job.rs, node/launch.rs, retune.rs, persist.rs: a job is a graph on a source band; persisted, resumed by serve (scan first, then widest first), run generation so a stopped run cannot outlive its job, history of 20. job_retune relaunches a running job under its id on a new band, squelch, deviation and sideband carried. Attached jobs (transcribe) read another job's stream, hold no lease and follow their input through a retune or graph_put."),
+ dict(title="Lease manager", note=2, body="lease.rs: one tuning per source. Rigid leases (decoders, identify, watch, scan), elastic followers (the page's spectrum), pins (a holder that is not a job). Per-source gate; replace stops named holders and tunes in one step; job_retune moves a lease under the gate; conflicts name the holders and the options."),
  dict(title="Graph document + stage registry", body="graph.rs, stage.rs: nodes (kind, params) and typed edges; 20 stage kinds with params_schema; a job kind expands to a built-in graph (channel → demod → decoder); graph_get/put restarts under the same id; re-expandable puts carry squelch, guard and width across capture changes."),
 ]
 core_b = [
  dict(title="IQ ring", body="ring.rs: per-source IQ history under --ring-budget-mb (10 s narrow, down to 1 s at 16 Msps). iq_read saves a SigMF pair of the whole ring band; classify reads a span; older spans fail too_old."),
  dict(title="Channel bank", note=3, body="bank.rs over zeta-dsp PfbBank: at 2 Msps and up one polyphase filter bank per source splits the capture into 8-256 bins; a channel that fits a bin is bank-served, wider or odd-rate ones take the direct path. job_context shows channel.path; source_list shows bank.dropped."),
  dict(title="Streams and ports", body="stream.rs, port.rs, types.rs: typed streams (iq, audio, video, text, event, sink), frames with provenance (source, job, channel, start_ns, end_ns), the node's own ops stream, lagged/missed accounting, stream_tail. Port trait: a source's tune + push side."),
- dict(title="Capture and sources", note=8, body="capture.rs, node/sources.rs: source_ensure, pin/unpin, free, set_gain; capability records (tune range, max bandwidth, remote, push); faults (device lost, too_busy, remote gone); Soapy stats (measured rate, overflows, clock-guard restarts)."),
+ dict(title="Capture and sources", note=(8, 9), body="capture.rs, node/sources.rs, recover.rs: source_ensure, pin/unpin, free, set_gain; capability records; faults (device lost, worker died, too_busy, remote gone); a healed source gets its gain, pin and failed jobs back. scan steps a span, odd sweeps a quarter step lower, each step's DC notch and edges masked on local hardware."),
 ]
 core_c = [
  dict(title="Mode registry", note=4, body="modes/: rows from modes/*.json (aprs, pocsag, rds, acars, adsb, rs41, dfm, m20) then the operator's --modes-dir; a row names its band, modulation, decoder (graph or program), event schema, summary template, identify rule. States ready, broken, unavailable. zeta modes check runs each row's synthesised test."),
@@ -162,7 +169,7 @@ core_c = [
  dict(title="Plans, logs, guide", body="plans.rs: channel plans (uhf_cb_au, 80 channels) naming channels and feeding the adjacent-channel guard. node/jsonlog.rs: ops.log and transcripts.log (8 MiB rotation). agents_md.rs: AGENTS.md generated from the schema plus docs/agents/field-craft.md, served at /agents-md."),
 ]
 
-dsp = dict(title="zeta-dsp: in-process stages", body="channel (fine filter, wide_hz for the guard), pfb bank, resample (rational, snapping), fft (CPU; GPU via wgpu behind feature gpu, shaders/), measure (layer 1: occupied band, SNR, burst, symbol-rate line, label), nbfm/wfm/am/ssb demod to 48 kHz audio, squelch (auto floor + 6 dB) and adjacent-channel guard, afsk + ax25 → aprs_decode, pocsag, rds, acars (MSK), detect (runs of bins that persist), denoise (RNNoise via nnnoiseless), vad, catalogue scoring, synth/fixtures (fsk/psk/ook families, RS41 frames, echo, snr, ppm impairments for modes check).")
+dsp = dict(title="zeta-dsp: in-process stages", body="channel (fine filter, wide_hz for the guard), pfb bank, resample (rational, snapping), fft (CPU; GPU via wgpu behind feature gpu, shaders/; notch_hz/edge_mask mark rows masked), measure (layer 1: occupied band, SNR, burst, symbol-rate line, label; ±25 kHz DC mask beside a local capture centre), nbfm/wfm/am/ssb demod to 48 kHz audio, squelch (auto floor + 6 dB) and adjacent-channel guard, afsk + ax25 → aprs_decode, pocsag, rds, acars (MSK), detect (runs of unmasked bins that persist), denoise (RNNoise via nnnoiseless), vad, catalogue scoring, synth/fixtures (fsk/psk/ook families, RS41 frames, echo, snr, ppm impairments for modes check).")
 ext = dict(title="zeta-ext: external decoder programs", note=4, body="external_decode runs a program row's command over stdio with IQ or demodulated audio (raw or wav fifo) and parses json_lines, sbs, nmea, kiss, text or multimon into events; adsb_decode (dump1090), rs41/dfm/m20 rows (rs1729: rs41mod, dfm09mod, m20mod); handler report at startup (ZETA_HANDLER_*).")
 plug = dict(title="zeta-plugin", body="Stdio plugin protocol 1 and 2 (hello, run, typed frames; 2 adds video). --plugin KIND=PATH registers a stage kind probed at startup; cleared environment. The Python SDK implements it.")
 children = dict(title="Child processes (spawned by the node, cleared env, stdio)", tag="OUTSIDE PROCESS", body="dump1090 · rs41mod / dfm09mod / m20mod · the operator's --plugin programs (any language; sdk/python). A crashed program fails its job with a reason naming it; a missing one leaves its row unavailable.")
@@ -173,7 +180,7 @@ sondehub = dict(title="SondeHub", body="api.v2.sondehub.org/sondes/telemetry: PU
 
 sources = [
  dict(title="zeta-source-file", body="SigMF recording as a source; with tune_min/max it plays as a tunable radio (test and demo aid). Fixtures for the test suite."),
- dict(title="zeta-source-soapy", note=12, body="SoapySDR devices (HackRF, USRP B210) through zeta-source-soapy-driver (cfg soapy). gain=, ppm=, UHD rate ladder, clock guard, overflow-storm and device-loss faults, stats."),
+ dict(title="zeta-source-soapy", note=12, body="SoapySDR (HackRF, B210) via zeta-source-soapy-driver (cfg soapy) in a zeta soapy-worker child (zeta-source-worker) the node respawns: a crash or unplug faults the source, never the node. gain=, ppm=, clock guard, stats."),
  dict(title="zeta-source-kiwi", body="KiwiSDR over websocket: 0-30 MHz, 12 kHz per connection, password from env; too_busy fault when the slots are full."),
  dict(title="zeta-source-node", note=7, body="Another ZetaSDR node's source: each tune holds a passthrough job there and reads ws ?format=binary; 250 kHz cap unless widened; faults when the remote goes away."),
  dict(title="zeta-source-vrt", body="VITA 49.2 packets on UDP; the sender's context packet sets frequency and rate; a job outside it fails unsupported."),
@@ -184,20 +191,18 @@ radios = [
  dict(title="SigMF files on disk", body="captures/ from iq_read, scratch fixtures"),
  dict(title="HackRF One, USRP B210", body="libsoapysdr + driver modules; 2 m / 70 cm antenna, discone"),
  dict(title="KiwiSDR receivers", body="public or private HF receivers, site-dependent"),
- dict(title="Remote ZetaSDR node", body="a Pi 5 at the antenna (deploy/pi), or a child node owning a HackRF"),
+ dict(title="Remote ZetaSDR node", body="a Pi 5 at the antenna (deploy/pi), or a radio on another host"),
  dict(title="VRT sender", body="any VITA 49.2 UDP streamer on the LAN"),
  dict(title="(codec only)", body="no device of its own"),
 ]
 planned_a = [
- dict(planned=True, note=9, title="Plan 15: scan grid", body="Core node, ops.rs scan_steps. Alternate the step grid every other sweep (half-step shift) and mask the DC notch and the outer ~10 % of each step's bins as no-data (masked: [[lo, hi], ...] on spectrum rows); report shift, notch and edge width in job_context. Spec first."),
- dict(planned=True, note=10, title="Plan 18: UI wave", body="Web UI only. Box a signal → create the demod (+ transcribe) → centre it on the measured signal, never a raster → bandwidth presets; per-job labels on the waterfall; staircase transcript ribbons; mode picking by band through knowledge_lookup; the Okudagram (LCARS) theme behind view set theme."),
+ dict(planned=True, note=15, title="UI wave: the rest", body="Web UI only. Staircase transcript ribbons (lanes from the pixel height between channels); mode picking by band through knowledge_lookup with a search fallback; state-stream decoders such as ADS-B as one held line per subject; the Okudagram (LCARS) theme behind view set theme."),
  dict(planned=True, note=11, title="Plan 19: layer 4 stages", body="zeta-dsp. A bits stream kind; fsk/psk/ook demod stages, clock_recover, slicer (eye and constellation stats), bit_view (run lengths, autocorrelation, sync-word and CRC hypotheses), correlate, frame_decode (preamble, length, NRZI/Manchester, CRC library) + thin Modbus RTU / DNP3 / IEC-101/104 rows; signature write-back to knowledge; burst-aware measure (duty, burst_ms, period_ms, cyclostationary rate, M-FSK clusters)."),
- dict(planned=True, note=12, title="Plan 20: Soapy worker", body="zeta soapy-worker child owns the Driver behind a Port that faults when the child exits, so a driver crash or a USB drop never ends the node (today a HackRF in its own child node is the interim pattern; a device lost in-process stays faulted until restart)."),
  dict(planned=True, note=13, title="Decoder wave 2 (rows)", body="Rows and small stages on the plan-17 frameworks: M17 (Codec 2) and DMR (AMBE via mbelib, tools/install-vocoders.sh) as audio rows feeding transcribe; AIS (nmea parser, map), FLEX; whole-span POCSAG/APRS as a watch with decode_on capture; stereo wfm_demod with pilot level; DFM/M20 synthesised tests; APRS positions on the map."),
+ dict(planned=True, note=13, title="Feeds and sinks", body="sink stage kinds for the standard feeds (APRS-IS, SBS/Beast, AIS NMEA, PSK Reporter, WSPRnet, KISS TNC); a generic sink: {kind, params} on the watch's detect node replacing the one-off sondehub field (shorthand kept); fixes: a sink-bearing decoder frozen as an operator graph, gated_stop cleared by a sink restart."),
 ]
 planned_b = [
  dict(planned=True, note=14, title="Knowledge: ACMA register", body="A provider over acma-local (the RRL as SQLite / MCP) answering knowledge_lookup with licensee, site, distance, power and decoded emission designator for assignments in the band near --station LAT,LON, so classify's layer 2 can say 'a licensed 16K0F1D link 12 km away' before anyone demodulates. Register the acma-local MCP in .mcp.json."),
- dict(planned=True, note=13, title="Feeds and sinks", body="sink stage kinds for the standard feeds (APRS-IS, SBS/Beast, AIS NMEA, PSK Reporter, WSPRnet, KISS TNC); a generic sink: {kind, params} on the watch's detect node replacing the one-off sondehub field (shorthand kept); fixes: a sink-bearing decoder frozen as an operator graph, gated_stop cleared by a sink restart."),
  dict(planned=True, note=5, title="Watch and identify fixes", body="Re-centre before identifying (power-weighted centroid over the run's bins, or a slow high-pass ahead of the WAV feed: rs41mod decodes only within ±1 kHz); detect defaults that hold on a real receiver (threshold vs median, min run energy, signal event rate limit); sonde rows before ACARS on a 12.5 kHz FSK box; classify tries a row-width slice at the measured centre."),
  dict(planned=True, note=14, title="Time, trunking, span", body="True block timestamps (HackRF drift bug) to unlock UTC-slotted modes (FT8/FT4, WSPR) and TDMA (DMR, TETRA); a trunking follower (P25, DMR Tier III, MPT1327) starting voice jobs from control-channel events inside a pin; decoders that find their own channels in a capture; wideband modes (DVB-T, DAB) on the GPU FFT, parked behind the HackRF-first set."),
  dict(planned=True, note=11, title="Packaging, layer 3, guide", body="--run-dir (ZETA_RUN_DIR) for program-row fifos and snap/flatpak/AppImage install hints; the vocoder install script and its legal note; layer 3 (a learned classifier) stays an empty slot until layer-4 sessions produce labelled captures; field craft additions: knowledge first on licensed bands, burst timing over 'noise', an unknown-signal playbook that stops at classification."),
@@ -241,7 +246,7 @@ h5 = max(rowh(sources, sw), need_h(hosts["title"], hosts["body"], OW)); s5y = Y5
 Y6 = Y5 + H5 + GAPY
 h6 = rowh(radios, sw); r6y = Y6 + PAD; H6 = h6 + 2 * PAD
 Y7 = Y6 + H6 + 18
-xp, pw = cols(5, 14, CX0, OX1)
+xp, pw = cols(4, 14, CX0, OX1)
 hp1 = rowh(planned_a, pw); hp2 = rowh(planned_b, pw)
 p_y = Y7 + 30; p2_y = p_y + hp1 + 12
 H7 = (p2_y + hp2 + PAD) - Y7
@@ -320,25 +325,27 @@ svg_text = "\n".join(svg)
 (HERE / "zetasdr-architecture.svg").write_text(svg_text)
 
 # --- the page ----------------------------------------------------------------
+PLANNED_NOTES = {11, 13, 14, 15}
 NOTES = [
- (1, "One operation set, every transport", "The CLI, the JSON over HTTP, the MCP tools and the in-process agent all end in Node::apply with the same 22 ops; the CLI form and the JSON form are the same call. Every applied op is appended to ops.log with its caller's transport and published on the node's own ops stream, so the page's transcript pane shows what the agent did."),
- (2, "Leases, not locks", "A source holds one tuning. Decoders, identify, watch and scan hold rigid leases; the page's spectrum job is elastic and follows every retune; a pin is a rigid holder with no job. A request that does not fit is a conflict that names the holders; replace stops the named holders and tunes under the source's gate in one step."),
+ (1, "One operation set, every transport", "The CLI, the JSON over HTTP, the MCP tools and the in-process agent all end in Node::apply with the same 23 ops; the CLI form and the JSON form are the same call. Every applied op is appended to ops.log with its caller's transport and published on the node's own ops stream, so the page's transcript pane shows what the agent did."),
+ (2, "Leases, not locks", "A source holds one tuning. Decoders, identify, watch and scan hold rigid leases; the page's spectrum job is elastic and follows every retune; a pin is a rigid holder with no job. A request that does not fit is a conflict that names the holders; replace stops the named holders and tunes under the source's gate in one step. job_retune moves a running job's lease under the same gate: inside the capture it is granted without a tune; outside it the source is tuned, or the request is a conflict and the old lease is put back."),
  (3, "A wide capture is shared, not copied", "At 2 Msps and up one polyphase filter bank per source splits the capture into coarse bins; a channel that fits a bin reads that bin, so 80 UHF CB channels on one 1 MHz pin cost 80 fine filters at a few hundred kHz each instead of 80 full-rate filters. A channel wider than a bin, or on a slow source, takes the direct path with the same graph and provenance."),
  (4, "A decoder is a row, not code", "Plan 16 made modes table rows: modes/*.json built in, the operator's --modes-dir after. A graph row reuses in-process stages (APRS, POCSAG, RDS, ACARS); a program row runs an external decoder through external_decode over stdio (dump1090, rs1729) with IQ or demodulated audio and a declared parser. Each row carries its identify rule, summary template and a synthesised test for zeta modes check."),
  (5, "The identification ladder", "measure is layer 1 (occupied band, SNR, burst, symbol-rate line, a coarse label). classify is the quick layer 2: it scores every row against the layer-1 record, tries the best five as decode-to-identify (a CRC-clean frame is the proof) and names up to three catalogue signals. identify is the thorough form: a rigid lease, then each fitting row run as a child job for its dwell. watch automates identify over a band. Layer 3, a learned classifier, is an empty slot by design. Nothing matching is reported as unknown with the measured features, never guessed."),
- (6, "Attached jobs", "transcribe is never started on the radio: it attaches to a running demodulator, reads that job's audio stream, holds no lease and ends when the input stops. Its chain is stream_in, denoise (RNNoise), vad, transcribe; the speech work happens in an external daemon or on another node's /stt."),
- (7, "Federation", "A node is a source for another node: each tune holds a passthrough job on the remote, whose source list shows who is using the radio, and IQ ships as VRT over the websocket's binary mode, narrowband by default. The same HTTP API forwards speech (--stt-node) and is what --node drives. The field pattern of a HackRF in its own child node is this mechanism turned inward."),
+ (6, "Attached jobs", "transcribe is never started on the radio: it attaches to a running demodulator, reads that job's audio stream and holds no lease. It follows its input through a job_retune or a graph_put restart, relaunched under its own id on the new stream, and ends when the input stops or fails for its own reason. Its chain is stream_in, denoise (RNNoise), vad, transcribe; the speech work happens in an external daemon or on another node's /stt."),
+ (7, "Federation", "A node is a source for another node: each tune holds a passthrough job on the remote, whose source list shows who is using the radio, and IQ ships as VRT over the websocket's binary mode, narrowband by default. The same HTTP API forwards speech (--stt-node) and is what --node drives. It is not crash protection: one node owns a local HackRF directly, its driver in a worker child (note 12)."),
  (8, "Health and faults", "A source's fault (device lost, Kiwi too_busy, remote gone) fails its jobs with the fault as the reason and is cleared by the next successful tune. Soapy sources report measured rate, overflows and clock-guard restarts; the bank reports dropped blocks; /health reports live stage tasks so a leak is visible."),
- (9, "Plan 15 (planned): scan grid", "Scan steps today sit end to end with the receiver's DC spike at every step centre and weak band edges, and surveys inherit both. The plan alternates the grid by half a step on odd sweeps and masks the bad bins in the node as no-data."),
- (10, "Plan 18 (planned): UI wave", "Box a signal, create its demodulator, then centre it on the measured signal (the operator's standing rule: no channel-grid assumptions) with bandwidth presets; label each job on the waterfall; staircase the transcript ribbons; pick modes by band; an LCARS theme behind view set theme."),
+ (9, "Plan 15: scan grid and masks", "The scan alternates its step grid between sweeps: the odd sweep sits a quarter step lower with at most one more step, so each grid's DC notch and edges fall a quarter of the way into a row of the other, clear of its mask (a half step put them inside the other grid's edge mask). On a local hardware receiver the scan's one fft node masks a 300 kHz centre notch and 0.10 of the bins at each edge; every other source gets none. Rows carry masked: [[lo, hi], ...], the row's floor ignores masked bins, detect skips them and the page paints nothing under them. job_context.scan reports alternate and mask; graph put on the fft node changes the mask. measure on a local receiver ignores the 25 kHz either side of the capture centre when the box holds the DC but is not centred on it. Live acceptance on the desktop HackRF is pending."),
+ (10, "Plan 18: fit first, drag to refine", "A demodulator started from a box is fitted first: a measure of the box, then the measured centre with 1.25 times the occupied width, floored per kind and never wider than the box; an SSB demod moves its dial only and keeps its band. That is the operator's standing rule: no channel-grid assumptions. A running job's outline is dragged by its edges or its body and retuned on release through job_retune, the 23rd op: the lease moves under the source's gate and the job is relaunched under its id, squelch, deviation and sideband carried and the channel-plan guard derived again. The outline menu offers Fit to signal, the 2.5 to 25 kHz widths and Stop; job tags on the waterfall light up with their rows. Live acceptance on the desktop HackRF is pending."),
  (11, "Plan 19 (planned): layer 4", "Today layer 4 is prose. The plan adds the vetted blocks an agent can chain from a channel to bits (generic FSK/PSK/OOK demods, clock recovery, slicer, bit viewer, correlator), a generic framing decoder with standards-based serial parsers for clear traffic only, signature write-back so the next encounter is a layer-2 match, and a burst-aware layer 1. The labelled captures these sessions leave are the training data layer 3 would need."),
- (12, "Plan 20 (planned): Soapy worker process", "A driver crash ends the process that loads it. The plan moves the driver into a zeta soapy-worker child behind a Port that faults on exit, so the node survives; until then the field craft runs the HackRF in a second node."),
+ (12, "Plan 20: Soapy worker", "A driver crash ends the process that loads it, so the driver runs in a zeta soapy-worker child the node spawns (crate zeta-source-worker). A crash or a pulled cable faults the source and fails its jobs with the fault; the node lives on, respawns the worker and, when the device is back, restores the gain and the pin and relaunches the jobs that failed with that fault under their own ids (zeta: source <id>: recovered: ...). source list shows worker {pid, restarts, since_ns}; --soapy-in-process opens the device in the node, for diagnosis only. Deployed on the field host 2026-10-31; acceptance items 1 and 2 passed."),
  (13, "Decoder wave 2 and feeds (planned)", "Voice rows (M17, DMR) feed transcribe unchanged; AIS and FLEX are parser rows; whole-span POCSAG/APRS reuses the watch; stereo lands on wfm_demod. Feeds out generalise sink_sondehub to a sink: {kind, params} on the watch and add the standard sinks (APRS-IS, SBS, AIS NMEA, PSK Reporter, WSPRnet, KISS)."),
  (14, "Knowledge and time (planned)", "A knowledge provider over the local ACMA licence register would have named the 404.025 MHz burst in seconds (Unitywater, 16K0F1D) where two hours of layer-1 analysis did not; it needs a station position. True block timestamps unlock FT8/WSPR and TDMA; a trunking follower and self-channelising span decoders are the other open architecture notes."),
+ (15, "The rest of the UI wave (planned)", "Plan 18 shipped the fit and the drag. Still pencilled in: staircase transcript ribbons (the newest line at the channel, older ones stepping up, lanes from the pixel height available), mode picking by band through knowledge_lookup with a search fallback, a held roster line per subject for state-stream decoders such as ADS-B, and the Okudagram (LCARS) theme behind view set theme. TODO.md holds the gists."),
 ]
 
 notes_html = "\n".join(
-    f'<li value="{n}"{" class=\"planned\"" if n >= 9 else ""}><b>{esc(t)}.</b> {esc(b)}</li>' for n, t, b in NOTES)
+    f'<li value="{n}"{" class=\"planned\"" if n in PLANNED_NOTES else ""}><b>{esc(t)}.</b> {esc(b)}</li>' for n, t, b in NOTES)
 
 page = f"""<!DOCTYPE html>
 <html lang="en">
@@ -370,8 +377,8 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; f
 <body>
 <main>
 <h1>ZetaSDR architecture</h1>
-<p class="lede">As it stands on {AS_OF}, with the planned work pencilled in. One Rust workspace of 18 crates; the diagram groups them by the layer they belong to. Generated by <code>docs/architecture/gen.py</code>; the same picture is in <code>docs/architecture/zetasdr-architecture.svg</code>.</p>
-<div class="row"><span><span class="sw"></span>shipped (plans 1-14, 16, 17 merged to main)</span><span><span class="sw planned"></span>planned (plan 15, 18-20, decoder wave 2, TODO gists)</span><span>numbered discs point at the notes below</span></div>
+<p class="lede">As it stands on {AS_OF}, with the planned work pencilled in. One Rust workspace of 18 crates, plus the Soapy driver crate built on its own; the diagram groups them by the layer they belong to. Generated by <code>docs/architecture/gen.py</code>; the same picture is in <code>docs/architecture/zetasdr-architecture.svg</code>.</p>
+<div class="row"><span><span class="sw"></span>{SHIPPED}</span><span><span class="sw planned"></span>{PLANNED}</span><span>numbered discs point at the notes below</span></div>
 <figure>
 {svg_text.replace('style="color:#1b1f24"', '')}
 <figcaption>Clients call one operation set over one transport layer; the core node turns operations into leased jobs that run graphs of stages over IQ pushed in by the sources; services outside the process sit to the right. Amber dashed boxes are not built yet.</figcaption>
@@ -386,7 +393,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; f
 <ol class="notes">
 <li value="1"><b>A request top to bottom.</b> <code>zeta job start --kind rs41_decode ...</code> becomes a <code>job_start</code> op (CLI or JSON, same thing), crosses the transport, and in the node asks the lease manager for the band on the source. Granted, the job runtime expands the row's graph (<code>channel → nbfm_demod → external_decode</code>), the channel stage pulls IQ from the shared bank or the direct path, the external stage spawns <code>rs41mod</code> and parses its lines into events that carry <code>position</code> and <code>t_ns</code>, and those events go out as frames on a stream the page, the CLI tail, the agent and the SondeHub sink all read the same way.</li>
 <li value="2"><b>What is deliberately absent.</b> No transmit path anywhere. No decoder guesses: a protocol is labelled only on a CRC-clean frame, and <em>unknown</em> is a first-class answer with measured features. No uploads without an operator's callsign and position. Nothing is fetched or built by the node: handlers, vocoders and speech models are the operator's to install.</li>
-<li value="3"><b>Where the amber lands.</b> Most planned work is rows and stages, not new machinery: plans 16 and 17 were built so that the second decoder wave is table entries. The three pieces that do change the architecture are the <code>bits</code> stream kind and layer-4 stages (plan 19), the Soapy worker process (plan 20), and the generic sink on the watch.</li>
+<li value="3"><b>Where the amber lands.</b> Most planned work is rows and stages, not new machinery: plans 16 and 17 were built so that the second decoder wave is table entries. The pieces that still change the architecture are the <code>bits</code> stream kind and layer-4 stages (plan 19) and the generic sink on the watch; the third, the Soapy worker process (plan 20), has landed.</li>
 </ol>
 </main>
 </body>
