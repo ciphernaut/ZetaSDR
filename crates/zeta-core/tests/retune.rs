@@ -20,7 +20,7 @@ use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{
     Backend, PassthroughStage, Stage, StageContext, StageError, StageRegistry, StageSpec,
 };
-use zeta_core::stream::{Frame, StreamBus};
+use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::stream_in::StreamInStage;
 use zeta_core::types::{
     Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, StreamId, StreamKind,
@@ -670,4 +670,43 @@ async fn a_retune_to_the_same_band_restarts_the_job_and_keeps_its_tuning() {
     assert_eq!(rec.tuning, band);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(node.debug_stage_count(), n);
+}
+
+/// The next frame on the `ops` stream, with its event payload.
+async fn next(rx: &mut broadcast::Receiver<Frame>) -> (Frame, serde_json::Value) {
+    let f = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("ops frame within 5 s")
+        .expect("ops stream open");
+    let Payload::Event(v) = f.payload.clone() else {
+        panic!("ops frame is not an Event: {:?}", f.payload);
+    };
+    (f, v)
+}
+
+#[tokio::test]
+async fn the_ops_stream_logs_job_retune_with_its_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let mut rx = node.bus().subscribe(&node.ops_stream()).unwrap();
+    let id = start(&node, JobKind::FmDemod, t(100_000_000, 12_500)).await;
+    let _ = next(&mut rx).await;
+    assert_eq!(
+        retune(&node, &id, 100_002_000, 10_000, &[]).await,
+        Ok(OpResult::Job(id.clone()))
+    );
+    let (_, p) = next(&mut rx).await;
+    assert_eq!(p["op"]["op"], "job_retune");
+    assert_eq!(p["op"]["job"], id.0.as_str());
+    assert_eq!(p["outcome"], "ok");
+    assert_eq!(p["result"]["result"], "job");
+    assert_eq!(p["result"]["value"], id.0.as_str());
+    assert_eq!(p["transport"], "local");
+    retune(&node, &JobId::new(), 100_000_000, 12_500, &[])
+        .await
+        .unwrap_err();
+    let (_, p) = next(&mut rx).await;
+    assert_eq!(p["op"]["op"], "job_retune");
+    assert_eq!(p["outcome"], "error");
+    assert_eq!(p["error"]["error"], "unknown");
 }

@@ -162,9 +162,10 @@ struct JobEntry {
     /// one of these.
     outputs: Vec<(StreamKind, StreamId)>,
     /// Set while the job is relaunched under its id, by [`Inner::relaunch_elastic`] (an
-    /// elastic job on a new capture) or by [`Inner::relaunch_in_place`] (a
-    /// `job_retune`): its supervisor then leaves the record `Running` and the lease
-    /// held for the relaunch.
+    /// elastic job on a new capture), by [`Inner::relaunch_in_place`] (a
+    /// `job_retune`) or by [`Inner::hold_attached`] (an attached job whose input is
+    /// retuned or restarted by `graph_put`): its supervisor then leaves the record
+    /// `Running` and the lease held for the relaunch.
     relaunch: bool,
     /// Set by a stop under the source's gate ([`Inner::stop_gated`], a `replace`):
     /// the supervisor then does not idle the port, which would take that gate, and
@@ -348,13 +349,29 @@ impl Inner {
         capture_rate_hz: Option<Option<u64>>,
         running: bool,
     ) -> Result<(), NodeError> {
-        let rec = self
+        // Before the stop: the jobs attached to it follow the restart (see
+        // `Inner::relaunch_attached`), relaunched once it runs again or failed to.
+        let held = match running {
+            true => self.hold_attached(id),
+            false => Vec::new(),
+        };
+        let rec = match self
             .store_graph(id, graph, capture_rate_hz, running.then_some(false))
-            .await?;
+            .await
+        {
+            Ok(rec) => rec,
+            Err(e) => {
+                self.relaunch_attached(held).await;
+                return Err(e);
+            }
+        };
         if running {
-            self.launch_task(rec)
+            let r = self
+                .launch_task(rec)
                 .await
-                .map_err(|e| NodeError::Other(format!("launch task: {e}")))??;
+                .map_err(|e| NodeError::Other(format!("launch task: {e}")));
+            self.relaunch_attached(held).await;
+            r??;
         }
         Ok(())
     }

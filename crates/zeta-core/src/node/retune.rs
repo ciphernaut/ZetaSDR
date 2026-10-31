@@ -96,6 +96,8 @@ impl Node {
             operator_graph: false,
             ..rec
         };
+        // Before the run stops: its attached jobs' supervisors keep them `Running`.
+        let held = self.inner.hold_attached(id);
         let (r, after) = self.inner.relaunch_in_place(new, Some(&guard)).await;
         drop(guard);
         self.inner.after_gate(after).await;
@@ -108,6 +110,8 @@ impl Node {
             // The relaunch failed or was stopped meanwhile: its lease is gone.
             self.idle_if_unheld(port.as_ref()).await;
         }
+        // On the input's new stream, or `failed` as `input job <id> not running`.
+        self.inner.relaunch_attached(held).await;
         r
     }
 }
@@ -176,5 +180,77 @@ impl Inner {
             );
         }
         (r, after)
+    }
+
+    /// Hold the jobs attached to `input` for a relaunch: every running one (state
+    /// `Running`, a live run) gets `relaunch` (see [`super::JobEntry::relaunch`]), so
+    /// its supervisor, ending when the input's streams unregister, leaves its record
+    /// `Running`. Called before the input's run is stopped; the ids go to
+    /// [`Inner::relaunch_attached`] once the input runs again (or failed to).
+    pub(super) fn hold_attached(&self, input: &JobId) -> Vec<JobId> {
+        let mut jobs = self.jobs.lock().unwrap();
+        jobs.values_mut()
+            .filter(|e| {
+                e.record.input.as_ref() == Some(input)
+                    && e.record.state == JobState::Running
+                    && e.cancel.is_some()
+            })
+            .map(|e| {
+                e.relaunch = true;
+                e.record.id.clone()
+            })
+            .collect()
+    }
+
+    /// Relaunch the attached jobs [`Inner::hold_attached`] held, each under its own id
+    /// on its input's current audio stream (the launch repoints `stream_in`; it takes
+    /// no lease and no gate). Each old run is cancelled (if still live) and awaited
+    /// through its `ended`, as [`Inner::relaunch_in_place`] does: an attached run has
+    /// no port, so its supervisor has nothing left to do once `ended` closes. A job
+    /// the operator stopped meanwhile stays stopped; a launch that fails (the input
+    /// not running) ends the job `Failed` with the reason.
+    pub(super) async fn relaunch_attached(self: &Arc<Self>, held: Vec<JobId>) {
+        for id in held {
+            let (run, ended) = {
+                let mut jobs = self.jobs.lock().unwrap();
+                let Some(e) = jobs.get_mut(&id) else {
+                    continue;
+                };
+                // Taken before the launch, or `record_running` refuses it as
+                // `already running a launch`.
+                if let Some(cancel) = e.cancel.take() {
+                    cancel.cancel();
+                }
+                drop(e.done.take());
+                (e.run, e.ended.clone())
+            };
+            if let Some(mut ended) = ended {
+                let _ = ended.changed().await;
+            }
+            let rec = {
+                let mut jobs = self.jobs.lock().unwrap();
+                let Some(e) = jobs.get_mut(&id) else {
+                    continue;
+                };
+                if e.record.state != JobState::Running {
+                    // Stopped by the operator meanwhile: it stays so.
+                    e.relaunch = false;
+                    continue;
+                }
+                e.record.clone()
+            };
+            if let Err(e) = self.launch(rec).await {
+                if let Some(entry) = self.jobs.lock().unwrap().get_mut(&id) {
+                    entry.relaunch = false;
+                }
+                self.finish(
+                    &id,
+                    run,
+                    JobState::Failed {
+                        reason: e.to_string(),
+                    },
+                );
+            }
+        }
     }
 }

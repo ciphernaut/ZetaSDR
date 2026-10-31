@@ -381,7 +381,8 @@ async fn attached_job_stops_when_input_stops() {
     assert!(streams_of(&node, &id).is_empty(), "streams unregistered");
 }
 
-/// Ruling R4: the attached job does not follow a restart of its input; it ends `Stopped`.
+/// The attached job follows a `graph_put` restart of its input: relaunched under its
+/// own id on the input's new stream, never `Stopped`.
 #[tokio::test]
 async fn attach_follows_graph_put_of_the_input() {
     let dir = tempfile::tempdir().unwrap();
@@ -396,10 +397,109 @@ async fn attach_follows_graph_put_of_the_input() {
         .await
         .unwrap();
     assert_eq!(record(&node, &input).state, JobState::Running);
-    assert_eq!(wait_not_running(&node, &id, 1000).await, JobState::Stopped);
-    // A new attach reads the restarted input's new stream.
-    let again = attach_ok(&node, &input).await;
-    assert!(event(&node, &again, "transcript", 2000).await.is_some());
+    assert_running_for(&node, &id, 2000).await;
+    assert!(event(&node, &id, "transcript", 2000).await.is_some());
+    assert_eq!(attached_to(&node, &input), vec![id]);
+}
+
+/// The ids of the records attached to `input`.
+fn attached_to(node: &Node, input: &JobId) -> Vec<JobId> {
+    node.job_list()
+        .into_iter()
+        .filter(|r| r.input.as_ref() == Some(input))
+        .map(|r| r.id)
+        .collect()
+}
+
+/// `id` stays `Running` throughout `ms` (it is relaunched, never ended).
+async fn assert_running_for(node: &Node, id: &JobId, ms: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    while tokio::time::Instant::now() < deadline {
+        let state = record(node, id).state;
+        assert_eq!(state, JobState::Running, "attached job {}", id.0);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// [`registry`] plus the real DSP stages (the stand-ins registered first win their kinds).
+fn registry_with_dsp() -> StageRegistry {
+    let mut r = registry();
+    zeta_dsp::register_all(&mut r);
+    r
+}
+
+/// An `fm_demod` on the tone, whose squelch opens, feeding the attached chain.
+async fn start_fm(node: &Node) -> JobId {
+    let op = Op::JobStart {
+        kind: JobKind::FmDemod,
+        source: file0(),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![],
+    };
+    match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("fm_demod start: {other:?}"),
+    }
+}
+
+async fn retune_input(node: &Node, input: &JobId) {
+    let op = Op::JobRetune {
+        job: input.clone(),
+        center_hz: Hz(100_002_000),
+        bandwidth_hz: Hz(10_000),
+        replace: vec![],
+    };
+    let r = tokio::time::timeout(Duration::from_secs(10), node.apply(op))
+        .await
+        .expect("no deadlock");
+    assert_eq!(r, Ok(OpResult::Job(input.clone())));
+}
+
+#[tokio::test]
+async fn an_attached_transcribe_survives_its_inputs_retune_under_its_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry_with_dsp(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let input = start_fm(&node).await;
+    let att = attach_ok(&node, &input).await;
+    assert!(event(&node, &att, "transcript", 3000).await.is_some());
+    retune_input(&node, &input).await;
+    assert_eq!(
+        record(&node, &input).tuning,
+        Tuning {
+            center_hz: Hz(100_002_000),
+            bandwidth_hz: Hz(10_000),
+        }
+    );
+    assert_running_for(&node, &att, 2000).await;
+    assert_eq!(record(&node, &att).input, Some(input.clone()));
+    assert!(event(&node, &att, "transcript", 3000).await.is_some());
+    assert_eq!(attached_to(&node, &input), vec![att]);
+}
+
+#[tokio::test]
+async fn an_attached_job_the_operator_stopped_stays_stopped_through_a_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry_with_dsp(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let input = start_fm(&node).await;
+    let att = attach_ok(&node, &input).await;
+    node.job_stop(&att).await.unwrap();
+    assert_eq!(record(&node, &att).state, JobState::Stopped);
+    retune_input(&node, &input).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(record(&node, &att).state, JobState::Stopped);
+    assert_eq!(attached_to(&node, &input), vec![att]);
 }
 
 #[tokio::test]

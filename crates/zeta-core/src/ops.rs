@@ -144,9 +144,11 @@ pub enum Op {
     /// reads that job's audio output stream (the last one in its graph order when it
     /// has several; audio passed between two of its stages does not count) instead of
     /// the radio, holds no lease, copies the job's `source` and `tuning`, and records
-    /// it as its `input`. It ends `stopped` when the input job's
-    /// stream closes for any reason, a restart by `graph_put` included (attach again to
-    /// follow the new graph). On a node restart it resumes after its input, or is
+    /// it as its `input`. It follows its input through a
+    /// `job_retune` or a `graph_put` restart: it is relaunched under its own id on the
+    /// input's new stream once the input runs again (`failed` with the reason when it
+    /// cannot be). It ends `stopped` when the input job stops or fails for its own
+    /// reason. On a node restart it resumes after its input, or is
     /// `failed` with `input job <id> not running` when the input does not run.
     JobAttach {
         kind: JobKind,
