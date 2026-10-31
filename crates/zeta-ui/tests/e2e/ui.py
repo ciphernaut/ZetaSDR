@@ -1900,6 +1900,39 @@ def scenario_drag_body_moves_the_centre_and_a_short_drag_is_a_click(page, url, s
         page.mouse.up()
         page.wait_for_timeout(200)
         assert seen == [], f"the release after a cancel sent {[r.post_data for r in seen]}"
+        # A band a few px tall: the handles sit outside it, so the body still moves it.
+        small = start_job(url, secret, "passthrough", "retune", cur + 12_000, 1000)
+        try:
+            page.evaluate("window.zetaTest.poll()")
+            sol = page.locator(f'#waterfall .outline[data-key="{small}"]')
+            expect(sol.locator(".outline-handle")).to_have_count(2)
+            expect(sol).to_have_class(re.compile(r"\bhandles-out\b"))
+            sb = outline_box(page, small)
+            hi = sol.locator('.outline-handle[data-edge="hi"]').bounding_box()
+            lo = sol.locator('.outline-handle[data-edge="lo"]').bounding_box()
+            assert hi["y"] + hi["height"] <= sb["y"] + 1, f"hi handle {hi} over the band {sb}"
+            assert lo["y"] >= sb["y"] + sb["height"] - 1, f"lo handle {lo} over the band {sb}"
+            x, y = centre_of(sb)
+            with page.expect_request(is_op("job_retune")) as req:
+                page.mouse.move(x, y)
+                page.mouse.down()
+                page.mouse.move(x, y + 20, steps=4)
+                page.mouse.up()
+            body = json.loads(req.value.post_data)
+            assert body["job"] == small and body["bandwidth_hz"] == 1000, f"body drag {body}"
+            assert body["center_hz"] < cur + 12_000, f"body drag {body}"
+            # A passthrough's outline menu offers Stop only (no fit, no presets).
+            page.evaluate("window.zetaTest.poll()")
+            sol.click(button="right")
+            menu = page.locator("#ctx-outline")
+            expect(menu).to_be_visible()
+            got = menu.locator(".ctx-item:visible").evaluate_all(
+                "els => els.map(e => e.dataset.action)")
+            assert got == ["stop"], f"passthrough outline menu {got}"
+            page.keyboard.press("Escape")
+            expect(menu).to_be_hidden()
+        finally:
+            stop_job(url, secret, small)
     finally:
         stop_job(url, secret, job)
 
@@ -2404,13 +2437,16 @@ def scenario_ssb_entry_tunes_the_dial(page, url, secret):
     page.click('#ctx .ctx-item[data-action="ssb_usb"]')
     jobs = []
     try:
+        # The fit moves the dial only: the band stays the entry's 6000 Hz (a 3000 Hz band
+        # about the dial would cut the voice above 1.5 kHz).
         expect(page.locator("#transcript .line.op", has_text=re.compile(
             r"^job_start kind=ssb_demod source=tone center_hz=\d+ "
-            r"bandwidth_hz=\d+ sideband=usb → job ")).first).to_be_visible()
+            r"bandwidth_hz=6000 sideband=usb → job ")).first).to_be_visible()
         jobs = [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
                 if j["kind"] == "ssb_demod" and j["source"] == "tone"
                 and j["state"]["status"] == "running"]
         assert len(jobs) == 1, f"ssb_demod jobs on tone: {jobs}"
+        assert jobs[0]["tuning"]["bandwidth_hz"] == 6000, f"ssb_demod tuning {jobs[0]}"
         expect(job_row(page, jobs[0]["id"]).locator("button.play")).to_have_text("▶")
     finally:
         for j in jobs:

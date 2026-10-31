@@ -192,6 +192,10 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 }
 #waterfall .outline-handle[data-edge="hi"] { top: -4px; }
 #waterfall .outline-handle[data-edge="lo"] { bottom: -4px; }
+/* a band shorter than three handles: the handles sit outside it, the band is all body
+   (-9px: the handle's 8px plus the outline's 1px border) */
+#waterfall .outline.handles-out .outline-handle[data-edge="hi"] { top: -9px; }
+#waterfall .outline.handles-out .outline-handle[data-edge="lo"] { bottom: -9px; }
 /* the band a drag left (dimmer, dashed, no label) and the dragged band's readout under it */
 #waterfall .outline-ghost {
   position: absolute; left: 0; right: 0; box-sizing: border-box;

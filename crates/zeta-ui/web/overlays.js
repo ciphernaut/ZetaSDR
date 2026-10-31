@@ -124,7 +124,10 @@
 //         pointer-transparent. With a `job` that ov.retunable allows, in the wide footprint,
 //         it is draggable (class `retunable`, cursor grab): two `.outline-handle` children
 //         (data-edge `hi` at the top edge, `lo` at the bottom, HANDLE_PX tall, centred on the
-//         edge, ns-resize) resize that edge, the body moves the band. A press (button 0)
+//         edge, ns-resize) resize that edge, the body moves the band. A band shorter than
+//         3 × HANDLE_PX (12.5 kHz at a 1 MHz view) gets class `handles-out`: its handles sit
+//         outside it, `hi` ending at its top edge and `lo` starting at its bottom one, so the
+//         whole band stays body. A press (button 0)
 //         captures the pointer; each move maps the pointer's y through wf.hzForY: a move
 //         shifts both edges by the Hz travelled, an edge follows it, clamped so the band
 //         stays MIN_WIDTH_HZ wide (no snapping to any raster). Past DRAG_CLICK_PX of travel a
@@ -1178,8 +1181,11 @@ class Overlays {
       return;
     }
     o.el.hidden = false;
+    const h = Math.max(1, bottom - top);
     o.el.style.top = `${top}px`;
-    o.el.style.height = `${Math.max(1, bottom - top)}px`;
+    o.el.style.height = `${h}px`;
+    // A band too short for two handles and a body keeps its handles outside it.
+    o.el.classList.toggle("handles-out", h < 3 * HANDLE_PX);
     this.layoutTags();
   }
 
