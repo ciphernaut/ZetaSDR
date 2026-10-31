@@ -6,6 +6,7 @@ mod jsonlog;
 mod launch;
 mod persist;
 mod recover;
+mod retune;
 mod sources;
 pub mod watch;
 
@@ -160,8 +161,10 @@ struct JobEntry {
     /// (each node's in its stage's output order), set at launch; an attached job reads
     /// one of these.
     outputs: Vec<(StreamKind, StreamId)>,
-    /// Set while an elastic job is relaunched on a new capture: its supervisor then
-    /// leaves the record `Running` and the lease held for the relaunch.
+    /// Set while the job is relaunched under its id, by [`Inner::relaunch_elastic`] (an
+    /// elastic job on a new capture) or by [`Inner::relaunch_in_place`] (a
+    /// `job_retune`): its supervisor then leaves the record `Running` and the lease
+    /// held for the relaunch.
     relaunch: bool,
     /// Set by a stop under the source's gate ([`Inner::stop_gated`], a `replace`):
     /// the supervisor then does not idle the port, which would take that gate, and
@@ -1273,6 +1276,12 @@ impl Node {
     /// only once the guard is dropped.
     pub(crate) async fn after_gate(&self, after: AfterGate) {
         self.inner.after_gate(after).await;
+    }
+
+    /// The kind a job recorded as `kind` was expanded from, when the node expands its
+    /// graph; see [`Inner::expandable_kind`].
+    pub(crate) fn expandable_kind(&self, kind: &str) -> Option<JobKind> {
+        self.inner.expandable_kind(kind)
     }
 
     /// Idle `port` if nobody holds it; see [`LeaseManager::idle_if_unheld`]. Not

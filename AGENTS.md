@@ -149,6 +149,19 @@ CLI: `zeta job attach --kind transcribe --job <id>`
 
 Attach a processing chain to a running job's output instead of the radio: `transcribe` reads the job's audio (any demodulator, later any digital voice decoder), cleans it (denoise, voice gate) and emits one `transcript` event per utterance (`text`, `language`, `start_ns`, `end_ns`) plus `vad` events as speech starts and stops; it holds no lease and ends when the input job stops. `language` is a BCP-47 code (`null` means `en`; the backend's languages are in `GET /stt/languages`). To transcribe a station: `job_start` a `wfm_demod` on it, then `job_attach` with `kind: transcribe` and that job's id. The attached job fails with a reason naming the speech backend when the node has none or it cannot serve the language. Every other kind (`identify`, `watch`, the demodulators and decoders) runs on the radio and is refused here as `<kind> is not attachable`.
 
+### job_retune
+
+Retune a running job on the radio to a new band under the same id: under the source's gate its lease is moved to `center_hz`/`bandwidth_hz` (inside the current capture it is granted without a tune, whether or not another rigid job's band overlaps it; outside it the source is tuned when no other rigid job or pin holds it, else it is a `conflict` naming the holders and the job is left as it was), its graph is expanded again for the new band at the capture's rate and the job relaunched, `tuning` updated. Applies to a `running` job the node expanded and can re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum` (elastic or rigid) and `transcribe` (attached: retune its input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new graph or start a new job). A job that is not running is `job <id> is <state>`; an unknown id is `unknown`. The result is the job's id, as `job_start` answers.
+
+- job: string; an id from `job list`
+- center_hz: integer (Hz)
+- bandwidth_hz: integer (Hz)
+- replace: array; ids from `job list` (strings), `[]` for none
+
+JSON: `{"op":"job_retune","job":"<id>","center_hz":144800000,"bandwidth_hz":12500,"replace":[]}`
+
+CLI: `zeta job retune --job <id> --center-hz 144800000 --bandwidth-hz 12500`
+
 ### job_list
 
 JSON: `{"op":"job_list"}`

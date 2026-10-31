@@ -372,6 +372,52 @@ impl LeaseManager {
         r
     }
 
+    /// Move `holder`'s lease on `port` to `want` under the source's gate the caller
+    /// holds (a `job_retune`): the holder's own leases are set aside, then a band
+    /// inside the current capture is leased without a tune whatever else holds the
+    /// source (unless a time-shared lease does), so even a lone holder, whom
+    /// [`LeaseManager::ensure_locked`] would tune, keeps the capture; any other band
+    /// is leased as a rigid request (a tune when no other rigid lease or pin holds
+    /// the source, else a conflict). On an error the set-aside leases are put back.
+    /// Also whether it tuned the port.
+    pub(crate) async fn retune_locked(
+        &self,
+        port: &dyn Port,
+        holder: &JobId,
+        want: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(Tuning, bool), LeaseError> {
+        let source = port.id().clone();
+        self.assert_gate(&source, guard);
+        let old: Vec<Lease> = {
+            let mut leases = self.leases.lock().unwrap();
+            let v = leases.entry(source.clone()).or_default();
+            let old = v.iter().filter(|l| &l.job == holder).cloned().collect();
+            v.retain(|l| &l.job != holder);
+            let shared = v.iter().any(|l| l.time_shared);
+            if !shared && let Some(cur) = port.current().filter(|c| fits(&want, c)) {
+                v.push(Lease::new(holder.clone(), want, false));
+                return Ok((cur, false));
+            }
+            if v.is_empty() {
+                leases.remove(&source);
+            }
+            old
+        };
+        let r = self
+            .ensure_as(port, holder.clone(), want, false, false, guard)
+            .await;
+        if r.is_err() && !old.is_empty() {
+            self.leases
+                .lock()
+                .unwrap()
+                .entry(source)
+                .or_default()
+                .extend(old);
+        }
+        r
+    }
+
     /// [`LeaseManager::pin_locked`], taking the source's gate.
     pub async fn pin(&self, port: &dyn Port, want: Tuning) -> Result<(Tuning, bool), LeaseError> {
         let guard = self.gate_guard(port.id()).await;
@@ -947,6 +993,70 @@ mod tests {
         assert_eq!(step.await.unwrap(), None);
         assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn retune_locked_moves_a_lease_inside_the_capture_without_a_tune() {
+        let (p, m, j1) = (FakePort::new(), LeaseManager::new(), JobId::new());
+        let first = t(100_000_000, 1_000_000);
+        m.ensure(&p, j1.clone(), first, false).await.unwrap();
+        let want = t(100_200_000, 10_000);
+        let guard = m.gate_guard(p.id()).await;
+        assert_eq!(
+            m.retune_locked(&p, &j1, want, &guard).await.unwrap(),
+            (first, false)
+        );
+        assert_eq!(m.holders(p.id()), vec![(j1, want)]);
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retune_locked_tunes_outside_when_only_elastic_leases_remain_and_restores_on_a_conflict()
+     {
+        let (p, m, j1, e1, j2) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+            JobId::new(),
+        );
+        m.ensure(&p, j1.clone(), t(100_000_000, 1_000_000), false)
+            .await
+            .unwrap();
+        m.ensure(&p, e1, t(100_000_000, 1_000_000), true)
+            .await
+            .unwrap();
+        let far = t(433_000_000, 12_500);
+        let guard = m.gate_guard(p.id()).await;
+        assert_eq!(
+            m.retune_locked(&p, &j1, far, &guard).await.unwrap(),
+            (far, true)
+        );
+        assert_eq!(p.current(), Some(far));
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // A second rigid job inside the new capture, granted untuned.
+        let inside = t(433_001_000, 1_000);
+        assert_eq!(
+            m.ensure_locked(&p, j2.clone(), inside, false, &guard)
+                .await
+                .unwrap(),
+            (far, false)
+        );
+        match m
+            .retune_locked(&p, &j2, t(900_000_000, 1_000), &guard)
+            .await
+        {
+            Err(LeaseError::Conflict {
+                holders, current, ..
+            }) => {
+                assert_eq!(holders, vec![j1.clone()]);
+                assert_eq!(current, far);
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        // j2's lease is put back.
+        assert_eq!(m.holders(p.id()), vec![(j1, far), (j2, inside)]);
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

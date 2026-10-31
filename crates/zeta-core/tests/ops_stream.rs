@@ -410,6 +410,12 @@ fn op_name_matches_the_serialised_tag() {
             elastic: false,
             replace: vec![],
         },
+        Op::JobRetune {
+            job: JobId("j".into()),
+            center_hz: Hz(1),
+            bandwidth_hz: Hz(1),
+            replace: vec![],
+        },
         Op::JobList {},
         Op::JobStop {
             job: JobId("j".into()),

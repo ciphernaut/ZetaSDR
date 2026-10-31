@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::capture::{CaptureMeta, write_cf32};
 use crate::classify::{Band, Classification, Label, Tried};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
-use crate::job::JobRecord;
+use crate::job::{JobRecord, JobState};
 use crate::knowledge::{Allocation, Signature};
 use crate::lease::LeaseError;
 use crate::modes::{
@@ -155,6 +155,25 @@ pub enum Op {
         #[serde(deserialize_with = "nullable_string_value")]
         #[schemars(required, schema_with = "nullable_language")]
         language: Option<String>,
+    },
+    /// Retune a running job on the radio to a new band under the same id: under the
+    /// source's gate its lease is moved to `center_hz`/`bandwidth_hz` (inside the current
+    /// capture it is granted without a tune, whether or not another rigid job's band
+    /// overlaps it; outside it the source is tuned when no other rigid job or pin holds
+    /// it, else it is a `conflict` naming the holders and the job is left as it was), its
+    /// graph is expanded again for the new band at the capture's rate and the job
+    /// relaunched, `tuning` updated. Applies to a `running` job the node expanded and can
+    /// re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the
+    /// mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum`
+    /// (elastic or rigid) and `transcribe` (attached: retune its input), and for a job
+    /// whose graph an operator `graph_put` replaced (it launches as stored: put a new
+    /// graph or start a new job). A job that is not running is `job <id> is <state>`; an
+    /// unknown id is `unknown`. The result is the job's id, as `job_start` answers.
+    JobRetune {
+        job: JobId,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+        replace: Vec<JobId>,
     },
     JobList {},
     JobStop {
@@ -493,6 +512,32 @@ impl JobKind {
             "mode {id} is {state}: {}",
             m.reason.as_deref().unwrap_or_default()
         )))
+    }
+
+    /// Whether `job_retune` may move a running job of the kind to another band: the
+    /// kinds whose one band the node expands a graph for. Not a `spectrum` (it shows the
+    /// capture), a `scan` (it sweeps), an `identify` or a `watch` (controllers) or an
+    /// attached `transcribe` (its input is retuned instead).
+    pub fn retunable(&self) -> bool {
+        match self {
+            JobKind::Passthrough
+            | JobKind::FmDemod
+            | JobKind::WfmDemod
+            | JobKind::AmDemod
+            | JobKind::SsbDemod
+            | JobKind::AprsDecode
+            | JobKind::PocsagDecode
+            | JobKind::RdsDecode
+            | JobKind::AcarsDecode
+            | JobKind::AdsbDecode
+            | JobKind::Measure
+            | JobKind::Mode(_) => true,
+            JobKind::Spectrum
+            | JobKind::Scan
+            | JobKind::Identify
+            | JobKind::Watch
+            | JobKind::Transcribe => false,
+        }
     }
 
     /// Whether `job_start` may start the kind `elastic` (following the capture).
@@ -1535,6 +1580,7 @@ impl Op {
             Op::SourceSetGain { .. } => "source_set_gain",
             Op::JobStart { .. } => "job_start",
             Op::JobAttach { .. } => "job_attach",
+            Op::JobRetune { .. } => "job_retune",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
             Op::JobContext { .. } => "job_context",
@@ -2347,6 +2393,12 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             job,
             language,
         } => job_attach(node, kind, job, language).await,
+        Op::JobRetune {
+            job,
+            center_hz,
+            bandwidth_hz,
+            replace,
+        } => job_retune(node, job, center_hz, bandwidth_hz, replace).await,
         Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),
         Op::JobStop { job } => node
             .job_stop(&job)
@@ -2452,6 +2504,64 @@ async fn job_attach(
         .await
         .map(OpResult::Job)
         .map_err(|e| node_error(node, e))
+}
+
+/// `job_retune`: refuse what cannot be retuned (an attached job, an operator's graph, a
+/// kind the node does not expand or that is not retunable, a job that is not running, a
+/// `replace` naming the job itself), check the band against the source's ranges and the
+/// kind's row, then move the job's lease and relaunch it under its id.
+async fn job_retune(
+    node: &Node,
+    job: JobId,
+    center_hz: Hz,
+    bandwidth_hz: Hz,
+    replace: Vec<JobId>,
+) -> Result<OpResult, OpError> {
+    let Some(rec) = node.job_list().into_iter().find(|r| r.id == job) else {
+        return Err(unknown_job(node, &job));
+    };
+    if let Some(input) = &rec.input {
+        return Err(other(format!(
+            "{} is attached to job {}: retune that job",
+            rec.kind, input.0
+        )));
+    }
+    if rec.operator_graph {
+        return Err(other(format!(
+            "job {} runs an operator graph (graph_put): put a new graph or start a new job",
+            job.0
+        )));
+    }
+    let Some(kind) = node.expandable_kind(&rec.kind) else {
+        return Err(other(format!(
+            "{} is not a kind the node expands: start a new job",
+            rec.kind
+        )));
+    };
+    if !kind.retunable() {
+        return Err(other(format!("{} is not retunable", kind.name())));
+    }
+    if rec.state != JobState::Running {
+        let state = serde_json::to_value(&rec.state).unwrap_or_default();
+        let status = state["status"].as_str().unwrap_or_default();
+        return Err(other(format!("job {} is {status}", job.0)));
+    }
+    if replace.contains(&job) {
+        return Err(other(format!("job {} cannot replace itself", job.0)));
+    }
+    let want = Tuning {
+        center_hz,
+        bandwidth_hz,
+    };
+    let port = checked_port(node, &rec.source, &want)?;
+    kind.mode_row(&node.modes())?;
+    match node.job_retune(&job, &kind, want, &replace).await {
+        Ok(()) => Ok(OpResult::Job(job)),
+        Err(e) => {
+            idle_after_replace(node, port.as_ref(), &replace, &e).await;
+            Err(node_error(node, e))
+        }
+    }
 }
 
 /// The ring's sample rate and centre and the selection's samples, once the

@@ -874,7 +874,7 @@ impl Inner {
     /// meanwhile or a later run took the job's entry (see [`JobEntry::run`]).
     /// A failed write keeps the new state in memory and is reported through
     /// `persist_errors`; the job will be resumed on the next `open`.
-    fn finish(&self, id: &JobId, run: u64, state: JobState) {
+    pub(super) fn finish(&self, id: &JobId, run: u64, state: JobState) {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(entry) = jobs.get_mut(id)
             && entry.run == run
