@@ -111,7 +111,7 @@ pub(crate) struct Link {
 }
 
 impl Link {
-    fn new(stdin: ChildStdin) -> Self {
+    pub(crate) fn new(stdin: ChildStdin) -> Self {
         Link {
             stdin: tokio::sync::Mutex::new(Some(stdin)),
             pending: Mutex::new(HashMap::new()),

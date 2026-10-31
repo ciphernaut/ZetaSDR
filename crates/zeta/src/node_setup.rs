@@ -22,6 +22,7 @@ use zeta_source_file::{FileOpts, FileSource};
 use zeta_source_kiwi::{KiwiConfig, KiwiSource};
 use zeta_source_node::{NodePort, NodeSourceConfig};
 use zeta_source_vrt::VrtSourceConfig;
+use zeta_source_worker::port::WorkerPort;
 use zeta_speech::{SpeechBackend, TranscribeStage};
 
 use crate::sources::{PluginSpec, SourceSpec};
@@ -194,18 +195,19 @@ const NEVER_SEEN: &str = "never seen on this host; plug it in once";
 /// A device absent at startup attaches faulted (and is polled for) when the source
 /// record in `state_dir` holds the capabilities an earlier open cached; never seen, it
 /// is refused. `in_process` (`--soapy-in-process`) opens the driver here instead, the
-/// path before workers existed, for diagnosis.
+/// path before workers existed, for diagnosis. The worker port is also returned on its
+/// own, to be closed before the process exits.
 #[cfg(soapy)]
 async fn open_soapy(
     id: &str,
     args: &str,
     in_process: bool,
     state_dir: &Path,
-) -> Result<Arc<dyn Port>, String> {
-    use zeta_source_worker::port::{Timings, WorkerConfig, WorkerPort};
+) -> Result<(Arc<dyn Port>, Option<Arc<WorkerPort>>), String> {
+    use zeta_source_worker::port::{Timings, WorkerConfig};
     if in_process {
         return zeta_source_soapy_driver::open(SourceId(id.to_owned()), args)
-            .map(|s| Arc::new(s) as Arc<dyn Port>)
+            .map(|s| (Arc::new(s) as Arc<dyn Port>, None))
             .map_err(|e| e.to_string());
     }
     let program = worker_program()?;
@@ -224,7 +226,7 @@ async fn open_soapy(
     match WorkerPort::open(cfg, cached).await {
         // A hello, or a device not found that was seen before: the supervisor has
         // logged that it is waiting for the device, and the port is faulted until then.
-        Ok((port, _attach)) => Ok(port as Arc<dyn Port>),
+        Ok((port, _attach)) => Ok((port.clone() as Arc<dyn Port>, Some(port))),
         Err(e) if !seen && e.starts_with("device not found: ") => {
             Err(format!("{e} ({NEVER_SEEN})"))
         }
@@ -253,7 +255,7 @@ async fn open_soapy(
     _args: &str,
     _in_process: bool,
     _state_dir: &Path,
-) -> Result<Arc<dyn Port>, String> {
+) -> Result<(Arc<dyn Port>, Option<Arc<WorkerPort>>), String> {
     Err(NO_SOAPY.into())
 }
 
@@ -285,17 +287,27 @@ async fn with_plugins(
     Ok(reg)
 }
 
-/// The `--source-node` ports of an opened node, kept to stop their remote jobs on exit.
+/// The ports of an opened node that must be closed before the process exits: the
+/// `--source-node` ports, whose remote jobs are stopped, and the soapy worker ports,
+/// whose children are shut down.
 #[derive(Default)]
-pub struct RemotePorts(Vec<Arc<NodePort>>);
+pub struct RemotePorts {
+    nodes: Vec<Arc<NodePort>>,
+    workers: Vec<Arc<WorkerPort>>,
+}
 
 impl RemotePorts {
-    /// Stop every remote `passthrough` job and wait for each node to confirm. Call before
-    /// the process exits: the stop a dropped port spawns never runs once the runtime is
-    /// shutting down.
+    /// Stop every remote `passthrough` job and wait for each node to confirm, then shut
+    /// every worker down and wait for it to be reaped (each bounded by its shutdown
+    /// grace plus a second). Call before the process exits: what a dropped port starts
+    /// runs on a task the runtime aborts as it shuts down, so a remote job would be left
+    /// running and a worker SIGKILLed with its device mid-stream.
     pub async fn close(&self) {
-        for p in &self.0 {
+        for p in &self.nodes {
             p.close().await;
+        }
+        for w in &self.workers {
+            w.close().await;
         }
     }
 }
@@ -384,7 +396,8 @@ pub async fn load_modes(
 }
 
 /// [`open`] on rows already loaded by [`load_modes`] (their registry and the operator
-/// directory it used).
+/// directory it used). A node that fails to open closes the ports it had opened (see
+/// [`RemotePorts::close`]) before the error is returned.
 pub async fn open_with(
     state_dir: PathBuf,
     registry: StageRegistry,
@@ -394,6 +407,40 @@ pub async fn open_with(
     resume: bool,
     ring_budget_mb: Option<u64>,
 ) -> Result<(Node, RemotePorts), String> {
+    let mut remotes = RemotePorts::default();
+    let opened = open_into(
+        state_dir,
+        registry,
+        modes,
+        modes_dir,
+        sources,
+        resume,
+        ring_budget_mb,
+        &mut remotes,
+    )
+    .await;
+    match opened {
+        Ok(node) => Ok((node, remotes)),
+        Err(e) => {
+            remotes.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// The body of [`open_with`]: each port that must be closed is added to `remotes` as
+/// it opens, so a failure later on still closes it.
+#[allow(clippy::too_many_arguments)]
+async fn open_into(
+    state_dir: PathBuf,
+    registry: StageRegistry,
+    modes: Arc<ModeRegistry>,
+    modes_dir: Option<PathBuf>,
+    sources: &[SourceSpec],
+    resume: bool,
+    ring_budget_mb: Option<u64>,
+    remotes: &mut RemotePorts,
+) -> Result<Node, String> {
     let opts = FileOpts {
         realtime: true,
         block_samples: 4800,
@@ -402,7 +449,6 @@ pub async fn open_with(
     };
     let mut files = Vec::new();
     let mut ports: Vec<Arc<dyn Port>> = Vec::new();
-    let mut remotes = RemotePorts::default();
     for spec in sources {
         let flag = |e: &dyn std::fmt::Display| format!("{spec}: {e}");
         let id = SourceId(spec.id().to_owned());
@@ -444,7 +490,7 @@ pub async fn open_with(
                     max_bandwidth_hz: *max_bandwidth_hz,
                 };
                 let p = Arc::new(NodePort::open(cfg).await.map_err(|e| flag(&e))?);
-                remotes.0.push(p.clone());
+                remotes.nodes.push(p.clone());
                 ports.push(p);
             }
             SourceSpec::Vrt { bind, .. } => {
@@ -454,9 +500,10 @@ pub async fn open_with(
             }
             SourceSpec::Soapy { args, .. } => {
                 let in_process = SOAPY_IN_PROCESS.load(std::sync::atomic::Ordering::Relaxed);
-                let p = open_soapy(spec.id(), args, in_process, &state_dir)
+                let (p, worker) = open_soapy(spec.id(), args, in_process, &state_dir)
                     .await
                     .map_err(|e| flag(&e))?;
+                remotes.workers.extend(worker);
                 ports.push(p);
             }
         }
@@ -492,7 +539,7 @@ pub async fn open_with(
     for c in zeta_dsp::classifiers(node.modes()) {
         node.add_classifier(c);
     }
-    Ok((node, remotes))
+    Ok(node)
 }
 
 #[cfg(test)]

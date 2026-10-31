@@ -555,3 +555,37 @@ async fn a_hello_of_another_protocol_is_refused_and_the_child_reaped() {
         .unwrap();
     assert!(!alive(pid), "worker {pid} still exists");
 }
+
+#[test]
+fn close_shuts_the_worker_down_before_the_runtime_ends() {
+    // As the node's `main` ends: the port is closed, then the runtime is torn
+    // down at once. The worker must have read `shutdown` and left `serve`
+    // (its `served` line), not been killed with the runtime.
+    let dir = tempdir();
+    let rec = dir.path().join("record");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pid = rt.block_on(async {
+        let (port, _) = open(cfg_recorded("stream", &rec), None).await;
+        port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+        let pid = port.worker().unwrap().pid.unwrap();
+        // Held elsewhere, as the node holds every port: closing must not wait
+        // for the last reference.
+        let held = port.clone();
+        drop(port);
+        let t0 = Instant::now();
+        held.close().await;
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        // A second close is a no-op.
+        held.close().await;
+        assert_eq!(
+            held.fault().as_deref(),
+            Some("soapy worker for f: shut down")
+        );
+        drop(held);
+        pid
+    });
+    drop(rt);
+    assert!(!alive(pid), "worker {pid} outlived the close");
+    let text = std::fs::read_to_string(&rec).unwrap();
+    assert!(text.lines().any(|l| l == "served"), "{text}");
+}

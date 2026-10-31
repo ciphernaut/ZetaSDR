@@ -43,6 +43,10 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// depend on the driver crate.
 pub const TUNE_TIMEOUT: Duration = Duration::from_secs(7);
 
+/// What [`WorkerPort::close`] allows beyond the shutdown grace: the kill and
+/// reap of a worker that outlived it, and the reader threads' join.
+const CLOSE_SLACK: Duration = Duration::from_secs(1);
+
 /// How long a request that lost its worker waits for the reap to close the
 /// link: the reap waits up to `READER_JOIN` for the reader threads, then
 /// closes it at once.
@@ -108,7 +112,12 @@ pub struct WorkerPort {
     next_request: AtomicU64,
     healed: watch::Receiver<u64>,
     /// Dropped or fired to stop the supervisor, which shuts the worker down.
-    cancel: Option<oneshot::Sender<()>>,
+    /// Taken by the first [`WorkerPort::close`] or by `Drop`.
+    cancel: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    /// Turns true once the supervisor has returned, its worker reaped.
+    done: watch::Receiver<bool>,
+    /// How long [`WorkerPort::close`] waits for `done`.
+    close_bound: Duration,
 }
 
 impl WorkerPort {
@@ -130,8 +139,13 @@ impl WorkerPort {
         let (healed_tx, healed) = watch::channel(0);
         let (cancel, cancel_rx) = oneshot::channel();
         let (first_tx, first_rx) = oneshot::channel();
+        let (done_tx, done) = watch::channel(false);
+        let close_bound = cfg.timings.shutdown_grace.saturating_add(CLOSE_SLACK);
         let supervisor = Supervisor::new(cfg, shared.clone(), healed_tx, cached);
-        tokio::spawn(supervisor.run(cancel_rx, first_tx));
+        tokio::spawn(async move {
+            supervisor.run(cancel_rx, first_tx).await;
+            done_tx.send_replace(true);
+        });
         let first = first_rx
             .await
             .map_err(|_| format!("soapy worker for {}: supervisor ended", id.0))?;
@@ -152,9 +166,37 @@ impl WorkerPort {
             gate: tokio::sync::Mutex::new(()),
             next_request: AtomicU64::new(1),
             healed,
-            cancel: Some(cancel),
+            cancel: std::sync::Mutex::new(Some(cancel)),
+            done,
+            close_bound,
         };
         Ok((Arc::new(port), attach))
+    }
+
+    /// Shut the worker down and wait until it is reaped: `shutdown` on its
+    /// stdin, the grace to exit (the device closes on the way out), then the
+    /// kill. Call it before the process exits: the shutdown `Drop` starts runs
+    /// on the supervisor task, which a runtime tearing down aborts midway,
+    /// leaving the child to the kill-on-drop SIGKILL and the device mid-stream.
+    /// It works while other references to the port remain (the node holds
+    /// one), is bounded by the shutdown grace plus a second, and a second call
+    /// only waits for the first.
+    pub async fn close(&self) {
+        let cancel = self.cancel.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(c) = cancel {
+            let _ = c.send(());
+        }
+        let mut done = self.done.clone();
+        if tokio::time::timeout(self.close_bound, done.wait_for(|d| *d))
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "zeta: soapy worker for {}: not shut down within {} s",
+                self.id.0,
+                self.close_bound.as_secs_f64()
+            );
+        }
     }
 
     /// Refuse a band the device cannot take before anything is sent, with the
@@ -197,7 +239,7 @@ impl WorkerPort {
     /// Send `cmd` to the live worker and wait for its reply. No live worker
     /// answers at once with the current fault; a worker that ends before it
     /// replies answers with the fault its end left.
-    async fn request(&self, cmd: Cmd, what: &str) -> Result<Reply, PortError> {
+    async fn request(&self, cmd: Cmd, what: &str) -> Result<(Reply, Arc<Link>), PortError> {
         // Taken out first: `down` locks the snapshot again.
         let link = self.shared.snapshot().link.clone();
         let Some(link) = link else {
@@ -209,7 +251,7 @@ impl WorkerPort {
             Err(_) => return Err(self.ended(&link).await),
         };
         match tokio::time::timeout(TUNE_TIMEOUT, reply).await {
-            Ok(Ok(r)) => r,
+            Ok(Ok(r)) => r.map(|r| (r, link)),
             Ok(Err(_)) => Err(self.ended(&link).await),
             Err(_) => {
                 link.forget(id);
@@ -220,6 +262,29 @@ impl WorkerPort {
                 )))
             }
         }
+    }
+}
+
+/// Record a tune the worker on `link` confirmed: the band, and the faults
+/// cleared, as a successful tune heals a source. Only while that worker is
+/// still the live one: a reply read just before its worker died can reach
+/// here after the reap set the fault the death left (or after a fresh worker
+/// reported a fault of its own), and must not wipe it.
+fn settle_tune(shared: &Shared, link: &Arc<Link>, got: Tuning) {
+    let mut s = shared.snapshot();
+    if s.link.as_ref().is_some_and(|l| Arc::ptr_eq(l, link)) {
+        s.current = Some(got);
+        s.worker_fault = None;
+        s.supervision_fault = None;
+    }
+}
+
+/// Record a gain the worker on `link` confirmed, while it is the live one
+/// (see [`settle_tune`]); the next worker reports its own in its hello.
+fn settle_gain(shared: &Shared, link: &Arc<Link>, g: GainInfo) {
+    let mut s = shared.snapshot();
+    if s.link.as_ref().is_some_and(|l| Arc::ptr_eq(l, link)) {
+        s.gain = Some(g);
     }
 }
 
@@ -245,7 +310,8 @@ impl Drop for WorkerPort {
     /// kills and reaps the worker. The child is also spawned kill-on-drop, so
     /// a runtime that ends before the supervisor runs still takes it down.
     fn drop(&mut self) {
-        if let Some(c) = self.cancel.take() {
+        let cancel = self.cancel.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cancel.take() {
             let _ = c.send(());
         }
     }
@@ -269,14 +335,11 @@ impl Port for WorkerPort {
             bandwidth_hz: t.bandwidth_hz.0,
         };
         match self.request(cmd, "tune").await? {
-            Reply::Tuning(got) => {
-                let mut s = self.shared.snapshot();
-                s.current = Some(got);
-                s.worker_fault = None;
-                s.supervision_fault = None;
+            (Reply::Tuning(got), link) => {
+                settle_tune(&self.shared, &link, got);
                 Ok(got)
             }
-            r => Err(unexpected(&self.id, "tune", &r)),
+            (r, _) => Err(unexpected(&self.id, "tune", &r)),
         }
     }
 
@@ -306,11 +369,11 @@ impl Port for WorkerPort {
             .request(Cmd::SetGain { gain_db: db }, "set_gain")
             .await?
         {
-            Reply::Gain(g) => {
-                self.shared.snapshot().gain = Some(g);
+            (Reply::Gain(g), link) => {
+                settle_gain(&self.shared, &link, g);
                 Ok(g)
             }
-            r => Err(unexpected(&self.id, "set_gain", &r)),
+            (r, _) => Err(unexpected(&self.id, "set_gain", &r)),
         }
     }
 
@@ -325,5 +388,72 @@ impl Port for WorkerPort {
             restarts: s.restarts,
             since_ns: s.since_ns,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeta_core::types::Hz;
+
+    /// A link over the stdin of a `cat` child: the settle functions only
+    /// compare links, nothing is written.
+    fn link() -> (tokio::process::Child, Arc<Link>) {
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        (child, Arc::new(Link::new(stdin)))
+    }
+
+    fn tuning() -> Tuning {
+        Tuning {
+            center_hz: Hz(100_000_000),
+            bandwidth_hz: Hz(2_000_000),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_reply_from_a_reaped_worker_leaves_its_fault() {
+        let shared = Shared::new(SourceId("f".into()));
+        let (_old_child, old) = link();
+        let (_new_child, new) = link();
+        // The worker the tune went through died and was reaped: no link, the
+        // fault its end left.
+        shared.snapshot().supervision_fault = Some("died".into());
+        settle_tune(&shared, &old, tuning());
+        let g = GainInfo {
+            db: Some(10.0),
+            min_db: 0.0,
+            max_db: 60.0,
+            automatic: false,
+            automatic_available: true,
+        };
+        settle_gain(&shared, &old, g);
+        {
+            let s = shared.snapshot();
+            assert_eq!(s.fault().as_deref(), Some("died"));
+            assert_eq!(s.current, None);
+            assert_eq!(s.gain, None);
+        }
+        // A fresh worker is live now and reports a fault of its own: the old
+        // worker's reply must not clear it either.
+        {
+            let mut s = shared.snapshot();
+            s.link = Some(new.clone());
+            s.worker_fault = Some("overflow".into());
+        }
+        settle_tune(&shared, &old, tuning());
+        assert_eq!(shared.snapshot().fault().as_deref(), Some("overflow"));
+        // The live worker's own reply heals.
+        settle_tune(&shared, &new, tuning());
+        settle_gain(&shared, &new, g);
+        let s = shared.snapshot();
+        assert_eq!(s.fault(), None);
+        assert_eq!(s.supervision_fault, None);
+        assert_eq!(s.current, Some(tuning()));
+        assert_eq!(s.gain, Some(g));
     }
 }
