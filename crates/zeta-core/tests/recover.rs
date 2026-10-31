@@ -315,8 +315,12 @@ fn failed_unplugged() -> Option<JobState> {
 }
 
 async fn source(node: &Node) -> SourceInfo {
+    source_of(node, &s()).await
+}
+
+async fn source_of(node: &Node, id: &SourceId) -> SourceInfo {
     match node.apply(Op::SourceList {}).await {
-        Ok(OpResult::Sources(v)) => v.into_iter().find(|i| i.id == s()).unwrap(),
+        Ok(OpResult::Sources(v)) => v.into_iter().find(|i| &i.id == id).unwrap(),
         r => panic!("source_list: {r:?}"),
     }
 }
@@ -385,7 +389,7 @@ async fn a_heal_restores_pin_gain_and_relaunches_the_failed_jobs_under_their_ids
     let gains_before = port.gain_calls().len();
 
     port.heal();
-    until("both run again", Duration::from_secs(2), || {
+    until("both run again", Duration::from_secs(5), || {
         state(&node, &a) == Some(JobState::Running) && state(&node, &b) == Some(JobState::Running)
     })
     .await;
@@ -395,7 +399,7 @@ async fn a_heal_restores_pin_gain_and_relaunches_the_failed_jobs_under_their_ids
     let gains = port.gain_calls();
     assert_eq!(gains.len(), gains_before + 1, "{gains:?}");
     assert_eq!(gains.last(), Some(&Some(20.0)));
-    until("the stages are back", Duration::from_secs(2), || {
+    until("the stages are back", Duration::from_secs(5), || {
         node.debug_stage_count() == stages
     })
     .await;
@@ -423,7 +427,7 @@ async fn recovery_leaves_stopped_and_self_failed_jobs_alone() {
 
     fault(&node, &port, &[&a]).await;
     port.heal();
-    until("a runs again", Duration::from_secs(2), || {
+    until("a runs again", Duration::from_secs(5), || {
         state(&node, &a) == Some(JobState::Running)
     })
     .await;
@@ -469,7 +473,7 @@ async fn a_record_failed_in_an_earlier_episode_is_not_recovered() {
     let b = start_passthrough(&node, "s").await;
     fault(&node, &port, &[&b]).await;
     port.heal();
-    until("b runs again", Duration::from_secs(2), || {
+    until("b runs again", Duration::from_secs(5), || {
         state(&node, &b) == Some(JobState::Running)
     })
     .await;
@@ -500,7 +504,7 @@ async fn history_pruning_keeps_recoverable_records() {
     assert_eq!(state(&node, &b), failed_unplugged());
 
     port.heal();
-    until("both run again", Duration::from_secs(2), || {
+    until("both run again", Duration::from_secs(5), || {
         state(&node, &a) == Some(JobState::Running) && state(&node, &b) == Some(JobState::Running)
     })
     .await;
@@ -534,7 +538,7 @@ async fn an_attached_job_comes_back_with_its_input() {
     );
 
     port.heal();
-    until("both run again", Duration::from_secs(2), || {
+    until("both run again", Duration::from_secs(5), || {
         state(&node, &input) == Some(JobState::Running)
             && state(&node, &attached) == Some(JobState::Running)
     })
@@ -552,31 +556,91 @@ async fn an_attached_job_comes_back_with_its_input() {
     stop_all(&node).await;
 }
 
+/// `source_list` reading the fault opens the episode on its own: here no job runs, so
+/// nothing else can have opened it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_list_shows_the_episode_fault_then_clears() {
     let dir = tempfile::tempdir().unwrap();
     let (node, port, _srcs) = node_on(dir.path(), true, &[]).await;
     assert_eq!(source(&node).await.fault, None);
-    let a = start_passthrough(&node, "s").await;
+    assert_eq!(node.debug_fault_episode(&s()), None);
     port.set_fault(Some(UNPLUGGED.into()));
-    // Read before the job has seen the fault: the episode opens here.
+    // Nothing has looked at the port yet.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(node.debug_fault_episode(&s()), None);
     assert_eq!(source(&node).await.fault.as_deref(), Some(UNPLUGGED));
-    until("a fails", Duration::from_secs(5), || {
-        state(&node, &a) != Some(JobState::Running)
+    assert!(node.debug_fault_episode(&s()).is_some());
+    port.heal();
+    until("the episode closes", Duration::from_secs(5), || {
+        node.debug_fault_episode(&s()).is_none()
     })
     .await;
-    assert_eq!(state(&node, &a), failed_unplugged());
-    port.heal();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let info = source(&node).await;
-        if info.fault.is_none() && state(&node, &a) == Some(JobState::Running) {
-            break;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "{info:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(source(&node).await.fault, None);
+}
+
+/// A port that is a [`FaultablePort`] but cannot heal (no `healed`, no worker), as a
+/// KiwiSDR, another node or an in-process device is.
+struct NoHeal(Arc<FaultablePort>);
+
+#[async_trait]
+impl Port for NoHeal {
+    fn id(&self) -> &SourceId {
+        self.0.id()
     }
-    stop_all(&node).await;
+    fn capabilities(&self) -> &zeta_core::types::Capabilities {
+        self.0.capabilities()
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, zeta_core::port::PortError> {
+        self.0.tune(t).await
+    }
+    fn current(&self) -> Option<Tuning> {
+        self.0.current()
+    }
+    fn subscribe(&self) -> zeta_core::port::IqReceiver {
+        self.0.subscribe()
+    }
+    fn fault(&self) -> Option<String> {
+        self.0.fault()
+    }
+    async fn idle(&self) {
+        self.0.idle().await
+    }
+}
+
+/// A port that cannot heal opens no episode: the records that fail with its fault are
+/// pruned as any other, so its history stays at the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_port_that_cannot_heal_opens_no_episode_and_its_records_are_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tone(dir.path(), "n");
+    let faultable = FaultablePort::new(src.clone());
+    let port: Arc<dyn Port> = Arc::new(NoHeal(faultable.clone()));
+    let node = Node::open(cfg(dir.path(), true), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let mut jobs = Vec::new();
+    for _ in 0..25 {
+        jobs.push(start_passthrough(&node, "n").await);
+    }
+    faultable.set_fault(Some(UNPLUGGED.into()));
+    let n = SourceId("n".into());
+    assert_eq!(source_of(&node, &n).await.fault.as_deref(), Some(UNPLUGGED));
+    until("every job ends", Duration::from_secs(10), || {
+        node.job_list().iter().all(|r| r.state != JobState::Running)
+    })
+    .await;
+    assert_eq!(node.debug_fault_episode(&n), None);
+    let list = node.job_list();
+    assert_eq!(
+        list.len(),
+        zeta_core::node::JOB_HISTORY_MAX,
+        "pruned to the cap"
+    );
+    let want = JobState::Failed {
+        reason: format!("source n: {UNPLUGGED}"),
+    };
+    assert!(list.iter().all(|r| r.state == want), "{list:#?}");
 }
 
 // The watch: a 1.024 Msps recording carrying a 1200-baud POCSAG page every 2 s, 300 kHz

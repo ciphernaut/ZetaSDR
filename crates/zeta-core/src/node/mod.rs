@@ -1428,6 +1428,13 @@ impl Node {
         self.inner.stages.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// When `source`'s open fault episode began (see [`recover::Episode`]), if one is
+    /// open, for tests of what opens and closes it.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn debug_fault_episode(&self, source: &SourceId) -> Option<u64> {
+        self.inner.episode_since(source)
+    }
+
     /// Hold `source`'s gate, for tests of what waits on it.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub async fn debug_gate(&self, source: &SourceId) -> OwnedMutexGuard<()> {

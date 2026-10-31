@@ -35,7 +35,10 @@ const ENDED_WAIT: Duration = Duration::from_secs(10);
 
 /// A source's fault episode: open from the first time the node sees the source's port
 /// faulted (a job failing with the `source <id>: ` prefix, `source_list` reading the
-/// fault, a tune the faulted port refused) until the heal that recovers the source. A
+/// fault, a tune the faulted port refused) until the heal that recovers the source. Only
+/// a port that can heal ([`Port::healed`] is `Some`, a supervised worker) has episodes:
+/// for any other (a KiwiSDR, another node, a VRT sender, an in-process device) no heal
+/// would ever close one, and its failed records would escape the history prune forever. A
 /// record is recovered only when it ended inside the episode (`JobEntry::ended_ns` at
 /// or after `since_ns`), so the heal never relaunches a record an operator or an earlier
 /// fault left failed. Kept in memory only: a node restart starts a fresh episode, as
@@ -107,8 +110,12 @@ impl Inner {
 
     /// Open `source`'s fault episode unless one is open (see [`Episode`]). Call it before
     /// the record that saw the fault is stamped with its end, so that record falls
-    /// inside the episode.
+    /// inside the episode. A no-op for a source whose port cannot heal: nothing would
+    /// close the episode.
     pub(super) fn note_fault(&self, source: &SourceId) {
+        if self.port(source).is_none_or(|p| p.healed().is_none()) {
+            return;
+        }
         self.episodes
             .lock()
             .unwrap()
@@ -122,6 +129,15 @@ impl Inner {
         if self.port(source).is_some_and(|p| p.fault().is_some()) {
             self.note_fault(source);
         }
+    }
+
+    /// When `source`'s open fault episode began, if one is open.
+    pub(super) fn episode_since(&self, source: &SourceId) -> Option<u64> {
+        self.episodes
+            .lock()
+            .unwrap()
+            .get(source)
+            .map(|e| e.since_ns)
     }
 
     /// Whether `jobs` entry `e` is to be kept from the history prune: it is recoverable
