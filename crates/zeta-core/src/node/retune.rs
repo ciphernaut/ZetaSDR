@@ -116,12 +116,14 @@ impl Inner {
     /// id, the record staying `Running` and the lease held throughout: the old run's
     /// supervisor, seeing `relaunch` (see [`super::JobEntry::relaunch`]), releases
     /// nothing but its streams and idles nothing. With `gate` (the source's gate,
-    /// held by the caller) the launch leases under it, as
-    /// [`Inner::launch_gated`] does, and what must wait for the gate is returned. A
-    /// launch that fails releases the lease and ends the job `Failed` with the reason;
-    /// the port is not idled here (the caller idles it once the gate is let go). A job
-    /// without a live run (stopped meanwhile) is `Stopped`, its lease released and
-    /// nothing else done.
+    /// held by the caller) the launch leases under it, as [`Inner::launch_gated`]
+    /// does, and what must wait for the gate is returned. The old run is awaited
+    /// through its `ended` (released and unregistered), never its supervisor's handle,
+    /// so a supervisor that goes on to idle the port (a run that ended on its own)
+    /// cannot deadlock on the gate held here. A launch that fails releases the lease
+    /// and ends the job `Failed` with the reason; the port is not idled here (the
+    /// caller idles it once the gate is let go). A job without a live run (stopped
+    /// meanwhile) is `Stopped`, its lease released and nothing else done.
     ///
     /// [`Inner::relaunch_elastic`] does the same for the elastic jobs a tune moved.
     pub(super) async fn relaunch_in_place(
@@ -130,7 +132,7 @@ impl Inner {
         gate: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<(), NodeError>, AfterGate) {
         let id = rec.id.clone();
-        let (run, done, ended) = {
+        let (run, ended) = {
             let mut jobs = self.jobs.lock().unwrap();
             let Some(e) = jobs
                 .get_mut(&id)
@@ -146,18 +148,17 @@ impl Inner {
             if let Some(cancel) = e.cancel.take() {
                 cancel.cancel();
             }
-            (e.run, e.done.take(), e.ended.clone())
+            // Detached, never awaited: see below.
+            drop(e.done.take());
+            (e.run, e.ended.clone())
         };
-        // A launch still on its way to setting `done` ends on the cancelled token:
-        // wait for its run to end all the same.
-        match (done, ended) {
-            (Some(h), _) => {
-                let _ = h.await;
-            }
-            (None, Some(mut ended)) => {
-                let _ = ended.changed().await;
-            }
-            (None, None) => {}
+        // Wait for the run to release and unregister (its `ended` closes), never for
+        // its supervisor to return: a run that ended on its own just before `relaunch`
+        // was set goes on to idle the port, which takes the source's gate the caller
+        // may hold (as a gated stop waits, see `Inner::stop_with`). Such a run is
+        // recorded ended, and `record_running` then refuses the relaunch as `Stopped`.
+        if let Some(mut ended) = ended {
+            let _ = ended.changed().await;
         }
         let (r, after) = self.launch_gated(rec, gate).await;
         if let Err(e) = &r {
