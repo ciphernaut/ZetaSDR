@@ -98,6 +98,12 @@ pub enum NodeError {
     Graph(#[from] GraphError),
     #[error(transparent)]
     Lease(#[from] LeaseError),
+    /// The source's port refused the tune a job's lease needed (a faulted device that
+    /// cannot be opened, a band outside its range). Displayed under the source's name,
+    /// as [`source_fault_reason`] words it, so a `job_start` against a faulted source
+    /// reads the same as a job that failed on it.
+    #[error("{}", source_fault_reason(.0, .1))]
+    SourcePort(SourceId, PortError),
     #[error("io: {0}")]
     Io(String),
     /// An attached job's input job is not running in this node.
@@ -580,6 +586,13 @@ fn resume_capture(
     elastic.into_iter().find(|t| contains(t))
 }
 
+/// A job's failure caused by its source's port, `source <id>: <error>`: the reason every
+/// fault-caused failure carries (a stage that saw the fault, a launch whose tune the port
+/// refused), so the node's recovery of the source can find the jobs it should relaunch.
+pub(crate) fn source_fault_reason(source: &SourceId, e: &dyn std::fmt::Display) -> String {
+    format!("source {}: {e}", source.0)
+}
+
 /// A port's refusal of a gain as the node reports it: an `Unsupported` text
 /// verbatim (it names the source and the range), an I/O failure as `Io`.
 fn gain_error(e: PortError) -> NodeError {
@@ -748,9 +761,11 @@ impl Node {
                 continue;
             }
             let mut failed = rec.clone();
+            let rec_source = rec.source.clone();
             if let Err(e) = node.inner.launch(rec).await {
                 let reason = match e {
                     NodeError::UnknownSource(s) => format!("source {} not present", s.0),
+                    NodeError::Lease(LeaseError::Port(e)) => source_fault_reason(&rec_source, &e),
                     e => e.to_string(),
                 };
                 failed.state = JobState::Failed { reason };

@@ -1468,3 +1468,46 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
     assert_eq!(holders, [measure]);
     stop_all(&node).await;
 }
+
+/// A fault of the watch's own port fails the watch under the source's name and leaves its
+/// decoders to fail on their own with the same prefix, not stopped by the watch: the
+/// node's recovery relaunches them with the watch, whose next run re-adopts them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_whose_port_faults_leaves_its_decoders_to_fail_on_their_own() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let src = file_source("rx", &fixtures().pocsag);
+    let port = zeta_core::test_fixtures::FaultablePort::new(src.clone());
+    let node = node_over(dir.path(), vec![(port.clone(), src)], None).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    port.set_fault(Some("device unplugged".into()));
+    let failed = Some(JobState::Failed {
+        reason: "source rx: device unplugged".into(),
+    });
+    until("the watch fails", Duration::from_secs(10), || {
+        matches!(state(&node, &watch), Some(JobState::Failed { .. }))
+    })
+    .await;
+    assert_eq!(state(&node, &watch), failed);
+    until("the decoder ends", Duration::from_secs(10), || {
+        state(&node, &job) != Some(JobState::Running)
+    })
+    .await;
+    assert_eq!(state(&node, &job), failed);
+    assert!(events.watch("lost").is_empty(), "{:#?}", events.all());
+    assert!(
+        decoding(&node, &watch)
+            .iter()
+            .any(|d| d["job"] == job.0.as_str()),
+        "{:?}",
+        node.job_context(&watch)
+    );
+    until("no lease", Duration::from_secs(5), || {
+        node.lease_holders(&rx()).is_empty()
+    })
+    .await;
+}

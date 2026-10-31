@@ -647,3 +647,67 @@ async fn launch_registers_every_output_of_a_multi_output_stage() {
     assert_eq!(kinds, ["Audio", "Audio", "Event", "Iq"]);
     assert!(event(&node, &chained, "two", 2000).await.is_some());
 }
+
+/// [`port`] behind a [`zeta_core::test_fixtures::FaultablePort`] the test can fault.
+#[cfg(feature = "test-fixtures")]
+fn faultable(
+    dir: &Path,
+) -> (
+    Arc<FileSource>,
+    Arc<zeta_core::test_fixtures::FaultablePort>,
+) {
+    let (src, _) = port(dir);
+    let port = zeta_core::test_fixtures::FaultablePort::new(src.clone());
+    (src, port)
+}
+
+/// An input that died of its source's fault fails the attached job as an input that is
+/// not running, the reason a resume reads as "relaunch me once the input runs again", so
+/// the node's recovery of the source brings the transcription back with the demodulator.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn an_attached_job_whose_input_died_of_a_source_fault_fails_input_not_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = faultable(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    src.start();
+    let input = start_audio(&node).await;
+    let id = attach_ok(&node, &input).await;
+    assert!(event(&node, &id, "transcript", 2000).await.is_some());
+    port.set_fault(Some("device unplugged".into()));
+    assert_eq!(
+        wait_not_running(&node, &input, 2000).await,
+        JobState::Failed {
+            reason: "source file0: device unplugged".into()
+        }
+    );
+    assert_eq!(
+        wait_not_running(&node, &id, 2000).await,
+        JobState::Failed {
+            reason: format!("input job {} not running", input.0)
+        }
+    );
+}
+
+/// An input stopped on purpose (the port healthy) leaves the attached job `Stopped`.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn an_attached_job_whose_input_was_stopped_stays_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = faultable(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    src.start();
+    let input = start_audio(&node).await;
+    let id = attach_ok(&node, &input).await;
+    assert!(event(&node, &id, "transcript", 2000).await.is_some());
+    node.job_stop(&input).await.unwrap();
+    assert_eq!(
+        wait_not_running(&node, &input, 2000).await,
+        JobState::Stopped
+    );
+    assert_eq!(wait_not_running(&node, &id, 2000).await, JobState::Stopped);
+}

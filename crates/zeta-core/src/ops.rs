@@ -1772,6 +1772,10 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
         NodeError::UnknownJob(j) => unknown_job(node, &j),
         NodeError::Graph(detail) => OpError::Graph { detail },
         NodeError::Lease(l) => lease_error(l),
+        // A range error keeps its corrective shape (`field`, the range, `suggested`);
+        // anything else reads as the source's failure.
+        NodeError::SourcePort(_, p @ PortError::OutOfRange { .. }) => port_error(p),
+        e @ NodeError::SourcePort(..) => other(e),
         NodeError::InputNotRunning(j) => OpError::Other {
             message: format!("job {} is not running", j.0),
         },

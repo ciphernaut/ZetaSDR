@@ -13,9 +13,10 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::persist::{now, persist};
-use super::{Inner, JobEntry, LogFile, NodeError, ring_seconds_for, watch};
+use super::{Inner, JobEntry, LogFile, NodeError, ring_seconds_for, source_fault_reason, watch};
 use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
+use crate::lease::LeaseError;
 use crate::ops::{JobKind, SPECTRUM_ROWS_PER_S, scan_steps, spectrum_size};
 use crate::port::{IqBlock, IqReceiver, Port, Tuning};
 use crate::ring::IqRing;
@@ -124,18 +125,24 @@ impl Inner {
         let mut bank = None;
         if let Some(port) = &port {
             // Without `gate` the source's gate is held only inside `ensure_tuned`.
-            let (granted, tuned) = match gate {
+            let leased = match gate {
                 Some(g) => {
                     self.leases
                         .ensure_locked(port.as_ref(), rec.id.clone(), rec.tuning, rec.elastic, g)
-                        .await?
+                        .await
                 }
                 None => {
                     self.leases
                         .ensure_tuned(port.as_ref(), rec.id.clone(), rec.tuning, rec.elastic)
-                        .await?
+                        .await
                 }
             };
+            // A tune the port refused is the source's failure: named after it, as a
+            // job that failed on the faulted source is (a conflict stays a conflict).
+            let (granted, tuned) = leased.map_err(|e| match e {
+                LeaseError::Port(e) => NodeError::SourcePort(rec.source.clone(), e),
+                e => NodeError::Lease(e),
+            })?;
             // Only a rigid request tunes a port elastic jobs follow (an elastic one
             // tunes only an unheld port), so a relaunch never relaunches again.
             if tuned && !rec.elastic {
@@ -903,11 +910,16 @@ pub(super) async fn supervise(
     let keep = relaunch || !ours;
     // After node shutdown the record must stay `Running` so the job resumes.
     if !inner.shutdown.is_cancelled() && !keep {
-        inner.finish(
-            &id,
-            run,
-            failure.map_or(JobState::Stopped, |reason| JobState::Failed { reason }),
-        );
+        let end = match failure {
+            Some(reason) => JobState::Failed { reason },
+            None => match inner.input_lost_to_fault(&id) {
+                Some(input) => JobState::Failed {
+                    reason: NodeError::InputNotRunning(input).to_string(),
+                },
+                None => JobState::Stopped,
+            },
+        };
+        inner.finish(&id, run, end);
     }
     // The only place a started job's lease is released, but for a relaunch that
     // fails (`Inner::relaunch_elastic`).
@@ -944,6 +956,31 @@ pub(super) async fn supervise(
     }
 }
 
+impl Inner {
+    /// The input job of the attached job `id` when that input died of its source's
+    /// fault: its record is `Failed` with a `source <id>: ` reason and its source's port
+    /// still reports a fault. Such an attached job ends `Failed` as `InputNotRunning`
+    /// rather than `Stopped` (its `stream_in` ended cleanly on the closed stream), the
+    /// reason a resume relaunches once the input runs again, so the node's recovery of
+    /// the source brings it back with its input. `None` for a job on the radio and for
+    /// any other end of the input (stopped, restarted, failed for another reason).
+    fn input_lost_to_fault(&self, id: &JobId) -> Option<JobId> {
+        let jobs = self.jobs.lock().unwrap();
+        let input = jobs.get(id)?.record.input.clone()?;
+        let rec = &jobs.get(&input)?.record;
+        let JobState::Failed { reason } = &rec.state else {
+            return None;
+        };
+        if !reason.starts_with("source ") {
+            return None;
+        }
+        let source = rec.source.clone();
+        drop(jobs);
+        let port = self.ports.read().unwrap().get(&source).cloned()?;
+        port.fault().is_some().then_some(input)
+    }
+}
+
 /// Republish a port's blocks as `Payload::Iq` frames on a job's IQ stream,
 /// as one of the job's supervised tasks. A port fault (checked on every block
 /// and every 200 ms) fails the job. A port that closes without a fault closes
@@ -957,7 +994,7 @@ async fn forward_iq(
     mut rx: IqReceiver,
     cancel: CancellationToken,
 ) -> Result<(), StageError> {
-    let faulted = |f: String| StageError::Failed(format!("source {}: {f}", port.id().0));
+    let faulted = |f: String| StageError::Failed(source_fault_reason(port.id(), &f));
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -1096,7 +1133,7 @@ struct Scan {
 /// fails the job; the port is left at the last step.
 async fn scan_loop(inner: Arc<Inner>, s: Scan) -> Result<(), StageError> {
     let dwell = Duration::from_millis(inner.scan_dwell_ms);
-    let faulted = |f: String| StageError::Failed(format!("source {}: {f}", s.port.id().0));
+    let faulted = |f: String| StageError::Failed(source_fault_reason(s.port.id(), &f));
     let mut i = 0;
     loop {
         // Checked before each tune, so a stopped scan never retunes again; a

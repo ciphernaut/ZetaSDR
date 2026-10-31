@@ -353,3 +353,34 @@ async fn job_start_records_the_capture_rate() {
     assert_eq!(rate, 48_000);
     assert_eq!(on_disk(dir.path(), &id).capture_rate_hz, Some(rate));
 }
+
+/// A record resumed against a port that cannot tune (a device that is not there) fails
+/// with the port's error under the source's name, as a job that failed on the faulted
+/// source reads, so the node's recovery can tell it from any other failure.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn a_record_resumed_against_a_faulted_port_fails_naming_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = fixtures::write_tone(dir.path());
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: None,
+    };
+    let src = Arc::new(FileSource::open(SourceId("s".into()), &meta, opts).unwrap());
+    let port = zeta_core::test_fixtures::FaultablePort::new(src);
+    port.set_fault(Some("device not found: x".into()));
+    let id = JobId::new();
+    let mut rec = running(&id, "passthrough", band(48_000), 1);
+    rec.source = SourceId("s".into());
+    write_records(dir.path(), &[rec]);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    let want = JobState::Failed {
+        reason: "source s: io: device not found: x".into(),
+    };
+    assert_eq!(record(&node, &id).state, want);
+    assert_eq!(on_disk(dir.path(), &id).state, want);
+}

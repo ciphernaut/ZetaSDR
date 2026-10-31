@@ -34,7 +34,11 @@ pub struct StreamInParams {
 /// attached job's provenance (the output stream's, with the frame's span), so everything
 /// downstream is pinned to the attached job. The stream closing for any reason (the input
 /// job stopped, failed or was restarted by `graph_put`) ends the stage with `Ok(())`, so
-/// the attached job ends `Stopped`: it does not follow a restarted input. A stream already
+/// the attached job ends `Stopped`: it does not follow a restarted input. The exception is
+/// an input that died of its source's fault (its reason `source <id>: ...`, the port still
+/// faulted): the node records the attached job `Failed` as `input job <id> not running`,
+/// which a resume relaunches once the input runs again, so it comes back when the source
+/// recovers (see the job supervisor). A stream already
 /// gone at the start counts as closed. A lag is logged to stderr and skipped; the frames'
 /// timestamps carry the gap downstream (`transcribe` closes an utterance on it).
 ///

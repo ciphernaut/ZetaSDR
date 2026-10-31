@@ -17,4 +17,6 @@ pub mod ring;
 pub mod stage;
 pub mod stream;
 pub mod stream_in;
+#[cfg(feature = "test-fixtures")]
+pub mod test_fixtures;
 pub mod types;

@@ -25,8 +25,8 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 
-use super::Inner;
 use super::persist::now;
+use super::{Inner, source_fault_reason};
 use crate::graph::{self, Edge, Graph, Node as GraphNode, NodeId};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::modes::ModeState;
@@ -974,10 +974,15 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
     w.guard = None;
     // At the node's shutdown everything is left as it is: the records resume, the next
     // run re-adopts the decoders and stops the identify run as stale. A `graph_put`
-    // restart keeps the decoders for the next run. Any other end (`job_stop`, a
-    // `replace`, a failure of the loop or of a stage) tears down all the run started.
+    // restart keeps the decoders for the next run. A fault of the watch's port leaves
+    // the decoders to fail on their own (those in the capture fail with the same fault),
+    // for the node's recovery of the source to relaunch and the next run to re-adopt;
+    // stopping them would mark them `Stopped`, which recovery never relaunches. Any other
+    // end (`job_stop`, a `replace`, a failure of the loop or of a stage) tears down all
+    // the run started.
     let shutdown = inner.shutdown.is_cancelled();
-    let teardown = !shutdown && !inner.restarting(&r.id);
+    let port_faulted = r.port.fault().is_some();
+    let teardown = !shutdown && !inner.restarting(&r.id) && !port_faulted;
     let (current, pending) = match shutdown {
         true => (None, None),
         false => (w.current.take().map(|(j, _)| j), w.pending.take()),
@@ -1032,7 +1037,7 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
             return Err(StageError::Failed("watch: test failure".into()));
         }
         if let Some(f) = r.port.fault() {
-            return Err(StageError::Failed(format!("source {}: {f}", r.port.id().0)));
+            return Err(StageError::Failed(source_fault_reason(r.port.id(), &f)));
         }
         let mut changed = signals(inner, r, w);
         changed |= verdict(inner, r, w).await;
@@ -1299,6 +1304,12 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     let mut changed = false;
     let mut kept = Vec::with_capacity(w.decoding.len());
     for d in std::mem::take(&mut w.decoding) {
+        // A decoder that died of the watch's port fault stays listed: the loop is about
+        // to fail on the same fault, and the next run re-adopts it once recovered.
+        if !inner.runs(&d.job) && r.port.fault().is_some() {
+            kept.push(d);
+            continue;
+        }
         if !inner.runs(&d.job) {
             w.subs.remove(&d.job);
             changed = true;
