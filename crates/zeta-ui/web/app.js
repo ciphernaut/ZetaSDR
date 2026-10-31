@@ -608,6 +608,7 @@ function start(api) {
     plan: () => state.view.get("plan"),
     applyOp,
     footprint: () => document.documentElement.dataset.footprint || "wide",
+    onOutlineMenu: (job, x, y) => state.menu?.openOutline(job, x, y),
   });
   state.map = mountMap($("#map"), api, state.view, { jobs: () => state.lastJobs });
   state.ov.onEvent((job, p) => state.map?.event(job, p));

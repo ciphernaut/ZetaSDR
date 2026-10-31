@@ -1930,6 +1930,90 @@ def near(a, b, width):
     return abs(a - b) <= width * 0.01
 
 
+# ---- the outline menu (plan 18 Task 7) -------------------------------------------------------
+# Right-click on a retunable outline (wide) or a long press on its label (narrow) opens
+# #ctx-outline: Fit to signal, width presets about the centre, Stop.
+
+def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
+    cur, _ = show_retune(page, url, secret)
+    job = start_job(url, secret, "fm_demod", "retune", cur, 20_000, deviation_hz=5000)
+    try:
+        ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
+        page.evaluate("window.zetaTest.poll()")
+        expect(ol.locator(".outline-handle")).to_have_count(2)
+        ol.click(button="right")
+        menu = page.locator("#ctx-outline")
+        expect(menu).to_be_visible()
+        got = menu.locator(".ctx-item").evaluate_all(
+            "els => els.map(e => [e.dataset.action, e.textContent])")
+        assert got == [["fit", "Fit to signal"], ["w2500", "2.5 kHz"], ["w5000", "5 kHz"],
+                       ["w6250", "6.25 kHz"], ["w12500", "12.5 kHz"], ["w25000", "25 kHz"],
+                       ["stop", "Stop"]], f"entries {got}"
+        expect(page.locator("#ctx-outline-footer")).to_contain_text(
+            f"job={job} center_hz={cur} bandwidth_hz=20000")
+        with page.expect_request(is_op("job_retune")) as req:
+            page.click('#ctx-outline .ctx-item[data-action="w12500"]')
+        assert json.loads(req.value.post_data) == {
+            "op": "job_retune", "job": job, "center_hz": cur, "bandwidth_hz": 12500,
+            "replace": []}, f"preset {req.value.post_data}"
+        expect(menu).to_be_hidden()
+        wait_until(lambda: job_record(url, secret, job)["tuning"]["bandwidth_hz"] == 12500,
+                   5.0, "preset applied")
+        page.evaluate("window.zetaTest.poll()")
+        # Fit: the tone sits at cur + 1000 Hz.
+        ol.click(button="right")
+        with page.expect_request(is_op("job_retune")) as req:
+            page.click('#ctx-outline .ctx-item[data-action="fit"]')
+        body = json.loads(req.value.post_data)
+        assert body["job"] == job and body["replace"] == [], f"fit {body}"
+        assert abs(body["center_hz"] - (cur + 1000)) <= 100, f"fit centre {body}"
+        # Measured on the retune fixture's tone through an fm_demod band of 12.5 kHz: a fresh
+        # measure's occupied width x 1.25 gave 7090 Hz (labelled `fm`), not the 5000 Hz floor,
+        # so the width is asserted as a range (floor 5000, cap the job's 12500) and the note
+        # must report the sent width.
+        assert 5000 <= body["bandwidth_hz"] <= 12500, f"fit width {body}"
+        kHz = f"{body['bandwidth_hz'] / 1000:.1f}"
+        mhz = f"{body['center_hz'] / 1e6:.4f}"
+        expect(page.locator("#transcript .line.note", has_text=re.compile(
+            rf"^fitted fm_demod to {re.escape(mhz)} MHz, {re.escape(kHz)} kHz \((carrier|fm)\)$"
+        ))).to_have_count(1)
+        wait_until(lambda: job_record(url, secret, job)["tuning"]["bandwidth_hz"]
+                   == body["bandwidth_hz"], 5.0, "fit applied")
+        page.evaluate("window.zetaTest.poll()")
+        ol.click(button="right")
+        page.click('#ctx-outline .ctx-item[data-action="stop"]')
+        wait_until(lambda: job_record(url, secret, job)["state"]["status"] == "stopped",
+                   5.0, "stopped from the menu")
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_narrow_long_press_opens_the_outline_menu(page, url, secret):
+    fresh_spectrum_jobs(url, secret)
+    page.set_viewport_size(NARROW)
+    login(page, url, secret)
+    page.click('.src-tab[data-id="retune"]')
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    job = start_job(url, secret, "passthrough", "retune", cur, 10_000)
+    try:
+        page.evaluate("window.zetaTest.poll()")
+        ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
+        expect(ol).to_have_count(1)
+        expect(ol.locator(".outline-handle")).to_have_count(0)
+        # Task 8 replaces the label with the tag and moves this press onto it.
+        cx, cy = centre_of(ol.locator(".outline-label").bounding_box())
+        page.mouse.move(cx, cy)
+        page.mouse.down()
+        page.wait_for_timeout(700)
+        page.mouse.up()
+        expect(page.locator("#ctx-outline")).to_be_visible()
+        page.keyboard.press("Escape")
+        expect(page.locator("#ctx-outline")).to_be_hidden()
+    finally:
+        stop_job(url, secret, job)
+
+
 def scenario_follow_target_eases_on_a_capture_change(page, url, secret):
     select_source(page, url, secret, "retune")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)

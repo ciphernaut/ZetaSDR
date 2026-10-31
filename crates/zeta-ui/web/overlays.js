@@ -12,7 +12,10 @@
 //       -> Promise<result | null>` is app.js's (null: failed and already reported, a
 //       `conflict` with its retry buttons); a dragged outline's `job_retune` goes through it.
 //       `footprint()` returns "wide" or "narrow" (<html data-footprint>): only the wide
-//       footprint's outlines can be dragged.
+//       footprint's outlines can be dragged. `onOutlineMenu(job, x, y)` is called with a
+//       retunable outline's job and a client point: by `contextmenu` on the outline (wide), or
+//       by a LONG_PRESS_MS press on its `.outline-label` in the narrow footprint (cancelled by
+//       pointerup/pointercancel or a move over LONG_PRESS_MOVE_PX).
 //   Overlays:
 //     ov.syncOutlines(jobs, source)  the outline half of ov.sync alone (app.js calls it after
 //                            each `source_list` poll, so a pin shows without waiting for jobs)
@@ -154,6 +157,8 @@ const PIN_KEY = "pin";
 export const NOT_RETUNABLE = ["spectrum", "scan", "identify", "watch", "transcribe"];
 export const HANDLE_PX = 8; // an edge handle's height (style.css .outline-handle)
 export const DRAG_CLICK_PX = 3; // less pointer travel than this is a click, not a drag
+export const LONG_PRESS_MS = 500; // a press this long on a narrow outline's label opens its menu
+export const LONG_PRESS_MOVE_PX = 10; // a press that moves further than this is no long press
 export const MIN_WIDTH_HZ = 1000; // the narrowest band an edge drag leaves
 
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
@@ -229,11 +234,14 @@ class Overlays {
       plan = () => "auto",
       applyOp = async () => null,
       footprint = () => "wide",
+      onOutlineMenu = () => {},
     } = {},
   ) {
     this.plan = plan;
     this.applyOp = applyOp;
     this.footprint = footprint;
+    this.onOutlineMenu = onOutlineMenu;
+    this.press = null; // the narrow long press in progress: {timer, x, y}
     // The outline drag in progress: {key, job, mode: "move"|"lo"|"hi", y0 (layer px), lo0,
     // hi0 (the ghost's band), lo, hi (the dragged band), moved, sending (job_retune sent)}.
     this.drag = null;
@@ -816,6 +824,11 @@ class Overlays {
     const d = this.drag;
     if (!on && d && d.key === o.el.dataset.key && !d.sending) this.endDrag(true);
     o.el.classList.toggle("retunable", on);
+    // Narrow: the label of a retunable job is the long-press target.
+    o.el.classList.toggle(
+      "pressable",
+      !!o.job && this.footprint() === "narrow" && this.retunable(o.job),
+    );
     if (on && !o.handles) {
       o.handles = ["hi", "lo"].map((edge) => {
         const h = document.createElement("div");
@@ -836,6 +849,38 @@ class Overlays {
     el.addEventListener("pointermove", (ev) => this.dragMove(ev, key));
     el.addEventListener("pointerup", () => this.dragUp(key));
     el.addEventListener("pointercancel", () => this.dragCancel(key));
+    el.addEventListener("contextmenu", (ev) => {
+      if (this.footprint() !== "wide" || !el.classList.contains("retunable")) return;
+      ev.preventDefault();
+      this.onOutlineMenu(o.job, ev.clientX, ev.clientY);
+    });
+    // Narrow: a long press on the label opens the menu.
+    const label = o.labelEl;
+    label.addEventListener("pointerdown", (ev) => {
+      if (this.footprint() !== "narrow" || !o.job || !this.retunable(o.job)) return;
+      this.cancelPress();
+      const { clientX: x, clientY: y } = ev;
+      this.press = {
+        x,
+        y,
+        timer: setTimeout(() => {
+          this.press = null;
+          if (o.job && this.retunable(o.job)) this.onOutlineMenu(o.job, x, y);
+        }, LONG_PRESS_MS),
+      };
+    });
+    label.addEventListener("pointermove", (ev) => {
+      const p = this.press;
+      if (p && Math.hypot(ev.clientX - p.x, ev.clientY - p.y) > LONG_PRESS_MOVE_PX) {
+        this.cancelPress();
+      }
+    });
+    label.addEventListener("pointerup", () => this.cancelPress());
+    label.addEventListener("pointercancel", () => this.cancelPress());
+    label.addEventListener("contextmenu", (ev) => {
+      // A touch long press may raise contextmenu too: ours is the timer's.
+      if (this.footprint() === "narrow") ev.preventDefault();
+    });
     // A wheel over a draggable outline still zooms the waterfall under it.
     el.addEventListener(
       "wheel",
@@ -847,6 +892,11 @@ class Overlays {
       },
       { passive: false },
     );
+  }
+
+  cancelPress() {
+    if (this.press) clearTimeout(this.press.timer);
+    this.press = null;
   }
 
   layerY(ev) {

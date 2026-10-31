@@ -30,6 +30,9 @@
 //   Menu:
 //     menu.open(sel, x, y)  shows the menu for a waterfall selection at client (x, y)
 //     menu.close()          hides it and erases the selection rectangle
+//     menu.openOutline(job, x, y)  shows #ctx-outline for a running job (a `job_list` record) at
+//                           client (x, y), kept inside the viewport; the first entry is focused
+//     menu.closeOutline()   hides it
 //     menu.destroy()
 //
 // Entries (`.ctx-item[data-action]`):
@@ -120,6 +123,21 @@
 //
 // Closing: Escape, a pointer press outside the menu, or choosing an entry. Up/Down move the
 // focus between entries; Enter or Space chooses one.
+//
+// The outline menu (#ctx-outline, role menu; overlays.js opens it by right-click on a retunable
+// outline, or a long press on its label in the narrow footprint). Entries
+// (`.ctx-item[data-action]`, OUTLINE_ENTRIES), on the job's own source and tuning:
+//   fit    Fit to signal   fitBand on the job's band, then job_retune to fitTuning(...) capped at
+//                          the job's bandwidth, note `fitted <kind> to <band> (<label>)`; no
+//                          signal: the note `no signal found in the band; left as it is` and
+//                          nothing changes. Shares the fit guard above (entries aria-disabled
+//                          meanwhile, closing the menu cancels it: `<kind>: fit cancelled`)
+//   w2500 2.5 kHz, w5000 5 kHz, w6250 6.25 kHz, w12500 12.5 kHz, w25000 25 kHz
+//                          job_retune to that bandwidth_hz about the same centre_hz
+//   stop   Stop            job_stop
+// Every retune is {op: job_retune, job, center_hz, bandwidth_hz, replace: []}. #ctx-outline-footer
+// reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
+// as for #ctx.
 
 import { bandText, mhzText } from "./units.js";
 
@@ -159,6 +177,16 @@ export const FIT_FACTOR = 1.25;
 export const FIT_TIMEOUT_MS = 3000;
 // An `unknown` label under this SNR (dB) counts as no signal.
 export const FIT_NOISE_SNR_DB = 6;
+
+const OUTLINE_ENTRIES = [
+  ["fit", "Fit to signal"],
+  ["w2500", "2.5 kHz"],
+  ["w5000", "5 kHz"],
+  ["w6250", "6.25 kHz"],
+  ["w12500", "12.5 kHz"],
+  ["w25000", "25 kHz"],
+  ["stop", "Stop"],
+];
 
 const ENTRIES = [
   ["classify", "What is this?"],
@@ -369,6 +397,26 @@ class Menu {
     this.el.append(this.footer);
     document.body.append(this.el);
 
+    // The outline menu and the job it is open for (a job_list record) or null.
+    this.outlineJob = null;
+    this.outlineEl = document.createElement("div");
+    this.outlineEl.id = "ctx-outline";
+    this.outlineEl.setAttribute("role", "menu");
+    this.outlineEl.hidden = true;
+    for (const [action, text] of OUTLINE_ENTRIES) {
+      const item = document.createElement("button");
+      item.className = "ctx-item";
+      item.dataset.action = action;
+      item.setAttribute("role", "menuitem");
+      item.textContent = text;
+      item.addEventListener("click", () => this.chooseOutline(action));
+      this.outlineEl.append(item);
+    }
+    this.outlineFooter = document.createElement("div");
+    this.outlineFooter.id = "ctx-outline-footer";
+    this.outlineEl.append(this.outlineFooter);
+    document.body.append(this.outlineEl);
+
     // The pointer position of the drag's end: pointerup reaches the document (capture) before
     // the waterfall's own handler calls onSelect.
     this.onPointerUp = (ev) => {
@@ -376,15 +424,19 @@ class Menu {
     };
     this.onPointerDown = (ev) => {
       if (!this.el.hidden && !this.el.contains(ev.target)) this.close();
+      if (!this.outlineEl.hidden && !this.outlineEl.contains(ev.target)) this.closeOutline();
     };
     this.onKey = (ev) => {
-      if (this.el.hidden) return;
+      const outline = !this.outlineEl.hidden;
+      const menu = outline ? this.outlineEl : this.el;
+      if (menu.hidden) return;
       if (ev.key === "Escape") {
         ev.preventDefault();
-        this.close();
+        if (outline) this.closeOutline();
+        else this.close();
       } else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
         ev.preventDefault();
-        const items = [...this.el.querySelectorAll(".ctx-item")];
+        const items = [...menu.querySelectorAll(".ctx-item")];
         const at = items.indexOf(document.activeElement);
         const step = ev.key === "ArrowDown" ? 1 : -1;
         items[(at + step + items.length) % items.length].focus();
@@ -437,10 +489,91 @@ class Menu {
     this.setFitting(null);
   }
 
+  openOutline(job, x, y) {
+    // One menu at a time; opening cancels a fit still running for the previous one.
+    if (!this.el.hidden) this.close();
+    this.fitGen += 1;
+    this.setFitting(null);
+    this.outlineJob = job;
+    const t = job.tuning;
+    this.outlineFooter.textContent =
+      `job=${job.id} center_hz=${t.center_hz} bandwidth_hz=${t.bandwidth_hz}`;
+    this.outlineEl.hidden = false;
+    const w = this.outlineEl.offsetWidth;
+    const h = this.outlineEl.offsetHeight;
+    this.outlineEl.style.left = `${Math.max(0, Math.min(x, window.innerWidth - w))}px`;
+    this.outlineEl.style.top = `${Math.max(0, Math.min(y, window.innerHeight - h))}px`;
+    this.outlineEl.querySelector(".ctx-item").focus({ preventScroll: true });
+  }
+
+  closeOutline() {
+    this.outlineEl.hidden = true;
+    this.outlineJob = null;
+    this.fitGen += 1;
+    this.setFitting(null);
+  }
+
+  async chooseOutline(action) {
+    const job = this.outlineJob;
+    if (!job || this.fitting !== null) return;
+    const t = job.tuning;
+    if (action === "fit") {
+      const token = ++this.fitGen;
+      this.setFitting(token);
+      const kind = job.kind;
+      let fit;
+      let error = null;
+      try {
+        fit = await fitBand(this.ov.api, job.source, t.center_hz, t.bandwidth_hz);
+      } catch (e) {
+        error = e;
+      }
+      if (token !== this.fitGen) {
+        this.t.note(`${kind}: fit cancelled`);
+        return;
+      }
+      this.closeOutline();
+      if (error) {
+        this.t.note(`${kind}: ${error.message}`, true);
+      } else if (fit === null) {
+        this.t.note("no signal found in the band; left as it is");
+      } else {
+        // The JOBS entry of the kind (ssb_demod: the USB one; a record carries no sideband).
+        const entry = Object.values(JOBS).find((j) => j.kind === kind) ?? { kind, sideband: null };
+        const f = fitTuning(entry, fit, { bandwidthHz: t.bandwidth_hz });
+        await this.applyOp({
+          op: "job_retune",
+          job: job.id,
+          center_hz: f.centerHz,
+          bandwidth_hz: f.bandwidthHz,
+          replace: [],
+        });
+        this.t.note(`fitted ${kind} to ${bandText(f.centerHz, f.bandwidthHz)} (${fit.label})`);
+      }
+      return;
+    }
+    this.closeOutline();
+    if (action === "stop") {
+      await this.applyOp({ op: "job_stop", job: job.id });
+    } else if (/^w\d+$/.test(action)) {
+      await this.applyOp({
+        op: "job_retune",
+        job: job.id,
+        center_hz: t.center_hz,
+        bandwidth_hz: Number(action.slice(1)),
+        replace: [],
+      });
+    }
+  }
+
   // Marks fit `token` in progress (null: none), the entries aria-disabled meanwhile.
   setFitting(token) {
     this.fitting = token;
-    for (const item of this.el.querySelectorAll(".ctx-item")) {
+    const items = [
+      ...this.el.querySelectorAll(".ctx-item"),
+      ...this.outlineEl.querySelectorAll(".ctx-item"),
+    ];
+    for (const item of items) {
       if (token === null) item.removeAttribute("aria-disabled");
       else item.setAttribute("aria-disabled", "true");
     }
@@ -652,5 +785,6 @@ class Menu {
     document.removeEventListener("pointerdown", this.onPointerDown, true);
     document.removeEventListener("keydown", this.onKey);
     this.el.remove();
+    this.outlineEl.remove();
   }
 }
