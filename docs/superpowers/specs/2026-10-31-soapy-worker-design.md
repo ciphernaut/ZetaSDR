@@ -84,7 +84,9 @@ Plan 20 therefore does two things, and the second is the point of the first:
   during the current fault episode come back; a job the operator stopped, or one that failed for a
   reason of its own, stays as it is.
 - A secret in the worker. The worker's environment carries no `ZETA_SECRET`, no
-  `ZETA_NODE_SECRET_*`, no `ZETA_KIWI_PASSWORD_*`, no `ZETA_STT_NODE_SECRET`.
+  `ZETA_NODE_SECRET_*`, no `ZETA_KIWI_PASSWORD_*`, no `ZETA_STT_NODE_SECRET`, no `ZETA_LLM_KEY`,
+  and no other `ZETA_*` variable whose name contains `SECRET`, `PASSWORD` or `KEY`: the list
+  names today's credentials, the pattern catches the ones added later.
 
 ## 3. Constraints
 

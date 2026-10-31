@@ -424,6 +424,8 @@ async fn the_child_environment_has_no_secrets() {
         std::env::set_var("ZETA_NODE_SECRET_X", "s");
         std::env::set_var("ZETA_KIWI_PASSWORD_Y", "s");
         std::env::set_var("ZETA_STT_NODE_SECRET", "s");
+        std::env::set_var("ZETA_LLM_KEY", "s");
+        std::env::set_var("ZETA_SOME_PASSWORD", "s");
         if std::env::var_os("HOME").is_none() {
             std::env::set_var("HOME", "/nonexistent");
         }
@@ -441,6 +443,8 @@ async fn the_child_environment_has_no_secrets() {
         "ZETA_NODE_SECRET_X",
         "ZETA_KIWI_PASSWORD_Y",
         "ZETA_STT_NODE_SECRET",
+        "ZETA_LLM_KEY",
+        "ZETA_SOME_PASSWORD",
     ] {
         assert!(!names.contains(&secret), "{secret} reached the worker");
     }

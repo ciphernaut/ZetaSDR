@@ -10,11 +10,16 @@
 
 use std::ffi::{OsStr, OsString};
 
-/// Variables removed by exact name.
-const SECRET_NAMES: &[&str] = &["ZETA_SECRET", "ZETA_STT_NODE_SECRET"];
+/// Variables removed by exact name: the node's secret, the speech node's, and
+/// the agent's LLM key.
+const SECRET_NAMES: &[&str] = &["ZETA_SECRET", "ZETA_STT_NODE_SECRET", "ZETA_LLM_KEY"];
 /// Variables removed by prefix: one per `--source-node` and per
 /// `--source-kiwi`.
 const SECRET_PREFIXES: &[&str] = &["ZETA_NODE_SECRET_", "ZETA_KIWI_PASSWORD_"];
+/// Words that mark any other `ZETA_*` variable as a secret: the lists above
+/// name the credentials zeta reads today, and the pattern catches the ones
+/// added later before anyone remembers to list them here.
+const SECRET_WORDS: &[&str] = &["SECRET", "PASSWORD", "KEY"];
 
 /// The parent's environment minus the secret variables.
 pub fn scrubbed() -> Vec<(OsString, OsString)> {
@@ -31,7 +36,9 @@ fn is_secret(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    SECRET_NAMES.contains(&name) || SECRET_PREFIXES.iter().any(|p| name.starts_with(p))
+    SECRET_NAMES.contains(&name)
+        || SECRET_PREFIXES.iter().any(|p| name.starts_with(p))
+        || (name.starts_with("ZETA_") && SECRET_WORDS.iter().any(|w| name.contains(w)))
 }
 
 #[cfg(test)]
@@ -45,11 +52,19 @@ mod tests {
             "ZETA_STT_NODE_SECRET",
             "ZETA_NODE_SECRET_B210",
             "ZETA_KIWI_PASSWORD_K",
+            "ZETA_LLM_KEY",
+            // Caught by the pattern alone.
+            "ZETA_SECRETS_DIR",
+            "ZETA_FUTURE_API_KEY",
+            "ZETA_ROUTER_PASSWORD",
             "HOME",
             "PATH",
             "UHD_IMAGES_DIR",
-            "ZETA_SECRETS_DIR",
             "ZETA_NODE",
+            "ZETA_STT_SOCKET",
+            // Not ours: the pattern is for `ZETA_*` only.
+            "SSH_AUTH_SOCK",
+            "GPG_KEY_ID",
         ]
         .map(|k| (OsString::from(k), OsString::from("v")));
         let kept: Vec<String> = scrub(vars)
@@ -62,8 +77,10 @@ mod tests {
                 "HOME",
                 "PATH",
                 "UHD_IMAGES_DIR",
-                "ZETA_SECRETS_DIR",
-                "ZETA_NODE"
+                "ZETA_NODE",
+                "ZETA_STT_SOCKET",
+                "SSH_AUTH_SOCK",
+                "GPG_KEY_ID"
             ]
         );
     }
