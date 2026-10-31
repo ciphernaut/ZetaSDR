@@ -74,6 +74,20 @@ parity:
   edge-masked there, are mid-step in the odd grid. The first and last odd steps reach `w/2`
   outside the span; those rows are valid spectrum and are emitted as they are (the page's
   stitcher already paints whatever band a row covers).
+
+  *Amended 2026-11-01 (final review of plan 15): the odd grid shifts by `w/4`, not `w/2`.* Its
+  centres are `start + w/4 + i*w` for `i` in `0..=n`, each clamped as below, a clamped duplicate
+  dropped, and a step whose band misses the span (only the last can) dropped, so an odd sweep
+  still has at most `n + 1` steps; `alternate.shift_hz` is `w/4`. Why: with rows about as wide
+  as the step (the HackRF at 16 Msps), a half-step shift puts every even centre exactly on an
+  odd step boundary and vice versa, so each grid's notch lies inside the other grid's edge mask
+  of both neighbouring rows, and the bins around every half-step were masked on every sweep
+  (about 300 kHz at 448, 456, 464, 472 and 480 MHz in the 440-488 MHz survey, against goal 1
+  and the anti-goal "a mask that hides signal"). At a quarter step each grid's notch and step
+  boundaries fall at the 25 % and 75 % points of the other grid's rows, clear of its notch and
+  of its edge mask, which the scheme therefore needs under 0.25 (`edge_mask < 0.25`). A
+  one-step span still does not alternate, and has no edge mask in force (nothing could fill it
+  in).
 - Both grids clamp each centre into `tune_min + w/2 ..= tune_max - w/2` as today. When the clamp
   makes two consecutive odd centres equal (a span at the tune floor or ceiling), the duplicate is
   dropped, so an odd sweep is never longer than `n + 1`.

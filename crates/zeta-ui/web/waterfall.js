@@ -376,7 +376,7 @@ function bandRow(row, p, tuning) {
 
 // Steps in one sweep of a scan over `span` ({lo, hi}) whose newest row is `row`: the span over
 // the row's width, rounded up, plus one (never fewer than a sweep's steps, the odd sweep's
-// extra half-step one included); 0 without either.
+// extra step included); 0 without either.
 function sweepCount(row, span) {
   if (!row || !span || !(row.hi > row.lo)) return 0;
   return Math.ceil((span.hi - span.lo) / (row.hi - row.lo)) + 1;
