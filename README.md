@@ -679,6 +679,15 @@ last step. The UI's context menu has "Scan this span"; in scan mode the waterfal
 the scan and each row paints its step's segment of a new column, so a sweep fills in
 progressively.
 
+Sweeps alternate between two step grids half a step apart (even sweeps use the steps above, odd
+sweeps shift every centre by half a step and take one more step), so a frequency under a step
+centre in one sweep is mid-step in the next: read two consecutive sweeps. On a local hardware
+receiver each row masks its centre notch (`notch_hz`, 300 kHz) and its outer edges (`edge_mask`,
+0.10 of the bins each side); the row carries `masked: [[lo, hi], ...]` (bin index ranges, `hi`
+exclusive), which are no data rather than low power. The job context's `scan.alternate`
+(`shift_hz`, `steps_shifted`) and `scan.mask` report both, and `graph get`, an edit of the scan's
+`fft` node (`notch_hz`, `edge_mask`) and `graph put` changes the mask.
+
 ```bash
 Z="./target/release/zeta --node http://field-host:7979"   # ZETA_SECRET set
 $Z job start --kind scan --source b210 --center-hz 500000000 --bandwidth-hz 1000000000

@@ -36,13 +36,41 @@ specs are written in a brainstorming session before the plan, as before.
 | Order | Plan | Why here | Depends on |
 |---|---|---|---|
 | 14 | Field fix wave (planned, above) | The timestamp bug blocks every UTC-slotted mode (FT8/FT4/WSPR) and TDMA (DMR, TETRA); the run leak would surface in minutes under a span of decoders; `measure` silence blocks layer 4 and `cb_watch.py`. | - |
-| 15 | Scan: alternate the step grid and mask the centre and edge bins | Spec gist in `TODO.md`; the survey tooling built on scan rows inherits the DC spike and edges today. Spec first. | 14 (`stats`, no leaks under repeated retunes) |
+| 15 | Scan: alternate the step grid and mask the centre and edge bins | Spec gist in `TODO.md`; the survey tooling built on scan rows inherits the DC spike and edges today. Spec first. Spec `docs/superpowers/specs/2026-10-31-scan-grid-mask-design.md`, plan `docs/superpowers/plans/2026-10-31-scan-grid-mask.md`. **Merged** to `main` pending the session's fast-forward, 2026-10-31; live acceptance on the desktop HackRF is pending (see "Plan 15 status"). | 14 (`stats`, no leaks under repeated retunes) |
 | 16 | Mode registry and external-decoder adaptor | Design spec first (brainstorm): a table-driven mode registry replacing the `JobKind` match for decoders, a declarative stdio wrapper for external decoders, the `video`/`text`/bits payload envelopes, a common decoded-event envelope and feed sinks, `tools/install-vocoders.sh`. No new mode ships here; `adsb_decode` is re-expressed as the first adaptor row. **Merged** to `main` (91886bc), 2026-10-28. Live acceptance on the HackRF 2026-10-28: registry, check, broken row, handlers, unknown kinds and `identify`'s unknown path pass; the on-air decode proofs await an antenna (see "Plan 16 status"). | 14 |
 | 17 | Sonde frameworks (decoder wave 1) | Re-scoped 2026-10-28 with the operator: radiosondes as the proving mode for the generic frameworks, so that the later wave is rows only. Audio-input program rows (RS41 through `rs41mod`, DFM and M20 as rows), generic `fsk`/`psk`/`ook` synthesiser families plus an RS41 frame generator proven by the real decoder and the echo impairment, a `watch` job (spot a new signal in a pinned band, `identify` it, keep the proved decoder on a free radio or in the capture), `source_free`, `position` on events with a map layer (vendored Leaflet), a SondeHub sink last. Spec `docs/superpowers/specs/2026-10-28-sonde-frameworks-design.md`, plan `docs/superpowers/plans/2026-10-28-sonde-frameworks.md`. Voice (M17, DMR), AIS, FLEX, whole-span POCSAG/APRS and stereo move to the later wave (`TODO.md`). **Merged** to `main` (97383b0), 2026-10-29; live acceptance during a Brisbane launch window is pending (see "Plan 17 status"). | 16 |
 | 18 | UI wave | Box a signal, demod it, refine it on the graph (no channel-grid assumptions); staircase transcript ribbons; mode picking by band through `knowledge_lookup`; the Okudagram (LCARS) theme behind `view set theme`. UI-only; can run beside 16/17. | 13 |
 | 19 | Layer 4 stages | Generic FSK/PSK/OOK demods, clock recovery, slicer, bit viewer with framing and CRC hypotheses, correlator, signature write-back; `measure` symbol-rate and modulation-order upgrades. Two or three plans. | 16 (bits payload) |
 | 20 | Soapy worker process | A `zeta soapy-worker` child owning the driver behind a Port that faults when the child exits, so a driver crash never ends the node, and a source that heals is recovered. Spec `docs/superpowers/specs/2026-10-31-soapy-worker-design.md`, plan `docs/superpowers/plans/2026-10-31-soapy-worker.md`. **Merged** to `main` pending the session's fast-forward, 2026-10-31; live acceptance on the field host is pending (see "Plan 20 status"). | 14 |
 
+
+## Plan 15 status
+
+Plan 15 (scan grid and mask) is on the `plan-15` branch, merged to `main` pending the session's fast-forward, 2026-10-31. Live acceptance on the desktop HackRF is pending.
+
+Built, per task:
+
+1. Task 1: `scan_steps` alternates the grid; odd sweeps shift every centre by half a step and take one more step.
+2. Task 2: `fft` gains `notch_hz` and `edge_mask`; spectrum rows carry `masked` bin ranges.
+3. Task 3: the scan carries its mask in its `fft` node (written from the capabilities on the first launch, honoured on every launch; `graph put` changes it); `job_context.scan` gains `alternate` and `mask`. A `graph put` that drops the scan's `fft` node is re-expanded with the default mask on the next launch rather than refused.
+4. Task 4: `detect` ignores bins inside a row's masked ranges.
+5. Task 5: `measure` ignores the bins within `MEASURE_DC_MASK_HZ` of the capture centre on a local hardware receiver; `job_context.measure.dc_mask_hz`.
+6. Task 6: the page paints a masked bin as nothing (the pixel keeps what the previous row left) and redraws replay the last two sweeps.
+7. Task 7: field craft, README, this status, TODO.
+
+Controller rulings:
+
+- `measure`'s DC mask is skipped when the DC lies within one bin of the measured band's centre: a lone job's capture is centred on its band (the lease does no offset tuning), so the literal mask would hide the very signal the box measures; a box inside a wider capture (a pin, another job's capture) keeps the mask. The lease follow-on gist (`TODO.md`, "Lease: keep a lone job's capture centre off its channel") is the proper fix.
+- The default `MEASURE_DC_MASK_HZ` of 25 000 Hz also masks ch20 under the UHF CB pin (ch20 at 476 900 000 Hz is 18 750 Hz from the pin centre 476 918 750 Hz: its band spans offsets 12.5-25 kHz), so a fit on ch20 under the pin reads noise until the live acceptance measures the HackRF's spike width and corrects the constant (likely lower).
+
+Default constants, to be corrected by the live run: `SCAN_NOTCH_HZ` 300 000 Hz, `SCAN_EDGE_MASK` 0.10, `MEASURE_DC_MASK_HZ` 25 000 Hz.
+
+Live acceptance (desktop HackRF, `--source-soapy hackrf=driver=hackrf,gain=45`):
+
+- [ ] (1) The 440-488 MHz survey at 45 dB with a 2 s dwell look shows no hump at any step centre and no 100 kHz grid of peaks moving with the parity.
+- [ ] (2) With `notch_hz: 0` for one run, the hump's width at the floor at 2, 8 and 16 Msps read from the rows, `SCAN_NOTCH_HZ` set to the widest plus 20 %, the same for the edge roll-off and `SCAN_EDGE_MASK`, figures recorded here and in the TODO gist; the same for the measure mask: `MEASURE_DC_MASK_HZ` set from the measured spike width at the pin's 1 Msps, checking ch20 under the UHF CB pin fits (at 25 000 Hz it reads noise: ch20 is 18 750 Hz from the pin centre).
+- [ ] (3) `zeta job context` on the scan shows `scan.alternate` and `scan.mask`, `zeta stream tail` shows rows with `masked`.
+- [ ] (4) The `detect` change is covered by its unit test only (no watch inside a scan step is started).
 
 ## Plan 20 status
 

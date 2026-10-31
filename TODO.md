@@ -2,35 +2,11 @@
 
 ## Scan: alternate the step grid and mask the centre and edge bins
 
-Gist for a spec, not the spec itself. Spec work is scheduled for the week after 2026-10-23.
+Done in plan 15 (docs/superpowers/specs/2026-10-31-scan-grid-mask-design.md); live acceptance pending: the notch and edge widths it measures set `SCAN_NOTCH_HZ` and `SCAN_EDGE_MASK` (300 kHz and 0.10 to begin with).
 
-**Problem.** `scan_steps` (`crates/zeta-core/src/ops.rs`) lays the steps (up to 16 MHz each) end to end: no overlap, and every step centre falls on a round number (448, 464, 480 MHz...). Each step's DC spike and its weak band edges go into the rows as if they were signal.
+## Lease: keep a lone job's capture centre off its channel
 
-Field survey, 2026-10-23, HackRF, 440-488 MHz at 45 dB:
-- Smooth humps 150-300 kHz wide around the step centres.
-- Steady peaks on the 100 kHz grid.
-- A one-off demod with the capture centred on its channel read the DC spike as a 59 dB carrier.
-
-The waterfall and any survey built on scan rows inherit all of this.
-
-**Idea.**
-- Alternate the grid instead of overlapping it: even sweeps use today's centres, odd sweeps shift every centre by half a step. A frequency that sits on a centre in one sweep is mid-step in the next. Same cost per sweep; every frequency gets a clean look every two sweeps.
-  - Overlap alone does not fix this: a step's centre is covered by a neighbour only at a pitch of at most half a step, which doubles the sweep.
-- Mask the bad bins in the node, not in each consumer:
-  - each row drops a notch around its centre (a few hundred kHz, to be measured) and the outer ~10% at each edge;
-  - the masked bins are flagged as no data, not shown as low power.
-- Report the alternation (shift, notch width, edge width) in the scan's `job_context`.
-
-**Open questions.**
-- How rows carry the mask. Lean: an explicit field such as `masked: [[lo_bin, hi_bin], ...]`, which stays backward-compatible. Reserving a `q` value would not, since `q = 0` occurs naturally.
-- Notch and edge widths: fixed, per device, or measured from the hardware.
-- Should a demod/decoder lease avoid centring the capture on its own channel (the same DC problem outside scans)?
-
-**Scope estimate.** About 200-300 lines, more than half of it tests:
-- `scan_steps` + tests in `ops.rs`;
-- `scan_loop` / `fft_step` in `node/launch.rs`;
-- coarse-view stitching in `crates/zeta-ui/web/coarse.js` / `waterfall.js`: masked bins keep the previous value. The fiddly part.
-- a few lines of docs in `crates/zeta/src/agents_md.rs` / `AGENTS.md`.
+From plan 15's non-goals, 2026-10-31. A demodulator's or decoder's own capture centre sits on its channel, so the receiver's DC spike lands in the channel (the same problem the scan grid had; a one-off demod read it as a 59 dB carrier on 2026-10-23). Keeping the centre off the channel needs the lease manager to know the capture's minimum width before it tunes, which the capability record does not carry, and the offset depends on the notch width plan 15 measures (`SCAN_NOTCH_HZ`: its live acceptance's figure is this gist's input). Its own small plan after plan 15.
 
 ## Bug: stopped jobs leave work running (CPU leak, "channel stage lagged")
 
