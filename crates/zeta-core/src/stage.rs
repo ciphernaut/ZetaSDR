@@ -72,6 +72,9 @@ pub struct StageContext {
     /// The mode row the job runs, when its kind resolves to one: a decoder stage then
     /// publishes its events in the row's envelope (`protocol`, `summary`, `t_ns`).
     pub mode: Option<Arc<ModeRow>>,
+    /// The absolute frequency of the receiver's DC (the capture's centre), `Some`
+    /// only for a job on a local hardware source (`ops::local_hardware`).
+    pub dc_hz: Option<u64>,
 }
 
 impl StageContext {
@@ -82,7 +85,13 @@ impl StageContext {
             bank: None,
             note: None,
             mode: None,
+            dc_hz: None,
         }
+    }
+
+    /// This context with the receiver's DC at `hz` (`None` for none).
+    pub fn with_dc_hz(self, hz: Option<u64>) -> Self {
+        Self { dc_hz: hz, ..self }
     }
 
     /// This context with `note`.

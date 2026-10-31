@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, Tried};
-use zeta_core::ops::channel_rate_hz;
+use zeta_core::ops::{MEASURE_DC_MASK_HZ, channel_rate_hz};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Baud, Hz, Provenance, StreamId, StreamKind, Timestamp};
@@ -367,6 +367,23 @@ pub fn measure_band(
     block_center_hz: u64,
     bandwidth_hz: u64,
 ) -> FeatureRecord {
+    measure_band_masked(iq, rate_hz, block_center_hz, bandwidth_hz, None)
+}
+
+/// [`measure_band`] with the receiver's DC spike masked: `dc = Some((dc_hz,
+/// half_width_hz))` masks the in-band bins whose centre lies within
+/// `half_width_hz` of `dc_hz - block_center_hz` (the DC's offset in the block).
+/// The floor is the 15th percentile of the unmasked in-band bins; the masked bins
+/// are then set to that floor, so they are neither the peak nor occupied. When
+/// the mask covers every in-band bin, or `dc_hz` lies outside the band, it is not
+/// applied and the result is [`measure_band`]'s.
+pub fn measure_band_masked(
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    block_center_hz: u64,
+    bandwidth_hz: u64,
+    dc: Option<(u64, u64)>,
+) -> FeatureRecord {
     if iq.is_empty() || rate_hz == 0 {
         return FeatureRecord {
             bandwidth_hz: Hz(0),
@@ -379,8 +396,42 @@ pub fn measure_band(
     let bin_hz = rate_hz as f64 / SIZE as f64;
     let half_bins = ((bandwidth_hz as f64 / 2.0 / bin_hz).floor() as usize).min(SIZE / 2);
     let first = SIZE / 2 - half_bins;
-    let db = &spectrum(iq)[first..(SIZE / 2 + half_bins + 1).min(SIZE)];
-    let floor = percentile(db, FLOOR_PERCENTILE);
+    let mut db = spectrum(iq)[first..(SIZE / 2 + half_bins + 1).min(SIZE)].to_vec();
+    // The in-band bins within the mask of the DC's offset in the block, when the
+    // DC lies inside the band.
+    let masked: Vec<bool> = match dc {
+        Some((dc_hz, half_width_hz)) => {
+            let dc_off = dc_hz as f64 - block_center_hz as f64;
+            let edge = (half_bins as f64 + 0.5) * bin_hz;
+            let inside = dc_off.abs() <= edge;
+            (0..db.len())
+                .map(|i| {
+                    let off = ((i + first) as f64 - (SIZE / 2) as f64) * bin_hz;
+                    inside && (off - dc_off).abs() <= half_width_hz as f64
+                })
+                .collect()
+        }
+        None => vec![false; db.len()],
+    };
+    let unmasked: Vec<f32> = db
+        .iter()
+        .zip(&masked)
+        .filter(|(_, m)| !**m)
+        .map(|(v, _)| *v)
+        .collect();
+    let floor = if unmasked.is_empty() {
+        // The mask covers the whole band: not applied.
+        percentile(&db, FLOOR_PERCENTILE)
+    } else {
+        let floor = percentile(&unmasked, FLOOR_PERCENTILE);
+        for (v, m) in db.iter_mut().zip(&masked) {
+            if *m {
+                *v = floor;
+            }
+        }
+        floor
+    };
+    let db = &db[..];
     let peak = argmax(db);
     let gap = (GAP_HZ / bin_hz).floor() as usize;
     let (lo, hi) = occupied(db, peak, floor + OCCUPIED_DB, gap);
@@ -740,9 +791,13 @@ pub const MIN_PARTIAL_S: f64 = 0.25;
 /// its samples when it holds at least [`MIN_PARTIAL_S`] of them (and
 /// [`SIZE`] samples), else discarded, and a new window starts from the next
 /// block, so a window never stitches across a gap. Each discard and partial is
-/// noted to the job as `{"measure": {"discarded", "partial", "last"}}`
-/// (`last`: `gap`, `lag` or `retune`; counts cumulative for the run). A window
-/// left when the input closes is not measured.
+/// noted to the job as `{"measure": {"discarded", "partial", "last", "dc_mask_hz"}}`
+/// (`last`: `gap`, `lag` or `retune`; counts cumulative for the run), and once
+/// when the stage starts with no cut yet. A window left when the input closes is
+/// not measured. With a `dc_hz` in its context (a local hardware receiver) the
+/// bins within [`MEASURE_DC_MASK_HZ`] of it take no part in the floor, the peak
+/// or the occupied band (see [`measure_band_masked`]); `dc_mask_hz` is that
+/// half-width, 0 without one.
 pub struct MeasureStage {
     spec: StageSpec,
 }
@@ -794,6 +849,11 @@ impl Stage for MeasureStage {
         let mut window: Option<(Provenance, Timestamp, u64, u64)> = None;
         let mut buf: Vec<Complex<f32>> = Vec::new();
         let (mut discarded, mut partials) = (0u64, 0u64);
+        // The receiver's DC, masked on a local hardware source only.
+        let dc = ctx.dc_hz.map(|hz| (hz, MEASURE_DC_MASK_HZ));
+        let dc_mask_hz = dc.map_or(0, |d| d.1);
+        ctx.note(serde_json::json!({"measure": {
+            "discarded": 0, "partial": 0, "last": null, "dc_mask_hz": dc_mask_hz}}));
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             // Cut the window short for `why`: a partial event, or a discard.
             let mut cut = |window: &mut Option<(Provenance, Timestamp, u64, u64)>,
@@ -809,13 +869,16 @@ impl Stage for MeasureStage {
                     held.len() >= (rate as f64 * MIN_PARTIAL_S) as usize && held.len() >= SIZE;
                 let event = if enough {
                     partials += 1;
-                    Some(window_event(&held, &p, &out, prov, t0, rate, center, true)?)
+                    Some(window_event(
+                        &held, &p, &out, prov, t0, rate, center, dc, true,
+                    )?)
                 } else {
                     discarded += 1;
                     None
                 };
                 ctx.note(serde_json::json!({"measure": {
-                    "discarded": discarded, "partial": partials, "last": why}}));
+                    "discarded": discarded, "partial": partials, "last": why,
+                    "dc_mask_hz": dc_mask_hz}}));
                 Ok(event.into_iter().collect())
             };
             let frame = match input {
@@ -851,7 +914,9 @@ impl Stage for MeasureStage {
             if rate == 0 || (buf.len() as u64) < rate {
                 return Ok(events);
             }
-            events.push(window_event(&buf, &p, &out, prov, t0, rate, center, false)?);
+            events.push(window_event(
+                &buf, &p, &out, prov, t0, rate, center, dc, false,
+            )?);
             window = None;
             buf.clear();
             Ok(events)
@@ -871,9 +936,10 @@ fn window_event(
     t0: Timestamp,
     rate: u64,
     center: u64,
+    dc: Option<(u64, u64)>,
     partial: bool,
 ) -> Result<Frame, StageError> {
-    let f = measure_band(buf, rate, center, p.bandwidth_hz.unwrap_or(rate));
+    let f = measure_band_masked(buf, rate, center, p.bandwidth_hz.unwrap_or(rate), dc);
     let label = layer1_label(&f, buf, rate);
     let mut ev =
         serde_json::to_value(&f).map_err(|e| StageError::Failed(format!("measure: {e}")))?;
@@ -979,6 +1045,7 @@ mod tests {
     const RATE: u64 = 48_000;
     const CENTER: u64 = 144_800_000;
     const BIN_HZ: f64 = RATE as f64 / 1024.0;
+    const WIDE_RATE: u64 = 192_000;
 
     fn show(what: &str, f: &FeatureRecord, l: &Label) {
         eprintln!("{what}: {f:?} -> {} ({})", l.name, l.evidence);
@@ -1184,6 +1251,7 @@ mod tests {
     /// broadcast input of `cap`; its events and the notes it made.
     async fn run_stage(
         cap: usize,
+        dc_hz: Option<u64>,
         script: impl FnOnce(broadcast::Sender<Frame>, Provenance) -> futures_script::Script,
     ) -> (Vec<Frame>, Vec<serde_json::Value>) {
         use zeta_core::types::{SourceId, Span, Timestamp};
@@ -1203,6 +1271,7 @@ mod tests {
         let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = notes.clone();
         let ctx = zeta_core::stage::StageContext::new(SourceId("s".into()))
+            .with_dc_hz(dc_hz)
             .with_note(Arc::new(move |v| sink.lock().unwrap().push(v)));
         let h = tokio::spawn(async move {
             MeasureStage::new()
@@ -1231,6 +1300,10 @@ mod tests {
     }
 
     fn iq_frame(prov: &Provenance, t0: u64, block: &[Complex<f32>]) -> Frame {
+        iq_frame_at(prov, t0, RATE, block)
+    }
+
+    fn iq_frame_at(prov: &Provenance, t0: u64, rate: u64, block: &[Complex<f32>]) -> Frame {
         use zeta_core::port::IqBlock;
         use zeta_core::types::Timestamp;
         Frame::new(
@@ -1238,7 +1311,7 @@ mod tests {
             prov.clone(),
             Payload::Iq(IqBlock {
                 t0: Timestamp(t0),
-                sample_rate_hz: Hz(RATE),
+                sample_rate_hz: Hz(rate),
                 center_hz: Hz(CENTER),
                 samples: block.to_vec().into(),
             }),
@@ -1261,7 +1334,7 @@ mod tests {
         let pre = 1_000_000_000u64;
         // 5 blocks (0.5 s), a 10 ms gap, then 10 blocks (1 s).
         let post = pre + 500_000_000 + 10_000_000;
-        let (events, notes) = run_stage(32, |tx, prov| {
+        let (events, notes) = run_stage(32, None, |tx, prov| {
             Box::pin(async move {
                 for (i, b) in blocks.iter().take(5).enumerate() {
                     tx.send(iq_frame(&prov, pre + i as u64 * 100_000_000, b))
@@ -1288,14 +1361,14 @@ mod tests {
         assert_eq!(span_ns(&events[1]), 1_000_000_000);
         assert_eq!(
             notes.last().unwrap(),
-            &serde_json::json!({"measure": {"discarded": 0, "partial": 1, "last": "gap"}})
+            &serde_json::json!({"measure": {"discarded": 0, "partial": 1, "last": "gap", "dc_mask_hz": 0}})
         );
     }
 
     #[tokio::test]
     async fn measure_stage_drops_a_short_remainder_on_lag() {
         let blocks = tone_blocks(10);
-        let (events, notes) = run_stage(8, |tx, prov| {
+        let (events, notes) = run_stage(8, None, |tx, prov| {
             Box::pin(async move {
                 tx.send(iq_frame(&prov, 1_000_000_000, &blocks[0])).unwrap();
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1310,7 +1383,7 @@ mod tests {
         assert!(events.is_empty(), "0.1 s is under MIN_PARTIAL_S");
         assert_eq!(
             notes.last().unwrap(),
-            &serde_json::json!({"measure": {"discarded": 1, "partial": 0, "last": "lag"}})
+            &serde_json::json!({"measure": {"discarded": 1, "partial": 0, "last": "lag", "dc_mask_hz": 0}})
         );
     }
 
@@ -1318,7 +1391,7 @@ mod tests {
     async fn a_partial_window_spans_its_samples() {
         let blocks = tone_blocks(4);
         // 0.3 s, then a block 1 s late: the 0.3 s remainder is a partial.
-        let (events, _) = run_stage(16, |tx, prov| {
+        let (events, _) = run_stage(16, None, |tx, prov| {
             Box::pin(async move {
                 for (i, b) in blocks.iter().take(3).enumerate() {
                     tx.send(iq_frame(&prov, 1_000_000_000 + i as u64 * 100_000_000, b))
@@ -1377,5 +1450,104 @@ mod tests {
                 .any(|l| l.layer == 2 && l.name == "FM Broadcast Radio"),
             "{labels:?}"
         );
+    }
+
+    /// A tone 40 kHz above centre at 0.1 under a DC spike (a constant 0.5) and 20 dB noise.
+    fn spike_and_tone(n: usize) -> Vec<Complex<f32>> {
+        let mut iq: Vec<Complex<f32>> = crate::util::nco(n, 40_000.0, WIDE_RATE as f64)
+            .into_iter()
+            .map(|c| c * 0.1 + Complex::new(0.5, 0.0))
+            .collect();
+        awgn(&mut iq, 20.0, 7);
+        iq
+    }
+
+    #[test]
+    fn measure_band_masked_ignores_the_dc_spike() {
+        let iq = spike_and_tone(WIDE_RATE as usize);
+        let bin = WIDE_RATE as f64 / SIZE as f64; // 187.5 Hz
+        let plain = measure_band(&iq, WIDE_RATE, CENTER, WIDE_RATE);
+        assert!(
+            (plain.center_hz.0 as f64 - CENTER as f64).abs() <= bin,
+            "{plain:?}"
+        );
+        let masked = measure_band_masked(&iq, WIDE_RATE, CENTER, WIDE_RATE, Some((CENTER, 25_000)));
+        assert!(
+            (masked.center_hz.0 as f64 - (CENTER + 40_000) as f64).abs() <= 2.0 * bin,
+            "{masked:?}"
+        );
+        assert!(masked.snr_db > 10.0, "{masked:?}");
+        assert_eq!(
+            measure_band_masked(&iq, WIDE_RATE, CENTER, WIDE_RATE, None),
+            plain
+        );
+    }
+
+    #[test]
+    fn measure_band_masked_with_the_mask_over_the_whole_band_measures_as_today() {
+        // A 12.5 kHz band around the DC: every in-band bin is within 25 kHz of it.
+        let iq = spike_and_tone(WIDE_RATE as usize);
+        let plain = measure_band(&iq, WIDE_RATE, CENTER, 12_500);
+        assert_eq!(
+            measure_band_masked(&iq, WIDE_RATE, CENTER, 12_500, Some((CENTER, 25_000))),
+            plain
+        );
+        // A DC outside the band: not applied either.
+        assert_eq!(
+            measure_band_masked(
+                &iq,
+                WIDE_RATE,
+                CENTER,
+                WIDE_RATE,
+                Some((CENTER + 500_000, 25_000))
+            ),
+            measure_band(&iq, WIDE_RATE, CENTER, WIDE_RATE)
+        );
+    }
+
+    /// One full second of [`spike_and_tone`] at [`WIDE_RATE`] through a measure stage
+    /// whose context carries `dc_hz`: the one event and the notes.
+    async fn spike_second(dc_hz: Option<u64>) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let iq = spike_and_tone(WIDE_RATE as usize);
+        let (events, notes) = run_stage(32, dc_hz, |tx, prov| {
+            Box::pin(async move {
+                let block = WIDE_RATE as usize / 10;
+                for (i, b) in iq.chunks(block).enumerate() {
+                    tx.send(iq_frame_at(
+                        &prov,
+                        1_000_000_000 + i as u64 * 100_000_000,
+                        WIDE_RATE,
+                        b,
+                    ))
+                    .unwrap();
+                }
+            })
+        })
+        .await;
+        assert_eq!(events.len(), 1, "one full second");
+        let Payload::Event(ev) = &events[0].payload else {
+            panic!("event")
+        };
+        assert_eq!(ev["partial"], false);
+        (ev.clone(), notes)
+    }
+
+    #[tokio::test]
+    async fn measure_stage_masks_the_dc_only_with_a_dc_hz_in_its_context() {
+        let bin = WIDE_RATE as f64 / SIZE as f64;
+        let (ev, notes) = spike_second(Some(CENTER)).await;
+        let center = ev["center_hz"].as_u64().unwrap() as f64;
+        assert!(
+            (center - (CENTER + 40_000) as f64).abs() <= 2.0 * bin,
+            "{ev}"
+        );
+        assert_eq!(
+            notes[0],
+            serde_json::json!({"measure": {"discarded": 0, "partial": 0, "last": null, "dc_mask_hz": 25_000}})
+        );
+        let (ev, notes) = spike_second(None).await;
+        let center = ev["center_hz"].as_u64().unwrap() as f64;
+        assert!((center - CENTER as f64).abs() <= bin, "{ev}");
+        assert_eq!(notes[0]["measure"]["dc_mask_hz"], 0);
     }
 }

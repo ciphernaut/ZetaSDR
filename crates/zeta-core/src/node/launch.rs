@@ -18,8 +18,8 @@ use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
 use crate::ops::{
-    JobKind, SPECTRUM_ROWS_PER_S, ScanGrid, scan_grid, scan_mask_default, scan_notch_in_force,
-    spectrum_size,
+    JobKind, SPECTRUM_ROWS_PER_S, ScanGrid, local_hardware, scan_grid, scan_mask_default,
+    scan_notch_in_force, spectrum_size,
 };
 use crate::port::{IqBlock, IqReceiver, Port, Tuning};
 use crate::ring::IqRing;
@@ -126,6 +126,8 @@ impl Inner {
         crate::ops::fill_squelch_params(&mut rec.graph);
         let mut stages = self.stages(&rec.graph)?;
         let mut bank = None;
+        // The receiver's DC (the capture's centre) for a job on a local hardware source.
+        let mut dc_hz = None;
         if let Some(port) = &port {
             // Without `gate` the source's gate is held only inside `ensure_tuned`.
             let leased = match gate {
@@ -166,6 +168,9 @@ impl Inner {
                 return Err(e);
             }
             let capture = port.current();
+            dc_hz = capture
+                .filter(|_| local_hardware(port.capabilities()))
+                .map(|b| b.center_hz.0);
             // A built-in graph expanded for another rate than the capture the lease
             // left the port at (a resume, or a rate change since the expand) is
             // expanded again for this one; the record below persists it.
@@ -199,6 +204,7 @@ impl Inner {
         let ctx = StageContext {
             bank,
             mode,
+            dc_hz,
             ..StageContext::new(rec.source.clone())
         }
         .with_note(Arc::new(move |v| {
