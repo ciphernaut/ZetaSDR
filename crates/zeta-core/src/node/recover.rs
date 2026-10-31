@@ -131,7 +131,9 @@ impl Inner {
         }
     }
 
-    /// When `source`'s open fault episode began, if one is open.
+    /// When `source`'s open fault episode began, if one is open. Only the tests read
+    /// it (`Node::debug_fault_episode`), so it is built with them alone.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(super) fn episode_since(&self, source: &SourceId) -> Option<u64> {
         self.episodes
             .lock()

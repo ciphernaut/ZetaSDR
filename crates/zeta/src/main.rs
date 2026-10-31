@@ -6,6 +6,7 @@ mod cli;
 mod modes_check;
 mod node_setup;
 mod serve_lock;
+mod soapy_worker;
 mod sources;
 mod transport;
 
@@ -45,6 +46,11 @@ async fn main() -> ExitCode {
     if let cli::Command::Soapy(cli::SoapyCmd::Find { filter }) = &cli.command {
         return node_setup::soapy_find(filter);
     }
+    // The node's own child: it serves one device to its parent, whatever else was given.
+    if let cli::Command::SoapyWorker(args) = cli.command {
+        return soapy_worker::run(args).await;
+    }
+    node_setup::set_soapy_in_process(cli.soapy_in_process);
     let cli = match transport::dispatch(cli).await {
         Ok(code) => return code,
         Err(cli) => cli,

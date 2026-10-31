@@ -1417,6 +1417,43 @@ fn soapy_without_cfg_is_explained() {
         .stderr(contains("libsoapysdr-dev"));
 }
 
+/// The worker subcommand of a build without the driver exits 1 naming the rebuild, as
+/// `--source-soapy` and `soapy find` do; a node never spawns it in such a build.
+#[cfg(not(soapy))]
+#[test]
+fn soapy_worker_without_the_cfg_exits_1_naming_the_rebuild() {
+    zeta_bin()
+        .args(["soapy-worker", "--id", "x", "--args", "driver=hackrf"])
+        .assert()
+        .code(1)
+        .stderr(contains("built without soapy"));
+}
+
+/// `soapy-worker` is the node's own child, not an operator command: it is left out of
+/// `--help` but still answers its own `--help`.
+#[test]
+fn soapy_worker_is_hidden_from_help() {
+    zeta_bin()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(contains("soapy-worker").not());
+    zeta_bin()
+        .args(["soapy-worker", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--args"));
+}
+
+/// `--soapy-in-process` is a global flag: a node without a Soapy source accepts it.
+#[test]
+fn soapy_in_process_is_accepted_as_a_global_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    zeta(dir.path(), &["--soapy-in-process", "source", "list"])
+        .assert()
+        .success();
+}
+
 #[test]
 fn node_mode_rejects_source_and_plugin_flags() {
     for flags in [

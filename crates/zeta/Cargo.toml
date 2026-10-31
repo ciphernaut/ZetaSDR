@@ -8,7 +8,7 @@ description = "ZetaSDR command-line node"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "env"] }
 serde_json = "1.0.154"
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1.53.3", features = ["io-std", "io-util", "rt-multi-thread", "macros", "signal", "time"] }
 zeta-core = { path = "../zeta-core" }
 zeta-client = { path = "../zeta-client" }
 zeta-ws = { path = "../zeta-ws" }
@@ -22,12 +22,16 @@ zeta-source-node = { path = "../zeta-source-node" }
 zeta-source-vrt = { path = "../zeta-source-vrt" }
 zeta-plugin = { path = "../zeta-plugin" }
 zeta-ext = { path = "../zeta-ext" }
+zeta-source-worker = { path = "../zeta-source-worker" }
 
 # The real SoapySDR driver links libSoapySDR (needs libsoapysdr-dev), so it is
 # behind a cfg, not a feature: `--all-features` must never build it. Build with
 # RUSTFLAGS="--cfg soapy" cargo build -p zeta --release
 [target.'cfg(soapy)'.dependencies]
 zeta-source-soapy-driver = { path = "../zeta-source-soapy-driver" }
+# The worker's own pieces: zeta's gain=/ppm= split, and prctl for the parent-death signal.
+zeta-source-soapy = { path = "../zeta-source-soapy" }
+libc = "0.2.191"
 
 [features]
 gpu = ["zeta-dsp/gpu"]

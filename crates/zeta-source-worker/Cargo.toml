@@ -28,4 +28,7 @@ test-bin = ["dep:zeta-source-soapy", "zeta-source-soapy/test-mock", "dep:zeta-so
 
 [dev-dependencies]
 tempfile = "3.27.0"
+zeta-core = { path = "../zeta-core", features = ["test-fixtures"] }
+zeta-dsp = { path = "../zeta-dsp" }
+zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] }
 zeta-source-worker = { path = ".", features = ["test-bin"] }

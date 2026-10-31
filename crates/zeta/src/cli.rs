@@ -27,6 +27,10 @@ pub struct Cli {
     /// e.g. driver=hackrf,serial=... (repeatable; needs a build with --cfg soapy)
     #[arg(long = "source-soapy", global = true, value_name = "ID=ARGS", value_parser = sources::parse_soapy)]
     source_soapy: Vec<SourceSpec>,
+    /// Open --source-soapy devices inside this process instead of a supervised worker
+    /// child (diagnosis only: a driver crash then ends the node)
+    #[arg(long, global = true)]
+    pub soapy_in_process: bool,
     /// Register a KiwiSDR as source <ID> (repeatable). The password is never printed,
     /// but like --secret it is visible in `ps`; prefer ZETA_KIWI_PASSWORD_<ID> (ID
     /// upper-cased, other characters as `_`), used when there is no /PASSWORD
@@ -223,6 +227,21 @@ pub enum Command {
     /// SoapySDR devices attached to this machine (local; not an operation)
     #[command(subcommand)]
     Soapy(SoapyCmd),
+    /// Serve one SoapySDR device over stdin and stdout for the node that spawned it
+    /// (the node's own child; not an operator command)
+    #[command(hide = true)]
+    SoapyWorker(SoapyWorkerArgs),
+}
+
+/// `zeta soapy-worker`: the device a node's `--source-soapy` names, served to that node.
+#[derive(Debug, Clone, Args)]
+pub struct SoapyWorkerArgs {
+    /// The source id the device serves as
+    #[arg(long)]
+    pub id: String,
+    /// SoapySDR device arguments, zeta's own gain= and ppm= included
+    #[arg(long)]
+    pub args: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -839,6 +858,7 @@ impl Command {
             | Command::Serve(_)
             | Command::Ask(_)
             | Command::Soapy(_)
+            | Command::SoapyWorker(_)
             | Command::Ops(_)
             | Command::Modes(ModesCmd::Check { .. })
             | Command::Transcripts(_) => {

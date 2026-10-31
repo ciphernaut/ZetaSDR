@@ -169,16 +169,78 @@ pub fn soapy_find(filter: &str) -> std::process::ExitCode {
     }
 }
 
-/// Open the SoapySDR device `args` as source `id`.
-#[cfg(soapy)]
-fn open_soapy(id: &str, args: &str) -> Result<Arc<dyn Port>, String> {
-    zeta_source_soapy_driver::open(SourceId(id.to_owned()), args)
-        .map(|s| Arc::new(s) as Arc<dyn Port>)
-        .map_err(|e| e.to_string())
+/// Whether `--soapy-in-process` was given: set once by `main` before any node opens.
+/// A process-wide switch rather than a parameter of [`open`], because it is a diagnosis
+/// aid for the whole process and every caller of [`open`] (one-shot, `serve`, `ask`)
+/// must honour it alike.
+static SOAPY_IN_PROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record `--soapy-in-process` for every node this process opens.
+pub fn set_soapy_in_process(on: bool) {
+    SOAPY_IN_PROCESS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// What a device absent at startup adds when no earlier open cached its capabilities:
+/// without them the node cannot list the source, so it is refused rather than attached
+/// faulted.
+#[cfg(soapy)]
+const NEVER_SEEN: &str = "never seen on this host; plug it in once";
+
+/// Open the SoapySDR device `args` as source `id`.
+///
+/// By default the device runs in a `zeta soapy-worker` child of this process, spawned
+/// and supervised by a [`WorkerPort`](zeta_source_worker::port::WorkerPort), so a driver
+/// crash faults the source and the worker is respawned instead of the node going down.
+/// A device absent at startup attaches faulted (and is polled for) when the source
+/// record in `state_dir` holds the capabilities an earlier open cached; never seen, it
+/// is refused. `in_process` (`--soapy-in-process`) opens the driver here instead, the
+/// path before workers existed, for diagnosis.
+#[cfg(soapy)]
+async fn open_soapy(
+    id: &str,
+    args: &str,
+    in_process: bool,
+    state_dir: &Path,
+) -> Result<Arc<dyn Port>, String> {
+    use zeta_source_worker::port::{Timings, WorkerConfig, WorkerPort};
+    if in_process {
+        return zeta_source_soapy_driver::open(SourceId(id.to_owned()), args)
+            .map(|s| Arc::new(s) as Arc<dyn Port>)
+            .map_err(|e| e.to_string());
+    }
+    let program = std::env::current_exe().map_err(|e| format!("locating zeta: {e}"))?;
+    let source = SourceId(id.to_owned());
+    let cached = zeta_core::node::load_source(&state_dir.join("sources"), &source)
+        .and_then(|r| r.capabilities);
+    let seen = cached.is_some();
+    let cfg = WorkerConfig {
+        id: source,
+        program,
+        args: ["soapy-worker", "--id", id, "--args", args]
+            .map(String::from)
+            .to_vec(),
+        timings: Timings::default(),
+    };
+    match WorkerPort::open(cfg, cached).await {
+        // A hello, or a device not found that was seen before: the supervisor has
+        // logged that it is waiting for the device, and the port is faulted until then.
+        Ok((port, _attach)) => Ok(port as Arc<dyn Port>),
+        Err(e) if !seen && e.starts_with("device not found: ") => {
+            Err(format!("{e} ({NEVER_SEEN})"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A build without the driver refuses before spawning anything: the worker would only
+/// exit 1 with the same text.
 #[cfg(not(soapy))]
-fn open_soapy(_id: &str, _args: &str) -> Result<Arc<dyn Port>, String> {
+async fn open_soapy(
+    _id: &str,
+    _args: &str,
+    _in_process: bool,
+    _state_dir: &Path,
+) -> Result<Arc<dyn Port>, String> {
     Err(NO_SOAPY.into())
 }
 
@@ -247,8 +309,9 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// subscriber stops at once); a KiwiSDR connects on its first tune; a remote node is asked
 /// for its source list here (with the secret from `ZETA_NODE_SECRET_<ID>`) and runs a
 /// `passthrough` job from each tune; a VRT source binds its UDP address here; a SoapySDR
-/// device is opened here. `resume` relaunches persisted `Running` jobs (`serve`); without it they
-/// are listed as persisted and left alone (one-shot). `speech` is the backend `transcribe`
+/// device is opened here, in a `zeta soapy-worker` child unless `--soapy-in-process`.
+/// `resume` relaunches persisted `Running` jobs (`serve`); without it they are listed as
+/// persisted and left alone (one-shot). `speech` is the backend `transcribe`
 /// jobs run on. `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for
 /// [`zeta_core::modes::default_operator_dir`]); each broken row is reported on stderr, one
 /// line each, then the handler report of the program rows ([`probe_handlers`]); neither
@@ -377,7 +440,11 @@ pub async fn open_with(
                 ports.push(Arc::new(p));
             }
             SourceSpec::Soapy { args, .. } => {
-                ports.push(open_soapy(spec.id(), args).map_err(|e| flag(&e))?);
+                let in_process = SOAPY_IN_PROCESS.load(std::sync::atomic::Ordering::Relaxed);
+                let p = open_soapy(spec.id(), args, in_process, &state_dir)
+                    .await
+                    .map_err(|e| flag(&e))?;
+                ports.push(p);
             }
         }
     }
