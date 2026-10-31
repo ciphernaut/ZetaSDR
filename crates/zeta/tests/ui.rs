@@ -8,7 +8,8 @@
 //! capture's centre) and `scanner` (the `tone` recording tunable over 50-150 MHz, the source
 //! the page's automatic scans pick for a view around `tone`: `retune` sorts first in
 //! `source_list` but its range does not contain 100 MHz) and `cb` (the `tone` recording
-//! relabelled at 476.9 MHz, channel 20 of the CB plan, last), and `--modes-dir` holding the
+//! relabelled at 476.9 MHz, channel 20 of the CB plan), `quiet` (1 s of low complex noise at
+//! 20 MHz, which `measure` labels `noise`; see [`quiet_fixture`]), and `--modes-dir` holding the
 //! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
 //! job; see [`fake_pos_row`]); the node's state directory is passed to ui.py in
 //! `ZETA_UI_STATE_DIR`. That node has a fake
@@ -161,6 +162,62 @@ fn tone_at(dir: &Path, stem: &str, center_hz: u64) -> PathBuf {
     let path = dir.join(format!("{stem}.sigmf-meta"));
     std::fs::write(&path, meta).expect("write meta");
     path
+}
+
+#[test]
+fn quiet_fixture_measures_as_noise() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = quiet_fixture(dir.path());
+    let out = Command::new(env!("CARGO_BIN_EXE_zeta"))
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--source-file")
+        .arg(format!("quiet={}", meta.display()))
+        .args([
+            "job",
+            "start",
+            "--kind",
+            "measure",
+            "--source",
+            "quiet",
+            "--center-hz",
+            "20000000",
+            "--bandwidth-hz",
+            "9600",
+            "--then-tail",
+            "1,3000",
+        ])
+        .output()
+        .expect("run zeta");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "zeta exited {}:\n{stdout}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("JSON on stdout");
+    let label = &v[1]["value"]["frames"][0]["payload"]["label"]["name"];
+    assert_eq!(label, "noise", "{stdout}");
+}
+
+/// The `quiet` recording as `quiet.sigmf-{meta,data}` in `dir`, labelled at 20 MHz: 48 000
+/// samples (1 s at 48 kHz) of complex noise, each part uniform in -0.01..0.01 from the LCG
+/// [`zeta_dsp::fixtures::awgn_real`] uses (seed 7), so `measure` labels it `noise`; the
+/// meta path.
+fn quiet_fixture(dir: &Path) -> PathBuf {
+    let mut state: u64 = 7;
+    let mut u = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let unit = ((state >> 11) + 1) as f64 / (1u64 << 53) as f64;
+        ((unit * 2.0 - 1.0) * 0.01) as f32
+    };
+    let iq: Vec<num_complex::Complex<f32>> = (0..48_000)
+        .map(|_| num_complex::Complex::new(u(), u()))
+        .collect();
+    zeta_dsp::fixtures::write_fixture(dir, "quiet", &iq, 48_000, 20_000_000)
 }
 
 /// Wall-clock limit on the whole ui.py run.
@@ -321,6 +378,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
     );
     // The tone recording labelled at 476.9 MHz, channel 20 of the node's CB plan.
     let cb = format!("cb={}", tone_at(dir.path(), "cb", 476_900_000).display());
+    // Noise only, at 20 MHz: a fitted demodulator finds no signal there.
+    let quiet = format!("quiet={}", quiet_fixture(dir.path()).display());
     let sock_dir = socket_dir();
     let sock = sock_dir.path().join("voiced.sock");
     let _voiced = fake_voiced(&sock);
@@ -349,6 +408,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
             &scanner,
             "--source-file",
             &cb,
+            "--source-file",
+            &quiet,
         ],
         &["--stt-socket", sock],
         &[

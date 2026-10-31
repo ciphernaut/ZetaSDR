@@ -10,7 +10,10 @@ Run by `cargo test -p zeta --test ui`, which starts the node with the `tone`, `a
 `HELLO ZETA` to address 1234567, 48 kHz at 148.6375 MHz) and `speech` (speech-like bursts,
 wideband FM, 240 kHz at 104.7 MHz) fixtures, `retune` (the tone recording at 250 MHz,
 tunable over 200-300 MHz: a tune moves its capture's centre), `scanner` (the tone recording
-tunable over 50-150 MHz: the source automatic scans around `tone` pick), and a fake speech daemon (`--stt-socket`, answering `what sources are there`), passes the node's
+tunable over 50-150 MHz: the source automatic scans around `tone` pick), `cb` (the tone
+recording at 476.9 MHz), `quiet` (low complex noise at 20 MHz, which `measure` labels `noise`:
+a fitted demodulator finds no signal there), and a fake speech daemon (`--stt-socket`,
+answering `what sources are there`), passes the node's
 state directory in ZETA_UI_STATE_DIR, and the URL of a second node started without a speech
 daemon (with the `speech` source) in ZETA_UI_URL_NOSTT (for the "no daemon" scenarios).
 """
@@ -115,7 +118,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (8 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (9 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -197,7 +200,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (8 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (9 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -222,7 +225,7 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb"):
+    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -516,7 +519,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (8 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (9 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -617,6 +620,68 @@ def scenario_decode_starts_job_and_logs_op(page, url, secret):
                 if j["kind"] == "fm_demod" and j["source"] == "tone"
                 and j["state"]["status"] == "running"]
         assert len(jobs) == 1, f"fm_demod jobs on tone: {jobs}"
+    finally:
+        for j in jobs:
+            stop_job(url, secret, j["id"])
+
+
+def running_jobs(url, secret, kind, source):
+    return [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            if j["kind"] == kind and j["source"] == source
+            and j["state"]["status"] == "running"]
+
+
+def scenario_fit_first_lands_on_the_tone(page, url, secret):
+    # The box is about 99.9952-100.0048 MHz (9.6 kHz); the tone is at 100.001 MHz. The NBFM
+    # entry measures the box first (the menu stays open, its footer reading `measuring…`),
+    # then starts on the measured centre, 1.25x the occupied width floored at 5 kHz and
+    # capped at the box. The noise-free tone's occupied width is the window's leakage skirt
+    # (measured 4781 Hz in a fresh measure job's first window, 7359 Hz after), so the width
+    # is checked as fitted (at least the floor, under the box), not pinned.
+    menu = open_menu_on_tone(page, url, secret)
+    page.click('#ctx .ctx-item[data-action="fm_demod"]')
+    jobs = []
+    try:
+        expect(page.locator("#ctx-footer")).to_have_text("measuring…")
+        expect(menu).to_be_hidden(timeout=10_000)
+        note = page.locator("#transcript .line.note", has_text=re.compile(
+            r"^fitted fm_demod to 100\.00\d\d MHz, \d+\.\d kHz \(carrier\)$"))
+        expect(note).to_have_count(1)
+        jobs = running_jobs(url, secret, "fm_demod", "tone")
+        assert len(jobs) == 1, f"fm_demod jobs on tone: {jobs}"
+        t = jobs[0]["tuning"]
+        assert abs(t["center_hz"] - 100_001_000) <= 100, f"tuning {t}"
+        assert 5000 <= t["bandwidth_hz"] < 9600, f"tuning {t}"
+        khz = re.search(r", (\d+\.\d) kHz", note.text_content()).group(1)
+        assert khz == f"{t['bandwidth_hz'] / 1e3:.1f}", f"note {khz} kHz for tuning {t}"
+        left = running_jobs(url, secret, "measure", "tone")
+        assert not left, f"measure jobs left on tone: {left}"
+    finally:
+        for j in jobs:
+            stop_job(url, secret, j["id"])
+
+
+def scenario_fit_first_without_a_signal_starts_at_the_box(page, url, secret):
+    # Noise only: the fit finds no signal and the job starts at the box as drawn.
+    select_source(page, url, secret, "quiet")
+    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    menu = drag_menu(page, 0.40, 0.60)
+    footer = page.locator("#ctx-footer").text_content()
+    m = re.search(r"center_hz=(\d+) bandwidth_hz=(\d+)", footer)
+    c, bw = int(m.group(1)), int(m.group(2))
+    page.click('#ctx .ctx-item[data-action="fm_demod"]')
+    jobs = []
+    try:
+        expect(menu).to_be_hidden(timeout=10_000)
+        expect(page.locator("#transcript .line.note", has_text=re.compile(
+            r"^no signal found in 19\.99\d\d-20\.00\d\d MHz; "
+            r"started fm_demod at the box as drawn$"))).to_have_count(1)
+        wait_until(lambda: running_jobs(url, secret, "fm_demod", "quiet"), 5.0,
+                   "a running fm_demod on quiet")
+        jobs = running_jobs(url, secret, "fm_demod", "quiet")
+        assert len(jobs) == 1, f"fm_demod jobs on quiet: {jobs}"
+        assert jobs[0]["tuning"] == {"center_hz": c, "bandwidth_hz": bw}, \
+            f"tuning {jobs[0]['tuning']} for footer {footer!r}"
     finally:
         for j in jobs:
             stop_job(url, secret, j["id"])
@@ -2009,8 +2074,8 @@ def scenario_ssb_entry_tunes_the_dial(page, url, secret):
     jobs = []
     try:
         expect(page.locator("#transcript .line.op", has_text=re.compile(
-            rf"^job_start kind=ssb_demod source=tone center_hz={centre - 1500} "
-            r"bandwidth_hz=6000 sideband=usb → job ")).first).to_be_visible()
+            r"^job_start kind=ssb_demod source=tone center_hz=\d+ "
+            r"bandwidth_hz=\d+ sideband=usb → job ")).first).to_be_visible()
         jobs = [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
                 if j["kind"] == "ssb_demod" and j["source"] == "tone"
                 and j["state"]["status"] == "running"]

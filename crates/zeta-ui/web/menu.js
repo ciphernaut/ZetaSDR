@@ -9,6 +9,24 @@
 //       failed, the failure already reported); `attachOp(jobId)` the `job_attach` op that
 //       transcribes a job (as the job rows' Transcribe button applies it); `ask(text)` is
 //       its /ask path.
+//   FIT_KINDS, FIT_MIN_HZ, FIT_MIN_HZ_DEFAULT, FIT_FACTOR, FIT_TIMEOUT_MS, FIT_NOISE_SNR_DB
+//       the fit of a demodulator entry (see Fitting below)
+//   fitBand(api, source, centerHz, bandwidthHz)
+//       -> Promise<{centerHz, bandwidthHz, label, snrDb, dialHz} | null>
+//       Starts a `measure` job on the band (api.op, so an OpError propagates), tails one of
+//       its events from its `event` stream (stream_tail, max_frames 3, FIT_TIMEOUT_MS) and
+//       stops it (always). The frame used is the first whose payload has `partial: false`,
+//       else the last; null when no frame came, when its label is `noise`, or when it is
+//       `unknown` under FIT_NOISE_SNR_DB. `label` is the label's name, `snrDb` its `snr_db`,
+//       `dialHz` the integer of `dial ≈ <n> Hz` in the label's evidence (an SSB label's), else
+//       null.
+//   fitTuning(job, fit, box) -> {centerHz, bandwidthHz}
+//       The tuning a fitted demodulator starts with (`job` a JOBS entry or {kind, sideband};
+//       only `box.bandwidthHz`, the cap, is read): the centre is the dial when `job.sideband`
+//       and fit.dialHz is known, else for SSB fit.centerHz ∓ SSB_DIAL_OFFSET_HZ (usb −,
+//       lsb +), else fit.centerHz; the width is fit.bandwidthHz × FIT_FACTOR, at least
+//       FIT_MIN_HZ[kind] (FIT_MIN_HZ_DEFAULT for a kind without one), at most box.bandwidthHz.
+//       Integers.
 //   Menu:
 //     menu.open(sel, x, y)  shows the menu for a waterfall selection at client (x, y)
 //     menu.close()          hides it and erases the selection rectangle
@@ -44,18 +62,22 @@
 //   acars_decode  Decode › ACARS              job_start kind=acars_decode, deviation_hz null,
 //                                             bandwidth_hz at least ACARS_MIN_BANDWIDTH_HZ
 //   fm_demod   Decode › NBFM audio            job_start kind=fm_demod, deviation_hz 5000
+//                                             (fitted first: see Fitting)
 //   wfm_demod  Decode › FM broadcast audio    job_start kind=wfm_demod, deviation_hz 75000,
 //                                             bandwidth_hz at least WFM_MIN_BANDWIDTH_HZ
+//                                             (fitted first)
 //   am_demod   Decode › AM                    job_start kind=am_demod, deviation_hz null
+//                                             (fitted first)
 //   ssb_usb    Decode › SSB (USB)             job_start kind=ssb_demod, sideband usb, at the
 //                                             dial: center_hz = selection centre − 1500,
-//                                             bandwidth_hz 6000 (ruling R6)
+//                                             bandwidth_hz 6000 (ruling R6; fitted first)
 //   ssb_lsb    Decode › SSB (LSB)             likewise, sideband lsb, centre + 1500
 //   wfm_transcribe  Transcribe › FM broadcast  the job_start of its Decode twin (wfm_demod,
 //   fm_transcribe   Transcribe › NBFM voice    fm_demod, am_demod, ssb_usb, ssb_lsb: same
 //   am_transcribe   Transcribe › AM            kind, deviation, sideband and tuning), then on
 //   ssb_usb_transcribe  Transcribe › SSB (USB) success attachOp(<its job>): a transcribe job
-//   ssb_lsb_transcribe  Transcribe › SSB (LSB) attached to that demodulator
+//   ssb_lsb_transcribe  Transcribe › SSB (LSB) attached to that demodulator (the twin is
+//                                             fitted first, as its Decode entry)
 //   measure    Start background job › measure job_start kind=measure, deviation_hz null
 //                                             (every job_start sends sideband: null unless SSB)
 //   scan       Scan this span                 wf.release() (stops the page's own spectrum job
@@ -75,12 +97,27 @@
 // Transcribe) is focused or hovered it shows that entry's dial instead: center_hz=<dial>
 // bandwidth_hz=6000 sideband=usb|lsb start_ns=… end_ns=….
 //
+// Fitting: the demodulator entries (a kind in FIT_KINDS: fm_demod, wfm_demod, am_demod,
+// ssb_demod; their Decode and Transcribe entries alike) measure the box before starting. The
+// menu stays open, the box drawn and #ctx-footer reading `measuring…`, while fitBand runs on
+// the selection's centre and bandwidth; then the menu closes and:
+//   - fitBand threw: the note `<kind>: <message>` (an error line) and nothing starts;
+//   - null (noise, a weak unknown, no event): the note `no signal found in <lo>-<hi> MHz;
+//     started <kind> at the box as drawn` (the box's edges, mhzText) and the job starts with
+//     the tuning above (jobTuning);
+//   - a fit: the job starts with fitTuning(job, fit, jobTuning(...)) and the note reads
+//     `fitted <kind> to <bandText(centre, width)> (<label>)`, e.g. `fitted fm_demod to
+//     100.0011 MHz, 6.0 kHz (carrier)`.
+// Every other entry closes the menu first.
+//
 // Span: the node reads the selection from the source ring, which keeps RING_HISTORY_S. The
 // span is clamped to the newest SPAN_LIMIT_NS before the newest painted column (on opening
 // and again when an entry is chosen); the footer says so when it was.
 //
 // Closing: Escape, a pointer press outside the menu, or choosing an entry. Up/Down move the
 // focus between entries; Enter or Space chooses one.
+
+import { bandText, mhzText } from "./units.js";
 
 export const SPAN_LIMIT_NS = 8_000_000_000;
 export const LABEL_STEP_PX = 18;
@@ -106,6 +143,18 @@ export const ADSB_BANDWIDTH_HZ = 2_400_000;
 // The identify entry asks for at least this bandwidth, the narrowest box classify fits the
 // mode rows to: a narrow drag would skip every row as wider than the box.
 export const IDENTIFY_MIN_BANDWIDTH_HZ = 12500;
+// The demodulators fitted to the signal before they start (see Fitting).
+export const FIT_KINDS = new Set(["fm_demod", "wfm_demod", "am_demod", "ssb_demod"]);
+// The narrowest band a fitted demodulator asks for, per kind ...
+export const FIT_MIN_HZ = { fm_demod: 5000, am_demod: 5000, ssb_demod: 3000, wfm_demod: 150000 };
+// ... and for a kind without an entry.
+export const FIT_MIN_HZ_DEFAULT = 5000;
+// The fitted band is the measured occupied width times this.
+export const FIT_FACTOR = 1.25;
+// How long the fit waits for a measure event.
+export const FIT_TIMEOUT_MS = 3000;
+// An `unknown` label under this SNR (dB) counts as no signal.
+export const FIT_NOISE_SNR_DB = 6;
 
 const ENTRIES = [
   ["classify", "What is this?"],
@@ -184,6 +233,72 @@ export function jobTuning(action, s) {
   return { centerHz: s.centerHz, bandwidthHz: s.bandwidthHz };
 }
 
+// Measures a band with a short `measure` job; the fit, or null when there is no signal.
+export async function fitBand(api, source, centerHz, bandwidthHz) {
+  const r = await api.op({
+    op: "job_start",
+    kind: "measure",
+    source,
+    center_hz: centerHz,
+    bandwidth_hz: bandwidthHz,
+    deviation_hz: null,
+    sideband: null,
+    elastic: false,
+    replace: [],
+  });
+  const id = r.value;
+  let frames = [];
+  try {
+    const streams = await api.streams();
+    const stream = streams.find(
+      (x) => x.kind === "event" && x.provenance && x.provenance.job === id,
+    );
+    if (stream) {
+      const t = await api.op({
+        op: "stream_tail",
+        stream: stream.id,
+        max_frames: 3,
+        timeout_ms: FIT_TIMEOUT_MS,
+      });
+      frames = (t && t.value && t.value.frames) || [];
+    }
+  } finally {
+    try {
+      await api.op({ op: "job_stop", job: id });
+    } catch {
+      // Best effort: a measure job that already ended needs no stop.
+    }
+  }
+  if (frames.length === 0) return null;
+  const frame = frames.find((f) => f.payload && f.payload.partial === false) ?? frames.at(-1);
+  const p = frame.payload || {};
+  const label = p.label || {};
+  if (label.name === "noise") return null;
+  if (label.name === "unknown" && p.snr_db < FIT_NOISE_SNR_DB) return null;
+  const dial = /dial ≈ (\d+) Hz/.exec(label.evidence || "");
+  return {
+    centerHz: p.center_hz,
+    bandwidthHz: p.bandwidth_hz,
+    label: label.name,
+    snrDb: p.snr_db,
+    dialHz: dial ? parseInt(dial[1], 10) : null,
+  };
+}
+
+// The tuning a fitted demodulator starts with (see the header).
+export function fitTuning(job, fit, box) {
+  let centerHz = fit.centerHz;
+  if (job.sideband && fit.dialHz !== null && fit.dialHz !== undefined) centerHz = fit.dialHz;
+  else if (job.sideband === "usb") centerHz = fit.centerHz - SSB_DIAL_OFFSET_HZ;
+  else if (job.sideband === "lsb") centerHz = fit.centerHz + SSB_DIAL_OFFSET_HZ;
+  const floor = FIT_MIN_HZ[job.kind] ?? FIT_MIN_HZ_DEFAULT;
+  const bandwidthHz = Math.min(
+    box.bandwidthHz,
+    Math.max(floor, Math.round(fit.bandwidthHz * FIT_FACTOR)),
+  );
+  return { centerHz: Math.round(centerHz), bandwidthHz: Math.round(bandwidthHz) };
+}
+
 export function mountMenu(wf, opts) {
   return new Menu(wf, opts);
 }
@@ -217,6 +332,7 @@ class Menu {
     this.t = transcript;
     this.ov = ov;
     this.sel = null;
+    this.fitting = false;
     this.labelKeys = [];
     this.pointer = { x: 0, y: 0 };
 
@@ -232,8 +348,8 @@ class Menu {
       item.textContent = text;
       item.addEventListener("click", () => this.choose(action));
       if (jobOf(action) && jobOf(action).sideband) {
-        const show = () => this.sel && this.showFooter(this.current(), action);
-        const hide = () => this.sel && this.showFooter(this.current());
+        const show = () => this.sel && !this.fitting && this.showFooter(this.current(), action);
+        const hide = () => this.sel && !this.fitting && this.showFooter(this.current());
         item.addEventListener("focus", show);
         item.addEventListener("pointerenter", show);
         item.addEventListener("blur", hide);
@@ -312,6 +428,11 @@ class Menu {
     if (!this.sel) return;
     const s = this.current();
     this.showFooter(s, action);
+    const job = jobOf(action);
+    if (job && FIT_KINDS.has(job.kind)) {
+      await this.fitAndStart(action, s, job);
+      return;
+    }
     this.close();
     const selection = {
       source: s.sourceId,
@@ -351,10 +472,46 @@ class Menu {
     }
   }
 
-  // The job_start of a job entry (a Transcribe entry: its Decode twin's); its result or null.
-  startJob(action, s) {
+  // A demodulator entry (Decode or Transcribe): fit, then start (see Fitting); a Transcribe
+  // entry attaches to the job after, as choose does.
+  async fitAndStart(action, s, job) {
+    this.footer.textContent = "measuring…";
+    // An SSB entry's hover no longer rewrites the footer.
+    this.fitting = true;
+    const kind = job.kind;
+    let fit;
+    try {
+      fit = await fitBand(this.ov.api, s.sourceId, s.centerHz, s.bandwidthHz);
+    } catch (e) {
+      this.t.note(`${kind}: ${e.message}`, true);
+      return;
+    } finally {
+      this.fitting = false;
+      this.close();
+    }
+    let r;
+    if (fit === null) {
+      const lo = s.centerHz - s.bandwidthHz / 2;
+      const hi = s.centerHz + s.bandwidthHz / 2;
+      this.t.note(
+        `no signal found in ${mhzText(lo)}-${mhzText(hi)} MHz; started ${kind} at the box as drawn`,
+      );
+      r = await this.startJob(action, s);
+    } else {
+      const t = fitTuning(job, fit, jobTuning(action, s));
+      r = await this.startJob(action, s, t);
+      this.t.note(`fitted ${kind} to ${bandText(t.centerHz, t.bandwidthHz)} (${fit.label})`);
+    }
+    if (action in TRANSCRIBE && r && r.result === "job" && r.value) {
+      await this.applyOp(this.attachOp(r.value));
+    }
+  }
+
+  // The job_start of a job entry (a Transcribe entry: its Decode twin's) with `tuning` (by
+  // default the entry's jobTuning); its result or null.
+  startJob(action, s, tuning = jobTuning(action, s)) {
     const job = jobOf(action);
-    const t = jobTuning(action, s);
+    const t = tuning;
     return this.applyOp({
       op: "job_start",
       kind: job.kind,

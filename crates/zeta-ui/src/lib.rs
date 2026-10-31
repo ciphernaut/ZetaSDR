@@ -77,6 +77,11 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
         "text/javascript; charset=utf-8",
         include_bytes!("../web/map.js"),
     ),
+    (
+        "units.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/units.js"),
+    ),
     // Leaflet 1.9.4 (BSD-2-Clause), verbatim from its release; map.js loads it on first use.
     (
         "vendor/leaflet/leaflet.js",
@@ -140,6 +145,7 @@ mod tests {
             ("coarse.js", "text/javascript; charset=utf-8"),
             ("plans.js", "text/javascript; charset=utf-8"),
             ("map.js", "text/javascript; charset=utf-8"),
+            ("units.js", "text/javascript; charset=utf-8"),
             (
                 "vendor/leaflet/leaflet.js",
                 "text/javascript; charset=utf-8",
