@@ -639,10 +639,26 @@ mod tests {
                         Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
                             assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
                         }
-                        // A scan or an identify runs no graph: the node drives the source
-                        // (and, for identify, its child jobs) itself.
-                        Ok(g) if matches!(kind, JobKind::Scan | JobKind::Identify) => {
+                        // An identify runs no graph: the node drives the source and its
+                        // child jobs itself.
+                        Ok(g) if kind == JobKind::Identify => {
                             assert!(g.nodes.is_empty() && g.edges.is_empty(), "{g:?}");
+                        }
+                        // A scan expands to one bare `fft` node; the node writes the mask
+                        // (`notch_hz`, `edge_mask`) into it at launch.
+                        Ok(g) if kind == JobKind::Scan => {
+                            validate(&g, &registry)
+                                .unwrap_or_else(|e| panic!("{kind:?} {rate} {bw}: {e}"));
+                            assert!(g.edges.is_empty(), "{g:?}");
+                            assert_eq!(g.nodes.len(), 1, "{g:?}");
+                            let n = &g.nodes[0];
+                            assert_eq!(n.kind, "fft", "{g:?}");
+                            for k in ["size", "window", "rows_per_s"] {
+                                assert!(n.params.get(k).is_some(), "{k} in {g:?}");
+                            }
+                            for k in ["notch_hz", "edge_mask"] {
+                                assert!(n.params.get(k).is_none(), "{k} in {g:?}");
+                            }
                         }
                         // A watch: `fft → detect` over the capture, the fft at about one
                         // bin per WATCH_BIN_TARGET_HZ (1500 Hz) of it.
