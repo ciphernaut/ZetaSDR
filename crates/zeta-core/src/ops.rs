@@ -983,8 +983,9 @@ pub const SCAN_DWELL_MS: u64 = 250;
 /// the mode rows.
 pub const IDENTIFY_MEASURE_MS: u64 = 1_000;
 
-/// Half-width of the DC notch a scan masks on local hardware, in Hz: bins within
-/// this of each capture's centre are masked.
+/// Full width of the DC notch a scan masks on local hardware, in Hz: bins within
+/// half of this of each capture's centre are masked (the `fft` stage's
+/// `notch_hz`).
 pub const SCAN_NOTCH_HZ: u64 = 300_000;
 /// Fraction of each capture's bins masked at each edge on local hardware.
 pub const SCAN_EDGE_MASK: f64 = 0.10;
@@ -1009,10 +1010,21 @@ pub fn scan_mask_default(caps: &Capabilities) -> (u64, f64) {
 }
 
 /// The notch actually applied for a scan step of `step_hz`: `0` when the step
-/// is under four notch half-widths (the notch would eat the capture), else
+/// is under four notch widths (the notch would eat the capture), else
 /// `notch_hz`.
 pub fn scan_notch_in_force(step_hz: u64, notch_hz: u64) -> u64 {
-    if step_hz < 4 * notch_hz { 0 } else { notch_hz }
+    if step_hz < notch_hz.saturating_mul(4) {
+        0
+    } else {
+        notch_hz
+    }
+}
+
+/// The edge mask actually applied: the configured `edge_mask` when the scan's
+/// grid alternates, else `0.0` (a one-step scan has no other sweep to fill its
+/// edges in, so masking them would hide signal for good).
+pub fn scan_edge_mask_in_force(alternates: bool, edge_mask: f64) -> f64 {
+    if alternates { edge_mask } else { 0.0 }
 }
 
 /// The two step lists a scan alternates between (see [`scan_grid`]).
@@ -1020,7 +1032,7 @@ pub fn scan_notch_in_force(step_hz: u64, notch_hz: u64) -> u64 {
 pub struct ScanGrid {
     /// Sweeps 0, 2, 4, ...
     pub even: Vec<Tuning>,
-    /// Sweeps 1, 3, 5, ...: the even grid shifted down by half a step.
+    /// Sweeps 1, 3, 5, ...: the even grid shifted down by a quarter step.
     pub odd: Vec<Tuning>,
 }
 
@@ -1039,9 +1051,9 @@ impl ScanGrid {
         }
     }
 
-    /// How far the odd grid sits below the even one: half a step.
+    /// How far the odd grid sits below the even one: a quarter step.
     pub fn shift_hz(&self) -> u64 {
-        self.even[0].bandwidth_hz.0 / 2
+        self.even[0].bandwidth_hz.0 / 4
     }
 }
 
@@ -1049,13 +1061,19 @@ impl ScanGrid {
 /// `w = min(max_bandwidth_hz, SCAN_STEP_MAX_HZ, span width)`. The even grid is
 /// centred at `start + w/2 + i·w` for `i < n = ceil(bandwidth_hz / w)`, where
 /// `start` is the span's lower edge, so a span narrower than one capture is one
-/// step exactly as wide as the span. The odd grid is centred at `start + i·w`
-/// for `i <= n` (one more step, half a step lower) so a DC notch falls in a
-/// different place each sweep; a one-step span does not alternate and its odd
-/// grid is a copy of the even one. Every centre is clamped to
-/// `[tune_min + w/2, tune_max - w/2]`, so no capture reaches outside the
-/// source's tune range (when that range is narrower than `w`, to
-/// `tune_min + w/2`), and a centre equal to the one before it is dropped.
+/// step exactly as wide as the span. The odd grid is centred at
+/// `start + w/4 + i·w` for `i <= n` (a quarter step lower), dropping a step
+/// whose band misses the span, so it has at most one more step. A quarter
+/// step, not a half: with rows about as wide as the step, each grid's DC notch
+/// and step boundaries then fall at the 25 % / 75 % points of the other grid's
+/// rows, clear of its notch and of any edge mask under 0.25, so every
+/// frequency is seen clean in one of two sweeps (a half-step shift put each
+/// notch on the other grid's step boundary, inside both neighbours' edge
+/// masks). A one-step span does not alternate and its odd grid is a copy of
+/// the even one. Every centre is clamped to `[tune_min + w/2, tune_max - w/2]`,
+/// so no capture reaches outside the source's tune range (when that range is
+/// narrower than `w`, to `tune_min + w/2`), and a centre equal to the one
+/// before it is dropped.
 pub fn scan_grid(span: Tuning, caps: &Capabilities) -> ScanGrid {
     let w = caps
         .max_bandwidth_hz
@@ -1082,8 +1100,15 @@ pub fn scan_grid(span: Tuning, caps: &Capabilities) -> ScanGrid {
         steps
     };
     let even = build(&mut (0..n).map(|i| start + w / 2 + i * w));
+    let end = start.saturating_add(span.bandwidth_hz.0);
     let odd = if n > 1 {
-        build(&mut (0..=n).map(|i| start + i * w))
+        // A step's unclamped band is `c - w/2 .. c + w/2`; its high edge is
+        // always past `start`, so only a last step can miss the span.
+        build(
+            &mut (0..=n)
+                .map(|i| start + w / 4 + i * w)
+                .filter(|&c| c.saturating_sub(w / 2) < end),
+        )
     } else {
         even.clone()
     };
@@ -2666,7 +2691,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_grid_odd_sweep_shifts_by_half_a_step_with_one_more_step() {
+    fn scan_grid_odd_sweep_shifts_by_a_quarter_step() {
         let g = scan_grid(t(20_000_000, 40_000_000), &caps_16m());
         assert_eq!(g.even, scan_steps(t(20_000_000, 40_000_000), &caps_16m()));
         assert_eq!(
@@ -2677,17 +2702,18 @@ mod tests {
                 t(40_000_000, 16_000_000)
             ]
         );
-        // 0, 16, 32, 48 MHz; the first clamped up to the 1 MHz floor + w/2.
+        // 4, 20, 36, 52 MHz: the first clamped up to the 1 MHz floor + w/2, the
+        // last dropped (its band, 44-60 MHz, misses the 0-40 MHz span).
         assert_eq!(
             g.odd,
             [
                 t(9_000_000, 16_000_000),
-                t(16_000_000, 16_000_000),
-                t(32_000_000, 16_000_000),
-                t(48_000_000, 16_000_000)
+                t(20_000_000, 16_000_000),
+                t(36_000_000, 16_000_000)
             ]
         );
-        assert_eq!(g.shift_hz(), 8_000_000);
+        assert_eq!(g.shift_hz(), 4_000_000);
+        assert!(g.odd.len() <= g.even.len() + 1);
         assert!(g.alternates());
         assert_eq!(g.steps(0), &g.even[..]);
         assert_eq!(g.steps(1), &g.odd[..]);
@@ -2696,20 +2722,63 @@ mod tests {
 
     #[test]
     fn scan_grid_drops_a_clamped_duplicate_at_the_tune_floor() {
-        // Tune floor 20 MHz: lo = 28 MHz. Odd 0, 16, 32, 48 -> 28, 28, 32, 48; even 8, 24, 40 -> 28, 28, 40.
+        // Tune floor 20 MHz: lo = 28 MHz. Odd 4, 20, 36 -> 28, 28, 36 (52 misses
+        // the span); even 8, 24, 40 -> 28, 28, 40.
         let g = scan_grid(t(20_000_000, 40_000_000), &caps_min(20_000_000));
         assert_eq!(
             g.odd,
-            [
-                t(28_000_000, 16_000_000),
-                t(32_000_000, 16_000_000),
-                t(48_000_000, 16_000_000)
-            ]
+            [t(28_000_000, 16_000_000), t(36_000_000, 16_000_000)]
         );
         assert_eq!(
             g.even,
             [t(28_000_000, 16_000_000), t(40_000_000, 16_000_000)]
         );
+    }
+
+    /// Whether `f` falls on an unmasked bin of one of `steps` (rows as wide as
+    /// the step): the notch is `notch_hz` wide about each centre, the edge mask
+    /// the outer `edge_mask` of each row.
+    fn seen_clean(f: f64, steps: &[Tuning], notch_hz: u64, edge_mask: f64) -> bool {
+        steps.iter().any(|s| {
+            let c = s.center_hz.0 as f64;
+            let w = s.bandwidth_hz.0 as f64;
+            let (lo, hi) = (c - w / 2.0, c + w / 2.0);
+            let notch = scan_notch_in_force(s.bandwidth_hz.0, notch_hz) as f64;
+            f >= lo + edge_mask * w && f < hi - edge_mask * w && (f - c).abs() >= notch / 2.0
+        })
+    }
+
+    #[test]
+    fn scan_grid_sees_every_frequency_clean_in_one_of_two_sweeps() {
+        let bin_hz = 16_000_000.0 / 4096.0;
+        for (span, caps) in [
+            // The 440-488 MHz survey on the HackRF at 16 Msps.
+            (t(464_000_000, 48_000_000), caps_16m()),
+            // Spans that are not a whole number of steps.
+            (t(464_000_000, 40_000_000), caps_16m()),
+            (t(464_000_000, 37_000_000), caps_16m()),
+            (t(464_000_000, 45_000_000), caps_16m()),
+            (t(464_000_000, 20_000_000), caps_16m()),
+            (t(1_000_000_000, 100_000_000), caps_16m()),
+        ] {
+            let g = scan_grid(span, &caps);
+            assert!(g.odd.len() <= g.even.len() + 1, "{span:?}");
+            let start = (span.center_hz.0 - span.bandwidth_hz.0 / 2) as f64;
+            let end = start + span.bandwidth_hz.0 as f64;
+            let mut f = start + bin_hz / 2.0;
+            while f < end {
+                assert!(
+                    seen_clean(f, &g.even, SCAN_NOTCH_HZ, SCAN_EDGE_MASK)
+                        || seen_clean(f, &g.odd, SCAN_NOTCH_HZ, SCAN_EDGE_MASK),
+                    "{span:?}: {f} Hz is masked in both grids"
+                );
+                f += bin_hz;
+            }
+        }
+        // A one-step span does not alternate: with no mask in force (see
+        // `scan_edge_mask_in_force`) it sees everything; the property is moot.
+        let g = scan_grid(t(100_000_000, 1_000_000), &caps_16m());
+        assert!(!g.alternates());
     }
 
     #[test]
@@ -2735,6 +2804,10 @@ mod tests {
         assert_eq!(scan_notch_in_force(1_200_000, 300_000), 300_000);
         assert_eq!(scan_notch_in_force(1_000_000, 300_000), 0);
         assert_eq!(scan_notch_in_force(48_000, 12_000), 12_000);
+        assert_eq!(scan_notch_in_force(16_000_000, u64::MAX), 0);
+        assert_eq!(scan_edge_mask_in_force(true, 0.10), 0.10);
+        assert_eq!(scan_edge_mask_in_force(false, 0.10), 0.0);
+        assert_eq!(scan_edge_mask_in_force(false, 0.0), 0.0);
     }
 
     #[test]

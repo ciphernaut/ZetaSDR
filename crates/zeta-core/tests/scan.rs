@@ -346,9 +346,9 @@ async fn scan_steps_the_port_across_the_span_and_emits_rows() {
     let (_dir, node, port) = open().await;
     let (id, mut rx) = start_scan(&node).await;
     // 0..40 MHz in 16 MHz steps; the first capture is kept above the 1 MHz tune floor.
-    // Even sweeps step 9, 24, 40 MHz, odd ones 9, 16, 32, 48 MHz.
-    let centres = [9 * MHZ, 24 * MHZ, 40 * MHZ, 16 * MHZ, 32 * MHZ, 48 * MHZ];
-    let mut seen = [0usize; 6];
+    // Even sweeps step 9, 24, 40 MHz, odd ones 9, 20, 36 MHz.
+    let centres = [9 * MHZ, 24 * MHZ, 40 * MHZ, 20 * MHZ, 36 * MHZ];
+    let mut seen = [0usize; 5];
     let mut most = 0u64;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while let Ok(Ok(f)) = tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -466,7 +466,7 @@ async fn stream_list_stays_flat_across_sweeps() {
     let (_id, _rx) = start_scan(&node).await;
     // Both counts are taken just after a tune, inside the step's dwell, when
     // no step's fft streams are live: after the first tune, and after the
-    // seventh (two sweeps of three steps done).
+    // sixth (the last step of one even and one odd sweep, three steps each).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let count_after_tune = async |n: usize| {
         while port.tunes().len() < n {
@@ -476,7 +476,7 @@ async fn stream_list_stays_flat_across_sweeps() {
         node.bus().list().len()
     };
     let before = count_after_tune(1).await;
-    let after = count_after_tune(7).await;
+    let after = count_after_tune(6).await;
     eprintln!("streams before {before}, after two sweeps {after}");
     assert_eq!(before, after, "per-step fft streams must be unregistered");
 }
@@ -500,7 +500,8 @@ async fn no_bank_is_made_per_step_while_a_scan_holds_the_source() {
     let makes = || factory.0.load(std::sync::atomic::Ordering::SeqCst);
     let (id, _rx) = start_scan(&node).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while port.tunes().len() < 7 {
+    // Six tunes: one even and one odd sweep of three steps each.
+    while port.tunes().len() < 6 {
         assert!(tokio::time::Instant::now() < deadline, "scan stalled");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -535,11 +536,12 @@ async fn scan_context_carries_its_step_count() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_alternates_its_grid_between_sweeps() {
-    // 0..40 MHz on radio0: even 9, 24, 40 MHz; odd 9, 16, 32, 48 MHz (0 clamped up to 9).
+    // 0..40 MHz on radio0: even 9, 24, 40 MHz; odd 9, 20, 36 MHz (4 clamped up to 9,
+    // 52 dropped: its band misses the span).
     let (_dir, node, port) = open().await;
     let (id, mut rx) = start_scan(&node).await;
     tunes_at_least(&port, 10, Duration::from_secs(5)).await;
-    let want = [9, 24, 40, 9, 16, 32, 48, 9, 24, 40].map(|m| m * MHZ);
+    let want = [9, 24, 40, 9, 20, 36, 9, 24, 40, 9].map(|m| m * MHZ);
     let got: Vec<u64> = port
         .tunes()
         .iter()
@@ -563,9 +565,8 @@ async fn scan_alternates_its_grid_between_sweeps() {
         (9, "scan/0"),
         (24, "scan/1"),
         (40, "scan/2"),
-        (16, "scan/1"),
-        (32, "scan/2"),
-        (48, "scan/3"),
+        (20, "scan/1"),
+        (36, "scan/2"),
     ] {
         assert_eq!(
             seen.get(&(c * MHZ)).map(String::as_str),
@@ -578,7 +579,7 @@ async fn scan_alternates_its_grid_between_sweeps() {
     assert_eq!(ctx["scan"]["step_hz"], 16 * MHZ);
     assert_eq!(
         ctx["scan"]["alternate"],
-        serde_json::json!({"shift_hz": 8 * MHZ, "steps_shifted": 4})
+        serde_json::json!({"shift_hz": 4 * MHZ, "steps_shifted": 3})
     );
     node.job_stop(&id).await.unwrap();
 }
@@ -631,7 +632,8 @@ async fn scan_mask_defaults_follow_the_capabilities() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_step_scan_does_not_alternate() {
-    // 1 MHz is narrower than four 300 kHz notches: no notch in force, though the node stores it.
+    // 1 MHz is narrower than four 300 kHz notches: no notch in force, though the node stores it;
+    // and with no odd sweep to fill the edges in, no edge mask in force either.
     let (_dir, node, port) = open().await;
     let id = match node.apply(start(JobKind::Scan, 100 * MHZ, MHZ)).await {
         Ok(OpResult::Job(id)) => id,
@@ -648,12 +650,12 @@ async fn a_one_step_scan_does_not_alternate() {
     assert!(ctx["scan"]["alternate"].is_null(), "{ctx}");
     assert_eq!(
         ctx["scan"]["mask"],
-        serde_json::json!({"notch_hz": 0, "edge_mask": 0.1})
+        serde_json::json!({"notch_hz": 0, "edge_mask": 0.0})
     );
-    assert_eq!(
-        fft_node(&graph_of(&node, &id).await).params["notch_hz"],
-        300_000
-    );
+    let g = graph_of(&node, &id).await;
+    let stored = fft_node(&g);
+    assert_eq!(stored.params["notch_hz"], 300_000);
+    assert_eq!(stored.params["edge_mask"], 0.1);
     node.job_stop(&id).await.unwrap();
 }
 

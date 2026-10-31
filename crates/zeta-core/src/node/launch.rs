@@ -18,8 +18,8 @@ use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
 use crate::ops::{
-    JobKind, SPECTRUM_ROWS_PER_S, ScanGrid, local_hardware, scan_grid, scan_mask_default,
-    scan_notch_in_force, spectrum_size,
+    JobKind, SPECTRUM_ROWS_PER_S, ScanGrid, local_hardware, scan_edge_mask_in_force, scan_grid,
+    scan_mask_default, scan_notch_in_force, spectrum_size,
 };
 use crate::port::{IqBlock, IqReceiver, Port, Tuning};
 use crate::ring::IqRing;
@@ -736,7 +736,13 @@ impl Inner {
             p.insert("size".into(), spectrum_size(w).into());
         }
         let notch_cfg = fft.params["notch_hz"].as_u64().unwrap_or(0);
-        let edge_mask = fft.params["edge_mask"].as_f64().unwrap_or(0.0);
+        // The stored node keeps what was configured; the rows and the context
+        // get the values in force: no notch on a step under four notches, no
+        // edge mask on a grid that does not alternate (no odd sweep fills it in).
+        let edge_mask = scan_edge_mask_in_force(
+            grid.alternates(),
+            fft.params["edge_mask"].as_f64().unwrap_or(0.0),
+        );
         let notch_hz = scan_notch_in_force(w, notch_cfg);
         match gate {
             Some(g) => {

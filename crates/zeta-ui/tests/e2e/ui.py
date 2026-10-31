@@ -1477,17 +1477,25 @@ TOP_QUARTER_LIT_JS = """() => {
 }"""
 
 
-# Paints the newest masked coarse row alone into a blank buffer and counts the background
-# pixel rows under its notch and the lit ones elsewhere in its band; then redraws and counts
-# the background rows under that notch in the replayed coarse column (both parities fill it).
+# Paints the newest masked coarse row whose notch (the masked range holding the row's middle
+# bin) lies inside the view alone into a blank buffer and counts the background pixel rows
+# under its notch and the lit ones elsewhere in its band; then redraws and counts the
+# background rows under that notch in the replayed coarse column (both parities fill it).
 MASK_PROBE_JS = """() => {
   const wf = window.zetaTest.waterfall();
+  const s = wf.shown();
+  const notchOf = (r) => (r.masked || []).find(([lo, hi]) => lo <= r.q.length / 2 && r.q.length / 2 < hi);
+  const inView = (r) => {
+    const n = notchOf(r);
+    if (!n) return false;
+    const perBin = (r.hi - r.lo) / r.q.length;
+    return r.lo + n[0] * perBin >= s.lo && r.lo + n[1] * perBin <= s.hi;
+  };
   const rows = wf.coarseRows.map((r) => r.row);
-  const row = [...rows].reverse().find((r) => r.masked);
+  const row = [...rows].reverse().find(inView);
   if (!row) return null;
   const h = wf.coarseColumn.height;
   const cw = wf.coarseColumn.width;
-  const s = wf.shown();
   const yOf = (hz) => Math.round(((s.hi - hz) / (s.hi - s.lo)) * h);
   const isBg = (b, y) => b.data[y * cw * 4] === 0 && b.data[y * cw * 4 + 1] === 0 && b.data[y * cw * 4 + 2] === 48;
   const count = (b, y0, y1, bg) => {
@@ -1496,8 +1504,8 @@ MASK_PROBE_JS = """() => {
     return n;
   };
   const perBin = (row.hi - row.lo) / row.q.length;
-  const [lo, hi] = row.masked[0];
-  // One px inside each edge, and inside the canvas (an odd step's notch at the view's edge).
+  const [lo, hi] = notchOf(row);
+  // One px inside each edge, and inside the canvas.
   const notchTop = Math.max(0, yOf(row.lo + hi * perBin) + 1);
   const notchBottom = Math.min(h, yOf(row.lo + lo * perBin) - 1);
   const buf = wf.ctx.createImageData(cw, h);
@@ -1562,9 +1570,10 @@ def scenario_coarse_layer_moves_on_when_the_fine_stream_stops(page, url, secret)
 
 
 def scenario_coarse_layer_leaves_masked_bins_unpainted(page, url, secret):
-    # A graph put of a 12 kHz notch on the page's own scan (48 kHz steps: four notches fit, so
-    # it is in force): the notch's pixel rows are not painted by the row that masks them, and a
-    # redraw, replaying both parities, fills them from the shifted sweep.
+    # A graph put of a 12 kHz notch and a 0.1 edge mask on the page's own scan (48 kHz steps:
+    # four notches fit, so the notch is in force; the grid alternates, so the edge mask is):
+    # the notch's pixel rows are not painted by the row that masks them, and a redraw,
+    # replaying both parities, fills them from the sweep shifted by a quarter step.
     stop_scans(url, secret)
     try:
         zoom_tone_out(page, url, secret)
@@ -1575,15 +1584,16 @@ def scenario_coarse_layer_leaves_masked_bins_unpainted(page, url, secret):
         fft = [n for n in graph["nodes"] if n["kind"] == "fft"]
         assert len(fft) == 1, f"scan graph {graph}"
         fft[0]["params"]["notch_hz"] = 12_000
+        fft[0]["params"]["edge_mask"] = 0.1
         http_json(url, secret, "/op", {"op": "graph_put", "job": own, "graph": graph})
         ctx = http_json(url, secret, "/op", {"op": "job_context", "job": own})["value"]["scan"]
-        assert ctx["mask"] == {"notch_hz": 12_000, "edge_mask": 0.0}, ctx
-        assert ctx["alternate"]["shift_hz"] == 24_000, ctx
+        assert ctx["mask"] == {"notch_hz": 12_000, "edge_mask": 0.1}, ctx
+        assert ctx["alternate"]["shift_hz"] == 12_000, ctx
         assert ctx["alternate"]["steps_shifted"] == ctx["steps"] + 1, ctx
         # Two sweeps of masked rows (about 5 rows per 250 ms step, 5 steps).
         page.wait_for_function("() => window.zetaTest.wf().coarseMasked >= 20", timeout=10_000)
         probe = page.evaluate(MASK_PROBE_JS)
-        assert probe and probe["masked"] == [[384, 641]], probe
+        assert probe and probe["masked"] == [[0, 102], [384, 641], [922, 1024]], probe
         assert probe["notchRows"] > 10, probe
         assert probe["notchBgAlone"] == probe["notchRows"], probe
         assert probe["restLit"] > 0, probe
