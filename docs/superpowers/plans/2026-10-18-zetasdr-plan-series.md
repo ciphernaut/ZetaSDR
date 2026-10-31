@@ -46,7 +46,7 @@ specs are written in a brainstorming session before the plan, as before.
 
 ## Plan 15 status
 
-Plan 15 (scan grid and mask) is on the `plan-15` branch, merged to `main` pending the session's fast-forward, 2026-10-31. Live acceptance on the desktop HackRF is pending.
+Plan 15 (scan grid and mask) is on the `plan-15` branch. Merged to `main` 2026-11-01 (83726a2). Live acceptance on the desktop HackRF is pending.
 
 Built, per task:
 
@@ -74,7 +74,7 @@ Live acceptance (desktop HackRF, `--source-soapy hackrf=driver=hackrf,gain=45`):
 
 ## Plan 18 status
 
-Plan 18 (box and refine) is on the `plan-18` branch (tasks 1-10), merged to `main` pending the session's fast-forward, 2026-11-01. Live acceptance on the desktop HackRF is pending.
+Plan 18 (box and refine) is on the `plan-18` branch (tasks 1-10). Merged to `main` 2026-11-01 (771ea93). Live acceptance on the desktop HackRF is pending.
 
 What was built (spec `docs/superpowers/specs/2026-10-31-box-and-refine-design.md`):
 
