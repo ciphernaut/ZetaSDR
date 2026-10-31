@@ -10,6 +10,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::bank::{BankFactory, ChannelBank};
+use zeta_core::graph::{Graph, GraphError, Node as GraphNode};
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult};
@@ -66,10 +67,19 @@ fn block_samples(t: Tuning) -> Arc<[Complex<f32>]> {
 
 impl ScanPort {
     fn new() -> Arc<Self> {
-        Self::with_fail_tune(None)
+        Self::with_caps(false, false)
+    }
+
+    /// A port whose capabilities say `remote` and `push` as given.
+    fn with_caps(remote: bool, push: bool) -> Arc<Self> {
+        Self::build(None, remote, push)
     }
 
     fn with_fail_tune(fail_tune: Option<usize>) -> Arc<Self> {
+        Self::build(fail_tune, false, false)
+    }
+
+    fn build(fail_tune: Option<usize>, remote: bool, push: bool) -> Arc<Self> {
         let p = Arc::new(Self {
             id: SourceId("radio0".into()),
             caps: Capabilities {
@@ -80,8 +90,8 @@ impl ScanPort {
                 channels: 1,
                 rx: true,
                 tx: false,
-                remote: false,
-                push: false,
+                remote,
+                push,
             },
             cur: Mutex::new(None),
             tunes: Mutex::new(Vec::new()),
@@ -146,8 +156,10 @@ impl Port for ScanPort {
 }
 
 /// Stands in for the dsp `fft` stage (core cannot depend on it): one event
-/// per input block with the params' `size`, the block's `center_hz`, its
-/// sample count and the tone it carries (mean phase step).
+/// per input block with the params' `size`, `notch_hz` and `edge_mask`, the
+/// block's `center_hz`, its sample count and the tone it carries (mean phase
+/// step). Its params check refuses an `edge_mask` outside `0..0.5` naming the
+/// field, as the real stage does.
 struct FakeFft(StageSpec);
 
 #[async_trait]
@@ -157,6 +169,12 @@ impl Stage for FakeFft {
     }
     fn backend(&self) -> Backend {
         Backend::Cpu
+    }
+    fn check_params(&self, params: &Value) -> Result<(), String> {
+        match params.get("edge_mask").and_then(Value::as_f64) {
+            Some(e) if !(0.0..0.5).contains(&e) => Err("edge_mask must be in 0..0.5".into()),
+            _ => Ok(()),
+        }
     }
     async fn run(
         &self,
@@ -191,6 +209,8 @@ impl Stage for FakeFft {
             let tone = acc.arg() * b.sample_rate_hz.0 as f64 / (2.0 * std::f64::consts::PI);
             let ev = serde_json::json!({
                 "size": params["size"],
+                "notch_hz": params["notch_hz"].clone(),
+                "edge_mask": params["edge_mask"].clone(),
                 "center_hz": b.center_hz.0,
                 "samples": s.len(),
                 "tone_hz": tone,
@@ -270,13 +290,48 @@ async fn start_scan(node: &Node) -> (JobId, broadcast::Receiver<Frame>) {
         Ok(OpResult::Job(id)) => id,
         other => panic!("expected a job, got {other:?}"),
     };
+    let rx = event_rx(node, &id);
+    (id, rx)
+}
+
+/// A receiver on job `id`'s event stream.
+fn event_rx(node: &Node, id: &JobId) -> broadcast::Receiver<Frame> {
     let stream = node
         .bus()
         .list()
         .into_iter()
-        .find(|s| s.kind == StreamKind::Event && s.provenance.job.as_ref() == Some(&id))
-        .expect("the scan has an event stream");
-    (id.clone(), node.bus().subscribe(&stream.id).unwrap())
+        .find(|s| s.kind == StreamKind::Event && s.provenance.job.as_ref() == Some(id))
+        .expect("the job has an event stream");
+    node.bus().subscribe(&stream.id).unwrap()
+}
+
+/// Wait until `port` has been tuned at least `n` times, failing after `within`.
+async fn tunes_at_least(port: &ScanPort, n: usize, within: Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    while port.tunes().len() < n {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} tunes, wanted {n}",
+            port.tunes().len()
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// The graph's first `fft` node.
+fn fft_node(g: &Graph) -> &GraphNode {
+    g.nodes
+        .iter()
+        .find(|n| n.kind == "fft")
+        .expect("an fft node")
+}
+
+/// Job `id`'s graph, through `graph_get`.
+async fn graph_of(node: &Node, id: &JobId) -> Graph {
+    match node.apply(Op::GraphGet { job: id.clone() }).await {
+        Ok(OpResult::Graph(g)) => g,
+        other => panic!("expected a graph, got {other:?}"),
+    }
 }
 
 fn source_info(r: OpResult) -> (Option<Tuning>, Vec<JobId>) {
@@ -291,8 +346,9 @@ async fn scan_steps_the_port_across_the_span_and_emits_rows() {
     let (_dir, node, port) = open().await;
     let (id, mut rx) = start_scan(&node).await;
     // 0..40 MHz in 16 MHz steps; the first capture is kept above the 1 MHz tune floor.
-    let centres = [9 * MHZ, 24 * MHZ, 40 * MHZ];
-    let mut seen = [0usize; 3];
+    // Even sweeps step 9, 24, 40 MHz, odd ones 9, 16, 32, 48 MHz.
+    let centres = [9 * MHZ, 24 * MHZ, 40 * MHZ, 16 * MHZ, 32 * MHZ, 48 * MHZ];
+    let mut seen = [0usize; 6];
     let mut most = 0u64;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while let Ok(Ok(f)) = tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -302,10 +358,6 @@ async fn scan_steps_the_port_across_the_span_and_emits_rows() {
         assert_eq!(f.provenance.job.as_ref(), Some(&id));
         let c = ev["center_hz"].as_u64().unwrap();
         let i = centres.iter().position(|&x| x == c).expect("a step centre");
-        assert_eq!(
-            f.provenance.channel.as_ref().map(|c| c.0.as_str()),
-            Some(format!("scan/{i}").as_str())
-        );
         // spectrum_size(16 MHz) = 4096.
         assert_eq!(ev["size"], 4096);
         assert!(ev["samples"].as_u64().unwrap() >= 4096, "{ev}");
@@ -314,7 +366,7 @@ async fn scan_steps_the_port_across_the_span_and_emits_rows() {
         assert!((tone - tone_hz(c)).abs() < 1_000.0, "step {i}: {ev}");
         seen[i] += 1;
     }
-    assert!(seen.iter().all(|&n| n >= 2), "rows per step {seen:?}");
+    assert!(seen[..3].iter().all(|&n| n >= 2), "rows per step {seen:?}");
     // The ring held a contiguous run, so a dwell read spanned several blocks.
     let one = block_len(16 * MHZ) as u64;
     eprintln!("largest dwell read {most} samples, one block {one}");
@@ -325,8 +377,7 @@ async fn scan_steps_the_port_across_the_span_and_emits_rows() {
 
     let tunes = port.tunes();
     assert!(tunes.len() >= 6, "{} tunes", tunes.len());
-    for (k, t) in tunes.iter().enumerate() {
-        assert_eq!(t.center_hz.0, centres[k % 3], "tune {k}");
+    for t in &tunes {
         assert_eq!(t.bandwidth_hz.0, 16 * MHZ);
     }
 }
@@ -479,5 +530,189 @@ async fn scan_context_carries_its_step_count() {
     assert_eq!(ctx["scan"]["step_hz"], 16 * MHZ, "{ctx}");
     // The harness opens the node with a 20 ms dwell.
     assert_eq!(ctx["scan"]["dwell_ms"], 20, "{ctx}");
+    node.job_stop(&id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_alternates_its_grid_between_sweeps() {
+    // 0..40 MHz on radio0: even 9, 24, 40 MHz; odd 9, 16, 32, 48 MHz (0 clamped up to 9).
+    let (_dir, node, port) = open().await;
+    let (id, mut rx) = start_scan(&node).await;
+    tunes_at_least(&port, 10, Duration::from_secs(5)).await;
+    let want = [9, 24, 40, 9, 16, 32, 48, 9, 24, 40].map(|m| m * MHZ);
+    let got: Vec<u64> = port
+        .tunes()
+        .iter()
+        .take(10)
+        .map(|t| t.center_hz.0)
+        .collect();
+    assert_eq!(got, want);
+    assert!(port.tunes().iter().all(|t| t.bandwidth_hz.0 == 16 * MHZ));
+    // Each row's channel is its index within its own sweep's list.
+    let mut seen = std::collections::HashMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Ok(f)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        let Payload::Event(ev) = &f.payload else {
+            panic!("events")
+        };
+        let c = ev["center_hz"].as_u64().unwrap();
+        let ch = f.provenance.channel.as_ref().unwrap().0.clone();
+        seen.insert(c, ch);
+    }
+    for (c, ch) in [
+        (9, "scan/0"),
+        (24, "scan/1"),
+        (40, "scan/2"),
+        (16, "scan/1"),
+        (32, "scan/2"),
+        (48, "scan/3"),
+    ] {
+        assert_eq!(
+            seen.get(&(c * MHZ)).map(String::as_str),
+            Some(ch),
+            "{seen:?}"
+        );
+    }
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["steps"], 3);
+    assert_eq!(ctx["scan"]["step_hz"], 16 * MHZ);
+    assert_eq!(
+        ctx["scan"]["alternate"],
+        serde_json::json!({"shift_hz": 8 * MHZ, "steps_shifted": 4})
+    );
+    node.job_stop(&id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_mask_defaults_follow_the_capabilities() {
+    // radio0 is local hardware (remote false, push false): the defaults are in force on a 16 MHz step.
+    let (_dir, node, _port) = open().await;
+    let (id, mut rx) = start_scan(&node).await;
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(
+        ctx["scan"]["mask"],
+        serde_json::json!({"notch_hz": 300_000, "edge_mask": 0.1})
+    );
+    let Payload::Event(ev) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .payload
+    else {
+        panic!()
+    };
+    assert_eq!(ev["notch_hz"], 300_000);
+    assert_eq!(ev["edge_mask"], 0.1);
+    let g = graph_of(&node, &id).await;
+    assert_eq!(g.nodes.len(), 1);
+    assert_eq!(fft_node(&g).params["notch_hz"], 300_000);
+    assert_eq!(fft_node(&g).params["edge_mask"], 0.1);
+    assert_eq!(fft_node(&g).params["size"], 4096);
+    node.job_stop(&id).await.unwrap();
+    // A remote source gets none.
+    let (_dir, node, _port) = open_with(ScanPort::with_caps(true, false)).await;
+    let (id, mut rx) = start_scan(&node).await;
+    assert_eq!(
+        node.job_context(&id).unwrap()["scan"]["mask"],
+        serde_json::json!({"notch_hz": 0, "edge_mask": 0.0})
+    );
+    let Payload::Event(ev) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .payload
+    else {
+        panic!()
+    };
+    assert_eq!(ev["notch_hz"], 0);
+    assert_eq!(ev["edge_mask"], 0.0);
+    node.job_stop(&id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_step_scan_does_not_alternate() {
+    // 1 MHz is narrower than four 300 kHz notches: no notch in force, though the node stores it.
+    let (_dir, node, port) = open().await;
+    let id = match node.apply(start(JobKind::Scan, 100 * MHZ, MHZ)).await {
+        Ok(OpResult::Job(id)) => id,
+        o => panic!("{o:?}"),
+    };
+    tunes_at_least(&port, 3, Duration::from_secs(3)).await;
+    assert!(port.tunes().iter().all(|t| *t
+        == Tuning {
+            center_hz: Hz(100 * MHZ),
+            bandwidth_hz: Hz(MHZ)
+        }));
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["steps"], 1);
+    assert!(ctx["scan"]["alternate"].is_null(), "{ctx}");
+    assert_eq!(
+        ctx["scan"]["mask"],
+        serde_json::json!({"notch_hz": 0, "edge_mask": 0.1})
+    );
+    assert_eq!(
+        fft_node(&graph_of(&node, &id).await).params["notch_hz"],
+        300_000
+    );
+    node.job_stop(&id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_put_on_a_scan_changes_its_mask() {
+    let (_dir, node, _port) = open().await;
+    let (id, _rx) = start_scan(&node).await;
+    let mut g = graph_of(&node, &id).await;
+    g.nodes[0].params["notch_hz"] = serde_json::json!(1_000_000);
+    g.nodes[0].params["edge_mask"] = serde_json::json!(0.25);
+    assert!(matches!(
+        node.apply(Op::GraphPut {
+            job: id.clone(),
+            graph: g.clone()
+        })
+        .await,
+        Ok(OpResult::Ok)
+    ));
+    assert_eq!(
+        node.job_list().iter().find(|r| r.id == id).unwrap().state,
+        JobState::Running
+    );
+    assert_eq!(
+        node.job_context(&id).unwrap()["scan"]["mask"],
+        serde_json::json!({"notch_hz": 1_000_000, "edge_mask": 0.25})
+    );
+    // The restarted scan's rows carry the new params (a fresh event stream: look it up again).
+    let mut rx = event_rx(&node, &id);
+    let Payload::Event(ev) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .payload
+    else {
+        panic!()
+    };
+    assert_eq!(ev["notch_hz"], 1_000_000);
+    assert_eq!(ev["edge_mask"], 0.25);
+    // A bad mask is refused naming the field; the scan runs on with its mask.
+    g.nodes[0].params["edge_mask"] = serde_json::json!(0.6);
+    match node
+        .apply(Op::GraphPut {
+            job: id.clone(),
+            graph: g,
+        })
+        .await
+    {
+        Err(OpError::Graph {
+            detail: GraphError::BadParams { reason, .. },
+        }) => assert!(reason.contains("edge_mask"), "{reason}"),
+        other => panic!("expected a bad-params refusal, got {other:?}"),
+    }
+    assert_eq!(
+        node.job_list().iter().find(|r| r.id == id).unwrap().state,
+        JobState::Running
+    );
+    assert_eq!(
+        node.job_context(&id).unwrap()["scan"]["mask"]["edge_mask"],
+        0.25
+    );
     node.job_stop(&id).await.unwrap();
 }

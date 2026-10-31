@@ -17,7 +17,10 @@ use super::{Inner, JobEntry, LogFile, NodeError, ring_seconds_for, source_fault_
 use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
-use crate::ops::{JobKind, SPECTRUM_ROWS_PER_S, scan_steps, spectrum_size};
+use crate::ops::{
+    JobKind, SPECTRUM_ROWS_PER_S, ScanGrid, scan_grid, scan_mask_default, scan_notch_in_force,
+    spectrum_size,
+};
 use crate::port::{IqBlock, IqReceiver, Port, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Stage, StageContext, StageError, StageSpec};
@@ -671,10 +674,16 @@ impl Inner {
 
     /// Launch a `scan` job: take a time-shared lease on its whole band
     /// (`rec.tuning`), then run [`scan_loop`] under [`supervise`] with one
-    /// `Event` output stream. The graph is ignored; the registered `fft`
-    /// stage does the spectra. The elastic jobs on the source are stopped:
-    /// first, or with `gate` (held by the caller, see [`Inner::launch_gated`])
-    /// once the lease is granted, through `after`.
+    /// `Event` output stream. The registered `fft` stage does the spectra; of
+    /// the graph only the first `fft` node's `notch_hz` and `edge_mask` are
+    /// read (its mask). The first launch writes them into that node from the
+    /// source's capabilities ([`scan_mask_default`]); a resume or a `graph put`
+    /// finds them and keeps them. A record with no `fft` node (persisted before
+    /// the scan carried a mask) gets the kind's expansion first. The graph is
+    /// validated before the lease, so a bad stored mask fails the launch there.
+    /// The elastic jobs on the source are stopped: first, or with `gate` (held
+    /// by the caller, see [`Inner::launch_gated`]) once the lease is granted,
+    /// through `after`.
     async fn launch_scan(
         self: &Arc<Self>,
         rec: JobRecord,
@@ -689,6 +698,40 @@ impl Inner {
                 known: self.registry.kinds(),
             }
         })?;
+        let mut rec = rec;
+        if !rec.graph.nodes.iter().any(|n| n.kind == "fft") {
+            rec.graph = JobKind::Scan
+                .expand(
+                    &rec.source,
+                    rec.tuning,
+                    Hz(0),
+                    None,
+                    None,
+                    None,
+                    &self.modes,
+                )
+                .map_err(|e| NodeError::Other(format!("scan graph: {e}")))?;
+        }
+        graph::validate(&rec.graph, &self.registry)?;
+        let grid = scan_grid(rec.tuning, port.capabilities());
+        let w = grid.even[0].bandwidth_hz.0;
+        let fft = rec
+            .graph
+            .nodes
+            .iter_mut()
+            .find(|n| n.kind == "fft")
+            .expect("expanded above");
+        if let Some(p) = fft.params.as_object_mut()
+            && !p.contains_key("notch_hz")
+        {
+            let (notch, edge) = scan_mask_default(port.capabilities());
+            p.insert("notch_hz".into(), notch.into());
+            p.entry("edge_mask").or_insert(edge.into());
+            p.insert("size".into(), spectrum_size(w).into());
+        }
+        let notch_cfg = fft.params["notch_hz"].as_u64().unwrap_or(0);
+        let edge_mask = fft.params["edge_mask"].as_f64().unwrap_or(0.0);
+        let notch_hz = scan_notch_in_force(w, notch_cfg);
         match gate {
             Some(g) => {
                 self.leases
@@ -706,21 +749,30 @@ impl Inner {
                 *after = AfterGate::StopElastic(rec.source.clone());
             }
         }
-        let (id, span) = (rec.id.clone(), rec.tuning);
-        let steps = scan_steps(span, port.capabilities());
-        let mut rec = rec;
+        let id = rec.id.clone();
         // `job_context` tells a reader (the agent above all) how many steps a
-        // sweep takes instead of leaving it to guess from the rows.
+        // sweep takes, how the odd sweeps shift and the mask in force, instead
+        // of leaving it to guess from the rows.
         if !rec.context.is_object() {
             rec.context = serde_json::json!({});
         }
         if let Some(ctx) = rec.context.as_object_mut() {
+            let alternate = if grid.alternates() {
+                serde_json::json!({
+                    "shift_hz": grid.shift_hz(),
+                    "steps_shifted": grid.odd.len(),
+                })
+            } else {
+                serde_json::Value::Null
+            };
             ctx.insert(
                 "scan".into(),
                 serde_json::json!({
-                    "steps": steps.len(),
-                    "step_hz": steps.first().map_or(0, |t| t.bandwidth_hz.0),
+                    "steps": grid.even.len(),
+                    "step_hz": w,
                     "dwell_ms": self.scan_dwell_ms,
+                    "alternate": alternate,
+                    "mask": {"notch_hz": notch_hz, "edge_mask": edge_mask},
                 }),
             );
         }
@@ -729,7 +781,9 @@ impl Inner {
         let out = self.bus.register(StreamKind::Event, prov.clone());
         let scan = Scan {
             id: id.clone(),
-            steps,
+            grid,
+            notch_hz,
+            edge_mask,
             port: port.clone(),
             ctx: StageContext::new(prov.source.clone()),
             stage,
@@ -1124,12 +1178,15 @@ pub(super) async fn feed_bank(inner: Arc<Inner>, source: SourceId, mut rx: IqRec
     }
 }
 
-/// What a running scan needs: its lease holder id, the steps it cycles
-/// through, the `fft` stage, and its output stream.
+/// What a running scan needs: its lease holder id, the grids its sweeps
+/// alternate between, the mask its `fft` runs apply (`notch_hz` the notch in
+/// force), the `fft` stage, and its output stream.
 struct Scan {
     id: JobId,
     port: Arc<dyn Port>,
-    steps: Vec<Tuning>,
+    grid: ScanGrid,
+    notch_hz: u64,
+    edge_mask: f64,
     stage: Arc<dyn Stage>,
     ctx: StageContext,
     prov: Provenance,
@@ -1137,26 +1194,29 @@ struct Scan {
     cancel: CancellationToken,
 }
 
-/// The `scan` job's body, until cancelled: tune the source to each step in
-/// turn (under the lease gate), wait the node's dwell, run the `fft` stage
+/// The `scan` job's body, until cancelled: tune the source to each step of the
+/// sweep in turn (under the lease gate; even sweeps take the grid's even
+/// steps, odd ones its odd steps), wait the node's dwell, run the `fft` stage
 /// over the step's last dwell of ring samples (skipped when the ring holds
 /// less than one FFT of the step's band), and re-publish its rows on the
-/// job's stream with channel `scan/<step index>` and the step's `center_hz`.
+/// job's stream with channel `scan/<step index>` (the index within the
+/// sweep's own list) and the step's `center_hz`.
 /// Cancellation is checked before every tune. A failed tune or a port fault
 /// fails the job; the port is left at the last step.
 async fn scan_loop(inner: Arc<Inner>, s: Scan) -> Result<(), StageError> {
     let dwell = Duration::from_millis(inner.scan_dwell_ms);
     let faulted = |f: String| StageError::Failed(source_fault_reason(s.port.id(), &f));
-    let mut i = 0;
+    let (mut sweep, mut i) = (0u64, 0usize);
     loop {
         // Checked before each tune, so a stopped scan never retunes again; a
         // tune is never abandoned half way, so it is checked after it too.
         if s.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
         }
+        let steps = s.grid.steps(sweep);
         let got = match inner
             .leases
-            .retune_shared(s.port.as_ref(), &s.id, s.steps[i], &s.cancel)
+            .retune_shared(s.port.as_ref(), &s.id, steps[i], &s.cancel)
             .await
         {
             Ok(Some(t)) => t,
@@ -1170,13 +1230,17 @@ async fn scan_loop(inner: Arc<Inner>, s: Scan) -> Result<(), StageError> {
         if let Some(f) = s.port.fault() {
             return Err(faulted(f));
         }
-        let size = spectrum_size(s.steps[i].bandwidth_hz.0);
+        let size = spectrum_size(steps[i].bandwidth_hz.0);
         if let Some(block) = inner.dwell_block(&s.prov.source, got.center_hz, dwell)
             && block.samples.len() >= size as usize
         {
             fft_step(&inner, &s, i, got.center_hz, block, size).await?;
         }
-        i = (i + 1) % s.steps.len();
+        i += 1;
+        if i == steps.len() {
+            i = 0;
+            sweep += 1;
+        }
     }
 }
 
@@ -1214,6 +1278,8 @@ async fn fft_step(
         "size": size,
         "window": "hann",
         "rows_per_s": SPECTRUM_ROWS_PER_S,
+        "notch_hz": s.notch_hz,
+        "edge_mask": s.edge_mask,
     });
     let ran = s
         .stage

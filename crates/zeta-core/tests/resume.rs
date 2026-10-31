@@ -384,3 +384,28 @@ async fn a_record_resumed_against_a_faulted_port_fails_naming_the_source() {
     assert_eq!(record(&node, &id).state, want);
     assert_eq!(on_disk(dir.path(), &id).state, want);
 }
+
+/// A scan persisted before the scan carried a mask (an empty graph) gets the expansion
+/// and its source's default mask on resume.
+#[tokio::test]
+async fn a_scan_record_with_an_empty_graph_resumes_with_the_default_mask() {
+    let scan = JobId::new();
+    let dir = tempfile::tempdir().unwrap();
+    write_records(dir.path(), &[running(&scan, "scan", band(40_000_000), 1)]);
+    let node = Node::open(cfg(dir.path()), registry(), vec![Radio::new()])
+        .await
+        .unwrap();
+    assert_eq!(record(&node, &scan).state, JobState::Running);
+    let g = &record(&node, &scan).graph;
+    assert_eq!(g.nodes.len(), 1);
+    assert_eq!(g.nodes[0].kind, "fft");
+    assert_eq!(g.nodes[0].params["notch_hz"], 300_000);
+    assert_eq!(g.nodes[0].params["edge_mask"], 0.1);
+    let ctx = node.job_context(&scan).unwrap();
+    assert_eq!(
+        ctx["scan"]["mask"],
+        serde_json::json!({"notch_hz": 300_000, "edge_mask": 0.1})
+    );
+    assert!(ctx["scan"]["alternate"].is_object(), "{ctx}");
+    node.job_stop(&scan).await.unwrap();
+}
