@@ -38,15 +38,11 @@ Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acc
 
 ## Bug: a USB drop of a SoapySDR device segfaults the node
 
-Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.
-In-process hardening only; the node survives a driver crash only with the radio in its own process (plan 20, Soapy worker process).
-
+Fixed in plan 20: the driver runs in a `zeta soapy-worker` child (docs/superpowers/specs/2026-10-31-soapy-worker-design.md); live acceptance pending.
 
 ## Bug: a node that loses its only device stays up faulted, so a restart loop never restarts it
 
-Found in plan 14's live acceptance (2026-10-28, HackRF One, two-node form). The in-process hardening works: on a cable pull the child `zeta serve` no longer dies, its source faults `no samples for 1000 ms (device unplugged?)` and every tune answers `device lost ...; restart the node`. But `scratch/serve-hackrf-child.sh` (and any systemd `Restart=on-failure` unit) only restarts a process that exits, so the radio stays dead until an operator kills the child. Wanted: either reopen the device when it reappears on USB (poll `SoapySDR::enumerate` for the same serial every few seconds after a fault, then clear the fault and re-tune the pin) or a `--exit-on-device-loss` (default on for a node whose only sources are Soapy devices) that exits with a distinct code so the loop restarts it. The main node's side already recovers: a re-pin after the child is back restores the capture and the jobs can be restarted.
-
-Scope estimate: 50-100 lines in `zeta-source-soapy` (reopen) or 20 in `node_setup` (exit), one test with the fake driver.
+Fixed in plan 20: the worker is respawned and the source heals (docs/superpowers/specs/2026-10-31-soapy-worker-design.md); live acceptance pending.
 
 ## Bug: sample timestamps run ahead of wall-clock time (HackRF)
 
@@ -157,7 +153,6 @@ Delivered by plan 16 (`docs/superpowers/specs/2026-10-27-mode-registry-design.md
 - **Vocoders.** Codec 2 (M17, FreeDV) in-crate; AMBE/IMBE only through an external `mbelib` build, never shipped; HD Radio HDC off.
 - **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback. Fits the Okudagram restyle.
 - **Wideband modes** (DVB-T 8 MHz, DAB 1.5 MHz, LTE) run the direct path at full rate and want the GPU FFT; park them behind the HackRF-first set.
-- **Soapy worker process** (plan 20). A `zeta soapy-worker` child owns the `Driver` behind a Port that faults when the child exits, so a driver crash never ends the node. Plan 14 only hardens in-process loss; the two-node pattern in field craft is the interim.
 - **`sync_bank` flapping** (from the 2026-10-27 investigation, not reproduced). A bank replaced while `feed_bank` still drains old-band blocks can swap back and forth, stalling a channel stage silently.
 
 ## Feature: classify on a 12.5-150 kHz box tries a row-width slice at the measured centre
@@ -255,3 +250,15 @@ From the 2026-10-29 investigation of a burst signal at 404.025 MHz: ZetaSDR's ow
 Found in plan 17's final review. The watch tunes its identify run on the detector's run centre, good to about one fft bin (1.46 kHz at a 6 MHz capture with `WATCH_BIN_TARGET_HZ` 1500), while `rs41mod` over NBFM audio decodes only within about ±1000 Hz of the sonde's centre (it slices the audio around zero, and an off-centre FM signal shifts that level); synthesised frames decode at ±1000 Hz and not at ±1500 Hz. A sonde at the wrong end of a bin is then reported `unknown` and retried on the same centre.
 
 Measure before identifying: a short `measure` (or a power-weighted centroid over the run's bins in `detect`, which the spectrum rows already carry) gives the occupied band's centre to a few hundred hertz, and the identify run starts there. Alternatively the audio rows could remove the demodulated DC (a slow high-pass ahead of the WAV feed), which makes the decoders tolerant of a few kilohertz of mis-tune; measure both against the RS41 generator with the job held off the signal.
+
+## Bug: a decoder the watch placed on another free source keeps running if the watch never recovers
+
+Found in plan 20's reviews. With `decode_on: free` the watch puts a decoder on a second source; when the watch's own source faults and the watch fails, its decoders are left to fail on their own (plan 20 spec 4.7), but a decoder on a healthy other source keeps running with nothing to stop it, and recovery re-adopts it only if the watch heals. Decide whether a watch that stays failed (the fault outlasting some bound) stops the decoders it placed elsewhere.
+
+## Bug: `source_ensure` and `source_pin` refusals from a faulted source lack the `source <id>: ` prefix
+
+Found in plan 20's reviews. `job_start` and a job's failure read `source <id>: <fault>`, but `source_ensure` and `source_pin` still answer bare `io: <fault>`. Route them through the same helper `job_start` uses.
+
+## Bug: a SIGKILLed node with a hung driver can orphan the worker
+
+Worker: if the node is killed with SIGKILL while the driver call is hung, the `zeta soapy-worker` child can outlive it and keep the device open. The respawn should exec `/proc/self/exe` (not a path that a rebuild can replace) and the worker should exit when its parent goes away.

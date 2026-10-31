@@ -41,8 +41,33 @@ specs are written in a brainstorming session before the plan, as before.
 | 17 | Sonde frameworks (decoder wave 1) | Re-scoped 2026-10-28 with the operator: radiosondes as the proving mode for the generic frameworks, so that the later wave is rows only. Audio-input program rows (RS41 through `rs41mod`, DFM and M20 as rows), generic `fsk`/`psk`/`ook` synthesiser families plus an RS41 frame generator proven by the real decoder and the echo impairment, a `watch` job (spot a new signal in a pinned band, `identify` it, keep the proved decoder on a free radio or in the capture), `source_free`, `position` on events with a map layer (vendored Leaflet), a SondeHub sink last. Spec `docs/superpowers/specs/2026-10-28-sonde-frameworks-design.md`, plan `docs/superpowers/plans/2026-10-28-sonde-frameworks.md`. Voice (M17, DMR), AIS, FLEX, whole-span POCSAG/APRS and stereo move to the later wave (`TODO.md`). **Merged** to `main` (97383b0), 2026-10-29; live acceptance during a Brisbane launch window is pending (see "Plan 17 status"). | 16 |
 | 18 | UI wave | Box a signal, demod it, refine it on the graph (no channel-grid assumptions); staircase transcript ribbons; mode picking by band through `knowledge_lookup`; the Okudagram (LCARS) theme behind `view set theme`. UI-only; can run beside 16/17. | 13 |
 | 19 | Layer 4 stages | Generic FSK/PSK/OOK demods, clock recovery, slicer, bit viewer with framing and CRC hypotheses, correlator, signature write-back; `measure` symbol-rate and modulation-order upgrades. Two or three plans. | 16 (bits payload) |
-| 20 | Soapy worker process | A `zeta soapy-worker` child owning the driver behind a Port that faults when the child exits, so a driver crash never ends the node. Moves up if plan 14's live acceptance shows the node still dying in-process. | 14 |
+| 20 | Soapy worker process | A `zeta soapy-worker` child owning the driver behind a Port that faults when the child exits, so a driver crash never ends the node, and a source that heals is recovered. Spec `docs/superpowers/specs/2026-10-31-soapy-worker-design.md`, plan `docs/superpowers/plans/2026-10-31-soapy-worker.md`. **Merged** to `main` pending the session's fast-forward, 2026-10-31; live acceptance on the field host is pending (see "Plan 20 status"). | 14 |
 
+
+## Plan 20 status
+
+Plan 20 is built on the `plan-20` branch (tasks 1-8 and a final fix wave) and merges to `main` by fast-forward after the whole-branch review, 2026-10-31. Live acceptance (spec section 6) is pending.
+
+What was built (spec `docs/superpowers/specs/2026-10-31-soapy-worker-design.md`):
+
+- Tasks 1-4, Worker: the `zeta soapy-worker --id ID --args ARGS` child (same executable) owns the Soapy driver and speaks a framed wire format to the node; `WorkerPort` is the node's port behind it. The worker exits 3 when the device is absent, 4 when the open fails, 5 on a source fault (`no samples for 1000 ms (device unplugged?)`, `read failed: ...`, `overflow storm ...`, `soapy retune timed out`); a crash is a signal.
+- Task 5, Supervision: the node respawns the worker (backoff 1 s doubling to 5 s, reset after 60 s alive; a device-not-found exit polls every 5 s; hello timeout 30 s). The fault shows as `fault` in `source list` (`soapy worker for <id> died: signal 11 (SIGSEGV)`, `device not found: <args>`, ...), jobs on it fail with `source <id>: <fault>`, and `source list` gains `worker: {pid, restarts, since_ns} | null`. Startup with the device absent attaches faulted when `sources/<id>.json` holds capabilities from an earlier open, else refuses the flag.
+- Task 6, Healing: on the hello that heals, recovery runs under the source's gate (gain, pin, then every job that failed with `source <id>: ` in the episode, scan first and widest first, attached `transcribe` jobs after their inputs, the `watch` re-adopting its decoders), one stderr line `zeta: source <id>: recovered: ...`. Recoverable records are never pruned while the episode lasts.
+- Task 7: `--soapy-in-process` (global; ignored with `--node`), the worker's stderr prefixed `zeta-soapy-worker[<id>]: `.
+- Task 8: field craft ("A radio that comes back" replaces "A radio in its own process"), README, this status, `TODO.md`, regenerated guides; `scratch/serve-hackrf-child.sh` retired (the two-node launcher is replaced by one node with `--source-soapy hackrf=driver=hackrf,gain=32`; two nodes stay documented as federation).
+
+Outcomes to record (live):
+
+- Time from `kill -SEGV` to the fault in `source list`, and from the fault to the worker's hello (a UHD reopen is expected within 30 s).
+- Whether `stages_running` returned to its pre-kill value.
+- Whether `journalctl` shows exactly one "waiting" and one "back" line per episode.
+
+Acceptance on the field host (spec section 6), for the live run (`RUSTFLAGS="--cfg soapy"`, `~/zetasdr/plan20-zeta`, the unit's `ExecStart` pointed at it):
+
+- [ ] 1. Restart the unit: `source list` shows `b210` with `worker.pid`, its pin and gain restored; `modes check --strict rs41_decode` still passes (local, unit stopped); the page loads.
+- [ ] 2. With the sonde watch running, `kill -SEGV <worker pid>`: within 1 s `source list` shows the fault naming the signal and the watch `Failed` with it; within 30 s the worker is back, `worker.restarts` is 1, the pin and gain are restored, the watch is `Running` under its id and `stages_running` is back to its pre-kill value.
+- [ ] 3. With the operator at the machine: pull the B210's cable, wait 10 s, replug. The same outcome through the device-lost path (`no samples for 1000 ms (device unplugged?)`, exit 5, polling, heal), and `journalctl` shows exactly one "waiting" and one "back" line.
+- [ ] 4. The desktop HackRF form: one node with `--source-soapy hackrf=driver=hackrf,gain=32` replaces the two-node launchers; a cable pull and a `kill -SEGV` behave as in 2 and 3.
 
 ## Plan 17 status
 
