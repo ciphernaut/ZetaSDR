@@ -180,10 +180,67 @@ pub struct FftParams {
     #[serde(default = "rows_per_s_default")]
     #[schemars(range(min = 1, max = 60), default = "rows_per_s_default")]
     pub rows_per_s: u32,
+    /// Width (Hz) of the notch masked about the DC bin; 0 masks nothing. Signed so a
+    /// negative value reaches [`FftParams::check`] and is refused naming the field.
+    #[serde(default)]
+    pub notch_hz: i64,
+    /// Fraction of the row masked at each edge, in `0..0.5`; 0 masks nothing.
+    #[serde(default)]
+    pub edge_mask: f64,
+}
+
+impl FftParams {
+    /// What the schema cannot say: `notch_hz` not negative, `edge_mask` in `0..0.5`.
+    /// The error names the field.
+    pub fn check(&self) -> Result<(), String> {
+        if self.notch_hz < 0 {
+            return Err("notch_hz must be at least 0".into());
+        }
+        if !(0.0..0.5).contains(&self.edge_mask) {
+            return Err("edge_mask must be in 0..0.5".into());
+        }
+        Ok(())
+    }
 }
 
 fn rows_per_s_default() -> u32 {
     zeta_core::ops::SPECTRUM_ROWS_PER_S
+}
+
+/// The bins `[lo, hi)` a row of `size` bins of `bin_hz` masks: the notch, bins `k`
+/// with `|(k - size/2) * bin_hz| <= notch_hz / 2` (bin `size/2` is DC, so with
+/// `m = floor((notch_hz / 2) / bin_hz)` it is `[size/2 - m, size/2 + m + 1)`; none
+/// for `notch_hz == 0`), and `floor(size * edge_mask)` bins at each edge. Clamped
+/// into `0..size`, sorted and merged where they overlap or touch.
+pub fn masked_ranges(size: usize, bin_hz: f64, notch_hz: u64, edge_mask: f64) -> Vec<[usize; 2]> {
+    let mut ranges: Vec<[usize; 2]> = Vec::new();
+    if notch_hz > 0 && bin_hz > 0.0 {
+        let m = ((notch_hz as f64 / 2.0) / bin_hz).floor() as usize;
+        let mid = size / 2;
+        ranges.push([
+            mid.saturating_sub(m),
+            mid.saturating_add(m).saturating_add(1),
+        ]);
+    }
+    let e = (size as f64 * edge_mask).floor() as usize;
+    if e > 0 {
+        ranges.push([0, e]);
+        ranges.push([size.saturating_sub(e), size]);
+    }
+    let mut ranges: Vec<[usize; 2]> = ranges
+        .into_iter()
+        .map(|[lo, hi]| [lo.min(size), hi.min(size)])
+        .filter(|[lo, hi]| lo < hi)
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<[usize; 2]> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if r[0] <= last[1] => last[1] = last[1].max(r[1]),
+            _ => merged.push(r),
+        }
+    }
+    merged
 }
 
 /// Quantisation step of a row's `q` values.
@@ -199,10 +256,26 @@ const ROWS_PER_S: std::ops::RangeInclusive<u32> = 1..=60;
 /// value minus 5 dB and `q = clamp(round((db - floor_db) / STEP_DB), 0, 255)`, so
 /// `floor_db + q * STEP_DB` is within half a step of `db` over 127.5 dB above the floor.
 pub fn quantise_row(db: &[f32]) -> (f32, Vec<u8>) {
+    quantise_row_masked(db, &[])
+}
+
+/// [`quantise_row`] with `floor_db` taken from the bins outside `masked` (sorted,
+/// non-overlapping `[lo, hi)` ranges, as [`masked_ranges`] gives them), or from every
+/// bin when `masked` covers them all; `q` is computed for every bin, masked or not.
+pub fn quantise_row_masked(db: &[f32], masked: &[[usize; 2]]) -> (f32, Vec<u8>) {
     if db.is_empty() {
         return (0.0, Vec::new());
     }
-    let mut sorted = db.to_vec();
+    let in_mask = |k: usize| masked.iter().any(|&[lo, hi]| (lo..hi).contains(&k));
+    let mut sorted: Vec<f32> = db
+        .iter()
+        .enumerate()
+        .filter(|&(k, _)| !in_mask(k))
+        .map(|(_, &v)| v)
+        .collect();
+    if sorted.is_empty() {
+        sorted = db.to_vec();
+    }
     sorted.sort_by(f32::total_cmp);
     let idx = (FLOOR_PERCENTILE * (sorted.len() - 1) as f32) as usize;
     let floor = sorted[idx] - FLOOR_MARGIN_DB;
@@ -396,6 +469,12 @@ impl Stage for FftStage {
         self.backend.backend()
     }
 
+    fn check_params(&self, params: &serde_json::Value) -> Result<(), String> {
+        serde_json::from_value::<FftParams>(params.clone())
+            .map_err(|e| e.to_string())?
+            .check()
+    }
+
     async fn run(
         &self,
         params: serde_json::Value,
@@ -419,6 +498,8 @@ impl Stage for FftStage {
                 p.rows_per_s
             )));
         }
+        p.check()
+            .map_err(|e| StageError::Failed(format!("fft params: {e}")))?;
         let Some(out) = outputs.first().cloned() else {
             return Err(StageError::Failed("expected 1 output".into()));
         };
@@ -426,6 +507,10 @@ impl Stage for FftStage {
         let rows_per_s = p.rows_per_s;
         let backend = self.backend.clone();
         let mut cutter = RowCutter::new(size, p.window, rows_per_s);
+        let (notch_hz, edge_mask) = (p.notch_hz as u64, p.edge_mask);
+        // The masked bins of the current rate, recomputed when a row's rate differs
+        // from the last row's (the cutter restarts then anyway).
+        let mut masked: Option<(u64, Vec<[usize; 2]>)> = None;
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
@@ -441,25 +526,33 @@ impl Stage for FftStage {
                 .push(block, backend.as_ref())
                 .into_iter()
                 .map(|row| {
-                    let (floor_db, q) = quantise_row(&row.power.db());
+                    let bin_hz = row.rate_hz as f64 / size as f64;
+                    if masked.as_ref().is_none_or(|(rate, _)| *rate != row.rate_hz) {
+                        masked = Some((
+                            row.rate_hz,
+                            masked_ranges(size, bin_hz, notch_hz, edge_mask),
+                        ));
+                    }
+                    let ranges = masked.as_ref().map_or(&[][..], |(_, r)| &r[..]);
+                    let (floor_db, q) = quantise_row_masked(&row.power.db(), ranges);
                     let mut prov = frame.provenance.clone();
                     prov.span = Span {
                         start_ns: Timestamp(row.start_ns),
                         end_ns: Timestamp(row.end_ns),
                     };
-                    Frame::new(
-                        out.clone(),
-                        prov,
-                        Payload::Event(serde_json::json!({
-                            "size": size,
-                            "bin_hz": row.rate_hz as f64 / size as f64,
-                            "rows_per_s": rows_per_s,
-                            "center_hz": row.center_hz,
-                            "floor_db": floor_db,
-                            "step_db": STEP_DB,
-                            "q": q,
-                        })),
-                    )
+                    let mut ev = serde_json::json!({
+                        "size": size,
+                        "bin_hz": bin_hz,
+                        "rows_per_s": rows_per_s,
+                        "center_hz": row.center_hz,
+                        "floor_db": floor_db,
+                        "step_db": STEP_DB,
+                        "q": q,
+                    });
+                    if !ranges.is_empty() {
+                        ev["masked"] = serde_json::json!(ranges);
+                    }
+                    Frame::new(out.clone(), prov, Payload::Event(ev))
                 })
                 .collect())
         })
@@ -529,8 +622,10 @@ mod tests {
         assert_eq!(q[99], 255); // 201 dB above the floor clamps at 127.5
     }
 
-    #[tokio::test]
-    async fn fft_stage_emits_v2_rows() {
+    /// The first row of the stage run with `params` over one 4800-sample block of a
+    /// 6 kHz tone at 48 kHz (one 50 ms row of 3 chunks closes in it), checking the
+    /// row's span and that the rest of the block stays a partial row.
+    async fn one_row(params: serde_json::Value) -> serde_json::Value {
         let prov = Provenance {
             source: SourceId("s".into()),
             job: None,
@@ -548,7 +643,7 @@ mod tests {
         let h = tokio::spawn(async move {
             FftStage::new(Arc::new(CpuFft::new()))
                 .run(
-                    serde_json::json!({"size": 1024, "window": "hann", "rows_per_s": 20}),
+                    params,
                     vec![rx_in],
                     vec![o2],
                     bus,
@@ -572,14 +667,6 @@ mod tests {
         let Payload::Event(ev) = &f.payload else {
             panic!("expected an event")
         };
-        // 4800 samples at 48 kHz, 20 rows/s: one 50 ms row (3 chunks) closes in this block.
-        assert_eq!(ev["q"].as_array().unwrap().len(), 1024);
-        assert_eq!(ev["bin_hz"].as_f64(), Some(46.875));
-        assert_eq!(ev["size"], 1024);
-        assert_eq!(ev["rows_per_s"], 20);
-        assert_eq!(ev["step_db"].as_f64(), Some(0.5));
-        assert!(ev["floor_db"].as_f64().is_some());
-        assert_eq!(ev["center_hz"], 100_000_000u64);
         assert_eq!(f.provenance.span.start_ns, Timestamp(5));
         assert_eq!(
             f.provenance.span.end_ns,
@@ -591,5 +678,157 @@ mod tests {
             rx_out.try_recv().is_err(),
             "the rest of the block is a partial row"
         );
+        ev.clone()
+    }
+
+    #[tokio::test]
+    async fn fft_stage_emits_v2_rows() {
+        let ev =
+            one_row(serde_json::json!({"size": 1024, "window": "hann", "rows_per_s": 20})).await;
+        // 4800 samples at 48 kHz, 20 rows/s: one 50 ms row (3 chunks) closes in this block.
+        assert_eq!(ev["q"].as_array().unwrap().len(), 1024);
+        assert_eq!(ev["bin_hz"].as_f64(), Some(46.875));
+        assert_eq!(ev["size"], 1024);
+        assert_eq!(ev["rows_per_s"], 20);
+        assert_eq!(ev["step_db"].as_f64(), Some(0.5));
+        assert!(ev["floor_db"].as_f64().is_some());
+        assert_eq!(ev["center_hz"], 100_000_000u64);
+    }
+
+    #[test]
+    fn masked_ranges_of_a_notch_are_symmetric_about_the_dc_bin() {
+        // 48 kHz over 1024 bins: 46.875 Hz each; 1875 Hz is 40 bins, so m = 20: 41 bins.
+        assert_eq!(masked_ranges(1024, 46.875, 1875, 0.0), vec![[492, 533]]);
+        assert_eq!(
+            masked_ranges(1024, 46.875, 0, 0.0),
+            Vec::<[usize; 2]>::new()
+        );
+    }
+
+    #[test]
+    fn masked_ranges_of_an_edge_mask() {
+        assert_eq!(
+            masked_ranges(1024, 46.875, 0, 0.1),
+            vec![[0, 102], [922, 1024]]
+        );
+        assert_eq!(
+            masked_ranges(1024, 46.875, 1875, 0.1),
+            vec![[0, 102], [492, 533], [922, 1024]]
+        );
+    }
+
+    #[test]
+    fn masked_ranges_merge_and_clamp() {
+        // 64 bins of 750 Hz; a 60 kHz notch is m = 40: [-8, 73) clamped to the row and merged with the edges.
+        assert_eq!(masked_ranges(64, 750.0, 60_000, 0.1), vec![[0, 64]]);
+        // A notch touching an edge range merges with it: m = 28 → [4, 61) plus [0, 6) and [58, 64).
+        assert_eq!(masked_ranges(64, 750.0, 42_000, 0.1), vec![[0, 64]]);
+    }
+
+    #[test]
+    fn quantise_row_masked_takes_the_floor_from_unmasked_bins() {
+        let db: Vec<f32> = (0..100).map(|i| -100.0 + 2.0 * i as f32).collect();
+        // The lower half masked (a hump that would otherwise set the floor): the floor is the
+        // 2nd percentile of 0, 2, ..., 98 (index 0 → 0 dB) minus 5.
+        let (floor, q) = quantise_row_masked(&db, &[[0, 50]]);
+        assert_eq!(floor, -5.0);
+        assert_eq!(q.len(), 100);
+        assert_eq!(q[0], 0); // -100 dB, masked, still quantised (clamped at 0)
+        assert_eq!(q[50], 10);
+        assert_eq!(q[99], 206);
+        assert_eq!(quantise_row_masked(&db, &[]), quantise_row(&db));
+    }
+
+    #[test]
+    fn quantise_row_masked_with_everything_masked_falls_back() {
+        let db: Vec<f32> = (0..100).map(|i| -100.0 + 2.0 * i as f32).collect();
+        assert_eq!(quantise_row_masked(&db, &[[0, 100]]), quantise_row(&db)); // floor -103
+    }
+
+    #[test]
+    fn fft_params_check_names_the_field() {
+        let p = |notch_hz: i64, edge_mask: f64| FftParams {
+            size: 1024,
+            window: Window::Hann,
+            rows_per_s: 20,
+            notch_hz,
+            edge_mask,
+        };
+        assert_eq!(p(0, 0.0).check(), Ok(()));
+        assert_eq!(p(300_000, 0.49).check(), Ok(()));
+        assert_eq!(
+            p(-1, 0.0).check(),
+            Err("notch_hz must be at least 0".into())
+        );
+        assert_eq!(p(0, 0.5).check(), Err("edge_mask must be in 0..0.5".into()));
+        assert_eq!(
+            p(0, -0.1).check(),
+            Err("edge_mask must be in 0..0.5".into())
+        );
+        let stage = FftStage::new(Arc::new(CpuFft::new()));
+        let e = stage
+            .check_params(&serde_json::json!({"size": 1024, "window": "hann", "edge_mask": 0.6}))
+            .unwrap_err();
+        assert!(e.contains("edge_mask"), "{e}");
+        assert_eq!(
+            stage.check_params(&serde_json::json!({"size": 1024, "window": "hann"})),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn fft_params_schema_lists_the_mask_params_with_defaults() {
+        let s = serde_json::to_value(schemars::schema_for!(FftParams)).unwrap();
+        assert_eq!(s["properties"]["notch_hz"]["default"], 0);
+        assert_eq!(s["properties"]["edge_mask"]["default"], 0.0);
+        let required: Vec<&str> = s["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !required.contains(&"notch_hz") && !required.contains(&"edge_mask"),
+            "{required:?}"
+        );
+        // A graph with a bad edge_mask is refused by validate naming the field (as detect's is).
+        let mut r = StageRegistry::new();
+        r.register(Arc::new(FftStage::new(Arc::new(CpuFft::new()))));
+        let g = Graph {
+            id: GraphId::new(),
+            nodes: vec![Node {
+                id: NodeId("a".into()),
+                kind: "fft".into(),
+                params: serde_json::json!({"size": 1024, "window": "hann", "rows_per_s": 20, "edge_mask": 0.6}),
+            }],
+            edges: vec![],
+        };
+        match validate(&g, &r) {
+            Err(GraphError::BadParams { reason, .. }) => {
+                assert!(reason.contains("edge_mask"), "{reason}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fft_stage_rows_carry_masked_only_when_a_bin_is_masked() {
+        let masked = one_row(serde_json::json!({
+            "size": 1024, "window": "hann", "rows_per_s": 20,
+            "notch_hz": 1875, "edge_mask": 0.1,
+        }))
+        .await;
+        assert_eq!(
+            masked["masked"],
+            serde_json::json!([[0, 102], [492, 533], [922, 1024]])
+        );
+        assert_eq!(masked["q"].as_array().unwrap().len(), 1024);
+        assert!(masked["floor_db"].as_f64().is_some_and(f64::is_finite));
+        let plain =
+            one_row(serde_json::json!({"size": 1024, "window": "hann", "rows_per_s": 20})).await;
+        assert!(plain.get("masked").is_none(), "{plain}");
+        for k in ["size", "bin_hz", "rows_per_s", "step_db", "center_hz"] {
+            assert_eq!(plain[k], masked[k], "{k}");
+        }
     }
 }

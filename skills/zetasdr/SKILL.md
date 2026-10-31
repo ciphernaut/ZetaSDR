@@ -364,6 +364,8 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - outputs: event
 - params.size: integer
 - params.window: string (Window: hann|rect)
+- params.edge_mask: number (optional, default 0.0)
+- params.notch_hz: integer (optional, default 0)
 - params.rows_per_s: integer (optional, default 20)
 
 ### measure
