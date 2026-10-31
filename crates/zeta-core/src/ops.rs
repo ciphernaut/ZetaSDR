@@ -1074,7 +1074,7 @@ pub fn channel_rate_hz(source_rate_hz: u64, bandwidth_hz: u64) -> u64 {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_worker)]
 pub struct SourceInfo {
     pub id: SourceId,
     pub capabilities: Capabilities,
@@ -1105,9 +1105,29 @@ pub struct SourceInfo {
     pub stats: Option<PortStats>,
     /// The child process the source runs in (`Port::worker`): its pid, how many
     /// times it was respawned, when the live one said hello; `null` for a source
-    /// that runs in the node.
-    #[schemars(required, schema_with = "crate::types::nullable::<WorkerInfo>")]
+    /// that runs in the node. Defaults to `null` when absent, so a plan-20 node can
+    /// attach a source of an older node that does not write it (serde already reads a
+    /// missing `Option` as `None`; the attribute keeps that if the field ever gains a
+    /// `deserialize_with`). The reverse does not hold: an older node refuses the field
+    /// as unknown, so both nodes of a federation are upgraded together.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<WorkerInfo>")]
     pub worker: Option<WorkerInfo>,
+}
+
+/// Schemars omits a serde-defaulted field from `required`, and `#[schemars(required)]`
+/// does not override that; every node of this version writes `worker`, so the published
+/// schema requires it (as `JobRecord`'s schema does its defaulted fields).
+fn require_worker(schema: &mut schemars::Schema) {
+    if let Some(req) = schema
+        .ensure_object()
+        .entry("required")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        && !req.iter().any(|r| r == "worker")
+    {
+        req.push("worker".into());
+    }
 }
 
 /// A source of `source_free` that covers the band but cannot take it now, with why.

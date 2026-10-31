@@ -56,6 +56,10 @@ What was built (spec `docs/superpowers/specs/2026-10-31-soapy-worker-design.md`)
 - Task 7: `--soapy-in-process` (global; ignored with `--node`), the worker's stderr prefixed `zeta-soapy-worker[<id>]: `.
 - Task 8: field craft ("A radio that comes back" replaces "A radio in its own process"), README, this status, `TODO.md`, regenerated guides; `scratch/serve-hackrf-child.sh` retired (the two-node launcher is replaced by one node with `--source-soapy hackrf=driver=hackrf,gain=32`; two nodes stay documented as federation).
 
+Deployment: `source list` gained `worker`, and a node deserialises a remote node's source list with unknown fields refused. A plan-20 node attaches an older node's source (a missing `worker` reads as `null`), but an older node cannot attach a plan-20 node's source until it is upgraded: upgrade both nodes of a federation together.
+
+Final fix wave (whole-branch review): the worker turns SIGTERM and SIGINT into `shutdown` and exits within 5 s of the first signal even with its driver hung in `open()`; a worker of another protocol is refused (`soapy worker for <id>: protocol N, expected 1`) and respawns exec `/proc/self/exe`, so a binary replaced under a running node is never paired with it; every node exit shuts the workers down (`shutdown`, 2 s grace, kill) instead of SIGKILLing them with the runtime; the worker's environment loses every `ZETA_*` variable naming a `SECRET`, `PASSWORD` or `KEY`.
+
 Outcomes to record (live):
 
 - Time from `kill -SEGV` to the fault in `source list`, and from the fault to the worker's hello (a UHD reopen is expected within 30 s).

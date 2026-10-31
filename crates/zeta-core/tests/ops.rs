@@ -1942,6 +1942,34 @@ async fn source_list_reports_fault() {
     );
 }
 
+/// A `SourceInfo` from a node older than `worker` (a federated source listed by
+/// an older node) deserialises with `worker: None`; the schema still marks it
+/// required, as every node of this version writes it.
+#[tokio::test]
+async fn source_info_without_worker_deserialises_with_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, file) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![file])
+        .await
+        .unwrap();
+    let Ok(OpResult::Sources(v)) = node.apply(Op::SourceList {}).await else {
+        panic!("expected sources");
+    };
+    let mut json = serde_json::to_value(&v[0]).unwrap();
+    json.as_object_mut().unwrap().remove("worker").unwrap();
+    let back: zeta_core::ops::SourceInfo = serde_json::from_value(json).unwrap();
+    assert_eq!(back.worker, None);
+    assert_eq!(back, v[0]);
+    let si = &schema()["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"worker".into()),
+        "{si}"
+    );
+}
+
 /// `source_list` items carry `stats`: required, nullable (`null` for a source
 /// that keeps no stream statistics, such as a recording), and when present an
 /// object with every field required and `measured_rate_hz` nullable.
