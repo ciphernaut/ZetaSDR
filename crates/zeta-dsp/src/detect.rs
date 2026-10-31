@@ -104,6 +104,9 @@ pub struct SpectrumRowView<'a> {
     pub floor_db: f32,
     pub step_db: f32,
     pub q: &'a [u8],
+    /// Bin ranges `[lo, hi)` (lo inclusive, hi exclusive) that hold no data: a bin
+    /// inside one takes no part in a run.
+    pub masked: &'a [[usize; 2]],
 }
 
 /// One contiguous run of occupied bins in a row.
@@ -118,8 +121,8 @@ pub struct Run {
 }
 
 /// The runs of `row`: maximal sets of contiguous unmasked bins over
-/// `floor_db + threshold_db`, inside `width_hz`. Masked are the bins within
-/// `dc_mask_hz` of the row's centre, the outer `edge_mask` fraction on each side and
+/// `floor_db + threshold_db`, inside `width_hz`. Masked are the bins inside
+/// one of the row's `masked` ranges, the bins within `dc_mask_hz` of the row's centre, the outer `edge_mask` fraction on each side and
 /// the bins within `dc_mask_hz / 5` of a spur; a masked bin ends a run. A run's centre
 /// is weighted by its bins' linear power, its width is its bin count times `bin_hz`
 /// and its SNR is its peak over `floor_db`.
@@ -136,6 +139,7 @@ pub fn runs(row: &SpectrumRowView, p: &DetectParams) -> Vec<Run> {
     let masked = |k: usize| {
         let f = freq(k);
         k < edge
+            || row.masked.iter().any(|&[lo, hi]| lo <= k && k < hi)
             || k >= size - edge
             || (f - center).abs() <= p.dc_mask_hz as f64
             || p.spurs_hz.iter().any(|&s| (f - s as f64).abs() <= spur_hz)
@@ -351,14 +355,38 @@ fn row_levels(v: &serde_json::Value) -> Option<Vec<u8>> {
 }
 
 /// The view of a spectrum row's payload `v` over its levels `q`.
-fn row_view<'a>(v: &serde_json::Value, q: &'a [u8]) -> Option<SpectrumRowView<'a>> {
+fn row_view<'a>(
+    v: &serde_json::Value,
+    q: &'a [u8],
+    masked: &'a [[usize; 2]],
+) -> Option<SpectrumRowView<'a>> {
     Some(SpectrumRowView {
         bin_hz: v.get("bin_hz")?.as_f64()?,
         center_hz: v.get("center_hz")?.as_u64()?,
         floor_db: v.get("floor_db")?.as_f64()? as f32,
         step_db: v.get("step_db")?.as_f64()? as f32,
         q,
+        masked,
     })
+}
+
+/// The payload's `masked` bin ranges as `[lo, hi)` pairs; an absent field or any
+/// malformed shape gives none (the mask is ignored).
+fn row_masked(v: &serde_json::Value) -> Vec<[usize; 2]> {
+    let pairs = || -> Option<Vec<[usize; 2]>> {
+        v.get("masked")?
+            .as_array()?
+            .iter()
+            .map(|p| {
+                let p = p.as_array()?;
+                match p.as_slice() {
+                    [lo, hi] => Some([lo.as_u64()? as usize, hi.as_u64()? as usize]),
+                    _ => None,
+                }
+            })
+            .collect()
+    };
+    pairs().unwrap_or_default()
 }
 
 /// Detects signals in spectrum rows (the `fft` stage's events): each row's [`runs`] go
@@ -434,7 +462,8 @@ impl Stage for DetectStage {
             let Some(q) = row_levels(v) else {
                 return Ok(Vec::new());
             };
-            let Some(row) = row_view(v, &q) else {
+            let masked = row_masked(v);
+            let Some(row) = row_view(v, &q, &masked) else {
                 return Ok(Vec::new());
             };
             let t_ns = frame.provenance.span.start_ns.0;
@@ -480,12 +509,58 @@ mod tests {
     }
 
     fn view(q: &[u8]) -> SpectrumRowView<'_> {
+        view_masked(q, &[])
+    }
+
+    fn view_masked<'a>(q: &'a [u8], masked: &'a [[usize; 2]]) -> SpectrumRowView<'a> {
         SpectrumRowView {
             bin_hz: BIN_HZ,
             center_hz: CENTER_HZ,
             floor_db: -100.0,
             step_db: 0.5,
             q,
+            masked,
+        }
+    }
+
+    #[test]
+    fn runs_ignore_bins_inside_a_masked_range() {
+        // The 10 kHz bump of runs_find_a_10_khz_bump_and_skip_the_dc_spike, wholly masked.
+        let up = 10 + 24;
+        let k = bin(1_000_000.0) - 1;
+        let q = row(&[(k, 3, up)]);
+        assert_eq!(runs(&view(&q), &DetectParams::default()).len(), 1);
+        assert!(runs(&view_masked(&q, &[[k, k + 3]]), &DetectParams::default()).is_empty());
+    }
+
+    #[test]
+    fn a_masked_range_cuts_a_run() {
+        // A 6-bin (21 kHz) bump with its first 3 bins masked: one 3-bin run on the unmasked half.
+        let up = 10 + 24;
+        let k = bin(1_000_000.0) - 1;
+        let q = row(&[(k, 6, up)]);
+        let found = runs(&view_masked(&q, &[[k, k + 3]]), &DetectParams::default());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].bandwidth_hz, (3.0 * BIN_HZ) as u64);
+        let centre = CENTER_HZ as f64 + (k as f64 + 4.0 - (SIZE / 2) as f64) * BIN_HZ;
+        assert!(
+            (found[0].center_hz as f64 - centre).abs() <= BIN_HZ,
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_masked_field_is_ignored() {
+        let ok = serde_json::json!({"masked": [[1, 2], [5, 9]]});
+        assert_eq!(row_masked(&ok), vec![[1, 2], [5, 9]]);
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"masked": null}),
+            serde_json::json!({"masked": [[1]]}),
+            serde_json::json!({"masked": [[1, "x"]]}),
+            serde_json::json!({"masked": "no"}),
+        ] {
+            assert!(row_masked(&bad).is_empty(), "{bad}");
         }
     }
 
