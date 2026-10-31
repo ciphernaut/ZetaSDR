@@ -182,8 +182,9 @@ naming the field, before anything starts or restarts, as the `detect` params are
 - A capability test: a fake local device (`remote: false`, `push: false`) scans with the default
   notch and edge mask in force; a remote or push source with none.
 - A `detect` test: a run entirely inside a masked range is not a signal.
-- A `measure` test: on a fake local device a synthetic DC spike louder than a tone 20 kHz away is
-  ignored and the tone is the measured centre; on a recording the spike is measured as today.
+- A `measure` test: on a fake local device a synthetic DC spike louder than a tone 40 kHz away
+  (outside the 25 kHz half-width mask) is ignored and the tone is the measured centre; on a
+  recording the spike is measured as today.
 - UI e2e (`crates/zeta-ui/tests/e2e/ui.py`, against the `scanner` fixture): after a `graph put`
   of a notch on the page's scan, a coarse row with a masked range leaves the pixels under it as
   they were, and a redraw keeps them (the harness already reads the coarse column;
