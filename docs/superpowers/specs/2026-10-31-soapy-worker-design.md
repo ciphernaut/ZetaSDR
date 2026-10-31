@@ -95,7 +95,7 @@ Plan 20 therefore does two things, and the second is the point of the first:
   used by tests) live in the workspace; the Soapy worker's `main` lives in `crates/zeta` behind
   `cfg(soapy)` like `open_soapy` does today.
 - One deployable binary. The worker is the `zeta` executable itself, invoked as `zeta soapy-worker`
-  (the node spawns `std::env::current_exe()`), so the field host unit changes nothing but the binary.
+  (the node spawns `/proc/self/exe` on Linux, `std::env::current_exe()` elsewhere), so the field host unit changes nothing but the binary.
 - `Port` methods `fault`, `current`, `gain`, `stats`, `capabilities` are synchronous. The parent must
   answer them from state it already holds; no round trip to the worker inside them.
 - Capabilities are taken once at attach (`Port::capabilities` returns a reference). The worker's
@@ -251,8 +251,9 @@ Rule from §3: the supervisor spawns a new worker only after it has reaped the o
 
 ### 4.6 Attaching a Soapy source
 
-`node_setup` builds a `WorkerPort` for each `--source-soapy ID=ARGS`, spawning `current_exe()
-soapy-worker --id ID --args ARGS`. The first hello decides whether the flag is accepted:
+`node_setup` builds a `WorkerPort` for each `--source-soapy ID=ARGS`, spawning `/proc/self/exe
+soapy-worker --id ID --args ARGS` (`current_exe()` off Linux), so a respawn runs the running
+image even after the binary on disk was replaced. The first hello decides whether the flag is accepted:
 
 - hello: attached, as today.
 - exit 3 (not found) and `sources/<id>.json` holds a capability record from an earlier open: attached

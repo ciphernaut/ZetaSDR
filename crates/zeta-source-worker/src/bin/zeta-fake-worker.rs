@@ -24,7 +24,8 @@
 //! the first spawn (the marker `<record>.crashed` says it has);
 //! `ZETA_FAKE_PRINT=1` prints `noise` to stdout after the redirect, which must
 //! land on stderr; `ZETA_FAKE_PROTOCOL=N` says hello with protocol `N` instead
-//! of serving, then waits to be killed.
+//! of serving, then waits to be killed; `ZETA_FAKE_WAIT_RUNTIME=1` ends with a
+//! plain runtime drop, which waits on the blocked stdin read.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -452,7 +453,14 @@ fn main() -> ExitCode {
         code
     });
     // Tokio's stdin read blocks a pool thread until a line arrives; after a
-    // `shutdown` there may be none, so the runtime is not waited for.
-    rt.shutdown_timeout(Duration::from_millis(100));
+    // `shutdown` there may be none, so the runtime is not waited for, unless
+    // `ZETA_FAKE_WAIT_RUNTIME=1` asks for the plain drop a `#[tokio::main]`
+    // does: that waits for the read, which only the parent closing the
+    // worker's stdin ends.
+    if std::env::var("ZETA_FAKE_WAIT_RUNTIME").is_ok_and(|v| v == "1") {
+        drop(rt);
+    } else {
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
     code
 }

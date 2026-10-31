@@ -593,3 +593,27 @@ fn close_shuts_the_worker_down_before_the_runtime_ends() {
     let text = std::fs::read_to_string(&rec).unwrap();
     assert!(text.lines().any(|l| l == "served"), "{text}");
 }
+
+#[tokio::test]
+async fn close_ends_a_worker_whose_runtime_waits_on_stdin_before_the_grace() {
+    // A worker that, like the real one returning into `#[tokio::main]`, waits
+    // for its blocked stdin read on the way out: it can only exit once the
+    // parent closes its stdin after `shutdown`. With a 3 s grace, a close that
+    // returns in under 1 s means the worker exited on its own, not by the kill.
+    let dir = tempdir();
+    let (mut cfg, rec) = cfg_wrapped(
+        dir.path(),
+        "ZETA_FAKE_WAIT_RUNTIME=1 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    cfg.timings.shutdown_grace = Duration::from_secs(3);
+    let (port, _) = open(cfg, None).await;
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    let pid = port.worker().unwrap().pid.unwrap();
+    let t0 = Instant::now();
+    port.close().await;
+    let took = t0.elapsed();
+    assert!(took < Duration::from_secs(1), "{took:?}");
+    assert!(!alive(pid), "worker {pid} outlived the close");
+    let text = std::fs::read_to_string(&rec).unwrap();
+    assert!(text.lines().any(|l| l == "served"), "{text}");
+}

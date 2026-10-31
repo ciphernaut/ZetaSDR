@@ -156,6 +156,13 @@ impl Link {
         stdin.flush().await
     }
 
+    /// Close the worker's stdin. A worker reads it on a blocking thread its
+    /// runtime cannot cancel, so it only gets past that read, and out of the
+    /// process, once it sees EOF; later writes fail as a broken pipe.
+    async fn close_stdin(&self) {
+        drop(self.stdin.lock().await.take());
+    }
+
     pub(crate) fn forget(&self, id: u64) {
         self.pending().remove(&id);
     }
@@ -632,7 +639,8 @@ impl Supervisor {
         })
     }
 
-    /// Stop a worker: `shutdown` on its stdin, the grace to exit, then kill.
+    /// Stop a worker: `shutdown` on its stdin, its stdin closed, the grace to
+    /// exit, then kill.
     /// Always reaped before returning.
     async fn shutdown(&self, mut w: Worker) {
         let _ = w
@@ -642,6 +650,9 @@ impl Supervisor {
                 cmd: Cmd::Shutdown,
             })
             .await;
+        // Then EOF: a worker whose runtime waits for its stdin read on the way
+        // out would otherwise sit out the grace and be killed.
+        w.link.close_stdin().await;
         let grace = self.cfg.timings.shutdown_grace;
         if tokio::time::timeout(grace, w.child.wait()).await.is_err() {
             let _ = w.child.kill().await;
