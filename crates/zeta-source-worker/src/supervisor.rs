@@ -31,7 +31,9 @@ use zeta_core::types::{Capabilities, SourceId};
 
 use crate::port::{Attach, WorkerConfig};
 use crate::serve::{EXIT_FAULTED, EXIT_NOT_FOUND, EXIT_OPEN_FAILED};
-use crate::wire::{Cmd, Control, Frame, Hello, Reply, Request, read_frame, write_request};
+use crate::wire::{
+    Cmd, Control, Frame, Hello, PROTOCOL, Reply, Request, read_frame, write_request,
+};
 
 /// Capacity of the port's block broadcast, as `zeta-source-node` uses.
 const BROADCAST_CAPACITY: usize = 64;
@@ -339,6 +341,20 @@ impl Supervisor {
         loop {
             tokio::select! {
                 h = &mut w.hello, if hello_open => match h {
+                    Ok(hello) if hello.protocol != PROTOCOL => {
+                        // Another build's worker (the binary replaced under a
+                        // running node): its frames cannot be trusted to mean
+                        // what ours do, so it is ended before anything is sent.
+                        let _ = w.child.kill().await;
+                        let mut ended = self.reap(w, None, None).await;
+                        ended.fault = format!(
+                            "soapy worker for {}: protocol {}, expected {PROTOCOL}",
+                            self.id(),
+                            hello.protocol
+                        );
+                        ended.not_found = None;
+                        return self.ended(ended);
+                    }
                     Ok(hello) => return Some(self.on_hello(w, hello)),
                     // The stdout thread ended without a hello: wait for the
                     // exit, still bounded by the hello deadline.
@@ -367,7 +383,7 @@ impl Supervisor {
         }
     }
 
-    /// A worker said hello: it is live. Heals an episode, answers `first`.
+    /// A worker of our protocol said hello: it is live. Heals an episode, answers `first`.
     fn on_hello(&mut self, w: Worker, hello: Hello) -> State {
         match &self.caps {
             None => self.caps = Some(hello.capabilities.clone()),

@@ -10,15 +10,21 @@
 //! - `open-fails`: exits 4 after `fake open: no such device` on stderr.
 //! - `crash-after-ms N`: `stream`, and N ms after start `abort()` (SIGABRT).
 //! - `hang-hello`: never writes a hello.
+//! - `hang-open`: installs the stop-signal handling the real worker installs,
+//!   prints `hanging in open` on stderr and blocks for good, as a driver hung
+//!   in `open()` does.
 //! - `file PATH[,crash-after-ms N]`: a looping real-time `FileSource` over the
 //!   recording `PATH`, tunable 2 MHz either side of its centre.
 //!
 //! `--record PATH` appends `start <unix_ms>` and one `env <NAME>` per
 //! environment variable at startup, then `tune <c> <bw>` and `gain <db|auto>`
 //! per call, so a test sees when the worker was spawned, what it inherited and
-//! what the node re-applied. `ZETA_FAKE_CRASH_ONCE=1` crashes only on the
-//! first spawn (the marker `<record>.crashed` says it has); `ZETA_FAKE_PRINT=1`
-//! prints `noise` to stdout after the redirect, which must land on stderr.
+//! what the node re-applied, and `served` when `serve` returns (a `shutdown`
+//! or a closed stdin, never a kill). `ZETA_FAKE_CRASH_ONCE=1` crashes only on
+//! the first spawn (the marker `<record>.crashed` says it has);
+//! `ZETA_FAKE_PRINT=1` prints `noise` to stdout after the redirect, which must
+//! land on stderr; `ZETA_FAKE_PROTOCOL=N` says hello with protocol `N` instead
+//! of serving, then waits to be killed.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -37,8 +43,9 @@ use zeta_source_file::{FileOpts, FileSource, read_meta};
 use zeta_source_soapy::SoapySource;
 use zeta_source_soapy::mock::{MockDevice, MockRead};
 use zeta_source_worker::serve::{
-    EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, serve,
+    EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
 };
+use zeta_source_worker::wire::{Control, Frame, Hello, write_frame};
 
 /// Samples per scripted read.
 const READ_SAMPLES: usize = 16_384;
@@ -286,6 +293,24 @@ fn crash_after(after: Duration, record: Option<&Path>) {
     });
 }
 
+/// Say hello with `protocol` on `frames`, as a worker of another build would,
+/// then wait for the parent to kill the process.
+fn wrong_hello(port: &dyn Port, protocol: u32, mut frames: File) -> ExitCode {
+    let hello = Frame::Control(Control::Hello(Hello {
+        protocol,
+        capabilities: port.capabilities().clone(),
+        gain: port.gain(),
+        driver: "fake".into(),
+    }));
+    if let Err(e) = write_frame(&mut frames, &hello).and_then(|()| frames.flush()) {
+        eprintln!("zeta-fake-worker: hello: {e}");
+        return ExitCode::from(EXIT_OPEN_FAILED);
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -353,6 +378,21 @@ fn main() -> ExitCode {
         }
     };
     let code = rt.block_on(async {
+        // Installed before the port opens, as the real worker does, so a
+        // signal during a hung open is handled.
+        let requests = match requests_until_signal() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("zeta-fake-worker: signal handlers: {e}");
+                return ExitCode::from(EXIT_OPEN_FAILED);
+            }
+        };
+        if name == "hang-open" {
+            eprintln!("hanging in open");
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
         // A receiver held for the life of the worker, see the `file` script.
         let mut keep: Option<IqReceiver> = None;
         let port: Result<Arc<dyn Port>, String> = match (name, arg) {
@@ -396,11 +436,18 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_OPEN_FAILED);
             }
         };
+        if let Some(protocol) = std::env::var("ZETA_FAKE_PROTOCOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            return wrong_hello(port.as_ref(), protocol, frames);
+        }
         let port: Arc<dyn Port> = Arc::new(Recorded {
             inner: port,
-            record,
+            record: record.clone(),
         });
-        let code = serve(port, "fake", tokio::io::stdin(), frames).await;
+        let code = serve(port, "fake", requests, frames).await;
+        record.line("served");
         drop(keep);
         code
     });

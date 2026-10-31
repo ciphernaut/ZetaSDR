@@ -264,3 +264,55 @@ fn a_print_to_stdout_in_the_worker_lands_on_stderr() {
     let stderr = stderr_of(&mut child);
     assert!(stderr.lines().any(|l| l == "noise"), "{stderr:?}");
 }
+
+/// Send `sig` to the child.
+fn signal(child: &Child, sig: i32) {
+    let pid = libc::pid_t::try_from(child.id()).unwrap();
+    // SAFETY: kill takes no pointers; the child is ours and not yet reaped.
+    assert_eq!(unsafe { libc::kill(pid, sig) }, 0);
+}
+
+#[test]
+fn sigint_takes_the_shutdown_path() {
+    // A terminal Ctrl-C reaches the whole foreground group, the worker
+    // included: it must leave as one the node shut down, not die of SIGINT.
+    let (mut child, _stdin, stdout) = spawn("stream");
+    let frames = Frames::new(stdout);
+    read_hello(&frames);
+    signal(&child, libc::SIGINT);
+    let status = wait_exit(&mut child, Duration::from_secs(3));
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[test]
+fn sigterm_takes_the_shutdown_path() {
+    let (mut child, _stdin, stdout) = spawn("stream");
+    let frames = Frames::new(stdout);
+    read_hello(&frames);
+    signal(&child, libc::SIGTERM);
+    let status = wait_exit(&mut child, Duration::from_secs(3));
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[test]
+fn sigterm_during_a_hung_open_exits_at_the_watchdog() {
+    // `hang-open` installs the signal forwarding the real worker installs,
+    // then blocks as a driver hung in `open()` does: `serve` never runs, so
+    // the `shutdown` the signal becomes is never read. Only the watchdog ends
+    // the process.
+    let mut child = spawn_with("hang-open", &[]);
+    let _stdin = child.stdin.take().unwrap();
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut stderr, &mut line).unwrap();
+    assert_eq!(line.trim(), "hanging in open", "{line:?}");
+    let t0 = Instant::now();
+    signal(&child, libc::SIGTERM);
+    let status = wait_exit(&mut child, Duration::from_secs(10));
+    let took = t0.elapsed();
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(
+        took >= Duration::from_millis(4500) && took < Duration::from_secs(8),
+        "{took:?}"
+    );
+}

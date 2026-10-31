@@ -258,7 +258,3 @@ Found in plan 20's reviews. With `decode_on: free` the watch puts a decoder on a
 ## Bug: `source_ensure` and `source_pin` refusals from a faulted source lack the `source <id>: ` prefix
 
 Found in plan 20's reviews. `job_start` and a job's failure read `source <id>: <fault>`, but `source_ensure` and `source_pin` still answer bare `io: <fault>`. Route them through the same helper `job_start` uses.
-
-## Bug: a SIGKILLed node with a hung driver can orphan the worker
-
-Worker: if the node is killed with SIGKILL while the driver call is hung, the `zeta soapy-worker` child can outlive it and keep the device open. The respawn should exec `/proc/self/exe` (not a path that a rebuild can replace) and the worker should exit when its parent goes away.

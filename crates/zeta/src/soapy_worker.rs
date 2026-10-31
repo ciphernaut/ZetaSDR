@@ -58,20 +58,13 @@ mod imp {
     use std::process::ExitCode;
     use std::sync::Arc;
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
-    use tokio::signal::unix::{SignalKind, signal};
     use zeta_core::port::Port;
     use zeta_core::types::SourceId;
     use zeta_source_worker::serve::{
-        EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, serve,
+        EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
     };
-    use zeta_source_worker::wire::{Cmd, Request};
 
     use crate::cli::SoapyWorkerArgs;
-
-    /// Room in the pipe between the stdin forwarder and `serve`: requests are short
-    /// lines, so this only has to absorb a burst while `serve` is busy.
-    const REQUEST_PIPE: usize = 64 * 1024;
 
     pub async fn run(args: SoapyWorkerArgs) -> ExitCode {
         die_with_parent();
@@ -84,10 +77,13 @@ mod imp {
                 return ExitCode::from(EXIT_OPEN_FAILED);
             }
         };
-        let requests = match requests_until_sigterm() {
+        // Before the device opens: a SIGTERM (the node's, or the parent-death signal)
+        // or a terminal's SIGINT during a hung open must still end the worker, which
+        // the watchdog this arms on the first signal does.
+        let requests = match requests_until_signal() {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("zeta: soapy-worker: SIGTERM handler: {e}");
+                eprintln!("zeta: soapy-worker: signal handlers: {e}");
                 return ExitCode::from(EXIT_OPEN_FAILED);
             }
         };
@@ -141,39 +137,4 @@ mod imp {
 
     #[cfg(not(target_os = "linux"))]
     fn die_with_parent() {}
-
-    /// Stdin as `serve` reads it, with SIGTERM turned into a `shutdown` request: a
-    /// terminated worker then leaves exactly as one the node shut down, closing the
-    /// device on the way out. Lines are forwarded whole, so the injected request never
-    /// lands inside one of the node's.
-    fn requests_until_sigterm() -> std::io::Result<DuplexStream> {
-        let mut term = signal(SignalKind::terminate())?;
-        let (mut tx, rx) = tokio::io::duplex(REQUEST_PIPE);
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            loop {
-                tokio::select! {
-                    line = lines.next_line() => match line {
-                        Ok(Some(mut l)) => {
-                            l.push('\n');
-                            if tx.write_all(l.as_bytes()).await.is_err() {
-                                return;
-                            }
-                        }
-                        // Closing the pipe ends `serve` as a closed stdin does.
-                        Ok(None) | Err(_) => return,
-                    },
-                    _ = term.recv() => {
-                        let req = Request { id: 0, cmd: Cmd::Shutdown };
-                        if let Ok(mut l) = serde_json::to_string(&req) {
-                            l.push('\n');
-                            let _ = tx.write_all(l.as_bytes()).await;
-                        }
-                        return;
-                    }
-                }
-            }
-        });
-        Ok(rx)
-    }
 }

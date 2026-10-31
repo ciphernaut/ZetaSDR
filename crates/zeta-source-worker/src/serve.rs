@@ -12,6 +12,10 @@
 //! and flushes per frame, so control messages and blocks keep one order and a
 //! parent that reads slowly never blocks the status task's fault check (blocks
 //! beyond [`MAX_QUEUED_BLOCKS`] are dropped and counted as lost instead).
+//!
+//! [`requests_until_signal`] is the stdin a worker hands `serve`: SIGTERM and
+//! SIGINT become a `shutdown` request, and a watchdog ends the process if the
+//! request is never read.
 
 use std::io::{self, BufWriter, Write};
 use std::os::fd::RawFd;
@@ -21,13 +25,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Notify, broadcast, oneshot};
 use zeta_core::port::{Port, Tuning};
 use zeta_core::types::Hz;
 
 use crate::wire::{
-    Cmd, Control, Frame, Hello, PROTOCOL, Reply, Status, parse_request, write_frame,
+    Cmd, Control, Frame, Hello, PROTOCOL, Reply, Request, Status, parse_request, write_frame,
+    write_request,
 };
 
 /// Exit code of a worker that found no device to open: the parent polls.
@@ -51,6 +57,15 @@ const LOST_LOG_EVERY: Duration = Duration::from_secs(10);
 /// How long the end of `serve` waits for queued frames to reach stdout; a
 /// parent that stopped reading must not keep the worker alive.
 const FINAL_FLUSH: Duration = Duration::from_secs(1);
+/// How long a worker told to stop by SIGTERM or SIGINT has to leave on its own
+/// before the process is ended regardless. A worker whose driver hangs in
+/// `open()` never reaches `serve`, so the `shutdown` the signal became is never
+/// read; without the watchdog it would hold the device until SIGKILL, and the
+/// parent-death signal (SIGTERM as well) would be swallowed the same way.
+pub const SIGNAL_EXIT_WATCHDOG: Duration = Duration::from_secs(5);
+/// Room in the pipe between the stdin forwarder and `serve`: requests are
+/// short lines, so this only has to absorb a burst while `serve` is busy.
+const REQUEST_PIPE: usize = 64 * 1024;
 
 /// What the writer thread is handed.
 enum Out {
@@ -259,6 +274,74 @@ async fn status_loop(
             let _ = faulted.send(());
             return;
         }
+    }
+}
+
+/// Stdin as [`serve`] reads it, with SIGTERM and SIGINT turned into a
+/// `shutdown` request, so a signalled worker leaves exactly as one the node
+/// shut down, closing the device on the way out. SIGINT is taken too because a
+/// terminal Ctrl-C reaches the whole foreground group, the worker included,
+/// while the node is shutting it down properly. Lines are forwarded whole, so
+/// the injected request never lands inside one of the node's.
+///
+/// The handlers replace the default dispositions for the life of the process,
+/// so the first signal also arms [`SIGNAL_EXIT_WATCHDOG`]: a later signal is
+/// swallowed, and a worker that never reads the request still ends. Call it
+/// from inside a tokio runtime, before opening the device.
+pub fn requests_until_signal() -> io::Result<DuplexStream> {
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let (mut tx, rx) = tokio::io::duplex(REQUEST_PIPE);
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        loop {
+            tokio::select! {
+                line = lines.next_line() => match line {
+                    Ok(Some(mut l)) => {
+                        l.push('\n');
+                        if tx.write_all(l.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Closing the pipe ends `serve` as a closed stdin does.
+                    Ok(None) | Err(_) => return,
+                },
+                _ = term.recv() => break,
+                _ = int.recv() => break,
+            }
+        }
+        arm_exit_watchdog(SIGNAL_EXIT_WATCHDOG);
+        let mut line = Vec::new();
+        let req = Request {
+            id: 0,
+            cmd: Cmd::Shutdown,
+        };
+        if write_request(&mut line, &req).is_ok() {
+            let _ = tx.write_all(&line).await;
+        }
+    });
+    Ok(rx)
+}
+
+/// End the process `after` from now, from a thread of its own so a blocked
+/// runtime cannot hold it up. `_exit` rather than `std::process::exit`: `exit`
+/// runs the C `atexit` handlers and static destructors, and a driver hung in
+/// `open()` may hold a lock one of them takes, which would hang the exit too.
+/// Code 0: the worker was asked to stop and stopped, as after a `shutdown`.
+fn arm_exit_watchdog(after: Duration) {
+    let spawned = std::thread::Builder::new()
+        .name("worker-exit-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(after);
+            eprintln!(
+                "zeta-source-worker: still running {} s after a stop signal; exiting",
+                after.as_secs()
+            );
+            // SAFETY: `_exit` takes no pointers and never returns.
+            unsafe { libc::_exit(0) }
+        });
+    if let Err(e) = spawned {
+        eprintln!("zeta-source-worker: exit watchdog thread: {e}");
     }
 }
 

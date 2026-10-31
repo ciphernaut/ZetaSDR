@@ -208,7 +208,7 @@ async fn open_soapy(
             .map(|s| Arc::new(s) as Arc<dyn Port>)
             .map_err(|e| e.to_string());
     }
-    let program = std::env::current_exe().map_err(|e| format!("locating zeta: {e}"))?;
+    let program = worker_program()?;
     let source = SourceId(id.to_owned());
     let cached = zeta_core::node::load_source(&state_dir.join("sources"), &source)
         .and_then(|r| r.capabilities);
@@ -230,6 +230,19 @@ async fn open_soapy(
         }
         Err(e) => Err(e),
     }
+}
+
+/// The program a worker is spawned from: this process's own image. On Linux that is
+/// `/proc/self/exe`, which the kernel resolves to the running image at each exec, so a
+/// respawn after the binary was replaced on disk (an upgrade under a running node)
+/// still runs the build the node is, never a worker of another protocol. Elsewhere the
+/// path the process was started from.
+#[cfg(soapy)]
+fn worker_program() -> Result<PathBuf, String> {
+    if cfg!(target_os = "linux") {
+        return Ok(PathBuf::from("/proc/self/exe"));
+    }
+    std::env::current_exe().map_err(|e| format!("locating zeta: {e}"))
 }
 
 /// A build without the driver refuses before spawning anything: the worker would only

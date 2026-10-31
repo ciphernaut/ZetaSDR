@@ -530,3 +530,28 @@ async fn a_bad_band_is_refused_without_a_round_trip() {
     let e = port.tune(tuning(100_000_000, 2_000_000)).await.unwrap_err();
     assert_eq!(e, PortError::Io("device not found: fake".into()));
 }
+
+#[tokio::test]
+async fn a_hello_of_another_protocol_is_refused_and_the_child_reaped() {
+    // A binary replaced under a running node says hello with its own
+    // protocol; the node must name the mismatch, not decode its frames.
+    let dir = tempdir();
+    let pidfile = dir.path().join("pid");
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        &format!(
+            "echo $$ > '{}'\nZETA_FAKE_PROTOCOL=99 exec \"$FAKE\" --script stream \"$@\"",
+            pidfile.display()
+        ),
+    );
+    let t0 = Instant::now();
+    let err = WorkerPort::open(cfg, None).await.err().expect("refused");
+    assert_eq!(err, "soapy worker for f: protocol 99, expected 1");
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!alive(pid), "worker {pid} still exists");
+}
