@@ -196,19 +196,6 @@ pub fn render(schema: &Value, field_craft: &str) -> String {
             list("inputs"),
             list("outputs")
         ));
-        let r = &st["readiness"];
-        let mut line = if r["ready"].as_bool().unwrap_or(true) {
-            "ready".to_string()
-        } else {
-            format!(
-                "not ready ({})",
-                r["reason"].as_str().unwrap_or("no reason given")
-            )
-        };
-        if let Some(c) = r["capacity"].as_u64() {
-            line.push_str(&format!(", capacity {c}"));
-        }
-        out.push_str(&format!("- readiness: {line}\n"));
         let req = required(ps);
         for p in &req {
             out.push_str(&format!(
