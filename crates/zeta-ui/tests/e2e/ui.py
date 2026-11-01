@@ -2370,7 +2370,7 @@ def scenario_watched_jobs_are_capped(page, url, secret):
             stop_job(url, secret, j)
 
 
-MAX_WS = 16  # zeta-ws Limits::default().max_ws
+MAX_WS = 64  # zeta-ws Limits::default().max_ws
 
 HOG_JS = """async ([n, id, proto]) => {
   window.hog = [];

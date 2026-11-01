@@ -55,7 +55,10 @@ impl Default for Limits {
         Self {
             body_bytes: 1 << 20,
             max_concurrent_ops: 8,
-            max_ws: 16,
+            // Stream websockets: a page holds one per shown stream (spectrum, ops, each running
+            // job's events), so 16 starved a second page; a socket is one task and one broadcast
+            // receiver, cheap enough for 64 even on a Pi.
+            max_ws: 64,
             op_timeout: Duration::from_secs(30),
             ws_send_timeout: Duration::from_secs(5),
             auth_fail_delay: Duration::from_millis(250),

@@ -62,9 +62,9 @@ An `identify` run's trial children (and a watch's identify runs) are ordinary re
 
 `fitBand` starts its `measure` job with `api.op` directly, so a conflict on it gets a bare `<kind>: <message>` note and no "stop … and retry" button. Route it through `applyOp` (or reuse its conflict rendering) so the retry is offered as for every other start. From plan 18's review, 2026-11-01.
 
-## Node: 16 stream sockets starve a second page
+## Node: stream sockets are a fixed pool
 
-One open page held 12-16 of the node's 16 stream slots (`max_ws`); a second page got `stream refused: too many stream connections` on every stream and could not paint. Raise the cap per client or per node, or make the page release the streams it no longer shows. From the B210 live run of plans 15/18, 2026-11-01.
+One open page held 12-16 of the node's 16 stream slots (`max_ws`); a second page got `stream refused: too many stream connections` on every stream and could not paint (the B210 live run of plans 15/18, 2026-11-01; the operator's page hit it again while agent `stream tail`s ran). The default was raised 16 → 64 the same day. Still to do: a `--max-streams N` flag on `serve` (env `ZETA_MAX_STREAMS`), per-client fairness so one page cannot take the whole pool, and the page releasing the streams it no longer shows.
 
 ## UI: the page watches at most 4 jobs, so a tag loses its squelch dot
 
