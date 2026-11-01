@@ -285,6 +285,9 @@ pub enum PlanCmd {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Channels(Vec<u32>);
 
+/// The widest `N-M` range of `--channels`, so a typo cannot expand to billions of numbers.
+const MAX_CHANNEL_RANGE: u32 = 1000;
+
 /// `1,2,5-8` into sorted, deduplicated channel numbers; an empty item or a reversed
 /// range is an error.
 pub fn parse_channels(s: &str) -> Result<Channels, String> {
@@ -300,6 +303,11 @@ pub fn parse_channels(s: &str) -> Result<Channels, String> {
                 let (lo, hi) = (num(lo)?, num(hi)?);
                 if lo > hi {
                     return Err(format!("channels: range {item} is reversed"));
+                }
+                if hi - lo >= MAX_CHANNEL_RANGE {
+                    return Err(format!(
+                        "channels: range {item} is wider than {MAX_CHANNEL_RANGE} channels"
+                    ));
                 }
                 out.extend(lo..=hi);
             }
@@ -1005,4 +1013,19 @@ fn read_graph(path: &std::path::Path) -> Result<Graph, OpError> {
     };
     let text = std::fs::read_to_string(path).map_err(|e| other(&e))?;
     serde_json::from_str(&text).map_err(|e| other(&e))
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn parse_channels_sorts_dedups_and_refuses_bad_input() {
+        assert_eq!(parse_channels("1,2,5-8").unwrap().0, [1, 2, 5, 6, 7, 8]);
+        assert_eq!(parse_channels("2,1-2,1").unwrap().0, [1, 2]);
+        for bad in ["1,,2", "8-5", "a", "5-", "-5", "1-5000"] {
+            let e = parse_channels(bad).expect_err(bad);
+            assert!(e.contains("channels"), "{bad}: {e}");
+        }
+    }
 }
