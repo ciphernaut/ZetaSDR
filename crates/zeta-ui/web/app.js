@@ -757,7 +757,10 @@ function start(api) {
     footprint: () => document.documentElement.dataset.footprint || "wide",
     onOutlineMenu: (job, x, y) => state.menu?.openOutline(job, x, y),
   });
-  state.map = mountMap($("#map"), api, state.view, { jobs: () => state.lastJobs });
+  state.map = mountMap($("#map"), api, state.view, {
+    jobs: () => state.lastJobs,
+    subjects: state.subjects,
+  });
   state.ov.onEvent((job, p) => {
     state.subjects?.event(job, p);
     state.map?.event(job, p);

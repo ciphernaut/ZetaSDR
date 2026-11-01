@@ -4080,6 +4080,239 @@ def scenario_protocol_text_has_no_adsb_case(page, url, secret):
 
 # ---- runner ----------------------------------------------------------------------------
 
+# ---- the map, per subject (plan 23 Task 4) ----------------------------------------------
+
+def map_with_subjects(page, url, secret):
+    """The map on, its tiles aborted, and `fake_subjects` running on the tone source with both
+    of its fixed aircraft drawn; the job id."""
+    page.route(OSM_TILES, lambda r: r.abort())
+    select_source(page, url, secret, "tone")
+    run_cmd(page, "view set map on")
+    expect(page.locator("#map")).to_be_visible()
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    expect(page.locator("#map .map-subject")).to_have_count(2, timeout=10_000)
+    return job
+
+
+def map_subject(page, text):
+    return page.locator("#map .map-subject").filter(has_text=text)
+
+
+def scenario_map_draws_one_marker_per_subject(page, url, secret):
+    errors = page_errors(page)
+    job = map_with_subjects(page, url, secret)
+    try:
+        expect(page.locator("#map path.map-track")).to_have_count(2)
+        # Every line in: 7C0001's two fixes are a move and one line segment.
+        page.wait_for_function(
+            "(job) => window.zetaSubjects.list(job).reduce((n, s) => n + s.count, 0) === 8",
+            arg=job, timeout=5_000)
+        page.wait_for_function(
+            """() => [...document.querySelectorAll('#map path.map-track')].some(
+                 (e) => (e.getAttribute('d').match(/[ML]/g) || []).length === 2)""",
+            timeout=5_000)
+        # The heading and speed came in a message with no fix, after the last fix.
+        qfa = map_subject(page, "QFA1")
+        expect(qfa.locator(".label")).to_have_text("QFA1 6401 m")
+        transform = qfa.locator(".arrow").evaluate("(e) => e.style.transform")
+        assert "rotate(245deg)" in transform, transform
+        voz = map_subject(page, "VOZ2")
+        expect(voz.locator(".label")).to_have_text("VOZ2 0 m")
+        assert voz.locator(".arrow").evaluate("(e) => e.style.transform") == ""
+        expect(voz.locator(".arrow.dot")).to_have_count(1)
+        # The popup names the subject and lists its values.
+        qfa.click()
+        popup = page.locator("#map .leaflet-popup-content")
+        expect(popup).to_contain_text("QFA1")
+        expect(popup).to_contain_text("780 km/h")
+        # Two subjects: the table has them, the job's row has no distance.
+        run_cmd(page, "view set home -27.50,153.00")
+        expect(page.locator(f'#jobs .job[data-id="{job}"]')).to_be_visible()
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f'#jobs .job[data-id="{job}"] .pos')).to_have_count(0)
+        # Decoder text stays text, in the marker and in its popup.
+        page.evaluate(
+            """async () => {
+              const { state } = await import('./app.js');
+              state.map.map.closePopup();
+            }""")
+        page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              const job = {id, kind: 'fake_subjects'};
+              const p = {icao: '7C0004', callsign: '<b>HOSTILE</b>',
+                         position: {lat: -27.35, lon: 153.15, alt_m: null}};
+              state.subjects.event(job, p);
+              state.map.event(job, p);
+            }""", job)
+        hostile = map_subject(page, "HOSTILE")
+        expect(hostile.locator(".label")).to_have_text("<b>HOSTILE</b>")
+        hostile.click()
+        # The fading popup of QFA1 may still be there.
+        expect(popup.last).to_contain_text("<b>HOSTILE</b>")
+        expect(page.locator("#map b")).to_have_count(0)
+        # The job's markers and tracks go with it.
+        stop_job(url, secret, job)
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator("#map .map-subject")).to_have_count(0)
+        expect(page.locator("#map path.map-track")).to_have_count(0)
+        assert not errors, f"console errors: {errors}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_a_keyed_job_with_one_subject_keeps_its_row_distance(page, url, secret):
+    select_source(page, url, secret, "tone")
+    run_cmd(page, "view set home -27.50,153.00")
+    expect(view_line(page, "home = -27.5,153")).to_be_visible()
+    r = page.evaluate(
+        """async () => {
+          const { state } = await import('./app.js');
+          await state.subjects.lookup(['fake_subjects']);
+          // In one tick: a jobs poll drops the subjects of a job that is not running.
+          const job = {id: 'stub', kind: 'fake_subjects'};
+          const fix = (icao, lat, lon) => {
+            const p = {icao, position: {lat, lon, alt_m: null}};
+            state.subjects.event(job, p);
+            state.map.event(job, p);
+          };
+          fix('AAAAAA', -27.41, 153.11);
+          const one = state.map.rowText('stub');
+          fix('BBBBBB', -27.30, 153.20);
+          const two = state.map.rowText('stub');
+          state.subjects.drop('stub', 'AAAAAA');
+          const back = state.map.rowText('stub');
+          state.subjects.drop('stub', 'BBBBBB');
+          return {one, two, back, none: state.map.rowText('stub')};
+        }""")
+    assert r["one"] == "14.8 km, 47°", r
+    assert r["two"] is None, r
+    assert r["back"] is not None and r["back"] != r["one"], r
+    assert r["none"] is None, r
+
+
+def scenario_track_keeps_the_last_100_fixes(page, url, secret):
+    select_source(page, url, secret, "tone")
+    r = page.evaluate(
+        """async () => {
+          const { state } = await import('./app.js');
+          const { SUBJECT_TRACK_POINTS, TRACK_POINTS } = await import('./map.js');
+          await state.subjects.lookup(['fake_subjects']);
+          const job = {id: 'stub', kind: 'fake_subjects'};
+          for (let i = 0; i < 150; i += 1) {
+            const p = {icao: 'AAAAAA', position: {lat: -27 - i / 1000, lon: 153, alt_m: null}};
+            state.subjects.event(job, p);
+            state.map.event(job, p);
+          }
+          const t = state.map.tracks.get('stub\\u0000AAAAAA');
+          const out = {n: t.points.length, last: t.points[t.points.length - 1],
+                       job: t.job, key: t.key, cap: SUBJECT_TRACK_POINTS, unkeyed: TRACK_POINTS,
+                       entries: state.map.tracks.size};
+          state.subjects.drop('stub', 'AAAAAA');
+          return out;
+        }""")
+    assert r["cap"] == 100 and r["unkeyed"] == 3600, r
+    assert r["n"] == 100, r
+    assert r["last"] == [-27.149, 153], r
+    assert (r["job"], r["key"], r["entries"]) == ("stub", "AAAAAA", 1), r
+
+
+def scenario_table_and_map_select_each_other(page, url, secret):
+    errors = page_errors(page)
+    job = map_with_subjects(page, url, secret)
+    try:
+        selected = page.locator("#map .map-subject.selected")
+        expect(selected).to_have_count(0)
+        subject_row(page, "7C0001").click()
+        expect(subject_row(page, "7C0001")).to_have_class(re.compile(r"\bselected\b"))
+        expect(selected).to_have_count(1)
+        expect(selected).to_contain_text("QFA1")
+        # A subject with no fix selects in the table and marks no marker.
+        subject_row(page, "7C0003").click()
+        expect(selected).to_have_count(0)
+        subject_row(page, "7C0001").click()
+        expect(selected).to_have_count(1)
+        # A selection off-screen pans to it; one on-screen does not.
+        moved = page.evaluate(
+            """async () => {
+              const { state } = await import('./app.js');
+              const m = state.map.map;
+              const at = () => { const c = m.getCenter(); return [c.lat, c.lng]; };
+              const before = at();
+              const job = state.subjects.selected().job;
+              state.subjects.select(job, '7C0002');
+              const on = at();
+              m.setView([40, 0], 10, {animate: false});
+              const away = m.getBounds().contains([-27.41, 153.11]);
+              state.subjects.select(job, '7C0001');
+              const shown = m.getBounds().contains([-27.41, 153.11]);
+              return {same: on[0] === before[0] && on[1] === before[1], away, shown};
+            }""")
+        assert moved == {"same": True, "away": False, "shown": True}, moved
+        page.evaluate(
+            """async () => {
+              const { state } = await import('./app.js');
+              state.map.map.setView([-27.35, 153.15], 10, {animate: false});
+            }""")
+        # A marker click selects its row, in view, and only that marker.
+        map_subject(page, "VOZ2").click()
+        row = subject_row(page, "7C0002")
+        expect(row).to_have_class(re.compile(r"\bselected\b"))
+        expect(row).to_be_in_viewport()
+        expect(selected).to_have_count(1)
+        expect(selected).to_contain_text("VOZ2")
+        expect(page.locator("#subjects tr.subject.selected")).to_have_count(1)
+        assert not errors, f"console errors: {errors}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_selected_row_scrolls_into_view(page, url, secret):
+    # A short pane, so the last row starts below its fold.
+    job = map_with_subjects(page, url, secret)
+    try:
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+        r = page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              const pane = document.querySelector('#subjects');
+              pane.style.height = '60px';
+              pane.style.bottom = 'auto';
+              pane.scrollTop = 0;
+              const rows = [...pane.querySelectorAll('tr.subject')];
+              const tr = rows[rows.length - 1];
+              const before = tr.getBoundingClientRect().bottom > pane.getBoundingClientRect().bottom;
+              state.subjects.select(id, tr.dataset.key);
+              const b = tr.getBoundingClientRect();
+              const p = pane.getBoundingClientRect();
+              return {before, after: b.top >= p.top - 1 && b.bottom <= p.bottom + 1};
+            }""", job)
+        assert r == {"before": True, "after": True}, r
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_map_follows_dim_and_drop(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    select_source(page, url, secret, "tone")
+    run_cmd(page, "view set subject_dim_s 1")
+    expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
+    run_cmd(page, "view set subject_drop_s 4")
+    expect(view_line(page, "subject_drop_s = 4")).to_be_visible()
+    run_cmd(page, "view set map on")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        expect(page.locator("#map .map-subject")).to_have_count(2, timeout=10_000)
+        page.evaluate("(job) => window.zetaSubjects.select(job, '7C0001')", job)
+        assert page.evaluate("window.zetaSubjects.selected().key") == "7C0001"
+        expect(page.locator("#map .map-subject.dim")).to_have_count(2, timeout=3_000)
+        expect(page.locator("#map .map-subject")).to_have_count(0, timeout=8_000)
+        expect(page.locator("#map path.map-track")).to_have_count(0)
+        assert page.evaluate("window.zetaSubjects.selected()") is None
+    finally:
+        stop_job(url, secret, job)
+
+
 def scenarios():
     return [(name[len("scenario_"):], fn) for name, fn in globals().items()
             if name.startswith("scenario_") and callable(fn)]

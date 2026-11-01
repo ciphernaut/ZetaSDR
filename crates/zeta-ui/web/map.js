@@ -3,6 +3,7 @@
 //
 // Exports:
 //   TRACK_POINTS   fixes kept per job track (the oldest dropped first)
+//   SUBJECT_TRACK_POINTS   fixes kept per subject's track (likewise)
 //   OSM_TILES, OSM_ATTRIBUTION   the only tile layer: OpenStreetMap's, with its attribution;
 //                  a tile that fails (offline, or the e2e suite aborting the host) leaves its
 //                  square blank
@@ -12,22 +13,27 @@
 //       decimal degrees.
 //   positionOf(payload) -> {lat, lon, alt_m} | null   an event's `position`, when it has finite
 //       lat and lon
-//   mountMap(el, api, view, {jobs}) -> MapPane
+//   mountMap(el, api, view, {jobs, subjects}) -> MapPane
 //       `el` (#map) is shown while view.get("map") is "on" and hidden otherwise (view.onChange).
 //       Leaflet (vendor/leaflet, served by the node) is loaded the first time the map shows,
 //       so a page that never shows it never loads it. `jobs()` returns the last `job_list`
-//       result. `api` is the node's client (unused so far: every fix arrives by event).
+//       result, `subjects` the store (subjects.js). `api` is the node's client (unused so far:
+//       every fix arrives by event).
 //   MapPane:
 //     map.event(job, payload)   one event of a job the overlays follow (overlays.js onEvent:
 //                               the selected source's watched jobs and the positioned jobs on
 //                               every other source): one with a `position` is that job's
-//                               newest fix, whichever source the page shows. Fixes are kept while the
-//                               map is hidden, so the track is whole when it shows.
+//                               newest fix, whichever source the page shows, or the newest
+//                               of its subject's when the store has merged the event into
+//                               one (call the store first). Fixes are kept while the map is
+//                               hidden, so the track is whole when it shows.
 //     map.sync()                after each jobs poll: the tracks of jobs no longer running
 //                               (stopped, failed, forgotten) are dropped with their marker
 //     map.rowText(jobId) -> "<km, 1 dp> km, <deg rounded>°" | null
 //                               the job's last fix from view `home` (null without a home or
-//                               a fix), for its jobs pane row (agent.js)
+//                               a fix), for its jobs pane row (agent.js). A job with subjects
+//                               answers for its one subject on the map; with more it is null,
+//                               since the table has them.
 //     map.destroy()
 //   Drawn, once Leaflet is in: one L.circleMarker (class `map-pos`) at each job's newest fix,
 //   whose popup is the last event's `summary` and its age (`12 s ago`, from when this page
@@ -35,10 +41,19 @@
 //   a non-interactive circle marker (class `map-home`) at view `home`. The view is centred
 //   once, on the first fix or on home (whichever comes first), at zoom FIRST_ZOOM, and never
 //   moved again: after that the user pans.
+//   A subject with a fix is drawn instead as a track under `${job}\u0000${key}`: one L.marker
+//   holding `div.map-subject` (classes `dim`, `selected`) with `span.arrow` turned to the row's
+//   heading (class `dot` while none is known) and `span.label`, the subject's label and altitude,
+//   and one polyline as above. An event with no fix refreshes them. Its popup names the subject
+//   and lists its values; a click selects it in the store. The store's selection marks the
+//   marker, panning only when it is off the map; a dim subject dims it and a drop removes it.
 
+import { subjectLabel, subjectValues } from "./subjects.js";
+import { metricText } from "./units.js";
 import { homePoint } from "./view.js";
 
 export const TRACK_POINTS = 3600;
+export const SUBJECT_TRACK_POINTS = 100;
 export const OSM_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 export const OSM_ATTRIBUTION =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
@@ -107,17 +122,40 @@ function ageText(ms) {
   return `${Math.max(0, Math.round(ms / 1000))} s ago`;
 }
 
+// A subject's popup, as it stands when opened: its name, its values and its age.
+function subjectPopup(s) {
+  const box = document.createElement("div");
+  const label = subjectLabel(s);
+  const name = document.createElement("div");
+  name.textContent = label === s.key ? label : `${label} (${s.key})`;
+  box.append(name);
+  for (const v of subjectValues(s)) {
+    if (v.text === "") continue;
+    const line = document.createElement("div");
+    line.textContent = `${v.label}: ${v.text}`;
+    box.append(line);
+  }
+  const age = document.createElement("div");
+  age.className = "age";
+  age.textContent = ageText(Date.now() - s.last_seen);
+  box.append(age);
+  return box;
+}
+
 export function mountMap(el, api, view, opts = {}) {
   return new MapPane(el, api, view, opts);
 }
 
 class MapPane {
-  constructor(el, api, view, { jobs = () => [] } = {}) {
+  constructor(el, api, view, { jobs = () => [], subjects = null } = {}) {
     this.el = el;
     this.api = api;
     this.view = view;
     this.jobs = jobs;
-    this.tracks = new Map(); // job id -> {points: [[lat, lon]], summary, at, marker, line}
+    this.subjects = subjects;
+    // job id -> {points: [[lat, lon]], summary, at, marker, line}
+    // `${job id}\u0000${key}` -> {job, key, subject, points, marker, line, box, arrow, label}
+    this.tracks = new Map();
     this.map = null; // the Leaflet map, once loaded and shown
     this.homeMarker = null;
     this.centred = false;
@@ -129,6 +167,9 @@ class MapPane {
       if (key === "map") this.show();
       else if (key === "home") this.drawHome();
     });
+    subjects?.onChange(() => this.markDim());
+    subjects?.onSelect((sel) => this.markSelected(sel));
+    subjects?.onDrop((jobId, key) => this.dropSubject(jobId, key));
     this.show();
   }
 
@@ -195,6 +236,11 @@ class MapPane {
 
   event(job, p) {
     if (this.destroyed) return;
+    const subject = this.subjects?.subjectOf(job, p);
+    if (subject) {
+      this.subjectEvent(subject, p);
+      return;
+    }
     const pos = positionOf(p);
     if (!pos) return;
     let t = this.tracks.get(job.id);
@@ -209,9 +255,92 @@ class MapPane {
     this.draw(job.id);
   }
 
+  subjectEvent(s, p) {
+    const id = `${s.job}\u0000${s.key}`;
+    let t = this.tracks.get(id);
+    const pos = positionOf(p);
+    if (pos) {
+      if (!t) {
+        t = { job: s.job, key: s.key, subject: s, points: [], marker: null, line: null };
+        this.tracks.set(id, t);
+      }
+      t.points.push([pos.lat, pos.lon]);
+      if (t.points.length > SUBJECT_TRACK_POINTS) t.points.shift();
+    }
+    if (t) this.draw(id);
+  }
+
+  drawSubject(t) {
+    const last = t.points[t.points.length - 1];
+    if (!t.marker) {
+      t.box = document.createElement("div");
+      t.box.className = "map-subject";
+      t.arrow = document.createElement("span");
+      t.label = document.createElement("span");
+      t.label.className = "label";
+      t.box.append(t.arrow, t.label);
+      t.line = this.L.polyline(t.points, { className: "map-track", interactive: false }).addTo(
+        this.map,
+      );
+      // No iconSize: `div.map-subject` sizes itself, its arrow on the fix (style.css).
+      const icon = this.L.divIcon({ html: t.box, className: "map-subject-icon", iconSize: null });
+      t.marker = this.L.marker(last, { icon }).addTo(this.map);
+      t.marker.bindPopup(() => subjectPopup(t.subject));
+      t.marker.on("click", () => this.subjects.select(t.job, t.key));
+      const sel = this.subjects.selected();
+      t.box.classList.toggle("selected", !!sel && sel.job === t.job && sel.key === t.key);
+    } else {
+      t.line.setLatLngs(t.points);
+      t.marker.setLatLng(last);
+    }
+    const s = t.subject;
+    const name = s.row.subject.heading;
+    const heading = name ? s.state[name] : null;
+    const known = Number.isFinite(heading);
+    t.arrow.className = known ? "arrow" : "arrow dot";
+    t.arrow.style.transform = known ? `rotate(${heading}deg)` : "";
+    const alt = s.position ? s.position.alt_m : null;
+    t.label.textContent =
+      alt === null ? subjectLabel(s) : `${subjectLabel(s)} ${metricText(alt, "m")}`;
+    t.box.classList.toggle("dim", s.dim);
+    this.centre(t.points[0]);
+  }
+
+  // The tracks of subjects (a job's own entry has no `key`).
+  subjectTracks() {
+    return [...this.tracks.values()].filter((t) => t.key !== undefined);
+  }
+
+  markDim() {
+    for (const t of this.subjectTracks()) t.box?.classList.toggle("dim", t.subject.dim);
+  }
+
+  markSelected(sel) {
+    for (const t of this.subjectTracks()) {
+      const on = !!sel && sel.job === t.job && sel.key === t.key;
+      t.box?.classList.toggle("selected", on);
+      if (!on || !this.map || this.el.hidden) continue;
+      const at = t.points[t.points.length - 1];
+      if (!this.map.getBounds().contains(at)) this.map.panTo(at);
+    }
+  }
+
+  dropSubject(jobId, key) {
+    const id = `${jobId}\u0000${key}`;
+    const t = this.tracks.get(id);
+    if (!t) return;
+    t.marker?.remove();
+    t.line?.remove();
+    this.tracks.delete(id);
+  }
+
   draw(id) {
     const t = this.tracks.get(id);
     if (!this.map || !t) return;
+    if (t.key !== undefined) {
+      this.drawSubject(t);
+      return;
+    }
     const last = t.points[t.points.length - 1];
     if (!t.marker) {
       t.line = this.L.polyline(t.points, { className: "map-track", interactive: false }).addTo(
@@ -242,7 +371,7 @@ class MapPane {
         .map((j) => j.id),
     );
     for (const [id, t] of [...this.tracks]) {
-      if (running.has(id)) continue;
+      if (running.has(t.job ?? id)) continue;
       t.marker?.remove();
       t.line?.remove();
       this.tracks.delete(id);
@@ -251,8 +380,13 @@ class MapPane {
 
   rowText(id) {
     const home = homePoint(this.view.get("home"));
-    const t = this.tracks.get(id);
-    if (!home || !t) return null;
+    if (!home) return null;
+    let t = this.tracks.get(id);
+    if (!t) {
+      const mine = this.subjectTracks().filter((s) => s.job === id);
+      if (mine.length !== 1) return null;
+      t = mine[0];
+    }
     const [lat, lon] = t.points[t.points.length - 1];
     const { km, deg: b } = distanceBearing(home, { lat, lon });
     return `${km.toFixed(1)} km, ${Math.round(b) % 360}°`;

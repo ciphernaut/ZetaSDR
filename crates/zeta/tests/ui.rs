@@ -222,9 +222,9 @@ fn quiet_fixture(dir: &Path) -> PathBuf {
     zeta_dsp::fixtures::write_fixture(dir, "quiet", &iq, 48_000, 20_000_000)
 }
 
-/// Wall-clock limit on the whole ui.py run: measured 256.3 s and 256.9 s on 2026-11-01 (plan 18
-/// added 31 s), so 330 s then; plan 23 adds about 16 scenarios, so 420 s until they are measured.
-const DEADLINE: Duration = Duration::from_secs(420);
+/// Wall-clock limit on the whole ui.py run: measured 351.8 s and 352.8 s on 2026-11-02 (plan 23's
+/// scenarios included), so about 1.25 times the slower run.
+const DEADLINE: Duration = Duration::from_secs(440);
 
 /// Waits for `child` until `deadline`, killing it then; its exit status (None when killed)
 /// and everything it wrote. Its pipes are drained on threads so it never blocks on them.

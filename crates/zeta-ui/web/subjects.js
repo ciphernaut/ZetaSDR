@@ -39,7 +39,8 @@
 //     `tr.subject[data-job][data-key]`, classes `dim` and `selected`), and one for a subject job
 //     `watching(id)` denies, with `.not-watched`. `th[data-col]` sorts: a first click ascending,
 //     a second reversed, nulls last either way (default last seen, newest first). A click on a
-//     row selects it. Redrawn at most every RENDER_MS on a change, and each second. Cells are
+//     row selects it, and a selection (from here or the map) scrolls its row into view.
+//     Redrawn at most every RENDER_MS on a change, and each second. Cells are
 //     written only when they differ, so a tooltip outlives a redraw. All text by textContent.
 //     pane.eligible() -> bool   a running job's row has table columns (app.js shows the pane)
 //     pane.destroy()
@@ -376,7 +377,10 @@ class SubjectsPane {
     this.onClick = (ev) => this.click(ev);
     el.addEventListener("click", this.onClick);
     store.onChange(() => this.schedule());
-    store.onSelect(() => this.render());
+    store.onSelect((sel) => {
+      this.render();
+      if (sel) this.sections.get(sel.job)?.rows.get(sel.key)?.scrollIntoView({ block: "nearest" });
+    });
     view.onChange((key) => {
       if (key === "home" || key === "subjects") this.render();
     });
