@@ -40,6 +40,10 @@ Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acc
 
 A `graph_put` that loses a race with another put on the same job returns an error, but its graph is already in the record (`graph_get` and a restart use it). Found in plan 14 review, pre-existing. Fix: under the jobs lock, refuse before persisting when the entry is `Running` again after this put's stop.
 
+## Audio: `nbfm_demod` has no voice-band low-pass and no de-emphasis
+
+From the operator listening to a fitted ch9 demod on the B210, 2026-11-01 ("a bit of noise"). The NBFM path is discriminator → resampler to 48 kHz (`crates/zeta-dsp/src/nbfm.rs`, `AudioFilter`) and nothing else: `am_demod` low-passes its audio at 5 kHz and `wfm_demod` de-emphasises and low-passes at 15 kHz, but NBFM passes everything up to the IQ filter's edge (`channel_hz / 2`, 6.25 kHz on a 12.5 kHz channel). FM noise rises with audio frequency, so most of the hiss on a weak signal sits above the voice (about three quarters of the noise power of a 6.25 kHz band lies above 4 kHz); narrowing the job to 8 kHz helped and 5 kHz sounded cleaner still, at the cost of the voice sidebands. Wanted: after the resampler, a 6 dB/octave de-emphasis (a one-pole, tau about 530 us as PMR radios use; reuse `wfm::deemphasis`) and a 3.4 kHz low-pass (`lowpass_taps` with a `StreamingFir`, as `am.rs`); keep the squelch's measurement on the unfiltered discriminator. Also the field craft: on a 12.5 kHz channel the default `deviation_hz` 5000 halves the audio level of a 2.5 kHz-deviation CB signal; the fit (or the channel plan) could set 2500 there.
+
 ## Feature: stereo for `wfm_demod`
 
 `wfm_demod` is mono only. Operators expect stereo for broadcast FM. A working offline reference is in `scratch/fm_stereo.py` (local, not committed):
@@ -81,6 +85,10 @@ With four demods and a `transcribe` attached, the oldest demod's tag had no sque
 ## Jobs: an attached job's record keeps its input's old tuning after a retune
 
 After its input's `job_retune` the `transcribe` row still read ch20 / 476.900 MHz while the demod sat at 476.925 MHz. `job_retune` (and `graph_put`) should update the attached records' `tuning` copy when they are relaunched. From the B210 live run of plans 15/18, 2026-11-01.
+
+## Fit: a weak voice channel fits to the width floor
+
+From the B210 CB run, 2026-11-01 (plan series "Plan 18 status"). A ch9 transmission at 9-12 dB measured `bandwidth_hz` 600-800 (`fsk`: "two rf tones 500 Hz apart", or `noise` between words) because `measure`'s occupied band is the bins 6 dB over the floor, and at that SNR only the carrier line clears it, never the ±3 kHz voice sidebands; 1.25 x 800 Hz floors at 5 kHz, so the demod was fitted 5 kHz wide on a 12.5 kHz voice channel (intelligible, transcribed, but clipped). The width rule should not trust an occupied width under a voice channel's minimum: when the layer-1 label is `fm`, `fsk` or `unknown` and the measured width is under the kind's floor, take the channel plan's width at that centre (12.5 kHz on UHF CB) or a measured width at a lower threshold (bins within 20 dB of the peak, or the width that holds 99 % of the band's excess power), and say which in the `fitted` line. The same 1 s window also mislabels an FM voice carrier as `fsk` (the carrier plus one modulation line); a burst-aware layer 1 (below) helps here too.
 
 ## UI: repeated Fit to signal walks the width down to the floor
 

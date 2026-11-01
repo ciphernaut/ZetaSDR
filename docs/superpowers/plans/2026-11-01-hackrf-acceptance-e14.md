@@ -1,6 +1,6 @@
 # HackRF acceptance on e14 (plans 15, 18, 20)
 
-**Run on the field host instead, 2026-11-01:** the operator moved the HackRF to the field host, where it was attached to the `sdr` node beside the B210; sections 1 and 3 and the DC-in-box half of section 2 are done and recorded in the plan series ("Plan 15/18/20 status", "Live run on the field host HackRF"). The indoor log periodic there hears no UHF CB, so section 2's fit on a transmitting channel still waits for an antenna. Note for section 3: `worker.restarts` counts respawns, so after a cable pull it reads one plus the `device not found` attempts, not 1.
+**Run on the field host instead, 2026-11-01:** the operator moved the HackRF to the field host, where it was attached to the `sdr` node beside the B210; sections 1 and 3 and the DC-in-box half of section 2 are done and recorded in the plan series ("Plan 15/18/20 status", "Live run on the field host HackRF"). The indoor log periodic there hears no UHF CB, so section 2's fit on a transmitting channel was done on the B210 with the discone instead (ch9, +450 Hz, transcripts; the width fitted to the 5 kHz floor on a weak signal, a TODO gist). Note for section 3: `worker.restarts` counts respawns, so after a cable pull it reads one plus the `device not found` attempts, not 1.
 
 The items of the 2026-10-27 sprint that only the HackRF on the ThinkPad E14 can settle, with the
 exact commands. Everything else was proved on the field host's B210 on 2026-11-01 (see "Plan 15

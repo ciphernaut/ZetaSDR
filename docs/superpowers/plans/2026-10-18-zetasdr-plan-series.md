@@ -54,7 +54,7 @@ Six of the seven plans shipped; plan 19 was not started and opens the next sprin
 | 15 scan grid and masks | 83726a2, 2026-11-01 | the mechanism on the B210 (alternation, `masked` rows, `graph put`, `job_context`); the HackRF constants measured on the field host 2026-11-01 (`SCAN_NOTCH_HZ` 50 kHz, `SCAN_EDGE_MASK` 0.02) | the HackRF's 4 MHz spur grid under the quarter-step shift (`TODO.md`) |
 | 16 mode registry | 91886bc, 2026-10-28 | registry, check, broken rows, handlers, identify-unknown on the HackRF | on-air POCSAG, APRS and ADS-B proofs |
 | 17 sonde frameworks | 97383b0, 2026-10-29 | RS41 X1142896 decoded on the B210 2026-11-01 (pre-placed decoder) | the watch finding a sonde on its own (detector, re-centre) |
-| 18 box, fit, refine | 771ea93, 2026-11-01 | retune, drag, menu, tags, conflict and the fit mechanism on the B210; the DC-in-box outcome on the HackRF | the fit on a transmitting CB channel (needs an antenna that hears CB) |
+| 18 box, fit, refine | 771ea93, 2026-11-01 | retune, drag, menu, tags, conflict and the fit mechanism on the B210; the DC-in-box outcome on the HackRF; the fit on a transmitting CB channel (ch9, +450 Hz, transcripts) on the B210 | the fitted width on a weak voice channel (the 5 kHz floor; `TODO.md`) |
 | 19 layer 4 stages | not started | | the whole plan |
 | 20 Soapy worker | 3acbad4, 2026-10-31 | items 1-2 on the B210 (SIGSEGV heal); the HackRF's cable pull and SIGSEGV on the two-radio field host node 2026-11-01 | the B210's own cable pull |
 
@@ -115,7 +115,7 @@ HackRF One r9 (`66a062dc`, firmware 2.3.2) moved from the desktop to the field h
 
 ## Plan 18 status
 
-Plan 18 (box and refine) is on the `plan-18` branch (tasks 1-10). Merged to `main` 2026-11-01 (771ea93). Live acceptance: the mechanism on the B210 and the DC-in-box outcome on the HackRF (both 2026-11-01); the fit on a transmitting CB channel still wants an antenna that hears CB.
+Plan 18 (box and refine) is on the `plan-18` branch (tasks 1-10). Merged to `main` 2026-11-01 (771ea93). Live acceptance done 2026-11-01: the mechanism and the fit on a transmitting CB channel on the B210, the DC-in-box outcome on the HackRF; the fitted width on a weak voice channel is the one open finding.
 
 What was built (spec `docs/superpowers/specs/2026-10-31-box-and-refine-design.md`):
 
@@ -140,11 +140,17 @@ Outcomes to record (live):
 
 Live acceptance (spec section 10), on the desktop HackRF with the 2 m / 70 cm antenna, UHF CB pinned at 476 918 750 / 1 000 000 Hz:
 
-- [ ] Box a transmitting channel generously (about 100 kHz) and start "Transcribe › NBFM": the job lands within 500 Hz of the channel's centre with a width of 10-16 kHz, the audio is clean, the transcript arrives. The transcript pane shows the `fitted` line. Pending: no CB traffic during the B210 run nor on the HackRF's indoor log periodic on the field host (2026-11-01); the fit mechanism was proved on the B210 on broadcast FM, below.
+- [ ] Box a transmitting channel generously (about 100 kHz) and start "Transcribe › NBFM": the job lands within 500 Hz of the channel's centre with a width of 10-16 kHz, the audio is clean, the transcript arrives. The transcript pane shows the `fitted` line. Done 2026-11-01 on the B210 through the op path (below): centre +450 Hz off ch9 (pass), transcripts arrived (pass), the width fitted to the 5 kHz floor on a 9-12 dB signal (the 10-16 kHz expectation fails: a finding, not a mechanism fault; gist in `TODO.md`). The page's `fitted` line itself was proved on broadcast FM, below.
 
 ### HackRF on the field host, 2026-11-01
 
 The HackRF pinned at 476 918 750 / 1 000 000 Hz (indoor low-gain log periodic; a 10 s max-hold over the pin showed nothing but the receiver's 477.000 MHz spur at +8 dB), driven over `--node`. A `measure` on a 100 kHz box containing the pin centre (476.95 MHz / 100 kHz): `job_context.measure.dc_mask_hz` 25000, the event `center_hz 476999902, bandwidth_hz 98, label carrier (7.5 dB)`: the DC needle (+42 dB) was not measured and the whole-MHz spur was, labelled a bare carrier. A 12.5 kHz `fm_demod` on ch20 ran unmasked (its box holds no DC) with the squelch closed (`floor_db` -67.5 dBFS, `guarded` false). The page's `no signal found ... (the capture centre ... not measured)` line for that box was proved on the B210 above; the HackRF run took the op path.
+
+### The fit on a transmitting CB channel, B210 with the discone, 2026-11-01
+
+The sonde watch and the RS41 decoder parked (the morning sonde was down), the B210 pinned at 476 918 750 / 1 000 000 Hz (lease 1 024 000) and driven over `--node` with the page's fit replayed as ops (`scratch/live/cb-fit2.py`, local): ten `measure` jobs on 100 kHz boxes tiling the pin clear of its centre, watched at once, the first box reporting a signal fitted as the page does (measured centre, 1.25 x the occupied width, floored at 5 kHz, capped at the box). A first attempt that started the `measure` only after a `spectrum` row showed a channel 12 dB up missed a sub-2 s opening on ch9 (the measure's first full second came after the PTT ended: `no signal found`), hence the tiling.
+
+- Fit on ch9 (476.625 MHz), 11:49:06 AEST: the box 476.66 MHz / 100 kHz measured `center_hz 476625450, bandwidth_hz 600, snr_db 8.8, label fsk ("two rf tones 500 Hz apart")`; `fm_demod` started at 476 625 450 / 5 000 Hz: centre +450 Hz from the channel (inside the 500 Hz criterion), width 5.0 kHz (the floor; the criterion wanted 10-16 kHz). The squelch opened (-65.8 dBFS over a -75.6 floor), 15 audio frames in 8 s, `vad` speech events, and the attached `transcribe` returned "How big do you want?", "Oh no, no.", "I'll send someone down.", "That's right, I'm thinking.", "Thank you." (`transcripts tail`, `error` null, nothing dropped; 7 utterances under 700 ms counted `short`). Re-measuring the channel for 6 s while it was active read 600-800 Hz at 9-12 dB (`fsk`, `unknown`) and `noise` between words: at that SNR the 6 dB occupied band holds the carrier line only, never the voice sidebands, so the fit lands on the width floor. A `job retune` to 476 625 450 / 12 500 moved the demod under its id with the `transcribe` relaunched (its record's `tuning` still reads 5 000, the known stale copy, and `transcripts.log` carries that). Centre: pass. Transcript: pass. Width: the finding "Fit: a weak voice channel fits to the width floor" in `TODO.md`.
 - [x] Drag the outline a channel over; the audio follows after the retune, the transcribe stays attached (same id in the job list), the ribbons keep scrolling. Mechanism proved on the B210 (same ids, transcribe relaunched on the new audio stream); audio and ribbons not heard (no traffic).
 - [x] Drag its edge to 25 kHz and back to 12.5 kHz with the presets; `zeta ops tail` shows each `job_retune`. On the B210 the ops stream (`stream tail`, the state directory being `sdr`'s) showed each one.
 - [x] Unpin, then drag a job outside the capture while another demod holds the radio: the conflict shows in the transcript, the outline snaps back, and the retry button moves it. Proved on the B210.
