@@ -23,6 +23,7 @@ zeta-core = { path = "../zeta-core" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["test-util"] }
 zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] }
 
 [features]

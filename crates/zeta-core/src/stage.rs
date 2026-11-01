@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bank::ChannelBank;
 use crate::modes::ModeRow;
 use crate::stream::{Frame, StreamBus};
-use crate::types::{SourceId, StreamId, StreamKind};
+use crate::types::{JobId, SourceId, StreamId, StreamKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -61,6 +61,18 @@ impl StageSpec {
 /// `job_context_merge`).
 pub type StageNote = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 
+/// One audio output a `mix` stage may read: a job's stream, the job's source and centre.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MixInput {
+    pub job: JobId,
+    pub stream: StreamId,
+    pub source: SourceId,
+    pub center_hz: u64,
+}
+
+/// The audio outputs of the jobs a node's `mix` stage may read, asked anew on each poll.
+pub type MixInputs = Arc<dyn Fn() -> Vec<MixInput> + Send + Sync>;
+
 /// What a stage knows of the job it runs in beyond its params and streams:
 /// the job's source, when the node keeps one for it, the source's channel
 /// bank, and the job's [`StageNote`] when it runs in a node.
@@ -75,6 +87,8 @@ pub struct StageContext {
     /// The absolute frequency of the receiver's DC (the capture's centre), `Some`
     /// only for a job on a local hardware source (`ops::local_hardware`).
     pub dc_hz: Option<u64>,
+    /// The node's list of audio outputs, `Some` only for a `mix` stage in a node.
+    pub mix_inputs: Option<MixInputs>,
 }
 
 impl StageContext {
@@ -86,6 +100,7 @@ impl StageContext {
             note: None,
             mode: None,
             dc_hz: None,
+            mix_inputs: None,
         }
     }
 
@@ -106,6 +121,14 @@ impl StageContext {
     pub fn with_mode(self, row: Arc<ModeRow>) -> Self {
         Self {
             mode: Some(row),
+            ..self
+        }
+    }
+
+    /// This context with the node's list of audio outputs `f`.
+    pub fn with_mix_inputs(self, f: MixInputs) -> Self {
+        Self {
+            mix_inputs: Some(f),
             ..self
         }
     }

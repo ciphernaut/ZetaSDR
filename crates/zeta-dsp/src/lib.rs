@@ -25,6 +25,7 @@ pub mod fft;
 pub mod gpu_fft;
 pub mod identify;
 pub mod measure;
+pub mod mix;
 pub mod nbfm;
 pub mod pfb;
 pub mod pocsag;
@@ -62,6 +63,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(detect::DetectStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));
     reg.register(Arc::new(vad::VadStage::new()));
+    reg.register(Arc::new(mix::MixStage::new()));
 }
 
 /// Whether a hardware GPU adapter is usable for the GPU stages; always false

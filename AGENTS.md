@@ -424,6 +424,13 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - outputs: event
 - params.bandwidth_hz: integer or null
 
+### mix
+
+- inputs: 
+- outputs: audio, event
+- params.sources: array or null
+- params.muted: array (optional, default [])
+
 ### nbfm_demod
 
 - inputs: iq
