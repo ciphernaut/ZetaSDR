@@ -1,7 +1,8 @@
 // agent.js: the transcript pane and the jobs list.
 //
 // Exports:
-//   AUDIO_KINDS                 job kinds with an audio stream (their rows get ▶)
+//   AUDIO_KINDS                 job kinds with an audio stream (their rows get ▶ and Transcribe;
+//                               a `mix` is one, and its row has no band)
 //   AUTO_SCAN_KEY               the sessionStorage key holding the page's automatic scan id
 //   errorText(error) -> the text of an op error JSON as formatOp shows it after `→`
 //   formatOp(payload) -> {text, error}
@@ -71,6 +72,9 @@
 //       has `open: false`.
 //       A running row whose position(id) (map.js rowText: the job's last fix from the view's
 //       `home`, `14.8 km, 47°`) is not null shows it in a `.pos` line under the row.
+//       A running `mix` row (job_start refuses the kind: it comes from mix_start) has a
+//       `.mix-now` cell with mixText(job) (mix.js rowText: `ch9 now`, `last ch9 12 s ago`);
+//       app.js rewrites it in place as the mix's events arrive.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 import { channelLabel } from "./plans.js";
@@ -78,7 +82,7 @@ import { bandText } from "./units.js";
 
 
 export const JOBS_POLL_MS = 2000;
-export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"];
+export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod", "mix"];
 export const SQUELCH_KINDS = ["fm_demod", "am_demod"];
 export const QUIET_OPS = new Set([
   "job_list",
@@ -296,7 +300,8 @@ export class Transcript {
 
 async function opsStreamId(api) {
   const list = await api.streams();
-  const s = list.find((i) => i.provenance && i.provenance.source === "node");
+  // A mix's streams are the node's too (source "node") but belong to a job: not the ops feed.
+  const s = list.find((i) => i.provenance && i.provenance.source === "node" && !i.provenance.job);
   return s ? s.id : null;
 }
 
@@ -389,7 +394,7 @@ export function setSquelchTag(row, event) {
 function jobRow(
   job,
   onStop,
-  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot },
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText },
 ) {
   const row = document.createElement("div");
   const attached = !!job.input;
@@ -414,6 +419,7 @@ function jobRow(
   if (t && Number.isFinite(t.center_hz) && Number.isFinite(t.bandwidth_hz) && t.bandwidth_hz > 0) {
     cells.splice(4, 0, ["band", bandText(t.center_hz, t.bandwidth_hz)]);
   }
+  if (job.kind === "mix") cells.splice(4, 0, ["mix-now", mixText ? mixText(job) : ""]);
   for (const [cls, text] of cells) {
     const span = document.createElement("span");
     span.className = cls;
@@ -543,6 +549,7 @@ export function startJobs(
     view = null,
     position = null,
     onHot = null,
+    mixText = null,
   } = {},
 ) {
   let timer = null;
@@ -560,6 +567,7 @@ export function startJobs(
     plan: view ? () => view.get("plan") : null,
     position,
     onHot,
+    mixText,
   };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;

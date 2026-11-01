@@ -115,6 +115,8 @@ input:focus { border-color: var(--accent); }
 #drawer-toggle { display: none; align-self: center; }
 #map-toggle { display: none; align-self: center; }
 #map-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+#listen-all { align-self: center; }
+#listen-all[aria-pressed="true"] { border-color: var(--ok); color: var(--ok); }
 
 #main { grid-area: main; position: relative; min-width: 0; min-height: 0; }
 #waterfall { position: absolute; inset: 0; background: var(--bg); }
@@ -182,6 +184,12 @@ html[data-map="on"] #waterfall { right: 50%; }
 .job-tag .short, .job-tag .snippet { color: var(--dim); }
 .job-tag.hot { color: var(--ok); }
 #waterfall .outline.hot { border-color: var(--ok); }
+/* speaking (overlays.js setSpeaking): a job the mix hears now; solid, apart from hot's dashes */
+.job-tag.speaking { color: var(--ok); outline: 1px solid var(--ok); }
+#waterfall .outline.speaking {
+  border-top: 2px solid var(--ok); border-bottom: 2px solid var(--ok);
+  background: rgba(126, 231, 135, 0.08);
+}
 /* narrow: the tag is the long-press target of a retunable outline */
 html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-action: none; }
 /* a retunable job's outline (wide footprint): the body moves it, the edge handles resize it */
@@ -280,6 +288,8 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 .job .id { color: var(--dim); }
 .job .band { color: var(--dim); font-size: 11px; }
 .job.hot { outline: 1px solid var(--accent); }
+.job.speaking { border-left: 3px solid var(--ok); }
+.job .mix-now { color: var(--ok); font-size: 11px; }
 .job .events { color: var(--user); }
 .job .actions { display: flex; gap: 4px; justify-content: flex-end; }
 .job .actions button { padding: 0 6px; }

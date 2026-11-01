@@ -73,6 +73,11 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
         include_bytes!("../web/plans.js"),
     ),
     (
+        "mix.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/mix.js"),
+    ),
+    (
         "map.js",
         "text/javascript; charset=utf-8",
         include_bytes!("../web/map.js"),
@@ -145,6 +150,7 @@ mod tests {
             ("coarse.js", "text/javascript; charset=utf-8"),
             ("plans.js", "text/javascript; charset=utf-8"),
             ("map.js", "text/javascript; charset=utf-8"),
+            ("mix.js", "text/javascript; charset=utf-8"),
             ("units.js", "text/javascript; charset=utf-8"),
             (
                 "vendor/leaflet/leaflet.js",

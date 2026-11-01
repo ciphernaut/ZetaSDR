@@ -26,8 +26,11 @@
 //       most). Hovering a tag or its outline puts class `hot` on both and on the job's row;
 //       hovering the row (agent.js `onHot` -> ov.setHot(id, on)) does the same the other way,
 //       and `ov.hotJob` is re-applied after each sync, as agent.js re-renders the rows. A tag
-//       click scrolls the row into view. The pin, the capture and the ghost keep a plain
-//       `.outline-label`; job outlines have none.
+//       click scrolls the row into view. `speaking` is the same on the jobs a mix hears now
+//       (app.js hands mix.js activeIds() to ov.setSpeaking(ids): class `speaking` on their
+//       outline, tag and row, styled apart from `hot`; `ov.speaking` is re-applied after each
+//       sync and whenever an outline or tag is made, as `hotJob`). The pin, the capture and
+//       the ghost keep a plain `.outline-label`; job outlines have none.
 //   Overlays:
 //     ov.syncOutlines(jobs, source)  the outline half of ov.sync alone (app.js calls it after
 //                            each `source_list` poll, so a pin shows without waiting for jobs)
@@ -171,7 +174,7 @@ export const SNIPPET_CHARS = 40;
 const CAPTURE_KEY = "capture";
 const PIN_KEY = "pin";
 // Kinds job_retune refuses (an attached `transcribe` follows its input instead).
-export const NOT_RETUNABLE = ["spectrum", "scan", "identify", "watch", "transcribe"];
+export const NOT_RETUNABLE = ["spectrum", "scan", "identify", "watch", "transcribe", "mix"];
 export const HANDLE_PX = 8; // an edge handle's height (style.css .outline-handle)
 export const DRAG_CLICK_PX = 3; // less pointer travel than this is a click, not a drag
 export const LONG_PRESS_MS = 500; // a press this long on a narrow outline's tag opens its menu
@@ -274,6 +277,7 @@ class Overlays {
     this.resolving = false; // a GET /streams for unwatched jobs is in flight
     this.counters = new Map(); // job id -> non-spectrum events seen while watched
     this.hotJob = null; // the job id whose tag, outline and row show `hot`
+    this.speaking = []; // the job ids a mix is playing now: `speaking` on each
     this.snippets = new Map(); // input job id -> the last transcript text of its attached job
     this.squelches = new Map(); // job id -> {event: the last `squelch` event seen, graph}
     this.labels = new Map(); // key -> {el, hz}
@@ -364,6 +368,7 @@ class Overlays {
     }
     // agent.js re-rendered the rows: the hovered job's row is hot again.
     if (this.hotJob) this.setHot(this.hotJob, true);
+    this.setSpeaking(this.speaking);
     this.syncPositioned(jobs);
   }
 
@@ -483,6 +488,7 @@ class Overlays {
     }
     this.captureOutlined = rigid.length === 0 && !pin;
     this.outlineCapture();
+    this.setSpeaking(this.speaking);
   }
 
   // The capture's outline follows wf.band while no rigid holder is outlined.
@@ -950,6 +956,22 @@ class Overlays {
     }
     const row = this.jobsEl && this.jobsEl.querySelector(`.job[data-id="${CSS.escape(jobId)}"]`);
     if (row) row.classList.toggle("hot", on);
+  }
+
+  // `speaking` on the outline, tag and row of each job in `ids` (and off the rest): the jobs a
+  // mix hears now. Kept in this.speaking and applied again after a sync.
+  setSpeaking(ids) {
+    this.speaking = [...ids];
+    const on = new Set(ids);
+    for (const [id, o] of this.outlines) {
+      o.el.classList.toggle("speaking", on.has(id));
+      if (o.tag) o.tag.classList.toggle("speaking", on.has(id));
+    }
+    if (this.jobsEl) {
+      for (const row of this.jobsEl.querySelectorAll(".job[data-id]")) {
+        row.classList.toggle("speaking", on.has(row.dataset.id));
+      }
+    }
   }
 
   // The pointer entered or left a tag or outline: its row follows.

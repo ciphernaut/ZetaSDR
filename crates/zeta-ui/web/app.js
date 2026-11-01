@@ -67,6 +67,15 @@
 // language: null}` through the command-line op path (its outcome, an error too, reaches the
 // transcript); `graph` opens the job's graph view (graph.js).
 //
+// Listen to all (#listen-all, and the typed `mix` or `mix ID[,ID]` with every id a source):
+// `mix_start` (null: every source) and plays the mix it answers, a single stream of every
+// channel's audio (listen()). The AudioContext is made in the click, before the op is awaited
+// (browsers tie autoplay to the gesture), and given to audio.js. Pressed while a mix plays it
+// stops (aria-pressed and its text follow the audio). The mix is a job with no band, so its
+// row has no outline: a MixWatch (mix.js) keeps one event socket on the playing (else the
+// newest) mix, its row's `.mix-now` cell says who is talking or was last, and
+// ov.setSpeaking lights the jobs it hears. Other text starting `mix` goes to the agent.
+//
 // The map (map.js) is mounted in #map at login: the overlays hand it every event of the jobs
 // they watch and of the positioned jobs on the other sources (ov.onEvent), each jobs poll drops the tracks of jobs that ended (map.sync), and
 // a job row with a fix shows its distance and bearing from the view's `home` (map.rowText).
@@ -102,7 +111,8 @@ import { playJob } from "./audio.js";
 import { closeGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
 import { mountView, runViewCommand } from "./view.js";
-import { loadPlans, resolvePlan } from "./plans.js";
+import { channelLabel, loadPlans, resolvePlan } from "./plans.js";
+import { MixWatch } from "./mix.js";
 import { mountCoarse } from "./coarse.js";
 import { mountMap } from "./map.js";
 
@@ -119,7 +129,8 @@ export const state = {
   ov: null,
   map: null, // map.js: the positions of decoded events
   menu: null,
-  audio: null, // {jobId, player}
+  audio: null, // {jobId, mix, seen (a job list has shown it), player}
+  mix: null, // mix.js: who the watched mix hears now
   mic: null,
   sources: [],
   selected: null,
@@ -622,6 +633,16 @@ async function runCommand(text) {
     if (r.text !== null) state.transcript.note(r.text, r.error);
     return;
   }
+  // `mix` or `mix ID[,ID]` with every id a source; "mix the channels please" is the agent's.
+  const mix = /^mix(?:\s+([\w.-]+(?:,[\w.-]+)*))?$/.exec(text);
+  if (mix) {
+    const ids = mix[1] ? mix[1].split(",") : null;
+    if (!ids || ids.every((id) => state.sources.some((s) => s.id === id))) {
+      state.transcript.user(text);
+      await listen(ids, { toggle: false });
+      return;
+    }
+  }
   const allow = /^allow\s+stops\s+(on|off)$/.exec(text);
   if (allow) {
     state.transcript.user(text);
@@ -748,6 +769,12 @@ function start(api) {
     if (!error && footprint() === "narrow") answerRibbon(text);
   });
   state.nodeCheck = startNodeCheck(api);
+  state.mix = new MixWatch(api, {
+    onChange: () => {
+      state.ov?.setSpeaking(state.mix ? state.mix.activeIds() : []);
+      paintMix();
+    },
+  });
   state.jobs = startJobs(api, $("#jobs"), state.transcript, {
     view: state.view,
     onJobs: (jobs) => {
@@ -757,6 +784,10 @@ function start(api) {
       if (state.wf) state.wf.syncJobs(jobs);
       pollSources(api);
       stopAudioUnlessRunning(jobs);
+      state.mix?.sync(jobs, state.audio?.jobId);
+      state.ov?.setSpeaking(state.mix ? state.mix.activeIds() : []);
+      paintMix();
+      syncListen();
     },
     onPlay: toggleAudio,
     onTranscribe: (job) => applyOp(attachOp(job.id)),
@@ -765,6 +796,7 @@ function start(api) {
     onHot: (id, on) => state.ov?.setHot(id, on),
     squelch: (id) => (state.ov ? state.ov.squelch(id) : null),
     position: (id) => (state.map ? state.map.rowText(id) : null),
+    mixText: (job) => mixRowText(job.id),
   });
   state.mic = mountMic($("#mic"), api, (text) => {
     $("#cmd").value = text;
@@ -881,6 +913,8 @@ function logout(api) {
   if (state.nodeCheck) state.nodeCheck.close();
   state.nodeCheck = null;
   stopAudio();
+  if (state.mix) state.mix.close();
+  state.mix = null;
   closeGraph();
   if (state.mic) state.mic.destroy();
   if (state.ops) state.ops.close();
@@ -908,31 +942,97 @@ function stopAudio() {
   const a = state.audio;
   state.audio = null;
   if (a) a.player.stop();
+  syncListen();
 }
 
 // ▶ on a job row: plays that job (stopping any other); ■ on the playing row stops it.
-function toggleAudio(job) {
+// `ctx`: an AudioContext made earlier in the gesture (audio.js playJob).
+function toggleAudio(job, { ctx = null } = {}) {
   const same = state.audio && state.audio.jobId === job.id;
   stopAudio();
   if (!same && state.api) {
-    const entry = { jobId: job.id, player: null };
+    const entry = { jobId: job.id, mix: job.kind === "mix", seen: !ctx, player: null };
     state.audio = entry;
     entry.player = playJob(state.api, job, {
+      ctx,
       onError: (message) => state.transcript.note(message, true),
       onEnd: () => {
         if (state.audio === entry) state.audio = null;
         state.jobs?.redraw();
+        syncListen();
       },
     });
+  } else if (ctx) {
+    ctx.close().catch(() => {});
   }
   state.jobs?.redraw();
+  syncListen();
+}
+
+// #listen-all: pressed while a mix plays it stops; else `mix_start` for `sources` (null:
+// every source) and plays the mix it answers. The context is made first, inside the click.
+async function listen(sources, { toggle }) {
+  if (!state.api) return;
+  if (toggle && state.audio && state.audio.mix) {
+    stopAudio();
+    state.jobs?.redraw();
+    return;
+  }
+  const ctx = new AudioContext();
+  ctx.resume().catch(() => {});
+  let id = null;
+  try {
+    const r = await state.api.op({ op: "mix_start", sources });
+    id = r && r.value;
+  } catch (e) {
+    ctx.close().catch(() => {});
+    state.transcript?.note(`mix_start: ${e.json ? errorText(e.json) : e.message}`, true);
+    return;
+  }
+  if (!state.api || typeof id !== "string") {
+    ctx.close().catch(() => {});
+    return;
+  }
+  stopAudio();
+  toggleAudio({ id, kind: "mix" }, { ctx });
+  state.jobs?.refresh();
+}
+
+// #listen-all follows the audio: pressed (and `Stop listening`) while a mix plays.
+function syncListen() {
+  const b = $("#listen-all");
+  if (!b) return;
+  const on = !!(state.audio && state.audio.mix);
+  b.setAttribute("aria-pressed", String(on));
+  b.textContent = on ? "Stop listening" : "Listen to all";
+}
+
+// What a mix's row says (mix.js rowText) with the plan's channel names.
+function mixRowText(id) {
+  if (!state.mix) return "";
+  const plan = state.view ? state.view.get("plan") : "auto";
+  const label = (hz) => {
+    const ch = channelLabel(hz, plan);
+    return ch ? ch.text : `${(hz / 1e6).toFixed(3)} MHz`;
+  };
+  return state.mix.rowText(id, label, Date.now());
+}
+
+// Rewrites every mix row's `.mix-now` cell in place (no redraw: the events come often).
+function paintMix() {
+  for (const cell of document.querySelectorAll("#jobs .job .mix-now")) {
+    const row = cell.closest(".job");
+    cell.textContent = row ? mixRowText(row.dataset.id) : "";
+  }
 }
 
 function stopAudioUnlessRunning(jobs) {
   const a = state.audio;
   if (!a) return;
   const j = jobs.find((x) => x.id === a.jobId);
-  if (!j || !j.state || j.state.status !== "running") stopAudio();
+  // A mix started by the click is not in a list polled before it: wait until one has shown it.
+  if (j) a.seen = true;
+  if (!j ? a.seen : !j.state || j.state.status !== "running") stopAudio();
 }
 
 // An `agent` ribbon at the centre of the band the waterfall shows (the middle when unknown).
@@ -1024,6 +1124,7 @@ function boot() {
     if (root.dataset.drawer === "open") delete root.dataset.drawer;
     else root.dataset.drawer = "open";
   });
+  $("#listen-all").addEventListener("click", () => listen(null, { toggle: true }));
   $("#map-toggle").addEventListener("click", () => {
     const root = document.documentElement;
     if (root.dataset.pane === "map") delete root.dataset.pane;

@@ -3166,6 +3166,140 @@ def scenario_channel_plan_labels(page, url, secret):
         stop_job(url, secret, job)
 
 
+# ---- the audio mix (plan 22 Task 5) -----------------------------------------------------
+# `cb` is the tone at ch20, which holds a demodulator's squelch open. A mix is a job on the
+# node's placeholder source ("node") with no band; Listen to all plays one.
+
+def mix_jobs(url, secret):
+    return running_jobs(url, secret, "mix", "node")
+
+
+def stop_mixes(url, secret):
+    for j in mix_jobs(url, secret):
+        stop_job(url, secret, j["id"])
+
+
+def http_mix_start(url, secret, sources):
+    return http_json(url, secret, "/op", {"op": "mix_start", "sources": sources})["value"]
+
+
+def scenario_listen_to_all_starts_one_mix_and_plays(page, url, secret):
+    stop_mixes(url, secret)
+    select_source(page, url, secret, "cb")
+    demod = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+    try:
+        button = page.locator("#listen-all")
+        expect(button).to_have_attribute("aria-pressed", "false")
+        button.click()
+        page.wait_for_function(
+            "() => window.zetaAudio && window.zetaAudio.framesPlayed > 0", timeout=5_000)
+        mixes = mix_jobs(url, secret)
+        assert len(mixes) == 1, f"one mix running: {mixes}"
+        mix = mixes[0]["id"]
+        assert page.evaluate("window.zetaAudio.playing") == mix, "the mix is what plays"
+        expect(button).to_have_attribute("aria-pressed", "true")
+        expect(button).to_have_text("Stop listening")
+        row = job_row(page, mix)
+        expect(row.locator(".band")).to_have_count(0)
+        # The ops feed is not the mix's stream: another caller's ops still reach the transcript.
+        probe = start_job(url, secret, "measure", "cb", 476_900_000, 10_000)
+        stop_job(url, secret, probe)
+        expect(page.locator("#transcript .line.op", has_text="[http] job_start kind=measure")
+               .first).to_be_visible(timeout=5_000)
+        button.click()
+        wait_until(lambda: page.evaluate("window.zetaAudio.playing") is None, 3.0, "stopped")
+        expect(button).to_have_attribute("aria-pressed", "false")
+        expect(button).to_have_text("Listen to all")
+        assert [j["id"] for j in mix_jobs(url, secret)] == [mix], "the mix is still running"
+        button.click()
+        page.wait_for_function(
+            "(m) => window.zetaAudio.playing === m && window.zetaAudio.framesPlayed > 0",
+            arg=mix, timeout=5_000)
+        assert [j["id"] for j in mix_jobs(url, secret)] == [mix], "the same mix, only one"
+    finally:
+        stop_job(url, secret, demod)
+        stop_mixes(url, secret)
+
+
+def scenario_mix_lights_the_speaker_and_names_the_last_heard(page, url, secret):
+    stop_mixes(url, secret)
+    select_source(page, url, secret, "cb")
+    demod = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+    try:
+        row = job_row(page, demod)
+        expect(row.locator(".tag.ch")).to_have_text("ch20", timeout=3_000)
+        idle = stable_ws_connections(url, secret)[-1]
+        first = http_mix_start(url, secret, None)
+        page.evaluate("window.zetaTest.poll()")
+        settled = stable_ws_connections(url, secret)[-1]
+        assert settled == idle + 1, f"one socket on the mix: {idle} -> {settled}"
+        newest = http_mix_start(url, secret, ["cb"])
+        assert newest != first, "a different set is another mix"
+        page.evaluate("window.zetaTest.poll()")
+        wait_until(lambda: page.evaluate("window.zetaMix.job") == newest, 5.0,
+                   "the newest mix is the one watched")
+        again = stable_ws_connections(url, secret)[-1]
+        assert again == idle + 1, f"still one socket with two mixes: {idle} -> {again}"
+        speaking = page.locator(f'#jobs .job[data-id="{demod}"].speaking')
+        expect(speaking).to_be_visible(timeout=5_000)
+        expect(page.locator("#waterfall .outline.speaking")).to_have_count(1)
+        assert "hot" not in (row.get_attribute("class") or "").split(), "speaking is not hot"
+        now = page.locator(f'#jobs .job[data-id="{newest}"] .mix-now')
+        expect(now).to_have_text("ch20 now", timeout=5_000)
+        stop_job(url, secret, demod)
+        wait_until(lambda: page.evaluate("window.zetaMix.active.length") == 0, 4.0,
+                   "nothing active after the demodulator stopped")
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(".speaking")).to_have_count(0)
+        expect(now).to_have_text(re.compile(r"^last ch20 \d+ s ago$"), timeout=3_000)
+        page.reload()
+        expect(page.locator("#login")).to_be_hidden()
+        reseeded = page.locator(f'#jobs .job[data-id="{newest}"] .mix-now')
+        expect(reseeded).to_have_text(re.compile(r"^last ch20 \d+ s ago$"), timeout=8_000)
+    finally:
+        stop_job(url, secret, demod)
+        stop_mixes(url, secret)
+
+
+def scenario_stopping_the_mix_ends_playback_and_lights(page, url, secret):
+    stop_mixes(url, secret)
+    select_source(page, url, secret, "cb")
+    demod = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+    try:
+        job_row(page, demod)
+        before = stable_ws_connections(url, secret)[-1]
+        button = page.locator("#listen-all")
+        button.click()
+        page.wait_for_function(
+            "() => window.zetaAudio && window.zetaAudio.framesPlayed > 0", timeout=5_000)
+        mix = mix_jobs(url, secret)[0]["id"]
+        expect(page.locator(f'#jobs .job[data-id="{demod}"].speaking')).to_be_visible(
+            timeout=5_000)
+        job_row(page, mix).locator("button.stop").click()
+        wait_until(lambda: page.evaluate("window.zetaAudio.playing") is None, 4.0,
+                   "playback ended")
+        expect(button).to_have_attribute("aria-pressed", "false")
+        expect(page.locator(".speaking")).to_have_count(0, timeout=4_000)
+        after = stable_ws_connections(url, secret)[-1]
+        assert after == before, f"sockets back to {before}: {after}"
+        # A typed `mix cb` plays a mix of that source; other text starting `mix` is the agent's.
+        run_cmd(page, "mix cb")
+        page.wait_for_function(
+            "() => window.zetaAudio.playing !== null && window.zetaAudio.framesPlayed > 0",
+            timeout=5_000)
+        typed = mix_jobs(url, secret)
+        assert len(typed) == 1, f"one mix: {typed}"
+        graph = http_json(url, secret, "/op", {"op": "graph_get", "job": typed[0]["id"]})["value"]
+        assert graph["nodes"][0]["params"]["sources"] == ["cb"], f"graph {graph}"
+        run_cmd(page, "mix the channels please")
+        page.wait_for_timeout(1_500)
+        assert [j["id"] for j in mix_jobs(url, secret)] == [typed[0]["id"]], "no new mix"
+    finally:
+        stop_job(url, secret, demod)
+        stop_mixes(url, secret)
+
+
+
 # ---- the map (plan 17 Task 9) -----------------------------------------------------------
 # The node's `fake_pos` mode row (ui.rs) runs zeta-ext's `fake_lines`, which prints two fixes
 # of sonde S1 (-27.40,153.10 then -27.41,153.11) 2 s into the job. The map's tiles come from

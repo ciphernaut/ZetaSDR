@@ -9,8 +9,10 @@
 //       De-interleaves audio into at most two channels: mono stays one, stereo is two, and
 //       anything above 2 keeps only the first two (a downmix by dropping the rest). A trailing
 //       partial frame is ignored.
-//   playJob(api, job, {onError, onEnd}) -> {stop}
-//       Creates an AudioContext at once (inside the click that asked for it), finds the job's
+//   playJob(api, job, {onError, onEnd, ctx}) -> {stop}
+//       Creates an AudioContext at once (inside the click that asked for it; with `ctx` given
+//       it plays on that one instead, which a click made before awaiting the op that starts
+//       the job, as browsers tie autoplay to the gesture), finds the job's
 //       audio stream (the GET /streams entry with provenance.job == job.id and kind "audio",
 //       looked up STREAM_LOOKUPS times STREAM_LOOKUP_MS apart while the job starts), opens it
 //       with api.streamBinary (credits 256, top-up 128, as zeta-client) and plays every frame
@@ -79,8 +81,8 @@ async function audioStreamId(api, jobId) {
   return s ? s.id : null;
 }
 
-export function playJob(api, job, { onError = () => {}, onEnd = () => {} } = {}) {
-  const ctx = new AudioContext();
+export function playJob(api, job, { onError = () => {}, onEnd = () => {}, ctx = null } = {}) {
+  ctx = ctx || new AudioContext();
   ctx.resume().catch(() => {});
   let sub = null;
   let stopped = false;
