@@ -97,6 +97,7 @@ Holding a capture, receive gain and transcripts:
 ./target/debug/zeta plans [--plan uhf_cb_au]     # channel plans with their channels expanded
 ./target/debug/zeta jobs stop --source b210   # every job on a source in one operation (no filter: every job; the page's spectrum stays)
 ./target/debug/zeta plan start --plan uhf_cb_au --kind fm_demod --source b210 --channels 1,2,5-8 --attach transcribe   # one lease decision, one job per channel
+./target/debug/zeta mix start [--sources b210,hackrf]   # one audio stream of every demodulator (no lease, no transcript)
 ```
 
 `source pin` holds a source at a band (the leased bandwidth may round up to what the radio can

@@ -128,7 +128,7 @@ Set the source's overall receive gain live (`gain_db` in dB within `source list`
 
 ### job_start
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
@@ -147,7 +147,7 @@ CLI: `zeta job start --kind passthrough --source <id> --center-hz 144800000 --ba
 
 Attach a job of an attachable `kind` (`transcribe`) to the running job `job`: it reads that job's audio output stream (the last one in its graph order when it has several; audio passed between two of its stages does not count) instead of the radio, holds no lease, copies the job's `source` and `tuning`, and records it as its `input`. It follows its input through a `job_retune` or a `graph_put` restart: it is relaunched under its own id on the input's new stream once the input runs again (`failed` with the reason when it cannot be). It ends `stopped` when the input job stops or fails for its own reason. On a node restart it resumes after its input, or is `failed` with `input job <id> not running` when the input does not run.
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - job: string; an id from `job list`
 - language: string or null
 
@@ -159,7 +159,7 @@ Attach a processing chain to a running job's output instead of the radio: `trans
 
 ### job_retune
 
-Retune a running job on the radio to a new band under the same id: under the source's gate its lease is moved to `center_hz`/`bandwidth_hz` (inside the current capture it is granted without a tune, whether or not another rigid job's band overlaps it; outside it the source is tuned when no other rigid job or pin holds it, else it is a `conflict` naming the holders and the job is left as it was), its graph is expanded again for the new band at the capture's rate and the job relaunched, `tuning` updated. Applies to a `running` job the node expanded and can re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum` (elastic or rigid) and `transcribe` (attached: retune its input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new graph or start a new job). A job that is not running is `job <id> is <state>`; an unknown id is `unknown`. The result is the job's id, as `job_start` answers.
+Retune a running job on the radio to a new band under the same id: under the source's gate its lease is moved to `center_hz`/`bandwidth_hz` (inside the current capture it is granted without a tune, whether or not another rigid job's band overlaps it; outside it the source is tuned when no other rigid job or pin holds it, else it is a `conflict` naming the holders and the job is left as it was), its graph is expanded again for the new band at the capture's rate and the job relaunched, `tuning` updated. Applies to a `running` job the node expanded and can re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum` (elastic or rigid), `mix` (it has no band) and `transcribe` (attached: retune its input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new graph or start a new job). A job that is not running is `job <id> is <state>`; an unknown id is `unknown`. The result is the job's id, as `job_start` answers.
 
 - job: string; an id from `job list`
 - center_hz: integer (Hz)
@@ -172,13 +172,25 @@ CLI: `zeta job retune --job <id> --center-hz 144800000 --bandwidth-hz 12500`
 
 `replace`: as on `job_start`, the holders that may be stopped to make room, stopped under the gate right before the request; a `conflict` offers `retry with replace: [<ids>]` and the page shows the same retry buttons. A demodulator keeps its `squelch`, `squelch_db`, `deviation_hz` and `sideband` through a retune; its adjacent-channel guard (`guard_hz`, `guard_db`, `channel_hz`, the channel node's `wide_hz`) is derived again from the channel plan at the new band, never carried, so a width preset changes what the filter passes and a move to a neighbouring channel takes that channel's geometry; a guard turned off with `graph_put` (`guard_hz: null`) comes back on a retune onto a plan channel. Every attached job (`job_attach`) reading the retuned job is relaunched under its own id once the input runs again (one that cannot relaunch is `failed` with the reason; the retune still succeeds). Centre the band on the signal's measured centre (`measure`, `classify`), never on a raster: see Fitting a demod to a signal under Field craft. A one-shot `zeta job retune` cannot reach a job `zeta serve` runs (`job <id> is not running in this node`): use `--node`. On the CLI, `--replace ID[,ID]`.
 
+### mix_start
+
+Start a mix: a job that sums the audio of every other job with an audio output on `sources` and plays it as one stream, so whatever is talking is heard. It takes no lease, tunes nothing and blocks no job (its record's source is `node`, its band 0); jobs started or stopped later join and leave by themselves within a second. It outputs `audio` and `event` streams; each change of who is talking publishes `{"protocol": "mix", "active": [{"job", "source", "center_hz"}], "t_ns", "summary"}`. Attached jobs, a `watch`'s or `identify`'s own jobs and other mixes are not mixed. With a mix of the same set of sources already running the result is its id; `null` matches only `null`, so a list naming every source is another mix. It runs until stopped, and a node restart resumes it after the jobs it mixes.
+
+- sources: array or null; ids from `source list` (strings), `null` for every source
+
+JSON: `{"op":"mix_start","sources":null}`
+
+CLI: `zeta mix start`
+
+Starts one `mix` job that plays the audio of every job on `sources` (`null`: every source) as one stream, so whatever is talking is heard. It holds no lease, tunes nothing and blocks no job; jobs started or stopped later join and leave by themselves. Its `event` stream publishes `active` (who is talking: `job`, `source`, `center_hz`) when it changes, with a hangover after a channel falls silent. It is idempotent on the same set of sources: a mix of that set already running answers its id (`null` matches only `null`). To mute a channel, `graph get` the mix, edit `muted` on the `mix` node (a list of `{source, center_hz}`), `graph put`, which restarts it under its id.
+
 ### plan_start
 
-Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on the channels numbered in `channels`, each at its channel's `center_hz` with the plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's gate, in this order: everything is checked first (an unknown `plan` or channel is `unknown`, a channel listed twice, a kind that does not run per channel — `spectrum`, `scan`, `watch`, `identify`, an attachable kind — and a non-attachable `attach` are `other`; nothing has happened yet); a channel where an identical rigid job already runs is `existing` and skipped; with `attach`, its stage must be ready, else the op is refused with the stage's reason; the `replace` jobs are stopped; then one lease decision for the band bounding the channels to start (lowest channel edge to highest), checked as a rigid `job_start` of that band would be: inside the capture no tune, outside it a tune when only elastic jobs hold the source, else a `conflict` naming the holders and nothing starts; a band wider than the source is `out_of_range` on `bandwidth_hz`. Each channel is then started in channel-number order inside that capture: one that fails is listed under `refused` with its error and the rest go on. With `attach`, each started job (and each `existing` one without one) gets one attached; a failure is that channel's `attach_error`, the job kept. The result: `capture`, `started` (`channel`, `center_hz`, `job`, `attached`, `attach_error`), `existing` (`channel`, `center_hz`, `job`, `attached`), `refused` (`channel`, `center_hz`, `error`) and `warnings` (strings to repeat to the operator; empty when there is nothing to say). The jobs are ordinary jobs; running the same request twice starts only what is missing.
+Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on the channels numbered in `channels`, each at its channel's `center_hz` with the plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's gate, in this order: everything is checked first (an unknown `plan` or channel is `unknown`, a channel listed twice, a kind that does not run per channel — `spectrum`, `scan`, `watch`, `identify`, `mix`, an attachable kind — and a non-attachable `attach` are `other`; nothing has happened yet); a channel where an identical rigid job already runs is `existing` and skipped; with `attach`, its stage must be ready, else the op is refused with the stage's reason; the `replace` jobs are stopped; then one lease decision for the band bounding the channels to start (lowest channel edge to highest), checked as a rigid `job_start` of that band would be: inside the capture no tune, outside it a tune when only elastic jobs hold the source, else a `conflict` naming the holders and nothing starts; a band wider than the source is `out_of_range` on `bandwidth_hz`. Each channel is then started in channel-number order inside that capture: one that fails is listed under `refused` with its error and the rest go on. With `attach`, each started job (and each `existing` one without one) gets one attached; a failure is that channel's `attach_error`, the job kept. The result: `capture`, `started` (`channel`, `center_hz`, `job`, `attached`, `attach_error`), `existing` (`channel`, `center_hz`, `job`, `attached`), `refused` (`channel`, `center_hz`, `error`) and `warnings` (strings to repeat to the operator; empty when there is nothing to say). The jobs are ordinary jobs; running the same request twice starts only what is missing.
 
 - plan: string; an id from `channel_plans`
 - channels: array or null; channel numbers of the plan (integers), `null` for all
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - source: string; an id from `source list`
 - deviation_hz: integer or null
 - sideband: string or null
@@ -222,7 +234,7 @@ JSON: `{"op":"jobs_stop","source":null,"kind":null,"plan":null}`
 
 CLI: `zeta jobs stop [--source ID] [--kind KIND] [--plan ID]`
 
-One call however many jobs match; the page's elastic spectrum keeps running. Stopping jobs is the operator's decision: use it only when the request asks for all of them, or names the source, kind or plan. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry. Report how many stopped and any `failed`.
+One call however many jobs match; the page's elastic spectrum keeps running. Stopping jobs is the operator's decision: use it only when the request asks for all of them, or names the source, kind or plan. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry. Report how many stopped and any `failed`. A `source` or `plan` filter leaves a `mix` alone; with neither it stops.
 
 ### job_context
 
@@ -244,7 +256,7 @@ CLI: `zeta iq read --source <id> --start-ns 1760000000000000000 --end-ns 1760000
 
 ### stream_list
 
-List the streams: id, kind and provenance. One is always the node's own `ops` event stream (provenance source `node`): one event per applied operation with its outcome and caller (`transport`: `local`, `http`, `ui` or `agent`), logged after the operation completes.
+List the streams: id, kind and provenance. One is always the node's own `ops` event stream (provenance source `node` and no `job`; a mix's streams have source `node` too, with their `job`): one event per applied operation with its outcome and caller (`transport`: `local`, `http`, `ui` or `agent`), logged after the operation completes.
 
 JSON: `{"op":"stream_list"}`
 
@@ -635,6 +647,8 @@ demodulator's audio, holds no radio lease and ends when that job stops:
 2. `job attach --kind transcribe --job THAT_ID`. Its chain is `stream_in → denoise → vad → transcribe` (without the `denoise` when the demodulator already denoises its own audio, below).
 3. `stream list` shows two event streams on the attached job (`vad`'s and `transcribe`'s); `stream tail` them. A `transcript` event is one utterance (`text`, `language`, `start_ns`, `end_ns`); `vad` events mark where speech starts and stops. An empty tail means no utterance ended in the window, not that nothing was said.
 
+Transcription is per demodulator: a `mix` (see "Listening to many channels") is not transcribed unless the operator asks for it.
+
 The node needs a speech backend (`--stt-socket` or `--stt-node`); without one the attached job fails naming it, so report that and do not retry. Language: the attached job transcribes `en` unless it was attached with `language`; a language the backend does not list (see `GET /stt/languages`) fails the job naming the languages it has. Do not guess a language from the band.
 
 Music and noise are gated, not separated: `vad` passes any loud audio, so a music station or a broadcast with a bed under the voice yields poor or empty text. Say so rather than reporting the text as the speech. Separation is a slot: an external audio-to-audio plugin (`--plugin separate=PATH`, a Demucs wrapper for instance) replaces the `denoise` node with `graph get` of the attached job, edit, `graph put`. The job restarts on `graph put`. `docs/speech.md` has the daemon install and the plugin stub.
@@ -684,6 +698,18 @@ To run demodulators on active channels only, not on all 80, use `examples/python
 5. A partial set is completed by running `plan_start` again: running channels come back as `existing`.
 
 A result of `not_allowed` means the run may not do that: the agent is not allowed to stop jobs, or to put any in `replace`, unless the operator unlocked it for the run. Do not retry and do not work around it with other calls. Tell the operator to say `allow stops on`, or press the retry button, then ask again.
+
+### Listening to many channels
+
+"Let me hear everything" is one `mix_start`, not a player per channel. `sources: null` mixes every source of the node, a list only those; one mix spans any set of tuners. It takes no lease, tunes nothing and stops nothing, so start it whenever; running it twice on the same set answers the same job.
+
+1. `mix_start`, then play the job's audio or `stream tail` its streams (`stream list` shows an `audio` and an `event` stream with provenance source `node` and the mix's `job`; the `ops` stream is the one with no `job`).
+2. Its `event` stream publishes `active` (`job`, `source`, `center_hz` of every channel being heard) whenever that changes; a channel stays active for 500 ms after its last audio. `job_context.mix` holds `inputs` (how many jobs it mixes), `active`, `last` (the last channel heard), `muted`, `dropped_ms` and `skipped` (jobs whose audio is not 48 kHz mono, each named once).
+3. `dropped_ms` counts audio the mix threw away because a channel's queue ran over 200 ms: the mix could not keep time with that channel. Report it with the job, do not hide it.
+4. A mute is a channel, `{source, center_hz}`, not a job: `graph get` the mix, add it to `muted` on the `mix` node, `graph put` (this restarts the mix under its id). It outlives the job, so a channel muted and restarted stays muted, and a job retuned off the channel is heard again.
+5. `wfm_demod` and `ssb_demod` have no squelch: they always produce audio, so a mix holding one is open all the time until that channel is muted. Say so rather than calling the mix broken.
+
+Transcription happens per demodulator. Starting a mix attaches no transcript; `job_attach` a `transcribe` to each channel you want transcribed, as under "Transcribing a channel". Attaching a `transcribe` to the mix's output is the operator's option, alongside the per-demodulator ones: it runs overlapping voices together and names no channel (its log shows `node` and 0 Hz): attach it there only when asked.
 
 ### Fitting a demod to a signal
 

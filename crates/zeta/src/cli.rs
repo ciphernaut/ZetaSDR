@@ -201,6 +201,9 @@ pub enum Command {
     /// Start a kind on every channel of a channel plan
     #[command(subcommand)]
     Plan(PlanCmd),
+    /// Listen to many channels as one audio stream
+    #[command(subcommand)]
+    Mix(MixCmd),
     /// Many jobs at once
     #[command(subcommand)]
     Jobs(JobsCmd),
@@ -264,6 +267,16 @@ pub enum JobsCmd {
         /// Only jobs on a channel of this plan
         #[arg(long, value_name = "ID")]
         plan: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MixCmd {
+    /// Start a mix: one audio stream summing every job with audio output on the sources
+    Start {
+        /// Only the audio of jobs on these sources (default: every source)
+        #[arg(long, value_name = "ID[,ID]", value_delimiter = ',')]
+        sources: Option<Vec<String>>,
     },
 }
 
@@ -839,6 +852,7 @@ impl Command {
                     | JobCmd::Stop(_)
             ) | Command::Graph(GraphCmd::Put { .. })
                 | Command::Plan(PlanCmd::Start { .. })
+                | Command::Mix(MixCmd::Start { .. })
                 | Command::Jobs(JobsCmd::Stop { .. })
         )
     }
@@ -1005,6 +1019,9 @@ impl Command {
                 attach: attach.map(Into::into),
                 language,
                 replace: replace.into_ids(),
+            },
+            Command::Mix(MixCmd::Start { sources }) => Op::MixStart {
+                sources: sources.map(|s| s.into_iter().map(SourceId).collect()),
             },
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },

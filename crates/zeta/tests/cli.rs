@@ -2999,3 +2999,85 @@ fn plan_start_cli_maps_to_the_op_and_parses_channel_ranges() {
     // The recording is 48 kHz wide, so two adjacent channels are what it can hold.
     run("8-5").assert().code(1).stderr(contains("channels"));
 }
+
+#[test]
+fn mix_start_cli_maps_to_the_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = |extra: &[&str]| {
+        let mut args = vec!["mix", "start"];
+        args.extend_from_slice(extra);
+        zeta(dir.path(), &args)
+    };
+    let out = start(&[]).assert().success().get_output().stdout.clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "job", "{v}");
+    let id = v["value"].as_str().expect("job id").to_owned();
+    assert_eq!(
+        last_logged_op(dir.path()),
+        serde_json::json!({"op": "mix_start", "sources": null})
+    );
+    // The persisted record is running: the same set answers the same id.
+    let out = start(&[]).assert().success().get_output().stdout.clone();
+    assert_eq!(json(&out)["value"], id.as_str());
+    // A list naming the source is another mix.
+    let out = start(&["--sources", "tone"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let other = json(&out);
+    assert_ne!(other["value"], id.as_str(), "{other}");
+    assert_eq!(
+        last_logged_op(dir.path()),
+        serde_json::json!({"op": "mix_start", "sources": ["tone"]})
+    );
+    let out = start(&["--sources", "nope"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(json(&out)["error"], "unknown");
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "mix",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "12500",
+        ],
+    )
+    .assert()
+    .code(2)
+    .get_output()
+    .stdout
+    .clone();
+    assert!(
+        json(&out)
+            .to_string()
+            .contains("mix takes no band: use mix_start"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_source_flag_named_node_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = write_tone(dir.path());
+    zeta_bin()
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--source-file")
+        .arg(format!("node={}", meta.display()))
+        .args(["source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("source id \"node\" is reserved"));
+}

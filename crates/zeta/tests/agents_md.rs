@@ -127,3 +127,24 @@ fn jobs_stop_cli_line_and_rule_are_in_the_guide() {
     assert!(md.contains("CLI: `zeta jobs stop [--source ID] [--kind KIND] [--plan ID]`"));
     assert!(md.contains("use `jobs_stop`, never one `job_stop` per job"));
 }
+
+#[test]
+fn mix_start_is_in_the_guide() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    for needle in [
+        "CLI: `zeta mix start`",
+        "\"op\":\"mix_start\",\"sources\":null",
+        "### Listening to many channels",
+        "attach it there only when asked",
+        "### mix\n",
+    ] {
+        assert!(md.contains(needle), "missing {needle}");
+    }
+}

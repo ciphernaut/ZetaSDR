@@ -118,6 +118,15 @@ fn split_id(s: &str) -> Option<(&str, &str)> {
         .filter(|(id, rest)| !id.is_empty() && !rest.is_empty())
 }
 
+/// A source may not be named like the node's own placeholder source, which a mix's record
+/// carries.
+fn refuse_reserved(id: &str) -> Result<(), String> {
+    if id == zeta_core::node::NODE_SOURCE {
+        return Err(format!("source id {id:?} is reserved"));
+    }
+    Ok(())
+}
+
 /// `ID=PATH.sigmf-meta[,tune_min_hz=N,tune_max_hz=M]`: the options start at the first
 /// `,tune_` (a path may hold commas otherwise); both bounds are required, integers in Hz,
 /// `N < M`. Errors name the bad part and show the expected form.
@@ -126,6 +135,7 @@ pub fn parse_file(s: &str) -> Result<SourceSpec, String> {
         format!("{part}; expected ID=PATH.sigmf-meta[,tune_min_hz=N,tune_max_hz=M], got {s:?}")
     };
     let (id, rest) = split_id(s).ok_or_else(|| bad("missing ID=".into()))?;
+    refuse_reserved(id)?;
     let (path, opts) = match rest.find(",tune_") {
         Some(at) => (&rest[..at], Some(&rest[at + 1..])),
         None => (rest, None),
@@ -166,6 +176,7 @@ pub fn parse_file(s: &str) -> Result<SourceSpec, String> {
 /// `ID=ARGS`, split at the first `=`.
 pub fn parse_soapy(s: &str) -> Result<SourceSpec, String> {
     let (id, args) = split_id(s).ok_or_else(|| format!("expected ID=ARGS, got {s:?}"))?;
+    refuse_reserved(id)?;
     Ok(SourceSpec::Soapy {
         id: id.into(),
         args: args.into(),
@@ -210,6 +221,7 @@ pub fn parse_kiwi(s: &str) -> Result<SourceSpec, String> {
 fn parse_kiwi_with(s: &str, env: impl Fn(&str) -> Option<String>) -> Result<SourceSpec, String> {
     let bad = || format!("expected ID=HOST:PORT[/PASSWORD], got {:?}", redact_kiwi(s));
     let (id, rest) = split_id(s).ok_or_else(bad)?;
+    refuse_reserved(id)?;
     let (addr, password) = match rest.split_once('/') {
         Some((a, p)) if !p.is_empty() => (a, Some(p.to_owned())),
         Some(_) => return Err(bad()),
@@ -259,6 +271,7 @@ pub fn parse_node(s: &str) -> Result<SourceSpec, String> {
     let bad =
         |part: String| format!("{part}; expected ID=SOURCE@URL[,max_bandwidth_hz=N], got {s:?}");
     let (id, rest) = split_id(s).ok_or_else(|| bad("missing ID=".into()))?;
+    refuse_reserved(id)?;
     let (target, opts) = match rest.split_once(',') {
         Some((t, o)) => (t, Some(o)),
         None => (rest, None),
@@ -310,6 +323,7 @@ pub fn parse_node(s: &str) -> Result<SourceSpec, String> {
 pub fn parse_vrt(s: &str) -> Result<SourceSpec, String> {
     let bad = |part: String| format!("{part}; expected ID=udp://ADDR:PORT, got {s:?}");
     let (id, url) = split_id(s).ok_or_else(|| bad("missing ID=".into()))?;
+    refuse_reserved(id)?;
     let Some(addr) = url.strip_prefix("udp://") else {
         return Err(bad(format!("{url:?} must start with udp://")));
     };
@@ -403,6 +417,16 @@ mod tests {
                 args: "driver=hackrf,serial=ab".into()
             })
         );
+        for e in [
+            parse_file("node=a.sigmf-meta").unwrap_err(),
+            parse_soapy("node=driver=x").unwrap_err(),
+            parse_kiwi("node=h:1").unwrap_err(),
+            parse_node("node=s@http://h:1").unwrap_err(),
+            parse_vrt("node=udp://127.0.0.1:4991").unwrap_err(),
+        ] {
+            assert!(e.contains("source id \"node\" is reserved"), "{e}");
+        }
+        assert!(parse_plugin("node=/x").is_ok());
         assert!(parse_soapy("h=").is_err());
         assert!(parse_soapy("h").is_err());
         assert_eq!(

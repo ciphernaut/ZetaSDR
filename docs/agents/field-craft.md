@@ -111,6 +111,8 @@ demodulator's audio, holds no radio lease and ends when that job stops:
 2. `job attach --kind transcribe --job THAT_ID`. Its chain is `stream_in → denoise → vad → transcribe` (without the `denoise` when the demodulator already denoises its own audio, below).
 3. `stream list` shows two event streams on the attached job (`vad`'s and `transcribe`'s); `stream tail` them. A `transcript` event is one utterance (`text`, `language`, `start_ns`, `end_ns`); `vad` events mark where speech starts and stops. An empty tail means no utterance ended in the window, not that nothing was said.
 
+Transcription is per demodulator: a `mix` (see "Listening to many channels") is not transcribed unless the operator asks for it.
+
 The node needs a speech backend (`--stt-socket` or `--stt-node`); without one the attached job fails naming it, so report that and do not retry. Language: the attached job transcribes `en` unless it was attached with `language`; a language the backend does not list (see `GET /stt/languages`) fails the job naming the languages it has. Do not guess a language from the band.
 
 Music and noise are gated, not separated: `vad` passes any loud audio, so a music station or a broadcast with a bed under the voice yields poor or empty text. Say so rather than reporting the text as the speech. Separation is a slot: an external audio-to-audio plugin (`--plugin separate=PATH`, a Demucs wrapper for instance) replaces the `denoise` node with `graph get` of the attached job, edit, `graph put`. The job restarts on `graph put`. `docs/speech.md` has the daemon install and the plugin stub.
@@ -160,6 +162,18 @@ To run demodulators on active channels only, not on all 80, use `examples/python
 5. A partial set is completed by running `plan_start` again: running channels come back as `existing`.
 
 A result of `not_allowed` means the run may not do that: the agent is not allowed to stop jobs, or to put any in `replace`, unless the operator unlocked it for the run. Do not retry and do not work around it with other calls. Tell the operator to say `allow stops on`, or press the retry button, then ask again.
+
+### Listening to many channels
+
+"Let me hear everything" is one `mix_start`, not a player per channel. `sources: null` mixes every source of the node, a list only those; one mix spans any set of tuners. It takes no lease, tunes nothing and stops nothing, so start it whenever; running it twice on the same set answers the same job.
+
+1. `mix_start`, then play the job's audio or `stream tail` its streams (`stream list` shows an `audio` and an `event` stream with provenance source `node` and the mix's `job`; the `ops` stream is the one with no `job`).
+2. Its `event` stream publishes `active` (`job`, `source`, `center_hz` of every channel being heard) whenever that changes; a channel stays active for 500 ms after its last audio. `job_context.mix` holds `inputs` (how many jobs it mixes), `active`, `last` (the last channel heard), `muted`, `dropped_ms` and `skipped` (jobs whose audio is not 48 kHz mono, each named once).
+3. `dropped_ms` counts audio the mix threw away because a channel's queue ran over 200 ms: the mix could not keep time with that channel. Report it with the job, do not hide it.
+4. A mute is a channel, `{source, center_hz}`, not a job: `graph get` the mix, add it to `muted` on the `mix` node, `graph put` (this restarts the mix under its id). It outlives the job, so a channel muted and restarted stays muted, and a job retuned off the channel is heard again.
+5. `wfm_demod` and `ssb_demod` have no squelch: they always produce audio, so a mix holding one is open all the time until that channel is muted. Say so rather than calling the mix broken.
+
+Transcription happens per demodulator. Starting a mix attaches no transcript; `job_attach` a `transcribe` to each channel you want transcribed, as under "Transcribing a channel". Attaching a `transcribe` to the mix's output is the operator's option, alongside the per-demodulator ones: it runs overlapping voices together and names no channel (its log shows `node` and 0 Hz): attach it there only when asked.
 
 ### Fitting a demod to a signal
 
