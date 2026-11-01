@@ -13,5 +13,7 @@ mod wav;
 pub use backend::{DEFAULT_LANGUAGE, SpeechBackend, SpeechError, Transcript};
 pub use node::NodeBackend;
 pub use socket::SocketBackend;
-pub use transcribe::{Accumulator, NO_BACKEND, TranscribeParams, TranscribeStage, Utterance};
+pub use transcribe::{
+    Accumulator, NO_BACKEND, NO_BACKEND_REASON, TranscribeParams, TranscribeStage, Utterance,
+};
 pub use wav::wav_s16_mono;

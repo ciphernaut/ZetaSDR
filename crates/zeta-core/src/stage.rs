@@ -118,6 +118,38 @@ impl StageContext {
     }
 }
 
+/// Whether a stage can run on this node now, and with what capacity.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Readiness {
+    /// The stage can run.
+    pub ready: bool,
+    /// Why it cannot, when `ready` is false.
+    pub reason: Option<String>,
+    /// How many runs it serves at once, when something bounds that (`None`: unbounded or
+    /// not known).
+    pub capacity: Option<u32>,
+}
+
+impl Readiness {
+    /// Ready, with no bound on its capacity: what a stage with no external need answers.
+    pub fn always() -> Self {
+        Self {
+            ready: true,
+            reason: None,
+            capacity: None,
+        }
+    }
+
+    /// Not ready, for `reason`.
+    pub fn unready(reason: impl Into<String>) -> Self {
+        Self {
+            ready: false,
+            reason: Some(reason.into()),
+            capacity: None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait Stage: Send + Sync {
     fn spec(&self) -> &StageSpec;
@@ -134,6 +166,12 @@ pub trait Stage: Send + Sync {
     /// failing its job at run time; the error names the field. By default nothing more.
     fn check_params(&self, _params: &serde_json::Value) -> Result<(), String> {
         Ok(())
+    }
+    /// Whether this stage can run on this node now (a speech backend present, a program
+    /// installed) and with what capacity, so a request is refused before a job is made
+    /// that would fail at launch. By default always ready.
+    fn readiness(&self) -> Readiness {
+        Readiness::always()
     }
     /// Run until the inputs close or `cancel` fires.
     ///
@@ -181,6 +219,15 @@ impl StageRegistry {
             .map_or(Ok(()), |s| s.check_params(params))
     }
 
+    /// [`Stage::readiness`] of the first implementation registered for `kind` (`None` for
+    /// an unknown kind).
+    pub fn readiness(&self, kind: &str) -> Option<Readiness> {
+        self.stages
+            .iter()
+            .find(|s| s.spec().kind == kind)
+            .map(|s| s.readiness())
+    }
+
     /// Every registered stage kind, sorted, each once.
     pub fn kinds(&self) -> Vec<String> {
         let mut v: Vec<String> = self.stages.iter().map(|s| s.spec().kind.into()).collect();
@@ -189,7 +236,7 @@ impl StageRegistry {
         v
     }
 
-    /// One `{kind, inputs, outputs, params_schema}` object per stage kind,
+    /// One `{kind, inputs, outputs, params_schema, readiness}` object per stage kind,
     /// sorted by kind, from the first implementation registered for it.
     pub fn describe(&self) -> serde_json::Value {
         let stages = self
@@ -202,6 +249,7 @@ impl StageRegistry {
                     "inputs": s.inputs,
                     "outputs": s.outputs,
                     "params_schema": s.params_schema,
+                    "readiness": self.readiness(s.kind),
                 })
             })
             .collect();

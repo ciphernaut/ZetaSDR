@@ -17,7 +17,7 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult};
 use zeta_core::port::{Port, Tuning};
 use zeta_core::stage::{
-    Backend, PassthroughStage, Stage, StageContext, StageError, StageRegistry, StageSpec,
+    Backend, PassthroughStage, Readiness, Stage, StageContext, StageError, StageRegistry, StageSpec,
 };
 use zeta_core::stream::{Frame, Payload, StreamBus, StreamInfo};
 use zeta_core::stream_in::StreamInStage;
@@ -881,4 +881,80 @@ async fn an_attached_transcribe_skips_denoise_when_its_input_denoises() {
         .map(|n| n.kind.clone())
         .collect();
     assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);
+}
+
+/// A stand-in that wraps another stage and answers [`Stage::readiness`] with a refusal.
+struct Unready(Arc<MapStage>, &'static str);
+
+#[async_trait]
+impl Stage for Unready {
+    fn spec(&self) -> &StageSpec {
+        self.0.spec()
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    fn readiness(&self) -> Readiness {
+        Readiness::unready(self.1)
+    }
+    async fn run(
+        &self,
+        params: serde_json::Value,
+        inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        ctx: StageContext,
+    ) -> Result<(), StageError> {
+        self.0.run(params, inputs, outputs, bus, cancel, ctx).await
+    }
+}
+
+#[tokio::test]
+async fn an_unready_attached_stage_is_refused_at_job_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let mut r = StageRegistry::new();
+    r.register(Arc::new(PassthroughStage::new()));
+    r.register(Arc::new(StreamInStage::new()));
+    r.register(MapStage::new(
+        "audio_src",
+        StreamKind::Iq,
+        &[StreamKind::Audio],
+        |_| vec![(0, audio())],
+    ));
+    r.register(Arc::new(Unready(
+        MapStage::new(
+            "transcribe",
+            StreamKind::Audio,
+            &[StreamKind::Event],
+            |_| vec![],
+        ),
+        "no backend here",
+    )));
+    let node = Node::open(cfg(dir.path()), r, vec![port]).await.unwrap();
+    src.start();
+    let input = start_audio(&node).await;
+    let before = node.job_list().len();
+    match attach(&node, &input).await {
+        Err(OpError::Other { message }) => assert_eq!(message, "transcribe: no backend here"),
+        other => panic!("attach: {other:?}"),
+    }
+    assert_eq!(node.job_list().len(), before, "no job record");
+    assert_eq!(
+        node.stage_readiness("transcribe"),
+        Some(Readiness::unready("no backend here"))
+    );
+    assert_eq!(node.stage_readiness("nope"), None);
+}
+
+#[test]
+fn registry_describe_lists_readiness() {
+    let mut r = StageRegistry::new();
+    r.register(Arc::new(PassthroughStage::new()));
+    let d = r.describe();
+    assert_eq!(
+        d[0]["readiness"],
+        serde_json::json!({"ready": true, "reason": null, "capacity": null})
+    );
 }

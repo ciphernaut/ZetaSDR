@@ -24,12 +24,16 @@ const TEXT: &str = "this is the fake transcript";
 const CENTER_HZ: u64 = common::SPEECH_HZ;
 
 fn registry(fake: Arc<FakeBackend>) -> StageRegistry {
+    registry_with(Some(fake))
+}
+
+fn registry_with(fake: Option<Arc<FakeBackend>>) -> StageRegistry {
     let mut r = StageRegistry::new();
     r.register(Arc::new(PassthroughStage::new()));
     r.register(Arc::new(StreamInStage::new()));
     zeta_dsp::register_all(&mut r);
     r.register(Arc::new(TranscribeStage::new(
-        Some(fake),
+        fake.map(|f| f as Arc<dyn zeta_speech::SpeechBackend>),
         Duration::from_secs(5),
     )));
     r
@@ -317,4 +321,56 @@ async fn attached_job_resumes_after_restart() {
             reason: format!("input job {} not running", wfm.0)
         }
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn job_attach_is_refused_at_op_time_without_a_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = speech_port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry_with(None), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let wfm = start(&node, JobKind::WfmDemod, 200_000).await;
+    let before = node.job_list().len();
+    match attach(&node, &wfm).await {
+        Err(OpError::Other { message }) => {
+            assert!(
+                message.ends_with(zeta_speech::NO_BACKEND_REASON),
+                "{message}"
+            )
+        }
+        r => panic!("attach: {r:?}"),
+    }
+    assert_eq!(node.job_list().len(), before, "no job record");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_lists_transcribe_readiness() {
+    let readiness = |node: &Node| {
+        node.schema()["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["kind"] == "transcribe")
+            .unwrap()["readiness"]
+            .clone()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, port) = speech_port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry_with(None), vec![port])
+        .await
+        .unwrap();
+    let r = readiness(&node);
+    assert_eq!(r["ready"], false, "{r}");
+    assert_eq!(r["reason"], zeta_speech::NO_BACKEND_REASON);
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, port) = speech_port(dir.path());
+    let fake = Arc::new(FakeBackend::new(TEXT));
+    let node = Node::open(cfg(dir.path()), registry_with(Some(fake)), vec![port])
+        .await
+        .unwrap();
+    let r = readiness(&node);
+    assert_eq!(r["ready"], true, "{r}");
+    assert_eq!(r["capacity"], 4, "{r}");
 }

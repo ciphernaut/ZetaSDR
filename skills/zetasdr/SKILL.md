@@ -319,16 +319,19 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: iq
 - outputs: event
+- readiness: ready
 
 ### adsb_decode
 
 - inputs: iq
 - outputs: event
+- readiness: ready
 
 ### am_demod
 
 - inputs: iq
 - outputs: audio, event
+- readiness: ready
 - params.audio_rate_hz: integer
 - params.denoise: boolean (optional, default false)
 - params.squelch: boolean (optional, default true)
@@ -338,11 +341,13 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: audio
 - outputs: event
+- readiness: ready
 
 ### channel
 
 - inputs: iq
 - outputs: iq
+- readiness: ready
 - params.center_hz: integer
 - params.bandwidth_hz: integer
 - params.out_rate_hz: integer
@@ -352,11 +357,13 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: audio
 - outputs: audio
+- readiness: ready
 
 ### detect
 
 - inputs: event
 - outputs: event
+- readiness: ready
 - params.dc_mask_hz: integer (optional, default 25000)
 - params.decode_on: string (DecodeOn: capture|free) (optional, default "capture")
 - params.edge_mask: number (optional, default 0.05)
@@ -372,12 +379,14 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: iq, audio
 - outputs: event
+- readiness: ready
 - params.mode: string
 
 ### fft
 
 - inputs: iq
 - outputs: event
+- readiness: ready
 - params.size: integer
 - params.window: string (Window: hann|rect)
 - params.edge_mask: number (optional, default 0.0)
@@ -388,12 +397,14 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: iq
 - outputs: event
+- readiness: ready
 - params.bandwidth_hz: integer or null
 
 ### nbfm_demod
 
 - inputs: iq
 - outputs: audio, event
+- readiness: ready
 - params.deviation_hz: integer
 - params.audio_rate_hz: integer
 - params.audio_lowpass_hz: integer or null (optional, default null)
@@ -409,22 +420,26 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: iq, audio, video, text, event, sink
 - outputs: iq, audio, video, text, event, sink
+- readiness: ready
 - params.kind: string (StreamKind: iq|audio|video|text|event|sink)
 
 ### pocsag_decode
 
 - inputs: iq
 - outputs: event
+- readiness: ready
 
 ### rds_decode
 
 - inputs: iq
 - outputs: event
+- readiness: ready
 
 ### sink_sondehub
 
 - inputs: event
 - outputs: 
+- readiness: ready
 - params.callsign: string
 - params.lat: number
 - params.lon: number
@@ -436,6 +451,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: iq
 - outputs: audio
+- readiness: ready
 - params.sideband: string (Sideband: usb|lsb)
 - params.audio_rate_hz: integer
 - params.audio_bandwidth_hz: integer
@@ -445,6 +461,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: 
 - outputs: audio
+- readiness: ready
 - params.job: string
 - params.kind: string (StreamKind: iq|audio|video|text|event|sink)
 - params.stream: string
@@ -453,6 +470,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: audio
 - outputs: event
+- readiness: not ready (this node has no speech backend (--stt-socket or --stt-node))
 - params.gap_ms: integer (optional, default 300)
 - params.language: string (optional, default "en")
 - params.max_utterance_s: integer (optional, default 15)
@@ -462,6 +480,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: audio
 - outputs: audio, event
+- readiness: ready
 - params.hangover_ms: integer (optional, default 300)
 - params.min_speech_ms: integer (optional, default 200)
 - params.threshold_db: number (optional, default 6.0)
@@ -470,6 +489,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 - inputs: iq
 - outputs: audio
+- readiness: ready
 - params.deviation_hz: integer
 - params.audio_rate_hz: integer
 - params.deemphasis_us: integer

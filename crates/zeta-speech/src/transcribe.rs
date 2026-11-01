@@ -11,13 +11,17 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
+use zeta_core::stage::{Backend, Readiness, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Provenance, Span, StreamId, StreamKind, Timestamp};
 use zeta_dsp::resample::Resampler;
 
 use crate::backend::{DEFAULT_LANGUAGE, SpeechBackend, SpeechError, Transcript, normalise};
+use crate::socket::STT_CONCURRENCY;
 use crate::wav::wav_s16_mono;
+
+/// Why transcription is not ready on a node started without a speech backend.
+pub const NO_BACKEND_REASON: &str = "this node has no speech backend (--stt-socket or --stt-node)";
 
 /// Why a transcribe job fails on a node started without a speech backend.
 pub const NO_BACKEND: &str =
@@ -421,6 +425,17 @@ impl Stage for TranscribeStage {
     }
     fn backend(&self) -> Backend {
         Backend::Cpu
+    }
+    fn readiness(&self) -> Readiness {
+        if self.backend.is_some() {
+            Readiness {
+                ready: true,
+                reason: None,
+                capacity: Some(STT_CONCURRENCY as u32),
+            }
+        } else {
+            Readiness::unready(NO_BACKEND_REASON)
+        }
     }
     async fn run(
         &self,

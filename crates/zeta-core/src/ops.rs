@@ -2572,6 +2572,15 @@ async fn job_attach(
     let Some(input) = node.job_list().into_iter().find(|r| r.id == job) else {
         return Err(unknown_job(node, &job));
     };
+    if let Some(r) = node.stage_readiness(kind.name())
+        && !r.ready
+    {
+        return Err(other(format!(
+            "{}: {}",
+            kind.name(),
+            r.reason.unwrap_or_else(|| "not ready".into())
+        )));
+    }
     let stream = node
         .job_audio_stream(&job)
         .map_err(|e| node_error(node, e))?;

@@ -968,6 +968,11 @@ impl Node {
         &self.inner.state_dir
     }
 
+    /// [`crate::stage::StageRegistry::readiness`] of the stage kind `kind` on this node.
+    pub fn stage_readiness(&self, kind: &str) -> Option<crate::stage::Readiness> {
+        self.inner.registry.readiness(kind)
+    }
+
     /// [`crate::ops::schema`] plus `stages`: every registered stage kind with
     /// its stream kinds and params schema (see [`StageRegistry::describe`]), with
     /// `$defs.JobKind.enum` (in the op, result and error schemas) extended by this
