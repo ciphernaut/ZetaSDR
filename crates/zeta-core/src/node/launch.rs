@@ -73,7 +73,8 @@ impl Inner {
     /// An attached job (`rec.input`) never touches the radio: no port, lease, tune,
     /// bank or IQ stream. Its `stream_in` nodes are first pointed at the input job's
     /// current audio stream (`InputNotRunning` / `NoAudioStream` otherwise), so a
-    /// resumed attached job reads the resumed input.
+    /// resumed attached job reads the resumed input. A `mix` has no input and no port
+    /// either: its stage finds its audio through [`Inner::mix_inputs`].
     ///
     /// With `gate` (the source's gate, held by the caller) the lease is taken
     /// under it and nothing here takes the gate: the relaunch of the elastic jobs
@@ -110,6 +111,7 @@ impl Inner {
                 point_stream_in(&mut rec.graph, &input, &stream);
                 None
             }
+            None if rec.kind == JobKind::Mix.name() => None,
             None => {
                 let port = self.ports.read().unwrap().get(&rec.source).cloned();
                 let port = port.ok_or_else(|| NodeError::UnknownSource(rec.source.clone()))?;
@@ -195,6 +197,7 @@ impl Inner {
         let id = rec.id.clone();
         // Weak: a running stage's note never keeps the node alive.
         let (inner, job) = (Arc::downgrade(self), id.clone());
+        let (mix_node, mix_job) = (inner.clone(), id.clone());
         // The row the job's kind expands from, for the events' envelope; a row that is
         // not ready never got this far (the expand refused it).
         let mode = self
@@ -211,6 +214,12 @@ impl Inner {
             if let Some(inner) = inner.upgrade() {
                 let _ = inner.context_merge(&job, v);
             }
+        }))
+        .with_mix_inputs(Arc::new(move || {
+            mix_node
+                .upgrade()
+                .map(|inner| inner.mix_inputs(&mix_job))
+                .unwrap_or_default()
         }));
 
         let token = self.shutdown.child_token();

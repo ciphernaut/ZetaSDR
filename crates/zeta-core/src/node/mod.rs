@@ -30,7 +30,7 @@ use crate::ops::{
 };
 use crate::port::{GainInfo, Port, PortError, Tuning};
 use crate::ring::IqRing;
-use crate::stage::{Backend, StageRegistry};
+use crate::stage::{Backend, MixInput, StageRegistry};
 use crate::stream::{Frame, Payload, StreamBus};
 use crate::types::{
     Capabilities, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
@@ -226,6 +226,21 @@ impl LogFile {
     }
 }
 
+/// The last audio stream of `outputs` (a job's, in graph order): what is read of the job.
+fn last_audio(outputs: &[(StreamKind, StreamId)]) -> Option<StreamId> {
+    outputs
+        .iter()
+        .rev()
+        .find(|(k, _)| *k == StreamKind::Audio)
+        .map(|(_, s)| s.clone())
+}
+
+/// Whether a mix may read `rec`: not an attached job (it is a chain over a job's audio),
+/// a job a controller owns (a trial) or another mix.
+fn mixable(rec: &JobRecord) -> bool {
+    rec.input.is_none() && rec.owner.is_none() && rec.kind != JobKind::Mix.name()
+}
+
 struct Inner {
     state_dir: PathBuf,
     jobs_dir: PathBuf,
@@ -269,6 +284,8 @@ struct Inner {
     /// Held across [`Inner::relaunch_elastic`], so two retunes never relaunch one
     /// elastic job at once.
     relaunching: tokio::sync::Mutex<()>,
+    /// Held across [`Node::mix_start`], so two starts of one set make one mix.
+    mix_gate: tokio::sync::Mutex<()>,
     /// Cancelled when the `Node` is dropped; every job token is a child of it.
     shutdown: CancellationToken,
     /// The verdicts of owned `identify` runs, by identify id, until their owner (a
@@ -553,13 +570,30 @@ impl Inner {
             .get(job)
             .filter(|e| e.record.state == JobState::Running && e.cancel.is_some())
             .ok_or_else(|| NodeError::InputNotRunning(job.clone()))?;
-        entry
-            .outputs
-            .iter()
-            .rev()
-            .find(|(k, _)| *k == StreamKind::Audio)
-            .map(|(_, s)| s.clone())
-            .ok_or_else(|| NodeError::NoAudioStream(job.clone()))
+        last_audio(&entry.outputs).ok_or_else(|| NodeError::NoAudioStream(job.clone()))
+    }
+
+    /// What a `mix` stage of the job `except` may read: the audio output of every job
+    /// with a live run that is [`mixable`]. A run that ended is not listed, so the stage
+    /// never holds a closed stream with no replacement.
+    pub(super) fn mix_inputs(&self, except: &JobId) -> Vec<MixInput> {
+        let jobs = self.jobs.lock().unwrap();
+        jobs.values()
+            .filter(|e| {
+                e.record.state == JobState::Running
+                    && e.cancel.is_some()
+                    && mixable(&e.record)
+                    && &e.record.id != except
+            })
+            .filter_map(|e| {
+                Some(MixInput {
+                    job: e.record.id.clone(),
+                    stream: last_audio(&e.outputs)?,
+                    source: e.record.source.clone(),
+                    center_hz: e.record.tuning.center_hz.0,
+                })
+            })
+            .collect()
     }
 
     /// The bin rate of `source`'s bank for the capture `band` (made now if
@@ -778,6 +812,7 @@ impl Node {
                 stages: Arc::default(),
                 runs: std::sync::atomic::AtomicU64::new(0),
                 relaunching: tokio::sync::Mutex::new(()),
+                mix_gate: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
                 verdicts: Mutex::new(HashMap::new()),
                 episodes: Mutex::new(HashMap::new()),
@@ -1136,6 +1171,57 @@ impl Node {
             context: serde_json::json!({}),
             created_ns: now(),
             input: Some(input.clone()),
+            capture_rate_hz: None,
+            elastic: false,
+            operator_graph: false,
+            owner: None,
+        };
+        let id = rec.id.clone();
+        self.inner.launch(rec).await?;
+        Ok(id)
+    }
+
+    /// Start a mix of `sources` (`None` for every source): one leaseless job on the
+    /// placeholder source [`NODE_SOURCE`], tuning 0/0. With one already recorded running
+    /// on the same set (a mute plays no part; `None` matches only `None`) its id is the
+    /// answer. `UnknownSource` for a source not attached, `Other` for an empty list.
+    pub async fn mix_start(&self, sources: Option<Vec<SourceId>>) -> Result<JobId, NodeError> {
+        if let Some(list) = &sources {
+            if list.is_empty() {
+                return Err(NodeError::Other(
+                    "sources: empty: pass null for every source".into(),
+                ));
+            }
+            if let Some(s) = list.iter().find(|s| self.inner.port(s).is_none()) {
+                return Err(NodeError::UnknownSource(s.clone()));
+            }
+        }
+        let graph = crate::ops::mix_graph(sources.as_deref());
+        let wanted = crate::ops::mix_graph_sources(&graph);
+        let _gate = self.inner.mix_gate.lock().await;
+        let running = self.job_list().into_iter().find(|r| {
+            r.kind == JobKind::Mix.name()
+                && r.state == JobState::Running
+                && crate::ops::mix_graph_sources(&r.graph) == wanted
+        });
+        if let Some(r) = running {
+            return Ok(r.id);
+        }
+        graph::validate(&graph, &self.inner.registry)?;
+        let rec = JobRecord {
+            format: JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: JobKind::Mix.name().to_string(),
+            graph,
+            source: SourceId(NODE_SOURCE.into()),
+            tuning: Tuning {
+                center_hz: Hz(0),
+                bandwidth_hz: Hz(0),
+            },
+            state: JobState::Running,
+            context: serde_json::json!({}),
+            created_ns: now(),
+            input: None,
             capture_rate_hz: None,
             elastic: false,
             operator_graph: false,
@@ -1756,5 +1842,40 @@ impl Node {
             })
             .collect();
         (free, busy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(kind: &str, input: Option<JobId>, owner: Option<JobId>) -> JobRecord {
+        JobRecord {
+            format: JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: kind.into(),
+            graph: crate::ops::mix_graph(None),
+            source: SourceId("a".into()),
+            tuning: Tuning {
+                center_hz: Hz(476_625_000),
+                bandwidth_hz: Hz(12_500),
+            },
+            state: JobState::Running,
+            context: serde_json::json!({}),
+            created_ns: Timestamp(0),
+            input,
+            capture_rate_hz: None,
+            elastic: false,
+            operator_graph: false,
+            owner,
+        }
+    }
+
+    #[test]
+    fn mixable_refuses_attached_owned_and_mix_records() {
+        assert!(mixable(&rec("fm_demod", None, None)));
+        assert!(!mixable(&rec("transcribe", Some(JobId::new()), None)));
+        assert!(!mixable(&rec("fm_demod", None, Some(JobId::new()))));
+        assert!(!mixable(&rec("mix", None, None)));
     }
 }

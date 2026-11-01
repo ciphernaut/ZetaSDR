@@ -597,12 +597,23 @@ mod tests {
         let registry = registry(None, &ModesHandle::default(), None);
         let modes = zeta_core::modes::ModeRegistry::load(&registry, None);
         for kind in kinds {
+            let t = Tuning {
+                center_hz: Hz(7_100_000),
+                bandwidth_hz: Hz(10_000),
+            };
+            // A mix has no band: its graph comes from `mix_graph`.
+            if kind == JobKind::Mix {
+                assert!(
+                    matches!(kind.expand(&src, t, Hz(48_000), None, None, None, &modes),
+                        Err(OpError::Other { message }) if message.ends_with("use mix_start")),
+                    "{kind:?}"
+                );
+                validate(&zeta_core::ops::mix_graph(None), &registry)
+                    .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+                continue;
+            }
             // An attachable kind is never started on the radio: its graph reads a job.
             if kind.attachable() {
-                let t = Tuning {
-                    center_hz: Hz(7_100_000),
-                    bandwidth_hz: Hz(10_000),
-                };
                 assert!(
                     matches!(kind.expand(&src, t, Hz(48_000), None, None, None, &modes),
                         Err(OpError::Other { message }) if message.ends_with("use job_attach")),

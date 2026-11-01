@@ -87,7 +87,8 @@ pub struct StageContext {
     /// The absolute frequency of the receiver's DC (the capture's centre), `Some`
     /// only for a job on a local hardware source (`ops::local_hardware`).
     pub dc_hz: Option<u64>,
-    /// The node's list of audio outputs, `Some` only for a `mix` stage in a node.
+    /// The node's list of audio outputs, `Some` for every job in a node (only a `mix`
+    /// stage reads it).
     pub mix_inputs: Option<MixInputs>,
 }
 

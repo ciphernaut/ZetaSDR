@@ -864,3 +864,40 @@ async fn a_watch_and_its_decoder_come_back_and_nothing_is_lost() {
     );
     stop_all(&node).await;
 }
+
+/// A mix has no port: a fault leaves it running, silent, and the relaunched job joins it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fault_leaves_a_mix_running_and_it_picks_the_relaunched_job_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port, _srcs) = node_on(dir.path(), true, &[]).await;
+    let demod = start(&node, "s", "audio_src", serde_json::json!({})).await;
+    let mix = match node.apply(Op::MixStart { sources: None }).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("mix_start: {r:?}"),
+    };
+    let inputs = |n: u64| node.job_context(&mix).unwrap()["mix"]["inputs"] == n;
+    until("the mix lists the job", Duration::from_secs(2), || {
+        inputs(1)
+    })
+    .await;
+
+    fault(&node, &port, &[&demod]).await;
+    until("the mix drops the job", Duration::from_secs(2), || {
+        inputs(0)
+    })
+    .await;
+    assert_eq!(state(&node, &mix), Some(JobState::Running));
+
+    port.heal();
+    until("the job comes back", Duration::from_secs(5), || {
+        state(&node, &demod) == Some(JobState::Running)
+    })
+    .await;
+    until("the mix picks it up", Duration::from_secs(2), || inputs(1)).await;
+    assert_eq!(state(&node, &mix), Some(JobState::Running));
+    assert_eq!(
+        node.job_list().iter().filter(|r| r.kind == "mix").count(),
+        1
+    );
+    stop_all(&node).await;
+}

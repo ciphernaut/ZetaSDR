@@ -728,7 +728,7 @@ fn parse_job_kind(s: &str) -> Result<JobKind, String> {
     JobKind::from_name(s).ok_or_else(|| {
         let builtins: Vec<&str> = zeta_core::ops::BUILTIN_KINDS
             .iter()
-            .filter(|k| !k.attachable())
+            .filter(|k| k.startable())
             .map(JobKind::name)
             .collect();
         format!(

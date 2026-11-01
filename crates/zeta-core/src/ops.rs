@@ -177,12 +177,28 @@ pub enum Op {
         bandwidth_hz: Hz,
         replace: Vec<JobId>,
     },
+    /// Start a mix: a job that sums the audio of every other job with an audio output on
+    /// `sources` and plays it as one stream, so whatever is talking is heard. It takes no
+    /// lease, tunes nothing and blocks no job (its record's source is `node`, its band 0);
+    /// jobs started or stopped later join and leave by themselves within a second. It
+    /// outputs `audio` and `event` streams; each change of who is talking publishes
+    /// `{"protocol": "mix", "active": [{"job", "source", "center_hz"}], "t_ns", "summary"}`.
+    /// Attached jobs, a `watch`'s or `identify`'s own jobs and other mixes are not mixed.
+    /// With a mix of the same set of sources already running the result is its id; `null`
+    /// matches only `null`, so a list naming every source is another mix. It runs until
+    /// stopped, and a node restart resumes it after the jobs it mixes.
+    MixStart {
+        /// Ids from `source_list`; `null` for every source of the node.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<Vec<SourceId>>")]
+        sources: Option<Vec<SourceId>>,
+    },
     /// Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on
     /// the channels numbered in `channels`, each at its channel's `center_hz` with the
     /// plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's
     /// gate, in this order: everything is checked first (an unknown `plan` or channel is
     /// `unknown`, a channel listed twice, a kind that does not run per channel —
-    /// `spectrum`, `scan`, `watch`, `identify`, an attachable kind — and a non-attachable
+    /// `spectrum`, `scan`, `watch`, `identify`, `mix`, an attachable kind — and a non-attachable
     /// `attach` are `other`; nothing has happened yet); a channel where an identical
     /// rigid job already runs is `existing` and skipped; with `attach`, its stage must be
     /// ready, else the op is refused with the stage's reason; the `replace` jobs are
@@ -266,7 +282,8 @@ pub enum Op {
         selection: Selection,
     },
     /// List the streams: id, kind and provenance. One is always the node's
-    /// own `ops` event stream (provenance source `node`): one event per
+    /// own `ops` event stream (provenance source `node` and no `job`; a mix's
+    /// streams have source `node` too, with their `job`): one event per
     /// applied operation with its outcome and caller (`transport`: `local`,
     /// `http`, `ui` or `agent`), logged after the operation completes.
     StreamList {},
@@ -504,12 +521,13 @@ pub enum JobKind {
     Identify,
     Watch,
     Transcribe,
+    Mix,
     /// A mode row's id that is not a built-in kind's name (an operator's row).
     Mode(ModeId),
 }
 
 /// The built-in kinds, in the order `schema` lists them: every kind but [`JobKind::Mode`].
-pub static BUILTIN_KINDS: [JobKind; 16] = [
+pub static BUILTIN_KINDS: [JobKind; 17] = [
     JobKind::Passthrough,
     JobKind::Spectrum,
     JobKind::FmDemod,
@@ -526,6 +544,7 @@ pub static BUILTIN_KINDS: [JobKind; 16] = [
     JobKind::Identify,
     JobKind::Watch,
     JobKind::Transcribe,
+    JobKind::Mix,
 ];
 
 impl Serialize for JobKind {
@@ -559,6 +578,36 @@ impl JsonSchema for JobKind {
     }
 }
 
+/// The graph of a mix of `sources` (`None` for every source): one `mix` node, nothing
+/// muted, no edges. A list is sorted and deduplicated, so a set has one spelling.
+pub fn mix_graph(sources: Option<&[SourceId]>) -> Graph {
+    let sources = sources.map(|s| normal_sources(s.to_vec()));
+    Graph {
+        id: GraphId::new(),
+        nodes: vec![GraphNode {
+            id: NodeId::new(),
+            kind: "mix".into(),
+            params: serde_json::json!({"sources": sources, "muted": []}),
+        }],
+        edges: vec![],
+    }
+}
+
+fn normal_sources(mut sources: Vec<SourceId>) -> Vec<SourceId> {
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    sources.dedup();
+    sources
+}
+
+/// The set of sources `graph`'s `mix` node names, spelled as [`mix_graph`] spells it:
+/// `Some(None)` for every source, `None` for a graph without a readable one.
+pub(crate) fn mix_graph_sources(graph: &Graph) -> Option<Option<Vec<SourceId>>> {
+    let node = graph.nodes.iter().find(|n| n.kind == "mix")?;
+    let sources: Option<Vec<SourceId>> =
+        serde_json::from_value(node.params.get("sources")?.clone()).ok()?;
+    Some(sources.map(normal_sources))
+}
+
 impl JobKind {
     /// The kind's wire name, also recorded as the job's `kind`.
     pub fn name(&self) -> &str {
@@ -579,6 +628,7 @@ impl JobKind {
             JobKind::Identify => "identify",
             JobKind::Watch => "watch",
             JobKind::Transcribe => "transcribe",
+            JobKind::Mix => "mix",
             JobKind::Mode(id) => &id.0,
         }
     }
@@ -608,7 +658,7 @@ impl JobKind {
         let m = modes.get(id).ok_or_else(|| {
             let mut known: Vec<String> = BUILTIN_KINDS
                 .iter()
-                .filter(|k| !k.attachable())
+                .filter(|k| k.startable())
                 .map(|k| k.name().to_string())
                 .collect();
             for row in modes.ids() {
@@ -635,8 +685,8 @@ impl JobKind {
 
     /// Whether `job_retune` may move a running job of the kind to another band: the
     /// kinds whose one band the node expands a graph for. Not a `spectrum` (it shows the
-    /// capture), a `scan` (it sweeps), an `identify` or a `watch` (controllers) or an
-    /// attached `transcribe` (its input is retuned instead).
+    /// capture), a `scan` (it sweeps), an `identify` or a `watch` (controllers), an
+    /// attached `transcribe` (its input is retuned instead) or a `mix` (it has no band).
     pub fn retunable(&self) -> bool {
         match self {
             JobKind::Passthrough
@@ -655,7 +705,8 @@ impl JobKind {
             | JobKind::Scan
             | JobKind::Identify
             | JobKind::Watch
-            | JobKind::Transcribe => false,
+            | JobKind::Transcribe
+            | JobKind::Mix => false,
         }
     }
 
@@ -670,11 +721,19 @@ impl JobKind {
         matches!(self, JobKind::Transcribe)
     }
 
-    /// Why `job_start` refuses an attachable kind.
+    /// Whether `job_start` may start the kind on the radio: not an attachable kind, and
+    /// not a `mix`, which has no source or band of its own (`mix_start`).
+    pub fn startable(&self) -> bool {
+        !self.attachable() && !matches!(self, JobKind::Mix)
+    }
+
+    /// Why `job_start` refuses a kind that is not [`startable`](Self::startable).
     fn start_refusal(&self) -> OpError {
-        OpError::Other {
-            message: format!("{} attaches to a job: use job_attach", self.name()),
-        }
+        let message = match self {
+            JobKind::Mix => "mix takes no band: use mix_start".to_string(),
+            k => format!("{} attaches to a job: use job_attach", k.name()),
+        };
+        OpError::Other { message }
     }
 
     /// The graph of an attached job of this kind reading `input_stream` (an audio stream)
@@ -877,7 +936,7 @@ impl JobKind {
         sideband: Option<Sideband>,
         modes: &ModeRegistry,
     ) -> Result<Graph, OpError> {
-        if self.attachable() {
+        if !self.startable() {
             return Err(self.start_refusal());
         }
         let row = self.mode_row(modes)?;
@@ -907,7 +966,7 @@ impl JobKind {
             return template::expand(row, tuning, out);
         }
         Ok(match self {
-            JobKind::Transcribe => unreachable!("refused above: attachable"),
+            JobKind::Transcribe | JobKind::Mix => unreachable!("refused above: not startable"),
             JobKind::AprsDecode
             | JobKind::PocsagDecode
             | JobKind::RdsDecode
@@ -1855,6 +1914,7 @@ impl Op {
             Op::JobStart { .. } => "job_start",
             Op::JobAttach { .. } => "job_attach",
             Op::JobRetune { .. } => "job_retune",
+            Op::MixStart { .. } => "mix_start",
             Op::PlanStart { .. } => "plan_start",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
@@ -2564,7 +2624,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             elastic,
             replace,
         } => {
-            if kind.attachable() {
+            if !kind.startable() {
                 return Err(kind.start_refusal());
             }
             if elastic && !kind.elastic_capable() {
@@ -2768,6 +2828,11 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             )
             .await
         }
+        Op::MixStart { sources } => node
+            .mix_start(sources)
+            .await
+            .map(OpResult::Job)
+            .map_err(|e| node_error(node, e)),
         Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),
         Op::JobStop { job } => node
             .job_stop(&job)
@@ -3002,7 +3067,7 @@ async fn plan_start(
             seen
         }
     };
-    if kind.attachable()
+    if !kind.startable()
         || matches!(
             kind,
             JobKind::Spectrum | JobKind::Scan | JobKind::Watch | JobKind::Identify
@@ -3269,6 +3334,10 @@ async fn job_retune(
     let Some(rec) = node.job_list().into_iter().find(|r| r.id == job) else {
         return Err(unknown_job(node, &job));
     };
+    // Before the operator's-graph test: a mute's `graph_put` sets that flag on a mix.
+    if rec.kind == JobKind::Mix.name() {
+        return Err(other("mix is not retunable"));
+    }
     if let Some(input) = &rec.input {
         return Err(other(format!(
             "{} is attached to job {}: retune that job",
