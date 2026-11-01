@@ -50,7 +50,7 @@ Six of the seven plans shipped; plan 19 was not started and opens the next sprin
 
 | Plan | Merged | Proved live | Rolls forward |
 |---|---|---|---|
-| 14 field fix wave | ?, 2026-10-28 | short-form clock/leak/measure/device-loss on the HackRF (Plan 14 status) | the 2 h clock run |
+| 14 field fix wave | 2026-10-27 (Plan 14 status) | short-form clock/leak/measure/device-loss on the HackRF (Plan 14 status) | the 2 h clock run |
 | 15 scan grid and masks | 83726a2, 2026-11-01 | the mechanism on the B210 (alternation, `masked` rows, `graph put`, `job_context`) | the HackRF constants (`docs/superpowers/plans/2026-11-01-hackrf-acceptance-e14.md`) |
 | 16 mode registry | 91886bc, 2026-10-28 | registry, check, broken rows, handlers, identify-unknown on the HackRF | on-air POCSAG, APRS and ADS-B proofs |
 | 17 sonde frameworks | 97383b0, 2026-10-29 | RS41 X1142896 decoded on the B210 2026-11-01 (pre-placed decoder) | the watch finding a sonde on its own (detector, re-centre) |
