@@ -85,7 +85,7 @@ pub struct ModeRow {
 
 /// What a mode's events are about: the event field naming it, the table columns the
 /// page shows per subject and how the waterfall draws it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields, rename = "ModeSubject", transform = require_all)]
 pub struct Subject {
@@ -104,7 +104,24 @@ pub struct Subject {
     /// The event field the subject is called by (a callsign); `null` for its key.
     #[serde(default)]
     pub label: Option<String>,
+    /// The most points a subject's track holds on the map, at least 4 (100 when left out):
+    /// at this count the older half loses every other point, its first kept.
+    #[serde(default = "default_track_points")]
+    pub track_points: u32,
+    /// How far in metres a fix must be from the track's last kept point to join it, counting
+    /// altitude where both have one (0 when left out: every fix joins). A turn of `heading`
+    /// by more than 10 degrees joins it too.
+    #[serde(default)]
+    pub track_min_m: f64,
 }
+
+/// `subject.track_points` when a row leaves it out.
+fn default_track_points() -> u32 {
+    100
+}
+
+/// The fewest points a track may be capped at: thinning needs an older half of two.
+const MIN_TRACK_POINTS: u32 = 4;
 
 /// How the waterfall draws a mode's subjects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -508,6 +525,11 @@ pub fn parse(text: &str) -> Result<ModeRow, RowError> {
         {
             return RowError::new(field, msg);
         }
+        if msg.contains("invalid")
+            && let Some(field) = bad_track_field(text)
+        {
+            return RowError::new(field, msg);
+        }
         let named = ["unknown field `", "missing field `"]
             .iter()
             .find_map(|p| msg.split_once(p))
@@ -541,6 +563,24 @@ fn bad_word_field(text: &str) -> Option<String> {
         {
             return Some(format!("subject.columns[{i}].unit"));
         }
+    }
+    None
+}
+
+/// The track field holding what its type cannot (`subject.track_points`,
+/// `subject.track_min_m`), read from the row's JSON.
+fn bad_track_field(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let subject = v.get("subject")?;
+    if let Some(n) = subject.get("track_points")
+        && n.as_u64().and_then(|n| u32::try_from(n).ok()).is_none()
+    {
+        return Some("subject.track_points".into());
+    }
+    if let Some(m) = subject.get("track_min_m")
+        && !m.is_number()
+    {
+        return Some("subject.track_min_m".into());
     }
     None
 }
@@ -611,6 +651,21 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
         }
         if sub.name.is_empty() {
             return Err(RowError::new("subject.name", "must not be empty"));
+        }
+        if sub.track_points < MIN_TRACK_POINTS {
+            return Err(RowError::new(
+                "subject.track_points",
+                format!(
+                    "{} is under the minimum of {MIN_TRACK_POINTS}",
+                    sub.track_points
+                ),
+            ));
+        }
+        if sub.track_min_m < 0.0 {
+            return Err(RowError::new(
+                "subject.track_min_m",
+                format!("{} must not be negative", sub.track_min_m),
+            ));
         }
         named.push(("subject.key".into(), sub.key.clone()));
         for (i, c) in sub.columns.iter().enumerate() {
@@ -1160,6 +1215,58 @@ mod tests {
             assert_eq!(e.field, field, "{e}");
             assert!(e.error.contains("which the event schema lacks"), "{e}");
         }
+    }
+
+    #[test]
+    fn track_fields_default_and_round_trip() {
+        let text = edited(ADSB, |v| {
+            let sub = v["subject"].as_object_mut().unwrap();
+            sub.remove("track_points");
+            sub.remove("track_min_m");
+        });
+        let sub = parse(&text).unwrap().subject.unwrap();
+        assert_eq!((sub.track_points, sub.track_min_m), (100, 0.0));
+        let text = edited(ADSB, |v| {
+            v["subject"]["track_points"] = 4.into();
+            v["subject"]["track_min_m"] = 12.5.into();
+        });
+        let row = parse(&text).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["subject"]["track_points"], 4);
+        assert_eq!(v["subject"]["track_min_m"], 12.5);
+    }
+
+    #[test]
+    fn too_few_track_points_is_broken_naming_the_field() {
+        let text = edited(ADSB, |v| v["subject"]["track_points"] = 3.into());
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "subject.track_points", "{e}");
+    }
+
+    #[test]
+    fn track_points_not_a_count_is_broken_naming_the_field() {
+        for bad in [serde_json::json!(-1), serde_json::json!(4.5), "many".into()] {
+            let text = edited(ADSB, |v| v["subject"]["track_points"] = bad.clone());
+            assert_eq!(
+                parse(&text).unwrap_err().field,
+                "subject.track_points",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_track_min_is_broken_naming_the_field() {
+        let text = edited(ADSB, |v| v["subject"]["track_min_m"] = (-1.0).into());
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "subject.track_min_m", "{e}");
+    }
+
+    #[test]
+    fn a_track_min_not_a_number_is_broken_naming_the_field() {
+        let text = edited(ADSB, |v| v["subject"]["track_min_m"] = "far".into());
+        assert_eq!(parse(&text).unwrap_err().field, "subject.track_min_m");
     }
 
     #[test]

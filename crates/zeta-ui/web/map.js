@@ -3,7 +3,8 @@
 //
 // Exports:
 //   TRACK_POINTS   fixes kept per job track (the oldest dropped first)
-//   SUBJECT_TRACK_POINTS   fixes kept per subject's track (likewise)
+//   SUBJECT_TRACK_POINTS   the points of a subject's track when its row names no
+//                  `subject.track_points`
 //   OSM_TILES, OSM_ATTRIBUTION   the only tile layer: OpenStreetMap's, with its attribution;
 //                  a tile that fails (offline, or the e2e suite aborting the host) leaves its
 //                  square blank
@@ -13,6 +14,16 @@
 //       decimal degrees.
 //   positionOf(payload) -> {lat, lon, alt_m} | null   an event's `position`, when it has finite
 //       lat and lon
+//   distanceM(a, b) -> metres between two {lat, lon, alt_m}, the altitudes counted where both
+//       are known
+//   addToTrack(kept, fix, {cap, minM}) -> kept points after `fix` ({lat, lon, alt_m, heading},
+//       unknowns null): it joins when at least `minM` from the last kept point, or when its
+//       heading has turned more than TURN_DEG from that point's; at `cap` the result is thinned,
+//       so a track never holds `cap` points after this call
+//   thinTrack(points) -> points less every other one of the older half, the first kept, the
+//       newer half whole: a track keeps its start and old detail coarsens with age
+//   drawnPoints(kept, latest) -> [[lat, lon]]   the line: the kept points, ending at the latest
+//       fix (`cap` at most, as `kept` is under it)
 //   mountMap(el, api, view, {jobs, subjects}) -> MapPane
 //       `el` (#map) is shown while view.get("map") is "on" and hidden otherwise (view.onChange).
 //       Leaflet (vendor/leaflet, served by the node) is loaded the first time the map shows,
@@ -44,9 +55,12 @@
 //   A subject with a fix is drawn instead as a track under `${job}\u0000${key}`: one L.marker
 //   holding `div.map-subject` (classes `dim`, `selected`) with `span.arrow` turned to the row's
 //   heading (class `dot` while none is known) and `span.label`, the subject's label and altitude,
-//   and one polyline as above. An event with no fix refreshes them. Its popup names the subject
-//   and lists its values; a click selects it in the store. The store's selection marks the
-//   marker, panning only when it is off the map; a dim subject dims it and a drop removes it.
+//   and one polyline as above through the fixes addToTrack kept, by the row's
+//   `subject.track_points` and `track_min_m`. The marker is always at the latest fix. An event
+//   with no fix refreshes the marker's face and leaves the geometry alone. Its popup names the
+//   subject and lists its values; a click selects it in the store. The store's selection marks
+//   the marker and raises it over the others, panning only when it is off the map; each of the
+//   store's ticks dims it with its subject, being heard again lights it, and a drop removes it.
 
 import { subjectLabel, subjectValues } from "./subjects.js";
 import { metricText } from "./units.js";
@@ -54,6 +68,9 @@ import { homePoint } from "./view.js";
 
 export const TRACK_POINTS = 3600;
 export const SUBJECT_TRACK_POINTS = 100;
+const TURN_DEG = 10;
+// Over any marker a screen's height of latitude would otherwise put in front.
+const SELECTED_Z = 10000;
 export const OSM_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 export const OSM_ATTRIBUTION =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
@@ -83,6 +100,41 @@ export function positionOf(p) {
   const { lat, lon } = pos;
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
   return { lat, lon, alt_m: Number.isFinite(pos.alt_m) ? pos.alt_m : null };
+}
+
+export function distanceM(a, b) {
+  const flat = distanceBearing(a, b).km * 1000;
+  const known = Number.isFinite(a.alt_m) && Number.isFinite(b.alt_m);
+  return known ? Math.hypot(flat, a.alt_m - b.alt_m) : flat;
+}
+
+// The angle between two headings, 0-180 degrees; 0 while either is unknown.
+function turned(a, b) {
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  return Math.abs((((a - b) % 360) + 540) % 360 - 180);
+}
+
+export function thinTrack(points) {
+  const older = Math.floor(points.length / 2);
+  return points.filter((_, i) => i >= older || i % 2 === 0);
+}
+
+export function addToTrack(kept, fix, { cap, minM }) {
+  const last = kept[kept.length - 1];
+  if (last && distanceM(last, fix) < minM && turned(last.heading, fix.heading) <= TURN_DEG) {
+    return kept;
+  }
+  const next = [...kept, fix];
+  return next.length >= cap ? thinTrack(next) : next;
+}
+
+export function drawnPoints(kept, latest) {
+  const line = kept.map((p) => [p.lat, p.lon]);
+  const last = kept[kept.length - 1];
+  if (!last || last.lat !== latest.lat || last.lon !== latest.lon) {
+    line.push([latest.lat, latest.lon]);
+  }
+  return line;
 }
 
 // Leaflet's stylesheet and script, added once; resolves to `L`.
@@ -154,7 +206,8 @@ class MapPane {
     this.jobs = jobs;
     this.subjects = subjects;
     // job id -> {points: [[lat, lon]], summary, at, marker, line}
-    // `${job id}\u0000${key}` -> {job, key, subject, points, marker, line, box, arrow, label}
+    // `${job id}\u0000${key}` -> {job, key, subject, kept, points (the line, as drawnPoints),
+    //   marker, line, box, arrow, label}
     this.tracks = new Map();
     this.map = null; // the Leaflet map, once loaded and shown
     this.homeMarker = null;
@@ -167,7 +220,7 @@ class MapPane {
       if (key === "map") this.show();
       else if (key === "home") this.drawHome();
     });
-    subjects?.onChange(() => this.markDim());
+    subjects?.onTick(() => this.markDim());
     subjects?.onSelect((sel) => this.markSelected(sel));
     subjects?.onDrop((jobId, key) => this.dropSubject(jobId, key));
     this.show();
@@ -259,15 +312,23 @@ class MapPane {
     const id = `${s.job}\u0000${s.key}`;
     let t = this.tracks.get(id);
     const pos = positionOf(p);
-    if (pos) {
-      if (!t) {
-        t = { job: s.job, key: s.key, subject: s, points: [], marker: null, line: null };
-        this.tracks.set(id, t);
-      }
-      t.points.push([pos.lat, pos.lon]);
-      if (t.points.length > SUBJECT_TRACK_POINTS) t.points.shift();
+    if (!pos) {
+      if (t?.marker) this.drawFace(t);
+      return;
     }
-    if (t) this.draw(id);
+    if (!t) {
+      t = { job: s.job, key: s.key, subject: s, kept: [], points: [], marker: null, line: null };
+      this.tracks.set(id, t);
+    }
+    const sub = s.row.subject;
+    const heading = sub.heading ? s.state[sub.heading] : null;
+    const fix = { ...pos, heading: Number.isFinite(heading) ? heading : null };
+    t.kept = addToTrack(t.kept, fix, {
+      cap: sub.track_points ?? SUBJECT_TRACK_POINTS,
+      minM: sub.track_min_m ?? 0,
+    });
+    t.points = drawnPoints(t.kept, fix);
+    this.draw(id);
   }
 
   drawSubject(t) {
@@ -288,11 +349,17 @@ class MapPane {
       t.marker.bindPopup(() => subjectPopup(t.subject));
       t.marker.on("click", () => this.subjects.select(t.job, t.key));
       const sel = this.subjects.selected();
-      t.box.classList.toggle("selected", !!sel && sel.job === t.job && sel.key === t.key);
+      this.markOne(t, !!sel && sel.job === t.job && sel.key === t.key);
     } else {
       t.line.setLatLngs(t.points);
       t.marker.setLatLng(last);
     }
+    this.drawFace(t);
+    this.centre(t.points[0]);
+  }
+
+  // What the marker says: its heading, its label, whether it is dim.
+  drawFace(t) {
     const s = t.subject;
     const name = s.row.subject.heading;
     const heading = name ? s.state[name] : null;
@@ -303,7 +370,11 @@ class MapPane {
     t.label.textContent =
       alt === null ? subjectLabel(s) : `${subjectLabel(s)} ${metricText(alt, "m")}`;
     t.box.classList.toggle("dim", s.dim);
-    this.centre(t.points[0]);
+  }
+
+  markOne(t, on) {
+    t.box.classList.toggle("selected", on);
+    t.marker.setZIndexOffset(on ? SELECTED_Z : 0);
   }
 
   // The tracks of subjects (a job's own entry has no `key`).
@@ -318,7 +389,7 @@ class MapPane {
   markSelected(sel) {
     for (const t of this.subjectTracks()) {
       const on = !!sel && sel.job === t.job && sel.key === t.key;
-      t.box?.classList.toggle("selected", on);
+      if (t.marker) this.markOne(t, on);
       if (!on || !this.map || this.el.hidden) continue;
       const at = t.points[t.points.length - 1];
       if (!this.map.getBounds().contains(at)) this.map.panTo(at);

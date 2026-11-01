@@ -6,8 +6,9 @@
 //   khzText(hz) -> "<kHz to 1 decimal>"         e.g. 5000 -> "5.0"
 //   bandText(centerHz, bandwidthHz) -> "<mhzText(centerHz)> MHz, <khzText(bandwidthHz)> kHz"
 //   metricText(value, unit) -> a mode row's value in metres and km/h, rounded: `ft`, `m` ->
-//       "6401 m", `kt`, `km_h` -> "780 km/h", `m_s` -> "5 m/s" (a climb rate stays a climb
-//       rate), `deg` -> "245°"; no unit or a non-number as sent; null or undefined -> ""
+//       "6401 m", `kt`, `km_h` -> "780 km/h", `m_s` -> "+5.0 m/s" (a climb rate stays a climb
+//       rate, one decimal and its sign), `deg` -> "245°" (359.6 -> "0°"); no unit or a
+//       non-number as sent; null or undefined -> ""
 
 export function mhzText(hz) {
   return (hz / 1e6).toFixed(4);
@@ -33,10 +34,13 @@ export function metricText(value, unit) {
       return `${Math.round(value * 1.852)} km/h`;
     case "km_h":
       return `${Math.round(value)} km/h`;
-    case "m_s":
-      return `${Math.round(value)} m/s`;
+    case "m_s": {
+      // Number() so -0.04, which rounds to "-0.0", reads as no climb.
+      const fixed = Number(value.toFixed(1));
+      return `${fixed < 0 ? "" : "+"}${(fixed === 0 ? 0 : fixed).toFixed(1)} m/s`;
+    }
     case "deg":
-      return `${Math.round(value)}°`;
+      return `${((Math.round(value) % 360) + 360) % 360}°`;
     default:
       return String(value);
   }

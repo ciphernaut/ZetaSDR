@@ -88,6 +88,8 @@
       }
     ],
     "heading": "track_deg",
-    "label": "callsign"
+    "label": "callsign",
+    "track_points": 100,
+    "track_min_m": 500
   }
 }

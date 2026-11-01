@@ -12,8 +12,8 @@
 //         lookup at a time (a call during another answers false, and whoever acts on the
 //         other's true asks again).
 //     store.rowOf(kind) -> row | null | undefined (undefined: not yet known)
-//     store.event(job, payload) -> subject | null   merges the event: non-null fields into
-//         `state`, the fix into `position`, `count` and `last_seen`. Null when the job's row has
+//     store.event(job, payload) -> subject | null   merges the event: non-null, non-blank fields
+//         into `state`, the fix into `position`, `count` and `last_seen`. Null when the job's row has
 //         no subject, the job has an `owner` (a watch's or identify's trial) or the key is null,
 //         absent or blank: such an event is unkeyed.
 //     store.subjectOf(job, payload) -> subject | null   the same test and lookup, no merge
@@ -23,11 +23,13 @@
 //     store.held(jobId, key | null) -> bool   the subject (with null, any of the job's) is not dim
 //     store.select(jobId, key), store.selected() -> {job, key} | null
 //     store.onChange(cb)   any merge, dim or drop, and a row learned
+//     store.onTick(cb)   each second, after dim and drop are checked
 //     store.onDrop(cb(jobId, key)), store.onSelect(cb(sel)), store.destroy()
 //     A subject past view `subject_dim_s` of silence is dim, past `subject_drop_s` dropped
-//     (checked each second, from this page's clock); a selection goes with its subject.
+//     (checked each second, from this page's clock, so a longer `subject_dim_s` un-dims it at
+//     the next check); a selection goes with its subject.
 //   A subject: {job, key, state, position, first_seen, last_seen, count, dim, row}. `job` is the
-//     job id, `state` a null-prototype object of every field heard, whose last non-null value
+//     job id, `state` a null-prototype object of every field heard, whose last non-null, non-blank value
 //     stands, `position` {lat, lon, alt_m} or null, the altitude surviving a fix without one.
 //   subjectLabel(subject) -> state[row.subject.label] when present, else the key
 //   subjectSummary(subject) -> the row's summary template filled from the merged state
@@ -35,10 +37,12 @@
 //   fillSummary(template, fields) -> string   summary.rs's `fill`: `{f}`, `{f?}` (dropped with
 //     the separators before it), `{a?b}`, each with an optional `:.N` or `:+.N`
 //   mountSubjectsPane(el, store, view, {jobs, watching, footprint}) -> pane
-//     One `section.subject-job[data-job]` per running job with subjects (an `h3` and a table of
+//     One `section.subject-job[data-job]` per running job with subjects or whose row has table
+//     columns, so a job heard nothing from yet says `0 aircraft` (an `h3` and a table of
 //     `tr.subject[data-job][data-key]`, classes `dim` and `selected`), and one for a subject job
-//     `watching(id)` denies, with `.not-watched`. `th[data-col]` sorts: a first click ascending,
-//     a second reversed, nulls last either way (default last seen, newest first). A click on a
+//     `watching(id)` denies, with `.not-watched`, after the watched ones. `th[data-col]` sorts: a
+//     first click ascending, a second reversed, nulls last either way (default last seen, newest
+//     first), kept for as long as the job is listed. A click on a
 //     row selects it, and a selection (from here or the map) scrolls its row into view.
 //     Redrawn at most every RENDER_MS on a change, and each second. Cells are
 //     written only when they differ, so a tooltip outlives a redraw. All text by textContent.
@@ -151,6 +155,7 @@ class SubjectStore {
     this.changeCbs = [];
     this.dropCbs = [];
     this.selectCbs = [];
+    this.tickCbs = [];
     this.destroyed = false;
     this.timer = setInterval(() => this.tick(), TICK_MS);
   }
@@ -231,7 +236,9 @@ class SubjectStore {
     }
     subjects.set(k.key, s);
     for (const [field, v] of Object.entries(p)) {
-      if (v !== null && v !== undefined) s.state[field] = v;
+      if (v === null || v === undefined) continue;
+      if (typeof v === "string" && v.trim() === "") continue;
+      s.state[field] = v;
     }
     const fix = positionOf(p);
     if (fix) {
@@ -299,6 +306,10 @@ class SubjectStore {
     this.selectCbs.push(cb);
   }
 
+  onTick(cb) {
+    this.tickCbs.push(cb);
+  }
+
   changed() {
     for (const cb of this.changeCbs) cb();
   }
@@ -322,13 +333,14 @@ class SubjectStore {
         if (age >= dropMs) {
           this.drop(jobId, s.key);
           changed = true;
-        } else if (age >= dimMs && !s.dim) {
-          s.dim = true;
+        } else if (age >= dimMs !== s.dim) {
+          s.dim = !s.dim;
           changed = true;
         }
       }
     }
     if (changed) this.changed();
+    for (const cb of this.tickCbs) cb();
   }
 
   destroy() {
@@ -339,6 +351,7 @@ class SubjectStore {
     this.changeCbs = [];
     this.dropCbs = [];
     this.selectCbs = [];
+    this.tickCbs = [];
     if (window.zetaSubjects === this) window.zetaSubjects = null;
   }
 }
@@ -573,13 +586,22 @@ class SubjectsPane {
     this.lastRender = Date.now();
     const wanted = this.subjectJobs()
       .map((job) => ({ job, subjects: this.store.list(job.id), watched: this.watching(job.id) }))
-      .filter((x) => x.subjects.length > 0 || !x.watched);
+      .filter(
+        (x) =>
+          x.subjects.length > 0 ||
+          !x.watched ||
+          this.store.rowOf(x.job.kind).subject.columns.length > 0,
+      )
+      .sort((a, b) => b.watched - a.watched);
     const ids = new Set(wanted.map((x) => x.job.id));
     for (const [id, sec] of [...this.sections]) {
       if (ids.has(id)) continue;
       sec.el.remove();
       this.sections.delete(id);
-      this.sorts.delete(id);
+    }
+    const listed = new Set((this.jobs() || []).map((j) => j.id));
+    for (const id of [...this.sorts.keys()]) {
+      if (!listed.has(id)) this.sorts.delete(id);
     }
     wanted.forEach(({ job, watched }, i) => {
       const row = this.store.rowOf(job.kind);

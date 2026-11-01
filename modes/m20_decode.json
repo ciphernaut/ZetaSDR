@@ -65,6 +65,8 @@
       }
     ],
     "heading": "heading",
-    "label": null
+    "label": null,
+    "track_points": 500,
+    "track_min_m": 100
   }
 }

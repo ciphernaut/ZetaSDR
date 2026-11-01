@@ -414,6 +414,27 @@ async fn modes_list_and_show_carry_the_subject() {
     let v = serde_json::to_value(&mode).unwrap();
     assert_eq!(v["row"]["subject"]["columns"].as_array().unwrap().len(), 4);
     assert_eq!(v["row"]["position"]["alt_unit"], "ft");
+    assert_eq!(v["row"]["subject"]["track_points"], 100);
+    assert_eq!(v["row"]["subject"]["track_min_m"], 500.0);
+}
+
+#[test]
+fn the_rows_thin_their_tracks_as_planned() {
+    let plan = [
+        ("adsb_decode", 100, 500.0),
+        ("rs41_decode", 500, 100.0),
+        ("dfm_decode", 500, 100.0),
+        ("m20_decode", 500, 100.0),
+        ("aprs_decode", 100, 50.0),
+        ("acars_decode", 100, 0.0),
+        ("rds_decode", 100, 0.0),
+    ];
+    let reg = ModeRegistry::load(&stages(), None);
+    for (id, points, min_m) in plan {
+        let row = &reg.all().iter().find(|m| m.row.id.0 == id).unwrap().row;
+        let sub = row.subject.as_ref().unwrap();
+        assert_eq!((sub.track_points, sub.track_min_m), (points, min_m), "{id}");
+    }
 }
 
 #[test]

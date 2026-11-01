@@ -3668,6 +3668,7 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
           const metric = [
             [21000, "ft"], [421, "kt"], [245, "deg"], [5, "m_s"], [0, "ft"], [1200.4, "m"],
             [90, "km_h"], ["x", null], ["x", "ft"], [null, "ft"], [undefined, null],
+            [-0.4, "m_s"], [-0.04, "m_s"], [359.6, "deg"], [0, "deg"],
           ].map(([v, u]) => metricText(v, u));
           const row = {
             protocol: "k",
@@ -3687,6 +3688,7 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
           const job = {id: "J", kind: "k"};
           store.event(job, {icao: "A", callsign: "QFA1"});
           const s = store.event(job, {icao: "A", callsign: null, altitude_ft: 0});
+          store.event(job, {icao: "A", callsign: "   "});
           store.event(job, {icao: "A", position: {lat: 1, lon: 2, alt_m: 100}});
           const fix = store.event(job, {icao: "A", position: {lat: 3, lon: 4, alt_m: null}});
           const proto = store.event(job, {icao: "__proto__", callsign: "P"});
@@ -3741,15 +3743,15 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
     assert f["plus"] == "+3.00", f
     assert f["text"] == "S1", f
     assert f["notFormat"] == "null", f
-    assert r["metric"] == ["6401 m", "780 km/h", "245°", "5 m/s", "0 m", "1200 m", "90 km/h",
-                           "x", "x", "", ""], r["metric"]
+    assert r["metric"] == ["6401 m", "780 km/h", "245°", "+5.0 m/s", "0 m", "1200 m", "90 km/h",
+                           "x", "x", "", "", "-0.4 m/s", "+0.0 m/s", "0°", "0°"], r["metric"]
     assert r["learned"] is True and r["again"] is False, r
     assert r["before"] is True, r  # undefined: not yet known
     assert r["noRow"] is None, r
     assert r["callsign"] == "QFA1", r  # a null never erases a value
     assert r["altitude"] == 0, r  # and 0 is a value
     assert r["nullProto"] is True, r
-    assert r["count"] == 4, r
+    assert r["count"] == 5, r
     assert r["pos"] == {"lat": 3, "lon": 4, "alt_m": 100}, r
     assert r["summary"] == "A QFA1 0", r
     assert r["label"] == "QFA1" and r["labelOfKey"] == "B", r
@@ -3759,7 +3761,7 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
     assert r["listed"] == 3 and r["lastHeard"] == "B", r
     for name in ("blank", "blanks", "absent", "nullKey", "owned", "unrowed", "lookedBlank"):
         assert r[name] is None, f"{name}: {r[name]}"
-    assert r["looked"] == 4, r  # subjectOf neither merges nor counts
+    assert r["looked"] == 5, r  # subjectOf neither merges nor counts
     assert r["held"] is True and r["heldAny"] is True and r["heldNone"] is False, r
     assert r["selectedFirst"] is None, r
     assert r["selected"] == {"job": "J", "key": "A"}, r
@@ -4118,6 +4120,7 @@ def scenario_map_draws_one_marker_per_subject(page, url, secret):
     job = map_with_subjects(page, url, secret)
     try:
         expect(page.locator("#map path.map-track")).to_have_count(2)
+        expect(page.locator("#map path.map-pos")).to_have_count(0)
         # Every line in: 7C0001's two fixes are a move and one line segment.
         page.wait_for_function(
             "(job) => window.zetaSubjects.list(job).reduce((n, s) => n + s.count, 0) === 8",
@@ -4206,7 +4209,7 @@ def scenario_a_keyed_job_with_one_subject_keeps_its_row_distance(page, url, secr
     assert r["none"] is None, r
 
 
-def scenario_track_keeps_the_last_100_fixes(page, url, secret):
+def scenario_a_subject_track_thins_at_its_cap(page, url, secret):
     select_source(page, url, secret, "tone")
     r = page.evaluate(
         """async () => {
@@ -4214,22 +4217,91 @@ def scenario_track_keeps_the_last_100_fixes(page, url, secret):
           const { SUBJECT_TRACK_POINTS, TRACK_POINTS } = await import('./map.js');
           await state.subjects.lookup(['fake_subjects']);
           const job = {id: 'stub', kind: 'fake_subjects'};
-          for (let i = 0; i < 150; i += 1) {
-            const p = {icao: 'AAAAAA', position: {lat: -27 - i / 1000, lon: 153, alt_m: null}};
+          let most = 0;
+          const fix = (lat, lon) => {
+            const p = {icao: 'AAAAAA', position: {lat, lon, alt_m: null}};
             state.subjects.event(job, p);
             state.map.event(job, p);
+          };
+          let t = null;
+          for (let i = 0; i < 150; i += 1) {
+            fix(-27 - i / 1000, 153);
+            t = state.map.tracks.get('stub\\u0000AAAAAA');
+            most = Math.max(most, t.points.length);
           }
-          const t = state.map.tracks.get('stub\\u0000AAAAAA');
-          const out = {n: t.points.length, last: t.points[t.points.length - 1],
+          const out = {most, first: t.points[0], last: t.points[t.points.length - 1],
                        job: t.job, key: t.key, cap: SUBJECT_TRACK_POINTS, unkeyed: TRACK_POINTS,
                        entries: state.map.tracks.size};
+          // An event with no fix touches no geometry.
+          const points = t.points;
+          state.subjects.event(job, {icao: 'AAAAAA', callsign: 'QFA1'});
+          state.map.event(job, {icao: 'AAAAAA', callsign: 'QFA1'});
+          out.untouched = t.points === points;
           state.subjects.drop('stub', 'AAAAAA');
           return out;
         }""")
     assert r["cap"] == 100 and r["unkeyed"] == 3600, r
-    assert r["n"] == 100, r
+    assert r["most"] <= 100, r
+    assert r["first"] == [-27, 153], r
     assert r["last"] == [-27.149, 153], r
+    assert r["untouched"] is True, r
     assert (r["job"], r["key"], r["entries"]) == ("stub", "AAAAAA", 1), r
+
+
+def scenario_track_thinning_functions(page, url, secret):
+    login(page, url, secret)
+    r = page.evaluate(
+        """async () => {
+          const { addToTrack, distanceM, drawnPoints, thinTrack } = await import('./map.js');
+          // 5000 moving fixes through a track capped at 100.
+          let kept = [];
+          let most = 0;
+          const opts = {cap: 100, minM: 0};
+          for (let i = 0; i < 5000; i += 1) {
+            kept = addToTrack(kept, {lat: i / 1000, lon: 0, alt_m: null, heading: null, n: i}, opts);
+            most = Math.max(most, kept.length);
+          }
+          const ns = kept.map((p) => p.n);
+          let tail = 1;
+          while (tail < ns.length && ns[ns.length - 1 - tail] === ns[ns.length - tail] - 1) tail += 1;
+          // A stationary subject keeps one point, and the line still ends at the latest fix.
+          let still = [];
+          const here = {lat: -27, lon: 153, alt_m: 100, heading: null};
+          for (let i = 0; i < 50; i += 1) still = addToTrack(still, {...here}, {cap: 100, minM: 500});
+          // Distance counts altitude; an unknown altitude counts for nothing.
+          const up = {lat: -27, lon: 153, alt_m: 1100, heading: null};
+          const blind = {lat: -27, lon: 153, alt_m: null, heading: null};
+          const climbed = addToTrack([here], up, {cap: 100, minM: 500}).length;
+          const unknown = addToTrack([here], blind, {cap: 100, minM: 500}).length;
+          // A turn past 10 degrees joins however near; across north counts the short way.
+          const at = (heading) => ({lat: -27, lon: 153, alt_m: null, heading});
+          const turn = (a, b) => addToTrack([at(a)], at(b), {cap: 100, minM: 500}).length;
+          const latest = {lat: -27.1, lon: 153, alt_m: 100, heading: null};
+          return {
+            most, first: ns[0], last: ns[ns.length - 1], tail, count: ns.length,
+            still: still.length,
+            metres: distanceM(here, up), blindMetres: distanceM(up, blind),
+            climbed, unknown,
+            turns: [turn(350, 5), turn(350, 1), turn(10, 20), turn(10, 21), turn(null, 90),
+                    turn(90, null)],
+            drawn: drawnPoints(still, latest),
+            drawnStill: drawnPoints(still, here),
+            thin4: thinTrack([0, 1, 2, 3]),
+            thin9: thinTrack([0, 1, 2, 3, 4, 5, 6, 7, 8]),
+          };
+        }""")
+    assert r["most"] <= 100, r
+    assert r["first"] == 0 and r["last"] == 4999, r
+    assert r["tail"] >= 50, r
+    assert r["count"] >= 50, r
+    assert r["still"] == 1, r
+    assert abs(r["metres"] - 1000) < 0.001 and r["blindMetres"] == 0, r
+    assert r["climbed"] == 2 and r["unknown"] == 1, r
+    assert r["turns"] == [2, 2, 1, 2, 1, 1], r  # 15, 11, not 10, 11; unknowns never
+    assert r["drawn"] == [[-27, 153], [-27.1, 153]], r
+    assert r["drawnStill"] == [[-27, 153]], r
+    assert r["thin4"] == [0, 2, 3], r
+    assert r["thin9"] == [0, 2, 4, 5, 6, 7, 8], r
 
 
 def scenario_table_and_map_select_each_other(page, url, secret):
@@ -4284,7 +4356,8 @@ def scenario_table_and_map_select_each_other(page, url, secret):
 
 def scenario_selected_row_scrolls_into_view(page, url, secret):
     # A short pane, so the last row starts below its fold.
-    job = map_with_subjects(page, url, secret)
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
     try:
         expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
         r = page.evaluate(
@@ -4312,8 +4385,8 @@ def scenario_map_follows_dim_and_drop(page, url, secret):
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set subject_dim_s 1")
     expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
-    run_cmd(page, "view set subject_drop_s 4")
-    expect(view_line(page, "subject_drop_s = 4")).to_be_visible()
+    run_cmd(page, "view set subject_drop_s 2")
+    expect(view_line(page, "subject_drop_s = 2")).to_be_visible()
     run_cmd(page, "view set map on")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
@@ -4324,6 +4397,142 @@ def scenario_map_follows_dim_and_drop(page, url, secret):
         expect(page.locator("#map .map-subject")).to_have_count(0, timeout=8_000)
         expect(page.locator("#map path.map-track")).to_have_count(0)
         assert page.evaluate("window.zetaSubjects.selected()") is None
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_a_dimmed_subject_relights(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    select_source(page, url, secret, "tone")
+    run_cmd(page, "view set subject_dim_s 1")
+    expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
+    run_cmd(page, "view set map on")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        expect(page.locator("#map .map-subject.dim")).to_have_count(2, timeout=10_000)
+        # Heard again: at once, not on the next tick.
+        r = page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              const job = {id, kind: 'fake_subjects'};
+              const p = {icao: '7C0001', ground_speed_kt: 400};
+              const s = state.subjects.event(job, p);
+              state.map.event(job, p);
+              const t = state.map.tracks.get(`${id}\\u0000${s.key}`);
+              return {store: s.dim, marker: t.box.classList.contains('dim')};
+            }""", job)
+        assert r == {"store": False, "marker": False}, r
+        # A longer dim time un-dims the rest on the next tick.
+        expect(page.locator("#map .map-subject.dim")).to_have_count(2, timeout=3_000)
+        run_cmd(page, "view set subject_dim_s 60")
+        expect(page.locator("#map .map-subject.dim")).to_have_count(0, timeout=3_000)
+        expect(page.locator("#subjects tr.subject.dim")).to_have_count(0)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_mark_dim_runs_from_the_tick_only(page, url, secret):
+    job = map_with_subjects(page, url, secret)
+    try:
+        r = page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              let calls = 0;
+              const real = state.map.markDim;
+              state.map.markDim = function () { calls += 1; return real.call(this); };
+              const job = {id, kind: 'fake_subjects'};
+              for (let i = 0; i < 5; i += 1) state.subjects.event(job, {icao: '7C0001'});
+              const merged = calls;
+              state.subjects.tick();
+              delete state.map.markDim;
+              return {merged, ticked: calls};
+            }""", job)
+        assert r == {"merged": 0, "ticked": 1}, r
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_selected_marker_rises(page, url, secret):
+    job = map_with_subjects(page, url, secret)
+    try:
+        r = page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              const t = state.map.tracks.get(`${id}\\u00007C0001`);
+              const before = t.marker.options.zIndexOffset;
+              state.subjects.select(id, '7C0001');
+              const on = t.marker.options.zIndexOffset;
+              state.subjects.select(id, '7C0002');
+              return {before, on, off: t.marker.options.zIndexOffset};
+            }""", job)
+        assert r["before"] == 0 and r["on"] > 0 and r["off"] == 0, r
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_subject_jobs_show_with_no_subjects_yet(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_job(url, secret, "fake_subjects", "tone", 100_000_000, 40_000)
+    try:
+        sec = page.locator(f'#subjects section.subject-job[data-job="{job}"]')
+        expect(sec.locator("h3")).to_have_text(re.compile(r"^fake_subjects tone, \d aircraft$"))
+        r = page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              const pane = state.subjectsPane;
+              const real = pane.jobs;
+              const all = real();
+              // A job the store has nothing for: its section says 0, with no table.
+              const stub = {...all.find((j) => j.id === id), id: 'stub-empty'};
+              pane.jobs = () => [...all, stub];
+              pane.render();
+              const empty = document.querySelector(
+                '#subjects section.subject-job[data-job="stub-empty"]');
+              const text = empty.querySelector('h3').textContent;
+              const tableHidden = empty.querySelector('table').hidden;
+              // A not-watched section goes after the watched ones, though listed first.
+              const watching = pane.watching;
+              pane.watching = (j) => j !== id;
+              pane.render();
+              const order = [...document.querySelectorAll('#subjects section.subject-job')]
+                .map((s) => s.dataset.job);
+              pane.watching = watching;
+              pane.jobs = real;
+              pane.render();
+              return {text, tableHidden, order};
+            }""", job)
+        assert r["text"] == "fake_subjects tone, 0 aircraft", r
+        assert r["tableHidden"] is True, r
+        assert r["order"][-1] == job and "stub-empty" in r["order"], r
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_a_chosen_sort_survives_its_section_going(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+        page.locator(f'#subjects section.subject-job[data-job="{job}"] th[data-col="count"]').click()
+        r = page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              const pane = state.subjectsPane;
+              const real = pane.jobs;
+              const all = real();
+              const listed = pane.sorts.get(id);
+              pane.jobs = () => all.map((j) => (j.id === id
+                ? {...j, state: {status: 'stopped'}} : j));
+              pane.render();
+              const gone = !document.querySelector(
+                `#subjects section.subject-job[data-job="${id}"]`);
+              pane.jobs = real;
+              pane.render();
+              return {listed, gone, after: pane.sorts.get(id)};
+            }""", job)
+        assert r["gone"] is True, r
+        assert r["listed"] == {"col": "count", "dir": 1}, r
+        assert r["after"] == r["listed"], r
     finally:
         stop_job(url, secret, job)
 
