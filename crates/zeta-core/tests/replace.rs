@@ -587,3 +587,79 @@ async fn replace_racing_a_graph_put_restart_leaves_the_job_stopped() {
     assert_eq!(s.holders, vec![b]);
     assert_eq!(s.current, Some(want));
 }
+
+fn duplicate(r: Result<OpResult, OpError>) -> (JobId, String) {
+    match r {
+        Err(OpError::Duplicate { job, message }) => (job, message),
+        other => panic!("expected a duplicate, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_identical_rigid_start_is_a_duplicate_naming_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path(), &[Radio::new(RADIO)]).await;
+    let b = band(100_000_000, 48_000);
+    let a = started(&node, start(JobKind::Passthrough, b, &[])).await;
+    let (job, message) = duplicate(node.apply(start(JobKind::Passthrough, b, &[])).await);
+    assert_eq!(job, a);
+    assert_eq!(
+        message,
+        format!(
+            "an identical passthrough already runs on radio0 at 100000000/48000 Hz as job {}",
+            a.0
+        )
+    );
+    let running = node
+        .job_list()
+        .into_iter()
+        .filter(|r| r.state == JobState::Running)
+        .count();
+    assert_eq!(running, 1);
+}
+
+#[tokio::test]
+async fn a_different_deviation_is_not_a_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = registry();
+    zeta_dsp::register_all(&mut reg);
+    let ports: Vec<Arc<dyn Port>> = vec![Radio::new(RADIO)];
+    let node = Node::open(cfg(dir.path()), reg, ports).await.unwrap();
+    let b = band(100_000_000, 200_000);
+    let fm = |dev: Option<u64>| Op::JobStart {
+        kind: JobKind::FmDemod,
+        source: SourceId(RADIO.into()),
+        center_hz: b.center_hz,
+        bandwidth_hz: b.bandwidth_hz,
+        deviation_hz: dev,
+        sideband: None,
+        elastic: false,
+        replace: vec![],
+    };
+    let a = started(&node, fm(None)).await;
+    let second = started(&node, fm(Some(2500))).await;
+    assert_ne!(a, second);
+    let (job, _) = duplicate(node.apply(fm(Some(5000))).await);
+    assert_eq!(job, a);
+}
+
+#[tokio::test]
+async fn an_elastic_start_is_never_a_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path(), &[Radio::new(RADIO)]).await;
+    let b = band(100_000_000, 48_000);
+    let a = started(&node, start_on(RADIO, JobKind::Spectrum, b, true, &[])).await;
+    let c = started(&node, start_on(RADIO, JobKind::Spectrum, b, true, &[])).await;
+    assert_ne!(a, c);
+}
+
+#[tokio::test]
+async fn a_stopped_identical_job_is_not_a_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path(), &[Radio::new(RADIO)]).await;
+    let b = band(100_000_000, 48_000);
+    let a = started(&node, start(JobKind::Passthrough, b, &[])).await;
+    node.apply(Op::JobStop { job: a.clone() }).await.unwrap();
+    let c = started(&node, start(JobKind::Passthrough, b, &[])).await;
+    assert_ne!(a, c);
+}

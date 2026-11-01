@@ -96,6 +96,15 @@ fn schema_prints_json_with_op_result_error() {
     ] {
         assert!(kinds.contains(&k), "stages missing {k}: {kinds:?}");
     }
+    let errors = v["value"]["error"]["oneOf"]
+        .as_array()
+        .expect("error oneOf");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e["properties"]["error"]["const"] == "duplicate"),
+        "error schema lacks duplicate: {errors:?}"
+    );
 }
 
 #[test]

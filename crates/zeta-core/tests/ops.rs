@@ -405,7 +405,7 @@ impl zeta_core::stage::Stage for IdleStage {
 }
 
 #[tokio::test]
-async fn job_start_reexpands_when_lease_rate_differs() {
+async fn job_start_holds_the_gate_through_its_tune_and_lease() {
     let dir = tempfile::tempdir().unwrap();
     let port = Arc::new(WidePort::slow("hackrf0"));
     let mut reg = registry();
@@ -434,8 +434,10 @@ async fn job_start_reexpands_when_lease_rate_differs() {
         elastic: false,
         replace: vec![],
     };
-    // B: 2 MHz around A's band, leased while A's slow pre-tune holds the gate,
-    // so B's lease is queued ahead of A's and A's lease shares B's 2 MS/s capture.
+    // B: 2 MHz around A's band, asked while A's slow tune is under way. A holds the
+    // source's gate from its tune through its lease, so B waits behind A (it cannot
+    // slip in between and change the capture A's graph was expanded for) and then
+    // conflicts with A's narrow lease.
     let wide = Tuning {
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(2_000_000),
@@ -455,16 +457,21 @@ async fn job_start_reexpands_when_lease_rate_differs() {
         Ok(OpResult::Job(id)) => id,
         other => panic!("expected Job, got {other:?}"),
     };
-    b.unwrap();
-    assert_eq!(port.current(), Some(wide));
+    assert!(
+        matches!(b, Err(zeta_core::node::NodeError::Lease(_))),
+        "{b:?}"
+    );
+    let narrow = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    assert_eq!(port.current(), Some(narrow));
     let rec = node.job_list().into_iter().find(|r| r.id == a).unwrap();
     assert_eq!(rec.state, JobState::Running);
+    // Expanded for the narrow capture and never relaunched.
     let out = rec.graph.nodes[0].params["out_rate_hz"].as_u64().unwrap();
-    assert_eq!(out, 50_000);
-    assert_eq!(2_000_000 % out, 0);
-    assert_eq!(rec.graph.nodes[1].params["audio_rate_hz"], 48_000);
-    // Relaunched under the same id: no stray stopped record.
-    assert_eq!(node.job_list().len(), 2);
+    assert!(out <= 12_500, "{out}");
+    assert_eq!(node.job_list().len(), 1);
 }
 
 fn variants(op: &Value) -> &Vec<Value> {

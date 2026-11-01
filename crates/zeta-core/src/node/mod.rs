@@ -25,7 +25,7 @@ use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
 use crate::modes::ModeRegistry;
-use crate::ops::{JobKind, Op, OpError, OpResult};
+use crate::ops::{JobKind, Op, OpError, OpResult, Sideband};
 use crate::port::{GainInfo, Port, PortError, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Backend, StageRegistry};
@@ -1171,6 +1171,47 @@ impl Node {
             true => None,
             false => Some(self.inner.leases.gate_guard(source).await),
         }
+    }
+
+    /// Hold `source`'s gate until the guard drops; see [`LeaseManager::gate_guard`].
+    pub(crate) async fn gate_guard(&self, source: &SourceId) -> OwnedMutexGuard<()> {
+        self.inner.leases.gate_guard(source).await
+    }
+
+    /// The first running, rigid, non-attached job on `source` that a start of
+    /// `kind` at `tuning` with `deviation_hz` and `sideband` would repeat: the
+    /// same kind string and tuning, and the same start params once both sides
+    /// are read as the kind's defaults (`fm_demod` 5000 Hz, `wfm_demod` 75000 Hz,
+    /// `ssb_demod` usb; other kinds have none). A kind the node does not expand
+    /// has no such job.
+    pub(crate) fn duplicate_of(
+        &self,
+        source: &SourceId,
+        kind: &str,
+        tuning: Tuning,
+        deviation_hz: Option<u64>,
+        sideband: Option<Sideband>,
+    ) -> Option<JobId> {
+        let k = self.expandable_kind(kind)?;
+        let norm = |(d, s): (Option<u64>, Option<Sideband>)| match k {
+            JobKind::FmDemod => (Some(d.unwrap_or(5000)), None),
+            JobKind::WfmDemod => (Some(d.unwrap_or(75000)), None),
+            JobKind::SsbDemod => (None, Some(s.unwrap_or(Sideband::Usb))),
+            _ => (None, None),
+        };
+        let want = norm((deviation_hz, sideband));
+        self.job_list()
+            .into_iter()
+            .find(|r| {
+                r.state == JobState::Running
+                    && !r.elastic
+                    && r.input.is_none()
+                    && &r.source == source
+                    && r.kind == kind
+                    && r.tuning == tuning
+                    && norm(k.start_params(&r.graph)) == want
+            })
+            .map(|r| r.id)
     }
 
     /// Stop the jobs `replace` names, under `source`'s gate (`guard`), so the

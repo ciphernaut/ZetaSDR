@@ -665,6 +665,16 @@ impl JobKind {
         )
     }
 
+    /// The `deviation_hz` and `sideband` a graph was expanded with, read back from
+    /// its demodulator nodes (`None` for each the graph has no node for).
+    pub fn start_params(&self, graph: &Graph) -> (Option<u64>, Option<Sideband>) {
+        let param = |key: &str| graph.nodes.iter().find_map(|n| n.params.get(key).cloned());
+        (
+            param("deviation_hz").and_then(|v| v.as_u64()),
+            param("sideband").and_then(|v| serde_json::from_value(v).ok()),
+        )
+    }
+
     /// [`JobKind::reexpand`] carrying only the params named in `carried` (a retune
     /// passes [`RETUNE_CARRIED_PARAMS`]); the rest take the values `expand` derives.
     /// `deviation_hz` and `sideband` are read back from `stored` whatever `carried` says.
@@ -679,9 +689,8 @@ impl JobKind {
         modes: &ModeRegistry,
         carried: &[&str],
     ) -> Result<Graph, OpError> {
-        let param = |key: &str| stored.nodes.iter().find_map(|n| n.params.get(key).cloned());
-        let deviation_hz = param("deviation_hz").and_then(|v| v.as_u64()).map(Hz);
-        let sideband = param("sideband").and_then(|v| serde_json::from_value(v).ok());
+        let (deviation_hz, sideband) = self.start_params(stored);
+        let deviation_hz = deviation_hz.map(Hz);
         let mut g = self.expand(
             source,
             tuning,
@@ -1827,6 +1836,12 @@ pub enum OpError {
     Other {
         message: String,
     },
+    /// A rigid start identical to the running job `job` (same source, kind, band,
+    /// `deviation_hz` and `sideband`): stop it or use it.
+    Duplicate {
+        job: JobId,
+        message: String,
+    },
 }
 
 impl OpError {
@@ -1839,6 +1854,7 @@ impl OpError {
             OpError::Ring { .. } => "ring",
             OpError::Graph { .. } => "graph",
             OpError::Other { .. } => "other",
+            OpError::Duplicate { .. } => "duplicate",
         }
     }
 
@@ -1892,7 +1908,7 @@ impl std::fmt::Display for OpError {
             }
             OpError::Ring { detail } => write!(f, "{detail}"),
             OpError::Graph { detail } => write!(f, "{detail}"),
-            OpError::Other { message } => f.write_str(message),
+            OpError::Other { message } | OpError::Duplicate { message, .. } => f.write_str(message),
         }
     }
 }
@@ -2370,12 +2386,40 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             let port = checked_port(node, &source, &tuning)?;
             // With `replace`, one hold of the source's gate covers stopping the named
             // holders, the tune and the new job's lease: nothing takes the radio in
-            // between. Without it each step takes the gate itself.
-            let guard = node.gate_for_replace(&source, &replace).await;
+            // between. The gate is taken always: the duplicate check below must not
+            // race a start of the same job.
+            let guard = Some(node.gate_guard(&source).await);
             if let Err(e) = replace_under(node, &source, &replace, guard.as_ref()).await {
                 drop(guard);
                 idle_after_replace(node, port.as_ref(), &replace, &e).await;
                 return Err(node_error(node, e));
+            }
+            // An identical rigid job already runs (after `replace` stopped what it
+            // named): refuse, naming it, before anything is tuned.
+            if !elastic
+                && let Some(job) = node.duplicate_of(
+                    &source,
+                    kind.name(),
+                    tuning,
+                    deviation.map(|d| d.0),
+                    sideband,
+                )
+            {
+                drop(guard);
+                if !replace.is_empty() {
+                    node.idle_if_unheld(port.as_ref()).await;
+                }
+                return Err(OpError::Duplicate {
+                    message: format!(
+                        "an identical {} already runs on {} at {}/{} Hz as job {}",
+                        kind.name(),
+                        source.0,
+                        tuning.center_hz.0,
+                        tuning.bandwidth_hz.0,
+                        job.0
+                    ),
+                    job,
+                });
             }
             // The granted capture band: its width is the source rate (Port contract).
             // An elastic job never tunes here: it joins the current capture (or tunes
