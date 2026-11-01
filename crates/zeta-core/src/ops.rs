@@ -177,6 +177,57 @@ pub enum Op {
         bandwidth_hz: Hz,
         replace: Vec<JobId>,
     },
+    /// Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on
+    /// the channels numbered in `channels`, each at its channel's `center_hz` with the
+    /// plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's
+    /// gate, in this order: everything is checked first (an unknown `plan` or channel is
+    /// `unknown`, a channel listed twice, a kind that does not run per channel —
+    /// `spectrum`, `scan`, `watch`, `identify`, an attachable kind — and a non-attachable
+    /// `attach` are `other`; nothing has happened yet); a channel where an identical
+    /// rigid job already runs is `existing` and skipped; with `attach`, its stage must be
+    /// ready, else the op is refused with the stage's reason; the `replace` jobs are
+    /// stopped; then one lease decision for the band bounding the channels to start
+    /// (lowest channel edge to highest), checked as a rigid `job_start` of that band
+    /// would be: inside the capture no tune, outside it a tune when only elastic jobs
+    /// hold the source, else a `conflict` naming the holders and nothing starts; a band
+    /// wider than the source is `out_of_range` on `bandwidth_hz`. Each channel is then
+    /// started in channel-number order inside that capture: one that fails is listed
+    /// under `refused` with its error and the rest go on. With `attach`, each started
+    /// job (and each `existing` one without one) gets one attached; a failure is that
+    /// channel's `attach_error`, the job kept. The result: `capture`, `started`
+    /// (`channel`, `center_hz`, `job`, `attached`, `attach_error`), `existing`
+    /// (`channel`, `center_hz`, `job`, `attached`), `refused` (`channel`, `center_hz`,
+    /// `error`) and `warnings` (strings to repeat to the operator; empty when there is
+    /// nothing to say). The jobs are ordinary jobs; running the same request twice
+    /// starts only what is missing.
+    PlanStart {
+        /// A plan id from `channel_plans`.
+        plan: String,
+        /// Channel numbers of the plan; `null` for every channel.
+        #[serde(deserialize_with = "nullable_u32_list")]
+        #[schemars(required, schema_with = "nullable_channels_schema")]
+        channels: Option<Vec<u32>>,
+        kind: JobKind,
+        source: SourceId,
+        /// As on `job_start`, passed to every start.
+        #[serde(deserialize_with = "nullable_u64")]
+        #[schemars(required, schema_with = "nullable_hz_u64")]
+        deviation_hz: Option<u64>,
+        /// As on `job_start`, passed to every start.
+        #[serde(deserialize_with = "nullable_sideband")]
+        #[schemars(required, schema_with = "nullable_sideband_schema")]
+        sideband: Option<Sideband>,
+        /// An attachable kind (`transcribe`) to attach to every started job; `null` for none.
+        #[serde(deserialize_with = "nullable_kind")]
+        #[schemars(required, schema_with = "nullable_attach_schema")]
+        attach: Option<JobKind>,
+        /// `job_attach`'s language, `null` for `en`; must be `null` when `attach` is.
+        #[serde(deserialize_with = "nullable_string_value")]
+        #[schemars(required, schema_with = "nullable_language")]
+        language: Option<String>,
+        /// As on `job_start`: rigid holders of `source` that may be stopped to make room.
+        replace: Vec<JobId>,
+    },
     JobList {},
     JobStop {
         job: JobId,
@@ -276,6 +327,41 @@ fn nullable_sideband_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sche
         "type": ["string", "null"],
         "enum": ["usb", "lsb", null],
         "description": "Sideband for `ssb_demod`: `usb` or `lsb`; `null` is `usb`. Any other kind must pass `null`."
+    })
+}
+
+/// Deserialize a required `Option<Vec<u32>>` (see [`nullable_u64`]).
+fn nullable_u32_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<u32>>, D::Error> {
+    <Option<Vec<u32>> as Deserialize>::deserialize(d)
+}
+
+/// Schema of `plan_start`'s `channels`: `["array","null"]` of channel numbers.
+fn nullable_channels_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["array", "null"],
+        "items": {"type": "integer", "format": "uint32", "minimum": 0},
+        "description": "Channel numbers of the plan; `null` for every channel."
+    })
+}
+
+/// Deserialize a required `Option<JobKind>` (see [`nullable_u64`]).
+fn nullable_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<JobKind>, D::Error> {
+    <Option<JobKind> as Deserialize>::deserialize(d)
+}
+
+/// Schema of `plan_start`'s `attach`: `["string","null"]`, enum the attachable kinds
+/// or `null`.
+fn nullable_attach_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let mut kinds: Vec<serde_json::Value> = BUILTIN_KINDS
+        .iter()
+        .filter(|k| k.attachable())
+        .map(|k| k.name().into())
+        .collect();
+    kinds.push(serde_json::Value::Null);
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "enum": kinds,
+        "description": "An attachable kind (`transcribe`) to attach to every started job; `null` for none."
     })
 }
 
@@ -1382,6 +1468,53 @@ fn require_worker(schema: &mut schemars::Schema) {
     }
 }
 
+/// A channel `plan_start` started: its job and, with `attach`, the attached job or why
+/// none could be attached.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PlanStarted {
+    pub channel: u32,
+    pub center_hz: Hz,
+    pub job: JobId,
+    /// The job attached to `job`; `null` without `attach` or when it failed.
+    #[schemars(required, schema_with = "crate::types::nullable::<JobId>")]
+    pub attached: Option<JobId>,
+    /// Why the attach failed (the job is kept); `null` otherwise.
+    #[schemars(required, schema_with = "nullable_op_error")]
+    pub attach_error: Option<OpError>,
+}
+
+/// Schema of `plan_start`'s `attach_error`: an [`OpError`] or `null`. (An `OpError`
+/// schema has no `type` to add `null` to, so this is an `anyOf`.)
+fn nullable_op_error(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let error = g.subschema_for::<OpError>();
+    schemars::json_schema!({ "anyOf": [error, { "type": "null" }] })
+}
+
+/// A channel `plan_start` skipped because an identical rigid job already runs there.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PlanExisting {
+    pub channel: u32,
+    pub center_hz: Hz,
+    pub job: JobId,
+    /// The running job of the `attach` kind reading `job`; `null` for none.
+    #[schemars(required, schema_with = "crate::types::nullable::<JobId>")]
+    pub attached: Option<JobId>,
+}
+
+/// A channel `plan_start` could not start, with the start's error.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PlanRefused {
+    pub channel: u32,
+    pub center_hz: Hz,
+    pub error: OpError,
+}
+
 /// A source of `source_free` that covers the band but cannot take it now, with why.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1649,6 +1782,17 @@ pub enum OpResult {
     },
     /// A source's gain after `source_set_gain`.
     Gain(GainInfo),
+    /// `plan_start`: the capture the channels run in, what started, what already ran,
+    /// what was refused, and warnings to repeat to the operator.
+    PlanStart {
+        plan: String,
+        source: SourceId,
+        capture: Tuning,
+        started: Vec<PlanStarted>,
+        existing: Vec<PlanExisting>,
+        refused: Vec<PlanRefused>,
+        warnings: Vec<String>,
+    },
     Ok,
     Schema(serde_json::Value),
 }
@@ -1666,6 +1810,7 @@ impl Op {
             Op::JobStart { .. } => "job_start",
             Op::JobAttach { .. } => "job_attach",
             Op::JobRetune { .. } => "job_retune",
+            Op::PlanStart { .. } => "plan_start",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
             Op::JobContext { .. } => "job_context",
@@ -1750,6 +1895,7 @@ impl OpResult {
             OpResult::Mode { .. } => "mode",
             OpResult::Classification { .. } => "classification",
             OpResult::Gain(_) => "gain",
+            OpResult::PlanStart { .. } => "plan_start",
             OpResult::Ok => "ok",
             OpResult::Schema(_) => "schema",
         }
@@ -2175,6 +2321,32 @@ async fn reconcile_rate(
     Ok(())
 }
 
+/// `job_start`'s checks of `sideband` (only `ssb_demod` takes one) and `deviation_hz`
+/// (only `fm_demod` and `wfm_demod`, within 100..=75000 Hz); the deviation as `Hz`.
+fn check_start_params(
+    kind: &JobKind,
+    deviation_hz: Option<u64>,
+    sideband: Option<Sideband>,
+) -> Result<Option<Hz>, OpError> {
+    if sideband.is_some() && *kind != JobKind::SsbDemod {
+        return Err(other(format!(
+            "sideband applies only to kind ssb_demod; pass null (kind is {})",
+            kind.name()
+        )));
+    }
+    match deviation_hz {
+        None => Ok(None),
+        Some(_) if !matches!(kind, JobKind::FmDemod | JobKind::WfmDemod) => Err(other(format!(
+            "deviation_hz applies only to kinds fm_demod and wfm_demod; pass null (kind is {})",
+            kind.name()
+        ))),
+        Some(d) => {
+            range("deviation_hz", d, FM_DEVIATION_MIN_HZ, FM_DEVIATION_MAX_HZ)?;
+            Ok(Some(Hz(d)))
+        }
+    }
+}
+
 /// Stop the `replace` holders under `guard` (see [`Node::replace_holders`]);
 /// nothing to do without a guard, which [`Node::gate_for_replace`] gives only
 /// when `replace` names jobs.
@@ -2324,29 +2496,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                     message: format!("{} cannot be elastic", kind.name()),
                 });
             }
-            if sideband.is_some() && kind != JobKind::SsbDemod {
-                return Err(OpError::Other {
-                    message: format!(
-                        "sideband applies only to kind ssb_demod; pass null (kind is {})",
-                        kind.name()
-                    ),
-                });
-            }
-            let deviation = match deviation_hz {
-                None => None,
-                Some(_) if !matches!(kind, JobKind::FmDemod | JobKind::WfmDemod) => {
-                    return Err(OpError::Other {
-                        message: format!(
-                            "deviation_hz applies only to kinds fm_demod and wfm_demod; pass null (kind is {})",
-                            kind.name()
-                        ),
-                    });
-                }
-                Some(d) => {
-                    range("deviation_hz", d, FM_DEVIATION_MIN_HZ, FM_DEVIATION_MAX_HZ)?;
-                    Some(Hz(d))
-                }
-            };
+            let deviation = check_start_params(&kind, deviation_hz, sideband)?;
             // An unknown or unready mode is refused before anything is tuned.
             kind.mode_row(&node.modes())?;
             let tuning = Tuning {
@@ -2519,6 +2669,29 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             bandwidth_hz,
             replace,
         } => job_retune(node, job, center_hz, bandwidth_hz, replace).await,
+        Op::PlanStart {
+            plan,
+            channels,
+            kind,
+            source,
+            deviation_hz,
+            sideband,
+            attach,
+            language,
+            replace,
+        } => {
+            plan_start(
+                node,
+                plan,
+                channels,
+                kind,
+                source,
+                (deviation_hz, sideband),
+                (attach, language),
+                replace,
+            )
+            .await
+        }
         Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),
         Op::JobStop { job } => node
             .job_stop(&job)
@@ -2613,9 +2786,9 @@ async fn job_attach(
             "language {language:?} is not a BCP-47 code such as en, de or pt-BR; pass null for en"
         )));
     }
-    let Some(input) = node.job_list().into_iter().find(|r| r.id == job) else {
+    if !node.job_list().iter().any(|r| r.id == job) {
         return Err(unknown_job(node, &job));
-    };
+    }
     if let Some(r) = node.stage_readiness(kind.name())
         && !r.ready
     {
@@ -2625,18 +2798,318 @@ async fn job_attach(
             r.reason.unwrap_or_else(|| "not ready".into())
         )));
     }
-    let stream = node
-        .job_audio_stream(&job)
-        .map_err(|e| node_error(node, e))?;
-    let graph = kind.expand_attached(
-        &job,
-        &stream,
-        &language,
-        JobKind::graph_denoises(&input.graph),
-    )?;
-    node.job_attach(kind.name(), &job, graph)
+    attach_one(node, &kind, &job, &language)
         .await
         .map(OpResult::Job)
+}
+
+/// The load warning `plan_start` gives when more jobs of the attached `kind` run than
+/// its stage has slots (`capacity`).
+fn load_warning(n: usize, kind: &JobKind, capacity: u32) -> String {
+    let stage = match kind {
+        JobKind::Transcribe => "speech backend".to_string(),
+        k => format!("{} stage", k.name()),
+    };
+    format!(
+        "{n} {} jobs share the {stage}'s {capacity} slots: with the squelch on most channels are silent, so the slots are rarely contested; a busy daemon drops utterances with reason busy",
+        kind.name()
+    )
+}
+
+/// `plan_start`: validate, find the channels already running, preflight the attached
+/// stage, stop `replace`, take one lease decision for the band bounding the channels to
+/// start, start each in channel-number order under the same hold of the source's gate,
+/// then attach to the started jobs (and to the existing ones without one).
+#[allow(clippy::too_many_arguments)]
+async fn plan_start(
+    node: &Node,
+    plan: String,
+    channels: Option<Vec<u32>>,
+    kind: JobKind,
+    source: SourceId,
+    (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
+    (attach, language): (Option<JobKind>, Option<String>),
+    replace: Vec<JobId>,
+) -> Result<OpResult, OpError> {
+    // 1. Validate: nothing has happened yet.
+    let Some(p) = crate::plans::plan(&plan) else {
+        return Err(OpError::Unknown {
+            field: "plan".into(),
+            value: plan,
+            known: crate::plans::PLANS.iter().map(|p| p.id.into()).collect(),
+        });
+    };
+    let all = crate::plans::channels(p);
+    let mut known: Vec<u32> = all.iter().map(|&(n, _)| n).collect();
+    known.sort_unstable();
+    let numbers: Vec<u32> = match channels {
+        None => known,
+        Some(listed) => {
+            let mut seen = Vec::with_capacity(listed.len());
+            for n in listed {
+                if !known.contains(&n) {
+                    return Err(OpError::Unknown {
+                        field: "channels".into(),
+                        value: n.to_string(),
+                        known: known.iter().map(u32::to_string).collect(),
+                    });
+                }
+                if seen.contains(&n) {
+                    return Err(other(format!("channels: {n} is listed twice")));
+                }
+                seen.push(n);
+            }
+            seen.sort_unstable();
+            seen
+        }
+    };
+    if kind.attachable()
+        || matches!(
+            kind,
+            JobKind::Spectrum | JobKind::Scan | JobKind::Watch | JobKind::Identify
+        )
+    {
+        return Err(other(format!(
+            "{} cannot be started per channel",
+            kind.name()
+        )));
+    }
+    let deviation = check_start_params(&kind, deviation_hz, sideband)?;
+    if let Some(a) = &attach
+        && !a.attachable()
+    {
+        return Err(other(format!("{} is not attachable", a.name())));
+    }
+    if language.is_some() && attach.is_none() {
+        return Err(other("language needs attach"));
+    }
+    let language = language.unwrap_or_else(|| ATTACH_LANGUAGE_DEFAULT.into());
+    if !is_bcp47(&language) {
+        return Err(other(format!(
+            "language {language:?} is not a BCP-47 code such as en, de or pt-BR; pass null for en"
+        )));
+    }
+    kind.mode_row(&node.modes())?;
+    let port = node
+        .port(&source)
+        .ok_or_else(|| unknown_source(node, &source))?;
+    let channel_band = |n: u32| Tuning {
+        center_hz: Hz(all.iter().find(|&&(m, _)| m == n).map_or(0, |&(_, hz)| hz)),
+        bandwidth_hz: Hz(p.bandwidth_hz),
+    };
+
+    // One hold of the source's gate covers every step that follows up to the last
+    // start: no other caller's tune slips between the lease decision and the starts.
+    let guard = node.gate_guard(&source).await;
+    // 2. The channels an identical rigid job already runs on (one that `replace` names
+    // is about to stop, so its channel is started again).
+    let mut existing = Vec::new();
+    let mut to_start = Vec::new();
+    for &n in &numbers {
+        let band = channel_band(n);
+        let dup = node
+            .duplicate_of(&source, kind.name(), band, deviation.map(|d| d.0), sideband)
+            .filter(|j| !replace.contains(j));
+        match dup {
+            Some(job) => existing.push(PlanExisting {
+                channel: n,
+                center_hz: band.center_hz,
+                attached: attach.as_ref().and_then(|a| attached_to(node, &job, a)),
+                job,
+            }),
+            None => to_start.push(n),
+        }
+    }
+    // 3. The attached stage must be ready: refused, with nothing done, otherwise.
+    let readiness = attach.as_ref().and_then(|a| node.stage_readiness(a.name()));
+    if let (Some(a), Some(r)) = (&attach, &readiness)
+        && !r.ready
+    {
+        return Err(other(format!(
+            "{}: {}; start without attach",
+            a.name(),
+            r.reason.as_deref().unwrap_or("not ready")
+        )));
+    }
+    // The bounding band against the source's ranges before anything is stopped: its
+    // width is the corrective `out_of_range`.
+    let bounding = crate::plans::bounding(p, &to_start);
+    if !to_start.is_empty() {
+        checked_port(node, &source, &bounding)?;
+    }
+    // 4. Replacements, under the gate.
+    if let Err(e) = node.replace_holders(&source, &replace, &guard).await {
+        drop(guard);
+        idle_after_replace(node, port.as_ref(), &replace, &e).await;
+        return Err(node_error(node, e));
+    }
+    let mut started = Vec::new();
+    let mut refused = Vec::new();
+    let capture = if to_start.is_empty() {
+        drop(guard);
+        if !replace.is_empty() {
+            node.idle_if_unheld(port.as_ref()).await;
+        }
+        port.current()
+            .unwrap_or_else(|| crate::plans::bounding(p, &numbers))
+    } else {
+        // 5. One lease decision for the bounding band, taken as a rigid start of it
+        // would be. The lease is held only until the channels hold theirs inside its
+        // capture: a rigid lease on a source no rigid job holds would retune it to that
+        // one channel.
+        let (hold, granted, tuned) = match node.hold_band(port.as_ref(), bounding, &guard).await {
+            Ok(t) => t,
+            Err(e) => {
+                drop(guard);
+                // A tune the port refused reads as the source's failure, as
+                // `job_start` words it (a conflict stays a conflict).
+                let e = match e {
+                    LeaseError::Port(p) => NodeError::SourcePort(source.clone(), p),
+                    e => NodeError::Lease(e),
+                };
+                idle_after_replace(node, port.as_ref(), &replace, &e).await;
+                return Err(node_error(node, e));
+            }
+        };
+        // 6. Each channel inside the capture, in channel-number order; a start that
+        // fails is that channel's refusal and the rest go on.
+        let bin_rate = node.bank_bin_rate(&source, granted);
+        let modes = node.modes();
+        // The tune above moved the capture: the elastic jobs follow once the gate goes.
+        let mut after = match tuned {
+            true => AfterGate::Relaunch {
+                source: source.clone(),
+                except: None,
+            },
+            false => AfterGate::Nothing,
+        };
+        for n in to_start {
+            let tuning = channel_band(n);
+            let r = match kind.expand(
+                &source,
+                tuning,
+                granted.bandwidth_hz,
+                bin_rate,
+                deviation,
+                sideband,
+                &modes,
+            ) {
+                Ok(graph) => {
+                    let (r, a) = node
+                        .job_start_gated(
+                            kind.name(),
+                            source.clone(),
+                            tuning,
+                            graph,
+                            Some(granted.bandwidth_hz),
+                            false,
+                            Some(&guard),
+                        )
+                        .await;
+                    after = match (after, a) {
+                        (AfterGate::Nothing, a) => a,
+                        (merged, AfterGate::Nothing) => merged,
+                        _ => AfterGate::Relaunch {
+                            source: source.clone(),
+                            except: None,
+                        },
+                    };
+                    r.map_err(|e| node_error(node, e))
+                }
+                Err(e) => Err(e),
+            };
+            match r {
+                Ok(job) => started.push(PlanStarted {
+                    channel: n,
+                    center_hz: tuning.center_hz,
+                    job,
+                    attached: None,
+                    attach_error: None,
+                }),
+                Err(error) => refused.push(PlanRefused {
+                    channel: n,
+                    center_hz: tuning.center_hz,
+                    error,
+                }),
+            }
+        }
+        node.release_hold(&hold);
+        drop(guard);
+        node.after_gate(after).await;
+        if started.is_empty() && !replace.is_empty() {
+            node.idle_if_unheld(port.as_ref()).await;
+        }
+        granted
+    };
+    // 7. Attach to every started job, and to each existing one without one; the
+    // attach needs no gate (an attached job holds no lease).
+    let mut warnings = Vec::new();
+    if let Some(a) = &attach {
+        for s in &mut started {
+            match attach_one(node, a, &s.job, &language).await {
+                Ok(id) => s.attached = Some(id),
+                Err(e) => s.attach_error = Some(e),
+            }
+        }
+        // An existing entry has no error field: one that cannot be attached stays
+        // without, and a second run tries again.
+        for e in existing.iter_mut().filter(|e| e.attached.is_none()) {
+            e.attached = attach_one(node, a, &e.job, &language).await.ok();
+        }
+        if let Some(c) = readiness.and_then(|r| r.capacity) {
+            let n = node
+                .job_list()
+                .into_iter()
+                .filter(|r| r.state == JobState::Running && r.kind == a.name())
+                .count();
+            if n > c as usize {
+                warnings.push(load_warning(n, a, c));
+            }
+        }
+    }
+    Ok(OpResult::PlanStart {
+        plan,
+        source,
+        capture,
+        started,
+        existing,
+        refused,
+        warnings,
+    })
+}
+
+/// The running job of `kind` attached to `job`, if any.
+fn attached_to(node: &Node, job: &JobId, kind: &JobKind) -> Option<JobId> {
+    node.job_list()
+        .into_iter()
+        .find(|r| {
+            r.state == JobState::Running && r.input.as_ref() == Some(job) && r.kind == kind.name()
+        })
+        .map(|r| r.id)
+}
+
+/// `job_attach`'s tail: attach a job of `kind` to `job`'s audio stream, the
+/// language and kind already checked.
+async fn attach_one(
+    node: &Node,
+    kind: &JobKind,
+    job: &JobId,
+    language: &str,
+) -> Result<JobId, OpError> {
+    let Some(input) = node.job_list().into_iter().find(|r| &r.id == job) else {
+        return Err(unknown_job(node, job));
+    };
+    let stream = node
+        .job_audio_stream(job)
+        .map_err(|e| node_error(node, e))?;
+    let graph = kind.expand_attached(
+        job,
+        &stream,
+        language,
+        JobKind::graph_denoises(&input.graph),
+    )?;
+    node.job_attach(kind.name(), job, graph)
+        .await
         .map_err(|e| node_error(node, e))
 }
 

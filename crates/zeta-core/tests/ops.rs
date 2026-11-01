@@ -485,7 +485,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 23, "one schema per Op variant");
+    assert_eq!(vs.len(), 24, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -634,7 +634,9 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                         // Counts of stream restarts and read timeouts, not times.
                         && !["restarts", "timeouts"].contains(&name.as_str())
                         // A mode row's `time` names the event field holding a time.
-                        && !(name == "time" && path.ends_with(".ModeRow"));
+                        && !(name == "time" && path.ends_with(".ModeRow"))
+                        // `plan_start`'s `started` lists the channels it started.
+                        && name != "started";
                     // `_ns` is an instant; `_ms` a duration (a timeout), plain integer.
                     assert!(
                         !time || name.ends_with("_ns") || name.ends_with("_ms"),

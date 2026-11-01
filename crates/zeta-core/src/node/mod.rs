@@ -1534,6 +1534,37 @@ impl Node {
         tuned
     }
 
+    /// Lease `want` on `port` as a rigid request under the source's gate the caller
+    /// holds, for a holder that is no job (a fresh id, returned): granted, tuned or a
+    /// conflict exactly as a rigid `job_start` of `want` would be (see
+    /// [`LeaseManager::ensure_locked`]), so the jobs leased inside it afterwards join its
+    /// capture untuned. Release it with [`Node::release_hold`] before the gate goes;
+    /// meanwhile `source_list` may list it among the holders. Also whether it tuned the
+    /// port: the caller then relaunches the elastic jobs ([`Node::after_gate`]).
+    pub(crate) async fn hold_band(
+        &self,
+        port: &dyn Port,
+        want: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(JobId, Tuning, bool), LeaseError> {
+        let holder = JobId::new();
+        let held = self
+            .inner
+            .leases
+            .ensure_locked(port, holder.clone(), want, false, guard)
+            .await;
+        // A tune the faulted port refused: the node has seen the fault.
+        if let Err(LeaseError::Port(_)) = &held {
+            self.inner.note_fault_if_faulted(port.id());
+        }
+        held.map(|(t, tuned)| (holder, t, tuned))
+    }
+
+    /// Drop the lease [`Node::hold_band`] took.
+    pub(crate) fn release_hold(&self, holder: &JobId) {
+        self.inner.leases.release(holder);
+    }
+
     /// Relaunch every running elastic job on `source` on its current capture; see
     /// [`Inner::relaunch_elastic`].
     pub(crate) async fn relaunch_elastic(&self, source: &SourceId) {

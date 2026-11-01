@@ -2,6 +2,9 @@
 //! the `channel_plans` op so the page, the CLI and the agent share one set of
 //! numbers. A plan is one [`ChannelPlan`] constant and one entry in [`PLANS`].
 
+use crate::port::Tuning;
+use crate::types::Hz;
+
 /// A run of `count` channels numbered from `first`, `step_hz` apart from `first_hz`.
 pub struct Segment {
     pub first: u32,
@@ -64,6 +67,35 @@ pub const UHF_CB_AU: ChannelPlan = ChannelPlan {
 /// Every plan the node knows; a frequency on two plans takes the first.
 pub const PLANS: &[ChannelPlan] = &[UHF_CB_AU];
 
+/// The plan in [`PLANS`] with this `id`.
+pub fn plan(id: &str) -> Option<&'static ChannelPlan> {
+    PLANS.iter().find(|p| p.id == id)
+}
+
+/// The band bounding the channels `numbers` of `plan`: from the lowest channel's
+/// lower edge to the highest's upper edge, each channel being its centre ±
+/// `bandwidth_hz / 2`. Numbers the plan lacks are ignored; none at all is a
+/// zero-width band at 0 Hz.
+pub fn bounding(plan: &ChannelPlan, numbers: &[u32]) -> Tuning {
+    let half = plan.bandwidth_hz / 2;
+    let centres: Vec<u64> = channels(plan)
+        .into_iter()
+        .filter(|(n, _)| numbers.contains(n))
+        .map(|(_, hz)| hz)
+        .collect();
+    let (Some(lo), Some(hi)) = (centres.iter().min(), centres.iter().max()) else {
+        return Tuning {
+            center_hz: Hz(0),
+            bandwidth_hz: Hz(0),
+        };
+    };
+    let (lo, hi) = (lo - half, hi + half);
+    Tuning {
+        center_hz: Hz(lo + (hi - lo) / 2),
+        bandwidth_hz: Hz(hi - lo),
+    }
+}
+
 /// The plan's `(number, centre Hz)` pairs, sorted by frequency.
 pub fn channels(plan: &ChannelPlan) -> Vec<(u32, u64)> {
     let mut v: Vec<(u32, u64)> = plan
@@ -111,6 +143,19 @@ mod tests {
         assert_eq!(hz(80), 477_412_500);
         assert_eq!(adjacent_hz(&UHF_CB_AU), 12_500);
         assert!(c.windows(2).all(|w| w[0].1 < w[1].1), "sorted by frequency");
+    }
+
+    #[test]
+    fn plan_finds_by_id_and_bounding_spans_the_channel_edges() {
+        assert_eq!(plan("uhf_cb_au").map(|p| p.id), Some("uhf_cb_au"));
+        assert!(plan("nope").is_none());
+        let all: Vec<u32> = (1..=80).collect();
+        let t = bounding(&UHF_CB_AU, &all);
+        assert_eq!(t.center_hz, Hz(476_918_750));
+        assert_eq!(t.bandwidth_hz, Hz(1_000_000));
+        let one = bounding(&UHF_CB_AU, &[20]);
+        assert_eq!(one.center_hz, Hz(476_900_000));
+        assert_eq!(one.bandwidth_hz, Hz(12_500));
     }
 
     #[test]
