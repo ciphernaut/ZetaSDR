@@ -258,7 +258,8 @@ export class Transcript {
       const d = document.createElement("details");
       d.className = "turn";
       const sum = document.createElement("summary");
-      const k = Array.isArray(turn.calls) ? turn.calls.length : 0;
+      // `calls` is the completion's tool-call count (TurnEntry.calls).
+      const k = Number.isInteger(turn.calls) ? turn.calls : 0;
       sum.textContent = `turn ${turn.turn} (${plural(k, "call")})`;
       d.append(sum);
       for (const part of [turn.reasoning, turn.content]) {

@@ -15,7 +15,9 @@ recording at 476.9 MHz), `quiet` (low complex noise at 20 MHz, which `measure` l
 a fitted demodulator finds no signal there), and a fake speech daemon (`--stt-socket`,
 answering `what sources are there`), passes the node's
 state directory in ZETA_UI_STATE_DIR, and the URL of a second node started without a speech
-daemon (with the `speech` source) in ZETA_UI_URL_NOSTT (for the "no daemon" scenarios).
+daemon (with the `speech` source) in ZETA_UI_URL_NOSTT (for the "no daemon" scenarios), and
+the URL of a third node with the `cb` source whose `--llm-url` is a request-keyed fake model in
+ZETA_UI_URL_LLM (for the `/ask` scenarios).
 """
 
 import base64
@@ -3012,6 +3014,85 @@ def scenario_duplicate_start_renders_the_job(page, url, secret):
     finally:
         for j in running_kind(url, secret, "measure", "tone"):
             stop_job(url, secret, j)
+
+
+# ---- the agent behind /ask (plan 21 Task 9) -------------------------------------------------
+# Against ZETA_UI_URL_LLM: a node with only `tone` and `cb` whose `--llm-url` is ui.rs's
+# `zeta-fake-llm`, answering by request: "think" lists the sources (with reasoning and content)
+# then answers "one source"; "stop the measure" calls job_stop on 01NOPE then answers "I was not
+# allowed to stop it."; "every CB channel" lists the sources, plan_starts fm_demod on ch20 and
+# ch59 of uhf_cb_au on `cb`, then answers "Started 2 channels.".
+
+def llm_url():
+    url = os.environ.get("ZETA_UI_URL_LLM")
+    assert url, "ZETA_UI_URL_LLM (a node with --llm-url on the fake model) is not set"
+    return url.rstrip("/")
+
+
+def capture_asks(page):
+    """The JSON bodies of the page's POST /ask requests, appended as they are sent."""
+    bodies = []
+    page.on("request", lambda r: bodies.append(json.loads(r.post_data))
+            if r.url.endswith("/ask") and r.method == "POST" else None)
+    return bodies
+
+
+def scenario_ask_sends_32_turns_and_the_allowance(page, url, secret):
+    url = llm_url()
+    select_source(page, url, secret, "cb")
+    asks = capture_asks(page)
+    run_cmd(page, "think")
+    answer = page.locator("#transcript .line.assistant", has_text="one source")
+    expect(answer).to_have_count(1)
+    assert len(asks) == 1, f"one /ask request: {asks}"
+    assert asks[0]["max_turns"] == 32, asks[0]
+    assert asks[0]["allow"] == {"stop_jobs": False, "replace": False}, asks[0]
+    expect(answer).not_to_contain_text("[may stop jobs]")
+    turn = page.locator("#transcript details.turn", has_text="turn 1 (1 call)")
+    expect(turn).to_have_count(1)
+    expect(turn.locator("summary")).to_have_text("turn 1 (1 call)")
+    expect(turn).to_contain_text("I should list the sources first.")
+
+
+def scenario_not_allowed_shows_the_unlock_and_reruns_with_the_allowance(page, url, secret):
+    url = llm_url()
+    select_source(page, url, secret, "cb")
+    asks = capture_asks(page)
+    run_cmd(page, "stop the measure")
+    expect(page.locator("#transcript .line.assistant",
+                        has_text="I was not allowed to stop it.")).to_have_count(1)
+    note = page.locator("#transcript .line.note",
+                        has_text="the agent was not allowed to stop or replace jobs")
+    expect(note).to_have_count(1)
+    button = note.get_by_role("button", name="allow stops and ask again")
+    expect(button).to_have_count(1)
+    button.click()
+    expect(page.locator("#transcript .line.assistant", has_text="[may stop jobs]")
+           ).to_have_count(1)
+    assert len(asks) == 2, f"two /ask requests: {asks}"
+    assert asks[0]["allow"]["stop_jobs"] is False, asks[0]
+    assert asks[1]["allow"]["stop_jobs"] is True, asks[1]
+    assert asks[1]["request"] == "stop the measure", asks[1]
+
+
+def scenario_ask_fans_out_through_plan_start(page, url, secret):
+    url = llm_url()
+    select_source(page, url, secret, "cb")
+    try:
+        run_cmd(page, "an FM decoder on every CB channel")
+        expect(page.locator("#transcript .line.assistant", has_text="Started 2 channels.")
+               ).to_have_count(1)
+        expect(page.locator("#transcript .line", has_text="[agent] ").filter(
+            has_text="plan_start").filter(has_text="ok (2 started")).not_to_have_count(0)
+        started = running_kind(url, secret, "fm_demod", "cb")
+        assert len(started) == 2, f"two fm_demod jobs running: {started}"
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator('#jobs .job[data-state="running"]', has_text="fm_demod")
+               ).to_have_count(2)
+    finally:
+        for j in running_kind(url, secret, "fm_demod", "cb"):
+            stop_job(url, secret, j)
+    assert not running_kind(url, secret, "fm_demod", "cb"), "the fm_demod jobs stopped"
 
 
 # ---- channel plans (plan 13 Task 4) ---------------------------------------------------------

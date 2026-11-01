@@ -452,3 +452,81 @@ async fn turn_log_keeps_reasoning_and_content_per_completion() {
             .contains("reasoning_content")
     );
 }
+
+#[tokio::test]
+async fn a_by_request_fake_answers_the_script_the_request_names() {
+    let script = |answer: &str| {
+        vec![
+            (200, tool_call_response(&[("source_list", json!({}))])),
+            (200, text_response(answer, "stop")),
+        ]
+    };
+    let fake = FakeLlm::start_by_request(
+        vec![
+            ("alpha".to_string(), script("alpha answer")),
+            ("beta".to_string(), script("beta answer")),
+        ],
+        vec![],
+    )
+    .await;
+    let agent = Agent::new(llm(&fake), RecordingExecutor::new(vec![]), cfg());
+
+    let t = agent.run("please alpha").await.unwrap();
+    assert_eq!(t.answer.as_deref(), Some("alpha answer"));
+    let t = agent.run("beta now").await.unwrap();
+    assert_eq!(t.answer.as_deref(), Some("beta answer"));
+    // The same request again is a new conversation, answered from the script's start.
+    let t = agent.run("please alpha").await.unwrap();
+    assert_eq!(t.answer.as_deref(), Some("alpha answer"));
+    assert_eq!(t.calls.len(), 1);
+
+    let err = agent.run("gamma").await.unwrap_err();
+    match &err.error {
+        AgentError::Llm { status: 500, body } => {
+            assert!(body.contains("fake: no script for gamma"), "{body}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_fake_llm_binary_serves_its_scripts_file() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = dir.path().join("scripts.json");
+    let file = json!([{"match": "alpha", "replies": [
+        tool_call_response(&[("source_list", json!({}))]),
+        text_response("alpha answer", "stop"),
+    ]}]);
+    std::fs::write(&scripts, file.to_string()).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_zeta-fake-llm"))
+        .args(["--listen", "127.0.0.1:0", "--scripts"])
+        .arg(&scripts)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn zeta-fake-llm");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let url = line.trim().strip_prefix("listening ").map(str::to_string);
+    let run = async move {
+        let url = url.unwrap_or_else(|| panic!("zeta-fake-llm said {line:?}"));
+        let mut c = LlmConfig::new(url, "floor-model");
+        c.ready_timeout = Duration::from_secs(5);
+        c.request_timeout = Duration::from_secs(5);
+        let agent = Agent::new(
+            LlmClient::new(c).unwrap(),
+            RecordingExecutor::new(vec![]),
+            cfg(),
+        );
+        let t = agent.run("please alpha").await.unwrap();
+        assert_eq!(t.answer.as_deref(), Some("alpha answer"));
+        assert!(agent.run("beta").await.is_err(), "no script for beta");
+    };
+    // Kill the child whether or not the run passed.
+    let outcome = tokio::spawn(run).await;
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome.unwrap();
+}

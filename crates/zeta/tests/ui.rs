@@ -15,7 +15,9 @@
 //! `ZETA_UI_STATE_DIR`. That node has a fake
 //! `voiced` (`--stt-socket`, zeta-speech's `FakeDaemon`) answering `ok:what sources are there`
 //! to every valid staged WAV; a second node without a speech daemon, with only the `speech`
-//! fixture, is passed in `ZETA_UI_URL_NOSTT`.
+//! fixture, is passed in `ZETA_UI_URL_NOSTT`; a third node with the `cb` fixture whose
+//! `--llm-url` is a request-keyed fake model (zeta-agent's `serve_by_request` with
+//! [`fake_llm_scripts`]) is passed in `ZETA_UI_URL_LLM`.
 //!
 //! The run is killed and the test fails after 300 s of wall clock. `ZETA_UI_ONLY=a,b` runs only
 //! those scenarios.
@@ -337,6 +339,68 @@ fn fake_pos_modes(dir: &Path) -> PathBuf {
     modes
 }
 
+/// The fake model's scripts, in `zeta-fake-llm --scripts` form, keyed by a substring of the
+/// request: a refused stop, a fan-out through `plan_start`, and a turn with reasoning and
+/// content.
+fn fake_llm_scripts() -> serde_json::Value {
+    use serde_json::json;
+    use zeta_agent::fake::{text_response, tool_call_response, tool_call_response_with};
+    let plan_start = json!({
+        "plan": "uhf_cb_au", "channels": [20, 59], "kind": "fm_demod", "source": "cb",
+        "deviation_hz": null, "sideband": null, "attach": null, "language": null, "replace": [],
+    });
+    json!([
+        {"match": "stop the measure", "replies": [
+            tool_call_response(&[("job_stop", json!({"job": "01NOPE"}))]),
+            text_response("I was not allowed to stop it.", "stop"),
+        ]},
+        {"match": "every CB channel", "replies": [
+            tool_call_response(&[("source_list", json!({}))]),
+            tool_call_response(&[("plan_start", plan_start)]),
+            text_response("Started 2 channels.", "stop"),
+        ]},
+        {"match": "think", "replies": [
+            tool_call_response_with(
+                &[("source_list", json!({}))],
+                "Let me look.",
+                Some("I should list the sources first."),
+            ),
+            text_response("one source", "stop"),
+        ]},
+    ])
+}
+
+/// Serves [`fake_llm_scripts`] on a free loopback port for the rest of the test, as
+/// `zeta-fake-llm` does (`serve_by_request` on a thread of its own: cargo defines
+/// `CARGO_BIN_EXE_zeta-fake-llm` only for zeta-agent's own tests, which spawn the binary);
+/// its `http://127.0.0.1:PORT`.
+fn start_fake_llm() -> String {
+    let scripts = fake_llm_scripts()
+        .as_array()
+        .expect("scripts are an array")
+        .iter()
+        .map(|s| {
+            let replies = s["replies"].as_array().unwrap().iter();
+            let key = s["match"].as_str().unwrap().to_string();
+            (key, replies.map(|r| (200, r.clone())).collect())
+        })
+        .collect();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake model");
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fake model runtime");
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let _ = zeta_agent::fake::serve_by_request(listener, scripts).await;
+        });
+    });
+    url
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -430,6 +494,20 @@ fn ui_scenarios_pass_in_headless_chromium() {
         &["--source-file", &nostt_speech],
         &[("XDG_RUNTIME_DIR", runtime)],
     );
+    // A fake model answering by request, behind a node with `tone` and `cb`.
+    let llm_dir = tempfile::tempdir().unwrap();
+    let fake_llm = start_fake_llm();
+    let cb_llm = format!(
+        "cb={}",
+        tone_at(llm_dir.path(), "cb", 476_900_000).display()
+    );
+    let llm = ServeProc::start_full(
+        llm_dir.path(),
+        SECRET,
+        &["--source-file", &cb_llm],
+        &["--llm-url", &fake_llm, "--llm-model", "fake"],
+        &[],
+    );
     let mut cmd = Command::new("python3");
     cmd.arg("crates/zeta-ui/tests/e2e/ui.py")
         .args([&serve.url, SECRET]);
@@ -439,6 +517,7 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let child = cmd
         .env("ZETA_UI_STATE_DIR", dir.path().join("state"))
         .env("ZETA_UI_URL_NOSTT", &nostt.url)
+        .env("ZETA_UI_URL_LLM", &llm.url)
         .env("ZETA_BIN", env!("CARGO_BIN_EXE_zeta"))
         .env("ZETA_UI_REBUILD_META", &rebuild_meta)
         .current_dir(repo_root())
@@ -460,4 +539,5 @@ fn ui_scenarios_pass_in_headless_chromium() {
     );
     drop(serve);
     drop(nostt);
+    drop(llm);
 }

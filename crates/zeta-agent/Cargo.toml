@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "LLM agent loop for ZetaSDR"
 
+[[bin]]
+name = "zeta-fake-llm"
+required-features = ["test-fake"]
+
 [features]
+# The fake chat server (`fake`) and the `zeta-fake-llm` test binary built on it.
 test-fake = ["dep:axum", "tokio/net"]
 
 [dependencies]

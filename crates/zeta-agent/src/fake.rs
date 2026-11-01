@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex};
 
 type Canned = Arc<Mutex<VecDeque<(u16, Value)>>>;
 
+/// Request-keyed scripts: (a substring of the last user message, its replies in order).
+pub type Scripts = Vec<(String, Vec<(u16, Value)>)>;
+
 #[derive(Clone)]
 struct Fake {
     chat: Canned,
@@ -22,6 +25,8 @@ struct Fake {
     status_polls: Arc<Mutex<usize>>,
     /// Refills `chat` when it runs out (`serve_loop`); empty for `FakeLlm`.
     repeat: Arc<Vec<(u16, Value)>>,
+    /// When set, chat answers come from these instead of `chat` (`start_by_request`).
+    scripts: Option<Arc<Scripts>>,
 }
 
 /// A loopback chat server answering canned responses in order.
@@ -49,6 +54,37 @@ impl FakeLlm {
         tokio::spawn(async move { axum::serve(listener, router(fake)).await });
         out
     }
+
+    /// Each chat request is answered from the first script whose key is a substring of the
+    /// last `user` message: its reply `k` when the request holds `k` assistant messages after
+    /// that user message, so every conversation (one agent run) starts at the script's first
+    /// reply. `500 {"error":"fake: no script for <text>"}` when no key matches, `500
+    /// {"error":"fake: script exhausted for <text>"}` past its last reply. Status answers as
+    /// in [`FakeLlm::start`].
+    pub async fn start_by_request(scripts: Scripts, status: Vec<(u16, Value)>) -> FakeLlm {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut fake = fake(Vec::new(), status);
+        fake.scripts = Some(Arc::new(scripts));
+        let out = FakeLlm {
+            url: format!("http://{addr}"),
+            requests: fake.requests.clone(),
+            status_polls: fake.status_polls.clone(),
+        };
+        tokio::spawn(async move { axum::serve(listener, router(fake)).await });
+        out
+    }
+}
+
+/// Serve `scripts` on `listener` forever, answering as [`FakeLlm::start_by_request`] does.
+/// Takes a bound listener so a caller binding port 0 can report the port first.
+pub async fn serve_by_request(
+    listener: tokio::net::TcpListener,
+    scripts: Scripts,
+) -> std::io::Result<()> {
+    let mut fake = fake(Vec::new(), Vec::new());
+    fake.scripts = Some(Arc::new(scripts));
+    axum::serve(listener, router(fake)).await
 }
 
 /// Serve `chat` on `addr` forever, starting over each time it runs out.
@@ -66,6 +102,7 @@ fn fake(chat: Vec<(u16, Value)>, status: Vec<(u16, Value)>) -> Fake {
         requests: Arc::default(),
         status_polls: Arc::default(),
         repeat: Arc::default(),
+        scripts: None,
     }
 }
 
@@ -83,7 +120,37 @@ fn reply((code, body): (u16, Value)) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// The reply `scripts` give the chat request `body` (see [`FakeLlm::start_by_request`]).
+fn scripted(scripts: &Scripts, body: &Value) -> (u16, Value) {
+    let messages = body["messages"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let last_user = messages.iter().rposition(|m| m["role"] == "user");
+    let text = last_user
+        .and_then(|i| messages[i]["content"].as_str())
+        .unwrap_or_default();
+    let Some((_, replies)) = scripts.iter().find(|(key, _)| text.contains(key.as_str())) else {
+        return (500, json!({"error": format!("fake: no script for {text}")}));
+    };
+    let turn = last_user.map_or(0, |i| {
+        messages[i + 1..]
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .count()
+    });
+    replies.get(turn).cloned().unwrap_or_else(|| {
+        let error = format!("fake: script exhausted for {text}");
+        (500, json!({ "error": error }))
+    })
+}
+
 async fn chat(State(f): State<Fake>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+    if let Some(scripts) = &f.scripts {
+        let next = scripted(scripts, &body);
+        f.requests.lock().unwrap().push(body);
+        return reply(next);
+    }
     f.requests.lock().unwrap().push(body);
     let next = {
         let mut q = f.chat.lock().unwrap();
