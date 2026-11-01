@@ -78,6 +78,22 @@ After its input's `job_retune` the `transcribe` row still read ch20 / 476.900 MH
 
 Each fit measures the already-narrowed channel's occupied width and takes 1.25 times it, so repeating it converges on the kind's minimum (100.5 MHz `wfm_demod`: 163.3 → 150.6 → 150 kHz). Fit from a band at least as wide as the current one plus a margin, or measure a fixed wider box around the job's centre. From the B210 live run of plans 15/18, 2026-11-01.
 
+
+## UI: more actions on an existing job, and a selected job lit on the waterfall
+
+From the operator, 2026-11-01 (after the B210 day). A running job's row and its tag/outline menu should offer the next steps directly: listen (the audio player on a demodulator), attach `transcribe`, decode or investigate its band (`identify`, `classify` on the job's band and span, `measure`, a `watch` on it), stop. Today the row has graph/stop and the outline menu has Fit, the width presets and Stop (plan 18), and the box menu is the only way into identify/classify. Selecting a job (a click on its row, tag or outline) should also light it on the waterfall as a sticky selection, not only on hover (`hot` from plan 18 is hover-only), so the operator can see which job the next action applies to. One entry table shared by the row, the tag and the outline menu.
+
+## UI: on-waterfall messages cover the newest columns
+
+From the operator, 2026-11-01. Event ribbons (`signal new`, `identifying`, `unknown`, transcripts, the watch's lines) are laid out from the right-hand edge, over the newest columns, so they hide the fresh RF activity they announce. Anchor them at the left (the oldest columns) and let them run towards the right, or into a gutter, so the latest spectrum stays visible; the staircase lanes (above) and this share the layout code in `overlays.js`.
+
+## UI: "What is this?" says the data is no longer in the buffer
+
+From the operator, 2026-11-01, seen at the higher, wider bands. `classify` on a box answers `too_old` when the IQ ring no longer covers the selection's span (the ring keeps 10 s at narrow rates and shrinks towards 1 s at wide ones; the box's span is the moment it was drawn, by which time a 61 Msps capture has moved on). The page shows the error and stops. Instead: on `too_old` re-issue the classify on the most recent span the ring does cover (end now, the same length or what the ring has), say so in the transcript (`buffer moved on; classified the last <n> s`), and show the ring's depth in the box footer so the operator sees it coming. The node side can help: a `too_old` error should carry the ring's oldest `start_ns`.
+
+## UI: the job panel hides the id behind a horizontal scroll
+
+From the operator, 2026-11-01. A job row's actions sit to the right of a horizontal scroller; by the time the scroller is found, the id (and kind) are out of view. Keep the id and kind sticky at the left, wrap or collapse the rest (band, state, events, actions) into a second line or an expand-on-select, and drop columns that repeat the tag. Settle it with the Okudagram (LCARS) restyle (below) rather than as a one-off, unless the row-actions gist above lands first.
 ## Feature: more digital decoding modes
 
 From the operator, 2026-10-27. Today's decoders: APRS (AFSK1200/AX.25), POCSAG, RDS, ACARS (MSK), ADS-B (dump1090 via `zeta-ext`). The design's layer-2 list (spec 6.2) also names DMR, LoRa/MeshCore and RS41 radiosondes, none of which decode yet, and the field craft promises digital voice (DMR, D-STAR, M17) feeding `transcribe`.
