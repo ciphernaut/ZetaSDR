@@ -1120,9 +1120,10 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, "follow = free")).to_have_text("follow = free")
     shown = view_show(page)
     for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
-                 "finished_rows_s 60", "scanner auto", "plan auto", "map off", "home none"):
+                 "finished_rows_s 60", "scanner auto", "plan auto", "map off", "home none",
+                 "subjects auto", "subject_dim_s 60", "subject_drop_s 300"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 7, f"view show: {shown!r}"
+    assert shown.count("\n") == 10, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -1131,7 +1132,8 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, '"-1"', error=True)).to_be_visible()
     run_cmd(page, "view set nosuch 1")
     expect(view_line(page, "nosuch", error=True)).to_contain_text(
-        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner, plan, map, home")
+        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner, plan, map, home, "
+        "subjects, subject_dim_s, subject_drop_s")
     run_cmd(page, "view reset")
     expect(view_line(page, "view policies reset")).to_be_visible()
     shown = view_show(page)
@@ -3612,6 +3614,374 @@ def scenario_home_gives_distance_and_bearing(page, url, secret):
         assert not errors, f"console errors: {errors}"
     finally:
         stop_job(url, secret, job)
+
+
+# ---- subjects (plan 23 Task 2) ----------------------------------------------------------
+# The node's `fake_subjects` row prints three aircraft in separate messages, `fake_fold` two
+# sondes (ui.rs), each 2 s into the job.
+
+def start_subject_job(page, url, secret, kind, source="tone", bandwidth_hz=40_000):
+    """Start a subject fixture at a width of its own (identical bands are `duplicate`), its row
+    waited for, so the page subscribes before the lines come; the job id."""
+    job = start_job(url, secret, kind, source, 100_000_000, bandwidth_hz)
+    job_row(page, job)
+    return job
+
+
+def subject_row(page, key):
+    return page.locator(f'#subjects tr.subject[data-key="{key}"]')
+
+
+def subject_keys(page):
+    return page.locator("#subjects tr.subject").evaluate_all("els => els.map((e) => e.dataset.key)")
+
+
+def subject_counts(page, job):
+    return page.evaluate(
+        "(job) => Object.fromEntries(window.zetaSubjects.list(job).map((s) => [s.key, s.count]))",
+        job)
+
+
+def scenario_subjects_store_merge_units_and_fill(page, url, secret):
+    login(page, url, secret)
+    r = page.evaluate(
+        """async () => {
+          const { mountSubjects, fillSummary, subjectLabel, subjectSummary, subjectValues } =
+            await import('./subjects.js');
+          const { metricText } = await import('./units.js');
+          const fill = {
+            aprs: fillSummary("{src} > {dst}: {n} {ok}",
+                              {src: "VK3ABC", dst: "APRS", n: 7, ok: true}),
+            nulls: fillSummary("{z} {absent} {o}", {z: null, o: {a: 1}}),
+            rds1: fillSummary("{ps?pi} · {rt?}", {ps: "ZETA FM", pi: null, rt: null}),
+            rds2: fillSummary("{ps?pi} · {rt?}", {pi: "2AB1", rt: "hello"}),
+            adsb: fillSummary("{icao} {callsign?} {alt?} {lat?},{lon?}",
+                              {icao: "7C6B2E", lat: -37.8}),
+            keep: fillSummary("{a}{b?}", {a: "x:", b: null}),
+            lat: fillSummary("{id} {lat?:.4}", {id: "S1", lat: -27.41234}),
+            noLat: fillSummary("{id} {lat?:.4}", {id: "S1"}),
+            plus: fillSummary("{n:+.2}", {n: 3}),
+            text: fillSummary("{id:.1}", {id: "S1"}),
+            notFormat: fillSummary("{a:x}", {a: 1}),
+          };
+          const metric = [
+            [21000, "ft"], [421, "kt"], [245, "deg"], [5, "m_s"], [0, "ft"], [1200.4, "m"],
+            [90, "km_h"], ["x", null], ["x", "ft"], [null, "ft"], [undefined, null],
+          ].map(([v, u]) => metricText(v, u));
+          const row = {
+            protocol: "k",
+            event: {summary: "{icao} {callsign?} {altitude_ft?}"},
+            subject: {key: "icao", name: "aircraft", waterfall: "summary", heading: null,
+                      label: "callsign",
+                      columns: [{field: "callsign", label: "Callsign", unit: null},
+                                {field: "altitude_ft", label: "Altitude", unit: "ft"}]},
+          };
+          const api = {op: async (o) => o.op === "modes_list"
+            ? {value: {modes: [{id: "k"}, {id: "plain"}]}}
+            : {value: {mode: {row: o.id === "k" ? row : {protocol: "p", subject: null}}}}};
+          const view = {get: (k) => (k === "subject_dim_s" ? 60 : 300), onChange() {}};
+          const store = mountSubjects(api, view);
+          const before = store.rowOf("k") === undefined && store.rowOf("nosuch") === undefined;
+          const learned = await store.lookup(["k", "plain", "nosuch"]);
+          const job = {id: "J", kind: "k"};
+          store.event(job, {icao: "A", callsign: "QFA1"});
+          const s = store.event(job, {icao: "A", callsign: null, altitude_ft: 0});
+          store.event(job, {icao: "A", position: {lat: 1, lon: 2, alt_m: 100}});
+          const fix = store.event(job, {icao: "A", position: {lat: 3, lon: 4, alt_m: null}});
+          const proto = store.event(job, {icao: "__proto__", callsign: "P"});
+          const out = {
+            fill, metric, learned, before,
+            noRow: store.rowOf("nosuch"), again: await store.lookup(["k"]),
+            callsign: s.state.callsign, altitude: s.state.altitude_ft,
+            nullProto: Object.getPrototypeOf(s.state) === null,
+            count: fix.count, pos: fix.position,
+            summary: subjectSummary(s), label: subjectLabel(s), values: subjectValues(s),
+            labelOfKey: subjectLabel(store.event(job, {icao: "B"})),
+            polluted: ({}).callsign !== undefined,
+            protoKey: proto && proto.key, listed: store.list("J").length,
+            lastHeard: store.lastHeard("J").key,
+            blank: store.event(job, {icao: ""}),
+            blanks: store.event(job, {icao: "  "}),
+            absent: store.event(job, {callsign: "X"}),
+            nullKey: store.event(job, {icao: null}),
+            owned: store.event({id: "O", kind: "k", owner: "W"}, {icao: "A"}),
+            unrowed: store.event({id: "P", kind: "plain"}, {icao: "A"}),
+            looked: store.subjectOf(job, {icao: "A"}).count,
+            lookedBlank: store.subjectOf(job, {icao: " "}),
+            held: store.held("J", "A"), heldAny: store.held("J", null),
+            heldNone: store.held("nosuch", null),
+            selectedFirst: store.selected(),
+          };
+          const events = [];
+          store.onSelect((sel) => events.push(sel));
+          const drops = [];
+          store.onDrop((j, k) => drops.push([j, k]));
+          store.select("J", "A");
+          out.selected = store.selected();
+          store.sync([{id: "J", state: {status: "stopped"}}]);
+          out.afterSync = store.list("J").length;
+          out.lastAfterSync = store.lastHeard("J");
+          out.dropped = drops.length;
+          out.selectedAfter = store.selected();
+          out.selectEvents = events;
+          store.destroy();
+          out.windowStore = window.zetaSubjects;
+          return out;
+        }""")
+    f = r["fill"]
+    assert f["aprs"] == "VK3ABC > APRS: 7 true", f
+    assert f["nulls"] == "null null {\"a\":1}", f
+    assert f["rds1"] == "ZETA FM", f
+    assert f["rds2"] == "2AB1 · hello", f
+    assert f["adsb"] == "7C6B2E -37.8", f
+    assert f["keep"] == "x:", f
+    assert f["lat"] == "S1 -27.4123", f
+    assert f["noLat"] == "S1", f
+    assert f["plus"] == "+3.00", f
+    assert f["text"] == "S1", f
+    assert f["notFormat"] == "null", f
+    assert r["metric"] == ["6401 m", "780 km/h", "245°", "5 m/s", "0 m", "1200 m", "90 km/h",
+                           "x", "x", "", ""], r["metric"]
+    assert r["learned"] is True and r["again"] is False, r
+    assert r["before"] is True, r  # undefined: not yet known
+    assert r["noRow"] is None, r
+    assert r["callsign"] == "QFA1", r  # a null never erases a value
+    assert r["altitude"] == 0, r  # and 0 is a value
+    assert r["nullProto"] is True, r
+    assert r["count"] == 4, r
+    assert r["pos"] == {"lat": 3, "lon": 4, "alt_m": 100}, r
+    assert r["summary"] == "A QFA1 0", r
+    assert r["label"] == "QFA1" and r["labelOfKey"] == "B", r
+    assert r["values"][0]["label"] == "Callsign" and r["values"][0]["text"] == "QFA1", r
+    assert r["values"][1]["text"] == "0 m", r
+    assert r["polluted"] is False and r["protoKey"] == "__proto__", r
+    assert r["listed"] == 3 and r["lastHeard"] == "B", r
+    for name in ("blank", "blanks", "absent", "nullKey", "owned", "unrowed", "lookedBlank"):
+        assert r[name] is None, f"{name}: {r[name]}"
+    assert r["looked"] == 4, r  # subjectOf neither merges nor counts
+    assert r["held"] is True and r["heldAny"] is True and r["heldNone"] is False, r
+    assert r["selectedFirst"] is None, r
+    assert r["selected"] == {"job": "J", "key": "A"}, r
+    assert r["afterSync"] == 0 and r["lastAfterSync"] is None and r["dropped"] == 3, r
+    assert r["selectedAfter"] is None, r
+    assert r["selectEvents"][-1] is None, r
+    assert r["windowStore"] is None, r
+
+
+def scenario_subjects_table_merges_three_aircraft(page, url, secret):
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        rows = page.locator("#subjects tr.subject")
+        expect(rows).to_have_count(3, timeout=10_000)
+        section = page.locator("#subjects section.subject-job")
+        expect(section).to_have_count(1)
+        expect(section.locator("h3")).to_have_text("fake_subjects tone, 3 aircraft")
+        # Every line in, never more than three rows.
+        page.wait_for_function(
+            "(job) => window.zetaSubjects.list(job).reduce((n, s) => n + s.count, 0) === 8",
+            arg=job, timeout=5_000)
+        expect(rows).to_have_count(3)
+        a = subject_row(page, "7C0001")
+        for text in ("QFA1", "6401 m", "780 km/h", "245°", "-27.41, 153.11"):
+            expect(a).to_contain_text(text)
+        expect(a.locator('td[data-col="count"]')).to_have_text("5")
+        expect(a.locator('td[data-col="last_seen"]')).to_have_text(re.compile(r"^\d+ s$"))
+        expect(subject_row(page, "7C0002")).to_contain_text("0 m")
+        # Decoder text is shown as text.
+        c = subject_row(page, "7C0003").locator('td[data-col="callsign"]')
+        expect(c).to_have_text("<b>JST3</b>")
+        expect(c).to_have_attribute("title", "<b>JST3</b>")
+        expect(page.locator("#subjects b")).to_have_count(0)
+        assert subject_keys(page)[0] == "7C0001", subject_keys(page)
+        assert page.evaluate("(job) => window.zetaSubjects.list(job).length", job) == 3
+        assert not errors, f"console errors: {errors}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_subjects_tab_appears_only_with_a_subject_job(page, url, secret):
+    select_source(page, url, secret, "tone")
+    toggle = page.locator("#subjects-toggle")
+    pane = page.locator("#subjects")
+    expect(toggle).to_be_hidden()
+    expect(pane).to_be_hidden()
+    pos = start_fake_pos(page, url, secret)
+    try:
+        page.evaluate("window.zetaTest.poll()")
+        page.wait_for_function("() => window.zetaSubjects.rowOf('fake_pos') !== undefined")
+        expect(toggle).to_be_hidden()
+        expect(pane).to_be_hidden()
+    finally:
+        stop_job(url, secret, pos)
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        expect(toggle).to_be_visible(timeout=10_000)
+        expect(pane).to_be_visible()
+        assert page.evaluate("document.documentElement.dataset.subjects") == "on"
+        wf = page.locator("#waterfall").bounding_box()
+        box = pane.bounding_box()
+        assert abs(box["x"] - (wf["x"] + wf["width"])) <= 2, f"{wf} {box}"
+        run_cmd(page, "view set subjects off")
+        expect(pane).to_be_hidden()
+        expect(toggle).to_be_visible()
+        assert page.evaluate("document.documentElement.dataset.subjects") is None
+        toggle.click()
+        expect(pane).to_be_visible()
+        assert "subjects on" in view_show(page)
+        # With the map on too, the map takes the top of the right half and the table the bottom.
+        page.route(OSM_TILES, lambda r: r.abort())
+        run_cmd(page, "view set map on")
+        expect(page.locator("#map")).to_be_visible()
+        mp = page.locator("#map").bounding_box()
+        box = pane.bounding_box()
+        assert abs(mp["x"] - box["x"]) <= 2 and mp["y"] < box["y"], f"{mp} {box}"
+        run_cmd(page, "view set map off")
+    finally:
+        stop_job(url, secret, job)
+    page.evaluate("window.zetaTest.poll()")
+    run_cmd(page, "view set subjects auto")
+    expect(pane).to_be_hidden()
+    expect(toggle).to_be_hidden()
+    run_cmd(page, "view set subjects on")
+    expect(pane).to_be_visible()
+    expect(toggle).to_be_visible()
+    expect(page.locator("#subjects section.subject-job")).to_have_count(0)
+
+
+def scenario_subjects_dim_and_drop(page, url, secret):
+    select_source(page, url, secret, "tone")
+    run_cmd(page, "view set subject_dim_s 0")
+    expect(view_line(page, "subject_dim_s", error=True)).to_contain_text(
+        "a positive integer of seconds")
+    run_cmd(page, "view set subject_dim_s 1")
+    expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
+    run_cmd(page, "view set subject_drop_s 4")
+    expect(view_line(page, "subject_drop_s = 4")).to_be_visible()
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        rows = page.locator("#subjects tr.subject")
+        expect(rows).to_have_count(3, timeout=10_000)
+        expect(page.locator("#subjects tr.subject.dim")).to_have_count(3, timeout=3_000)
+        expect(rows).to_have_count(0, timeout=8_000)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_subjects_distance_and_sort(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+        expect(page.locator('#subjects th[data-col="distance"]')).to_have_count(0)
+        run_cmd(page, "view set home -27.50,153.00")
+        expect(page.locator('#subjects th[data-col="distance"]')).to_have_count(1)
+        dist = lambda key: subject_row(page, key).locator('td[data-col="distance"]')
+        expect(dist("7C0001")).to_have_text("14.8 km, 47°")
+        expect(dist("7C0003")).to_have_text("")
+        icao = page.locator('#subjects th[data-col="icao"]')
+        icao.click()
+        assert subject_keys(page) == ["7C0001", "7C0002", "7C0003"], subject_keys(page)
+        icao.click()
+        assert subject_keys(page) == ["7C0003", "7C0002", "7C0001"], subject_keys(page)
+        # Only 7C0001 has a track: nulls last, whichever way it is sorted.
+        track = page.locator('#subjects th[data-col="track_deg"]')
+        track.click()
+        assert subject_keys(page)[0] == "7C0001", subject_keys(page)
+        track.click()
+        assert subject_keys(page)[0] == "7C0001", subject_keys(page)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_subjects_narrow_shows_three_columns(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    page.set_viewport_size(NARROW)  # its row is in the drawer from here
+    try:
+        toggle = page.locator("#subjects-toggle")
+        expect(toggle).to_be_visible(timeout=10_000)
+        pane = page.locator("#subjects")
+        expect(pane).to_be_hidden()
+        toggle.click()
+        expect(pane).to_be_visible()
+        assert page.evaluate("document.documentElement.dataset.pane") == "subjects"
+        box = pane.bounding_box()
+        assert box["x"] == 0 and box["width"] >= NARROW["width"] - 2, box
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+        ths = page.locator("#subjects th")
+        expect(ths).to_have_count(3)
+        assert ths.all_text_contents() == ["icao", "Altitude", "Last seen"], ths.all_text_contents()
+        toggle.click()
+        expect(pane).to_be_hidden()
+        assert page.evaluate("document.documentElement.dataset.pane") is None
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_subjects_survive_a_source_switch(page, url, secret):
+    select_source(page, url, secret, "tone")
+    a = start_subject_job(page, url, secret, "fake_subjects", bandwidth_hz=40_000)
+    b = start_subject_job(page, url, secret, "fake_fold", bandwidth_hz=41_000)
+    c = None
+    try:
+        expect(page.locator("#subjects tr.subject")).to_have_count(5, timeout=10_000)
+        page.wait_for_function(
+            """([a, b]) => [a, b].every((j) => window.zetaSubjects.list(j)
+                 .reduce((n, s) => n + s.count, 0) === (j === a ? 8 : 5))""",
+            arg=[a, b], timeout=5_000)
+        before = [subject_counts(page, a), subject_counts(page, b)]
+        assert before[1] == {"S1": 2, "S2": 3}, before
+        for source in ("aprs", "tone"):
+            page.click(f'.src-tab[data-id="{source}"]')
+            page.evaluate("window.zetaTest.poll()")
+            page.wait_for_timeout(1500)
+            expect(page.locator("#subjects tr.subject")).to_have_count(5)
+            after = [subject_counts(page, a), subject_counts(page, b)]
+            assert after == before, f"on {source}: {before} -> {after}"
+        # A stopped job's section goes at the next poll; the other's stays.
+        stop_job(url, secret, a)
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator("#subjects section.subject-job")).to_have_count(1)
+        expect(page.locator("#subjects tr.subject")).to_have_count(2)
+        stop_job(url, secret, b)
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator("#subjects section.subject-job")).to_have_count(0)
+        # A keyed row with no `position` on a source the page does not show is followed too.
+        page.click('.src-tab[data-id="aprs"]')
+        expect(page.locator('.src-tab[data-id="aprs"]')).to_have_attribute(
+            "aria-selected", "true")
+        c = start_subject_job(page, url, secret, "fake_fold", bandwidth_hz=42_000)
+        run_cmd(page, "view set subjects on")
+        expect(subject_row(page, "S1")).to_have_count(1, timeout=10_000)
+        expect(subject_row(page, "S2")).to_have_count(1)
+    finally:
+        for job in (a, b, c):
+            if job:
+                stop_job(url, secret, job)
+
+
+def scenario_subjects_name_the_jobs_not_watched(page, url, secret):
+    select_source(page, url, secret, "tone")
+    jobs = []
+    try:
+        for bw in (40_000, 41_000, 42_000, 43_000, 44_000):
+            jobs.append(start_job(url, secret, "fake_subjects", "tone", 100_000_000, bw))
+        job_row(page, jobs[-1])
+        sections = page.locator("#subjects section.subject-job")
+        expect(sections).to_have_count(5, timeout=10_000)
+        marked = page.locator("#subjects section.subject-job .not-watched")
+        expect(marked).to_have_count(1)
+        expect(marked).to_have_text("not watched (limit 4)")
+        oldest = page.locator(f'#subjects section.subject-job[data-job="{jobs[0]}"]')
+        expect(oldest.locator(".not-watched")).to_have_count(1)
+        for job in jobs[1:]:
+            rows = page.locator(f'#subjects section.subject-job[data-job="{job}"] tr.subject')
+            expect(rows).to_have_count(3, timeout=10_000)
+    finally:
+        for job in jobs:
+            stop_job(url, secret, job)
 
 
 # ---- runner ----------------------------------------------------------------------------

@@ -60,15 +60,18 @@
 //                            job is watched like any other (its source is its input's).
 //                            Then the positioned jobs: the MAX_POSITIONED most recent
 //                            running jobs on the other sources whose kind is a mode row
-//                            with a `position` map (spec 7.2: the map follows every
-//                            positioned job, e.g. a decoder on a second radio while this
-//                            page shows the watching one) are subscribed too, for
-//                            ov.onEvent only: no outline, ribbon, label, mark or counter.
-//                            The row ids come from one `modes_list` per login (this
-//                            Overlays' life) and each running kind's `position` from one
-//                            `modes_show`, both cached; a failed lookup is tried again on
-//                            the next poll. A positioned job whose source becomes the
-//                            selected one is handed to the ordinary watch.
+//                            with a `position` map or a `subject` (spec 7.2: the map follows
+//                            every positioned job, e.g. a decoder on a second radio while
+//                            this page shows the watching one; plan 23: so does the Subjects
+//                            pane) are subscribed too, for ov.onEvent only: no outline,
+//                            ribbon, label, mark or counter. Every running kind goes to
+//                            the `subjects` store's row cache (store.lookup); a job is
+//                            subscribed only once its row is known, so an event never
+//                            arrives before it, and what the lookup learns is applied at
+//                            once by a second sync. A positioned job whose source becomes
+//                            the selected one is handed to the ordinary watch.
+//     ov.watching(jobId) -> bool  false for a running job over either cap, so its events
+//                            are not seen (the Subjects pane says so)
 //     ov.watchJob(job, streamIds)  subscribes to the job's event streams (an id or an array:
 //                            an attached `transcribe` job has two, its `vad` and its
 //                            `transcript` stage's; text mode, each re-resolved by provenance
@@ -250,6 +253,7 @@ class Overlays {
     wf,
     api,
     {
+      subjects = null,
       jobsEl = document.getElementById("jobs"),
       plan = () => "auto",
       applyOp = async () => null,
@@ -289,9 +293,8 @@ class Overlays {
     this.eventFns = []; // ov.onEvent listeners
     this.positioned = new Map(); // job id -> {job, ids, subs, closed, positionOnly: true}
     this.resolvingPositioned = false; // a GET /streams for unwatched positioned jobs
-    this.rowIds = null; // the mode-row ids (`modes_list`), once looked up
-    this.positionKinds = new Map(); // job kind -> whether its mode row has a `position`
-    this.lookingUp = false; // a `modes_list`/`modes_show` lookup is in flight
+    this.subjects = subjects; // the row cache and the subjects (subjects.js)
+    this.overCap = new Set(); // running job ids over MAX_WATCHED or MAX_POSITIONED
     this.destroyed = false;
 
     this.layer = document.createElement("div");
@@ -353,8 +356,12 @@ class Overlays {
       const known = this.watched.get(j.id);
       if (known) known.job = j;
     }
-    const fresh = capped.filter((j) => !this.watched.has(j.id));
+    this.lookup(jobs);
+    const fresh = capped.filter((j) => !this.watched.has(j.id) && this.rowKnown(j));
     if (fresh.length > 0) this.resolve(fresh);
+    this.overCap = new Set(
+      want.filter((j) => !ids.has(j.id) && !this.noEventStream.has(j.id)).map((j) => j.id),
+    );
     for (const j of want) {
       // A `graph_put` restarted the job (perhaps with its squelch off): forget the old state.
       const sq = this.squelches.get(j.id);
@@ -372,19 +379,38 @@ class Overlays {
     this.syncPositioned(jobs);
   }
 
-  // The running jobs on the other sources whose mode row carries a `position`, newest first,
-  // up to MAX_POSITIONED: subscribed for ov.onEvent (the map) only.
+  // Whether the job's mode row is settled (a row, or no row): no event before that.
+  rowKnown(job) {
+    return !this.subjects || this.subjects.rowOf(job.kind) !== undefined;
+  }
+
+  // Every running kind's row looked up; what is learned is applied at once, since a poll
+  // later a decoder's first lines may be gone.
+  async lookup(jobs) {
+    if (!this.subjects) return;
+    const learned = await this.subjects.lookup(jobs.filter(isRunning).map((j) => j.kind));
+    if (learned && !this.destroyed) this.sync(this.lastJobs, this.sourceRec);
+  }
+
+  watching(jobId) {
+    return !this.overCap.has(jobId);
+  }
+
+  // The running jobs on the other sources whose mode row carries a `position` or a `subject`,
+  // newest first, up to MAX_POSITIONED: subscribed for ov.onEvent alone.
   syncPositioned(jobs) {
     if (this.destroyed) return;
     const others = jobs.filter(
       (j) => j.source !== this.sourceId && j.kind !== "spectrum" && isRunning(j),
     );
-    const unknown = others.filter((j) => !this.positionKinds.has(j.kind));
-    if (unknown.length > 0) this.lookupKinds(unknown.map((j) => j.kind));
-    const want = others
-      .filter((j) => this.positionKinds.get(j.kind) === true)
-      .sort((a, b) => (b.created_ns ?? 0) - (a.created_ns ?? 0))
-      .slice(0, MAX_POSITIONED);
+    const followed = others
+      .filter((j) => {
+        const row = this.subjects ? this.subjects.rowOf(j.kind) : null;
+        return row && (row.position || row.subject);
+      })
+      .sort((a, b) => (b.created_ns ?? 0) - (a.created_ns ?? 0));
+    const want = followed.slice(0, MAX_POSITIONED);
+    for (const j of followed.slice(MAX_POSITIONED)) this.overCap.add(j.id);
     const ids = new Set(want.map((j) => j.id));
     for (const id of [...this.positioned.keys()]) if (!ids.has(id)) this.unwatchPositioned(id);
     for (const j of want) {
@@ -393,40 +419,6 @@ class Overlays {
     }
     const fresh = want.filter((j) => !this.positioned.has(j.id));
     if (fresh.length > 0) this.resolvePositioned(fresh);
-  }
-
-  // Whether each of `kinds` is a mode row with a `position` map: the row ids once
-  // (`modes_list`), then one `modes_show` per row kind not yet known (a kind that is no row
-  // is false without asking). Every answer is cached; a failure leaves the rest unknown,
-  // tried again on the next poll. What was learned is applied at once.
-  async lookupKinds(kinds) {
-    if (this.lookingUp) return;
-    this.lookingUp = true;
-    let learned = false;
-    try {
-      if (!this.rowIds) {
-        const r = await this.api.op({ op: "modes_list", family: null, state: null });
-        const modes = (r && r.value && r.value.modes) || [];
-        this.rowIds = new Set(modes.map((m) => m.id));
-      }
-      for (const kind of new Set(kinds)) {
-        if (this.destroyed) return;
-        if (this.positionKinds.has(kind)) continue;
-        if (!this.rowIds.has(kind)) {
-          this.positionKinds.set(kind, false);
-        } else {
-          const r = await this.api.op({ op: "modes_show", id: kind });
-          const row = r && r.value && r.value.mode && r.value.mode.row;
-          this.positionKinds.set(kind, !!(row && row.position));
-        }
-        learned = true;
-      }
-    } catch {
-      // Tried again on the next poll.
-    } finally {
-      this.lookingUp = false;
-    }
-    if (learned && !this.destroyed) this.syncPositioned(this.lastJobs);
   }
 
   // One GET /streams for the positioned jobs not yet subscribed.

@@ -14,6 +14,8 @@ space-separated>, "n": <how many>}`. FAKE_WAV=1 makes it read a 44-byte WAV
 header first (exiting 3 unless it starts `RIFF....WAVE`), print
 `{"wav": {"rate_hz": R, "bits": B, "channels": C}}` as its first line, then count
 only the bytes after the header and exit 3 should a second `RIFF` follow.
+`--lines-file PATH` takes the lines from that file instead of $FAKE_LINES, which is
+node-wide when a node runs this as a mode row: two rows differ by their `args`.
 """
 
 import json
@@ -47,6 +49,9 @@ def read_wav_header(src, out) -> bool:
 def main() -> int:
     args = sys.argv[1:]
     lines = os.environ.get("FAKE_LINES", "")
+    if "--lines-file" in args:
+        with open(args[args.index("--lines-file") + 1]) as f:
+            lines = f.read().rstrip("\n")
     if os.environ.get("FAKE_PRINT_ENV") == "1":
         names = sorted(os.environ)
         lines = json.dumps({"text": " ".join(names), "n": len(names)})

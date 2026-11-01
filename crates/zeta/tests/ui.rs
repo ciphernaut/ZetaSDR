@@ -223,9 +223,8 @@ fn quiet_fixture(dir: &Path) -> PathBuf {
 }
 
 /// Wall-clock limit on the whole ui.py run: measured 256.3 s and 256.9 s on 2026-11-01 (plan 18
-/// added 31 s), so 330 s. The margin covers the plan-15 scenario
-/// `coarse_layer_leaves_masked_bins_unpainted` (about 10 s) that joins on rebase.
-const DEADLINE: Duration = Duration::from_secs(330);
+/// added 31 s), so 330 s then; plan 23 adds about 16 scenarios, so 420 s until they are measured.
+const DEADLINE: Duration = Duration::from_secs(420);
 
 /// Waits for `child` until `deadline`, killing it then; its exit status (None when killed)
 /// and everything it wrote. Its pipes are drained on threads so it never blocks on them.
@@ -330,12 +329,124 @@ const FAKE_POS_LINES: &str = "{\"id\":\"S1\",\"lat\":-27.40,\"lon\":153.10,\"alt
 /// the page has subscribed to the job's events by then.
 const FAKE_POS_AFTER_BYTES: &str = "384000";
 
-/// A modes directory under `dir` holding `fake_pos.json`; its path.
-fn fake_pos_modes(dir: &Path) -> PathBuf {
+/// A `fake_lines` row shaped as [`fake_pos_row`], so no sweep tries it, printing the lines of
+/// `lines_file` (`$FAKE_LINES` is node-wide, so two rows differ by this).
+fn fake_subject_row(
+    id: &str,
+    lines_file: &Path,
+    event: serde_json::Value,
+    position: serde_json::Value,
+    subject: serde_json::Value,
+) -> serde_json::Value {
+    let mut row = fake_pos_row();
+    row["id"] = id.into();
+    row["name"] = format!("{id} (UI tests)").into();
+    row["protocol"] = id.into();
+    row["decoder"]["args"] = serde_json::json!(["--lines-file", lines_file.to_str().unwrap()]);
+    row["event"] = event;
+    row["position"] = position;
+    row["subject"] = subject;
+    row
+}
+
+/// `fake_subjects`: three aircraft in separate messages as dump1090 sends them, every field in
+/// every line, `null` when the message does not carry it. 7C0001 comes last, so it is the last
+/// heard, and carries everything; 7C0003's callsign is markup, which must stay text.
+fn fake_subjects_lines() -> String {
+    let line =
+        |icao: &str, callsign: &str, alt: &str, kt: &str, track: &str, lat: &str, lon: &str| {
+            format!(
+                "{{\"icao\":\"{icao}\",\"callsign\":{callsign},\"altitude_ft\":{alt},\
+             \"ground_speed_kt\":{kt},\"track_deg\":{track},\"lat\":{lat},\"lon\":{lon}}}"
+            )
+        };
+    let n = "null";
+    [
+        line("7C0002", "\"VOZ2\"", n, n, n, n, n),
+        line("7C0002", n, "0", n, n, "-27.30", "153.20"),
+        line("7C0003", "\"<b>JST3</b>\"", n, n, n, n, n),
+        line("7C0001", "\"QFA1\"", n, n, n, n, n),
+        line("7C0001", n, "21000", n, n, n, n),
+        line("7C0001", n, n, n, n, "-27.40", "153.10"),
+        line("7C0001", n, "21000", n, n, "-27.41", "153.11"),
+        line("7C0001", n, n, "421", "245", n, n),
+    ]
+    .join("\n")
+}
+
+/// `fake_fold`'s lines: sonde S1 twice, S2 three times.
+const FAKE_FOLD_LINES: &str = "{\"id\":\"S1\",\"alt\":1000}\n{\"id\":\"S2\",\"alt\":2000}\n\
+{\"id\":\"S1\",\"alt\":1100}\n{\"id\":\"S2\",\"alt\":2100}\n{\"id\":\"S2\",\"alt\":2200}";
+
+/// A modes directory under `dir` holding the fake rows and their lines files; its path.
+fn fake_modes(dir: &Path) -> PathBuf {
+    use serde_json::json;
     let modes = dir.join("modes");
     std::fs::create_dir_all(&modes).expect("create modes dir");
-    let row = serde_json::to_string_pretty(&fake_pos_row()).unwrap();
-    std::fs::write(modes.join("fake_pos.json"), row).expect("write fake_pos.json");
+    let subjects_file = dir.join("fake_subjects.lines");
+    std::fs::write(&subjects_file, fake_subjects_lines()).expect("write fake_subjects.lines");
+    let fold_file = dir.join("fake_fold.lines");
+    std::fs::write(&fold_file, FAKE_FOLD_LINES).expect("write fake_fold.lines");
+    let number = json!({"type": ["number", "null"]});
+    let text = json!({"type": ["string", "null"]});
+    let rows = [
+        fake_pos_row(),
+        fake_subject_row(
+            "fake_subjects",
+            &subjects_file,
+            json!({
+                "schema": {"type": "object", "properties": {
+                    "icao": {"type": "string"},
+                    "callsign": text,
+                    "altitude_ft": number,
+                    "ground_speed_kt": number,
+                    "track_deg": number,
+                    "lat": number,
+                    "lon": number,
+                }},
+                "summary": "{icao} {callsign?} {altitude_ft?} {lat?},{lon?}",
+            }),
+            json!({"lat": "lat", "lon": "lon", "alt_m": "altitude_ft", "alt_unit": "ft"}),
+            json!({
+                "key": "icao",
+                "name": "aircraft",
+                "waterfall": "summary",
+                "columns": [
+                    {"field": "callsign", "label": "Callsign", "unit": null},
+                    {"field": "altitude_ft", "label": "Altitude", "unit": "ft"},
+                    {"field": "ground_speed_kt", "label": "Speed", "unit": "kt"},
+                    {"field": "track_deg", "label": "Track", "unit": "deg"},
+                ],
+                "heading": "track_deg",
+                "label": "callsign",
+            }),
+        ),
+        fake_subject_row(
+            "fake_fold",
+            &fold_file,
+            json!({
+                "schema": {"type": "object", "properties": {
+                    "id": {"type": "string"},
+                    "alt": number,
+                }},
+                "summary": "{id} {alt?:.0} m",
+            }),
+            serde_json::Value::Null,
+            json!({
+                "key": "id",
+                "name": "sondes",
+                "waterfall": "fold",
+                "columns": [{"field": "alt", "label": "Altitude", "unit": "m"}],
+                "heading": null,
+                "label": null,
+            }),
+        ),
+    ];
+    for row in rows {
+        let file = format!("{}.json", row["id"].as_str().unwrap());
+        let text = serde_json::to_string_pretty(&row).unwrap();
+        std::fs::write(modes.join(file), text).expect("write a fake row");
+    }
     modes
 }
 
@@ -454,7 +565,7 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let sock = sock_dir.path().join("voiced.sock");
     let _voiced = fake_voiced(&sock);
     let sock = sock.to_str().expect("socket path is UTF-8");
-    let modes = fake_pos_modes(dir.path());
+    let modes = fake_modes(dir.path());
     let modes = modes.to_str().expect("modes path is UTF-8");
     let fake_lines = repo_root().join("crates/zeta-ext/tests/fake_lines");
     let fake_lines = fake_lines.to_str().expect("fake_lines path is UTF-8");

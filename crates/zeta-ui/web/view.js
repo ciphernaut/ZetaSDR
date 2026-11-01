@@ -17,6 +17,10 @@
 //                          (default none): where the map's home marker sits and the job rows'
 //                          distance and bearing count from; kept as `<lat>,<lon>` with the
 //                          numbers as JavaScript prints them (`-27.50,153.00` → `-27.5,153`)
+//         subjects         auto | on | off (default auto): the Subjects pane (subjects.js);
+//                          auto shows it while a running job's row has table columns
+//         subject_dim_s    a positive integer of seconds (default 60): a silent subject dims
+//         subject_drop_s   a positive integer of seconds (default 300): and then is dropped
 //   homePoint(value) -> {lat, lon} | null   the `home` policy's value as numbers (null: none)
 //   VIEW_KEY   the sessionStorage key holding the values set ({key: value}, defaults left out)
 //   mountView() -> View
@@ -54,6 +58,9 @@ function latLon(text) {
 export function homePoint(value) {
   return value === "none" ? null : latLon(value);
 }
+
+const positiveSeconds = (t) =>
+  /^[1-9]\d*$/.test(t) && Number.isSafeInteger(Number(t)) ? Number(t) : undefined;
 
 export const POLICIES = [
   { key: "follow", values: ["target", "free"], default_: "target", describe: "target, free" },
@@ -94,6 +101,19 @@ export const POLICIES = [
     },
     default_: "none",
     describe: "LAT,LON in decimal degrees (lat -90..90, lon -180..180), none",
+  },
+  { key: "subjects", values: ["auto", "on", "off"], default_: "auto", describe: "auto, on, off" },
+  {
+    key: "subject_dim_s",
+    parse: positiveSeconds,
+    default_: 60,
+    describe: "a positive integer of seconds",
+  },
+  {
+    key: "subject_drop_s",
+    parse: positiveSeconds,
+    default_: 300,
+    describe: "a positive integer of seconds",
   },
 ];
 
