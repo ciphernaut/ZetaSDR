@@ -91,6 +91,33 @@ async fn streams_all_samples_in_blocks() {
 }
 
 #[tokio::test]
+async fn realtime_playback_keeps_the_rate() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = FileSource::open(
+        SourceId("f".into()),
+        &common::tone(dir.path()),
+        FileOpts {
+            realtime: true,
+            block_samples: 480,
+            repeat: true,
+            tune_range: None,
+        },
+    )
+    .unwrap();
+    let mut rx = src.subscribe();
+    let _h = src.start();
+    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut total = 0;
+    while let Ok(block) = tokio::time::timeout_at(until, rx.recv()).await {
+        total += block.unwrap().samples.len();
+    }
+    assert!(
+        (95_040..=96_960).contains(&total),
+        "{total} samples in 2 s at 48 kHz"
+    );
+}
+
+#[tokio::test]
 async fn tune_off_center_is_out_of_range() {
     let dir = tempfile::tempdir().unwrap();
     let src = FileSource::open(

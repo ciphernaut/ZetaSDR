@@ -258,6 +258,9 @@ impl FileSource {
             let Some(tx) = tx else { return };
             let rate = meta.sample_rate_hz.0;
             let mut elapsed: u64 = 0;
+            // Paced by this clock rather than by summed sleeps, whose overshoots would add
+            // up: a radio's samples do not run slow, and a mix's wall clock would starve.
+            let anchor = tokio::time::Instant::now();
             if samples.is_empty() {
                 if !opts.repeat {
                     shared.lock().unwrap().take();
@@ -280,9 +283,9 @@ impl FileSource {
                         samples: chunk.into(),
                     });
                     if opts.realtime {
-                        tokio::time::sleep(Duration::from_secs_f64(
-                            chunk.len() as f64 / rate as f64,
-                        ))
+                        tokio::time::sleep_until(
+                            anchor + Duration::from_secs_f64(elapsed as f64 / rate as f64),
+                        )
                         .await;
                     } else {
                         tokio::task::yield_now().await;

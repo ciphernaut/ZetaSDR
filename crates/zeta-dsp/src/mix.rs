@@ -23,6 +23,12 @@ use crate::{frame_span, note_lag};
 pub const MIX_STAGE: &str = "mix";
 /// How long a burst's first samples wait before its queue feeds the sum, so block-sized
 /// delivery does not starve it.
+///
+/// 40 ms, measured 2026-11-01 on two `fm_demod`s over a realtime recording
+/// (`crates/zeta/tests/mix.rs`, three idle runs and one beside `cargo test -p zeta-core`):
+/// the worst `underruns` in a window was 0, and `max_demod_gap_ms` at most 101 at 100 ms
+/// blocks and 19 at 16 ms blocks. 40 was the first candidate and passed, so 60 and 80 were
+/// not run. The ceiling is 80: 100 ms blocks + 80 ms + a 20 ms tick is the 200 ms cap.
 pub const PREBUFFER_MS: u64 = 40;
 
 /// The only audio format mixed.
@@ -43,7 +49,7 @@ const UNDERRUN_WINDOW: Duration = Duration::from_millis(100);
 /// How far a frame's span may run from the wall clock before it re-anchors.
 const REANCHOR_NS: u64 = 100_000_000;
 /// How often the span clock takes the system clock again (see [`WallClock`]).
-const WALL_REBASE: Duration = Duration::from_secs(3600);
+const WALL_REBASE: Duration = Duration::from_secs(60);
 /// The limiter's knee: unity gain inside it.
 const KNEE: f32 = 0.8;
 
@@ -125,7 +131,7 @@ impl Default for MixStage {
 }
 
 /// The wall clock as the stage's timer sees it: the system clock when last taken, advanced
-/// by the timer, so spans and hangovers share one clock. Taken again hourly, which heals a
+/// by the timer, so spans and hangovers share one clock. Taken again each minute, which heals a
 /// system clock that was stepped (a Pi's first NTP sync).
 struct WallClock {
     base_ns: u64,
