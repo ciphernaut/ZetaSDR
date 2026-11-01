@@ -117,6 +117,34 @@ async fn realtime_playback_keeps_the_rate() {
     );
 }
 
+/// A stall (here the whole runtime's thread) must not come back as a burst its subscribers
+/// cannot keep up with: the broadcast holds 64 blocks, 0.64 s at this block size.
+#[tokio::test]
+async fn realtime_playback_after_a_stall_loses_no_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = FileSource::open(
+        SourceId("f".into()),
+        &common::tone(dir.path()),
+        FileOpts {
+            realtime: true,
+            block_samples: 480,
+            repeat: true,
+            tune_range: None,
+        },
+    )
+    .unwrap();
+    let mut rx = src.subscribe();
+    let _h = src.start();
+    rx.recv().await.unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut total = 0;
+    while let Ok(block) = tokio::time::timeout_at(until, rx.recv()).await {
+        total += block.expect("no block lost after the stall").samples.len();
+    }
+    assert!(total >= 47_520, "{total} samples in the second after it");
+}
+
 #[tokio::test]
 async fn tune_off_center_is_out_of_range() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,5 +1,6 @@
 //! The mix on the real chain: two `fm_demod`s on one recording played in real time, at
-//! the block sizes a file source and a Soapy device deliver. These are the numbers
+//! the block sizes a file source delivers and a Soapy device delivers at capture rates
+//! (16 ms; a narrow 250 kHz capture's blocks are 65 ms). These are the numbers
 //! `zeta_dsp::mix::PREBUFFER_MS` is set from.
 
 use std::path::{Path, PathBuf};
@@ -226,7 +227,8 @@ async fn check(block_samples: usize) {
         clean += usize::from(w.clean());
     }
     // One clean window of three proves the design; a scheduler stall on a loaded machine may
-    // spoil another. A drift or a too-short prebuffer spoils all three.
+    // spoil another. A source that drifts against the mix's clock spoils all three. This does
+    // not pin the prebuffer: an idle machine passes at 0 ms.
     assert!(clean > 0, "no clean window at {block_samples} samples");
     assert_eq!(mix_context(&chain)["dropped_ms"], json!({}));
 }

@@ -260,7 +260,11 @@ impl FileSource {
             let mut elapsed: u64 = 0;
             // Paced by this clock rather than by summed sleeps, whose overshoots would add
             // up: a radio's samples do not run slow, and a mix's wall clock would starve.
-            let anchor = tokio::time::Instant::now();
+            let mut anchor = tokio::time::Instant::now();
+            let played = |n: u64| Duration::from_secs_f64(n as f64 / rate as f64);
+            // Later than this the clock restarts rather than catch up: the broadcast holds
+            // 64 blocks, and a longer burst would lag its subscribers.
+            let max_late = Duration::from_secs(1).min(played(32 * opts.block_samples as u64));
             if samples.is_empty() {
                 if !opts.repeat {
                     shared.lock().unwrap().take();
@@ -283,10 +287,16 @@ impl FileSource {
                         samples: chunk.into(),
                     });
                     if opts.realtime {
-                        tokio::time::sleep_until(
-                            anchor + Duration::from_secs_f64(elapsed as f64 / rate as f64),
-                        )
-                        .await;
+                        let due = anchor + played(elapsed);
+                        let late = due.elapsed();
+                        if late > max_late {
+                            anchor += late;
+                        }
+                        if late.is_zero() {
+                            tokio::time::sleep_until(due).await;
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
                     } else {
                         tokio::task::yield_now().await;
                     }
