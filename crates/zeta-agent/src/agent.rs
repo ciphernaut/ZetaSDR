@@ -32,6 +32,7 @@ pub const GATED_REPLACE_OPS: &[&str] = &[
 /// a `job_stop`, or a gated op with a non-empty `replace`. The executor is
 /// never reached; the error goes back to the model as the call's result.
 pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
+    // `op_from_call` always inserts `"op"`, so a value without a name never comes from a call.
     let name = op["op"].as_str()?;
     let field = if name == "job_stop" {
         if allow.stop_jobs {

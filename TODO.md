@@ -334,3 +334,13 @@ Found in plan 20's final review. `watch_healed` is spawned in `add_port`, before
 ## Worker: control frames queue behind IQ blocks
 
 Found in plan 20's final review. The worker's writer thread takes frames in order, so a reply or a status can wait behind up to 64 queued IQ blocks (at 20 Msps, tens of milliseconds and megabytes). Give control frames priority (a second queue the writer drains first) or cap the block queue in bytes rather than blocks.
+
+## Agent: let a run stop the jobs it started itself
+
+Found in the plan 21 final review, 2026-11-01. The stop gate (`allow.stop_jobs` false by default) also blocks the agent stopping jobs it started itself in the same run: the `measure` it starts to fit a demodulator, the decoder an `identify` leaves running under `verdict.job`. They pile up, and a repeat measure on the same box is refused as `duplicate` of the first.
+
+Suggested: the gate passes `job_stop` for ids that a `job_start` returned earlier in the same run, and still refuses every other id as `not_allowed`.
+
+## Agent: `graph_put` and `job_retune` change an operator's job without the allowance
+
+Found in the plan 21 final review, 2026-11-01. `graph_put` and `job_retune` can change an operator's job, or in effect end it (a graph that fails, a retune off the signal it served), without the allowance: the spec gates only `job_stop` and `replace`. Recorded as a slot: a gate for changes to jobs the run did not start, if the agent is ever seen doing this.
