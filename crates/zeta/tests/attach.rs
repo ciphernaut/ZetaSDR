@@ -374,3 +374,80 @@ async fn schema_lists_transcribe_readiness() {
     assert_eq!(r["ready"], true, "{r}");
     assert_eq!(r["capacity"], 4, "{r}");
 }
+
+/// The tone recording as a radio tunable over 470-480 MHz, source `cb`, and a node
+/// over it with the real stages (`transcribe` over `fake`, or without a backend).
+async fn cb_node(dir: &Path, fake: Option<Arc<FakeBackend>>) -> Node {
+    let tone = zeta_source_file::fixtures::write_tone(dir);
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: Some((Hz(470_000_000), Hz(480_000_000))),
+    };
+    let src = Arc::new(FileSource::open(SourceId("cb".into()), &tone, opts).unwrap());
+    src.start();
+    let port: Arc<dyn Port> = src;
+    Node::open(cfg(dir), registry_with(fake), vec![port])
+        .await
+        .unwrap()
+}
+
+fn cb_plan() -> Op {
+    Op::PlanStart {
+        plan: "uhf_cb_au".into(),
+        channels: Some(vec![1, 2]),
+        kind: JobKind::FmDemod,
+        source: SourceId("cb".into()),
+        deviation_hz: None,
+        sideband: None,
+        attach: Some(JobKind::Transcribe),
+        language: None,
+        replace: vec![],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plan_start_with_transcribe_is_refused_without_a_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = cb_node(dir.path(), None).await;
+    match node.apply(cb_plan()).await {
+        Err(OpError::Other { message }) => {
+            assert!(
+                message.contains(zeta_speech::NO_BACKEND_REASON),
+                "{message}"
+            );
+            assert!(message.ends_with("start without attach"), "{message}");
+        }
+        r => panic!("plan_start: {r:?}"),
+    }
+    assert!(node.job_list().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plan_start_with_transcribe_over_a_fake_backend_attaches_real_transcribers() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = cb_node(dir.path(), Some(Arc::new(FakeBackend::new(TEXT)))).await;
+    match node.apply(cb_plan()).await {
+        Ok(OpResult::PlanStart {
+            started,
+            refused,
+            warnings,
+            ..
+        }) => {
+            assert!(refused.is_empty(), "{refused:?}");
+            assert_eq!(started.len(), 2);
+            assert!(started.iter().all(|s| s.attached.is_some()));
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+        r => panic!("plan_start: {r:?}"),
+    }
+    let running = |kind: &str| {
+        node.job_list()
+            .iter()
+            .filter(|r| r.state == JobState::Running && r.kind == kind)
+            .count()
+    };
+    assert_eq!(running("fm_demod"), 2);
+    assert_eq!(running("transcribe"), 2);
+}

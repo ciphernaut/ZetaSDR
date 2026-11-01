@@ -3052,9 +3052,12 @@ async fn plan_start(
             }
         }
         // An existing entry has no error field: one that cannot be attached stays
-        // without, and a second run tries again.
+        // without, says why in a warning, and a second run tries again.
         for e in existing.iter_mut().filter(|e| e.attached.is_none()) {
-            e.attached = attach_one(node, a, &e.job, &language).await.ok();
+            match attach_one(node, a, &e.job, &language).await {
+                Ok(id) => e.attached = Some(id),
+                Err(err) => warnings.push(format!("ch{}: attach failed: {err}", e.channel)),
+            }
         }
         if let Some(c) = readiness.and_then(|r| r.capacity) {
             let n = node

@@ -9,12 +9,19 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
+use tokio_util::sync::CancellationToken;
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, SourceInfo};
+use zeta_core::ops::{PlanExisting, PlanStarted};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
-use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
+use zeta_core::stage::{
+    Backend, PassthroughStage, Readiness, Stage, StageContext, StageError, StageRegistry, StageSpec,
+};
+use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::stream_in::StreamInStage;
 use zeta_core::types::{Capabilities, Claim, Hz, JobId, SampleFormat, SourceId};
+use zeta_core::types::{StreamId, StreamKind};
 
 /// A radio that tunes to exactly the band asked for, counting its tunes.
 struct Radio {
@@ -443,4 +450,226 @@ async fn a_restart_resumes_the_plan_jobs_as_ordinary_jobs() {
         .collect();
     assert_eq!(fm.len(), 3);
     assert_eq!(source(&node).await.holders.len(), 3);
+}
+
+/// A stand-in for an audio-in stage of the given kind and readiness.
+struct Stand {
+    spec: StageSpec,
+    readiness: Readiness,
+}
+
+impl Stand {
+    fn new(kind: &'static str, outputs: &[StreamKind], readiness: Readiness) -> Arc<Self> {
+        Arc::new(Self {
+            spec: StageSpec {
+                kind,
+                inputs: vec![StreamKind::Audio],
+                outputs: outputs.to_vec(),
+                params_schema: schemars::json_schema!({"type": "object"}),
+            },
+            readiness,
+        })
+    }
+}
+
+#[async_trait]
+impl Stage for Stand {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    fn readiness(&self) -> Readiness {
+        self.readiness.clone()
+    }
+    async fn run(
+        &self,
+        _params: serde_json::Value,
+        mut inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let Some(rx) = inputs.first_mut() else {
+            return Err(StageError::Failed("expected 1 input".into()));
+        };
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                r = rx.recv() => match r {
+                    Ok(frame) => {
+                        // Audio-out stages pass the audio on; event outputs stay quiet.
+                        if let (Some(out), Payload::Audio { .. }) = (outputs.first(), &frame.payload)
+                            && self.spec.outputs.first() == Some(&StreamKind::Audio)
+                        {
+                            bus.publish(Frame::new(
+                                out.clone(),
+                                frame.provenance.clone(),
+                                frame.payload.clone(),
+                            ));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+            }
+        }
+    }
+}
+
+/// The registry with the attached chain's stand-ins; `transcribe` answers `readiness`.
+fn attach_registry(readiness: Readiness) -> StageRegistry {
+    let mut r = registry();
+    r.register(Arc::new(StreamInStage::new()));
+    r.register(Stand::new(
+        "denoise",
+        &[StreamKind::Audio],
+        Readiness::always(),
+    ));
+    r.register(Stand::new(
+        "vad",
+        &[StreamKind::Audio, StreamKind::Event],
+        Readiness::always(),
+    ));
+    r.register(Stand::new("transcribe", &[StreamKind::Event], readiness));
+    r
+}
+
+async fn open_with(dir: &Path, radio: &Arc<Radio>, r: StageRegistry) -> Node {
+    let ports: Vec<Arc<dyn Port>> = vec![radio.clone()];
+    Node::open(cfg(dir), r, ports).await.unwrap()
+}
+
+fn fm_attach(channels: Vec<u32>) -> Op {
+    plan_op(
+        PLAN,
+        Some(channels),
+        JobKind::FmDemod,
+        Some(JobKind::Transcribe),
+        None,
+        &[],
+    )
+}
+
+fn capacity(c: u32) -> Readiness {
+    Readiness {
+        ready: true,
+        reason: None,
+        capacity: Some(c),
+    }
+}
+
+type PlanParts = (Vec<PlanStarted>, Vec<PlanExisting>, Vec<String>);
+
+fn plan_result(r: Result<OpResult, OpError>) -> PlanParts {
+    match r {
+        Ok(OpResult::PlanStart {
+            started,
+            existing,
+            warnings,
+            ..
+        }) => (started, existing, warnings),
+        other => panic!("expected plan_start, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unready_attach_refuses_the_whole_op_before_any_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open_with(
+        dir.path(),
+        &radio,
+        attach_registry(Readiness::unready("no backend here")),
+    )
+    .await;
+    let m = other_message(node.apply(fm_attach(vec![1, 2])).await);
+    assert_eq!(m, "transcribe: no backend here; start without attach");
+    assert!(node.job_list().is_empty());
+    assert_eq!(radio.tunes(), 0);
+}
+
+#[tokio::test]
+async fn attach_follows_every_started_channel_and_warns_over_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open_with(dir.path(), &radio, attach_registry(capacity(4))).await;
+    let (started, existing, warnings) = plan_result(node.apply(fm_attach((1..=8).collect())).await);
+    assert_eq!(started.len(), 8);
+    assert!(existing.is_empty());
+    assert_eq!(running(&node).len(), 16);
+    for s in &started {
+        let att = s.attached.clone().expect("attached");
+        assert_eq!(s.attach_error, None);
+        let rec = node.job_list().into_iter().find(|r| r.id == att).unwrap();
+        assert_eq!(rec.input.as_ref(), Some(&s.job));
+        assert_eq!(rec.kind, "transcribe");
+    }
+    assert_eq!(
+        warnings,
+        [
+            "8 transcribe jobs share the speech backend's 4 slots: with the squelch on most channels are silent, so the slots are rarely contested; a busy daemon drops utterances with reason busy"
+        ]
+    );
+    // Two channels alone stay under the capacity.
+    let dir2 = tempfile::tempdir().unwrap();
+    let radio2 = Radio::new(RADIO);
+    let node2 = open_with(dir2.path(), &radio2, attach_registry(capacity(4))).await;
+    let (started, _, warnings) = plan_result(node2.apply(fm_attach(vec![1, 2])).await);
+    assert_eq!(started.len(), 2);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[tokio::test]
+async fn a_second_run_with_attach_attaches_the_existing_demods() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open_with(dir.path(), &radio, attach_registry(Readiness::always())).await;
+    let first = planned(&node, fm_plan(Some(vec![1, 2, 3]), &[])).await;
+    assert_eq!(first.started.len(), 3);
+    let (started, existing, warnings) = plan_result(node.apply(fm_attach(vec![1, 2, 3])).await);
+    assert!(started.is_empty());
+    assert!(warnings.is_empty());
+    assert_eq!(existing.len(), 3);
+    let ids: Vec<JobId> = existing
+        .iter()
+        .map(|e| e.attached.clone().expect("attached"))
+        .collect();
+    assert_eq!(running(&node).len(), 6);
+    let (started, existing, _) = plan_result(node.apply(fm_attach(vec![1, 2, 3])).await);
+    assert!(started.is_empty());
+    let again: Vec<JobId> = existing
+        .iter()
+        .map(|e| e.attached.clone().unwrap())
+        .collect();
+    assert_eq!(again, ids);
+    assert_eq!(running(&node).len(), 6);
+}
+
+#[tokio::test]
+async fn an_existing_channel_that_cannot_attach_is_named_in_a_warning() {
+    // `measure` publishes no audio, so a transcriber has nothing to read: the stand-in
+    // `transcribe` is ready but `attach_one` fails on the existing job's audio lookup.
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open_with(dir.path(), &radio, attach_registry(Readiness::always())).await;
+    let measure = |attach| plan_op(PLAN, Some(vec![1, 2]), JobKind::Measure, attach, None, &[]);
+    let first = planned(&node, measure(None)).await;
+    assert_eq!(first.started.len(), 2);
+    let (started, existing, warnings) =
+        plan_result(node.apply(measure(Some(JobKind::Transcribe))).await);
+    assert!(started.is_empty());
+    assert!(existing.iter().all(|e| e.attached.is_none()));
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with("ch1: attach failed: "),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings[1].starts_with("ch2: attach failed: "),
+        "{warnings:?}"
+    );
 }
