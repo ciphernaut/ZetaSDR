@@ -19,6 +19,7 @@ const RULES: &[&str] = &[
     "Ids are never invented: `source` values come from `source list`, `job` values from `job list`.",
     "Jobs belong to the operator: never `job_stop` a job or put one in `replace` unless the request names it or the run allows it. A `conflict` is reported with its holders; the operator decides.",
     "For a kind on every channel of a plan use `plan_start`, never one `job_start` per channel.",
+    "To stop every job, or every job of a source, kind or plan, use `jobs_stop`, never one `job_stop` per job.",
 ];
 
 const RUNNING: &str = "Every command takes these global flags:
@@ -44,7 +45,7 @@ There are two ways to run:
 - `zeta serve --listen PORT --llm-url URL --llm-model NAME` (the other `--llm-*` flags of `zeta ask` apply too) enables `POST /ask` with `{\"request\": \"TEXT\", \"max_turns\": 8, \"allow\": {\"stop_jobs\": false, \"replace\": false}}` (`max_turns` 1-32, default 8; `allow` optional, both false by default: without them the agent's `job_stop` and non-empty `replace` calls are refused as `not_allowed`): the node runs the agent against itself, so every operation it applies appears on the `ops` stream, and answers the transcript (`request`, `answer`, `calls`, `turns`) as `zeta ask` prints it, plus `allow` as the run had it and `turn_log`, one entry per model completion with its reasoning, content and call count. One run at a time (409 while one is in progress); 503 when serve has no `--llm-url`; a failed run is 502 with the error and the transcript so far; 504 after 300 s.
 - `zeta serve --listen PORT --stt-socket PATH` (env `ZETA_STT_SOCKET`; default `$XDG_RUNTIME_DIR/voiced.sock` when that file exists) enables `POST /stt?lang=CODE` (`lang` defaults to `en`): the body is a 16 kHz mono `audio/wav` (at most 4 MiB), the node hands it to the speech daemon at that Unix socket and answers `{\"text\": \"TRANSCRIPT\"}`. The daemon is `local-voice` or any daemon speaking its protocol: one line per connection, `file:<absolute wav path>` answered `ok:<text>` or `error:<message>`, and `languages` answered `ok:en,de,...` (a daemon answering `error:` there is taken to know English only). Instead of a daemon, `--stt-node URL` (env `ZETA_STT_NODE`, secret in `ZETA_STT_NODE_SECRET`, never printed) forwards each request to that node's `POST /stt`; the two flags are exclusive, for every command (exit 1). A forwarded request carries `X-Zeta-Stt-Hop: 1`, and a node that would forward it again answers 508 (`stt forwarding loop`). `GET /stt/languages` answers `{\"backend\": NAME, \"languages\": [CODES]}` (503 without a backend). 415 when the body is not WAV, 413 when too large, 422 `{\"error\": \"unsupported\", \"language\", \"supported\"}` for a language the backend lacks, 502 when the daemon reports an error, 503 when serve has no backend or cannot reach it, 503 `{\"error\": \"busy\", \"message\", \"wait_ms\"}` when every one of the daemon's 4 slots stayed taken for 30 s (a node forwarding with `--stt-node` reports that as a `busy` drop, not an error), 504 when the daemon does not answer within 30 s of its turn.
 
-While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `plan start`, `graph put`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
+While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `jobs stop`, `plan start`, `graph put`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
 
 Every operation the node applies is appended to `ops.log` in the state directory (rotated at 8 MiB) with its caller's transport (read-only operations are logged without their result); `zeta ops tail --lines N` prints the last N (local only). Every `transcript` event of a `transcribe` job is appended to `transcripts.log` in the state directory (rotated at 8 MiB) with the job, its input, the source and the channel's centre; `zeta transcripts tail --lines N [--job ID]` prints the last N (local only).";
 
@@ -78,6 +79,9 @@ fn note(op: &str) -> Option<&'static str> {
         ),
         "job_stop" => Some(
             "Stopping a job is the operator's decision: never `job_stop` a job the request did not name. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry.",
+        ),
+        "jobs_stop" => Some(
+            "One call however many jobs match; the page's elastic spectrum keeps running. Stopping jobs is the operator's decision: use it only when the request asks for all of them, or names the source, kind or plan. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry. Report how many stopped and any `failed`.",
         ),
         "plan_start" => Some(
             "Starts `kind` on the channels of a plan (`channels`, `null` for all of them) at each channel's `center_hz` with the plan's `bandwidth_hz`, under one lease decision for the band that bounds them: inside the current capture nothing retunes, otherwise the source is tuned when only elastic jobs hold it, and a scan or a rigid holder elsewhere is a `conflict` naming the holders with nothing started. Check `source_list` first. `kind` must run on the radio (not `transcribe`, `spectrum`, `scan`, `watch` or `identify`). `deviation_hz` and `sideband` are passed to every start as on `job_start` (`null` is the kind's default; give 2500 for `fm_demod` on 12.5 kHz channels). `attach` is `null` or `transcribe`, attached to every channel started or already running, and needs a ready stage (a speech backend for `transcribe`), else the op is refused with the stage's reason: start without `attach`. `language` must be `null` without `attach`. `replace`: as on `job_start`. The result lists `started` (channel, `center_hz`, `job`, `attached`, `attach_error`), `existing` (channels an identical running job already holds, skipped), `refused` (channels whose own start failed, with the error; the others went on) and `warnings`: repeat the `warnings` to the operator. Run it again to complete a partial set: running channels are `existing`, so nothing doubles.",
@@ -394,6 +398,9 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     }
     if op == "modes_show" {
         return "zeta modes show <id>".into();
+    }
+    if op == "jobs_stop" {
+        return "zeta jobs stop [--source ID] [--kind KIND] [--plan ID]".into();
     }
     if op == "plan_start" {
         return "zeta plan start --plan uhf_cb_au --kind fm_demod --source <id> [--channels 1,2,5-8] [--attach transcribe] [--language de] [--replace ID,ID]".into();

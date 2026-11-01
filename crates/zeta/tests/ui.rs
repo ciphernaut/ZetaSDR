@@ -359,6 +359,10 @@ fn fake_llm_scripts() -> serde_json::Value {
             tool_call_response(&[("plan_start", plan_start)]),
             text_response("Started 2 channels.", "stop"),
         ]},
+        {"match": "stop all jobs", "replies": [
+            tool_call_response(&[("jobs_stop", json!({"source": null, "kind": null, "plan": null}))]),
+            text_response("Stopped them.", "stop"),
+        ]},
         {"match": "think", "replies": [
             tool_call_response_with(
                 &[("source_list", json!({}))],

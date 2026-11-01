@@ -129,6 +129,13 @@ function labelText(l) {
 
 function resultText(r) {
   if (!r || typeof r !== "object") return "ok";
+  if (r.truncated && r.counts && r.result === "plan_start") {
+    const c = r.counts;
+    return `ok (${c.started} started, ${c.existing} existing, ${c.refused} refused)`;
+  }
+  if (r.truncated && r.counts && r.result === "jobs_stopped") {
+    return `ok (${r.counts.stopped} stopped, ${r.counts.failed} failed)`;
+  }
   if (r.truncated) return `ok (${r.result}, ${r.bytes} bytes)`;
   const v = r.value;
   switch (r.result) {
@@ -154,6 +161,10 @@ function resultText(r) {
     case "plan_start": {
       const n = (k) => (v && Array.isArray(v[k]) ? v[k].length : 0);
       return `ok (${n("started")} started, ${n("existing")} existing, ${n("refused")} refused)`;
+    }
+    case "jobs_stopped": {
+      const n = (k) => (v && Array.isArray(v[k]) ? v[k].length : 0);
+      return `ok (${n("stopped")} stopped, ${n("failed")} failed)`;
     }
     default:
       return `ok (${r.result})`;

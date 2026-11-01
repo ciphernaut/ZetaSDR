@@ -21,7 +21,7 @@ fn rendering_lists_every_op_variant() {
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let variants = v["value"]["op"]["oneOf"].as_array().unwrap();
-    assert_eq!(variants.len(), 24);
+    assert_eq!(variants.len(), 25);
     let md = zeta()
         .arg("agents-md")
         .assert()
@@ -112,4 +112,18 @@ fn plan_start_cli_line_is_the_real_command() {
     );
     assert!(md.contains("never `job_stop`"), "rule missing");
     assert!(md.contains("use `plan_start`"), "rule missing");
+}
+
+#[test]
+fn jobs_stop_cli_line_and_rule_are_in_the_guide() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    assert!(md.contains("CLI: `zeta jobs stop [--source ID] [--kind KIND] [--plan ID]`"));
+    assert!(md.contains("use `jobs_stop`, never one `job_stop` per job"));
 }

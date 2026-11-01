@@ -201,6 +201,9 @@ pub enum Command {
     /// Start a kind on every channel of a channel plan
     #[command(subcommand)]
     Plan(PlanCmd),
+    /// Many jobs at once
+    #[command(subcommand)]
+    Jobs(JobsCmd),
     /// The decoder modes the node knows
     #[command(subcommand)]
     Modes(ModesCmd),
@@ -245,6 +248,23 @@ pub struct SoapyWorkerArgs {
     /// SoapySDR device arguments, zeta's own gain= and ppm= included
     #[arg(long)]
     pub args: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JobsCmd {
+    /// Stop every running job matching the filters (none: every job), except elastic
+    /// jobs and those another job owns
+    Stop {
+        /// Only this source
+        #[arg(long)]
+        source: Option<String>,
+        /// Only this kind
+        #[arg(long, value_parser = parse_job_kind)]
+        kind: Option<JobKind>,
+        /// Only jobs on a channel of this plan
+        #[arg(long, value_name = "ID")]
+        plan: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -819,6 +839,7 @@ impl Command {
                     | JobCmd::Stop(_)
             ) | Command::Graph(GraphCmd::Put { .. })
                 | Command::Plan(PlanCmd::Start { .. })
+                | Command::Jobs(JobsCmd::Stop { .. })
         )
     }
 
@@ -959,6 +980,11 @@ impl Command {
                 }
                 Op::ChannelPlans {}
             }
+            Command::Jobs(JobsCmd::Stop { source, kind, plan }) => Op::JobsStop {
+                source: source.map(SourceId),
+                kind,
+                plan,
+            },
             Command::Plan(PlanCmd::Start {
                 plan,
                 channels,

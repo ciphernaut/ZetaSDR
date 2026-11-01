@@ -145,6 +145,10 @@ A start outside the pin is a `conflict` offering `unpin source S (source_unpin)`
 
 To run demodulators on active channels only, not on all 80, use `examples/python/cb_watch.py` (`--dry-run` shows which channels the capture holds): it keeps one elastic `spectrum` job, starts `fm_demod` plus `transcribe` on a channel that stands 10 dB over the floor and stops them after 60 s of quiet. For every channel at once, `plan_start`.
 
+### Stopping many jobs
+
+"Stop all jobs" is one `jobs_stop` with `source`, `kind` and `plan` all `null`, not one `job_stop` per job: there are not enough turns for that. Name a `source`, `kind` or `plan` when the request does. Report how many stopped and any `failed`. `not_allowed` means the run may not stop jobs: tell the operator, do not retry.
+
 ### Starting a whole plan
 
 "Transcribe all the UHF CB channels" is one operation, not 80 starts:

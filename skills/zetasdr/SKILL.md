@@ -17,6 +17,7 @@ ZetaSDR is an agentic SDR runtime. You drive it through a small typed operation 
 - Ids are never invented: `source` values come from `source list`, `job` values from `job list`.
 - Jobs belong to the operator: never `job_stop` a job or put one in `replace` unless the request names it or the run allows it. A `conflict` is reported with its holders; the operator decides.
 - For a kind on every channel of a plan use `plan_start`, never one `job_start` per channel.
+- To stop every job, or every job of a source, kind or plan, use `jobs_stop`, never one `job_stop` per job.
 
 ## Running the node
 
@@ -43,7 +44,7 @@ There are two ways to run:
 - `zeta serve --listen PORT --llm-url URL --llm-model NAME` (the other `--llm-*` flags of `zeta ask` apply too) enables `POST /ask` with `{"request": "TEXT", "max_turns": 8, "allow": {"stop_jobs": false, "replace": false}}` (`max_turns` 1-32, default 8; `allow` optional, both false by default: without them the agent's `job_stop` and non-empty `replace` calls are refused as `not_allowed`): the node runs the agent against itself, so every operation it applies appears on the `ops` stream, and answers the transcript (`request`, `answer`, `calls`, `turns`) as `zeta ask` prints it, plus `allow` as the run had it and `turn_log`, one entry per model completion with its reasoning, content and call count. One run at a time (409 while one is in progress); 503 when serve has no `--llm-url`; a failed run is 502 with the error and the transcript so far; 504 after 300 s.
 - `zeta serve --listen PORT --stt-socket PATH` (env `ZETA_STT_SOCKET`; default `$XDG_RUNTIME_DIR/voiced.sock` when that file exists) enables `POST /stt?lang=CODE` (`lang` defaults to `en`): the body is a 16 kHz mono `audio/wav` (at most 4 MiB), the node hands it to the speech daemon at that Unix socket and answers `{"text": "TRANSCRIPT"}`. The daemon is `local-voice` or any daemon speaking its protocol: one line per connection, `file:<absolute wav path>` answered `ok:<text>` or `error:<message>`, and `languages` answered `ok:en,de,...` (a daemon answering `error:` there is taken to know English only). Instead of a daemon, `--stt-node URL` (env `ZETA_STT_NODE`, secret in `ZETA_STT_NODE_SECRET`, never printed) forwards each request to that node's `POST /stt`; the two flags are exclusive, for every command (exit 1). A forwarded request carries `X-Zeta-Stt-Hop: 1`, and a node that would forward it again answers 508 (`stt forwarding loop`). `GET /stt/languages` answers `{"backend": NAME, "languages": [CODES]}` (503 without a backend). 415 when the body is not WAV, 413 when too large, 422 `{"error": "unsupported", "language", "supported"}` for a language the backend lacks, 502 when the daemon reports an error, 503 when serve has no backend or cannot reach it, 503 `{"error": "busy", "message", "wait_ms"}` when every one of the daemon's 4 slots stayed taken for 30 s (a node forwarding with `--stt-node` reports that as a `busy` drop, not an error), 504 when the daemon does not answer within 30 s of its turn.
 
-While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `plan start`, `graph put`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
+While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `jobs stop`, `plan start`, `graph put`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
 
 Every operation the node applies is appended to `ops.log` in the state directory (rotated at 8 MiB) with its caller's transport (read-only operations are logged without their result); `zeta ops tail --lines N` prints the last N (local only). Every `transcript` event of a `transcribe` job is appended to `transcripts.log` in the state directory (rotated at 8 MiB) with the job, its input, the source and the channel's centre; `zeta transcripts tail --lines N [--job ID]` prints the last N (local only).
 
@@ -208,6 +209,20 @@ JSON: `{"op":"job_stop","job":"<id>"}`
 CLI: `zeta job stop --job <id>`
 
 Stopping a job is the operator's decision: never `job_stop` a job the request did not name. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry.
+
+### jobs_stop
+
+Stop every running job that matches all the filters given, in one operation: `source`, `kind` and `plan` (`null` for any; all three `null` is every job). A job's filter on `plan` is its centre lying on one of that plan's channels. Elastic jobs (the page's spectrum) and jobs another job owns (a `watch`'s or an `identify`'s trial jobs) are never named: they follow the capture or their owner. Jobs on a radio are stopped first, then those attached to them; an attached job that ended with its input counts as stopped. The result lists `stopped` (ids) and `failed` (`job`, `error`; the others go on). No match is an empty `stopped`, not an error.
+
+- source: string or null; an id from `source list`
+- kind: string or null
+- plan: string or null; an id from `channel_plans`
+
+JSON: `{"op":"jobs_stop","source":null,"kind":null,"plan":null}`
+
+CLI: `zeta jobs stop [--source ID] [--kind KIND] [--plan ID]`
+
+One call however many jobs match; the page's elastic spectrum keeps running. Stopping jobs is the operator's decision: use it only when the request asks for all of them, or names the source, kind or plan. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry. Report how many stopped and any `failed`.
 
 ### job_context
 
@@ -646,6 +661,10 @@ A start outside the pin is a `conflict` offering `unpin source S (source_unpin)`
 `channel_plans` (CLI `zeta plans`) returns the plans the node knows with every channel's `number` and `center_hz`. Name a channel to the user by its number ("ch20", not 476.9 MHz) and start jobs at its `center_hz` with the plan's `bandwidth_hz`. The AU UHF CB plan interleaves two rasters: ch1-40 sit 25 kHz apart and ch41-80 fall halfway between them, so every channel has neighbours 12.5 kHz either side. A strong ch20 transmission leaks into ch59 and ch60 and used to open both squelches and echo the same words three times. An `fm_demod` on a plan channel therefore carries a guard: its squelch stays closed while a neighbour `guard_hz` away is more than `guard_db` stronger, and the `squelch` event says so with `guarded: true` and `adjacent_db`. When a quiet channel shows `squelch` and no transcripts, read `guarded` before concluding it is broken. The guard needs the squelch on (it is inert with `squelch: false`) and `graph put` with `guard_hz: null` turns it off. `transcribe` ignores utterances under `min_utterance_ms` (700) and a busy speech daemon drops with `reason` `queue` or `busy`; `queued_ms` on a transcript is the time it waited.
 
 To run demodulators on active channels only, not on all 80, use `examples/python/cb_watch.py` (`--dry-run` shows which channels the capture holds): it keeps one elastic `spectrum` job, starts `fm_demod` plus `transcribe` on a channel that stands 10 dB over the floor and stops them after 60 s of quiet. For every channel at once, `plan_start`.
+
+### Stopping many jobs
+
+"Stop all jobs" is one `jobs_stop` with `source`, `kind` and `plan` all `null`, not one `job_stop` per job: there are not enough turns for that. Name a `source`, `kind` or `plan` when the request does. Report how many stopped and any `failed`. `not_allowed` means the run may not stop jobs: tell the operator, do not retry.
 
 ### Starting a whole plan
 

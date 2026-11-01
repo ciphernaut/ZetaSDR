@@ -407,6 +407,19 @@ async fn an_empty_replace_passes_the_gate() {
 }
 
 #[test]
+fn jobs_stop_needs_stops_allowed() {
+    let op = json!({"op": "jobs_stop", "source": null, "kind": null, "plan": null});
+    let refused = gate(&op, Allow::default()).expect("refused");
+    assert_eq!(refused["error"], "not_allowed");
+    assert_eq!(refused["op"], "jobs_stop");
+    let allowed = Allow {
+        stop_jobs: true,
+        replace: false,
+    };
+    assert!(gate(&op, allowed).is_none());
+}
+
+#[test]
 fn gate_covers_every_replace_taking_op() {
     for name in GATED_REPLACE_OPS {
         assert!(

@@ -712,3 +712,131 @@ async fn a_plan_start_dropped_mid_way_leaves_no_holder() {
     assert_eq!(radio.current(), Some(two_metres));
     assert_eq!(running(&node), vec![job]);
 }
+
+#[tokio::test]
+async fn jobs_stop_stops_what_matches_and_keeps_the_elastic_spectrum() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    let stop = |source: Option<&str>, kind: Option<JobKind>, plan: Option<&str>| Op::JobsStop {
+        source: source.map(|s| zeta_core::types::SourceId(s.into())),
+        kind,
+        plan: plan.map(Into::into),
+    };
+    planned(&node, fm_plan(None, &[])).await;
+    let elastic = started(
+        &node,
+        Op::JobStart {
+            kind: JobKind::Spectrum,
+            source: zeta_core::types::SourceId(RADIO.into()),
+            center_hz: Hz(476_918_750),
+            bandwidth_hz: Hz(1_000_000),
+            deviation_hz: None,
+            sideband: None,
+            elastic: true,
+            replace: vec![],
+        },
+    )
+    .await;
+    assert_eq!(running(&node).len(), 81);
+
+    // Bad filters change nothing; a filter that matches nothing is an empty answer.
+    let r = node.apply(stop(Some("nope"), None, None)).await;
+    assert!(matches!(r, Err(OpError::Unknown { ref field, .. }) if field == "source"));
+    let r = node.apply(stop(None, None, Some("nope"))).await;
+    assert!(matches!(r, Err(OpError::Unknown { ref field, .. }) if field == "plan"));
+    match node
+        .apply(stop(None, Some(JobKind::Measure), None))
+        .await
+        .unwrap()
+    {
+        OpResult::JobsStopped { stopped, failed } => {
+            assert!(stopped.is_empty() && failed.is_empty())
+        }
+        r => panic!("jobs_stop: {r:?}"),
+    }
+    assert_eq!(running(&node).len(), 81);
+
+    match node.apply(stop(None, None, Some(PLAN))).await.unwrap() {
+        OpResult::JobsStopped { stopped, failed } => {
+            assert_eq!(stopped.len(), 80);
+            assert!(failed.is_empty());
+        }
+        r => panic!("jobs_stop: {r:?}"),
+    }
+    assert_eq!(running(&node), vec![elastic]);
+    assert!(source(&node).await.holders.is_empty());
+}
+
+#[tokio::test]
+async fn jobs_stop_with_no_filter_stops_a_job_outside_any_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    let a = started(
+        &node,
+        start(JobKind::Passthrough, band(100_000_000, 48_000)),
+    )
+    .await;
+    let r = node
+        .apply(Op::JobsStop {
+            source: None,
+            kind: None,
+            plan: Some(PLAN.into()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(r, OpResult::JobsStopped { ref stopped, .. } if stopped.is_empty()));
+    assert_eq!(running(&node), vec![a.clone()]);
+    let r = node
+        .apply(Op::JobsStop {
+            source: None,
+            kind: None,
+            plan: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(r, OpResult::JobsStopped { ref stopped, .. } if *stopped == vec![a.clone()]));
+    assert!(running(&node).is_empty());
+}
+
+#[tokio::test]
+async fn a_whole_plan_result_keeps_its_counts_when_the_ops_record_is_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    let r = node.apply(fm_plan(None, &[])).await.unwrap();
+    let v = r.summary_json();
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["result"], "plan_start");
+    assert_eq!(
+        v["counts"],
+        serde_json::json!({"started": 80, "existing": 0, "refused": 0})
+    );
+}
+
+#[tokio::test]
+async fn jobs_stop_ends_demodulators_and_their_attached_jobs_without_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open_with(dir.path(), &radio, attach_registry(capacity(4))).await;
+    node.apply(fm_attach((1..=8).collect())).await.unwrap();
+    assert_eq!(running(&node).len(), 16);
+    let r = node
+        .apply(Op::JobsStop {
+            source: Some(SourceId(RADIO.into())),
+            kind: None,
+            plan: None,
+        })
+        .await
+        .unwrap();
+    match r {
+        OpResult::JobsStopped { stopped, failed } => {
+            assert_eq!(stopped.len(), 16);
+            assert!(failed.is_empty(), "{failed:?}");
+        }
+        r => panic!("jobs_stop: {r:?}"),
+    }
+    assert!(running(&node).is_empty());
+    assert!(source(&node).await.holders.is_empty());
+}

@@ -88,7 +88,8 @@
 // that may stop jobs ends " [may stop jobs]", each turn of its `turn_log` is a collapsed
 // `details.turn`, and a refused call (`not_allowed`) adds the note with the action `allow stops
 // and ask again`, which re-sends that one request with both flags true and leaves the switch
-// off; the note's buttons disable once clicked) and `plan start <plan> <kind> [<attach>] [ch N,N-M]` (a `plan_start` op on
+// off; the note's buttons disable once clicked), `stop all` (a `jobs_stop` of every job but the
+// page's spectrum) and `plan start <plan> <kind> [<attach>] [ch N,N-M]` (a `plan_start` op on
 // the shown source through applyOp: conflicts get retry buttons, refused channels and
 // warnings a note each).
 
@@ -626,6 +627,12 @@ async function runCommand(text) {
     state.transcript.user(text);
     state.allowStops = allow[1] === "on";
     state.transcript.note(`allow stops: ${allow[1]}`);
+    return;
+  }
+  // Exactly these words: "stop all jobs" and the like are requests for the agent.
+  if (/^stop\s+all$/.test(text)) {
+    state.transcript.user(text);
+    await applyOp({ op: "jobs_stop", source: null, kind: null, plan: null });
     return;
   }
   if (/^plan\s+start\b/.test(text)) {

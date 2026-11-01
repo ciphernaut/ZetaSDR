@@ -232,6 +232,29 @@ pub enum Op {
     JobStop {
         job: JobId,
     },
+    /// Stop every running job that matches all the filters given, in one operation:
+    /// `source`, `kind` and `plan` (`null` for any; all three `null` is every job). A
+    /// job's filter on `plan` is its centre lying on one of that plan's channels. Elastic
+    /// jobs (the page's spectrum) and jobs another job owns (a `watch`'s or an
+    /// `identify`'s trial jobs) are never named: they follow the capture or their owner.
+    /// Jobs on a radio are stopped first, then those attached to them; an attached job
+    /// that ended with its input counts as stopped. The result lists `stopped` (ids) and
+    /// `failed` (`job`, `error`; the others go on). No match is an empty `stopped`, not
+    /// an error.
+    JobsStop {
+        /// An id from `source_list`; `null` for every source.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<SourceId>")]
+        source: Option<SourceId>,
+        /// A job kind; `null` for every kind.
+        #[serde(deserialize_with = "nullable_kind")]
+        #[schemars(required, schema_with = "nullable_kind_filter_schema")]
+        kind: Option<JobKind>,
+        /// A plan id from `channel_plans`; `null` for any band.
+        #[serde(deserialize_with = "nullable_string_value")]
+        #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+        plan: Option<String>,
+    },
     JobContext {
         job: JobId,
     },
@@ -347,6 +370,14 @@ fn nullable_channels_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sche
 /// Deserialize a required `Option<JobKind>` (see [`nullable_u64`]).
 fn nullable_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<JobKind>, D::Error> {
     <Option<JobKind> as Deserialize>::deserialize(d)
+}
+
+/// Schema of `jobs_stop`'s `kind`: any job kind's name, or `null`.
+fn nullable_kind_filter_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "description": "A job kind; `null` for every kind."
+    })
 }
 
 /// Schema of `plan_start`'s `attach`: `["string","null"]`, enum the attachable kinds
@@ -1515,6 +1546,15 @@ pub struct PlanRefused {
     pub error: OpError,
 }
 
+/// A job `jobs_stop` could not stop, with why.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct JobStopFailed {
+    pub job: JobId,
+    pub error: OpError,
+}
+
 /// A source of `source_free` that covers the band but cannot take it now, with why.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1793,6 +1833,11 @@ pub enum OpResult {
         refused: Vec<PlanRefused>,
         warnings: Vec<String>,
     },
+    /// `jobs_stop`: the jobs stopped and those that could not be.
+    JobsStopped {
+        stopped: Vec<JobId>,
+        failed: Vec<JobStopFailed>,
+    },
     Ok,
     Schema(serde_json::Value),
 }
@@ -1813,6 +1858,7 @@ impl Op {
             Op::PlanStart { .. } => "plan_start",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
+            Op::JobsStop { .. } => "jobs_stop",
             Op::JobContext { .. } => "job_context",
             Op::IqRead { .. } => "iq_read",
             Op::StreamList {} => "stream_list",
@@ -1896,6 +1942,7 @@ impl OpResult {
             OpResult::Classification { .. } => "classification",
             OpResult::Gain(_) => "gain",
             OpResult::PlanStart { .. } => "plan_start",
+            OpResult::JobsStopped { .. } => "jobs_stopped",
             OpResult::Ok => "ok",
             OpResult::Schema(_) => "schema",
         }
@@ -1904,9 +1951,36 @@ impl OpResult {
     /// The result as JSON for the `ops` stream: the full value when it fits
     /// in [`OPS_RESULT_LIMIT_BYTES`], otherwise
     /// `{"result": <variant>, "truncated": true, "bytes": n}`. A value that
-    /// fails to serialise is summarised with `bytes: 0`.
+    /// fails to serialise is summarised with `bytes: 0`. A truncated `plan_start` or
+    /// `jobs_stop` keeps what its reader needs: `counts`, and `plan_start`'s `warnings`.
     pub fn summary_json(&self) -> serde_json::Value {
-        bounded_json(self, "result", self.variant_name())
+        let mut v = bounded_json(self, "result", self.variant_name());
+        if v.get("truncated").is_some() {
+            match self {
+                OpResult::PlanStart {
+                    started,
+                    existing,
+                    refused,
+                    warnings,
+                    ..
+                } => {
+                    v["counts"] = serde_json::json!({
+                        "started": started.len(),
+                        "existing": existing.len(),
+                        "refused": refused.len(),
+                    });
+                    v["warnings"] = serde_json::json!(warnings);
+                }
+                OpResult::JobsStopped { stopped, failed } => {
+                    v["counts"] = serde_json::json!({
+                        "stopped": stopped.len(),
+                        "failed": failed.len(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        v
     }
 }
 
@@ -2700,6 +2774,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             .await
             .map(|()| OpResult::Ok)
             .map_err(|e| node_error(node, e)),
+        Op::JobsStop { source, kind, plan } => jobs_stop(node, source, kind, plan).await,
         Op::JobContext { job } => node
             .job_context(&job)
             .map(OpResult::Context)
@@ -2770,6 +2845,68 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
         Op::Classify { selection } => classify(node, selection).await,
         Op::Schema {} => Ok(OpResult::Schema(node.schema())),
     }
+}
+
+/// `jobs_stop`: stop the running jobs the filters match, those on a radio first (an
+/// attached job then usually ends with its input, and stopping it again is a no-op). A
+/// record already forgotten from the history has stopped too.
+async fn jobs_stop(
+    node: &Node,
+    source: Option<SourceId>,
+    kind: Option<JobKind>,
+    plan: Option<String>,
+) -> Result<OpResult, OpError> {
+    if let Some(s) = &source
+        && node.port(s).is_none()
+    {
+        return Err(unknown_source(node, s));
+    }
+    let channels = match &plan {
+        None => None,
+        Some(id) => {
+            let Some(p) = crate::plans::plan(id) else {
+                return Err(OpError::Unknown {
+                    field: "plan".into(),
+                    value: id.clone(),
+                    known: crate::plans::PLANS
+                        .iter()
+                        .map(|p| p.id.to_string())
+                        .collect(),
+                });
+            };
+            Some(crate::plans::channels(p))
+        }
+    };
+    let on_plan = |hz: u64| {
+        channels.as_ref().is_none_or(|c| {
+            c.iter()
+                .any(|&(_, center)| center.abs_diff(hz) <= crate::plans::CHANNEL_MATCH_HZ)
+        })
+    };
+    let mut matched: Vec<_> = node
+        .job_list()
+        .into_iter()
+        .filter(|r| {
+            r.state == JobState::Running
+                && !r.elastic
+                && r.owner.is_none()
+                && source.as_ref().is_none_or(|s| r.source == *s)
+                && kind.as_ref().is_none_or(|k| r.kind == k.name())
+                && on_plan(r.tuning.center_hz.0)
+        })
+        .collect();
+    matched.sort_by_key(|r| r.input.is_some());
+    let (mut stopped, mut failed) = (Vec::new(), Vec::new());
+    for r in matched {
+        match node.job_stop(&r.id).await {
+            Ok(()) | Err(NodeError::UnknownJob(_)) => stopped.push(r.id),
+            Err(e) => failed.push(JobStopFailed {
+                job: r.id,
+                error: node_error(node, e),
+            }),
+        }
+    }
+    Ok(OpResult::JobsStopped { stopped, failed })
 }
 
 /// `job_attach`: check the kind and language, then attach to `job`'s audio stream.

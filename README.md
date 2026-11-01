@@ -95,6 +95,7 @@ Holding a capture, receive gain and transcripts:
 ./target/debug/zeta source gain --source b210 --db 45     # or --auto
 ./target/debug/zeta transcripts tail --lines 20 --job job-7   # default 50 lines, local state dir only
 ./target/debug/zeta plans [--plan uhf_cb_au]     # channel plans with their channels expanded
+./target/debug/zeta jobs stop --source b210   # every job on a source in one operation (no filter: every job; the page's spectrum stays)
 ./target/debug/zeta plan start --plan uhf_cb_au --kind fm_demod --source b210 --channels 1,2,5-8 --attach transcribe   # one lease decision, one job per channel
 ```
 

@@ -34,7 +34,7 @@ pub const GATED_REPLACE_OPS: &[&str] = &[
 pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
     // `op_from_call` always inserts `"op"`, so a value without a name never comes from a call.
     let name = op["op"].as_str()?;
-    let field = if name == "job_stop" {
+    let field = if name == "job_stop" || name == "jobs_stop" {
         if allow.stop_jobs {
             return None;
         }

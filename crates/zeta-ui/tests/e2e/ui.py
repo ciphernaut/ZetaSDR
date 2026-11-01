@@ -3105,6 +3105,36 @@ def scenario_ask_fans_out_through_plan_start(page, url, secret):
     assert not running_kind(url, secret, "fm_demod", "cb"), "the fm_demod jobs stopped"
 
 
+def scenario_stop_all_is_one_operation_and_keeps_the_spectrum(page, url, secret):
+    url = llm_url()
+    select_source(page, url, secret, "cb")
+    measure = lambda: start_job(url, secret, "measure", "cb", 476_900_000, 10_000)
+    jobs = lambda kind: running_kind(url, secret, kind, "cb")
+    try:
+        # Through the agent: refused until stops are allowed, then one call.
+        measure()
+        run_cmd(page, "stop all jobs")
+        expect(page.locator("#transcript .line.note",
+                            has_text="the agent was not allowed to stop or replace jobs")
+               ).to_have_count(1)
+        assert len(jobs("measure")) == 1, "a refused jobs_stop stopped nothing"
+        run_cmd(page, "allow stops on")
+        run_cmd(page, "stop all jobs")
+        expect(page.locator("#transcript .line", has_text="[agent] ").filter(
+            has_text="jobs_stop").filter(has_text="1 stopped, 0 failed")).to_have_count(1)
+        assert not jobs("measure"), "the agent's jobs_stop stopped the job"
+        # Typed: the exact words, no model.
+        measure()
+        run_cmd(page, "stop all")
+        expect(page.locator("#transcript .line.op", has_text="jobs_stop").filter(
+            has_text="1 stopped, 0 failed")).to_have_count(2)
+        assert not jobs("measure"), "the typed stop all stopped the job"
+        assert jobs("spectrum"), "the page's elastic spectrum keeps running"
+    finally:
+        for j in jobs("measure"):
+            stop_job(url, secret, j)
+
+
 # ---- channel plans (plan 13 Task 4) ---------------------------------------------------------
 # `cb` is the tone recording labelled at 476.9 MHz, channel 20 of uhf_cb_au.
 
