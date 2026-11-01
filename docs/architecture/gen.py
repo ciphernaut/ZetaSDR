@@ -9,7 +9,7 @@ from __future__ import annotations
 import html, pathlib
 
 HERE = pathlib.Path(__file__).parent
-AS_OF = "2026-11-01, main 771ea93, v0.1.0"
+AS_OF = "2026-11-01, main 9d736ab, v0.1.0; sprint 2026-10-27 closed"
 SHIPPED = "shipped (plans 1-18 and 20 merged to main)"
 PLANNED = "planned (plan 19, the rest of the UI wave, TODO gists)"
 AMBER = "#b7791f"

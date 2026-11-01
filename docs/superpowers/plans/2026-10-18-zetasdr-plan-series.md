@@ -44,6 +44,32 @@ specs are written in a brainstorming session before the plan, as before.
 | 20 | Soapy worker process | A `zeta soapy-worker` child owning the driver behind a Port that faults when the child exits, so a driver crash never ends the node, and a source that heals is recovered. Spec `docs/superpowers/specs/2026-10-31-soapy-worker-design.md`, plan `docs/superpowers/plans/2026-10-31-soapy-worker.md`. **Merged** to `main` 2026-10-31 (3acbad4); live acceptance on the field host partly done (see "Plan 20 status"). | 14 |
 
 
+### Outcome (closed 2026-11-01)
+
+Six of the seven plans shipped; plan 19 was not started and opens the next sprint.
+
+| Plan | Merged | Proved live | Rolls forward |
+|---|---|---|---|
+| 14 field fix wave | ?, 2026-10-28 | short-form clock/leak/measure/device-loss on the HackRF (Plan 14 status) | the 2 h clock run |
+| 15 scan grid and masks | 83726a2, 2026-11-01 | the mechanism on the B210 (alternation, `masked` rows, `graph put`, `job_context`) | the HackRF constants (`docs/superpowers/plans/2026-11-01-hackrf-acceptance-e14.md`) |
+| 16 mode registry | 91886bc, 2026-10-28 | registry, check, broken rows, handlers, identify-unknown on the HackRF | on-air POCSAG, APRS and ADS-B proofs |
+| 17 sonde frameworks | 97383b0, 2026-10-29 | RS41 X1142896 decoded on the B210 2026-11-01 (pre-placed decoder) | the watch finding a sonde on its own (detector, re-centre) |
+| 18 box, fit, refine | 771ea93, 2026-11-01 | retune, drag, menu, tags, conflict and the fit mechanism on the B210 | the fit on a transmitting CB channel (e14 note) |
+| 19 layer 4 stages | not started | | the whole plan |
+| 20 Soapy worker | 3acbad4, 2026-10-31 | items 1-2 on the B210 (SIGSEGV heal) | the cable pull and the HackRF single-node form (e14 note) |
+
+Also shipped in the sprint's last days: the stream socket pool 16 → 64 (9d736ab), the
+architecture page as of 771ea93, and the TODO gists this week left behind (serialise restarts of
+one input; refuse `job_retune` on owned jobs; the fit's measure through `applyOp`; `job_start`
+tunes twice on an unheld radio; a `--max-streams` flag and per-client fairness; the page's four
+watched jobs; an attached record's stale tuning; repeated Fit walking the width down; the detector
+floor versus a real RS41; the lease keeping a lone job's capture centre off its channel).
+Two specs were amended during execution and say so in dated notes: plan 15 §3 (a quarter-step
+grid, not a half) and plan 18 §4 (an SSB fit moves the dial and keeps its band).
+
+The next sprint's first candidates, from `TODO.md`: staircase transcript ribbons (seen again on the
+sonde decode), the watch detector, plan 19, and the lease offset.
+
 ## Plan 15 status
 
 Plan 15 (scan grid and mask) is on the `plan-15` branch. Merged to `main` 2026-11-01 (83726a2). Live acceptance on the desktop HackRF is pending.
@@ -208,6 +234,22 @@ sonde (RS41-SGE X1142834) on 401.4999 MHz, 15 km up and descending 120 km east a
 there read 8-13 dB SNR fading to noise by 11:15 and `rs41_decode` on the published frequency produced
 no frame before it faded. The on-air decode proof therefore still waits for the 22:00 launch, which
 ascends towards the station.
+
+Second live run, 2026-11-01 10:00-10:50 on the field host's B210 (`plan18-zeta`, main 9d736ab, discone,
+10:00 Brisbane launch): the on-air decode proof is in. RS41-SGE X1142896 on 401.4999 MHz was decoded
+by the `rs41_decode` pre-placed on the last known frequency (401.500250 Hz, 375 Hz off), frames with
+`id`, `position` and the row's `summary` from about 10:12 AEST (21.8 km up, rising 5 m/s, about 70 km
+east over the water) and still arriving at 10:50; the ribbons for one job staircase down the
+waterfall (`TODO.md` "staircase transcript ribbons"). The watch half is not proved: with the
+field-tested detector (`threshold_db` 18, `persist_ms` 5000, `width_hz` [8000, 30000]) the sonde
+read 4.5 kHz wide at 19 dB and was never a `signal`; at `width_hz` [4000, 30000] it was, but so were
+a dozen 4.5 kHz spikes at round offsets from the capture centre (402.0245, 402.1505, 402.9005,
+403.1494, 403.8996 MHz: B210 spurs) and the watch churned identify runs on them, so the floor went
+back to 8 kHz. Two 15-18 kHz bursty links at 404.025 (Unitywater) and 404.299 MHz identified
+`unknown` three times each, correctly. The sonde's channel SNR was about 6 dB where `measure`
+said 20 (a per-bin peak); B210 gain 65 → 76 dB raised signal and floor alike. What remains is the
+detector (a tone-pair or run-energy criterion and a per-device spur list, `TODO.md` "the watch's
+detect defaults fire on receiver noise") and the re-centre before identify.
 
 ## Plan 16 status
 
