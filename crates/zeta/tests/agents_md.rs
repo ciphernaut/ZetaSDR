@@ -148,3 +148,18 @@ fn mix_start_is_in_the_guide() {
         assert!(md.contains(needle), "missing {needle}");
     }
 }
+
+#[test]
+fn the_guide_has_the_plan_rule_and_the_own_jobs_rule() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    assert!(md.contains("Plan ids come from `channel_plans`: read it before naming a plan. A band with no plan takes one `job_start` per measured station; never invent a plan."));
+    assert!(md.contains("started it in this run"));
+    assert!(md.contains("never `job_stop`"));
+}

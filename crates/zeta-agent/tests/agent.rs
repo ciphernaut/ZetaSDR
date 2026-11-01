@@ -543,3 +543,183 @@ async fn the_fake_llm_binary_serves_its_scripts_file() {
     let _ = child.wait();
     outcome.unwrap();
 }
+
+fn start_args(kind: &str) -> Value {
+    json!({"kind": kind, "source": "tone", "center_hz": 1, "bandwidth_hz": 1,
+           "deviation_hz": null, "sideband": null, "elastic": false, "replace": []})
+}
+
+fn started(id: &str) -> Result<Value, Value> {
+    Ok(json!({"result": "job", "value": id}))
+}
+
+fn applied_ops(exec: &RecordingExecutor) -> Vec<String> {
+    exec.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|o| o["op"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_run_stops_the_job_it_started() {
+    let fake = fake(vec![
+        tool_call_response(&[("job_start", start_args("measure"))]),
+        tool_call_response(&[("job_stop", json!({"job": "J1"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![("job_start", started("J1"))]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("measure it").await.unwrap();
+    assert_eq!(applied_ops(&exec), ["job_start", "job_stop"]);
+    assert!(t.calls[1].ok, "{}", t.calls[1].result);
+}
+
+#[tokio::test]
+async fn a_run_stops_what_plan_start_gave_it() {
+    let planned = json!({"result": "plan_start", "value": {
+        "started": [{"job": "J1", "attached": "T1"}, {"job": "J2", "attached": null}],
+        "existing": [{"job": "E1"}], "refused": [], "warnings": []}});
+    let plan_args = json!({"plan": "p", "kind": "fm_demod", "channels": null, "deviation_hz": null,
+        "sideband": null, "attach": null, "language": null, "source": "tone", "replace": []});
+    let mut script = vec![tool_call_response(&[("plan_start", plan_args)])];
+    for j in ["J1", "T1", "J2", "E1"] {
+        script.push(tool_call_response(&[("job_stop", json!({"job": j}))]));
+    }
+    script.push(text_response("done", "stop"));
+    let fake = fake(script).await;
+    let exec = RecordingExecutor::new(vec![("plan_start", Ok(planned))]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("start the plan").await.unwrap();
+    assert!(t.calls[1].ok && t.calls[2].ok && t.calls[3].ok);
+    assert!(!t.calls[4].ok);
+    assert_eq!(t.calls[4].result["error"], "not_allowed");
+}
+
+#[tokio::test]
+async fn a_run_stops_the_job_it_attached() {
+    let fake = fake(vec![
+        tool_call_response(&[(
+            "job_attach",
+            json!({"kind": "transcribe", "job": "J1", "language": null}),
+        )]),
+        tool_call_response(&[("job_stop", json!({"job": "T1"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![("job_attach", started("T1"))]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("attach").await.unwrap();
+    assert!(t.calls[1].ok, "{}", t.calls[1].result);
+}
+
+#[tokio::test]
+async fn identify_verdict_job_is_its_own_once_read() {
+    let ctx = json!({"result": "job_context", "value": {"identify": {"verdict": {"job": "V1"}}}});
+    let fake = fake(vec![
+        tool_call_response(&[("job_start", start_args("identify"))]),
+        tool_call_response(&[("job_stop", json!({"job": "V1"}))]),
+        tool_call_response(&[("job_context", json!({"job": "I1"}))]),
+        tool_call_response(&[("job_stop", json!({"job": "V1"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![("job_start", started("I1")), ("job_context", Ok(ctx))]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("identify").await.unwrap();
+    assert!(!t.calls[1].ok);
+    assert_eq!(t.calls[1].result["error"], "not_allowed");
+    assert!(t.calls[3].ok, "{}", t.calls[3].result);
+}
+
+#[tokio::test]
+async fn a_verdict_read_from_another_jobs_context_is_not_its_own() {
+    let ctx = json!({"result": "job_context", "value": {"identify": {"verdict": {"job": "V1"}}}});
+    let fake = fake(vec![
+        tool_call_response(&[("job_context", json!({"job": "X"}))]),
+        tool_call_response(&[("job_stop", json!({"job": "V1"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![("job_context", Ok(ctx))]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("context").await.unwrap();
+    assert!(!t.calls[1].ok);
+    assert_eq!(t.calls[1].result["error"], "not_allowed");
+}
+
+#[tokio::test]
+async fn a_failed_start_records_nothing() {
+    let fake = fake(vec![
+        tool_call_response(&[("job_start", start_args("measure"))]),
+        tool_call_response(&[("job_stop", json!({"job": "J9"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![(
+        "job_start",
+        Err(json!({"error": "duplicate", "job": "J9"})),
+    )]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("start").await.unwrap();
+    assert!(!t.calls[1].ok);
+    assert_eq!(t.calls[1].result["error"], "not_allowed");
+}
+
+#[tokio::test]
+async fn another_id_is_still_refused() {
+    let fake = fake(vec![
+        tool_call_response(&[("job_start", start_args("measure"))]),
+        tool_call_response(&[("job_stop", json!({"job": "X"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![("job_start", started("J1"))]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("start").await.unwrap();
+    assert!(!t.calls[1].ok);
+    assert_eq!(t.calls[1].result["error"], "not_allowed");
+    assert_eq!(t.calls[1].result["field"], "op");
+}
+
+#[tokio::test]
+async fn jobs_stop_and_replace_stay_refused() {
+    let mut with_replace = start_args("measure");
+    with_replace["replace"] = json!(["J1"]);
+    let fake = fake(vec![
+        tool_call_response(&[("job_start", start_args("measure"))]),
+        tool_call_response(&[(
+            "jobs_stop",
+            json!({"source": null, "kind": null, "plan": null}),
+        )]),
+        tool_call_response(&[("job_start", with_replace)]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![("job_start", started("J1"))]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("start").await.unwrap();
+    assert!(!t.calls[1].ok);
+    assert_eq!(t.calls[1].result["op"], "jobs_stop");
+    assert!(!t.calls[2].ok);
+    assert_eq!(t.calls[2].result["field"], "replace");
+}
+
+#[tokio::test]
+async fn a_second_run_cannot_stop_the_first_runs_job() {
+    let fake = fake(vec![
+        tool_call_response(&[("job_start", start_args("measure"))]),
+        text_response("started", "stop"),
+        tool_call_response(&[("job_stop", json!({"job": "J1"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![("job_start", started("J1"))]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    agent.run("start").await.unwrap();
+    let t = agent.run("stop it").await.unwrap();
+    assert!(!t.calls[0].ok);
+    assert_eq!(t.calls[0].result["error"], "not_allowed");
+}

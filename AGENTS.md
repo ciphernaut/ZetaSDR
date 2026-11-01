@@ -10,8 +10,9 @@ ZetaSDR is an agentic SDR runtime. You drive it through a small typed operation 
 - Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.
 - Unknown signals are reported as unknown, never guessed.
 - Ids are never invented: `source` values come from `source list`, `job` values from `job list`.
-- Jobs belong to the operator: never `job_stop` a job or put one in `replace` unless the request names it or the run allows it. A `conflict` is reported with its holders; the operator decides.
+- Jobs belong to the operator: never `job_stop` a job or put one in `replace` unless the request names it, the run allows it or, for `job_stop`, you started it in this run. A `conflict` is reported with its holders; the operator decides.
 - For a kind on every channel of a plan use `plan_start`, never one `job_start` per channel.
+- Plan ids come from `channel_plans`: read it before naming a plan. A band with no plan takes one `job_start` per measured station; never invent a plan.
 - To stop every job, or every job of a source, kind or plan, use `jobs_stop`, never one `job_stop` per job.
 
 ## Running the node
@@ -215,7 +216,7 @@ JSON: `{"op":"job_stop","job":"<id>"}`
 
 CLI: `zeta job stop --job <id>`
 
-Stopping a job is the operator's decision: never `job_stop` a job the request did not name. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry.
+Stopping a job is the operator's decision: never `job_stop` a job the request did not name, except one you started in this run (`job_start`, `plan_start`, `job_attach`, or the `verdict.job` of your own `identify` once you have read it): stop your own `measure` and `identify` leftovers when done. Through `ask` any other stop needs the run to allow stops, else it is refused as `not_allowed`: report that, do not retry.
 
 ### jobs_stop
 
@@ -678,6 +679,8 @@ A start outside the pin is a `conflict` offering `unpin source S (source_unpin)`
 
 `channel_plans` (CLI `zeta plans`) returns the plans the node knows with every channel's `number` and `center_hz`. Name a channel to the user by its number ("ch20", not 476.9 MHz) and start jobs at its `center_hz` with the plan's `bandwidth_hz`. The AU UHF CB plan interleaves two rasters: ch1-40 sit 25 kHz apart and ch41-80 fall halfway between them, so every channel has neighbours 12.5 kHz either side. A strong ch20 transmission leaks into ch59 and ch60 and used to open both squelches and echo the same words three times. An `fm_demod` on a plan channel therefore carries a guard: its squelch stays closed while a neighbour `guard_hz` away is more than `guard_db` stronger, and the `squelch` event says so with `guarded: true` and `adjacent_db`. When a quiet channel shows `squelch` and no transcripts, read `guarded` before concluding it is broken. The guard needs the squelch on (it is inert with `squelch: false`) and `graph put` with `guard_hz: null` turns it off. `transcribe` ignores utterances under `min_utterance_ms` (700) and a busy speech daemon drops with `reason` `queue` or `busy`; `queued_ms` on a transcript is the time it waited.
 
+Plan ids come from `channel_plans`: read it before naming a plan. A band with no plan takes one `job_start` per measured station; never invent a plan. Broadcast FM is the example: it has no channel plan, so measure the band and start a `wfm_demod` on each station found.
+
 To run demodulators on active channels only, not on all 80, use `examples/python/cb_watch.py` (`--dry-run` shows which channels the capture holds): it keeps one elastic `spectrum` job, starts `fm_demod` plus `transcribe` on a channel that stands 10 dB over the floor and stops them after 60 s of quiet. For every channel at once, `plan_start`.
 
 ### Stopping many jobs
@@ -712,7 +715,7 @@ Transcription happens per demodulator. Starting a mix attaches no transcript; `j
 
 A box drawn by hand over a 12.5 kHz channel is about 100 kHz wide: 10 dB of extra noise in the audio and a centre a little off the signal. Fit the band to the signal, never to a raster (channels do not sit on a grid; a plan's channel numbers are names, not truth):
 
-1. Measure the box: `job start --kind measure --source S --center-hz C --bandwidth-hz B --then-tail 1,3000`. Read `label.name`, `center_hz` (the occupied band's centre, absolute RF) and `bandwidth_hz` (the occupied width) from the event; an `ssb` label's `evidence` carries the dial frequency (`dial ≈ N Hz`).
+1. Measure the box: `job start --kind measure --source S --center-hz C --bandwidth-hz B --then-tail 1,3000`. Read `label.name`, `center_hz` (the occupied band's centre, absolute RF) and `bandwidth_hz` (the occupied width) from the event; an `ssb` label's `evidence` carries the dial frequency (`dial ≈ N Hz`). Started without `--then-tail`, the `measure` keeps running: `job_stop` it when you have read it.
 2. A `noise` label (or `unknown` under 6 dB SNR) means nothing to fit: start at the box as drawn and say so.
 3. Otherwise start the demodulator on the measured centre with the occupied width times 1.25, floored at 5000 Hz for `fm_demod` and `am_demod`, 150000 Hz for `wfm_demod`, and never wider than the box; an `ssb_demod` keeps its 6000 Hz band and only its dial moves (to the evidence's dial, else 1500 Hz below the occupied centre for USB, above for LSB): its channel passes half the band either side of the dial, and USB voice reaches 2.7 kHz above it.
 4. A job already running is moved the same way with `job retune --job ID --center-hz C --bandwidth-hz B`: same id, its attached `transcribe` relaunched with it, its squelch settings kept, its channel-plan guard derived again at the new band. Inside the current capture nothing retunes the radio; outside it the radio moves when no other rigid job or pin holds it, else the `conflict` names the holders and `--replace` is the answer when they may stop.

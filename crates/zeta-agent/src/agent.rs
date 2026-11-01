@@ -5,6 +5,7 @@ use crate::llm::{AgentError, LlmClient, LlmConfig};
 use crate::wire::{ChatMessage, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use zeta_client::{ToolDef, op_from_call, op_tools, system_prompt};
 use zeta_core::ops::OpError;
 
@@ -55,6 +56,60 @@ pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
         "op": name,
         "message": "stopping jobs is not allowed in this run: report the conflict and its holders to the operator; they unlock it with the retry button or by allowing stops for the run",
     }))
+}
+
+/// The jobs one run started itself, which it may stop without the run
+/// being allowed stops: a `measure` it read, an `identify` it is done
+/// with. Per run, never shared: a later run starts empty.
+#[derive(Default)]
+pub struct OwnJobs {
+    /// Jobs a successful `job_start`, `job_attach` or `plan_start` answered, and
+    /// the `verdict.job` of an own `identify` once its context was read.
+    jobs: HashSet<String>,
+    /// The own `identify` jobs, whose context names the job that proved.
+    identifies: HashSet<String>,
+}
+
+impl OwnJobs {
+    /// Whether `op` is a `job_stop` of one of this run's own jobs. `jobs_stop` never is,
+    /// and a `job_stop` has no `replace`, which stays with [`gate`].
+    pub fn allows_stop(&self, op: &Value) -> bool {
+        op["op"] == "job_stop" && op["job"].as_str().is_some_and(|j| self.jobs.contains(j))
+    }
+
+    /// Note what a call that succeeded gave this run; `result` is `{"result", "value"}`
+    /// as the executor answers. A plan's `existing` jobs are not the run's.
+    pub fn record(&mut self, tool: &str, arguments: &Value, result: &Value) {
+        let value = &result["value"];
+        match tool {
+            "job_start" | "job_attach" => {
+                if let Some(id) = value.as_str() {
+                    self.jobs.insert(id.to_string());
+                    if tool == "job_start" && arguments["kind"] == "identify" {
+                        self.identifies.insert(id.to_string());
+                    }
+                }
+            }
+            "plan_start" => {
+                for s in value["started"].as_array().into_iter().flatten() {
+                    for key in ["job", "attached"] {
+                        if let Some(id) = s[key].as_str() {
+                            self.jobs.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+            "job_context" => {
+                let own = arguments["job"]
+                    .as_str()
+                    .is_some_and(|j| self.identifies.contains(j));
+                if let (true, Some(id)) = (own, value["identify"]["verdict"]["job"].as_str()) {
+                    self.jobs.insert(id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub struct AgentConfig {
@@ -196,6 +251,7 @@ impl<E: Executor> Agent<E> {
             ChatMessage::system(self.cfg.system_prompt.clone()),
             ChatMessage::user(t.request.clone()),
         ];
+        let mut own = OwnJobs::default();
         while t.turns < self.cfg.max_turns {
             t.turns += 1;
             let c = self.llm.complete(&messages, &self.cfg.tools).await?;
@@ -229,7 +285,7 @@ impl<E: Executor> Agent<E> {
                 tool_call_id: None,
             });
             for call in &c.tool_calls {
-                let record = self.call(call).await?;
+                let record = self.call(call, &mut own).await?;
                 // Compact JSON, as `serde_json::to_string` writes it.
                 let content = record.result.to_string();
                 messages.push(ChatMessage::tool(call.id.clone(), content));
@@ -243,7 +299,7 @@ impl<E: Executor> Agent<E> {
 
     /// Apply one tool call. Bad arguments and unknown tools are the model's
     /// fault: they become the call's result and never reach the node.
-    async fn call(&self, call: &ToolCall) -> Result<CallRecord, AgentError> {
+    async fn call(&self, call: &ToolCall, own: &mut OwnJobs) -> Result<CallRecord, AgentError> {
         let f = &call.function;
         let (arguments, outcome) = match f.args() {
             Err(message) => (f.arguments.clone(), Err(OpError::Other { message })),
@@ -254,11 +310,14 @@ impl<E: Executor> Agent<E> {
         };
         let result = match outcome {
             Ok(op) => match gate(&op, self.cfg.allow) {
-                Some(refusal) => Err(refusal),
-                None => self.exec.apply(op).await?,
+                Some(refusal) if !own.allows_stop(&op) => Err(refusal),
+                _ => self.exec.apply(op).await?,
             },
             Err(e) => Err(to_json(&e)),
         };
+        if let Ok(value) = &result {
+            own.record(&f.name, &arguments, value);
+        }
         let ok = result.is_ok();
         let mut result = result.unwrap_or_else(|e| e);
         if ok {
