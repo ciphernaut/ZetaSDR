@@ -3,6 +3,7 @@
 // Exports:
 //   loadPlans(api) -> Promise<void>   `channel_plans` once; an error leaves the list empty
 //   planIds() -> string[]             the loaded plan ids
+//   resolvePlan(policy) -> string | null   the id of the first plan `policy` selects
 //   channelLabel(hz, policy) -> {text: "ch20", title: "uhf_cb_au ch20 · <note>"} | null
 //       The channel centred within CHANNEL_MATCH_HZ of `hz`. `policy` is the view's `plan`:
 //       `auto` any plan, a plan id that plan only, `none` null.
@@ -36,6 +37,12 @@ export function planIds() {
 function selected(policy) {
   if (policy === "none") return [];
   return policy === "auto" || policy === undefined ? plans : plans.filter((p) => p.id === policy);
+}
+
+// The id of the first plan `policy` selects (null for `none` or when no plan is loaded).
+export function resolvePlan(policy) {
+  const p = selected(policy)[0];
+  return p ? p.id : null;
 }
 
 export function channelLabel(hz, policy) {

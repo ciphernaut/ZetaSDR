@@ -3,7 +3,7 @@
 // or asks the agent.
 //
 // Exports:
-//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov}) -> Menu
+//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command}) -> Menu
 //       Opens #ctx at the pointer after each wf.onSelect. `applyOp(op) -> Promise<result|null>`
 //       is app.js's command-line op path (shows its outcome per ruling R6; null when it
 //       failed, the failure already reported); `attachOp(jobId)` the `job_attach` op that
@@ -97,6 +97,10 @@
 //                                             kind=scan on the selection's centre and
 //                                             bandwidth, then wf.resume() (scan mode when the
 //                                             scan runs, else the spectrum job again)
+//   plan       Start plan…                    shown only when the view's plan policy names a plan
+//                                             (mountMenu's `plan()`); puts `plan start <plan>
+//                                             fm_demod transcribe` in the command line
+//                                             (`command(text)`) and focuses it
 //   iq_read    Save selection as SigMF        iq_read {selection}; the transcript shows the path
 //   ask        Send to agent                  /ask "Look at <c> Hz, <bw> Hz wide, from <start>
 //                                             to <end>: what is it?"
@@ -256,6 +260,7 @@ const ENTRIES = [
   ["ssb_usb_transcribe", "Transcribe › SSB (USB)"],
   ["ssb_lsb_transcribe", "Transcribe › SSB (LSB)"],
   ["measure", "Start background job › measure"],
+  ["plan", "Start plan…"],
   ["scan", "Scan this span"],
   ["iq_read", "Save selection as SigMF"],
   ["ask", "Send to agent"],
@@ -427,11 +432,13 @@ export function clampSpan(startNs, endNs, newest) {
 }
 
 class Menu {
-  constructor(wf, { applyOp, attachOp, ask, transcript, ov }) {
+  constructor(wf, { applyOp, attachOp, ask, transcript, ov, plan = () => null, command = () => {} }) {
     this.wf = wf;
     this.applyOp = applyOp;
     this.attachOp = attachOp;
     this.ask = ask;
+    this.plan = plan;
+    this.command = command;
     this.t = transcript;
     this.ov = ov;
     this.sel = null;
@@ -543,6 +550,8 @@ class Menu {
     this.setFitting(null);
     this.sel = { ...sel, sourceId: this.wf.sourceId };
     this.showFooter(this.current());
+    // `Start plan…` only where the view's plan policy names a plan.
+    this.el.querySelector('[data-action="plan"]').hidden = this.plan() === null;
     this.el.hidden = false;
     // Keep it inside the viewport.
     const w = this.el.offsetWidth;
@@ -724,6 +733,9 @@ class Menu {
         `Look at ${s.centerHz} Hz, ${s.bandwidthHz} Hz wide, ` +
           `from ${s.startNs} to ${s.endNs}: what is it?`,
       );
+    } else if (action === "plan") {
+      const plan = this.plan();
+      if (plan !== null) this.command(`plan start ${plan} fm_demod transcribe`);
     } else if (action === "scan") {
       await this.scan(s);
     } else if (jobOf(action)) {

@@ -19,7 +19,8 @@
 //         subscription keeps its normal backoff either way.
 //     api.op(obj) -> Promise<result JSON>              POST /op with `X-Zeta-Client: ui` (its
 //         ops-stream record carries transport "ui"); throws OpError (with .json)
-//     api.ask(text, maxTurns = 8) -> Promise<Transcript>  POST /ask {request, max_turns};
+//     api.ask(text, maxTurns = 32, allow = {stop_jobs: false, replace: false})
+//         -> Promise<Transcript>  POST /ask {request, max_turns, allow};
 //         throws OpError (503 with {"error":"other","message":...} when serve has no LLM)
 //     api.stt(wav) -> Promise<{text}>   POST /stt with the WAV bytes (ArrayBuffer) as
 //         `Content-Type: audio/wav`; throws OpError (503 when serve has no speech daemon)
@@ -146,8 +147,8 @@ export class Api {
     return this.#request("POST", "/op", obj, null, { "X-Zeta-Client": "ui" });
   }
 
-  ask(text, maxTurns = 8) {
-    return this.#request("POST", "/ask", { request: text, max_turns: maxTurns });
+  ask(text, maxTurns = 32, allow = { stop_jobs: false, replace: false }) {
+    return this.#request("POST", "/ask", { request: text, max_turns: maxTurns, allow });
   }
 
   stt(wav) {

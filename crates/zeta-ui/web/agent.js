@@ -151,6 +151,10 @@ function resultText(r) {
     }
     case "iq":
       return `ok (${plural(v && v.samples ? v.samples : 0, "sample")})`;
+    case "plan_start": {
+      const n = (k) => (v && Array.isArray(v[k]) ? v[k].length : 0);
+      return `ok (${n("started")} started, ${n("existing")} existing, ${n("refused")} refused)`;
+    }
     default:
       return `ok (${r.result})`;
   }
@@ -158,6 +162,10 @@ function resultText(r) {
 
 export function errorText(e) {
   if (!e || typeof e !== "object") return "error";
+  if (e.error === "duplicate") {
+    return `duplicate of job ${String(e.job ?? "").slice(-6)} ${e.message ?? ""}`.trimEnd();
+  }
+  if (e.error === "not_allowed") return `not allowed: ${e.message ?? ""}`.trimEnd();
   const parts = [e.error ?? "error"];
   if (e.field !== undefined) parts.push(`field=${e.field}`);
   if (e.value !== undefined && e.min !== undefined && e.max !== undefined) {
@@ -241,8 +249,27 @@ export class Transcript {
     this.#append(text, "user");
   }
 
-  assistant(text, error = false) {
+  // `turnLog` is /ask's `turn_log`: after the answer line, one collapsed `<details
+  // class="turn">` per turn that has reasoning or content.
+  assistant(text, error = false, turnLog = []) {
     this.#append(text, error ? "assistant error" : "assistant");
+    for (const turn of turnLog) {
+      if (!turn || (!turn.reasoning && !turn.content)) continue;
+      const d = document.createElement("details");
+      d.className = "turn";
+      const sum = document.createElement("summary");
+      const k = Array.isArray(turn.calls) ? turn.calls.length : 0;
+      sum.textContent = `turn ${turn.turn} (${plural(k, "call")})`;
+      d.append(sum);
+      for (const part of [turn.reasoning, turn.content]) {
+        if (!part) continue;
+        const pre = document.createElement("pre");
+        pre.textContent = part;
+        d.append(pre);
+      }
+      this.el.append(d);
+      this.last = null;
+    }
     for (const fn of this.listeners) fn(text, error);
   }
 

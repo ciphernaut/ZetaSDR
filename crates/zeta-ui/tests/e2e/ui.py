@@ -581,6 +581,9 @@ def drag_menu(page, lo=0.40, hi=0.60):
     page.mouse.up()
     menu = page.locator("#ctx")
     expect(menu).to_be_visible()
+    # A menu clamped to the viewport can open under the pointer, and a hovered SSB entry shows
+    # its dial in the footer: leave the menu so the footer reads the selection.
+    page.mouse.move(2, 2)
     footer = page.locator("#ctx-footer").text_content()
     m = re.search(r"center_hz=\d+ bandwidth_hz=\d+ start_ns=(\d+) end_ns=(\d+)", footer)
     assert m, f"footer {footer!r}"
@@ -2359,8 +2362,8 @@ def scenario_watched_jobs_are_capped(page, url, secret):
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
     jobs = []
     try:
-        for _ in range(6):
-            jobs.append(start_job(url, secret, "measure", "tone", 100_000_000, 10_000))
+        for i in range(6):  # distinct bands: an identical rigid start is a duplicate
+            jobs.append(start_job(url, secret, "measure", "tone", 100_000_000, 10_000 + 100 * i))
         page.evaluate("window.zetaTest.poll()")
         expect(page.locator('#jobs .job[data-state="running"]', has_text="measure")).to_have_count(6)
         for j in jobs[:2]:
@@ -2379,8 +2382,8 @@ def scenario_watched_jobs_are_capped(page, url, secret):
         assert max(counts) <= 2 + 4, f"ws_connections {counts}"
         # Four newer fm_demods (squelch streams only) take no decoder's slot: they go
         # unwatched and the four measures keep theirs.
-        for _ in range(4):
-            jobs.append(start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500))
+        for i in range(4):
+            jobs.append(start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500 + 100 * i))
         page.evaluate("window.zetaTest.poll()")
         for j in jobs[6:]:
             expect(page.locator(f'#jobs .job[data-id="{j}"] .events')).to_have_attribute(
@@ -2820,19 +2823,14 @@ def scenario_transcribe_without_backend_fails_visibly(page, url, secret):
     page.click('.src-tab[data-id="speech"]')
     demod = start_job(nostt, secret, "wfm_demod", "speech", SPEECH_HZ, 200_000,
                       deviation_hz=75_000)
-    attached = None
     try:
+        # job_attach checks the stage's readiness (7e08b62): refused at once, no job made.
         job_row(page, demod).locator("button.transcribe").click()
-        attached = wait_attached(nostt, secret, demod)["id"]
-        page.evaluate("window.zetaTest.poll()")
-        row = page.locator(f'#jobs .job[data-id="{attached}"]')
-        expect(row.locator(".state")).to_have_text("failed")
-        expect(row).to_have_attribute("title", re.compile("speech backend"))
-        expect(row.locator(".kind")).to_have_text("↳ transcribe")
+        expect(page.locator("#transcript .line.error", has_text="speech backend")
+               ).not_to_have_count(0)
+        assert attached_jobs(nostt, secret, demod) == [], "no attached job on a node without STT"
     finally:
-        for j in (attached, demod):
-            if j:
-                stop_job(nostt, secret, j)
+        stop_job(nostt, secret, demod)
 
 
 # ---- voice (Task 11) -----------------------------------------------------------------------
@@ -2954,6 +2952,66 @@ def scenario_mic_without_daemon_shows_message(page, url, secret):
     assert not asks, f"/ask requested without a transcript: {asks}"
     record_and_stop(page, 300)
     expect(page.locator("#mic-status")).to_have_text("no speech daemon on this node")
+
+
+# ---- bulk operations (plan 21 Task 8) --------------------------------------------------------
+# The typed `plan start` and `allow stops`, and the duplicate error's text, on the main server
+# (no model). `cb` holds ch20, ch59 and ch60 of uhf_cb_au in its 48 kHz capture.
+
+def running_kind(url, secret, kind, source):
+    jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+    return [j["id"] for j in jobs if j["kind"] == kind and j["source"] == source
+            and j["state"]["status"] == "running"]
+
+
+def scenario_plan_start_typed_renders_counts_and_refusals(page, url, secret):
+    select_source(page, url, secret, "cb")
+    started = []
+    try:
+        run_cmd(page, "plan start uhf_cb_au fm_demod ch 20,59")
+        expect(page.locator("#transcript .line.op", has_text="plan_start").filter(
+            has_text="ok (2 started, 0 existing, 0 refused)")).not_to_have_count(0)
+        started = running_kind(url, secret, "fm_demod", "cb")
+        assert len(started) == 2, f"two fm_demod jobs running: {started}"
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator('#jobs .job[data-state="running"]', has_text="fm_demod")
+               ).to_have_count(2)
+        run_cmd(page, "plan start uhf_cb_au fm_demod ch 20,59")
+        expect(page.locator("#transcript .line.op", has_text="plan_start").filter(
+            has_text="ok (0 started, 2 existing, 0 refused)")).not_to_have_count(0)
+        run_cmd(page, "plan start uhf_cb_au fm_demod ch 1")
+        expect(page.locator("#transcript .line.error", has_text="plan_start")).not_to_have_count(0)
+        assert running_kind(url, secret, "fm_demod", "cb") == started, "nothing partial"
+    finally:
+        for j in running_kind(url, secret, "fm_demod", "cb"):
+            stop_job(url, secret, j)
+
+
+def scenario_allow_stops_toggle_is_noted(page, url, secret):
+    select_source(page, url, secret, "cb")
+    run_cmd(page, "allow stops on")
+    expect(page.locator("#transcript .line.note:not(.error)", has_text="allow stops: on")
+           ).to_have_count(1)
+    run_cmd(page, "allow stops off")
+    expect(page.locator("#transcript .line.note:not(.error)", has_text="allow stops: off")
+           ).to_have_count(1)
+
+
+def scenario_duplicate_start_renders_the_job(page, url, secret):
+    select_source(page, url, secret, "tone")
+    op = ('{"op":"job_start","kind":"measure","source":"tone","center_hz":100000000,'
+          '"bandwidth_hz":20000,"deviation_hz":null,"sideband":null,"elastic":false,'
+          '"replace":[]}')
+    try:
+        run_cmd(page, op)
+        expect(page.locator("#transcript .line.op", has_text="measure").filter(
+            has_text="→ job ")).not_to_have_count(0)
+        run_cmd(page, op)
+        expect(page.locator("#transcript .line.error", has_text="duplicate of job")
+               ).not_to_have_count(0)
+    finally:
+        for j in running_kind(url, secret, "measure", "tone"):
+            stop_job(url, secret, j)
 
 
 # ---- channel plans (plan 13 Task 4) ---------------------------------------------------------

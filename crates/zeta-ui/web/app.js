@@ -79,11 +79,20 @@
 // failures such as a node without a speech daemon.
 //
 // Exports `state` ({api, transcript, jobs, wf, coarse, ov, map, menu, audio, mic, sources,
-// selected, view, lastJobs}), `onSourceChange(fn)` for the later views (waterfall, audio,
-// voice), `conflictActions(err, retry)` and `runSourceCommand(state, words)`.
+// selected, view, lastJobs, allowStops}), `onSourceChange(fn)` for the later views (waterfall, audio,
+// voice), `conflictActions(err, retry)`, `runSourceCommand(state, words)` and
+// `runPlanCommand(state, words)`.
+//
+// Typed commands beside `view` and `source`: `allow stops on|off` (state.allowStops, off at
+// load; every following /ask carries `allow: {stop_jobs, replace}` of it; an answer from a run
+// that may stop jobs ends " [may stop jobs]", each turn of its `turn_log` is a collapsed
+// `details.turn`, and a refused call (`not_allowed`) adds the note with the action `allow stops
+// and ask again`) and `plan start <plan> <kind> [<attach>] [ch N,N-M]` (a `plan_start` op on
+// the shown source through applyOp: conflicts get retry buttons, refused channels and
+// warnings a note each).
 
 import { connect, Unauthorized } from "./api.js";
-import { QUIET_OPS, Transcript, startJobs, startOpsFeed } from "./agent.js";
+import { QUIET_OPS, Transcript, errorText, startJobs, startOpsFeed } from "./agent.js";
 import { mountWaterfall } from "./waterfall.js";
 import { mountOverlays } from "./overlays.js";
 import { mountMenu } from "./menu.js";
@@ -91,7 +100,7 @@ import { playJob } from "./audio.js";
 import { closeGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
 import { mountView, runViewCommand } from "./view.js";
-import { loadPlans } from "./plans.js";
+import { loadPlans, resolvePlan } from "./plans.js";
 import { mountCoarse } from "./coarse.js";
 import { mountMap } from "./map.js";
 
@@ -115,6 +124,7 @@ export const state = {
   view: null, // view.js policies
   coarse: null, // coarse.js: the automatic scans of a view past the capture
   lastJobs: [], // the last job_list result
+  allowStops: false, // `allow stops on|off`: /ask may stop and replace jobs (not persisted)
 };
 const sourceListeners = [];
 
@@ -325,6 +335,15 @@ function notApplied(e) {
   return e.json.error === "other" && /^invalid operation/.test(e.json.message || "");
 }
 
+// A `plan_start` result's refused channels and warnings, one note each.
+function noteRefusals(v) {
+  if (!v) return;
+  for (const r of v.refused || []) {
+    state.transcript.note(`ch${r.channel}: ${errorText(r.error)}`, true);
+  }
+  for (const w of v.warnings || []) state.transcript.note(w);
+}
+
 // Applies `op` as typed by the user (command line or context menu); its outcome reaches the
 // transcript through the ops stream, except a successful quiet op (job_list, stream_list,
 // source_list, modes_list, modes_show), whose "ui" record is hidden with the polls (ruling R6): that one is shown
@@ -337,6 +356,7 @@ async function applyOp(op) {
   try {
     result = await state.api.op(op);
     if (QUIET_OPS.has(op.op)) t.reply(op, result);
+    if (op.op === "plan_start") noteRefusals(result && result.value);
   } catch (e) {
     if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
     else if (e.json && e.json.error === "conflict") await offerReplace(op, e.json);
@@ -348,7 +368,7 @@ async function applyOp(op) {
 // ---- conflicts -------------------------------------------------------------------------
 
 // Ops that take `replace` (a conflict on them can be retried with the holders named).
-const REPLACEABLE = new Set(["job_start", "job_retune", "source_ensure", "source_pin"]);
+const REPLACEABLE = new Set(["job_start", "job_retune", "source_ensure", "source_pin", "plan_start"]);
 
 // `<kind> <id> @ <centre MHz>` for holder `id`, from the last job list (the conflict's
 // `current` centre when the job is not in it).
@@ -498,14 +518,84 @@ export async function runSourceCommand(st, words) {
   }
 }
 
+// `plan start <plan> <kind> [<attach>] [ch N,N-M]`: the `plan_start` op for the shown source,
+// or {error} when the words do not parse. No `ch` means every channel of the plan.
+function planOp(src, words) {
+  const [verb, plan, kind, ...rest] = words;
+  const usage = "plan start: expected <plan> <kind> [<attach>] [ch N,N-M]";
+  if (verb !== "start" || !plan || !kind) return { error: usage };
+  let channels = null;
+  const at = rest.indexOf("ch");
+  if (at >= 0) {
+    const list = rest.slice(at + 1);
+    rest.length = at;
+    if (list.length !== 1 || !/^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(list[0])) {
+      return { error: "plan start: ch expects numbers like 1,2,5-8" };
+    }
+    const out = new Set();
+    for (const item of list[0].split(",")) {
+      const [lo, hi] = item.split("-").map(Number);
+      if (hi !== undefined && (hi < lo || hi - lo >= 1000)) {
+        return { error: `plan start: range ${item} is reversed or wider than 1000` };
+      }
+      for (let n = lo; n <= (hi ?? lo); n += 1) out.add(n);
+    }
+    channels = [...out].sort((a, b) => a - b);
+  }
+  if (rest.length > 1) return { error: usage };
+  return {
+    op: {
+      op: "plan_start",
+      plan,
+      channels,
+      kind,
+      source: src.id,
+      deviation_hz: null,
+      sideband: null,
+      attach: rest[0] ?? null,
+      language: null,
+      replace: [],
+    },
+  };
+}
+
+// `plan start …` on the shown source, applied through applyOp (a conflict gets its retry
+// buttons, refusals and warnings their notes). {text: null}: applyOp wrote the transcript.
+export async function runPlanCommand(st, words) {
+  let src;
+  try {
+    src = await shownSource();
+  } catch (e) {
+    return { text: `source_list: ${e.message}`, error: true };
+  }
+  if (!src) return { text: `no source shown`, error: true };
+  const parsed = planOp(src, words);
+  if (parsed.error) return { text: parsed.error, error: true };
+  await applyOp(parsed.op);
+  return { text: null, error: false };
+}
+
 // Sends `text` to /ask and shows the answer (or the error, e.g. no LLM configured).
 async function askAgent(text) {
   const t = state.transcript;
   if (!state.api) return;
   t.user(text);
   try {
-    const r = await state.api.ask(text);
-    t.assistant(r.answer ?? "(no answer)");
+    const flag = state.allowStops;
+    const r = await state.api.ask(text, 32, { stop_jobs: flag, replace: flag });
+    const may = r.allow && (r.allow.stop_jobs || r.allow.replace) ? " [may stop jobs]" : "";
+    t.assistant((r.answer ?? "(no answer)") + may, false, r.turn_log || []);
+    if ((r.calls || []).some((c) => c.result && c.result.error === "not_allowed")) {
+      t.note("the agent was not allowed to stop or replace jobs", false, [
+        {
+          label: "allow stops and ask again",
+          run: () => {
+            state.allowStops = true;
+            askAgent(text);
+          },
+        },
+      ]);
+    }
   } catch (e) {
     t.assistant(e.message, true);
   }
@@ -525,6 +615,19 @@ async function runCommand(text) {
   if (/^source\s+(pin|unpin|gain)\b/.test(text)) {
     state.transcript.user(text);
     const r = await runSourceCommand(state, text.split(/\s+/).slice(1));
+    if (r.text !== null) state.transcript.note(r.text, r.error);
+    return;
+  }
+  const allow = /^allow\s+stops\s+(on|off)$/.exec(text);
+  if (allow) {
+    state.transcript.user(text);
+    state.allowStops = allow[1] === "on";
+    state.transcript.note(`allow stops: ${allow[1]}`);
+    return;
+  }
+  if (/^plan\s+start\b/.test(text)) {
+    state.transcript.user(text);
+    const r = await runPlanCommand(state, text.split(/\s+/).slice(1));
     if (r.text !== null) state.transcript.note(r.text, r.error);
     return;
   }
@@ -624,6 +727,12 @@ function start(api) {
     ask: askAgent,
     transcript: state.transcript,
     ov: state.ov,
+    plan: () => resolvePlan(state.view.get("plan")),
+    command: (text) => {
+      const cmd = $("#cmd");
+      cmd.value = text;
+      cmd.focus();
+    },
   });
   state.transcript.onAssistant((text, error) => {
     if (!error && footprint() === "narrow") answerRibbon(text);
