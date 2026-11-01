@@ -3201,11 +3201,6 @@ def scenario_listen_to_all_starts_one_mix_and_plays(page, url, secret):
         expect(button).to_have_text("Stop listening")
         row = job_row(page, mix)
         expect(row.locator(".band")).to_have_count(0)
-        # The ops feed is not the mix's stream: another caller's ops still reach the transcript.
-        probe = start_job(url, secret, "measure", "cb", 476_900_000, 10_000)
-        stop_job(url, secret, probe)
-        expect(page.locator("#transcript .line.op", has_text="[http] job_start kind=measure")
-               .first).to_be_visible(timeout=5_000)
         button.click()
         wait_until(lambda: page.evaluate("window.zetaAudio.playing") is None, 3.0, "stopped")
         expect(button).to_have_attribute("aria-pressed", "false")
@@ -3216,6 +3211,23 @@ def scenario_listen_to_all_starts_one_mix_and_plays(page, url, secret):
             "(m) => window.zetaAudio.playing === m && window.zetaAudio.framesPlayed > 0",
             arg=mix, timeout=5_000)
         assert [j["id"] for j in mix_jobs(url, secret)] == [mix], "the same mix, only one"
+        # The ops feed is not the mix's stream: the node lists streams by id, the ops stream
+        # first, so list the job's streams first (as a node that started the mix before its
+        # ops stream would) and reload with the mix running: the ops subscription resolves
+        # among them, and another caller's op must still show.
+        def job_streams_first(route):
+            listed = json.loads(route.fetch().body())
+            listed.sort(key=lambda i: 0 if (i.get("provenance") or {}).get("job") else 1)
+            route.fulfill(json=listed)
+
+        page.route("**/streams", job_streams_first)
+        page.reload()
+        expect(page.locator("#login")).to_be_hidden()
+        page.wait_for_timeout(1_000)
+        probe = start_job(url, secret, "measure", "cb", 476_900_000, 10_000)
+        stop_job(url, secret, probe)
+        expect(page.locator("#transcript .line.op", has_text="[http] job_start kind=measure")
+               .first).to_be_visible(timeout=5_000)
     finally:
         stop_job(url, secret, demod)
         stop_mixes(url, secret)

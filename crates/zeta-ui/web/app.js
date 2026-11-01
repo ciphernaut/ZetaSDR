@@ -971,6 +971,7 @@ function toggleAudio(job, { ctx = null } = {}) {
 
 // #listen-all: pressed while a mix plays it stops; else `mix_start` for `sources` (null:
 // every source) and plays the mix it answers. The context is made first, inside the click.
+let listening = false; // a mix_start of listen() is in flight
 async function listen(sources, { toggle }) {
   if (!state.api) return;
   if (toggle && state.audio && state.audio.mix) {
@@ -978,6 +979,8 @@ async function listen(sources, { toggle }) {
     state.jobs?.redraw();
     return;
   }
+  if (listening) return; // a second press while mix_start is in flight
+  listening = true;
   const ctx = new AudioContext();
   ctx.resume().catch(() => {});
   let id = null;
@@ -988,6 +991,8 @@ async function listen(sources, { toggle }) {
     ctx.close().catch(() => {});
     state.transcript?.note(`mix_start: ${e.json ? errorText(e.json) : e.message}`, true);
     return;
+  } finally {
+    listening = false;
   }
   if (!state.api || typeof id !== "string") {
     ctx.close().catch(() => {});
