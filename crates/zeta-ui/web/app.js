@@ -74,7 +74,8 @@
 // stops (aria-pressed and its text follow the audio). The mix is a job with no band, so its
 // row has no outline: a MixWatch (mix.js) keeps one event socket on the playing (else the
 // newest) mix, its row's `.mix-now` cell says who is talking or was last, and
-// ov.setSpeaking lights the jobs it hears. Other text starting `mix` goes to the agent.
+// ov.setSpeaking lights the jobs it hears. A demodulator's row and outline menu offer
+// `Mute in mix` while a running mix covers its source (muteFor). Other text starting `mix` goes to the agent.
 //
 // The map (map.js) is mounted in #map at login: the overlays hand it every event of the jobs
 // they watch and of the positioned jobs on the other sources (ov.onEvent), each jobs poll drops the tracks of jobs that ended (map.sync), and
@@ -112,7 +113,7 @@ import { closeGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
 import { mountView, runViewCommand } from "./view.js";
 import { channelLabel, loadPlans, resolvePlan } from "./plans.js";
-import { MixWatch } from "./mix.js";
+import { MixWatch, isMuted, mixCovering, muteOp } from "./mix.js";
 import { mountCoarse } from "./coarse.js";
 import { mountMap } from "./map.js";
 
@@ -755,6 +756,7 @@ function start(api) {
   state.menu = mountMenu(state.wf, {
     applyOp,
     attachOp,
+    muteFor,
     ask: askAgent,
     transcript: state.transcript,
     ov: state.ov,
@@ -797,6 +799,7 @@ function start(api) {
     squelch: (id) => (state.ov ? state.ov.squelch(id) : null),
     position: (id) => (state.map ? state.map.rowText(id) : null),
     mixText: (job) => mixRowText(job.id),
+    mute: muteFor,
   });
   state.mic = mountMic($("#mic"), api, (text) => {
     $("#cmd").value = text;
@@ -1010,6 +1013,25 @@ function syncListen() {
   const on = !!(state.audio && state.audio.mix);
   b.setAttribute("aria-pressed", String(on));
   b.textContent = on ? "Stop listening" : "Listen to all";
+}
+
+// The mute a demodulator's row or outline offers: the running mix that hears it (mix.js
+// mixCovering, the playing one first), whether the channel is muted there and the op to flip
+// it; null when no mix covers the job.
+function muteFor(job) {
+  const mix = mixCovering(job, state.lastJobs, state.audio?.jobId);
+  if (!mix) return null;
+  const muted = isMuted(job, mix);
+  const op = muteOp(job, mix, !muted);
+  return {
+    muted,
+    title: `graph_put ${mix.id}`,
+    run: async () => {
+      const r = await applyOp(op);
+      state.jobs?.refresh();
+      return r;
+    },
+  };
 }
 
 // What a mix's row says (mix.js rowText) with the plan's channel names.

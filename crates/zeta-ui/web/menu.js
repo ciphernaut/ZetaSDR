@@ -3,12 +3,14 @@
 // or asks the agent.
 //
 // Exports:
-//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command}) -> Menu
+//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor}) -> Menu
 //       Opens #ctx at the pointer after each wf.onSelect. `applyOp(op) -> Promise<result|null>`
 //       is app.js's command-line op path (shows its outcome per ruling R6; null when it
 //       failed, the failure already reported); `attachOp(jobId)` the `job_attach` op that
 //       transcribes a job (as the job rows' Transcribe button applies it); `ask(text)` is
-//       its /ask path.
+//       its /ask path. `muteFor(job) -> {muted, title, run} | null` is app.js's (null: no
+//       running mix covers the job; `run()` applies the mute or unmute op and answers its
+//       result).
 //   FIT_KINDS, FIT_MIN_HZ, FIT_MIN_HZ_DEFAULT, FIT_FACTOR, FIT_TIMEOUT_MS, FIT_NOISE_SNR_DB,
 //   MEASURE_DC_MASK_HZ
 //       the fit of a demodulator entry (see Fitting below)
@@ -164,6 +166,10 @@
 //                          demodulator node (nbfm_demod, am_demod, ssb_demod: DENOISE_KINDS;
 //                          hidden for the others), the entry reading the state it would
 //                          switch to; the note `<kind>: denoise on|off`
+//   mute   Mute in mix     graph_put of the covering mix's own graph with this channel added to
+//                          its `muted` (mix.js mixCovering, muteOp; the entry reads `Unmute in
+//                          mix` for a muted one, hidden when no running mix covers the job's
+//                          source); the note `<kind>: muted in mix` / `unmuted in mix`
 //   stop   Stop            job_stop
 // Every retune is {op: job_retune, job, center_hz, bandwidth_hz, replace: []}. #ctx-outline-footer
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
@@ -221,6 +227,7 @@ const OUTLINE_ENTRIES = [
   ["w12500", "12.5 kHz"],
   ["w25000", "25 kHz"],
   ["denoise", "Denoise on"],
+  ["mute", "Mute in mix"],
   ["stop", "Stop"],
 ];
 
@@ -432,8 +439,12 @@ export function clampSpan(startNs, endNs, newest) {
 }
 
 class Menu {
-  constructor(wf, { applyOp, attachOp, ask, transcript, ov, plan = () => null, command = () => {} }) {
+  constructor(
+    wf,
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, command = () => {}, muteFor = () => null },
+  ) {
     this.wf = wf;
+    this.muteFor = muteFor;
     this.applyOp = applyOp;
     this.attachOp = attachOp;
     this.ask = ask;
@@ -582,7 +593,11 @@ class Menu {
     const dn = denoiseNode(job);
     for (const item of this.outlineEl.querySelectorAll(".ctx-item")) {
       const action = item.dataset.action;
-      if (action === "denoise") {
+      if (action === "mute") {
+        const m = this.muteFor(job);
+        item.hidden = m === null;
+        item.textContent = m && m.muted ? "Unmute in mix" : "Mute in mix";
+      } else if (action === "denoise") {
         item.hidden = dn === null;
         item.textContent = dn && dn.params && dn.params.denoise ? "Denoise off" : "Denoise on";
       } else {
@@ -654,6 +669,12 @@ class Menu {
     this.closeOutline();
     if (action === "stop") {
       await this.applyOp({ op: "job_stop", job: job.id });
+    } else if (action === "mute") {
+      // The mix's own graph with this channel added to (or taken off) `muted`.
+      const m = this.muteFor(job);
+      if (!m) return;
+      const r = await m.run();
+      if (r) this.t.note(`${job.kind}: ${m.muted ? "unmuted" : "muted"} in mix`);
     } else if (action === "denoise") {
       // The job's own graph with the flag flipped: a carried param, so the node keeps the
       // job re-expandable and relaunches it under its id (an attached transcribe follows).

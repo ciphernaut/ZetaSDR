@@ -11,16 +11,31 @@
 //                                `onReconnect` after the mix was restarted); a pick that
 //                                changes or goes closes it. On opening, `active` and `last`
 //                                are seeded from the mix's `job_context.mix`, unless an event
-//                                came first. Each `protocol: "mix"` event replaces `active`; a
-//                                job that left it becomes `last`, stamped with the page's own
-//                                time. `last` survives a restart of the same mix; a socket
-//                                closing clears `active` only; another mix clears both.
+//                                came first, and again after a reconnect (a restarted mix says
+//                                nothing until its set changes). Each `protocol: "mix"` event
+//                                replaces `active`; a job that left it becomes `last`, stamped
+//                                with the page's own time. `last` survives a restart of the
+//                                same mix; a socket closing clears `active` only; another mix
+//                                clears both.
 //       .activeIds() -> string[] the job ids speaking now (overlays.js setSpeaking)
 //       .rowText(mixId, labelOf, nowMs) -> string
 //                                `ch9 now`, `ch9, ch22 now`, `last ch9 12 s ago`, or "" before
 //                                any (and for a mix other than the watched one). `labelOf(hz)`
 //                                names a centre: the plan channel, else `476.625 MHz`.
 //       .close()
+//   DEMOD_KINDS                the job kinds a mix can mute (the four demodulators)
+//   mixCovering(job, jobs, playingId) -> mix | null
+//       The running mix that would hear `job`: null for a mix, an attached job or a kind
+//       outside DEMOD_KINDS; else pickMix among the running mixes whose `mix` node's
+//       `sources` is null or holds `job.source`.
+//   isMuted(job, mix) -> boolean
+//       Whether the mix's graph mutes the job's channel: an entry of `muted` on the job's
+//       source within CHANNEL_MATCH_HZ of its centre (a mute is a channel, not a job, so it
+//       outlives the job and a restart at the same band is still muted).
+//   muteOp(job, mix, on) -> op
+//       The `graph_put` of the mix's own graph with `{source, center_hz}` added to `muted`
+//       (`on`), or every entry on that source within CHANNEL_MATCH_HZ removed. The node
+//       keeps the mix's id and relaunches it.
 //   window.zetaMix = {job, active, last}: the watched mix id and what the page believes; read
 //       by the e2e scenarios.
 //
@@ -35,6 +50,40 @@ export function pickMix(jobs, playingId) {
   const playing = mixes.find((j) => j.id === playingId);
   if (playing) return playing;
   return mixes.reduce((a, b) => ((b.created_ns ?? 0) > (a.created_ns ?? 0) ? b : a));
+}
+
+export const DEMOD_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"];
+const CHANNEL_MATCH_HZ = 1_000; // zeta_core::plans::CHANNEL_MATCH_HZ
+
+const mixNode = (mix) => ((mix.graph && mix.graph.nodes) || []).find((n) => n.kind === "mix");
+
+export function mixCovering(job, jobs, playingId) {
+  if (!job || job.input || !DEMOD_KINDS.includes(job.kind)) return null;
+  const covering = (jobs || []).filter((j) => {
+    const node = j.kind === "mix" ? mixNode(j) : null;
+    const sources = node && node.params ? node.params.sources : undefined;
+    return sources === null || (Array.isArray(sources) && sources.includes(job.source));
+  });
+  return pickMix(covering, playingId);
+}
+
+const sameChannel = (m, job) =>
+  m.source === job.source && Math.abs(m.center_hz - job.tuning.center_hz) <= CHANNEL_MATCH_HZ;
+
+export function isMuted(job, mix) {
+  const node = mixNode(mix);
+  return !!node && ((node.params && node.params.muted) || []).some((m) => sameChannel(m, job));
+}
+
+export function muteOp(job, mix, on) {
+  const graph = JSON.parse(JSON.stringify(mix.graph));
+  const node = mixNode({ graph });
+  const kept = ((node.params && node.params.muted) || []).filter((m) => !sameChannel(m, job));
+  node.params = {
+    ...(node.params || {}),
+    muted: on ? [...kept, { source: job.source, center_hz: job.tuning.center_hz }] : kept,
+  };
+  return { op: "graph_put", job: mix.id, graph };
 }
 
 window.zetaMix = { job: null, active: [], last: null };
@@ -136,7 +185,18 @@ export class MixWatch {
         this.#publish();
         this.onChange();
       },
-      { onReconnect: () => this.#streamId(id) },
+      {
+        // A restarted mix (a mute's graph_put) publishes again only when its active set
+        // changes, so what it holds now is read again, as when the socket first opened.
+        onReconnect: async () => {
+          const next = await this.#streamId(id);
+          if (next && this.jobId === id) {
+            this.sawEvent = false;
+            this.#seed(id);
+          }
+          return next;
+        },
+      },
     );
     this.#seed(id);
   }

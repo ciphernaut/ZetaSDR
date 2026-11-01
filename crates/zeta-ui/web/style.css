@@ -289,6 +289,7 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 .job .band { color: var(--dim); font-size: 11px; }
 .job.hot { outline: 1px solid var(--accent); }
 .job.speaking { border-left: 3px solid var(--ok); }
+.job button.mute[aria-pressed="true"] { border-color: var(--dim); color: var(--dim); }
 .job .mix-now { color: var(--ok); font-size: 11px; }
 .job .events { color: var(--user); }
 .job .actions { display: flex; gap: 4px; justify-content: flex-end; }

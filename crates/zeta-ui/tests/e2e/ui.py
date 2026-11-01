@@ -3312,6 +3312,86 @@ def scenario_stopping_the_mix_ends_playback_and_lights(page, url, secret):
 
 
 
+def mix_graph_muted(url, secret, mix):
+    graph = http_json(url, secret, "/op", {"op": "graph_get", "job": mix})["value"]
+    return [n for n in graph["nodes"] if n["kind"] == "mix"][0]["params"]["muted"]
+
+
+def frames_played(page):
+    return page.evaluate("window.zetaAudio.framesPlayed")
+
+
+def scenario_mute_in_mix_from_row_and_outline(page, url, secret):
+    stop_mixes(url, secret)
+    select_source(page, url, secret, "cb")
+    demod = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+    other = start_job(url, secret, "fm_demod", "tone", 100_000_000, 10_000, deviation_hz=5000)
+    jobs = [demod, other]
+    try:
+        run_cmd(page, "mix cb")
+        page.wait_for_function(
+            "() => window.zetaAudio.playing !== null && window.zetaAudio.framesPlayed > 0",
+            timeout=5_000)
+        mix = mix_jobs(url, secret)[0]["id"]
+        # A demodulator on a source the mix does not cover has no Mute.
+        expect(job_row(page, other).locator("button.mute")).to_have_count(0)
+        row = job_row(page, demod)
+        expect(row).to_have_class(re.compile(r"\bspeaking\b"), timeout=5_000)
+        mute = row.locator("button.mute")
+        expect(mute).to_have_text("Mute in mix")
+        mute.click()
+        wait_until(lambda: mix_graph_muted(url, secret, mix) ==
+                   [{"source": "cb", "center_hz": 476_900_000}], 5.0, "muted in the graph")
+        assert [j["id"] for j in mix_jobs(url, secret)] == [mix], "the same mix"
+        page.evaluate("window.zetaTest.poll()")
+        expect(job_row(page, demod)).not_to_have_class(re.compile(r"\bspeaking\b"),
+                                                       timeout=3_000)
+        assert running_kind(url, secret, "fm_demod", "cb") == [demod], "the demodulator runs"
+        expect(job_row(page, demod).locator("button.mute")).to_have_text("Unmute in mix")
+        assert page.evaluate("window.zetaAudio.playing") == mix, "still playing the mix"
+        page.wait_for_timeout(1_500)
+        before = frames_played(page)
+        page.wait_for_timeout(1_000)
+        assert frames_played(page) == before, "no audio frames while the channel is muted"
+        # The mute is the channel's: a demodulator restarted at the same band is still muted.
+        stop_job(url, secret, demod)
+        demod = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+        jobs.append(demod)
+        row = job_row(page, demod)
+        expect(row.locator("button.mute")).to_have_text("Unmute in mix", timeout=5_000)
+        page.wait_for_timeout(1_500)
+        assert page.evaluate("window.zetaMix.active.length") == 0, "still muted after restart"
+        # From the outline menu.
+        page.evaluate("window.zetaTest.poll()")
+        page.locator(f'#waterfall .outline[data-key="{demod}"]').click(button="right")
+        item = page.locator('#ctx-outline .ctx-item[data-action="mute"]')
+        expect(item).to_have_text("Unmute in mix")
+        item.click()
+        wait_until(lambda: mix_graph_muted(url, secret, mix) == [], 5.0, "unmuted in the graph")
+        expect(page.locator("#transcript .line.note", has_text="fm_demod: unmuted in mix")
+               ).to_have_count(1)
+        page.evaluate("window.zetaTest.poll()")
+        expect(job_row(page, demod)).to_have_class(re.compile(r"\bspeaking\b"), timeout=5_000)
+        before = frames_played(page)
+        wait_until(lambda: frames_played(page) > before, 5.0, "audio frames again")
+        # The mix's row takes the ordinary Transcribe button, off until pressed.
+        mrow = job_row(page, mix)
+        assert not [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+                    if j["kind"] == "transcribe"], "no transcript attached by default"
+        mrow.locator("button.transcribe").click()
+        attached = wait_until(
+            lambda: [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+                     if j["kind"] == "transcribe" and j["input"] == mix],
+            5.0, "a transcribe attached to the mix")
+        jobs.append(attached[0]["id"])
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f'#jobs .job.attached[data-id="{attached[0]["id"]}"]')).to_be_visible()
+    finally:
+        for j in jobs:
+            stop_job(url, secret, j)
+        stop_mixes(url, secret)
+
+
 # ---- the map (plan 17 Task 9) -----------------------------------------------------------
 # The node's `fake_pos` mode row (ui.rs) runs zeta-ext's `fake_lines`, which prints two fixes
 # of sonde S1 (-27.40,153.10 then -27.41,153.11) 2 s into the job. The map's tiles come from

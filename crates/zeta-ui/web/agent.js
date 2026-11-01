@@ -74,7 +74,9 @@
 //       `home`, `14.8 km, 47°`) is not null shows it in a `.pos` line under the row.
 //       A running `mix` row (job_start refuses the kind: it comes from mix_start) has a
 //       `.mix-now` cell with mixText(job) (mix.js rowText: `ch9 now`, `last ch9 12 s ago`);
-//       app.js rewrites it in place as the mix's events arrive.
+//       app.js rewrites it in place as the mix's events arrive. A running demodulator's row has
+//       a `.mute` button (`Mute in mix` / `Unmute in mix`, aria-pressed) when mute(job) gives
+//       {muted, title, run} (app.js: a running mix covers the job's source).
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 import { channelLabel } from "./plans.js";
@@ -394,7 +396,7 @@ export function setSquelchTag(row, event) {
 function jobRow(
   job,
   onStop,
-  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText },
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute },
 ) {
   const row = document.createElement("div");
   const attached = !!job.input;
@@ -499,6 +501,16 @@ function jobRow(
     tr.onclick = () => onTranscribe(job);
     actions.append(tr);
   }
+  const m = mute && status === "running" ? mute(job) : null;
+  if (m) {
+    const b = document.createElement("button");
+    b.className = "mute";
+    b.textContent = m.muted ? "Unmute in mix" : "Mute in mix";
+    b.title = m.title;
+    b.setAttribute("aria-pressed", String(m.muted));
+    b.onclick = () => m.run();
+    actions.append(b);
+  }
   if (onGraph) actions.append(graphButton(job, onGraph));
   actions.append(stopButton(job, onStop));
   row.append(actions);
@@ -550,6 +562,7 @@ export function startJobs(
     position = null,
     onHot = null,
     mixText = null,
+    mute = null,
   } = {},
 ) {
   let timer = null;
@@ -568,6 +581,7 @@ export function startJobs(
     position,
     onHot,
     mixText,
+    mute,
   };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;
