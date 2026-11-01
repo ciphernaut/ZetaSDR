@@ -624,6 +624,8 @@ since the stream does not say who sent them); errors always show. The `ops` stre
 ordinary stream (`stream list` shows it with provenance source `node`), so a script can follow
 it too.
 
+**Many channels at once.** `plan start <plan> <kind> [<attach>] [ch N,N-M]` on the command line (or `Start plan…` in the box menu) starts a kind on a plan's channels on the shown source in one operation, and `stop all` stops every job but the page's spectrum. **Listen to all**, beside the source tabs, or a typed `mix [ID,ID]`, plays one stream summing every demodulator on every tuner (or those named): silence until someone keys up, the speaking channel's row and outline lit, and the mix's row naming who is talking and who was last. **Mute in mix** on a demodulator's row or outline menu silences that channel in the mix, not its transcript; a mute follows the channel, and stopping the mix forgets it. Transcripts stay per demodulator; the mix's row offers Transcribe as an option. The agent may not stop or replace jobs unless allowed: `allow stops on|off` sets that for the page's session, and a refused request offers a button that re-asks once.
+
 The command line takes either an operation as JSON (`{"op":"source_list"}`, applied with
 `POST /op`) or free text, which goes to the agent. That needs `--llm-url` and `--llm-model` on
 `serve` (the other `--llm-*` flags of `zeta ask` apply), which enable `POST /ask`: the node runs

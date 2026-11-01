@@ -291,7 +291,11 @@ Wanted: gate the measurement on the burst (on/off at 1 ms, measure over on-time 
 
 ## Agent: requests too big for the voice console
 
-Scheduled as plan 21 (`docs/superpowers/plans/2026-11-01-agent-bulk-ops.md`); the four parts and the duplicate refusal are its tasks.
+Done: plan 21 (`docs/superpowers/plans/2026-11-01-agent-bulk-ops.md`), plus `jobs_stop` for "stop all jobs". Live acceptance is in `UAT.md`.
+
+## Agent: the model invents a plan id
+
+From UAT, 2026-11-01. Asked for broadcast FM, gemma-4-12b called `plan_start` with a plan `broadcast_fm`, which does not exist, and got `unknown`. The node refused correctly. Broadcast FM has no channel plan, and FM stations are not on a plan the node knows. Wanted: the guide says to read `channel_plans` first and that a band with no plan takes one `job_start` per station; or a broadcast plan, if requests like this keep coming.
 
 ## Agent guide: SIGINT and UX additions
 
