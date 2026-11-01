@@ -184,8 +184,8 @@ impl Inner {
     /// the others fail naming it, as they would live), then the widest band first
     /// (ties oldest first) inside the capture [`Inner::resume_captures`] restores,
     /// elastic jobs after every rigid one (they join whatever capture those left), then
-    /// mixes (they list what runs), and attached jobs last, on their inputs' streams. A launch that fails leaves its
-    /// record `Failed` with the reason (`source <id> not present` for an absent source,
+    /// mixes (they list what runs), and attached jobs last, on their inputs' streams. A
+    /// launch that fails leaves its record `Failed` with the reason (`source <id> not present` for an absent source,
     /// the port's refusal under the source's name), persisted, with a fresh entry.
     ///
     /// Shared by `open` (every source, `relaunch` its [`Inner::resumable`]) and

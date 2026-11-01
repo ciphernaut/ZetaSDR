@@ -167,8 +167,8 @@ pub enum Op {
     /// relaunched, `tuning` updated. Applies to a `running` job the node expanded and can
     /// re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the
     /// mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum`
-    /// (elastic or rigid) and `transcribe` (attached: retune its input), and for a job
-    /// whose graph an operator `graph_put` replaced (it launches as stored: put a new
+    /// (elastic or rigid), `mix` (it has no band) and `transcribe` (attached: retune its
+    /// input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new
     /// graph or start a new job). A job that is not running is `job <id> is <state>`; an
     /// unknown id is `unknown`. The result is the job's id, as `job_start` answers.
     JobRetune {
@@ -198,9 +198,9 @@ pub enum Op {
     /// plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's
     /// gate, in this order: everything is checked first (an unknown `plan` or channel is
     /// `unknown`, a channel listed twice, a kind that does not run per channel —
-    /// `spectrum`, `scan`, `watch`, `identify`, `mix`, an attachable kind — and a non-attachable
-    /// `attach` are `other`; nothing has happened yet); a channel where an identical
-    /// rigid job already runs is `existing` and skipped; with `attach`, its stage must be
+    /// `spectrum`, `scan`, `watch`, `identify`, `mix`, an attachable kind — and a
+    /// non-attachable `attach` are `other`; nothing has happened yet); a channel where an
+    /// identical rigid job already runs is `existing` and skipped; with `attach`, its stage must be
     /// ready, else the op is refused with the stage's reason; the `replace` jobs are
     /// stopped; then one lease decision for the band bounding the channels to start
     /// (lowest channel edge to highest), checked as a rigid `job_start` of that band

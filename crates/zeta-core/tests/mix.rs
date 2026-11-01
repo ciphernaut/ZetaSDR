@@ -4,7 +4,7 @@
 //! demodulator's output stream (the radio delivers no blocks).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,21 +34,16 @@ struct Radio {
     cur: Mutex<Option<Tuning>>,
     tx: broadcast::Sender<IqBlock>,
     tunes: AtomicUsize,
-    slow: AtomicBool,
 }
 
 impl Radio {
     fn new(id: &str) -> Arc<Self> {
-        Self::with_max(id, 20_000_000)
-    }
-
-    fn with_max(id: &str, max_bandwidth_hz: u64) -> Arc<Self> {
         Arc::new(Self {
             id: SourceId(id.into()),
             caps: Capabilities {
                 tune_min_hz: Claim::Asserted(Hz(1_000_000)),
                 tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
-                max_bandwidth_hz: Claim::Asserted(Hz(max_bandwidth_hz)),
+                max_bandwidth_hz: Claim::Asserted(Hz(20_000_000)),
                 formats: vec![SampleFormat::Cf32],
                 channels: 1,
                 rx: true,
@@ -59,7 +54,6 @@ impl Radio {
             cur: Mutex::new(None),
             tx: broadcast::channel(1).0,
             tunes: AtomicUsize::new(0),
-            slow: AtomicBool::new(false),
         })
     }
 
@@ -78,9 +72,6 @@ impl Port for Radio {
     }
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         self.tunes.fetch_add(1, Ordering::SeqCst);
-        if self.slow.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
         *self.cur.lock().unwrap() = Some(t);
         Ok(t)
     }
@@ -447,14 +438,34 @@ async fn the_same_set_answers_the_same_id_and_another_set_a_new_one() {
     assert_ne!(again, one, "a stopped mix is history");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_mix_starts_answer_one_job() {
+    const TASKS: usize = 8;
     let dir = tempfile::tempdir().unwrap();
-    let node = open_on(dir.path(), &[Radio::new("a")]).await;
-    let (x, y) = tokio::join!(mix(&node, None), mix(&node, None));
-    assert_eq!(x, y);
-    let mixes = node.job_list().iter().filter(|r| r.kind == "mix").count();
-    assert_eq!(mixes, 1);
+    let node = Arc::new(open_on(dir.path(), &[Radio::new("a")]).await);
+    for round in 0..30 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(TASKS));
+        let starts: Vec<_> = (0..TASKS)
+            .map(|_| {
+                let (node, barrier) = (node.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    mix(&node, None).await
+                })
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for start in starts {
+            ids.push(start.await.unwrap());
+        }
+        ids.dedup();
+        assert_eq!(ids.len(), 1, "round {round}: {ids:?}");
+        let job = ids.remove(0);
+        let live = |r: &JobRecord| r.kind == "mix" && r.state == JobState::Running;
+        let mixes = node.job_list().iter().filter(|r| live(r)).count();
+        assert_eq!(mixes, 1, "round {round}");
+        node.apply(Op::JobStop { job }).await.unwrap();
+    }
 }
 
 #[tokio::test]
