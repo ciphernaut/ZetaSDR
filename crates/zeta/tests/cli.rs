@@ -3079,5 +3079,7 @@ fn a_source_flag_named_node_is_refused() {
         .args(["source", "list"])
         .assert()
         .code(1)
-        .stderr(contains("source id \"node\" is reserved"));
+        .stderr(contains(
+            "source id \"node\" is reserved for the node's own streams",
+        ));
 }

@@ -19,20 +19,22 @@
 //       as one AudioBufferSourceNode at the header's payload.sample_rate_hz (one buffer
 //       channel per audio channel, up to 2; a missing payload.channels is 1), queued back to
 //       back: `nextStart` advances by each frame's duration; when the queue has run dry
-//       (nextStart before ctx.currentTime) it is re-anchored at ctx.currentTime + LEAD_S. A
-//       frame that would start more than MAX_AHEAD_S ahead is dropped (bounds the latency if
-//       the stream outruns real time). The stream is re-resolved by provenance after a drop
+//       (nextStart before ctx.currentTime) it is re-anchored at ctx.currentTime + LEAD_S.
+//       Past MAX_AHEAD_S of queue (the stream outran real time, or the context stood still)
+//       what is queued is cut and it is re-anchored the same way, at each frame and when the
+//       context runs again. A context found suspended on `visibilitychange` or `statechange`
+//       (a phone's lock screen) is resumed. The stream is re-resolved by provenance after a drop
 //       (graph_put restarts the job with new stream ids). onError(message) reports a failure
 //       (no audio stream, a bad envelope, an unplayable rate), after which playback stops and
 //       onEnd() is called; stop() closes the socket and the context (and calls onEnd).
 //   window.zetaAudio = {framesPlayed, framesDropped, playing, lastRate}: frames scheduled and
-//       frames dropped (beyond MAX_AHEAD_S) since the last playJob, the job id being played
+//       frames cut (beyond MAX_AHEAD_S) since the last playJob, the job id being played
 //       (null when stopped), the sample_rate_hz of the last frame's header (null before
 //       one) and the channels of the last frame's header (null before one); read by the e2e
 //       scenarios.
 
 export const LEAD_S = 0.1;
-export const MAX_AHEAD_S = 2.0;
+export const MAX_AHEAD_S = 1.0;
 const STREAM_LOOKUPS = 20;
 const STREAM_LOOKUP_MS = 250;
 
@@ -87,6 +89,7 @@ export function playJob(api, job, { onError = () => {}, onEnd = () => {}, ctx = 
   let sub = null;
   let stopped = false;
   let nextStart = 0;
+  const queued = new Set();
   window.zetaAudio = {
     framesPlayed: 0,
     framesDropped: 0,
@@ -95,9 +98,27 @@ export function playJob(api, job, { onError = () => {}, onEnd = () => {}, ctx = 
     lastChannels: null,
   };
 
+  // Cut a queue grown past MAX_AHEAD_S: played late it would be delay for good.
+  const reanchor = () => {
+    const now = ctx.currentTime;
+    if (nextStart - now <= MAX_AHEAD_S) return;
+    for (const src of queued) src.stop();
+    window.zetaAudio.framesDropped += queued.size;
+    queued.clear();
+    nextStart = now + LEAD_S;
+  };
+  const wake = () => {
+    if (ctx.state === "running") reanchor();
+    else if (ctx.state !== "closed") ctx.resume().catch(() => {});
+  };
+  ctx.addEventListener("statechange", wake);
+  document.addEventListener("visibilitychange", wake);
+
   const stop = () => {
     if (stopped) return;
     stopped = true;
+    ctx.removeEventListener("statechange", wake);
+    document.removeEventListener("visibilitychange", wake);
     if (sub) sub.close();
     ctx.close().catch(() => {});
     if (window.zetaAudio.playing === job.id) window.zetaAudio.playing = null;
@@ -140,13 +161,12 @@ export function playJob(api, job, { onError = () => {}, onEnd = () => {}, ctx = 
     split.forEach((data, c) => buffer.copyToChannel(data, c));
     const now = ctx.currentTime;
     if (nextStart < now) nextStart = now + LEAD_S;
-    if (nextStart - now > MAX_AHEAD_S) {
-      window.zetaAudio.framesDropped += 1;
-      return;
-    }
+    reanchor();
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(ctx.destination);
+    src.onended = () => queued.delete(src);
+    queued.add(src);
     src.start(nextStart);
     nextStart += n / rate;
     window.zetaAudio.framesPlayed += 1;

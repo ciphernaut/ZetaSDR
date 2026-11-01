@@ -344,3 +344,7 @@ Suggested: the gate passes `job_stop` for ids that a `job_start` returned earlie
 ## Agent: `graph_put` and `job_retune` change an operator's job without the allowance
 
 Found in the plan 21 final review, 2026-11-01. `graph_put` and `job_retune` can change an operator's job, or in effect end it (a graph that fails, a retune off the signal it served), without the allowance: the spec gates only `job_stop` and `replace`. Recorded as a slot: a gate for changes to jobs the run did not start, if the agent is ever seen doing this.
+
+## Mix: mutes do not survive the mix, the page offers fewer than it hears, a phone is untested
+
+Found in the plan 22 final review, 2026-11-01. Mutes live in the mix's graph, so stopping the mix (`stop all` included) forgets them. The page offers Mute in mix only on the demodulator kinds, though the mix hears any job with audio. And how the page's audio behaves on a real phone is untested: the resume and the re-anchor on a suspended context were only run against a context suspended in headless Chromium.

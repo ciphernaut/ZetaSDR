@@ -122,7 +122,9 @@ fn split_id(s: &str) -> Option<(&str, &str)> {
 /// carries.
 fn refuse_reserved(id: &str) -> Result<(), String> {
     if id == zeta_core::node::NODE_SOURCE {
-        return Err(format!("source id {id:?} is reserved"));
+        return Err(format!(
+            "source id {id:?} is reserved for the node's own streams"
+        ));
     }
     Ok(())
 }
@@ -424,7 +426,10 @@ mod tests {
             parse_node("node=s@http://h:1").unwrap_err(),
             parse_vrt("node=udp://127.0.0.1:4991").unwrap_err(),
         ] {
-            assert!(e.contains("source id \"node\" is reserved"), "{e}");
+            assert_eq!(
+                e,
+                "source id \"node\" is reserved for the node's own streams"
+            );
         }
         assert!(parse_plugin("node=/x").is_ok());
         assert!(parse_soapy("h=").is_err());

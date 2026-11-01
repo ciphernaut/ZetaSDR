@@ -53,6 +53,9 @@ const UNDERRUN_WINDOW: Duration = Duration::from_millis(100);
 const REANCHOR_NS: u64 = 100_000_000;
 /// How often the span clock takes the system clock again (see [`WallClock`]).
 const WALL_REBASE: Duration = Duration::from_secs(60);
+/// How often a record that only moves `last.t_ns` is written: an always-open input moves it
+/// at every poll.
+const LAST_TIME_WRITE: Duration = Duration::from_secs(5);
 /// The limiter's knee: unity gain inside it.
 const KNEE: f32 = 0.8;
 
@@ -295,7 +298,10 @@ impl Mixed {
             sum.resize(n, 0.0);
         }
         for (out, s) in sum.iter_mut().zip(self.queue.drain(..n)) {
-            *out += s;
+            // A non-finite sample would poison the sum for every other input.
+            if s.is_finite() {
+                *out += s;
+            }
         }
     }
 
@@ -426,6 +432,15 @@ impl Mix {
     }
 }
 
+/// `state` without `last.t_ns`.
+fn without_last_time(state: &Value) -> Value {
+    let mut state = state.clone();
+    if let Some(last) = state.get_mut("last").and_then(Value::as_object_mut) {
+        last.remove("t_ns");
+    }
+    state
+}
+
 /// The event's one line: the active centres, or `silent`.
 fn summary(active: &[Value]) -> String {
     if active.is_empty() {
@@ -464,6 +479,15 @@ impl Stage for MixStage {
         Backend::Cpu
     }
 
+    fn check_params(&self, params: &Value) -> Result<(), String> {
+        let params: MixParams =
+            serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+        if params.sources.is_some_and(|s| s.is_empty()) {
+            return Err("sources: empty: pass null for every source".into());
+        }
+        Ok(())
+    }
+
     async fn run(
         &self,
         params: Value,
@@ -492,6 +516,7 @@ impl Stage for MixStage {
         let mut active: Vec<Value> = Vec::new();
         let mut noted = mix.context(&active);
         ctx.note(json!({"mix": noted}));
+        let mut noted_at = Instant::now();
 
         let mut clock = WallClock::new();
         let mut next_start_ns: Option<u64> = None;
@@ -566,9 +591,12 @@ impl Stage for MixStage {
             }
             if changed || polled {
                 let state = mix.context(&active);
-                if state != noted {
+                let due = now - noted_at >= LAST_TIME_WRITE;
+                if state != noted && (due || without_last_time(&state) != without_last_time(&noted))
+                {
                     ctx.note(json!({"mix": state}));
                     noted = state;
+                    noted_at = now;
                 }
             }
         }
@@ -1096,6 +1124,55 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "stage failed: mix needs a node's job list");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_non_finite_sample_contributes_silence() {
+        let (mut bed, s) = Bed::start(
+            json!({"sources": null}),
+            &[("a", "b210", C), ("b", "b210", C + 5000)],
+        )
+        .await;
+        bed.feed(&s[0], &[0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+        bed.feed(&s[1], &[0.2; 4]);
+        bed.run_ms(100).await;
+        let out = all_samples(&bed.frames());
+        assert_eq!(out.len(), 4);
+        assert!((out[0] - 0.3).abs() < 1e-6, "{out:?}");
+        assert_eq!(&out[1..], &[0.2; 3]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_always_open_input_does_not_rewrite_the_record_at_every_poll() {
+        let (bed, s) = Bed::start(json!({"sources": null}), &[("a", "b210", C)]).await;
+        bed.feed_for(&s[0], 0.1, 2_000, 20).await;
+        let settled = bed.notes.lock().unwrap().len();
+        let at_settled = bed.mix()["last"]["t_ns"].as_u64().unwrap();
+        bed.feed_for(&s[0], 0.1, 20_000, 20).await;
+        let written = bed.notes.lock().unwrap().len() - settled;
+        // One per 5 s, not 40 at the 500 ms poll.
+        assert!((3..=5).contains(&written), "{written} writes in 20 s");
+        assert!(bed.mix()["last"]["t_ns"].as_u64().unwrap() > at_settled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_other_than_the_time_is_written_at_its_poll() {
+        let (mut bed, s) = Bed::start(json!({"sources": null}), &[("a", "b210", C)]).await;
+        bed.feed_for(&s[0], 0.1, 1_000, 20).await;
+        bed.add("b", "b210", C + 5000);
+        bed.feed_for(&s[0], 0.1, 600, 20).await;
+        assert_eq!(bed.mix()["inputs"], 2);
+    }
+
+    #[test]
+    fn an_empty_sources_is_refused() {
+        let stage = MixStage::new();
+        assert_eq!(
+            stage.check_params(&json!({"sources": []})),
+            Err("sources: empty: pass null for every source".to_string())
+        );
+        assert!(stage.check_params(&json!({"sources": null})).is_ok());
+        assert!(stage.check_params(&json!({"sources": ["a"]})).is_ok());
     }
 
     #[test]

@@ -27,15 +27,16 @@
 //   mixCovering(job, jobs, playingId) -> mix | null
 //       The running mix that would hear `job`: null for a mix, an attached job or a kind
 //       outside DEMOD_KINDS; else pickMix among the running mixes whose `mix` node's
-//       `sources` is null or holds `job.source`.
+//       `sources` is null or holds `job.source`. A mute goes to that mix only: when several
+//       cover a source, the others go on hearing the channel.
 //   isMuted(job, mix) -> boolean
 //       Whether the mix's graph mutes the job's channel: an entry of `muted` on the job's
 //       source within CHANNEL_MATCH_HZ of its centre (a mute is a channel, not a job, so it
 //       outlives the job and a restart at the same band is still muted).
-//   muteOp(job, mix, on) -> op
-//       The `graph_put` of the mix's own graph with `{source, center_hz}` added to `muted`
-//       (`on`), or every entry on that source within CHANNEL_MATCH_HZ removed. The node
-//       keeps the mix's id and relaunches it.
+//   muteOp(job, mixId, graph, on) -> op
+//       The `graph_put` of `graph`, the mix's own as a `graph_get` just read it, with
+//       `{source, center_hz}` added to `muted` (`on`), or every entry on that source within
+//       CHANNEL_MATCH_HZ removed. The node keeps the mix's id and relaunches it.
 //   window.zetaMix = {job, active, last}: the watched mix id and what the page believes; read
 //       by the e2e scenarios.
 //
@@ -75,15 +76,15 @@ export function isMuted(job, mix) {
   return !!node && ((node.params && node.params.muted) || []).some((m) => sameChannel(m, job));
 }
 
-export function muteOp(job, mix, on) {
-  const graph = JSON.parse(JSON.stringify(mix.graph));
+export function muteOp(job, mixId, read, on) {
+  const graph = JSON.parse(JSON.stringify(read));
   const node = mixNode({ graph });
   const kept = ((node.params && node.params.muted) || []).filter((m) => !sameChannel(m, job));
   node.params = {
     ...(node.params || {}),
     muted: on ? [...kept, { source: job.source, center_hz: job.tuning.center_hz }] : kept,
   };
-  return { op: "graph_put", job: mix.id, graph };
+  return { op: "graph_put", job: mixId, graph };
 }
 
 window.zetaMix = { job: null, active: [], last: null };

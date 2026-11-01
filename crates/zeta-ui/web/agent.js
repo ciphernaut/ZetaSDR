@@ -34,7 +34,8 @@
 //       .onAssistant(fn)        fn(text, error) is also called for every assistant line
 //                               (Task 8 hangs the narrow-footprint ribbons here)
 //   startOpsFeed(api, transcript, {onConflict}) -> {close}
-//       Finds the `ops` stream (the GET /streams entry whose provenance.source is "node")
+//       Finds the `ops` stream (the GET /streams entry whose provenance.source is "node" and
+//       that belongs to no job, as a mix's streams do)
 //       and appends one line per frame; reconnects and re-resolves the id when it drops.
 //       onConflict(payload) is called for a `conflict` error of another caller (transport
 //       not "ui"; this page's own typed ops are handled where it applies them).
@@ -76,7 +77,8 @@
 //       `.mix-now` cell with mixText(job) (mix.js rowText: `ch9 now`, `last ch9 12 s ago`);
 //       app.js rewrites it in place as the mix's events arrive. A running demodulator's row has
 //       a `.mute` button (`Mute in mix` / `Unmute in mix`, aria-pressed) when mute(job) gives
-//       {muted, title, run} (app.js: a running mix covers the job's source).
+//       {muted, title, run} (app.js: a running mix covers the job's source); `muted` is the
+//       label only, run() decides from the mix's graph at the click.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 import { channelLabel } from "./plans.js";

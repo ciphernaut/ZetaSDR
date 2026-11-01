@@ -1016,22 +1016,41 @@ function syncListen() {
 }
 
 // The mute a demodulator's row or outline offers: the running mix that hears it (mix.js
-// mixCovering, the playing one first), whether the channel is muted there and the op to flip
-// it; null when no mix covers the job.
+// mixCovering, the playing one first) and whether the job list says the channel is muted there,
+// for the label; null when no mix covers the job. `run()` flips what the mix's graph says then
+// and answers `{muted}`, or null when nothing was applied.
 function muteFor(job) {
   const mix = mixCovering(job, state.lastJobs, state.audio?.jobId);
   if (!mix) return null;
-  const muted = isMuted(job, mix);
-  const op = muteOp(job, mix, !muted);
   return {
-    muted,
+    muted: isMuted(job, mix),
     title: `graph_put ${mix.id}`,
-    run: async () => {
-      const r = await applyOp(op);
-      state.jobs?.refresh();
-      return r;
+    run: () => {
+      const turn = muteQueue.then(() => flipMute(job));
+      muteQueue = turn.catch(() => {});
+      return turn;
     },
   };
+}
+
+// The page's mutes, one at a time: each reads the graph the one before it wrote.
+let muteQueue = Promise.resolve();
+
+// The job list is up to 2 s old and a graph_put replaces the whole list of mutes, so the edit is
+// made on the graph as it stands now.
+async function flipMute(rendered) {
+  const job = state.lastJobs.find((j) => j.id === rendered.id) ?? rendered;
+  const mix = mixCovering(job, state.lastJobs, state.audio?.jobId);
+  if (!mix || !state.api) return null;
+  let graph;
+  try {
+    graph = (await state.api.op({ op: "graph_get", job: mix.id })).value;
+  } catch (e) {
+    state.transcript.note(`graph_get: ${e.message}`, true);
+    return null;
+  }
+  const muted = !isMuted(job, { graph });
+  return (await applyOp(muteOp(job, mix.id, graph, muted))) ? { muted } : null;
 }
 
 // What a mix's row says (mix.js rowText) with the plan's channel names.

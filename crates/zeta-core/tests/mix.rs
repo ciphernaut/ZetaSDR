@@ -694,3 +694,25 @@ async fn a_restart_resumes_the_mix_after_its_jobs_and_before_its_transcribe() {
     until_inputs(&node, &m, 1).await;
     assert!(hears(&node, &m, &ch).await);
 }
+
+#[tokio::test]
+async fn a_restart_keeps_the_mute_in_the_mix() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new("a");
+    let node = open_on(dir.path(), std::slice::from_ref(&radio)).await;
+    let m = mix(&node, None).await;
+    let ch = demod(&node, "a", CH).await;
+    put_muted(&node, &m, json!([{"source": "a", "center_hz": CH}]))
+        .await
+        .unwrap();
+    drop(node);
+
+    let node = open_on(dir.path(), std::slice::from_ref(&radio)).await;
+    assert_eq!(record(&node, &m).state, JobState::Running);
+    until_inputs(&node, &m, 1).await;
+    assert!(!hears(&node, &m, &ch).await);
+    assert_eq!(
+        mix_ctx(&node, &m)["muted"],
+        json!([{"job": ch.0, "source": "a", "center_hz": CH}])
+    );
+}

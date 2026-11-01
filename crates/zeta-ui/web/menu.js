@@ -670,11 +670,11 @@ class Menu {
     if (action === "stop") {
       await this.applyOp({ op: "job_stop", job: job.id });
     } else if (action === "mute") {
-      // The mix's own graph with this channel added to (or taken off) `muted`.
+      // The mix's own graph, read now, with this channel added to (or taken off) `muted`.
       const m = this.muteFor(job);
       if (!m) return;
       const r = await m.run();
-      if (r) this.t.note(`${job.kind}: ${m.muted ? "unmuted" : "muted"} in mix`);
+      if (r) this.t.note(`${job.kind}: ${r.muted ? "muted" : "unmuted"} in mix`);
     } else if (action === "denoise") {
       // The job's own graph with the flag flipped: a carried param, so the node keeps the
       // job re-expandable and relaunches it under its id (an attached transcribe follows).

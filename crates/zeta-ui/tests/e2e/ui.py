@@ -3321,6 +3321,22 @@ def frames_played(page):
     return page.evaluate("window.zetaAudio.framesPlayed")
 
 
+def transcribes_on(url, secret, job):
+    return [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            if j["kind"] == "transcribe" and j["input"] == job]
+
+
+def job_status(url, secret, job):
+    jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+    return [j for j in jobs if j["id"] == job][0]["state"]["status"]
+
+
+def attached_stream(url, secret, job):
+    """The stream an attached job's `stream_in` reads."""
+    graph = http_json(url, secret, "/op", {"op": "graph_get", "job": job})["value"]
+    return [n for n in graph["nodes"] if n["kind"] == "stream_in"][0]["params"]["stream"]
+
+
 def scenario_mute_in_mix_from_row_and_outline(page, url, secret):
     stop_mixes(url, secret)
     select_source(page, url, secret, "cb")
@@ -3335,6 +3351,16 @@ def scenario_mute_in_mix_from_row_and_outline(page, url, secret):
         mix = mix_jobs(url, secret)[0]["id"]
         # A demodulator on a source the mix does not cover has no Mute.
         expect(job_row(page, other).locator("button.mute")).to_have_count(0)
+        # The mix's row takes the ordinary Transcribe button, off until pressed.
+        mrow = job_row(page, mix)
+        assert not transcribes_on(url, secret, mix), "no transcript attached by default"
+        mrow.locator("button.transcribe").click()
+        attached = wait_until(lambda: transcribes_on(url, secret, mix), 5.0,
+                              "a transcribe attached to the mix")[0]["id"]
+        jobs.append(attached)
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f'#jobs .job.attached[data-id="{attached}"]')).to_be_visible()
+        read_before = attached_stream(url, secret, attached)
         row = job_row(page, demod)
         expect(row).to_have_class(re.compile(r"\bspeaking\b"), timeout=5_000)
         mute = row.locator("button.mute")
@@ -3343,6 +3369,12 @@ def scenario_mute_in_mix_from_row_and_outline(page, url, secret):
         wait_until(lambda: mix_graph_muted(url, secret, mix) ==
                    [{"source": "cb", "center_hz": 476_900_000}], 5.0, "muted in the graph")
         assert [j["id"] for j in mix_jobs(url, secret)] == [mix], "the same mix"
+        # The mute's restart gives the mix a new audio stream; the transcribe follows it under
+        # its own id.
+        wait_until(lambda: attached_stream(url, secret, attached) != read_before, 5.0,
+                   "the transcribe relaunched on the mix's new stream")
+        assert [j["id"] for j in transcribes_on(url, secret, mix)] == [attached], "the same one"
+        assert job_status(url, secret, attached) == "running", "the transcribe runs"
         page.evaluate("window.zetaTest.poll()")
         expect(job_row(page, demod)).not_to_have_class(re.compile(r"\bspeaking\b"),
                                                        timeout=3_000)
@@ -3374,21 +3406,83 @@ def scenario_mute_in_mix_from_row_and_outline(page, url, secret):
         expect(job_row(page, demod)).to_have_class(re.compile(r"\bspeaking\b"), timeout=5_000)
         before = frames_played(page)
         wait_until(lambda: frames_played(page) > before, 5.0, "audio frames again")
-        # The mix's row takes the ordinary Transcribe button, off until pressed.
-        mrow = job_row(page, mix)
-        assert not [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
-                    if j["kind"] == "transcribe"], "no transcript attached by default"
-        mrow.locator("button.transcribe").click()
-        attached = wait_until(
-            lambda: [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
-                     if j["kind"] == "transcribe" and j["input"] == mix],
-            5.0, "a transcribe attached to the mix")
-        jobs.append(attached[0]["id"])
-        page.evaluate("window.zetaTest.poll()")
-        expect(page.locator(f'#jobs .job.attached[data-id="{attached[0]["id"]}"]')).to_be_visible()
     finally:
         for j in jobs:
             stop_job(url, secret, j)
+        stop_mixes(url, secret)
+
+
+def scenario_mutes_in_quick_succession_keep_each_other(page, url, secret):
+    """Each mute reads the mix's graph when it runs, one at a time: neither a second click before
+    a poll nor another client's mute is undone by a list the page cached."""
+    stop_mixes(url, secret)
+    select_source(page, url, secret, "cb")
+    a = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+    b = start_job(url, secret, "fm_demod", "tone", 100_000_000, 10_000, deviation_hz=5000)
+    try:
+        mix = http_json(url, secret, "/op", {"op": "mix_start", "sources": None})["value"]
+        page.evaluate("window.zetaTest.poll()")
+        expect(job_row(page, a).locator("button.mute")).to_have_text("Mute in mix")
+        expect(job_row(page, b).locator("button.mute")).to_have_text("Mute in mix")
+        # Another client's mute, which the page's list has not seen.
+        theirs = {"source": "tone", "center_hz": 90_000_000}
+        graph = http_json(url, secret, "/op", {"op": "graph_get", "job": mix})["value"]
+        [n for n in graph["nodes"] if n["kind"] == "mix"][0]["params"]["muted"] = [theirs]
+        http_json(url, secret, "/op", {"op": "graph_put", "job": mix, "graph": graph})
+        page.evaluate(
+            """(ids) => ids.forEach((id) =>
+                 document.querySelector(`#jobs .job[data-id="${id}"] button.mute`).click())""",
+            [a, b])
+        want = [theirs, {"source": "cb", "center_hz": 476_900_000},
+                {"source": "tone", "center_hz": 100_000_000}]
+        wait_until(lambda: mix_graph_muted(url, secret, mix) == want, 5.0, "both in the graph")
+        page.wait_for_timeout(500)
+        assert mix_graph_muted(url, secret, mix) == want, "neither undone"
+        page.evaluate("window.zetaTest.poll()")
+        expect(job_row(page, a).locator("button.mute")).to_have_text("Unmute in mix")
+        expect(job_row(page, b).locator("button.mute")).to_have_text("Unmute in mix")
+    finally:
+        stop_job(url, secret, a)
+        stop_job(url, secret, b)
+        stop_mixes(url, secret)
+
+
+def scenario_audio_comes_back_from_a_suspended_context(page, url, secret):
+    """As a phone's lock screen does: the context stops while frames keep arriving. Coming back
+    it runs again, and the audio queued meanwhile is cut rather than heard late."""
+    stop_mixes(url, secret)
+    select_source(page, url, secret, "cb")
+    demod = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+    try:
+        page.evaluate(
+            """() => {
+                 const Real = window.AudioContext;
+                 window.AudioContext = class extends Real {
+                   constructor(...a) { super(...a); window.__ctx = this; }
+                 };
+               }""")
+        run_cmd(page, "mix cb")
+        page.wait_for_function(
+            "() => window.zetaAudio.playing !== null && window.zetaAudio.framesPlayed > 0",
+            timeout=5_000)
+        # The node's own statechange answer: a suspend is resumed.
+        page.evaluate("window.__ctx.suspend()")
+        page.wait_for_function("() => window.__ctx.state === 'running'", timeout=3_000)
+        # Locked: a resume does nothing until the page is visible again.
+        page.evaluate("window.__ctx.resume = async () => {}; window.__ctx.suspend()")
+        page.wait_for_function("() => window.__ctx.state === 'suspended'", timeout=3_000)
+        page.wait_for_function("() => window.zetaAudio.framesDropped > 0", timeout=10_000)
+        page.evaluate(
+            """() => {
+                 delete window.__ctx.resume;
+                 document.dispatchEvent(new Event("visibilitychange"));
+               }""")
+        page.wait_for_function("() => window.__ctx.state === 'running'", timeout=3_000)
+        before = frames_played(page)
+        wait_until(lambda: frames_played(page) > before, 5.0, "frames again")
+        assert page.evaluate("window.zetaAudio.playing") is not None, "still playing"
+    finally:
+        stop_job(url, secret, demod)
         stop_mixes(url, secret)
 
 
