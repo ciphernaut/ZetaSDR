@@ -592,7 +592,7 @@ async fn scan_mask_defaults_follow_the_capabilities() {
     let ctx = node.job_context(&id).unwrap();
     assert_eq!(
         ctx["scan"]["mask"],
-        serde_json::json!({"notch_hz": 300_000, "edge_mask": 0.1})
+        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.02})
     );
     let Payload::Event(ev) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -602,12 +602,12 @@ async fn scan_mask_defaults_follow_the_capabilities() {
     else {
         panic!()
     };
-    assert_eq!(ev["notch_hz"], 300_000);
-    assert_eq!(ev["edge_mask"], 0.1);
+    assert_eq!(ev["notch_hz"], 50_000);
+    assert_eq!(ev["edge_mask"], 0.02);
     let g = graph_of(&node, &id).await;
     assert_eq!(g.nodes.len(), 1);
-    assert_eq!(fft_node(&g).params["notch_hz"], 300_000);
-    assert_eq!(fft_node(&g).params["edge_mask"], 0.1);
+    assert_eq!(fft_node(&g).params["notch_hz"], 50_000);
+    assert_eq!(fft_node(&g).params["edge_mask"], 0.02);
     assert_eq!(fft_node(&g).params["size"], 4096);
     node.job_stop(&id).await.unwrap();
     // A remote source gets none.
@@ -632,8 +632,8 @@ async fn scan_mask_defaults_follow_the_capabilities() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_step_scan_does_not_alternate() {
-    // 1 MHz is narrower than four 300 kHz notches: no notch in force, though the node stores it;
-    // and with no odd sweep to fill the edges in, no edge mask in force either.
+    // One step: the 50 kHz notch is in force (1 MHz is wider than four notches; the unit test
+    // covers a step too narrow for it), but with no odd sweep to fill the edges in, no edge mask.
     let (_dir, node, port) = open().await;
     let id = match node.apply(start(JobKind::Scan, 100 * MHZ, MHZ)).await {
         Ok(OpResult::Job(id)) => id,
@@ -650,12 +650,12 @@ async fn a_one_step_scan_does_not_alternate() {
     assert!(ctx["scan"]["alternate"].is_null(), "{ctx}");
     assert_eq!(
         ctx["scan"]["mask"],
-        serde_json::json!({"notch_hz": 0, "edge_mask": 0.0})
+        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.0})
     );
     let g = graph_of(&node, &id).await;
     let stored = fft_node(&g);
-    assert_eq!(stored.params["notch_hz"], 300_000);
-    assert_eq!(stored.params["edge_mask"], 0.1);
+    assert_eq!(stored.params["notch_hz"], 50_000);
+    assert_eq!(stored.params["edge_mask"], 0.02);
     node.job_stop(&id).await.unwrap();
 }
 

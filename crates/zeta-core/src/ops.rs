@@ -1057,10 +1057,16 @@ pub const IDENTIFY_MEASURE_MS: u64 = 1_000;
 
 /// Full width of the DC notch a scan masks on local hardware, in Hz: bins within
 /// half of this of each capture's centre are masked (the `fft` stage's
-/// `notch_hz`).
-pub const SCAN_NOTCH_HZ: u64 = 300_000;
+/// `notch_hz`). Measured 2026-11-01: the HackRF One's DC artefact is a 3-bin
+/// needle at every rate (11.7 kHz over 6 dB at 4096 bins of 16 Msps, 2.9 kHz at
+/// 1 Msps), the B210's 5-6 kHz over 6 dB and 9-15 kHz over 3 dB; 50 kHz is four
+/// times the widest and the same width as `MEASURE_DC_MASK_HZ` either side.
+pub const SCAN_NOTCH_HZ: u64 = 50_000;
 /// Fraction of each capture's bins masked at each edge on local hardware.
-pub const SCAN_EDGE_MASK: f64 = 0.10;
+/// Measured 2026-11-01: the HackRF has no edge roll-off at 1-16 Msps (the outer
+/// 5 % within 3 dB of the row median) but a spur on its edge bins (±fs/2, 13-23 dB
+/// at 16 Msps); the B210 rolls off over 0.9-3.2 % of the row. 0.02 covers both.
+pub const SCAN_EDGE_MASK: f64 = 0.02;
 /// Half-width of the DC mask a `measure` job applies, in Hz.
 pub const MEASURE_DC_MASK_HZ: u64 = 25_000;
 
@@ -2943,10 +2949,7 @@ mod tests {
         assert!(local_hardware(&caps_flags(false, false)));
         assert!(!local_hardware(&caps_flags(true, false)));
         assert!(!local_hardware(&caps_flags(false, true)));
-        assert_eq!(
-            scan_mask_default(&caps_flags(false, false)),
-            (300_000, 0.10)
-        );
+        assert_eq!(scan_mask_default(&caps_flags(false, false)), (50_000, 0.02));
         assert_eq!(scan_mask_default(&caps_flags(true, false)), (0, 0.0));
         assert_eq!(scan_mask_default(&caps_flags(false, true)), (0, 0.0));
         assert_eq!(scan_notch_in_force(16_000_000, 300_000), 300_000);

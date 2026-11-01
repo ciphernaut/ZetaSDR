@@ -694,7 +694,7 @@ Sweeps alternate between two step grids a quarter step apart (even sweeps use th
 odd sweeps shift every centre down by a quarter step, with at most one more step), so a step's
 centre and its edges in one sweep fall a quarter of the way into a row of the next: read two
 consecutive sweeps. On a local hardware receiver each row masks its centre notch (`notch_hz`,
-300 kHz) and its outer edges (`edge_mask`, 0.10 of the bins each side; keep it under 0.25, or the
+50 kHz) and its outer edges (`edge_mask`, 0.02 of the bins each side; keep it under 0.25, or the
 two grids' masks overlap); the row carries `masked: [[lo, hi], ...]` (bin index ranges, `hi`
 exclusive), which are no data rather than low power. A one-step scan does not alternate and gets
 no edge mask (no other sweep could fill it in). The job context's `scan.alternate` (`shift_hz`,

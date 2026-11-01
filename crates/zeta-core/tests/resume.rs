@@ -399,12 +399,12 @@ async fn a_scan_record_with_an_empty_graph_resumes_with_the_default_mask() {
     let g = &record(&node, &scan).graph;
     assert_eq!(g.nodes.len(), 1);
     assert_eq!(g.nodes[0].kind, "fft");
-    assert_eq!(g.nodes[0].params["notch_hz"], 300_000);
-    assert_eq!(g.nodes[0].params["edge_mask"], 0.1);
+    assert_eq!(g.nodes[0].params["notch_hz"], 50_000);
+    assert_eq!(g.nodes[0].params["edge_mask"], 0.02);
     let ctx = node.job_context(&scan).unwrap();
     assert_eq!(
         ctx["scan"]["mask"],
-        serde_json::json!({"notch_hz": 300_000, "edge_mask": 0.1})
+        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.02})
     );
     assert!(ctx["scan"]["alternate"].is_object(), "{ctx}");
     node.job_stop(&scan).await.unwrap();
