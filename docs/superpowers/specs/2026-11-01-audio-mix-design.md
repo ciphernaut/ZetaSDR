@@ -15,14 +15,17 @@ something."
 Each `fm_demod` already publishes nothing while its squelch is closed, so summing the demodulators
 gives silence until someone keys up, and that voice when they do.
 
-The operator ruled that transcription stays per channel: "transcribing 3 concurrent TX from one
-audio chain would make a mess". The mix is for ears only.
+The operator's rulings: transcription stays per channel by default ("transcribing 3 concurrent TX
+from one audio chain would make a mess"), but a transcript can still be attached to the mix output
+when someone asks for it ("it just isnt the default"). One mix can take audio from any number of
+tuners. Specific channels can be muted in it.
 
 ## 2. Goals, non-goals, anti-goals
 
 ### Goals
 
-- One action starts a mix of every demodulator on a source and plays it on the page. Demodulators
+- One action starts a mix of every demodulator on every tuner (or a chosen set) and plays it on the
+  page. Demodulators
   started or stopped later join and leave by themselves, within a second.
 - While a channel is heard, its job row and waterfall outline light up, and the mix's row names it.
   The last channel heard stays named after it ends, because the operator looks up late.
@@ -33,13 +36,13 @@ audio chain would make a mess". The mix is for ears only.
 ### Non-goals
 
 - Stereo placement, per-channel gain, level matching or AGC, solo, ducking.
-- Mixing across sources: one mix per source. Two radios are two mixes.
 - Recording the mix.
 - Removing the page's limit of 4 watched jobs for other purposes.
 
 ### Anti-goals
 
-- A mix that can be transcribed. `job_attach` to a mix is refused; each channel keeps its own.
+- A transcript of the mix as the default. Nothing attaches one unless asked; `plan_start` keeps
+  attaching per channel, and the guide says so.
 - A mix that takes a lease, retunes a radio or blocks a job.
 - Silence that lies: a muted or dropped input must be visible in `job_context`.
 
@@ -60,34 +63,40 @@ audio chain would make a mess". The mix is for ears only.
 
 ### 4.1 Operation
 
-`mix_start {"op": "mix_start", "source": "<id>"}`, CLI `zeta mix start --source ID`. It answers the
-job id. It is idempotent: with a mix already running on that source it answers that job's id rather
-than `duplicate`, so "listen to everything" pressed twice is harmless. An unknown source is
-`unknown`.
+`{"op": "mix_start", "sources": null}`, CLI `zeta mix start [--sources ID[,ID]]`. `sources` is `null`
+for every source of the node, else a list of ids from `source_list`. It answers the job id. It is
+idempotent: with a mix already running on the same set it answers that job's id rather than
+`duplicate`, so "listen to everything" pressed twice is harmless. A different set is another mix. An
+unknown source is `unknown`.
 
 The job is a new `JobKind::Mix`, name `mix`:
 
-- It takes no lease and never tunes. `source_list.holders` never lists it. Its record's `tuning` is
-  the source's current band, or `0`/`0` when idle, and is informational.
+- It takes no lease and never tunes. `source_list.holders` never lists it. A record needs one
+  `source` and `tuning`, and a mix has neither: they are `node` (as the `ops` stream's provenance) and
+  `0`/`0`, and every path that reads a record's source or band must take that (`source_free`, capture
+  restore, resume, fault recovery, `jobs_stop --source`, the page's per-source lists and outlines).
+  `jobs_stop` with a `source` filter therefore leaves a mix alone; with none it stops it.
 - `job_start` with `kind: mix` is refused, naming `mix_start`, as `transcribe` names `job_attach`.
-  `job_retune` refuses it by kind. `job_attach` onto it is refused: `mix is for listening: attach
-  transcribe to each channel`.
+  `job_retune` refuses it by kind. `job_attach` of `transcribe` onto it works as on any demodulator:
+  the attached job follows the mix through a mute's restart and ends with it. Its `source` and tuning
+  are the mix's, so a transcript line names no channel, and `transcripts.log` shows `node` and 0 Hz.
 - It runs until stopped. Its inputs ending does not end it. `job_stop` and `jobs_stop` stop it, and
   it counts in `jobs_stop` like any job. A node restart resumes it, after the jobs it mixes.
 - It has no port and no IQ forwarder, so fault handling ignores it: on a source fault it falls silent
   and picks the jobs up when they are relaunched.
 - A stopped or failed mix is history: `mix_start` then makes a new job.
 
-Its graph is one node of stage kind `mix`, params `{"muted": [job ids]}` (default `[]`), with outputs
+Its graph is one node of stage kind `mix`, params `{"sources": null | [ids], "muted": [{"source",
+"center_hz"}]}` (`muted` default `[]`), with outputs
 `audio` and `event`.
 
 ### 4.2 The `mix` stage
 
 **Inputs.** Every 500 ms the stage asks the node for the audio outputs of the running jobs on its
-source and subscribes to those it does not hold. It drops those gone. Attached jobs, owned jobs
+sources and subscribes to those it does not hold. It drops those gone. Attached jobs, owned jobs
 (`owner` set: a `watch`'s or `identify`'s trials) and other `mix` jobs are excluded. Any other job
 with an audio output counts, an operator's `graph_put` graph included. Getting this list needs a new
-hook on `StageContext`, a function from nothing to a list of `{job, stream, center_hz}`, built on
+hook on `StageContext`, a function from nothing to a list of `{job, stream, source, center_hz}`, built on
 `Node::job_audio_stream`; a test may stand in for it. Each poll refreshes `center_hz`, so a retune
 shows. The same job under a new stream id (a retune, a `graph_put`, a recovery) stays the same input:
 its receiver is swapped, its queue and `active` state kept, so `active` does not flicker. An input with another rate or more than one channel is skipped once with a line in
@@ -112,11 +121,11 @@ above 0.8), so one voice is untouched and a collision does not clip. There is no
 The event output publishes on each change:
 
 ```json
-{"protocol": "mix", "active": [{"job": "<id>", "center_hz": 476625000}], "t_ns": 0,
+{"protocol": "mix", "active": [{"job": "<id>", "source": "b210", "center_hz": 476625000}], "t_ns": 0,
  "summary": "476.625000 MHz"}
 ```
 
-A muted job is never active. `job_context.mix` holds `inputs` (count), `active`, `last` (`job`,
+A muted job is never active. `job_context.mix` holds `inputs` (count), `active`, `last` (`job`, `source`,
 `center_hz`, `t_ns` of the last job heard), `muted`, `dropped_ms` and `skipped`.
 
 **Restarts.** `job_context.mix` starts empty after a restart of the mix, a mute included. The page
@@ -127,31 +136,36 @@ is accepted.
 
 ### 4.3 Muting
 
-`muted` on the `mix` node is set with `graph_put`, like the demodulator's squelch params. It restarts
-the mix under its id; the page's player reconnects as it does after any restart. A job id in `muted`
-that no longer runs is harmless and is kept: channels restarted under their ids stay muted.
+A mute is a channel, not a job: `{source, center_hz}`, matching a job on that source whose centre is
+within `CHANNEL_MATCH_HZ` (1 kHz). So ch22 stays muted when its demodulator is stopped and started
+again, and a fit's small move keeps it; a job retuned elsewhere is no longer muted. `muted` is set with
+`graph_put`, like the demodulator's squelch params. It restarts the mix under its id; the page's player
+reconnects as it does after any restart.
 
 ### 4.4 The page
 
-- A **Listen to all** button beside the source tabs, and a typed `mix`: `mix_start` on the shown
-  source, then the existing `playJob` on that job. Pressing it again stops playback. The mix job
+- A **Listen to all** button beside the source tabs, and a typed `mix [ID,ID]`: `mix_start` with
+  `sources: null` (or those ids), then the existing `playJob` on that job. Pressing it again stops playback. The mix job
   stays running until stopped from its row, since it costs little while silent; the next press
   reuses it.
 - `mix` joins `AUDIO_KINDS`, so its row has the ordinary play button. Only one player plays at a
   time, as today: playing one channel stops the mix's playback, and the reverse.
-- While a mix on the shown source is listed, the page holds one event socket on it, outside
-  `MAX_WATCHED`, for both playing and not.
+- While a mix is listed, the page holds one event socket on it, outside `MAX_WATCHED`, playing or
+  not; with several, on the one playing, else the newest. A mix's row is listed whichever source is
+  shown and has no outline.
+- A mix's row offers Transcribe like any audio job, as an ordinary button with no default on.
 - Each job in `active` gets the class `speaking` on its row and outline (a new class, distinct from
   hover's `hot`), removed when it leaves `active`.
 - The mix's row shows the speaker and the last heard, by plan channel when it has one: `ch9 now`, or
   `last ch9 12 s ago`, from the same channel lookup the outlines use.
-- A demodulator's outline menu and row gain **Mute in mix** / **Unmute in mix** when a mix runs on
+- A demodulator's outline menu and row gain **Mute in mix** / **Unmute in mix** when a mix covers
   its source: `graph_get`, edit `muted`, `graph_put`.
 
 ### 4.5 Guide and agent
 
 The op section, plus field craft "Listening to many channels": `mix_start`, what `active` means, how
-to mute, that a transcript comes from `job_attach` on each channel, never the mix. No rule is added
+to mute, that a transcript normally comes from `job_attach` on each channel, and that one on the mix
+runs overlapping voices together and names no channel, so attach it there only when asked. No rule is added
 to the gate: starting a mix stops nothing. Muting through the agent is a `graph_put`, which is
 ungated (see the TODO gist).
 
@@ -168,10 +182,14 @@ Stage tests, driving the 20 ms clock with tokio's paused time and a stand-in inp
 
 Node tests over the `Radio` fixture of `crates/zeta-core/tests/plan_start.rs`:
 
-- `mix_start` takes no lease and `holders` stays empty; a rigid job's tune is not refused by it. A
-  second `mix_start` answers the same id.
+- `mix_start` takes no lease and `holders` stays empty on every source; a rigid job's tune is not
+  refused by it. A second `mix_start` with the same set answers the same id, another set a new one.
+- Two radios: jobs on both are inputs with `sources: null`, only the named one with a list.
+- `muted` holds through stopping and restarting a channel's job, and a job retuned off it is heard.
+- `source_free`, a restart's capture restore and a fault's recovery ignore a mix's `node` source.
 - A `transcribe` attached to a demodulator is not an input: its inner audio streams are ignored.
-- `job_start` kind `mix`, `job_retune` and `job_attach` onto it are refused with their texts.
+- `job_start` kind `mix` and `job_retune` are refused with their texts. `job_attach` of a stand-in
+  `transcribe` onto it runs, relaunches through a `graph_put` and ends with the mix.
 - `jobs_stop` stops it. Restart resumes it with no lease and picks its jobs up.
 
 Real chain (`crates/zeta/tests`): two `fm_demod`s on recorded tones in one capture, squelch on: the
@@ -180,7 +198,7 @@ spans.
 
 Page (`ui.py`): Listen to all starts one mix and plays (`window.zetaAudio` counts frames); pressing
 twice reuses the job; the speaking row gains `speaking` and the mix's row names it; Mute in mix puts
-the id in the graph and the row stops lighting.
+the channel in the graph and the row stops lighting.
 
 ## 6. Acceptance on the field host
 
@@ -189,7 +207,8 @@ the id in the graph and the row stops lighting.
 2. Two channels at once: both are heard, without clipping.
 3. After a transmission, the mix's row still names the last channel.
 4. `source list`'s `bank.dropped` and `measured_rate_hz` do not change when the mix starts.
-5. Each channel's transcripts keep arriving while the mix plays.
+5. With demodulators on both radios, both are heard through one mix.
+6. Each channel's transcripts keep arriving while the mix plays.
 
 ## 7. Left to the builder
 
@@ -199,12 +218,12 @@ the id in the graph and the row stops lighting.
 
 ## 8. Calls made in this document (check these while reading)
 
-- The speaking channel lights up, and the mix's row names the last heard. The operator was asked and
-  did not yet answer; this is my assumption, and removing it leaves the audio untouched.
-- Per source, not whole node. A mix across both radios means a record with no single `source`.
+- A record's `source` is the placeholder `node` for a mix, instead of making `source` optional across
+  every record and reader. A real source named `node` would be confused with it: the flags refuse the
+  name.
+- A mute is `{source, center_hz}` rather than a job id, so it outlives the job.
 - `mix_start` is a new op rather than `job_attach`, whose input is one job.
-- Muting is included, though not asked for: UHF CB ch22 and ch23 are data channels and would hold the
-  mix open. It goes through `graph_put` to avoid a new op, at the cost of an audio blip per mute.
+- Muting goes through `graph_put` to avoid a new op, at the cost of an audio blip per mute.
 - Stopping playback leaves the mix job running, so the row and its last-heard stay.
 - `wfm_demod`, `am_demod` and `ssb_demod` are mixed as well as `fm_demod`, since all output 48 kHz
   mono. `wfm_demod` and `ssb_demod` have no squelch and would hold the mix open until muted.
