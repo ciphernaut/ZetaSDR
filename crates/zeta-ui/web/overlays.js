@@ -710,9 +710,7 @@ class Overlays {
     text = String(text);
     let r = this.ribbons.find((o) => o.key === key);
     if (!r) {
-      const el = this.ribbon(hz, text, cls);
-      r = this.ribbons[this.ribbons.length - 1];
-      if (!r || r.el !== el) return el;
+      r = this.makeRibbon(hz, text, cls);
       r.key = key;
     }
     const moved = r.right > 0;
@@ -735,7 +733,7 @@ class Overlays {
     if (this.destroyed) return null;
     text = String(text);
     const same = this.ribbons.find(
-      (r) => r.text === text && r.cls === cls && r.hz === hz && r.right < r.w,
+      (r) => !r.key && r.text === text && r.cls === cls && r.hz === hz && r.right < r.w,
     );
     if (same) {
       same.count += 1;
@@ -743,6 +741,11 @@ class Overlays {
       same.born = performance.now();
       return same.el;
     }
+    return this.makeRibbon(hz, text, cls).el;
+  }
+
+  // A new ribbon record, drawn and placed, never folded into another by its text.
+  makeRibbon(hz, text, cls) {
     const el = document.createElement("div");
     el.className = cls ? `ov-ribbon ${cls}` : "ov-ribbon";
     const body = document.createElement("span");
@@ -759,7 +762,7 @@ class Overlays {
     this.place(r);
     this.ribbons.push(r);
     while (this.ribbons.length > MAX_RIBBONS) this.ribbons.shift().el.remove();
-    return el;
+    return r;
   }
 
   // Moves a new ribbon below any ribbon it would overlap at the right edge.

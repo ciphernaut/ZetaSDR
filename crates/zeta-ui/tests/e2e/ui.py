@@ -4067,6 +4067,21 @@ def scenario_slow_row_lookup_draws_no_ribbon_per_message(page, url, secret):
         stop_job(url, secret, job)
 
 
+def scenario_keyed_ribbons_with_equal_text_stay_two(page, url, secret):
+    select_source(page, url, secret, "tone")
+    r = page.evaluate(
+        """() => {
+          const t = window.zetaTest;
+          t.keyedRibbon("a", 100e6, "same", "kr", 1);
+          t.keyedRibbon("b", 100e6, "same", "kr", 1);
+          t.keyedRibbon("b", 100e6, "same", "kr", 2);
+          t.keyedRibbon("a", 100e6, "same", "kr", 3);
+          return [...document.querySelectorAll('#waterfall .ov-ribbon.kr .count')]
+            .map((e) => e.textContent.trim());
+        }""")
+    assert r == ["×3", "×2"], r
+
+
 def scenario_protocol_text_has_no_adsb_case(page, url, secret):
     login(page, url, secret)
     r = page.evaluate(

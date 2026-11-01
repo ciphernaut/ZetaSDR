@@ -1182,6 +1182,10 @@ window.zetaTest = {
   label(hz, name) {
     return state.ov ? state.ov.label(hz, { layer: 1, name }, "probe") : null;
   },
+  // A keyed ribbon (overlays.js keyedRibbon) for a test; the element, or null without overlays.
+  keyedRibbon(key, hz, text, cls, count) {
+    return state.ov ? state.ov.keyedRibbon(key, hz, text, cls, count, () => true) : null;
+  },
   setSecret(s) {
     if (state.api) state.api.secret = s;
   },
