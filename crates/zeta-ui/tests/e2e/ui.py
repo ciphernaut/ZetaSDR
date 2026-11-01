@@ -454,7 +454,8 @@ def scenario_aprs_ribbon_appears(page, url, secret):
         page.evaluate("window.zetaTest.poll()")
         ribbon = page.locator("#waterfall .ov-ribbon", has_text="VK3ABC")
         expect(ribbon.first).to_be_visible(timeout=15_000)
-        expect(ribbon.first).to_contain_text("VK3ABC > APRS: >hi")
+        expect(page.locator("#waterfall .ov-ribbon.aprs")).to_have_count(1)
+        expect(ribbon.first).to_have_text("aprs 1 stations, last VK3ABC")
         counter = page.locator(f'#jobs .job[data-id="{job}"] .events')
         page.wait_for_function(
             """(id) => {
@@ -3982,6 +3983,99 @@ def scenario_subjects_name_the_jobs_not_watched(page, url, secret):
     finally:
         for job in jobs:
             stop_job(url, secret, job)
+
+
+# ---- the waterfall's one line (plan 23 Task 3) -----------------------------------------
+
+def scenario_summary_line_replaces_ribbons_per_aircraft(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        ribbons = page.locator("#waterfall .ov-ribbon.fake_subjects")
+        expect(ribbons).to_have_text("fake_subjects 3 aircraft, last QFA1", timeout=15_000)
+        page.wait_for_timeout(3_000)
+        expect(ribbons).to_have_count(1)
+        expect(ribbons).to_have_text("fake_subjects 3 aircraft, last QFA1")
+        for icao in ("7C0001", "7C0003"):
+            expect(page.locator("#waterfall .ov-ribbon", has_text=icao)).to_have_count(0)
+        expect(page.locator("#waterfall b")).to_have_count(0)
+        assert ribbons.evaluate("e => e.style.right") == "0px"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_fold_gives_one_ribbon_per_subject(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_fold")
+    try:
+        ribbons = page.locator("#waterfall .ov-ribbon.fake_fold")
+        expect(ribbons).to_have_count(2, timeout=15_000)
+        s1 = ribbons.filter(has_text="S1")
+        s2 = ribbons.filter(has_text="S2")
+        expect(s1).to_contain_text("×2", timeout=5_000)
+        expect(s2).to_contain_text("×3", timeout=5_000)
+        expect(ribbons).to_have_count(2)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_unkeyed_row_keeps_separate_ribbons(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_fake_pos(page, url, secret)
+    try:
+        ribbons = page.locator("#waterfall .ov-ribbon.fake_pos")
+        expect(ribbons).to_have_count(2, timeout=15_000)
+        expect(ribbons.filter(has_text="S1 -27.40,153.10")).to_have_count(1)
+        expect(ribbons.filter(has_text="S1 -27.41,153.11")).to_have_count(1)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_silent_ribbon_moves_off_the_edge(page, url, secret):
+    select_source(page, url, secret, "tone")
+    run_cmd(page, "view set subject_dim_s 1")
+    expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
+    job = start_subject_job(page, url, secret, "fake_fold")
+    try:
+        ribbons = page.locator("#waterfall .ov-ribbon.fake_fold")
+        expect(ribbons).to_have_count(2, timeout=15_000)
+        page.wait_for_function(
+            """() => {
+              const els = [...document.querySelectorAll('#waterfall .ov-ribbon.fake_fold')];
+              return els.length > 0 && els.every((e) => parseFloat(e.style.right) > 0);
+            }""", timeout=10_000)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_slow_row_lookup_draws_no_ribbon_per_message(page, url, secret):
+    def route(r):
+        if "modes_show" in (r.request.post_data or ""):
+            page.wait_for_timeout(500)
+        r.continue_()
+    page.route("**/op", route)
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        most = 0
+        for _ in range(40):
+            most = max(most, page.locator("#waterfall .ov-ribbon.fake_subjects").count())
+            page.wait_for_timeout(100)
+        assert most <= 1, f"{most} ribbons at once while the row was looked up"
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_protocol_text_has_no_adsb_case(page, url, secret):
+    login(page, url, secret)
+    r = page.evaluate(
+        """async () => {
+          const { protocolText } = await import('./overlays.js');
+          return [protocolText({protocol: "adsb", icao: "X"}),
+                  protocolText({protocol: "acars", reg: "R", label: "H1", text: "t"})];
+        }""")
+    assert r == [None, "R H1: t"], r
 
 
 # ---- runner ----------------------------------------------------------------------------

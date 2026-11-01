@@ -96,8 +96,6 @@
 //           fallback texts below), at the tuning centre, class = the protocol:
 //             `pocsag`: "<address>: <text>" ("<address>: tone" for kind tone);
 //             `rds`:    "<ps ?? pi> · <rt ?? ''>", trimmed;
-//             `adsb`:   "<icao> <callsign> <altitude_ft> ft <lat>,<lon>", each absent (null)
-//                       field omitted ("ft" with the altitude, lat,lon only as a pair);
 //             `acars`:  "<reg> <label>: <text>";
 //             `transcript`: "<text>", class `transcript`, tooltip "<language> · <duration_ms>
 //                       ms"; a `dropped` one "[dropped]" and an `error` one
@@ -161,6 +159,7 @@
 
 import { SQUELCH_KINDS, setSquelchTag } from "./agent.js";
 import { channelLabel } from "./plans.js";
+import { subjectLabel, subjectSummary } from "./subjects.js";
 import { bandText } from "./units.js";
 
 export const RIBBON_TTL_MS = 60_000;
@@ -219,13 +218,6 @@ export function protocolText(p) {
       return p.kind === "tone" ? `${p.address}: tone` : `${p.address}: ${p.text ?? ""}`;
     case "rds":
       return `${p.ps ?? p.pi} · ${p.rt ?? ""}`.trim();
-    case "adsb": {
-      const parts = [p.icao];
-      if (present(p.callsign)) parts.push(String(p.callsign).trim());
-      if (present(p.altitude_ft)) parts.push(`${p.altitude_ft} ft`);
-      if (present(p.lat) && present(p.lon)) parts.push(`${p.lat},${p.lon}`);
-      return parts.filter(present).join(" ");
-    }
     case "acars":
       return `${p.reg} ${p.label}: ${p.text ?? ""}`;
     default:
@@ -289,7 +281,7 @@ class Overlays {
     this.marks = new Map(); // `${job id}:${rounded centre}` -> {el, hz}: a watch's `signal new`
     this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
-    this.ribbons = []; // {el, countEl, text, cls, hz, w, h, top, dy, right, born, count}
+    this.ribbons = []; // {el, bodyEl, countEl, text, cls, hz, w, h, top, dy, right, born, count, key, held}
     this.eventFns = []; // ov.onEvent listeners
     this.positioned = new Map(); // job id -> {job, ids, subs, closed, positionOnly: true}
     this.resolvingPositioned = false; // a GET /streams for unwatched positioned jobs
@@ -629,6 +621,7 @@ class Overlays {
         return;
       }
       if (typeof p.summary === "string") {
+        if (this.subjectRibbon(job, p)) return;
         this.ribbon(tuningCentre(job), p.summary, typeof p.protocol === "string" ? p.protocol : "event");
         return;
       }
@@ -684,6 +677,60 @@ class Overlays {
     return y === null || !Number.isFinite(y) ? this.layer.clientHeight / 2 : y;
   }
 
+  // The one line a subject job draws: `waterfall: summary` keeps a single ribbon for the job
+  // (`<protocol> <n> <name>, last <label>`), `fold` one per subject, each updated in place.
+  // False for an event with no subject (no row, a row without one, a blank key): the ordinary
+  // ribbon takes it.
+  subjectRibbon(job, p) {
+    const store = this.subjects;
+    const k = store ? store.keyed(job, p) : null;
+    if (!k) return false;
+    const { row } = k;
+    const hz = tuningCentre(job);
+    if (row.subject.waterfall === "fold") {
+      const s = store.subjectOf(job, p);
+      if (!s) return false;
+      this.keyedRibbon(
+        `job:${job.id}:${k.key}`, hz, subjectSummary(s), row.protocol, s.count,
+        () => store.held(job.id, k.key),
+      );
+      return true;
+    }
+    const n = store.list(job.id).length;
+    const line = `${row.protocol} ${n} ${row.subject.name}, last ${subjectLabel(store.lastHeard(job.id))}`;
+    this.keyedRibbon(`job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null));
+    return true;
+  }
+
+  // The ribbon for `key`, made or updated in place: the text replaced, `×count` when `count`
+  // is over 1, the width measured again, the ribbon back at the right edge and placed again if
+  // it had moved. `held()` true keeps it from scrolling or expiring while its subject is heard.
+  keyedRibbon(key, hz, text, cls, count, held) {
+    if (this.destroyed) return null;
+    text = String(text);
+    let r = this.ribbons.find((o) => o.key === key);
+    if (!r) {
+      const el = this.ribbon(hz, text, cls);
+      r = this.ribbons[this.ribbons.length - 1];
+      if (!r || r.el !== el) return el;
+      r.key = key;
+    }
+    const moved = r.right > 0;
+    r.held = held;
+    r.hz = hz;
+    r.text = text;
+    r.bodyEl.textContent = text;
+    r.el.title = text;
+    r.count = count;
+    r.countEl.textContent = count > 1 ? ` ×${count}` : "";
+    r.w = r.el.offsetWidth;
+    r.right = 0;
+    r.el.style.right = "0px";
+    r.born = performance.now();
+    if (moved) this.place(r);
+    return r.el;
+  }
+
   ribbon(hz, text, cls = "") {
     if (this.destroyed) return null;
     text = String(text);
@@ -706,7 +753,7 @@ class Overlays {
     el.title = text;
     el.style.right = "0px";
     this.layer.append(el);
-    const r = { el, countEl, text, cls, hz, dy: 0, right: 0, born: performance.now(), count: 1 };
+    const r = { el, bodyEl: body, countEl, text, cls, hz, dy: 0, right: 0, born: performance.now(), count: 1 };
     r.w = el.offsetWidth;
     r.h = el.offsetHeight;
     this.place(r);
@@ -720,7 +767,7 @@ class Overlays {
     const base = this.yFor(r.hz) - r.h / 2;
     let top = base;
     for (let lane = 0; lane < MAX_LANES; lane++) {
-      const hit = this.ribbons.find((o) => o.right < r.w && top < o.top + o.h && o.top < top + r.h);
+      const hit = this.ribbons.find((o) => o !== r && o.right < r.w && top < o.top + o.h && o.top < top + r.h);
       if (!hit) break;
       top = hit.top + hit.h + RIBBON_GAP_PX;
     }
@@ -1224,6 +1271,7 @@ class Overlays {
   scroll(shift) {
     const width = this.layer.clientWidth;
     this.ribbons = this.ribbons.filter((r) => {
+      if (r.held?.()) return true;
       r.right += shift;
       if (r.right > width) {
         r.el.remove();
@@ -1238,6 +1286,7 @@ class Overlays {
   expire() {
     const now = performance.now();
     this.ribbons = this.ribbons.filter((r) => {
+      if (r.held?.()) r.born = now;
       if (now - r.born <= RIBBON_TTL_MS) return true;
       r.el.remove();
       return false;
