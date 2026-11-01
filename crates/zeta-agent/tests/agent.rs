@@ -2,6 +2,7 @@
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
+use zeta_agent::agent::{Allow, GATED_REPLACE_OPS, gate};
 use zeta_agent::fake::{FakeLlm, RecordingExecutor, text_response, tool_call_response};
 use zeta_agent::{
     Agent, AgentConfig, AgentError, AgentFailure, LlmClient, LlmConfig, LocalExecutor, is_question,
@@ -307,4 +308,115 @@ async fn job_list_reaches_the_model_without_graphs() {
     let tool_msg = reqs[1]["messages"][3]["content"].as_str().unwrap();
     assert!(!tool_msg.contains("graph"), "{tool_msg}");
     assert!(tool_msg.contains("\"kind\":\"spectrum\""), "{tool_msg}");
+}
+
+fn start_with_replace(replace: Value) -> Value {
+    tool_call_response(&[(
+        "job_start",
+        json!({"kind": "passthrough", "source": "tone", "center_hz": 1, "bandwidth_hz": 1,
+               "deviation_hz": null, "sideband": null, "elastic": false, "replace": replace}),
+    )])
+}
+
+#[tokio::test]
+async fn job_stop_is_refused_until_stops_are_allowed() {
+    let fake = fake(vec![
+        tool_call_response(&[("job_stop", json!({"job": "01X"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("stop it").await.unwrap();
+    assert!(exec.calls.lock().unwrap().is_empty());
+    assert!(!t.calls[0].ok);
+    let r = &t.calls[0].result;
+    assert_eq!(r["error"], "not_allowed");
+    assert_eq!(r["field"], "op");
+    assert_eq!(r["op"], "job_stop");
+    let reqs = requests(&fake);
+    assert!(reqs[1]["messages"].to_string().contains("not_allowed"));
+}
+
+#[tokio::test]
+async fn job_stop_is_applied_when_stops_are_allowed() {
+    let fake = fake(vec![
+        tool_call_response(&[("job_stop", json!({"job": "01X"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let mut c = cfg();
+    c.allow = Allow {
+        stop_jobs: true,
+        replace: false,
+    };
+    let agent = Agent::new(llm(&fake), &exec, c);
+    let t = agent.run("stop it").await.unwrap();
+    assert_eq!(exec.calls.lock().unwrap().len(), 1);
+    assert!(t.calls[0].ok);
+}
+
+#[tokio::test]
+async fn a_non_empty_replace_is_refused_until_replace_is_allowed() {
+    let fake1 = fake(vec![
+        start_with_replace(json!(["01X"])),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let agent = Agent::new(llm(&fake1), &exec, cfg());
+    let t = agent.run("start").await.unwrap();
+    assert!(exec.calls.lock().unwrap().is_empty());
+    let r = &t.calls[0].result;
+    assert!(!t.calls[0].ok);
+    assert_eq!(r["error"], "not_allowed");
+    assert_eq!(r["field"], "replace");
+    assert_eq!(r["op"], "job_start");
+
+    let fake2 = fake(vec![
+        start_with_replace(json!(["01X"])),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let mut c = cfg();
+    c.allow = Allow {
+        replace: true,
+        ..Allow::default()
+    };
+    let agent = Agent::new(llm(&fake2), &exec, c);
+    let t = agent.run("start").await.unwrap();
+    assert_eq!(exec.calls.lock().unwrap().len(), 1);
+    assert!(t.calls[0].ok);
+}
+
+#[tokio::test]
+async fn an_empty_replace_passes_the_gate() {
+    let fake = fake(vec![
+        start_with_replace(json!([])),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    agent.run("start").await.unwrap();
+    assert_eq!(exec.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn gate_covers_every_replace_taking_op() {
+    for name in GATED_REPLACE_OPS {
+        assert!(
+            gate(&json!({"op": name, "replace": ["a"]}), Allow::default()).is_some(),
+            "{name}"
+        );
+    }
+    assert!(
+        gate(
+            &json!({"op": "source_unpin", "source": "s"}),
+            Allow::default()
+        )
+        .is_none()
+    );
 }

@@ -3,15 +3,65 @@
 use crate::exec::{Executor, to_json, trim_result};
 use crate::llm::{AgentError, LlmClient, LlmConfig};
 use crate::wire::{ChatMessage, ToolCall};
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use zeta_client::{ToolDef, op_from_call, op_tools, system_prompt};
 use zeta_core::ops::OpError;
+
+/// What a run may do beyond reading and starting: stopping jobs is the
+/// operator's call, so both switches are off unless the run is allowed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Allow {
+    /// `job_stop` may be applied.
+    pub stop_jobs: bool,
+    /// A non-empty `replace` may be sent (it stops the named jobs).
+    pub replace: bool,
+}
+
+/// The operations whose `replace` stops jobs to make room.
+pub const GATED_REPLACE_OPS: &[&str] = &[
+    "job_start",
+    "job_retune",
+    "source_ensure",
+    "source_pin",
+    "plan_start",
+];
+
+/// `Some(error)` when `op` would stop jobs and the run is not allowed to:
+/// a `job_stop`, or a gated op with a non-empty `replace`. The executor is
+/// never reached; the error goes back to the model as the call's result.
+pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
+    let name = op["op"].as_str()?;
+    let field = if name == "job_stop" {
+        if allow.stop_jobs {
+            return None;
+        }
+        "op"
+    } else if GATED_REPLACE_OPS.contains(&name)
+        && op["replace"].as_array().is_some_and(|r| !r.is_empty())
+    {
+        if allow.replace {
+            return None;
+        }
+        "replace"
+    } else {
+        return None;
+    };
+    Some(json!({
+        "error": "not_allowed",
+        "field": field,
+        "op": name,
+        "message": "stopping jobs is not allowed in this run: report the conflict and its holders to the operator; they unlock it with the retry button or by allowing stops for the run",
+    }))
+}
 
 pub struct AgentConfig {
     pub system_prompt: String,
     pub tools: Vec<ToolDef>,
     pub max_turns: u32,
+    /// What the run may stop; nothing by default.
+    pub allow: Allow,
 }
 
 impl AgentConfig {
@@ -21,6 +71,7 @@ impl AgentConfig {
             system_prompt: system_prompt.into(),
             tools,
             max_turns: 8,
+            allow: Allow::default(),
         }
     }
 }
@@ -85,10 +136,12 @@ pub fn build_agent<E: Executor>(
     schema: &Value,
     agents_md: &str,
     max_turns: u32,
+    allow: Allow,
 ) -> Result<Agent<E>, AgentError> {
     let llm = LlmClient::new(llm)?;
     let mut cfg = AgentConfig::new(system_prompt(agents_md), op_tools(schema, agents_md));
     cfg.max_turns = max_turns;
+    cfg.allow = allow;
     Ok(Agent::new(llm, exec, cfg))
 }
 
@@ -170,7 +223,10 @@ impl<E: Executor> Agent<E> {
             }
         };
         let result = match outcome {
-            Ok(op) => self.exec.apply(op).await?,
+            Ok(op) => match gate(&op, self.cfg.allow) {
+                Some(refusal) => Err(refusal),
+                None => self.exec.apply(op).await?,
+            },
             Err(e) => Err(to_json(&e)),
         };
         let ok = result.is_ok();

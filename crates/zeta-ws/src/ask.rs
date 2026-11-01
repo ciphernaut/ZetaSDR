@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use zeta_agent::{LocalExecutor, build_agent};
+use zeta_agent::{Allow, LocalExecutor, build_agent};
 use zeta_core::ops::OpError;
 
 use crate::http::{Shared, error_response, other};
@@ -77,6 +77,7 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
         &schema,
         &st.agents_md,
         max_turns,
+        Allow::default(),
     ) {
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::BAD_GATEWAY, other(e.to_string())),
