@@ -95,3 +95,21 @@ fn channel_plans_cli_line_is_the_real_command() {
         .expect("CLI line");
     assert!(line.starts_with("CLI: `zeta plans"), "{line}");
 }
+
+#[test]
+fn plan_start_cli_line_is_the_real_command() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    assert!(
+        md.contains("CLI: `zeta plan start --plan uhf_cb_au --kind fm_demod --source <id>"),
+        "plan_start CLI line missing"
+    );
+    assert!(md.contains("never `job_stop`"), "rule missing");
+    assert!(md.contains("use `plan_start`"), "rule missing");
+}

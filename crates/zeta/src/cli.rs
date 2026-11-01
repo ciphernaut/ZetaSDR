@@ -198,6 +198,9 @@ pub enum Command {
         #[arg(long, value_name = "ID")]
         plan: Option<String>,
     },
+    /// Start a kind on every channel of a channel plan
+    #[command(subcommand)]
+    Plan(PlanCmd),
     /// The decoder modes the node knows
     #[command(subcommand)]
     Modes(ModesCmd),
@@ -242,6 +245,70 @@ pub struct SoapyWorkerArgs {
     /// SoapySDR device arguments, zeta's own gain= and ppm= included
     #[arg(long)]
     pub args: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PlanCmd {
+    /// Start a kind on channels of a plan under one lease decision, optionally
+    /// attaching a transcriber to each
+    Start {
+        /// Plan id (from `zeta plans`)
+        #[arg(long, value_name = "ID")]
+        plan: String,
+        /// Channel numbers, e.g. 1,2,5-8; absent = every channel of the plan
+        #[arg(long, value_name = "N[,N|N-M]", value_parser = parse_channels)]
+        channels: Option<Channels>,
+        /// Job kind to start on each channel
+        #[arg(long, value_parser = parse_job_kind)]
+        kind: JobKind,
+        /// Source id
+        #[arg(long)]
+        source: String,
+        /// FM peak deviation in Hz, as on `job start`; absent = the kind's default
+        #[arg(long, value_name = "HZ")]
+        deviation_hz: Option<u64>,
+        /// Sideband for ssb_demod only; absent = usb
+        #[arg(long, value_enum)]
+        sideband: Option<SidebandArg>,
+        /// Attach this kind to every started job
+        #[arg(long, value_enum)]
+        attach: Option<AttachKind>,
+        /// Language of the attached job (BCP-47); absent = en
+        #[arg(long)]
+        language: Option<String>,
+        #[command(flatten)]
+        replace: ReplaceArg,
+    },
+}
+
+/// The channel numbers of `--channels`: sorted, no repeats.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Channels(Vec<u32>);
+
+/// `1,2,5-8` into sorted, deduplicated channel numbers; an empty item or a reversed
+/// range is an error.
+pub fn parse_channels(s: &str) -> Result<Channels, String> {
+    let num = |t: &str| {
+        t.trim()
+            .parse::<u32>()
+            .map_err(|_| format!("channels: `{t}` is not a channel number"))
+    };
+    let mut out = vec![];
+    for item in s.split(',') {
+        match item.split_once('-') {
+            Some((lo, hi)) => {
+                let (lo, hi) = (num(lo)?, num(hi)?);
+                if lo > hi {
+                    return Err(format!("channels: range {item} is reversed"));
+                }
+                out.extend(lo..=hi);
+            }
+            None => out.push(num(item)?),
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(Channels(out))
 }
 
 #[derive(Debug, Subcommand)]
@@ -743,6 +810,7 @@ impl Command {
                     | JobCmd::Retune { .. }
                     | JobCmd::Stop(_)
             ) | Command::Graph(GraphCmd::Put { .. })
+                | Command::Plan(PlanCmd::Start { .. })
         )
     }
 
@@ -883,6 +951,27 @@ impl Command {
                 }
                 Op::ChannelPlans {}
             }
+            Command::Plan(PlanCmd::Start {
+                plan,
+                channels,
+                kind,
+                source,
+                deviation_hz,
+                sideband,
+                attach,
+                language,
+                replace,
+            }) => Op::PlanStart {
+                plan,
+                channels: channels.map(|c| c.0),
+                kind,
+                source: SourceId(source),
+                deviation_hz,
+                sideband: sideband.map(Into::into),
+                attach: attach.map(Into::into),
+                language,
+                replace: replace.into_ids(),
+            },
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Classify(s) => Op::Classify {

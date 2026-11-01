@@ -10,6 +10,8 @@ ZetaSDR is an agentic SDR runtime. You drive it through a small typed operation 
 - Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.
 - Unknown signals are reported as unknown, never guessed.
 - Ids are never invented: `source` values come from `source list`, `job` values from `job list`.
+- Jobs belong to the operator: never `job_stop` a job or put one in `replace` unless the request names it or the run allows it. A `conflict` is reported with its holders; the operator decides.
+- For a kind on every channel of a plan use `plan_start`, never one `job_start` per channel.
 
 ## Running the node
 
@@ -36,7 +38,7 @@ There are two ways to run:
 - `zeta serve --listen PORT --llm-url URL --llm-model NAME` (the other `--llm-*` flags of `zeta ask` apply too) enables `POST /ask` with `{"request": "TEXT", "max_turns": 8}` (`max_turns` 1-32, default 8): the node runs the agent against itself, so every operation it applies appears on the `ops` stream, and answers the transcript (`request`, `answer`, `calls`, `turns`) as `zeta ask` prints it. One run at a time (409 while one is in progress); 503 when serve has no `--llm-url`; a failed run is 502 with the error and the transcript so far; 504 after 300 s.
 - `zeta serve --listen PORT --stt-socket PATH` (env `ZETA_STT_SOCKET`; default `$XDG_RUNTIME_DIR/voiced.sock` when that file exists) enables `POST /stt?lang=CODE` (`lang` defaults to `en`): the body is a 16 kHz mono `audio/wav` (at most 4 MiB), the node hands it to the speech daemon at that Unix socket and answers `{"text": "TRANSCRIPT"}`. The daemon is `local-voice` or any daemon speaking its protocol: one line per connection, `file:<absolute wav path>` answered `ok:<text>` or `error:<message>`, and `languages` answered `ok:en,de,...` (a daemon answering `error:` there is taken to know English only). Instead of a daemon, `--stt-node URL` (env `ZETA_STT_NODE`, secret in `ZETA_STT_NODE_SECRET`, never printed) forwards each request to that node's `POST /stt`; the two flags are exclusive, for every command (exit 1). A forwarded request carries `X-Zeta-Stt-Hop: 1`, and a node that would forward it again answers 508 (`stt forwarding loop`). `GET /stt/languages` answers `{"backend": NAME, "languages": [CODES]}` (503 without a backend). 415 when the body is not WAV, 413 when too large, 422 `{"error": "unsupported", "language", "supported"}` for a language the backend lacks, 502 when the daemon reports an error, 503 when serve has no backend or cannot reach it, 503 `{"error": "busy", "message", "wait_ms"}` when every one of the daemon's 4 slots stayed taken for 30 s (a node forwarding with `--stt-node` reports that as a `busy` drop, not an error), 504 when the daemon does not answer within 30 s of its turn.
 
-While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `graph put`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
+While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `plan start`, `graph put`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
 
 Every operation the node applies is appended to `ops.log` in the state directory (rotated at 8 MiB) with its caller's transport (read-only operations are logged without their result); `zeta ops tail --lines N` prints the last N (local only). Every `transcript` event of a `transcribe` job is appended to `transcripts.log` in the state directory (rotated at 8 MiB) with the job, its input, the source and the channel's centre; `zeta transcripts tail --lines N [--job ID]` prints the last N (local only).
 
@@ -164,6 +166,26 @@ CLI: `zeta job retune --job <id> --center-hz 144800000 --bandwidth-hz 12500`
 
 `replace`: as on `job_start`, the holders that may be stopped to make room, stopped under the gate right before the request; a `conflict` offers `retry with replace: [<ids>]` and the page shows the same retry buttons. A demodulator keeps its `squelch`, `squelch_db`, `deviation_hz` and `sideband` through a retune; its adjacent-channel guard (`guard_hz`, `guard_db`, `channel_hz`, the channel node's `wide_hz`) is derived again from the channel plan at the new band, never carried, so a width preset changes what the filter passes and a move to a neighbouring channel takes that channel's geometry; a guard turned off with `graph_put` (`guard_hz: null`) comes back on a retune onto a plan channel. Every attached job (`job_attach`) reading the retuned job is relaunched under its own id once the input runs again (one that cannot relaunch is `failed` with the reason; the retune still succeeds). Centre the band on the signal's measured centre (`measure`, `classify`), never on a raster: see Fitting a demod to a signal under Field craft. A one-shot `zeta job retune` cannot reach a job `zeta serve` runs (`job <id> is not running in this node`): use `--node`. On the CLI, `--replace ID[,ID]`.
 
+### plan_start
+
+Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on the channels numbered in `channels`, each at its channel's `center_hz` with the plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's gate, in this order: everything is checked first (an unknown `plan` or channel is `unknown`, a channel listed twice, a kind that does not run per channel — `spectrum`, `scan`, `watch`, `identify`, an attachable kind — and a non-attachable `attach` are `other`; nothing has happened yet); a channel where an identical rigid job already runs is `existing` and skipped; with `attach`, its stage must be ready, else the op is refused with the stage's reason; the `replace` jobs are stopped; then one lease decision for the band bounding the channels to start (lowest channel edge to highest), checked as a rigid `job_start` of that band would be: inside the capture no tune, outside it a tune when only elastic jobs hold the source, else a `conflict` naming the holders and nothing starts; a band wider than the source is `out_of_range` on `bandwidth_hz`. Each channel is then started in channel-number order inside that capture: one that fails is listed under `refused` with its error and the rest go on. With `attach`, each started job (and each `existing` one without one) gets one attached; a failure is that channel's `attach_error`, the job kept. The result: `capture`, `started` (`channel`, `center_hz`, `job`, `attached`, `attach_error`), `existing` (`channel`, `center_hz`, `job`, `attached`), `refused` (`channel`, `center_hz`, `error`) and `warnings` (strings to repeat to the operator; empty when there is nothing to say). The jobs are ordinary jobs; running the same request twice starts only what is missing.
+
+- plan: string; an id from `channel_plans`
+- channels: array or null; channel numbers of the plan (integers), `null` for all
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- source: string; an id from `source list`
+- deviation_hz: integer or null
+- sideband: string or null
+- attach: string or null
+- language: string or null
+- replace: array; ids from `job list` (strings), `[]` for none
+
+JSON: `{"op":"plan_start","plan":"uhf_cb_au","channels":null,"kind":"passthrough","source":"<id>","deviation_hz":null,"sideband":null,"attach":"transcribe","language":null,"replace":[]}`
+
+CLI: `zeta plan start --plan uhf_cb_au --kind fm_demod --source <id> [--channels 1,2,5-8] [--attach transcribe] [--language de] [--replace ID,ID]`
+
+Starts `kind` on the channels of a plan (`channels`, `null` for all of them) at each channel's `center_hz` with the plan's `bandwidth_hz`, under one lease decision for the band that bounds them: inside the current capture nothing retunes, otherwise the source is tuned when only elastic jobs hold it, and a scan or a rigid holder elsewhere is a `conflict` naming the holders with nothing started. Check `source_list` first. `kind` must run on the radio (not `transcribe`, `spectrum`, `scan`, `watch` or `identify`). `deviation_hz` and `sideband` are passed to every start as on `job_start` (`null` is the kind's default; give 2500 for `fm_demod` on 12.5 kHz channels). `attach` is `null` or `transcribe`, attached to every channel started or already running, and needs a ready stage (a speech backend for `transcribe`), else the op is refused with the stage's reason: start without `attach`. `language` must be `null` without `attach`. `replace`: as on `job_start`. The result lists `started` (channel, `center_hz`, `job`, `attached`, `attach_error`), `existing` (channels an identical running job already holds, skipped), `refused` (channels whose own start failed, with the error; the others went on) and `warnings`: repeat the `warnings` to the operator. Run it again to complete a partial set: running channels are `existing`, so nothing doubles.
+
 ### job_list
 
 JSON: `{"op":"job_list"}`
@@ -179,6 +201,8 @@ Stopped and failed jobs are kept as history, newest 20 only (older ones are forg
 JSON: `{"op":"job_stop","job":"<id>"}`
 
 CLI: `zeta job stop --job <id>`
+
+Stopping a job is the operator's decision: never `job_stop` a job the request did not name. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry.
 
 ### job_context
 
@@ -602,7 +626,7 @@ Digital voice decoders (DMR, D-STAR, M17) will be transcribed the same way: they
 
 ### Taking the radio from another job
 
-A source holds one tuning, and a second job that needs a different one gets a `conflict` error. Read it before acting: it names the holders (job ids, kinds and what each is doing) and lists options, the last being `retry with replace: [<ids>]`. Decide whether the holders matter. If they do not, or the user asked for the new job, retry the same request with `--replace ID[,ID]` (`job start`, `source ensure`; `replace` is an array in the op). The named jobs are stopped and the new job started in one step under the source's gate, so nothing else can slip in between. Replace is not transactional: if a holder you did not name still conflicts, the jobs you named stay stopped and the new conflict names the remaining holders. Every id must hold that source as a rigid lease (`unknown_job` or `job <id> does not hold source <src>` otherwise); naming an elastic job is that error and nothing is stopped, the elastic job keeps running. Never replace a holder you have not read, and say in the report what you stopped.
+A source holds one tuning, and a second job that needs a different one gets a `conflict` error. Read it before acting: it names the holders (job ids, kinds and what each is doing) and lists options, the last being `retry with replace: [<ids>]`. Decide whether the holders matter. If they do not, or the user asked for the new job, retry the same request with `--replace ID[,ID]` (`job start`, `source ensure`; `replace` is an array in the op). The named jobs are stopped and the new job started in one step under the source's gate, so nothing else can slip in between. Replace is not transactional: if a holder you did not name still conflicts, the jobs you named stay stopped and the new conflict names the remaining holders. Every id must hold that source as a rigid lease (`unknown_job` or `job <id> does not hold source <src>` otherwise); naming an elastic job is that error and nothing is stopped, the elastic job keeps running. Never replace a holder you have not read, and say in the report what you stopped. Stopping or replacing a job is the operator's explicit decision; hand-made jobs survive any request that did not name them.
 
 The web page's own `spectrum` job is elastic (`job start --elastic`, `spectrum` only): it never conflicts, never blocks a retune and follows each retune of its source, so it is not a holder to wait for or replace. `source list` shows such jobs under `elastic`, not `holders`. A scan on the source stops it, and the page restarts its view afterwards. After a restart of the node the capture is restored (the band bounding a source's rigid jobs, when the radio can capture it) and the jobs resume in it, a scan first, then widest first. `zeta ops tail --lines N` (default 50) shows the last applied ops with the transport that sent them (`local`, `http`, `ui`, `agent`): use it to see who changed the radio.
 
@@ -616,7 +640,19 @@ A start outside the pin is a `conflict` offering `unpin source S (source_unpin)`
 
 `channel_plans` (CLI `zeta plans`) returns the plans the node knows with every channel's `number` and `center_hz`. Name a channel to the user by its number ("ch20", not 476.9 MHz) and start jobs at its `center_hz` with the plan's `bandwidth_hz`. The AU UHF CB plan interleaves two rasters: ch1-40 sit 25 kHz apart and ch41-80 fall halfway between them, so every channel has neighbours 12.5 kHz either side. A strong ch20 transmission leaks into ch59 and ch60 and used to open both squelches and echo the same words three times. An `fm_demod` on a plan channel therefore carries a guard: its squelch stays closed while a neighbour `guard_hz` away is more than `guard_db` stronger, and the `squelch` event says so with `guarded: true` and `adjacent_db`. When a quiet channel shows `squelch` and no transcripts, read `guarded` before concluding it is broken. The guard needs the squelch on (it is inert with `squelch: false`) and `graph put` with `guard_hz: null` turns it off. `transcribe` ignores utterances under `min_utterance_ms` (700) and a busy speech daemon drops with `reason` `queue` or `busy`; `queued_ms` on a transcript is the time it waited.
 
-To run demodulators on active channels only, not on all 80, use `examples/python/cb_watch.py` (`--dry-run` shows which channels the capture holds): it keeps one elastic `spectrum` job, starts `fm_demod` plus `transcribe` on a channel that stands 10 dB over the floor and stops them after 60 s of quiet.
+To run demodulators on active channels only, not on all 80, use `examples/python/cb_watch.py` (`--dry-run` shows which channels the capture holds): it keeps one elastic `spectrum` job, starts `fm_demod` plus `transcribe` on a channel that stands 10 dB over the floor and stops them after 60 s of quiet. For every channel at once, `plan_start`.
+
+### Starting a whole plan
+
+"Transcribe all the UHF CB channels" is one operation, not 80 starts:
+
+1. `source_list`: note the `holders` other than `elastic` (the page's spectrum job is not one) on the source you will use. A holder outside the plan's band will make the start a `conflict`.
+2. `plan_start` with the plan, `channels: null` (or the numbers asked for), the `kind`, the `source`, and `attach: "transcribe"` when transcripts are wanted. For `fm_demod` on a 12.5 kHz plan give `deviation_hz: 2500`.
+3. Read all four lists of the result and report them: `started` (with each `attached` and any `attach_error`), `existing` (channels already running an identical job, left alone), `refused` (channels whose own start failed, each with its error) and `warnings` (repeat them to the operator, the speech backend's capacity among them).
+4. A `conflict` names the holders and starts nothing. Report it and stop: the operator decides whether those jobs go. Do not retry with `replace` or `job_stop` them unless the request named them.
+5. A partial set is completed by running `plan_start` again: running channels come back as `existing`.
+
+A result of `not_allowed` means the run may not do that: the agent is not allowed to stop jobs, or to put any in `replace`, unless the operator unlocked it for the run. Do not retry and do not work around it with other calls. Tell the operator to say `allow stops on`, or press the retry button, then ask again.
 
 ### Fitting a demod to a signal
 

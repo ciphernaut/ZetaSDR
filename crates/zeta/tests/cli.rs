@@ -2939,3 +2939,63 @@ fn job_start_accepts_a_mode_id_string() {
         .code(1)
         .stderr(contains("Nope").and(contains("mode id")));
 }
+
+/// The tone fixture relabelled at 476.9 MHz, playing as a radio tunable over 470-480 MHz.
+fn cb_source(dir: &Path) -> String {
+    let tone = write_tone(dir);
+    let meta = std::fs::read_to_string(&tone).unwrap();
+    let field = "\"core:frequency\":100000000";
+    assert!(meta.contains(field), "{meta}");
+    let path = dir.join("cb.sigmf-meta");
+    std::fs::write(&path, meta.replace(field, "\"core:frequency\":476900000")).unwrap();
+    std::fs::copy(tone.with_extension("sigmf-data"), dir.join("cb.sigmf-data")).unwrap();
+    format!(
+        "cb={},tune_min_hz=470000000,tune_max_hz=480000000",
+        path.display()
+    )
+}
+
+#[test]
+fn plan_start_cli_maps_to_the_op_and_parses_channel_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |channels: &str| {
+        let mut cmd = zeta_bin();
+        cmd.arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .arg("--source-file")
+            .arg(cb_source(dir.path()))
+            .arg("--json")
+            .args([
+                "plan",
+                "start",
+                "--plan",
+                "uhf_cb_au",
+                "--kind",
+                "fm_demod",
+                "--source",
+                "cb",
+                "--channels",
+                channels,
+            ]);
+        cmd
+    };
+    let out = run("2,1-2,1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let started: Vec<u64> = v["value"]["started"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["channel"].as_u64().unwrap())
+        .collect();
+    assert_eq!(started, [1, 2], "{v}");
+    let op = last_logged_op(dir.path());
+    assert_eq!(op["op"], "plan_start", "{op}");
+    assert_eq!(op["channels"], serde_json::json!([1, 2]), "{op}");
+    // The recording is 48 kHz wide, so two adjacent channels are what it can hold.
+    run("8-5").assert().code(1).stderr(contains("channels"));
+}

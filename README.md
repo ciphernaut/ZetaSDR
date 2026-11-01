@@ -95,6 +95,7 @@ Holding a capture, receive gain and transcripts:
 ./target/debug/zeta source gain --source b210 --db 45     # or --auto
 ./target/debug/zeta transcripts tail --lines 20 --job job-7   # default 50 lines, local state dir only
 ./target/debug/zeta plans [--plan uhf_cb_au]     # channel plans with their channels expanded
+./target/debug/zeta plan start --plan uhf_cb_au --kind fm_demod --source b210 --channels 1,2,5-8 --attach transcribe   # one lease decision, one job per channel
 ```
 
 `source pin` holds a source at a band (the leased bandwidth may round up to what the radio can
@@ -463,6 +464,8 @@ else it gets 401.
 | `GET /agents-md` | the node's agent guide |
 | `GET /stream/{id}` | websocket of one stream |
 | `GET /streams/{id}/tail?max_frames=N&timeout_ms=T` | the `stream_tail` operation: up to N frames arriving within T ms |
+
+`plan_start` (`zeta plan start`) starts a kind on a plan's channels, with an optional attach, in one operation; the agent is told to use it for a kind on every channel, and never to stop or replace jobs the request did not name (`not_allowed`, unlocked per run).
 
 `POST /op` answers 504 if an operation takes longer than 30 s. `GET /streams/{id}/tail` applies
 `stream_tail` and returns exactly what `POST /op` returns for it (`{"result":"frames","value":

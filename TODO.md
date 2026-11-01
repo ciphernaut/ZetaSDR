@@ -291,14 +291,7 @@ Wanted: gate the measurement on the burst (on/off at 1 ms, measure over on-time 
 
 ## Agent: requests too big for the voice console
 
-From the operator, 2026-11-01, after "set up a narrowband FM decoder for every CB channel and attach a transcribe session" ended on the turn limit twice (8 turns; 80 channels is 160 operations). Four parts:
-
-- **Never clear jobs unasked.** Stopping or replacing jobs is the operator's explicit decision; hand-crafted jobs must survive any request that did not name them. Say so in the guide. A `conflict` is reported to the operator unless the request allowed `replace`.
-- **Bulk operation, discoverable.** One op that starts a kind (with an optional attach) on every channel of a plan, returning ids and refusals. It must not be hidden knowledge: an ordinary op in `schema` and the guide, offered on the page (the plan's channels in a menu), and named by the agent when it plans. Refuse or warn on load: 80 transcribers share the speech daemon's 4 slots.
-- **Turn budget.** The page sends the default 8 (`api.ask`); raise it to the API's maximum of 32.
-- **The model's reasoning in the transcript.** `Completion.reasoning` is parsed (`zeta-agent/src/llm.rs`) and dropped. Carry it per turn in the `/ask` transcript and show it on the page, collapsed, so the operator sees the plan and any capability it considers.
-
-Also: refuse an identical rigid start on a band that already has one (ch2 was started twice).
+Scheduled as plan 21 (`docs/superpowers/plans/2026-11-01-agent-bulk-ops.md`); the four parts and the duplicate refusal are its tasks.
 
 ## Agent guide: SIGINT and UX additions
 
