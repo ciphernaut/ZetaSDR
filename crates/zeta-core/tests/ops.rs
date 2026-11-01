@@ -1045,7 +1045,7 @@ fn job_attach_schema_has_a_nullable_language() {
 fn transcribe_expands_attached_to_stream_in_denoise_vad_transcribe() {
     let (job, stream) = (JobId("in".into()), StreamId("s".into()));
     let g = JobKind::Transcribe
-        .expand_attached(&job, &stream, "de")
+        .expand_attached(&job, &stream, "de", false)
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);
@@ -1063,7 +1063,7 @@ fn transcribe_expands_attached_to_stream_in_denoise_vad_transcribe() {
         assert_eq!(e.to, g.nodes[i + 1].id);
     }
     assert_eq!(
-        JobKind::WfmDemod.expand_attached(&job, &stream, "en"),
+        JobKind::WfmDemod.expand_attached(&job, &stream, "en", false),
         Err(OpError::Other {
             message: "wfm_demod is not attachable".into()
         })
@@ -1200,7 +1200,8 @@ fn fm_demod_kind_expands_to_channel_then_nbfm() {
     assert_eq!(g.nodes[1].kind, "nbfm_demod");
     assert_eq!(
         g.nodes[1].params,
-        serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true})
+        serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true,
+            "audio_lowpass_hz": 3_400, "deemphasis_us": 530, "denoise": false})
     );
     assert_eq!(g.edges.len(), 1);
     assert_eq!(g.edges[0].from, g.nodes[0].id);
@@ -2315,7 +2316,7 @@ fn am_expansion_is_channel_then_am_demod() {
     assert_eq!(g.nodes[1].kind, "am_demod");
     assert_eq!(
         g.nodes[1].params,
-        serde_json::json!({"audio_rate_hz": 48_000, "squelch_db": null, "squelch": true})
+        serde_json::json!({"audio_rate_hz": 48_000, "squelch_db": null, "squelch": true, "denoise": false})
     );
     assert_eq!(g.edges.len(), 1);
     assert_eq!(g.edges[0].from, g.nodes[0].id);
@@ -2355,7 +2356,7 @@ fn ssb_expansion_defaults_to_usb() {
         assert_eq!(g.nodes[1].kind, "ssb_demod");
         assert_eq!(
             g.nodes[1].params,
-            serde_json::json!({"sideband": name, "audio_rate_hz": AUDIO_RATE_HZ, "audio_bandwidth_hz": 2_800})
+            serde_json::json!({"sideband": name, "audio_rate_hz": AUDIO_RATE_HZ, "audio_bandwidth_hz": 2_800, "denoise": false})
         );
         assert_eq!(g.edges.len(), 1);
         assert_eq!(g.edges[0].from, g.nodes[0].id);
@@ -2575,6 +2576,7 @@ fn plan_channels_carry_the_guard() {
         serde_json::json!({
             "deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true,
             "guard_hz": 12_500, "guard_db": 12, "channel_hz": 12_500,
+            "audio_lowpass_hz": 3_400, "deemphasis_us": 530, "denoise": false,
         })
     );
     // Too narrow a channel rate for three raster steps: no guard.
@@ -2599,7 +2601,7 @@ fn plan_channels_carry_the_guard() {
 #[test]
 fn off_plan_graphs_are_unchanged() {
     use zeta_core::graph::{Edge, Graph, GraphId, Node as GraphNode, NodeId, same_pipeline};
-    // Plan 12's graph, literally.
+    // Plan 12's graph, literally, plus the voice shaping fm_demod carries since 2026-11-01.
     let (channel, demod) = (NodeId::new(), NodeId::new());
     let plan12 = Graph {
         id: GraphId::new(),
@@ -2612,7 +2614,8 @@ fn off_plan_graphs_are_unchanged() {
             GraphNode {
                 id: demod.clone(),
                 kind: "nbfm_demod".into(),
-                params: serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true}),
+                params: serde_json::json!({"deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": null, "squelch": true,
+                    "audio_lowpass_hz": 3_400, "deemphasis_us": 530, "denoise": false}),
             },
         ],
         edges: vec![Edge {
@@ -2708,6 +2711,7 @@ fn reexpand_carrying_squelch_only_rederives_the_guard_at_the_new_band() {
         serde_json::json!({
             "deviation_hz": 5_000, "audio_rate_hz": 48_000, "squelch_db": -70, "squelch": true,
             "guard_hz": 12_500, "guard_db": 12, "channel_hz": 12_500,
+            "audio_lowpass_hz": 3_400, "deemphasis_us": 530, "denoise": false,
         })
     );
 }
@@ -3238,4 +3242,73 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
         }
         other => panic!("expected OutOfRange, got {other:?}"),
     }
+}
+
+#[test]
+fn demod_graphs_carry_denoise_and_the_voice_shaping() {
+    let tuning = Tuning {
+        center_hz: Hz(100_005_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let src = SourceId("file0".into());
+    for (kind, demod) in [
+        (JobKind::FmDemod, "nbfm_demod"),
+        (JobKind::AmDemod, "am_demod"),
+        (JobKind::SsbDemod, "ssb_demod"),
+    ] {
+        let g = kind
+            .expand(&src, tuning, Hz(48_000), None, None, None, &modes())
+            .unwrap();
+        let n = g.nodes.iter().find(|n| n.kind == demod).expect(demod);
+        assert_eq!(n.params["denoise"], false, "{kind:?}");
+        // What `graph_put` set survives a re-expansion and a retune.
+        let mut stored = g.clone();
+        for m in stored.nodes.iter_mut().filter(|m| m.kind == demod) {
+            m.params["denoise"] = true.into();
+            if demod == "nbfm_demod" {
+                m.params["audio_lowpass_hz"] = serde_json::Value::Null;
+                m.params["deemphasis_us"] = 750.into();
+            }
+        }
+        for carried in [None, Some(&zeta_core::ops::RETUNE_CARRIED_PARAMS[..])] {
+            let again = match carried {
+                None => kind.reexpand(&src, tuning, Hz(96_000), None, &stored, &modes()),
+                Some(c) => {
+                    kind.reexpand_carrying(&src, tuning, Hz(96_000), None, &stored, &modes(), c)
+                }
+            }
+            .unwrap();
+            let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
+            assert_eq!(n.params["denoise"], true, "{kind:?} {carried:?}");
+            if demod == "nbfm_demod" {
+                assert_eq!(
+                    n.params["audio_lowpass_hz"],
+                    serde_json::Value::Null,
+                    "{carried:?}"
+                );
+                assert_eq!(n.params["deemphasis_us"], 750, "{carried:?}");
+            }
+        }
+    }
+    // Only the NBFM voice demodulator shapes its audio; the WFM one has its own.
+    let g = JobKind::WfmDemod
+        .expand(&src, tuning, Hz(480_000), None, None, None, &modes())
+        .unwrap();
+    assert!(g.nodes.iter().all(|n| n.params.get("denoise").is_none()));
+}
+
+#[test]
+fn an_attached_transcribe_skips_its_own_denoise_when_the_input_denoises() {
+    let (job, stream) = (JobId("in".into()), StreamId("s".into()));
+    let g = JobKind::Transcribe
+        .expand_attached(&job, &stream, "en", true)
+        .unwrap();
+    let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+    assert_eq!(kinds, ["stream_in", "vad", "transcribe"]);
+    assert_eq!(g.edges.len(), 2);
+    let g = JobKind::Transcribe
+        .expand_attached(&job, &stream, "en", false)
+        .unwrap();
+    let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+    assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);
 }

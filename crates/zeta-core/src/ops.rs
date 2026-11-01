@@ -562,20 +562,28 @@ impl JobKind {
 
     /// The graph of an attached job of this kind reading `input_stream` (an audio stream)
     /// of `input_job`: `stream_in` then the kind's chain, joined by audio edges. For
-    /// `transcribe`: `stream_in -> denoise -> vad -> transcribe {"language"}`. A kind that
-    /// is not [`attachable`](Self::attachable) is `other("<kind> is not attachable")`.
+    /// `transcribe`: `stream_in -> denoise -> vad -> transcribe {"language"}`, without the
+    /// `denoise` when `input_denoised` (the input's demodulator runs RNNoise itself: see
+    /// [`graph_denoises`]). A kind that is not [`attachable`](Self::attachable) is
+    /// `other("<kind> is not attachable")`.
     pub fn expand_attached(
         &self,
         input_job: &JobId,
         input_stream: &StreamId,
         language: &str,
+        input_denoised: bool,
     ) -> Result<Graph, OpError> {
         let chain: Vec<(&str, serde_json::Value)> = match self {
-            JobKind::Transcribe => vec![
-                ("denoise", serde_json::json!({})),
-                ("vad", serde_json::json!({})),
-                ("transcribe", serde_json::json!({"language": language})),
-            ],
+            JobKind::Transcribe => {
+                let mut chain = vec![
+                    ("vad", serde_json::json!({})),
+                    ("transcribe", serde_json::json!({"language": language})),
+                ];
+                if !input_denoised {
+                    chain.insert(0, ("denoise", serde_json::json!({})));
+                }
+                chain
+            }
             _ => {
                 return Err(OpError::Other {
                     message: format!("{} is not attachable", self.name()),
@@ -608,6 +616,14 @@ impl JobKind {
             id: GraphId::new(),
             nodes,
             edges,
+        })
+    }
+
+    /// Whether `graph` denoises its audio itself: a demodulator node with `denoise: true`
+    /// (`nbfm_demod`, `am_demod`, `ssb_demod`), or a `denoise` stage.
+    pub fn graph_denoises(graph: &Graph) -> bool {
+        graph.nodes.iter().any(|n| {
+            n.kind == "denoise" || n.params.get("denoise").and_then(|v| v.as_bool()) == Some(true)
         })
     }
 
@@ -878,6 +894,9 @@ impl JobKind {
                     "audio_rate_hz": AUDIO_RATE_HZ,
                     "squelch_db": null,
                     "squelch": true,
+                    "audio_lowpass_hz": FM_AUDIO_LOWPASS_HZ,
+                    "deemphasis_us": FM_DEEMPHASIS_US,
+                    "denoise": false,
                 });
                 // On a plan channel, with room for both neighbours at the channel rate: the
                 // adjacent-channel guard (the channel cut three raster steps wide).
@@ -963,6 +982,7 @@ impl JobKind {
                                 "audio_rate_hz": AUDIO_RATE_HZ,
                                 "squelch_db": null,
                                 "squelch": true,
+                                "denoise": false,
                             }),
                         },
                     ],
@@ -994,6 +1014,7 @@ impl JobKind {
                                 "sideband": sideband.unwrap_or(Sideband::Usb),
                                 "audio_rate_hz": AUDIO_RATE_HZ,
                                 "audio_bandwidth_hz": SSB_AUDIO_BANDWIDTH_HZ,
+                                "denoise": false,
                             }),
                         },
                     ],
@@ -1248,13 +1269,16 @@ pub const DETECT_GONE_MS_DEFAULT: u64 = 30_000;
 
 /// The params [`JobKind::reexpand`] carries from a stored graph to the node of the same
 /// stage kind: what an operator may set with `graph_put` and still have the node's graph.
-const CARRIED_PARAMS: [&str; 6] = [
+const CARRIED_PARAMS: [&str; 9] = [
     "squelch_db",
     "squelch",
     "guard_hz",
     "guard_db",
     "channel_hz",
     "wide_hz",
+    "denoise",
+    "audio_lowpass_hz",
+    "deemphasis_us",
 ];
 
 /// The params a retune ([`JobKind::reexpand_carrying`]) carries from the stored graph:
@@ -1262,7 +1286,19 @@ const CARRIED_PARAMS: [&str; 6] = [
 /// channel node's `wide_hz`) is derived again from the channel plan at the new band, so a
 /// width preset changes the filter and a move to a neighbouring channel takes that
 /// channel's geometry.
-pub const RETUNE_CARRIED_PARAMS: [&str; 2] = ["squelch_db", "squelch"];
+pub const RETUNE_CARRIED_PARAMS: [&str; 5] = [
+    "squelch_db",
+    "squelch",
+    "denoise",
+    "audio_lowpass_hz",
+    "deemphasis_us",
+];
+
+/// `fm_demod`'s audio low-pass cutoff, Hz: voice to 3.4 kHz, the FM hiss above it out.
+pub const FM_AUDIO_LOWPASS_HZ: u64 = 3_400;
+/// `fm_demod`'s de-emphasis time constant, µs (a 6 dB per octave roll-off, as PMR radios
+/// apply).
+pub const FM_DEEMPHASIS_US: u64 = 530;
 
 /// The narrowest exact divisor of `source_rate_hz` that is at least
 /// [`CHANNEL_RATE_MIN_HZ`] and at least `bandwidth_hz`; the source rate itself
@@ -2533,13 +2569,18 @@ async fn job_attach(
             "language {language:?} is not a BCP-47 code such as en, de or pt-BR; pass null for en"
         )));
     }
-    if !node.job_list().iter().any(|r| r.id == job) {
+    let Some(input) = node.job_list().into_iter().find(|r| r.id == job) else {
         return Err(unknown_job(node, &job));
-    }
+    };
     let stream = node
         .job_audio_stream(&job)
         .map_err(|e| node_error(node, e))?;
-    let graph = kind.expand_attached(&job, &stream, &language)?;
+    let graph = kind.expand_attached(
+        &job,
+        &stream,
+        &language,
+        JobKind::graph_denoises(&input.graph),
+    )?;
     node.job_attach(kind.name(), &job, graph)
         .await
         .map(OpResult::Job)

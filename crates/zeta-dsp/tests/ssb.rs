@@ -7,8 +7,8 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::ops::Sideband;
 use zeta_core::stage::{Stage, StageError};
-use zeta_core::stream::StreamBus;
-use zeta_core::types::StreamId;
+use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::types::{Hz, StreamId};
 use zeta_dsp::am::{SsbDemod, SsbDemodStage, SsbParams};
 use zeta_dsp::fft::{Window, power_spectrum_db};
 use zeta_dsp::fixtures::{ssb_modulate, tone};
@@ -27,6 +27,7 @@ fn demod(iq: &[Complex<f32>], sideband: Sideband) -> Vec<f32> {
         sideband,
         audio_rate_hz: 48_000,
         audio_bandwidth_hz: 2_800,
+        denoise: false,
     })
     .unwrap();
     let mut out = Vec::new();
@@ -109,4 +110,73 @@ async fn ssb_stage_rejects_bad_bandwidth() {
             r => panic!("expected Failed for {bw}, got {r:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn ssb_denoise_frames_the_audio_and_dates_held_samples_from_their_block() {
+    use zeta_core::port::IqBlock;
+    use zeta_core::types::{Provenance, SourceId, Span, StreamKind, Timestamp};
+    let prov = || Provenance {
+        source: SourceId("s".into()),
+        job: None,
+        channel: None,
+        span: Span {
+            start_ns: Timestamp(0),
+            end_ns: Timestamp(1),
+        },
+    };
+    let bus = Arc::new(StreamBus::new(8));
+    let out = bus.register(StreamKind::Audio, prov());
+    let mut rx = bus.subscribe(&out).unwrap();
+    let (tx, rx_in) = broadcast::channel(8);
+    tokio::spawn(async move {
+        SsbDemodStage::new()
+            .run(
+                serde_json::json!({"sideband": "usb", "audio_rate_hz": 48_000, "audio_bandwidth_hz": 2_800, "denoise": true}),
+                vec![rx_in],
+                vec![out],
+                bus,
+                CancellationToken::new(),
+                zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
+            )
+            .await
+    });
+    // A 1 kHz tone in the upper sideband at baseband.
+    let n = 4_800 + 100 + 380;
+    let iq: Vec<Complex<f32>> = (0..n)
+        .map(|i| {
+            Complex::from_polar(
+                0.5,
+                2.0 * std::f64::consts::PI as f32 * 1_000.0 * i as f32 / 48_000.0,
+            )
+        })
+        .collect();
+    let at = |s: &[Complex<f32>], t0: u64| {
+        Frame::new(
+            StreamId::new(),
+            prov(),
+            Payload::Iq(IqBlock {
+                t0: Timestamp(t0),
+                sample_rate_hz: Hz(48_000),
+                center_hz: Hz(7_100_000),
+                samples: s.to_vec().into(),
+            }),
+        )
+    };
+    tx.send(at(&iq[..4_800], 1_000_000_000)).unwrap();
+    let f = rx.recv().await.unwrap();
+    let Payload::Audio { samples, .. } = &f.payload else {
+        panic!()
+    };
+    assert_eq!(samples.len(), 4_800);
+    assert_eq!(f.provenance.span.start_ns, Timestamp(1_000_000_000));
+    tx.send(at(&iq[4_800..4_900], 1_100_000_000)).unwrap();
+    tx.send(at(&iq[4_900..], 1_102_083_333)).unwrap();
+    let f = rx.recv().await.unwrap();
+    let Payload::Audio { samples, .. } = &f.payload else {
+        panic!()
+    };
+    assert_eq!(samples.len(), 480);
+    assert_eq!(f.provenance.span.start_ns, Timestamp(1_100_000_000));
+    assert_eq!(f.provenance.span.end_ns, Timestamp(1_110_000_000));
 }

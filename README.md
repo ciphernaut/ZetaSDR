@@ -115,6 +115,14 @@ beside the pin) and re-applied at the next start, where it wins over `gain=` in 
 `dropped`, `error`; rotated to `transcripts.log.1` past 8 MiB); `transcripts tail` reads it and is a
 usage error with `--node`.
 
+`fm_demod` shapes its audio as a voice receiver does: a 3.4 kHz low-pass and a 530 µs
+de-emphasis after the discriminator (`audio_lowpass_hz`, `deemphasis_us` on its node; `null`
+keeps the flat audio the audio-input decoder rows read). Every voice demodulator (`fm_demod`,
+`am_demod`, `ssb_demod`) takes `denoise: true` on its node to run RNNoise on its audio output
+(off by default: a speech model; one 10 ms frame of delay the frames' spans account for), set
+with `graph put` or the page's outline menu ("Denoise on/off") and kept through a retune; a
+`transcribe` attached to such a job runs without a `denoise` stage of its own.
+
 `fm_demod` and `am_demod` carry an automatic squelch, always on: it opens 6 dB over the noise
 floor it tracks (the automatic floor is never taken above -40 dBFS) and closes after 300 ms under
 it. While closed the stage publishes no audio; it emits a `squelch` event (`open`, `power_db`,

@@ -74,3 +74,25 @@ pub fn awgn_real(x: &mut [f32], snr_db: f32, seed: u64) {
         *s += (sigma * (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()) as f32;
     }
 }
+
+/// Mean power in burst windows over mean power in silence windows, dB.
+/// Windows are the inner 200 ms of each 300 ms burst / silence of the 600 ms period.
+pub fn burst_to_silence_db(x: &[f32]) -> f64 {
+    let rate = 48_000usize;
+    let (period, win, margin) = (rate * 600 / 1000, rate * 200 / 1000, rate * 50 / 1000);
+    let (mut pb, mut nb, mut ps, mut ns) = (0.0f64, 0usize, 0.0f64, 0usize);
+    let mut start = 0;
+    while start + period <= x.len() {
+        for &s in &x[start + margin..start + margin + win] {
+            pb += (s as f64).powi(2);
+            nb += 1;
+        }
+        let sil = start + rate * 300 / 1000 + margin;
+        for &s in &x[sil..sil + win] {
+            ps += (s as f64).powi(2);
+            ns += 1;
+        }
+        start += period;
+    }
+    10.0 * ((pb / nb as f64) / (ps / ns as f64)).log10()
+}

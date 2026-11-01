@@ -156,6 +156,10 @@
 //                          `<kind>: fit cancelled`)
 //   w2500 2.5 kHz, w5000 5 kHz, w6250 6.25 kHz, w12500 12.5 kHz, w25000 25 kHz
 //                          job_retune to that bandwidth_hz about the same centre_hz
+//   denoise Denoise on|off graph_put of the job's own graph with `denoise` flipped on its
+//                          demodulator node (nbfm_demod, am_demod, ssb_demod: DENOISE_KINDS;
+//                          hidden for the others), the entry reading the state it would
+//                          switch to; the note `<kind>: denoise on|off`
 //   stop   Stop            job_stop
 // Every retune is {op: job_retune, job, center_hz, bandwidth_hz, replace: []}. #ctx-outline-footer
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
@@ -212,8 +216,25 @@ const OUTLINE_ENTRIES = [
   ["w6250", "6.25 kHz"],
   ["w12500", "12.5 kHz"],
   ["w25000", "25 kHz"],
+  ["denoise", "Denoise on"],
   ["stop", "Stop"],
 ];
+
+// The job kinds whose demodulator node takes `denoise` (RNNoise on its audio), by the node's
+// stage kind: the voice demodulators; wfm_demod (music) has none.
+export const DENOISE_KINDS = new Map([
+  ["fm_demod", "nbfm_demod"],
+  ["am_demod", "am_demod"],
+  ["ssb_demod", "ssb_demod"],
+]);
+
+// The demodulator node of `job` (a job_list record with its graph) that takes `denoise`,
+// or null.
+function denoiseNode(job) {
+  const kind = DENOISE_KINDS.get(job.kind);
+  if (!kind) return null;
+  return ((job.graph && job.graph.nodes) || []).find((n) => n.kind === kind) || null;
+}
 
 const ENTRIES = [
   ["classify", "What is this?"],
@@ -546,10 +567,18 @@ class Menu {
     this.setFitting(null);
     this.outlineJob = job;
     const t = job.tuning;
-    // Fit and the width presets only for the demodulators; Stop always.
+    // Fit and the width presets only for the demodulators, Denoise for the voice ones
+    // (reading the state it would switch to); Stop always.
     const fits = FIT_KINDS.has(job.kind);
+    const dn = denoiseNode(job);
     for (const item of this.outlineEl.querySelectorAll(".ctx-item")) {
-      item.hidden = item.dataset.action !== "stop" && !fits;
+      const action = item.dataset.action;
+      if (action === "denoise") {
+        item.hidden = dn === null;
+        item.textContent = dn && dn.params && dn.params.denoise ? "Denoise off" : "Denoise on";
+      } else {
+        item.hidden = action !== "stop" && !fits;
+      }
     }
     this.outlineFooter.textContent =
       `job=${job.id} center_hz=${t.center_hz} bandwidth_hz=${t.bandwidth_hz}`;
@@ -616,6 +645,18 @@ class Menu {
     this.closeOutline();
     if (action === "stop") {
       await this.applyOp({ op: "job_stop", job: job.id });
+    } else if (action === "denoise") {
+      // The job's own graph with the flag flipped: a carried param, so the node keeps the
+      // job re-expandable and relaunches it under its id (an attached transcribe follows).
+      const dn = denoiseNode(job);
+      if (!dn) return;
+      const on = !(dn.params && dn.params.denoise);
+      const graph = JSON.parse(JSON.stringify(job.graph));
+      for (const n of graph.nodes) {
+        if (n.kind === dn.kind) n.params = { ...(n.params || {}), denoise: on };
+      }
+      const r = await this.applyOp({ op: "graph_put", job: job.id, graph });
+      if (r) this.t.note(`${job.kind}: denoise ${on ? "on" : "off"}`);
     } else if (/^w\d+$/.test(action)) {
       await this.applyOp({
         op: "job_retune",

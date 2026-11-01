@@ -2024,7 +2024,7 @@ def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
             ".map(e => [e.dataset.action, e.textContent])")
         assert got == [["fit", "Fit to signal"], ["w2500", "2.5 kHz"], ["w5000", "5 kHz"],
                        ["w6250", "6.25 kHz"], ["w12500", "12.5 kHz"], ["w25000", "25 kHz"],
-                       ["stop", "Stop"]], f"entries {got}"
+                       ["denoise", "Denoise on"], ["stop", "Stop"]], f"entries {got}"
         expect(page.locator("#ctx-outline-footer")).to_contain_text(
             f"job={job} center_hz={cur} bandwidth_hz=20000")
         with page.expect_request(is_op("job_retune")) as req:
@@ -2035,6 +2035,29 @@ def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
         expect(menu).to_be_hidden()
         wait_until(lambda: job_record(url, secret, job)["tuning"]["bandwidth_hz"] == 12500,
                    5.0, "preset applied")
+        page.evaluate("window.zetaTest.poll()")
+        # Denoise: a graph_put of the job's own graph with `denoise: true` on its demodulator
+        # (the node keeps the job re-expandable), the entry reading "Denoise off" afterwards.
+        ol.click(button="right")
+        with page.expect_request(is_op("graph_put")) as req:
+            page.click('#ctx-outline .ctx-item[data-action="denoise"]')
+        body = json.loads(req.value.post_data)
+        demod = [n for n in body["graph"]["nodes"] if n["kind"] == "nbfm_demod"]
+        assert body["job"] == job and len(demod) == 1 and demod[0]["params"]["denoise"] is True, \
+            f"denoise put {body}"
+        expect(menu).to_be_hidden()
+        expect(page.locator("#transcript .line.note", has_text="fm_demod: denoise on")).to_have_count(1)
+        wait_until(lambda: [n for n in job_record(url, secret, job)["graph"]["nodes"]
+                            if n["kind"] == "nbfm_demod"][0]["params"]["denoise"] is True,
+                   5.0, "denoise applied")
+        wait_until(lambda: job_record(url, secret, job)["state"]["status"] == "running",
+                   5.0, "running again")
+        assert job_record(url, secret, job)["operator_graph"] is False
+        page.evaluate("window.zetaTest.poll()")
+        ol.click(button="right")
+        expect(menu.locator('.ctx-item[data-action="denoise"]')).to_have_text("Denoise off")
+        page.keyboard.press("Escape")
+        expect(menu).to_be_hidden()
         page.evaluate("window.zetaTest.poll()")
         # Fit: the tone sits at cur + 1000 Hz.
         ol.click(button="right")

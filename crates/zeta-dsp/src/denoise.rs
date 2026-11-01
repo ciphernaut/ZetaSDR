@@ -13,7 +13,7 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, StreamId, StreamKind};
 
 use crate::resample::Resampler;
-use crate::{Input, frame_span, run_map};
+use crate::{Input, run_map};
 
 /// RNNoise works at this sample rate only.
 pub const DENOISE_RATE_HZ: u64 = 48_000;
@@ -22,6 +22,26 @@ pub const DENOISE_FRAME: usize = 480;
 
 /// RNNoise works on samples scaled to 16-bit full scale.
 const RNNOISE_SCALE: f32 = 32_768.0;
+
+/// `samples` (mono audio at `rate_hz` whose first sample is at `t0`) through `d`, with
+/// the span the output covers: it starts where the samples `d` held back from earlier
+/// calls did, so a frame's time stays true through the denoiser's 10 ms framing.
+pub fn denoised(
+    d: &mut Denoiser,
+    samples: &[f32],
+    t0: zeta_core::types::Timestamp,
+    rate_hz: u64,
+) -> (Vec<f32>, zeta_core::types::Span) {
+    let held = d.pending() as u64;
+    let start = t0.0.saturating_sub(held * 1_000_000_000 / rate_hz.max(1));
+    let out = d.feed(samples);
+    let span = crate::frame_span(
+        zeta_core::types::Timestamp(start),
+        out.len(),
+        DENOISE_RATE_HZ,
+    );
+    (out, span)
+}
 
 /// Streaming RNNoise: any input rate and channel count in, mono 48 kHz out.
 pub struct Denoiser {
@@ -49,6 +69,12 @@ impl Denoiser {
             state: DenoiseState::new(),
             pending: Vec::new(),
         })
+    }
+
+    /// Mono 48 kHz samples held back, waiting for a whole frame: the delay the next
+    /// output carries.
+    pub fn pending(&self) -> usize {
+        self.pending.len()
     }
 
     /// Denoise `interleaved` samples; returns every whole 480-sample frame now
@@ -172,12 +198,12 @@ impl Stage for DenoiseStage {
                     run.insert((rate, ch, dn))
                 }
             };
-            let cleaned = dn.feed(samples);
+            let (cleaned, span) = denoised(dn, samples, frame.provenance.span.start_ns, rate);
             if cleaned.is_empty() {
                 return Ok(Vec::new());
             }
             let mut prov = frame.provenance.clone();
-            prov.span = frame_span(prov.span.start_ns, cleaned.len(), DENOISE_RATE_HZ);
+            prov.span = span;
             Ok(vec![Frame::new(
                 out.clone(),
                 prov,
@@ -195,29 +221,7 @@ impl Stage for DenoiseStage {
 #[cfg(all(test, feature = "test-fixtures"))]
 mod tests {
     use super::*;
-    use crate::fixtures::{awgn_real, speech_like, tone};
-
-    /// Mean power in burst windows over mean power in silence windows, dB.
-    /// Windows are the inner 200 ms of each 300 ms burst / silence of the 600 ms period.
-    fn burst_to_silence_db(x: &[f32]) -> f64 {
-        let rate = 48_000usize;
-        let (period, win, margin) = (rate * 600 / 1000, rate * 200 / 1000, rate * 50 / 1000);
-        let (mut pb, mut nb, mut ps, mut ns) = (0.0f64, 0usize, 0.0f64, 0usize);
-        let mut start = 0;
-        while start + period <= x.len() {
-            for &s in &x[start + margin..start + margin + win] {
-                pb += (s as f64).powi(2);
-                nb += 1;
-            }
-            let sil = start + rate * 300 / 1000 + margin;
-            for &s in &x[sil..sil + win] {
-                ps += (s as f64).powi(2);
-                ns += 1;
-            }
-            start += period;
-        }
-        10.0 * ((pb / nb as f64) / (ps / ns as f64)).log10()
-    }
+    use crate::fixtures::{awgn_real, burst_to_silence_db, speech_like, tone};
 
     #[test]
     fn denoise_raises_snr_of_speech_like_in_white_noise() {

@@ -42,6 +42,8 @@ A `graph_put` that loses a race with another put on the same job returns an erro
 
 ## Audio: `nbfm_demod` has no voice-band low-pass and no de-emphasis
 
+Done 2026-11-01 (`fm_demod` carries `audio_lowpass_hz` 3400 and `deemphasis_us` 530, and the voice demodulators take `denoise: true` for RNNoise on their output; the page's outline menu toggles it). Left: the default `deviation_hz` on a 12.5 kHz channel (below). Original note:
+
 From the operator listening to a fitted ch9 demod on the B210, 2026-11-01 ("a bit of noise"). The NBFM path is discriminator → resampler to 48 kHz (`crates/zeta-dsp/src/nbfm.rs`, `AudioFilter`) and nothing else: `am_demod` low-passes its audio at 5 kHz and `wfm_demod` de-emphasises and low-passes at 15 kHz, but NBFM passes everything up to the IQ filter's edge (`channel_hz / 2`, 6.25 kHz on a 12.5 kHz channel). FM noise rises with audio frequency, so most of the hiss on a weak signal sits above the voice (about three quarters of the noise power of a 6.25 kHz band lies above 4 kHz); narrowing the job to 8 kHz helped and 5 kHz sounded cleaner still, at the cost of the voice sidebands. Wanted: after the resampler, a 6 dB/octave de-emphasis (a one-pole, tau about 530 us as PMR radios use; reuse `wfm::deemphasis`) and a 3.4 kHz low-pass (`lowpass_taps` with a `StreamingFir`, as `am.rs`); keep the squelch's measurement on the unfiltered discriminator. Also the field craft: on a 12.5 kHz channel the default `deviation_hz` 5000 halves the audio level of a 2.5 kHz-deviation CB signal; the fit (or the channel plan) could set 2500 there.
 
 ## Feature: stereo for `wfm_demod`

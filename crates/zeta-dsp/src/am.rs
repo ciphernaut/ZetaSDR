@@ -18,6 +18,7 @@ use zeta_core::types::{Hz, StreamId, StreamKind};
 
 use zeta_core::ops::Sideband;
 
+use crate::denoise::{Denoiser, denoised};
 use crate::nbfm::AudioFilter;
 use crate::squelch::{
     default_true, squelch_event, squelch_outputs, squelch_streams, stage_squelch,
@@ -147,6 +148,10 @@ pub struct AmParams {
     /// The squelch is on (the default); `false` passes every block.
     #[serde(default = "default_true")]
     pub squelch: bool,
+    /// RNNoise on the audio output (speech only). Adds one 10 ms frame of delay, which
+    /// the frames' spans account for.
+    #[serde(default)]
+    pub denoise: bool,
 }
 
 /// Streaming AM demodulator. State carries across blocks; the filters are
@@ -258,11 +263,19 @@ impl Stage for AmDemodStage {
             // No gate this run: clear one an earlier run (before a `graph_put`) latched.
             ctx.note(serde_json::json!({ "squelch": null }));
         }
+        let mut denoiser = p
+            .denoise
+            .then(|| Denoiser::new(p.audio_rate_hz, 1))
+            .transpose()
+            .map_err(StageError::Failed)?;
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {
                     demod = AmDemod::new(&p).map_err(StageError::Failed)?;
+                    if let Some(d) = denoiser.as_mut() {
+                        *d = Denoiser::new(p.audio_rate_hz, 1).map_err(StageError::Failed)?;
+                    }
                     return Ok(Vec::new());
                 }
             };
@@ -290,9 +303,14 @@ impl Stage for AmDemodStage {
                     return Ok(published);
                 }
             }
-            let samples = demod
+            let mut samples = demod
                 .process(&block.samples, rate)
                 .map_err(StageError::Failed)?;
+            if let Some(d) = denoiser.as_mut() {
+                let (s, span) = denoised(d, &samples, block.t0, p.audio_rate_hz);
+                samples = s;
+                prov.span = span;
+            }
             if !samples.is_empty() {
                 published.push(Frame::new(
                     out.clone(),
@@ -328,6 +346,10 @@ pub struct SsbParams {
     pub audio_rate_hz: u64,
     /// Audio bandwidth, Hz (500..=6000).
     pub audio_bandwidth_hz: u64,
+    /// RNNoise on the audio output (speech only). Adds one 10 ms frame of delay, which
+    /// the frames' spans account for.
+    #[serde(default)]
+    pub denoise: bool,
 }
 
 /// Per-input-rate state of [`SsbDemod`].
@@ -475,11 +497,19 @@ impl Stage for SsbDemodStage {
         let Some(out) = outputs.first().cloned() else {
             return Err(StageError::Failed("expected 1 output".into()));
         };
+        let mut denoiser = p
+            .denoise
+            .then(|| Denoiser::new(p.audio_rate_hz, 1))
+            .transpose()
+            .map_err(StageError::Failed)?;
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {
                     demod = SsbDemod::new(&p).map_err(StageError::Failed)?;
+                    if let Some(d) = denoiser.as_mut() {
+                        *d = Denoiser::new(p.audio_rate_hz, 1).map_err(StageError::Failed)?;
+                    }
                     return Ok(Vec::new());
                 }
             };
@@ -489,14 +519,19 @@ impl Stage for SsbDemodStage {
                 ));
             };
             let rate = block.sample_rate_hz.0;
-            let samples = demod
+            let mut samples = demod
                 .process(&block.samples, rate)
                 .map_err(StageError::Failed)?;
+            let mut prov = frame.provenance.clone();
+            prov.span = frame_span(block.t0, block.samples.len(), rate);
+            if let Some(d) = denoiser.as_mut() {
+                let (s, span) = denoised(d, &samples, block.t0, p.audio_rate_hz);
+                samples = s;
+                prov.span = span;
+            }
             if samples.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut prov = frame.provenance.clone();
-            prov.span = frame_span(block.t0, block.samples.len(), rate);
             Ok(vec![Frame::new(
                 out.clone(),
                 prov,

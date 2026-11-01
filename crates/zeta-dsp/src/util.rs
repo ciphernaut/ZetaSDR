@@ -116,6 +116,11 @@ impl StreamingFir {
         Self { taps, history }
     }
 
+    /// Forget the history (back to zero), as at construction.
+    pub fn reset(&mut self) {
+        self.history.iter_mut().for_each(|v| *v = 0.0);
+    }
+
     /// Filter `x`, one output per input.
     pub fn process(&mut self, x: &[f32]) -> Vec<f32> {
         let h = self.history.len();

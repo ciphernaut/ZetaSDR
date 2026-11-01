@@ -835,3 +835,50 @@ async fn an_attached_job_whose_input_was_stopped_stays_stopped() {
     );
     assert_eq!(wait_not_running(&node, &id, 2000).await, JobState::Stopped);
 }
+
+/// A transcribe attached to a demodulator that denoises its own audio (`denoise: true`
+/// put on its `nbfm_demod` node) runs without a `denoise` stage of its own; the put keeps
+/// the input the node's to re-expand.
+#[tokio::test]
+async fn an_attached_transcribe_skips_denoise_when_its_input_denoises() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry_with_dsp(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let input = start_fm(&node).await;
+    let mut g = record(&node, &input).graph;
+    for n in g.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
+        n.params["denoise"] = true.into();
+    }
+    node.job_graph_put(&input, g).await.unwrap();
+    assert_running_for(&node, &input, 300).await;
+    assert!(
+        !record(&node, &input).operator_graph,
+        "a denoise toggle keeps the node's graph"
+    );
+    let t = attach_ok(&node, &input).await;
+    let kinds: Vec<String> = record(&node, &t)
+        .graph
+        .nodes
+        .iter()
+        .map(|n| n.kind.clone())
+        .collect();
+    assert_eq!(kinds, ["stream_in", "vad", "transcribe"]);
+    // Toggled off again, a fresh attach denoises for itself.
+    let mut g = record(&node, &input).graph;
+    for n in g.nodes.iter_mut().filter(|n| n.kind == "nbfm_demod") {
+        n.params["denoise"] = false.into();
+    }
+    node.job_graph_put(&input, g).await.unwrap();
+    assert_running_for(&node, &input, 300).await;
+    let t2 = attach_ok(&node, &input).await;
+    let kinds: Vec<String> = record(&node, &t2)
+        .graph
+        .nodes
+        .iter()
+        .map(|n| n.kind.clone())
+        .collect();
+    assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);
+}

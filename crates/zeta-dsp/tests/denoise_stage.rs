@@ -106,3 +106,26 @@ async fn channel_change_fails_with_both_counts() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test]
+async fn held_samples_date_the_next_frame_from_their_own_block() {
+    // 4 800 samples are ten whole frames; 100 more are held back; the 380 that complete
+    // the frame come out dated from the 100's block, not from their own.
+    let (tx, mut rx, _h) = spawn();
+    let x = speech_like(48_000, 0.2);
+    tx.send(audio(x[..4_800].to_vec(), 48_000, 1, 1_000_000_000))
+        .unwrap();
+    let f = rx.recv().await.unwrap();
+    assert_eq!(f.provenance.span.start_ns, Timestamp(1_000_000_000));
+    tx.send(audio(x[4_800..4_900].to_vec(), 48_000, 1, 1_100_000_000))
+        .unwrap();
+    tx.send(audio(x[4_900..5_280].to_vec(), 48_000, 1, 1_102_083_333))
+        .unwrap();
+    let f = rx.recv().await.unwrap();
+    let Payload::Audio { samples, .. } = &f.payload else {
+        panic!("expected audio")
+    };
+    assert_eq!(samples.len(), DENOISE_FRAME);
+    assert_eq!(f.provenance.span.start_ns, Timestamp(1_100_000_000));
+    assert_eq!(f.provenance.span.end_ns, Timestamp(1_110_000_000));
+}

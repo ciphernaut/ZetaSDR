@@ -28,6 +28,7 @@ fn am_demod_recovers_tone() {
         audio_rate_hz: 48_000,
         squelch_db: None,
         squelch: true,
+        denoise: false,
     })
     .unwrap();
     let mut out = Vec::new();
@@ -83,12 +84,14 @@ fn am_and_ssb_survive_a_nan_sample() {
         audio_rate_hz: 48_000,
         squelch_db: None,
         squelch: true,
+        denoise: false,
     })
     .unwrap();
     let mut ssb_d = SsbDemod::new(&SsbParams {
         sideband: Sideband::Usb,
         audio_rate_hz: 48_000,
         audio_bandwidth_hz: 2_700,
+        denoise: false,
     })
     .unwrap();
     type Run<'a> = Box<dyn FnMut(&[Complex<f32>]) -> Vec<f32> + 'a>;
@@ -195,4 +198,87 @@ async fn am_squelch_closes_on_noise_and_opens_on_a_carrier() {
     assert!(audio >= 9, "{audio} audio frames");
     let opens: Vec<_> = events.iter().map(|e| e["open"].clone()).collect();
     assert_eq!(opens, [false, true], "{events:?}");
+}
+
+/// The AM stage with `params`: its input sender and its audio receiver.
+fn spawn_am(params: serde_json::Value) -> (broadcast::Sender<Frame>, broadcast::Receiver<Frame>) {
+    let bus = Arc::new(StreamBus::new(8));
+    let prov = Provenance {
+        source: SourceId("s".into()),
+        job: None,
+        channel: None,
+        span: Span {
+            start_ns: Timestamp(0),
+            end_ns: Timestamp(1),
+        },
+    };
+    let out = bus.register(StreamKind::Audio, prov);
+    let rx_out = bus.subscribe(&out).unwrap();
+    let (tx, rx_in) = broadcast::channel(8);
+    tokio::spawn(async move {
+        AmDemodStage::new()
+            .run(
+                params,
+                vec![rx_in],
+                vec![out],
+                bus,
+                CancellationToken::new(),
+                zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
+            )
+            .await
+    });
+    (tx, rx_out)
+}
+
+fn am_iq(samples: &[f32]) -> Vec<Complex<f32>> {
+    samples
+        .iter()
+        .map(|&a| Complex::new(0.5 + 0.25 * a, 0.0))
+        .collect()
+}
+
+fn iq_at(samples: Vec<Complex<f32>>, t0: u64) -> Frame {
+    Frame::new(
+        StreamId::new(),
+        Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(1),
+            },
+        },
+        Payload::Iq(IqBlock {
+            t0: Timestamp(t0),
+            sample_rate_hz: Hz(48_000),
+            center_hz: Hz(1_000_000),
+            samples: samples.into(),
+        }),
+    )
+}
+
+#[tokio::test]
+async fn am_denoise_frames_the_audio_and_dates_held_samples_from_their_block() {
+    let (tx, mut rx) =
+        spawn_am(serde_json::json!({"audio_rate_hz": 48_000, "squelch": false, "denoise": true}));
+    let audio = tone(48_000, 4_800 + 100 + 380, 1_000.0, 1.0);
+    let iq = am_iq(&audio);
+    tx.send(iq_at(iq[..4_800].to_vec(), 1_000_000_000)).unwrap();
+    let f = rx.recv().await.unwrap();
+    let Payload::Audio { samples, .. } = &f.payload else {
+        panic!()
+    };
+    assert_eq!(samples.len(), 4_800);
+    assert_eq!(f.provenance.span.start_ns, Timestamp(1_000_000_000));
+    tx.send(iq_at(iq[4_800..4_900].to_vec(), 1_100_000_000))
+        .unwrap();
+    tx.send(iq_at(iq[4_900..].to_vec(), 1_102_083_333)).unwrap();
+    let f = rx.recv().await.unwrap();
+    let Payload::Audio { samples, .. } = &f.payload else {
+        panic!()
+    };
+    assert_eq!(samples.len(), 480);
+    assert_eq!(f.provenance.span.start_ns, Timestamp(1_100_000_000));
+    assert_eq!(f.provenance.span.end_ns, Timestamp(1_110_000_000));
 }

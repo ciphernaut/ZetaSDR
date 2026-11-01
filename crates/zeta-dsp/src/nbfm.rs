@@ -12,13 +12,15 @@ use tokio_util::sync::CancellationToken;
 use zeta_core::plans::GUARD_DB_DEFAULT;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::{Hz, StreamId, StreamKind};
+use zeta_core::types::{Hz, Span, StreamId, StreamKind, Timestamp};
 
+use crate::denoise::{Denoiser, denoised};
 use crate::resample::Resampler;
 use crate::squelch::{
     db, default_true, squelch_event, squelch_outputs, squelch_streams, stage_squelch,
 };
-use crate::util::lowpass_taps;
+use crate::util::{StreamingFir, lowpass_taps};
+use crate::wfm::deemphasis;
 use crate::{Input, frame_span, run_map};
 
 /// Taps of the adjacent-channel guard's channel filter (a Hann low-pass at
@@ -112,7 +114,94 @@ pub struct NbfmParams {
     /// demodulates that.
     #[serde(default)]
     pub channel_hz: Option<u64>,
+    /// Audio low-pass cutoff, Hz, applied after the resampler (`null`: flat, what a
+    /// decoder reading the discriminator wants; 3400 for voice).
+    #[serde(default)]
+    pub audio_lowpass_hz: Option<u64>,
+    /// De-emphasis time constant, µs, a one-pole roll-off of 6 dB per octave (`null`:
+    /// none; 530 for PMR voice).
+    #[serde(default)]
+    pub deemphasis_us: Option<u64>,
+    /// RNNoise on the audio output (speech only: a tone or a data burst comes out
+    /// mangled). Adds one 10 ms frame of delay, which the frames' spans account for.
+    #[serde(default)]
+    pub denoise: bool,
 }
+
+/// What shapes the audio after the resampler: de-emphasis, the low-pass and RNNoise,
+/// each as the params ask. Built for one audio rate.
+struct Voice {
+    rate_hz: u64,
+    deemphasis_us: Option<u64>,
+    deemph: f32,
+    lpf: Option<StreamingFir>,
+    denoiser: Option<Denoiser>,
+}
+
+impl Voice {
+    /// For `p` at its `audio_rate_hz`; `None` when the params ask for nothing.
+    fn new(p: &NbfmParams) -> Result<Option<Self>, String> {
+        if p.audio_lowpass_hz.is_none() && p.deemphasis_us.is_none() && !p.denoise {
+            return Ok(None);
+        }
+        let rate_hz = p.audio_rate_hz;
+        if let Some(c) = p.audio_lowpass_hz
+            && (c == 0 || c as f64 >= 0.5 * rate_hz as f64)
+        {
+            return Err(format!(
+                "nbfm_demod params: audio_lowpass_hz {c} must be 1..{} (under half the audio rate)",
+                rate_hz / 2
+            ));
+        }
+        if p.deemphasis_us == Some(0) {
+            return Err("nbfm_demod params: deemphasis_us must be >= 1".into());
+        }
+        let lpf = p
+            .audio_lowpass_hz
+            .map(|c| StreamingFir::new(lowpass_taps(c as f64, rate_hz as f64, VOICE_LPF_TAPS)));
+        let denoiser = p.denoise.then(|| Denoiser::new(rate_hz, 1)).transpose()?;
+        Ok(Some(Self {
+            rate_hz,
+            deemphasis_us: p.deemphasis_us,
+            deemph: 0.0,
+            lpf,
+            denoiser,
+        }))
+    }
+
+    /// Shape `x` (audio at the stage's rate, its first sample at `t0`), in order:
+    /// de-emphasis, low-pass, RNNoise; with the span the output covers (the denoiser's
+    /// held samples date it from their own block).
+    fn process(&mut self, mut x: Vec<f32>, t0: Timestamp) -> (Vec<f32>, Span) {
+        if let Some(tau) = self.deemphasis_us {
+            deemphasis(&mut x, self.rate_hz, tau, &mut self.deemph);
+        }
+        if let Some(f) = self.lpf.as_mut() {
+            x = f.process(&x);
+        }
+        match self.denoiser.as_mut() {
+            Some(d) => denoised(d, &x, t0, self.rate_hz),
+            None => {
+                let span = frame_span(t0, x.len(), self.rate_hz);
+                (x, span)
+            }
+        }
+    }
+
+    /// Forget the history: the audio before a gap is not shaped into what follows it.
+    fn reset(&mut self) {
+        self.deemph = 0.0;
+        if let Some(f) = self.lpf.as_mut() {
+            f.reset();
+        }
+        if let Some(d) = self.denoiser.as_mut() {
+            *d = Denoiser::new(self.rate_hz, 1).expect("rate checked at build");
+        }
+    }
+}
+
+/// Taps of the voice audio low-pass.
+const VOICE_LPF_TAPS: usize = 127;
 
 /// A streaming FIR filter without decimation: history carried across blocks.
 struct Fir {
@@ -356,6 +445,7 @@ impl Stage for NbfmDemodStage {
                 "nbfm_demod params: channel_hz must be >= 1".into(),
             ));
         }
+        let mut voice = Voice::new(&p).map_err(StageError::Failed)?;
         let (out, events) = squelch_streams(&outputs, squelch.is_some())?;
         if squelch.is_none() {
             // No gate this run: clear one an earlier run (before a `graph_put`) latched.
@@ -376,6 +466,9 @@ impl Stage for NbfmDemodStage {
                 Input::Lagged { .. } => {
                     prev = Complex::new(0.0, 0.0);
                     filter = AudioFilter::default();
+                    if let Some(v) = voice.as_mut() {
+                        v.reset();
+                    }
                     guard = None;
                     return Ok(Vec::new());
                 }
@@ -452,12 +545,20 @@ impl Stage for NbfmDemodStage {
                 if !std::mem::replace(&mut was_open, true) {
                     // Audio from before the close is not resampled into the reopening block.
                     filter = AudioFilter::default();
+                    if let Some(v) = voice.as_mut() {
+                        v.reset();
+                    }
                 }
             }
             let demod = nbfm_demod(iq, rate, p.deviation_hz, &mut prev);
-            let samples = filter
+            let mut samples = filter
                 .process(&demod, rate, p.audio_rate_hz)
                 .map_err(StageError::Failed)?;
+            if let Some(v) = voice.as_mut() {
+                let (s, span) = v.process(samples, block.t0);
+                samples = s;
+                prov.span = span;
+            }
             if !samples.is_empty() {
                 published.push(Frame::new(
                     out.clone(),
@@ -481,7 +582,7 @@ mod tests {
     use zeta_core::types::{Provenance, SourceId, Span, Timestamp};
 
     use super::*;
-    use crate::fixtures::{awgn, nbfm_modulate, tone};
+    use crate::fixtures::{awgn, awgn_real, burst_to_silence_db, nbfm_modulate, speech_like, tone};
 
     /// Frequency (Hz) of the largest DFT bin of `x` in `[1, len/2)` and the RMS of `x`.
     fn peak_and_rms(x: &[f32], rate_hz: f64) -> (f64, f64) {
@@ -682,6 +783,134 @@ mod tests {
         assert_eq!(samples.len(), 480);
         drop(tx);
         assert!(matches!(h.await.unwrap(), Ok(())));
+    }
+
+    /// RMS of the audio the stage with `params` gives for the third 0.1 s block of a
+    /// `freq_hz` tone at ±2.5 kHz deviation (the first two settle its filters).
+    async fn tone_rms(params: serde_json::Value, freq_hz: f64) -> f64 {
+        let (tx, mut rx_out, _h) = spawn(params);
+        let audio = tone(48_000, 3 * 4_800, freq_hz, 1.0);
+        let mut last = Vec::new();
+        for i in 0..3 {
+            let iq = nbfm_modulate(
+                &audio[i * 4_800..(i + 1) * 4_800],
+                48_000,
+                96_000,
+                2_500.0,
+                0.0,
+            );
+            tx.send(iq_frame_at(
+                iq,
+                96_000,
+                1_000_000_000 + i as u64 * 100_000_000,
+            ))
+            .unwrap();
+            let f = rx_out.recv().await.unwrap();
+            let Payload::Audio { samples, .. } = &f.payload else {
+                panic!()
+            };
+            last = samples.to_vec();
+        }
+        (last.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / last.len() as f64).sqrt()
+    }
+
+    #[tokio::test]
+    async fn audio_lowpass_passes_voice_and_cuts_a_tone_above_the_cutoff() {
+        let p = serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000, "audio_lowpass_hz": 3_400});
+        let voice = tone_rms(p.clone(), 1_000.0).await;
+        assert!((voice - 0.707).abs() < 0.07, "1 kHz rms {voice}");
+        let hiss = tone_rms(p, 5_000.0).await;
+        assert!(hiss < 0.05, "5 kHz rms {hiss}");
+        // Flat without it.
+        let flat = serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000});
+        let hiss = tone_rms(flat, 5_000.0).await;
+        assert!((hiss - 0.707).abs() < 0.07, "flat 5 kHz rms {hiss}");
+    }
+
+    #[tokio::test]
+    async fn deemphasis_rolls_the_audio_off_at_six_db_per_octave() {
+        // A one-pole with tau 530 us: |H| is 0.71 at 300 Hz and 0.10 at 3 kHz.
+        let p = serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000, "deemphasis_us": 530});
+        let low = tone_rms(p.clone(), 300.0).await;
+        let high = tone_rms(p, 3_000.0).await;
+        let ratio = high / low;
+        assert!(
+            (0.10..0.20).contains(&ratio),
+            "low {low} high {high} ratio {ratio}"
+        );
+    }
+
+    #[tokio::test]
+    async fn denoise_frames_the_audio_in_rnnoise_frames_and_quietens_hiss() {
+        // Speech-like bursts with hiss 10 dB under them, through the channel in 0.1 s
+        // blocks: RNNoise lifts the burst-to-silence ratio and frames the output.
+        let clean = speech_like(48_000, 6.0);
+        let mut noisy = clean.clone();
+        awgn_real(&mut noisy, 7.0, 7);
+        let iq = nbfm_modulate(&noisy, 48_000, 48_000, 2_500.0, 0.0);
+        let run = |denoise: bool| {
+            let iq = iq.clone();
+            async move {
+                let p = serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000, "squelch": false, "denoise": denoise});
+                let (tx, mut rx_out, _rx_ev, _h) = spawn_with(p, 128);
+                let mut out = Vec::new();
+                let mut lens = Vec::new();
+                for (i, block) in iq.chunks(4_800).enumerate() {
+                    tx.send(iq_frame_at(
+                        block.to_vec(),
+                        48_000,
+                        1_000_000_000 + i as u64 * 100_000_000,
+                    ))
+                    .unwrap();
+                }
+                drop(tx);
+                while let Ok(f) = rx_out.recv().await {
+                    let Payload::Audio { samples, .. } = &f.payload else {
+                        panic!()
+                    };
+                    lens.push(samples.len());
+                    out.extend_from_slice(samples);
+                }
+                (out, lens)
+            }
+        };
+        let (flat, _) = run(false).await;
+        let (clean_out, lens) = run(true).await;
+        assert!(lens.iter().all(|n| n % 480 == 0), "{lens:?}");
+        let (before, after) = (burst_to_silence_db(&flat), burst_to_silence_db(&clean_out));
+        assert!(
+            after - before >= 6.0,
+            "burst/silence {before:.1} dB -> {after:.1} dB"
+        );
+    }
+
+    #[tokio::test]
+    async fn denoised_frames_keep_the_time_of_their_first_sample() {
+        // 4 800 samples make ten whole RNNoise frames; then 100 samples are held back and
+        // the 380 that complete the frame carry the earlier block's start time.
+        let p = serde_json::json!({"deviation_hz": 2_500, "audio_rate_hz": 48_000, "squelch": false, "denoise": true});
+        let (tx, mut rx_out, _h) = spawn(p);
+        let audio = tone(48_000, 4_800 + 100 + 380, 1_000.0, 0.5);
+        let iq = nbfm_modulate(&audio, 48_000, 48_000, 2_500.0, 0.0);
+        tx.send(iq_frame_at(iq[..4_800].to_vec(), 48_000, 1_000_000_000))
+            .unwrap();
+        let f = rx_out.recv().await.unwrap();
+        assert_eq!(f.provenance.span.start_ns, Timestamp(1_000_000_000));
+        tx.send(iq_frame_at(
+            iq[4_800..4_900].to_vec(),
+            48_000,
+            1_100_000_000,
+        ))
+        .unwrap();
+        tx.send(iq_frame_at(iq[4_900..].to_vec(), 48_000, 1_102_083_333))
+            .unwrap();
+        let f = rx_out.recv().await.unwrap();
+        let Payload::Audio { samples, .. } = &f.payload else {
+            panic!()
+        };
+        assert_eq!(samples.len(), 480);
+        assert_eq!(f.provenance.span.start_ns, Timestamp(1_100_000_000));
+        assert_eq!(f.provenance.span.end_ns, Timestamp(1_110_000_000));
     }
 
     #[tokio::test]

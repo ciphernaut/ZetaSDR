@@ -128,7 +128,14 @@ async fn fm_demod_job_produces_audio_with_tone() {
     let (peak, rms) = peak_and_rms(&samples[samples.len() - 4_800..], RATE as f64);
     eprintln!("fm_demod end to end: peak {peak} Hz, rms {rms:.4}");
     assert_eq!(peak, 1_000.0);
-    assert!((rms - 0.707).abs() <= 0.0707, "rms {rms}");
+    // Full deviation is 0.707 RMS at the discriminator; fm_demod's 530 us de-emphasis (a
+    // one-pole) passes a 1 kHz tone at 1 / sqrt(1 + (2 pi f tau)^2).
+    let tau = zeta_core::ops::FM_DEEMPHASIS_US as f64 * 1e-6;
+    let expect = 0.707 / (1.0 + (2.0 * std::f64::consts::PI * 1_000.0 * tau).powi(2)).sqrt();
+    assert!(
+        (rms - expect).abs() <= 0.1 * expect,
+        "rms {rms}, expected {expect:.3}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
