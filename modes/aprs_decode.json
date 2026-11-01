@@ -75,5 +75,24 @@
     "echo": {"delay_us": 100, "gain_db": -6},
     "expect": {"protocol": "aprs", "src": "VK3ABC", "fcs_ok": true},
     "within_ms": 5000
+  },
+  "subject": {
+    "key": "src",
+    "name": "stations",
+    "waterfall": "summary",
+    "columns": [
+      {
+        "field": "dst",
+        "label": "Destination",
+        "unit": null
+      },
+      {
+        "field": "info",
+        "label": "Info",
+        "unit": null
+      }
+    ],
+    "heading": null,
+    "label": null
   }
 }

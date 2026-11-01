@@ -20,10 +20,10 @@ use serde::{Deserialize, Serialize};
 use crate::stage::StageRegistry;
 
 pub use row::{
-    Band, Container, Decoder, DecoderKind, Demod, Event, Family, Identify, InputStream, InputVia,
-    Install, ModeId, ModeRow, OutputVia, Parser, PositionMap, ProgramBlock, ProgramInput,
-    ProgramOutput, Proof, QUICK_ATTEMPTS, RowError, RowTest, SampleFormat, TestSpec, is_mode_id,
-    parse, validate,
+    AltUnit, Band, Container, Decoder, DecoderKind, Demod, Event, Family, Identify, InputStream,
+    InputVia, Install, ModeId, ModeRow, OutputVia, Parser, PositionMap, ProgramBlock, ProgramInput,
+    ProgramOutput, Proof, QUICK_ATTEMPTS, RowError, RowTest, SampleFormat, Subject, SubjectColumn,
+    SubjectUnit, SubjectWaterfall, TestSpec, is_mode_id, parse, validate,
 };
 
 /// Where a loaded row stands: `ready` (parsed, validated and, for a program row, its
@@ -364,6 +364,7 @@ fn placeholder(id: &str) -> ModeRow {
         notes: None,
         position: None,
         time: None,
+        subject: None,
     }
 }
 

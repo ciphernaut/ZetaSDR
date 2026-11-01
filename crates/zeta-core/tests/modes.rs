@@ -5,7 +5,8 @@ use std::path::Path;
 
 use zeta_core::graph::NodeId;
 use zeta_core::modes::{
-    Container, Decoder, Family, InputStream, ModeRegistry, ModeState, parse, template, validate,
+    Container, Decoder, Family, InputStream, ModeRegistry, ModeState, SubjectWaterfall, parse,
+    template, validate,
 };
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpError, OpResult};
@@ -378,4 +379,136 @@ fn the_rs41_row_is_an_audio_program_row() {
         assert_eq!(block.input.stream, InputStream::Audio);
         assert_eq!(m.row.identify.priority, 0);
     }
+}
+
+#[tokio::test]
+async fn modes_list_and_show_carry_the_subject() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let Ok(OpResult::Modes { modes }) = node
+        .apply(Op::ModesList {
+            family: None,
+            state: None,
+        })
+        .await
+    else {
+        panic!("expected modes");
+    };
+    let info =
+        |id: &str| serde_json::to_value(modes.iter().find(|m| m.id.0 == id).unwrap()).unwrap();
+    assert_eq!(info("adsb_decode")["subject"]["key"], "icao");
+    assert_eq!(info("adsb_decode")["subject"]["waterfall"], "summary");
+    assert_eq!(info("pocsag_decode")["subject"], serde_json::Value::Null);
+    let Ok(OpResult::Mode { mode }) = node
+        .apply(Op::ModesShow {
+            id: "adsb_decode".into(),
+        })
+        .await
+    else {
+        panic!("expected mode");
+    };
+    let v = serde_json::to_value(&mode).unwrap();
+    assert_eq!(v["row"]["subject"]["columns"].as_array().unwrap().len(), 4);
+    assert_eq!(v["row"]["position"]["alt_unit"], "ft");
+}
+
+#[test]
+fn the_rows_name_the_planned_subjects() {
+    type Plan = (
+        &'static str,
+        &'static str,
+        &'static str,
+        SubjectWaterfall,
+        &'static [&'static str],
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+    use SubjectWaterfall::{Fold, Summary};
+    let sondes: &[&str] = &["alt", "vel_v"];
+    let plan: [Plan; 7] = [
+        (
+            "adsb_decode",
+            "icao",
+            "aircraft",
+            Summary,
+            &["callsign", "altitude_ft", "ground_speed_kt", "track_deg"],
+            Some("track_deg"),
+            Some("callsign"),
+        ),
+        (
+            "rs41_decode",
+            "id",
+            "sondes",
+            Fold,
+            sondes,
+            Some("heading"),
+            None,
+        ),
+        (
+            "dfm_decode",
+            "id",
+            "sondes",
+            Fold,
+            sondes,
+            Some("heading"),
+            None,
+        ),
+        (
+            "m20_decode",
+            "id",
+            "sondes",
+            Fold,
+            sondes,
+            Some("heading"),
+            None,
+        ),
+        (
+            "aprs_decode",
+            "src",
+            "stations",
+            Summary,
+            &["dst", "info"],
+            None,
+            None,
+        ),
+        (
+            "acars_decode",
+            "reg",
+            "aircraft",
+            Summary,
+            &["flight", "label", "text"],
+            None,
+            Some("flight"),
+        ),
+        ("rds_decode", "pi", "stations", Fold, &[], None, Some("ps")),
+    ];
+    let reg = ModeRegistry::load(&stages(), None);
+    for (id, key, name, waterfall, columns, heading, label) in plan {
+        let sub = reg
+            .all()
+            .iter()
+            .find(|m| m.row.id.0 == id)
+            .unwrap()
+            .row
+            .subject
+            .clone()
+            .unwrap_or_else(|| panic!("{id}: no subject"));
+        assert_eq!(sub.key, key, "{id}");
+        assert_eq!(sub.name, name, "{id}");
+        assert_eq!(sub.waterfall, waterfall, "{id}");
+        let fields: Vec<&str> = sub.columns.iter().map(|c| c.field.as_str()).collect();
+        assert_eq!(fields, columns, "{id}");
+        assert_eq!(sub.heading.as_deref(), heading, "{id}");
+        assert_eq!(sub.label.as_deref(), label, "{id}");
+    }
+    let pocsag = reg
+        .all()
+        .iter()
+        .find(|m| m.row.id.0 == "pocsag_decode")
+        .unwrap();
+    assert_eq!(pocsag.row.subject, None);
 }

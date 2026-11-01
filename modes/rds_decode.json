@@ -63,5 +63,13 @@
     "rt": "HELLO FROM ZETASDR",
     "expect": {"pi": "2AB1"},
     "within_ms": 10000
+  },
+  "subject": {
+    "key": "pi",
+    "name": "stations",
+    "waterfall": "fold",
+    "columns": [],
+    "heading": null,
+    "label": "ps"
   }
 }

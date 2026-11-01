@@ -17,7 +17,7 @@ use crate::knowledge::{Allocation, Signature};
 use crate::lease::LeaseError;
 use crate::modes::{
     Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow, ModeState,
-    is_mode_id, template,
+    Subject, is_mode_id, template,
 };
 use crate::node::{AfterGate, Node, NodeError};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
@@ -1801,6 +1801,11 @@ pub struct ModeInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub checked: Option<u64>,
+    /// What the mode's events are about, its table columns and how the page folds it;
+    /// `null` for a mode with none.
+    #[schemars(required, schema_with = "crate::types::nullable::<Subject>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub subject: Option<Subject>,
 }
 
 impl From<&LoadedMode> for ModeInfo {
@@ -1817,6 +1822,7 @@ impl From<&LoadedMode> for ModeInfo {
             file: m.file.clone(),
             program: m.program.as_ref().map(|p| p.display().to_string()),
             checked: m.checked,
+            subject: m.row.subject.clone(),
         }
     }
 }

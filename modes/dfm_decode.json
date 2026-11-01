@@ -52,5 +52,24 @@
     "graw-dfm-17-radiosonde"
   ],
   "test": null,
-  "notes": "Graw DFM-06/09/17 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. dfm09mod 1.8.1 (sonde-decoders) takes --json and --ecc (Hamming ECC on the frames, wanted); it has no --crc (an unknown option is read as the input file, error: open), and no --dist/--auto, so the id comes from the frames as decoded."
+  "notes": "Graw DFM-06/09/17 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. dfm09mod 1.8.1 (sonde-decoders) takes --json and --ecc (Hamming ECC on the frames, wanted); it has no --crc (an unknown option is read as the input file, error: open), and no --dist/--auto, so the id comes from the frames as decoded.",
+  "subject": {
+    "key": "id",
+    "name": "sondes",
+    "waterfall": "fold",
+    "columns": [
+      {
+        "field": "alt",
+        "label": "Altitude",
+        "unit": "m"
+      },
+      {
+        "field": "vel_v",
+        "label": "Vertical speed",
+        "unit": "m_s"
+      }
+    ],
+    "heading": "heading",
+    "label": null
+  }
 }

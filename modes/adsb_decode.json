@@ -59,5 +59,35 @@
     "repeats": 20,
     "expect": {"icao": "7C6B28"},
     "within_ms": 5000
+  },
+  "position": {"lat": "lat", "lon": "lon", "alt_m": "altitude_ft", "alt_unit": "ft"},
+  "subject": {
+    "key": "icao",
+    "name": "aircraft",
+    "waterfall": "summary",
+    "columns": [
+      {
+        "field": "callsign",
+        "label": "Callsign",
+        "unit": null
+      },
+      {
+        "field": "altitude_ft",
+        "label": "Altitude",
+        "unit": "ft"
+      },
+      {
+        "field": "ground_speed_kt",
+        "label": "Speed",
+        "unit": "kt"
+      },
+      {
+        "field": "track_deg",
+        "label": "Track",
+        "unit": "deg"
+      }
+    ],
+    "heading": "track_deg",
+    "label": "callsign"
   }
 }

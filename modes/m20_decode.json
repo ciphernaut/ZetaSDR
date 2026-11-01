@@ -47,5 +47,24 @@
   },
   "catalogue": ["m20-radiosonde"],
   "test": null,
-  "notes": "Meteomodem M20 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. m20mod 1.8.1 (sonde-decoders) takes --json only: it has no --ecc or --crc (an unknown option is read as the input file, error: open)."
+  "notes": "Meteomodem M20 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. m20mod 1.8.1 (sonde-decoders) takes --json only: it has no --ecc or --crc (an unknown option is read as the input file, error: open).",
+  "subject": {
+    "key": "id",
+    "name": "sondes",
+    "waterfall": "fold",
+    "columns": [
+      {
+        "field": "alt",
+        "label": "Altitude",
+        "unit": "m"
+      },
+      {
+        "field": "vel_v",
+        "label": "Vertical speed",
+        "unit": "m_s"
+      }
+    ],
+    "heading": "heading",
+    "label": null
+  }
 }

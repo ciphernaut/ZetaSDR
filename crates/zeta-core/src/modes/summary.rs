@@ -4,7 +4,10 @@
 
 use serde_json::Value;
 
-use super::ModeRow;
+use super::{AltUnit, ModeRow};
+
+/// Metres in a foot.
+const FT_M: f64 = 0.3048;
 
 /// What a template drops with an absent optional field: the separator run just before it.
 fn is_separator(c: char) -> bool {
@@ -106,7 +109,8 @@ pub fn fill(template: &str, event: &Value) -> String {
 /// and `t_ns` set; every field is kept. `t_ns` is the time in the row's `time` field
 /// when the event carries a well-formed one, else `start_ns`. With a row `position`
 /// map and its `lat` and `lon` fields both numbers, `position` is
-/// `{lat, lon, alt_m}` (`alt_m` `null` unless its field is a number).
+/// `{lat, lon, alt_m}` (`alt_m` `null` unless its field is a number, converted from feet
+/// when the map's `alt_unit` is `ft`).
 pub fn envelope(row: &ModeRow, start_ns: u64, mut fields: Value) -> Value {
     let summary = fill(&row.event.summary, &fields);
     let t_ns = row
@@ -118,7 +122,15 @@ pub fn envelope(row: &ModeRow, start_ns: u64, mut fields: Value) -> Value {
         .unwrap_or(start_ns);
     let number = |name: &str| fields.get(name).filter(|v| v.is_number()).cloned();
     let position = row.position.as_ref().and_then(|p| {
-        let alt_m = p.alt_m.as_deref().and_then(number).unwrap_or(Value::Null);
+        let alt_m = p
+            .alt_m
+            .as_deref()
+            .and_then(number)
+            .map(|a| match (p.alt_unit, a.as_f64()) {
+                (AltUnit::Ft, Some(ft)) => Value::from(ft * FT_M),
+                _ => a,
+            })
+            .unwrap_or(Value::Null);
         Some(serde_json::json!({
             "lat": number(&p.lat)?,
             "lon": number(&p.lon)?,
@@ -281,6 +293,37 @@ mod tests {
     }
 
     #[test]
+    fn alt_unit_ft_converts_in_position() {
+        let ev = envelope(
+            &row(|_| {}),
+            7,
+            json!({"icao": "7C6B28", "lat": -27.4, "lon": 153.1, "altitude_ft": 21000}),
+        );
+        let alt = ev["position"]["alt_m"].as_f64().unwrap();
+        assert!((alt - 6400.8).abs() < 0.001, "{alt}");
+        assert_eq!(ev["position"]["lat"], -27.4);
+        assert_eq!(ev["position"]["lon"], 153.1);
+        assert_eq!(ev["altitude_ft"], 21000, "the event keeps its own unit");
+    }
+
+    #[test]
+    fn a_fix_with_no_altitude_is_a_partial_position() {
+        let ev = envelope(
+            &row(|_| {}),
+            7,
+            json!({"icao": "S1", "lat": -27.4, "lon": 153.1, "altitude_ft": null}),
+        );
+        assert_eq!(ev["position"]["alt_m"], Value::Null);
+        assert_eq!(ev["position"]["lat"], -27.4);
+        let ev = envelope(
+            &row(|_| {}),
+            7,
+            json!({"icao": "S1", "lat": null, "lon": 153.1, "altitude_ft": 100}),
+        );
+        assert!(ev.get("position").is_none(), "{ev}");
+    }
+
+    #[test]
     fn position_added_from_the_map() {
         let ev = envelope(
             &positioned(),
@@ -293,7 +336,11 @@ mod tests {
         );
         assert_eq!(ev["lat"], -27.4, "the fields are kept");
         // A row without a map adds nothing.
-        let ev = envelope(&row(|_| {}), 7, json!({"lat": -27.4, "lon": 153.1}));
+        let ev = envelope(
+            &row(|v| v["position"] = Value::Null),
+            7,
+            json!({"lat": -27.4, "lon": 153.1}),
+        );
         assert!(ev.get("position").is_none(), "{ev}");
     }
 

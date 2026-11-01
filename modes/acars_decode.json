@@ -65,5 +65,29 @@
     "text": "#M1BPOS/ZETASDR TEST",
     "expect": {"reg": "VH-ZET", "label": "H1"},
     "within_ms": 5000
+  },
+  "subject": {
+    "key": "reg",
+    "name": "aircraft",
+    "waterfall": "summary",
+    "columns": [
+      {
+        "field": "flight",
+        "label": "Flight",
+        "unit": null
+      },
+      {
+        "field": "label",
+        "label": "Label",
+        "unit": null
+      },
+      {
+        "field": "text",
+        "label": "Text",
+        "unit": null
+      }
+    ],
+    "heading": null,
+    "label": "flight"
   }
 }

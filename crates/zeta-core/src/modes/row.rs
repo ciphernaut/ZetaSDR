@@ -77,9 +77,94 @@ pub struct ModeRow {
     /// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) that becomes `t_ns`; `null` for none.
     #[serde(default)]
     pub time: Option<String>,
+    /// What the mode's events are about (the aircraft, the sonde, the station), how the
+    /// page tabulates and folds them; `null` keeps one ribbon per event.
+    #[serde(default)]
+    pub subject: Option<Subject>,
 }
 
-/// Which event fields hold a fix: latitude and longitude in degrees, altitude in metres.
+/// What a mode's events are about: the event field naming it, the table columns the
+/// page shows per subject and how the waterfall draws it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeSubject", transform = require_all)]
+pub struct Subject {
+    /// The event field that names the subject (`icao`, `id`, `src`); events with it null
+    /// or blank are about no subject.
+    pub key: String,
+    /// The plural noun for the subjects ("aircraft", "sondes").
+    pub name: String,
+    /// How the waterfall draws the subjects: one summary line, or each folded to a line.
+    pub waterfall: SubjectWaterfall,
+    /// The table columns, in order.
+    pub columns: Vec<SubjectColumn>,
+    /// The event field holding the subject's heading in degrees; `null` for none.
+    #[serde(default)]
+    pub heading: Option<String>,
+    /// The event field the subject is called by (a callsign); `null` for its key.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// How the waterfall draws a mode's subjects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "SubjectWaterfall")]
+pub enum SubjectWaterfall {
+    /// One line for the job: the protocol, the count and the last label.
+    Summary,
+    /// One line per subject.
+    Fold,
+}
+
+/// One column of a subject table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "SubjectColumn", transform = require_all)]
+pub struct SubjectColumn {
+    /// The event field shown.
+    pub field: String,
+    /// The column heading.
+    pub label: String,
+    /// The unit the field is in, so the page can show it as the operator reads it;
+    /// `null` for text or a bare number.
+    #[serde(default)]
+    pub unit: Option<SubjectUnit>,
+}
+
+/// The unit of a subject column's field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "SubjectUnit")]
+pub enum SubjectUnit {
+    #[serde(rename = "ft")]
+    Ft,
+    #[serde(rename = "m")]
+    M,
+    #[serde(rename = "kt")]
+    Kt,
+    #[serde(rename = "km_h")]
+    KmH,
+    #[serde(rename = "m_s")]
+    MS,
+    #[serde(rename = "deg")]
+    Deg,
+}
+
+/// The unit of a position map's altitude field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "AltUnit")]
+pub enum AltUnit {
+    /// Metres.
+    #[default]
+    #[serde(rename = "m")]
+    M,
+    /// Feet; `position.alt_m` is converted.
+    #[serde(rename = "ft")]
+    Ft,
+}
+
+/// Which event fields hold a fix: latitude and longitude in degrees, altitude in metres
+/// (or in feet, by `alt_unit`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields, rename = "ModePosition", transform = require_all)]
@@ -89,6 +174,9 @@ pub struct PositionMap {
     /// `null` for a mode whose events carry no altitude.
     #[serde(default)]
     pub alt_m: Option<String>,
+    /// The unit of the `alt_m` field (`m` when left out); `position.alt_m` is metres.
+    #[serde(default)]
+    pub alt_unit: AltUnit,
 }
 
 /// The channel a mode's decoder expects.
@@ -415,6 +503,11 @@ const UNIT_SUFFIXES: [&str; 4] = ["_hz", "_ms", "_ns", "_baud"];
 pub fn parse(text: &str) -> Result<ModeRow, RowError> {
     serde_json::from_str(text).map_err(|e| {
         let msg = e.to_string();
+        if msg.contains("unknown variant")
+            && let Some(field) = bad_word_field(text)
+        {
+            return RowError::new(field, msg);
+        }
         let named = ["unknown field `", "missing field `"]
             .iter()
             .find_map(|p| msg.split_once(p))
@@ -422,6 +515,34 @@ pub fn parse(text: &str) -> Result<ModeRow, RowError> {
             .map(|(name, _)| name.to_string());
         RowError::new(named.unwrap_or_else(|| "row".into()), msg)
     })
+}
+
+/// The field whose value is not one of its allowed words (`subject.waterfall`,
+/// `subject.columns[<i>].unit`, `position.alt_unit`), read from the row's JSON.
+fn bad_word_field(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let word = |x: &serde_json::Value, ok: &[&str]| x.as_str().is_none_or(|w| !ok.contains(&w));
+    if let Some(a) = v.pointer("/position/alt_unit")
+        && word(a, &["m", "ft"])
+    {
+        return Some("position.alt_unit".into());
+    }
+    let subject = v.get("subject")?;
+    if let Some(w) = subject.get("waterfall")
+        && word(w, &["summary", "fold"])
+    {
+        return Some("subject.waterfall".into());
+    }
+    let units = ["ft", "m", "kt", "km_h", "m_s", "deg"];
+    for (i, c) in subject.get("columns")?.as_array()?.iter().enumerate() {
+        if let Some(u) = c.get("unit")
+            && !u.is_null()
+            && word(u, &units)
+        {
+            return Some(format!("subject.columns[{i}].unit"));
+        }
+    }
+    None
 }
 
 /// Check what serde cannot: the id's spelling, unit-suffixed fields holding integers,
@@ -484,6 +605,20 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
         named.extend(p.alt_m.clone().map(|a| ("position.alt_m".into(), a)));
     }
     named.extend(row.time.clone().map(|t| ("time".into(), t)));
+    if let Some(sub) = &row.subject {
+        if sub.key.is_empty() {
+            return Err(RowError::new("subject.key", "must not be empty"));
+        }
+        if sub.name.is_empty() {
+            return Err(RowError::new("subject.name", "must not be empty"));
+        }
+        named.push(("subject.key".into(), sub.key.clone()));
+        for (i, c) in sub.columns.iter().enumerate() {
+            named.push((format!("subject.columns[{i}].field"), c.field.clone()));
+        }
+        named.extend(sub.heading.clone().map(|h| ("subject.heading".into(), h)));
+        named.extend(sub.label.clone().map(|l| ("subject.label".into(), l)));
+    }
     for (field, name) in named {
         if !properties.contains_key(&name) {
             let mut known: Vec<&str> = properties.keys().map(String::as_str).collect();
@@ -926,7 +1061,8 @@ mod tests {
             Some(PositionMap {
                 lat: "lat".into(),
                 lon: "lon".into(),
-                alt_m: None
+                alt_m: None,
+                alt_unit: AltUnit::M,
             })
         );
         for (position, field) in [
@@ -952,6 +1088,84 @@ mod tests {
         assert_eq!(validate(&row, &no_stages()).unwrap_err().field, "time");
         let text = edited(ADSB, |v| v["position"] = serde_json::json!({"lat": "lat"}));
         assert_eq!(parse(&text).unwrap_err().field, "lon");
+    }
+
+    #[test]
+    fn subject_round_trips() {
+        let row = parse(ADSB).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        let sub = row.subject.clone().unwrap();
+        assert_eq!(sub.key, "icao");
+        assert_eq!(sub.columns[1].unit, Some(SubjectUnit::Ft));
+        let again = parse(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(again, row);
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["subject"]["columns"][1]["unit"], "ft");
+        assert_eq!(v["position"]["alt_unit"], "ft");
+        assert_eq!(serde_json::to_value(SubjectUnit::KmH).unwrap(), "km_h");
+        assert_eq!(serde_json::to_value(SubjectUnit::MS).unwrap(), "m_s");
+    }
+
+    #[test]
+    fn a_row_without_subject_loads_as_null() {
+        let text = edited(ADSB, |v| {
+            v.as_object_mut().unwrap().remove("subject");
+            v["position"].as_object_mut().unwrap().remove("alt_unit");
+        });
+        let row = parse(&text).unwrap();
+        assert_eq!(row.subject, None);
+        assert_eq!(row.position.unwrap().alt_unit, AltUnit::M);
+    }
+
+    #[test]
+    fn a_bad_waterfall_is_broken_naming_the_field() {
+        let text = edited(ADSB, |v| v["subject"]["waterfall"] = "sideways".into());
+        assert_eq!(parse(&text).unwrap_err().field, "subject.waterfall");
+    }
+
+    #[test]
+    fn an_unknown_unit_is_broken_naming_the_field() {
+        let text = edited(ADSB, |v| {
+            v["subject"]["columns"][1]["unit"] = "furlong".into()
+        });
+        assert_eq!(parse(&text).unwrap_err().field, "subject.columns[1].unit");
+    }
+
+    #[test]
+    fn a_bad_alt_unit_is_broken_naming_the_field() {
+        let text = edited(ADSB, |v| v["position"]["alt_unit"] = "cubits".into());
+        assert_eq!(parse(&text).unwrap_err().field, "position.alt_unit");
+    }
+
+    #[test]
+    fn an_empty_key_or_name_is_broken() {
+        for field in ["key", "name"] {
+            let text = edited(ADSB, |v| v["subject"][field] = "".into());
+            let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+            assert_eq!(e.field, format!("subject.{field}"), "{e}");
+        }
+    }
+
+    #[test]
+    fn subject_names_schema_fields() {
+        let cases = [
+            ("subject.key", "/subject/key"),
+            ("subject.columns[0].field", "/subject/columns/0/field"),
+            ("subject.heading", "/subject/heading"),
+            ("subject.label", "/subject/label"),
+        ];
+        for (field, pointer) in cases {
+            let text = edited(ADSB, |v| *v.pointer_mut(pointer).unwrap() = "nope".into());
+            let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+            assert_eq!(e.field, field, "{e}");
+            assert!(e.error.contains("which the event schema lacks"), "{e}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_subject_field_is_rejected() {
+        let text = edited(ADSB, |v| v["subject"]["extra"] = 1.into());
+        assert_eq!(parse(&text).unwrap_err().field, "extra");
     }
 
     #[test]
