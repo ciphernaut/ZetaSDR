@@ -2257,9 +2257,11 @@ fn leased_band(node: &Node, port: &dyn Port, id: &JobId) -> Option<Tuning> {
     port.current().or_else(|| holders.first().map(|(_, t)| *t))
 }
 
-/// `job_start` expands against the pre-tune rate, but another job can lease
-/// the source between that tune and this job's lease, so the lease may share a
-/// capture at another rate. Re-expand against the leased rate and relaunch the
+/// `job_start` expands against the pre-tune rate and leases under the same
+/// hold of the source's gate as the tune, so no other job can lease in between;
+/// this stays as a defensive check for a port whose `current()` moves outside
+/// the gate (a fault recovery retuning it), when the lease may share a capture
+/// at another rate. Re-expand against the leased rate and relaunch the
 /// job under the same id (`job_graph_put`), once; if the rate moves again the
 /// job is stopped and the start is a `Conflict`. Kinds without a `channel`
 /// node do not depend on the rate and are left alone.
@@ -2539,26 +2541,21 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             // between. The gate is taken always: the duplicate check below must not
             // race a start of the same job.
             let guard = Some(node.gate_guard(&source).await);
-            if let Err(e) = replace_under(node, &source, &replace, guard.as_ref()).await {
-                drop(guard);
-                idle_after_replace(node, port.as_ref(), &replace, &e).await;
-                return Err(node_error(node, e));
-            }
-            // An identical rigid job already runs (after `replace` stopped what it
-            // named): refuse, naming it, before anything is tuned.
+            // An identical rigid job already runs: refuse, naming it, before anything
+            // is stopped or tuned, so a `replace` on a refused start stops nothing. A
+            // match that `replace` names is about to stop, so it is no duplicate.
             if !elastic
-                && let Some(job) = node.duplicate_of(
-                    &source,
-                    kind.name(),
-                    tuning,
-                    deviation.map(|d| d.0),
-                    sideband,
-                )
+                && let Some(job) = node
+                    .duplicate_of(
+                        &source,
+                        kind.name(),
+                        tuning,
+                        deviation.map(|d| d.0),
+                        sideband,
+                    )
+                    .filter(|j| !replace.contains(j))
             {
                 drop(guard);
-                if !replace.is_empty() {
-                    node.idle_if_unheld(port.as_ref()).await;
-                }
                 return Err(OpError::Duplicate {
                     message: format!(
                         "an identical {} already runs on {} at {}/{} Hz as job {}",
@@ -2570,6 +2567,11 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                     ),
                     job,
                 });
+            }
+            if let Err(e) = replace_under(node, &source, &replace, guard.as_ref()).await {
+                drop(guard);
+                idle_after_replace(node, port.as_ref(), &replace, &e).await;
+                return Err(node_error(node, e));
             }
             // The granted capture band: its width is the source rate (Port contract).
             // An elastic job never tunes here: it joins the current capture (or tunes
@@ -3033,7 +3035,7 @@ async fn plan_start(
                 }),
             }
         }
-        node.release_hold(&hold);
+        drop(hold);
         drop(guard);
         node.after_gate(after).await;
         if started.is_empty() && !replace.is_empty() {

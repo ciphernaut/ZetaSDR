@@ -663,3 +663,28 @@ async fn a_stopped_identical_job_is_not_a_duplicate() {
     let c = started(&node, start(JobKind::Passthrough, b, &[])).await;
     assert_ne!(a, c);
 }
+
+#[tokio::test]
+async fn a_duplicate_is_refused_before_replace_stops_anything() {
+    // Spec §4.3: the duplicate check runs before the replacements, under the same
+    // gate, so a refused start stops nothing; a duplicate that `replace` names is
+    // about to stop and is no duplicate.
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path(), &[Radio::new(RADIO)]).await;
+    let x = started(
+        &node,
+        start(JobKind::Passthrough, band(100_000_000, 1_000_000), &[]),
+    )
+    .await;
+    let b = band(100_200_000, 48_000);
+    let y = started(&node, start(JobKind::Passthrough, b, &[])).await;
+    let (job, _) = duplicate(node.apply(start(JobKind::Passthrough, b, &[&x])).await);
+    assert_eq!(job, y);
+    assert_eq!(record(&node, &x).state, JobState::Running);
+    assert_eq!(record(&node, &y).state, JobState::Running);
+    let z = started(&node, start(JobKind::Passthrough, b, &[&y])).await;
+    assert_ne!(z, y);
+    assert_eq!(record(&node, &y).state, JobState::Stopped);
+    assert_eq!(record(&node, &x).state, JobState::Running);
+    assert_eq!(record(&node, &z).state, JobState::Running);
+}

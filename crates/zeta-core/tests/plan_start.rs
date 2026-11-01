@@ -3,8 +3,9 @@
 //! already ran and what was refused.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -23,13 +24,15 @@ use zeta_core::stream_in::StreamInStage;
 use zeta_core::types::{Capabilities, Claim, Hz, JobId, SampleFormat, SourceId};
 use zeta_core::types::{StreamId, StreamKind};
 
-/// A radio that tunes to exactly the band asked for, counting its tunes.
+/// A radio that tunes to exactly the band asked for, counting its tunes; with
+/// `slow` set a tune takes a second, so a caller's future can be dropped inside it.
 struct Radio {
     id: SourceId,
     caps: Capabilities,
     cur: Mutex<Option<Tuning>>,
     tx: broadcast::Sender<IqBlock>,
     tunes: AtomicUsize,
+    slow: AtomicBool,
 }
 
 impl Radio {
@@ -54,6 +57,7 @@ impl Radio {
             cur: Mutex::new(None),
             tx: broadcast::channel(1).0,
             tunes: AtomicUsize::new(0),
+            slow: AtomicBool::new(false),
         })
     }
 
@@ -72,6 +76,9 @@ impl Port for Radio {
     }
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         self.tunes.fetch_add(1, Ordering::SeqCst);
+        if self.slow.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         *self.cur.lock().unwrap() = Some(t);
         Ok(t)
     }
@@ -672,4 +679,36 @@ async fn an_existing_channel_that_cannot_attach_is_named_in_a_warning() {
         warnings[1].starts_with("ch2: attach failed: "),
         "{warnings:?}"
     );
+}
+
+#[tokio::test]
+async fn a_plan_start_dropped_mid_way_leaves_no_holder() {
+    // A request timed out or disconnected drops the op's future: whatever it had
+    // leased for the plan is released with it, and the source's gate goes too.
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    radio.slow.store(true, Ordering::SeqCst);
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(50), node.apply(fm_plan(None, &[]))).await;
+    assert!(
+        dropped.is_err(),
+        "the plan_start was not dropped: {dropped:?}"
+    );
+    assert_eq!(radio.tunes(), 1, "dropped inside the bounding band's tune");
+    radio.slow.store(false, Ordering::SeqCst);
+    let s = source(&node).await;
+    assert!(s.holders.is_empty(), "holders: {:?}", s.holders);
+    assert!(running(&node).is_empty());
+    // A start elsewhere on the source neither conflicts nor waits on the gate.
+    let two_metres = band(144_800_000, 12_500);
+    let job = tokio::time::timeout(
+        Duration::from_secs(5),
+        started(&node, start(JobKind::Passthrough, two_metres)),
+    )
+    .await
+    .expect("the gate was let go");
+    assert_eq!(source(&node).await.holders, vec![job.clone()]);
+    assert_eq!(radio.current(), Some(two_metres));
+    assert_eq!(running(&node), vec![job]);
 }

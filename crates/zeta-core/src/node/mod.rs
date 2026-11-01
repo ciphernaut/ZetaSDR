@@ -25,7 +25,9 @@ use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
 use crate::modes::ModeRegistry;
-use crate::ops::{JobKind, Op, OpError, OpResult, Sideband};
+use crate::ops::{
+    FM_DEVIATION_DEFAULT_HZ, JobKind, Op, OpError, OpResult, Sideband, WFM_DEVIATION_DEFAULT_HZ,
+};
 use crate::port::{GainInfo, Port, PortError, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Backend, StageRegistry};
@@ -673,6 +675,22 @@ impl Drop for Node {
     }
 }
 
+/// The lease [`Node::hold_band`] took, under an id that is no job: released when
+/// this is dropped, whether the caller lets it go on its normal path or its future
+/// is dropped between hold and release (a timed-out or disconnected request), so
+/// the lease never outlives the request. The release takes no gate and tunes
+/// nothing (`LeaseManager::release`).
+pub(crate) struct BandHold<'a> {
+    node: &'a Node,
+    id: JobId,
+}
+
+impl Drop for BandHold<'_> {
+    fn drop(&mut self) {
+        self.node.inner.leases.release(&self.id);
+    }
+}
+
 impl Node {
     /// Open the node on `cfg.state_dir`, attach `ports`, and, when
     /// `cfg.resume`, resume every `Running` job and every job that `Failed`
@@ -1182,8 +1200,9 @@ impl Node {
     /// `kind` at `tuning` with `deviation_hz` and `sideband` would repeat: the
     /// same kind string and tuning, and the same start params once both sides
     /// are read as the kind's defaults (`fm_demod` 5000 Hz, `wfm_demod` 75000 Hz,
-    /// `ssb_demod` usb; other kinds have none). A kind the node does not expand
-    /// has no such job.
+    /// `ssb_demod` usb; other kinds have none). A job another job owns (an
+    /// `identify` or `watch` trial child) is never named. A kind the node does not
+    /// expand has no such job.
     pub(crate) fn duplicate_of(
         &self,
         source: &SourceId,
@@ -1194,8 +1213,8 @@ impl Node {
     ) -> Option<JobId> {
         let k = self.expandable_kind(kind)?;
         let norm = |(d, s): (Option<u64>, Option<Sideband>)| match k {
-            JobKind::FmDemod => (Some(d.unwrap_or(5000)), None),
-            JobKind::WfmDemod => (Some(d.unwrap_or(75000)), None),
+            JobKind::FmDemod => (Some(d.unwrap_or(FM_DEVIATION_DEFAULT_HZ)), None),
+            JobKind::WfmDemod => (Some(d.unwrap_or(WFM_DEVIATION_DEFAULT_HZ)), None),
             JobKind::SsbDemod => (None, Some(s.unwrap_or(Sideband::Usb))),
             _ => (None, None),
         };
@@ -1206,6 +1225,7 @@ impl Node {
                 r.state == JobState::Running
                     && !r.elastic
                     && r.input.is_none()
+                    && r.owner.is_none()
                     && &r.source == source
                     && r.kind == kind
                     && r.tuning == tuning
@@ -1538,15 +1558,17 @@ impl Node {
     /// holds, for a holder that is no job (a fresh id, returned): granted, tuned or a
     /// conflict exactly as a rigid `job_start` of `want` would be (see
     /// [`LeaseManager::ensure_locked`]), so the jobs leased inside it afterwards join its
-    /// capture untuned. Release it with [`Node::release_hold`] before the gate goes;
-    /// meanwhile `source_list` may list it among the holders. Also whether it tuned the
-    /// port: the caller then relaunches the elastic jobs ([`Node::after_gate`]).
+    /// capture untuned. The lease lives as long as the returned [`BandHold`]: drop it
+    /// before the gate goes (it is released however the caller's future ends, a
+    /// dropped one included); meanwhile `source_list` may list it among the holders.
+    /// Also whether it tuned the port: the caller then relaunches the elastic jobs
+    /// ([`Node::after_gate`]).
     pub(crate) async fn hold_band(
         &self,
         port: &dyn Port,
         want: Tuning,
         guard: &OwnedMutexGuard<()>,
-    ) -> Result<(JobId, Tuning, bool), LeaseError> {
+    ) -> Result<(BandHold<'_>, Tuning, bool), LeaseError> {
         let holder = JobId::new();
         let held = self
             .inner
@@ -1557,12 +1579,13 @@ impl Node {
         if let Err(LeaseError::Port(_)) = &held {
             self.inner.note_fault_if_faulted(port.id());
         }
-        held.map(|(t, tuned)| (holder, t, tuned))
-    }
-
-    /// Drop the lease [`Node::hold_band`] took.
-    pub(crate) fn release_hold(&self, holder: &JobId) {
-        self.inner.leases.release(holder);
+        held.map(|(t, tuned)| {
+            let hold = BandHold {
+                node: self,
+                id: holder,
+            };
+            (hold, t, tuned)
+        })
     }
 
     /// Relaunch every running elastic job on `source` on its current capture; see
