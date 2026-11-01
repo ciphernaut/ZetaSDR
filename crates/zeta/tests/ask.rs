@@ -217,3 +217,28 @@ async fn ask_remote_starts_job_on_serving_node() {
     assert_eq!(arr.len(), 1, "{jobs}");
     assert_eq!(arr[0]["state"]["status"], "running");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_allow_stop_flag_reaches_the_agent() {
+    for (flag, want) in [(Some("--allow-stop"), "unknown"), (None, "not_allowed")] {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = write_tone(dir.path());
+        let fake = FakeLlm::start(
+            vec![
+                (
+                    200,
+                    tool_call_response(&[("job_stop", json!({"job": "nope"}))]),
+                ),
+                (200, text_response("done", "stop")),
+            ],
+            vec![],
+        )
+        .await;
+        let mut rest = vec!["ask", "stop the job nope"];
+        rest.extend(flag);
+        let out = zeta(local_args(dir.path(), &meta, &fake, &rest), None).await;
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let t = json_out(&out);
+        assert_eq!(t["calls"][0]["result"]["error"], want, "{t}");
+    }
+}

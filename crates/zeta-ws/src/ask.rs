@@ -21,6 +21,8 @@ const MAX_TURNS: u64 = 32;
 struct AskRequest {
     request: String,
     max_turns: Option<u64>,
+    /// What the run may stop; nothing when absent.
+    allow: Option<Allow>,
 }
 
 pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
@@ -77,7 +79,7 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
         &schema,
         &st.agents_md,
         max_turns,
-        Allow::default(),
+        req.allow.unwrap_or_default(),
     ) {
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::BAD_GATEWAY, other(e.to_string())),

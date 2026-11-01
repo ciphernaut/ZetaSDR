@@ -109,6 +109,15 @@ async fn status(State(f): State<Fake>) -> (StatusCode, Json<Value>) {
 /// An OpenAI tool-call response as llama-server emits it for a thinking
 /// model: `arguments` as a JSON string, plus `reasoning_content`.
 pub fn tool_call_response(calls: &[(&str, Value)]) -> Value {
+    tool_call_response_with(calls, "", Some("The user wants this; call the tool."))
+}
+
+/// As `tool_call_response`, with the message's `content` and `reasoning_content` given.
+pub fn tool_call_response_with(
+    calls: &[(&str, Value)],
+    content: &str,
+    reasoning: Option<&str>,
+) -> Value {
     let tool_calls: Vec<Value> = calls
         .iter()
         .enumerate()
@@ -119,16 +128,19 @@ pub fn tool_call_response(calls: &[(&str, Value)]) -> Value {
             }})
         })
         .collect();
+    let mut message = json!({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": tool_calls,
+    });
+    if let Some(r) = reasoning {
+        message["reasoning_content"] = json!(r);
+    }
     json!({
         "choices": [{
             "index": 0,
             "finish_reason": "tool_calls",
-            "message": {
-                "role": "assistant",
-                "content": "",
-                "reasoning_content": "The user wants this; call the tool.",
-                "tool_calls": tool_calls,
-            },
+            "message": message,
         }],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
     })

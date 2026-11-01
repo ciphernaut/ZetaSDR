@@ -368,6 +368,12 @@ pub struct AskArgs {
     /// Most model turns before giving up
     #[arg(long, default_value_t = 8, value_name = "N")]
     pub max_turns: u32,
+    /// Let the agent stop jobs (`job_stop`)
+    #[arg(long)]
+    pub allow_stop: bool,
+    /// Let the agent stop the holders a conflict names (a non-empty `replace`)
+    #[arg(long)]
+    pub allow_replace: bool,
 }
 
 /// The usage error for `--stt-socket` with `--stt-node`.

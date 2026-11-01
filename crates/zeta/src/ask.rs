@@ -38,6 +38,10 @@ pub async fn run(
         Err(e) => return fail(&e),
     };
     let max_turns = args.max_turns;
+    let allow = Allow {
+        stop_jobs: args.allow_stop,
+        replace: args.allow_replace,
+    };
     match remote {
         Some(client) => {
             let (schema, md) = match (client.schema().await, client.agents_md().await) {
@@ -50,6 +54,7 @@ pub async fn run(
                 &schema,
                 &md,
                 max_turns,
+                allow,
                 &request,
             )
             .await
@@ -81,6 +86,7 @@ pub async fn run(
                 &schema,
                 &md,
                 max_turns,
+                allow,
                 &request,
             )
             .await;
@@ -96,9 +102,10 @@ async fn drive<E: Executor>(
     schema: &serde_json::Value,
     md: &str,
     max_turns: u32,
+    allow: Allow,
     request: &str,
 ) -> ExitCode {
-    let agent = match build_agent(cfg, exec, schema, md, max_turns, Allow::default()) {
+    let agent = match build_agent(cfg, exec, schema, md, max_turns, allow) {
         Ok(a) => a,
         Err(e) => return fail(&e.to_string()),
     };

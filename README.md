@@ -513,7 +513,7 @@ OpenAI-compatible endpoint (thinking off, token budget per turn, bounded turns, 
 ./target/debug/zeta ask "what sources are there?" --llm-url http://127.0.0.1:8080 --llm-model gemma-4-12b
 ```
 
-`zeta ask` reads its request from stdin, so a `local-voice` transcript can be piped in.
+`zeta ask` reads its request from stdin, so a `local-voice` transcript can be piped in. `--max-turns N` bounds the model turns; `--allow-stop` and `--allow-replace` let the agent stop jobs and stop the holders a conflict names, both refused otherwise.
 
 ## UI
 
@@ -623,7 +623,7 @@ The command line takes either an operation as JSON (`{"op":"source_list"}`, appl
 `POST /op`) or free text, which goes to the agent. That needs `--llm-url` and `--llm-model` on
 `serve` (the other `--llm-*` flags of `zeta ask` apply), which enable `POST /ask`: the node runs
 the `zeta ask` agent against itself, so its calls appear in the transcript as they happen, and
-the answer follows when the run ends (one run at a time; 503 without `--llm-url`, 504 after
+the answer follows when the run ends; the body may carry `allow` (`{"stop_jobs": bool, "replace": bool}`, both false by default: without them the agent's `job_stop` and non-empty `replace` are refused as `not_allowed`), and the answer carries `allow` as the run had it and `turn_log`, one entry per model completion with its reasoning, content and call count (one run at a time; 503 without `--llm-url`, 504 after
 300 s). The microphone records in the browser and sends a 16 kHz WAV to `POST /stt`, which hands
 it to a `local-voice` speech daemon on the node's host at `--stt-socket PATH` (default
 `$XDG_RUNTIME_DIR/voiced.sock` when that exists); the transcript is submitted as if typed.

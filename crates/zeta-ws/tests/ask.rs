@@ -246,3 +246,85 @@ async fn ask_body_over_the_limit_is_413() {
     assert!(fake.requests.lock().unwrap().is_empty());
     ts.stop().await;
 }
+
+#[tokio::test]
+async fn ask_allow_defaults_to_false_and_rejects_an_unknown_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeLlm::start(
+        vec![
+            (200, tool_call_response(&[("source_list", json!({}))])),
+            (200, text_response("two sources", "stop")),
+            (200, tool_call_response(&[("source_list", json!({}))])),
+            (200, text_response("two sources", "stop")),
+        ],
+        vec![],
+    )
+    .await;
+    let ts = with_llm(
+        dir.path(),
+        llm(&fake, false, Duration::from_millis(10)),
+        Limits::default(),
+    )
+    .await;
+
+    let resp = ask(&ts, Some(BEARER), &json!({"request": "what sources?"})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let t: Value = resp.json().await.unwrap();
+    assert_eq!(t["allow"], json!({"stop_jobs": false, "replace": false}));
+    assert_eq!(t["turn_log"].as_array().unwrap().len(), 2);
+
+    let resp = ask(
+        &ts,
+        Some(BEARER),
+        &json!({"request": "what sources?", "allow": {"stop_jobs": true}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let t: Value = resp.json().await.unwrap();
+    assert_eq!(t["allow"], json!({"stop_jobs": true, "replace": false}));
+
+    let resp = ask(
+        &ts,
+        Some(BEARER),
+        &json!({"request": "what sources?", "allow": {"stops": true}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    ts.stop().await;
+}
+
+#[tokio::test]
+async fn ask_refuses_job_stop_without_the_allowance() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeLlm::start(
+        vec![
+            (
+                200,
+                tool_call_response(&[("job_stop", json!({"job": "01X"}))]),
+            ),
+            (200, text_response("refused", "stop")),
+        ],
+        vec![],
+    )
+    .await;
+    let ts = with_llm(
+        dir.path(),
+        llm(&fake, false, Duration::from_millis(10)),
+        Limits::default(),
+    )
+    .await;
+    let mut ops = ts.node.bus().subscribe(&ts.node.ops_stream()).unwrap();
+
+    let resp = ask(&ts, Some(BEARER), &json!({"request": "stop job 01X"})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let t: Value = resp.json().await.unwrap();
+    assert_eq!(t["calls"][0]["result"]["error"], "not_allowed");
+
+    while let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_millis(500), ops.recv()).await {
+        let Payload::Event(p) = frame.payload else {
+            continue;
+        };
+        assert_ne!(p["op"]["op"], "job_stop", "job_stop reached the node");
+    }
+    ts.stop().await;
+}

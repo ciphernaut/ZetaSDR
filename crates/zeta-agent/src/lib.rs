@@ -8,7 +8,8 @@ pub mod llm;
 pub mod wire;
 
 pub use agent::{
-    Agent, AgentConfig, AgentFailure, Allow, CallRecord, Transcript, build_agent, gate, is_question,
+    Agent, AgentConfig, AgentFailure, Allow, CallRecord, Transcript, TurnEntry, build_agent, gate,
+    is_question,
 };
 pub use exec::{Executor, LocalExecutor, RemoteExecutor};
 pub use llm::{AgentError, Completion, LlmClient, LlmConfig};

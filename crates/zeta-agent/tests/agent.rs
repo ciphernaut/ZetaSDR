@@ -3,7 +3,9 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use zeta_agent::agent::{Allow, GATED_REPLACE_OPS, gate};
-use zeta_agent::fake::{FakeLlm, RecordingExecutor, text_response, tool_call_response};
+use zeta_agent::fake::{
+    FakeLlm, RecordingExecutor, text_response, tool_call_response, tool_call_response_with,
+};
 use zeta_agent::{
     Agent, AgentConfig, AgentError, AgentFailure, LlmClient, LlmConfig, LocalExecutor, is_question,
 };
@@ -418,5 +420,35 @@ fn gate_covers_every_replace_taking_op() {
             Allow::default()
         )
         .is_none()
+    );
+}
+
+#[tokio::test]
+async fn turn_log_keeps_reasoning_and_content_per_completion() {
+    let fake = fake(vec![
+        tool_call_response_with(
+            &[("source_list", json!({}))],
+            "Looking at the sources.",
+            Some("plan: list first"),
+        ),
+        text_response("two sources", "stop"),
+    ])
+    .await;
+    let agent = Agent::new(llm(&fake), RecordingExecutor::new(vec![]), cfg());
+
+    let t = agent.run("list the sources").await.unwrap();
+    let log = serde_json::to_value(&t.turn_log).unwrap();
+    assert_eq!(
+        log,
+        json!([
+            {"turn": 1, "reasoning": "plan: list first", "content": "Looking at the sources.", "calls": 1},
+            {"turn": 2, "reasoning": null, "content": "two sources", "calls": 0},
+        ])
+    );
+    assert_eq!(t.allow, Allow::default());
+    assert!(
+        !serde_json::to_string(&requests(&fake))
+            .unwrap()
+            .contains("reasoning_content")
     );
 }

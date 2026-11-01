@@ -84,6 +84,19 @@ pub struct CallRecord {
     pub result: Value,
 }
 
+/// One model completion: what it thought and said, and how many calls it made.
+#[derive(Clone, Debug, Serialize)]
+pub struct TurnEntry {
+    /// 1-based completion number.
+    pub turn: u32,
+    /// The model's reasoning, shown to the operator and never sent back.
+    pub reasoning: Option<String>,
+    /// The content as the model sent it; `None` when empty after trimming.
+    pub content: Option<String>,
+    /// Tool calls in the completion.
+    pub calls: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Transcript {
     pub request: String,
@@ -91,6 +104,10 @@ pub struct Transcript {
     pub calls: Vec<CallRecord>,
     /// How many completions were requested.
     pub turns: u32,
+    /// One entry per completion, in order.
+    pub turn_log: Vec<TurnEntry>,
+    /// What the run was allowed to stop.
+    pub allow: Allow,
 }
 
 /// Why a run stopped, with everything done up to that point.
@@ -163,6 +180,8 @@ impl<E: Executor> Agent<E> {
             answer: None,
             calls: Vec::new(),
             turns: 0,
+            turn_log: Vec::new(),
+            allow: self.cfg.allow,
         };
         match self.turns(&mut transcript).await {
             Ok(()) => Ok(transcript),
@@ -179,6 +198,16 @@ impl<E: Executor> Agent<E> {
         while t.turns < self.cfg.max_turns {
             t.turns += 1;
             let c = self.llm.complete(&messages, &self.cfg.tools).await?;
+            t.turn_log.push(TurnEntry {
+                turn: t.turns,
+                reasoning: c.reasoning.clone(),
+                content: c
+                    .content
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string),
+                calls: c.tool_calls.len(),
+            });
             if c.tool_calls.is_empty() {
                 // Design 10: prose is an answer only to a question (see
                 // `is_question`: a polite request is not one) or after
