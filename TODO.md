@@ -289,9 +289,20 @@ From the 2026-10-29 404.025 MHz investigation: `measure` labels whole one-second
 
 Wanted: gate the measurement on the burst (on/off at 1 ms, measure over on-time only); report `duty`, `burst_ms`, `period_ms` as features; a cyclostationary symbol-rate estimate (the `|x|^2` line); an M-level instantaneous-frequency cluster count for M-FSK and the squaring test for PSK. Each is testable with the plan-17 synthesiser families (`fsk`/`psk`/`ook` with `repeat`). Pairs with the ACMA knowledge provider: register says `16K0F1D`, layer 1 confirms "burst FSK, 16 kHz".
 
+## Agent: requests too big for the voice console
+
+From the operator, 2026-11-01, after "set up a narrowband FM decoder for every CB channel and attach a transcribe session" ended on the turn limit twice (8 turns; 80 channels is 160 operations). Four parts:
+
+- **Never clear jobs unasked.** Stopping or replacing jobs is the operator's explicit decision; hand-crafted jobs must survive any request that did not name them. Say so in the guide. A `conflict` is reported to the operator unless the request allowed `replace`.
+- **Bulk operation, discoverable.** One op that starts a kind (with an optional attach) on every channel of a plan, returning ids and refusals. It must not be hidden knowledge: an ordinary op in `schema` and the guide, offered on the page (the plan's channels in a menu), and named by the agent when it plans. Refuse or warn on load: 80 transcribers share the speech daemon's 4 slots.
+- **Turn budget.** The page sends the default 8 (`api.ask`); raise it to the API's maximum of 32.
+- **The model's reasoning in the transcript.** `Completion.reasoning` is parsed (`zeta-agent/src/llm.rs`) and dropped. Carry it per turn in the `/ask` transcript and show it on the page, collapsed, so the operator sees the plan and any capability it considers.
+
+Also: refuse an identical rigid start on a band that already has one (ch2 was started twice).
+
 ## Agent guide: SIGINT and UX additions
 
-For `agents_md`/field craft: (1) on a licensed band call `knowledge_lookup` first and report licensee and emission before demodulating, noting data age; (2) when `measure` reports a low duty cycle, report burst timing and say the band label is unreliable rather than "noise"; (3) an unknown-signal playbook that ends at classification and signature write-back and stops before decoding third-party content, stating the legal line once; (4) lead the operator with the map and the one-line `summary`, name channels and licensees in plain words, and offer the next investigative step (measure, identify, knowledge lookup, direction-find).
+For `agents_md`/field craft: (1) on a licensed band call `knowledge_lookup` first and report licensee and emission before demodulating, noting data age; (2) when `measure` reports a low duty cycle, report burst timing and say the band label is unreliable rather than "noise"; (3) an unknown-signal playbook that ends at classification and signature write-back and stops before decoding third-party content, stating the legal line once; (5, from the operator, 2026-11-01) expand this guidance as each mode and SIGINT component lands, including when not to touch running jobs; (4) lead the operator with the map and the one-line `summary`, name channels and licensees in plain words, and offer the next investigative step (measure, identify, knowledge lookup, direction-find).
 
 ## Feature: a `knowledge` provider over the ACMA licence register (acma-local)
 
