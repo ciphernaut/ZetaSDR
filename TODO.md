@@ -1,9 +1,5 @@
 # TODO
 
-## Scan: alternate the step grid and mask the centre and edge bins
-
-Done in plan 15 (docs/superpowers/specs/2026-10-31-scan-grid-mask-design.md); live acceptance done 2026-11-01 (the B210 for the mechanism, the HackRF on the field host for the constants: `SCAN_NOTCH_HZ` 50 kHz, `SCAN_EDGE_MASK` 0.02; figures in the plan series "Plan 15 status").
-
 ## Scan: the HackRF's spur grid coincides with the quarter-step shift
 
 From the HackRF run on the field host, 2026-11-01 (plan series "Plan 15 status"). The HackRF One has spurs on multiples of 4 MHz whose level depends on the tune: a 3-bin spike at +4 MHz (and mostly -4 MHz) of 21-37 dB when tuned to 444, 460, 476 or 492 MHz, ±8 MHz spikes on the edge bins of every 16 Msps row, a +2 MHz spike at 462 and 470 MHz, a comb every 100 kHz around 480 MHz. The scan's quarter-step shift at a 16 MHz step is exactly 4 MHz, so one grid's +4 MHz spur lands on the other grid's centre and is painted where that grid masks its DC: the survey shows a grid of peaks that moves between sweeps (the plan's failure sign) that no mask width fixes. Wanted: a per-device spur list the scan rows mask as `masked` ranges (offsets from the tune, as the HackRF's are, plus absolute frequencies as the B210's 402.0245/402.1505/402.9005/403.1494/403.8996 MHz are: the watch's `spurs_hz` is the absolute half), measured once per device by a `zeta soapy survey` over a quiet span and kept with the source record; and a step or shift that is not a multiple of the spur spacing on a device that has one (15 MHz steps, or a shift of a third). The B210 showed no such grid.
@@ -16,35 +12,13 @@ From the same run. At the 1 Msps UHF CB pin `stats.timeouts` climbs about 8 per 
 
 From plan 15's non-goals, 2026-10-31. A demodulator's or decoder's own capture centre sits on its channel, so the receiver's DC spike lands in the channel (the same problem the scan grid had; a one-off demod read it as a 59 dB carrier on 2026-10-23). Keeping the centre off the channel needs the lease manager to know the capture's minimum width before it tunes, which the capability record does not carry, and the offset depends on the notch width plan 15 measures (`SCAN_NOTCH_HZ`: its live acceptance's figure is this gist's input). Its own small plan after plan 15. Seen live 2026-11-01 on the B210: after `replace` moved the last fm_demod to 477.466 MHz the capture centred on it, putting the DC spike on the channel.
 
-## Bug: stopped jobs leave work running (CPU leak, "channel stage lagged")
-
-Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.
-
-## Bug: a USB drop of a SoapySDR device segfaults the node
-
-Fixed in plan 20: the driver runs in a `zeta soapy-worker` child (docs/superpowers/specs/2026-10-31-soapy-worker-design.md); live acceptance pending.
-
-## Bug: a node that loses its only device stays up faulted, so a restart loop never restarts it
-
-Fixed in plan 20: the worker is respawned and the source heals (docs/superpowers/specs/2026-10-31-soapy-worker-design.md); live acceptance pending.
-
-## Bug: sample timestamps run ahead of wall-clock time (HackRF)
-
-Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.
-
-## Bug: `measure` jobs emit no events
-
-Fixed in plan 14 (docs/superpowers/plans/2026-10-27-field-fix-wave.md); live acceptance pending.
-
 ## Bug: a refused `graph_put` persists its graph
 
 A `graph_put` that loses a race with another put on the same job returns an error, but its graph is already in the record (`graph_get` and a restart use it). Found in plan 14 review, pre-existing. Fix: under the jobs lock, refuse before persisting when the entry is `Running` again after this put's stop.
 
-## Audio: `nbfm_demod` has no voice-band low-pass and no de-emphasis
+## Audio: the default `deviation_hz` on a 12.5 kHz channel
 
-Done 2026-11-01 (`fm_demod` carries `audio_lowpass_hz` 3400 and `deemphasis_us` 530, and the voice demodulators take `denoise: true` for RNNoise on their output; the page's outline menu toggles it). Left: the default `deviation_hz` on a 12.5 kHz channel (below). Original note:
-
-From the operator listening to a fitted ch9 demod on the B210, 2026-11-01 ("a bit of noise"). The NBFM path is discriminator → resampler to 48 kHz (`crates/zeta-dsp/src/nbfm.rs`, `AudioFilter`) and nothing else: `am_demod` low-passes its audio at 5 kHz and `wfm_demod` de-emphasises and low-passes at 15 kHz, but NBFM passes everything up to the IQ filter's edge (`channel_hz / 2`, 6.25 kHz on a 12.5 kHz channel). FM noise rises with audio frequency, so most of the hiss on a weak signal sits above the voice (about three quarters of the noise power of a 6.25 kHz band lies above 4 kHz); narrowing the job to 8 kHz helped and 5 kHz sounded cleaner still, at the cost of the voice sidebands. Wanted: after the resampler, a 6 dB/octave de-emphasis (a one-pole, tau about 530 us as PMR radios use; reuse `wfm::deemphasis`) and a 3.4 kHz low-pass (`lowpass_taps` with a `StreamingFir`, as `am.rs`); keep the squelch's measurement on the unfiltered discriminator. Also the field craft: on a 12.5 kHz channel the default `deviation_hz` 5000 halves the audio level of a 2.5 kHz-deviation CB signal; the fit (or the channel plan) could set 2500 there.
+The voice low-pass and de-emphasis shipped 2026-11-01 (`fm_demod` carries `audio_lowpass_hz` 3400 and `deemphasis_us` 530; the voice demodulators take `denoise: true`). Left, from the operator listening to a fitted ch9 demod on the B210: on a 12.5 kHz channel the default `deviation_hz` 5000 halves the audio level of a 2.5 kHz-deviation CB signal; the fit (or the channel plan) could set 2500 there.
 
 ## Feature: stereo for `wfm_demod`
 
@@ -55,10 +29,6 @@ From the operator listening to a fitted ch9 demod on the B210, 2026-11-01 ("a bi
 - L/R matrix, 50 us de-emphasis per channel.
 
 Report the pilot's level (event or `job_context`), so "no pilot" (no station, or too weak to lock) is visible. Keep mono as the fallback below a pilot threshold, as receivers do: stereo needs about 20 dB more signal for the same audio SNR.
-
-## UI: box a signal, demod it, then refine it on the graph
-
-Done by plan 18 (`docs/superpowers/specs/2026-10-31-box-and-refine-design.md`): fit first, `job_retune`, draggable outlines, the width presets, tags linked to the rows. Left to plan 15's follow-on: a lone job's capture centre off its channel (the DC spike).
 
 ## Jobs: serialise restarts of one input
 
@@ -179,10 +149,10 @@ Scope estimate: 300-500 lines CSS, 100-200 lines JS for the theme hooks and canv
 
 ## Architecture: a mode registry and a generic external-decoder adaptor
 
-Delivered by plan 16 (`docs/superpowers/specs/2026-10-27-mode-registry-design.md`, `docs/superpowers/plans/2026-10-27-mode-registry.md`, status in the plan series): mode rows, the `external_decode` adaptor, the event envelope, the `video` and bits payloads, `classify` sweeps and `identify`. Still open from the same note:
+Open work left from plan 16's mode registry (delivered; see the plan series):
 
 - **Feeds.** `sink` stage kinds for the standard feeds (APRS-IS, SBS/Beast, AIS NMEA, PSK Reporter, WSPRnet, KISS TNC) so results leave the node the way other tools expect.
-- **Time.** UTC-slotted modes (FT8/FT4 15 s, WSPR 2 min, JT65 1 min) and TDMA (DMR, TETRA) need true block timestamps. The HackRF drift bug above blocks the whole WSJT family.
+- **Time.** UTC-slotted modes (FT8/FT4 15 s, WSPR 2 min, JT65 1 min) and TDMA (DMR, TETRA) need true block timestamps. The HackRF timestamp bug is fixed (plan 14); the 2 h clock run that would clear the WSJT family is still outstanding (plan series, "Outcome").
 - **Span decoders and trunking.** OnAir and OpenWebRX+ decode every POCSAG/APRS/VDL2 channel in a capture at once. On a pin that is one job per channel on the bank today; a decoder that finds its own channels would take the whole capture. Trunking (P25, DMR Tier III, MPT1327) needs a follower that starts voice jobs from control-channel events inside the pin.
 - **Vocoders.** Codec 2 (M17, FreeDV) in-crate; AMBE/IMBE only through an external `mbelib` build, never shipped; HD Radio HDC off.
 - **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback. Fits the Okudagram restyle.
@@ -213,22 +183,15 @@ Points to work out:
 
 Scope estimate: 100-200 lines in `overlays.js` plus CSS; one or two scenarios.
 
-Related: a state-stream decoder (ADS-B) does not want a staircase at all but one ribbon per subject, folded by key; see "UI: ADS-B (and any state-stream decoder) on the page" below. The two should share the lane budget: a staircase for packet-shaped rows, a held roster line for keyed rows.
+Related: a state-stream decoder (ADS-B) does not want a staircase at all but one ribbon per subject, folded by key; see plan 23 (subjects) and "UI: state-stream decoders beyond the first subjects" below. The two should share the lane budget: a staircase for packet-shaped rows, a held roster line for keyed rows.
 
-## UI: ADS-B (and any state-stream decoder) on the page
+## UI: state-stream decoders beyond the first subjects
 
-From the operator, 2026-10-31, with a screenshot (`scratch/Screenshot From 2026-10-31 16-13-17.png`, local): an `adsb_decode` job on a HackRF at 1090 MHz fills the waterfall with dozens of boxes for one aircraft (`7C5309` / `QLK335D`): `7C5309 ×14`, `7C5309 21000 ×6`, `7C5309 QLK335D ×2`, `7C5309 21000 -27.39,152.43`, ... stacked down `MAX_LANES` and spilling over each other. Nothing on the page can be read.
+Plan 23 delivered the ADS-B request: a row names its subject (`key`, columns, `waterfall`, `heading`, `label`), the page folds by key, the Subjects tab lists one row per aircraft, the waterfall shows one line, and the map tracks per subject (`adsb_decode` has a `position`). Left from the original note:
 
-Cause (`crates/zeta-ui/web/overlays.js` `ribbon`): every decoder event is a ribbon at the job's tuning centre, folded into `×N` only when its text is identical and still at the right edge. The ADS-B row's summary is `{icao} {callsign?} {altitude_ft?} {lat?},{lon?}` and dump1090 delivers identity, altitude and position in separate messages, several a second per aircraft, with the position changing every time, so one aircraft yields four or five distinct texts that never fold. Ribbons were designed for packet-shaped rows (APRS, POCSAG: one readable thing per event); ADS-B is a state stream, and that is the mismatch. The map does not help: the `adsb_decode` row has no `position` block (the sonde rows do), and `map.js` keeps one marker and track per job, not per aircraft in a job.
-
-Wanted, in order of value:
-1. **Fold by key.** A mode row names the event field that identifies a subject (`icao`; `id` for the sondes, `src` for APRS, `reg` for ACARS, MMSI for AIS when it lands). The page keeps one ribbon per (job, key), merges each event's non-null fields into that subject's state, and re-renders the row's `summary` from the merged state: `7C5309 QLK335D 21000 -27.45,152.49 ×38`, updated in place, held at the right edge while the subject is heard and released to drift off after a silence (say 30 s). A row without a key keeps today's per-event ribbons. This alone fixes the screenshot and is generic. Suggested shape: `event.key: "<field>"` on the row (schema, `modes_show`, `AGENTS.md`); the node could do the merge too, so `job_context` carries a `subjects` map any client reads.
-2. **A subject table for the job.** A pane like dump1090's own view: ICAO, callsign, altitude, ground speed, track, position, distance and bearing from `view set home` (`map.js` `distanceBearing` already does the maths), last seen, message count; sorted by last seen or distance; one row per subject, from the same merged state as item 1. The waterfall then shows one line per aircraft, or none for a job that has a table. The same pane serves APRS stations, AIS vessels and a POCSAG address list.
-3. **Aircraft on the map.** Give the row a `position` block (`altitude_ft` needs a feet-to-metres factor the sonde rows never needed: a `scale` on the `alt_m` mapping, or an `alt_ft` alternative) and make `map.js` track per (job, key) rather than per job, so each aircraft gets a marker and a track and a job's popup names its subject. This is what the wave-2 "APRS positions on the map" item needs as well, since one APRS job hears many stations.
-
-Not wanted: a per-protocol special case in `overlays.js` (`protocolText` already carries one fallback for `adsb`; the row should drive it). Keep the UI e2e scenarios that find ribbons by text working for the unkeyed rows.
-
-Scope estimate: item 1 is a small change (a row field, 60-120 lines in `overlays.js`, a scenario); items 2 and 3 together are a plan of their own (a pane, the map rework, the row schema and the docs), roughly 400-700 lines.
+- POCSAG has no subject (each page is its own message); an address list in the Subjects tab would need a key on the pager's address.
+- AIS vessels (MMSI as key) when the AIS row lands; it needs only a row.
+- The node-side half is a separate gist ("Subjects: state does not survive a refresh").
 
 ## Build: an install script for the AMBE/IMBE vocoder libraries
 
@@ -293,10 +256,6 @@ Wanted: gate the measurement on the burst (on/off at 1 ms, measure over on-time 
 
 Done: plan 21 (`docs/superpowers/plans/2026-11-01-agent-bulk-ops.md`), plus `jobs_stop` for "stop all jobs". Live acceptance is in `UAT.md`.
 
-## Agent: the model invents a plan id
-
-From UAT, 2026-11-01. Asked for broadcast FM, gemma-4-12b called `plan_start` with a plan `broadcast_fm`, which does not exist, and got `unknown`. The node refused correctly. Broadcast FM has no channel plan, and FM stations are not on a plan the node knows. Wanted: the guide says to read `channel_plans` first and that a band with no plan takes one `job_start` per station; or a broadcast plan, if requests like this keep coming.
-
 ## Agent guide: SIGINT and UX additions
 
 For `agents_md`/field craft: (1) on a licensed band call `knowledge_lookup` first and report licensee and emission before demodulating, noting data age; (2) when `measure` reports a low duty cycle, report burst timing and say the band label is unreliable rather than "noise"; (3) an unknown-signal playbook that ends at classification and signature write-back and stops before decoding third-party content, stating the legal line once; (5, from the operator, 2026-11-01) expand this guidance as each mode and SIGINT component lands, including when not to touch running jobs; (4) lead the operator with the map and the one-line `summary`, name channels and licensees in plain words, and offer the next investigative step (measure, identify, knowledge lookup, direction-find).
@@ -339,12 +298,6 @@ Found in plan 20's final review. `watch_healed` is spawned in `add_port`, before
 
 Found in plan 20's final review. The worker's writer thread takes frames in order, so a reply or a status can wait behind up to 64 queued IQ blocks (at 20 Msps, tens of milliseconds and megabytes). Give control frames priority (a second queue the writer drains first) or cap the block queue in bytes rather than blocks.
 
-## Agent: let a run stop the jobs it started itself
-
-Found in the plan 21 final review, 2026-11-01. The stop gate (`allow.stop_jobs` false by default) also blocks the agent stopping jobs it started itself in the same run: the `measure` it starts to fit a demodulator, the decoder an `identify` leaves running under `verdict.job`. They pile up, and a repeat measure on the same box is refused as `duplicate` of the first.
-
-Suggested: the gate passes `job_stop` for ids that a `job_start` returned earlier in the same run, and still refuses every other id as `not_allowed`.
-
 ## Agent: `graph_put` and `job_retune` change an operator's job without the allowance
 
 Found in the plan 21 final review, 2026-11-01. `graph_put` and `job_retune` can change an operator's job, or in effect end it (a graph that fails, a retune off the signal it served), without the allowance: the spec gates only `job_stop` and `replace`. Recorded as a slot: a gate for changes to jobs the run did not start, if the agent is ever seen doing this.
@@ -352,3 +305,17 @@ Found in the plan 21 final review, 2026-11-01. `graph_put` and `job_retune` can 
 ## Mix: mutes do not survive the mix, the page offers fewer than it hears, a phone is untested
 
 Found in the plan 22 final review, 2026-11-01. Mutes live in the mix's graph, so stopping the mix (`stop all` included) forgets them. The page offers Mute in mix only on the demodulator kinds, though the mix hears any job with audio. And how the page's audio behaves on a real phone is untested: the resume and the re-anchor on a suspended context were only run against a context suspended in headless Chromium.
+
+## Subjects: state does not survive a refresh
+
+Plan 23 merges each subject's events on the page, so a refresh starts the Subjects tab, the tracks and the dim and drop clocks empty and refills them from live traffic (an aircraft re-announces within seconds; a sonde every second, an APRS station only when it next transmits). A node-side store, kept as `job_context.subjects` (the merged state by key, last seen, count, the track), would survive a refresh, serve the agent and the CLI ("which aircraft are up?") and let a second page open on the same picture. Decide where the dim and drop settings live then.
+
+## Subjects: leftovers
+
+Rulings of plan 23 an operator may want otherwise:
+
+- `m_s` shows as signed m/s to one decimal (the plan text said km/h; metres and m/s are the metric pair, and a climb rate in km/h misreads). `ft` shows as metres and `kt` as km/h. One line in `metricText` (`crates/zeta-ui/web/units.js`) changes it.
+- The table is stacked under the map on the wide footprint, since seven or eight columns do not fit a quarter of the screen.
+- Jobs with an `owner` (identify's trials, a watch's runs) have no subjects; their events keep today's ribbons.
+- The agent's own jobs: `mix_start` ids are not recorded as the run's own, so a run cannot stop a mix it started (the stop gate was not widened).
+- Tracks keep a fix when the subject has moved `track_min_m` (or turned over 10 degrees) and, at `track_points`, thin the older half by every other point (the first point stays). Keeping sharp curves when thinning old points is a future sprint: today a thinned half can cut a corner, and a long straight leg and a tight turn lose points alike.

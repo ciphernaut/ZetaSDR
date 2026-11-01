@@ -30,7 +30,7 @@ marker and track on the map, and at most one line on the waterfall.
 - A subject dims after 60 s of silence and is dropped after 5 minutes (operator); both are view settings.
 - Metric everywhere: metres and km/h, converted on the page from what the row declares (operator).
 - The map draws each subject with a position as a marker rotated to its heading where known, a label,
-  and a track of its last 100 fixes. A click on a table row highlights it on the map, and the reverse
+  and a track (amended 2026-11-02, see 4.5: a track thinned by movement and age, not the last 100 fixes). A click on a table row highlights it on the map, and the reverse
   (operator).
 - The agent may `job_stop` jobs it started in the same run without the allowance (operator).
 - The guide tells the model to read `channel_plans` before naming a plan (operator: guide rule only).
@@ -161,8 +161,16 @@ Remove `protocolText`'s ADS-B fallback, since the row now drives it.
 
 `map.js` tracks per (job, key) for a keyed row, per job otherwise. A marker is rotated by `heading` when
 known, with a label of the key or first column, plus altitude in metres when known. A track holds the
-last 100 fixes. A popup names the subject and its table's values. Dim and drop follow the store. The
+last 100 fixes (amended, below). A popup names the subject and its table's values. Dim and drop follow the store. The
 existing per-job behaviour for an unkeyed positioned row stays as it is.
+
+*Amendment, 2026-11-02 (operator, during the build):* a track is not the last 100 fixes. A row sets
+`subject.track_points` (the cap, default 100) and `subject.track_min_m` (default 0). A fix joins the
+track only when the subject has moved at least `track_min_m` (3D distance) from the last kept point, or
+its heading has turned over 10 degrees where one is known; the marker always shows the latest fix. When
+a track reaches `track_points`, every other point of its older half is removed, keeping the first point
+and the newest half at full detail, and it refills. Rows: ADS-B 100 / 500 m, APRS 100 / 50 m, sondes
+500 / 100 m. Keeping sharp curves while thinning is not done (`TODO.md`).
 
 ### 4.6 The agent's own jobs
 
