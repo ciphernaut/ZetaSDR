@@ -3073,6 +3073,16 @@ def scenario_not_allowed_shows_the_unlock_and_reruns_with_the_allowance(page, ur
     assert asks[0]["allow"]["stop_jobs"] is False, asks[0]
     assert asks[1]["allow"]["stop_jobs"] is True, asks[1]
     assert asks[1]["request"] == "stop the measure", asks[1]
+    assert asks[1]["allow"] == {"stop_jobs": True, "replace": True}, asks[1]
+    # The note's button disables once clicked, and the unlock was for that request only:
+    # the session's `allow stops` switch is still off for the next plain ask.
+    expect(button).to_be_disabled()
+    run_cmd(page, "think")
+    answer = page.locator("#transcript .line.assistant", has_text="one source")
+    expect(answer).to_have_count(1)
+    expect(answer).not_to_contain_text("[may stop jobs]")
+    assert len(asks) == 3, f"three /ask requests: {asks}"
+    assert asks[2]["allow"] == {"stop_jobs": False, "replace": False}, asks[2]
 
 
 def scenario_ask_fans_out_through_plan_start(page, url, secret):

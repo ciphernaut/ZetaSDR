@@ -87,7 +87,8 @@
 // load; every following /ask carries `allow: {stop_jobs, replace}` of it; an answer from a run
 // that may stop jobs ends " [may stop jobs]", each turn of its `turn_log` is a collapsed
 // `details.turn`, and a refused call (`not_allowed`) adds the note with the action `allow stops
-// and ask again`) and `plan start <plan> <kind> [<attach>] [ch N,N-M]` (a `plan_start` op on
+// and ask again`, which re-sends that one request with both flags true and leaves the switch
+// off; the note's buttons disable once clicked) and `plan start <plan> <kind> [<attach>] [ch N,N-M]` (a `plan_start` op on
 // the shown source through applyOp: conflicts get retry buttons, refused channels and
 // warnings a note each).
 
@@ -575,24 +576,26 @@ export async function runPlanCommand(st, words) {
   return { text: null, error: false };
 }
 
-// Sends `text` to /ask and shows the answer (or the error, e.g. no LLM configured).
-async function askAgent(text) {
+// Sends `text` to /ask and shows the answer (or the error, e.g. no LLM configured). The
+// allowance is the session's `allow stops` switch unless `allowOverride` gives one for this
+// request only (the unlock button's re-run); the switch itself is never changed here.
+async function askAgent(text, allowOverride = null) {
   const t = state.transcript;
   if (!state.api) return;
   t.user(text);
   try {
     const flag = state.allowStops;
-    const r = await state.api.ask(text, 32, { stop_jobs: flag, replace: flag });
+    const allow = allowOverride ?? { stop_jobs: flag, replace: flag };
+    const r = await state.api.ask(text, 32, allow);
     const may = r.allow && (r.allow.stop_jobs || r.allow.replace) ? " [may stop jobs]" : "";
     t.assistant((r.answer ?? "(no answer)") + may, false, r.turn_log || []);
     if ((r.calls || []).some((c) => c.result && c.result.error === "not_allowed")) {
       t.note("the agent was not allowed to stop or replace jobs", false, [
         {
           label: "allow stops and ask again",
-          run: () => {
-            state.allowStops = true;
-            askAgent(text);
-          },
+          // This one request again with both flags true; the session stays as it was
+          // (`allow stops on` is the switch). The note's buttons disable on click.
+          run: () => askAgent(text, { stop_jobs: true, replace: true }),
         },
       ]);
     }
