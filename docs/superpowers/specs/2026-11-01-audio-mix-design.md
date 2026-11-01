@@ -31,6 +31,8 @@ tuners. Specific channels can be muted in it.
   The last channel heard stays named after it ends, because the operator looks up late.
 - A channel that will not shut up (a data channel, a squelch left open) can be muted in the mix
   without stopping its demodulator or its transcript.
+- Transcription happens per demodulator. Starting a mix attaches no transcript to it. As an option,
+  the operator can also attach a `transcribe` to the mix's output, alongside the per-demodulator ones.
 - It costs one websocket for audio and one for events, however many channels are mixed.
 
 ### Non-goals
@@ -41,8 +43,6 @@ tuners. Specific channels can be muted in it.
 
 ### Anti-goals
 
-- A transcript of the mix as the default. Nothing attaches one unless asked; `plan_start` keeps
-  attaching per channel, and the guide says so.
 - A mix that takes a lease, retunes a radio or blocks a job.
 - Silence that lies: a muted or dropped input must be visible in `job_context`.
 
