@@ -1,15 +1,21 @@
 // explore.js: the Explore pane (plan 19 spec 5.7), the captures the node holds.
 //
 // mountExplorePane(el, api, view, transcript, {panes}) -> {render(), eligible(), destroy()}
-//   Polls `capture_list` every EXPLORE_POLL_MS; lists the captures newest first (time, band, size, the feature summary,
+//   Polls `capture_list` once at load, then every EXPLORE_POLL_MS while the pane is shown, has
+//   been shown once this load, a `capture` job runs (fed by noteJobs(jobs) from each job_list;
+//   one more poll when the last one ends) or a bracket is drawn (so a deleted capture's goes;
+//   brackets scroll off with the columns), and never otherwise: a page that never opens
+//   Explore, runs no capture job and has no capture on screen costs one op per load. Lists the captures newest first (time, band, size, the feature summary,
 //   the nearest transmitter's licensee) as `tr.capture` rows with the buttons What is this
 //   (`capture_classify`, labels to the transcript), Download (both SigMF files fetched with the
 //   bearer and saved as Blobs: the secret never goes into a URL) and Delete (`capture_delete`,
 //   a second click within DELETE_CONFIRM_MS confirms; the button reads `sure?` between).
 //   Draws the cached region (ov.span, tagged with the id's last 6 characters) of each capture
-//   still on the waterfall's columns; polls while hidden too, for that.
+//   still on the waterfall's columns (one that ended before the oldest column is skipped).
 //   Registers the `explore` pane with the strip, eligible while any capture exists, and selects
-//   it the first time a capture appears (once per page load).
+//   it when a capture appears that the load's first poll did not list (once per load): a
+//   reload never takes the pane back from the stored one (spec 5.7, auto-selected the first
+//   time a capture appears, never again).
 
 import { bandText, khzText } from "./units.js";
 
@@ -58,7 +64,10 @@ class ExplorePane {
     this.t = transcript;
     this.panes = panes;
     this.captures = [];
-    this.seen = false; // a capture has been seen (the auto-select happens once)
+    this.baseline = null; // the ids the first poll listed (null before it answers)
+    this.selected = false; // the auto-select happened (once per load)
+    this.everShown = false; // the pane was shown this load
+    this.capturing = false; // a capture job runs (noteJobs)
     this.timer = null;
     this.destroyed = false;
     this.armed = new Map(); // capture id -> timer of the pending delete confirmation
@@ -68,7 +77,10 @@ class ExplorePane {
     panes?.register("explore", "explore", {
       eligible: () => this.eligible(),
       el,
-      onShow: () => this.poll(),
+      onShow: () => {
+        this.everShown = true;
+        this.poll();
+      },
       onHide: () => {},
     });
     this.poll();
@@ -82,8 +94,23 @@ class ExplorePane {
     return !this.el.hidden;
   }
 
+  // Whether the 2 s poll runs (see the header).
+  polling() {
+    return this.shown() || this.everShown || this.capturing || this.spans.size > 0;
+  }
+
+  // From each job_list: whether a capture job runs; its end gets one more poll.
+  noteJobs(jobs) {
+    const was = this.capturing;
+    this.capturing = (jobs || []).some(
+      (j) => j && j.kind === "capture" && (j.state?.status ?? j.status) === "running",
+    );
+    if (this.capturing && !was) this.schedule();
+    else if (was && !this.capturing && !this.polling()) this.poll();
+  }
+
   schedule() {
-    if (this.destroyed || this.timer !== null) return;
+    if (this.destroyed || this.timer !== null || !this.polling()) return;
     this.timer = setTimeout(() => {
       this.timer = null;
       this.poll();
@@ -92,17 +119,25 @@ class ExplorePane {
 
   async poll() {
     if (this.destroyed) return;
+    let listed = false;
     try {
       const r = await this.api.op({ op: "capture_list", signal: null });
       if (this.destroyed) return;
-      if (r && r.result === "captures" && Array.isArray(r.value)) this.captures = r.value;
+      if (r && r.result === "captures" && Array.isArray(r.value)) {
+        this.captures = r.value;
+        listed = true;
+      }
     } catch {
       // The next poll tries again.
     }
     this.render();
     this.syncSpans();
-    if (!this.seen && this.captures.length > 0) {
-      this.seen = true;
+    const ids = this.captures.map((c) => c.id);
+    if (!listed) {
+      // Nothing new is known: no baseline, no auto-select.
+    } else if (this.baseline === null) this.baseline = new Set(ids);
+    else if (!this.selected && ids.some((id) => !this.baseline.has(id))) {
+      this.selected = true;
       this.panes?.select("explore");
     }
     this.panes?.render();
@@ -115,10 +150,13 @@ class ExplorePane {
   syncSpans() {
     const ov = this.ov();
     if (!ov) return;
-    const sourceId = this.wf()?.sourceId;
+    const wf = this.wf();
+    const sourceId = wf?.sourceId;
+    const oldest = wf?.oldestNs?.() ?? null;
     const want = new Set();
     for (const c of this.captures) {
       if (c.source !== sourceId) continue;
+      if (oldest !== null && c.end_ns < oldest) continue;
       const key = `capture:${c.id}`;
       const lo = c.center_hz - c.bandwidth_hz / 2;
       const hi = c.center_hz + c.bandwidth_hz / 2;

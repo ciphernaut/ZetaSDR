@@ -73,19 +73,75 @@ impl Executor for RemoteExecutor {
     }
 }
 
+/// How many capture records a trimmed `capture_list` keeps for the model (the newest).
+pub const CAPTURE_LIST_KEEP: usize = 20;
+
 /// Trim a result before the model sees it: a `job_list` loses each record's
 /// `graph` (a graph is several hundred bytes the model never needs; `graph_get`
-/// fetches one). Everything else passes unchanged.
+/// fetches one); a `capture_list` keeps the newest [`CAPTURE_LIST_KEEP`] records (the
+/// node lists newest first), each without `allocations`, `meta_path` and `data_path`
+/// (`capture_show` has them), and gains `count`, how many the store holds. Everything
+/// else passes unchanged.
 pub fn trim_result(op: &str, result: &mut Value) {
-    if op != "job_list" {
+    let drop: &[&str] = match op {
+        "job_list" => &["graph"],
+        "capture_list" => &["allocations", "meta_path", "data_path"],
+        _ => return,
+    };
+    let Some(records) = result.get_mut("value").and_then(Value::as_array_mut) else {
         return;
+    };
+    let count = records.len();
+    if op == "capture_list" {
+        records.truncate(CAPTURE_LIST_KEEP);
     }
-    if let Some(records) = result.get_mut("value").and_then(Value::as_array_mut) {
-        for r in records {
-            if let Some(o) = r.as_object_mut() {
-                o.remove("graph");
+    for r in records.iter_mut() {
+        if let Some(o) = r.as_object_mut() {
+            for k in drop {
+                o.remove(*k);
             }
         }
+    }
+    if op == "capture_list"
+        && let Some(o) = result.as_object_mut()
+    {
+        o.insert("count".into(), count.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_list_is_trimmed_to_the_newest_twenty_with_a_count() {
+        let records: Vec<Value> = (0..30)
+            .map(|i| {
+                json!({"id": format!("c{i:02}"), "allocations": [{"x": 1}],
+                       "meta_path": "/a.sigmf-meta", "data_path": "/a.sigmf-data",
+                       "center_hz": 1})
+            })
+            .collect();
+        let mut r = json!({"kind": "captures", "value": records});
+        trim_result("capture_list", &mut r);
+        let v = r["value"].as_array().unwrap();
+        assert_eq!(v.len(), CAPTURE_LIST_KEEP);
+        assert_eq!(v[0]["id"], "c00");
+        assert_eq!(r["count"], 30);
+        for rec in v {
+            let o = rec.as_object().unwrap();
+            assert!(!o.contains_key("allocations") && !o.contains_key("meta_path"));
+            assert!(!o.contains_key("data_path"));
+            assert_eq!(rec["center_hz"], 1);
+        }
+    }
+
+    #[test]
+    fn other_results_pass_unchanged() {
+        let mut r = json!({"kind": "captures", "value": [{"allocations": []}]});
+        let before = r.clone();
+        trim_result("capture_show", &mut r);
+        assert_eq!(r, before);
     }
 }
 

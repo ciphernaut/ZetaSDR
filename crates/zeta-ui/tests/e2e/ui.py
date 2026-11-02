@@ -3666,6 +3666,33 @@ def scenario_home_gives_distance_and_bearing(page, url, secret):
         stop_job(url, secret, job)
 
 
+def scenario_station_is_the_default_home(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    errors = page_errors(page)
+    http_json(url, secret, "/op", {"op": "station_set", "lat": -27.5, "lon": 153.0,
+                                   "alt_m": 10.0, "region": "AU", "antennas": None})
+    job = None
+    try:
+        # Read once at page load: no `view set home` needed.
+        select_source(page, url, secret, "tone")
+        page.wait_for_function(
+            "() => { const h = window.zetaTest.home(); return !!h && h.lat === -27.5"
+            " && h.lon === 153; }", timeout=10_000)
+        assert view_value(page, "home") == "home none", view_value(page, "home")
+        job = start_fake_pos(page, url, secret)
+        pos = page.locator(f'#jobs .job[data-id="{job}"] .pos')
+        expect(pos).to_have_text("14.8 km, 47°", timeout=10_000)
+        # The view's home takes precedence.
+        run_cmd(page, "view set home -27.41,153.11")
+        assert page.evaluate("window.zetaTest.home()") == {"lat": -27.41, "lon": 153.11}
+        run_cmd(page, "view set home none")
+        assert not errors, f"console errors: {errors}"
+    finally:
+        if job:
+            stop_job(url, secret, job)
+        http_json(url, secret, "/op", {"op": "station_clear"})
+
+
 # ---- subjects (plan 23 Task 2) ----------------------------------------------------------
 # The node's `fake_subjects` row prints three aircraft in separate messages, `fake_fold` two
 # sondes (ui.rs), each 2 s into the job.
@@ -5034,7 +5061,13 @@ def scenario_explore_what_is_this_and_delete(page, url, secret):
     wait_until(lambda: len(capture_ops(url, secret, "capture_list", signal=None)) == 2,
                30, "two captures")
     login(page, url, secret)
-    # The first capture seen on this page load selects the pane by itself.
+    tab = page.locator('#panes .pane-tab[data-pane="explore"]')
+    expect(tab).to_be_visible(timeout=20000)
+    # Captures written before this load never take the pane by themselves (spec 5.7: only
+    # a capture that appears while the page runs selects it, once).
+    page.wait_for_timeout(2500)
+    assert view_value(page, "pane") != "pane explore", view_value(page, "pane")
+    tab.click()
     expect(page.locator("#explore tr.capture")).to_have_count(2, timeout=20000)
     row = '#explore tr.capture >> nth=0 >> '
     page.click(row + 'button[data-action="classify"]')
@@ -5043,6 +5076,12 @@ def scenario_explore_what_is_this_and_delete(page, url, secret):
     expect(page.locator(row + 'button[data-action="delete"]')).to_have_text("sure?")
     page.click(row + 'button[data-action="delete"]')
     expect(page.locator("#explore tr.capture")).to_have_count(1)
+    # The stored pane survives a reload with captures present.
+    run_cmd(page, "view set pane none")
+    page.reload()
+    expect(tab).to_be_visible(timeout=20000)
+    page.wait_for_timeout(2500)
+    assert view_value(page, "pane") == "pane none", view_value(page, "pane")
     clear_captures(url, secret)
 
 

@@ -15,7 +15,8 @@
 //         map              on | off (default off): the map pane (map.js)
 //         home             `LAT,LON` (lat -90..90, lon -180..180, decimal degrees) | none
 //                          (default none): where the map's home marker sits and the job rows'
-//                          distance and bearing count from; kept as `<lat>,<lon>` with the
+//                          distance and bearing count from (none: the node's station, when
+//                          one is set; see homeOf); kept as `<lat>,<lon>` with the
 //                          numbers as JavaScript prints them (`-27.50,153.00` → `-27.5,153`)
 //         subjects         auto | on | off (default auto): an alias of `pane` for the
 //                          Subjects pane (subjects.js): `on` sets `pane subjects`, `off` sets
@@ -28,6 +29,10 @@
 //                          shown under the waterfall. A stored id is kept over a reload before
 //                          its pane registers (the strip shows none until it does)
 //   homePoint(value) -> {lat, lon} | null   the `home` policy's value as numbers (null: none)
+//   setStationHome(point|null)  the node's station position ({lat, lon}; app.js reads it once
+//       with `station_get` at page load), the home used while the view's `home` is none
+//   homeOf(view) -> {lat, lon} | null   the home in force: the view's `home` when set, else
+//       the station's (`view set home` takes precedence; `none` falls back to the station)
 //   VIEW_KEY   the sessionStorage key holding the values set ({key: value}, defaults left out)
 //   mountView() -> View
 //     view.get(key)             the value (the default when not set)
@@ -64,6 +69,17 @@ function latLon(text) {
 
 export function homePoint(value) {
   return value === "none" ? null : latLon(value);
+}
+
+let stationHome = null;
+
+export function setStationHome(point) {
+  const ok = point && Number.isFinite(point.lat) && Number.isFinite(point.lon);
+  stationHome = ok ? { lat: point.lat, lon: point.lon } : null;
+}
+
+export function homeOf(view) {
+  return homePoint(view.get("home")) ?? stationHome;
 }
 
 const PANE_ID = /^[a-z][a-z0-9_]*(:[A-Za-z0-9_.:-]+)?$/;

@@ -119,7 +119,7 @@ import { mountMenu } from "./menu.js";
 import { playJob } from "./audio.js";
 import { closeGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
-import { mountView, runViewCommand } from "./view.js";
+import { homeOf, mountView, runViewCommand, setStationHome } from "./view.js";
 import { channelLabel, loadPlans, resolvePlan } from "./plans.js";
 import { MixWatch, isMuted, mixCovering, muteOp } from "./mix.js";
 import { mountCoarse } from "./coarse.js";
@@ -793,6 +793,7 @@ function start(api) {
     wf: () => state.wf,
   });
   state.subjects.onLearn(applyPanes);
+  loadStationHome(api);
   applyMapPane();
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
@@ -829,6 +830,7 @@ function start(api) {
     view: state.view,
     onJobs: (jobs) => {
       state.lastJobs = jobs;
+      state.explore?.noteJobs(jobs);
       if (state.map) state.map.sync();
       state.subjects?.sync(jobs);
       if (state.ov) state.ov.sync(jobs, shown());
@@ -867,6 +869,21 @@ function redrawPlan() {
 
 // <html data-map="on"> while the view's `map` policy is on (style.css lays the pane out);
 // off also leaves the narrow footprint's map tab.
+// The node's station as the home while the view's `home` is none (view.js homeOf): read
+// once per page load; `view set home` keeps precedence. A node without one, or an older
+// node without the op, leaves no home.
+async function loadStationHome(api) {
+  try {
+    const r = await api.op({ op: "station_get" });
+    if (!r || r.result !== "station" || !r.value) return;
+    setStationHome(r.value);
+    state.map?.drawHome();
+    state.jobs?.refresh();
+  } catch {
+    // No station: the view's home only.
+  }
+}
+
 function applyMapPane() {
   const root = document.documentElement;
   const on = !!state.view && state.view.get("map") === "on";
@@ -1184,6 +1201,10 @@ window.zetaTest = {
   },
   setSecret(s) {
     if (state.api) state.api.secret = s;
+  },
+  // The home in force (view.js homeOf: view `home`, else the station read at load), or null.
+  home() {
+    return state.view ? homeOf(state.view) : null;
   },
   poll() {
     return state.jobs ? state.jobs.refresh() : Promise.resolve();

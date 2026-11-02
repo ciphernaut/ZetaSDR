@@ -66,6 +66,7 @@
 //     wf.centerHz() -> the centre of the band shown (null before the band is known)
 //     wf.xForNs(ns) -> CSS x of a time on the painted columns (right edge when newer than
 //         the newest; null when older than the oldest column or none is painted)
+//     wf.oldestNs() -> the start of the oldest column on screen (null when none or untimed)
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
 //     wf.band       the capture {lo, hi} in Hz (a scan: its whole span); null before known
 //     wf.view       the range {lo, hi} shown, or null for the whole capture; past the capture
@@ -1616,17 +1617,33 @@ class Waterfall {
     const shown = Math.min(this.columns, RING_COLUMNS, Math.ceil(this.canvas.width / cw));
     const slotOf = (age) => (this.columns - 1 - age) % RING_COLUMNS;
     if (ns >= this.ringEnd[slotOf(0)]) return this.canvas.width / dpr;
-    for (let age = 0; age < shown; age++) {
-      const slot = slotOf(age);
-      const start = this.ringStart[slot];
-      if (!start) return null;
-      if (ns >= start) {
-        const span = this.ringEnd[slot] - start;
-        const frac = span > 0 ? Math.min(1, (ns - start) / span) : 0;
-        return (this.canvas.width - (age + 1 - frac) * cw) / dpr;
-      }
+    // The column starts fall with age (the ring is monotonic), so the youngest column that
+    // starts at or before `ns` (or is untimed, which ends the walk) is a binary search.
+    let lo = 0;
+    let hi = shown;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const start = this.ringStart[slotOf(mid)];
+      if (!start || ns >= start) hi = mid;
+      else lo = mid + 1;
     }
-    return null;
+    if (lo >= shown) return null;
+    const slot = slotOf(lo);
+    const start = this.ringStart[slot];
+    if (!start) return null;
+    const span = this.ringEnd[slot] - start;
+    const frac = span > 0 ? Math.min(1, (ns - start) / span) : 0;
+    return (this.canvas.width - (lo + 1 - frac) * cw) / dpr;
+  }
+
+  // The start (ns since the epoch) of the oldest column on screen; null when none is painted
+  // or it is untimed. A time before it has no x (xForNs answers null).
+  oldestNs() {
+    if (!(this.columns > 0)) return null;
+    const cw = Math.max(1, Math.min(this.column.width, this.canvas.width));
+    const shown = Math.min(this.columns, RING_COLUMNS, Math.ceil(this.canvas.width / cw));
+    const start = this.ringStart[(this.columns - 1 - (shown - 1)) % RING_COLUMNS];
+    return start || null;
   }
 
   resolve(d) {

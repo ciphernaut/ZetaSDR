@@ -64,7 +64,7 @@
 import { MAX_WATCHED } from "./overlays.js";
 import { distanceBearing, positionOf } from "./map.js";
 import { metricText } from "./units.js";
-import { homePoint } from "./view.js";
+import { homeOf } from "./view.js";
 
 const TICK_MS = 1000;
 const RENDER_MS = 500;
@@ -535,7 +535,7 @@ class SubjectsPane {
         value: (s) => (s.position ? s.position.lat : null),
       },
     ];
-    const home = homePoint(this.view.get("home"));
+    const home = homeOf(this.view);
     if (home) {
       const from = (s) => (s.position ? distanceBearing(home, s.position) : null);
       cols.push({

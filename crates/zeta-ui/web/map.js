@@ -41,7 +41,8 @@
 //     map.sync()                after each jobs poll: the tracks of jobs no longer running
 //                               (stopped, failed, forgotten) are dropped with their marker
 //     map.rowText(jobId) -> "<km, 1 dp> km, <deg rounded>°" | null
-//                               the job's last fix from view `home` (null without a home or
+//                               the job's last fix from the home (view.js homeOf: view `home`,
+//                               else the node's station; null without a home or
 //                               a fix), for its jobs pane row (agent.js). A job with subjects
 //                               answers for its one subject on the map; with more it is null,
 //                               since the table has them.
@@ -49,7 +50,7 @@
 //   Drawn, once Leaflet is in: one L.circleMarker (class `map-pos`) at each job's newest fix,
 //   whose popup is the last event's `summary` and its age (`12 s ago`, from when this page
 //   received it), and one non-interactive L.polyline (class `map-track`) through its fixes;
-//   a non-interactive circle marker (class `map-home`) at view `home`. The view is centred
+//   a non-interactive circle marker (class `map-home`) at the home (homeOf). The view is centred
 //   once, on the first fix or on home (whichever comes first), at zoom FIRST_ZOOM, and never
 //   moved again: after that the user pans.
 //   A subject with a fix is drawn instead as a track under `${job}\u0000${key}`: one L.marker
@@ -65,7 +66,7 @@
 
 import { subjectLabel, subjectValues } from "./subjects.js";
 import { metricText } from "./units.js";
-import { homePoint } from "./view.js";
+import { homeOf } from "./view.js";
 
 const SUBJECT_DRAW_MS = 500;
 export const TRACK_POINTS = 3600;
@@ -255,7 +256,7 @@ class MapPane {
     this.map = L.map(this.el, { worldCopyJump: true });
     L.tileLayer(OSM_TILES, { attribution: OSM_ATTRIBUTION, maxZoom: 19 }).addTo(this.map);
     const first = this.tracks.values().next().value;
-    const home = homePoint(this.view.get("home"));
+    const home = homeOf(this.view);
     if (first) this.centre(first.points[0]);
     else if (home) this.centre([home.lat, home.lon]);
     else this.map.setView([0, 0], 2);
@@ -271,7 +272,7 @@ class MapPane {
 
   drawHome() {
     if (!this.map) return;
-    const home = homePoint(this.view.get("home"));
+    const home = homeOf(this.view);
     if (!home) {
       this.homeMarker?.remove();
       this.homeMarker = null;
@@ -478,7 +479,7 @@ class MapPane {
   }
 
   rowText(id) {
-    const home = homePoint(this.view.get("home"));
+    const home = homeOf(this.view);
     if (!home) return null;
     let t = this.tracks.get(id);
     if (!t) {
