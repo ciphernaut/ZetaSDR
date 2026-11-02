@@ -20,7 +20,9 @@ use zeta_core::types::{Baud, Hz, Provenance, StreamId, StreamKind, Timestamp};
 mod burst;
 mod order;
 
-pub(crate) use burst::{BURST_ENVELOPE_MS, BURST_MERGE_MS, BURST_ON_DB};
+pub(crate) use burst::{
+    BURST_DUTY_MAX, BURST_ENVELOPE_MS, BURST_MERGE_MS, BURST_ON_DB, noise_floor_power,
+};
 pub use burst::{Bursts, burst_runs, on_time};
 use burst::{
     View, averaged_half_spectrum, bandpass, cyclo_symbol_rate, gated_view, strongest_line,

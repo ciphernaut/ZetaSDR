@@ -21,7 +21,7 @@ pub(crate) const BURST_MERGE_MS: u64 = 2;
 /// ... runs shorter than this many ms are dropped ...
 const BURST_MIN_MS: u64 = 1;
 /// ... and a window on for less than this fraction is measured over its runs only ...
-pub(super) const BURST_DUTY_MAX: f32 = 0.5;
+pub(crate) const BURST_DUTY_MAX: f32 = 0.5;
 /// ... unless its runs repeat faster than this many ms: shorter, denser on-off
 /// runs are keying, not bursts.
 pub(super) const BURST_MIN_PERIOD_MS: f32 = 20.0;
@@ -114,7 +114,7 @@ pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
 /// its spectrum's `FLOOR_PERCENTILE`th-percentile bin over its mean bin (the share of the
 /// power a flat floor at that level would hold). `None` for a window shorter than one
 /// `SIZE`-point transform.
-pub(super) fn noise_floor_power(iq: &[Complex<f32>]) -> Option<f64> {
+pub(crate) fn noise_floor_power(iq: &[Complex<f32>]) -> Option<f64> {
     let ps = CpuFft::new().power_sum(iq, SIZE, Window::Hann);
     if ps.chunks == 0 || iq.is_empty() {
         return None;

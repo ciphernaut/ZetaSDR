@@ -17,6 +17,13 @@
 //! it. With `whole`, the gate decides nothing: windows of `window_ms` are written back
 //! to back from the first sample. A retune, a gap in time or a lag drops the window
 //! being cut and restarts the gate.
+//!
+//! A signal already on when the run starts makes no on-edge (the floor is the signal).
+//! So after [`WARMUP_MS`] with no on-edge the buffer is measured once: when its duty
+//! ([`crate::measure::burst_runs`]) is at least `BURST_DUTY_MAX` and its mean power
+//! stands more than `BURST_ON_DB` over the in-band noise floor (a continuous signal,
+//! not plain noise), the run switches to `whole` from the buffer's first sample on, and
+//! `job_context.capture.whole_auto` reads true.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -36,7 +43,8 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, JobId, Span, StreamId, StreamKind, Timestamp};
 
 use crate::measure::{
-    BURST_ENVELOPE_MS, BURST_MERGE_MS, BURST_ON_DB, FLOOR_PERCENTILE, measure_band,
+    BURST_DUTY_MAX, BURST_ENVELOPE_MS, BURST_MERGE_MS, BURST_ON_DB, FLOOR_PERCENTILE, burst_runs,
+    measure_band, noise_floor_power,
 };
 
 /// `bursts` by default: windows one run writes.
@@ -52,6 +60,9 @@ pub const TIMEOUT_MS_DEFAULT: u64 = 120_000;
 /// The gate decides nothing until the envelope holds this many ms: a floor needs
 /// chunks to be a percentile of.
 pub const GATE_WARMUP_MS: u64 = 100;
+/// With no on-edge after this many ms of signal the buffer is checked once for a
+/// continuous signal, which switches the run to `whole` (see the module docs).
+pub const WARMUP_MS: u64 = 500;
 
 /// `burst_capture` parameters; every one optional.
 #[derive(Clone, Debug, PartialEq, JsonSchema, Serialize, Deserialize)]
@@ -164,6 +175,10 @@ struct Gate {
     bursts_seen: u64,
     /// Signal time seen, ns.
     elapsed_ns: u64,
+    /// The continuous-signal check ran (once per run).
+    warm_checked: bool,
+    /// The check switched the run to `whole`.
+    whole_auto: bool,
 }
 
 impl Gate {
@@ -184,6 +199,31 @@ impl Gate {
             open: None,
             bursts_seen: 0,
             elapsed_ns: 0,
+            warm_checked: false,
+            whole_auto: false,
+        }
+    }
+
+    /// After `WARMUP_MS` of the stream with no on-edge, once: a continuous signal in the
+    /// buffer switches the run to `whole` from the buffer's first sample.
+    fn check_continuous(&mut self) {
+        if self.warm_checked || self.p.whole || self.next - self.base.0 < self.samples(WARMUP_MS) {
+            return;
+        }
+        self.warm_checked = true;
+        if self.bursts_seen > 0 || self.held.is_some() {
+            return;
+        }
+        let buf: Vec<Complex<f32>> = self.hist.iter().copied().collect();
+        let duty = burst_runs(&buf, self.rate()).duty;
+        let mean = buf.iter().map(|s| s.norm_sqr() as f64).sum::<f64>() / buf.len().max(1) as f64;
+        let on = noise_floor_power(&buf)
+            .is_some_and(|floor| floor > 0.0 && 10.0 * (mean / floor).log10() > BURST_ON_DB);
+        if duty >= BURST_DUTY_MAX && on {
+            self.p.whole = true;
+            self.whole_auto = true;
+            self.open = None;
+            self.open_whole(self.hist_start);
         }
     }
 
@@ -262,6 +302,7 @@ impl Gate {
             p.sort_by(f64::total_cmp);
             p[p.len() * FLOOR_PERCENTILE / 100]
         });
+        self.check_continuous();
         let mut cuts = Vec::new();
         for (end, power) in chunks {
             self.gate(end, power);
@@ -423,6 +464,7 @@ impl Tally {
             "bytes": self.bytes,
             "bursts_seen": gate.bursts_seen,
             "timed_out": self.timed_out,
+            "whole_auto": gate.whole_auto,
         }}));
     }
 }
@@ -615,7 +657,7 @@ mod tests {
         Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
     };
 
-    use super::BurstCaptureStage;
+    use super::{BurstCaptureStage, WINDOW_MS_DEFAULT};
     use crate::synth::awgn;
 
     const RATE: u64 = 48_000;
@@ -816,6 +858,32 @@ mod tests {
         assert_eq!(r.context["written"], serde_json::json!([]));
         assert_eq!(r.context["bursts_seen"], 0);
         assert!(r.store.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_signal_on_from_the_start_is_cut_into_back_to_back_windows() {
+        // A carrier on from the first sample: no on-edge ever comes.
+        let mut iq = noise(5.0, 5);
+        carrier(&mut iq, 0.0, 5_000.0);
+        let r = run(serde_json::json!({"bursts": 2}), &iq).await;
+        assert!(matches!(r.result, Ok(())), "{:?}", r.result);
+        assert_eq!(r.events.len(), 2, "{:?}", r.context);
+        assert_eq!(r.events[0]["start_ns"], *T0);
+        assert_eq!(
+            r.events[1]["start_ns"].as_u64().unwrap() - *T0,
+            WINDOW_MS_DEFAULT * 1_000_000
+        );
+        assert_eq!(r.context["whole_auto"], true);
+        assert_eq!(r.context["timed_out"], false);
+    }
+
+    #[tokio::test]
+    async fn plain_noise_does_not_switch_to_whole() {
+        let iq = noise(1.5, 6);
+        let r = run(serde_json::json!({"bursts": 2, "timeout_ms": 1_000}), &iq).await;
+        assert!(r.events.is_empty(), "{:?}", r.events);
+        assert_eq!(r.context["whole_auto"], false);
+        assert_eq!(r.context["timed_out"], true);
     }
 
     #[test]
