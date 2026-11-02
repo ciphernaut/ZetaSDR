@@ -144,7 +144,11 @@ impl Classifier for DecodeToIdentify {
         let mut chans: Vec<((i64, u64), Option<(Vec<Complex<f32>>, u64)>)> = Vec::new();
         let mut labels = Vec::new();
         let mut tried = Vec::new();
-        for s in scored.into_iter().take(CLASSIFY_TRIES) {
+        for s in scored
+            .into_iter()
+            .filter(|s| s.in_range)
+            .take(CLASSIFY_TRIES)
+        {
             let row = &s.mode.row;
             let attempt = row.identify.quick.as_deref().and_then(quick_attempt);
             let outcome = if row.identify.min_span_ms > span_ms {
@@ -171,11 +175,19 @@ impl Classifier for DecodeToIdentify {
                         chans.len() - 1
                     }
                 };
-                match chans[i]
+                let mut found = chans[i]
                     .1
                     .as_ref()
-                    .and_then(|(c, r)| attempt.and_then(|a| a(c, *r)))
-                {
+                    .and_then(|(c, r)| attempt.and_then(|a| a(c, *r)));
+                // A box between the floor and the RDS gate may hold the signal off its
+                // centre: once more on the row's own width at the measured centre.
+                if found.is_none() && !wide && layer1 != "noise" {
+                    let slice = (m_center as i64 - center_hz.0 as i64, row_bw);
+                    if slice != key {
+                        found = attempt.and_then(|a| slice_attempt(iq, rate, slice, a));
+                    }
+                }
+                match found {
                     Some(evidence) => {
                         labels.push(Label {
                             layer: 2,
@@ -210,6 +222,18 @@ fn extract(
     // The channel filter refuses a band wider than its output rate.
     let bw = bw.max(MIN_BW_HZ).min(out_rate);
     extract_offset(iq, rate, offset, bw, out_rate).ok()
+}
+
+/// `attempt` over the channel at `(offset, bandwidth)` from the block centre: its
+/// evidence when a frame passes its check.
+fn slice_attempt(
+    iq: &[Complex<f32>],
+    rate: u64,
+    (offset, bw): (i64, u64),
+    attempt: Attempt,
+) -> Option<String> {
+    let (chan, out_rate) = extract(iq, rate, offset, bw)?;
+    attempt(&chan, out_rate)
 }
 
 /// One decoder tried over the extracted channel (IQ at the given rate): its

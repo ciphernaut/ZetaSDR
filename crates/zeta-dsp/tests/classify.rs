@@ -11,7 +11,7 @@ use zeta_core::ops::{Op, OpResult};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::types::{Hz, Selection, SourceId, Span, Timestamp};
-use zeta_dsp::fixtures::{aprs_packet_iq, nbfm_modulate, tone, write_fixture};
+use zeta_dsp::fixtures::{aprs_packet_iq, nbfm_modulate, pocsag_packet_iq, tone, write_fixture};
 use zeta_source_file::{FileOpts, FileSource};
 
 const CENTER: u64 = 144_800_000;
@@ -23,7 +23,6 @@ async fn node_over(dir: &std::path::Path, iq: &[Complex<f32>]) -> Node {
     node_over_with(dir, iq, None).await
 }
 
-/// [`node_over`] with the operator rows in `modes_dir`.
 async fn node_over_with(
     dir: &std::path::Path,
     iq: &[Complex<f32>],
@@ -169,10 +168,9 @@ async fn program_rows_are_skipped_quick() {
     let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
     let node = node_over(dir.path(), &iq).await;
     let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
-    // The sonde rows (program rows, 12.5 kHz FSK/FM) score among the best five on an FM
-    // box; a program row has no quick attempt.
+    // A program row in range (adsb_decode has no range) is tried but has no quick attempt.
     assert_eq!(
-        outcome(&c, "rs41_decode"),
+        outcome(&c, "adsb_decode"),
         Some(Outcome::SkippedQuick),
         "{c:?}"
     );
@@ -182,19 +180,7 @@ async fn program_rows_are_skipped_quick() {
 async fn wide_rows_are_skipped_on_a_narrow_box() {
     let dir = tempfile::tempdir().unwrap();
     let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
-    // The sonde rows (12.5 kHz FSK/FM) outscore rds on this FM box and would push it out
-    // of the five tried: the operator rows here present them as no modulation.
-    let modes = dir.path().join("modes");
-    std::fs::create_dir_all(&modes).unwrap();
-    for (file, text) in zeta_core::modes::ModeRegistry::embedded() {
-        let mut row: serde_json::Value = serde_json::from_str(text).unwrap();
-        if row["family"] == "weather_science" {
-            row["modulation"] = serde_json::json!([]);
-            let name = std::path::Path::new(&file).file_name().unwrap();
-            std::fs::write(modes.join(name), row.to_string()).unwrap();
-        }
-    }
-    let node = node_over_with(dir.path(), &iq, Some(modes)).await;
+    let node = node_over(dir.path(), &iq).await;
     let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
     assert_eq!(
         outcome(&c, "rds_decode"),
@@ -276,4 +262,39 @@ async fn a_40_khz_box_decodes_on_its_own_channel() {
     let node = node_over(dir.path(), &iq).await;
     let c = classify_span(&node, CENTER, 40_000, 2_000_000_000).await;
     assert_eq!(outcome(&c, "aprs_decode"), Some(Outcome::Proved), "{c:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_packet_10_khz_off_a_40_khz_box_centre_is_proved_on_the_row_width_slice() {
+    // POCSAG 10 kHz above the centre of a 40 kHz box: the box's own channel fails, the
+    // 12 500 Hz slice at the measured centre decodes.
+    let dir = tempfile::tempdir().unwrap();
+    let mut iq = pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 10_000.0);
+    // A noise floor, so the measured occupied band is the signal's and not the whole box.
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+    };
+    for x in iq.iter_mut() {
+        *x += Complex::new(uniform(), uniform()) * 0.6;
+    }
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 40_000, 2_000_000_000).await;
+    assert_eq!(outcome(&c, "pocsag_decode"), Some(Outcome::Proved), "{c:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sonde_rows_do_not_fill_the_tried_list_outside_their_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
+    for sonde in ["rs41_decode", "dfm_decode", "m20_decode"] {
+        assert_eq!(outcome(&c, sonde), None, "{c:?}");
+    }
+    assert!(outcome(&c, "pocsag_decode").is_some(), "{c:?}");
+    assert!(outcome(&c, "aprs_decode").is_some(), "{c:?}");
 }

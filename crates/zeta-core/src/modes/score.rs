@@ -81,12 +81,16 @@ pub struct Scored<'a> {
     /// Whether the band passed to [`score_rows`] is wide enough for the row
     /// ([`super::Band::fits`]).
     pub fits_band: bool,
+    /// Whether the measured centre lies in the row's `band.range_hz` (true for a row
+    /// without one); a row out of range scores nothing for the centre and never fits.
+    pub in_range: bool,
 }
 
 /// The `ready` and `unavailable` rows of `modes` (a broken row is never tried) scored
 /// against a signal measured at `center_hz`, `bandwidth_hz` wide and labelled `layer1`:
 /// 0.4 when `center_hz` lies within `band.bandwidth_hz` of one of `band.centers_hz` or
-/// inside `band.range_hz` (or the row has neither, "anywhere"); 0.3 when `bandwidth_hz`
+/// inside `band.range_hz` (or the row has neither, "anywhere"; a row whose `range_hz`
+/// and listed centres both exclude `center_hz` scores 0 for it, is not `in_range` and never `fits_band`); 0.3 when `bandwidth_hz`
 /// lies within 0.5-1.5 times `band.bandwidth_hz`; 0.3 when `layer1` is in `modulation`
 /// (never for an empty list); plus the best `catalogue(id)` among the row's `catalogue`
 /// ids, so a catalogue match can lift a row above 1; plus `allocation(row)` (the
@@ -109,12 +113,14 @@ pub fn score_rows<'a>(
             let in_range = band
                 .range_hz
                 .is_some_and(|[lo, hi]| (lo..=hi).contains(&center_hz));
-            let center = (band.centers_hz.is_empty() && band.range_hz.is_none())
-                || in_range
-                || band
-                    .centers_hz
-                    .iter()
-                    .any(|&c| center_hz.abs_diff(c) <= band.bandwidth_hz);
+            let near = band
+                .centers_hz
+                .iter()
+                .any(|&c| center_hz.abs_diff(c) <= band.bandwidth_hz);
+            // A row with a range and no listed centre near excludes a centre outside it.
+            let in_range_or_none = band.range_hz.is_none() || in_range || near;
+            let center = in_range_or_none
+                && (in_range || near || (band.centers_hz.is_empty() && band.range_hz.is_none()));
             let bw = band.bandwidth_hz as f64;
             let width = (bw * 0.5..=bw * 1.5).contains(&(bandwidth_hz as f64));
             let modulation = m.row.modulation.iter().any(|l| l == layer1);
@@ -139,7 +145,8 @@ pub fn score_rows<'a>(
             Scored {
                 mode: m,
                 score,
-                fits_band: band.fits(bandwidth_hz),
+                fits_band: in_range_or_none && band.fits(bandwidth_hz),
+                in_range: in_range_or_none,
             }
         })
         .collect();

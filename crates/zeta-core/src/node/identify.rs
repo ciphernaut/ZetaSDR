@@ -507,7 +507,10 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                 .band
                 .min_hz
                 .unwrap_or(s.mode.row.band.bandwidth_hz);
-            let evidence = format!("needs a band of at least {min} Hz; the job's is {bw} Hz");
+            let evidence = match s.in_range {
+                true => format!("needs a band of at least {min} Hz; the job's is {bw} Hz"),
+                false => format!("the measured centre {m_center} Hz is outside the row's range"),
+            };
             inner.candidate(&r, id, s.score, Outcome::SkippedBand, &evidence, None, fit);
         } else if s.mode.state != ModeState::Ready {
             let evidence = s.mode.reason.clone().unwrap_or_else(|| "not ready".into());
