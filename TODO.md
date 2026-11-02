@@ -314,6 +314,10 @@ Found in the plan 22 final review, 2026-11-01. Mutes live in the mix's graph, so
 
 Plan 23 merges each subject's events on the page, so a refresh starts the Subjects tab, the tracks and the dim and drop clocks empty and refills them from live traffic (an aircraft re-announces within seconds; a sonde every second, an APRS station only when it next transmits). A node-side store, kept as `job_context.subjects` (the merged state by key, last seen, count, the track), would survive a refresh, serve the agent and the CLI ("which aircraft are up?") and let a second page open on the same picture. Decide where the dim and drop settings live then.
 
+## UI: the Subjects list must not take over the page
+
+From the operator, 2026-11-02, on first sight of plan 23's Subjects pane: "move list to separate tab alongside the radios. it should not just take over real estate like this", or a hover box. Today the pane opens under the map (`subjects auto`) and halves the waterfall whenever a subject job runs. Wanted: the list lives behind its own tab beside the source tabs (the `#tabs` strip the radios and Listen to all sit in), shown only when chosen, or as a hover box over the waterfall that does not reflow the layout; the waterfall and map keep their room by default. The `auto` policy then means "the tab appears", not "the pane opens". Same rule for any future pane: a new view earns a tab or an overlay, never a slice of the waterfall.
+
 ## Subjects: leftovers
 
 Rulings of plan 23 an operator may want otherwise:
