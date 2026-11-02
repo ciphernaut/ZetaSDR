@@ -92,7 +92,7 @@ const SSB_ONE_SIDE: f64 = 0.8;
 /// peak is at least this far below the weaker tone.
 const FSK_PEAK_DB: f32 = 6.0;
 /// FSK: tone separation range.
-const FSK_SEP_HZ: (f64, f64) = (500.0, 3_000.0);
+pub(super) const FSK_SEP_HZ: (f64, f64) = (500.0, 3_000.0);
 
 /// Noise floor of [`measure_band`]: this percentile of the in-band bins. A
 /// signal may fill more than half of a channel (APRS: Carson ~10.4 kHz in
@@ -2092,5 +2092,30 @@ mod tests {
         let l = layer1_label(&f, &iq, 48_000);
         show("fsk burst train", &f, &l);
         assert_ne!(l.name, "ook", "{}", l.evidence);
+    }
+
+    #[test]
+    fn a_one_bin_band_just_over_the_noise_snr_carries_no_order() {
+        // 2-FSK at -12 dB measures just over the noise SNR on a one-bin
+        // (47 Hz) band; its histogram's clusters (once order 4, 4 Hz apart)
+        // are closer than any FSK tone pair.
+        let spec = SynthSpec::Fsk {
+            symbol_rate_baud: 2400,
+            deviation_hz: 4000.0,
+            order: 2,
+            bits: lcg_hex(128),
+            repeat: 1,
+            gap_ms: 50,
+        };
+        let imp = Impairments {
+            snr_db: Some(-12.0),
+            ..Default::default()
+        };
+        let iq = synthesise(&spec, &imp, 48_000, 0);
+        let f = measure_band(&iq, 48_000, CENTER, 24_000);
+        eprintln!("one-bin 2-fsk: {f:?}");
+        assert!(f.snr_db >= NOISE_SNR_DB, "snr_db {}", f.snr_db);
+        assert_eq!(f.order, None, "{f:?}");
+        assert_eq!(f.tone_spacing_hz, None, "{f:?}");
     }
 }

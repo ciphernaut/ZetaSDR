@@ -7,7 +7,7 @@ use num_complex::Complex;
 use zeta_core::types::Hz;
 
 use super::burst::{BURST_MIN_PERIOD_MS, averaged_half_spectrum, bandpass, burst_runs, hann};
-use super::{LOCAL_BINS, MIN_LINE_HZ, SIZE, discriminator, median};
+use super::{FSK_SEP_HZ, LOCAL_BINS, MIN_LINE_HZ, SIZE, discriminator, median};
 use crate::fft::{CpuFft, FftBackend, PowerSum, Window};
 
 /// FSK: a cluster of the instantaneous-frequency histogram holds at least
@@ -90,14 +90,16 @@ fn clusters(hist: &[f64], total: usize, min_weight: f64) -> Vec<(usize, f64)> {
 /// (discriminator) histogrammed across that band in `FSK_HIST_BINS` bins,
 /// and the histogram's [`clusters`] holding at least `FSK_CLUSTER_MIN_WEIGHT`
 /// of the samples counted. Two or four clusters give the order and the
-/// median distance between adjacent ones; any other count is `None`.
+/// median distance between adjacent ones; any other count is `None`. So is a
+/// spacing, or an occupied band, under `FSK_SEP_HZ.0`: a tone pair closer
+/// than the two-peak rule's minimum is not an FSK order.
 pub(super) fn fsk_clusters(
     runs: &[&[Complex<f32>]],
     rate_hz: u64,
     (offset_hz, bandwidth_hz): (f64, u64),
 ) -> Option<(u8, Hz)> {
     let bw = bandwidth_hz as f64;
-    if bw <= 0.0 || rate_hz == 0 {
+    if bw < FSK_SEP_HZ.0 || rate_hz == 0 {
         return None;
     }
     let bin = bw / FSK_HIST_BINS as f64;
@@ -126,7 +128,8 @@ pub(super) fn fsk_clusters(
         .windows(2)
         .map(|w| ((w[1].0 - w[0].0) as f64 * bin) as f32)
         .collect();
-    Some((c.len() as u8, Hz(median(&gaps).round() as u64)))
+    let spacing = median(&gaps) as f64;
+    (spacing >= FSK_SEP_HZ.0).then(|| (c.len() as u8, Hz(spacing.round() as u64)))
 }
 
 /// Share of the power of the instantaneous frequency `freqs` (one per run;
