@@ -445,7 +445,8 @@ fn head(v: &Value) -> String {
 }
 
 /// The fixed assignments query: devices whose `FREQUENCY ± BANDWIDTH / 2` overlaps
-/// the band, joined to their site, licence and licensee, inside a box of `km`
+/// the band (a device with no `BANDWIDTH` counts as 0 Hz wide, so it is matched on its
+/// frequency rather than dropped by a NULL comparison), joined to their site, licence and licensee, inside a box of `km`
 /// around `(lat, lon)` when one is given, nearest in frequency first.
 fn assignments_sql(center_hz: Hz, bandwidth_hz: Hz, bbox: Option<(f64, f64, f64)>) -> String {
     let half = bandwidth_hz.0 / 2;
@@ -463,7 +464,8 @@ fn assignments_sql(center_hz: Hz, bandwidth_hz: Hz, bbox: Option<(f64, f64, f64)
          JOIN site s ON s.SITE_ID = d.SITE_ID \
          LEFT JOIN licence l ON l.LICENCE_NO = d.LICENCE_NO \
          LEFT JOIN client c ON c.CLIENT_NO = l.CLIENT_NO \
-         WHERE d.FREQUENCY - d.BANDWIDTH / 2 <= {hi} AND d.FREQUENCY + d.BANDWIDTH / 2 >= {lo}"
+         WHERE d.FREQUENCY - COALESCE(d.BANDWIDTH, 0) / 2 <= {hi} \
+         AND d.FREQUENCY + COALESCE(d.BANDWIDTH, 0) / 2 >= {lo}"
     );
     if let Some((lat, lon, km)) = bbox {
         let dlat = km / KM_PER_DEG_LAT;

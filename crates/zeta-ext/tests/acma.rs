@@ -25,6 +25,8 @@ enum Mode {
     RpcError,
     Html,
     Slow,
+    /// One row without a `BANDWIDTH` (NULL in the register).
+    NullBandwidth,
 }
 
 #[derive(Default)]
@@ -116,7 +118,11 @@ async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Re
             let out = match req["params"]["name"].as_str().unwrap() {
                 "execute_sql" => {
                     *s.sql.lock().unwrap() = Some(args.clone());
-                    rows()
+                    let mut r = rows();
+                    if s.mode == Mode::NullBandwidth {
+                        r["rows"][0][1] = Value::Null;
+                    }
+                    r
                 }
                 "get_frequency_allocation" => plan(s.mode == Mode::Satellite),
                 t => panic!("unexpected tool {t}"),
@@ -236,11 +242,11 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
     assert_eq!(sql["limit"], 200);
     let q = sql["sql"].as_str().unwrap();
     assert!(
-        q.contains("FREQUENCY - d.BANDWIDTH / 2 <= 404033000"),
+        q.contains("FREQUENCY - COALESCE(d.BANDWIDTH, 0) / 2 <= 404033000"),
         "{q}"
     );
     assert!(
-        q.contains("FREQUENCY + d.BANDWIDTH / 2 >= 404017000"),
+        q.contains("FREQUENCY + COALESCE(d.BANDWIDTH, 0) / 2 >= 404017000"),
         "{q}"
     );
     assert!(q.contains("LATITUDE BETWEEN"), "{q}");
@@ -379,4 +385,30 @@ async fn a_satellite_plan_sets_space_reach() {
         .allocations("AU", Hz(404_025_000), Hz(16_000))
         .await;
     assert!(a.iter().any(|x| x.service == "MOBILE-SATELLITE (primary)"));
+}
+
+#[tokio::test]
+async fn a_device_without_a_bandwidth_is_kept() {
+    let (url, stub) = serve(Mode::NullBandwidth).await;
+    let provider = provider(&url, demo_station());
+    let a = provider
+        .allocations("AU", Hz(404_025_000), Hz(16_000))
+        .await;
+    // The query matches a NULL bandwidth as 0 Hz wide instead of dropping it ...
+    let sql = stub.sql.lock().unwrap().clone().unwrap();
+    let q = sql["sql"].as_str().unwrap();
+    assert!(!q.contains(" d.BANDWIDTH / 2"), "{q}");
+    assert!(q.contains("COALESCE(d.BANDWIDTH, 0) / 2"), "{q}");
+    // ... and the row it answers becomes an assignment like the others.
+    let asg: Vec<_> = a
+        .iter()
+        .filter(|x| x.kind.as_deref() == Some("assignment"))
+        .collect();
+    assert_eq!(asg.len(), 4);
+    assert!(
+        asg.iter()
+            .any(|x| x.site.as_deref() == Some("Example Rail Site A")
+                && x.center_hz == Some(Hz(404_025_000))),
+        "{asg:?}"
+    );
 }
