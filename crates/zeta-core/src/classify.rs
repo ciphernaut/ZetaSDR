@@ -8,6 +8,7 @@ use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::knowledge::Allocation;
 use crate::types::{Baud, Hz};
 
 /// Measurements of a detected signal, filled by the detector.
@@ -85,14 +86,17 @@ pub struct Tried {
     pub outcome: Outcome,
 }
 
-/// A classifier run's result: every label, and the modes decode-to-identify
-/// considered in the order it considered them.
+/// A classifier run's result: every label, the modes decode-to-identify
+/// considered in the order it considered them, and the register's assignments for
+/// the band the run was handed (nearest first).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
 pub struct Classification {
     pub labels: Vec<Label>,
     pub tried: Vec<Tried>,
+    #[serde(default)]
+    pub allocations: Vec<Allocation>,
 }
 
 /// The band a classifier analyses within an IQ block: its centre's offset
@@ -127,6 +131,8 @@ pub struct Measurement {
     pub label: Label,
 }
 
+// `classify_measured` takes the band, both earlier answers and the register: eight.
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait Classifier: Send + Sync {
     fn name(&self) -> &str;
@@ -143,11 +149,13 @@ pub trait Classifier: Send + Sync {
     ) -> Vec<Label>;
 
     /// [`Classifier::classify`] given `measured`, an earlier classifier's
-    /// measurement of the same band, and returning the classifier's own
-    /// measurement when it made one and the modes it tried. The default
-    /// ignores `measured`, measures nothing and tries nothing; a classifier
-    /// that measures the band overrides this to return it, and one that needs
-    /// a measurement overrides it to use `measured` instead of measuring again.
+    /// measurement of the same band, and `allocations`, the register's
+    /// assignments for it (nearest first; empty when none was consulted),
+    /// returning the classifier's own measurement when it made one and the
+    /// modes it tried. The default ignores `measured` and `allocations`,
+    /// measures nothing and tries nothing; a classifier that measures the band
+    /// overrides this to return it, and one that needs a measurement overrides
+    /// it to use `measured` instead of measuring again.
     async fn classify_measured(
         &self,
         iq: &[Complex<f32>],
@@ -156,6 +164,7 @@ pub trait Classifier: Send + Sync {
         band: Band,
         features: Option<&FeatureRecord>,
         _measured: Option<&Measurement>,
+        _allocations: &[Allocation],
     ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
         (
             self.classify(iq, sample_rate_hz, center_hz, band, features)
@@ -203,6 +212,8 @@ impl ClassifierSet {
     /// `center_hz`), lowest layer first; registration order within a layer.
     /// The first [`Measurement`] a classifier returns is passed to every
     /// classifier after it; the modes each tried are listed in the same order.
+    /// `allocations` (the register's assignments for the band) are handed to
+    /// every classifier and returned with the result.
     pub async fn run_all(
         &self,
         iq: &[Complex<f32>],
@@ -210,6 +221,7 @@ impl ClassifierSet {
         center_hz: Hz,
         band: Band,
         features: Option<&FeatureRecord>,
+        allocations: Vec<Allocation>,
     ) -> Classification {
         let mut ordered: Vec<&Arc<dyn Classifier>> = self.classifiers.iter().collect();
         ordered.sort_by_key(|c| c.layer());
@@ -224,6 +236,7 @@ impl ClassifierSet {
                     band,
                     features,
                     measured.as_ref(),
+                    &allocations,
                 )
                 .await;
             out.labels.extend(l);
@@ -232,6 +245,7 @@ impl ClassifierSet {
                 measured = m;
             }
         }
+        out.allocations = allocations;
         out
     }
 
@@ -247,7 +261,7 @@ impl ClassifierSet {
     ) -> Option<Measurement> {
         for c in self.classifiers.iter().filter(|c| c.layer() == 1) {
             let (_, m, _) = c
-                .classify_measured(iq, sample_rate_hz, center_hz, band, None, None)
+                .classify_measured(iq, sample_rate_hz, center_hz, band, None, None, &[])
                 .await;
             if m.is_some() {
                 return m;
@@ -298,7 +312,8 @@ mod tests {
     /// Layer 1 that measures (returning `marker` as its record), and layer 2
     /// that records the measurement it was handed.
     struct Measures(FeatureRecord);
-    struct Uses(Mutex<Vec<Option<Measurement>>>);
+    /// Records the measurement and the allocations each run hands it.
+    struct Uses(Mutex<Vec<Option<Measurement>>>, Mutex<Vec<Allocation>>);
 
     fn label(layer: u8, name: &str) -> Label {
         Label {
@@ -335,6 +350,7 @@ mod tests {
             _: Band,
             _: Option<&FeatureRecord>,
             _: Option<&Measurement>,
+            _: &[Allocation],
         ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
             let l = label(1, "wfm");
             (
@@ -374,8 +390,10 @@ mod tests {
             _: Band,
             _: Option<&FeatureRecord>,
             measured: Option<&Measurement>,
+            allocations: &[Allocation],
         ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
             self.0.lock().unwrap().push(measured.cloned());
+            self.1.lock().unwrap().extend_from_slice(allocations);
             let tried = Tried {
                 mode: "uses_decode".into(),
                 score: 0.5,
@@ -400,16 +418,30 @@ mod tests {
             order: None,
             tone_spacing_hz: None,
         };
-        let uses = Arc::new(Uses(Mutex::new(Vec::new())));
+        let uses = Arc::new(Uses(Mutex::new(Vec::new()), Mutex::new(Vec::new())));
+        let licence = Allocation {
+            licensee: Some("Test Pty Ltd".into()),
+            ..Allocation::default()
+        };
         let mut set = ClassifierSet::default();
         // Registered before layer 1: run_all orders by layer, not registration.
         set.register(uses.clone());
         set.register(Arc::new(Measures(marker.clone())));
         set.register(Arc::new(StubClassifier));
         let c = set
-            .run_all(&[], Hz(240_000), Hz(0), Band::whole(Hz(240_000)), None)
+            .run_all(
+                &[],
+                Hz(240_000),
+                Hz(0),
+                Band::whole(Hz(240_000)),
+                None,
+                vec![licence.clone()],
+            )
             .await;
         assert_eq!(c.labels, [label(1, "wfm")]);
+        // The allocations reach the classifiers and come back beside the labels.
+        assert_eq!(c.allocations, std::slice::from_ref(&licence));
+        assert_eq!(*uses.1.lock().unwrap(), [licence]);
         // The modes a classifier tried are collected beside the labels.
         assert_eq!(c.tried.len(), 1);
         assert_eq!(c.tried[0].mode, "uses_decode");
@@ -432,7 +464,14 @@ mod tests {
         set.register(Arc::new(StubClassifier));
         set.register(Arc::new(fixed(2, "b")));
         let names: Vec<String> = set
-            .run_all(&[], Hz(48_000), Hz(0), Band::whole(Hz(48_000)), None)
+            .run_all(
+                &[],
+                Hz(48_000),
+                Hz(0),
+                Band::whole(Hz(48_000)),
+                None,
+                vec![],
+            )
             .await
             .labels
             .into_iter()
@@ -453,6 +492,7 @@ mod tests {
             Hz(104_900_000),
             Band::whole(Hz(48_000)),
             None,
+            vec![],
         )
         .await;
         assert_eq!(*a.2.lock().unwrap(), [Hz(104_900_000)]);

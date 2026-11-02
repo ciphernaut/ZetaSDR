@@ -24,8 +24,9 @@ use super::persist::now;
 use super::{Inner, NodeError, source_fault_reason};
 use crate::classify::{Band, Measurement, Outcome};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
+use crate::knowledge::{Allocation, DEFAULT_REGION, nearest_assignments};
 use crate::modes::Proof;
-use crate::modes::score::score_rows;
+use crate::modes::score::{allocation_match, allocation_term, score_rows};
 use crate::modes::{LoadedMode, ModeState};
 use crate::ops::{IDENTIFY_MEASURE_MS, JobKind};
 use crate::port::{Port, Tuning};
@@ -232,7 +233,9 @@ impl Inner {
         }
     }
 
-    /// Publish one `candidate` event on the job's stream.
+    /// Publish one `candidate` event on the job's stream; `allocation` is the register's
+    /// assignment that fits the row best ([`allocation_match`]), if any.
+    #[allow(clippy::too_many_arguments)]
     fn candidate(
         &self,
         r: &Run,
@@ -241,6 +244,7 @@ impl Inner {
         outcome: Outcome,
         evidence: &str,
         job: Option<&JobId>,
+        allocation: Option<&Allocation>,
     ) {
         let outcome_name = serde_json::to_value(outcome).expect("outcome serialises");
         let summary = format!("{mode}: {}", outcome_name.as_str().unwrap_or_default());
@@ -253,6 +257,7 @@ impl Inner {
             "evidence": evidence,
             "summary": summary,
             "job": job.map(|j| j.0.clone()),
+            "allocation": allocation,
             "t_ns": t.0,
         });
         let prov = Provenance {
@@ -266,8 +271,9 @@ impl Inner {
             .publish(Frame::new(r.out.clone(), prov, Payload::Event(payload)));
     }
 
-    /// Start `mode`'s job on the job's source and band, inside the capture the job
-    /// holds (so granted without a retune). The launch runs in its own task, so a
+    /// Start `mode`'s job on the job's source at `tuning` (the job's band, or its width
+    /// on the measured centre), inside the capture the job holds (so granted without a
+    /// retune). The launch runs in its own task, so a
     /// stop of the job never drops it half way: a stop under the source's gate (which
     /// the launch's lease waits on) leaves it to a task that stops the child once it
     /// is up; any other waits for it and stops the child. `Ok(None)`: cancelled.
@@ -275,6 +281,7 @@ impl Inner {
         self: &Arc<Self>,
         r: &Run,
         mode: &LoadedMode,
+        tuning: Tuning,
     ) -> Result<Option<JobId>, String> {
         let kind = JobKind::from_name(&mode.row.id.0)
             .ok_or_else(|| format!("{} is not a job kind", mode.row.id.0))?;
@@ -283,7 +290,7 @@ impl Inner {
         let graph = kind
             .expand(
                 &r.prov.source,
-                r.tuning,
+                tuning,
                 capture.bandwidth_hz,
                 bin_rate,
                 None,
@@ -297,7 +304,7 @@ impl Inner {
             kind: kind.name().to_string(),
             graph,
             source: r.prov.source.clone(),
-            tuning: r.tuning,
+            tuning,
             state: JobState::Running,
             context: serde_json::json!({}),
             created_ns: now(),
@@ -425,13 +432,16 @@ impl Inner {
 }
 
 /// The `identify` job's body: (1) measure [`IDENTIFY_MEASURE_MS`] of the ring over
-/// the band with the node's layer-1 classifiers; (2) score the rows
-/// ([`score_rows`], the measured centre, the job's own band; no catalogue term, which
-/// lives with the classifiers) and publish `skipped_band` for those wider than the
-/// band and `unavailable` for those not ready; (3) try the rest in score order, each
-/// as a child job for its `identify.dwell_ms`: `no_frame` stops it before the next,
-/// `proved` leaves it running and ends the job with the verdict; (4) an exhausted list
-/// ends the job with `mode: null`, the layer-1 label and features.
+/// the band with the node's layer-1 classifiers, and ask the knowledge providers once
+/// for the band's nearest assignments (the station's region, else [`DEFAULT_REGION`]);
+/// (2) score the rows ([`score_rows`], the measured centre, the job's own band, the
+/// register's [`allocation_term`]; no catalogue term, which lives with the
+/// classifiers) and publish `skipped_band` for those wider than the band and
+/// `unavailable` for those not ready; (3) try the rest in score order, each as a child
+/// job for its `identify.dwell_ms`, centred on the measured centre when that lies in
+/// the band (else on the band's): `no_frame` stops it before the next, `proved` leaves
+/// it running and ends the job with the verdict; (4) an exhausted list ends the job
+/// with `mode: null`, the layer-1 label and features, `recentred` and `allocations`.
 async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     // A child the run before a restart was trying (resumed as an ordinary job): stopped
     // first, needing no samples, so a measurement that fails cannot orphan it.
@@ -459,10 +469,38 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         .as_ref()
         .map_or(r.tuning.center_hz.0, |m| m.features.center_hz.0);
     let bw = r.tuning.bandwidth_hz.0;
-    let scored = score_rows(&inner.modes, m_center, bw, &layer1, &|_| 0.0);
+    // Each trial runs on the measured centre when the measurement lies in the band.
+    let recentred = measured.is_some() && m_center.abs_diff(r.tuning.center_hz.0) <= bw / 2;
+    let trial = Tuning {
+        center_hz: match recentred {
+            true => Hz(m_center),
+            false => r.tuning.center_hz,
+        },
+        bandwidth_hz: r.tuning.bandwidth_hz,
+    };
+    let region = inner
+        .station
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region.clone());
+    let providers = inner.knowledge.read().unwrap().clone();
+    let lookup = nearest_assignments(
+        &providers,
+        &region,
+        r.tuning.center_hz,
+        r.tuning.bandwidth_hz,
+    );
+    let allocations = tokio::select! {
+        a = lookup => a,
+        _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
+    };
+    let allocation = |m: &LoadedMode| allocation_term(m, &allocations);
+    let scored = score_rows(&inner.modes, m_center, bw, &layer1, &|_| 0.0, &allocation);
     let mut tries = Vec::new();
     for s in &scored {
         let id = s.mode.row.id.0.as_str();
+        let fit = allocation_match(s.mode, &allocations);
         if !s.fits_band {
             let min = s
                 .mode
@@ -471,12 +509,12 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                 .min_hz
                 .unwrap_or(s.mode.row.band.bandwidth_hz);
             let evidence = format!("needs a band of at least {min} Hz; the job's is {bw} Hz");
-            inner.candidate(&r, id, s.score, Outcome::SkippedBand, &evidence, None);
+            inner.candidate(&r, id, s.score, Outcome::SkippedBand, &evidence, None, fit);
         } else if s.mode.state != ModeState::Ready {
             let evidence = s.mode.reason.clone().unwrap_or_else(|| "not ready".into());
-            inner.candidate(&r, id, s.score, Outcome::Unavailable, &evidence, None);
+            inner.candidate(&r, id, s.score, Outcome::Unavailable, &evidence, None, fit);
         } else {
-            tries.push((s.mode, s.score));
+            tries.push((s.mode, s.score, fit));
         }
     }
     let faulted = |f: String| StageError::Failed(source_fault_reason(r.port.id(), &f));
@@ -486,7 +524,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         child: None,
     };
     let mut attempts = 0;
-    for (mode, score) in tries {
+    for (mode, score, fit) in tries {
         if r.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
         }
@@ -494,11 +532,11 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             return Err(faulted(f));
         }
         let id = mode.row.id.0.as_str();
-        let child = match inner.start_child(&r, mode).await {
+        let child = match inner.start_child(&r, mode, trial).await {
             Ok(Some(c)) => c,
             Ok(None) => return Err(StageError::Cancelled),
             Err(e) => {
-                inner.candidate(&r, id, score, Outcome::Unavailable, &e, None);
+                inner.candidate(&r, id, score, Outcome::Unavailable, &e, None, fit);
                 continue;
             }
         };
@@ -515,12 +553,14 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                 if let Some(f) = r.port.fault() {
                     return Err(faulted(f));
                 }
-                inner.candidate(&r, id, score, Outcome::NoFrame, &evidence, Some(&child));
+                let job = Some(&child);
+                inner.candidate(&r, id, score, Outcome::NoFrame, &evidence, job, fit);
             }
             Attempt::Proved { evidence, summary } => {
                 // The proved child outlives the job.
                 current.child = None;
-                inner.candidate(&r, id, score, Outcome::Proved, &evidence, Some(&child));
+                let job = Some(&child);
+                inner.candidate(&r, id, score, Outcome::Proved, &evidence, job, fit);
                 let verdict = serde_json::json!({"identify": {
                     "verdict": {
                         "mode": id,
@@ -528,6 +568,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                         "summary": summary,
                         "evidence": evidence,
                         "job": child.0,
+                        "allocations": allocations,
                     },
                     "attempts": attempts,
                 }});
@@ -544,6 +585,8 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             "mode": null,
             "label": layer1,
             "features": measured.as_ref().map(|m| &m.features),
+            "recentred": recentred,
+            "allocations": allocations,
         },
         "attempts": attempts,
     }});

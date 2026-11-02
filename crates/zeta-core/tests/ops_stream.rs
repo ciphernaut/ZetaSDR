@@ -331,6 +331,7 @@ fn variant_name_matches_the_serialised_tag() {
         OpResult::Classification {
             labels: vec![],
             tried: vec![],
+            allocations: vec![],
         },
         OpResult::Ok,
         OpResult::Schema(serde_json::json!({})),

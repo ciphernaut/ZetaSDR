@@ -2,6 +2,7 @@
 //! `identify` try the modes in.
 
 use super::{LoadedMode, ModeRegistry, ModeState};
+use crate::knowledge::Allocation;
 
 /// Score for the measured centre lying near one of the row's well-known centres or in
 /// its `range_hz` (granted when it has neither).
@@ -10,6 +11,67 @@ const CENTER_SCORE: f32 = 0.4;
 const BANDWIDTH_SCORE: f32 = 0.3;
 /// Score for the layer-1 label being one the row presents as.
 const MODULATION_SCORE: f32 = 0.3;
+/// Score for a licensed transmitter on the band whose emission fits the row
+/// ([`allocation_term`]).
+pub const ALLOCATION_SCORE: f32 = 0.2;
+/// An assignment's bandwidth fits a row's within these factors of `band.bandwidth_hz`.
+const ALLOCATION_WIDTH: (f64, f64) = (0.5, 1.5);
+/// The layer-1 labels each emission designator's modulation letter is compatible with.
+const DESIGNATOR_LABELS: &[(char, &[&str])] = &[
+    ('F', &["fm", "fsk"]),
+    ('G', &["fm", "fsk", "psk"]),
+    ('D', &["psk"]),
+    ('A', &["am", "ssb"]),
+    ('H', &["am", "ssb"]),
+    ('J', &["am", "ssb"]),
+    ('R', &["am", "ssb"]),
+    ('N', &["carrier"]),
+];
+
+/// The `tx` assignment of `allocs` that fits `row`, the first in their order (a
+/// provider lists the nearest first): its decoded designator's `bandwidth_hz` (else the
+/// assignment's own `bandwidth_hz`) within 0.5-1.5 times the row's `band.bandwidth_hz`,
+/// and its modulation letter compatible with one of the row's `modulation` labels
+/// (`F`, `G` with `fm`/`fsk`; `G`, `D` with `psk`; `A`, `H`, `J`, `R` with `am`/`ssb`;
+/// `N` with `carrier`). An assignment without a designator passes the modulation test;
+/// one without any bandwidth fits none. Plan rows and receivers never match.
+pub fn allocation_match<'a>(row: &LoadedMode, allocs: &'a [Allocation]) -> Option<&'a Allocation> {
+    let bw = row.row.band.bandwidth_hz as f64;
+    let (lo, hi) = ALLOCATION_WIDTH;
+    allocs.iter().find(|a| {
+        if a.role.as_deref() != Some("tx") || a.kind.as_deref() == Some("plan") {
+            return false;
+        }
+        let width = a
+            .emission_decoded
+            .as_ref()
+            .map(|e| e.bandwidth_hz)
+            .or(a.bandwidth_hz);
+        let Some(width) = width else {
+            return false;
+        };
+        if !(bw * lo..=bw * hi).contains(&(width.0 as f64)) {
+            return false;
+        }
+        let Some(e) = &a.emission_decoded else {
+            return true;
+        };
+        DESIGNATOR_LABELS
+            .iter()
+            .filter(|(c, _)| *c == e.modulation)
+            .flat_map(|(_, labels)| labels.iter())
+            .any(|l| row.row.modulation.iter().any(|m| m == l))
+    })
+}
+
+/// [`ALLOCATION_SCORE`] when [`allocation_match`] finds a `tx` assignment that fits
+/// `row`, else 0.
+pub fn allocation_term(row: &LoadedMode, allocs: &[Allocation]) -> f32 {
+    match allocation_match(row, allocs) {
+        Some(_) => ALLOCATION_SCORE,
+        None => 0.0,
+    }
+}
 
 /// One row's score against a measured band.
 #[derive(Clone, Debug)]
@@ -27,7 +89,8 @@ pub struct Scored<'a> {
 /// inside `band.range_hz` (or the row has neither, "anywhere"); 0.3 when `bandwidth_hz`
 /// lies within 0.5-1.5 times `band.bandwidth_hz`; 0.3 when `layer1` is in `modulation`
 /// (never for an empty list); plus the best `catalogue(id)` among the row's `catalogue`
-/// ids, so a catalogue match can lift a row above 1. Highest score first; equal scores
+/// ids, so a catalogue match can lift a row above 1; plus `allocation(row)` (the
+/// register's term, [`allocation_term`]). Highest score first; equal scores
 /// by `identify.priority` (highest first), then `family`, then `id`.
 pub fn score_rows<'a>(
     modes: &'a ModeRegistry,
@@ -35,6 +98,7 @@ pub fn score_rows<'a>(
     bandwidth_hz: u64,
     layer1: &str,
     catalogue: &dyn Fn(&str) -> f32,
+    allocation: &dyn Fn(&LoadedMode) -> f32,
 ) -> Vec<Scored<'a>> {
     let mut scored: Vec<Scored> = modes
         .all()
@@ -70,7 +134,8 @@ pub fn score_rows<'a>(
                 .filter(|(hit, _)| *hit)
                 .map(|(_, s)| s)
                 .sum::<f32>()
-                + best;
+                + best
+                + allocation(m);
             Scored {
                 mode: m,
                 score,
@@ -127,7 +192,14 @@ mod tests {
     #[test]
     fn aprs_at_144_800_scores_highest_and_wide_rows_do_not_fit() {
         let modes = registry();
-        let got = ids(&score_rows(&modes, 144_800_000, 12_500, "fm", &|_| 0.0));
+        let got = ids(&score_rows(
+            &modes,
+            144_800_000,
+            12_500,
+            "fm",
+            &|_| 0.0,
+            &|_| 0.0,
+        ));
         assert_eq!(got[0].0, "aprs_decode");
         assert!((got[0].1 - 1.0).abs() < 1e-6, "{got:?}");
         assert!(got[0].2, "{got:?}");
@@ -151,14 +223,28 @@ mod tests {
                 0.0
             }
         };
-        let got = ids(&score_rows(&modes, 104_900_000, 150_000, "wfm", &cat));
+        let got = ids(&score_rows(
+            &modes,
+            104_900_000,
+            150_000,
+            "wfm",
+            &cat,
+            &|_| 0.0,
+        ));
         assert_eq!(got[0].0, "rds_decode", "{got:?}");
         // Centre granted (no list), bandwidth, modulation, plus the catalogue's 0.7.
         assert!((got[0].1 - 1.7).abs() < 1e-6, "{got:?}");
         assert!(got[0].2, "150 kHz meets rds's min_hz");
         set_state(&mut modes, "rds_decode", ModeState::Broken);
         set_state(&mut modes, "adsb_decode", ModeState::Unavailable);
-        let got = ids(&score_rows(&modes, 104_900_000, 150_000, "wfm", &cat));
+        let got = ids(&score_rows(
+            &modes,
+            104_900_000,
+            150_000,
+            "wfm",
+            &cat,
+            &|_| 0.0,
+        ));
         assert!(got.iter().all(|g| g.0 != "rds_decode"), "{got:?}");
         assert!(got.iter().any(|g| g.0 == "adsb_decode"), "{got:?}");
     }
@@ -182,7 +268,7 @@ mod tests {
             r.catalogue = vec![];
         });
         let sonde = |center_hz| {
-            score_rows(&modes, center_hz, 1, "noise", &|_| 0.0)
+            score_rows(&modes, center_hz, 1, "noise", &|_| 0.0, &|_| 0.0)
                 .iter()
                 .find(|s| s.mode.row.id.0 == "sonde")
                 .unwrap()
@@ -199,7 +285,7 @@ mod tests {
         add_row(&mut modes, "both", |r| {
             r.band.range_hz = Some([400_050_000, 406_000_000]);
         });
-        let both = score_rows(&modes, 1_090_000_000, 1, "noise", &|_| 0.0);
+        let both = score_rows(&modes, 1_090_000_000, 1, "noise", &|_| 0.0, &|_| 0.0);
         let both = both.iter().find(|s| s.mode.row.id.0 == "both").unwrap();
         assert!((both.score - CENTER_SCORE).abs() < 1e-6, "{}", both.score);
     }
@@ -210,7 +296,14 @@ mod tests {
         // Equal score and family; the priority-1 row sorts first though its id is later.
         add_row(&mut modes, "zz_sonde", |r| r.identify.priority = 1);
         add_row(&mut modes, "aa_sonde", |r| r.identify.priority = 0);
-        let got = ids(&score_rows(&modes, 1_090_000_000, 1, "noise", &|_| 0.0));
+        let got = ids(&score_rows(
+            &modes,
+            1_090_000_000,
+            1,
+            "noise",
+            &|_| 0.0,
+            &|_| 0.0,
+        ));
         let order: Vec<&str> = got
             .iter()
             .filter(|g| g.0.ends_with("_sonde") || g.0 == "adsb_decode")
@@ -219,7 +312,14 @@ mod tests {
         assert_eq!(order, ["zz_sonde", "aa_sonde", "adsb_decode"], "{got:?}");
         // A negative priority sorts after the default.
         add_row(&mut modes, "a_low", |r| r.identify.priority = -1);
-        let got = ids(&score_rows(&modes, 1_090_000_000, 1, "noise", &|_| 0.0));
+        let got = ids(&score_rows(
+            &modes,
+            1_090_000_000,
+            1,
+            "noise",
+            &|_| 0.0,
+            &|_| 0.0,
+        ));
         assert_eq!(got.iter().rev().find(|g| g.1 > 0.0).unwrap().0, "a_low");
     }
 
@@ -227,7 +327,7 @@ mod tests {
     fn equal_scores_order_by_family_then_id() {
         let modes = registry();
         // Nothing matches but rds's empty centre list.
-        let got = ids(&score_rows(&modes, 1, 1, "noise", &|_| 0.0));
+        let got = ids(&score_rows(&modes, 1, 1, "noise", &|_| 0.0, &|_| 0.0));
         let order: Vec<&str> = got.iter().map(|g| g.0.as_str()).collect();
         // rds at 0.4; then at 0 rs41 (priority 1), then aviation (acars, adsb), pagers,
         // weather_science (dfm, m20), amateur_digital.
@@ -243,6 +343,66 @@ mod tests {
                 "m20_decode",
                 "aprs_decode"
             ]
+        );
+    }
+
+    /// A transmitter of `designator` (and `bandwidth_hz` when given) in role `role`.
+    fn assignment(designator: Option<&str>, bandwidth_hz: Option<u64>, role: &str) -> Allocation {
+        Allocation {
+            kind: Some("assignment".into()),
+            role: Some(role.into()),
+            emission: designator.map(Into::into),
+            emission_decoded: designator.and_then(crate::emission::parse_emission),
+            bandwidth_hz: bandwidth_hz.map(crate::types::Hz),
+            ..Allocation::default()
+        }
+    }
+
+    #[test]
+    fn a_fitting_transmitter_adds_the_allocation_term() {
+        let modes = registry();
+        let row = |id| modes.get(id).unwrap();
+        let fm = [assignment(Some("16K0F1D"), None, "tx")];
+        // POCSAG: 12.5 kHz, fm/fsk. ACARS: 10 kHz, am: 16 kHz is over 1.5 times.
+        assert_eq!(allocation_term(row("pocsag_decode"), &fm), ALLOCATION_SCORE);
+        assert_eq!(allocation_term(row("acars_decode"), &fm), 0.0);
+        // The modulation letter must suit the row: A3E is AM, not FM.
+        let am = [assignment(Some("10K0A3E"), None, "tx")];
+        assert_eq!(allocation_term(row("pocsag_decode"), &am), 0.0);
+        assert_eq!(allocation_term(row("acars_decode"), &am), ALLOCATION_SCORE);
+        // No designator: the assignment's own bandwidth, and the modulation test passes.
+        let bare = [assignment(None, Some(12_500), "tx")];
+        assert_eq!(
+            allocation_term(row("pocsag_decode"), &bare),
+            ALLOCATION_SCORE
+        );
+        // Receivers, plan rows and a width-less assignment never score.
+        assert_eq!(
+            allocation_term(
+                row("pocsag_decode"),
+                &[assignment(Some("16K0F1D"), None, "rx")]
+            ),
+            0.0
+        );
+        let mut plan = assignment(Some("16K0F1D"), None, "tx");
+        plan.kind = Some("plan".into());
+        assert_eq!(allocation_term(row("pocsag_decode"), &[plan]), 0.0);
+        assert_eq!(
+            allocation_term(row("pocsag_decode"), &[assignment(None, None, "tx")]),
+            0.0
+        );
+        // The term is added to the row's score.
+        let with = score_rows(&modes, 148_637_500, 12_500, "fsk", &|_| 0.0, &|m| {
+            allocation_term(m, &fm)
+        });
+        let pocsag = with
+            .iter()
+            .find(|s| s.mode.row.id.0 == "pocsag_decode")
+            .unwrap();
+        assert!(
+            (pocsag.score - (1.0 + ALLOCATION_SCORE)).abs() < 1e-6,
+            "{}",
+            pocsag.score
         );
     }
 }

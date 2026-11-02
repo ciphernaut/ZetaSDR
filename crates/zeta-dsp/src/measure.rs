@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, Tried};
+use zeta_core::knowledge::Allocation;
 use zeta_core::ops::{MEASURE_DC_MASK_HZ, channel_rate_hz};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
@@ -1171,6 +1172,7 @@ impl Classifier for Layer1Classifier {
         band: Band,
         _features: Option<&FeatureRecord>,
         _measured: Option<&Measurement>,
+        _allocations: &[Allocation],
     ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
         match measure_selection(iq, sample_rate_hz.0, center_hz.0, band) {
             Some((features, label)) => (
@@ -1845,7 +1847,7 @@ mod tests {
         let mut set = ClassifierSet::default();
         set.register(Arc::new(CatalogueClassifier));
         set.register(Arc::new(Layer1Classifier));
-        let (c, n) = measures(set.run_all(&iq, rate, center, band, None)).await;
+        let (c, n) = measures(set.run_all(&iq, rate, center, band, None, vec![])).await;
         let labels = c.labels;
         eprintln!("run_all: {n} measure(s) -> {labels:?}");
         assert_eq!(n, 1, "the band is measured once per run_all");

@@ -13,7 +13,7 @@ use crate::capture::{CaptureMeta, write_cf32};
 use crate::classify::{Band, Classification, Label, Tried};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::{JobRecord, JobState};
-use crate::knowledge::{Allocation, Signature};
+use crate::knowledge::{Allocation, DEFAULT_REGION, Signature, nearest_assignments};
 use crate::lease::LeaseError;
 use crate::modes::{
     Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow, ModeState,
@@ -487,6 +487,18 @@ pub fn is_bcp47(code: &str) -> bool {
 
 /// `ssb_demod` audio bandwidth, Hz, used by the `ssb_demod` job kind.
 pub const SSB_AUDIO_BANDWIDTH_HZ: u64 = 2_800;
+
+/// A result variant's `value` requires every property, its `#[serde(default)]` ones
+/// included: they are always written, and defaulted only for an older node's answer.
+fn require_all_value(schema: &mut schemars::Schema) {
+    let value = schema
+        .get_mut("properties")
+        .and_then(|p| p.get_mut("value"))
+        .and_then(|v| <&mut schemars::Schema>::try_from(v).ok());
+    if let Some(value) = value {
+        crate::knowledge::require_all(value);
+    }
+}
 
 /// Schema of a required `Option<String>`: `["string","null"]`.
 fn nullable_string(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -1914,11 +1926,16 @@ pub enum OpResult {
     Mode {
         mode: Box<LoadedMode>,
     },
-    /// `classify`: every classifier's labels, and the modes decode-to-identify
-    /// considered with their score and outcome.
+    /// `classify`: every classifier's labels, the modes decode-to-identify
+    /// considered with their score and outcome, and the nearest assignments the
+    /// knowledge providers hold for the selection's band (in the station's region).
+    #[schemars(transform = require_all_value)]
     Classification {
         labels: Vec<Label>,
         tried: Vec<Tried>,
+        /// Always written; an older node's answer without it loads as empty.
+        #[serde(default)]
+        allocations: Vec<Allocation>,
     },
     /// A source's gain after `source_set_gain`.
     Gain(GainInfo),
@@ -3513,11 +3530,25 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         offset_hz: sel.center_hz.0 as i64 - center.0 as i64,
         bandwidth_hz: sel.bandwidth_hz,
     };
-    let Classification { labels, tried } = node
+    // Asked once per run, before the classifiers: a dead register costs its deadline once.
+    let region = node
+        .station()
+        .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region);
+    let allocations =
+        nearest_assignments(&node.knowledge(), &region, sel.center_hz, sel.bandwidth_hz).await;
+    let Classification {
+        labels,
+        tried,
+        allocations,
+    } = node
         .classifiers()
-        .run_all(&samples, rate, center, band, None)
+        .run_all(&samples, rate, center, band, None, allocations)
         .await;
-    Ok(OpResult::Classification { labels, tried })
+    Ok(OpResult::Classification {
+        labels,
+        tried,
+        allocations,
+    })
 }
 
 /// Most frames and longest wait one `stream_tail` takes.

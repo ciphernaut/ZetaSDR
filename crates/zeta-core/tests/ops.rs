@@ -827,9 +827,86 @@ async fn classify_op_runs_stub_and_returns_empty_labels() {
         node.apply(Op::Classify { selection }).await,
         Ok(OpResult::Classification {
             labels: vec![],
-            tried: vec![]
+            tried: vec![],
+            allocations: vec![],
         })
     );
+}
+
+/// A licence register's answer: one transmitter, 16K0F1D, and one plan row.
+struct RegisterProvider;
+
+#[async_trait]
+impl KnowledgeProvider for RegisterProvider {
+    fn name(&self) -> &str {
+        "register"
+    }
+    async fn allocations(&self, region: &str, center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Allocation> {
+        vec![
+            Allocation {
+                provider: "register".into(),
+                region: region.into(),
+                min_hz: Hz(center_hz.0 - 8_000),
+                max_hz: Hz(center_hz.0 + 8_000),
+                service: "assignment".into(),
+                note: None,
+                kind: Some("assignment".into()),
+                licensee: Some("Test Paging Pty Ltd".into()),
+                site: Some("Mt Coot-tha".into()),
+                distance_km: Some(12.3),
+                center_hz: Some(center_hz),
+                bandwidth_hz: Some(Hz(16_000)),
+                role: Some("tx".into()),
+                emission: Some("16K0F1D".into()),
+                emission_decoded: zeta_core::emission::parse_emission("16K0F1D"),
+                ..Allocation::default()
+            },
+            Allocation {
+                provider: "register".into(),
+                region: region.into(),
+                min_hz: Hz(center_hz.0 - 1_000_000),
+                max_hz: Hz(center_hz.0 + 1_000_000),
+                service: "fixed primary".into(),
+                note: None,
+                kind: Some("plan".into()),
+                ..Allocation::default()
+            },
+        ]
+    }
+    async fn signatures(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Signature> {
+        vec![]
+    }
+}
+
+#[tokio::test]
+async fn classify_lists_allocations_beside_the_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    node.add_classifier(Arc::new(StubClassifier));
+    node.add_knowledge(Arc::new(RegisterProvider));
+    src.start();
+    let selection = selection(&node, 100_000_000, 48_000).await;
+    let Ok(OpResult::Classification { allocations, .. }) =
+        node.apply(Op::Classify { selection }).await
+    else {
+        panic!("expected Classification");
+    };
+    // The assignment; the plan row is not kept.
+    assert_eq!(allocations.len(), 1, "{allocations:?}");
+    assert_eq!(
+        allocations[0].licensee.as_deref(),
+        Some("Test Paging Pty Ltd")
+    );
+    // An older node's answer, without `allocations`, still loads.
+    let old: OpResult = serde_json::from_value(serde_json::json!({
+        "result": "classification",
+        "value": {"labels": [], "tried": []},
+    }))
+    .unwrap();
+    assert!(matches!(old, OpResult::Classification { allocations, .. } if allocations.is_empty()));
 }
 
 #[tokio::test]

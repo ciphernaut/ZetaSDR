@@ -95,7 +95,15 @@ async fn classify_span(
         bandwidth_hz: Hz(bandwidth_hz),
     };
     let c = match node.apply(Op::Classify { selection }).await {
-        Ok(OpResult::Classification { labels, tried }) => Classification { labels, tried },
+        Ok(OpResult::Classification {
+            labels,
+            tried,
+            allocations,
+        }) => Classification {
+            labels,
+            tried,
+            allocations,
+        },
         other => panic!("expected a classification, got {other:?}"),
     };
     eprintln!("classification at {center_hz}: {c:?}");

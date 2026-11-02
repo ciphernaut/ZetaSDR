@@ -12,6 +12,8 @@ use num_complex::Complex;
 use serde_json::Value;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
+use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
+use zeta_core::modes::score::score_rows;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::port::{IqReceiver, Port, PortError, Tuning};
@@ -26,17 +28,21 @@ const BANDWIDTH_HZ: u64 = 12_500;
 const APRS_HZ: u64 = 144_800_000;
 /// A well-known POCSAG centre: `pocsag_decode` is tried first.
 const POCSAG_HZ: u64 = 148_637_500;
+/// Where the tone fixture's 1 kHz tone sits.
+const TONE_HZ: u64 = APRS_HZ + 1_000;
 
 /// Each node runs a 2.048 MHz source in real time: the tests run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The fixtures, written once: the POCSAG page centred on [`APRS_HZ`] and on
-/// [`POCSAG_HZ`], and one second of a 1 kHz tone on [`APRS_HZ`].
+/// [`POCSAG_HZ`], one second of a 1 kHz tone on [`APRS_HZ`], and one second of random
+/// 2400-baud GFSK (no row proves it) on [`APRS_HZ`].
 struct Fixtures {
     _dir: tempfile::TempDir,
     pocsag_on_aprs: PathBuf,
     pocsag: PathBuf,
     tone: PathBuf,
+    gfsk: PathBuf,
 }
 
 fn fixtures() -> &'static Fixtures {
@@ -54,11 +60,24 @@ fn fixtures() -> &'static Fixtures {
             })
             .collect();
         let tone = write(dir.path(), "tone", &tone, RATE_HZ, APRS_HZ);
+        let mut state = 0x5eed_u64;
+        let symbols: Vec<u8> = (0..2400)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 63) as u8
+            })
+            .collect();
+        let mut gfsk = zeta_dsp::synth::gfsk_modulate(&symbols, 2, 2400, 3_000.0, RATE_HZ);
+        zeta_dsp::synth::awgn(&mut gfsk, 20.0, 1);
+        let gfsk = write(dir.path(), "gfsk", &gfsk, RATE_HZ, APRS_HZ);
         Fixtures {
             _dir: dir,
             pocsag_on_aprs,
             pocsag,
             tone,
+            gfsk,
         }
     })
 }
@@ -634,5 +653,112 @@ async fn identify_resumed_after_a_restart_stops_its_stale_child() {
     .expect("a candidate from the resumed identify");
     assert_eq!(first["protocol"], "candidate", "{first}");
     assert_ne!(state(&node, &child), JobState::Running);
+    stop_all(&node).await;
+}
+
+/// A licence register's answer: one band-plan row, and one transmitter licensed for
+/// 16K0F1D on the band, 12 km away.
+struct Register;
+
+/// The licensee [`Register`] names.
+const LICENSEE: &str = "Test Paging Pty Ltd";
+
+#[async_trait]
+impl KnowledgeProvider for Register {
+    fn name(&self) -> &str {
+        "register"
+    }
+    async fn allocations(&self, region: &str, center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Allocation> {
+        vec![
+            Allocation {
+                provider: "register".into(),
+                region: region.into(),
+                min_hz: Hz(center_hz.0 - 1_000_000),
+                max_hz: Hz(center_hz.0 + 1_000_000),
+                service: "fixed primary".into(),
+                note: None,
+                kind: Some("plan".into()),
+                ..Allocation::default()
+            },
+            Allocation {
+                provider: "register".into(),
+                region: region.into(),
+                min_hz: Hz(center_hz.0 - 8_000),
+                max_hz: Hz(center_hz.0 + 8_000),
+                service: "assignment".into(),
+                note: None,
+                kind: Some("assignment".into()),
+                licensee: Some(LICENSEE.into()),
+                site: Some("Mt Coot-tha".into()),
+                distance_km: Some(12.3),
+                center_hz: Some(center_hz),
+                bandwidth_hz: Some(Hz(16_000)),
+                role: Some("tx".into()),
+                emission: Some("16K0F1D".into()),
+                emission_decoded: zeta_core::emission::parse_emission("16K0F1D"),
+                ..Allocation::default()
+            },
+        ]
+    }
+    async fn signatures(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Signature> {
+        vec![]
+    }
+}
+
+/// With a register answering a 16K0F1D transmitter, an unknown verdict carries the nearest
+/// assignments beside its features, and a row the designator fits (POCSAG: 12.5 kHz,
+/// `fm`/`fsk`) scores the allocation term over what the measurement alone gives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_verdict_carries_the_nearest_allocations_and_the_score_term() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().gfsk).await;
+    node.add_knowledge(Arc::new(Register));
+    let (id, events) = identify(&node, APRS_HZ).await;
+    let events = ended(&node, &id, events, Duration::from_secs(40)).await;
+    let ctx = node.job_context(&id).unwrap();
+    let verdict = &ctx["identify"]["verdict"];
+    assert!(verdict["mode"].is_null(), "{ctx}");
+    assert_eq!(verdict["recentred"], true, "{ctx}");
+    let allocations = verdict["allocations"].as_array().expect("allocations");
+    // The assignment only: the plan row is not kept.
+    assert_eq!(allocations.len(), 1, "{ctx}");
+    assert_eq!(allocations[0]["licensee"], LICENSEE, "{ctx}");
+    let pocsag = outcome(&events, "pocsag_decode").expect("pocsag_decode considered");
+    assert_eq!(pocsag["allocation"]["licensee"], LICENSEE, "{pocsag}");
+    // What the measurement alone scores the row.
+    let label = verdict["label"].as_str().unwrap();
+    let center = verdict["features"]["center_hz"].as_u64().unwrap();
+    let modes = node.modes();
+    let base = score_rows(&modes, center, BANDWIDTH_HZ, label, &|_| 0.0, &|_| 0.0)
+        .into_iter()
+        .find(|s| s.mode.row.id.0 == "pocsag_decode")
+        .unwrap()
+        .score;
+    let score = pocsag["score"].as_f64().unwrap() as f32;
+    assert!(score >= base + 0.2 - 1e-4, "{score} vs {base}: {pocsag}");
+    // A row the designator does not fit (ACARS: 10 kHz, and 16 kHz is over 1.5 times
+    // that) has no allocation.
+    let acars = outcome(&events, "acars_decode").expect("acars_decode considered");
+    assert!(acars["allocation"].is_null(), "{acars}");
+}
+
+/// Identify's band centred 2 kHz above the tone: each trial job starts on the measured
+/// centre (the tone), not on the band's, with the band's width.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trial_jobs_start_on_the_measured_centre() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().tone).await;
+    let (id, _events) = identify(&node, TONE_HZ + 2_000).await;
+    let (child, _) = first_child(&node, "aprs_decode").await;
+    let rec = node.job_list().into_iter().find(|r| r.id == child).unwrap();
+    assert!(
+        rec.tuning.center_hz.0.abs_diff(TONE_HZ) <= 500,
+        "child at {} Hz, the tone at {TONE_HZ} Hz",
+        rec.tuning.center_hz.0
+    );
+    assert_eq!(rec.tuning.bandwidth_hz, Hz(BANDWIDTH_HZ));
+    node.job_stop(&id).await.unwrap();
     stop_all(&node).await;
 }

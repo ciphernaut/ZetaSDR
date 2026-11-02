@@ -96,7 +96,15 @@ async fn catalogue_uses_a_handed_measurement_without_measuring() {
     };
     let band = Band::whole(Hz(WFM_RATE));
     let (labels, own, _) = CatalogueClassifier
-        .classify_measured(&[], Hz(WFM_RATE), Hz(104_900_000), band, None, Some(&m))
+        .classify_measured(
+            &[],
+            Hz(WFM_RATE),
+            Hz(104_900_000),
+            band,
+            None,
+            Some(&m),
+            &[],
+        )
         .await;
     assert!(own.is_none());
     let top = labels.first().expect("labels from the handed measurement");
@@ -115,7 +123,15 @@ async fn catalogue_uses_a_handed_measurement_without_measuring() {
         ..m
     };
     let (labels, _, _) = CatalogueClassifier
-        .classify_measured(&[], Hz(WFM_RATE), Hz(104_900_000), band, None, Some(&noise))
+        .classify_measured(
+            &[],
+            Hz(WFM_RATE),
+            Hz(104_900_000),
+            band,
+            None,
+            Some(&noise),
+            &[],
+        )
         .await;
     assert!(labels.is_empty(), "{labels:?}");
 }

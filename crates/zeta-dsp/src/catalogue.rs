@@ -323,7 +323,7 @@ impl Classifier for CatalogueClassifier {
         band: Band,
         features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
-        self.classify_measured(iq, sample_rate_hz, center_hz, band, features, None)
+        self.classify_measured(iq, sample_rate_hz, center_hz, band, features, None, &[])
             .await
             .0
     }
@@ -335,6 +335,7 @@ impl Classifier for CatalogueClassifier {
         band: Band,
         features: Option<&FeatureRecord>,
         measured: Option<&Measurement>,
+        _allocations: &[Allocation],
     ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
         let own;
         let m = match measured {

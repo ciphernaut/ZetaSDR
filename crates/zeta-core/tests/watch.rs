@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::graph::{Edge, Graph, Node as GraphNode, NodeId};
 use zeta_core::job::JobState;
+use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
@@ -658,6 +659,71 @@ async fn an_unknown_signal_is_retried_at_most_three_times() {
     assert_eq!(running(&node), [(watch.0.clone(), "watch".to_string())]);
     stop_all(&node).await;
     zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// A licence register's answer: one transmitter licensed for 16K0F1D on the band.
+struct Register;
+
+#[async_trait]
+impl KnowledgeProvider for Register {
+    fn name(&self) -> &str {
+        "register"
+    }
+    async fn allocations(&self, region: &str, center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Allocation> {
+        vec![Allocation {
+            provider: "register".into(),
+            region: region.into(),
+            min_hz: Hz(center_hz.0 - 8_000),
+            max_hz: Hz(center_hz.0 + 8_000),
+            service: "assignment".into(),
+            note: None,
+            kind: Some("assignment".into()),
+            licensee: Some("Test Telemetry Pty Ltd".into()),
+            site: Some("Mt Gravatt".into()),
+            distance_km: Some(7.6),
+            center_hz: Some(center_hz),
+            bandwidth_hz: Some(Hz(16_000)),
+            role: Some("tx".into()),
+            emission: Some("16K0F1D".into()),
+            emission_decoded: zeta_core::emission::parse_emission("16K0F1D"),
+            ..Allocation::default()
+        }]
+    }
+    async fn signatures(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Signature> {
+        vec![]
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_summary_names_the_licensee() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let src = file_source("rx", &fixtures().fsk);
+    let node = node_over(
+        dir.path(),
+        vec![(src.clone() as Arc<dyn Port>, src)],
+        Some(&fixtures().quick_modes),
+    )
+    .await;
+    node.add_knowledge(Arc::new(Register));
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    until("an unknown", Duration::from_secs(60), || {
+        !events.watch("unknown").is_empty()
+    })
+    .await;
+    let e = &events.watch("unknown")[0];
+    let summary = e["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("; licensed: Test Telemetry Pty Ltd, Mt Gravatt, 8 km"),
+        "{e}"
+    );
+    assert_eq!(
+        e["allocations"][0]["licensee"], "Test Telemetry Pty Ltd",
+        "{e}"
+    );
+    stop_all(&node).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

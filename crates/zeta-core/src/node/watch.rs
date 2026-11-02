@@ -457,6 +457,8 @@ struct Event<'a> {
     source: Option<&'a SourceId>,
     placed: Option<Placed>,
     features: Option<serde_json::Value>,
+    /// The register's nearest assignments for an `unknown` (the identify verdict's).
+    allocations: Option<serde_json::Value>,
 }
 
 impl Inner {
@@ -477,6 +479,7 @@ impl Inner {
             "source": e.source.map(|s| s.0.clone()),
             "placed": e.placed.map(Placed::as_str),
             "features": e.features,
+            "allocations": e.allocations,
             "summary": summary,
             "t_ns": t.0,
         });
@@ -546,18 +549,25 @@ impl Inner {
     /// measured width within half to 1.5 times the row's band, the scoring's width term)
     /// and the watch's band, else the signal's own width at score 0.
     fn identify_band(&self, r: &Run, s: &Signal) -> (u64, f32) {
-        score_rows(&self.modes, s.center_hz, s.bandwidth_hz, "", &|_| 0.0)
-            .into_iter()
-            .filter(|x| x.mode.state == ModeState::Ready)
-            .find(|x| {
-                let band = &x.mode.row.band;
-                let bw = band.bandwidth_hz as f64;
-                (bw * 0.5..=bw * 1.5).contains(&(s.bandwidth_hz as f64))
-                    && band.bandwidth_hz <= r.tuning.bandwidth_hz.0
-            })
-            .map_or((s.bandwidth_hz, 0.0), |x| {
-                (x.mode.row.band.bandwidth_hz, x.score)
-            })
+        score_rows(
+            &self.modes,
+            s.center_hz,
+            s.bandwidth_hz,
+            "",
+            &|_| 0.0,
+            &|_| 0.0,
+        )
+        .into_iter()
+        .filter(|x| x.mode.state == ModeState::Ready)
+        .find(|x| {
+            let band = &x.mode.row.band;
+            let bw = band.bandwidth_hz as f64;
+            (bw * 0.5..=bw * 1.5).contains(&(s.bandwidth_hz as f64))
+                && band.bandwidth_hz <= r.tuning.bandwidth_hz.0
+        })
+        .map_or((s.bandwidth_hz, 0.0), |x| {
+            (x.mode.row.band.bandwidth_hz, x.score)
+        })
     }
 
     /// Whether a running job other than the watch's own (itself, its identify run, its
@@ -1273,15 +1283,42 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     if v.is_null() {
         summary.push_str("; identify ended without a verdict");
     }
+    let allocations = v["verdict"]["allocations"].clone();
+    summary.push_str(&licensed(&allocations));
     let signal = tracked.signal.clone();
     let e = Event {
         signal: Some(&signal),
         job: Some(&id),
         features: Some(v["verdict"]["features"].clone()),
+        allocations: Some(allocations),
         ..Event::default()
     };
     inner.watch_event(r, "unknown", summary, e);
     true
+}
+
+/// `; licensed: <licensee>, <site>, <d> km` for the nearest `tx` assignment of
+/// `allocations` (an identify verdict's, nearest first), or nothing when there is none.
+fn licensed(allocations: &serde_json::Value) -> String {
+    let nearest = allocations
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|a| a["role"] == "tx");
+    let Some(a) = nearest else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = ["licensee", "site"]
+        .iter()
+        .filter_map(|k| a[*k].as_str().map(str::to_string))
+        .collect();
+    if let Some(d) = a["distance_km"].as_f64() {
+        parts.push(format!("{d:.0} km"));
+    }
+    match parts.is_empty() {
+        true => String::new(),
+        false => format!("; licensed: {}", parts.join(", ")),
+    }
 }
 
 /// Note the decoders' events; drop those whose job no longer runs; stop (`lost`) those
@@ -1414,6 +1451,7 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
                     false => tracked.next_retry_ns = Some(t.saturating_add(retry_ms() * 1_000_000)),
                 }
                 let signal = tracked.signal.clone();
+                // No identify ran, so no register answer: `allocations` stays null.
                 let summary = format!("unknown at {}: identify did not start: {e}", signal.mhz());
                 let ev = Event {
                     signal: Some(&signal),

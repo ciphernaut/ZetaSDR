@@ -8,8 +8,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use num_complex::Complex;
 use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, Outcome, Tried};
-use zeta_core::modes::score::score_rows;
-use zeta_core::modes::{ModeRegistry, ModeState};
+use zeta_core::knowledge::Allocation;
+use zeta_core::modes::score::{allocation_term, score_rows};
+use zeta_core::modes::{LoadedMode, ModeRegistry, ModeState};
 use zeta_core::ops::channel_rate_hz;
 use zeta_core::types::Hz;
 
@@ -57,7 +58,8 @@ const DEVIATION_HZ: u64 = 3_000;
 /// own `band.bandwidth_hz` is narrower, on a channel of the row's width
 /// around the measured centre: `proved` or `no_frame`. A box narrower than
 /// [`MIN_BW_HZ`] is fitted as [`MIN_BW_HZ`] wide. Every row is considered;
-/// a proof does not stop the sweep. Upstream features are not used.
+/// a proof does not stop the sweep. Upstream features are not used. The
+/// register's assignments handed to the run score [`allocation_term`].
 pub struct DecodeToIdentify {
     modes: Arc<ModeRegistry>,
 }
@@ -84,7 +86,7 @@ impl Classifier for DecodeToIdentify {
         band: Band,
         features: Option<&FeatureRecord>,
     ) -> Vec<Label> {
-        self.classify_measured(iq, sample_rate_hz, center_hz, band, features, None)
+        self.classify_measured(iq, sample_rate_hz, center_hz, band, features, None, &[])
             .await
             .0
     }
@@ -96,6 +98,7 @@ impl Classifier for DecodeToIdentify {
         band: Band,
         _features: Option<&FeatureRecord>,
         measured: Option<&Measurement>,
+        allocations: &[Allocation],
     ) -> (Vec<Label>, Option<Measurement>, Vec<Tried>) {
         let rate = sample_rate_hz.0;
         if iq.len() < MIN_SAMPLES || rate < MIN_AUDIO_HZ {
@@ -135,7 +138,8 @@ impl Classifier for DecodeToIdentify {
         };
         let span_ms = iq.len() as u64 * 1000 / rate;
         let catalogue = |id: &str| catalogue_score(id, m_center, m_bw, layer1);
-        let scored = score_rows(&self.modes, m_center, m_bw, layer1, &catalogue);
+        let allocation = |m: &LoadedMode| allocation_term(m, allocations);
+        let scored = score_rows(&self.modes, m_center, m_bw, layer1, &catalogue, &allocation);
         // Each channel is extracted once, when the first row that runs on it does.
         let mut chans: Vec<((i64, u64), Option<(Vec<Complex<f32>>, u64)>)> = Vec::new();
         let mut labels = Vec::new();

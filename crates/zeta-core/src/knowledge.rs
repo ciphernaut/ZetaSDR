@@ -1,6 +1,7 @@
 //! Knowledge providers: what should be at a frequency, and what a signal looks like.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -82,7 +83,7 @@ pub struct Allocation {
 
 /// Every property is always written (`null` when absent), so the schema requires
 /// them all; the `#[serde(default)]` fields still load from files that lack them.
-fn require_all(schema: &mut schemars::Schema) {
+pub(crate) fn require_all(schema: &mut schemars::Schema) {
     let props: Vec<serde_json::Value> = schema
         .get("properties")
         .and_then(serde_json::Value::as_object)
@@ -117,6 +118,41 @@ pub trait KnowledgeProvider: Send + Sync {
     async fn reach(&self, _region: &str, _center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
         None
     }
+}
+
+/// The region a register is asked about when the node has no station.
+pub const DEFAULT_REGION: &str = "AU";
+/// How many assignments `identify` and `classify` keep, nearest first.
+pub const NEAREST_ASSIGNMENTS: usize = 5;
+
+/// Every provider's assignments (`kind` `assignment`; plan rows are not kept) for the
+/// band in `region`, nearest first (an assignment without a distance last; the
+/// providers' order otherwise, which puts transmitters before receivers), at most
+/// [`NEAREST_ASSIGNMENTS`]. One call per provider: a lookup against a dead service
+/// may take seconds.
+pub async fn nearest_assignments(
+    providers: &[Arc<dyn KnowledgeProvider>],
+    region: &str,
+    center_hz: Hz,
+    bandwidth_hz: Hz,
+) -> Vec<Allocation> {
+    let mut out = Vec::new();
+    for p in providers {
+        out.extend(
+            p.allocations(region, center_hz, bandwidth_hz)
+                .await
+                .into_iter()
+                .filter(|a| a.kind.as_deref() == Some("assignment")),
+        );
+    }
+    out.sort_by(|a, b| match (a.distance_km, b.distance_km) {
+        (Some(x), Some(y)) => x.total_cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    out.truncate(NEAREST_ASSIGNMENTS);
+    out
 }
 
 /// Providers backed by JSON data held in memory.
