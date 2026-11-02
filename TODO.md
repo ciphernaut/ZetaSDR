@@ -337,3 +337,7 @@ Rulings of plan 23 an operator may want otherwise:
 - The row cache (`store.lookup`) lives for the page: an operator row edited on the node needs a page reload.
 - The agent's own jobs: `mix_start` ids are not recorded as the run's own, so a run cannot stop a mix it started (the stop gate was not widened).
 - Tracks keep a fix when the subject has moved `track_min_m` (or turned over 10 degrees) and, at `track_points`, thin the older half by every other point (the first point stays). Keeping sharp curves when thinning old points is a future sprint: today a thinned half can cut a corner, and a long straight leg and a tight turn lose points alike.
+
+## Architecture: recipes the node stores and runs by name
+
+From the operator, 2026-11-02. A job setup (all ACARS channels on one radio, the CB plan with transcribers, the sonde watch with a pre-placed decoder) is reproduced from text each time: field craft prose, the scratch scripts on the field host, now `RECIPES.md`. The node cannot tell "the ACARS set" from seven unrelated jobs, and an agent re-derives the ops every run. A recipe should be a thing the node stores next to pins and plans (one JSON file each, `recipes/*.json` built in plus an operator directory as for mode rows): a name, the preconditions, the ops in order, and a start, a status and a stop by name (`recipe_start`, `recipe_status`, `recipe_stop`), with `plan_start` as the one-step special case it generalises. `RECIPES.md` is the stop-gap and the spec material: its JSON blocks are the ops a loader would lift unchanged.
