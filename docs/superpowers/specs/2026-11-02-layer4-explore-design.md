@@ -124,7 +124,7 @@ boxes one:
    fitting row for its dwell. A proof ends the ladder: the decoder is left running.
 2. **The register and the decoders it suggests.** `knowledge_lookup` answers the band's `allocations`
    from every provider; with the ACMA provider configured and a station set, that is each licensed
-   assignment overlapping the band within the radius, nearest first. The allocation's channel width
+   assignment overlapping the band within the band's reach, nearest first. The allocation's channel width
    feeds the row score (section 5.4), so a decoder that fits the licensed channel is tried before one
    that does not. The allocations ride along in the result whatever happens next.
 3. **Features, and the evidence kept.** With no proof, the answer is `unknown` with the layer-1 features
@@ -182,10 +182,20 @@ takes the station's, and with no station the sink is refused naming `sink.params
 home: `view set home` keeps its per-browser value, and with none set the page takes the node's station.
 `region` is also the default `region` of `knowledge_lookup` through the page and the agent guide.
 
+The station also declares its **antennas** (operator, 2026-11-02: the register's reach "will be
+context dependent on the RX antenna setup"): `station_set` takes `antennas`, a list of `{id, kind,
+min_hz, max_hz, height_m, azimuth_deg, elevation_deg}` (`kind` one of `discone`, `dipole`, `skyloop`,
+`vertical`, `yagi`, `dish`, `other`; `azimuth_deg` and `elevation_deg` `null` for an omnidirectional
+one; CLI `--antenna KIND=MIN_HZ-MAX_HZ[,height_m=N,azimuth_deg=N,elevation_deg=N]`, repeatable), and
+`null` for the defaults: a `discone` from 30 MHz up and a `dipole` below 30 MHz (operator: "assume
+discone by default for VHF+, and tuned dipole or ground/skyloop for HF"), both at `alt_m` + 5 m. A
+lookup picks the antenna whose band holds the centre, else the default for that range.
+
 ### 5.3 The ACMA provider
 
-`--knowledge-acma URL[,radius_km=N]` (env `ZETA_KNOWLEDGE_ACMA`) attaches the operator's ACMA
-register service at `URL` as the provider `acma`, `radius_km` 60 by default. The node does not read
+`--knowledge-acma URL[,reach_km=N]` (env `ZETA_KNOWLEDGE_ACMA`) attaches the operator's ACMA
+register service at `URL` as the provider `acma`; `reach_km` is an override of the reach rule below
+(default: derived per lookup). The node does not read
 the mirror itself (the operator, 2026-11-02: "just fire up the mcp service"): the register's schema and
 sync stay in the service, which the operator maintains. The service is the **acma-rrl-server fork**
 (version 1.11.0, checked 2026-11-02 at `http://acma-host:3110`, a different host from
@@ -198,7 +208,7 @@ the node's): MCP over streamable HTTP at `URL/mcp` (`initialize`, `notifications
   `TRANSMITTER_POWER_UNIT`, `SITE_ID`, `LICENCE_NO`), `site` (`NAME`, `LATITUDE`, `LONGITUDE`),
   `licence` (`CLIENT_NO`) and `client` (`LICENCEE`). One fixed query per lookup: the devices whose
   `FREQUENCY ± BANDWIDTH / 2` overlaps the band, joined to site, licence and client, with a bounding
-  box around the station for the radius; it answered the four 404.025 MHz assignments (Example Rail Operator
+  box around the station for the reach; it answered the four 404.025 MHz assignments (Example Rail Operator
   and the water utility, each a `T` and an `R` site, `16K0F2D` and `16K0F1D`) in under 100 ms.
 - `get_frequency_allocation {freq_hz, include_footnotes: false}`: the Australian Spectrum Plan's
   services at the centre (403-406 MHz: FIXED and MOBILE primary, METEOROLOGICAL AIDS and RADIOLOCATION
@@ -214,9 +224,34 @@ logs once per minute, so `identify` goes on without the register; the MCP sessio
 reopened on a `Server not initialized` error. `allocations(region, center_hz, bandwidth_hz)` answers
 only for `region` `AU` (any other region: empty), the plan's services first, then the assignments:
 
-- every assignment overlapping the band whose site lies within `radius_km` of the station, nearest
-  first, at most 50. Without a station the radius is not applied and the list is ordered by the
-  assignment's distance from the band's centre in frequency, `distance_km` and `bearing_deg` `null`.
+- every assignment overlapping the band whose site lies within the lookup's **reach** of the station,
+  nearest first, at most 50. Without a station the reach is not applied and the list is ordered by
+  the assignment's distance from the band's centre in frequency, `distance_km` and `bearing_deg`
+  `null`.
+
+**Reach.** How far the register is searched is a propagation question, not a constant (operator:
+"consider skips on HF bands, and refractions at higher frequencies; the SDR may also be pointed at a
+satellite further away, maybe even abroad"). The provider derives it from the band and the antenna
+that serves it (5.2), and states it in the result (`reach: {km, class, antenna, note}`) so the summary
+reads "within 300 km (VHF, discone)":
+
+| class | band | reach from an omnidirectional antenna | note |
+|---|---|---|---|
+| `ground` | under 2 MHz | 300 km | ground wave and night skywave: the far rows are kept, ordered by distance |
+| `skywave` | 2-30 MHz | no cut: the whole register, nearest first | NVIS by day under 10 MHz reaches a few hundred km, a skip at night thousands; the transmitter may be abroad and outside the register, and the result's `note` says so |
+| `tropo` | 30-300 MHz | 300 km | line of sight is 4.1 √h km each end; tropospheric refraction and ducting carry VHF much further, hence the margin |
+| `uhf` | 300 MHz-1 GHz | 150 km | ducting still happens; 404.025 MHz at 12 km is well inside |
+| `microwave` | over 1 GHz | 60 km | |
+
+A directional antenna (`yagi`, `dish`, or any with an `azimuth_deg`) doubles the reach inside a
+sector of ±30° about its azimuth and halves it outside. An antenna with `elevation_deg` over 20°, or
+a band whose plan services are space ones (`SPACE`, `-SATELLITE`, `EARTH EXPLORATION`), sets class
+`space`: the assignments are searched at the `uhf` reach for earth stations only, and the note says
+the transmitter may be a spacecraft the register does not list. `reach_km` on the flag replaces the
+table's kilometres for every class but `skywave` and `space`, which it caps. The rows the reach
+cuts are gone from the result, not demoted: a wider look is the operator's `reach_km` or a wider
+antenna declaration. The table's numbers are the author's starting values; each is a named constant
+and the field craft says how to read `reach`.
 - each as an `Allocation`: the existing `provider`, `region`, `min_hz`, `max_hz` (the channel), `service`
   (a plan row: the service name with `primary` or `secondary`; an assignment: `assignment`), `note`
   (one line: licensee, site name, distance, power, the designator decoded), plus new optional fields
@@ -629,9 +664,12 @@ the operator's.
 4. The ACMA provider calls the operator's acma-rrl-server fork over its MCP streamable-HTTP endpoint
    (operator: "fire up the mcp service", then "check acma-host:3110, it has a newer
    fork"), never a mirror file, through `execute_sql` and `get_frequency_allocation`; the designator
-   is decoded in the node; radius 60 km; `AU` only; no change in the fork; an unreachable service is
+   is decoded in the node; reach per band class and antenna (call 5); `AU` only; no change in the fork; an unreachable service is
    logged, not fatal.
-5. The station is a node record, not a source property; `sink_sondehub` takes it as a default.
+5. The station is a node record, not a source property; `sink_sondehub` takes it as a default. It
+   carries the antennas (operator's defaults: discone from 30 MHz, dipole below), and the register's
+   reach is derived per lookup from the band class and antenna, with `reach_km` as the override; the
+   reach kilometres in the 5.3 table are the author's starting values.
 6. Demod outputs travel as `audio` frames; bits as `event` frames; no new stream kind.
 7. `graph_start` is the generic "job from a graph with no radio"; `bits_start` is the shorthand that
    builds the chain from a capture's features.
