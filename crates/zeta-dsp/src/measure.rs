@@ -376,8 +376,8 @@ pub fn measure_band(
 /// the envelope moves, else, or when it finds none, the keying line of
 /// [`keying_signal`].
 ///
-/// Order (above the noise SNR only): `order` and `tone_spacing_hz` are the
-/// FSK tones of the instantaneous-frequency clusters over the runs
+/// Order: `order` and `tone_spacing_hz` are the FSK tones of the
+/// instantaneous-frequency clusters over the runs
 /// ([`order::fsk_clusters`]), else of the two-peak rule on the measured
 /// spectrum (order 2); without tones and with a symbol rate, `order` is the
 /// PSK order of the m-th power test ([`order::psk_order`]) and
@@ -478,16 +478,11 @@ pub(crate) fn measure_band_noted(
     // FSK order and spacing from the instantaneous-frequency clusters, else the
     // two-peak rule on the measured spectrum; PSK order only without tones.
     let snr_db = db[peak] - floor;
-    let keyed = snr_db >= NOISE_SNR_DB;
-    let fsk = keyed
-        .then(|| fsk_clusters(&v.runs, rate_hz, (offset, bandwidth_hz)))
-        .flatten()
-        .or_else(|| {
-            let (a, b) = (lo - first, hi - first);
-            tone_pair(db, (a, b), floor + OCCUPIED_DB, bin_hz, true)
-                .map(|(a, b)| (2, Hz((b - a).round() as u64)))
-                .filter(|_| keyed)
-        });
+    let fsk = fsk_clusters(&v.runs, rate_hz, (offset, bandwidth_hz)).or_else(|| {
+        let (a, b) = (lo - first, hi - first);
+        tone_pair(db, (a, b), floor + OCCUPIED_DB, bin_hz, true)
+            .map(|(a, b)| (2, Hz((b - a).round() as u64)))
+    });
     let psk = match (fsk, rate) {
         (None, Some(_)) => psk_order(&v.runs, rate_hz, (offset, bandwidth_hz)),
         _ => None,
@@ -2025,8 +2020,8 @@ mod tests {
 
     #[test]
     fn under_the_noise_snr_the_record_carries_no_order() {
-        // Without the SNR gate these noise windows read order 2 or 4 with a
-        // tone spacing of a few Hz (seeds 0-3 and 5).
+        // Without the 500 Hz minimum spacing these noise windows read order 2
+        // or 4 with a tone spacing of a few Hz (seeds 0-3 and 5).
         for seed in 0..6u64 {
             let mut iq = vec![Complex::new(0.0f32, 0.0); RATE as usize];
             awgn(&mut iq, 0.0, seed);
