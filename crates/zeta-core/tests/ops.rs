@@ -3433,3 +3433,69 @@ fn an_attached_transcribe_skips_its_own_denoise_when_the_input_denoises() {
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);
 }
+
+/// A classify over a span older than the ring fails `too_old`, and the error's
+/// `detail.earliest_ns` is the ring's first retained sample (a number on the wire),
+/// so a client can re-issue on what the ring still holds.
+#[tokio::test]
+async fn too_old_carries_the_rings_earliest_ns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let mut sel = selection(&node, 100_000_000, 48_000).await;
+    let ring_start = sel.span.start_ns.0;
+    sel.span = Span {
+        start_ns: Timestamp(ring_start - 5_000_000_000),
+        end_ns: Timestamp(ring_start - 4_000_000_000),
+    };
+    let Err(e) = node.apply(Op::Classify { selection: sel }).await else {
+        panic!("expected too_old");
+    };
+    let OpError::Ring {
+        detail: zeta_core::ring::RingError::TooOld { earliest_ns, .. },
+    } = &e
+    else {
+        panic!("expected too_old, got {e:?}");
+    };
+    assert!(
+        earliest_ns.0 >= ring_start,
+        "{earliest_ns:?} < {ring_start}"
+    );
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["detail"]["cause"], "too_old");
+    assert_eq!(
+        json["detail"]["earliest_ns"],
+        serde_json::json!(earliest_ns.0)
+    );
+}
+
+/// `source_list` carries `ring: {seconds}` once the source's ring exists (the
+/// seconds it was sized to) and `null` before; required and nullable in the schema.
+#[tokio::test]
+async fn source_list_reports_the_ring_depth() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    let ring =
+        |v: &[zeta_core::ops::SourceInfo]| serde_json::to_value(&v[0]).unwrap()["ring"].clone();
+    let Ok(OpResult::Sources(v)) = node.apply(Op::SourceList {}).await else {
+        panic!("expected sources");
+    };
+    assert_eq!(ring(&v), Value::Null);
+    src.start();
+    let _ = selection(&node, 100_000_000, 48_000).await;
+    let Ok(OpResult::Sources(v)) = node.apply(Op::SourceList {}).await else {
+        panic!("expected sources");
+    };
+    assert_eq!(ring(&v), serde_json::json!({"seconds": 1.0}));
+    let si = &schema()["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"].as_array().unwrap().contains(&"ring".into()),
+        "{si}"
+    );
+}

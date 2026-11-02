@@ -64,6 +64,8 @@
 //     wf.easing     true while an easeTo runs
 //     wf.clearSelection()   erases the drawn selection rectangle (the menu closed)
 //     wf.centerHz() -> the centre of the band shown (null before the band is known)
+//     wf.xForNs(ns) -> CSS x of a time on the painted columns (right edge when newer than
+//         the newest; null when older than the oldest column or none is painted)
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
 //     wf.band       the capture {lo, hi} in Hz (a scan: its whole span); null before known
 //     wf.view       the range {lo, hi} shown, or null for the whole capture; past the capture
@@ -1600,6 +1602,31 @@ class Waterfall {
     const age = Math.floor(px / cw);
     const oldest = Math.min(this.columns, RING_COLUMNS, Math.ceil(this.canvas.width / cw)) - 1;
     return (this.columns - 1 - Math.min(age, oldest)) % RING_COLUMNS;
+  }
+
+  // CSS x of the time `ns` (ns since the epoch) on the painted columns: the newest column is
+  // at the right edge, each `column.width` backing px wide. A time newer than the newest
+  // column clamps to the right edge; null when `ns` is older than the oldest column kept (or
+  // on screen), or no timed column is painted. Inside a column the x is interpolated over
+  // the column's own span.
+  xForNs(ns) {
+    if (!(this.columns > 0) || !Number.isFinite(ns)) return null;
+    const dpr = this.canvas.width / (this.canvas.clientWidth || 1);
+    const cw = Math.max(1, Math.min(this.column.width, this.canvas.width));
+    const shown = Math.min(this.columns, RING_COLUMNS, Math.ceil(this.canvas.width / cw));
+    const slotOf = (age) => (this.columns - 1 - age) % RING_COLUMNS;
+    if (ns >= this.ringEnd[slotOf(0)]) return this.canvas.width / dpr;
+    for (let age = 0; age < shown; age++) {
+      const slot = slotOf(age);
+      const start = this.ringStart[slot];
+      if (!start) return null;
+      if (ns >= start) {
+        const span = this.ringEnd[slot] - start;
+        const frac = span > 0 ? Math.min(1, (ns - start) / span) : 0;
+        return (this.canvas.width - (age + 1 - frac) * cw) / dpr;
+      }
+    }
+    return null;
   }
 
   resolve(d) {

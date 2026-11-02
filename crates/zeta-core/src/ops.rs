@@ -62,7 +62,9 @@ pub enum Op {
     /// `timeouts`, `restarts`, streams reopened because their samples ran ahead
     /// of the clock; `null` for a source that keeps none), and `worker`, the child
     /// process the source runs in (`pid`, `restarts`, `since_ns`; `null` for a
-    /// source that runs in the node). Jobs on a faulted source fail with
+    /// source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
+    /// before the first block; a `classify` or `iq_read` span older than it fails
+    /// `too_old`). Jobs on a faulted source fail with
     /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,
     /// `job_start`) clears it. A channelised job's `job_context` holds `channel.path`:
     /// `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
@@ -1668,10 +1670,16 @@ pub struct SourceInfo {
     #[serde(default)]
     #[schemars(schema_with = "crate::types::nullable::<WorkerInfo>")]
     pub worker: Option<WorkerInfo>,
+    /// The source's IQ history (`seconds`, the length it was sized to by the
+    /// memory budget); `null` before its first block. A `classify` or `iq_read`
+    /// span older than this fails `too_old`.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<RingInfo>")]
+    pub ring: Option<RingInfo>,
 }
 
 /// Schemars omits a serde-defaulted field from `required`, and `#[schemars(required)]`
-/// does not override that; every node of this version writes `worker`, so the published
+/// does not override that; every node of this version writes `worker` and `ring`, so the published
 /// schema requires it (as `JobRecord`'s schema does its defaulted fields).
 fn require_worker(schema: &mut schemars::Schema) {
     if let Some(req) = schema
@@ -1679,9 +1687,12 @@ fn require_worker(schema: &mut schemars::Schema) {
         .entry("required")
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
-        && !req.iter().any(|r| r == "worker")
     {
-        req.push("worker".into());
+        for field in ["worker", "ring"] {
+            if !req.iter().any(|r| r == field) {
+                req.push(field.into());
+            }
+        }
     }
 }
 
@@ -1757,6 +1768,15 @@ pub struct BusySource {
     /// The port's unrecoverable failure; `null` when healthy.
     #[schemars(required, schema_with = "nullable_string")]
     pub fault: Option<String>,
+}
+
+/// A source's IQ history, as `source_list` reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RingInfo {
+    /// The history length the ring was sized to, in seconds.
+    pub seconds: f64,
 }
 
 /// A source's channel bank: its bin spacing and live subscribers.
@@ -2701,6 +2721,9 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                     gain: node.port(&id).and_then(|p| p.gain()),
                     stats: node.port(&id).and_then(|p| p.stats()),
                     worker: node.port(&id).and_then(|p| p.worker()),
+                    ring: node.ring(&id).map(|r| RingInfo {
+                        seconds: r.read().unwrap().capacity_seconds(),
+                    }),
                     id,
                     capabilities,
                 })

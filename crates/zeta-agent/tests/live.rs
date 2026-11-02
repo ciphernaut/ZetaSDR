@@ -41,6 +41,7 @@ async fn field_host_gemma_tunes_hackrf0() {
         gain: None,
         stats: None,
         worker: None,
+        ring: None,
     }]);
     let tuning = OpResult::Tuning(Tuning {
         center_hz: Hz(101_500_000),

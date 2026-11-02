@@ -17,7 +17,8 @@ answering `what sources are there`), passes the node's
 state directory in ZETA_UI_STATE_DIR, and the URL of a second node started without a speech
 daemon (with the `speech` source) in ZETA_UI_URL_NOSTT (for the "no daemon" scenarios), and
 the URL of a third node with the `cb` source whose `--llm-url` is a request-keyed fake model in
-ZETA_UI_URL_LLM (for the `/ask` scenarios).
+ZETA_UI_URL_LLM (for the `/ask` scenarios), and a node whose ring is a few seconds
+(`--ring-budget-mb 1`) in ZETA_UI_URL_SHORTRING.
 """
 
 import base64
@@ -5043,6 +5044,48 @@ def scenario_explore_what_is_this_and_delete(page, url, secret):
     page.click(row + 'button[data-action="delete"]')
     expect(page.locator("#explore tr.capture")).to_have_count(1)
     clear_captures(url, secret)
+
+
+def scenario_a_capture_draws_a_bracket_while_on_screen(page, url, secret):
+    clear_captures(url, secret)
+    # The page first, so its columns cover the capture's time.
+    show_tone_waterfall(page, url, secret)
+    job = start_job(url, secret, "capture", "tone", 100_001_000, 6_000)
+    two_windows(url, secret, job)
+    wait_until(lambda: len(capture_ops(url, secret, "capture_list", signal=None)) == 2,
+               30, "two captures")
+    span = page.locator("#waterfall .ov-span")
+    expect(span.first).to_be_visible(timeout=20000)
+    ids = {c["id"][-6:] for c in capture_ops(url, secret, "capture_list", signal=None)}
+    assert span.first.text_content() in ids, (span.first.text_content(), ids)
+    box = span.first.bounding_box()
+    canvas = page.locator("#waterfall canvas.wf-canvas").bounding_box()
+    assert box["width"] >= 2 and box["height"] >= 2, box
+    assert box["x"] + box["width"] <= canvas["x"] + canvas["width"] + 1, (box, canvas)
+    clear_captures(url, secret)
+    expect(page.locator("#waterfall .ov-span")).to_have_count(0, timeout=20000)
+
+
+def scenario_too_old_classify_reissues_on_the_latest_span(page, url, secret):
+    short = os.environ.get("ZETA_UI_URL_SHORTRING")
+    assert short, "ZETA_UI_URL_SHORTRING (a node with a short ring) is not set"
+    fresh_spectrum_jobs(short, secret)
+    page.set_viewport_size(WIDE)
+    login(page, short, secret)
+    page.click('.src-tab[data-id="tone"]')
+    expect(page.locator('.src-tab[data-id="tone"]')).to_have_attribute("aria-selected", "true")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+    # The ring holds a few seconds; the page keeps more columns than that.
+    page.wait_for_function("() => window.zetaTest.wf().painted > 260", timeout=30_000)
+    drag_menu(page)
+    footer = page.locator("#ctx-footer").text_content()
+    m = re.search(r" ring (\d+\.\d) s", footer)
+    assert m, f"no ring depth in the footer {footer!r}"
+    assert 1.0 <= float(m.group(1)) <= 4.0, footer
+    page.click('#ctx .ctx-item[data-action="classify"]')
+    expect(page.locator("#transcript .line.note", has_text="buffer moved on; classified the last")
+           .first).to_be_visible(timeout=20000)
+    expect(page.locator("#transcript .line.note", has_text="tried ").first).to_be_visible(timeout=20000)
 
 
 def scenarios():

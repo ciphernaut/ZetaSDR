@@ -378,8 +378,10 @@ function noteRefusals(v) {
 // transcript through the ops stream, except a successful quiet op (job_list, stream_list,
 // source_list, modes_list, modes_show), whose "ui" record is hidden with the polls (ruling R6): that one is shown
 // from the /op reply. A `conflict` also gets its offer line (offerReplace). The result
-// JSON, or null when it failed.
-async function applyOp(op) {
+// JSON, or null when it failed; with `{errors: true}` an error the node applied (not a
+// transport or validation failure) comes back as its JSON (`error`, ...) so the caller can
+// act on it (classify's `too_old` retry).
+async function applyOp(op, { errors = false } = {}) {
   const t = state.transcript;
   if (!state.api) return null;
   let result = null;
@@ -390,6 +392,7 @@ async function applyOp(op) {
   } catch (e) {
     if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
     else if (e.json && e.json.error === "conflict") await offerReplace(op, e.json);
+    if (errors && !notApplied(e)) result = e.json;
   }
   state.jobs?.refresh();
   return result;
@@ -786,6 +789,8 @@ function start(api) {
   });
   state.explore = mountExplorePane($("#explore"), api, state.view, state.transcript, {
     panes: state.panes,
+    ov: () => state.ov,
+    wf: () => state.wf,
   });
   state.subjects.onLearn(applyPanes);
   applyMapPane();
@@ -802,6 +807,7 @@ function start(api) {
     ask: askAgent,
     transcript: state.transcript,
     ov: state.ov,
+    ringSeconds: (id) => state.sources.find((x) => x.id === id)?.ring?.seconds ?? null,
     plan: () => resolvePlan(state.view.get("plan")),
     command: (text) => {
       const cmd = $("#cmd");

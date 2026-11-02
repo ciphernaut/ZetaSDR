@@ -1,12 +1,13 @@
 // explore.js: the Explore pane (plan 19 spec 5.7), the captures the node holds.
 //
 // mountExplorePane(el, api, view, transcript, {panes}) -> {render(), eligible(), destroy()}
-//   Polls `capture_list` every EXPLORE_POLL_MS while the pane is shown, and until the first
-//   capture is seen; lists the captures newest first (time, band, size, the feature summary,
+//   Polls `capture_list` every EXPLORE_POLL_MS; lists the captures newest first (time, band, size, the feature summary,
 //   the nearest transmitter's licensee) as `tr.capture` rows with the buttons What is this
 //   (`capture_classify`, labels to the transcript), Download (both SigMF files fetched with the
 //   bearer and saved as Blobs: the secret never goes into a URL) and Delete (`capture_delete`,
 //   a second click within DELETE_CONFIRM_MS confirms; the button reads `sure?` between).
+//   Draws the cached region (ov.span, tagged with the id's last 6 characters) of each capture
+//   still on the waterfall's columns; polls while hidden too, for that.
 //   Registers the `explore` pane with the strip, eligible while any capture exists, and selects
 //   it the first time a capture appears (once per page load).
 
@@ -42,12 +43,15 @@ function nearestTx(c) {
   return tx.length ? tx[0].licensee : "";
 }
 
-export function mountExplorePane(el, api, view, transcript, { panes = null } = {}) {
-  return new ExplorePane(el, api, view, transcript, panes);
+export function mountExplorePane(el, api, view, transcript, { panes = null, ov = () => null, wf = () => null } = {}) {
+  return new ExplorePane(el, api, view, transcript, panes, ov, wf);
 }
 
 class ExplorePane {
-  constructor(el, api, view, transcript, panes) {
+  constructor(el, api, view, transcript, panes, ov, wf) {
+    this.ov = ov; // () => the overlays (or null)
+    this.wf = wf; // () => the waterfall (or null)
+    this.spans = new Set(); // keys of the cached-region brackets drawn
     this.el = el;
     this.api = api;
     this.view = view;
@@ -80,7 +84,6 @@ class ExplorePane {
 
   schedule() {
     if (this.destroyed || this.timer !== null) return;
-    if (!this.shown() && this.seen) return;
     this.timer = setTimeout(() => {
       this.timer = null;
       this.poll();
@@ -97,12 +100,32 @@ class ExplorePane {
       // The next poll tries again.
     }
     this.render();
+    this.syncSpans();
     if (!this.seen && this.captures.length > 0) {
       this.seen = true;
       this.panes?.select("explore");
     }
     this.panes?.render();
     this.schedule();
+  }
+
+  // The cached region: a bracket (ov.span) over each capture of the selected source whose end
+  // is still on the waterfall's columns, tagged with the tail of its id; the overlays drop it
+  // when it scrolls off, so a bracket is only kept here while it is drawn.
+  syncSpans() {
+    const ov = this.ov();
+    if (!ov) return;
+    const sourceId = this.wf()?.sourceId;
+    const want = new Set();
+    for (const c of this.captures) {
+      if (c.source !== sourceId) continue;
+      const key = `capture:${c.id}`;
+      const lo = c.center_hz - c.bandwidth_hz / 2;
+      const hi = c.center_hz + c.bandwidth_hz / 2;
+      if (ov.span(lo, hi, c.start_ns, c.end_ns, c.id.slice(-6), key)) want.add(key);
+    }
+    for (const key of this.spans) if (!want.has(key)) ov.unspan(key);
+    this.spans = want;
   }
 
   render() {

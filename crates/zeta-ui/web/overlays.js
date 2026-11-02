@@ -149,6 +149,11 @@
 //     ov.retunable(job) -> bool  a running rigid job (as outlined) the node can move with
 //                            `job_retune`: no operator graph, kind not in NOT_RETUNABLE
 //     ov.unoutline(key)      removes the outline drawn under `key`, if any
+//     ov.span(lo, hi, startNs, endNs, text, key) -> element|null
+//                            a thin bracket (class ov-span) over lo..hi Hz between the columns
+//                            of startNs and endNs (wf.xForNs), tagged `text`; re-laid on every
+//                            column and view change and removed (null) once endNs left the columns
+//     ov.unspan(key)         removes the span drawn under `key`, if any
 //     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a watched job
 //     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a watched job,
 //                            before it is drawn, and of a positioned job on another source
@@ -279,6 +284,7 @@ class Overlays {
     this.squelches = new Map(); // job id -> {event: the last `squelch` event seen, graph}
     this.labels = new Map(); // key -> {el, hz}
     this.outlines = new Map(); // key -> {el, labelEl (pin, capture) or tag, lo, hi, job, handles}
+    this.spans = new Map(); // key -> {el, lo, hi, startNs, endNs}: a capture's cached region
     this.marks = new Map(); // `${job id}:${rounded centre}` -> {el, hz}: a watch's `signal new`
     this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
@@ -317,6 +323,7 @@ class Overlays {
     this.labels.clear();
     for (const key of [...this.marks.keys()]) this.unmark(key);
     for (const key of [...this.outlines.keys()]) this.unoutline(key);
+    for (const key of [...this.spans.keys()]) this.unspan(key);
     this.captureOutlined = false;
   }
 
@@ -919,6 +926,65 @@ class Overlays {
     this.layoutTags();
   }
 
+  // ---- spans ---------------------------------------------------------------------------
+
+  // A thin bracket over the band lo..hi spanning the times startNs..endNs (a capture's
+  // cached region), tagged `text`; re-laid as the columns scroll and the view changes, and
+  // removed once its end has scrolled off. Returns the element, or null when it is off
+  // screen already.
+  span(lo, hi, startNs, endNs, text, key) {
+    if (this.destroyed) return null;
+    let sp = this.spans.get(key);
+    if (!sp) {
+      const el = document.createElement("div");
+      el.className = "ov-span";
+      el.dataset.key = key;
+      el.append(document.createElement("span"));
+      this.layer.prepend(el);
+      sp = { el };
+      this.spans.set(key, sp);
+    }
+    Object.assign(sp, { lo, hi, startNs, endNs });
+    sp.el.firstChild.textContent = String(text);
+    sp.el.title = `${text} ${(lo / 1e6).toFixed(3)}-${(hi / 1e6).toFixed(3)} MHz`;
+    return this.placeSpan(key, sp) ? sp.el : null;
+  }
+
+  unspan(key) {
+    const sp = this.spans.get(key);
+    if (!sp) return;
+    sp.el.remove();
+    this.spans.delete(key);
+  }
+
+  // Positions a span's element; false (and the span removed) when its end left the columns.
+  placeSpan(key, sp) {
+    const x1 = this.wf.xForNs(sp.endNs);
+    if (x1 === null) {
+      this.unspan(key);
+      return false;
+    }
+    const x0 = this.wf.xForNs(sp.startNs);
+    const left = x0 === null ? 0 : x0;
+    const y0 = this.wf.yForHz(sp.hi);
+    const y1 = this.wf.yForHz(sp.lo);
+    if (y0 === null || y1 === null || !Number.isFinite(y0 + y1)) {
+      sp.el.hidden = true;
+      return true;
+    }
+    sp.el.hidden = false;
+    const s = sp.el.style;
+    s.left = `${left}px`;
+    s.width = `${Math.max(2, x1 - left)}px`;
+    s.top = `${y0}px`;
+    s.height = `${Math.max(2, y1 - y0)}px`;
+    return true;
+  }
+
+  layoutSpans() {
+    for (const [key, sp] of [...this.spans]) this.placeSpan(key, sp);
+  }
+
   // ---- job tags ------------------------------------------------------------------------
 
   // The tag of a job's outline `o`: kind, short id, [squelch dot], channel, [snippet].
@@ -1284,6 +1350,7 @@ class Overlays {
 
   // Re-places everything vertically (the band or the height changed).
   layout() {
+    this.layoutSpans();
     this.outlineCapture();
     for (const [key, o] of this.outlines) {
       if (!this.drag || this.drag.key !== key) this.placeOutline(o);

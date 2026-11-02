@@ -139,6 +139,11 @@ impl IqRing {
         self.capacity_seconds = seconds;
     }
 
+    /// The history length the ring is sized to, in seconds.
+    pub fn capacity_seconds(&self) -> f64 {
+        self.capacity_seconds
+    }
+
     /// Bytes currently allocated for samples.
     pub fn capacity_bytes(&self) -> usize {
         self.buf.capacity() * std::mem::size_of::<Complex<f32>>()

@@ -177,6 +177,8 @@
 
 import { bandText, mhzText } from "./units.js";
 
+// How far past the ring's earliest sample a `too_old` retry starts, as the front moves on.
+const RING_FRONT_MARGIN_NS = 300_000_000;
 export const SPAN_LIMIT_NS = 8_000_000_000;
 export const LABEL_STEP_PX = 18;
 // The label spacing in Hz while the waterfall cannot map Hz to pixels (band not known yet).
@@ -443,11 +445,12 @@ export function clampSpan(startNs, endNs, newest) {
 class Menu {
   constructor(
     wf,
-    { applyOp, attachOp, ask, transcript, ov, plan = () => null, command = () => {}, muteFor = () => null },
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, ringSeconds = () => null, command = () => {}, muteFor = () => null },
   ) {
     this.wf = wf;
     this.muteFor = muteFor;
     this.applyOp = applyOp;
+    this.ringSeconds = ringSeconds;
     this.attachOp = attachOp;
     this.ask = ask;
     this.plan = plan;
@@ -553,7 +556,14 @@ class Menu {
       `center_hz=${t.centerHz} bandwidth_hz=${t.bandwidthHz} ` +
       (sb ? `sideband=${sb} ` : "") +
       `start_ns=${s.startNs} end_ns=${s.endNs}` +
-      (s.clamped ? " (span clamped to the last 8 s)" : "");
+      (s.clamped ? " (span clamped to the last 8 s)" : "") +
+      this.ringText();
+  }
+
+  // ` ring <d> s`: the selected source's IQ history, when its record carries one.
+  ringText() {
+    const d = this.sel ? this.ringSeconds(this.sel.sourceId) : null;
+    return typeof d === "number" ? ` ring ${d.toFixed(1)} s` : "";
   }
 
   open(sel, x, y) {
@@ -720,6 +730,22 @@ class Menu {
     }
   }
 
+  // The ring no longer holds the span (`too_old`): once, on the latest span of the same
+  // length the ring still covers (not before `earliest_ns`). The result, or null.
+  async reclassify(selection, detail) {
+    const end = newestNs(this.wf);
+    const len = selection.span.end_ns - selection.span.start_ns;
+    if (end === null || !Number.isFinite(detail.earliest_ns)) return null;
+    // The ring's front keeps moving while the retry is in flight: keep clear of it.
+    const start = Math.round(Math.max(end - len, detail.earliest_ns + RING_FRONT_MARGIN_NS));
+    if (start >= end) return null;
+    this.t.note(`buffer moved on; classified the last ${((end - start) / 1e9).toFixed(1)} s`);
+    return this.applyOp({
+      op: "classify",
+      selection: { ...selection, span: { start_ns: start, end_ns: Math.round(end) } },
+    });
+  }
+
   async choose(action) {
     // A fit in progress ignores further choices (a double click starts one job).
     if (!this.sel || this.fitting !== null) return;
@@ -740,7 +766,8 @@ class Menu {
     };
     if (action === "classify") {
       this.t.note("classify: running…");
-      const r = await this.applyOp({ op: "classify", selection });
+      let r = await this.applyOp({ op: "classify", selection }, { errors: true });
+      if (r && r.error === "ring" && r.detail?.cause === "too_old") r = await this.reclassify(selection, r.detail);
       if (r && r.result === "classification" && r.value) {
         this.showLabels(s, r.value.labels || []);
         for (const t of r.value.tried || []) {

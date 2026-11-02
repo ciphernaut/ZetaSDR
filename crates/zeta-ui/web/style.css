@@ -206,6 +206,15 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
   position: absolute; padding: 0 5px; border-radius: 2px; white-space: nowrap;
   background: rgba(11, 14, 20, 0.78); border: 1px solid var(--border);
 }
+/* overlays.js: a capture's cached region, a thin bracket over its band and time columns */
+#waterfall .ov-span {
+  position: absolute; box-sizing: border-box; pointer-events: none;
+  border: 1px solid var(--user); background: rgba(255, 255, 255, 0.04);
+}
+#waterfall .ov-span > span {
+  position: absolute; left: 2px; top: 0; padding: 0 3px; font-size: 10px; line-height: 12px;
+  color: var(--user); background: rgba(11, 14, 20, 0.78);
+}
 /* overlays.js: a rigid holder's band (or the capture), bordered, its kind at the top right */
 #waterfall .outline {
   position: absolute; left: 0; right: 0; box-sizing: border-box;

@@ -223,8 +223,9 @@ fn quiet_fixture(dir: &Path) -> PathBuf {
 }
 
 /// Wall-clock limit on the whole ui.py run: measured 351.8 s and 352.8 s on 2026-11-02 (plan 23's
-/// scenarios included), so about 1.25 times the slower run.
-const DEADLINE: Duration = Duration::from_secs(440);
+/// scenarios included), so about 1.25 times the slower run; plan 19's pane, Explore and ring scenarios have since
+/// added to it (the 440 s limit was reached on 2026-11-02), so the limit is 600 s.
+const DEADLINE: Duration = Duration::from_secs(600);
 
 /// Waits for `child` until `deadline`, killing it then; its exit status (None when killed)
 /// and everything it wrote. Its pipes are drained on threads so it never blocks on them.
@@ -623,6 +624,9 @@ fn ui_scenarios_pass_in_headless_chromium() {
         &["--llm-url", &fake_llm, "--llm-model", "fake"],
         &[],
     );
+    // A ring of a few seconds (a 1 MB budget), so a box outlives the buffer behind it.
+    let short_dir = tempfile::tempdir().unwrap();
+    let shortring = ServeProc::start_env(short_dir.path(), SECRET, &["--ring-budget-mb", "1"], &[]);
     let mut cmd = Command::new("python3");
     cmd.arg("crates/zeta-ui/tests/e2e/ui.py")
         .args([&serve.url, SECRET]);
@@ -633,6 +637,7 @@ fn ui_scenarios_pass_in_headless_chromium() {
         .env("ZETA_UI_STATE_DIR", dir.path().join("state"))
         .env("ZETA_UI_URL_NOSTT", &nostt.url)
         .env("ZETA_UI_URL_LLM", &llm.url)
+        .env("ZETA_UI_URL_SHORTRING", &shortring.url)
         .env("ZETA_BIN", env!("CARGO_BIN_EXE_zeta"))
         .env("ZETA_UI_REBUILD_META", &rebuild_meta)
         .current_dir(repo_root())
@@ -655,4 +660,5 @@ fn ui_scenarios_pass_in_headless_chromium() {
     drop(serve);
     drop(nostt);
     drop(llm);
+    drop(shortring);
 }
