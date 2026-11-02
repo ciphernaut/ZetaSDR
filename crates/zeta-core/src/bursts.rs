@@ -164,6 +164,11 @@ impl BurstStore {
         let n = read.len();
         let kept: Vec<CaptureRecord> = read
             .into_iter()
+            .map(|mut r| {
+                r.meta_path = resolve(&dir, &r.meta_path);
+                r.data_path = resolve(&dir, &r.data_path);
+                r
+            })
             .filter(|r| r.data_path.is_file() && r.meta_path.is_file())
             .collect();
         let store = Self {
@@ -361,9 +366,20 @@ impl BurstStore {
         self.index.lock().unwrap().iter().map(|r| r.bytes).sum()
     }
 
-    /// Write `index` to `index.json` atomically (a temp file, then a rename).
+    /// Write `index` to `index.json` atomically (a temp file, then a rename), compact,
+    /// each record's files named relative to the store's directory (resolved against it
+    /// again at [`open`](Self::open), so a moved state directory keeps its captures).
     fn persist(&self, index: &[CaptureRecord]) -> std::io::Result<()> {
-        let json = serde_json::to_vec_pretty(index)?;
+        let relative: Vec<CaptureRecord> = index
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.meta_path = relative_to(&self.dir, &r.meta_path);
+                r.data_path = relative_to(&self.dir, &r.data_path);
+                r
+            })
+            .collect();
+        let json = serde_json::to_vec(&relative)?;
         let tmp = self.dir.join(format!("{INDEX_FILE}.tmp"));
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, self.dir.join(INDEX_FILE))
@@ -431,6 +447,26 @@ fn record_from_meta(meta_path: &Path) -> Option<CaptureRecord> {
         pinned: false,
         written_ns,
     })
+}
+
+/// A file name as the index stores it: relative to `dir` when it lies there.
+fn relative_to(dir: &Path, p: &Path) -> PathBuf {
+    p.strip_prefix(dir)
+        .map_or_else(|_| p.to_path_buf(), Path::to_path_buf)
+}
+
+/// A file name read from the index: a relative one under `dir`; an absolute one (an index
+/// written before names were relative) as it is while it exists, else its file name under
+/// `dir` (the state directory moved).
+fn resolve(dir: &Path, p: &Path) -> PathBuf {
+    if p.is_relative() {
+        return dir.join(p);
+    }
+    if p.exists() {
+        return p.to_path_buf();
+    }
+    p.file_name()
+        .map_or_else(|| p.to_path_buf(), |f| dir.join(f))
 }
 
 /// Remove a record's files; one already gone is no error.
@@ -519,6 +555,66 @@ mod tests {
         assert_eq!(s.delete(&a.id), Ok(a.clone()));
         assert!(!a.data_path.exists());
         assert_eq!(s.delete(&a.id), Err(StoreError::Unknown(a.id.clone())));
+    }
+
+    #[test]
+    fn the_index_is_compact_with_relative_file_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path(), u64::MAX);
+        let a = s.write(new_capture(t(0)), &samples()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(BURSTS_DIR).join(INDEX_FILE)).unwrap();
+        assert!(!text.contains('\n'), "compact: {text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v[0]["meta_path"], format!("{}.sigmf-meta", a.id));
+        assert_eq!(v[0]["data_path"], format!("{}.sigmf-data", a.id));
+        // The API keeps absolute paths.
+        assert!(a.meta_path.is_absolute() && a.data_path.is_absolute());
+    }
+
+    #[test]
+    fn a_moved_state_dir_keeps_every_record() {
+        let root = tempfile::tempdir().unwrap();
+        let (from, to) = (root.path().join("a"), root.path().join("b"));
+        let ids: Vec<String> = {
+            let s = store(&from, u64::MAX);
+            (0..3)
+                .map(|i| s.write(new_capture(t(i)), &samples()).unwrap().id)
+                .collect()
+        };
+        std::fs::rename(&from, &to).unwrap();
+        let s = store(&to, u64::MAX);
+        let listed = s.list();
+        assert_eq!(listed.len(), 3);
+        for r in &listed {
+            assert!(ids.contains(&r.id));
+            assert!(r.meta_path.starts_with(&to) && r.meta_path.is_file());
+            assert!(r.data_path.starts_with(&to) && r.data_path.is_file());
+        }
+    }
+
+    #[test]
+    fn an_index_with_absolute_names_from_a_moved_dir_still_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let (from, to) = (root.path().join("a"), root.path().join("b"));
+        {
+            let s = store(&from, u64::MAX);
+            s.write(new_capture(t(0)), &samples()).unwrap();
+        }
+        // Rewrite the index as an older store did: absolute names under `from`.
+        let index = from.join(BURSTS_DIR).join(INDEX_FILE);
+        let mut v: Value = serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        for k in ["meta_path", "data_path"] {
+            let name = v[0][k].as_str().unwrap().to_string();
+            v[0][k] = from
+                .join(BURSTS_DIR)
+                .join(name)
+                .display()
+                .to_string()
+                .into();
+        }
+        std::fs::write(&index, serde_json::to_vec(&v).unwrap()).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+        assert_eq!(store(&to, u64::MAX).list().len(), 1);
     }
 
     #[test]

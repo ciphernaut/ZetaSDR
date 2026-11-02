@@ -1838,7 +1838,14 @@ fn knowledge_acma_from_the_environment_is_ignored_with_node() {
         .env("ZETA_KNOWLEDGE_ACMA", "http://127.0.0.1:9")
         .env("ZETA_BURSTS_KEEP_MB", "1")
         .env("ZETA_BURSTS_KEEP_DAYS", "1")
-        .args(["--node", "http://127.0.0.1:9", "--secret", "s", "source", "list"])
+        .args([
+            "--node",
+            "http://127.0.0.1:9",
+            "--secret",
+            "s",
+            "source",
+            "list",
+        ])
         .output()
         .unwrap();
     let text = format!(
@@ -1851,7 +1858,14 @@ fn knowledge_acma_from_the_environment_is_ignored_with_node() {
     // A bad value in the environment is ignored too.
     let out = zeta_bin()
         .env("ZETA_KNOWLEDGE_ACMA", "ftp://x")
-        .args(["--node", "http://127.0.0.1:9", "--secret", "s", "source", "list"])
+        .args([
+            "--node",
+            "http://127.0.0.1:9",
+            "--secret",
+            "s",
+            "source",
+            "list",
+        ])
         .output()
         .unwrap();
     assert!(!String::from_utf8_lossy(&out.stderr).contains("--knowledge-acma"));
