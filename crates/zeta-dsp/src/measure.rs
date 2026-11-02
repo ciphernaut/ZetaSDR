@@ -1248,6 +1248,53 @@ mod tests {
     }
 
     #[test]
+    fn a_single_5_ms_burst_in_a_window_is_gated() {
+        let spec = SynthSpec::Fsk {
+            symbol_rate_baud: 4800,
+            deviation_hz: 4000.0,
+            order: 2,
+            bits: LCG_BITS[..6].into(),
+            repeat: 1,
+            gap_ms: 50,
+        };
+        let mut iq = synthesise(&spec, &Impairments::default(), 48_000, 0);
+        iq.resize(48_000, Complex::new(0.0, 0.0));
+        awgn(&mut iq, 20.0, 17);
+        let v = gated_view(&iq, 48_000);
+        eprintln!("single burst: {:?}", v.bursts);
+        assert_eq!(v.bursts.runs.len(), 1);
+        assert!(v.gated);
+    }
+
+    #[test]
+    fn a_lone_1_ms_outlier_chunk_is_not_gated() {
+        for rate in [8_000u64, 48_000] {
+            let mut clean = vec![Complex::new(0.0f32, 0.0); rate as usize];
+            awgn(&mut clean, 0.0, 23);
+            // One 1 ms chunk of the noise 8 dB up: the lone outlier a quiet
+            // capture can hold.
+            let mut iq = clean.clone();
+            let ms = (rate / 1_000) as usize;
+            iq[500 * ms..501 * ms].iter_mut().for_each(|s| *s *= 2.5);
+            let v = gated_view(&iq, rate);
+            eprintln!("noise at {rate} Hz: {:?}", v.bursts);
+            assert_eq!(v.bursts.runs.len(), 1, "{rate} Hz: {:?}", v.bursts);
+            assert!(v.bursts.burst_ms.is_some_and(|ms| ms < 3.0));
+            assert!(!v.gated, "{rate} Hz: {:?}", v.bursts);
+            let f = measure_band(&iq, rate, CENTER, rate);
+            let l = layer1_label(&f, &iq, rate);
+            eprintln!("noise at {rate} Hz: {f:?} -> {}", l.name);
+            assert!(!f.burst, "{rate} Hz: {f:?}");
+            // Measured whole: labelled as the same noise without the outlier.
+            let plain = measure_band(&clean, rate, CENTER, rate);
+            assert_eq!(l.name, layer1_label(&plain, &clean, rate).name);
+            if rate == 48_000 {
+                assert_eq!(l.name, "noise", "{f:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_bursty_psk_link_reports_its_symbol_rate() {
         // 100 ms bursts of 240 random bits every 1050 ms
         let spec = SynthSpec::Psk {

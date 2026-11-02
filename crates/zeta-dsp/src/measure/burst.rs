@@ -25,6 +25,11 @@ pub(super) const BURST_DUTY_MAX: f32 = 0.5;
 /// ... unless its runs repeat faster than this many ms: shorter, denser on-off
 /// runs are keying, not bursts.
 pub(super) const BURST_MIN_PERIOD_MS: f32 = 20.0;
+/// The gate needs at least this many on-runs ...
+const BURST_MIN_BURSTS: usize = 2;
+/// ... or one run at least this many ms long: a lone shorter run is an outlier
+/// chunk of noise, not a burst.
+const BURST_MIN_SINGLE_MS: f32 = 3.0;
 /// FFT size of the cyclostationary line search: a line grows with the
 /// transform length and the noise continuum does not.
 const CYCLO_SIZE: usize = 4096;
@@ -139,12 +144,15 @@ pub(super) struct View<'a> {
 
 /// What layer 1 measures of `iq`: its runs ([`burst_runs`]); the on-time
 /// ([`on_time`]) when the duty is under `BURST_DUTY_MAX` and the runs repeat no
-/// faster than `BURST_MIN_PERIOD_MS` (denser runs are keying), else the whole
-/// window.
+/// faster than `BURST_MIN_PERIOD_MS` (denser runs are keying), and there are
+/// at least `BURST_MIN_BURSTS` runs or one of at least `BURST_MIN_SINGLE_MS`
+/// (a lone shorter run is an outlier chunk); else the whole window.
 pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64) -> View<'_> {
     let bursts = burst_runs(iq, rate_hz);
-    let bursty = bursts.period_ms.is_none_or(|p| p >= BURST_MIN_PERIOD_MS);
-    if bursts.duty < BURST_DUTY_MAX && bursty && !bursts.runs.is_empty() {
+    let sparse = bursts.period_ms.is_none_or(|p| p >= BURST_MIN_PERIOD_MS);
+    let enough = bursts.runs.len() >= BURST_MIN_BURSTS
+        || (bursts.runs.len() == 1 && bursts.burst_ms.is_some_and(|ms| ms >= BURST_MIN_SINGLE_MS));
+    if bursts.duty < BURST_DUTY_MAX && sparse && enough {
         let runs: Vec<&[Complex<f32>]> = bursts.runs.iter().map(|&(s, e)| &iq[s..e]).collect();
         let raw: Vec<Complex<f32>> = runs.iter().flat_map(|r| r.iter()).copied().collect();
         View {
