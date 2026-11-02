@@ -63,6 +63,8 @@ const INFO: [(char, &str); 9] = [
 
 /// A decoded emission designator.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct Emission {
     pub bandwidth_hz: Hz,
     pub modulation: char,

@@ -326,6 +326,7 @@ fn variant_name_matches_the_serialised_tag() {
         OpResult::Knowledge {
             allocations: vec![],
             signatures: vec![],
+            reach: None,
         },
         OpResult::Classification {
             labels: vec![],

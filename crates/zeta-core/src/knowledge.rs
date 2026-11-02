@@ -6,12 +6,16 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::emission::Emission;
+use crate::reach::Reach;
 use crate::types::{Baud, Hz};
 
-/// A band plan entry: what a region allocates `[min_hz, max_hz]` to.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// A band plan entry: what a region allocates `[min_hz, max_hz]` to, or (from a
+/// licence register) one assignment in it. The fields after `note` are optional and
+/// `null` when the provider lacks them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
 pub struct Allocation {
     pub provider: String,
     pub region: String,
@@ -20,6 +24,71 @@ pub struct Allocation {
     pub service: String,
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     pub note: Option<String>,
+    /// `plan` (a band plan service) or `assignment` (a licensed device).
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub licensee: Option<String>,
+    /// The assignment's site name.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub site: Option<String>,
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
+    pub lon: Option<f64>,
+    /// From the station to the site; `null` without a station.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
+    pub distance_km: Option<f64>,
+    /// From the station to the site, degrees clockwise from true north.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
+    pub bearing_deg: Option<f64>,
+    /// Transmitter power in watts, converted from the register's unit.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
+    pub power_w: Option<f64>,
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<Hz>")]
+    pub center_hz: Option<Hz>,
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<Hz>")]
+    pub bandwidth_hz: Option<Hz>,
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub licence_no: Option<String>,
+    /// `tx` or `rx`.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub role: Option<String>,
+    /// The emission designator as the register stores it, trimmed.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub emission: Option<String>,
+    /// `emission` decoded; `null` for a designator the parser cannot read.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<Emission>")]
+    pub emission_decoded: Option<Emission>,
+    /// The provider's data as of this time (its last sync), when it says.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub as_of: Option<String>,
+}
+
+/// Every property is always written (`null` when absent), so the schema requires
+/// them all; the `#[serde(default)]` fields still load from files that lack them.
+fn require_all(schema: &mut schemars::Schema) {
+    let props: Vec<serde_json::Value> = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|p| p.keys().map(|k| k.as_str().into()).collect())
+        .unwrap_or_default();
+    schema.insert("required".into(), props.into());
 }
 
 /// What a known signal looks like and which decoder handles it.
@@ -43,6 +112,11 @@ pub trait KnowledgeProvider: Send + Sync {
     fn name(&self) -> &str;
     async fn allocations(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Allocation>;
     async fn signatures(&self, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Signature>;
+    /// How far from the station this provider searched for the band, when it
+    /// applies a reach.
+    async fn reach(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
+        None
+    }
 }
 
 /// Providers backed by JSON data held in memory.

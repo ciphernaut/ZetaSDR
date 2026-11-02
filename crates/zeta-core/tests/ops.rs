@@ -707,6 +707,7 @@ impl KnowledgeProvider for TestProvider {
             max_hz: Hz(148_000_000),
             service: "amateur".into(),
             note: None,
+            ..Allocation::default()
         }]
     }
     async fn signatures(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Signature> {
@@ -726,11 +727,21 @@ async fn knowledge_lookup_op_returns_allocations_from_provider() {
         center_hz: Hz(144_800_000),
         bandwidth_hz: Hz(25_000),
     };
-    match node.apply(op).await {
+    let result = node.apply(op).await;
+    let v = serde_json::to_value(result.as_ref().unwrap()).unwrap();
+    assert_eq!(v["value"]["reach"], Value::Null, "{v}");
+    assert_eq!(
+        v["value"]["allocations"][0]["distance_km"],
+        Value::Null,
+        "{v}"
+    );
+    match result {
         Ok(OpResult::Knowledge {
             allocations,
             signatures,
+            reach,
         }) => {
+            assert_eq!(reach, None);
             assert_eq!(allocations.len(), 1);
             assert_eq!(allocations[0].provider, "test");
             assert_eq!(allocations[0].region, "AU");

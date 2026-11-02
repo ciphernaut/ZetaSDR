@@ -41,12 +41,16 @@ pub enum ReachClass {
 
 /// The distance a signal on a frequency can come from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct Reach {
     /// The search radius; `None` for skywave with no override (unbounded).
+    #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
     pub km: Option<f64>,
     pub class: ReachClass,
     /// The antenna id the reach was computed for.
     pub antenna: String,
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     pub note: Option<String>,
 }
 

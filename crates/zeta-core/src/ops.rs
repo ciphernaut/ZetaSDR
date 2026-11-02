@@ -1895,6 +1895,13 @@ pub enum OpResult {
     Knowledge {
         allocations: Vec<Allocation>,
         signatures: Vec<Signature>,
+        /// How far the providers searched: the first provider that applies one.
+        /// (A missing `Option` reads as `None`, so an older node's answer loads.)
+        #[schemars(
+            required,
+            schema_with = "crate::types::nullable::<crate::reach::Reach>"
+        )]
+        reach: Option<crate::reach::Reach>,
     },
     ChannelPlans {
         plans: Vec<PlanInfo>,
@@ -2939,14 +2946,18 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             center_hz,
             bandwidth_hz,
         } => {
-            let (mut allocations, mut signatures) = (Vec::new(), Vec::new());
+            let (mut allocations, mut signatures, mut reach) = (Vec::new(), Vec::new(), None);
             for p in node.knowledge() {
                 allocations.extend(p.allocations(&region, center_hz, bandwidth_hz).await);
                 signatures.extend(p.signatures(center_hz, bandwidth_hz).await);
+                if reach.is_none() {
+                    reach = p.reach(center_hz, bandwidth_hz).await;
+                }
             }
             Ok(OpResult::Knowledge {
                 allocations,
                 signatures,
+                reach,
             })
         }
         Op::ChannelPlans {} => Ok(OpResult::ChannelPlans {
