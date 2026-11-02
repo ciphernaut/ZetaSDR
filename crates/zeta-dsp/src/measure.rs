@@ -23,7 +23,7 @@ pub use burst::{Bursts, burst_runs, on_time};
 use burst::{
     View, averaged_half_spectrum, bandpass, cyclo_symbol_rate, gated_view, strongest_line,
 };
-use order::{fsk_clusters, psk_order, two_levels};
+use order::{envelope_runs, fsk_clusters, psk_order, two_levels};
 
 use crate::channel::extract_offset;
 use crate::fft::{Window, power_spectrum_db};
@@ -582,8 +582,10 @@ fn tone_pair(
 ///    below 0.2) with a keying line, when its discriminator audio does (AFSK
 ///    on FM).
 /// 3. `"ook"` (0.6) when the envelope CV is at least 0.25, the record has a
-///    symbol rate and no PSK order, and the envelope sits at two levels, the
-///    lower one off ([`order::two_levels`]).
+///    symbol rate and no PSK order, and over the burst runs
+///    ([`order::envelope_runs`]: the gaps between bursts are not an off
+///    level) the envelope CV is still at least 0.25 and the envelope sits at
+///    two levels, the lower one off ([`order::two_levels`]).
 /// 4. `"wfm"` (0.9) when the occupied band is 40–250 kHz and
 ///    [`pilot_line_db`] finds a 19 kHz pilot at least 10 dB above its
 ///    region, with no envelope or deviation gate (multipath and noise ripple
@@ -794,7 +796,12 @@ fn classify_block(
             }
         }
     }
-    if cv >= AM_MIN_CV && f.order.is_none() && f.symbol_rate_baud.is_some() && two_levels(iq) {
+    let keyed_runs = || {
+        let runs = envelope_runs(iq, rate_hz);
+        let on: Vec<Complex<f32>> = runs.iter().flat_map(|r| r.iter()).copied().collect();
+        envelope_cv(&on) >= AM_MIN_CV && two_levels(&runs)
+    };
+    if cv >= AM_MIN_CV && f.order.is_none() && f.symbol_rate_baud.is_some() && keyed_runs() {
         return (
             "ook",
             0.6,
@@ -1454,6 +1461,9 @@ mod tests {
         assert!(!f.burst);
         assert!(f.snr_db < 3.0, "snr_db {}", f.snr_db);
         assert_eq!(f.symbol_rate_baud, None);
+        // Noise histograms show spurious clusters; the record carries no order.
+        assert_eq!(f.order, None);
+        assert_eq!(f.tone_spacing_hz, None);
         assert_eq!(l.name, "noise");
         assert_eq!(l.layer, 1);
     }
@@ -2011,5 +2021,76 @@ mod tests {
         let l = layer1_label(&f, &iq, 48_000);
         show("ook", &f, &l);
         assert_eq!(l.name, "ook", "{}", l.evidence);
+    }
+
+    #[test]
+    fn under_the_noise_snr_the_record_carries_no_order() {
+        // Without the SNR gate these noise windows read order 2 or 4 with a
+        // tone spacing of a few Hz (seeds 0-3 and 5).
+        for seed in 0..6u64 {
+            let mut iq = vec![Complex::new(0.0f32, 0.0); RATE as usize];
+            awgn(&mut iq, 0.0, seed);
+            for bw in [RATE, 12_500] {
+                let f = measure_band(&iq, RATE, CENTER, bw);
+                assert!(f.snr_db < NOISE_SNR_DB, "seed {seed}: {f:?}");
+                assert_eq!(f.order, None, "seed {seed}, {bw} Hz: {f:?}");
+                assert_eq!(f.tone_spacing_hz, None, "seed {seed}, {bw} Hz: {f:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_2_fsk_under_the_noise_snr_carries_no_order() {
+        let spec = SynthSpec::Fsk {
+            symbol_rate_baud: 2400,
+            deviation_hz: 4000.0,
+            order: 2,
+            bits: lcg_hex(128),
+            repeat: 1,
+            gap_ms: 50,
+        };
+        let measured = |snr_db: f32| {
+            let imp = Impairments {
+                snr_db: Some(snr_db),
+                ..Default::default()
+            };
+            let iq = synthesise(&spec, &imp, 48_000, 0);
+            measure_band(&iq, 48_000, CENTER, 24_000)
+        };
+        let strong = measured(20.0);
+        assert_eq!(strong.order, Some(2), "{strong:?}");
+        let weak = measured(WEAK_FSK_SNR_DB);
+        eprintln!("weak 2-fsk: {weak:?}");
+        assert!(
+            (2.0..NOISE_SNR_DB).contains(&weak.snr_db),
+            "snr_db {}",
+            weak.snr_db
+        );
+        assert_eq!(weak.order, None, "{weak:?}");
+        assert_eq!(weak.tone_spacing_hz, None, "{weak:?}");
+    }
+
+    /// Fixture SNR (over the whole 48 kHz) that measures a 2-FSK block at about
+    /// 4 dB, under `NOISE_SNR_DB`.
+    const WEAK_FSK_SNR_DB: f32 = -14.0;
+
+    #[test]
+    fn a_constant_envelope_burst_train_is_not_ook() {
+        // Three 1 s bursts of 2400 Bd 2-FSK on an alternating pattern (its
+        // instantaneous frequency is a tone, so no FSK clusters) 950 ms apart:
+        // the gaps between bursts are not an off level.
+        let spec = SynthSpec::Fsk {
+            symbol_rate_baud: 2400,
+            deviation_hz: 2400.0,
+            order: 2,
+            bits: "pattern:aa".into(),
+            repeat: 3,
+            gap_ms: 950,
+        };
+        let iq = at_20_db(&spec);
+        let f = measure_band(&iq, 48_000, CENTER, 20_000);
+        let l = layer1_label(&f, &iq, 48_000);
+        show("fsk burst train", &f, &l);
+        assert_ne!(l.name, "ook", "{}", l.evidence);
     }
 }

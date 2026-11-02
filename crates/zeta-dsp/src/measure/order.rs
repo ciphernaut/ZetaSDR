@@ -6,7 +6,7 @@
 use num_complex::Complex;
 use zeta_core::types::Hz;
 
-use super::burst::{averaged_half_spectrum, bandpass, hann};
+use super::burst::{BURST_MIN_PERIOD_MS, averaged_half_spectrum, bandpass, burst_runs, hann};
 use super::{LOCAL_BINS, MIN_LINE_HZ, SIZE, discriminator, median};
 use crate::fft::{CpuFft, FftBackend, PowerSum, Window};
 
@@ -213,11 +213,17 @@ pub(super) fn psk_order(
     })
 }
 
-/// Whether the envelope `|x|` of `iq` sits at two levels: its histogram from 0
-/// to the `OOK_TOP_PERCENTILE`th percentile in `OOK_HIST_BINS` bins has
-/// exactly two [`clusters`] of at least `FSK_CLUSTER_MIN_WEIGHT` each.
-pub(super) fn two_levels(iq: &[Complex<f32>]) -> bool {
-    let env: Vec<f32> = iq.iter().map(|s| s.norm()).collect();
+/// Whether the envelope `|x|` of `runs` sits at two levels: its histogram
+/// from 0 to the `OOK_TOP_PERCENTILE`th percentile in `OOK_HIST_BINS` bins
+/// has exactly two [`clusters`] of at least `FSK_CLUSTER_MIN_WEIGHT` each, the
+/// lower under `OOK_OFF_MAX` of the upper. The caller passes the burst runs
+/// ([`envelope_runs`]), so the gaps between bursts are not an off level.
+pub(super) fn two_levels(runs: &[&[Complex<f32>]]) -> bool {
+    let env: Vec<f32> = runs
+        .iter()
+        .flat_map(|r| r.iter())
+        .map(|s| s.norm())
+        .collect();
     let top = super::percentile(&env, OOK_TOP_PERCENTILE);
     if top <= 0.0 {
         return false;
@@ -230,4 +236,17 @@ pub(super) fn two_levels(iq: &[Complex<f32>]) -> bool {
     let c = clusters(&hist, env.len(), FSK_CLUSTER_MIN_WEIGHT);
     // The off level, below the on level's `OOK_OFF_MAX`.
     c.len() == 2 && (c[0].0 as f32 + 0.5) < OOK_OFF_MAX * (c[1].0 as f32 + 0.5)
+}
+
+/// The samples whose envelope is read for its levels: the window's burst runs
+/// ([`burst_runs`]) when they repeat no faster than `BURST_MIN_PERIOD_MS`
+/// (bursts, whose gaps are not keying, whatever the duty), else the whole
+/// window (one run, or dense on-off runs, which are the keying itself).
+pub(super) fn envelope_runs(iq: &[Complex<f32>], rate_hz: u64) -> Vec<&[Complex<f32>]> {
+    let b = burst_runs(iq, rate_hz);
+    if b.period_ms.is_some_and(|p| p >= BURST_MIN_PERIOD_MS) {
+        b.runs.iter().map(|&(s, e)| &iq[s..e]).collect()
+    } else {
+        vec![iq]
+    }
 }
