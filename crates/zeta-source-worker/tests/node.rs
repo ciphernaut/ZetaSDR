@@ -123,6 +123,7 @@ async fn streams_of(node: &Node, job: &JobId) -> Vec<String> {
 
 fn node_cfg(state: &Path) -> NodeConfig {
     NodeConfig {
+        burst_policy: Default::default(),
         state_dir: state.to_path_buf(),
         ring_seconds: 1.0,
         ring_budget_bytes: u64::MAX,

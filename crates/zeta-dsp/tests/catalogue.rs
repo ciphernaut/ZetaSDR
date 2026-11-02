@@ -176,6 +176,7 @@ async fn catalogue_does_not_match_nbfm_in_the_broadcast_band() {
 async fn knowledge_lookup_returns_catalogue_signatures() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 10.0,
         ring_budget_bytes: u64::MAX,
@@ -247,6 +248,7 @@ fn equal_scores_are_not_left_in_catalogue_order() {
 async fn lookup(center_hz: u64, bandwidth_hz: u64) -> Vec<zeta_core::knowledge::Signature> {
     let dir = tempfile::tempdir().unwrap();
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 10.0,
         ring_budget_bytes: u64::MAX,

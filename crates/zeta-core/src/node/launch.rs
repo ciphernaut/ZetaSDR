@@ -209,6 +209,7 @@ impl Inner {
             mode,
             dc_hz,
             station: self.station.lock().unwrap().clone(),
+            bursts: Some(self.bursts.clone()),
             ..StageContext::new(rec.source.clone())
         }
         .with_note(Arc::new(move |v| {

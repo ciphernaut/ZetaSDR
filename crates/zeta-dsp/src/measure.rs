@@ -20,6 +20,7 @@ use zeta_core::types::{Baud, Hz, Provenance, StreamId, StreamKind, Timestamp};
 mod burst;
 mod order;
 
+pub(crate) use burst::{BURST_ENVELOPE_MS, BURST_MERGE_MS, BURST_ON_DB};
 pub use burst::{Bursts, burst_runs, on_time};
 use burst::{
     View, averaged_half_spectrum, bandpass, cyclo_symbol_rate, gated_view, strongest_line,
@@ -98,7 +99,7 @@ pub(super) const FSK_SEP_HZ: (f64, f64) = (500.0, 3_000.0);
 /// Noise floor of [`measure_band`]: this percentile of the in-band bins. A
 /// signal may fill more than half of a channel (APRS: Carson ~10.4 kHz in
 /// 12.5 kHz), so the median would be signal, not noise.
-const FLOOR_PERCENTILE: usize = 15;
+pub(crate) const FLOOR_PERCENTILE: usize = 15;
 
 /// The `pct`th percentile of `v` (the value at index `len · pct / 100` when
 /// sorted); 0 when empty.

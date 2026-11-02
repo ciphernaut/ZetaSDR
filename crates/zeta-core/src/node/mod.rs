@@ -87,6 +87,9 @@ pub struct NodeConfig {
     /// reads none (the CLI resolves the default, [`crate::modes::default_operator_dir`]).
     /// A missing directory reads as empty.
     pub modes_dir: Option<PathBuf>,
+    /// What the burst store (`state_dir/bursts`) keeps; `BurstPolicy::default()` is
+    /// 256 MiB and 7 days.
+    pub burst_policy: crate::bursts::BurstPolicy,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -263,6 +266,8 @@ struct Inner {
     registry: StageRegistry,
     /// The decoder modes, loaded at `open` against `registry`.
     modes: Arc<ModeRegistry>,
+    /// The `capture` jobs' windows, opened (and expired) at `open`.
+    bursts: Arc<crate::bursts::BurstStore>,
     leases: LeaseManager,
     bus: Arc<StreamBus>,
     ports: RwLock<HashMap<SourceId, Arc<dyn Port>>>,
@@ -779,6 +784,9 @@ impl Node {
         let (source_records, source_errors) = load_sources(&sources_dir);
         load_errors.extend(source_errors);
         let resume = cfg.resume;
+        let bursts =
+            crate::bursts::BurstStore::open(&cfg.state_dir, cfg.burst_policy).map_err(io)?;
+        bursts.expire();
         let modes = modes
             .unwrap_or_else(|| Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref())));
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
@@ -805,6 +813,7 @@ impl Node {
                 backends: cfg.backends,
                 registry,
                 modes,
+                bursts,
                 leases: LeaseManager::new(),
                 bus,
                 ports: RwLock::new(HashMap::new()),
@@ -1002,6 +1011,11 @@ impl Node {
     /// The decoder modes loaded at `open` (see [`crate::modes`]).
     pub fn modes(&self) -> Arc<ModeRegistry> {
         self.inner.modes.clone()
+    }
+
+    /// The burst store: the windows `capture` jobs wrote.
+    pub fn bursts(&self) -> Arc<crate::bursts::BurstStore> {
+        self.inner.bursts.clone()
     }
 
     pub(crate) fn knowledge(&self) -> Vec<Arc<dyn KnowledgeProvider>> {

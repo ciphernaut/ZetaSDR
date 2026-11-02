@@ -16,6 +16,7 @@ pub mod am;
 pub mod aprs;
 pub mod ax25;
 pub mod bank;
+pub mod burst_capture;
 pub mod catalogue;
 pub mod channel;
 pub mod denoise;
@@ -61,6 +62,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(acars::AcarsDecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
     reg.register(Arc::new(detect::DetectStage::new()));
+    reg.register(Arc::new(burst_capture::BurstCaptureStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));
     reg.register(Arc::new(vad::VadStage::new()));
     reg.register(Arc::new(mix::MixStage::new()));

@@ -55,6 +55,7 @@ fn speech_port(dir: &Path) -> (Arc<FileSource>, Arc<dyn Port>) {
 
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: u64::MAX,

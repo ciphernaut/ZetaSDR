@@ -34,6 +34,7 @@ const GAP_NS: u64 = 1_000_000;
 
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: u64::MAX,

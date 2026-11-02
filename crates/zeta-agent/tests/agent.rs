@@ -54,6 +54,7 @@ async fn tone_node(dir: &std::path::Path) -> Arc<Node> {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 10.0,
         ring_budget_bytes: u64::MAX,

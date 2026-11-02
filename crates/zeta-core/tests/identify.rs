@@ -141,6 +141,7 @@ async fn node_unstarted(
     wrap: impl FnOnce(Arc<dyn Port>) -> Arc<dyn Port>,
 ) -> (Node, Arc<FileSource>) {
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 4.0,
         ring_budget_bytes: u64::MAX,

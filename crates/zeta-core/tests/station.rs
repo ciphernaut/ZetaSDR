@@ -10,6 +10,7 @@ use zeta_core::types::Hz;
 
 async fn open(dir: &Path) -> Node {
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: 64 << 20,

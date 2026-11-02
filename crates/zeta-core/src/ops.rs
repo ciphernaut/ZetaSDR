@@ -537,6 +537,9 @@ const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 /// (see `node::watch`).
 /// `transcribe` is attachable, not started on the radio: `job_attach` runs it on another
 /// job's audio (see [`JobKind::expand_attached`]); `job_start` refuses it.
+/// `capture` channelises its band as `measure` does and expands to `channel →
+/// burst_capture` ([`BURST_CAPTURE_STAGE`]): the stage writes the band's bursts to the
+/// node's burst store and returns, so the job ends `stopped` with `job_context.capture`.
 ///
 /// The decoder kinds (`aprs_decode`, `pocsag_decode`, `rds_decode`, `acars_decode`,
 /// `adsb_decode`) and [`JobKind::Mode`] expand from their mode rows (see
@@ -562,12 +565,13 @@ pub enum JobKind {
     Watch,
     Transcribe,
     Mix,
+    Capture,
     /// A mode row's id that is not a built-in kind's name (an operator's row).
     Mode(ModeId),
 }
 
 /// The built-in kinds, in the order `schema` lists them: every kind but [`JobKind::Mode`].
-pub static BUILTIN_KINDS: [JobKind; 17] = [
+pub static BUILTIN_KINDS: [JobKind; 18] = [
     JobKind::Passthrough,
     JobKind::Spectrum,
     JobKind::FmDemod,
@@ -585,6 +589,7 @@ pub static BUILTIN_KINDS: [JobKind; 17] = [
     JobKind::Watch,
     JobKind::Transcribe,
     JobKind::Mix,
+    JobKind::Capture,
 ];
 
 impl Serialize for JobKind {
@@ -669,6 +674,7 @@ impl JobKind {
             JobKind::Watch => "watch",
             JobKind::Transcribe => "transcribe",
             JobKind::Mix => "mix",
+            JobKind::Capture => "capture",
             JobKind::Mode(id) => &id.0,
         }
     }
@@ -746,7 +752,8 @@ impl JobKind {
             | JobKind::Identify
             | JobKind::Watch
             | JobKind::Transcribe
-            | JobKind::Mix => false,
+            | JobKind::Mix
+            | JobKind::Capture => false,
         }
     }
 
@@ -950,6 +957,7 @@ impl JobKind {
                 | JobKind::AcarsDecode
                 | JobKind::AdsbDecode
                 | JobKind::Measure
+                | JobKind::Capture
                 | JobKind::Mode(_)
         )
     }
@@ -1063,6 +1071,33 @@ impl JobKind {
                     edges: vec![Edge {
                         from: channel,
                         to: measure,
+                        kind: StreamKind::Iq,
+                    }],
+                }
+            }
+            JobKind::Capture => {
+                let (channel, capture) = (NodeId::new(), NodeId::new());
+                Graph {
+                    id: GraphId::new(),
+                    nodes: vec![
+                        GraphNode {
+                            id: channel.clone(),
+                            kind: "channel".into(),
+                            params: serde_json::json!({
+                                "center_hz": tuning.center_hz.0,
+                                "bandwidth_hz": tuning.bandwidth_hz.0,
+                                "out_rate_hz": out,
+                            }),
+                        },
+                        GraphNode {
+                            id: capture.clone(),
+                            kind: BURST_CAPTURE_STAGE.into(),
+                            params: serde_json::json!({"bandwidth_hz": tuning.bandwidth_hz.0}),
+                        },
+                    ],
+                    edges: vec![Edge {
+                        from: channel,
+                        to: capture,
                         kind: StreamKind::Iq,
                     }],
                 }
@@ -1487,6 +1522,10 @@ pub const DETECT_STAGE: &str = "detect";
 /// The stage kind of the sonde feed a watch appends to its decoders when its `detect`
 /// params carry `sondehub` (registered by `zeta-ext`).
 pub const SONDEHUB_STAGE: &str = "sink_sondehub";
+
+/// The stage kind a `capture` job cuts its bursts with (registered by `zeta-dsp`): it
+/// writes them to the node's [`crate::bursts::BurstStore`] and ends the job.
+pub const BURST_CAPTURE_STAGE: &str = "burst_capture";
 
 /// The `detect` stage's default `gone_ms`: an announced signal unmatched this long is
 /// `gone`. The watch re-adopts a decoder only when its signal reappears within it.

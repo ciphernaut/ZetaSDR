@@ -165,6 +165,7 @@ fn registry_lingering(linger: Duration) -> StageRegistry {
 
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: 64 << 20,

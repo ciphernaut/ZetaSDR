@@ -119,6 +119,7 @@ fn spawn(
         dc_hz: None,
         mix_inputs: None,
         station: None,
+        bursts: None,
     };
     let (bus2, rx_in, c2) = (bus.clone(), root.subscribe(), cancel.clone());
     let stage = tokio::spawn(async move {
@@ -477,6 +478,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
     let mut reg = StageRegistry::new();
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: u64::MAX,
@@ -600,6 +602,7 @@ async fn measure_emits_partials_when_the_input_gaps_every_400_ms() {
     let mut reg = StageRegistry::new();
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: u64::MAX,

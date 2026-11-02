@@ -34,6 +34,7 @@ const EMBEDDED: [&str; 8] = [
 
 fn cfg(dir: &Path, modes_dir: &Path) -> NodeConfig {
     NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: 64 << 20,
@@ -188,6 +189,7 @@ async fn modes_list_filters_by_family_and_state() {
 async fn a_node_without_a_modes_dir_lists_only_the_embedded_rows() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         modes_dir: None,
         ..cfg(dir.path(), dir.path())
     };

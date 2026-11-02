@@ -92,6 +92,9 @@ pub struct StageContext {
     pub mix_inputs: Option<MixInputs>,
     /// The node's station (position, region, antennas), when one is set.
     pub station: Option<crate::station::Station>,
+    /// The node's burst store, `Some` for every job in a node (only a `burst_capture`
+    /// stage writes to it).
+    pub bursts: Option<Arc<crate::bursts::BurstStore>>,
 }
 
 impl StageContext {
@@ -105,6 +108,15 @@ impl StageContext {
             dc_hz: None,
             mix_inputs: None,
             station: None,
+            bursts: None,
+        }
+    }
+
+    /// This context with the node's burst store.
+    pub fn with_bursts(self, bursts: Arc<crate::bursts::BurstStore>) -> Self {
+        Self {
+            bursts: Some(bursts),
+            ..self
         }
     }
 

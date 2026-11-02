@@ -34,6 +34,7 @@ fn source_with(dir: &Path, repeat: bool) -> (Arc<FileSource>, Arc<dyn Port>) {
 
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
         ring_budget_bytes: u64::MAX,
@@ -170,6 +171,7 @@ async fn open_without_resume_leaves_records_untouched() {
     let before = std::fs::read(&path).unwrap();
     let node = Node::open(
         NodeConfig {
+            burst_policy: Default::default(),
             resume: false,
             ..cfg(dir.path())
         },

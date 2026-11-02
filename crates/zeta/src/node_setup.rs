@@ -515,6 +515,7 @@ async fn open_into(
         backends.push(Backend::Gpu);
     }
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir,
         ring_seconds: 10.0,
         ring_budget_bytes: ring_budget_mb

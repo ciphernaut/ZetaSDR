@@ -61,6 +61,7 @@ async fn retune_resizes_ring_within_budget() {
     let dir = tempfile::tempdir().unwrap();
     let budget = 128 << 20;
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 10.0,
         ring_budget_bytes: budget,

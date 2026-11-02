@@ -274,6 +274,7 @@ async fn node_over(
     modes_dir: Option<&Path>,
 ) -> Node {
     let cfg = NodeConfig {
+        burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 4.0,
         ring_budget_bytes: u64::MAX,
