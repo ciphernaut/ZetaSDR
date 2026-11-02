@@ -1,13 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1660 1998.0" width="1660" height="1998.0" role="img" aria-label="ZetaSDR architecture: clients over transports over one core node that runs jobs as graphs of stages fed by sources, with external services beside it and planned work pencilled in." font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" fill="currentColor" style="color:#1b1f24">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1660 2024.0" width="1660" height="2024.0" role="img" aria-label="ZetaSDR architecture: clients over transports over one core node that runs jobs as graphs of stages fed by sources, with external services beside it and planned work pencilled in." font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" fill="currentColor" style="color:#1b1f24">
 <defs>
 <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
 <marker id="arrow-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 10 0 L 0 5 L 10 10 z" fill="currentColor"/></marker>
 </defs>
-<rect x="0" y="0" width="1660" height="1998.0" fill="#fbfbf9"/>
+<rect x="0" y="0" width="1660" height="2024.0" fill="#fbfbf9"/>
 <text x="18" y="34" font-size="22" font-weight="800">ZetaSDR architecture</text>
-<text x="300" y="34" font-size="12" text-anchor="start" opacity="0.8">as it stands 2026-11-01, main fd126b0, v0.1.0; plans 21 and 22 shipped; planned work pencilled in amber</text>
+<text x="300" y="34" font-size="12" text-anchor="start" opacity="0.8">as it stands 2026-11-02, main 812cf1b, v0.1.0; plans 21, 22 and 23 shipped; planned work pencilled in amber</text>
 <rect x="18" y="48" width="26" height="12" rx="3" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="50" y="58" font-size="10.5" text-anchor="start" opacity="0.8">shipped (plans 1-18, 20, 21 and 22 merged to main)</text>
+<text x="50" y="58" font-size="10.5" text-anchor="start" opacity="0.8">shipped (plans 1-18 and 20-23 merged to main)</text>
 <rect x="300" y="48" width="26" height="12" rx="3" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
 <text x="332" y="58" font-size="10.5" text-anchor="start" opacity="0.8">planned (plan 19, the rest of the UI wave, TODO gists)</text>
 <circle cx="660" cy="54" r="9" fill="currentColor" fill-opacity="0.9"/>
@@ -15,23 +15,23 @@
 <text x="674" y="58" font-size="10.5" text-anchor="start" opacity="0.8">see note n under the figure</text>
 <line x1="830" y1="54" x2="870" y2="54" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
 <text x="876" y="58" font-size="10.5" text-anchor="start" opacity="0.8">data or control flow (label says which)</text>
-<rect x="112" y="84" width="1544" height="256.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
+<rect x="112" y="84" width="1544" height="282.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
 <text x="18" y="100" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">CLIENTS</text>
-<rect x="112" y="354.0" width="1544" height="139.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
-<text x="18" y="370.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">TRANSPORTS</text>
-<rect x="112" y="521.0" width="1544" height="561.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
-<text x="18" y="537.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">CORE NODE</text>
-<rect x="112" y="1110.0" width="1544" height="253.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
-<text x="18" y="1126.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">STAGES</text>
-<rect x="112" y="1391.0" width="1544" height="165.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
-<text x="18" y="1407.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">SOURCES</text>
-<rect x="112" y="1570.0" width="1544" height="100.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
-<text x="18" y="1586.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">RADIOS, FILES</text>
-<rect x="112" y="1688.0" width="1544" height="304.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
-<text x="18" y="1704.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">PLANNED</text>
-<rect x="1404" y="84" width="236" height="1472.0" rx="8" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 4" opacity="0.6"/>
+<rect x="112" y="380.0" width="1544" height="139.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
+<text x="18" y="396.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">TRANSPORTS</text>
+<rect x="112" y="547.0" width="1544" height="561.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
+<text x="18" y="563.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">CORE NODE</text>
+<rect x="112" y="1136.0" width="1544" height="253.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
+<text x="18" y="1152.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">STAGES</text>
+<rect x="112" y="1417.0" width="1544" height="165.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
+<text x="18" y="1433.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">SOURCES</text>
+<rect x="112" y="1596.0" width="1544" height="100.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
+<text x="18" y="1612.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">RADIOS, FILES</text>
+<rect x="112" y="1714.0" width="1544" height="304.0" rx="8" fill="currentColor" fill-opacity="0.025"/>
+<text x="18" y="1730.0" font-size="10.5" font-weight="700" letter-spacing="0.12em" opacity="0.75">PLANNED</text>
+<rect x="1404" y="84" width="236" height="1498.0" rx="8" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 4" opacity="0.6"/>
 <text x="1414" y="78" font-size="10.5" text-anchor="start" opacity="0.75" font-weight="700">OUTSIDE THE NODE: services it talks to</text>
-<rect x="130.0" y="98" width="220.4" height="228.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<rect x="130.0" y="98" width="220.4" height="254.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
 <text x="138.0" y="114" font-size="12.5" font-weight="700">zeta CLI</text>
 <text x="138.0" y="129" font-size="10.5">
 <tspan x="138.0" dy="0">crate zeta. zeta &lt;group&gt; &lt;verb&gt;</tspan>
@@ -47,7 +47,7 @@
 </text>
 <circle cx="130.0" cy="98" r="9" fill="currentColor" fill-opacity="0.9"/>
 <text x="130.0" y="101.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">1</text>
-<rect x="366.4" y="98" width="220.4" height="228.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<rect x="366.4" y="98" width="220.4" height="254.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
 <text x="374.4" y="114" font-size="12.5" font-weight="700">Web UI</text>
 <text x="374.4" y="129" font-size="10.5">
 <tspan x="374.4" dy="0">crate zeta-ui: plain JS embedded in</tspan>
@@ -64,11 +64,15 @@
 <tspan x="374.4" dy="13.0">job tags link to the rows. Its own</tspan>
 <tspan x="374.4" dy="13.0">spectrum job is elastic. Listen to</tspan>
 <tspan x="374.4" dy="13.0">all plays a mix; a speaking channel</tspan>
-<tspan x="374.4" dy="13.0">lights up.</tspan>
+<tspan x="374.4" dy="13.0">lights up. A Subjects tab lists one</tspan>
+<tspan x="374.4" dy="13.0">row per aircraft, sonde or station,</tspan>
+<tspan x="374.4" dy="13.0">and the map tracks each.</tspan>
 </text>
 <circle cx="366.4" cy="98" r="9" fill="currentColor" fill-opacity="0.9"/>
 <text x="366.4" y="101.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">10</text>
-<rect x="602.8" y="98" width="220.4" height="228.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<circle cx="433.4" cy="98" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="433.4" y="101.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">18</text>
+<rect x="602.8" y="98" width="220.4" height="254.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
 <text x="610.8" y="114" font-size="12.5" font-weight="700">MCP server</text>
 <text x="610.8" y="129" font-size="10.5">
 <tspan x="610.8" dy="0">crate zeta-mcp: zeta-mcp --node URL.</tspan>
@@ -76,7 +80,7 @@
 <tspan x="610.8" dy="13.0">generated from the schema; tool text</tspan>
 <tspan x="610.8" dy="13.0">from AGENTS.md.</tspan>
 </text>
-<rect x="839.2" y="98" width="220.4" height="228.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<rect x="839.2" y="98" width="220.4" height="254.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
 <text x="847.2" y="114" font-size="12.5" font-weight="700">Python SDK and scripts</text>
 <text x="847.2" y="129" font-size="10.5">
 <tspan x="847.2" dy="0">sdk/python zeta_plugin (plugin</tspan>
@@ -89,7 +93,7 @@
 <tspan x="847.2" dy="13.0">(the agent skill), deploy/pi</tspan>
 <tspan x="847.2" dy="13.0">(systemd unit, Pi build).</tspan>
 </text>
-<rect x="1075.6" y="98" width="220.4" height="228.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<rect x="1075.6" y="98" width="220.4" height="254.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
 <text x="1083.6" y="114" font-size="12.5" font-weight="700">Agent</text>
 <text x="1083.6" y="129" font-size="10.5">
 <tspan x="1083.6" dy="0">crate zeta-agent: zeta ask "REQUEST"</tspan>
@@ -103,7 +107,7 @@
 </text>
 <circle cx="1075.6" cy="98" r="9" fill="currentColor" fill-opacity="0.9"/>
 <text x="1075.6" y="101.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">16</text>
-<rect x="1414" y="98" width="216" height="228.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<rect x="1414" y="98" width="216" height="254.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
 <text x="1422" y="114" font-size="12.5" font-weight="700">LLM server</text>
 <text x="1422" y="129" font-size="10.5">
 <tspan x="1422" dy="0">OpenAI-compatible chat API (e.g.</tspan>
@@ -113,30 +117,30 @@
 <tspan x="1422" dy="13.0">thinking off, token budget,</tspan>
 <tspan x="1422" dy="13.0">prose-answer detection.</tspan>
 </text>
-<line x1="240.2" y1="326.0" x2="240.2" y2="368.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="246.2" y="360.0" font-size="10" text-anchor="start" opacity="0.85">in-process or HTTP</text>
-<line x1="476.59999999999997" y1="326.0" x2="476.59999999999997" y2="368.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="482.59999999999997" y="360.0" font-size="10" text-anchor="start" opacity="0.85">HTTP + ws</text>
-<line x1="713.0" y1="326.0" x2="713.0" y2="368.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="719.0" y="360.0" font-size="10" text-anchor="start" opacity="0.85">HTTP</text>
-<line x1="949.4000000000001" y1="326.0" x2="949.4000000000001" y2="368.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="955.4000000000001" y="360.0" font-size="10" text-anchor="start" opacity="0.85">HTTP</text>
-<line x1="1185.8" y1="326.0" x2="1185.8" y2="368.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="1191.8" y="360.0" font-size="10" text-anchor="start" opacity="0.85">HTTP, or in-process via /ask</text>
+<line x1="240.2" y1="352.0" x2="240.2" y2="394.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="246.2" y="386.0" font-size="10" text-anchor="start" opacity="0.85">in-process or HTTP</text>
+<line x1="476.59999999999997" y1="352.0" x2="476.59999999999997" y2="394.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="482.59999999999997" y="386.0" font-size="10" text-anchor="start" opacity="0.85">HTTP + ws</text>
+<line x1="713.0" y1="352.0" x2="713.0" y2="394.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="719.0" y="386.0" font-size="10" text-anchor="start" opacity="0.85">HTTP</text>
+<line x1="949.4000000000001" y1="352.0" x2="949.4000000000001" y2="394.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="955.4000000000001" y="386.0" font-size="10" text-anchor="start" opacity="0.85">HTTP</text>
+<line x1="1185.8" y1="352.0" x2="1185.8" y2="394.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="1191.8" y="386.0" font-size="10" text-anchor="start" opacity="0.85">HTTP, or in-process via /ask</text>
 <line x1="1296.0" y1="138" x2="1414" y2="138" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
 <text x="1355.0" y="132" font-size="10" text-anchor="middle" opacity="0.85">chat + tool calls</text>
-<rect x="130" y="368.0" width="862.84" height="111.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="138" y="384.0" font-size="12.5" font-weight="700">zeta-ws: HTTP + WebSocket, bearer secret on every route</text>
-<text x="138" y="399.0" font-size="10.5">
+<rect x="130" y="394.0" width="862.84" height="111.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="138" y="410.0" font-size="12.5" font-weight="700">zeta-ws: HTTP + WebSocket, bearer secret on every route</text>
+<text x="138" y="425.0" font-size="10.5">
 <tspan x="138" dy="0">POST /op (one operation, 30 s cap) · GET /schema · GET /health (build, uptime, stages_running) · GET /streams · ws /stream/{id} (text frames;</tspan>
 <tspan x="138" dy="13.0">?format=binary ships IQ as VRT) · GET /streams/{id}/tail · POST /ask (agent) · POST /stt, GET /stt/languages (speech) · GET /agents-md · /ui/. Routes:</tspan>
 <tspan x="138" dy="13.0">http.rs, stream.rs, ask.rs, stt.rs, ui.rs, auth.rs.</tspan>
 </text>
-<circle cx="130" cy="368.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="130" y="371.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">1</text>
-<rect x="1008.84" y="368.0" width="287.15999999999997" height="111.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1016.84" y="384.0" font-size="12.5" font-weight="700">zeta-client</text>
-<text x="1016.84" y="399.0" font-size="10.5">
+<circle cx="130" cy="394.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="130" y="397.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">1</text>
+<rect x="1008.84" y="394.0" width="287.15999999999997" height="111.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1016.84" y="410.0" font-size="12.5" font-weight="700">zeta-client</text>
+<text x="1016.84" y="425.0" font-size="10.5">
 <tspan x="1016.84" dy="0">Typed client of a node: remote.rs (HTTP), ws.rs</tspan>
 <tspan x="1016.84" dy="13.0">(streams), tools.rs and guide.rs (tool list and</tspan>
 <tspan x="1016.84" dy="13.0">guide text shared by the CLI, MCP and agent).</tspan>
@@ -144,9 +148,9 @@
 <tspan x="1016.84" dy="13.0">Node::apply in-process; serve.lock keeps</tspan>
 <tspan x="1016.84" dy="13.0">mutating one-shots off a served state dir.</tspan>
 </text>
-<rect x="1414" y="368.0" width="216" height="111.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1422" y="384.0" font-size="12.5" font-weight="700">Other ZetaSDR nodes</text>
-<text x="1422" y="399.0" font-size="10.5">
+<rect x="1414" y="394.0" width="216" height="111.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1422" y="410.0" font-size="12.5" font-weight="700">Other ZetaSDR nodes</text>
+<text x="1422" y="425.0" font-size="10.5">
 <tspan x="1422" dy="0">Federation peers: a node is a</tspan>
 <tspan x="1422" dy="13.0">source for another (--source-node),</tspan>
 <tspan x="1422" dy="13.0">forwards speech (--stt-node,</tspan>
@@ -154,18 +158,18 @@
 <tspan x="1422" dy="13.0">driven with --node. One secret per</tspan>
 <tspan x="1422" dy="13.0">node.</tspan>
 </text>
-<circle cx="1414" cy="368.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="1414" y="371.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">7</text>
-<line x1="1296" y1="408.0" x2="1414" y2="408.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)" marker-start="url(#arrow-start)"/>
-<text x="1355.0" y="402.0" font-size="10" text-anchor="middle" opacity="0.85">HTTP + ws, both ways</text>
-<rect x="130" y="535.0" width="1166" height="533.0" rx="8" fill="none" stroke="currentColor" stroke-width="1.6"/>
-<text x="140" y="554.0" font-size="13" font-weight="800">zeta-core: the node (one process, one state dir: jobs, captures, pins, gain, ops.log, transcripts.log)</text>
-<text x="1286" y="554.0" font-size="10.5" text-anchor="end" opacity="0.8">every transport ends in Node::apply(op)</text>
-<line x1="580" y1="479.0" x2="580" y2="535.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="588" y="525.0" font-size="10" text-anchor="start" opacity="0.85">Node::apply(op); results back; frames out on streams</text>
-<rect x="142.0" y="565.0" width="273.5" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="150.0" y="581.0" font-size="12.5" font-weight="700">Operation set</text>
-<text x="150.0" y="596.0" font-size="10.5">
+<circle cx="1414" cy="394.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="1414" y="397.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">7</text>
+<line x1="1296" y1="434.0" x2="1414" y2="434.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)" marker-start="url(#arrow-start)"/>
+<text x="1355.0" y="428.0" font-size="10" text-anchor="middle" opacity="0.85">HTTP + ws, both ways</text>
+<rect x="130" y="561.0" width="1166" height="533.0" rx="8" fill="none" stroke="currentColor" stroke-width="1.6"/>
+<text x="140" y="580.0" font-size="13" font-weight="800">zeta-core: the node (one process, one state dir: jobs, captures, pins, gain, ops.log, transcripts.log)</text>
+<text x="1286" y="580.0" font-size="10.5" text-anchor="end" opacity="0.8">every transport ends in Node::apply(op)</text>
+<line x1="580" y1="505.0" x2="580" y2="561.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="588" y="551.0" font-size="10" text-anchor="start" opacity="0.85">Node::apply(op); results back; frames out on streams</text>
+<rect x="142.0" y="591.0" width="273.5" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="150.0" y="607.0" font-size="12.5" font-weight="700">Operation set</text>
+<text x="150.0" y="622.0" font-size="10.5">
 <tspan x="150.0" dy="0">ops.rs: 26 typed ops (source_*, job_* with</tspan>
 <tspan x="150.0" dy="13.0">job_retune, jobs_stop, plan_start, mix_start,</tspan>
 <tspan x="150.0" dy="13.0">stream_*, graph_*, iq_read, classify,</tspan>
@@ -175,11 +179,11 @@
 <tspan x="150.0" dy="13.0">conflict holders). CLI form and JSON form are</tspan>
 <tspan x="150.0" dy="13.0">the same op.</tspan>
 </text>
-<circle cx="142.0" cy="565.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="142.0" y="568.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">1</text>
-<rect x="431.5" y="565.0" width="273.5" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="439.5" y="581.0" font-size="12.5" font-weight="700">Job runtime</text>
-<text x="439.5" y="596.0" font-size="10.5">
+<circle cx="142.0" cy="591.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="142.0" y="594.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">1</text>
+<rect x="431.5" y="591.0" width="273.5" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="439.5" y="607.0" font-size="12.5" font-weight="700">Job runtime</text>
+<text x="439.5" y="622.0" font-size="10.5">
 <tspan x="439.5" dy="0">job.rs, node/launch.rs, retune.rs, persist.rs:</tspan>
 <tspan x="439.5" dy="13.0">a job is a graph on a source band; persisted,</tspan>
 <tspan x="439.5" dy="13.0">resumed by serve (scan first, then widest</tspan>
@@ -191,15 +195,15 @@
 <tspan x="439.5" dy="13.0">stream, hold no lease and follow their input</tspan>
 <tspan x="439.5" dy="13.0">through a retune or graph_put.</tspan>
 </text>
-<circle cx="431.5" cy="565.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="431.5" y="568.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">6</text>
-<circle cx="536.0" cy="565.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="536.0" y="568.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">10</text>
-<circle cx="558.0" cy="565.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="558.0" y="568.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">17</text>
-<rect x="721.0" y="565.0" width="273.5" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="729.0" y="581.0" font-size="12.5" font-weight="700">Lease manager</text>
-<text x="729.0" y="596.0" font-size="10.5">
+<circle cx="431.5" cy="591.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="431.5" y="594.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">6</text>
+<circle cx="536.0" cy="591.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="536.0" y="594.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">10</text>
+<circle cx="558.0" cy="591.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="558.0" y="594.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">17</text>
+<rect x="721.0" y="591.0" width="273.5" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="729.0" y="607.0" font-size="12.5" font-weight="700">Lease manager</text>
+<text x="729.0" y="622.0" font-size="10.5">
 <tspan x="729.0" dy="0">lease.rs: one tuning per source. Rigid leases</tspan>
 <tspan x="729.0" dy="13.0">(decoders, identify, watch, scan), elastic</tspan>
 <tspan x="729.0" dy="13.0">followers (the page's spectrum), pins (a</tspan>
@@ -208,11 +212,11 @@
 <tspan x="729.0" dy="13.0">step; job_retune moves a lease under the gate;</tspan>
 <tspan x="729.0" dy="13.0">conflicts name the holders and the options.</tspan>
 </text>
-<circle cx="721.0" cy="565.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="721.0" y="568.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">2</text>
-<rect x="1010.5" y="565.0" width="273.5" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1018.5" y="581.0" font-size="12.5" font-weight="700">Graph document + stage registry</text>
-<text x="1018.5" y="596.0" font-size="10.5">
+<circle cx="721.0" cy="591.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="721.0" y="594.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">2</text>
+<rect x="1010.5" y="591.0" width="273.5" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1018.5" y="607.0" font-size="12.5" font-weight="700">Graph document + stage registry</text>
+<text x="1018.5" y="622.0" font-size="10.5">
 <tspan x="1018.5" dy="0">graph.rs, stage.rs: nodes (kind, params) and</tspan>
 <tspan x="1018.5" dy="13.0">typed edges; 21 stage kinds with</tspan>
 <tspan x="1018.5" dy="13.0">params_schema; a job kind expands to a</tspan>
@@ -221,18 +225,18 @@
 <tspan x="1018.5" dy="13.0">re-expandable puts carry squelch, guard and</tspan>
 <tspan x="1018.5" dy="13.0">width across capture changes.</tspan>
 </text>
-<rect x="142.0" y="742.0" width="273.5" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="150.0" y="758.0" font-size="12.5" font-weight="700">IQ ring</text>
-<text x="150.0" y="773.0" font-size="10.5">
+<rect x="142.0" y="768.0" width="273.5" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="150.0" y="784.0" font-size="12.5" font-weight="700">IQ ring</text>
+<text x="150.0" y="799.0" font-size="10.5">
 <tspan x="150.0" dy="0">ring.rs: per-source IQ history under</tspan>
 <tspan x="150.0" dy="13.0">--ring-budget-mb (10 s narrow, down to 1 s at</tspan>
 <tspan x="150.0" dy="13.0">16 Msps). iq_read saves a SigMF pair of the</tspan>
 <tspan x="150.0" dy="13.0">whole ring band; classify reads a span; older</tspan>
 <tspan x="150.0" dy="13.0">spans fail too_old.</tspan>
 </text>
-<rect x="431.5" y="742.0" width="273.5" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="439.5" y="758.0" font-size="12.5" font-weight="700">Channel bank</text>
-<text x="439.5" y="773.0" font-size="10.5">
+<rect x="431.5" y="768.0" width="273.5" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="439.5" y="784.0" font-size="12.5" font-weight="700">Channel bank</text>
+<text x="439.5" y="799.0" font-size="10.5">
 <tspan x="439.5" dy="0">bank.rs over zeta-dsp PfbBank: at 2 Msps and</tspan>
 <tspan x="439.5" dy="13.0">up one polyphase filter bank per source splits</tspan>
 <tspan x="439.5" dy="13.0">the capture into 8-256 bins; a channel that</tspan>
@@ -240,11 +244,11 @@
 <tspan x="439.5" dy="13.0">ones take the direct path. job_context shows</tspan>
 <tspan x="439.5" dy="13.0">channel.path; source_list shows bank.dropped.</tspan>
 </text>
-<circle cx="431.5" cy="742.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="431.5" y="745.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">3</text>
-<rect x="721.0" y="742.0" width="273.5" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="729.0" y="758.0" font-size="12.5" font-weight="700">Streams and ports</text>
-<text x="729.0" y="773.0" font-size="10.5">
+<circle cx="431.5" cy="768.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="431.5" y="771.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">3</text>
+<rect x="721.0" y="768.0" width="273.5" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="729.0" y="784.0" font-size="12.5" font-weight="700">Streams and ports</text>
+<text x="729.0" y="799.0" font-size="10.5">
 <tspan x="729.0" dy="0">stream.rs, port.rs, types.rs: typed streams</tspan>
 <tspan x="729.0" dy="13.0">(iq, audio, video, text, event, sink), frames</tspan>
 <tspan x="729.0" dy="13.0">with provenance (source, job, channel,</tspan>
@@ -252,9 +256,9 @@
 <tspan x="729.0" dy="13.0">lagged/missed accounting, stream_tail. Port</tspan>
 <tspan x="729.0" dy="13.0">trait: a source's tune + push side.</tspan>
 </text>
-<rect x="1010.5" y="742.0" width="273.5" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1018.5" y="758.0" font-size="12.5" font-weight="700">Capture and sources</text>
-<text x="1018.5" y="773.0" font-size="10.5">
+<rect x="1010.5" y="768.0" width="273.5" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1018.5" y="784.0" font-size="12.5" font-weight="700">Capture and sources</text>
+<text x="1018.5" y="799.0" font-size="10.5">
 <tspan x="1018.5" dy="0">capture.rs, node/sources.rs, recover.rs:</tspan>
 <tspan x="1018.5" dy="13.0">source_ensure, pin/unpin, free, set_gain;</tspan>
 <tspan x="1018.5" dy="13.0">capability records; faults (device lost,</tspan>
@@ -264,13 +268,13 @@
 <tspan x="1018.5" dy="13.0">step lower, each step's DC notch and edges</tspan>
 <tspan x="1018.5" dy="13.0">masked on local hardware.</tspan>
 </text>
-<circle cx="1010.5" cy="742.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="1010.5" y="745.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">8</text>
-<circle cx="1175.0" cy="742.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="1175.0" y="745.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">9</text>
-<rect x="142.0" y="893.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="150.0" y="909.0" font-size="12.5" font-weight="700">Mode registry</text>
-<text x="150.0" y="924.0" font-size="10.5">
+<circle cx="1010.5" cy="768.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="1010.5" y="771.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">8</text>
+<circle cx="1175.0" cy="768.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="1175.0" y="771.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">9</text>
+<rect x="142.0" y="919.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="150.0" y="935.0" font-size="12.5" font-weight="700">Mode registry</text>
+<text x="150.0" y="950.0" font-size="10.5">
 <tspan x="150.0" dy="0">modes/: rows from modes/*.json</tspan>
 <tspan x="150.0" dy="13.0">(aprs, pocsag, rds, acars, adsb,</tspan>
 <tspan x="150.0" dy="13.0">rs41, dfm, m20) then the operator's</tspan>
@@ -282,11 +286,11 @@
 <tspan x="150.0" dy="13.0">modes check runs each row's</tspan>
 <tspan x="150.0" dy="13.0">synthesised test.</tspan>
 </text>
-<circle cx="142.0" cy="893.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="142.0" y="896.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">4</text>
-<rect x="372.6" y="893.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="380.6" y="909.0" font-size="12.5" font-weight="700">Knowledge</text>
-<text x="380.6" y="924.0" font-size="10.5">
+<circle cx="142.0" cy="919.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="142.0" y="922.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">4</text>
+<rect x="372.6" y="919.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="380.6" y="935.0" font-size="12.5" font-weight="700">Knowledge</text>
+<text x="380.6" y="950.0" font-size="10.5">
 <tspan x="380.6" dy="0">knowledge.rs: providers answer</tspan>
 <tspan x="380.6" dy="13.0">knowledge_lookup for a band:</tspan>
 <tspan x="380.6" dy="13.0">built-in seed signatures (e.g. the</tspan>
@@ -295,11 +299,11 @@
 <tspan x="380.6" dy="13.0">Apache-2.0); a signature's decoder</tspan>
 <tspan x="380.6" dy="13.0">names the mode row that proves it.</tspan>
 </text>
-<circle cx="372.6" cy="893.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="372.6" y="896.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">14</text>
-<rect x="603.2" y="893.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="611.2" y="909.0" font-size="12.5" font-weight="700">Classify</text>
-<text x="611.2" y="924.0" font-size="10.5">
+<circle cx="372.6" cy="919.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="372.6" y="922.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">14</text>
+<rect x="603.2" y="919.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="611.2" y="935.0" font-size="12.5" font-weight="700">Classify</text>
+<text x="611.2" y="950.0" font-size="10.5">
 <tspan x="611.2" dy="0">classify.rs: layer 1 labels the</tspan>
 <tspan x="611.2" dy="13.0">measured band (wfm, fm, am, ssb,</tspan>
 <tspan x="611.2" dy="13.0">fsk, carrier, noise, unknown); layer</tspan>
@@ -310,11 +314,11 @@
 <tspan x="611.2" dy="13.0">an empty slot. Unknown stays</tspan>
 <tspan x="611.2" dy="13.0">unknown.</tspan>
 </text>
-<circle cx="603.2" cy="893.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="603.2" y="896.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">5</text>
-<rect x="833.8" y="893.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="841.8" y="909.0" font-size="12.5" font-weight="700">Identify and watch</text>
-<text x="841.8" y="924.0" font-size="10.5">
+<circle cx="603.2" cy="919.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="603.2" y="922.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">5</text>
+<rect x="833.8" y="919.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="841.8" y="935.0" font-size="12.5" font-weight="700">Identify and watch</text>
+<text x="841.8" y="950.0" font-size="10.5">
 <tspan x="841.8" dy="0">node/identify.rs, watch.rs: identify</tspan>
 <tspan x="841.8" dy="13.0">holds the band, measures 1 s, runs</tspan>
 <tspan x="841.8" dy="13.0">each fitting row as a child job for</tspan>
@@ -326,11 +330,11 @@
 <tspan x="841.8" dy="13.0">in the capture or on a free source;</tspan>
 <tspan x="841.8" dy="13.0">optional SondeHub sink.</tspan>
 </text>
-<circle cx="833.8" cy="893.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="833.8" y="896.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">5</text>
-<rect x="1064.4" y="893.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1072.4" y="909.0" font-size="12.5" font-weight="700">Plans, logs, guide</text>
-<text x="1072.4" y="924.0" font-size="10.5">
+<circle cx="833.8" cy="919.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="833.8" y="922.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">5</text>
+<rect x="1064.4" y="919.0" width="219.6" height="163.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1072.4" y="935.0" font-size="12.5" font-weight="700">Plans, logs, guide</text>
+<text x="1072.4" y="950.0" font-size="10.5">
 <tspan x="1072.4" dy="0">plans.rs: channel plans (uhf_cb_au,</tspan>
 <tspan x="1072.4" dy="13.0">80 channels) naming channels and</tspan>
 <tspan x="1072.4" dy="13.0">feeding the adjacent-channel guard.</tspan>
@@ -341,11 +345,11 @@
 <tspan x="1072.4" dy="13.0">docs/agents/field-craft.md, served</tspan>
 <tspan x="1072.4" dy="13.0">at /agents-md.</tspan>
 </text>
-<line x1="580" y1="1068.0" x2="580" y2="1124.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="588" y="1114.0" font-size="10" text-anchor="start" opacity="0.85">a job launches its graph; stages read and write typed streams</text>
-<rect x="130" y="1124.0" width="430" height="225.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="138" y="1140.0" font-size="12.5" font-weight="700">zeta-dsp: in-process stages</text>
-<text x="138" y="1155.0" font-size="10.5">
+<line x1="580" y1="1094.0" x2="580" y2="1150.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="588" y="1140.0" font-size="10" text-anchor="start" opacity="0.85">a job launches its graph; stages read and write typed streams</text>
+<rect x="130" y="1150.0" width="430" height="225.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="138" y="1166.0" font-size="12.5" font-weight="700">zeta-dsp: in-process stages</text>
+<text x="138" y="1181.0" font-size="10.5">
 <tspan x="138" dy="0">channel (fine filter, wide_hz for the guard), pfb bank, resample</tspan>
 <tspan x="138" dy="13.0">(rational, snapping), fft (CPU; GPU via wgpu behind feature gpu, shaders/;</tspan>
 <tspan x="138" dy="13.0">notch_hz/edge_mask mark rows masked), measure (layer 1: occupied band,</tspan>
@@ -357,9 +361,9 @@
 <tspan x="138" dy="13.0">nnnoiseless), vad, catalogue scoring, synth/fixtures (fsk/psk/ook</tspan>
 <tspan x="138" dy="13.0">families, RS41 frames, echo, snr, ppm impairments for modes check).</tspan>
 </text>
-<rect x="576" y="1124.0" width="290" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="584" y="1140.0" font-size="12.5" font-weight="700">zeta-ext: external decoder programs</text>
-<text x="584" y="1155.0" font-size="10.5">
+<rect x="576" y="1150.0" width="290" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="584" y="1166.0" font-size="12.5" font-weight="700">zeta-ext: external decoder programs</text>
+<text x="584" y="1181.0" font-size="10.5">
 <tspan x="584" dy="0">external_decode runs a program row's command over</tspan>
 <tspan x="584" dy="13.0">stdio with IQ or demodulated audio (raw or wav</tspan>
 <tspan x="584" dy="13.0">fifo) and parses json_lines, sbs, nmea, kiss,</tspan>
@@ -368,11 +372,11 @@
 <tspan x="584" dy="13.0">dfm09mod, m20mod); handler report at startup</tspan>
 <tspan x="584" dy="13.0">(ZETA_HANDLER_*).</tspan>
 </text>
-<circle cx="576" cy="1124.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="576" y="1127.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">4</text>
-<rect x="880" y="1124.0" width="160" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="888" y="1140.0" font-size="12.5" font-weight="700">zeta-plugin</text>
-<text x="888" y="1155.0" font-size="10.5">
+<circle cx="576" cy="1150.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="576" y="1153.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">4</text>
+<rect x="880" y="1150.0" width="160" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="888" y="1166.0" font-size="12.5" font-weight="700">zeta-plugin</text>
+<text x="888" y="1181.0" font-size="10.5">
 <tspan x="888" dy="0">Stdio plugin protocol 1</tspan>
 <tspan x="888" dy="13.0">and 2 (hello, run, typed</tspan>
 <tspan x="888" dy="13.0">frames; 2 adds video).</tspan>
@@ -382,19 +386,19 @@
 <tspan x="888" dy="13.0">cleared environment. The</tspan>
 <tspan x="888" dy="13.0">Python SDK implements it.</tspan>
 </text>
-<rect x="576" y="1277.0" width="464" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="584" y="1293.0" font-size="12.5" font-weight="700">Child processes (spawned by the node, cleared env, stdio)</text>
-<text x="1032" y="1293.0" font-size="9" text-anchor="end" opacity="0.7" letter-spacing="0.06em">OUTSIDE PROCESS</text>
-<text x="584" y="1308.0" font-size="10.5">
+<rect x="576" y="1303.0" width="464" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="584" y="1319.0" font-size="12.5" font-weight="700">Child processes (spawned by the node, cleared env, stdio)</text>
+<text x="1032" y="1319.0" font-size="9" text-anchor="end" opacity="0.7" letter-spacing="0.06em">OUTSIDE PROCESS</text>
+<text x="584" y="1334.0" font-size="10.5">
 <tspan x="584" dy="0">dump1090 · rs41mod / dfm09mod / m20mod · the operator's --plugin programs (any</tspan>
 <tspan x="584" dy="13.0">language; sdk/python). A crashed program fails its job with a reason naming it;</tspan>
 <tspan x="584" dy="13.0">a missing one leaves its row unavailable.</tspan>
 </text>
-<line x1="721.0" y1="1261.0" x2="721.0" y2="1277.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<line x1="960.0" y1="1261.0" x2="960.0" y2="1277.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<rect x="1056" y="1124.0" width="240" height="124.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1064" y="1140.0" font-size="12.5" font-weight="700">zeta-speech</text>
-<text x="1064" y="1155.0" font-size="10.5">
+<line x1="721.0" y1="1287.0" x2="721.0" y2="1303.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<line x1="960.0" y1="1287.0" x2="960.0" y2="1303.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<rect x="1056" y="1150.0" width="240" height="124.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1064" y="1166.0" font-size="12.5" font-weight="700">zeta-speech</text>
+<text x="1064" y="1181.0" font-size="10.5">
 <tspan x="1064" dy="0">transcribe stage; backends SocketBackend</tspan>
 <tspan x="1064" dy="13.0">(local-voice protocol on a Unix socket)</tspan>
 <tspan x="1064" dy="13.0">and NodeBackend (another node's POST</tspan>
@@ -402,11 +406,11 @@
 <tspan x="1064" dy="13.0">drop; attached chain stream_in → denoise</tspan>
 <tspan x="1064" dy="13.0">→ vad → transcribe.</tspan>
 </text>
-<circle cx="1056" cy="1124.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="1056" y="1127.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">6</text>
-<rect x="1414" y="1124.0" width="216" height="124.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1422" y="1140.0" font-size="12.5" font-weight="700">Speech daemon</text>
-<text x="1422" y="1155.0" font-size="10.5">
+<circle cx="1056" cy="1150.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="1056" y="1153.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">6</text>
+<rect x="1414" y="1150.0" width="216" height="124.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1422" y="1166.0" font-size="12.5" font-weight="700">Speech daemon</text>
+<text x="1422" y="1181.0" font-size="10.5">
 <tspan x="1422" dy="0">local-voice (or any daemon speaking</tspan>
 <tspan x="1422" dy="13.0">its protocol) at</tspan>
 <tspan x="1422" dy="13.0">$XDG_RUNTIME_DIR/voiced.sock:</tspan>
@@ -415,42 +419,42 @@
 <tspan x="1422" dy="13.0">Runs on the GPU host (the field host</tspan>
 <tspan x="1422" dy="13.0">4090).</tspan>
 </text>
-<line x1="1296" y1="1164.0" x2="1414" y2="1164.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="1355.0" y="1158.0" font-size="10" text-anchor="middle" opacity="0.85">wav in, text out</text>
-<rect x="1056" y="1262.0" width="240" height="85.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1064" y="1278.0" font-size="12.5" font-weight="700">Feeds out</text>
-<text x="1064" y="1293.0" font-size="10.5">
+<line x1="1296" y1="1190.0" x2="1414" y2="1190.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="1355.0" y="1184.0" font-size="10" text-anchor="middle" opacity="0.85">wav in, text out</text>
+<rect x="1056" y="1288.0" width="240" height="85.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1064" y="1304.0" font-size="12.5" font-weight="700">Feeds out</text>
+<text x="1064" y="1319.0" font-size="10.5">
 <tspan x="1064" dy="0">sink_sondehub (zeta-ext): batches</tspan>
 <tspan x="1064" dy="13.0">positioned sonde events into a PUT every</tspan>
 <tspan x="1064" dy="13.0">batch_ms; sent/failed/last_error in</tspan>
 <tspan x="1064" dy="13.0">job_context. The only sink stage today.</tspan>
 </text>
-<circle cx="1056" cy="1262.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="1056" y="1265.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">13</text>
-<rect x="1414" y="1262.0" width="216" height="85.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1422" y="1278.0" font-size="12.5" font-weight="700">SondeHub</text>
-<text x="1422" y="1293.0" font-size="10.5">
+<circle cx="1056" cy="1288.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="1056" y="1291.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">13</text>
+<rect x="1414" y="1288.0" width="216" height="85.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1422" y="1304.0" font-size="12.5" font-weight="700">SondeHub</text>
+<text x="1422" y="1319.0" font-size="10.5">
 <tspan x="1422" dy="0">api.v2.sondehub.org/sondes/telemetry:</tspan>
 <tspan x="1422" dy="13.0">PUT every batch_ms with the</tspan>
 <tspan x="1422" dy="13.0">operator's callsign and position.</tspan>
 <tspan x="1422" dy="13.0">Nothing uploads without them.</tspan>
 </text>
-<line x1="1296" y1="1302.0" x2="1414" y2="1302.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="1355.0" y="1296.0" font-size="10" text-anchor="middle" opacity="0.85">HTTPS PUT</text>
-<line x1="580" y1="1405.0" x2="580" y2="1349.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="588" y="1395.0" font-size="10" text-anchor="start" opacity="0.85">IQ blocks into the ring and the bank (Port push side); tune and lease the other way</text>
-<rect x="130.0" y="1405.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="138.0" y="1421.0" font-size="12.5" font-weight="700">zeta-source-file</text>
-<text x="138.0" y="1436.0" font-size="10.5">
+<line x1="1296" y1="1328.0" x2="1414" y2="1328.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="1355.0" y="1322.0" font-size="10" text-anchor="middle" opacity="0.85">HTTPS PUT</text>
+<line x1="580" y1="1431.0" x2="580" y2="1375.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="588" y="1421.0" font-size="10" text-anchor="start" opacity="0.85">IQ blocks into the ring and the bank (Port push side); tune and lease the other way</text>
+<rect x="130.0" y="1431.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="138.0" y="1447.0" font-size="12.5" font-weight="700">zeta-source-file</text>
+<text x="138.0" y="1462.0" font-size="10.5">
 <tspan x="138.0" dy="0">SigMF recording as a source;</tspan>
 <tspan x="138.0" dy="13.0">with tune_min/max it plays as</tspan>
 <tspan x="138.0" dy="13.0">a tunable radio (test and</tspan>
 <tspan x="138.0" dy="13.0">demo aid). Fixtures for the</tspan>
 <tspan x="138.0" dy="13.0">test suite.</tspan>
 </text>
-<rect x="327.0" y="1405.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="335.0" y="1421.0" font-size="12.5" font-weight="700">zeta-source-soapy</text>
-<text x="335.0" y="1436.0" font-size="10.5">
+<rect x="327.0" y="1431.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="335.0" y="1447.0" font-size="12.5" font-weight="700">zeta-source-soapy</text>
+<text x="335.0" y="1462.0" font-size="10.5">
 <tspan x="335.0" dy="0">SoapySDR (HackRF, B210) via</tspan>
 <tspan x="335.0" dy="13.0">zeta-source-soapy-driver (cfg</tspan>
 <tspan x="335.0" dy="13.0">soapy) in a zeta soapy-worker</tspan>
@@ -460,20 +464,20 @@
 <tspan x="335.0" dy="13.0">never the node. gain=, ppm=,</tspan>
 <tspan x="335.0" dy="13.0">clock guard, stats.</tspan>
 </text>
-<circle cx="327.0" cy="1405.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="327.0" y="1408.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">12</text>
-<rect x="524.0" y="1405.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="532.0" y="1421.0" font-size="12.5" font-weight="700">zeta-source-kiwi</text>
-<text x="532.0" y="1436.0" font-size="10.5">
+<circle cx="327.0" cy="1431.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="327.0" y="1434.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">12</text>
+<rect x="524.0" y="1431.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="532.0" y="1447.0" font-size="12.5" font-weight="700">zeta-source-kiwi</text>
+<text x="532.0" y="1462.0" font-size="10.5">
 <tspan x="532.0" dy="0">KiwiSDR over websocket: 0-30</tspan>
 <tspan x="532.0" dy="13.0">MHz, 12 kHz per connection,</tspan>
 <tspan x="532.0" dy="13.0">password from env; too_busy</tspan>
 <tspan x="532.0" dy="13.0">fault when the slots are</tspan>
 <tspan x="532.0" dy="13.0">full.</tspan>
 </text>
-<rect x="721.0" y="1405.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="729.0" y="1421.0" font-size="12.5" font-weight="700">zeta-source-node</text>
-<text x="729.0" y="1436.0" font-size="10.5">
+<rect x="721.0" y="1431.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="729.0" y="1447.0" font-size="12.5" font-weight="700">zeta-source-node</text>
+<text x="729.0" y="1462.0" font-size="10.5">
 <tspan x="729.0" dy="0">Another ZetaSDR node's</tspan>
 <tspan x="729.0" dy="13.0">source: each tune holds a</tspan>
 <tspan x="729.0" dy="13.0">passthrough job there and</tspan>
@@ -482,92 +486,92 @@
 <tspan x="729.0" dy="13.0">faults when the remote goes</tspan>
 <tspan x="729.0" dy="13.0">away.</tspan>
 </text>
-<circle cx="721.0" cy="1405.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="721.0" y="1408.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">7</text>
-<rect x="918.0" y="1405.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="926.0" y="1421.0" font-size="12.5" font-weight="700">zeta-source-vrt</text>
-<text x="926.0" y="1436.0" font-size="10.5">
+<circle cx="721.0" cy="1431.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="721.0" y="1434.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">7</text>
+<rect x="918.0" y="1431.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="926.0" y="1447.0" font-size="12.5" font-weight="700">zeta-source-vrt</text>
+<text x="926.0" y="1462.0" font-size="10.5">
 <tspan x="926.0" dy="0">VITA 49.2 packets on UDP; the</tspan>
 <tspan x="926.0" dy="13.0">sender's context packet sets</tspan>
 <tspan x="926.0" dy="13.0">frequency and rate; a job</tspan>
 <tspan x="926.0" dy="13.0">outside it fails unsupported.</tspan>
 </text>
-<rect x="1115.0" y="1405.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1123.0" y="1421.0" font-size="12.5" font-weight="700">zeta-vrt</text>
-<text x="1123.0" y="1436.0" font-size="10.5">
+<rect x="1115.0" y="1431.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1123.0" y="1447.0" font-size="12.5" font-weight="700">zeta-vrt</text>
+<text x="1123.0" y="1462.0" font-size="10.5">
 <tspan x="1123.0" dy="0">VRT packet codec (context,</tspan>
 <tspan x="1123.0" dy="13.0">data) and the typed envelope</tspan>
 <tspan x="1123.0" dy="13.0">for non-IQ frames; used by</tspan>
 <tspan x="1123.0" dy="13.0">the ws binary stream and the</tspan>
 <tspan x="1123.0" dy="13.0">vrt source.</tspan>
 </text>
-<rect x="1414" y="1405.0" width="216" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1422" y="1421.0" font-size="12.5" font-weight="700">Decoder and speech hosts</text>
-<text x="1422" y="1436.0" font-size="10.5">
+<rect x="1414" y="1431.0" width="216" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1422" y="1447.0" font-size="12.5" font-weight="700">Decoder and speech hosts</text>
+<text x="1422" y="1462.0" font-size="10.5">
 <tspan x="1422" dy="0">dump1090-fa, sonde-decoders</tspan>
 <tspan x="1422" dy="13.0">(rs1729), a future mbelib build:</tspan>
 <tspan x="1422" dy="13.0">installed by the operator from the</tspan>
 <tspan x="1422" dy="13.0">handler report's hint, never</tspan>
 <tspan x="1422" dy="13.0">fetched by zeta.</tspan>
 </text>
-<rect x="130.0" y="1584.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="138.0" y="1600.0" font-size="12.5" font-weight="700">SigMF files on disk</text>
-<text x="138.0" y="1615.0" font-size="10.5">
+<rect x="130.0" y="1610.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="138.0" y="1626.0" font-size="12.5" font-weight="700">SigMF files on disk</text>
+<text x="138.0" y="1641.0" font-size="10.5">
 <tspan x="138.0" dy="0">captures/ from iq_read,</tspan>
 <tspan x="138.0" dy="13.0">scratch fixtures</tspan>
 </text>
-<rect x="327.0" y="1584.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="335.0" y="1600.0" font-size="12.5" font-weight="700">HackRF One, USRP B210</text>
-<text x="335.0" y="1615.0" font-size="10.5">
+<rect x="327.0" y="1610.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="335.0" y="1626.0" font-size="12.5" font-weight="700">HackRF One, USRP B210</text>
+<text x="335.0" y="1641.0" font-size="10.5">
 <tspan x="335.0" dy="0">libsoapysdr + driver modules;</tspan>
 <tspan x="335.0" dy="13.0">2 m / 70 cm antenna, discone</tspan>
 </text>
-<rect x="524.0" y="1584.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="532.0" y="1600.0" font-size="12.5" font-weight="700">KiwiSDR receivers</text>
-<text x="532.0" y="1615.0" font-size="10.5">
+<rect x="524.0" y="1610.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="532.0" y="1626.0" font-size="12.5" font-weight="700">KiwiSDR receivers</text>
+<text x="532.0" y="1641.0" font-size="10.5">
 <tspan x="532.0" dy="0">public or private HF</tspan>
 <tspan x="532.0" dy="13.0">receivers, site-dependent</tspan>
 </text>
-<rect x="721.0" y="1584.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="729.0" y="1600.0" font-size="12.5" font-weight="700">Remote ZetaSDR node</text>
-<text x="729.0" y="1615.0" font-size="10.5">
+<rect x="721.0" y="1610.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="729.0" y="1626.0" font-size="12.5" font-weight="700">Remote ZetaSDR node</text>
+<text x="729.0" y="1641.0" font-size="10.5">
 <tspan x="729.0" dy="0">a Pi 5 at the antenna</tspan>
 <tspan x="729.0" dy="13.0">(deploy/pi), or a radio on</tspan>
 <tspan x="729.0" dy="13.0">another host</tspan>
 </text>
-<rect x="918.0" y="1584.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="926.0" y="1600.0" font-size="12.5" font-weight="700">VRT sender</text>
-<text x="926.0" y="1615.0" font-size="10.5">
+<rect x="918.0" y="1610.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="926.0" y="1626.0" font-size="12.5" font-weight="700">VRT sender</text>
+<text x="926.0" y="1641.0" font-size="10.5">
 <tspan x="926.0" dy="0">any VITA 49.2 UDP streamer on</tspan>
 <tspan x="926.0" dy="13.0">the LAN</tspan>
 </text>
-<rect x="1115.0" y="1584.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1123.0" y="1600.0" font-size="12.5" font-weight="700">(codec only)</text>
-<text x="1123.0" y="1615.0" font-size="10.5">
+<rect x="1115.0" y="1610.0" width="181.0" height="72.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1123.0" y="1626.0" font-size="12.5" font-weight="700">(codec only)</text>
+<text x="1123.0" y="1641.0" font-size="10.5">
 <tspan x="1123.0" dy="0">no device of its own</tspan>
 </text>
-<line x1="220.5" y1="1584.0" x2="220.5" y2="1542.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<line x1="417.5" y1="1584.0" x2="417.5" y2="1542.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<line x1="614.5" y1="1584.0" x2="614.5" y2="1542.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<line x1="811.5" y1="1584.0" x2="811.5" y2="1542.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<line x1="1008.5" y1="1584.0" x2="1008.5" y2="1542.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="130" y="1706.0" font-size="12" font-weight="800" font-style="italic" fill="#b7791f">Pencilled in: where each planned piece lands (plan numbers from docs/superpowers/plans/2026-10-18-zetasdr-plan-series.md, gists from TODO.md)</text>
-<rect x="130.0" y="1718.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="138.0" y="1734.0" font-size="12.5" font-weight="700" font-style="italic">UI wave: the rest</text>
-<text x="489.0" y="1734.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
-<text x="138.0" y="1749.0" font-size="10.5" opacity="0.85">
+<line x1="220.5" y1="1610.0" x2="220.5" y2="1568.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<line x1="417.5" y1="1610.0" x2="417.5" y2="1568.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<line x1="614.5" y1="1610.0" x2="614.5" y2="1568.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<line x1="811.5" y1="1610.0" x2="811.5" y2="1568.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<line x1="1008.5" y1="1610.0" x2="1008.5" y2="1568.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="130" y="1732.0" font-size="12" font-weight="800" font-style="italic" fill="#b7791f">Pencilled in: where each planned piece lands (plan numbers from docs/superpowers/plans/2026-10-18-zetasdr-plan-series.md, gists from TODO.md)</text>
+<rect x="130.0" y="1744.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="138.0" y="1760.0" font-size="12.5" font-weight="700" font-style="italic">UI wave: the rest</text>
+<text x="489.0" y="1760.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
+<text x="138.0" y="1775.0" font-size="10.5" opacity="0.85">
 <tspan x="138.0" dy="0">Web UI only. Staircase transcript ribbons (lanes from the pixel</tspan>
 <tspan x="138.0" dy="13.0">height between channels); mode picking by band through</tspan>
 <tspan x="138.0" dy="13.0">knowledge_lookup with a search fallback; state-stream decoders</tspan>
 <tspan x="138.0" dy="13.0">such as ADS-B as one held line per subject; the Okudagram</tspan>
 <tspan x="138.0" dy="13.0">(LCARS) theme behind view set theme.</tspan>
 </text>
-<circle cx="130.0" cy="1718.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="130.0" y="1721.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">15</text>
-<rect x="511.0" y="1718.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="519.0" y="1734.0" font-size="12.5" font-weight="700" font-style="italic">Plan 19: layer 4 stages</text>
-<text x="870.0" y="1734.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
-<text x="519.0" y="1749.0" font-size="10.5" opacity="0.85">
+<circle cx="130.0" cy="1744.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="130.0" y="1747.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">15</text>
+<rect x="511.0" y="1744.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="519.0" y="1760.0" font-size="12.5" font-weight="700" font-style="italic">Plan 19: layer 4 stages</text>
+<text x="870.0" y="1760.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
+<text x="519.0" y="1775.0" font-size="10.5" opacity="0.85">
 <tspan x="519.0" dy="0">zeta-dsp. A bits stream kind; fsk/psk/ook demod stages,</tspan>
 <tspan x="519.0" dy="13.0">clock_recover, slicer (eye and constellation stats), bit_view</tspan>
 <tspan x="519.0" dy="13.0">(run lengths, autocorrelation, sync-word and CRC hypotheses),</tspan>
@@ -576,12 +580,12 @@
 <tspan x="519.0" dy="13.0">write-back to knowledge; burst-aware measure (duty, burst_ms,</tspan>
 <tspan x="519.0" dy="13.0">period_ms, cyclostationary rate, M-FSK clusters).</tspan>
 </text>
-<circle cx="511.0" cy="1718.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="511.0" y="1721.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">11</text>
-<rect x="892.0" y="1718.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="900.0" y="1734.0" font-size="12.5" font-weight="700" font-style="italic">Decoder wave 2 (rows)</text>
-<text x="1251.0" y="1734.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
-<text x="900.0" y="1749.0" font-size="10.5" opacity="0.85">
+<circle cx="511.0" cy="1744.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="511.0" y="1747.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">11</text>
+<rect x="892.0" y="1744.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="900.0" y="1760.0" font-size="12.5" font-weight="700" font-style="italic">Decoder wave 2 (rows)</text>
+<text x="1251.0" y="1760.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
+<text x="900.0" y="1775.0" font-size="10.5" opacity="0.85">
 <tspan x="900.0" dy="0">Rows and small stages on the plan-17 frameworks: M17 (Codec 2)</tspan>
 <tspan x="900.0" dy="13.0">and DMR (AMBE via mbelib, tools/install-vocoders.sh) as audio</tspan>
 <tspan x="900.0" dy="13.0">rows feeding transcribe; AIS (nmea parser, map), FLEX;</tspan>
@@ -589,12 +593,12 @@
 <tspan x="900.0" dy="13.0">stereo wfm_demod with pilot level; DFM/M20 synthesised tests;</tspan>
 <tspan x="900.0" dy="13.0">APRS positions on the map.</tspan>
 </text>
-<circle cx="892.0" cy="1718.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="892.0" y="1721.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">13</text>
-<rect x="1273.0" y="1718.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="1281.0" y="1734.0" font-size="12.5" font-weight="700" font-style="italic">Feeds and sinks</text>
-<text x="1632.0" y="1734.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
-<text x="1281.0" y="1749.0" font-size="10.5" opacity="0.85">
+<circle cx="892.0" cy="1744.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="892.0" y="1747.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">13</text>
+<rect x="1273.0" y="1744.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="1281.0" y="1760.0" font-size="12.5" font-weight="700" font-style="italic">Feeds and sinks</text>
+<text x="1632.0" y="1760.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
+<text x="1281.0" y="1775.0" font-size="10.5" opacity="0.85">
 <tspan x="1281.0" dy="0">sink stage kinds for the standard feeds (APRS-IS, SBS/Beast,</tspan>
 <tspan x="1281.0" dy="13.0">AIS NMEA, PSK Reporter, WSPRnet, KISS TNC); a generic sink:</tspan>
 <tspan x="1281.0" dy="13.0">{kind, params} on the watch's detect node replacing the one-off</tspan>
@@ -602,12 +606,12 @@
 <tspan x="1281.0" dy="13.0">frozen as an operator graph, gated_stop cleared by a sink</tspan>
 <tspan x="1281.0" dy="13.0">restart.</tspan>
 </text>
-<circle cx="1273.0" cy="1718.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="1273.0" y="1721.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">13</text>
-<rect x="130.0" y="1854.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="138.0" y="1870.0" font-size="12.5" font-weight="700" font-style="italic">Knowledge: ACMA register</text>
-<text x="489.0" y="1870.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
-<text x="138.0" y="1885.0" font-size="10.5" opacity="0.85">
+<circle cx="1273.0" cy="1744.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="1273.0" y="1747.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">13</text>
+<rect x="130.0" y="1880.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="138.0" y="1896.0" font-size="12.5" font-weight="700" font-style="italic">Knowledge: ACMA register</text>
+<text x="489.0" y="1896.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
+<text x="138.0" y="1911.0" font-size="10.5" opacity="0.85">
 <tspan x="138.0" dy="0">A provider over acma-local (the RRL as SQLite / MCP) answering</tspan>
 <tspan x="138.0" dy="13.0">knowledge_lookup with licensee, site, distance, power and</tspan>
 <tspan x="138.0" dy="13.0">decoded emission designator for assignments in the band near</tspan>
@@ -615,12 +619,12 @@
 <tspan x="138.0" dy="13.0">16K0F1D link 12 km away' before anyone demodulates. Register</tspan>
 <tspan x="138.0" dy="13.0">the acma-local MCP in .mcp.json.</tspan>
 </text>
-<circle cx="130.0" cy="1854.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="130.0" y="1857.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">14</text>
-<rect x="511.0" y="1854.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="519.0" y="1870.0" font-size="12.5" font-weight="700" font-style="italic">Watch and identify fixes</text>
-<text x="870.0" y="1870.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
-<text x="519.0" y="1885.0" font-size="10.5" opacity="0.85">
+<circle cx="130.0" cy="1880.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="130.0" y="1883.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">14</text>
+<rect x="511.0" y="1880.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="519.0" y="1896.0" font-size="12.5" font-weight="700" font-style="italic">Watch and identify fixes</text>
+<text x="870.0" y="1896.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
+<text x="519.0" y="1911.0" font-size="10.5" opacity="0.85">
 <tspan x="519.0" dy="0">Re-centre before identifying (power-weighted centroid over the</tspan>
 <tspan x="519.0" dy="13.0">run's bins, or a slow high-pass ahead of the WAV feed: rs41mod</tspan>
 <tspan x="519.0" dy="13.0">decodes only within ±1 kHz); detect defaults that hold on a</tspan>
@@ -628,12 +632,12 @@
 <tspan x="519.0" dy="13.0">event rate limit); sonde rows before ACARS on a 12.5 kHz FSK</tspan>
 <tspan x="519.0" dy="13.0">box; classify tries a row-width slice at the measured centre.</tspan>
 </text>
-<circle cx="511.0" cy="1854.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="511.0" y="1857.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">5</text>
-<rect x="892.0" y="1854.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="900.0" y="1870.0" font-size="12.5" font-weight="700" font-style="italic">Time, trunking, span</text>
-<text x="1251.0" y="1870.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
-<text x="900.0" y="1885.0" font-size="10.5" opacity="0.85">
+<circle cx="511.0" cy="1880.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="511.0" y="1883.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">5</text>
+<rect x="892.0" y="1880.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="900.0" y="1896.0" font-size="12.5" font-weight="700" font-style="italic">Time, trunking, span</text>
+<text x="1251.0" y="1896.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
+<text x="900.0" y="1911.0" font-size="10.5" opacity="0.85">
 <tspan x="900.0" dy="0">True block timestamps (HackRF drift bug) to unlock UTC-slotted</tspan>
 <tspan x="900.0" dy="13.0">modes (FT8/FT4, WSPR) and TDMA (DMR, TETRA); a trunking</tspan>
 <tspan x="900.0" dy="13.0">follower (P25, DMR Tier III, MPT1327) starting voice jobs from</tspan>
@@ -641,12 +645,12 @@
 <tspan x="900.0" dy="13.0">own channels in a capture; wideband modes (DVB-T, DAB) on the</tspan>
 <tspan x="900.0" dy="13.0">GPU FFT, parked behind the HackRF-first set.</tspan>
 </text>
-<circle cx="892.0" cy="1854.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="892.0" y="1857.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">14</text>
-<rect x="1273.0" y="1854.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
-<text x="1281.0" y="1870.0" font-size="12.5" font-weight="700" font-style="italic">Packaging, layer 3, guide</text>
-<text x="1632.0" y="1870.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
-<text x="1281.0" y="1885.0" font-size="10.5" opacity="0.85">
+<circle cx="892.0" cy="1880.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="892.0" y="1883.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">14</text>
+<rect x="1273.0" y="1880.0" width="367.0" height="124.0" rx="6" fill="currentColor" fill-opacity="0.03" stroke="#b7791f" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="1281.0" y="1896.0" font-size="12.5" font-weight="700" font-style="italic">Packaging, layer 3, guide</text>
+<text x="1632.0" y="1896.0" font-size="9" font-weight="700" text-anchor="end" fill="#b7791f" letter-spacing="0.08em">PLANNED</text>
+<text x="1281.0" y="1911.0" font-size="10.5" opacity="0.85">
 <tspan x="1281.0" dy="0">--run-dir (ZETA_RUN_DIR) for program-row fifos and</tspan>
 <tspan x="1281.0" dy="13.0">snap/flatpak/AppImage install hints; the vocoder install script</tspan>
 <tspan x="1281.0" dy="13.0">and its legal note; layer 3 (a learned classifier) stays an</tspan>
@@ -655,6 +659,6 @@
 <tspan x="1281.0" dy="13.0">timing over 'noise', an unknown-signal playbook that stops at</tspan>
 <tspan x="1281.0" dy="13.0">classification.</tspan>
 </text>
-<circle cx="1273.0" cy="1854.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="1273.0" y="1857.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">11</text>
+<circle cx="1273.0" cy="1880.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="1273.0" y="1883.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">11</text>
 </svg>
