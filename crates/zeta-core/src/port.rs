@@ -259,6 +259,10 @@ pub trait Port: Send + Sync {
     fn healed(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         None
     }
+    /// The node has seen every job of the fault the last heal ended, and is about to
+    /// relaunch them. A port that bumps [`Port::healed`] may keep reporting [`Port::fault`]
+    /// until this call, so a fault shorter than a job's poll of it is not missed.
+    fn heal_settled(&self) {}
     /// The worker process behind the port, for a port that runs its device in
     /// a child process; `None` for every other port.
     fn worker(&self) -> Option<WorkerInfo> {

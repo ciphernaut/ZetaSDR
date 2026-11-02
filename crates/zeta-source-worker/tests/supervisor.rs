@@ -197,6 +197,11 @@ async fn a_crash_faults_names_the_signal_and_a_respawn_heals_once() {
     // Give a second bump time to show if there were one.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(*healed.borrow(), 1);
+    // Reported until the node has seen it, a tune or not: jobs poll the fault.
+    assert_eq!(port.fault().as_deref(), Some(crashed));
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert_eq!(port.fault().as_deref(), Some(crashed));
+    port.heal_settled();
     assert_eq!(port.fault(), None);
     let w = port.worker().unwrap();
     assert_eq!(w.restarts, 1);
@@ -410,6 +415,7 @@ async fn backoff_doubles_to_the_cap_and_resets_after_alive() {
         "healed {}",
         *healed.borrow()
     );
+    port.heal_settled();
     assert_eq!(port.fault(), None);
     assert_eq!(port.worker().unwrap().restarts, 6);
 }

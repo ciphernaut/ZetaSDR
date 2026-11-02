@@ -381,6 +381,10 @@ impl Port for WorkerPort {
         Some(self.healed.clone())
     }
 
+    fn heal_settled(&self) {
+        self.shared.snapshot().healing_fault = None;
+    }
+
     fn worker(&self) -> Option<WorkerInfo> {
         let s = self.shared.snapshot();
         Some(WorkerInfo {

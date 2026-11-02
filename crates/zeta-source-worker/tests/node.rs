@@ -31,10 +31,15 @@ const CYCLE: usize = 2 * RATE_HZ as usize;
 /// The supervisor's clock shortened as `tests/supervisor.rs` does, so a crash and its
 /// respawn take a fraction of a second.
 fn timings() -> Timings {
+    timings_backoff(Duration::from_millis(100))
+}
+
+/// [`timings`] with the wait before a respawn at `backoff`.
+fn timings_backoff(backoff: Duration) -> Timings {
     Timings {
         hello: Duration::from_secs(3),
-        backoff_first: Duration::from_millis(100),
-        backoff_max: Duration::from_millis(300),
+        backoff_first: backoff,
+        backoff_max: backoff.max(Duration::from_millis(300)),
         alive_reset: Duration::from_secs(2),
         shutdown_grace: Duration::from_millis(500),
     }
@@ -101,6 +106,18 @@ fn cfg(script: &str, record: &Path, env: &str) -> WorkerConfig {
         program: PathBuf::from("/bin/sh"),
         args,
         timings: timings(),
+    }
+}
+
+/// The ids of the streams the job's current run publishes: a relaunch registers new ones.
+async fn streams_of(node: &Node, job: &JobId) -> Vec<String> {
+    match node.apply(Op::StreamList {}).await {
+        Ok(OpResult::Streams(v)) => v
+            .into_iter()
+            .filter(|s| s.provenance.job.as_ref() == Some(job))
+            .map(|s| s.id.0)
+            .collect(),
+        r => panic!("stream_list: {r:?}"),
     }
 }
 
@@ -176,9 +193,11 @@ async fn a_node_over_a_crashing_fake_worker_recovers_its_jobs() {
     let dir = tempfile::tempdir().unwrap();
     let script = format!("file {},crash-after-ms 1500", pocsag().meta.display());
     let rec = dir.path().join("record");
-    let (port, attach) = WorkerPort::open(cfg(&script, &rec, "ZETA_FAKE_CRASH_ONCE=1"), None)
-        .await
-        .unwrap();
+    // A wait before the respawn well over the 200 ms the forwarder polls the fault at, so
+    // the test can watch the record read `Failed` before the recovery relaunches it.
+    let mut crashing = cfg(&script, &rec, "ZETA_FAKE_CRASH_ONCE=1");
+    crashing.timings = timings_backoff(Duration::from_millis(800));
+    let (port, attach) = WorkerPort::open(crashing, None).await.unwrap();
     assert_eq!(attach, Attach::Hello);
     let node = node_over(&dir.path().join("state"), port).await;
     let op = Op::SourcePin {
@@ -216,6 +235,52 @@ async fn a_node_over_a_crashing_fake_worker_recovers_its_jobs() {
     assert_eq!(info.worker.unwrap().restarts, 1);
     assert_eq!(info.pin, Some(band()));
     assert_eq!(info.fault, None);
+    until("the stages are back", Duration::from_secs(5), || {
+        node.debug_stage_count() == stages
+    })
+    .await;
+    let _ = node.job_stop(&job).await;
+}
+
+/// A worker back within milliseconds, so its fault could fall between two polls of a
+/// job's forwarder: the port keeps reporting it until the node has seen the job end, so
+/// the job is relaunched. No pin here: nothing but the relaunch tunes the new worker, and
+/// a job that missed the crash would read `Running` on a radio that sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_shorter_than_the_fault_poll_still_relaunches_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = format!("file {},crash-after-ms 1500", pocsag().meta.display());
+    let rec = dir.path().join("record");
+    let mut crashing = cfg(&script, &rec, "ZETA_FAKE_CRASH_ONCE=1");
+    crashing.timings = timings_backoff(Duration::from_millis(1));
+    let (port, attach) = WorkerPort::open(crashing, None).await.unwrap();
+    assert_eq!(attach, Attach::Hello);
+    let node = node_over(&dir.path().join("state"), port).await;
+    let job = start_passthrough(&node).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stages = node.debug_stage_count();
+    let before = streams_of(&node, &job).await;
+    assert!(!before.is_empty());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let streams = streams_of(&node, &job).await;
+        if state(&node, &job) == Some(JobState::Running) && !streams.is_empty() && streams != before
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out: the job is relaunched, state {:?}, source {:?}",
+            state(&node, &job),
+            source(&node).await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let info = source(&node).await;
+    assert_eq!(info.worker.unwrap().restarts, 1);
+    assert_eq!(info.fault, None);
+    assert_eq!(info.current, Some(band()));
     until("the stages are back", Duration::from_secs(5), || {
         node.debug_stage_count() == stages
     })

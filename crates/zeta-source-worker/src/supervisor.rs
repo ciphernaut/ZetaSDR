@@ -78,6 +78,11 @@ pub(crate) struct Snapshot {
     pub(crate) worker_fault: Option<String>,
     /// Why no worker is live: how the last one ended.
     pub(crate) supervision_fault: Option<String>,
+    /// The supervision fault a fresh worker's hello ended, still reported until the
+    /// node has seen it ([`Port::heal_settled`](zeta_core::port::Port::heal_settled)):
+    /// jobs poll the fault, and a quick respawn must not fall between two polls. A tune
+    /// does not clear it.
+    pub(crate) healing_fault: Option<String>,
     pub(crate) current: Option<Tuning>,
     pub(crate) gain: Option<GainInfo>,
     pub(crate) stats: Option<PortStats>,
@@ -87,10 +92,13 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
-    /// The worker's own fault while one is live, else the supervision fault.
+    /// The worker's own fault while one is live, or the fault its hello is healing;
+    /// else the supervision fault.
     pub(crate) fn fault(&self) -> Option<String> {
         if self.link.is_some() {
-            self.worker_fault.clone()
+            self.worker_fault
+                .clone()
+                .or_else(|| self.healing_fault.clone())
         } else {
             self.supervision_fault.clone()
         }
@@ -404,7 +412,6 @@ impl Supervisor {
             let mut s = self.shared.snapshot();
             s.pid = w.pid;
             s.since_ns = Some(now_ns());
-            s.supervision_fault = None;
         }
         if let Some(e) = self.episode.take() {
             self.healed.send_modify(|n| *n += 1);
@@ -560,6 +567,7 @@ impl Supervisor {
                 s.link = None;
             }
             s.worker_fault = None;
+            s.healing_fault = None;
             s.supervision_fault = Some(fault.clone());
             s.current = None;
             s.pid = None;
@@ -770,6 +778,7 @@ fn read_stdout(mut stdout: File, shared: &Shared, link: &Arc<Link>, hello: onesh
                     let mut s = shared.snapshot();
                     s.link = Some(link.clone());
                     s.worker_fault = None;
+                    s.healing_fault = s.supervision_fault.take();
                     s.current = None;
                     s.gain = h.gain;
                 }

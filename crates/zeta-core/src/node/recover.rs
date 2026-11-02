@@ -342,15 +342,25 @@ impl Inner {
     /// recovery keeps it open, so its next heal relaunches what failed this time). One
     /// stderr line says what came back. With no episode open the gain and pin are
     /// re-applied and nothing is relaunched.
+    ///
+    /// Jobs learn of a fault by polling [`Port::fault`], so a worker back quicker than a
+    /// poll could leave one `Running` on a radio nobody tunes. A port that still reports
+    /// its fault here opens the episode and has its jobs waited for, running ones too;
+    /// [`Port::heal_settled`] then ends the fault, under the gate.
     pub(crate) async fn recover_source(self: &Arc<Self>, id: &SourceId) {
         let Some(port) = self.port(id) else {
             return;
         };
+        let held = port.fault().is_some();
+        if held {
+            self.note_fault(id);
+        }
         let episode = self.episodes.lock().unwrap().get(id).copied();
         if episode.is_some() {
-            self.wait_ended(id).await;
+            self.wait_ended(id, held).await;
         }
         let guard = self.leases.gate_guard(id).await;
+        port.heal_settled();
         self.note_capabilities(port.as_ref());
         let (gain, pin) = self
             .sources
@@ -464,15 +474,21 @@ impl Inner {
 
     /// Wait (up to [`ENDED_WAIT`]) for every failed record of `source` whose run is
     /// still ending to release its lease and streams, so its supervisor never releases
-    /// the lease of the run a recovery starts in its place.
-    async fn wait_ended(&self, source: &SourceId) {
+    /// the lease of the run a recovery starts in its place. With `running`, the port still
+    /// reports its fault, so every job on the source is about to fail of it (an attached
+    /// one with its input): those are waited for too.
+    async fn wait_ended(&self, source: &SourceId, running: bool) {
         let ending: Vec<_> = self
             .jobs
             .lock()
             .unwrap()
             .values()
             .filter(|e| &e.record.source == source)
-            .filter(|e| matches!(e.record.state, JobState::Failed { .. }))
+            .filter(|e| match e.record.state {
+                JobState::Failed { .. } => true,
+                JobState::Running => running,
+                _ => false,
+            })
             .filter_map(|e| e.ended.clone())
             .collect();
         let all = async {
