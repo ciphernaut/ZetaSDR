@@ -223,3 +223,23 @@ fn capture_ops_are_in_the_guide() {
         assert!(md.contains(needle), "missing {needle}");
     }
 }
+
+#[test]
+fn bursts_keep_flags_are_in_the_running_section() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    for needle in [
+        "--bursts-keep-mb N",
+        "ZETA_BURSTS_KEEP_MB",
+        "--bursts-keep-days N",
+        "ZETA_BURSTS_KEEP_DAYS",
+    ] {
+        assert!(md.contains(needle), "missing {needle}");
+    }
+}

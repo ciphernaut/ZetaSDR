@@ -3204,3 +3204,70 @@ fn capture_commands_round_trip_on_an_empty_store() {
         assert_eq!(v["field"], "capture", "{v}");
     }
 }
+
+#[test]
+fn bursts_keep_flags_reach_the_store() {
+    use zeta_core::bursts::{BurstPolicy, BurstStore, NewCapture};
+    use zeta_core::types::{Hz, JobId, SourceId};
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = BurstStore::open(
+            &dir.path().join("state"),
+            BurstPolicy {
+                keep_bytes: u64::MAX,
+                keep_days: 7,
+            },
+        )
+        .unwrap();
+        // About 1 MB each (131072 samples of 8 bytes = 1 MiB).
+        let samples = vec![num_complex::Complex::new(0.1f32, 0.2); 131_072];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        for i in 0..3u64 {
+            store
+                .write(
+                    NewCapture {
+                        source: SourceId("tone".into()),
+                        set: JobId("set".into()),
+                        center_hz: Hz(100_000_000),
+                        bandwidth_hz: Hz(12_500),
+                        sample_rate_hz: Hz(48_000),
+                        start_ns: now - 1_000_000_000 * (10 - i),
+                        end_ns: now,
+                        features: serde_json::json!({}),
+                        signal: None,
+                        job: JobId("job".into()),
+                        watch: None,
+                        allocations: serde_json::json!([]),
+                    },
+                    &samples,
+                )
+                .unwrap();
+        }
+    }
+    let list = |args: &[&str]| -> usize {
+        let out = zeta(dir.path(), args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        json(&out)["value"].as_array().unwrap().len()
+    };
+    assert_eq!(list(&["capture", "list"]), 3);
+    assert_eq!(list(&["--bursts-keep-mb", "1", "capture", "list"]), 1);
+    for (flag, name) in [
+        ("--bursts-keep-mb", "bursts-keep-mb"),
+        ("--bursts-keep-days", "bursts-keep-days"),
+    ] {
+        let out = zeta(dir.path(), &[flag, "0", "capture", "list"])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        assert!(String::from_utf8_lossy(&out).contains(name));
+    }
+}

@@ -135,16 +135,26 @@ pub struct BurstStore {
 
 impl BurstStore {
     /// Open (making it if missing) `state_dir/bursts`, reading `index.json`; a record
-    /// whose data or meta file is gone is dropped (and the index rewritten). A missing or
-    /// unreadable index reads as empty. Nothing is expired here: the node calls
+    /// whose data or meta file is gone is dropped (and the index rewritten). A missing index
+    /// reads as empty; an unreadable one is moved aside as `index.json.broken-<ulid>` and
+    /// rebuilt from the `.sigmf-meta` files present (pins are lost). Nothing is expired here: the node calls
     /// [`BurstStore::expire`] once it is open.
     pub fn open(state_dir: &Path, policy: BurstPolicy) -> std::io::Result<Arc<Self>> {
         let dir = state_dir.join(BURSTS_DIR);
         std::fs::create_dir_all(&dir)?;
-        let read: Vec<CaptureRecord> = std::fs::read(dir.join(INDEX_FILE))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let index_path = dir.join(INDEX_FILE);
+        let (read, rebuilt) = match std::fs::read(&index_path) {
+            Err(_) => (Vec::new(), false),
+            Ok(b) => match serde_json::from_slice::<Vec<CaptureRecord>>(&b) {
+                Ok(v) => (v, false),
+                Err(e) => {
+                    let aside = dir.join(format!("{INDEX_FILE}.broken-{}", ulid::Ulid::generate()));
+                    eprintln!("zeta: bursts: index unreadable ({e}); moved aside");
+                    std::fs::rename(&index_path, aside)?;
+                    (rebuild_index(&dir), true)
+                }
+            },
+        };
         let n = read.len();
         let kept: Vec<CaptureRecord> = read
             .into_iter()
@@ -155,7 +165,7 @@ impl BurstStore {
             policy,
             index: Mutex::new(kept),
         };
-        if store.index.lock().unwrap().len() != n {
+        if rebuilt || store.index.lock().unwrap().len() != n {
             store.persist(&store.index.lock().unwrap())?;
         }
         Ok(Arc::new(store))
@@ -224,7 +234,7 @@ impl BurstStore {
             return Err(e);
         }
         drop(index);
-        self.expire();
+        self.expire_except(Some(&record.id));
         Ok(record)
     }
 
@@ -288,6 +298,12 @@ impl BurstStore {
     /// `keep_days`. Returns the ids removed. A failed index write keeps the records
     /// (their files are left) for the next expiry.
     pub fn expire(&self) -> Vec<String> {
+        self.expire_except(None)
+    }
+
+    /// [`expire`](Self::expire) sparing the record `keep` (the one just written, whose
+    /// id its job has yet to publish); it still counts against the budget.
+    fn expire_except(&self, keep: Option<&str>) -> Vec<String> {
         let mut index = self.index.lock().unwrap();
         index.sort_by(|a, b| (a.age_from_ns(), &a.id).cmp(&(b.age_from_ns(), &b.id)));
         // Pinned captures are the operator's: they count against no budget.
@@ -297,7 +313,7 @@ impl BurstStore {
             if total <= self.policy.keep_bytes {
                 break;
             }
-            if !r.pinned {
+            if !r.pinned && Some(r.id.as_str()) != keep {
                 gone[i] = true;
                 total -= r.bytes;
             }
@@ -305,7 +321,7 @@ impl BurstStore {
         let cutoff =
             now_ns().saturating_sub(u64::from(self.policy.keep_days).saturating_mul(NS_PER_DAY));
         for (i, r) in index.iter().enumerate() {
-            if !r.pinned && r.age_from_ns() < cutoff {
+            if !r.pinned && Some(r.id.as_str()) != keep && r.age_from_ns() < cutoff {
                 gone[i] = true;
             }
         }
@@ -346,6 +362,69 @@ impl BurstStore {
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, self.dir.join(INDEX_FILE))
     }
+}
+
+/// Rebuild the records from the `.sigmf-meta` files in `dir`, each read from its
+/// `zeta:` annotation; a meta that does not read, or without its data file, is skipped.
+/// `written_ns` is the data file's modification time.
+fn rebuild_index(dir: &Path) -> Vec<CaptureRecord> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sigmf-meta"))
+        .filter_map(|p| record_from_meta(&p))
+        .collect()
+}
+
+fn record_from_meta(meta_path: &Path) -> Option<CaptureRecord> {
+    let json: Value = serde_json::from_slice(&std::fs::read(meta_path).ok()?).ok()?;
+    let id = meta_path.file_stem()?.to_str()?.to_string();
+    let data_path = meta_path.with_extension("sigmf-data");
+    let md = std::fs::metadata(&data_path).ok()?;
+    let rate = json["global"]["core:sample_rate"].as_u64()?;
+    let cap = &json["captures"][0];
+    let center = cap["core:frequency"].as_u64()?;
+    let start_ns = cap["core:datetime"]
+        .as_str()
+        .and_then(crate::capture::parse_iso8601)
+        .map_or(0, |t| t.0);
+    let ann = &json["annotations"][0];
+    let lower = ann["core:freq_lower_edge"].as_u64()?;
+    let upper = ann["core:freq_upper_edge"].as_u64()?;
+    let count = ann["core:sample_count"].as_u64().unwrap_or(md.len() / 8);
+    let text = |k: &str| ann[k].as_str().map(str::to_string);
+    let written_ns = md
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as u64);
+    Some(CaptureRecord {
+        id,
+        meta_path: meta_path.to_path_buf(),
+        data_path,
+        source: SourceId(text("zeta:source")?),
+        set: JobId(text("zeta:set")?),
+        center_hz: Hz(center),
+        bandwidth_hz: Hz(upper.saturating_sub(lower)),
+        sample_rate_hz: Hz(rate),
+        start_ns,
+        end_ns: start_ns + count.saturating_mul(1_000_000_000) / rate.max(1),
+        bytes: md.len(),
+        features: ann["zeta:features"].clone(),
+        signal: Some(ann["zeta:signal"].clone()).filter(|v| !v.is_null()),
+        job: JobId(text("zeta:job")?),
+        watch: text("zeta:watch").map(JobId),
+        allocations: if ann["zeta:allocations"].is_array() {
+            ann["zeta:allocations"].clone()
+        } else {
+            empty_array()
+        },
+        pinned: false,
+        written_ns,
+    })
 }
 
 /// Remove a record's files; one already gone is no error.
@@ -527,5 +606,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn a_write_never_expires_the_record_it_just_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        // The budget is smaller than one window.
+        let s = store(dir.path(), 8);
+        let a = s.write(new_capture(t(0)), &samples()).unwrap();
+        assert!(a.data_path.is_file() && a.meta_path.is_file());
+        assert_eq!(s.get(&a.id), Some(a.clone()));
+        // The next write expires the older one, never itself.
+        let b = s.write(new_capture(t(1)), &samples()).unwrap();
+        assert!(!a.data_path.exists());
+        assert_eq!(s.list(), std::slice::from_ref(&b));
+    }
+
+    #[test]
+    fn an_unreadable_index_is_moved_aside_and_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = {
+            let s = store(dir.path(), u64::MAX);
+            let mut n = new_capture(t(0));
+            n.signal = Some(serde_json::json!({"snr_db": 12.0}));
+            n.watch = Some(JobId("w".into()));
+            (
+                s.write(n, &samples()).unwrap(),
+                s.write(new_capture(t(1)), &samples()).unwrap(),
+            )
+        };
+        let bursts = dir.path().join(BURSTS_DIR);
+        std::fs::write(bursts.join(INDEX_FILE), b"{ not json").unwrap();
+        let s = store(dir.path(), u64::MAX);
+        let mut got = s.list();
+        got.sort_by(|x, y| x.id.cmp(&y.id));
+        let mut want = vec![a, b];
+        want.sort_by(|x, y| x.id.cmp(&y.id));
+        for (g, w) in got.iter().zip(&want) {
+            let mut w = w.clone();
+            w.written_ns = g.written_ns;
+            assert_eq!(g, &w);
+        }
+        assert_eq!(got.len(), 2);
+        let aside = std::fs::read_dir(&bursts)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("index.json.broken-")
+            })
+            .count();
+        assert_eq!(aside, 1);
+        // The rebuilt index was written: a reopen reads it without moving anything aside.
+        drop(s);
+        assert_eq!(store(dir.path(), u64::MAX).list().len(), 2);
     }
 }

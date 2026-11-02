@@ -56,6 +56,7 @@ async fn main() -> ExitCode {
         Err(cli) => cli,
     };
     let (sources, plugins) = (cli.sources(), cli.plugins.clone());
+    let burst_policy = cli.burst_policy();
     let state_dir = match cli.state_dir.map_or_else(node_setup::default_state_dir, Ok) {
         Ok(d) => d,
         Err(e) => return fail(&e),
@@ -122,6 +123,7 @@ async fn main() -> ExitCode {
         &plugins,
         op.is_none(),
         cli.ring_budget_mb,
+        burst_policy,
         cli.modes_dir.clone(),
         speech.clone(),
     )

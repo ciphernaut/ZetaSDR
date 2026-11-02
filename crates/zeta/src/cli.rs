@@ -79,6 +79,24 @@ pub struct Cli {
     /// Memory budget in MB for one source's IQ ring (default: a quarter of RAM, at most 4 GiB)
     #[arg(long, global = true, env = "ZETA_RING_BUDGET_MB", value_name = "MB")]
     pub ring_budget_mb: Option<u64>,
+    /// Keep at most MB megabytes of unpinned burst captures (default 256); the oldest go first
+    #[arg(
+        long,
+        global = true,
+        env = "ZETA_BURSTS_KEEP_MB",
+        value_name = "MB",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub bursts_keep_mb: Option<u64>,
+    /// Drop unpinned burst captures older than DAYS days (default 7)
+    #[arg(
+        long,
+        global = true,
+        env = "ZETA_BURSTS_KEEP_DAYS",
+        value_name = "DAYS",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub bursts_keep_days: Option<u32>,
     /// Attach the ACMA register service (MCP over HTTP) as a knowledge provider; `reach_km=N`
     /// overrides its reach rule
     #[arg(
@@ -113,6 +131,18 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// The burst store's policy: the defaults, with `--bursts-keep-mb` and
+    /// `--bursts-keep-days` where given.
+    pub fn burst_policy(&self) -> zeta_core::bursts::BurstPolicy {
+        let d = zeta_core::bursts::BurstPolicy::default();
+        zeta_core::bursts::BurstPolicy {
+            keep_bytes: self
+                .bursts_keep_mb
+                .map_or(d.keep_bytes, |mb| mb.saturating_mul(1 << 20)),
+            keep_days: self.bursts_keep_days.unwrap_or(d.keep_days),
+        }
+    }
+
     /// Parse the command line, then check the source and plugin flags: `--source-kiwi`
     /// values are parsed here (so clap never echoes a password), each `--source-node`
     /// needs its `ZETA_NODE_SECRET_<ID>` (unless `--node` rejects the flag anyway), and a
@@ -189,6 +219,8 @@ impl Cli {
             || self.state_dir.is_some()
             || self.modes_dir.is_some()
             || self.knowledge_acma.is_some()
+            || self.bursts_keep_mb.is_some()
+            || self.bursts_keep_days.is_some()
     }
 }
 

@@ -170,6 +170,7 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         &[source],
         false,
         None,
+        Default::default(),
     )
     .await;
     let node = match opened {

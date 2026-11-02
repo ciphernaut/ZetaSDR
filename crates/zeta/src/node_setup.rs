@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use zeta_core::bursts::BurstPolicy;
 use zeta_core::classify::StubClassifier;
 use zeta_core::knowledge::StaticKnowledge;
 use zeta_core::modes::{Decoder, ModeRegistry, ModeState, ProgramBlock};
@@ -342,12 +343,14 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// line each, then the handler report of the program rows ([`probe_handlers`]); neither
 /// fails the node. Errors name the flag, never a Kiwi password or a node secret. The node
 /// comes with its [`RemotePorts`].
+#[allow(clippy::too_many_arguments)]
 pub async fn open(
     state_dir: PathBuf,
     sources: &[SourceSpec],
     plugins: &[PluginSpec],
     resume: bool,
     ring_budget_mb: Option<u64>,
+    burst_policy: BurstPolicy,
     modes_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
 ) -> Result<(Node, RemotePorts), String> {
@@ -360,6 +363,7 @@ pub async fn open(
         sources,
         resume,
         ring_budget_mb,
+        burst_policy,
     )
     .await
 }
@@ -398,6 +402,7 @@ pub async fn load_modes(
 /// [`open`] on rows already loaded by [`load_modes`] (their registry and the operator
 /// directory it used). A node that fails to open closes the ports it had opened (see
 /// [`RemotePorts::close`]) before the error is returned.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_with(
     state_dir: PathBuf,
     registry: StageRegistry,
@@ -406,6 +411,7 @@ pub async fn open_with(
     sources: &[SourceSpec],
     resume: bool,
     ring_budget_mb: Option<u64>,
+    burst_policy: BurstPolicy,
 ) -> Result<(Node, RemotePorts), String> {
     let mut remotes = RemotePorts::default();
     let opened = open_into(
@@ -416,6 +422,7 @@ pub async fn open_with(
         sources,
         resume,
         ring_budget_mb,
+        burst_policy,
         &mut remotes,
     )
     .await;
@@ -439,6 +446,7 @@ async fn open_into(
     sources: &[SourceSpec],
     resume: bool,
     ring_budget_mb: Option<u64>,
+    burst_policy: BurstPolicy,
     remotes: &mut RemotePorts,
 ) -> Result<Node, String> {
     let opts = FileOpts {
@@ -515,7 +523,7 @@ async fn open_into(
         backends.push(Backend::Gpu);
     }
     let cfg = NodeConfig {
-        burst_policy: Default::default(),
+        burst_policy,
         state_dir,
         ring_seconds: 10.0,
         ring_budget_bytes: ring_budget_mb

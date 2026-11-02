@@ -25,6 +25,7 @@ pub async fn run(
     sources: &[SourceSpec],
     plugins: &[PluginSpec],
     ring_budget_mb: Option<u64>,
+    burst_policy: zeta_core::bursts::BurstPolicy,
     modes_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
     knowledge_acma: Option<(String, Option<f64>)>,
@@ -74,6 +75,7 @@ pub async fn run(
                 plugins,
                 false,
                 ring_budget_mb,
+                burst_policy,
                 modes_dir,
                 speech,
             );

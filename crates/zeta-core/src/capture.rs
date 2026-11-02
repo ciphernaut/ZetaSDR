@@ -71,7 +71,7 @@ pub fn write_cf32(
 }
 
 /// Parse `2000-03-01T00:00:01.500000000Z` back to nanoseconds; `None` for any other shape.
-fn parse_iso8601(s: &str) -> Option<Timestamp> {
+pub(crate) fn parse_iso8601(s: &str) -> Option<Timestamp> {
     let (date, time) = s.strip_suffix('Z')?.split_once('T')?;
     let mut d = date.splitn(3, '-');
     let (y, m, day): (i64, i64, i64) = (
