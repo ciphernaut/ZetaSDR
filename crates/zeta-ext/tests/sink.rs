@@ -315,15 +315,22 @@ async fn an_omitted_position_takes_the_station() {
 }
 
 #[tokio::test]
-async fn an_omitted_position_without_a_station_fails_naming_the_field() {
+async fn an_omitted_position_without_a_station_idles_with_a_context_note() {
     let params = json!({"callsign": "TEST"});
     let r = start_with(params, None);
-    let end = r.handle.await.unwrap();
-    match end {
-        Err(StageError::Failed(m)) => assert!(
-            m.starts_with("sink.params.lat: no station set (station set --lat --lon --alt-m)"),
-            "{m}"
-        ),
-        other => panic!("{other:?}"),
-    }
+    until("the idle note", || r.sondehub()["idle"] == true).await;
+    let note = r.sondehub();
+    assert!(
+        note["last_error"]
+            .as_str()
+            .unwrap()
+            .starts_with("sink.params.lat: no station set (station set --lat --lon --alt-m)"),
+        "{note}"
+    );
+    assert_eq!(note["sent"], 0);
+    // It keeps consuming events and never ends on its own (a decoder it rides on runs on).
+    r.send(rs41("R1", 1));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!r.handle.is_finished());
+    stop(r).await;
 }

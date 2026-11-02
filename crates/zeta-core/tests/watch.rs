@@ -1439,6 +1439,36 @@ async fn a_failed_sink_restart_keeps_the_decoder_without_the_sink() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sondehub_sink_without_a_station_keeps_the_decoder() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    assert!(node.station().is_none());
+    // A callsign only: the position would come from the station, and there is none.
+    let sondehub = serde_json::json!({ "callsign": "TEST" });
+    let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub })).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let d = &events.watch("decoding")[0];
+    let summary = d["summary"].as_str().unwrap();
+    assert!(summary.contains("sondehub sink refused"), "{summary}");
+    assert!(summary.contains("no station set"), "{summary}");
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    let rec = record(&node, &job).unwrap();
+    assert!(rec.graph.nodes.iter().all(|n| n.kind != "sink_sondehub"));
+    let listed = decoding(&node, &watch);
+    let err = listed[0]["sink_error"].as_str().unwrap_or_default();
+    assert!(
+        err.starts_with("sink.params.lat: no station set"),
+        "{listed:?}"
+    );
+    assert!(events.watch("lost").is_empty(), "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_decoder_that_cannot_be_relaunched_is_lost_not_decoding() {
     let _one = SERIAL.lock().await;
     zeta_core::node::watch::test_timing(0, 0);

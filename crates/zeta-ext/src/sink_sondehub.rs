@@ -254,7 +254,14 @@ impl Stage for SondehubStage {
                 lon.unwrap_or(st.lon),
                 alt.unwrap_or(st.alt_m),
             ],
-            _ => return Err(StageError::Failed(NO_STATION.into())),
+            _ => {
+                // No position to report from: say so in the context and idle (the events are
+                // consumed, nothing is uploaded), never failing the decoder it rides on.
+                if inputs.len() != 1 {
+                    return Err(fail("expected 1 input".into()));
+                }
+                return idle(inputs.remove(0), &ctx, &cancel).await;
+            }
         };
         if inputs.len() != 1 {
             return Err(fail("expected 1 input".into()));
@@ -294,6 +301,28 @@ impl Stage for SondehubStage {
         // The input closed: what is collected still goes.
         flush(&client, &p.url, &mut batch, &mut tally, &ctx, &cancel).await;
         Ok(())
+    }
+}
+
+/// A sink with no position (none in its params, no station): `job_context.sondehub`
+/// carries [`NO_STATION`] as `last_error` and `idle: true`, and the input is drained until it
+/// closes or the stage is cancelled.
+async fn idle(
+    mut rx: broadcast::Receiver<Frame>,
+    ctx: &StageContext,
+    cancel: &CancellationToken,
+) -> Result<(), StageError> {
+    ctx.note(json!({
+        "sondehub": {"sent": 0, "failed": 0, "last_error": NO_STATION, "idle": true}
+    }));
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(StageError::Cancelled),
+            f = rx.recv() => if let Err(broadcast::error::RecvError::Closed) = f {
+                return Ok(());
+            },
+        }
     }
 }
 

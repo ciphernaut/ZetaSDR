@@ -146,6 +146,9 @@ fn silence_ms() -> u64 {
     SILENCE_MS
 }
 
+/// The refusal of a sink with no position and no station (the text `sink_sondehub` notes
+/// when it idles for the same reason).
+const SINK_NO_STATION: &str = "sink.params.lat: no station set (station set --lat --lon --alt-m)";
 /// How often the loop looks at its streams, its identify run and its decoders.
 const POLL: Duration = Duration::from_millis(50);
 /// How long a resumed watch waits for the records it names (its decoders, a stale
@@ -859,9 +862,17 @@ impl Inner {
     /// reason, the graph left as it was, when the graph with the sink would not validate
     /// (the start and put of the watch check `sondehub` first, so this is the last line of
     /// defence: the decoder runs without the feed and the caller says so).
+    ///
+    /// A sink whose params give no whole position (`lat`, `lon`, `alt_m`) needs the node's
+    /// station for the rest: without one it is refused here, so the decoder runs without
+    /// it and the `decoding` summary says why, rather than the stage idling unseen.
     fn append_sink(&self, graph: &mut Graph, sondehub: &serde_json::Value) -> Result<bool, String> {
         if graph.nodes.iter().any(|n| n.kind == SONDEHUB_STAGE) {
             return Ok(false);
+        }
+        let has = |k: &str| sondehub.get(k).is_some_and(serde_json::Value::is_number);
+        if !(has("lat") && has("lon") && has("alt_m")) && self.station.lock().unwrap().is_none() {
+            return Err(SINK_NO_STATION.into());
         }
         let from = graph.nodes.iter().rev().find(|n| {
             self.registry
