@@ -351,3 +351,59 @@ async fn bind_refuses_non_lan() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     ts.stop().await;
 }
+
+#[tokio::test]
+async fn captures_are_served_with_the_bearer_and_404_without_a_record() {
+    use zeta_core::bursts::NewCapture;
+    use zeta_core::types::{Hz, JobId};
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let iq = vec![num_complex::Complex::new(0.5f32, -0.25); 16];
+    let rec = ts
+        .node
+        .bursts()
+        .write(
+            NewCapture {
+                source: SourceId("rx".into()),
+                set: JobId("set".into()),
+                center_hz: Hz(433_920_000),
+                bandwidth_hz: Hz(10_000),
+                sample_rate_hz: Hz(48_000),
+                start_ns: 1,
+                end_ns: 2,
+                features: json!({}),
+                signal: None,
+                job: JobId("cap".into()),
+                watch: None,
+                allocations: json!([]),
+            },
+            &iq,
+        )
+        .unwrap();
+    let resp = get(&ts, &format!("/captures/{}.sigmf-meta", rec.id)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    let meta: Value = resp.json().await.unwrap();
+    assert_eq!(meta["global"]["core:sample_rate"], 48_000);
+    let resp = get(&ts, &format!("/captures/{}.sigmf-data", rec.id)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/octet-stream");
+    assert_eq!(resp.bytes().await.unwrap().len(), 16 * 8);
+    // No bearer: 401. No record, or another name or extension: 404.
+    let resp = client()
+        .get(format!("{}/captures/{}.sigmf-meta", ts.url, rec.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    for name in [
+        "01NOPE.sigmf-meta".to_string(),
+        format!("{}.json", rec.id),
+        rec.id.clone(),
+        "..%2Findex.json".to_string(),
+    ] {
+        let resp = get(&ts, &format!("/captures/{name}")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
+    }
+    ts.stop().await;
+}

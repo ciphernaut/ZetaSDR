@@ -41,7 +41,9 @@ impl Default for BurstPolicy {
 }
 
 /// One capture in the store: a SigMF pair and what is known of it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
+#[schemars(transform = crate::knowledge::require_all)]
 pub struct CaptureRecord {
     /// A ULID; the stem of its files.
     pub id: String,

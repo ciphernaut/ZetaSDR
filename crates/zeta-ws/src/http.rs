@@ -30,7 +30,7 @@ use zeta_speech::SpeechBackend;
 
 use crate::addr::is_lan;
 use crate::auth::{Secret, subprotocol_secret};
-use crate::{ask, stream, stt, ui};
+use crate::{ask, captures, stream, stt, ui};
 
 /// Resource limits sized for a Raspberry Pi.
 #[derive(Clone, Copy, Debug)]
@@ -334,6 +334,7 @@ fn router(state: Shared) -> Router {
         .route("/agents-md", get(agents_md))
         .route("/stream/{id}", get(stream::ws))
         .route("/streams/{id}/tail", get(stream::tail_route))
+        .route("/captures/{file}", get(captures::file))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));

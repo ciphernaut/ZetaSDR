@@ -353,6 +353,7 @@ async fn job_stop_is_applied_when_stops_are_allowed() {
     c.allow = Allow {
         stop_jobs: true,
         replace: false,
+        delete_captures: false,
     };
     let agent = Agent::new(llm(&fake), &exec, c);
     let t = agent.run("stop it").await.unwrap();
@@ -416,6 +417,7 @@ fn jobs_stop_needs_stops_allowed() {
     let allowed = Allow {
         stop_jobs: true,
         replace: false,
+        delete_captures: false,
     };
     assert!(gate(&op, allowed).is_none());
 }
@@ -723,4 +725,66 @@ async fn a_second_run_cannot_stop_the_first_runs_job() {
     let t = agent.run("stop it").await.unwrap();
     assert!(!t.calls[0].ok);
     assert_eq!(t.calls[0].result["error"], "not_allowed");
+}
+
+#[tokio::test]
+async fn capture_delete_needs_delete_captures_allowed() {
+    let first = fake(vec![
+        tool_call_response(&[("capture_delete", json!({"capture": "01X"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let agent = Agent::new(llm(&first), &exec, cfg());
+    let t = agent.run("delete it").await.unwrap();
+    assert!(exec.calls.lock().unwrap().is_empty());
+    let r = &t.calls[0].result;
+    assert_eq!(r["error"], "not_allowed");
+    assert_eq!(r["field"], "op");
+    assert_eq!(r["op"], "capture_delete");
+
+    let second = fake(vec![
+        tool_call_response(&[("capture_delete", json!({"capture": "01X"}))]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let mut c = cfg();
+    c.allow = Allow {
+        delete_captures: true,
+        ..Allow::default()
+    };
+    let agent = Agent::new(llm(&second), &exec, c);
+    agent.run("delete it").await.unwrap();
+    assert_eq!(exec.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn gate_covers_every_delete_taking_op() {
+    assert!(
+        gate(
+            &json!({"op": "capture_delete", "capture": "a"}),
+            Allow::default()
+        )
+        .is_some()
+    );
+    let allowed = Allow {
+        delete_captures: true,
+        ..Allow::default()
+    };
+    assert!(gate(&json!({"op": "capture_delete", "capture": "a"}), allowed).is_none());
+    // Allowing stops does not allow deleting.
+    let stops = Allow {
+        stop_jobs: true,
+        replace: true,
+        delete_captures: false,
+    };
+    assert!(gate(&json!({"op": "capture_delete", "capture": "a"}), stops).is_some());
+    assert!(
+        gate(
+            &json!({"op": "capture_list", "signal": null}),
+            Allow::default()
+        )
+        .is_none()
+    );
 }

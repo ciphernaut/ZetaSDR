@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
 use zeta_core::modes::{Family, ModeState};
-use zeta_core::ops::{JobKind, Op, OpError, Sideband};
+use zeta_core::ops::{JobKind, Op, OpError, Sideband, SignalBand};
 use zeta_core::station::{Antenna, AntennaKind, Station};
 use zeta_core::types::{Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
 
@@ -227,6 +227,9 @@ pub enum Command {
     /// The node's station: position, region and antennas
     #[command(subcommand)]
     Station(StationCmd),
+    /// The burst captures the node stored
+    #[command(subcommand)]
+    Capture(CaptureCmd),
     /// Many jobs at once
     #[command(subcommand)]
     Jobs(JobsCmd),
@@ -300,6 +303,38 @@ pub enum MixCmd {
         /// Only the audio of jobs on these sources (default: every source)
         #[arg(long, value_name = "ID[,ID]", value_delimiter = ',')]
         sources: Option<Vec<String>>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CaptureCmd {
+    /// List the captures, newest first; with --center-hz and --bandwidth-hz only those
+    /// overlapping that band
+    List {
+        /// The band's centre, Hz (with --bandwidth-hz)
+        #[arg(long, requires = "bandwidth_hz")]
+        center_hz: Option<u64>,
+        /// The band's width, Hz (with --center-hz)
+        #[arg(long, requires = "center_hz")]
+        bandwidth_hz: Option<u64>,
+    },
+    /// Print one capture's record and its SigMF meta
+    Show {
+        /// A capture id (from `capture list`)
+        #[arg(long)]
+        capture: String,
+    },
+    /// Run the classifiers over a capture's window
+    Classify {
+        /// A capture id (from `capture list`)
+        #[arg(long)]
+        capture: String,
+    },
+    /// Delete a capture and its files (a pinned one is refused)
+    Delete {
+        /// A capture id (from `capture list`)
+        #[arg(long)]
+        capture: String,
     },
 }
 
@@ -589,6 +624,9 @@ pub struct AskArgs {
     /// Let the agent stop the holders a conflict names (a non-empty `replace`)
     #[arg(long)]
     pub allow_replace: bool,
+    /// Let the agent delete captures (`capture_delete`)
+    #[arg(long)]
+    pub allow_delete: bool,
 }
 
 /// The usage error for `--stt-socket` with `--stt-node`.
@@ -961,6 +999,7 @@ impl Command {
                 | Command::Plan(PlanCmd::Start { .. })
                 | Command::Mix(MixCmd::Start { .. })
                 | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
+                | Command::Capture(CaptureCmd::Delete { .. })
                 | Command::Jobs(JobsCmd::Stop { .. })
         )
     }
@@ -1148,6 +1187,18 @@ impl Command {
                     number_antennas(all)
                 }),
             },
+            Command::Capture(CaptureCmd::List {
+                center_hz,
+                bandwidth_hz,
+            }) => Op::CaptureList {
+                signal: center_hz.zip(bandwidth_hz).map(|(c, b)| SignalBand {
+                    center_hz: Hz(c),
+                    bandwidth_hz: Hz(b),
+                }),
+            },
+            Command::Capture(CaptureCmd::Show { capture }) => Op::CaptureShow { capture },
+            Command::Capture(CaptureCmd::Classify { capture }) => Op::CaptureClassify { capture },
+            Command::Capture(CaptureCmd::Delete { capture }) => Op::CaptureDelete { capture },
             Command::Station(StationCmd::Get) => Op::StationGet {},
             Command::Station(StationCmd::Clear) => Op::StationClear {},
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },

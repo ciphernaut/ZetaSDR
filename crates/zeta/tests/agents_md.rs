@@ -21,7 +21,7 @@ fn rendering_lists_every_op_variant() {
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let variants = v["value"]["op"]["oneOf"].as_array().unwrap();
-    assert_eq!(variants.len(), 29);
+    assert_eq!(variants.len(), 33);
     let md = zeta()
         .arg("agents-md")
         .assert()
@@ -196,6 +196,30 @@ fn station_set_is_in_the_guide() {
         .clone();
     let md = String::from_utf8(md).unwrap();
     for needle in ["CLI: `zeta station set --lat", "\"op\":\"station_set\""] {
+        assert!(md.contains(needle), "missing {needle}");
+    }
+}
+
+#[test]
+fn capture_ops_are_in_the_guide() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    for needle in [
+        "CLI: `zeta capture list",
+        "CLI: `zeta capture show --capture",
+        "CLI: `zeta capture classify --capture",
+        "CLI: `zeta capture delete --capture",
+        "\"op\":\"capture_delete\"",
+        "allow.delete_captures",
+        "GET /captures/<id>.sigmf-meta",
+        "newest first",
+    ] {
         assert!(md.contains(needle), "missing {needle}");
     }
 }

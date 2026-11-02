@@ -18,6 +18,8 @@ pub struct Allow {
     pub stop_jobs: bool,
     /// A non-empty `replace` may be sent (it stops the named jobs).
     pub replace: bool,
+    /// `capture_delete` may be applied.
+    pub delete_captures: bool,
 }
 
 /// The operations whose `replace` stops jobs to make room.
@@ -35,6 +37,17 @@ pub const GATED_REPLACE_OPS: &[&str] = &[
 pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
     // `op_from_call` always inserts `"op"`, so a value without a name never comes from a call.
     let name = op["op"].as_str()?;
+    if name == "capture_delete" {
+        if allow.delete_captures {
+            return None;
+        }
+        return Some(json!({
+            "error": "not_allowed",
+            "field": "op",
+            "op": name,
+            "message": "deleting captures is not allowed in this run: report it to the operator; they unlock it by allowing capture deletes for the run",
+        }));
+    }
     let field = if name == "job_stop" || name == "jobs_stop" {
         if allow.stop_jobs {
             return None;

@@ -28,6 +28,15 @@ use crate::types::{
     Capabilities, ChannelId, Hz, JobId, Selection, SourceId, StreamId, StreamKind, Timestamp,
 };
 
+/// A band as `capture_list` narrows by: a capture matches when its own band overlaps it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SignalBand {
+    pub center_hz: Hz,
+    pub bandwidth_hz: Hz,
+}
+
 /// One request to the node.
 ///
 /// Variants without fields are written `Variant {}` so serde enforces
@@ -221,6 +230,35 @@ pub enum Op {
     StationGet {},
     /// Forget the station (`station.json` is removed).
     StationClear {},
+    /// The captures the node's burst store holds, newest first, each a record (`id`,
+    /// `source`, `center_hz`, `bandwidth_hz`, `sample_rate_hz`, `start_ns`, `end_ns`,
+    /// `bytes`, `features`, `signal`, `job`, `watch`, `allocations`, `pinned`). `signal`
+    /// narrows the list to the captures whose band overlaps that band; `null` lists all.
+    CaptureList {
+        /// The band to narrow to; `null` for every capture.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<SignalBand>")]
+        signal: Option<SignalBand>,
+    },
+    /// One capture's record and its SigMF meta (`meta`, the `.sigmf-meta` as written).
+    /// The record's `meta_path` and `data_path` are the node's own files; a remote
+    /// caller fetches them at `GET /captures/<id>.sigmf-meta` and `.sigmf-data`.
+    CaptureShow {
+        /// An id from `capture_list`.
+        capture: String,
+    },
+    /// Run the classifiers over a capture's whole window (the stored allocations
+    /// included) as `classify` does over the ring: `{labels, tried, allocations}`.
+    CaptureClassify {
+        /// An id from `capture_list`.
+        capture: String,
+    },
+    /// Delete a capture and its files. A pinned capture is refused. Deleting is the
+    /// operator's decision: through `ask` it needs `allow.delete_captures`.
+    CaptureDelete {
+        /// An id from `capture_list`.
+        capture: String,
+    },
     /// Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on
     /// the channels numbered in `channels`, each at its channel's `center_hz` with the
     /// plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's
@@ -1996,6 +2034,13 @@ pub enum OpResult {
         failed: Vec<JobStopFailed>,
     },
     Ok,
+    /// `capture_list`: the records, newest first.
+    Captures(Vec<crate::bursts::CaptureRecord>),
+    /// `capture_show`: the record and its `.sigmf-meta` as JSON.
+    Capture {
+        record: crate::bursts::CaptureRecord,
+        meta: serde_json::Value,
+    },
     /// `station_set`, `station_get` and `station_clear`: the station, `null` for none.
     Station(Option<crate::station::Station>),
     Schema(serde_json::Value),
@@ -2018,6 +2063,10 @@ impl Op {
             Op::StationSet { .. } => "station_set",
             Op::StationGet {} => "station_get",
             Op::StationClear {} => "station_clear",
+            Op::CaptureList { .. } => "capture_list",
+            Op::CaptureShow { .. } => "capture_show",
+            Op::CaptureClassify { .. } => "capture_classify",
+            Op::CaptureDelete { .. } => "capture_delete",
             Op::PlanStart { .. } => "plan_start",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
@@ -2055,6 +2104,8 @@ impl Op {
                 | Op::ModesList { .. }
                 | Op::ModesShow { .. }
                 | Op::StationGet {}
+                | Op::CaptureList { .. }
+                | Op::CaptureShow { .. }
         )
     }
 
@@ -2110,6 +2161,8 @@ impl OpResult {
             OpResult::Ok => "ok",
             OpResult::Schema(_) => "schema",
             OpResult::Station(_) => "station",
+            OpResult::Captures(_) => "captures",
+            OpResult::Capture { .. } => "capture",
         }
     }
 
@@ -2960,6 +3013,33 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             .await
             .map(|()| OpResult::Station(None))
             .map_err(|e| node_error(node, e)),
+        Op::CaptureList { signal } => {
+            let mut v = node.bursts().list();
+            if let Some(b) = signal {
+                let (lo, hi) = band_edges(b.center_hz, b.bandwidth_hz);
+                v.retain(|r| {
+                    let (rlo, rhi) = band_edges(r.center_hz, r.bandwidth_hz);
+                    rlo < hi && lo < rhi
+                });
+            }
+            Ok(OpResult::Captures(v))
+        }
+        Op::CaptureShow { capture } => {
+            let record = capture_record(node, &capture)?;
+            let meta = std::fs::read(&record.meta_path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+                .map_err(|e| other(format!("capture {capture}: {e}")))?;
+            Ok(OpResult::Capture { record, meta })
+        }
+        Op::CaptureClassify { capture } => capture_classify(node, &capture).await,
+        Op::CaptureDelete { capture } => {
+            capture_record(node, &capture)?;
+            node.bursts()
+                .delete(&capture)
+                .map(|_| OpResult::Ok)
+                .map_err(other)
+        }
         Op::MixStart { sources } => node
             .mix_start(sources)
             .await
@@ -3560,6 +3640,58 @@ fn check_band(sel: &Selection, center: Hz, rate: Hz) -> Result<(), OpError> {
         center.0.saturating_sub(ring_half).saturating_add(half),
         center.0.saturating_add(ring_half).saturating_sub(half),
     )
+}
+
+/// `[lo, hi)` in Hz of a band, the low edge clamped at 0.
+fn band_edges(center: Hz, bandwidth: Hz) -> (u64, u64) {
+    let half = bandwidth.0 / 2;
+    (
+        center.0.saturating_sub(half),
+        center.0.saturating_add(bandwidth.0 - half),
+    )
+}
+
+/// The store's record `id`, else an `unknown` error naming `capture` and the known ids.
+fn capture_record(node: &Node, id: &str) -> Result<crate::bursts::CaptureRecord, OpError> {
+    let store = node.bursts();
+    store.get(id).ok_or_else(|| OpError::Unknown {
+        field: "capture".into(),
+        value: id.into(),
+        known: store.list().into_iter().map(|r| r.id).collect(),
+    })
+}
+
+/// `capture_classify`: the classifiers over the capture's samples, whole band, with the
+/// allocations the record kept.
+async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
+    let rec = capture_record(node, id)?;
+    let path = rec.meta_path.clone();
+    let (meta, samples) = tokio::task::spawn_blocking(move || crate::capture::read_cf32(&path))
+        .await
+        .map_err(other)?
+        .map_err(|e| other(format!("capture {id}: {e}")))?;
+    let allocations: Vec<Allocation> =
+        serde_json::from_value(rec.allocations.clone()).unwrap_or_default();
+    let Classification {
+        labels,
+        tried,
+        allocations,
+    } = node
+        .classifiers()
+        .run_all(
+            &samples,
+            meta.sample_rate_hz,
+            meta.center_hz,
+            Band::whole(meta.sample_rate_hz),
+            None,
+            allocations,
+        )
+        .await;
+    Ok(OpResult::Classification {
+        labels,
+        tried,
+        allocations,
+    })
 }
 
 /// Run the classifier set over the selection's band and span of the source ring.

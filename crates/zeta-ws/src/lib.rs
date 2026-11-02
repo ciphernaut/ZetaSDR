@@ -3,6 +3,7 @@
 pub mod addr;
 mod ask;
 pub mod auth;
+mod captures;
 pub mod http;
 pub mod stream;
 mod stt;

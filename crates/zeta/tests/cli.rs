@@ -3154,3 +3154,49 @@ fn station_set_get_clear_round_trip() {
         serde_json::json!({"result": "station", "value": null})
     );
 }
+
+/// `capture list` answers an empty store, narrowed or not; `capture show`/`classify`/
+/// `delete` name the unknown id (exit 2) and `delete` is a mutating command.
+#[test]
+fn capture_commands_round_trip_on_an_empty_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = zeta_bin();
+        cmd.arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .arg("--json")
+            .args(args);
+        cmd
+    };
+    for args in [
+        &["capture", "list"][..],
+        &[
+            "capture",
+            "list",
+            "--center-hz",
+            "433920000",
+            "--bandwidth-hz",
+            "10000",
+        ][..],
+    ] {
+        let out = run(args).assert().success().get_output().stdout.clone();
+        assert_eq!(
+            json(&out),
+            serde_json::json!({"result": "captures", "value": []})
+        );
+    }
+    run(&["capture", "list", "--center-hz", "433920000"])
+        .assert()
+        .failure();
+    for verb in ["show", "classify", "delete"] {
+        let out = run(&["capture", verb, "--capture", "01NOPE"])
+            .assert()
+            .code(2)
+            .get_output()
+            .stdout
+            .clone();
+        let v = json(&out);
+        assert_eq!(v["error"], "unknown", "{v}");
+        assert_eq!(v["field"], "capture", "{v}");
+    }
+}

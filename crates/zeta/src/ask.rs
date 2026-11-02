@@ -42,6 +42,7 @@ pub async fn run(
     let allow = Allow {
         stop_jobs: args.allow_stop,
         replace: args.allow_replace,
+        delete_captures: args.allow_delete,
     };
     match remote {
         Some(client) => {

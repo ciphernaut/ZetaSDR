@@ -270,7 +270,10 @@ async fn ask_allow_defaults_to_false_and_rejects_an_unknown_key() {
     let resp = ask(&ts, Some(BEARER), &json!({"request": "what sources?"})).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let t: Value = resp.json().await.unwrap();
-    assert_eq!(t["allow"], json!({"stop_jobs": false, "replace": false}));
+    assert_eq!(
+        t["allow"],
+        json!({"stop_jobs": false, "replace": false, "delete_captures": false})
+    );
     assert_eq!(t["turn_log"].as_array().unwrap().len(), 2);
 
     let resp = ask(
@@ -281,7 +284,10 @@ async fn ask_allow_defaults_to_false_and_rejects_an_unknown_key() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let t: Value = resp.json().await.unwrap();
-    assert_eq!(t["allow"], json!({"stop_jobs": true, "replace": false}));
+    assert_eq!(
+        t["allow"],
+        json!({"stop_jobs": true, "replace": false, "delete_captures": false})
+    );
 
     let resp = ask(
         &ts,
