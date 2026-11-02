@@ -70,9 +70,8 @@ each ending with working, testable software; the operator accepts once, at the e
 - Working a live channel to bits in 19.2: the stages run over captured bursts first; a live chain is
   composed by hand with `graph_put` on a job and is not a deliverable of these plans.
 - A GPS fix from the B210. The station is set by hand; `station set --from-source ID` is a later gist.
-- The emission designator. The ACMA mirror on this machine carries frequency, bandwidth, power, licensee
-  and site, not the designator (checked 2026-11-02: `device_details` has no such column); the record
-  keeps an `emission` slot, `null` until a mirror provides it.
+- A second register transport. The provider speaks the fork's MCP endpoint only; the older Python
+  `acma-mcp` build (plain `POST /tools`, no emission column) is not supported.
 - A per-device spur list for the scan (the scan gist stays), the HackRF's 1 Msps timeouts, the detector's
   tone-pair criterion for the sondes beyond what section 5.6 changes.
 - Chirp (LoRa) rate detection, multi-carrier (OFDM) features, a trained layer-1 classifier, layer 3.
@@ -104,10 +103,9 @@ each ending with working, testable software; the operator accepts once, at the e
   from the live stream as it passes, never read back from the ring.
 - `measure` windows are one second; a burst-gated measurement must still emit one record per second
   (`partial` semantics unchanged).
-- The ACMA mirror is a 45 GB SQLite file (`/Projects/acma-local/data/acma_licences.db`, 2 534 203
-  `device_details` rows, `frequency` and `bandwidth` in MHz as REAL, `power` in W, indexed on
-  `frequency`) behind the acma-mcp HTTP service on the same host. The node never opens the file: it
-  calls the service, and a lookup must answer in well under a second or be dropped.
+- The ACMA register is the operator's acma-rrl-server (MCP over streamable HTTP) on another host of
+  the LAN. The node never opens a mirror file: it calls the service, and a lookup must answer in well
+  under a second or be dropped; the node and every test run without it.
 - The watch's identify runs and capture jobs are owned jobs: `owner` set, no history, stopped with the
   watch.
 - The page's tabs: a new pane goes behind its own tab beside the radios, never a slice of the waterfall
@@ -186,59 +184,69 @@ home: `view set home` keeps its per-browser value, and with none set the page ta
 
 ### 5.3 The ACMA provider
 
-`--knowledge-acma URL[,radius_km=N]` (env `ZETA_KNOWLEDGE_ACMA`) attaches the acma-mcp service at
-`URL` (its `http://HOST:PORT`) as the provider `acma`, `radius_km` 60 by default. The node does not
-read the mirror itself (the operator, 2026-11-02: "just fire up the mcp service"): the register's
-schema and SQL stay in acma-local, which the operator maintains, and the node speaks the service's
-plain HTTP tool form, `POST /tools/<name>` with a JSON body, answered `{"result": ...}` or
-`{"error": ...}`. Checked on the field host 2026-11-02: the mirror and the service are on the node's own
-host (`/Projects/acma-local`, `data/acma_licences.db`, 45 GB, `frequency` and `bandwidth` in MHz,
-`power` in W, no emission column); the service runs with `python3 -m uvicorn acma_mcp.server:app
---port 8010` once its dependencies are installed and `mcp` is pinned under 1.1 (with the current 2.x
-SDK it fails at startup on `Server.list_tools`); `find_devices_by_location {latitude, longitude,
-radius_km}` answers every device within the radius (`device_id`, `licence_no`, `frequency`,
-`bandwidth`, `power` or `null`, `site_id`, `latitude`, `longitude`, `address`, `licence_type_name`,
-`licencee`, `distance_km`): 11 218 devices in 3.6 s for 15 km, with no frequency filter. So 19.1's
-first task on the acma-local side adds optional `frequency_start` and `frequency_end` (MHz) and
-`limit` to that tool, using the mirror's `idx_device_frequency`, so one call answers one band in well
-under a second, and pins `mcp<1.1` in its `pyproject.toml`; running the service on the field host as a
-systemd user unit is the operator's (the account is their choice; the `claude` account can run it for
-the acceptance). At startup the node probes `GET /health` and logs `zeta: knowledge acma: <url>
-unreachable` without refusing the flag; a call that fails or exceeds 5 s answers no allocations and
-logs once per minute, so `identify` goes on without the register. `allocations(region, center_hz,
-bandwidth_hz)` answers only for `region` `AU` (any other region: empty):
+`--knowledge-acma URL[,radius_km=N]` (env `ZETA_KNOWLEDGE_ACMA`) attaches the operator's ACMA
+register service at `URL` as the provider `acma`, `radius_km` 60 by default. The node does not read
+the mirror itself (the operator, 2026-11-02: "just fire up the mcp service"): the register's schema and
+sync stay in the service, which the operator maintains. The service is the **acma-rrl-server fork**
+(version 1.11.0, checked 2026-11-02 at `http://acma-host:3110`, a different host from
+the node's): MCP over streamable HTTP at `URL/mcp` (`initialize`, `notifications/initialized`, then
+`tools/call`, the session in the `mcp-session-id` header, answers as `event: message` / `data:` lines),
+`GET URL/health` answering `{"status", "version", "isSyncing"}`. Its tools the provider uses:
 
-- one `find_devices_by_location` call with the station's position and `radius_km`, the band's edges
-  as `frequency_start`/`frequency_end`, `limit` 50: every device whose channel (`frequency ± bandwidth
-  / 2`) overlaps the band, nearest first. Without a station the provider answers empty and the node
-  logs once that the ACMA provider needs `station set` (the tool is anchored on a position).
+- `execute_sql {sql, limit}` over the RRL's own tables: `device_details` (`FREQUENCY` and `BANDWIDTH`
+  in Hz, `EMISSION` the designator, `DEVICE_TYPE` `T` or `R`, `TRANSMITTER_POWER` with
+  `TRANSMITTER_POWER_UNIT`, `SITE_ID`, `LICENCE_NO`), `site` (`NAME`, `LATITUDE`, `LONGITUDE`),
+  `licence` (`CLIENT_NO`) and `client` (`LICENCEE`). One fixed query per lookup: the devices whose
+  `FREQUENCY ± BANDWIDTH / 2` overlaps the band, joined to site, licence and client, with a bounding
+  box around the station for the radius; it answered the four 404.025 MHz assignments (Example Rail Operator
+  and the water utility, each a `T` and an `R` site, `16K0F2D` and `16K0F1D`) in under 100 ms.
+- `get_frequency_allocation {freq_hz, include_footnotes: false}`: the Australian Spectrum Plan's
+  services at the centre (403-406 MHz: FIXED and MOBILE primary, METEOROLOGICAL AIDS and RADIOLOCATION
+  secondary), which become `Allocation` rows of their own.
+
+The emission designator is decoded in the node (a small parser: the bandwidth prefix, then the
+modulation, signal-nature and information-type letters; `16K0F1D` is 16 kHz, frequency modulation,
+single digital channel, data), so a lookup is two calls, not one per row; the service's
+`decode_emission_designator` is the reference the parser's tests check against. No change in the
+fork is needed. At startup the node probes `GET /health` and logs `zeta: knowledge acma: <url>
+unreachable` without refusing the flag; a call that fails or exceeds 5 s answers no allocations and
+logs once per minute, so `identify` goes on without the register; the MCP session is opened once and
+reopened on a `Server not initialized` error. `allocations(region, center_hz, bandwidth_hz)` answers
+only for `region` `AU` (any other region: empty), the plan's services first, then the assignments:
+
+- every assignment overlapping the band whose site lies within `radius_km` of the station, nearest
+  first, at most 50. Without a station the radius is not applied and the list is ordered by the
+  assignment's distance from the band's centre in frequency, `distance_km` and `bearing_deg` `null`.
 - each as an `Allocation`: the existing `provider`, `region`, `min_hz`, `max_hz` (the channel), `service`
-  (`<licence_type_name> / <licence_category_name>`), `note` (one line: licensee, site address, distance,
-  power, width), plus new optional fields (`null` when the service lacks them): `licensee`, `site`,
-  `lat`, `lon`, `distance_km`, `bearing_deg` (computed from the station), `power_w`, `center_hz`,
-  `bandwidth_hz`, `status`, `licence_no`, `class_of_station_code`, `role` (`tx` when the row has a
-  `power`, `rx` when it has none: the mirror has no transmit flag, and a receive assignment carries no
-  power), `emission` (always `null` today), `as_of` (the row's `updated_at`, the mirror's freshness).
-  The tool answers `licence_type_name`, `licencee`, `address`, `distance_km`, `power` today; the
-  acma-local task above adds `licence_category_name`, `status`, `class_of_station_code` and
-  `updated_at` to its rows, and the provider reads each as optional. Transmitters are listed before
-  receivers at equal distance, and only `tx` rows feed the score term in 5.4.
+  (a plan row: the service name with `primary` or `secondary`; an assignment: `assignment`), `note`
+  (one line: licensee, site name, distance, power, the designator decoded), plus new optional fields
+  (`null` when the service lacks them): `kind` (`plan` or `assignment`), `licensee`, `site`, `lat`,
+  `lon`, `distance_km`, `bearing_deg` (computed from the station), `power_w` (converted from the unit
+  column), `center_hz`, `bandwidth_hz`, `licence_no`, `role` (`tx` or `rx` from `DEVICE_TYPE`),
+  `emission` (the designator as stored, trimmed) and `emission_decoded` (`{bandwidth_hz, modulation,
+  nature, info}` from the parser, `null` for a designator it cannot read), `as_of` (the service's
+  sync time from `health`, or `null`). Transmitters are listed before receivers at equal distance,
+  and only `tx` rows feed the score term in 5.4.
 - `signatures()` is empty: the register describes licences, not waveforms.
 
 `Allocation` gains those fields as optional with defaults, so the seed provider's file keeps loading.
 `knowledge_lookup`'s result is unchanged in shape; `AGENTS.md`'s "Neither has allocations" note is
-regenerated. The project's `.mcp.json` registers the acma-local MCP server
-(`http://127.0.0.1:8010/mcp/sse`, the port the service was started on 2026-11-02) so a Claude session
-on this repo can query it directly; that is tooling, not the node.
+regenerated. The project's `.mcp.json` registers the fork (`http://acma-host:3110/mcp`,
+streamable HTTP) so a Claude session on this repo can query it directly; that is tooling, not the
+node. The Python `acma-mcp` copy under `/Projects/acma-local` on the field host (a 45 GB mirror in MHz with
+no emission column, 11 tools) is the older build and is not a target.
 
 ### 5.4 Identify, classify and the watch consult the register
 
 - `identify` calls every provider's `allocations` for its band (the station's region) in its layer-1
   step and keeps the nearest five under `features.allocations`; each `candidate` event carries
-  `allocation` (the best match for that row, or `null`). The row score gains 0.2 when an allocation's
-  `bandwidth_hz` lies within 0.5-1.5 times the row's `band.bandwidth_hz` (the "decoders the register
-  suggests" rung). `classify`'s result gains `allocations` the same way, and its `tried` scoring the
-  same term.
+  `allocation` (the best match for that row, or `null`). The row score gains 0.2 when a `tx`
+  assignment's decoded designator fits the row: its `bandwidth_hz` within 0.5-1.5 times the row's
+  `band.bandwidth_hz`, and its modulation letter compatible with the row's `modulation` (`F` and `G`
+  with `fm`/`fsk`, `G` and `D` with `psk`, `A` and `H`/`J`/`R` with `am`/`ssb`, `N` with `carrier`)
+  (the "decoders the register suggests" rung). `classify`'s result gains `allocations` the same way,
+  and its `tried` scoring the same term. The `unknown` summary pairs the two: "register says 16K0F1D
+  (16 kHz FM data); measured burst fsk 16 kHz".
 - The watch's `unknown` event and `job_context.watch.signals[].features` carry the record with its new
   fields and `allocations`; its `summary` names the nearest licensee, site and distance when there is
   one.
@@ -553,11 +561,14 @@ the operator's.
   encoding and length rule; every CRC against a known vector.
 - `burst_capture` over a synthesised burst stream: `bursts` files, each window's `pre_ms`/`post_ms`
   and features; the policy expiring oldest first and never a pinned capture.
-- The ACMA provider over a stub HTTP server in the test (the service's `POST /tools/<name>` form with
-  a dozen canned devices, recorded from the real service's answer shape): the request's band and
-  position, overlap, ordering nearest first, `tx` before `rx`, the `AU`-only rule, the no-station
-  rule, a 5 s timeout and an `{"error"}` answer each giving no allocations and one log line; and in
-  acma-local, a test for the new frequency filter and `limit` over its sample mirror.
+- The ACMA provider over a stub MCP server in the test (streamable HTTP: `initialize`, the session
+  header, `tools/call` for `execute_sql` and `get_frequency_allocation`, answers recorded from the
+  real fork's shape with the four 404.025 MHz rows and the 403-406 MHz plan entry): the request's
+  band and bounding box, overlap, ordering nearest first, `tx` before `rx`, the `AU`-only rule, the
+  no-station rule, the session reopened on `Server not initialized`, a 5 s timeout and a JSON-RPC
+  error each giving no allocations and one log line; the designator parser against a table of codes
+  with the fork's `decode_emission_designator` answers (`16K0F1D`, `16K0F2D`, `25K0G7W`, `2K80J3E`,
+  `6K00A3E`, an invalid one).
 - Node tests: `identify` and `classify` carrying `allocations` and the score term; the watch with
   `on_unknown: capture` capturing once per signal and publishing `capturing`/`captured`;
   `capture_classify`; `graph_start` refusing an unfed input; `bits_start` from a capture's features and
@@ -572,8 +583,10 @@ the operator's.
 
 ## 9. Acceptance on the field host (the operator's, after 19.3)
 
-1. `station set` with the field host antenna's position; `--knowledge-acma` on the node. `knowledge
-   lookup` at 404.025 MHz names the Example Suburb and Example Suburb assignments with distance and power.
+1. `station set` with the field host antenna's position; `--knowledge-acma
+   http://acma-host:3110` on the node with the fork up. `knowledge lookup` at
+   404.025 MHz names the 403-406 MHz plan services and the Example Suburb and Example Suburb assignments with
+   distance, power and `16K0F1D` decoded.
 2. A watch on 400-406 MHz with `on_unknown: capture` on the B210: the 404.025 MHz link is reported
    `unknown` with burst features (duty about 1 %, period about 1 s, `fsk`, a symbol rate) and the
    licensee in the summary, then `captured` with captures in `capture list` and on the Explore tab; the
@@ -613,10 +626,11 @@ the operator's.
    policy"); a hand capture is `job_start --kind capture`.
 3. Captures live under `state_dir/bursts/`, 256 MB and 7 days by default, 8 bursts per signal per run,
    oldest first, pinned by an accepted signature.
-4. The ACMA provider calls the acma-mcp HTTP service on the node's host (operator: "fire up the mcp
-   service"), never the SQLite file; acma-local gains a frequency filter on
-   `find_devices_by_location` and an `mcp<1.1` pin; radius 60 km; `AU` only; no emission designator
-   (the mirror has none); an unreachable service is logged, not fatal.
+4. The ACMA provider calls the operator's acma-rrl-server fork over its MCP streamable-HTTP endpoint
+   (operator: "fire up the mcp service", then "check acma-host:3110, it has a newer
+   fork"), never a mirror file, through `execute_sql` and `get_frequency_allocation`; the designator
+   is decoded in the node; radius 60 km; `AU` only; no change in the fork; an unreachable service is
+   logged, not fatal.
 5. The station is a node record, not a source property; `sink_sondehub` takes it as a default.
 6. Demod outputs travel as `audio` frames; bits as `event` frames; no new stream kind.
 7. `graph_start` is the generic "job from a graph with no radio"; `bits_start` is the shorthand that
