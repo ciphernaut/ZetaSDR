@@ -1,7 +1,8 @@
 //! Signal detection over spectrum rows: contiguous runs of bins over the row's
-//! floor, tracked across rows, announced `new` once they persist and `gone` once
-//! they fall silent.
+//! median with enough energy, tracked across rows, announced `new` once they persist
+//! and `gone` once they fall silent, at most [`SIGNAL_EVENTS_PER_S`] a second.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,13 +16,33 @@ use zeta_core::types::{SourceId, StreamId, StreamKind};
 
 use crate::{Input, run_map};
 
+/// Default `threshold_db`: a bin is occupied more than this many dB over the row's
+/// median. An RS41 at 6 dB channel SNR stands 7-11 dB over the median in 1 kHz bins,
+/// so 10 missed it; at 6 it is found down to 4 dB channel SNR, while white noise
+/// averaged into 20 rows a second never stands 3 dB over its median.
+pub const THRESHOLD_DB_DEFAULT: f32 = 6.0;
+/// Default `energy_db`: a run counts when the sum over its bins of dB over the row's
+/// median reaches this. Set against the synthesised inputs (the watch tests and an
+/// RS41 at 6 dB channel SNR, still found with up to 60); the B210 noise recording
+/// that should bound it from the other side is pending.
+pub const ENERGY_DB_DEFAULT: f32 = 30.0;
+/// Default `width_hz`: the real RS41 of 2026-11-01 read 4.5 kHz wide.
+pub const WIDTH_HZ_DEFAULT: [u64; 2] = [4000, 30000];
+/// A track is announced `new` only after this many rows have matched it.
+pub const SIGHTINGS_MIN: u32 = 3;
+/// At most this many `signal` events a second per stage; the rest wait their turn.
+pub const SIGNAL_EVENTS_PER_S: usize = 10;
+
 /// `detect` parameters; every field may be left out for its default.
 #[derive(Clone, Debug, PartialEq, JsonSchema, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct DetectParams {
-    /// A bin is occupied when it stands more than this many dB over the row's `floor_db`.
+    /// A bin is occupied when it stands more than this many dB over the row's median bin.
     pub threshold_db: f32,
+    /// A run is a signal when the sum over its bins of dB over the row's median is at
+    /// least this.
+    pub energy_db: f32,
     /// A run is announced `new` once it has been seen this long.
     pub persist_ms: u64,
     /// Runs narrower than the first or wider than the second width (Hz) are ignored.
@@ -47,11 +68,14 @@ pub struct DetectParams {
 }
 
 impl DetectParams {
-    /// What the schema cannot say: `threshold_db` finite, `edge_mask` in `0..0.5`,
-    /// `width_hz` ordered `[min, max]`. The error names the field.
+    /// What the schema cannot say: `threshold_db` and `energy_db` finite, `edge_mask`
+    /// in `0..0.5`, `width_hz` ordered `[min, max]`. The error names the field.
     pub fn check(&self) -> Result<(), String> {
         if !self.threshold_db.is_finite() {
             return Err("threshold_db must be finite".into());
+        }
+        if !self.energy_db.is_finite() {
+            return Err("energy_db must be finite".into());
         }
         if !(0.0..0.5).contains(&self.edge_mask) {
             return Err("edge_mask must be in 0..0.5".into());
@@ -81,9 +105,10 @@ fn edge_mask_default() -> f64 {
 impl Default for DetectParams {
     fn default() -> Self {
         Self {
-            threshold_db: 10.0,
+            threshold_db: THRESHOLD_DB_DEFAULT,
+            energy_db: ENERGY_DB_DEFAULT,
             persist_ms: 3000,
-            width_hz: [5000, 30000],
+            width_hz: WIDTH_HZ_DEFAULT,
             dc_mask_hz: 25000,
             edge_mask: 0.05,
             spurs_hz: Vec::new(),
@@ -120,8 +145,9 @@ pub struct Run {
     pub snr_db: f32,
 }
 
-/// The runs of `row`: maximal sets of contiguous unmasked bins over
-/// `floor_db + threshold_db`, inside `width_hz`. Masked are the bins inside
+/// The runs of `row`: maximal sets of contiguous unmasked bins more than `threshold_db`
+/// over the median of the row's unmasked bins, inside `width_hz`, whose energy (the sum
+/// over their bins of dB over that median) is at least `energy_db`. Masked are the bins inside
 /// one of the row's `masked` ranges, the bins within `dc_mask_hz` of the row's centre, the outer `edge_mask` fraction on each side and
 /// the bins within `dc_mask_hz / 5` of a spur; a masked bin ends a run. A run's centre
 /// is weighted by its bins' linear power, its width is its bin count times `bin_hz`
@@ -144,7 +170,17 @@ pub fn runs(row: &SpectrumRowView, p: &DetectParams) -> Vec<Run> {
             || (f - center).abs() <= p.dc_mask_hz as f64
             || p.spurs_hz.iter().any(|&s| (f - s as f64).abs() <= spur_hz)
     };
-    let occupied = |k: usize| !masked(k) && f32::from(row.q[k]) * row.step_db > p.threshold_db;
+    let mut levels: Vec<u8> = (0..size)
+        .filter(|&k| !masked(k))
+        .map(|k| row.q[k])
+        .collect();
+    if levels.is_empty() {
+        return Vec::new();
+    }
+    let mid = levels.len() / 2;
+    let median = *levels.select_nth_unstable(mid).1;
+    let over = |k: usize| (f32::from(row.q[k]) - f32::from(median)) * row.step_db;
+    let occupied = |k: usize| !masked(k) && over(k) > p.threshold_db;
     let mut out = Vec::new();
     let mut k = 0;
     while k < size {
@@ -158,6 +194,9 @@ pub fn runs(row: &SpectrumRowView, p: &DetectParams) -> Vec<Run> {
         }
         let bandwidth_hz = ((k - k0) as f64 * row.bin_hz).round() as u64;
         if bandwidth_hz < p.width_hz[0] || bandwidth_hz > p.width_hz[1] {
+            continue;
+        }
+        if (k0..k).map(over).sum::<f32>() < p.energy_db {
             continue;
         }
         let (mut power, mut moment, mut peak) = (0.0f64, 0.0f64, 0u8);
@@ -241,6 +280,8 @@ struct Track {
     last_ns: u64,
     /// Time of the first row since the last match that did not match it.
     unmatched_since: Option<u64>,
+    /// Rows that matched it, the first included.
+    sightings: u32,
     announced: bool,
 }
 
@@ -261,7 +302,8 @@ impl Track {
 /// in that row) whose last centre lies within `max(bandwidth_hz, 2 * bin_hz)` of it,
 /// which takes the run's centre, width and SNR, so a drifting signal is followed; an
 /// unmatched run starts a new signal. A signal matched in a row at least `persist_ms`
-/// after its first is announced [`SignalState::New`] once; a signal no row has matched
+/// after its first, by at least [`SIGHTINGS_MIN`] rows in all, is announced
+/// [`SignalState::New`] once; a signal no row has matched
 /// for `gone_ms` (counted from the first row that missed it) is dropped, announced
 /// [`SignalState::Gone`] when it had been announced new, forgotten silently otherwise.
 pub struct Tracker {
@@ -307,6 +349,7 @@ impl Tracker {
                     tr.bandwidth_hz = r.bandwidth_hz;
                     tr.snr_db = r.snr_db;
                     tr.last_ns = t_ns;
+                    tr.sightings = tr.sightings.saturating_add(1);
                     matched[i] = true;
                 }
                 None => {
@@ -317,6 +360,7 @@ impl Tracker {
                         first_ns: t_ns,
                         last_ns: t_ns,
                         unmatched_since: None,
+                        sightings: 1,
                         announced: false,
                     });
                     matched.push(true);
@@ -328,7 +372,10 @@ impl Tracker {
         for (mut tr, m) in std::mem::take(&mut self.tracks).into_iter().zip(matched) {
             if m {
                 tr.unmatched_since = None;
-                if !tr.announced && t_ns.saturating_sub(tr.first_ns) >= self.persist_ns {
+                if !tr.announced
+                    && tr.sightings >= SIGHTINGS_MIN
+                    && t_ns.saturating_sub(tr.first_ns) >= self.persist_ns
+                {
                     tr.announced = true;
                     out.push(tr.signal(SignalState::New));
                 }
@@ -342,6 +389,39 @@ impl Tracker {
         }
         self.tracks = keep;
         out
+    }
+}
+
+/// Holds announcements to at most `per_s` in each second of row time (`t_ns / 1 s`);
+/// the rest wait, in order, for the following seconds' rows.
+pub struct Pacer {
+    per_s: usize,
+    second: u64,
+    sent: usize,
+    queue: VecDeque<Signal>,
+}
+
+impl Pacer {
+    pub fn new(per_s: usize) -> Self {
+        Self {
+            per_s,
+            second: 0,
+            sent: 0,
+            queue: VecDeque::new(),
+        }
+    }
+
+    /// Queue `signals` from the row at `t_ns`; the ones to publish with that row.
+    pub fn pace(&mut self, t_ns: u64, signals: Vec<Signal>) -> Vec<Signal> {
+        self.queue.extend(signals);
+        let second = t_ns / 1_000_000_000;
+        if second != self.second {
+            self.second = second;
+            self.sent = 0;
+        }
+        let n = self.queue.len().min(self.per_s.saturating_sub(self.sent));
+        self.sent += n;
+        self.queue.drain(..n).collect()
     }
 }
 
@@ -390,7 +470,8 @@ fn row_masked(v: &serde_json::Value) -> Vec<[usize; 2]> {
 }
 
 /// Detects signals in spectrum rows (the `fft` stage's events): each row's [`runs`] go
-/// through a [`Tracker`] and every announcement is published as one `signal` event,
+/// through a [`Tracker`] and every announcement is published, at most
+/// [`SIGNAL_EVENTS_PER_S`] a second ([`Pacer`]), as one `signal` event,
 /// `{protocol, state, center_hz, bandwidth_hz, snr_db, first_ns, last_ns, summary,
 /// t_ns}`, `t_ns` the row's start; events that are not spectrum rows are ignored.
 pub struct DetectStage {
@@ -449,6 +530,7 @@ impl Stage for DetectStage {
             return Err(StageError::Failed("expected 1 output".into()));
         };
         let mut tracker = Tracker::new(&p, 0.0);
+        let mut pacer = Pacer::new(SIGNAL_EVENTS_PER_S);
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             // Rows carry their own time, so lost rows only thin the evidence.
             let Input::Frame(frame) = input else {
@@ -469,8 +551,8 @@ impl Stage for DetectStage {
             let t_ns = frame.provenance.span.start_ns.0;
             tracker.set_bin_hz(row.bin_hz);
             let found = runs(&row, &p);
-            Ok(tracker
-                .observe(t_ns, &found)
+            Ok(pacer
+                .pace(t_ns, tracker.observe(t_ns, &found))
                 .into_iter()
                 .map(|s| {
                     Frame::new(
@@ -657,5 +739,208 @@ mod tests {
         assert_eq!(events[0].state, SignalState::New);
         assert_eq!(events[0].first_ns, 0);
         assert_eq!(events[0].center_hz, 404_000_000 + 3 * BIN_HZ as u64);
+    }
+
+    fn bin_center(k: usize) -> i64 {
+        CENTER_HZ as i64 + ((k as f64 - (SIZE / 2) as f64) * BIN_HZ) as i64
+    }
+
+    #[test]
+    fn occupancy_is_over_the_median_and_a_run_needs_energy() {
+        // A 2-bin bump 3 dB over the q = 10 median (under the threshold) and a 3-bin bump
+        // 12 dB over it (36 dB of energy, over 30).
+        let p = DetectParams {
+            threshold_db: 10.0,
+            energy_db: 30.0,
+            ..Default::default()
+        };
+        let r = runs(&view(&row(&[(100, 2, 16), (300, 3, 34)])), &p);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!((r[0].center_hz as i64 - bin_center(301)).abs() <= BIN_HZ as i64);
+        // A row whose median stands 15 dB over floor_db: the floor rule would call every
+        // bin occupied (one run too wide to count); the median rule finds the bump.
+        let mut q = vec![30u8; SIZE];
+        q[300..303].fill(30 + 24);
+        let r = runs(&view(&q), &p);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!((r[0].center_hz as i64 - bin_center(301)).abs() <= BIN_HZ as i64);
+    }
+
+    #[test]
+    fn a_wide_weak_run_under_the_energy_floor_is_not_a_signal() {
+        let p = DetectParams {
+            threshold_db: 10.0,
+            energy_db: 30.0,
+            ..Default::default()
+        };
+        // +11 dB is q 22 over the median.
+        let wide = runs(&view(&row(&[(300, 6, 32)])), &p);
+        assert_eq!(wide.len(), 1, "6 bins at +11 dB = 66 dB: {wide:?}");
+        let narrow = runs(&view(&row(&[(300, 2, 32)])), &p);
+        assert!(narrow.is_empty(), "2 bins at +11 dB = 22 dB: {narrow:?}");
+    }
+
+    #[test]
+    fn the_tracker_needs_three_sightings_before_new() {
+        let p = DetectParams {
+            persist_ms: 1500,
+            ..Default::default()
+        };
+        let r = [run_at(404_000_000)];
+        let mut t = Tracker::new(&p, BIN_HZ);
+        assert!(t.observe(0, &r).is_empty());
+        assert!(t.observe(S, &r).is_empty());
+        let new = t.observe(2 * S, &r);
+        assert_eq!(new.len(), 1, "{new:?}");
+        assert_eq!(new[0].state, SignalState::New);
+        // Two sightings past persist_ms are not enough: the third announces it.
+        let mut t = Tracker::new(&p, BIN_HZ);
+        assert!(t.observe(0, &r).is_empty());
+        assert!(t.observe(2 * S, &r).is_empty());
+        assert_eq!(t.observe(5 * S / 2, &r).len(), 1);
+    }
+
+    #[test]
+    fn a_5_ms_burst_every_second_is_new_after_three_sightings() {
+        let p = DetectParams {
+            persist_ms: 3000,
+            gone_ms: 30000,
+            ..Default::default()
+        };
+        let mut t = Tracker::new(&p, BIN_HZ);
+        let row_ns = S / 20;
+        let mut news = Vec::new();
+        for n in 0..200u64 {
+            let r: &[Run] = if n % 20 == 0 {
+                &[run_at(404_000_000)]
+            } else {
+                &[]
+            };
+            for s in t.observe(n * row_ns, r) {
+                news.push((n * row_ns, s));
+            }
+        }
+        assert_eq!(news.len(), 1, "{news:?}");
+        assert_eq!(news[0].0, 3 * S);
+        assert_eq!(news[0].1.state, SignalState::New);
+    }
+
+    #[test]
+    fn signal_events_are_rate_limited_to_ten_per_second() {
+        let p = DetectParams {
+            persist_ms: 1000,
+            ..Default::default()
+        };
+        let mut t = Tracker::new(&p, BIN_HZ);
+        let mut pacer = Pacer::new(SIGNAL_EVENTS_PER_S);
+        let many: Vec<Run> = (0..100u64)
+            .map(|i| run_at(402_000_000 + i * 20_000))
+            .collect();
+        let row_ns = S / 20;
+        let mut per_s = std::collections::BTreeMap::<u64, usize>::new();
+        let mut total = 0;
+        for n in 0..400u64 {
+            let t_ns = n * row_ns;
+            let out = pacer.pace(t_ns, t.observe(t_ns, &many));
+            total += out.len();
+            *per_s.entry(t_ns / S).or_default() += out.len();
+        }
+        assert_eq!(total, 100);
+        assert!(per_s.values().all(|&n| n <= 10), "{per_s:?}");
+        assert_eq!(per_s.get(&1), Some(&10), "{per_s:?}");
+        assert_eq!(per_s.get(&10), Some(&10), "{per_s:?}");
+    }
+
+    /// Spectrum rows (`(floor_db, q)`) of `iq` at `rate_hz`, `size` bins, 20 a second.
+    fn fft_rows(
+        iq: &[num_complex::Complex<f32>],
+        rate_hz: usize,
+        size: usize,
+    ) -> Vec<(f32, Vec<u8>)> {
+        let fft = crate::fft::CpuFft::new();
+        iq.chunks_exact(rate_hz / 20)
+            .map(|chunk| {
+                let power =
+                    crate::fft::FftBackend::power_sum(&fft, chunk, size, crate::fft::Window::Hann);
+                crate::fft::quantise_row(&power.db())
+            })
+            .collect()
+    }
+
+    const RS41_OFFSET_HZ: f64 = 200_000.0;
+
+    /// Eight synthesised RS41 frames at `RS41_OFFSET_HZ` in a capture of `rate_hz`, under
+    /// white noise `channel_snr_db` below the sonde's power while it transmits, measured
+    /// in a 12.5 kHz channel.
+    fn rs41_capture(rate_hz: usize, channel_snr_db: f64) -> Vec<num_complex::Complex<f32>> {
+        use crate::synth::{Impairments, SynthSpec, awgn, synthesise};
+        let spec = SynthSpec::Rs41 {
+            serial: "S1234567".into(),
+            lat: -27.38,
+            lon: 153.12,
+            alt_m: 12_000.0,
+            vel_v: 5.0,
+            frames: 8,
+        };
+        let imp = Impairments {
+            offset_hz: RS41_OFFSET_HZ,
+            ..Default::default()
+        };
+        let mut iq = synthesise(&spec, &imp, rate_hz as u32, CENTER_HZ);
+        // The noise over the whole capture is the burst power less `channel_snr_db`,
+        // spread over rate / 12 500 channels; `awgn` takes its SNR against the mean
+        // power, gaps between frames included.
+        let power = |s: &num_complex::Complex<f32>| f64::from(s.norm_sqr());
+        let on: Vec<f64> = iq.iter().map(power).filter(|&p| p > 0.0).collect();
+        let burst_p = on.iter().sum::<f64>() / on.len() as f64;
+        let mean_p = iq.iter().map(power).sum::<f64>() / iq.len() as f64;
+        let noise_p = burst_p / 10f64.powf(channel_snr_db / 10.0) * rate_hz as f64 / 12_500.0;
+        awgn(&mut iq, (10.0 * (mean_p / noise_p).log10()) as f32, 7);
+        iq
+    }
+
+    /// The announcements of `runs` and a [`Tracker`] over `iq`'s rows of `size` bins.
+    fn detect_iq(
+        iq: &[num_complex::Complex<f32>],
+        rate_hz: usize,
+        size: usize,
+        p: &DetectParams,
+    ) -> Vec<Signal> {
+        let bin_hz = rate_hz as f64 / size as f64;
+        let mut t = Tracker::new(p, bin_hz);
+        let mut news = Vec::new();
+        for (n, (floor_db, q)) in fft_rows(iq, rate_hz, size).iter().enumerate() {
+            let row = SpectrumRowView {
+                bin_hz,
+                center_hz: CENTER_HZ,
+                floor_db: *floor_db,
+                step_db: crate::fft::STEP_DB,
+                q,
+                masked: &[],
+            };
+            news.extend(t.observe(n as u64 * S / 20, &runs(&row, p)));
+        }
+        news
+    }
+
+    #[test]
+    fn a_6_db_rs41_is_detected() {
+        const RATE: usize = 1_024_000;
+        let news = detect_iq(
+            &rs41_capture(RATE, 6.0),
+            RATE,
+            1024,
+            &DetectParams::default(),
+        );
+        let want = CENTER_HZ + RS41_OFFSET_HZ as u64;
+        assert!(
+            news.iter()
+                .any(|s| s.state == SignalState::New && s.center_hz.abs_diff(want) <= 6_000),
+            "{news:?}"
+        );
+        assert!(
+            news.iter().all(|s| s.center_hz.abs_diff(want) <= 15_000),
+            "{news:?}"
+        );
     }
 }

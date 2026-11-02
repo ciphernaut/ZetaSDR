@@ -76,6 +76,8 @@ One radio: pin or start the watch on the band and let the decoder share the capt
 3. `job context --job WATCH` holds `watch.signals`, `watch.decoding` (the kept decoder's `mode`, `job`, `source`, `since_ns`) and `watch.current` (the identify run in progress). The decoder is an ordinary job in `job list`; its events carry `id`, `position` and `summary`. The watch's own identify runs are owned by it (`owner` in `job list`) and leave no history.
 4. `job stop` on the watch stops its identify run and every decoder it keeps. A decoder whose signal is `gone` and silent for 120 s is stopped by the watch (a landed sonde).
 
+The detector counts a bin occupied when it stands `threshold_db` (6) over the row's median bin, not its floor, and a run as a signal only when its energy, the sum over its bins of dB over that median, reaches `energy_db` (30): a synthesised RS41 at 6 dB channel SNR clears both, and on a noisy receiver raise `energy_db` (with `graph put` on the `detect` node) before `threshold_db`.
+
 `--then-tail` on a watch tails its event stream: frame 1 is the `signal new`, frame 2 the watch's own event.
 
 The identify run is tuned on the detector's centre, which is good to about one fft bin (about 1.5 kHz at 6 MHz), and `rs41mod` decodes only within about 1 kHz of the sonde's centre (measured on synthesised frames: ok at ±1000 Hz, nothing at ±1500 Hz). So the watch may need `identify` to re-centre: when a sonde shows as `signal new` but ends `unknown`, run a `measure` job on the signal's band and start `identify` (or `rs41_decode`) yourself on the measured `center_hz`.
