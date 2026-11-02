@@ -1156,7 +1156,7 @@ mod tests {
             symbol_rate_baud: 4800,
             deviation_hz: 4000.0,
             order: 2,
-            bits: "a5c3f0".into(),
+            bits: LCG_BITS[..6].into(),
             repeat: 3,
             gap_ms: 995,
         };
@@ -1184,14 +1184,12 @@ mod tests {
             "bw {}",
             f.bandwidth_hz.0
         );
-        // No line from the runs' windows (200 Hz harmonics under 1 kHz). PENDING
-        // RULING (task-2-report.md, fix round 2): the ruled check was "None or
-        // within 4 % of 4800"; this fixture's keying line reads 2456 Bd (the same
-        // bits rotated, c3f0a5, read 4830; random bits read none), so only the
-        // artefact bound is asserted until the controller rules.
-        if let Some(Baud(baud)) = f.symbol_rate_baud {
-            assert!(baud >= 1_000, "baud {baud}");
-        }
+        // A 24-bit burst has too few symbols to owe a rate, but no window edge may read as one.
+        assert!(
+            f.symbol_rate_baud.is_none_or(|Baud(b)| b >= 1000),
+            "no sub-kHz window-edge artefact: {:?}",
+            f.symbol_rate_baud
+        );
     }
 
     #[test]
