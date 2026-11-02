@@ -1582,3 +1582,152 @@ async fn a_watch_whose_port_faults_leaves_its_decoders_to_fail_on_their_own() {
     })
     .await;
 }
+
+/// A node over the FSK fixture with the quick rows: every identify ends unknown.
+async fn fsk_node(dir: &Path) -> Arc<Node> {
+    let src = file_source("rx", &fixtures().fsk);
+    let node = node_over(
+        dir,
+        vec![(src.clone() as Arc<dyn Port>, src)],
+        Some(&fixtures().quick_modes),
+    )
+    .await;
+    Arc::new(node)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_unknown_capture_captures_once_per_signal() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(1_000, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let node = fsk_node(dir.path()).await;
+    let params = serde_json::json!({"on_unknown": "capture", "capture": {"bursts": 2}});
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    until("a captured event", Duration::from_secs(60), || {
+        !events.watch("captured").is_empty()
+    })
+    .await;
+    // A retry identifies again; it starts no second capture.
+    until("a second unknown", Duration::from_secs(60), || {
+        events.watch("unknown").len() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let all = events.all();
+    let at = |e: &Value| all.iter().position(|x| x == e).unwrap();
+    let (identifying, unknown) = (events.watch("identifying"), events.watch("unknown"));
+    let (capturing, captured) = (events.watch("capturing"), events.watch("captured"));
+    assert_eq!(capturing.len(), 1, "{all:#?}");
+    assert_eq!(captured.len(), 1, "{all:#?}");
+    assert!(at(&identifying[0]) < at(&unknown[0]), "{all:#?}");
+    assert!(at(&unknown[0]) < at(&capturing[0]), "{all:#?}");
+    assert!(at(&capturing[0]) < at(&captured[0]), "{all:#?}");
+    let child = capturing[0]["job"].as_str().unwrap().to_string();
+    assert!(capturing[0]["signal"]["center_hz"].is_u64(), "{all:#?}");
+    let c = &captured[0];
+    assert_eq!(c["signal"], capturing[0]["signal"], "{c}");
+    let ids: Vec<String> = c["captures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2, "{c}");
+    assert!(c["summary"].as_str().unwrap().contains("captured"), "{c}");
+    // The child inherits the watch's unknown verdict: nothing classified.
+    assert!(c.get("classified").is_none(), "{c}");
+    for id in &ids {
+        let rec = node.bursts().get(id).expect("in the store");
+        assert_eq!(rec.watch, Some(watch.clone()), "{rec:?}");
+        assert_eq!(rec.job, JobId(child.clone()), "{rec:?}");
+        assert_eq!(
+            rec.signal.as_ref().unwrap()["center_hz"],
+            capturing[0]["signal"]["center_hz"],
+            "{rec:?}"
+        );
+        assert!(rec.bandwidth_hz.0 >= 12_500, "{rec:?}");
+    }
+    let ctx = node.job_context(&watch).unwrap();
+    let s = &ctx["watch"]["signals"][0];
+    assert_eq!(s["captures"].as_array().unwrap().len(), 2, "{ctx}");
+    assert_eq!(s["captured"], true, "{ctx}");
+    // The child is gone with no trace in the history.
+    assert!(record(&node, &JobId(child)).is_none());
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bad_capture_block_is_refused_naming_the_field() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let bad = serde_json::json!({"on_unknown": "capture", "capture": {"bursts": "x"}});
+    let g = watch_graph(&node, bad);
+    let e = node
+        .job_start("watch", rx(), capture(), g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("capture.bursts"), "{e}");
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    // The stage's own check: a zero is named too.
+    let zero = serde_json::json!({"capture": {"window_ms": 0}});
+    let g = watch_graph(&node, zero);
+    let e = node
+        .job_start("watch", rx(), capture(), g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("capture.window_ms"), "{e}");
+    // At a put: refused before anything restarts.
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let stream = node.job_outputs(&watch);
+    let mut graph = record(&node, &watch).unwrap().graph;
+    let detect = graph.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params["capture"] = serde_json::json!({"bursts": "x"});
+    let e = node
+        .apply(Op::GraphPut {
+            job: watch.clone(),
+            graph,
+        })
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("capture.bursts"), "{e}");
+    assert_eq!(node.job_outputs(&watch), stream, "nothing restarted");
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_the_watch_stops_a_running_capture_child() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let node = fsk_node(dir.path()).await;
+    let params = serde_json::json!({"on_unknown": "capture", "capture": {"bursts": 32}});
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    until("a capturing event", Duration::from_secs(60), || {
+        !events.watch("capturing").is_empty()
+    })
+    .await;
+    let child = JobId(
+        events.watch("capturing")[0]["job"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
+    assert_eq!(state(&node, &child), Some(JobState::Running));
+    node.job_stop(&watch).await.unwrap();
+    assert_eq!(state(&node, &watch), Some(JobState::Stopped));
+    until("the child ends", Duration::from_secs(5), || {
+        state(&node, &child) != Some(JobState::Running)
+    })
+    .await;
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    until("no lease on rx", Duration::from_secs(5), || {
+        node.lease_holders(&rx()).is_empty()
+    })
+    .await;
+    assert!(events.watch("captured").is_empty(), "{:#?}", events.all());
+}

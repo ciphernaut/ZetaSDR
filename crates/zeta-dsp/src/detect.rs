@@ -65,6 +65,13 @@ pub struct DetectParams {
     pub prefer: Vec<SourceId>,
     /// Watch policy, ignored by the stage: the feed sink's settings, kept as given.
     pub sondehub: Option<serde_json::Value>,
+    /// Watch policy, ignored by the stage: what a `watch` does with a signal whose first
+    /// identify run ends unknown, `report` it or also `capture` its bursts.
+    pub on_unknown: OnUnknown,
+    /// Watch policy, ignored by the stage: the `burst_capture` params (`bursts`,
+    /// `window_ms`, `pre_ms`, `post_ms`, `timeout_ms`) of the capture a `watch` with
+    /// `on_unknown: capture` starts; checked by the graph as that stage's.
+    pub capture: Option<serde_json::Value>,
 }
 
 impl DetectParams {
@@ -96,6 +103,15 @@ pub enum DecodeOn {
     Free,
 }
 
+/// What a `watch` does with an unknown signal (see [`DetectParams::on_unknown`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnUnknown {
+    #[default]
+    Report,
+    Capture,
+}
+
 /// The schema's `edge_mask` default, written as the decimal it is (the `f32` 0.05
 /// would print as 0.05000000074505806).
 fn edge_mask_default() -> f64 {
@@ -116,6 +132,8 @@ impl Default for DetectParams {
             decode_on: DecodeOn::Capture,
             prefer: Vec::new(),
             sondehub: None,
+            on_unknown: OnUnknown::Report,
+            capture: None,
         }
     }
 }

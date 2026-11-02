@@ -90,13 +90,30 @@ pub enum GraphError {
 /// would check its own: `sondehub.<field>: <error>` (or `sondehub: <error>` when no field
 /// is named), `sondehub: sink_sondehub stage not registered` without the stage.
 fn check_sondehub(params: &serde_json::Value, registry: &StageRegistry) -> Result<(), String> {
-    let kind = crate::ops::SONDEHUB_STAGE;
+    check_block("sondehub", crate::ops::SONDEHUB_STAGE, params, registry)
+}
+
+/// The `capture` params of a watch's `detect` node (the `on_unknown: capture` child's),
+/// checked as the `burst_capture` stage would check its own: `capture.<field>: <error>`
+/// (or `capture: <error>` when no field is named).
+fn check_capture(params: &serde_json::Value, registry: &StageRegistry) -> Result<(), String> {
+    check_block("capture", crate::ops::BURST_CAPTURE_STAGE, params, registry)
+}
+
+/// A `detect` node's policy block `block` holding stage `kind`'s params, checked against
+/// that stage's schema and `check_params`, the errors named `<block>.<field>`.
+fn check_block(
+    block: &str,
+    kind: &str,
+    params: &serde_json::Value,
+    registry: &StageRegistry,
+) -> Result<(), String> {
     let Some(spec) = registry.spec(kind) else {
-        return Err(format!("sondehub: {kind} stage not registered"));
+        return Err(format!("{block}: {kind} stage not registered"));
     };
     let named = |field: Option<String>, e: String| match field.filter(|f| !f.is_empty()) {
-        Some(f) => format!("sondehub.{f}: {e}"),
-        None => format!("sondehub: {e}"),
+        Some(f) => format!("{block}.{f}: {e}"),
+        None => format!("{block}: {e}"),
     };
     let schema =
         serde_json::to_value(&spec.params_schema).map_err(|e| named(None, e.to_string()))?;
@@ -109,12 +126,17 @@ fn check_sondehub(params: &serde_json::Value, registry: &StageRegistry) -> Resul
         ));
     }
     registry.check_params(kind, params).map_err(|e| {
-        // The stage's own messages name the field first or in backticks.
+        // The stage's own messages name the field first (`field: ...` or `field ...`) or
+        // in backticks.
         let field = e
             .split('`')
             .nth(1)
             .map(str::to_string)
-            .or_else(|| e.split_whitespace().next().map(str::to_string))
+            .or_else(|| {
+                e.split_whitespace()
+                    .next()
+                    .map(|w| w.trim_end_matches(':').to_string())
+            })
             .filter(|f| f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
         named(field, e)
     })
@@ -146,6 +168,11 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
             && let Some(p) = n.params.get("sondehub").filter(|p| !p.is_null())
         {
             check_sondehub(p, registry).map_err(bad)?;
+        }
+        if n.kind == crate::ops::DETECT_STAGE
+            && let Some(p) = n.params.get("capture").filter(|p| !p.is_null())
+        {
+            check_capture(p, registry).map_err(bad)?;
         }
     }
     let find = |id: &NodeId| graph.nodes.iter().find(|n| &n.id == id);

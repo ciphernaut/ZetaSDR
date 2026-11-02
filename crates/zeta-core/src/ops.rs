@@ -970,6 +970,16 @@ impl JobKind {
                 n.params = old.params.clone();
                 continue;
             }
+            // A `capture` job's `burst_capture` params (the watch's policy block, the
+            // signal it records) are kept whole but for the band, derived again.
+            if n.kind == BURST_CAPTURE_STAGE {
+                let band = n.params.get("bandwidth_hz").cloned();
+                n.params = old.params.clone();
+                if let (Some(band), Some(p)) = (band, n.params.as_object_mut()) {
+                    p.insert("bandwidth_hz".into(), band);
+                }
+                continue;
+            }
             for &key in carried {
                 if let (Some(v), Some(p)) = (old.params.get(key), n.params.as_object_mut())
                     && p.contains_key(key)
@@ -3665,19 +3675,35 @@ fn capture_record(node: &Node, id: &str) -> Result<crate::bursts::CaptureRecord,
 /// allocations the record kept.
 async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
     let rec = capture_record(node, id)?;
-    let path = rec.meta_path.clone();
-    let (meta, samples) = tokio::task::spawn_blocking(move || crate::capture::read_cf32(&path))
-        .await
-        .map_err(other)?
-        .map_err(|e| other(format!("capture {id}: {e}")))?;
-    let allocations: Vec<Allocation> =
-        serde_json::from_value(rec.allocations.clone()).unwrap_or_default();
     let Classification {
         labels,
         tried,
         allocations,
-    } = node
-        .classifiers()
+    } = classify_capture(&node.classifiers(), &rec)
+        .await
+        .map_err(other)?;
+    Ok(OpResult::Classification {
+        labels,
+        tried,
+        allocations,
+    })
+}
+
+/// The classifiers `set` over the capture `rec`'s samples, whole band, with the
+/// allocations the record kept: `capture_classify`, and a hand `capture` job's
+/// end-of-run classify of its first window.
+pub(crate) async fn classify_capture(
+    set: &crate::classify::ClassifierSet,
+    rec: &crate::bursts::CaptureRecord,
+) -> Result<Classification, String> {
+    let path = rec.meta_path.clone();
+    let (meta, samples) = tokio::task::spawn_blocking(move || crate::capture::read_cf32(&path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("capture {}: {e}", rec.id))?;
+    let allocations: Vec<Allocation> =
+        serde_json::from_value(rec.allocations.clone()).unwrap_or_default();
+    Ok(set
         .run_all(
             &samples,
             meta.sample_rate_hz,
@@ -3686,12 +3712,7 @@ async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
             None,
             allocations,
         )
-        .await;
-    Ok(OpResult::Classification {
-        labels,
-        tried,
-        allocations,
-    })
+        .await)
 }
 
 /// Run the classifier set over the selection's band and span of the source ring.

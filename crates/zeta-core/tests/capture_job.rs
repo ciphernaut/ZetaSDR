@@ -10,7 +10,7 @@ use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
-use zeta_core::port::Port;
+use zeta_core::port::{Port, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{Hz, JobId, SourceId, Timestamp};
 use zeta_source_file::{FileOpts, FileSource};
@@ -157,4 +157,112 @@ async fn a_capture_job_ends_stopped_with_its_records_in_the_store() {
         records.iter().map(|r| r.bytes).sum::<u64>()
     );
     assert!(capture["bursts_seen"].as_u64().unwrap() >= BURSTS as u64);
+}
+
+/// A 1200-baud POCSAG page (its carrier on for about 1.5 s) then 0.5 s off, 20 dB over
+/// the noise, at the centre.
+fn pocsag_fixture(dir: &Path) -> std::path::PathBuf {
+    let mut iq = zeta_dsp::synth::pocsag_packet_iq(1_234_567, 3, "HELLO ZETA", 1200, RATE_HZ, 0.0);
+    iq.resize(iq.len() + RATE_HZ as usize / 2, Complex::new(0.0, 0.0));
+    zeta_dsp::synth::awgn(&mut iq, 20.0, 11);
+    let meta = CaptureMeta {
+        sample_rate_hz: Hz(RATE_HZ as u64),
+        center_hz: Hz(CENTER_HZ),
+        start: Timestamp(0),
+        annotations: Vec::new(),
+    };
+    write_cf32(dir, "pocsag", &meta, &iq).expect("write fixture")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hand_capture_classifies_its_first_window_and_a_watch_child_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = pocsag_fixture(dir.path());
+    let source = Arc::new(
+        FileSource::open(
+            SourceId("rx".into()),
+            &meta,
+            FileOpts {
+                realtime: true,
+                block_samples: 4_800,
+                repeat: true,
+                tune_range: None,
+            },
+        )
+        .unwrap(),
+    );
+    let mut registry = StageRegistry::new();
+    registry.register(Arc::new(PassthroughStage::new()));
+    zeta_dsp::register_all(&mut registry);
+    let cfg = NodeConfig {
+        state_dir: dir.path().join("state"),
+        ring_seconds: 4.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
+        backends: vec![Backend::Cpu],
+        resume: true,
+        bank_factory: None,
+        modes_dir: None,
+        burst_policy: Default::default(),
+    };
+    let port: Arc<dyn Port> = source.clone();
+    let node = Node::open(cfg, registry, vec![port]).await.unwrap();
+    for c in zeta_dsp::classifiers(node.modes()) {
+        node.add_classifier(c);
+    }
+    source.start();
+    let tuning = Tuning {
+        center_hz: Hz(CENTER_HZ),
+        bandwidth_hz: Hz(12_500),
+    };
+    let rx = SourceId("rx".into());
+    let mut graph = JobKind::Capture
+        .expand(
+            &rx,
+            tuning,
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    let capture = graph
+        .nodes
+        .iter_mut()
+        .find(|n| n.kind == "burst_capture")
+        .unwrap();
+    capture.params["bursts"] = 1.into();
+    let job = node
+        .job_start(
+            "capture",
+            rx,
+            tuning,
+            graph,
+            Some(Hz(RATE_HZ as u64)),
+            false,
+        )
+        .await
+        .unwrap();
+    until("the capture job ends", Duration::from_secs(30), || {
+        state(&node, &job) != Some(JobState::Running)
+    })
+    .await;
+    assert_eq!(state(&node, &job), Some(JobState::Stopped));
+    let ctx = node.job_context(&job).expect("the context is kept");
+    let capture = &ctx["capture"];
+    assert_eq!(capture["written"].as_array().unwrap().len(), 1, "{ctx}");
+    let classified = &capture["classified"];
+    let labels = classified["labels"].as_array().expect("labels");
+    assert!(
+        labels.iter().any(|l| l["name"] == "POCSAG"),
+        "{classified:#}"
+    );
+    assert!(classified["tried"].is_array(), "{classified:#}");
+    assert!(classified["allocations"].is_array(), "{classified:#}");
+    // A hand capture belongs to no watch. (A watch's child inherits the watch's unknown
+    // verdict instead: `watch.rs`'s `on_unknown_capture_captures_once_per_signal` reads
+    // its `captured` event without `classified`.)
+    let rec = node.bursts().list().into_iter().next().unwrap();
+    assert_eq!(rec.watch, None);
 }

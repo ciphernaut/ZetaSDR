@@ -74,6 +74,14 @@ pub struct BurstCaptureParams {
     /// The channel's band, recorded with each capture and measured in its features;
     /// `null` for the channel's whole rate.
     pub bandwidth_hz: Option<u64>,
+    /// The signal a `watch` captures (centre, width, SNR as detected), recorded with each
+    /// capture; set by the watch, `null` for a hand capture.
+    pub signal: Option<serde_json::Value>,
+    /// The `watch` that started the capture, recorded with each capture.
+    pub watch: Option<JobId>,
+    /// The register's allocations the watch's identify found, recorded with each capture
+    /// (`null`: none, recorded as `[]`).
+    pub allocations: Option<serde_json::Value>,
 }
 
 impl Default for BurstCaptureParams {
@@ -86,6 +94,9 @@ impl Default for BurstCaptureParams {
             timeout_ms: TIMEOUT_MS_DEFAULT,
             whole: false,
             bandwidth_hz: None,
+            signal: None,
+            watch: None,
+            allocations: None,
         }
     }
 }
@@ -546,10 +557,13 @@ async fn write(
         start_ns: cut.start_ns,
         end_ns: cut.end_ns,
         features: features.clone(),
-        signal: None,
+        signal: p.signal.clone(),
         job: job.clone(),
-        watch: None,
-        allocations: serde_json::json!([]),
+        watch: p.watch.clone(),
+        allocations: p
+            .allocations
+            .clone()
+            .unwrap_or_else(|| serde_json::json!([])),
     };
     let store = store.clone();
     let samples = cut.samples;

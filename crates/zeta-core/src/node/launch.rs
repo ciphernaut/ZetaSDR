@@ -979,10 +979,15 @@ pub(super) async fn supervise(
     streams: Vec<StreamId>,
 ) {
     let mut failure = None;
+    // Whether a stage ended the job (not a stop, nothing failing).
+    let mut stage_ended = false;
     while let Some(r) = set.join_next().await {
         match r {
             Ok(Err(StageError::Cancelled)) => {}
-            Ok(Ok(())) => token.cancel(),
+            Ok(Ok(())) => {
+                stage_ended |= !token.is_cancelled();
+                token.cancel();
+            }
             Ok(Err(StageError::Failed(m))) => {
                 failure.get_or_insert(m);
                 token.cancel();
@@ -1005,6 +1010,16 @@ pub(super) async fn supervise(
     let keep = relaunch || !ours;
     // After node shutdown the record must stay `Running` so the job resumes.
     if !inner.shutdown.is_cancelled() && !keep {
+        let capture = inner
+            .jobs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|e| e.record.clone())
+            .filter(|r| r.kind == JobKind::Capture.name());
+        if let Some(rec) = capture {
+            super::capture::capture_finished(&inner, &rec, failure.as_deref(), stage_ended).await;
+        }
         let end = match failure {
             Some(reason) => JobState::Failed { reason },
             None => match inner.input_lost_to_fault(&id) {

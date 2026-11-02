@@ -1,6 +1,7 @@
 //! The node: owns ports, leases, rings and the stream bus, and runs graphs as
 //! persistent jobs that resume after restart.
 
+mod capture;
 mod identify;
 mod jsonlog;
 mod launch;
@@ -304,6 +305,9 @@ struct Inner {
     /// `watch`) takes them: an owned record is dropped as soon as it ends, context and
     /// all (see [`Inner::prune_history`]).
     verdicts: Mutex<HashMap<JobId, serde_json::Value>>,
+    /// How owned `capture` runs ended (`{capture, failed}`, see [`capture::capture_finished`]),
+    /// by capture id, until their watch takes them: as `verdicts`, the record goes at its end.
+    captured: Mutex<HashMap<JobId, serde_json::Value>>,
     /// The open fault episode of each source whose port the node has seen faulted and
     /// not yet recovered (see [`recover::Episode`]). Locked after `jobs` when both are
     /// held, never the other way round.
@@ -834,6 +838,7 @@ impl Node {
                 mix_gate: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
                 verdicts: Mutex::new(HashMap::new()),
+                captured: Mutex::new(HashMap::new()),
                 episodes: Mutex::new(HashMap::new()),
             }),
             load_errors,

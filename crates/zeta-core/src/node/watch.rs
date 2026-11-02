@@ -9,12 +9,15 @@
 //! `graph_put` restart or a node restart re-adopts the decoders from the persisted
 //! context instead: those whose job no longer runs are dropped, those whose signal does
 //! not reappear within the detector's `gone_ms` are stopped. An unknown signal is tried
-//! again after [`RETRY_MS`] while it persists, at most [`RETRY_MAX`] times.
+//! again after [`RETRY_MS`] while it persists, at most [`RETRY_MAX`] times; with
+//! `on_unknown: capture` its bursts are captured once per run by an owned `capture`
+//! child (see [`capture`]).
 //!
 //! Events, `protocol: "watch"`, go on the job's event stream beside `detect`'s `signal`
-//! events: `state` `identifying | decoding | unknown | lost`, with `signal`, `job`,
-//! `mode`, `source`, `placed` (`capture | free`), `features` (for `unknown`), `summary`
-//! and `t_ns` (fields that do not apply are `null`).
+//! events: `state` `identifying | decoding | unknown | lost | capturing | captured`, with
+//! `signal`, `job`, `mode`, `source`, `placed` (`capture | free`), `features` and
+//! `allocations` (for `unknown`), `captures` (for `captured`), `summary` and `t_ns`
+//! (fields that do not apply are `null`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,6 +39,8 @@ use crate::port::{Port, Tuning};
 use crate::stage::StageError;
 use crate::stream::{Frame, Payload};
 use crate::types::{Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind};
+
+mod capture;
 
 /// How long after an `unknown` verdict a signal that persists is identified again.
 pub const RETRY_MS: u64 = 60_000;
@@ -175,6 +180,9 @@ pub(super) struct Policy {
     /// The `sink_sondehub` params every decoder graph the watch starts gets a sink with
     /// (`sondehub` in the `detect` node's params; none appends nothing).
     sondehub: Option<serde_json::Value>,
+    /// With `on_unknown: capture`, the `burst_capture` params (the `capture` block, `{}`
+    /// for the defaults) of the capture an unknown signal gets; `None` with `report`.
+    capture: Option<serde_json::Value>,
 }
 
 impl Policy {
@@ -199,6 +207,10 @@ impl Policy {
                 .unwrap_or_default(),
             gone_ms: p["gone_ms"].as_u64().unwrap_or(DETECT_GONE_MS_DEFAULT),
             sondehub: Some(p["sondehub"].clone()).filter(|v| !v.is_null()),
+            capture: (p["on_unknown"] == "capture").then(|| match &p["capture"] {
+                serde_json::Value::Null => serde_json::json!({}),
+                v => v.clone(),
+            }),
         }
     }
 }
@@ -258,6 +270,12 @@ struct Tracked {
     /// The last unknown verdict's register answer (identify's `allocations`).
     #[serde(default)]
     allocations: Option<serde_json::Value>,
+    /// Whether this run has started a capture of it (`on_unknown: capture`).
+    #[serde(default)]
+    captured: bool,
+    /// The captures its capture wrote.
+    #[serde(default)]
+    captures: Vec<String>,
 }
 
 /// What came of giving a kept decoder the `sondehub` sink.
@@ -377,6 +395,11 @@ struct State {
     subs: HashMap<JobId, Vec<Receiver<Frame>>>,
     /// A proved decoder while it is placed: neither `current` nor in `decoding` yet.
     pending: Option<JobId>,
+    /// The capture children running, with the signal each is on.
+    capturing: Vec<(JobId, Signal)>,
+    /// The signals this run has captured, with what each capture wrote: a signal that
+    /// goes and comes back is not captured again.
+    captured: Vec<(Signal, Vec<String>)>,
     /// Set until [`watch_loop`]'s exit path has run: any other end of the state (a panic
     /// unwinding the loop) tears down what it started from a task the drop spawns.
     guard: Option<Guard>,
@@ -402,26 +425,35 @@ impl Drop for State {
             .into_iter()
             .map(|d| (d.job, d.source))
             .collect();
+        let captures = std::mem::take(&mut self.capturing)
+            .into_iter()
+            .map(|(j, _)| j)
+            .collect();
         rt.spawn(async move {
             let source = port.id().clone();
-            release(&inner, &source, current, pending, decoders).await;
+            release(&inner, &source, current, pending, decoders, captures).await;
             inner.leases.idle_if_unheld(port.as_ref()).await;
         });
     }
 }
 
 /// Stop what a run of the watch on `source` started: the identify run `current` (and the
-/// decoder a proof it landed left, never adopted), a proved decoder being placed, and
-/// `decoders`. Gated on `source` (the watch's lease is held meanwhile, so there is
-/// nothing to idle, and a `replace` holding the gate never waits on it), plainly on
-/// another source.
+/// decoder a proof it landed left, never adopted), a proved decoder being placed,
+/// `decoders` and the capture children `captures`. Gated on `source` (the watch's lease
+/// is held meanwhile, so there is nothing to idle, and a `replace` holding the gate never
+/// waits on it), plainly on another source.
 async fn release(
     inner: &Arc<Inner>,
     source: &SourceId,
     current: Option<JobId>,
     pending: Option<JobId>,
     decoders: Vec<(JobId, SourceId)>,
+    captures: Vec<JobId>,
 ) {
+    for id in captures {
+        let _ = inner.stop_gated(&id).await;
+        inner.captured.lock().unwrap().remove(&id);
+    }
     if let Some(id) = current {
         let _ = inner.stop_gated(&id).await;
         let verdict = inner.verdicts.lock().unwrap().remove(&id);
@@ -465,6 +497,8 @@ struct Event<'a> {
     features: Option<serde_json::Value>,
     /// The register's allocations for an `unknown` (the identify verdict's).
     allocations: Option<serde_json::Value>,
+    /// The captures a `captured` lists.
+    captures: Option<&'a [String]>,
 }
 
 impl Inner {
@@ -486,6 +520,7 @@ impl Inner {
             "placed": e.placed.map(Placed::as_str),
             "features": e.features,
             "allocations": e.allocations,
+            "captures": e.captures,
             "summary": summary,
             "t_ns": t.0,
         });
@@ -981,6 +1016,8 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
         current: None,
         subs: HashMap::new(),
         pending: None,
+        capturing: Vec::new(),
+        captured: Vec::new(),
         guard: Some(Guard {
             inner: inner.clone(),
             port: r.port.clone(),
@@ -999,9 +1036,16 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
     let shutdown = inner.shutdown.is_cancelled();
     let port_faulted = r.port.fault().is_some();
     let teardown = !shutdown && !inner.restarting(&r.id) && !port_faulted;
-    let (current, pending) = match shutdown {
-        true => (None, None),
-        false => (w.current.take().map(|(j, _)| j), w.pending.take()),
+    let (current, pending, captures) = match shutdown {
+        true => (None, None, Vec::new()),
+        false => (
+            w.current.take().map(|(j, _)| j),
+            w.pending.take(),
+            std::mem::take(&mut w.capturing)
+                .into_iter()
+                .map(|(j, _)| j)
+                .collect(),
+        ),
     };
     let decoders = match teardown {
         true => std::mem::take(&mut w.decoding)
@@ -1010,7 +1054,7 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
             .collect(),
         false => Vec::new(),
     };
-    release(&inner, &r.prov.source, current, pending, decoders).await;
+    release(&inner, &r.prov.source, current, pending, decoders, captures).await;
     if teardown {
         w.signals.clear();
     }
@@ -1061,6 +1105,7 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
             return cancelled();
         }
         changed |= decoders(inner, r, w).await;
+        changed |= capture::ended(inner, r, w);
         if w.current.is_none() {
             sweep(inner, r, w).await;
             match next(inner, r, w).await {
@@ -1139,7 +1184,10 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                     score,
                     features: None,
                     allocations: None,
+                    captured: false,
+                    captures: Vec::new(),
                 });
+                capture::seen_before(w);
             }
             (false, Some(i)) => {
                 let on = w
@@ -1152,7 +1200,13 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                         w.signals[i].signal.bandwidth_hz,
                     )
                 });
-                match on || decoded {
+                let capturing = w.capturing.iter().any(|(_, c)| {
+                    c.overlaps(
+                        w.signals[i].signal.center_hz,
+                        w.signals[i].signal.bandwidth_hz,
+                    )
+                });
+                match on || decoded || capturing {
                     true => w.signals[i].present = false,
                     false => {
                         w.signals.remove(i);
@@ -1309,6 +1363,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         ..Event::default()
     };
     inner.watch_event(r, "unknown", summary, e);
+    capture::on_unknown(inner, r, w, i).await;
     true
 }
 
@@ -1470,10 +1525,13 @@ async fn sweep(inner: &Arc<Inner>, r: &Run, w: &State) {
         .filter(|e| e.record.owner.as_ref() == Some(&r.id))
         .filter(|e| e.record.state == JobState::Running && e.cancel.is_some())
         .filter(|e| !w.decoding.iter().any(|d| d.job == e.record.id))
+        .filter(|e| !w.capturing.iter().any(|(j, _)| *j == e.record.id))
         .map(|e| e.record.id.clone())
         .collect();
     for id in strays {
         let _ = inner.stop_gated(&id).await;
+        // A stale capture child's end is nobody's to report.
+        inner.captured.lock().unwrap().remove(&id);
     }
 }
 
