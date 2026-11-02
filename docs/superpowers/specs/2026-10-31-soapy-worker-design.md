@@ -238,6 +238,8 @@ One supervisor task per `WorkerPort`, owning the child. Its loop:
    lived 60 s. A device-not-found exit polls at the cap at once (it is the common long wait). The
    loop never gives up: a radio unplugged for an hour comes back after an hour.
 
+2026-11-02: the hello no longer ends the fault at once. It moves to a held fault that `fault()` keeps reporting (a tune does not clear it) until the node calls `Port::heal_settled`, so a crash shorter than a job's poll of the fault still fails the job; `reap` clears it too.
+
 Logging, once per episode, so a long unplug does not flood the log: `zeta: soapy worker for <id>:
 <fault>; waiting for the device` on the first end, `zeta: soapy worker for <id>: back after <n>
 attempts, <s> s` on the hello that heals. A respawn whose worker dies again logs at most once per
@@ -283,6 +285,7 @@ reports `healed`:
    this is a tune of the same band), then relaunches the **recoverable** records of that source with
    the resume machinery (`resume_captures` for this source only, then `launch` in resume order),
    then the attached records whose input now runs, and releases the hold.
+   2026-11-02: when the port still holds its fault, `recover_source` opens the episode, waits (at most 10 s, logging `zeta: source <id>: recovery: job <ids> did not end in 10 s; left running`) for the running jobs that poll the fault as well as the failed ones, then calls `heal_settled` under the gate. A `job_start` in that hold is accepted, and its job may fail and be relaunched under its id. A bump before the port is attached is taken for a heal, which the hold relies on.
 3. A record is recoverable when it is `Failed` with a reason starting `source <id>: ` **and** it
    failed during the current fault episode. Every way a port fault fails a job carries that prefix:
    `forward_iq`, the scan loop and the watch loop do today; the launch-time tune failure

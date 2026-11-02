@@ -288,6 +288,32 @@ async fn a_crash_shorter_than_the_fault_poll_still_relaunches_the_job() {
     let _ = node.job_stop(&job).await;
 }
 
+/// A heal before the port is attached still counts: the watcher's first look takes it,
+/// and only that recovery ends the fault the port holds after the hello.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_heal_before_the_port_is_attached_ends_the_held_fault() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = format!("file {},crash-after-ms 100", pocsag().meta.display());
+    let rec = dir.path().join("record");
+    let mut crashing = cfg(&script, &rec, "ZETA_FAKE_CRASH_ONCE=1");
+    crashing.timings = timings_backoff(Duration::from_millis(1));
+    let (port, attach) = WorkerPort::open(crashing, None).await.unwrap();
+    assert_eq!(attach, Attach::Hello);
+    let healed = port.healed().unwrap();
+    until("the worker is back", Duration::from_secs(5), || {
+        *healed.borrow() == 1
+    })
+    .await;
+    assert!(port.fault().is_some(), "held until the node has seen it");
+
+    let node = node_over(&dir.path().join("state"), port.clone()).await;
+    until("the node ends the fault", Duration::from_secs(5), || {
+        port.fault().is_none()
+    })
+    .await;
+    assert_eq!(source(&node).await.fault, None);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_with_the_device_absent_attaches_faulted_when_seen_before() {
     let dir = tempfile::tempdir().unwrap();

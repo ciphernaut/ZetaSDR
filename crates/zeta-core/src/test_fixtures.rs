@@ -28,6 +28,8 @@ pub struct FaultablePort {
     inner: Arc<dyn Port>,
     fault: Mutex<Option<String>>,
     healed: tokio::sync::watch::Sender<u64>,
+    /// Set by [`FaultablePort::heal_held`]: [`Port::heal_settled`] ends the fault.
+    held: Mutex<bool>,
     gain: Mutex<Option<f64>>,
     gains: Mutex<Vec<Option<f64>>>,
 }
@@ -38,6 +40,7 @@ impl FaultablePort {
             inner,
             fault: Mutex::new(None),
             healed: tokio::sync::watch::channel(0).0,
+            held: Mutex::new(false),
             gain: Mutex::new(Some(GAIN_RANGE_DB.0)),
             gains: Mutex::new(Vec::new()),
         })
@@ -53,6 +56,13 @@ impl FaultablePort {
     /// again does.
     pub fn heal(&self) {
         self.set_fault(None);
+        self.healed.send_modify(|n| *n += 1);
+    }
+
+    /// Bump the healed counter and keep reporting the fault until [`Port::heal_settled`],
+    /// as a worker back quicker than the node's polls does.
+    pub fn heal_held(&self) {
+        *self.held.lock().unwrap() = true;
         self.healed.send_modify(|n| *n += 1);
     }
 
@@ -121,6 +131,11 @@ impl Port for FaultablePort {
     }
     fn healed(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.healed.subscribe())
+    }
+    fn heal_settled(&self) {
+        if std::mem::take(&mut *self.held.lock().unwrap()) {
+            self.set_fault(None);
+        }
     }
     fn worker(&self) -> Option<WorkerInfo> {
         Some(WorkerInfo {

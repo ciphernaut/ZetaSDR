@@ -229,6 +229,7 @@ impl Inner {
         // A `watch`'s controller runs beside its stages (see `super::watch`).
         let watch =
             (rec.kind == JobKind::Watch.name()).then(|| (watch::Seed::of(&rec), rec.tuning));
+        let attached = rec.input.is_some();
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.
         let (prov, run, ended) = self.record_running(rec, &token)?;
 
@@ -244,6 +245,7 @@ impl Inner {
             !st.spec().inputs.is_empty() && !graph.edges.iter().any(|e| e.to == n.id)
         });
         let iq = (roots && port.is_some()).then(|| self.bus.register(StreamKind::Iq, prov.clone()));
+        let blind = iq.is_none() && watch.is_none() && !attached;
         let mut streams: Vec<StreamId> = edge_streams.iter().cloned().chain(iq.clone()).collect();
         // The job's output streams (no edge consumes them), in graph order: what a job
         // attached to this one can read.
@@ -349,6 +351,7 @@ impl Inner {
         {
             e.done = Some(h);
             e.outputs = job_outputs;
+            e.blind = blind;
         }
         Ok(())
     }
@@ -678,6 +681,7 @@ impl Inner {
                 done: None,
                 ended: Some(ended_rx),
                 outputs: Vec::new(),
+                blind: false,
                 relaunch: false,
                 gated_stop: false,
                 released: false,

@@ -123,6 +123,32 @@ impl Stage for FailStage {
     }
 }
 
+/// A stage with no input, publishing nothing until it is cancelled: a job of this alone
+/// has no IQ forwarder, so nothing in it polls the port's fault.
+struct IdleStage(StageSpec);
+
+#[async_trait]
+impl Stage for IdleStage {
+    fn spec(&self) -> &StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        _inputs: Vec<broadcast::Receiver<Frame>>,
+        _outputs: Vec<StreamId>,
+        _bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        cancel.cancelled().await;
+        Err(StageError::Cancelled)
+    }
+}
+
 fn audio() -> Payload {
     Payload::Audio {
         sample_rate_hz: Hz(48_000),
@@ -182,6 +208,12 @@ fn registry() -> StageRegistry {
         kind: "fail_now",
         inputs: vec![StreamKind::Iq],
         outputs: vec![StreamKind::Event],
+        params_schema: schemars::json_schema!({"type": "object"}),
+    })));
+    r.register(Arc::new(IdleStage(StageSpec {
+        kind: "idle_src",
+        inputs: vec![],
+        outputs: vec![StreamKind::Audio],
         params_schema: schemars::json_schema!({"type": "object"}),
     })));
     zeta_dsp::register_all(&mut r);
@@ -553,6 +585,41 @@ async fn an_attached_job_comes_back_with_its_input() {
     let mut rx = node.bus().subscribe(&stream).unwrap();
     let frame = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
     assert!(matches!(frame, Ok(Ok(_))), "{frame:?}");
+    stop_all(&node).await;
+}
+
+/// A running job with no IQ forwarder never polls the fault, so it (and a job attached to
+/// it) is not waited for: the job that does end is relaunched at once, not after the
+/// 10 s bound, and the two are left as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_fault_does_not_wait_for_a_job_with_no_forwarder() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port, _srcs) = node_on(dir.path(), true, &[]).await;
+    let idle = start(&node, "s", "idle_src", serde_json::json!({})).await;
+    let op = Op::JobAttach {
+        kind: JobKind::Transcribe,
+        job: idle.clone(),
+        language: None,
+    };
+    let attached = match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("job_attach: {r:?}"),
+    };
+    let fed = start_passthrough(&node, "s").await;
+    let (fed_before, idle_before) = (node.job_outputs(&fed), node.job_outputs(&idle));
+
+    port.set_fault(Some(UNPLUGGED.into()));
+    port.heal_held();
+    until(
+        "the fed job is relaunched well inside the 10 s bound",
+        Duration::from_secs(5),
+        || state(&node, &fed) == Some(JobState::Running) && node.job_outputs(&fed) != fed_before,
+    )
+    .await;
+    assert_eq!(port.fault(), None);
+    assert_eq!(state(&node, &idle), Some(JobState::Running));
+    assert_eq!(state(&node, &attached), Some(JobState::Running));
+    assert_eq!(node.job_outputs(&idle), idle_before);
     stop_all(&node).await;
 }
 

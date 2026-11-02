@@ -40,7 +40,9 @@ pub enum Op {
     /// rigid lease holders' job ids), `elastic` (the jobs following the
     /// capture, see `job_start`), `pin` (the band `source_pin` holds the source
     /// at, `null` for none), `fault`, the source's unrecoverable failure (`null` when
-    /// healthy), `bank`, the channel bank shared by the capture's channels
+    /// healthy; a healed fault stays until recovery has seen the jobs end, normally up to
+    /// one poll after the worker's hello, and a `job_start` in that hold is accepted, its
+    /// job possibly failing and being relaunched under its id), `bank`, the channel bank shared by the capture's channels
     /// (`bin_hz`, `consumers`, `dropped`, the input blocks it dropped because it could
     /// not keep up; `null` for none), `gain`, the overall receive
     /// gain (`db`, `null` while automatic; `min_db`, `max_db`, `automatic`,

@@ -475,37 +475,59 @@ impl Inner {
     /// Wait (up to [`ENDED_WAIT`]) for every failed record of `source` whose run is
     /// still ending to release its lease and streams, so its supervisor never releases
     /// the lease of the run a recovery starts in its place. With `running`, the port still
-    /// reports its fault, so every job on the source is about to fail of it (an attached
-    /// one with its input): those are waited for too.
+    /// reports its fault, so every job on the source that polls it is about to fail of it
+    /// (an attached one with its input): those are waited for too. A blind run
+    /// ([`JobEntry::blind`]) and a job attached to one never end of a fault, so they are
+    /// not, and do not delay the others. One that outwaits the bound is logged.
     async fn wait_ended(&self, source: &SourceId, running: bool) {
-        let ending: Vec<_> = self
-            .jobs
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|e| &e.record.source == source)
-            .filter(|e| match e.record.state {
-                JobState::Failed { .. } => true,
-                JobState::Running => running,
-                _ => false,
-            })
-            .filter_map(|e| e.ended.clone())
-            .collect();
+        let mut ending: Vec<_> = {
+            let jobs = self.jobs.lock().unwrap();
+            let blind = |e: &JobEntry| {
+                e.blind
+                    || e.record
+                        .input
+                        .as_ref()
+                        .and_then(|input| jobs.get(input))
+                        .is_some_and(|input| input.blind)
+            };
+            jobs.values()
+                .filter(|e| &e.record.source == source)
+                .filter(|e| match e.record.state {
+                    JobState::Failed { .. } => true,
+                    JobState::Running => running && !blind(e),
+                    _ => false,
+                })
+                .filter_map(|e| Some((e.record.id.clone(), e.ended.clone()?)))
+                .collect()
+        };
         let all = async {
-            for mut ended in ending {
+            for (_, ended) in &mut ending {
                 // Closed once the run has released (`Err`), which is all this waits for.
                 while ended.changed().await.is_ok() {}
             }
         };
-        let _ = tokio::time::timeout(ENDED_WAIT, all).await;
+        if tokio::time::timeout(ENDED_WAIT, all).await.is_err() {
+            let late: Vec<_> = ending
+                .iter()
+                .filter(|(_, ended)| ended.has_changed().is_ok())
+                .map(|(id, _)| id.0.as_str())
+                .collect();
+            eprintln!(
+                "zeta: source {}: recovery: job {} did not end in {} s; left running",
+                source.0,
+                late.join(","),
+                ENDED_WAIT.as_secs()
+            );
+        }
     }
 }
 
 /// Recover `source` (see [`Inner::recover_source`]) on every bump of its port's healed
 /// counter `rx` to a value above 0, until the node shuts down or the port drops the
-/// counter. Subscribed when the port is attached, so a bump before that is not taken
-/// for a heal; the `> 0` guard keeps a counter that starts at 0 from recovering a
-/// source that never faulted.
+/// counter. `rx` has seen nothing when the port is attached, so a bump before that is
+/// taken for a heal too, on the first look: a port holding its fault until
+/// [`Port::heal_settled`] relies on it. The `> 0` guard keeps a counter that starts at 0
+/// from recovering a source that never faulted.
 pub(super) async fn watch_healed(
     inner: Arc<Inner>,
     source: SourceId,

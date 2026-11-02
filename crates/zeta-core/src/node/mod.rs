@@ -163,6 +163,10 @@ struct JobEntry {
     /// (each node's in its stage's output order), set at launch; an attached job reads
     /// one of these.
     outputs: Vec<(StreamKind, StreamId)>,
+    /// Set at launch for a run nothing in which polls its port's fault: it has no IQ
+    /// forwarder and no controller loop, and is not attached. A fault does not end it, so
+    /// a recovery does not wait for it (see [`Inner::wait_ended`]).
+    blind: bool,
     /// Set while the job is relaunched under its id, by [`Inner::relaunch_elastic`] (an
     /// elastic job on a new capture), by [`Inner::relaunch_in_place`] (a
     /// `job_retune`) or by [`Inner::hold_attached`] (an attached job whose input is
@@ -195,6 +199,7 @@ impl JobEntry {
             done: None,
             ended: None,
             outputs: Vec::new(),
+            blind: false,
             relaunch: false,
             gated_stop: false,
             released: false,
