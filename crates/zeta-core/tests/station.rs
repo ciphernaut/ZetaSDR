@@ -45,11 +45,11 @@ async fn station_set_persists_and_get_reads_it_after_reopen() {
     let node = open(dir.path()).await;
     assert_eq!(node.station().unwrap().lat, -27.38);
     assert!(matches!(
-        node.apply(Op::StationClear).await.unwrap(),
+        node.apply(Op::StationClear {}).await.unwrap(),
         OpResult::Station(None)
     ));
     assert!(matches!(
-        node.apply(Op::StationGet).await.unwrap(),
+        node.apply(Op::StationGet {}).await.unwrap(),
         OpResult::Station(None)
     ));
     drop(node);
@@ -123,4 +123,11 @@ fn duplicate_ids_are_refused() {
     };
     s.antennas[1].id = "dipole".into();
     assert!(s.validate().unwrap_err().starts_with("antennas[1].id"));
+}
+
+#[test]
+fn an_unknown_field_on_a_fieldless_station_op_is_rejected() {
+    assert!(serde_json::from_str::<Op>(r#"{"op":"station_get","x":1}"#).is_err());
+    assert!(serde_json::from_str::<Op>(r#"{"op":"station_clear","x":1}"#).is_err());
+    assert!(serde_json::from_str::<Op>(r#"{"op":"station_get"}"#).is_ok());
 }

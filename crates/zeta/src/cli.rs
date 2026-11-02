@@ -1129,8 +1129,8 @@ impl Command {
                     number_antennas(all)
                 }),
             },
-            Command::Station(StationCmd::Get) => Op::StationGet,
-            Command::Station(StationCmd::Clear) => Op::StationClear,
+            Command::Station(StationCmd::Get) => Op::StationGet {},
+            Command::Station(StationCmd::Clear) => Op::StationClear {},
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Classify(s) => Op::Classify {

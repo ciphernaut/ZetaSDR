@@ -218,9 +218,9 @@ pub enum Op {
         antennas: Option<Vec<crate::station::Antenna>>,
     },
     /// The station, or `null` when none is set.
-    StationGet,
+    StationGet {},
     /// Forget the station (`station.json` is removed).
-    StationClear,
+    StationClear {},
     /// Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on
     /// the channels numbered in `channels`, each at its channel's `center_hz` with the
     /// plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's
@@ -1952,8 +1952,8 @@ impl Op {
             Op::JobRetune { .. } => "job_retune",
             Op::MixStart { .. } => "mix_start",
             Op::StationSet { .. } => "station_set",
-            Op::StationGet => "station_get",
-            Op::StationClear => "station_clear",
+            Op::StationGet {} => "station_get",
+            Op::StationClear {} => "station_clear",
             Op::PlanStart { .. } => "plan_start",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
@@ -1990,7 +1990,7 @@ impl Op {
                 | Op::ChannelPlans {}
                 | Op::ModesList { .. }
                 | Op::ModesShow { .. }
-                | Op::StationGet
+                | Op::StationGet {}
         )
     }
 
@@ -2890,8 +2890,8 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 .map(|s| OpResult::Station(Some(s)))
                 .map_err(|e| node_error(node, e))
         }
-        Op::StationGet => Ok(OpResult::Station(node.station())),
-        Op::StationClear => node
+        Op::StationGet {} => Ok(OpResult::Station(node.station())),
+        Op::StationClear {} => node
             .clear_station()
             .await
             .map(|()| OpResult::Station(None))

@@ -1690,14 +1690,6 @@ impl Node {
         let _ = self.inner.relaunch_elastic(source, None).await;
     }
 
-    /// Hold `source` at `want` without a job: a rigid lease under
-    /// [`crate::lease::pin_holder`] that is never listed among the holders. Under
-    /// one hold of the source's gate the `replace` jobs are stopped (see
-    /// [`Node::replace_holders`]), any existing pin is set aside and the band is
-    /// leased as a rigid request; a conflict keeps the old pin. The pin is then
-    /// persisted in `sources/<id>.json`; a write that fails releases it and is
-    /// `Io`. A tune relaunches the elastic jobs there once the gate is let go.
-    /// The result is the capture, as `source_ensure`'s.
     /// The node's station, when one is set.
     pub fn station(&self) -> Option<crate::station::Station> {
         self.inner.station.lock().unwrap().clone()
@@ -1721,6 +1713,14 @@ impl Node {
         Ok(())
     }
 
+    /// Hold `source` at `want` without a job: a rigid lease under
+    /// [`crate::lease::pin_holder`] that is never listed among the holders. Under
+    /// one hold of the source's gate the `replace` jobs are stopped (see
+    /// [`Node::replace_holders`]), any existing pin is set aside and the band is
+    /// leased as a rigid request; a conflict keeps the old pin. The pin is then
+    /// persisted in `sources/<id>.json`; a write that fails releases it and is
+    /// `Io`. A tune relaunches the elastic jobs there once the gate is let go.
+    /// The result is the capture, as `source_ensure`'s.
     pub async fn source_pin(
         &self,
         source: &SourceId,
