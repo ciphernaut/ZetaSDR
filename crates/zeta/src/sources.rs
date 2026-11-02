@@ -404,7 +404,20 @@ pub fn parse_knowledge_acma(s: &str) -> Result<(String, Option<f64>), String> {
             }
         }
     };
-    Ok((url.to_owned(), reach))
+    // The client appends `/mcp` and `/health` itself: take the base URL, and accept the
+    // `.mcp.json` form with its trailing `/mcp`.
+    let base = url
+        .strip_suffix("/mcp/")
+        .or_else(|| url.strip_suffix("/mcp"))
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let after_scheme = base.split_once("://").map_or("", |(_, r)| r);
+    if after_scheme.is_empty() || after_scheme.contains('/') {
+        return Err(bad(&format!(
+            "the URL must be http(s)://HOST:PORT without a path (a trailing /mcp is accepted), got {url:?}"
+        )));
+    }
+    Ok((base.to_owned(), reach))
 }
 
 #[cfg(test)]
@@ -418,10 +431,16 @@ mod tests {
             Ok(("http://h:1".into(), Some(20.0)))
         );
         assert_eq!(
-            parse_knowledge_acma("https://h/mcp"),
-            Ok(("https://h/mcp".into(), None))
+            parse_knowledge_acma("https://h:2/mcp"),
+            Ok(("https://h:2".into(), None))
+        );
+        assert_eq!(
+            parse_knowledge_acma("http://h:1/mcp/,reach_km=5"),
+            Ok(("http://h:1".into(), Some(5.0)))
         );
         for bad in [
+            "http://h:1/other",
+            "http://h:1/mcp/x",
             "ftp://x",
             "h:1",
             "http://h,reach_km=0",

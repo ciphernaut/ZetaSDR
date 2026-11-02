@@ -161,6 +161,7 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         path: capture,
         tune_range: None,
     };
+    // No knowledge provider (`--knowledge-acma`) is attached here: a row check needs none.
     let opened = node_setup::open_with(
         scratch.join("state"),
         ctx.registry.clone(),
