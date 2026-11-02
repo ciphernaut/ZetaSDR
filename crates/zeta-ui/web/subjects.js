@@ -14,15 +14,20 @@
 //     store.rowOf(kind) -> row | null | undefined (undefined: not yet known)
 //     store.event(job, payload) -> subject | null   merges the event: non-null, non-blank fields
 //         into `state`, the fix into `position`, `count` and `last_seen`. Null when the job's row has
-//         no subject, the job has an `owner` (a watch's or identify's trial) or the key is null,
-//         absent or blank: such an event is unkeyed.
+//         no subject, the job has an `owner` (a watch's run or its trial) or is a running identify's
+//         current trial (`context.identify.current`, as of the last `sync`), or the key is not a
+//         string, number or boolean, or is blank: such an event is unkeyed. The key is trimmed.
 //     store.subjectOf(job, payload) -> subject | null   the same test and lookup, no merge
-//     store.sync(jobs)   drops the subjects of jobs not `running`
-//     store.list(jobId) -> subject[]   least recently heard first
+//     store.sync(jobs)   drops the subjects of jobs not `running`; notes the running identifies'
+//         current trials
+//     store.isTrial(jobId) -> bool   a running identify's current trial
+//     store.list(jobId) -> subject[]   least recently heard first, a copy (never per message)
+//     store.size(jobId) -> number
 //     store.lastHeard(jobId) -> subject | null
 //     store.held(jobId, key | null) -> bool   the subject (with null, any of the job's) is not dim
 //     store.select(jobId, key), store.selected() -> {job, key} | null
 //     store.onChange(cb)   any merge, dim or drop, and a row learned
+//     store.onLearn(cb)   a row learned, after onChange's
 //     store.onTick(cb)   each second, after dim and drop are checked
 //     store.onDrop(cb(jobId, key)), store.onSelect(cb(sel)), store.destroy()
 //     A subject past view `subject_dim_s` of silence is dim, past `subject_drop_s` dropped
@@ -40,13 +45,20 @@
 //     One `section.subject-job[data-job]` per running job with subjects or whose row has table
 //     columns, so a job heard nothing from yet says `0 aircraft` (an `h3` and a table of
 //     `tr.subject[data-job][data-key]`, classes `dim` and `selected`), and one for a subject job
-//     `watching(id)` denies, with `.not-watched`, after the watched ones. `th[data-col]` sorts: a
-//     first click ascending, a second reversed, nulls last either way (default last seen, newest
-//     first), kept for as long as the job is listed. A click on a
-//     row selects it, and a selection (from here or the map) scrolls its row into view.
-//     Redrawn at most every RENDER_MS on a change, and each second. Cells are
-//     written only when they differ, so a tooltip outlives a redraw. All text by textContent.
-//     pane.eligible() -> bool   a running job's row has table columns (app.js shows the pane)
+//     `watching(id)` denies, with `.not-watched`, after the watched ones. The default order is
+//     last seen in SORT_STEP_MS steps, newest step first, then the key, so a busy table does not
+//     churn. `th[data-col]` sorts exactly: a first click ascending, a second reversed, nulls last
+//     either way, kept for as long as the job is listed. While the pointer is over a job's table
+//     its rows keep their order (a header click sorts once, a new row goes last), resuming on
+//     leave. A press (`pointerdown`) on a row selects it, so a row moving cannot lose a click, and
+//     a selection (from here or the map) scrolls its row into view.
+//     Redrawn at most every RENDER_MS on a change, and each second; not at all while hidden (the
+//     `hidden` attribute, or the narrow footprint's other tab), so whoever shows it calls render.
+//     Cells are written only when they differ, so a tooltip outlives a redraw. All text by
+//     textContent.
+//     pane.render()   draws now, unless hidden
+//     pane.eligible() -> bool   a running job's row has table columns, a trial's not counting
+//         (app.js shows the pane)
 //     pane.destroy()
 
 import { MAX_WATCHED } from "./overlays.js";
@@ -56,6 +68,7 @@ import { homePoint } from "./view.js";
 
 const TICK_MS = 1000;
 const RENDER_MS = 500;
+const SORT_STEP_MS = 10_000;
 
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 
@@ -151,8 +164,11 @@ class SubjectStore {
     // job id -> key -> subject. Each merge moves its subject to the end, so the last entry
     // is the last heard even when two events share a millisecond.
     this.jobs = new Map();
+    this.lastBy = new Map(); // job id -> its last heard subject
+    this.trials = new Set(); // the running identifies' current trials
     this.sel = null;
     this.changeCbs = [];
+    this.learnCbs = [];
     this.dropCbs = [];
     this.selectCbs = [];
     this.tickCbs = [];
@@ -186,7 +202,10 @@ class SubjectStore {
     } finally {
       this.lookingUp = false;
     }
-    if (learned) this.changed();
+    if (learned) {
+      this.changed();
+      for (const cb of this.learnCbs) cb();
+    }
     return learned;
   }
 
@@ -197,11 +216,12 @@ class SubjectStore {
   // The row and the key of a keyed event, or null.
   keyed(job, p) {
     const row = this.rows.get(job.kind);
-    if (!row || !row.subject || job.owner) return null;
+    if (!row || !row.subject || job.owner || this.trials.has(job.id)) return null;
     if (!p || typeof p !== "object" || Array.isArray(p)) return null;
     const v = fieldOf(p, row.subject.key);
-    if (v === null || v === undefined || String(v).trim() === "") return null;
-    return { row, key: String(v) };
+    if (!["string", "number", "boolean"].includes(typeof v)) return null;
+    const key = String(v).trim();
+    return key === "" ? null : { row, key };
   }
 
   subjectOf(job, p) {
@@ -235,6 +255,7 @@ class SubjectStore {
       };
     }
     subjects.set(k.key, s);
+    this.lastBy.set(job.id, s);
     for (const [field, v] of Object.entries(p)) {
       if (v === null || v === undefined) continue;
       if (typeof v === "string" && v.trim() === "") continue;
@@ -256,7 +277,13 @@ class SubjectStore {
   }
 
   sync(jobs) {
-    const running = new Set((jobs || []).filter(isRunning).map((j) => j.id));
+    const live = (jobs || []).filter(isRunning);
+    const running = new Set(live.map((j) => j.id));
+    this.trials = new Set(
+      live
+        .filter((j) => j.kind === "identify" && j.context?.identify?.current)
+        .map((j) => j.context.identify.current),
+    );
     let dropped = false;
     for (const [jobId, subjects] of [...this.jobs]) {
       if (running.has(jobId)) continue;
@@ -270,14 +297,29 @@ class SubjectStore {
     return [...(this.jobs.get(jobId)?.values() ?? [])];
   }
 
+  size(jobId) {
+    return this.jobs.get(jobId)?.size ?? 0;
+  }
+
+  isTrial(jobId) {
+    return this.trials.has(jobId);
+  }
+
   lastHeard(jobId) {
-    const all = this.list(jobId);
-    return all.length > 0 ? all[all.length - 1] : null;
+    return this.lastBy.get(jobId) ?? null;
   }
 
   held(jobId, key) {
-    const all = this.list(jobId);
-    return all.some((s) => !s.dim && (key === null || key === undefined || s.key === key));
+    const subjects = this.jobs.get(jobId);
+    if (!subjects) return false;
+    if (key !== null && key !== undefined) {
+      const s = subjects.get(key);
+      return !!s && !s.dim;
+    }
+    for (const s of subjects.values()) {
+      if (!s.dim) return true;
+    }
+    return false;
   }
 
   select(jobId, key) {
@@ -296,6 +338,10 @@ class SubjectStore {
 
   onChange(cb) {
     this.changeCbs.push(cb);
+  }
+
+  onLearn(cb) {
+    this.learnCbs.push(cb);
   }
 
   onDrop(cb) {
@@ -317,7 +363,14 @@ class SubjectStore {
   drop(jobId, key) {
     const subjects = this.jobs.get(jobId);
     if (!subjects || !subjects.delete(key)) return;
-    if (subjects.size === 0) this.jobs.delete(jobId);
+    if (subjects.size === 0) {
+      this.jobs.delete(jobId);
+      this.lastBy.delete(jobId);
+    } else if (this.lastBy.get(jobId)?.key === key) {
+      let last = null;
+      for (const s of subjects.values()) last = s;
+      this.lastBy.set(jobId, last);
+    }
     if (this.sel && this.sel.job === jobId && this.sel.key === key) this.setSelected(null);
     for (const cb of this.dropCbs) cb(jobId, key);
   }
@@ -347,8 +400,10 @@ class SubjectStore {
     this.destroyed = true;
     clearInterval(this.timer);
     this.jobs.clear();
+    this.lastBy.clear();
     this.sel = null;
     this.changeCbs = [];
+    this.learnCbs = [];
     this.dropCbs = [];
     this.selectCbs = [];
     this.tickCbs = [];
@@ -357,8 +412,6 @@ class SubjectStore {
 }
 
 // ---- the pane ---------------------------------------------------------------------------
-
-const DEFAULT_SORT = { col: "last_seen", dir: -1 };
 
 function compareValues(a, b) {
   if (typeof a === "number" && typeof b === "number") return a - b;
@@ -382,13 +435,17 @@ class SubjectsPane {
     this.jobs = jobs;
     this.watching = watching;
     this.footprint = footprint;
-    this.sections = new Map(); // job id -> {el, h3, note, table, head, body, sig, rows: key -> tr}
+    // job id -> {el, h3, note, table, head, body, sig, rows: key -> tr, hover, order: the keys as
+    // last sorted}
+    this.sections = new Map();
     this.sorts = new Map(); // job id -> {col, dir}
     this.pending = null; // the throttled redraw's timer
     this.lastRender = 0;
     this.destroyed = false;
     this.onClick = (ev) => this.click(ev);
+    this.onPress = (ev) => this.press(ev);
     el.addEventListener("click", this.onClick);
+    el.addEventListener("pointerdown", this.onPress);
     store.onChange(() => this.schedule());
     store.onSelect((sel) => {
       this.render();
@@ -401,11 +458,12 @@ class SubjectsPane {
     this.render();
   }
 
-  // The running jobs whose row names a subject (a job's trial never is one).
+  // The running jobs whose row names a subject (a job's trial, or a running identify's, never is
+  // one).
   subjectJobs() {
     return (this.jobs() || []).filter((j) => {
       const row = this.store.rowOf(j.kind);
-      return isRunning(j) && !j.owner && row && row.subject;
+      return isRunning(j) && !j.owner && !this.store.isTrial(j.id) && row && row.subject;
     });
   }
 
@@ -424,16 +482,27 @@ class SubjectsPane {
 
   click(ev) {
     const th = ev.target.closest("th[data-col]");
-    if (th) {
-      const jobId = th.closest("section.subject-job").dataset.job;
-      const col = th.dataset.col;
-      const cur = this.sorts.get(jobId) || DEFAULT_SORT;
-      this.sorts.set(jobId, { col, dir: cur.col === col ? -cur.dir : 1 });
-      this.render();
-      return;
-    }
+    if (!th) return;
+    const jobId = th.closest("section.subject-job").dataset.job;
+    const col = th.dataset.col;
+    const cur = this.sorts.get(jobId);
+    this.sorts.set(jobId, { col, dir: cur && cur.col === col ? -cur.dir : 1 });
+    // Asked for under the pointer: sorted once, then held as any other order.
+    const sec = this.sections.get(jobId);
+    if (sec) sec.order = null;
+    this.render();
+  }
+
+  press(ev) {
+    if (ev.button !== 0) return;
     const tr = ev.target.closest("tr.subject");
     if (tr) this.store.select(tr.dataset.job, tr.dataset.key);
+  }
+
+  // Not on screen: nothing to draw, whoever shows it renders.
+  isHidden() {
+    if (this.el.hidden) return true;
+    return this.footprint() === "narrow" && document.documentElement.dataset.pane !== "subjects";
   }
 
   // The table's columns for a job's row: {col, label, text(s, values), value(s)}.
@@ -488,12 +557,16 @@ class SubjectsPane {
     return cols;
   }
 
-  // Newest heard first, then by the job's sort; a tie keeps that order.
+  // The default order, or the job's sort over newest heard first, a tie keeping that order.
   sorted(jobId, cols) {
     const subjects = this.store.list(jobId).reverse();
-    const wanted = this.sorts.get(jobId) || DEFAULT_SORT;
-    const sort = cols.some((c) => c.col === wanted.col) ? wanted : DEFAULT_SORT;
-    const col = cols.find((c) => c.col === sort.col);
+    const wanted = this.sorts.get(jobId);
+    const col = wanted && cols.find((c) => c.col === wanted.col);
+    if (!col) {
+      const step = (s) => Math.floor(s.last_seen / SORT_STEP_MS);
+      return subjects.sort((a, b) => step(b) - step(a) || a.key.localeCompare(b.key));
+    }
+    const sort = wanted;
     return subjects
       .map((s) => ({ s, v: col.value(s) }))
       .sort((a, b) => {
@@ -503,6 +576,20 @@ class SubjectsPane {
         return sort.dir * compareValues(a.v, b.v);
       })
       .map((x) => x.s);
+  }
+
+  // The sorted subjects in the order the pointer is holding, a new row last; else as sorted,
+  // which then is the order to hold.
+  held(sec, subjects) {
+    if (!sec.hover || !sec.order) {
+      sec.order = subjects.map((s) => s.key);
+      return subjects;
+    }
+    const at = new Map(sec.order.map((key, i) => [key, i]));
+    const place = (s) => at.get(s.key) ?? at.size;
+    const kept = subjects.sort((a, b) => place(a) - place(b));
+    sec.order = kept.map((s) => s.key);
+    return kept;
   }
 
   section(jobId) {
@@ -522,7 +609,14 @@ class SubjectsPane {
     const body = document.createElement("tbody");
     table.append(thead, body);
     el.append(h3, table);
-    sec = { el, h3, note, table, head, body, sig: "", rows: new Map() };
+    sec = { el, h3, note, table, head, body, sig: "", rows: new Map(), hover: false, order: null };
+    table.addEventListener("pointerenter", () => {
+      sec.hover = true;
+    });
+    table.addEventListener("pointerleave", () => {
+      sec.hover = false;
+      this.render();
+    });
     this.sections.set(jobId, sec);
     return sec;
   }
@@ -535,6 +629,8 @@ class SubjectsPane {
     if (watched) sec.note.remove();
     else if (!sec.note.isConnected) sec.h3.after(sec.note);
     sec.table.hidden = subjects.length === 0;
+    // A table hidden under the pointer sends no leave.
+    if (sec.table.hidden) sec.hover = false;
     const sig = JSON.stringify(cols.map((c) => c.col));
     if (sig !== sec.sig) {
       sec.sig = sig;
@@ -582,7 +678,7 @@ class SubjectsPane {
   }
 
   render() {
-    if (this.destroyed) return;
+    if (this.destroyed || this.isHidden()) return;
     this.lastRender = Date.now();
     const wanted = this.subjectJobs()
       .map((job) => ({ job, subjects: this.store.list(job.id), watched: this.watching(job.id) }))
@@ -607,7 +703,7 @@ class SubjectsPane {
       const row = this.store.rowOf(job.kind);
       const sec = this.section(job.id);
       const cols = this.columns(row);
-      const subjects = this.sorted(job.id, cols);
+      const subjects = this.held(sec, this.sorted(job.id, cols));
       this.drawSection(sec, job, row, subjects, cols, watched);
       if (this.el.children[i] !== sec.el) this.el.insertBefore(sec.el, this.el.children[i] || null);
     });
@@ -618,6 +714,7 @@ class SubjectsPane {
     clearInterval(this.timer);
     if (this.pending !== null) clearTimeout(this.pending);
     this.el.removeEventListener("click", this.onClick);
+    this.el.removeEventListener("pointerdown", this.onPress);
     this.el.replaceChildren();
     this.sections.clear();
   }

@@ -4072,12 +4072,13 @@ def scenario_slow_row_lookup_draws_no_ribbon_per_message(page, url, secret):
 def scenario_keyed_ribbons_with_equal_text_stay_two(page, url, secret):
     select_source(page, url, secret, "tone")
     r = page.evaluate(
-        """() => {
+        """async () => {
           const t = window.zetaTest;
           t.keyedRibbon("a", 100e6, "same", "kr", 1);
           t.keyedRibbon("b", 100e6, "same", "kr", 1);
           t.keyedRibbon("b", 100e6, "same", "kr", 2);
           t.keyedRibbon("a", 100e6, "same", "kr", 3);
+          await new Promise((done) => setTimeout(done, 700));
           return [...document.querySelectorAll('#waterfall .ov-ribbon.kr .count')]
             .map((e) => e.textContent.trim());
         }""")
@@ -4385,8 +4386,8 @@ def scenario_map_follows_dim_and_drop(page, url, secret):
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set subject_dim_s 1")
     expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
-    run_cmd(page, "view set subject_drop_s 2")
-    expect(view_line(page, "subject_drop_s = 2")).to_be_visible()
+    run_cmd(page, "view set subject_drop_s 4")
+    expect(view_line(page, "subject_drop_s = 4")).to_be_visible()
     run_cmd(page, "view set map on")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
@@ -4450,6 +4451,266 @@ def scenario_mark_dim_runs_from_the_tick_only(page, url, secret):
         assert r == {"merged": 0, "ticked": 1}, r
     finally:
         stop_job(url, secret, job)
+
+
+def scenario_identify_trials_do_not_flap_the_subjects_pane(page, url, secret):
+    select_source(page, url, secret, "tone")
+    pane = page.locator("#subjects")
+    expect(pane).to_be_hidden()
+    identify = start_job(url, secret, "identify", "tone", 100_000_000, 12_500)
+    try:
+        # A real trial of a row with a table: its identify names it, and it has no owner.
+        seen = None
+        for _ in range(240):
+            page.evaluate("window.zetaTest.poll()")
+            jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            me = next(j for j in jobs if j["id"] == identify)
+            if me["state"]["status"] != "running":
+                break
+            current = me["context"].get("identify", {}).get("current")
+            child = next((j for j in jobs if j["id"] == current
+                          and j["state"]["status"] == "running"), None)
+            has_table = child is not None and page.evaluate(
+                "(k) => window.zetaSubjects.rowOf(k)?.subject?.columns.length > 0", child["kind"])
+            if has_table:
+                seen = child
+                assert child.get("owner") is None, child
+                page.evaluate("window.zetaTest.poll()")
+                page.wait_for_timeout(300)
+                assert pane.is_hidden(), child
+                assert page.evaluate("document.documentElement.dataset.subjects") is None
+                expect(page.locator("#subjects-toggle")).to_be_hidden()
+                break
+            page.wait_for_timeout(250)
+        assert seen is not None, "no trial of a row with a table ran"
+    finally:
+        stop_job(url, secret, identify)
+    # The store: a trial's events are not a subject; once its identify ended the job is
+    # ordinary (a proved decoder), and its events are.
+    r = page.evaluate(
+        """async () => {
+          const { state } = await import('./app.js');
+          const { mountSubjects, mountSubjectsPane } = await import('./subjects.js');
+          await state.subjects.lookup(['fake_subjects']);
+          const api = {op: async () => ({value: {modes: []}})};
+          const store = mountSubjects(api, state.view);
+          store.rows.set('fake_subjects', state.subjects.rowOf('fake_subjects'));
+          const child = {id: 'c', kind: 'fake_subjects', source: 't', state: {status: 'running'}};
+          const parent = {id: 'p', kind: 'identify', state: {status: 'running'},
+                          context: {identify: {current: 'c'}}};
+          let jobs = [parent, child];
+          const pane = mountSubjectsPane(document.createElement('div'), store, state.view,
+                                         {jobs: () => jobs});
+          store.sync(jobs);
+          const out = {};
+          out.trial = [store.event(child, {icao: 'A'}), store.list('c').length, pane.eligible()];
+          parent.state = {status: 'stopped'};
+          store.sync(jobs);
+          out.proved = [!!store.event(child, {icao: 'A'}), store.list('c').length, pane.eligible()];
+          pane.destroy();
+          store.destroy();
+          window.zetaSubjects = state.subjects;
+          return out;
+        }""")
+    assert r == {"trial": [None, 0, False], "proved": [True, 1, True]}, r
+
+
+def scenario_two_thousand_messages_cost_little(page, url, secret):
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+        expect(page.locator("#waterfall .ov-ribbon.fake_subjects")).to_have_count(1)
+        page.wait_for_function(
+            "(job) => window.zetaSubjects.list(job).reduce((n, s) => n + s.count, 0) === 8",
+            arg=job, timeout=5_000)
+        r = page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              const store = window.zetaSubjects;
+              const job = {id, kind: 'fake_subjects'};
+              let measured = 0, applied = 0, copied = 0, drawn = 0;
+              const width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth');
+              Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
+                configurable: true,
+                get() { measured += 1; return width.get.call(this); },
+              });
+              const list = store.list;
+              store.list = function (j) { copied += 1; return list.call(this, j); };
+              const render = state.subjectsPane.render;
+              state.subjectsPane.render = function () { drawn += 1; return render.call(this); };
+              const hidden = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'hidden');
+              const pane = document.querySelector('#subjects');
+              Object.defineProperty(pane, 'hidden', {
+                configurable: true,
+                get() { return hidden.get.call(this); },
+                set(v) { applied += 1; hidden.set.call(this, v); },
+              });
+              const t0 = performance.now();
+              for (let i = 0; i < 2000; i += 1) {
+                const p = {icao: `B${i % 50}`, altitude_ft: i, summary: `B${i % 50} ${i}`};
+                store.event(job, p);
+                state.ov.subjectRibbon(job, p);
+              }
+              const ms = performance.now() - t0;
+              const out = {ms, measured, copied, applied, drawn};
+              Object.defineProperty(HTMLElement.prototype, 'offsetWidth', width);
+              delete store.list;
+              delete state.subjectsPane.render;
+              delete pane.hidden;
+              const b = store.jobs.get(id).get('B49');
+              out.merged = [store.jobs.get(id).size, b.count, b.state.altitude_ft];
+              return out;
+            }""", job)
+        assert r["merged"] == [53, 40, 1999], r
+        assert r["measured"] == 0, r
+        assert r["copied"] == 0, r
+        assert r["applied"] == 0, r
+        assert r["drawn"] == 0, r
+        assert r["ms"] < 1000, r
+        # Settled within a second: the ribbon says so and the table has them all.
+        expect(page.locator("#waterfall .ov-ribbon.fake_subjects")).to_have_text(
+            "fake_subjects 53 aircraft, last B49", timeout=1_000)
+        expect(page.locator("#subjects tr.subject")).to_have_count(53, timeout=1_000)
+        expect(subject_row(page, "B49").locator('td[data-col="count"]')).to_have_text(
+            "40", timeout=1_000)
+        assert not errors, f"console errors: {errors}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_a_hidden_subjects_pane_does_not_draw(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+        run_cmd(page, "view set subjects off")
+        expect(page.locator("#subjects")).to_be_hidden()
+        # Hidden: nothing drawn. Shown: drawn at once, no timer waited for.
+        r = page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              const job = {id, kind: 'fake_subjects'};
+              state.subjects.event(job, {icao: 'C1', altitude_ft: 1000});
+              state.subjectsPane.render();
+              const hidden = !!document.querySelector('#subjects tr.subject[data-key="C1"]');
+              state.view.set('subjects', 'on');
+              return {hidden, shown: !!document.querySelector('#subjects tr.subject[data-key="C1"]')};
+            }""", job)
+        assert r == {"hidden": False, "shown": True}, r
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_a_subjects_fix_redraws_the_map_at_most_twice_a_second(page, url, secret):
+    job = map_with_subjects(page, url, secret)
+    try:
+        r = page.evaluate(
+            """async (id) => {
+              const { state } = await import('./app.js');
+              let drawn = 0;
+              const real = state.map.drawSubject;
+              state.map.drawSubject = function (t) { drawn += 1; return real.call(this, t); };
+              const job = {id, kind: 'fake_subjects'};
+              for (let i = 0; i < 200; i += 1) {
+                const p = {icao: '7C0001', position: {lat: -27 - i / 1000, lon: 153, alt_m: null}};
+                state.subjects.event(job, p);
+                state.map.event(job, p);
+              }
+              const burst = drawn;
+              await new Promise((done) => setTimeout(done, 700));
+              delete state.map.drawSubject;
+              const t = state.map.tracks.get(`${id}\\u00007C0001`);
+              const at = t.marker.getLatLng();
+              return {burst, after: drawn, last: [at.lat, at.lng]};
+            }""", job)
+        assert r["burst"] <= 1 and r["after"] <= 3, r
+        assert r["last"] == [-27.199, 153], r
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_a_row_holds_still_under_the_pointer(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+        page.wait_for_function(
+            "(job) => window.zetaSubjects.list(job).reduce((n, s) => n + s.count, 0) === 8",
+            arg=job, timeout=5_000)
+        # One 10 s step holds them, so the key orders them; across a step's edge a later key
+        # could lead, so the step is made certain.
+        page.evaluate(
+            """(id) => {
+              const store = window.zetaSubjects;
+              const now = Date.now();
+              for (const s of store.list(id)) s.last_seen = now;
+              store.changed();
+            }""", job)
+        page.evaluate("async () => (await import('./app.js')).state.subjectsPane.render()")
+        assert subject_keys(page) == ["7C0001", "7C0002", "7C0003"], subject_keys(page)
+        later = """(id) => {
+          const store = window.zetaSubjects;
+          store.jobs.get(id).get('7C0003').last_seen = Date.now() + 30000;
+          store.changed();
+        }"""
+        render = "async () => (await import('./app.js')).state.subjectsPane.render()"
+        subject_row(page, "7C0002").hover()
+        page.evaluate(later, job)
+        page.evaluate(render)
+        assert subject_keys(page) == ["7C0001", "7C0002", "7C0003"], subject_keys(page)
+        # A press selects, on the row that was under it.
+        box = subject_row(page, "7C0002").bounding_box()
+        page.mouse.move(box["x"] + 5, box["y"] + box["height"] / 2)
+        page.mouse.down()
+        assert page.evaluate("window.zetaSubjects.selected().key") == "7C0002"
+        page.mouse.up()
+        # A header click sorts as asked, under the pointer, and then that order holds.
+        page.locator('#subjects th[data-col="icao"]').click()
+        page.locator('#subjects th[data-col="icao"]').click()
+        assert subject_keys(page) == ["7C0003", "7C0002", "7C0001"], subject_keys(page)
+        page.evaluate(
+            """(id) => {
+              window.zetaSubjects.event({id, kind: 'fake_subjects'}, {icao: '7C0000'});
+            }""", job)
+        page.evaluate(render)
+        assert subject_keys(page) == ["7C0003", "7C0002", "7C0001", "7C0000"], subject_keys(page)
+        # Off the table, the default order would have moved 7C0003 first anyway: the chosen
+        # sort resumes and keeps the new row where the sort puts it.
+        page.locator("#subjects-toggle").hover()
+        page.wait_for_timeout(100)
+        page.evaluate(render)
+        assert subject_keys(page) == ["7C0003", "7C0002", "7C0001", "7C0000"], subject_keys(page)
+        page.locator('#subjects th[data-col="icao"]').click()
+        page.locator("#subjects-toggle").hover()
+        page.evaluate(render)
+        assert subject_keys(page) == ["7C0000", "7C0001", "7C0002", "7C0003"], subject_keys(page)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_a_subject_key_is_trimmed_and_scalar(page, url, secret):
+    select_source(page, url, secret, "tone")
+    r = page.evaluate(
+        """async () => {
+          const { state } = await import('./app.js');
+          const { metricText } = await import('./units.js');
+          await state.subjects.lookup(['fake_subjects']);
+          const store = state.subjects;
+          const job = {id: 'stub2', kind: 'fake_subjects'};
+          const key = (icao) => store.event(job, {icao})?.key ?? null;
+          const out = {
+            trimmed: key('  AB12 '), number: key(7), blank: key('   '),
+            object: key({a: 1}), array: key(['x']),
+            text: metricText({a: 1}, null), list: metricText([1, 2], null),
+          };
+          store.drop('stub2', 'AB12');
+          store.drop('stub2', '7');
+          return out;
+        }""")
+    assert r == {"trimmed": "AB12", "number": "7", "blank": None, "object": None, "array": None,
+                 "text": '{"a":1}', "list": "[1,2]"}, r
 
 
 def scenario_selected_marker_rises(page, url, secret):

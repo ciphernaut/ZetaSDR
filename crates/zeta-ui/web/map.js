@@ -56,7 +56,8 @@
 //   holding `div.map-subject` (classes `dim`, `selected`) with `span.arrow` turned to the row's
 //   heading (class `dot` while none is known) and `span.label`, the subject's label and altitude,
 //   and one polyline as above through the fixes addToTrack kept, by the row's
-//   `subject.track_points` and `track_min_m`. The marker is always at the latest fix. An event
+//   `subject.track_points` and `track_min_m`. The marker is always at the latest fix, redrawn at
+//   most twice a second per subject. An event
 //   with no fix refreshes the marker's face and leaves the geometry alone. Its popup names the
 //   subject and lists its values; a click selects it in the store. The store's selection marks
 //   the marker and raises it over the others, panning only when it is off the map; each of the
@@ -66,6 +67,7 @@ import { subjectLabel, subjectValues } from "./subjects.js";
 import { metricText } from "./units.js";
 import { homePoint } from "./view.js";
 
+const SUBJECT_DRAW_MS = 500;
 export const TRACK_POINTS = 3600;
 export const SUBJECT_TRACK_POINTS = 100;
 const TURN_DEG = 10;
@@ -313,7 +315,11 @@ class MapPane {
     let t = this.tracks.get(id);
     const pos = positionOf(p);
     if (!pos) {
-      if (t?.marker) this.drawFace(t);
+      if (t?.marker) {
+        // Being heard lights it at once; what it says waits for the draw.
+        t.box.classList.toggle("dim", s.dim);
+        this.scheduleDraw(id, t);
+      }
       return;
     }
     if (!t) {
@@ -328,7 +334,29 @@ class MapPane {
       minM: sub.track_min_m ?? 0,
     });
     t.points = drawnPoints(t.kept, fix);
-    this.draw(id);
+    t.moved = true;
+    t.box?.classList.toggle("dim", s.dim);
+    this.scheduleDraw(id, t);
+  }
+
+  // A subject's marker and line at most every SUBJECT_DRAW_MS: the first message at once, the
+  // last of a burst from a timer. Only a fix moves them; other messages redraw the face.
+  scheduleDraw(id, t) {
+    if (t.drawTimer !== undefined) return;
+    const flush = () => {
+      t.drawTimer = undefined;
+      if (this.destroyed || this.tracks.get(id) !== t) return;
+      t.drawnAt = Date.now();
+      if (t.moved || !t.marker) {
+        t.moved = false;
+        this.draw(id);
+      } else {
+        this.drawFace(t);
+      }
+    };
+    const wait = (t.drawnAt ?? 0) + SUBJECT_DRAW_MS - Date.now();
+    if (wait <= 0) flush();
+    else t.drawTimer = setTimeout(flush, wait);
   }
 
   drawSubject(t) {

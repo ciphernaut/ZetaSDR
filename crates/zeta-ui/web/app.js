@@ -770,7 +770,7 @@ function start(api) {
     watching: (id) => (state.ov ? state.ov.watching(id) : true),
     footprint,
   });
-  state.subjects.onChange(applySubjectsPane);
+  state.subjects.onLearn(applySubjectsPane);
   applyMapPane();
   applySubjectsPane();
   state.view.onChange((key) => {
@@ -865,7 +865,8 @@ function subjectsPressed() {
 }
 
 // #subjects, #subjects-toggle and <html data-subjects="on"> from the view's `subjects` policy
-// and whether a running job has a table; off also leaves the narrow footprint's tab.
+// and whether a running job has a table; off also leaves the narrow footprint's tab. Run on a
+// row learned and on a job poll, never on a message, and drawn at once when it comes to show.
 function applySubjectsPane() {
   const root = document.documentElement;
   const policy = state.view ? state.view.get("subjects") : "auto";
@@ -876,7 +877,11 @@ function applySubjectsPane() {
     delete root.dataset.subjects;
     if (root.dataset.pane === "subjects") delete root.dataset.pane;
   }
+  // A last draw going out, so a hidden pane holds no ended job's section.
+  if (!on && !$("#subjects").hidden) state.subjectsPane?.render();
+  const shown = on && $("#subjects").hidden;
   $("#subjects").hidden = !on;
+  if (shown) state.subjectsPane.render();
   $("#subjects-toggle").hidden = !(eligible || policy === "on");
   $("#subjects-toggle").setAttribute("aria-pressed", String(subjectsPressed()));
 }
@@ -890,6 +895,7 @@ function toggleSubjects() {
     else {
       if (root.dataset.subjects !== "on") state.view?.set("subjects", "on");
       root.dataset.pane = "subjects";
+      state.subjectsPane?.render();
     }
     applyMapPane();
     return;

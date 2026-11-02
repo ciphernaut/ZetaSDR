@@ -316,6 +316,8 @@ Rulings of plan 23 an operator may want otherwise:
 
 - `m_s` shows as signed m/s to one decimal (the plan text said km/h; metres and m/s are the metric pair, and a climb rate in km/h misreads). `ft` shows as metres and `kt` as km/h. One line in `metricText` (`crates/zeta-ui/web/units.js`) changes it.
 - The table is stacked under the map on the wide footprint, since seven or eight columns do not fit a quarter of the screen.
-- Jobs with an `owner` (identify's trials, a watch's runs) have no subjects; their events keep today's ribbons.
+- Jobs with an `owner` (a watch's runs and their trials) and a running identify's current trial have no subjects; their events keep today's ribbons. A proved decoder left running is an ordinary job and has them.
+- Two decoders tracking one aircraft give two rows and two markers: subjects are per job, not merged across jobs.
+- The row cache (`store.lookup`) lives for the page: an operator row edited on the node needs a page reload.
 - The agent's own jobs: `mix_start` ids are not recorded as the run's own, so a run cannot stop a mix it started (the stop gate was not widened).
 - Tracks keep a fix when the subject has moved `track_min_m` (or turned over 10 degrees) and, at `track_points`, thin the older half by every other point (the first point stays). Keeping sharp curves when thinning old points is a future sprint: today a thinned half can cut a corner, and a long straight leg and a tight turn lose points alike.

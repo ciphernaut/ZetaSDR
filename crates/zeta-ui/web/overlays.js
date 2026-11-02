@@ -168,6 +168,7 @@ export const MAX_WATCHED = 4;
 export const MAX_POSITIONED = 4;
 export const MAX_RIBBONS = 200;
 const EXPIRE_EVERY_MS = 1000;
+const KEYED_RIBBON_MS = 500;
 const RIBBON_GAP_PX = 2;
 const LABEL_GAP_PX = 2;
 const MAX_LANES = 8;
@@ -691,42 +692,70 @@ class Overlays {
       const s = store.subjectOf(job, p);
       if (!s) return false;
       this.keyedRibbon(
-        `job:${job.id}:${k.key}`, hz, subjectSummary(s), row.protocol, s.count,
+        `job:${job.id}:${k.key}`, hz, () => subjectSummary(s), row.protocol, s.count,
         () => store.held(job.id, k.key),
       );
       return true;
     }
-    const n = store.list(job.id).length;
-    const line = `${row.protocol} ${n} ${row.subject.name}, last ${subjectLabel(store.lastHeard(job.id))}`;
+    const line = () => {
+      const last = store.lastHeard(job.id);
+      const label = last ? subjectLabel(last) : "";
+      return `${row.protocol} ${store.size(job.id)} ${row.subject.name}, last ${label}`;
+    };
     this.keyedRibbon(`job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null));
     return true;
   }
 
-  // The ribbon for `key`, made or updated in place: the text replaced, `×count` when `count`
-  // is over 1, the width measured again, the ribbon back at the right edge and placed again if
-  // it had moved. `held()` true keeps it from scrolling or expiring while its subject is heard.
+  // The ribbon for `key`, `text` a string or a function asked when it is drawn. A new one is
+  // drawn at once; a message to one only notes what it says, and a timer draws it at most every
+  // KEYED_RIBBON_MS, so no message measures anything. `held()` true keeps it from scrolling or
+  // expiring while its subject is heard.
   keyedRibbon(key, hz, text, cls, count, held) {
     if (this.destroyed) return null;
-    text = String(text);
     let r = this.ribbons.find((o) => o.key === key);
-    if (!r) {
-      r = this.makeRibbon(hz, text, cls);
+    const fresh = !r;
+    if (fresh) {
+      r = this.makeRibbon(hz, typeof text === "function" ? String(text()) : String(text), cls);
       r.key = key;
+      r.countText = "";
+      r.drawn = 0;
     }
-    const moved = r.right > 0;
     r.held = held;
     r.hz = hz;
+    r.nextText = text;
+    r.count = count;
+    r.born = performance.now();
+    if (fresh && count <= 1) {
+      r.drawn = r.born;
+      return r.el;
+    }
+    if (r.keyedTimer === undefined) {
+      const wait = Math.max(0, r.drawn + KEYED_RIBBON_MS - r.born);
+      r.keyedTimer = setTimeout(() => this.drawKeyed(r), wait);
+    }
+    return r.el;
+  }
+
+  // A keyed ribbon as last told: the text replaced, `×count` when `count` is over 1, the width
+  // measured again if either changed, the ribbon back at the right edge and placed again if it
+  // had moved.
+  drawKeyed(r) {
+    r.keyedTimer = undefined;
+    if (this.destroyed || !r.el.isConnected) return;
+    r.drawn = performance.now();
+    const text = String(typeof r.nextText === "function" ? r.nextText() : r.nextText);
+    const countText = r.count > 1 ? ` ×${r.count}` : "";
+    const moved = r.right > 0;
+    if (text === r.text && countText === r.countText && !moved) return;
     r.text = text;
     r.bodyEl.textContent = text;
     r.el.title = text;
-    r.count = count;
-    r.countEl.textContent = count > 1 ? ` ×${count}` : "";
+    r.countText = countText;
+    r.countEl.textContent = countText;
     r.w = r.el.offsetWidth;
     r.right = 0;
     r.el.style.right = "0px";
-    r.born = performance.now();
     if (moved) this.place(r);
-    return r.el;
   }
 
   ribbon(hz, text, cls = "") {

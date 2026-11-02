@@ -646,7 +646,7 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
     }
     named.extend(row.time.clone().map(|t| ("time".into(), t)));
     if let Some(sub) = &row.subject {
-        if sub.key.is_empty() {
+        if sub.key.trim().is_empty() {
             return Err(RowError::new("subject.key", "must not be empty"));
         }
         if sub.name.is_empty() {
@@ -1215,6 +1215,14 @@ mod tests {
             assert_eq!(e.field, field, "{e}");
             assert!(e.error.contains("which the event schema lacks"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_whitespace_subject_key_is_broken_naming_the_field() {
+        let text = edited(ADSB, |v| v["subject"]["key"] = "  ".into());
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "subject.key", "{e}");
+        assert!(e.error.contains("must not be empty"), "{e}");
     }
 
     #[test]

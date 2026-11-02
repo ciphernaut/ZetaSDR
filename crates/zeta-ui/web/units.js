@@ -8,7 +8,7 @@
 //   metricText(value, unit) -> a mode row's value in metres and km/h, rounded: `ft`, `m` ->
 //       "6401 m", `kt`, `km_h` -> "780 km/h", `m_s` -> "+5.0 m/s" (a climb rate stays a climb
 //       rate, one decimal and its sign), `deg` -> "245°" (359.6 -> "0°"); no unit or a
-//       non-number as sent; null or undefined -> ""
+//       non-number as sent, an object as JSON; null or undefined -> ""
 
 export function mhzText(hz) {
   return (hz / 1e6).toFixed(4);
@@ -24,6 +24,7 @@ export function bandText(centerHz, bandwidthHz) {
 
 export function metricText(value, unit) {
   if (value === null || value === undefined) return "";
+  if (typeof value === "object") return JSON.stringify(value);
   if (typeof value !== "number" || !Number.isFinite(value)) return String(value);
   switch (unit) {
     case "ft":

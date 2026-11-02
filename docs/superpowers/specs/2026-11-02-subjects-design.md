@@ -144,6 +144,12 @@ Clicking a row selects the subject: it highlights in the table, and on the map i
 `selected` style, with a pan if it is off-screen. Clicking a map marker selects its row and scrolls to
 it. Selection clears when the subject drops.
 
+Amendment (2026-11-02): under real traffic rows sorted strictly by last seen never hold still. The
+default sort buckets last seen into 10 s steps, newest bucket first, the key as tie-break. Reordering
+is suspended while the pointer is over the table and resumes on leave; a header click still sorts,
+exactly as chosen, once, and is held likewise. Selection happens on `pointerdown`, so a row moving
+cannot lose a click.
+
 ### 4.4 The waterfall
 
 In `overlays.js` `ribbon`, a keyed event no longer always makes a ribbon:
