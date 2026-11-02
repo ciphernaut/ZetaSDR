@@ -6,6 +6,7 @@
 
 pub mod adsb;
 pub mod external;
+pub mod mcp_client;
 pub mod parsers;
 pub mod proc;
 pub mod sink_sondehub;
