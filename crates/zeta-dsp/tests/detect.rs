@@ -46,6 +46,7 @@ fn capture() -> Vec<Complex<f32>> {
         order: 2,
         bits: "pattern:aa".into(),
         repeat: 3,
+        gap_ms: 50,
     };
     let narrow_rate = spec.rate_hz();
     let narrow = synthesise(&spec, &Impairments::default(), narrow_rate, CENTER_HZ);

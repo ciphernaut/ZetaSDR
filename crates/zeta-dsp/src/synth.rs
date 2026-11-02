@@ -720,6 +720,12 @@ pub fn acars_packet_iq(
 
 /// Gap between the bursts of a generic family's `repeat`, in milliseconds.
 const BURST_GAP_MS: u64 = 50;
+/// Longest `gap_ms` a generic family accepts.
+const BURST_GAP_MAX_MS: u64 = 60_000;
+
+fn default_gap_ms() -> u64 {
+    BURST_GAP_MS
+}
 
 /// The sample rate of the generic `fsk`/`psk`/`ook` families: 48 kHz up to 4800
 /// baud, 240 kHz up to 24 000 baud, else 2.4 MHz.
@@ -877,9 +883,14 @@ fn ook_modulate(symbols: &[u8], symbol_rate_baud: u32, rate_hz: u32) -> Vec<Comp
         .collect()
 }
 
-/// `repeat` copies of `burst` with [`BURST_GAP_MS`] of silence between them.
-fn repeat_bursts(burst: Vec<Complex<f32>>, repeat: u32, rate_hz: u32) -> Vec<Complex<f32>> {
-    let gap = (u64::from(rate_hz) * BURST_GAP_MS / 1000) as usize;
+/// `repeat` copies of `burst` with `gap_ms` of silence between them.
+fn repeat_bursts(
+    burst: Vec<Complex<f32>>,
+    repeat: u32,
+    gap_ms: u64,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    let gap = (u64::from(rate_hz) * gap_ms / 1000) as usize;
     let mut out = Vec::with_capacity((burst.len() + gap) * repeat as usize);
     for r in 0..repeat {
         if r > 0 {
@@ -933,6 +944,7 @@ fn rs41_iq(
 fn generic_params(
     symbol_rate_baud: u32,
     repeat: u32,
+    gap_ms: u64,
     deviation_hz: Option<f64>,
 ) -> Result<(), String> {
     if !(1..=600_000).contains(&symbol_rate_baud) {
@@ -940,6 +952,9 @@ fn generic_params(
     }
     if !(1..=100).contains(&repeat) {
         return Err("repeat: 1..=100".into());
+    }
+    if gap_ms > BURST_GAP_MAX_MS {
+        return Err(format!("gap_ms: 0..={BURST_GAP_MAX_MS}"));
     }
     if let Some(d) = deviation_hz {
         let half = f64::from(generic_rate_hz(symbol_rate_baud)) / 2.0;
@@ -986,13 +1001,15 @@ pub enum SynthSpec {
     /// A tone frequency-modulated onto a carrier: one second of `tone_hz`.
     NbfmTone { tone_hz: f64, deviation_hz: f64 },
     /// Gaussian FSK (BT 0.5) of `bits` (hex, or `pattern:<hex>` repeated to one
-    /// second), `order` 2 or 4, in `repeat` bursts 50 ms apart.
+    /// second), `order` 2 or 4, in `repeat` bursts `gap_ms` apart (50 by default).
     Fsk {
         symbol_rate_baud: u32,
         deviation_hz: f64,
         order: u8,
         bits: String,
         repeat: u32,
+        #[serde(default = "default_gap_ms")]
+        gap_ms: u64,
     },
     /// PSK (raised cosine, roll-off 0.35) of `bits`, `order` 2 (BPSK) or 4 (QPSK).
     Psk {
@@ -1000,12 +1017,16 @@ pub enum SynthSpec {
         order: u8,
         bits: String,
         repeat: u32,
+        #[serde(default = "default_gap_ms")]
+        gap_ms: u64,
     },
-    /// On-off keying of `bits`.
+    /// On-off keying of `bits`, in `repeat` bursts `gap_ms` apart (50 by default).
     Ook {
         symbol_rate_baud: u32,
         bits: String,
         repeat: u32,
+        #[serde(default = "default_gap_ms")]
+        gap_ms: u64,
     },
     /// `frames` Vaisala RS41 frames one second apart ([`crate::rs41_frame`]): GFSK at
     /// 4800 baud and 2400 Hz deviation carrying `serial`, the position and the climb.
@@ -1127,11 +1148,12 @@ impl SynthSpec {
                 order,
                 bits,
                 repeat,
+                gap_ms,
             } => {
                 if !matches!(order, 2 | 4) {
                     return Err("order: 2 or 4".into());
                 }
-                generic_params(*symbol_rate_baud, *repeat, Some(*deviation_hz))?;
+                generic_params(*symbol_rate_baud, *repeat, *gap_ms, Some(*deviation_hz))?;
                 generic_symbols(bits, *order, *symbol_rate_baud)?;
             }
             SynthSpec::Psk {
@@ -1139,19 +1161,21 @@ impl SynthSpec {
                 order,
                 bits,
                 repeat,
+                gap_ms,
             } => {
                 if !matches!(order, 2 | 4) {
                     return Err("order: 2 or 4".into());
                 }
-                generic_params(*symbol_rate_baud, *repeat, None)?;
+                generic_params(*symbol_rate_baud, *repeat, *gap_ms, None)?;
                 generic_symbols(bits, *order, *symbol_rate_baud)?;
             }
             SynthSpec::Ook {
                 symbol_rate_baud,
                 bits,
                 repeat,
+                gap_ms,
             } => {
-                generic_params(*symbol_rate_baud, *repeat, None)?;
+                generic_params(*symbol_rate_baud, *repeat, *gap_ms, None)?;
                 generic_symbols(bits, 2, *symbol_rate_baud)?;
             }
             SynthSpec::Rs41 {
@@ -1278,11 +1302,12 @@ pub fn synthesise(
             order,
             bits,
             repeat,
+            gap_ms,
         } => {
             let sym = generic_symbols(bits, *order, *symbol_rate_baud)
                 .expect("synth spec validated before synthesise");
             let burst = gfsk_modulate(&sym, *order, *symbol_rate_baud, *deviation_hz, rate_hz);
-            let mut iq = repeat_bursts(burst, *repeat, rate_hz);
+            let mut iq = repeat_bursts(burst, *repeat, *gap_ms, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -1291,11 +1316,12 @@ pub fn synthesise(
             order,
             bits,
             repeat,
+            gap_ms,
         } => {
             let sym = generic_symbols(bits, *order, *symbol_rate_baud)
                 .expect("synth spec validated before synthesise");
             let burst = psk_modulate(&sym, *order, *symbol_rate_baud, rate_hz);
-            let mut iq = repeat_bursts(burst, *repeat, rate_hz);
+            let mut iq = repeat_bursts(burst, *repeat, *gap_ms, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -1303,11 +1329,12 @@ pub fn synthesise(
             symbol_rate_baud,
             bits,
             repeat,
+            gap_ms,
         } => {
             let sym = generic_symbols(bits, 2, *symbol_rate_baud)
                 .expect("synth spec validated before synthesise");
             let burst = ook_modulate(&sym, *symbol_rate_baud, rate_hz);
-            let mut iq = repeat_bursts(burst, *repeat, rate_hz);
+            let mut iq = repeat_bursts(burst, *repeat, *gap_ms, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -1395,6 +1422,7 @@ mod tests {
             order,
             bits: bits.into(),
             repeat: 1,
+            gap_ms: 50,
         }
     }
 
@@ -1455,6 +1483,7 @@ mod tests {
             order: 2,
             bits: "pattern:aa".into(),
             repeat: 1,
+            gap_ms: 50,
         };
         let iq = synthesise(&spec, &Impairments::default(), 48_000, 0);
         let (p, bin) = spectrum(&iq[1000..], 48_000, 4096);
@@ -1476,6 +1505,7 @@ mod tests {
             symbol_rate_baud: 4800,
             bits: "80".into(),
             repeat: 1,
+            gap_ms: 50,
         };
         let iq = synthesise(&spec, &Impairments::default(), 48_000, 0);
         assert_eq!(iq.len(), 80);
@@ -1490,6 +1520,7 @@ mod tests {
             symbol_rate_baud: 100_000,
             bits: "80".into(),
             repeat: 1,
+            gap_ms: 50,
         };
         let imp = Impairments {
             echo: Some(Echo {
@@ -1565,6 +1596,35 @@ mod tests {
         assert_eq!(iq.len(), 96_000);
         assert!(iq[28_000].norm() > 0.99 && iq[30_000].norm() == 0.0);
         assert!(iq[48_000].norm() > 0.99);
+    }
+
+    #[test]
+    fn gap_ms_spaces_the_bursts() {
+        let spec = SynthSpec::Fsk {
+            symbol_rate_baud: 4800,
+            deviation_hz: 4000.0,
+            order: 2,
+            bits: "ff00".into(),
+            repeat: 3,
+            gap_ms: 995,
+        };
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 0);
+        // 3 bursts of 16 bits at 4800 Bd = 3.33 ms each, two gaps of 995 ms
+        let burst = 16 * 48_000 / 4800;
+        assert_eq!(iq.len(), 3 * burst + 2 * 995 * 48);
+        assert!(iq[burst + 48 * 500].norm() == 0.0, "the gap is silent");
+    }
+
+    #[test]
+    fn gap_ms_defaults_to_50_and_is_bounded() {
+        let parse = |v: serde_json::Value| parse_params(v.as_object().unwrap().clone());
+        let (spec, _) = parse(
+            serde_json::json!({"family":"ook","symbol_rate_baud":1200,"bits":"a5","repeat":2}),
+        )
+        .unwrap();
+        assert!(matches!(spec, SynthSpec::Ook { gap_ms: 50, .. }));
+        let err = parse(serde_json::json!({"family":"ook","symbol_rate_baud":1200,"bits":"a5","repeat":2,"gap_ms":60001})).unwrap_err();
+        assert!(err.starts_with("gap_ms: "), "{err}");
     }
 
     #[test]
