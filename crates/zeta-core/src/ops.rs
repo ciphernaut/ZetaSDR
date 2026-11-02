@@ -13,7 +13,7 @@ use crate::capture::{CaptureMeta, write_cf32};
 use crate::classify::{Band, Classification, Label, Tried};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::{JobRecord, JobState};
-use crate::knowledge::{Allocation, DEFAULT_REGION, Signature, nearest_assignments};
+use crate::knowledge::{Allocation, DEFAULT_REGION, Signature, nearest_allocations};
 use crate::lease::LeaseError;
 use crate::modes::{
     Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow, ModeState,
@@ -1927,8 +1927,9 @@ pub enum OpResult {
         mode: Box<LoadedMode>,
     },
     /// `classify`: every classifier's labels, the modes decode-to-identify
-    /// considered with their score and outcome, and the nearest assignments the
-    /// knowledge providers hold for the selection's band (in the station's region).
+    /// considered with their score and outcome, and the allocations the knowledge
+    /// providers hold for the selection's band in the station's region (the nearest
+    /// assignments, then the plan rows: [`nearest_allocations`]).
     #[schemars(transform = require_all_value)]
     Classification {
         labels: Vec<Label>,
@@ -3535,7 +3536,7 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         .station()
         .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region);
     let allocations =
-        nearest_assignments(&node.knowledge(), &region, sel.center_hz, sel.bandwidth_hz).await;
+        nearest_allocations(&node.knowledge(), &region, sel.center_hz, sel.bandwidth_hz).await;
     let Classification {
         labels,
         tried,

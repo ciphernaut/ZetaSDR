@@ -252,6 +252,12 @@ struct Tracked {
     band_hz: u64,
     /// That row's score, the queue's order.
     score: f32,
+    /// The last unknown verdict's layer-1 record.
+    #[serde(default)]
+    features: Option<serde_json::Value>,
+    /// The last unknown verdict's register answer (identify's `allocations`).
+    #[serde(default)]
+    allocations: Option<serde_json::Value>,
 }
 
 /// What came of giving a kept decoder the `sondehub` sink.
@@ -457,7 +463,7 @@ struct Event<'a> {
     source: Option<&'a SourceId>,
     placed: Option<Placed>,
     features: Option<serde_json::Value>,
-    /// The register's nearest assignments for an `unknown` (the identify verdict's).
+    /// The register's allocations for an `unknown` (the identify verdict's).
     allocations: Option<serde_json::Value>,
 }
 
@@ -1131,6 +1137,8 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                     handled: false,
                     band_hz,
                     score,
+                    features: None,
+                    allocations: None,
                 });
             }
             (false, Some(i)) => {
@@ -1274,22 +1282,29 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         }
     }
     let label = v["verdict"]["label"].as_str().unwrap_or("unknown");
+    let features = v["verdict"]["features"].clone();
+    let allocations = v["verdict"]["allocations"].clone();
     let mut summary = format!(
-        "unknown at {}: {label} (identify {} of {})",
+        "unknown at {}: {label}{}{}",
         tracked.signal.mhz(),
+        measured(&features),
+        register_says(&allocations),
+    );
+    summary.push_str(&format!(
+        " (identify {} of {})",
         tracked.tries,
         RETRY_MAX + 1
-    );
+    ));
     if v.is_null() {
         summary.push_str("; identify ended without a verdict");
     }
-    let allocations = v["verdict"]["allocations"].clone();
-    summary.push_str(&licensed(&allocations));
+    tracked.features = Some(features.clone());
+    tracked.allocations = Some(allocations.clone());
     let signal = tracked.signal.clone();
     let e = Event {
         signal: Some(&signal),
         job: Some(&id),
-        features: Some(v["verdict"]["features"].clone()),
+        features: Some(features),
         allocations: Some(allocations),
         ..Event::default()
     };
@@ -1297,9 +1312,58 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     true
 }
 
-/// `; licensed: <licensee>, <site>, <d> km` for the nearest `tx` assignment of
-/// `allocations` (an identify verdict's, nearest first), or nothing when there is none.
-fn licensed(allocations: &serde_json::Value) -> String {
+/// `<n>` kHz from `hz`: whole kHz bare, else to one decimal.
+fn khz(hz: u64) -> String {
+    match hz % 1_000 {
+        0 => format!("{}", hz / 1_000),
+        _ => format!("{:.1}", hz as f64 / 1e3),
+    }
+}
+
+/// ` <bw> kHz[, <baud> Bd][, duty <d>]` from a verdict's layer-1 `features`, or nothing
+/// without a record.
+fn measured(features: &serde_json::Value) -> String {
+    let Some(bw) = features["bandwidth_hz"].as_u64() else {
+        return String::new();
+    };
+    let mut out = format!(" {} kHz", khz(bw));
+    if let Some(baud) = features["symbol_rate_baud"].as_u64() {
+        out.push_str(&format!(", {baud} Bd"));
+    }
+    if let Some(duty) = features["duty"].as_f64() {
+        out.push_str(&format!(", duty {duty:.2}"));
+    }
+    out
+}
+
+/// A designator's decoded modulation as one word: `FM`, `AM`, `PM`, else its letter.
+fn modulation_word(e: &serde_json::Value) -> String {
+    let name = e["modulation_name"].as_str().unwrap_or_default();
+    let words = [("Frequency", "FM"), ("Amplitude", "AM"), ("Phase", "PM")];
+    match words.iter().find(|(start, _)| name.starts_with(start)) {
+        Some((_, w)) => (*w).to_string(),
+        None => e["modulation"].as_str().unwrap_or("?").to_string(),
+    }
+}
+
+/// A designator's decoded information type as one word: `data`, `telephony`,
+/// `telegraphy`, else its letter.
+fn info_word(e: &serde_json::Value) -> String {
+    let info = e["info"].as_str().unwrap_or("?");
+    match info {
+        "D" => "data",
+        "E" => "telephony",
+        "A" | "B" => "telegraphy",
+        other => other,
+    }
+    .to_string()
+}
+
+/// `; register says <EMISSION> (<bw> kHz <mod> <info>) <licensee>, <site>, <d> km` for
+/// the nearest `tx` assignment of `allocations` (an identify verdict's, nearest
+/// first): without a decoded designator `; register says <licensee>, <site>, <d> km`;
+/// nothing when there is no transmitter.
+fn register_says(allocations: &serde_json::Value) -> String {
     let nearest = allocations
         .as_array()
         .into_iter()
@@ -1308,17 +1372,28 @@ fn licensed(allocations: &serde_json::Value) -> String {
     let Some(a) = nearest else {
         return String::new();
     };
-    let mut parts: Vec<String> = ["licensee", "site"]
+    let mut where_: Vec<String> = ["licensee", "site"]
         .iter()
         .filter_map(|k| a[*k].as_str().map(str::to_string))
         .collect();
     if let Some(d) = a["distance_km"].as_f64() {
-        parts.push(format!("{d:.0} km"));
+        where_.push(format!("{d:.0} km"));
     }
-    match parts.is_empty() {
-        true => String::new(),
-        false => format!("; licensed: {}", parts.join(", ")),
+    let mut out = String::from("; register says");
+    let e = &a["emission_decoded"];
+    if let (Some(code), Some(bw)) = (a["emission"].as_str(), e["bandwidth_hz"].as_u64()) {
+        out.push_str(&format!(
+            " {code} ({} kHz {} {})",
+            khz(bw),
+            modulation_word(e),
+            info_word(e)
+        ));
     }
+    if !where_.is_empty() {
+        out.push(' ');
+        out.push_str(&where_.join(", "));
+    }
+    out
 }
 
 /// Note the decoders' events; drop those whose job no longer runs; stop (`lost`) those

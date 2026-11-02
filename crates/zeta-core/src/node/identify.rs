@@ -24,7 +24,7 @@ use super::persist::now;
 use super::{Inner, NodeError, source_fault_reason};
 use crate::classify::{Band, Measurement, Outcome};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
-use crate::knowledge::{Allocation, DEFAULT_REGION, nearest_assignments};
+use crate::knowledge::{Allocation, DEFAULT_REGION, nearest_allocations};
 use crate::modes::Proof;
 use crate::modes::score::{allocation_match, allocation_term, score_rows};
 use crate::modes::{LoadedMode, ModeState};
@@ -433,7 +433,8 @@ impl Inner {
 
 /// The `identify` job's body: (1) measure [`IDENTIFY_MEASURE_MS`] of the ring over
 /// the band with the node's layer-1 classifiers, and ask the knowledge providers once
-/// for the band's nearest assignments (the station's region, else [`DEFAULT_REGION`]);
+/// for the band's allocations ([`nearest_allocations`]; the station's region, else
+/// [`DEFAULT_REGION`]);
 /// (2) score the rows ([`score_rows`], the measured centre, the job's own band, the
 /// register's [`allocation_term`]; no catalogue term, which lives with the
 /// classifiers) and publish `skipped_band` for those wider than the band and
@@ -469,15 +470,13 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         .as_ref()
         .map_or(r.tuning.center_hz.0, |m| m.features.center_hz.0);
     let bw = r.tuning.bandwidth_hz.0;
-    // Each trial runs on the measured centre when the measurement lies in the band.
-    let recentred = measured.is_some() && m_center.abs_diff(r.tuning.center_hz.0) <= bw / 2;
-    let trial = Tuning {
-        center_hz: match recentred {
-            true => Hz(m_center),
-            false => r.tuning.center_hz,
-        },
-        bandwidth_hz: r.tuning.bandwidth_hz,
-    };
+    let (trial, recentred) = trial_tuning(
+        r.tuning,
+        capture,
+        measured
+            .as_ref()
+            .map(|m| (m.features.center_hz.0, m.label.name.as_str())),
+    );
     let region = inner
         .station
         .lock()
@@ -485,7 +484,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         .as_ref()
         .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region.clone());
     let providers = inner.knowledge.read().unwrap().clone();
-    let lookup = nearest_assignments(
+    let lookup = nearest_allocations(
         &providers,
         &region,
         r.tuning.center_hz,
@@ -568,6 +567,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                         "summary": summary,
                         "evidence": evidence,
                         "job": child.0,
+                        "recentred": recentred,
                         "allocations": allocations,
                     },
                     "attempts": attempts,
@@ -592,6 +592,38 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     }});
     inner.verdict(&r, verdict);
     Ok(())
+}
+
+/// The band each trial job runs on, and whether it is re-centred: the identify band's
+/// width on the measured centre (`measured`: the layer-1 centre and label) when the label
+/// is not `noise`, the centre lies in `band`, and the shifted band lies inside `capture`
+/// (a trial outside the capture the job holds would need a retune its lease forbids);
+/// else `band` itself.
+fn trial_tuning(band: Tuning, capture: Tuning, measured: Option<(u64, &str)>) -> (Tuning, bool) {
+    let half = band.bandwidth_hz.0 / 2;
+    let edges = |t: Tuning| {
+        let h = t.bandwidth_hz.0 / 2;
+        (
+            t.center_hz.0.saturating_sub(h),
+            t.center_hz.0.saturating_add(h),
+        )
+    };
+    let (cap_lo, cap_hi) = edges(capture);
+    let fits = |c: u64| {
+        c.abs_diff(band.center_hz.0) <= half
+            && c.saturating_sub(half) >= cap_lo
+            && c.saturating_add(half) <= cap_hi
+    };
+    match measured {
+        Some((c, label)) if label != "noise" && fits(c) => (
+            Tuning {
+                center_hz: Hz(c),
+                bandwidth_hz: band.bandwidth_hz,
+            },
+            true,
+        ),
+        _ => (band, false),
+    }
 }
 
 /// The child the loop is trying. Stopped by [`ChildGuard::stop`], or, on any other exit
@@ -627,5 +659,39 @@ impl Drop for ChildGuard {
             let _ = inner.stop_gated(&child).await;
             inner.leases.idle_if_unheld(port.as_ref()).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(center_hz: u64, bandwidth_hz: u64) -> Tuning {
+        Tuning {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(bandwidth_hz),
+        }
+    }
+
+    #[test]
+    fn trials_recentre_only_inside_the_band_and_the_capture() {
+        let band = t(144_800_000, 12_500);
+        let wide = t(144_800_000, 2_048_000);
+        // Inside both: the measured centre, the band's width.
+        let got = trial_tuning(band, wide, Some((144_798_000, "fsk")));
+        assert_eq!(got, (t(144_798_000, 12_500), true));
+        // A measured centre outside the band: the band.
+        let got = trial_tuning(band, wide, Some((144_810_000, "fsk")));
+        assert_eq!(got, (band, false));
+        // Noise, or no measurement: the band.
+        let got = trial_tuning(band, wide, Some((144_798_000, "noise")));
+        assert_eq!(got, (band, false));
+        assert_eq!(trial_tuning(band, wide, None), (band, false));
+        // A capture no wider than the band: the shifted band would leave it.
+        let got = trial_tuning(band, band, Some((144_798_000, "fsk")));
+        assert_eq!(got, (band, false));
+        // On the band's own centre the trial fits any capture holding the band.
+        let got = trial_tuning(band, band, Some((144_800_000, "fsk")));
+        assert_eq!(got, (band, true));
     }
 }

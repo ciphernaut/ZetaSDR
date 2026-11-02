@@ -125,34 +125,36 @@ pub const DEFAULT_REGION: &str = "AU";
 /// How many assignments `identify` and `classify` keep, nearest first.
 pub const NEAREST_ASSIGNMENTS: usize = 5;
 
-/// Every provider's assignments (`kind` `assignment`; plan rows are not kept) for the
-/// band in `region`, nearest first (an assignment without a distance last; the
-/// providers' order otherwise, which puts transmitters before receivers), at most
-/// [`NEAREST_ASSIGNMENTS`]. One call per provider: a lookup against a dead service
-/// may take seconds.
-pub async fn nearest_assignments(
+/// What `identify`, `classify` and the watch report for a band: every provider's
+/// assignments (`kind` `assignment`) in `region`, nearest first (one without a distance
+/// last; the providers' order otherwise, which puts transmitters before receivers), at
+/// most [`NEAREST_ASSIGNMENTS`], then every plan row (`kind` `plan`, or none: the seed
+/// and static entries) in provider order, uncapped. One call per provider: a lookup
+/// against a dead service may take seconds.
+pub async fn nearest_allocations(
     providers: &[Arc<dyn KnowledgeProvider>],
     region: &str,
     center_hz: Hz,
     bandwidth_hz: Hz,
 ) -> Vec<Allocation> {
-    let mut out = Vec::new();
+    let (mut assignments, mut plans) = (Vec::new(), Vec::new());
     for p in providers {
-        out.extend(
-            p.allocations(region, center_hz, bandwidth_hz)
-                .await
-                .into_iter()
-                .filter(|a| a.kind.as_deref() == Some("assignment")),
-        );
+        for a in p.allocations(region, center_hz, bandwidth_hz).await {
+            match a.kind.as_deref() == Some("assignment") {
+                true => assignments.push(a),
+                false => plans.push(a),
+            }
+        }
     }
-    out.sort_by(|a, b| match (a.distance_km, b.distance_km) {
+    assignments.sort_by(|a, b| match (a.distance_km, b.distance_km) {
         (Some(x), Some(y)) => x.total_cmp(&y),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     });
-    out.truncate(NEAREST_ASSIGNMENTS);
-    out
+    assignments.truncate(NEAREST_ASSIGNMENTS);
+    assignments.extend(plans);
+    assignments
 }
 
 /// Providers backed by JSON data held in memory.
@@ -236,6 +238,53 @@ impl KnowledgeProvider for StaticKnowledge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers `rows` whatever it is asked.
+    struct Fixed(Vec<Allocation>);
+
+    #[async_trait]
+    impl KnowledgeProvider for Fixed {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+        async fn allocations(&self, _: &str, _: Hz, _: Hz) -> Vec<Allocation> {
+            self.0.clone()
+        }
+        async fn signatures(&self, _: Hz, _: Hz) -> Vec<Signature> {
+            Vec::new()
+        }
+    }
+
+    fn row(kind: Option<&str>, service: &str, distance_km: Option<f64>) -> Allocation {
+        Allocation {
+            kind: kind.map(Into::into),
+            service: service.into(),
+            distance_km,
+            ..Allocation::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn nearest_allocations_keep_five_assignments_then_every_plan_row() {
+        let mut first = vec![row(Some("plan"), "p1", None)];
+        for d in [9.0, 3.0, 7.0, 1.0] {
+            first.push(row(Some("assignment"), &format!("a{d}"), Some(d)));
+        }
+        let second = vec![
+            row(Some("assignment"), "a-none", None),
+            row(None, "seed", None),
+            row(Some("assignment"), "a5", Some(5.0)),
+            row(Some("assignment"), "a2", Some(2.0)),
+            row(Some("plan"), "p2", None),
+        ];
+        let providers: Vec<Arc<dyn KnowledgeProvider>> =
+            vec![Arc::new(Fixed(first)), Arc::new(Fixed(second))];
+        let got = nearest_allocations(&providers, "AU", Hz(1), Hz(1)).await;
+        let services: Vec<&str> = got.iter().map(|a| a.service.as_str()).collect();
+        // The five nearest assignments (the distance-less and the farthest dropped),
+        // then the plan rows, a kind-less one among them, in provider order.
+        assert_eq!(services, ["a1", "a2", "a3", "a5", "a7", "p1", "seed", "p2"]);
+    }
 
     #[tokio::test]
     async fn builtin_signatures_include_aprs_at_144_800() {

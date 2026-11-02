@@ -30,19 +30,25 @@ const APRS_HZ: u64 = 144_800_000;
 const POCSAG_HZ: u64 = 148_637_500;
 /// Where the tone fixture's 1 kHz tone sits.
 const TONE_HZ: u64 = APRS_HZ + 1_000;
+/// The narrow fixture's rate: a capture no wider than an identify band of this width.
+const NARROW_RATE_HZ: u32 = 48_000;
+/// The narrow fixture's tone, above its centre.
+const NARROW_TONE_HZ: u64 = 2_000;
 
 /// Each node runs a 2.048 MHz source in real time: the tests run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The fixtures, written once: the POCSAG page centred on [`APRS_HZ`] and on
 /// [`POCSAG_HZ`], one second of a 1 kHz tone on [`APRS_HZ`], and one second of random
-/// 2400-baud GFSK (no row proves it) on [`APRS_HZ`].
+/// 2400-baud GFSK (no row proves it) on [`APRS_HZ`], and one second sampled at
+/// [`NARROW_RATE_HZ`] on [`APRS_HZ`] holding a tone [`NARROW_TONE_HZ`] above it.
 struct Fixtures {
     _dir: tempfile::TempDir,
     pocsag_on_aprs: PathBuf,
     pocsag: PathBuf,
     tone: PathBuf,
     gfsk: PathBuf,
+    narrow: PathBuf,
 }
 
 fn fixtures() -> &'static Fixtures {
@@ -72,12 +78,22 @@ fn fixtures() -> &'static Fixtures {
         let mut gfsk = zeta_dsp::synth::gfsk_modulate(&symbols, 2, 2400, 3_000.0, RATE_HZ);
         zeta_dsp::synth::awgn(&mut gfsk, 20.0, 1);
         let gfsk = write(dir.path(), "gfsk", &gfsk, RATE_HZ, APRS_HZ);
+        let n = NARROW_RATE_HZ as usize;
+        let mut narrow: Vec<Complex<f32>> = (0..n)
+            .map(|k| {
+                let cycles = k as f64 * NARROW_TONE_HZ as f64 / NARROW_RATE_HZ as f64;
+                Complex::from_polar(0.5, (2.0 * std::f64::consts::PI * cycles.fract()) as f32)
+            })
+            .collect();
+        zeta_dsp::synth::awgn(&mut narrow, 20.0, 2);
+        let narrow = write(dir.path(), "narrow", &narrow, NARROW_RATE_HZ, APRS_HZ);
         Fixtures {
             _dir: dir,
             pocsag_on_aprs,
             pocsag,
             tone,
             gfsk,
+            narrow,
         }
     })
 }
@@ -721,9 +737,10 @@ async fn the_verdict_carries_the_nearest_allocations_and_the_score_term() {
     assert!(verdict["mode"].is_null(), "{ctx}");
     assert_eq!(verdict["recentred"], true, "{ctx}");
     let allocations = verdict["allocations"].as_array().expect("allocations");
-    // The assignment only: the plan row is not kept.
-    assert_eq!(allocations.len(), 1, "{ctx}");
+    // The assignment first, then the plan row.
+    assert_eq!(allocations.len(), 2, "{ctx}");
     assert_eq!(allocations[0]["licensee"], LICENSEE, "{ctx}");
+    assert_eq!(allocations[1]["kind"], "plan", "{ctx}");
     let pocsag = outcome(&events, "pocsag_decode").expect("pocsag_decode considered");
     assert_eq!(pocsag["allocation"]["licensee"], LICENSEE, "{pocsag}");
     // What the measurement alone scores the row.
@@ -760,5 +777,54 @@ async fn trial_jobs_start_on_the_measured_centre() {
     );
     assert_eq!(rec.tuning.bandwidth_hz, Hz(BANDWIDTH_HZ));
     node.job_stop(&id).await.unwrap();
+    stop_all(&node).await;
+}
+
+/// An identify band as wide as the capture: a trial moved to the measured centre (the
+/// tone, 2 kHz up) would leave the capture the job holds, so every trial starts on the
+/// band's centre and the verdict says it did not re-centre.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trials_stay_on_the_band_when_the_capture_is_no_wider() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().narrow).await;
+    let op = Op::JobStart {
+        kind: JobKind::Identify,
+        source: rx(),
+        center_hz: Hz(APRS_HZ),
+        bandwidth_hz: Hz(NARROW_RATE_HZ as u64),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![],
+    };
+    let id = match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("identify: {r:?}"),
+    };
+    until("identify ends", Duration::from_secs(60), || {
+        state(&node, &id) != JobState::Running
+    })
+    .await;
+    let ctx = node.job_context(&id).unwrap();
+    let verdict = &ctx["identify"]["verdict"];
+    assert!(verdict["mode"].is_null(), "{ctx}");
+    let measured = verdict["features"]["center_hz"].as_u64().unwrap();
+    assert!(
+        measured.abs_diff(APRS_HZ + NARROW_TONE_HZ) <= 500,
+        "measured {measured}: {ctx}"
+    );
+    assert_eq!(verdict["recentred"], false, "{ctx}");
+    let trials: Vec<_> = node.job_list().into_iter().filter(|r| r.id != id).collect();
+    assert!(!trials.is_empty(), "no trial started: {ctx}");
+    for t in &trials {
+        assert_eq!(
+            t.tuning.center_hz,
+            Hz(APRS_HZ),
+            "{} at {:?}",
+            t.kind,
+            t.tuning
+        );
+    }
     stop_all(&node).await;
 }

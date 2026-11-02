@@ -894,8 +894,9 @@ async fn classify_lists_allocations_beside_the_labels() {
     else {
         panic!("expected Classification");
     };
-    // The assignment; the plan row is not kept.
-    assert_eq!(allocations.len(), 1, "{allocations:?}");
+    // The assignment first, then the plan row.
+    assert_eq!(allocations.len(), 2, "{allocations:?}");
+    assert_eq!(allocations[1].kind.as_deref(), Some("plan"));
     assert_eq!(
         allocations[0].licensee.as_deref(),
         Some("Test Paging Pty Ltd")

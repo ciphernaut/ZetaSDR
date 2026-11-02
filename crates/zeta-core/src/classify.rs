@@ -87,8 +87,8 @@ pub struct Tried {
 }
 
 /// A classifier run's result: every label, the modes decode-to-identify
-/// considered in the order it considered them, and the register's assignments for
-/// the band the run was handed (nearest first).
+/// considered in the order it considered them, and the allocations for the band the
+/// run was handed (the nearest assignments, then the plan rows).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
@@ -212,7 +212,7 @@ impl ClassifierSet {
     /// `center_hz`), lowest layer first; registration order within a layer.
     /// The first [`Measurement`] a classifier returns is passed to every
     /// classifier after it; the modes each tried are listed in the same order.
-    /// `allocations` (the register's assignments for the band) are handed to
+    /// `allocations` (the knowledge providers' for the band) are handed to
     /// every classifier and returned with the result.
     pub async fn run_all(
         &self,

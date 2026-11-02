@@ -715,14 +715,18 @@ async fn an_unknown_summary_names_the_licensee() {
     .await;
     let e = &events.watch("unknown")[0];
     let summary = e["summary"].as_str().unwrap();
-    assert!(
-        summary.contains("; licensed: Test Telemetry Pty Ltd, Mt Gravatt, 8 km"),
-        "{e}"
-    );
-    assert_eq!(
-        e["allocations"][0]["licensee"], "Test Telemetry Pty Ltd",
-        "{e}"
-    );
+    // The measurement, then the register's transmitter.
+    assert!(summary.contains(" kHz"), "{e}");
+    let register = "; register says 16K0F1D (16 kHz FM data) Test Telemetry Pty Ltd, \
+        Mt Gravatt, 8 km (identify 1 of";
+    assert!(summary.contains(register), "{e}");
+    let licensee = "Test Telemetry Pty Ltd";
+    assert_eq!(e["allocations"][0]["licensee"], licensee, "{e}");
+    // The signal keeps the verdict's record and register answer.
+    let ctx = node.job_context(&watch).unwrap();
+    let s = &ctx["watch"]["signals"][0];
+    assert!(s["features"]["bandwidth_hz"].is_u64(), "{ctx}");
+    assert_eq!(s["allocations"][0]["licensee"], licensee, "{ctx}");
     stop_all(&node).await;
 }
 
