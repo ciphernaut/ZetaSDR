@@ -9,9 +9,9 @@
 //                                stream of pickMix's mix (found in `api.streams()` by
 //                                `provenance.job` and `kind === "event"`, and again through
 //                                `onReconnect` after the mix was restarted); a pick that
-//                                changes or goes closes it. On opening, `active` and `last`
-//                                are seeded from the mix's `job_context.mix`, unless an event
-//                                came first, and again after a reconnect (a restarted mix says
+//                                changes or goes closes it. When the socket has opened, first
+//                                and after a reconnect, `active` and `last` are seeded from the
+//                                mix's `job_context.mix`, unless an event came first (a mix says
 //                                nothing until its set changes). Each `protocol: "mix"` event
 //                                replaces `active`; a job that left it becomes `last`, stamped
 //                                with the page's own time. `last` survives a restart of the
@@ -191,15 +191,15 @@ export class MixWatch {
         // changes, so what it holds now is read again, as when the socket first opened.
         onReconnect: async () => {
           const next = await this.#streamId(id);
-          if (next && this.jobId === id) {
-            this.sawEvent = false;
-            this.#seed(id);
-          }
+          if (next && this.jobId === id) this.sawEvent = false;
           return next;
         },
+        // Only now: the node subscribes a socket before it answers the upgrade, so a change
+        // after this read reaches the socket. Read sooner, a change between the read and the
+        // subscription reaches neither, and the page stays dark until the set next changes.
+        onOpen: () => this.#seed(id),
       },
     );
-    this.#seed(id);
   }
 
   #event(id, payload) {

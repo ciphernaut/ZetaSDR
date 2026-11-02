@@ -27,7 +27,7 @@
 //     api.health() -> Promise<{status, version, build, uptime_s, ws_connections}>
 //     api.build, api.uptimeS  the `build` and `uptime_s` connect() saw (null on an older node)
 //     api.streams() -> Promise<[{id, kind, provenance}]>   GET /streams (not an op)
-//     api.streamText(id, onMessage, onClose, {reconnect = true, onReconnect}) -> {close}
+//     api.streamText(id, onMessage, onClose, {reconnect = true, onReconnect, onOpen}) -> {close}
 //         Text websocket /stream/{id}; onMessage(msg) per parsed message
 //         ({"type":"frame",...}, {"type":"lagged","missed":n}, {"type":"closed","reason":s});
 //         onClose({code, reason, reconnecting}) after every socket close. While `reconnect`
@@ -35,7 +35,8 @@
 //         `onReconnect(oldId) -> Promise<id|null>` is given the id is re-resolved first
 //         (null: try again after the next backoff; nothing more happens if the subscription
 //         was closed meanwhile). Stream ids change when a job restarts under `graph_put`, so
-//         callers re-resolve by provenance with `streams()`.
+//         callers re-resolve by provenance with `streams()`. `onOpen()` runs on every open: the
+//         node subscribes before it answers the upgrade, so what is published after it arrives.
 //     api.streamBinary(id, onFrame, {credits = 256, topup = 128, onText, onClose,
 //                      reconnect = true, onReconnect}) -> {close}
 //         Binary websocket /stream/{id}?format=binary. Grants `credits` on open with
@@ -241,7 +242,9 @@ export class Api {
       "",
       false,
       {
-        open() {},
+        open() {
+          if (opts.onOpen) opts.onOpen();
+        },
         message(ev) {
           let msg;
           try {

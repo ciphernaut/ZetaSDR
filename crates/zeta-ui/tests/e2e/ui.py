@@ -3276,6 +3276,54 @@ def scenario_mix_lights_the_speaker_and_names_the_last_heard(page, url, secret):
         stop_mixes(url, secret)
 
 
+def scenario_mix_active_before_the_socket_opens_still_lights(page, url, secret):
+    # The mix says `active` only when it changes, so the seed must read after the node has
+    # subscribed the socket: a change between an earlier read and the subscription reaches
+    # neither. Sockets are held back here, so the demodulator starts talking in that gap.
+    stop_mixes(url, secret)
+    select_source(page, url, secret, "cb")
+    demod = None
+    page.evaluate("""() => {
+      const Real = window.WebSocket;
+      window.zetaHeldSockets = { Real, open: [] };
+      window.WebSocket = function (url, protocols) {
+        const held = { close() { if (held.real) held.real.close(); else held.closed = true; } };
+        window.zetaHeldSockets.open.push(() => {
+          if (held.closed) return;
+          const ws = new Real(url, protocols);
+          held.real = ws;
+          for (const on of ["onopen", "onmessage", "onclose"]) {
+            ws[on] = (ev) => held[on] && held[on](ev);
+          }
+        });
+        return held;
+      };
+    }""")
+    release = """() => {
+      window.WebSocket = window.zetaHeldSockets.Real;
+      for (const open of window.zetaHeldSockets.open) open();
+      window.zetaHeldSockets.open = [];
+    }"""
+    try:
+        mix = http_mix_start(url, secret, ["cb"])
+        page.evaluate("window.zetaTest.poll()")
+        wait_until(lambda: page.evaluate("window.zetaHeldSockets.open.length") > 0, 5.0,
+                   "the mix's socket was asked for")
+        page.wait_for_timeout(300)  # whatever the page reads now, it reads an idle mix
+        demod = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+        wait_until(lambda: http_json(url, secret, "/op", {"op": "job_context", "job": mix})
+                   ["value"]["mix"]["active"], 5.0, "the mix hears the demodulator")
+        page.evaluate(release)
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f'#jobs .job[data-id="{demod}"].speaking')).to_be_visible(
+            timeout=5_000)
+    finally:
+        page.evaluate(release)
+        if demod:
+            stop_job(url, secret, demod)
+        stop_mixes(url, secret)
+
+
 def scenario_stopping_the_mix_ends_playback_and_lights(page, url, secret):
     stop_mixes(url, secret)
     select_source(page, url, secret, "cb")
