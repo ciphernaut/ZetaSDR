@@ -3853,6 +3853,31 @@ def scenario_subjects_tab_appears_only_with_a_subject_job(page, url, secret):
     expect(page.locator("#subjects section.subject-job")).to_have_count(0)
 
 
+def scenario_subjects_table_has_padding_and_scrolls_sideways(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    select_source(page, url, secret, "tone")
+    page.set_viewport_size(WIDE)
+    run_cmd(page, "view set map on")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+        pane = page.locator("#subjects").bounding_box()
+        first = page.locator("#subjects tbody tr.subject td").first.bounding_box()
+        assert first["x"] - pane["x"] >= 4, f"{first} {pane}"
+        last = page.locator("#subjects thead th").last
+        sec = page.locator("#subjects section.subject-job")
+        assert sec.evaluate("(e) => e.scrollWidth >= e.clientWidth") is True
+        last.scroll_into_view_if_needed()
+        lb, pb = last.bounding_box(), page.locator("#subjects").bounding_box()
+        assert lb["x"] >= pb["x"] and lb["x"] + lb["width"] <= pb["x"] + pb["width"] + 1, f"{lb} {pb}"
+        # The key stays in view while the rest is scrolled in.
+        fb = page.locator("#subjects thead th").first.bounding_box()
+        assert fb["x"] - pb["x"] >= 4, f"{fb} {pb}"
+        run_cmd(page, "view set map off")
+    finally:
+        stop_job(url, secret, job)
+
+
 def scenario_subjects_dim_and_drop(page, url, secret):
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set subject_dim_s 0")

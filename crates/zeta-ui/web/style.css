@@ -143,15 +143,22 @@ html[data-map="on"] #waterfall { right: 50%; }
 html[data-subjects="on"] #waterfall { right: 50%; }
 html:not([data-footprint="narrow"])[data-map="on"][data-subjects="on"] #map { bottom: 50%; }
 html:not([data-footprint="narrow"])[data-map="on"][data-subjects="on"] #subjects { top: 50%; border-top: 1px solid var(--border); }
-#subjects .subject-job { padding: 4px 8px; }
-#subjects h3 { margin: 4px 0; font-size: 12px; font-weight: normal; color: var(--accent); }
-#subjects .not-watched { color: var(--error); font-size: 11px; }
-#subjects table { width: 100%; border-collapse: collapse; font-size: 12px; }
-#subjects th { text-align: left; font-weight: normal; color: var(--dim); cursor: pointer; white-space: nowrap; padding: 1px 6px 1px 0; }
-#subjects td { max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 6px 1px 0; }
+/* The pane is a column of sections; each section scrolls both ways on its own, so its header
+   row sticks to it and its first column (the key) stays put when the rest is scrolled in. */
+#subjects { display: flex; flex-direction: column; }
+#subjects[hidden] { display: none; }
+#subjects .subject-job { flex: 0 1 auto; min-height: 0; margin: 4px 8px; overflow: auto; }
+#subjects h3 { position: sticky; left: 0; margin: 4px 0; font-size: 12px; font-weight: normal; color: var(--accent); }
+#subjects .not-watched { position: sticky; left: 0; color: var(--error); font-size: 11px; }
+#subjects table { min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+#subjects thead th { position: sticky; top: 0; z-index: 2; background: var(--bg); text-align: left; font-weight: normal; color: var(--dim); cursor: pointer; white-space: nowrap; padding: 1px 8px 1px 0; }
+#subjects td { max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 8px 1px 0; }
+#subjects th:first-child, #subjects td:first-child { position: sticky; left: 0; padding-left: 4px; background: var(--bg); }
+#subjects thead th:first-child { z-index: 3; }
 #subjects tr.subject { cursor: pointer; }
 #subjects tr.subject.dim { color: var(--dim); }
-#subjects tr.subject.selected { background: var(--bar); box-shadow: inset 2px 0 0 var(--accent); }
+#subjects tr.subject.selected, #subjects tr.subject.selected td:first-child { background: var(--bar); }
+#subjects tr.subject.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 #waterfall { --axis-w: 64px; }
 #waterfall .wf-axis {
   position: absolute; left: 0; top: 0; bottom: 0; width: var(--axis-w);
