@@ -21,6 +21,30 @@ pub struct FeatureRecord {
     pub symbol_rate_baud: Option<Baud>,
     pub snr_db: f32,
     pub burst: bool,
+    /// Fraction of the window the signal is on (1 when continuous).
+    #[serde(default)]
+    #[schemars(required)]
+    pub duty: Option<f32>,
+    /// How many on-runs (bursts) the window holds.
+    #[serde(default)]
+    #[schemars(required)]
+    pub bursts: Option<u32>,
+    /// Median burst length, ms.
+    #[serde(default)]
+    #[schemars(required)]
+    pub burst_ms: Option<f32>,
+    /// Median burst start-to-start interval, ms; `None` under two bursts.
+    #[serde(default)]
+    #[schemars(required)]
+    pub period_ms: Option<f32>,
+    /// Modulation order (2 or 4 tones, or PSK points) when layer 1 proved one.
+    #[serde(default)]
+    #[schemars(required)]
+    pub order: Option<u8>,
+    /// Spacing of adjacent FSK tones when layer 1 measured them.
+    #[serde(default)]
+    #[schemars(required)]
+    pub tone_spacing_hz: Option<Hz>,
 }
 
 /// One classifier verdict.
@@ -369,6 +393,12 @@ mod tests {
             symbol_rate_baud: None,
             snr_db: 12.5,
             burst: false,
+            duty: None,
+            bursts: None,
+            burst_ms: None,
+            period_ms: None,
+            order: None,
+            tone_spacing_hz: None,
         };
         let uses = Arc::new(Uses(Mutex::new(Vec::new())));
         let mut set = ClassifierSet::default();

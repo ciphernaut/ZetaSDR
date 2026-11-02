@@ -80,6 +80,12 @@ async fn catalogue_uses_a_handed_measurement_without_measuring() {
             symbol_rate_baud: None,
             snr_db: 20.0,
             burst: false,
+            duty: None,
+            bursts: None,
+            burst_ms: None,
+            period_ms: None,
+            order: None,
+            tone_spacing_hz: None,
         },
         label: Label {
             layer: 1,
