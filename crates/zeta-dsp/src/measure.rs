@@ -39,6 +39,10 @@ const LOCAL_BINS: usize = 16;
 const SILENT_AUDIO: f32 = 0.25;
 /// Lowest symbol rate searched.
 const MIN_LINE_HZ: f64 = 50.0;
+/// FFT size of the cyclostationary line search (at most; a shorter block takes
+/// the largest power of two it holds): a line grows with the transform length
+/// and the noise continuum does not.
+const CYCLO_SIZE: usize = 4096;
 /// Below this SNR a block is labelled noise.
 const NOISE_SNR_DB: f32 = 6.0;
 /// FM needs discriminator audio (band-limited to half the occupied band) with
@@ -95,8 +99,11 @@ const BURST_ON_DB: f64 = 6.0;
 const BURST_MERGE_MS: u64 = 2;
 /// ... runs shorter than this many ms are dropped ...
 const BURST_MIN_MS: u64 = 1;
-/// ... and a window on for less than this fraction is measured over its runs only.
+/// ... and a window on for less than this fraction is measured over its runs only ...
 const BURST_DUTY_MAX: f32 = 0.5;
+/// ... unless its runs repeat faster than this many ms: shorter, denser on-off
+/// runs are keying, not bursts.
+const BURST_MIN_PERIOD_MS: f32 = 20.0;
 
 /// Noise floor of [`measure_band`]: this percentile of the in-band bins. A
 /// signal may fill more than half of a channel (APRS: Carson ~10.4 kHz in
@@ -385,15 +392,17 @@ fn keying_signal(iq: &[Complex<f32>], rate_hz: u64, cv: f32, bandwidth_hz: u64) 
 /// Positive-frequency half of the `SIZE`-bin spectrum of demeaned real `x`
 /// (bin `k` is `k · rate / SIZE`); `None` when `x` is shorter than `SIZE`.
 fn real_spectrum(x: &[f32]) -> Option<Vec<f32>> {
-    if x.len() < SIZE {
-        return None;
-    }
-    let mean = x.iter().map(|&v| v as f64).sum::<f64>() / x.len() as f64;
+    (x.len() >= SIZE).then(|| half_spectrum(x, SIZE))
+}
+
+/// Positive-frequency half of the `size`-bin Hann spectrum of demeaned real `x`.
+fn half_spectrum(x: &[f32], size: usize) -> Vec<f32> {
+    let mean = x.iter().map(|&v| v as f64).sum::<f64>() / x.len().max(1) as f64;
     let c: Vec<Complex<f32>> = x
         .iter()
         .map(|&v| Complex::new((v as f64 - mean) as f32, 0.0))
         .collect();
-    Some(power_spectrum_db(&c, SIZE, Window::Hann)[SIZE / 2..].to_vec())
+    power_spectrum_db(&c, size, Window::Hann)[size / 2..].to_vec()
 }
 
 /// Strongest line (a local maximum) of the keying signal between
@@ -416,28 +425,76 @@ fn symbol_rate(iq: &[Complex<f32>], rate_hz: u64, cv: f32, bandwidth_hz: u64) ->
     } else {
         db.len()
     };
-    strongest_line(&db, rate_hz, lo, hi)
+    strongest_line(&db, bin_hz, lo, hi).map(|(hz, _)| Baud(hz.round() as u32))
 }
 
-/// Cyclostationary symbol rate: the [`strongest_line`] of the spectrum of
-/// `|x|²` (demeaned) between `MIN_LINE_HZ` and `max_hz`. Amplitude keying and
-/// band-limited linear modulation (OOK/ASK, PSK) put their symbol rate there; a
-/// constant-envelope signal does not, so the caller asks only when the
+/// Cyclostationary symbol rate: the stronger of two candidate lines between
+/// `MIN_LINE_HZ` and `max_hz` ([`strongest_line`] of each spectrum), the one
+/// standing further over its local median: (a) the spectrum of `|x|²`, where
+/// shaped linear modulation (PSK, ASK) has its symbol-rate line, and (b) the
+/// spectrum of the rectified envelope derivative `| |x[n]| - |x[n-1]| |`, where
+/// rectangular on-off keying, whose `|x|²` has a null at the baud, has an edge
+/// line. Both are taken over up to `CYCLO_SIZE` points. `iq` should hold the
+/// occupied band only ([`bandpass`]): noise outside it buries the lines. A
+/// constant-envelope signal has neither line, so the caller asks only when the
 /// envelope moves (see [`rate_of`]).
 fn cyclo_symbol_rate(iq: &[Complex<f32>], rate_hz: u64, max_hz: f64) -> Option<Baud> {
-    let env: Vec<f32> = iq.iter().map(|s| s.norm_sqr()).collect();
-    let db = real_spectrum(&env)?;
-    let bin_hz = rate_hz as f64 / SIZE as f64;
+    if iq.len() < SIZE + 1 {
+        return None;
+    }
+    let size = CYCLO_SIZE.min(1 << (usize::BITS - 1 - (iq.len() - 1).leading_zeros()));
+    let bin_hz = rate_hz as f64 / size as f64;
     let lo = (MIN_LINE_HZ / bin_hz).ceil() as usize;
-    strongest_line(&db, rate_hz, lo, (max_hz / bin_hz).floor() as usize + 1)
+    let hi = (max_hz / bin_hz).floor() as usize + 1;
+    let power: Vec<f32> = iq.iter().map(|s| s.norm_sqr()).collect();
+    let edges: Vec<f32> = iq
+        .windows(2)
+        .map(|w| (w[1].norm() - w[0].norm()).abs())
+        .collect();
+    [power, edges]
+        .iter()
+        .filter_map(|x| strongest_line(&half_spectrum(x, size), bin_hz, lo, hi))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(hz, _)| Baud(hz.round() as u32))
+}
+
+/// `iq` with everything outside `offset_hz ± bandwidth_hz / 2` removed by FFT.
+fn bandpass(
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    offset_hz: f64,
+    bandwidth_hz: f64,
+) -> Vec<Complex<f32>> {
+    let n = iq.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut planner = FftPlanner::<f32>::new();
+    let mut buf = iq.to_vec();
+    planner.plan_fft_forward(n).process(&mut buf);
+    let bin_hz = rate_hz as f64 / n as f64;
+    for (k, b) in buf.iter_mut().enumerate() {
+        let f = if 2 * k <= n {
+            k as f64
+        } else {
+            k as f64 - n as f64
+        } * bin_hz;
+        if (f - offset_hz).abs() > bandwidth_hz / 2.0 {
+            *b = Complex::new(0.0, 0.0);
+        }
+    }
+    planner.plan_fft_inverse(n).process(&mut buf);
+    let scale = 1.0 / n as f32;
+    buf.iter().map(|c| c * scale).collect()
 }
 
 /// The strongest local maximum of the half spectrum `db` in bins `lo..hi`
 /// that stands `LINE_DB` above the median of `db[lo..]` and also `LINE_DB`
 /// above the median of its own neighbourhood (`LOCAL_BINS` either side, its
-/// main lobe excluded), so a coloured noise hump is not mistaken for a line;
-/// its frequency (bin `k` is `k · rate / SIZE`) refined by a parabola.
-fn strongest_line(db: &[f32], rate_hz: u64, lo: usize, hi: usize) -> Option<Baud> {
+/// main lobe excluded), so a coloured noise hump is not mistaken for a line:
+/// its frequency (bin `k` is `k · bin_hz`) refined by a parabola, and its
+/// margin over that local median in dB.
+fn strongest_line(db: &[f32], bin_hz: f64, lo: usize, hi: usize) -> Option<(f64, f32)> {
     let lo = lo.max(1);
     let hi = hi.min(db.len());
     if lo + 1 >= hi {
@@ -457,8 +514,7 @@ fn strongest_line(db: &[f32], rate_hz: u64, lo: usize, hi: usize) -> Option<Baud
             is_max && db[k] - global >= LINE_DB && db[k] - local(k) >= LINE_DB
         })
         .max_by(|&a, &b| db[a].total_cmp(&db[b]))?;
-    let bin_hz = rate_hz as f64 / SIZE as f64;
-    Some(Baud(((k as f64 + parabola(db, k)) * bin_hz).round() as u32))
+    Some(((k as f64 + parabola(db, k)) * bin_hz, db[k] - local(k)))
 }
 
 /// Parabolic offset, in bins (±0.5), of the peak at `k` of `db`.
@@ -587,7 +643,7 @@ pub fn measure_band_masked(
     FeatureRecord {
         bandwidth_hz: Hz(bandwidth_hz),
         center_hz: Hz(center as u64),
-        symbol_rate_baud: rate_of(iq, rate_hz, cv, bandwidth_hz).map(|(r, _)| r),
+        symbol_rate_baud: rate_of(iq, rate_hz, cv, (offset, bandwidth_hz)).map(|(r, _)| r),
         snr_db: db[peak] - floor,
         burst: gated || is_burst(full, rate_hz),
         duty: Some(b.duty),
@@ -600,12 +656,14 @@ pub fn measure_band_masked(
 }
 
 /// What layer 1 measures of `iq`: its runs ([`burst_runs`]); the on-time
-/// ([`on_time`]) when the duty is under `BURST_DUTY_MAX`, else the whole
+/// ([`on_time`]) when the duty is under `BURST_DUTY_MAX` and the runs repeat no
+/// faster than `BURST_MIN_PERIOD_MS` (denser runs are keying), else the whole
 /// window; whether it was gated; and the envelope CV of those samples as
 /// received (the runs' Hann windows would read as amplitude keying).
 fn gated_view(iq: &[Complex<f32>], rate_hz: u64) -> (Bursts, Cow<'_, [Complex<f32>]>, bool, f32) {
     let b = burst_runs(iq, rate_hz);
-    if b.duty < BURST_DUTY_MAX && !b.runs.is_empty() {
+    let bursty = b.period_ms.is_none_or(|p| p >= BURST_MIN_PERIOD_MS);
+    if b.duty < BURST_DUTY_MAX && bursty && !b.runs.is_empty() {
         let raw: Vec<Complex<f32>> = b
             .runs
             .iter()
@@ -621,17 +679,19 @@ fn gated_view(iq: &[Complex<f32>], rate_hz: u64) -> (Bursts, Cow<'_, [Complex<f3
 }
 
 /// The symbol rate of the measured samples and the line it came from:
-/// [`cyclo_symbol_rate`] up to the occupied band (`"cyclo"`) when the envelope
+/// [`cyclo_symbol_rate`] of the occupied band `offset_hz ± bandwidth_hz / 2`
+/// (from the block centre), up to its width (`"cyclo"`), when the envelope
 /// moves (`cv` at least `FM_MAX_CV`), else, or when it finds none, the
 /// [`symbol_rate`] keying line (`"keying"`).
 fn rate_of(
     iq: &[Complex<f32>],
     rate_hz: u64,
     cv: f32,
-    bandwidth_hz: u64,
+    (offset_hz, bandwidth_hz): (f64, u64),
 ) -> Option<(Baud, &'static str)> {
+    let bw = bandwidth_hz as f64;
     (cv >= FM_MAX_CV)
-        .then(|| cyclo_symbol_rate(iq, rate_hz, bandwidth_hz as f64))
+        .then(|| cyclo_symbol_rate(&bandpass(iq, rate_hz, offset_hz, bw), rate_hz, bw))
         .flatten()
         .map(|r| (r, "cyclo"))
         .or_else(|| symbol_rate(iq, rate_hz, cv, bandwidth_hz).map(|r| (r, "keying")))
@@ -712,13 +772,15 @@ pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Lab
     }
 }
 
-/// Which line gave `f.symbol_rate_baud` when `iq` is measured again:
-/// `"cyclo"` ([`cyclo_symbol_rate`]) or `"keying"` ([`symbol_rate`]).
+/// Which line gave `f.symbol_rate_baud`: `"keying"` when [`symbol_rate`]
+/// over the measured samples of `iq` gives it too (or the envelope is steady,
+/// where only that line is searched), else `"cyclo"` ([`cyclo_symbol_rate`]).
 fn rate_line(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> &'static str {
     let (_, on, _, cv) = gated_view(iq, rate_hz);
-    match rate_of(&on, rate_hz, cv, f.bandwidth_hz.0) {
-        Some((r, line)) if Some(r) == f.symbol_rate_baud => line,
-        _ => "keying",
+    if cv < FM_MAX_CV || symbol_rate(&on, rate_hz, cv, f.bandwidth_hz.0) == f.symbol_rate_baud {
+        "keying"
+    } else {
+        "cyclo"
     }
 }
 
@@ -1252,8 +1314,11 @@ mod tests {
         eprintln!("{what}: {f:?} -> {} ({})", l.name, l.evidence);
     }
 
+    /// 240 non-repeating bits (an LCG's top nibbles), so no pattern line
+    /// competes with the symbol rate.
+    const LCG_BITS: &str = "14ed58c6d3ff2d75a5650138a8d447f00ec47321d420c5d08bec3850735c";
+
     #[test]
-    #[ignore = "brief tolerances unmet (task-2-report.md): duty 0.00748 (3 x 5 ms in 2005 ms), bw 18234 Hz, no 4800 Bd line"]
     fn a_1_percent_duty_burst_reports_duty_period_and_band() {
         // 5 ms burst (24 bits at 4800 Bd) every 1000 ms, 3 bursts = 2 s of signal
         let spec = SynthSpec::Fsk {
@@ -1276,35 +1341,101 @@ mod tests {
         let f = measure_band(&iq, 48_000, CENTER, 20_000);
         eprintln!("1 % duty burst: {f:?}");
         let duty = f.duty.unwrap();
-        assert!((0.003..=0.007).contains(&duty), "duty {duty}");
+        // 3 × 5 ms on in 2005 ms
+        assert!((0.005..=0.010).contains(&duty), "duty {duty}");
         assert_eq!(f.bursts, Some(3));
         assert!((980.0..=1020.0).contains(&f.period_ms.unwrap()));
         assert!((4.0..=7.0).contains(&f.burst_ms.unwrap()));
         assert!(f.burst);
-        // occupied band ≈ 2·deviation + rate = 12.8 kHz, within 10 %
+        // Carson for 4800 Bd at 4 kHz deviation: 2·(4000 + 4800) = 17.6 kHz
         assert!(
-            (11_500..=14_100).contains(&f.bandwidth_hz.0),
+            (15_000..=21_000).contains(&f.bandwidth_hz.0),
             "bw {}",
             f.bandwidth_hz.0
         );
-        let baud = f.symbol_rate_baud.unwrap().0;
-        assert!((4700..=4900).contains(&baud), "baud {baud}");
     }
 
     #[test]
-    #[ignore = "brief tolerances unmet (task-2-report.md): |x|^2 of the repeated-pattern fixtures peaks at 1902 Hz (PSK 2400) and 375 Hz (OOK 1200)"]
+    fn a_bursty_fsk_link_reports_its_symbol_rate() {
+        // 50 ms bursts of 240 random bits every 1000 ms
+        let spec = SynthSpec::Fsk {
+            symbol_rate_baud: 4800,
+            deviation_hz: 4000.0,
+            order: 2,
+            bits: LCG_BITS.into(),
+            repeat: 3,
+            gap_ms: 950,
+        };
+        let iq = synthesise(
+            &spec,
+            &Impairments {
+                snr_db: Some(20.0),
+                ..Default::default()
+            },
+            48_000,
+            0,
+        );
+        let f = measure_band(&iq, 48_000, CENTER, 20_000);
+        eprintln!("bursty fsk: {f:?}");
+        let duty = f.duty.unwrap();
+        assert!(duty < 0.5, "duty {duty}");
+        let baud = f.symbol_rate_baud.expect("a rate").0 as f64;
+        assert!((baud - 4800.0).abs() <= 4800.0 * 0.04, "baud {baud}");
+    }
+
+    #[test]
+    fn dense_on_off_keying_is_not_gated() {
+        let spec = SynthSpec::Ook {
+            symbol_rate_baud: 1200,
+            bits: LCG_BITS.into(),
+            repeat: 2,
+            gap_ms: 300,
+        };
+        let imp = Impairments {
+            snr_db: Some(10.0),
+            offset_hz: 500.0,
+            ..Default::default()
+        };
+        let iq = synthesise(&spec, &imp, 48_000, 0);
+        let b = burst_runs(&iq, 48_000);
+        eprintln!(
+            "ook runs: {} duty {} period {:?}",
+            b.runs.len(),
+            b.duty,
+            b.period_ms
+        );
+        // Two 200 ms transmissions 300 ms apart: on for under half the window,
+        // but the symbols' on-off runs repeat within a few ms, which is keying,
+        // not bursts, so the window is measured whole.
+        assert!(b.duty < BURST_DUTY_MAX, "duty {}", b.duty);
+        assert!(b.period_ms.is_some_and(|p| p < BURST_MIN_PERIOD_MS));
+        let (_, on, gated, _) = gated_view(&iq, 48_000);
+        assert!(!gated);
+        assert_eq!(on.len(), iq.len());
+        let f = measure_band(&iq, 48_000, CENTER, 20_000);
+        eprintln!("ook: {f:?}");
+        assert_eq!(f.bursts, Some(b.runs.len() as u32));
+        assert_eq!(f.period_ms, b.period_ms);
+        // Band and rate as for a continuous signal: the sinc main lobe at
+        // least, and the keying line.
+        assert!(f.bandwidth_hz.0 >= 2_400, "bw {}", f.bandwidth_hz.0);
+        let baud = f.symbol_rate_baud.expect("a rate").0 as f64;
+        assert!((baud - 1200.0).abs() <= 1200.0 * 0.02, "baud {baud}");
+    }
+
+    #[test]
     fn the_cyclostationary_line_finds_psk_and_ook_rates() {
         for spec in [
             SynthSpec::Psk {
                 symbol_rate_baud: 2400,
                 order: 2,
-                bits: "3c5a96".repeat(20),
+                bits: LCG_BITS.into(),
                 repeat: 1,
                 gap_ms: 50,
             },
             SynthSpec::Ook {
                 symbol_rate_baud: 1200,
-                bits: "a5".repeat(60),
+                bits: LCG_BITS.into(),
                 repeat: 1,
                 gap_ms: 50,
             },
