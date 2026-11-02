@@ -425,7 +425,7 @@ pub(crate) fn measure_band_noted(
         };
         return (record, note);
     }
-    let v = gated_view(iq, rate_hz);
+    let v = gated_view(iq, rate_hz, bandwidth_hz);
     let full = iq;
     let iq = &v.on[..];
     let bin_hz = rate_hz as f64 / SIZE as f64;
@@ -1265,7 +1265,7 @@ mod tests {
         let mut iq = synthesise(&spec, &Impairments::default(), 48_000, 0);
         iq.resize(48_000, Complex::new(0.0, 0.0));
         awgn(&mut iq, 20.0, 17);
-        let v = gated_view(&iq, 48_000);
+        let v = gated_view(&iq, 48_000, 48_000);
         eprintln!("single burst: {:?}", v.bursts);
         assert_eq!(v.bursts.runs.len(), 1);
         assert!(v.gated);
@@ -1284,7 +1284,7 @@ mod tests {
                 .iter_mut()
                 .for_each(|s| *s *= 10f32.sqrt());
         }
-        let v = gated_view(&iq, RATE);
+        let v = gated_view(&iq, RATE, 20_000);
         eprintln!("clicks: {:?}", v.bursts);
         assert!(!v.gated, "{:?}", v.bursts);
         let f = measure_band(&iq, RATE, CENTER, 20_000);
@@ -1304,6 +1304,46 @@ mod tests {
     }
 
     #[test]
+    fn channel_filtered_noise_still_lets_a_burst_gate() {
+        // The 1 % duty fixture as a channel stage hands it on: low-passed to a 12.5 kHz
+        // band at 48 kHz, so most of the spectrum is stopband, not noise.
+        let spec = SynthSpec::Fsk {
+            symbol_rate_baud: 4800,
+            deviation_hz: 4000.0,
+            order: 2,
+            bits: LCG_BITS[..6].into(),
+            repeat: 3,
+            gap_ms: 995,
+        };
+        let raw = synthesise(
+            &spec,
+            &Impairments {
+                snr_db: Some(20.0),
+                ..Default::default()
+            },
+            48_000,
+            0,
+        );
+        let (iq, _) = crate::channel::extract_offset(&raw, RATE, 0, 12_500, RATE).unwrap();
+        // The floor of the band, not of the stopband: plain filtered noise reads near 0 dB
+        // over it (98.6 dB with the whole spectrum's 15th-percentile bin).
+        let mut w = vec![Complex::new(0.0f32, 0.0); 2 * RATE as usize];
+        awgn(&mut w, 0.0, 41);
+        let (noise, _) = crate::channel::extract_offset(&w, RATE, 0, 12_500, RATE).unwrap();
+        let mean = noise.iter().map(|s| s.norm_sqr() as f64).sum::<f64>() / noise.len() as f64;
+        let ratio = 10.0 * (mean / noise_floor_power(&noise, RATE, 12_500).unwrap()).log10();
+        eprintln!("filtered noise mean/floor: {ratio:.1} dB");
+        assert!(ratio.abs() < 3.0, "{ratio}");
+        let v = gated_view(&iq, RATE, 12_500);
+        eprintln!("filtered bursts: {:?}", v.bursts);
+        assert!(v.gated, "{:?}", v.bursts);
+        let f = measure_band(&iq, RATE, CENTER, 12_500);
+        assert!(f.burst, "{f:?}");
+        assert_eq!(f.bursts, Some(3), "{f:?}");
+        assert!(f.duty.unwrap() < 0.02, "{f:?}");
+    }
+
+    #[test]
     fn a_lone_1_ms_outlier_chunk_is_not_gated() {
         for rate in [8_000u64, 48_000] {
             let mut clean = vec![Complex::new(0.0f32, 0.0); rate as usize];
@@ -1313,7 +1353,7 @@ mod tests {
             let mut iq = clean.clone();
             let ms = (rate / 1_000) as usize;
             iq[500 * ms..501 * ms].iter_mut().for_each(|s| *s *= 2.5);
-            let v = gated_view(&iq, rate);
+            let v = gated_view(&iq, rate, rate);
             eprintln!("noise at {rate} Hz: {:?}", v.bursts);
             assert_eq!(v.bursts.runs.len(), 1, "{rate} Hz: {:?}", v.bursts);
             assert!(v.bursts.burst_ms.is_some_and(|ms| ms < 3.0));
@@ -1412,7 +1452,7 @@ mod tests {
         // not bursts, so the window is measured whole.
         assert!(b.duty < BURST_DUTY_MAX, "duty {}", b.duty);
         assert!(b.period_ms.is_some_and(|p| p < BURST_MIN_PERIOD_MS));
-        let v = gated_view(&iq, 48_000);
+        let v = gated_view(&iq, 48_000, 48_000);
         assert!(!v.gated);
         assert_eq!(v.on.len(), iq.len());
         let f = measure_band(&iq, 48_000, CENTER, 20_000);

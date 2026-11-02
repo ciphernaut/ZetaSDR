@@ -21,9 +21,10 @@
 //! A signal already on when the run starts makes no on-edge (the floor is the signal).
 //! So after [`WARMUP_MS`] with no on-edge the buffer is measured once: when its duty
 //! ([`crate::measure::burst_runs`]) is at least `BURST_DUTY_MAX` and its mean power
-//! stands more than `BURST_ON_DB` over the in-band noise floor (a continuous signal,
-//! not plain noise), the run switches to `whole` from the buffer's first sample on, and
-//! `job_context.capture.whole_auto` reads true.
+//! stands more than `BURST_ON_DB` over the noise floor of the channel's band
+//! (`bandwidth_hz`; a continuous signal, not plain noise), the run switches to `whole` from the buffer's first sample on, and
+//! `job_context.capture.whole_auto` reads true. A reset (retune, gap, lag) drops that
+//! `whole` and checks again after the next warm-up.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -217,7 +218,11 @@ impl Gate {
         let buf: Vec<Complex<f32>> = self.hist.iter().copied().collect();
         let duty = burst_runs(&buf, self.rate()).duty;
         let mean = buf.iter().map(|s| s.norm_sqr() as f64).sum::<f64>() / buf.len().max(1) as f64;
-        let on = noise_floor_power(&buf)
+        // The floor of the channel's own band (`bandwidth_hz`, else the whole rate): a
+        // channel's stopband is not noise.
+        let rate = self.rate();
+        let band = self.p.bandwidth_hz.unwrap_or(rate).min(rate);
+        let on = noise_floor_power(&buf, rate, band)
             .is_some_and(|floor| floor > 0.0 && 10.0 * (mean / floor).log10() > BURST_ON_DB);
         if duty >= BURST_DUTY_MAX && on {
             self.p.whole = true;
@@ -252,6 +257,13 @@ impl Gate {
         self.held = None;
         self.off_chunks = 0;
         self.open = None;
+        // The warm-up check is redone on the new stream, and a `whole` it set does not
+        // outlive it (an explicit `whole` does).
+        self.warm_checked = false;
+        if self.whole_auto {
+            self.whole_auto = false;
+            self.p.whole = false;
+        }
     }
 
     /// Feed one block; the windows it completes, in order.
@@ -884,6 +896,68 @@ mod tests {
         assert!(r.events.is_empty(), "{:?}", r.events);
         assert_eq!(r.context["whole_auto"], false);
         assert_eq!(r.context["timed_out"], true);
+    }
+
+    /// `iq` as a 12.5 kHz channel stage at 48 kHz hands it on.
+    fn channel(iq: &[Complex<f32>]) -> Vec<Complex<f32>> {
+        crate::channel::extract_offset(iq, RATE, 0, 12_500, RATE)
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn channel_filtered_plain_noise_does_not_switch_to_whole() {
+        let iq = channel(&noise(2.0, 7));
+        let r = run(
+            serde_json::json!({"bursts": 2, "timeout_ms": 1_500, "bandwidth_hz": 12_500}),
+            &iq,
+        )
+        .await;
+        assert!(r.events.is_empty(), "{:?}", r.events);
+        assert_eq!(r.context["whole_auto"], false);
+        assert_eq!(r.context["timed_out"], true);
+        assert!(r.store.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_channel_filtered_carrier_on_from_the_start_still_switches() {
+        let mut raw = noise(5.0, 8);
+        carrier(&mut raw, 0.0, 5_000.0);
+        let iq = channel(&raw);
+        let r = run(
+            serde_json::json!({"bursts": 2, "bandwidth_hz": 12_500}),
+            &iq,
+        )
+        .await;
+        assert_eq!(r.events.len(), 2, "{:?}", r.context);
+        assert_eq!(r.context["whole_auto"], true);
+    }
+
+    #[test]
+    fn a_reset_drops_an_automatic_whole_and_checks_again() {
+        let mut raw = noise(1.0, 9);
+        carrier(&mut raw, 0.0, 1_000.0);
+        let block = |t0: u64, samples: &[Complex<f32>]| IqBlock {
+            t0: Timestamp(t0),
+            sample_rate_hz: Hz(RATE),
+            center_hz: Hz(CENTER),
+            samples: samples.to_vec().into(),
+        };
+        let mut g = super::Gate::new(serde_json::from_value(serde_json::json!({})).unwrap());
+        for (i, b) in raw.chunks(BLOCK).enumerate() {
+            g.push(&block(*T0 + (i * BLOCK) as u64 * 1_000_000_000 / RATE, b));
+        }
+        assert!(g.whole_auto && g.p.whole && g.warm_checked);
+        // A gap in time resets the gate: the automatic whole goes, the check is redone.
+        let quiet = noise(1.0, 10);
+        g.push(&block(*T0 + 10_000_000_000, &quiet[..BLOCK]));
+        assert!(!g.whole_auto && !g.p.whole && !g.warm_checked);
+        // An explicit whole survives a reset.
+        let mut g =
+            super::Gate::new(serde_json::from_value(serde_json::json!({"whole": true})).unwrap());
+        g.push(&block(*T0, &quiet[..BLOCK]));
+        g.reset();
+        assert!(g.p.whole && !g.whole_auto);
     }
 
     #[test]

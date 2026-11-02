@@ -110,30 +110,42 @@ pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
     }
 }
 
-/// The in-band noise floor of `iq` as a per-sample power: the window's mean power scaled by
-/// its spectrum's `FLOOR_PERCENTILE`th-percentile bin over its mean bin (the share of the
-/// power a flat floor at that level would hold). `None` for a window shorter than one
-/// `SIZE`-point transform.
-pub(crate) fn noise_floor_power(iq: &[Complex<f32>]) -> Option<f64> {
+/// The noise floor of `iq` as a per-sample power, from the band `bandwidth_hz` wide about
+/// the stream's centre (offset 0: a channelised stream, as `measure_band` reads it): the
+/// `FLOOR_PERCENTILE`th-percentile in-band bin of a `SIZE`-point spectrum stands for every
+/// in-band bin, the out-of-band bins count as they are, and the sum over the whole
+/// spectrum scales the window's mean power to it. A channel's stopband (most of the bins
+/// when the band is narrow against the rate) thus never reads as the floor, and on an
+/// unfiltered stream the out-of-band noise counts like the chunks that hold it. `None` for a
+/// window shorter than one transform.
+pub(crate) fn noise_floor_power(
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    bandwidth_hz: u64,
+) -> Option<f64> {
     let ps = CpuFft::new().power_sum(iq, SIZE, Window::Hann);
-    if ps.chunks == 0 || iq.is_empty() {
+    if ps.chunks == 0 || iq.is_empty() || rate_hz == 0 {
         return None;
     }
-    let mut bins = ps.sum.clone();
-    let mean_bin = bins.iter().sum::<f64>() / bins.len() as f64;
-    if mean_bin <= 0.0 {
+    let total: f64 = ps.sum.iter().sum();
+    if total <= 0.0 {
         return None;
     }
-    bins.sort_by(f64::total_cmp);
-    let floor_bin = bins[bins.len() * FLOOR_PERCENTILE / 100];
+    let bin_hz = rate_hz as f64 / SIZE as f64;
+    let half = ((bandwidth_hz as f64 / 2.0 / bin_hz).floor() as usize).min(SIZE / 2);
+    let (lo, hi) = (SIZE / 2 - half, (SIZE / 2 + half + 1).min(SIZE));
+    let mut inband = ps.sum[lo..hi].to_vec();
+    inband.sort_by(f64::total_cmp);
+    let floor_bin = inband[inband.len() * FLOOR_PERCENTILE / 100];
+    let outside: f64 = ps.sum[..lo].iter().chain(&ps.sum[hi..]).sum();
     let mean = iq.iter().map(|s| s.norm_sqr() as f64).sum::<f64>() / iq.len() as f64;
-    Some(mean * floor_bin / mean_bin)
+    Some(mean * (floor_bin * inband.len() as f64 + outside) / total)
 }
 
-/// Whether the off chunks of `b` sit near the in-band noise floor of `iq`
+/// Whether the off chunks of `b` sit near the noise floor of `iq` in its band
 /// (`BURST_OFF_NEAR_FLOOR_DB`); true when the floor cannot be measured.
-fn off_is_noise(iq: &[Complex<f32>], b: &Bursts) -> bool {
-    match noise_floor_power(iq) {
+fn off_is_noise(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64, b: &Bursts) -> bool {
+    match noise_floor_power(iq, rate_hz, bandwidth_hz) {
         Some(floor) if floor > 0.0 && b.off_power > 0.0 => {
             10.0 * (b.off_power / floor).log10() <= BURST_OFF_NEAR_FLOOR_DB
         }
@@ -187,14 +199,19 @@ pub(super) struct View<'a> {
 /// faster than `BURST_MIN_PERIOD_MS` (denser runs are keying), and there are
 /// at least `BURST_MIN_BURSTS` runs or one of at least `BURST_MIN_SINGLE_MS`
 /// (a lone shorter run is an outlier chunk), and the off chunks are noise
-/// (within `BURST_OFF_NEAR_FLOOR_DB` of the in-band floor: impulses over a
-/// continuous signal are not bursts); else the whole window.
-pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64) -> View<'_> {
+/// (within `BURST_OFF_NEAR_FLOOR_DB` of the floor in the `bandwidth_hz` band
+/// about the centre, [`noise_floor_power`]: impulses over a continuous signal
+/// are not bursts); else the whole window.
+pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> View<'_> {
     let bursts = burst_runs(iq, rate_hz);
     let sparse = bursts.period_ms.is_none_or(|p| p >= BURST_MIN_PERIOD_MS);
     let enough = bursts.runs.len() >= BURST_MIN_BURSTS
         || (bursts.runs.len() == 1 && bursts.burst_ms.is_some_and(|ms| ms >= BURST_MIN_SINGLE_MS));
-    if bursts.duty < BURST_DUTY_MAX && sparse && enough && off_is_noise(iq, &bursts) {
+    if bursts.duty < BURST_DUTY_MAX
+        && sparse
+        && enough
+        && off_is_noise(iq, rate_hz, bandwidth_hz, &bursts)
+    {
         let runs: Vec<&[Complex<f32>]> = bursts.runs.iter().map(|&(s, e)| &iq[s..e]).collect();
         let raw: Vec<Complex<f32>> = runs.iter().flat_map(|r| r.iter()).copied().collect();
         View {
