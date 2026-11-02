@@ -17,11 +17,13 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Baud, Hz, Provenance, StreamId, StreamKind, Timestamp};
 
 mod burst;
+mod order;
 
 pub use burst::{Bursts, burst_runs, on_time};
 use burst::{
     View, averaged_half_spectrum, bandpass, cyclo_symbol_rate, gated_view, strongest_line,
 };
+use order::{fsk_clusters, psk_order, two_levels};
 
 use crate::channel::extract_offset;
 use crate::fft::{Window, power_spectrum_db};
@@ -373,6 +375,14 @@ pub fn measure_band(
 /// `symbol_rate_baud` is the cyclostationary line ([`cyclo_symbol_rate`]) when
 /// the envelope moves, else, or when it finds none, the keying line of
 /// [`keying_signal`].
+///
+/// Order (above the noise SNR only): `order` and `tone_spacing_hz` are the
+/// FSK tones of the instantaneous-frequency clusters over the runs
+/// ([`order::fsk_clusters`]), else of the two-peak rule on the measured
+/// spectrum (order 2); without tones and with a symbol rate, `order` is the
+/// PSK order of the m-th power test ([`order::psk_order`]) and
+/// `tone_spacing_hz` is `None`. AFSK under FM carries no order: its tones are
+/// audio, not RF.
 pub fn measure_band_masked(
     iq: &[Complex<f32>],
     rate_hz: u64,
@@ -465,19 +475,36 @@ pub(crate) fn measure_band_noted(
         .max(0);
     let bandwidth_hz = (bins * bin_hz).round().max(bin_hz.round()) as u64;
     let rate = rate_of(&v, rate_hz, (offset, bandwidth_hz));
+    // FSK order and spacing from the instantaneous-frequency clusters, else the
+    // two-peak rule on the measured spectrum; PSK order only without tones.
+    let snr_db = db[peak] - floor;
+    let keyed = snr_db >= NOISE_SNR_DB;
+    let fsk = keyed
+        .then(|| fsk_clusters(&v.runs, rate_hz, (offset, bandwidth_hz)))
+        .flatten()
+        .or_else(|| {
+            let (a, b) = (lo - first, hi - first);
+            tone_pair(db, (a, b), floor + OCCUPIED_DB, bin_hz, true)
+                .map(|(a, b)| (2, Hz((b - a).round() as u64)))
+                .filter(|_| keyed)
+        });
+    let psk = match (fsk, rate) {
+        (None, Some(_)) => psk_order(&v.runs, rate_hz, (offset, bandwidth_hz)),
+        _ => None,
+    };
     let b = &v.bursts;
     let record = FeatureRecord {
         bandwidth_hz: Hz(bandwidth_hz),
         center_hz: Hz(center as u64),
         symbol_rate_baud: rate.map(|(r, _)| r),
-        snr_db: db[peak] - floor,
+        snr_db,
         burst: v.gated || is_burst(full, rate_hz),
         duty: Some(b.duty),
         bursts: Some(b.runs.len() as u32),
         burst_ms: b.burst_ms,
         period_ms: b.period_ms,
-        order: None,
-        tone_spacing_hz: None,
+        order: fsk.map(|(o, _)| o).or(psk),
+        tone_spacing_hz: fsk.map(|(_, s)| s),
     };
     let note = RateNote {
         line: rate.map(|(_, line)| line),
@@ -548,34 +575,43 @@ fn tone_pair(
 /// Conservative layer-1 label for a measured block. Rules, first match wins:
 ///
 /// 1. `"noise"` (0.5) when `snr_db < 6`.
-/// 2. `"fsk"` (0.6) when the power spectrum has exactly two dominant peaks
-///    inside the occupied band 500–3000 Hz apart and within 6 dB of each
-///    other, or, for a constant-envelope signal (CV below 0.2) with a keying
-///    line, when its discriminator audio does (AFSK on FM).
-/// 3. `"wfm"` (0.9) when the occupied band is 40–250 kHz and
+/// 2. `"fsk"` (0.6) when the record carries an FSK `order` and
+///    `tone_spacing_hz` ([`measure_band_masked`]), or the power spectrum has
+///    exactly two dominant peaks inside the occupied band 500–3000 Hz apart
+///    and within 6 dB of each other, or, for a constant-envelope signal (CV
+///    below 0.2) with a keying line, when its discriminator audio does (AFSK
+///    on FM).
+/// 3. `"ook"` (0.6) when the envelope CV is at least 0.25, the record has a
+///    symbol rate and no PSK order, and the envelope sits at two levels, the
+///    lower one off ([`order::two_levels`]).
+/// 4. `"wfm"` (0.9) when the occupied band is 40–250 kHz and
 ///    [`pilot_line_db`] finds a 19 kHz pilot at least 10 dB above its
 ///    region, with no envelope or deviation gate (multipath and noise ripple
 ///    a real station's envelope; the pilot is the stronger evidence).
 ///    Otherwise `"wfm"` (0.6) when the occupied band is 60–250 kHz, the
 ///    envelope CV is below 0.45 and the discriminator audio deviates by more
 ///    than 5 kHz RMS.
-/// 4. `"am"` (0.6) when a carrier line sits at the block centre (the
+/// 5. `"psk"` (0.6) when the record carries a PSK `order` (no tone spacing)
+///    and a symbol rate. It precedes `am`: the carrier-line test of `am`
+///    reads a narrow PSK main lobe as a carrier (15.9 dB on 2400 Bd BPSK),
+///    while the PSK order requires no line in `x` itself.
+/// 6. `"am"` (0.6) when a carrier line sits at the block centre (the
 ///    strongest of the centre bin and its two neighbours at least 6 dB above
 ///    the mean power of the bins 1–5 kHz either side) and the envelope CV is
 ///    at least 0.25.
-/// 5. `"ssb"` (0.6) when there is no such centre line, the envelope CV is at
+/// 7. `"ssb"` (0.6) when there is no such centre line, the envelope CV is at
 ///    least 0.25, the occupied band is 1.5–4 kHz and at least 80 % of its
 ///    power lies on one side of centre; the evidence names `usb` (above) or
 ///    `lsb` (below) and the dial frequency [`ssb_dial_hz`] gives.
-/// 6. `"am"` (0.6) for low-index AM: the same centre line, an envelope CV
+/// 8. `"am"` (0.6) for low-index AM: the same centre line, an envelope CV
 ///    of at least 0.1 both whole-band and within half the occupied band (so
 ///    wideband noise on a bare carrier does not pass), and an RMS phase
 ///    deviation of the discriminator audio (radians per sample, band-limited
 ///    as for `fm`) below the CV, so the envelope moves more than the phase.
-/// 7. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
+/// 9. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
 ///    25 kHz and the discriminator audio deviates by more than 100 Hz RMS;
 ///    `"carrier"` (0.7) under the same gate when it does not.
-/// 8. Otherwise `"unknown"` (0.5).
+/// 10. Otherwise `"unknown"` (0.5).
 pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Label {
     layer1_label_noted(f, None, iq, rate_hz)
 }
@@ -731,6 +767,9 @@ fn classify_block(
     let floor = median(&db);
     let gap = (GAP_HZ / bin_hz).floor() as usize;
     let (lo, hi) = occupied(&db, argmax(&db), floor + OCCUPIED_DB, gap);
+    if let (Some(order), Some(Hz(spacing))) = (f.order, f.tone_spacing_hz) {
+        return ("fsk", 0.6, format!("{order} rf tones {spacing} Hz apart"));
+    }
     if let Some((a, b)) = tone_pair(&db, (lo, hi), floor + OCCUPIED_DB, bin_hz, true) {
         return ("fsk", 0.6, format!("two rf tones {:.0} Hz apart", b - a));
     }
@@ -755,6 +794,13 @@ fn classify_block(
             }
         }
     }
+    if cv >= AM_MIN_CV && f.order.is_none() && f.symbol_rate_baud.is_some() && two_levels(iq) {
+        return (
+            "ook",
+            0.6,
+            "two envelope levels with a symbol-rate line".into(),
+        );
+    }
     let bw = f.bandwidth_hz.0;
     if (WFM_PILOT_MIN_BW_HZ..=WFM_MAX_BW_HZ).contains(&bw)
         && let Some(d) = pilot_line_db(iq, rate_hz).filter(|&d| d >= LINE_DB)
@@ -774,6 +820,13 @@ fn classify_block(
                 format!("wideband constant envelope, rms deviation {dev:.0} Hz"),
             );
         }
+    }
+    if let (Some(m), None, Some(_)) = (f.order, f.tone_spacing_hz, f.symbol_rate_baud) {
+        return (
+            "psk",
+            0.6,
+            format!("a line at {m}\u{d7} the centre in x^{m}, none in x"),
+        );
     }
     if cv >= AM_MIN_CV {
         let carrier_db = centre_line_db(&db, bin_hz);
@@ -1879,5 +1932,84 @@ mod tests {
         let center = ev["center_hz"].as_u64().unwrap() as f64;
         assert!((center - (CENTER - 20_000) as f64).abs() <= bin, "{ev}");
         assert_eq!(notes[0]["measure"]["dc_mask_hz"], 0);
+    }
+
+    /// `n` hex characters of non-repeating bits (the top nibble of each step
+    /// of a 32-bit LCG), for fixtures longer than [`LCG_BITS`].
+    fn lcg_hex(n: usize) -> String {
+        let mut x: u32 = 0x2545_f491;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                char::from_digit(x >> 28, 16).unwrap()
+            })
+            .collect()
+    }
+
+    fn at_20_db(spec: &SynthSpec) -> Vec<Complex<f32>> {
+        let imp = Impairments {
+            snr_db: Some(20.0),
+            ..Default::default()
+        };
+        synthesise(spec, &imp, 48_000, 0)
+    }
+
+    #[test]
+    fn fsk_order_and_tone_spacing_are_measured() {
+        for (order, dev, want_spacing) in [(2u8, 4000.0, 8000u64), (4u8, 6000.0, 4000u64)] {
+            let spec = SynthSpec::Fsk {
+                symbol_rate_baud: 2400,
+                deviation_hz: dev,
+                order,
+                bits: lcg_hex(128),
+                repeat: 1,
+                gap_ms: 50,
+            };
+            let iq = at_20_db(&spec);
+            let f = measure_band(&iq, 48_000, CENTER, 24_000);
+            let l = layer1_label(&f, &iq, 48_000);
+            show(&format!("{order}-fsk"), &f, &l);
+            assert_eq!(l.name, "fsk", "{order}-fsk: {}", l.evidence);
+            assert_eq!(f.order, Some(order));
+            let s = f.tone_spacing_hz.unwrap().0;
+            assert!(
+                (s as f64 - want_spacing as f64).abs() < 600.0,
+                "spacing {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn psk_order_is_the_smallest_power_with_a_line() {
+        for order in [2u8, 4u8] {
+            let spec = SynthSpec::Psk {
+                symbol_rate_baud: 2400,
+                order,
+                bits: lcg_hex(160),
+                repeat: 1,
+                gap_ms: 50,
+            };
+            let iq = at_20_db(&spec);
+            let f = measure_band(&iq, 48_000, CENTER, 12_000);
+            let l = layer1_label(&f, &iq, 48_000);
+            show(&format!("{order}-psk"), &f, &l);
+            assert_eq!(l.name, "psk", "{order}-psk: {}", l.evidence);
+            assert_eq!(f.order, Some(order));
+        }
+    }
+
+    #[test]
+    fn ook_is_labelled_ook() {
+        let spec = SynthSpec::Ook {
+            symbol_rate_baud: 1200,
+            bits: lcg_hex(120),
+            repeat: 1,
+            gap_ms: 50,
+        };
+        let iq = at_20_db(&spec);
+        let f = measure_band(&iq, 48_000, CENTER, 8_000);
+        let l = layer1_label(&f, &iq, 48_000);
+        show("ook", &f, &l);
+        assert_eq!(l.name, "ook", "{}", l.evidence);
     }
 }

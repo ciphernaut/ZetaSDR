@@ -97,7 +97,7 @@ pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
 }
 
 /// `n`-point Hann window value at `i`.
-fn hann(i: usize, n: usize) -> f32 {
+pub(super) fn hann(i: usize, n: usize) -> f32 {
     if n > 1 {
         0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos()
     } else {
