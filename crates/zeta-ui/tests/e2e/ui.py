@@ -5026,7 +5026,12 @@ def scenario_capture_bursts_from_the_box_menu_and_explore_lists_it(page, url, se
 
 
 def scenario_explore_what_is_this_and_delete(page, url, secret):
-    assert len(capture_ops(url, secret, "capture_list", signal=None)) == 2
+    # Self-seeding: its own two windows on the tone, so it passes alone.
+    clear_captures(url, secret)
+    job = start_job(url, secret, "capture", "tone", 100_001_000, 6_000)
+    two_windows(url, secret, job)
+    wait_until(lambda: len(capture_ops(url, secret, "capture_list", signal=None)) == 2,
+               30, "two captures")
     login(page, url, secret)
     # The first capture seen on this page load selects the pane by itself.
     expect(page.locator("#explore tr.capture")).to_have_count(2, timeout=20000)
