@@ -5032,7 +5032,7 @@ def scenario_explore_what_is_this_and_delete(page, url, secret):
     expect(page.locator("#explore tr.capture")).to_have_count(2, timeout=20000)
     row = '#explore tr.capture >> nth=0 >> '
     page.click(row + 'button[data-action="classify"]')
-    expect(page.locator("#transcript .line.note", has_text=": L1 ").first).to_be_visible(timeout=20000)
+    expect(page.locator("#transcript .line.note", has_text="carrier").first).to_be_visible(timeout=20000)
     page.click(row + 'button[data-action="delete"]')
     expect(page.locator(row + 'button[data-action="delete"]')).to_have_text("sure?")
     page.click(row + 'button[data-action="delete"]')

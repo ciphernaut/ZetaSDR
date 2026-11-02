@@ -3671,7 +3671,7 @@ fn capture_record(node: &Node, id: &str) -> Result<crate::bursts::CaptureRecord,
     })
 }
 
-/// `capture_classify`: the classifiers over the capture's samples, whole band, with the
+/// `capture_classify`: the classifiers over the capture's samples in the record's band, with the
 /// allocations the record kept.
 async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
     let rec = capture_record(node, id)?;
@@ -3708,7 +3708,10 @@ pub(crate) async fn classify_capture(
             &samples,
             meta.sample_rate_hz,
             meta.center_hz,
-            Band::whole(meta.sample_rate_hz),
+            Band {
+                offset_hz: rec.center_hz.0 as i64 - meta.center_hz.0 as i64,
+                bandwidth_hz: rec.bandwidth_hz,
+            },
             None,
             allocations,
         )

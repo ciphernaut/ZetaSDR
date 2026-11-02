@@ -195,3 +195,29 @@ async fn an_unknown_capture_is_unknown_naming_the_field() {
     assert_eq!(r, OpResult::Ok);
     assert!(node.bursts().get("nope").is_none());
 }
+
+#[tokio::test]
+async fn capture_classify_reads_the_records_band_not_the_whole_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    // A pure tone 1 kHz above the centre, 6 kHz record band inside a 48 kHz file.
+    let iq: Vec<Complex<f32>> = (0..2 * RATE_HZ as usize)
+        .map(|k| {
+            let ph = 2.0 * std::f64::consts::PI * (k as f64 * 1_000.0 / RATE_HZ as f64);
+            Complex::from_polar(0.5, ph as f32)
+        })
+        .collect();
+    let rec = node
+        .bursts()
+        .write(new_capture(433_920_000, 6_000, 1), &iq)
+        .unwrap();
+    let OpResult::Classification { labels, .. } = node
+        .apply(Op::CaptureClassify { capture: rec.id })
+        .await
+        .unwrap()
+    else {
+        panic!("classification")
+    };
+    let l1 = labels.iter().find(|l| l.layer == 1).expect("layer 1");
+    assert_eq!(l1.name, "carrier", "{labels:?}");
+}
