@@ -17,10 +17,16 @@
 //                          (default none): where the map's home marker sits and the job rows'
 //                          distance and bearing count from; kept as `<lat>,<lon>` with the
 //                          numbers as JavaScript prints them (`-27.50,153.00` → `-27.5,153`)
-//         subjects         auto | on | off (default auto): the Subjects pane (subjects.js);
-//                          auto shows it while a running job's row has table columns
+//         subjects         auto | on | off (default auto): an alias of `pane` for the
+//                          Subjects pane (subjects.js): `on` sets `pane subjects`, `off` sets
+//                          `pane none` when Subjects is the pane shown, `auto` changes no pane
+//                          (the tab shows while a running job's row has table columns); a
+//                          `pane` set that contradicts `on` or `off` puts it back to auto
 //         subject_dim_s    a positive integer of seconds (default 60): a silent subject dims
 //         subject_drop_s   a positive integer of seconds (default 300): and then is dropped
+//         pane             none | a registered pane's id (default none; panes.js): the pane
+//                          shown under the waterfall. A stored id is kept over a reload before
+//                          its pane registers (the strip shows none until it does)
 //   homePoint(value) -> {lat, lon} | null   the `home` policy's value as numbers (null: none)
 //   VIEW_KEY   the sessionStorage key holding the values set ({key: value}, defaults left out)
 //   mountView() -> View
@@ -39,6 +45,7 @@
 //       anything else an error naming the commands.
 
 import { planIds } from "./plans.js";
+import { paneIds } from "./panes.js";
 
 export const VIEW_KEY = "zeta.view";
 
@@ -58,6 +65,8 @@ function latLon(text) {
 export function homePoint(value) {
   return value === "none" ? null : latLon(value);
 }
+
+const PANE_ID = /^[a-z][a-z0-9_]*(:[A-Za-z0-9_.:-]+)?$/;
 
 const positiveSeconds = (t) =>
   /^[1-9]\d*$/.test(t) && Number.isSafeInteger(Number(t)) ? Number(t) : undefined;
@@ -102,7 +111,17 @@ export const POLICIES = [
     default_: "none",
     describe: "LAT,LON in decimal degrees (lat -90..90, lon -180..180), none",
   },
-  { key: "subjects", values: ["auto", "on", "off"], default_: "auto", describe: "auto, on, off" },
+  {
+    key: "subjects",
+    values: ["auto", "on", "off"],
+    default_: "auto",
+    describe: "auto, on, off",
+    // The alias: `on` and `off` choose the pane.
+    then(v, view, put) {
+      if (v === "on") put("pane", "subjects");
+      else if (v === "off" && view.get("pane") === "subjects") put("pane", "none");
+    },
+  },
   {
     key: "subject_dim_s",
     parse: positiveSeconds,
@@ -114,6 +133,21 @@ export const POLICIES = [
     parse: positiveSeconds,
     default_: 300,
     describe: "a positive integer of seconds",
+  },
+  {
+    key: "pane",
+    parse: (t) => (t === "none" || paneIds().includes(t) ? t : undefined),
+    restore: (t) => (t === "none" || PANE_ID.test(t) ? t : undefined),
+    default_: "none",
+    get describe() {
+      return ["none", ...paneIds()].join(", ");
+    },
+    then(v, view, put) {
+      const s = view.get("subjects");
+      if ((s === "on" && v !== "subjects") || (s === "off" && v === "subjects")) {
+        put("subjects", "auto");
+      }
+    },
   },
 ];
 
@@ -147,12 +181,21 @@ export function mountView() {
   const values = {};
   for (const [k, v] of Object.entries(loadStored())) {
     const p = byKey.get(k);
-    if (p && parseValue(p, String(v)) !== undefined) values[k] = parseValue(p, String(v));
+    if (!p) continue;
+    const kept = p.restore ? p.restore(String(v)) : parseValue(p, String(v));
+    if (kept !== undefined) values[k] = kept;
   }
   const changeCbs = [];
   const clearCbs = [];
   const fire = (key) => {
     for (const cb of changeCbs) cb(key, view.get(key));
+  };
+  // A value already checked, stored and announced (an alias's `then` sets another key so).
+  const put = (key, v) => {
+    if (v === byKey.get(key).default_) delete values[key];
+    else values[key] = v;
+    saveStored(values);
+    fire(key);
   };
   const view = {
     get(key) {
@@ -170,10 +213,8 @@ export function mountView() {
       if (v === undefined) {
         return { ok: false, error: `view set ${key}: "${text}" is not allowed (allowed: ${p.describe})` };
       }
-      if (v === p.default_) delete values[key];
-      else values[key] = v;
-      saveStored(values);
-      fire(key);
+      put(key, v);
+      if (p.then) p.then(v, view, put);
       return { ok: true, value: v };
     },
     show() {

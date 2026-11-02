@@ -1122,9 +1122,9 @@ def scenario_view_set_show_reset(page, url, secret):
     shown = view_show(page)
     for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
                  "finished_rows_s 60", "scanner auto", "plan auto", "map off", "home none",
-                 "subjects auto", "subject_dim_s 60", "subject_drop_s 300"):
+                 "subjects auto", "subject_dim_s 60", "subject_drop_s 300", "pane none"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 10, f"view show: {shown!r}"
+    assert shown.count("\n") == 11, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -3824,6 +3824,7 @@ def scenario_subjects_table_merges_three_aircraft(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        open_subjects(page)
         rows = page.locator("#subjects tr.subject")
         expect(rows).to_have_count(3, timeout=10_000)
         section = page.locator("#subjects section.subject-job")
@@ -3854,7 +3855,7 @@ def scenario_subjects_table_merges_three_aircraft(page, url, secret):
 
 def scenario_subjects_tab_appears_only_with_a_subject_job(page, url, secret):
     select_source(page, url, secret, "tone")
-    toggle = page.locator("#subjects-toggle")
+    toggle = pane_tab(page)
     pane = page.locator("#subjects")
     expect(toggle).to_be_hidden()
     expect(pane).to_be_hidden()
@@ -3868,31 +3869,35 @@ def scenario_subjects_tab_appears_only_with_a_subject_job(page, url, secret):
         stop_job(url, secret, pos)
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        # Eligible: the tab shows; the pane waits for it to be chosen.
         expect(toggle).to_be_visible(timeout=10_000)
+        expect(pane).to_be_hidden()
+        toggle.click()
         expect(pane).to_be_visible()
-        assert page.evaluate("document.documentElement.dataset.subjects") == "on"
+        assert page.evaluate("document.documentElement.dataset.strip") == "subjects"
         wf = page.locator("#waterfall").bounding_box()
-        box = pane.bounding_box()
-        assert abs(box["x"] - (wf["x"] + wf["width"])) <= 2, f"{wf} {box}"
+        box = page.locator("#pane").bounding_box()
+        assert abs(box["y"] - (wf["y"] + wf["height"])) <= 2, f"{wf} {box}"
         run_cmd(page, "view set subjects off")
         expect(pane).to_be_hidden()
         expect(toggle).to_be_visible()
-        assert page.evaluate("document.documentElement.dataset.subjects") is None
+        assert page.evaluate("document.documentElement.dataset.strip") is None
         toggle.click()
         expect(pane).to_be_visible()
-        assert "subjects on" in view_show(page)
-        # With the map on too, the map takes the top of the right half and the table the bottom.
+        assert "pane subjects" in view_show(page)
+        # With the map on too, the map takes the right of the top and the table the bottom.
         page.route(OSM_TILES, lambda r: r.abort())
         run_cmd(page, "view set map on")
         expect(page.locator("#map")).to_be_visible()
         mp = page.locator("#map").bounding_box()
         box = pane.bounding_box()
-        assert abs(mp["x"] - box["x"]) <= 2 and mp["y"] < box["y"], f"{mp} {box}"
+        assert mp["y"] + mp["height"] <= box["y"] + 2, f"{mp} {box}"
         run_cmd(page, "view set map off")
     finally:
         stop_job(url, secret, job)
     page.evaluate("window.zetaTest.poll()")
     run_cmd(page, "view set subjects auto")
+    run_cmd(page, "view set pane none")
     expect(pane).to_be_hidden()
     expect(toggle).to_be_hidden()
     run_cmd(page, "view set subjects on")
@@ -3908,6 +3913,7 @@ def scenario_subjects_table_has_padding_and_scrolls_sideways(page, url, secret):
     run_cmd(page, "view set map on")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        open_subjects(page)
         expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
         pane = page.locator("#subjects").bounding_box()
         first = page.locator("#subjects tbody tr.subject td").first.bounding_box()
@@ -3937,6 +3943,7 @@ def scenario_subjects_dim_and_drop(page, url, secret):
     expect(view_line(page, "subject_drop_s = 4")).to_be_visible()
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        open_subjects(page)
         rows = page.locator("#subjects tr.subject")
         expect(rows).to_have_count(3, timeout=10_000)
         expect(page.locator("#subjects tr.subject.dim")).to_have_count(3, timeout=3_000)
@@ -3949,6 +3956,7 @@ def scenario_subjects_distance_and_sort(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        open_subjects(page)
         expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
         expect(page.locator('#subjects th[data-col="distance"]')).to_have_count(0)
         run_cmd(page, "view set home -27.50,153.00")
@@ -3976,7 +3984,7 @@ def scenario_subjects_narrow_shows_three_columns(page, url, secret):
     job = start_subject_job(page, url, secret, "fake_subjects")
     page.set_viewport_size(NARROW)  # its row is in the drawer from here
     try:
-        toggle = page.locator("#subjects-toggle")
+        toggle = pane_tab(page)
         expect(toggle).to_be_visible(timeout=10_000)
         pane = page.locator("#subjects")
         expect(pane).to_be_hidden()
@@ -4002,6 +4010,7 @@ def scenario_subjects_survive_a_source_switch(page, url, secret):
     b = start_subject_job(page, url, secret, "fake_fold", bandwidth_hz=41_000)
     c = None
     try:
+        open_subjects(page)
         expect(page.locator("#subjects tr.subject")).to_have_count(5, timeout=10_000)
         page.wait_for_function(
             """([a, b]) => [a, b].every((j) => window.zetaSubjects.list(j)
@@ -4045,6 +4054,7 @@ def scenario_subjects_name_the_jobs_not_watched(page, url, secret):
         for bw in (40_000, 41_000, 42_000, 43_000, 44_000):
             jobs.append(start_job(url, secret, "fake_subjects", "tone", 100_000_000, bw))
         job_row(page, jobs[-1])
+        open_subjects(page)
         sections = page.locator("#subjects section.subject-job")
         expect(sections).to_have_count(5, timeout=10_000)
         marked = page.locator("#subjects section.subject-job .not-watched")
@@ -4137,6 +4147,7 @@ def scenario_slow_row_lookup_draws_no_ribbon_per_message(page, url, secret):
             most = max(most, page.locator("#waterfall .ov-ribbon.fake_subjects").count())
             page.wait_for_timeout(100)
         assert most <= 1, f"{most} ribbons at once while the row was looked up"
+        open_subjects(page)
         expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
     finally:
         stop_job(url, secret, job)
@@ -4382,6 +4393,7 @@ def scenario_table_and_map_select_each_other(page, url, secret):
     errors = page_errors(page)
     job = map_with_subjects(page, url, secret)
     try:
+        open_subjects(page)
         selected = page.locator("#map .map-subject.selected")
         expect(selected).to_have_count(0)
         subject_row(page, "7C0001").click()
@@ -4433,6 +4445,7 @@ def scenario_selected_row_scrolls_into_view(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        open_subjects(page)
         expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
         r = page.evaluate(
             """async (id) => {
@@ -4551,8 +4564,8 @@ def scenario_identify_trials_do_not_flap_the_subjects_pane(page, url, secret):
                 page.evaluate("window.zetaTest.poll()")
                 page.wait_for_timeout(300)
                 assert pane.is_hidden(), child
-                assert page.evaluate("document.documentElement.dataset.subjects") is None
-                expect(page.locator("#subjects-toggle")).to_be_hidden()
+                assert page.evaluate("document.documentElement.dataset.strip") is None
+                expect(pane_tab(page)).to_be_hidden()
                 break
             page.wait_for_timeout(250)
         assert seen is not None, "no trial of a row with a table ran"
@@ -4593,6 +4606,7 @@ def scenario_two_thousand_messages_cost_little(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        open_subjects(page)
         expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
         expect(page.locator("#waterfall .ov-ribbon.fake_subjects")).to_have_count(1)
         page.wait_for_function(
@@ -4657,6 +4671,7 @@ def scenario_a_hidden_subjects_pane_does_not_draw(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        open_subjects(page)
         expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
         run_cmd(page, "view set subjects off")
         expect(page.locator("#subjects")).to_be_hidden()
@@ -4708,6 +4723,7 @@ def scenario_a_row_holds_still_under_the_pointer(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        open_subjects(page)
         expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
         page.wait_for_function(
             "(job) => window.zetaSubjects.list(job).reduce((n, s) => n + s.count, 0) === 8",
@@ -4751,12 +4767,12 @@ def scenario_a_row_holds_still_under_the_pointer(page, url, secret):
         assert subject_keys(page) == ["7C0003", "7C0002", "7C0001", "7C0000"], subject_keys(page)
         # Off the table, the default order would have moved 7C0003 first anyway: the chosen
         # sort resumes and keeps the new row where the sort puts it.
-        page.locator("#subjects-toggle").hover()
+        pane_tab(page).hover()
         page.wait_for_timeout(100)
         page.evaluate(render)
         assert subject_keys(page) == ["7C0003", "7C0002", "7C0001", "7C0000"], subject_keys(page)
         page.locator('#subjects th[data-col="icao"]').click()
-        page.locator("#subjects-toggle").hover()
+        pane_tab(page).hover()
         page.evaluate(render)
         assert subject_keys(page) == ["7C0000", "7C0001", "7C0002", "7C0003"], subject_keys(page)
     finally:
@@ -4808,6 +4824,7 @@ def scenario_subject_jobs_show_with_no_subjects_yet(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_job(url, secret, "fake_subjects", "tone", 100_000_000, 40_000)
     try:
+        open_subjects(page)
         sec = page.locator(f'#subjects section.subject-job[data-job="{job}"]')
         expect(sec.locator("h3")).to_have_text(re.compile(r"^fake_subjects tone, \d aircraft$"))
         r = page.evaluate(
@@ -4846,6 +4863,7 @@ def scenario_a_chosen_sort_survives_its_section_going(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
+        open_subjects(page)
         expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
         page.locator(f'#subjects section.subject-job[data-job="{job}"] th[data-col="count"]').click()
         r = page.evaluate(
@@ -4869,6 +4887,111 @@ def scenario_a_chosen_sort_survives_its_section_going(page, url, secret):
         assert r["after"] == r["listed"], r
     finally:
         stop_job(url, secret, job)
+
+
+# ---- the pane tab strip (plan 19 Task 17) -----------------------------------------------
+
+def pane_tab(page, pane="subjects"):
+    return page.locator(f'#panes .pane-tab[data-pane="{pane}"]')
+
+
+def open_subjects(page):
+    """Select the Subjects tab once it shows (a subject job running), unless it is selected."""
+    tab = pane_tab(page)
+    expect(tab).to_be_visible(timeout=10_000)
+    if tab.get_attribute("aria-selected") != "true":
+        tab.click()
+    expect(page.locator("#subjects")).to_be_visible()
+
+
+def view_value(page, key):
+    """The `<key> <value>` part of `view show`'s line for `key`."""
+    for line in view_show(page).splitlines():
+        if line.startswith(f"{key} "):
+            return line.split(" (allowed")[0]
+    raise AssertionError(f"no {key} in view show")
+
+
+def scenario_panes_show_one_at_a_time(page, url, secret):
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    strip = page.locator('#top > nav#panes[role="tablist"][aria-label="Panes"]')
+    expect(strip).to_have_count(1)
+    assert page.evaluate(
+        "document.querySelector('#tabs').nextElementSibling.id") == "panes"
+    tab = pane_tab(page)
+    pane = page.locator("#pane")
+    expect(tab).to_be_hidden()
+    expect(pane).to_be_hidden()
+    expect(page.locator("#subjects-toggle")).to_have_count(0)
+    run_cmd(page, "view set pane explore")
+    expect(view_line(page, '"explore"', error=True)).to_contain_text("none, subjects")
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        # Eligible: the tab shows, nothing is selected.
+        expect(tab).to_be_visible(timeout=10_000)
+        expect(tab).to_have_attribute("role", "tab")
+        expect(tab).to_have_attribute("aria-selected", "false")
+        expect(pane).to_be_hidden()
+        tab.click()
+        expect(pane).to_be_visible()
+        expect(page.locator("#subjects")).to_be_visible()
+        expect(tab).to_have_attribute("aria-selected", "true")
+        assert view_value(page, "pane") == "pane subjects"
+        expect(page.locator("#subjects tr.subject")).to_have_count(3, timeout=10_000)
+        # Under the waterfall, the width of #main, at most 40 % of its height.
+        main = page.locator("#main").bounding_box()
+        wf = page.locator("#waterfall").bounding_box()
+        box = pane.bounding_box()
+        assert abs(box["x"] - main["x"]) <= 1 and abs(box["width"] - main["width"]) <= 1, box
+        assert box["height"] <= 0.4 * main["height"] + 1, f"{box} {main}"
+        assert abs(box["y"] + box["height"] - (main["y"] + main["height"])) <= 1, f"{box} {main}"
+        assert wf["y"] + wf["height"] <= box["y"] + 1, f"{wf} {box}"
+        assert abs(wf["width"] - main["width"]) <= 1, f"{wf} {main}"
+        # A second click deselects.
+        tab.click()
+        expect(pane).to_be_hidden()
+        expect(tab).to_have_attribute("aria-selected", "false")
+        expect(tab).to_be_visible()
+        assert view_value(page, "pane") == "pane none"
+        wf = page.locator("#waterfall").bounding_box()
+        assert abs(wf["height"] - main["height"]) <= 1, f"{wf} {main}"
+        # `view set pane` and the `subjects` alias.
+        run_cmd(page, "view set pane subjects")
+        expect(pane).to_be_visible()
+        run_cmd(page, "view set pane none")
+        expect(pane).to_be_hidden()
+        run_cmd(page, "view set subjects on")
+        expect(pane).to_be_visible()
+        assert view_value(page, "pane") == "pane subjects"
+        run_cmd(page, "view set subjects off")
+        expect(pane).to_be_hidden()
+        assert view_value(page, "pane") == "pane none"
+        run_cmd(page, "view set subjects auto")
+        expect(pane).to_be_hidden()
+        expect(tab).to_be_visible()
+        # The map stays its own toggle: with the pane open it keeps the top's right half.
+        page.route(OSM_TILES, lambda r: r.abort())
+        tab.click()
+        run_cmd(page, "view set map on")
+        expect(page.locator("#map")).to_be_visible()
+        mp = page.locator("#map").bounding_box()
+        box = pane.bounding_box()
+        assert mp["y"] + mp["height"] <= box["y"] + 1, f"{mp} {box}"
+        assert page.locator("#panes .pane-tab").count() == 1
+        run_cmd(page, "view set map off")
+        # The selection is the view's, kept over a reload.
+        page.reload()
+        expect(pane).to_be_visible(timeout=10_000)
+        expect(pane_tab(page)).to_have_attribute("aria-selected", "true")
+    finally:
+        stop_job(url, secret, job)
+    # Selected, the tab stays when its pane is no longer eligible.
+    page.evaluate("window.zetaTest.poll()")
+    expect(pane_tab(page)).to_be_visible()
+    pane_tab(page).click()
+    expect(pane_tab(page)).to_be_hidden()
+    assert not errors, f"console errors: {errors}"
 
 
 def scenarios():

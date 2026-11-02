@@ -112,11 +112,22 @@ input:focus { border-color: var(--accent); }
   color: var(--accent);
   font-size: 10px;
 }
+/* The pane strip (panes.js): one tab per pane, beside the source tabs. */
+#panes { display: flex; gap: 2px; flex: 0 0 auto; }
+.pane-tab {
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  padding: 0 10px;
+  white-space: nowrap;
+  color: var(--dim);
+}
+.pane-tab[hidden] { display: none; }
+.pane-tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
 #drawer-toggle { display: none; align-self: center; }
 #map-toggle { display: none; align-self: center; }
 #map-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
-#subjects-toggle { align-self: center; }
-#subjects-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 #listen-all { align-self: center; }
 #listen-all[aria-pressed="true"] { border-color: var(--ok); color: var(--ok); }
 
@@ -138,11 +149,13 @@ html[data-map="on"] #waterfall { right: 50%; }
 #map .map-subject.selected .arrow.dot { background: #2aa1ff; }
 #map .map-subject.selected .label { box-shadow: 0 0 0 1px #2aa1ff; }
 #map path.map-home { stroke: #2aa1ff; fill: #2aa1ff; fill-opacity: 0.6; stroke-width: 2; }
-/* The Subjects pane (subjects.js): the right half, or under the map when both are on. */
-#subjects { position: absolute; top: 0; bottom: 0; right: 0; left: 50%; overflow: auto; background: var(--bg); }
-html[data-subjects="on"] #waterfall { right: 50%; }
-html:not([data-footprint="narrow"])[data-map="on"][data-subjects="on"] #map { bottom: 50%; }
-html:not([data-footprint="narrow"])[data-map="on"][data-subjects="on"] #subjects { top: 50%; border-top: 1px solid var(--border); }
+/* The pane under the waterfall (panes.js): the strip's selected pane, at the height the jobs
+   panel has; the waterfall and the map keep the rest. */
+#pane { position: absolute; left: 0; right: 0; bottom: 0; height: 40%; overflow: hidden; background: var(--bg); border-top: 1px solid var(--border); }
+#pane[hidden] { display: none; }
+html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
+/* The Subjects pane (subjects.js) fills it. */
+#subjects { height: 100%; overflow: auto; background: var(--bg); }
 /* The pane is a column of sections; each section scrolls both ways on its own, so its header
    row sticks to it and its first column (the key) stays put when the rest is scrolled in. */
 #subjects { display: flex; flex-direction: column; }
@@ -392,9 +405,8 @@ html[data-footprint="narrow"][data-map="on"] #map-toggle { display: inline-block
 html[data-footprint="narrow"] #waterfall { right: 0; }
 html[data-footprint="narrow"] #map { left: 0; z-index: 5; }
 html[data-footprint="narrow"]:not([data-pane="map"]) #map { display: none; }
-/* And so is the table (#subjects-toggle). */
-html[data-footprint="narrow"] #subjects { left: 0; z-index: 5; }
-html[data-footprint="narrow"]:not([data-pane="subjects"]) #subjects { display: none; }
+/* And so is the strip's pane (its tab), the whole of #main. */
+html[data-footprint="narrow"] #pane { top: 0; height: auto; z-index: 5; border-top: 0; }
 html[data-footprint="narrow"] #side { display: none; }
 html[data-footprint="narrow"][data-drawer="open"] #side {
   display: flex;

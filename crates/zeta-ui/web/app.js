@@ -86,16 +86,17 @@
 //
 // The subjects (subjects.js): the store is mounted before the overlays, which hand it every
 // event first and ask it for mode rows; each jobs poll drops the subjects of jobs that ended.
-// Its pane, #subjects, shows with view `subjects on`, or `auto` while a running job's row has
-// table columns (<html data-subjects="on">; never with `off`); #subjects-toggle shows then or
-// with `on`, and sets `on` or `off`. In the narrow footprint the pane is a tab in the
-// waterfall's place (<html data-pane="subjects">) and the toggle opens and closes it.
+// Its pane, #subjects, is the Subjects tab of the pane strip (panes.js, #panes beside the
+// source tabs): the tab shows while a running job's row has table columns or while it is
+// selected, and the pane shows in #pane under the waterfall while the view's `pane` is
+// `subjects` (`view set subjects on|off` is an alias). In the narrow footprint the pane is a
+// tab in the waterfall's place (<html data-pane="subjects">) that the strip's tab opens and closes.
 //
 // The mic button (#mic, voice.js) is mounted at login: its transcript is put in the command
 // line and submitted as if typed (so free text goes to /ask); #mic-status beside it shows
 // failures such as a node without a speech daemon.
 //
-// Exports `state` ({api, transcript, jobs, wf, coarse, subjects, subjectsPane, ov, map, menu,
+// Exports `state` ({api, transcript, jobs, wf, coarse, subjects, subjectsPane, panes, ov, map, menu,
 // audio, mic, sources, selected, view, lastJobs, allowStops}), `onSourceChange(fn)` for the later views (waterfall, audio,
 // voice), `conflictActions(err, retry)`, `runSourceCommand(state, words)` and
 // `runPlanCommand(state, words)`.
@@ -124,6 +125,7 @@ import { MixWatch, isMuted, mixCovering, muteOp } from "./mix.js";
 import { mountCoarse } from "./coarse.js";
 import { mountMap } from "./map.js";
 import { mountSubjects, mountSubjectsPane } from "./subjects.js";
+import { mountPanes } from "./panes.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -137,6 +139,7 @@ export const state = {
   wf: null,
   subjects: null,
   subjectsPane: null,
+  panes: null,
   ov: null,
   map: null, // map.js: the positions of decoded events
   menu: null,
@@ -189,6 +192,7 @@ function applyFootprint() {
   if (root.dataset.footprint !== fp) {
     root.dataset.footprint = fp;
     delete root.dataset.drawer;
+    applyPanes();
   }
 }
 
@@ -770,13 +774,20 @@ function start(api) {
     watching: (id) => (state.ov ? state.ov.watching(id) : true),
     footprint,
   });
-  state.subjects.onLearn(applySubjectsPane);
+  state.panes = mountPanes($("#panes"), state.view, { footprint, host: $("#pane") });
+  state.panes.register("subjects", "subjects", {
+    eligible: () => !!state.subjectsPane && state.subjectsPane.eligible(),
+    el: $("#subjects"),
+    onShow: () => state.subjectsPane?.render(),
+    // A last draw going out, so a hidden pane holds no ended job's section.
+    onHide: () => state.subjectsPane?.render(),
+  });
+  state.subjects.onLearn(applyPanes);
   applyMapPane();
-  applySubjectsPane();
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
     if (key === "map") applyMapPane();
-    if (key === "subjects") applySubjectsPane();
+    if (key === "pane") applyPanes();
   });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
@@ -810,7 +821,7 @@ function start(api) {
       if (state.map) state.map.sync();
       state.subjects?.sync(jobs);
       if (state.ov) state.ov.sync(jobs, shown());
-      applySubjectsPane();
+      applyPanes();
       if (state.wf) state.wf.syncJobs(jobs);
       pollSources(api);
       stopAudioUnlessRunning(jobs);
@@ -854,53 +865,18 @@ function applyMapPane() {
     if (root.dataset.pane === "map") delete root.dataset.pane;
   }
   $("#map-toggle").setAttribute("aria-pressed", String(root.dataset.pane === "map"));
-  $("#subjects-toggle").setAttribute("aria-pressed", String(subjectsPressed()));
+  state.panes?.render();
 }
 
-// Whether the Subjects pane is what the toggle would close.
-function subjectsPressed() {
-  const root = document.documentElement;
-  if (root.dataset.footprint === "narrow") return root.dataset.pane === "subjects";
-  return root.dataset.subjects === "on";
-}
-
-// #subjects, #subjects-toggle and <html data-subjects="on"> from the view's `subjects` policy
-// and whether a running job has a table; off also leaves the narrow footprint's tab. Run on a
-// row learned and on a job poll, never on a message, and drawn at once when it comes to show.
-function applySubjectsPane() {
-  const root = document.documentElement;
-  const policy = state.view ? state.view.get("subjects") : "auto";
-  const eligible = !!state.subjectsPane && state.subjectsPane.eligible();
-  const on = !!state.subjectsPane && (policy === "on" || (policy === "auto" && eligible));
-  if (on) root.dataset.subjects = "on";
-  else {
-    delete root.dataset.subjects;
-    if (root.dataset.pane === "subjects") delete root.dataset.pane;
-  }
-  // A last draw going out, so a hidden pane holds no ended job's section.
-  if (!on && !$("#subjects").hidden) state.subjectsPane?.render();
-  const shown = on && $("#subjects").hidden;
-  $("#subjects").hidden = !on;
-  if (shown) state.subjectsPane.render();
-  $("#subjects-toggle").hidden = !(eligible || policy === "on");
-  $("#subjects-toggle").setAttribute("aria-pressed", String(subjectsPressed()));
-}
-
-// The toggle: `on` or `off` in the wide footprint; narrow, the tab opens and closes (turning
-// the pane on first when the view has it off).
-function toggleSubjects() {
-  const root = document.documentElement;
-  if (root.dataset.footprint === "narrow") {
-    if (root.dataset.pane === "subjects") delete root.dataset.pane;
-    else {
-      if (root.dataset.subjects !== "on") state.view?.set("subjects", "on");
-      root.dataset.pane = "subjects";
-      state.subjectsPane?.render();
-    }
-    applyMapPane();
-    return;
-  }
-  state.view?.set("subjects", root.dataset.subjects === "on" ? "off" : "on");
+// The pane strip and #pane from the view's `pane` and the panes' eligibility (panes.js), and
+// the map's narrow tab, which a pane's tab replaces. Run on a view change, a row learned, a jobs
+// poll and a footprint change, never on a message.
+function applyPanes() {
+  state.panes?.render();
+  $("#map-toggle").setAttribute(
+    "aria-pressed",
+    String(document.documentElement.dataset.pane === "map"),
+  );
 }
 
 // The shown source's last `source_list` record (null when unknown).
@@ -1000,6 +976,7 @@ function logout(api) {
   if (state.menu) state.menu.destroy();
   if (state.ov) state.ov.destroy();
   if (state.map) state.map.destroy();
+  if (state.panes) state.panes.destroy();
   if (state.subjectsPane) state.subjectsPane.destroy();
   if (state.subjects) state.subjects.destroy();
   if (state.coarse) state.coarse.destroy();
@@ -1008,9 +985,9 @@ function logout(api) {
   state.jobs = null;
   state.ov = null;
   state.map = null;
+  state.panes = null;
   state.subjectsPane = null;
   state.subjects = null;
-  applySubjectsPane();
   state.coarse = null;
   state.menu = null;
   state.wf = null;
@@ -1261,7 +1238,6 @@ function boot() {
     else root.dataset.pane = "map";
     applyMapPane();
   });
-  $("#subjects-toggle").addEventListener("click", toggleSubjects);
   $("#login-form").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const secret = $("#secret").value;
