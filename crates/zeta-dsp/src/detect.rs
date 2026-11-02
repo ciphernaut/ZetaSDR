@@ -393,7 +393,8 @@ impl Tracker {
 }
 
 /// Holds announcements to at most `per_s` in each second of row time (`t_ns / 1 s`);
-/// the rest wait, in order, for the following seconds' rows.
+/// the rest wait, in order, for the following seconds' rows. The queue is bounded by
+/// the tracker: each track queues at most one `New` and one `Gone`.
 pub struct Pacer {
     per_s: usize,
     second: u64,
