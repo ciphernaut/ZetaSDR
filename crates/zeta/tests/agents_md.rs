@@ -243,3 +243,25 @@ fn bursts_keep_flags_are_in_the_running_section() {
         assert!(md.contains(needle), "missing {needle}");
     }
 }
+
+#[test]
+fn exploring_an_unknown_signal_is_in_the_guide() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    for needle in [
+        "### Exploring an unknown signal",
+        "on_unknown",
+        "capture_classify",
+        "register says",
+        "legal line",
+        "measured over the bursts",
+    ] {
+        assert!(md.contains(needle), "missing {needle}");
+    }
+}

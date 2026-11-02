@@ -75,10 +75,6 @@ From the operator, 2026-11-01 (after the B210 day). A running job's row and its 
 
 From the operator, 2026-11-01. Event ribbons (`signal new`, `identifying`, `unknown`, transcripts, the watch's lines) are laid out from the right-hand edge, over the newest columns, so they hide the fresh RF activity they announce. Anchor them at the left (the oldest columns) and let them run towards the right, or into a gutter, so the latest spectrum stays visible; the staircase lanes (above) and this share the layout code in `overlays.js`.
 
-## UI: "What is this?" says the data is no longer in the buffer
-
-From the operator, 2026-11-01, seen at the higher, wider bands. `classify` on a box answers `too_old` when the IQ ring no longer covers the selection's span (the ring keeps 10 s at narrow rates and shrinks towards 1 s at wide ones; the box's span is the moment it was drawn, by which time a 61 Msps capture has moved on). The page shows the error and stops. Instead: on `too_old` re-issue the classify on the most recent span the ring does cover (end now, the same length or what the ring has), say so in the transcript (`buffer moved on; classified the last <n> s`), and show the ring's depth in the box footer so the operator sees it coming. The node side can help: a `too_old` error should carry the ring's oldest `start_ns`.
-
 ## UI: the job panel hides the id behind a horizontal scroll
 
 From the operator, 2026-11-01. A job row's actions sit to the right of a horizontal scroller; by the time the scroller is found, the id (and kind) are out of view. Keep the id and kind sticky at the left, wrap or collapse the rest (band, state, events, actions) into a second line or an expand-on-select, and drop columns that repeat the tag. Settle it with the Okudagram (LCARS) restyle (below) rather than as a one-off, unless the row-actions gist above lands first.
@@ -159,12 +155,6 @@ Open work left from plan 16's mode registry (delivered; see the plan series):
 - **Wideband modes** (DVB-T 8 MHz, DAB 1.5 MHz, LTE) run the direct path at full rate and want the GPU FFT; park them behind the HackRF-first set.
 - **`sync_bank` flapping** (from the 2026-10-27 investigation, not reproduced). A bank replaced while `feed_bank` still drains old-band blocks can swap back and forth, stalling a channel stage silently.
 
-## Feature: classify on a 12.5-150 kHz box tries a row-width slice at the measured centre
-
-On a box between `MIN_BW_HZ` and the RDS gate, after a `no_frame` also try the row-width slice at the measured centre when layer 1 is not `noise` (plan 16 ruling 21): a packet 10 kHz off a 40 kHz box's centre is missed today and decodes on that slice. Fits the "centre on the measured signal" rule.
-
-Related, from plan 17 (ruling 6): what `CLASSIFY_TRIES` counts. `classify` takes the best five rows by score, and the three sonde rows score 0.6 on any narrow FM box (centre list empty, width fits, `fm` in `modulation`) even outside 400-406 MHz, so on a 2 m or UHF channel they can fill three of the five `tried` slots as `skipped_quick` and push a quick-attempt row (APRS, POCSAG) out of the list. Count only rows with a quick attempt against the five (or take the five after dropping `skipped_quick`/out-of-range rows), and let the range term in the score drop a row whose `range_hz` does not contain the measured centre. Tests in `tests/classify.rs` carry an operator override for it today.
-
 ## Bug: a plain `pocsag_decode` never decodes on the debug-build bank at 2.048 MHz
 
 Found in plan 16 task 7 (pre-existing): the debug-build bank path at 2.048 MHz does not deliver a decodable channel for a plain `pocsag_decode`, so the core identify tests run without the bank. Reproduce with the POCSAG fixture on a 2.048 MHz capture in a debug build, then check the release build before fixing.
@@ -239,18 +229,9 @@ Found in plan 17's final review. The watch's feed out is wired for one sink: `De
 
 Replace it with `sink: {kind, params}` (or a list of them) on the detect node: `graph::validate` checks `params` against the named stage's `params_schema` and requires an `event` input and no outputs, the watch appends `kind` with `params` fed by the decoder's events, and `sondehub: {...}` stays accepted as shorthand for `sink: {kind: "sink_sondehub", params: {...}}` so existing watches resume. The `sondehub.<field>` error naming becomes `sink.params.<field>`, and the sink-restart path (`place_decoder`, the sink-less fallback) works on any kind.
 
-## Bug: the watch's detect defaults fire on receiver noise
+## Detect: a per-device spur list
 
-Found at the first live run (2026-10-29, the field host's B210 at 65 dB on 400-406 MHz with the discone): with the defaults (`threshold_db` 10 over the row's `floor_db`, which already sits 5 dB under the 2nd-percentile bin, and `width_hz` `[5000, 30000]`) the detect stage reported about a hundred "signals" 6-9 kHz wide across the band and the watch identified noise one 20 s slot at a time. `threshold_db` 18, `persist_ms` 5000 and `width_hz` `[8000, 30000]` left one real signal. The defaults were tuned on synthesised captures whose noise is flat.
-
-Wanted: a threshold relative to the band's median (not the 2nd percentile), or a minimum run energy, so the defaults hold on a real receiver; a `signal` event rate limit; and `identify`'s candidate order on a 12.5 kHz FSK box should put the sonde rows before `acars_decode` (it tried ACARS first, then POCSAG, with the sonde rows after). Record the thresholds that worked in field craft meanwhile.
-
-Seen again on the field host B210, 2026-11-01, with a real RS41 (X1142896, 401.500 MHz, 21 km up, 70 km away): the detector saw it as 4.5 kHz wide at 19 dB, under the field-tested 8 kHz floor, so the watch never flagged it and only the pre-placed `rs41_decode` on the last known frequency decoded it (27 frames in the first minutes); the sonde's channel SNR was about 6 dB (the `measure` `snr_db` of 20 dB is a per-bin peak and flatters narrow FSK tones; B210 gain 65 → 76 dB raised signal and floor alike). Lowering the floor to 4 kHz surfaced a dozen 4.5 kHz spikes at round offsets from the capture centre (402.0245, 402.1505, 402.9005, 403.1494, 403.8996 MHz: B210 spurs, `spurs_hz` material) and the watch churned identify runs on them. The detector needs a run-energy or tone-pair criterion, not a width floor, and a spur list per device.
-## Feature: a burst-aware layer 1
-
-From the 2026-10-29 404.025 MHz investigation: `measure` labels whole one-second windows, so a 1 % duty burst signal (5 ms every 1000 ms) read as `noise` with a 47 Hz "bandwidth"; the FSK rule wants two steady tones 500-3000 Hz apart and never matches multi-level or bursty FSK; there is no symbol-rate estimate beyond a spectral line.
-
-Wanted: gate the measurement on the burst (on/off at 1 ms, measure over on-time only); report `duty`, `burst_ms`, `period_ms` as features; a cyclostationary symbol-rate estimate (the `|x|^2` line); an M-level instantaneous-frequency cluster count for M-FSK and the squaring test for PSK. Each is testable with the plan-17 synthesiser families (`fsk`/`psk`/`ook` with `repeat`). Pairs with the ACMA knowledge provider: register says `16K0F1D`, layer 1 confirms "burst FSK, 16 kHz".
+Plan 19.1 changed the detector (occupancy over the row median, a run-energy floor `energy_db` 30, `threshold_db` 6, a 4 kHz width floor, three sightings, at most 10 events a second), tuned on synthesised captures only: the B210 noise recording (`scratch/live/record-noise.sh`, then the ignored test `crates/zeta-dsp/tests/detect_noise.rs`) is the operator's to make. What is left: the B210's spurs (402.0245, 402.1505, 402.9005, 403.1494, 403.8996 MHz, 4.5 kHz wide at round offsets from the capture centre) still need a per-device spur list that `detect` masks (`spurs_hz` is the absolute half, empty by default), measured once per device by a survey over a quiet span and kept with the source record; the scan gist "the HackRF's spur grid" is the same list for the offsets-from-tune half. Also a tone-pair criterion for a narrow FSK sonde (4.5 kHz at 19 dB on 2026-11-01).
 
 ## Agent: requests too big for the voice console
 
@@ -258,25 +239,15 @@ Done: plan 21 (`docs/superpowers/plans/2026-11-01-agent-bulk-ops.md`), plus `job
 
 ## Agent guide: SIGINT and UX additions
 
-For `agents_md`/field craft: (1) on a licensed band call `knowledge_lookup` first and report licensee and emission before demodulating, noting data age; (2) when `measure` reports a low duty cycle, report burst timing and say the band label is unreliable rather than "noise"; (3) an unknown-signal playbook that ends at classification and signature write-back and stops before decoding third-party content, stating the legal line once; (5, from the operator, 2026-11-01) expand this guidance as each mode and SIGINT component lands, including when not to touch running jobs; (4) lead the operator with the map and the one-line `summary`, name channels and licensees in plain words, and offer the next investigative step (measure, identify, knowledge lookup, direction-find).
+Items 1-3 of the first list shipped in plan 19.1 (the register and `as_of`, the low-duty rule, the unknown-signal playbook with its legal line: "Exploring an unknown signal"). Still open: (5, from the operator, 2026-11-01) expand this guidance as each mode and SIGINT component lands, including when not to touch running jobs; (4) lead the operator with the map and the one-line `summary`, name channels and licensees in plain words, and offer the next investigative step (measure, identify, knowledge lookup, direction-find). Plan 19.2 and 19.3 extend the playbook with bits, frames and signature write-back.
 
 ## Feature: VDL Mode 2 and HFDL rows (the other aircraft data links)
 
 From the operator, 2026-11-02 ("ACARS and VDL"). Plain VHF ACARS is `acars_decode`; most airline traffic has moved to VDL Mode 2 (136.975 MHz in Australia plus a few channels, D8PSK at 31.5 kbaud, 25 kHz spacing). `dumpvdl2` 2.6.0 and `dumphfdl` are installed on the field host (`libacars` inside both). Wanted: a program row `vdl2_decode` like `adsb_decode` (IQ over stdin at the sample rate the decoder wants, its JSON output through `json_lines`), subject key the AVLC source address (the aircraft's ICAO), the ACARS fields it carries (`reg`, `flight`, `label`, `text`) as columns, no `position` (some message texts carry one; parse later); and `hfdl_decode` the same shape on a KiwiSDR source (HFDL ground stations around 8.9, 10.0 and 11.4 MHz; a 2.4 kHz channel fits the Kiwi's 12 kHz). Neither has a synthesiser: the `modes check` fixture is a minute recorded off the air with `iq read` (VDL2 near Brisbane is busy). One small plan, no node changes.
 
-## Feature: a station position (`set position`) and a GPS fix from the B210
+## Station: a GPS fix from the B210
 
-From the operator, 2026-11-02. The page's `view set home LAT,LON` is per browser and only feeds distance and bearing. Wanted: a node-level station position, set once (`station set --lat --lon --alt-m`, or `position set`), persisted in the state directory and read by everything that needs one: the page's home by default, the SondeHub sink's `lat`/`lon`/`alt_m`, the ACMA knowledge provider's "licensed N km away" (below), and the subjects' distance column. And a source of truth for it: the B210 carries a GPSDO option whose UHD sensors (`gps_locked`, `gps_gpgga`, `gps_time`) are reachable through SoapySDR's sensor API from the worker; when a locked fix is present the node takes the position (and can discipline its clock, see "Time, trunking, span"). `source_list` shows `gps` (`locked`, `lat`, `lon`, `alt_m`, `satellites`) for a source that has one. Hand-set wins over an unlocked fix; a locked fix updates a position marked as from GPS.
-
-## Feature: a `knowledge` provider over the ACMA licence register (acma-local)
-
-From the 2026-10-29 investigation of a burst signal at 404.025 MHz: ZetaSDR's own layer 1 called it `unknown`/`noise` (`measure` averages a 1 % duty burst into nothing, reports a 47 Hz "bandwidth" and no symbol rate), two hours of hand analysis flip-flopped between PSK and FSK, and one SQL query against the local ACMA mirror (`/Projects/acma-local/data/acma.db`, the RRL as a SQLite mirror with an MCP server) named it in seconds: Unitywater fixed point-to-point telemetry, Example Suburb to Example Suburb, 1 W, emission `16K0F1D` (16 kHz FM digital data). `knowledge_lookup` should answer the same question: a provider that queries `device_details` + `site` + `licence` + `client` for assignments within the band and within N km of the station's position (a `--station LAT,LON` the SondeHub sink already wants), returning licensee, site, distance, power and the decoded emission designator (the mirror has the decode tables) as `allocations`, so `classify`'s layer 2 can say "a licensed 16K0F1D data link sits on this channel 12 km away" before anyone demodulates. Needs the mirror's path (or the MCP server's URL) as a node flag; the data is as fresh as its last `npm run sync` (29 Aug 2026 today). Also: register the acma-local MCP server in this project's `.mcp.json` so the agent can call it directly.
-
-## Feature: the watch re-centres before it identifies
-
-Found in plan 17's final review. The watch tunes its identify run on the detector's run centre, good to about one fft bin (1.46 kHz at a 6 MHz capture with `WATCH_BIN_TARGET_HZ` 1500), while `rs41mod` over NBFM audio decodes only within about ±1000 Hz of the sonde's centre (it slices the audio around zero, and an off-centre FM signal shifts that level); synthesised frames decode at ±1000 Hz and not at ±1500 Hz. A sonde at the wrong end of a bin is then reported `unknown` and retried on the same centre.
-
-Measure before identifying: a short `measure` (or a power-weighted centroid over the run's bins in `detect`, which the spectrum rows already carry) gives the occupied band's centre to a few hundred hertz, and the identify run starts there. Alternatively the audio rows could remove the demodulated DC (a slow high-pass ahead of the WAV feed), which makes the decoders tolerant of a few kilohertz of mis-tune; measure both against the RS41 generator with the job held off the signal.
+The node-level station (`station set/get/clear`) shipped in plan 19.1. What is left is a source of truth for it: the B210 carries a GPSDO option whose UHD sensors (`gps_locked`, `gps_gpgga`, `gps_time`) are reachable through SoapySDR's sensor API from the worker. Wanted: `source_list` shows `gps` (`locked`, `lat`, `lon`, `alt_m`, `satellites`) for a source that has one, and `station set --from-source ID` takes a locked fix as the station (marked as from GPS; hand-set wins over an unlocked fix, a locked fix updates a position marked as from GPS); the clock discipline is under "Time, trunking, span".
 
 ## Bug: a decoder the watch placed on another free source keeps running if the watch never recovers
 
@@ -322,10 +293,6 @@ Found in the plan 22 final review, 2026-11-01. Mutes live in the mix's graph, so
 
 Plan 23 merges each subject's events on the page, so a refresh starts the Subjects tab, the tracks and the dim and drop clocks empty and refills them from live traffic (an aircraft re-announces within seconds; a sonde every second, an APRS station only when it next transmits). A node-side store, kept as `job_context.subjects` (the merged state by key, last seen, count, the track), would survive a refresh, serve the agent and the CLI ("which aircraft are up?") and let a second page open on the same picture. Decide where the dim and drop settings live then.
 
-## UI: the Subjects list must not take over the page
-
-From the operator, 2026-11-02, on first sight of plan 23's Subjects pane: "move list to separate tab alongside the radios. it should not just take over real estate like this", or a hover box. Today the pane opens under the map (`subjects auto`) and halves the waterfall whenever a subject job runs. Wanted: the list lives behind its own tab beside the source tabs (the `#tabs` strip the radios and Listen to all sit in), shown only when chosen, or as a hover box over the waterfall that does not reflow the layout; the waterfall and map keep their room by default. The `auto` policy then means "the tab appears", not "the pane opens". Same rule for any future pane: a new view earns a tab or an overlay, never a slice of the waterfall.
-
 ## Subjects: leftovers
 
 Rulings of plan 23 an operator may want otherwise:
@@ -337,3 +304,7 @@ Rulings of plan 23 an operator may want otherwise:
 - The row cache (`store.lookup`) lives for the page: an operator row edited on the node needs a page reload.
 - The agent's own jobs: `mix_start` ids are not recorded as the run's own, so a run cannot stop a mix it started (the stop gate was not widened).
 - Tracks keep a fix when the subject has moved `track_min_m` (or turned over 10 degrees) and, at `track_points`, thin the older half by every other point (the first point stays). Keeping sharp curves when thinning old points is a future sprint: today a thinned half can cut a corner, and a long straight leg and a tight turn lose points alike.
+
+## Layer 1 and explore: deferred minors from plan 19.1
+
+For an operator, not blocking: the burst gate's `on` reference is the 15th-percentile chunk, so one impulse over a continuous signal gives duty 0.001 (wants a minimum on-time guard); an 8 kHz noise window averages only 7 spectra and reads `unknown` (the noise rule should scale its margin with the spectrum count); the AM tone reads its tone frequency as a baud; the `am` rule reads the whole block's cv, so a keyed constant-envelope burst train reads `am` (it should read the on-runs' cv); `clusters()` has no prominence or merge, so ripple could read a 2-FSK as 4-FSK; CW/Morse (gated low-rate OOK) never reaches the `ook` rule; the register's space class is not limited to earth stations (the RRL has no flag); a rebuilt bursts index loses pins (and the same open may expire a former pin); the detector's Pacer can add latency under a flood of tracks; `unregister` on the page does not re-render the Explore pane (19.2); the B210 noise recording is pending the operator.
