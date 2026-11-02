@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::stage::{Stage, StageContext, StageError};
+use zeta_core::station::Station;
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Provenance, SourceId, Span, StreamId, Timestamp};
 use zeta_ext::SondehubStage;
@@ -122,20 +123,26 @@ impl Running {
 }
 
 fn start(url: &str, batch_ms: u64) -> Running {
-    let bus = Arc::new(StreamBus::new(64));
-    let (tx, rx_in) = broadcast::channel(64);
-    let context = Arc::new(Mutex::new(json!({})));
-    let c = context.clone();
-    let ctx = StageContext::new(SourceId("s".into())).with_note(Arc::new(move |v: Value| {
-        let mut cx = c.lock().unwrap();
-        for (k, x) in v.as_object().unwrap() {
-            cx[k] = x.clone();
-        }
-    }));
     let params = json!({
         "callsign": "TEST", "lat": -27.5, "lon": 153.0, "alt_m": 10.0,
         "batch_ms": batch_ms, "url": url
     });
+    start_with(params, None)
+}
+
+fn start_with(params: Value, station: Option<Station>) -> Running {
+    let bus = Arc::new(StreamBus::new(64));
+    let (tx, rx_in) = broadcast::channel(64);
+    let context = Arc::new(Mutex::new(json!({})));
+    let c = context.clone();
+    let ctx = StageContext::new(SourceId("s".into()))
+        .with_note(Arc::new(move |v: Value| {
+            let mut cx = c.lock().unwrap();
+            for (k, x) in v.as_object().unwrap() {
+                cx[k] = x.clone();
+            }
+        }))
+        .with_station(station);
     let cancel = CancellationToken::new();
     let c2 = cancel.clone();
     let handle = tokio::spawn(async move {
@@ -280,4 +287,43 @@ async fn an_unreachable_api_counts_a_failure() {
     until("failed counted", || r.sondehub()["failed"] == 1).await;
     assert!(r.sondehub()["last_error"].is_string());
     stop(r).await;
+}
+
+fn station() -> Station {
+    Station {
+        lat: -27.38,
+        lon: 153.12,
+        alt_m: 40.0,
+        region: "AU".into(),
+        antennas: vec![],
+    }
+}
+
+#[tokio::test]
+async fn an_omitted_position_takes_the_station() {
+    let (url, seen) = api(200).await;
+    let params = json!({"callsign": "TEST", "batch_ms": 300, "url": url});
+    let r = start_with(params, Some(station()));
+    r.send(rs41("R1", 1));
+    until("sent counted", || r.sondehub()["sent"] == 1).await;
+    {
+        let seen = seen.lock().unwrap();
+        let e = &seen[0].body[0];
+        assert_eq!(e["uploader_position"], json!([-27.3842, 153.1175, 4.0]));
+    }
+    stop(r).await;
+}
+
+#[tokio::test]
+async fn an_omitted_position_without_a_station_fails_naming_the_field() {
+    let params = json!({"callsign": "TEST"});
+    let r = start_with(params, None);
+    let end = r.handle.await.unwrap();
+    match end {
+        Err(StageError::Failed(m)) => assert!(
+            m.starts_with("sink.params.lat: no station set (station set --lat --lon --alt-m)"),
+            "{m}"
+        ),
+        other => panic!("{other:?}"),
+    }
 }

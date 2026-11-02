@@ -35,6 +35,9 @@ const BATCH_MS_MIN: u64 = 100;
 /// How long one upload may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The failure when a position is needed and neither the params nor a station give one.
+const NO_STATION: &str = "sink.params.lat: no station set (station set --lat --lon --alt-m)";
+
 fn default_batch_ms() -> u64 {
     BATCH_MS
 }
@@ -50,12 +53,15 @@ fn default_url() -> String {
 pub struct SondehubParams {
     /// The station's callsign, shown on SondeHub.
     pub callsign: String,
-    /// The station's latitude in degrees.
-    pub lat: f64,
-    /// The station's longitude in degrees.
-    pub lon: f64,
-    /// The station's altitude in metres.
-    pub alt_m: f64,
+    /// The uploader's latitude in degrees; the node's station when omitted.
+    #[serde(default)]
+    pub lat: Option<f64>,
+    /// The uploader's longitude in degrees; the node's station when omitted.
+    #[serde(default)]
+    pub lon: Option<f64>,
+    /// The uploader's altitude in metres; the node's station when omitted.
+    #[serde(default)]
+    pub alt_m: Option<f64>,
     /// How often a batch is sent, in milliseconds (at least 100).
     #[serde(default = "default_batch_ms")]
     pub batch_ms: u64,
@@ -130,25 +136,25 @@ fn now_ns() -> u64 {
 /// The telemetry object for sonde event `ev` as `p`'s station received it at
 /// `received`, or `None` for an event that is not sonde telemetry SondeHub accepts: one
 /// with a position (a numeric altitude included), a `datetime` and a `frame`.
-fn telemetry(p: &SondehubParams, ev: &Value, received: &str) -> Option<Value> {
+fn telemetry(p: &SondehubParams, pos: [f64; 3], ev: &Value, received: &str) -> Option<Value> {
     let (manufacturer, kind) = sonde_type(ev["protocol"].as_str()?)?;
-    let pos = ev.get("position")?;
+    let fix = ev.get("position")?;
     let serial = ev["id"].as_str()?;
-    pos["alt_m"].as_f64()?;
+    fix["alt_m"].as_f64()?;
     ev["datetime"].as_str()?;
     ev["frame"].as_u64()?;
     let mut t = json!({
         "software_name": "zetasdr",
         "software_version": env!("CARGO_PKG_VERSION"),
         "uploader_callsign": p.callsign,
-        "uploader_position": [p.lat, p.lon, p.alt_m],
+        "uploader_position": pos,
         "time_received": received,
         "manufacturer": manufacturer,
         "type": kind,
         "serial": serial,
-        "lat": pos["lat"],
-        "lon": pos["lon"],
-        "alt": pos["alt_m"],
+        "lat": fix["lat"],
+        "lon": fix["lon"],
+        "alt": fix["alt_m"],
     });
     let o = t.as_object_mut()?;
     for k in [
@@ -211,8 +217,10 @@ impl Stage for SondehubStage {
         if p.callsign.trim().is_empty() {
             return Err("callsign is empty".into());
         }
-        if !(-90.0..=90.0).contains(&p.lat) || !(-180.0..=180.0).contains(&p.lon) {
-            return Err(format!("lat {} / lon {} out of range", p.lat, p.lon));
+        if p.lat.is_some_and(|v| !(-90.0..=90.0).contains(&v))
+            || p.lon.is_some_and(|v| !(-180.0..=180.0).contains(&v))
+        {
+            return Err(format!("lat {:?} / lon {:?} out of range", p.lat, p.lon));
         }
         if p.batch_ms < BATCH_MS_MIN {
             return Err(format!(
@@ -239,6 +247,15 @@ impl Stage for SondehubStage {
         self.check_params(&params).map_err(&fail)?;
         let p: SondehubParams =
             serde_json::from_value(params).map_err(|e| fail(format!("params: {e}")))?;
+        let pos = match (p.lat, p.lon, p.alt_m, ctx.station.as_ref()) {
+            (Some(lat), Some(lon), Some(alt), _) => [lat, lon, alt],
+            (lat, lon, alt, Some(st)) => [
+                lat.unwrap_or(st.lat),
+                lon.unwrap_or(st.lon),
+                alt.unwrap_or(st.alt_m),
+            ],
+            _ => return Err(StageError::Failed(NO_STATION.into())),
+        };
         if inputs.len() != 1 {
             return Err(fail("expected 1 input".into()));
         }
@@ -260,7 +277,7 @@ impl Stage for SondehubStage {
                 _ = cancel.cancelled() => return Err(StageError::Cancelled),
                 f = rx.recv() => match f {
                     Ok(Frame { payload: Payload::Event(ev), .. }) => {
-                        if let Some(t) = telemetry(&p, &ev, &iso8601(now_ns())) {
+                        if let Some(t) = telemetry(&p, pos, &ev, &iso8601(now_ns())) {
                             batch.push(t);
                         }
                     }

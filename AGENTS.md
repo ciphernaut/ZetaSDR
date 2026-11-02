@@ -512,10 +512,10 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: event
 - outputs: 
 - params.callsign: string
-- params.lat: number
-- params.lon: number
-- params.alt_m: number
+- params.alt_m: number or null (optional, default null)
 - params.batch_ms: integer (optional, default 5000)
+- params.lat: number or null (optional, default null)
+- params.lon: number or null (optional, default null)
 - params.url: string (optional, default "https://api.v2.sondehub.org/sondes/telemetry")
 
 ### ssb_demod
@@ -648,7 +648,7 @@ Two radios: with a second source, for example the field host's B210 attached as 
 
 The page shows a watch as an outline on the waterfall with its signals marked ("Watch this band" in the box menu starts one). Its owned identify jobs are hidden. Events with a `position` appear on the map (`view set map on|off`): a marker and track per subject for a row that names one (thinned by the row's `track_points` and `track_min_m`, the marker turned to its heading and labelled with its name and altitude), per job otherwise, whichever source it runs on (the decoder on the second radio included), and with `view set home LAT,LON` (`none` clears it) the jobs pane shows distance and bearing from home for a job with one marker. A row with `subject` columns also shows on the Subjects tab (`view set subjects auto|on|off`), one table row per subject in metres and km/h, climb rate in m/s; a subject silent for `subject_dim_s` (60) dims and for `subject_drop_s` (300) goes, and a click on a table row selects its marker and the reverse. This state lives on the page, so a refresh refills from live traffic. The map uses vendored Leaflet and fetches OpenStreetMap tiles only when the browser is online.
 
-SondeHub is a feed out of the node, so nothing uploads unless the operator gave a callsign. Put `sondehub: {callsign, lat, lon, alt_m}` on the watch's `detect` node (`batch_ms` and `url` are optional) and every decoder it keeps gains a `sink_sondehub` node; or `graph put` a `sink_sondehub` node on any sonde job yourself. `job_context.sondehub` counts `sent` and `failed` and keeps `last_error`; events SondeHub would reject (no position, no `datetime`, no `frame`, no numeric altitude) are skipped, not counted, so `failed` means transport trouble. Do not invent a callsign or a position.
+SondeHub is a feed out of the node, so nothing uploads unless the operator gave a callsign. Put `sondehub: {callsign}` (with `lat`, `lon`, `alt_m` only to override the station) on the watch's `detect` node (`batch_ms` and `url` are optional) and every decoder it keeps gains a `sink_sondehub` node; or `graph put` a `sink_sondehub` node on any sonde job yourself. `job_context.sondehub` counts `sent` and `failed` and keeps `last_error`; events SondeHub would reject (no position, no `datetime`, no `frame`, no numeric altitude) are skipped, not counted, so `failed` means transport trouble. `lat`, `lon` and `alt_m` may be left out: the node's station (`station_get`) supplies them, and the sink fails `sink.params.lat: no station set` when there is none. Do not invent a callsign or a position.
 
 ### Remote HF receivers (KiwiSDR)
 
