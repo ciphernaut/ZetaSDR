@@ -152,7 +152,35 @@ impl Cli {
     /// needs its `ZETA_NODE_SECRET_<ID>` (unless `--node` rejects the flag anyway), and a
     /// source id or a plugin kind given twice is refused.
     pub fn try_parse_checked() -> Result<Self, clap::Error> {
-        Self::try_parse()?.checked()
+        Self::try_parse_checked_from(std::env::args_os())
+    }
+
+    /// [`Cli::try_parse_checked`] over `args` (the first being the program name).
+    pub fn try_parse_checked_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = Self::command().try_get_matches_from(args)?;
+        let mut cli = Self::from_arg_matches(&matches)?;
+        // The node-local flags an environment variable can set: with `--node` the
+        // environment's values are ignored and only an explicit command-line flag is
+        // refused, so a shell that sources the serving node's settings still talks to it.
+        if cli.node.is_some() {
+            let from_env =
+                |id: &str| matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine);
+            if from_env("knowledge_acma_raw") {
+                cli.knowledge_acma_raw = None;
+            }
+            if from_env("bursts_keep_mb") {
+                cli.bursts_keep_mb = None;
+            }
+            if from_env("bursts_keep_days") {
+                cli.bursts_keep_days = None;
+            }
+        }
+        cli.checked()
     }
 
     fn checked(mut self) -> Result<Self, clap::Error> {
@@ -216,7 +244,8 @@ impl Cli {
     }
 
     /// Whether any flag that configures the local node (sources, plugins, state dir, modes
-    /// dir) was given.
+    /// dir, `--knowledge-acma`, `--bursts-keep-*`; with `--node` their environment variables
+    /// were already dropped by `try_parse_checked`) was given.
     pub fn configures_local_node(&self) -> bool {
         !self.sources.is_empty()
             || !self.plugins.is_empty()

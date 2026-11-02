@@ -90,7 +90,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
     if cli.configures_local_node() {
         return usage(
-            "sources, plugins and modes are configured on the serving node: drop --source-*, --plugin, --state-dir, --modes-dir and --knowledge-acma with --node",
+            "sources, plugins and modes are configured on the serving node: drop --source-*, --plugin, --state-dir, --modes-dir, --knowledge-acma and --bursts-keep-* with --node (their environment variables are ignored)",
         );
     }
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {

@@ -1831,6 +1831,41 @@ fn knowledge_acma_flag_is_refused_with_node() {
 }
 
 #[test]
+fn knowledge_acma_from_the_environment_is_ignored_with_node() {
+    // Nothing listens on port 9: the command fails on the connection, never as a usage
+    // error over the node-local settings a sourced `zeta.env` puts in the environment.
+    let out = zeta_bin()
+        .env("ZETA_KNOWLEDGE_ACMA", "http://127.0.0.1:9")
+        .env("ZETA_BURSTS_KEEP_MB", "1")
+        .env("ZETA_BURSTS_KEEP_DAYS", "1")
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s", "source", "list"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!text.contains("configured on the serving node"), "{text}");
+    assert!(!out.status.success(), "{text}");
+    // A bad value in the environment is ignored too.
+    let out = zeta_bin()
+        .env("ZETA_KNOWLEDGE_ACMA", "ftp://x")
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("--knowledge-acma"));
+    // The explicit flag is still refused.
+    zeta_bin()
+        .env("ZETA_BURSTS_KEEP_MB", "1")
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
+        .args(["--bursts-keep-mb", "2", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("configured on the serving node"));
+}
+
+#[test]
 fn knowledge_acma_with_a_bad_url_is_a_usage_error() {
     for bad in ["ftp://x", "http://h:1,reach_km=0", "http://h:1,reach_km=x"] {
         zeta_bin()
