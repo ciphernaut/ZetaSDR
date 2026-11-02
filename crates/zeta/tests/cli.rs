@@ -1110,10 +1110,14 @@ fn job_start_identify_then_tail_prints_candidates() {
             )
         })
         .collect();
-    assert!(outcomes.contains(&("rds_decode", "skipped_band")), "{v}");
-    assert!(outcomes.contains(&("adsb_decode", "skipped_band")), "{v}");
-    assert_eq!(outcomes[2].1, "no_frame", "{v}");
-    assert!(frames[2]["payload"]["job"].is_string(), "{v}");
+    // Candidates come in score order, each at its row's turn: a row that cannot run
+    // (here the sonde rows, out of range) is published when reached, between trials.
+    assert!(outcomes.iter().any(|o| o.1 == "skipped_band"), "{v}");
+    let tried = frames
+        .iter()
+        .find(|f| f["payload"]["outcome"] == "no_frame")
+        .unwrap_or_else(|| panic!("{v}"));
+    assert!(tried["payload"]["job"].is_string(), "{v}");
     assert_eq!(v[2], serde_json::json!({"stopped": true}));
     let id = v[0]["value"].as_str().expect("job id");
     let jobs = zeta(dir.path(), &["job", "list"])

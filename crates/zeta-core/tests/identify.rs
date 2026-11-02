@@ -434,7 +434,7 @@ async fn a_proof_leaves_one_named_child() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn wide_rows_are_skipped_band_on_a_narrow_identify() {
+async fn skipped_rows_publish_at_their_turn_not_ahead_of_the_trials() {
     let _one = SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let node = node_over(dir.path(), &fixtures().tone).await;
@@ -445,12 +445,13 @@ async fn wide_rows_are_skipped_band_on_a_narrow_identify() {
     .await;
     node.job_stop(&id).await.unwrap();
     let events = events.await.unwrap();
-    for m in ["rds_decode", "adsb_decode"] {
-        let e = outcome(&events, m).unwrap_or_else(|| panic!("{m}: {events:#?}"));
-        assert_eq!(e["outcome"], "skipped_band", "{e}");
-        assert!(e["job"].is_null(), "{e}");
-        assert!(e["evidence"].as_str().unwrap().contains("12500 Hz"), "{e}");
-    }
+    // Candidates come in score order, each at its row's turn: stopped during the first
+    // trial, the wide rows (scored below it) have published nothing, and no skip was
+    // batched ahead of the trials.
+    assert!(
+        events.iter().all(|e| e["outcome"] != "skipped_band"),
+        "{events:#?}"
+    );
     assert!(running(&node).is_empty());
     assert!(node.lease_holders(&rx()).is_empty());
 }

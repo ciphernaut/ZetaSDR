@@ -496,29 +496,6 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     };
     let allocation = |m: &LoadedMode| allocation_term(m, &allocations);
     let scored = score_rows(&inner.modes, m_center, bw, &layer1, &|_| 0.0, &allocation);
-    let mut tries = Vec::new();
-    for s in &scored {
-        let id = s.mode.row.id.0.as_str();
-        let fit = allocation_match(s.mode, &allocations);
-        if !s.fits_band {
-            let min = s
-                .mode
-                .row
-                .band
-                .min_hz
-                .unwrap_or(s.mode.row.band.bandwidth_hz);
-            let evidence = match s.in_range {
-                true => format!("needs a band of at least {min} Hz; the job's is {bw} Hz"),
-                false => format!("the measured centre {m_center} Hz is outside the row's range"),
-            };
-            inner.candidate(&r, id, s.score, Outcome::SkippedBand, &evidence, None, fit);
-        } else if s.mode.state != ModeState::Ready {
-            let evidence = s.mode.reason.clone().unwrap_or_else(|| "not ready".into());
-            inner.candidate(&r, id, s.score, Outcome::Unavailable, &evidence, None, fit);
-        } else {
-            tries.push((s.mode, s.score, fit));
-        }
-    }
     let faulted = |f: String| StageError::Failed(source_fault_reason(r.port.id(), &f));
     let mut current = ChildGuard {
         inner: inner.clone(),
@@ -526,7 +503,26 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         child: None,
     };
     let mut attempts = 0;
-    for (mode, score, fit) in tries {
+    // One pass in score order: a row that cannot run publishes its candidate at its turn.
+    for s in &scored {
+        let (mode, score) = (s.mode, s.score);
+        let fit = allocation_match(mode, &allocations);
+        if !s.fits_band {
+            let min = mode.row.band.min_hz.unwrap_or(mode.row.band.bandwidth_hz);
+            let evidence = match s.in_range {
+                true => format!("needs a band of at least {min} Hz; the job's is {bw} Hz"),
+                false => format!("the measured centre {m_center} Hz is outside the row's range"),
+            };
+            let id = mode.row.id.0.as_str();
+            inner.candidate(&r, id, score, Outcome::SkippedBand, &evidence, None, fit);
+            continue;
+        }
+        if mode.state != ModeState::Ready {
+            let evidence = mode.reason.clone().unwrap_or_else(|| "not ready".into());
+            let id = mode.row.id.0.as_str();
+            inner.candidate(&r, id, score, Outcome::Unavailable, &evidence, None, fit);
+            continue;
+        }
         if r.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
         }
