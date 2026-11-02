@@ -30,6 +30,9 @@ pub const ACMA_SQL_LIMIT: u64 = 200;
 pub const ACMA_TIMEOUT: Duration = Duration::from_secs(5);
 /// A failing service is logged at most once per this period.
 pub const ACMA_LOG_EVERY: Duration = Duration::from_secs(60);
+/// `reach()` reuses the plan answer of a lookup at the same centre this recent
+/// instead of asking again, so one `knowledge_lookup` is one deadline.
+pub const ACMA_PLAN_TTL: Duration = Duration::from_secs(60);
 
 /// Mean earth radius for the haversine distance.
 const EARTH_RADIUS_KM: f64 = 6371.0088;
@@ -39,8 +42,6 @@ const KM_PER_DEG_LAT: f64 = 111.0;
 const MIN_COS_LAT: f64 = 0.01;
 /// A plan service whose name holds one of these makes the band a space band.
 const SPACE_SERVICES: [&str; 3] = ["SATELLITE", "SPACE", "EARTH EXPLORATION"];
-/// Fields of the service's `health` answer that may carry its last sync time.
-const AS_OF_FIELDS: [&str; 4] = ["lastSync", "lastSyncAt", "last_sync", "syncedAt"];
 
 /// Where the station is now; `None` when none is set.
 pub type StationFn = Arc<dyn Fn() -> Option<Station> + Send + Sync>;
@@ -54,6 +55,16 @@ pub struct AcmaKnowledge {
     errors: AtomicU64,
     logged: AtomicU64,
     last_log: Mutex<Option<Instant>>,
+    plan_memo: Mutex<Option<PlanMemo>>,
+}
+
+/// What the last plan lookup at a centre said about space services: `space` is
+/// `None` when it failed or did not answer in time.
+#[derive(Clone, Copy)]
+struct PlanMemo {
+    center_hz: Hz,
+    at: Instant,
+    space: Option<bool>,
 }
 
 /// One service of the plan entry at a frequency.
@@ -114,6 +125,7 @@ impl AcmaKnowledge {
             errors: AtomicU64::new(0),
             logged: AtomicU64::new(0),
             last_log: Mutex::new(None),
+            plan_memo: Mutex::new(None),
         }
     }
 
@@ -161,7 +173,34 @@ impl AcmaKnowledge {
         }
     }
 
+    fn memo(&self, center_hz: Hz, space: Option<bool>) {
+        *self.plan_memo.lock().unwrap_or_else(|p| p.into_inner()) = Some(PlanMemo {
+            center_hz,
+            at: Instant::now(),
+            space,
+        });
+    }
+
+    /// The memo for `center_hz` when fresh: `Some(space)`, `space` itself `None`
+    /// when that lookup failed.
+    fn fresh_memo(&self, center_hz: Hz) -> Option<Option<bool>> {
+        self.plan_memo
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .filter(|m| m.center_hz == center_hz && m.at.elapsed() < ACMA_PLAN_TTL)
+            .map(|m| m.space)
+    }
+
+    /// The plan at `center_hz`, memoised for `reach()`.
     async fn plan(&self, center_hz: Hz) -> Result<Option<Plan>, String> {
+        // Marked failed first, so a lookup cut off by the deadline leaves that.
+        self.memo(center_hz, None);
+        let plan = self.fetch_plan(center_hz).await?;
+        self.memo(center_hz, Some(plan.as_ref().is_some_and(Plan::is_space)));
+        Ok(plan)
+    }
+
+    async fn fetch_plan(&self, center_hz: Hz) -> Result<Option<Plan>, String> {
         let v = self
             .client
             .call(
@@ -190,9 +229,7 @@ impl AcmaKnowledge {
         center_hz: Hz,
         bandwidth_hz: Hz,
     ) -> Result<Vec<Allocation>, String> {
-        let (plan, health) = tokio::join!(self.plan(center_hz), self.client.health());
-        let plan = plan?;
-        let as_of = health.ok().as_ref().and_then(as_of);
+        let plan = self.plan(center_hz).await?;
         let here = self.here(
             station,
             center_hz,
@@ -228,14 +265,13 @@ impl AcmaKnowledge {
                     ),
                     note: s.qualifier.clone(),
                     kind: Some("plan".into()),
-                    as_of: as_of.clone(),
                     ..Allocation::default()
                 })
             })
             .collect();
         let mut assignments: Vec<Allocation> = rows
             .into_iter()
-            .map(|r| assignment(r, here.as_ref(), as_of.clone()))
+            .map(|r| assignment(r, here.as_ref()))
             .filter(|a| within_reach(a, here.as_ref()))
             .collect();
         let role_rank = |a: &Allocation| u8::from(a.role.as_deref() != Some("tx"));
@@ -269,7 +305,7 @@ impl KnowledgeProvider for AcmaKnowledge {
     }
 
     async fn allocations(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Allocation> {
-        if !region.eq_ignore_ascii_case(ACMA_REGION) {
+        if !answers(region) {
             return Vec::new();
         }
         let station = (self.station)();
@@ -282,20 +318,30 @@ impl KnowledgeProvider for AcmaKnowledge {
         Vec::new()
     }
 
-    /// The band's reach from the station; `None` without an Australian station
-    /// (the reach is not applied then).
-    async fn reach(&self, center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
-        let station = (self.station)()?;
-        if !station.region.eq_ignore_ascii_case(ACMA_REGION) {
+    /// The band's reach from the station; `None` for another region or without a
+    /// station (the reach is not applied then). It reuses the plan answer of the
+    /// `allocations()` just made at this centre (see [`ACMA_PLAN_TTL`]) and asks the
+    /// service only when there is none; a plan that failed reads as no space band.
+    async fn reach(&self, region: &str, center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
+        if !answers(region) {
             return None;
         }
-        let space = self
-            .guarded(self.plan(center_hz))
-            .await
-            .flatten()
-            .is_some_and(|p| p.is_space());
-        self.here(Some(station), center_hz, space).map(|h| h.reach)
+        let station = (self.station)()?;
+        let space = match self.fresh_memo(center_hz) {
+            Some(space) => space,
+            None => self
+                .guarded(self.plan(center_hz))
+                .await
+                .map(|p| p.as_ref().is_some_and(Plan::is_space)),
+        };
+        self.here(Some(station), center_hz, space.unwrap_or(false))
+            .map(|h| h.reach)
     }
+}
+
+/// Whether the register answers for `region` (Australia only).
+fn answers(region: &str) -> bool {
+    region.eq_ignore_ascii_case(ACMA_REGION)
 }
 
 /// The plan entry in a `get_frequency_allocation` answer; `None` when the plan has
@@ -398,14 +444,6 @@ fn head(v: &Value) -> String {
     v.to_string().chars().take(80).collect()
 }
 
-/// The service's sync time from its `health` answer, when it gives one.
-fn as_of(health: &Value) -> Option<String> {
-    AS_OF_FIELDS
-        .iter()
-        .find_map(|k| health.get(k).and_then(Value::as_str))
-        .map(str::to_string)
-}
-
 /// The fixed assignments query: devices whose `FREQUENCY ± BANDWIDTH / 2` overlaps
 /// the band, joined to their site, licence and licensee, inside a box of `km`
 /// around `(lat, lon)` when one is given, nearest in frequency first.
@@ -443,7 +481,7 @@ fn assignments_sql(center_hz: Hz, bandwidth_hz: Hz, bbox: Option<(f64, f64, f64)
 }
 
 /// One register row as an `assignment` allocation.
-fn assignment(r: Row, here: Option<&Here>, as_of: Option<String>) -> Allocation {
+fn assignment(r: Row, here: Option<&Here>) -> Allocation {
     let half = r.bandwidth / 2;
     let (distance_km, bearing_deg) = match (here, r.lat, r.lon) {
         (Some(h), Some(lat), Some(lon)) => (
@@ -491,7 +529,8 @@ fn assignment(r: Row, here: Option<&Here>, as_of: Option<String>) -> Allocation 
         role,
         emission: r.emission,
         emission_decoded,
-        as_of,
+        // The service carries no sync time yet.
+        as_of: None,
     }
 }
 

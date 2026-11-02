@@ -2951,7 +2951,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 allocations.extend(p.allocations(&region, center_hz, bandwidth_hz).await);
                 signatures.extend(p.signatures(center_hz, bandwidth_hz).await);
                 if reach.is_none() {
-                    reach = p.reach(center_hz, bandwidth_hz).await;
+                    reach = p.reach(&region, center_hz, bandwidth_hz).await;
                 }
             }
             Ok(OpResult::Knowledge {

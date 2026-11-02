@@ -735,6 +735,28 @@ async fn knowledge_lookup_op_returns_allocations_from_provider() {
         Value::Null,
         "{v}"
     );
+    // An older node's answer, without `reach` or the assignment fields, still loads.
+    let old: OpResult = serde_json::from_value(serde_json::json!({
+        "result": "knowledge",
+        "value": {"allocations": [{"provider": "p", "region": "AU", "min_hz": 1,
+            "max_hz": 2, "service": "s", "note": null}], "signatures": []},
+    }))
+    .unwrap();
+    let OpResult::Knowledge {
+        allocations: old_allocations,
+        reach: None,
+        ..
+    } = old
+    else {
+        panic!("{old:?}");
+    };
+    assert_eq!(old_allocations[0].kind, None);
+    assert_eq!(old_allocations[0].emission_decoded, None);
+    // An allocation on its own (a static provider's file) loads without them too.
+    let a: Allocation = serde_json::from_value(serde_json::json!({"provider": "p",
+        "region": "AU", "min_hz": 1, "max_hz": 2, "service": "s", "note": null}))
+    .unwrap();
+    assert_eq!(a.distance_km, None);
     match result {
         Ok(OpResult::Knowledge {
             allocations,

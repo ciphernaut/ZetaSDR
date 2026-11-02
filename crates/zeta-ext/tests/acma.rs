@@ -32,6 +32,8 @@ struct Stub {
     mode: Mode,
     /// Tool calls seen.
     calls: AtomicUsize,
+    /// `get_frequency_allocation` calls seen.
+    plans: AtomicUsize,
     /// The last `execute_sql` arguments.
     sql: Mutex<Option<Value>>,
 }
@@ -98,6 +100,9 @@ async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Re
         "tools/call" => {
             assert_eq!(headers.get("mcp-session-id").unwrap(), "session-0");
             s.calls.fetch_add(1, Ordering::SeqCst);
+            if req["params"]["name"] == "get_frequency_allocation" {
+                s.plans.fetch_add(1, Ordering::SeqCst);
+            }
             match s.mode {
                 Mode::RpcError => {
                     return sse(json!({"jsonrpc":"2.0","id":id,
@@ -240,7 +245,10 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
     );
     assert!(q.contains("LATITUDE BETWEEN"), "{q}");
 
-    let r = provider.reach(Hz(404_025_000), Hz(16_000)).await.unwrap();
+    let r = provider
+        .reach("AU", Hz(404_025_000), Hz(16_000))
+        .await
+        .unwrap();
     assert_eq!((r.class, r.km), (ReachClass::Uhf, Some(150.0)));
     assert_eq!(r.antenna, "discone");
 }
@@ -272,7 +280,10 @@ async fn without_a_station_the_list_is_by_frequency_distance_with_null_km() {
         .to_string();
     assert!(!q.contains("LATITUDE BETWEEN"), "{q}");
     assert!(asg[0].note.as_deref().is_some_and(|n| !n.contains(" km")));
-    assert_eq!(provider.reach(Hz(404_030_000), Hz(16_000)).await, None);
+    assert_eq!(
+        provider.reach("AU", Hz(404_030_000), Hz(16_000)).await,
+        None
+    );
 }
 
 #[tokio::test]
@@ -291,7 +302,47 @@ async fn another_region_is_empty() {
             .await
             .is_empty()
     );
+    assert_eq!(
+        provider.reach("US", Hz(404_025_000), Hz(16_000)).await,
+        None
+    );
     assert_eq!(stub.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn reach_reuses_the_plan_of_the_lookup_just_made() {
+    let (url, stub) = serve(Mode::Normal).await;
+    let provider = provider(&url, demo_station());
+    provider
+        .allocations("AU", Hz(404_025_000), Hz(16_000))
+        .await;
+    let r = provider.reach("AU", Hz(404_025_000), Hz(16_000)).await;
+    assert_eq!(r.map(|r| r.class), Some(ReachClass::Uhf));
+    assert_eq!(stub.plans.load(Ordering::SeqCst), 1);
+    // Another centre has no plan answer yet: reach asks for it.
+    provider.reach("AU", Hz(404_050_000), Hz(16_000)).await;
+    assert_eq!(stub.plans.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_hung_service_costs_one_lookup_one_deadline() {
+    let (url, stub) = serve(Mode::Slow).await;
+    let deadline = Duration::from_millis(500);
+    let provider = provider(&url, demo_station()).with_timeout(deadline);
+    let t0 = std::time::Instant::now();
+    assert!(
+        provider
+            .allocations("AU", Hz(404_025_000), Hz(16_000))
+            .await
+            .is_empty()
+    );
+    let r = provider.reach("AU", Hz(404_025_000), Hz(16_000)).await;
+    let took = t0.elapsed();
+    assert!(took < deadline + Duration::from_millis(300), "{took:?}");
+    // The failed plan reads as no space band; the reach is the band's own.
+    assert_eq!(r.map(|r| r.class), Some(ReachClass::Uhf));
+    assert_eq!(stub.plans.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.errors(), 1);
 }
 
 #[tokio::test]
@@ -318,7 +369,10 @@ async fn a_service_error_a_bad_body_and_a_timeout_each_give_no_allocations() {
 async fn a_satellite_plan_sets_space_reach() {
     let (url, _) = serve(Mode::Satellite).await;
     let provider = provider(&url, demo_station());
-    let r = provider.reach(Hz(404_025_000), Hz(16_000)).await.unwrap();
+    let r = provider
+        .reach("AU", Hz(404_025_000), Hz(16_000))
+        .await
+        .unwrap();
     assert_eq!(r.class, ReachClass::Space);
     assert!(r.note.unwrap().contains("spacecraft"));
     let a = provider

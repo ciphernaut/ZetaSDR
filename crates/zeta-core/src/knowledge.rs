@@ -114,7 +114,7 @@ pub trait KnowledgeProvider: Send + Sync {
     async fn signatures(&self, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Signature>;
     /// How far from the station this provider searched for the band, when it
     /// applies a reach.
-    async fn reach(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
+    async fn reach(&self, _region: &str, _center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
         None
     }
 }
