@@ -790,7 +790,9 @@ impl Node {
         let resume = cfg.resume;
         let bursts =
             crate::bursts::BurstStore::open(&cfg.state_dir, cfg.burst_policy).map_err(io)?;
-        bursts.expire();
+        if cfg.burst_policy.expire_at_open {
+            bursts.expire();
+        }
         let modes = modes
             .unwrap_or_else(|| Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref())));
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));

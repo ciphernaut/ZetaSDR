@@ -3216,6 +3216,7 @@ fn bursts_keep_flags_reach_the_store() {
             BurstPolicy {
                 keep_bytes: u64::MAX,
                 keep_days: 7,
+                expire_at_open: true,
             },
         )
         .unwrap();
@@ -3256,7 +3257,27 @@ fn bursts_keep_flags_reach_the_store() {
             .clone();
         json(&out)["value"].as_array().unwrap().len()
     };
+    // A one-shot with no policy flags never expires at open, even captures its default
+    // 7 days would drop (the index's write times made ancient here).
+    let index = dir.path().join("state/bursts/index.json");
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    for r in v.as_array_mut().unwrap() {
+        r["written_ns"] = 1.into();
+        r["start_ns"] = 1.into();
+    }
+    std::fs::write(&index, serde_json::to_vec(&v).unwrap()).unwrap();
     assert_eq!(list(&["capture", "list"]), 3);
+    // Under a running serve (this test's pid holds the lock) a one-shot's own policy
+    // never expires either: serve's policy is the one in force.
+    let lock = dir.path().join("state/serve.lock");
+    std::fs::write(&lock, std::process::id().to_string()).unwrap();
+    assert_eq!(list(&["--bursts-keep-days", "1", "capture", "list"]), 3);
+    std::fs::remove_file(&lock).unwrap();
+    // With no serve, an explicit policy is applied at open.
+    for r in v.as_array_mut().unwrap() {
+        r["written_ns"] = 2_000_000_000_000_000_000u64.into();
+    }
+    std::fs::write(&index, serde_json::to_vec(&v).unwrap()).unwrap();
     assert_eq!(list(&["--bursts-keep-mb", "1", "capture", "list"]), 1);
     for (flag, name) in [
         ("--bursts-keep-mb", "bursts-keep-mb"),

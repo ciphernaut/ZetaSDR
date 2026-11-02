@@ -29,6 +29,11 @@ const NS_PER_DAY: u64 = 86_400 * 1_000_000_000;
 pub struct BurstPolicy {
     pub keep_bytes: u64,
     pub keep_days: u32,
+    /// Whether the node expires the store when it opens (true by default). The CLI
+    /// turns it off for a one-shot that does not own the state directory or was given
+    /// no policy of its own, so it never deletes what `zeta serve`'s policy keeps; the
+    /// expiry after each write applies either way.
+    pub expire_at_open: bool,
 }
 
 impl Default for BurstPolicy {
@@ -36,6 +41,7 @@ impl Default for BurstPolicy {
         Self {
             keep_bytes: BURSTS_KEEP_BYTES_DEFAULT,
             keep_days: BURSTS_KEEP_DAYS_DEFAULT,
+            expire_at_open: true,
         }
     }
 }
@@ -478,6 +484,7 @@ mod tests {
             BurstPolicy {
                 keep_bytes,
                 keep_days: 7,
+                expire_at_open: true,
             },
         )
         .unwrap()

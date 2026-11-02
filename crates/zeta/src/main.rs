@@ -56,7 +56,7 @@ async fn main() -> ExitCode {
         Err(cli) => cli,
     };
     let (sources, plugins) = (cli.sources(), cli.plugins.clone());
-    let burst_policy = cli.burst_policy();
+    let mut burst_policy = cli.burst_policy();
     let state_dir = match cli.state_dir.map_or_else(node_setup::default_state_dir, Ok) {
         Ok(d) => d,
         Err(e) => return fail(&e),
@@ -101,6 +101,13 @@ async fn main() -> ExitCode {
     let op = match cli.command.into_op() {
         Ok(op) => op,
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
+    };
+    // Only the state dir's owner expires the burst store at open: `serve`, or a one-shot
+    // given a policy of its own while no serve runs (a read-only one-shot under serve
+    // never expires what serve's policy keeps).
+    burst_policy.expire_at_open = match op {
+        None => true,
+        Some(_) => burst_policy.expire_at_open && serve_lock::owner(&state_dir).is_none(),
     };
     // `serve` holds the state dir until it exits; the guard removes the lock.
     let _lock = match op {

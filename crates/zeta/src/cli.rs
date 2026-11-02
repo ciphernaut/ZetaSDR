@@ -132,7 +132,10 @@ pub struct Cli {
 
 impl Cli {
     /// The burst store's policy: the defaults, with `--bursts-keep-mb` and
-    /// `--bursts-keep-days` where given.
+    /// `--bursts-keep-days` where given. The store is expired at open only when one of
+    /// them was given (the caller also turns that on for `serve` and off for a one-shot
+    /// under a running serve), so a plain one-shot never applies the default policy to
+    /// captures `zeta serve` keeps under its own.
     pub fn burst_policy(&self) -> zeta_core::bursts::BurstPolicy {
         let d = zeta_core::bursts::BurstPolicy::default();
         zeta_core::bursts::BurstPolicy {
@@ -140,6 +143,7 @@ impl Cli {
                 .bursts_keep_mb
                 .map_or(d.keep_bytes, |mb| mb.saturating_mul(1 << 20)),
             keep_days: self.bursts_keep_days.unwrap_or(d.keep_days),
+            expire_at_open: self.bursts_keep_mb.is_some() || self.bursts_keep_days.is_some(),
         }
     }
 
