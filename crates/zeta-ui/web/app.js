@@ -126,6 +126,7 @@ import { mountCoarse } from "./coarse.js";
 import { mountMap } from "./map.js";
 import { mountSubjects, mountSubjectsPane } from "./subjects.js";
 import { mountPanes } from "./panes.js";
+import { mountExplorePane } from "./explore.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -140,6 +141,7 @@ export const state = {
   subjects: null,
   subjectsPane: null,
   panes: null,
+  explore: null,
   ov: null,
   map: null, // map.js: the positions of decoded events
   menu: null,
@@ -782,6 +784,9 @@ function start(api) {
     // A last draw going out, so a hidden pane holds no ended job's section.
     onHide: () => state.subjectsPane?.render(),
   });
+  state.explore = mountExplorePane($("#explore"), api, state.view, state.transcript, {
+    panes: state.panes,
+  });
   state.subjects.onLearn(applyPanes);
   applyMapPane();
   state.view.onChange((key) => {
@@ -976,6 +981,7 @@ function logout(api) {
   if (state.menu) state.menu.destroy();
   if (state.ov) state.ov.destroy();
   if (state.map) state.map.destroy();
+  if (state.explore) state.explore.destroy();
   if (state.panes) state.panes.destroy();
   if (state.subjectsPane) state.subjectsPane.destroy();
   if (state.subjects) state.subjects.destroy();
@@ -986,6 +992,7 @@ function logout(api) {
   state.ov = null;
   state.map = null;
   state.panes = null;
+  state.explore = null;
   state.subjectsPane = null;
   state.subjects = null;
   state.coarse = null;

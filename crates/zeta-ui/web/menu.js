@@ -249,6 +249,7 @@ function denoiseNode(job) {
 
 const ENTRIES = [
   ["classify", "What is this?"],
+  ["capture", "Capture bursts"],
   ["identify", "Identify (thorough)"],
   ["watch", "Watch this band"],
   ["aprs_decode", "Decode › APRS"],
@@ -274,6 +275,7 @@ const ENTRIES = [
 ];
 // The job each decode entry starts: kind, deviation_hz and sideband.
 const JOBS = {
+  capture: { kind: "capture", deviation: null, sideband: null },
   identify: { kind: "identify", deviation: null, sideband: null },
   watch: { kind: "watch", deviation: null, sideband: null },
   aprs_decode: { kind: "aprs_decode", deviation: null, sideband: null },
@@ -724,7 +726,8 @@ class Menu {
     const s = this.current();
     this.showFooter(s, action);
     const job = jobOf(action);
-    if (job && FIT_KINDS.has(job.kind)) {
+    // "Capture bursts" is fitted first like a demodulator, but a running capture has no retune.
+    if (job && (FIT_KINDS.has(job.kind) || job.kind === "capture")) {
       await this.fitAndStart(action, s, job);
       return;
     }

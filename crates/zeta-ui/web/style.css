@@ -507,3 +507,11 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 #graph .graph-status { color: var(--ok); }
 #graph .graph-error { color: var(--error); overflow-wrap: anywhere; }
 #graph .graph-error:empty { display: none; }
+
+/* The Explore pane (explore.js). */
+#explore { height: 100%; overflow: auto; background: var(--bg); }
+#explore[hidden] { display: none; }
+#explore table { min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+#explore td { max-width: 18em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 8px 1px 4px; }
+#explore td button { margin-right: 4px; font-size: 11px; }
+#explore td.actions { max-width: none; overflow: visible; }

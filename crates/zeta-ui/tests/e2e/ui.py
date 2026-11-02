@@ -4924,8 +4924,8 @@ def scenario_panes_show_one_at_a_time(page, url, secret):
     expect(tab).to_be_hidden()
     expect(pane).to_be_hidden()
     expect(page.locator("#subjects-toggle")).to_have_count(0)
-    run_cmd(page, "view set pane explore")
-    expect(view_line(page, '"explore"', error=True)).to_contain_text("none, subjects")
+    run_cmd(page, "view set pane bits:x")
+    expect(view_line(page, '"bits:x"', error=True)).to_contain_text("none, subjects, explore")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
         # Eligible: the tab shows, nothing is selected.
@@ -4978,7 +4978,7 @@ def scenario_panes_show_one_at_a_time(page, url, secret):
         mp = page.locator("#map").bounding_box()
         box = pane.bounding_box()
         assert mp["y"] + mp["height"] <= box["y"] + 1, f"{mp} {box}"
-        assert page.locator("#panes .pane-tab").count() == 1
+        assert page.locator("#panes .pane-tab:visible").count() == 1
         run_cmd(page, "view set map off")
         # The selection is the view's, kept over a reload.
         page.reload()
@@ -4992,6 +4992,52 @@ def scenario_panes_show_one_at_a_time(page, url, secret):
     pane_tab(page).click()
     expect(pane_tab(page)).to_be_hidden()
     assert not errors, f"console errors: {errors}"
+
+
+def capture_ops(url, secret, op, **kw):
+    return http_json(url, secret, "/op", {"op": op, **kw}).get("value")
+
+
+def clear_captures(url, secret):
+    for c in capture_ops(url, secret, "capture_list", signal=None):
+        capture_ops(url, secret, "capture_delete", capture=c["id"])
+
+
+def two_windows(url, secret, job):
+    """graph_put the capture job's burst_capture node to two whole windows (the tone has
+    no bursts, so the defaults would wait out their timeout)."""
+    g = capture_ops(url, secret, "graph_get", job=job)
+    for n in g["nodes"]:
+        if n["kind"] == "burst_capture":
+            n["params"].update({"bursts": 2, "whole": True})
+    http_json(url, secret, "/op", {"op": "graph_put", "job": job, "graph": g})
+
+
+def scenario_capture_bursts_from_the_box_menu_and_explore_lists_it(page, url, secret):
+    clear_captures(url, secret)
+    menu = open_menu_on_tone(page, url, secret)
+    page.click('#ctx .ctx-item[data-action="capture"]')
+    expect(page.locator("#transcript .line.note", has_text="fitted capture to").first).to_be_visible(timeout=20000)
+    job = next(j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+               if j["kind"] == "capture")["id"]
+    two_windows(url, secret, job)
+    expect(page.locator('#panes .pane-tab[data-pane="explore"]')).to_be_visible(timeout=30000)
+    expect(page.locator("#explore tr.capture")).to_have_count(2, timeout=30000)
+
+
+def scenario_explore_what_is_this_and_delete(page, url, secret):
+    assert len(capture_ops(url, secret, "capture_list", signal=None)) == 2
+    login(page, url, secret)
+    # The first capture seen on this page load selects the pane by itself.
+    expect(page.locator("#explore tr.capture")).to_have_count(2, timeout=20000)
+    row = '#explore tr.capture >> nth=0 >> '
+    page.click(row + 'button[data-action="classify"]')
+    expect(page.locator("#transcript .line.note", has_text=": L1 ").first).to_be_visible(timeout=20000)
+    page.click(row + 'button[data-action="delete"]')
+    expect(page.locator(row + 'button[data-action="delete"]')).to_have_text("sure?")
+    page.click(row + 'button[data-action="delete"]')
+    expect(page.locator("#explore tr.capture")).to_have_count(1)
+    clear_captures(url, secret)
 
 
 def scenarios():
