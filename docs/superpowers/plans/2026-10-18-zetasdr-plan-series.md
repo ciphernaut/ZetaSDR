@@ -173,7 +173,7 @@ USRP B210 on the field host (`sdr` node, gain 65 dB, `ppm=2.7`), UHF CB pinned a
 
 ## Plan 23 status
 
-Plan 23 is built on `worktree-subjects` (tasks 1-6 and a track-thinning change, 6ab145e..d3d19f1), 2026-11-02; not merged, not deployed. Spec `docs/superpowers/specs/2026-11-02-subjects-design.md`, plan `docs/superpowers/plans/2026-11-02-subjects.md`.
+Plan 23 is built on `worktree-subjects` (tasks 1-6, a track-thinning change, a final fix wave and three fixes found by its reviews, 6ab145e..3894778), 2026-11-02; not merged, not deployed. Final gate: 1353 passed, 0 failed, the ui e2e at about 400 s of its 440 s deadline. Spec `docs/superpowers/specs/2026-11-02-subjects-design.md`, plan `docs/superpowers/plans/2026-11-02-subjects.md`.
 
 What was built:
 
@@ -188,6 +188,8 @@ What was built:
 Rulings: `m_s` displays as m/s, never km/h (the plan text said km/h); the spec's section 4.5 and goals were amended for the tracks (dated note in the spec).
 
 Acceptance (the operator's, the field host): open; `UAT.md` "Plan 23" is the checklist. Nothing was deployed.
+
+Found by the whole-branch review and fixed on the branch (bfea35c, 935b8f1): a plain `identify`'s trials no longer flap the Subjects pane; a message costs no layout work (ribbons and the map coalesce to 2 Hz, the pane shows and hides on polls only); the default sort buckets last-seen into 10 s steps and holds still under the pointer, with selection on pointerdown; the table has padding and scrolls sideways with its key held. Two bugs outside the plan, both present in the deployed fd126b0: a worker crash shorter than a job's 200 ms fault poll left the job `Running` with no samples (7e5bfc8, 8cb5b1a: a healed fault stays reported until recovery has seen the jobs end, bounded at 10 s and logged); and the mix page read its `active` seed before its socket opened, so a change in between left a talking channel dark (3894778).
 
 ## Plan 22 status
 
