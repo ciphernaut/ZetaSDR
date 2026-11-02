@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
 use zeta_core::modes::{Family, ModeState};
 use zeta_core::ops::{JobKind, Op, OpError, Sideband};
+use zeta_core::station::{Antenna, AntennaKind, Station};
 use zeta_core::types::{Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
 
 use crate::sources::{self, PluginSpec, SourceSpec};
@@ -204,6 +205,9 @@ pub enum Command {
     /// Listen to many channels as one audio stream
     #[command(subcommand)]
     Mix(MixCmd),
+    /// The node's station: position, region and antennas
+    #[command(subcommand)]
+    Station(StationCmd),
     /// Many jobs at once
     #[command(subcommand)]
     Jobs(JobsCmd),
@@ -278,6 +282,90 @@ pub enum MixCmd {
         #[arg(long, value_name = "ID[,ID]", value_delimiter = ',')]
         sources: Option<Vec<String>>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StationCmd {
+    /// Set the station (persisted); the defaults (a dipole and a discone) always stay, each
+    /// --antenna adds one
+    Set {
+        /// Latitude, degrees (-90..=90)
+        #[arg(long, allow_negative_numbers = true)]
+        lat: f64,
+        /// Longitude, degrees (-180..=180)
+        #[arg(long, allow_negative_numbers = true)]
+        lon: f64,
+        /// Altitude, metres
+        #[arg(long, value_name = "M", allow_negative_numbers = true)]
+        alt_m: f64,
+        /// Region code
+        #[arg(long, default_value = "AU")]
+        region: String,
+        /// An antenna: KIND=MIN_HZ-MAX_HZ[,height_m=N,azimuth_deg=N,elevation_deg=N]
+        /// (kind: discone, dipole, skyloop, vertical, yagi, dish or other); repeatable
+        #[arg(long, value_name = "SPEC", value_parser = parse_antenna)]
+        antenna: Vec<Antenna>,
+    },
+    /// Print the station (null when none)
+    Get,
+    /// Forget the station
+    Clear,
+}
+
+/// `KIND=MIN_HZ-MAX_HZ[,height_m=N,azimuth_deg=N,elevation_deg=N]`; the id is the kind
+/// (made unique by `number_antennas`), `height_m` defaults to 5.
+fn parse_antenna(s: &str) -> Result<Antenna, String> {
+    let mut parts = s.split(',');
+    let head = parts.next().unwrap_or("");
+    let (kind, band) = head
+        .split_once('=')
+        .ok_or("expected KIND=MIN_HZ-MAX_HZ[,height_m=N,...]")?;
+    let kind: AntennaKind = serde_json::from_value(serde_json::Value::from(kind))
+        .map_err(|_| format!("unknown antenna kind {kind}"))?;
+    let (lo, hi) = band.split_once('-').ok_or("expected MIN_HZ-MAX_HZ")?;
+    let hz = |v: &str| v.parse::<u64>().map_err(|e| format!("{v}: {e}"));
+    let mut a = Antenna {
+        id: kind_word(kind),
+        kind,
+        min_hz: Hz(hz(lo)?),
+        max_hz: Hz(hz(hi)?),
+        height_m: 5.0,
+        azimuth_deg: None,
+        elevation_deg: None,
+    };
+    for kv in parts {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or(format!("{kv}: expected key=value"))?;
+        let n: f64 = v.parse().map_err(|e| format!("{kv}: {e}"))?;
+        match k {
+            "height_m" => a.height_m = n,
+            "azimuth_deg" => a.azimuth_deg = Some(n),
+            "elevation_deg" => a.elevation_deg = Some(n),
+            _ => return Err(format!("unknown antenna key {k}")),
+        }
+    }
+    Ok(a)
+}
+
+fn kind_word(k: AntennaKind) -> String {
+    serde_json::to_value(k)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Antenna ids from the kinds: the first of a kind keeps it, later ones get `-2`, `-3`.
+fn number_antennas(mut v: Vec<Antenna>) -> Vec<Antenna> {
+    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    for a in &mut v {
+        let n = seen.entry(a.id.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            a.id = format!("{}-{}", a.id, n);
+        }
+    }
+    v
 }
 
 #[derive(Debug, Subcommand)]
@@ -853,6 +941,7 @@ impl Command {
             ) | Command::Graph(GraphCmd::Put { .. })
                 | Command::Plan(PlanCmd::Start { .. })
                 | Command::Mix(MixCmd::Start { .. })
+                | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
                 | Command::Jobs(JobsCmd::Stop { .. })
         )
     }
@@ -1023,6 +1112,25 @@ impl Command {
             Command::Mix(MixCmd::Start { sources }) => Op::MixStart {
                 sources: sources.map(|s| s.into_iter().map(SourceId).collect()),
             },
+            Command::Station(StationCmd::Set {
+                lat,
+                lon,
+                alt_m,
+                region,
+                antenna,
+            }) => Op::StationSet {
+                lat,
+                lon,
+                alt_m,
+                region,
+                antennas: (!antenna.is_empty()).then(|| {
+                    let mut all = Station::default_antennas(alt_m);
+                    all.extend(antenna);
+                    number_antennas(all)
+                }),
+            },
+            Command::Station(StationCmd::Get) => Op::StationGet,
+            Command::Station(StationCmd::Clear) => Op::StationClear,
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Classify(s) => Op::Classify {

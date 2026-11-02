@@ -208,6 +208,7 @@ impl Inner {
             bank,
             mode,
             dc_hz,
+            station: self.station.lock().unwrap().clone(),
             ..StageContext::new(rec.source.clone())
         }
         .with_note(Arc::new(move |v| {

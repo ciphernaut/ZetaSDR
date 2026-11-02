@@ -248,6 +248,8 @@ fn mixable(rec: &JobRecord) -> bool {
 
 struct Inner {
     state_dir: PathBuf,
+    /// The node's station, loaded at `open` and written through on every change.
+    station: Mutex<Option<crate::station::Station>>,
     jobs_dir: PathBuf,
     /// `state_dir/sources`, one [`SourceRecord`] per source.
     sources_dir: PathBuf,
@@ -771,6 +773,8 @@ impl Node {
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (records, mut load_errors) = load(&jobs_dir)?;
         let job_load_errors = load_errors.len();
+        let (station, station_error) = crate::station::load(&cfg.state_dir);
+        load_errors.extend(station_error);
         let sources_dir = cfg.state_dir.join("sources");
         let (source_records, source_errors) = load_sources(&sources_dir);
         load_errors.extend(source_errors);
@@ -791,6 +795,7 @@ impl Node {
         let mut node = Node {
             inner: Arc::new(Inner {
                 state_dir: cfg.state_dir.clone(),
+                station: Mutex::new(station),
                 jobs_dir,
                 sources_dir,
                 sources: Mutex::new(source_records),
@@ -1693,6 +1698,29 @@ impl Node {
     /// persisted in `sources/<id>.json`; a write that fails releases it and is
     /// `Io`. A tune relaunches the elastic jobs there once the gate is let go.
     /// The result is the capture, as `source_ensure`'s.
+    /// The node's station, when one is set.
+    pub fn station(&self) -> Option<crate::station::Station> {
+        self.inner.station.lock().unwrap().clone()
+    }
+
+    /// Store `s` as the station: written to `station.json` first, then kept in memory;
+    /// a failed write leaves the old one. Jobs started afterwards see it.
+    pub async fn set_station(
+        &self,
+        s: crate::station::Station,
+    ) -> Result<crate::station::Station, NodeError> {
+        crate::station::persist(&self.inner.state_dir, &s)?;
+        *self.inner.station.lock().unwrap() = Some(s.clone());
+        Ok(s)
+    }
+
+    /// Forget the station and remove `station.json`.
+    pub async fn clear_station(&self) -> Result<(), NodeError> {
+        crate::station::remove(&self.inner.state_dir)?;
+        *self.inner.station.lock().unwrap() = None;
+        Ok(())
+    }
+
     pub async fn source_pin(
         &self,
         source: &SourceId,

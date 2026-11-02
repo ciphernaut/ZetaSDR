@@ -21,7 +21,7 @@ fn rendering_lists_every_op_variant() {
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let variants = v["value"]["op"]["oneOf"].as_array().unwrap();
-    assert_eq!(variants.len(), 26);
+    assert_eq!(variants.len(), 29);
     let md = zeta()
         .arg("agents-md")
         .assert()
@@ -162,4 +162,19 @@ fn the_guide_has_the_plan_rule_and_the_own_jobs_rule() {
     assert!(md.contains("Plan ids come from `channel_plans`: read it before naming a plan. A band with no plan takes one `job_start` per measured station; never invent a plan."));
     assert!(md.contains("started it in this run"));
     assert!(md.contains("never `job_stop`"));
+}
+
+#[test]
+fn station_set_is_in_the_guide() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    for needle in ["CLI: `zeta station set --lat", "\"op\":\"station_set\""] {
+        assert!(md.contains(needle), "missing {needle}");
+    }
 }

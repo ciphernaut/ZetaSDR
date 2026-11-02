@@ -90,6 +90,8 @@ pub struct StageContext {
     /// The node's list of audio outputs, `Some` for every job in a node (only a `mix`
     /// stage reads it).
     pub mix_inputs: Option<MixInputs>,
+    /// The node's station (position, region, antennas), when one is set.
+    pub station: Option<crate::station::Station>,
 }
 
 impl StageContext {
@@ -102,7 +104,13 @@ impl StageContext {
             mode: None,
             dc_hz: None,
             mix_inputs: None,
+            station: None,
         }
+    }
+
+    /// This context with the node's `station`.
+    pub fn with_station(self, station: Option<crate::station::Station>) -> Self {
+        Self { station, ..self }
     }
 
     /// This context with the receiver's DC at `hz` (`None` for none).

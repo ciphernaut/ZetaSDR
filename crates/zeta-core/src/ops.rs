@@ -22,6 +22,7 @@ use crate::modes::{
 use crate::node::{AfterGate, Node, NodeError};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
 use crate::ring::RingError;
+use crate::station::Station;
 use crate::stream::{Frame, Payload, StreamInfo};
 use crate::types::{
     Capabilities, ChannelId, Hz, JobId, Selection, SourceId, StreamId, StreamKind, Timestamp,
@@ -195,6 +196,31 @@ pub enum Op {
         #[schemars(required, schema_with = "crate::types::nullable::<Vec<SourceId>>")]
         sources: Option<Vec<SourceId>>,
     },
+    /// Set the node's station: its position, region and antennas, persisted in
+    /// `station.json`. A node-level record, set once; the ACMA provider's distance and
+    /// reach, `sink_sondehub`'s defaults and the page's home read it. `antennas` is
+    /// `null` for the defaults (a 0-30 MHz dipole and a 30 MHz-6 GHz discone, both 5 m
+    /// up). Validated before anything is written: `lat` -90..=90, `lon` -180..=180,
+    /// each antenna `min_hz` < `max_hz`, `azimuth_deg` 0..360, `elevation_deg` 0..=90,
+    /// ids unique. The result is the station as stored.
+    StationSet {
+        lat: f64,
+        lon: f64,
+        alt_m: f64,
+        /// A free-text region code such as `AU`.
+        region: String,
+        /// The antennas; `null` for the defaults.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(
+            required,
+            schema_with = "crate::types::nullable::<Vec<crate::station::Antenna>>"
+        )]
+        antennas: Option<Vec<crate::station::Antenna>>,
+    },
+    /// The station, or `null` when none is set.
+    StationGet,
+    /// Forget the station (`station.json` is removed).
+    StationClear,
     /// Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on
     /// the channels numbered in `channels`, each at its channel's `center_hz` with the
     /// plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's
@@ -1906,6 +1932,8 @@ pub enum OpResult {
         failed: Vec<JobStopFailed>,
     },
     Ok,
+    /// `station_set`, `station_get` and `station_clear`: the station, `null` for none.
+    Station(Option<crate::station::Station>),
     Schema(serde_json::Value),
 }
 
@@ -1923,6 +1951,9 @@ impl Op {
             Op::JobAttach { .. } => "job_attach",
             Op::JobRetune { .. } => "job_retune",
             Op::MixStart { .. } => "mix_start",
+            Op::StationSet { .. } => "station_set",
+            Op::StationGet => "station_get",
+            Op::StationClear => "station_clear",
             Op::PlanStart { .. } => "plan_start",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
@@ -1959,6 +1990,7 @@ impl Op {
                 | Op::ChannelPlans {}
                 | Op::ModesList { .. }
                 | Op::ModesShow { .. }
+                | Op::StationGet
         )
     }
 
@@ -2013,6 +2045,7 @@ impl OpResult {
             OpResult::JobsStopped { .. } => "jobs_stopped",
             OpResult::Ok => "ok",
             OpResult::Schema(_) => "schema",
+            OpResult::Station(_) => "station",
         }
     }
 
@@ -2836,6 +2869,33 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             )
             .await
         }
+        Op::StationSet {
+            lat,
+            lon,
+            alt_m,
+            region,
+            antennas,
+        } => {
+            let antennas = antennas.unwrap_or_else(|| Station::default_antennas(alt_m));
+            let station = Station {
+                lat,
+                lon,
+                alt_m,
+                region,
+                antennas,
+            };
+            station.validate().map_err(other)?;
+            node.set_station(station)
+                .await
+                .map(|s| OpResult::Station(Some(s)))
+                .map_err(|e| node_error(node, e))
+        }
+        Op::StationGet => Ok(OpResult::Station(node.station())),
+        Op::StationClear => node
+            .clear_station()
+            .await
+            .map(|()| OpResult::Station(None))
+            .map_err(|e| node_error(node, e)),
         Op::MixStart { sources } => node
             .mix_start(sources)
             .await

@@ -3083,3 +3083,53 @@ fn a_source_flag_named_node_is_refused() {
             "source id \"node\" is reserved for the node's own streams",
         ));
 }
+
+/// `station set` persists across one-shot processes; `station get` reads it back with the
+/// two default antennas plus the declared one, and `station clear` forgets it.
+#[test]
+fn station_set_get_clear_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = zeta_bin();
+        cmd.arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .arg("--json")
+            .args(args);
+        cmd
+    };
+    run(&[
+        "station",
+        "set",
+        "--lat",
+        "-27.38",
+        "--lon",
+        "153.12",
+        "--alt-m",
+        "40",
+        "--antenna",
+        "yagi=430000000-440000000,azimuth_deg=90",
+    ])
+    .assert()
+    .success();
+    let out = run(&["station", "get"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "station", "{v}");
+    assert_eq!(v["value"]["region"], "AU", "{v}");
+    assert_eq!(v["value"]["antennas"].as_array().unwrap().len(), 3, "{v}");
+    assert_eq!(v["value"]["antennas"][2]["azimuth_deg"], 90.0, "{v}");
+    let out = run(&["station", "clear"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        json(&out),
+        serde_json::json!({"result": "station", "value": null})
+    );
+}

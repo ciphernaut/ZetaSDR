@@ -45,7 +45,7 @@ There are two ways to run:
 - `zeta serve --listen PORT --llm-url URL --llm-model NAME` (the other `--llm-*` flags of `zeta ask` apply too) enables `POST /ask` with `{"request": "TEXT", "max_turns": 8, "allow": {"stop_jobs": false, "replace": false}}` (`max_turns` 1-32, default 8; `allow` optional, both false by default: without them the agent's `job_stop` and non-empty `replace` calls are refused as `not_allowed`): the node runs the agent against itself, so every operation it applies appears on the `ops` stream, and answers the transcript (`request`, `answer`, `calls`, `turns`) as `zeta ask` prints it, plus `allow` as the run had it and `turn_log`, one entry per model completion with its reasoning, content and call count. One run at a time (409 while one is in progress); 503 when serve has no `--llm-url`; a failed run is 502 with the error and the transcript so far; 504 after 300 s.
 - `zeta serve --listen PORT --stt-socket PATH` (env `ZETA_STT_SOCKET`; default `$XDG_RUNTIME_DIR/voiced.sock` when that file exists) enables `POST /stt?lang=CODE` (`lang` defaults to `en`): the body is a 16 kHz mono `audio/wav` (at most 4 MiB), the node hands it to the speech daemon at that Unix socket and answers `{"text": "TRANSCRIPT"}`. The daemon is `local-voice` or any daemon speaking its protocol: one line per connection, `file:<absolute wav path>` answered `ok:<text>` or `error:<message>`, and `languages` answered `ok:en,de,...` (a daemon answering `error:` there is taken to know English only). Instead of a daemon, `--stt-node URL` (env `ZETA_STT_NODE`, secret in `ZETA_STT_NODE_SECRET`, never printed) forwards each request to that node's `POST /stt`; the two flags are exclusive, for every command (exit 1). A forwarded request carries `X-Zeta-Stt-Hop: 1`, and a node that would forward it again answers 508 (`stt forwarding loop`). `GET /stt/languages` answers `{"backend": NAME, "languages": [CODES]}` (503 without a backend). 415 when the body is not WAV, 413 when too large, 422 `{"error": "unsupported", "language", "supported"}` for a language the backend lacks, 502 when the daemon reports an error, 503 when serve has no backend or cannot reach it, 503 `{"error": "busy", "message", "wait_ms"}` when every one of the daemon's 4 slots stayed taken for 30 s (a node forwarding with `--stt-node` reports that as a `busy` drop, not an error), 504 when the daemon does not answer within 30 s of its turn.
 
-While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `jobs stop`, `plan start`, `mix start`, `graph put`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
+While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `jobs stop`, `plan start`, `mix start`, `graph put`, `station set`, `station clear`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
 
 Every operation the node applies is appended to `ops.log` in the state directory (rotated at 8 MiB) with its caller's transport (read-only operations are logged without their result); `zeta ops tail --lines N` prints the last N (local only). Every `transcript` event of a `transcribe` job is appended to `transcripts.log` in the state directory (rotated at 8 MiB) with the job, its input, the source and the channel's centre; `zeta transcripts tail --lines N [--job ID]` prints the last N (local only).
 
@@ -184,6 +184,38 @@ JSON: `{"op":"mix_start","sources":null}`
 CLI: `zeta mix start`
 
 Starts one `mix` job that plays the audio of every job on `sources` (`null`: every source) as one stream, so whatever is talking is heard. It holds no lease, tunes nothing and blocks no job; jobs started or stopped later join and leave by themselves. Its `event` stream publishes `active` (who is talking: `job`, `source`, `center_hz`) when it changes, with a hangover after a channel falls silent. It is idempotent on the same set of sources: a mix of that set already running answers its id (`null` matches only `null`). To mute a channel, `graph get` the mix, edit `muted` on the `mix` node (a list of `{source, center_hz}`), `graph put`, which restarts it under its id.
+
+### station_set
+
+Set the node's station: its position, region and antennas, persisted in `station.json`. A node-level record, set once; the ACMA provider's distance and reach, `sink_sondehub`'s defaults and the page's home read it. `antennas` is `null` for the defaults (a 0-30 MHz dipole and a 30 MHz-6 GHz discone, both 5 m up). Validated before anything is written: `lat` -90..=90, `lon` -180..=180, each antenna `min_hz` < `max_hz`, `azimuth_deg` 0..360, `elevation_deg` 0..=90, ids unique. The result is the station as stored.
+
+- lat: number
+- lon: number
+- alt_m: number
+- region: string; free-text region code such as `AU`
+- antennas: array or null
+
+JSON: `{"op":"station_set","lat":null,"lon":null,"alt_m":null,"region":"AU","antennas":null}`
+
+CLI: `zeta station set --lat -27.38 --lon 153.12 --alt-m 4 [--region AU] [--antenna KIND=MIN_HZ-MAX_HZ[,height_m=N,azimuth_deg=N,elevation_deg=N]]...`
+
+A node-level record, set once: the position, region and antennas the node listens from. The ACMA provider's distance and reach, `sink_sondehub`'s defaults and the page's home read it. `antennas: null` takes the defaults (a 0-30 MHz dipole and a 30 MHz-6 GHz discone, both 5 m up); an antenna is `{id, kind, min_hz, max_hz, height_m, azimuth_deg, elevation_deg}` with `kind` one of `discone`, `dipole`, `skyloop`, `vertical`, `yagi`, `dish`, `other` and the two angles `null` for an omnidirectional one. A bad value is refused naming the field (`lat`, `antennas[<i>].<field>`), with nothing written. On the CLI, `--region` defaults to `AU` and each `--antenna KIND=MIN_HZ-MAX_HZ[,height_m=N,azimuth_deg=N,elevation_deg=N]` adds one to the defaults (its id is the kind, numbered when taken); a declared antenna wins over a default on its own band. `station_get` answers the station or `null`; `station_clear` forgets it.
+
+### station_get
+
+The station, or `null` when none is set.
+
+JSON: `{"op":"station_get"}`
+
+CLI: `zeta station get`
+
+### station_clear
+
+Forget the station (`station.json` is removed).
+
+JSON: `{"op":"station_clear"}`
+
+CLI: `zeta station clear`
 
 ### plan_start
 
