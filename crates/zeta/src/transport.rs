@@ -60,6 +60,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             cli.ring_budget_mb,
             cli.modes_dir,
             speech,
+            cli.knowledge_acma,
         )
         .await);
     }
@@ -87,7 +88,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
     if cli.configures_local_node() {
         return usage(
-            "sources, plugins and modes are configured on the serving node: drop --source-*, --plugin, --state-dir and --modes-dir with --node",
+            "sources, plugins and modes are configured on the serving node: drop --source-*, --plugin, --state-dir, --modes-dir and --knowledge-acma with --node",
         );
     }
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {
@@ -104,6 +105,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
             PathBuf::new(),
             &[],
             &[],
+            None,
             None,
             None,
             None,

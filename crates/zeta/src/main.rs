@@ -130,6 +130,7 @@ async fn main() -> ExitCode {
         Ok(n) => n,
         Err(e) => return fail(&e),
     };
+    node_setup::attach_acma(&node, &state_dir, cli.knowledge_acma.as_ref()).await;
     let (jobs, others) = node.load_errors_by_origin();
     for name in jobs {
         eprintln!("zeta: warning: unreadable job record {name}");

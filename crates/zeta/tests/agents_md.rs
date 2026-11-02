@@ -165,6 +165,27 @@ fn the_guide_has_the_plan_rule_and_the_own_jobs_rule() {
 }
 
 #[test]
+fn knowledge_acma_is_in_the_running_section() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    for needle in [
+        "--knowledge-acma URL[,reach_km=N]",
+        "ZETA_KNOWLEDGE_ACMA",
+        "`acma`",
+        "`station set`",
+    ] {
+        assert!(md.contains(needle), "missing {needle}");
+    }
+    assert!(!md.contains("Neither has allocations"));
+}
+
+#[test]
 fn station_set_is_in_the_guide() {
     let md = zeta()
         .arg("agents-md")

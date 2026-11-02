@@ -542,6 +542,31 @@ async fn open_into(
     Ok(node)
 }
 
+/// Attach the ACMA register service (`--knowledge-acma`) as a knowledge provider. The
+/// service is probed once (the client's 5 s timeout); an unreachable one is logged and
+/// the provider is attached anyway, as it logs its own failures. The provider reads the
+/// station from `state_dir` on every lookup, so a `station set` takes effect at once.
+pub async fn attach_acma(node: &Node, state_dir: &Path, flag: Option<&(String, Option<f64>)>) {
+    let Some((url, reach_km)) = flag else {
+        return;
+    };
+    let client = match zeta_ext::mcp_client::McpClient::new(url, Duration::from_secs(5)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zeta: knowledge acma: {url} unreachable: {e}");
+            return;
+        }
+    };
+    if let Err(e) = client.health().await {
+        eprintln!("zeta: knowledge acma: {url} unreachable: {e}");
+    }
+    let dir = state_dir.to_path_buf();
+    let station: zeta_ext::acma::StationFn = Arc::new(move || zeta_core::station::load(&dir).0);
+    node.add_knowledge(Arc::new(zeta_ext::acma::AcmaKnowledge::new(
+        client, *reach_km, station,
+    )));
+}
+
 #[cfg(test)]
 mod meminfo_tests {
     use super::parse_meminfo;

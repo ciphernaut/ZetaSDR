@@ -375,9 +375,63 @@ pub fn parse_plugin(s: &str) -> Result<PluginSpec, String> {
     })
 }
 
+/// `--knowledge-acma URL[,reach_km=N]`: the register service's `http(s)://` URL and the
+/// optional reach override in kilometres (a positive, finite number). Errors name the flag.
+pub fn parse_knowledge_acma(s: &str) -> Result<(String, Option<f64>), String> {
+    let bad = |why: &str| format!("--knowledge-acma: {why}, expected URL[,reach_km=N]");
+    let (url, opt) = match s.split_once(',') {
+        Some((u, o)) => (u, Some(o)),
+        None => (s, None),
+    };
+    if !(url.starts_with("http://") || url.starts_with("https://")) || url.contains(' ') {
+        return Err(bad(&format!(
+            "the URL must be http:// or https://, got {url:?}"
+        )));
+    }
+    let reach = match opt {
+        None => None,
+        Some(o) => {
+            let v = o
+                .strip_prefix("reach_km=")
+                .ok_or_else(|| bad(&format!("unknown option {o:?}")))?;
+            match v.parse::<f64>() {
+                Ok(n) if n.is_finite() && n > 0.0 => Some(n),
+                _ => {
+                    return Err(bad(&format!(
+                        "reach_km must be a positive number, got {v:?}"
+                    )));
+                }
+            }
+        }
+    };
+    Ok((url.to_owned(), reach))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knowledge_acma_parses_url_and_reach() {
+        assert_eq!(
+            parse_knowledge_acma("http://h:1,reach_km=20"),
+            Ok(("http://h:1".into(), Some(20.0)))
+        );
+        assert_eq!(
+            parse_knowledge_acma("https://h/mcp"),
+            Ok(("https://h/mcp".into(), None))
+        );
+        for bad in [
+            "ftp://x",
+            "h:1",
+            "http://h,reach_km=0",
+            "http://h,radius=3",
+            "http://h,reach_km=-1",
+        ] {
+            let e = parse_knowledge_acma(bad).unwrap_err();
+            assert!(e.contains("--knowledge-acma"), "{e}");
+        }
+    }
 
     fn kiwi(id: &str, host: &str, port: u16, pw: Option<&str>) -> SourceSpec {
         SourceSpec::Kiwi {

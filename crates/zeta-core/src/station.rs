@@ -148,7 +148,7 @@ fn path(state_dir: &Path) -> PathBuf {
 }
 
 /// Read the station; a missing file is `None`, an unreadable one an error string.
-pub(crate) fn load(state_dir: &Path) -> (Option<Station>, Option<String>) {
+pub fn load(state_dir: &Path) -> (Option<Station>, Option<String>) {
     match std::fs::read(path(state_dir)) {
         Ok(b) => match serde_json::from_slice(&b) {
             Ok(s) => (Some(s), None),

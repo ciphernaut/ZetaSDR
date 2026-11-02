@@ -79,6 +79,18 @@ pub struct Cli {
     /// Memory budget in MB for one source's IQ ring (default: a quarter of RAM, at most 4 GiB)
     #[arg(long, global = true, env = "ZETA_RING_BUDGET_MB", value_name = "MB")]
     pub ring_budget_mb: Option<u64>,
+    /// Attach the ACMA register service (MCP over HTTP) as a knowledge provider; `reach_km=N`
+    /// overrides its reach rule
+    #[arg(
+        long = "knowledge-acma",
+        global = true,
+        env = "ZETA_KNOWLEDGE_ACMA",
+        value_name = "URL[,reach_km=N]"
+    )]
+    knowledge_acma_raw: Option<String>,
+    /// `--knowledge-acma` parsed (filled by `try_parse_checked`).
+    #[arg(skip)]
+    pub knowledge_acma: Option<(String, Option<f64>)>,
     /// Machine-readable JSON output (the default when stdout is not a terminal;
     /// no human format exists yet, so output is always JSON)
     #[arg(long, global = true)]
@@ -115,6 +127,12 @@ impl Cli {
         let err = |kind, msg: String| Err(Self::command().error(kind, msg));
         if self.speech.stt_socket.is_some() && self.speech.stt_node.is_some() {
             return err(ErrorKind::ArgumentConflict, SPEECH_EXCLUSIVE.to_string());
+        }
+        if let Some(raw) = self.knowledge_acma_raw.take() {
+            match sources::parse_knowledge_acma(&raw) {
+                Ok(k) => self.knowledge_acma = Some(k),
+                Err(e) => return err(ErrorKind::ValueValidation, e),
+            }
         }
         let mut sources = std::mem::take(&mut self.source_files);
         sources.append(&mut self.source_soapy);
@@ -170,6 +188,7 @@ impl Cli {
             || !self.plugins.is_empty()
             || self.state_dir.is_some()
             || self.modes_dir.is_some()
+            || self.knowledge_acma.is_some()
     }
 }
 

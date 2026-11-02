@@ -1817,6 +1817,27 @@ fn source_node_bad_flag_is_usage_error_naming_the_part() {
 }
 
 #[test]
+fn knowledge_acma_flag_is_refused_with_node() {
+    zeta_bin()
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
+        .args(["--knowledge-acma", "http://127.0.0.1:9", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("configured on the serving node"));
+}
+
+#[test]
+fn knowledge_acma_with_a_bad_url_is_a_usage_error() {
+    for bad in ["ftp://x", "http://h:1,reach_km=0", "http://h:1,reach_km=x"] {
+        zeta_bin()
+            .args(["--knowledge-acma", bad, "source", "list"])
+            .assert()
+            .code(1)
+            .stderr(contains("--knowledge-acma"));
+    }
+}
+
+#[test]
 fn source_node_is_rejected_with_node() {
     zeta_bin()
         .env("ZETA_NODE_SECRET_PI", NODE_SECRET)

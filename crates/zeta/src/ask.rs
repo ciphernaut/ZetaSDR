@@ -27,6 +27,7 @@ pub async fn run(
     ring_budget_mb: Option<u64>,
     modes_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
+    knowledge_acma: Option<(String, Option<f64>)>,
 ) -> ExitCode {
     let request = match read_request(args.request.as_deref()) {
         Ok(r) => r,
@@ -65,6 +66,7 @@ pub async fn run(
                     "zeta serve (pid {pid}) owns this state dir; use --node"
                 ));
             }
+            let acma_dir = state_dir.clone();
             let opened = node_setup::open(
                 state_dir,
                 sources,
@@ -78,6 +80,7 @@ pub async fn run(
                 Ok((n, r)) => (Arc::new(n), r),
                 Err(e) => return fail(&e),
             };
+            node_setup::attach_acma(&node, &acma_dir, knowledge_acma.as_ref()).await;
             let md = agents_md::rendering();
             let schema = node.schema();
             let code = drive(
