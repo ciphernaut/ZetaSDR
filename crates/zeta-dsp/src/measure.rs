@@ -1270,6 +1270,38 @@ mod tests {
     }
 
     #[test]
+    fn two_clicks_over_a_continuous_signal_do_not_gate() {
+        let audio = tone(48_000, 48_000, 1_000.0, 1.0);
+        let mut clean = nbfm_modulate(&audio, 48_000, RATE as u32, 2_500.0, 0.0);
+        awgn(&mut clean, 20.0, 3);
+        // Two 1 ms clicks 10 dB over the signal.
+        let mut iq = clean.clone();
+        let ms = (RATE / 1_000) as usize;
+        for at in [300, 700] {
+            iq[at * ms..(at + 1) * ms]
+                .iter_mut()
+                .for_each(|s| *s *= 10f32.sqrt());
+        }
+        let v = gated_view(&iq, RATE);
+        eprintln!("clicks: {:?}", v.bursts);
+        assert!(!v.gated, "{:?}", v.bursts);
+        let f = measure_band(&iq, RATE, CENTER, 20_000);
+        let plain = measure_band(&clean, RATE, CENTER, 20_000);
+        show("clicks", &f, &layer1_label(&f, &iq, RATE));
+        let tol = 2 * BIN_HZ as u64;
+        assert!(
+            f.bandwidth_hz.0.abs_diff(plain.bandwidth_hz.0) <= tol,
+            "{} vs {}",
+            f.bandwidth_hz.0,
+            plain.bandwidth_hz.0
+        );
+        assert_eq!(
+            layer1_label(&f, &iq, RATE).name,
+            layer1_label(&plain, &clean, RATE).name
+        );
+    }
+
+    #[test]
     fn a_lone_1_ms_outlier_chunk_is_not_gated() {
         for rate in [8_000u64, 48_000] {
             let mut clean = vec![Complex::new(0.0f32, 0.0); rate as usize];

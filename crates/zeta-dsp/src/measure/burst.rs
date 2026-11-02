@@ -30,6 +30,11 @@ const BURST_MIN_BURSTS: usize = 2;
 /// ... or one run at least this many ms long: a lone shorter run is an outlier
 /// chunk of noise, not a burst.
 const BURST_MIN_SINGLE_MS: f32 = 3.0;
+/// The gate also needs the off chunks to be noise: the `FLOOR_PERCENTILE`th-percentile
+/// chunk power at most this many dB over the window's in-band noise floor (the
+/// `FLOOR_PERCENTILE`th-percentile bin of its spectrum, as a per-sample power), so two
+/// clicks over a continuous signal, whose off chunks are the signal, never gate it.
+pub(crate) const BURST_OFF_NEAR_FLOOR_DB: f64 = 6.0;
 /// FFT size of the cyclostationary line search: a line grows with the
 /// transform length and the noise continuum does not.
 const CYCLO_SIZE: usize = 4096;
@@ -45,6 +50,9 @@ pub struct Bursts {
     pub burst_ms: Option<f32>,
     /// Median start-to-start interval of the runs, ms; `None` under two runs.
     pub period_ms: Option<f32>,
+    /// The off level: the `FLOOR_PERCENTILE`th-percentile chunk power (linear, per
+    /// sample) the chunks were compared with; 0 for an empty window.
+    pub off_power: f64,
 }
 
 /// The on-runs of `iq`: the mean power of each `BURST_ENVELOPE_MS` chunk is
@@ -97,7 +105,39 @@ pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
         },
         burst_ms: (!lengths.is_empty()).then(|| median(&lengths)),
         period_ms: (!periods.is_empty()).then(|| median(&periods)),
+        off_power: floor,
         runs,
+    }
+}
+
+/// The in-band noise floor of `iq` as a per-sample power: the window's mean power scaled by
+/// its spectrum's `FLOOR_PERCENTILE`th-percentile bin over its mean bin (the share of the
+/// power a flat floor at that level would hold). `None` for a window shorter than one
+/// `SIZE`-point transform.
+pub(super) fn noise_floor_power(iq: &[Complex<f32>]) -> Option<f64> {
+    let ps = CpuFft::new().power_sum(iq, SIZE, Window::Hann);
+    if ps.chunks == 0 || iq.is_empty() {
+        return None;
+    }
+    let mut bins = ps.sum.clone();
+    let mean_bin = bins.iter().sum::<f64>() / bins.len() as f64;
+    if mean_bin <= 0.0 {
+        return None;
+    }
+    bins.sort_by(f64::total_cmp);
+    let floor_bin = bins[bins.len() * FLOOR_PERCENTILE / 100];
+    let mean = iq.iter().map(|s| s.norm_sqr() as f64).sum::<f64>() / iq.len() as f64;
+    Some(mean * floor_bin / mean_bin)
+}
+
+/// Whether the off chunks of `b` sit near the in-band noise floor of `iq`
+/// (`BURST_OFF_NEAR_FLOOR_DB`); true when the floor cannot be measured.
+fn off_is_noise(iq: &[Complex<f32>], b: &Bursts) -> bool {
+    match noise_floor_power(iq) {
+        Some(floor) if floor > 0.0 && b.off_power > 0.0 => {
+            10.0 * (b.off_power / floor).log10() <= BURST_OFF_NEAR_FLOOR_DB
+        }
+        _ => true,
     }
 }
 
@@ -146,13 +186,15 @@ pub(super) struct View<'a> {
 /// ([`on_time`]) when the duty is under `BURST_DUTY_MAX` and the runs repeat no
 /// faster than `BURST_MIN_PERIOD_MS` (denser runs are keying), and there are
 /// at least `BURST_MIN_BURSTS` runs or one of at least `BURST_MIN_SINGLE_MS`
-/// (a lone shorter run is an outlier chunk); else the whole window.
+/// (a lone shorter run is an outlier chunk), and the off chunks are noise
+/// (within `BURST_OFF_NEAR_FLOOR_DB` of the in-band floor: impulses over a
+/// continuous signal are not bursts); else the whole window.
 pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64) -> View<'_> {
     let bursts = burst_runs(iq, rate_hz);
     let sparse = bursts.period_ms.is_none_or(|p| p >= BURST_MIN_PERIOD_MS);
     let enough = bursts.runs.len() >= BURST_MIN_BURSTS
         || (bursts.runs.len() == 1 && bursts.burst_ms.is_some_and(|ms| ms >= BURST_MIN_SINGLE_MS));
-    if bursts.duty < BURST_DUTY_MAX && sparse && enough {
+    if bursts.duty < BURST_DUTY_MAX && sparse && enough && off_is_noise(iq, &bursts) {
         let runs: Vec<&[Complex<f32>]> = bursts.runs.iter().map(|&(s, e)| &iq[s..e]).collect();
         let raw: Vec<Complex<f32>> = runs.iter().flat_map(|r| r.iter()).copied().collect();
         View {
