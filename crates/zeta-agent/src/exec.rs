@@ -109,6 +109,11 @@ pub fn trim_result(op: &str, result: &mut Value) {
     }
 }
 
+/// An operation error as JSON; one that cannot be serialised becomes `other`.
+pub(crate) fn to_json(e: &(impl Serialize + std::fmt::Display)) -> Value {
+    serde_json::to_value(e).unwrap_or_else(|_| json!({"error": "other", "message": e.to_string()}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,9 +148,4 @@ mod tests {
         trim_result("capture_show", &mut r);
         assert_eq!(r, before);
     }
-}
-
-/// An operation error as JSON; one that cannot be serialised becomes `other`.
-pub(crate) fn to_json(e: &(impl Serialize + std::fmt::Display)) -> Value {
-    serde_json::to_value(e).unwrap_or_else(|_| json!({"error": "other", "message": e.to_string()}))
 }
