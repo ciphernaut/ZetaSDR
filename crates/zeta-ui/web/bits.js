@@ -7,10 +7,12 @@
 //   one job at a time: the one setJob(id) chose, else the newest eligible; a
 //   `<select id="bits-job">` picks among several. While shown it polls the job's
 //   `job_context` every BITS_POLL_MS for `clock` (`#bits-clock`: `<rate_est_baud> Bd
-//   locked|searching`) and GET /streams for the job's event streams (`provenance.job`; the
-//   slicer's, bit_view's hypotheses, a `correlate`'s syncs), subscribing to each one listed
-//   and closing those no longer listed (a `graph_put` relaunches the job with new ids). It
-//   holds no socket while hidden.
+//   locked|searching`) and GET /streams for the job's event streams (`provenance.job`),
+//   subscribing to each one listed and closing those no longer listed (a `graph_put`
+//   relaunches the job with new ids). It holds no socket while hidden. Rows and the eye are
+//   read from one stream, the bits stream: `context.correlate.stream` (a correlator's output,
+//   which forwards the slicer's events with its `sync` events among them) while it is listed,
+//   else `context.slicer.stream`; `sync` and `hypotheses` events from any of the job's.
 //   `bits` events append rows (`#bits-rows .bits-row`: the row's first bit offset, then
 //   BITS_ROW_BYTES bytes of hex as `.byte` spans), at most BITS_ROWS_MAX rows, oldest
 //   dropped; the byte under the pointer shows its 8 bits in `#bits-binary`. `sync` events
@@ -18,11 +20,12 @@
 //   offset; a row scrolled off keeps nothing). The latest `hypotheses` event fills
 //   `#bits-hyps`: one `<li>` per sync candidate (`0x2dd4 ×14 every 1120 bits`) with a Try
 //   button (`data-action="try"`: graph_get, a `correlate` node {pattern, bits, max_errors: 0}
-//   added or updated and fed by an `event` edge from the `slicer` node in bit_view's place
-//   (see withCorrelate), graph_put; the rows clear, the hypotheses stay), then the frame
-//   periods, the likely encoding and each CRC candidate (a `period_bits` of 0 reads `to next
-//   sync`). `#bits-eye` draws the latest `constellation`
-//   event: an eye of the symbols against ±1 lines on 1 channel, I/Q dots on 2.
+//   put between the `slicer` and what it fed (see withCorrelate), graph_put; the rows clear,
+//   the last hypotheses stay until bit_view publishes again), then the frame periods, the
+//   likely encoding and each CRC candidate (a `period_bits` of 0 reads `to next sync`).
+//   `#bits-hyps[data-events]` counts the hypotheses events since the job, or its last
+//   relaunch by Try, was shown. `#bits-eye` draws the latest `constellation` event: an eye of the symbols against ±1
+//   lines on 1 channel, I/Q dots on 2.
 
 export const BITS_POLL_MS = 1000;
 export const BITS_ROWS_MAX = 64;
@@ -48,26 +51,22 @@ function hexBits(hex) {
   return parseInt(hex, 16).toString(2).padStart(8, "0");
 }
 
-// The `correlate` node set to `pattern` (hex, `bits` wide) and fed by an `event` edge from
-// the slicer: the graph changed in place. A stage's output feeds one edge (the node gives each
-// edge its own stream, and the slicer publishes on one), so the correlator takes the place of
-// what the slicer fed (bit_view): the pane keeps the last hypotheses, and Try again only
-// updates the correlator's params.
+// The `correlate` node set to `pattern` (hex, `bits` wide), put between the slicer and what
+// it fed (`slicer -event-> correlate -event-> bit_view`; correlate forwards the slicer's
+// events): the graph changed in place. A graph that has the node already only gets its params.
 export function withCorrelate(graph, pattern, bits) {
   const params = { pattern, bits, max_errors: 0 };
   const node = graph.nodes.find((n) => n.id === "correlate");
   if (node) {
     node.kind = "correlate";
     node.params = params;
-  } else graph.nodes.push({ id: "correlate", kind: "correlate", params });
-  const fed = new Set(
-    graph.edges.filter((e) => e.from === "slicer" && e.to !== "correlate").map((e) => e.to),
-  );
-  graph.nodes = graph.nodes.filter((n) => !fed.has(n.id));
-  graph.edges = graph.edges.filter(
-    (e) => e.to !== "correlate" && !fed.has(e.to) && !fed.has(e.from),
-  );
+    return graph;
+  }
+  graph.nodes.push({ id: "correlate", kind: "correlate", params });
+  const fed = graph.edges.filter((e) => e.from === "slicer" && e.kind === "event");
+  graph.edges = graph.edges.filter((e) => !fed.includes(e));
   graph.edges.push({ from: "slicer", to: "correlate", kind: "event" });
+  for (const e of fed) graph.edges.push({ from: "correlate", to: e.to, kind: "event" });
   return graph;
 }
 
@@ -89,7 +88,9 @@ class BitsPane {
     this.rows = []; // {offset, bytes: [hex], count}
     this.syncs = []; // {offset, bits}
     this.syncBits = SYNC_BITS_DEFAULT;
+    this.bitsStream = null; // the stream rows and the eye are read from
     this.hyps = null;
+    this.hypsEvents = 0; // hypotheses events since the job (or its last relaunch) was shown
     this.constellation = null;
     this.clock = null;
     this.timer = null;
@@ -192,6 +193,7 @@ class BitsPane {
     this.rows = [];
     this.syncs = [];
     this.hyps = null;
+    this.hypsEvents = 0; // hypotheses events since the job (or its last relaunch) was shown
     this.constellation = null;
     this.clock = null;
   }
@@ -226,7 +228,12 @@ class BitsPane {
         this.clock = c.clock ?? null;
         if (!this.hyps && c.bit_view) this.hyps = c.bit_view;
       }
-      if (Array.isArray(streams)) this.syncStreams(job.id, streams);
+      if (Array.isArray(streams)) {
+        const listed = new Set(streams.map((x) => x.id));
+        const pick = [c?.correlate?.stream, c?.slicer?.stream].find((id) => listed.has(id));
+        this.bitsStream = pick ?? null;
+        this.syncStreams(job.id, streams);
+      }
       this.renderClock();
       this.renderHyps();
     } finally {
@@ -254,7 +261,7 @@ class BitsPane {
       rec.sub = this.api.streamText(
         id,
         (msg) => {
-          if (!rec.closed && msg.type === "frame") this.event(msg.payload);
+          if (!rec.closed && msg.type === "frame") this.event(msg.payload, id);
         },
         () => {
           rec.closed = true;
@@ -265,20 +272,25 @@ class BitsPane {
     }
   }
 
-  event(p) {
+  // One event of stream `id`: bits and constellations count from the bits stream only (the
+  // slicer's and a correlator's output both carry them).
+  event(p, id) {
     if (!p || typeof p !== "object") return;
+    const fromBits = id === this.bitsStream;
     switch (p.protocol) {
       case "bits":
-        this.addBits(p);
+        if (fromBits) this.addBits(p);
         break;
       case "sync":
         this.addSync(p);
         break;
       case "hypotheses":
         this.hyps = p;
+        this.hypsEvents += 1;
         this.renderHyps();
         break;
       case "constellation":
+        if (!fromBits) break;
         this.constellation = p;
         this.renderEye();
         break;
@@ -441,6 +453,7 @@ class BitsPane {
     }
     if (!items.length) li(this.shownJob ? "no hypotheses yet" : "", "empty");
     this.hypsEl.replaceChildren(...items);
+    this.hypsEl.dataset.events = String(this.hypsEvents);
   }
 
   renderEye() {
@@ -507,11 +520,12 @@ class BitsPane {
       this.t.note(`correlating ${job.slice(-6)} on 0x${word}`);
       // The job restarts under its id with new streams: the next poll subscribes to them.
       this.syncBits = bits;
-      // The hypotheses stay: the correlator took bit_view's place (withCorrelate).
+      // The last hypotheses stay until bit_view publishes again.
       const hyps = this.hyps;
       this.closeAll();
       this.reset();
       this.hyps = hyps;
+      this.bitsStream = null;
       this.render();
     } catch (e) {
       this.t.note(`try 0x${word}: ${e.message}`, true);

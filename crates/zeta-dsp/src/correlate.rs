@@ -1,8 +1,10 @@
 //! Sync-word correlation over a bit stream.
 //!
-//! Reads `slicer`'s `bits` events and publishes one `sync` event wherever `pattern`
-//! appears with at most `max_errors` bit errors, the hit's offset counted in bits from
-//! the start of its segment (the slicer's `offset_bits` origin).
+//! Reads `slicer`'s `bits` events, forwards every event it reads unchanged, and
+//! publishes one `sync` event wherever `pattern` appears with at most `max_errors` bit
+//! errors, the hit's offset counted in bits from the start of its segment (the slicer's
+//! `offset_bits` origin). So it sits between the slicer and `bit_view`, whose input
+//! then carries the syncs beside the bits.
 
 use std::sync::Arc;
 
@@ -138,7 +140,10 @@ struct Carry {
 /// `pattern` match with at most `max_errors` errors, the last `bits - 1` bits carried
 /// across events so a pattern split between two is found. A `bits` event whose
 /// `offset_bits` is not the previous one's end (a seam restarts it at 0), and a lag,
-/// start a new segment. Nothing else passes through.
+/// start a new segment. Every event read is forwarded unchanged (its payload and
+/// provenance, on the output stream), the `sync` events of a `bits` event right after
+/// it. Notes `correlate` (`pattern`, `hits` so far, `stream` its output) at the first
+/// `bits` event and at each one with a hit.
 pub struct CorrelateStage {
     spec: StageSpec,
 }
@@ -185,7 +190,7 @@ impl Stage for CorrelateStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         self.check_params(&params).map_err(StageError::Failed)?;
         let p: CorrelateParams = serde_json::from_value(params)
@@ -196,6 +201,8 @@ impl Stage for CorrelateStage {
         let label = p.pattern.to_ascii_lowercase();
         let n = pattern.len();
         let mut carry = Carry::default();
+        let mut hits = 0u64;
+        let mut noted = false;
         run_map(CORRELATE_KIND, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
@@ -204,8 +211,13 @@ impl Stage for CorrelateStage {
                     return Ok(Vec::new());
                 }
             };
+            let forward = Frame::new(
+                events.clone(),
+                frame.provenance.clone(),
+                frame.payload.clone(),
+            );
             let Some(b) = BitsIn::parse(CORRELATE_KIND, frame)? else {
-                return Ok(Vec::new());
+                return Ok(vec![forward]);
             };
             if carry.end != Some(b.offset_bits) {
                 carry = Carry::default();
@@ -214,7 +226,7 @@ impl Stage for CorrelateStage {
             carry.bits.extend_from_slice(&b.bits);
             carry.times.extend((0..b.bits.len()).map(|i| b.time(i)));
             carry.end = Some(b.end());
-            let mut out = Vec::new();
+            let mut out = vec![forward];
             for start in 0..(carry.bits.len() + 1).saturating_sub(n) {
                 let mut errors = 0u32;
                 for (x, y) in carry.bits[start..start + n].iter().zip(&pattern) {
@@ -241,6 +253,15 @@ impl Stage for CorrelateStage {
                     end_ns: Timestamp(t + (n as f64 * b.bit_ns) as u64),
                 };
                 out.push(Frame::new(events.clone(), prov, Payload::Event(ev)));
+                hits += 1;
+            }
+            if !noted || out.len() > 1 {
+                noted = true;
+                ctx.note(serde_json::json!({"correlate": {
+                    "pattern": label,
+                    "hits": hits,
+                    "stream": events.0,
+                }}));
             }
             let drop = carry.bits.len() - carry.bits.len().min(n - 1);
             carry.bits.drain(..drop);
@@ -262,6 +283,54 @@ mod tests {
     const PERIOD: usize = 1120;
     const SYNC_BITS: usize = 16;
 
+    /// The `sync` events among `events`.
+    fn syncs(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter(|e| e["protocol"] == "sync")
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_event_read_comes_out_unchanged_and_in_order_among_the_syncs() {
+        let bits = framed_stream(4, 136, 5);
+        let input = bits_frames(&bits, &[PERIOD + SYNC_BITS / 2, 3 * PERIOD]);
+        let sent: Vec<serde_json::Value> = input
+            .iter()
+            .map(|f| match &f.payload {
+                zeta_core::stream::Payload::Event(v) => v.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let (events, context) = run_events(
+            &CorrelateStage::new(),
+            json!({"pattern": "2dd4", "bits": 16}),
+            input,
+        )
+        .await;
+        assert_eq!(context["correlate"]["hits"], 4);
+        assert_eq!(context["correlate"]["pattern"], "2dd4");
+        assert!(context["correlate"]["stream"].is_string());
+        let forwarded: Vec<_> = events
+            .iter()
+            .filter(|e| e["protocol"] != "sync")
+            .cloned()
+            .collect();
+        assert_eq!(forwarded, sent);
+        // Each hit follows the bits event holding its last bit, before the next one.
+        let mut seen_end = 0u64;
+        for e in &events {
+            if e["protocol"] == "bits" {
+                seen_end = e["offset_bits"].as_u64().unwrap() + e["count"].as_u64().unwrap();
+            } else {
+                let at = e["offset_bits"].as_u64().unwrap();
+                assert!(at + SYNC_BITS as u64 <= seen_end, "{e} before its bits");
+            }
+        }
+        assert_eq!(syncs(&events).len(), 4);
+    }
+
     #[tokio::test]
     async fn sync_hits_land_at_the_planted_offsets() {
         let bits = framed_stream(8, 136, 7);
@@ -272,7 +341,7 @@ mod tests {
             bits_frames(&bits, &[split]),
         )
         .await;
-        let offsets: Vec<u64> = events
+        let offsets: Vec<u64> = syncs(&events)
             .iter()
             .map(|e| {
                 assert_eq!(e["protocol"], "sync");
@@ -282,7 +351,10 @@ mod tests {
             .collect();
         let want: Vec<u64> = (0..8).map(|k| (k * PERIOD) as u64).collect();
         assert_eq!(offsets, want);
-        assert_eq!(events[1]["summary"], "sync 0x2dd4 at 1120 (0 errors)");
+        assert_eq!(
+            syncs(&events)[1]["summary"],
+            "sync 0x2dd4 at 1120 (0 errors)"
+        );
     }
 
     #[tokio::test]
@@ -290,10 +362,9 @@ mod tests {
         let mut bits = framed_stream(3, 136, 3);
         bits[PERIOD + 3] ^= 1;
         let at = |events: &[serde_json::Value]| {
-            events
-                .iter()
+            syncs(events)
+                .into_iter()
                 .find(|e| e["offset_bits"] == PERIOD as u64)
-                .cloned()
         };
         let (strict, _) = run_events(
             &CorrelateStage::new(),

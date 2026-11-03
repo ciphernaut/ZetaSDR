@@ -1000,6 +1000,7 @@ mod tests {
 
     use serde_json::json;
     use zeta_core::stage::Stage;
+    use zeta_core::stream::Payload;
 
     use super::test_streams::{
         bits_frames, framed_stream, framed_stream_of, random_bits, run_events,
@@ -1078,6 +1079,27 @@ mod tests {
                 .all(|e| e["window_bits"].as_u64().unwrap() <= 4096)
         );
         assert_eq!(context["bit_view"], *events.last().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_sync_event_among_the_bits_changes_nothing() {
+        let bits = random_bits(10_000, 9);
+        let splits: Vec<usize> = (1..10).map(|k| k * 1000).collect();
+        let plain = bits_frames(&bits, &splits);
+        // A correlator's `sync` event after every bits event, as `correlate` forwards them.
+        let mut mixed = Vec::new();
+        for f in &plain {
+            mixed.push(f.clone());
+            let mut sync = f.clone();
+            sync.payload = Payload::Event(json!({
+                "protocol": "sync", "offset_bits": 0, "errors": 0, "t_ns": 0, "summary": "sync"
+            }));
+            mixed.push(sync);
+        }
+        let params = json!({"window_bits": 4096});
+        let (want, _) = run_events(&BitViewStage::new(), params.clone(), plain).await;
+        let (got, _) = run_events(&BitViewStage::new(), params, mixed).await;
+        assert_eq!(got, want);
     }
 
     #[tokio::test]

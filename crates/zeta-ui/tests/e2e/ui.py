@@ -5590,6 +5590,15 @@ def scenario_work_the_bits_shows_a_stream_and_a_sync_hit(page, url, secret):
     expect(page.locator("#bits-hyps li", has_text="2dd4").first).to_be_visible(timeout=40000)
     page.click('#bits-hyps li:has-text("2dd4") button[data-action="try"]')
     expect(page.locator("#bits .sync").first).to_be_visible(timeout=30000)
+    # The correlator sits before bit_view: the hypotheses keep coming after the relaunch.
+    expect(page.locator("#bits-hyps")).to_have_attribute("data-events", re.compile(r"^[1-9]"),
+                                                         timeout=20000)
+    expect(page.locator("#bits-hyps li", has_text="2dd4").first).to_be_visible()
+    graph = capture_ops(url, secret, "graph_get", job=[
+        j["id"] for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+        if j["kind"] == "bits" and j["state"]["status"] == "running"][0])
+    edges = {(e["from"], e["to"]) for e in graph["edges"]}
+    assert ("slicer", "correlate") in edges and ("correlate", "bit_view") in edges, edges
     # The job's row offers the pane.
     expect(page.locator("#jobs .job button.bits").first).to_be_visible(timeout=10000)
     stop_bits_jobs(url, secret)
