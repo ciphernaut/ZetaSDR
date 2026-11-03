@@ -20,6 +20,7 @@ pub mod burst_capture;
 pub mod capture_in;
 pub mod catalogue;
 pub mod channel;
+pub mod clock;
 pub mod crc;
 pub mod denoise;
 pub mod detect;
@@ -67,6 +68,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(burst_capture::BurstCaptureStage::new()));
     reg.register(Arc::new(capture_in::CaptureInStage::new()));
     reg.register(Arc::new(resample::ResampleStage::new()));
+    reg.register(Arc::new(clock::ClockRecoverStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));
     reg.register(Arc::new(vad::VadStage::new()));
     reg.register(Arc::new(mix::MixStage::new()));
@@ -175,13 +177,33 @@ pub(crate) enum Input {
 /// error from `f` ends the stage with that error.
 pub(crate) async fn run_map<F>(
     kind: &'static str,
-    mut inputs: Vec<broadcast::Receiver<Frame>>,
+    inputs: Vec<broadcast::Receiver<Frame>>,
     bus: Arc<StreamBus>,
     cancel: CancellationToken,
     mut f: F,
 ) -> Result<(), StageError>
 where
     F: FnMut(Input) -> Result<Vec<Frame>, StageError> + Send,
+{
+    run_map_ending(kind, inputs, bus, cancel, move |input| match input {
+        Some(input) => f(input),
+        None => Ok(Vec::new()),
+    })
+    .await
+}
+
+/// [`run_map`] for a stage that flushes what it holds when its input ends: `f` is
+/// called with `None` once the input closes, and what it returns is published before
+/// the stage returns `Ok(())`.
+pub(crate) async fn run_map_ending<F>(
+    kind: &'static str,
+    mut inputs: Vec<broadcast::Receiver<Frame>>,
+    bus: Arc<StreamBus>,
+    cancel: CancellationToken,
+    mut f: F,
+) -> Result<(), StageError>
+where
+    F: FnMut(Option<Input>) -> Result<Vec<Frame>, StageError> + Send,
 {
     if inputs.len() != 1 {
         return Err(StageError::Failed("expected 1 input".into()));
@@ -193,17 +215,22 @@ where
             _ = cancel.cancelled() => return Err(StageError::Cancelled),
             r = rx.recv() => match r {
                 Ok(frame) => {
-                    for out in f(Input::Frame(frame))? {
+                    for out in f(Some(Input::Frame(frame)))? {
                         bus.publish(out);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     note_lag(kind, n);
-                    for out in f(Input::Lagged { missed: n })? {
+                    for out in f(Some(Input::Lagged { missed: n }))? {
                         bus.publish(out);
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                Err(broadcast::error::RecvError::Closed) => {
+                    for out in f(None)? {
+                        bus.publish(out);
+                    }
+                    return Ok(());
+                }
             },
         }
     }
