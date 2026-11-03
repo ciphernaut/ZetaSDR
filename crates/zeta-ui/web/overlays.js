@@ -138,8 +138,10 @@
 //         (its centre line plus or minus half a lane) keeps its lane and gets class `clipped`,
 //         its tail under the newer ribbon (newer ribbons draw higher). On each layout a ribbon
 //         whose next lane down is clear falls back one lane. A keyed ribbon never steps nor
-//         falls: a new one takes the first lane free of overlap. Its `data-colour` is that of
-//         the job outline whose band holds hz (the narrowest), none when no job band does.
+//         falls: a new one takes the first lane free of overlap. A job's ribbon (an attached
+//         job's: its input's) carries that job's `data-colour` (channelColour) and band; one
+//         with no job takes the narrowest job outline holding hz, none when no job band does.
+//         The layer isolates its stacking (style.css), so the newer-on-top z-index stays in it.
 //         At most MAX_RIBBONS are kept: the oldest goes first.
 //     ov.label(hz, {layer, name, confidence, evidence}, key = "") -> element
 //         "L<layer> <name> <confidence, 2 dp>" at the left edge at wf.yForHz(hz); a layer-2
@@ -635,6 +637,7 @@ class Overlays {
 
   render(rec, p) {
     const job = rec.job;
+    const owner = job.input ?? job.id; // whose colour and band its ribbons take
     const obj = p && typeof p === "object" && !Array.isArray(p);
     if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
     for (const fn of this.eventFns) fn(job, p);
@@ -669,29 +672,29 @@ class Overlays {
           this.refreshTag(this.outlines.get(job.input));
         }
         const t = transcriptRibbon(p);
-        const el = this.ribbon(tuningCentre(job), t.text, t.cls);
+        const el = this.ribbon(tuningCentre(job), t.text, t.cls, owner);
         if (el && t.title) el.title = `${t.text}\n${t.title}`;
         return;
       }
       if (typeof p.summary === "string") {
         if (this.subjectRibbon(job, p)) return;
-        this.ribbon(tuningCentre(job), p.summary, typeof p.protocol === "string" ? p.protocol : "event");
+        this.ribbon(tuningCentre(job), p.summary, typeof p.protocol === "string" ? p.protocol : "event", owner);
         return;
       }
       if (typeof p.protocol === "string") {
         const text = protocolText(p);
         if (text !== null) {
-          this.ribbon(tuningCentre(job), text, p.protocol);
+          this.ribbon(tuningCentre(job), text, p.protocol, owner);
           return;
         }
       }
       if ("src" in p && "info" in p) {
-        this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}`, "aprs");
+        this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}`, "aprs", owner);
         return;
       }
     }
     const json = JSON.stringify(p) ?? String(p);
-    this.ribbon(tuningCentre(job), json.slice(0, OTHER_EVENT_CHARS), "event");
+    this.ribbon(tuningCentre(job), json.slice(0, OTHER_EVENT_CHARS), "event", owner);
   }
 
   onEvent(fn) {
@@ -745,7 +748,7 @@ class Overlays {
       if (!s) return false;
       this.keyedRibbon(
         `job:${job.id}:${k.key}`, hz, () => subjectSummary(s), row.protocol, s.count,
-        () => store.held(job.id, k.key),
+        () => store.held(job.id, k.key), job.id,
       );
       return true;
     }
@@ -754,7 +757,7 @@ class Overlays {
       const label = last ? subjectLabel(last) : "";
       return `${row.protocol} ${store.size(job.id)} ${row.subject.name}, last ${label}`;
     };
-    this.keyedRibbon(`job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null));
+    this.keyedRibbon(`job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null), job.id);
     return true;
   }
 
@@ -762,12 +765,12 @@ class Overlays {
   // drawn at once; a message to one only notes what it says, and a timer draws it at most every
   // KEYED_RIBBON_MS, so no message measures anything. `held()` true keeps it from scrolling or
   // expiring while its subject is heard.
-  keyedRibbon(key, hz, text, cls, count, held) {
+  keyedRibbon(key, hz, text, cls, count, held, job = null) {
     if (this.destroyed) return null;
     let r = this.ribbons.find((o) => o.key === key);
     const fresh = !r;
     if (fresh) {
-      r = this.makeRibbon(hz, typeof text === "function" ? String(text()) : String(text), cls, key);
+      r = this.makeRibbon(hz, typeof text === "function" ? String(text()) : String(text), cls, key, job);
       r.countText = "";
       r.drawn = 0;
     }
@@ -809,7 +812,7 @@ class Overlays {
     if (moved) this.place(r);
   }
 
-  ribbon(hz, text, cls = "") {
+  ribbon(hz, text, cls = "", job = null) {
     if (this.destroyed) return null;
     text = String(text);
     const same = this.ribbons.find(
@@ -821,16 +824,18 @@ class Overlays {
       same.born = performance.now();
       return same.el;
     }
-    return this.makeRibbon(hz, text, cls).el;
+    return this.makeRibbon(hz, text, cls, undefined, job).el;
   }
 
-  // A new ribbon record, drawn and placed, never folded into another by its text.
-  makeRibbon(hz, text, cls, key = undefined) {
+  // A new ribbon record, drawn and placed, never folded into another by its text. `job` (the
+  // id whose ribbon it is: an attached job's input) gives its colour (channelColour) and band;
+  // a ribbon with no job (the agent's notes, a test's) takes the job outline holding hz, if any.
+  makeRibbon(hz, text, cls, key = undefined, job = null) {
     const el = document.createElement("div");
     el.className = cls ? `ov-ribbon ${cls}` : "ov-ribbon";
     el.dir = "auto";
-    const band = this.bandOf(hz);
-    if (band) el.dataset.colour = band.el.dataset.colour;
+    const band = job ? { key: job, colour: String(channelColour(job)) } : this.bandOf(hz);
+    if (band) el.dataset.colour = band.colour;
     const body = document.createElement("span");
     body.textContent = text;
     const countEl = document.createElement("span");
@@ -852,14 +857,14 @@ class Overlays {
     return r;
   }
 
-  // The narrowest job outline whose band holds `hz` ({key, el}), or null (no job band does,
+  // The narrowest job outline whose band holds `hz` ({key, colour, o}), or null (no job band does,
   // or hz unknown): the band a ribbon at hz belongs to.
   bandOf(hz) {
     if (typeof hz !== "number") return null;
     let best = null;
     for (const [key, o] of this.outlines) {
       if (!o.job || !o.el.dataset.colour || hz < o.lo || hz > o.hi) continue;
-      if (!best || o.hi - o.lo < best.o.hi - best.o.lo) best = { key, el: o.el, o };
+      if (!best || o.hi - o.lo < best.o.hi - best.o.lo) best = { key, colour: o.el.dataset.colour, o };
     }
     return best;
   }

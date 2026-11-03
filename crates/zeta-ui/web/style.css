@@ -297,6 +297,7 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
   position: absolute; inset-inline-start: calc(var(--rail-w) + var(--axis-w)); top: 0;
   width: calc(100% - var(--rail-w) - var(--axis-w)); height: 100%;
   overflow: hidden; pointer-events: none;
+  isolation: isolate; /* the ribbons' newer-on-top z-index stays inside the layer */
 }
 #waterfall .ov-label, #waterfall .ov-ribbon {
   position: absolute; padding: 0 5px; border-radius: 2px; white-space: nowrap;

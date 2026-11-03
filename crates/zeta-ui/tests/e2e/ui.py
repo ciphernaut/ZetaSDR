@@ -4365,6 +4365,16 @@ def scenario_ribbon_rides_band(page, url, secret):
         top2 = page.evaluate("el => parseFloat(el.style.top)", second.element_handle())
         h = page.evaluate("el => el.offsetHeight", second.element_handle())
         assert abs((top2 - top1) - (h + 2)) <= 1, (top1, top2, h)
+        # The ribbons' z-index stays inside the overlay layer (menus, badge and drawer above).
+        iso = page.evaluate("getComputedStyle(document.querySelector('#waterfall .ov-layer')).isolation")
+        assert iso == "isolate", iso
+        # A job's ribbon takes the job's colour wherever it sits: here outside the job's band.
+        colour = page.locator(f'#waterfall .outline[data-key="{job}"]').get_attribute("data-colour")
+        assert colour, "outline without a colour"
+        page.evaluate(
+            f"window.zetaTest.ribbon({cur + 20_000}, 'job chunk', 'transcript', null, {json.dumps(job)})")
+        expect(page.locator("#waterfall .ov-ribbon.transcript", has_text="job chunk")
+               ).to_have_attribute("data-colour", colour)
         # A keyed ribbon (a subject) never steps: a second one with the same key replaces in place.
         page.evaluate(f"window.zetaTest.ribbon({cur + 3_000}, 'VH-A 1', 'kr', 'VH-A')")
         page.evaluate(f"window.zetaTest.ribbon({cur + 3_000}, 'VH-A 2', 'kr', 'VH-A')")
