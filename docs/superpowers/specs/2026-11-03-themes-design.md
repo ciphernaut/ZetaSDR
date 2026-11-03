@@ -1,4 +1,4 @@
-# Plan 26: themes as folders (the built-ins and the operator's own, three new looks)
+# Plan 26: themes as folders (the built-ins and the operator's own, four new looks)
 
 Design spec, 2026-11-03. Brainstormed in chat with the operator; answers marked "operator" are
 theirs, the rest are the author's calls, listed in section 10. Plan 25 is the parked public release
@@ -25,15 +25,15 @@ frequency axis, ribbons riding the waterfall (operator: "layout, sure it will be
 
 So themes become data. A theme is a folder with a declarative `theme.json` and a `style.css`; the
 built-in themes ship in that format inside the binary, and an operator's themes folder, read like
-`--modes-dir`, adds or replaces them (operator). Three new built-ins ship with this plan: cyberpunk,
-terminal and psytrance (operator chose these three from five; the looks are the author's,
-section 6).
+`--modes-dir`, adds or replaces them (operator). Four new built-ins ship with this plan: cyberpunk,
+terminal and psytrance (operator chose these three from five) and vibecoder (operator: "the sort
+of UI that many vibe coded apps have"); the looks are the author's, section 6.
 
 ## 2. Goals, non-goals, anti-goals
 
 ### Goals
 
-- **One mechanism.** Console, plain and the three new themes are theme folders embedded in the
+- **One mechanism.** Console, plain and the four new themes are theme folders embedded in the
   binary, loaded by the same loader as an operator's. An operator theme with a built-in's `id`
   replaces it, as a mode row does.
 - **An operator themes folder** (operator): `--themes-dir PATH`, default
@@ -46,8 +46,8 @@ section 6).
   console in the theme format is the proof the hooks are complete.
 - **No visible change to console or plain.** After the move both render as they do on main today
   (checked by screenshot comparison, section 8).
-- **Three new looks** that each change shape or texture as well as colour, none reading as the
-  console (section 6).
+- **Four new looks** that each change shape or texture as well as colour, none reading as the
+  console (section 6), one of them light (vibecoder), so the `color_scheme: light` path is exercised.
 - **A documented hooks contract** (section 5): the selectors and attributes a theme may rely on,
   kept stable across releases and pinned by a test.
 - **Canvas parts are themeable** through tokens the JS reads (section 4.3): the waterfall ramp and
@@ -140,7 +140,8 @@ The folder name must equal `theme.json`'s `id`. `id` is lowercase `[a-z][a-z0-9_
   the `theme === "console"` test in `app.js:1004`). `ribbon_tilt_deg`, -30..=30, the ribbons' lean.
   The builder may add switches the JS needs (section 9), each documented with the hooks.
 - `tokens`: values for the documented custom properties (section 4.3). A key outside the documented
-  list is refused naming it. A value is a CSS value string of at most 200 characters; one containing
+  list is refused naming it. A value is a CSS value string (no length cap: theme files are the operator's own,
+  and the character rule below is what keeps a value from escaping its declaration); one containing
   `;`, `{`, `}`, `<` or `url(` is refused (URLs belong in `style.css`, relative to the folder).
   A token the theme leaves out takes the neutral core's value.
 - `ramp`: the waterfall's colour stops, 2-16 of `[t, [r, g, b]]`, `t` ascending from 0 to 1 exactly,
@@ -159,7 +160,8 @@ with one line per token saying what it paints; the loader checks `tokens` agains
 
 ### 4.4 `style.css`
 
-At most 256 KiB. The node serves it wrapped so that it applies only while its theme is active: the
+At most 1 MiB, a sanity limit against a stray file, not a security one (the refusal names the
+limit and the file's size; raising it later changes nothing else). The node serves it wrapped so that it applies only while its theme is active: the
 author's call is native CSS nesting, `[data-theme="<id>"] { <file> }`, with the file's
 `@font-face` and `@keyframes` rules hoisted out of the wrapper (keyframe names prefixed with the
 theme id so two themes cannot clash). `@import` is refused. `url()` resolves inside the theme's
@@ -218,7 +220,7 @@ hook for one of these, the builder adds a class or `data-` attribute. Everything
 change in any release. An e2e scenario asserts every listed hook exists on a page with a running job,
 a ribbon and an open pane, so renaming one fails the suite.
 
-## 6. The three new looks (author's call)
+## 6. The four new looks (author's call)
 
 Each must pass the anti-goals: not the console's frame, bars or face, not plain recoloured, AA
 contrast for body text, every animation off under `prefers-reduced-motion`. Each has its own font
@@ -252,6 +254,23 @@ on the brand and the speaking glow, a faint radial pattern in the side column's 
 contrast floor. Type: a rounded geometric face for labels, a clean sans for decoded text. Waterfall
 ramp: a rainbow ramp from indigo to white, checked for readable weak signals (the low end must stay
 dark and distinct from the floor). Rail on, ribbons lean the other way from cyberpunk.
+
+### 6.4 Vibecoder (`vibecoder`)
+
+The look of a freshly generated web app starter, affectionately: the one light theme. Off-white
+ground (a cool slate tint), white cards, slate text, an indigo-to-violet gradient as the one accent
+(primary buttons, the brand, the selected source, the speaking glow) and the waterfall shown as a dark
+card set into the light page (the canvas keeps a dark ground; its ramp: near-black navy through
+indigo and violet to pink and white). Shape: everything a rounded card (about 12-16 px radius) with a
+1 px hairline border and a soft, wide drop shadow; panes float with gaps between them rather than
+sharing borders; frosted-glass (`backdrop-filter: blur`) on the top bar, menus and the graph view.
+Status as small badges: a light tint of the colour behind darker text of the same hue (never dark
+text on a saturated fill, so it does not read as the console's bars). Texture: gentle 150 ms
+transitions on hover and focus, a focus ring in the accent, a subtle gradient wash behind the brand.
+Type: a neutral geometric grotesque in the Inter family (OFL) for everything, a matching monospace
+for numbers and decoded text; sentence case, no uppercase transforms. Rail on with rounded tags,
+ribbons flat. It is the stress test for a light `color_scheme`: the builder checks every token the
+JS draws with (axis text, outlines, ribbons over the dark canvas) still reads.
 
 ## 7. Moving console and plain
 
@@ -293,15 +312,16 @@ dark and distinct from the floor). Rail on, ribbons lean the other way from cybe
 ## 10. The author's calls (check these)
 
 1. The plan number 26 and the folder layout `crates/zeta-ui/themes/<id>/`.
-2. The three looks in section 6, including the theme ids `cyberpunk`, `terminal`, `psytrance` and
-   the name "Terminal" (operator).
+2. The four looks in section 6, including the theme ids `cyberpunk`, `terminal`, `psytrance`,
+   `vibecoder` and the name "Terminal" (operator); vibecoder as the one light theme.
 3. Themes are read once at startup; no hot reload.
 4. Tokens may not contain `url(`; images and fonts are referenced from `style.css` only.
 5. Scoping `style.css` with native CSS nesting, hoisting `@font-face` and `@keyframes`.
 6. Theme files served without the bearer, like the page's own assets.
 7. A stored theme that is no longer ready falls back to console.
 8. A new op `themes_list` rather than an HTTP-only listing.
-9. A 256 KiB cap on `style.css` and a 200-character cap on a token value.
+9. A 1 MiB sanity cap on `style.css` and no length cap on a token value (operator worried the
+   caps would bite; the character and `url()` rules are what protect the page).
 10. The no-visible-change rule for console and plain, checked by screenshots.
 11. The browser floor Chrome 120 / Firefox 117 / Safari 17.2 (section 3), so the node wraps CSS
     instead of rewriting selectors.
