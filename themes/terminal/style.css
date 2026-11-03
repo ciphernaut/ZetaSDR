@@ -291,14 +291,16 @@ html&[data-side="none"]:not([data-footprint="narrow"]) .pane h2 { margin: 0; ali
 .job .actions button { padding: 0; }
 .job-group > summary { color: var(--dim); }
 
-/* ---- menus and the graph view: boxes, the entry under the pointer in inverse video ---- */
-[role="menu"] {
+/* ---- menus and the graph view: boxes, the entry under the pointer in inverse video (the
+   menus named by id, to outweigh the core's id rules) ---- */
+#ctx, #ctx-outline {
   background: var(--bg);
   border: 1px solid var(--text);
   box-shadow: 0 0 0 1px var(--bg), 0 8px 18px var(--shadow);
 }
-[role="menu"] .ctx-item { border: 0; color: var(--text); }
-[role="menu"] .ctx-item:hover, [role="menu"] .ctx-item:focus-visible {
+#ctx .ctx-item, #ctx-outline .ctx-item { border: 0; color: var(--text); }
+#ctx .ctx-item:hover, #ctx .ctx-item:focus-visible,
+#ctx-outline .ctx-item:hover, #ctx-outline .ctx-item:focus-visible {
   background: var(--text); color: #000; text-shadow: none;
 }
 #ctx-footer, #ctx-outline-footer { border-top: 1px solid var(--border); }

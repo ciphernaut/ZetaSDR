@@ -1294,38 +1294,61 @@ MOTION_PROBE_JS = """(job) => {
 }"""
 
 
-# The colour an element's text actually sits on: its own background colour or, while that is
-# transparent, the first ancestor's that is not. An ancestor painted with a background image (a
-# gradient) has an unknown colour; the walk goes on to the nearest solid colour below it.
-EFFECTIVE_GROUND_JS = """(el) => {
-  for (let e = el; e; e = e.parentElement) {
-    const c = getComputedStyle(e).backgroundColor;
-    const m = c.match(/rgba?\\(([^)]*)\\)/);
-    const parts = m ? m[1].split(/[ ,\\/]+/).filter(Boolean) : [];
-    if (parts.length === 4 && Number(parts[3]) === 0) continue;
-    if (c === "transparent") continue;
-    return c;
-  }
-  return getComputedStyle(document.documentElement).backgroundColor;
-}"""
+# Colour helpers for the contrast checks. `rgba(c)` normalises any CSS colour the browser
+# computes (rgb(), color(srgb ...) from a color-mix, ...) to [r, g, b, a] by painting it on a
+# 1x1 canvas (a an alpha 0-1; a colour the canvas cannot parse reads as transparent).
+# `ground(el)` is the [r, g, b] an element's text actually sits on: its own background colour
+# and its ancestors', from the element up to the first opaque one, composited; a layer under
+# 0.05 alpha counts as transparent. An element painted only with a background image (a
+# gradient) has an unknown colour, so the walk goes on to the solid colour below it.
+COLOUR_HELPERS_JS = """(() => {
+  const x = document.createElement("canvas").getContext("2d", {willReadFrequently: true});
+  const rgba = (c) => {
+    x.clearRect(0, 0, 1, 1);
+    x.fillStyle = "rgba(0, 0, 0, 0)";
+    x.fillStyle = c;
+    x.fillRect(0, 0, 1, 1);
+    const d = x.getImageData(0, 0, 1, 1).data;
+    return [d[0], d[1], d[2], Math.round(d[3] / 255 * 100) / 100];
+  };
+  const ground = (el) => {
+    const layers = [];
+    for (let e = el; e; e = e.parentElement) {
+      const c = rgba(getComputedStyle(e).backgroundColor);
+      if (c[3] < 0.05) continue;
+      layers.push(c);
+      if (c[3] >= 0.95) break;
+    }
+    if (!layers.length) return [255, 255, 255];
+    let out = layers.pop().slice(0, 3);
+    while (layers.length) {
+      const [r, g, b, a] = layers.pop();
+      out = [r, g, b].map((v, i) => Math.round(v * a + out[i] * (1 - a)));
+    }
+    return out;
+  };
+  return {rgba, ground};
+})()"""
 
 # A keyboard-focused unselected source tab: [its name's colour, the ground it sits on].
 FOCUSED_TAB_JS = """() => {
-  const ground = """ + EFFECTIVE_GROUND_JS + """;
+  const {rgba, ground} = """ + COLOUR_HELPERS_JS + """;
   const tab = document.querySelector('.src-tab:not([aria-selected="true"])');
   tab.focus({focusVisible: true});
   const name = tab.querySelector(".name");
-  const out = [getComputedStyle(name).color, ground(name)];
+  const out = [rgba(getComputedStyle(name).color).slice(0, 3), ground(name)];
   tab.blur();
   return out;
 }"""
 
-# The hovered action button in a job's (hot) row: its text and the ground it sits on.
+# The hovered action button in a job's (hot) row: its text, the ground it sits on, its own
+# background colour ([r, g, b, a]) and the row's ground.
 HOT_ACTION_JS = """(job) => {
-  const ground = """ + EFFECTIVE_GROUND_JS + """;
+  const {rgba, ground} = """ + COLOUR_HELPERS_JS + """;
   const row = document.querySelector(`#jobs .job[data-id="${job}"]`);
   const button = row.querySelector(".actions button");
-  return {text: getComputedStyle(button).color, ground: ground(button)};
+  return {text: rgba(getComputedStyle(button).color).slice(0, 3), ground: ground(button),
+          own: rgba(getComputedStyle(button).backgroundColor), row: ground(row)};
 }"""
 
 
@@ -1372,7 +1395,8 @@ def scenario_new_themes(page, url, secret):
                 f"{theme}: motion under reduced motion: {still_running} (normal: {moving})"
             # Focus and hover never draw text on its own colour: a keyboard-focused unselected
             # source tab's name and a hovered action in the hot job row, each against the
-            # ground it actually sits on (the first non-transparent background up the tree).
+            # ground it actually sits on (its own and its ancestors' backgrounds, composited).
+            # A hovered action with a ground of its own also stands out of the hot row's.
             focused = page.evaluate(FOCUSED_TAB_JS)
             assert focused[0] != focused[1], f"{theme}: focused tab's name on its own colour: {focused}"
             job_row(page, demod).locator(".actions button").first.hover()
@@ -1380,6 +1404,9 @@ def scenario_new_themes(page, url, secret):
             hovered = page.evaluate(HOT_ACTION_JS, demod)
             assert hovered["text"] != hovered["ground"], \
                 f"{theme}: hovered action in the hot row: {hovered}"
+            if hovered["own"][3] >= 0.05:
+                assert hovered["own"][:3] != hovered["row"], \
+                    f"{theme}: hovered action melts into the hot row: {hovered}"
             page.mouse.move(0, 0)
             for name, size in (("wide", WIDE), ("narrow", NARROW)):
                 page.set_viewport_size(size)

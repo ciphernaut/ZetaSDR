@@ -21,7 +21,7 @@
    --cut is the cut corner's leg; --line the outline's colour. The cut corner is the top end
    one; the gradient layer draws its diagonal 1.5 px inside the clip so the outline is whole. */
 button, #cmd, .src-tab, .pane-tab, .job-tag, #jobs .job, section.pane, #waterfall .ov-ribbon,
-[role="menu"], #graph .graph-panel, #band, #login-form, input {
+#ctx, #ctx-outline, #graph .graph-panel, #band, #login-form, input {
   --cut: 7px;
   --line: var(--border);
   --ground: transparent;
@@ -270,16 +270,17 @@ section.pane {
 .job .actions button { padding: 0 7px 0 4px; font-size: 11px; --cut: 5px; }
 .job-group > summary { color: var(--dim); font-size: 10px; }
 
-/* ---- menus and the graph view ---- */
-[role="menu"] {
+/* ---- menus and the graph view (the menus named by id, to outweigh the core's id rules) ---- */
+#ctx, #ctx-outline {
   --line: var(--accent);
   --ground: var(--bar);
   --cut: 10px;
   border-radius: 0;
   box-shadow: inset 0 0 12px rgba(255, 43, 214, 0.2);
 }
-[role="menu"] .ctx-item { clip-path: none; background: transparent; border: 1px solid transparent; color: var(--text); }
-[role="menu"] .ctx-item:hover, [role="menu"] .ctx-item:focus-visible { border-color: var(--ok); color: var(--ok); box-shadow: none; }
+#ctx .ctx-item, #ctx-outline .ctx-item { clip-path: none; background: transparent; border: 1px solid transparent; color: var(--text); }
+#ctx .ctx-item:hover, #ctx .ctx-item:focus-visible,
+#ctx-outline .ctx-item:hover, #ctx-outline .ctx-item:focus-visible { border-color: var(--ok); color: var(--ok); box-shadow: none; }
 #graph .graph-panel { --line: var(--ok); --ground: var(--bar); --cut: 14px; }
 #graph .graph-title { color: var(--ok); text-shadow: 0 0 6px rgba(0, 240, 255, 0.6); }
 #graph .graph-canvas { border-color: var(--border); }

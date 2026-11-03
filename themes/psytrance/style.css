@@ -40,12 +40,14 @@ button, .src-tab, .pane-tab, #cmd, input, #jobs .job, .job-tag[data-colour],
   border-radius: var(--soft-sm);
   background: linear-gradient(var(--ground), var(--ground)) padding-box, var(--edge) border-box;
 }
-section.pane, [role="menu"], #graph .graph-panel {
-  position: relative;
+/* The menus are named by id (#ctx, #ctx-outline) to outweigh the core's id rules; they are
+   position: fixed already, which holds the ring. */
+section.pane, #graph .graph-panel { position: relative; }
+section.pane, #ctx, #ctx-outline, #graph .graph-panel {
   border: 0;
   border-radius: var(--soft);
 }
-section.pane::before, [role="menu"]::before, #graph .graph-panel::before {
+section.pane::before, #ctx::before, #ctx-outline::before, #graph .graph-panel::before {
   content: "";
   position: absolute;
   inset: 0;
@@ -335,8 +337,8 @@ section.pane > * { position: relative; z-index: 1; }
 .job-group > summary { color: var(--dim); font-size: 11px; }
 
 /* ---- menus and the graph view ---- */
-[role="menu"] { background: var(--bar); box-shadow: 0 10px 28px var(--shadow); }
-[role="menu"] .ctx-item {
+#ctx, #ctx-outline { background: var(--bar); box-shadow: 0 10px 28px var(--shadow); }
+#ctx .ctx-item, #ctx-outline .ctx-item {
   position: relative;
   z-index: 1;
   background: transparent;
@@ -345,11 +347,14 @@ section.pane > * { position: relative; z-index: 1; }
   color: var(--text);
   box-shadow: none;
 }
-[role="menu"] .ctx-item:hover, [role="menu"] .ctx-item:focus-visible {
+#ctx .ctx-item:hover, #ctx .ctx-item:focus-visible,
+#ctx-outline .ctx-item:hover, #ctx-outline .ctx-item:focus-visible {
   background: color-mix(in srgb, var(--c-action) 16%, var(--bar));
   color: var(--text);
   box-shadow: none;
+  outline: none;
 }
+#ctx-footer, #ctx-outline-footer { position: relative; z-index: 1; border-top-color: var(--border); }
 #graph .graph-panel { background: var(--bar); }
 #graph .graph-panel > * { position: relative; z-index: 1; }
 #graph .graph-title {
