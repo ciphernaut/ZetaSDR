@@ -321,3 +321,19 @@ From the operator, 2026-11-03, after UAT 19.1.A was done by hand. Two tools want
 - **A VNA-style sweep over a TX/RX port pair.** For a device with a TX port (the B210, the HackRF), sweep a tone across a band from TX into the device's own RX (through the antenna under test and a coupler or a reflection bridge, or TX to a second RX port through the cable) and plot return loss / insertion loss against frequency: antenna resonance and bandwidth, cable loss, filter shape. Needs a TX path the node does not have yet (`tx: false` in every capability record): a `tx_tone` stage and a `sweep` job that steps both tuners together, a TX-safe gate (power limits, a band list the operator allows transmitting on, a dead-man that stops TX when the job ends or the node exits), and a `calibration` result stored with the source (through, open, short, load references when the operator has them). Report in dB against frequency on the page (its own tab, per "panes earn a tab"), and as a `sweep` event stream for the agent.
 
 Both are the operator's tools, run on their word (an `allow`-class gate for TX). Specs are to be scheduled; the measured facts from the 19.1.A run (the ring holds just under 10 s, a pin moves the radio where an ensure does not, the 5 % edge mask hides a signal 1 MHz from a 2 MHz capture's centre) go in the first one.
+
+## Watch: the identify dwell misses a marginal sonde the detector now sees
+
+Seen on the B210 2026-11-03 14:10 AEST during UAT 19.1.D: the watch's detector raised RS41 `X1342539` at
+401.5001 MHz (5 kHz, 4800 Bd, 15 dB, 130 km away at 15.8 km up) as `new`, so plan 17's miss is fixed, but
+its identify ended `unknown` and, with `on_unknown: capture`, spent the run's 32 captures on a signal a
+decoder row proves. An `rs41_decode` started by hand on the measured centre got 3 frames in the first 10 s and
+none in the next 20: at that strength a frame comes only now and then, so the row's 5 s `identify.dwell_ms`
+sees none. Also, the hand decoder took the signal out of the watch's list (a job on its band), so the watch
+never re-tried it. Options, to spec: (1) a dwell that grows with the retry (`tries`): 5 s, then 15, then 30;
+(2) when layer 1 reads a sonde-shaped signal (4800 Bd, 4-6 kHz, in 400.05-406 MHz) run the sonde rows for a
+longer dwell before the capture, since the capture is what an `unknown` costs; (3) classify the captured
+windows with the program rows too (they are `skipped_span` today at 46 ms, but a sonde's 640 ms windows
+hold frames). Beside it, `capture classify` on a 46 ms window of the 404.025 MHz telemetry link ranks three
+catalogue radiosonde names at 0.7 above the layer-1 `unknown` 0.5 on the frequency range alone: cap a
+range-only catalogue match under the layer-1 label, or say "range only" in its evidence.
