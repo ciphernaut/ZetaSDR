@@ -73,6 +73,26 @@ pub const BUILTIN: &[(&str, &[u8])] = &[
         "plain/theme.json",
         include_bytes!("../../../../themes/plain/theme.json"),
     ),
+    (
+        "terminal/FONTS.md",
+        include_bytes!("../../../../themes/terminal/FONTS.md"),
+    ),
+    (
+        "terminal/JetBrainsMono-VF.ttf",
+        include_bytes!("../../../../themes/terminal/JetBrainsMono-VF.ttf"),
+    ),
+    (
+        "terminal/OFL-JetBrainsMono.txt",
+        include_bytes!("../../../../themes/terminal/OFL-JetBrainsMono.txt"),
+    ),
+    (
+        "terminal/style.css",
+        include_bytes!("../../../../themes/terminal/style.css"),
+    ),
+    (
+        "terminal/theme.json",
+        include_bytes!("../../../../themes/terminal/theme.json"),
+    ),
 ];
 
 /// `$XDG_CONFIG_HOME/zetasdr/themes`, else `$HOME/.config/zetasdr/themes`; `None` when

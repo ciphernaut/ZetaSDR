@@ -1,0 +1,345 @@
+/* The terminal theme: a text-mode screen. Black ground, phosphor green text, amber for
+   warnings, inverse video (green ground, black text) for what is selected or under the pointer
+   instead of coloured fills. Square corners everywhere; panes are boxes drawn with a single
+   line, their titles set into the top edge as `[ JOBS ]`; the bars are rows of text over a rule,
+   buttons read `[ label ]`. CRT scanlines over the whole screen and a slight glow on the text;
+   a block cursor in the command bar (the native caret drawn as a block where the browser can,
+   and a blinking block after the prompt while the line waits). One monospace face, JetBrains
+   Mono, and no uppercase beyond the pane titles. The node wraps this file in
+   [data-theme="terminal"] { ... }: `X` is `[data-theme="terminal"] X`, `&[...]` adds to <html>
+   (`html&[...]` keeps the type selector's weight). */
+
+/* The waiting cursor's blink: on, then off, no fade. */
+@keyframes blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+/* ---- square corners everywhere (the :not(#id) lifts this over the core's one-id rules) ---- */
+*:not(#zeta-square), *:not(#zeta-square)::before, *:not(#zeta-square)::after { border-radius: 0; }
+
+/* ---- ground, type, glow and the scanlines ---- */
+& body {
+  background: var(--bg);
+  font-family: var(--font-ui);
+  text-shadow: 0 0 3px rgba(77, 255, 106, 0.45);
+}
+/* CRT scanlines: a fixed, click-through layer of dark lines over the whole screen. */
+& body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+  background: repeating-linear-gradient(to bottom, rgba(0, 0, 0, 0.22) 0 1px, transparent 1px 3px);
+}
+::selection { background: var(--text); color: #000; text-shadow: none; }
+
+/* ---- buttons: text in brackets, no box; inverse video under the pointer or pressed ---- */
+button {
+  background: none;
+  border: 0;
+  color: var(--c-action);
+  padding: 0 2px;
+}
+#top button:not(.src-tab, .pane-tab)::before, #bar button::before, .job .actions button::before,
+#band button::before, .line button.action::before, #graph button::before,
+#login-form button::before, #explore button::before { content: "["; }
+#top button:not(.src-tab, .pane-tab)::after, #bar button::after, .job .actions button::after,
+#band button::after, .line button.action::after, #graph button::after,
+#login-form button::after, #explore button::after { content: "]"; }
+button:hover:not(:disabled), button:focus-visible,
+#listen-all[aria-pressed="true"], #map-toggle[aria-pressed="true"],
+.job button.play[aria-pressed="true"] {
+  background: var(--text);
+  color: #000;
+  text-shadow: none;
+  outline: none;
+}
+input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  caret-color: var(--text);
+}
+input:focus { border-color: var(--text); }
+
+/* ---- the top bar: one row of text over a single rule ---- */
+#top {
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  gap: 10px;
+  padding: 0 8px;
+}
+.brand { color: var(--ok); font-weight: 700; letter-spacing: 0; }
+.brand::before { content: "# "; color: var(--dim); }
+#tabs, #panes { gap: 0; }
+.src-tab, .pane-tab {
+  align-self: center;
+  border: 0;
+  background: none;
+  color: var(--dim);
+  padding: 0 1ch;
+  line-height: 1.5;
+}
+.src-tab .name { color: var(--text); }
+.src-tab .range, .src-tab .centre { opacity: 1; }
+/* A row of names: only the selected source spells out its band (and its health). */
+&:not([data-footprint="narrow"]) .src-tab:not([aria-selected="true"]) .range { display: none; }
+/* The selected source and pane tab: inverse video, a row of black text on green. */
+.src-tab[aria-selected="true"], .pane-tab[aria-selected="true"] {
+  background: var(--text);
+  color: #000;
+  text-shadow: none;
+}
+.src-tab[aria-selected="true"] .name { color: #000; font-weight: 700; }
+.src-tab:hover:not([aria-selected="true"]) .name, .pane-tab:hover:not([aria-selected="true"]) { color: var(--ok); }
+.src-tab:hover:not([aria-selected="true"]), .pane-tab:hover:not([aria-selected="true"]) {
+  background: none; color: var(--ok); text-shadow: inherit;
+}
+.src-tab.fault .name { color: var(--error); }
+.src-tab .tag.pin { border: 1px solid var(--error); color: var(--error); }
+.src-tab[aria-selected="true"] .tag.pin { border-color: #000; color: #000; }
+.src-tab[aria-selected="true"] .health {
+  display: inline-flex;
+  gap: 1ch;
+  margin-inline-start: auto;
+  align-items: baseline;
+}
+.health .k { color: inherit; }
+.health .v { margin-inline-end: 1ch; font-weight: 700; }
+#listen-all, #map-toggle, #drawer-toggle { align-self: center; }
+
+/* ---- the command bar: a prompt and the line, a block cursor waiting after the prompt ---- */
+#bar {
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  gap: 1ch;
+  padding: 0 8px;
+}
+#bar .prompt { font-size: 0; color: var(--ok); white-space: nowrap; }
+#bar .prompt::before { content: "zeta>"; font-size: 13px; font-weight: 700; }
+#bar .prompt::after {
+  content: "";
+  display: none;
+  inline-size: 0.6em;
+  block-size: 1.15em;
+  margin-inline-start: 1ch;
+  vertical-align: text-bottom;
+  font-size: 13px;
+  background: var(--text);
+  box-shadow: 0 0 4px rgba(77, 255, 106, 0.6);
+}
+/* The line is empty and waits: the block sits after the prompt. Typing takes it over. */
+#bar:has(#cmd:placeholder-shown:not(:focus)) .prompt::after { display: inline-block; }
+#cmd {
+  border: 0;
+  background: none;
+  color: var(--user);
+  caret-color: var(--text);
+  padding-inline: 0;
+  font-size: 13px;
+}
+#cmd::placeholder { color: var(--dim); opacity: 1; }
+#cmd:focus { border: 0; }
+@supports (caret-shape: block) {
+  #cmd { caret-shape: block; }
+}
+#mic .dot { inline-size: 7px; block-size: 7px; background: var(--dim); }
+#mic.recording { color: var(--error); }
+#mic.recording .dot { background: var(--error); box-shadow: none; }
+#mic-status { color: var(--dim); }
+
+/* ---- the waterfall: the axis, the rail and its tags as rows of text ---- */
+#waterfall .wf-axis { color: var(--dim); border-inline-end: 1px solid var(--border); }
+#waterfall #rail {
+  border-inline-start: 0;
+  border-inline-end: 1px solid var(--border);
+  background: var(--bg);
+}
+.job-tag { background: var(--overlay-bg); }
+.job-tag[data-colour] { color: var(--job-c); }
+#waterfall #rail .job-tag {
+  inset-inline-start: 0; inset-inline-end: 1px;
+  padding-inline: 1ch 4px;
+  line-height: 18px;
+  font-size: 11px;
+  background: var(--bg);
+  border-radius: 0;
+}
+.job-tag .short, .job-tag .snippet { display: none; }
+.job-tag:has(.channel:not(:empty)) .kind { display: none; }
+.job-tag .channel:empty { display: none; }
+.job-tag .centre { color: var(--text); }
+.job-tag .dot { inline-size: 7px; block-size: 7px; margin-inline: 0.6ch; }
+.job-tag .dot.open { background: var(--ok); }
+.job-tag .dot.closed { background: var(--c-idle); }
+/* A closed squelch: the row dims, the job's colour kept as a one-character mark at its start. */
+.job-tag[data-colour]:has(.dot.closed) { color: var(--dim); box-shadow: inset 2px 0 0 var(--job-c); }
+.job-tag[data-colour]:has(.dot.closed) .centre { color: var(--dim); }
+/* Under the pointer: inverse video in the job's colour. */
+.job-tag[data-colour].hot, #waterfall #rail .job-tag[data-colour].hot {
+  background: var(--job-c);
+  color: #000;
+  text-shadow: none;
+  outline: none;
+}
+.job-tag[data-colour].hot .centre { color: #000; }
+/* Being heard: the brightest phosphor, boxed by a single line. */
+.job-tag[data-colour].speaking {
+  color: var(--c-speaking);
+  outline: 1px solid var(--c-speaking);
+  outline-offset: -1px;
+  text-shadow: 0 0 4px rgba(230, 255, 232, 0.7);
+}
+.job-tag[data-colour].speaking .centre { color: var(--c-speaking); }
+
+/* ---- outlines and ribbons on the waterfall ---- */
+#waterfall .outline[data-colour] {
+  border-top: 1px dashed var(--job-c);
+  border-bottom: 1px dashed var(--job-c);
+}
+#waterfall .outline[data-colour].hot { border-top-style: solid; border-bottom-style: solid; }
+#waterfall .outline[data-colour].speaking {
+  border-top: 1px solid var(--c-speaking);
+  border-bottom: 1px solid var(--c-speaking);
+}
+#waterfall .outline-label { color: var(--job-c, var(--text)); }
+#waterfall .ov-label, #waterfall .ov-ribbon { border: 1px solid var(--border); }
+#waterfall .ov-ribbon[data-colour] { border-color: var(--job-c); color: var(--user); }
+#waterfall .ov-ribbon.transcript-error { border-color: var(--error); color: var(--error); }
+#waterfall .ov-ribbon.agent { border-color: var(--text); color: var(--ok); }
+#waterfall .ov-span, #waterfall .ov-span > span { color: var(--error); border-color: var(--error); }
+#wf-badge { background: var(--bg); border-color: var(--error); color: var(--error); }
+#band { background: var(--bg); border-color: var(--border); opacity: 1; }
+
+/* ---- the side column: boxes drawn with a single line, the title set into the top edge ---- */
+#side {
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+  padding: 4px 6px 6px;
+  gap: 6px;
+}
+section.pane {
+  border: 1px solid var(--border);
+  margin-block-start: 9px;
+  background: var(--bg);
+}
+.pane h2 {
+  align-self: flex-start;
+  max-inline-size: calc(100% - 16px);
+  margin: -0.75em 0 0 8px;
+  border: 0;
+  font-size: 12px;
+  line-height: 1.3;
+}
+.pane-head {
+  inline-size: auto;
+  max-inline-size: 100%;
+  padding: 0 1ch;
+  background: var(--bg);
+  color: var(--ok);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.pane-head::before { content: "[\a0"; }
+.pane-head::after { content: "\a0]"; }
+.pane-head .count { margin-inline-start: 0; color: var(--text); font-weight: 400; }
+.pane-head:hover:not(:disabled), .pane-head:focus-visible {
+  background: var(--text);
+  color: #000;
+}
+.pane-head:hover:not(:disabled) .count, .pane-head:focus-visible .count { color: #000; }
+&:not([data-footprint="narrow"]) section.pane[data-collapsed] .pane-head { color: var(--dim); }
+&:not([data-footprint="narrow"]) section.pane[data-collapsed] .pane-head:is(:hover:not(:disabled), :focus-visible) { color: #000; }
+&:not([data-footprint="narrow"]) section.pane[data-collapsed] { padding-block-end: 4px; }
+/* Both folded: the column is two upright titles, so the box gives way to plain rows. */
+html&[data-side="none"]:not([data-footprint="narrow"]) section.pane { margin: 0; border: 0; }
+html&[data-side="none"]:not([data-footprint="narrow"]) .pane h2 { margin: 0; align-self: stretch; max-inline-size: none; }
+.line.assistant { color: var(--ok); }
+.line.note { color: var(--dim); }
+.line.user { color: var(--user); }
+.line.user::before { content: "> "; color: var(--dim); }
+#jobs { padding: 4px 1ch; }
+/* A job row: a row of text, its kind in the job's colour after a block mark. */
+#jobs .job { padding-block: 1px; column-gap: 1ch; }
+#jobs .job[data-colour] { border-inline-start: 0; padding-inline-start: 0; }
+#jobs .job[data-colour] > .kind { color: var(--job-c); font-weight: 700; }
+#jobs .job[data-colour] > .kind::before { content: "\25a0\a0"; color: var(--job-c); }
+#jobs .job.hot { outline: 0; background: var(--text); color: #000; text-shadow: none; }
+#jobs .job.hot > span, #jobs .job.hot > .kind, #jobs .job.hot > .kind::before,
+#jobs .job.hot .tag { color: #000; }
+#jobs .job.hot .actions button { color: #000; }
+#jobs .job[data-colour].speaking > .kind { color: var(--c-speaking); }
+#jobs .job.finished { color: var(--dim); opacity: 1; }
+#jobs .job[data-colour].finished > .kind, #jobs .job[data-colour].finished > .kind::before { color: var(--dim); }
+.job .state { color: var(--ok); }
+.job[data-state="failed"] .state, .job[data-state="failed"] .reason { color: var(--error); }
+.job .tag { border: 0; padding: 0; color: var(--dim); text-transform: none; letter-spacing: 0; }
+.job .tag::before { content: "["; }
+.job .tag::after { content: "]"; }
+.job .actions { gap: 0.5ch; }
+.job .actions button { padding: 0; }
+.job-group > summary { color: var(--dim); }
+
+/* ---- menus and the graph view: boxes, the entry under the pointer in inverse video ---- */
+[role="menu"] {
+  background: var(--bg);
+  border: 1px solid var(--text);
+  box-shadow: 0 0 0 1px var(--bg), 0 8px 18px var(--shadow);
+}
+[role="menu"] .ctx-item { border: 0; color: var(--text); }
+[role="menu"] .ctx-item:hover, [role="menu"] .ctx-item:focus-visible {
+  background: var(--text); color: #000; text-shadow: none;
+}
+#ctx-footer, #ctx-outline-footer { border-top: 1px solid var(--border); }
+#graph .graph-panel { background: var(--bg); border: 1px solid var(--text); }
+#graph .graph-title { color: var(--ok); }
+#graph .graph-canvas, #graph-params { border-color: var(--border); }
+#graph .graph-node rect { fill: var(--bg); stroke: var(--border); }
+#graph .graph-node[data-kind$="_demod"] rect { stroke: var(--text); }
+#graph .graph-node[data-kind$="_decode"] rect,
+#graph .graph-node[data-kind="transcribe"] rect { stroke: var(--c-channel-3); }
+#graph .graph-node:hover rect, #graph .graph-node:focus-visible rect { stroke: var(--ok); }
+#graph .graph-node.selected rect { stroke: var(--error); stroke-width: 2; }
+#graph .graph-edge line { stroke: var(--dim); }
+#graph .graph-arrowhead { fill: var(--dim); }
+#login h1 { color: var(--ok); }
+#login-form { background: var(--bg); border-color: var(--text); }
+
+/* ---- crowded rail tags (the core's 8 x 5 px .thin segments): a solid bar in the job's colour,
+   no text; half strength when its squelch is closed, the brightest phosphor while heard ---- */
+#waterfall #rail .job-tag.thin {
+  inset-inline-start: auto; inset-inline-end: 1px;
+  border: 0; border-radius: 0; outline: 0; box-shadow: none; background: var(--job-c);
+}
+#waterfall #rail .job-tag.thin:has(.dot.closed) {
+  background: color-mix(in srgb, var(--job-c) 50%, transparent);
+}
+#waterfall #rail .job-tag.thin.speaking { background: var(--c-speaking); }
+
+/* ---- narrow: the rail is 14 px of thin segments; a tapped one floats out as its label ---- */
+html&[data-footprint="narrow"] { --rail-w: 14px; }
+html&[data-footprint="narrow"] #waterfall #rail { overflow: visible; z-index: 6; }
+html&[data-footprint="narrow"] #waterfall #rail .job-tag {
+  inset-inline-start: 0; inset-inline-end: 0; width: auto;
+  height: var(--rail-thin-px); padding: 0; font-size: 0; line-height: 0;
+  border: 0; outline: 0; box-shadow: none; background: var(--job-c); touch-action: none;
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag > * { display: none; }
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded {
+  inset-inline-start: var(--rail-w); inset-inline-end: auto; width: max-content; height: auto;
+  z-index: 6; padding-inline: 1ch; font-size: 12px; line-height: 20px;
+  background: var(--bg); border: 1px solid var(--job-c);
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .channel:not(:empty),
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded:not(:has(.channel:not(:empty))) > .kind,
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .centre {
+  display: inline;
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .dot { display: inline-block; }
+
+/* ---- motion: only for a reader who has not asked for less ---- */
+@media (prefers-reduced-motion: no-preference) {
+  #bar .prompt::after { animation: blink 1060ms steps(1, end) infinite; }
+}

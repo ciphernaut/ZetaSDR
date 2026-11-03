@@ -36,7 +36,7 @@ fn theme_dir(root: &Path, id: &str, json: serde_json::Value, files: &[(&str, &[u
 fn builtins_load_ready() {
     let reg = ThemeRegistry::load(None);
     let ids: Vec<&str> = reg.all().iter().map(|t| t.id.as_str()).collect();
-    assert_eq!(ids, ["console", "cyberpunk", "plain"]);
+    assert_eq!(ids, ["console", "cyberpunk", "plain", "terminal"]);
     for t in reg.all() {
         assert_eq!(t.state, ThemeState::Ready, "{}: {:?}", t.id, t.reason);
         assert!(t.builtin, "{}", t.id);
@@ -329,7 +329,7 @@ async fn themes_list_answers_every_theme() {
             .find(|t| t.id == id)
             .unwrap_or_else(|| panic!("{id}"))
     };
-    for id in ["console", "cyberpunk", "plain"] {
+    for id in ["console", "cyberpunk", "plain", "terminal"] {
         let t = row(id);
         assert_eq!(t.state, ThemeState::Ready);
         assert!(t.builtin && !t.replaces_builtin && t.reason.is_none());
@@ -397,7 +397,7 @@ fn docs_list_every_token() {
 }
 
 /// The built-in themes held to WCAG AA by `builtin_themes_meet_aa`.
-const AA_THEMES: &[&str] = &["console", "plain", "cyberpunk"];
+const AA_THEMES: &[&str] = &["console", "plain", "cyberpunk", "terminal"];
 
 /// WCAG 2 relative luminance of a `#rrggbb` colour.
 fn luminance(hex: &str) -> f64 {

@@ -1134,7 +1134,7 @@ def scenario_theme_switch(page, url, secret):
     assert '"theme":"plain"' in stored, stored
     run_cmd(page, "view set theme neon")
     neon = view_line(page, "neon", error=True)
-    for theme in ("console", "plain", "fixture_theme"):
+    for theme in ("console", "plain", "terminal", "fixture_theme"):
         expect(neon).to_contain_text(theme)
     run_cmd(page, "view reset")
     expect(page.locator("html")).to_have_attribute("data-theme", "console")
@@ -1263,7 +1263,7 @@ def scenario_theme_shots(page, url, secret):
 
 
 # The built-in themes added in plan 26 (Tasks 8-11), each checked by scenario_new_themes.
-NEW_THEMES = ["cyberpunk"]
+NEW_THEMES = ["cyberpunk", "terminal"]
 
 # The motion a theme may start, provoked and read in one synchronous step (a jobs poll would
 # re-sync `.speaking` and cancel a hand-made glitch, and a short animation would finish while
