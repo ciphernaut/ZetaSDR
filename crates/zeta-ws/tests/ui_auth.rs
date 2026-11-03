@@ -55,6 +55,91 @@ async fn iq_stream(ts: &TestServer) -> StreamId {
 }
 
 #[tokio::test]
+async fn theme_files_are_served_without_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let client = no_redirect();
+
+    let resp = client
+        .get(format!("{}/ui/themes/console/style.css", ts.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[CONTENT_TYPE], "text/css; charset=utf-8");
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("[data-theme=\"console\"]")
+    );
+
+    let resp = client
+        .get(format!("{}/ui/themes/console/theme.json", ts.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["id"], "console", "{v}");
+    ts.stop().await;
+}
+
+/// Sends the request line as written: reqwest would fold `..` away before sending.
+async fn raw_get(url: &str, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = url.trim_start_matches("http://");
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    out
+}
+
+#[tokio::test]
+async fn theme_files_do_not_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    for path in [
+        "/ui/themes/console/../../index.html",
+        "/ui/themes/console/%2e%2e/plain/theme.json",
+        "/ui/themes/console/..%2fplain%2ftheme.json",
+        "/ui/themes/nope/theme.json",
+        "/ui/themes/console/nope.css",
+    ] {
+        let out = raw_get(&ts.url, path).await;
+        let status = out.lines().next().unwrap_or_default();
+        assert!(status.contains("404"), "{path}: {status}");
+        assert!(!out.contains("ZetaSDR"), "{path} leaked the index");
+    }
+    ts.stop().await;
+}
+
+#[tokio::test]
+async fn theme_files_carry_the_csp() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let client = no_redirect();
+    let resp = client
+        .get(format!("{}/ui/themes/console/style.css", ts.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()[CACHE_CONTROL], "no-cache");
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    let csp = resp.headers()["content-security-policy"].clone();
+    assert!(
+        csp.to_str()
+            .unwrap()
+            .contains("default-src 'self'; script-src")
+    );
+    let ui = client.get(format!("{}/ui/", ts.url)).send().await.unwrap();
+    assert_eq!(ui.headers()["content-security-policy"], csp);
+    ts.stop().await;
+}
+
+#[tokio::test]
 async fn ui_index_is_served_without_auth() {
     let dir = tempfile::tempdir().unwrap();
     let ts = spawn(dir.path()).await;
