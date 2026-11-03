@@ -128,15 +128,15 @@ Needs: the `bits` stream kind and the layer-4 demod/slicer stages above (prerequ
 
 Scope estimate: the stage set about 1500-2500 lines in `zeta-dsp` with fixtures (synthesised FSK/PSK/OOK at known rates); `bit_view` heuristics 400-600; signature write-back 200-300; the `measure` upgrades 300-500. Two or three plans.
 
-## UI: Okudagram (LCARS) restyle
+## UI: console restyle
 
-From the operator, 2026-10-27. Restyle the web page in the LCARS / Okudagram idiom: rounded elbow frames, horizontal bar segments with end caps, the signature palette (orange, peach, lilac, blue, pale yellow on black), condensed uppercase labels with right-aligned numerals, blocks of pseudo-random numeric readouts as status fillers.
+From the operator, 2026-10-27; designed as plan 24 (`docs/superpowers/specs/2026-11-03-console-theme-design.md`), which supersedes the shape below. Restyle the web page in the idiom of the 1990s science-fiction bridge consoles, as homage and nothing that is the franchise's by name or mark (the software will be open source): rounded elbow frames, horizontal bar segments with end caps, a warm palette of our own values (orange, peach, lilac, blue, pale yellow on black), condensed uppercase labels with right-aligned numerals; every readout live, no decorative fillers.
 
 Today: `crates/zeta-ui/web/style.css` (391 lines, CSS variables from `:root`, dark `#0b0e14` background), 12 JS files, about 6200 lines. Layout lives partly in JS (overlays, waterfall, graph canvas), so a restyle is not CSS-only.
 
 Shape:
-- A theme layer: all colours and radii through `:root` variables, an `lcars` theme switching them (keep the current theme as `plain`). `view set theme lcars|plain`, persisted like the other view policies.
-- Frame: an elbow-and-sidebar chrome around the waterfall, job rows as LCARS bar buttons (kind, channel tag, squelch state as colour), transport/ops pane as a numeric readout column.
+- A theme layer: all colours and radii through `:root` variables, a `console` theme switching them (keep the current theme as `plain`). `view set theme console|plain`, persisted like the other view policies.
+- Frame: an elbow-and-sidebar chrome around the waterfall, job rows as end-capped bar buttons (kind, channel tag, squelch state as colour), transport/ops pane as a numeric readout column.
 - Canvas-drawn parts (axis ticks, channel outlines, graph nodes) read the theme variables rather than hard-coded colours.
 - Font: a condensed sans with tabular numerals (Antonio or Swiss 911 lookalike; free options exist). No external CDN; bundle it in the UI assets.
 - Keep the UI e2e suite green: scenarios select by id/role, not by colour or layout, so a restyle should not touch them; check the budget (the suite already runs near its 237 s deadline).

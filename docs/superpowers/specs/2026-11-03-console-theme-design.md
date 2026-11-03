@@ -3,7 +3,7 @@
 Design spec, 2026-11-03. The operator brainstormed this with three rounds of mockups
 (`.superpowers/brainstorm/*/content/layout*.html`, kept locally, not committed); answers marked
 "operator" are theirs, the rest are the author's calls, listed in section 10. It answers the
-`TODO.md` entries "UI: Okudagram (LCARS) restyle", "UI: staircase transcript ribbons on the
+`TODO.md` entries "UI: console restyle" (the 2026-10-27 gist, renamed by this plan), "UI: staircase transcript ribbons on the
 waterfall" and "UI: the job panel hides the id behind a horizontal scroll"; "UI: the page watches at
 most 4 jobs, so a tag loses its squelch dot" is untouched (see non-goals). UI only: no node change, no
 new op.
@@ -14,7 +14,8 @@ The page grew up as a developer's console: a monospace dark theme from a mockup,
 long line scrolling sideways, job tags stacked on the waterfall's outlines, transcript ribbons pushed
 down lane by lane until nothing reads. The operator wants the spectrum to be the thing the eye lands
 on, inside a frame that is "familiar yet futuristic": an homage to the bridge displays of the
-Next-Generation-era Star Trek series, in the idiom its designer Michael Okuda gave them (rounded elbow
+1990s science-fiction television series the operator grew up with, in the idiom its production designer
+gave them (rounded elbow
 frames, bar segments with end caps, a warm palette on black, condensed uppercase labels, right-aligned
 numerals), without anything that is the franchise's by name or mark, because this software will be
 open source.
@@ -66,8 +67,10 @@ the RF, tilted so a burst of lines reads as a staircase rather than a pile.
 
 ### Anti-goals
 
-- Anything that is the franchise's: the words "LCARS", "Starfleet", "Okudagram" or any ship, series or
-  character name in code, docs, settings, the page or the theme id; the delta insignia; stardates;
+- Anything that is the franchise's: the name of its computer interface, its fleet, its designer's
+  eponym for the panels, or any ship, series or character name, in code, docs, settings, the page or
+  the theme id (the operator keeps the word list outside the repository; a redaction pass before
+  publishing checks for it); the delta insignia; stardates;
   verbatim screen layouts copied from frames; the fan wikis' exact palette codes; the show's
   typeface or a clone sold as one. The theme id is `console`.
 - Decorative numbers. If a readout cannot be fed from a value the page has, it is not drawn.
@@ -422,7 +425,8 @@ Deployed as `plan24-zeta` beside the running node, then main. The operator says 
 
 ## 7. Tidying `TODO.md`
 
-Remove "UI: Okudagram (LCARS) restyle" and "UI: the job panel hides the id behind a horizontal scroll"
+Rename the 2026-10-27 restyle gist to "UI: console restyle" in the plan's first commit (its body
+loses the franchise words too), then remove it and "UI: the job panel hides the id behind a horizontal scroll"
 when shipped (evidence: the scenarios above). Rewrite "UI: staircase transcript ribbons on the
 waterfall" to what remains after 4.5 (a lane budget from pixel height per footprint, the staircase
 sharing lanes with keyed rows). Add gists: `view set dir`, `view set time_flow` (section 4.9); the theme
