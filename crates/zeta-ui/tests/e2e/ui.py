@@ -165,10 +165,20 @@ def scenario_narrow_hides_pane(page, url, secret):
     expect(page.locator("#drawer-toggle")).to_be_visible()
     page.click("#drawer-toggle")
     expect(page.locator("#side")).to_be_visible()
+    # The drawer shows both panes, so their header bars are inert and read expanded.
+    for name in ("transcript", "jobs"):
+        head = page.locator(f"#side .pane.{name} .pane-head")
+        expect(head).to_be_disabled()
+        expect(head).to_have_attribute("aria-expanded", "true")
+        expect(head).to_have_attribute("aria-controls", f"pane-{name}")
+        expect(page.locator(f"section#pane-{name}.pane.{name}")).to_have_count(1)
     # Widening re-evaluates the footprint.
     page.set_viewport_size(WIDE)
+    # (a function predicate polls without a string eval, which the page's CSP refuses)
+    page.wait_for_function("() => document.documentElement.dataset.footprint === 'wide'")
     page.wait_for_function("document.documentElement.dataset.footprint == 'wide'")
     expect(page.locator("#drawer-toggle")).to_be_hidden()
+    expect(page.locator("#side .pane.jobs .pane-head")).to_be_enabled()
 
 
 def scenario_401_after_login_returns_to_login(page, url, secret):
@@ -1126,6 +1136,18 @@ def scenario_theme_switch(page, url, secret):
     expect(view_line(page, "neon", error=True)).to_contain_text("console, plain")
     run_cmd(page, "view reset")
     expect(page.locator("html")).to_have_attribute("data-theme", "console")
+    # The mic ends the command bar with the elbow's cap; a finished row reads in the theme's text.
+    radii = page.evaluate("(() => { const s = getComputedStyle(document.getElementById('mic'));"
+                          " return [s.borderStartStartRadius, s.borderEndEndRadius]; })()")
+    assert radii == ["14px", "22px"], radii
+    colours = page.evaluate("(() => { const r = document.createElement('div');"
+                            " r.className = 'job finished'; r.dataset.colour = '1';"
+                            " document.getElementById('jobs').append(r);"
+                            " const c = getComputedStyle(r).color; r.remove();"
+                            " const t = document.createElement('span'); t.style.color = 'var(--text)';"
+                            " document.body.append(t); const want = getComputedStyle(t).color;"
+                            " t.remove(); return [c, want]; })()")
+    assert colours[0] == colours[1], colours
     # Live jobs' tags move between the rail (console) and their outlines (plain), the squelch
     # dot with them, none left behind.
     job = start_job(url, secret, "passthrough", "tone", 100_000_000, 10_000)
@@ -1911,6 +1933,10 @@ def scenario_rail_collapses_crowd(page, url, secret):
         tags = page.locator("#rail .job-tag")
         expect(tags).to_have_count(6)
         expect(page.locator("#rail .job-tag.thin")).to_have_count(5)
+        for t in page.locator("#rail .job-tag.thin").all():  # named: channel or kind, centre
+            title = t.get_attribute("title")
+            assert title and title == t.get_attribute("aria-label"), (title, t.get_attribute("aria-label"))
+            assert re.fullmatch(r"\S+ 476\.\d{3}", title), title
         full = page.locator("#rail .job-tag:not(.thin)")
         expect(full).to_have_count(1)
         boxes = [t.bounding_box() for t in tags.all()]
@@ -2001,8 +2027,10 @@ def scenario_job_rows_fold_idle_plan_channels(page, url, secret):
 def scenario_job_rows_fold_only_on_evidence(page, url, secret):
     # The page watches at most 4 jobs (overlays.js MAX_WATCHED): an unwatched demodulator's
     # squelch and events are unknown, so it folds only while a mix covering its source says it
-    # is not speaking. Fifteen fm_demod on cb's three plan channels (five widths each): the
-    # tone holds ch20 open, its guard keeps ch59 and ch60 closed.
+    # has not heard it for the idle age. Eighteen fm_demod on cb's three plan channels (six
+    # widths each): the tone holds ch20 open, its guard keeps ch59 and ch60 closed. The four
+    # newest are watched (three of them on ch59/ch60), so nine quiet rows are unwatched: more
+    # than JOBS_FOLD_MIN (8) on the mix's evidence alone.
     stop_mixes(url, secret)
     select_source(page, url, secret, "cb")
     plans = http_json(url, secret, "/op", {"op": "channel_plans"})["value"]["plans"]
@@ -2012,7 +2040,7 @@ def scenario_job_rows_fold_only_on_evidence(page, url, secret):
     ch20 = next(ch["center_hz"] for ch in inside if ch["number"] == 20)
     jobs = []
     try:
-        for i in range(15):
+        for i in range(18):
             ch = inside[i % 3]
             jobs.append((start_job(url, secret, "fm_demod", "cb", ch["center_hz"],
                                    5_000 + 1_000 * (i // 3), deviation_hz=2500),
@@ -2022,7 +2050,7 @@ def scenario_job_rows_fold_only_on_evidence(page, url, secret):
         for _ in range(3):  # the watched ones' squelch states arrive
             page.evaluate("window.zetaTest.poll()")
             page.wait_for_timeout(700)
-        # No mix: the eleven unwatched rows stay out, the watched closed ones are too few.
+        # No mix: the fourteen unwatched rows stay out, the watched closed ones are too few.
         expect(group).to_have_count(0)
         for j, _ in jobs:
             expect(page.locator(f'#jobs > .job[data-id="{j}"]')).to_have_count(1)
@@ -2032,7 +2060,24 @@ def scenario_job_rows_fold_only_on_evidence(page, url, secret):
         for j in talking:
             expect(page.locator(f'#jobs .job[data-id="{j}"].speaking')).to_have_count(
                 1, timeout=8_000)
-        page.evaluate("window.zetaTest.poll()")
+        # The mix's silence is evidence only once it has lasted the idle age: under a 60 s
+        # age nothing folds right after the mix starts (the jobs are seconds old).
+        page.evaluate("window.zetaTest.foldIdle(60000)")
+        for _ in range(3):
+            page.evaluate("window.zetaTest.poll()")
+            page.wait_for_timeout(500)
+            assert group.count() == 0, "folded on the mix's evidence with no idle age"
+        page.evaluate("window.zetaTest.foldIdle(0)")
+
+        # A watched row's squelch may take a poll to be re-seeded: poll until the group shows.
+        def grouped():
+            page.evaluate("window.zetaTest.poll()")
+            if group.count() == 1:
+                return True
+            page.wait_for_timeout(500)
+            return False
+
+        wait_until(grouped, 10.0, "the quiet rows fold under the mix")
         expect(group).to_have_count(1)
         for j in talking:
             expect(group.locator(f'.job[data-id="{j}"]')).to_have_count(0)
@@ -2386,6 +2431,24 @@ def scenario_narrow_long_press_opens_the_outline_menu(page, url, secret):
         expect(page.locator("#ctx-outline")).to_be_visible()
         page.keyboard.press("Escape")
         expect(page.locator("#ctx-outline")).to_be_hidden()
+        # A tapped segment reads as the console tag does: the channel or the kind, the squelch
+        # dot (one is put in here: this job has no squelch) and the centre, nothing else,
+        # floated one rail width in.
+        tag = page.locator(f'#rail .job-tag[data-job="{job}"]')
+        page.evaluate("t => { t.classList.add('expanded');"
+                      " const d = document.createElement('span'); d.className = 'dot closed';"
+                      " t.prepend(d); }", tag.element_handle())
+        expect(tag.locator(".short")).to_be_hidden()
+        expect(tag.locator(".centre")).to_be_visible()
+        named = page.evaluate("t => ['kind', 'channel'].filter(c =>"
+                              " getComputedStyle(t.querySelector('.' + c)).display !== 'none')"
+                              ".length", tag.element_handle())
+        assert named == 1, f"{named} of kind and channel shown"
+        dot = tag.locator(".dot").bounding_box()
+        assert dot and dot["width"] >= 6 and dot["height"] >= 6, dot
+        rail_x = page.locator("#rail").bounding_box()["x"]
+        rail_w = page.evaluate("document.getElementById('rail').getBoundingClientRect().width")
+        assert abs(tag.bounding_box()["x"] - rail_x - rail_w) < 1.5, (tag.bounding_box(), rail_x, rail_w)
     finally:
         stop_job(url, secret, job)
 

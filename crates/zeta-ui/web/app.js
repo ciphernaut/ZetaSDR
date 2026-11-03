@@ -9,7 +9,8 @@
 // viewport width; `?footprint=wide|narrow` forces it. Re-evaluated on resize. In narrow the
 // side pane is a drawer opened by #drawer-toggle (<html data-drawer="open">).
 // Wide, each side pane's header bar (`.pane-head`) folds it (view policy `side`, applySide);
-// both folded narrow the column to --side-collapsed-w. The Jobs header carries the running
+// both folded narrow the column to --side-collapsed-w. Narrow, the bars are disabled and
+// read expanded (the drawer shows both panes). The Jobs header carries the running
 // count (`.count`, set by agent.js startJobs).
 //
 // Source tabs come from `source_list` (id and tuning range; in narrow, id and a compact
@@ -198,6 +199,7 @@ function applyFootprint() {
     root.dataset.footprint = fp;
     delete root.dataset.drawer;
     applyPanes();
+    applySide();
   }
 }
 
@@ -955,16 +957,23 @@ function sideOpen(value) {
   return SIDE_PANES.includes(value) ? [value] : [];
 }
 
+// Narrow, the drawer shows both panes whatever `side` says, so the header bars are inert:
+// disabled (out of the tab order, no Enter), each announced expanded. Applied again on a
+// footprint change (applyFootprint).
 function applySide() {
   const value = state.view ? state.view.get("side") : "both";
   const open = sideOpen(value);
+  const narrow = footprint() === "narrow";
   for (const name of SIDE_PANES) {
     const section = document.querySelector(`#side .pane.${name}`);
     if (!section) continue;
     const on = open.includes(name);
     if (on) delete section.dataset.collapsed;
     else section.dataset.collapsed = "";
-    section.querySelector(".pane-head")?.setAttribute("aria-expanded", String(on));
+    const head = section.querySelector(".pane-head");
+    if (!head) continue;
+    head.disabled = narrow;
+    head.setAttribute("aria-expanded", String(narrow || on));
   }
   document.documentElement.dataset.side = value;
 }

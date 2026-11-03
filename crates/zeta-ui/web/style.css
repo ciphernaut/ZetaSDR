@@ -443,6 +443,7 @@ html:not([data-footprint="narrow"]) .pane.transcript[data-collapsed] + .pane.job
   flex: 1; max-height: none;
 }
 html[data-footprint="narrow"] .pane-head { pointer-events: none; cursor: default; }
+html[data-footprint="narrow"] .pane-head:disabled { opacity: 1; }   /* inert, not dimmed (app.js applySide) */
 /* Both folded: the column narrows to the two header bars, read downwards. */
 html[data-side="none"]:not([data-footprint="narrow"]) #app {
   grid-template-columns: minmax(0, 1fr) var(--side-collapsed-w);
@@ -801,10 +802,10 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   color: #000;
 }
 /* The last visible bar: Listen to all on wide (the map and drawer toggles are hidden there),
-   the drawer toggle on narrow. */
+   the drawer toggle on narrow. The command bar's mic takes its end cap with its own rule
+   below. */
 [data-theme="console"] #listen-all,
-[data-theme="console"][data-footprint="narrow"] #drawer-toggle,
-[data-theme="console"] #mic {
+[data-theme="console"][data-footprint="narrow"] #drawer-toggle {
   border-start-end-radius: var(--radius-elbow);
   border-end-end-radius: var(--radius-elbow);
 }
@@ -833,7 +834,10 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   background: var(--c-channel-5);
   color: #000;
   border: none;
-  border-radius: var(--radius-bar);
+  border-start-start-radius: var(--radius-bar);
+  border-end-start-radius: var(--radius-bar);
+  border-start-end-radius: var(--radius-elbow);   /* the command bar's end cap */
+  border-end-end-radius: var(--radius-elbow);
   text-transform: uppercase;   /* bar caption */
 }
 
@@ -877,10 +881,17 @@ html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag {
 }
 html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag > * { display: none; }
 html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.expanded {
-  inset-inline-start: 14px; inset-inline-end: auto; width: max-content; height: auto; z-index: 6;
+  inset-inline-start: var(--rail-w); inset-inline-end: auto; width: max-content; height: auto; z-index: 6;
   padding-inline: 6px; font-size: 12px; line-height: 20px; border-radius: var(--radius-bar);
 }
-html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.expanded > * { display: initial; }
+/* the label reads as the console tag does: the channel on a plan, else the kind, then the
+   squelch dot and the centre (never the short id or the snippet) */
+html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.expanded > .channel:not(:empty),
+html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.expanded:not(:has(.channel:not(:empty))) > .kind,
+html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.expanded > .centre {
+  display: inline;
+}
+html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.expanded > .dot { display: inline-block; }
 
 [data-theme="console"] .job-tag .short,
 [data-theme="console"] .job-tag .snippet { display: none; }
@@ -920,7 +931,7 @@ html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.ex
   border-start-end-radius: var(--radius-bar);
   border-end-end-radius: var(--radius-bar);
 }
-[data-theme="console"] section.pane[data-collapsed] .pane-head {
+[data-theme="console"]:not([data-footprint="narrow"]) section.pane[data-collapsed] .pane-head {
   background: var(--c-idle);
   color: var(--text);
 }
@@ -946,6 +957,6 @@ html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.ex
 }
 [data-theme="console"] #jobs .job[data-colour].hot { outline: 2px solid var(--text); outline-offset: -2px; }
 [data-theme="console"] #jobs .job[data-colour].finished {
-  background: var(--c-idle); color: #c8c8c8; opacity: 1;
+  background: var(--c-idle); color: var(--text); opacity: 1;
 }
 [data-theme="console"] .job-group > summary { color: var(--text); text-transform: uppercase; }

@@ -40,8 +40,11 @@
 //       overlaps the last full tag's (TAG_GAP_PX apart at least) gets class `thin`
 //       (RAIL_THIN_PX high, centred on its frequency, in the rail's end strip, text hidden by
 //       CSS), unless it is `hot` or `speaking`: then it stays full and the full tags it
-//       overlaps go thin instead. The first of a run of more than RAIL_GROUP_MIN thin tags is
-//       titled with the run's count. ov.setHot and ov.setSpeaking lay the rail out again.
+//       overlaps go thin instead. Every thin tag is named (title and aria-label: its channel
+//       on a plan, else its kind, and its centre); the first of a run of more than
+//       RAIL_GROUP_MIN thin tags has the run's count appended. ov.setHot and ov.setSpeaking
+//       lay the rail out again. A pass over many outlines (ov.layout, ov.sync,
+//       ov.syncOutlines) lays the tags out once at its end (ov.batchTags).
 //   Colour: channelColour(jobId) -> 1..6 (the sum of the id's char codes mod 6, plus 1) is
 //       the `data-colour` of the job's outline, tag and ribbons (an attached job's ribbons take
 //       its input's), and agent.js puts it on the job's row; style.css maps it to
@@ -98,9 +101,10 @@
 //           job's last squelch event (ov.squelch, forgotten when the job's graph changes)
 //           and the row's tag set from it at once (agent.js setSquelchTag; the 2 s
 //           re-render keeps it through agent.js); when such a job's watch starts, its
-//           `job_context` is asked once and its latched `squelch` event seeds that state
+//           `job_context` is asked and its latched `squelch` event seeds that state
 //           unless a live one came first (the gate changes rarely, so a late watch would
-//           otherwise miss it);
+//           otherwise miss it); while no gate is known it is asked again on each ov.sync,
+//           one request at a time (an event sent before the subscription was live is lost);
 //         - every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
@@ -345,6 +349,10 @@ class Overlays {
     this.subjects = subjects; // the row cache and the subjects (subjects.js)
     this.overCap = new Set(); // running job ids over MAX_WATCHED or MAX_POSITIONED
     this.destroyed = false;
+    // Above zero inside a pass over many outlines (ov.layout, ov.sync, ov.syncOutlines):
+    // layoutTags only marks the tags dirty, and the pass lays them out once at its end.
+    this.tagBatch = 0;
+    this.tagsDirty = false;
     this.rail = null; // the element the job tags live in (ov.setRail), null: their outlines
 
     this.layer = document.createElement("div");
@@ -380,55 +388,62 @@ class Overlays {
   }
 
   sync(jobs, source) {
-    if (this.destroyed) return;
-    this.syncOutlines(jobs, source);
-    const want = jobs.filter(
-      (j) =>
-        j.source === this.sourceId &&
-        j.kind !== "spectrum" &&
-        j.state &&
-        j.state.status === "running",
-    );
-    this.syncMarks(want);
-    for (const [id, graph] of [...this.noEventStream]) {
-      const j = want.find((x) => x.id === id);
-      if (!j || graphKey(j) !== graph) this.noEventStream.delete(id);
-    }
-    // Jobs known to have no event stream take no socket and so no place under the cap.
-    // Decoders first, then the SQUELCH_KINDS jobs (whose stream only tags their row), each
-    // newest first: a squelch tag never crowds a decoder's ribbons and counter out.
-    const squelchOnly = (j) => (SQUELCH_KINDS.includes(j.kind) ? 1 : 0);
-    const capped = want
-      .filter((j) => !this.noEventStream.has(j.id))
-      .sort((a, b) => squelchOnly(a) - squelchOnly(b) || (b.created_ns ?? 0) - (a.created_ns ?? 0))
-      .slice(0, MAX_WATCHED);
-    const ids = new Set(capped.map((j) => j.id));
-    for (const id of [...this.watched.keys()]) if (!ids.has(id)) this.unwatch(id);
-    for (const j of capped) {
-      const known = this.watched.get(j.id);
-      if (known) known.job = j;
-    }
-    this.lookup(jobs);
-    const fresh = capped.filter((j) => !this.watched.has(j.id) && this.rowKnown(j));
-    if (fresh.length > 0) this.resolve(fresh);
-    this.overCap = new Set(
-      want.filter((j) => !ids.has(j.id) && !this.noEventStream.has(j.id)).map((j) => j.id),
-    );
-    for (const j of want) {
-      // A `graph_put` restarted the job (perhaps with its squelch off): forget the old state.
-      const sq = this.squelches.get(j.id);
-      if (sq && sq.graph !== graphKey(j)) {
-        this.squelches.delete(j.id);
-        setSquelchTag(this.jobRowEl(j), null);
-        this.refreshTag(this.outlines.get(j.id));
+    this.batchTags(() => {
+      if (this.destroyed) return;
+      this.syncOutlines(jobs, source);
+      const want = jobs.filter(
+        (j) =>
+          j.source === this.sourceId &&
+          j.kind !== "spectrum" &&
+          j.state &&
+          j.state.status === "running",
+      );
+      this.syncMarks(want);
+      for (const [id, graph] of [...this.noEventStream]) {
+        const j = want.find((x) => x.id === id);
+        if (!j || graphKey(j) !== graph) this.noEventStream.delete(id);
       }
-      const over = !ids.has(j.id) && !this.noEventStream.has(j.id);
-      this.jobRow(j, over ? "—" : this.counters.get(j.id) || 0);
-    }
-    // agent.js re-rendered the rows: the hovered job's row is hot again.
-    if (this.hotJob) this.setHot(this.hotJob, true);
-    this.setSpeaking(this.speaking);
-    this.syncPositioned(jobs);
+      // Jobs known to have no event stream take no socket and so no place under the cap.
+      // Decoders first, then the SQUELCH_KINDS jobs (whose stream only tags their row), each
+      // newest first: a squelch tag never crowds a decoder's ribbons and counter out.
+      const squelchOnly = (j) => (SQUELCH_KINDS.includes(j.kind) ? 1 : 0);
+      const capped = want
+        .filter((j) => !this.noEventStream.has(j.id))
+        .sort((a, b) => squelchOnly(a) - squelchOnly(b) || (b.created_ns ?? 0) - (a.created_ns ?? 0))
+        .slice(0, MAX_WATCHED);
+      const ids = new Set(capped.map((j) => j.id));
+      for (const id of [...this.watched.keys()]) if (!ids.has(id)) this.unwatch(id);
+      for (const j of capped) {
+        const known = this.watched.get(j.id);
+        if (!known) continue;
+        known.job = j;
+        // The node sends a gate's `squelch` event on the first block and on each change only,
+        // so one that came between the context read and the subscription is lost for good: a
+        // watched squelch kind with no gate known asks its context again, once per poll.
+        if (SQUELCH_KINDS.includes(j.kind) && !this.squelches.has(j.id)) this.seedSquelch(known);
+      }
+      this.lookup(jobs);
+      const fresh = capped.filter((j) => !this.watched.has(j.id) && this.rowKnown(j));
+      if (fresh.length > 0) this.resolve(fresh);
+      this.overCap = new Set(
+        want.filter((j) => !ids.has(j.id) && !this.noEventStream.has(j.id)).map((j) => j.id),
+      );
+      for (const j of want) {
+        // A `graph_put` restarted the job (perhaps with its squelch off): forget the old state.
+        const sq = this.squelches.get(j.id);
+        if (sq && sq.graph !== graphKey(j)) {
+          this.squelches.delete(j.id);
+          setSquelchTag(this.jobRowEl(j), null);
+          this.refreshTag(this.outlines.get(j.id));
+        }
+        const over = !ids.has(j.id) && !this.noEventStream.has(j.id);
+        this.jobRow(j, over ? "—" : this.counters.get(j.id) || 0);
+      }
+      // agent.js re-rendered the rows: the hovered job's row is hot again.
+      if (this.hotJob) this.setHot(this.hotJob, true);
+      this.setSpeaking(this.speaking);
+      this.syncPositioned(jobs);
+    });
   }
 
   // Whether the job's mode row is settled (a row, or no row): no event before that.
@@ -510,29 +525,31 @@ class Overlays {
   // there is none. `source` is the selected source's `source_list` record; without one (or
   // another source's) the last one given is kept.
   syncOutlines(jobs, source) {
-    if (this.destroyed) return;
-    if (source !== undefined) this.sourceRec = source;
-    this.lastJobs = jobs;
-    const rec = this.sourceRec && this.sourceRec.id === this.sourceId ? this.sourceRec : null;
-    const pin = rec && rec.pin && typeof rec.pin.center_hz === "number" ? rec.pin : null;
-    const rigid = jobs.filter((j) => j.source === this.sourceId && isRunning(j) && rigidBand(j));
-    const keys = new Set(rigid.map((j) => j.id));
-    if (pin) keys.add(PIN_KEY);
-    for (const key of [...this.outlines.keys()]) {
-      if (key !== CAPTURE_KEY && !keys.has(key)) this.unoutline(key);
-    }
-    for (const j of rigid) {
-      const { center_hz: c, bandwidth_hz: bw } = j.tuning;
-      const ch = channelLabel(c, this.plan());
-      this.outline(c - bw / 2, c + bw / 2, ch ? `${ch.text} ${j.kind}` : j.kind, j.id, j);
-    }
-    if (pin) {
-      const { center_hz: c, bandwidth_hz: bw } = pin;
-      this.outline(c - bw / 2, c + bw / 2, "pin", PIN_KEY);
-    }
-    this.captureOutlined = rigid.length === 0 && !pin;
-    this.outlineCapture();
-    this.setSpeaking(this.speaking);
+    this.batchTags(() => {
+      if (this.destroyed) return;
+      if (source !== undefined) this.sourceRec = source;
+      this.lastJobs = jobs;
+      const rec = this.sourceRec && this.sourceRec.id === this.sourceId ? this.sourceRec : null;
+      const pin = rec && rec.pin && typeof rec.pin.center_hz === "number" ? rec.pin : null;
+      const rigid = jobs.filter((j) => j.source === this.sourceId && isRunning(j) && rigidBand(j));
+      const keys = new Set(rigid.map((j) => j.id));
+      if (pin) keys.add(PIN_KEY);
+      for (const key of [...this.outlines.keys()]) {
+        if (key !== CAPTURE_KEY && !keys.has(key)) this.unoutline(key);
+      }
+      for (const j of rigid) {
+        const { center_hz: c, bandwidth_hz: bw } = j.tuning;
+        const ch = channelLabel(c, this.plan());
+        this.outline(c - bw / 2, c + bw / 2, ch ? `${ch.text} ${j.kind}` : j.kind, j.id, j);
+      }
+      if (pin) {
+        const { center_hz: c, bandwidth_hz: bw } = pin;
+        this.outline(c - bw / 2, c + bw / 2, "pin", PIN_KEY);
+      }
+      this.captureOutlined = rigid.length === 0 && !pin;
+      this.outlineCapture();
+      this.setSpeaking(this.speaking);
+    });
   }
 
   // The capture's outline follows wf.band while no rigid holder is outlined.
@@ -587,13 +604,19 @@ class Overlays {
   // The gate the job's context latched (its last `squelch` event), asked once the
   // subscriptions are open: a job whose only event came before this watch is still tagged.
   // A live event seen meanwhile is newer and wins; a failed request leaves the live path.
+  // ov.sync asks again, once per poll and one request at a time (rec.seeding), while the
+  // gate is still unknown.
   async seedSquelch(rec) {
+    if (rec.seeding) return;
+    rec.seeding = true;
     const job = rec.job;
     let r = null;
     try {
       r = await this.api.op({ op: "job_context", job: job.id });
     } catch {
       return;
+    } finally {
+      rec.seeding = false;
     }
     const p = r && r.value && r.value.squelch;
     if (rec.closed || this.destroyed || this.watched.get(job.id) !== rec) return;
@@ -1242,16 +1265,37 @@ class Overlays {
       t.classList.remove("thin");
       t.hidden = false;
       t.removeAttribute("title");
+      t.removeAttribute("aria-label");
       t.style.top = "";
       (this.rail ?? o.el).append(t);
     }
     this.layoutTags();
   }
 
+  // Runs `fn` as one pass: every layoutTags it causes (one per outline placed or tag
+  // refreshed) is deferred and done once when the outermost pass ends, so a pass over 80
+  // outlines forces one rail reflow, not 80. A lone call outside a pass lays out at once.
+  batchTags(fn) {
+    this.tagBatch++;
+    try {
+      return fn();
+    } finally {
+      this.tagBatch--;
+      if (this.tagBatch === 0 && this.tagsDirty) {
+        this.tagsDirty = false;
+        this.layoutTags();
+      }
+    }
+  }
+
   // Tags at their outline's vertical centre. In the rail: see `The rail` above. On the
   // outlines: stacked, sorted by top, a tag under the previous one's bottom + TAG_GAP_PX is
   // pushed down (at most MAX_LANES in a row).
   layoutTags() {
+    if (this.tagBatch > 0) {
+      this.tagsDirty = true;
+      return;
+    }
     if (this.rail) {
       this.layoutRail();
       return;
@@ -1290,7 +1334,7 @@ class Overlays {
       const h = parseFloat(o.el.style.height) || 0;
       const off = o.el.hidden || !Number.isFinite(top) || top + h <= 0 || top >= height;
       t.hidden = off;
-      if (!off) items.push({ t, c: top + h / 2 });
+      if (!off) items.push({ o, t, c: top + h / 2 });
     }
     for (const it of items) it.th = it.t.offsetHeight; // full height: every `thin` is off
     items.sort((a, b) => a.c - b.c);
@@ -1307,14 +1351,28 @@ class Overlays {
       if (fulls.length && overlaps(fulls.at(-1), it)) it.thin = true;
       else fulls.push(it);
     }
-    let run = []; // consecutive thin tags: more than RAIL_GROUP_MIN titles the first
+    // A thin segment shows no text, so it is named: its channel (on a plan) or kind, and its
+    // centre, as title and aria-label.
+    const name = (x, text) => {
+      x.t.title = text;
+      x.t.setAttribute("aria-label", text);
+    };
+    const thinText = (x) => {
+      const p = x.o.parts;
+      return [p.channel.textContent || p.kind.textContent, p.centre.textContent]
+        .filter((s) => s)
+        .join(" ");
+    };
+    let run = []; // consecutive thin tags: more than RAIL_GROUP_MIN adds the count to the first
     const endRun = () => {
-      if (run.length > RAIL_GROUP_MIN) run[0].t.title = `${run.length} jobs`;
+      if (run.length > RAIL_GROUP_MIN) name(run[0], `${thinText(run[0])} (${run.length} jobs)`);
       run = [];
     };
     for (const x of items) {
       x.t.removeAttribute("title");
+      x.t.removeAttribute("aria-label");
       if (x.thin) {
+        name(x, thinText(x));
         x.t.classList.add("thin");
         x.t.style.top = `${clamp(x.c - RAIL_THIN_PX / 2, RAIL_THIN_PX)}px`;
         run.push(x);
@@ -1595,19 +1653,21 @@ class Overlays {
 
   // Re-places everything vertically (the band or the height changed).
   layout() {
-    this.layoutSpans();
-    this.outlineCapture();
-    for (const [key, o] of this.outlines) {
-      if (!this.drag || this.drag.key !== key) this.placeOutline(o);
-    }
-    this.placeGhost();
-    for (const r of this.ribbons) this.setLane(r, r.lane);
-    this.fallBack();
-    for (const m of this.marks.values()) m.el.style.top = `${this.yFor(m.hz)}px`;
-    for (const l of this.labels.values()) {
-      l.el.style.top = `${this.yFor(l.hz) - l.h / 2 + (l.dy || 0)}px`;
-    }
-    this.layoutTags();
+    this.batchTags(() => {
+      this.layoutSpans();
+      this.outlineCapture();
+      for (const [key, o] of this.outlines) {
+        if (!this.drag || this.drag.key !== key) this.placeOutline(o);
+      }
+      this.placeGhost();
+      for (const r of this.ribbons) this.setLane(r, r.lane);
+      this.fallBack();
+      for (const m of this.marks.values()) m.el.style.top = `${this.yFor(m.hz)}px`;
+      for (const l of this.labels.values()) {
+        l.el.style.top = `${this.yFor(l.hz) - l.h / 2 + (l.dy || 0)}px`;
+      }
+      this.layoutTags();
+    });
   }
 
   scroll(shift) {

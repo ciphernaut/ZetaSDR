@@ -93,9 +93,9 @@
 //       `<n> idle <kinds> on <plan>[, <m> <attached kind>]`; it is open unless the operator
 //       folded it (sessionStorage[JOB_FOLD_KEY + plan]). foldIdle(ms) changes the idle age.
 //       A job folds only on evidence (foldPlan): an unwatched squelch kind needs the watched
-//       mix (watchedMix(): its id) running and covering its source (activity(id): {watched,
-//       speaking, hot}, overlays.js); a `speaking` row never folds, nor a `hot` one unless the
-//       hot is its own row's hover.
+//       mix (watchedMix(): its id) running and covering its source, and that mix not to have
+//       heard it for JOBS_FOLD_IDLE_MS (activity(id): {watched, speaking, hot}, overlays.js);
+//       a `speaking` row never folds, nor a `hot` one unless the hot is its own row's hover.
 import { channelColour } from "./overlays.js";
 import { mixCovering } from "./mix.js";
 import { channelLabel } from "./plans.js";
@@ -672,6 +672,9 @@ export function startJobs(
   // id -> performance.now() when this page first saw the job running (its idle age starts
   // there when no event has been seen).
   const runningSince = new Map();
+  // id -> performance.now() when the watched mix last heard the job (`speaking`): the idle
+  // age of path (c) below starts there.
+  const lastSpeaking = new Map();
   const groupEls = new Map(); // plan -> its kept details.job-group
   // The job whose own row the pointer is on (set here from the row's pointerenter/leave): its
   // `hot` comes from the list itself and does not keep it out of a group.
@@ -742,7 +745,8 @@ export function startJobs(
   //     watches at most 4 jobs"), its squelch known closed and no event for foldIdleMs;
   // (c) it is an unwatched squelch kind (its squelch and events unknown) on a source the
   //     mix the page watches (watchedMix(), mix.js MixWatch: the one `speaking` comes from)
-  //     covers, and that mix does not hear it (not `speaking`); another mix is no evidence.
+  //     covers, and that mix has not heard it (`speaking`) for foldIdleMs (lastSpeaking);
+  //     another mix is no evidence.
   // Never a `speaking` row, nor a `hot` one when the hot comes from outside the list (a rail
   // tag, an outline): a row hovered inside its group stays there (rowHot). An unwatched
   // squelch kind with no watched covering mix never folds. Every way out of a group (the job
@@ -757,7 +761,9 @@ export function startJobs(
     if (SQUELCH_KINDS.includes(j.kind) && !seen.watched) {
       const id = watchedMix ? watchedMix() : null;
       const mix = id ? jobs.filter((m) => m.id === id) : [];
-      return mixCovering(j, mix) ? ch.plan : null;
+      if (!mixCovering(j, mix)) return null;
+      const since = Math.max(runningSince.get(j.id) ?? now, lastSpeaking.get(j.id) ?? -Infinity);
+      return now - since >= foldIdleMs ? ch.plan : null;
     }
     if (SQUELCH_KINDS.includes(j.kind)) {
       const sq = squelch ? squelch(j.id) : null;
@@ -773,9 +779,15 @@ export function startJobs(
     const now = performance.now();
     const ids = new Set(shown.map((j) => j.id));
     for (const id of runningSince.keys()) if (!ids.has(id)) runningSince.delete(id);
+    for (const id of lastSpeaking.keys()) if (!ids.has(id)) lastSpeaking.delete(id);
     for (const j of shown) {
-      if (isFinished(j)) runningSince.delete(j.id);
-      else if (!runningSince.has(j.id)) runningSince.set(j.id, now);
+      if (isFinished(j)) {
+        runningSince.delete(j.id);
+        lastSpeaking.delete(j.id);
+        continue;
+      }
+      if (!runningSince.has(j.id)) runningSince.set(j.id, now);
+      if (activity && activity(j.id).speaking) lastSpeaking.set(j.id, now);
     }
     const planOf = new Map();
     const members = new Map(); // plan -> its foldable jobs (not the attached ones)
