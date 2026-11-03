@@ -92,9 +92,10 @@
 //       attached to them are moved into one `details.job-group[data-plan]` whose summary reads
 //       `<n> idle <kinds> on <plan>[, <m> <attached kind>]`; it is open unless the operator
 //       folded it (sessionStorage[JOB_FOLD_KEY + plan]). foldIdle(ms) changes the idle age.
-//       A job folds only on evidence (foldPlan): an unwatched squelch kind needs a running mix
-//       covering its source (activity(id): {watched, speaking, hot}, overlays.js), and a
-//       `speaking` or `hot` row never folds.
+//       A job folds only on evidence (foldPlan): an unwatched squelch kind needs the watched
+//       mix (watchedMix(): its id) running and covering its source (activity(id): {watched,
+//       speaking, hot}, overlays.js); a `speaking` row never folds, nor a `hot` one unless the
+//       hot is its own row's hover.
 import { channelColour } from "./overlays.js";
 import { mixCovering } from "./mix.js";
 import { channelLabel } from "./plans.js";
@@ -663,6 +664,7 @@ export function startJobs(
     countEl = null,
     lastEvent = null,
     activity = null,
+    watchedMix = null,
   } = {},
 ) {
   let timer = null;
@@ -671,6 +673,9 @@ export function startJobs(
   // there when no event has been seen).
   const runningSince = new Map();
   const groupEls = new Map(); // plan -> its kept details.job-group
+  // The job whose own row the pointer is on (set here from the row's pointerenter/leave): its
+  // `hot` comes from the list itself and does not keep it out of a group.
+  let rowHot = null;
   let ageTimer = null;
   let stopped = false;
   let last = null;
@@ -684,7 +689,12 @@ export function startJobs(
     squelch,
     plan: view ? () => view.get("plan") : null,
     position,
-    onHot,
+    onHot: onHot
+      ? (id, on) => {
+          rowHot = on ? id : rowHot === id ? null : rowHot;
+          onHot(id, on);
+        }
+      : null,
     mixText,
     mute,
   };
@@ -730,20 +740,24 @@ export function startJobs(
   // (a) its kind has no squelch (counted closed) and it sent no event for foldIdleMs;
   // (b) it is watched (overlays.js, at most MAX_WATCHED = 4 jobs: TODO.md "UI: the page
   //     watches at most 4 jobs"), its squelch known closed and no event for foldIdleMs;
-  // (c) it is an unwatched squelch kind (its squelch and events unknown) on a source a
-  //     running mix covers, and the mix does not hear it (not `speaking`).
-  // Never a `speaking` or `hot` row; an unwatched squelch kind with no covering mix never
-  // folds. Every way out of a group (the job stopped, its squelch opened, an event arrived,
-  // the mix heard it, the group under JOBS_FOLD_MIN) is this test failing at the next render,
-  // one poll at most.
+  // (c) it is an unwatched squelch kind (its squelch and events unknown) on a source the
+  //     mix the page watches (watchedMix(), mix.js MixWatch: the one `speaking` comes from)
+  //     covers, and that mix does not hear it (not `speaking`); another mix is no evidence.
+  // Never a `speaking` row, nor a `hot` one when the hot comes from outside the list (a rail
+  // tag, an outline): a row hovered inside its group stays there (rowHot). An unwatched
+  // squelch kind with no watched covering mix never folds. Every way out of a group (the job
+  // stopped, its squelch opened, an event arrived, the mix heard it, the group under
+  // JOBS_FOLD_MIN) is this test failing at the next render, one poll at most.
   const foldPlan = (j, now, jobs) => {
     if (isFinished(j) || j.input || j.elastic || !j.tuning || !view) return null;
     const ch = channelLabel(j.tuning.center_hz, view.get("plan"));
     if (!ch) return null;
     const seen = activity ? activity(j.id) : { watched: true, speaking: false, hot: false };
-    if (seen.speaking || seen.hot) return null;
+    if (seen.speaking || (seen.hot && j.id !== rowHot)) return null;
     if (SQUELCH_KINDS.includes(j.kind) && !seen.watched) {
-      return mixCovering(j, jobs) ? ch.plan : null;
+      const id = watchedMix ? watchedMix() : null;
+      const mix = id ? jobs.filter((m) => m.id === id) : [];
+      return mixCovering(j, mix) ? ch.plan : null;
     }
     if (SQUELCH_KINDS.includes(j.kind)) {
       const sq = squelch ? squelch(j.id) : null;

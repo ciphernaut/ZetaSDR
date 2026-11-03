@@ -2038,6 +2038,14 @@ def scenario_job_rows_fold_only_on_evidence(page, url, secret):
             expect(group.locator(f'.job[data-id="{j}"]')).to_have_count(0)
         expect(group.locator("summary")).to_have_text(
             re.compile(r"^\d+ idle fm_demod on uhf_cb_au"))
+        # A newer mix on another source is the one the page watches: the mix over cb is no
+        # evidence then, and the unwatched rows leave the group.
+        other = http_mix_start(url, secret, ["tone"])
+        page.evaluate("window.zetaTest.poll()")
+        wait_until(lambda: page.evaluate("window.zetaMix.job") == other, 5.0,
+                   "the newest mix is the one watched")
+        page.evaluate("window.zetaTest.poll()")
+        expect(group).to_have_count(0)
     finally:
         stop_mixes(url, secret)
         for j, _ in jobs:

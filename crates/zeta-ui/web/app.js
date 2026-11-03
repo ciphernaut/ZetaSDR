@@ -904,6 +904,7 @@ function start(api) {
     lastEvent: (id) => (state.ov ? state.ov.lastEvent(id) : null),
     activity: (id) =>
       state.ov ? state.ov.activity(id) : { watched: false, speaking: false, hot: false },
+    watchedMix: () => (state.mix ? state.mix.jobId : null),
     position: (id) => (state.map ? state.map.rowText(id) : null),
     mixText: (job) => mixRowText(job.id),
     mute: muteFor,
