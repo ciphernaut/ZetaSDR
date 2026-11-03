@@ -337,3 +337,14 @@ windows with the program rows too (they are `skipped_span` today at 46 ms, but a
 hold frames). Beside it, `capture classify` on a 46 ms window of the 404.025 MHz telemetry link ranks three
 catalogue radiosonde names at 0.7 above the layer-1 `unknown` 0.5 on the frequency range alone: cap a
 range-only catalogue match under the layer-1 label, or say "range only" in its evidence.
+
+## Channel bank: a capture under 2 Msps gets none, so 80 CB channels run direct at 5 cores
+
+Seen in UAT 22.1 on the field host 2026-11-03: the UHF CB pin (476 918 750 / 1 024 000 Hz) is under
+`PFB_MIN_RATE_HZ` (2 Msps), so `sync_bank` makes no bank and every one of the 80 `fm_demod` channels took
+the `direct` path (`job_context.channel.reason: no bank`). Counters stayed clean (underruns 0, dropped 0,
+rate held) but the node sat at 498 % CPU on 12 cores for 80 demods and 80 transcribes, the host 45 % busy.
+The floor was chosen when a bank's fixed cost outweighed a few direct channels; with 80 consumers it is the
+other way round. Options, to spec: make the bank when the capture is narrow but the consumer count is high
+(a bank per `plan_start` of 20 or more channels), or lower the floor to the rate at which a 500 kHz bin
+still fits the plan's channels. Measure both on the B210 CB pin before choosing.
