@@ -1371,6 +1371,55 @@ def scenario_theme_switch_live(page, url, secret):
             stop_job(url, secret, demod)
 
 
+# The selectors docs/themes.md promises a theme may target (spec 5). Each must match on a page
+# with a running demodulator, a ribbon, a collapsed pane, the map and the graph view open, and
+# each must appear verbatim in the docs.
+THEME_HOOKS = [
+    "#top", ".brand", ".src-tab", '.src-tab[aria-selected="true"]', "#rail", ".wf-axis",
+    "#waterfall", ".wf-canvas", "#side", "section.pane", ".pane-head",
+    "section.pane[data-collapsed]", "#panes", "#bar", "#cmd", "#mic", "#map", "#graph",
+    '[role="menu"]', ".ctx-item", ".job", ".job .kind", ".job .band", '.job[data-state="running"]',
+    ".job-tag", ".job-tag .kind", ".job-tag .channel", ".job-tag .centre", ".ov-ribbon",
+    ".outline", ".graph-node.selected", ".job-tag.hot", ".job-tag.speaking",
+    ".job-tag .dot.closed", "html[data-theme]", "html[data-rail]", "html[data-footprint]",
+]
+
+
+def scenario_theme_hooks(page, url, secret):
+    """Every hook the theme docs list exists in the live page and is named in docs/themes.md."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))))
+    with open(os.path.join(root, "docs", "themes.md"), encoding="utf-8") as f:
+        docs = f.read()
+    missing = [h for h in THEME_HOOKS if f"`{h}`" not in docs]
+    assert not missing, f"docs/themes.md does not list: {missing}"
+    page.set_viewport_size(WIDE)
+    select_source(page, url, secret, "tone")
+    demod = None
+    try:
+        # Off the tone, so its squelch stays closed (the idle state hook).
+        demod = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500, deviation_hz=5000)
+        row = job_row(page, demod)
+        page.evaluate("window.zetaTest.ribbon('hooks')")
+        run_cmd(page, "view set map on")
+        expect(page.locator("#map")).to_be_visible()
+        page.click("#pane-transcript .pane-head")
+        tag = page.locator(f'#rail .job-tag[data-job="{demod}"]')
+        expect(tag.locator(".dot.closed")).to_have_count(1, timeout=5_000)
+        open_graph(page, demod)
+        page.locator("#graph .graph-node").first.click()
+        row.dispatch_event("pointerenter")
+        expect(tag).to_have_class(re.compile(r"\bhot\b"))
+        tag.evaluate("t => t.classList.add('speaking')")
+        for hook in THEME_HOOKS:
+            expect(page.locator(hook).first, hook).to_be_attached()
+        page.keyboard.press("Escape")
+    finally:
+        run_cmd(page, "view reset")
+        if demod:
+            stop_job(url, secret, demod)
+
+
 def scenario_source_bar_shows_live_numbers(page, url, secret):
     select_source(page, url, secret, "tone")
     tab = page.locator('.src-tab[aria-selected="true"]')

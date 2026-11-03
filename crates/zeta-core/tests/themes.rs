@@ -343,3 +343,51 @@ async fn themes_list_answers_every_theme() {
     assert!(broken.reason.as_deref().unwrap().contains("bogus"));
     assert!(themes.windows(2).all(|w| w[0].id <= w[1].id));
 }
+
+/// The `--name:` declarations of the core stylesheet's `:root` block.
+fn root_custom_properties() -> Vec<String> {
+    let css = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../zeta-ui/web/style.css"
+    ))
+    .expect("read the core stylesheet");
+    let start = css.find(":root {").expect(":root block");
+    let block = &css[start..start + css[start..].find("\n}").expect(":root end")];
+    block
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("--"))
+        .filter_map(|l| l.split_once(':'))
+        .map(|(name, _)| format!("--{name}"))
+        .collect()
+}
+
+#[test]
+fn tokens_match_the_core_stylesheet() {
+    let declared = root_custom_properties();
+    assert!(declared.len() > 40, "{declared:?}");
+    for name in &declared {
+        assert!(
+            name == "--ribbon-tilt" || zeta_core::themes::TOKENS.contains(&name.as_str()),
+            "{name} is declared in :root but is not in TOKENS"
+        );
+    }
+    for token in zeta_core::themes::TOKENS {
+        assert!(
+            declared.iter().any(|d| d == token),
+            "{token} is in TOKENS but :root does not declare it"
+        );
+    }
+}
+
+#[test]
+fn docs_list_every_token() {
+    let docs =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/themes.md"))
+            .expect("read docs/themes.md");
+    for token in zeta_core::themes::TOKENS {
+        assert!(
+            docs.contains(&format!("`{token}`")),
+            "docs/themes.md omits {token}"
+        );
+    }
+}
