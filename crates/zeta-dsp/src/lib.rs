@@ -25,12 +25,14 @@ pub mod crc;
 pub mod denoise;
 pub mod detect;
 pub mod fft;
+pub mod fsk;
 #[cfg(feature = "gpu")]
 pub mod gpu_fft;
 pub mod identify;
 pub mod measure;
 pub mod mix;
 pub mod nbfm;
+pub mod ook;
 pub mod pfb;
 pub mod pocsag;
 pub mod rds;
@@ -69,6 +71,8 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(burst_capture::BurstCaptureStage::new()));
     reg.register(Arc::new(capture_in::CaptureInStage::new()));
     reg.register(Arc::new(resample::ResampleStage::new()));
+    reg.register(Arc::new(fsk::FskDemodStage::new()));
+    reg.register(Arc::new(ook::OokDemodStage::new()));
     reg.register(Arc::new(clock::ClockRecoverStage::new()));
     reg.register(Arc::new(slicer::SlicerStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));
@@ -110,6 +114,23 @@ pub(crate) fn frame_span(t0: Timestamp, n: usize, rate_hz: u64) -> Span {
         start_ns: t0,
         end_ns: Timestamp(t0.0.saturating_add(dur)),
     }
+}
+
+/// Fewest samples per symbol a layer-4 demodulator (`fsk_demod`, `ook_demod`,
+/// `psk_demod`) accepts at its input.
+pub const MIN_SAMPLES_PER_SYMBOL: u64 = 4;
+
+/// Refuse an input of `rate_hz` under [`MIN_SAMPLES_PER_SYMBOL`] samples per symbol at
+/// `symbol_rate_baud`, naming the rate to resample to; the message starts with `kind`.
+pub fn sps_check(kind: &str, rate_hz: u64, symbol_rate_baud: u32) -> Result<(), String> {
+    let need = MIN_SAMPLES_PER_SYMBOL * symbol_rate_baud as u64;
+    if rate_hz >= need {
+        return Ok(());
+    }
+    let sps = rate_hz as f64 / symbol_rate_baud as f64;
+    Err(format!(
+        "{kind}: {rate_hz} Hz is {sps:.1} samples per symbol at {symbol_rate_baud} Bd; resample to at least {need} Hz"
+    ))
 }
 
 /// Least gap, in nanoseconds, that [`is_seam`] calls a time discontinuity.
