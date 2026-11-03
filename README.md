@@ -389,7 +389,7 @@ test lives in the driver crate, see its README).
 
 ## Decoder modes
 
-A decoder is a data row, not code. The built-in rows live in `modes/*.json` (embedded in the binary); your own go in `--modes-dir PATH` (default `$XDG_CONFIG_HOME/zetasdr/modes`, else `~/.config/zetasdr/modes`), and a row with a built-in `id` replaces it. A row that does not parse or validate is listed `broken` (with its `file` and the offending field) and logged at startup as `zeta: mode <id> (<file>): <field>: <error>`; it never stops the node.
+A decoder is a data row, not code. The built-in rows live in `modes/*.json` (embedded in the binary); your own go in `--modes-dir PATH` (default `$XDG_CONFIG_HOME/zetasdr/modes`, else `~/.config/zetasdr/modes`), and a row with a built-in `id` replaces it. Themes follow the same pattern: `--themes-dir PATH` (default `$XDG_CONFIG_HOME/zetasdr/themes`, else `~/.config/zetasdr/themes`), see `docs/themes.md`. A row that does not parse or validate is listed `broken` (with its `file` and the offending field) and logged at startup as `zeta: mode <id> (<file>): <field>: <error>`; it never stops the node.
 
 ```bash
 zeta modes list [--family F] [--state ready|broken|unavailable]   # every row, with its state
@@ -524,7 +524,7 @@ OpenAI-compatible endpoint (thinking off, token budget per turn, bounded turns, 
 
 `zeta serve --listen` also serves a web app at `http://HOST:PORT/ui/` (`/` redirects there). It
 is plain JavaScript embedded in the binary, a client of the same HTTP and websocket API as
-everything else: no build step, nothing fetched from elsewhere. The page asks for the node's
+everything else: no build step, nothing fetched from elsewhere. It needs Chrome 120, Firefox 117 or Safari 17.2 or later. The page asks for the node's
 secret once and keeps it in the tab's `sessionStorage`; a wrong secret shows "secret rejected"
 and opens nothing, and a secret the node later rejects (a restart with a new one) returns to the
 box.
@@ -578,7 +578,7 @@ View policies shape this, set from the command line and kept in the tab's `sessi
 | `auto_scan_stop` | `inside` (stop when back inside the capture), `keep` |
 | `finished_rows_s` | seconds a finished job stays listed, `60`; `0` never shows them |
 | `scanner` | `auto`, or a source id |
-| `theme` | `console` (also set on `<html data-theme>`), `plain` (the old look: tags on the outlines, level ribbons) |
+| `theme` | a ready theme's id, set on `<html data-theme>`: the built-ins `console` (default), `plain` (tags on the outlines, level ribbons), `cyberpunk`, `terminal`, `psytrance`, `vibecoder` (the light one), and any operator theme in `--themes-dir` (`zeta themes list`; `docs/themes.md` is the author's guide) |
 | `side` | `both`, `transcript`, `jobs`, `none`: which of the side panes show |
 | `subjects` | `auto` (the Subjects tab shows while a running job's row has table columns), `on`, `off` |
 | `subject_dim_s` | seconds of silence before a subject dims, `60` |
@@ -594,7 +594,7 @@ and stops the one it started when the page closes). Overlays are pinned to their
 scroll with it: a `measure` job's layer-1 label with its confidence, an `aprs_decode` packet as
 a ribbon (`VK3ABC > APRS: >hi` on the fixture), any other event as a short ribbon. Ribbons
 ride their band: centred on the band line, tilted by the theme (-15 degrees in `console`, level in
-`plain`) and in the job's colour; a new chunk takes the line and older ones step up a lane, then
+`plain`; `layout.ribbon_tilt_deg` in a theme's `theme.json`) and in the job's colour; a new chunk takes the line and older ones step up a lane, then
 fall back as it clears (a subject's keyed ribbon never steps). The job list
 shows every job that is not stopped, two lines a row (kind and state, then band, numbers and the
 id's tail; no sideways scroll), with a live event counter, ■ to stop it, ▶ on an

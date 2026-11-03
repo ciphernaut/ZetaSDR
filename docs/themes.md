@@ -1,9 +1,19 @@
 # Themes
 
 A theme is a folder. The page offers every ready theme to `view set theme NAME`; `console` is
-the default and the fallback. The built-in themes live under `themes/` in the repository
-(`console`, `plain`); yours go in the operator folder and can add a theme or replace a built-in
-one by using its `id`.
+the default and the fallback. The built-in themes live under `themes/` in the repository;
+yours go in the operator folder and can add a theme or replace a built-in one by using its `id`.
+
+The six built-in themes:
+
+| id | name | look |
+|---|---|---|
+| `console` | Console | black ground, an elbowed frame, pill bars with dark text and a condensed face (the default) |
+| `plain` | Plain | dark slate panels, hairline borders, a monospace face and no frame |
+| `cyberpunk` | Cyberpunk | near-black ground, magenta and cyan neon outlines, chamfered corners and a techno face |
+| `terminal` | Terminal | phosphor green on black, boxed panes with titles in the border, a block cursor |
+| `psytrance` | Psytrance | fluorescent pink, lime, orange and UV cyan on deep indigo, soft uneven panels with gradient borders |
+| `vibecoder` | Vibecoder | the one light theme: white rounded cards on cool slate, an indigo-to-violet accent, the waterfall a dark card |
 
 Browser floor: Chrome 120, Firefox 117, Safari 17.2 (the first versions with native CSS nesting
 of bare type selectors, which the wrapper below relies on; the page already needs `color-mix()`).
@@ -36,7 +46,8 @@ The folder name must equal `theme.json`'s `id`. The node serves a ready theme un
 theme without a `style.css` still serves one (its fonts, colour scheme, ribbon tilt and tokens).
 The content security policy is the page's and is not widened for themes: a `url(https://...)`
 is blocked by the browser and refused by the loader, and fonts load from the theme's own folder
-only. Fonts must be SIL OFL 1.1 (or as permissive) with their licence text beside them.
+only. The project's rule for the fonts of built-in themes is SIL OFL 1.1 with the licence text beside
+them; the loader does not enforce it, so check the licence of any font you ship in your own.
 
 ## `theme.json`
 
@@ -177,7 +188,12 @@ loader refuses the key today.
 ## The hooks
 
 These are what a theme may target; the project keeps them stable. Everything else in the markup
-may change in any release. An end-to-end scenario (`scenario_theme_hooks`) checks that each
+may change in any release. The built-in themes are the exception: they also use internal
+selectors (`#bar .prompt`, `html[data-side]`, `.thin`, `.expanded`, `#wf-badge`, `#band`,
+`.job .actions`, `#ctx`, `#ctx-outline`, `.ctx-item`) that are not promised stable and are
+fixed along with the page when it changes; a theme of your own should keep to the hooks below. The
+core's menu rules are written with ID selectors, so a theme that styles menus must write
+`#ctx, #ctx-outline` (a bare `[role="menu"]` loses to them). An end-to-end scenario (`scenario_theme_hooks`) checks that each
 selector below matches on a page with a running demodulator, a ribbon, a collapsed pane, the map
 and the graph view open, so renaming one fails the suite.
 

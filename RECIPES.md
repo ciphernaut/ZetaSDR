@@ -235,6 +235,29 @@ sonde. `measure.snr_db` is a per-bin peak and reads 20 dB where the channel SNR 
 
 **On the page.** The watch is outlined on the waterfall and its decoder's rail tag shows the centre; `view set side jobs` gives the jobs list the whole side column, and if the watch keeps several decoders **Listen to all** lets the idle ones fold.
 
+## Make your own theme
+
+Verified on the plan 26 build; the folder format and every hook are in `docs/themes.md`.
+
+**Check.** `zeta themes list` shows the six built-ins (`console`, `plain`, `cyberpunk`, `terminal`,
+`psytrance`, `vibecoder`) as `ready`.
+
+```bash
+mkdir -p ~/.config/zetasdr/themes
+cp -r themes/plain ~/.config/zetasdr/themes/mine
+```
+
+Edit `mine/theme.json` (`id` `mine`, the same as the folder; a few `tokens`) and put any extra rules
+in `mine/style.css`. Restart the node, then type `view set theme mine` in the command bar.
+
+**Verify.** `zeta themes list` shows `mine` as `ready`; a typo shows it `broken` with the field, and
+the node logs `zeta: theme mine (<path>): <field>: <error>` at startup.
+
+**Stop.** `view set theme console` returns the default; delete the folder to remove the theme.
+
+**Gotchas.** A stored theme that is no longer ready falls back to `console`. Style the hooks listed in
+`docs/themes.md`, not other markup.
+
 ## Adding a recipe
 
 One section per recipe, in this order: a one-line intent with where and when it was verified;
