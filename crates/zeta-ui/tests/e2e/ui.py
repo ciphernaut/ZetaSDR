@@ -1265,11 +1265,53 @@ def scenario_theme_shots(page, url, secret):
 # The built-in themes added in plan 26 (Tasks 8-11), each checked by scenario_new_themes.
 NEW_THEMES = ["cyberpunk"]
 
+# The motion a theme may start, provoked and read in one synchronous step (a jobs poll would
+# re-sync `.speaking` and cancel a hand-made glitch, and a short animation would finish while
+# a test waited): the speaking state on a job tag, keyboard focus on a button and focus in the
+# command line, reading document.getAnimations() after each (it flushes style, so transitions
+# and animations have started). The names of what runs: CSS animations by animationName, CSS
+# transitions as "transition:<property>", anything else by its constructor.
+MOTION_PROBE_JS = """(job) => {
+  const seen = new Set();
+  const read = () => {
+    for (const a of document.getAnimations()) {
+      seen.add(a.animationName || (a.transitionProperty ? "transition:" + a.transitionProperty
+                                                        : a.constructor.name));
+    }
+  };
+  if (document.activeElement) document.activeElement.blur();
+  getComputedStyle(document.body).color;
+  const tag = document.querySelector(`#waterfall .job-tag[data-job="${job}"]`);
+  tag.classList.add("speaking");
+  read();
+  document.getElementById("listen-all").focus({focusVisible: true});
+  read();
+  document.getElementById("cmd").focus();
+  read();
+  tag.classList.remove("speaking");
+  document.activeElement.blur();
+  return [...seen].sort();
+}"""
+
+
+def visible_controls(page, ids):
+    """The ids among `ids` whose centre is not hit by the element itself or a child (covered
+    or off screen)."""
+    return page.evaluate("""(ids) => ids.filter((id) => {
+      const el = document.getElementById(id);
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) return true;
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return !(hit && el.contains(hit));
+    })""", ids)
+
 
 def scenario_new_themes(page, url, secret):
-    """Each new built-in theme applies; for a reader who asks for reduced motion it runs no
-    animation, a speaking tag included; and, with ZETA_UI_SHOTS, it is shot wide and narrow
-    as scenario_theme_shots does, the waterfall left unmasked so its ramp can be judged."""
+    """Each new built-in theme applies; it starts motion for a reader who has not asked for
+    less (the probe can see it) and none for one who has, transitions included; its Listen to
+    all (wide) and drawer toggle (narrow) stay visible and clickable; and, with ZETA_UI_SHOTS,
+    it is shot wide and narrow as scenario_theme_shots does, the waterfall left unmasked so
+    its ramp can be judged."""
     shots = os.environ.get("ZETA_UI_SHOTS")
     select_source(page, url, secret, "tone")
     demod = None
@@ -1281,26 +1323,28 @@ def scenario_new_themes(page, url, secret):
         calm = still.new_page()
         login(calm, url, secret)
         calm.click('.src-tab[data-id="tone"]')
-        calm_tag = calm.locator(f'#waterfall .job-tag[data-job="{demod}"]')
         for theme in NEW_THEMES:
-            run_cmd(page, f"view set theme {theme}")
-            expect(page.locator("html")).to_have_attribute("data-theme", theme)
-            run_cmd(calm, f"view set theme {theme}")
-            expect(calm.locator("html")).to_have_attribute("data-theme", theme)
-            calm.evaluate("window.zetaTest.poll()")
-            expect(calm_tag).to_have_count(1, timeout=5_000)
-            calm_tag.evaluate("t => t.classList.add('speaking')")
-            calm.wait_for_timeout(400)
-            running = calm.evaluate(
-                "() => document.getAnimations().map((a) => a.animationName || a.constructor.name)")
-            assert running == [], f"{theme}: animations under reduced motion: {running}"
-            calm_tag.evaluate("t => t.classList.remove('speaking')")
-            if not shots:
-                continue
+            for p in (page, calm):
+                run_cmd(p, f"view set theme {theme}")
+                expect(p.locator("html")).to_have_attribute("data-theme", theme)
+                p.evaluate("window.zetaTest.poll()")
+                expect(p.locator(f'#waterfall .job-tag[data-job="{demod}"]')
+                       ).to_have_count(1, timeout=5_000)
+            moving = page.evaluate(MOTION_PROBE_JS, demod)
+            assert moving, f"{theme}: the motion probe saw nothing on a normal-motion page"
+            still_running = calm.evaluate(MOTION_PROBE_JS, demod)
+            assert still_running == [], \
+                f"{theme}: motion under reduced motion: {still_running} (normal: {moving})"
             for name, size in (("wide", WIDE), ("narrow", NARROW)):
                 page.set_viewport_size(size)
                 page.wait_for_function(
                     f"() => document.documentElement.dataset.footprint === '{name}'")
+                controls = ["listen-all"] if name == "wide" else ["listen-all", "drawer-toggle"]
+                expect(page.locator("#listen-all")).to_be_visible()
+                hidden = visible_controls(page, controls)
+                assert hidden == [], f"{theme} {name}: covered or off screen: {hidden}"
+                if not shots:
+                    continue
                 expect(page.locator(f'#waterfall .job-tag[data-job="{demod}"] .dot.closed')
                        ).to_have_count(1, timeout=5_000)
                 page.evaluate("document.activeElement && document.activeElement.blur()")

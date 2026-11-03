@@ -298,6 +298,18 @@ section.pane {
 #graph .graph-edge line { stroke: color-mix(in srgb, var(--accent) 70%, transparent); }
 #graph .graph-arrowhead { fill: var(--accent); }
 
+/* ---- crowded rail tags (the core's 8 x 5 px .thin segments): a solid glowing segment in the
+   job's colour, no chamfer (a cut larger than the segment would clip it away), no text ---- */
+#waterfall #rail .job-tag.thin {
+  clip-path: none; border: 0; background: var(--job-c); box-shadow: 0 0 6px var(--job-c);
+}
+#waterfall #rail .job-tag.thin:has(.dot.closed) {
+  background: color-mix(in srgb, var(--job-c) 50%, transparent); box-shadow: none;
+}
+#waterfall #rail .job-tag.thin.speaking {
+  background: var(--c-speaking); box-shadow: 0 0 8px var(--c-speaking);
+}
+
 /* ---- narrow: the rail is 14 px of thin segments; a tapped one floats out as its label ---- */
 html&[data-footprint="narrow"] { --rail-w: 14px; }
 html&[data-footprint="narrow"] #waterfall #rail { overflow: visible; z-index: 6; }
