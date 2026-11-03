@@ -35,6 +35,7 @@ pub mod nbfm;
 pub mod ook;
 pub mod pfb;
 pub mod pocsag;
+pub mod psk;
 pub mod rds;
 pub mod resample;
 pub mod rs41_frame;
@@ -73,6 +74,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(resample::ResampleStage::new()));
     reg.register(Arc::new(fsk::FskDemodStage::new()));
     reg.register(Arc::new(ook::OokDemodStage::new()));
+    reg.register(Arc::new(psk::PskDemodStage::new()));
     reg.register(Arc::new(clock::ClockRecoverStage::new()));
     reg.register(Arc::new(slicer::SlicerStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));

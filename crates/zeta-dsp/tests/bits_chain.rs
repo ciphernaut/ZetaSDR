@@ -29,6 +29,7 @@ fn stage_of(kind: &str) -> Arc<dyn Stage> {
         "resample" => Arc::new(zeta_dsp::resample::ResampleStage::new()),
         "fsk_demod" => Arc::new(zeta_dsp::fsk::FskDemodStage::new()),
         "ook_demod" => Arc::new(zeta_dsp::ook::OokDemodStage::new()),
+        "psk_demod" => Arc::new(zeta_dsp::psk::PskDemodStage::new()),
         "clock_recover" => Arc::new(zeta_dsp::clock::ClockRecoverStage::new()),
         "slicer" => Arc::new(zeta_dsp::slicer::SlicerStage::new()),
         other => panic!("no stage {other} in the chain harness"),
@@ -350,4 +351,72 @@ async fn ook_chain_recovers_the_bits() {
     assert_eq!(clean, 0, "{clean} bit errors at 20 dB");
     let noisy = ook_errors(10.0).await;
     assert!(noisy < 21, "{noisy} bit errors at 10 dB");
+}
+
+/// The fewest bit errors of `got` against `want` ([`align_errors_tail`] with
+/// `tail_bits`) over the four rotations of a QPSK stream: each symbol pair of `got`
+/// (the slicer's natural mapping, MSB first) read as index `s` and remapped to
+/// `(s + r) mod 4`. `psk_demod` does not resolve the phase ambiguity of its order.
+pub fn best_rotation(got: &[u8], want: &[u8], tail_bits: usize) -> usize {
+    (0..4u8)
+        .map(|r| {
+            let rotated: Vec<u8> = got
+                .chunks_exact(2)
+                .flat_map(|p| {
+                    let s = (p[0] * 2 + p[1] + r) % 4;
+                    [s >> 1, s & 1]
+                })
+                .collect();
+            align_errors_tail(&rotated, want, tail_bits)
+        })
+        .min()
+        .unwrap_or(want.len())
+}
+
+/// The PSK chain's recovered bits and the planted ones: `order`-PSK of
+/// [`PLANTED_BITS`] random bits (after the preamble of `order`) under `imp`, resampled
+/// to [`FSK_RATE`], demodulated, clocked (Gardner, the 2-channel default) and sliced on
+/// `constellation`.
+async fn psk_bits(order: u8, constellation: &str, imp: Impairments) -> (Vec<u8>, Vec<u8>) {
+    let want = random_bits(PLANTED_BITS, SEED);
+    let spec = SynthSpec::Psk {
+        symbol_rate_baud: FSK_BAUD,
+        order,
+        bits: hex_of(&with_preamble(&want, preamble_pattern(order))),
+        repeat: 1,
+        gap_ms: 0,
+    };
+    let iq = synthesise(&spec, &imp, IN_RATE, 0);
+    let events = run_chain(
+        &[
+            ("resample", json!({"out_rate_hz": FSK_RATE})),
+            (
+                "psk_demod",
+                json!({"symbol_rate_baud": FSK_BAUD, "order": order}),
+            ),
+            ("clock_recover", json!({"symbol_rate_baud": FSK_BAUD})),
+            ("slicer", json!({"constellation": constellation})),
+        ],
+        &iq,
+        IN_RATE as u64,
+    )
+    .await;
+    (recovered_bits(&events), want)
+}
+
+#[tokio::test]
+async fn bpsk_chain_recovers_the_bits_up_to_inversion() {
+    let (got, want) = psk_bits(2, "bpsk", impairments(20.0, OFFSET_HZ)).await;
+    let clean = align_errors_tail(&got, &want, RESAMPLE_TAIL_SYMBOLS);
+    assert_eq!(clean, 0, "{clean} bit errors at 20 dB");
+    let (got, want) = psk_bits(2, "bpsk", impairments(10.0, OFFSET_HZ)).await;
+    let noisy = align_errors_tail(&got, &want, RESAMPLE_TAIL_SYMBOLS);
+    assert!(noisy < 21, "{noisy} bit errors at 10 dB");
+}
+
+#[tokio::test]
+async fn qpsk_chain_recovers_the_bits_up_to_rotation() {
+    let (got, want) = psk_bits(4, "qpsk", impairments(20.0, OFFSET_HZ)).await;
+    let e = best_rotation(&got, &want, RESAMPLE_TAIL_SYMBOLS * 2);
+    assert_eq!(e, 0, "{e} bit errors");
 }
