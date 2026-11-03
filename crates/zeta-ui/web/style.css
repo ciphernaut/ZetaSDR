@@ -607,3 +607,106 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 #explore td { max-width: 18em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 8px 1px 4px; }
 #explore td button { margin-right: 4px; font-size: 11px; }
 #explore td.actions { max-width: none; overflow: visible; }
+
+/* ---- the frame (spec 4.3) ---- */
+/* The source bar's live numbers: plain shows them in the tab's title only. */
+.health { display: none; }
+.health .v { font-variant-numeric: tabular-nums; }
+/* The spine between the two elbows, painted only under the console theme. */
+[data-theme="console"] #main { padding-inline-start: 12px; }
+[data-theme="console"] #main::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  width: 12px;
+  background: var(--c-frame);  /* frame role: the spine */
+}
+[data-theme="console"] #waterfall { inset-inline-start: 12px; }
+[data-theme="console"] #top,
+[data-theme="console"] #bar {
+  background: #000;            /* ground behind the bars */
+  border: none;
+  gap: 6px;
+  padding: 0;
+}
+[data-theme="console"] #tabs, [data-theme="console"] #panes { gap: 6px; }
+/* The upper elbow: the brand, in the frame colour. */
+[data-theme="console"] .brand {
+  align-self: stretch;
+  display: flex;
+  align-items: flex-end;
+  background: var(--c-frame);
+  color: #000;                 /* black text on every coloured bar */
+  border-start-start-radius: var(--radius-elbow);
+  padding-inline: 10px 8px;
+  min-width: calc(var(--rail-w) + 12px);
+}
+/* Source bars: the selected one takes the free width and carries the live numbers. */
+[data-theme="console"] .src-tab {
+  background: var(--c-source);
+  color: #000;
+  border: none;
+  border-radius: var(--radius-bar);
+  flex: 0 0 auto;
+  text-transform: uppercase;   /* bar caption */
+}
+[data-theme="console"] .src-tab .name,
+[data-theme="console"] .src-tab[aria-selected="true"] .name { color: #000; }
+[data-theme="console"] .src-tab.fault { background: var(--error); }
+[data-theme="console"] .src-tab[aria-selected="true"] { flex: 1; }
+[data-theme="console"] .src-tab:not([aria-selected="true"]) { opacity: 0.8; }
+[data-theme="console"] .src-tab .tag.pin { border-color: #000; color: #000; }
+[data-theme="console"] .src-tab[aria-selected="true"] .health {
+  display: inline-flex;
+  gap: 4px;
+  margin-inline-start: auto;
+  align-items: baseline;
+}
+[data-theme="console"] .health .k { font-size: 10px; text-transform: uppercase; opacity: 0.7; }
+[data-theme="console"] .health .v { margin-inline-end: 8px; }
+/* Action bars, the last one end-capped. */
+[data-theme="console"] .pane-tab,
+[data-theme="console"] #map-toggle,
+[data-theme="console"] #listen-all,
+[data-theme="console"] #drawer-toggle {
+  background: var(--c-action);
+  color: #000;
+  border: none;
+  border-radius: var(--radius-bar);
+  text-transform: uppercase;   /* bar caption */
+}
+[data-theme="console"] .pane-tab[aria-selected="true"],
+[data-theme="console"] #map-toggle[aria-pressed="true"],
+[data-theme="console"] #listen-all[aria-pressed="true"] {
+  background: var(--c-speaking);
+  color: #000;
+}
+[data-theme="console"] #top > button:last-of-type {
+  border-start-end-radius: var(--radius-elbow);
+  border-end-end-radius: var(--radius-elbow);
+}
+/* The lower elbow: the prompt, in the frame colour; the command line a dark bar; mic a peach bar. */
+[data-theme="console"] #bar .prompt {
+  align-self: stretch;
+  display: flex;
+  align-items: flex-start;
+  background: var(--c-frame);
+  color: #000;
+  border-end-start-radius: var(--radius-elbow);
+  padding-inline: 10px 8px;
+  min-width: calc(var(--rail-w) + 12px);
+}
+[data-theme="console"] #cmd {
+  background: var(--c-idle);
+  color: var(--text);
+  border: none;
+  border-radius: var(--radius-bar);
+}
+[data-theme="console"] #mic {
+  background: var(--c-channel-5);
+  color: #000;
+  border: none;
+  border-radius: var(--radius-bar);
+  text-transform: uppercase;   /* bar caption */
+}

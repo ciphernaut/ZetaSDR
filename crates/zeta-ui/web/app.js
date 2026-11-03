@@ -301,9 +301,46 @@ function decorateTab(tab, s) {
   } else if (!s.pin && tag) {
     tag.remove();
   }
-  if (s.fault) tab.title = `fault: ${JSON.stringify(s.fault)}`;
-  else if (s.pin) tab.title = pinTitle(s);
-  else tab.title = rangeText(s);
+  let title;
+  if (s.fault) title = `fault: ${JSON.stringify(s.fault)}`;
+  else if (s.pin) title = pinTitle(s);
+  else title = rangeText(s);
+  const pairs = healthPairs(s);
+  tab.title = `${title}; ${pairs.map(([k, v]) => `${k} ${v}`).join(" ")}`;
+  let health = tab.querySelector(".health");
+  if (!health) {
+    health = document.createElement("span");
+    health.className = "health";
+    tab.append(health);
+  }
+  health.replaceChildren(
+    ...pairs.flatMap(([k, v]) => {
+      const key = document.createElement("span");
+      key.className = "k";
+      key.textContent = k;
+      const val = document.createElement("span");
+      val.className = "v";
+      val.dataset.field = k;
+      val.textContent = v;
+      return [key, val];
+    }),
+  );
+}
+
+// The numbers a source's bar carries: [field, text] pairs from its `source_list` record.
+function healthPairs(s) {
+  const rate = s.stats?.measured_rate_hz;
+  const g = s.gain;
+  const pairs = [
+    ["pin", s.pin ? (s.pin.center_hz / 1e6).toFixed(3) : "—"],
+    ["rate", rate == null ? "—" : String(rate).replace(/\B(?=(\d{3})+(?!\d))/g, " ")],
+    ["ovf", s.stats?.overflows ?? "—"],
+    ["gain", g ? (g.db == null ? "auto" : `${g.db} dB`) : "—"],
+    ["hold", (s.holders || []).length],
+    ["bank", s.bank ? s.bank.bin_hz : "direct"],
+  ];
+  if (s.fault) pairs.push(["fault", "fault"]);
+  return pairs.map(([k, v]) => [k, String(v)]);
 }
 
 function renderTabs(sources) {

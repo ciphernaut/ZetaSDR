@@ -1128,6 +1128,19 @@ def scenario_theme_switch(page, url, secret):
     expect(page.locator("html")).to_have_attribute("data-theme", "console")
 
 
+def scenario_source_bar_shows_live_numbers(page, url, secret):
+    select_source(page, url, secret, "tone")
+    tab = page.locator('.src-tab[aria-selected="true"]')
+    health = tab.locator(".health")
+    expect(health.locator('.v[data-field="hold"]')).to_have_text(re.compile(r"^\d+$"))
+    expect(health.locator('.v[data-field="bank"]')).to_have_text(re.compile(r"^(direct|\d+)$"))
+    expect(health.locator('.v[data-field="gain"]')).to_have_text(
+        re.compile(r"^(auto|-?\d+(\.\d+)? dB|—)$"))
+    assert "hold" in (tab.get_attribute("title") or "")
+    run_cmd(page, "view set theme plain")
+    expect(health).to_be_hidden()
+
+
 def scenario_view_set_show_reset(page, url, secret):
     page.set_viewport_size(WIDE)
     login(page, url, secret)
