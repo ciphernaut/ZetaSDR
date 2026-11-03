@@ -973,6 +973,9 @@ let themeSwitch = 0;
 async function applyTheme() {
   const id = state.view ? state.view.get("theme") : "console";
   const seq = ++themeSwitch;
+  // A stylesheet still loading for an older switch is superseded now, not once this one has
+  // fetched its theme.json: it drops itself on load and leaves the sheet in force alone.
+  themeCssLatest = null;
   const root = document.documentElement;
   let theme;
   try {
