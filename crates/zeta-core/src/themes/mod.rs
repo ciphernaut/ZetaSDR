@@ -395,16 +395,20 @@ fn read_folder(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, ThemeError> {
                 true => name.to_string(),
                 false => format!("{prefix}/{name}"),
             };
-            if !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ' ' | '-'))
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|e| err(format!("{rel}: {e}")))?;
+            // Only what is served (and the folders that may hold it) is name-checked: an
+            // editor's leftover (`style.css~`, `#style.css#`) is skipped below, not refused.
+            let served = kind.is_dir() || mime(&rel).is_some();
+            if served
+                && !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ' ' | '-'))
             {
                 return Err(err(format!(
                     "{rel:?}: a name may hold only A-Z, a-z, 0-9, `.`, `_`, ` ` and `-`"
                 )));
             }
-            let path = entry.path();
-            let kind = entry.file_type().map_err(|e| err(format!("{rel}: {e}")))?;
             if kind.is_dir() {
                 stack.push((path, rel));
                 continue;

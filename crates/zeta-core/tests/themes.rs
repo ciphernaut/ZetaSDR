@@ -194,6 +194,24 @@ fn file_serves_ready_themes_only() {
 }
 
 #[test]
+fn editor_leftovers_with_odd_names_are_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    theme_dir(
+        root.path(),
+        "leftovers",
+        valid("leftovers"),
+        &[
+            ("style.css", b"a{}".as_slice()),
+            ("style.css~", b"a{}".as_slice()),
+            ("#x#", b"x".as_slice()),
+        ],
+    );
+    let reg = ThemeRegistry::load(Some(root.path()));
+    let t = reg.all().iter().find(|t| t.id == "leftovers").unwrap();
+    assert_eq!(t.state, ThemeState::Ready, "{:?}", t.reason);
+}
+
+#[test]
 fn a_folder_without_theme_json_is_broken() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("empty")).unwrap();
