@@ -36,6 +36,7 @@ pub mod pocsag;
 pub mod rds;
 pub mod resample;
 pub mod rs41_frame;
+pub mod slicer;
 pub mod squelch;
 pub mod synth;
 pub mod util;
@@ -69,6 +70,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(capture_in::CaptureInStage::new()));
     reg.register(Arc::new(resample::ResampleStage::new()));
     reg.register(Arc::new(clock::ClockRecoverStage::new()));
+    reg.register(Arc::new(slicer::SlicerStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));
     reg.register(Arc::new(vad::VadStage::new()));
     reg.register(Arc::new(mix::MixStage::new()));
