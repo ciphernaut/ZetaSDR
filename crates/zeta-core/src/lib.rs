@@ -23,4 +23,5 @@ pub mod stream;
 pub mod stream_in;
 #[cfg(feature = "test-fixtures")]
 pub mod test_fixtures;
+pub mod themes;
 pub mod types;
