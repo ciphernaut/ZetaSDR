@@ -1185,9 +1185,9 @@ def scenario_view_set_show_reset(page, url, secret):
     for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
                  "finished_rows_s 60", "scanner auto", "plan auto", "map off", "home none",
                  "subjects auto", "subject_dim_s 60", "subject_drop_s 300", "pane none",
-                 "theme console"):
+                 "theme console", "side both"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 12, f"view show: {shown!r}"
+    assert shown.count("\n") == 13, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -1925,6 +1925,77 @@ def scenario_rail_collapses_crowd(page, url, secret):
         for j in jobs:
             stop_job(url, secret, j)
 
+
+
+# ---- the side column (plan 24 Task 5) --------------------------------------------------------
+# The chat log and the jobs pane fold on their header bars (view `side`), job rows sit on two
+# lines with no sideways scroll, and idle plan channels fold into one group row.
+
+def scenario_side_folds(page, url, secret):
+    select_source(page, url, secret, "tone")
+    before = page.locator("canvas.wf-canvas").bounding_box()["width"]
+    page.locator(".pane.jobs .pane-head").click()
+    expect(page.locator("section.pane.jobs")).to_have_attribute("data-collapsed", "")
+    assert view_value(page, "side") == "side transcript"
+    page.locator(".pane.transcript .pane-head").click()
+    assert view_value(page, "side") == "side none"
+    page.wait_for_function(  # the waterfall follows its resize
+        "w => document.querySelector('canvas.wf-canvas').getBoundingClientRect().width - w >= 200",
+        arg=before, timeout=3_000)
+    after = page.locator("canvas.wf-canvas").bounding_box()["width"]
+    assert after - before >= 200, (before, after)
+    run_cmd(page, "view set side both")
+    expect(page.locator("section.pane[data-collapsed]")).to_have_count(0)
+    expect(page.locator(".pane.jobs h2 .count")).to_have_text(re.compile(r"^\d+$"))
+
+
+def scenario_job_row_two_lines(page, url, secret):
+    select_source(page, url, secret, "tone")
+    cur = source_info(url, secret, "tone")["current"]["center_hz"]
+    job = start_job(url, secret, "fm_demod", "tone", cur, 12_500, deviation_hz=5000)
+    try:
+        row = job_row(page, job)
+        kind, band, ident = (row.locator(s).bounding_box() for s in (".kind", ".band", ".id"))
+        assert band["y"] > kind["y"] + kind["height"] / 2, (kind, band)
+        assert ident["y"] > kind["y"] + kind["height"] / 2, (kind, ident)
+        sw, cw = page.evaluate("el => [el.scrollWidth, el.clientWidth]", row.element_handle())
+        assert sw == cw, (sw, cw)
+        expect(row.locator(".band")).to_have_text(f"{cur / 1e6:.4f} MHz, 12.5 kHz")
+        assert row.locator(".kind").get_attribute("dir") == "auto"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_job_rows_fold_idle_plan_channels(page, url, secret):
+    # `cb` plays its own 48 kHz only (476.876-476.924 MHz), which holds three uhf_cb_au channels
+    # (ch20, ch59, ch60): three passthrough jobs on each, told apart by their widths so no start
+    # is a duplicate.
+    select_source(page, url, secret, "cb")
+    plans = http_json(url, secret, "/op", {"op": "channel_plans"})["value"]["plans"]
+    plan = next(p for p in plans if p["id"] == "uhf_cb_au")
+    inside = [ch for ch in plan["channels"] if 476_880_000 <= ch["center_hz"] <= 476_920_000]
+    assert len(inside) == 3, inside
+    jobs = []
+    try:
+        for i in range(9):
+            ch = inside[i % 3]
+            jobs.append(start_job(url, secret, "passthrough", "cb", ch["center_hz"],
+                                  1_000 * (1 + i // 3)))
+        page.evaluate("window.zetaTest.foldIdle(0)")  # idle threshold 0 ms for the test
+        page.evaluate("window.zetaTest.poll()")
+        group = page.locator('#jobs details.job-group[data-plan="uhf_cb_au"]')
+        expect(group).to_have_count(1)
+        expect(group.locator("summary")).to_have_text(re.compile(r"^9 idle passthrough on uhf_cb_au"))
+        assert group.get_attribute("open") is not None
+        for j in jobs:
+            expect(group.locator(f'.job[data-id="{j}"]')).to_have_count(1)
+        stop_job(url, secret, jobs[0])
+        stop_job(url, secret, jobs[1])
+        page.evaluate("window.zetaTest.poll()")
+        expect(group).to_have_count(0)
+    finally:
+        for j in jobs[2:]:
+            stop_job(url, secret, j)
 
 # ---- draggable outlines (plan 18 Task 6) -----------------------------------------------------
 # A running rigid job the node can retune is dragged by its outline: an edge handle resizes,

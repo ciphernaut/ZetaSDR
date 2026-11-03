@@ -183,6 +183,8 @@
 //                            column and view change and removed (null) once endNs left the columns
 //     ov.unspan(key)         removes the span drawn under `key`, if any
 //     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a watched job
+//     ov.lastEvent(jobId) -> ms|null  performance.now() of the last event counted in the job's
+//                            row (agent.js folds idle plan channels on it)
 //     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a watched job,
 //                            before it is drawn, and of a positioned job on another source
 //                            (the map reads `position` from them)
@@ -323,6 +325,7 @@ class Overlays {
     this.noEventStream = new Map(); // job id -> JSON of the graph that has no event stream
     this.resolving = false; // a GET /streams for unwatched jobs is in flight
     this.counters = new Map(); // job id -> non-spectrum events seen while watched
+    this.lastEvents = new Map(); // job id -> performance.now() of its last counted event
     this.hotJob = null; // the job id whose tag, outline and row show `hot`
     this.speaking = []; // the job ids a mix is playing now: `speaking` on each
     this.snippets = new Map(); // input job id -> the last transcript text of its attached job
@@ -605,6 +608,7 @@ class Overlays {
     for (const sub of rec.subs) sub.close();
     this.watched.delete(jobId);
     this.counters.delete(jobId);
+    this.lastEvents.delete(jobId);
     this.squelches.delete(jobId);
     this.unlabel(jobId);
     for (const key of [...this.marks.keys()]) if (key.startsWith(`${jobId}:`)) this.unmark(key);
@@ -654,6 +658,7 @@ class Overlays {
     // Every non-spectrum event counts in the job row, whatever its shape.
     const n = (this.counters.get(job.id) || 0) + 1;
     this.counters.set(job.id, n);
+    this.lastEvents.set(job.id, performance.now());
     this.jobRow(job, n);
     if (obj) {
       if (p.label && typeof p.label === "object" && typeof p.center_hz === "number") {
@@ -704,6 +709,10 @@ class Overlays {
   squelch(jobId) {
     const s = this.squelches.get(jobId);
     return s ? s.event : null;
+  }
+
+  lastEvent(jobId) {
+    return this.lastEvents.get(jobId) ?? null;
   }
 
   jobRowEl(job) {

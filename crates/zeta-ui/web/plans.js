@@ -4,7 +4,7 @@
 //   loadPlans(api) -> Promise<void>   `channel_plans` once; an error leaves the list empty
 //   planIds() -> string[]             the loaded plan ids
 //   resolvePlan(policy) -> string | null   the id of the first plan `policy` selects
-//   channelLabel(hz, policy) -> {text: "ch20", title: "uhf_cb_au ch20 · <note>"} | null
+//   channelLabel(hz, policy) -> {text: "ch20", title: "uhf_cb_au ch20 · <note>", plan: "uhf_cb_au"} | null
 //       The channel centred within CHANNEL_MATCH_HZ of `hz`. `policy` is the view's `plan`:
 //       `auto` any plan, a plan id that plan only, `none` null.
 //   channelsIn(lo, hi, policy) -> [{number, center_hz}]   the channels centred in lo..hi
@@ -51,7 +51,7 @@ export function channelLabel(hz, policy) {
     for (const c of p.channels) {
       if (Math.abs(c.center_hz - hz) <= CHANNEL_MATCH_HZ) {
         const note = c.note ? ` · ${c.note}` : "";
-        return { text: `ch${c.number}`, title: `${p.id} ch${c.number}${note}` };
+        return { text: `ch${c.number}`, title: `${p.id} ch${c.number}${note}`, plan: p.id };
       }
     }
   }

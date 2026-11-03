@@ -82,12 +82,30 @@
 //       label only, run() decides from the mix's graph at the click.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
+//       Each render writes the running rows' count into countEl (the Jobs header's `.count`).
+//       Rows sit on two lines (style.css), every text span `dir="auto"`, the ones line two may
+//       cut (TITLED, `.reason`, `.id`) carrying their full text as title. Idle plan channels
+//       fold (foldPlan): when more than JOBS_FOLD_MIN running jobs sit on one plan's channels
+//       (channelLabel under view `plan`) with their squelch closed (squelch(id) not open; a
+//       kind without a squelch counts as closed) and no event (lastEvent(id), overlays.js) for
+//       JOBS_FOLD_IDLE_MS since this page first saw them running, their rows and the rows
+//       attached to them are moved into one `details.job-group[data-plan]` whose summary reads
+//       `<n> idle <kinds> on <plan>[, <m> <attached kind>]`; it is open unless the operator
+//       folded it (sessionStorage[JOB_FOLD_KEY + plan]). foldIdle(ms) changes the idle age.
 import { channelColour } from "./overlays.js";
 import { channelLabel } from "./plans.js";
 import { bandText } from "./units.js";
 
 
 export const JOBS_POLL_MS = 2000;
+// Idle plan channels fold into one group row (spec 4.7): more than JOBS_FOLD_MIN running
+// jobs on one plan's channels, each with its squelch closed (or no squelch) and no event
+// for JOBS_FOLD_IDLE_MS.
+export const JOBS_FOLD_MIN = 8;
+export const JOBS_FOLD_IDLE_MS = 60_000;
+export const JOB_FOLD_KEY = "zeta.jobfold."; // + plan id: "open" | "closed", the operator's fold
+// The row spans whose full text is their title (line two cuts them with an ellipsis).
+const TITLED = ["band", "source", "events"];
 export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod", "mix"];
 export const SQUELCH_KINDS = ["fm_demod", "am_demod"];
 export const QUIET_OPS = new Set([
@@ -390,6 +408,7 @@ export function setSquelchTag(row, event) {
   if (!tag) {
     tag = document.createElement("span");
     tag.className = "tag squelch";
+    tag.dir = "auto";
     tag.textContent = "squelch";
     cell.append(" ", tag);
   }
@@ -434,9 +453,13 @@ function jobRow(
     const span = document.createElement("span");
     span.className = cls;
     span.textContent = text;
+    span.dir = "auto";
+    if (TITLED.includes(cls)) span.title = text;
+    if (cls === "id") span.title = job.id;
     if (cls === "kind" && job.elastic) {
       const tag = document.createElement("span");
       tag.className = "tag elastic";
+      tag.dir = "auto";
       tag.textContent = "elastic";
       tag.title = "follows the capture; holds no lease";
       span.append(" ", tag);
@@ -446,6 +469,7 @@ function jobRow(
       if (ch) {
         const tag = document.createElement("span");
         tag.className = "tag ch";
+        tag.dir = "auto";
         tag.textContent = ch.text;
         tag.title = ch.title;
         span.append(" ", tag);
@@ -454,6 +478,7 @@ function jobRow(
     if (cls === "kind" && job.kind === "scan" && job.id === autoScanId()) {
       const tag = document.createElement("span");
       tag.className = "tag auto";
+      tag.dir = "auto";
       tag.textContent = "auto";
       tag.title = "the page's automatic scan of the view outside the capture";
       span.append(" ", tag);
@@ -468,6 +493,7 @@ function jobRow(
     const span = document.createElement("span");
     span.className = "pos";
     span.textContent = pos;
+    span.dir = "auto";
     span.title = "the last position decoded, from the view's home";
     row.append(span);
   }
@@ -476,6 +502,8 @@ function jobRow(
     const reason = document.createElement("span");
     reason.className = "reason";
     reason.textContent = (job.state && job.state.reason) || "stopped";
+    reason.dir = "auto";
+    reason.title = reason.textContent;
     row.append(reason);
   }
   const actions = document.createElement("span");
@@ -555,6 +583,41 @@ function underInputs(jobs) {
   return out;
 }
 
+// The group row of a plan's idle channels: `<n> idle <kind> on <plan>`, plus `, <m> <kind>`
+// for each kind attached to them; open unless the operator folded it this session.
+function jobGroup(plan, list, shown) {
+  const g = document.createElement("details");
+  g.className = "job-group";
+  g.dataset.plan = plan;
+  let stored = null;
+  try {
+    stored = sessionStorage.getItem(JOB_FOLD_KEY + plan);
+  } catch {
+    /* no storage: open */
+  }
+  g.open = stored !== "closed";
+  g.addEventListener("toggle", () => {
+    try {
+      sessionStorage.setItem(JOB_FOLD_KEY + plan, g.open ? "open" : "closed");
+    } catch {
+      /* the fold is not remembered */
+    }
+  });
+  const kinds = [...new Set(list.map((j) => j.kind))].join(", ");
+  const inside = new Set(list.map((j) => j.id));
+  const attached = new Map();
+  for (const j of shown) {
+    if (j.input && inside.has(j.input)) attached.set(j.kind, (attached.get(j.kind) || 0) + 1);
+  }
+  const summary = document.createElement("summary");
+  summary.dir = "auto";
+  summary.textContent =
+    `${list.length} idle ${kinds} on ${plan}` +
+    [...attached].map(([kind, m]) => `, ${m} ${kind}`).join("");
+  g.append(summary);
+  return g;
+}
+
 export function startJobs(
   api,
   el,
@@ -571,9 +634,15 @@ export function startJobs(
     onHot = null,
     mixText = null,
     mute = null,
+    countEl = null,
+    lastEvent = null,
   } = {},
 ) {
   let timer = null;
+  let foldIdleMs = JOBS_FOLD_IDLE_MS;
+  // id -> performance.now() when this page first saw the job running (its idle age starts
+  // there when no event has been seen).
+  const runningSince = new Map();
   let ageTimer = null;
   let stopped = false;
   let last = null;
@@ -629,23 +698,81 @@ export function startJobs(
       if (key === "finished_rows_s" || key === "plan" || key === "home") redraw();
     });
   }
+  // The plan id of a running job that may fold: on a plan channel, its squelch closed (a kind
+  // without one counts as closed) and no event for foldIdleMs. Every way out of a group (the
+  // job stopped, its squelch opened, an event arrived, the group under JOBS_FOLD_MIN) is this
+  // test failing at the next render, one poll at most.
+  const foldPlan = (j, now) => {
+    if (isFinished(j) || j.input || j.elastic || !j.tuning || !view) return null;
+    const ch = channelLabel(j.tuning.center_hz, view.get("plan"));
+    if (!ch) return null;
+    if (SQUELCH_KINDS.includes(j.kind)) {
+      const sq = squelch ? squelch(j.id) : null;
+      if (sq && sq.open !== false) return null;
+    }
+    const heard = lastEvent ? lastEvent(j.id) : null;
+    const since = Math.max(runningSince.get(j.id) ?? now, heard ?? -Infinity);
+    return now - since >= foldIdleMs ? ch.plan : null;
+  };
+  // The rows in list order, a plan's foldable jobs (and the jobs attached to them) wrapped in
+  // one `details.job-group[data-plan]` where the first of them stood.
+  const fold = (shown, rows) => {
+    const now = performance.now();
+    const ids = new Set(shown.map((j) => j.id));
+    for (const id of runningSince.keys()) if (!ids.has(id)) runningSince.delete(id);
+    for (const j of shown) {
+      if (isFinished(j)) runningSince.delete(j.id);
+      else if (!runningSince.has(j.id)) runningSince.set(j.id, now);
+    }
+    const planOf = new Map();
+    const members = new Map(); // plan -> its foldable jobs (not the attached ones)
+    for (const j of shown) {
+      const plan = foldPlan(j, now);
+      if (!plan) continue;
+      planOf.set(j.id, plan);
+      if (!members.has(plan)) members.set(plan, []);
+      members.get(plan).push(j);
+    }
+    for (const [plan, list] of members) if (list.length <= JOBS_FOLD_MIN) members.delete(plan);
+    const groups = new Map();
+    const out = [];
+    shown.forEach((j, i) => {
+      const plan = planOf.get(j.input ?? j.id);
+      if (!plan || !members.has(plan)) {
+        out.push(rows[i]);
+        return;
+      }
+      let g = groups.get(plan);
+      if (!g) {
+        g = jobGroup(plan, members.get(plan), shown);
+        groups.set(plan, g);
+        out.push(g);
+      }
+      g.append(rows[i]);
+    });
+    return out;
+  };
   const render = (jobs) => {
     last = jobs;
     // A job a controller (a watch) started is shown through its owner, not on its own.
     const shown = underInputs(visible(jobs)).filter((j) => !j.owner);
-    el.replaceChildren(
-      ...shown.map((j) =>
-        jobRow(j, async (id, button) => {
-          button.disabled = true;
-          try {
-            await api.op({ op: "job_stop", job: id });
-          } catch (e) {
-            if (!(e.json && e.status === 422)) transcript.note(`job_stop: ${e.message}`, true);
-          }
-          refresh();
-        }, buttons),
-      ),
+    const rows = shown.map((j) =>
+      jobRow(j, async (id, button) => {
+        button.disabled = true;
+        try {
+          await api.op({ op: "job_stop", job: id });
+        } catch (e) {
+          if (!(e.json && e.status === 422)) transcript.note(`job_stop: ${e.message}`, true);
+        }
+        refresh();
+      }, buttons),
     );
+    el.replaceChildren(...fold(shown, rows));
+    if (countEl) {
+      const n = shown.filter((j) => !isFinished(j)).length;
+      countEl.textContent = String(n);
+      countEl.title = `${n} running`;
+    }
     if (shown.length === 0) {
       const empty = document.createElement("div");
       empty.className = "empty";
@@ -670,6 +797,11 @@ export function startJobs(
   return {
     refresh,
     redraw,
+    // The idle age at which plan channels fold (JOBS_FOLD_IDLE_MS), drawn again at once.
+    foldIdle(ms) {
+      foldIdleMs = Number(ms);
+      redraw();
+    },
     close() {
       stopped = true;
       clearTimeout(timer);

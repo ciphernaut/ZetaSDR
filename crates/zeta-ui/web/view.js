@@ -28,6 +28,10 @@
 //         pane             none | a registered pane's id (default none; panes.js): the pane
 //                          shown under the waterfall. A stored id is kept over a reload before
 //                          its pane registers (the strip shows none until it does)
+//         theme            console | plain (default console): <html data-theme> (app.js)
+//         side             both | transcript | jobs | none (default both): which of the side
+//                          column's panes are open, the others folded to their header bars
+//                          (app.js applySide)
 //   homePoint(value) -> {lat, lon} | null   the `home` policy's value as numbers (null: none)
 //   setStationHome(point|null)  the node's station position ({lat, lon}; app.js reads it once
 //       with `station_get` at page load), the home used while the view's `home` is none
@@ -166,6 +170,12 @@ export const POLICIES = [
     },
   },
   { key: "theme", values: ["console", "plain"], default_: "console", describe: "console, plain" },
+  {
+    key: "side",
+    values: ["both", "transcript", "jobs", "none"],
+    default_: "both",
+    describe: "both, transcript, jobs, none",
+  },
 ];
 
 const byKey = new Map(POLICIES.map((p) => [p.key, p]));

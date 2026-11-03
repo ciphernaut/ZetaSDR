@@ -8,6 +8,9 @@
 // Footprint: `wide` or `narrow` on <html data-footprint>, narrow below NARROW_MAX_PX of
 // viewport width; `?footprint=wide|narrow` forces it. Re-evaluated on resize. In narrow the
 // side pane is a drawer opened by #drawer-toggle (<html data-drawer="open">).
+// Wide, each side pane's header bar (`.pane-head`) folds it (view policy `side`, applySide);
+// both folded narrow the column to --side-collapsed-w. The Jobs header carries the running
+// count (`.count`, set by agent.js startJobs).
 //
 // Source tabs come from `source_list` (id and tuning range; in narrow, id and a compact
 // centre in MHz such as `144.8`); the selection is kept in
@@ -832,6 +835,8 @@ function start(api) {
   state.subjects.onLearn(applyPanes);
   loadStationHome(api);
   applyTheme();
+  applySide();
+  mountSideHeads();
   applyRail();
   applyMapPane();
   state.view.onChange((key) => {
@@ -842,6 +847,7 @@ function start(api) {
       state.wf?.refreshThemeColours();
       state.wf?.redraw();
     }
+    if (key === "side") applySide();
     if (key === "map") applyMapPane();
     if (key === "pane") applyPanes();
   });
@@ -873,6 +879,7 @@ function start(api) {
   });
   state.jobs = startJobs(api, $("#jobs"), state.transcript, {
     view: state.view,
+    countEl: $(".pane.jobs h2 .count"),
     onJobs: (jobs) => {
       state.lastJobs = jobs;
       state.explore?.noteJobs(jobs);
@@ -894,6 +901,7 @@ function start(api) {
     playing: (id) => !!state.audio && state.audio.jobId === id,
     onHot: (id, on) => state.ov?.setHot(id, on),
     squelch: (id) => (state.ov ? state.ov.squelch(id) : null),
+    lastEvent: (id) => (state.ov ? state.ov.lastEvent(id) : null),
     position: (id) => (state.map ? state.map.rowText(id) : null),
     mixText: (job) => mixRowText(job.id),
     mute: muteFor,
@@ -932,6 +940,50 @@ async function loadStationHome(api) {
 // <html data-theme="console|plain"> from the view's `theme` policy; never absent.
 function applyTheme() {
   document.documentElement.dataset.theme = state.view ? state.view.get("theme") : "console";
+}
+
+// The side column's panes (view policy `side`): the ones left out of the value are folded to
+// their header bars (`section.pane[data-collapsed]`, the button's aria-expanded), and
+// <html data-side="…"> lets style.css narrow the column when both are.
+const SIDE_PANES = ["transcript", "jobs"];
+
+function sideOpen(value) {
+  if (value === "both") return SIDE_PANES;
+  return SIDE_PANES.includes(value) ? [value] : [];
+}
+
+function applySide() {
+  const value = state.view ? state.view.get("side") : "both";
+  const open = sideOpen(value);
+  for (const name of SIDE_PANES) {
+    const section = document.querySelector(`#side .pane.${name}`);
+    if (!section) continue;
+    const on = open.includes(name);
+    if (on) delete section.dataset.collapsed;
+    else section.dataset.collapsed = "";
+    section.querySelector(".pane-head")?.setAttribute("aria-expanded", String(on));
+  }
+  document.documentElement.dataset.side = value;
+}
+
+// A header bar folds or unfolds its own pane, the other kept as it is. Mounted once per
+// document (the handlers read the view of the session in force).
+let sideHeadsMounted = false;
+function mountSideHeads() {
+  if (sideHeadsMounted) return;
+  sideHeadsMounted = true;
+  for (const name of SIDE_PANES) {
+    const head = document.querySelector(`#side .pane.${name} .pane-head`);
+    if (!head) continue;
+    head.addEventListener("click", () => {
+      if (!state.view) return;
+      const open = new Set(sideOpen(state.view.get("side")));
+      if (open.has(name)) open.delete(name);
+      else open.add(name);
+      const next = open.size === 2 ? "both" : open.size === 1 ? [...open][0] : "none";
+      state.view.set("side", next);
+    });
+  }
 }
 
 // The job tags live in the waterfall's rail in the console theme, on their outlines in plain.
@@ -1271,6 +1323,11 @@ window.zetaTest = {
   },
   poll() {
     return state.jobs ? state.jobs.refresh() : Promise.resolve();
+  },
+  // The idle age (ms) after which plan channels fold into a group (agent.js JOBS_FOLD_IDLE_MS),
+  // for the page's lifetime; the rows are drawn again at once.
+  foldIdle(ms) {
+    if (state.jobs) state.jobs.foldIdle(ms);
   },
   // The node build this document connected to (null before login or on an older node).
   build() {

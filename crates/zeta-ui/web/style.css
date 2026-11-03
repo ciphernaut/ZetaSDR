@@ -406,16 +406,53 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 }
 .pane { display: flex; flex-direction: column; min-height: 0; }
 .pane.transcript { flex: 1; }
-.pane.jobs { flex: 0 0 auto; max-height: 40%; border-top: 1px solid var(--border); }
+.pane.jobs { flex: 0 0 auto; max-height: 40%; border-block-start: 1px solid var(--border); }
 .pane h2 {
   margin: 0;
-  padding: 4px 8px;
   font-size: 11px;
   font-weight: normal;
+  border-block-end: 1px solid var(--border);
+}
+/* The header bar folds its pane (view `side`, app.js applySide). */
+.pane-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  inline-size: 100%;
+  margin: 0;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--dim);
+  font: inherit;
+  text-align: start;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: var(--dim);
-  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.pane-head .count { margin-inline-start: auto; font-variant-numeric: tabular-nums; }
+.pane-head .count:empty { display: none; }
+/* Folded: the header bar only; the other pane takes the column. Wide footprint only: the
+   narrow drawer keeps both panes and its headers do not fold. */
+html:not([data-footprint="narrow"]) section.pane[data-collapsed] > :not(h2) { display: none; }
+html:not([data-footprint="narrow"]) section.pane[data-collapsed] { flex: 0 0 auto; }
+html:not([data-footprint="narrow"]) .pane.transcript[data-collapsed] + .pane.jobs {
+  flex: 1; max-height: none;
+}
+html[data-footprint="narrow"] .pane-head { pointer-events: none; cursor: default; }
+/* Both folded: the column narrows to the two header bars, read downwards. */
+html[data-side="none"]:not([data-footprint="narrow"]) #app {
+  grid-template-columns: minmax(0, 1fr) var(--side-collapsed-w);
+}
+html[data-side="none"]:not([data-footprint="narrow"]) .pane-head {
+  writing-mode: vertical-rl;
+  inline-size: auto;
+  block-size: 100%;
+  padding: 8px 4px;
+  align-items: center;
 }
 #transcript { flex: 1; overflow-y: auto; padding: 4px 8px; }
 #jobs { overflow-y: auto; padding: 4px 8px; }
@@ -430,21 +467,49 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 .line.note { color: var(--dim); font-style: italic; }
 .line.error { color: var(--error); }
 
+/* A job row, two lines and never wider than the column (spec 4.7):
+     line 1  .kind (with its tags)  .state  ...........  .actions
+     line 2  .band .source .events .mix-now .pos .reason ...  .id
+   A flex row with a forced break (::after): the text spans grow from nothing to their own
+   width, so a line shrinks its longest spans (ellipsis, the full text in their title)
+   before it would wrap. */
 .job {
-  display: grid;
-  grid-template-columns: auto auto 1fr auto auto auto auto;
-  gap: 8px;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  padding: 2px 0;
+  column-gap: 8px;
+  row-gap: 0;
+  padding-block: 2px;
+  overflow: hidden;
 }
+.job::after { content: ""; order: 4; flex-basis: 100%; block-size: 0; }
+.job > span {
+  flex: 1 1 0;
+  max-inline-size: max-content;
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.job > span:empty { display: none; }
+.job > .kind { order: 1; }
+.job > .state { order: 2; flex: 0 0 auto; }
+.job > .actions { order: 3; flex: 0 0 auto; max-inline-size: none; margin-inline-start: auto; overflow: visible; }
+.job > .band { order: 5; }
+.job > .source { order: 6; }
+.job > .events { order: 7; }
+.job > .mix-now { order: 8; }
+.job > .pos { order: 9; }
+.job > .reason { order: 10; }
+.job > .id { order: 11; flex: 0 0 auto; margin-inline-start: auto; }
 .job .kind { color: var(--accent); }
-.job.attached .kind { color: var(--dim); padding-left: 0.6em; }
+.job.attached .kind { color: var(--dim); padding-inline-start: 0.6em; }
 .job .state { color: var(--ok); }
 .job[data-state="failed"] .state { color: var(--error); }
 .job .id { color: var(--dim); }
 .job .band { color: var(--dim); font-size: 11px; }
+.job .source { color: var(--dim); }
 .job.hot { outline: 1px solid var(--accent); }
-.job.speaking { border-left: 3px solid var(--ok); }
 .job button.mute[aria-pressed="true"] { border-color: var(--dim); color: var(--dim); }
 .job .mix-now { color: var(--ok); font-size: 11px; }
 .job .events { color: var(--user); }
@@ -464,17 +529,26 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 #waterfall .wf-axis .tick.ch { color: var(--ok); font-size: 10px; }
 /* A closed squelch: the channel is quiet, not dead. */
 .job .tag.squelch { font-style: italic; }
-/* A finished row (stopped, failed) is dimmed; its reason reads inline on a line of its own. */
+/* A finished row (stopped, failed) is dimmed; its reason reads on line two. */
 .job.finished { opacity: 0.7; }
-.job .reason {
-  grid-column: 1 / -1;
-  order: 10;
-  color: var(--dim);
-  overflow-wrap: anywhere;
-}
+.job .reason { color: var(--dim); }
 .job[data-state="failed"] .reason { color: var(--error); }
-/* The last decoded position's distance and bearing from home, on a line under the row. */
-.job .pos { grid-column: 1 / -1; order: 9; color: var(--dim); }
+/* The last decoded position's distance and bearing from home. */
+.job .pos { color: var(--dim); }
+/* The start edge in the job's colour (channelColour), the speaking ground's green. */
+#jobs .job[data-colour] {
+  border-inline-start: 3px solid var(--job-c); padding-inline-start: 4px;
+}
+#jobs .job.speaking { border-inline-start-color: var(--ok); }
+/* Idle plan channels folded into one row (agent.js startJobs, spec 4.7). */
+.job-group { margin-block: 2px; }
+.job-group > summary {
+  cursor: pointer;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 /* Buttons offered after a transcript line (a conflict's "stop … and retry"). */
 .line button.action { margin-left: 6px; padding: 0 6px; font-style: normal; }
 
@@ -784,6 +858,41 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 [data-theme="console"] #waterfall .ov-ribbon.agent { background: var(--user); color: #000; border: 0; }
 [data-theme="console"] #waterfall .ov-ribbon.transcript-error .count,
 [data-theme="console"] #waterfall .ov-ribbon.agent .count { color: inherit; opacity: 0.7; }
-[data-theme="console"] #jobs .job[data-colour] {
-  border-inline-start: 3px solid var(--job-c); padding-inline-start: 4px;
+/* ---- the side column (spec 4.6, 4.7) ---- */
+/* Header bars in the frame colour, end-capped; a folded one goes idle grey. */
+[data-theme="console"] .pane h2 { border: 0; padding-block: 2px; }
+[data-theme="console"] .pane-head {
+  background: var(--c-frame);
+  color: #000;
+  border-start-end-radius: var(--radius-bar);
+  border-end-end-radius: var(--radius-bar);
 }
+[data-theme="console"] section.pane[data-collapsed] .pane-head {
+  background: var(--c-idle);
+  color: var(--text);
+}
+[data-theme="console"] .pane.jobs { border: 0; }
+/* A row is an end-capped bar in its job's colour with black text; speaking and hot as the
+   rail's tag; a finished one idle grey. */
+[data-theme="console"] #jobs .job[data-colour] {
+  background: var(--job-c);
+  color: #000;
+  border-start-end-radius: var(--radius-bar);
+  border-end-end-radius: var(--radius-bar);
+  padding-inline-end: 8px;
+  margin-block-end: 2px;
+}
+[data-theme="console"] #jobs .job[data-colour] > span,
+[data-theme="console"] #jobs .job[data-colour] .tag { color: inherit; }
+[data-theme="console"] #jobs .job[data-colour] .tag { border-color: currentColor; }
+[data-theme="console"] #jobs .job[data-colour] .actions button {
+  background: #000; color: var(--text); border-color: #000;
+}
+[data-theme="console"] #jobs .job[data-colour].speaking {
+  background: var(--c-speaking); border-inline-start-color: var(--c-speaking);
+}
+[data-theme="console"] #jobs .job[data-colour].hot { outline: 2px solid var(--text); outline-offset: -2px; }
+[data-theme="console"] #jobs .job[data-colour].finished {
+  background: var(--c-idle); color: #c8c8c8; opacity: 1;
+}
+[data-theme="console"] .job-group > summary { color: var(--text); text-transform: uppercase; }
