@@ -9,14 +9,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
-use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::{Hz, StreamId, StreamKind};
+use zeta_core::stream::{Frame, StreamBus};
+use zeta_core::types::{StreamId, StreamKind};
 
 use crate::fsk::{
-    DISCRIMINATOR_LOWPASS_FACTOR, MIN_SCALE, NORMALISER_SYMBOLS, Periods, decision_lowpass,
+    DISCRIMINATOR_LOWPASS_FACTOR, Decision, Levels, MIN_SCALE, WARMUP_DELAYS, decision_lowpass,
+    run_decision,
 };
+use crate::sps_check;
 use crate::util::StreamingFir;
-use crate::{Input, is_seam, run_map, sps_check};
 
 /// The stage kind, as graphs name it.
 pub const OOK_DEMOD_KIND: &str = "ook_demod";
@@ -30,47 +31,11 @@ pub struct OokDemodParams {
     pub symbol_rate_baud: u32,
 }
 
-/// The running off and on levels of the envelope.
-struct Levels {
-    periods: Periods,
-    /// `(lo, hi)` once the first symbol period has closed.
-    levels: Option<(f64, f64)>,
-}
-
-impl Levels {
-    /// Take one envelope sample; the `(lo, hi)` to scale it by, so the output stays in
-    /// 0..1. A sample under `lo` or over `hi` takes it at once; at each period's close
-    /// its minimum moves `lo` back by `1/NORMALISER_SYMBOLS` when it lies under the
-    /// midpoint, and its maximum moves `hi` when it lies over it, so a run of off (or
-    /// on) symbols does not drag the other level. The first period after the low-pass's
-    /// warm-up seeds both, and until it closes the extremes so far stand in.
-    fn of(&mut self, v: f64) -> (f64, f64) {
-        let closed = self.periods.push(v);
-        match (&mut self.levels, closed) {
-            (None, Some(seed)) => self.levels = Some(seed),
-            (Some((lo, hi)), closed) => {
-                *lo = lo.min(v);
-                *hi = hi.max(v);
-                if let Some((pmin, pmax)) = closed {
-                    let mid = (*lo + *hi) / 2.0;
-                    if pmin < mid {
-                        *lo += (pmin - *lo) / NORMALISER_SYMBOLS;
-                    }
-                    if pmax > mid {
-                        *hi += (pmax - *hi) / NORMALISER_SYMBOLS;
-                    }
-                }
-            }
-            (None, None) => {}
-        }
-        self.levels.unwrap_or_else(|| self.periods.seen())
-    }
-}
-
-/// The demodulator over one run of contiguous input.
+/// The OOK demodulator over one run of contiguous input.
 struct Demod {
     rate_hz: u64,
     fir: StreamingFir,
+    delay: usize,
     levels: Levels,
 }
 
@@ -78,38 +43,55 @@ impl Demod {
     fn new(p: &OokDemodParams, rate_hz: u64) -> Result<Demod, StageError> {
         sps_check(OOK_DEMOD_KIND, rate_hz, p.symbol_rate_baud).map_err(StageError::Failed)?;
         let cutoff = DISCRIMINATOR_LOWPASS_FACTOR * p.symbol_rate_baud as f64;
-        let (fir, warmup) = decision_lowpass(cutoff, rate_hz, p.symbol_rate_baud);
+        let (fir, delay) = decision_lowpass(cutoff, rate_hz, p.symbol_rate_baud);
         Ok(Demod {
             rate_hz,
             fir,
-            levels: Levels {
-                periods: Periods::new(rate_hz, p.symbol_rate_baud, warmup),
-                levels: None,
-            },
+            delay,
+            levels: Levels::new(rate_hz, p.symbol_rate_baud, WARMUP_DELAYS * delay),
         })
     }
 
-    fn process(&mut self, x: &[Complex<f32>]) -> Vec<f32> {
-        let env: Vec<f32> = x.iter().map(|s| s.norm()).collect();
-        self.fir
-            .process(&env)
+    /// Scale low-passed envelope samples to 0 (off) .. 1 (on) by the running levels.
+    fn scale(&mut self, filtered: Vec<f32>) -> Vec<f32> {
+        filtered
             .into_iter()
             .map(|v| {
                 let v = v as f64;
-                let (lo, hi) = self.levels.of(v);
+                let Some((lo, hi)) = self.levels.push(v) else {
+                    return 0.0;
+                };
                 ((v - lo) / (hi - lo).max(MIN_SCALE)) as f32
             })
             .collect()
     }
 }
 
+impl Decision for Demod {
+    fn rate_hz(&self) -> u64 {
+        self.rate_hz
+    }
+
+    fn process(&mut self, x: &[Complex<f32>]) -> Vec<f32> {
+        let env: Vec<f32> = x.iter().map(|s| s.norm()).collect();
+        let filtered = self.fir.process(&env);
+        self.scale(filtered)
+    }
+
+    /// Silence for the group delay: after the input the carrier is off.
+    fn flush(&mut self) -> Vec<f32> {
+        let filtered = self.fir.process(&vec![0.0; self.delay]);
+        self.scale(filtered)
+    }
+}
+
 /// Demodulates on-off keying into a 1-channel decision signal at the input rate: the
 /// envelope `|x|`, low-passed at [`DISCRIMINATOR_LOWPASS_FACTOR`] × `symbol_rate_baud`,
-/// scaled to 0 (off) .. 1 (on) by the running off and on levels (each tracked over
-/// [`NORMALISER_SYMBOLS`] symbol periods). An input under
-/// [`crate::MIN_SAMPLES_PER_SYMBOL`] samples per symbol fails the stage naming the rate
-/// to resample to. A seam ([`is_seam`]), a lag or a rate change restarts the filter and
-/// the levels.
+/// scaled to 0 (off) .. 1 (on) by the running off and on levels (see
+/// [`crate::fsk::Levels`]). An input under [`crate::MIN_SAMPLES_PER_SYMBOL`] samples per
+/// symbol fails the stage naming the rate to resample to. A seam ([`crate::is_seam`]), a
+/// lag, a rate change and the input's end flush the low-pass (silence for its group
+/// delay) and restart the filter and the levels.
 pub struct OokDemodStage {
     spec: StageSpec,
 }
@@ -166,46 +148,8 @@ impl Stage for OokDemodStage {
             .map_err(|e| StageError::Failed(format!("{OOK_DEMOD_KIND} params: {e}")))?;
         let [out] = <[StreamId; 1]>::try_from(outputs)
             .map_err(|o| StageError::Failed(format!("expected 1 output, got {}", o.len())))?;
-        let mut demod: Option<Demod> = None;
-        let mut prev_end: Option<u64> = None;
-        run_map(OOK_DEMOD_KIND, inputs, bus, cancel, move |input| {
-            let frame = match input {
-                Input::Frame(f) => f,
-                Input::Lagged { .. } => {
-                    demod = None;
-                    prev_end = None;
-                    return Ok(Vec::new());
-                }
-            };
-            let Payload::Iq(block) = &frame.payload else {
-                return Err(StageError::Failed(format!(
-                    "{OOK_DEMOD_KIND} stage expects iq frames"
-                )));
-            };
-            let rate = block.sample_rate_hz.0;
-            let span = &frame.provenance.span;
-            let seam = prev_end.is_some_and(|e| is_seam(e, span.start_ns.0, rate));
-            prev_end = Some(span.end_ns.0);
-            if seam || demod.as_ref().is_some_and(|d| d.rate_hz != rate) {
-                demod = None;
-            }
-            let d = match &mut demod {
-                Some(d) => d,
-                None => demod.insert(Demod::new(&p, rate)?),
-            };
-            let y = d.process(&block.samples);
-            if y.is_empty() {
-                return Ok(Vec::new());
-            }
-            Ok(vec![Frame::new(
-                out.clone(),
-                frame.provenance.clone(),
-                Payload::Audio {
-                    sample_rate_hz: Hz(rate),
-                    channels: 1,
-                    samples: y.into(),
-                },
-            )])
+        run_decision(OOK_DEMOD_KIND, inputs, out, bus, cancel, move |rate| {
+            Demod::new(&p, rate)
         })
         .await
     }
@@ -227,31 +171,58 @@ mod tests {
     use super::OokDemodStage;
     use crate::frame_span;
 
+    const RATE: u64 = 48_000;
     const BAUD: u32 = 2_400;
+    const SPS: usize = (RATE / BAUD as u64) as usize;
+    /// The decision low-pass's group delay at [`RATE`]: 41 taps.
+    const DELAY: usize = 20;
     const T0: u64 = 1_000_000_000;
+    /// Symbols per run of on or off in the test signals.
+    const RUN: usize = 4;
+    /// The on amplitude of the test signals.
+    const ON: f32 = 0.3;
 
-    async fn demod(rate: u64, iq: Vec<Complex<f32>>) -> Result<Vec<f32>, StageError> {
-        let p = Provenance {
+    fn prov(t0: u64, n: usize, rate: u64) -> Provenance {
+        Provenance {
             source: SourceId("s".into()),
             job: Some(JobId("job".into())),
             channel: None,
-            span: frame_span(Timestamp(T0), iq.len(), rate),
-        };
+            span: frame_span(Timestamp(t0), n, rate),
+        }
+    }
+
+    /// `symbols` symbols at [`RATE`] alternating in runs of [`RUN`] between `amp` (first)
+    /// and silence.
+    fn keyed(symbols: usize, amp: f32) -> Vec<Complex<f32>> {
+        (0..symbols * SPS)
+            .map(|i| {
+                let on = (i / SPS / RUN).is_multiple_of(2);
+                Complex::new(if on { amp } else { 0.0 }, 0.0)
+            })
+            .collect()
+    }
+
+    /// The stage's output frames' samples over `input` (`(t0, iq, rate)` frames).
+    async fn run_frames(
+        input: Vec<(u64, Vec<Complex<f32>>, u64)>,
+    ) -> Result<Vec<Vec<f32>>, StageError> {
         let bus = Arc::new(StreamBus::new(64));
-        let out = bus.register(StreamKind::Audio, p.clone());
+        let out = bus.register(StreamKind::Audio, prov(0, 0, RATE));
         let mut rx_out = bus.subscribe(&out).unwrap();
-        let (tx, rx) = broadcast::channel(4);
-        tx.send(Frame::new(
-            zeta_core::types::StreamId::new(),
-            p,
-            Payload::Iq(IqBlock {
-                t0: Timestamp(T0),
-                sample_rate_hz: Hz(rate),
-                center_hz: Hz(0),
-                samples: iq.into(),
-            }),
-        ))
-        .unwrap();
+        let (tx, rx) = broadcast::channel(input.len().max(1));
+        for (t0, iq, rate) in input {
+            tx.send(Frame::new(
+                zeta_core::types::StreamId::new(),
+                prov(t0, iq.len(), rate),
+                Payload::Iq(IqBlock {
+                    t0: Timestamp(t0),
+                    sample_rate_hz: Hz(rate),
+                    center_hz: Hz(0),
+                    samples: iq.into(),
+                }),
+            ))
+            .unwrap();
+        }
         drop(tx);
         OokDemodStage::new()
             .run(
@@ -263,7 +234,7 @@ mod tests {
                 StageContext::new(SourceId("s".into())),
             )
             .await?;
-        let mut y = Vec::new();
+        let mut frames = Vec::new();
         while let Ok(f) = rx_out.try_recv() {
             let Payload::Audio {
                 sample_rate_hz,
@@ -273,35 +244,85 @@ mod tests {
             else {
                 panic!("an audio frame")
             };
-            assert_eq!((sample_rate_hz.0, channels), (rate, 1));
-            y.extend(samples.iter().copied());
+            assert_eq!((sample_rate_hz.0, channels), (RATE, 1));
+            frames.push(samples.to_vec());
         }
-        Ok(y)
+        Ok(frames)
+    }
+
+    /// The mean output over input symbol `k` (the low-pass's delay allowed for).
+    fn symbol_mean(y: &[f32], k: usize) -> f32 {
+        let w = &y[k * SPS + DELAY..(k + 1) * SPS + DELAY];
+        w.iter().sum::<f32>() / SPS as f32
+    }
+
+    /// The middle symbol of the on run and of the off run starting at symbol `k`.
+    fn on_off(y: &[f32], k: usize) -> (f32, f32) {
+        (
+            symbol_mean(y, k + RUN / 2),
+            symbol_mean(y, k + RUN + RUN / 2),
+        )
     }
 
     #[tokio::test]
     async fn on_and_off_map_to_one_and_zero() {
-        let rate = 48_000u64;
-        let sps = (rate / BAUD as u64) as usize;
-        // Alternating runs of 4 symbols on, 4 off, at amplitude 0.3.
-        let iq: Vec<Complex<f32>> = (0..64 * sps)
-            .map(|i| {
-                let on = (i / sps / 4).is_multiple_of(2);
-                Complex::new(if on { 0.3 } else { 0.0 }, 0.0)
-            })
-            .collect();
-        let y = demod(rate, iq).await.unwrap();
-        assert_eq!(y.len(), 64 * sps);
-        // The middle of the run of each kind near the end, clear of the filter's delay.
-        let mean = |k: usize| y[k * sps..(k + 1) * sps].iter().sum::<f32>() / sps as f32;
-        let (on, off) = (mean(56 + 2), mean(60 + 2));
+        const SYMBOLS: usize = 64;
+        let iq = keyed(SYMBOLS, ON);
+        let n = iq.len();
+        let y = run_frames(vec![(T0, iq, RATE)]).await.unwrap().concat();
+        // The flush lets the last input samples out: one output per input, plus the delay.
+        assert_eq!(y.len(), n + DELAY);
+        let (on, off) = on_off(&y, SYMBOLS - 2 * RUN);
         assert!((on - 1.0).abs() < 0.1, "on reads {on}");
         assert!(off.abs() < 0.1, "off reads {off}");
     }
 
+    /// Symbols after an impulse within which the on-level reads 1 again (within 0.1): the
+    /// release takes back the quarter of the excess the attack let in, at 1/64 a period.
+    /// Measured: 96 symbols suffice and 64 do not; the bound keeps a margin.
+    const IMPULSE_RECOVERY_SYMBOLS: usize = 128;
+
+    #[tokio::test]
+    async fn the_on_level_recovers_from_an_impulse() {
+        // 64 keyed symbols, one symbol at 5x the on amplitude, then keying again.
+        const BEFORE: usize = 64;
+        const AFTER: usize = 320;
+        let mut iq = keyed(BEFORE, ON);
+        iq.extend(vec![Complex::new(5.0 * ON, 0.0); SPS]);
+        // The keying resumes on a whole run boundary after the impulse symbol.
+        iq.extend(vec![Complex::new(0.0, 0.0); (RUN - 1) * SPS]);
+        iq.extend(keyed(AFTER, ON));
+        let y = run_frames(vec![(T0, iq, RATE)]).await.unwrap().concat();
+        let resume = BEFORE + RUN;
+        let (on, _) = on_off(&y, resume);
+        assert!(on < 0.9, "the impulse should lift the on level, reads {on}");
+        for k in (resume + IMPULSE_RECOVERY_SYMBOLS..resume + AFTER - 2 * RUN).step_by(2 * RUN) {
+            let (on, off) = on_off(&y, k);
+            assert!((on - 1.0).abs() < 0.1, "symbol {k}: on reads {on}");
+            assert!(off.abs() < 0.1, "symbol {k}: off reads {off}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seam_resets_the_levels_and_flushes_the_run() {
+        // 32 symbols at amplitude 1, a 1 s gap, then 32 at 0.2: after the seam the levels
+        // start again, so the quieter stream reads 1; carried over it would read 0.2.
+        const SYMBOLS: usize = 32;
+        let (a, b) = (keyed(SYMBOLS, 1.0), keyed(SYMBOLS, 0.2));
+        let n = a.len();
+        let frames = run_frames(vec![(T0, a, RATE), (T0 + 2_000_000_000, b, RATE)])
+            .await
+            .unwrap();
+        let lens: Vec<usize> = frames.iter().map(Vec::len).collect();
+        assert_eq!(lens, [n, DELAY, n, DELAY]);
+        let (on, off) = on_off(&frames[2], SYMBOLS - 2 * RUN);
+        assert!((on - 1.0).abs() < 0.1, "after the seam on reads {on}");
+        assert!(off.abs() < 0.1, "after the seam off reads {off}");
+    }
+
     #[tokio::test]
     async fn too_few_samples_per_symbol_is_refused() {
-        let e = demod(7_200, vec![Complex::new(1.0, 0.0); 100])
+        let e = run_frames(vec![(T0, vec![Complex::new(1.0, 0.0); 100], 7_200)])
             .await
             .unwrap_err();
         assert!(
