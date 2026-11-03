@@ -1235,8 +1235,9 @@ function answerRibbon(text) {
 // what the coarse layer follows (`coarse()`: {scanJobId, followed, source, rows}), the
 // format of the last painted spectrum row (`lastRowFormat`: "q" or "db", null before one), its
 // mode (`waterfallMode`: "spectrum" or "scan", null without a waterfall),
-// draw the narrow-footprint answer ribbon for `text` without an LLM (ruling R3), and draw a
-// probe label at a frequency.
+// draw the narrow-footprint answer ribbon for `text` without an LLM (ruling R3) or, given
+// `hz` first, a ribbon at hz (keyed by `key` when given; the element), and draw a probe label
+// at a frequency.
 window.zetaTest = {
   get lastRowFormat() {
     return state.wf ? state.wf.lastRowFormat : null;
@@ -1244,8 +1245,11 @@ window.zetaTest = {
   get waterfallMode() {
     return state.wf ? state.wf.mode : null;
   },
-  ribbon(text) {
-    answerRibbon(text);
+  ribbon(...args) {
+    if (args.length <= 1) return answerRibbon(args[0]);
+    const [hz, text, cls, key] = args;
+    if (!state.ov) return null;
+    return key ? state.ov.keyedRibbon(key, hz, text, cls, 1, () => false) : state.ov.ribbon(hz, text, cls);
   },
   // A layer-1 overlay label `name` at `hz` (key "probe"); the element, or null without overlays.
   label(hz, name) {

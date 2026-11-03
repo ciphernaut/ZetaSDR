@@ -372,18 +372,23 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 #waterfall .ov-label[data-layer="2"] { color: var(--accent); border-color: var(--accent); }
 #waterfall .ov-ribbon {
   max-width: 80%; overflow: hidden; text-overflow: ellipsis; color: var(--text);
-  border-left: 2px solid var(--user);
+  border-inline-start: 2px solid var(--user);
+  /* overlays.js sets `top` to the ribbon's centre line (spec 4.5): the box is centred on it and
+     leans by the theme about its own centre; a lane step glides over RIBBON_STEP_MS */
+  transform: translateY(-50%) rotate(var(--ribbon-tilt));
+  transform-origin: center;
+  transition: top var(--ribbon-step-ms, 160ms) ease-out;
 }
 #waterfall .ov-ribbon .count { color: var(--dim); }
 #waterfall .ov-ribbon.aprs { color: var(--user); }
-#waterfall .ov-ribbon.pocsag { color: var(--user); border-left-color: var(--user); }
-#waterfall .ov-ribbon.rds { color: var(--ok); border-left-color: var(--ok); }
-#waterfall .ov-ribbon.adsb { color: var(--accent); border-left-color: var(--accent); }
-#waterfall .ov-ribbon.acars { color: var(--text); border-left-color: var(--accent); }
-#waterfall .ov-ribbon.transcript { color: var(--text); border-left-color: var(--ok); }
-#waterfall .ov-ribbon.transcript-error { color: var(--error); border-left-color: var(--error); }
+#waterfall .ov-ribbon.pocsag { color: var(--user); border-inline-start-color: var(--user); }
+#waterfall .ov-ribbon.rds { color: var(--ok); border-inline-start-color: var(--ok); }
+#waterfall .ov-ribbon.adsb { color: var(--accent); border-inline-start-color: var(--accent); }
+#waterfall .ov-ribbon.acars { color: var(--text); border-inline-start-color: var(--accent); }
+#waterfall .ov-ribbon.transcript { color: var(--text); border-inline-start-color: var(--ok); }
+#waterfall .ov-ribbon.transcript-error { color: var(--error); border-inline-start-color: var(--error); }
 #waterfall .ov-ribbon.agent {
-  white-space: normal; overflow-wrap: anywhere; color: var(--accent); border-left-color: var(--accent);
+  white-space: normal; overflow-wrap: anywhere; color: var(--accent); border-inline-start-color: var(--accent);
 }
 #wf-badge {
   position: absolute; top: 8px; right: 8px; padding: 2px 8px; z-index: 1;
@@ -766,9 +771,18 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 [data-theme="console"] #waterfall .outline[data-colour] { border-color: var(--job-c); }
 [data-theme="console"] #waterfall .outline[data-colour].hot { border-color: var(--text); }
 [data-theme="console"] #waterfall .outline[data-colour].speaking { border-color: var(--c-speaking); }
-[data-theme="console"] #waterfall .ov-ribbon[data-colour]:not(.transcript-error):not(.agent) {
-  border-inline-start-color: var(--job-c);
+/* a ribbon's ground is its job's colour; an error or dropped chunk and the agent's own notes
+   stand apart (spec 4.4) */
+[data-theme="console"] #waterfall .ov-ribbon[data-colour] {
+  background: var(--job-c); color: #000; border: 0;
 }
+[data-theme="console"] #waterfall .ov-ribbon[data-colour] .count { color: inherit; opacity: 0.7; }
+[data-theme="console"] #waterfall .ov-ribbon.transcript-error {
+  background: var(--error); color: #000; border: 0;
+}
+[data-theme="console"] #waterfall .ov-ribbon.agent { background: var(--user); color: #000; border: 0; }
+[data-theme="console"] #waterfall .ov-ribbon.transcript-error .count,
+[data-theme="console"] #waterfall .ov-ribbon.agent .count { color: inherit; opacity: 0.7; }
 [data-theme="console"] #jobs .job[data-colour] {
   border-inline-start: 3px solid var(--job-c); padding-inline-start: 4px;
 }

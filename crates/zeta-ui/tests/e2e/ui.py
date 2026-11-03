@@ -4342,6 +4342,71 @@ def scenario_keyed_ribbons_with_equal_text_stay_two(page, url, secret):
     assert r == ["×3", "×2"], r
 
 
+# ---- riding ribbons (plan 24 Task 4) -----------------------------------------------------
+
+def scenario_ribbon_rides_band(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    job = start_job(url, secret, "passthrough", "retune", cur, 10_000)
+    try:
+        page.evaluate("window.zetaTest.poll()")
+        ol = page.locator(f'#waterfall .outline[data-key="{job}"]').bounding_box()
+        page.evaluate(f"window.zetaTest.ribbon({cur}, 'first chunk', 'transcript')")
+        first = page.locator("#waterfall .ov-ribbon.transcript", has_text="first chunk")
+        fb = first.bounding_box()
+        assert abs((fb["y"] + fb["height"] / 2) - (ol["y"] + ol["height"] / 2)) <= 2, (fb, ol)
+        tilt = page.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--ribbon-tilt').trim()")
+        assert tilt == "-15deg", tilt
+        page.evaluate(f"window.zetaTest.ribbon({cur}, 'second chunk', 'transcript')")
+        second = page.locator("#waterfall .ov-ribbon.transcript", has_text="second chunk")
+        page.wait_for_timeout(300)
+        top1 = page.evaluate("el => parseFloat(el.style.top)", first.element_handle())
+        top2 = page.evaluate("el => parseFloat(el.style.top)", second.element_handle())
+        h = page.evaluate("el => el.offsetHeight", second.element_handle())
+        assert abs((top2 - top1) - (h + 2)) <= 1, (top1, top2, h)
+        # A keyed ribbon (a subject) never steps: a second one with the same key replaces in place.
+        page.evaluate(f"window.zetaTest.ribbon({cur + 3_000}, 'VH-A 1', 'kr', 'VH-A')")
+        page.evaluate(f"window.zetaTest.ribbon({cur + 3_000}, 'VH-A 2', 'kr', 'VH-A')")
+        expect(page.locator("#waterfall .ov-ribbon.kr")).to_have_count(1)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_ribbon_clips_at_other_band(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    set_band(page, cur, 40_000)
+    lo = start_job(url, secret, "passthrough", "retune", cur - 2_000, 1_000)
+    hi = start_job(url, secret, "passthrough", "retune", cur + 2_000, 1_000)
+    try:
+        page.evaluate("window.zetaTest.poll()")
+        for i in range(4):
+            page.evaluate(f"window.zetaTest.ribbon({cur - 2_000}, 'lo {i}', 'transcript')")
+        page.wait_for_timeout(300)
+        hi_y = page.locator(f'#waterfall .outline[data-key="{hi}"]').bounding_box()
+        hi_c = hi_y["y"] + hi_y["height"] / 2
+        for el in page.locator("#waterfall .ov-ribbon.transcript").element_handles():
+            b = el.bounding_box()
+            assert not (b["y"] <= hi_c <= b["y"] + b["height"]), f"ribbon crossed the other band: {b} {hi_c}"
+    finally:
+        stop_job(url, secret, lo)
+        stop_job(url, secret, hi)
+
+
+def scenario_dir_auto(page, url, secret):
+    select_source(page, url, secret, "tone")
+    cur = source_info(url, secret, "tone")["current"]["center_hz"]
+    page.evaluate(f"window.zetaTest.ribbon({cur}, 'مرحبا بالعالم', 'transcript')")
+    rib = page.locator("#waterfall .ov-ribbon.transcript", has_text="مرحبا")
+    assert rib.get_attribute("dir") == "auto"
+    assert page.evaluate("el => getComputedStyle(el).direction", rib.element_handle()) == "rtl"
+    run_cmd(page, "view get theme")
+    line = page.locator("#transcript .line").last
+    assert line.locator("span").first.get_attribute("dir") == "auto"
+
+
 def scenario_protocol_text_has_no_adsb_case(page, url, secret):
     login(page, url, secret)
     r = page.evaluate(

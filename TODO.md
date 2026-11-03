@@ -161,19 +161,11 @@ Found in plan 16 task 7 (pre-existing): the debug-build bank path at 2.048 MHz d
 
 ## UI: staircase transcript ribbons on the waterfall
 
-From the operator, 2026-10-27. Ribbons enter at the right edge and move left with the waterfall's columns (`crates/zeta-ui/web/overlays.js` `ribbon`/`place`): a new ribbon at the same frequency is pushed down a lane when it would overlap the previous one, up to `MAX_LANES`. On a busy channel this stacks downward with no order the eye can follow.
+From the operator, 2026-10-27. Plan 24 shipped the step-up rule (`crates/zeta-ui/web/overlays.js` `place`/`fallBack`, behind `RIBBON_STEP_DIR` and `RIBBON_STEP_MS`): a new chunk takes its band's line, the unkeyed ribbons it overlaps step one lane up over 160 ms, a ribbon that would pass `MAX_LANES` (8) or reach another job band's base lane clips under the newer one, and lanes fall back as the line clears. `RIBBON_STEP_DIR = 1` with `RIBBON_STEP_MS = 0` restores the old push-down.
 
-Wanted: when a new transcript line arrives on a channel, the previous one steps up (or the new one takes the base lane and older ones shift up), so a channel's lines always form a staircase: newest at the channel's frequency, older ones ascending and ageing out to the left. The eye reads one channel's conversation top to bottom, time ordered.
-
-Points to work out:
-- Animate the step (a short CSS transition on `top`) so the move reads as a scroll, not a jump.
-- Screen real estate: the number of lanes must come from the pixel height available between this channel and the next job's ribbons, so phone, laptop and a 4K wall give 2, 4 and 8 lanes rather than a constant. Collisions between two channels' staircases: the lower channel's staircase should fold to fewer lanes rather than overlap.
-- Interaction with `transcript-error` and `[dropped]` ribbons (they take a lane too) and with the `×N` repeat merge.
-- Keep the UI e2e scenarios that find ribbons by text (they should not depend on lane).
-
-Scope estimate: 100-200 lines in `overlays.js` plus CSS; one or two scenarios.
-
-Related: a state-stream decoder (ADS-B) does not want a staircase at all but one ribbon per subject, folded by key; see plan 23 (subjects) and "UI: state-stream decoders beyond the first subjects" below. The two should share the lane budget: a staircase for packet-shaped rows, a held roster line for keyed rows.
+Left:
+- A lane budget from the pixel height between this band and the next job's band, per footprint, so phone, laptop and a 4K wall give 2, 4 and 8 lanes rather than the constant `MAX_LANES`; the lower channel's staircase folds to fewer lanes rather than clipping.
+- The staircase sharing lanes with keyed rows (subjects, `fold`): today a keyed ribbon takes the first free lane and never steps, and an unkeyed chunk on the line simply draws over it. A held roster line for keyed rows and a staircase for packet-shaped rows should share one lane budget (see plan 23 and "UI: state-stream decoders beyond the first subjects" below).
 
 ## UI: state-stream decoders beyond the first subjects
 

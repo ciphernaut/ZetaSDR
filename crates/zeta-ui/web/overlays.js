@@ -128,7 +128,18 @@
 //         entering at the right edge and moving left with the waterfall's columns
 //         (wf.onColumn); removed when it leaves the left edge or RIBBON_TTL_MS after it was
 //         last refreshed. The same text and class still at the right edge is refreshed with a
-//         ×N count instead of drawn again; a different one overlapping it is moved below.
+//         ×N count instead of drawn again. `top` is the ribbon's centre line (style.css's
+//         translateY(-50%) centres the box on it, rotated by --ribbon-tilt about its centre;
+//         `right` and `top` stay the untilted box). A ribbon is in lane `lane` (0: on the band
+//         line, yFor(hz)); its top is yFor(hz) + lane * RIBBON_STEP_DIR * (h + RIBBON_GAP_PX).
+//         A new one takes lane 0 and every unkeyed ribbon it overlaps (at the right edge,
+//         and, in turn, every one those overlap) steps one lane on, animated over
+//         RIBBON_STEP_MS; one that would pass MAX_LANES or reach another job band's base lane
+//         (its centre line plus or minus half a lane) keeps its lane and gets class `clipped`,
+//         its tail under the newer ribbon (newer ribbons draw higher). On each layout a ribbon
+//         whose next lane down is clear falls back one lane. A keyed ribbon never steps nor
+//         falls: a new one takes the first lane free of overlap. Its `data-colour` is that of
+//         the job outline whose band holds hz (the narrowest), none when no job band does.
 //         At most MAX_RIBBONS are kept: the oldest goes first.
 //     ov.label(hz, {layer, name, confidence, evidence}, key = "") -> element
 //         "L<layer> <name> <confidence, 2 dp>" at the left edge at wf.yForHz(hz); a layer-2
@@ -192,6 +203,13 @@ const KEYED_RIBBON_MS = 500;
 const RIBBON_GAP_PX = 2;
 const LABEL_GAP_PX = 2;
 const MAX_LANES = 8;
+// Ribbon collisions. A new ribbon takes its band's line; the ribbons it overlaps step one lane
+// away in RIBBON_STEP_DIR (-1 up, +1 down) over RIBBON_STEP_MS, at most MAX_LANES lanes and never
+// into another band's base lane (they clip instead), and fall back as the line clears. Keyed
+// (subject) ribbons never step. To return to the pre-plan-24 behaviour set RIBBON_STEP_DIR = 1
+// and RIBBON_STEP_MS = 0.
+export const RIBBON_STEP_DIR = -1;
+export const RIBBON_STEP_MS = 160;
 const TAG_GAP_PX = 2;
 const RAIL_THIN_PX = 5; // a collapsed rail tag's height (style.css --rail-thin-px)
 const RAIL_GROUP_MIN = 6; // a cluster with more thin tags than this titles the first with the count
@@ -313,7 +331,7 @@ class Overlays {
     this.marks = new Map(); // `${job id}:${rounded centre}` -> {el, hz}: a watch's `signal new`
     this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
-    this.ribbons = []; // {el, bodyEl, countEl, text, cls, hz, w, h, top, dy, right, born, count, key, held}
+    this.ribbons = []; // {el, bodyEl, countEl, text, cls, hz, band, w, h, top, lane, right, born, count, key, held}
     this.eventFns = []; // ov.onEvent listeners
     this.positioned = new Map(); // job id -> {job, ids, subs, closed, positionOnly: true}
     this.resolvingPositioned = false; // a GET /streams for unwatched positioned jobs
@@ -324,6 +342,7 @@ class Overlays {
 
     this.layer = document.createElement("div");
     this.layer.className = "ov-layer";
+    this.layer.style.setProperty("--ribbon-step-ms", `${RIBBON_STEP_MS}ms`);
     el.append(this.layer);
 
     wf.onColumn((shift) => this.scroll(shift));
@@ -616,12 +635,6 @@ class Overlays {
 
   render(rec, p) {
     const job = rec.job;
-    // A ribbon takes its job's colour (an attached job's, its input's).
-    const colour = channelColour(job.input ?? job.id);
-    const paint = (el) => {
-      if (el) el.dataset.colour = colour;
-      return el;
-    };
     const obj = p && typeof p === "object" && !Array.isArray(p);
     if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
     for (const fn of this.eventFns) fn(job, p);
@@ -656,29 +669,29 @@ class Overlays {
           this.refreshTag(this.outlines.get(job.input));
         }
         const t = transcriptRibbon(p);
-        const el = paint(this.ribbon(tuningCentre(job), t.text, t.cls));
+        const el = this.ribbon(tuningCentre(job), t.text, t.cls);
         if (el && t.title) el.title = `${t.text}\n${t.title}`;
         return;
       }
       if (typeof p.summary === "string") {
         if (this.subjectRibbon(job, p)) return;
-        paint(this.ribbon(tuningCentre(job), p.summary, typeof p.protocol === "string" ? p.protocol : "event"));
+        this.ribbon(tuningCentre(job), p.summary, typeof p.protocol === "string" ? p.protocol : "event");
         return;
       }
       if (typeof p.protocol === "string") {
         const text = protocolText(p);
         if (text !== null) {
-          paint(this.ribbon(tuningCentre(job), text, p.protocol));
+          this.ribbon(tuningCentre(job), text, p.protocol);
           return;
         }
       }
       if ("src" in p && "info" in p) {
-        paint(this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}`, "aprs"));
+        this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}`, "aprs");
         return;
       }
     }
     const json = JSON.stringify(p) ?? String(p);
-    paint(this.ribbon(tuningCentre(job), json.slice(0, OTHER_EVENT_CHARS), "event"));
+    this.ribbon(tuningCentre(job), json.slice(0, OTHER_EVENT_CHARS), "event");
   }
 
   onEvent(fn) {
@@ -730,11 +743,10 @@ class Overlays {
     if (row.subject.waterfall === "fold") {
       const s = store.subjectOf(job, p);
       if (!s) return false;
-      const el = this.keyedRibbon(
+      this.keyedRibbon(
         `job:${job.id}:${k.key}`, hz, () => subjectSummary(s), row.protocol, s.count,
         () => store.held(job.id, k.key),
       );
-      if (el) el.dataset.colour = channelColour(job.id);
       return true;
     }
     const line = () => {
@@ -742,8 +754,7 @@ class Overlays {
       const label = last ? subjectLabel(last) : "";
       return `${row.protocol} ${store.size(job.id)} ${row.subject.name}, last ${label}`;
     };
-    const el = this.keyedRibbon(`job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null));
-    if (el) el.dataset.colour = channelColour(job.id);
+    this.keyedRibbon(`job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null));
     return true;
   }
 
@@ -756,8 +767,7 @@ class Overlays {
     let r = this.ribbons.find((o) => o.key === key);
     const fresh = !r;
     if (fresh) {
-      r = this.makeRibbon(hz, typeof text === "function" ? String(text()) : String(text), cls);
-      r.key = key;
+      r = this.makeRibbon(hz, typeof text === "function" ? String(text()) : String(text), cls, key);
       r.countText = "";
       r.drawn = 0;
     }
@@ -815,9 +825,12 @@ class Overlays {
   }
 
   // A new ribbon record, drawn and placed, never folded into another by its text.
-  makeRibbon(hz, text, cls) {
+  makeRibbon(hz, text, cls, key = undefined) {
     const el = document.createElement("div");
     el.className = cls ? `ov-ribbon ${cls}` : "ov-ribbon";
+    el.dir = "auto";
+    const band = this.bandOf(hz);
+    if (band) el.dataset.colour = band.el.dataset.colour;
     const body = document.createElement("span");
     body.textContent = text;
     const countEl = document.createElement("span");
@@ -826,27 +839,111 @@ class Overlays {
     el.title = text;
     el.style.right = "0px";
     this.layer.append(el);
-    const r = { el, bodyEl: body, countEl, text, cls, hz, dy: 0, right: 0, born: performance.now(), count: 1 };
+    const r = {
+      el, bodyEl: body, countEl, text, cls, hz, band: band ? band.key : null, lane: 0, right: 0,
+      born: performance.now(), count: 1, key,
+    };
     r.w = el.offsetWidth;
     r.h = el.offsetHeight;
+    el.style.zIndex = String(this.ribbons.length);
     this.place(r);
     this.ribbons.push(r);
     while (this.ribbons.length > MAX_RIBBONS) this.ribbons.shift().el.remove();
     return r;
   }
 
-  // Moves a new ribbon below any ribbon it would overlap at the right edge.
-  place(r) {
-    const base = this.yFor(r.hz) - r.h / 2;
-    let top = base;
-    for (let lane = 0; lane < MAX_LANES; lane++) {
-      const hit = this.ribbons.find((o) => o !== r && o.right < r.w && top < o.top + o.h && o.top < top + r.h);
-      if (!hit) break;
-      top = hit.top + hit.h + RIBBON_GAP_PX;
+  // The narrowest job outline whose band holds `hz` ({key, el}), or null (no job band does,
+  // or hz unknown): the band a ribbon at hz belongs to.
+  bandOf(hz) {
+    if (typeof hz !== "number") return null;
+    let best = null;
+    for (const [key, o] of this.outlines) {
+      if (!o.job || !o.el.dataset.colour || hz < o.lo || hz > o.hi) continue;
+      if (!best || o.hi - o.lo < best.o.hi - best.o.lo) best = { key, el: o.el, o };
     }
-    r.dy = top - base;
-    r.top = top;
-    r.el.style.top = `${top}px`;
+    return best;
+  }
+
+  // The centre line of ribbon `r` in lane `lane` (layer px).
+  laneTop(r, lane) {
+    return this.yFor(r.hz) + lane * RIBBON_STEP_DIR * (r.h + RIBBON_GAP_PX);
+  }
+
+  // Whether ribbons a and b overlap, a's centre line at `top` (a.top when not given).
+  ribbonsOverlap(a, b, top = a.top) {
+    return (
+      a.right < b.right + b.w &&
+      b.right < a.right + a.w &&
+      Math.abs(top - b.top) < (a.h + b.h) / 2
+    );
+  }
+
+  // Whether ribbon r, its centre line at `top`, would reach another job band's base lane
+  // (that band's centre line plus or minus half a lane).
+  crossesOtherBand(r, top) {
+    const half = (r.h + RIBBON_GAP_PX) / 2;
+    for (const [key, o] of this.outlines) {
+      if (!o.job || key === r.band) continue;
+      const y = this.yFor((o.lo + o.hi) / 2);
+      if (Math.abs(top - y) < r.h / 2 + half) return true;
+    }
+    return false;
+  }
+
+  setLane(r, lane) {
+    r.lane = lane;
+    r.top = this.laneTop(r, lane);
+    r.el.style.top = `${r.top}px`;
+  }
+
+  // Places a new (or redrawn) ribbon at the right edge. An unkeyed one takes the band line and
+  // steps the unkeyed ribbons it overlaps one lane on, and in turn those they then overlap; a
+  // ribbon that cannot step (MAX_LANES, another band's base lane) is clipped where it is. A
+  // keyed one takes the first lane free of overlap and moves nobody.
+  place(r) {
+    if (r.key) {
+      let lane = 0;
+      for (let l = 0; l < MAX_LANES; l++) {
+        const top = this.laneTop(r, l);
+        if (!this.ribbons.some((o) => o !== r && this.ribbonsOverlap(r, o, top))) {
+          lane = l;
+          break;
+        }
+      }
+      this.setLane(r, lane);
+      return;
+    }
+    this.setLane(r, 0);
+    r.el.classList.remove("clipped");
+    const seen = new Set([r]);
+    const queue = [r];
+    while (queue.length > 0) {
+      const x = queue.shift();
+      for (const o of this.ribbons) {
+        if (seen.has(o) || o.key || !this.ribbonsOverlap(x, o)) continue;
+        seen.add(o);
+        const lane = o.lane + 1;
+        const top = this.laneTop(o, lane);
+        if (lane >= MAX_LANES || this.crossesOtherBand(o, top)) {
+          o.el.classList.add("clipped");
+          continue;
+        }
+        o.el.classList.remove("clipped");
+        this.setLane(o, lane);
+        queue.push(o);
+      }
+    }
+  }
+
+  // Each unkeyed ribbon off its band line whose next lane down is clear falls back one lane.
+  fallBack() {
+    for (const r of this.ribbons) {
+      if (r.key || r.lane <= 0) continue;
+      const top = this.laneTop(r, r.lane - 1);
+      if (this.ribbons.some((o) => o !== r && this.ribbonsOverlap(r, o, top))) continue;
+      r.el.classList.remove("clipped");
+      this.setLane(r, r.lane - 1);
+    }
   }
 
   label(hz, { layer = 1, name = "?", confidence = null, evidence = null } = {}, key = "") {
@@ -1469,10 +1566,8 @@ class Overlays {
       if (!this.drag || this.drag.key !== key) this.placeOutline(o);
     }
     this.placeGhost();
-    for (const r of this.ribbons) {
-      r.top = this.yFor(r.hz) - r.h / 2 + r.dy;
-      r.el.style.top = `${r.top}px`;
-    }
+    for (const r of this.ribbons) this.setLane(r, r.lane);
+    this.fallBack();
     for (const m of this.marks.values()) m.el.style.top = `${this.yFor(m.hz)}px`;
     for (const l of this.labels.values()) {
       l.el.style.top = `${this.yFor(l.hz) - l.h / 2 + (l.dy || 0)}px`;

@@ -232,6 +232,7 @@ export class Transcript {
       const line = document.createElement("div");
       line.className = "line " + classes;
       const body = document.createElement("span");
+      body.dir = "auto";
       body.textContent = text;
       const countEl = document.createElement("span");
       countEl.className = "count";
