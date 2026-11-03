@@ -1424,16 +1424,17 @@ impl Node {
             order: None,
             tone_spacing_hz: None,
         });
-        let label = match modulation {
-            Some(_) => None,
-            None => crate::ops::classify_capture(&self.classifiers(), &named)
-                .await
-                .map_err(NodeError::Other)?
-                .labels
-                .into_iter()
-                .find(|l| l.layer == 1)
-                .map(|l| l.name),
+        // The layer-1 label names the modulation when the request does not, and a
+        // `noise` label keeps the chain off the measured centre; with the modulation
+        // given, a capture that does not classify is only unlabelled.
+        let classified = crate::ops::classify_capture(&self.classifiers(), &named).await;
+        let classified = match (modulation, classified) {
+            (_, Ok(c)) => Some(c),
+            (Some(_), Err(_)) => None,
+            (None, Err(e)) => return Err(NodeError::Other(e)),
         };
+        let label =
+            classified.and_then(|c| c.labels.into_iter().find(|l| l.layer == 1).map(|l| l.name));
         let plan = crate::bits::bits_plan(
             &set,
             &features,

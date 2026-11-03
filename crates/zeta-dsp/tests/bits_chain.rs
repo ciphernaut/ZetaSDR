@@ -524,52 +524,82 @@ fn ev1527_codes(chips: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// The EV1527 codes the OOK chain recovers from the real-remote fixture `name`
-/// (`tests/data/<name>.sigmf-meta`, cf32 at 51 200 Hz centred on the remote), through
-/// the chain `bits_start` builds for OOK.
-async fn remote_codes(name: &str) -> Vec<u32> {
+/// The stages `bits_start` builds for `plan`, without its `capture_in` (the harness
+/// feeds the IQ) and `bit_view` (the slicer's `bits` events are what is read), in graph
+/// order.
+fn plan_stages(plan: &zeta_core::bits::BitsPlan) -> Vec<(String, Value)> {
+    zeta_core::bits::bits_graph(plan)
+        .nodes
+        .into_iter()
+        .filter(|n| !matches!(n.kind.as_str(), "capture_in" | "bit_view"))
+        .map(|n| (n.kind, n.params))
+        .collect()
+}
+
+/// The chips and EV1527 codes that the chain `bits_start` builds recovers from the
+/// real-remote fixture `name` (`tests/data/<name>.sigmf-meta`, cf32 at 51 200 Hz centred
+/// on the remote): the plan is made from the fixture's own record and feature values,
+/// centred on the capture, OOK at [`REMOTE_BAUD`].
+async fn remote_codes(name: &str) -> (String, Vec<u32>) {
     let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data")
         .join(format!("{name}.sigmf-meta"));
     let (m, iq) = zeta_core::capture::read_cf32(&meta).expect("fixture");
     let rate = m.sample_rate_hz.0;
-    let chain_rate =
-        zeta_core::bits::chain_rate_hz(rate, REMOTE_BAUD, zeta_core::bits::Modulation::Ook, 2);
-    let events = run_chain(
-        &[
-            ("resample", json!({"out_rate_hz": chain_rate})),
-            ("ook_demod", json!({"symbol_rate_baud": REMOTE_BAUD})),
-            (
-                "clock_recover",
-                json!({"symbol_rate_baud": REMOTE_BAUD, "algorithm": "early_late"}),
-            ),
-            ("slicer", json!({})),
-        ],
-        &iq,
-        rate,
+    let mut features: zeta_core::classify::FeatureRecord =
+        serde_json::from_value(m.annotations[0]["zeta:features"].clone()).expect("features");
+    features.center_hz = m.center_hz;
+    let record = zeta_core::bursts::CaptureRecord {
+        id: name.into(),
+        data_path: meta.with_extension("sigmf-data"),
+        meta_path: meta,
+        source: SourceId("s".into()),
+        set: JobId("set".into()),
+        center_hz: m.center_hz,
+        bandwidth_hz: features.bandwidth_hz,
+        sample_rate_hz: m.sample_rate_hz,
+        start_ns: m.start.0,
+        end_ns: m.start.0 + iq.len() as u64 * NS_PER_S / rate,
+        bytes: 0,
+        features: serde_json::to_value(&features).expect("features"),
+        signal: None,
+        job: JobId("set".into()),
+        watch: None,
+        allocations: json!([]),
+        pinned: false,
+        written_ns: 0,
+    };
+    let plan = zeta_core::bits::bits_plan(
+        &[record],
+        &features,
+        None,
+        Some(zeta_core::bits::Modulation::Ook),
+        Some(zeta_core::types::Baud(REMOTE_BAUD)),
+        None,
     )
-    .await;
+    .expect("plan");
+    let stages = plan_stages(&plan);
+    let stages: Vec<(&str, Value)> = stages
+        .iter()
+        .map(|(k, p)| (k.as_str(), p.clone()))
+        .collect();
+    let events = run_chain(&stages, &iq, rate).await;
     let chips = recovered_bits(&events);
-    let codes = ev1527_codes(&chips);
     let shown: String = chips.iter().map(|c| char::from(b'0' + c)).collect();
-    eprintln!("{name}: {} chips {shown}\ncodes {codes:06x?}", chips.len());
-    codes
+    (shown, ev1527_codes(&chips))
 }
 
 /// A real EV1527-style remote (433.882 MHz, about 30 dB SNR, 3200 chips/s) captured on
-/// the air: every whole frame the chain recovers reads the remote's code.
+/// the air: every whole frame that the chain `bits_start` builds recovers reads the
+/// remote's code.
 #[tokio::test]
 async fn a_real_ook_remote_decodes_to_its_code() {
-    let one = remote_codes("ook-remote-433882k-1").await;
-    assert!(one.len() >= 3, "fixture 1: {one:06x?}");
-    assert!(
-        one.iter().all(|&c| c == REMOTE_CODE),
-        "fixture 1: {one:06x?}"
-    );
-    let two = remote_codes("ook-remote-433882k-2").await;
-    assert!(two.len() >= 2, "fixture 2: {two:06x?}");
-    assert!(
-        two.iter().all(|&c| c == REMOTE_CODE),
-        "fixture 2: {two:06x?}"
-    );
+    for (name, least) in [("ook-remote-433882k-1", 3), ("ook-remote-433882k-2", 2)] {
+        let (chips, codes) = remote_codes(name).await;
+        assert!(
+            codes.len() >= least && codes.iter().all(|&c| c == REMOTE_CODE),
+            "{name}: codes {codes:06x?} from {} chips {chips}",
+            chips.len()
+        );
+    }
 }

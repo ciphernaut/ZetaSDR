@@ -36,11 +36,15 @@ const PSK_GRID_SAMPLES_PER_SYMBOL: u64 = 4;
 /// How many steps of the PSK grid the chain rate search tries above the least rate.
 const PSK_RATE_SEARCH_STEPS: u64 = 64;
 
-/// How far the measured centre may sit from the capture's centre, as a fraction of the
-/// chain rate, before the chain shifts to it with a `channel` stage: the resampler's
-/// low-pass keeps about half its output rate, so a signal a quarter of the chain rate
-/// off still passes whole (its own band allowed for), and one further off is cut.
-pub const SHIFT_TOLERANCE_FRACTION: f64 = 0.25;
+/// The resampler's passband edge as a fraction of its output rate (the chain rate): a
+/// copy of `zeta_dsp::resample::CUTOFF`, which `zeta-core` cannot reach. A signal whose
+/// measured band reaches past it from the capture's centre (`|shift| + bandwidth / 2`)
+/// is cut by the resampler, so the chain shifts to the measured centre first.
+pub const RESAMPLE_PASSBAND_FRACTION: f64 = 0.45;
+
+/// The layer-1 label of a capture with nothing in it: its measured centre is noise's,
+/// so the chain does not shift to it.
+const NOISE_LABEL: &str = "noise";
 
 /// The shifted chain's channel band as a multiple of the measured bandwidth.
 pub const CHANNEL_BAND_FACTOR: f64 = 1.25;
@@ -97,8 +101,9 @@ pub struct BitsPlan {
     /// The set's capture ids, in time order.
     pub captures: Vec<String>,
     pub source: SourceId,
-    /// The centre the chain runs on: the capture's, or the measured centre when that
-    /// lies more than [`SHIFT_TOLERANCE_FRACTION`] of the chain rate off it.
+    /// The centre the chain runs on: the capture's, or the measured centre when the
+    /// measured band, seen from the capture's centre, reaches past the resampler's
+    /// passband ([`RESAMPLE_PASSBAND_FRACTION`] of the chain rate).
     pub center_hz: Hz,
     /// `center_hz` minus the capture's centre: 0 when the chain does not shift.
     pub shift_hz: i64,
@@ -276,7 +281,11 @@ pub fn bits_plan(
     }
     let chain_rate = chain_rate_hz(capture_rate, rate.0, modulation, order);
     let shift_hz = features.center_hz.0 as i64 - first.center_hz.0 as i64;
-    let shifts = shift_hz.unsigned_abs() as f64 > SHIFT_TOLERANCE_FRACTION * chain_rate as f64;
+    // Centring helps only a signal off the centre; a noise label measured no signal.
+    let reach = shift_hz.unsigned_abs() as f64 + features.bandwidth_hz.0 as f64 / 2.0;
+    let shifts = shift_hz != 0
+        && label != Some(NOISE_LABEL)
+        && reach > RESAMPLE_PASSBAND_FRACTION * chain_rate as f64;
     let (center_hz, shift_hz, bandwidth_hz, channel_rate_hz, rate_hz) = if shifts {
         let band = ((features.bandwidth_hz.0 as f64 * CHANNEL_BAND_FACTOR).ceil() as u64)
             .max(CHANNEL_MIN_BAND_SYMBOLS * rate.0 as u64);
@@ -343,9 +352,11 @@ pub fn bits_graph(plan: &BitsPlan) -> Graph {
         ),
         Modulation::Ook => ("ook_demod", json!({"symbol_rate_baud": baud})),
     };
-    // The default Mueller and Müller detector mistimes 4-level input.
+    // The default Mueller and Müller detector mistimes 4-level input, and on OOK it
+    // reads no timing across a keyed plateau (both strobes on the same level): early-late
+    // takes the slope at the on/off edges.
     let algorithm = match (plan.modulation, plan.order) {
-        (Modulation::Fsk, 4) => json!("early_late"),
+        (Modulation::Fsk, 4) | (Modulation::Ook, _) => json!("early_late"),
         _ => Value::Null,
     };
     let (levels, constellation) = match plan.modulation {
@@ -626,9 +637,23 @@ mod tests {
             .map(|n| n.id.0.clone())
             .collect();
         assert_eq!(ids[1..3], ["channel", "demod"]);
-        // Centred (within a quarter of the chain rate): no channel, the band the capture's.
-        f.center_hz = Hz(433_400_000 + 6_000);
-        let plan = bits_plan(&[wide.clone()], &f, None, Some(Modulation::Ook), None, None).unwrap();
+        // The OOK clock is early-late.
+        assert_eq!(g.nodes[4].params["algorithm"], "early_late");
+        // Inside the resampler's passband (0.45 × 25 600 = 11 520 Hz from the centre):
+        // 8000 Hz off with a 2000 Hz band reaches 9000 Hz, so no channel and the band the
+        // capture's.
+        let mut near = f.clone();
+        near.center_hz = Hz(433_400_000 + 8_000);
+        near.bandwidth_hz = Hz(2_000);
+        let plan = bits_plan(
+            &[wide.clone()],
+            &near,
+            None,
+            Some(Modulation::Ook),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.center_hz, Hz(433_400_000));
         assert_eq!(plan.shift_hz, 0);
         assert_eq!(plan.channel_rate_hz, None);
@@ -636,6 +661,33 @@ mod tests {
         let g = bits_graph(&plan);
         assert!(g.nodes.iter().all(|n| n.kind != "channel"));
         assert_eq!(g.nodes[1].kind, "resample");
+        // 6000 Hz off with a 12 000 Hz band reaches 12 000 Hz: past the edge, shifted.
+        near.center_hz = Hz(433_400_000 + 6_000);
+        near.bandwidth_hz = Hz(12_000);
+        let plan = bits_plan(
+            &[wide.clone()],
+            &near,
+            None,
+            Some(Modulation::Ook),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.shift_hz, 6_000);
+        assert!(plan.channel_rate_hz.is_some());
+        // A capture layer 1 labels noise is not shifted, however far its centre.
+        let plan = bits_plan(
+            &[wide.clone()],
+            &f,
+            Some("noise"),
+            Some(Modulation::Ook),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.shift_hz, 0);
+        assert_eq!(plan.channel_rate_hz, None);
+        assert!(bits_graph(&plan).nodes.iter().all(|n| n.kind != "channel"));
         // A measured band that leaves the capture is refused.
         f.center_hz = Hz(433_400_000 + 1_020_000);
         let e = bits_plan(&[wide], &f, None, Some(Modulation::Ook), None, None).unwrap_err();

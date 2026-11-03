@@ -40,14 +40,71 @@ pub const CONSTELLATION_EVERY_MS: u64 = 1000;
 /// symbols.
 const AVERAGE_SYMBOLS: f64 = 64.0;
 
-/// The quantile of the run's first frame that seeds the lower cluster level (and one
-/// minus it the upper level and the outer magnitude), in place of the frame's extremes.
-/// A cluster level moves only by the values that fall in its cluster, so a seed beyond
-/// every later symbol never comes back: a start-up transient (a demodulator's levels
-/// settling on an onset after silence, measured at 4.7 against an on-level of 1 on a
-/// real OOK remote) seeded the upper level so high that no symbol reached the midpoint
-/// and every bit read 0. A seed inside the data is always pulled out to its cluster.
+/// The quantile of the run's first frame that starts the 2-level seed's centres (and
+/// one minus it the upper centre and the 4-level outer magnitude), in place of the
+/// frame's extremes. A cluster level moves only by the values that fall in its cluster,
+/// so a seed beyond every later symbol never comes back: a start-up transient (a
+/// demodulator's levels settling on an onset after silence, measured at 4.7 against an
+/// on-level of 1 on a real OOK remote) seeded the upper level so high that no symbol
+/// reached the midpoint and every bit read 0.
 const SEED_QUANTILE: f64 = 0.1;
+
+/// Lloyd iterations of the 2-level seed's 2-means over the first frame: each centre
+/// becomes the mean of the values nearer to it. A frame of one level with a few symbols
+/// of the other (a carrier lead-in, OOK mostly silence) starts with both quantiles on
+/// the one level; the first iteration moves the upper centre off it and the second
+/// splits the clusters, so a few spare iterations cover a noisy frame.
+const SEED_ITERATIONS: usize = 8;
+
+/// The 2-means seed is degenerate when its centres end closer than this fraction of the
+/// first frame's range (min to max): the frame shows no second cluster to find, and the
+/// seed falls back to the frame's minimum and maximum.
+const SEED_DEGENERATE_FRACTION: f64 = 0.05;
+
+/// The 2-level seed `(lo, hi)` of the first frame's `values`: [`SEED_ITERATIONS`]
+/// Lloyd iterations of a 2-means from the [`SEED_QUANTILE`] and `1 - SEED_QUANTILE`
+/// quantiles (a centre whose side is empty stays put), the frame's minimum and maximum
+/// when the centres end closer than [`SEED_DEGENERATE_FRACTION`] of its range.
+fn two_level_seed(values: &[f64]) -> (f64, f64) {
+    let v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
+    let (min, max) = v
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| {
+            (a.min(x), b.max(x))
+        });
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    let (mut lo, mut hi) = (
+        quantile(&v, SEED_QUANTILE),
+        quantile(&v, 1.0 - SEED_QUANTILE),
+    );
+    for _ in 0..SEED_ITERATIONS {
+        let mid = (lo + hi) / 2.0;
+        let (mut sl, mut nl, mut sh, mut nh) = (0.0, 0usize, 0.0, 0usize);
+        for &x in &v {
+            // As the slicer decides: the midpoint itself is the upper cluster's.
+            if x >= mid {
+                sh += x;
+                nh += 1;
+            } else {
+                sl += x;
+                nl += 1;
+            }
+        }
+        if nl > 0 {
+            lo = sl / nl as f64;
+        }
+        if nh > 0 {
+            hi = sh / nh as f64;
+        }
+    }
+    if hi - lo < SEED_DEGENERATE_FRACTION * (max - min) {
+        (min, max)
+    } else {
+        (lo, hi)
+    }
+}
 
 /// The `q` quantile (0..=1, nearest rank) of `values`; 0 when there are none.
 fn quantile(values: &[f64], q: f64) -> f64 {
@@ -270,8 +327,7 @@ impl Slicer {
             p.levels as u32
         };
         let values: Vec<f64> = first.iter().map(|&v| v as f64).collect();
-        let lo = quantile(&values, SEED_QUANTILE);
-        let hi = quantile(&values, 1.0 - SEED_QUANTILE);
+        let (lo, hi) = two_level_seed(&values);
         let magnitudes: Vec<f64> = values.iter().map(|v| v.abs()).collect();
         let peak = quantile(&magnitudes, 1.0 - SEED_QUANTILE);
         let n = (first.len() / channels).max(1) as f64;
@@ -533,8 +589,8 @@ impl Totals {
 /// 0 and ±2/3 of the running outer cluster magnitude, the midpoints between cluster
 /// centres ±1 and ±1/3 of it; each an exponential average over [`AVERAGE_SYMBOLS`]
 /// symbols of the values falling in that cluster, started from the run's first frame's
-/// [`SEED_QUANTILE`] and `1 - SEED_QUANTILE` quantiles of the values and the latter of
-/// their magnitudes), 2 channels by angle onto `constellation`.
+/// 2-means of its values (see [`two_level_seed`]) and the `1 - SEED_QUANTILE` quantile
+/// of their magnitudes), 2 channels by angle onto `constellation`.
 /// Publishes a `bits` event per `chunk_bits` (and the short chunk at a seam, a lag, a
 /// change of rate or channels and the input's end, each of which restarts the
 /// statistics, the differential reference and `offset_bits`), a `constellation` event
@@ -878,6 +934,34 @@ mod tests {
         x.extend(bits.iter().map(|&b| b as f32));
         let r = run(serde_json::json!({}), frames(&x, 1, T0)).await;
         assert_eq!(&r.bits()[TRANSIENT.len()..], bits.as_slice());
+    }
+
+    /// A first frame of one level with a few symbols of the other (an OOK burst after
+    /// silence, a carrier lead-in) slices those few correctly: both quantiles sit on the
+    /// one level, and seeded there the midpoint would read every symbol 1.
+    #[tokio::test]
+    async fn a_one_level_heavy_first_frame_slices_its_few_others() {
+        // 20 ms at 4800 Bd: one frame of 96 symbols, 5 of them 1.
+        const FIRST: usize = 96;
+        const ONES: [usize; 5] = [10, 30, 50, 70, 90];
+        let mut bits: Vec<u8> = (0..FIRST).map(|i| ONES.contains(&i) as u8).collect();
+        bits.extend(random_bits(1_000, 5));
+        let x: Vec<f32> = bits.iter().map(|&b| b as f32).collect();
+        let r = run(serde_json::json!({}), frames(&x, 1, T0)).await;
+        assert_eq!(r.bits(), bits);
+    }
+
+    #[test]
+    fn the_two_level_seed_falls_back_to_the_extremes_on_one_level() {
+        assert_eq!(super::two_level_seed(&[0.5; 40]), (0.5, 0.5));
+        let mut v = vec![0.0; 90];
+        v.extend([1.0; 6]);
+        v.push(4.7);
+        // A transient joins the upper cluster without lifting the midpoint to the
+        // on-level.
+        let (lo, hi) = super::two_level_seed(&v);
+        assert!(lo.abs() < 1e-9, "({lo}, {hi})");
+        assert!((lo + hi) / 2.0 < 1.0, "({lo}, {hi})");
     }
 
     #[tokio::test]

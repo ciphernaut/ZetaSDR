@@ -398,13 +398,14 @@ pub enum Op {
     /// or 8, ook 2). The capture is resampled to about 8 samples per symbol for fsk and ook, and
     /// for psk to the smallest multiple of 4 times the baud that also covers a carrier offset
     /// of 2000 Hz (the coarse estimate is unambiguous only within the rate over twice the
-    /// order), moved to a rate the resampler serves exactly. A signal whose recorded
-    /// `center_hz` lies more than a quarter of that rate off the capture's centre is
-    /// shifted to it first: `capture_in → channel [→ resample] → <demod> → ...`, the
+    /// order), moved to a rate the resampler serves exactly. A signal off the capture's
+    /// centre whose recorded band reaches past the resampler's passband (its offset plus
+    /// half its `bandwidth_hz` over 0.45 times that rate) is shifted to its recorded
+    /// `center_hz` first, unless layer 1 labels the capture `noise`: `capture_in → channel [→ resample] → <demod> → ...`, the
     /// `channel` stage at the measured centre with the measured bandwidth × 1.25 (at least
     /// 4 × the baud) and an output rate the capture rate over a whole divisor (the
-    /// resampler follows unless that is already the chain rate). 4-fsk takes the `early_late`
-    /// clock; fsk's demodulator is given the record's measured `tone_spacing_hz` (it tracks
+    /// resampler follows unless that is already the chain rate). 4-fsk and ook take the
+    /// `early_late` clock; fsk's demodulator is given the record's measured `tone_spacing_hz` (it tracks
     /// the tones itself when the record has none); `capture_in` loops, paced, with a 500 ms
     /// pause between
     /// passes, and the job runs until stopped. Refused with `other`: a field neither the
