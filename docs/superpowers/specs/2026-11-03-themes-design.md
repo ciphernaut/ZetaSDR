@@ -294,7 +294,7 @@ dark and distinct from the floor). Rail on, ribbons lean the other way from cybe
 
 1. The plan number 26 and the folder layout `crates/zeta-ui/themes/<id>/`.
 2. The three looks in section 6, including the theme ids `cyberpunk`, `terminal`, `psytrance` and
-   the name "Terminal" (operator: no "hacker" or "APT" in names or text).
+   the name "Terminal" (operator).
 3. Themes are read once at startup; no hot reload.
 4. Tokens may not contain `url(`; images and fonts are referenced from `style.css` only.
 5. Scoping `style.css` with native CSS nesting, hoisting `@font-face` and `@keyframes`.
