@@ -832,11 +832,13 @@ function start(api) {
   state.subjects.onLearn(applyPanes);
   loadStationHome(api);
   applyTheme();
+  applyRail();
   applyMapPane();
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
     if (key === "theme") {
       applyTheme();
+      applyRail();
       state.wf?.refreshThemeColours();
       state.wf?.redraw();
     }
@@ -930,6 +932,12 @@ async function loadStationHome(api) {
 // <html data-theme="console|plain"> from the view's `theme` policy; never absent.
 function applyTheme() {
   document.documentElement.dataset.theme = state.view ? state.view.get("theme") : "console";
+}
+
+// The job tags live in the waterfall's rail in the console theme, on their outlines in plain.
+function applyRail() {
+  if (!state.ov || !state.wf) return;
+  state.ov.setRail(state.view && state.view.get("theme") === "console" ? state.wf.rail : null);
 }
 
 function applyMapPane() {

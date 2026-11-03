@@ -1126,6 +1126,40 @@ def scenario_theme_switch(page, url, secret):
     expect(view_line(page, "neon", error=True)).to_contain_text("console, plain")
     run_cmd(page, "view reset")
     expect(page.locator("html")).to_have_attribute("data-theme", "console")
+    # Live jobs' tags move between the rail (console) and their outlines (plain), the squelch
+    # dot with them, none left behind.
+    job = start_job(url, secret, "passthrough", "tone", 100_000_000, 10_000)
+    demod = None
+    try:
+        # Off the tone, so its squelch stays closed.
+        demod = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500, deviation_hz=5000)
+        page.evaluate("window.zetaTest.poll()")
+        in_outline = page.locator(f'#waterfall .outline[data-key="{job}"] .job-tag')
+        in_rail = page.locator(f'#rail .job-tag[data-job="{job}"]')
+        dot_rail = page.locator(f'#rail .job-tag[data-job="{demod}"] .dot.closed')
+        dot_outline = page.locator(f'#waterfall .outline[data-key="{demod}"] .job-tag .dot.closed')
+        expect(in_rail).to_have_count(1)
+        expect(dot_rail).to_have_count(1, timeout=5_000)
+        run_cmd(page, "view set theme plain")
+        expect(page.locator("html")).to_have_attribute("data-theme", "plain")
+        expect(in_outline).to_have_count(1)
+        expect(in_outline.locator(".kind")).to_have_text("passthrough")
+        expect(dot_outline).to_have_count(1)
+        expect(page.locator("#rail")).to_be_hidden()
+        expect(page.locator("#rail .job-tag")).to_have_count(0)
+        run_cmd(page, "view set theme console")
+        expect(page.locator("html")).to_have_attribute("data-theme", "console")
+        expect(in_rail).to_have_count(1)
+        expect(in_outline).to_have_count(0)
+        expect(in_rail.locator(".kind")).to_have_text("passthrough")
+        expect(dot_rail).to_have_count(1)
+        expect(page.locator("#waterfall .outline .job-tag")).to_have_count(0)
+        for j in (job, demod):
+            expect(page.locator(f'#waterfall .job-tag[data-job="{j}"]')).to_have_count(1)
+    finally:
+        for j in (job, demod):
+            if j:
+                stop_job(url, secret, j)
 
 
 def scenario_source_bar_shows_live_numbers(page, url, secret):
@@ -1759,7 +1793,6 @@ def scenario_rigid_bands_are_outlined(page, url, secret):
         for job in (lo, hi):
             el = page.locator(f'#waterfall .outline[data-key="{job}"]')
             expect(el).to_have_count(1)
-            expect(el.locator(".job-tag .kind")).to_have_text("passthrough")
             expect(page.locator(f'#waterfall .job-tag[data-job="{job}"] .kind')
                    ).to_have_text("passthrough")
         top = {j: page.locator(f'#waterfall .outline[data-key="{j}"]').bounding_box()["y"]
@@ -1808,6 +1841,72 @@ def scenario_tags_show_kind_id_and_link_rows(page, url, secret):
             if j:
                 stop_job(url, secret, j)
 
+
+
+# ---- the rail (plan 24 Task 3) ----------------------------------------------------------------
+# In the console theme job tags sit in #rail beside the axis, at their outline's centre; where
+# they crowd they collapse to thin segments and the hot or speaking one keeps the space.
+
+def scenario_rail_tags_align(page, url, secret):
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    capture = source_info(url, secret, "retune")["current"]
+    cur = capture["center_hz"]
+    a = start_job(url, secret, "passthrough", "retune", cur - 8_000, 4_000)
+    b = start_job(url, secret, "passthrough", "retune", cur + 8_000, 4_000)
+    c = None
+    try:
+        page.evaluate("window.zetaTest.poll()")
+        rail = page.locator("#waterfall #rail")
+        expect(rail).to_be_visible()
+        for job in (a, b):
+            tag = page.locator(f'#rail .job-tag[data-job="{job}"]')
+            ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
+            expect(tag).to_have_count(1)
+            tb, ob = tag.bounding_box(), ol.bounding_box()
+            assert abs((tb["y"] + tb["height"] / 2) - (ob["y"] + ob["height"] / 2)) <= 2, (tb, ob)
+            expect(tag.locator(".centre")).to_have_text(re.compile(r"^\d+\.\d{3}$"))
+            assert tag.get_attribute("data-colour") == ol.get_attribute("data-colour")
+        page.locator(f'#rail .job-tag[data-job="{a}"]').hover()
+        expect(page.locator(f'#waterfall .outline[data-key="{a}"]')).to_have_class(re.compile(r"\bhot\b"))
+        expect(job_row(page, a)).to_have_class(re.compile(r"\bhot\b"))
+        # A job outside the shown band has a hidden tag, not one pinned at the rail's edge. It
+        # sits inside the capture (a and b hold the source) but outside the 20 kHz shown.
+        set_band(page, cur, 20_000)
+        c_hz = cur + capture["bandwidth_hz"] // 2 - 4_000
+        assert c_hz - 2_000 > cur + 10_000, f"no room outside the shown band: {capture}"
+        c = start_job(url, secret, "passthrough", "retune", c_hz, 4_000)
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f'#rail .job-tag[data-job="{c}"]')).to_have_count(1)
+        expect(page.locator(f'#rail .job-tag[data-job="{c}"]')).to_be_hidden()
+    finally:
+        for j in (a, b, c):
+            if j:
+                stop_job(url, secret, j)
+
+
+def scenario_rail_collapses_crowd(page, url, secret):
+    # `cb` plays its recording's own 48 kHz only (476.876-476.924 MHz), so the crowd is six
+    # jobs 1 kHz apart in the capture shown whole: under 18 px apart on any WIDE waterfall.
+    select_source(page, url, secret, "cb")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    jobs = []
+    try:
+        for i in range(6):
+            jobs.append(start_job(url, secret, "passthrough", "cb", 476_895_000 + i * 1_000, 800))
+        page.evaluate("window.zetaTest.poll()")
+        tags = page.locator("#rail .job-tag")
+        expect(tags).to_have_count(6)
+        expect(page.locator("#rail .job-tag.thin")).to_have_count(5)
+        full = page.locator("#rail .job-tag:not(.thin)")
+        expect(full).to_have_count(1)
+        other = page.locator(f'#rail .job-tag[data-job="{jobs[3]}"]')
+        other.hover()
+        expect(other).not_to_have_class(re.compile(r"\bthin\b"))
+        expect(page.locator("#rail .job-tag:not(.thin)")).to_have_count(1)
+    finally:
+        for j in jobs:
+            stop_job(url, secret, j)
 
 
 # ---- draggable outlines (plan 18 Task 6) -----------------------------------------------------
@@ -2137,7 +2236,7 @@ def scenario_narrow_long_press_opens_the_outline_menu(page, url, secret):
         ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
         expect(ol).to_have_count(1)
         expect(ol.locator(".outline-handle")).to_have_count(0)
-        cx, cy = centre_of(ol.locator(".job-tag").bounding_box())
+        cx, cy = centre_of(page.locator(f'#waterfall .job-tag[data-job="{job}"]').bounding_box())
         page.mouse.move(cx, cy)
         page.mouse.down()
         page.wait_for_timeout(700)
@@ -2590,7 +2689,8 @@ def scenario_watch_entry_starts_a_watch_and_outlines_its_band(page, url, secret)
         el = page.locator(f'#waterfall .outline[data-key="{watches[0]["id"]}"]')
         page.evaluate("window.zetaTest.poll()")
         expect(el).to_have_count(1)
-        expect(el.locator(".job-tag .kind")).to_have_text("watch")
+        expect(page.locator(f'#waterfall .job-tag[data-job="{watches[0]["id"]}"] .kind')
+               ).to_have_text("watch")
         expect(el.locator(".outline-handle")).to_have_count(0)
         assert "retunable" not in (el.get_attribute("class") or "")
     finally:

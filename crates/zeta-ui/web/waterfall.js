@@ -68,6 +68,8 @@
 //         the newest; null when older than the oldest column or none is painted)
 //     wf.oldestNs() -> the start of the oldest column on screen (null when none or untimed)
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
+//     wf.rail       the `div#rail` before the axis, the canvas's height (0 wide and hidden in
+//         the plain theme); overlays.js lays the job tags into it (ov.setRail)
 //     wf.band       the capture {lo, hi} in Hz (a scan: its whole span); null before known
 //     wf.view       the range {lo, hi} shown, or null for the whole capture; past the capture
 //         (and wider than it) only while wf.coarseActive() holds
@@ -469,6 +471,8 @@ class Waterfall {
     this.wheelAt = 0;
     this.redrawPending = false;
 
+    this.rail = document.createElement("div");
+    this.rail.id = "rail";
     this.axis = document.createElement("div");
     this.axis.className = "wf-axis";
     this.axis.title = "drag to pan";
@@ -481,7 +485,7 @@ class Waterfall {
     this.badge.textContent = "reconnecting…";
     this.badge.hidden = true;
     this.bandForm = this.buildBandForm();
-    el.replaceChildren(this.axis, this.canvas, this.overlay, this.badge, this.bandForm);
+    el.replaceChildren(this.rail, this.axis, this.canvas, this.overlay, this.badge, this.bandForm);
     this.ctx = this.canvas.getContext("2d", { willReadFrequently: true });
     this.octx = this.overlay.getContext("2d");
 

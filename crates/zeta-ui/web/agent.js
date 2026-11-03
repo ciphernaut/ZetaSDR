@@ -48,7 +48,8 @@
 //   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, squelch,
 //                                   view, position, onHot})
 //                                                       -> {close, refresh, redraw}
-//       Each row carries `data-job` (the id, beside `data-id`) and, when the tuning is
+//       Each row carries `data-job` (the id, beside `data-id`), `data-colour` (overlays.js
+//       channelColour, the colour its outline and tag share) and, when the tuning is
 //       usable, a `.band` cell (bandText) after the short id; with `onHot(id, on)` given,
 //       pointerenter/pointerleave on a row call it (overlays.js setHot puts `hot` on the
 //       job's outline and tag, and on the row).
@@ -81,6 +82,7 @@
 //       label only, run() decides from the mix's graph at the click.
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
+import { channelColour } from "./overlays.js";
 import { channelLabel } from "./plans.js";
 import { bandText } from "./units.js";
 
@@ -408,6 +410,7 @@ function jobRow(
   row.className = ["job", attached && "attached", finished && "finished"].filter(Boolean).join(" ");
   row.dataset.id = job.id;
   row.dataset.job = job.id;
+  row.dataset.colour = String(channelColour(job.id));
   if (onHot) {
     row.addEventListener("pointerenter", () => onHot(job.id, true));
     row.addEventListener("pointerleave", () => onHot(job.id, false));

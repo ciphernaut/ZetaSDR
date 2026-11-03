@@ -95,7 +95,9 @@
 [data-theme="console"] .job-tag .kind,
 [data-theme="console"] .job-tag .channel { text-transform: uppercase; }
 /* Numbers line up in columns. */
-.job .band, .src-tab .range, .src-tab .centre, #subjects td { font-variant-numeric: tabular-nums; }
+.job .band, .src-tab .range, .src-tab .centre, .job-tag .centre, #subjects td {
+  font-variant-numeric: tabular-nums;
+}
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -256,9 +258,15 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
 #subjects tr.subject.dim { color: var(--dim); }
 #subjects tr.subject.selected, #subjects tr.subject.selected td:first-child { background: var(--bar); }
 #subjects tr.subject.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+/* the rail (overlays.js setRail): the job tags beside the axis, the console theme's alone */
+#waterfall #rail {
+  position: absolute; inset-inline-start: 0; top: 0; bottom: 0; width: var(--rail-w);
+  overflow: hidden; display: none;
+}
+[data-theme="console"] #waterfall #rail { display: block; }
 #waterfall .wf-axis {
-  position: absolute; left: 0; top: 0; bottom: 0; width: var(--axis-w);
-  border-right: 1px solid var(--border); color: var(--dim);
+  position: absolute; inset-inline-start: var(--rail-w); top: 0; bottom: 0; width: var(--axis-w);
+  border-inline-end: 1px solid var(--border); color: var(--dim);
 }
 #waterfall .wf-axis .tick {
   position: absolute; right: 6px; transform: translateY(-50%); font-size: 11px;
@@ -266,7 +274,8 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
 #waterfall .wf-axis .tick[data-edge="top"] { transform: none; }
 #waterfall .wf-axis .tick[data-edge="bottom"] { transform: translateY(-100%); }
 #waterfall .wf-canvas, #waterfall .wf-overlay {
-  position: absolute; left: var(--axis-w); top: 0; width: calc(100% - var(--axis-w)); height: 100%;
+  position: absolute; inset-inline-start: calc(var(--rail-w) + var(--axis-w)); top: 0;
+  width: calc(100% - var(--rail-w) - var(--axis-w)); height: 100%;
 }
 #waterfall .wf-overlay { cursor: crosshair; touch-action: none; }
 #waterfall .wf-axis { cursor: ns-resize; touch-action: none; user-select: none; }
@@ -282,7 +291,8 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
 #band button { padding: 1px 6px; font-size: 12px; }
 /* overlays.js: labels at the left edge, ribbons entering at the right and scrolling left */
 #waterfall .ov-layer {
-  position: absolute; left: var(--axis-w); top: 0; width: calc(100% - var(--axis-w)); height: 100%;
+  position: absolute; inset-inline-start: calc(var(--rail-w) + var(--axis-w)); top: 0;
+  width: calc(100% - var(--rail-w) - var(--axis-w)); height: 100%;
   overflow: hidden; pointer-events: none;
 }
 #waterfall .ov-label, #waterfall .ov-ribbon {
@@ -717,4 +727,51 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   border: none;
   border-radius: var(--radius-bar);
   text-transform: uppercase;   /* bar caption */
+}
+
+/* ---- the rail (spec 4.4) ---- */
+/* A job's colour (overlays.js channelColour): its outline, tag, ribbons and row share it. */
+[data-colour="1"] { --job-c: var(--c-channel-1); }
+[data-colour="2"] { --job-c: var(--c-channel-2); }
+[data-colour="3"] { --job-c: var(--c-channel-3); }
+[data-colour="4"] { --job-c: var(--c-channel-4); }
+[data-colour="5"] { --job-c: var(--c-channel-5); }
+[data-colour="6"] { --job-c: var(--c-channel-6); }
+#waterfall #rail .job-tag {
+  inset-inline-start: 0; inset-inline-end: 4px; max-width: none;
+  padding-inline: 6px; line-height: 16px; font-size: 12px;
+  border-start-start-radius: 0; border-end-start-radius: 0;
+  border-start-end-radius: var(--radius-bar); border-end-end-radius: var(--radius-bar);
+  z-index: 1;
+}
+#waterfall #rail .job-tag[hidden] { display: none; }
+/* collapsed where tags crowd: a thin segment at the job's frequency, its colour kept */
+#waterfall #rail .job-tag.thin {
+  height: var(--rail-thin-px); padding: 0; font-size: 0; line-height: 0; z-index: 0;
+  border-start-end-radius: 3px; border-end-end-radius: 3px;
+}
+#waterfall #rail .job-tag.thin > * { display: none; }
+[data-theme="console"] .job-tag[data-colour] { background: var(--job-c); color: #000; }
+[data-theme="console"] .job-tag .short,
+[data-theme="console"] .job-tag .snippet { display: none; }
+/* on a plan channel the rail reads the channel, else the kind; then the centre */
+[data-theme="console"] .job-tag:has(.channel:not(:empty)) .kind { display: none; }
+[data-theme="console"] .job-tag .channel:empty { display: none; }
+[data-theme="console"] .job-tag .dot.closed { background: var(--c-idle); }
+/* a closed squelch: the idle ground, the job's colour kept as the start border */
+[data-theme="console"] .job-tag[data-colour]:has(.dot.closed) {
+  background: var(--c-idle); color: var(--text); box-shadow: inset 3px 0 0 var(--job-c);
+}
+[data-theme="console"] .job-tag.hot { outline: 2px solid var(--text); outline-offset: -2px; }
+[data-theme="console"] .job-tag[data-colour].speaking {
+  background: var(--c-speaking); color: #000; outline: none;
+}
+[data-theme="console"] #waterfall .outline[data-colour] { border-color: var(--job-c); }
+[data-theme="console"] #waterfall .outline[data-colour].hot { border-color: var(--text); }
+[data-theme="console"] #waterfall .outline[data-colour].speaking { border-color: var(--c-speaking); }
+[data-theme="console"] #waterfall .ov-ribbon[data-colour]:not(.transcript-error):not(.agent) {
+  border-inline-start-color: var(--job-c);
+}
+[data-theme="console"] #jobs .job[data-colour] {
+  border-inline-start: 3px solid var(--job-c); padding-inline-start: 4px;
 }

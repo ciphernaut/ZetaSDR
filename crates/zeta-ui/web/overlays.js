@@ -30,7 +30,22 @@
 //       (app.js hands mix.js activeIds() to ov.setSpeaking(ids): class `speaking` on their
 //       outline, tag and row, styled apart from `hot`; `ov.speaking` is re-applied after each
 //       sync and whenever an outline or tag is made, as `hotJob`). The pin, the capture and
-//       the ghost keep a plain `.outline-label`; job outlines have none.
+//       the ghost keep a plain `.outline-label`; job outlines have none. Each tag also has a
+//       `.centre` (the tuning centre in MHz, three decimals).
+//   The rail: ov.setRail(el) (app.js hands it wf.rail in the console theme, null in plain)
+//       moves every tag out of its outline into `el` at once (null moves them back), and new
+//       tags are made there. A rail tag's top is its outline's vertical centre less half its
+//       height, clamped to the rail; a tag whose outline is hidden or wholly off the shown
+//       band is hidden (never pinned at the edge). Sorted by centre, tags whose full extents
+//       overlap (TAG_GAP_PX apart at least) form a cluster, and one tag of each cluster stays
+//       full: the `hot` one, else a `speaking` one, else the first (highest frequency); the
+//       rest get class `thin` (RAIL_THIN_PX high, centred on their frequency, text hidden by
+//       CSS), the first thin of a cluster with more than RAIL_GROUP_MIN thin titled with the
+//       count. ov.setHot and ov.setSpeaking lay the rail out again.
+//   Colour: channelColour(jobId) -> 1..6 (the sum of the id's char codes mod 6, plus 1) is
+//       the `data-colour` of the job's outline, tag and ribbons (an attached job's ribbons take
+//       its input's), and agent.js puts it on the job's row; style.css maps it to
+//       --c-channel-<n>.
 //   Overlays:
 //     ov.syncOutlines(jobs, source)  the outline half of ov.sync alone (app.js calls it after
 //                            each `source_list` poll, so a pin shows without waiting for jobs)
@@ -178,6 +193,8 @@ const RIBBON_GAP_PX = 2;
 const LABEL_GAP_PX = 2;
 const MAX_LANES = 8;
 const TAG_GAP_PX = 2;
+const RAIL_THIN_PX = 5; // a collapsed rail tag's height (style.css --rail-thin-px)
+const RAIL_GROUP_MIN = 6; // a cluster with more thin tags than this titles the first with the count
 export const SNIPPET_CHARS = 40;
 const CAPTURE_KEY = "capture";
 const PIN_KEY = "pin";
@@ -188,6 +205,14 @@ export const DRAG_CLICK_PX = 3; // less pointer travel than this is a click, not
 export const LONG_PRESS_MS = 500; // a press this long on a narrow outline's tag opens its menu
 export const LONG_PRESS_MOVE_PX = 10; // a press that moves further than this is no long press
 export const MIN_WIDTH_HZ = 1000; // the narrowest band an edge drag leaves
+
+// The colour slot 1..6 of a job: stable across reloads and the same in every view.
+export function channelColour(jobId) {
+  const id = String(jobId ?? "");
+  let sum = 0;
+  for (let i = 0; i < id.length; i++) sum += id.charCodeAt(i);
+  return (sum % 6) + 1;
+}
 
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 
@@ -295,6 +320,7 @@ class Overlays {
     this.subjects = subjects; // the row cache and the subjects (subjects.js)
     this.overCap = new Set(); // running job ids over MAX_WATCHED or MAX_POSITIONED
     this.destroyed = false;
+    this.rail = null; // the element the job tags live in (ov.setRail), null: their outlines
 
     this.layer = document.createElement("div");
     this.layer.className = "ov-layer";
@@ -590,6 +616,12 @@ class Overlays {
 
   render(rec, p) {
     const job = rec.job;
+    // A ribbon takes its job's colour (an attached job's, its input's).
+    const colour = channelColour(job.input ?? job.id);
+    const paint = (el) => {
+      if (el) el.dataset.colour = colour;
+      return el;
+    };
     const obj = p && typeof p === "object" && !Array.isArray(p);
     if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
     for (const fn of this.eventFns) fn(job, p);
@@ -624,29 +656,29 @@ class Overlays {
           this.refreshTag(this.outlines.get(job.input));
         }
         const t = transcriptRibbon(p);
-        const el = this.ribbon(tuningCentre(job), t.text, t.cls);
+        const el = paint(this.ribbon(tuningCentre(job), t.text, t.cls));
         if (el && t.title) el.title = `${t.text}\n${t.title}`;
         return;
       }
       if (typeof p.summary === "string") {
         if (this.subjectRibbon(job, p)) return;
-        this.ribbon(tuningCentre(job), p.summary, typeof p.protocol === "string" ? p.protocol : "event");
+        paint(this.ribbon(tuningCentre(job), p.summary, typeof p.protocol === "string" ? p.protocol : "event"));
         return;
       }
       if (typeof p.protocol === "string") {
         const text = protocolText(p);
         if (text !== null) {
-          this.ribbon(tuningCentre(job), text, p.protocol);
+          paint(this.ribbon(tuningCentre(job), text, p.protocol));
           return;
         }
       }
       if ("src" in p && "info" in p) {
-        this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}`, "aprs");
+        paint(this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}`, "aprs"));
         return;
       }
     }
     const json = JSON.stringify(p) ?? String(p);
-    this.ribbon(tuningCentre(job), json.slice(0, OTHER_EVENT_CHARS), "event");
+    paint(this.ribbon(tuningCentre(job), json.slice(0, OTHER_EVENT_CHARS), "event"));
   }
 
   onEvent(fn) {
@@ -698,10 +730,11 @@ class Overlays {
     if (row.subject.waterfall === "fold") {
       const s = store.subjectOf(job, p);
       if (!s) return false;
-      this.keyedRibbon(
+      const el = this.keyedRibbon(
         `job:${job.id}:${k.key}`, hz, () => subjectSummary(s), row.protocol, s.count,
         () => store.held(job.id, k.key),
       );
+      if (el) el.dataset.colour = channelColour(job.id);
       return true;
     }
     const line = () => {
@@ -709,7 +742,8 @@ class Overlays {
       const label = last ? subjectLabel(last) : "";
       return `${row.protocol} ${store.size(job.id)} ${row.subject.name}, last ${label}`;
     };
-    this.keyedRibbon(`job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null));
+    const el = this.keyedRibbon(`job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null));
+    if (el) el.dataset.colour = channelColour(job.id);
     return true;
   }
 
@@ -987,7 +1021,8 @@ class Overlays {
 
   // ---- job tags ------------------------------------------------------------------------
 
-  // The tag of a job's outline `o`: kind, short id, [squelch dot], channel, [snippet].
+  // The tag of a job's outline `o`: kind, short id, [squelch dot], channel, centre, [snippet];
+  // in the rail when there is one, else in the outline.
   tag(o, key) {
     const el = document.createElement("div");
     el.className = "job-tag";
@@ -997,9 +1032,17 @@ class Overlays {
       s.className = cls;
       return s;
     };
-    o.parts = { kind: span("kind"), short: span("short"), channel: span("channel"), dot: null, snippet: null };
-    el.append(o.parts.kind, " ", o.parts.short, " ", o.parts.channel, " ");
-    o.el.append(el);
+    o.parts = {
+      kind: span("kind"),
+      short: span("short"),
+      channel: span("channel"),
+      centre: span("centre"),
+      dot: null,
+      snippet: null,
+    };
+    el.append(o.parts.kind, " ", o.parts.short, " ", o.parts.channel, " ", o.parts.centre, " ");
+    el.dataset.colour = o.el.dataset.colour = String(channelColour(key));
+    (this.rail ?? o.el).append(el);
     o.tag = el;
     el.addEventListener("click", () => {
       const row = o.job && this.jobRowEl(o.job);
@@ -1045,6 +1088,7 @@ class Overlays {
     }
     const ch = job.tuning ? channelLabel(job.tuning.center_hz, this.plan()) : null;
     parts.channel.textContent = ch ? ch.text : "";
+    parts.centre.textContent = tuningCentre(job) === null ? "" : (job.tuning.center_hz / 1e6).toFixed(3);
     const text = this.snippets.get(job.id);
     if (text !== undefined) {
       if (!parts.snippet) {
@@ -1057,9 +1101,29 @@ class Overlays {
     this.layoutTags();
   }
 
-  // Tags at their outline's vertical centre, stacked: sorted by top, a tag under the
-  // previous one's bottom + TAG_GAP_PX is pushed down (at most MAX_LANES in a row).
+  // Moves every job tag into `el` (the rail), or back into its outline with null.
+  setRail(el) {
+    this.rail = el ?? null;
+    for (const o of this.outlines.values()) {
+      const t = o.tag;
+      if (!t) continue;
+      t.classList.remove("thin");
+      t.hidden = false;
+      t.removeAttribute("title");
+      t.style.top = "";
+      (this.rail ?? o.el).append(t);
+    }
+    this.layoutTags();
+  }
+
+  // Tags at their outline's vertical centre. In the rail: see `The rail` above. On the
+  // outlines: stacked, sorted by top, a tag under the previous one's bottom + TAG_GAP_PX is
+  // pushed down (at most MAX_LANES in a row).
   layoutTags() {
+    if (this.rail) {
+      this.layoutRail();
+      return;
+    }
     const items = [];
     for (const o of this.outlines.values()) {
       if (!o.tag || o.el.hidden) continue;
@@ -1083,6 +1147,47 @@ class Overlays {
     }
   }
 
+  layoutRail() {
+    const height = this.rail.clientHeight;
+    const items = [];
+    for (const o of this.outlines.values()) {
+      const t = o.tag;
+      if (!t) continue;
+      t.classList.remove("thin");
+      const top = parseFloat(o.el.style.top);
+      const h = parseFloat(o.el.style.height) || 0;
+      const off = o.el.hidden || !Number.isFinite(top) || top + h <= 0 || top >= height;
+      t.hidden = off;
+      if (!off) items.push({ t, c: top + h / 2 });
+    }
+    for (const it of items) it.th = it.t.offsetHeight; // full height: every `thin` is off
+    items.sort((a, b) => a.c - b.c);
+    const clamp = (top, h) => Math.max(0, Math.min(top, height - h));
+    const wins = (it, cls) => it.t.classList.contains(cls);
+    let start = 0;
+    for (let i = 1; i <= items.length; i++) {
+      const prev = items[i - 1];
+      const it = items[i];
+      if (it && it.c - it.th / 2 < prev.c + prev.th / 2 + TAG_GAP_PX) continue;
+      // items[start..i) is one cluster: one full tag, the rest thin.
+      const cluster = items.slice(start, i);
+      const full =
+        cluster.find((x) => wins(x, "hot")) ?? cluster.find((x) => wins(x, "speaking")) ?? cluster[0];
+      const thin = cluster.filter((x) => x !== full);
+      for (const x of cluster) {
+        x.t.removeAttribute("title");
+        if (x === full) {
+          x.t.style.top = `${clamp(x.c - x.th / 2, x.th)}px`;
+        } else {
+          x.t.classList.add("thin");
+          x.t.style.top = `${clamp(x.c - RAIL_THIN_PX / 2, RAIL_THIN_PX)}px`;
+        }
+      }
+      if (thin.length > RAIL_GROUP_MIN) thin[0].t.title = `${cluster.length} jobs`;
+      start = i;
+    }
+  }
+
   // `hot` on the job's outline, tag and row (agent.js calls it when its row is hovered).
   setHot(jobId, on) {
     this.hotJob = on ? jobId : this.hotJob === jobId ? null : this.hotJob;
@@ -1093,6 +1198,7 @@ class Overlays {
     }
     const row = this.jobsEl && this.jobsEl.querySelector(`.job[data-id="${CSS.escape(jobId)}"]`);
     if (row) row.classList.toggle("hot", on);
+    if (this.rail) this.layoutTags(); // the hot tag wins the rail's space
   }
 
   // `speaking` on the outline, tag and row of each job in `ids` (and off the rest): the jobs a
@@ -1109,6 +1215,7 @@ class Overlays {
         row.classList.toggle("speaking", on.has(row.dataset.id));
       }
     }
+    if (this.rail) this.layoutTags(); // a speaking tag wins the rail's space
   }
 
   // The pointer entered or left a tag or outline: its row follows.
@@ -1398,6 +1505,7 @@ class Overlays {
     this.ro.disconnect();
     for (const id of [...this.watched.keys()]) this.unwatch(id);
     for (const id of [...this.positioned.keys()]) this.unwatchPositioned(id);
+    for (const o of this.outlines.values()) if (o.tag) o.tag.remove(); // the rail's
     this.layer.remove();
   }
 }
