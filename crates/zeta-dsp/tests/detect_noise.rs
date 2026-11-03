@@ -1,14 +1,14 @@
 //! The detector's defaults against a real receiver's noise: a SigMF capture of a band
-//! with nothing in it (`scratch/live/record-noise.sh` records 10 s of 400-406 MHz on
-//! the field host's B210 with the input terminated), named by `ZETA_NOISE_CAPTURE`, kept
-//! outside the repo. Its rows, cut as a `watch` cuts them and replayed for 60 s, must
-//! announce no signal.
+//! with nothing in it (`deploy/field-host/record-noise.sh noise` records 9.3 s of the
+//! watch's band on the field host's B210 with the input terminated), named by
+//! `ZETA_NOISE_CAPTURE`, kept outside the repo. Its rows, cut as a `watch` cuts them and
+//! replayed for 60 s, must announce no signal.
 //!
 //! `ZETA_NOISE_CAPTURE=~/zeta-fixtures/b210-noise-403m.sigmf-meta \
 //!  cargo test -p zeta-dsp --test detect_noise -- --ignored`
 //!
-//! The positive control is the same recording with the antenna on (`b210-air-403m`),
-//! named by `ZETA_AIR_CAPTURE`: the 404.025 MHz telemetry link that bursts about once a
+//! The positive control is the same recording with the antenna on
+//! (`deploy/field-host/record-noise.sh air`, `b210-air-403m`), named by `ZETA_AIR_CAPTURE`: the 404.025 MHz telemetry link that bursts about once a
 //! second must be announced within the first `AIR_ANNOUNCE_S` seconds of the replay.
 //!
 //! `ZETA_AIR_CAPTURE=~/zeta-fixtures/b210-air-403m.sigmf-meta \
