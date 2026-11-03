@@ -353,3 +353,7 @@ idle channels". The channel filter at the capture rate is the cost, not the demo
 squelch could skip the demod and the resampler and read its gate from the bank bin's power alone; on the
 direct path there is nothing to skip before the filter. Measure the page counter first: if the page never
 runs dry the gap is in the browser's own output and (2) is the fix.
+
+## Architecture: recipes the node stores and runs by name
+
+From the operator, 2026-11-02. A job setup (all ACARS channels on one radio, the CB plan with transcribers, the sonde watch with a pre-placed decoder) is reproduced from text each time: field craft prose, the scratch scripts on the field host, now `RECIPES.md`. The node cannot tell "the ACARS set" from seven unrelated jobs, and an agent re-derives the ops every run. A recipe should be a thing the node stores next to pins and plans (one JSON file each, `recipes/*.json` built in plus an operator directory as for mode rows): a name, the preconditions, the ops in order, and a start, a status and a stop by name (`recipe_start`, `recipe_status`, `recipe_stop`), with `plan_start` as the one-step special case it generalises. `RECIPES.md` is the stop-gap and the spec material: its JSON blocks are the ops a loader would lift unchanged.
