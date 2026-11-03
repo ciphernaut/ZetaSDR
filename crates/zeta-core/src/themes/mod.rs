@@ -38,6 +38,34 @@ pub const BUILTIN: &[(&str, &[u8])] = &[
         include_bytes!("../../../../themes/console/theme.json"),
     ),
     (
+        "cyberpunk/FONTS.md",
+        include_bytes!("../../../../themes/cyberpunk/FONTS.md"),
+    ),
+    (
+        "cyberpunk/OFL-Orbitron.txt",
+        include_bytes!("../../../../themes/cyberpunk/OFL-Orbitron.txt"),
+    ),
+    (
+        "cyberpunk/OFL-ShareTechMono.txt",
+        include_bytes!("../../../../themes/cyberpunk/OFL-ShareTechMono.txt"),
+    ),
+    (
+        "cyberpunk/Orbitron-VF.ttf",
+        include_bytes!("../../../../themes/cyberpunk/Orbitron-VF.ttf"),
+    ),
+    (
+        "cyberpunk/ShareTechMono-Regular.ttf",
+        include_bytes!("../../../../themes/cyberpunk/ShareTechMono-Regular.ttf"),
+    ),
+    (
+        "cyberpunk/style.css",
+        include_bytes!("../../../../themes/cyberpunk/style.css"),
+    ),
+    (
+        "cyberpunk/theme.json",
+        include_bytes!("../../../../themes/cyberpunk/theme.json"),
+    ),
+    (
         "plain/style.css",
         include_bytes!("../../../../themes/plain/style.css"),
     ),

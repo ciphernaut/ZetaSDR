@@ -1,0 +1,335 @@
+/* The cyberpunk theme: a near-black ground with a blue cast, magenta and cyan neon, acid yellow
+   for warnings. Corners are chamfered (one corner cut at 45 degrees with clip-path, its
+   diagonal redrawn by a gradient so the outline stays closed), outlines are 1 px with a soft
+   glow, and text never sits on a solid coloured fill. Bars carry a faint scanline overlay; a
+   job tag that starts speaking glitches once (a two-colour split). Orbitron for labels and
+   headings, Share Tech Mono (--font-ui) for numbers and decoded text. The node wraps this file
+   in [data-theme="cyberpunk"] { ... }: `X` is `[data-theme="cyberpunk"] X`, `&[...]` adds to
+   <html> (`html&[...]` keeps the type selector's weight). */
+
+/* The glitch: a two-colour split that jumps for a moment, then settles. */
+@keyframes glitch {
+  0% { transform: translateX(0); text-shadow: -2px 0 var(--accent), 2px 0 var(--ok); }
+  20% { transform: translateX(-2px); text-shadow: 3px 0 var(--accent), -3px 0 var(--ok); }
+  40% { transform: translateX(2px); text-shadow: -3px 0 var(--accent), 3px 0 var(--ok); }
+  60% { transform: translateX(-1px); text-shadow: 2px 0 var(--accent), -2px 0 var(--ok); }
+  80% { transform: translateX(1px); text-shadow: -1px 0 var(--accent), 1px 0 var(--ok); }
+  100% { transform: translateX(0); text-shadow: 0 0 6px var(--c-speaking); }
+}
+
+/* ---- the chamfer ----
+   --cut is the cut corner's leg; --line the outline's colour. The cut corner is the top end
+   one; the gradient layer draws its diagonal 1.5 px inside the clip so the outline is whole. */
+button, #cmd, .src-tab, .pane-tab, .job-tag, #jobs .job, section.pane, #waterfall .ov-ribbon,
+[role="menu"], #graph .graph-panel, #band, #login-form, input {
+  --cut: 7px;
+  --line: var(--border);
+  --ground: transparent;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
+  background:
+    linear-gradient(225deg, transparent 50%, var(--line) 50% calc(50% + 1.5px), transparent 0)
+      top right / var(--cut) var(--cut) no-repeat border-box,
+    var(--ground);
+}
+
+/* ---- ground and type ---- */
+& body {
+  background:
+    radial-gradient(ellipse at 50% -20%, rgba(43, 49, 140, 0.18), transparent 60%),
+    var(--bg);
+  font-family: var(--font-ui);
+}
+.brand, .pane-head, .pane-tab, .src-tab .name, #listen-all, #map-toggle, #drawer-toggle,
+#mic, .job .kind, .job-tag .kind, .job-tag .channel, .job-group > summary, #graph .graph-title,
+#login h1, #bar .prompt {
+  font-family: "Orbitron", var(--font-ui);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* ---- the bars: dark, a neon hairline, scanlines over them ---- */
+#top, #bar {
+  position: relative;
+  background:
+    repeating-linear-gradient(to bottom, rgba(220, 230, 255, 0.035) 0 1px, transparent 1px 3px),
+    var(--bar);
+  border: 0;
+  gap: 8px;
+  padding: 3px 8px;
+}
+#top { box-shadow: inset 0 -1px 0 var(--accent), 0 1px 10px rgba(255, 43, 214, 0.35); z-index: 1; }
+#bar { box-shadow: inset 0 1px 0 var(--ok), 0 -1px 10px rgba(0, 240, 255, 0.3); }
+.brand {
+  color: var(--ok);
+  font-weight: 800;
+  text-shadow: 0 0 6px rgba(0, 240, 255, 0.7);
+  padding-inline: 4px 10px;
+  min-width: calc(var(--rail-w) - 8px);
+}
+
+/* ---- buttons ---- */
+button {
+  --line: color-mix(in srgb, var(--c-action) 55%, transparent);
+  --ground: var(--bar);
+  color: var(--c-action);
+  padding: 2px 12px 2px 8px;
+}
+button:hover:not(:disabled), button:focus-visible {
+  --line: var(--c-action);
+  box-shadow: inset 0 0 8px rgba(0, 240, 255, 0.35);
+  text-shadow: 0 0 6px rgba(0, 240, 255, 0.6);
+  outline: none;
+}
+input, #cmd {
+  --line: var(--border);
+  --ground: var(--bg);
+  color: var(--text);
+  caret-color: var(--accent);
+}
+input:focus, #cmd:focus {
+  --line: var(--accent);
+  box-shadow: inset 0 0 8px rgba(255, 43, 214, 0.3);
+}
+
+/* ---- source tabs: neon outlines, the selected one magenta and wide with its numbers ---- */
+#tabs, #panes { gap: 6px; }
+.src-tab {
+  --line: color-mix(in srgb, var(--c-source) 45%, transparent);
+  --ground: transparent;
+  color: var(--dim);
+  padding: 0 14px 0 10px;
+}
+.src-tab .name { color: var(--c-source); font-size: 11px; }
+.src-tab .range { font-size: 10px; }
+.src-tab[aria-selected="true"] {
+  --line: var(--accent);
+  --ground: rgba(255, 43, 214, 0.06);
+  flex: 1;
+  color: var(--text);
+  box-shadow: inset 0 0 10px rgba(255, 43, 214, 0.3);
+}
+.src-tab[aria-selected="true"] .name { color: var(--accent); text-shadow: 0 0 6px rgba(255, 43, 214, 0.7); }
+.src-tab.fault { --line: var(--error); }
+.src-tab.fault .name { color: var(--error); }
+.src-tab .tag.pin { border-color: var(--error); color: var(--error); border-radius: 0; }
+.src-tab[aria-selected="true"] .health {
+  display: inline-flex;
+  gap: 4px;
+  margin-inline-start: auto;
+  align-items: baseline;
+}
+.health .k { font-size: 10px; text-transform: uppercase; color: var(--dim); }
+.health .v { margin-inline-end: 8px; color: var(--ok); }
+
+/* ---- action buttons and pane tabs ---- */
+.pane-tab, #listen-all, #map-toggle, #drawer-toggle { font-size: 10px; align-self: center; }
+.pane-tab {
+  --line: color-mix(in srgb, var(--c-action) 55%, transparent);
+  color: var(--c-action);
+  padding: 2px 12px 2px 8px;
+}
+.pane-tab[aria-selected="true"], #map-toggle[aria-pressed="true"], #listen-all[aria-pressed="true"] {
+  --line: var(--accent);
+  color: var(--accent);
+  box-shadow: inset 0 0 8px rgba(255, 43, 214, 0.35);
+  text-shadow: 0 0 6px rgba(255, 43, 214, 0.6);
+}
+
+/* ---- the command bar ---- */
+#bar .prompt {
+  color: var(--accent);
+  font-weight: 700;
+  text-shadow: 0 0 6px rgba(255, 43, 214, 0.7);
+  min-width: calc(var(--rail-w) - 8px);
+}
+#mic { font-size: 10px; }
+#mic .dot { border-radius: 0; transform: rotate(45deg); width: 7px; height: 7px; }
+#mic.recording { --line: var(--error); color: var(--error); }
+
+/* ---- the waterfall: the axis and the rail ---- */
+#waterfall .wf-axis {
+  color: color-mix(in srgb, var(--ok) 70%, var(--dim));
+  border-inline-end: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+  box-shadow: 1px 0 6px rgba(0, 240, 255, 0.25);
+}
+#waterfall #rail {
+  border-inline-start: 0;
+  background: repeating-linear-gradient(to bottom, rgba(220, 230, 255, 0.025) 0 1px, transparent 1px 3px), var(--bg);
+  box-shadow: inset -1px 0 0 color-mix(in srgb, var(--accent) 45%, transparent);
+}
+/* A tag: dark glass, a 1 px outline and text in its job's colour, glowing. */
+.job-tag[data-colour] {
+  --line: var(--job-c);
+  --ground: color-mix(in srgb, var(--bg) 88%, transparent);
+  --cut: 6px;
+  color: var(--job-c);
+  text-shadow: 0 0 5px color-mix(in srgb, var(--job-c) 60%, transparent);
+  box-shadow: inset 0 0 6px color-mix(in srgb, var(--job-c) 35%, transparent);
+}
+#waterfall #rail .job-tag { inset-inline-start: 4px; inset-inline-end: 2px; line-height: 18px; padding-inline: 5px 9px; }
+.job-tag .kind, .job-tag .channel { font-size: 9px; font-weight: 600; letter-spacing: 0.02em; }
+.job-tag .short, .job-tag .snippet { display: none; }
+.job-tag:has(.channel:not(:empty)) .kind { display: none; }
+.job-tag .channel:empty { display: none; }
+.job-tag .centre { color: var(--text); font-size: 11px; }
+.job-tag .dot { border-radius: 0; transform: rotate(45deg); width: 6px; height: 6px; margin-inline: 2px; }
+.job-tag .dot.open { background: var(--ok); box-shadow: 0 0 5px var(--ok); }
+.job-tag .dot.closed { background: var(--c-idle); }
+/* A closed squelch: the outline goes quiet, the job's colour kept as its start edge. */
+.job-tag[data-colour]:has(.dot.closed) {
+  --line: var(--c-idle);
+  color: var(--dim);
+  text-shadow: none;
+  box-shadow: inset 2px 0 0 var(--job-c);
+}
+.job-tag[data-colour]:has(.dot.closed) .centre { color: var(--dim); }
+.job-tag.hot { outline: 1px solid var(--text); outline-offset: -3px; }
+.job-tag[data-colour].speaking {
+  --line: var(--c-speaking);
+  color: var(--c-speaking);
+  outline: none;
+  text-shadow: 0 0 6px var(--c-speaking);
+  box-shadow: inset 0 0 10px rgba(0, 240, 255, 0.45);
+}
+.job-tag[data-colour].speaking .centre { color: var(--text); }
+
+/* ---- outlines and ribbons on the waterfall ---- */
+#waterfall .outline[data-colour] {
+  border-top: 1px solid var(--job-c);
+  border-bottom: 1px solid var(--job-c);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--job-c) 45%, transparent);
+}
+#waterfall .outline[data-colour].hot { border-color: var(--text); }
+#waterfall .outline[data-colour].speaking {
+  border-color: var(--c-speaking);
+  box-shadow: 0 0 10px rgba(0, 240, 255, 0.6);
+}
+#waterfall .outline-label { color: var(--job-c, var(--accent)); border-radius: 0; }
+#waterfall .ov-label { border-radius: 0; }
+#waterfall .ov-ribbon {
+  --line: color-mix(in srgb, var(--user) 70%, transparent);
+  --ground: var(--overlay-bg);
+  --cut: 6px;
+  border-inline-start-width: 1px;
+  padding-inline: 6px 10px;
+}
+#waterfall .ov-ribbon[data-colour] { --line: var(--job-c); color: var(--text); }
+#waterfall .ov-ribbon.transcript-error { --line: var(--error); color: var(--error); }
+#waterfall .ov-ribbon.agent { --line: var(--accent); color: var(--user); }
+#wf-badge { border-color: var(--error); color: var(--error); }
+#band { --ground: var(--bar); }
+
+/* ---- the side column ---- */
+#side {
+  background: var(--bg);
+  border-left: 0;
+  box-shadow: inset 1px 0 0 color-mix(in srgb, var(--ok) 40%, transparent);
+  padding: 5px 4px 5px 6px;
+  gap: 5px;
+}
+section.pane {
+  --line: color-mix(in srgb, var(--ok) 35%, transparent);
+  --ground: var(--bar);
+  --cut: 10px;
+}
+.pane h2 { border-block-end: 0; }
+.pane-head {
+  color: var(--ok);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 5px 14px 5px 8px;
+  background: repeating-linear-gradient(to bottom, rgba(220, 230, 255, 0.035) 0 1px, transparent 1px 3px);
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--accent) 55%, transparent);
+  text-shadow: 0 0 6px rgba(0, 240, 255, 0.55);
+}
+&:not([data-footprint="narrow"]) section.pane[data-collapsed] .pane-head { color: var(--dim); text-shadow: none; }
+.line.assistant { color: var(--ok); }
+.line.note { color: var(--dim); }
+.line.user::before { content: "> "; color: var(--accent); }
+#jobs { padding: 4px 5px; }
+/* A job row: a chamfered outline in its job's colour; its kind glows, nothing is filled. */
+#jobs .job[data-colour] {
+  --line: color-mix(in srgb, var(--job-c) 55%, transparent);
+  --ground: color-mix(in srgb, var(--job-c) 5%, var(--bg));
+  border-inline-start: 3px solid var(--job-c);
+  padding: 3px 10px 3px 5px;
+  margin-block-end: 4px;
+  column-gap: 6px;
+}
+#jobs .job[data-colour] .kind { color: var(--job-c); font-size: 10px; font-weight: 700; letter-spacing: 0.02em; text-shadow: 0 0 5px color-mix(in srgb, var(--job-c) 55%, transparent); }
+#jobs .job[data-colour].speaking { --line: var(--c-speaking); border-inline-start-color: var(--c-speaking); box-shadow: inset 0 0 10px rgba(0, 240, 255, 0.3); }
+#jobs .job[data-colour].hot { --line: var(--text); outline: none; }
+#jobs .job[data-colour].finished { --line: var(--c-idle); border-inline-start-color: var(--c-idle); opacity: 1; color: var(--dim); }
+#jobs .job[data-colour].finished .kind { color: var(--dim); text-shadow: none; }
+.job .state { color: var(--ok); }
+.job .tag { border-radius: 0; font-family: var(--font-ui); text-transform: none; letter-spacing: 0; text-shadow: none; }
+.job .tag.squelch { color: var(--dim); }
+.job .actions { gap: 3px; }
+.job .actions button { padding: 0 7px 0 4px; font-size: 11px; --cut: 5px; }
+.job-group > summary { color: var(--dim); font-size: 10px; }
+
+/* ---- menus and the graph view ---- */
+[role="menu"] {
+  --line: var(--accent);
+  --ground: var(--bar);
+  --cut: 10px;
+  border-radius: 0;
+  box-shadow: inset 0 0 12px rgba(255, 43, 214, 0.2);
+}
+[role="menu"] .ctx-item { clip-path: none; background: transparent; border: 1px solid transparent; color: var(--text); }
+[role="menu"] .ctx-item:hover, [role="menu"] .ctx-item:focus-visible { border-color: var(--ok); color: var(--ok); box-shadow: none; }
+#graph .graph-panel { --line: var(--ok); --ground: var(--bar); --cut: 14px; }
+#graph .graph-title { color: var(--ok); text-shadow: 0 0 6px rgba(0, 240, 255, 0.6); }
+#graph .graph-canvas { border-color: var(--border); }
+#graph .graph-node rect { fill: var(--bg); stroke: var(--c-channel-2); }
+#graph .graph-node[data-kind$="_demod"] rect { stroke: var(--accent); }
+#graph .graph-node[data-kind$="_decode"] rect,
+#graph .graph-node[data-kind="transcribe"] rect,
+#graph .graph-node[data-kind="burst_capture"] rect { stroke: var(--ok); }
+#graph .graph-node[data-kind="denoise"] rect,
+#graph .graph-node[data-kind="vad"] rect,
+#graph .graph-node[data-kind="mix"] rect,
+#graph .graph-node[data-kind="stream_in"] rect { stroke: var(--c-channel-3); }
+#graph .graph-node:hover rect, #graph .graph-node:focus-visible rect { stroke: var(--text); }
+#graph .graph-node.selected rect { stroke: var(--error); stroke-width: 2.5; }
+#graph .graph-node text.kind { font-family: "Orbitron", var(--font-ui); text-transform: uppercase; font-size: 10px; }
+#graph .graph-edge line { stroke: color-mix(in srgb, var(--accent) 70%, transparent); }
+#graph .graph-arrowhead { fill: var(--accent); }
+
+/* ---- narrow: the rail is 14 px of thin segments; a tapped one floats out as its label ---- */
+html&[data-footprint="narrow"] { --rail-w: 14px; }
+html&[data-footprint="narrow"] #waterfall #rail { overflow: visible; z-index: 6; }
+html&[data-footprint="narrow"] #waterfall #rail .job-tag {
+  inset-inline-start: 0; inset-inline-end: 0; width: auto;
+  height: var(--rail-thin-px); padding: 0; font-size: 0; line-height: 0;
+  clip-path: none; border: 0; background: var(--job-c); touch-action: none;
+  box-shadow: 0 0 6px var(--job-c);
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag > * { display: none; }
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded {
+  inset-inline-start: var(--rail-w); inset-inline-end: auto; width: max-content; height: auto;
+  z-index: 6; padding-inline: 6px 12px; font-size: 12px; line-height: 20px;
+  border: 1px solid var(--line);
+  clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
+  background:
+    linear-gradient(225deg, transparent 50%, var(--line) 50% calc(50% + 1.5px), transparent 0)
+      top right / var(--cut) var(--cut) no-repeat border-box,
+    var(--ground);
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .channel:not(:empty),
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded:not(:has(.channel:not(:empty))) > .kind,
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .centre {
+  display: inline;
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .dot { display: inline-block; }
+html&[data-footprint="narrow"] #bar .prompt { min-width: 0; }
+
+/* ---- motion: only for a reader who has not asked for less ---- */
+@media (prefers-reduced-motion: no-preference) {
+  .job-tag[data-colour].speaking { animation: glitch 420ms steps(1, end) 1; }
+  button, .src-tab, .pane-tab, #jobs .job, input, #cmd {
+    transition: box-shadow 120ms ease-out, color 120ms ease-out;
+  }
+}

@@ -1262,6 +1262,64 @@ def scenario_theme_shots(page, url, secret):
             stop_job(url, secret, demod)
 
 
+# The built-in themes added in plan 26 (Tasks 8-11), each checked by scenario_new_themes.
+NEW_THEMES = ["cyberpunk"]
+
+
+def scenario_new_themes(page, url, secret):
+    """Each new built-in theme applies; for a reader who asks for reduced motion it runs no
+    animation, a speaking tag included; and, with ZETA_UI_SHOTS, it is shot wide and narrow
+    as scenario_theme_shots does, the waterfall left unmasked so its ramp can be judged."""
+    shots = os.environ.get("ZETA_UI_SHOTS")
+    select_source(page, url, secret, "tone")
+    demod = None
+    still = page.context.browser.new_context(viewport=WIDE, reduced_motion="reduce")
+    try:
+        # Off the tone, so its squelch stays closed and the tag reads the same every run.
+        demod = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500, deviation_hz=5000)
+        job_row(page, demod)
+        calm = still.new_page()
+        login(calm, url, secret)
+        calm.click('.src-tab[data-id="tone"]')
+        calm_tag = calm.locator(f'#waterfall .job-tag[data-job="{demod}"]')
+        for theme in NEW_THEMES:
+            run_cmd(page, f"view set theme {theme}")
+            expect(page.locator("html")).to_have_attribute("data-theme", theme)
+            run_cmd(calm, f"view set theme {theme}")
+            expect(calm.locator("html")).to_have_attribute("data-theme", theme)
+            calm.evaluate("window.zetaTest.poll()")
+            expect(calm_tag).to_have_count(1, timeout=5_000)
+            calm_tag.evaluate("t => t.classList.add('speaking')")
+            calm.wait_for_timeout(400)
+            running = calm.evaluate(
+                "() => document.getAnimations().map((a) => a.animationName || a.constructor.name)")
+            assert running == [], f"{theme}: animations under reduced motion: {running}"
+            calm_tag.evaluate("t => t.classList.remove('speaking')")
+            if not shots:
+                continue
+            for name, size in (("wide", WIDE), ("narrow", NARROW)):
+                page.set_viewport_size(size)
+                page.wait_for_function(
+                    f"() => document.documentElement.dataset.footprint === '{name}'")
+                expect(page.locator(f'#waterfall .job-tag[data-job="{demod}"] .dot.closed')
+                       ).to_have_count(1, timeout=5_000)
+                page.evaluate("document.activeElement && document.activeElement.blur()")
+                # A ribbon in the job's colour, and time for the waterfall to fill a little.
+                page.evaluate(f"window.zetaTest.ribbon(100015000, 'copy, signal clear', "
+                              f"'transcript', null, '{demod}')")
+                page.wait_for_timeout(2_500)
+                page.evaluate(SHOT_STEADY_JS)
+                page.screenshot(
+                    path=os.path.join(shots, f"{theme}-{name}.png"), animations="disabled",
+                    mask=[page.locator("#status"), page.locator(".src-tab .health")])
+            page.set_viewport_size(WIDE)
+    finally:
+        still.close()
+        run_cmd(page, "view reset")
+        if demod:
+            stop_job(url, secret, demod)
+
+
 # The right-most 10 columns of the waterfall hold the fixture theme's ramp (black to magenta):
 # no pixel greener than it is red, and the tone well on the red side.
 MAGENTA_AT_RIGHT_JS = """() => {

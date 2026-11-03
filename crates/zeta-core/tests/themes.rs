@@ -36,7 +36,7 @@ fn theme_dir(root: &Path, id: &str, json: serde_json::Value, files: &[(&str, &[u
 fn builtins_load_ready() {
     let reg = ThemeRegistry::load(None);
     let ids: Vec<&str> = reg.all().iter().map(|t| t.id.as_str()).collect();
-    assert_eq!(ids, ["console", "plain"]);
+    assert_eq!(ids, ["console", "cyberpunk", "plain"]);
     for t in reg.all() {
         assert_eq!(t.state, ThemeState::Ready, "{}: {:?}", t.id, t.reason);
         assert!(t.builtin, "{}", t.id);
@@ -57,7 +57,11 @@ fn an_operator_theme_is_added() {
     assert!(!t.replaces_builtin);
     assert_eq!(t.file, dir.display().to_string());
     let ids: Vec<&str> = reg.all().iter().map(|t| t.id.as_str()).collect();
-    assert_eq!(ids, ["console", "mytheme", "plain"]);
+    let builtins = ThemeRegistry::load(None);
+    let mut want: Vec<&str> = builtins.all().iter().map(|t| t.id.as_str()).collect();
+    want.push("mytheme");
+    want.sort_unstable();
+    assert_eq!(ids, want);
 }
 
 #[test]
@@ -109,7 +113,7 @@ fn a_broken_override_leaves_the_builtin_in_force() {
 fn a_missing_operator_dir_is_not_an_error() {
     let root = tempfile::tempdir().unwrap();
     let reg = ThemeRegistry::load(Some(&root.path().join("absent")));
-    assert_eq!(reg.all().len(), 2);
+    assert_eq!(reg.all().len(), ThemeRegistry::load(None).all().len());
     assert!(reg.startup_lines().is_empty());
 }
 
@@ -325,7 +329,7 @@ async fn themes_list_answers_every_theme() {
             .find(|t| t.id == id)
             .unwrap_or_else(|| panic!("{id}"))
     };
-    for id in ["console", "plain"] {
+    for id in ["console", "cyberpunk", "plain"] {
         let t = row(id);
         assert_eq!(t.state, ThemeState::Ready);
         assert!(t.builtin && !t.replaces_builtin && t.reason.is_none());
@@ -390,4 +394,65 @@ fn docs_list_every_token() {
             "docs/themes.md omits {token}"
         );
     }
+}
+
+/// The built-in themes held to WCAG AA by `builtin_themes_meet_aa`.
+const AA_THEMES: &[&str] = &["console", "plain", "cyberpunk"];
+
+/// WCAG 2 relative luminance of a `#rrggbb` colour.
+fn luminance(hex: &str) -> f64 {
+    let h = hex.strip_prefix('#').filter(|h| h.len() == 6);
+    let h = h.unwrap_or_else(|| panic!("{hex} is not #rrggbb"));
+    let channel = |i: usize| {
+        let c = f64::from(u8::from_str_radix(&h[i..i + 2], 16).unwrap()) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+}
+
+/// The WCAG contrast ratio of two `#rrggbb` colours.
+fn contrast(a: &str, b: &str) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+#[test]
+fn builtin_themes_meet_aa() {
+    let mut failures = Vec::new();
+    for id in AA_THEMES {
+        let path = format!("{id}/theme.json");
+        let bytes = BUILTIN
+            .iter()
+            .find(|(k, _)| *k == path)
+            .unwrap_or_else(|| panic!("{path} is not in BUILTIN"))
+            .1;
+        let json: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let token = |name: &str| {
+            json["tokens"][name]
+                .as_str()
+                .unwrap_or_else(|| panic!("{id}: {name} is not set"))
+                .to_string()
+        };
+        let (bg, bar, text, dim) = (
+            token("--bg"),
+            token("--bar"),
+            token("--text"),
+            token("--dim"),
+        );
+        for (what, fg, ground, floor) in [
+            ("--text on --bg", &text, &bg, 4.5),
+            ("--text on --bar", &text, &bar, 4.5),
+            ("--dim on --bg", &dim, &bg, 3.0),
+        ] {
+            let ratio = contrast(fg, ground);
+            if ratio < floor {
+                failures.push(format!("{id}: {what} is {ratio:.2}, under {floor}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
