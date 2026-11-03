@@ -44,6 +44,18 @@ pub const RRC_SPAN_SYMBOLS: usize = 8;
 /// Samples of a stream's start the coarse offset is read from.
 pub const COARSE_FFT: usize = 4096;
 
+/// Least ratio of the peak to the median of the `|X|²` spectrum of `x^order` that
+/// [`coarse_offset`] trusts. White noise over [`COARSE_FFT`] bins peaks about 12 times
+/// over its median (measured 11 to 19; the chance of 50 is about 4096 × 2^-50); the
+/// line of a 1000-sample BPSK burst at 20 dB stood 28 000 times over it and QPSK over
+/// a whole block 7 000.
+pub const COARSE_MIN_PEAK_TO_MEDIAN: f64 = 50.0;
+
+/// Further [`COARSE_FFT`] blocks of a run a coarse estimate under
+/// [`COARSE_MIN_PEAK_TO_MEDIAN`] defers to before the offset falls back to 0 Hz (the
+/// residual left to the Costas loop).
+pub const MAX_COARSE_DEFERRALS: usize = 4;
+
 const ORDER_DEFAULT: u8 = 2;
 
 /// Damping of the Costas loop.
@@ -138,20 +150,32 @@ fn rrc_taps(rolloff: f64, sps: usize) -> Vec<f32> {
     h.iter().map(|v| (v / sum) as f32).collect()
 }
 
-/// The carrier offset of `x`, in radians per sample: the peak of the FFT of `x^order`
-/// over its first [`COARSE_FFT`] samples (zero-padded when shorter), refined by a
-/// parabola through the peak and its neighbours, divided by `order`.
-fn coarse_offset(x: &[Complex<f32>], order: u32) -> f64 {
+/// A coarse offset estimate: the offset in radians per sample and how far its line
+/// stands over the spectrum's median (power ratio).
+struct Coarse {
+    offset: f64,
+    peak_to_median: f64,
+}
+
+/// The carrier offset of `x`: the peak of the `|X|²` spectrum of `x^order` over its
+/// first [`COARSE_FFT`] samples (zero-padded when shorter), refined by a parabola
+/// through the peak and its neighbours, divided by `order`, with the peak's ratio to
+/// the spectrum's median. It is unambiguous only within ±rate / (2 × order).
+fn coarse_offset(x: &[Complex<f32>], order: u32) -> Coarse {
     let mut buf: Vec<Complex<f32>> = x.iter().take(COARSE_FFT).map(|s| s.powu(order)).collect();
     buf.resize(COARSE_FFT, Complex::new(0.0, 0.0));
     FftPlanner::<f32>::new()
         .plan_fft_forward(COARSE_FFT)
         .process(&mut buf);
-    let mag = |k: usize| buf[k % COARSE_FFT].norm() as f64;
+    let power: Vec<f64> = buf.iter().map(|b| b.norm_sqr() as f64).collect();
+    let pw = |k: usize| power[k % COARSE_FFT];
     let peak = (0..COARSE_FFT)
-        .max_by(|&a, &b| mag(a).total_cmp(&mag(b)))
+        .max_by(|&a, &b| pw(a).total_cmp(&pw(b)))
         .unwrap_or(0);
-    let (l, c, r) = (mag(peak + COARSE_FFT - 1), mag(peak), mag(peak + 1));
+    let mut sorted = power.clone();
+    let (_, median, _) = sorted.select_nth_unstable_by(COARSE_FFT / 2, f64::total_cmp);
+    let median = *median;
+    let (l, c, r) = (pw(peak + COARSE_FFT - 1), pw(peak), pw(peak + 1));
     let denom = l - 2.0 * c + r;
     let delta = if denom.abs() > 0.0 {
         (0.5 * (l - r) / denom).clamp(-0.5, 0.5)
@@ -163,14 +187,23 @@ fn coarse_offset(x: &[Complex<f32>], order: u32) -> f64 {
     } else {
         peak as f64
     };
-    TAU * (bin + delta) / COARSE_FFT as f64 / order as f64
+    Coarse {
+        offset: TAU * (bin + delta) / COARSE_FFT as f64 / order as f64,
+        peak_to_median: if median > 0.0 {
+            c / median
+        } else if c > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        },
+    }
 }
 
-/// A decision-directed Costas loop of order `m` on one sample per call: the phase error
-/// `sin(m φ) / m` (φ the sample's angle after the loop's correction; about φ near a
-/// lock) weighted by the sample's magnitude over the running amplitude (at most
-/// [`MAX_WEIGHT`]), so the samples between symbols, small or not, count by how much
-/// they carry.
+/// A Costas loop of order `m` with an `m`-th power phase detector, on one sample per
+/// call: the error `sin(m φ) / m` (φ the sample's angle after the loop's correction;
+/// about φ near a lock, whichever of the `m` points the sample is near) weighted by
+/// the sample's magnitude over the running amplitude (at most [`MAX_WEIGHT`]), so the
+/// samples between symbols, small or not, count by how much they carry.
 struct Costas {
     m: f64,
     kp: f64,
@@ -219,10 +252,14 @@ struct Demod {
     t0_ns: u64,
     /// The matched filter's group delay, in input samples.
     delay: usize,
-    /// Input held until [`COARSE_FFT`] samples give the offset.
+    /// Input held until a confident estimate (or the fallback) gives the offset.
     pending: Vec<Complex<f32>>,
-    /// The coarse offset in radians per sample, once read.
+    /// [`COARSE_FFT`] blocks of `pending` estimated so far.
+    tried: usize,
+    /// The coarse offset in radians per sample, once decided.
     offset: Option<f64>,
+    /// The decision's `psk` note for the job context, until the stage takes it.
+    note: Option<serde_json::Value>,
     mix_phase: f64,
     fir: StreamingComplexFir,
     /// Filtered samples to skip before the next one kept.
@@ -244,7 +281,9 @@ impl Demod {
             t0_ns,
             delay: taps.len() / 2,
             pending: Vec::new(),
+            tried: 0,
             offset: None,
+            note: None,
             mix_phase: 0.0,
             fir: StreamingComplexFir::new(taps),
             skip: 0,
@@ -295,46 +334,83 @@ impl Demod {
         out
     }
 
-    /// The output of `x`, interleaved I/Q; empty while the coarse offset waits for
-    /// [`COARSE_FFT`] samples.
+    /// The output of `x`, interleaved I/Q; empty while the coarse offset waits for a
+    /// confident [`COARSE_FFT`] block.
     fn process(&mut self, x: &[Complex<f32>]) -> Vec<f32> {
         if let Some(offset) = self.offset {
             return self.filter(x, offset);
         }
         self.pending.extend_from_slice(x);
-        if self.pending.len() < COARSE_FFT {
+        while self.offset.is_none() && self.pending.len() >= (self.tried + 1) * COARSE_FFT {
+            let block = &self.pending[self.tried * COARSE_FFT..(self.tried + 1) * COARSE_FFT];
+            let est = coarse_offset(block, self.order as u32);
+            self.tried += 1;
+            if est.peak_to_median >= COARSE_MIN_PEAK_TO_MEDIAN {
+                self.decide(est.offset, true, self.tried - 1);
+            } else if self.tried > MAX_COARSE_DEFERRALS {
+                self.decide(0.0, false, MAX_COARSE_DEFERRALS);
+            }
+        }
+        if self.offset.is_none() {
             return Vec::new();
         }
         self.release()
     }
 
-    /// Read the offset from what is pending and filter it.
-    fn release(&mut self) -> Vec<f32> {
-        let offset = coarse_offset(&self.pending, self.order as u32);
+    /// Fix the coarse offset and note it.
+    fn decide(&mut self, offset: f64, confident: bool, deferrals: usize) {
         self.offset = Some(offset);
+        self.note = Some(serde_json::json!({"psk": {
+            "coarse_hz": offset * self.rate_hz as f64 / TAU,
+            "coarse_confident": confident,
+            "coarse_deferrals": deferrals,
+        }}));
+    }
+
+    /// Filter what is pending with the decided offset.
+    fn release(&mut self) -> Vec<f32> {
+        let offset = self.offset.unwrap_or(0.0);
         let pending = std::mem::take(&mut self.pending);
         self.filter(&pending, offset)
     }
 
-    /// The run's end: anything still pending (its offset read from what there is),
-    /// then the matched filter's group delay of zeros, so the last input comes out.
+    /// The run's end: anything still pending (its offset read from the samples not yet
+    /// estimated, else 0 Hz), then the matched filter's group delay of zeros, so the
+    /// last input comes out.
     fn flush(&mut self) -> Vec<f32> {
-        let mut out = if self.offset.is_none() && !self.pending.is_empty() {
-            self.release()
-        } else {
-            Vec::new()
-        };
-        if self.offset.is_some() {
-            let zeros = vec![Complex::new(0.0, 0.0); self.delay];
-            out.extend(self.filter(&zeros, 0.0));
+        if self.pending.is_empty() && self.offset.is_none() {
+            return Vec::new();
         }
+        if self.offset.is_none() {
+            let rest = &self.pending[self.tried * COARSE_FFT..];
+            let est = (!rest.is_empty()).then(|| coarse_offset(rest, self.order as u32));
+            match est {
+                Some(e) if e.peak_to_median >= COARSE_MIN_PEAK_TO_MEDIAN => {
+                    self.decide(e.offset, true, self.tried)
+                }
+                _ => self.decide(0.0, false, self.tried),
+            }
+        }
+        let mut out = self.release();
+        let zeros = vec![Complex::new(0.0, 0.0); self.delay];
+        out.extend(self.filter(&zeros, 0.0));
         out
     }
 }
 
 /// The audio frame of `y` (interleaved I/Q, `d`'s next output samples) on `out`, with
-/// `prov` and the span of those samples; `None` when `y` is empty.
-fn publish(out: &StreamId, d: &mut Demod, prov: &Provenance, y: Vec<f32>) -> Option<Frame> {
+/// `prov` and the span of those samples; `None` when `y` is empty. A coarse offset
+/// decided since the last call is noted on `ctx` first.
+fn publish(
+    ctx: &StageContext,
+    out: &StreamId,
+    d: &mut Demod,
+    prov: &Provenance,
+    y: Vec<f32>,
+) -> Option<Frame> {
+    if let Some(note) = d.note.take() {
+        ctx.note(note);
+    }
     if y.is_empty() {
         return None;
     }
@@ -360,7 +436,18 @@ fn publish(out: &StreamId, d: &mut Demod, prov: &Provenance, y: Vec<f32>) -> Opt
 /// [`RRC_SPAN_SYMBOLS`], decimation, then a Costas loop of `order` whose gains come from
 /// `loop_bw`, locked with the constellation's first point at angle 0 (one of `order`
 /// rotations). The input rate must be a whole multiple of `OUT_SAMPLES_PER_SYMBOL ×
-/// symbol_rate_baud`, else the stage fails naming the rate to give `resample`. A seam
+/// symbol_rate_baud`, else the stage fails naming the rate to give `resample`.
+///
+/// The coarse estimate is unambiguous only within ±rate / (2 × `order`): at the least
+/// rate, 4 × baud, that is ±baud for BPSK, ±baud/2 for QPSK and ±baud/4 for 8PSK; at
+/// 8 × baud ±2 × baud, ±baud and ±baud/2. A larger offset aliases, so a chain must give
+/// `resample` a rate wide enough for the offset it expects, not merely the smallest
+/// rate on the grid. An estimate whose line stands under
+/// [`COARSE_MIN_PEAK_TO_MEDIAN`] over the spectrum's median (noise, no carrier yet)
+/// defers to the run's next [`COARSE_FFT`] block, at most [`MAX_COARSE_DEFERRALS`]
+/// times; at that bound, or at a flush with no confident line, the offset falls back
+/// to 0 Hz and the Costas loop is left the residual. The decision is noted in the job
+/// context under `psk`: `coarse_hz`, `coarse_confident` and `coarse_deferrals`. A seam
 /// ([`is_seam`]), a lag, a rate change and the input's end flush the matched filter
 /// (its group delay of zeros pushed through) and the next frame starts again: a new
 /// offset estimate, filter, decimation phase and loop.
@@ -422,7 +509,7 @@ impl Stage for PskDemodStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         self.check_params(&params).map_err(StageError::Failed)?;
         let p: PskDemodParams = serde_json::from_value(params)
@@ -431,16 +518,16 @@ impl Stage for PskDemodStage {
             .map_err(|o| StageError::Failed(format!("expected 1 output, got {}", o.len())))?;
         // The run's demodulator and its last frame's provenance.
         let mut run: Option<(Demod, Provenance)> = None;
-        let tail = |out: &StreamId, run: &mut Option<(Demod, Provenance)>| {
+        let tail = |ctx: &StageContext, out: &StreamId, run: &mut Option<(Demod, Provenance)>| {
             let (mut d, prov) = run.take()?;
             let y = d.flush();
-            publish(out, &mut d, &prov, y)
+            publish(ctx, out, &mut d, &prov, y)
         };
         run_map_ending(PSK_DEMOD_KIND, inputs, bus, cancel, move |input| {
             let frame = match input {
                 Some(Input::Frame(f)) => f,
                 Some(Input::Lagged { .. }) | None => {
-                    return Ok(tail(&out, &mut run).into_iter().collect());
+                    return Ok(tail(&ctx, &out, &mut run).into_iter().collect());
                 }
             };
             let Payload::Iq(block) = &frame.payload else {
@@ -454,7 +541,7 @@ impl Stage for PskDemodStage {
             if run.as_ref().is_some_and(|(d, prev)| {
                 d.rate_hz != rate || is_seam(prev.span.end_ns.0, span.start_ns.0, rate)
             }) {
-                published.extend(tail(&out, &mut run));
+                published.extend(tail(&ctx, &out, &mut run));
             }
             let (d, prev) = match &mut run {
                 Some(r) => r,
@@ -465,7 +552,7 @@ impl Stage for PskDemodStage {
             };
             *prev = frame.provenance.clone();
             let y = d.process(&block.samples);
-            published.extend(publish(&out, d, prev, y));
+            published.extend(publish(&ctx, &out, d, prev, y));
             Ok(published)
         })
         .await
@@ -474,7 +561,7 @@ impl Stage for PskDemodStage {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use num_complex::Complex;
     use serde_json::{Value, json};
@@ -485,9 +572,9 @@ mod tests {
     use zeta_core::stream::{Frame, Payload, StreamBus};
     use zeta_core::types::{Hz, JobId, Provenance, SourceId, Span, StreamKind, Timestamp};
 
-    use super::{COARSE_FFT, PskDemodStage, RRC_SPAN_SYMBOLS};
+    use super::{COARSE_FFT, MAX_COARSE_DEFERRALS, PskDemodStage, RRC_SPAN_SYMBOLS};
     use crate::frame_span;
-    use crate::synth::{Impairments, SynthSpec, synthesise};
+    use crate::synth::{Impairments, SynthSpec, awgn, synthesise};
 
     const RATE: u64 = 38_400;
     const BAUD: u32 = 4_800;
@@ -496,6 +583,10 @@ mod tests {
     /// The matched filter's group delay at [`RATE`], in input samples.
     const DELAY: usize = RRC_SPAN_SYMBOLS * (RATE / BAUD as u64) as usize / 2;
     const T0: u64 = 1_000_000_000;
+    /// Input samples per frame fed by [`blocks`]: 50 ms.
+    const BLOCK: usize = 1920;
+    /// Symbols of a burst the loops settle over before its Q share is read.
+    const SETTLE_SYMBOLS: usize = 32;
 
     fn prov(t0: u64, n: usize, rate: u64) -> Provenance {
         Provenance {
@@ -512,6 +603,14 @@ mod tests {
         params: Value,
         input: Vec<(u64, Vec<Complex<f32>>, u64)>,
     ) -> Result<Vec<(Span, Vec<f32>)>, StageError> {
+        Ok(run_noted(params, input).await?.0)
+    }
+
+    /// [`run_frames`] and the stage's job-context notes.
+    async fn run_noted(
+        params: Value,
+        input: Vec<(u64, Vec<Complex<f32>>, u64)>,
+    ) -> Result<(Vec<(Span, Vec<f32>)>, Vec<Value>), StageError> {
         let bus = Arc::new(StreamBus::new(64));
         let out = bus.register(StreamKind::Audio, prov(0, 0, RATE));
         let mut rx_out = bus.subscribe(&out).unwrap();
@@ -530,6 +629,10 @@ mod tests {
             .unwrap();
         }
         drop(tx);
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let sink = notes.clone();
+        let ctx = StageContext::new(SourceId("s".into()))
+            .with_note(Arc::new(move |v| sink.lock().unwrap().push(v)));
         PskDemodStage::new()
             .run(
                 params,
@@ -537,7 +640,7 @@ mod tests {
                 vec![out],
                 bus.clone(),
                 CancellationToken::new(),
-                StageContext::new(SourceId("s".into())),
+                ctx,
             )
             .await?;
         let mut frames = Vec::new();
@@ -553,7 +656,19 @@ mod tests {
             assert_eq!((sample_rate_hz.0, channels), (RATE / DECIM as u64, 2));
             frames.push((f.provenance.span, samples.to_vec()));
         }
-        Ok(frames)
+        let notes = notes.lock().unwrap().clone();
+        Ok((frames, notes))
+    }
+
+    /// `iq` as [`BLOCK`]-sample frames from [`T0`], contiguous.
+    fn blocks(iq: &[Complex<f32>]) -> Vec<(u64, Vec<Complex<f32>>, u64)> {
+        iq.chunks(BLOCK)
+            .enumerate()
+            .map(|(i, c)| {
+                let t0 = T0 + (i * BLOCK) as u64 * 1_000_000_000 / RATE;
+                (t0, c.to_vec(), RATE)
+            })
+            .collect()
     }
 
     /// Clean BPSK of `symbols` alternating-run bits at [`RATE`], `offset_hz` off centre.
@@ -628,9 +743,13 @@ mod tests {
     /// The share of `iq`'s power (interleaved, the second half) in Q: near 0 once a
     /// BPSK stream is locked on the real axis.
     fn q_share(iq: &[f32]) -> f32 {
-        let half = &iq[iq.len() / 2 / 2 * 2..];
+        q_share_from(iq, iq.len() / 4)
+    }
+
+    /// The share in Q of `iq`'s power after its first `skip` I/Q pairs.
+    fn q_share_from(iq: &[f32], skip: usize) -> f32 {
         let (mut i2, mut q2) = (0.0, 0.0);
-        for p in half.chunks(2) {
+        for p in iq[2 * skip..].chunks(2) {
             i2 += p[0] * p[0];
             q2 += p[1] * p[1];
         }
@@ -666,5 +785,78 @@ mod tests {
             let share = q_share(&frames[k].1);
             assert!(share < 0.05, "run {k}: {share} of the power in Q");
         }
+    }
+
+    /// The `psk` note of `notes`, the only one.
+    fn coarse_note(notes: &[Value]) -> &Value {
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        &notes[0]["psk"]
+    }
+
+    #[tokio::test]
+    async fn noise_ahead_of_the_signal_defers_the_offset_to_a_later_block() {
+        // Two blocks of noise, then BPSK at +1200 Hz and 20 dB.
+        const NOISE: usize = 2 * COARSE_FFT;
+        let mut sig = bpsk(1024, 1200.0);
+        awgn(&mut sig, 20.0, 11);
+        let mut noise = vec![Complex::new(0.0, 0.0); NOISE];
+        awgn(&mut noise, 20.0, 12);
+        let iq = [noise, sig].concat();
+        let n = iq.len();
+        let (frames, notes) = run_noted(json!({"symbol_rate_baud": BAUD}), blocks(&iq))
+            .await
+            .unwrap();
+        let note = coarse_note(&notes);
+        assert_eq!(note["coarse_confident"], true, "{note}");
+        assert_eq!(note["coarse_deferrals"], 2, "{note}");
+        let hz = note["coarse_hz"].as_f64().unwrap();
+        assert!((hz - 1200.0).abs() < 5.0, "{hz} Hz");
+        let y: Vec<f32> = frames.into_iter().flat_map(|(_, y)| y).collect();
+        assert_eq!(y.len() / 2, (n + DELAY).div_ceil(DECIM));
+        let share = q_share(&y);
+        assert!(share < 0.05, "{share} of the power in Q");
+    }
+
+    #[tokio::test]
+    async fn pure_noise_falls_back_to_0_hz_unconfident() {
+        let mut iq = vec![Complex::new(0.0, 0.0); (MAX_COARSE_DEFERRALS + 2) * COARSE_FFT];
+        awgn(&mut iq, 20.0, 13);
+        let n = iq.len();
+        let (frames, notes) = run_noted(json!({"symbol_rate_baud": BAUD}), blocks(&iq))
+            .await
+            .unwrap();
+        let note = coarse_note(&notes);
+        assert_eq!(note["coarse_confident"], false, "{note}");
+        assert_eq!(note["coarse_hz"], 0.0, "{note}");
+        assert_eq!(note["coarse_deferrals"], MAX_COARSE_DEFERRALS, "{note}");
+        let out: usize = frames.iter().map(|(_, y)| y.len() / 2).sum();
+        assert_eq!(out, (n + DELAY).div_ceil(DECIM));
+    }
+
+    #[tokio::test]
+    async fn a_short_burst_is_estimated_at_the_flush_and_locks() {
+        // 125 symbols (1000 samples) at +1200 Hz and 20 dB: under one coarse block, so
+        // the whole burst waits for the flush.
+        let mut iq = bpsk(125, 1200.0);
+        awgn(&mut iq, 20.0, 14);
+        let n = iq.len();
+        assert!(n < COARSE_FFT);
+        let (frames, notes) = run_noted(json!({"symbol_rate_baud": BAUD}), blocks(&iq))
+            .await
+            .unwrap();
+        let note = coarse_note(&notes);
+        assert_eq!(note["coarse_confident"], true, "{note}");
+        assert_eq!(note["coarse_deferrals"], 0, "{note}");
+        let hz = note["coarse_hz"].as_f64().unwrap();
+        assert!((hz - 1200.0).abs() < 10.0, "{hz} Hz");
+        assert_eq!(frames.len(), 1);
+        let y = &frames[0].1;
+        assert_eq!(y.len() / 2, (n + DELAY).div_ceil(DECIM));
+        // The filter's delay, then the settling symbols, then the burst's body (the
+        // tail of zeros through the filter excluded).
+        let skip = DELAY / DECIM + SETTLE_SYMBOLS * super::OUT_SAMPLES_PER_SYMBOL as usize;
+        let body = &y[..2 * (n / DECIM)];
+        let share = q_share_from(body, skip);
+        assert!(share < 0.05, "{share} of the power in Q");
     }
 }

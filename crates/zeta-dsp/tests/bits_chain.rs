@@ -174,11 +174,19 @@ pub fn align_errors(got: &[u8], want: &[u8]) -> usize {
 /// planted bits into symbols, and an inverted 4-level stream (index `3 - s`) is every bit
 /// flipped.
 pub fn align_errors_tail(got: &[u8], want: &[u8], tail_bits: usize) -> usize {
+    fewest_errors(got, want, tail_bits, 1, true)
+}
+
+/// The fewest bit errors over the alignments of `want` inside `got` at offsets that are
+/// multiples of `step`, each also tried inverted when `invert`, `want` allowed to run up
+/// to `tail_bits` past the end of `got`; `want.len()` when no alignment fits.
+fn fewest_errors(got: &[u8], want: &[u8], tail_bits: usize, step: usize, invert: bool) -> usize {
     let need = want.len().saturating_sub(tail_bits);
     if got.len() < need {
         return want.len();
     }
     (0..=got.len() - need)
+        .step_by(step)
         .map(|off| {
             let n = (got.len() - off).min(want.len());
             let e = got[off..off + n]
@@ -186,7 +194,7 @@ pub fn align_errors_tail(got: &[u8], want: &[u8], tail_bits: usize) -> usize {
                 .zip(want)
                 .filter(|(g, w)| g != w)
                 .count();
-            e.min(n - e)
+            if invert { e.min(n - e) } else { e }
         })
         .min()
         .unwrap_or(want.len())
@@ -353,10 +361,12 @@ async fn ook_chain_recovers_the_bits() {
     assert!(noisy < 21, "{noisy} bit errors at 10 dB");
 }
 
-/// The fewest bit errors of `got` against `want` ([`align_errors_tail`] with
-/// `tail_bits`) over the four rotations of a QPSK stream: each symbol pair of `got`
-/// (the slicer's natural mapping, MSB first) read as index `s` and remapped to
-/// `(s + r) mod 4`. `psk_demod` does not resolve the phase ambiguity of its order.
+/// The fewest bit errors of `got` against `want` over exactly the four rotations of a
+/// QPSK stream: each symbol pair of `got` (the slicer's natural mapping, MSB first)
+/// read as index `s` and remapped to `(s + r) mod 4`, then aligned on symbol boundaries
+/// without inversion (an inversion, `3 - s`, is a reflection, not a rotation), `want`
+/// allowed to run up to `tail_bits` past the end. `psk_demod` does not resolve the
+/// phase ambiguity of its order.
 pub fn best_rotation(got: &[u8], want: &[u8], tail_bits: usize) -> usize {
     (0..4u8)
         .map(|r| {
@@ -367,7 +377,7 @@ pub fn best_rotation(got: &[u8], want: &[u8], tail_bits: usize) -> usize {
                     [s >> 1, s & 1]
                 })
                 .collect();
-            align_errors_tail(&rotated, want, tail_bits)
+            fewest_errors(&rotated, want, tail_bits, 2, false)
         })
         .min()
         .unwrap_or(want.len())
@@ -418,5 +428,42 @@ async fn bpsk_chain_recovers_the_bits_up_to_inversion() {
 async fn qpsk_chain_recovers_the_bits_up_to_rotation() {
     let (got, want) = psk_bits(4, "qpsk", impairments(20.0, OFFSET_HZ)).await;
     let e = best_rotation(&got, &want, RESAMPLE_TAIL_SYMBOLS * 2);
+    assert_eq!(e, 0, "{e} bit errors");
+}
+
+/// Data bits of the short-burst chain, after its [`PREAMBLE_BITS`]: 128 symbols, 1024
+/// samples at [`FSK_RATE`].
+const BURST_BITS: usize = 64;
+const BURST_OFFSET_HZ: f64 = 1200.0;
+
+/// One short BPSK burst at [`FSK_RATE`] through `psk_demod → clock_recover → slicer`
+/// (no `resample`): its bit errors up to inversion, no tail tolerance.
+#[tokio::test]
+async fn a_short_bpsk_burst_recovers_its_bits_without_resample() {
+    let want = random_bits(BURST_BITS, SEED);
+    let spec = SynthSpec::Psk {
+        symbol_rate_baud: FSK_BAUD,
+        order: 2,
+        bits: hex_of(&with_preamble(&want, preamble_pattern(2))),
+        repeat: 1,
+        gap_ms: 0,
+    };
+    let iq = synthesise(
+        &spec,
+        &impairments(20.0, BURST_OFFSET_HZ),
+        FSK_RATE as u32,
+        0,
+    );
+    let events = run_chain(
+        &[
+            ("psk_demod", json!({"symbol_rate_baud": FSK_BAUD})),
+            ("clock_recover", json!({"symbol_rate_baud": FSK_BAUD})),
+            ("slicer", json!({"constellation": "bpsk"})),
+        ],
+        &iq,
+        FSK_RATE,
+    )
+    .await;
+    let e = align_errors(&recovered_bits(&events), &want);
     assert_eq!(e, 0, "{e} bit errors");
 }
