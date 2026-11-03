@@ -1,0 +1,243 @@
+/* The console theme: black ground, an elbowed frame, pill bars with dark text, a condensed
+   face, the ribbons leaning. The node wraps this file in [data-theme="console"] { ... } after
+   the theme's font faces, colour scheme, ribbon tilt and tokens (theme.json), so every rule
+   below is relative to it: `X` is `[data-theme="console"] X`, `&[...]` adds to <html>
+   (`html&[...]` keeps the type selector's weight). */
+& body { background: var(--bg); font-family: var(--font-ui); }
+/* Label roles are capitals under the console theme; decoded text, .line bodies, params and
+   .band stay as sent. */
+.pane h2,
+.job .kind,
+.job-tag .kind,
+.job-tag .channel { text-transform: uppercase; }
+
+/* Console: nodes are rounded bars coloured by stage family, black text on every one. */
+#graph .graph-node rect { fill: var(--c-idle); stroke: none; }
+#graph .graph-node[data-kind="channel"] rect,
+#graph .graph-node[data-kind="fft"] rect,
+#graph .graph-node[data-kind="measure"] rect,
+#graph .graph-node[data-kind="detect"] rect { fill: var(--c-channel-1); }
+#graph .graph-node[data-kind="nbfm_demod"] rect,
+#graph .graph-node[data-kind="wfm_demod"] rect,
+#graph .graph-node[data-kind="am_demod"] rect,
+#graph .graph-node[data-kind="ssb_demod"] rect { fill: var(--c-frame); }
+#graph .graph-node[data-kind="denoise"] rect,
+#graph .graph-node[data-kind="vad"] rect,
+#graph .graph-node[data-kind="mix"] rect,
+#graph .graph-node[data-kind="stream_in"] rect { fill: var(--c-channel-3); }
+#graph .graph-node[data-kind="aprs_decode"] rect,
+#graph .graph-node[data-kind="pocsag_decode"] rect,
+#graph .graph-node[data-kind="rds_decode"] rect,
+#graph .graph-node[data-kind="acars_decode"] rect,
+#graph .graph-node[data-kind="adsb_decode"] rect,
+#graph .graph-node[data-kind="external_decode"] rect,
+#graph .graph-node[data-kind="transcribe"] rect,
+#graph .graph-node[data-kind="burst_capture"] rect { fill: var(--c-action); }
+#graph .graph-node[data-kind="sink_sondehub"] rect { fill: var(--c-channel-4); }
+#graph .graph-node[data-kind="passthrough"] rect { fill: var(--c-idle); }
+#graph .graph-node:hover rect,
+#graph .graph-node:focus-visible rect { stroke: var(--text); stroke-width: 2; }
+#graph .graph-node.selected rect { stroke: var(--text); stroke-width: 3; }
+#graph .graph-node text { fill: #000; }
+#graph .graph-node text.kind { font-weight: bold; text-transform: uppercase; }
+#graph .graph-node text.nid,
+#graph .graph-node text.graph-node-headline { fill: color-mix(in srgb, #000 70%, transparent); }
+#graph .graph-edge line { stroke: var(--c-frame); }
+#graph .graph-edge text { fill: var(--c-channel-5); }
+#graph .graph-arrowhead { fill: var(--c-frame); }
+
+/* The spine between the two elbows, painted only under the console theme: the rail's start
+   border (the rail rule below), so #waterfall keeps the width of #main. */
+#top,
+#bar {
+  background: #000;            /* ground behind the bars */
+  border: none;
+  gap: 6px;
+  padding: 0;
+}
+#tabs, #panes { gap: 6px; }
+/* The upper elbow: the brand, in the frame colour. */
+.brand {
+  align-self: stretch;
+  display: flex;
+  align-items: flex-end;
+  background: var(--c-frame);
+  color: #000;                 /* black text on every coloured bar */
+  border-start-start-radius: var(--radius-elbow);
+  padding-inline: 10px 8px;
+  min-width: var(--rail-w);    /* the spine and the rail under it */
+}
+/* Source bars: the selected one takes the free width and carries the live numbers. */
+.src-tab {
+  background: var(--c-source);
+  color: #000;
+  border: none;
+  border-radius: var(--radius-bar);
+  flex: 0 0 auto;
+  text-transform: uppercase;   /* bar caption */
+}
+.src-tab .name,
+.src-tab[aria-selected="true"] .name { color: #000; }
+.src-tab.fault { background: var(--error); }
+.src-tab[aria-selected="true"] { flex: 1; }
+.src-tab:not([aria-selected="true"]) { opacity: 0.8; }
+.src-tab .tag.pin { border-color: #000; color: #000; }
+.src-tab[aria-selected="true"] .health {
+  display: inline-flex;
+  gap: 4px;
+  margin-inline-start: auto;
+  align-items: baseline;
+}
+.health .k { font-size: 10px; text-transform: uppercase; opacity: 0.7; }
+.health .v { margin-inline-end: 8px; }
+/* Action bars, the last one end-capped. */
+.pane-tab,
+#map-toggle,
+#listen-all,
+#drawer-toggle {
+  background: var(--c-action);
+  color: #000;
+  border: none;
+  border-radius: var(--radius-bar);
+  text-transform: uppercase;   /* bar caption */
+}
+.pane-tab[aria-selected="true"],
+#map-toggle[aria-pressed="true"],
+#listen-all[aria-pressed="true"] {
+  background: var(--c-speaking);
+  color: #000;
+}
+/* The last visible bar: Listen to all on wide (the map and drawer toggles are hidden there),
+   the drawer toggle on narrow. The command bar's mic takes its end cap with its own rule
+   below. */
+#listen-all,
+&[data-footprint="narrow"] #drawer-toggle {
+  border-start-end-radius: var(--radius-elbow);
+  border-end-end-radius: var(--radius-elbow);
+}
+&[data-footprint="narrow"] #listen-all {
+  border-start-end-radius: var(--radius-bar);
+  border-end-end-radius: var(--radius-bar);
+}
+/* The lower elbow: the prompt, in the frame colour; the command line a dark bar; mic a peach bar. */
+#bar .prompt {
+  align-self: stretch;
+  display: flex;
+  align-items: flex-start;
+  background: var(--c-frame);
+  color: #000;
+  border-end-start-radius: var(--radius-elbow);
+  padding-inline: 10px 8px;
+  min-width: var(--rail-w);    /* the spine and the rail under it */
+}
+#cmd {
+  background: var(--c-idle);
+  color: var(--text);
+  border: none;
+  border-radius: var(--radius-bar);
+}
+#mic {
+  background: var(--c-channel-5);
+  color: #000;
+  border: none;
+  border-start-start-radius: var(--radius-bar);
+  border-end-start-radius: var(--radius-bar);
+  border-start-end-radius: var(--radius-elbow);   /* the command bar's end cap */
+  border-end-end-radius: var(--radius-elbow);
+  text-transform: uppercase;   /* bar caption */
+}
+
+.job-tag[data-colour] { background: var(--job-c); color: #000; }
+/* narrow footprint (spec 4.10): the rail is 14px of thin segments, no text; the 12px spine
+   border is dropped so the whole width is clickable. A tap adds .expanded (overlays.js
+   RAIL_EXPAND_MS): the tag floats over the axis as a label, then folds back. */
+html&[data-footprint="narrow"] { --rail-w: 14px; }
+html&[data-footprint="narrow"] #waterfall #rail {
+  border-inline-start: 0; overflow: visible; z-index: 6;
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag {
+  inset-inline-start: 0; inset-inline-end: 0; width: auto;
+  height: var(--rail-thin-px); padding: 0; font-size: 0; line-height: 0;
+  border-radius: 0; touch-action: none;
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag > * { display: none; }
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded {
+  inset-inline-start: var(--rail-w); inset-inline-end: auto; width: max-content; height: auto; z-index: 6;
+  padding-inline: 6px; font-size: 12px; line-height: 20px; border-radius: var(--radius-bar);
+}
+/* the label reads as the console tag does: the channel on a plan, else the kind, then the
+   squelch dot and the centre (never the short id or the snippet) */
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .channel:not(:empty),
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded:not(:has(.channel:not(:empty))) > .kind,
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .centre {
+  display: inline;
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .dot { display: inline-block; }
+
+.job-tag .short,
+.job-tag .snippet { display: none; }
+/* on a plan channel the rail reads the channel, else the kind; then the centre */
+.job-tag:has(.channel:not(:empty)) .kind { display: none; }
+.job-tag .channel:empty { display: none; }
+.job-tag .dot.closed { background: var(--c-idle); }
+/* a closed squelch: the idle ground, the job's colour kept as the start border */
+.job-tag[data-colour]:has(.dot.closed) {
+  background: var(--c-idle); color: var(--text); box-shadow: inset 3px 0 0 var(--job-c);
+}
+.job-tag.hot { outline: 2px solid var(--text); outline-offset: -2px; }
+.job-tag[data-colour].speaking {
+  background: var(--c-speaking); color: #000; outline: none;
+}
+#waterfall .outline[data-colour] { border-color: var(--job-c); }
+#waterfall .outline[data-colour].hot { border-color: var(--text); }
+#waterfall .outline[data-colour].speaking { border-color: var(--c-speaking); }
+/* a ribbon's ground is its job's colour; an error or dropped chunk and the agent's own notes
+   stand apart (spec 4.4) */
+#waterfall .ov-ribbon[data-colour] {
+  background: var(--job-c); color: #000; border: 0;
+}
+#waterfall .ov-ribbon[data-colour] .count { color: inherit; opacity: 0.7; }
+#waterfall .ov-ribbon.transcript-error {
+  background: var(--error); color: #000; border: 0;
+}
+#waterfall .ov-ribbon.agent { background: var(--user); color: #000; border: 0; }
+#waterfall .ov-ribbon.transcript-error .count,
+#waterfall .ov-ribbon.agent .count { color: inherit; opacity: 0.7; }
+/* ---- the side column (spec 4.6, 4.7) ---- */
+/* Header bars in the frame colour, end-capped; a folded one goes idle grey. */
+.pane h2 { border: 0; padding-block: 2px; }
+.pane-head {
+  background: var(--c-frame);
+  color: #000;
+  border-start-end-radius: var(--radius-bar);
+  border-end-end-radius: var(--radius-bar);
+}
+&:not([data-footprint="narrow"]) section.pane[data-collapsed] .pane-head {
+  background: var(--c-idle);
+  color: var(--text);
+}
+.pane.jobs { border: 0; }
+/* A row is an end-capped bar in its job's colour with black text; speaking and hot as the
+   rail's tag; a finished one idle grey. */
+#jobs .job[data-colour] {
+  background: var(--job-c);
+  color: #000;
+  border-start-end-radius: var(--radius-bar);
+  border-end-end-radius: var(--radius-bar);
+  padding-inline-end: 8px;
+  margin-block-end: 2px;
+}
+#jobs .job[data-colour] > span,
+#jobs .job[data-colour] .tag { color: inherit; }
+#jobs .job[data-colour] .tag { border-color: currentColor; }
+#jobs .job[data-colour] .actions button {
+  background: #000; color: var(--text); border-color: #000;
+}
+#jobs .job[data-colour].speaking {
+  background: var(--c-speaking); border-inline-start-color: var(--c-speaking);
+}
+#jobs .job[data-colour].hot { outline: 2px solid var(--text); outline-offset: -2px; }
+#jobs .job[data-colour].finished {
+  background: var(--c-idle); color: var(--text); opacity: 1;
+}
+.job-group > summary { color: var(--text); text-transform: uppercase; }

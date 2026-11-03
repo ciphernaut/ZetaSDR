@@ -942,9 +942,13 @@ async function loadStationHome(api) {
   }
 }
 
-// <html data-theme="console|plain"> from the view's `theme` policy; never absent.
+// <html data-theme="console|plain"> from the view's `theme` policy; never absent. The rail
+// switch <html data-rail="on|off"> follows the console theme until it comes from the theme's
+// layout.
 function applyTheme() {
-  document.documentElement.dataset.theme = state.view ? state.view.get("theme") : "console";
+  const theme = state.view ? state.view.get("theme") : "console";
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.dataset.rail = theme === "console" ? "on" : "off";
 }
 
 // The side column's panes (view policy `side`): the ones left out of the value are folded to

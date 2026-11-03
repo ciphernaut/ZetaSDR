@@ -118,18 +118,6 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
         "text/plain; charset=utf-8",
         include_bytes!("../web/vendor/leaflet/LICENSE"),
     ),
-    // Antonio (variable weight, SIL Open Font License 1.1, OFL.txt beside it): the console
-    // theme's face. No woff2_compress on the build host, so the TTF ships as is.
-    (
-        "vendor/antonio/Antonio-VF.ttf",
-        "font/ttf",
-        include_bytes!("../web/vendor/antonio/Antonio-VF.ttf"),
-    ),
-    (
-        "vendor/antonio/OFL.txt",
-        "text/plain; charset=utf-8",
-        include_bytes!("../web/vendor/antonio/OFL.txt"),
-    ),
 ];
 
 /// The MIME type and bytes of the file at `path`; `""` is `index.html`.
@@ -188,8 +176,6 @@ mod tests {
             ),
             ("vendor/leaflet/leaflet.css", "text/css; charset=utf-8"),
             ("vendor/leaflet/LICENSE", "text/plain; charset=utf-8"),
-            ("vendor/antonio/Antonio-VF.ttf", "font/ttf"),
-            ("vendor/antonio/OFL.txt", "text/plain; charset=utf-8"),
         ] {
             let (m, bytes) = asset(path).unwrap_or_else(|| panic!("{path} embedded"));
             assert_eq!(m, mime, "{path}");
