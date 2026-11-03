@@ -371,6 +371,7 @@ impl Slicer {
                 self.pending.push(((sym >> b) & 1) as u8);
                 self.pending_end = end;
                 if self.pending.len() >= p.chunk_bits as usize {
+                    totals.events += 1;
                     out.push(self.bits_frame(events));
                 }
             }
@@ -463,17 +464,24 @@ impl Slicer {
         Frame::new(events.clone(), prov, Payload::Event(ev))
     }
 
-    /// The pending chunk as a short `bits` event, and the partial window noted.
+    /// The pending chunk as a short `bits` event, and the partial window noted (the
+    /// note counting that event).
     fn flush(
         &mut self,
         events: &StreamId,
         totals: &mut Totals,
         ctx: &StageContext,
     ) -> Option<Frame> {
+        let frame = (!self.pending.is_empty()).then(|| {
+            totals.events += 1;
+            self.bits_frame(events)
+        });
         if self.window.symbols > 0 {
             self.close_window(events, totals, ctx);
+        } else if frame.is_some() {
+            totals.note(events, ctx);
         }
-        (!self.pending.is_empty()).then(|| self.bits_frame(events))
+        frame
     }
 }
 
@@ -481,6 +489,8 @@ impl Slicer {
 #[derive(Default)]
 struct Totals {
     symbols: u64,
+    /// `bits` events published.
+    events: u64,
     eye_open: Option<f64>,
     evm: Option<f64>,
 }
@@ -489,6 +499,7 @@ impl Totals {
     fn note(&self, events: &StreamId, ctx: &StageContext) {
         ctx.note(serde_json::json!({"slicer": {
             "symbols": self.symbols,
+            "events": self.events,
             "eye_open": self.eye_open,
             "evm": self.evm,
             "stream": events.0,

@@ -298,7 +298,7 @@ JSON: `{"op":"job_stop","job":"<id>"}`
 
 CLI: `zeta job stop --job <id>`
 
-Stopping a job is the operator's decision: never `job_stop` a job the request did not name, except one you started in this run (`job_start`, `plan_start`, `job_attach`, or the `verdict.job` of your own `identify` once you have read it): stop your own `measure` and `identify` leftovers when done. Through `ask` any other stop needs the run to allow stops, else it is refused as `not_allowed`: report that, do not retry.
+Stopping a job is the operator's decision: never `job_stop` a job the request did not name, except one you started in this run (`job_start`, `plan_start`, `job_attach`, `graph_start`, `bits_start`, or the `verdict.job` of your own `identify` once you have read it): stop your own `measure` and `identify` leftovers when done. Through `ask` any other stop needs the run to allow stops, else it is refused as `not_allowed`: report that, do not retry.
 
 ### jobs_stop
 
@@ -382,6 +382,19 @@ Start a job from a graph whose first node has no inputs (`capture_in`, `stream_i
 JSON: `{"op":"graph_start","graph":{"id":"<id>","nodes":[{"id":"<node-id>","kind":"passthrough","params":{"kind":"iq"}}],"edges":[]}}`
 
 CLI: `zeta graph start --file graph.json`
+
+### bits_start
+
+Work a capture's bits: takes every capture of the named capture's `set`, in time order, and starts `capture_in → resample → <demod> → clock_recover → slicer → bit_view` from the named capture's feature record, each `null` taken from the features (`modulation`, one of `fsk`, `psk` and `ook`, from the layer-1 label: `fsk` and `fm` give `fsk`, `psk` and `ook` themselves; `symbol_rate_baud` and `order` from the record, `order` 2 when it has none; fsk takes 2 or 4, psk 2, 4 or 8, ook 2). The capture is resampled to 8 samples per symbol, moved to a rate the resampler serves exactly; `capture_in` loops, paced, with a 500 ms pause between passes, and the job runs until stopped. Refused with `other`: a field neither the request nor the features give (`no symbol rate measured; give symbol_rate_baud`, `no modulation measured (label <x>); give modulation`), a rate the capture cannot hold (`symbol_rate_baud <r> needs <n> Hz; the capture holds <rate> Hz`, 4 samples per symbol at least), and a set whose captures differ in rate or centre (`capture <id>: <rate> Hz differs from <first>'s <rate> Hz`); an unknown `capture` is `unknown`. The record's kind is `bits`, its source `node`, its band the capture's, `job_context.bits` the plan (`captures`, `modulation`, `symbol_rate_baud`, `order`, `rate_hz`); the slicer's `bits` events are on `job_context.slicer.stream` and `bit_view`'s latest hypotheses in `job_context.bit_view`. Change a running chain with `graph_get`, edit, `graph_put`. The result is the job's id, as `job_start` answers; one-shot `--then-tail` tails the `bits` events. The agent's own `bits_start` jobs count as jobs it started.
+
+- capture: string
+- modulation: string or null
+- symbol_rate_baud: integer or null
+- order: integer or null
+
+JSON: `{"op":"bits_start","capture":"<id>","modulation":null,"symbol_rate_baud":null,"order":null}`
+
+CLI: `zeta bits start --capture <id> [--modulation fsk|psk|ook] [--symbol-rate-baud N] [--order N] [--then-tail MAX_FRAMES,TIMEOUT_MS] [--keep]`
 
 ### knowledge_lookup
 

@@ -21,7 +21,7 @@ fn rendering_lists_every_op_variant() {
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let variants = v["value"]["op"]["oneOf"].as_array().unwrap();
-    assert_eq!(variants.len(), 34);
+    assert_eq!(variants.len(), 35);
     let md = zeta()
         .arg("agents-md")
         .assert()

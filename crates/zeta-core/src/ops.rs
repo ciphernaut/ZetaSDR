@@ -9,6 +9,7 @@ use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub use crate::bits::Modulation;
 use crate::capture::{CaptureMeta, write_cf32};
 use crate::classify::{Band, Classification, Label, Tried};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
@@ -25,7 +26,7 @@ use crate::ring::RingError;
 use crate::station::Station;
 use crate::stream::{Frame, Payload, StreamInfo};
 use crate::types::{
-    Capabilities, ChannelId, Hz, JobId, Selection, SourceId, StreamId, StreamKind, Timestamp,
+    Baud, Capabilities, ChannelId, Hz, JobId, Selection, SourceId, StreamId, StreamKind, Timestamp,
 };
 
 /// A band as `capture_list` narrows by: a capture matches when its own band overlaps it.
@@ -386,6 +387,45 @@ pub enum Op {
     /// to retune. The result is the job's id, as `job_start` answers.
     GraphStart {
         graph: Graph,
+    },
+    /// Work a capture's bits: takes every capture of the named capture's `set`, in time
+    /// order, and starts `capture_in → resample → <demod> → clock_recover → slicer →
+    /// bit_view` from the named capture's feature record, each `null` taken from the
+    /// features (`modulation`, one of `fsk`, `psk` and `ook`, from the layer-1 label:
+    /// `fsk` and `fm` give `fsk`, `psk` and `ook` themselves; `symbol_rate_baud` and
+    /// `order` from the record, `order` 2 when it has none; fsk takes 2 or 4, psk 2, 4
+    /// or 8, ook 2). The capture is resampled to 8 samples per symbol, moved to a rate the
+    /// resampler serves exactly; `capture_in` loops, paced, with a 500 ms pause between
+    /// passes, and the job runs until stopped. Refused with `other`: a field neither the
+    /// request nor the features give (`no symbol rate measured; give symbol_rate_baud`,
+    /// `no modulation measured (label <x>); give modulation`), a rate the capture cannot
+    /// hold (`symbol_rate_baud <r> needs <n> Hz; the capture holds <rate> Hz`, 4 samples
+    /// per symbol at least), and a set whose captures differ in rate or centre
+    /// (`capture <id>: <rate> Hz differs from <first>'s <rate> Hz`); an unknown `capture`
+    /// is `unknown`. The record's kind is `bits`, its source `node`, its band the
+    /// capture's, `job_context.bits` the plan (`captures`, `modulation`,
+    /// `symbol_rate_baud`, `order`, `rate_hz`); the slicer's `bits` events are on
+    /// `job_context.slicer.stream` and `bit_view`'s latest hypotheses in
+    /// `job_context.bit_view`. Change a running chain with `graph_get`, edit,
+    /// `graph_put`. The result is the job's id, as `job_start` answers; one-shot
+    /// `--then-tail` tails the `bits` events. The agent's own `bits_start` jobs count as
+    /// jobs it started.
+    BitsStart {
+        /// An id from `capture_list`.
+        capture: String,
+        /// The demodulator; `null` for the layer-1 label's.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::modes::nullable_enum::<Modulation>")]
+        modulation: Option<Modulation>,
+        /// The symbol rate; `null` for the feature record's.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<Baud>")]
+        symbol_rate_baud: Option<Baud>,
+        /// The modulation order (fsk 2 or 4, psk 2, 4 or 8, ook 2); `null` for the
+        /// feature record's, else 2.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<u8>")]
+        order: Option<u8>,
     },
     /// Band-plan allocations in `region` and known signatures overlapping the
     /// band, from every registered knowledge provider.
@@ -1605,6 +1645,10 @@ pub const BURST_CAPTURE_STAGE: &str = "burst_capture";
 /// `captures` are ids in the node's [`crate::bursts::BurstStore`].
 pub const CAPTURE_IN_STAGE: &str = "capture_in";
 
+/// The stage kind that slices symbols into `bits` events (registered by `zeta-dsp`): it
+/// notes the stream it publishes them on as `slicer.stream` in the job's context.
+pub const SLICER_STAGE: &str = "slicer";
+
 /// The kind recorded for a job `graph_start` started.
 pub const GRAPH_KIND: &str = "graph";
 
@@ -2142,6 +2186,7 @@ impl Op {
             Op::GraphGet { .. } => "graph_get",
             Op::GraphPut { .. } => "graph_put",
             Op::GraphStart { .. } => "graph_start",
+            Op::BitsStart { .. } => "bits_start",
             Op::KnowledgeLookup { .. } => "knowledge_lookup",
             Op::ChannelPlans {} => "channel_plans",
             Op::ModesList { .. } => "modes_list",
@@ -3148,6 +3193,16 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             .map_err(|e| node_error(node, e)),
         Op::GraphStart { graph } => node
             .graph_start(graph)
+            .await
+            .map(OpResult::Job)
+            .map_err(|e| node_error(node, e)),
+        Op::BitsStart {
+            capture,
+            modulation,
+            symbol_rate_baud,
+            order,
+        } => node
+            .bits_start(&capture, modulation, symbol_rate_baud, order)
             .await
             .map(OpResult::Job)
             .map_err(|e| node_error(node, e)),

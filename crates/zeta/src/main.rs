@@ -166,7 +166,11 @@ async fn one_shot(
 ) -> ExitCode {
     let starts_job = matches!(
         op,
-        Op::JobStart { .. } | Op::JobAttach { .. } | Op::MixStart { .. } | Op::GraphStart { .. }
+        Op::JobStart { .. }
+            | Op::JobAttach { .. }
+            | Op::MixStart { .. }
+            | Op::GraphStart { .. }
+            | Op::BitsStart { .. }
     );
     if let Op::IqRead { selection } | Op::Classify { selection } = &op {
         wait_for_ring(node, selection).await;
@@ -267,7 +271,8 @@ fn verdict_job(rec: &zeta_core::job::JobRecord) -> Option<Option<zeta_core::type
 /// `--then-tail`: wait up to `STREAM_WAIT` for the job's audio output (a
 /// demodulator's; its `squelch` events are not what a tail is for), else its
 /// first event output stream (an edge between its stages never), then apply
-/// `StreamTail` to it.
+/// `StreamTail` to it. A job whose graph has a `slicer` is tailed on the stream
+/// `job_context.slicer.stream` names, waited for the same way.
 async fn tail_job(
     node: &zeta_core::node::Node,
     job: &zeta_core::types::JobId,
@@ -275,16 +280,34 @@ async fn tail_job(
 ) -> Result<zeta_core::ops::OpResult, OpError> {
     use zeta_core::types::StreamKind;
     let deadline = tokio::time::Instant::now() + STREAM_WAIT;
+    // A chain with a slicer (`bits_start`) is tailed on its `bits` events, which the
+    // slicer names in the job's context once it has sliced.
+    let sliced = node
+        .job_list()
+        .into_iter()
+        .find(|r| &r.id == job)
+        .is_some_and(|r| {
+            r.graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == zeta_core::ops::SLICER_STAGE)
+        });
     let stream = loop {
-        if let Ok(s) = node.job_audio_stream(job) {
-            break s;
-        }
-        // An output, never an edge between two of its stages (a watch's spectrum rows).
-        if let Some((_, s)) = node
-            .job_outputs(job)
-            .into_iter()
-            .find(|(k, _)| *k == StreamKind::Event)
-        {
+        let found = if sliced {
+            node.job_context(job)
+                .and_then(|c| c["slicer"]["stream"].as_str().map(String::from))
+                .map(zeta_core::types::StreamId)
+        } else {
+            node.job_audio_stream(job).ok().or_else(|| {
+                // An output, never an edge between two of its stages (a watch's
+                // spectrum rows).
+                node.job_outputs(job)
+                    .into_iter()
+                    .find(|(k, _)| *k == StreamKind::Event)
+                    .map(|(_, s)| s)
+            })
+        };
+        if let Some(s) = found {
             break s;
         }
         if tokio::time::Instant::now() >= deadline {

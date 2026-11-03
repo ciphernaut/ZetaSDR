@@ -5,6 +5,7 @@ mod capture;
 mod identify;
 mod jsonlog;
 mod launch;
+pub use launch::DRAIN_TIMEOUT_MS;
 mod persist;
 mod recover;
 mod retune;
@@ -1358,6 +1359,96 @@ impl Node {
             tuning,
             state: JobState::Running,
             context: serde_json::json!({}),
+            created_ns: now(),
+            input: None,
+            capture_rate_hz: None,
+            elastic: false,
+            operator_graph: true,
+            owner: None,
+        };
+        let id = rec.id.clone();
+        self.inner.launch(rec).await?;
+        Ok(id)
+    }
+
+    /// Start the bits chain ([`crate::bits::bits_graph`]) over the set of the burst
+    /// capture `capture`, in time order, each `None` filled from the capture's feature
+    /// record or, for `modulation`, the layer-1 label the classifiers give its samples: a
+    /// leaseless [`BITS_KIND`](crate::ops::BITS_KIND) record on [`NODE_SOURCE`], its band
+    /// the capture's, `context.bits` the plan, launched as stored as `graph_start`
+    /// launches. `Expand(Unknown)` naming `capture` for a capture not in the store;
+    /// `Other` for what [`crate::bits::bits_plan`] refuses.
+    pub async fn bits_start(
+        &self,
+        capture: &str,
+        modulation: Option<crate::bits::Modulation>,
+        symbol_rate_baud: Option<crate::types::Baud>,
+        order: Option<u8>,
+    ) -> Result<JobId, NodeError> {
+        let store = self.bursts();
+        let Some(named) = store.get(capture) else {
+            return Err(NodeError::Expand(OpError::Unknown {
+                field: "capture".into(),
+                value: capture.to_string(),
+                known: store.list().into_iter().map(|r| r.id).collect(),
+            }));
+        };
+        let mut set: Vec<_> = store
+            .list()
+            .into_iter()
+            .filter(|r| r.set == named.set)
+            .collect();
+        set.sort_by_key(|r| (r.start_ns, r.id.clone()));
+        // A record that does not read as one (an older store's `{}`) measured nothing.
+        let features: crate::classify::FeatureRecord = serde_json::from_value(
+            named.features.clone(),
+        )
+        .unwrap_or(crate::classify::FeatureRecord {
+            bandwidth_hz: named.bandwidth_hz,
+            center_hz: named.center_hz,
+            symbol_rate_baud: None,
+            snr_db: 0.0,
+            burst: false,
+            duty: None,
+            bursts: None,
+            burst_ms: None,
+            period_ms: None,
+            order: None,
+            tone_spacing_hz: None,
+        });
+        let label = match modulation {
+            Some(_) => None,
+            None => crate::ops::classify_capture(&self.classifiers(), &named)
+                .await
+                .map_err(NodeError::Other)?
+                .labels
+                .into_iter()
+                .find(|l| l.layer == 1)
+                .map(|l| l.name),
+        };
+        let plan = crate::bits::bits_plan(
+            &set,
+            &features,
+            label.as_deref(),
+            modulation,
+            symbol_rate_baud,
+            order,
+        )
+        .map_err(NodeError::Other)?;
+        let graph = crate::bits::bits_graph(&plan);
+        graph::validate(&graph, &self.inner.registry)?;
+        let rec = JobRecord {
+            format: JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: crate::ops::BITS_KIND.to_string(),
+            graph,
+            source: SourceId(NODE_SOURCE.into()),
+            tuning: Tuning {
+                center_hz: named.center_hz,
+                bandwidth_hz: named.bandwidth_hz,
+            },
+            state: JobState::Running,
+            context: serde_json::json!({ "bits": plan }),
             created_ns: now(),
             input: None,
             capture_rate_hz: None,

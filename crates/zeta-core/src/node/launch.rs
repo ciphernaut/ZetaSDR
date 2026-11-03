@@ -2,7 +2,7 @@
 //! the `scan` job's step loop. Attached jobs launch here too, without the radio; the
 //! `identify` job's controller is in [`super::identify`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -29,6 +29,13 @@ use crate::stream_in::STREAM_IN_KIND;
 use crate::types::{
     ChannelId, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
 };
+
+/// How long the rest of a draining job (one on no radio and no input job) may run after
+/// its first stage ended cleanly, before the supervisor cancels it, ms.
+pub const DRAIN_TIMEOUT_MS: u64 = 2000;
+
+/// A draining job's stage tasks with the streams each outputs to.
+pub(super) type Drain = HashMap<tokio::task::Id, Vec<StreamId>>;
 
 /// What a launch under the source's gate leaves for once the gate is released
 /// (see [`Inner::launch_gated`]): each takes the gate itself.
@@ -232,6 +239,8 @@ impl Inner {
         let watch =
             (rec.kind == JobKind::Watch.name()).then(|| (watch::Seed::of(&rec), rec.tuning));
         let attached = rec.input.is_some();
+        // A job on no radio and no input job drains when a stage ends (see `supervise`).
+        let drains = rec.leaseless() && !attached;
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.
         let (prov, run, ended) = self.record_running(rec, &token)?;
 
@@ -263,6 +272,7 @@ impl Inner {
             .map(|(n, _)| &n.id)
             .collect();
         let mut set = JoinSet::new();
+        let mut drain: Drain = HashMap::new();
         for (n, stage) in graph.nodes.iter().zip(stages) {
             let mut inputs = Vec::new();
             let mut leaving = Vec::new();
@@ -295,14 +305,16 @@ impl Inner {
             if let Some(rec) = &tee {
                 self.tee_transcripts(rec, &job_outputs[before..], &token);
             }
-            let ids = outputs.into_iter().map(|(_, s)| s).collect();
+            let ids: Vec<StreamId> = outputs.into_iter().map(|(_, s)| s).collect();
+            let own = ids.clone();
             let (params, bus, cancel) = (n.params.clone(), self.bus.clone(), token.clone());
             let ctx = ctx.clone();
             let running = StageRunning::new(self.stages.clone());
-            set.spawn(async move {
+            let task = set.spawn(async move {
                 let _running = running;
                 stage.run(params, inputs, ids, bus, cancel, ctx).await
             });
+            drain.insert(task.id(), own);
         }
         if let (Some((seed, tuning)), Some(port)) = (watch, &port) {
             // The controller reads `detect`'s events and publishes its own beside them.
@@ -346,7 +358,7 @@ impl Inner {
             port,
             set,
             token,
-            streams,
+            (streams, drains.then_some(drain)),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run
@@ -834,7 +846,7 @@ impl Inner {
             Some(port),
             set,
             token,
-            vec![out.clone()],
+            (vec![out.clone()], None),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run
@@ -969,6 +981,12 @@ fn node_outputs(
 /// All but the streams (this run's own) only while the job's entry is still
 /// for `run`: a later run of the id holds the record, the lease and the port.
 /// `ended` is dropped once released, before the idle (see [`JobEntry::ended`]).
+///
+/// With `drain` (a job on no radio and no input job: its stage tasks and their output
+/// streams), a stage that ends cleanly stops nothing: its output streams are
+/// unregistered, so each consumer sees its input close, flushes and ends in turn, and
+/// the rest are cancelled once all have ended or [`DRAIN_TIMEOUT_MS`] after the first
+/// clean end. A failure still cancels at once.
 pub(super) async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
@@ -976,19 +994,43 @@ pub(super) async fn supervise(
     port: Option<Arc<dyn Port>>,
     mut set: JoinSet<Result<(), StageError>>,
     token: CancellationToken,
-    streams: Vec<StreamId>,
+    (streams, mut drain): (Vec<StreamId>, Option<Drain>),
 ) {
     let mut failure = None;
     // Whether a stage ended the job (not a stop, nothing failing).
     let mut stage_ended = false;
-    while let Some(r) = set.join_next().await {
+    // When a draining job's first clean end gave the rest `DRAIN_TIMEOUT_MS`.
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let next = match deadline.filter(|_| !token.is_cancelled()) {
+            Some(at) => match tokio::time::timeout_at(at, set.join_next_with_id()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    token.cancel();
+                    continue;
+                }
+            },
+            None => set.join_next_with_id().await,
+        };
+        let Some(r) = next else { break };
         match r {
-            Ok(Err(StageError::Cancelled)) => {}
-            Ok(Ok(())) => {
+            Ok((_, Err(StageError::Cancelled))) => {}
+            Ok((task, Ok(()))) => {
                 stage_ended |= !token.is_cancelled();
-                token.cancel();
+                match drain.as_mut().filter(|_| !token.is_cancelled()) {
+                    // Its consumers see their input close, flush and end in turn.
+                    Some(outputs) => {
+                        for s in outputs.remove(&task).unwrap_or_default() {
+                            inner.bus.unregister(&s);
+                        }
+                        deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + Duration::from_millis(DRAIN_TIMEOUT_MS)
+                        });
+                    }
+                    None => token.cancel(),
+                }
             }
-            Ok(Err(StageError::Failed(m))) => {
+            Ok((_, Err(StageError::Failed(m)))) => {
                 failure.get_or_insert(m);
                 token.cancel();
             }
@@ -997,6 +1039,9 @@ pub(super) async fn supervise(
                 token.cancel();
             }
         }
+    }
+    if drain.is_some() {
+        token.cancel();
     }
     // An elastic job being relaunched keeps its record `Running` and its lease
     // for the relaunch (see `Inner::relaunch_elastic`). A run whose entry a later
