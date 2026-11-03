@@ -1263,6 +1263,113 @@ impl Node {
         Ok(id)
     }
 
+    /// Start a job from `graph`, whose first node takes no input (`capture_in`,
+    /// `stream_in`, `mix`): a leaseless [`GRAPH_KIND`](crate::ops::GRAPH_KIND) record on
+    /// [`NODE_SOURCE`], its band the first `capture_in`'s first capture's (0/0 without
+    /// one), launched as stored (`operator_graph`). `Graph` when it does not validate;
+    /// `Other` for a first node that takes input or a node with no edge into it whose
+    /// stage takes input (nothing would feed it: there is no radio); `Expand(Unknown)`
+    /// naming `captures[<i>]` for a capture not in the burst store.
+    pub async fn graph_start(&self, graph: Graph) -> Result<JobId, NodeError> {
+        graph::validate(&graph, &self.inner.registry)?;
+        let registry = &self.inner.registry;
+        let takes_input = |n: &crate::graph::Node| {
+            registry
+                .spec(&n.kind)
+                .and_then(|s| s.inputs.first().copied())
+        };
+        let kind_name = |k: StreamKind| {
+            serde_json::to_value(k)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default()
+        };
+        let unfed = |n: &crate::graph::Node, k: StreamKind| {
+            NodeError::Other(format!(
+                "graph_start: node {} ({}) has an unfed {} input",
+                n.id.0,
+                n.kind,
+                kind_name(k)
+            ))
+        };
+        let first = graph
+            .nodes
+            .first()
+            .ok_or_else(|| NodeError::Other("graph_start: the graph has no nodes".into()))?;
+        if let Some(k) = takes_input(first) {
+            // A lone stage that takes input is a node nothing feeds; one in a chain is a
+            // root that would wait for a radio.
+            if !graph
+                .edges
+                .iter()
+                .any(|e| e.from == first.id || e.to == first.id)
+            {
+                return Err(unfed(first, k));
+            }
+            return Err(NodeError::Other(format!(
+                "graph_start: node {} ({}) takes input; the first node must take none \
+                 (capture_in, stream_in, mix)",
+                first.id.0, first.kind
+            )));
+        }
+        for n in &graph.nodes {
+            if let Some(k) = takes_input(n)
+                && !graph.edges.iter().any(|e| e.to == n.id)
+            {
+                return Err(unfed(n, k));
+            }
+        }
+        let store = self.bursts();
+        let mut tuning = Tuning {
+            center_hz: Hz(0),
+            bandwidth_hz: Hz(0),
+        };
+        let mut placed = false;
+        for n in graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == crate::ops::CAPTURE_IN_STAGE)
+        {
+            let ids = n.params.get("captures").and_then(|v| v.as_array());
+            for (i, id) in ids.into_iter().flatten().enumerate() {
+                let id = id.as_str().unwrap_or_default();
+                let Some(rec) = store.get(id) else {
+                    return Err(NodeError::Expand(OpError::Unknown {
+                        field: format!("captures[{i}]"),
+                        value: id.to_string(),
+                        known: store.list().into_iter().map(|r| r.id).collect(),
+                    }));
+                };
+                if !placed {
+                    tuning = Tuning {
+                        center_hz: rec.center_hz,
+                        bandwidth_hz: rec.bandwidth_hz,
+                    };
+                    placed = true;
+                }
+            }
+        }
+        let rec = JobRecord {
+            format: JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: crate::ops::GRAPH_KIND.to_string(),
+            graph,
+            source: SourceId(NODE_SOURCE.into()),
+            tuning,
+            state: JobState::Running,
+            context: serde_json::json!({}),
+            created_ns: now(),
+            input: None,
+            capture_rate_hz: None,
+            elastic: false,
+            operator_graph: true,
+            owner: None,
+        };
+        let id = rec.id.clone();
+        self.inner.launch(rec).await?;
+        Ok(id)
+    }
+
     /// The audio stream a job attached to `job` would read: the last audio output stream
     /// (not an edge between its stages) in `job`'s graph order. `InputNotRunning` unless
     /// `job` runs in this node (a one-shot node runs only what it started),

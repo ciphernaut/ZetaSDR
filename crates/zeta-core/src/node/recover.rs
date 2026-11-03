@@ -184,7 +184,7 @@ impl Inner {
     /// the others fail naming it, as they would live), then the widest band first
     /// (ties oldest first) inside the capture [`Inner::resume_captures`] restores,
     /// elastic jobs after every rigid one (they join whatever capture those left), then
-    /// mixes (they list what runs), and attached jobs last, on their inputs' streams. A
+    /// leaseless jobs (a mix lists what runs), and attached jobs last, on their inputs' streams. A
     /// launch that fails leaves its record `Failed` with the reason (`source <id> not present` for an absent source,
     /// the port's refusal under the source's name), persisted, with a fresh entry.
     ///
@@ -200,7 +200,7 @@ impl Inner {
         records.sort_by_key(|r| {
             (
                 r.input.is_some(),
-                r.kind == JobKind::Mix.name(),
+                r.leaseless(),
                 r.elastic,
                 r.kind != JobKind::Scan.name(),
                 Reverse(r.tuning.bandwidth_hz.0),

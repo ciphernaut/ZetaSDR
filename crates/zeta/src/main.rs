@@ -166,7 +166,7 @@ async fn one_shot(
 ) -> ExitCode {
     let starts_job = matches!(
         op,
-        Op::JobStart { .. } | Op::JobAttach { .. } | Op::MixStart { .. }
+        Op::JobStart { .. } | Op::JobAttach { .. } | Op::MixStart { .. } | Op::GraphStart { .. }
     );
     if let Op::IqRead { selection } | Op::Classify { selection } = &op {
         wait_for_ring(node, selection).await;

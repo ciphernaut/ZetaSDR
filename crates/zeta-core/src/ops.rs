@@ -181,7 +181,8 @@ pub enum Op {
     /// relaunched, `tuning` updated. Applies to a `running` job the node expanded and can
     /// re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the
     /// mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum`
-    /// (elastic or rigid), `mix` (it has no band) and `transcribe` (attached: retune its
+    /// (elastic or rigid), `mix` (it has no band), a `graph_start` job (it runs on no
+    /// radio) and `transcribe` (attached: retune its
     /// input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new
     /// graph or start a new job). A job that is not running is `job <id> is <state>`; an
     /// unknown id is `unknown`. The result is the job's id, as `job_start` answers.
@@ -371,6 +372,19 @@ pub enum Op {
     /// the new graph.
     GraphPut {
         job: JobId,
+        graph: Graph,
+    },
+    /// Start a job from a graph whose first node has no inputs (`capture_in`,
+    /// `stream_in`, `mix`): the record's kind is `graph`, its source `node`, its band
+    /// the first `capture_in`'s first capture's (0/0 without one, so the page can place
+    /// it), and it takes no lease and tunes nothing. A first node that takes input, and a
+    /// node with an unfed input (no edge into it), are refused (`other`, naming the
+    /// node); a `capture_in` whose capture is not in the store is `unknown` naming
+    /// `captures[<i>]`. It launches the graph as stored (as after a `graph_put`); it is
+    /// persisted and resumed like any job, after the jobs on a radio, and a `capture_in`
+    /// job whose capture was expired since fails `capture <id> not found`. It has no band
+    /// to retune. The result is the job's id, as `job_start` answers.
+    GraphStart {
         graph: Graph,
     },
     /// Band-plan allocations in `region` and known signatures overlapping the
@@ -809,15 +823,25 @@ impl JobKind {
     }
 
     /// Whether `job_start` may start the kind on the radio: not an attachable kind, and
-    /// not a `mix`, which has no source or band of its own (`mix_start`).
+    /// not a `mix` (`mix_start`) or a [`GRAPH_KIND`] or [`BITS_KIND`] job (`graph_start`,
+    /// `bits_start`), which have no source or band of their own.
     pub fn startable(&self) -> bool {
-        !self.attachable() && !matches!(self, JobKind::Mix)
+        !self.attachable() && !matches!(self, JobKind::Mix) && !self.leaseless_name()
+    }
+
+    /// Whether the kind is named [`GRAPH_KIND`] or [`BITS_KIND`]: no built-in kind, so it
+    /// would read as a mode row's id.
+    fn leaseless_name(&self) -> bool {
+        matches!(self, JobKind::Mode(id) if id.0 == GRAPH_KIND || id.0 == BITS_KIND)
     }
 
     /// Why `job_start` refuses a kind that is not [`startable`](Self::startable).
     fn start_refusal(&self) -> OpError {
         let message = match self {
             JobKind::Mix => "mix takes no band: use mix_start".to_string(),
+            k if k.leaseless_name() => {
+                format!("{} takes no band: use graph_start / bits_start", k.name())
+            }
             k => format!("{} attaches to a job: use job_attach", k.name()),
         };
         OpError::Other { message }
@@ -1577,6 +1601,16 @@ pub const SONDEHUB_STAGE: &str = "sink_sondehub";
 /// writes them to the node's [`crate::bursts::BurstStore`] and ends the job.
 pub const BURST_CAPTURE_STAGE: &str = "burst_capture";
 
+/// The stage kind that replays burst captures (registered by `zeta-dsp`): its params'
+/// `captures` are ids in the node's [`crate::bursts::BurstStore`].
+pub const CAPTURE_IN_STAGE: &str = "capture_in";
+
+/// The kind recorded for a job `graph_start` started.
+pub const GRAPH_KIND: &str = "graph";
+
+/// The kind recorded for a job `bits_start` started.
+pub const BITS_KIND: &str = "bits";
+
 /// The `detect` stage's default `gone_ms`: an announced signal unmatched this long is
 /// `gone`. The watch re-adopts a decoder only when its signal reappears within it.
 pub const DETECT_GONE_MS_DEFAULT: u64 = 30_000;
@@ -2107,6 +2141,7 @@ impl Op {
             Op::StreamTail { .. } => "stream_tail",
             Op::GraphGet { .. } => "graph_get",
             Op::GraphPut { .. } => "graph_put",
+            Op::GraphStart { .. } => "graph_start",
             Op::KnowledgeLookup { .. } => "knowledge_lookup",
             Op::ChannelPlans {} => "channel_plans",
             Op::ModesList { .. } => "modes_list",
@@ -3111,6 +3146,11 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             .await
             .map(|()| OpResult::Ok)
             .map_err(|e| node_error(node, e)),
+        Op::GraphStart { graph } => node
+            .graph_start(graph)
+            .await
+            .map(OpResult::Job)
+            .map_err(|e| node_error(node, e)),
         Op::KnowledgeLookup {
             region,
             center_hz,
@@ -3586,6 +3626,12 @@ async fn job_retune(
     // Before the operator's-graph test: a mute's `graph_put` sets that flag on a mix.
     if rec.kind == JobKind::Mix.name() {
         return Err(other("mix is not retunable"));
+    }
+    if rec.leaseless() {
+        return Err(other(format!(
+            "{} has no band: it runs on no radio",
+            rec.kind
+        )));
     }
     if let Some(input) = &rec.input {
         return Err(other(format!(

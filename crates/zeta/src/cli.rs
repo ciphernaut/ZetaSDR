@@ -927,6 +927,13 @@ pub enum GraphCmd {
         #[arg(long, value_name = "GRAPH.json")]
         file: PathBuf,
     },
+    /// Start a job from a JSON graph whose first node takes no input (capture_in,
+    /// stream_in, mix): no radio, no lease
+    Start {
+        /// Graph JSON file
+        #[arg(long, value_name = "GRAPH.json")]
+        file: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1060,7 +1067,7 @@ impl Command {
                     | JobCmd::Attach { .. }
                     | JobCmd::Retune { .. }
                     | JobCmd::Stop(_)
-            ) | Command::Graph(GraphCmd::Put { .. })
+            ) | Command::Graph(GraphCmd::Put { .. } | GraphCmd::Start { .. })
                 | Command::Plan(PlanCmd::Start { .. })
                 | Command::Mix(MixCmd::Start { .. })
                 | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
@@ -1091,7 +1098,7 @@ impl Command {
     }
 
     /// The operation this subcommand applies; `None` for `serve`. Fails only
-    /// when `graph put` cannot read or parse its file.
+    /// when `graph put` or `graph start` cannot read or parse its file.
     pub fn into_op(self) -> Result<Option<Op>, OpError> {
         let job = |a: JobArg| JobId(a.job);
         Ok(Some(match self {
@@ -1184,6 +1191,9 @@ impl Command {
             Command::Graph(GraphCmd::Get(a)) => Op::GraphGet { job: job(a) },
             Command::Graph(GraphCmd::Put { job: a, file }) => Op::GraphPut {
                 job: job(a),
+                graph: read_graph(&file)?,
+            },
+            Command::Graph(GraphCmd::Start { file }) => Op::GraphStart {
                 graph: read_graph(&file)?,
             },
             Command::Knowledge(KnowledgeCmd::Lookup {
@@ -1313,5 +1323,33 @@ mod channel_tests {
             let e = parse_channels(bad).expect_err(bad);
             assert!(e.contains("channels"), "{bad}: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_graph_tests {
+    use super::*;
+
+    #[test]
+    fn cli_graph_start_reads_the_graph_from_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("g.json");
+        let g = serde_json::json!({
+            "id": "g",
+            "nodes": [{"id": "src", "kind": "capture_in", "params": {"captures": ["01A"]}}],
+            "edges": [],
+        });
+        std::fs::write(&file, g.to_string()).unwrap();
+        let cli = Cli::try_parse_from(["zeta", "graph", "start", "--file", file.to_str().unwrap()])
+            .unwrap();
+        let want: Graph = serde_json::from_value(g).unwrap();
+        match cli.command.into_op().unwrap() {
+            Some(Op::GraphStart { graph }) => assert_eq!(graph, want),
+            op => panic!("graph start: {op:?}"),
+        }
+        let missing =
+            Cli::try_parse_from(["zeta", "graph", "start", "--file", "/nonexistent/g.json"])
+                .unwrap();
+        assert!(missing.command.into_op().is_err());
     }
 }

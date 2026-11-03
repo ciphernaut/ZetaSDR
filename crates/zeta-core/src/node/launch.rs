@@ -111,7 +111,7 @@ impl Inner {
                 point_stream_in(&mut rec.graph, &input, &stream);
                 None
             }
-            None if rec.kind == JobKind::Mix.name() => None,
+            None if rec.leaseless() => None,
             None => {
                 let port = self.ports.read().unwrap().get(&rec.source).cloned();
                 let port = port.ok_or_else(|| NodeError::UnknownSource(rec.source.clone()))?;

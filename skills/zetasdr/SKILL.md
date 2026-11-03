@@ -162,7 +162,7 @@ Attach a processing chain to a running job's output instead of the radio: `trans
 
 ### job_retune
 
-Retune a running job on the radio to a new band under the same id: under the source's gate its lease is moved to `center_hz`/`bandwidth_hz` (inside the current capture it is granted without a tune, whether or not another rigid job's band overlaps it; outside it the source is tuned when no other rigid job or pin holds it, else it is a `conflict` naming the holders and the job is left as it was), its graph is expanded again for the new band at the capture's rate and the job relaunched, `tuning` updated. Applies to a `running` job the node expanded and can re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum` (elastic or rigid), `mix` (it has no band) and `transcribe` (attached: retune its input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new graph or start a new job). A job that is not running is `job <id> is <state>`; an unknown id is `unknown`. The result is the job's id, as `job_start` answers.
+Retune a running job on the radio to a new band under the same id: under the source's gate its lease is moved to `center_hz`/`bandwidth_hz` (inside the current capture it is granted without a tune, whether or not another rigid job's band overlaps it; outside it the source is tuned when no other rigid job or pin holds it, else it is a `conflict` naming the holders and the job is left as it was), its graph is expanded again for the new band at the capture's rate and the job relaunched, `tuning` updated. Applies to a `running` job the node expanded and can re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum` (elastic or rigid), `mix` (it has no band), a `graph_start` job (it runs on no radio) and `transcribe` (attached: retune its input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new graph or start a new job). A job that is not running is `job <id> is <state>`; an unknown id is `unknown`. The result is the job's id, as `job_start` answers.
 
 - job: string; an id from `job list`
 - center_hz: integer (Hz)
@@ -378,6 +378,16 @@ CLI: `zeta graph put --job <id> --file graph.json`
 
 Fetch the current graph with `graph get`, edit it, and put it back; stage kinds and their params are listed under Stage kinds below and by `schema`. A put that changes only a demodulator's `squelch`/`squelch_db`, its guard's `guard_hz`/`guard_db`/`channel_hz`, the channel node's `wide_hz` (or `deviation_hz`/`sideband`) keeps the job re-expandable: a later capture change (another rate after a restart) re-expands it with those values carried. Any other change launches the graph as stored from then on.
 
+### graph_start
+
+Start a job from a graph whose first node has no inputs (`capture_in`, `stream_in`, `mix`): the record's kind is `graph`, its source `node`, its band the first `capture_in`'s first capture's (0/0 without one, so the page can place it), and it takes no lease and tunes nothing. A first node that takes input, and a node with an unfed input (no edge into it), are refused (`other`, naming the node); a `capture_in` whose capture is not in the store is `unknown` naming `captures[<i>]`. It launches the graph as stored (as after a `graph_put`); it is persisted and resumed like any job, after the jobs on a radio, and a `capture_in` job whose capture was expired since fails `capture <id> not found`. It has no band to retune. The result is the job's id, as `job_start` answers.
+
+- graph: object (Graph: id, nodes[Node: id, kind, params], edges[Edge: from, to, kind])
+
+JSON: `{"op":"graph_start","graph":{"id":"<id>","nodes":[{"id":"<node-id>","kind":"passthrough","params":{"kind":"iq"}}],"edges":[]}}`
+
+CLI: `zeta graph start --file graph.json`
+
 ### knowledge_lookup
 
 Band-plan allocations in `region` and known signatures overlapping the band, from every registered knowledge provider.
@@ -473,6 +483,12 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: audio
 - outputs: event
 
+### bit_view
+
+- inputs: event
+- outputs: event
+- params.window_bits: integer (optional, default 65536)
+
 ### burst_capture
 
 - inputs: iq
@@ -488,6 +504,15 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.whole: boolean (optional, default false)
 - params.window_ms: integer (optional, default 2000)
 
+### capture_in
+
+- inputs: 
+- outputs: iq, event
+- params.captures: array
+- params.loop: boolean (optional, default false)
+- params.loop_pause_ms: integer (optional, default 500)
+- params.realtime: boolean (optional, default true)
+
 ### channel
 
 - inputs: iq
@@ -496,6 +521,23 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.bandwidth_hz: integer
 - params.out_rate_hz: integer
 - params.wide_hz: integer or null (optional, default null)
+
+### clock_recover
+
+- inputs: audio
+- outputs: audio, event
+- params.symbol_rate_baud: integer
+- params.algorithm: any (optional, default null)
+- params.loop_bw: number (optional, default 0.01)
+- params.max_ppm: integer (optional, default 2000)
+
+### correlate
+
+- inputs: event
+- outputs: event
+- params.pattern: string
+- params.bits: integer
+- params.max_errors: integer (optional, default 0)
 
 ### denoise
 
@@ -536,6 +578,14 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.notch_hz: integer (optional, default 0)
 - params.rows_per_s: integer (optional, default 20)
 
+### fsk_demod
+
+- inputs: iq
+- outputs: audio
+- params.symbol_rate_baud: integer
+- params.order: integer (optional, default 2)
+- params.tone_spacing_hz: integer or null (optional, default null)
+
 ### measure
 
 - inputs: iq
@@ -564,6 +614,12 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.squelch: boolean (optional, default true)
 - params.squelch_db: integer or null (optional, default null)
 
+### ook_demod
+
+- inputs: iq
+- outputs: audio
+- params.symbol_rate_baud: integer
+
 ### passthrough
 
 - inputs: iq, audio, video, text, event, sink
@@ -575,10 +631,25 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: iq
 - outputs: event
 
+### psk_demod
+
+- inputs: iq
+- outputs: audio
+- params.symbol_rate_baud: integer
+- params.loop_bw: number (optional, default 0.02)
+- params.order: integer (optional, default 2)
+- params.rolloff: number (optional, default 0.35)
+
 ### rds_decode
 
 - inputs: iq
 - outputs: event
+
+### resample
+
+- inputs: iq
+- outputs: iq
+- params.out_rate_hz: integer
 
 ### sink_sondehub
 
@@ -590,6 +661,16 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.lat: number or null (optional, default null)
 - params.lon: number or null (optional, default null)
 - params.url: string (optional, default "https://api.v2.sondehub.org/sondes/telemetry")
+
+### slicer
+
+- inputs: audio
+- outputs: event
+- params.chunk_bits: integer (optional, default 4096)
+- params.constellation: any (optional, default null)
+- params.differential: boolean (optional, default false)
+- params.levels: integer (optional, default 2)
+- params.mapping: any (optional, default "natural")
 
 ### ssb_demod
 
