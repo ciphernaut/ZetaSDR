@@ -398,7 +398,12 @@ pub enum Op {
     /// or 8, ook 2). The capture is resampled to about 8 samples per symbol for fsk and ook, and
     /// for psk to the smallest multiple of 4 times the baud that also covers a carrier offset
     /// of 2000 Hz (the coarse estimate is unambiguous only within the rate over twice the
-    /// order), moved to a rate the resampler serves exactly; 4-fsk takes the `early_late`
+    /// order), moved to a rate the resampler serves exactly. A signal whose recorded
+    /// `center_hz` lies more than a quarter of that rate off the capture's centre is
+    /// shifted to it first: `capture_in → channel [→ resample] → <demod> → ...`, the
+    /// `channel` stage at the measured centre with the measured bandwidth × 1.25 (at least
+    /// 4 × the baud) and an output rate the capture rate over a whole divisor (the
+    /// resampler follows unless that is already the chain rate). 4-fsk takes the `early_late`
     /// clock; fsk's demodulator is given the record's measured `tone_spacing_hz` (it tracks
     /// the tones itself when the record has none); `capture_in` loops, paced, with a 500 ms
     /// pause between
@@ -406,11 +411,15 @@ pub enum Op {
     /// request nor the features give (`no symbol rate measured; give symbol_rate_baud`,
     /// `no modulation measured (label <x>); give modulation`), a rate the capture cannot
     /// hold (`symbol_rate_baud <r> needs <n> Hz; the capture holds <rate> Hz`, 4 samples
-    /// per symbol at least; a rate of 0 is `symbol_rate_baud: at least 1`), and a set whose captures differ in rate or centre
+    /// per symbol at least; a rate of 0 is `symbol_rate_baud: at least 1`), a measured
+    /// band the capture does not hold (`the measured centre <c> Hz with <b> Hz leaves the
+    /// capture <lo>..=<hi> Hz`), and a set whose captures differ in rate or centre
     /// (`capture <id>: <rate> Hz differs from <first>'s <rate> Hz`); an unknown `capture`
     /// is `unknown`. The record's kind is `bits`, its source `node`, its band the
     /// capture's, `job_context.bits` the plan (`captures`, `modulation`,
-    /// `symbol_rate_baud`, `order`, `tone_spacing_hz`, `rate_hz`); the slicer's `bits` events are on
+    /// `symbol_rate_baud`, `order`, `tone_spacing_hz`, `rate_hz`, `center_hz` the centre the
+    /// chain runs on and `shift_hz` its offset from the capture's, `bandwidth_hz`, and
+    /// `channel_rate_hz`, `null` when the chain does not shift); the slicer's `bits` events are on
     /// `job_context.slicer.stream` and `bit_view`'s latest hypotheses in
     /// `job_context.bit_view`. Change a running chain with `graph_get`, edit,
     /// `graph_put`. The result is the job's id, as `job_start` answers; one-shot

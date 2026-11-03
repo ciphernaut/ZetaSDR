@@ -1,5 +1,6 @@
 //! `bits_start`'s plan and chain: from a capture set's feature record to
-//! `capture_in → resample → <demod> → clock_recover → slicer → bit_view`.
+//! `capture_in → resample → <demod> → clock_recover → slicer → bit_view`, or, for a
+//! signal off the capture's centre, `capture_in → channel [→ resample] → <demod> → ...`.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,19 @@ const PSK_GRID_SAMPLES_PER_SYMBOL: u64 = 4;
 
 /// How many steps of the PSK grid the chain rate search tries above the least rate.
 const PSK_RATE_SEARCH_STEPS: u64 = 64;
+
+/// How far the measured centre may sit from the capture's centre, as a fraction of the
+/// chain rate, before the chain shifts to it with a `channel` stage: the resampler's
+/// low-pass keeps about half its output rate, so a signal a quarter of the chain rate
+/// off still passes whole (its own band allowed for), and one further off is cut.
+pub const SHIFT_TOLERANCE_FRACTION: f64 = 0.25;
+
+/// The shifted chain's channel band as a multiple of the measured bandwidth.
+pub const CHANNEL_BAND_FACTOR: f64 = 1.25;
+
+/// The narrowest shifted channel band, in symbols per second of the chain's baud: the
+/// keying's main lobe and its first sidelobes.
+pub const CHANNEL_MIN_BAND_SYMBOLS: u64 = 4;
 
 /// The pause `capture_in` takes after each pass of the set, ms.
 pub const LOOP_PAUSE_MS: u64 = 500;
@@ -83,9 +97,20 @@ pub struct BitsPlan {
     /// The set's capture ids, in time order.
     pub captures: Vec<String>,
     pub source: SourceId,
+    /// The centre the chain runs on: the capture's, or the measured centre when that
+    /// lies more than [`SHIFT_TOLERANCE_FRACTION`] of the chain rate off it.
     pub center_hz: Hz,
+    /// `center_hz` minus the capture's centre: 0 when the chain does not shift.
+    pub shift_hz: i64,
+    /// The band: the capture's, or when shifting the `channel` stage's band (the
+    /// measured bandwidth × [`CHANNEL_BAND_FACTOR`], at least
+    /// [`CHANNEL_MIN_BAND_SYMBOLS`] × the baud).
     pub bandwidth_hz: Hz,
     pub capture_rate_hz: Hz,
+    /// The `channel` stage's output rate when the chain shifts (the capture rate over
+    /// the largest whole divisor that keeps it at least the chain rate the capture rate
+    /// would take and the band), `None` when it does not.
+    pub channel_rate_hz: Option<Hz>,
     pub modulation: Modulation,
     pub symbol_rate_baud: Baud,
     pub order: u8,
@@ -93,8 +118,20 @@ pub struct BitsPlan {
     /// the record has none (the demodulator then tracks the tones itself) or the chain
     /// is not FSK.
     pub tone_spacing_hz: Option<Hz>,
-    /// The rate the capture is resampled to.
+    /// The rate the demodulator runs at: the capture (or the channel's output, when
+    /// shifting) is resampled to it.
     pub rate_hz: Hz,
+}
+
+/// The largest whole divisor `d` of `rate_hz` with `rate_hz / d` at least `least_hz`:
+/// the output rate a `channel` stage can decimate `rate_hz` to; `rate_hz` itself when
+/// none is smaller.
+fn channel_out_rate(rate_hz: u64, least_hz: u64) -> u64 {
+    let most = rate_hz / least_hz.max(1);
+    (1..=most.max(1))
+        .rev()
+        .find(|d| rate_hz.is_multiple_of(*d))
+        .map_or(rate_hz, |d| rate_hz / d)
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -237,24 +274,56 @@ pub fn bits_plan(
             rate.0
         ));
     }
+    let chain_rate = chain_rate_hz(capture_rate, rate.0, modulation, order);
+    let shift_hz = features.center_hz.0 as i64 - first.center_hz.0 as i64;
+    let shifts = shift_hz.unsigned_abs() as f64 > SHIFT_TOLERANCE_FRACTION * chain_rate as f64;
+    let (center_hz, shift_hz, bandwidth_hz, channel_rate_hz, rate_hz) = if shifts {
+        let band = ((features.bandwidth_hz.0 as f64 * CHANNEL_BAND_FACTOR).ceil() as u64)
+            .max(CHANNEL_MIN_BAND_SYMBOLS * rate.0 as u64);
+        let (lo, hi) = (
+            first.center_hz.0 as i128 - capture_rate as i128 / 2,
+            first.center_hz.0 as i128 + capture_rate as i128 / 2,
+        );
+        // Compared doubled, so an odd band is exact.
+        let (c, b) = (features.center_hz.0 as i128, band as i128);
+        if 2 * c - b < 2 * lo || 2 * c + b > 2 * hi {
+            return Err(format!(
+                "the measured centre {} Hz with {band} Hz leaves the capture {lo}..={hi} Hz",
+                features.center_hz.0
+            ));
+        }
+        let out = channel_out_rate(capture_rate, chain_rate.max(band));
+        (
+            features.center_hz,
+            shift_hz,
+            Hz(band),
+            Some(Hz(out)),
+            chain_rate_hz(out, rate.0, modulation, order),
+        )
+    } else {
+        (first.center_hz, 0, first.bandwidth_hz, None, chain_rate)
+    };
     Ok(BitsPlan {
         captures: set.iter().map(|r| r.id.clone()).collect(),
         source: first.source.clone(),
-        center_hz: first.center_hz,
-        bandwidth_hz: first.bandwidth_hz,
+        center_hz,
+        shift_hz,
+        bandwidth_hz,
         capture_rate_hz: first.sample_rate_hz,
+        channel_rate_hz,
         modulation,
         symbol_rate_baud: rate,
         order,
         tone_spacing_hz: features
             .tone_spacing_hz
             .filter(|s| modulation == Modulation::Fsk && s.0 > 0),
-        rate_hz: Hz(chain_rate_hz(capture_rate, rate.0, modulation, order)),
+        rate_hz: Hz(rate_hz),
     })
 }
 
 /// The plan's graph: `capture_in` (looping, paced, [`LOOP_PAUSE_MS`] between passes) →
-/// `resample` → `demod` (`fsk_demod` given the plan's `tone_spacing_hz`, `null` when it
+/// `resample` (or, when the plan shifts, `channel` at its centre, band and
+/// `channel_rate_hz`, then `resample` unless that is already the chain rate) → `demod` (`fsk_demod` given the plan's `tone_spacing_hz`, `null` when it
 /// has none) → `clock` → `slicer` → `bit_view`.
 pub fn bits_graph(plan: &BitsPlan) -> Graph {
     use serde_json::{Value, json};
@@ -291,56 +360,66 @@ pub fn bits_graph(plan: &BitsPlan) -> Graph {
         ),
         Modulation::Ook => (2, Value::Null),
     };
-    let nodes = [
-        (
-            "capture_in",
-            crate::ops::CAPTURE_IN_STAGE,
+    let mut nodes: Vec<(&str, &str, Value, StreamKind)> = vec![(
+        "capture_in",
+        crate::ops::CAPTURE_IN_STAGE,
+        json!({
+            "captures": plan.captures,
+            "loop": true,
+            "realtime": true,
+            "loop_pause_ms": LOOP_PAUSE_MS,
+        }),
+        StreamKind::Iq,
+    )];
+    if let Some(out) = plan.channel_rate_hz {
+        nodes.push((
+            "channel",
+            "channel",
             json!({
-                "captures": plan.captures,
-                "loop": true,
-                "realtime": true,
-                "loop_pause_ms": LOOP_PAUSE_MS,
+                "center_hz": plan.center_hz.0,
+                "bandwidth_hz": plan.bandwidth_hz.0,
+                "out_rate_hz": out.0,
             }),
-        ),
-        (
+            StreamKind::Iq,
+        ));
+    }
+    if plan.channel_rate_hz != Some(plan.rate_hz) {
+        nodes.push((
             "resample",
             "resample",
             json!({"out_rate_hz": plan.rate_hz.0}),
-        ),
-        ("demod", demod.0, demod.1),
+            StreamKind::Iq,
+        ));
+    }
+    nodes.extend([
+        ("demod", demod.0, demod.1, StreamKind::Audio),
         (
             "clock",
             "clock_recover",
             json!({"symbol_rate_baud": baud, "algorithm": algorithm}),
+            StreamKind::Audio,
         ),
         (
             "slicer",
             crate::ops::SLICER_STAGE,
             json!({"levels": levels, "constellation": constellation}),
+            StreamKind::Event,
         ),
-        ("bit_view", "bit_view", json!({})),
-    ];
-    let kinds = [
-        StreamKind::Iq,
-        StreamKind::Iq,
-        StreamKind::Audio,
-        StreamKind::Audio,
-        StreamKind::Event,
-    ];
+        ("bit_view", "bit_view", json!({}), StreamKind::Event),
+    ]);
     let edges = nodes
         .windows(2)
-        .zip(kinds)
-        .map(|(w, kind)| Edge {
+        .map(|w| Edge {
             from: NodeId(w[0].0.into()),
             to: NodeId(w[1].0.into()),
-            kind,
+            kind: w[0].3,
         })
         .collect();
     Graph {
         id: GraphId::new(),
         nodes: nodes
             .into_iter()
-            .map(|(id, kind, params)| GraphNode {
+            .map(|(id, kind, params, _)| GraphNode {
                 id: NodeId(id.into()),
                 kind: kind.into(),
                 params,
@@ -479,6 +558,90 @@ mod tests {
                 StreamKind::Audio,
                 StreamKind::Event
             ]
+        );
+    }
+
+    /// The wide capture's offset: the operator's remote 482 kHz above a 433.4 MHz
+    /// capture centre.
+    const OFF_HZ: u64 = 482_000;
+    const WIDE_RATE: u64 = 2_048_000;
+
+    #[test]
+    fn an_off_centre_signal_gets_a_channel_at_its_measured_centre() {
+        let mut wide = record("01W", WIDE_RATE, 1);
+        wide.center_hz = Hz(433_400_000);
+        let mut f = features(Some(3200), None);
+        f.center_hz = Hz(433_400_000 + OFF_HZ);
+        f.bandwidth_hz = Hz(30_000);
+        let plan = bits_plan(&[wide.clone()], &f, None, Some(Modulation::Ook), None, None).unwrap();
+        assert_eq!(plan.center_hz, Hz(433_882_000));
+        assert_eq!(plan.shift_hz, OFF_HZ as i64);
+        assert_eq!(plan.bandwidth_hz, Hz(37_500));
+        // 2 048 000 / 50: the largest whole divisor keeping the 37 500 Hz band, then
+        // resampled to the chain rate the channel's output takes (3/5 of it: 7.68 samples
+        // per symbol).
+        assert_eq!(plan.channel_rate_hz, Some(Hz(40_960)));
+        let chain = chain_rate_hz(40_960, 3200, Modulation::Ook, 2);
+        assert_eq!(chain, 24_576);
+        assert_eq!(plan.rate_hz, Hz(chain));
+        let g = bits_graph(&plan);
+        let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "capture_in",
+                "channel",
+                "resample",
+                "demod",
+                "clock",
+                "slicer",
+                "bit_view"
+            ]
+        );
+        let ch = &g.nodes[1];
+        assert_eq!(ch.kind, "channel");
+        assert_eq!(ch.params["center_hz"], 433_882_000u64);
+        assert_eq!(ch.params["bandwidth_hz"], 37_500);
+        assert_eq!(ch.params["out_rate_hz"], 40_960);
+        assert_eq!(g.nodes[2].params["out_rate_hz"], chain);
+        assert!(g.edges[..3].iter().all(|e| e.kind == StreamKind::Iq));
+        // A narrower signal: 2 048 000 / 80 is the chain rate itself, so no resample.
+        let mut narrow = f.clone();
+        narrow.bandwidth_hz = Hz(12_000);
+        let plan = bits_plan(
+            &[wide.clone()],
+            &narrow,
+            None,
+            Some(Modulation::Ook),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.bandwidth_hz, Hz(15_000));
+        assert_eq!(plan.channel_rate_hz, Some(Hz(25_600)));
+        assert_eq!(plan.rate_hz, Hz(25_600));
+        let ids: Vec<String> = bits_graph(&plan)
+            .nodes
+            .iter()
+            .map(|n| n.id.0.clone())
+            .collect();
+        assert_eq!(ids[1..3], ["channel", "demod"]);
+        // Centred (within a quarter of the chain rate): no channel, the band the capture's.
+        f.center_hz = Hz(433_400_000 + 6_000);
+        let plan = bits_plan(&[wide.clone()], &f, None, Some(Modulation::Ook), None, None).unwrap();
+        assert_eq!(plan.center_hz, Hz(433_400_000));
+        assert_eq!(plan.shift_hz, 0);
+        assert_eq!(plan.channel_rate_hz, None);
+        assert_eq!(plan.bandwidth_hz, wide.bandwidth_hz);
+        let g = bits_graph(&plan);
+        assert!(g.nodes.iter().all(|n| n.kind != "channel"));
+        assert_eq!(g.nodes[1].kind, "resample");
+        // A measured band that leaves the capture is refused.
+        f.center_hz = Hz(433_400_000 + 1_020_000);
+        let e = bits_plan(&[wide], &f, None, Some(Modulation::Ook), None, None).unwrap_err();
+        assert_eq!(
+            e,
+            "the measured centre 434420000 Hz with 37500 Hz leaves the capture 432376000..=434424000 Hz"
         );
     }
 

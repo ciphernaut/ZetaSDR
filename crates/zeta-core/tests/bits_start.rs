@@ -490,6 +490,77 @@ async fn a_one_pass_ook_chain_finds_the_planted_sync() {
     assert!(finds_the_sync(&rec, false), "{}", rec.context["bit_view"]);
 }
 
+/// The wide capture of the off-centre test: 2.048 MHz centred on 433.4 MHz.
+const WIDE_RATE_HZ: u32 = 2_048_000;
+const WIDE_CENTER_HZ: u64 = 433_400_000;
+/// Where the signal sits from the wide capture's centre (the operator's remote).
+const WIDE_OFFSET_HZ: f64 = 482_000.0;
+const WIDE_BAUD: u32 = 2_400;
+/// [`planted`] at [`WIDE_BAUD`], in ns.
+const WIDE_SPAN_NS: u64 = SYMBOLS as u64 * 1_000_000_000 / WIDE_BAUD as u64;
+
+/// OOK whose signal sits [`WIDE_OFFSET_HZ`] off a [`WIDE_RATE_HZ`] capture's centre, its
+/// features recording the measured centre: `bits_start` shifts to it with a `channel`
+/// stage (the resampler alone would cut it away) and the planted sync is found.
+#[tokio::test]
+async fn an_off_centre_ook_capture_is_shifted_to_its_measured_centre() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let spec = json!({
+        "family": "ook", "symbol_rate_baud": WIDE_BAUD, "bits": planted_hex(), "repeat": 1,
+    });
+    let spec: zeta_dsp::synth::SynthSpec = serde_json::from_value(spec).unwrap();
+    let imp = zeta_dsp::synth::Impairments {
+        offset_hz: WIDE_OFFSET_HZ,
+        ..Default::default()
+    };
+    let iq = zeta_dsp::synth::synthesise(&spec, &imp, WIDE_RATE_HZ, WIDE_CENTER_HZ);
+    let measured = WIDE_CENTER_HZ + WIDE_OFFSET_HZ as u64;
+    let features = json!({
+        "bandwidth_hz": 2 * WIDE_BAUD, "center_hz": measured, "symbol_rate_baud": WIDE_BAUD,
+        "snr_db": 30.0, "burst": false, "duty": 0.5, "bursts": 1, "burst_ms": 400.0,
+        "period_ms": null, "order": null, "tone_spacing_hz": null,
+    });
+    let cap = node
+        .bursts()
+        .write(
+            NewCapture {
+                source: SourceId("rx".into()),
+                set: JobId("wide".into()),
+                center_hz: Hz(WIDE_CENTER_HZ),
+                bandwidth_hz: Hz(WIDE_RATE_HZ as u64),
+                sample_rate_hz: Hz(WIDE_RATE_HZ as u64),
+                start_ns: T0_NS,
+                end_ns: T0_NS + WIDE_SPAN_NS,
+                features,
+                signal: None,
+                job: JobId("wide".into()),
+                watch: None,
+                allocations: json!([]),
+            },
+            &iq,
+        )
+        .unwrap()
+        .id;
+    let id = bits_start(&node, &cap, Some(Modulation::Ook), None)
+        .await
+        .unwrap();
+    let rec = record(&node, &id);
+    let bits = &rec.context["bits"];
+    assert_eq!(bits["center_hz"], measured);
+    assert_eq!(bits["shift_hz"], WIDE_OFFSET_HZ as i64);
+    assert!(
+        rec.graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == "channel" && n.params["center_hz"] == measured),
+        "{:?}",
+        rec.graph
+    );
+    let rec = one_pass(&node, &id).await;
+    assert!(finds_the_sync(&rec, false), "{}", rec.context["bit_view"]);
+}
+
 /// The record once it leaves `Running`, within `within`.
 async fn ended(node: &Node, id: &JobId, within: Duration) -> JobRecord {
     let t0 = Instant::now();
