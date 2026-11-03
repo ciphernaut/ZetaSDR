@@ -203,7 +203,7 @@ Deferred minors are gists in `TODO.md` ("Layer 1 and explore: deferred minors fr
 
 ## Plan 19.2 status
 
-Plan 19.2 (layer 4 bits) is built on `worktree-plan19-2` (8ff4829..the docs commit), 2026-11-04. Spec `docs/superpowers/specs/2026-11-02-layer4-explore-design.md`, plan `docs/superpowers/plans/2026-11-03-layer4-bits.md`. Live acceptance (spec 9 item 3) waits for the field host, after 19.3.
+Plan 19.2 (layer 4 bits) is built on `worktree-plan19-2` (8ff4829..0b90359), 2026-11-04. Spec `docs/superpowers/specs/2026-11-02-layer4-explore-design.md`, plan `docs/superpowers/plans/2026-11-03-layer4-bits.md`. Live acceptance (spec 9 item 3) waits for the field host, after 19.3.
 
 What shipped: stages `capture_in`, `resample`, `fsk_demod`, `psk_demod`, `ook_demod`, `clock_recover`, `slicer`, `correlate`, `bit_view` in `zeta-dsp`; the ops `graph_start` and `bits_start` (`zeta graph start --file`, `zeta bits start ... --then-tail`); the Bits pane and "Work the bits" on the Explore pane; the field craft's "Working layer 4" as the executable playbook (AGENTS.md and the skill regenerated); the agent may stop its own `bits_start` and `graph_start` jobs; `graph` and `bits` are reserved kind names.
 
