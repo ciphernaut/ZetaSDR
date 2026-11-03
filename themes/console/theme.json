@@ -5,7 +5,7 @@
   "color_scheme": "dark",
   "layout": { "rail": true, "ribbon_tilt_deg": -15 },
   "tokens": {
-    "--bg": "#000",
+    "--bg": "#000000",
     "--bar": "#0c0c10",
     "--border": "#3a3d48",
     "--accent": "#f3e3a0",

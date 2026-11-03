@@ -21,6 +21,10 @@ pub const BUILTIN: &[(&str, &[u8])] = &[
         include_bytes!("../../../../themes/console/Antonio-VF.ttf"),
     ),
     (
+        "console/FONTS.md",
+        include_bytes!("../../../../themes/console/FONTS.md"),
+    ),
+    (
         "console/OFL-Antonio.txt",
         include_bytes!("../../../../themes/console/OFL-Antonio.txt"),
     ),
@@ -257,7 +261,8 @@ fn check_folder(
     Ok((theme, served))
 }
 
-/// Every file under `dir`, by path relative to it with `/` between segments. Each
+/// Every served file under `dir` (by [`mime`]; the others are skipped unread), by path
+/// relative to it with `/` between segments. Each
 /// segment must be `[A-Za-z0-9._ -]+`; a symlink is followed only to a file inside the
 /// folder. A refusal names `files`.
 fn read_folder(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, ThemeError> {
@@ -301,6 +306,9 @@ fn read_folder(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, ThemeError> {
                 if !target.is_file() {
                     return Err(err(format!("{rel}: a link must name a file")));
                 }
+            }
+            if mime(&rel).is_none() {
+                continue;
             }
             let bytes = std::fs::read(&path).map_err(|e| err(format!("{rel}: {e}")))?;
             out.insert(rel, bytes);
