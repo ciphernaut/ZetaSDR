@@ -1886,20 +1886,37 @@ def scenario_rail_tags_align(page, url, secret):
 
 
 def scenario_rail_collapses_crowd(page, url, secret):
-    # `cb` plays its recording's own 48 kHz only (476.876-476.924 MHz), so the crowd is six
-    # jobs 1 kHz apart in the capture shown whole: under 18 px apart on any WIDE waterfall.
+    # `cb` plays its recording's own 48 kHz only (476.876-476.924 MHz). Six narrow jobs packed so
+    # every centre lies within one full tag's height of the first (so each overlaps the one full
+    # tag), yet over half a thin segment apart (so a thin one's middle is not under the next).
     select_source(page, url, secret, "cb")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
-    jobs = []
+    base = 476_895_000
+    jobs = [start_job(url, secret, "passthrough", "cb", base, 100)]
     try:
-        for i in range(6):
-            jobs.append(start_job(url, secret, "passthrough", "cb", 476_895_000 + i * 1_000, 800))
+        page.evaluate("window.zetaTest.poll()")
+        first = page.locator(f'#rail .job-tag[data-job="{jobs[0]}"]')
+        expect(first).to_be_visible()
+        th = first.bounding_box()["height"]
+        view = page.evaluate("window.zetaTest.wf().view")
+        h = page.evaluate("document.querySelector('#waterfall canvas.wf-canvas').clientHeight")
+        # Five steps under one tag height, each well over half a 5 px thin segment (the
+        # pointer lands on whole pixels, so the next segment must clear the middle by more).
+        step_px = 0.9 * th / 5
+        assert step_px > 3.2, f"tags {th} px high leave no room for six thin segments"
+        step_hz = round(step_px * (view["hi"] - view["lo"]) / h)
+        for i in range(1, 6):
+            jobs.append(start_job(url, secret, "passthrough", "cb", base + i * step_hz, 100))
         page.evaluate("window.zetaTest.poll()")
         tags = page.locator("#rail .job-tag")
         expect(tags).to_have_count(6)
         expect(page.locator("#rail .job-tag.thin")).to_have_count(5)
         full = page.locator("#rail .job-tag:not(.thin)")
         expect(full).to_have_count(1)
+        boxes = [t.bounding_box() for t in tags.all()]
+        mids = [bx["y"] + bx["height"] / 2 for bx in boxes]
+        full_h = full.bounding_box()["height"]
+        assert max(mids) - min(mids) < full_h, f"the crowd spans {max(mids) - min(mids)} px, a tag {full_h}"
         other = page.locator(f'#rail .job-tag[data-job="{jobs[3]}"]')
         other.hover()
         expect(other).not_to_have_class(re.compile(r"\bthin\b"))

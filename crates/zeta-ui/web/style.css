@@ -263,7 +263,10 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
   position: absolute; inset-inline-start: 0; top: 0; bottom: 0; width: var(--rail-w);
   overflow: hidden; display: none;
 }
-[data-theme="console"] #waterfall #rail { display: block; }
+[data-theme="console"] #waterfall #rail {
+  display: block; box-sizing: border-box;
+  border-inline-start: 12px solid var(--c-frame);  /* frame role: the spine */
+}
 #waterfall .wf-axis {
   position: absolute; inset-inline-start: var(--rail-w); top: 0; bottom: 0; width: var(--axis-w);
   border-inline-end: 1px solid var(--border); color: var(--dim);
@@ -622,17 +625,8 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 /* The source bar's live numbers: plain shows them in the tab's title only. */
 .health { display: none; }
 .health .v { font-variant-numeric: tabular-nums; }
-/* The spine between the two elbows, painted only under the console theme. */
-[data-theme="console"] #main { padding-inline-start: 12px; }
-[data-theme="console"] #main::before {
-  content: "";
-  position: absolute;
-  inset-block: 0;
-  inset-inline-start: 0;
-  width: 12px;
-  background: var(--c-frame);  /* frame role: the spine */
-}
-[data-theme="console"] #waterfall { inset-inline-start: 12px; }
+/* The spine between the two elbows, painted only under the console theme: the rail's start
+   border (the rail rule below), so #waterfall keeps the width of #main. */
 [data-theme="console"] #top,
 [data-theme="console"] #bar {
   background: #000;            /* ground behind the bars */
@@ -650,7 +644,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   color: #000;                 /* black text on every coloured bar */
   border-start-start-radius: var(--radius-elbow);
   padding-inline: 10px 8px;
-  min-width: calc(var(--rail-w) + 12px);
+  min-width: var(--rail-w);    /* the spine and the rail under it */
 }
 /* Source bars: the selected one takes the free width and carries the live numbers. */
 [data-theme="console"] .src-tab {
@@ -713,7 +707,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   color: #000;
   border-end-start-radius: var(--radius-elbow);
   padding-inline: 10px 8px;
-  min-width: calc(var(--rail-w) + 12px);
+  min-width: var(--rail-w);    /* the spine and the rail under it */
 }
 [data-theme="console"] #cmd {
   background: var(--c-idle);
@@ -738,16 +732,19 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 [data-colour="5"] { --job-c: var(--c-channel-5); }
 [data-colour="6"] { --job-c: var(--c-channel-6); }
 #waterfall #rail .job-tag {
-  inset-inline-start: 0; inset-inline-end: 4px; max-width: none;
-  padding-inline: 6px; line-height: 16px; font-size: 12px;
+  inset-inline-start: 0; inset-inline-end: 0; max-width: none;
+  padding-inline: 6px 12px; line-height: 20px; font-size: 12px;
   border-start-start-radius: 0; border-end-start-radius: 0;
   border-start-end-radius: var(--radius-bar); border-end-end-radius: var(--radius-bar);
   z-index: 1;
 }
 #waterfall #rail .job-tag[hidden] { display: none; }
-/* collapsed where tags crowd: a thin segment at the job's frequency, its colour kept */
+/* collapsed where tags crowd: a thin segment at the job's frequency, its colour kept, in the
+   rail's end strip, drawn over a full label's end (its padding keeps the text clear), so a
+   segment hovered into a full tag stays under the pointer */
 #waterfall #rail .job-tag.thin {
-  height: var(--rail-thin-px); padding: 0; font-size: 0; line-height: 0; z-index: 0;
+  inset-inline-start: auto; inset-inline-end: 0; width: 8px;
+  height: var(--rail-thin-px); padding: 0; font-size: 0; line-height: 0; z-index: 2;
   border-start-end-radius: 3px; border-end-end-radius: 3px;
 }
 #waterfall #rail .job-tag.thin > * { display: none; }

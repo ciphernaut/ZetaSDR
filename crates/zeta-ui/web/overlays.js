@@ -36,12 +36,12 @@
 //       moves every tag out of its outline into `el` at once (null moves them back), and new
 //       tags are made there. A rail tag's top is its outline's vertical centre less half its
 //       height, clamped to the rail; a tag whose outline is hidden or wholly off the shown
-//       band is hidden (never pinned at the edge). Sorted by centre, tags whose full extents
-//       overlap (TAG_GAP_PX apart at least) form a cluster, and one tag of each cluster stays
-//       full: the `hot` one, else a `speaking` one, else the first (highest frequency); the
-//       rest get class `thin` (RAIL_THIN_PX high, centred on their frequency, text hidden by
-//       CSS), the first thin of a cluster with more than RAIL_GROUP_MIN thin titled with the
-//       count. ov.setHot and ov.setSpeaking lay the rail out again.
+//       band is hidden (never pinned at the edge). Sorted by centre, a tag whose full extent
+//       overlaps the last full tag's (TAG_GAP_PX apart at least) gets class `thin`
+//       (RAIL_THIN_PX high, centred on its frequency, in the rail's end strip, text hidden by
+//       CSS), unless it is `hot` or `speaking`: then it stays full and the full tags it
+//       overlaps go thin instead. The first of a run of more than RAIL_GROUP_MIN thin tags is
+//       titled with the run's count. ov.setHot and ov.setSpeaking lay the rail out again.
 //   Colour: channelColour(jobId) -> 1..6 (the sum of the id's char codes mod 6, plus 1) is
 //       the `data-colour` of the job's outline, tag and ribbons (an attached job's ribbons take
 //       its input's), and agent.js puts it on the job's row; style.css maps it to
@@ -1163,29 +1163,35 @@ class Overlays {
     for (const it of items) it.th = it.t.offsetHeight; // full height: every `thin` is off
     items.sort((a, b) => a.c - b.c);
     const clamp = (top, h) => Math.max(0, Math.min(top, height - h));
-    const wins = (it, cls) => it.t.classList.contains(cls);
-    let start = 0;
-    for (let i = 1; i <= items.length; i++) {
-      const prev = items[i - 1];
-      const it = items[i];
-      if (it && it.c - it.th / 2 < prev.c + prev.th / 2 + TAG_GAP_PX) continue;
-      // items[start..i) is one cluster: one full tag, the rest thin.
-      const cluster = items.slice(start, i);
-      const full =
-        cluster.find((x) => wins(x, "hot")) ?? cluster.find((x) => wins(x, "speaking")) ?? cluster[0];
-      const thin = cluster.filter((x) => x !== full);
-      for (const x of cluster) {
-        x.t.removeAttribute("title");
-        if (x === full) {
-          x.t.style.top = `${clamp(x.c - x.th / 2, x.th)}px`;
-        } else {
-          x.t.classList.add("thin");
-          x.t.style.top = `${clamp(x.c - RAIL_THIN_PX / 2, RAIL_THIN_PX)}px`;
-        }
+    const wins = (it) => it.t.classList.contains("hot") || it.t.classList.contains("speaking");
+    const overlaps = (a, b) => b.c - b.th / 2 < a.c + a.th / 2 + TAG_GAP_PX; // a above b
+    const fulls = []; // the full tags so far, top first
+    for (const it of items) {
+      it.thin = false;
+      // A hot or speaking tag keeps its space: the full tags it overlaps go thin instead.
+      while (wins(it) && fulls.length && !wins(fulls.at(-1)) && overlaps(fulls.at(-1), it)) {
+        fulls.pop().thin = true;
       }
-      if (thin.length > RAIL_GROUP_MIN) thin[0].t.title = `${cluster.length} jobs`;
-      start = i;
+      if (fulls.length && overlaps(fulls.at(-1), it)) it.thin = true;
+      else fulls.push(it);
     }
+    let run = []; // consecutive thin tags: more than RAIL_GROUP_MIN titles the first
+    const endRun = () => {
+      if (run.length > RAIL_GROUP_MIN) run[0].t.title = `${run.length} jobs`;
+      run = [];
+    };
+    for (const x of items) {
+      x.t.removeAttribute("title");
+      if (x.thin) {
+        x.t.classList.add("thin");
+        x.t.style.top = `${clamp(x.c - RAIL_THIN_PX / 2, RAIL_THIN_PX)}px`;
+        run.push(x);
+      } else {
+        x.t.style.top = `${clamp(x.c - x.th / 2, x.th)}px`;
+        endRun();
+      }
+    }
+    endRun();
   }
 
   // `hot` on the job's outline, tag and row (agent.js calls it when its row is hovered).
