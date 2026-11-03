@@ -95,7 +95,7 @@ const PANE_ID = /^[a-z][a-z0-9_]*(:[A-Za-z0-9_.:-]+)?$/;
 const THEME_ID = /^[a-z][a-z0-9_-]{0,31}$/;
 
 // The built-in themes, offered until `themes_list` answers.
-const BUILTIN_THEMES = ["console", "plain", "cyberpunk", "terminal", "psytrance"];
+const BUILTIN_THEMES = ["console", "plain", "cyberpunk", "terminal", "psytrance", "vibecoder"];
 let readyThemes = BUILTIN_THEMES;
 
 export function themeIds() {

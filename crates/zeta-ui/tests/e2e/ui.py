@@ -1263,7 +1263,7 @@ def scenario_theme_shots(page, url, secret):
 
 
 # The built-in themes added in plan 26 (Tasks 8-11), each checked by scenario_new_themes.
-NEW_THEMES = ["cyberpunk", "terminal", "psytrance"]
+NEW_THEMES = ["cyberpunk", "terminal", "psytrance", "vibecoder"]
 
 # The motion a theme may start, provoked and read in one synchronous step (a jobs poll would
 # re-sync `.speaking` and cancel a hand-made glitch, and a short animation would finish while
@@ -1299,8 +1299,12 @@ MOTION_PROBE_JS = """(job) => {
 # 1x1 canvas (a an alpha 0-1; a colour the canvas cannot parse reads as transparent).
 # `ground(el)` is the [r, g, b] an element's text actually sits on: its own background colour
 # and its ancestors', from the element up to the first opaque one, composited; a layer under
-# 0.05 alpha counts as transparent. An element painted only with a background image (a
-# gradient) has an unknown colour, so the walk goes on to the solid colour below it.
+# 0.05 alpha counts as transparent. A stack that never reaches an opaque layer is composited
+# over the canvas ground (the background of <html>, else <body>, else white), as the browser
+# paints it. An element painted only with a background image (a gradient) has an unknown
+# colour, so the walk goes on to the solid colour below it. `settle()` finishes the CSS
+# transitions in flight, so a check reads the colours a state settles on, not a frame of a
+# fade into them.
 COLOUR_HELPERS_JS = """(() => {
   const x = document.createElement("canvas").getContext("2d", {willReadFrequently: true});
   const rgba = (c) => {
@@ -1311,6 +1315,13 @@ COLOUR_HELPERS_JS = """(() => {
     const d = x.getImageData(0, 0, 1, 1).data;
     return [d[0], d[1], d[2], Math.round(d[3] / 255 * 100) / 100];
   };
+  const canvas = () => {
+    for (const e of [document.documentElement, document.body]) {
+      const c = rgba(getComputedStyle(e).backgroundColor);
+      if (c[3] >= 0.95) return c.slice(0, 3);
+    }
+    return [255, 255, 255];
+  };
   const ground = (el) => {
     const layers = [];
     for (let e = el; e; e = e.parentElement) {
@@ -1319,22 +1330,28 @@ COLOUR_HELPERS_JS = """(() => {
       layers.push(c);
       if (c[3] >= 0.95) break;
     }
-    if (!layers.length) return [255, 255, 255];
-    let out = layers.pop().slice(0, 3);
+    let out = layers.length && layers[layers.length - 1][3] >= 0.95
+      ? layers.pop().slice(0, 3) : canvas();
     while (layers.length) {
       const [r, g, b, a] = layers.pop();
       out = [r, g, b].map((v, i) => Math.round(v * a + out[i] * (1 - a)));
     }
     return out;
   };
-  return {rgba, ground};
+  const settle = () => {
+    for (const a of document.getAnimations()) {
+      if (a instanceof CSSTransition) a.finish();
+    }
+  };
+  return {rgba, ground, settle};
 })()"""
 
 # A keyboard-focused unselected source tab: [its name's colour, the ground it sits on].
 FOCUSED_TAB_JS = """() => {
-  const {rgba, ground} = """ + COLOUR_HELPERS_JS + """;
+  const {rgba, ground, settle} = """ + COLOUR_HELPERS_JS + """;
   const tab = document.querySelector('.src-tab:not([aria-selected="true"])');
   tab.focus({focusVisible: true});
+  settle();
   const name = tab.querySelector(".name");
   const out = [rgba(getComputedStyle(name).color).slice(0, 3), ground(name)];
   tab.blur();
@@ -1344,7 +1361,8 @@ FOCUSED_TAB_JS = """() => {
 # The hovered action button in a job's (hot) row: its text, the ground it sits on, its own
 # background colour ([r, g, b, a]) and the row's ground.
 HOT_ACTION_JS = """(job) => {
-  const {rgba, ground} = """ + COLOUR_HELPERS_JS + """;
+  const {rgba, ground, settle} = """ + COLOUR_HELPERS_JS + """;
+  settle();
   const row = document.querySelector(`#jobs .job[data-id="${job}"]`);
   const button = row.querySelector(".actions button");
   return {text: rgba(getComputedStyle(button).color).slice(0, 3), ground: ground(button),
@@ -6023,3 +6041,4 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+

@@ -1,0 +1,601 @@
+/* The vibecoder theme: a freshly generated web app starter, affectionately, and the one light
+   theme. A cool slate ground, white rounded cards with a hairline border and a soft wide shadow,
+   slate text, and one accent: an indigo-to-violet gradient on the primary buttons, the brand,
+   the selected source and the speaking glow. The waterfall stays a dark card set into the light
+   page; what is drawn over it (outlines in the channel colours, white chips for labels and
+   ribbons) reads on the dark ground. Status reads as small badges, a light tint of a colour
+   behind darker text of the same hue, never dark text on a saturated fill. Frosted glass on the
+   top bar, the menus and the graph view. Inter for everything, JetBrains Mono for numbers and
+   decoded text; sentence case throughout. The node wraps this file in
+   [data-theme="vibecoder"] { ... }: `X` is `[data-theme="vibecoder"] X`, `&[...]` adds to
+   <html> (`html&[...]` keeps the type selector's weight). */
+
+& {
+  --grad: linear-gradient(120deg, #4f46e5, #7c3aed);
+  --ring: 0 0 0 3px rgba(99, 102, 241, 0.35);
+  --card-shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 12px 32px -12px rgba(15, 23, 42, 0.16);
+  --glass: rgba(255, 255, 255, 0.74);
+  --radius-card: 14px;
+}
+/* A job's colour, darkened to text on its own light tint (badges, tags, rows). Declared on
+   each coloured element, where --job-c is set, so it resolves to that job's colour. */
+&, [data-colour] {
+  --job-ink: color-mix(in srgb, var(--job-c, var(--accent)) 55%, #0f172a);
+  --job-tint: color-mix(in srgb, var(--job-c, var(--accent)) 13%, #ffffff);
+}
+
+/* ---- ground and type ---- */
+& body {
+  background:
+    radial-gradient(ellipse 60% 40% at 0% 0%, rgba(99, 102, 241, 0.08), transparent 70%),
+    radial-gradient(ellipse 50% 40% at 100% 100%, rgba(139, 92, 246, 0.06), transparent 70%),
+    var(--bg);
+  font: 13px/1.45 var(--font-ui);
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+}
+.job .band, .src-tab .range, .src-tab .centre, .job-tag .centre, .health .v, .job .id,
+#transcript, #cmd, #band input, #graph-params, #waterfall .wf-axis, #waterfall .ov-ribbon,
+#subjects td, #explore td {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+#transcript, #waterfall .ov-ribbon { font-size: 12px; }
+
+/* ---- controls: white cards, a hairline, a focus ring in the accent ---- */
+button {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-bar);
+  color: #334155;
+  font-weight: 500;
+  padding: 4px 11px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+}
+button:hover:not(:disabled) { background: #f8fafc; border-color: #c7d2fe; color: var(--c-action); }
+button:focus-visible { outline: none; box-shadow: var(--ring); border-color: #818cf8; }
+button:disabled { opacity: 0.5; }
+input, #cmd, #graph-params {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: var(--radius-bar);
+  color: var(--text);
+  caret-color: var(--accent);
+}
+input:focus, #cmd:focus, #graph-params:focus {
+  outline: none;
+  border-color: #818cf8;
+  box-shadow: var(--ring);
+}
+input::placeholder { color: #64748b; }
+/* The primary buttons: the gradient, white text. */
+#listen-all, #connect, #graph-apply, #band button {
+  background: var(--grad);
+  border: 1px solid transparent;
+  color: #ffffff;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(79, 70, 229, 0.25), 0 6px 16px -6px rgba(124, 58, 237, 0.5);
+}
+#listen-all:hover:not(:disabled), #connect:hover:not(:disabled),
+#graph-apply:hover:not(:disabled), #band button:hover:not(:disabled) {
+  background: linear-gradient(120deg, #4338ca, #6d28d9);
+  border-color: transparent;
+  color: #ffffff;
+}
+#listen-all:focus-visible, #connect:focus-visible, #graph-apply:focus-visible,
+#band button:focus-visible {
+  box-shadow: var(--ring), 0 6px 16px -6px rgba(124, 58, 237, 0.5);
+}
+#listen-all[aria-pressed="true"] {
+  border-color: transparent;
+  color: #ffffff;
+  box-shadow: 0 0 0 3px rgba(167, 139, 250, 0.45), 0 6px 18px -4px rgba(124, 58, 237, 0.65);
+}
+
+/* ---- the top bar: a floating frosted card ---- */
+#top {
+  margin: 8px 8px 0;
+  padding: 0 8px 0 12px;
+  gap: 10px;
+  align-items: center;
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(14px) saturate(1.6);
+  backdrop-filter: blur(14px) saturate(1.6);
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  border-radius: var(--radius-card);
+  box-shadow: var(--card-shadow);
+  position: relative;
+  z-index: 3;
+}
+/* The brand: gradient text over a soft wash of the same colours. */
+.brand {
+  position: relative;
+  font-weight: 750;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  color: var(--accent);
+  background: var(--grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  padding: 2px 6px;
+  min-width: calc(var(--rail-w) - 20px);
+}
+.brand::before {
+  content: "";
+  position: absolute;
+  inset: -6px -4px;
+  z-index: -1;
+  border-radius: 12px;
+  background: radial-gradient(ellipse at 30% 50%, rgba(99, 102, 241, 0.16), rgba(139, 92, 246, 0.08) 55%, transparent 80%);
+}
+#tabs { gap: 4px; align-self: center; align-items: center; padding: 4px 0; }
+#panes { gap: 4px; align-self: center; }
+.src-tab {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-bar);
+  background: transparent;
+  box-shadow: none;
+  color: var(--dim);
+  gap: 8px;
+}
+.src-tab .name { color: var(--text); font-weight: 600; }
+.src-tab .range, .src-tab .centre { font-size: 11px; opacity: 1; }
+/* An unselected tab is its name (the band stays in its title), so the selected one, with its
+   band and live numbers, fits beside them. */
+.src-tab:not([aria-selected="true"]) .range,
+.src-tab:not([aria-selected="true"]) .centre { display: none; }
+.src-tab:hover:not(:disabled) { background: #f1f5f9; border-color: transparent; color: var(--text); }
+.src-tab:focus-visible { background: #eef2ff; color: #3730a3; box-shadow: var(--ring); }
+.src-tab:focus-visible .name { color: #3730a3; }
+/* The selected source: the gradient, white text. */
+.src-tab[aria-selected="true"],
+.src-tab[aria-selected="true"]:hover:not(:disabled) {
+  background: var(--grad);
+  border-color: transparent;
+  color: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 6px 16px -6px rgba(124, 58, 237, 0.55);
+}
+.src-tab[aria-selected="true"] .name { color: #ffffff; }
+.src-tab[aria-selected="true"] .health {
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+}
+.src-tab[aria-selected="true"] .health .k { font-size: 10px; color: rgba(255, 255, 255, 0.75); }
+.src-tab[aria-selected="true"] .health .v { margin-inline-end: 6px; color: #ffffff; }
+.src-tab.fault .name { color: var(--error); }
+.src-tab[aria-selected="true"].fault .name { color: #fee2e2; }
+.src-tab .tag.pin {
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  background: #fffbeb;
+  color: #92400e;
+  font-weight: 600;
+}
+.pane-tab, #map-toggle, #drawer-toggle { align-self: center; }
+.pane-tab {
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-bar);
+  background: transparent;
+  box-shadow: none;
+  color: var(--dim);
+}
+.pane-tab:hover:not(:disabled) { background: #f1f5f9; border-color: transparent; color: var(--text); }
+.pane-tab[aria-selected="true"], #map-toggle[aria-pressed="true"] {
+  background: #eef2ff;
+  border-color: #c7d2fe;
+  color: #3730a3;
+}
+
+/* ---- the command bar: a floating card holding a roomy input ---- */
+#bar {
+  margin: 0 8px 8px;
+  padding: 0 8px 0 12px;
+  gap: 8px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--card-shadow);
+}
+#bar .prompt {
+  font-weight: 700;
+  font-size: 16px;
+  background: var(--grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  min-width: calc(var(--rail-w) - 20px);
+}
+#cmd { height: 34px; padding-inline: 12px; background: #f8fafc; }
+#cmd:focus { background: #ffffff; }
+#mic { height: 32px; }
+#mic .dot { background: #94a3b8; }
+#mic.recording { border-color: #fecaca; background: #fef2f2; color: #b91c1c; }
+#mic-status { color: var(--dim); }
+
+/* ---- the waterfall: a dark card set into the light page ---- */
+#waterfall {
+  inset: 10px 10px 10px 8px;
+  background: transparent;
+}
+#waterfall .wf-canvas {
+  border-radius: var(--radius-card);
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.08), 0 18px 40px -16px rgba(15, 23, 42, 0.45);
+}
+#waterfall .wf-overlay, #waterfall .ov-layer { border-radius: var(--radius-card); }
+#waterfall .wf-axis { color: var(--dim); border-inline-end: 0; font-size: 11px; }
+#waterfall .wf-axis .tick.ch { color: var(--ok); }
+&[data-rail="on"] #waterfall #rail {
+  border-inline-start: 0;
+  background: transparent;
+}
+/* A rail tag: a small rounded badge, the job's colour as a light tint behind its darker ink. */
+.job-tag {
+  border-radius: 8px;
+  background: var(--overlay-bg);
+  color: var(--text);
+}
+.job-tag[data-colour] {
+  background: var(--job-tint);
+  color: var(--job-ink);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--job-c) 30%, transparent);
+}
+#waterfall #rail .job-tag {
+  inset-inline-start: 4px;
+  inset-inline-end: 4px;
+  padding-inline: 8px;
+  line-height: 20px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.job-tag .short, .job-tag .snippet { display: none; }
+.job-tag:has(.channel:not(:empty)) .kind { display: none; }
+.job-tag .channel:empty { display: none; }
+.job-tag .centre { font-weight: 500; }
+.job-tag .dot { width: 7px; height: 7px; margin-inline: 4px 2px; }
+.job-tag .dot.open { background: #10b981; box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.25); }
+.job-tag .dot.closed { background: var(--c-idle); }
+.job-tag[data-colour]:has(.dot.closed) {
+  background: #ffffff;
+  color: var(--dim);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.job-tag.hot, .job-tag[data-colour].hot {
+  outline: none;
+  color: #3730a3;
+  background: #e0e7ff;
+  box-shadow: inset 0 0 0 1.5px #818cf8, 0 4px 12px -4px rgba(79, 70, 229, 0.45);
+}
+/* Speaking: the gradient edge and a violet glow. */
+.job-tag.speaking, .job-tag[data-colour].speaking {
+  outline: none;
+  color: #5b21b6;
+  border: 1px solid transparent;
+  background: linear-gradient(#f5f3ff, #f5f3ff) padding-box, var(--grad) border-box;
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.18), 0 6px 18px -4px rgba(124, 58, 237, 0.55);
+}
+
+/* ---- outlines and ribbons over the dark canvas ---- */
+#waterfall .outline {
+  border-top: 1px solid #a5b4fc;
+  border-bottom: 1px solid #a5b4fc;
+  border-radius: 6px;
+}
+#waterfall .outline[data-colour] {
+  border-top-color: var(--job-c);
+  border-bottom-color: var(--job-c);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--job-c) 35%, transparent);
+}
+#waterfall .outline.hot { border-color: #c7d2fe; }
+#waterfall .outline.speaking, #waterfall .outline[data-colour].speaking {
+  border-top: 2px solid #a78bfa;
+  border-bottom: 2px solid #a78bfa;
+  box-shadow: 0 0 16px rgba(167, 139, 250, 0.55);
+}
+#waterfall .outline-label, #waterfall .outline-readout {
+  border-radius: 6px;
+  color: #3730a3;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(2, 6, 23, 0.35);
+}
+#waterfall .outline[data-colour] .outline-label { color: var(--job-ink); }
+#waterfall .ov-label, #waterfall .ov-ribbon {
+  border-radius: 8px;
+  border: 0;
+  box-shadow: 0 4px 14px -2px rgba(2, 6, 23, 0.45);
+}
+#waterfall .ov-label { color: var(--ok); }
+#waterfall .ov-label[data-layer="2"] { color: var(--accent); }
+#waterfall .ov-span > span { border-radius: 4px; }
+#waterfall .ov-ribbon {
+  padding: 1px 9px;
+  color: var(--text);
+  border-inline-start: 3px solid var(--user);
+}
+#waterfall .ov-ribbon[data-colour] { border-inline-start-color: var(--job-c); }
+#waterfall .ov-ribbon.agent {
+  color: #3730a3;
+  border: 1px solid transparent;
+  background: linear-gradient(#ffffff, #ffffff) padding-box, var(--grad) border-box;
+}
+#wf-badge {
+  border-radius: 8px;
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  color: #92400e;
+  font-weight: 600;
+  font-size: 11px;
+}
+#band {
+  right: 10px;
+  bottom: 10px;
+  gap: 6px;
+  padding: 5px 6px 5px 10px;
+  opacity: 1;
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(12px) saturate(1.5);
+  backdrop-filter: blur(12px) saturate(1.5);
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  border-radius: 12px;
+  box-shadow: 0 10px 28px -8px rgba(2, 6, 23, 0.5);
+}
+#band label { color: var(--dim); }
+#band input { border-radius: 8px; }
+#band button { padding: 2px 10px; border-radius: 8px; }
+
+/* ---- the side column: panes float as cards with gaps between them ---- */
+#side {
+  background: transparent;
+  border-left: 0;
+  padding: 10px 8px 10px 2px;
+  gap: 10px;
+}
+section.pane {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--card-shadow);
+  overflow: hidden;
+}
+.pane.jobs { border-block-start: 1px solid var(--border); }
+.pane h2 { border-block-end: 1px solid #f1f5f9; }
+.pane-head {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  padding: 9px 14px;
+  border-radius: 0;
+  box-shadow: none;
+}
+.pane-head:hover:not(:disabled) { background: #f8fafc; color: var(--text); border-color: transparent; }
+.pane-head:focus-visible { box-shadow: inset 0 0 0 3px rgba(99, 102, 241, 0.35); }
+.pane-head .count {
+  padding: 0 7px;
+  border-radius: 6px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 11px;
+  font-weight: 600;
+}
+&:not([data-footprint="narrow"]) section.pane[data-collapsed] .pane-head { color: var(--dim); }
+#transcript { padding: 8px 14px; }
+.line { padding: 2px 0; }
+.line.assistant { color: var(--accent); }
+.line.note { color: var(--dim); }
+.line.user { color: var(--user); }
+.line.user::before { color: #94a3b8; }
+.line button.action { border-radius: 8px; }
+#jobs { padding: 6px 8px; }
+/* A job row: a soft rounded row, its colour in the start edge and its kind's badge. */
+.job { border-radius: 10px; padding: 4px 8px; margin-block-end: 2px; column-gap: 6px; }
+#jobs .job[data-colour] {
+  border-inline-start: 3px solid var(--job-c);
+  padding-inline-start: 8px;
+}
+#jobs .job.speaking {
+  border-inline-start-color: #7c3aed;
+  background: linear-gradient(90deg, rgba(139, 92, 246, 0.12), transparent 70%);
+}
+.job.hot, #jobs .job.hot {
+  outline: none;
+  background: #eef2ff;
+  box-shadow: inset 0 0 0 1px #c7d2fe;
+}
+.job .kind {
+  padding: 0 6px;
+  border-radius: 6px;
+  background: var(--job-tint);
+  color: var(--job-ink);
+  font-weight: 600;
+  font-size: 11.5px;
+}
+.job.attached .kind { background: #f1f5f9; color: var(--dim); }
+.job .state {
+  padding: 0 7px;
+  border-radius: 6px;
+  background: #ecfdf5;
+  color: var(--ok);
+  font-size: 11px;
+  font-weight: 600;
+}
+.job[data-state="failed"] .state { background: #fef2f2; color: #b91c1c; }
+.job[data-state="failed"] .reason { color: #b91c1c; }
+.job.finished { opacity: 0.75; }
+.job .tag {
+  border: 0;
+  border-radius: 6px;
+  padding: 0 6px;
+  background: #f1f5f9;
+  color: var(--dim);
+  font-weight: 500;
+}
+.job .tag.ch { background: #ecfdf5; color: var(--ok); }
+.job .tag.squelch { font-style: normal; }
+.job .events { color: var(--user); }
+.job .mix-now { color: var(--ok); }
+.job .actions { gap: 3px; }
+.job .actions button { padding: 0 6px; border-radius: 8px; font-size: 11px; }
+.job .actions button:hover:not(:disabled) { background: #ffffff; border-color: #a5b4fc; color: #3730a3; }
+.job button.play[aria-pressed="true"] { background: #ecfdf5; border-color: #a7f3d0; color: var(--ok); }
+.job button.mute[aria-pressed="true"] { background: #f1f5f9; color: var(--dim); }
+.job-group > summary { color: var(--dim); padding: 2px 8px; border-radius: 8px; }
+
+/* ---- menus: frosted cards ---- */
+#ctx, #ctx-outline {
+  padding: 6px;
+  background: rgba(255, 255, 255, 0.8);
+  -webkit-backdrop-filter: blur(18px) saturate(1.6);
+  backdrop-filter: blur(18px) saturate(1.6);
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  border-radius: var(--radius-card);
+  box-shadow: 0 24px 56px -16px rgba(15, 23, 42, 0.35), 0 2px 6px rgba(15, 23, 42, 0.06);
+}
+#ctx .ctx-item, #ctx-outline .ctx-item {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text);
+  font-weight: 500;
+  padding: 6px 10px;
+}
+#ctx .ctx-item:hover, #ctx .ctx-item:focus-visible,
+#ctx-outline .ctx-item:hover, #ctx-outline .ctx-item:focus-visible {
+  background: rgba(99, 102, 241, 0.1);
+  color: #3730a3;
+  box-shadow: none;
+  outline: none;
+}
+#ctx-footer, #ctx-outline-footer { border-top-color: var(--border); color: var(--dim); }
+
+/* ---- the graph view: a frosted panel over a blurred page ---- */
+#graph {
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+#graph .graph-panel {
+  padding: 14px 16px 16px;
+  background: rgba(255, 255, 255, 0.9);
+  -webkit-backdrop-filter: blur(20px) saturate(1.6);
+  backdrop-filter: blur(20px) saturate(1.6);
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  border-radius: 16px;
+  box-shadow: 0 32px 72px -20px var(--shadow-strong);
+}
+#graph .graph-title {
+  font-weight: 700;
+  background: var(--grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+#graph .graph-canvas { background: #f8fafc; border-color: var(--border); border-radius: 12px; }
+#graph .graph-node rect { fill: #ffffff; stroke: #cbd5e1; rx: 10px; }
+#graph .graph-node[data-kind$="_demod"] rect { stroke: #a5b4fc; }
+#graph .graph-node[data-kind$="_decode"] rect,
+#graph .graph-node[data-kind="transcribe"] rect { stroke: #c4b5fd; }
+#graph .graph-node:hover rect, #graph .graph-node:focus-visible rect { stroke: #6366f1; }
+#graph .graph-node.selected rect { stroke: #4f46e5; stroke-width: 2.5; fill: #eef2ff; }
+#graph .graph-node text { font-family: var(--font-ui); }
+#graph .graph-edge line { stroke: #94a3b8; }
+#graph .graph-arrowhead { fill: #94a3b8; }
+#graph .graph-edge text { fill: var(--user); }
+#graph .graph-status { color: var(--ok); }
+
+/* ---- the login card ---- */
+#login-form {
+  gap: 10px;
+  padding: 22px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--card-shadow);
+}
+#login h1 {
+  font-size: 18px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+  background: var(--grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* ---- the panes under the waterfall ---- */
+#pane { background: var(--bg); border-top: 1px solid var(--border); }
+#subjects, #explore, #subjects thead th, #subjects th:first-child, #subjects td:first-child {
+  background: #ffffff;
+}
+#subjects tr.subject.selected, #subjects tr.subject.selected td:first-child { background: #eef2ff; }
+
+/* ---- crowded rail tags (the core's 8 x 5 px .thin segments): a solid rounded segment in the
+   job's colour at the rail's end strip, no badge ground, no text ---- */
+#waterfall #rail .job-tag.thin {
+  inset-inline-start: auto; inset-inline-end: 0; width: 8px; padding: 0;
+  border: 0; outline: 0; border-radius: 3px;
+  background: var(--job-c, var(--accent)); box-shadow: none;
+}
+#waterfall #rail .job-tag.thin:has(.dot.closed) {
+  background: color-mix(in srgb, var(--job-c, var(--accent)) 55%, #ffffff);
+}
+#waterfall #rail .job-tag.thin.speaking { background: var(--grad); }
+
+/* ---- narrow: tighter cards; the rail is 14 px of thin segments; the drawer is frosted ---- */
+html&[data-footprint="narrow"] { --rail-w: 14px; }
+html&[data-footprint="narrow"] #top { margin: 6px 6px 0; padding-inline: 6px; gap: 6px; }
+html&[data-footprint="narrow"] #bar { margin: 0 6px 6px; }
+html&[data-footprint="narrow"] #waterfall { inset: 8px 6px 8px 4px; }
+html&[data-footprint="narrow"] #waterfall #rail { overflow: visible; z-index: 6; }
+html&[data-footprint="narrow"] #waterfall #rail .job-tag {
+  inset-inline-start: 0; inset-inline-end: 0; width: auto;
+  height: var(--rail-thin-px); padding: 0; font-size: 0; line-height: 0;
+  border: 0; border-radius: 3px; background: var(--job-c, var(--accent)); box-shadow: none;
+  touch-action: none;
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag > * { display: none; }
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded {
+  inset-inline-start: var(--rail-w); inset-inline-end: auto; width: max-content; height: auto;
+  z-index: 6; padding-inline: 8px; font-size: 12px; line-height: 22px;
+  border-radius: 8px; background: var(--job-tint); color: var(--job-ink);
+  box-shadow: 0 6px 18px -4px rgba(2, 6, 23, 0.4);
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .channel:not(:empty),
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded:not(:has(.channel:not(:empty))) > .kind,
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .centre {
+  display: inline;
+}
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .dot { display: inline-block; }
+html&[data-footprint="narrow"] #bar .prompt, html&[data-footprint="narrow"] .brand { min-width: 0; }
+html&[data-footprint="narrow"][data-drawer="open"] #side {
+  top: calc(var(--bar-h-top) + 6px);
+  bottom: calc(var(--bar-h-bottom) + 6px);
+  right: 6px;
+  padding: 8px;
+  border-radius: 16px;
+  background: rgba(241, 245, 249, 0.82);
+  -webkit-backdrop-filter: blur(18px) saturate(1.5);
+  backdrop-filter: blur(18px) saturate(1.5);
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  box-shadow: 0 24px 56px -16px rgba(15, 23, 42, 0.35);
+}
+
+/* ---- motion: gentle 150 ms transitions, only for a reader who has not asked for less ---- */
+@media (prefers-reduced-motion: no-preference) {
+  button, .src-tab, .pane-tab, input, #cmd, #graph-params, .job, .job-tag, .ctx-item {
+    transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease,
+      box-shadow 150ms ease;
+  }
+  .job-tag.speaking, #jobs .job.speaking { animation: breathe 2.4s ease-in-out infinite; }
+}
+@keyframes breathe {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.18), 0 6px 18px -4px rgba(124, 58, 237, 0.55); }
+  50% { box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.28), 0 8px 22px -4px rgba(124, 58, 237, 0.7); }
+}

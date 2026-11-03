@@ -38,7 +38,14 @@ fn builtins_load_ready() {
     let ids: Vec<&str> = reg.all().iter().map(|t| t.id.as_str()).collect();
     assert_eq!(
         ids,
-        ["console", "cyberpunk", "plain", "psytrance", "terminal"]
+        [
+            "console",
+            "cyberpunk",
+            "plain",
+            "psytrance",
+            "terminal",
+            "vibecoder"
+        ]
     );
     for t in reg.all() {
         assert_eq!(t.state, ThemeState::Ready, "{}: {:?}", t.id, t.reason);
@@ -332,7 +339,14 @@ async fn themes_list_answers_every_theme() {
             .find(|t| t.id == id)
             .unwrap_or_else(|| panic!("{id}"))
     };
-    for id in ["console", "cyberpunk", "plain", "psytrance", "terminal"] {
+    for id in [
+        "console",
+        "cyberpunk",
+        "plain",
+        "psytrance",
+        "terminal",
+        "vibecoder",
+    ] {
         let t = row(id);
         assert_eq!(t.state, ThemeState::Ready);
         assert!(t.builtin && !t.replaces_builtin && t.reason.is_none());
@@ -400,7 +414,14 @@ fn docs_list_every_token() {
 }
 
 /// The built-in themes held to WCAG AA by `builtin_themes_meet_aa`.
-const AA_THEMES: &[&str] = &["console", "plain", "cyberpunk", "terminal", "psytrance"];
+const AA_THEMES: &[&str] = &[
+    "console",
+    "plain",
+    "cyberpunk",
+    "terminal",
+    "psytrance",
+    "vibecoder",
+];
 
 /// WCAG 2 relative luminance of a `#rrggbb` colour.
 fn luminance(hex: &str) -> f64 {
@@ -456,8 +477,63 @@ fn builtin_themes_meet_aa() {
                 failures.push(format!("{id}: {what} is {ratio:.2}, under {floor}"));
             }
         }
+        if json["color_scheme"] == "light" {
+            light_theme_checks(id, &token, &mut failures);
+        }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A light theme keeps a dark waterfall, so it is held to more: `--wf-bg` stays dark; the
+/// labels and ribbons over the waterfall (`--text` on `--overlay-bg`, the overlay composited
+/// over `--wf-bg`, the darkest ground it sits on) and the axis labels over the light page
+/// (`--dim`, the core `.wf-axis` colour, on `--bg`) read as body text, 4.5:1.
+fn light_theme_checks(id: &str, token: &dyn Fn(&str) -> String, failures: &mut Vec<String>) {
+    let (bg, text, dim, wf_bg) = (
+        token("--bg"),
+        token("--text"),
+        token("--dim"),
+        token("--wf-bg"),
+    );
+    if luminance(&wf_bg) >= 0.05 {
+        failures.push(format!("{id}: --wf-bg {wf_bg} is not a dark ground"));
+    }
+    let overlay = over(&token("--overlay-bg"), &wf_bg);
+    for (what, fg, ground) in [
+        ("--text on --overlay-bg (over --wf-bg)", &text, &overlay),
+        ("axis labels (--dim) on --bg", &dim, &bg),
+    ] {
+        let ratio = contrast(fg, ground);
+        if ratio < 4.5 {
+            failures.push(format!("{id}: {what} is {ratio:.2}, under 4.5"));
+        }
+    }
+}
+
+/// `colour` (`#rrggbb` or `rgba(r, g, b, a)`) composited over the `#rrggbb` `ground`, as
+/// `#rrggbb`.
+fn over(colour: &str, ground: &str) -> String {
+    let rgb = |hex: &str| {
+        let h = hex.strip_prefix('#').filter(|h| h.len() == 6);
+        let h = h.unwrap_or_else(|| panic!("{hex} is not #rrggbb"));
+        [0, 2, 4].map(|i| f64::from(u8::from_str_radix(&h[i..i + 2], 16).unwrap()))
+    };
+    let (top, alpha) = if let Some(args) = colour
+        .strip_prefix("rgba(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let v: Vec<f64> = args
+            .split(',')
+            .map(|p| p.trim().parse().unwrap_or_else(|_| panic!("{colour}")))
+            .collect();
+        assert_eq!(v.len(), 4, "{colour} is not rgba(r, g, b, a)");
+        ([v[0], v[1], v[2]], v[3])
+    } else {
+        (rgb(colour), 1.0)
+    };
+    let base = rgb(ground);
+    let c = [0, 1, 2].map(|i| (top[i] * alpha + base[i] * (1.0 - alpha)).round() as u8);
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
 /// The colour of a theme's ramp at `t`, interpolated linearly between its stops.

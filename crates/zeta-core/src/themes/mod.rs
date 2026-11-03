@@ -121,6 +121,34 @@ pub const BUILTIN: &[(&str, &[u8])] = &[
         "terminal/theme.json",
         include_bytes!("../../../../themes/terminal/theme.json"),
     ),
+    (
+        "vibecoder/FONTS.md",
+        include_bytes!("../../../../themes/vibecoder/FONTS.md"),
+    ),
+    (
+        "vibecoder/Inter-VF.ttf",
+        include_bytes!("../../../../themes/vibecoder/Inter-VF.ttf"),
+    ),
+    (
+        "vibecoder/JetBrainsMono-VF.ttf",
+        include_bytes!("../../../../themes/vibecoder/JetBrainsMono-VF.ttf"),
+    ),
+    (
+        "vibecoder/OFL-Inter.txt",
+        include_bytes!("../../../../themes/vibecoder/OFL-Inter.txt"),
+    ),
+    (
+        "vibecoder/OFL-JetBrainsMono.txt",
+        include_bytes!("../../../../themes/vibecoder/OFL-JetBrainsMono.txt"),
+    ),
+    (
+        "vibecoder/style.css",
+        include_bytes!("../../../../themes/vibecoder/style.css"),
+    ),
+    (
+        "vibecoder/theme.json",
+        include_bytes!("../../../../themes/vibecoder/theme.json"),
+    ),
 ];
 
 /// `$XDG_CONFIG_HOME/zetasdr/themes`, else `$HOME/.config/zetasdr/themes`; `None` when
