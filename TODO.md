@@ -1,5 +1,9 @@
 # TODO
 
+## UI: themes as folders (plan 26)
+
+Planned 2026-11-03: spec `docs/superpowers/specs/2026-11-03-themes-design.md`, plan `docs/superpowers/plans/2026-11-03-themes.md`. Themes become folders (`theme.json` + `style.css`), built-ins embedded from `themes/`, the operator's own in `--themes-dir`, listed by `themes_list`; console and plain move into that format unchanged; four new built-ins: cyberpunk, terminal, psytrance, vibecoder (the light one). Mobile and other per-device layouts are later: the spec reserves a `footprints` key in `theme.json` for them.
+
 ## Scan: the HackRF's spur grid coincides with the quarter-step shift
 
 From the HackRF run on the field host, 2026-11-01 (plan series "Plan 15 status"). The HackRF One has spurs on multiples of 4 MHz whose level depends on the tune: a 3-bin spike at +4 MHz (and mostly -4 MHz) of 21-37 dB when tuned to 444, 460, 476 or 492 MHz, ±8 MHz spikes on the edge bins of every 16 Msps row, a +2 MHz spike at 462 and 470 MHz, a comb every 100 kHz around 480 MHz. The scan's quarter-step shift at a 16 MHz step is exactly 4 MHz, so one grid's +4 MHz spur lands on the other grid's centre and is painted where that grid masks its DC: the survey shows a grid of peaks that moves between sweeps (the plan's failure sign) that no mask width fixes. Wanted: a per-device spur list the scan rows mask as `masked` ranges (offsets from the tune, as the HackRF's are, plus absolute frequencies as the B210's 402.0245/402.1505/402.9005/403.1494/403.8996 MHz are: the watch's `spurs_hz` is the absolute half), measured once per device by a `zeta soapy survey` over a quiet span and kept with the source record; and a step or shift that is not a multiple of the spur spacing on a device that has one (15 MHz steps, or a shift of a third). The B210 showed no such grid.
