@@ -40,6 +40,26 @@ pub const CONSTELLATION_EVERY_MS: u64 = 1000;
 /// symbols.
 const AVERAGE_SYMBOLS: f64 = 64.0;
 
+/// The quantile of the run's first frame that seeds the lower cluster level (and one
+/// minus it the upper level and the outer magnitude), in place of the frame's extremes.
+/// A cluster level moves only by the values that fall in its cluster, so a seed beyond
+/// every later symbol never comes back: a start-up transient (a demodulator's levels
+/// settling on an onset after silence, measured at 4.7 against an on-level of 1 on a
+/// real OOK remote) seeded the upper level so high that no symbol reached the midpoint
+/// and every bit read 0. A seed inside the data is always pulled out to its cluster.
+const SEED_QUANTILE: f64 = 0.1;
+
+/// The `q` quantile (0..=1, nearest rank) of `values`; 0 when there are none.
+fn quantile(values: &[f64], q: f64) -> f64 {
+    let mut v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    let k = ((v.len() - 1) as f64 * q).round() as usize;
+    v[k]
+}
+
 /// Default number of levels on a 1-channel input.
 const LEVELS_DEFAULT: u8 = 2;
 
@@ -249,10 +269,11 @@ impl Slicer {
         } else {
             p.levels as u32
         };
-        let values = first.iter().map(|&v| v as f64);
-        let lo = values.clone().fold(f64::INFINITY, f64::min);
-        let hi = values.clone().fold(f64::NEG_INFINITY, f64::max);
-        let peak = values.map(f64::abs).fold(0.0, f64::max);
+        let values: Vec<f64> = first.iter().map(|&v| v as f64).collect();
+        let lo = quantile(&values, SEED_QUANTILE);
+        let hi = quantile(&values, 1.0 - SEED_QUANTILE);
+        let magnitudes: Vec<f64> = values.iter().map(|v| v.abs()).collect();
+        let peak = quantile(&magnitudes, 1.0 - SEED_QUANTILE);
         let n = (first.len() / channels).max(1) as f64;
         let radius = first
             .chunks(channels)
@@ -512,7 +533,8 @@ impl Totals {
 /// 0 and ±2/3 of the running outer cluster magnitude, the midpoints between cluster
 /// centres ±1 and ±1/3 of it; each an exponential average over [`AVERAGE_SYMBOLS`]
 /// symbols of the values falling in that cluster, started from the run's first frame's
-/// minimum, maximum and largest magnitude), 2 channels by angle onto `constellation`.
+/// [`SEED_QUANTILE`] and `1 - SEED_QUANTILE` quantiles of the values and the latter of
+/// their magnitudes), 2 channels by angle onto `constellation`.
 /// Publishes a `bits` event per `chunk_bits` (and the short chunk at a seam, a lag, a
 /// change of rate or channels and the input's end, each of which restarts the
 /// statistics, the differential reference and `offset_bits`), a `constellation` event
@@ -842,6 +864,20 @@ mod tests {
         let period = 1_000_000_000 / BAUD as u64;
         let t1 = ev[1]["t_ns"].as_u64().unwrap();
         assert!(t1.abs_diff(T0 + 4096 * period) <= 4096, "{t1}");
+    }
+
+    /// A start-up transient in the first frame (an OOK demodulator's onset after
+    /// silence: a few symbols at several times the on-level) does not seed the upper
+    /// level beyond every later symbol: the 0/1 stream after it reads as planted. Seeded
+    /// from the frame's maximum, the midpoint sat at 2.5 and every bit read 0.
+    #[tokio::test]
+    async fn a_start_up_transient_does_not_seed_the_levels() {
+        const TRANSIENT: [f32; 3] = [4.7, 2.4, 1.2];
+        let bits = random_bits(2_000, 3);
+        let mut x: Vec<f32> = TRANSIENT.to_vec();
+        x.extend(bits.iter().map(|&b| b as f32));
+        let r = run(serde_json::json!({}), frames(&x, 1, T0)).await;
+        assert_eq!(&r.bits()[TRANSIENT.len()..], bits.as_slice());
     }
 
     #[tokio::test]

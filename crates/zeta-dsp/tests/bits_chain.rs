@@ -467,3 +467,109 @@ async fn a_short_bpsk_burst_recovers_its_bits_without_resample() {
     let e = align_errors(&recovered_bits(&events), &want);
     assert_eq!(e, 0, "{e} bit errors");
 }
+
+/// Chip rate of the real OOK remote in the fixtures: about 313 us a chip.
+const REMOTE_BAUD: u32 = 3_200;
+/// The remote's fixed code, read by pulse width from the fixtures.
+const REMOTE_CODE: u32 = <button-code>;
+/// Chips of one EV1527 symbol: a 0 is `1000`, a 1 is `1110`.
+const EV1527_SYMBOL_CHIPS: usize = 4;
+/// Data bits of one EV1527 frame; the sync pulse makes its 25th symbol.
+const EV1527_BITS: usize = 24;
+/// Off chips that end a frame: the sync's silence is 31 chips, a bit's at most 3.
+const EV1527_SYNC_ZERO_CHIPS: usize = 20;
+
+/// The codes of every whole EV1527 frame in `chips`: split at runs of at least
+/// [`EV1527_SYNC_ZERO_CHIPS`] zeros, each group cut into 4-chip symbols (`1000` is 0,
+/// `1110` is 1, anything else spoils the group), and a group of exactly
+/// [`EV1527_BITS`] + 1 symbols (the bits, then the sync pulse) read as its first 24 bits,
+/// MSB first.
+fn ev1527_codes(chips: &[u8]) -> Vec<u32> {
+    let mut groups: Vec<Vec<u8>> = Vec::new();
+    let (mut cur, mut zeros) = (Vec::new(), 0usize);
+    for &c in chips {
+        if c == 0 {
+            zeros += 1;
+            if zeros == EV1527_SYNC_ZERO_CHIPS && !cur.is_empty() {
+                groups.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if zeros < EV1527_SYNC_ZERO_CHIPS && !cur.is_empty() {
+            cur.extend(std::iter::repeat_n(0, zeros));
+        }
+        zeros = 0;
+        cur.push(c);
+    }
+    groups
+        .into_iter()
+        .filter_map(|mut g| {
+            // A group ends on its last on chip (the sync pulse): pad it to a symbol.
+            g.resize(g.len().next_multiple_of(EV1527_SYMBOL_CHIPS), 0);
+            let symbols: Option<Vec<u32>> = g
+                .chunks(EV1527_SYMBOL_CHIPS)
+                .map(|s| match s {
+                    [1, 0, 0, 0] => Some(0),
+                    [1, 1, 1, 0] => Some(1),
+                    _ => None,
+                })
+                .collect();
+            let symbols = symbols?;
+            (symbols.len() == EV1527_BITS + 1).then(|| {
+                symbols[..EV1527_BITS]
+                    .iter()
+                    .fold(0u32, |acc, &b| (acc << 1) | b)
+            })
+        })
+        .collect()
+}
+
+/// The EV1527 codes the OOK chain recovers from the real-remote fixture `name`
+/// (`tests/data/<name>.sigmf-meta`, cf32 at 51 200 Hz centred on the remote), through
+/// the chain `bits_start` builds for OOK.
+async fn remote_codes(name: &str) -> Vec<u32> {
+    let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(format!("{name}.sigmf-meta"));
+    let (m, iq) = zeta_core::capture::read_cf32(&meta).expect("fixture");
+    let rate = m.sample_rate_hz.0;
+    let chain_rate =
+        zeta_core::bits::chain_rate_hz(rate, REMOTE_BAUD, zeta_core::bits::Modulation::Ook, 2);
+    let events = run_chain(
+        &[
+            ("resample", json!({"out_rate_hz": chain_rate})),
+            ("ook_demod", json!({"symbol_rate_baud": REMOTE_BAUD})),
+            (
+                "clock_recover",
+                json!({"symbol_rate_baud": REMOTE_BAUD, "algorithm": "early_late"}),
+            ),
+            ("slicer", json!({})),
+        ],
+        &iq,
+        rate,
+    )
+    .await;
+    let chips = recovered_bits(&events);
+    let codes = ev1527_codes(&chips);
+    let shown: String = chips.iter().map(|c| char::from(b'0' + c)).collect();
+    eprintln!("{name}: {} chips {shown}\ncodes {codes:06x?}", chips.len());
+    codes
+}
+
+/// A real EV1527-style remote (433.882 MHz, about 30 dB SNR, 3200 chips/s) captured on
+/// the air: every whole frame the chain recovers reads the remote's code.
+#[tokio::test]
+async fn a_real_ook_remote_decodes_to_its_code() {
+    let one = remote_codes("ook-remote-433882k-1").await;
+    assert!(one.len() >= 3, "fixture 1: {one:06x?}");
+    assert!(
+        one.iter().all(|&c| c == REMOTE_CODE),
+        "fixture 1: {one:06x?}"
+    );
+    let two = remote_codes("ook-remote-433882k-2").await;
+    assert!(two.len() >= 2, "fixture 2: {two:06x?}");
+    assert!(
+        two.iter().all(|&c| c == REMOTE_CODE),
+        "fixture 2: {two:06x?}"
+    );
+}
