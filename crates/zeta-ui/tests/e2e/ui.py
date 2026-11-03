@@ -1184,6 +1184,82 @@ def scenario_theme_switch(page, url, secret):
                 stop_job(url, secret, j)
 
 
+# Job ids differ from run to run, and so does each job's colour (overlays.js channelColour
+# sums the id): the shots write every id, and its 6-character short form, as one fixed id and
+# give every coloured element colour 1, so two runs of the same stylesheet match. A
+# MutationObserver keeps it so through the page's own re-renders (it runs before each paint).
+SHOT_STEADY_JS = """() => {
+  if (window.__shotSteady) return;
+  const ULID = /01[0-9A-HJKMNP-TV-Z]{24}/g;
+  const FIXED = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+  const app = document.getElementById("app");
+  const ids = new Set();
+  const steady = () => {
+    for (const el of app.querySelectorAll("[data-job], [data-key], [data-id]")) {
+      for (const v of [el.dataset.job, el.dataset.key, el.dataset.id]) {
+        if (v && /^01[0-9A-HJKMNP-TV-Z]{24}$/.test(v)) ids.add(v);
+      }
+    }
+    const walker = document.createTreeWalker(app, NodeFilter.SHOW_TEXT);
+    const texts = [];
+    while (walker.nextNode()) texts.push(walker.currentNode);
+    for (const t of texts) for (const m of t.data.match(ULID) || []) ids.add(m);
+    const shorts = [...ids].map((id) => id.slice(-6));
+    for (const t of texts) {
+      let s = t.data.replace(ULID, FIXED);
+      for (const short of shorts) s = s.split(short).join(FIXED.slice(-6));
+      if (s !== t.data) t.data = s;
+    }
+    for (const el of app.querySelectorAll("[data-colour]")) {
+      if (el.dataset.colour !== "1") el.dataset.colour = "1";
+    }
+  };
+  steady();
+  window.__shotSteady = new MutationObserver(steady);
+  window.__shotSteady.observe(app, {subtree: true, childList: true, characterData: true,
+                                    attributes: true, attributeFilter: ["data-colour"]});
+}"""
+
+
+def scenario_theme_shots(page, url, secret):
+    """Screenshots of console and plain, wide and narrow, into ZETA_UI_SHOTS (nothing without
+    it), for shotdiff.py to compare across a stylesheet move. The waterfall canvas, the status
+    line and the live source numbers are masked: they change from run to run."""
+    shots = os.environ.get("ZETA_UI_SHOTS")
+    if not shots:
+        return
+    select_source(page, url, secret, "tone")
+    demod = None
+    try:
+        # Off the tone, so its squelch stays closed and the tag reads the same every run.
+        demod = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500, deviation_hz=5000)
+        # The page's own spectrum job and the demodulator both listed, so every run shows the
+        # same rows.
+        spectrum = wait_one_spectrum_job(url, secret, "tone", within_s=10.0)
+        assert len(spectrum) == 1, spectrum
+        job_row(page, spectrum[0]["id"])
+        job_row(page, demod)
+        for theme in ("console", "plain"):
+            for name, size in (("wide", WIDE), ("narrow", NARROW)):
+                page.set_viewport_size(size)
+                page.wait_for_function(
+                    f"() => document.documentElement.dataset.footprint === '{name}'")
+                run_cmd(page, f"view set theme {theme}")
+                expect(page.locator("html")).to_have_attribute("data-theme", theme)
+                expect(page.locator(f'#waterfall .job-tag[data-job="{demod}"] .dot.closed')
+                       ).to_have_count(1, timeout=5_000)
+                page.evaluate("document.activeElement && document.activeElement.blur()")
+                page.wait_for_timeout(500)
+                page.evaluate(SHOT_STEADY_JS)
+                page.screenshot(
+                    path=os.path.join(shots, f"{theme}-{name}.png"), animations="disabled",
+                    mask=[page.locator(".wf-canvas"), page.locator("#status"),
+                          page.locator(".src-tab .health")])
+    finally:
+        if demod:
+            stop_job(url, secret, demod)
+
+
 def scenario_source_bar_shows_live_numbers(page, url, secret):
     select_source(page, url, secret, "tone")
     tab = page.locator('.src-tab[aria-selected="true"]')
