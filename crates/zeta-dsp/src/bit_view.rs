@@ -26,8 +26,11 @@ pub const BIT_VIEW_KIND: &str = "bit_view";
 /// Default window, in bits.
 pub const WINDOW_BITS_DEFAULT: u32 = 65_536;
 
-/// Largest window, in bits.
-pub const WINDOW_BITS_MAX: u32 = 1 << 20;
+/// Largest window, in bits: [`hypotheses`] runs on the async worker, so the window stays
+/// where it keeps to [`HYPOTHESES_BUDGET_MS`]. Measured in a release build on the field host (2026-11-04,
+/// `hypotheses_timing_on_64_and_256_kbit`): 64 kbit 19.6 ms framed, 8.6 ms random,
+/// 9.5 ms repeating; 256 kbit 55.3 ms framed, 37.5 ms random, 47.7 ms repeating.
+pub const WINDOW_BITS_MAX: u32 = 262_144;
 
 /// Smallest window, in bits.
 pub const WINDOW_BITS_MIN: u32 = 64;
@@ -110,7 +113,7 @@ fn default_window_bits() -> u32 {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct BitViewParams {
-    /// The window, in bits, 64..=1048576.
+    /// The window, in bits, 64..=262144.
     #[serde(default = "default_window_bits")]
     pub window_bits: u32,
 }
@@ -220,20 +223,54 @@ fn runs_of(runs: &[(u8, u32)]) -> Runs {
     }
 }
 
-/// How much the run lengths of `bits` look like those of fair random bits: 1 less the
-/// total variation distance between the share of runs of each length (zeros and ones
-/// together, binned as [`Runs`]) and the geometric `2^-length` that random bits give,
-/// the last bin taking the tail. 0 with no runs.
-fn flatness(bits: &[u8]) -> f32 {
-    let runs = run_lengths(bits);
-    if runs.is_empty() {
+/// The window's segments: `starts[k]..ends[k]` of the concatenated bits is segment `k`.
+/// Words, runs, periods and frames never span two segments.
+struct Segments {
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+}
+
+impl Segments {
+    fn of(segments: &[&[u8]]) -> Self {
+        let mut starts = Vec::with_capacity(segments.len());
+        let mut ends = Vec::with_capacity(segments.len());
+        let mut at = 0;
+        for s in segments {
+            starts.push(at);
+            at += s.len();
+            ends.push(at);
+        }
+        Self { starts, ends }
+    }
+
+    /// The segment holding bit `p` of the concatenation.
+    fn index_of(&self, p: usize) -> usize {
+        self.starts.partition_point(|&s| s <= p) - 1
+    }
+
+    /// One past the last bit of the segment holding bit `p`.
+    fn end_of(&self, p: usize) -> usize {
+        self.ends[self.index_of(p)]
+    }
+}
+
+/// How much the run lengths of `segments` look like those of fair random bits: 1 less
+/// the total variation distance between the share of runs of each length (zeros and
+/// ones together, binned as [`Runs`], each segment's runs its own) and the geometric
+/// `2^-length` that random bits give, the last bin taking the tail. 0 with no runs.
+fn flatness(segments: &[Vec<u8>]) -> f32 {
+    let mut hist = [0u32; RUN_HISTOGRAM_MAX];
+    let mut total = 0usize;
+    for s in segments {
+        for (_, l) in run_lengths(s) {
+            hist[run_bin(l)] += 1;
+            total += 1;
+        }
+    }
+    if total == 0 {
         return 0.0;
     }
-    let mut hist = [0u32; RUN_HISTOGRAM_MAX];
-    for &(_, l) in &runs {
-        hist[run_bin(l)] += 1;
-    }
-    let total = runs.len() as f64;
+    let total = total as f64;
     let tv: f64 = hist
         .iter()
         .enumerate()
@@ -245,18 +282,25 @@ fn flatness(bits: &[u8]) -> f32 {
     (1.0 - tv / 2.0).clamp(0.0, 1.0) as f32
 }
 
-/// The line code scores of `bits`: `nrz` the [`flatness`] of the bits as they are,
+/// The line code scores of `segments`: `nrz` the [`flatness`] of the bits as they are,
 /// `nrzi` that of the bits decoded as NRZI (a bit is a change of level), `differential`
 /// that of the bits XORed with the previous one (on two levels the same decoding as
 /// NRZI, so the same score), `manchester` the share of runs of at most
 /// [`MANCHESTER_RUN_MAX`] bits (1 when no run exceeds it). `likely` is the highest,
 /// `nrz` unless another beats it by more than [`ENCODING_MARGIN`] (random-looking bits
 /// read about the same under every decoding), then the first of `manchester`, `nrzi`,
-/// `differential` on a tie.
-fn encoding_of(bits: &[u8], runs: &[(u8, u32)]) -> Encoding {
-    let changes: Vec<u8> = bits.windows(2).map(|w| u8::from(w[0] != w[1])).collect();
-    let xored: Vec<u8> = bits.windows(2).map(|w| w[0] ^ w[1]).collect();
-    let nrz = flatness(bits);
+/// `differential` on a tie. Each decoding is taken within a segment.
+fn encoding_of(segments: &[&[u8]], runs: &[(u8, u32)]) -> Encoding {
+    let plain: Vec<Vec<u8>> = segments.iter().map(|s| s.to_vec()).collect();
+    let changes: Vec<Vec<u8>> = segments
+        .iter()
+        .map(|s| s.windows(2).map(|w| u8::from(w[0] != w[1])).collect())
+        .collect();
+    let xored: Vec<Vec<u8>> = segments
+        .iter()
+        .map(|s| s.windows(2).map(|w| w[0] ^ w[1]).collect())
+        .collect();
+    let nrz = flatness(&plain);
     let nrzi = flatness(&changes);
     let differential = flatness(&xored);
     let manchester = if runs.is_empty() {
@@ -287,22 +331,32 @@ fn mask(width: u32) -> u64 {
     u64::MAX >> (u64::BITS - width)
 }
 
-/// The `width`-bit word at every bit offset of `bits`, MSB first.
-fn words(bits: &[u8], width: u32) -> Vec<u64> {
+/// The `width`-bit words of the segments, MSB first, at every bit offset where the
+/// word lies inside one segment: `values[i]` starts at bit `pos[i]` of the
+/// concatenation.
+struct Words {
+    values: Vec<u64>,
+    pos: Vec<usize>,
+}
+
+fn words(segments: &[&[u8]], width: u32) -> Words {
     let w = width as usize;
-    if bits.len() < w {
-        return Vec::new();
-    }
     let m = mask(width);
-    let mut v = 0u64;
-    let mut out = Vec::with_capacity(bits.len() - w + 1);
-    for (i, &b) in bits.iter().enumerate() {
-        v = ((v << 1) | u64::from(b)) & m;
-        if i + 1 >= w {
-            out.push(v);
+    let mut values = Vec::new();
+    let mut pos = Vec::new();
+    let mut at = 0;
+    for s in segments {
+        let mut v = 0u64;
+        for (i, &b) in s.iter().enumerate() {
+            v = ((v << 1) | u64::from(b)) & m;
+            if i + 1 >= w {
+                values.push(v);
+                pos.push(at + i + 1 - w);
+            }
         }
+        at += s.len();
     }
-    out
+    Words { values, pos }
 }
 
 /// A run (all zeros, all ones) or one of the two alternations, which every lag and
@@ -322,23 +376,31 @@ fn contains(long: u64, long_w: u32, short: u64, short_w: u32) -> bool {
 /// lost in the ±1 autocorrelation (16 agreeing bits per period against the payload's
 /// noise), so the autocorrelation is taken over word identity instead: a chain at lag
 /// `L` is an offset whose [`PERIOD_WORD_BITS`]-bit word (not [`uninformative`]) recurs
-/// at `+L` and `+2L`, which random bits give about once per 2^32 offsets. Each
-/// occurrence is paired with its next [`PERIOD_NEIGHBOURS`] occurrences, lags
-/// [`PERIOD_MIN_LAG`]..=window/4. `score` is the chains at `L` over the chains a
-/// window repeating every `L` bits would hold (`floor((n - 16) / L) - 1`, the zero-lag
-/// count scaled to the lag), capped at 1. A lag needs [`PERIOD_MIN_CHAINS`]; the
-/// strongest are listed (the shorter on a tie), each skipping a multiple of one already
-/// listed, at most [`PERIOD_CANDIDATES_MAX`].
-fn periods(n: usize, w16: &[u64]) -> Vec<Period> {
-    let max_lag = n / PERIOD_MAX_LAG_DIVISOR;
+/// at `+L` and `+2L` in the same segment, which random bits give about once per 2^32
+/// offsets. Each occurrence is paired with its next [`PERIOD_NEIGHBOURS`] occurrences,
+/// lags [`PERIOD_MIN_LAG`]..=(the longest segment)/4. `score` is the chains at `L`
+/// over the chains segments repeating every `L` bits would hold (the sum over the
+/// segments of `floor((len - 16) / L) - 1`, the zero-lag count scaled to the lag),
+/// capped at 1. A lag needs [`PERIOD_MIN_CHAINS`]; the strongest are listed (the
+/// shorter on a tie), each skipping a multiple of one already listed, at most
+/// [`PERIOD_CANDIDATES_MAX`].
+fn periods(segs: &Segments, w16: &Words) -> Vec<Period> {
+    let lens: Vec<usize> = segs
+        .starts
+        .iter()
+        .zip(&segs.ends)
+        .map(|(a, b)| b - a)
+        .collect();
+    let max_lag = lens.iter().copied().max().unwrap_or(0) / PERIOD_MAX_LAG_DIVISOR;
     if max_lag < PERIOD_MIN_LAG as usize {
         return Vec::new();
     }
     let mut keyed: Vec<u64> = w16
+        .values
         .iter()
-        .enumerate()
-        .filter(|(_, v)| !uninformative(**v, PERIOD_WORD_BITS))
-        .map(|(i, &v)| (v << u32::BITS) | i as u64)
+        .zip(&w16.pos)
+        .filter(|(v, _)| !uninformative(**v, PERIOD_WORD_BITS))
+        .map(|(&v, &p)| (v << u32::BITS) | p as u64)
         .collect();
     keyed.sort_unstable();
     let mut chains = vec![0u32; max_lag + 1];
@@ -351,13 +413,16 @@ fn periods(n: usize, w16: &[u64]) -> Vec<Period> {
             .map(|k| (k & u64::from(u32::MAX)) as usize)
             .collect();
         for j in 0..pos.len() {
+            let seg_end = segs.end_of(pos[j]);
             for k in j + 1..pos.len().min(j + 1 + PERIOD_NEIGHBOURS) {
                 let lag = pos[k] - pos[j];
-                if lag > max_lag {
+                if lag > max_lag || pos[k] >= seg_end {
                     break;
                 }
+                let third = pos[k] + lag;
                 if lag >= PERIOD_MIN_LAG as usize
-                    && pos[k + 1..].binary_search(&(pos[k] + lag)).is_ok()
+                    && third < seg_end
+                    && pos[k + 1..].binary_search(&third).is_ok()
                 {
                     chains[lag] += 1;
                 }
@@ -365,13 +430,16 @@ fn periods(n: usize, w16: &[u64]) -> Vec<Period> {
         }
         start = end;
     }
-    let span = n - PERIOD_WORD_BITS as usize;
     let mut scored: Vec<Period> = chains
         .iter()
         .enumerate()
         .filter(|&(_, &c)| c >= PERIOD_MIN_CHAINS)
         .map(|(lag, &c)| {
-            let possible = (span / lag).saturating_sub(1).max(1);
+            let possible: usize = lens
+                .iter()
+                .map(|&n| (n.saturating_sub(PERIOD_WORD_BITS as usize) / lag).saturating_sub(1))
+                .sum::<usize>()
+                .max(1);
             Period {
                 lag: lag as u32,
                 score: (c as f32 / possible as f32).min(1.0),
@@ -391,11 +459,13 @@ fn periods(n: usize, w16: &[u64]) -> Vec<Period> {
     out
 }
 
-/// A sync candidate with its occurrences.
+/// A sync candidate with its occurrences (bit offsets of the concatenation, ascending)
+/// and the segment of each.
 struct Sync {
     value: u64,
     width: u32,
     positions: Vec<usize>,
+    segments: Vec<usize>,
 }
 
 impl Sync {
@@ -407,31 +477,40 @@ impl Sync {
         )
     }
 
+    /// The mean gap from one occurrence to the next within a segment; 0 when no
+    /// segment holds two.
     fn mean_gap(&self) -> f32 {
-        match (self.positions.first(), self.positions.last()) {
-            (Some(&a), Some(&b)) if self.positions.len() > 1 => {
-                (b - a) as f32 / (self.positions.len() - 1) as f32
+        let (mut span, mut gaps) = (0usize, 0usize);
+        for k in 1..self.positions.len() {
+            if self.segments[k] == self.segments[k - 1] {
+                span += self.positions[k] - self.positions[k - 1];
+                gaps += 1;
             }
-            _ => 0.0,
+        }
+        if gaps == 0 {
+            0.0
+        } else {
+            span as f32 / gaps as f32
         }
     }
 }
 
 /// Sync candidates: for each width of [`SYNC_WORD_BITS`], the words (not
-/// [`uninformative`]) at every bit offset that occur at least `chance + 6 sqrt(chance) +
-/// 3` times, `chance` being `(n - width + 1) / 2^width`, what random bits give; listed
-/// by count, then width (wider first), a word skipped when a listed wider word contains
-/// it (its occurrences are that word's), at most [`SYNC_CANDIDATES_MAX`].
-fn syncs(bits: &[u8], by_width: &[(u32, Vec<u64>)]) -> Vec<Sync> {
-    let n = bits.len();
+/// [`uninformative`]) at every bit offset of every segment that occur, over all the
+/// segments, at least `chance + 6 sqrt(chance) + 3` times, `chance` being the words of
+/// that width over `2^width`, what random bits give; listed by count, then width
+/// (wider first), a word skipped when a listed wider word contains it (its occurrences
+/// are that word's), at most [`SYNC_CANDIDATES_MAX`].
+fn syncs(segs: &Segments, by_width: &[(u32, Words)]) -> Vec<Sync> {
     let mut pool: Vec<(u32, u32, u64)> = Vec::new(); // (count, width, value)
     for (width, ws) in by_width {
-        if ws.is_empty() {
+        if ws.values.is_empty() {
             continue;
         }
-        let chance = (n - *width as usize + 1) as f64 / 2f64.powi(*width as i32);
+        let chance = ws.values.len() as f64 / 2f64.powi(*width as i32);
         let need = chance + SYNC_CHANCE_SIGMAS * chance.sqrt() + SYNC_MIN_COUNT;
         let mut sorted: Vec<u64> = ws
+            .values
             .iter()
             .copied()
             .filter(|&v| !uninformative(v, *width))
@@ -460,15 +539,19 @@ fn syncs(bits: &[u8], by_width: &[(u32, Vec<u64>)]) -> Vec<Sync> {
     kept.into_iter()
         .map(|(width, value)| {
             let ws = &by_width.iter().find(|(w, _)| *w == width).unwrap().1;
+            let positions: Vec<usize> = ws
+                .values
+                .iter()
+                .zip(&ws.pos)
+                .filter(|&(&v, _)| v == value)
+                .map(|(_, &p)| p)
+                .collect();
+            let segments = positions.iter().map(|&p| segs.index_of(p)).collect();
             Sync {
                 value,
                 width,
-                positions: ws
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &v)| v == value)
-                    .map(|(i, _)| i)
-                    .collect(),
+                positions,
+                segments,
             }
         })
         .collect()
@@ -489,24 +572,25 @@ fn value_of(bits: &[u8]) -> u64 {
     bits.iter().fold(0u64, |acc, &v| (acc << 1) | u64::from(v))
 }
 
-/// The frames of `period` bits cut at the occurrences of `sync` that fit the window,
-/// at most [`CRC_MAX_FRAMES`].
-fn period_frames<'a>(bits: &'a [u8], sync: &Sync, period: usize) -> Vec<&'a [u8]> {
+/// The frames of `period` bits cut at the occurrences of `sync` that fit inside their
+/// segment, at most [`CRC_MAX_FRAMES`].
+fn period_frames<'a>(bits: &'a [u8], segs: &Segments, sync: &Sync, period: usize) -> Vec<&'a [u8]> {
     sync.positions
         .iter()
-        .filter(|&&s| s + period <= bits.len())
+        .zip(&sync.segments)
+        .filter(|&(&s, &k)| s + period <= segs.ends[k])
         .take(CRC_MAX_FRAMES)
-        .map(|&s| &bits[s..s + period])
+        .map(|(&s, _)| &bits[s..s + period])
         .collect()
 }
 
-/// The frames from each occurrence of `sync` to the next, for frames of varying length
-/// that abut, at most [`CRC_MAX_FRAMES`].
+/// The frames from each occurrence of `sync` to the next in the same segment, for
+/// frames of varying length that abut, at most [`CRC_MAX_FRAMES`].
 fn next_sync_frames<'a>(bits: &'a [u8], sync: &Sync) -> Vec<&'a [u8]> {
-    sync.positions
-        .windows(2)
+    (1..sync.positions.len())
+        .filter(|&k| sync.segments[k] == sync.segments[k - 1])
         .take(CRC_MAX_FRAMES)
-        .map(|w| &bits[w[0]..w[1]])
+        .map(|k| &bits[sync.positions[k - 1]..sync.positions[k]])
         .collect()
 }
 
@@ -562,42 +646,47 @@ fn reflect(v: u64, spec: &CrcSpec) -> u64 {
     v.reverse_bits() >> (u64::BITS - u32::from(spec.width))
 }
 
-/// What one window of bits suggests (see each field's type): the run-length histogram,
-/// the frame periods (see `periods`), the sync candidates, the line code scores and the
-/// CRC candidates. The CRC search tries each sync candidate with frames of each listed
+/// What one window of bits suggests (see each field's type), the window given as its
+/// segments (the stretches of contiguous bits, one per capture of a set): the
+/// run-length histogram, the frame periods (see `periods`), the sync candidates, the
+/// line code scores and the CRC candidates. No word, run, period or frame spans two
+/// segments; the counts sum over all of them, and a gap or a next-sync frame is taken
+/// within one. The CRC search tries each sync candidate with frames of each listed
 /// period and with frames that run from each occurrence to the next (listed with
 /// `period_bits` 0), so at most [`SYNC_CANDIDATES_MAX`] × ([`PERIOD_CANDIDATES_MAX`] + 1)
-/// hypotheses of [`CRC_MAX_FRAMES`] frames, within
-/// [`HYPOTHESES_BUDGET_MS`] on a 64 kbit window; the most frames first, at most
-/// [`CRC_CANDIDATES_MAX`]. `summary` reads `sync 0x<word> ×<count>
-/// every <gap> bits, <likely>, <crc> <frames>/<checked>` for the first sync and CRC
-/// candidates (the CRC part only when one checks), or `no sync candidate`.
-pub fn hypotheses(bits: &[u8]) -> Hypotheses {
-    let runs = run_lengths(bits);
-    let encoding = encoding_of(bits, &runs);
-    let by_width: Vec<(u32, Vec<u64>)> = SYNC_WORD_BITS
+/// hypotheses of [`CRC_MAX_FRAMES`] frames, within [`HYPOTHESES_BUDGET_MS`] on a
+/// [`WINDOW_BITS_DEFAULT`] window; the most frames first, at most
+/// [`CRC_CANDIDATES_MAX`]. `summary` reads `sync 0x<word> ×<count> every <gap> bits,
+/// <likely>, <crc> <frames>/<checked>` for the first sync and CRC candidates (the CRC
+/// part only when one checks), or `no sync candidate`.
+pub fn hypotheses(segments: &[&[u8]]) -> Hypotheses {
+    let segs = Segments::of(segments);
+    let bits: Vec<u8> = segments.concat();
+    let runs: Vec<(u8, u32)> = segments.iter().flat_map(|s| run_lengths(s)).collect();
+    let encoding = encoding_of(segments, &runs);
+    let by_width: Vec<(u32, Words)> = SYNC_WORD_BITS
         .iter()
-        .map(|&w| (w, words(bits, w)))
+        .map(|&w| (w, words(segments, w)))
         .collect();
     let w16 = &by_width
         .iter()
         .find(|(w, _)| *w == PERIOD_WORD_BITS)
         .unwrap()
         .1;
-    let period_bits = periods(bits.len(), w16);
-    let syncs = syncs(bits, &by_width);
+    let period_bits = periods(&segs, w16);
+    let syncs = syncs(&segs, &by_width);
     let mut crc_candidates = Vec::new();
     for s in &syncs {
         for p in &period_bits {
             crcs_for(
-                &period_frames(bits, s, p.lag as usize),
+                &period_frames(&bits, &segs, s, p.lag as usize),
                 s,
                 p.lag,
                 &mut crc_candidates,
             );
         }
         crcs_for(
-            &next_sync_frames(bits, s),
+            &next_sync_frames(&bits, s),
             s,
             NEXT_SYNC_PERIOD,
             &mut crc_candidates,
@@ -640,7 +729,8 @@ pub fn hypotheses(bits: &[u8]) -> Hypotheses {
     }
 }
 
-/// Where one `bits` event's bits sit in the segment, for the window's times.
+/// Where one `bits` event's bits sit in the window (positions count the bits pushed
+/// since the window opened), for the window's times.
 struct Piece {
     start: u64,
     t_ns: u64,
@@ -648,18 +738,24 @@ struct Piece {
 }
 
 impl Piece {
-    fn time(&self, offset: u64) -> u64 {
-        self.t_ns + ((offset - self.start) as f64 * self.bit_ns) as u64
+    fn time(&self, at: u64) -> u64 {
+        self.t_ns + ((at - self.start) as f64 * self.bit_ns) as u64
     }
 }
 
-/// The window over one segment.
+/// The window over the segments of a set.
 struct Window {
     size: usize,
     bits: VecDeque<u8>,
     pieces: VecDeque<Piece>,
-    /// The offset one past the last bit.
+    /// Where each segment starts, in window positions; the first may lie before the
+    /// window's first bit.
+    segments: VecDeque<u64>,
+    /// The position one past the last bit.
     end: u64,
+    /// The slicer's `offset_bits` one past the current segment's last bit; `None` when
+    /// the next `bits` event starts a segment (at the first and after a lag).
+    seg_end: Option<u64>,
     /// Bits added toward the next quarter: the publishing cadence only.
     grown: usize,
     /// Bits added since the last event, which a segment's or the input's end publishes.
@@ -668,20 +764,44 @@ struct Window {
 }
 
 impl Window {
+    fn new(size: usize, prov: Provenance) -> Self {
+        Self {
+            size,
+            bits: VecDeque::with_capacity(size),
+            pieces: VecDeque::new(),
+            segments: VecDeque::new(),
+            end: 0,
+            seg_end: None,
+            grown: 0,
+            unpublished: 0,
+            prov,
+        }
+    }
+
     fn start(&self) -> u64 {
         self.end - self.bits.len() as u64
     }
 
+    /// The time of the window's first bit.
+    fn first_t(&self) -> u64 {
+        let first = &self.pieces[0];
+        first.time(self.start().max(first.start))
+    }
+
     fn push(&mut self, b: &BitsIn) {
-        self.bits.extend(&b.bits);
-        let excess = self.bits.len().saturating_sub(self.size);
-        self.bits.drain(..excess);
+        if self.seg_end != Some(b.offset_bits) {
+            self.segments.push_back(self.end);
+        }
         self.pieces.push_back(Piece {
-            start: b.offset_bits,
+            start: self.end,
             t_ns: b.t_ns,
             bit_ns: b.bit_ns,
         });
-        self.end = b.end();
+        self.bits.extend(&b.bits);
+        self.end += b.bits.len() as u64;
+        self.seg_end = Some(b.end());
+        let excess = self.bits.len().saturating_sub(self.size);
+        self.bits.drain(..excess);
         self.grown += b.bits.len();
         self.unpublished += b.bits.len();
         self.prov = b.prov.clone();
@@ -689,18 +809,26 @@ impl Window {
         while self.pieces.len() > 1 && self.pieces[1].start <= start {
             self.pieces.pop_front();
         }
+        while self.segments.len() > 1 && self.segments[1] <= start {
+            self.segments.pop_front();
+        }
     }
 
     /// The window's `hypotheses` event, noted to the job; nothing left unpublished.
     fn publish(&mut self, events: &StreamId, ctx: &StageContext) -> Frame {
         self.unpublished = 0;
         let start = self.start();
+        let t0 = self.first_t();
+        let t1 = self.pieces.back().unwrap().time(self.end);
+        let mut cuts: Vec<usize> = self
+            .segments
+            .iter()
+            .map(|&s| (s.max(start) - start) as usize)
+            .collect();
         let bits = self.bits.make_contiguous();
-        let h = hypotheses(bits);
-        let first = &self.pieces[0];
-        let t0 = first.time(start.max(first.start));
-        let last = self.pieces.back().unwrap();
-        let t1 = last.time(self.end);
+        cuts.push(bits.len());
+        let segments: Vec<&[u8]> = cuts.windows(2).map(|c| &bits[c[0]..c[1]]).collect();
+        let h = hypotheses(&segments);
         let mut ev = serde_json::to_value(&h).expect("hypotheses serialise");
         let obj = ev.as_object_mut().expect("an object");
         obj.insert("protocol".into(), "hypotheses".into());
@@ -716,12 +844,16 @@ impl Window {
     }
 }
 
-/// Keeps the last `window_bits` bits of a `bits` segment (a `bits` event whose
-/// `offset_bits` is not the previous one's end, or a lag, starts a new one) and
-/// publishes a `hypotheses` event ([`Hypotheses`]' fields, `protocol`, `window_bits`
-/// the bits it covers and `t_ns` its first bit's time) each time the window has grown by
-/// a quarter of `window_bits` since the last, and once more when a segment or the input
-/// ends with growth unpublished. Notes the latest under `bit_view`.
+/// Keeps the last `window_bits` bits of the `bits` segments of a set (a `bits` event
+/// whose `offset_bits` is not the previous one's end, or the first after a lag, starts
+/// a new segment, one per capture of the set) and publishes a `hypotheses` event
+/// ([`Hypotheses`]' fields over the window's segments, `protocol`, `window_bits` the
+/// bits it covers and `t_ns` its first bit's time) each time the window has grown by a
+/// quarter of `window_bits` since the last, and once more when a segment or the input
+/// ends with growth unpublished. The window clears only by sliding past `window_bits`
+/// and when a looping replay restarts (a segment starting at `offset_bits` 0 at or
+/// before the window's first bit's time), so a pass is never counted twice. Notes the
+/// latest under `bit_view`: the set-wide view.
 pub struct BitViewStage {
     spec: StageSpec,
 }
@@ -791,30 +923,29 @@ impl Stage for BitViewStage {
                 },
                 Some(Input::Lagged { .. }) | None => None,
             };
-            if win
-                .as_ref()
-                .is_some_and(|w| b.as_ref().is_none_or(|b| b.offset_bits != w.end))
-            {
-                let mut w = win.take().unwrap();
-                if w.unpublished > 0 {
-                    out.push(w.publish(&events, &ctx));
-                }
-            }
             let Some(b) = b else {
+                // A lag or the input's end: publish what is pending; after a lag the
+                // next bits start a new segment.
+                if let Some(w) = win.as_mut() {
+                    if w.unpublished > 0 {
+                        out.push(w.publish(&events, &ctx));
+                    }
+                    w.seg_end = None;
+                }
                 return Ok(out);
             };
             if b.bits.is_empty() {
                 return Ok(out);
             }
-            let w = win.get_or_insert_with(|| Window {
-                size,
-                bits: VecDeque::with_capacity(size),
-                pieces: VecDeque::new(),
-                end: b.offset_bits,
-                grown: 0,
-                unpublished: 0,
-                prov: b.prov.clone(),
-            });
+            let w = win.get_or_insert_with(|| Window::new(size, b.prov.clone()));
+            if !w.bits.is_empty() && w.seg_end != Some(b.offset_bits) {
+                if w.unpublished > 0 {
+                    out.push(w.publish(&events, &ctx));
+                }
+                if b.offset_bits == 0 && b.t_ns <= w.first_t() {
+                    *w = Window::new(size, b.prov.clone());
+                }
+            }
             w.push(&b);
             if w.grown >= quarter {
                 w.grown %= quarter;
@@ -914,11 +1045,16 @@ pub(crate) mod test_streams {
     /// `bits` as `bits` event frames cut at `splits` (ascending), one segment from
     /// [`T0`] at [`BAUD`].
     pub fn bits_frames(bits: &[u8], splits: &[usize]) -> Vec<Frame> {
+        bits_frames_at(bits, splits, T0)
+    }
+
+    /// [`bits_frames`] with the segment's first bit at `t0`.
+    pub fn bits_frames_at(bits: &[u8], splits: &[usize], t0: u64) -> Vec<Frame> {
         let id = StreamId::new();
         let mut cuts = vec![0];
         cuts.extend_from_slice(splits);
         cuts.push(bits.len());
-        let t = |k: usize| T0 + (k as u128 * 1_000_000_000 / BAUD as u128) as u64;
+        let t = |k: usize| t0 + (k as u128 * 1_000_000_000 / BAUD as u128) as u64;
         cuts.windows(2)
             .map(|w| {
                 Frame::new(
@@ -1000,11 +1136,13 @@ mod tests {
 
     use serde_json::json;
     use zeta_core::stage::Stage;
-    use zeta_core::stream::Payload;
+    use zeta_core::stream::{Frame, Payload};
 
     use super::test_streams::{
-        bits_frames, framed_stream, framed_stream_of, random_bits, run_events,
+        T0, bits_frames, bits_frames_at, framed_stream, framed_stream_of, random_bits, run_events,
     };
+
+    const SECOND_NS: u64 = 1_000_000_000;
     use super::{
         BitViewStage, CRC_CANDIDATES_MAX, CRC_MAX_FRAMES, CRC_MIN_FRAMES, NEXT_SYNC_PERIOD,
         hypotheses,
@@ -1012,7 +1150,7 @@ mod tests {
 
     #[test]
     fn a_framed_stream_gives_its_sync_period_and_crc() {
-        let h = hypotheses(&framed_stream(14, 136, 1));
+        let h = hypotheses(&[&framed_stream(14, 136, 1)]);
         assert_eq!(h.sync_candidates[0].word, "2dd4", "{:?}", h.sync_candidates);
         assert!(
             h.period_bits.iter().any(|p| p.lag == 1120),
@@ -1039,13 +1177,13 @@ mod tests {
             .into_iter()
             .flat_map(|b| [b, b ^ 1])
             .collect();
-        let h = hypotheses(&bits);
+        let h = hypotheses(&[&bits]);
         assert_eq!(h.encoding.likely, "manchester", "{:?}", h.encoding);
     }
 
     #[test]
     fn random_bits_give_no_sync_candidate_and_say_so() {
-        let h = hypotheses(&random_bits(65_536, 11));
+        let h = hypotheses(&[&random_bits(65_536, 11)]);
         assert!(h.crc_candidates.is_empty(), "{:?}", h.crc_candidates);
         assert!(
             h.period_bits.iter().all(|p| p.score <= 0.5),
@@ -1103,12 +1241,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_seam_clears_the_window() {
+    async fn a_seam_starts_a_segment_and_a_restart_clears_the_window() {
         let bits = random_bits(3000, 4);
+        // The next capture of a set: offset_bits restarts at 0, later in time.
+        let mut input = bits_frames(&bits[..2000], &[1000]);
+        input.extend(bits_frames_at(&bits[2000..], &[], T0 + 10 * SECOND_NS));
+        let (events, _) = run_events(&BitViewStage::new(), json!({}), input).await;
+        assert_eq!(events.last().unwrap()["window_bits"], 3000);
+        // A looping replay back at the set's start: the window clears.
         let mut input = bits_frames(&bits[..2000], &[1000]);
         input.extend(bits_frames(&bits[2000..], &[]));
         let (events, _) = run_events(&BitViewStage::new(), json!({}), input).await;
         assert_eq!(events.last().unwrap()["window_bits"], 1000);
+    }
+
+    /// `segments` segments of two framed frames (a 30-byte body) each.
+    fn set_of_segments(segments: usize) -> Vec<Vec<u8>> {
+        (0..segments)
+            .map(|k| framed_stream(2, 30, 100 + k as u64))
+            .collect()
+    }
+
+    /// The segments as `bits` frames, two per segment, the segments ten seconds apart.
+    fn set_frames(segments: &[Vec<u8>]) -> Vec<Frame> {
+        segments
+            .iter()
+            .enumerate()
+            .flat_map(|(k, s)| bits_frames_at(s, &[s.len() / 2], T0 + 10 * k as u64 * SECOND_NS))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_window_spans_the_segments_of_a_set() {
+        let segments = set_of_segments(6);
+        for s in &segments {
+            let alone = hypotheses(&[s]);
+            assert!(
+                alone.sync_candidates.is_empty(),
+                "{:?}",
+                alone.sync_candidates
+            );
+            assert!(
+                alone.crc_candidates.is_empty(),
+                "{:?}",
+                alone.crc_candidates
+            );
+        }
+        let (_, context) = run_events(&BitViewStage::new(), json!({}), set_frames(&segments)).await;
+        let view = &context["bit_view"];
+        assert_eq!(view["sync_candidates"][0]["word"], "2dd4", "{view}");
+        assert_eq!(view["sync_candidates"][0]["count"], 12, "{view}");
+        // The gap is taken within a segment: one frame of 16 + 240 + 16 bits.
+        assert_eq!(view["sync_candidates"][0]["mean_gap_bits"], 272.0, "{view}");
+        let crcs = view["crc_candidates"].as_array().unwrap();
+        assert!(
+            crcs.iter().any(|c| c["crc"] == "crc16-ccitt"
+                && c["period_bits"] == NEXT_SYNC_PERIOD
+                && c["frames"].as_u64().unwrap() as usize >= CRC_MIN_FRAMES),
+            "{view}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_looping_replay_does_not_count_a_pass_twice() {
+        let segments = set_of_segments(3);
+        let mut input = set_frames(&segments);
+        input.extend(set_frames(&segments));
+        let (_, context) = run_events(&BitViewStage::new(), json!({}), input).await;
+        assert_eq!(
+            context["bit_view"]["sync_candidates"][0]["count"], 6,
+            "{}",
+            context["bit_view"]
+        );
     }
 
     #[tokio::test]
@@ -1129,7 +1333,7 @@ mod tests {
         let s = BitViewStage::new();
         assert_eq!(
             s.check_params(&json!({"window_bits": 32})),
-            Err("window_bits: 64..=1048576".into())
+            Err("window_bits: 64..=262144".into())
         );
         assert!(s.check_params(&json!({"window": 4096})).is_err());
         assert!(s.check_params(&json!({})).is_ok());
@@ -1138,7 +1342,7 @@ mod tests {
     #[test]
     fn abutting_frames_of_varying_length_give_their_crc() {
         let lengths: Vec<usize> = (0..12).map(|k| [100, 120, 136][k % 3]).collect();
-        let h = hypotheses(&framed_stream_of(&lengths, 6));
+        let h = hypotheses(&[&framed_stream_of(&lengths, 6)]);
         assert_eq!(h.sync_candidates[0].word, "2dd4", "{:?}", h.sync_candidates);
         assert!(
             h.crc_candidates.iter().any(|c| c.crc == "crc16-ccitt"
@@ -1151,7 +1355,7 @@ mod tests {
 
     #[test]
     fn the_crc_search_is_bounded() {
-        let h = hypotheses(&framed_stream(200, 136, 2));
+        let h = hypotheses(&[&framed_stream(200, 136, 2)]);
         assert!(!h.crc_candidates.is_empty());
         assert!(
             h.crc_candidates
@@ -1163,27 +1367,30 @@ mod tests {
         assert!(h.crc_candidates.len() <= CRC_CANDIDATES_MAX);
     }
 
-    /// The [`super::HYPOTHESES_BUDGET_MS`] budget on 64 kbit; run with
+    /// The [`super::HYPOTHESES_BUDGET_MS`] budget on 64 kbit and the time on a
+    /// [`super::WINDOW_BITS_MAX`] window; run with
     /// `cargo test --release -p zeta-dsp hypotheses_timing -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing, release build"]
-    fn hypotheses_timing_on_64_kbit() {
-        let mut framed = framed_stream(59, 136, 1);
-        framed.truncate(65_536);
-        let repeating: Vec<u8> = (0..65_536).map(|i| u8::from(i % 8 >= 4)).collect();
-        for (name, bits) in [
-            ("framed", framed),
-            ("random", random_bits(65_536, 11)),
-            ("repeating 0x0f", repeating),
-        ] {
-            let t = Instant::now();
-            let h = hypotheses(&bits);
-            eprintln!(
-                "hypotheses on {} {name} bits: {:?} ({})",
-                bits.len(),
-                t.elapsed(),
-                h.summary
-            );
+    fn hypotheses_timing_on_64_and_256_kbit() {
+        for n in [65_536, super::WINDOW_BITS_MAX as usize] {
+            let mut framed = framed_stream(n / 1120 + 1, 136, 1);
+            framed.truncate(n);
+            let repeating: Vec<u8> = (0..n).map(|i| u8::from(i % 8 >= 4)).collect();
+            for (name, bits) in [
+                ("framed", framed),
+                ("random", random_bits(n, 11)),
+                ("repeating 0x0f", repeating),
+            ] {
+                let t = Instant::now();
+                let h = hypotheses(&[&bits]);
+                eprintln!(
+                    "hypotheses on {} {name} bits: {:?} ({})",
+                    bits.len(),
+                    t.elapsed(),
+                    h.summary
+                );
+            }
         }
     }
 }

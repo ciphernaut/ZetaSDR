@@ -717,3 +717,33 @@ async fn a_restart_keeps_the_mute_in_the_mix() {
         json!([{"job": ch.0, "source": "a", "center_hz": CH}])
     );
 }
+
+/// A `graph_start` of a graph whose root is a `mix` node: a mix by another name.
+async fn graph_mix(node: &Node) -> JobId {
+    let graph = serde_json::from_value(json!({
+        "id": "g",
+        "nodes": [{"id": "mix", "kind": "mix", "params": {"sources": null}}],
+        "edges": [],
+    }))
+    .unwrap();
+    job_of(node, Op::GraphStart { graph }).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_mix_started_by_graph_start_is_not_mixed() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open_on(dir.path(), &[Radio::new("a")]).await;
+    let ch = demod(&node, "a", CH).await;
+    let m = mix(&node, None).await;
+    let (g1, g2) = (graph_mix(&node).await, graph_mix(&node).await);
+    assert_eq!(record(&node, &g1).kind, "graph");
+    // Each reads the demodulator only: neither the mix nor the other graph mix.
+    for id in [&m, &g1, &g2] {
+        until_inputs(&node, id, 1).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    for id in [&m, &g1, &g2] {
+        assert_eq!(mix_ctx(&node, id)["inputs"], 1, "{id:?}");
+    }
+    assert!(hears(&node, &m, &ch).await);
+}

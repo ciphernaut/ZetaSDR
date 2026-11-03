@@ -36,6 +36,10 @@ pub const CAPTURE_IN_KIND: &str = "capture_in";
 /// `loop_pause_ms` by default: the wait after the last block of a pass.
 pub const LOOP_PAUSE_MS_DEFAULT: u64 = 500;
 
+/// The least `loop_pause_ms` of an unpaced loop (`loop: true`, `realtime: false`): with
+/// no pause it would replay as fast as the bus takes blocks, without end.
+pub const LOOP_PAUSE_MS_MIN_UNPACED: u64 = 100;
+
 /// The length of one published block, and the wall time one takes with `realtime`.
 pub const BLOCK_MS: u64 = 50;
 
@@ -60,7 +64,8 @@ pub struct CaptureInParams {
     /// Pace the blocks at the captures' rate; unpaced otherwise.
     #[serde(default = "default_true")]
     pub realtime: bool,
-    /// The wait after the last block of a pass, in milliseconds.
+    /// The wait after the last block of a pass, in milliseconds; at least
+    /// [`LOOP_PAUSE_MS_MIN_UNPACED`] for a loop that is not `realtime`.
     #[serde(default = "default_loop_pause_ms")]
     pub loop_pause_ms: u64,
 }
@@ -69,6 +74,12 @@ impl CaptureInParams {
     fn check(&self) -> Result<(), String> {
         if self.captures.is_empty() {
             return Err("captures: at least one".into());
+        }
+        if self.replay && !self.realtime && self.loop_pause_ms < LOOP_PAUSE_MS_MIN_UNPACED {
+            return Err(format!(
+                "loop_pause_ms: at least {LOOP_PAUSE_MS_MIN_UNPACED} when loop is true and \
+                 realtime false"
+            ));
         }
         Ok(())
     }
@@ -532,6 +543,24 @@ mod tests {
                 assert!(m.starts_with("capture_in: "), "{m}");
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unpaced_loop_needs_a_pause() {
+        let st = CaptureInStage::new();
+        assert_eq!(
+            st.check_params(&serde_json::json!({
+                "captures": ["x"], "loop": true, "realtime": false, "loop_pause_ms": 99
+            })),
+            Err("loop_pause_ms: at least 100 when loop is true and realtime false".to_string())
+        );
+        for ok in [
+            serde_json::json!({"captures": ["x"], "loop": true, "realtime": false, "loop_pause_ms": 100}),
+            serde_json::json!({"captures": ["x"], "loop": true, "realtime": true, "loop_pause_ms": 0}),
+            serde_json::json!({"captures": ["x"], "loop": false, "realtime": false, "loop_pause_ms": 0}),
+        ] {
+            assert!(st.check_params(&ok).is_ok(), "{ok}");
         }
     }
 

@@ -92,6 +92,11 @@ async fn open(dir: &Path) -> Node {
 
 /// 200 ms of 2-FSK at 4800 Bd, written to the node's burst store; its id.
 fn write_fsk(node: &Node) -> String {
+    write_fsk_at(node, CENTER_HZ)
+}
+
+/// [`write_fsk`] centred on `center_hz`.
+fn write_fsk_at(node: &Node, center_hz: u64) -> String {
     let symbols: Vec<u8> = (0..960u32).map(|i| ((i * 7 + i / 3) % 2) as u8).collect();
     let iq = zeta_dsp::synth::gfsk_modulate(&symbols, 2, 4_800, 2_400.0, RATE_HZ);
     let start_ns = 1_760_000_000_000_000_000;
@@ -101,7 +106,7 @@ fn write_fsk(node: &Node) -> String {
             NewCapture {
                 source: SourceId("rx".into()),
                 set: JobId("set".into()),
-                center_hz: Hz(CENTER_HZ),
+                center_hz: Hz(center_hz),
                 bandwidth_hz: Hz(BAND_HZ),
                 sample_rate_hz: Hz(RATE_HZ as u64),
                 start_ns,
@@ -371,6 +376,38 @@ async fn job_retune_refuses_a_graph_job() {
         .unwrap_err();
     let m = other_message(e);
     assert!(m.contains("graph has no band: it runs on no radio"), "{m}");
+    assert_eq!(record(&node, &id).state, JobState::Running);
+    node.job_stop(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn jobs_stop_with_a_plan_skips_a_graph_job_on_a_plan_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    // UHF CB ch1: the graph job's centre is the capture's, on the plan's channel.
+    let cap = write_fsk_at(&node, 476_425_000);
+    let id = start(
+        &node,
+        replay(json!({"captures": [cap], "loop": true, "realtime": true})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(record(&node, &id).tuning.center_hz, Hz(476_425_000));
+    let r = node
+        .apply(Op::JobsStop {
+            source: None,
+            kind: None,
+            plan: Some("uhf_cb_au".into()),
+        })
+        .await
+        .unwrap();
+    match r {
+        OpResult::JobsStopped { stopped, failed } => {
+            assert!(stopped.is_empty(), "{stopped:?}");
+            assert!(failed.is_empty(), "{failed:?}");
+        }
+        r => panic!("jobs_stop: {r:?}"),
+    }
     assert_eq!(record(&node, &id).state, JobState::Running);
     node.job_stop(&id).await.unwrap();
 }

@@ -246,9 +246,17 @@ fn last_audio(outputs: &[(StreamKind, StreamId)]) -> Option<StreamId> {
 }
 
 /// Whether a mix may read `rec`: not an attached job (it is a chain over a job's audio),
-/// a job a controller owns (a trial) or another mix.
+/// a job a controller owns (a trial) or another mix (a `mix` job, or any job whose graph
+/// holds a `mix` node, as a `graph_start` of one does).
 fn mixable(rec: &JobRecord) -> bool {
-    rec.input.is_none() && rec.owner.is_none() && rec.kind != JobKind::Mix.name()
+    rec.input.is_none()
+        && rec.owner.is_none()
+        && rec.kind != JobKind::Mix.name()
+        && !rec
+            .graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == JobKind::Mix.name())
 }
 
 struct Inner {
@@ -2106,7 +2114,15 @@ mod tests {
             format: JOB_RECORD_FORMAT,
             id: JobId::new(),
             kind: kind.into(),
-            graph: crate::ops::mix_graph(None),
+            graph: if kind == "mix" {
+                crate::ops::mix_graph(None)
+            } else {
+                crate::graph::Graph {
+                    id: crate::graph::GraphId("g".into()),
+                    nodes: vec![],
+                    edges: vec![],
+                }
+            },
             source: SourceId("a".into()),
             tuning: Tuning {
                 center_hz: Hz(476_625_000),
@@ -2129,5 +2145,8 @@ mod tests {
         assert!(!mixable(&rec("transcribe", Some(JobId::new()), None)));
         assert!(!mixable(&rec("fm_demod", None, Some(JobId::new()))));
         assert!(!mixable(&rec("mix", None, None)));
+        let mut graph_mix = rec("graph", None, None);
+        graph_mix.graph = crate::ops::mix_graph(None);
+        assert!(!mixable(&graph_mix));
     }
 }

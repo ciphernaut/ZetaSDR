@@ -30,6 +30,41 @@ const BAUD: u32 = 4_800;
 /// One window: 200 ms of symbols, four 50 ms blocks of `capture_in`.
 const SYMBOLS: usize = 960;
 const T0_NS: u64 = 1_760_000_000_000_000_000;
+/// The sync word [`planted`] repeats.
+const SYNC: u16 = 0x2DD4;
+/// Bits of the alternating preamble [`planted`] opens with.
+const PREAMBLE_BITS: usize = 64;
+/// Bits of one planted frame: the sync and a 48-bit payload.
+const FRAME_BITS: usize = 64;
+
+/// [`SYMBOLS`] bits: a [`PREAMBLE_BITS`] alternating preamble for the clock, then frames
+/// of [`SYNC`] and a pseudo-random 48-bit payload, back to back.
+fn planted() -> Vec<u8> {
+    let mut out: Vec<u8> = (0..PREAMBLE_BITS).map(|i| (i % 2) as u8).collect();
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+    while out.len() < SYMBOLS {
+        out.extend((0..16).rev().map(|b| ((SYNC >> b) & 1) as u8));
+        for _ in 0..FRAME_BITS - 16 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            out.push((s >> 40) as u8 & 1);
+        }
+    }
+    out.truncate(SYMBOLS);
+    out
+}
+
+/// How many frames [`planted`] holds.
+const FRAMES: usize = (SYMBOLS - PREAMBLE_BITS) / FRAME_BITS;
+
+/// [`planted`] as hex, MSB first, for the synthesiser's `bits`.
+fn planted_hex() -> String {
+    planted()
+        .chunks(4)
+        .map(|c| format!("{:x}", c.iter().fold(0u8, |a, &b| a << 1 | b)))
+        .collect()
+}
 
 async fn open(dir: &Path) -> Node {
     open_with(dir, None).await
@@ -69,13 +104,36 @@ fn features(rate: Option<u32>) -> Value {
     })
 }
 
-/// 200 ms of 2-FSK at 4800 Bd in set `set`, starting `start_ns`, captured at `rate_hz`;
-/// its id.
+/// 200 ms of 2-FSK at 4800 Bd carrying [`planted`] in set `set`, starting `start_ns`,
+/// captured at `rate_hz`; its id.
 fn write_fsk(node: &Node, set: &str, start_ns: u64, rate_hz: u32, features: Value) -> String {
-    let symbols: Vec<u8> = (0..SYMBOLS as u32)
-        .map(|i| ((i * 7 + i / 3) % 2) as u8)
-        .collect();
-    let iq = zeta_dsp::synth::gfsk_modulate(&symbols, 2, BAUD, 2_400.0, rate_hz);
+    let iq = zeta_dsp::synth::gfsk_modulate(&planted(), 2, BAUD, 2_400.0, rate_hz);
+    write_iq(node, set, start_ns, rate_hz, features, &iq)
+}
+
+/// [`planted`] at 4800 Bd by the synthesiser's `family` (`psk` with `order` 2, `ook`),
+/// at [`RATE_HZ`].
+fn synth_planted(family: &str) -> Vec<num_complex::Complex<f32>> {
+    let mut spec = json!({
+        "family": family, "symbol_rate_baud": BAUD, "bits": planted_hex(), "repeat": 1,
+    });
+    if family == "psk" {
+        spec["order"] = json!(2);
+    }
+    let spec: zeta_dsp::synth::SynthSpec = serde_json::from_value(spec).unwrap();
+    spec.validate().unwrap();
+    zeta_dsp::synth::synthesise(&spec, &Default::default(), RATE_HZ, CENTER_HZ)
+}
+
+/// `iq`, 200 ms at `rate_hz` from `start_ns`, written to set `set`; its id.
+fn write_iq(
+    node: &Node,
+    set: &str,
+    start_ns: u64,
+    rate_hz: u32,
+    features: Value,
+    iq: &[num_complex::Complex<f32>],
+) -> String {
     node.bursts()
         .write(
             NewCapture {
@@ -92,7 +150,7 @@ fn write_fsk(node: &Node, set: &str, start_ns: u64, rate_hz: u32, features: Valu
                 watch: None,
                 allocations: json!([]),
             },
-            &iq,
+            iq,
         )
         .unwrap()
         .id
@@ -104,12 +162,22 @@ async fn bits_start(
     modulation: Option<Modulation>,
     symbol_rate_baud: Option<Baud>,
 ) -> Result<JobId, OpError> {
+    bits_start_order(node, capture, modulation, symbol_rate_baud, None).await
+}
+
+async fn bits_start_order(
+    node: &Node,
+    capture: &str,
+    modulation: Option<Modulation>,
+    symbol_rate_baud: Option<Baud>,
+    order: Option<u8>,
+) -> Result<JobId, OpError> {
     match node
         .apply(Op::BitsStart {
             capture: capture.into(),
             modulation,
             symbol_rate_baud,
-            order: None,
+            order,
         })
         .await?
     {
@@ -300,19 +368,10 @@ async fn bits_start_refuses_an_unknown_capture() {
     assert!(node.job_list().is_empty());
 }
 
-/// When `capture_in` ends a pass that does not loop, the job drains: its streams close
-/// one stage after another, the slicer flushes its short chunk and `bit_view` publishes
-/// what it holds, then the job ends `stopped`. Stream ids are fresh on every launch, so
-/// the ended record's context is read rather than a stream subscribed before the put.
-#[tokio::test]
-async fn a_one_pass_chain_ends_stopped_with_its_last_chunk_delivered() {
-    let dir = tempfile::tempdir().unwrap();
-    let node = open(dir.path()).await;
-    let cap = write_fsk(&node, "one", T0_NS, RATE_HZ, features(Some(BAUD)));
-    let id = bits_start(&node, &cap, Some(Modulation::Fsk), None)
-        .await
-        .unwrap();
-    let mut graph = record(&node, &id).graph;
+/// Put `id`'s graph back with `capture_in` making one unpaced pass, and wait for the
+/// job to drain and end.
+async fn one_pass(node: &Node, id: &JobId) -> JobRecord {
+    let mut graph = record(node, id).graph;
     let src = graph
         .nodes
         .iter_mut()
@@ -328,8 +387,54 @@ async fn a_one_pass_chain_ends_stopped_with_its_last_chunk_delivered() {
         .await
         .unwrap();
     assert!(matches!(r, OpResult::Ok), "{r:?}");
-    let rec = ended(&node, &id, Duration::from_secs(5)).await;
+    let rec = ended(node, id, Duration::from_secs(5)).await;
     assert_eq!(rec.state, JobState::Stopped, "{:?}", rec.state);
+    rec
+}
+
+/// The sync candidates of the ended job's `bit_view`, as `(word, count)`.
+fn sync_candidates(rec: &JobRecord) -> Vec<(String, u64)> {
+    rec.context["bit_view"]["sync_candidates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", rec.context))
+        .iter()
+        .map(|c| {
+            (
+                c["word"].as_str().unwrap().to_string(),
+                c["count"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Whether the planted sync (or, with `either_polarity`, its complement) is a candidate
+/// seen on all but at most one of the [`FRAMES`] frames.
+fn finds_the_sync(rec: &JobRecord, either_polarity: bool) -> bool {
+    let words = [format!("{SYNC:04x}"), format!("{:04x}", !SYNC)];
+    let words = if either_polarity {
+        &words[..]
+    } else {
+        &words[..1]
+    };
+    sync_candidates(rec)
+        .iter()
+        .any(|(w, n)| words.contains(w) && *n as usize + 1 >= FRAMES)
+}
+
+/// When `capture_in` ends a pass that does not loop, the job drains: its streams close
+/// one stage after another, the slicer flushes its short chunk and `bit_view` publishes
+/// what it holds, then the job ends `stopped`. Stream ids are fresh on every launch, so
+/// the ended record's context is read rather than a stream subscribed before the put.
+/// The planted bits come out: the sync word is `bit_view`'s candidate.
+#[tokio::test]
+async fn a_one_pass_chain_ends_stopped_with_its_last_chunk_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let cap = write_fsk(&node, "one", T0_NS, RATE_HZ, features(Some(BAUD)));
+    let id = bits_start(&node, &cap, Some(Modulation::Fsk), None)
+        .await
+        .unwrap();
+    let rec = one_pass(&node, &id).await;
     let slicer = &rec.context["slicer"];
     let sliced = slicer["symbols"]
         .as_u64()
@@ -345,6 +450,44 @@ async fn a_one_pass_chain_ends_stopped_with_its_last_chunk_delivered() {
         "{}",
         rec.context
     );
+    assert!(finds_the_sync(&rec, false), "{}", rec.context["bit_view"]);
+}
+
+/// BPSK built by `bits_start` with the rate given: the planted sync is found (in either
+/// polarity: a BPSK carrier loop locks at 0 or 180 degrees).
+#[tokio::test]
+async fn a_one_pass_bpsk_chain_finds_the_planted_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let iq = synth_planted("psk");
+    let cap = write_iq(&node, "psk", T0_NS, RATE_HZ, features(None), &iq);
+    let id = bits_start_order(
+        &node,
+        &cap,
+        Some(Modulation::Psk),
+        Some(Baud(BAUD)),
+        Some(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(record(&node, &id).context["bits"]["modulation"], "psk");
+    let rec = one_pass(&node, &id).await;
+    assert!(finds_the_sync(&rec, true), "{}", rec.context["bit_view"]);
+}
+
+/// OOK built by `bits_start`: the planted sync is found.
+#[tokio::test]
+async fn a_one_pass_ook_chain_finds_the_planted_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let iq = synth_planted("ook");
+    let cap = write_iq(&node, "ook", T0_NS, RATE_HZ, features(Some(BAUD)), &iq);
+    let id = bits_start(&node, &cap, Some(Modulation::Ook), None)
+        .await
+        .unwrap();
+    assert_eq!(record(&node, &id).context["bits"]["modulation"], "ook");
+    let rec = one_pass(&node, &id).await;
+    assert!(finds_the_sync(&rec, false), "{}", rec.context["bit_view"]);
 }
 
 /// The record once it leaves `Running`, within `within`.

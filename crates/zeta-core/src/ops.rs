@@ -320,7 +320,8 @@ pub enum Op {
     },
     /// Stop every running job that matches all the filters given, in one operation:
     /// `source`, `kind` and `plan` (`null` for any; all three `null` is every job). A
-    /// job's filter on `plan` is its centre lying on one of that plan's channels. Elastic
+    /// job's filter on `plan` is its centre lying on one of that plan's channels; a job on
+    /// no radio (`graph_start`, `bits_start`, a mix) never matches a `plan`. Elastic
     /// jobs (the page's spectrum) and jobs another job owns (a `watch`'s or an
     /// `identify`'s trial jobs) are never named: they follow the capture or their owner.
     /// Jobs on a radio are stopped first, then those attached to them; an attached job
@@ -398,16 +399,18 @@ pub enum Op {
     /// for psk to the smallest multiple of 4 times the baud that also covers a carrier offset
     /// of 2000 Hz (the coarse estimate is unambiguous only within the rate over twice the
     /// order), moved to a rate the resampler serves exactly; 4-fsk takes the `early_late`
-    /// clock; `capture_in` loops, paced, with a 500 ms pause between
+    /// clock; fsk's demodulator is given the record's measured `tone_spacing_hz` (it tracks
+    /// the tones itself when the record has none); `capture_in` loops, paced, with a 500 ms
+    /// pause between
     /// passes, and the job runs until stopped. Refused with `other`: a field neither the
     /// request nor the features give (`no symbol rate measured; give symbol_rate_baud`,
     /// `no modulation measured (label <x>); give modulation`), a rate the capture cannot
     /// hold (`symbol_rate_baud <r> needs <n> Hz; the capture holds <rate> Hz`, 4 samples
-    /// per symbol at least), and a set whose captures differ in rate or centre
+    /// per symbol at least; a rate of 0 is `symbol_rate_baud: at least 1`), and a set whose captures differ in rate or centre
     /// (`capture <id>: <rate> Hz differs from <first>'s <rate> Hz`); an unknown `capture`
     /// is `unknown`. The record's kind is `bits`, its source `node`, its band the
     /// capture's, `job_context.bits` the plan (`captures`, `modulation`,
-    /// `symbol_rate_baud`, `order`, `rate_hz`); the slicer's `bits` events are on
+    /// `symbol_rate_baud`, `order`, `tone_spacing_hz`, `rate_hz`); the slicer's `bits` events are on
     /// `job_context.slicer.stream` and `bit_view`'s latest hypotheses in
     /// `job_context.bit_view`. Change a running chain with `graph_get`, edit,
     /// `graph_put`. The result is the job's id, as `job_start` answers; one-shot
@@ -3305,6 +3308,8 @@ async fn jobs_stop(
                 && source.as_ref().is_none_or(|s| r.source == *s)
                 && kind.as_ref().is_none_or(|k| r.kind == k.name())
                 && on_plan(r.tuning.center_hz.0)
+                // A leaseless job's centre is its capture's, not a channel it holds.
+                && (plan.is_none() || !r.leaseless())
         })
         .collect();
     matched.sort_by_key(|r| r.input.is_some());

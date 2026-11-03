@@ -89,6 +89,10 @@ pub struct BitsPlan {
     pub modulation: Modulation,
     pub symbol_rate_baud: Baud,
     pub order: u8,
+    /// The feature record's measured tone spacing, handed to `fsk_demod`; `None` when
+    /// the record has none (the demodulator then tracks the tones itself) or the chain
+    /// is not FSK.
+    pub tone_spacing_hz: Option<Hz>,
     /// The rate the capture is resampled to.
     pub rate_hz: Hz,
 }
@@ -193,6 +197,9 @@ pub fn bits_plan(
     let rate = symbol_rate_baud
         .or(features.symbol_rate_baud)
         .ok_or("no symbol rate measured; give symbol_rate_baud")?;
+    if rate.0 == 0 {
+        return Err("symbol_rate_baud: at least 1".into());
+    }
     let modulation = match modulation {
         Some(m) => m,
         None => label.and_then(Modulation::from_label).ok_or_else(|| {
@@ -239,19 +246,27 @@ pub fn bits_plan(
         modulation,
         symbol_rate_baud: rate,
         order,
+        tone_spacing_hz: features
+            .tone_spacing_hz
+            .filter(|s| modulation == Modulation::Fsk && s.0 > 0),
         rate_hz: Hz(chain_rate_hz(capture_rate, rate.0, modulation, order)),
     })
 }
 
 /// The plan's graph: `capture_in` (looping, paced, [`LOOP_PAUSE_MS`] between passes) →
-/// `resample` → `demod` → `clock` → `slicer` → `bit_view`.
+/// `resample` → `demod` (`fsk_demod` given the plan's `tone_spacing_hz`, `null` when it
+/// has none) → `clock` → `slicer` → `bit_view`.
 pub fn bits_graph(plan: &BitsPlan) -> Graph {
     use serde_json::{Value, json};
     let baud = plan.symbol_rate_baud.0;
     let demod = match plan.modulation {
         Modulation::Fsk => (
             "fsk_demod",
-            json!({"symbol_rate_baud": baud, "order": plan.order, "tone_spacing_hz": null}),
+            json!({
+                "symbol_rate_baud": baud,
+                "order": plan.order,
+                "tone_spacing_hz": plan.tone_spacing_hz.map(|s| s.0),
+            }),
         ),
         Modulation::Psk => (
             "psk_demod",
@@ -465,6 +480,45 @@ mod tests {
                 StreamKind::Event
             ]
         );
+    }
+
+    #[test]
+    fn the_fsk_demod_takes_the_measured_tone_spacing() {
+        let set = [record("01A", 48_000, 1)];
+        let mut f = features(Some(4800), Some(2));
+        let plan = bits_plan(&set, &f, Some("fsk"), None, None, None).unwrap();
+        assert_eq!(plan.tone_spacing_hz, Some(Hz(4800)));
+        assert_eq!(bits_graph(&plan).nodes[2].params["tone_spacing_hz"], 4800);
+        f.tone_spacing_hz = None;
+        let plan = bits_plan(&set, &f, Some("fsk"), None, None, None).unwrap();
+        assert!(bits_graph(&plan).nodes[2].params["tone_spacing_hz"].is_null());
+        // Only FSK takes it.
+        f.tone_spacing_hz = Some(Hz(4800));
+        let plan = bits_plan(&set, &f, None, Some(Modulation::Ook), None, None).unwrap();
+        assert_eq!(plan.tone_spacing_hz, None);
+    }
+
+    #[test]
+    fn a_symbol_rate_of_zero_is_refused() {
+        let set = [record("01A", 48_000, 1)];
+        let given = bits_plan(
+            &set,
+            &features(Some(4800), None),
+            Some("fsk"),
+            None,
+            Some(Baud(0)),
+            None,
+        );
+        assert_eq!(given.unwrap_err(), "symbol_rate_baud: at least 1");
+        let recorded = bits_plan(
+            &set,
+            &features(Some(0), None),
+            Some("fsk"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(recorded.unwrap_err(), "symbol_rate_baud: at least 1");
     }
 
     #[test]

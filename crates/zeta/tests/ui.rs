@@ -20,8 +20,8 @@
 //! `--llm-url` is a request-keyed fake model (zeta-agent's `serve_by_request` with
 //! [`fake_llm_scripts`]) is passed in `ZETA_UI_URL_LLM`.
 //!
-//! The run is killed and the test fails after 300 s of wall clock. `ZETA_UI_ONLY=a,b` runs only
-//! those scenarios.
+//! The run is killed and the test fails after [`DEADLINE`] (690 s) of wall clock.
+//! `ZETA_UI_ONLY=a,b` runs only those scenarios.
 //!
 //! Skipped, with `ui e2e skipped: <reason>` on stdout, only when Playwright for `python3` or
 //! its Chromium is missing. `python3` runs without `-I`: Playwright is commonly installed in
@@ -289,10 +289,10 @@ fn fsk_fixture(dir: &Path) -> PathBuf {
     zeta_dsp::fixtures::write_fixture(dir, "fsk", &iq, 48_000, 433_920_000)
 }
 
-/// Wall-clock limit on the whole ui.py run: measured 351.8 s and 352.8 s on 2026-11-02 (plan 23's
-/// scenarios included), so about 1.25 times the slower run; plan 19's pane, Explore and ring scenarios have since
-/// added to it (the 440 s limit was reached on 2026-11-02), so the limit is 600 s.
-const DEADLINE: Duration = Duration::from_secs(600);
+/// Wall-clock limit on the whole ui.py run, about 1.25 times the slowest measured run: about
+/// 474 s at plan 24, 500.8 s after plan 19.2's Bits scenario, 547.7 s run alone on 2026-11-04;
+/// 1.25 × 547.7 s ≈ 685 s, so the limit is 690 s.
+const DEADLINE: Duration = Duration::from_secs(690);
 
 /// Waits for `child` until `deadline`, killing it then; its exit status (None when killed)
 /// and everything it wrote. Its pipes are drained on threads so it never blocks on them.

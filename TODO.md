@@ -115,7 +115,9 @@ From the operator, 2026-10-27. Plan 19.2 shipped the stages (`capture_in`, `resa
 - `psk_demod` holds up to 5 x 4096 samples while its coarse estimate defers.
 - A general fan-out (tee) for a node output; today one output feeds one edge.
 - The Bits pane's minors: stale sync marks across a seam, a full redraw per event, `withCorrelate` matching the node id `slicer` rather than the kind.
-- `jobs_stop` with a `plan` filter can stop a graph job whose capture band sits on a plan channel.
+- `bit_view`'s `hypotheses` off the async worker (`spawn_blocking`) so the window can grow again: `window_bits` is capped at 262144 because the analysis runs on the async worker (55 ms on 256 kbit framed, release).
+- A `stream_in` root in `graph_start` names a stream id that changes per launch (a relaunch or a resume reads a dead stream): fail it at `graph_start`, or document it.
+- A wider sync word hides a 16-bit sync followed by a constant header byte: the CRC search then cuts frames at the 24-bit word; try the CRC from each contained width.
 
 ## Feature: generic layer-4 framing decoders (bits to structured frames)
 
