@@ -9,9 +9,9 @@ from __future__ import annotations
 import html, pathlib
 
 HERE = pathlib.Path(__file__).parent
-AS_OF = "2026-11-02, branch worktree-plan19-spec, v0.1.0; plans 21-23 on main, plan 19.1 built pending merge"
-SHIPPED = "shipped (plans 1-18 and 20-23 merged to main)"
-PLANNED = "planned (plans 19.2 and 19.3, the rest of the UI wave, TODO gists)"
+AS_OF = "2026-11-03, main 4098fd2, v0.1.0; plans 19.1 and 21-24 merged"
+SHIPPED = "shipped (plans 1-18 and 20-24 merged to main)"
+PLANNED = "planned (plans 19.2 and 19.3, the rest of the UI wave: lane budget, mode picking, TODO gists)"
 AMBER = "#b7791f"
 FONT = "Inter, 'Segoe UI', Helvetica, Arial, sans-serif"
 W = 1660
@@ -196,7 +196,7 @@ radios = [
  dict(title="(codec only)", body="no device of its own"),
 ]
 planned_a = [
- dict(planned=True, note=15, title="UI wave: the rest", body="Web UI only. Staircase transcript ribbons (lanes from the pixel height between channels); mode picking by band through knowledge_lookup with a search fallback; state-stream decoders such as ADS-B as one held line per subject; the console theme behind view set theme."),
+ dict(planned=True, note=15, title="UI wave: the rest", body="Web UI only. Plan 24 shipped the console theme, the rail, riding ribbons, two-line rows and collapsible panes; still pencilled in: a lane budget from the pixel height between channels, mode picking by band through knowledge_lookup with a search fallback, state-stream decoders such as ADS-B as one held line per subject."),
  dict(planned=True, note=11, title="Plans 19.2 and 19.3: bits, frames, signatures", body="zeta-dsp. 19.2: capture_in, resample, fsk/psk/ook demod stages, clock_recover, slicer, bit_view (run lengths, autocorrelation, sync-word and CRC hypotheses) over a burst capture, a Bits tab. 19.3: frame_decode (preamble, length, NRZI/Manchester, CRC library), thin Modbus RTU / DNP3 / IEC-101/104 rows, operator-accepted signature write-back to knowledge. Plan 19.1 (burst-aware measure, the register, burst captures, the Explore pane) is built, pending merge."),
  dict(planned=True, note=13, title="Decoder wave 2 (rows)", body="Rows and small stages on the plan-17 frameworks: M17 (Codec 2) and DMR (AMBE via mbelib, tools/install-vocoders.sh) as audio rows feeding transcribe; AIS (nmea parser, map), FLEX; whole-span POCSAG/APRS as a watch with decode_on capture; stereo wfm_demod with pilot level; DFM/M20 synthesised tests; APRS positions on the map."),
  dict(planned=True, note=13, title="Feeds and sinks", body="sink stage kinds for the standard feeds (APRS-IS, SBS/Beast, AIS NMEA, PSK Reporter, WSPRnet, KISS TNC); a generic sink: {kind, params} on the watch's detect node replacing the one-off sondehub field (shorthand kept); fixes: a sink-bearing decoder frozen as an operator graph, gated_stop cleared by a sink restart."),
@@ -343,7 +343,7 @@ NOTES = [
  (18, "Plan 23: subjects", "A decoder's events are about things: a mode row names the event field identifying its subject (icao, a sonde's id, an APRS src), the table columns and units, and how the waterfall shows it (one line per job, or one ribbon per subject updated in place). The page merges each subject's events into one state: a Subjects tab beside the map (metres and km/h, climb in m/s, distance from home, dimmed after 60 s and dropped after 5 min), a marker turned to its heading with a track that keeps a point only when the subject has moved and thins its older half at the cap. No per-protocol code on the page. The agent may stop the jobs it started in the same run, and reads channel_plans before naming a plan."),
  (13, "Decoder wave 2 and feeds (planned)", "Voice rows (M17, DMR) feed transcribe unchanged; AIS and FLEX are parser rows; whole-span POCSAG/APRS reuses the watch; stereo lands on wfm_demod. Feeds out generalise sink_sondehub to a sink: {kind, params} on the watch and add the standard sinks (APRS-IS, SBS, AIS NMEA, PSK Reporter, WSPRnet, KISS)."),
  (14, "Knowledge and time (planned)", "Plan 19.1 added the knowledge provider over the ACMA licence register (it names the 404.025 MHz burst, Unitywater 16K0F1D, in seconds) and the node-level station it needs; a GPS fix for the station is a gist. True block timestamps unlock FT8/WSPR and TDMA; a trunking follower and self-channelising span decoders are the other open architecture notes."),
- (15, "The rest of the UI wave (planned)", "Plan 18 shipped the fit and the drag. Still pencilled in: staircase transcript ribbons (the newest line at the channel, older ones stepping up, lanes from the pixel height available), mode picking by band through knowledge_lookup with a search fallback, a held roster line per subject for state-stream decoders such as ADS-B, and the console theme behind view set theme. TODO.md holds the gists."),
+ (15, "The rest of the UI wave (planned)", "Plan 18 shipped the fit and the drag; plan 24 (deployed 2026-11-03) shipped the console theme behind view set theme: the rail of job tags beside the frequency axis, ribbons that ride their band and step up a lane, two-line job rows, idle plan channels folded into one group, collapsible chat and jobs panes (view set side). Still pencilled in: a lane budget from the pixel height available per band, mode picking by band through knowledge_lookup with a search fallback, and a held roster line per subject for state-stream decoders such as ADS-B. TODO.md holds the gists."),
 ]
 
 notes_html = "\n".join(

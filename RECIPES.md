@@ -163,6 +163,8 @@ first. The script used a 10 000 Hz band per channel so a strong neighbour did no
 squelch; `plan_start` uses the plan's 12 500 Hz and relies on the adjacent-channel guard instead.
 `examples/python/cb_watch.py` is the alternative that runs demodulators on active channels only.
 
+**On the page.** With more than 8 idle channels the jobs list folds them into one `<n> idle fm_demod on uhf_cb_au` group, but only on evidence the page has: press **Listen to all** (the mix) and idle channels fold as the mix hears none of them; without it most demodulators stay listed, which is not a fault. `view set side jobs` gives the jobs list the whole side column.
+
 ## Radiosonde watch, 400-406 MHz
 
 Hold the sonde band, let a `watch` spot and identify what appears, and pre-place an RS41 decoder
@@ -230,6 +232,8 @@ decoder is separate.
 **Gotchas.** The 404.025 MHz carrier the watch keeps seeing is the Unitywater telemetry link
 (16K0F1D in the ACMA register), written to `signatures.json` as `404.025-beacon`; it is not a
 sonde. `measure.snr_db` is a per-bin peak and reads 20 dB where the channel SNR is 6 dB.
+
+**On the page.** The watch is outlined on the waterfall and its decoder's rail tag shows the centre; `view set side jobs` gives the jobs list the whole side column, and if the watch keeps several decoders **Listen to all** lets the idle ones fold.
 
 ## Adding a recipe
 

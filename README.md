@@ -145,7 +145,7 @@ plan channel gets an adjacent-channel guard: its channel is widened to 37.5 kHz,
 filtered in the stage, and its squelch stays closed while a channel `guard_hz` (12.5 kHz) away is
 more than `guard_db` (12) stronger; the `squelch` event adds `adjacent_db` and `guarded`, and a
 `graph put` with `guard_hz: null` on the demod turns it off. A job off every plan is unchanged.
-The page tags plan channels (`ch20`) on job rows and outlines and numbers them on the axis when
+The page tags plan channels (`ch20`) on job rows and on the rail (on the outlines in the plain theme) and numbers them on the axis when
 zoomed; `view set plan auto|<id>|none` picks the plan. `transcribe` drops utterances shorter than
 `min_utterance_ms` (default 700, counted in the job context as `transcribe.short`), and the speech
 daemon queue holds 4 requests: a transcript event carries `queued_ms`, and a dropped one a `reason`
@@ -540,10 +540,14 @@ The page picks its layout from the viewport width (`?footprint=wide|narrow` forc
 
 - Wide (700 px and up): source tabs along the top, one per `source_list` entry; the waterfall
   for the selected source, newest column at the right, frequency vertical; on the side the
-  transcript and the job list; along the bottom the command line (Ctrl-K) and the microphone.
+  transcript and the job list, each folding on its header bar (the Jobs header shows the
+  running-job count); along the bottom the command line (Ctrl-K) and the microphone. The default
+  `console` theme frames the page in elbow-and-bar chrome and the selected source's tab bar
+  carries its live pin, rate, overflows, gain, holders and bank from `source_list` (in `plain`
+  they sit in the tab's tooltip).
 - Narrow (under 700 px, a phone): the waterfall takes the screen. The transcript and job
   list move into a drawer behind ☰, and the agent's answers also appear as ribbons on the
-  waterfall.
+  waterfall. The rail is 14 px of thin segments there; a tap expands one for 3 s.
 
 The page's own `spectrum` job is elastic: it never blocks another job from taking the radio and
 follows every retune, so the waterfall is never the reason a conflict appears. A job started inside
@@ -574,6 +578,8 @@ View policies shape this, set from the command line and kept in the tab's `sessi
 | `auto_scan_stop` | `inside` (stop when back inside the capture), `keep` |
 | `finished_rows_s` | seconds a finished job stays listed, `60`; `0` never shows them |
 | `scanner` | `auto`, or a source id |
+| `theme` | `console` (also set on `<html data-theme>`), `plain` (the old look: tags on the outlines, level ribbons) |
+| `side` | `both`, `transcript`, `jobs`, `none`: which of the side panes show |
 | `subjects` | `auto` (the Subjects tab shows while a running job's row has table columns), `on`, `off` |
 | `subject_dim_s` | seconds of silence before a subject dims, `60` |
 | `subject_drop_s` | seconds of silence before a subject goes from the table and the map, `300` |
@@ -586,8 +592,12 @@ strongest signal`) is a question for the agent.
 The waterfall is the UI's own `spectrum` job on the selected source (it reuses a running one,
 and stops the one it started when the page closes). Overlays are pinned to their channel and
 scroll with it: a `measure` job's layer-1 label with its confidence, an `aprs_decode` packet as
-a ribbon (`VK3ABC > APRS: >hi` on the fixture), any other event as a short ribbon. The job list
-shows every job that is not stopped, with a live event counter, ■ to stop it, ▶ on an
+a ribbon (`VK3ABC > APRS: >hi` on the fixture), any other event as a short ribbon. Ribbons
+ride their band: centred on the band line, tilted by the theme (-15 degrees in `console`, level in
+`plain`) and in the job's colour; a new chunk takes the line and older ones step up a lane, then
+fall back as it clears (a subject's keyed ribbon never steps). The job list
+shows every job that is not stopped, two lines a row (kind and state, then band, numbers and the
+id's tail; no sideways scroll), with a live event counter, ■ to stop it, ▶ on an
 `fm_demod` row to play its audio in the browser (one job at a time) and `graph` to open the
 job's graph view.
 
@@ -608,7 +618,15 @@ the job id, the attached `transcribe` and the ribbons; a conflict snaps it back 
 retry buttons. Right-click (long press on a phone) opens Fit to signal, the width presets and
 Stop (a decoder's or a passthrough's menu holds Stop only; an SSB fit moves the dial and keeps
 the band). Every rigid job carries a tag (kind, short id, squelch dot, channel, last transcript
-snippet) linked by hover with its row in the job list, and rows show the band. A selection drag
+snippet) linked by hover with its row in the job list, and rows show the band. In `console` the
+tags move to a rail, a column left of the frequency axis, each at its band's height and showing
+the plan channel (or the kind) and the centre in MHz; a tag that overlaps a full one collapses to
+a thin segment, a hot or speaking tag stays full, and the outline, tag, row and ribbons share one
+colour per job. Idle plan channels fold into one `<n> idle <kind> on <plan>` group when more than
+8 are idle, judged only from what the page knows: a kind with no squelch, a watched job (at most 4)
+whose squelch is known closed for 60 s, or an unwatched job on a source whose mix the page plays
+and which that mix has not heard for 60 s. So without **Listen to all** most CB demodulators stay
+listed; a row under the pointer stays put. A selection drag
 can no longer start inside a running retunable job's band (its outline takes the pointer): start
 the box outside it or on another part of the waterfall.
 
@@ -644,7 +662,8 @@ microphone only on a secure origin: `localhost` qualifies, a LAN address over pl
 not.
 
 Clicking `graph` on a job row draws its graph document (stages as boxes, streams as labelled
-edges). Clicking a stage shows its `params` as JSON; editing them and pressing Apply sends
+edges; in `console` the stages are rounded bars coloured by stage family with a params headline
+under the kind). Clicking a stage shows its `params` as JSON; editing them and pressing Apply sends
 `graph_put` with that stage changed, which restarts the job under the same id.
 
 Only `/` and `/ui/*` (the static files, which hold no secret) are served without the secret.
