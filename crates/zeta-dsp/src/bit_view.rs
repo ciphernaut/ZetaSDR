@@ -50,6 +50,12 @@ pub const CRC_MIN_FRAMES: usize = 3;
 /// Most frames tried per (sync, period) hypothesis.
 pub const CRC_MAX_FRAMES: usize = 64;
 
+/// Most CRC candidates listed.
+pub const CRC_CANDIDATES_MAX: usize = 8;
+
+/// The `period_bits` of a CRC candidate whose frames run from each sync to the next.
+pub const NEXT_SYNC_PERIOD: u32 = 0;
+
 /// Run lengths counted one by one; longer runs fall in the last bin.
 pub const RUN_HISTOGRAM_MAX: usize = 32;
 
@@ -152,7 +158,8 @@ pub struct Encoding {
     pub likely: String,
 }
 
-/// A CRC that checks on `frames` of the `checked` frames of `period_bits` cut at `sync`.
+/// A CRC that checks on `frames` of the `checked` frames of `period_bits` cut at `sync`
+/// ([`NEXT_SYNC_PERIOD`] for frames that run from each sync to the next).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CrcCandidate {
     pub crc: String,
@@ -482,33 +489,49 @@ fn value_of(bits: &[u8]) -> u64 {
     bits.iter().fold(0u64, |acc, &v| (acc << 1) | u64::from(v))
 }
 
-/// The CRCs that check on frames of `period` bits cut at the occurrences of `sync`:
-/// the frame's last `width` bits are the CRC, the bits between the sync and it the data,
-/// packed MSB first (a data length that is not whole bytes skips the spec). Tried as
-/// sent and LSB first (every data byte bit-reversed, the CRC field read reversed), on
-/// at most [`CRC_MAX_FRAMES`] frames that fit the window.
-fn crcs_for(bits: &[u8], sync: &Sync, period: usize, out: &mut Vec<CrcCandidate>) {
-    let frames: Vec<&[u8]> = sync
-        .positions
+/// The frames of `period` bits cut at the occurrences of `sync` that fit the window,
+/// at most [`CRC_MAX_FRAMES`].
+fn period_frames<'a>(bits: &'a [u8], sync: &Sync, period: usize) -> Vec<&'a [u8]> {
+    sync.positions
         .iter()
         .filter(|&&s| s + period <= bits.len())
         .take(CRC_MAX_FRAMES)
         .map(|&s| &bits[s..s + period])
-        .collect();
+        .collect()
+}
+
+/// The frames from each occurrence of `sync` to the next, for frames of varying length
+/// that abut, at most [`CRC_MAX_FRAMES`].
+fn next_sync_frames<'a>(bits: &'a [u8], sync: &Sync) -> Vec<&'a [u8]> {
+    sync.positions
+        .windows(2)
+        .take(CRC_MAX_FRAMES)
+        .map(|w| &bits[w[0]..w[1]])
+        .collect()
+}
+
+/// The CRCs that check on `frames` cut at `sync` (listed with `period_bits`): a frame's
+/// last `width` bits are the CRC, the bits between the sync and it the data, packed MSB
+/// first; a frame whose data is not whole bytes (or empty) is not tried for that spec.
+/// Tried as sent and LSB first (every data byte bit-reversed, the CRC field read
+/// reversed); a spec is listed when it checks on at least [`CRC_MIN_FRAMES`], with
+/// `checked` the frames it was tried on.
+fn crcs_for(frames: &[&[u8]], sync: &Sync, period_bits: u32, out: &mut Vec<CrcCandidate>) {
     if frames.len() < CRC_MIN_FRAMES {
         return;
     }
     let sync_w = sync.width as usize;
     for spec in CRCS {
         let width = spec.width as usize;
-        let Some(data_bits) = period.checked_sub(sync_w + width) else {
-            continue;
-        };
-        if data_bits == 0 || data_bits % BYTE_BITS != 0 {
-            continue;
-        }
-        let (mut plain, mut lsb) = (0u32, 0u32);
-        for f in &frames {
+        let (mut plain, mut lsb, mut checked) = (0u32, 0u32, 0u32);
+        for f in frames {
+            let Some(data_bits) = f.len().checked_sub(sync_w + width) else {
+                continue;
+            };
+            if data_bits == 0 || data_bits % BYTE_BITS != 0 {
+                continue;
+            }
+            checked += 1;
             let data = &f[sync_w..sync_w + data_bits];
             let field = value_of(&f[sync_w + data_bits..]);
             if crc(spec, &pack(data, false)) == field {
@@ -526,9 +549,9 @@ fn crcs_for(bits: &[u8], sync: &Sync, period: usize, out: &mut Vec<CrcCandidate>
                 out.push(CrcCandidate {
                     crc: name,
                     sync: sync.word(),
-                    period_bits: period as u32,
+                    period_bits,
                     frames: passed,
-                    checked: frames.len() as u32,
+                    checked,
                 });
             }
         }
@@ -541,10 +564,12 @@ fn reflect(v: u64, spec: &CrcSpec) -> u64 {
 
 /// What one window of bits suggests (see each field's type): the run-length histogram,
 /// the frame periods (see `periods`), the sync candidates, the line code scores and the
-/// CRC candidates. The CRC search tries each sync candidate with each listed period and
-/// the candidate's own mean gap (rounded), so at most [`SYNC_CANDIDATES_MAX`] ×
-/// ([`PERIOD_CANDIDATES_MAX`] + 1) hypotheses of [`CRC_MAX_FRAMES`] frames, within
-/// [`HYPOTHESES_BUDGET_MS`] on a 64 kbit window. `summary` reads `sync 0x<word> ×<count>
+/// CRC candidates. The CRC search tries each sync candidate with frames of each listed
+/// period and with frames that run from each occurrence to the next (listed with
+/// `period_bits` 0), so at most [`SYNC_CANDIDATES_MAX`] × ([`PERIOD_CANDIDATES_MAX`] + 1)
+/// hypotheses of [`CRC_MAX_FRAMES`] frames, within
+/// [`HYPOTHESES_BUDGET_MS`] on a 64 kbit window; the most frames first, at most
+/// [`CRC_CANDIDATES_MAX`]. `summary` reads `sync 0x<word> ×<count>
 /// every <gap> bits, <likely>, <crc> <frames>/<checked>` for the first sync and CRC
 /// candidates (the CRC part only when one checks), or `no sync candidate`.
 pub fn hypotheses(bits: &[u8]) -> Hypotheses {
@@ -563,15 +588,23 @@ pub fn hypotheses(bits: &[u8]) -> Hypotheses {
     let syncs = syncs(bits, &by_width);
     let mut crc_candidates = Vec::new();
     for s in &syncs {
-        let mut tried: Vec<usize> = period_bits.iter().map(|p| p.lag as usize).collect();
-        tried.push(s.mean_gap().round() as usize);
-        tried.sort_unstable();
-        tried.dedup();
-        for period in tried {
-            crcs_for(bits, s, period, &mut crc_candidates);
+        for p in &period_bits {
+            crcs_for(
+                &period_frames(bits, s, p.lag as usize),
+                s,
+                p.lag,
+                &mut crc_candidates,
+            );
         }
+        crcs_for(
+            &next_sync_frames(bits, s),
+            s,
+            NEXT_SYNC_PERIOD,
+            &mut crc_candidates,
+        );
     }
     crc_candidates.sort_by_key(|c| std::cmp::Reverse(c.frames));
+    crc_candidates.truncate(CRC_CANDIDATES_MAX);
     let sync_candidates: Vec<SyncCandidate> = syncs
         .iter()
         .map(|s| SyncCandidate {
@@ -627,8 +660,10 @@ struct Window {
     pieces: VecDeque<Piece>,
     /// The offset one past the last bit.
     end: u64,
-    /// Bits added since the last event.
+    /// Bits added toward the next quarter: the publishing cadence only.
     grown: usize,
+    /// Bits added since the last event, which a segment's or the input's end publishes.
+    unpublished: usize,
     prov: Provenance,
 }
 
@@ -648,6 +683,7 @@ impl Window {
         });
         self.end = b.end();
         self.grown += b.bits.len();
+        self.unpublished += b.bits.len();
         self.prov = b.prov.clone();
         let start = self.start();
         while self.pieces.len() > 1 && self.pieces[1].start <= start {
@@ -655,9 +691,9 @@ impl Window {
         }
     }
 
-    /// The window's `hypotheses` event, noted to the job; the growth reset.
+    /// The window's `hypotheses` event, noted to the job; nothing left unpublished.
     fn publish(&mut self, events: &StreamId, ctx: &StageContext) -> Frame {
-        self.grown = 0;
+        self.unpublished = 0;
         let start = self.start();
         let bits = self.bits.make_contiguous();
         let h = hypotheses(bits);
@@ -760,7 +796,7 @@ impl Stage for BitViewStage {
                 .is_some_and(|w| b.as_ref().is_none_or(|b| b.offset_bits != w.end))
             {
                 let mut w = win.take().unwrap();
-                if w.grown > 0 {
+                if w.unpublished > 0 {
                     out.push(w.publish(&events, &ctx));
                 }
             }
@@ -776,13 +812,13 @@ impl Stage for BitViewStage {
                 pieces: VecDeque::new(),
                 end: b.offset_bits,
                 grown: 0,
+                unpublished: 0,
                 prov: b.prov.clone(),
             });
             w.push(&b);
             if w.grown >= quarter {
-                let rest = w.grown % quarter;
+                w.grown %= quarter;
                 out.push(w.publish(&events, &ctx));
-                w.grown = rest;
             }
             Ok(out)
         })
@@ -834,12 +870,17 @@ pub(crate) mod test_streams {
     /// A body that would put [`SYNC`] anywhere but at a frame start is drawn again, so
     /// the sync occurs exactly `frames` times.
     pub fn framed_stream(frames: usize, body_bytes: usize, seed: u64) -> Vec<u8> {
+        framed_stream_of(&vec![body_bytes; frames], seed)
+    }
+
+    /// [`framed_stream`] with a body of `body_bytes[k]` in frame `k`.
+    pub fn framed_stream_of(body_bytes: &[usize], seed: u64) -> Vec<u8> {
         const SYNC_W: usize = 16;
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let mut out = Vec::new();
         let mut made = 0;
-        while made < frames {
-            let body: Vec<u8> = (0..body_bytes)
+        while made < body_bytes.len() {
+            let body: Vec<u8> = (0..body_bytes[made])
                 .map(|_| {
                     s ^= s << 13;
                     s ^= s >> 7;
@@ -960,8 +1001,13 @@ mod tests {
     use serde_json::json;
     use zeta_core::stage::Stage;
 
-    use super::test_streams::{bits_frames, framed_stream, random_bits, run_events};
-    use super::{BitViewStage, CRC_MAX_FRAMES, hypotheses};
+    use super::test_streams::{
+        bits_frames, framed_stream, framed_stream_of, random_bits, run_events,
+    };
+    use super::{
+        BitViewStage, CRC_CANDIDATES_MAX, CRC_MAX_FRAMES, CRC_MIN_FRAMES, NEXT_SYNC_PERIOD,
+        hypotheses,
+    };
 
     #[test]
     fn a_framed_stream_gives_its_sync_period_and_crc() {
@@ -1023,7 +1069,8 @@ mod tests {
             bits_frames(&bits, &splits),
         )
         .await;
-        assert!(events.len() >= 9, "{}", events.len());
+        assert_eq!(events.len(), 9);
+        assert!(events.windows(2).all(|w| w[0] != w[1]));
         assert!(events.iter().all(|e| e["protocol"] == "hypotheses"));
         assert!(
             events
@@ -1067,6 +1114,20 @@ mod tests {
     }
 
     #[test]
+    fn abutting_frames_of_varying_length_give_their_crc() {
+        let lengths: Vec<usize> = (0..12).map(|k| [100, 120, 136][k % 3]).collect();
+        let h = hypotheses(&framed_stream_of(&lengths, 6));
+        assert_eq!(h.sync_candidates[0].word, "2dd4", "{:?}", h.sync_candidates);
+        assert!(
+            h.crc_candidates.iter().any(|c| c.crc == "crc16-ccitt"
+                && c.period_bits == NEXT_SYNC_PERIOD
+                && c.frames as usize >= CRC_MIN_FRAMES),
+            "{:?}",
+            h.crc_candidates
+        );
+    }
+
+    #[test]
     fn the_crc_search_is_bounded() {
         let h = hypotheses(&framed_stream(200, 136, 2));
         assert!(!h.crc_candidates.is_empty());
@@ -1077,6 +1138,7 @@ mod tests {
             "{:?}",
             h.crc_candidates
         );
+        assert!(h.crc_candidates.len() <= CRC_CANDIDATES_MAX);
     }
 
     /// The [`super::HYPOTHESES_BUDGET_MS`] budget on 64 kbit; run with
