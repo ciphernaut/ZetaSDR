@@ -2,6 +2,7 @@
 //! then the operator's folder layered over them. A theme is a folder holding
 //! `theme.json`, an optional `style.css` and the fonts and images it names.
 
+pub mod css;
 pub mod theme_json;
 pub mod tokens;
 
@@ -253,11 +254,19 @@ fn check_folder(
         .collect();
     let names: BTreeSet<String> = served.keys().cloned().collect();
     validate(&theme, folder_id, &names)?;
-    // Task 2 wraps style.css; until then it is served as written.
-    served.entry("style.css".into()).or_insert(ThemeFile {
-        mime: "text/css; charset=utf-8",
-        bytes: Arc::from(&b""[..]),
-    });
+    // style.css is served wrapped; a theme without one still gets the wrapper.
+    let raw = served.remove("style.css").map(|f| f.bytes);
+    let raw: &[u8] = raw.as_deref().unwrap_or_default();
+    css::check_size(raw.len())?;
+    let text = std::str::from_utf8(raw).map_err(|e| ThemeError::new("style.css", e.to_string()))?;
+    let wrapped = css::wrap_style(&theme, text, &names)?;
+    served.insert(
+        "style.css".into(),
+        ThemeFile {
+            mime: "text/css; charset=utf-8",
+            bytes: Arc::from(wrapped.into_bytes()),
+        },
+    );
     Ok((theme, served))
 }
 

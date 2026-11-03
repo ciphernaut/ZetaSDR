@@ -222,3 +222,67 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
         }
     }
 }
+
+#[test]
+fn style_css_is_served_wrapped() {
+    let root = tempfile::tempdir().unwrap();
+    theme_dir(
+        root.path(),
+        "mytheme",
+        valid("mytheme"),
+        &[
+            ("style.css", b".a { background: url(bg.png); }\n"),
+            ("bg.png", b"png"),
+        ],
+    );
+    let reg = ThemeRegistry::load(Some(root.path()));
+    let (mime, bytes) = reg.file("mytheme", "style.css").expect("style.css served");
+    assert_eq!(mime, "text/css; charset=utf-8");
+    let css = std::str::from_utf8(&bytes).unwrap();
+    let open = css.find("[data-theme=\"mytheme\"] {").expect(css);
+    assert!(css.find("--accent: #ff00ff;").unwrap() > open, "{css}");
+    assert!(
+        css.find(".a { background: url(bg.png); }").unwrap() > open,
+        "{css}"
+    );
+}
+
+#[test]
+fn a_theme_without_style_css_serves_the_wrapper() {
+    let root = tempfile::tempdir().unwrap();
+    theme_dir(root.path(), "mytheme", valid("mytheme"), &[]);
+    let reg = ThemeRegistry::load(Some(root.path()));
+    let (_, bytes) = reg.file("mytheme", "style.css").expect("style.css served");
+    let css = std::str::from_utf8(&bytes).unwrap();
+    assert!(css.contains("[data-theme=\"mytheme\"] {"), "{css}");
+    assert!(css.contains("color-scheme: dark;"), "{css}");
+    let (_, console) = reg.file("console", "style.css").unwrap();
+    let console = std::str::from_utf8(&console).unwrap();
+    assert!(console.contains("font-family: \"Antonio\""), "{console}");
+}
+
+#[test]
+fn a_bad_style_css_breaks_the_theme() {
+    let root = tempfile::tempdir().unwrap();
+    theme_dir(
+        root.path(),
+        "mytheme",
+        valid("mytheme"),
+        &[("style.css", b"@import \"x.css\";")],
+    );
+    let big = vec![b' '; 1_048_577];
+    theme_dir(root.path(), "big", valid("big"), &[("style.css", &big)]);
+    let reg = ThemeRegistry::load(Some(root.path()));
+    assert!(reg.get("mytheme").is_none());
+    let t = reg.all().iter().find(|t| t.id == "mytheme").unwrap();
+    assert_eq!(t.state, ThemeState::Broken);
+    assert_eq!(
+        t.reason.as_deref(),
+        Some("style.css: @import is not allowed")
+    );
+    let t = reg.all().iter().find(|t| t.id == "big").unwrap();
+    assert_eq!(
+        t.reason.as_deref(),
+        Some("style.css: 1048577 bytes, more than the 1 MiB limit")
+    );
+}
