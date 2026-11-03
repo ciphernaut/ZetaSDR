@@ -1294,6 +1294,24 @@ MOTION_PROBE_JS = """(job) => {
 }"""
 
 
+# A keyboard-focused unselected source tab: [its name's colour, the tab's ground].
+FOCUSED_TAB_JS = """() => {
+  const tab = document.querySelector('.src-tab:not([aria-selected="true"])');
+  tab.focus({focusVisible: true});
+  const out = [getComputedStyle(tab.querySelector(".name")).color,
+               getComputedStyle(tab).backgroundColor];
+  tab.blur();
+  return out;
+}"""
+
+# The hovered action button in a job's (hot) row: its text, its ground and the row's ground.
+HOT_ACTION_JS = """(job) => {
+  const row = document.querySelector(`#jobs .job[data-id="${job}"]`);
+  const b = getComputedStyle(row.querySelector(".actions button"));
+  return {text: b.color, ground: b.backgroundColor, row: getComputedStyle(row).backgroundColor};
+}"""
+
+
 def visible_controls(page, ids):
     """The ids among `ids` whose centre is not hit by the element itself or a child (covered
     or off screen)."""
@@ -1335,6 +1353,17 @@ def scenario_new_themes(page, url, secret):
             still_running = calm.evaluate(MOTION_PROBE_JS, demod)
             assert still_running == [], \
                 f"{theme}: motion under reduced motion: {still_running} (normal: {moving})"
+            # Focus and hover never draw text on its own colour: a keyboard-focused unselected
+            # source tab's name against the tab, a hovered action in the hot job row against
+            # its own ground and that ground against the row's.
+            focused = page.evaluate(FOCUSED_TAB_JS)
+            assert focused[0] != focused[1], f"{theme}: focused tab's name on its own colour: {focused}"
+            job_row(page, demod).locator(".actions button").first.hover()
+            expect(job_row(page, demod)).to_have_class(re.compile(r"\bhot\b"))
+            hovered = page.evaluate(HOT_ACTION_JS, demod)
+            assert hovered["text"] != hovered["ground"] != hovered["row"], \
+                f"{theme}: hovered action in the hot row: {hovered}"
+            page.mouse.move(0, 0)
             for name, size in (("wide", WIDE), ("narrow", NARROW)):
                 page.set_viewport_size(size)
                 page.wait_for_function(

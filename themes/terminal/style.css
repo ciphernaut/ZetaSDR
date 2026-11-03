@@ -48,13 +48,24 @@ button {
 #top button:not(.src-tab, .pane-tab)::after, #bar button::after, .job .actions button::after,
 #band button::after, .line button.action::after, #graph button::after,
 #login-form button::after, #explore button::after { content: "]"; }
-button:hover:not(:disabled), button:focus-visible,
-#listen-all[aria-pressed="true"], #map-toggle[aria-pressed="true"],
-.job button.play[aria-pressed="true"] {
+/* Inverse video: what is selected, pressed, focused or under the pointer is black text on green,
+   every part of it. One list, lifted by :not(#id) over the core's and this file's one-id colour
+   rules (#connect, #mic.recording, a faulted tab's name), so no part keeps a green of its own. */
+:is(button:hover:not(:disabled), button:focus-visible,
+    #listen-all[aria-pressed="true"], #map-toggle[aria-pressed="true"],
+    .job button.play[aria-pressed="true"],
+    .src-tab[aria-selected="true"], .pane-tab[aria-selected="true"]):not(#zeta-inv) {
   background: var(--text);
   color: #000;
   text-shadow: none;
   outline: none;
+}
+:is(button:hover:not(:disabled), button:focus-visible,
+    #listen-all[aria-pressed="true"], #map-toggle[aria-pressed="true"],
+    .job button.play[aria-pressed="true"],
+    .src-tab[aria-selected="true"], .pane-tab[aria-selected="true"]):not(#zeta-inv) * {
+  color: #000;
+  border-color: #000;
 }
 input {
   background: var(--bg);
@@ -86,20 +97,11 @@ input:focus { border-color: var(--text); }
 .src-tab .range, .src-tab .centre { opacity: 1; }
 /* A row of names: only the selected source spells out its band (and its health). */
 &:not([data-footprint="narrow"]) .src-tab:not([aria-selected="true"]) .range { display: none; }
-/* The selected source and pane tab: inverse video, a row of black text on green. */
-.src-tab[aria-selected="true"], .pane-tab[aria-selected="true"] {
-  background: var(--text);
-  color: #000;
-  text-shadow: none;
-}
-.src-tab[aria-selected="true"] .name { color: #000; font-weight: 700; }
-.src-tab:hover:not([aria-selected="true"]) .name, .pane-tab:hover:not([aria-selected="true"]) { color: var(--ok); }
-.src-tab:hover:not([aria-selected="true"]), .pane-tab:hover:not([aria-selected="true"]) {
-  background: none; color: var(--ok); text-shadow: inherit;
-}
+/* The selected source and pane tab: inverse video, a row of black text on green
+   (the inverse rule under buttons draws it; hovered and focused tabs read the same way) */
+.src-tab[aria-selected="true"] .name { font-weight: 700; }
 .src-tab.fault .name { color: var(--error); }
 .src-tab .tag.pin { border: 1px solid var(--error); color: var(--error); }
-.src-tab[aria-selected="true"] .tag.pin { border-color: #000; color: #000; }
 .src-tab[aria-selected="true"] .health {
   display: inline-flex;
   gap: 1ch;
@@ -177,14 +179,15 @@ input:focus { border-color: var(--text); }
 /* A closed squelch: the row dims, the job's colour kept as a one-character mark at its start. */
 .job-tag[data-colour]:has(.dot.closed) { color: var(--dim); box-shadow: inset 2px 0 0 var(--job-c); }
 .job-tag[data-colour]:has(.dot.closed) .centre { color: var(--dim); }
-/* Under the pointer: inverse video in the job's colour. */
-.job-tag[data-colour].hot, #waterfall #rail .job-tag[data-colour].hot {
-  background: var(--job-c);
+/* Under the pointer: inverse video in the job's colour, every part black (two ids lift it over
+   the closed squelch's dim and the speaking colour); the squelch dot a black block or box. */
+#waterfall #rail .job-tag[data-colour].hot { background: var(--job-c); box-shadow: none; }
+#waterfall #rail .job-tag[data-colour].hot, #waterfall #rail .job-tag[data-colour].hot * {
   color: #000;
   text-shadow: none;
-  outline: none;
 }
-.job-tag[data-colour].hot .centre { color: #000; }
+#waterfall #rail .job-tag[data-colour].hot .dot.open { background: #000; }
+#waterfall #rail .job-tag[data-colour].hot .dot.closed { background: transparent; box-shadow: inset 0 0 0 1px #000; }
 /* Being heard: the brightest phosphor, boxed by a single line. */
 .job-tag[data-colour].speaking {
   color: var(--c-speaking);
@@ -245,13 +248,7 @@ section.pane {
 .pane-head::before { content: "[\a0"; }
 .pane-head::after { content: "\a0]"; }
 .pane-head .count { margin-inline-start: 0; color: var(--text); font-weight: 400; }
-.pane-head:hover:not(:disabled), .pane-head:focus-visible {
-  background: var(--text);
-  color: #000;
-}
-.pane-head:hover:not(:disabled) .count, .pane-head:focus-visible .count { color: #000; }
 &:not([data-footprint="narrow"]) section.pane[data-collapsed] .pane-head { color: var(--dim); }
-&:not([data-footprint="narrow"]) section.pane[data-collapsed] .pane-head:is(:hover:not(:disabled), :focus-visible) { color: #000; }
 &:not([data-footprint="narrow"]) section.pane[data-collapsed] { padding-block-end: 4px; }
 /* Both folded: the column is two upright titles, so the box gives way to plain rows. */
 html&[data-side="none"]:not([data-footprint="narrow"]) section.pane { margin: 0; border: 0; }
@@ -266,10 +263,22 @@ html&[data-side="none"]:not([data-footprint="narrow"]) .pane h2 { margin: 0; ali
 #jobs .job[data-colour] { border-inline-start: 0; padding-inline-start: 0; }
 #jobs .job[data-colour] > .kind { color: var(--job-c); font-weight: 700; }
 #jobs .job[data-colour] > .kind::before { content: "\25a0\a0"; color: var(--job-c); }
+/* The hot row: inverse video, every part black (two ids lift it over the speaking, finished and
+   failed colours). An action hovered, focused or pressed inside it turns back to green on black,
+   so it stands out of the row instead of melting into it. */
 #jobs .job.hot { outline: 0; background: var(--text); color: #000; text-shadow: none; }
-#jobs .job.hot > span, #jobs .job.hot > .kind, #jobs .job.hot > .kind::before,
-#jobs .job.hot .tag { color: #000; }
-#jobs .job.hot .actions button { color: #000; }
+#jobs#jobs .job.hot *, #jobs#jobs .job.hot *::before, #jobs#jobs .job.hot *::after {
+  color: #000;
+  text-shadow: none;
+}
+#jobs#jobs .job.hot .actions button:is(:hover:not(:disabled), :focus-visible, [aria-pressed="true"]) {
+  background: #000;
+  color: var(--text);
+}
+#jobs#jobs .job.hot .actions button:is(:hover:not(:disabled), :focus-visible, [aria-pressed="true"])::before,
+#jobs#jobs .job.hot .actions button:is(:hover:not(:disabled), :focus-visible, [aria-pressed="true"])::after {
+  color: var(--text);
+}
 #jobs .job[data-colour].speaking > .kind { color: var(--c-speaking); }
 #jobs .job.finished { color: var(--dim); opacity: 1; }
 #jobs .job[data-colour].finished > .kind, #jobs .job[data-colour].finished > .kind::before { color: var(--dim); }
@@ -338,6 +347,7 @@ html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .centre {
   display: inline;
 }
 html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded > .dot { display: inline-block; }
+html&[data-footprint="narrow"] #waterfall #rail .job-tag.expanded.hot { background: var(--job-c); }
 
 /* ---- motion: only for a reader who has not asked for less ---- */
 @media (prefers-reduced-motion: no-preference) {
