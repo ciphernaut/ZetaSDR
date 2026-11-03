@@ -267,6 +267,8 @@ struct Inner {
     registry: StageRegistry,
     /// The decoder modes, loaded at `open` against `registry`.
     modes: Arc<ModeRegistry>,
+    /// The page themes: the built-in ones until the caller sets its own with `set_themes`.
+    themes: RwLock<Arc<crate::themes::ThemeRegistry>>,
     /// The `capture` jobs' windows, opened (and expired) at `open`.
     bursts: Arc<crate::bursts::BurstStore>,
     leases: LeaseManager,
@@ -819,6 +821,7 @@ impl Node {
                 backends: cfg.backends,
                 registry,
                 modes,
+                themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
                 bursts,
                 leases: LeaseManager::new(),
                 bus,
@@ -988,6 +991,16 @@ impl Node {
                 self.inner.sync_bank(p.id(), band);
             }
         }
+    }
+
+    /// Use `themes` as the page themes (`themes_list`, the served theme files).
+    pub fn set_themes(&self, themes: Arc<crate::themes::ThemeRegistry>) {
+        *self.inner.themes.write().unwrap() = themes;
+    }
+
+    /// The page themes (the built-in ones unless `set_themes` replaced them).
+    pub fn themes(&self) -> Arc<crate::themes::ThemeRegistry> {
+        self.inner.themes.read().unwrap().clone()
     }
 
     /// The channel bank the node keeps for `source`, if any.

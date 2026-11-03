@@ -132,6 +132,7 @@ async fn main() -> ExitCode {
         cli.ring_budget_mb,
         burst_policy,
         cli.modes_dir.clone(),
+        cli.themes_dir.clone(),
         speech.clone(),
     )
     .await

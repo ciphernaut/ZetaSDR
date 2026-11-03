@@ -338,7 +338,8 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// device is opened here, in a `zeta soapy-worker` child unless `--soapy-in-process`.
 /// `resume` relaunches persisted `Running` jobs (`serve`); without it they are listed as
 /// persisted and left alone (one-shot). `speech` is the backend `transcribe`
-/// jobs run on. `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for
+/// jobs run on. `themes_dir` is the operator's themes (`--themes-dir`; `None` for
+/// [`zeta_core::themes::default_operator_dir`]). `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for
 /// [`zeta_core::modes::default_operator_dir`]); each broken row is reported on stderr, one
 /// line each, then the handler report of the program rows ([`probe_handlers`]); neither
 /// fails the node. Errors name the flag, never a Kiwi password or a node secret. The node
@@ -352,10 +353,12 @@ pub async fn open(
     ring_budget_mb: Option<u64>,
     burst_policy: BurstPolicy,
     modes_dir: Option<PathBuf>,
+    themes_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
 ) -> Result<(Node, RemotePorts), String> {
     let (registry, modes, modes_dir) = load_modes(&state_dir, plugins, speech, modes_dir).await?;
-    open_with(
+    let themes = load_themes(themes_dir);
+    let (node, remotes) = open_with(
         state_dir,
         registry,
         modes,
@@ -365,7 +368,21 @@ pub async fn open(
         ring_budget_mb,
         burst_policy,
     )
-    .await
+    .await?;
+    node.set_themes(themes);
+    Ok((node, remotes))
+}
+
+/// The themes (`--themes-dir`, else [`zeta_core::themes::default_operator_dir`]) over the
+/// built-in ones; each broken theme is reported on stderr, one line each, and none fails
+/// the node.
+fn load_themes(themes_dir: Option<PathBuf>) -> Arc<zeta_core::themes::ThemeRegistry> {
+    let dir = themes_dir.or_else(zeta_core::themes::default_operator_dir);
+    let themes = zeta_core::themes::ThemeRegistry::load(dir.as_deref());
+    for line in themes.startup_lines() {
+        eprintln!("{line}");
+    }
+    Arc::new(themes)
 }
 
 /// The stage registry (built-ins, `transcribe` on `speech`, each probed `--plugin`) and

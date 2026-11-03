@@ -489,6 +489,7 @@ async fn read_only_ops_are_logged_without_their_result() {
     let dir = tempfile::tempdir().unwrap();
     let node = open(dir.path()).await;
     node.apply(Op::JobList {}).await.unwrap();
+    node.apply(Op::ThemesList {}).await.unwrap();
     let id = match node
         .apply(Op::JobStart {
             kind: zeta_core::ops::JobKind::Passthrough,
@@ -518,15 +519,25 @@ async fn read_only_ops_are_logged_without_their_result() {
         .iter()
         .map(|l| l["op"]["op"].as_str().unwrap())
         .collect();
-    assert_eq!(ops, ["job_list", "job_start", "job_context", "job_stop"]);
+    assert_eq!(
+        ops,
+        [
+            "job_list",
+            "themes_list",
+            "job_start",
+            "job_context",
+            "job_stop"
+        ]
+    );
     // A successful read: op, outcome, transport and time, no result.
     assert!(lines[0].get("result").is_none(), "{}", lines[0]);
     assert_eq!(lines[0]["outcome"], "ok");
     assert_eq!(lines[0]["transport"], "local");
     assert!(lines[0]["t_ns"].is_u64());
     // A mutating op keeps its result; a failed read keeps its error.
-    assert_eq!(lines[1]["result"]["result"], "job");
-    assert_eq!(lines[2]["outcome"], "error");
-    assert_eq!(lines[2]["error"]["error"], "unknown");
-    assert!(lines[3].get("result").is_some(), "{}", lines[3]);
+    assert!(lines[1].get("result").is_none(), "{}", lines[1]);
+    assert_eq!(lines[2]["result"]["result"], "job");
+    assert_eq!(lines[3]["outcome"], "error");
+    assert_eq!(lines[3]["error"]["error"], "unknown");
+    assert!(lines[4].get("result").is_some(), "{}", lines[4]);
 }

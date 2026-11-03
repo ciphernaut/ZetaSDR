@@ -286,3 +286,60 @@ fn a_bad_style_css_breaks_the_theme() {
         Some("style.css: 1048577 bytes, more than the 1 MiB limit")
     );
 }
+
+/// `themes_list` answers the built-ins, the operator's theme and a broken one with its
+/// reason, from the registry `set_themes` gave the node.
+#[tokio::test]
+async fn themes_list_answers_every_theme() {
+    use std::sync::Arc;
+    use zeta_core::node::{Node, NodeConfig};
+    use zeta_core::ops::{Op, OpResult};
+    use zeta_core::stage::{Backend, StageRegistry};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("themes");
+    theme_dir(&root, "mine", valid("mine"), &[]);
+    let bad = root.join("broken");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("theme.json"), r#"{"id":"broken","bogus":1}"#).unwrap();
+    let cfg = NodeConfig {
+        burst_policy: Default::default(),
+        state_dir: dir.path().join("state"),
+        ring_seconds: 1.0,
+        ring_budget_bytes: 64 << 20,
+        scan_dwell_ms: 20,
+        backends: vec![Backend::Cpu],
+        resume: true,
+        bank_factory: None,
+        modes_dir: None,
+    };
+    let node = Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap();
+    node.set_themes(Arc::new(ThemeRegistry::load(Some(&root))));
+    let OpResult::Themes { themes } = node.apply_from(Op::ThemesList {}, "local").await.unwrap()
+    else {
+        panic!("not themes");
+    };
+    let row = |id: &str| {
+        themes
+            .iter()
+            .find(|t| t.id == id)
+            .unwrap_or_else(|| panic!("{id}"))
+    };
+    for id in ["console", "plain"] {
+        let t = row(id);
+        assert_eq!(t.state, ThemeState::Ready);
+        assert!(t.builtin && !t.replaces_builtin && t.reason.is_none());
+        assert!(t.color_scheme.is_some());
+    }
+    let mine = row("mine");
+    assert_eq!(mine.name, "My theme");
+    assert_eq!(mine.state, ThemeState::Ready);
+    assert!(!mine.builtin);
+    let broken = row("broken");
+    assert_eq!(broken.state, ThemeState::Broken);
+    assert_eq!(broken.name, "broken");
+    assert_eq!(broken.description, "");
+    assert!(broken.color_scheme.is_none());
+    assert!(broken.reason.as_deref().unwrap().contains("bogus"));
+    assert!(themes.windows(2).all(|w| w[0].id <= w[1].id));
+}

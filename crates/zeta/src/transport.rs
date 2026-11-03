@@ -61,6 +61,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             cli.ring_budget_mb,
             burst_policy,
             cli.modes_dir,
+            cli.themes_dir,
             speech,
             cli.knowledge_acma,
         )
@@ -90,7 +91,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
     if cli.configures_local_node() {
         return usage(
-            "sources, plugins and modes are configured on the serving node: drop --source-*, --plugin, --state-dir, --modes-dir, --knowledge-acma and --bursts-keep-* with --node (their environment variables are ignored)",
+            "sources, plugins, modes and themes are configured on the serving node: drop --source-*, --plugin, --state-dir, --modes-dir, --themes-dir, --knowledge-acma and --bursts-keep-* with --node (their environment variables are ignored)",
         );
     }
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {
@@ -109,6 +110,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
             &[],
             None,
             Default::default(),
+            None,
             None,
             None,
             None,

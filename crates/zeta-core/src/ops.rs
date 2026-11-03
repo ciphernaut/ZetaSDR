@@ -394,6 +394,9 @@ pub enum Op {
         #[schemars(required, schema_with = "crate::modes::nullable_enum::<ModeState>")]
         state: Option<ModeState>,
     },
+    /// The themes the page can use, one row each (built-ins, then the operator's
+    /// `--themes-dir`), sorted by id.
+    ThemesList {},
     /// One mode's row as loaded, with its `state` and `reason`.
     ModesShow {
         id: String,
@@ -1974,6 +1977,58 @@ impl From<&LoadedMode> for ModeInfo {
     }
 }
 
+/// One theme as `themes_list` reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct ThemeInfo {
+    pub id: String,
+    /// The theme's display name; a broken theme's id.
+    pub name: String,
+    /// One line about the look; `""` for a broken theme.
+    pub description: String,
+    /// The page's `color-scheme` under the theme; `null` for a broken theme.
+    #[schemars(
+        required,
+        schema_with = "crate::modes::nullable_enum::<crate::themes::ColorScheme>"
+    )]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub color_scheme: Option<crate::themes::ColorScheme>,
+    /// Shipped with the node.
+    pub builtin: bool,
+    /// An operator theme that replaces the built-in with its id.
+    pub replaces_builtin: bool,
+    /// `themes/<id>` for a built-in, the folder's path for an operator theme.
+    pub file: String,
+    pub state: crate::themes::ThemeState,
+    /// Why the theme is broken (`<field>: <error>`); `null` when ready.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub reason: Option<String>,
+}
+
+impl From<&crate::themes::LoadedTheme> for ThemeInfo {
+    fn from(t: &crate::themes::LoadedTheme) -> Self {
+        ThemeInfo {
+            id: t.id.clone(),
+            name: t
+                .theme
+                .as_ref()
+                .map_or_else(|| t.id.clone(), |j| j.name.clone()),
+            description: t
+                .theme
+                .as_ref()
+                .map_or_else(String::new, |j| j.description.clone()),
+            color_scheme: t.theme.as_ref().map(|j| j.color_scheme),
+            builtin: t.builtin,
+            replaces_builtin: t.replaces_builtin,
+            file: t.file.clone(),
+            state: t.state,
+            reason: t.reason.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "result",
@@ -2028,6 +2083,10 @@ pub enum OpResult {
     /// `modes_list`: one entry per row, sorted by id.
     Modes {
         modes: Vec<ModeInfo>,
+    },
+    /// `themes_list`: one entry per theme, sorted by id.
+    Themes {
+        themes: Vec<ThemeInfo>,
     },
     /// `modes_show`: the row as loaded.
     Mode {
@@ -2110,6 +2169,7 @@ impl Op {
             Op::KnowledgeLookup { .. } => "knowledge_lookup",
             Op::ChannelPlans {} => "channel_plans",
             Op::ModesList { .. } => "modes_list",
+            Op::ThemesList {} => "themes_list",
             Op::ModesShow { .. } => "modes_show",
             Op::Classify { .. } => "classify",
             Op::Schema {} => "schema",
@@ -2132,6 +2192,7 @@ impl Op {
                 | Op::KnowledgeLookup { .. }
                 | Op::ChannelPlans {}
                 | Op::ModesList { .. }
+                | Op::ThemesList {}
                 | Op::ModesShow { .. }
                 | Op::StationGet {}
                 | Op::CaptureList { .. }
@@ -2183,6 +2244,7 @@ impl OpResult {
             OpResult::Knowledge { .. } => "knowledge",
             OpResult::ChannelPlans { .. } => "channel_plans",
             OpResult::Modes { .. } => "modes",
+            OpResult::Themes { .. } => "themes",
             OpResult::Mode { .. } => "mode",
             OpResult::Classification { .. } => "classification",
             OpResult::Gain(_) => "gain",
@@ -3142,6 +3204,9 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 .filter(|m| state.is_none_or(|s| m.state == s))
                 .map(ModeInfo::from)
                 .collect(),
+        }),
+        Op::ThemesList {} => Ok(OpResult::Themes {
+            themes: node.themes().all().iter().map(ThemeInfo::from).collect(),
         }),
         Op::ModesShow { id } => {
             let modes = node.modes();

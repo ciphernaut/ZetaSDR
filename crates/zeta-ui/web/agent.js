@@ -119,6 +119,7 @@ export const QUIET_OPS = new Set([
   "source_list",
   "modes_list",
   "modes_show",
+  "themes_list",
   "capture_list",
   "station_get",
 ]);

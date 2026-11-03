@@ -70,6 +70,11 @@ pub struct Cli {
     /// ~/.config/zetasdr/modes]
     #[arg(long, global = true, value_name = "PATH")]
     pub modes_dir: Option<PathBuf>,
+    /// Directory of the operator's themes (one folder each), read after the built-in ones;
+    /// a theme with a built-in id replaces it [default: $XDG_CONFIG_HOME/zetasdr/themes or
+    /// ~/.config/zetasdr/themes]
+    #[arg(long, global = true, value_name = "PATH")]
+    pub themes_dir: Option<PathBuf>,
     #[command(flatten)]
     pub speech: SpeechArgs,
     /// Every source flag parsed, file then soapy then kiwi then node then vrt (filled by
@@ -251,6 +256,7 @@ impl Cli {
             || !self.plugins.is_empty()
             || self.state_dir.is_some()
             || self.modes_dir.is_some()
+            || self.themes_dir.is_some()
             || self.knowledge_acma.is_some()
             || self.bursts_keep_mb.is_some()
             || self.bursts_keep_days.is_some()
@@ -301,6 +307,9 @@ pub enum Command {
     /// The decoder modes the node knows
     #[command(subcommand)]
     Modes(ModesCmd),
+    /// The themes the page can use
+    #[command(subcommand)]
+    Themes(ThemesCmd),
     /// Run every classifier over a selection of a source ring
     Classify(SelectionArgs),
     /// JSON schemas of operations, results and errors
@@ -557,6 +566,12 @@ pub fn parse_channels(s: &str) -> Result<Channels, String> {
     out.sort_unstable();
     out.dedup();
     Ok(Channels(out))
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ThemesCmd {
+    /// List the themes with their state (ready, broken)
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1268,6 +1283,7 @@ impl Command {
             Command::Station(StationCmd::Clear) => Op::StationClear {},
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
+            Command::Themes(ThemesCmd::List) => Op::ThemesList {},
             Command::Classify(s) => Op::Classify {
                 selection: s.into(),
             },

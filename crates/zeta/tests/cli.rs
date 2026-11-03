@@ -1586,6 +1586,7 @@ fn node_mode_rejects_source_and_plugin_flags() {
         ["--source-vrt", "v=udp://127.0.0.1:4991"],
         ["--source-soapy", "h=driver=hackrf"],
         ["--plugin", "gain=/x"],
+        ["--themes-dir", "/x"],
     ] {
         zeta_bin()
             .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
@@ -2915,6 +2916,53 @@ fn the_default_modes_dir_is_the_xdg_one() {
     let m = show(&["--modes-dir", &empty]);
     assert_eq!(m["row"]["name"], "POCSAG pagers", "{m}");
     assert_eq!(m["file"], "modes/pocsag_decode.json", "{m}");
+}
+
+/// `zeta themes list` prints the built-in themes, ready.
+#[test]
+fn themes_list_prints_the_builtins() {
+    let dir = tempfile::tempdir().unwrap();
+    let themes = dir.path().join("themes");
+    std::fs::create_dir_all(&themes).unwrap();
+    let themes_dir = themes.display().to_string();
+    let out = zeta(dir.path(), &["--themes-dir", &themes_dir, "themes", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "themes", "{v}");
+    let rows = v["value"]["themes"].as_array().expect("themes array");
+    let ids: Vec<&str> = rows.iter().filter_map(|t| t["id"].as_str()).collect();
+    assert!(ids.contains(&"console") && ids.contains(&"plain"), "{v}");
+    assert!(rows.iter().all(|t| t["state"] == "ready"), "{v}");
+}
+
+/// A theme folder that does not validate is logged at startup and listed as broken; the
+/// node runs.
+#[test]
+fn a_broken_operator_theme_is_reported_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let themes = dir.path().join("themes");
+    std::fs::create_dir_all(themes.join("mytheme")).unwrap();
+    std::fs::write(
+        themes.join("mytheme/theme.json"),
+        r#"{"id":"mytheme","bogus":1}"#,
+    )
+    .unwrap();
+    let themes_dir = themes.display().to_string();
+    let out = zeta(dir.path(), &["--themes-dir", &themes_dir, "themes", "list"])
+        .assert()
+        .success()
+        .stderr(contains("zeta: theme mytheme ("))
+        .get_output()
+        .stdout
+        .clone();
+    let rows = json(&out)["value"]["themes"].as_array().unwrap().clone();
+    let t = rows.iter().find(|t| t["id"] == "mytheme").expect("mytheme");
+    assert_eq!(t["state"], "broken");
+    assert!(t["reason"].as_str().unwrap().contains("bogus"));
 }
 
 /// A row file that does not parse is logged at startup and listed as broken; the node runs.
