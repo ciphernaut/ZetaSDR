@@ -389,7 +389,9 @@ test lives in the driver crate, see its README).
 
 ## Decoder modes
 
-A decoder is a data row, not code. The built-in rows live in `modes/*.json` (embedded in the binary); your own go in `--modes-dir PATH` (default `$XDG_CONFIG_HOME/zetasdr/modes`, else `~/.config/zetasdr/modes`), and a row with a built-in `id` replaces it. Themes follow the same pattern: `--themes-dir PATH` (default `$XDG_CONFIG_HOME/zetasdr/themes`, else `~/.config/zetasdr/themes`), see `docs/themes.md`. A row that does not parse or validate is listed `broken` (with its `file` and the offending field) and logged at startup as `zeta: mode <id> (<file>): <field>: <error>`; it never stops the node.
+A decoder is a data row, not code. The built-in rows live in `modes/*.json` (embedded in the binary); your own go in `--modes-dir PATH` (default `$XDG_CONFIG_HOME/zetasdr/modes`, else `~/.config/zetasdr/modes`), and a row with a built-in `id` replaces it. A row that does not parse or validate is listed `broken` (with its `file` and the offending field) and logged at startup as `zeta: mode <id> (<file>): <field>: <error>`; it never stops the node.
+
+Themes follow the same pattern: `--themes-dir PATH` (default `$XDG_CONFIG_HOME/zetasdr/themes`, else `~/.config/zetasdr/themes`), see `docs/themes.md`.
 
 ```bash
 zeta modes list [--family F] [--state ready|broken|unavailable]   # every row, with its state

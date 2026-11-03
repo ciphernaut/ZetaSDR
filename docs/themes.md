@@ -159,6 +159,11 @@ The node serves the file wrapped so that it applies only while its theme is acti
 4. `[data-theme="<id>"] { ... }` holding the colour scheme, `--ribbon-tilt`, each token and the
    rest of the file, scoped by native CSS nesting.
 
+`@font-face` and `@keyframes` are hoisted only at the file's top level: nested in `@media` they
+stay inside the wrapper, where browsers drop them. `@property`, `@counter-style` and `@charset`
+are not supported (they would end up inside the wrapper rule). An `animation` that names a
+keyframe through `var()` is not renamed.
+
 Write selectors as you would for the page; the wrapper adds the scope. A rule about `<html>`
 itself (its `data-` attributes) must be written with `&`: a bare `html[...]` or `:root` inside the
 wrapper matches nothing. The narrow footprint's rail, for example:
@@ -207,7 +212,12 @@ Regions:
 - `#side`: the side column. `section.pane` is a pane in it (`#pane-transcript`, `#pane-jobs`);
   `.pane-head` is its header button; `section.pane[data-collapsed]` is a folded one.
 - `#panes`: the pane strip (the tabs for the subjects and explore views).
-- `#bar`: the command bar. `#cmd`: its input. `#mic`: the microphone button.
+- `#bar`: the command bar.
+
+With only the binary and no checkout, fetch the starting files from a running node instead:
+`/ui/themes/plain/theme.json` and `/ui/themes/plain/style.css` (no bearer needed). The
+`style.css` comes back wrapped in the theme's scope, so start from `theme.json` and an empty
+`style.css`. `#cmd`: its input. `#mic`: the microphone button.
 - `#map`: the map pane. `#graph`: the graph view (a modal dialog).
 - `[role="menu"]`: a menu (`#ctx`, the box menu, and `#ctx-outline`, the outline menu); its entries
   are `.ctx-item`.
