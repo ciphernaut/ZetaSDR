@@ -17,7 +17,7 @@ use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, Provenance, StreamId, StreamKind, Timestamp};
 
-use crate::{Input, frame_span, is_seam, run_map_ending};
+use crate::{Input, is_seam, run_map_ending};
 
 /// The stage kind, as graphs name it.
 pub const CLOCK_RECOVER_KIND: &str = "clock_recover";
@@ -61,6 +61,11 @@ const POWER_TC_SYMBOLS: f64 = 32.0;
 
 /// Furthest one normalised detector output may move the loop, either way.
 const ERROR_CLAMP: f64 = 4.0;
+
+/// Furthest one symbol's step may move from the period, as a fraction of it, so the
+/// strobe always moves forward (a step in `[period/2, 3·period/2]`) even at the
+/// largest `loop_bw`.
+const STEP_REACH: f64 = 0.5;
 
 /// Floor of the normalising power, so silence does not divide by zero.
 const MIN_POWER: f64 = 1e-12;
@@ -310,7 +315,11 @@ impl Loop {
                 self.window.errors += 1;
                 self.period =
                     (self.period + self.sps * self.ki * e).clamp(self.period_lo, self.period_hi);
-                step = self.period + self.sps * self.kp * e;
+                // Bounded so the strobe always moves forward, whatever `loop_bw`.
+                step = (self.period + self.sps * self.kp * e).clamp(
+                    self.period * (1.0 - STEP_REACH),
+                    self.period * (1.0 + STEP_REACH),
+                );
             }
             first.get_or_insert(self.next);
             self.window.first.get_or_insert(self.next);
@@ -391,8 +400,8 @@ impl Loop {
 }
 
 /// Recovers the symbol clock of a 1-channel decision signal or 2-channel I/Q: one
-/// sample per symbol out at `sample_rate_hz = symbol_rate_baud`, each frame stamped
-/// with its first symbol's time, and a `timing` event every [`TIMING_EVERY_MS`] of
+/// sample per symbol out at `sample_rate_hz = symbol_rate_baud`, each frame spanning
+/// its first symbol's time to the next strobe's (so frames within a run meet exactly), and a `timing` event every [`TIMING_EVERY_MS`] of
 /// input (and for the partial window at a seam, a lag or the input's end) noted to the
 /// job as `clock`. A seam ([`is_seam`]), a lag or a change of rate or channels restarts
 /// the loop.
@@ -486,6 +495,12 @@ impl Stage for ClockRecoverStage {
                     "{CLOCK_RECOVER_KIND}: expects 1 or 2 channels, got {channels}"
                 )));
             }
+            if samples.len() % channels != 0 {
+                return Err(StageError::Failed(format!(
+                    "{CLOCK_RECOVER_KIND}: {} samples is not a whole number of {channels}-channel frames",
+                    samples.len()
+                )));
+            }
             let span = &frame.provenance.span;
             let seam = prev_end.is_some_and(|e| is_seam(e, span.start_ns.0, rate));
             prev_end = Some(span.end_ns.0);
@@ -509,8 +524,12 @@ impl Stage for ClockRecoverStage {
             let (symbols, first) = l.step(samples);
             if let Some(first) = first {
                 let mut prov = frame.provenance.clone();
-                let n = symbols.len() / channels;
-                prov.span = frame_span(Timestamp(l.time_ns(first)), n, l.baud as u64);
+                // From the first symbol's time to the next strobe's, so the next frame
+                // starts where this one ends however the loop spaced its symbols.
+                prov.span = zeta_core::types::Span {
+                    start_ns: Timestamp(l.time_ns(first)),
+                    end_ns: Timestamp(l.time_ns(l.next)),
+                };
                 published.push(Frame::new(
                     out.clone(),
                     prov,
@@ -649,6 +668,11 @@ mod tests {
     /// Run the stage over `input` to its end: its audio frames, event payloads, the job
     /// context its notes build (merged key by key) and its event stream's id.
     async fn run_clock_frames(params: Value, input: Vec<Frame>) -> Run {
+        try_run_clock_frames(params, input).await.unwrap()
+    }
+
+    /// [`run_clock_frames`], or the stage's error.
+    async fn try_run_clock_frames(params: Value, input: Vec<Frame>) -> Result<Run, StageError> {
         let bus = Arc::new(StreamBus::new(4096));
         let p = prov(0, 0, 1);
         let out = bus.register(StreamKind::Audio, p.clone());
@@ -673,8 +697,7 @@ mod tests {
                 CancellationToken::new(),
                 ctx,
             )
-            .await
-            .unwrap();
+            .await?;
         let mut frames = Vec::new();
         while let Ok(f) = rx_out.try_recv() {
             frames.push(f);
@@ -692,11 +715,24 @@ mod tests {
                 context.insert(k.clone(), v.clone());
             }
         }
-        Run {
+        Ok(Run {
             frames,
             events,
             context: Value::Object(context),
             event_stream: ev.0,
+        })
+    }
+
+    /// Output frames start in time order, each after the previous one's start, and no
+    /// two consecutive ones read as a seam.
+    fn assert_spans_continuous(frames: &[Frame]) {
+        for w in frames.windows(2) {
+            let (a, b) = (&w[0].provenance.span, &w[1].provenance.span);
+            assert!(b.start_ns.0 > a.start_ns.0, "{a:?} -> {b:?}");
+            assert!(
+                !crate::is_seam(a.end_ns.0, b.start_ns.0, BAUD as u64),
+                "{a:?} -> {b:?}"
+            );
         }
     }
 
@@ -886,6 +922,74 @@ mod tests {
                 w[1].provenance.span.start_ns.0,
             );
             assert!(!crate::is_seam(end, next, BAUD as u64), "{end} -> {next}");
+        }
+    }
+
+    /// Params for `algorithm` with the widest loop accepted.
+    fn wide(algorithm: &str) -> Value {
+        serde_json::json!({
+            "symbol_rate_baud": BAUD,
+            "loop_bw": super::LOOP_BW_MAX,
+            "algorithm": algorithm,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_widest_loop_over_noise_keeps_the_strobe_moving_forward() {
+        let rate = 8 * BAUD as u64;
+        let mut x = vec![0.0f32; 2 * rate as usize];
+        awgn_real(&mut x, 0.0, 16);
+        for algorithm in ["mm", "gardner", "early_late"] {
+            let run = run_clock_frames(wide(algorithm), frames(&x, 1, rate, T0)).await;
+            assert_spans_continuous(&run.frames);
+            let n: usize = run.frames.iter().map(|f| audio(f).2.len()).sum();
+            let symbols = x.len() / 8;
+            assert!(
+                n >= symbols * 2 / 3 && n <= symbols * 2,
+                "{algorithm}: {n} symbols from {symbols}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_widest_loop_over_a_1000_ppm_stream_strobes_each_symbol_once() {
+        // On rectangular pulses no detector holds the bits at the widest loop (the
+        // decisions need a narrower `loop_bw`); the strobe still moves forward, one per
+        // symbol, and the frames stay continuous.
+        let bits = random_bits(4000, 17);
+        let mut x = nrz(&bits, 8.0, TRACK_PPM)[3..].to_vec();
+        awgn_real(&mut x, 20.0, 18);
+        let rate = 8 * BAUD as u64;
+        for algorithm in ["mm", "gardner", "early_late"] {
+            let run = run_clock_frames(wide(algorithm), frames(&x, 1, rate, T0)).await;
+            assert_spans_continuous(&run.frames);
+            let n: usize = run.frames.iter().map(|f| audio(f).2.len()).sum();
+            assert!(
+                n.abs_diff(bits.len()) * 100 < bits.len(),
+                "{algorithm}: {n} symbols from {} bits",
+                bits.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ragged_two_channel_frame_is_refused_naming_the_count() {
+        let rate = 4 * BAUD as u64;
+        let input = vec![Frame::new(
+            zeta_core::types::StreamId::new(),
+            prov(T0, 2, rate),
+            Payload::Audio {
+                sample_rate_hz: Hz(rate),
+                channels: 2,
+                samples: Arc::from(vec![0.0f32; 5]),
+            },
+        )];
+        match try_run_clock_frames(serde_json::json!({"symbol_rate_baud": BAUD}), input).await {
+            Err(StageError::Failed(m)) => assert!(
+                m.contains("5 samples is not a whole number of 2-channel frames"),
+                "{m}"
+            ),
+            r => panic!("expected Failed, got {:?}", r.map(|r| r.frames.len())),
         }
     }
 
