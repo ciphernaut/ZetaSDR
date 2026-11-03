@@ -19,6 +19,7 @@ pub mod bank;
 pub mod burst_capture;
 pub mod catalogue;
 pub mod channel;
+pub mod crc;
 pub mod denoise;
 pub mod detect;
 pub mod fft;

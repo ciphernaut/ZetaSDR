@@ -69,18 +69,7 @@ pub fn bit_tones(bits: &[u8]) -> Vec<f64> {
 /// (CRC-16/KERMIT). Sent low byte first, so the CRC of a block followed by
 /// its CRC bytes is zero.
 pub fn crc16(bytes: &[u8]) -> u16 {
-    let mut crc = 0u16;
-    for &b in bytes {
-        crc ^= u16::from(b);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0x8408
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    crc
+    crate::crc::crc(&crate::crc::CRC16_KERMIT, bytes) as u16
 }
 
 /// One CRC-clean ACARS block.
