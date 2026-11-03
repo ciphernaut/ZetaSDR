@@ -863,6 +863,25 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 }
 #waterfall #rail .job-tag.thin > * { display: none; }
 [data-theme="console"] .job-tag[data-colour] { background: var(--job-c); color: #000; }
+/* narrow footprint (spec 4.10): the rail is 14px of thin segments, no text; the 12px spine
+   border is dropped so the whole width is clickable. A tap adds .expanded (overlays.js
+   RAIL_EXPAND_MS): the tag floats over the axis as a label, then folds back. */
+html[data-footprint="narrow"][data-theme="console"] { --rail-w: 14px; }
+html[data-footprint="narrow"][data-theme="console"] #waterfall #rail {
+  border-inline-start: 0; overflow: visible; z-index: 6;
+}
+html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag {
+  inset-inline-start: 0; inset-inline-end: 0; width: auto;
+  height: var(--rail-thin-px); padding: 0; font-size: 0; line-height: 0;
+  border-radius: 0; touch-action: none;
+}
+html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag > * { display: none; }
+html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.expanded {
+  inset-inline-start: 14px; inset-inline-end: auto; width: max-content; height: auto; z-index: 6;
+  padding-inline: 6px; font-size: 12px; line-height: 20px; border-radius: var(--radius-bar);
+}
+html[data-footprint="narrow"][data-theme="console"] #waterfall #rail .job-tag.expanded > * { display: initial; }
+
 [data-theme="console"] .job-tag .short,
 [data-theme="console"] .job-tag .snippet { display: none; }
 /* on a plan channel the rail reads the channel, else the kind; then the centre */

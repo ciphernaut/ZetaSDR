@@ -52,7 +52,7 @@ One open page held 12-16 of the node's 16 stream slots (`max_ws`); a second page
 
 ## UI: the page watches at most 4 jobs, so a tag loses its squelch dot
 
-With four demods and a `transcribe` attached, the oldest demod's tag had no squelch dot: the transcribe took a watched slot first (`MAX_WATCHED` 4, decoders before squelch-only jobs). Watch the squelch for every rigid job on the shown source, or prefer demodulators for the slots. From the B210 live run of plans 15/18, 2026-11-01.
+With four demods and a `transcribe` attached, the oldest demod's tag had no squelch dot: the transcribe took a watched slot first (`MAX_WATCHED` 4, decoders before squelch-only jobs). Watch the squelch for every rigid job on the shown source, or prefer demodulators for the slots. The jobs fold uses the watched-mix active set for unwatched jobs, so without a mix the fold only covers watched and squelch-less jobs. From the B210 live run of plans 15/18, 2026-11-01.
 
 ## Jobs: an attached job's record keeps its input's old tuning after a retune
 
@@ -75,9 +75,6 @@ From the operator, 2026-11-01 (after the B210 day). A running job's row and its 
 
 From the operator, 2026-11-01. Event ribbons (`signal new`, `identifying`, `unknown`, transcripts, the watch's lines) are laid out from the right-hand edge, over the newest columns, so they hide the fresh RF activity they announce. Anchor them at the left (the oldest columns) and let them run towards the right, or into a gutter, so the latest spectrum stays visible; the staircase lanes (above) and this share the layout code in `overlays.js`.
 
-## UI: the job panel hides the id behind a horizontal scroll
-
-From the operator, 2026-11-01. A job row's actions sit to the right of a horizontal scroller; by the time the scroller is found, the id (and kind) are out of view. Keep the id and kind sticky at the left, wrap or collapse the rest (band, state, events, actions) into a second line or an expand-on-select, and drop columns that repeat the tag. Settle it with the console restyle (below) rather than as a one-off, unless the row-actions gist above lands first.
 ## Feature: more digital decoding modes
 
 From the operator, 2026-10-27. Today's decoders: APRS (AFSK1200/AX.25), POCSAG, RDS, ACARS (MSK), ADS-B (dump1090 via `zeta-ext`). The design's layer-2 list (spec 6.2) also names DMR, LoRa/MeshCore and RS41 radiosondes, none of which decode yet, and the field craft promises digital voice (DMR, D-STAR, M17) feeding `transcribe`.
@@ -128,21 +125,6 @@ Needs: the `bits` stream kind and the layer-4 demod/slicer stages above (prerequ
 
 Scope estimate: the stage set about 1500-2500 lines in `zeta-dsp` with fixtures (synthesised FSK/PSK/OOK at known rates); `bit_view` heuristics 400-600; signature write-back 200-300; the `measure` upgrades 300-500. Two or three plans.
 
-## UI: console restyle
-
-From the operator, 2026-10-27; designed as plan 24 (`docs/superpowers/specs/2026-11-03-console-theme-design.md`), which supersedes the shape below. Restyle the web page in the idiom of the 1990s science-fiction bridge consoles, as homage and nothing that is the franchise's by name or mark (the software will be open source): rounded elbow frames, horizontal bar segments with end caps, a warm palette of our own values (orange, peach, lilac, blue, pale yellow on black), condensed uppercase labels with right-aligned numerals; every readout live, no decorative fillers.
-
-Today: `crates/zeta-ui/web/style.css` (391 lines, CSS variables from `:root`, dark `#0b0e14` background), 12 JS files, about 6200 lines. Layout lives partly in JS (overlays, waterfall, graph canvas), so a restyle is not CSS-only.
-
-Shape:
-- A theme layer: all colours and radii through `:root` variables, a `console` theme switching them (keep the current theme as `plain`). `view set theme console|plain`, persisted like the other view policies.
-- Frame: an elbow-and-sidebar chrome around the waterfall, job rows as end-capped bar buttons (kind, channel tag, squelch state as colour), transport/ops pane as a numeric readout column.
-- Canvas-drawn parts (axis ticks, channel outlines, graph nodes) read the theme variables rather than hard-coded colours.
-- Font: a condensed sans with tabular numerals (Antonio or Swiss 911 lookalike; free options exist). No external CDN; bundle it in the UI assets.
-- Keep the UI e2e suite green: scenarios select by id/role, not by colour or layout, so a restyle should not touch them; check the budget (the suite already runs near its 237 s deadline).
-
-Scope estimate: 300-500 lines CSS, 100-200 lines JS for the theme hooks and canvas colours, plus the font asset. One plan, UI-only, no node changes.
-
 ## Architecture: a mode registry and a generic external-decoder adaptor
 
 Open work left from plan 16's mode registry (delivered; see the plan series):
@@ -151,7 +133,7 @@ Open work left from plan 16's mode registry (delivered; see the plan series):
 - **Time.** UTC-slotted modes (FT8/FT4 15 s, WSPR 2 min, JT65 1 min) and TDMA (DMR, TETRA) need true block timestamps. The HackRF timestamp bug is fixed (plan 14); the 2 h clock run that would clear the WSJT family is still outstanding (plan series, "Outcome").
 - **Span decoders and trunking.** OnAir and OpenWebRX+ decode every POCSAG/APRS/VDL2 channel in a capture at once. On a pin that is one job per channel on the bank today; a decoder that finds its own channels would take the whole capture. Trunking (P25, DMR Tier III, MPT1327) needs a follower that starts voice jobs from control-channel events inside the pin.
 - **Vocoders.** Codec 2 (M17, FreeDV) in-crate; AMBE/IMBE only through an external `mbelib` build, never shipped; HD Radio HDC off.
-- **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback. Fits the console restyle.
+- **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback.
 - **Wideband modes** (DVB-T 8 MHz, DAB 1.5 MHz, LTE) run the direct path at full rate and want the GPU FFT; park them behind the HackRF-first set.
 - **`sync_bank` flapping** (from the 2026-10-27 investigation, not reproduced). A bank replaced while `feed_bank` still drains old-band blocks can swap back and forth, stalling a channel stage silently.
 
@@ -159,11 +141,24 @@ Open work left from plan 16's mode registry (delivered; see the plan series):
 
 Found in plan 16 task 7 (pre-existing): the debug-build bank path at 2.048 MHz does not deliver a decodable channel for a plain `pocsag_decode`, so the core identify tests run without the bank. Reproduce with the POCSAG fixture on a 2.048 MHz capture in a debug build, then check the release build before fixing.
 
+## UI: `view set dir ltr|rtl|auto`
+
+Plan 24 draws the frame, rail and ribbons with logical properties (`inset-inline-start` and friends), so a right-to-left page is mostly the `dir` attribute. Add the view policy (`auto` follows the browser) and check the canvas-drawn parts (axis ticks, ribbons' tilt) for left/right assumptions. Spec 4.9 of the console theme.
+
+## UI: `view set time_flow left|right`
+
+The waterfall's newest columns are on the right and ribbons drift left with the RF. A policy to flip it (newest on the left, drift right) independent of `dir`; ribbons, the rail's end strip and the squelch scroller read it. Spec 4.9 of the console theme.
+
+## UI: view policies in localStorage
+
+The theme and the side-column fold are held per tab, so a new tab starts from the defaults. Move the `view set` policies to localStorage (one choice shared across tabs), keeping the page's refill-from-live-traffic behaviour for everything else.
+
 ## UI: staircase transcript ribbons on the waterfall
 
 From the operator, 2026-10-27. Plan 24 shipped the step-up rule (`crates/zeta-ui/web/overlays.js` `place`/`fallBack`, behind `RIBBON_STEP_DIR` and `RIBBON_STEP_MS`): a new chunk takes its band's line, the unkeyed ribbons it overlaps step one lane up over 160 ms, a ribbon that would pass `MAX_LANES` (8) or reach another job band's base lane clips under the newer one, and lanes fall back as the line clears. `RIBBON_STEP_DIR = 1` with `RIBBON_STEP_MS = 0` restores the old push-down.
 
 Left:
+- A tilted long chunk visually crosses the neighbouring lanes: the rotation is outside the lane maths, so a lane's height ignores it.
 - A lane budget from the pixel height between this band and the next job's band, per footprint, so phone, laptop and a 4K wall give 2, 4 and 8 lanes rather than the constant `MAX_LANES`; the lower channel's staircase folds to fewer lanes rather than clipping.
 - The staircase sharing lanes with keyed rows (subjects, `fold`): today a keyed ribbon takes the first free lane and never steps, and an unkeyed chunk on the line simply draws over it. A held roster line for keyed rows and a staircase for packet-shaped rows should share one lane budget (see plan 23 and "UI: state-stream decoders beyond the first subjects" below).
 

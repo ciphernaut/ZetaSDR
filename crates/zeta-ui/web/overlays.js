@@ -217,6 +217,7 @@ export const RIBBON_STEP_DIR = -1;
 export const RIBBON_STEP_MS = 160;
 const TAG_GAP_PX = 2;
 const RAIL_THIN_PX = 5; // a collapsed rail tag's height (style.css --rail-thin-px)
+const RAIL_EXPAND_MS = 3000; // a tapped narrow rail segment shows its label this long
 const RAIL_GROUP_MIN = 6; // a cluster with more thin tags than this titles the first with the count
 export const SNIPPET_CHARS = 40;
 const CAPTURE_KEY = "capture";
@@ -1166,6 +1167,14 @@ class Overlays {
     el.dataset.colour = o.el.dataset.colour = String(channelColour(key));
     (this.rail ?? o.el).append(el);
     o.tag = el;
+    // Narrow: a tap expands the thin segment into its label for RAIL_EXPAND_MS. It only adds a
+    // class, so the long press (listenPress) on the same tag is untouched.
+    el.addEventListener("pointerdown", () => {
+      if (document.documentElement.dataset.footprint !== "narrow") return;
+      el.classList.add("expanded");
+      clearTimeout(o.expandTimer);
+      o.expandTimer = setTimeout(() => el.classList.remove("expanded"), RAIL_EXPAND_MS);
+    });
     el.addEventListener("click", () => {
       const row = o.job && this.jobRowEl(o.job);
       if (row) row.scrollIntoView({ block: "nearest" });
@@ -1183,6 +1192,7 @@ class Overlays {
     if (!o.tag) return;
     this.snippets.delete(key);
     if (this.hotJob === key) this.hotJob = null;
+    clearTimeout(o.expandTimer);
     o.tag.remove();
     o.tag = null;
     o.parts = null;
