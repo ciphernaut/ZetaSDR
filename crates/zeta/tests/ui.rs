@@ -469,7 +469,15 @@ fn fake_themes(dir: &Path) -> PathBuf {
     let mut broken = fixture.clone();
     broken["id"] = json!("console");
     broken["footprints"] = json!({"narrow": {"rail": false}});
-    for theme in [fixture, broken] {
+    // Waterfall grounds the page has to normalise: a CSS colour that is neither #hex nor
+    // comma rgb(), and one that is no colour at all.
+    let mut hsl = fixture.clone();
+    hsl["id"] = json!("hsl_bg");
+    hsl["tokens"] = json!({"--wf-bg": "hsl(120 100% 25%)"});
+    let mut bad = fixture.clone();
+    bad["id"] = json!("bad_bg");
+    bad["tokens"] = json!({"--wf-bg": "not-a-colour"});
+    for theme in [fixture, broken, hsl, bad] {
         let folder = themes.join(theme["id"].as_str().unwrap());
         std::fs::create_dir_all(&folder).expect("create a theme folder");
         let text = serde_json::to_string_pretty(&theme).unwrap();

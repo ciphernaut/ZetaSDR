@@ -196,17 +196,19 @@ const COARSE_ONLY = Object.freeze({ coarseOnly: true });
 export function themeColour(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
-// "#rrggbb", "#rgb" or "rgb(r, g, b)" -> [r, g, b]; null when it is none of them.
-function hexRgb(t) {
-  const f = /^rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$/i.exec(t);
-  if (f) {
-    const rgb = f.slice(1).map(Number);
-    return rgb.every((c) => c <= 255) ? rgb : null;
-  }
-  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(t);
-  if (!m) return null;
-  const h = m[1].length === 3 ? [...m[1]].map((c) => c + c).join("") : m[1];
-  return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+// Any CSS colour (named, #hex, rgb() in either syntax, hsl(), color-mix() ...) -> [r, g, b],
+// by painting it on a 1x1 canvas; null when the browser does not parse it or it is not opaque.
+let PARSE_CTX = null;
+function parseColour(t) {
+  if (!t) return null;
+  PARSE_CTX ||= document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+  const x = PARSE_CTX;
+  x.clearRect(0, 0, 1, 1);
+  x.fillStyle = "rgba(0, 0, 0, 0)"; // the sentinel an unparsed value leaves in place
+  x.fillStyle = t;
+  x.fillRect(0, 0, 1, 1);
+  const d = x.getImageData(0, 0, 1, 1).data;
+  return d[3] === 255 ? [d[0], d[1], d[2]] : null;
 }
 // The canvas ground (--wf-bg, #000030 in both themes), read again by refreshThemeColours().
 let BG = [0, 0, 48];
@@ -1619,13 +1621,11 @@ class Waterfall {
 
   // Read --wf-bg, --wf-select and --wf-select-alpha from the theme; the caller redraws.
   refreshThemeColours() {
-    const bg = themeColour("--wf-bg");
-    const rgb = hexRgb(bg);
-    if (rgb) {
-      BG = rgb;
-      BG_CSS = bg;
-    }
-    SELECT_CSS = themeColour("--wf-select") || SELECT_CSS;
+    // A value that does not parse falls back to the default, never to the last theme's.
+    BG = parseColour(themeColour("--wf-bg")) || [0, 0, 48];
+    BG_CSS = `rgb(${BG[0]}, ${BG[1]}, ${BG[2]})`;
+    const sel = parseColour(themeColour("--wf-select"));
+    SELECT_CSS = sel ? `rgb(${sel[0]}, ${sel[1]}, ${sel[2]})` : "#ffffff";
     const alpha = parseFloat(themeColour("--wf-select-alpha"));
     SELECT_ALPHA = Number.isFinite(alpha) && alpha >= 0 && alpha <= 1 ? alpha : 0.08;
   }

@@ -110,8 +110,8 @@ Each token is a custom property the core stylesheet declares in `:root`.
 - `--c-channel-6`: per-channel colour 6.
 - `--c-idle`: a quiet channel.
 - `--c-speaking`: a channel being heard.
-- `--wf-bg`: the waterfall canvas ground.
-- `--wf-select`: the drag rectangle's colour.
+- `--wf-bg`: the waterfall canvas ground; any opaque CSS colour (`#hex`, `rgb()`, `hsl()`, a name, `color-mix()`); one the browser cannot parse falls back to `#000030`.
+- `--wf-select`: the drag rectangle's colour; any opaque CSS colour, `#ffffff` when it does not parse.
 - `--wf-select-alpha`: the drag rectangle's fill opacity.
 - `--overlay-bg`: labels over the waterfall.
 - `--tint-span`: a capture's cached region.

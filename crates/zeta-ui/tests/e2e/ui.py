@@ -1470,6 +1470,18 @@ MAGENTA_AT_RIGHT_JS = """() => {
 }"""
 
 
+# Whether the left-most backing-pixel column of the waterfall canvas (no data scrolled to it
+# yet) holds the ground colour `arg` = [r, g, b].
+GROUND_AT_LEFT_JS = """(want) => {
+  const c = document.querySelector('#waterfall canvas.wf-canvas');
+  const d = c.getContext('2d').getImageData(0, 0, 1, c.height).data;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i] === want[0] && d[i + 1] === want[1] && d[i + 2] === want[2]) return true;
+  }
+  return false;
+}"""
+
+
 def scenario_operator_theme(page, url, secret):
     """An operator theme from --themes-dir (ui.rs fake_themes) applies its tokens, its layout
     (no rail) and its waterfall ramp; a broken folder's id is not offered."""
@@ -1484,11 +1496,19 @@ def scenario_operator_theme(page, url, secret):
             "() => getComputedStyle(document.documentElement)"
             ".getPropertyValue('--accent').trim() === '#ff00ff'")
         page.wait_for_function(MAGENTA_AT_RIGHT_JS, timeout=5_000)
+        # --wf-bg in any CSS colour paints the canvas ground; a value that is no colour falls
+        # back to #000030, not to the previous theme's ground.
+        run_cmd(page, "view set theme hsl_bg")
+        expect(html).to_have_attribute("data-theme", "hsl_bg")
+        page.wait_for_function(GROUND_AT_LEFT_JS, arg=[0, 128, 0], timeout=5_000)
+        run_cmd(page, "view set theme bad_bg")
+        expect(html).to_have_attribute("data-theme", "bad_bg")
+        page.wait_for_function(GROUND_AT_LEFT_JS, arg=[0, 0, 48], timeout=5_000)
         run_cmd(page, "view set theme console@broken")
         expect(view_line(page, "console@broken", error=True)).to_be_visible()
         run_cmd(page, "view set theme neon")
         expect(view_line(page, "neon", error=True)).to_contain_text("fixture_theme")
-        expect(html).to_have_attribute("data-theme", "fixture_theme")
+        expect(html).to_have_attribute("data-theme", "bad_bg")
     finally:
         run_cmd(page, "view reset")
 
