@@ -394,8 +394,11 @@ pub enum Op {
     /// features (`modulation`, one of `fsk`, `psk` and `ook`, from the layer-1 label:
     /// `fsk` and `fm` give `fsk`, `psk` and `ook` themselves; `symbol_rate_baud` and
     /// `order` from the record, `order` 2 when it has none; fsk takes 2 or 4, psk 2, 4
-    /// or 8, ook 2). The capture is resampled to 8 samples per symbol, moved to a rate the
-    /// resampler serves exactly; `capture_in` loops, paced, with a 500 ms pause between
+    /// or 8, ook 2). The capture is resampled to about 8 samples per symbol for fsk and ook, and
+    /// for psk to the smallest multiple of 4 times the baud that also covers a carrier offset
+    /// of 2000 Hz (the coarse estimate is unambiguous only within the rate over twice the
+    /// order), moved to a rate the resampler serves exactly; 4-fsk takes the `early_late`
+    /// clock; `capture_in` loops, paced, with a 500 ms pause between
     /// passes, and the job runs until stopped. Refused with `other`: a field neither the
     /// request nor the features give (`no symbol rate measured; give symbol_rate_baud`,
     /// `no modulation measured (label <x>); give modulation`), a rate the capture cannot

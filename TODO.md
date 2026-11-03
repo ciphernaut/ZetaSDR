@@ -97,20 +97,25 @@ Scope estimate: 300-600 lines per in-crate mode including fixtures and tests; 15
 
 ## Feature: layer 4, working an unknown signal
 
-From the operator, 2026-10-27. Today layer 4 is prose only (AGENTS.md "Working layer 4", spec 6.4): `measure` gives centre, bandwidth, SNR, burstiness, a symbol-rate guess and a coarse label; `classify` tries four decode-to-identify protocols and the catalogue; `iq read` saves a capture. There is no stage an agent can chain to go from a channel to bits.
+From the operator, 2026-10-27. Plan 19.2 shipped the stages (`capture_in`, `resample`, `fsk_demod`, `psk_demod`, `ook_demod`, `clock_recover`, `slicer`, `correlate`, `bit_view`), `graph_start`, `bits_start` and the Bits pane; the playbook is "Working layer 4". What is left:
+- Live chains by hand on a real capture (spec 9 item 3, after 19.3): the field host 404.025 MHz captures through `bits_start` and the Bits tab; `UAT.md` "Plan 19.2".
+- LoRa chirp-rate detection in `measure` (an unknown 250 kHz chirp is reported unknown today).
+- The `measure` upgrades 19.1 did not take: `measure` finds no symbol rate on short FSK bursts (the e2e fixture's captures had none, so `bits_start` needs `symbol_rate_baud` given), and better order estimates from constellation moments.
+- Write-back of a successful hypothesis as a signature (plan 19.3).
 
-Missing blocks (the spec's "vetted DSP blocks with typed parameters"):
-- `resample` (exists in `zeta-dsp` as a library, not a stage).
-- Demod primitives as stages: `fsk_demod` (2/4-level, measured tone spacing), `psk_demod` (BPSK/QPSK with Costas loop), `ook_demod` (envelope + threshold).
-- `clock_recover` (Gardner / M&M, early-late for OOK) → symbol stream.
-- `slicer` → bit stream events, with eye/constellation statistics in `job_context`.
-- `bit_view`: run-length histogram, autocorrelation for frame period, sync-word candidates, Manchester/NRZI/differential hypotheses, a few candidate CRC polynomials over hypothesised frames.
-- `correlate` against a given preamble or sync word.
-- Write-back: a successful hypothesis becomes a signature (sync word, rate, modulation, framing) a future `classify` matches; every session writes a labelled SigMF capture + feature record + steps (the layer-3 training data of spec 6.4).
+## Bits: deferred minors from plan 19.2
 
-Needs a `bits` stream kind (or `event` frames carrying packed bits) and an event payload for symbol statistics. The agent path exists (`zeta ask`, `/ask`, MCP), so the loop is driveable once the stages are there.
-
-Also a better `measure`: `symbol_rate_baud` by cyclostationary / spectral-line detection is `null` far too often today; add modulation-order estimates (constellation moments), tone spacing for FSK, chirp-rate detection for LoRa, and burst timing (on/off durations, period) for TDMA-like signals.
+- A bits job's outline on its capture's source tab (it has source `node` and shows on no radio tab).
+- `bit_view` decoding the likely line code (Manchester, NRZI) and re-running its candidates on the decoded stream.
+- An 8PSK chain test (the BER tests cover BPSK and QPSK).
+- `correlate` on `capture_in`'s segment boundary, when a sync straddles one.
+- `resample` does not flush its filter at input end: a one-pass chain loses one symbol.
+- The decision demods' shared levels release both levels every period, so a long one-level run drags the other (OOK silence without a seam, a long FSK carrier lead-in).
+- `eye_open` reads 0 on any outlier: use a percentile edge.
+- `psk_demod` holds up to 5 x 4096 samples while its coarse estimate defers.
+- A general fan-out (tee) for a node output; today one output feeds one edge.
+- The Bits pane's minors: stale sync marks across a seam, a full redraw per event, `withCorrelate` matching the node id `slicer` rather than the kind.
+- `jobs_stop` with a `plan` filter can stop a graph job whose capture band sits on a plan channel.
 
 ## Feature: generic layer-4 framing decoders (bits to structured frames)
 
