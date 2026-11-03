@@ -95,6 +95,14 @@ Original shape, now carried by rows: one job kind per mode, graph-expanded like 
 
 Scope estimate: 300-600 lines per in-crate mode including fixtures and tests; 150-250 per external wrapper. A first wave of M17 + DMR voice + RS41 + AIS is a plan on its own.
 
+## Bug: the bits chain does not recover a real OOK remote (first on-air test, 2026-11-04)
+
+The operator's 433 MHz fixed-code remote on the field host B210 (pin 435 MHz / 6.144 MHz): EV1527/PT2262 style at 433.882 MHz, about 30 kHz wide, 30-34 dB SNR; pulses 280 us (0) and 910 us (1) in a 1.25 ms bit, chip about 313 us (3200 Bd); a sync of one short pulse and 9.7 ms of silence (31 chips), then 24 bits, repeated about every 40 ms; code <button-code>, decoded offline from the samples. Captures on the node: the narrow set of job 01M6HTR8A8FK7E0P4G64RPPZTX (8 windows, 51.2 kHz at 433.882 MHz, layer 1 measured 3197 Bd) and the wide set of job 01M6HTNMP9ESVNSG6DXJPPE9DC (8 windows, 2.048 MHz at 433.4 MHz). Pin them before the store expires them, and copy one into a test fixture.
+
+- `bits_start --modulation ook --symbol-rate-baud 3200` on the narrow set (job 01M6HTS9GDRVCNY236ZRPFDXWH): `clock_recover` (early-late) reads 3199 Bd but never locks (error_rms 1.38), the slicer's eye_open is 0.04, the bits are almost all zeros, and the code's chip pattern matches at best 42/96 chips. The likely cause is the deferred minor of plan 19.2: the decision demods' shared levels release both levels every period, so the 31-chip sync silence drags the on-level toward the noise and the threshold with it. Fix that (release only the level an extreme is nearer to) and let early-late hold its phase through long off runs; a test over this capture must give <button-code>.
+- `bits_start` builds the chain around the capture's centre and never shifts to the measured centre: on the wide set the signal sits 482 kHz off the 433.4 MHz centre and the resampler's low-pass removes it. Mix the feature record's `center_hz` to DC (and filter to its band) before `resample`, or refuse naming the offset.
+- A fixed-code OOK remote like this one wants a mode row (rtl_433-style pulse-width decoding) more than layer-4 bits: a `pulse_ook` stage measuring on/off widths and a row per common timing (EV1527, PT2262) would decode it directly.
+
 ## Feature: layer 4, working an unknown signal
 
 From the operator, 2026-10-27. Plan 19.2 shipped the stages (`capture_in`, `resample`, `fsk_demod`, `psk_demod`, `ook_demod`, `clock_recover`, `slicer`, `correlate`, `bit_view`), `graph_start`, `bits_start` and the Bits pane; the playbook is "Working layer 4". What is left:
