@@ -19,6 +19,9 @@
 //       closes it.
 //   closeGraph()
 //       Closes the open graph modal, if any (the app calls it when the secret is rejected).
+//   redrawOpenGraph()
+//       Renders the open graph modal again, if any, so it reads the theme in force (the node
+//       radius, --radius-bar); the app calls it on a theme change.
 
 const NODE_W = 160;
 const NODE_H = 58;
@@ -351,6 +354,10 @@ class GraphModal {
 
 export function closeGraph() {
   if (current) current.close();
+}
+
+export function redrawOpenGraph() {
+  if (current && current.doc) current.render();
 }
 
 export async function showGraph(api, jobId) {

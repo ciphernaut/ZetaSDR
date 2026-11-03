@@ -28,7 +28,10 @@
 //         pane             none | a registered pane's id (default none; panes.js): the pane
 //                          shown under the waterfall. A stored id is kept over a reload before
 //                          its pane registers (the strip shows none until it does)
-//         theme            console | plain (default console): <html data-theme> (app.js)
+//         theme            a ready theme's id (default console; themeIds): the theme the
+//                          page applies (app.js applyTheme). A stored id that is a valid id
+//                          is kept over a reload before themes_list answers; app.js falls
+//                          back to console when it is not ready
 //         side             both | transcript | jobs | none (default both): which of the side
 //                          column's panes are open, the others folded to their header bars
 //                          (app.js applySide)
@@ -37,6 +40,8 @@
 //       with `station_get` at page load), the home used while the view's `home` is none
 //   homeOf(view) -> {lat, lon} | null   the home in force: the view's `home` when set, else
 //       the station's (`view set home` takes precedence; `none` falls back to the station)
+//   themeIds() -> [id]   the ids `view set theme` accepts: the built-ins until
+//       setThemeIds(ids) gives the ready ids `themes_list` answered (app.js loadThemes)
 //   VIEW_KEY   the sessionStorage key holding the values set ({key: value}, defaults left out)
 //   mountView() -> View
 //     view.get(key)             the value (the default when not set)
@@ -87,6 +92,19 @@ export function homeOf(view) {
 }
 
 const PANE_ID = /^[a-z][a-z0-9_]*(:[A-Za-z0-9_.:-]+)?$/;
+const THEME_ID = /^[a-z][a-z0-9_-]{0,31}$/;
+
+// The built-in themes, offered until `themes_list` answers.
+const BUILTIN_THEMES = ["console", "plain"];
+let readyThemes = BUILTIN_THEMES;
+
+export function themeIds() {
+  return [...readyThemes];
+}
+
+export function setThemeIds(ids) {
+  readyThemes = ids.filter((id) => typeof id === "string" && THEME_ID.test(id));
+}
 
 const positiveSeconds = (t) =>
   /^[1-9]\d*$/.test(t) && Number.isSafeInteger(Number(t)) ? Number(t) : undefined;
@@ -169,7 +187,15 @@ export const POLICIES = [
       }
     },
   },
-  { key: "theme", values: ["console", "plain"], default_: "console", describe: "console, plain" },
+  {
+    key: "theme",
+    parse: (t) => (themeIds().includes(t) ? t : undefined),
+    restore: (t) => (THEME_ID.test(t) ? t : undefined),
+    default_: "console",
+    get describe() {
+      return themeIds().join(", ");
+    },
+  },
   {
     key: "side",
     values: ["both", "transcript", "jobs", "none"],

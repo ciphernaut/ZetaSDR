@@ -25,6 +25,7 @@
   --c-speaking: var(--ok);      /* a channel being heard */
   --wf-bg: #000030;             /* waterfall canvas ground, both themes */
   --wf-select: #ffffff;         /* the drag rectangle */
+  --wf-select-alpha: 0.08;      /* the drag rectangle's fill opacity */
   --overlay-bg: color-mix(in srgb, var(--bg) 78%, transparent); /* labels over the waterfall */
   --tint-span: rgba(255, 255, 255, 0.04);     /* a capture's cached region */
   --tint-outline: rgba(255, 255, 255, 0.03);  /* a job outline's fill */

@@ -121,9 +121,16 @@ import { mountWaterfall } from "./waterfall.js";
 import { mountOverlays } from "./overlays.js";
 import { mountMenu } from "./menu.js";
 import { playJob } from "./audio.js";
-import { closeGraph, showGraph } from "./graph.js";
+import { closeGraph, redrawOpenGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
-import { homeOf, mountView, runViewCommand, setStationHome } from "./view.js";
+import {
+  homeOf,
+  mountView,
+  runViewCommand,
+  setStationHome,
+  setThemeIds,
+  themeIds,
+} from "./view.js";
 import { channelLabel, loadPlans, resolvePlan } from "./plans.js";
 import { MixWatch, isMuted, mixCovering, muteOp } from "./mix.js";
 import { mountCoarse } from "./coarse.js";
@@ -836,6 +843,7 @@ function start(api) {
   });
   state.subjects.onLearn(applyPanes);
   loadStationHome(api);
+  loadThemes(api);
   applyTheme();
   applySide();
   mountSideHeads();
@@ -843,12 +851,7 @@ function start(api) {
   applyMapPane();
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
-    if (key === "theme") {
-      applyTheme();
-      applyRail();
-      state.wf?.refreshThemeColours();
-      state.wf?.redraw();
-    }
+    if (key === "theme") applyTheme();
     if (key === "side") applySide();
     if (key === "map") applyMapPane();
     if (key === "pane") applyPanes();
@@ -942,13 +945,98 @@ async function loadStationHome(api) {
   }
 }
 
-// <html data-theme="console|plain"> from the view's `theme` policy; never absent. The rail
-// switch <html data-rail="on|off"> follows the console theme until it comes from the theme's
-// layout.
-function applyTheme() {
-  const theme = state.view ? state.view.get("theme") : "console";
-  document.documentElement.dataset.theme = theme;
-  document.documentElement.dataset.rail = theme === "console" ? "on" : "off";
+// The ready themes from `themes_list` become what `view set theme` offers (view.js
+// themeIds); a stored theme that is not among them falls back to console. A node without the
+// op leaves the built-ins.
+async function loadThemes(api) {
+  let ids;
+  try {
+    const r = await api.op({ op: "themes_list" });
+    if (!r || r.result !== "themes" || !Array.isArray(r.value?.themes)) return;
+    ids = r.value.themes.filter((t) => t.state === "ready").map((t) => t.id);
+  } catch {
+    return; // The built-in themes only.
+  }
+  if (state.api !== api) return;
+  setThemeIds(ids);
+  const theme = state.view.get("theme");
+  if (!themeIds().includes(theme)) themeFallback(theme);
+}
+
+// The theme in force: the view's `theme` policy applied from its files under
+// /ui/themes/<id>/ (theme.json, then style.css, which the node wraps in
+// [data-theme="<id>"]). <html data-theme> changes only once the new stylesheet has loaded,
+// so the page is never unstyled, and with it <html data-rail> (layout.rail), the waterfall's
+// ramp and canvas colours, the rail and an open graph view. A later switch supersedes one in
+// flight. A theme whose files fail falls back to console (themeFallback).
+let themeSwitch = 0;
+async function applyTheme() {
+  const id = state.view ? state.view.get("theme") : "console";
+  const seq = ++themeSwitch;
+  const root = document.documentElement;
+  let theme;
+  try {
+    const r = await fetch(`themes/${encodeURIComponent(id)}/theme.json`, { cache: "no-cache" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    theme = await r.json();
+    if (seq !== themeSwitch) return;
+    await loadThemeCss(id);
+  } catch {
+    if (seq === themeSwitch) themeFallback(id);
+    return;
+  }
+  if (seq !== themeSwitch) return;
+  root.dataset.theme = id;
+  root.dataset.rail = theme.layout?.rail === false ? "off" : "on";
+  applyRail();
+  if (state.wf) {
+    state.wf.refreshThemeColours();
+    state.wf.setRamp(theme.ramp);
+  }
+  redrawOpenGraph();
+}
+
+// Loads themes/<id>/style.css into a new <link id="theme-css">, replacing the old one once it
+// has loaded (the old rules stay until then); rejects when it fails to load. A stylesheet a
+// later call superseded is dropped when it loads, leaving the newer one.
+let themeCssLatest = null;
+function loadThemeCss(id) {
+  const old = document.getElementById("theme-css");
+  const href = `themes/${encodeURIComponent(id)}/style.css`;
+  themeCssLatest = null;
+  if (old && old.getAttribute("href") === href && old.sheet) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const link = document.createElement("link");
+    themeCssLatest = link;
+    link.rel = "stylesheet";
+    link.href = href;
+    link.onload = () => {
+      if (link !== themeCssLatest) {
+        link.remove();
+        resolve();
+        return;
+      }
+      if (old !== link) old?.remove();
+      link.id = "theme-css";
+      resolve();
+    };
+    link.onerror = () => {
+      link.remove();
+      reject(new Error(`${href} failed to load`));
+    };
+    (old ?? document.head.lastElementChild).after(link);
+  });
+}
+
+// A theme that is not available (gone from the node, broken, its files failing): the
+// transcript says so once and the view's `theme` goes back to console, which applies it.
+function themeFallback(id) {
+  if (id === "console") {
+    document.documentElement.dataset.theme = "console";
+    return;
+  }
+  state.transcript?.note(`theme ${id} is not available; using console`, true);
+  state.view?.set("theme", "console");
 }
 
 // The side column's panes (view policy `side`): the ones left out of the value are folded to
@@ -1002,10 +1090,11 @@ function mountSideHeads() {
   }
 }
 
-// The job tags live in the waterfall's rail in the console theme, on their outlines in plain.
+// The job tags live in the waterfall's rail when the theme's layout has one (<html
+// data-rail="on">), on their outlines otherwise.
 function applyRail() {
   if (!state.ov || !state.wf) return;
-  state.ov.setRail(state.view && state.view.get("theme") === "console" ? state.wf.rail : null);
+  state.ov.setRail(document.documentElement.dataset.rail === "on" ? state.wf.rail : null);
 }
 
 function applyMapPane() {
@@ -1332,6 +1421,11 @@ window.zetaTest = {
   },
   setSecret(s) {
     if (state.api) state.api.secret = s;
+  },
+  // The ids `view set theme` accepts (view.js themeIds: the ready ones once themes_list
+  // answered).
+  themeIds() {
+    return themeIds();
   },
   // The home in force (view.js homeOf: view `home`, else the station read at load), or null.
   home() {

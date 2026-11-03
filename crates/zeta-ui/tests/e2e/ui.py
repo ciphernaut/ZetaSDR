@@ -1133,7 +1133,9 @@ def scenario_theme_switch(page, url, secret):
     stored = page.evaluate("sessionStorage.getItem('zeta.view')")
     assert '"theme":"plain"' in stored, stored
     run_cmd(page, "view set theme neon")
-    expect(view_line(page, "neon", error=True)).to_contain_text("console, plain")
+    neon = view_line(page, "neon", error=True)
+    for theme in ("console", "plain", "fixture_theme"):
+        expect(neon).to_contain_text(theme)
     run_cmd(page, "view reset")
     expect(page.locator("html")).to_have_attribute("data-theme", "console")
     # The mic ends the command bar with the elbow's cap; a finished row reads in the theme's text.
@@ -1256,6 +1258,115 @@ def scenario_theme_shots(page, url, secret):
                     mask=[page.locator(".wf-canvas"), page.locator("#status"),
                           page.locator(".src-tab .health")])
     finally:
+        if demod:
+            stop_job(url, secret, demod)
+
+
+# The right-most 10 columns of the waterfall hold the fixture theme's ramp (black to magenta):
+# no pixel greener than it is red, and the tone well on the red side.
+MAGENTA_AT_RIGHT_JS = """() => {
+  const c = document.querySelector('#waterfall canvas.wf-canvas');
+  if (!c || c.width < 10 || c.height < 1) return false;
+  const d = c.getContext('2d').getImageData(c.width - 10, 0, 10, c.height).data;
+  let best = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 1] > d[i]) return false;
+    best = Math.max(best, d[i] - d[i + 1]);
+  }
+  return best > 100;
+}"""
+
+
+def scenario_operator_theme(page, url, secret):
+    """An operator theme from --themes-dir (ui.rs fake_themes) applies its tokens, its layout
+    (no rail) and its waterfall ramp; a broken folder's id is not offered."""
+    select_source(page, url, secret, "tone")
+    try:
+        run_cmd(page, "view set theme fixture_theme")
+        expect(view_line(page, "theme = fixture_theme")).to_be_visible()
+        html = page.locator("html")
+        expect(html).to_have_attribute("data-theme", "fixture_theme")
+        expect(html).to_have_attribute("data-rail", "off")
+        page.wait_for_function(
+            "() => getComputedStyle(document.documentElement)"
+            ".getPropertyValue('--accent').trim() === '#ff00ff'")
+        page.wait_for_function(MAGENTA_AT_RIGHT_JS, timeout=5_000)
+        run_cmd(page, "view set theme console@broken")
+        expect(view_line(page, "console@broken", error=True)).to_be_visible()
+        run_cmd(page, "view set theme neon")
+        expect(view_line(page, "neon", error=True)).to_contain_text("fixture_theme")
+        expect(html).to_have_attribute("data-theme", "fixture_theme")
+    finally:
+        run_cmd(page, "view reset")
+
+
+def scenario_theme_gone_falls_back(page, url, secret):
+    """A stored theme that is no longer there falls back to console, saying so once."""
+    page.set_viewport_size(WIDE)
+    login(page, url, secret)
+    page.evaluate("sessionStorage.setItem('zeta.view', JSON.stringify({theme: 'gone'}))")
+    page.reload()
+    expect(page.locator("#login")).to_be_hidden()
+    expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
+    line = page.locator("#transcript .line", has_text="theme gone is not available; using console")
+    expect(line).to_have_count(1)
+    html = page.locator("html")
+    expect(html).to_have_attribute("data-theme", "console")
+    expect(html).to_have_attribute("data-rail", "on")
+    page.wait_for_function(
+        "() => !(sessionStorage.getItem('zeta.view') || '').includes('gone')")
+    # The themes list has answered too (fixture_theme is offered), and said nothing more.
+    page.wait_for_function("() => window.zetaTest.themeIds().includes('fixture_theme')")
+    expect(line).to_have_count(1)
+    run_cmd(page, "view set theme plain")
+    expect(html).to_have_attribute("data-theme", "plain")
+    run_cmd(page, "view reset")
+
+
+def scenario_theme_switch_live(page, url, secret):
+    """A switch console -> plain -> console moves live tags without losing their state, and
+    an open graph view redraws in the new theme."""
+    select_source(page, url, secret, "tone")
+    demod = None
+    try:
+        # Off the tone, so its squelch stays closed.
+        demod = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500, deviation_hz=5000)
+        row = job_row(page, demod)
+        row.dispatch_event("pointerenter")
+        in_rail = page.locator(f'#rail .job-tag[data-job="{demod}"]')
+        in_outline = page.locator(f'#waterfall .outline[data-key="{demod}"] .job-tag')
+        expect(in_rail.locator(".dot.closed")).to_have_count(1, timeout=5_000)
+        expect(in_rail).to_have_class(re.compile(r"\bhot\b"))
+        in_rail.evaluate("t => t.classList.add('speaking')")
+        html = page.locator("html")
+        for theme, tag in (("plain", in_outline), ("console", in_rail)):
+            run_cmd(page, f"view set theme {theme}")
+            expect(html).to_have_attribute("data-theme", theme)
+            expect(tag).to_have_count(1)
+            expect(tag).to_have_class(re.compile(r"\bhot\b"))
+            expect(tag).to_have_class(re.compile(r"\bspeaking\b"))
+            expect(tag.locator(".dot.closed")).to_have_count(1)
+        modal = open_graph(page, demod)
+        rect = modal.locator('svg .graph-node[data-kind="nbfm_demod"] rect')
+        expect(rect).to_have_count(1)
+        look = "r => [getComputedStyle(r).fill, r.getAttribute('rx')]"
+        console_look = rect.evaluate(look)
+        run_cmd(page, "view set theme plain")
+        expect(html).to_have_attribute("data-theme", "plain")
+        page.wait_for_function(
+            "() => document.querySelector("
+            "'#graph svg .graph-node[data-kind=\"nbfm_demod\"] rect')?.getAttribute('rx') === '3'")
+        plain_look = rect.evaluate(look)
+        assert plain_look[0] != console_look[0], (console_look, plain_look)
+        run_cmd(page, "view set theme console")
+        expect(html).to_have_attribute("data-theme", "console")
+        page.wait_for_function(
+            "() => document.querySelector("
+            "'#graph svg .graph-node[data-kind=\"nbfm_demod\"] rect')?.getAttribute('rx') === '14'")
+        assert rect.evaluate(look) == console_look, (console_look, rect.evaluate(look))
+        page.keyboard.press("Escape")
+    finally:
+        run_cmd(page, "view reset")
         if demod:
             stop_job(url, secret, demod)
 

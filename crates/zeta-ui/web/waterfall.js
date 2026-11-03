@@ -70,6 +70,10 @@
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
 //     wf.rail       the `div#rail` before the axis, the canvas's height (0 wide and hidden in
 //         the plain theme); overlays.js lays the job tags into it (ov.setRail)
+//     wf.setRamp(stops)  the theme's ramp ([t, [r, g, b]] stops, theme.json `ramp`); paints
+//         every stored column again with it
+//     wf.refreshThemeColours()  reads --wf-bg, --wf-select and --wf-select-alpha (default
+//         0.08, the drag rectangle's fill) from the theme; the caller redraws
 //     wf.band       the capture {lo, hi} in Hz (a scan: its whole span); null before known
 //     wf.view       the range {lo, hi} shown, or null for the whole capture; past the capture
 //         (and wider than it) only while wf.coarseActive() holds
@@ -192,8 +196,13 @@ const COARSE_ONLY = Object.freeze({ coarseOnly: true });
 export function themeColour(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
-// "#rrggbb" or "#rgb" -> [r, g, b]; null when it is neither.
+// "#rrggbb", "#rgb" or "rgb(r, g, b)" -> [r, g, b]; null when it is none of them.
 function hexRgb(t) {
+  const f = /^rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$/i.exec(t);
+  if (f) {
+    const rgb = f.slice(1).map(Number);
+    return rgb.every((c) => c <= 255) ? rgb : null;
+  }
   const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(t);
   if (!m) return null;
   const h = m[1].length === 3 ? [...m[1]].map((c) => c + c).join("") : m[1];
@@ -203,6 +212,7 @@ function hexRgb(t) {
 let BG = [0, 0, 48];
 let BG_CSS = "#000030";
 let SELECT_CSS = "#ffffff"; // --wf-select, the drag rectangle
+let SELECT_ALPHA = 0.08; // --wf-select-alpha, the drag rectangle's fill
 // Wheel deltas (px; a line counts WHEEL_LINE_PX, a page WHEEL_PAGE_PX) add up to one zoom
 // step per WHEEL_NOTCH_PX, so a touchpad's stream of small deltas does not zoom at every
 // event; the sum restarts after WHEEL_IDLE_MS without wheel events.
@@ -235,6 +245,7 @@ function storeIds(key, ids) {
 
 // ---- colour ----------------------------------------------------------------------------
 
+// The default ramp (console's and plain's); a theme's `ramp` replaces it (wf.setRamp).
 const RAMP_STOPS = [
   [0, [0, 0, 48]],
   [0.35, [0, 90, 255]],
@@ -242,21 +253,22 @@ const RAMP_STOPS = [
   [1, [255, 255, 255]],
 ];
 
-function buildRamp() {
+// 256 RGB triplets interpolated between `stops` ([t, [r, g, b]], t ascending from 0 to 1).
+function buildRamp(stops) {
   const ramp = new Uint8ClampedArray(256 * 3);
   for (let i = 0; i < 256; i++) {
     const t = i / 255;
     let k = 0;
-    while (k < RAMP_STOPS.length - 2 && t > RAMP_STOPS[k + 1][0]) k++;
-    const [t0, c0] = RAMP_STOPS[k];
-    const [t1, c1] = RAMP_STOPS[k + 1];
+    while (k < stops.length - 2 && t > stops[k + 1][0]) k++;
+    const [t0, c0] = stops[k];
+    const [t1, c1] = stops[k + 1];
     const f = (t - t0) / (t1 - t0);
     for (let ch = 0; ch < 3; ch++) ramp[i * 3 + ch] = Math.round(c0[ch] + (c1[ch] - c0[ch]) * f);
   }
   return ramp;
 }
 
-const RAMP = buildRamp();
+let RAMP = buildRamp(RAMP_STOPS);
 
 function percentile(values, p) {
   const sorted = Float64Array.from(values).sort();
@@ -1593,7 +1605,19 @@ class Waterfall {
     this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
   }
 
-  // Read --wf-bg and --wf-select from the theme; the caller redraws.
+  // The theme's waterfall ramp (theme.json `ramp`: 2-16 stops [t, [r, g, b]], t from 0 to 1,
+  // checked by the node); anything else keeps the default. Every stored column is painted
+  // again with it.
+  setRamp(stops) {
+    const ok =
+      Array.isArray(stops) &&
+      stops.length >= 2 &&
+      stops.every((s) => Array.isArray(s) && Array.isArray(s[1]) && s[1].length === 3);
+    RAMP = buildRamp(ok ? stops : RAMP_STOPS);
+    this.redraw();
+  }
+
+  // Read --wf-bg, --wf-select and --wf-select-alpha from the theme; the caller redraws.
   refreshThemeColours() {
     const bg = themeColour("--wf-bg");
     const rgb = hexRgb(bg);
@@ -1602,6 +1626,8 @@ class Waterfall {
       BG_CSS = bg;
     }
     SELECT_CSS = themeColour("--wf-select") || SELECT_CSS;
+    const alpha = parseFloat(themeColour("--wf-select-alpha"));
+    SELECT_ALPHA = Number.isFinite(alpha) && alpha >= 0 && alpha <= 1 ? alpha : 0.08;
   }
 
   drawDrag() {
@@ -1618,7 +1644,7 @@ class Waterfall {
     const y = Math.min(d.y0, d.y1) * dpr;
     const w = Math.abs(d.x1 - d.x0) * dpr;
     const h = Math.abs(d.y1 - d.y0) * dpr;
-    o.globalAlpha = 0.08;
+    o.globalAlpha = SELECT_ALPHA;
     o.fillRect(x, y, w, h);
     o.globalAlpha = 1;
     o.strokeRect(x + 0.5, y + 0.5, w, h);

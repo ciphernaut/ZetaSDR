@@ -451,6 +451,33 @@ fn fake_modes(dir: &Path) -> PathBuf {
     modes
 }
 
+/// A themes directory under `dir`: `fixture_theme`, an operator theme (accent `#ff00ff`, no
+/// rail, a black-to-magenta ramp, no style.css), and a broken `console` override (an unknown
+/// `footprints` key), which leaves the built-in console in force; its path.
+fn fake_themes(dir: &Path) -> PathBuf {
+    use serde_json::json;
+    let themes = dir.join("themes");
+    let fixture = json!({
+        "id": "fixture_theme",
+        "name": "Fixture",
+        "description": "An operator theme for the e2e scenarios.",
+        "color_scheme": "dark",
+        "layout": {"rail": false, "ribbon_tilt_deg": 0},
+        "tokens": {"--accent": "#ff00ff"},
+        "ramp": [[0, [0, 0, 0]], [1, [255, 0, 255]]],
+    });
+    let mut broken = fixture.clone();
+    broken["id"] = json!("console");
+    broken["footprints"] = json!({"narrow": {"rail": false}});
+    for theme in [fixture, broken] {
+        let folder = themes.join(theme["id"].as_str().unwrap());
+        std::fs::create_dir_all(&folder).expect("create a theme folder");
+        let text = serde_json::to_string_pretty(&theme).unwrap();
+        std::fs::write(folder.join("theme.json"), text).expect("write a fake theme.json");
+    }
+    themes
+}
+
 /// The fake model's scripts, in `zeta-fake-llm --scripts` form, keyed by a substring of the
 /// request: a refused stop, a fan-out through `plan_start`, and a turn with reasoning and
 /// content.
@@ -568,6 +595,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let sock = sock.to_str().expect("socket path is UTF-8");
     let modes = fake_modes(dir.path());
     let modes = modes.to_str().expect("modes path is UTF-8");
+    let themes = fake_themes(dir.path());
+    let themes = themes.to_str().expect("themes path is UTF-8");
     let fake_lines = repo_root().join("crates/zeta-ext/tests/fake_lines");
     let fake_lines = fake_lines.to_str().expect("fake_lines path is UTF-8");
     let serve = ServeProc::start_full(
@@ -576,6 +605,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
         &[
             "--modes-dir",
             modes,
+            "--themes-dir",
+            themes,
             "--source-file",
             &aprs,
             "--source-file",
