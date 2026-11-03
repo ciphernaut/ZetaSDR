@@ -2453,6 +2453,23 @@ def stream_of(url, secret, job, kind):
     return None
 
 
+def scenario_graph_headline(page, url, secret):
+    select_source(page, url, secret, "tone")
+    cur = source_info(url, secret, "tone")["current"]["center_hz"]
+    job = start_job(url, secret, "fm_demod", "tone", cur, 12_500, deviation_hz=5000)
+    try:
+        open_graph(page, job)
+        node = page.locator('#graph svg .graph-node[data-kind="channel"]')
+        expect(node.locator("text.graph-node-headline")).to_contain_text("center_hz")
+        expect(node.locator("text.graph-node-headline")).to_contain_text(str(cur))
+        rx = page.evaluate("el => el.querySelector('rect').getAttribute('rx')",
+                           node.element_handle())
+        assert rx not in (None, "0"), rx
+    finally:
+        page.keyboard.press("Escape")
+        stop_job(url, secret, job)
+
+
 def scenario_graph_view_renders_nodes(page, url, secret):
     select_source(page, url, secret, "aprs")
     job = start_job(url, secret, "aprs_decode", "aprs", 144_800_000, 12_500)

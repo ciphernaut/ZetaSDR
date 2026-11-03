@@ -672,12 +672,46 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 #graph .graph-node rect { fill: var(--bar); stroke: var(--border); stroke-width: 1.5; }
 #graph .graph-node:hover rect, #graph .graph-node:focus-visible rect { stroke: var(--accent); }
 #graph .graph-node.selected rect { stroke: var(--accent); stroke-width: 2.5; }
-#graph .graph-node text { fill: var(--text); font: 12px var(--font-mono); }
-#graph .graph-node text.nid { fill: var(--dim); font-size: 11px; }
+#graph .graph-node text { fill: var(--text); font: 12px var(--font-ui); }
+#graph .graph-node text.nid, #graph .graph-node text.graph-node-headline { fill: var(--dim); font-size: 11px; }
 #graph .graph-edge line { stroke: var(--dim); stroke-width: 1.5; }
-#graph .graph-edge text { fill: var(--user); font: 11px var(--font-mono); }
+#graph .graph-edge text { fill: var(--user); font: 11px var(--font-ui); }
 #graph .graph-arrowhead { fill: var(--dim); }
 #graph .graph-node-title { color: var(--dim); }
+/* Console: nodes are rounded bars coloured by stage family, black text on every one. */
+[data-theme="console"] #graph .graph-node rect { fill: var(--c-idle); stroke: none; }
+[data-theme="console"] #graph .graph-node[data-kind="channel"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="fft"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="measure"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="detect"] rect { fill: var(--c-channel-1); }
+[data-theme="console"] #graph .graph-node[data-kind="nbfm_demod"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="wfm_demod"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="am_demod"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="ssb_demod"] rect { fill: var(--c-frame); }
+[data-theme="console"] #graph .graph-node[data-kind="denoise"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="vad"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="mix"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="stream_in"] rect { fill: var(--c-channel-3); }
+[data-theme="console"] #graph .graph-node[data-kind="aprs_decode"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="pocsag_decode"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="rds_decode"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="acars_decode"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="adsb_decode"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="external_decode"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="transcribe"] rect,
+[data-theme="console"] #graph .graph-node[data-kind="burst_capture"] rect { fill: var(--c-action); }
+[data-theme="console"] #graph .graph-node[data-kind="sink_sondehub"] rect { fill: var(--c-channel-4); }
+[data-theme="console"] #graph .graph-node[data-kind="passthrough"] rect { fill: var(--c-idle); }
+[data-theme="console"] #graph .graph-node:hover rect,
+[data-theme="console"] #graph .graph-node:focus-visible rect { stroke: var(--text); stroke-width: 2; }
+[data-theme="console"] #graph .graph-node.selected rect { stroke: var(--text); stroke-width: 3; }
+[data-theme="console"] #graph .graph-node text { fill: #000; }
+[data-theme="console"] #graph .graph-node text.kind { font-weight: bold; text-transform: uppercase; }
+[data-theme="console"] #graph .graph-node text.nid,
+[data-theme="console"] #graph .graph-node text.graph-node-headline { fill: color-mix(in srgb, #000 70%, transparent); }
+[data-theme="console"] #graph .graph-edge line { stroke: var(--c-frame); }
+[data-theme="console"] #graph .graph-edge text { fill: var(--c-channel-5); }
+[data-theme="console"] #graph .graph-arrowhead { fill: var(--c-frame); }
 #graph-params {
   width: 100%;
   resize: vertical;

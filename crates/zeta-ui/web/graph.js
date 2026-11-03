@@ -21,7 +21,44 @@
 //       Closes the open graph modal, if any (the app calls it when the secret is rejected).
 
 const NODE_W = 160;
-const NODE_H = 46;
+const NODE_H = 58;
+// The params each stage kind shows under its name (up to two, as `key value`).
+const HEADLINE_PARAMS = {
+  channel: ["center_hz", "bandwidth_hz"],
+  nbfm_demod: ["deviation_hz", "squelch_db"],
+  wfm_demod: ["deviation_hz"],
+  am_demod: ["squelch_db"],
+  ssb_demod: ["sideband"],
+  transcribe: ["language"],
+  fft: ["size", "window"],
+  detect: ["threshold_db", "energy_db"],
+  measure: ["bandwidth_hz"],
+  burst_capture: ["bursts", "window_ms"],
+  sink_sondehub: ["callsign"],
+  mix: ["sources"],
+  stream_in: ["job"],
+  external_decode: ["mode"],
+  passthrough: ["kind"],
+};
+const HEADLINE_MAX = 26;
+
+function headline(n) {
+  const params = n.params || {};
+  const parts = [];
+  for (const key of HEADLINE_PARAMS[n.kind] || []) {
+    if (!(key in params) || params[key] === null || params[key] === undefined) continue;
+    const v = params[key];
+    parts.push(`${key} ${Array.isArray(v) ? `[${v.length}]` : v}`);
+    if (parts.length === 2) break;
+  }
+  const text = parts.join(" ");
+  return text.length > HEADLINE_MAX ? text.slice(0, HEADLINE_MAX - 1) + "\u2026" : text;
+}
+
+function nodeRadius() {
+  const r = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--radius-bar"));
+  return Number.isFinite(r) ? r : 4;
+}
 const COL_GAP = 70;
 const ROW_GAP = 24;
 const PAD = 16;
@@ -235,6 +272,7 @@ class GraphModal {
       );
       svg.append(grp);
     }
+    const rx = nodeRadius();
     for (const n of g.nodes) {
       const p = pos.get(n.id);
       const grp = svgEl("g", {
@@ -245,9 +283,10 @@ class GraphModal {
         role: "button",
       });
       grp.append(
-        svgEl("rect", { x: p.x, y: p.y, width: NODE_W, height: NODE_H, rx: 4 }),
+        svgEl("rect", { x: p.x, y: p.y, width: NODE_W, height: NODE_H, rx }),
         svgEl("text", { x: p.x + 10, y: p.y + 19, class: "kind" }, n.kind),
         svgEl("text", { x: p.x + 10, y: p.y + 36, class: "nid" }, short(n.id)),
+        svgEl("text", { x: p.x + 10, y: p.y + 50, class: "graph-node-headline" }, headline(n)),
       );
       const title = svgEl("title", {}, `${n.kind} ${n.id}\n${JSON.stringify(n.params)}`);
       grp.append(title);
