@@ -92,7 +92,11 @@
 //       attached to them are moved into one `details.job-group[data-plan]` whose summary reads
 //       `<n> idle <kinds> on <plan>[, <m> <attached kind>]`; it is open unless the operator
 //       folded it (sessionStorage[JOB_FOLD_KEY + plan]). foldIdle(ms) changes the idle age.
+//       A job folds only on evidence (foldPlan): an unwatched squelch kind needs a running mix
+//       covering its source (activity(id): {watched, speaking, hot}, overlays.js), and a
+//       `speaking` or `hot` row never folds.
 import { channelColour } from "./overlays.js";
+import { mixCovering } from "./mix.js";
 import { channelLabel } from "./plans.js";
 import { bandText } from "./units.js";
 
@@ -583,39 +587,61 @@ function underInputs(jobs) {
   return out;
 }
 
-// The group row of a plan's idle channels: `<n> idle <kind> on <plan>`, plus `, <m> <kind>`
-// for each kind attached to them; open unless the operator folded it this session.
-function jobGroup(plan, list, shown) {
+// The fold of the operator's choice: "closed" when folded this session, else open.
+function storedOpen(plan) {
+  try {
+    return sessionStorage.getItem(JOB_FOLD_KEY + plan) !== "closed";
+  } catch {
+    return true;
+  }
+}
+
+// The group row of a plan's idle channels, made once per plan and kept across renders (so a
+// focused summary stays focused); open unless the operator folded it this session. Only a
+// change of the fold is written (opening a fresh group queues a `toggle` too).
+function jobGroup(plan) {
   const g = document.createElement("details");
   g.className = "job-group";
   g.dataset.plan = plan;
-  let stored = null;
-  try {
-    stored = sessionStorage.getItem(JOB_FOLD_KEY + plan);
-  } catch {
-    /* no storage: open */
-  }
-  g.open = stored !== "closed";
+  g.open = storedOpen(plan);
   g.addEventListener("toggle", () => {
+    if (g.open === storedOpen(plan)) return;
     try {
       sessionStorage.setItem(JOB_FOLD_KEY + plan, g.open ? "open" : "closed");
     } catch {
       /* the fold is not remembered */
     }
   });
+  const summary = document.createElement("summary");
+  summary.dir = "auto";
+  g.append(summary);
+  return g;
+}
+
+// `<n> idle <kinds> on <plan>`, plus `, <m> <kind>` for each kind attached to them.
+function groupText(plan, list, shown) {
   const kinds = [...new Set(list.map((j) => j.kind))].join(", ");
   const inside = new Set(list.map((j) => j.id));
   const attached = new Map();
   for (const j of shown) {
     if (j.input && inside.has(j.input)) attached.set(j.kind, (attached.get(j.kind) || 0) + 1);
   }
-  const summary = document.createElement("summary");
-  summary.dir = "auto";
-  summary.textContent =
+  return (
     `${list.length} idle ${kinds} on ${plan}` +
-    [...attached].map(([kind, m]) => `, ${m} ${kind}`).join("");
-  g.append(summary);
-  return g;
+    [...attached].map(([kind, m]) => `, ${m} ${kind}`).join("")
+  );
+}
+
+// `parent`'s children made `nodes`, in order, without detaching a node that stays (a kept
+// group keeps its focus): the stale ones go first, then each node is put in its place.
+function placeChildren(parent, nodes) {
+  const keep = new Set(nodes);
+  for (const c of [...parent.childNodes]) if (!keep.has(c)) c.remove();
+  let ref = parent.firstChild;
+  for (const n of nodes) {
+    if (n === ref) ref = ref.nextSibling;
+    else parent.insertBefore(n, ref);
+  }
 }
 
 export function startJobs(
@@ -636,6 +662,7 @@ export function startJobs(
     mute = null,
     countEl = null,
     lastEvent = null,
+    activity = null,
   } = {},
 ) {
   let timer = null;
@@ -643,6 +670,7 @@ export function startJobs(
   // id -> performance.now() when this page first saw the job running (its idle age starts
   // there when no event has been seen).
   const runningSince = new Map();
+  const groupEls = new Map(); // plan -> its kept details.job-group
   let ageTimer = null;
   let stopped = false;
   let last = null;
@@ -698,17 +726,28 @@ export function startJobs(
       if (key === "finished_rows_s" || key === "plan" || key === "home") redraw();
     });
   }
-  // The plan id of a running job that may fold: on a plan channel, its squelch closed (a kind
-  // without one counts as closed) and no event for foldIdleMs. Every way out of a group (the
-  // job stopped, its squelch opened, an event arrived, the group under JOBS_FOLD_MIN) is this
-  // test failing at the next render, one poll at most.
-  const foldPlan = (j, now) => {
+  // The plan id of a running job on a plan channel that folds, on evidence the page has:
+  // (a) its kind has no squelch (counted closed) and it sent no event for foldIdleMs;
+  // (b) it is watched (overlays.js, at most MAX_WATCHED = 4 jobs: TODO.md "UI: the page
+  //     watches at most 4 jobs"), its squelch known closed and no event for foldIdleMs;
+  // (c) it is an unwatched squelch kind (its squelch and events unknown) on a source a
+  //     running mix covers, and the mix does not hear it (not `speaking`).
+  // Never a `speaking` or `hot` row; an unwatched squelch kind with no covering mix never
+  // folds. Every way out of a group (the job stopped, its squelch opened, an event arrived,
+  // the mix heard it, the group under JOBS_FOLD_MIN) is this test failing at the next render,
+  // one poll at most.
+  const foldPlan = (j, now, jobs) => {
     if (isFinished(j) || j.input || j.elastic || !j.tuning || !view) return null;
     const ch = channelLabel(j.tuning.center_hz, view.get("plan"));
     if (!ch) return null;
+    const seen = activity ? activity(j.id) : { watched: true, speaking: false, hot: false };
+    if (seen.speaking || seen.hot) return null;
+    if (SQUELCH_KINDS.includes(j.kind) && !seen.watched) {
+      return mixCovering(j, jobs) ? ch.plan : null;
+    }
     if (SQUELCH_KINDS.includes(j.kind)) {
       const sq = squelch ? squelch(j.id) : null;
-      if (sq && sq.open !== false) return null;
+      if (!sq || sq.open !== false) return null;
     }
     const heard = lastEvent ? lastEvent(j.id) : null;
     const since = Math.max(runningSince.get(j.id) ?? now, heard ?? -Infinity);
@@ -716,7 +755,7 @@ export function startJobs(
   };
   // The rows in list order, a plan's foldable jobs (and the jobs attached to them) wrapped in
   // one `details.job-group[data-plan]` where the first of them stood.
-  const fold = (shown, rows) => {
+  const fold = (shown, rows, jobs) => {
     const now = performance.now();
     const ids = new Set(shown.map((j) => j.id));
     for (const id of runningSince.keys()) if (!ids.has(id)) runningSince.delete(id);
@@ -727,14 +766,15 @@ export function startJobs(
     const planOf = new Map();
     const members = new Map(); // plan -> its foldable jobs (not the attached ones)
     for (const j of shown) {
-      const plan = foldPlan(j, now);
+      const plan = foldPlan(j, now, jobs);
       if (!plan) continue;
       planOf.set(j.id, plan);
       if (!members.has(plan)) members.set(plan, []);
       members.get(plan).push(j);
     }
     for (const [plan, list] of members) if (list.length <= JOBS_FOLD_MIN) members.delete(plan);
-    const groups = new Map();
+    for (const plan of [...groupEls.keys()]) if (!members.has(plan)) groupEls.delete(plan);
+    const inside = new Map(); // plan -> its rows, in list order
     const out = [];
     shown.forEach((j, i) => {
       const plan = planOf.get(j.input ?? j.id);
@@ -742,14 +782,20 @@ export function startJobs(
         out.push(rows[i]);
         return;
       }
-      let g = groups.get(plan);
-      if (!g) {
-        g = jobGroup(plan, members.get(plan), shown);
-        groups.set(plan, g);
-        out.push(g);
+      if (!inside.has(plan)) {
+        if (!groupEls.has(plan)) groupEls.set(plan, jobGroup(plan));
+        inside.set(plan, []);
+        out.push(groupEls.get(plan));
       }
-      g.append(rows[i]);
+      inside.get(plan).push(rows[i]);
     });
+    for (const [plan, list] of inside) {
+      const g = groupEls.get(plan);
+      const summary = g.querySelector("summary");
+      const text = groupText(plan, members.get(plan), shown);
+      if (summary.textContent !== text) summary.textContent = text;
+      placeChildren(g, [summary, ...list]);
+    }
     return out;
   };
   const render = (jobs) => {
@@ -767,7 +813,7 @@ export function startJobs(
         refresh();
       }, buttons),
     );
-    el.replaceChildren(...fold(shown, rows));
+    placeChildren(el, fold(shown, rows, jobs));
     if (countEl) {
       const n = shown.filter((j) => !isFinished(j)).length;
       countEl.textContent = String(n);

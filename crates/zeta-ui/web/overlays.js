@@ -185,6 +185,7 @@
 //     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a watched job
 //     ov.lastEvent(jobId) -> ms|null  performance.now() of the last event counted in the job's
 //                            row (agent.js folds idle plan channels on it)
+//     ov.activity(jobId) -> {watched, speaking, hot}  what the page knows of the job now
 //     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a watched job,
 //                            before it is drawn, and of a positioned job on another source
 //                            (the map reads `position` from them)
@@ -713,6 +714,16 @@ class Overlays {
 
   lastEvent(jobId) {
     return this.lastEvents.get(jobId) ?? null;
+  }
+
+  // What the page knows of a job's activity: watched (its event stream subscribed, so its
+  // squelch and events are seen), speaking (a mix hears it), hot (hovered).
+  activity(jobId) {
+    return {
+      watched: this.watched.has(jobId),
+      speaking: this.speaking.includes(jobId),
+      hot: this.hotJob === jobId,
+    };
   }
 
   jobRowEl(job) {

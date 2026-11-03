@@ -1997,6 +1997,52 @@ def scenario_job_rows_fold_idle_plan_channels(page, url, secret):
         for j in jobs[2:]:
             stop_job(url, secret, j)
 
+
+def scenario_job_rows_fold_only_on_evidence(page, url, secret):
+    # The page watches at most 4 jobs (overlays.js MAX_WATCHED): an unwatched demodulator's
+    # squelch and events are unknown, so it folds only while a mix covering its source says it
+    # is not speaking. Fifteen fm_demod on cb's three plan channels (five widths each): the
+    # tone holds ch20 open, its guard keeps ch59 and ch60 closed.
+    stop_mixes(url, secret)
+    select_source(page, url, secret, "cb")
+    plans = http_json(url, secret, "/op", {"op": "channel_plans"})["value"]["plans"]
+    plan = next(p for p in plans if p["id"] == "uhf_cb_au")
+    inside = [ch for ch in plan["channels"] if 476_880_000 <= ch["center_hz"] <= 476_920_000]
+    assert len(inside) == 3, inside
+    ch20 = next(ch["center_hz"] for ch in inside if ch["number"] == 20)
+    jobs = []
+    try:
+        for i in range(15):
+            ch = inside[i % 3]
+            jobs.append((start_job(url, secret, "fm_demod", "cb", ch["center_hz"],
+                                   5_000 + 1_000 * (i // 3), deviation_hz=2500),
+                         ch["center_hz"]))
+        page.evaluate("window.zetaTest.foldIdle(0)")
+        group = page.locator('#jobs details.job-group[data-plan="uhf_cb_au"]')
+        for _ in range(3):  # the watched ones' squelch states arrive
+            page.evaluate("window.zetaTest.poll()")
+            page.wait_for_timeout(700)
+        # No mix: the eleven unwatched rows stay out, the watched closed ones are too few.
+        expect(group).to_have_count(0)
+        for j, _ in jobs:
+            expect(page.locator(f'#jobs > .job[data-id="{j}"]')).to_have_count(1)
+        # A mix over every source: the quiet unwatched ones fold, ch20's speaking rows do not.
+        http_mix_start(url, secret, None)
+        talking = [j for j, hz in jobs if hz == ch20]
+        for j in talking:
+            expect(page.locator(f'#jobs .job[data-id="{j}"].speaking')).to_have_count(
+                1, timeout=8_000)
+        page.evaluate("window.zetaTest.poll()")
+        expect(group).to_have_count(1)
+        for j in talking:
+            expect(group.locator(f'.job[data-id="{j}"]')).to_have_count(0)
+        expect(group.locator("summary")).to_have_text(
+            re.compile(r"^\d+ idle fm_demod on uhf_cb_au"))
+    finally:
+        stop_mixes(url, secret)
+        for j, _ in jobs:
+            stop_job(url, secret, j)
+
 # ---- draggable outlines (plan 18 Task 6) -----------------------------------------------------
 # A running rigid job the node can retune is dragged by its outline: an edge handle resizes,
 # the body moves, release sends `job_retune`. `retune` shows its 48 kHz capture.
