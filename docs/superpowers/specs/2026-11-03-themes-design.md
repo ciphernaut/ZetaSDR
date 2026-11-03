@@ -26,7 +26,7 @@ frequency axis, ribbons riding the waterfall (operator: "layout, sure it will be
 So themes become data. A theme is a folder with a declarative `theme.json` and a `style.css`; the
 built-in themes ship in that format inside the binary, and an operator's themes folder, read like
 `--modes-dir`, adds or replaces them (operator). Three new built-ins ship with this plan: cyberpunk,
-hacker terminal and psytrance (operator chose these three from five; the looks are the author's,
+terminal and psytrance (operator chose these three from five; the looks are the author's,
 section 6).
 
 ## 2. Goals, non-goals, anti-goals
@@ -124,7 +124,7 @@ The folder name must equal `theme.json`'s `id`. `id` is lowercase `[a-z][a-z0-9_
 ```json
 {
   "id": "terminal",
-  "name": "Hacker terminal",
+  "name": "Terminal",
   "description": "Phosphor green on black, boxed panes, a block cursor.",
   "color_scheme": "dark",
   "layout": { "rail": true, "ribbon_tilt_deg": 0 },
@@ -234,7 +234,7 @@ coloured fills behind text. Texture: a faint scanline overlay on the bars, a bri
 for labels and headings, a monospace for numbers and decoded text. Waterfall ramp: deep violet,
 magenta, cyan, white. Rail on, ribbons lean slightly.
 
-### 6.2 Hacker terminal (`terminal`)
+### 6.2 Terminal (`terminal`)
 
 A text-mode screen: black ground, phosphor green text, amber for warnings, inverse video (green
 ground, black text) for selection instead of colour fills. Shape: square corners everywhere; panes
@@ -294,7 +294,7 @@ dark and distinct from the floor). Rail on, ribbons lean the other way from cybe
 
 1. The plan number 26 and the folder layout `crates/zeta-ui/themes/<id>/`.
 2. The three looks in section 6, including the theme ids `cyberpunk`, `terminal`, `psytrance` and
-   the name "Hacker terminal" (the operator's working name was "APT hacker terminal").
+   the name "Terminal" (operator: no "hacker" or "APT" in names or text).
 3. Themes are read once at startup; no hot reload.
 4. Tokens may not contain `url(`; images and fonts are referenced from `style.css` only.
 5. Scoping `style.css` with native CSS nesting, hoisting `@font-face` and `@keyframes`.
