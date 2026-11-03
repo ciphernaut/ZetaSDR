@@ -186,7 +186,21 @@ export const EASE_MS = 400;
 export const COARSE_ALONE_MS = 1000;
 // The ring entry of a column painted from the coarse layer alone.
 const COARSE_ONLY = Object.freeze({ coarseOnly: true });
-const BG = [0, 0, 48]; // #000030
+// The theme's colour variable `name` (a custom property of <html>), trimmed.
+export function themeColour(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+// "#rrggbb" or "#rgb" -> [r, g, b]; null when it is neither.
+function hexRgb(t) {
+  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(t);
+  if (!m) return null;
+  const h = m[1].length === 3 ? [...m[1]].map((c) => c + c).join("") : m[1];
+  return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+}
+// The canvas ground (--wf-bg, #000030 in both themes), read again by refreshThemeColours().
+let BG = [0, 0, 48];
+let BG_CSS = "#000030";
+let SELECT_CSS = "#ffffff"; // --wf-select, the drag rectangle
 // Wheel deltas (px; a line counts WHEEL_LINE_PX, a page WHEEL_PAGE_PX) add up to one zoom
 // step per WHEEL_NOTCH_PX, so a touchpad's stream of small deltas does not zoom at every
 // event; the sum restarts after WHEEL_IDLE_MS without wheel events.
@@ -416,6 +430,7 @@ class Waterfall {
   constructor(el, api, source) {
     this.el = el;
     this.api = api;
+    this.refreshThemeColours();
     this.selectCbs = [];
     this.columnCbs = [];
     this.viewCbs = [];
@@ -934,7 +949,7 @@ class Waterfall {
     this.canvas.height = h;
     this.overlay.width = w;
     this.overlay.height = h;
-    this.ctx.fillStyle = "#000030";
+    this.ctx.fillStyle = BG_CSS;
     this.ctx.fillRect(0, 0, w, h);
     if (old) this.ctx.drawImage(old, w - old.width, 0, old.width, h);
     this.column = this.ctx.createImageData(Math.max(1, Math.round(dpr)), h);
@@ -952,7 +967,7 @@ class Waterfall {
     this.staleBand = null;
     this.coarseRows = [];
     this.coarseSpan = null;
-    this.ctx.fillStyle = "#000030";
+    this.ctx.fillStyle = BG_CSS;
     this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
     this.axis.replaceChildren();
@@ -1477,7 +1492,7 @@ class Waterfall {
   redraw() {
     const w = this.canvas.width;
     const h = this.canvas.height;
-    this.ctx.fillStyle = "#000030";
+    this.ctx.fillStyle = BG_CSS;
     this.ctx.fillRect(0, 0, w, h);
     this.blankColumn();
     if (!this.shown()) return;
@@ -1574,6 +1589,17 @@ class Waterfall {
     this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
   }
 
+  // Read --wf-bg and --wf-select from the theme; the caller redraws.
+  refreshThemeColours() {
+    const bg = themeColour("--wf-bg");
+    const rgb = hexRgb(bg);
+    if (rgb) {
+      BG = rgb;
+      BG_CSS = bg;
+    }
+    SELECT_CSS = themeColour("--wf-select") || SELECT_CSS;
+  }
+
   drawDrag() {
     const d = this.drag;
     const dpr = this.overlay.width / (this.overlay.clientWidth || 1);
@@ -1582,13 +1608,15 @@ class Waterfall {
     o.save();
     o.setLineDash([6 * dpr, 4 * dpr]);
     o.lineWidth = Math.max(1, dpr);
-    o.strokeStyle = "#ffffff";
-    o.fillStyle = "rgba(255,255,255,0.08)";
+    o.strokeStyle = SELECT_CSS;
+    o.fillStyle = SELECT_CSS;
     const x = Math.min(d.x0, d.x1) * dpr;
     const y = Math.min(d.y0, d.y1) * dpr;
     const w = Math.abs(d.x1 - d.x0) * dpr;
     const h = Math.abs(d.y1 - d.y0) * dpr;
+    o.globalAlpha = 0.08;
     o.fillRect(x, y, w, h);
+    o.globalAlpha = 1;
     o.strokeRect(x + 0.5, y + 0.5, w, h);
     o.restore();
   }

@@ -1114,6 +1114,20 @@ def scenario_waterfall_reuses_an_elastic_spectrum_job_first(page, url, secret):
         fresh_spectrum_jobs(url, secret)
 
 
+def scenario_theme_switch(page, url, secret):
+    select_source(page, url, secret, "tone")
+    expect(page.locator("html")).to_have_attribute("data-theme", "console")
+    run_cmd(page, "view set theme plain")
+    expect(view_line(page, "theme = plain")).to_be_visible()
+    expect(page.locator("html")).to_have_attribute("data-theme", "plain")
+    stored = page.evaluate("sessionStorage.getItem('zeta.view')")
+    assert '"theme":"plain"' in stored, stored
+    run_cmd(page, "view set theme neon")
+    expect(view_line(page, "neon", error=True)).to_contain_text("console, plain")
+    run_cmd(page, "view reset")
+    expect(page.locator("html")).to_have_attribute("data-theme", "console")
+
+
 def scenario_view_set_show_reset(page, url, secret):
     page.set_viewport_size(WIDE)
     login(page, url, secret)
@@ -1123,9 +1137,10 @@ def scenario_view_set_show_reset(page, url, secret):
     shown = view_show(page)
     for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
                  "finished_rows_s 60", "scanner auto", "plan auto", "map off", "home none",
-                 "subjects auto", "subject_dim_s 60", "subject_drop_s 300", "pane none"):
+                 "subjects auto", "subject_dim_s 60", "subject_drop_s 300", "pane none",
+                 "theme console"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 11, f"view show: {shown!r}"
+    assert shown.count("\n") == 12, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")

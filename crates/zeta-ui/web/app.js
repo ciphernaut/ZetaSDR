@@ -794,9 +794,15 @@ function start(api) {
   });
   state.subjects.onLearn(applyPanes);
   loadStationHome(api);
+  applyTheme();
   applyMapPane();
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
+    if (key === "theme") {
+      applyTheme();
+      state.wf?.refreshThemeColours();
+      state.wf?.redraw();
+    }
     if (key === "map") applyMapPane();
     if (key === "pane") applyPanes();
   });
@@ -882,6 +888,11 @@ async function loadStationHome(api) {
   } catch {
     // No station: the view's home only.
   }
+}
+
+// <html data-theme="console|plain"> from the view's `theme` policy; never absent.
+function applyTheme() {
+  document.documentElement.dataset.theme = state.view ? state.view.get("theme") : "console";
 }
 
 function applyMapPane() {

@@ -55,7 +55,7 @@ row in the job list.
 - Live retune while dragging (a retune restarts the demodulator; the audio would stutter on every
   pixel). The ghost and the readout show where the job will land; release commits.
 - Staircase transcript ribbons, fold-by-key for state-stream decoders, mode picking by band through
-  `knowledge_lookup`, the LCARS theme: the other items of the UI wave, each its own plan.
+  `knowledge_lookup`, the console theme: the other items of the UI wave, each its own plan.
 - Keeping a lone job's capture centre off its channel in the lease (the DC problem): plan 15's
   follow-on; "Fit to signal" and dragging give the operator the manual fix meanwhile.
 - Dragging a pin, a watch, a scan, an identify, an elastic job, or the capture outline. Pins move

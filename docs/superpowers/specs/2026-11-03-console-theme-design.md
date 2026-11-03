@@ -70,7 +70,7 @@ the RF, tilted so a burst of lines reads as a staircase rather than a pile.
 - Anything that is the franchise's: the name of its computer interface, its fleet, its designer's
   eponym for the panels, or any ship, series or character name, in code, docs, settings, the page or
   the theme id (the operator keeps the word list outside the repository; a redaction pass before
-  publishing checks for it); the delta insignia; stardates;
+  publishing checks for it); the delta insignia; the franchise's date format;
   verbatim screen layouts copied from frames; the fan wikis' exact palette codes; the show's
   typeface or a clone sold as one. The theme id is `console`.
 - Decorative numbers. If a readout cannot be fed from a value the page has, it is not drawn.

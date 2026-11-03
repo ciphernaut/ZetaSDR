@@ -77,7 +77,7 @@ From the operator, 2026-11-01. Event ribbons (`signal new`, `identifying`, `unkn
 
 ## UI: the job panel hides the id behind a horizontal scroll
 
-From the operator, 2026-11-01. A job row's actions sit to the right of a horizontal scroller; by the time the scroller is found, the id (and kind) are out of view. Keep the id and kind sticky at the left, wrap or collapse the rest (band, state, events, actions) into a second line or an expand-on-select, and drop columns that repeat the tag. Settle it with the Okudagram (LCARS) restyle (below) rather than as a one-off, unless the row-actions gist above lands first.
+From the operator, 2026-11-01. A job row's actions sit to the right of a horizontal scroller; by the time the scroller is found, the id (and kind) are out of view. Keep the id and kind sticky at the left, wrap or collapse the rest (band, state, events, actions) into a second line or an expand-on-select, and drop columns that repeat the tag. Settle it with the console restyle (below) rather than as a one-off, unless the row-actions gist above lands first.
 ## Feature: more digital decoding modes
 
 From the operator, 2026-10-27. Today's decoders: APRS (AFSK1200/AX.25), POCSAG, RDS, ACARS (MSK), ADS-B (dump1090 via `zeta-ext`). The design's layer-2 list (spec 6.2) also names DMR, LoRa/MeshCore and RS41 radiosondes, none of which decode yet, and the field craft promises digital voice (DMR, D-STAR, M17) feeding `transcribe`.
@@ -151,7 +151,7 @@ Open work left from plan 16's mode registry (delivered; see the plan series):
 - **Time.** UTC-slotted modes (FT8/FT4 15 s, WSPR 2 min, JT65 1 min) and TDMA (DMR, TETRA) need true block timestamps. The HackRF timestamp bug is fixed (plan 14); the 2 h clock run that would clear the WSJT family is still outstanding (plan series, "Outcome").
 - **Span decoders and trunking.** OnAir and OpenWebRX+ decode every POCSAG/APRS/VDL2 channel in a capture at once. On a pin that is one job per channel on the bank today; a decoder that finds its own channels would take the whole capture. Trunking (P25, DMR Tier III, MPT1327) needs a follower that starts voice jobs from control-channel events inside the pin.
 - **Vocoders.** Codec 2 (M17, FreeDV) in-crate; AMBE/IMBE only through an external `mbelib` build, never shipped; HD Radio HDC off.
-- **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback. Fits the Okudagram restyle.
+- **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback. Fits the console restyle.
 - **Wideband modes** (DVB-T 8 MHz, DAB 1.5 MHz, LTE) run the direct path at full rate and want the GPU FFT; park them behind the HackRF-first set.
 - **`sync_bank` flapping** (from the 2026-10-27 investigation, not reproduced). A bank replaced while `feed_bank` still drains old-band blocks can swap back and forth, stalling a channel stage silently.
 

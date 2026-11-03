@@ -68,7 +68,7 @@ marked "builder's call" (left open) or "author's call" (my choice, open to chang
   not care whether a decoder is a process or a stage, so a later sprint can swap one for the
   other and the row's test proves them equal.
 - No UI redesign. The page gains only what the envelope's `summary` gives it for free and a way
-  to start `identify` from a box; mode picking by band and the Okudagram theme are plan 18.
+  to start `identify` from a box; mode picking by band and the console theme are plan 18.
 - No span decoders (every POCSAG channel in a capture at once) and no trunking followers.
 
 ### Anti-goals (what would make this a failure even if it worked)

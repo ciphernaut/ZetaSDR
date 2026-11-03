@@ -1,17 +1,101 @@
-/* ZetaSDR web app: palette from the mockup. */
+/* ZetaSDR web app. Every colour, radius, font and geometry value below is a variable: the
+   plain values live in :root (the look before the console theme), the console theme restates
+   them in [data-theme="console"] (view policy `theme`, mirrored on <html> by app.js). */
+@font-face {
+  font-family: "Antonio";
+  src: url("vendor/antonio/Antonio-VF.ttf") format("truetype");
+  font-weight: 400 700;
+  font-display: swap;
+}
 :root {
-  --bg: #0b0e14;
-  --bar: #141923;
-  --border: #2a3140;
-  --accent: #5ec8ff;
-  --text: #c9d1dc;
-  --dim: #7a8496;
-  --error: #ff6b6b;
-  --ok: #7ee787;
-  --user: #e6c07b;
-  --side-w: 360px;
+  --bg: #0b0e14;            /* page ground */
+  --bar: #141923;           /* bars and panels */
+  --border: #2a3140;        /* hairlines */
+  --accent: #5ec8ff;        /* links, selection, the active job */
+  --text: #c9d1dc;          /* body text */
+  --dim: #7a8496;           /* captions, ids */
+  --error: #ff6b6b;         /* failures */
+  --ok: #7ee787;            /* open, running, speaking */
+  --user: #e6c07b;          /* operator input, events */
+  --c-frame: var(--border);     /* the console frame (the console theme paints it) */
+  --c-source: var(--accent);    /* the source bar */
+  --c-action: var(--accent);    /* action buttons */
+  --c-channel-1: var(--accent); /* per-channel colours, cycled by channel */
+  --c-channel-2: var(--accent);
+  --c-channel-3: var(--accent);
+  --c-channel-4: var(--accent);
+  --c-channel-5: var(--accent);
+  --c-channel-6: var(--accent);
+  --c-idle: var(--dim);         /* a quiet channel */
+  --c-speaking: var(--ok);      /* a channel being heard */
+  --wf-bg: #000030;             /* waterfall canvas ground, both themes */
+  --wf-select: #ffffff;         /* the drag rectangle */
+  --overlay-bg: color-mix(in srgb, var(--bg) 78%, transparent); /* labels over the waterfall */
+  --tint-span: rgba(255, 255, 255, 0.04);     /* a capture's cached region */
+  --tint-outline: rgba(255, 255, 255, 0.03);  /* a job outline's fill */
+  --tint-speaking: color-mix(in srgb, var(--ok) 8%, transparent);
+  --label-bg: rgba(0, 0, 0, 0.65);            /* map label ground */
+  --map-mark: #ff7a1a;                        /* map position and track */
+  --map-sel: #2aa1ff;                         /* map selection and home */
+  --map-dim: #666;                            /* map popup age */
+  --map-label-text: #fff;
+  --scrim: rgba(0, 0, 0, 0.55);               /* behind the graph view */
+  --shadow: rgba(0, 0, 0, 0.5);               /* menus, drawer */
+  --shadow-strong: rgba(0, 0, 0, 0.6);        /* graph panel */
+  --font-ui: ui-monospace, "SFMono-Regular", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --font-mono: ui-monospace, monospace;
+  --ribbon-tilt: 0deg;     /* the lean of a transcript ribbon */
+  --rail-w: 0px;           /* the frequency-aligned rail */
+  --rail-thin-px: 5px;     /* the rail's thin form */
+  --radius-bar: 3px;       /* buttons and bars */
+  --radius-elbow: 0;       /* the frame's elbows */
+  --axis-w: 64px;          /* the waterfall's frequency axis */
+  --side-w: 360px;         /* the side column */
+  --side-collapsed-w: 44px;
+  --bar-h-top: 34px;       /* the top bar */
+  --bar-h-bottom: 38px;    /* the command bar */
+  --bar-h: var(--bar-h-top);
   color-scheme: dark;
 }
+
+/* The console theme: black ground, coloured bars with black text, a condensed face, the
+   ribbons leaning. Only the roles change; the rules below name no colour of their own. */
+[data-theme="console"] {
+  --bg: #000;                   /* console ground */
+  --bar: #0c0c10;               /* panels */
+  --border: #3a3d48;            /* hairlines: the idle grey */
+  --accent: #f3e3a0;            /* action */
+  --text: #e9e4d8;              /* console text */
+  --dim: #8a8f9a;               /* console dim */
+  --error: #e05a5a;
+  --ok: #7ee787;
+  --user: #f7b98a;
+  --c-frame: #f08c3c;           /* the frame */
+  --c-source: #b79ae6;          /* the source bar */
+  --c-action: #f3e3a0;          /* action buttons */
+  --c-channel-1: #6aa8e0;       /* channel colours 1-6 */
+  --c-channel-2: #f3e3a0;
+  --c-channel-3: #b79ae6;
+  --c-channel-4: #6fcfc4;
+  --c-channel-5: #f7b98a;
+  --c-channel-6: #f08c3c;
+  --c-idle: #3a3d48;            /* a quiet channel */
+  --c-speaking: #7ee787;        /* a channel being heard */
+  --font-ui: "Antonio", "DejaVu Sans Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --ribbon-tilt: -15deg;
+  --rail-w: 96px;
+  --radius-bar: 14px;
+  --radius-elbow: 22px;
+}
+[data-theme="console"] body { background: var(--bg); font-family: var(--font-ui); }
+/* Label roles are capitals under the console theme; decoded text, .line bodies, params and
+   .band stay as sent. */
+[data-theme="console"] .pane h2,
+[data-theme="console"] .job .kind,
+[data-theme="console"] .job-tag .kind,
+[data-theme="console"] .job-tag .channel { text-transform: uppercase; }
+/* Numbers line up in columns. */
+.job .band, .src-tab .range, .src-tab .centre, #subjects td { font-variant-numeric: tabular-nums; }
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -21,14 +105,14 @@ html, body {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font: 12px/1.4 ui-monospace, "SFMono-Regular", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  font: 12px/1.4 var(--font-ui);
 }
 
 button, input { font: inherit; color: inherit; }
 button {
   background: var(--bar);
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--radius-bar);
   padding: 3px 8px;
   cursor: pointer;
 }
@@ -37,7 +121,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 input {
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: var(--radius-bar);
   padding: 4px 6px;
   outline: none;
 }
@@ -70,7 +154,7 @@ input:focus { border-color: var(--accent); }
   height: 100%;
   display: grid;
   grid-template-columns: minmax(0, 1fr) var(--side-w);
-  grid-template-rows: 34px minmax(0, 1fr) 38px;
+  grid-template-rows: var(--bar-h-top) minmax(0, 1fr) var(--bar-h-bottom);
   grid-template-areas: "top top" "main side" "bar bar";
 }
 
@@ -136,19 +220,19 @@ input:focus { border-color: var(--accent); }
 /* The map (map.js, view `map on`): a pane beside the waterfall in the wide footprint. */
 #map { position: absolute; top: 0; bottom: 0; right: 0; left: 50%; background: var(--bg); }
 html[data-map="on"] #waterfall { right: 50%; }
-#map .leaflet-popup-content .age { color: #666; font-size: 11px; }
-#map path.map-pos { stroke: #ff7a1a; fill: #ff7a1a; fill-opacity: 0.8; stroke-width: 2; }
-#map path.map-track { stroke: #ff7a1a; stroke-opacity: 0.7; stroke-width: 2; fill: none; }
+#map .leaflet-popup-content .age { color: var(--map-dim); font-size: 11px; }
+#map path.map-pos { stroke: var(--map-mark); fill: var(--map-mark); fill-opacity: 0.8; stroke-width: 2; }
+#map path.map-track { stroke: var(--map-mark); stroke-opacity: 0.7; stroke-width: 2; fill: none; }
 /* A subject's marker: the arrow's centre sits on the fix, the label beside it. */
 #map .map-subject { position: absolute; left: -6px; top: -7px; display: flex; align-items: center; gap: 3px; white-space: nowrap; }
-#map .map-subject .arrow { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 14px solid #ff7a1a; }
-#map .map-subject .arrow.dot { width: 10px; height: 10px; margin: 2px 1px; border: 0; border-radius: 50%; background: #ff7a1a; }
-#map .map-subject .label { padding: 0 3px; font-size: 11px; color: #fff; background: rgba(0, 0, 0, 0.65); }
+#map .map-subject .arrow { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 14px solid var(--map-mark); }
+#map .map-subject .arrow.dot { width: 10px; height: 10px; margin: 2px 1px; border: 0; border-radius: 50%; background: var(--map-mark); }
+#map .map-subject .label { padding: 0 3px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); }
 #map .map-subject.dim { opacity: 0.45; }
-#map .map-subject.selected .arrow { border-bottom-color: #2aa1ff; }
-#map .map-subject.selected .arrow.dot { background: #2aa1ff; }
-#map .map-subject.selected .label { box-shadow: 0 0 0 1px #2aa1ff; }
-#map path.map-home { stroke: #2aa1ff; fill: #2aa1ff; fill-opacity: 0.6; stroke-width: 2; }
+#map .map-subject.selected .arrow { border-bottom-color: var(--map-sel); }
+#map .map-subject.selected .arrow.dot { background: var(--map-sel); }
+#map .map-subject.selected .label { box-shadow: 0 0 0 1px var(--map-sel); }
+#map path.map-home { stroke: var(--map-sel); fill: var(--map-sel); fill-opacity: 0.6; stroke-width: 2; }
 /* The pane under the waterfall (panes.js): the strip's selected pane, at the height the jobs
    panel has; the waterfall and the map keep the rest. */
 #pane { position: absolute; left: 0; right: 0; bottom: 0; height: 40%; overflow: hidden; background: var(--bg); border-top: 1px solid var(--border); }
@@ -172,7 +256,6 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
 #subjects tr.subject.dim { color: var(--dim); }
 #subjects tr.subject.selected, #subjects tr.subject.selected td:first-child { background: var(--bar); }
 #subjects tr.subject.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
-#waterfall { --axis-w: 64px; }
 #waterfall .wf-axis {
   position: absolute; left: 0; top: 0; bottom: 0; width: var(--axis-w);
   border-right: 1px solid var(--border); color: var(--dim);
@@ -204,32 +287,32 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
 }
 #waterfall .ov-label, #waterfall .ov-ribbon {
   position: absolute; padding: 0 5px; border-radius: 2px; white-space: nowrap;
-  background: rgba(11, 14, 20, 0.78); border: 1px solid var(--border);
+  background: var(--overlay-bg); border: 1px solid var(--border);
 }
 /* overlays.js: a capture's cached region, a thin bracket over its band and time columns */
 #waterfall .ov-span {
   position: absolute; box-sizing: border-box; pointer-events: none;
-  border: 1px solid var(--user); background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--user); background: var(--tint-span);
 }
 #waterfall .ov-span > span {
   position: absolute; left: 2px; top: 0; padding: 0 3px; font-size: 10px; line-height: 12px;
-  color: var(--user); background: rgba(11, 14, 20, 0.78);
+  color: var(--user); background: var(--overlay-bg);
 }
 /* overlays.js: a rigid holder's band (or the capture), bordered, its kind at the top right */
 #waterfall .outline {
   position: absolute; left: 0; right: 0; box-sizing: border-box;
   border-top: 1px dashed var(--accent); border-bottom: 1px dashed var(--accent);
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--tint-outline);
 }
 #waterfall .outline-label {
   position: absolute; right: 6px; top: 1px; padding: 0 4px; font-size: 11px; border-radius: 2px;
-  color: var(--accent); background: rgba(11, 14, 20, 0.78); white-space: nowrap;
+  color: var(--accent); background: var(--overlay-bg); white-space: nowrap;
 }
 /* a job's tag (overlays.js): kind, short id, squelch dot, channel, transcript snippet */
 #waterfall .job-tag { position: absolute; right: 6px; pointer-events: auto; }
 .job-tag {
   padding: 0 4px; font-size: 11px; border-radius: 2px; color: var(--accent);
-  background: rgba(11, 14, 20, 0.78); white-space: nowrap; max-width: 60%;
+  background: var(--overlay-bg); white-space: nowrap; max-width: 60%;
   overflow: hidden; text-overflow: ellipsis;
 }
 .job-tag .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; }
@@ -242,7 +325,7 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
 .job-tag.speaking { color: var(--ok); outline: 1px solid var(--ok); }
 #waterfall .outline.speaking {
   border-top: 2px solid var(--ok); border-bottom: 2px solid var(--ok);
-  background: rgba(126, 231, 135, 0.08);
+  background: var(--tint-speaking);
 }
 /* narrow: the tag is the long-press target of a retunable outline */
 html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-action: none; }
@@ -265,7 +348,7 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 }
 #waterfall .outline-readout {
   position: absolute; right: 6px; top: calc(100% + 2px); padding: 0 4px; font-size: 11px;
-  border-radius: 2px; color: var(--accent); background: rgba(11, 14, 20, 0.78);
+  border-radius: 2px; color: var(--accent); background: var(--overlay-bg);
   white-space: nowrap; pointer-events: none;
 }
 #waterfall .ov-mark {
@@ -420,12 +503,12 @@ html[data-footprint="narrow"] #side { display: none; }
 html[data-footprint="narrow"][data-drawer="open"] #side {
   display: flex;
   position: fixed;
-  top: 34px;
-  bottom: 38px;
+  top: var(--bar-h-top);
+  bottom: var(--bar-h-bottom);
   right: 0;
   width: min(var(--side-w), 92vw);
   z-index: 10;
-  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
+  box-shadow: -8px 0 24px var(--shadow);
 }
 
 /* Context menu on a waterfall selection (menu.js). */
@@ -440,7 +523,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   background: var(--bar);
   border: 1px solid var(--border);
   border-radius: 4px;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 6px 18px var(--shadow);
 }
 #ctx .ctx-item, #ctx-outline .ctx-item {
   text-align: left;
@@ -472,7 +555,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   align-items: center;
   justify-content: center;
   padding: 16px;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--scrim);
 }
 #graph .graph-panel {
   display: flex;
@@ -485,7 +568,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   background: var(--bar);
   border: 1px solid var(--border);
   border-radius: 4px;
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 10px 28px var(--shadow-strong);
 }
 #graph .graph-head { display: flex; align-items: center; justify-content: space-between; }
 #graph .graph-title { color: var(--accent); }
@@ -496,10 +579,10 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 #graph .graph-node rect { fill: var(--bar); stroke: var(--border); stroke-width: 1.5; }
 #graph .graph-node:hover rect, #graph .graph-node:focus-visible rect { stroke: var(--accent); }
 #graph .graph-node.selected rect { stroke: var(--accent); stroke-width: 2.5; }
-#graph .graph-node text { fill: var(--text); font: 12px ui-monospace, monospace; }
+#graph .graph-node text { fill: var(--text); font: 12px var(--font-mono); }
 #graph .graph-node text.nid { fill: var(--dim); font-size: 11px; }
 #graph .graph-edge line { stroke: var(--dim); stroke-width: 1.5; }
-#graph .graph-edge text { fill: var(--user); font: 11px ui-monospace, monospace; }
+#graph .graph-edge text { fill: var(--user); font: 11px var(--font-mono); }
 #graph .graph-arrowhead { fill: var(--dim); }
 #graph .graph-node-title { color: var(--dim); }
 #graph-params {

@@ -577,8 +577,8 @@
 <tspan x="138.0" dy="0">Web UI only. Staircase transcript ribbons (lanes from the pixel</tspan>
 <tspan x="138.0" dy="13.0">height between channels); mode picking by band through</tspan>
 <tspan x="138.0" dy="13.0">knowledge_lookup with a search fallback; state-stream decoders</tspan>
-<tspan x="138.0" dy="13.0">such as ADS-B as one held line per subject; the Okudagram</tspan>
-<tspan x="138.0" dy="13.0">(LCARS) theme behind view set theme.</tspan>
+<tspan x="138.0" dy="13.0">such as ADS-B as one held line per subject; the console theme</tspan>
+<tspan x="138.0" dy="13.0">behind view set theme.</tspan>
 </text>
 <circle cx="130.0" cy="1822.0" r="9" fill="currentColor" fill-opacity="0.9"/>
 <text x="130.0" y="1825.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">15</text>

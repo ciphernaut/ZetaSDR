@@ -165,6 +165,7 @@ export const POLICIES = [
       }
     },
   },
+  { key: "theme", values: ["console", "plain"], default_: "console", describe: "console, plain" },
 ];
 
 const byKey = new Map(POLICIES.map((p) => [p.key, p]));
