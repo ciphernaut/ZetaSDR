@@ -124,6 +124,18 @@ pub fn wrap_style(
 /// comment, string or bracket, or a stray `\` that would escape what follows it.
 fn check_fragment(field: &str, value: &str) -> Result<(), ThemeError> {
     let toks = Lexer::new(value, field, false).run()?;
+    // A `url()` however it is spelt (`u\72l(` included): a value loads nothing.
+    let url = toks.iter().enumerate().any(|(i, t)| match &t.kind {
+        Kind::Url { .. } => true,
+        Kind::Ident(n) => {
+            n.eq_ignore_ascii_case("url")
+                && matches!(toks.get(i + 1).map(|t| &t.kind), Some(Kind::Open('(')))
+        }
+        _ => false,
+    });
+    if url {
+        return Err(ThemeError::new(field, "url() is not allowed"));
+    }
     let stray = toks
         .iter()
         .any(|t| t.kind == Kind::Other && &value[t.start..t.end] == "\\");
@@ -625,9 +637,28 @@ impl<'a> Lexer<'a> {
             return Ok(Kind::AtKeyword(self.name()));
         }
         if self.number_at() {
-            self.i += 1;
-            while self.peek(0).is_some_and(|c| c.is_ascii_digit() || c == '.') {
+            // CSS Syntax 4.3.12: a sign, digits, `.` and at least one digit, then an
+            // exponent only when a digit follows it; the unit is an identifier.
+            let digit = |l: &Self, k: usize| l.peek(k).is_some_and(|c: char| c.is_ascii_digit());
+            let digits = |l: &mut Self| {
+                while digit(l, 0) {
+                    l.i += 1;
+                }
+            };
+            if matches!(self.peek(0), Some('+' | '-')) {
                 self.i += 1;
+            }
+            digits(self);
+            if self.peek(0) == Some('.') && digit(self, 1) {
+                self.i += 1;
+                digits(self);
+            }
+            if matches!(self.peek(0), Some('e' | 'E')) {
+                let sign = matches!(self.peek(1), Some('+' | '-')) as usize;
+                if digit(self, 1 + sign) {
+                    self.i += 1 + sign;
+                    digits(self);
+                }
             }
             if self.ident_at(0) {
                 self.name();
@@ -656,6 +687,11 @@ impl<'a> Lexer<'a> {
     /// Every token of the text; brackets must pair up.
     fn run(mut self) -> Result<Vec<Tok>, ThemeError> {
         let mut toks = Vec::new();
+        // A browser reads NUL as U+FFFD, a name character; refuse it rather than
+        // lex it otherwise.
+        if let Some(at) = self.s.find('\0') {
+            return Err(self.err(at, "a NUL character is not allowed"));
+        }
         let mut open: Vec<(char, usize)> = Vec::new();
         while self.i < self.cs.len() {
             let start = self.byte(self.i);
@@ -960,5 +996,43 @@ mod tests {
         t.fonts[0].weight = "400\\".into();
         let e = wrap_style(&t, "", &files()).unwrap_err();
         assert_eq!(e.field, "fonts[0].weight", "{e}");
+    }
+
+    #[test]
+    fn numbers_are_read_as_the_browser_does() {
+        // `1.url(` is the number `1`, a `.` and a url token, never a number with the
+        // unit `url`: the url is checked, and a `/*` inside it opens no comment.
+        let e = refused(".a { x: 1.url(/*) } } html{background:red} .z{ */ ) }");
+        assert_eq!(e.field, "style.css", "{e}");
+        let e = refused(".a { x: 1.url(https://e/x) }");
+        assert!(e.error.starts_with("url(https://e/x): "), "{e}");
+        let e = refused(".a { x: 1e3.url(https://e/x) }");
+        assert!(e.error.starts_with("url(https://e/x): "), "{e}");
+        wrap(".a { x: 1.url(bg.png); width: 1.5em; margin: -.5e+3px 1e 2E3%; }");
+    }
+
+    #[test]
+    fn a_raw_nul_is_refused() {
+        let e = refused(".a { x: \0url(data:/*) \"*/ ) } } html { background: red } .z { \"; }");
+        assert_eq!(e.field, "style.css", "{e}");
+        assert!(e.error.contains("NUL"), "{e}");
+        let mut t = theme();
+        t.tokens.insert("--accent".into(), "a\0b".into());
+        let e = wrap_style(&t, "", &files()).unwrap_err();
+        assert_eq!(e.field, "tokens.--accent", "{e}");
+    }
+
+    #[test]
+    fn a_url_in_a_token_is_refused_escaped_or_not() {
+        for value in [
+            "u\\72l(https://e/x.png)",
+            "U\\52L(\"bg.png\")",
+            "url(bg.png)",
+        ] {
+            let mut t = theme();
+            t.tokens.insert("--accent".into(), value.into());
+            let e = wrap_style(&t, "", &files()).unwrap_err();
+            assert_eq!(e.field, "tokens.--accent", "{value}: {e}");
+        }
     }
 }
