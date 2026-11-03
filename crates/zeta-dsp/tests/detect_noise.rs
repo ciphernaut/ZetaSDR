@@ -1,19 +1,34 @@
 //! The detector's defaults against a real receiver's noise: a SigMF capture of a band
 //! with nothing in it (`scratch/live/record-noise.sh` records 10 s of 400-406 MHz on
-//! the field host's B210), named by `ZETA_NOISE_CAPTURE`, kept outside the repo. Its rows,
-//! cut as a `watch` cuts them and replayed for 60 s, must announce no signal.
+//! the field host's B210 with the input terminated), named by `ZETA_NOISE_CAPTURE`, kept
+//! outside the repo. Its rows, cut as a `watch` cuts them and replayed for 60 s, must
+//! announce no signal.
 //!
 //! `ZETA_NOISE_CAPTURE=~/zeta-fixtures/b210-noise-403m.sigmf-meta \
 //!  cargo test -p zeta-dsp --test detect_noise -- --ignored`
+//!
+//! The positive control is the same recording with the antenna on (`b210-air-403m`),
+//! named by `ZETA_AIR_CAPTURE`: the 404.025 MHz telemetry link that bursts about once a
+//! second must be announced within the first `AIR_ANNOUNCE_S` seconds of the replay.
+//!
+//! `ZETA_AIR_CAPTURE=~/zeta-fixtures/b210-air-403m.sigmf-meta \
+//!  cargo test -p zeta-dsp --test detect_noise -- --ignored`
 
 use num_complex::Complex;
-use zeta_dsp::detect::{DetectParams, SignalState, SpectrumRowView, Tracker, runs};
+use zeta_dsp::detect::{DetectParams, Signal, SignalState, SpectrumRowView, Tracker, runs};
 use zeta_dsp::fft::{CpuFft, FftBackend, STEP_DB, Window, quantise_row};
 
-/// How long the rows are replayed for.
+/// How long the noise rows are replayed for.
 const REPLAY_S: u64 = 60;
 /// Rows a second, as a `watch` cuts them.
 const ROWS_PER_S: u64 = zeta_core::ops::SPECTRUM_ROWS_PER_S as u64;
+/// The link the antenna-on capture must show, and how far from it the detector's centre
+/// may land (it is good to about one bin).
+const AIR_LINK_HZ: u64 = 404_025_000;
+const AIR_LINK_TOLERANCE_HZ: u64 = 20_000;
+/// How soon the link must be announced: its bursts are about a second apart and the
+/// detector wants `persist_ms` of sightings before `new`.
+const AIR_ANNOUNCE_S: u64 = 10;
 
 /// The capture's samples, its rate and its centre.
 fn read_capture(meta_path: &str) -> (Vec<Complex<f32>>, u64, u64) {
@@ -31,7 +46,7 @@ fn read_capture(meta_path: &str) -> (Vec<Complex<f32>>, u64, u64) {
     let data_path = meta_path
         .strip_suffix(".sigmf-meta")
         .map(|stem| format!("{stem}.sigmf-data"))
-        .expect("ZETA_NOISE_CAPTURE names a .sigmf-meta");
+        .expect("the capture is named by its .sigmf-meta");
     let bytes = std::fs::read(&data_path).expect("read the data");
     let iq = match datatype {
         "cf32_le" => bytes
@@ -61,12 +76,10 @@ fn read_capture(meta_path: &str) -> (Vec<Complex<f32>>, u64, u64) {
     (iq, rate, center)
 }
 
-#[test]
-#[ignore = "needs a recorded noise capture in ZETA_NOISE_CAPTURE"]
-fn a_recorded_noise_capture_yields_no_signal_in_60_s() {
-    let path = std::env::var("ZETA_NOISE_CAPTURE")
-        .expect("ZETA_NOISE_CAPTURE names the noise capture's .sigmf-meta");
-    let (iq, rate, center) = read_capture(&path);
+/// The capture's rows, cut as a `watch` cuts them and replayed (looped) for `replay_s`
+/// through the detector's defaults; the `new` signals announced, in order.
+fn announced_new(meta_path: &str, replay_s: u64) -> Vec<Signal> {
+    let (iq, rate, center) = read_capture(meta_path);
     let size = zeta_core::ops::watch_fft_size(rate) as usize;
     let per_row = (rate / ROWS_PER_S) as usize;
     let fft = CpuFft::new();
@@ -80,7 +93,7 @@ fn a_recorded_noise_capture_yields_no_signal_in_60_s() {
     let mut tracker = Tracker::new(&p, bin_hz);
     let mut announced = Vec::new();
     let row_ns = 1_000_000_000 / ROWS_PER_S;
-    for n in 0..REPLAY_S * ROWS_PER_S {
+    for n in 0..replay_s * ROWS_PER_S {
         let (floor_db, q) = &rows[n as usize % rows.len()];
         let row = SpectrumRowView {
             bin_hz,
@@ -97,10 +110,36 @@ fn a_recorded_noise_capture_yields_no_signal_in_60_s() {
                 .filter(|s| s.state == SignalState::New),
         );
     }
+    announced
+}
+
+#[test]
+#[ignore = "needs a recorded noise capture in ZETA_NOISE_CAPTURE"]
+fn a_recorded_noise_capture_yields_no_signal_in_60_s() {
+    let path = std::env::var("ZETA_NOISE_CAPTURE")
+        .expect("ZETA_NOISE_CAPTURE names the noise capture's .sigmf-meta");
+    let announced = announced_new(&path, REPLAY_S);
     assert!(
         announced.is_empty(),
         "{} signals announced on noise: {:?}",
         announced.len(),
         announced.iter().map(|s| s.summary()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+#[ignore = "needs a recorded antenna-on capture in ZETA_AIR_CAPTURE"]
+fn a_recorded_antenna_on_capture_announces_the_404_025_mhz_link() {
+    let path = std::env::var("ZETA_AIR_CAPTURE")
+        .expect("ZETA_AIR_CAPTURE names the antenna-on capture's .sigmf-meta");
+    let announced = announced_new(&path, AIR_ANNOUNCE_S);
+    let summaries: Vec<String> = announced.iter().map(|s| s.summary()).collect();
+    eprintln!("announced in {AIR_ANNOUNCE_S} s: {summaries:?}");
+    let link = announced
+        .iter()
+        .find(|s| s.center_hz.abs_diff(AIR_LINK_HZ) <= AIR_LINK_TOLERANCE_HZ);
+    assert!(
+        link.is_some(),
+        "no signal within {AIR_LINK_TOLERANCE_HZ} Hz of {AIR_LINK_HZ} Hz in {AIR_ANNOUNCE_S} s; announced: {summaries:?}"
     );
 }
