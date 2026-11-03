@@ -1,0 +1,164 @@
+# Public Release Preparation Plan (plan 25)
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** The ZetaSDR tree can be published as a public repository: nothing in it names the operator's hosts, home position or private services, every bundled third-party file is credited, a stranger can build and test it from the README alone, CI gates every push, and a script exports the tree as a fresh one-commit history ready to push.
+
+**Architecture:** Four kinds of change, in order. (1) A leak gate (`scripts/public-check.sh`) that fails on private names and precise coordinates, so every later task proves itself against it. (2) Removal and scrubbing: private ops files leave the tree, hostnames become roles, the home position becomes a public demo station. (3) Release furniture: notices, crate metadata, community files, CI. (4) An export script that builds the public history from a scrubbed `HEAD` and re-runs every gate in the export, so the private repository and its 616 commits stay as they are.
+
+**Tech Stack:** Rust workspace (19 crates, edition 2024, Apache-2.0), bash, `gitleaks` 8 (installed at `~/.local/bin/gitleaks`), `cargo-deny`, GitHub Actions, Playwright for the UI e2e.
+
+**Spec:** none; this plan is its own spec. The audit it rests on (2026-11-03, `main` at 8215ccd) is summarised in "Audit findings" below.
+
+## Audit findings (2026-11-03)
+
+- **Private hosts:** `field-host` in 51 tracked files (130 hits under `docs/superpowers` alone; code: `crates/zeta-agent/tests/live.rs:13-16`, comments in `crates/zeta-dsp/src/mix.rs:33`, `crates/zeta-dsp/tests/detect_noise.rs:2-11`, `crates/zeta-dsp/tests/pfb.rs:199`); `acma-host` in 5 files, `.mcp.json` among them (`http://acma-host:3110/mcp`).
+- **Home position:** `UAT.md:285` gives the station to six decimals; history also carries five other precise points near it. Coarse `-27.38/153.12` and `-27.38/153.12` appear in `AGENTS.md:197` (generated), `crates/zeta-core/tests/station.rs:32,47`, `crates/zeta-ext/src/acma.rs:671-673`.
+- **Operator-only files:** `deploy/field-host/` (4 scripts), `UAT.md` (acceptance log with the station), `scratch/` (already ignored; `scratch/live/record-noise.sh` exists only in history).
+- **Secrets:** `gitleaks git` over all history finds one hit, a redacted placeholder in `docs/superpowers/plans/2026-10-19-ui.md:70` (false positive). Test secrets (`s3cret`) are fixtures. No keys, no private-key blocks.
+- **Identity:** every commit is `Sage Grigull <ciphernaut@proton.me>`.
+- **Third-party content:** `crates/zeta-dsp/data/signals.json` (iNTERCEPT, Apache-2.0, has `NOTICE`), `crates/zeta-ui/web/vendor/leaflet` (BSD-2, has `LICENSE`), `crates/zeta-ui/web/vendor/antonio` (SIL OFL 1.1, has `OFL.txt`). GPL decoders (dump1090, rs1729) run as external programs, never linked. No top-level `NOTICE`.
+- **Missing:** `.github/`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`, `repository`/`homepage`/`readme`/`keywords` in the crates' `Cargo.toml`, a dependency licence check.
+- **Size:** `.git` is 32 MB; the largest blob is `signals.json` (794 KB). Size is no obstacle.
+
+## Rulings to confirm (defaults the plan takes)
+
+These are the operator's calls; the plan proceeds on the default unless told otherwise.
+
+1. **History: a fresh root commit** (Task 7), not `git filter-repo`. The home position, hostnames and 130 plan-doc mentions are spread over 616 commits; rewriting them is error-prone and a missed blob is public forever. The private repository keeps the full history. Alternative: filter-repo with the same denylist, then gitleaks over the result.
+2. **Design history stays public, scrubbed:** `docs/superpowers/{specs,plans}`, `TODO.md`, `RECIPES.md` and `docs/architecture` are kept with hosts replaced by roles. Alternative: drop `docs/superpowers` from the public tree.
+3. **Leave the public tree:** `deploy/field-host/`, `UAT.md`, `.mcp.json`. They move to a private `ops` location the operator names (default: kept on the private `main`, removed only on the export branch; see Task 2).
+4. **No crates.io publish** in this plan: every crate gets `publish = false`. A publish plan comes later if wanted.
+5. **Public identity:** the export commit is authored `Sage Grigull <ciphernaut@proton.me>`, as the history already is. Change `PUBLIC_AUTHOR` in Task 7 if another identity is wanted.
+6. **Host: GitHub**, CI on GitHub Actions, private vulnerability reporting for `SECURITY.md`.
+7. **Demo station:** the public examples and tests use Brisbane Airport, `-27.3842, 153.1175`, 4 m (a public landmark already named in the field craft for sonde launches).
+
+## Global Constraints
+
+- Work on branch `worktree-public-release` in a worktree; one commit per task with the message the task names, each ending with the session attribution line. No push, no merge, no deploy: the operator does those (Task 8).
+- The private denylist never enters the tree: `scripts/public-check.sh` reads it from the file named by `ZETA_PUBLIC_DENYLIST` (default `$XDG_CONFIG_HOME/zetasdr/public-denylist`, else `~/.config/zetasdr/public-denylist`), one extended regex per line, `#` comments. Without the file the script still runs the built-in checks and prints `public-check: no private denylist; built-in checks only`.
+- Built-in checks (public, in the script): latitude/longitude pairs with 4 or more decimals (`-?[0-9]{1,3}\.[0-9]{4,}, ?-?[0-9]{1,3}\.[0-9]{4,}`) outside an allowlist file `scripts/public-allow.txt` (`path:regex` lines; the demo station and synthesised test values go there), any `*.local` hostname with a port (`[a-z0-9-]+\.local:[0-9]+`), and `gitleaks dir` with `.gitleaks.toml`.
+- Hosts become roles, consistently: `field-host` → `the field host` in prose, `field-host` in URLs and paths (`http://field-host:7979`); `acma-host:3110` → `acma-host:3110`. Hardware names (B210, HackRF) stay: they are the facts that make the measurements reproducible.
+- `AGENTS.md` and `skills/zetasdr/SKILL.md` are generated: edit their sources (`docs/agents/*.md`, op docs in code) and regenerate with `cargo run -p zeta -- agents-md`; `zeta agents-md --check` must pass.
+- Gates per task: `bash scripts/public-check.sh` (from Task 1 on; it may list findings only in files a later task owns, and the task's report names them), `cargo fmt -p <touched crates> -- --check` (per member: the nested worktree breaks `--all`), `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`. The UI e2e (`cargo test -p zeta --test ui`) only in Tasks 5 and 7.
+- Temp files under the job's tmp directory, never `/tmp`.
+
+## Review Focus
+
+1. **A leak in a file the gate does not scan.** Binary and generated files (`docs/architecture/zetasdr-architecture.svg`, `index.html`, `.png` screenshots) carry text too. The gate scans every tracked file `git ls-files` lists, binaries via `strings`. Pinned in Task 1 (`svg_and_binary_are_scanned`).
+2. **The denylist leaking itself.** A failure message must print the file and line of the hit, never the pattern that matched. Pinned in Task 1 (`message_omits_pattern`).
+3. **A scrub that breaks a test's arithmetic.** Moving the station moves every expected distance and bearing; recomputed, not edited by hand. Pinned in Task 3 (the `acma.rs` haversine/bearing test against an independent value).
+4. **An export that differs from what was checked.** The export must come from `git archive` of a committed `HEAD` (no untracked or ignored file, no `target/`), and every gate runs again inside the export. Pinned in Task 7 (`export_has_no_ignored_files`, gates in the export).
+5. **Live tests that now point nowhere.** `crates/zeta-agent/tests/live.rs` must skip with a reason when `ZETA_LIVE_LLM_URL` is unset, not fail or hang on a dead default. Pinned in Task 2.
+
+---
+
+### Task 1: The leak gate (Sonnet)
+
+**Files:**
+- Create: `scripts/public-check.sh`, `scripts/public-allow.txt`, `.gitleaks.toml`, `scripts/tests/public-check.sh`
+
+**Interfaces:**
+- Produces: `bash scripts/public-check.sh [ROOT]` (default the repo root): exit 0 and `public-check: clean (<n> files)`; exit 1 with one line per hit, `public-check: <path>:<line>: <check>` where `<check>` is `denylist`, `coordinates`, `local-host` or `gitleaks:<rule>`. Every later task runs it.
+
+- [ ] **Step 1: Write the failing tests** in `scripts/tests/public-check.sh` (plain bash, builds fixture repos in `$CLAUDE_JOB_DIR/tmp` or `mktemp -d` under `${TMPDIR}`): `clean_tree_passes`; `denylist_hit_fails` (denylist `secret-host`, file containing `ssh secret-host` → exit 1, line `a.md:1: denylist`); `message_omits_pattern` (that output does not contain `secret-host`); `coordinates_fail_unless_allowed` (`-27.384212, 153.117501` fails; the same line allowed in `public-allow.txt` passes); `local_host_with_port_fails` (`http://box.local:8080`); `svg_and_binary_are_scanned` (hit inside an `.svg` and inside a `.png` built with `printf`); `no_denylist_still_runs` (message and exit 0 on a clean tree); `gitleaks_hit_fails` (a fake AWS key string `AKIA` + 16 caps). Exit non-zero on the first failing case, print `ok <name>` per pass.
+- [ ] **Step 2: Run** `bash scripts/tests/public-check.sh`. Expected: fails (script missing).
+- [ ] **Step 3: Implement `scripts/public-check.sh`**: `git -C ROOT ls-files` for the file list, `grep -nE` per pattern (text) and `strings | grep` for files `grep -I` calls binary; gitleaks as `gitleaks dir --no-banner --redact -c .gitleaks.toml -r <tmp json> ROOT`, mapped to the output format with `python3 -I`. `.gitleaks.toml` extends the default config and allowlists `docs/superpowers/plans/2026-10-19-ui.md` line 70's placeholder by regex and the `s3cret` fixtures by path.
+- [ ] **Step 4: Run** the test script. Expected: every `ok`. Then run `bash scripts/public-check.sh` on the repo with the operator's denylist and record the hit count per file in the task report (expected: dozens, owned by Tasks 2-3).
+- [ ] **Step 5: Commit** `release: a public-check gate for private names, precise coordinates and secrets`.
+
+### Task 2: Operator-only files leave the tree (Sonnet)
+
+**Files:**
+- Delete: `deploy/field-host/`, `UAT.md`, `.mcp.json`
+- Create: `.mcp.json.example` (`{"mcpServers": {"acma": {"type": "http", "url": "http://acma-host:3110/mcp"}}}`), `deploy/README.md`
+- Modify: `.gitignore` (add `/.mcp.json`, `/UAT.md`, `/deploy/local/`), `crates/zeta-agent/tests/live.rs:13-16`, every doc line that links the deleted files (`git grep -n 'deploy/field-host\|UAT.md\|\.mcp\.json'`)
+
+**Interfaces:**
+- Consumes: Task 1's gate.
+- Produces: the private files kept beside the tree, untracked: before deleting, copy `deploy/field-host/`, `UAT.md` and `.mcp.json` to `deploy/local/field-host/`, `deploy/local/UAT.md`, and leave `.mcp.json` in place untracked (`git rm --cached`), so the operator's checkout keeps working.
+
+- [ ] **Step 1:** Copy the three to their ignored places, then `git rm -r --cached` them; `git status --ignored` must list them as ignored, not deleted from disk.
+- [ ] **Step 2:** `live.rs`: the test reads `ZETA_LIVE_LLM_URL` and `ZETA_LIVE_LLM_MODEL`; unset, it prints `skipped: set ZETA_LIVE_LLM_URL` and returns (keep `#[ignore]`, reason `needs an LLM at ZETA_LIVE_LLM_URL`); rename the fn `live_llm_tunes_a_source`. Run `cargo test -p zeta-agent --test live -- --ignored` with the variable unset: passes, prints the skip.
+- [ ] **Step 3:** `deploy/README.md`: `deploy/pi` is the supported example; a host's own scripts live in the ignored `deploy/local/`. Re-point the doc links found above (README, RECIPES, memory-free docs) at `deploy/README.md` or drop them; acceptance prose that cited `UAT.md` cites nothing.
+- [ ] **Step 4:** Gates; `public-check` shows no hit in a file this task touched.
+- [ ] **Step 5: Commit** `release: the operator's deploy scripts, UAT log and MCP config leave the tree (kept ignored locally)`.
+
+### Task 3: Scrub hosts and the home position (Opus: many files, arithmetic in tests)
+
+**Files:**
+- Modify: `crates/zeta-core/tests/station.rs:32,47`, `crates/zeta-ext/src/acma.rs:665-680`, `crates/zeta-core/src/modes/summary.rs:267-268` (allowlist instead if it is a synthesised value), `crates/zeta-dsp/src/mix.rs:33`, `crates/zeta-dsp/tests/detect_noise.rs:1-15`, `crates/zeta-dsp/tests/pfb.rs:199`, the op doc for `station_set` (source of `AGENTS.md:197`), `docs/agents/*.md`, `docs/speech.md`, `README.md`, `RECIPES.md`, `TODO.md`, `docs/architecture/{gen.py,index.html,zetasdr-architecture.svg}`, `docs/superpowers/**`; regenerated `AGENTS.md`, `skills/zetasdr/SKILL.md`
+- Modify: `scripts/public-allow.txt` (the demo station, synthesised test coordinates)
+
+**Interfaces:**
+- Consumes: Task 1's gate and the host→role mapping in Global Constraints.
+
+- [ ] **Step 1: Coordinates in code.** `station.rs` uses `-27.3842, 153.1175, 4.0`. `acma.rs`'s distance/bearing test keeps a site but measures from the demo station; compute the expected `haversine_km` and `bearing_deg` with an independent formula (`python3 -I -c` with `math`, spherical earth R = 6371.0088 km as the code uses; check its constant) and assert to the test's existing tolerance. Run `cargo test -p zeta-core --test station` and `cargo test -p zeta-ext acma`: pass.
+- [ ] **Step 2: Hosts in code comments and docs**, scripted then read: `git grep -lE 'the field host|acma-host'` → `sed` per the mapping, then read every changed hunk (`git diff --word-diff`) and fix grammar ("on the field host's B210" → "on the field host's B210"). The `station set` CLI example becomes `--lat -27.38 --lon 153.12 --alt-m 4`. `docs/architecture/gen.py` is edited and run to regenerate the svg and html, not the outputs by hand.
+- [ ] **Step 3: Precise coordinates in prose** (`docs/superpowers/**`, `TODO.md`, `RECIPES.md`): replace each with the demo station or `<station>`; a transmitter site from the public register may stay only if its distance to the old home is not given beside it (else replace both).
+- [ ] **Step 4:** Regenerate: `cargo run -p zeta -- agents-md`, then `cargo run -p zeta -- agents-md --check` passes; the skill regenerated by the same path the plan 24 docs commit used.
+- [ ] **Step 5:** `bash scripts/public-check.sh` with the operator's denylist: `clean`. Full gates.
+- [ ] **Step 6: Commit** `release: hosts become roles and the station a public demo position, in code, docs and the design history`.
+
+### Task 4: Notices, crate metadata and the licence check (Sonnet)
+
+**Files:**
+- Create: `NOTICE`, `deny.toml`
+- Modify: `Cargo.toml` (`[workspace.package]`: `repository`, `homepage`, `readme = "README.md"`, `authors`), every `crates/*/Cargo.toml` (`repository.workspace = true`, `homepage.workspace = true`, `publish = false`, `keywords`, `categories` where it helps: `["sdr", "radio", "dsp"]`, `["command-line-utilities"]` for `zeta`)
+
+**Interfaces:**
+- Produces: `cargo deny check licenses bans sources` passing; CI (Task 6) runs it.
+
+- [ ] **Step 1: `NOTICE`**: ZetaSDR copyright line (`Copyright 2026 Sage Grigull`), then one section per bundled third party with path, licence and copyright: `crates/zeta-dsp/data/signals.json` (iNTERCEPT, Apache-2.0, from its `NOTICE`), `crates/zeta-ui/web/vendor/leaflet` (Leaflet 1.9.4, BSD-2-Clause), `crates/zeta-ui/web/vendor/antonio` (Antonio, SIL OFL 1.1); and a paragraph that dump1090 and the rs1729 decoders are GPL programs run as separate processes, not distributed or linked.
+- [ ] **Step 2: `deny.toml`**: allow `Apache-2.0`, `MIT`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, `Unicode-3.0`, `Zlib`, `MPL-2.0`, `CC0-1.0` and whatever `cargo deny check licenses` reports as in use that is permissive (add with a comment naming the crate); deny copyleft; `sources` allow crates.io only. Install `cargo-deny` if missing (`cargo install cargo-deny --locked`) and name it in the report. Run: passes. A GPL/LGPL/AGPL dependency found here stops the task and is reported, not allowlisted.
+- [ ] **Step 3:** Metadata as listed; the repository URL is `https://github.com/<OWNER>/ZetaSDR` with `<OWNER>` taken from the operator (ruling 6); until given, use the placeholder and list it in the report. `cargo metadata --format-version 1 >/dev/null` succeeds; `cargo package -p zeta-core --no-verify --allow-dirty --list` shows `README.md` resolved.
+- [ ] **Step 4:** Gates. **Commit** `release: NOTICE for the bundled data, map and font, crate metadata, and a cargo-deny licence check`.
+
+### Task 5: A README a stranger can follow, and the community files (Sonnet)
+
+**Files:**
+- Modify: `README.md` (top only: everything from the first `##` on stays)
+- Create: `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`
+
+- [ ] **Step 1: README head**, above the existing content: one paragraph on what ZetaSDR is (an agentic SDR runtime: a node, a typed operation set, a web page, MCP and an LLM agent); status (`0.1.0`, Linux, pre-1.0 operations may change); a **Quick start without a radio**: build (`cargo build --release -p zeta`), run against the recording the e2e tests use (find the fixture `crates/zeta/tests` uses; if none is small enough to name, `zeta` can synthesise one: use whatever the test harness uses and say so), open the page, a first `job start`; then **With a radio** (`--source-soapy` with `RUSTFLAGS="--cfg soapy"`, `libsoapysdr-dev`); then **Legal**: the field-craft paragraph on interception law in one short paragraph (receiving and decoding public protocols vs. third-party content; the operator's responsibility; SondeHub uploads only with a callsign). Every command in the head is run in Step 3.
+- [ ] **Step 2:** `CONTRIBUTING.md`: the gates (per-member `cargo fmt`, clippy with `-D warnings`, `cargo test --workspace`, the UI e2e and its Playwright setup from the e2e README or `crates/zeta/tests/ui.rs`), `zeta agents-md --check` after an op doc change, `bash scripts/public-check.sh`, commit style (imperative summary with an area prefix as the history uses). `SECURITY.md`: report via GitHub private vulnerability reporting; scope notes (the node secret, `--listen` refuses non-LAN addresses, plugins and handlers run with a cleared environment). `CODE_OF_CONDUCT.md`: Contributor Covenant 2.1 by reference with the contact method of `SECURITY.md`. `CHANGELOG.md`: `## 0.1.0 - <release date>` with a ten-line summary of plans 1-24 from the plan series.
+- [ ] **Step 3:** In a fresh clone of the worktree under the job's tmp dir, follow the README head verbatim: every command succeeds and the page answers. Run the UI e2e once (`cargo test -p zeta --test ui`): passes.
+- [ ] **Step 4:** Gates. **Commit** `release: a README head for newcomers, contributing, security, code of conduct and changelog`.
+
+### Task 6: CI (Sonnet)
+
+**Files:**
+- Create: `.github/workflows/ci.yml`, `.github/dependabot.yml`
+
+**Interfaces:**
+- Consumes: Task 1's script, Task 4's `deny.toml`.
+
+- [ ] **Step 1: `ci.yml`**, on push and pull request, `ubuntu-24.04`, toolchain from `rust-toolchain.toml`, `Swatinem/rust-cache` pinned by commit SHA: jobs `fmt` (per member: loop over `crates/*` except `zeta-source-soapy-driver`), `clippy` (`--workspace --all-targets --all-features -D warnings`), `test` (`cargo test --workspace`, excluding the UI e2e via whatever filter `ui.rs` honours; if none, `--exclude`-free with `ZETA_UI_SKIP` added to `ui.rs` in this task with a test), `ui` (Playwright install, `cargo test -p zeta --test ui`, `timeout-minutes: 20`), `agents-md` (`zeta agents-md --check`), `deny` (`EmbarkStudios/cargo-deny-action` pinned), `public-check` (`gitleaks` pinned, `bash scripts/public-check.sh`; no denylist in CI, so built-in checks only). Every third-party action pinned to a full commit SHA with the version in a comment. `permissions: contents: read`.
+- [ ] **Step 2: `dependabot.yml`**: cargo and github-actions, weekly.
+- [ ] **Step 3:** Validate: `actionlint` if available (install with `go install` or the release binary and name it), else `python3 -I -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))'`; run each job's command locally and record pass/fail and wall-clock time in the report. The workflow first runs for real after Task 8's push.
+- [ ] **Step 4: Commit** `release: CI for fmt, clippy, tests, the UI e2e, agents-md, licences and the leak gate`.
+
+### Task 7: The public export (Opus: last line of defence)
+
+**Files:**
+- Create: `scripts/export-public.sh`, `scripts/tests/export-public.sh`
+
+**Interfaces:**
+- Consumes: Tasks 1-6 committed.
+- Produces: `bash scripts/export-public.sh DEST [REF]` (`REF` default `HEAD`): refuses a dirty tree or an existing non-empty `DEST`; `git archive REF | tar -x -C DEST`; `git init -b main`; one commit `ZetaSDR 0.1.0` authored and committed as `PUBLIC_AUTHOR` (default `Sage Grigull <ciphernaut@proton.me>`, overridable by env) with `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` set to the release date; tag `v0.1.0`; then in `DEST`: `public-check.sh` (with the denylist), `gitleaks git` over the new history, `cargo build --workspace`, `cargo test --workspace`; prints `export: ready at DEST (<sha>)` or the first failing gate and exits 1. Never adds a remote, never pushes.
+
+- [ ] **Step 1: Failing tests** in `scripts/tests/export-public.sh` (on a tiny fixture repo, the cargo gates skipped by `EXPORT_SKIP_CARGO=1`): `refuses_dirty_tree`, `refuses_nonempty_dest`, `export_has_one_commit_and_tag`, `export_has_no_ignored_files` (a file ignored in the fixture is absent in `DEST`), `export_fails_on_leak` (a denylist hit committed in the fixture → exit 1 naming `public-check`), `author_is_public_author`, `no_remote`.
+- [ ] **Step 2:** Run: fail. **Step 3:** Implement. **Step 4:** Run: every `ok`.
+- [ ] **Step 5: The real dry run**: `bash scripts/export-public.sh $CLAUDE_JOB_DIR/tmp/zetasdr-public` on the branch tip. Expected `export: ready`. Report the commit SHA, the tree's file count and size, and `du -sh DEST/.git`.
+- [ ] **Step 6: Commit** `release: export-public.sh builds the one-commit public history and re-runs every gate in it`.
+
+### Task 8: Publish (operator, by hand)
+
+Not for an agent: publishing is outward-facing and irreversible.
+
+- [ ] Merge `worktree-public-release` to the private `main` (fast-forward), so the private repo keeps the gate and scripts.
+- [ ] Re-run `bash scripts/export-public.sh <dest>` from `main`.
+- [ ] Create the GitHub repository (empty, no README), enable private vulnerability reporting and Dependabot alerts; set the `repository` URL placeholder from Task 4 if it was left (then re-export).
+- [ ] In `<dest>`: `git remote add origin git@github.com:<OWNER>/ZetaSDR.git && git push -u origin main --tags`.
+- [ ] Watch the first CI run; protect `main` (require the CI jobs) once it is green.
+- [ ] Later releases: keep developing privately and export each tag on top of the public history (a follow-up gist: `export-public.sh --onto <public clone>` committing the diff as one release commit), or move development to the public repo outright.
