@@ -682,9 +682,17 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   background: var(--c-speaking);
   color: #000;
 }
-[data-theme="console"] #top > button:last-of-type {
+/* The last visible bar: Listen to all on wide (the map and drawer toggles are hidden there),
+   the drawer toggle on narrow. */
+[data-theme="console"] #listen-all,
+[data-theme="console"][data-footprint="narrow"] #drawer-toggle,
+[data-theme="console"] #mic {
   border-start-end-radius: var(--radius-elbow);
   border-end-end-radius: var(--radius-elbow);
+}
+[data-theme="console"][data-footprint="narrow"] #listen-all {
+  border-start-end-radius: var(--radius-bar);
+  border-end-end-radius: var(--radius-bar);
 }
 /* The lower elbow: the prompt, in the frame colour; the command line a dark bar; mic a peach bar. */
 [data-theme="console"] #bar .prompt {
