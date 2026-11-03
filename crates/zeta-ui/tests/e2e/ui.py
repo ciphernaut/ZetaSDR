@@ -1263,7 +1263,7 @@ def scenario_theme_shots(page, url, secret):
 
 
 # The built-in themes added in plan 26 (Tasks 8-11), each checked by scenario_new_themes.
-NEW_THEMES = ["cyberpunk", "terminal"]
+NEW_THEMES = ["cyberpunk", "terminal", "psytrance"]
 
 # The motion a theme may start, provoked and read in one synchronous step (a jobs poll would
 # re-sync `.speaking` and cancel a hand-made glitch, and a short animation would finish while
@@ -1294,21 +1294,38 @@ MOTION_PROBE_JS = """(job) => {
 }"""
 
 
-# A keyboard-focused unselected source tab: [its name's colour, the tab's ground].
+# The colour an element's text actually sits on: its own background colour or, while that is
+# transparent, the first ancestor's that is not. An ancestor painted with a background image (a
+# gradient) has an unknown colour; the walk goes on to the nearest solid colour below it.
+EFFECTIVE_GROUND_JS = """(el) => {
+  for (let e = el; e; e = e.parentElement) {
+    const c = getComputedStyle(e).backgroundColor;
+    const m = c.match(/rgba?\\(([^)]*)\\)/);
+    const parts = m ? m[1].split(/[ ,\\/]+/).filter(Boolean) : [];
+    if (parts.length === 4 && Number(parts[3]) === 0) continue;
+    if (c === "transparent") continue;
+    return c;
+  }
+  return getComputedStyle(document.documentElement).backgroundColor;
+}"""
+
+# A keyboard-focused unselected source tab: [its name's colour, the ground it sits on].
 FOCUSED_TAB_JS = """() => {
+  const ground = """ + EFFECTIVE_GROUND_JS + """;
   const tab = document.querySelector('.src-tab:not([aria-selected="true"])');
   tab.focus({focusVisible: true});
-  const out = [getComputedStyle(tab.querySelector(".name")).color,
-               getComputedStyle(tab).backgroundColor];
+  const name = tab.querySelector(".name");
+  const out = [getComputedStyle(name).color, ground(name)];
   tab.blur();
   return out;
 }"""
 
-# The hovered action button in a job's (hot) row: its text, its ground and the row's ground.
+# The hovered action button in a job's (hot) row: its text and the ground it sits on.
 HOT_ACTION_JS = """(job) => {
+  const ground = """ + EFFECTIVE_GROUND_JS + """;
   const row = document.querySelector(`#jobs .job[data-id="${job}"]`);
-  const b = getComputedStyle(row.querySelector(".actions button"));
-  return {text: b.color, ground: b.backgroundColor, row: getComputedStyle(row).backgroundColor};
+  const button = row.querySelector(".actions button");
+  return {text: getComputedStyle(button).color, ground: ground(button)};
 }"""
 
 
@@ -1354,14 +1371,14 @@ def scenario_new_themes(page, url, secret):
             assert still_running == [], \
                 f"{theme}: motion under reduced motion: {still_running} (normal: {moving})"
             # Focus and hover never draw text on its own colour: a keyboard-focused unselected
-            # source tab's name against the tab, a hovered action in the hot job row against
-            # its own ground and that ground against the row's.
+            # source tab's name and a hovered action in the hot job row, each against the
+            # ground it actually sits on (the first non-transparent background up the tree).
             focused = page.evaluate(FOCUSED_TAB_JS)
             assert focused[0] != focused[1], f"{theme}: focused tab's name on its own colour: {focused}"
             job_row(page, demod).locator(".actions button").first.hover()
             expect(job_row(page, demod)).to_have_class(re.compile(r"\bhot\b"))
             hovered = page.evaluate(HOT_ACTION_JS, demod)
-            assert hovered["text"] != hovered["ground"] != hovered["row"], \
+            assert hovered["text"] != hovered["ground"], \
                 f"{theme}: hovered action in the hot row: {hovered}"
             page.mouse.move(0, 0)
             for name, size in (("wide", WIDE), ("narrow", NARROW)):

@@ -36,7 +36,10 @@ fn theme_dir(root: &Path, id: &str, json: serde_json::Value, files: &[(&str, &[u
 fn builtins_load_ready() {
     let reg = ThemeRegistry::load(None);
     let ids: Vec<&str> = reg.all().iter().map(|t| t.id.as_str()).collect();
-    assert_eq!(ids, ["console", "cyberpunk", "plain", "terminal"]);
+    assert_eq!(
+        ids,
+        ["console", "cyberpunk", "plain", "psytrance", "terminal"]
+    );
     for t in reg.all() {
         assert_eq!(t.state, ThemeState::Ready, "{}: {:?}", t.id, t.reason);
         assert!(t.builtin, "{}", t.id);
@@ -329,7 +332,7 @@ async fn themes_list_answers_every_theme() {
             .find(|t| t.id == id)
             .unwrap_or_else(|| panic!("{id}"))
     };
-    for id in ["console", "cyberpunk", "plain", "terminal"] {
+    for id in ["console", "cyberpunk", "plain", "psytrance", "terminal"] {
         let t = row(id);
         assert_eq!(t.state, ThemeState::Ready);
         assert!(t.builtin && !t.replaces_builtin && t.reason.is_none());
@@ -397,7 +400,7 @@ fn docs_list_every_token() {
 }
 
 /// The built-in themes held to WCAG AA by `builtin_themes_meet_aa`.
-const AA_THEMES: &[&str] = &["console", "plain", "cyberpunk", "terminal"];
+const AA_THEMES: &[&str] = &["console", "plain", "cyberpunk", "terminal", "psytrance"];
 
 /// WCAG 2 relative luminance of a `#rrggbb` colour.
 fn luminance(hex: &str) -> f64 {
@@ -455,4 +458,58 @@ fn builtin_themes_meet_aa() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The colour of a theme's ramp at `t`, interpolated linearly between its stops.
+fn ramp_at(ramp: &[serde_json::Value], t: f64) -> [f64; 3] {
+    let stop = |v: &serde_json::Value| {
+        let rgb = &v[1];
+        (
+            v[0].as_f64().unwrap(),
+            [0, 1, 2].map(|i| rgb[i].as_f64().unwrap()),
+        )
+    };
+    for pair in ramp.windows(2) {
+        let ((t0, c0), (t1, c1)) = (stop(&pair[0]), stop(&pair[1]));
+        if t <= t1 {
+            let f = (t - t0) / (t1 - t0);
+            return [0, 1, 2].map(|i| c0[i] + (c1[i] - c0[i]) * f);
+        }
+    }
+    stop(ramp.last().unwrap()).1
+}
+
+/// Psytrance's rainbow ramp keeps weak signals readable: its first 20 % stays under 25 %
+/// relative luminance, and its low end is distinct from the waterfall's ground.
+#[test]
+fn psytrance_ramp_low_end_stays_dark() {
+    let bytes = BUILTIN
+        .iter()
+        .find(|(k, _)| *k == "psytrance/theme.json")
+        .expect("psytrance/theme.json is not in BUILTIN")
+        .1;
+    let json: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let ramp = json["ramp"].as_array().unwrap();
+    let hex = |c: [f64; 3]| {
+        format!(
+            "#{:02x}{:02x}{:02x}",
+            c[0].round() as u8,
+            c[1].round() as u8,
+            c[2].round() as u8
+        )
+    };
+    for step in 0..=20 {
+        let t = f64::from(step) / 100.0;
+        let lum = luminance(&hex(ramp_at(ramp, t)));
+        assert!(
+            lum < 0.25,
+            "psytrance ramp at {t}: luminance {lum:.3}, not under 0.25"
+        );
+    }
+    let floor = json["tokens"]["--wf-bg"].as_str().unwrap();
+    let low = hex(ramp_at(ramp, 0.1));
+    assert!(
+        contrast(&low, floor) >= 1.5,
+        "psytrance ramp at 0.1 ({low}) is not distinct from --wf-bg {floor}"
+    );
 }

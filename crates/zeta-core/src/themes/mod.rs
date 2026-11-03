@@ -74,6 +74,34 @@ pub const BUILTIN: &[(&str, &[u8])] = &[
         include_bytes!("../../../../themes/plain/theme.json"),
     ),
     (
+        "psytrance/Comfortaa-VF.ttf",
+        include_bytes!("../../../../themes/psytrance/Comfortaa-VF.ttf"),
+    ),
+    (
+        "psytrance/FONTS.md",
+        include_bytes!("../../../../themes/psytrance/FONTS.md"),
+    ),
+    (
+        "psytrance/Nunito-VF.ttf",
+        include_bytes!("../../../../themes/psytrance/Nunito-VF.ttf"),
+    ),
+    (
+        "psytrance/OFL-Comfortaa.txt",
+        include_bytes!("../../../../themes/psytrance/OFL-Comfortaa.txt"),
+    ),
+    (
+        "psytrance/OFL-Nunito.txt",
+        include_bytes!("../../../../themes/psytrance/OFL-Nunito.txt"),
+    ),
+    (
+        "psytrance/style.css",
+        include_bytes!("../../../../themes/psytrance/style.css"),
+    ),
+    (
+        "psytrance/theme.json",
+        include_bytes!("../../../../themes/psytrance/theme.json"),
+    ),
+    (
         "terminal/FONTS.md",
         include_bytes!("../../../../themes/terminal/FONTS.md"),
     ),
