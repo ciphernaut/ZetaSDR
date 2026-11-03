@@ -79,7 +79,9 @@
 //       app.js rewrites it in place as the mix's events arrive. A running demodulator's row has
 //       a `.mute` button (`Mute in mix` / `Unmute in mix`, aria-pressed) when mute(job) gives
 //       {muted, title, run} (app.js: a running mix covers the job's source); `muted` is the
-//       label only, run() decides from the mix's graph at the click.
+//       label only, run() decides from the mix's graph at the click. A running row whose
+//       job's `context.slicer.stream` exists (a `bits` or `graph` job with a slicer) has a
+//       `button.bits` (Bits) calling onBits(job) (app.js: the Bits pane on that job).
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 //       Each render writes the running rows' count into countEl (the Jobs header's `.count`).
@@ -427,7 +429,7 @@ export function setSquelchTag(row, event) {
 function jobRow(
   job,
   onStop,
-  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute },
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits },
 ) {
   const row = document.createElement("div");
   const attached = !!job.input;
@@ -552,6 +554,14 @@ function jobRow(
     b.onclick = () => m.run();
     actions.append(b);
   }
+  if (onBits && status === "running" && job.context?.slicer?.stream) {
+    const b = document.createElement("button");
+    b.className = "bits";
+    b.textContent = "Bits";
+    b.title = "show its bits in the Bits pane";
+    b.onclick = () => onBits(job);
+    actions.append(b);
+  }
   if (onGraph) actions.append(graphButton(job, onGraph));
   actions.append(stopButton(job, onStop));
   row.append(actions);
@@ -661,6 +671,7 @@ export function startJobs(
     onHot = null,
     mixText = null,
     mute = null,
+    onBits = null,
     countEl = null,
     lastEvent = null,
     activity = null,
@@ -700,6 +711,7 @@ export function startJobs(
       : null,
     mixText,
     mute,
+    onBits,
   };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;

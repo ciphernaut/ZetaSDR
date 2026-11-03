@@ -245,9 +245,12 @@ export function channelColour(jobId) {
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 
 // Whether `job` (a running `job_list` record) holds its source rigidly with a usable tuning.
+// A job on source `node` (a mix, a `bits` job replaying a capture) holds no radio and draws
+// no outline, whatever band its record carries.
 function rigidBand(job) {
   const t = job.tuning;
   return (
+    job.source !== "node" &&
     !job.elastic &&
     !job.input &&
     job.kind !== "scan" &&

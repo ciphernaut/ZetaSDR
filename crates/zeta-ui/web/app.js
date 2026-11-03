@@ -95,6 +95,10 @@
 // selected, and the pane shows in #pane under the waterfall while the view's `pane` is
 // `subjects` (`view set subjects on|off` is an alias). In the narrow footprint the pane is a
 // tab in the waterfall's place (<html data-pane="subjects">) that the strip's tab opens and closes.
+// The Bits pane (bits.js, #bits) is the strip's `bits` tab, eligible while a running job has a
+// slicer stream; Explore's Work the bits and a job row's Bits button select it on that job. A
+// `bits` job runs on source `node`, so it draws no outline (overlays.js outlines only the
+// selected source's jobs).
 //
 // The mic button (#mic, voice.js) is mounted at login: its transcript is put in the command
 // line and submitted as if typed (so free text goes to /ask); #mic-status beside it shows
@@ -131,6 +135,7 @@ import { mountMap } from "./map.js";
 import { mountSubjects, mountSubjectsPane } from "./subjects.js";
 import { mountPanes } from "./panes.js";
 import { mountExplorePane } from "./explore.js";
+import { mountBitsPane } from "./bits.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -146,6 +151,7 @@ export const state = {
   subjectsPane: null,
   panes: null,
   explore: null,
+  bits: null, // bits.js: the Bits pane
   ov: null,
   map: null, // map.js: the positions of decoded events
   menu: null,
@@ -833,6 +839,11 @@ function start(api) {
     panes: state.panes,
     ov: () => state.ov,
     wf: () => state.wf,
+    onBits: (id) => state.bits?.setJob(id),
+  });
+  state.bits = mountBitsPane($("#bits"), api, state.view, state.transcript, {
+    panes: state.panes,
+    jobs: () => state.lastJobs,
   });
   state.subjects.onLearn(applyPanes);
   loadStationHome(api);
@@ -885,6 +896,7 @@ function start(api) {
     onJobs: (jobs) => {
       state.lastJobs = jobs;
       state.explore?.noteJobs(jobs);
+      state.bits?.noteJobs(jobs);
       if (state.map) state.map.sync();
       state.subjects?.sync(jobs);
       if (state.ov) state.ov.sync(jobs, shown());
@@ -910,6 +922,10 @@ function start(api) {
     position: (id) => (state.map ? state.map.rowText(id) : null),
     mixText: (job) => mixRowText(job.id),
     mute: muteFor,
+    onBits: (job) => {
+      state.bits?.setJob(job.id);
+      state.panes?.select("bits");
+    },
   });
   state.mic = mountMic($("#mic"), api, (text) => {
     $("#cmd").value = text;
@@ -1125,6 +1141,7 @@ function logout(api) {
   if (state.ov) state.ov.destroy();
   if (state.map) state.map.destroy();
   if (state.explore) state.explore.destroy();
+  if (state.bits) state.bits.destroy();
   if (state.panes) state.panes.destroy();
   if (state.subjectsPane) state.subjectsPane.destroy();
   if (state.subjects) state.subjects.destroy();
@@ -1136,6 +1153,7 @@ function logout(api) {
   state.map = null;
   state.panes = null;
   state.explore = null;
+  state.bits = null;
   state.subjectsPane = null;
   state.subjects = null;
   state.coarse = null;

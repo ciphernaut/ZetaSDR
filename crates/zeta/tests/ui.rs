@@ -9,7 +9,8 @@
 //! the page's automatic scans pick for a view around `tone`: `retune` sorts first in
 //! `source_list` but its range does not contain 100 MHz) and `cb` (the `tone` recording
 //! relabelled at 476.9 MHz, channel 20 of the CB plan), `quiet` (1 s of low complex noise at
-//! 20 MHz, which `measure` labels `noise`; see [`quiet_fixture`]), and `--modes-dir` holding the
+//! 20 MHz, which `measure` labels `noise`; see [`quiet_fixture`]), `fsk` (framed 2-FSK at
+//! 433.92 MHz, the Bits pane's; see [`fsk_fixture`]), and `--modes-dir` holding the
 //! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
 //! job; see [`fake_pos_row`]); the node's state directory is passed to ui.py in
 //! `ZETA_UI_STATE_DIR`. That node has a fake
@@ -220,6 +221,72 @@ fn quiet_fixture(dir: &Path) -> PathBuf {
         .map(|_| num_complex::Complex::new(u(), u()))
         .collect();
     zeta_dsp::fixtures::write_fixture(dir, "quiet", &iq, 48_000, 20_000_000)
+}
+
+/// Frames in the `fsk` fixture.
+const FSK_FRAMES: usize = 8;
+/// Body bytes of each `fsk` frame.
+const FSK_BODY_BYTES: usize = 136;
+/// The `fsk` frames' sync word.
+const FSK_SYNC: u16 = 0x2DD4;
+
+/// The `fsk` recording as `fsk.sigmf-{meta,data}` in `dir`, labelled at 433.92 MHz: 64 bits
+/// of `01` alternation (the slicer's preamble), then [`FSK_FRAMES`] frames of [`FSK_SYNC`],
+/// [`FSK_BODY_BYTES`] pseudo-random bytes (an xorshift from a fixed seed; a body that would
+/// put the sync anywhere but at a frame start is drawn again) and the CRC-16-CCITT of the
+/// body, as 2-FSK at 4800 Bd with 2400 Hz deviation and a 50 ms gap, at 48 kHz (a period of
+/// 1120 bits); the meta path.
+fn fsk_fixture(dir: &Path) -> PathBuf {
+    use zeta_dsp::crc::{CRC16_CCITT, crc};
+    let mut s: u64 = 0x2DD4_0001_9E37_79B9;
+    let mut bytes: Vec<u8> = vec![0x55; 8];
+    let sync = FSK_SYNC.to_be_bytes();
+    let mut made = 0;
+    while made < FSK_FRAMES {
+        let body: Vec<u8> = (0..FSK_BODY_BYTES)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect();
+        let mut frame = sync.to_vec();
+        frame.extend(&body);
+        frame.extend((crc(&CRC16_CCITT, &body) as u16).to_be_bytes());
+        // The sync anywhere in the frame but its start, at any bit offset, redraws it.
+        let bits: Vec<u8> = frame
+            .iter()
+            .flat_map(|b| (0..8).rev().map(move |i| (b >> i) & 1))
+            .collect();
+        let stray = (1..=bits.len() - 16).any(|i| {
+            bits[i..i + 16]
+                .iter()
+                .fold(0u16, |w, &b| (w << 1) | u16::from(b))
+                == FSK_SYNC
+        });
+        if stray {
+            continue;
+        }
+        bytes.extend(frame);
+        made += 1;
+    }
+    let bits: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let spec = zeta_dsp::synth::SynthSpec::Fsk {
+        symbol_rate_baud: 4800,
+        deviation_hz: 2400.0,
+        order: 2,
+        bits,
+        repeat: 1,
+        gap_ms: 50,
+    };
+    let iq = zeta_dsp::synth::synthesise(
+        &spec,
+        &zeta_dsp::synth::Impairments::default(),
+        48_000,
+        433_920_000,
+    );
+    zeta_dsp::fixtures::write_fixture(dir, "fsk", &iq, 48_000, 433_920_000)
 }
 
 /// Wall-clock limit on the whole ui.py run: measured 351.8 s and 352.8 s on 2026-11-02 (plan 23's
@@ -562,6 +629,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let cb = format!("cb={}", tone_at(dir.path(), "cb", 476_900_000).display());
     // Noise only, at 20 MHz: a fitted demodulator finds no signal there.
     let quiet = format!("quiet={}", quiet_fixture(dir.path()).display());
+    // Framed 2-FSK at 433.92 MHz: the Bits pane's stream, hypotheses and sync hits.
+    let fsk = format!("fsk={}", fsk_fixture(dir.path()).display());
     let sock_dir = socket_dir();
     let sock = sock_dir.path().join("voiced.sock");
     let _voiced = fake_voiced(&sock);
@@ -592,6 +661,8 @@ fn ui_scenarios_pass_in_headless_chromium() {
             &cb,
             "--source-file",
             &quiet,
+            "--source-file",
+            &fsk,
         ],
         &["--stt-socket", sock],
         &[

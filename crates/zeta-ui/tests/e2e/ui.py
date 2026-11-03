@@ -121,7 +121,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (9 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (10 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -213,7 +213,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (9 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (10 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -533,7 +533,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (9 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (10 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -5550,6 +5550,50 @@ def scenario_too_old_classify_reissues_on_the_latest_span(page, url, secret):
     expect(page.locator("#transcript .line.note", has_text="buffer moved on; classified the last")
            .first).to_be_visible(timeout=20000)
     expect(page.locator("#transcript .line.note", has_text="tried ").first).to_be_visible(timeout=20000)
+
+
+def stop_bits_jobs(url, secret):
+    for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]:
+        if j["kind"] == "bits" and j["state"]["status"] == "running":
+            stop_job(url, secret, j["id"])
+
+
+def scenario_work_the_bits_shows_a_stream_and_a_sync_hit(page, url, secret):
+    # Self-seeding: two windows of the fsk fixture's framed 2-FSK (sync 0x2dd4, 1120 bits).
+    clear_captures(url, secret)
+    stop_bits_jobs(url, secret)
+    job = start_job(url, secret, "capture", "fsk", 433_920_000, 12_000)
+    two_windows(url, secret, job)
+    wait_until(lambda: len(capture_ops(url, secret, "capture_list", signal=None)) == 2,
+               30, "two captures")
+    # `measure` finds no keying line on this whole-window capture (its features carry no
+    # symbol rate), so the row's rate is typed; a measured one is prefilled.
+    newest = capture_ops(url, secret, "capture_list", signal=None)[0]
+    login(page, url, secret)
+    page.locator('#panes .pane-tab[data-pane="explore"]').click()
+    expect(page.locator("#explore tr.capture")).to_have_count(2, timeout=20000)
+    row = '#explore tr.capture >> nth=0 >> '
+    rate = newest["features"].get("symbol_rate_baud")
+    if rate:
+        expect(page.locator(row + "input.bits-rate")).to_have_value(str(round(rate)))
+    else:
+        page.fill(row + "input.bits-rate", "4800")
+    page.click(row + 'button[data-action="bits"]')
+    expect(page.locator("#transcript .line.note", has_text="started bits").first).to_be_visible(timeout=20000)
+    expect(page.locator('#panes .pane-tab[data-pane="bits"]')).to_have_attribute(
+        "aria-selected", "true", timeout=20000)
+    expect(page.locator("#bits .bits-row").first).to_be_visible(timeout=20000)
+    # The byte under the pointer reads in binary.
+    page.locator("#bits .bits-row .byte").first.hover()
+    expect(page.locator("#bits-binary")).to_have_text(re.compile(r"^[01]{8}"), timeout=5000)
+    expect(page.locator("#bits-clock")).to_contain_text("Bd", timeout=20000)
+    expect(page.locator("#bits-hyps li", has_text="2dd4").first).to_be_visible(timeout=40000)
+    page.click('#bits-hyps li:has-text("2dd4") button[data-action="try"]')
+    expect(page.locator("#bits .sync").first).to_be_visible(timeout=30000)
+    # The job's row offers the pane.
+    expect(page.locator("#jobs .job button.bits").first).to_be_visible(timeout=10000)
+    stop_bits_jobs(url, secret)
+    clear_captures(url, secret)
 
 
 def scenarios():
