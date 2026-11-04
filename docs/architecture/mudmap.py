@@ -179,18 +179,18 @@ svg_text = "\n".join(svg)
 # the allowance gate. An external coding agent runs its own loop on its own model and
 # reaches the node as any HTTP client does: no gate, only the guide's words.
 parts.clear()
-AW, AH = 1440, 626
+AW, AH = 1440, 664
 text(18, 32, "Two ways a model drives the node", size=22, bold=True, op=1)
 text(390, 32, "who runs the tool loop, what can refuse a call, and how the ops log records it", size=12, op=0.8)
 
 def panel(x0, x1, title, sub):
-    emit(f'<rect x="{x0}" y="58" width="{x1 - x0}" height="430" rx="10" fill="currentColor" fill-opacity="0.025"/>')
+    emit(f'<rect x="{x0}" y="58" width="{x1 - x0}" height="470" rx="10" fill="currentColor" fill-opacity="0.025"/>')
     text(x0 + 14, 80, title, size=13, bold=True, op=1)
     text(x0 + 14, 96, sub, size=10.5, op=0.75, italic=True)
 
 L0, L1, R0, R1 = 20, 700, 740, 1420
 panel(L0, L1, "A. A configured LLM: zeta runs the loop", "POST /ask (the page's agent pane) or zeta ask; the model only proposes calls")
-panel(R0, R1, "B. An external coding agent (Claude Code): the agent runs the loop", "zeta-mcp or the zeta CLI; the node sees one more HTTP client")
+panel(R0, R1, "B. An external coding agent (Claude Code): the agent runs the loop", "four doors: MCP, the CLI, raw HTTP, or handing the request to the node's own agent")
 
 # A
 box(40, 110, 640, 54, "Operator", "types a request in the page's agent pane, or runs zeta ask \"REQUEST\" (stdin works: a voice transcript piped in).")
@@ -214,23 +214,30 @@ box(1200, 196, 200, 150, "Its model",
 line([(1110, 236), (1200, 236)]); text(1155, 229, "prompt", size=9.5, anchor="middle")
 line([(1200, 300), (1110, 300)]); text(1155, 315, "tool calls", size=9.5, anchor="middle")
 line([(935, 164), (935, 196)])
-box(760, 376, 300, 96, "zeta-mcp",
-    "stdio MCP server beside the agent: one tool per op, generated from GET /schema; each call is a POST /op with the bearer.", "EITHER", size=10.2)
-box(1080, 376, 320, 96, "zeta CLI",
-    "zeta --node URL ... with ZETA_SECRET, or deploy/field-host/z.sh over ssh (the secret is sourced on the sdr side, never seen by the agent).", "EITHER", size=10.2)
-line([(860, 346), (860, 376)]); line([(1095, 346), (1095, 376)])
+DY, DH, DW = 376, 134, 148
+doors = [
+    (760, "1. zeta-mcp", "stdio MCP server beside the agent: one tool per op from GET /schema, AGENTS.md as its instructions.", "POST /op: http"),
+    (924, "2. zeta CLI", "zeta --node URL with ZETA_SECRET, or z.sh over ssh. Without --node a one-shot opens the node in-process, only while no serve owns the state dir.", "POST /op: http (one-shot: local)"),
+    (1088, "3. Raw HTTP + ws", "curl, cb_watch.py, any language: POST /op, GET /schema, /agents-md, /streams/{id}/tail, ws /stream/{id}. The page is one such client.", "POST /op: http (ui by header)"),
+    (1252, "4. POST /ask", "Hand the request to the node's own agent: path A from outside, its LLM, its turn budget and the gate (allow in the body).", "runs path A: agent"),
+]
+for x, t, b, _ in doors:
+    box(x, DY, DW, DH, t, b, size=9.8)
+line([(834, 346), (834, DY)]); line([(998, 346), (998, DY)])
+line([(1100, 346), (1100, 361), (1326, 361), (1326, DY)]); line([(1162, 361), (1162, DY)])
 
 # shared node
-box(20, 520, 1400, 92, "zeta serve: Node::apply(op), the same 36 ops for both",
+box(20, 556, 1400, 92, "zeta serve: Node::apply(op), the same 36 ops for every route",
     "A arrives in-process: POST /ask logs ops as transport agent; zeta ask logs local (one-shot) or http (with --node), not agent. "
-    "B arrives over HTTP /op and logs http, like any script: the log cannot tell Claude Code from curl, nor which request caused a call. "
-    "Over HTTP the bearer is the whole of the authority: no gate refuses B's job_stop or replace. The guide's rules (stop only what the request names or you started) bind B only as instructions it follows, and the operator's approval of its tool calls.", "LOCAL", size=10.5, strong=True)
-line([(215, 472), (215, 520)]); text(223, 500, "in-process executor (HTTP with zeta ask --node)", size=10)
-line([(910, 472), (910, 520)]); text(918, 500, "HTTP POST /op, bearer", size=10)
-line([(1240, 472), (1240, 520)]); text(1248, 500, "HTTP POST /op, bearer", size=10)
+    "B's doors 1-3 arrive over HTTP /op and log http (ui when the caller sends X-Zeta-Client: ui, a label it chooses, not a credential): the log cannot tell Claude Code from curl, nor which request caused a call. Door 4 runs path A inside the node, gate included. "
+    "Over HTTP the bearer is the whole of the authority: no gate refuses a job_stop or replace sent through doors 1-3. The guide's rules (stop only what the request names or you started) bind B only as instructions it follows, and the operator's approval of its tool calls.", "LOCAL", size=10.5, strong=True)
+line([(215, 472), (215, 556)]); text(223, 520, "in-process executor (HTTP with zeta ask --node)", size=10)
+for x, *_, lab in doors:
+    line([(x + DW / 2, DY + DH), (x + DW / 2, 556)])
+    text(x + DW / 2 + 5, DY + DH + 26, lab, size=9.2)
 
 asvg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {AW} {AH}" width="{AW}" height="{AH}" role="img" '
-        f'aria-label="Two agent paths: a configured LLM proposes calls that zeta-agent executes behind an allowance gate; an external coding agent runs its own loop and calls the node over HTTP through zeta-mcp or the CLI, with no gate." '
+        f'aria-label="Two agent paths: a configured LLM proposes calls that zeta-agent executes behind an allowance gate; an external coding agent runs its own loop and reaches the node through zeta-mcp, the CLI or raw HTTP with no gate, or hands the request to the node\'s own agent through POST /ask." '
         f'font-family="{FONT}" fill="currentColor" style="color:#1b1f24">'] + svg[1:5] + \
        [f'<rect x="0" y="0" width="{AW}" height="{AH}" fill="#fbfbf9"/>'] + parts + ['</svg>']
 agents_svg = "\n".join(asvg)
@@ -240,10 +247,10 @@ AGENT_TABLE = [
     ("Who runs the tool loop", "zeta-agent, in the node (<code>/ask</code>) or the <code>zeta ask</code> process", "the coding agent, on its own host"),
     ("Which model", "the one at <code>--llm-url</code> (any OpenAI-compatible server)", "the agent's own (Anthropic's API for Claude Code)"),
     ("What the model sees", "the tool list, the guide and trimmed results; never the node or the secret", "full results, the repo, the shell: whatever the agent's permissions allow"),
-    ("How calls reach the node", "in-process executor (HTTP when <code>zeta ask --node</code>)", "<code>zeta-mcp</code> or the CLI: <code>POST /op</code> with the bearer"),
-    ("What can refuse a stop or replace", "the allowance gate in code: <code>not_allowed</code> unless the run allows it", "nothing in the node; the guide's rules and the operator's approval of tool calls"),
+    ("How calls reach the node", "in-process executor (HTTP when <code>zeta ask --node</code>)", "<code>zeta-mcp</code>, the CLI or raw HTTP/ws: <code>POST /op</code> with the bearer; or <code>POST /ask</code>, which hands the request to path A"),
+    ("What can refuse a stop or replace", "the allowance gate in code: <code>not_allowed</code> unless the run allows it", "through <code>/op</code>, nothing in the node: the guide's rules and the operator's approval of tool calls; through <code>/ask</code>, the gate"),
     ("Budget", "<code>max_turns</code> 1-32 (default 8), one call per turn; bulk ops (<code>plan_start</code>, <code>jobs_stop</code>) exist for it", "the agent's own; it can make hundreds of calls"),
-    ("ops log <code>transport</code>", "<code>agent</code> (<code>/ask</code>); <code>local</code> or <code>http</code> (<code>zeta ask</code>)", "<code>http</code>, the same as any script"),
+    ("ops log <code>transport</code>", "<code>agent</code> (<code>/ask</code>); <code>local</code> or <code>http</code> (<code>zeta ask</code>)", "<code>http</code>, the same as any script (<code>ui</code> if it sends <code>X-Zeta-Client: ui</code>; <code>local</code> for a one-shot CLI; <code>agent</code> via <code>/ask</code>)"),
     ("Beyond the node", "nothing: only the operations", "code, builds, deploys, logs, other hosts"),
 ]
 agent_rows = "\n".join(f"<tr><td>{a}</td><td>{b}</td><td>{c}</td></tr>" for a, b, c in AGENT_TABLE)
