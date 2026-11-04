@@ -61,17 +61,22 @@ const SEED_ITERATIONS: usize = 8;
 /// seed falls back to the frame's minimum and maximum.
 const SEED_DEGENERATE_FRACTION: f64 = 0.05;
 
+/// How far past the seed's starting quantiles a first-frame value counts, in spans
+/// between them: a value beyond is held at that fence for the 2-means. An OOK
+/// demodulator whose levels settled on the silence before a burst scales the onset by
+/// the noise's range: on a real remote at 42 dB SNR (the B210 windows) one strobe read
+/// 73 against an on-level of 1, and as a cluster of its own it set the midpoint at 37,
+/// so every bit read 0.
+const SEED_FENCE_SPANS: f64 = 1.0;
+
 /// The 2-level seed `(lo, hi)` of the first frame's `values`: [`SEED_ITERATIONS`]
 /// Lloyd iterations of a 2-means from the [`SEED_QUANTILE`] and `1 - SEED_QUANTILE`
-/// quantiles (a centre whose side is empty stays put), the frame's minimum and maximum
-/// when the centres end closer than [`SEED_DEGENERATE_FRACTION`] of its range.
+/// quantiles (a centre whose side is empty stays put) over the values held within
+/// [`SEED_FENCE_SPANS`] of those quantiles' span past them (none held when the span is
+/// 0), the held values' minimum and maximum when the centres end closer than
+/// [`SEED_DEGENERATE_FRACTION`] of their range.
 fn two_level_seed(values: &[f64]) -> (f64, f64) {
     let v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
-    let (min, max) = v
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| {
-            (a.min(x), b.max(x))
-        });
     if v.is_empty() {
         return (0.0, 0.0);
     }
@@ -79,6 +84,19 @@ fn two_level_seed(values: &[f64]) -> (f64, f64) {
         quantile(&v, SEED_QUANTILE),
         quantile(&v, 1.0 - SEED_QUANTILE),
     );
+    // A value far past the quantiles (an onset transient) is held at the fence, so it
+    // cannot pull a centre off by itself.
+    let fence = SEED_FENCE_SPANS * (hi - lo);
+    let v: Vec<f64> = if fence > 0.0 {
+        v.iter().map(|x| x.clamp(lo - fence, hi + fence)).collect()
+    } else {
+        v
+    };
+    let (min, max) = v
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| {
+            (a.min(x), b.max(x))
+        });
     for _ in 0..SEED_ITERATIONS {
         let mid = (lo + hi) / 2.0;
         let (mut sl, mut nl, mut sh, mut nh) = (0.0, 0usize, 0.0, 0usize);
@@ -962,6 +980,25 @@ mod tests {
         let (lo, hi) = super::two_level_seed(&v);
         assert!(lo.abs() < 1e-9, "({lo}, {hi})");
         assert!((lo + hi) / 2.0 < 1.0, "({lo}, {hi})");
+    }
+
+    /// The B210 remote's first strobe frame: noise scaled to 0..1 by levels settled on
+    /// silence, one onset strobe at 73 (then 3.4) and the 0/1 keying. The onset is held at
+    /// the fence, so it neither forms a cluster of its own nor sends the seed to the
+    /// extremes: the midpoint sits between the keyed levels.
+    #[test]
+    fn an_onset_strobe_far_past_the_levels_does_not_seed_them() {
+        const ONSET: [f64; 2] = [73.4, 3.4];
+        let mut v: Vec<f64> = random_bits(64, 7)
+            .iter()
+            .zip(random_bits(64, 8))
+            .map(|(&a, b)| 0.25 * a as f64 + 0.5 * b as f64)
+            .collect();
+        v.extend(ONSET);
+        v.extend(random_bits(90, 9).iter().map(|&b| b as f64));
+        let (lo, hi) = super::two_level_seed(&v);
+        let mid = (lo + hi) / 2.0;
+        assert!(mid > 0.25 && mid < 0.75, "({lo}, {hi})");
     }
 
     #[tokio::test]

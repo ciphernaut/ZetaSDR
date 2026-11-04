@@ -26,6 +26,7 @@ const MS_PER_S: u64 = 1_000;
 /// The stage implementing `kind`.
 fn stage_of(kind: &str) -> Arc<dyn Stage> {
     match kind {
+        "channel" => Arc::new(zeta_dsp::channel::ChannelStage::new()),
         "resample" => Arc::new(zeta_dsp::resample::ResampleStage::new()),
         "fsk_demod" => Arc::new(zeta_dsp::fsk::FskDemodStage::new()),
         "ook_demod" => Arc::new(zeta_dsp::ook::OokDemodStage::new()),
@@ -53,6 +54,17 @@ fn prov(span: Span) -> Provenance {
 /// `resample`, so a chain through it loses its last [`RESAMPLE_TAIL_SYMBOLS`] symbol(s):
 /// compare such a chain with [`align_errors_tail`].
 pub async fn run_chain(stages: &[(&str, Value)], iq: &[Complex<f32>], rate_hz: u64) -> Vec<Value> {
+    run_chain_at(stages, iq, rate_hz, 0).await
+}
+
+/// [`run_chain`] with the IQ blocks centred on `center_hz` (a `channel` stage cuts its
+/// band relative to the block's centre).
+pub async fn run_chain_at(
+    stages: &[(&str, Value)],
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    center_hz: u64,
+) -> Vec<Value> {
     let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
     let block = (rate_hz * BLOCK_MS / MS_PER_S) as usize;
     let blocks = iq.chunks(block).count();
@@ -116,7 +128,7 @@ pub async fn run_chain(stages: &[(&str, Value)], iq: &[Complex<f32>], rate_hz: u
             Payload::Iq(IqBlock {
                 t0: Timestamp(t0),
                 sample_rate_hz: Hz(rate_hz),
-                center_hz: Hz(0),
+                center_hz: Hz(center_hz),
                 samples: chunk.to_vec().into(),
             }),
         ))
@@ -541,6 +553,17 @@ fn plan_stages(plan: &zeta_core::bits::BitsPlan) -> Vec<(String, Value)> {
 /// on the remote): the plan is made from the fixture's own record and feature values,
 /// centred on the capture, OOK at [`REMOTE_BAUD`].
 async fn remote_codes(name: &str) -> (String, Vec<u32>) {
+    remote_codes_with(name, true).await.1
+}
+
+/// The plan, chips and EV1527 codes the chain `bits_start` builds recovers from the
+/// real-remote fixture `name`: as [`remote_codes`], the plan made from the fixture's own
+/// record and features, its measured centre kept as recorded unless `centred` (then the
+/// capture's own, so the chain does not shift).
+async fn remote_codes_with(
+    name: &str,
+    centred: bool,
+) -> (zeta_core::bits::BitsPlan, (String, Vec<u32>)) {
     let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data")
         .join(format!("{name}.sigmf-meta"));
@@ -548,7 +571,9 @@ async fn remote_codes(name: &str) -> (String, Vec<u32>) {
     let rate = m.sample_rate_hz.0;
     let mut features: zeta_core::classify::FeatureRecord =
         serde_json::from_value(m.annotations[0]["zeta:features"].clone()).expect("features");
-    features.center_hz = m.center_hz;
+    if centred {
+        features.center_hz = m.center_hz;
+    }
     let record = zeta_core::bursts::CaptureRecord {
         id: name.into(),
         data_path: meta.with_extension("sigmf-data"),
@@ -583,10 +608,10 @@ async fn remote_codes(name: &str) -> (String, Vec<u32>) {
         .iter()
         .map(|(k, p)| (k.as_str(), p.clone()))
         .collect();
-    let events = run_chain(&stages, &iq, rate).await;
+    let events = run_chain_at(&stages, &iq, rate, m.center_hz.0).await;
     let chips = recovered_bits(&events);
     let shown: String = chips.iter().map(|c| char::from(b'0' + c)).collect();
-    (shown, ev1527_codes(&chips))
+    (plan, (shown, ev1527_codes(&chips)))
 }
 
 /// A real EV1527-style remote (433.882 MHz, about 30 dB SNR, 3200 chips/s) captured on
@@ -599,6 +624,30 @@ async fn a_real_ook_remote_decodes_to_its_code() {
         assert!(
             codes.len() >= least && codes.iter().all(|&c| c == REMOTE_CODE),
             "{name}: codes {codes:06x?} from {} chips {chips}",
+            chips.len()
+        );
+    }
+}
+
+/// The same remote's code with another button: the B210 windows' frames, read by pulse
+/// width from the samples.
+const B210_CODE: u32 = <button-code>;
+/// Whole frames each B210 window holds, read by pulse width: 12, one allowed lost at a
+/// window edge (the chain reads 12 and 13).
+const B210_LEAST_FRAMES: usize = 11;
+
+/// The B210 windows at 61 440 Hz, their measured centre 1110 Hz off the capture's and
+/// 40 kHz wide: the plan `bits_start` makes from their own features shifts through a
+/// `channel` stage, and every whole frame of each window still reads the code.
+#[tokio::test]
+async fn b210_windows_decode_every_whole_frame() {
+    for name in ["ook-remote-b210-1", "ook-remote-b210-2"] {
+        let (plan, (chips, codes)) = remote_codes_with(name, false).await;
+        assert!(plan.channel_rate_hz.is_some(), "{name}: no shift: {plan:?}");
+        assert!(
+            codes.len() >= B210_LEAST_FRAMES && codes.iter().all(|&c| c == B210_CODE),
+            "{name}: {} codes {codes:06x?} from {} chips {chips}",
+            codes.len(),
             chips.len()
         );
     }
