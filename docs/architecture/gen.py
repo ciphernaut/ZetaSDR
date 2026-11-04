@@ -143,7 +143,7 @@ clients = [
  dict(title="Agent", note=16, body="crate zeta-agent: zeta ask \"REQUEST\" and POST /ask. OpenAI-compatible tool-calling loop over the operation set; refuses stops and replace unless the run allows them; tools and guide generated from AGENTS.md; its calls appear on the ops stream as transport agent. Asked from the page (page_tools), it also has view_set for that tab's view settings, applied by the page, never by the node."),
 ]
 client_labels = ["in-process or HTTP", "HTTP + ws", "HTTP", "HTTP", "HTTP, or in-process via /ask"]
-llm = dict(title="LLM server", body="OpenAI-compatible chat API (e.g. llama.cpp or vLLM serving Gemma on field-host:8080). The agent sends the tool list and the transcript; thinking off, token budget, prose-answer detection.")
+llm = dict(title="LLM server", body="OpenAI-compatible chat API (e.g. llama.cpp or vLLM), on the node's host or another. The agent sends the tool list and the transcript; thinking off, token budget, prose-answer detection.")
 
 ws = dict(title="zeta-ws: HTTP + WebSocket, bearer secret on every route", note=1, body="POST /op (one operation, 30 s cap) · GET /schema · GET /health (build, uptime, stages_running) · GET /streams · ws /stream/{id} (text frames; ?format=binary ships IQ as VRT) · GET /streams/{id}/tail · POST /ask (agent) · POST /stt, GET /stt/languages (speech) · GET /captures/<id>.sigmf-meta|-data · GET /agents-md · /ui/ and /ui/themes/<id>/ (no bearer for a ready theme's files). Routes: http.rs, stream.rs, ask.rs, stt.rs, ui.rs, auth.rs.")
 client = dict(title="zeta-client", body="Typed client of a node: remote.rs (HTTP), ws.rs (streams), tools.rs and guide.rs (tool list and guide text shared by the CLI, MCP and agent). Local transport: a one-shot CLI calls Node::apply in-process; serve.lock keeps mutating one-shots off a served state dir.")
@@ -175,7 +175,7 @@ plug = dict(title="zeta-plugin", body="Stdio plugin protocol 1 and 2 (hello, run
 children = dict(title="Child processes (spawned by the node, cleared env, stdio)", tag="OUTSIDE PROCESS", body="dump1090 · rs41mod / dfm09mod / m20mod · the operator's --plugin programs (any language; sdk/python). A crashed program fails its job with a reason naming it; a missing one leaves its row unavailable.")
 speech = dict(title="zeta-speech", note=6, body="transcribe stage; backends SocketBackend (local-voice protocol on a Unix socket) and NodeBackend (another node's POST /stt); 16 kHz WAV; 4 slots, 30 s busy drop; attached chain stream_in → denoise → vad → transcribe.")
 feeds = dict(title="Feeds out", note=13, body="sink_sondehub (zeta-ext): batches positioned sonde events into a PUT every batch_ms; sent/failed/last_error in job_context. The only sink stage today.")
-daemon = dict(title="Speech daemon", body="local-voice (or any daemon speaking its protocol) at $XDG_RUNTIME_DIR/voiced.sock: file:<wav> answered ok:<text>; languages answered ok:en,de,... Runs on the GPU host (the field host 4090).")
+daemon = dict(title="Speech daemon", body="local-voice (or any daemon speaking its protocol) at $XDG_RUNTIME_DIR/voiced.sock: file:<wav> answered ok:<text>; languages answered ok:en,de,... Runs on the node's host (a Unix socket), on its GPU when it has one.")
 sondehub = dict(title="SondeHub", body="api.v2.sondehub.org/sondes/telemetry: PUT every batch_ms with the operator's callsign and position. Nothing uploads without them.")
 
 sources = [

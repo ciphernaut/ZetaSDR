@@ -159,8 +159,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 <text x="1422" y="114" font-size="12.5" font-weight="700">LLM server</text>
 <text x="1422" y="129" font-size="10.5">
 <tspan x="1422" dy="0">OpenAI-compatible chat API (e.g.</tspan>
-<tspan x="1422" dy="13.0">llama.cpp or vLLM serving Gemma on</tspan>
-<tspan x="1422" dy="13.0">field-host:8080). The agent sends</tspan>
+<tspan x="1422" dy="13.0">llama.cpp or vLLM), on the node's</tspan>
+<tspan x="1422" dy="13.0">host or another. The agent sends</tspan>
 <tspan x="1422" dy="13.0">the tool list and the transcript;</tspan>
 <tspan x="1422" dy="13.0">thinking off, token budget,</tspan>
 <tspan x="1422" dy="13.0">prose-answer detection.</tspan>
@@ -478,7 +478,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 </text>
 <line x1="721.0" y1="1482.0" x2="721.0" y2="1498.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
 <line x1="960.0" y1="1482.0" x2="960.0" y2="1498.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<rect x="1056" y="1345.0" width="240" height="124.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<rect x="1056" y="1345.0" width="240" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
 <text x="1064" y="1361.0" font-size="12.5" font-weight="700">zeta-speech</text>
 <text x="1064" y="1376.0" font-size="10.5">
 <tspan x="1064" dy="0">transcribe stage; backends SocketBackend</tspan>
@@ -490,7 +490,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 </text>
 <circle cx="1056" cy="1345.0" r="9" fill="currentColor" fill-opacity="0.9"/>
 <text x="1056" y="1348.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">6</text>
-<rect x="1414" y="1345.0" width="216" height="124.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<rect x="1414" y="1345.0" width="216" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
 <text x="1422" y="1361.0" font-size="12.5" font-weight="700">Speech daemon</text>
 <text x="1422" y="1376.0" font-size="10.5">
 <tspan x="1422" dy="0">local-voice (or any daemon speaking</tspan>
@@ -498,31 +498,32 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 <tspan x="1422" dy="13.0">$XDG_RUNTIME_DIR/voiced.sock:</tspan>
 <tspan x="1422" dy="13.0">file:&lt;wav&gt; answered ok:&lt;text&gt;;</tspan>
 <tspan x="1422" dy="13.0">languages answered ok:en,de,...</tspan>
-<tspan x="1422" dy="13.0">Runs on the GPU host (the field host</tspan>
-<tspan x="1422" dy="13.0">4090).</tspan>
+<tspan x="1422" dy="13.0">Runs on the node's host (a Unix</tspan>
+<tspan x="1422" dy="13.0">socket), on its GPU when it has</tspan>
+<tspan x="1422" dy="13.0">one.</tspan>
 </text>
 <line x1="1296" y1="1385.0" x2="1414" y2="1385.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
 <text x="1355.0" y="1379.0" font-size="10" text-anchor="middle" opacity="0.85">wav in, text out</text>
-<rect x="1056" y="1483.0" width="240" height="85.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1064" y="1499.0" font-size="12.5" font-weight="700">Feeds out</text>
-<text x="1064" y="1514.0" font-size="10.5">
+<rect x="1056" y="1496.0" width="240" height="85.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1064" y="1512.0" font-size="12.5" font-weight="700">Feeds out</text>
+<text x="1064" y="1527.0" font-size="10.5">
 <tspan x="1064" dy="0">sink_sondehub (zeta-ext): batches</tspan>
 <tspan x="1064" dy="13.0">positioned sonde events into a PUT every</tspan>
 <tspan x="1064" dy="13.0">batch_ms; sent/failed/last_error in</tspan>
 <tspan x="1064" dy="13.0">job_context. The only sink stage today.</tspan>
 </text>
-<circle cx="1056" cy="1483.0" r="9" fill="currentColor" fill-opacity="0.9"/>
-<text x="1056" y="1486.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">13</text>
-<rect x="1414" y="1483.0" width="216" height="85.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
-<text x="1422" y="1499.0" font-size="12.5" font-weight="700">SondeHub</text>
-<text x="1422" y="1514.0" font-size="10.5">
+<circle cx="1056" cy="1496.0" r="9" fill="currentColor" fill-opacity="0.9"/>
+<text x="1056" y="1499.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">13</text>
+<rect x="1414" y="1496.0" width="216" height="85.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
+<text x="1422" y="1512.0" font-size="12.5" font-weight="700">SondeHub</text>
+<text x="1422" y="1527.0" font-size="10.5">
 <tspan x="1422" dy="0">api.v2.sondehub.org/sondes/telemetry:</tspan>
 <tspan x="1422" dy="13.0">PUT every batch_ms with the</tspan>
 <tspan x="1422" dy="13.0">operator's callsign and position.</tspan>
 <tspan x="1422" dy="13.0">Nothing uploads without them.</tspan>
 </text>
-<line x1="1296" y1="1523.0" x2="1414" y2="1523.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
-<text x="1355.0" y="1517.0" font-size="10" text-anchor="middle" opacity="0.85">HTTPS PUT</text>
+<line x1="1296" y1="1536.0" x2="1414" y2="1536.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
+<text x="1355.0" y="1530.0" font-size="10" text-anchor="middle" opacity="0.85">HTTPS PUT</text>
 <line x1="580" y1="1668.0" x2="580" y2="1612.0" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow)"/>
 <text x="588" y="1658.0" font-size="10" text-anchor="start" opacity="0.85">IQ blocks into the ring and the bank (Port push side); tune and lease the other way</text>
 <rect x="130.0" y="1668.0" width="181.0" height="137.0" rx="6" fill="currentColor" fill-opacity="0.07" stroke="currentColor" stroke-width="1.2"/>
