@@ -1,5 +1,5 @@
 # cargo-deny: licences, bans and sources. Run: cargo deny check licenses bans sources
-# Copyleft (GPL, LGPL, AGPL) is not allowed; a dependency under one stops the build.
+# Copyleft (GPL, LGPL, AGPL) is not allowed; a dependency under one fails the CI licence check.
 
 [graph]
 all-features = true

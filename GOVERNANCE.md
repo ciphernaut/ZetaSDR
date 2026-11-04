@@ -35,6 +35,6 @@ merge. Maintainers are added by the existing maintainer, in a public note in thi
 
 The code is Apache-2.0 ([docs/licensing.md](docs/licensing.md)) and the design history is public,
 so anyone can fork and continue the project without asking. The build, the checks and the
-generated documents are all in the repository, and a release needs no private service. If a
-second maintainer exists by then, they continue the project under this file; if not, a fork is the
-plan.
+generated documents are all in the repository, and a build and its checks need no private
+service. If a second maintainer exists by then, they continue the project under this file; if
+not, a fork is the plan.

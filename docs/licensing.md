@@ -13,7 +13,7 @@ section 5 of the licence says).
 Taken from [NOTICE](../NOTICE), which is the authority. Rust dependencies are checked by
 `cargo deny` against [deny.toml](../deny.toml): Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC,
 Unicode-3.0, Zlib, MPL-2.0, CC0-1.0, MIT-0, BSL-1.0 and CDLA-Permissive-2.0 are allowed; copyleft
-(GPL, LGPL, AGPL) is not, and a dependency under one stops the build.
+(GPL, LGPL, AGPL) is not, and a dependency under one fails the CI licence check.
 
 | Component | Path | Licence |
 |---|---|---|
@@ -31,7 +31,10 @@ Some decoders are GPL programs: dump1090 and the rs1729 sonde decoders (`rs41mod
 `m20mod`). ZetaSDR runs them as separate processes when the operator has installed them. It never
 links them and never ships them, and a missing one only makes its mode row `unavailable`. A new
 decoder under the GPL follows the same rule: a program row that the operator installs, not code
-in this repository.
+in this repository. So does one under the LGPL, such as Codec 2 (LGPL-2.1) for a future M17 row:
+it runs as an external handler. Linking it dynamically instead would bring the LGPL's obligations
+(the library replaceable by the user, its source offered, the notice shipped) and needs `deny.toml`
+changed first.
 
 ## To decide
 

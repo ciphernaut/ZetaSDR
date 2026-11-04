@@ -20,7 +20,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Toolchain from rust-toolchain.toml
-        run: rustup component add rustfmt
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt
       # Per member: zeta-source-soapy-driver is outside the workspace and links libSoapySDR.
       - name: cargo fmt per member
         run: |
@@ -37,7 +39,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Toolchain from rust-toolchain.toml
-        run: rustup component add clippy
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

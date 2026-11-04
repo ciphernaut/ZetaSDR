@@ -36,7 +36,9 @@ and M20 radiosondes), in-process in `crates/zeta-dsp` or as external programs th
 
 Would add: rows for FT8/FT4 and WSPR (HF through a KiwiSDR, with the WSJT-X programs run as
 external processes), CW, M17 with Codec 2 (an open vocoder, so its audio can feed the existing
-`transcribe` attachment) and AX.25 from amateur satellites, each with its synthesised test.
+`transcribe` attachment; Codec 2 is LGPL-2.1, so it would run as an external handler, see
+[docs/licensing.md](docs/licensing.md)) and AX.25 from amateur satellites, each with its
+synthesised test.
 
 ### A multi-stream FPGA source over VITA 49.2
 
@@ -66,7 +68,8 @@ would stay reported as unknown.
 Today: the node's operations are a typed set an LLM calls through `zeta ask`, `POST /ask` or
 `zeta-mcp`, driven by the guide in [AGENTS.md](AGENTS.md) (`crates/zeta-agent`). The rules in it
 (do not stop an operator's jobs, report unknown as unknown, use the id the error suggests) are
-checked by unit tests, not measured against a model.
+checked by unit tests; an opt-in live test (`crates/zeta-agent/tests/live.rs`, given an LLM's URL)
+drives a real model through one request, but outcomes are not yet scored across models.
 
 Would add: a suite of replayable requests against recorded sources with scored outcomes (right
 operation, right fields, no forbidden stop, no invented id), so that a model, a prompt or a change
