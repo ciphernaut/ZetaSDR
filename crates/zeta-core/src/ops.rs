@@ -403,7 +403,8 @@ pub enum Op {
     /// half its `bandwidth_hz` over 0.45 times that rate) is shifted to its recorded
     /// `center_hz` first, unless layer 1 labels the capture `noise`: `capture_in → channel [→ resample] → <demod> → ...`, the
     /// `channel` stage at the measured centre with the measured bandwidth × 1.25 (at least
-    /// 4 × the baud) and an output rate the capture rate over a whole divisor (the
+    /// 4 × the baud, at most what the capture holds about that centre: its rate less twice
+    /// the shift) and an output rate the capture rate over a whole divisor (the
     /// resampler follows unless that is already the chain rate). 4-fsk and ook take the
     /// `early_late` clock; fsk's demodulator is given the record's measured `tone_spacing_hz` (it tracks
     /// the tones itself when the record has none); `capture_in` loops, paced, with a 500 ms
@@ -413,8 +414,9 @@ pub enum Op {
     /// `no modulation measured (label <x>); give modulation`), a rate the capture cannot
     /// hold (`symbol_rate_baud <r> needs <n> Hz; the capture holds <rate> Hz`, 4 samples
     /// per symbol at least; a rate of 0 is `symbol_rate_baud: at least 1`), a measured
-    /// band the capture does not hold (`the measured centre <c> Hz with <b> Hz leaves the
-    /// capture <lo>..=<hi> Hz`), and a set whose captures differ in rate or centre
+    /// centre the capture holds under 4 × the baud about (`the measured centre <c> Hz
+    /// leaves <room> Hz of the capture <lo>..=<hi> Hz about it, under the <floor> Hz the
+    /// chain needs (4 x <baud> Bd)`), and a set whose captures differ in rate or centre
     /// (`capture <id>: <rate> Hz differs from <first>'s <rate> Hz`); an unknown `capture`
     /// is `unknown`. The record's kind is `bits`, its source `node`, its band the
     /// capture's, `job_context.bits` the plan (`captures`, `modulation`,

@@ -109,7 +109,9 @@ pub struct BitsPlan {
     pub shift_hz: i64,
     /// The band: the capture's, or when shifting the `channel` stage's band (the
     /// measured bandwidth × [`CHANNEL_BAND_FACTOR`], at least
-    /// [`CHANNEL_MIN_BAND_SYMBOLS`] × the baud).
+    /// [`CHANNEL_MIN_BAND_SYMBOLS`] × the baud, and at most what fits inside the capture
+    /// about the measured centre: the capture's span less twice the shift; the plan is
+    /// refused when that is under the floor).
     pub bandwidth_hz: Hz,
     pub capture_rate_hz: Hz,
     /// The `channel` stage's output rate when the chain shifts (the capture rate over
@@ -287,20 +289,26 @@ pub fn bits_plan(
         && label != Some(NOISE_LABEL)
         && reach > RESAMPLE_PASSBAND_FRACTION * chain_rate as f64;
     let (center_hz, shift_hz, bandwidth_hz, channel_rate_hz, rate_hz) = if shifts {
-        let band = ((features.bandwidth_hz.0 as f64 * CHANNEL_BAND_FACTOR).ceil() as u64)
-            .max(CHANNEL_MIN_BAND_SYMBOLS * rate.0 as u64);
+        let floor = CHANNEL_MIN_BAND_SYMBOLS * rate.0 as u64;
+        let padded =
+            ((features.bandwidth_hz.0 as f64 * CHANNEL_BAND_FACTOR).ceil() as u64).max(floor);
         let (lo, hi) = (
             first.center_hz.0 as i128 - capture_rate as i128 / 2,
             first.center_hz.0 as i128 + capture_rate as i128 / 2,
         );
-        // Compared doubled, so an odd band is exact.
-        let (c, b) = (features.center_hz.0 as i128, band as i128);
-        if 2 * c - b < 2 * lo || 2 * c + b > 2 * hi {
+        // The widest band about the measured centre inside the capture: twice the
+        // distance to its nearer edge (the capture less twice the shift).
+        let c = features.center_hz.0 as i128;
+        let room = (2 * (c - lo).min(hi - c)).max(0) as u64;
+        if room < floor {
             return Err(format!(
-                "the measured centre {} Hz with {band} Hz leaves the capture {lo}..={hi} Hz",
-                features.center_hz.0
+                "the measured centre {} Hz leaves {room} Hz of the capture {lo}..={hi} Hz about it, under the {floor} Hz the chain needs ({CHANNEL_MIN_BAND_SYMBOLS} x {} Bd)",
+                features.center_hz.0, rate.0
             ));
         }
+        // A weak signal's measured band reaches into the noise, past the capture: the
+        // channel takes what fits.
+        let band = padded.min(room);
         let out = channel_out_rate(capture_rate, chain_rate.max(band));
         (
             features.center_hz,
@@ -688,13 +696,42 @@ mod tests {
         assert_eq!(plan.shift_hz, 0);
         assert_eq!(plan.channel_rate_hz, None);
         assert!(bits_graph(&plan).nodes.iter().all(|n| n.kind != "channel"));
-        // A measured band that leaves the capture is refused.
+        // A measured centre whose capture holds under the 4 x baud floor about it is
+        // refused: 4000 Hz to the capture's edge is 8000 Hz, under 12 800.
         f.center_hz = Hz(433_400_000 + 1_020_000);
         let e = bits_plan(&[wide], &f, None, Some(Modulation::Ook), None, None).unwrap_err();
         assert_eq!(
             e,
-            "the measured centre 434420000 Hz with 37500 Hz leaves the capture 432376000..=434424000 Hz"
+            "the measured centre 434420000 Hz leaves 8000 Hz of the capture 432376000..=434424000 Hz about it, under the 12800 Hz the chain needs (4 x 3200 Bd)"
         );
+    }
+
+    /// The HackRF window of a weak remote (`ook-remote-hackrf-sparse-3`, 62 500 Hz at
+    /// 433 882 000 Hz) measured 56 580 Hz about 433 883 709 Hz, mostly noise: padded it
+    /// is 70 725 Hz, wider than the capture. The channel takes what fits about the
+    /// measured centre, the capture less twice the shift, not a refusal.
+    #[test]
+    fn a_measured_band_past_the_capture_is_clamped_to_what_fits() {
+        let mut capture = record("01S", 62_500, 1);
+        capture.center_hz = Hz(433_882_000);
+        capture.bandwidth_hz = Hz(60_000);
+        let mut f = features(Some(3200), None);
+        f.center_hz = Hz(433_883_709);
+        f.bandwidth_hz = Hz(56_580);
+        let plan = bits_plan(&[capture.clone()], &f, Some("ook"), None, None, None).unwrap();
+        assert_eq!(plan.shift_hz, 1_709);
+        assert_eq!(plan.bandwidth_hz, Hz(62_500 - 2 * 1_709));
+        let g = bits_graph(&plan);
+        let ch = g
+            .nodes
+            .iter()
+            .find(|n| n.kind == "channel")
+            .expect("a channel");
+        assert_eq!(ch.params["bandwidth_hz"], 62_500 - 2 * 1_709);
+        // An odd room is kept whole: 1 Hz more shift, 2 Hz less band.
+        f.center_hz = Hz(433_883_710);
+        let plan = bits_plan(&[capture], &f, Some("ook"), None, None, None).unwrap();
+        assert_eq!(plan.bandwidth_hz, Hz(62_500 - 2 * 1_710));
     }
 
     #[test]

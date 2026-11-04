@@ -564,16 +564,60 @@ async fn remote_codes_with(
     name: &str,
     centred: bool,
 ) -> (zeta_core::bits::BitsPlan, (String, Vec<u32>)) {
+    remote_codes_from(name, Features::Recorded { centred }).await
+}
+
+/// Where [`remote_codes_from`] takes the plan's features from.
+enum Features {
+    /// The fixture's recorded features, OOK at [`REMOTE_BAUD`] given; the capture's
+    /// centre in place of the measured one when `centred`.
+    Recorded { centred: bool },
+    /// Measured afresh as the node's burst capture does (`measure_band` over the
+    /// capture's band), the modulation from the layer-1 label `measure_selection` gives
+    /// the same band, nothing given: a bare `bits_start`.
+    Remeasured,
+}
+
+/// The plan, chips and EV1527 codes the chain `bits_start` builds recovers from the
+/// real-remote fixture `name`, its plan made from the fixture's record and `features`.
+async fn remote_codes_from(
+    name: &str,
+    features: Features,
+) -> (zeta_core::bits::BitsPlan, (String, Vec<u32>)) {
     let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data")
         .join(format!("{name}.sigmf-meta"));
     let (m, iq) = zeta_core::capture::read_cf32(&meta).expect("fixture");
     let rate = m.sample_rate_hz.0;
-    let mut features: zeta_core::classify::FeatureRecord =
-        serde_json::from_value(m.annotations[0]["zeta:features"].clone()).expect("features");
-    if centred {
-        features.center_hz = m.center_hz;
-    }
+    let (features, label, modulation, baud) = match features {
+        Features::Recorded { centred } => {
+            let mut f: zeta_core::classify::FeatureRecord =
+                serde_json::from_value(m.annotations[0]["zeta:features"].clone())
+                    .expect("features");
+            if centred {
+                f.center_hz = m.center_hz;
+            }
+            let ook = Some(zeta_core::bits::Modulation::Ook);
+            (f, None, ook, Some(zeta_core::types::Baud(REMOTE_BAUD)))
+        }
+        Features::Remeasured => {
+            let a = &m.annotations[0];
+            let edge = |k: &str| a[k].as_u64().expect("annotation edge");
+            let band = edge("core:freq_upper_edge") - edge("core:freq_lower_edge");
+            let f = zeta_dsp::measure::measure_band(&iq, rate, m.center_hz.0, band);
+            let (_, l) = zeta_dsp::measure::measure_selection(
+                &iq,
+                rate,
+                m.center_hz.0,
+                zeta_core::classify::Band {
+                    offset_hz: 0,
+                    bandwidth_hz: zeta_core::types::Hz(band),
+                },
+            )
+            .expect("a measurement");
+            (f, Some(l.name), None, None)
+        }
+    };
     let record = zeta_core::bursts::CaptureRecord {
         id: name.into(),
         data_path: meta.with_extension("sigmf-data"),
@@ -597,9 +641,9 @@ async fn remote_codes_with(
     let plan = zeta_core::bits::bits_plan(
         &[record],
         &features,
-        None,
-        Some(zeta_core::bits::Modulation::Ook),
-        Some(zeta_core::types::Baud(REMOTE_BAUD)),
+        label.as_deref(),
+        modulation,
+        baud,
         None,
     )
     .expect("plan");
@@ -646,6 +690,41 @@ async fn b210_windows_decode_every_whole_frame() {
         assert!(plan.channel_rate_hz.is_some(), "{name}: no shift: {plan:?}");
         assert!(
             codes.len() >= B210_LEAST_FRAMES && codes.iter().all(|&c| c == B210_CODE),
+            "{name}: {} codes {codes:06x?} from {} chips {chips}",
+            codes.len(),
+            chips.len()
+        );
+    }
+}
+
+/// The codes of the weak HackRF remote (`ook-remote-hackrf-sparse-*`: one press of two
+/// buttons), read on the node by pulse width and by `bits_start` given the rate.
+const SPARSE_CODES: [u32; 2] = [<button-code>, <button-code>];
+/// Whole frames the long sparse windows decode at least, from their own re-measured
+/// features with nothing given: the 431 ms window holds about 10 frames, the chain reads
+/// 9 (all <button-code>); the 471 ms one about 11, the chain reads 8 (all <button-code>). One
+/// fewer each is allowed.
+const SPARSE_LEAST_FRAMES: [(&str, usize); 2] = [
+    ("ook-remote-hackrf-sparse-1", 8),
+    ("ook-remote-hackrf-sparse-3", 7),
+];
+
+/// The 431 ms and 471 ms windows of the weak remote, their features measured afresh
+/// (OOK at about 3200 Bd; the 471 ms one's band, 56 580 Hz of mostly noise, clamped to
+/// the capture): the chain a bare `bits_start` builds decodes whole frames, every one of
+/// them one of the remote's codes.
+#[tokio::test]
+async fn a_weak_remote_decodes_from_its_own_measured_features() {
+    for (name, least) in SPARSE_LEAST_FRAMES {
+        let (plan, (chips, codes)) = remote_codes_from(name, Features::Remeasured).await;
+        eprintln!("{name}: {} codes {codes:06x?} plan {plan:?}", codes.len());
+        assert_eq!(
+            plan.modulation,
+            zeta_core::bits::Modulation::Ook,
+            "{plan:?}"
+        );
+        assert!(
+            codes.len() >= least && codes.iter().all(|c| SPARSE_CODES.contains(c)),
             "{name}: {} codes {codes:06x?} from {} chips {chips}",
             codes.len(),
             chips.len()

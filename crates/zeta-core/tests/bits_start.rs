@@ -647,6 +647,58 @@ const REMOTE_BAUD: f64 = 3_200.0;
 /// How far the inferred rate may stray from [`REMOTE_BAUD`], as a fraction.
 const REMOTE_BAUD_TOLERANCE: f64 = 0.02;
 
+/// The `zeta-dsp` fixture window `name` written to the store in set `set` from
+/// `start_ns`, with the features the node's own burst capture measures (`measure_band`
+/// over the capture's band); its id.
+fn write_fixture(node: &Node, name: &str, set: &str, start_ns: u64) -> String {
+    let meta = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../zeta-dsp/tests/data")
+        .join(format!("{name}.sigmf-meta"));
+    let (m, iq) = zeta_core::capture::read_cf32(&meta).unwrap();
+    let a = &m.annotations[0];
+    let edge = |k: &str| a[k].as_u64().unwrap();
+    let band = edge("core:freq_upper_edge") - edge("core:freq_lower_edge");
+    let rate = m.sample_rate_hz.0;
+    let features = zeta_dsp::measure::measure_band(&iq, rate, m.center_hz.0, band);
+    node.bursts()
+        .write(
+            NewCapture {
+                source: SourceId("rx".into()),
+                set: JobId(set.into()),
+                center_hz: m.center_hz,
+                bandwidth_hz: Hz(band),
+                sample_rate_hz: m.sample_rate_hz,
+                start_ns,
+                end_ns: start_ns + iq.len() as u64 * 1_000_000_000 / rate,
+                features: serde_json::to_value(&features).unwrap(),
+                signal: None,
+                job: JobId(set.into()),
+                watch: None,
+                allocations: json!([]),
+            },
+            &iq,
+        )
+        .unwrap()
+        .id
+}
+
+/// `bits_start` with nothing given on capture `cap`: its plan (`context.bits`), the job
+/// stopped, asserted OOK within [`REMOTE_BAUD_TOLERANCE`] of [`REMOTE_BAUD`].
+async fn infers_the_remote(node: &Node, cap: &str, name: &str) -> Value {
+    let id = bits_start(node, cap, None, None)
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    let bits = record(node, &id).context["bits"].clone();
+    node.job_stop(&id).await.unwrap();
+    assert_eq!(bits["modulation"], "ook", "{name}: {bits}");
+    let baud = bits["symbol_rate_baud"].as_f64().unwrap();
+    assert!(
+        (baud - REMOTE_BAUD).abs() <= REMOTE_BAUD * REMOTE_BAUD_TOLERANCE,
+        "{name}: {bits}"
+    );
+    bits
+}
+
 /// The real remote's windows from `zeta-dsp`'s fixtures (B210 at 51 200 and 61 440 Hz,
 /// a HackRF at 62 500 Hz, all at 433.882 MHz), each written to the store with the
 /// features the node's own burst capture measures (`measure_band` over the capture's
@@ -663,44 +715,40 @@ async fn bits_start_infers_ook_at_the_chip_rate_on_a_real_remote() {
         "ook-remote-b210-2",
         "ook-remote-hackrf-1",
     ] {
-        let meta = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../zeta-dsp/tests/data")
-            .join(format!("{name}.sigmf-meta"));
-        let (m, iq) = zeta_core::capture::read_cf32(&meta).unwrap();
-        let a = &m.annotations[0];
-        let edge = |k: &str| a[k].as_u64().unwrap();
-        let band = edge("core:freq_upper_edge") - edge("core:freq_lower_edge");
-        let rate = m.sample_rate_hz.0;
-        let features = zeta_dsp::measure::measure_band(&iq, rate, m.center_hz.0, band);
-        let cap = node
-            .bursts()
-            .write(
-                NewCapture {
-                    source: SourceId("rx".into()),
-                    set: JobId(name.into()),
-                    center_hz: m.center_hz,
-                    bandwidth_hz: Hz(band),
-                    sample_rate_hz: m.sample_rate_hz,
-                    start_ns: T0_NS,
-                    end_ns: T0_NS + iq.len() as u64 * 1_000_000_000 / rate,
-                    features: serde_json::to_value(&features).unwrap(),
-                    signal: None,
-                    job: JobId(name.into()),
-                    watch: None,
-                    allocations: json!([]),
-                },
-                &iq,
-            )
-            .unwrap()
-            .id;
-        let id = bits_start(&node, &cap, None, None).await.unwrap();
-        let bits = record(&node, &id).context["bits"].clone();
-        node.job_stop(&id).await.unwrap();
-        assert_eq!(bits["modulation"], "ook", "{name}: {bits}");
-        let baud = bits["symbol_rate_baud"].as_f64().unwrap();
-        assert!(
-            (baud - REMOTE_BAUD).abs() <= REMOTE_BAUD * REMOTE_BAUD_TOLERANCE,
+        let cap = write_fixture(&node, name, name, T0_NS);
+        infers_the_remote(&node, &cap, name).await;
+    }
+}
+
+/// The three HackRF windows of one press of a weak remote (431, 71 and 471 ms at 62 500
+/// Hz, 20-34 dB SNR), written as one set as the node's burst capture wrote them: a bare
+/// `bits_start` on each picks OOK at the chip rate (live it refused, `no symbol rate
+/// measured`, or read `fsk`), and the 471 ms window, whose measured band (56 580 Hz,
+/// mostly noise) padded is wider than the capture, takes a channel that fits instead of
+/// a refusal.
+#[tokio::test]
+async fn bits_start_infers_ook_on_every_window_of_a_weak_remote_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let names = [
+        "ook-remote-hackrf-sparse-1",
+        "ook-remote-hackrf-sparse-2",
+        "ook-remote-hackrf-sparse-3",
+    ];
+    let caps: Vec<String> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| write_fixture(&node, name, "press", T0_NS + i as u64 * 1_000_000_000))
+        .collect();
+    for (name, cap) in names.iter().zip(&caps) {
+        let bits = infers_the_remote(&node, cap, name).await;
+        assert_eq!(
+            bits["captures"].as_array().unwrap().len(),
+            3,
             "{name}: {bits}"
         );
+        let band = bits["bandwidth_hz"].as_u64().unwrap();
+        let shift = bits["shift_hz"].as_i64().unwrap().unsigned_abs();
+        assert!(band + 2 * shift <= 62_500, "{name}: {bits}");
     }
 }
