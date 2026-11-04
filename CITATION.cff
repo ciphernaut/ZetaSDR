@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use ZetaSDR, please cite it as below."
 title: "ZetaSDR"
 version: 0.1.0
-# date-released is added on main when the release is cut: CHANGELOG's date, the PUBLIC_DATE the export tags v0.1.0 with.
+date-released: 2026-11-05
 abstract: "ZetaSDR is an agentic software-defined radio runtime: one node owns the radios and offers measuring, identifying and decoding signals as a small set of typed operations, for people and for LLM agents."
 authors:
   - family-names: Grigull
