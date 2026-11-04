@@ -69,6 +69,17 @@ pub struct FskDemodParams {
 /// the slow release ([`NORMALISER_SYMBOLS`]) brings it back.
 const ATTACK: f64 = 0.25;
 
+/// A sample more than this many spans (`hi - lo`) above the high level sets it at once,
+/// not by [`ATTACK`]: an onset after silence, the levels the noise's. A real OOK remote
+/// after 20 ms of silence read 73 against an on-level of 1 by the attack alone; an
+/// impulse over keying (5 times the on-level, 4 spans over it) stays under the bound
+/// and takes the attack.
+const ONSET_SPANS: f64 = 8.0;
+
+/// Symbol periods the high level follows the samples after an onset: the decision
+/// low-pass's span ([`LOWPASS_SPAN_SYMBOLS`]) and one more, the edge's whole rise.
+const ONSET_PERIODS: usize = LOWPASS_SPAN_SYMBOLS as usize + 1;
+
 /// The warm-up of the running levels, in group delays of the decision low-pass: its own
 /// history (two delays) filling from zero, which also spreads an upstream filter's
 /// start-up transient (the resampler's) into it.
@@ -105,7 +116,9 @@ pub(crate) fn decision_lowpass(cutoff_hz: f64, rate_hz: u64, baud: u32) -> (Stre
 /// extremes of the first [`SEED_PERIODS`] periods seed both; until then the extremes so
 /// far stand in, so the scaled output is bounded from the first sample. The first
 /// `warmup` samples (the low-pass filling from zero history, and the start-up transient
-/// of any filter upstream it spreads) take no part and scale to 0. Alongside, the
+/// of any filter upstream it spreads) take no part and scale to 0. A sample more than
+/// [`ONSET_SPANS`] spans over the high level sets it at once, and for [`ONSET_PERIODS`]
+/// the high level follows every sample above it (an onset after silence). Alongside, the
 /// centre: the plain exponential average over [`CENTRE_SYMBOLS`] of each period's
 /// midpoint `(min + max) / 2`, seeded with the mean of the seed periods. It moves the same
 /// amount whichever way the signal goes, so a run of one tone does not shift it the way
@@ -121,6 +134,9 @@ pub(crate) struct Levels {
     seen_sum: f64,
     seen_n: usize,
     closed: usize,
+    /// Periods left in which the high level follows every sample above it: set by an
+    /// onset ([`ONSET_SPANS`]), so the whole rising edge sets it, not its first sample.
+    onset_left: usize,
     levels: Option<(f64, f64)>,
     centre: Option<f64>,
 }
@@ -138,6 +154,7 @@ impl Levels {
             seen_sum: 0.0,
             seen_n: 0,
             closed: 0,
+            onset_left: 0,
             levels: None,
             centre: None,
         }
@@ -161,6 +178,7 @@ impl Levels {
             let (pmin, pmax) = (self.min, self.max);
             (self.min, self.max) = (f64::INFINITY, f64::NEG_INFINITY);
             self.closed += 1;
+            self.onset_left = self.onset_left.saturating_sub(1);
             let step = |level: &mut f64, x: f64, beyond: bool| {
                 let rate = if beyond {
                     ATTACK
@@ -180,6 +198,17 @@ impl Levels {
                     self.centre = Some(self.seen_mean());
                 }
                 _ => {}
+            }
+        }
+        // An onset far past the high level (keying after a warm-up silence, whose levels
+        // are the noise's) sets it at once: by the attack alone the first pulse would
+        // read the on-level over the noise's span.
+        if let Some((lo, hi)) = &mut self.levels {
+            if v > *hi + ONSET_SPANS * (*hi - *lo) {
+                self.onset_left = ONSET_PERIODS;
+            }
+            if self.onset_left > 0 && v > *hi {
+                *hi = v;
             }
         }
         Some(self.levels.unwrap_or((self.seen_min, self.seen_max)))

@@ -303,6 +303,41 @@ mod tests {
         }
     }
 
+    /// How far the first pulse after a silence may read from 1.0: the decision low-pass's
+    /// ringing on its edges, not the noise's span.
+    const FIRST_PULSE_TOLERANCE: f32 = 0.25;
+
+    /// 20 ms of noise (the levels warm up and seed on it) then keying: the first pulse
+    /// reads about 1, not the on-level over the noise's span (73 on a real remote).
+    #[tokio::test]
+    async fn the_first_pulse_after_silence_reads_about_one() {
+        const SILENCE_SYMBOLS: usize = 48;
+        const NOISE: f32 = 0.002;
+        let mut s: u64 = 0x5eed;
+        let mut noise = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            NOISE * (((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
+        };
+        let mut iq: Vec<Complex<f32>> = (0..SILENCE_SYMBOLS * SPS)
+            .map(|_| Complex::new(noise(), noise()))
+            .collect();
+        iq.extend(keyed(64, ON));
+        let y = run_frames(vec![(T0, iq, RATE)]).await.unwrap().concat();
+        let pulse = &y[SILENCE_SYMBOLS * SPS + DELAY..(SILENCE_SYMBOLS + RUN) * SPS + DELAY];
+        let peak = pulse.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            (peak - 1.0).abs() <= FIRST_PULSE_TOLERANCE,
+            "first pulse peaks at {peak}"
+        );
+        let mid = symbol_mean(&y, SILENCE_SYMBOLS + RUN / 2);
+        assert!(
+            (mid - 1.0).abs() <= FIRST_PULSE_TOLERANCE,
+            "first pulse reads {mid}"
+        );
+    }
+
     #[tokio::test]
     async fn a_seam_resets_the_levels_and_flushes_the_run() {
         // 32 symbols at amplitude 1, a 1 s gap, then 32 at 0.2: after the seam the levels

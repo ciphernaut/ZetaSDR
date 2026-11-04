@@ -40,87 +40,85 @@ pub const CONSTELLATION_EVERY_MS: u64 = 1000;
 /// symbols.
 const AVERAGE_SYMBOLS: f64 = 64.0;
 
-/// The quantile of the run's first frame that starts the 2-level seed's centres (and
-/// one minus it the upper centre and the 4-level outer magnitude), in place of the
-/// frame's extremes. A cluster level moves only by the values that fall in its cluster,
-/// so a seed beyond every later symbol never comes back: a start-up transient (a
-/// demodulator's levels settling on an onset after silence, measured at 4.7 against an
-/// on-level of 1 on a real OOK remote) seeded the upper level so high that no symbol
-/// reached the midpoint and every bit read 0.
+/// One minus the quantile of the run's first frame that seeds the 4-level outer
+/// magnitude, in place of the frame's maximum, so a start-up transient does not seed it
+/// beyond every later symbol.
 const SEED_QUANTILE: f64 = 0.1;
 
-/// Lloyd iterations of the 2-level seed's 2-means over the first frame: each centre
-/// becomes the mean of the values nearer to it. A frame of one level with a few symbols
-/// of the other (a carrier lead-in, OOK mostly silence) starts with both quantiles on
-/// the one level; the first iteration moves the upper centre off it and the second
-/// splits the clusters, so a few spare iterations cover a noisy frame.
+/// Rounds of the 2-level seed's 2-medians over the first frame: each centre becomes the
+/// median of the values nearer to it; a few spare rounds cover a noisy frame.
 const SEED_ITERATIONS: usize = 8;
 
-/// The 2-means seed is degenerate when its centres end closer than this fraction of the
-/// first frame's range (min to max): the frame shows no second cluster to find, and the
-/// seed falls back to the frame's minimum and maximum.
+/// The 2-level seed is degenerate when its centres end closer than this fraction of its
+/// starting quantiles' span: the frame shows no second cluster to find, and the seed
+/// falls back to the frame's minimum and maximum.
 const SEED_DEGENERATE_FRACTION: f64 = 0.05;
 
-/// How far past the seed's starting quantiles a first-frame value counts, in spans
-/// between them: a value beyond is held at that fence for the 2-means. An OOK
-/// demodulator whose levels settled on the silence before a burst scales the onset by
-/// the noise's range: on a real remote at 42 dB SNR (the B210 windows) one strobe read
-/// 73 against an on-level of 1, and as a cluster of its own it set the midpoint at 37,
-/// so every bit read 0.
-const SEED_FENCE_SPANS: f64 = 1.0;
+/// A 2-level value updates its cluster's level as if it lay at most this many spans
+/// (`hi - lo`) past the levels: one onset strobe at 73 times the on-level would
+/// otherwise lift the upper level past the on-level by itself, after which no on
+/// symbol reaches the midpoint to bring it back.
+const UPDATE_CLAMP_SPANS: f64 = 1.0;
+
+/// The quantile of the run's first frame that starts the 2-level seed's lower centre
+/// (and one minus it the upper): low enough that a level holding only 5 % of the frame
+/// (an OOK burst's first pulses after a silence) starts a centre of its own. From the
+/// 10th/90th percentiles both centres start in the noise when under 10 % of the frame is
+/// the other level, and no median moves them off it.
+const SEED_MEDIAN_QUANTILE: f64 = 0.03;
 
 /// The 2-level seed `(lo, hi)` of the first frame's `values`: [`SEED_ITERATIONS`]
-/// Lloyd iterations of a 2-means from the [`SEED_QUANTILE`] and `1 - SEED_QUANTILE`
-/// quantiles (a centre whose side is empty stays put) over the values held within
-/// [`SEED_FENCE_SPANS`] of those quantiles' span past them (none held when the span is
-/// 0), the held values' minimum and maximum when the centres end closer than
-/// [`SEED_DEGENERATE_FRACTION`] of their range.
+/// rounds of a 2-medians (each centre the median of the values nearer to it, a centre
+/// whose side is empty staying put) from the [`SEED_MEDIAN_QUANTILE`] and
+/// `1 - SEED_MEDIAN_QUANTILE` quantiles, so one outlier (an OOK onset after silence, 73
+/// against an on-level of 1 on a real remote) cannot move a centre while a small true
+/// cluster keeps its own. The frame's minimum and maximum when the centres end closer
+/// than [`SEED_DEGENERATE_FRACTION`] of the starting quantiles' span (of the frame's
+/// range when that is 0), so an outlier's reach does not judge a good split degenerate.
 fn two_level_seed(values: &[f64]) -> (f64, f64) {
     let v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
     if v.is_empty() {
         return (0.0, 0.0);
     }
-    let (mut lo, mut hi) = (
-        quantile(&v, SEED_QUANTILE),
-        quantile(&v, 1.0 - SEED_QUANTILE),
-    );
-    // A value far past the quantiles (an onset transient) is held at the fence, so it
-    // cannot pull a centre off by itself.
-    let fence = SEED_FENCE_SPANS * (hi - lo);
-    let v: Vec<f64> = if fence > 0.0 {
-        v.iter().map(|x| x.clamp(lo - fence, hi + fence)).collect()
-    } else {
-        v
-    };
     let (min, max) = v
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| {
             (a.min(x), b.max(x))
         });
+    let (mut lo, mut hi) = (
+        quantile(&v, SEED_MEDIAN_QUANTILE),
+        quantile(&v, 1.0 - SEED_MEDIAN_QUANTILE),
+    );
+    let span = if hi > lo { hi - lo } else { max - min };
     for _ in 0..SEED_ITERATIONS {
         let mid = (lo + hi) / 2.0;
-        let (mut sl, mut nl, mut sh, mut nh) = (0.0, 0usize, 0.0, 0usize);
-        for &x in &v {
-            // As the slicer decides: the midpoint itself is the upper cluster's.
-            if x >= mid {
-                sh += x;
-                nh += 1;
-            } else {
-                sl += x;
-                nl += 1;
-            }
+        // As the slicer decides: the midpoint itself is the upper cluster's.
+        let (upper, lower): (Vec<f64>, Vec<f64>) = v.iter().partition(|&&x| x >= mid);
+        if !lower.is_empty() {
+            lo = median(&lower);
         }
-        if nl > 0 {
-            lo = sl / nl as f64;
-        }
-        if nh > 0 {
-            hi = sh / nh as f64;
+        if !upper.is_empty() {
+            hi = median(&upper);
         }
     }
-    if hi - lo < SEED_DEGENERATE_FRACTION * (max - min) {
+    if hi - lo < SEED_DEGENERATE_FRACTION * span {
         (min, max)
     } else {
         (lo, hi)
+    }
+}
+
+/// The median of `values` (the mean of the middle two for an even count).
+fn median(values: &[f64]) -> f64 {
+    let mut v = values.to_vec();
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
     }
 }
 
@@ -380,7 +378,12 @@ impl Slicer {
     fn slice_real(&mut self, x: f64) -> u32 {
         let a = 1.0 / AVERAGE_SYMBOLS;
         if self.m == 2 {
-            if x >= (self.lo + self.hi) / 2.0 {
+            let decide = x;
+            // A value far past the levels (an onset transient) moves its level no
+            // further than one span's worth.
+            let d = UPDATE_CLAMP_SPANS * (self.hi - self.lo).abs();
+            let x = x.clamp(self.lo.min(self.hi) - d, self.lo.max(self.hi) + d);
+            if decide >= (self.lo + self.hi) / 2.0 {
                 self.hi += (x - self.hi) * a;
                 1
             } else {
@@ -983,9 +986,9 @@ mod tests {
     }
 
     /// The B210 remote's first strobe frame: noise scaled to 0..1 by levels settled on
-    /// silence, one onset strobe at 73 (then 3.4) and the 0/1 keying. The onset is held at
-    /// the fence, so it neither forms a cluster of its own nor sends the seed to the
-    /// extremes: the midpoint sits between the keyed levels.
+    /// silence, one onset strobe at 73 (then 3.4) and the 0/1 keying. The 2-medians
+    /// leaves the onset no cluster of its own, and the split is not judged degenerate on
+    /// its reach: the midpoint sits between the keyed levels.
     #[test]
     fn an_onset_strobe_far_past_the_levels_does_not_seed_them() {
         const ONSET: [f64; 2] = [73.4, 3.4];
@@ -999,6 +1002,83 @@ mod tests {
         let (lo, hi) = super::two_level_seed(&v);
         let mid = (lo + hi) / 2.0;
         assert!(mid > 0.25 && mid < 0.75, "({lo}, {hi})");
+    }
+
+    /// `n` deterministic samples of N(0, `sigma`).
+    fn gaussian(n: usize, sigma: f64, seed: u64) -> Vec<f64> {
+        let mut s = seed;
+        let mut uniform = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        (0..n)
+            .map(|_| {
+                let (u, v) = (uniform(), uniform());
+                sigma * (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+            })
+            .collect()
+    }
+
+    /// The seed of a 159-strobe first frame (the B210 remote's) of |N(0, 0.03)| noise with
+    /// 5 % or 10 % on strobes at 1 + N(0, 0.03) and one onset at 73: the midpoint sits
+    /// between the noise and the on-level, so no noise strobe and every on strobe clears it.
+    #[test]
+    fn a_small_on_cluster_with_an_onset_keeps_its_own_seed() {
+        const FRAME: usize = 159;
+        for (ones, seed) in [(8usize, 31u64), (16, 32)] {
+            let noise = gaussian(FRAME, 0.03, seed);
+            let every = FRAME / ones;
+            let v: Vec<f64> = noise
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| match i {
+                    0 => 73.0,
+                    i if i % every == every / 2 => 1.0 + n,
+                    _ => n.abs(),
+                })
+                .collect();
+            let (lo, hi) = super::two_level_seed(&v);
+            let mid = (lo + hi) / 2.0;
+            let top_noise = noise.iter().map(|n| n.abs()).fold(0.0, f64::max);
+            assert!(
+                mid > top_noise && mid < 1.0 - 0.1,
+                "{ones} on: ({lo}, {hi}), noise up to {top_noise}"
+            );
+        }
+    }
+
+    /// A first frame that is mostly silence, as an OOK burst's after a quiet lead-in: the
+    /// strobes |N(0, 0.03)|, one onset strobe at 73, then a 5 % or 10 % share of on
+    /// strobes at 1 + N(0, 0.03), the next frames the same keying share. Every on strobe
+    /// (and the onset) reads 1 and every noise strobe 0: the seed's upper centre starts on
+    /// the small on-cluster and keeps it, and the onset moves no level.
+    #[tokio::test]
+    async fn a_mostly_silent_first_frame_with_an_onset_slices_its_few_pulses() {
+        const SIGMA: f64 = 0.03;
+        const ONSET: f64 = 73.0;
+        const ONSET_AT: usize = 10;
+        const SYMBOLS: usize = 480;
+        for (share, seed) in [(0.05, 21u64), (0.10, 22)] {
+            let every = (1.0 / share) as usize;
+            let noise = gaussian(SYMBOLS, SIGMA, seed);
+            let want: Vec<u8> = (0..SYMBOLS)
+                .map(|i| (i == ONSET_AT || (i > ONSET_AT && i % every == 0)) as u8)
+                .collect();
+            let x: Vec<f32> = want
+                .iter()
+                .zip(&noise)
+                .enumerate()
+                .map(|(i, (&b, &n))| match (i, b) {
+                    (ONSET_AT, _) => ONSET as f32,
+                    (_, 1) => (1.0 + n) as f32,
+                    _ => n.abs() as f32,
+                })
+                .collect();
+            let r = run(serde_json::json!({}), frames(&x, 1, T0)).await;
+            assert_eq!(r.bits(), want, "share {share}");
+        }
     }
 
     #[tokio::test]
