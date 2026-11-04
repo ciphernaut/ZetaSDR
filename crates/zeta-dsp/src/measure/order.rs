@@ -25,6 +25,14 @@ const FSK_LINE_BINS: usize = 2;
 /// an FM test tone 0.998, AFSK under FM 0.41-0.46, random 2- and 4-FSK
 /// 0.16-0.22).
 const FSK_TONE_SHARE_MAX: f64 = 0.3;
+/// FSK: only the samples whose envelope reaches this fraction of the
+/// `FSK_ON_PERCENTILE`th-percentile envelope are histogrammed. FSK's envelope
+/// is constant, so this keeps its every sample; on-off keying's off samples are
+/// noise, whose instantaneous frequency spreads across the band, and with them
+/// a real OOK remote's carrier read as two clusters 2.5-8 kHz apart.
+const FSK_ON_FRACTION: f32 = 0.5;
+/// FSK: the envelope percentile `FSK_ON_FRACTION` is taken of.
+const FSK_ON_PERCENTILE: usize = 90;
 /// Histograms are smoothed by a mean over this many bins.
 const SMOOTH_BINS: usize = 3;
 /// PSK: the orders tried by the m-th power test, smallest first.
@@ -87,9 +95,11 @@ fn clusters(hist: &[f64], total: usize, min_weight: f64) -> Vec<(usize, f64)> {
 
 /// FSK order and tone spacing of `runs`: each run band-passed to the occupied
 /// band `offset_hz ± bandwidth_hz / 2`, its instantaneous frequency
-/// (discriminator) histogrammed across that band in `FSK_HIST_BINS` bins,
-/// and the histogram's [`clusters`] holding at least `FSK_CLUSTER_MIN_WEIGHT`
-/// of the samples counted. Two or four clusters give the order and the
+/// (discriminator) where the signal is on (the envelope at least
+/// `FSK_ON_FRACTION` of its `FSK_ON_PERCENTILE`th percentile over the runs)
+/// histogrammed across that band in `FSK_HIST_BINS` bins, and the histogram's
+/// [`clusters`] holding at least `FSK_CLUSTER_MIN_WEIGHT` of the samples
+/// counted. Two or four clusters give the order and the
 /// median distance between adjacent ones; any other count is `None`. So is a
 /// spacing, or an occupied band, under `FSK_SEP_HZ.0`: a tone pair closer
 /// than the two-peak rule's minimum is not an FSK order.
@@ -105,11 +115,21 @@ pub(super) fn fsk_clusters(
     let bin = bw / FSK_HIST_BINS as f64;
     let mut hist = vec![0.0f64; FSK_HIST_BINS];
     let mut total = 0usize;
-    let freqs: Vec<Vec<f32>> = runs
+    let band: Vec<Vec<Complex<f32>>> = runs
         .iter()
-        .map(|r| discriminator(&bandpass(r, rate_hz, offset_hz, bw)))
+        .map(|r| bandpass(r, rate_hz, offset_hz, bw))
         .collect();
-    for d in freqs.iter().flatten() {
+    let env: Vec<f32> = band.iter().flatten().map(|s| s.norm()).collect();
+    let on = FSK_ON_FRACTION * super::percentile(&env, FSK_ON_PERCENTILE);
+    let freqs: Vec<Vec<f32>> = band.iter().map(|x| discriminator(x)).collect();
+    // Each discriminator sample with the envelope of the two samples it spans.
+    let on_samples = band.iter().zip(&freqs).flat_map(|(x, d)| {
+        d.iter()
+            .zip(x.windows(2))
+            .filter(|(_, w)| w[0].norm().min(w[1].norm()) >= on)
+            .map(|(d, _)| d)
+    });
+    for d in on_samples {
         total += 1;
         let f = *d as f64 * rate_hz as f64 / std::f64::consts::TAU - offset_hz + bw / 2.0;
         if (0.0..bw).contains(&f) {
@@ -252,4 +272,110 @@ pub(super) fn envelope_runs(iq: &[Complex<f32>], rate_hz: u64) -> Vec<&[Complex<
     } else {
         vec![iq]
     }
+}
+
+/// OOK chip rate: an edge turns the keying on above this fraction of the
+/// `OOK_TOP_PERCENTILE`th-percentile envelope ...
+const OOK_EDGE_ON: f32 = 0.6;
+/// ... and off below this fraction (the hysteresis between the two keeps
+/// noise riding an edge from cutting a run).
+const OOK_EDGE_OFF: f32 = 0.4;
+/// OOK chip rate: the seed unit is this percentile of the run lengths. The
+/// shortest runs are one chip and in pulse-width keying they are common (a 0 is
+/// one chip on, a 1 one chip off), so the 10th percentile is one, past a
+/// stray short run.
+const OOK_UNIT_SEED_PERCENTILE: usize = 10;
+/// OOK chip rate: runs of more than this many units are not fitted (a frame's
+/// sync silence, the gaps between frames): they hold no timing finer than a
+/// short run does.
+const OOK_UNIT_MAX_MULTIPLE: f64 = 8.0;
+/// OOK chip rate: a run fits a multiple of the unit within this many units.
+const OOK_UNIT_TOLERANCE: f64 = 0.25;
+/// OOK chip rate: at least this share of the fitted runs fit ...
+const OOK_UNIT_MIN_SHARE: f64 = 0.8;
+/// ... and at least this many runs fit.
+const OOK_UNIT_MIN_RUNS: usize = 16;
+/// OOK chip rate: a unit shorter than this many samples is not timing.
+const OOK_UNIT_MIN_SAMPLES: f64 = 2.0;
+/// OOK chip rate: refinements of the unit by its least-squares fit.
+const OOK_UNIT_ITERATIONS: usize = 4;
+
+/// The chip rate of on-off keying in `runs` from its run lengths: each run
+/// band-passed to the occupied band `offset_hz ± bandwidth_hz / 2`, and when its
+/// envelope sits at two levels with the lower off ([`two_levels`]), cut into on
+/// and off runs at the `OOK_EDGE_ON` / `OOK_EDGE_OFF` fractions of the
+/// `OOK_TOP_PERCENTILE`th-percentile envelope (the first and last run of each, cut
+/// by the window, dropped). The unit is seeded by the
+/// `OOK_UNIT_SEED_PERCENTILE`th-percentile run and refined
+/// `OOK_UNIT_ITERATIONS` times as the least-squares unit of the runs of at most
+/// `OOK_UNIT_MAX_MULTIPLE` units (sum of lengths over sum of nearest
+/// multiples), so an edge threshold that shortens every on run and lengthens
+/// every off run by the same time cancels between them. The rate is `rate_hz`
+/// over the unit when at least `OOK_UNIT_MIN_RUNS` runs, and `OOK_UNIT_MIN_SHARE`
+/// of those fitted, lie within `OOK_UNIT_TOLERANCE` of a multiple; else `None`.
+/// The cyclostationary lines of pulse-width keying stand at its bit rate and
+/// harmonics (an EV1527 remote, a bit of four chips, read 1598 Bd for 3200),
+/// while its run lengths are whole chips.
+pub(super) fn ook_unit_rate(
+    runs: &[&[Complex<f32>]],
+    rate_hz: u64,
+    (offset_hz, bandwidth_hz): (f64, u64),
+) -> Option<zeta_core::types::Baud> {
+    let band: Vec<Vec<Complex<f32>>> = runs
+        .iter()
+        .map(|r| bandpass(r, rate_hz, offset_hz, bandwidth_hz as f64))
+        .collect();
+    let slices: Vec<&[Complex<f32>]> = band.iter().map(|b| b.as_slice()).collect();
+    if !two_levels(&slices) {
+        return None;
+    }
+    let env: Vec<f32> = band.iter().flatten().map(|s| s.norm()).collect();
+    let top = super::percentile(&env, OOK_TOP_PERCENTILE);
+    if top <= 0.0 {
+        return None;
+    }
+    let (on_at, off_at) = (OOK_EDGE_ON * top, OOK_EDGE_OFF * top);
+    let mut lengths: Vec<f64> = Vec::new();
+    for x in &band {
+        let mut state = x.first().is_some_and(|s| s.norm() >= on_at);
+        let mut edges: Vec<usize> = Vec::new();
+        for (i, s) in x.iter().enumerate() {
+            let e = s.norm();
+            if (!state && e >= on_at) || (state && e < off_at) {
+                state = !state;
+                edges.push(i);
+            }
+        }
+        lengths.extend(edges.windows(2).map(|w| (w[1] - w[0]) as f64));
+    }
+    if lengths.len() < OOK_UNIT_MIN_RUNS {
+        return None;
+    }
+    let mut sorted = lengths.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mut unit = sorted[(sorted.len() - 1) * OOK_UNIT_SEED_PERCENTILE / 100];
+    let fit = |unit: f64| {
+        lengths.iter().filter_map(move |&l| {
+            let k = (l / unit).round();
+            (1.0..=OOK_UNIT_MAX_MULTIPLE).contains(&k).then_some((l, k))
+        })
+    };
+    for _ in 0..OOK_UNIT_ITERATIONS {
+        if unit < OOK_UNIT_MIN_SAMPLES {
+            return None;
+        }
+        let (sum_l, sum_k) = fit(unit).fold((0.0, 0.0), |(a, b), (l, k)| (a + l, b + k));
+        if sum_k == 0.0 {
+            return None;
+        }
+        unit = sum_l / sum_k;
+    }
+    let fitted = fit(unit).count();
+    let close = fit(unit)
+        .filter(|&(l, k)| (l / unit - k).abs() <= OOK_UNIT_TOLERANCE)
+        .count();
+    (unit >= OOK_UNIT_MIN_SAMPLES
+        && close >= OOK_UNIT_MIN_RUNS
+        && close as f64 >= OOK_UNIT_MIN_SHARE * fitted as f64)
+        .then(|| zeta_core::types::Baud((rate_hz as f64 / unit).round() as u32))
 }

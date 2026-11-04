@@ -641,3 +641,60 @@ async fn a_drain_a_stage_ignores_is_cut_after_the_drain_timeout() {
         "ended after {took:?}"
     );
 }
+
+/// The real EV1527 remote's chip rate (313 us a chip).
+const REMOTE_BAUD: f64 = 3_200.0;
+/// How far the inferred rate may stray from [`REMOTE_BAUD`], as a fraction.
+const REMOTE_BAUD_TOLERANCE: f64 = 0.02;
+
+/// The real remote's windows from `zeta-dsp`'s fixtures (a B210 at 61 440 Hz and a
+/// HackRF at 62 500 Hz, both at 433.882 MHz), each written to the store with the
+/// features the node's own burst capture measures (`measure_band` over the capture's
+/// band): `bits_start` with nothing given picks OOK at the chip rate, not FSK at the
+/// bit rate's harmonic (the HackRF window read `fsk` at 1598 Bd).
+#[tokio::test]
+async fn bits_start_infers_ook_at_the_chip_rate_on_a_real_remote() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    for name in ["ook-remote-b210-1", "ook-remote-hackrf-1"] {
+        let meta = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../zeta-dsp/tests/data")
+            .join(format!("{name}.sigmf-meta"));
+        let (m, iq) = zeta_core::capture::read_cf32(&meta).unwrap();
+        let a = &m.annotations[0];
+        let edge = |k: &str| a[k].as_u64().unwrap();
+        let band = edge("core:freq_upper_edge") - edge("core:freq_lower_edge");
+        let rate = m.sample_rate_hz.0;
+        let features = zeta_dsp::measure::measure_band(&iq, rate, m.center_hz.0, band);
+        let cap = node
+            .bursts()
+            .write(
+                NewCapture {
+                    source: SourceId("rx".into()),
+                    set: JobId(name.into()),
+                    center_hz: m.center_hz,
+                    bandwidth_hz: Hz(band),
+                    sample_rate_hz: m.sample_rate_hz,
+                    start_ns: T0_NS,
+                    end_ns: T0_NS + iq.len() as u64 * 1_000_000_000 / rate,
+                    features: serde_json::to_value(&features).unwrap(),
+                    signal: None,
+                    job: JobId(name.into()),
+                    watch: None,
+                    allocations: json!([]),
+                },
+                &iq,
+            )
+            .unwrap()
+            .id;
+        let id = bits_start(&node, &cap, None, None).await.unwrap();
+        let bits = record(&node, &id).context["bits"].clone();
+        node.job_stop(&id).await.unwrap();
+        assert_eq!(bits["modulation"], "ook", "{name}: {bits}");
+        let baud = bits["symbol_rate_baud"].as_f64().unwrap();
+        assert!(
+            (baud - REMOTE_BAUD).abs() <= REMOTE_BAUD * REMOTE_BAUD_TOLERANCE,
+            "{name}: {bits}"
+        );
+    }
+}

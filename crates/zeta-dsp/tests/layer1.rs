@@ -193,3 +193,71 @@ fn centred_carrier_is_still_carrier() {
         assert_eq!(l.name, "carrier", "snr {snr}: {l:?}");
     }
 }
+
+/// The real EV1527 remote's windows (433.88 MHz, chip 313 us, 3200 chips/s): B210 at
+/// 51 200 and 61 440 Hz, HackRF at 62 500 Hz.
+const OOK_REMOTES: [&str; 5] = [
+    "ook-remote-433882k-1",
+    "ook-remote-433882k-2",
+    "ook-remote-b210-1",
+    "ook-remote-b210-2",
+    "ook-remote-hackrf-1",
+];
+/// The remote's chip rate: the reciprocal of its shortest on or off run.
+const OOK_REMOTE_BAUD: f64 = 3_200.0;
+/// How far a measured chip rate may stray from [`OOK_REMOTE_BAUD`], as a fraction.
+const OOK_REMOTE_BAUD_TOLERANCE: f64 = 0.02;
+
+/// A fixture window as a burst capture measures it (`measure_band` over the capture's
+/// band, its annotation's edges) and as `classify` labels it (`measure_selection` on
+/// the same band): the features and the layer-1 label.
+fn ook_remote(name: &str) -> (zeta_core::classify::FeatureRecord, Label) {
+    let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(format!("{name}.sigmf-meta"));
+    let (m, iq) = zeta_core::capture::read_cf32(&meta).expect("fixture");
+    let a = &m.annotations[0];
+    let edge = |k: &str| a[k].as_u64().expect("annotation edge");
+    let band = edge("core:freq_upper_edge") - edge("core:freq_lower_edge");
+    let rate = m.sample_rate_hz.0;
+    let f = zeta_dsp::measure::measure_band(&iq, rate, m.center_hz.0, band);
+    let (_, l) = zeta_dsp::measure::measure_selection(
+        &iq,
+        rate,
+        m.center_hz.0,
+        zeta_core::classify::Band {
+            offset_hz: 0,
+            bandwidth_hz: zeta_core::types::Hz(band),
+        },
+    )
+    .expect("a measurement");
+    eprintln!("{name}: {f:?} -> {} ({})", l.name, l.evidence);
+    (f, l)
+}
+
+/// Pulse-width OOK (a 0 is one chip on and three off, a 1 three on and one off) has its
+/// strongest keying lines at the bit rate (800 bit/s) and its harmonics; the chip rate
+/// is the run lengths' unit, and every window measures it.
+#[test]
+fn a_real_ook_remote_measures_its_chip_rate() {
+    for name in OOK_REMOTES {
+        let (f, _) = ook_remote(name);
+        let baud = f.symbol_rate_baud.map(|b| b.0 as f64);
+        assert!(
+            baud.is_some_and(
+                |b| (b - OOK_REMOTE_BAUD).abs() <= OOK_REMOTE_BAUD * OOK_REMOTE_BAUD_TOLERANCE
+            ),
+            "{name}: {f:?}"
+        );
+    }
+}
+
+/// The remote's envelope sits at two levels, its off level the noise floor: layer 1
+/// labels every window `ook`, not `fsk` or `fm`.
+#[test]
+fn a_real_ook_remote_labels_ook() {
+    for name in OOK_REMOTES {
+        let (_, l) = ook_remote(name);
+        assert_eq!(l.name, "ook", "{name}: {l:?}");
+    }
+}

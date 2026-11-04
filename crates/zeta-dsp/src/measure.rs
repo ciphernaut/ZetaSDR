@@ -27,7 +27,7 @@ pub use burst::{Bursts, burst_runs, on_time};
 use burst::{
     View, averaged_half_spectrum, bandpass, cyclo_symbol_rate, gated_view, strongest_line,
 };
-use order::{envelope_runs, fsk_clusters, psk_order, two_levels};
+use order::{envelope_runs, fsk_clusters, ook_unit_rate, psk_order, two_levels};
 
 use crate::channel::extract_offset;
 use crate::fft::{Window, power_spectrum_db};
@@ -376,9 +376,10 @@ pub fn measure_band(
 /// occupied band are taken over the on-time ([`on_time`]), the symbol-rate
 /// searches over each run as received, and `burst` is set; otherwise the
 /// whole window is measured and `burst` compares 10 ms chunk powers.
-/// `symbol_rate_baud` is the cyclostationary line ([`cyclo_symbol_rate`]) when
-/// the envelope moves, else, or when it finds none, the keying line of
-/// [`keying_signal`].
+/// `symbol_rate_baud` is, when the envelope moves, on-off keying's run-length
+/// unit ([`ook_unit_rate`]: a two-level envelope whose runs are whole chips)
+/// or else the cyclostationary line ([`cyclo_symbol_rate`]); otherwise, or when
+/// neither finds one, the keying line of [`keying_signal`].
 ///
 /// Order: `order` and `tone_spacing_hz` are the FSK tones of the
 /// instantaneous-frequency clusters over the runs
@@ -513,11 +514,14 @@ pub(crate) fn measure_band_noted(
 }
 
 /// The symbol rate of the view's rate samples ([`View::runs`]: each run as
-/// received when gated, else the whole window) and the line it came from:
+/// received when gated, else the whole window) and the line it came from, when
+/// the envelope moves (`cv` at least `FM_MAX_CV`): the on-off keying's chip
+/// rate from its run lengths ([`ook_unit_rate`], `"runs"`) when the envelope
+/// sits at two levels and its runs are whole multiples of one unit, else
 /// [`cyclo_symbol_rate`] of the occupied band `offset_hz ± bandwidth_hz / 2`
 /// (from the block centre, band-passed per run), up to its width
-/// (`"cyclo"`), when the envelope moves (`cv` at least `FM_MAX_CV`), else, or
-/// when it finds none, the [`symbol_rate`] keying line (`"keying"`).
+/// (`"cyclo"`); else, or when neither finds one, the [`symbol_rate`] keying
+/// line (`"keying"`).
 fn rate_of(
     v: &View,
     rate_hz: u64,
@@ -532,17 +536,20 @@ fn rate_of(
             .collect();
         cyclo_symbol_rate(&runs, rate_hz, bw)
     };
-    (v.cv >= FM_MAX_CV)
-        .then(cyclo)
+    let moves = v.cv >= FM_MAX_CV;
+    moves
+        .then(|| ook_unit_rate(&v.runs, rate_hz, (offset_hz, bandwidth_hz)))
         .flatten()
-        .map(|r| (r, "cyclo"))
+        .map(|r| (r, "runs"))
+        .or_else(|| moves.then(cyclo).flatten().map(|r| (r, "cyclo")))
         .or_else(|| symbol_rate(&v.runs, rate_hz, v.cv, bandwidth_hz).map(|r| (r, "keying")))
 }
 
 /// How layer 1 measured a record's symbol rate, for its label's evidence.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RateNote {
-    /// The line the rate came from (`"cyclo"` or `"keying"`); `None` without a rate.
+    /// The line the rate came from (`"runs"`, `"cyclo"` or `"keying"`); `None` without
+    /// a rate.
     pub line: Option<&'static str>,
     /// Envelope CV of the samples the rate was searched over.
     pub cv: f32,
