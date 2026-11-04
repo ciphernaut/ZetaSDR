@@ -92,7 +92,7 @@ CL_X, CL_W = 20, 300
 clients = [
     (130, 88, "Browser: the page", "http://NODE:PORT/ui/ with the secret: waterfall, jobs, map, the agent pane (POST /ask), the mic (POST /stt).", "EITHER"),
     (232, 112, "zeta CLI", "One-shot: opens the node in-process on its --state-dir (only when no serve owns it). --node URL (ZETA_NODE, ZETA_SECRET): the op runs on that node. Local-only verbs: ops tail, transcripts tail, modes check, soapy find.", "EITHER"),
-    (358, 88, "zeta-mcp", "stdio MCP server for Claude Code or any MCP client, one tool per op; runs beside that client and calls the node with --node URL.", "EITHER"),
+    (358, 88, "zeta-mcp", "stdio MCP server for any MCP-capable agent or client, one tool per op; runs beside that client and calls the node with --node URL.", "EITHER"),
     (460, 100, "zeta ask \"REQUEST\"", "A tool-calling loop: talks to the LLM itself (--llm-url, --llm-model) and applies ops in-process or on --node URL. Stops and replace refused unless --allow-*.", "EITHER"),
     (574, 70, "Scripts, Python SDK", "examples/python (cb_watch.py, gain.py) over HTTP; sdk/python for plugins (run as children, below).", "EITHER"),
 ]
@@ -192,7 +192,7 @@ def panel(x0, x1, title, sub):
 
 L0, L1, R0, R1 = 20, 700, 740, 1420
 panel(L0, L1, "A. A configured LLM: zeta runs the loop", "POST /ask (the page's agent pane) or zeta ask; the model only proposes calls")
-panel(R0, R1, "B. An external coding agent (Claude Code): the agent runs the loop", "four doors: MCP, the CLI, raw HTTP, or handing the request to the node's own agent")
+panel(R0, R1, "B. An external coding agent: the agent runs the loop", "four doors: MCP, the CLI, raw HTTP, or handing the request to the node's own agent")
 
 # A
 box(40, 110, 640, 54, "Operator", "types a request in the page's agent pane, or runs zeta ask \"REQUEST\" (stdin works: a voice transcript piped in).")
@@ -209,10 +209,10 @@ line([(215, 346), (215, 376)])
 
 # B
 box(760, 110, 640, 54, "Operator", "asks in a terminal or IDE session; approves the agent's tool calls by its own permission settings.")
-box(760, 196, 350, 150, "Claude Code (or any MCP-capable agent)",
-    "Its own loop on its own host (the node's host or another machine). Reads AGENTS.md as the MCP server's instructions or the skills/zetasdr skill. Gets full results, chains as many calls as it likes, and can also edit code, build, deploy and read logs: things no node op can do.", "EITHER", size=10.2)
+box(760, 196, 350, 150, "A coding agent (any MCP or shell-capable one)",
+    "Its own loop on its own host (the node's host or another machine). Reads AGENTS.md as the MCP server's instructions, from GET /agents-md, or as a skill (skills/zetasdr). Gets full results, chains as many calls as it likes, and can also edit code, build, deploy and read logs: things no node op can do.", "EITHER", size=10.2)
 box(1200, 196, 200, 150, "Its model",
-    "Anthropic's API, called by the agent. The node never talks to it and never sees its prompts.", "REMOTE", size=10.2)
+    "Whatever the agent is set up with: a hosted API or a local model. The node never talks to it and never sees its prompts.", "EITHER", size=10.2)
 line([(1110, 236), (1200, 236)]); text(1155, 229, "prompt", size=9.5, anchor="middle")
 line([(1200, 300), (1110, 300)]); text(1155, 315, "tool calls", size=9.5, anchor="middle")
 line([(935, 164), (935, 196)])
@@ -231,7 +231,7 @@ line([(1100, 346), (1100, 361), (1326, 361), (1326, DY)]); line([(1162, 361), (1
 # shared node
 box(20, 556, 1400, 92, "zeta serve: Node::apply(op), the same 36 ops for every route",
     "A arrives in-process: POST /ask logs ops as transport agent; zeta ask logs local (one-shot) or http (with --node), not agent. "
-    "B's doors 1-3 arrive over HTTP /op and log http (ui when the caller sends X-Zeta-Client: ui, a label it chooses, not a credential): the log cannot tell Claude Code from curl, nor which request caused a call. Door 4 runs path A inside the node, gate included. "
+    "B's doors 1-3 arrive over HTTP /op and log http (ui when the caller sends X-Zeta-Client: ui, a label it chooses, not a credential): the log cannot tell a coding agent from curl, nor which request caused a call. Door 4 runs path A inside the node, gate included. "
     "Over HTTP the bearer is the whole of the authority: no gate refuses a job_stop or replace sent through doors 1-3. The guide's rules (stop only what the request names or you started) bind B only as instructions it follows, and the operator's approval of its tool calls.", "LOCAL", size=10.5, strong=True)
 line([(215, 472), (215, 556)]); text(223, 520, "in-process executor (HTTP with zeta ask --node)", size=10)
 for x, *_, lab in doors:
@@ -247,7 +247,7 @@ agents_svg = "\n".join(asvg)
 
 AGENT_TABLE = [
     ("Who runs the tool loop", "zeta-agent, in the node (<code>/ask</code>) or the <code>zeta ask</code> process", "the coding agent, on its own host"),
-    ("Which model", "the one at <code>--llm-url</code> (any OpenAI-compatible server)", "the agent's own (Anthropic's API for Claude Code)"),
+    ("Which model", "the one at <code>--llm-url</code> (any OpenAI-compatible server)", "the agent's own: a hosted API or a local model"),
     ("What the model sees", "the tool list, the guide and trimmed results; never the node or the secret", "full results, the repo, the shell: whatever the agent's permissions allow"),
     ("How calls reach the node", "in-process executor (HTTP when <code>zeta ask --node</code>)", "<code>zeta-mcp</code>, the CLI or raw HTTP/ws: <code>POST /op</code> with the bearer; or <code>POST /ask</code>, which hands the request to path A"),
     ("What can refuse a stop or replace", "the allowance gate in code: <code>not_allowed</code> unless the run allows it", "through <code>/op</code>, nothing in the node: the guide's rules and the operator's approval of tool calls; through <code>/ask</code>, the gate"),
@@ -262,7 +262,7 @@ agent_rows = "\n".join(f"<tr><td>{a}</td><td>{b}</td><td>{c}</td></tr>" for a, b
 TABLE = [
     ("Browser page", "HTTP + ws to the node, bearer secret", "open <code>/ui/</code> on the node's <code>--listen</code> address", "EITHER"),
     ("zeta CLI", "in-process, or HTTP to <code>--node URL</code>", "one-shot on the node's <code>--state-dir</code>, else <code>ZETA_NODE</code> + <code>ZETA_SECRET</code>; <code>ops tail</code>, <code>transcripts tail</code>, <code>modes check</code> and <code>soapy find</code> are local only", "EITHER"),
-    ("zeta-mcp", "stdio to the MCP client, HTTP to the node", "<code>claude mcp add zeta -e ZETA_SECRET=… -- zeta-mcp --node URL</code>", "EITHER"),
+    ("zeta-mcp", "stdio to the MCP client, HTTP to the node", "register the command <code>zeta-mcp --node URL</code>, with <code>ZETA_SECRET</code> in its environment, in the agent's MCP configuration", "EITHER"),
     ("zeta ask", "HTTP to the LLM; in-process or HTTP to the node", "<code>--llm-url</code>, <code>--llm-model</code>; <code>--node URL</code> to drive a served node", "EITHER"),
     ("Agent in the node (<code>POST /ask</code>)", "the node calls the LLM over HTTP", "<code>zeta serve --listen … --llm-url URL --llm-model NAME</code>", "EITHER"),
     ("LLM server", "OpenAI-compatible chat API", "a URL: localhost or another host", "EITHER"),
@@ -323,10 +323,10 @@ ul {{ max-width: 1000px; }}
 <li><b>Either</b>: it is reached by URL, so localhost and another host work the same way. All the clients, the LLM and the ACMA register are in this group.</li>
 </ul>
 <p>Two rules cover most cases. A USB radio on another machine is attached by running a node on that machine and adding it here with <code>--source-node</code>. Speech that needs a GPU elsewhere goes through <code>--stt-node</code> to the node that has the GPU. Every flag that wires something in (<code>--source-*</code>, <code>--plugin</code>, <code>--knowledge-acma</code>, <code>--stt-*</code>, <code>--llm-*</code>, <code>--modes-dir</code>, <code>--themes-dir</code>) belongs to the serving node and must be repeated on every start. A client using <code>--node</code> passes none of them.</p>
-<p>There are two MCP directions. <code>zeta-mcp</code> makes the node an MCP <em>server</em> for Claude Code and similar clients. With <code>--knowledge-acma</code>, the node is an MCP <em>client</em> of the register. There are also two agent paths. <code>zeta ask</code> runs the tool loop wherever it is started. <code>POST /ask</code> (the page's agent pane) runs it inside the node, so the node's own <code>--llm-url</code> must reach the LLM.</p>
+<p>There are two MCP directions. <code>zeta-mcp</code> makes the node an MCP <em>server</em> for any MCP-capable coding agent or client. With <code>--knowledge-acma</code>, the node is an MCP <em>client</em> of the register. There are also two agent paths. <code>zeta ask</code> runs the tool loop wherever it is started. <code>POST /ask</code> (the page's agent pane) runs it inside the node, so the node's own <code>--llm-url</code> must reach the LLM.</p>
 
 <h2>How a model drives the node: who runs the loop, and the doors in</h2>
-<p>A configured LLM never touches the node. It answers with tool calls, and zeta's own loop executes each one behind a gate that code enforces. An external coding agent such as Claude Code is a client with the secret. It runs its own loop, calls the node over HTTP the way any script does, and is held only by the guide's rules and the operator's approval of its tool calls.</p>
+<p>A configured LLM never touches the node. It answers with tool calls, and zeta's own loop executes each one behind a gate that code enforces. An external coding agent is a client with the secret. It runs its own loop, calls the node over HTTP the way any script does, and is held only by the guide's rules and the operator's approval of its tool calls.</p>
 <figure>
 {agents_svg.replace('style="color:#1b1f24"', '')}
 </figure>

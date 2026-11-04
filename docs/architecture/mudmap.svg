@@ -45,9 +45,9 @@
 <rect x="261.4" y="364" width="51.599999999999994" height="15" rx="7.5" fill="#7c3aed"/>
 <text x="287.2" y="375" font-size="9" font-weight="700" letter-spacing="0.06em" text-anchor="middle" fill="#ffffff">EITHER</text>
 <text x="29" y="393" font-size="10.5">
-<tspan x="29" dy="0">stdio MCP server for Claude Code or any MCP client,</tspan>
-<tspan x="29" dy="13.0">one tool per op; runs beside that client and calls</tspan>
-<tspan x="29" dy="13.0">the node with --node URL.</tspan>
+<tspan x="29" dy="0">stdio MCP server for any MCP-capable agent or</tspan>
+<tspan x="29" dy="13.0">client, one tool per op; runs beside that client</tspan>
+<tspan x="29" dy="13.0">and calls the node with --node URL.</tspan>
 </text>
 <rect x="20" y="460" width="300" height="100" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
 <text x="29" y="478" font-size="12.5" font-weight="700">zeta ask "REQUEST"</text>
