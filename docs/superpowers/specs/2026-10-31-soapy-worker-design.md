@@ -95,7 +95,7 @@ Plan 20 therefore does two things, and the second is the point of the first:
   used by tests) live in the workspace; the Soapy worker's `main` lives in `crates/zeta` behind
   `cfg(soapy)` like `open_soapy` does today.
 - One deployable binary. The worker is the `zeta` executable itself, invoked as `zeta soapy-worker`
-  (the node spawns `/proc/self/exe` on Linux, `std::env::current_exe()` elsewhere), so the field host unit changes nothing but the binary.
+  (the node spawns `/proc/self/exe` on Linux, `std::env::current_exe()` elsewhere), so the field host's unit changes nothing but the binary.
 - `Port` methods `fault`, `current`, `gain`, `stats`, `capabilities` are synchronous. The parent must
   answer them from state it already holds; no round trip to the worker inside them.
 - Capabilities are taken once at attach (`Port::capabilities` returns a reference). The worker's

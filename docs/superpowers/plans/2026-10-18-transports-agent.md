@@ -505,7 +505,7 @@ const MD: &str = include_str!("../../../AGENTS.md");
 // tests/live.rs
 #[tokio::test]
 #[ignore = "needs field-host:8080 serving gemma-4-12b"]
-async fn field_host_gemma_tunes_hackrf0() {
+async fn live_llm_tunes_a_source() {
     /* url = env ZETA_LIVE_LLM_URL or "http://field-host:8080", model "gemma-4-12b";
        tools = op_tools(&zeta_core::ops::schema(), AGENTS_MD); system = system_prompt(AGENTS_MD);
        RecordingExecutor answering source_list with one source "hackrf0" (tune 1 MHz..6 GHz, max bandwidth 20 MHz) and source_ensure with a Tuning;

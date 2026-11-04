@@ -29,9 +29,9 @@ async fn station_set_persists_and_get_reads_it_after_reopen() {
     let node = open(dir.path()).await;
     let r = node
         .apply(Op::StationSet {
-            lat: -27.38,
-            lon: 153.12,
-            alt_m: 40.0,
+            lat: -27.3842,
+            lon: 153.1175,
+            alt_m: 4.0,
             region: "AU".into(),
             antennas: None,
         })
@@ -44,7 +44,7 @@ async fn station_set_persists_and_get_reads_it_after_reopen() {
     assert_eq!(s.antennas[0].kind, AntennaKind::Dipole);
     drop(node);
     let node = open(dir.path()).await;
-    assert_eq!(node.station().unwrap().lat, -27.38);
+    assert_eq!(node.station().unwrap().lat, -27.3842);
     assert!(matches!(
         node.apply(Op::StationClear {}).await.unwrap(),
         OpResult::Station(None)

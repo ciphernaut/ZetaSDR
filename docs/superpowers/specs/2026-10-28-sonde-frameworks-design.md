@@ -7,7 +7,7 @@ here is written in those terms.
 
 ## 1. Intent and why
 
-The operator lives near Example Suburb, Queensland, with a HackRF at the desk, roof discones, and on the field host
+The operator lives in south-east Queensland, with a HackRF at the desk, roof discones, and on the field host
 a B210 and a LimeSDR side by side. The signal they most want decoded is the Bureau of Meteorology
 radiosonde: Brisbane Airport launches twice a day (author's understanding: the synoptic 00Z and 12Z
 releases, about 10:00 and 22:00 local, a flight of two to three hours; Rockhampton's on a good day),

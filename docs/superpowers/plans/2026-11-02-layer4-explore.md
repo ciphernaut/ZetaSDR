@@ -297,13 +297,13 @@ git commit -m "Measure: FSK order and tone spacing, PSK order by the m-th power 
 async fn station_set_persists_and_get_reads_it_after_reopen() {
     let dir = tempdir();
     let node = open(&dir).await;
-    let r = apply(&node, Op::StationSet { lat: -27.38, lon: 153.12, alt_m: 40.0, region: "AU".into(), antennas: None }).await.unwrap();
+    let r = apply(&node, Op::StationSet { lat: -27.3842, lon: 153.1175, alt_m: 4.0, region: "AU".into(), antennas: None }).await.unwrap();
     let OpResult::Station(Some(s)) = r else { panic!("{r:?}") };
     assert_eq!(s.antennas.len(), 2);
     assert_eq!(s.antennas[0].kind, AntennaKind::Dipole);
     drop(node);
     let node = open(&dir).await;
-    assert_eq!(node.station().unwrap().lat, -27.38);
+    assert_eq!(node.station().unwrap().lat, -27.3842);
     assert!(matches!(apply(&node, Op::StationClear).await.unwrap(), OpResult::Station(None)));
     assert!(matches!(apply(&node, Op::StationGet).await.unwrap(), OpResult::Station(None)));
 }
@@ -561,7 +561,7 @@ git commit -m "Ext: an MCP streamable-HTTP client (initialize, session header, t
 ```rust
 #[tokio::test]
 async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
-    // station at Example Suburb (-27.38, 153.12), default antennas
+    // station at the demo station (-27.3842, 153.1175), default antennas
     let a = provider.allocations("AU", Hz(404_025_000), Hz(16_000)).await;
     let plan: Vec<_> = a.iter().filter(|x| x.kind.as_deref() == Some("plan")).collect();
     assert!(plan.iter().any(|x| x.service == "FIXED (primary)"));

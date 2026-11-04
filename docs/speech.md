@@ -85,7 +85,7 @@ all of this as the user that runs `zeta serve`, on the host that serves the node
    The node prints `zeta: speech backend: socket:/run/user/UID/voiced.sock` on start. The daemon
    answers `languages` with `error:unknown command`, so the node takes it to speak English only.
 
-**the field host.** There the node runs as the `sdr` user, so the clone is
+**The field host.** There the node runs as the `sdr` user, so the clone is
 `~sdr/zetasdr/local-voice` (that is, `~/zetasdr/local-voice` when logged in as `sdr`), the unit
 is `~sdr/.config/systemd/user/voiced.service` with
 `ExecStart=%h/zetasdr/local-voice/.venv/bin/python %h/zetasdr/local-voice/bin/voiced`, and

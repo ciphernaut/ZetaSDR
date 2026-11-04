@@ -291,9 +291,9 @@ async fn an_unreachable_api_counts_a_failure() {
 
 fn station() -> Station {
     Station {
-        lat: -27.38,
-        lon: 153.12,
-        alt_m: 40.0,
+        lat: -27.3842,
+        lon: 153.1175,
+        alt_m: 4.0,
         region: "AU".into(),
         antennas: vec![],
     }

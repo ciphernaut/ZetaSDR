@@ -618,7 +618,7 @@ the operator's.
 
 ## 9. Acceptance on the field host (the operator's, after 19.3)
 
-1. `station set` with the field host antenna's position; `--knowledge-acma
+1. `station set` with the field host's antenna's position; `--knowledge-acma
    http://acma-host:3110` on the node with the fork up. `knowledge lookup` at
    404.025 MHz names the 403-406 MHz plan services and the Example Suburb and Example Suburb assignments with
    distance, power and `16K0F1D` decoded.

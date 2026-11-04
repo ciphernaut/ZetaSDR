@@ -492,7 +492,7 @@ On the `sdr` node with the B210 pinned at 476 918 750 / 1 000 000 Hz:
 - The page's `/ask` e2e scenarios get a request-keyed `FakeLlm` behind a third harness server rather
   than being cut to the ws level: the not-allowed note, its button and the turn log are page
   behaviour and should be seen on the page. If the harness work turns out larger than a task, the
-  builder may land the ws-level checks first and leave the page scenarios to the field host
+  builder may land the ws-level checks first and leave the page scenarios to the field host's
   acceptance, saying so in the plan.
 - A per-channel failure after the lease decision (step 6) does not roll the others back: the clash
   the operator cares about is ruled out in step 5; a channel's own expansion error is that

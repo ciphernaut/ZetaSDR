@@ -4480,7 +4480,7 @@ def scenario_home_gives_distance_and_bearing(page, url, secret):
     try:
         pos = page.locator(f'#jobs .job[data-id="{job}"] .pos')
         expect(pos).to_have_text(re.compile(r"^\d+(\.\d+)? km, \d+°$"), timeout=10_000)
-        # The last fix, -27.41,153.11 from -27.50,153.00: 14.8 km at 48°.
+        # The last fix, -27.41,153.11 from -27.50,153.00: 14.8 km at 47°.
         expect(pos).to_have_text("14.8 km, 47°")
         run_cmd(page, "view set home none")
         expect(pos).to_have_count(0)

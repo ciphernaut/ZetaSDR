@@ -66,7 +66,7 @@ Six of the seven plans shipped; plan 19 was not started then and opens the next 
 | 19.1 layer 4 explore | 1b57cf7, 2026-11-03 (fast-forward; Plan 19.1 status) | not yet: acceptance deferred to after 19.3 | the live acceptance; the B210 noise recording; 19.3 not started |
 | 19.2 layer 4 bits | fast-forward to 0b90359, 2026-11-04 (Plan 19.2 status); the OOK run-length fit after it (49ceb21..1ef6c69) | not yet: spec 9 item 3 after 19.3; the first real OOK remote (433.882 MHz) not recovered end to end | the test_host check (`UAT.md` Plan 19.2); 19.3 not started |
 | 26 themes as folders | 576002a, 2026-11-04 (Plan 26 status) | deployed as plan26-zeta 2026-11-04; UAT open | per-footprint layouts, a node-level default theme (`TODO.md`) |
-| 20 Soapy worker | 3acbad4, 2026-10-31 | items 1-2 on the B210 (SIGSEGV heal); the HackRF's cable pull and SIGSEGV on the two-radio field host node 2026-11-01 | the B210's own cable pull |
+| 20 Soapy worker | 3acbad4, 2026-10-31 | items 1-2 on the B210 (SIGSEGV heal); the HackRF's cable pull and SIGSEGV on the field host's two-radio node 2026-11-01 | the B210's own cable pull |
 
 Also shipped in the sprint's last days: the stream socket pool 16 → 64 (9d736ab), the
 architecture page as of 771ea93, and the TODO gists this week left behind (serialise restarts of
@@ -105,10 +105,10 @@ Live acceptance (desktop HackRF, `--source-soapy hackrf=driver=hackrf,gain=45`):
 
 - [x] (1) The 440-488 MHz survey at 45 dB with a 2 s dwell look shows no hump at any step centre, no 100 kHz grid of peaks moving with the parity, and no band left unpainted after two sweeps (448, 456, 464, 472 and 480 MHz in particular, where the half-step grid left holes). HackRF on the field host, 2026-11-01 (below): no hump and no unpainted band; a grid of peaks does move with the parity, but it is the HackRF's own spurs at ±4 MHz, not the mask (a gist in `TODO.md`).
 - [x] (2) With `notch_hz: 0` for one run, the hump's width at the floor at 2, 8 and 16 Msps read from the rows, `SCAN_NOTCH_HZ` set to the widest plus 20 %, the same for the edge roll-off and `SCAN_EDGE_MASK` (which must stay under 0.25 for the quarter-step grid), figures recorded here and in the TODO gist; the hump's width at the UHF CB pin's 1 Msps measured and recorded too. Done on the HackRF 2026-11-01 (below); the rule's literal result (14 kHz, 0.0) was widened to 50 kHz and 0.02 so the B210's figures and the HackRF's edge spur are covered too. `MEASURE_DC_MASK_HZ` is not tuned from it: a 12.5 kHz box on ch20 (18 750 Hz from the pin centre) holds no DC and is measured unmasked, with the spike's skirt in it; a fit box wide enough to hold the DC has ch20 masked at any half-width of 13.75 kHz or more. Record what a fit on ch20 under the pin reads; the lease-offset follow-on is the fix. Still pending on the HackRF (the constants are the HackRF's); the B210 figures below are a second data point, not the setting.
-- [x] (3) `zeta job context` on the scan shows `scan.alternate` and `scan.mask`, `zeta stream tail` shows rows with `masked`. Proved on the field host B210 (below).
+- [x] (3) `zeta job context` on the scan shows `scan.alternate` and `scan.mask`, `zeta stream tail` shows rows with `masked`. Proved on the field host's B210 (below).
 - [ ] (4) The `detect` change is covered by its unit test only (no watch inside a scan step is started).
 
-### Live run on the field host B210, 2026-11-01
+### Live run on the field host's B210, 2026-11-01
 
 USRP B210 on the field host (`sdr` node, gain 65 dB, `ppm=2.7`), driven over `--node` and the page; mechanism only, the HackRF sets the constants.
 
@@ -116,7 +116,7 @@ USRP B210 on the field host (`sdr` node, gain 65 dB, `ppm=2.7`), driven over `--
 - P15-1 PASS (scan-mode path). With the manual scan on the shown source the page follows it in scan mode (`waterfallMode` `scan`), so the coarse layer is not engaged (`coarsePainted`/`coarseMasked` stay 0); the masked bins go through the same `fillColumn`. After two-plus sweeps (`painted` 54) the pixel-row profile shows no hump at any step centre (444/448/460/464/476/480 MHz read 70-73 against a median of 72) and no grid that moves between sweeps; the only unpainted band is the 492 MHz step's notch (outside the 440-488 MHz span, only the odd grid reaches it), drawn as background, not as a carrier. The bright lines at 464.458 and 480.47 MHz are real signals (seen in both grids at 10-16 dB). Screenshots `p15-coarse.png`, `p15-coarse-2.png`.
 - P15-2 B210 data point. `graph put` with `notch_hz: 0`, `edge_mask: 0.0` gave `scan.mask {notch_hz: 0, edge_mask: 0.0}` and rows without `masked`. DC hump, mean of 60-120 rows relative to the row median: 20.48 Msps (scan step) peak 8.3 dB, over 6 dB 5 kHz (1 bin), over 3 dB 15 kHz, a 1-2 dB pedestal about ±100 kHz; 10.24 Msps (an 8 MHz `spectrum`) peak 6.1 dB, 5 kHz over 6 dB, 15 kHz over 3 dB; 2.048 Msps (2 MHz) peak 7.3 dB, 6 kHz over 6 dB, 12 kHz over 3 dB; 1.024 Msps (the UHF CB pin) peak 7.3 dB, 5 kHz over 6 dB, 9 kHz over 3 dB. Edge roll-off (bins more than 3 dB under mid-row, low/high end): 20.48 Msps 190/245 kHz (0.9/1.2 %), 10.24 Msps 100/140 kHz (1.0/1.4 %), 2.048 Msps 66/50 kHz (3.2/2.4 %), 1.024 Msps 30/28 kHz (2.9/2.7 %). The B210's hump is far narrower than the 300 kHz notch and the 10 % edge mask; the HackRF's constants stay as they are until its run.
 
-### Live run on the field host HackRF, 2026-11-01
+### Live run on the field host's HackRF, 2026-11-01
 
 HackRF One r9 (`66a062dc`, firmware 2.3.2) moved from the desktop to the field host and attached to the `sdr` node beside the B210 (`--source-soapy hackrf=driver=hackrf,gain=45`; the node's unit now carries both), an indoor low-gain log periodic on it (the floor at 100.5 MHz moved 2.5 dB for 25 dB of gain and no broadcast station showed: the antenna hears nothing, which does not matter to the receiver's own artefacts). Driven over `--node` from the `claude` account; rows read with `stream tail` and `scratch/live/hump.py`, raw rows and the notes in `scratch/live/` (local).
 
@@ -167,7 +167,7 @@ The sonde watch and the RS41 decoder parked (the morning sonde was down), the B2
 - [ ] With four demods running, each tag reads its kind, id, squelch dot and channel; hovering a row lights its tag. B210: hover linking both ways proved; the oldest demod's tag had no squelch dot with a `transcribe` attached (the page watches at most 4 jobs, the attached `transcribe` first), see below.
 - [x] `zeta job retune` from the CLI against the serving node moves a job the page shows. Proved on the B210.
 
-### Live run on the field host B210, 2026-11-01
+### Live run on the field host's B210, 2026-11-01
 
 USRP B210 on the field host (`sdr` node, gain 65 dB, `ppm=2.7`), UHF CB pinned at 476 918 750 / 1 000 000 Hz (lease 1 024 000 Hz), driven over `--node` and a headless page. The node's 16 stream sockets were nearly all held by another open page (12-16 in use), so the test page subscribed to its spectrum stream only and the ops were read through `stream_tail` of the node's `ops` stream; with four demods running the other page took all 16 and the test page could not paint (the tag screenshot has an empty waterfall).
 
@@ -564,7 +564,7 @@ cause is unknown and server-side. The live result is therefore unconfirmed and n
 Deferred to later plans: browser websocket authentication and the operation log stream (plan 6),
 binary audio and IQ over the websocket (plans 5 and 6), federation authentication (plan 5).
 On 2026-10-19 in the evening the field host's chat completions answered again: the live test
-`field_host_gemma_tunes_hackrf0` passed (1.2 s) and `zeta ask` against the B210 node answered correctly.
+`live_llm_tunes_a_source` passed (1.2 s) and `zeta ask` against the B210 node answered correctly.
 
 ## Plan 4 status
 
@@ -612,7 +612,7 @@ subscription with credits in `zeta-client`, another node as a push source (`zeta
 a Pi 5 cross-build, qemu smoke test and systemd deployment (`deploy/pi/`). Discovery is deferred:
 v1 nodes talk by URL. The workspace gates passed on 2026-10-19: fmt, clippy with `--all-targets
 --all-features -D warnings`, `cargo test --workspace --all-features` 456 passed, 0 failed, 2
-ignored (the live Kiwi and the field host model tests), `no_privileged_deps`, `zeta agents-md
+ignored (the live Kiwi and the field host's model tests), `no_privileged_deps`, `zeta agents-md
 --check` and `--skill --check`, and `deploy/pi/smoke.sh` (the aarch64 release binary under
 qemu-aarch64). By hand on this box, node A served the tone fixture on 127.0.0.1:7979 and node B
 federated it with `--source-node a=tone@http://127.0.0.1:7979` under `serve --listen
@@ -673,7 +673,7 @@ six-entry context menu on a drag, audio playback of `fm_demod` jobs over the bin
 editable graph view, the microphone, and a narrow footprint below 700 px with the side pane in a
 drawer and answers as ribbons. The workspace gates passed on 2026-10-19: fmt, clippy with
 `--all-targets --all-features -D warnings`, `cargo test --workspace --all-features` 500 passed, 0
-failed, 2 ignored (the live Kiwi and the field host model tests), `no_privileged_deps`, `zeta agents-md
+failed, 2 ignored (the live Kiwi and the field host's model tests), `no_privileged_deps`, `zeta agents-md
 --check` and `--skill --check`, `deploy/pi/smoke.sh` (PASS, on the aarch64 binary built for plan 5;
 it was not rebuilt with the UI), and `cargo test -p zeta --test ui`: all 23 Playwright scenarios
 passed in headless Chromium (62 s, no skip line). The first test run filled the disk (22 GB of
@@ -726,7 +726,7 @@ ship in the production bundle.
 
 Pending: the phone check. Start the node on the LAN address,
 `ZETA_SECRET=… zeta --state-dir … --source-file tone=… --source-file aprs=… serve --listen
-<wired-ip>:7979` (wired; <wifi-ip> on WiFi), open `http://<wired-ip>:7979/ui/` on the phone,
+<host-ip>:7979` (wired; <host-ip> on WiFi), open `http://<host-ip>:7979/ui/` on the phone,
 paste the secret, and check the narrow renderer: waterfall full width, ☰ drawer, a drag opening the
 menu by touch, Decode › APRS and its ribbon. The mic will not work there over plain HTTP (browsers
 allow it only on a secure origin). Also pending: the microphone against a real `voiced`, the
@@ -752,7 +752,7 @@ centre; and in the UI, Decode entries for wideband FM, AM, USB and LSB, ▶ on a
 the top layer-2 name drawn beside the layer-1 label. `rustfft` and `num-complex` are built at
 `opt-level = 3` in debug builds. The workspace gates passed on 2026-10-19: fmt, clippy with
 `--all-targets --all-features -D warnings`, `cargo test --workspace --all-features` 547 passed, 0
-failed, 2 ignored (the live Kiwi and the field host model tests) over 80 test binaries,
+failed, 2 ignored (the live Kiwi and the field host's model tests) over 80 test binaries,
 `no_privileged_deps`, `zeta agents-md --check` and `--skill --check`, and `cargo test -p zeta
 --test ui`: all 30 Playwright scenarios passed in headless Chromium (125 s, no skip line; the two
 classify scenarios take 19 s and 28 s of it). The `opt-level` override did not move the e2e time
@@ -801,7 +801,7 @@ stitched scan waterfall with "Scan this span". `wfm_demod` now decimates before 
 
 The workspace gates passed on 2026-10-20 at 14f1df7: fmt; clippy with `--all-targets
 --all-features -D warnings`; `cargo test --workspace --all-features` 588 passed, 0 failed, 3 ignored
-(live Kiwi, live the field host model, and the release-only PFB timing test) over 86 test binaries;
+(live Kiwi, the field host's live model, and the release-only PFB timing test) over 86 test binaries;
 `zeta agents-md --check` and `--skill --check`; `cargo test -p zeta --test ui`: all 35 Playwright
 scenarios passed in headless Chromium (144.6 s, no skip line). The release timing test
 (`cargo test -p zeta-dsp --release --test pfb pfb_runs -- --include-ignored`) pushed 2 s of 24 Msps

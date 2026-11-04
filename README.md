@@ -415,7 +415,7 @@ When nothing proves a signal, the answer is `unknown` with its measured features
 the tools to look further (field craft: "Exploring an unknown signal" and "Working layer 4").
 
 ```bash
-zeta station set --lat -27.38 --lon 153.12 --alt-m 4          # once: position, region, antennas
+zeta station set --lat -27.38 --lon 153.12 --alt-m 4           # once: position, region, antennas
 zeta --knowledge-acma http://HOST:3110 knowledge lookup --region AU --center-hz 404025000 --bandwidth-hz 25000
 zeta job start --kind capture --source S --center-hz C --bandwidth-hz B   # write the signal's bursts as SigMF
 zeta capture list                                               # the burst store, newest first

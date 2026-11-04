@@ -2,3 +2,20 @@
 # One entry per line: PATH-GLOB:EXTENDED-REGEX. A hit on a line of a file whose
 # path matches PATH-GLOB is dropped when the regex matches the line.
 # Entries are added with the demo station and synthesised test values (Task 3).
+
+# The demo station, Brisbane Airport (public; plan 25 ruling 7), to four decimals exactly.
+*:-27\.3842, ?153\.1175([^0-9]|$)
+# Synthesised test values: a sonde fix in the rs41 CLI test and its plan.
+*:S1234567 -27\.4000,153\.1000
+# Public data: iNTERCEPT catalogue descriptions, the synthesised register sites of the
+# ACMA fixture, the dump1090 SBS sample position.
+crates/zeta-dsp/data/signals.json:"description":
+crates/zeta-ext/*:-27\.95[05], 153\.25
+crates/zeta-ext/tests/adsb.rs:,52\.25720,3\.91937,
+# Not coordinates: B210 spur frequencies in MHz, sample rates in Msps.
+*:40[23]\.[0-9]{4}, 40[23]\.[0-9]{4}
+docs/superpowers/plans/2026-10-18-zetasdr-plan-series.md:1\.0114 Msps
+# The gate's own test cases, named in plan 25.
+docs/superpowers/plans/2026-11-03-public-release.md:coordinates_fail_unless_allowed
+# Generic example hosts: the KiwiSDR's own mDNS name, a Raspberry Pi, a placeholder.
+*:(kiwisdr|kiwi2?|pi|host)\.local:[0-9]

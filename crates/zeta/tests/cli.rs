@@ -3227,7 +3227,7 @@ fn station_set_get_clear_round_trip() {
         "--lon",
         "153.12",
         "--alt-m",
-        "40",
+        "4",
         "--antenna",
         "yagi=430000000-440000000,azimuth_deg=90",
     ])
