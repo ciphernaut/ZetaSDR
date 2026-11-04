@@ -334,3 +334,88 @@ async fn ask_refuses_job_stop_without_the_allowance() {
     }
     ts.stop().await;
 }
+
+#[tokio::test]
+async fn ask_page_tools_default_off_and_on_offers_view_set_with_the_ready_themes() {
+    let dir = tempfile::tempdir().unwrap();
+    let view_set =
+        |value: &str| tool_call_response(&[("view_set", json!({"key": "theme", "value": value}))]);
+    let fake = FakeLlm::start(
+        vec![
+            (200, view_set("plain")),
+            (200, text_response("cannot", "stop")),
+            (200, view_set("plain")),
+            (200, view_set("neon")),
+            (200, text_response("Switched to plain.", "stop")),
+        ],
+        vec![],
+    )
+    .await;
+    let ts = with_llm(
+        dir.path(),
+        llm(&fake, false, Duration::from_millis(10)),
+        Limits::default(),
+    )
+    .await;
+    let mut ops = ts.node.bus().subscribe(&ts.node.ops_stream()).unwrap();
+    let tool_names = |req: &Value| -> Vec<String> {
+        req["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    // Absent: accepted, and the tool is not offered.
+    let resp = ask(
+        &ts,
+        Some(BEARER),
+        &json!({"request": "switch to the plain theme"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let t: Value = resp.json().await.unwrap();
+    assert_eq!(t["calls"][0]["ok"], false);
+    assert_eq!(t["calls"][0]["result"]["field"], "tool");
+    assert!(!tool_names(&fake.requests.lock().unwrap()[0]).contains(&"view_set".to_string()));
+
+    // On: offered, answered for the page, checked against the ready themes.
+    let resp = ask(
+        &ts,
+        Some(BEARER),
+        &json!({"request": "switch to the plain theme", "page_tools": true}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let t: Value = resp.json().await.unwrap();
+    assert!(tool_names(&fake.requests.lock().unwrap()[2]).contains(&"view_set".to_string()));
+    assert_eq!(t["calls"][0]["tool"], "view_set");
+    assert_eq!(t["calls"][0]["ok"], true);
+    assert_eq!(t["calls"][0]["result"]["page"], true);
+    assert_eq!(t["calls"][1]["ok"], false);
+    let known = t["calls"][1]["result"]["known"].as_array().unwrap().clone();
+    assert!(
+        known.contains(&json!("console")) && known.contains(&json!("plain")),
+        "{known:?}"
+    );
+    assert_eq!(t["answer"], "Switched to plain.");
+
+    // An unknown field is still refused.
+    let resp = ask(
+        &ts,
+        Some(BEARER),
+        &json!({"request": "switch", "page_tools": true, "page": true}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Nothing reached the node's ops.
+    while let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_millis(300), ops.recv()).await {
+        let Payload::Event(p) = frame.payload else {
+            continue;
+        };
+        assert_ne!(p["op"]["op"], "view_set", "view_set reached the node");
+    }
+    ts.stop().await;
+}

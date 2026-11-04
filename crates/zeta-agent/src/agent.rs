@@ -2,6 +2,7 @@
 
 use crate::exec::{Executor, to_json, trim_result};
 use crate::llm::{AgentError, LlmClient, LlmConfig};
+use crate::page::{PageTools, VIEW_SET, view_set, view_set_tool};
 use crate::wire::{ChatMessage, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -132,6 +133,8 @@ pub struct AgentConfig {
     pub max_turns: u32,
     /// What the run may stop; nothing by default.
     pub allow: Allow,
+    /// The page-only tools (`view_set`), on only for a run the page asked for.
+    pub page: Option<PageTools>,
 }
 
 impl AgentConfig {
@@ -142,7 +145,16 @@ impl AgentConfig {
             tools,
             max_turns: 8,
             allow: Allow::default(),
+            page: None,
         }
+    }
+
+    /// Offer the page-only tools (`view_set`), `themes` being the node's ready theme ids.
+    pub fn enable_page_tools(&mut self, themes: Vec<String>) {
+        if self.page.is_none() {
+            self.tools.push(view_set_tool());
+        }
+        self.page = Some(PageTools { themes });
     }
 }
 
@@ -216,7 +228,9 @@ pub fn is_question(request: &str) -> bool {
 }
 
 /// The agent `zeta ask` and the node's `POST /ask` both run: tools from the
-/// node's `schema`, the system prompt from its guide `agents_md`.
+/// node's `schema`, the system prompt from its guide `agents_md`. `page`
+/// (the node's ready theme ids) adds the page-only tools, for a run the web
+/// page asked for; `zeta ask` passes `None`.
 pub fn build_agent<E: Executor>(
     llm: LlmConfig,
     exec: E,
@@ -224,11 +238,15 @@ pub fn build_agent<E: Executor>(
     agents_md: &str,
     max_turns: u32,
     allow: Allow,
+    page: Option<PageTools>,
 ) -> Result<Agent<E>, AgentError> {
     let llm = LlmClient::new(llm)?;
     let mut cfg = AgentConfig::new(system_prompt(agents_md), op_tools(schema, agents_md));
     cfg.max_turns = max_turns;
     cfg.allow = allow;
+    if let Some(page) = page {
+        cfg.enable_page_tools(page.themes);
+    }
     Ok(Agent::new(llm, exec, cfg))
 }
 
@@ -312,9 +330,29 @@ impl<E: Executor> Agent<E> {
     }
 
     /// Apply one tool call. Bad arguments and unknown tools are the model's
-    /// fault: they become the call's result and never reach the node.
+    /// fault: they become the call's result and never reach the node. A
+    /// page-only tool is answered here, never gated and never applied.
     async fn call(&self, call: &ToolCall, own: &mut OwnJobs) -> Result<CallRecord, AgentError> {
         let f = &call.function;
+        if let (Some(page), VIEW_SET) = (&self.cfg.page, f.name.as_str()) {
+            let (arguments, result) = match f.args() {
+                Err(message) => (
+                    f.arguments.clone(),
+                    Err(to_json(&OpError::Other { message })),
+                ),
+                Ok(args) => {
+                    let result = view_set(page, &args);
+                    (args, result)
+                }
+            };
+            let ok = result.is_ok();
+            return Ok(CallRecord {
+                tool: f.name.clone(),
+                arguments,
+                ok,
+                result: result.unwrap_or_else(|e| e),
+            });
+        }
         let (arguments, outcome) = match f.args() {
             Err(message) => (f.arguments.clone(), Err(OpError::Other { message })),
             Ok(args) => {

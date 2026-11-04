@@ -113,7 +113,7 @@ async fn drive<E: Executor>(
     allow: Allow,
     request: &str,
 ) -> ExitCode {
-    let agent = match build_agent(cfg, exec, schema, md, max_turns, allow) {
+    let agent = match build_agent(cfg, exec, schema, md, max_turns, allow, None) {
         Ok(a) => a,
         Err(e) => return fail(&e.to_string()),
     };

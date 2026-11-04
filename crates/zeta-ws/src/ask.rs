@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use zeta_agent::{Allow, LocalExecutor, build_agent};
+use zeta_agent::{Allow, LocalExecutor, PageTools, build_agent};
 use zeta_core::ops::OpError;
 
 use crate::http::{Shared, error_response, other};
@@ -23,6 +23,9 @@ struct AskRequest {
     max_turns: Option<u64>,
     /// What the run may stop; nothing when absent.
     allow: Option<Allow>,
+    /// Offer the page-only tools (`view_set`): the web page sets it, `zeta ask` never does.
+    #[serde(default)]
+    page_tools: bool,
 }
 
 pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
@@ -73,6 +76,16 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
         return error_response(StatusCode::CONFLICT, other("an agent run is in progress"));
     };
     let schema = st.node.schema();
+    let page = req.page_tools.then(|| PageTools {
+        themes: st
+            .node
+            .themes()
+            .all()
+            .iter()
+            .filter(|t| t.state == zeta_core::themes::ThemeState::Ready)
+            .map(|t| t.id.clone())
+            .collect(),
+    });
     let agent = match build_agent(
         llm,
         LocalExecutor::tagged(st.node.clone(), "agent"),
@@ -80,6 +93,7 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
         &st.agents_md,
         max_turns,
         req.allow.unwrap_or_default(),
+        page,
     ) {
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::BAD_GATEWAY, other(e.to_string())),

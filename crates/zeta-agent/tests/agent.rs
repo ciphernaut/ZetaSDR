@@ -788,3 +788,128 @@ fn gate_covers_every_delete_taking_op() {
         .is_none()
     );
 }
+
+/// `cfg()` with the page-only tools on, the page's ready themes `console` and `plain`.
+fn page_cfg() -> AgentConfig {
+    let mut c = cfg();
+    c.enable_page_tools(vec!["console".to_string(), "plain".to_string()]);
+    c
+}
+
+#[tokio::test]
+async fn view_set_is_recorded_for_the_page_and_never_reaches_the_executor() {
+    let fake = fake(vec![
+        tool_call_response(&[("view_set", json!({"key": "theme", "value": "plain"}))]),
+        text_response("Switched to plain.", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let agent = Agent::new(llm(&fake), &exec, page_cfg());
+
+    let t = agent.run("switch to the plain theme").await.unwrap();
+    assert_eq!(t.answer.as_deref(), Some("Switched to plain."));
+    assert_eq!(t.calls.len(), 1);
+    let call = &t.calls[0];
+    assert_eq!(call.tool, "view_set");
+    assert!(call.ok, "{call:?}");
+    assert_eq!(call.arguments, json!({"key": "theme", "value": "plain"}));
+    assert_eq!(
+        call.result,
+        json!({"page": true, "key": "theme", "value": "plain", "applied": "by the page when this answer arrives"})
+    );
+    assert!(exec.calls.lock().unwrap().is_empty());
+    // The tool is offered to the model.
+    let reqs = requests(&fake);
+    let names: Vec<&str> = reqs[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(names.contains(&"view_set"), "{names:?}");
+}
+
+#[tokio::test]
+async fn view_set_refuses_a_theme_that_is_not_ready_listing_the_ready_ids() {
+    let fake = fake(vec![
+        tool_call_response(&[("view_set", json!({"key": "theme", "value": "neon"}))]),
+        text_response("No such theme.", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let agent = Agent::new(llm(&fake), &exec, page_cfg());
+
+    let t = agent.run("switch to the neon theme").await.unwrap();
+    let call = &t.calls[0];
+    assert!(!call.ok);
+    assert_eq!(call.result["error"], "unknown");
+    assert_eq!(call.result["field"], "value");
+    assert_eq!(call.result["known"], json!(["console", "plain"]));
+    assert!(exec.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn view_set_names_a_missing_or_unknown_field() {
+    let fake = fake(vec![
+        tool_call_response(&[
+            ("view_set", json!({"key": "theme"})),
+            (
+                "view_set",
+                json!({"key": "side", "value": "jobs", "tab": "1"}),
+            ),
+            ("view_set", json!({"key": "side", "value": "jobs"})),
+        ]),
+        text_response("Done.", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let agent = Agent::new(llm(&fake), &exec, page_cfg());
+
+    let t = agent.run("show only jobs").await.unwrap();
+    assert!(!t.calls[0].ok);
+    assert_eq!(t.calls[0].result["field"], "value");
+    assert!(!t.calls[1].ok);
+    assert_eq!(t.calls[1].result["field"], "tab");
+    // Other keys pass through: the page validates them.
+    assert!(t.calls[2].ok, "{:?}", t.calls[2]);
+    assert_eq!(t.calls[2].result["key"], "side");
+    assert!(exec.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn view_set_is_not_gated_by_the_allowance() {
+    let fake = fake(vec![
+        tool_call_response(&[("view_set", json!({"key": "theme", "value": "console"}))]),
+        text_response("Switched.", "stop"),
+    ])
+    .await;
+    let mut c = page_cfg();
+    c.allow = Allow {
+        stop_jobs: false,
+        replace: false,
+        delete_captures: false,
+    };
+    let agent = Agent::new(llm(&fake), RecordingExecutor::new(vec![]), c);
+    let t = agent.run("switch to the console theme").await.unwrap();
+    assert!(t.calls[0].ok, "{:?}", t.calls[0]);
+    assert_eq!(t.calls[0].result["page"], true);
+}
+
+#[tokio::test]
+async fn view_set_is_an_unknown_tool_without_page_tools() {
+    let fake = fake(vec![
+        tool_call_response(&[("view_set", json!({"key": "theme", "value": "plain"}))]),
+        text_response("Cannot.", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("switch to the plain theme").await.unwrap();
+    let call = &t.calls[0];
+    assert!(!call.ok);
+    assert_eq!(call.result["error"], "unknown");
+    assert_eq!(call.result["field"], "tool");
+    assert!(exec.calls.lock().unwrap().is_empty());
+    let reqs = requests(&fake);
+    assert!(!reqs[0]["tools"].to_string().contains("view_set"));
+}

@@ -5,6 +5,7 @@ pub mod exec;
 #[cfg(feature = "test-fake")]
 pub mod fake;
 pub mod llm;
+pub mod page;
 pub mod wire;
 
 pub use agent::{
@@ -13,4 +14,5 @@ pub use agent::{
 };
 pub use exec::{Executor, LocalExecutor, RemoteExecutor};
 pub use llm::{AgentError, Completion, LlmClient, LlmConfig};
+pub use page::PageTools;
 pub use wire::{ChatMessage, FunctionCall, ToolCall};
