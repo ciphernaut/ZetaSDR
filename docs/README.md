@@ -41,7 +41,7 @@ attach one.
 [the plan series](superpowers/plans/2026-10-18-zetasdr-plan-series.md), which lists every plan with
 its status and what was proved live. They are kept as written at the time: later work supersedes
 some of what they say, and the guide and `AGENTS.md` describe the current behaviour. They refer to
-features by plan number; the changelog names them.
+features by plan number.
 
 ## Contributing
 

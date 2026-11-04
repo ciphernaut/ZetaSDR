@@ -36,7 +36,8 @@ Send only what you have the right to offer on those terms.
 ## Building and checking locally
 
 For your own changes, or a patch you want to offer as a gist, these are the checks the project
-runs. The toolchain is pinned in `rust-toolchain.toml`; add `rustfmt` and `clippy` to it.
+runs. The toolchain is pinned in `rust-toolchain.toml` (1.97); add `rustfmt` and `clippy` to it
+with `rustup component add rustfmt clippy --toolchain 1.97`.
 
 ```bash
 cargo fmt --check                    # in a nested worktree, per member: cargo fmt -p <crate> -- --check
@@ -49,11 +50,20 @@ bash scripts/public-check.sh         # needs gitleaks on PATH and strings (binut
 bash scripts/check-doc-links.sh
 ```
 
-The UI test drives the page with Playwright and headless Chromium. Install Playwright for the
-`python3` on your `PATH` and its browser: `python3 -m pip install --user playwright`, then
-`python3 -m playwright install chromium` (where the system Python refuses `pip install`, use a
-virtual environment and keep it active when you run the test). Without Playwright the test prints
-`ui e2e skipped: <reason>` and passes, so check for that line.
+The UI test drives the page with Playwright and headless Chromium. It runs whichever `python3`
+is first on your `PATH`, so install Playwright into a virtual environment with
+[uv](https://docs.astral.sh/uv/) and keep it active for the test:
+
+```bash
+uv venv && . .venv/bin/activate
+uv pip install playwright
+python -m playwright install chromium   # the browser goes to ~/.cache/ms-playwright
+cargo test -p zeta --test ui
+```
+
+The test is skipped, printing `ui e2e skipped: <reason>` and passing, when that `python3` cannot
+`import playwright.sync_api` or there is no `chromium*` directory under `~/.cache/ms-playwright`,
+so check for that line.
 
 `AGENTS.md` and `skills/zetasdr/SKILL.md` are generated: edit the operation docs in the code or
 [docs/agents/field-craft.md](docs/agents/field-craft.md), then regenerate them with

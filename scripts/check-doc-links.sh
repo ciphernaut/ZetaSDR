@@ -5,6 +5,8 @@
 # directory holding one, and a #anchor into a Markdown file must name one of its
 # headings by GitHub's slug rules (lower case, punctuation dropped, spaces as
 # hyphens, a repeated heading numbered -1, -2, ...).
+# A paragraph's lines are joined before matching, so a link whose text wraps is
+# checked and reported at the line it starts on.
 # Links inside code blocks and code spans are not links. Links with a scheme
 # (https:, mailto:) are not checked.
 # Exit 0 and "doc-links: clean (<n> links)", or exit 1 with one line per broken
@@ -39,31 +41,49 @@ docs = sorted(
 )
 
 FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
-CODE_SPAN = re.compile(r"(`+)(?:.+?)\1")
+CODE_SPAN = re.compile(r"(`+)(?:.+?)\1", re.S)
 LINK = re.compile(r"!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
-REF_DEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*(\S+)")
+REF_DEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*(\S+)", re.M)
 HTML_ATTR = re.compile(r"\b(?:src|href)\s*=\s*\"([^\"]+)\"")
 HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
 HTML_ID = re.compile(r"<a\s+(?:name|id)\s*=\s*\"([^\"]+)\"")
 SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
-def lines_outside_code(path):
-    """(line number, text with code spans removed) for lines outside fences."""
+def paragraphs(path):
+    """(first line number, text) for each paragraph outside code fences: its
+    lines joined with newlines, so a link whose text wraps is one match, and
+    code spans (which may wrap too) blanked to their newlines."""
     out = []
+    cur = []
     fence = None
+
+    def flush():
+        if cur:
+            text = "\n".join(t for _, t in cur)
+            text = CODE_SPAN.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+            out.append((cur[0][0], text))
+            cur.clear()
+
     with open(os.path.join(root, path), encoding="utf-8", errors="replace") as f:
         for n, line in enumerate(f, 1):
+            line = line.rstrip("\n")
             m = FENCE.match(line)
             if m:
+                flush()
                 mark = m.group(1)
                 if fence is None:
                     fence = mark[0] * len(mark)
                 elif mark[0] == fence[0] and len(mark) >= len(fence):
                     fence = None
                 continue
-            if fence is None:
-                out.append((n, CODE_SPAN.sub("", line.rstrip("\n"))))
+            if fence is not None:
+                continue
+            if line.strip() == "":
+                flush()
+            else:
+                cur.append((n, line))
+    flush()
     return out
 
 
@@ -72,6 +92,7 @@ def slug(text):
     text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"<[^>]+>", "", text)
     text = text.replace("**", "").replace("*", "")
+    text = re.sub(r"(?<![\w])__?([^_]+?)__?(?![\w])", r"\1", text)
     text = text.strip().lower()
     text = re.sub(r"[^\w\- ]", "", text)
     return text.replace(" ", "-")
@@ -114,13 +135,12 @@ broken = []
 count = 0
 for doc in docs:
     base = os.path.dirname(doc)
-    for n, text in lines_outside_code(doc):
-        targets = [m.group(1) for m in LINK.finditer(text)]
-        targets += HTML_ATTR.findall(text)
-        m = REF_DEF.match(text)
-        if m:
-            targets.append(m.group(1))
-        for raw in targets:
+    for first, text in paragraphs(doc):
+        found = [(m.start(), m.group(1)) for m in LINK.finditer(text)]
+        found += [(m.start(), m.group(1)) for m in HTML_ATTR.finditer(text)]
+        found += [(m.start(), m.group(1)) for m in REF_DEF.finditer(text)]
+        for at, raw in sorted(found):
+            n = first + text.count("\n", 0, at)
             link = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
             if not link or SCHEME.match(link) or link.startswith("//"):
                 continue

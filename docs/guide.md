@@ -716,9 +716,9 @@ a websocket, so `/stream/{id}` also accepts the secret as a subprotocol: offer
 websocket client:
 
 ```bash
-python3 - <<'PY'
+uv run --with websockets python - <<'PY'
 import base64, json, os, urllib.request
-from websockets.sync.client import connect   # pip install websockets
+from websockets.sync.client import connect
 node, secret = "127.0.0.1:7979", os.environ["ZETA_SECRET"]
 req = urllib.request.Request(f"http://{node}/streams", headers={"Authorization": "Bearer " + secret})
 ops = next(s["id"] for s in json.load(urllib.request.urlopen(req)) if s["provenance"]["source"] == "node")

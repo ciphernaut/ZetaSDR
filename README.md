@@ -138,14 +138,15 @@ endpoint (`--llm-url`, `--llm-model`), and `zeta-mcp` offers every operation as 
 
 ## Legal
 
-Laws on receiving and decoding radio traffic differ by country, and you are responsible for how
-you use a receiver where you are. The node's decoders are for public protocols (APRS, POCSAG,
-ADS-B, ACARS, RDS, radiosondes), the ordinary use of a radio. For a signal nobody has named, ZetaSDR stops at measuring it, classifying it,
-capturing a few bursts to identify it and reporting who the licence register says transmits there;
-recovering and reading the content of someone else's link is not something it does for you; that
-is the operator's decision and legal responsibility. The node sends nothing to outside services you have not
-configured (the page's map fetches OpenStreetMap tiles while the browser is online); radiosonde
-telemetry goes to SondeHub only when you give a callsign.
+The node has decoders for public protocols: APRS, ADS-B, ACARS, RDS, radiosondes and POCSAG.
+Having a decoder is not permission to use it. Whether you may receive and decode a given
+transmission where you are, pager traffic in particular, depends on your local law and is your
+responsibility; nothing here is legal advice. For an unknown third-party signal the agent's
+playbook stops at measuring and classifying it, capturing a few bursts and reporting who the
+licence register says transmits there; it does not set out to recover the content. The node sends
+nothing to outside services you have not configured (the page's map fetches OpenStreetMap tiles
+while the browser is online), and radiosonde telemetry goes to SondeHub only with a callsign you
+give.
 
 ZetaSDR is licensed under the Apache License 2.0 ([LICENSE](LICENSE)). It bundles a signal
 catalogue, a map library and fonts under their own licences, listed in [NOTICE](NOTICE).

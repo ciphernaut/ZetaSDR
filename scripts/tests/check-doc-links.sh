@@ -111,7 +111,39 @@ design_history_and_untracked_are_skipped() {
   pass design_history_and_untracked_are_skipped
 }
 
+split_link_is_checked() {
+  local d
+  d=$(repo split)
+  printf '%s\n' "# A" "" "Read [the" "guide](missing.md) and the [front" "page](README.md#a)." \
+    "" "A \`code span" "[x](gone.md)\` that wraps is not a link." >"$d/README.md"
+  track "$d"
+  run "$d"
+  [ $rc -eq 1 ] || fail split_link_is_checked "rc=$rc $out"
+  case $out in *"README.md:3: missing.md"*) ;; *) fail split_link_is_checked "$out" ;; esac
+  case $out in *"README.md#a"* | *"gone.md"*) fail split_link_is_checked "$out" ;; esac
+  printf '%s\n' "# A" "" "The [front" "page](README.md#a)." >"$d/README.md"
+  track "$d"
+  run "$d"
+  [ $rc -eq 0 ] || fail split_link_is_checked "good: rc=$rc $out"
+  case $out in *"doc-links: clean (1 links)"*) ;; *) fail split_link_is_checked "$out" ;; esac
+  pass split_link_is_checked
+}
+
+slug_rules() {
+  local d
+  d=$(repo slug)
+  printf '%s\n' "# A & B" "## _Emphasis_ here" "## snake_case name" >"$d/README.md"
+  printf '%s\n' "[1](README.md#a--b) [2](README.md#emphasis-here) [3](README.md#snake_case-name)" >"$d/b.md"
+  track "$d"
+  run "$d"
+  [ $rc -eq 0 ] || fail slug_rules "rc=$rc $out"
+  case $out in *"doc-links: clean (3 links)"*) ;; *) fail slug_rules "$out" ;; esac
+  pass slug_rules
+}
+
 ok_link
+split_link_is_checked
+slug_rules
 broken_file
 broken_anchor
 design_history_and_untracked_are_skipped
