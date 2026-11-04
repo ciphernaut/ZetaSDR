@@ -12,7 +12,7 @@ from __future__ import annotations
 import html, pathlib, sys
 
 HERE = pathlib.Path(__file__).parent
-AS_OF = "2026-11-04 (plan26-zeta)"
+AS_OF = "2026-11-04 (agent-theme-zeta on the field host)"
 FONT = "Inter, 'Segoe UI', Helvetica, Arial, sans-serif"
 W, H = 1440, 784
 WHERE = {
@@ -280,7 +280,7 @@ TABLE = [
     ("SondeHub", "HTTPS PUT, outbound", "<code>sondehub: {callsign}</code> on a watch, or a <code>sink_sondehub</code> node", "REMOTE"),
 ]
 STATION = [
-    ("the field host, user <code>sdr</code>", "<code>zeta serve --listen 0.0.0.0:7979</code> as the user unit <code>zeta.service</code>, binary <code>~/zetasdr/plan26-zeta</code>, state <code>~/zetasdr/state</code>"),
+    ("the field host, user <code>sdr</code>", "<code>zeta serve --listen 0.0.0.0:7979</code> as the user unit <code>zeta.service</code>, binary <code>~/zetasdr/agent-theme-zeta</code>, state <code>~/zetasdr/state</code>"),
     ("Radios", "<code>--source-soapy b210=driver=uhd,…,gain=65,ppm=2.7</code> and <code>--source-soapy hackrf=driver=hackrf,gain=45</code>: both on the field host's USB"),
     ("LLM", "<code>--llm-url http://127.0.0.1:8080 --llm-model gemma-4-12b</code>: the field host's OpenAI-compatible gateway (user <code>vllm</code>) in front of llama.cpp serving Gemma 4 12B on the 4090"),
     ("Speech", "<code>--stt-socket</code> to the <code>sdr</code> user's runtime-dir socket: local-voice (<code>voiced</code>) on the same host and GPU"),
