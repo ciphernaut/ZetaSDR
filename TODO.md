@@ -95,6 +95,18 @@ Original shape, now carried by rows: one job kind per mode, graph-expanded like 
 
 Scope estimate: 300-600 lines per in-crate mode including fixtures and tests; 150-250 per external wrapper. A first wave of M17 + DMR voice + RS41 + AIS is a plan on its own.
 
+## Process: lessons for DSP and layer-1 fix rounds (2026-11-04)
+
+From five fix rounds against the operator's 433 MHz OOK remote (the section below). Each cost a round or a wrong conclusion:
+
+- **Real captures first.** Every round passed its synthesised tests and failed on air: the slicer's start-up seed broke three ways (an onset transient, a mostly silent first frame, a 73x pulse after silence) that no synthesised test held. Copy real windows from the node's burst store into `crates/zeta-dsp/tests/data/` and assert on them before changing code.
+- **Test the chain the node builds.** A hand-built test chain ran early-late while `bits_graph` gave OOK M&M, so it proved nothing about the live job. Build test chains through `bits_plan`/`bits_graph`.
+- **Sweep base against head.** A reviewer's ~110-case synthesised sweep through `measure_selection` (FSK, PSK bursts, POCSAG/APRS/ACARS, RS41, Mode S, AM, carrier, noise at 30/15/8 dB) found a 30x cost blow-up and new false `ook` labels the targeted tests missed. Make it a permanent test (today an uncommitted `probe.rs` under `target/tmp/review-ook-sparse/`) and run it on any layer-1 change.
+- **Fix at the source.** The onset overshoot came from the shared `Levels` (fsk.rs); patching only the slicer left every other consumer exposed.
+- **Verify live with a fresh capture.** A capture keeps the features of the binary that measured it, and `bits_start` reads them, so a layer-1 fix shows only on new presses. An op to re-measure stored captures would remove the trap.
+- **Re-check thin margins.** The 8 dB off-level veto (2.7 dB over the worst real window), the 1/8 band-narrowing stop (exactly where the weakest window fits) and the 5 % whole-window refit threshold were set on eight windows and shipped without the final review: collect real windows across radios and SNR, and review them.
+- **Mechanics.** Run gates with a private `CARGO_TARGET_DIR` and deploy from a copied binary (`ZETA_RELEASE=...`), since another session's `cargo test` swaps binaries in the shared target; the permission classifier refuses stopping the operator's jobs, so hand the operator the command; the worktree guard refuses compound shell commands, so keep helpers as script files.
+
 ## Bug: the bits chain does not recover a real OOK remote (first on-air test, 2026-11-04)
 
 The operator's 433 MHz fixed-code remote on the field host B210 (pin 435 MHz / 6.144 MHz): EV1527/PT2262 style at 433.882 MHz, about 30 kHz wide, 30-34 dB SNR; pulses 280 us (0) and 910 us (1) in a 1.25 ms bit, chip about 313 us (3200 Bd); a sync of one short pulse and 9.7 ms of silence (31 chips), then 24 bits, repeated about every 40 ms; code <button-code>, decoded by pulse width from the samples (every whole frame of both fixture windows). Captures on the node: the narrow set of job 01M6HTR8A8FK7E0P4G64RPPZTX (8 windows, 51.2 kHz at 433.882 MHz, layer 1 measured 3197 Bd) and the wide set of job 01M6HTNMP9ESVNSG6DXJPPE9DC (8 windows, 2.048 MHz at 433.4 MHz). Pin them before the store expires them, and copy one into a test fixture.
