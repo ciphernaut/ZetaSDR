@@ -12,7 +12,7 @@ from __future__ import annotations
 import html, pathlib, sys
 
 HERE = pathlib.Path(__file__).parent
-AS_OF = "2026-11-04 (agent-theme-zeta on the field host)"
+AS_OF = "2026-11-04"
 FONT = "Inter, 'Segoe UI', Helvetica, Arial, sans-serif"
 W, H = 1440, 784
 WHERE = {
@@ -137,7 +137,7 @@ box(796, RY, KW, RH, "Handlers on PATH", "apt install dump1090-fa, sonde-decoder
 RX, RW = 1110, 310
 services = [
     (128, 92, "LLM server", "Any OpenAI-compatible chat API (llama.cpp, vLLM, a gateway). Called by serve for POST /ask (--llm-url, --llm-model on serve) and by zeta ask from wherever it runs.", "EITHER"),
-    (236, 84, "ACMA licence register", "acma-rrl-server, an MCP server over HTTP. --knowledge-acma URL on the serving node; needs station set for distances.", "EITHER"),
+    (236, 84, "ACMA licence register", "acma-local (github.com/ciphernaut/acma-local): the licence register in SQLite behind an MCP server, HTTP at /mcp. --knowledge-acma URL on the serving node; needs station set.", "EITHER"),
     (336, 70, "SondeHub", "Internet. sink_sondehub PUTs sonde telemetry only once a callsign is given.", "REMOTE"),
 ]
 for y, h, t, b, w in services:
@@ -199,7 +199,7 @@ box(40, 110, 640, 54, "Operator", "types a request in the page's agent pane, or 
 box(40, 196, 350, 150, "zeta-agent: the tool loop",
     "Runs inside zeta serve for POST /ask, inside the zeta process for zeta ask. Builds the tool list and guide from the schema and AGENTS.md, sends them with the transcript, executes each call it gets back, appends the result, repeats up to max_turns (1-32, default 8). Results trimmed for a small model (job_list without graphs, the newest 20 captures).", "EITHER", size=10.2)
 box(480, 196, 200, 150, "LLM server",
-    "OpenAI-compatible (field-host:8080, Gemma 4 12B). Sees text only: never the node, the secret or the radios. Answers one tool call per turn, or the final prose.", "EITHER", size=10.2)
+    "Any OpenAI-compatible server (llama.cpp, vLLM, a gateway). Sees text only: never the node, the secret or the radios. Answers one tool call per turn, or the final prose.", "EITHER", size=10.2)
 line([(390, 236), (480, 236)]); text(435, 229, "tools, transcript", size=9.5, anchor="middle")
 line([(480, 300), (390, 300)]); text(435, 315, "one tool call", size=9.5, anchor="middle")
 line([(215, 164), (215, 196)])
@@ -210,7 +210,7 @@ line([(215, 346), (215, 376)])
 # B
 box(760, 110, 640, 54, "Operator", "asks in a terminal or IDE session; approves the agent's tool calls by its own permission settings.")
 box(760, 196, 350, 150, "Claude Code (or any MCP-capable agent)",
-    "Its own loop on its own host (on the field host as claude, or the desktop). Reads AGENTS.md as the MCP server's instructions or the skills/zetasdr skill. Gets full results, chains as many calls as it likes, and can also edit code, build, deploy and read logs: things no node op can do.", "EITHER", size=10.2)
+    "Its own loop on its own host (the node's host or another machine). Reads AGENTS.md as the MCP server's instructions or the skills/zetasdr skill. Gets full results, chains as many calls as it likes, and can also edit code, build, deploy and read logs: things no node op can do.", "EITHER", size=10.2)
 box(1200, 196, 200, 150, "Its model",
     "Anthropic's API, called by the agent. The node never talks to it and never sees its prompts.", "REMOTE", size=10.2)
 line([(1110, 236), (1200, 236)]); text(1155, 229, "prompt", size=9.5, anchor="middle")
@@ -219,7 +219,7 @@ line([(935, 164), (935, 196)])
 DY, DH, DW = 376, 134, 148
 doors = [
     (760, "1. zeta-mcp", "stdio MCP server beside the agent: one tool per op from GET /schema, AGENTS.md as its instructions.", "POST /op: http"),
-    (924, "2. zeta CLI", "zeta --node URL with ZETA_SECRET, or z.sh over ssh. Without --node a one-shot opens the node in-process, only while no serve owns the state dir.", "POST /op: http (one-shot: local)"),
+    (924, "2. zeta CLI", "zeta --node URL with ZETA_SECRET (ZETA_NODE works too). Without --node a one-shot opens the node in-process, only while no serve owns the state dir.", "POST /op: http (one-shot: local)"),
     (1088, "3. Raw HTTP + ws", "curl, cb_watch.py, any language: POST /op, GET /schema, /agents-md, /streams/{id}/tail, ws /stream/{id}. The page is one such client.", "POST /op: http (ui by header)"),
     (1252, "4. POST /ask", "Hand the request to the node's own agent: path A from outside, its LLM, its turn budget and the gate (allow in the body).", "runs path A: agent"),
 ]
@@ -266,7 +266,7 @@ TABLE = [
     ("zeta ask", "HTTP to the LLM; in-process or HTTP to the node", "<code>--llm-url</code>, <code>--llm-model</code>; <code>--node URL</code> to drive a served node", "EITHER"),
     ("Agent in the node (<code>POST /ask</code>)", "the node calls the LLM over HTTP", "<code>zeta serve --listen … --llm-url URL --llm-model NAME</code>", "EITHER"),
     ("LLM server", "OpenAI-compatible chat API", "a URL: localhost or another host", "EITHER"),
-    ("ACMA register", "MCP over HTTP (the node is the MCP client)", "<code>--knowledge-acma URL[,reach_km=N]</code> on the serving node, plus <code>station set</code>", "EITHER"),
+    ("ACMA register (<a href=\"https://github.com/ciphernaut/acma-local\">acma-local</a>)", "MCP over HTTP at <code>/mcp</code> (the node is the MCP client)", "<code>--knowledge-acma URL[,reach_km=N]</code> on the serving node, plus <code>station set</code>", "EITHER"),
     ("Speech daemon", "Unix socket", "<code>--stt-socket PATH</code> (default <code>$XDG_RUNTIME_DIR/voiced.sock</code>)", "LOCAL"),
     ("Speech on another node", "HTTP <code>POST /stt</code>", "<code>--stt-node URL</code>, secret in <code>ZETA_STT_NODE_SECRET</code>", "REMOTE"),
     ("HackRF, B210 (SoapySDR)", "USB, through a <code>zeta soapy-worker</code> child", "<code>--source-soapy ID=driver=…,gain=N,ppm=N</code>; build with <code>--cfg soapy</code>", "LOCAL"),
@@ -279,16 +279,7 @@ TABLE = [
     ("Operator modes, themes", "files", "<code>--modes-dir</code>, <code>--themes-dir</code>", "LOCAL"),
     ("SondeHub", "HTTPS PUT, outbound", "<code>sondehub: {callsign}</code> on a watch, or a <code>sink_sondehub</code> node", "REMOTE"),
 ]
-STATION = [
-    ("the field host, user <code>sdr</code>", "<code>zeta serve --listen 0.0.0.0:7979</code> as the user unit <code>zeta.service</code>, binary <code>~/zetasdr/agent-theme-zeta</code>, state <code>~/zetasdr/state</code>"),
-    ("Radios", "<code>--source-soapy b210=driver=uhd,…,gain=65,ppm=2.7</code> and <code>--source-soapy hackrf=driver=hackrf,gain=45</code>: both on the field host's USB"),
-    ("LLM", "<code>--llm-url http://127.0.0.1:8080 --llm-model gemma-4-12b</code>: the field host's OpenAI-compatible gateway (user <code>vllm</code>) in front of llama.cpp serving Gemma 4 12B on the 4090"),
-    ("Speech", "<code>--stt-socket</code> to the <code>sdr</code> user's runtime-dir socket: local-voice (<code>voiced</code>) on the same host and GPU"),
-    ("ACMA register", "<code>--knowledge-acma http://acma-host:3110</code>: another host on the LAN"),
-    ("Clients", "the page from the desktop browser; <code>deploy/field-host/z.sh</code> runs the CLI on the <code>sdr</code> side over ssh, with the secret sourced there"),
-]
 rows = "\n".join(f'<tr><td>{p}</td><td>{w}</td><td>{h}</td><td><span class="chip {where.lower()}">{where}</span></td></tr>' for p, w, h, where in TABLE)
-station = "\n".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a, b in STATION)
 
 page = f"""<!DOCTYPE html>
 <html lang="en">
@@ -354,13 +345,6 @@ ul {{ max-width: 1000px; }}
 </tbody>
 </table></div>
 
-<h2>This station</h2>
-<p>How the home node is wired today (from the running unit's command line, 2026-11-04):</p>
-<div class="wrap"><table>
-<tbody>
-{station}
-</tbody>
-</table></div>
 </main>
 </body>
 </html>
