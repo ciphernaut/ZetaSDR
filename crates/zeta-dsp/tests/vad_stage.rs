@@ -366,3 +366,71 @@ async fn rate_and_channel_changes_fail() {
         }
     }
 }
+
+/// Send `x` as 100 ms mono frames, the first starting at `t0`.
+fn send_at(tx: &broadcast::Sender<Frame>, x: &[f32], t0: u64) {
+    for (k, c) in x.chunks(CHUNK).enumerate() {
+        tx.send(audio(c.to_vec(), 48_000, 1, t0 + k as u64 * 100_000_000))
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_gap_in_the_input_restarts_the_clock() {
+    // A squelched demodulator publishes nothing while closed: two transmissions
+    // arrive as frames 5 s apart with nothing between them. The second must be
+    // stamped at its own frames' time, not straight after the first's samples, and
+    // the first run must close where its input stopped.
+    let bus = Arc::new(StreamBus::new(256));
+    let a_out = bus.register(StreamKind::Audio, prov(0));
+    let e_out = bus.register(StreamKind::Event, prov(0));
+    let mut rx_a = bus.subscribe(&a_out).unwrap();
+    let mut rx_e = bus.subscribe(&e_out).unwrap();
+    let (tx, rx_in) = broadcast::channel(256);
+    let h = spawn_with(
+        serde_json::json!({"hangover_ms": 200}),
+        bus,
+        rx_in,
+        vec![a_out, e_out],
+    );
+    // First transmission: 500 ms of noise, a 300 ms burst, then a squelch tail
+    // that leaves a part-frame (and the onset look-back) held in the stage.
+    let mut first = noise(5 * CHUNK, 31);
+    first.extend(noisy(speech_like(48_000, 0.3), 32));
+    first.extend(noise(1_000, 33));
+    send_at(&tx, &first, T_BASE);
+    let first_end = T_BASE + first.len() as u64 * 1_000_000_000 / 48_000;
+    // Second transmission 5 s later: a burst at its first frame, then noise.
+    let second_t0 = first_end + 5_000_000_000;
+    let mut second = noisy(speech_like(48_000, 0.3), 34);
+    second.extend(noise(5 * CHUNK, 35));
+    send_at(&tx, &second, second_t0);
+    drop(tx);
+    assert!(h.await.unwrap().is_ok());
+    let (events, audio) = drain(&mut rx_a, &mut rx_e);
+
+    assert_eq!(events.len(), 4, "{events:?}");
+    let speech: Vec<bool> = events.iter().map(|e| e.0).collect();
+    assert_eq!(speech, [true, false, true, false], "{events:?}");
+    assert!(
+        events[0].1.abs_diff(T_BASE + 500_000_000) <= FRAME_NS,
+        "{events:?}"
+    );
+    assert!(
+        events[1].1 <= first_end,
+        "first run closes by the end of its input: {events:?}"
+    );
+    assert!(
+        events[2].1.abs_diff(second_t0) <= FRAME_NS,
+        "second run stamped at {}, its frames start at {second_t0}",
+        events[2].1
+    );
+    // No forwarded audio falls in the gap.
+    for &(s, e) in &audio {
+        assert!(
+            e <= first_end || s >= second_t0,
+            "audio {s}..{e} in the gap"
+        );
+    }
+    assert!(audio.iter().any(|&(s, _)| s >= second_t0), "{audio:?}");
+}

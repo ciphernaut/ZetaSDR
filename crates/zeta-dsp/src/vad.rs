@@ -139,6 +139,15 @@ impl Vad {
         self.release(0)
     }
 
+    /// The input paused: release every held sample with its current label, as
+    /// `flush` does, then start the next sample outside speech with a fresh frame.
+    /// The noise floor is kept.
+    pub fn gap(&mut self) -> Vec<Segment> {
+        let segs = self.release(0);
+        self.skip();
+        segs
+    }
+
     /// The input skipped ahead (a lag): drop the held samples, the open frame
     /// and the run or onset in progress, so the next sample starts a fresh
     /// frame outside speech. The noise floor is kept.
@@ -283,6 +292,8 @@ struct State {
     run: Option<(u64, u16, Vad)>,
     pending: Vec<f32>,
     pending_t0: Timestamp,
+    /// Where the last input frame ended, by its start and sample count.
+    in_end: Option<Timestamp>,
     prov: Option<Provenance>,
     /// Last speech state announced by an event.
     speaking: bool,
@@ -399,16 +410,46 @@ impl State {
                 self.run = Some((rate, ch, Vad::new(rate, ch, params)));
             }
         }
+        let start = frame.provenance.span.start_ns;
+        // A frame that starts more than a detector frame after the last input ended
+        // follows a gap (a squelch that closed publishes nothing): the samples held
+        // before it are not followed by these, so they go out now and the clock
+        // restarts at this frame's own time.
+        let mut out = match self.in_end {
+            Some(end) if start.0 > end.0 + FRAME_MS * 1_000_000 => self.gap(rate, ch),
+            _ => Vec::new(),
+        };
         if self.pending.is_empty() {
-            self.pending_t0 = frame.provenance.span.start_ns;
+            self.pending_t0 = start;
         }
         self.pending.extend_from_slice(samples);
         self.prov = Some(frame.provenance.clone());
+        let n = (samples.len() / ch as usize) as u64;
+        self.in_end = Some(Timestamp(start.0 + n * 1_000_000_000 / rate));
         let segs = match &mut self.run {
             Some((_, _, vad)) => vad.feed(samples),
             None => Vec::new(),
         };
-        Ok(self.emit(segs, rate, ch))
+        out.extend(self.emit(segs, rate, ch));
+        Ok(out)
+    }
+
+    /// The input stopped and resumed later: release every held sample with its
+    /// label, close a run in progress where the input stopped and start the next
+    /// sample outside speech. The noise floor is kept.
+    fn gap(&mut self, rate: u64, ch: u16) -> Vec<Frame> {
+        let segs = match &mut self.run {
+            Some((_, _, vad)) => vad.gap(),
+            None => Vec::new(),
+        };
+        let mut out = self.emit(segs, rate, ch);
+        if self.speaking
+            && let Some(base) = self.prov.clone()
+        {
+            out.extend(self.transition(&base, false, self.pending_t0, rate));
+        }
+        self.pending.clear();
+        out
     }
 
     /// Release what the detector still holds (the input closed).
@@ -449,6 +490,7 @@ impl Stage for VadStage {
             run: None,
             pending: Vec::new(),
             pending_t0: Timestamp(0),
+            in_end: None,
             prov: None,
             speaking: false,
         }));
