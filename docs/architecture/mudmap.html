@@ -267,6 +267,145 @@ ul { max-width: 1000px; }
 <p>Two rules cover most cases. A USB radio on another machine is attached by running a node on that machine and adding it here with <code>--source-node</code>. Speech that needs a GPU elsewhere goes through <code>--stt-node</code> to the node that has the GPU. Every flag that wires something in (<code>--source-*</code>, <code>--plugin</code>, <code>--knowledge-acma</code>, <code>--stt-*</code>, <code>--llm-*</code>, <code>--modes-dir</code>, <code>--themes-dir</code>) belongs to the serving node and must be repeated on every start. A client using <code>--node</code> passes none of them.</p>
 <p>There are two MCP directions. <code>zeta-mcp</code> makes the node an MCP <em>server</em> for Claude Code and similar clients. With <code>--knowledge-acma</code>, the node is an MCP <em>client</em> of the register. There are also two agent paths. <code>zeta ask</code> runs the tool loop wherever it is started. <code>POST /ask</code> (the page's agent pane) runs it inside the node, so the node's own <code>--llm-url</code> must reach the LLM.</p>
 
+<h2>Two ways a model drives the node</h2>
+<p>A configured LLM never touches the node. It answers with tool calls, and zeta's own loop executes each one behind a gate that code enforces. An external coding agent such as Claude Code is a client with the secret. It runs its own loop, calls the node over HTTP the way any script does, and is held only by the guide's rules and the operator's approval of its tool calls.</p>
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 626" width="1440" height="626" role="img" aria-label="Two agent paths: a configured LLM proposes calls that zeta-agent executes behind an allowance gate; an external coding agent runs its own loop and calls the node over HTTP through zeta-mcp or the CLI, with no gate." font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" fill="currentColor" >
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
+<marker id="arrow-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 10 0 L 0 5 L 10 10 z" fill="currentColor"/></marker>
+</defs>
+<rect x="0" y="0" width="1440" height="626" fill="#fbfbf9"/>
+<text x="18" y="32" font-size="22" text-anchor="start" opacity="1" font-weight="700">Two ways a model drives the node</text>
+<text x="390" y="32" font-size="12" text-anchor="start" opacity="0.8">who runs the tool loop, what can refuse a call, and how the ops log records it</text>
+<rect x="20" y="58" width="680" height="430" rx="10" fill="currentColor" fill-opacity="0.025"/>
+<text x="34" y="80" font-size="13" text-anchor="start" opacity="1" font-weight="700">A. A configured LLM: zeta runs the loop</text>
+<text x="34" y="96" font-size="10.5" text-anchor="start" opacity="0.75" font-style="italic">POST /ask (the page's agent pane) or zeta ask; the model only proposes calls</text>
+<rect x="740" y="58" width="680" height="430" rx="10" fill="currentColor" fill-opacity="0.025"/>
+<text x="754" y="80" font-size="13" text-anchor="start" opacity="1" font-weight="700">B. An external coding agent (Claude Code): the agent runs the loop</text>
+<text x="754" y="96" font-size="10.5" text-anchor="start" opacity="0.75" font-style="italic">zeta-mcp or the zeta CLI; the node sees one more HTTP client</text>
+<rect x="40" y="110" width="640" height="54" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
+<text x="49" y="128" font-size="12.5" font-weight="700">Operator</text>
+<text x="49" y="145" font-size="10.5">
+<tspan x="49" dy="0">types a request in the page's agent pane, or runs zeta ask "REQUEST" (stdin works: a voice transcript piped in).</tspan>
+</text>
+<rect x="40" y="196" width="350" height="150" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
+<text x="49" y="214" font-size="12.5" font-weight="700">zeta-agent: the tool loop</text>
+<rect x="331.4" y="202" width="51.599999999999994" height="15" rx="7.5" fill="#7c3aed"/>
+<text x="357.2" y="213" font-size="9" font-weight="700" letter-spacing="0.06em" text-anchor="middle" fill="#ffffff">EITHER</text>
+<text x="49" y="231" font-size="10.2">
+<tspan x="49" dy="0">Runs inside zeta serve for POST /ask, inside the zeta process</tspan>
+<tspan x="49" dy="12.7">for zeta ask. Builds the tool list and guide from the schema</tspan>
+<tspan x="49" dy="12.7">and AGENTS.md, sends them with the transcript, executes each</tspan>
+<tspan x="49" dy="12.7">call it gets back, appends the result, repeats up to</tspan>
+<tspan x="49" dy="12.7">max_turns (1-32, default 8). Results trimmed for a small</tspan>
+<tspan x="49" dy="12.7">model (job_list without graphs, the newest 20 captures).</tspan>
+</text>
+<rect x="480" y="196" width="200" height="150" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
+<text x="489" y="214" font-size="12.5" font-weight="700">LLM server</text>
+<rect x="621.4" y="202" width="51.599999999999994" height="15" rx="7.5" fill="#7c3aed"/>
+<text x="647.2" y="213" font-size="9" font-weight="700" letter-spacing="0.06em" text-anchor="middle" fill="#ffffff">EITHER</text>
+<text x="489" y="231" font-size="10.2">
+<tspan x="489" dy="0">OpenAI-compatible (field-host:8080,</tspan>
+<tspan x="489" dy="12.7">Gemma 4 12B). Sees text only:</tspan>
+<tspan x="489" dy="12.7">never the node, the secret or the</tspan>
+<tspan x="489" dy="12.7">radios. Answers one tool call per</tspan>
+<tspan x="489" dy="12.7">turn, or the final prose.</tspan>
+</text>
+<path d="M 390 236 L 480 236" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="435" y="229" font-size="9.5" text-anchor="middle" opacity="0.85">tools, transcript</text>
+<path d="M 480 300 L 390 300" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="435" y="315" font-size="9.5" text-anchor="middle" opacity="0.85">one tool call</text>
+<path d="M 215 164 L 215 196" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<rect x="40" y="376" width="640" height="96" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
+<text x="49" y="394" font-size="12.5" font-weight="700">The allowance gate (in the loop, before the node)</text>
+<text x="49" y="411" font-size="10.2">
+<tspan x="49" dy="0">job_stop, jobs_stop, a non-empty replace and capture_delete come back to the model as not_allowed unless the run</tspan>
+<tspan x="49" dy="12.7">allows them (allow.stop_jobs / replace / delete_captures, zeta ask --allow-stop / --allow-replace /</tspan>
+<tspan x="49" dy="12.7">--allow-delete); jobs this run started itself may be stopped. Code enforces it, not the prompt.</tspan>
+</text>
+<path d="M 215 346 L 215 376" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<rect x="760" y="110" width="640" height="54" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
+<text x="769" y="128" font-size="12.5" font-weight="700">Operator</text>
+<text x="769" y="145" font-size="10.5">
+<tspan x="769" dy="0">asks in a terminal or IDE session; approves the agent's tool calls by its own permission settings.</tspan>
+</text>
+<rect x="760" y="196" width="350" height="150" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
+<text x="769" y="214" font-size="12.5" font-weight="700">Claude Code (or any MCP-capable agent)</text>
+<rect x="1051.4" y="202" width="51.599999999999994" height="15" rx="7.5" fill="#7c3aed"/>
+<text x="1077.2" y="213" font-size="9" font-weight="700" letter-spacing="0.06em" text-anchor="middle" fill="#ffffff">EITHER</text>
+<text x="769" y="231" font-size="10.2">
+<tspan x="769" dy="0">Its own loop on its own host (on the field host as claude, or the</tspan>
+<tspan x="769" dy="12.7">desktop). Reads AGENTS.md as the MCP server's instructions or</tspan>
+<tspan x="769" dy="12.7">the skills/zetasdr skill. Gets full results, chains as many</tspan>
+<tspan x="769" dy="12.7">calls as it likes, and can also edit code, build, deploy and</tspan>
+<tspan x="769" dy="12.7">read logs: things no node op can do.</tspan>
+</text>
+<rect x="1200" y="196" width="200" height="150" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
+<text x="1209" y="214" font-size="12.5" font-weight="700">Its model</text>
+<rect x="1341.4" y="202" width="51.599999999999994" height="15" rx="7.5" fill="#1d4ed8"/>
+<text x="1367.2" y="213" font-size="9" font-weight="700" letter-spacing="0.06em" text-anchor="middle" fill="#ffffff">REMOTE</text>
+<text x="1209" y="231" font-size="10.2">
+<tspan x="1209" dy="0">Anthropic's API, called by the</tspan>
+<tspan x="1209" dy="12.7">agent. The node never talks to it</tspan>
+<tspan x="1209" dy="12.7">and never sees its prompts.</tspan>
+</text>
+<path d="M 1110 236 L 1200 236" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="1155" y="229" font-size="9.5" text-anchor="middle" opacity="0.85">prompt</text>
+<path d="M 1200 300 L 1110 300" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="1155" y="315" font-size="9.5" text-anchor="middle" opacity="0.85">tool calls</text>
+<path d="M 935 164 L 935 196" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<rect x="760" y="376" width="300" height="96" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
+<text x="769" y="394" font-size="12.5" font-weight="700">zeta-mcp</text>
+<rect x="1001.4" y="382" width="51.599999999999994" height="15" rx="7.5" fill="#7c3aed"/>
+<text x="1027.2" y="393" font-size="9" font-weight="700" letter-spacing="0.06em" text-anchor="middle" fill="#ffffff">EITHER</text>
+<text x="769" y="411" font-size="10.2">
+<tspan x="769" dy="0">stdio MCP server beside the agent: one tool per op,</tspan>
+<tspan x="769" dy="12.7">generated from GET /schema; each call is a POST /op</tspan>
+<tspan x="769" dy="12.7">with the bearer.</tspan>
+</text>
+<rect x="1080" y="376" width="320" height="96" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
+<text x="1089" y="394" font-size="12.5" font-weight="700">zeta CLI</text>
+<rect x="1341.4" y="382" width="51.599999999999994" height="15" rx="7.5" fill="#7c3aed"/>
+<text x="1367.2" y="393" font-size="9" font-weight="700" letter-spacing="0.06em" text-anchor="middle" fill="#ffffff">EITHER</text>
+<text x="1089" y="411" font-size="10.2">
+<tspan x="1089" dy="0">zeta --node URL ... with ZETA_SECRET, or</tspan>
+<tspan x="1089" dy="12.7">deploy/field-host/z.sh over ssh (the secret is sourced on</tspan>
+<tspan x="1089" dy="12.7">the sdr side, never seen by the agent).</tspan>
+</text>
+<path d="M 860 346 L 860 376" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<path d="M 1095 346 L 1095 376" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<rect x="20" y="520" width="1400" height="92" rx="7" fill="currentColor" fill-opacity="0.1" stroke="currentColor" stroke-width="1.8"/>
+<text x="29" y="538" font-size="14" font-weight="700">zeta serve: Node::apply(op), the same 36 ops for both</text>
+<rect x="1368.0" y="526" width="45.0" height="15" rx="7.5" fill="#0f766e"/>
+<text x="1390.5" y="537" font-size="9" font-weight="700" letter-spacing="0.06em" text-anchor="middle" fill="#ffffff">LOCAL</text>
+<text x="29" y="555" font-size="10.5">
+<tspan x="29" dy="0">A arrives in-process: POST /ask logs ops as transport agent; zeta ask logs local (one-shot) or http (with --node), not agent. B arrives over HTTP /op and logs http, like any script: the log cannot tell Claude Code from curl, nor which request</tspan>
+<tspan x="29" dy="13.0">caused a call. Over HTTP the bearer is the whole of the authority: no gate refuses B's job_stop or replace. The guide's rules (stop only what the request names or you started) bind B only as instructions it follows, and the operator's approval of</tspan>
+<tspan x="29" dy="13.0">its tool calls.</tspan>
+</text>
+<path d="M 215 472 L 215 520" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="223" y="500" font-size="10" text-anchor="start" opacity="0.85">in-process executor (HTTP with zeta ask --node)</text>
+<path d="M 910 472 L 910 520" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="918" y="500" font-size="10" text-anchor="start" opacity="0.85">HTTP POST /op, bearer</text>
+<path d="M 1240 472 L 1240 520" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="1248" y="500" font-size="10" text-anchor="start" opacity="0.85">HTTP POST /op, bearer</text>
+</svg>
+</figure>
+<div class="wrap"><table>
+<thead><tr><th></th><th>A. Configured LLM (<code>POST /ask</code>, <code>zeta ask</code>)</th><th>B. External coding agent (<code>zeta-mcp</code>, CLI)</th></tr></thead>
+<tbody>
+<tr><td>Who runs the tool loop</td><td>zeta-agent, in the node (<code>/ask</code>) or the <code>zeta ask</code> process</td><td>the coding agent, on its own host</td></tr>
+<tr><td>Which model</td><td>the one at <code>--llm-url</code> (any OpenAI-compatible server)</td><td>the agent's own (Anthropic's API for Claude Code)</td></tr>
+<tr><td>What the model sees</td><td>the tool list, the guide and trimmed results; never the node or the secret</td><td>full results, the repo, the shell: whatever the agent's permissions allow</td></tr>
+<tr><td>How calls reach the node</td><td>in-process executor (HTTP when <code>zeta ask --node</code>)</td><td><code>zeta-mcp</code> or the CLI: <code>POST /op</code> with the bearer</td></tr>
+<tr><td>What can refuse a stop or replace</td><td>the allowance gate in code: <code>not_allowed</code> unless the run allows it</td><td>nothing in the node; the guide's rules and the operator's approval of tool calls</td></tr>
+<tr><td>Budget</td><td><code>max_turns</code> 1-32 (default 8), one call per turn; bulk ops (<code>plan_start</code>, <code>jobs_stop</code>) exist for it</td><td>the agent's own; it can make hundreds of calls</td></tr>
+<tr><td>ops log <code>transport</code></td><td><code>agent</code> (<code>/ask</code>); <code>local</code> or <code>http</code> (<code>zeta ask</code>)</td><td><code>http</code>, the same as any script</td></tr>
+<tr><td>Beyond the node</td><td>nothing: only the operations</td><td>code, builds, deploys, logs, other hosts</td></tr>
+</tbody>
+</table></div>
+
 <h2>Each piece</h2>
 <div class="wrap"><table>
 <thead><tr><th>Piece</th><th>Wire</th><th>How it is wired</th><th>Where</th></tr></thead>
