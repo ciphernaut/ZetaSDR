@@ -21,7 +21,7 @@ licence register can be attached as a knowledge provider.
 - The agent guide (every operation and the field craft): [AGENTS.md](AGENTS.md), generated from the
   schema and [docs/agents/field-craft.md](docs/agents/field-craft.md).
 - Worked recipes: [RECIPES.md](RECIPES.md). Speech: [docs/speech.md](docs/speech.md). Themes:
-  [docs/themes.md](docs/themes.md). Acceptance checks: [UAT.md](UAT.md). Open work: [TODO.md](TODO.md).
+  [docs/themes.md](docs/themes.md). Open work: [TODO.md](TODO.md).
 
 Design: [docs/superpowers/specs/2026-10-18-zetasdr-design.md](docs/superpowers/specs/2026-10-18-zetasdr-design.md).
 The plan series, with each plan's status and what was proved live:

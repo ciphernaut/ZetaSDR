@@ -10,11 +10,14 @@ use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId};
 const AGENTS_MD: &str = include_str!("../../../AGENTS.md");
 
 #[tokio::test]
-#[ignore = "needs field-host:8080 serving gemma-4-12b"]
-async fn field_host_gemma_tunes_hackrf0() {
-    let url = std::env::var("ZETA_LIVE_LLM_URL")
-        .unwrap_or_else(|_| "http://field-host:8080".to_string());
-    let llm = LlmClient::new(LlmConfig::new(url, "gemma-4-12b")).unwrap();
+#[ignore = "needs an LLM at ZETA_LIVE_LLM_URL"]
+async fn live_llm_tunes_a_source() {
+    let Ok(url) = std::env::var("ZETA_LIVE_LLM_URL") else {
+        eprintln!("skipped: set ZETA_LIVE_LLM_URL");
+        return;
+    };
+    let model = std::env::var("ZETA_LIVE_LLM_MODEL").unwrap_or_else(|_| "default".to_string());
+    let llm = LlmClient::new(LlmConfig::new(url, model)).unwrap();
     let cfg = AgentConfig::new(
         system_prompt(AGENTS_MD),
         op_tools(&zeta_core::ops::schema(), AGENTS_MD),
