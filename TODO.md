@@ -383,6 +383,20 @@ squelch could skip the demod and the resampler and read its gate from the bank b
 direct path there is nothing to skip before the filter. Measure the page counter first: if the page never
 runs dry the gap is in the browser's own output and (2) is the fix.
 
+## Agent: the language for the node's own model to work out automations itself
+
+From the operator, 2026-11-04, after a session spent decoding their 433 MHz OOK remote by hand: "create the language needed to allow the supplied llm inference back end to figure some of these automations itself, with the view that those backend llms will become more capable as time passes." The session's loop was done by the coding agent from outside, step by step: pin a radio off the signal's centre, arm a short burst capture on a band, wait for the operator's press, read the windows' features, start `bits_start` (giving the modulation and rate layer 1 got wrong), tail the bits, decode whole frames, compare two radios on the same press, notice a fault (a refused band, a 1600 Bd bit-rate read, an `fsk` label) and route around it, re-arm. None of that is a step the node's own model (`zeta ask`, `POST /ask`, gemma-4-12b on the field host today) can do: it has single ops and the field-craft prose, not the vocabulary for waiting on an event, for a loop of "arm → wait → measure → decode → report", for comparing results across sources, or for knowing a step's result is suspect.
+
+What "the language" should give it, as a direction (not designed yet):
+
+- Waiting on events as ops, so a model with a small turn budget can say "until 3 windows land or 60 s" instead of polling: a `wait` op over a job's context or an event stream with a condition and a timeout.
+- Composable recipes (see the next gist) that a model can write, store and run by name, so a sequence worked out once (the press-capture-decode round, the two-radio comparison) becomes a step the next run calls rather than re-derives; the model proposes, the operator accepts, as with signatures in plan 19.3.
+- Results that say how far to trust them (a layer-1 rate with its source, `runs` or `cyclo`; a decode with its frame count and integrity), so a model can tell a good answer from one to double-check, the way the session caught the 1600 Bd read.
+- A graded surface: the same vocabulary works for today's small model through a few high-level ops and recipes, and for a stronger model through the low-level ops and graph editing, so the node does not need rewriting as models improve; the `allow` gate stays the operator's line for what any model may change.
+- The field craft as the playbook a model reads (it is already AGENTS.md), extended with worked sessions like this one written as recipes rather than prose.
+
+Prerequisites already in TODO: recipes (below), the rtl_433 live decoder (spec draft `docs/superpowers/specs/2026-11-04-ism-remotes-design.md`), the layer-1 OOK fixes. Brainstorm with the operator before a spec.
+
 ## Architecture: recipes the node stores and runs by name
 
 From the operator, 2026-11-02. A job setup (all ACARS channels on one radio, the CB plan with transcribers, the sonde watch with a pre-placed decoder) is reproduced from text each time: field craft prose, the scratch scripts on the field host, now `RECIPES.md`. The node cannot tell "the ACARS set" from seven unrelated jobs, and an agent re-derives the ops every run. A recipe should be a thing the node stores next to pins and plans (one JSON file each, `recipes/*.json` built in plus an operator directory as for mode rows): a name, the preconditions, the ops in order, and a start, a status and a stop by name (`recipe_start`, `recipe_status`, `recipe_stop`), with `plan_start` as the one-step special case it generalises. `RECIPES.md` is the stop-gap and the spec material: its JSON blocks are the ops a loader would lift unchanged.
