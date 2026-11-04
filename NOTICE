@@ -1,0 +1,43 @@
+ZetaSDR
+Copyright 2026 Sage Grigull
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles the third-party material below. Each keeps its own licence.
+
+iNTERCEPT signal catalogue
+  Path:      crates/zeta-dsp/data/signals.json (notice: crates/zeta-dsp/data/NOTICE)
+  Source:    https://github.com/smittix/intercept
+  Licence:   Apache-2.0
+  Copyright: Copyright 2025 smittix
+  Copied unchanged.
+
+Leaflet 1.9.4
+  Path:      crates/zeta-ui/web/vendor/leaflet (licence: LICENSE in that directory)
+  Source:    https://leafletjs.com
+  Licence:   BSD-2-Clause
+  Copyright: Copyright (c) 2010-2023, Volodymyr Agafonkin
+             Copyright (c) 2010-2011, CloudMade
+
+Fonts of the page themes
+  Path:      themes/<theme>/ (each font with its licence text, OFL-*.txt, beside it)
+  Licence:   SIL Open Font License 1.1
+  Antonio (themes/console)
+             Copyright 2013 The Antonio Project Authors (https://github.com/googlefonts/antonioFont)
+  Orbitron (themes/cyberpunk)
+             Copyright 2018 The Orbitron Project Authors (https://github.com/theleagueof/orbitron), with Reserved Font Name "Orbitron"
+  Share Tech Mono (themes/cyberpunk)
+             Copyright (c) 2012, Carrois Type Design, Ralph du Carrois (post@carrois.com www.carrois.com), with Reserved Font Name 'Share'
+  Comfortaa (themes/psytrance)
+             Copyright 2011 The Comfortaa Project Authors (https://github.com/alexeiva/comfortaa), with Reserved Font Name "Comfortaa"
+  Nunito (themes/psytrance)
+             Copyright 2014 The Nunito Project Authors (https://github.com/googlefonts/nunito)
+  JetBrains Mono (themes/terminal, themes/vibecoder)
+             Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
+  Inter (themes/vibecoder)
+             Copyright 2020 The Inter Project Authors (https://github.com/rsms/inter)
+
+External programs
+  dump1090 and the rs1729 sonde decoders (rs41mod, dfm09mod, m20mod) are GPL
+  programs. ZetaSDR runs them as separate processes when the operator has
+  installed them; it neither distributes nor links them.

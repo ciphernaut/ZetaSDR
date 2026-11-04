@@ -1,0 +1,33 @@
+# cargo-deny: licences, bans and sources. Run: cargo deny check licenses bans sources
+# Copyleft (GPL, LGPL, AGPL) is not allowed; a dependency under one stops the build.
+
+[graph]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "MIT-0",                 # borrow-or-share
+    "BSL-1.0",               # soapysdr-sys
+    "CDLA-Permissive-2.0",   # webpki-root-certs (Mozilla root store data)
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -8,6 +8,10 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/ciphernaut/ZetaSDR"
+homepage = "https://github.com/ciphernaut/ZetaSDR"
+readme = "README.md"
+authors = ["Sage Grigull <ciphernaut@proton.me>"]
 
 # The e2e and DSP tests run debug builds; unoptimised FFTs dominate their time.
 [profile.dev.package.rustfft]

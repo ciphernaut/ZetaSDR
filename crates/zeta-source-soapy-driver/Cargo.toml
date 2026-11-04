@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "ZetaSDR SoapySDR driver adapter (links libSoapySDR; outside the workspace)"
+repository = "https://github.com/ciphernaut/ZetaSDR"
+homepage = "https://github.com/ciphernaut/ZetaSDR"
 publish = false
+keywords = ["sdr", "radio", "dsp"]
+categories = ["science"]
 
 # Excluded from the workspace (root Cargo.toml `exclude`): soapysdr-sys needs
 # libsoapysdr-dev to build, which the workspace gate must never require.

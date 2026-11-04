@@ -3,6 +3,13 @@ name = "zeta-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+publish = false
+keywords = ["sdr", "radio", "dsp"]
+categories = ["science"]
 description = "LLM agent loop for ZetaSDR"
 
 [[bin]]
