@@ -267,17 +267,17 @@ ul { max-width: 1000px; }
 <p>Two rules cover most cases. A USB radio on another machine is attached by running a node on that machine and adding it here with <code>--source-node</code>. Speech that needs a GPU elsewhere goes through <code>--stt-node</code> to the node that has the GPU. Every flag that wires something in (<code>--source-*</code>, <code>--plugin</code>, <code>--knowledge-acma</code>, <code>--stt-*</code>, <code>--llm-*</code>, <code>--modes-dir</code>, <code>--themes-dir</code>) belongs to the serving node and must be repeated on every start. A client using <code>--node</code> passes none of them.</p>
 <p>There are two MCP directions. <code>zeta-mcp</code> makes the node an MCP <em>server</em> for Claude Code and similar clients. With <code>--knowledge-acma</code>, the node is an MCP <em>client</em> of the register. There are also two agent paths. <code>zeta ask</code> runs the tool loop wherever it is started. <code>POST /ask</code> (the page's agent pane) runs it inside the node, so the node's own <code>--llm-url</code> must reach the LLM.</p>
 
-<h2>Two ways a model drives the node</h2>
+<h2>How a model drives the node: who runs the loop, and the doors in</h2>
 <p>A configured LLM never touches the node. It answers with tool calls, and zeta's own loop executes each one behind a gate that code enforces. An external coding agent such as Claude Code is a client with the secret. It runs its own loop, calls the node over HTTP the way any script does, and is held only by the guide's rules and the operator's approval of its tool calls.</p>
 <figure>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 664" width="1440" height="664" role="img" aria-label="Two agent paths: a configured LLM proposes calls that zeta-agent executes behind an allowance gate; an external coding agent runs its own loop and reaches the node through zeta-mcp, the CLI or raw HTTP with no gate, or hands the request to the node's own agent through POST /ask." font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" fill="currentColor" >
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 664" width="1440" height="664" role="img" aria-label="How a model drives the node: a configured LLM proposes calls that zeta-agent executes behind an allowance gate; an external coding agent runs its own loop and reaches the node through zeta-mcp, the CLI or raw HTTP with no gate, or hands the request to the node's own agent through POST /ask." font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" fill="currentColor" >
 <defs>
 <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
 <marker id="arrow-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 10 0 L 0 5 L 10 10 z" fill="currentColor"/></marker>
 </defs>
 <rect x="0" y="0" width="1440" height="664" fill="#fbfbf9"/>
-<text x="18" y="32" font-size="22" text-anchor="start" opacity="1" font-weight="700">Two ways a model drives the node</text>
-<text x="390" y="32" font-size="12" text-anchor="start" opacity="0.8">who runs the tool loop, what can refuse a call, and how the ops log records it</text>
+<text x="18" y="32" font-size="22" text-anchor="start" opacity="1" font-weight="700">How a model drives the node</text>
+<text x="330" y="32" font-size="12" text-anchor="start" opacity="0.8">who runs the loop (A: zeta, B: the agent), the doors in, what can refuse a call, and how the ops log records it</text>
 <rect x="20" y="58" width="680" height="470" rx="10" fill="currentColor" fill-opacity="0.025"/>
 <text x="34" y="80" font-size="13" text-anchor="start" opacity="1" font-weight="700">A. A configured LLM: zeta runs the loop</text>
 <text x="34" y="96" font-size="10.5" text-anchor="start" opacity="0.75" font-style="italic">POST /ask (the page's agent pane) or zeta ask; the model only proposes calls</text>

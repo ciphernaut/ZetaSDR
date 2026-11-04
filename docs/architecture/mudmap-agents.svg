@@ -1,11 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 664" width="1440" height="664" role="img" aria-label="Two agent paths: a configured LLM proposes calls that zeta-agent executes behind an allowance gate; an external coding agent runs its own loop and reaches the node through zeta-mcp, the CLI or raw HTTP with no gate, or hands the request to the node's own agent through POST /ask." font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" fill="currentColor" style="color:#1b1f24">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 664" width="1440" height="664" role="img" aria-label="How a model drives the node: a configured LLM proposes calls that zeta-agent executes behind an allowance gate; an external coding agent runs its own loop and reaches the node through zeta-mcp, the CLI or raw HTTP with no gate, or hands the request to the node's own agent through POST /ask." font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" fill="currentColor" style="color:#1b1f24">
 <defs>
 <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>
 <marker id="arrow-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 10 0 L 0 5 L 10 10 z" fill="currentColor"/></marker>
 </defs>
 <rect x="0" y="0" width="1440" height="664" fill="#fbfbf9"/>
-<text x="18" y="32" font-size="22" text-anchor="start" opacity="1" font-weight="700">Two ways a model drives the node</text>
-<text x="390" y="32" font-size="12" text-anchor="start" opacity="0.8">who runs the tool loop, what can refuse a call, and how the ops log records it</text>
+<text x="18" y="32" font-size="22" text-anchor="start" opacity="1" font-weight="700">How a model drives the node</text>
+<text x="330" y="32" font-size="12" text-anchor="start" opacity="0.8">who runs the loop (A: zeta, B: the agent), the doors in, what can refuse a call, and how the ops log records it</text>
 <rect x="20" y="58" width="680" height="470" rx="10" fill="currentColor" fill-opacity="0.025"/>
 <text x="34" y="80" font-size="13" text-anchor="start" opacity="1" font-weight="700">A. A configured LLM: zeta runs the loop</text>
 <text x="34" y="96" font-size="10.5" text-anchor="start" opacity="0.75" font-style="italic">POST /ask (the page's agent pane) or zeta ask; the model only proposes calls</text>

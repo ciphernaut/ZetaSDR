@@ -180,8 +180,8 @@ svg_text = "\n".join(svg)
 # reaches the node as any HTTP client does: no gate, only the guide's words.
 parts.clear()
 AW, AH = 1440, 664
-text(18, 32, "Two ways a model drives the node", size=22, bold=True, op=1)
-text(390, 32, "who runs the tool loop, what can refuse a call, and how the ops log records it", size=12, op=0.8)
+text(18, 32, "How a model drives the node", size=22, bold=True, op=1)
+text(330, 32, "who runs the loop (A: zeta, B: the agent), the doors in, what can refuse a call, and how the ops log records it", size=12, op=0.8)
 
 def panel(x0, x1, title, sub):
     emit(f'<rect x="{x0}" y="58" width="{x1 - x0}" height="470" rx="10" fill="currentColor" fill-opacity="0.025"/>')
@@ -237,7 +237,7 @@ for x, *_, lab in doors:
     text(x + DW / 2 + 5, DY + DH + 26, lab, size=9.2)
 
 asvg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {AW} {AH}" width="{AW}" height="{AH}" role="img" '
-        f'aria-label="Two agent paths: a configured LLM proposes calls that zeta-agent executes behind an allowance gate; an external coding agent runs its own loop and reaches the node through zeta-mcp, the CLI or raw HTTP with no gate, or hands the request to the node\'s own agent through POST /ask." '
+        f'aria-label="How a model drives the node: a configured LLM proposes calls that zeta-agent executes behind an allowance gate; an external coding agent runs its own loop and reaches the node through zeta-mcp, the CLI or raw HTTP with no gate, or hands the request to the node\'s own agent through POST /ask." '
         f'font-family="{FONT}" fill="currentColor" style="color:#1b1f24">'] + svg[1:5] + \
        [f'<rect x="0" y="0" width="{AW}" height="{AH}" fill="#fbfbf9"/>'] + parts + ['</svg>']
 agents_svg = "\n".join(asvg)
@@ -332,7 +332,7 @@ ul {{ max-width: 1000px; }}
 <p>Two rules cover most cases. A USB radio on another machine is attached by running a node on that machine and adding it here with <code>--source-node</code>. Speech that needs a GPU elsewhere goes through <code>--stt-node</code> to the node that has the GPU. Every flag that wires something in (<code>--source-*</code>, <code>--plugin</code>, <code>--knowledge-acma</code>, <code>--stt-*</code>, <code>--llm-*</code>, <code>--modes-dir</code>, <code>--themes-dir</code>) belongs to the serving node and must be repeated on every start. A client using <code>--node</code> passes none of them.</p>
 <p>There are two MCP directions. <code>zeta-mcp</code> makes the node an MCP <em>server</em> for Claude Code and similar clients. With <code>--knowledge-acma</code>, the node is an MCP <em>client</em> of the register. There are also two agent paths. <code>zeta ask</code> runs the tool loop wherever it is started. <code>POST /ask</code> (the page's agent pane) runs it inside the node, so the node's own <code>--llm-url</code> must reach the LLM.</p>
 
-<h2>Two ways a model drives the node</h2>
+<h2>How a model drives the node: who runs the loop, and the doors in</h2>
 <p>A configured LLM never touches the node. It answers with tool calls, and zeta's own loop executes each one behind a gate that code enforces. An external coding agent such as Claude Code is a client with the secret. It runs its own loop, calls the node over HTTP the way any script does, and is held only by the guide's rules and the operator's approval of its tool calls.</p>
 <figure>
 {agents_svg.replace('style="color:#1b1f24"', '')}
