@@ -34,6 +34,11 @@ if [ -z "$gl" ]; then
   exit 2
 fi
 
+if ! command -v strings >/dev/null 2>&1; then
+  echo "public-check: strings not found (install binutils); binary files cannot be scanned" >&2
+  exit 2
+fi
+
 # Tracked files, minus the excluded globs.
 specs=(.)
 if [ -f "$exclude" ]; then
@@ -50,6 +55,18 @@ nfiles=$(grep -c . "$tmp/files" || true)
 : >"$tmp/deny"
 if [ -f "$denylist" ]; then
   sed -e 's/^[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$denylist" >"$tmp/deny"
+  # every pattern must compile; the message names the line, never the pattern
+  n=0
+  while IFS= read -r pat || [ -n "$pat" ]; do
+    n=$((n + 1))
+    case $pat in *[![:space:]]*) ;; *) continue ;; esac
+    s=0
+    grep -E -e "$pat" /dev/null >/dev/null 2>&1 || s=$?
+    if [ "$s" -gt 1 ]; then
+      echo "public-check: denylist: invalid pattern on line $n" >&2
+      exit 2
+    fi
+  done <"$tmp/deny"
 else
   echo "public-check: no private denylist; built-in checks only"
 fi
@@ -81,13 +98,24 @@ allowed() {
   return 1
 }
 
+# run_grep ARGS...: grep, where no match is fine and any error ends the gate.
+run_grep() {
+  local s=0
+  grep "$@" 2>/dev/null || s=$?
+  if [ "$s" -gt 1 ]; then
+    echo "public-check: grep failed (status $s)" >&2
+    kill -TERM "$$"
+  fi
+  return 0
+}
+
 # scan_file PATH TEXTFILE: appends "path:line: check" for every hit.
 scan_file() {
   local f=$1 src=$2 m n text check re
   if [ -s "$tmp/deny" ]; then
     while IFS= read -r m; do
       echo "$f:${m%%:*}: denylist" >>"$tmp/hits"
-    done < <(grep -n -iE -f "$tmp/deny" "$src" 2>/dev/null || true)
+    done < <(run_grep -n -iE -f "$tmp/deny" "$src")
   fi
   for check in coordinates local-host; do
     if [ "$check" = coordinates ]; then re=$coord_re; else re=$host_re; fi
@@ -95,7 +123,7 @@ scan_file() {
       n=${m%%:*}
       text=${m#*:}
       if ! allowed "$f" "$text"; then echo "$f:$n: $check" >>"$tmp/hits"; fi
-    done < <(grep -nE -- "$re" "$src" 2>/dev/null || true)
+    done < <(run_grep -nE -e "$re" "$src")
   done
 }
 
@@ -105,7 +133,10 @@ while IFS= read -r f; do
     scan_file "$f" "$root/$f"
   else
     # binary: scan the printable strings (the line is the strings' line)
-    strings -n 4 "$root/$f" >"$tmp/strings" 2>/dev/null || true
+    if ! strings -n 4 "$root/$f" >"$tmp/strings" 2>/dev/null; then
+      echo "public-check: strings failed on $f" >&2
+      exit 2
+    fi
     scan_file "$f" "$tmp/strings"
   fi
 done <"$tmp/files"

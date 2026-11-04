@@ -149,9 +149,23 @@ excluded_paths_are_skipped() {
   pass excluded_paths_are_skipped
 }
 
+bad_denylist_regex_fails() {
+  local d
+  d=$(repo badre)
+  echo "foo bar" >"$d/a.md"
+  track "$d"
+  printf '%s\n' "# c" "fo""o(bar" >"$base/bad.txt"
+  run "$d" ZETA_PUBLIC_DENYLIST="$base/bad.txt"
+  [ $rc -ne 0 ] || fail bad_denylist_regex_fails "rc=0 $out"
+  case $out in *"clean"*) fail bad_denylist_regex_fails "$out" ;; esac
+  case $out in *"foo"*) fail bad_denylist_regex_fails "pattern printed: $out" ;; esac
+  pass bad_denylist_regex_fails
+}
+
 clean_tree_passes
 denylist_hit_fails
 message_omits_pattern
+bad_denylist_regex_fails
 coordinates_fail_unless_allowed
 local_host_with_port_fails
 svg_and_binary_are_scanned
