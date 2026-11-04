@@ -647,16 +647,22 @@ const REMOTE_BAUD: f64 = 3_200.0;
 /// How far the inferred rate may stray from [`REMOTE_BAUD`], as a fraction.
 const REMOTE_BAUD_TOLERANCE: f64 = 0.02;
 
-/// The real remote's windows from `zeta-dsp`'s fixtures (a B210 at 61 440 Hz and a
-/// HackRF at 62 500 Hz, both at 433.882 MHz), each written to the store with the
+/// The real remote's windows from `zeta-dsp`'s fixtures (B210 at 51 200 and 61 440 Hz,
+/// a HackRF at 62 500 Hz, all at 433.882 MHz), each written to the store with the
 /// features the node's own burst capture measures (`measure_band` over the capture's
-/// band): `bits_start` with nothing given picks OOK at the chip rate, not FSK at the
-/// bit rate's harmonic (the HackRF window read `fsk` at 1598 Bd).
+/// band): `bits_start` with nothing given picks OOK at the chip rate, not FSK (the
+/// HackRF window read `fsk` at 1598 Bd, the bit rate's harmonic; the 433882k ones `fsk`).
 #[tokio::test]
 async fn bits_start_infers_ook_at_the_chip_rate_on_a_real_remote() {
     let dir = tempfile::tempdir().unwrap();
     let node = open(dir.path()).await;
-    for name in ["ook-remote-b210-1", "ook-remote-hackrf-1"] {
+    for name in [
+        "ook-remote-433882k-1",
+        "ook-remote-433882k-2",
+        "ook-remote-b210-1",
+        "ook-remote-b210-2",
+        "ook-remote-hackrf-1",
+    ] {
         let meta = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../zeta-dsp/tests/data")
             .join(format!("{name}.sigmf-meta"));

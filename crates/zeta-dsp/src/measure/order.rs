@@ -121,8 +121,29 @@ pub(super) fn fsk_clusters(
         .collect();
     let env: Vec<f32> = band.iter().flatten().map(|s| s.norm()).collect();
     let on = FSK_ON_FRACTION * super::percentile(&env, FSK_ON_PERCENTILE);
-    let freqs: Vec<Vec<f32>> = band.iter().map(|x| discriminator(x)).collect();
-    // Each discriminator sample with the envelope of the two samples it spans.
+    // Each run's discriminator, its samples where the signal is off (either sample it
+    // spans under `on`) held at the run's mean on-frequency: they take no part in the
+    // histogram, and in the tone share's spectrum they add no power off its DC.
+    let freqs: Vec<Vec<f32>> = band
+        .iter()
+        .map(|x| {
+            let d = discriminator(x);
+            let is_on: Vec<bool> = x
+                .windows(2)
+                .map(|w| w[0].norm().min(w[1].norm()) >= on)
+                .collect();
+            let (sum, n) = d
+                .iter()
+                .zip(&is_on)
+                .filter(|(_, o)| **o)
+                .fold((0.0f64, 0usize), |(s, n), (v, _)| (s + *v as f64, n + 1));
+            let mean = (sum / n.max(1) as f64) as f32;
+            d.iter()
+                .zip(&is_on)
+                .map(|(&v, &o)| if o { v } else { mean })
+                .collect()
+        })
+        .collect();
     let on_samples = band.iter().zip(&freqs).flat_map(|(x, d)| {
         d.iter()
             .zip(x.windows(2))
@@ -152,7 +173,8 @@ pub(super) fn fsk_clusters(
     (spacing >= FSK_SEP_HZ.0).then(|| (c.len() as u8, Hz(spacing.round() as u64)))
 }
 
-/// Share of the power of the instantaneous frequency `freqs` (one per run;
+/// Share of the power of the instantaneous frequency `freqs` (one per run, its off
+/// samples held at the run's mean on-frequency by [`fsk_clusters`];
 /// its spectrum averaged over them) between `MIN_LINE_HZ` and `max_hz` that
 /// its strongest line (that bin and `FSK_LINE_BINS` either side) holds.
 fn tone_share(freqs: &[Vec<f32>], rate_hz: u64, max_hz: f64) -> Option<f64> {
@@ -299,23 +321,24 @@ const OOK_UNIT_MIN_RUNS: usize = 16;
 const OOK_UNIT_MIN_SAMPLES: f64 = 2.0;
 /// OOK chip rate: refinements of the unit by its least-squares fit.
 const OOK_UNIT_ITERATIONS: usize = 4;
+/// OOK chip rate: the runs of at most `OOK_UNIT_MAX_MULTIPLE` units must be at least
+/// this share of all runs. A half or a third of the chip fits every run of a few chips,
+/// but pushes the longer ones past the bound.
+const OOK_UNIT_MIN_FITTED_SHARE: f64 = 0.5;
+/// OOK chip rate: the multiples of the converged unit tried as the chip, the largest
+/// that still fits kept: a seed on a half or a third of the chip converges there, and
+/// every run is then a whole multiple of it as of the chip.
+const OOK_UNIT_MULTIPLES: [f64; 2] = [2.0, 3.0];
 
 /// The chip rate of on-off keying in `runs` from its run lengths: each run
 /// band-passed to the occupied band `offset_hz ± bandwidth_hz / 2`, and when its
-/// envelope sits at two levels with the lower off ([`two_levels`]), cut into on
-/// and off runs at the `OOK_EDGE_ON` / `OOK_EDGE_OFF` fractions of the
-/// `OOK_TOP_PERCENTILE`th-percentile envelope (the first and last run of each, cut
-/// by the window, dropped). The unit is seeded by the
-/// `OOK_UNIT_SEED_PERCENTILE`th-percentile run and refined
-/// `OOK_UNIT_ITERATIONS` times as the least-squares unit of the runs of at most
-/// `OOK_UNIT_MAX_MULTIPLE` units (sum of lengths over sum of nearest
-/// multiples), so an edge threshold that shortens every on run and lengthens
-/// every off run by the same time cancels between them. The rate is `rate_hz`
-/// over the unit when at least `OOK_UNIT_MIN_RUNS` runs, and `OOK_UNIT_MIN_SHARE`
-/// of those fitted, lie within `OOK_UNIT_TOLERANCE` of a multiple; else `None`.
-/// The cyclostationary lines of pulse-width keying stand at its bit rate and
-/// harmonics (an EV1527 remote, a bit of four chips, read 1598 Bd for 3200),
-/// while its run lengths are whole chips.
+/// envelope sits at two levels with the lower off ([`two_levels`]) and it carries no
+/// FSK tones ([`fsk_clusters`]: a dense train of FSK packets is two envelope levels
+/// too), cut into on and off runs at the `OOK_EDGE_ON` / `OOK_EDGE_OFF` fractions of
+/// the `OOK_TOP_PERCENTILE`th-percentile envelope (the first and last run of each, cut
+/// by the window, dropped), and the unit found by [`chip_unit`]. The cyclostationary
+/// lines of pulse-width keying stand at its bit rate and harmonics (an EV1527 remote, a
+/// bit of four chips, read 1598 Bd for 3200), while its run lengths are whole chips.
 pub(super) fn ook_unit_rate(
     runs: &[&[Complex<f32>]],
     rate_hz: u64,
@@ -326,7 +349,7 @@ pub(super) fn ook_unit_rate(
         .map(|r| bandpass(r, rate_hz, offset_hz, bandwidth_hz as f64))
         .collect();
     let slices: Vec<&[Complex<f32>]> = band.iter().map(|b| b.as_slice()).collect();
-    if !two_levels(&slices) {
+    if !two_levels(&slices) || fsk_clusters(runs, rate_hz, (offset_hz, bandwidth_hz)).is_some() {
         return None;
     }
     let env: Vec<f32> = band.iter().flatten().map(|s| s.norm()).collect();
@@ -348,34 +371,255 @@ pub(super) fn ook_unit_rate(
         }
         lengths.extend(edges.windows(2).map(|w| (w[1] - w[0]) as f64));
     }
-    if lengths.len() < OOK_UNIT_MIN_RUNS {
-        return None;
+    let unit = chip_unit(&lengths, None)?;
+    Some(zeta_core::types::Baud(
+        (rate_hz as f64 / unit).round() as u32
+    ))
+}
+
+/// Whether `unit` fits `lengths`: of the runs within `OOK_UNIT_MAX_MULTIPLE` units
+/// (at least `OOK_UNIT_MIN_FITTED_SHARE` of all), at least `OOK_UNIT_MIN_RUNS`, and
+/// `OOK_UNIT_MIN_SHARE` of them, lie within `OOK_UNIT_TOLERANCE` of a whole multiple
+/// of at least 1 (a run under half a unit fits none).
+fn unit_fits(lengths: &[f64], unit: f64) -> bool {
+    if unit < OOK_UNIT_MIN_SAMPLES {
+        return false;
     }
-    let mut sorted = lengths.clone();
-    sorted.sort_by(f64::total_cmp);
-    let mut unit = sorted[(sorted.len() - 1) * OOK_UNIT_SEED_PERCENTILE / 100];
-    let fit = |unit: f64| {
-        lengths.iter().filter_map(move |&l| {
-            let k = (l / unit).round();
-            (1.0..=OOK_UNIT_MAX_MULTIPLE).contains(&k).then_some((l, k))
-        })
-    };
+    let within: Vec<f64> = lengths
+        .iter()
+        .map(|&l| l / unit)
+        .filter(|&r| r.round() <= OOK_UNIT_MAX_MULTIPLE)
+        .collect();
+    let close = within
+        .iter()
+        .filter(|&&r| r.round() >= 1.0 && (r - r.round()).abs() <= OOK_UNIT_TOLERANCE)
+        .count();
+    within.len() as f64 >= OOK_UNIT_MIN_FITTED_SHARE * lengths.len() as f64
+        && close >= OOK_UNIT_MIN_RUNS
+        && close as f64 >= OOK_UNIT_MIN_SHARE * within.len() as f64
+}
+
+/// `unit` refined `OOK_UNIT_ITERATIONS` times as the least-squares unit of the runs of
+/// 1 to `OOK_UNIT_MAX_MULTIPLE` units (sum of lengths over sum of nearest multiples), so
+/// an edge threshold that shortens every on run and lengthens every off run by the same
+/// time cancels between them; `None` when it falls under `OOK_UNIT_MIN_SAMPLES` or no
+/// run fits.
+fn refine_unit(lengths: &[f64], mut unit: f64) -> Option<f64> {
     for _ in 0..OOK_UNIT_ITERATIONS {
         if unit < OOK_UNIT_MIN_SAMPLES {
             return None;
         }
-        let (sum_l, sum_k) = fit(unit).fold((0.0, 0.0), |(a, b), (l, k)| (a + l, b + k));
+        let (sum_l, sum_k) = lengths
+            .iter()
+            .map(|&l| (l, (l / unit).round()))
+            .filter(|(_, k)| (1.0..=OOK_UNIT_MAX_MULTIPLE).contains(k))
+            .fold((0.0, 0.0), |(a, b), (l, k)| (a + l, b + k));
         if sum_k == 0.0 {
             return None;
         }
         unit = sum_l / sum_k;
     }
-    let fitted = fit(unit).count();
-    let close = fit(unit)
-        .filter(|&(l, k)| (l / unit - k).abs() <= OOK_UNIT_TOLERANCE)
-        .count();
-    (unit >= OOK_UNIT_MIN_SAMPLES
-        && close >= OOK_UNIT_MIN_RUNS
-        && close as f64 >= OOK_UNIT_MIN_SHARE * fitted as f64)
-        .then(|| zeta_core::types::Baud((rate_hz as f64 / unit).round() as u32))
+    Some(unit)
+}
+
+/// The chip, in samples, of the on and off run `lengths`: from `seed` (else the
+/// `OOK_UNIT_SEED_PERCENTILE`th-percentile run) refined ([`refine_unit`]), then each of
+/// `OOK_UNIT_MULTIPLES` of it refined in turn, the largest unit that fits
+/// ([`unit_fits`]) kept; `None` with fewer than `OOK_UNIT_MIN_RUNS` runs or when none
+/// fits.
+fn chip_unit(lengths: &[f64], seed: Option<f64>) -> Option<f64> {
+    if lengths.len() < OOK_UNIT_MIN_RUNS {
+        return None;
+    }
+    let seed = seed.unwrap_or_else(|| {
+        let mut sorted = lengths.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted[(sorted.len() - 1) * OOK_UNIT_SEED_PERCENTILE / 100]
+    });
+    let base = refine_unit(lengths, seed)?;
+    std::iter::once(base)
+        .chain(
+            OOK_UNIT_MULTIPLES
+                .iter()
+                .filter_map(|&m| refine_unit(lengths, m * base)),
+        )
+        .filter(|&u| unit_fits(lengths, u))
+        .max_by(f64::total_cmp)
+}
+
+#[cfg(all(test, feature = "test-fixtures"))]
+mod tests {
+    use num_complex::Complex;
+
+    use super::{chip_unit, ook_unit_rate};
+    use crate::fixtures::{Impairments, SynthSpec, am_modulate, awgn, speech_like, synthesise};
+
+    const RATE: u64 = 48_000;
+    /// The EV1527 remote's chip, in samples at 61 440 Hz (3200 chips/s).
+    const CHIP: f64 = 19.2;
+    /// The edge threshold's bias on a real remote: on runs read this much of a chip
+    /// short and off runs as much long (280 us pulses for a 313 us chip).
+    const BIAS: f64 = 0.1;
+    /// How far a found unit or rate may stray from the chip's, as a fraction.
+    const TOLERANCE: f64 = 0.02;
+    /// 240 non-repeating bits.
+    const BITS: &str = "14ed58c6d3ff2d75a5650138a8d447f00ec47321d420c5d08bec3850735c";
+
+    fn lcg(seed: u64) -> impl FnMut() -> u64 {
+        let mut s = seed;
+        move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            s >> 33
+        }
+    }
+
+    /// The on and off run lengths, in samples, of `frames` EV1527 frames (24 bits, a 0
+    /// one chip on and three off, a 1 three on and one off, then the sync pulse and 31
+    /// chips of silence), each run biased by [`BIAS`] and jittered by up to a sample.
+    fn ev1527_runs(frames: usize) -> Vec<f64> {
+        const CODE: u32 = <button-code>;
+        let mut r = lcg(0xe715);
+        let mut jitter = move || (r() % 3) as f64 - 1.0;
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            let mut chips: Vec<(f64, f64)> = (0..24)
+                .rev()
+                .map(|b| {
+                    if (CODE >> b) & 1 == 1 {
+                        (3.0, 1.0)
+                    } else {
+                        (1.0, 3.0)
+                    }
+                })
+                .collect();
+            chips.push((1.0, 31.0));
+            for (on, off) in chips {
+                out.push((on - BIAS) * CHIP + jitter());
+                out.push((off + BIAS) * CHIP + jitter());
+            }
+        }
+        out
+    }
+
+    /// The run lengths of NRZ OOK of `bits` random bits, one chip a bit.
+    fn nrz_runs(bits: usize) -> Vec<f64> {
+        let mut r = lcg(0x4e52);
+        let b: Vec<u64> = (0..bits).map(|_| r() & 1).collect();
+        let mut out = Vec::new();
+        let mut n = 1.0;
+        for w in b.windows(2) {
+            if w[0] == w[1] {
+                n += 1.0;
+            } else {
+                out.push(n * CHIP);
+                n = 1.0;
+            }
+        }
+        out
+    }
+
+    /// Seeded on half and a third of the chip (where the least-squares fit alone
+    /// converges, every short run a whole multiple of it), the search still returns the
+    /// chip: its multiples are tried and the largest that fits kept.
+    #[test]
+    fn the_chip_of_pwm_and_nrz_runs_is_found_from_any_seed() {
+        for (what, runs) in [("pwm", ev1527_runs(12)), ("nrz", nrz_runs(400))] {
+            for seed in [None, Some(CHIP / 2.0), Some(CHIP / 3.0)] {
+                let u = chip_unit(&runs, seed);
+                assert!(
+                    u.is_some_and(|u| (u - CHIP).abs() <= CHIP * TOLERANCE),
+                    "{what} from {seed:?}: {u:?}"
+                );
+            }
+        }
+    }
+
+    /// `iq` measured over the whole band at [`RATE`].
+    fn rate_of(iq: &[Complex<f32>]) -> Option<u32> {
+        ook_unit_rate(&[iq], RATE, (0.0, RATE)).map(|b| b.0)
+    }
+
+    fn noisy(mut iq: Vec<Complex<f32>>, seed: u64) -> Vec<Complex<f32>> {
+        awgn(&mut iq, 20.0, seed);
+        iq
+    }
+
+    fn within(r: Option<u32>, baud: u32) -> bool {
+        r.is_some_and(|r| (r as f64 - baud as f64).abs() <= baud as f64 * TOLERANCE)
+    }
+
+    /// Envelope keying of `runs` (on first, alternating), amplitude 1.
+    fn keyed(runs: &[f64]) -> Vec<Complex<f32>> {
+        let mut out = Vec::new();
+        for (i, &l) in runs.iter().enumerate() {
+            let a = if i % 2 == 0 { 1.0 } else { 0.0 };
+            out.extend(std::iter::repeat_n(
+                Complex::new(a, 0.0),
+                l.round() as usize,
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn ook_unit_rate_reads_the_chip_of_pwm_and_nrz_keying() {
+        // The EV1527 runs at 48 kHz: a chip of 15 samples, 3200 Bd.
+        let pwm: Vec<f64> = ev1527_runs(12).iter().map(|l| l * 15.0 / CHIP).collect();
+        let r = rate_of(&noisy(keyed(&pwm), 1));
+        assert!(within(r, 3_200), "pwm {r:?}");
+        let spec = SynthSpec::Ook {
+            symbol_rate_baud: 2_400,
+            bits: BITS.into(),
+            repeat: 4,
+            gap_ms: 0,
+        };
+        let iq = synthesise(&spec, &Impairments::default(), RATE as u32, 0);
+        let r = rate_of(&noisy(iq, 2));
+        assert!(within(r, 2_400), "nrz {r:?}");
+    }
+
+    #[test]
+    fn ook_unit_rate_reads_nothing_on_other_signals() {
+        let synth = |spec: SynthSpec| synthesise(&spec, &Impairments::default(), RATE as u32, 0);
+        let fsk = |repeat, gap_ms| {
+            synth(SynthSpec::Fsk {
+                symbol_rate_baud: 4_800,
+                deviation_hz: 2_400.0,
+                order: 2,
+                bits: BITS.into(),
+                repeat,
+                gap_ms,
+            })
+        };
+        let bpsk = synth(SynthSpec::Psk {
+            symbol_rate_baud: 4_800,
+            order: 2,
+            bits: BITS.into(),
+            repeat: 4,
+            gap_ms: 0,
+        });
+        let mut r = lcg(0x0153);
+        let mut u = move || (r() as f64 / (1u64 << 31) as f64 - 0.5) as f32;
+        let noise: Vec<Complex<f32>> = (0..RATE).map(|_| Complex::new(u(), u())).collect();
+        let am = am_modulate(
+            &speech_like(RATE as u32, 1.0),
+            RATE as u32,
+            RATE as u32,
+            1.0,
+            0.0,
+        );
+        // 50 ms packets of 2-FSK every 60 ms: two envelope levels, and every run a
+        // whole multiple of the 10 ms gap.
+        for (what, iq) in [
+            ("2-fsk", noisy(fsk(4, 0), 3)),
+            ("bpsk", noisy(bpsk, 4)),
+            ("fsk packet train", noisy(fsk(16, 10), 5)),
+            ("noise", noise),
+            ("am voice", noisy(am, 7)),
+        ] {
+            assert_eq!(rate_of(&iq), None, "{what}");
+        }
+    }
 }

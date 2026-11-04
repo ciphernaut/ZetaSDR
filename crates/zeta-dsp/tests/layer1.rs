@@ -194,6 +194,27 @@ fn centred_carrier_is_still_carrier() {
     }
 }
 
+/// A dense train of 2-FSK packets (50 ms at 4800 Bd every 60 ms) has two envelope
+/// levels and runs that are whole multiples of its 10 ms gap, but it carries tones: it
+/// labels `fsk` and its rate is not the packet train's 100 Bd.
+#[test]
+fn a_dense_fsk_packet_train_is_fsk_not_ook_runs() {
+    let spec = zeta_dsp::synth::SynthSpec::Fsk {
+        symbol_rate_baud: 4_800,
+        deviation_hz: 2_400.0,
+        order: 2,
+        bits: "14ed58c6d3ff2d75a5650138a8d447f00ec47321d420c5d08bec3850735c".into(),
+        repeat: 16,
+        gap_ms: 10,
+    };
+    let mut iq = zeta_dsp::synth::synthesise(&spec, &Default::default(), 48_000, CENTER);
+    awgn(&mut iq, 20.0, 41);
+    let f = measure(&iq, 48_000, CENTER);
+    let l = label("fsk packet train", &iq, 48_000);
+    assert_eq!(l.name, "fsk", "{l:?}");
+    assert_ne!(f.symbol_rate_baud.map(|b| b.0), Some(100), "{f:?}");
+}
+
 /// The real EV1527 remote's windows (433.88 MHz, chip 313 us, 3200 chips/s): B210 at
 /// 51 200 and 61 440 Hz, HackRF at 62 500 Hz.
 const OOK_REMOTES: [&str; 5] = [

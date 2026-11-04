@@ -517,7 +517,8 @@ pub(crate) fn measure_band_noted(
 /// received when gated, else the whole window) and the line it came from, when
 /// the envelope moves (`cv` at least `FM_MAX_CV`): the on-off keying's chip
 /// rate from its run lengths ([`ook_unit_rate`], `"runs"`) when the envelope
-/// sits at two levels and its runs are whole multiples of one unit, else
+/// sits at two levels, it shows no FSK tones and its runs are whole multiples of
+/// one unit, else
 /// [`cyclo_symbol_rate`] of the occupied band `offset_hz ± bandwidth_hz / 2`
 /// (from the block centre, band-passed per run), up to its width
 /// (`"cyclo"`); else, or when neither finds one, the [`symbol_rate`] keying
