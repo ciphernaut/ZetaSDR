@@ -893,7 +893,8 @@ mod tests {
     /// and 31 chips of silence), each on run `bias` chips short and each off run as much
     /// long, and jittered by up to a sample.
     fn ev1527_runs(frames: usize, bias: f64) -> Vec<(f64, bool)> {
-        const CODE: u32 = <button-code>;
+        // The public fixtures' invented remote ([`crate::fixtures::SYNTH_REMOTE_ID`]), button 4.
+        const CODE: u32 = 0xC0DE14;
         let mut r = lcg(0xe715);
         let mut jitter = move || (r() % 3) as f64 - 1.0;
         let mut out = Vec::new();

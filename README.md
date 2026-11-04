@@ -7,11 +7,11 @@ set of typed operations (36 of them). The same operations are reached from the `
 authenticated HTTP and websocket API, a web page the node serves (waterfall, jobs, map,
 transcripts), an MCP server, and an agent that lets a local LLM call them. Every job is a graph of
 stages: channelisers, NBFM/WFM/AM/SSB demodulators, decoders (APRS on 2 m, radiosondes, ADS-B,
-then RDS, ACARS and POCSAG pagers), measurement and classification, a band watch that identifies what appears, burst
-capture, transcription and a mix of every talking channel. It is for the radio amateur who wants
-the radio to do the fiddly work (hear what is on 2 m and 70 cm, track a radiosonde, see the
-aircraft overhead), and for an agent that needs operations it can call rather than a GUI to
-click. UHF CB and pager channels use the same machinery.
+then RDS, ACARS and POCSAG pagers), measurement and classification, a band watch that identifies
+what appears, burst capture, transcription and a mix of every talking channel. It is for the
+radio amateur who wants the radio to do the fiddly work (hear what is on 2 m and 70 cm, track a
+radiosonde, see the aircraft overhead), and for an agent that needs operations it can call rather
+than a GUI to click. UHF CB and pager channels use the same machinery.
 
 ![What plugs into a node, and where each piece may run](docs/architecture/mudmap.svg)
 
@@ -22,8 +22,9 @@ The figure shows what plugs into a node and which pieces may run on another host
 
 Version 0.1.0, for Linux. It is pre-1.0: operations and their fields may still change between
 releases, and both ends of a federated link should run the same version. The decoders are tested
-against synthesised signals and a few real recordings. Feedback is very welcome; at this stage
-contributions come as gists, not pull requests (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+against synthesised signals; the few real recordings they were also checked on are not published.
+Feedback is very welcome; at this stage contributions come as gists, not pull requests (see
+[CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Quick start without a radio
 
@@ -36,26 +37,27 @@ cd ZetaSDR
 cargo build --release -p zeta
 ```
 
-Play a recording as a source. The repository carries a few short captures of a 433.88 MHz key fob
-(on-off keyed bursts, recorded on a B210); a file source plays in real time and loops.
+Play a recording as a source. The repository carries a short synthesised capture of a 433.92 MHz
+key fob (an EV1527-style on-off keyed remote with an invented code, written by the `gen_ook`
+example); a file source plays in real time and loops.
 
 ```bash
 Z=./target/release/zeta
-REC=crates/zeta-dsp/tests/data/ook-remote-433882k-1.sigmf-meta
+REC=crates/zeta-dsp/tests/data/ook-ev1527-synth-1.sigmf-meta
 A="--state-dir scratch/state --source-file remote=$REC"
 $Z $A source list
-$Z $A job start --kind measure --source remote --center-hz 433882000 --bandwidth-hz 50000 --then-tail 1,3000
-$Z $A classify --source remote --start-ns 1793747342000000000 --end-ns 1793747343000000000 \
-    --center-hz 433882000 --bandwidth-hz 50000
+$Z $A job start --kind measure --source remote --center-hz 433920000 --bandwidth-hz 50000 --then-tail 1,3000
+$Z $A classify --source remote --start-ns 1767225600100000000 --end-ns 1767225601100000000 \
+    --center-hz 433920000 --bandwidth-hz 50000
 ```
 
 Each command opens the node, applies one operation, prints JSON and exits. `job start ...
---then-tail 1,3000` starts a `measure` job, waits for its first event and stops it: a 24 kHz wide
-signal 34 dB over the noise, labelled `ook` at about 3190 Bd, with its burst timing. `classify`
-runs over a span of the source's ring (a recording's clock starts at its `core:datetime`, so the
-span is a second just after 2026-11-03T23:09:01.96Z, in nanoseconds since the UNIX epoch). It adds
-catalogue names that fit the band ("ISM Device (433 MHz EU)", a key fob) and lists the decoders it
-tried under `tried`; none proved, so it names no protocol.
+--then-tail 1,3000` starts a `measure` job, waits for its first event and stops it: a 30 kHz wide
+signal about 40 dB over the noise, labelled `ook` at about 3190 Bd, with its burst timing.
+`classify` runs over a span of the source's ring (a recording's clock starts at its
+`core:datetime`, so the span is a second just after 2026-01-01T00:00:00.1Z, in nanoseconds since
+the UNIX epoch). It adds catalogue names that fit the band ("ISM Device (433 MHz EU)" among them)
+and lists the decoders it tried under `tried`; none proved, so it names no protocol.
 
 A decode needs a signal the node has a decoder for. The test fixtures include a synthesised APRS
 packet:
@@ -81,7 +83,7 @@ a second terminal, send operations to the running node; the page shows each one 
 
 ```bash
 export ZETA_NODE=http://127.0.0.1:7979 ZETA_SECRET=change-me-to-a-long-secret
-./target/release/zeta job start --kind measure --source remote --center-hz 433882000 --bandwidth-hz 50000
+./target/release/zeta job start --kind measure --source remote --center-hz 433920000 --bandwidth-hz 50000
 ./target/release/zeta job list
 ```
 

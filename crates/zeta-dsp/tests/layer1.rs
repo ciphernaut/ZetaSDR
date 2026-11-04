@@ -228,14 +228,18 @@ fn a_dense_fsk_packet_train_is_fsk_not_ook_runs() {
     assert_ne!(f.symbol_rate_baud.map(|b| b.0), Some(100), "{f:?}");
 }
 
-/// The real EV1527 remote's windows (433.88 MHz, chip 313 us, 3200 chips/s): B210 at
-/// 51 200 and 61 440 Hz, HackRF at 62 500 Hz.
-const OOK_REMOTES: [&str; 5] = [
+/// EV1527-style remote windows (chip 313 us, 3200 chips/s): the real remote's
+/// (433.88 MHz; B210 at 51 200 and 61 440 Hz, HackRF at 62 500 Hz; private captures,
+/// skipped when absent) and the public synthesised ones (`gen_ook`, 433.92 MHz at 51 200
+/// and 62 500 Hz).
+const OOK_REMOTES: [&str; 7] = [
     "ook-remote-433882k-1",
     "ook-remote-433882k-2",
     "ook-remote-b210-1",
     "ook-remote-b210-2",
     "ook-remote-hackrf-1",
+    "ook-ev1527-synth-1",
+    "ook-ev1527-synth-2",
 ];
 /// The remote's chip rate: the reciprocal of its shortest on or off run.
 const OOK_REMOTE_BAUD: f64 = 3_200.0;
@@ -244,11 +248,16 @@ const OOK_REMOTE_BAUD_TOLERANCE: f64 = 0.02;
 
 /// A fixture window as a burst capture measures it (`measure_band` over the capture's
 /// band, its annotation's edges) and as `classify` labels it (`measure_selection` on
-/// the same band): the features and the layer-1 label.
-fn ook_remote(name: &str) -> (zeta_core::classify::FeatureRecord, Label) {
+/// the same band): the features and the layer-1 label. `None`, with the reason printed,
+/// for a private capture not in this checkout; a missing public one fails.
+fn ook_remote(name: &str) -> Option<(zeta_core::classify::FeatureRecord, Label)> {
     let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data")
         .join(format!("{name}.sigmf-meta"));
+    if !meta.exists() && !name.starts_with("ook-ev1527-synth-") {
+        eprintln!("skipped: {name}: a private capture, not in this checkout");
+        return None;
+    }
     let (m, iq) = zeta_core::capture::read_cf32(&meta).expect("fixture");
     let a = &m.annotations[0];
     let edge = |k: &str| a[k].as_u64().expect("annotation edge");
@@ -266,16 +275,18 @@ fn ook_remote(name: &str) -> (zeta_core::classify::FeatureRecord, Label) {
     )
     .expect("a measurement");
     eprintln!("{name}: {f:?} -> {} ({})", l.name, l.evidence);
-    (f, l)
+    Some((f, l))
 }
 
 /// Pulse-width OOK (a 0 is one chip on and three off, a 1 three on and one off) has its
 /// strongest keying lines at the bit rate (800 bit/s) and its harmonics; the chip rate
 /// is the run lengths' unit, and every window measures it.
 #[test]
-fn a_real_ook_remote_measures_its_chip_rate() {
+fn an_ook_remote_measures_its_chip_rate() {
     for name in OOK_REMOTES {
-        let (f, _) = ook_remote(name);
+        let Some((f, _)) = ook_remote(name) else {
+            continue;
+        };
         let baud = f.symbol_rate_baud.map(|b| b.0 as f64);
         assert!(
             baud.is_some_and(
@@ -289,9 +300,11 @@ fn a_real_ook_remote_measures_its_chip_rate() {
 /// The remote's envelope sits at two levels, its off level the noise floor: layer 1
 /// labels every window `ook`, not `fsk` or `fm`.
 #[test]
-fn a_real_ook_remote_labels_ook() {
+fn an_ook_remote_labels_ook() {
     for name in OOK_REMOTES {
-        let (_, l) = ook_remote(name);
+        let Some((_, l)) = ook_remote(name) else {
+            continue;
+        };
         assert_eq!(l.name, "ook", "{name}: {l:?}");
     }
 }
@@ -313,7 +326,9 @@ const OOK_SPARSE_REMOTES: [&str; 3] = [
 #[test]
 fn a_sparse_ook_remote_window_measures_its_chip_rate() {
     for name in OOK_SPARSE_REMOTES {
-        let (f, _) = ook_remote(name);
+        let Some((f, _)) = ook_remote(name) else {
+            continue;
+        };
         let baud = f.symbol_rate_baud.map(|b| b.0 as f64);
         assert!(
             baud.is_some_and(
@@ -328,7 +343,9 @@ fn a_sparse_ook_remote_window_measures_its_chip_rate() {
 #[test]
 fn a_sparse_ook_remote_window_labels_ook() {
     for name in OOK_SPARSE_REMOTES {
-        let (f, l) = ook_remote(name);
+        let Some((f, l)) = ook_remote(name) else {
+            continue;
+        };
         assert_eq!(l.name, "ook", "{name}: {f:?} {l:?}");
         assert_eq!(f.tone_spacing_hz, None, "{name}: {f:?}");
     }

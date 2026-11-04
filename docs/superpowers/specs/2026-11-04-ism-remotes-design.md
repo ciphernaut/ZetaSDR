@@ -10,7 +10,7 @@ remote. Questions for the operator are in section 7.
 - An EV1527-class fixed-code OOK remote on the field host's B210: 433.876-433.885 MHz, 23-42 kHz occupied,
   30-36 dB SNR. The centre moved 9 kHz across 22 presses in two minutes (a SAW/LC fob's normal drift).
 - Pulse-width coding: 280 us and 907 us pulses, 344 us and 967 us gaps, a 1249 us bit, a 9.69 ms reset
-  after each 25-pulse row (24 bits and the sync pulse). Three codes seen, one 20-bit ID `<id>` and three
+  after each 25-pulse row (24 bits and the sync pulse). Three codes seen: one 20-bit ID `<id>` and three
   button nibbles, each code `<id>` and a nibble (`<button-code>`).
 - Plan 19.2's layer-4 chain decodes it after the slicer fix (branch `worktree-ook-remote-gist`), but only
   from a stored capture, after the fact, by hand.

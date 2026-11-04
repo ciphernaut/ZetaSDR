@@ -44,3 +44,7 @@ required-features = ["test-fixtures"]
 [[example]]
 name = "gen_pocsag"
 required-features = ["test-fixtures"]
+
+[[example]]
+name = "gen_ook"
+required-features = ["test-fixtures"]

@@ -480,10 +480,33 @@ async fn a_short_bpsk_burst_recovers_its_bits_without_resample() {
     assert_eq!(e, 0, "{e} bit errors");
 }
 
-/// Chip rate of the real OOK remote in the fixtures: about 313 us a chip.
+/// Chip rate of the OOK remotes in the fixtures: about 313 us a chip.
 const REMOTE_BAUD: u32 = 3_200;
-/// The remote's fixed code, read by pulse width from the fixtures.
-const REMOTE_CODE: u32 = <button-code>;
+
+/// The meta of fixture `name` (`tests/data/<name>.sigmf-meta`) and the codes its
+/// annotation says the window holds (`zeta:expected.codes`, hex), or `None` with the
+/// reason printed when the file is absent: the real remote's captures are the
+/// operator's and are not published; the synthesised `ook-ev1527-synth-*` always are.
+fn fixture(name: &str) -> Option<(std::path::PathBuf, Vec<u32>)> {
+    let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(format!("{name}.sigmf-meta"));
+    if !meta.exists() {
+        eprintln!("skipped: {name}: a private capture, not in this checkout");
+        return None;
+    }
+    let json: Value = serde_json::from_slice(&std::fs::read(&meta).expect("meta")).expect("json");
+    let codes = json["annotations"][0]["zeta:expected"]["codes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{name}: no zeta:expected.codes in its annotation"))
+        .iter()
+        .map(|c| {
+            let c = c.as_str().expect("a hex code");
+            u32::from_str_radix(c.trim_start_matches("0x"), 16).expect("a hex code")
+        })
+        .collect();
+    Some((meta, codes))
+}
 /// Chips of one EV1527 symbol: a 0 is `1000`, a 1 is `1110`.
 const EV1527_SYMBOL_CHIPS: usize = 4;
 /// Data bits of one EV1527 frame; the sync pulse makes its 25th symbol.
@@ -552,8 +575,8 @@ fn plan_stages(plan: &zeta_core::bits::BitsPlan) -> Vec<(String, Value)> {
 /// real-remote fixture `name` (`tests/data/<name>.sigmf-meta`, cf32 at 51 200 Hz centred
 /// on the remote): the plan is made from the fixture's own record and feature values,
 /// centred on the capture, OOK at [`REMOTE_BAUD`].
-async fn remote_codes(name: &str) -> (String, Vec<u32>) {
-    remote_codes_with(name, true).await.1
+async fn remote_codes(meta: &std::path::Path) -> (String, Vec<u32>) {
+    remote_codes_with(meta, true).await.1
 }
 
 /// The plan, chips and EV1527 codes the chain `bits_start` builds recovers from the
@@ -561,10 +584,10 @@ async fn remote_codes(name: &str) -> (String, Vec<u32>) {
 /// record and features, its measured centre kept as recorded unless `centred` (then the
 /// capture's own, so the chain does not shift).
 async fn remote_codes_with(
-    name: &str,
+    meta: &std::path::Path,
     centred: bool,
 ) -> (zeta_core::bits::BitsPlan, (String, Vec<u32>)) {
-    remote_codes_from(name, Features::Recorded { centred }).await
+    remote_codes_from(meta, Features::Recorded { centred }).await
 }
 
 /// Where [`remote_codes_from`] takes the plan's features from.
@@ -581,12 +604,15 @@ enum Features {
 /// The plan, chips and EV1527 codes the chain `bits_start` builds recovers from the
 /// real-remote fixture `name`, its plan made from the fixture's record and `features`.
 async fn remote_codes_from(
-    name: &str,
+    meta: &std::path::Path,
     features: Features,
 ) -> (zeta_core::bits::BitsPlan, (String, Vec<u32>)) {
-    let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data")
-        .join(format!("{name}.sigmf-meta"));
+    let meta = meta.to_path_buf();
+    let name = meta
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("a fixture name")
+        .to_string();
     let (m, iq) = zeta_core::capture::read_cf32(&meta).expect("fixture");
     let rate = m.sample_rate_hz.0;
     let (features, label, modulation, baud) = match features {
@@ -619,7 +645,7 @@ async fn remote_codes_from(
         }
     };
     let record = zeta_core::bursts::CaptureRecord {
-        id: name.into(),
+        id: name,
         data_path: meta.with_extension("sigmf-data"),
         meta_path: meta,
         source: SourceId("s".into()),
@@ -660,36 +686,41 @@ async fn remote_codes_from(
 
 /// A real EV1527-style remote (433.882 MHz, about 30 dB SNR, 3200 chips/s) captured on
 /// the air: every whole frame that the chain `bits_start` builds recovers reads the
-/// remote's code.
+/// remote's code (its annotation's `zeta:expected`). The captures are private: without
+/// them the test says so and passes; the synthesised remote below runs everywhere.
 #[tokio::test]
 async fn a_real_ook_remote_decodes_to_its_code() {
     for (name, least) in [("ook-remote-433882k-1", 3), ("ook-remote-433882k-2", 2)] {
-        let (chips, codes) = remote_codes(name).await;
+        let Some((meta, want)) = fixture(name) else {
+            continue;
+        };
+        let (chips, codes) = remote_codes(&meta).await;
         assert!(
-            codes.len() >= least && codes.iter().all(|&c| c == REMOTE_CODE),
+            codes.len() >= least && codes.iter().all(|c| want.contains(c)),
             "{name}: codes {codes:06x?} from {} chips {chips}",
             chips.len()
         );
     }
 }
 
-/// The same remote's code with another button: the B210 windows' frames, read by pulse
-/// width from the samples.
-const B210_CODE: u32 = <button-code>;
 /// Whole frames each B210 window holds, read by pulse width: 12, one allowed lost at a
 /// window edge (the chain reads 12 and 13).
 const B210_LEAST_FRAMES: usize = 11;
 
-/// The B210 windows at 61 440 Hz, their measured centre 1110 Hz off the capture's and
-/// 40 kHz wide: the plan `bits_start` makes from their own features shifts through a
-/// `channel` stage, and every whole frame of each window still reads the code.
+/// The B210 windows at 61 440 Hz (another button of the same remote), their measured
+/// centre 1110 Hz off the capture's and 40 kHz wide: the plan `bits_start` makes from
+/// their own features shifts through a `channel` stage, and every whole frame of each
+/// window still reads the code. Private captures: skipped without them.
 #[tokio::test]
 async fn b210_windows_decode_every_whole_frame() {
     for name in ["ook-remote-b210-1", "ook-remote-b210-2"] {
-        let (plan, (chips, codes)) = remote_codes_with(name, false).await;
+        let Some((meta, want)) = fixture(name) else {
+            continue;
+        };
+        let (plan, (chips, codes)) = remote_codes_with(&meta, false).await;
         assert!(plan.channel_rate_hz.is_some(), "{name}: no shift: {plan:?}");
         assert!(
-            codes.len() >= B210_LEAST_FRAMES && codes.iter().all(|&c| c == B210_CODE),
+            codes.len() >= B210_LEAST_FRAMES && codes.iter().all(|c| want.contains(c)),
             "{name}: {} codes {codes:06x?} from {} chips {chips}",
             codes.len(),
             chips.len()
@@ -697,13 +728,11 @@ async fn b210_windows_decode_every_whole_frame() {
     }
 }
 
-/// The codes of the weak HackRF remote (`ook-remote-hackrf-sparse-*`: one press of two
-/// buttons), read on the node by pulse width and by `bits_start` given the rate.
-const SPARSE_CODES: [u32; 2] = [<button-code>, <button-code>];
-/// Whole frames the long sparse windows decode at least, from their own re-measured
-/// features with nothing given: the 431 ms window holds about 10 frames, the chain reads
-/// 9 (all <button-code>); the 471 ms one about 11, the chain reads 8 (all <button-code>). One
-/// fewer each is allowed.
+/// Whole frames the long sparse windows of the weak HackRF remote
+/// (`ook-remote-hackrf-sparse-*`: one press of two buttons, both codes in each
+/// annotation) decode at least, from their own re-measured features with nothing given:
+/// the 431 ms window holds about 10 frames, the chain reads 9; the 471 ms one about 11,
+/// the chain reads 8. One fewer each is allowed.
 const SPARSE_LEAST_FRAMES: [(&str, usize); 2] = [
     ("ook-remote-hackrf-sparse-1", 8),
     ("ook-remote-hackrf-sparse-3", 7),
@@ -712,11 +741,14 @@ const SPARSE_LEAST_FRAMES: [(&str, usize); 2] = [
 /// The 431 ms and 471 ms windows of the weak remote, their features measured afresh
 /// (OOK at about 3200 Bd; the 471 ms one's band, 56 580 Hz of mostly noise, clamped to
 /// the capture): the chain a bare `bits_start` builds decodes whole frames, every one of
-/// them one of the remote's codes.
+/// them one of the remote's codes. Private captures: skipped without them.
 #[tokio::test]
 async fn a_weak_remote_decodes_from_its_own_measured_features() {
     for (name, least) in SPARSE_LEAST_FRAMES {
-        let (plan, (chips, codes)) = remote_codes_from(name, Features::Remeasured).await;
+        let Some((meta, want)) = fixture(name) else {
+            continue;
+        };
+        let (plan, (chips, codes)) = remote_codes_from(&meta, Features::Remeasured).await;
         eprintln!("{name}: {} codes {codes:06x?} plan {plan:?}", codes.len());
         assert_eq!(
             plan.modulation,
@@ -724,10 +756,79 @@ async fn a_weak_remote_decodes_from_its_own_measured_features() {
             "{plan:?}"
         );
         assert!(
-            codes.len() >= least && codes.iter().all(|c| SPARSE_CODES.contains(c)),
+            codes.len() >= least && codes.iter().all(|c| want.contains(c)),
             "{name}: {} codes {codes:06x?} from {} chips {chips}",
             codes.len(),
             chips.len()
         );
+    }
+}
+
+/// The public synthesised remotes (`gen_ook`: an invented ID, two buttons, 8 frames
+/// each; edges biased as a real fob's read, the second window weaker, 1.9 kHz off the
+/// centre and opening on 20 ms of silence).
+const SYNTH_REMOTES: [&str; 2] = ["ook-ev1527-synth-1", "ook-ev1527-synth-2"];
+/// Frames each synthesised window holds.
+const SYNTH_FRAMES: usize = 8;
+
+/// The synthesised remotes through the three plans the real ones take (the recorded
+/// features centred, as recorded, and measured afresh with nothing given): every
+/// whole frame reads the window's code, and at most one of the 8 is lost (the chain
+/// reads 7 of them on each window and plan).
+#[tokio::test]
+async fn a_synthesised_ook_remote_decodes_every_frame_to_its_code() {
+    for name in SYNTH_REMOTES {
+        let (meta, want) = fixture(name).expect("a public fixture");
+        assert_eq!(want.len(), 1, "{name}: one code a window");
+        for (how, features) in [
+            ("centred", Features::Recorded { centred: true }),
+            ("recorded", Features::Recorded { centred: false }),
+            ("remeasured", Features::Remeasured),
+        ] {
+            let (plan, (chips, codes)) = remote_codes_from(&meta, features).await;
+            eprintln!("{name} {how}: {} whole frames", codes.len());
+            assert_eq!(
+                plan.modulation,
+                zeta_core::bits::Modulation::Ook,
+                "{name} {how}: {plan:?}"
+            );
+            assert!(
+                codes.len() >= SYNTH_FRAMES - 1 && codes.iter().all(|c| want.contains(c)),
+                "{name} {how}: {} codes {codes:06x?} from {} chips {chips}",
+                codes.len(),
+                chips.len()
+            );
+        }
+    }
+}
+
+/// The committed synthesised fixtures are `gen_ook`'s output: the same samples (to
+/// float rounding across platforms), the same expected codes.
+#[test]
+fn ev1527_fixtures_match_their_generator() {
+    let dir = tempfile::tempdir().unwrap();
+    for f in zeta_dsp::fixtures::ev1527_fixtures() {
+        let fresh = zeta_dsp::fixtures::write_ev1527_fixture(dir.path(), &f);
+        let (committed, _) = fixture(f.stem).expect("a public fixture");
+        let (cm, ciq) = zeta_core::capture::read_cf32(&committed).unwrap();
+        let (fm, fiq) = zeta_core::capture::read_cf32(&fresh).unwrap();
+        assert_eq!(
+            (cm.sample_rate_hz, cm.center_hz, cm.start.0),
+            (fm.sample_rate_hz, fm.center_hz, fm.start.0),
+            "{}",
+            f.stem
+        );
+        assert_eq!(
+            cm.annotations[0]["zeta:expected"], fm.annotations[0]["zeta:expected"],
+            "{}",
+            f.stem
+        );
+        assert_eq!(ciq.len(), fiq.len(), "{}", f.stem);
+        let worst = ciq
+            .iter()
+            .zip(&fiq)
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "{}: samples differ by {worst}", f.stem);
     }
 }

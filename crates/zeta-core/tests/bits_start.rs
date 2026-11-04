@@ -642,18 +642,33 @@ async fn a_drain_a_stage_ignores_is_cut_after_the_drain_timeout() {
     );
 }
 
-/// The real EV1527 remote's chip rate (313 us a chip).
+/// The EV1527 remotes' chip rate (313 us a chip).
 const REMOTE_BAUD: f64 = 3_200.0;
 /// How far the inferred rate may stray from [`REMOTE_BAUD`], as a fraction.
 const REMOTE_BAUD_TOLERANCE: f64 = 0.02;
+
+/// Whether `zeta-dsp`'s fixture window `name` is in this checkout: the real remote's
+/// captures are the operator's and are not published (the reason is printed when one
+/// is absent); the synthesised `ook-ev1527-synth-*` always are.
+fn have_fixture(name: &str) -> bool {
+    let there = fixture_meta(name).exists();
+    if !there {
+        eprintln!("skipped: {name}: a private capture, not in this checkout");
+    }
+    there
+}
+
+fn fixture_meta(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../zeta-dsp/tests/data")
+        .join(format!("{name}.sigmf-meta"))
+}
 
 /// The `zeta-dsp` fixture window `name` written to the store in set `set` from
 /// `start_ns`, with the features the node's own burst capture measures (`measure_band`
 /// over the capture's band); its id.
 fn write_fixture(node: &Node, name: &str, set: &str, start_ns: u64) -> String {
-    let meta = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../zeta-dsp/tests/data")
-        .join(format!("{name}.sigmf-meta"));
+    let meta = fixture_meta(name);
     let (m, iq) = zeta_core::capture::read_cf32(&meta).unwrap();
     let a = &m.annotations[0];
     let edge = |k: &str| a[k].as_u64().unwrap();
@@ -700,12 +715,14 @@ async fn infers_the_remote(node: &Node, cap: &str, name: &str) -> Value {
 }
 
 /// The real remote's windows from `zeta-dsp`'s fixtures (B210 at 51 200 and 61 440 Hz,
-/// a HackRF at 62 500 Hz, all at 433.882 MHz), each written to the store with the
-/// features the node's own burst capture measures (`measure_band` over the capture's
-/// band): `bits_start` with nothing given picks OOK at the chip rate, not FSK (the
-/// HackRF window read `fsk` at 1598 Bd, the bit rate's harmonic; the 433882k ones `fsk`).
+/// a HackRF at 62 500 Hz, all at 433.882 MHz; private, skipped when absent) and the
+/// public synthesised ones (433.92 MHz at 51 200 and 62 500 Hz), each written to the
+/// store with the features the node's own burst capture measures (`measure_band` over
+/// the capture's band): `bits_start` with nothing given picks OOK at the chip rate, not
+/// FSK (the HackRF window read `fsk` at 1598 Bd, the bit rate's harmonic; the 433882k
+/// ones `fsk`).
 #[tokio::test]
-async fn bits_start_infers_ook_at_the_chip_rate_on_a_real_remote() {
+async fn bits_start_infers_ook_at_the_chip_rate_on_a_remote() {
     let dir = tempfile::tempdir().unwrap();
     let node = open(dir.path()).await;
     for name in [
@@ -714,18 +731,27 @@ async fn bits_start_infers_ook_at_the_chip_rate_on_a_real_remote() {
         "ook-remote-b210-1",
         "ook-remote-b210-2",
         "ook-remote-hackrf-1",
+        "ook-ev1527-synth-1",
+        "ook-ev1527-synth-2",
     ] {
+        if !have_fixture(name) {
+            assert!(
+                !name.starts_with("ook-ev1527-synth-"),
+                "{name}: a public fixture"
+            );
+            continue;
+        }
         let cap = write_fixture(&node, name, name, T0_NS);
         infers_the_remote(&node, &cap, name).await;
     }
 }
 
 /// The three HackRF windows of one press of a weak remote (431, 71 and 471 ms at 62 500
-/// Hz, 20-34 dB SNR), written as one set as the node's burst capture wrote them: a bare
-/// `bits_start` on each picks OOK at the chip rate (live it refused, `no symbol rate
-/// measured`, or read `fsk`), and the 471 ms window, whose measured band (56 580 Hz,
-/// mostly noise) padded is wider than the capture, takes a channel that fits instead of
-/// a refusal.
+/// Hz, 20-34 dB SNR; private, skipped when absent), written as one set as the node's
+/// burst capture wrote them: a bare `bits_start` on each picks OOK at the chip rate
+/// (live it refused, `no symbol rate measured`, or read `fsk`), and the 471 ms window,
+/// whose measured band (56 580 Hz, mostly noise) padded is wider than the capture, takes
+/// a channel that fits instead of a refusal.
 #[tokio::test]
 async fn bits_start_infers_ook_on_every_window_of_a_weak_remote_set() {
     let dir = tempfile::tempdir().unwrap();
@@ -735,6 +761,9 @@ async fn bits_start_infers_ook_on_every_window_of_a_weak_remote_set() {
         "ook-remote-hackrf-sparse-2",
         "ook-remote-hackrf-sparse-3",
     ];
+    if !names.iter().all(|n| have_fixture(n)) {
+        return;
+    }
     let caps: Vec<String> = names
         .iter()
         .enumerate()

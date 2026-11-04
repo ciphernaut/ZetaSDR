@@ -1,0 +1,43 @@
+{
+  "annotations": [
+    {
+      "core:description": "synthesised EV1527-style remote (invented ID), crates/zeta-dsp/examples/gen_ook.rs",
+      "core:freq_lower_edge": 433895000,
+      "core:freq_upper_edge": 433945000,
+      "core:sample_count": 16487,
+      "core:sample_start": 0,
+      "zeta:expected": {
+        "codes": [
+          "0xC0DE18"
+        ],
+        "id": "0xC0DE1"
+      },
+      "zeta:features": {
+        "bandwidth_hz": 29700,
+        "burst": false,
+        "burst_ms": 30.87890625,
+        "bursts": 8,
+        "center_hz": 433919625,
+        "duty": 0.7733365893363953,
+        "order": null,
+        "period_ms": 39.84375,
+        "snr_db": 38.53288269042969,
+        "symbol_rate_baud": 3193,
+        "symbol_rate_line": "runs",
+        "tone_spacing_hz": null
+      }
+    }
+  ],
+  "captures": [
+    {
+      "core:datetime": "2026-01-01T00:00:00.000000000Z",
+      "core:frequency": 433920000,
+      "core:sample_start": 0
+    }
+  ],
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:sample_rate": 51200,
+    "core:version": "1.0.0"
+  }
+}
