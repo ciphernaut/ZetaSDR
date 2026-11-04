@@ -440,6 +440,130 @@ source_repo_untouched() {
   pass source_repo_untouched
 }
 
+# A git environment inherited from the caller (GIT_DIR and friends override
+# `git -C`) must not point the rewrite at the source.
+inherited_git_dir_is_ignored() {
+  local d o before after
+  d=$(history_fixture inherited)
+  git -C "$d" status --porcelain >/dev/null
+  touch "$base/stamp"
+  sleep 1
+  before=$(state "$d")
+  o="$base/inherited-out"
+  run "$d" "$o" GIT_DIR="$d/.git" GIT_WORK_TREE="$d" GIT_INDEX_FILE="$d/.git/index" \
+    GIT_OBJECT_DIRECTORY="$d/.git/objects" GIT_COMMON_DIR="$d/.git"
+  after=$(state "$d")
+  [ "$before" = "$after" ] || fail inherited_git_dir_is_ignored "source changed: $(diff <(echo "$before") <(echo "$after"))"
+  [ $rc -eq 0 ] || fail inherited_git_dir_is_ignored "rc=$rc $out"
+  [ "$(git -C "$o" log -1 --format=%s HEAD~1)" = "deploy to field-host" ] ||
+    fail inherited_git_dir_is_ignored "DEST not rewritten"
+  pass inherited_git_dir_is_ignored
+}
+
+# DEST/.git holds nothing private outside its objects: no machine identity in a
+# reflog, no remote-tracking refs or their logs.
+dest_metadata_is_clean() {
+  local d o
+  d=$(history_fixture meta)
+  o="$base/meta-out"
+  run "$d" "$o" EMAIL="someone@$secret_host" GIT_COMMITTER_NAME="$secret_host" GIT_AUTHOR_NAME="$secret_host"
+  [ $rc -eq 0 ] || fail dest_metadata_is_clean "rc=$rc $out"
+  ! grep -rqa --exclude-dir=objects -- "$secret_host" "$o/.git" || fail dest_metadata_is_clean "metadata names the private host"
+  [ ! -e "$o/.git/refs/remotes" ] || fail dest_metadata_is_clean "refs/remotes left"
+  [ ! -e "$o/.git/logs/refs/remotes" ] || fail dest_metadata_is_clean "logs/refs/remotes left"
+  [ -z "$(git -C "$o" for-each-ref refs/remotes)" ] || fail dest_metadata_is_clean "a remote-tracking ref left"
+  [ ! -s "$o/.git/logs/HEAD" ] || fail dest_metadata_is_clean "a reflog left: $(cat "$o/.git/logs/HEAD")"
+  pass dest_metadata_is_clean
+}
+
+# fr_wrapper NAME SCRIPT: a git-filter-repo that runs the real one, then SCRIPT in DEST.
+fr_wrapper() {
+  local real
+  real=$(command -v git-filter-repo || echo "$HOME/.local/bin/git-filter-repo")
+  printf '#!/bin/sh\n"%s" "$@" || exit 1\n%s\n' "$real" "$2" >"$base/$1"
+  chmod +x "$base/$1"
+}
+
+metadata_gate_fails() {
+  local d
+  d=$(history_fixture metagate)
+  fr_wrapper fr-meta "echo '$secret_host' >>.git/info/exclude"
+  run "$d" "$base/metagate-out" GIT_FILTER_REPO="$base/fr-meta"
+  [ $rc -eq 1 ] || fail metadata_gate_fails "rc=$rc $out"
+  case $out in *"metadata: .git/info/exclude: denylist"*"export: metadata failed"*) ;; *) fail metadata_gate_fails "$out" ;; esac
+  no_secret metadata_gate_fails
+  pass metadata_gate_fails
+}
+
+no_alternates() {
+  local d
+  d=$(history_fixture alt)
+  mkdir -p "$base/empty-objects"
+  fr_wrapper fr-alt "mkdir -p .git/objects/info && echo '$base/empty-objects' >.git/objects/info/alternates"
+  run "$d" "$base/alt-out" GIT_FILTER_REPO="$base/fr-alt"
+  [ $rc -eq 1 ] || fail no_alternates "rc=$rc $out"
+  case $out in *"export: alternates"*"failed"*) ;; *) fail no_alternates "$out" ;; esac
+  pass no_alternates
+}
+
+# The built-in checks run over messages, identities and path names too.
+history_builtin_checks_on_messages_and_paths() {
+  local d host
+  host="box"".local:8080"
+  d=$(fixture builtin)
+  echo "a" >"$d/a.md"
+  git -C "$d" add a.md
+  commit "$d" "served from $host"
+  run "$d" "$base/builtin-out1"
+  [ $rc -eq 1 ] || fail history_builtin_checks_on_messages_and_paths "message: rc=$rc $out"
+  case $out in *"message or identity: local-host"*"export: history failed"*) ;; *) fail history_builtin_checks_on_messages_and_paths "message: $out" ;; esac
+  d=$(fixture builtin2)
+  mkdir -p "$d/notes"
+  echo "a" >"$d/notes/$host.md"
+  git -C "$d" add notes
+  commit "$d" "notes"
+  git -C "$d" rm -q -r notes
+  commit "$d" "no notes"
+  run "$d" "$base/builtin-out2"
+  [ $rc -eq 1 ] || fail history_builtin_checks_on_messages_and_paths "path: rc=$rc $out"
+  case $out in *"a path name the local-host check matches"*) ;; *) fail history_builtin_checks_on_messages_and_paths "path: $out" ;; esac
+  pass history_builtin_checks_on_messages_and_paths
+}
+
+# A coordinate pair in an old blob is excused by the tip's allowlist only when
+# every path the blob was stored under is allowed.
+history_coordinates_allowed_by_path() {
+  local d c
+  c="-27.1234""56, 153.1234""56"
+  d=$(fixture coords)
+  printf '%s\n' "docs/allowed.md:EXAMPLE" >"$d/scripts/public-allow.txt"
+  mkdir -p "$d/docs"
+  echo "$c EXAMPLE" >"$d/docs/allowed.md"
+  git -C "$d" add scripts/public-allow.txt docs
+  commit "$d" "an allowed point"
+  git -C "$d" rm -q docs/allowed.md
+  commit "$d" "gone"
+  run "$d" "$base/coords-out1"
+  [ $rc -eq 0 ] || fail history_coordinates_allowed_by_path "allowed: rc=$rc $out"
+  # The same blob, first under a path the allowlist does not name, later under
+  # the allowed one (the newest commit holding it shows only the allowed path).
+  d=$(fixture coords2)
+  printf '%s\n' "docs/allowed.md:EXAMPLE" >"$d/scripts/public-allow.txt"
+  mkdir -p "$d/docs"
+  echo "$c EXAMPLE" >"$d/docs/other.md"
+  git -C "$d" add scripts/public-allow.txt docs
+  commit "$d" "a point elsewhere"
+  git -C "$d" mv docs/other.md docs/allowed.md
+  commit "$d" "moved where it is allowed"
+  git -C "$d" rm -q docs/allowed.md
+  commit "$d" "gone"
+  run "$d" "$base/coords-out2"
+  [ $rc -eq 1 ] || fail history_coordinates_allowed_by_path "elsewhere: rc=$rc $out"
+  case $out in *":docs/other.md: coordinates"*) ;; *) fail history_coordinates_allowed_by_path "elsewhere: $out" ;; esac
+  case $out in *":docs/allowed.md: coordinates"*) fail history_coordinates_allowed_by_path "the allowed path was flagged: $out" ;; esac
+  pass history_coordinates_allowed_by_path
+}
+
 gitleaks_hit_fails() {
   local d o
   d=$(fixture leaks)
@@ -529,6 +653,12 @@ history_private_path_is_dropped
 history_unreplaced_leak_fails
 history_tip_tree_matches_source
 source_repo_untouched
+inherited_git_dir_is_ignored
+dest_metadata_is_clean
+metadata_gate_fails
+no_alternates
+history_builtin_checks_on_messages_and_paths
+history_coordinates_allowed_by_path
 gitleaks_hit_fails
 doc_links_required
 pycache_removed_other_strays_fail

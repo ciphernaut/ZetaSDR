@@ -17,7 +17,9 @@
 # Prints "export: ready at DEST (<sha>, <n> commits); skipped: <gates|none>", or
 # "export: <gate> failed" and exits 1 (DEST is left for inspection). A history
 # gate names each hit as "history: <commit7>:<path>: <check>" and never prints
-# the text that matched.
+# the text that matched. An inherited git environment (GIT_DIR and friends) is
+# dropped, every git command in DEST is checked to act on DEST's own repository,
+# and DEST/.git outside its objects is checked too (gate metadata).
 #
 # ZETA_PUBLIC_DENYLIST      the private denylist public-check reads (required)
 #                           (default $XDG_CONFIG_HOME/zetasdr/public-denylist)
@@ -39,6 +41,13 @@ set -euo pipefail
 
 version=0.1.0
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# A git environment inherited from the caller overrides `git -C`: with GIT_DIR
+# set, the rewrite and the cleanup below would act on that repository instead
+# of DEST. None of it is used.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX \
+  GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CEILING_DIRECTORIES
 
 die() {
   echo "export: $*" >&2
@@ -116,6 +125,11 @@ trap 'rm -rf "$tmp"' EXIT
 # git in DEST: no system or global config, no hooks, no templates, no signing,
 # so nothing of the operator's setup (remotes, insteadOf, hooks) reaches it.
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+# Every identity git records in DEST (reflogs included) is the public one, never
+# the machine's default (user@host) or an inherited EMAIL.
+export GIT_AUTHOR_NAME="$author_name" GIT_AUTHOR_EMAIL="$author_email" \
+  GIT_COMMITTER_NAME="$author_name" GIT_COMMITTER_EMAIL="$author_email"
+unset EMAIL
 qgit() {
   git -C "$dest" -c core.hooksPath=/dev/null -c commit.gpgSign=false -c tag.gpgSign=false "$@"
 }
@@ -130,6 +144,16 @@ dgit() {
 gate_failed() {
   echo "export: $1 failed; $dest is left for inspection" >&2
   exit 1
+}
+
+# assert_dest_repo: git run with -C DEST acts on DEST's own repository (checked
+# before every step that rewrites or deletes), and borrows no objects.
+assert_dest_repo() {
+  local g
+  g=$(qgit rev-parse --absolute-git-dir 2>/dev/null) || gate_failed "dest-repo (no repository in DEST)"
+  [ "$(realpath -- "$g")" = "$(realpath -- "$dest/.git")" ] ||
+    gate_failed "dest-repo (git would act on another repository)"
+  [ ! -e "$dest/.git/objects/info/alternates" ] || gate_failed "alternates (DEST borrows objects)"
 }
 
 skipped=()
@@ -187,6 +211,7 @@ echo "export: $mode of $ref ($sha_src) to $dest"
 if [ $mode = squash ]; then
   git -C "$src" archive --format=tar "$sha_src" | tar -x -C "$dest" || gate_failed archive
   dgit init -q -b main --template= || gate_failed init
+  assert_dest_repo
   # -f: a tracked file the tree's own .gitignore matches is still part of the export.
   dgit add -A -f || gate_failed add
 
@@ -212,6 +237,7 @@ else
   # A fresh clone of the one branch: the source's objects are only read.
   git clone -q --no-local --no-tags --single-branch --branch "$branch" --template= \
     -c core.hooksPath=/dev/null "$srcp" "$dest" || gate_failed clone
+  assert_dest_repo
   [ "$(qgit rev-parse "refs/heads/$branch")" = "$sha_src" ] ||
     gate_failed "clone (the branch moved while cloning)"
   if [ "$branch" != main ]; then qgit branch -m "$branch" main || gate_failed clone; fi
@@ -277,15 +303,22 @@ else
   # The rewrite. main is the only ref, so the whole history is that branch; the
   # full (not --refs) mode also expires the reflogs and repacks, so the old
   # objects leave DEST.
+  assert_dest_repo
   (cd "$dest" && "$fr" --force --quiet \
     --invert-paths --paths-from-file "$tmp/drop-paths" \
     --replace-text "$tmp/replace" --replace-message "$tmp/replace" "${mailmap[@]}") ||
     gate_failed filter-repo
   rm -rf "$dest/.git/filter-repo"
+  assert_dest_repo
   qgit reflog expire --expire=now --all || gate_failed filter-repo
   qgit gc -q --prune=now || gate_failed filter-repo
   qgit reset -q --hard main || gate_failed filter-repo
   qgit clean -q -ffdx || gate_failed filter-repo
+  # No remote-tracking refs (a dangling origin/HEAD) and no reflog entries left.
+  qgit for-each-ref --format='%(refname)' refs/remotes >"$tmp/remote-refs"
+  while IFS= read -r r; do qgit update-ref -d --no-deref "$r" || gate_failed "remote refs"; done <"$tmp/remote-refs"
+  rm -rf "$dest/.git/refs/remotes" "$dest/.git/logs/refs/remotes"
+  qgit reflog expire --expire=now --all || gate_failed "reflog"
 
   qgit cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)' |
     sed -n 's/ blob$//p' | sort >"$tmp/blobs-after"
@@ -355,7 +388,7 @@ with open(os.path.join(out, "names"), "wb") as m:
         cat.stdin.write(sha + b"\n"); cat.stdin.flush()
         size = int(cat.stdout.readline().split()[2])
         data = cat.stdout.read(size); cat.stdout.read(1)
-        if typ == b"blob" and b"\0" in data[:8000]:
+        if typ == b"blob" and b"\0" in data[:8192]:
             data = subprocess.run(["strings", "-n", "4"], input=data, check=True,
                                   capture_output=True).stdout
         with open(os.path.join(out, typ.decode(), sha.decode()), "wb") as f:
@@ -365,18 +398,29 @@ with open(os.path.join(out, "names"), "wb") as m:
 cat.stdin.close(); cat.wait()
 PY
   : >"$tmp/hist-hits"
-  # where SHA: "<commit7>:<path>" of the first commit that holds blob SHA.
+  # Every (blob, path) pair of every commit: a blob is judged by every path it
+  # was stored under.
+  qgit rev-list --all >"$tmp/commits"
+  while IFS= read -r c; do
+    qgit ls-tree -r -z --format='%(objecttype) %(objectname)%x09%(path)' "$c"
+  done <"$tmp/commits" | tr '\0' '\n' | sed -n 's/^blob //p' | sort -u >"$tmp/blob-paths"
+  cut -f2- "$tmp/blob-paths" | sort -u >"$tmp/paths-after"
+  # paths_of SHA: the paths blob SHA was stored under, one per line (none when unreachable).
+  paths_of() { sed -n "s|^$1\t||p" "$tmp/blob-paths"; }
+  # where SHA [PATH]: "<commit7>:<path>" of the first commit holding blob SHA (at PATH).
   where() {
     local p c
-    p=$(sed -n "s|^$1\t||p" "$tmp/obj/names")
-    c=$(qgit log --all --reverse --format=%h --find-object="$1" | sed -n 1p)
-    if [ -n "$p" ] && [ -n "$c" ]; then echo "$c:$p"; else echo "unreachable ${1:0:7}"; fi
+    p=${2:-$(paths_of "$1" | sed -n 1p)}
+    [ -n "$p" ] && c=$(qgit log --all --reverse --format=%h --find-object="$1" -- ":(literal)$p" | sed -n 1p)
+    if [ -n "$p" ] && [ -n "${c:-}" ]; then echo "$c:$p"; else echo "unreachable ${1:0:7}"; fi
   }
   hist_grep() {
     local s=0
     grep "$@" 2>/dev/null || s=$?
     [ "$s" -le 1 ] || gate_failed "history (grep status $s)"
   }
+  coord_re='-?[0-9]{1,3}\.[0-9]{4,}, ?-?[0-9]{1,3}\.[0-9]{4,}'
+  host_re='[a-z0-9-]+\.local:[0-9]+'
   # (each grep writes a file first: a failure inside a process substitution
   # would not end the gate)
   if [ -s "$tmp/deny" ]; then
@@ -386,41 +430,57 @@ PY
     done <"$tmp/hit-blobs"
     hist_grep -rlaiE -f "$tmp/deny" "$tmp/obj/commit" "$tmp/obj/tag" >"$tmp/hit-commits"
     while IFS= read -r f; do
-      echo "history: $(qgit rev-parse --short "$(basename "$f")"): message or identity" >>"$tmp/hist-hits"
+      echo "history: $(qgit rev-parse --short "$(basename "$f")"): message or identity: denylist" >>"$tmp/hist-hits"
     done <"$tmp/hit-commits"
   fi
-  coord_re='-?[0-9]{1,3}\.[0-9]{4,}, ?-?[0-9]{1,3}\.[0-9]{4,}'
-  host_re='[a-z0-9-]+\.local:[0-9]+'
   for check in coordinates local-host; do
     if [ $check = coordinates ]; then re=$coord_re; else re=$host_re; fi
+    # Blobs: a matching line is excused only when every path of the blob allows it.
     hist_grep -rlaE -e "$re" "$tmp/obj/blob" >"$tmp/hit-$check"
     while IFS= read -r f; do
       b=$(basename "$f")
-      p=$(sed -n "s|^$b\t||p" "$tmp/obj/names")
+      paths_of "$b" >"$tmp/hit-paths"
+      [ -s "$tmp/hit-paths" ] || echo "" >"$tmp/hit-paths"
       hist_grep -naE -e "$re" "$f" >"$tmp/hit-lines"
+      while IFS= read -r p; do
+        while IFS= read -r m; do
+          if ! allowed "$p" "${m#*:}"; then
+            echo "history: $(where "$b" "$p"): $check" >>"$tmp/hist-hits"
+            break
+          fi
+        done <"$tmp/hit-lines"
+      done <"$tmp/hit-paths"
+    done <"$tmp/hit-$check"
+    # Messages and identities: only the allowlist's entries for every path (`*`) apply.
+    hist_grep -rlaE -e "$re" "$tmp/obj/commit" "$tmp/obj/tag" >"$tmp/hit-msg-$check"
+    while IFS= read -r f; do
+      hist_grep -aE -e "$re" "$f" >"$tmp/hit-lines"
       while IFS= read -r m; do
-        if ! allowed "$p" "${m#*:}"; then
-          echo "history: $(where "$b"): $check" >>"$tmp/hist-hits"
+        if ! allowed "" "$m"; then
+          echo "history: $(qgit rev-parse --short "$(basename "$f")"): message or identity: $check" >>"$tmp/hist-hits"
           break
         fi
       done <"$tmp/hit-lines"
-    done <"$tmp/hit-$check"
+    done <"$tmp/hit-msg-$check"
   done
-  # No path in any commit is excluded or named by the denylist (the path is not
-  # printed: it may be the private text itself).
-  qgit rev-list --all >"$tmp/commits"
-  while IFS= read -r c; do qgit ls-tree -r -z --name-only "$c"; done <"$tmp/commits" |
-    tr '\0' '\n' | sort -u >"$tmp/paths-after"
+  # No path in any commit is excluded, named by the denylist or caught by a
+  # built-in check (the path is not printed: it may be the private text itself).
   git_glob_match "$tmp/paths-after" >"$tmp/bad-excluded"
   deny_match "$tmp/paths-after" >"$tmp/bad-named"
-  for kind in excluded named; do
+  : >"$tmp/bad-coordinates"
+  : >"$tmp/bad-local-host"
+  hist_grep -aE -e "$coord_re" "$tmp/paths-after" >"$tmp/path-coords"
+  hist_grep -aE -e "$host_re" "$tmp/paths-after" >"$tmp/path-hosts"
+  while IFS= read -r p; do allowed "$p" "$p" || echo "$p" >>"$tmp/bad-coordinates"; done <"$tmp/path-coords"
+  while IFS= read -r p; do allowed "$p" "$p" || echo "$p" >>"$tmp/bad-local-host"; done <"$tmp/path-hosts"
+  for kind in excluded named coordinates local-host; do
     while IFS= read -r p; do
       c=$(qgit log --all --format=%h -1 -- ":(literal)$p")
-      if [ $kind = excluded ]; then
-        echo "history: $c: a path the exclude file matches" >>"$tmp/hist-hits"
-      else
-        echo "history: $c: a path name the denylist matches" >>"$tmp/hist-hits"
-      fi
+      case $kind in
+      excluded) echo "history: $c: a path the exclude file matches" >>"$tmp/hist-hits" ;;
+      named) echo "history: $c: a path name the denylist matches" >>"$tmp/hist-hits" ;;
+      *) echo "history: $c: a path name the $kind check matches" >>"$tmp/hist-hits" ;;
+      esac
     done <"$tmp/bad-$kind"
   done
   nobj=$(wc -l <"$tmp/obj/names")
@@ -437,6 +497,25 @@ PY
       sort -u >&2 || true
     gate_failed tip-tree
   fi
+fi
+
+# DEST/.git outside its objects (config, HEAD, refs, packed-refs, logs, info,
+# hooks, the index): nothing the denylist matches, and no borrowed objects.
+echo "export: gate metadata"
+assert_dest_repo
+(cd "$dest/.git" && find . -path ./objects -prune -o -type f -print) | sed 's|^\./||' | sort >"$tmp/meta-files"
+: >"$tmp/meta-hits"
+if [ -s "$tmp/deny" ]; then
+  while IFS= read -r f; do
+    s=0
+    grep -qaiE -f "$tmp/deny" "$dest/.git/$f" 2>/dev/null || s=$?
+    [ "$s" -le 1 ] || gate_failed "metadata (grep status $s)"
+    [ "$s" -eq 0 ] && echo "metadata: .git/$f: denylist" >>"$tmp/meta-hits"
+  done <"$tmp/meta-files"
+fi
+if [ -s "$tmp/meta-hits" ]; then
+  sed 's/^/export: /' "$tmp/meta-hits" >&2
+  gate_failed metadata
 fi
 
 # The gates, in DEST, with DEST's own scripts.
