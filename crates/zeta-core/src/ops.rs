@@ -9,6 +9,7 @@ use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub use crate::bits::Modulation;
 use crate::capture::{CaptureMeta, write_cf32};
 use crate::classify::{Band, Classification, Label, Tried};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
@@ -25,7 +26,7 @@ use crate::ring::RingError;
 use crate::station::Station;
 use crate::stream::{Frame, Payload, StreamInfo};
 use crate::types::{
-    Capabilities, ChannelId, Hz, JobId, Selection, SourceId, StreamId, StreamKind, Timestamp,
+    Baud, Capabilities, ChannelId, Hz, JobId, Selection, SourceId, StreamId, StreamKind, Timestamp,
 };
 
 /// A band as `capture_list` narrows by: a capture matches when its own band overlaps it.
@@ -181,7 +182,8 @@ pub enum Op {
     /// relaunched, `tuning` updated. Applies to a `running` job the node expanded and can
     /// re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the
     /// mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum`
-    /// (elastic or rigid), `mix` (it has no band) and `transcribe` (attached: retune its
+    /// (elastic or rigid), `mix` (it has no band), a `graph_start` job (it runs on no
+    /// radio) and `transcribe` (attached: retune its
     /// input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new
     /// graph or start a new job). A job that is not running is `job <id> is <state>`; an
     /// unknown id is `unknown`. The result is the job's id, as `job_start` answers.
@@ -318,7 +320,8 @@ pub enum Op {
     },
     /// Stop every running job that matches all the filters given, in one operation:
     /// `source`, `kind` and `plan` (`null` for any; all three `null` is every job). A
-    /// job's filter on `plan` is its centre lying on one of that plan's channels. Elastic
+    /// job's filter on `plan` is its centre lying on one of that plan's channels; a job on
+    /// no radio (`graph_start`, `bits_start`, a mix) never matches a `plan`. Elastic
     /// jobs (the page's spectrum) and jobs another job owns (a `watch`'s or an
     /// `identify`'s trial jobs) are never named: they follow the capture or their owner.
     /// Jobs on a radio are stopped first, then those attached to them; an attached job
@@ -372,6 +375,77 @@ pub enum Op {
     GraphPut {
         job: JobId,
         graph: Graph,
+    },
+    /// Start a job from a graph whose first node has no inputs (`capture_in`,
+    /// `stream_in`, `mix`): the record's kind is `graph`, its source `node`, its band
+    /// the first `capture_in`'s first capture's (0/0 without one, so the page can place
+    /// it), and it takes no lease and tunes nothing. A first node that takes input, and a
+    /// node with an unfed input (no edge into it), are refused (`other`, naming the
+    /// node); a `capture_in` whose capture is not in the store is `unknown` naming
+    /// `captures[<i>]`. It launches the graph as stored (as after a `graph_put`); it is
+    /// persisted and resumed like any job, after the jobs on a radio, and a `capture_in`
+    /// job whose capture was expired since fails `capture <id> not found`. It has no band
+    /// to retune. The result is the job's id, as `job_start` answers.
+    GraphStart {
+        graph: Graph,
+    },
+    /// Work a capture's bits: takes every capture of the named capture's `set`, in time
+    /// order, and starts `capture_in → resample → <demod> → clock_recover → slicer →
+    /// bit_view` from the named capture's feature record, each `null` taken from the
+    /// features (`modulation`, one of `fsk`, `psk` and `ook`, from the layer-1 label:
+    /// `fsk` and `fm` give `fsk`, `psk` and `ook` themselves; `symbol_rate_baud` and
+    /// `order` from the record, `order` 2 when it has none; fsk takes 2 or 4, psk 2, 4
+    /// or 8, ook 2). The capture is resampled to about 8 samples per symbol for fsk and ook, and
+    /// for psk to the smallest multiple of 4 times the baud that also covers a carrier offset
+    /// of 2000 Hz (the coarse estimate is unambiguous only within the rate over twice the
+    /// order), moved to a rate the resampler serves exactly. A signal off the capture's
+    /// centre whose recorded band reaches past the resampler's passband (its offset plus
+    /// half its `bandwidth_hz` over 0.45 times that rate) is shifted to its recorded
+    /// `center_hz` first, unless layer 1 labels the capture `noise`: `capture_in → channel [→ resample] → <demod> → ...`, the
+    /// `channel` stage at the measured centre with the measured bandwidth × 1.25 (at least
+    /// 4 × the baud, at most what the capture holds about that centre: its rate less twice
+    /// the shift) and an output rate the capture rate over a whole divisor (the
+    /// resampler follows unless that is already the chain rate). 4-fsk and ook take the
+    /// `early_late` clock; fsk's demodulator is given the record's measured `tone_spacing_hz` (it tracks
+    /// the tones itself when the record has none); `capture_in` loops, paced, with a 500 ms
+    /// pause between
+    /// passes, and the job runs until stopped. Refused with `other`: a field neither the
+    /// request nor the features give (`no symbol rate measured; give symbol_rate_baud`,
+    /// `no modulation measured (label <x>); give modulation`), a rate the capture cannot
+    /// hold (`symbol_rate_baud <r> needs <n> Hz; the capture holds <rate> Hz`, 4 samples
+    /// per symbol at least; a rate of 0 is `symbol_rate_baud: at least 1`), a measured
+    /// centre the capture holds under 4 × the baud about (`the measured centre <c> Hz
+    /// leaves <room> Hz of the capture <lo>..=<hi> Hz about it, under the <floor> Hz the
+    /// chain needs (4 x <baud> Bd)`), and a set whose captures differ in rate or centre
+    /// (`capture <id>: <rate> Hz differs from <first>'s <rate> Hz`); an unknown `capture`
+    /// is `unknown`. The record's kind is `bits`, its source `node`, its band the
+    /// capture's, `job_context.bits` the plan (`captures`, `modulation`,
+    /// `symbol_rate_baud`, `order`, `tone_spacing_hz`, `rate_hz`, `center_hz` the centre the
+    /// chain runs on and `shift_hz` its offset from the capture's, `bandwidth_hz`,
+    /// `padded_bandwidth_hz` the channel band uncut and `clamped` whether it was cut to the
+    /// capture, and `channel_rate_hz`, `null` (and `padded_bandwidth_hz` `null`) when the
+    /// chain does not shift); the slicer's `bits` events are on
+    /// `job_context.slicer.stream` and `bit_view`'s latest hypotheses in
+    /// `job_context.bit_view`. Change a running chain with `graph_get`, edit,
+    /// `graph_put`. The result is the job's id, as `job_start` answers; one-shot
+    /// `--then-tail` tails the `bits` events. The agent's own `bits_start` jobs count as
+    /// jobs it started.
+    BitsStart {
+        /// An id from `capture_list`.
+        capture: String,
+        /// The demodulator; `null` for the layer-1 label's.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::modes::nullable_enum::<Modulation>")]
+        modulation: Option<Modulation>,
+        /// The symbol rate; `null` for the feature record's.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<Baud>")]
+        symbol_rate_baud: Option<Baud>,
+        /// The modulation order (fsk 2 or 4, psk 2, 4 or 8, ook 2); `null` for the
+        /// feature record's, else 2.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<u8>")]
+        order: Option<u8>,
     },
     /// Band-plan allocations in `region` and known signatures overlapping the
     /// band, from every registered knowledge provider.
@@ -812,15 +886,25 @@ impl JobKind {
     }
 
     /// Whether `job_start` may start the kind on the radio: not an attachable kind, and
-    /// not a `mix`, which has no source or band of its own (`mix_start`).
+    /// not a `mix` (`mix_start`) or a [`GRAPH_KIND`] or [`BITS_KIND`] job (`graph_start`,
+    /// `bits_start`), which have no source or band of their own.
     pub fn startable(&self) -> bool {
-        !self.attachable() && !matches!(self, JobKind::Mix)
+        !self.attachable() && !matches!(self, JobKind::Mix) && !self.leaseless_name()
+    }
+
+    /// Whether the kind is named [`GRAPH_KIND`] or [`BITS_KIND`]: no built-in kind, so it
+    /// would read as a mode row's id.
+    fn leaseless_name(&self) -> bool {
+        matches!(self, JobKind::Mode(id) if id.0 == GRAPH_KIND || id.0 == BITS_KIND)
     }
 
     /// Why `job_start` refuses a kind that is not [`startable`](Self::startable).
     fn start_refusal(&self) -> OpError {
         let message = match self {
             JobKind::Mix => "mix takes no band: use mix_start".to_string(),
+            k if k.leaseless_name() => {
+                format!("{} takes no band: use graph_start / bits_start", k.name())
+            }
             k => format!("{} attaches to a job: use job_attach", k.name()),
         };
         OpError::Other { message }
@@ -1580,6 +1664,20 @@ pub const SONDEHUB_STAGE: &str = "sink_sondehub";
 /// writes them to the node's [`crate::bursts::BurstStore`] and ends the job.
 pub const BURST_CAPTURE_STAGE: &str = "burst_capture";
 
+/// The stage kind that replays burst captures (registered by `zeta-dsp`): its params'
+/// `captures` are ids in the node's [`crate::bursts::BurstStore`].
+pub const CAPTURE_IN_STAGE: &str = "capture_in";
+
+/// The stage kind that slices symbols into `bits` events (registered by `zeta-dsp`): it
+/// notes the stream it publishes them on as `slicer.stream` in the job's context.
+pub const SLICER_STAGE: &str = "slicer";
+
+/// The kind recorded for a job `graph_start` started.
+pub const GRAPH_KIND: &str = "graph";
+
+/// The kind recorded for a job `bits_start` started.
+pub const BITS_KIND: &str = "bits";
+
 /// The `detect` stage's default `gone_ms`: an announced signal unmatched this long is
 /// `gone`. The watch re-adopts a decoder only when its signal reappears within it.
 pub const DETECT_GONE_MS_DEFAULT: u64 = 30_000;
@@ -2166,6 +2264,8 @@ impl Op {
             Op::StreamTail { .. } => "stream_tail",
             Op::GraphGet { .. } => "graph_get",
             Op::GraphPut { .. } => "graph_put",
+            Op::GraphStart { .. } => "graph_start",
+            Op::BitsStart { .. } => "bits_start",
             Op::KnowledgeLookup { .. } => "knowledge_lookup",
             Op::ChannelPlans {} => "channel_plans",
             Op::ModesList { .. } => "modes_list",
@@ -3173,6 +3273,21 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
             .await
             .map(|()| OpResult::Ok)
             .map_err(|e| node_error(node, e)),
+        Op::GraphStart { graph } => node
+            .graph_start(graph)
+            .await
+            .map(OpResult::Job)
+            .map_err(|e| node_error(node, e)),
+        Op::BitsStart {
+            capture,
+            modulation,
+            symbol_rate_baud,
+            order,
+        } => node
+            .bits_start(&capture, modulation, symbol_rate_baud, order)
+            .await
+            .map(OpResult::Job)
+            .map_err(|e| node_error(node, e)),
         Op::KnowledgeLookup {
             region,
             center_hz,
@@ -3272,6 +3387,8 @@ async fn jobs_stop(
                 && source.as_ref().is_none_or(|s| r.source == *s)
                 && kind.as_ref().is_none_or(|k| r.kind == k.name())
                 && on_plan(r.tuning.center_hz.0)
+                // A leaseless job's centre is its capture's, not a channel it holds.
+                && (plan.is_none() || !r.leaseless())
         })
         .collect();
     matched.sort_by_key(|r| r.input.is_some());
@@ -3651,6 +3768,12 @@ async fn job_retune(
     // Before the operator's-graph test: a mute's `graph_put` sets that flag on a mix.
     if rec.kind == JobKind::Mix.name() {
         return Err(other("mix is not retunable"));
+    }
+    if rec.leaseless() {
+        return Err(other(format!(
+            "{} has no band: it runs on no radio",
+            rec.kind
+        )));
     }
     if let Some(input) = &rec.input {
         return Err(other(format!(

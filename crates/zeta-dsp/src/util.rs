@@ -189,16 +189,5 @@ pub fn power_db(x: &[Complex<f32>]) -> f32 {
 
 /// CRC-16/X-25 (the AX.25 FCS): init 0xFFFF, reflected poly 0x8408, final XOR 0xFFFF.
 pub fn crc16_x25(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
-    for &b in data {
-        crc ^= b as u16;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0x8408
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
+    crate::crc::crc(&crate::crc::CRC16_X25, data) as u16
 }

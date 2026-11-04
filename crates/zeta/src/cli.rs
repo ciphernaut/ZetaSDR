@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
 use zeta_core::modes::{Family, ModeState};
-use zeta_core::ops::{JobKind, Op, OpError, Sideband, SignalBand};
+use zeta_core::ops::{JobKind, Modulation, Op, OpError, Sideband, SignalBand};
 use zeta_core::station::{Antenna, AntennaKind, Station};
-use zeta_core::types::{Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
+use zeta_core::types::{Baud, Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
 
 use crate::sources::{self, PluginSpec, SourceSpec};
 
@@ -295,6 +295,9 @@ pub enum Command {
     /// Listen to many channels as one audio stream
     #[command(subcommand)]
     Mix(MixCmd),
+    /// Work a burst capture's bits
+    #[command(subcommand)]
+    Bits(BitsCmd),
     /// The node's station: position, region and antennas
     #[command(subcommand)]
     Station(StationCmd),
@@ -378,6 +381,51 @@ pub enum MixCmd {
         #[arg(long, value_name = "ID[,ID]", value_delimiter = ',')]
         sources: Option<Vec<String>>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BitsCmd {
+    /// Start the replay-demod-clock-slice-view chain over a capture's set, from its
+    /// feature record (no radio, no lease)
+    Start {
+        /// A capture id (from `capture list`)
+        #[arg(long, value_name = "ID")]
+        capture: String,
+        /// The demodulator; absent = the layer-1 label's
+        #[arg(long, value_enum)]
+        modulation: Option<ModulationArg>,
+        /// The symbol rate in baud; absent = the feature record's
+        #[arg(long, value_name = "N")]
+        symbol_rate_baud: Option<u32>,
+        /// The modulation order; absent = the feature record's, else 2
+        #[arg(long, value_name = "N")]
+        order: Option<u8>,
+        /// After starting, tail the slicer's `bits` events, stop the job and print
+        /// `[job_result, frames_result, {"stopped": true}]` (one-shot only)
+        #[arg(long, value_name = "MAX_FRAMES,TIMEOUT_MS", value_parser = parse_then_tail)]
+        then_tail: Option<ThenTail>,
+        /// With --then-tail: leave the job running after the tail
+        #[arg(long, requires = "then_tail")]
+        keep: bool,
+    },
+}
+
+/// `bits start --modulation`, mirroring `Modulation`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ModulationArg {
+    Fsk,
+    Psk,
+    Ook,
+}
+
+impl From<ModulationArg> for Modulation {
+    fn from(m: ModulationArg) -> Self {
+        match m {
+            ModulationArg::Fsk => Modulation::Fsk,
+            ModulationArg::Psk => Modulation::Psk,
+            ModulationArg::Ook => Modulation::Ook,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -942,6 +990,13 @@ pub enum GraphCmd {
         #[arg(long, value_name = "GRAPH.json")]
         file: PathBuf,
     },
+    /// Start a job from a JSON graph whose first node takes no input (capture_in,
+    /// stream_in, mix): no radio, no lease
+    Start {
+        /// Graph JSON file
+        #[arg(long, value_name = "GRAPH.json")]
+        file: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1075,9 +1130,10 @@ impl Command {
                     | JobCmd::Attach { .. }
                     | JobCmd::Retune { .. }
                     | JobCmd::Stop(_)
-            ) | Command::Graph(GraphCmd::Put { .. })
+            ) | Command::Graph(GraphCmd::Put { .. } | GraphCmd::Start { .. })
                 | Command::Plan(PlanCmd::Start { .. })
                 | Command::Mix(MixCmd::Start { .. })
+                | Command::Bits(BitsCmd::Start { .. })
                 | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
                 | Command::Capture(CaptureCmd::Delete { .. })
                 | Command::Jobs(JobsCmd::Stop { .. })
@@ -1092,21 +1148,26 @@ impl Command {
         }
     }
 
-    /// `--then-tail` of a `job start`, if given.
+    /// `--then-tail` of a `job start` or a `bits start`, if given.
     pub fn then_tail(&self) -> Option<ThenTail> {
         match self {
-            Command::Job(JobCmd::Start { then_tail, .. }) => *then_tail,
+            Command::Job(JobCmd::Start { then_tail, .. })
+            | Command::Bits(BitsCmd::Start { then_tail, .. }) => *then_tail,
             _ => None,
         }
     }
 
-    /// `job start --keep`: leave a `--then-tail` job running.
+    /// `job start --keep`, `bits start --keep`: leave a `--then-tail` job running.
     pub fn keep(&self) -> bool {
-        matches!(self, Command::Job(JobCmd::Start { keep: true, .. }))
+        matches!(
+            self,
+            Command::Job(JobCmd::Start { keep: true, .. })
+                | Command::Bits(BitsCmd::Start { keep: true, .. })
+        )
     }
 
     /// The operation this subcommand applies; `None` for `serve`. Fails only
-    /// when `graph put` cannot read or parse its file.
+    /// when `graph put` or `graph start` cannot read or parse its file.
     pub fn into_op(self) -> Result<Option<Op>, OpError> {
         let job = |a: JobArg| JobId(a.job);
         Ok(Some(match self {
@@ -1201,6 +1262,9 @@ impl Command {
                 job: job(a),
                 graph: read_graph(&file)?,
             },
+            Command::Graph(GraphCmd::Start { file }) => Op::GraphStart {
+                graph: read_graph(&file)?,
+            },
             Command::Knowledge(KnowledgeCmd::Lookup {
                 region,
                 center_hz,
@@ -1249,6 +1313,18 @@ impl Command {
             },
             Command::Mix(MixCmd::Start { sources }) => Op::MixStart {
                 sources: sources.map(|s| s.into_iter().map(SourceId).collect()),
+            },
+            Command::Bits(BitsCmd::Start {
+                capture,
+                modulation,
+                symbol_rate_baud,
+                order,
+                ..
+            }) => Op::BitsStart {
+                capture,
+                modulation: modulation.map(Modulation::from),
+                symbol_rate_baud: symbol_rate_baud.map(Baud),
+                order,
             },
             Command::Station(StationCmd::Set {
                 lat,
@@ -1328,6 +1404,81 @@ mod channel_tests {
         for bad in ["1,,2", "8-5", "a", "5-", "-5", "1-5000"] {
             let e = parse_channels(bad).expect_err(bad);
             assert!(e.contains("channels"), "{bad}: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_graph_tests {
+    use super::*;
+
+    #[test]
+    fn cli_graph_start_reads_the_graph_from_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("g.json");
+        let g = serde_json::json!({
+            "id": "g",
+            "nodes": [{"id": "src", "kind": "capture_in", "params": {"captures": ["01A"]}}],
+            "edges": [],
+        });
+        std::fs::write(&file, g.to_string()).unwrap();
+        let cli = Cli::try_parse_from(["zeta", "graph", "start", "--file", file.to_str().unwrap()])
+            .unwrap();
+        let want: Graph = serde_json::from_value(g).unwrap();
+        match cli.command.into_op().unwrap() {
+            Some(Op::GraphStart { graph }) => assert_eq!(graph, want),
+            op => panic!("graph start: {op:?}"),
+        }
+        let missing =
+            Cli::try_parse_from(["zeta", "graph", "start", "--file", "/nonexistent/g.json"])
+                .unwrap();
+        assert!(missing.command.into_op().is_err());
+    }
+}
+
+#[cfg(test)]
+mod cli_bits_tests {
+    use super::*;
+
+    #[test]
+    fn cli_bits_start_takes_the_nullable_fields_and_the_tail() {
+        let cli = Cli::try_parse_from([
+            "zeta",
+            "bits",
+            "start",
+            "--capture",
+            "X",
+            "--modulation",
+            "psk",
+            "--order",
+            "4",
+            "--then-tail",
+            "2,3000",
+            "--keep",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command.then_tail(),
+            Some(ThenTail {
+                max_frames: 2,
+                timeout_ms: 3000
+            })
+        );
+        assert!(cli.command.keep());
+        assert!(cli.command.mutates());
+        match cli.command.into_op().unwrap() {
+            Some(Op::BitsStart {
+                capture,
+                modulation,
+                symbol_rate_baud,
+                order,
+            }) => {
+                assert_eq!(capture, "X");
+                assert_eq!(modulation, Some(Modulation::Psk));
+                assert_eq!(symbol_rate_baud, None);
+                assert_eq!(order, Some(4));
+            }
+            op => panic!("bits start: {op:?}"),
         }
     }
 }

@@ -23,7 +23,8 @@ Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2
 [docs/superpowers/plans/2026-10-19-ui.md](docs/superpowers/plans/2026-10-19-ui.md),
 [docs/superpowers/plans/2026-10-19-audio-wfm.md](docs/superpowers/plans/2026-10-19-audio-wfm.md),
 [docs/superpowers/plans/2026-10-19-wideband.md](docs/superpowers/plans/2026-10-19-wideband.md),
-[docs/superpowers/plans/2026-10-20-speech.md](docs/superpowers/plans/2026-10-20-speech.md).
+[docs/superpowers/plans/2026-10-20-speech.md](docs/superpowers/plans/2026-10-20-speech.md),
+[docs/superpowers/plans/2026-11-03-layer4-bits.md](docs/superpowers/plans/2026-11-03-layer4-bits.md) (plan 19.2: layer 4 bits, from a capture to a bit stream and its framing hypotheses).
 
 ## Tests
 

@@ -103,6 +103,14 @@ impl JobRecord {
     fn current_format() -> u32 {
         JOB_RECORD_FORMAT
     }
+
+    /// Whether the job runs on no radio: its record's source is the node's placeholder
+    /// [`NODE_SOURCE`](crate::node::NODE_SOURCE) (a `mix`, a `graph_start` job). It takes
+    /// no lease, launches with no port, resumes after the jobs on a radio and has no band
+    /// to retune.
+    pub fn leaseless(&self) -> bool {
+        self.source.0 == crate::node::NODE_SOURCE
+    }
 }
 
 #[cfg(test)]

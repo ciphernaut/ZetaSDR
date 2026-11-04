@@ -5,6 +5,7 @@ mod capture;
 mod identify;
 mod jsonlog;
 mod launch;
+pub use launch::DRAIN_TIMEOUT_MS;
 mod persist;
 mod recover;
 mod retune;
@@ -245,9 +246,17 @@ fn last_audio(outputs: &[(StreamKind, StreamId)]) -> Option<StreamId> {
 }
 
 /// Whether a mix may read `rec`: not an attached job (it is a chain over a job's audio),
-/// a job a controller owns (a trial) or another mix.
+/// a job a controller owns (a trial) or another mix (a `mix` job, or any job whose graph
+/// holds a `mix` node, as a `graph_start` of one does).
 fn mixable(rec: &JobRecord) -> bool {
-    rec.input.is_none() && rec.owner.is_none() && rec.kind != JobKind::Mix.name()
+    rec.input.is_none()
+        && rec.owner.is_none()
+        && rec.kind != JobKind::Mix.name()
+        && !rec
+            .graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == JobKind::Mix.name())
 }
 
 struct Inner {
@@ -1276,6 +1285,205 @@ impl Node {
         Ok(id)
     }
 
+    /// Start a job from `graph`, whose first node takes no input (`capture_in`,
+    /// `stream_in`, `mix`): a leaseless [`GRAPH_KIND`](crate::ops::GRAPH_KIND) record on
+    /// [`NODE_SOURCE`], its band the first `capture_in`'s first capture's (0/0 without
+    /// one), launched as stored (`operator_graph`). `Graph` when it does not validate;
+    /// `Other` for a first node that takes input or a node with no edge into it whose
+    /// stage takes input (nothing would feed it: there is no radio); `Expand(Unknown)`
+    /// naming `captures[<i>]` for a capture not in the burst store.
+    pub async fn graph_start(&self, graph: Graph) -> Result<JobId, NodeError> {
+        graph::validate(&graph, &self.inner.registry)?;
+        let registry = &self.inner.registry;
+        let takes_input = |n: &crate::graph::Node| {
+            registry
+                .spec(&n.kind)
+                .and_then(|s| s.inputs.first().copied())
+        };
+        let kind_name = |k: StreamKind| {
+            serde_json::to_value(k)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default()
+        };
+        let unfed = |n: &crate::graph::Node, k: StreamKind| {
+            NodeError::Other(format!(
+                "graph_start: node {} ({}) has an unfed {} input",
+                n.id.0,
+                n.kind,
+                kind_name(k)
+            ))
+        };
+        let first = graph
+            .nodes
+            .first()
+            .ok_or_else(|| NodeError::Other("graph_start: the graph has no nodes".into()))?;
+        if let Some(k) = takes_input(first) {
+            // A lone stage that takes input is a node nothing feeds; one in a chain is a
+            // root that would wait for a radio.
+            if !graph
+                .edges
+                .iter()
+                .any(|e| e.from == first.id || e.to == first.id)
+            {
+                return Err(unfed(first, k));
+            }
+            return Err(NodeError::Other(format!(
+                "graph_start: node {} ({}) takes input; the first node must take none \
+                 (capture_in, stream_in, mix)",
+                first.id.0, first.kind
+            )));
+        }
+        for n in &graph.nodes {
+            if let Some(k) = takes_input(n)
+                && !graph.edges.iter().any(|e| e.to == n.id)
+            {
+                return Err(unfed(n, k));
+            }
+        }
+        let store = self.bursts();
+        let mut tuning = Tuning {
+            center_hz: Hz(0),
+            bandwidth_hz: Hz(0),
+        };
+        let mut placed = false;
+        for n in graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == crate::ops::CAPTURE_IN_STAGE)
+        {
+            let ids = n.params.get("captures").and_then(|v| v.as_array());
+            for (i, id) in ids.into_iter().flatten().enumerate() {
+                let id = id.as_str().unwrap_or_default();
+                let Some(rec) = store.get(id) else {
+                    return Err(NodeError::Expand(OpError::Unknown {
+                        field: format!("captures[{i}]"),
+                        value: id.to_string(),
+                        known: store.list().into_iter().map(|r| r.id).collect(),
+                    }));
+                };
+                if !placed {
+                    tuning = Tuning {
+                        center_hz: rec.center_hz,
+                        bandwidth_hz: rec.bandwidth_hz,
+                    };
+                    placed = true;
+                }
+            }
+        }
+        let rec = JobRecord {
+            format: JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: crate::ops::GRAPH_KIND.to_string(),
+            graph,
+            source: SourceId(NODE_SOURCE.into()),
+            tuning,
+            state: JobState::Running,
+            context: serde_json::json!({}),
+            created_ns: now(),
+            input: None,
+            capture_rate_hz: None,
+            elastic: false,
+            operator_graph: true,
+            owner: None,
+        };
+        let id = rec.id.clone();
+        self.inner.launch(rec).await?;
+        Ok(id)
+    }
+
+    /// Start the bits chain ([`crate::bits::bits_graph`]) over the set of the burst
+    /// capture `capture`, in time order, each `None` filled from the capture's feature
+    /// record or, for `modulation`, the layer-1 label the classifiers give its samples: a
+    /// leaseless [`BITS_KIND`](crate::ops::BITS_KIND) record on [`NODE_SOURCE`], its band
+    /// the capture's, `context.bits` the plan, launched as stored as `graph_start`
+    /// launches. `Expand(Unknown)` naming `capture` for a capture not in the store;
+    /// `Other` for what [`crate::bits::bits_plan`] refuses.
+    pub async fn bits_start(
+        &self,
+        capture: &str,
+        modulation: Option<crate::bits::Modulation>,
+        symbol_rate_baud: Option<crate::types::Baud>,
+        order: Option<u8>,
+    ) -> Result<JobId, NodeError> {
+        let store = self.bursts();
+        let Some(named) = store.get(capture) else {
+            return Err(NodeError::Expand(OpError::Unknown {
+                field: "capture".into(),
+                value: capture.to_string(),
+                known: store.list().into_iter().map(|r| r.id).collect(),
+            }));
+        };
+        let mut set: Vec<_> = store
+            .list()
+            .into_iter()
+            .filter(|r| r.set == named.set)
+            .collect();
+        set.sort_by_key(|r| (r.start_ns, r.id.clone()));
+        // A record that does not read as one (an older store's `{}`) measured nothing.
+        let features: crate::classify::FeatureRecord = serde_json::from_value(
+            named.features.clone(),
+        )
+        .unwrap_or(crate::classify::FeatureRecord {
+            bandwidth_hz: named.bandwidth_hz,
+            center_hz: named.center_hz,
+            symbol_rate_baud: None,
+            snr_db: 0.0,
+            burst: false,
+            duty: None,
+            bursts: None,
+            burst_ms: None,
+            period_ms: None,
+            order: None,
+            tone_spacing_hz: None,
+            symbol_rate_line: None,
+        });
+        // The layer-1 label names the modulation when the request does not, and a
+        // `noise` label keeps the chain off the measured centre; with the modulation
+        // given, a capture that does not classify is only unlabelled.
+        let classified = crate::ops::classify_capture(&self.classifiers(), &named).await;
+        let classified = match (modulation, classified) {
+            (_, Ok(c)) => Some(c),
+            (Some(_), Err(_)) => None,
+            (None, Err(e)) => return Err(NodeError::Other(e)),
+        };
+        let label =
+            classified.and_then(|c| c.labels.into_iter().find(|l| l.layer == 1).map(|l| l.name));
+        let plan = crate::bits::bits_plan(
+            &set,
+            &features,
+            label.as_deref(),
+            modulation,
+            symbol_rate_baud,
+            order,
+        )
+        .map_err(NodeError::Other)?;
+        let graph = crate::bits::bits_graph(&plan);
+        graph::validate(&graph, &self.inner.registry)?;
+        let rec = JobRecord {
+            format: JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: crate::ops::BITS_KIND.to_string(),
+            graph,
+            source: SourceId(NODE_SOURCE.into()),
+            tuning: Tuning {
+                center_hz: named.center_hz,
+                bandwidth_hz: named.bandwidth_hz,
+            },
+            state: JobState::Running,
+            context: serde_json::json!({ "bits": plan }),
+            created_ns: now(),
+            input: None,
+            capture_rate_hz: None,
+            elastic: false,
+            operator_graph: true,
+            owner: None,
+        };
+        let id = rec.id.clone();
+        self.inner.launch(rec).await?;
+        Ok(id)
+    }
+
     /// The audio stream a job attached to `job` would read: the last audio output stream
     /// (not an edge between its stages) in `job`'s graph order. `InputNotRunning` unless
     /// `job` runs in this node (a one-shot node runs only what it started),
@@ -1921,7 +2129,15 @@ mod tests {
             format: JOB_RECORD_FORMAT,
             id: JobId::new(),
             kind: kind.into(),
-            graph: crate::ops::mix_graph(None),
+            graph: if kind == "mix" {
+                crate::ops::mix_graph(None)
+            } else {
+                crate::graph::Graph {
+                    id: crate::graph::GraphId("g".into()),
+                    nodes: vec![],
+                    edges: vec![],
+                }
+            },
             source: SourceId("a".into()),
             tuning: Tuning {
                 center_hz: Hz(476_625_000),
@@ -1944,5 +2160,8 @@ mod tests {
         assert!(!mixable(&rec("transcribe", Some(JobId::new()), None)));
         assert!(!mixable(&rec("fm_demod", None, Some(JobId::new()))));
         assert!(!mixable(&rec("mix", None, None)));
+        let mut graph_mix = rec("graph", None, None);
+        graph_mix.graph = crate::ops::mix_graph(None);
+        assert!(!mixable(&graph_mix));
     }
 }

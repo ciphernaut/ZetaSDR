@@ -97,7 +97,7 @@ fn note(op: &str) -> Option<&'static str> {
             "`replace`: as on `job_start`, the holders that may be stopped to make room, stopped under the gate right before the request; a `conflict` offers `retry with replace: [<ids>]` and the page shows the same retry buttons. A demodulator keeps its `squelch`, `squelch_db`, `deviation_hz` and `sideband` through a retune; its adjacent-channel guard (`guard_hz`, `guard_db`, `channel_hz`, the channel node's `wide_hz`) is derived again from the channel plan at the new band, never carried, so a width preset changes what the filter passes and a move to a neighbouring channel takes that channel's geometry; a guard turned off with `graph_put` (`guard_hz: null`) comes back on a retune onto a plan channel. Every attached job (`job_attach`) reading the retuned job is relaunched under its own id once the input runs again (one that cannot relaunch is `failed` with the reason; the retune still succeeds). Centre the band on the signal's measured centre (`measure`, `classify`), never on a raster: see Fitting a demod to a signal under Field craft. A one-shot `zeta job retune` cannot reach a job `zeta serve` runs (`job <id> is not running in this node`): use `--node`. On the CLI, `--replace ID[,ID]`.",
         ),
         "job_stop" => Some(
-            "Stopping a job is the operator's decision: never `job_stop` a job the request did not name, except one you started in this run (`job_start`, `plan_start`, `job_attach`, or the `verdict.job` of your own `identify` once you have read it): stop your own `measure` and `identify` leftovers when done. Through `ask` any other stop needs the run to allow stops, else it is refused as `not_allowed`: report that, do not retry.",
+            "Stopping a job is the operator's decision: never `job_stop` a job the request did not name, except one you started in this run (`job_start`, `plan_start`, `job_attach`, `graph_start`, `bits_start`, or the `verdict.job` of your own `identify` once you have read it): stop your own `measure` and `identify` leftovers when done. Through `ask` any other stop needs the run to allow stops, else it is refused as `not_allowed`: report that, do not retry.",
         ),
         "jobs_stop" => Some(
             "One call however many jobs match; the page's elastic spectrum keeps running. Stopping jobs is the operator's decision: use it only when the request asks for all of them, or names the source, kind or plan. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry. Report how many stopped and any `failed`. A mix stops only with no filter or `kind: mix`.",
@@ -433,6 +433,9 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     }
     if op == "station_set" {
         return "zeta station set --lat -27.38 --lon 153.12 --alt-m 4 [--region AU] [--antenna KIND=MIN_HZ-MAX_HZ[,height_m=N,azimuth_deg=N,elevation_deg=N]]...".into();
+    }
+    if op == "bits_start" {
+        return "zeta bits start --capture <id> [--modulation fsk|psk|ook] [--symbol-rate-baud N] [--order N] [--then-tail MAX_FRAMES,TIMEOUT_MS] [--keep]".into();
     }
     if op == "plan_start" {
         return "zeta plan start --plan uhf_cb_au --kind fm_demod --source <id> [--channels 1,2,5-8] [--attach transcribe] [--language de] [--replace ID,ID]".into();

@@ -9,10 +9,23 @@ use zeta_dsp::measure::{envelope_cv, layer1_label, measure, pilot_line_db};
 const CENTER: u64 = 100_000_000;
 const WFM_RATE: u32 = 240_000;
 
-/// `measure` + `layer1_label`, printing the measured features.
+/// The label production gives the whole block (`measure_selection`, as `classify`
+/// runs it), asserted to be what `measure` + `layer1_label` name, printing the measured
+/// features.
 fn label(what: &str, iq: &[Complex<f32>], rate_hz: u32) -> Label {
     let f = measure(iq, rate_hz as u64, CENTER);
-    let l = layer1_label(&f, iq, rate_hz as u64);
+    let (pf, l) = zeta_dsp::measure::measure_selection(
+        iq,
+        rate_hz as u64,
+        CENTER,
+        zeta_core::classify::Band {
+            offset_hz: 0,
+            bandwidth_hz: zeta_core::types::Hz(rate_hz as u64),
+        },
+    )
+    .expect("a measurement");
+    assert_eq!(pf, f, "{what}");
+    assert_eq!(layer1_label(&f, iq, rate_hz as u64).name, l.name, "{what}");
     eprintln!(
         "{what}: bandwidth {} Hz, snr {:.1} dB, cv {:.3}, pilot {:?} -> {} {} ({})",
         f.bandwidth_hz.0,
@@ -191,5 +204,309 @@ fn centred_carrier_is_still_carrier() {
         awgn(&mut iq, snr, seed);
         let l = label(&format!("carrier {snr} dB"), &iq, 48_000);
         assert_eq!(l.name, "carrier", "snr {snr}: {l:?}");
+    }
+}
+
+/// A dense train of 2-FSK packets (50 ms at 4800 Bd every 60 ms) has two envelope
+/// levels and runs that are whole multiples of its 10 ms gap, but it carries tones: it
+/// labels `fsk` and its rate is not the packet train's 100 Bd.
+#[test]
+fn a_dense_fsk_packet_train_is_fsk_not_ook_runs() {
+    let spec = zeta_dsp::synth::SynthSpec::Fsk {
+        symbol_rate_baud: 4_800,
+        deviation_hz: 2_400.0,
+        order: 2,
+        bits: "14ed58c6d3ff2d75a5650138a8d447f00ec47321d420c5d08bec3850735c".into(),
+        repeat: 16,
+        gap_ms: 10,
+    };
+    let mut iq = zeta_dsp::synth::synthesise(&spec, &Default::default(), 48_000, CENTER);
+    awgn(&mut iq, 20.0, 41);
+    let f = measure(&iq, 48_000, CENTER);
+    let l = label("fsk packet train", &iq, 48_000);
+    assert_eq!(l.name, "fsk", "{l:?}");
+    assert_ne!(f.symbol_rate_baud.map(|b| b.0), Some(100), "{f:?}");
+}
+
+/// The real EV1527 remote's windows (433.88 MHz, chip 313 us, 3200 chips/s): B210 at
+/// 51 200 and 61 440 Hz, HackRF at 62 500 Hz.
+const OOK_REMOTES: [&str; 5] = [
+    "ook-remote-433882k-1",
+    "ook-remote-433882k-2",
+    "ook-remote-b210-1",
+    "ook-remote-b210-2",
+    "ook-remote-hackrf-1",
+];
+/// The remote's chip rate: the reciprocal of its shortest on or off run.
+const OOK_REMOTE_BAUD: f64 = 3_200.0;
+/// How far a measured chip rate may stray from [`OOK_REMOTE_BAUD`], as a fraction.
+const OOK_REMOTE_BAUD_TOLERANCE: f64 = 0.02;
+
+/// A fixture window as a burst capture measures it (`measure_band` over the capture's
+/// band, its annotation's edges) and as `classify` labels it (`measure_selection` on
+/// the same band): the features and the layer-1 label.
+fn ook_remote(name: &str) -> (zeta_core::classify::FeatureRecord, Label) {
+    let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(format!("{name}.sigmf-meta"));
+    let (m, iq) = zeta_core::capture::read_cf32(&meta).expect("fixture");
+    let a = &m.annotations[0];
+    let edge = |k: &str| a[k].as_u64().expect("annotation edge");
+    let band = edge("core:freq_upper_edge") - edge("core:freq_lower_edge");
+    let rate = m.sample_rate_hz.0;
+    let f = zeta_dsp::measure::measure_band(&iq, rate, m.center_hz.0, band);
+    let (_, l) = zeta_dsp::measure::measure_selection(
+        &iq,
+        rate,
+        m.center_hz.0,
+        zeta_core::classify::Band {
+            offset_hz: 0,
+            bandwidth_hz: zeta_core::types::Hz(band),
+        },
+    )
+    .expect("a measurement");
+    eprintln!("{name}: {f:?} -> {} ({})", l.name, l.evidence);
+    (f, l)
+}
+
+/// Pulse-width OOK (a 0 is one chip on and three off, a 1 three on and one off) has its
+/// strongest keying lines at the bit rate (800 bit/s) and its harmonics; the chip rate
+/// is the run lengths' unit, and every window measures it.
+#[test]
+fn a_real_ook_remote_measures_its_chip_rate() {
+    for name in OOK_REMOTES {
+        let (f, _) = ook_remote(name);
+        let baud = f.symbol_rate_baud.map(|b| b.0 as f64);
+        assert!(
+            baud.is_some_and(
+                |b| (b - OOK_REMOTE_BAUD).abs() <= OOK_REMOTE_BAUD * OOK_REMOTE_BAUD_TOLERANCE
+            ),
+            "{name}: {f:?}"
+        );
+    }
+}
+
+/// The remote's envelope sits at two levels, its off level the noise floor: layer 1
+/// labels every window `ook`, not `fsk` or `fm`.
+#[test]
+fn a_real_ook_remote_labels_ook() {
+    for name in OOK_REMOTES {
+        let (_, l) = ook_remote(name);
+        assert_eq!(l.name, "ook", "{name}: {l:?}");
+    }
+}
+
+/// Three HackRF windows of one press of two buttons (62 500 Hz, 20-34 dB SNR, the
+/// remote about 1.9 kHz over the capture centre): 431 ms, 71 ms and 471 ms, each a
+/// train of whole frames. On the node they measured as bursts (duty 0.076, 1.0 and
+/// 0.011), the first two at the 800 bit/s bit rate from the cyclostationary line and
+/// unknown, the third `fsk` with no rate.
+const OOK_SPARSE_REMOTES: [&str; 3] = [
+    "ook-remote-hackrf-sparse-1",
+    "ook-remote-hackrf-sparse-2",
+    "ook-remote-hackrf-sparse-3",
+];
+
+/// Every sparse window, the 71 ms one too (under two frames, 90-odd on and off runs
+/// of a few chips each, enough for the fit), measures the chip rate, never the
+/// remote's 800 bit/s bit rate.
+#[test]
+fn a_sparse_ook_remote_window_measures_its_chip_rate() {
+    for name in OOK_SPARSE_REMOTES {
+        let (f, _) = ook_remote(name);
+        let baud = f.symbol_rate_baud.map(|b| b.0 as f64);
+        assert!(
+            baud.is_some_and(
+                |b| (b - OOK_REMOTE_BAUD).abs() <= OOK_REMOTE_BAUD * OOK_REMOTE_BAUD_TOLERANCE
+            ),
+            "{name}: {f:?}"
+        );
+    }
+}
+
+/// Every sparse window labels `ook`: no FSK tones from the noise of its off samples.
+#[test]
+fn a_sparse_ook_remote_window_labels_ook() {
+    for name in OOK_SPARSE_REMOTES {
+        let (f, l) = ook_remote(name);
+        assert_eq!(l.name, "ook", "{name}: {f:?} {l:?}");
+        assert_eq!(f.tone_spacing_hz, None, "{name}: {f:?}");
+    }
+}
+
+/// The review probe's signal builder: `spec` synthesised at `rate` Hz, `snr` dB (none for
+/// clean), `off` Hz from the centre.
+fn probe_signal(
+    spec: zeta_dsp::synth::SynthSpec,
+    snr: Option<f32>,
+    off: f64,
+    rate: u32,
+) -> Vec<Complex<f32>> {
+    let imp = zeta_dsp::synth::Impairments {
+        snr_db: snr,
+        offset_hz: off,
+        ..Default::default()
+    };
+    zeta_dsp::synth::synthesise(&spec, &imp, rate, 0)
+}
+
+/// Eight patterned PSK bursts, 100 ms apart, as the review probe built them.
+fn psk_bursts(baud: u32, order: u8) -> zeta_dsp::synth::SynthSpec {
+    zeta_dsp::synth::SynthSpec::Psk {
+        symbol_rate_baud: baud,
+        order,
+        bits: "a5c3f0e1a5c3f0e1".into(),
+        repeat: 8,
+        gap_ms: 100,
+    }
+}
+
+/// `iq` measured and labelled as production does it (`measure_selection` over the whole
+/// block).
+fn production(iq: &[Complex<f32>], rate: u64) -> (zeta_core::classify::FeatureRecord, Label) {
+    zeta_dsp::measure::measure_selection(
+        iq,
+        rate,
+        CENTER,
+        zeta_core::classify::Band {
+            offset_hz: 0,
+            bandwidth_hz: zeta_core::types::Hz(rate),
+        },
+    )
+    .expect("a measurement")
+}
+
+/// The review probe's false positives (2026-11-04, 41c5c07..59141c4): the run-length fit
+/// read PSK bursts and POCSAG through a narrow band as on-off keying, and its `ook`
+/// overrode every rule. A fit whose off runs are signal (PSK's envelope dips: 15-29 dB
+/// over the noise against a remote's 1-5), whose twice-wider band holds FSK tones
+/// (POCSAG: the other tone) or whose band carries a PSK order is vetoed, and the label and
+/// order are the base's again.
+#[test]
+fn a_vetoed_run_fit_leaves_psk_bursts_and_nbfm_pocsag_to_the_other_rules() {
+    use zeta_core::classify::RateLine;
+    use zeta_dsp::synth::SynthSpec;
+    let pocsag = SynthSpec::Pocsag {
+        address: 1_234_567,
+        function: 3,
+        text: "HELLO WORLD THIS IS A PAGE".into(),
+        baud: 2_400,
+    };
+    for (what, iq, rate, label, order) in [
+        (
+            "bpsk bursts 2400 Bd 30 dB",
+            probe_signal(psk_bursts(2_400, 2), Some(30.0), 0.0, 48_000),
+            48_000,
+            "fsk",
+            Some(2),
+        ),
+        (
+            "qpsk bursts 2400 Bd 30 dB",
+            probe_signal(psk_bursts(2_400, 4), Some(30.0), 0.0, 48_000),
+            48_000,
+            "am",
+            None,
+        ),
+        (
+            "qpsk bursts 2400 Bd 8 dB",
+            probe_signal(psk_bursts(2_400, 4), Some(8.0), 0.0, 48_000),
+            48_000,
+            "am",
+            None,
+        ),
+        (
+            "pocsag 2400 Bd over nbfm 8 dB",
+            probe_signal(pocsag, Some(8.0), 0.0, 48_000),
+            48_000,
+            "am",
+            None,
+        ),
+    ] {
+        let (f, l) = production(&iq, rate);
+        eprintln!("{what}: {f:?} -> {} ({})", l.name, l.evidence);
+        assert_eq!(l.name, label, "{what}: {f:?} {l:?}");
+        assert_eq!(f.order, order, "{what}: {f:?}");
+        assert_ne!(f.symbol_rate_line, Some(RateLine::Runs), "{what}: {f:?}");
+    }
+}
+
+/// Signals the probe found the run-length fit claiming outside the reviewer's list, none
+/// of them on-off keying: QPSK bursts at 9600 Bd (the base's runs fit read 12 787 and
+/// 12 048 Bd and labelled them `ook`; now vetoed, their off runs 20-23 dB over the
+/// noise), and a Mode S train at 2.4 Msps whose 49 kHz measured band, narrowed to a
+/// sixteenth, fitted its envelope at 2005 Bd (the narrowing now stops at an eighth).
+#[test]
+fn qpsk_bursts_and_a_mode_s_train_are_not_runs_of_ook() {
+    use zeta_core::classify::RateLine;
+    use zeta_dsp::synth::SynthSpec;
+    let modes = SynthSpec::ModesIdent {
+        icao: 0x7c_1234,
+        callsign: "QFA1".into(),
+        repeats: 20,
+    };
+    for (what, iq, rate) in [
+        (
+            "qpsk bursts 9600 Bd 15 dB",
+            probe_signal(psk_bursts(9_600, 4), Some(15.0), 0.0, 96_000),
+            96_000,
+        ),
+        (
+            "qpsk bursts 9600 Bd 8 dB",
+            probe_signal(psk_bursts(9_600, 4), Some(8.0), 0.0, 96_000),
+            96_000,
+        ),
+        (
+            "mode s 30 dB",
+            probe_signal(modes.clone(), Some(30.0), 0.0, 2_400_000),
+            2_400_000,
+        ),
+        (
+            "mode s 8 dB",
+            probe_signal(modes, Some(8.0), 0.0, 2_400_000),
+            2_400_000,
+        ),
+    ] {
+        let (f, l) = production(&iq, rate);
+        eprintln!("{what}: {f:?} -> {} ({})", l.name, l.evidence);
+        assert_ne!(l.name, "ook", "{what}: {f:?} {l:?}");
+        assert_ne!(f.symbol_rate_line, Some(RateLine::Runs), "{what}: {f:?}");
+    }
+}
+
+/// Base's time (41c5c07, debug build, the review probe on the field host) for one 1 s window
+/// of bursty FSK at 2.4 Msps through `measure_selection`, ms.
+const BURSTY_FSK_2M4_BASE_MS: u128 = 112;
+
+/// The cost guard: bursty FSK at 2.4 Msps (eight 4800 Bd bursts 100 ms apart, 200 kHz
+/// off the centre, 15 dB) measures within twice base's time. The head before the fix
+/// took 3465 ms (the whole-window refit and the narrowing at the full rate); with each
+/// band cut once at a decimated rate, the refit skipped for a gate that holds more than
+/// 5 % of the window, and selections in place of sorts it takes 80 ms (debug, the field host,
+/// 2026-11-04). Timing depends on the build and the host: run with `--ignored`; the bound
+/// is asserted in a debug build only.
+#[test]
+#[ignore]
+fn bursty_fsk_at_2m4_measures_within_twice_base_time() {
+    let spec = zeta_dsp::synth::SynthSpec::Fsk {
+        symbol_rate_baud: 4_800,
+        deviation_hz: 6_000.0,
+        order: 2,
+        bits: "a5c3f0e1a5c3f0e1".into(),
+        repeat: 8,
+        gap_ms: 100,
+    };
+    let iq = probe_signal(spec, Some(15.0), 200_000.0, 2_400_000);
+    // The best of three, so a busy host does not fail it.
+    let ms = (0..3)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            let _ = production(&iq, 2_400_000);
+            t.elapsed().as_millis()
+        })
+        .min()
+        .unwrap();
+    eprintln!("bursty fsk at 2.4 Msps: {ms} ms (base {BURSTY_FSK_2M4_BASE_MS} ms)");
+    if cfg!(debug_assertions) {
+        assert!(ms <= 2 * BURSTY_FSK_2M4_BASE_MS, "{ms} ms");
     }
 }

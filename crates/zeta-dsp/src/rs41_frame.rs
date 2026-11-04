@@ -71,17 +71,7 @@ const WGS84_F: f64 = 1.0 / 298.257_223_563;
 
 /// CRC-16/CCITT: polynomial 0x1021, initial value 0xFFFF, no reflection, no final XOR.
 pub fn crc16_ccitt(data: &[u8]) -> u16 {
-    data.iter().fold(0xFFFF, |mut c, &b| {
-        c ^= u16::from(b) << 8;
-        for _ in 0..8 {
-            c = if c & 0x8000 != 0 {
-                (c << 1) ^ 0x1021
-            } else {
-                c << 1
-            };
-        }
-        c
-    })
+    crate::crc::crc(&crate::crc::CRC16_CCITT, data) as u16
 }
 
 /// GF(256) with field polynomial 0x11D, alpha = 2.

@@ -76,8 +76,9 @@ pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
 /// with. Per run, never shared: a later run starts empty.
 #[derive(Default)]
 pub struct OwnJobs {
-    /// Jobs a successful `job_start`, `job_attach` or `plan_start` answered, and
-    /// the `verdict.job` of an own `identify` once its context was read.
+    /// Jobs a successful `job_start`, `job_attach`, `graph_start`, `bits_start` or
+    /// `plan_start` answered, and the `verdict.job` of an own `identify` once its
+    /// context was read.
     jobs: HashSet<String>,
     /// The own `identify` jobs, whose context names the job that proved.
     identifies: HashSet<String>,
@@ -95,7 +96,7 @@ impl OwnJobs {
     pub fn record(&mut self, tool: &str, arguments: &Value, result: &Value) {
         let value = &result["value"];
         match tool {
-            "job_start" | "job_attach" => {
+            "job_start" | "job_attach" | "graph_start" | "bits_start" => {
                 if let Some(id) = value.as_str() {
                     self.jobs.insert(id.to_string());
                     if tool == "job_start" && arguments["kind"] == "identify" {
@@ -342,5 +343,21 @@ impl<E: Executor> Agent<E> {
             ok,
             result,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_jobs_count_bits_start_results() {
+        let mut own = OwnJobs::default();
+        let job = |id: &str| json!({"result": "job", "value": id});
+        own.record("bits_start", &json!({"capture": "01CAP"}), &job("01BITS"));
+        own.record("graph_start", &json!({}), &job("01GRAPH"));
+        assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01BITS"})));
+        assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01GRAPH"})));
+        assert!(!own.allows_stop(&json!({"op": "job_stop", "job": "01OTHER"})));
     }
 }

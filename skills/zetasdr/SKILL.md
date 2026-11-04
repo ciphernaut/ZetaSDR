@@ -163,7 +163,7 @@ Attach a processing chain to a running job's output instead of the radio: `trans
 
 ### job_retune
 
-Retune a running job on the radio to a new band under the same id: under the source's gate its lease is moved to `center_hz`/`bandwidth_hz` (inside the current capture it is granted without a tune, whether or not another rigid job's band overlaps it; outside it the source is tuned when no other rigid job or pin holds it, else it is a `conflict` naming the holders and the job is left as it was), its graph is expanded again for the new band at the capture's rate and the job relaunched, `tuning` updated. Applies to a `running` job the node expanded and can re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum` (elastic or rigid), `mix` (it has no band) and `transcribe` (attached: retune its input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new graph or start a new job). A job that is not running is `job <id> is <state>`; an unknown id is `unknown`. The result is the job's id, as `job_start` answers.
+Retune a running job on the radio to a new band under the same id: under the source's gate its lease is moved to `center_hz`/`bandwidth_hz` (inside the current capture it is granted without a tune, whether or not another rigid job's band overlaps it; outside it the source is tuned when no other rigid job or pin holds it, else it is a `conflict` naming the holders and the job is left as it was), its graph is expanded again for the new band at the capture's rate and the job relaunched, `tuning` updated. Applies to a `running` job the node expanded and can re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum` (elastic or rigid), `mix` (it has no band), a `graph_start` job (it runs on no radio) and `transcribe` (attached: retune its input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new graph or start a new job). A job that is not running is `job <id> is <state>`; an unknown id is `unknown`. The result is the job's id, as `job_start` answers.
 
 - job: string; an id from `job list`
 - center_hz: integer (Hz)
@@ -304,11 +304,11 @@ JSON: `{"op":"job_stop","job":"<id>"}`
 
 CLI: `zeta job stop --job <id>`
 
-Stopping a job is the operator's decision: never `job_stop` a job the request did not name, except one you started in this run (`job_start`, `plan_start`, `job_attach`, or the `verdict.job` of your own `identify` once you have read it): stop your own `measure` and `identify` leftovers when done. Through `ask` any other stop needs the run to allow stops, else it is refused as `not_allowed`: report that, do not retry.
+Stopping a job is the operator's decision: never `job_stop` a job the request did not name, except one you started in this run (`job_start`, `plan_start`, `job_attach`, `graph_start`, `bits_start`, or the `verdict.job` of your own `identify` once you have read it): stop your own `measure` and `identify` leftovers when done. Through `ask` any other stop needs the run to allow stops, else it is refused as `not_allowed`: report that, do not retry.
 
 ### jobs_stop
 
-Stop every running job that matches all the filters given, in one operation: `source`, `kind` and `plan` (`null` for any; all three `null` is every job). A job's filter on `plan` is its centre lying on one of that plan's channels. Elastic jobs (the page's spectrum) and jobs another job owns (a `watch`'s or an `identify`'s trial jobs) are never named: they follow the capture or their owner. Jobs on a radio are stopped first, then those attached to them; an attached job that ended with its input counts as stopped. The result lists `stopped` (ids) and `failed` (`job`, `error`; the others go on). No match is an empty `stopped`, not an error.
+Stop every running job that matches all the filters given, in one operation: `source`, `kind` and `plan` (`null` for any; all three `null` is every job). A job's filter on `plan` is its centre lying on one of that plan's channels; a job on no radio (`graph_start`, `bits_start`, a mix) never matches a `plan`. Elastic jobs (the page's spectrum) and jobs another job owns (a `watch`'s or an `identify`'s trial jobs) are never named: they follow the capture or their owner. Jobs on a radio are stopped first, then those attached to them; an attached job that ended with its input counts as stopped. The result lists `stopped` (ids) and `failed` (`job`, `error`; the others go on). No match is an empty `stopped`, not an error.
 
 - source: string or null; an id from `source list`
 - kind: string or null
@@ -378,6 +378,29 @@ JSON: `{"op":"graph_put","job":"<id>","graph":{"id":"<id>","nodes":[{"id":"<node
 CLI: `zeta graph put --job <id> --file graph.json`
 
 Fetch the current graph with `graph get`, edit it, and put it back; stage kinds and their params are listed under Stage kinds below and by `schema`. A put that changes only a demodulator's `squelch`/`squelch_db`, its guard's `guard_hz`/`guard_db`/`channel_hz`, the channel node's `wide_hz` (or `deviation_hz`/`sideband`) keeps the job re-expandable: a later capture change (another rate after a restart) re-expands it with those values carried. Any other change launches the graph as stored from then on.
+
+### graph_start
+
+Start a job from a graph whose first node has no inputs (`capture_in`, `stream_in`, `mix`): the record's kind is `graph`, its source `node`, its band the first `capture_in`'s first capture's (0/0 without one, so the page can place it), and it takes no lease and tunes nothing. A first node that takes input, and a node with an unfed input (no edge into it), are refused (`other`, naming the node); a `capture_in` whose capture is not in the store is `unknown` naming `captures[<i>]`. It launches the graph as stored (as after a `graph_put`); it is persisted and resumed like any job, after the jobs on a radio, and a `capture_in` job whose capture was expired since fails `capture <id> not found`. It has no band to retune. The result is the job's id, as `job_start` answers.
+
+- graph: object (Graph: id, nodes[Node: id, kind, params], edges[Edge: from, to, kind])
+
+JSON: `{"op":"graph_start","graph":{"id":"<id>","nodes":[{"id":"<node-id>","kind":"passthrough","params":{"kind":"iq"}}],"edges":[]}}`
+
+CLI: `zeta graph start --file graph.json`
+
+### bits_start
+
+Work a capture's bits: takes every capture of the named capture's `set`, in time order, and starts `capture_in → resample → <demod> → clock_recover → slicer → bit_view` from the named capture's feature record, each `null` taken from the features (`modulation`, one of `fsk`, `psk` and `ook`, from the layer-1 label: `fsk` and `fm` give `fsk`, `psk` and `ook` themselves; `symbol_rate_baud` and `order` from the record, `order` 2 when it has none; fsk takes 2 or 4, psk 2, 4 or 8, ook 2). The capture is resampled to about 8 samples per symbol for fsk and ook, and for psk to the smallest multiple of 4 times the baud that also covers a carrier offset of 2000 Hz (the coarse estimate is unambiguous only within the rate over twice the order), moved to a rate the resampler serves exactly. A signal off the capture's centre whose recorded band reaches past the resampler's passband (its offset plus half its `bandwidth_hz` over 0.45 times that rate) is shifted to its recorded `center_hz` first, unless layer 1 labels the capture `noise`: `capture_in → channel [→ resample] → <demod> → ...`, the `channel` stage at the measured centre with the measured bandwidth × 1.25 (at least 4 × the baud, at most what the capture holds about that centre: its rate less twice the shift) and an output rate the capture rate over a whole divisor (the resampler follows unless that is already the chain rate). 4-fsk and ook take the `early_late` clock; fsk's demodulator is given the record's measured `tone_spacing_hz` (it tracks the tones itself when the record has none); `capture_in` loops, paced, with a 500 ms pause between passes, and the job runs until stopped. Refused with `other`: a field neither the request nor the features give (`no symbol rate measured; give symbol_rate_baud`, `no modulation measured (label <x>); give modulation`), a rate the capture cannot hold (`symbol_rate_baud <r> needs <n> Hz; the capture holds <rate> Hz`, 4 samples per symbol at least; a rate of 0 is `symbol_rate_baud: at least 1`), a measured centre the capture holds under 4 × the baud about (`the measured centre <c> Hz leaves <room> Hz of the capture <lo>..=<hi> Hz about it, under the <floor> Hz the chain needs (4 x <baud> Bd)`), and a set whose captures differ in rate or centre (`capture <id>: <rate> Hz differs from <first>'s <rate> Hz`); an unknown `capture` is `unknown`. The record's kind is `bits`, its source `node`, its band the capture's, `job_context.bits` the plan (`captures`, `modulation`, `symbol_rate_baud`, `order`, `tone_spacing_hz`, `rate_hz`, `center_hz` the centre the chain runs on and `shift_hz` its offset from the capture's, `bandwidth_hz`, `padded_bandwidth_hz` the channel band uncut and `clamped` whether it was cut to the capture, and `channel_rate_hz`, `null` (and `padded_bandwidth_hz` `null`) when the chain does not shift); the slicer's `bits` events are on `job_context.slicer.stream` and `bit_view`'s latest hypotheses in `job_context.bit_view`. Change a running chain with `graph_get`, edit, `graph_put`. The result is the job's id, as `job_start` answers; one-shot `--then-tail` tails the `bits` events. The agent's own `bits_start` jobs count as jobs it started.
+
+- capture: string
+- modulation: string or null
+- symbol_rate_baud: integer or null
+- order: integer or null
+
+JSON: `{"op":"bits_start","capture":"<id>","modulation":null,"symbol_rate_baud":null,"order":null}`
+
+CLI: `zeta bits start --capture <id> [--modulation fsk|psk|ook] [--symbol-rate-baud N] [--order N] [--then-tail MAX_FRAMES,TIMEOUT_MS] [--keep]`
 
 ### knowledge_lookup
 
@@ -484,6 +507,12 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: audio
 - outputs: event
 
+### bit_view
+
+- inputs: event
+- outputs: event
+- params.window_bits: integer (optional, default 65536)
+
 ### burst_capture
 
 - inputs: iq
@@ -499,6 +528,15 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.whole: boolean (optional, default false)
 - params.window_ms: integer (optional, default 2000)
 
+### capture_in
+
+- inputs: 
+- outputs: iq, event
+- params.captures: array
+- params.loop: boolean (optional, default false)
+- params.loop_pause_ms: integer (optional, default 500)
+- params.realtime: boolean (optional, default true)
+
 ### channel
 
 - inputs: iq
@@ -507,6 +545,23 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.bandwidth_hz: integer
 - params.out_rate_hz: integer
 - params.wide_hz: integer or null (optional, default null)
+
+### clock_recover
+
+- inputs: audio
+- outputs: audio, event
+- params.symbol_rate_baud: integer
+- params.algorithm: any (optional, default null)
+- params.loop_bw: number (optional, default 0.01)
+- params.max_ppm: integer (optional, default 2000)
+
+### correlate
+
+- inputs: event
+- outputs: event
+- params.pattern: string
+- params.bits: integer
+- params.max_errors: integer (optional, default 0)
 
 ### denoise
 
@@ -547,6 +602,14 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.notch_hz: integer (optional, default 0)
 - params.rows_per_s: integer (optional, default 20)
 
+### fsk_demod
+
+- inputs: iq
+- outputs: audio
+- params.symbol_rate_baud: integer
+- params.order: integer (optional, default 2)
+- params.tone_spacing_hz: integer or null (optional, default null)
+
 ### measure
 
 - inputs: iq
@@ -575,6 +638,12 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.squelch: boolean (optional, default true)
 - params.squelch_db: integer or null (optional, default null)
 
+### ook_demod
+
+- inputs: iq
+- outputs: audio
+- params.symbol_rate_baud: integer
+
 ### passthrough
 
 - inputs: iq, audio, video, text, event, sink
@@ -586,10 +655,25 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: iq
 - outputs: event
 
+### psk_demod
+
+- inputs: iq
+- outputs: audio
+- params.symbol_rate_baud: integer
+- params.loop_bw: number (optional, default 0.02)
+- params.order: integer (optional, default 2)
+- params.rolloff: number (optional, default 0.35)
+
 ### rds_decode
 
 - inputs: iq
 - outputs: event
+
+### resample
+
+- inputs: iq
+- outputs: iq
+- params.out_rate_hz: integer
 
 ### sink_sondehub
 
@@ -601,6 +685,16 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.lat: number or null (optional, default null)
 - params.lon: number or null (optional, default null)
 - params.url: string (optional, default "https://api.v2.sondehub.org/sondes/telemetry")
+
+### slicer
+
+- inputs: audio
+- outputs: event
+- params.chunk_bits: integer (optional, default 4096)
+- params.constellation: any (optional, default null)
+- params.differential: boolean (optional, default false)
+- params.levels: integer (optional, default 2)
+- params.mapping: any (optional, default "natural")
 
 ### ssb_demod
 
@@ -661,7 +755,7 @@ Measured facts first, then method. Verify against the node's `knowledge lookup` 
 
 To decode APRS from a source, start the job and tail its events in one call: `zeta job start --kind aprs_decode --source S --center-hz 144800000 --bandwidth-hz 12500 --then-tail 1,5000`. It prints `[job_result, frames_result, {"stopped": true}]` (the job is stopped after the tail; add `--keep` to leave it running); each frame's `payload` is one decoded packet (`src`, `dst`, `info`, `fcs_ok`). An empty frame list means no packet arrived within the timeout, not that none exist. Exit 2 with `[job_result, job_record]` means the job is not running: read `state.reason` (e.g. a stage that failed on the source's blocks). A `measure` job emits one event per second of IQ: `center_hz` and `bandwidth_hz` are the occupied band (spectrum bins at least 6 dB above the noise floor, the 15th-percentile bin of the band), `snr_db` is the peak above that floor, `burst` is true when the loudest 10 ms is more than 3 times the median 10 ms power, `symbol_rate_baud` is the keying rate when a symbol-rate line stands out and `null` otherwise, and `label.name` is one of `noise` (SNR under 6 dB), `carrier` (steady envelope, no modulation), `fm` (steady envelope with deviation), `fsk` (two tones 500-3000 Hz apart, on RF or in FM audio), `psk`, `ook` or `unknown`. Report `unknown` as unknown, with the measured fields. A `measure` event with `partial: true` covers a window cut short by a gap, lag or retune and spans only its samples; `partial: false` is a full second. `classify` and `measure` analyse only the selection/job band (a `measure` event's `center_hz` is absolute RF, within that band); `spectrum` covers the whole source band. A `spectrum` event is one row of power-averaged spectrum (20 per second of signal time) with `size` bins lowest frequency first, `bin_hz`, `center_hz` and the levels quantised as `q` (0-255 per bin): the dB of bin k is `floor_db + q[k] * step_db`; `floor_db` sits 5 dB under the row's 2nd-percentile bin, so a `q` near 10 is the noise floor and 255 means at least 127.5 dB above `floor_db`. A row may carry `masked: [[lo, hi], ...]`, bin index ranges (`lo` inclusive, `hi` exclusive) the receiver could not see honestly (a scan step's DC notch, its band edges): read them as no data, never as a quiet band; the `q` under them is present only so an older reader sees a whole row. A scan's steps alternate between two grids a quarter step apart, so a step's notch and its edges in one sweep fall a quarter of the way into a row of the next, clear of its mask: judge a frequency from two consecutive sweeps. On a local hardware receiver a `measure` job ignores the bins within 25 kHz of the capture centre (`job context` shows `measure.dc_mask_hz`, 0 when none), unless the box is centred on it (a lone job's capture: then the box is measured as today), so a box that sits beside the DC spike in a wider capture measures the signal.
 
-A `measure` event also carries the burst features, always: `duty` (the share of the window the signal is on), `bursts`, `burst_ms` and `period_ms` (`null` when there is no burst train), and, when a keying line or tone clusters stand out, `order` (the FSK or PSK order: 2, 4, 8) and `tone_spacing_hz`. When the window holds a burst train (at least two on-runs, or one of 3 ms or more, with the signal off between them: the quiet chunks within 6 dB of the in-band noise floor, so clicks over a continuous signal do not count) the band, SNR, label, `symbol_rate_baud` and `order` are measured over the on-time only, not averaged into the silence. So a low `duty` means the features were measured over the bursts: report the burst timing (`duty`, `burst_ms`, `period_ms`) with them and say the measurement is over the bursts, never that the band is quiet or `noise` on the strength of a whole-window average. `symbol_rate_baud` comes from a cyclostationary line (the |x|^2 spectrum, or the envelope edges for on-off keying); a line is a hypothesis about the keying rate, and a short burst may give none (`null`).
+A `measure` event also carries the burst features, always: `duty` (the share of the window the signal is on), `bursts`, `burst_ms` and `period_ms` (`null` when there is no burst train), and, when a keying line or tone clusters stand out, `order` (the FSK or PSK order: 2, 4, 8) and `tone_spacing_hz`. When the window holds a burst train (at least two on-runs, or one of 3 ms or more, with the signal off between them: the quiet chunks within 6 dB of the in-band noise floor, so clicks over a continuous signal do not count) the band, SNR, label, `symbol_rate_baud` and `order` are measured over the on-time only, not averaged into the silence. So a low `duty` means the features were measured over the bursts: report the burst timing (`duty`, `burst_ms`, `period_ms`) with them and say the measurement is over the bursts, never that the band is quiet or `noise` on the strength of a whole-window average. `symbol_rate_baud` comes, for on-off keying whose envelope sits at two levels, from its run lengths (the chip: the unit every on and off run is a whole multiple of, so pulse-width keying such as a 433 MHz remote reads its chip rate, not its bit rate; fitted over the whole window even when it gated as bursts, in the measured band or, for a weak signal whose measured band is mostly noise, a narrower one, and such a window labels `ook` with no tones), else from a cyclostationary line (the |x|^2 spectrum, or the envelope edges for on-off keying); `symbol_rate_line` says which (`runs`, `cyclo` or `keying`; `null` without a rate). A run-length rate is dropped for the other lines when its off runs are signal rather than the noise (a PSK burst's envelope dips), twice its band holds FSK tones, or the band carries a PSK order. A rate is a hypothesis about the keying rate, and a short burst may give none (`null`).
 
 ### Decoding pagers, aircraft and FM data
 
@@ -874,20 +968,23 @@ A signal nobody has named goes up a ladder; stop at the first rung that answers,
 
 When `classify` answers `too_old` the ring has moved on: the error carries the ring's earliest start in its detail; re-issue on the latest span it still holds, and say so.
 
-The playbook ends at classification and, when the operator accepts one, the signature written back so the next encounter is a layer 2 match. It stops before decoding the content of a third-party transmission: measuring, classifying, capturing a few bursts to identify the signal and saying who the register says is licensed is in scope; recovering and reading the messages of someone else's link is not, and interception law varies by country, so that is the operator's decision and legal responsibility. State this legal line once when a request goes that way, and do not repeat it. A known public protocol the node has a decoder row for (APRS, POCSAG, ADS-B, ACARS, radiosondes) is the ordinary use of the radio and is not held back by it. Bits, frame hypotheses and signature write-back as ops arrive in later plans; until then layer 4 below is the method, by hand.
+The playbook ends at classification and, when the operator accepts one, the signature written back so the next encounter is a layer 2 match. It stops before decoding the content of a third-party transmission: measuring, classifying, capturing a few bursts to identify the signal and saying who the register says is licensed is in scope; recovering and reading the messages of someone else's link is not, and interception law varies by country, so that is the operator's decision and legal responsibility. State this legal line once when a request goes that way, and do not repeat it. A known public protocol the node has a decoder row for (APRS, POCSAG, ADS-B, ACARS, radiosondes) is the ordinary use of the radio and is not held back by it. Bits and frame hypotheses are ops now (below); signature write-back arrives in a later plan.
 
 ### Working layer 4
 
-When a signal has no known decoder, work it in this order:
+When a signal has no known decoder and a capture of it exists, work its bits with the ops, in this order:
 
-1. Isolate the channel.
-2. Resample to a rate suited to the symbol rate.
-3. Recover the clock.
-4. Slice symbols.
-5. Inspect the bit stream.
-6. Hypothesise framing (preamble, sync word, length, checksum).
-7. Attempt a decode.
-8. Write the result back as a signature, so the next encounter is a layer 2 match.
+1. `capture_list` (narrow with `signal` when the band is known); take the capture's id from it, never invent one. No capture: start a `capture` job on the signal's measured band first.
+2. `bits_start` with `capture`, `modulation`, `symbol_rate_baud` and `order`, each `null` to take it from the capture's feature record and its layer-1 label (`fsk` and `fm` give `fsk`; `psk` and `ook` themselves). It takes every capture of the capture's `set` in time order and builds `capture_in → resample → <demod> → clock_recover → slicer → bit_view`; a signal off the capture's centre whose measured band reaches past the resampler's passband (offset plus half the measured width over 0.45 times the chain rate: a wide capture) is shifted to its measured centre first by a `channel` stage, unless layer 1 labels it `noise` (`job_context.bits.shift_hz` says by how much); the channel's band is the measured width × 1.25, at least 4 × the baud, cut to what the capture holds about the measured centre (a weak signal's measured band reaches into the noise). fsk takes order 2 or 4, psk 2, 4 or 8, ook 2. It refuses with `other`: `no symbol rate measured; give symbol_rate_baud`, `no modulation measured (label <x>); give modulation`, `symbol_rate_baud <r> needs <4r> Hz; the capture holds <rate> Hz`, `symbol_rate_baud: at least 1` for a rate of 0, a measured centre the capture holds under 4 × the baud about (`the measured centre <c> Hz leaves <room> Hz of the capture <lo>..=<hi> Hz about it, under the <floor> Hz the chain needs (4 x <baud> Bd)`), and a set of mixed rates or centres (`capture <id>: <rate> Hz differs from <first>'s <rate> Hz`). Short FSK bursts, real or synthesised, often have no measured rate: give it. On a refusal, report it and the features; do not guess a rate.
+3. The chain's rate: about 8 samples per symbol for fsk and ook; for psk the smallest multiple of 4 times the baud that also covers a carrier offset of 2000 Hz (`psk_demod`'s coarse estimate is unambiguous only within the rate over twice the order). A 4-FSK or OOK chain takes `clock_recover` `algorithm: early_late` (the default Mueller and Müller mistimes 4 levels and reads no timing across an OOK pulse's flat top); `bits_start` sets it, a chain built by hand must too, or it mistimes.
+4. The replay loops (`loop: true`, `realtime: true`, a 500 ms pause between passes) and the job runs until stopped. A one-pass chain (`loop: false`) drains to its end, its last chunk delivered, and ends `stopped`. An unpaced loop (`loop: true`, `realtime: false`) needs `loop_pause_ms` of at least 100.
+5. Read, with `job_context`: `bit_view` (the hypotheses over the whole set: line code, frame period, sync-word candidates, CRC candidates, each with its counts; its window spans the set's captures, each a segment no word or frame crosses, the counts summed over them, and a looping replay's next pass starts it afresh, so a pass is never counted twice), `clock` (`rate_est_baud`, `locked`: a clock that is not locked, or an estimate far from the rate, means the rate or the modulation is wrong) and `slicer` (`symbols`, `events`, `stream`). Never tail the whole bits stream: `stream_tail` of `job_context.slicer.stream` with `max_frames` at most 4. A CRC candidate with `period_bits` 0 means the frames run from each sync to the next.
+6. Change a running chain with `graph_get`, edit, `graph_put`: a `slicer` with `differential: true` or another `mapping`, or a `correlate` node (`{pattern, bits, max_errors}`) between the slicer and `bit_view`. `correlate` forwards every event and adds `sync` hits, so the hypotheses keep coming. A node's output feeds one edge: there is no fan-out.
+7. PSK's phase ambiguity is not resolved: a BPSK stream may come out inverted and a QPSK stream rotated. `slicer` `differential: true` is the answer; try it before calling a PSK stream noise.
+8. Report the hypotheses with their counts (`sync` hits, matching frames out of tried, CRC passes), and say which are guesses. When nothing checks, stop at "unknown" with the measured features: do not claim a protocol, a framing or a payload from a hypothesis without a CRC-clean check.
+9. A chain of your own: `graph_start` runs a graph that has no radio (a `capture_in`, `stream_in` or `mix` at its root) on the node source (`zeta graph start --file`). `graph` and `bits` are reserved kind names, so `job_start` refuses them (an operator mode row with either id cannot be started).
+10. You may stop your own `bits_start` and `graph_start` jobs when done (`job_stop`); never one you did not start. `jobs_stop` with a plan filter skips them (their centre is the capture's, not a channel they hold).
+11. Write the result back as a signature so the next encounter is a layer 2 match: not yet an op (plan 19.3); until then report it.
 
 ### The rule
 

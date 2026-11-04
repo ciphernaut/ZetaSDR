@@ -662,6 +662,25 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 #explore td { max-width: 18em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 8px 1px 4px; }
 #explore td button { margin-right: 4px; font-size: 11px; }
 #explore td.actions { max-width: none; overflow: visible; }
+#explore td input.bits-rate { width: 5.5em; margin-right: 4px; font-size: 11px; }
+
+/* The Bits pane (bits.js). */
+#bits { height: 100%; display: flex; flex-direction: column; background: var(--bg); font-size: 12px; }
+#bits[hidden] { display: none; }
+#bits .bits-head { display: flex; gap: 12px; align-items: center; padding: 2px 4px; border-bottom: 1px solid var(--border); }
+#bits .bits-head select[hidden] { display: none; }
+#bits-binary { font-family: monospace; color: var(--ok); }
+#bits .bits-body { flex: 1; min-height: 0; display: flex; }
+#bits-rows { flex: 1; min-width: 0; overflow: auto; font-family: monospace; white-space: pre; padding: 2px 4px; }
+#bits .bits-row .off { color: var(--border); margin-right: 8px; }
+#bits .bits-row .byte { padding: 0 2px; }
+#bits .bits-row .byte:hover { outline: 1px solid var(--text); }
+#bits .bits-row .byte.sync { background: var(--ok); color: #000; }
+#bits .bits-side { width: 22em; display: flex; flex-direction: column; gap: 4px; padding: 2px 4px; overflow: auto; border-left: 1px solid var(--border); }
+#bits-eye { width: 192px; height: 128px; border: 1px solid var(--border); }
+#bits-hyps { margin: 0; padding-left: 1.2em; }
+#bits-hyps li { margin: 1px 0; }
+#bits-hyps li button { font-size: 11px; }
 
 /* ---- the frame (spec 4.3) ---- */
 /* The source bar's live numbers: plain shows them in the tab's title only. */

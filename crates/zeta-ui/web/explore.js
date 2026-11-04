@@ -1,6 +1,7 @@
 // explore.js: the Explore pane (plan 19 spec 5.7), the captures the node holds.
 //
-// mountExplorePane(el, api, view, transcript, {panes}) -> {render(), eligible(), destroy()}
+// mountExplorePane(el, api, view, transcript, {panes, ov, wf, onBits})
+//   -> {render(), eligible(), destroy()}
 //   Polls `capture_list` once at load, then every EXPLORE_POLL_MS while the pane is shown, has
 //   been shown once this load, a `capture` job runs (fed by noteJobs(jobs) from each job_list;
 //   one more poll when the last one ends) or a bracket is drawn (so a deleted capture's goes;
@@ -9,7 +10,11 @@
 //   the nearest transmitter's licensee) as `tr.capture` rows with the buttons What is this
 //   (`capture_classify`, labels to the transcript), Download (both SigMF files fetched with the
 //   bearer and saved as Blobs: the secret never goes into a URL) and Delete (`capture_delete`,
-//   a second click within DELETE_CONFIRM_MS confirms; the button reads `sure?` between).
+//   a second click within DELETE_CONFIRM_MS confirms; the button reads `sure?` between) and
+//   Work the bits (`bits_start {capture, modulation: null, symbol_rate_baud, order: null}`,
+//   `symbol_rate_baud` the row's `input.bits-rate`, prefilled from the features' symbol rate,
+//   null when empty so the node fills it; the transcript says `started bits <id> on <kHz> kHz`
+//   or the error, then the Bits pane is selected; a rate typed survives the 2 s redraw).
 //   Draws the cached region (ov.span, tagged with the id's last 6 characters) of each capture
 //   still on the waterfall's columns (one that ended before the oldest column is skipped).
 //   Registers the `explore` pane with the strip, eligible while any capture exists, and selects
@@ -49,8 +54,16 @@ function nearestTx(c) {
   return tx.length ? tx[0].licensee : "";
 }
 
-export function mountExplorePane(el, api, view, transcript, { panes = null, ov = () => null, wf = () => null } = {}) {
-  return new ExplorePane(el, api, view, transcript, panes, ov, wf);
+export function mountExplorePane(
+  el,
+  api,
+  view,
+  transcript,
+  { panes = null, ov = () => null, wf = () => null, onBits = null } = {},
+) {
+  const pane = new ExplorePane(el, api, view, transcript, panes, ov, wf);
+  pane.onBits = onBits; // (job id) after a bits_start: the Bits pane shows that job
+  return pane;
 }
 
 class ExplorePane {
@@ -72,6 +85,12 @@ class ExplorePane {
     this.destroyed = false;
     this.armed = new Map(); // capture id -> timer of the pending delete confirmation
     this.busy = new Set();
+    this.rates = new Map(); // capture id -> the symbol rate typed in its row
+    this.onInput = (ev) => {
+      const tr = ev.target.closest("tr.capture");
+      if (tr && ev.target.classList.contains("bits-rate")) this.rates.set(tr.dataset.id, ev.target.value);
+    };
+    el.addEventListener("input", this.onInput);
     this.onClick = (ev) => this.click(ev);
     el.addEventListener("click", this.onClick);
     panes?.register("explore", "explore", {
@@ -191,7 +210,9 @@ class ExplorePane {
         ["classify", "What is this"],
         ["download", "Download"],
         ["delete", this.armed.has(c.id) ? "sure?" : "Delete"],
+        ["bits", "Work the bits"],
       ]) {
+        if (action === "bits") td.append(this.rateInput(c));
         const b = document.createElement("button");
         b.type = "button";
         b.dataset.action = action;
@@ -206,6 +227,20 @@ class ExplorePane {
     this.el.replaceChildren(table);
   }
 
+  // The symbol rate Work the bits sends: what was typed, else the features' (empty: none).
+  rateInput(c) {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.className = "bits-rate";
+    input.min = "1";
+    input.step = "1";
+    input.placeholder = "Bd";
+    input.title = "symbol rate for Work the bits (empty: the node's measurement)";
+    const rate = c.features?.symbol_rate_baud;
+    input.value = this.rates.get(c.id) ?? (typeof rate === "number" ? String(Math.round(rate)) : "");
+    return input;
+  }
+
   async click(ev) {
     const b = ev.target.closest("button[data-action]");
     const tr = ev.target.closest("tr.capture");
@@ -218,6 +253,7 @@ class ExplorePane {
     try {
       if (action === "classify") await this.classify(id);
       else if (action === "download") await this.download(id);
+      else if (action === "bits") await this.bits(id, tr.querySelector("input.bits-rate")?.value);
     } finally {
       this.busy.delete(id + action);
     }
@@ -239,6 +275,27 @@ class ExplorePane {
       }
     } catch (e) {
       this.t.note(`capture_classify: ${e.message}`, true);
+    }
+  }
+
+  async bits(id, rateText) {
+    const c = this.captures.find((x) => x.id === id);
+    const rate = Number.parseInt(rateText, 10);
+    try {
+      const r = await this.api.op({
+        op: "bits_start",
+        capture: id,
+        modulation: null,
+        symbol_rate_baud: Number.isFinite(rate) && rate > 0 ? rate : null,
+        order: null,
+      });
+      const job = r && r.result === "job" ? r.value : null;
+      if (!job) return;
+      this.t.note(`started bits ${job} on ${c ? khzText(c.bandwidth_hz) : "?"} kHz`);
+      this.onBits?.(job);
+      this.panes?.select("bits");
+    } catch (e) {
+      this.t.note(`bits_start: ${e.message}`, true);
     }
   }
 
@@ -290,6 +347,7 @@ class ExplorePane {
     clearTimeout(this.timer);
     for (const t of this.armed.values()) clearTimeout(t);
     this.el.removeEventListener("click", this.onClick);
+    this.el.removeEventListener("input", this.onInput);
     this.panes?.unregister("explore");
   }
 }
