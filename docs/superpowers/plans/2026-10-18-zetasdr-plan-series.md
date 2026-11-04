@@ -64,7 +64,7 @@ Six of the seven plans shipped; plan 19 was not started then and opens the next 
 | 17 sonde frameworks | 97383b0, 2026-10-29 | RS41 X1142896 decoded on the B210 2026-11-01 (pre-placed decoder) | the watch finding a sonde on its own (detector, re-centre) |
 | 18 box, fit, refine | 771ea93, 2026-11-01 | retune, drag, menu, tags, conflict and the fit mechanism on the B210; the DC-in-box outcome on the HackRF; the fit on a transmitting CB channel (ch9, +450 Hz, transcripts) on the B210 | the fitted width on a weak voice channel (the 5 kHz floor; `TODO.md`) |
 | 19.1 layer 4 explore | 1b57cf7, 2026-11-03 (fast-forward; Plan 19.1 status) | not yet: acceptance deferred to after 19.3 | the live acceptance; the B210 noise recording; 19.3 not started |
-| 19.2 layer 4 bits | fast-forward to 0b90359, 2026-11-04 (Plan 19.2 status); the OOK run-length fit after it (49ceb21..1ef6c69) | not yet: spec 9 item 3 after 19.3; the first real OOK remote (433.882 MHz) not recovered end to end | the field host check (`UAT.md` Plan 19.2); 19.3 not started |
+| 19.2 layer 4 bits | fast-forward to 0b90359, 2026-11-04 (Plan 19.2 status); the OOK run-length fit after it (49ceb21..1ef6c69) | not yet: spec 9 item 3 after 19.3; the first real OOK remote (433.882 MHz) not recovered end to end | the test_host check (`UAT.md` Plan 19.2); 19.3 not started |
 | 26 themes as folders | 576002a, 2026-11-04 (Plan 26 status) | deployed as plan26-zeta 2026-11-04; UAT open | per-footprint layouts, a node-level default theme (`TODO.md`) |
 | 20 Soapy worker | 3acbad4, 2026-10-31 | items 1-2 on the B210 (SIGSEGV heal); the HackRF's cable pull and SIGSEGV on the two-radio field host node 2026-11-01 | the B210's own cable pull |
 
@@ -206,7 +206,7 @@ Deferred minors are gists in `TODO.md` ("Layer 1 and explore: deferred minors fr
 
 ## Plan 19.2 status
 
-Plan 19.2 (layer 4 bits) was built on `worktree-plan19-2` (8ff4829..0b90359) and fast-forwarded to `main` 2026-11-04; deployed on the field host with plan26-zeta. The OOK run-length fit (layer 1 measuring on-off keying's chip from its run lengths, 49ceb21..1ef6c69) followed the first on-air remote. Spec `docs/superpowers/specs/2026-11-02-layer4-explore-design.md`, plan `docs/superpowers/plans/2026-11-03-layer4-bits.md`. Live acceptance (spec 9 item 3) waits for the field host, after 19.3.
+Plan 19.2 (layer 4 bits) was built on `worktree-plan19-2` (8ff4829..0b90359) and fast-forwarded to `main` 2026-11-04; deployed on test_host with plan26-zeta. The OOK run-length fit (layer 1 measuring on-off keying's chip from its run lengths, 49ceb21..1ef6c69) followed the first on-air remote. Spec `docs/superpowers/specs/2026-11-02-layer4-explore-design.md`, plan `docs/superpowers/plans/2026-11-03-layer4-bits.md`. Live acceptance (spec 9 item 3) waits for test_host, after 19.3.
 
 What shipped: stages `capture_in`, `resample`, `fsk_demod`, `psk_demod`, `ook_demod`, `clock_recover`, `slicer`, `correlate`, `bit_view` in `zeta-dsp`; the ops `graph_start` and `bits_start` (`zeta graph start --file`, `zeta bits start ... --then-tail`); the Bits pane and "Work the bits" on the Explore pane; the field craft's "Working layer 4" as the executable playbook (AGENTS.md and the skill regenerated); the agent may stop its own `bits_start` and `graph_start` jobs; `graph` and `bits` are reserved kind names.
 
@@ -218,7 +218,7 @@ Deferred minors are gists in `TODO.md` ("Bits: deferred minors from plan 19.2", 
 
 ## Plan 26 status
 
-Plan 26 (themes as folders) is merged to `main` (576002a, the merge of main into the themes branch, op count 36) and deployed on the field host 2026-11-04 as `~/zetasdr/plan26-zeta`. Spec `docs/superpowers/specs/2026-11-03-themes-design.md`, plan `docs/superpowers/plans/2026-11-03-themes.md`, guide `docs/themes.md`.
+Plan 26 (themes as folders) is merged to `main` (576002a, the merge of main into the themes branch, op count 36) and deployed on test_host 2026-11-04 as `~/zetasdr/plan26-zeta`. Spec `docs/superpowers/specs/2026-11-03-themes-design.md`, plan `docs/superpowers/plans/2026-11-03-themes.md`, guide `docs/themes.md`.
 
 What was built: a theme is a folder (`theme.json`, an optional `style.css`, the fonts and images it names), built in under `themes/` or the operator's `--themes-dir`, listed by `themes_list` (`zeta themes list`) as ready or broken; the node wraps `style.css` (tokens and layout first, scoped by nesting, font faces and keyframes hoisted, imports and escaping urls refused) and serves a ready theme's files under `/ui/themes/<id>/` without the bearer; console's look moved into `themes/console`; four new built-ins: cyberpunk, terminal, psytrance and vibecoder (the light one). UAT (`UAT.md` Plan 26) is open; the deferred minors, per-footprint layouts and a node-level default theme are gists in `TODO.md`.
 
