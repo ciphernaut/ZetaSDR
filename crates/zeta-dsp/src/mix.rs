@@ -30,7 +30,7 @@ pub const MIX_STAGE: &str = "mix";
 /// idle, and showed one window of 3 underruns under 3x CPU oversubscription where 40 ms
 /// showed none, so 40 is margin against tick quantisation and jitter, not a measured
 /// requirement. 60 and 80 were not run. Real hardware is to be read from `underruns` at the
-/// the field host acceptance. The ceiling is 80: 100 ms blocks + 80 ms + a 20 ms tick is the
+/// field host's acceptance. The ceiling is 80: 100 ms blocks + 80 ms + a 20 ms tick is the
 /// 200 ms cap.
 pub const PREBUFFER_MS: u64 = 40;
 

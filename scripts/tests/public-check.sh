@@ -15,6 +15,8 @@ trap 'rm -rf "$base"' EXIT
 coord="-27.38""4212, 153.11""7501"
 akia="AK""IA""ABCDEFGHIJKLMNOP"
 lhost="http://box.lo""cal:8080"
+khost="http://kiwisdr.lo""cal:8073"
+xhost="xhost.lo""cal:1"
 secret_host="secret""-host"
 
 fail() { echo "FAIL $1: $2" >&2; exit 1; }
@@ -99,6 +101,36 @@ local_host_with_port_fails() {
   pass local_host_with_port_fails
 }
 
+# The real repository's allowlist excuses kiwisdr.local; a tree without its own allowlist
+# has none, so the same line fails there.
+allowlist_is_the_scanned_trees_own() {
+  local d
+  d=$(repo ownallow)
+  echo "curl $khost/x" >"$d/a.md"
+  track "$d"
+  run "$d"
+  [ $rc -eq 1 ] || fail allowlist_is_the_scanned_trees_own "rc=$rc $out"
+  case $out in *"a.md:1: local-host"*) ;; *) fail allowlist_is_the_scanned_trees_own "$out" ;; esac
+  pass allowlist_is_the_scanned_trees_own
+}
+
+# The real allowlist's example-host entry is anchored: a longer name ending in one of its
+# words still fails.
+example_host_entry_is_anchored() {
+  local d
+  d=$(repo anchored)
+  mkdir -p "$d/scripts"
+  grep -F 'local:[0-9]' "$here/../public-allow.txt" >"$d/scripts/public-allow.txt"
+  [ -s "$d/scripts/public-allow.txt" ] || fail example_host_entry_is_anchored "no example-host entry"
+  printf '%s\n' "curl $khost/x" "ssh $xhost" >"$d/a.md"
+  track "$d"
+  run "$d"
+  [ $rc -eq 1 ] || fail example_host_entry_is_anchored "rc=$rc $out"
+  case $out in *"a.md:1:"*) fail example_host_entry_is_anchored "example host not allowed: $out" ;; esac
+  case $out in *"a.md:2: local-host"*) ;; *) fail example_host_entry_is_anchored "$out" ;; esac
+  pass example_host_entry_is_anchored
+}
+
 svg_and_binary_are_scanned() {
   local d
   d=$(repo bin)
@@ -168,6 +200,8 @@ message_omits_pattern
 bad_denylist_regex_fails
 coordinates_fail_unless_allowed
 local_host_with_port_fails
+allowlist_is_the_scanned_trees_own
+example_host_entry_is_anchored
 svg_and_binary_are_scanned
 no_denylist_still_runs
 gitleaks_hit_fails

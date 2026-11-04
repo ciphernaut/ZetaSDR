@@ -726,7 +726,7 @@ ship in the production bundle.
 
 Pending: the phone check. Start the node on the LAN address,
 `ZETA_SECRET=… zeta --state-dir … --source-file tone=… --source-file aprs=… serve --listen
-<host-ip>:7979` (wired; <host-ip> on WiFi), open `http://<host-ip>:7979/ui/` on the phone,
+<wired-ip>:7979` (wired; <wifi-ip> on WiFi), open `http://<wired-ip>:7979/ui/` on the phone,
 paste the secret, and check the narrow renderer: waterfall full width, ☰ drawer, a drag opening the
 menu by touch, Decode › APRS and its ribbon. The mic will not work there over plain HTTP (browsers
 allow it only on a secure origin). Also pending: the microphone against a real `voiced`, the

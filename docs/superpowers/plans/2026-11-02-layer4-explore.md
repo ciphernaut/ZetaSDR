@@ -568,7 +568,7 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
     let asg: Vec<_> = a.iter().filter(|x| x.kind.as_deref() == Some("assignment")).collect();
     assert_eq!(asg.len(), 4);
     assert_eq!(asg[0].licensee.as_deref(), Some("Example Water Authority"));
-    assert_eq!(asg[0].role.as_deref(), Some("tx")); // Example Suburb, 1 W, nearest tx
+    assert_eq!(asg[0].role.as_deref(), Some("tx")); // 1 W, nearest tx
     assert_eq!(asg[0].emission_decoded.as_ref().unwrap().bandwidth_hz, Hz(16_000));
     assert!(asg[0].distance_km.unwrap() < 20.0);
     assert!(asg.windows(2).all(|w| w[0].distance_km <= w[1].distance_km));

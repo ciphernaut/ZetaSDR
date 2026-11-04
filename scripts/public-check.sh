@@ -71,11 +71,10 @@ else
   echo "public-check: no private denylist; built-in checks only"
 fi
 
+# The allowlist is the scanned tree's own, never this script's repository's.
 allow=""
 if [ -f "$root/scripts/public-allow.txt" ]; then
   allow="$root/scripts/public-allow.txt"
-elif [ -f "$here/public-allow.txt" ]; then
-  allow="$here/public-allow.txt"
 fi
 
 coord_re='-?[0-9]{1,3}\.[0-9]{4,}, ?-?[0-9]{1,3}\.[0-9]{4,}'

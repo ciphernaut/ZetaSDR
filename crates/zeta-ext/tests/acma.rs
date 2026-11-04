@@ -48,8 +48,8 @@ fn sse(v: Value) -> Response {
         .into_response()
 }
 
-/// The four 404.025 MHz assignments, shaped as the register answered them on 2026-11-02: the
-/// Example Rail Operator rows as answered, the 9000002/1 sites synthesised near the demo station.
+/// Four 404.025 MHz assignments shaped as the register answers them (2026-11-02), every row
+/// synthetic: licensees, licences and sites made up, the sites near the demo station.
 fn rows() -> Value {
     json!({
         "columns": ["FREQUENCY", "BANDWIDTH", "EMISSION", "DEVICE_TYPE", "TRANSMITTER_POWER",
@@ -59,14 +59,11 @@ fn rows() -> Value {
             [404025000, 25000, "16K0F2D  ", "T", 1, "W", "9000001/1", "Example Rail Site A",
                 -27.950, 153.250, "Example Rail Operator"],
             [404025000, 25000, "16K0F2D  ", "R", null, "W", "9000001/1",
-                "Example Rail Site B", -27.955, 153.255,
-                "Example Rail Operator"],
+                "Example Rail Site B", -27.955, 153.255, "Example Rail Operator"],
             [404025000, 25000, "16K0F1D  ", "T", 1, "W", "9000002/1",
-                "Synthesised tx site", -27.300, 153.100,
-                "Example Water Authority"],
+                "Example Site Hill Rd", -27.300, 153.100, "Example Water Authority"],
             [404025000, 25000, "16K0F1D  ", "R", null, "W", "9000002/1",
-                "Synthesised rx site", -27.250, 153.120,
-                "Example Water Authority"]
+                "Example Depot", -27.250, 153.120, "Example Water Authority"]
         ],
         "truncated": false, "rowCount": 4, "result_id": "r1", "_hints": []
     })
@@ -199,12 +196,9 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
     // The plan rows come first.
     assert_eq!(a[0].kind.as_deref(), Some("plan"));
     let first = asg[0];
-    assert_eq!(
-        first.licensee.as_deref(),
-        Some("Example Water Authority")
-    );
+    assert_eq!(first.licensee.as_deref(), Some("Example Water Authority"));
     assert_eq!(first.role.as_deref(), Some("tx")); // 1 W, nearest tx
-    assert_eq!(first.site.as_deref(), Some("Synthesised tx site"));
+    assert_eq!(first.site.as_deref(), Some("Example Site Hill Rd"));
     assert_eq!(first.emission.as_deref(), Some("16K0F1D"));
     assert_eq!(
         first.emission_decoded.as_ref().unwrap().bandwidth_hz,
@@ -227,10 +221,7 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
     assert!((270.0..360.0).contains(&b), "{b}"); // a little west of north
     assert_eq!(
         first.note.as_deref(),
-        Some(
-            "Example Water Authority, Synthesised tx site, 10 km, 1 W, \
-             16 kHz FM data"
-        )
+        Some("Example Water Authority, Example Site Hill Rd, 10 km, 1 W, 16 kHz FM data")
     );
     assert_eq!(asg[1].role.as_deref(), Some("rx"));
     assert_eq!(asg[1].power_w, None);

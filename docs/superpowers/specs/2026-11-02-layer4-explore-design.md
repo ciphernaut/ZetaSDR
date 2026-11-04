@@ -17,7 +17,7 @@ additions" items 1-3. The plan series row for plan 19 is replaced by three rows,
 On 2026-10-29 a 16 kHz bursty FSK link at 404.025 MHz cost two hours of hand analysis that flip-flopped
 between PSK and FSK. ZetaSDR's own layer 1 called it `noise` with a 47 Hz "bandwidth": `measure` averages
 a 1 % duty burst over a one-second window into nothing. One query against the local ACMA mirror named it
-in seconds: a licensed point-to-point telemetry link, Example Suburb to Example Suburb, 1 W, 25 kHz channel. The
+in seconds: a licensed point-to-point telemetry link between two nearby sites, 1 W, 25 kHz channel. The
 watch job identified it `unknown` three times, correctly, and had nothing more to say; the IQ ring had
 moved on before anyone could look at the bursts themselves.
 
@@ -129,7 +129,7 @@ boxes one:
    that does not. The allocations ride along in the result whatever happens next.
 3. **Features, and the evidence kept.** With no proof, the answer is `unknown` with the layer-1 features
    and the allocations: "unknown at 404.025 MHz: burst fsk, 16 kHz, 4800 Bd, 1 % duty every 1.0 s;
-   licensed: Example Water Authority, Example Suburb, 1 W, 25 kHz". With the explore
+   licensed: <licensee>, <site>, 1 W, 25 kHz". With the explore
    policy on, the watch captures a few bursts to disk and says so.
 4. **Bits.** From a capture, `bits_start` builds the chain the features suggest and the bit stream and
    its hypotheses appear on the Bits tab and in `job_context`.
@@ -620,7 +620,7 @@ the operator's.
 
 1. `station set` with the field host's antenna's position; `--knowledge-acma
    http://acma-host:3110` on the node with the fork up. `knowledge lookup` at
-   404.025 MHz names the 403-406 MHz plan services and the Example Suburb and Example Suburb assignments with
+   404.025 MHz names the 403-406 MHz plan services and the link's tx and rx assignments with
    distance, power and `16K0F1D` decoded.
 2. A watch on 400-406 MHz with `on_unknown: capture` on the B210: the 404.025 MHz link is reported
    `unknown` with burst features (duty about 1 %, period about 1 s, `fsk`, a symbol rate) and the

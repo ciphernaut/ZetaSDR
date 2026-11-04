@@ -667,12 +667,12 @@ mod tests {
 
     #[test]
     fn distance_and_bearing() {
-        // The demo station (Brisbane Airport) to a synthetic site: about 70.5 km,
-        // a little west of north.
-        let d = haversine_km(-27.3842, 153.1175, -27.950, 153.250);
-        assert!((d - 70.53).abs() < 0.05, "{d}");
-        let b = bearing_deg(-27.3842, 153.1175, -27.950, 153.250);
-        assert!((340.0..355.0).contains(&b), "{b}");
+        // The demo station (Brisbane Airport) to a synthetic site: about 9.5 km, a little
+        // west of north.
+        let d = haversine_km(-27.3842, 153.1175, -27.300, 153.100);
+        assert!((d - 9.52).abs() < 0.05, "{d}");
+        let b = bearing_deg(-27.3842, 153.1175, -27.300, 153.100);
+        assert!((345.0..355.0).contains(&b), "{b}");
         assert!((bearing_deg(0.0, 0.0, 1.0, 0.0) - 0.0).abs() < 1e-9);
         assert!((bearing_deg(0.0, 0.0, 0.0, 1.0) - 90.0).abs() < 1e-9);
     }
