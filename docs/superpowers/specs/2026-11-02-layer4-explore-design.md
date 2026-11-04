@@ -208,7 +208,7 @@ the node's): MCP over streamable HTTP at `URL/mcp` (`initialize`, `notifications
   `TRANSMITTER_POWER_UNIT`, `SITE_ID`, `LICENCE_NO`), `site` (`NAME`, `LATITUDE`, `LONGITUDE`),
   `licence` (`CLIENT_NO`) and `client` (`LICENCEE`). One fixed query per lookup: the devices whose
   `FREQUENCY ± BANDWIDTH / 2` overlaps the band, joined to site, licence and client, with a bounding
-  box around the station for the reach; it answered the four 404.025 MHz assignments (Example Rail Operator
+  box around the station for the reach; it answered the four 404.025 MHz assignments (a rail operator
   and the water utility, each a `T` and an `R` site, `16K0F2D` and `16K0F1D`) in under 100 ms.
 - `get_frequency_allocation {freq_hz, include_footnotes: false}`: the Australian Spectrum Plan's
   services at the centre (403-406 MHz: FIXED and MOBILE primary, METEOROLOGICAL AIDS and RADIOLOCATION
