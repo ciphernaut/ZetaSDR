@@ -2,7 +2,7 @@
 
 ## UI: themes as folders (plan 26)
 
-Built 2026-11-03 (branch `worktree-themes-spec`, not yet merged): spec `docs/superpowers/specs/2026-11-03-themes-design.md`, plan `docs/superpowers/plans/2026-11-03-themes.md`. Themes are folders (`theme.json` + `style.css`) under repo-root `themes/` (console, plain, cyberpunk, terminal, psytrance, vibecoder), the operator's own in `--themes-dir`, listed by `themes_list` / `zeta themes list`, served at `/ui/themes/<id>/`; the author's guide is `docs/themes.md`, the UAT section is "Plan 26: themes". Mobile and other per-device layouts are later (see the footprints entry below).
+Merged to `main` 576002a and deployed on the field host 2026-11-04: spec `docs/superpowers/specs/2026-11-03-themes-design.md`, plan `docs/superpowers/plans/2026-11-03-themes.md`. Themes are folders (`theme.json` + `style.css`) under repo-root `themes/` (console, plain, cyberpunk, terminal, psytrance, vibecoder), the operator's own in `--themes-dir`, listed by `themes_list` / `zeta themes list`, served at `/ui/themes/<id>/`; the author's guide is `docs/themes.md`, the UAT section is "Plan 26: themes". Mobile and other per-device layouts are later (see the footprints entry below).
 
 ## UI: per-footprint layout in theme.json (`footprints`)
 
@@ -35,6 +35,12 @@ A `graph_put` that loses a race with another put on the same job returns an erro
 ## Audio: the default `deviation_hz` on a 12.5 kHz channel
 
 The voice low-pass and de-emphasis shipped 2026-11-01 (`fm_demod` carries `audio_lowpass_hz` 3400 and `deemphasis_us` 530; the voice demodulators take `denoise: true`). Left, from the operator listening to a fitted ch9 demod on the B210: on a 12.5 kHz channel the default `deviation_hz` 5000 halves the audio level of a 2.5 kHz-deviation CB signal; the fit (or the channel plan) could set 2500 there.
+
+## Speech: a Whisper server over the network
+
+Asked 2026-11-04. Today speech is local to the node or goes through another ZetaSDR node: `--stt-socket` speaks the local-voice protocol, whose `file:<absolute wav path>` hands the daemon a path, so the daemon must share the node's filesystem (same host); `--stt-node URL` forwards to another node's `POST /stt`, so the GPU host must run zeta. Wanted: a third `SpeechBackend` in `zeta-speech` that POSTs the utterance's WAV bytes to a speech server on another host, e.g. `--stt-url URL` for an OpenAI-compatible `/v1/audio/transcriptions` (faster-whisper-server, speaches, vLLM) or whisper.cpp's `server` (`/inference`, multipart), with a bearer from `ZETA_STT_URL_KEY` (stripped from the worker and plugin environments like the other secrets) and `GET /stt/languages` answered from a flag or the server's model list. Keep the backend's 4 slots, the 30 s busy drop and the 4 MiB cap; exclusive with `--stt-socket` and `--stt-node`, as those two are with each other.
+
+Caveat, network use: an utterance is 16 kHz mono 16-bit PCM, 32 kB per second of speech (256 kbit/s while it uploads), up to `max_utterance_s` 15, so at most about 480 kB per call, sent as one burst after the utterance ends, not streamed. One channel is nothing on a LAN; a `plan_start` with `attach: transcribe` on all 80 UHF CB channels can have every slot uploading at once in a busy minute, and on a slow uplink (a Pi at the antenna on WiFi or 4G) the upload time adds to `queued_ms` and counts against the 30 s busy window, so drops (`reason: busy`) rise before the GPU is the limit. Say so in the docs and the startup line; measure on the field-host-to-desktop LAN and over WiFi; consider FLAC or 8 kHz for narrowband voice (CB audio is 3.4 kHz wide) to cut it by half or more, only if a Whisper server accepts it without a quality loss. The audio of third-party transmissions leaves the host: the operator's choice, said once in the guide. The mudmap's speech boxes gain the REMOTE row.
 
 ## Feature: stereo for `wfm_demod`
 
