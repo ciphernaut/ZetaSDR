@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use ZetaSDR, please cite it as below."
+title: "ZetaSDR"
+version: 0.1.0
+abstract: "ZetaSDR is an agentic SDR runtime that offers what is there, what is it and decode it as a small set of typed operations for people and LLM agents."
+authors:
+  - family-names: Grigull
+    given-names: Sage
+license: Apache-2.0
+repository-code: "https://github.com/ciphernaut/ZetaSDR"
+type: software

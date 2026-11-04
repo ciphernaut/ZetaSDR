@@ -30,6 +30,10 @@ attach one.
   piece may run (the figure on the front page).
 - [architecture/index.html](architecture/index.html): every crate, what it holds and how they
   depend on each other.
+- [ROADMAP.md](../ROADMAP.md): where the project is going, and the tracks that need funding.
+- [GOVERNANCE.md](../GOVERNANCE.md): who maintains it and how decisions are made.
+- [licensing.md](licensing.md): the project's licence, what is bundled and how GPL decoders are
+  kept apart.
 - [TODO.md](../TODO.md): open work and ideas not yet scheduled.
 - [CHANGELOG.md](../CHANGELOG.md): what each release contains.
 

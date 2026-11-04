@@ -203,13 +203,13 @@ pub trait Classifier: Send + Sync {
     }
 }
 
-/// The layer-3 slot, proving a SIGINT classifier can plug in; labels nothing.
+/// The layer-3 slot, proving a layer-3 classifier can plug in; labels nothing.
 pub struct StubClassifier;
 
 #[async_trait]
 impl Classifier for StubClassifier {
     fn name(&self) -> &str {
-        "sigint-slot"
+        "layer3-slot"
     }
     fn layer(&self) -> u8 {
         3

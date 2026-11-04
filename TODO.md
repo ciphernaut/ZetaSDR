@@ -287,9 +287,9 @@ Plan 19.1 changed the detector (occupancy over the row median, a run-energy floo
 
 Done: plan 21 (`docs/superpowers/plans/2026-11-01-agent-bulk-ops.md`), plus `jobs_stop` for "stop all jobs".
 
-## Agent guide: SIGINT and UX additions
+## Agent guide: layer-3 and UX additions
 
-Items 1-3 of the first list shipped in plan 19.1 (the register and `as_of`, the low-duty rule, the unknown-signal playbook with its legal line: "Exploring an unknown signal"). Still open: (5, from the operator, 2026-11-01) expand this guidance as each mode and SIGINT component lands, including when not to touch running jobs; (4) lead the operator with the map and the one-line `summary`, name channels and licensees in plain words, and offer the next investigative step (measure, identify, knowledge lookup, direction-find). Plan 19.2 and 19.3 extend the playbook with bits, frames and signature write-back.
+Items 1-3 of the first list shipped in plan 19.1 (the register and `as_of`, the low-duty rule, the unknown-signal playbook with its legal line: "Exploring an unknown signal"). Still open: (5, from the operator, 2026-11-01) expand this guidance as each mode and layer-3 component lands, including when not to touch running jobs; (4) lead the operator with the map and the one-line `summary`, name channels and licensees in plain words, and offer the next investigative step (measure, identify, knowledge lookup, direction-find). Plan 19.2 and 19.3 extend the playbook with bits, frames and signature write-back.
 
 ## Feature: VDL Mode 2 and HFDL rows (the other aircraft data links)
 

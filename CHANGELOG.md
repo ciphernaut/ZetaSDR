@@ -25,3 +25,5 @@ The first public release.
   subjects table for positioned events, captures and bits panes, and themes.
 - Plugins as external stage processes speaking a small wire protocol, with a Python SDK.
 - Uploads to SondeHub only with a callsign; a Raspberry Pi deployment example.
+- The layer-3 stub classifier is named `layer3-slot` (it was `sigint-slot`) in `classify` results.
+- ROADMAP, GOVERNANCE, a licensing note and a CITATION file.

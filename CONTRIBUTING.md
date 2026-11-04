@@ -1,6 +1,6 @@
 # Contributing to ZetaSDR
 
-At this stage ZetaSDR takes feedback and gists, not pull requests.
+At this stage ZetaSDR takes feedback and gists, not pull requests. Pull requests will open at 0.2.0.
 
 The project is young and still changing shape, so the most useful thing you can send is an account
 of what you tried and what happened, or an idea with the reason behind it. Code is welcome too, as

@@ -6,11 +6,12 @@ keeps a live picture of the spectrum and offers "what is there, what is it, deco
 set of typed operations (36 of them). The same operations are reached from the `zeta` CLI, an
 authenticated HTTP and websocket API, a web page the node serves (waterfall, jobs, map,
 transcripts), an MCP server, and an agent that lets a local LLM call them. Every job is a graph of
-stages: channelisers, NBFM/WFM/AM/SSB demodulators, decoders (APRS, POCSAG, RDS, ACARS, ADS-B,
-radiosondes), measurement and classification, a band watch that identifies what appears, burst
-capture, transcription and a mix of every talking channel. It is for an operator who wants the
-radio to do the fiddly work, and for an agent that needs operations it can call rather than a GUI
-to click.
+stages: channelisers, NBFM/WFM/AM/SSB demodulators, decoders (APRS on 2 m, radiosondes, ADS-B,
+then RDS, ACARS and POCSAG pagers), measurement and classification, a band watch that identifies what appears, burst
+capture, transcription and a mix of every talking channel. It is for the radio amateur who wants
+the radio to do the fiddly work (hear what is on 2 m and 70 cm, track a radiosonde, see the
+aircraft overhead), and for an agent that needs operations it can call rather than a GUI to
+click. UHF CB and pager channels use the same machinery.
 
 ![What plugs into a node, and where each piece may run](docs/architecture/mudmap.svg)
 
@@ -138,7 +139,7 @@ endpoint (`--llm-url`, `--llm-model`), and `zeta-mcp` offers every operation as 
 
 ## Legal
 
-The node has decoders for public protocols: APRS, ADS-B, ACARS, RDS, radiosondes and POCSAG.
+The node has decoders for public protocols: APRS, radiosondes, ADS-B, ACARS, RDS and POCSAG.
 Having a decoder is not permission to use it. Whether you may receive and decode a given
 transmission where you are, pager traffic in particular, depends on your local law and is your
 responsibility; nothing here is legal advice. For an unknown third-party signal the agent's
@@ -149,10 +150,12 @@ while the browser is online), and radiosonde telemetry goes to SondeHub only wit
 give.
 
 ZetaSDR is licensed under the Apache License 2.0 ([LICENSE](LICENSE)). It bundles a signal
-catalogue, a map library and fonts under their own licences, listed in [NOTICE](NOTICE).
+catalogue, a map library and fonts under their own licences, listed in [NOTICE](NOTICE);
+[docs/licensing.md](docs/licensing.md) says why Apache-2.0 and how GPL decoders are kept apart.
 
 ## Feedback and contributions
 
 At this stage ZetaSDR takes feedback and ideas as issues, and code as gists rather than pull
-requests. [CONTRIBUTING.md](CONTRIBUTING.md) says how, and what makes a report useful. Security
-problems go to [SECURITY.md](SECURITY.md).
+requests (pull requests open at 0.2.0). [CONTRIBUTING.md](CONTRIBUTING.md) says how, and what
+makes a report useful. [ROADMAP.md](ROADMAP.md) says where the project is going and
+[GOVERNANCE.md](GOVERNANCE.md) who decides. Security problems go to [SECURITY.md](SECURITY.md).
