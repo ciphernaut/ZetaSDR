@@ -197,7 +197,7 @@ panel(R0, R1, "B. An external coding agent: the agent runs the loop", "four door
 # A
 box(40, 110, 640, 54, "Operator", "types a request in the page's agent pane, or runs zeta ask \"REQUEST\" (stdin works: a voice transcript piped in).")
 box(40, 196, 350, 150, "zeta-agent: the tool loop",
-    "Runs inside zeta serve for POST /ask, inside the zeta process for zeta ask. Builds the tool list and guide from the schema and AGENTS.md, sends them with the transcript, executes each call it gets back, appends the result, repeats up to max_turns (1-32, default 8). Results trimmed for a small model (job_list without graphs, the newest 20 captures).", "EITHER", size=10.2)
+    "Runs inside zeta serve for POST /ask, inside the zeta process for zeta ask. Builds the tool list and guide from the schema and AGENTS.md, sends them with the transcript, executes each call it gets back, appends the result, repeats up to max_turns (1-32, default 8). Results trimmed for a small model. Asked from the page (page_tools) it also offers view_set, answered by the loop and applied by the page, never the node.", "EITHER", size=10.2)
 box(480, 196, 200, 150, "LLM server",
     "Any OpenAI-compatible server (llama.cpp, vLLM, a gateway). Sees text only: never the node, the secret or the radios. Answers one tool call per turn, or the final prose.", "EITHER", size=10.2)
 line([(390, 236), (480, 236)]); text(435, 229, "tools, transcript", size=9.5, anchor="middle")
@@ -253,7 +253,7 @@ AGENT_TABLE = [
     ("What can refuse a stop or replace", "the allowance gate in code: <code>not_allowed</code> unless the run allows it", "through <code>/op</code>, nothing in the node: the guide's rules and the operator's approval of tool calls; through <code>/ask</code>, the gate"),
     ("Budget", "<code>max_turns</code> 1-32 (default 8), one call per turn; bulk ops (<code>plan_start</code>, <code>jobs_stop</code>) exist for it", "the agent's own; it can make hundreds of calls"),
     ("ops log <code>transport</code>", "<code>agent</code> (<code>/ask</code>); <code>local</code> or <code>http</code> (<code>zeta ask</code>)", "<code>http</code>, the same as any script (<code>ui</code> if it sends <code>X-Zeta-Client: ui</code>; <code>local</code> for a one-shot CLI; <code>agent</code> via <code>/ask</code>)"),
-    ("Beyond the node", "nothing: only the operations", "code, builds, deploys, logs, other hosts"),
+    ("Beyond the node", "only the operations, plus the asking tab's view settings (<code>view_set</code>, from the page only)", "code, builds, deploys, logs, other hosts"),
 ]
 agent_rows = "\n".join(f"<tr><td>{a}</td><td>{b}</td><td>{c}</td></tr>" for a, b, c in AGENT_TABLE)
 

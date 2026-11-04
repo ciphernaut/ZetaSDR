@@ -309,7 +309,9 @@ ul { max-width: 1000px; }
 <tspan x="49" dy="12.7">and AGENTS.md, sends them with the transcript, executes each</tspan>
 <tspan x="49" dy="12.7">call it gets back, appends the result, repeats up to</tspan>
 <tspan x="49" dy="12.7">max_turns (1-32, default 8). Results trimmed for a small</tspan>
-<tspan x="49" dy="12.7">model (job_list without graphs, the newest 20 captures).</tspan>
+<tspan x="49" dy="12.7">model. Asked from the page (page_tools) it also offers</tspan>
+<tspan x="49" dy="12.7">view_set, answered by the loop and applied by the page, never</tspan>
+<tspan x="49" dy="12.7">the node.</tspan>
 </text>
 <rect x="480" y="196" width="200" height="150" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
 <text x="489" y="214" font-size="12.5" font-weight="700">LLM server</text>
@@ -442,7 +444,7 @@ ul { max-width: 1000px; }
 <tr><td>What can refuse a stop or replace</td><td>the allowance gate in code: <code>not_allowed</code> unless the run allows it</td><td>through <code>/op</code>, nothing in the node: the guide's rules and the operator's approval of tool calls; through <code>/ask</code>, the gate</td></tr>
 <tr><td>Budget</td><td><code>max_turns</code> 1-32 (default 8), one call per turn; bulk ops (<code>plan_start</code>, <code>jobs_stop</code>) exist for it</td><td>the agent's own; it can make hundreds of calls</td></tr>
 <tr><td>ops log <code>transport</code></td><td><code>agent</code> (<code>/ask</code>); <code>local</code> or <code>http</code> (<code>zeta ask</code>)</td><td><code>http</code>, the same as any script (<code>ui</code> if it sends <code>X-Zeta-Client: ui</code>; <code>local</code> for a one-shot CLI; <code>agent</code> via <code>/ask</code>)</td></tr>
-<tr><td>Beyond the node</td><td>nothing: only the operations</td><td>code, builds, deploys, logs, other hosts</td></tr>
+<tr><td>Beyond the node</td><td>only the operations, plus the asking tab's view settings (<code>view_set</code>, from the page only)</td><td>code, builds, deploys, logs, other hosts</td></tr>
 </tbody>
 </table></div>
 

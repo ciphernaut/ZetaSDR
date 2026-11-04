@@ -27,7 +27,9 @@
 <tspan x="49" dy="12.7">and AGENTS.md, sends them with the transcript, executes each</tspan>
 <tspan x="49" dy="12.7">call it gets back, appends the result, repeats up to</tspan>
 <tspan x="49" dy="12.7">max_turns (1-32, default 8). Results trimmed for a small</tspan>
-<tspan x="49" dy="12.7">model (job_list without graphs, the newest 20 captures).</tspan>
+<tspan x="49" dy="12.7">model. Asked from the page (page_tools) it also offers</tspan>
+<tspan x="49" dy="12.7">view_set, answered by the loop and applied by the page, never</tspan>
+<tspan x="49" dy="12.7">the node.</tspan>
 </text>
 <rect x="480" y="196" width="200" height="150" rx="7" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.2"/>
 <text x="489" y="214" font-size="12.5" font-weight="700">LLM server</text>

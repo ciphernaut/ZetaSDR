@@ -9,7 +9,7 @@ from __future__ import annotations
 import html, pathlib
 
 HERE = pathlib.Path(__file__).parent
-AS_OF = "2026-11-04, main 2544d9a, v0.1.0; plans 19.2 and 26 merged, plan26-zeta deployed"
+AS_OF = "2026-11-04, main a58389d, v0.1.0; plans 19.2 and 26 merged"
 SHIPPED = "shipped (plans 1-24 and 26 merged; 19.3 and 25 not)"
 PLANNED = "planned (plan 19.3, the rtl_433 row, the rest of the UI wave, TODO gists)"
 AMBER = "#b7791f"
@@ -140,7 +140,7 @@ clients = [
  dict(title="Web UI", note=(10, 18, 20), body="crate zeta-ui: plain JS embedded in the binary, served at /ui/. Waterfall (fine capture + coarse scan layer, blank under a mask), ribbons, job list, graph view, map (vendored Leaflet), channel-plan axis, Ctrl-K command line, microphone to /stt. A boxed demod is fitted to the measured signal first; outlines drag to retune (job_retune) and have a menu (Fit, widths, Stop); job tags link to the rows. Its own spectrum job is elastic. Listen to all plays a mix; a speaking channel lights up. A pane strip under the waterfall holds Subjects (one row per aircraft, sonde or station; the map tracks each), Explore (burst captures: What is this, Download, Work the bits) and Bits (hex rows, sync hits, hypotheses with Try, the eye, the clock). Themes are folders (console default, plain, cyberpunk, terminal, psytrance, vibecoder, the operator's own) served at /ui/themes/<id>/."),
  dict(title="MCP server", body="crate zeta-mcp: zeta-mcp --node URL. One MCP tool per operation, generated from the schema; tool text from AGENTS.md."),
  dict(title="Python SDK and scripts", body="sdk/python zeta_plugin (plugin protocol), examples/python (cb_watch.py: elastic spectrum, demod + transcribe on active CB channels; gain.py; stt_daemon_stub.py; separate_stub.py), skills/zetasdr (the agent skill), deploy/pi (systemd unit, Pi build)."),
- dict(title="Agent", note=16, body="crate zeta-agent: zeta ask \"REQUEST\" and POST /ask. OpenAI-compatible tool-calling loop over the operation set; refuses stops and replace unless the run allows them; tools and guide generated from AGENTS.md; its calls appear on the ops stream as transport agent."),
+ dict(title="Agent", note=16, body="crate zeta-agent: zeta ask \"REQUEST\" and POST /ask. OpenAI-compatible tool-calling loop over the operation set; refuses stops and replace unless the run allows them; tools and guide generated from AGENTS.md; its calls appear on the ops stream as transport agent. Asked from the page (page_tools), it also has view_set for that tab's view settings, applied by the page, never by the node."),
 ]
 client_labels = ["in-process or HTTP", "HTTP + ws", "HTTP", "HTTP", "HTTP, or in-process via /ask"]
 llm = dict(title="LLM server", body="OpenAI-compatible chat API (e.g. llama.cpp or vLLM serving Gemma on field-host:8080). The agent sends the tool list and the transcript; thinking off, token budget, prose-answer detection.")
