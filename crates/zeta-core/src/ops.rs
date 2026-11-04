@@ -421,8 +421,10 @@ pub enum Op {
     /// is `unknown`. The record's kind is `bits`, its source `node`, its band the
     /// capture's, `job_context.bits` the plan (`captures`, `modulation`,
     /// `symbol_rate_baud`, `order`, `tone_spacing_hz`, `rate_hz`, `center_hz` the centre the
-    /// chain runs on and `shift_hz` its offset from the capture's, `bandwidth_hz`, and
-    /// `channel_rate_hz`, `null` when the chain does not shift); the slicer's `bits` events are on
+    /// chain runs on and `shift_hz` its offset from the capture's, `bandwidth_hz`,
+    /// `padded_bandwidth_hz` the channel band uncut and `clamped` whether it was cut to the
+    /// capture, and `channel_rate_hz`, `null` (and `padded_bandwidth_hz` `null`) when the
+    /// chain does not shift); the slicer's `bits` events are on
     /// `job_context.slicer.stream` and `bit_view`'s latest hypotheses in
     /// `job_context.bit_view`. Change a running chain with `graph_get`, edit,
     /// `graph_put`. The result is the job's id, as `job_start` answers; one-shot

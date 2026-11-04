@@ -46,6 +46,34 @@ pub struct FeatureRecord {
     #[serde(default)]
     #[schemars(required)]
     pub tone_spacing_hz: Option<Hz>,
+    /// Where layer 1 read `symbol_rate_baud`; `null` without a rate (or in a record
+    /// written before it was kept).
+    #[serde(default)]
+    #[schemars(required)]
+    pub symbol_rate_line: Option<RateLine>,
+}
+
+/// Where layer 1 read a symbol rate: `runs`, on-off keying's chip from its on and off
+/// run lengths (the label then `ook`); `cyclo`, a cyclostationary line of the squared
+/// envelope or of the envelope edges; `keying`, the line of the keying signal (the
+/// squared envelope, or under FM the demodulated audio's tone changes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLine {
+    Runs,
+    Cyclo,
+    Keying,
+}
+
+impl RateLine {
+    /// Its name as serialised.
+    pub fn name(self) -> &'static str {
+        match self {
+            RateLine::Runs => "runs",
+            RateLine::Cyclo => "cyclo",
+            RateLine::Keying => "keying",
+        }
+    }
 }
 
 /// One classifier verdict.
@@ -417,6 +445,7 @@ mod tests {
             period_ms: None,
             order: None,
             tone_spacing_hz: None,
+            symbol_rate_line: None,
         };
         let uses = Arc::new(Uses(Mutex::new(Vec::new()), Mutex::new(Vec::new())));
         let licence = Allocation {

@@ -4,6 +4,7 @@
 //! window's edges are not keying.
 
 use num_complex::Complex;
+use rustfft::FftPlanner;
 use zeta_core::types::Hz;
 
 use super::burst::{BURST_MIN_PERIOD_MS, averaged_half_spectrum, bandpass, burst_runs, hann};
@@ -112,13 +113,26 @@ pub(super) fn fsk_clusters(
     if bw < FSK_SEP_HZ.0 || rate_hz == 0 {
         return None;
     }
-    let bin = bw / FSK_HIST_BINS as f64;
-    let mut hist = vec![0.0f64; FSK_HIST_BINS];
-    let mut total = 0usize;
     let band: Vec<Vec<Complex<f32>>> = runs
         .iter()
         .map(|r| bandpass(r, rate_hz, offset_hz, bw))
         .collect();
+    fsk_clusters_in(&band, rate_hz, (offset_hz, bandwidth_hz))
+}
+
+/// [`fsk_clusters`] of `band`, runs already band-passed to `offset_hz ± bandwidth_hz / 2`.
+fn fsk_clusters_in(
+    band: &[Vec<Complex<f32>>],
+    rate_hz: u64,
+    (offset_hz, bandwidth_hz): (f64, u64),
+) -> Option<(u8, Hz)> {
+    let bw = bandwidth_hz as f64;
+    if bw < FSK_SEP_HZ.0 || rate_hz == 0 {
+        return None;
+    }
+    let bin = bw / FSK_HIST_BINS as f64;
+    let mut hist = vec![0.0f64; FSK_HIST_BINS];
+    let mut total = 0usize;
     let env: Vec<f32> = band.iter().flatten().map(|s| s.norm()).collect();
     let on = FSK_ON_FRACTION * super::percentile(&env, FSK_ON_PERCENTILE);
     // Each run's discriminator, its samples where the signal is off (either sample it
@@ -349,10 +363,14 @@ const OOK_UNIT_BAND_STEP: f64 = 0.5;
 /// short window, reaches far into the noise (a 71 ms window of a remote read 37 kHz
 /// for about 7), and the noise in it cuts every pulse.
 const OOK_UNIT_MIN_BAND_HZ: f64 = 2_000.0;
-/// OOK chip rate: on a narrowed band, the off runs must stand at least this many dB
-/// under the on runs in a band twice as wide (at most the occupied band). A band that
-/// holds one tone of an FSK signal keys on and off with its symbols, but the wider band
-/// holds the other tone in the off runs.
+/// ... and to at least this fraction of the occupied band (three halvings). The weak
+/// remote's 471 ms window fitted at an eighth of its 56 580 Hz measured band; narrower,
+/// a burst train's envelope fits on its own (a synthesised Mode S train measured 49 kHz
+/// wide fitted 2005 Bd at a sixteenth).
+const OOK_UNIT_MIN_BAND_FRACTION: f64 = 0.125;
+/// OOK chip rate: the off runs must stand at least this many dB under the on runs in a
+/// band twice as wide as the fit's. A band that holds one tone of an FSK signal keys on
+/// and off with its symbols, but the wider band holds the other tone in the off runs.
 const OOK_OFF_DB: f64 = 6.0;
 
 /// OOK chip rate: a chip rate over this many times the band it was measured in is not
@@ -378,73 +396,237 @@ impl KeyRun {
 }
 
 /// The off and on levels of the envelope `env`: a 2-medians seeded at the
-/// `OOK_LEVEL_SEED_PERCENTILES` and refined `OOK_LEVEL_ITERATIONS` times, each level the
-/// median of the samples on its side of their midpoint. `None` when the two meet.
+/// `OOK_LEVEL_SEED_PERCENTILES` and refined up to `OOK_LEVEL_ITERATIONS` times (until
+/// it stops moving), each level the median of the samples on its side of their
+/// midpoint. `None` when the two meet.
 fn envelope_levels(env: &[f32]) -> Option<(f32, f32)> {
     let (mut lo, mut hi) = (
         super::percentile(env, OOK_LEVEL_SEED_PERCENTILES.0),
         super::percentile(env, OOK_LEVEL_SEED_PERCENTILES.1),
     );
+    let (mut below, mut above) = (Vec::with_capacity(env.len()), Vec::with_capacity(env.len()));
     for _ in 0..OOK_LEVEL_ITERATIONS {
         let mid = 0.5 * (lo + hi);
-        let (below, above): (Vec<f32>, Vec<f32>) = env.iter().partition(|&&e| e < mid);
+        below.clear();
+        above.clear();
+        for &e in env {
+            if e < mid {
+                below.push(e)
+            } else {
+                above.push(e)
+            }
+        }
         if below.is_empty() || above.is_empty() {
             return None;
         }
-        (lo, hi) = (median(&below), median(&above));
+        let next = (upper_median(&mut below), upper_median(&mut above));
+        if next == (lo, hi) {
+            break;
+        }
+        (lo, hi) = next;
     }
     (hi > lo).then_some((lo, hi))
 }
 
-/// The chip rate of on-off keying in `runs` from its run lengths: none when the
-/// occupied band `offset_hz ± bandwidth_hz / 2` carries FSK tones ([`fsk_clusters`]; a
-/// narrower band may hold one tone, which keys on and off with the symbols), else
-/// [`ook_unit_rate_in`] over that band, else over it narrowed by `OOK_UNIT_BAND_STEP` at
-/// a time down to `OOK_UNIT_MIN_BAND_HZ`, the first that fits.
-/// The cyclostationary lines of pulse-width keying stand at its bit rate and harmonics
-/// (an EV1527 remote, a bit of four chips, read 1598 Bd for 3200), while its run lengths
-/// are whole chips.
+/// The upper median of `v` (as [`median`] reads it), reordering it: a selection, not a
+/// sort.
+fn upper_median(v: &mut [f32]) -> f32 {
+    let k = v.len() / 2;
+    *v.select_nth_unstable_by(k, f32::total_cmp).1
+}
+
+/// The runs' spectra, taken once, from which every band [`ook_unit_rate`] tries is cut
+/// at a decimated rate: one forward transform a run (each zero-padded to a whole number
+/// of `pad` samples), then for each band a small inverse transform of the bins inside
+/// it, moved to baseband, at the capture rate over a divisor of `pad`
+/// ([`Spectra::decim_for`]).
+struct Spectra {
+    bins: Vec<Vec<Complex<f32>>>,
+    /// Each run's length before padding.
+    lens: Vec<usize>,
+    rate_hz: u64,
+    /// The coarsest decimation: the largest divisor of the rate that keeps
+    /// `OOK_BAND_OVERSAMPLE` times the narrowest band tried.
+    pad: usize,
+}
+
+impl Spectra {
+    fn new(planner: &mut FftPlanner<f32>, runs: &[&[Complex<f32>]], rate_hz: u64) -> Self {
+        let least = (OOK_BAND_OVERSAMPLE * OOK_UNIT_MIN_BAND_HZ).ceil() as u64;
+        let pad = (rate_hz / zeta_core::ops::channel_rate_hz(rate_hz, least.min(rate_hz))).max(1)
+            as usize;
+        let bins = runs
+            .iter()
+            .map(|r| {
+                let mut buf = r.to_vec();
+                buf.resize(r.len().next_multiple_of(pad), Complex::new(0.0, 0.0));
+                if !buf.is_empty() {
+                    planner.plan_fft_forward(buf.len()).process(&mut buf);
+                }
+                buf
+            })
+            .collect();
+        Spectra {
+            bins,
+            lens: runs.iter().map(|r| r.len()).collect(),
+            rate_hz,
+            pad,
+        }
+    }
+
+    /// The decimation a band `bandwidth_hz` wide is cut at: the largest divisor of `pad`
+    /// keeping a rate of at least `OOK_BAND_OVERSAMPLE` times the band (twice the band,
+    /// [`off_under_on_db`]'s, then fits it twice over).
+    fn decim_for(&self, bandwidth_hz: f64) -> usize {
+        (1..=self.pad)
+            .rev()
+            .find(|&d| {
+                self.pad.is_multiple_of(d)
+                    && self.rate_hz as f64 / d as f64 >= OOK_BAND_OVERSAMPLE * bandwidth_hz
+            })
+            .unwrap_or(1)
+    }
+
+    /// The rate a band is cut at with `decim`.
+    fn out_rate_hz(&self, decim: usize) -> u64 {
+        self.rate_hz / decim as u64
+    }
+
+    /// Each run's band `offset_hz ± bandwidth_hz / 2`, moved to baseband at
+    /// [`Self::out_rate_hz`] of `decim` (a divisor of `pad`): `len / decim` samples,
+    /// sample `j` the band-limited run at sample `j · decim` (the band at most that rate
+    /// wide).
+    fn band(
+        &self,
+        planner: &mut FftPlanner<f32>,
+        offset_hz: f64,
+        bandwidth_hz: f64,
+        decim: usize,
+    ) -> Vec<Vec<Complex<f32>>> {
+        self.bins
+            .iter()
+            .zip(&self.lens)
+            .map(|(x, &len)| {
+                let n = x.len();
+                let m = n / decim;
+                if m == 0 {
+                    return Vec::new();
+                }
+                let bin_hz = self.rate_hz as f64 / n as f64;
+                let centre = (offset_hz / bin_hz).round() as i64;
+                let half = (bandwidth_hz / 2.0 / bin_hz).floor() as i64;
+                let mut y = vec![Complex::new(0.0f32, 0.0); m];
+                // Only the bins inside the band: signed bin `centre - half ..= centre + half`.
+                for signed in (centre - half)..=(centre + half) {
+                    if (signed as f64 * bin_hz - offset_hz).abs() > bandwidth_hz / 2.0 {
+                        continue;
+                    }
+                    let k = signed.rem_euclid(n as i64) as usize;
+                    y[(signed - centre).rem_euclid(m as i64) as usize] += x[k];
+                }
+                planner.plan_fft_inverse(m).process(&mut y);
+                let scale = 1.0 / n as f32;
+                y.truncate(len / decim);
+                y.iter_mut().for_each(|v| *v *= scale);
+                y
+            })
+            .collect()
+    }
+}
+
+/// OOK chip rate: each band is cut at a rate of at least this many times its width (the
+/// capture rate over a whole divisor), so a 1 s window at 2.4 Msps is worked at tens of
+/// kHz, twice the band still fits for the off-run checks, and a chip in the narrowest
+/// band spans several samples.
+const OOK_BAND_OVERSAMPLE: f64 = 4.0;
+
+/// What [`ook_unit_rate`] fitted, with what the label's veto reads of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct OokFit {
+    pub baud: zeta_core::types::Baud,
+    /// The band the fit was made in, Hz.
+    pub bandwidth_hz: f64,
+    /// How many dB the fitted off runs (those of at most `OOK_UNIT_MAX_MULTIPLE` units)
+    /// stand over the noise floor in twice that band ([`off_over_noise_db`]); `None`
+    /// when it cannot be measured.
+    pub off_over_noise_db: Option<f64>,
+    /// Whether twice that band carries FSK tones ([`fsk_clusters_in`]): a narrow band
+    /// holding one tone of an FSK signal keys with its symbols.
+    pub wide_tones: bool,
+}
+
+/// The chip rate of on-off keying in `runs` from its run lengths: each band cut from
+/// one transform of the runs at a decimated rate ([`Spectra`]); [`ook_unit_rate_in`] over
+/// the occupied band `offset_hz ± bandwidth_hz / 2`, else over it narrowed by
+/// `OOK_UNIT_BAND_STEP` at a time down to `OOK_UNIT_MIN_BAND_HZ` and
+/// `OOK_UNIT_MIN_BAND_FRACTION` of it, the first that fits,
+/// and none when the occupied band carries FSK tones ([`fsk_clusters_in`], taken once,
+/// when a band fits; a narrower band may hold one tone, which keys on and off with the
+/// symbols). The cyclostationary lines of pulse-width keying stand at its bit rate and
+/// harmonics (an EV1527 remote, a bit of four chips, read 1598 Bd for 3200), while its
+/// run lengths are whole chips.
 pub(super) fn ook_unit_rate(
     runs: &[&[Complex<f32>]],
     rate_hz: u64,
     (offset_hz, bandwidth_hz): (f64, u64),
-) -> Option<zeta_core::types::Baud> {
+) -> Option<OokFit> {
     let occupied = bandwidth_hz as f64;
-    if fsk_clusters(runs, rate_hz, (offset_hz, bandwidth_hz)).is_some() {
+    if rate_hz == 0 || occupied <= 0.0 {
         return None;
     }
-    std::iter::successors(Some(occupied), |&b| {
-        Some(b * OOK_UNIT_BAND_STEP).filter(|&n| n >= OOK_UNIT_MIN_BAND_HZ)
-    })
-    .find_map(|bw| ook_unit_rate_in(runs, rate_hz, offset_hz, (bw, occupied)))
+    let mut planner = FftPlanner::<f32>::new();
+    let spectra = Spectra::new(&mut planner, runs, rate_hz);
+    let narrowest = OOK_UNIT_MIN_BAND_HZ.max(occupied * OOK_UNIT_MIN_BAND_FRACTION);
+    let bands = std::iter::successors(Some(occupied), |&b| {
+        Some(b * OOK_UNIT_BAND_STEP).filter(|&n| n >= narrowest)
+    });
+    for (i, bw) in bands.enumerate() {
+        let (fit, tones) = ook_unit_rate_in(&spectra, &mut planner, offset_hz, bw);
+        if let Some(f) = fit {
+            // The occupied band's tones: the fitted band's own when it is that band.
+            let occupied_tones = if i == 0 {
+                tones
+            } else {
+                let d = spectra.decim_for(occupied);
+                let band = spectra.band(&mut planner, offset_hz, occupied, d);
+                fsk_clusters_in(&band, spectra.out_rate_hz(d), (0.0, bandwidth_hz)).is_some()
+            };
+            return (!occupied_tones).then_some(f);
+        }
+    }
+    None
 }
 
-/// [`ook_unit_rate`] in one band: each run band-passed to `offset_hz ± bandwidth_hz / 2`,
-/// and when its envelope sits at two levels with the lower off ([`two_levels`]) and it
-/// carries no FSK tones ([`fsk_clusters`]: a dense train of FSK packets is two envelope
-/// levels too), cut into on and off runs at the `OOK_EDGE_ON` / `OOK_EDGE_OFF` fractions
-/// between its two levels ([`envelope_levels`]; the first and last run of each slice,
-/// cut by the window, dropped), and the unit found by [`chip_unit`]. A band narrower
-/// than `occupied_hz` also needs the off runs `OOK_OFF_DB` under the on runs in twice its
-/// width ([`off_is_off`]), and a rate of at most `OOK_UNIT_MAX_RATE_PER_HZ` times the band.
+/// [`ook_unit_rate`] in one band: each run's band `offset_hz ± bandwidth_hz / 2` (from
+/// `spectra`, at baseband), and when its envelope sits at two levels with the lower off
+/// ([`two_levels`]) and it carries no FSK tones ([`fsk_clusters_in`]: a dense train of
+/// FSK packets is two envelope levels too), cut into on and off runs at the `OOK_EDGE_ON`
+/// / `OOK_EDGE_OFF` fractions between its two levels ([`envelope_levels`]; the first and
+/// last run of each slice, cut by the window, dropped), and the unit found by
+/// [`chip_unit`]. The fit also needs the off runs `OOK_OFF_DB` under the on runs in
+/// twice the band ([`off_under_on_db`]), and a rate of at most
+/// `OOK_UNIT_MAX_RATE_PER_HZ` times the band. With the fit, whether the band carries
+/// FSK tones (taken only of a two-level band).
 fn ook_unit_rate_in(
-    runs: &[&[Complex<f32>]],
-    rate_hz: u64,
+    spectra: &Spectra,
+    planner: &mut FftPlanner<f32>,
     offset_hz: f64,
-    (bandwidth_hz, occupied_hz): (f64, f64),
-) -> Option<zeta_core::types::Baud> {
-    let band: Vec<Vec<Complex<f32>>> = runs
-        .iter()
-        .map(|r| bandpass(r, rate_hz, offset_hz, bandwidth_hz))
-        .collect();
+    bandwidth_hz: f64,
+) -> (Option<OokFit>, bool) {
+    let decim = spectra.decim_for(bandwidth_hz);
+    let rate_hz = spectra.out_rate_hz(decim);
+    let band = spectra.band(planner, offset_hz, bandwidth_hz, decim);
     let slices: Vec<&[Complex<f32>]> = band.iter().map(|b| b.as_slice()).collect();
-    if !two_levels(&slices)
-        || fsk_clusters(runs, rate_hz, (offset_hz, bandwidth_hz.round() as u64)).is_some()
-    {
-        return None;
+    if !two_levels(&slices) {
+        return (None, false);
+    }
+    if fsk_clusters_in(&band, rate_hz, (0.0, bandwidth_hz.round() as u64)).is_some() {
+        return (None, true);
     }
     let env: Vec<f32> = band.iter().flatten().map(|s| s.norm()).collect();
-    let (lo, hi) = envelope_levels(&env)?;
+    let Some((lo, hi)) = envelope_levels(&env) else {
+        return (None, false);
+    };
     let (on_at, off_at) = (lo + OOK_EDGE_ON * (hi - lo), lo + OOK_EDGE_OFF * (hi - lo));
     let mut keyed: Vec<KeyRun> = Vec::new();
     for (slice, x) in band.iter().enumerate() {
@@ -465,30 +647,101 @@ fn ook_unit_rate_in(
         }));
     }
     let lengths: Vec<(f64, bool)> = keyed.iter().map(|r| (r.length(), r.on)).collect();
-    let (unit, _) = chip_unit(&lengths, None)?;
+    let Some((unit, _)) = chip_unit(&lengths, None) else {
+        return (None, false);
+    };
     let baud = rate_hz as f64 / unit;
     if baud > OOK_UNIT_MAX_RATE_PER_HZ * bandwidth_hz {
-        return None;
+        return (None, false);
     }
-    let wider = (2.0 * bandwidth_hz).min(occupied_hz);
-    if bandwidth_hz < occupied_hz && !off_is_off(runs, rate_hz, (offset_hz, wider), &keyed) {
-        return None;
+    let wider = (2.0 * bandwidth_hz).min(rate_hz as f64);
+    let wide = spectra.band(planner, offset_hz, wider, decim);
+    let off_db = off_under_on_db(&wide, &keyed);
+    if off_db < OOK_OFF_DB {
+        return (None, false);
     }
-    Some(zeta_core::types::Baud(baud.round() as u32))
+    // What the veto reads ([`OokFit`]), over the runs of at most `OOK_UNIT_MAX_MULTIPLE`
+    // units (a burst train's gaps are not keying).
+    let fitted: Vec<KeyRun> = keyed
+        .iter()
+        .copied()
+        .filter(|r| r.length() <= OOK_UNIT_MAX_MULTIPLE * unit)
+        .collect();
+    let fit = OokFit {
+        baud: zeta_core::types::Baud(baud.round() as u32),
+        bandwidth_hz,
+        off_over_noise_db: off_over_noise_db(&wide, &fitted, rate_hz, wider),
+        wide_tones: fsk_clusters_in(&wide, rate_hz, (0.0, wider.round() as u64)).is_some(),
+    };
+    (Some(fit), false)
 }
 
-/// Whether the off runs of `keyed` (cut in `runs`) stand `OOK_OFF_DB` under its on runs
-/// in the band `offset_hz ± bandwidth_hz / 2`: their mean powers there compared.
-fn off_is_off(
-    runs: &[&[Complex<f32>]],
+/// OOK veto: the noise floor's spectrum is averaged over segments of at most this many
+/// samples ...
+const OOK_NOISE_SEGMENT: usize = 1_024;
+/// ... and at least this many (shorter runs are zero-padded to it).
+const OOK_NOISE_MIN_SEGMENT: usize = 64;
+
+/// How many dB the off runs of `fitted` stand over the noise floor of `band` (the runs
+/// cut `bandwidth_hz` wide at baseband, `rate_hz`): their mean power against the
+/// `FLOOR_PERCENTILE`th-percentile in-band bin of the band's averaged spectrum standing
+/// for every in-band bin. `None` when no off run or no spectrum.
+fn off_over_noise_db(
+    band: &[Vec<Complex<f32>>],
+    fitted: &[KeyRun],
     rate_hz: u64,
-    (offset_hz, bandwidth_hz): (f64, f64),
-    keyed: &[KeyRun],
-) -> bool {
-    let band: Vec<Vec<Complex<f32>>> = runs
+    bandwidth_hz: f64,
+) -> Option<f64> {
+    let longest = band.iter().map(Vec::len).max()?;
+    let size = OOK_NOISE_SEGMENT
+        .min(longest.next_power_of_two() / 2)
+        .max(OOK_NOISE_MIN_SEGMENT);
+    let fft = CpuFft::new();
+    let mut acc = PowerSum::new(size);
+    for x in band.iter().filter(|x| !x.is_empty()) {
+        if x.len() >= size {
+            acc.add(&fft.power_sum(x, size, Window::Hann));
+        } else {
+            let mut y: Vec<Complex<f32>> = x
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| v * hann(i, x.len()))
+                .collect();
+            y.resize(size, Complex::new(0.0, 0.0));
+            acc.add(&fft.power_sum(&y, size, Window::Rect));
+        }
+    }
+    if acc.chunks == 0 {
+        return None;
+    }
+    let bin_hz = rate_hz as f64 / size as f64;
+    let half = ((bandwidth_hz / 2.0 / bin_hz) as usize).clamp(1, size / 2 - 1);
+    let mut inband: Vec<f64> = acc.sum[size / 2 - half..=size / 2 + half].to_vec();
+    let total: f64 = inband.iter().sum();
+    inband.sort_by(f64::total_cmp);
+    let floor_bin = inband[inband.len() * super::FLOOR_PERCENTILE / 100];
+    let samples = band.iter().map(Vec::len).sum::<usize>();
+    let mean = band
         .iter()
-        .map(|r| bandpass(r, rate_hz, offset_hz, bandwidth_hz))
-        .collect();
+        .flatten()
+        .map(|v| v.norm_sqr() as f64)
+        .sum::<f64>()
+        / samples.max(1) as f64;
+    let noise = mean * floor_bin * inband.len() as f64 / total;
+    let (sum, n) = fitted
+        .iter()
+        .filter(|r| !r.on)
+        .flat_map(|r| &band[r.slice][r.start..r.end])
+        .fold((0.0f64, 0usize), |(s, n), x| {
+            (s + x.norm_sqr() as f64, n + 1)
+        });
+    (n > 0 && noise > 0.0 && total > 0.0).then(|| 10.0 * (sum / n as f64 / noise).log10())
+}
+
+/// How many dB the off runs of `keyed` stand under its on runs in `band` (the runs cut
+/// in a wider band, sample for sample): their mean powers there compared; infinite for
+/// silent off runs.
+fn off_under_on_db(band: &[Vec<Complex<f32>>], keyed: &[KeyRun]) -> f64 {
     let mean = |on: bool| {
         let (sum, n) = keyed
             .iter()
@@ -500,7 +753,11 @@ fn off_is_off(
         sum / n.max(1) as f64
     };
     let (on, off) = (mean(true), mean(false));
-    off <= 0.0 || 10.0 * (on / off).log10() >= OOK_OFF_DB
+    if off <= 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (on / off).log10()
+    }
 }
 
 /// Run `(length, on)` read as `k` units: `(length ± bias) / unit`, an on run lengthened
@@ -710,7 +967,7 @@ mod tests {
 
     /// `iq` measured over the whole band at [`RATE`].
     fn rate_of(iq: &[Complex<f32>]) -> Option<u32> {
-        ook_unit_rate(&[iq], RATE, (0.0, RATE)).map(|b| b.0)
+        ook_unit_rate(&[iq], RATE, (0.0, RATE)).map(|f| f.baud.0)
     }
 
     fn noisy(mut iq: Vec<Complex<f32>>, seed: u64) -> Vec<Complex<f32>> {

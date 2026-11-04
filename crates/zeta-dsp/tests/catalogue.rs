@@ -86,6 +86,7 @@ async fn catalogue_uses_a_handed_measurement_without_measuring() {
             period_ms: None,
             order: None,
             tone_spacing_hz: None,
+            symbol_rate_line: None,
         },
         label: Label {
             layer: 1,

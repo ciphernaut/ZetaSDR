@@ -113,6 +113,12 @@ pub struct BitsPlan {
     /// about the measured centre: the capture's span less twice the shift; the plan is
     /// refused when that is under the floor).
     pub bandwidth_hz: Hz,
+    /// When shifting, the band the channel would take uncut (the measured bandwidth ×
+    /// [`CHANNEL_BAND_FACTOR`], at least the floor); `None` when the chain does not shift.
+    pub padded_bandwidth_hz: Option<Hz>,
+    /// Whether that band was cut to what the capture holds about the measured centre
+    /// (`bandwidth_hz` then under `padded_bandwidth_hz`).
+    pub clamped: bool,
     pub capture_rate_hz: Hz,
     /// The `channel` stage's output rate when the chain shifts (the capture rate over
     /// the largest whole divisor that keeps it at least the chain rate the capture rate
@@ -288,44 +294,55 @@ pub fn bits_plan(
     let shifts = shift_hz != 0
         && label != Some(NOISE_LABEL)
         && reach > RESAMPLE_PASSBAND_FRACTION * chain_rate as f64;
-    let (center_hz, shift_hz, bandwidth_hz, channel_rate_hz, rate_hz) = if shifts {
-        let floor = CHANNEL_MIN_BAND_SYMBOLS * rate.0 as u64;
-        let padded =
-            ((features.bandwidth_hz.0 as f64 * CHANNEL_BAND_FACTOR).ceil() as u64).max(floor);
-        let (lo, hi) = (
-            first.center_hz.0 as i128 - capture_rate as i128 / 2,
-            first.center_hz.0 as i128 + capture_rate as i128 / 2,
-        );
-        // The widest band about the measured centre inside the capture: twice the
-        // distance to its nearer edge (the capture less twice the shift).
-        let c = features.center_hz.0 as i128;
-        let room = (2 * (c - lo).min(hi - c)).max(0) as u64;
-        if room < floor {
-            return Err(format!(
-                "the measured centre {} Hz leaves {room} Hz of the capture {lo}..={hi} Hz about it, under the {floor} Hz the chain needs ({CHANNEL_MIN_BAND_SYMBOLS} x {} Bd)",
-                features.center_hz.0, rate.0
-            ));
-        }
-        // A weak signal's measured band reaches into the noise, past the capture: the
-        // channel takes what fits.
-        let band = padded.min(room);
-        let out = channel_out_rate(capture_rate, chain_rate.max(band));
-        (
-            features.center_hz,
-            shift_hz,
-            Hz(band),
-            Some(Hz(out)),
-            chain_rate_hz(out, rate.0, modulation, order),
-        )
-    } else {
-        (first.center_hz, 0, first.bandwidth_hz, None, chain_rate)
-    };
+    let (center_hz, shift_hz, bandwidth_hz, padded_bandwidth_hz, channel_rate_hz, rate_hz) =
+        if shifts {
+            let floor = CHANNEL_MIN_BAND_SYMBOLS * rate.0 as u64;
+            let padded =
+                ((features.bandwidth_hz.0 as f64 * CHANNEL_BAND_FACTOR).ceil() as u64).max(floor);
+            let (lo, hi) = (
+                first.center_hz.0 as i128 - capture_rate as i128 / 2,
+                first.center_hz.0 as i128 + capture_rate as i128 / 2,
+            );
+            // The widest band about the measured centre inside the capture: twice the
+            // distance to its nearer edge (the capture less twice the shift).
+            let c = features.center_hz.0 as i128;
+            let room = (2 * (c - lo).min(hi - c)).max(0) as u64;
+            if room < floor {
+                return Err(format!(
+                    "the measured centre {} Hz leaves {room} Hz of the capture {lo}..={hi} Hz about it, under the {floor} Hz the chain needs ({CHANNEL_MIN_BAND_SYMBOLS} x {} Bd)",
+                    features.center_hz.0, rate.0
+                ));
+            }
+            // A weak signal's measured band reaches into the noise, past the capture: the
+            // channel takes what fits.
+            let band = padded.min(room);
+            let out = channel_out_rate(capture_rate, chain_rate.max(band));
+            (
+                features.center_hz,
+                shift_hz,
+                Hz(band),
+                Some(Hz(padded)),
+                Some(Hz(out)),
+                chain_rate_hz(out, rate.0, modulation, order),
+            )
+        } else {
+            (
+                first.center_hz,
+                0,
+                first.bandwidth_hz,
+                None,
+                None,
+                chain_rate,
+            )
+        };
     Ok(BitsPlan {
         captures: set.iter().map(|r| r.id.clone()).collect(),
         source: first.source.clone(),
         center_hz,
         shift_hz,
         bandwidth_hz,
+        clamped: padded_bandwidth_hz.is_some_and(|p| p.0 > bandwidth_hz.0),
+        padded_bandwidth_hz,
         capture_rate_hz: first.sample_rate_hz,
         channel_rate_hz,
         modulation,
@@ -466,6 +483,7 @@ mod tests {
             period_ms: Some(100.0),
             order,
             tone_spacing_hz: Some(Hz(4800)),
+            symbol_rate_line: None,
         }
     }
 
@@ -596,6 +614,8 @@ mod tests {
         assert_eq!(plan.center_hz, Hz(433_882_000));
         assert_eq!(plan.shift_hz, OFF_HZ as i64);
         assert_eq!(plan.bandwidth_hz, Hz(37_500));
+        assert_eq!(plan.padded_bandwidth_hz, Some(Hz(37_500)));
+        assert!(!plan.clamped);
         // 2 048 000 / 50: the largest whole divisor keeping the 37 500 Hz band, then
         // resampled to the chain rate the channel's output takes (3/5 of it: 7.68 samples
         // per symbol).
@@ -665,6 +685,8 @@ mod tests {
         assert_eq!(plan.center_hz, Hz(433_400_000));
         assert_eq!(plan.shift_hz, 0);
         assert_eq!(plan.channel_rate_hz, None);
+        assert_eq!(plan.padded_bandwidth_hz, None);
+        assert!(!plan.clamped);
         assert_eq!(plan.bandwidth_hz, wide.bandwidth_hz);
         let g = bits_graph(&plan);
         assert!(g.nodes.iter().all(|n| n.kind != "channel"));
@@ -721,6 +743,12 @@ mod tests {
         let plan = bits_plan(&[capture.clone()], &f, Some("ook"), None, None, None).unwrap();
         assert_eq!(plan.shift_hz, 1_709);
         assert_eq!(plan.bandwidth_hz, Hz(62_500 - 2 * 1_709));
+        // The context records the cut: the padded width it wanted, and that it was cut.
+        assert_eq!(plan.padded_bandwidth_hz, Some(Hz(70_725)));
+        assert!(plan.clamped);
+        let ctx = serde_json::to_value(&plan).unwrap();
+        assert_eq!(ctx["padded_bandwidth_hz"], 70_725);
+        assert_eq!(ctx["clamped"], true);
         let g = bits_graph(&plan);
         let ch = g
             .nodes

@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, Tried};
+use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, RateLine, Tried};
 use zeta_core::knowledge::Allocation;
 use zeta_core::ops::{MEASURE_DC_MASK_HZ, channel_rate_hz};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
@@ -27,7 +27,7 @@ pub use burst::{Bursts, burst_runs, on_time};
 use burst::{
     View, averaged_half_spectrum, bandpass, cyclo_symbol_rate, gated_view, strongest_line,
 };
-use order::{envelope_runs, fsk_clusters, ook_unit_rate, psk_order, two_levels};
+use order::{OokFit, envelope_runs, fsk_clusters, ook_unit_rate, psk_order, two_levels};
 
 use crate::channel::extract_offset;
 use crate::fft::{Window, power_spectrum_db};
@@ -110,8 +110,9 @@ pub(crate) fn percentile(v: &[f32], pct: usize) -> f32 {
         return 0.0;
     }
     let mut s = v.to_vec();
-    s.sort_by(f32::total_cmp);
-    s[(s.len() * pct / 100).min(s.len() - 1)]
+    let k = (s.len() * pct / 100).min(s.len() - 1);
+    // The k-th smallest, as a sort would place it: a selection, not a sort.
+    *s.select_nth_unstable_by(k, f32::total_cmp).1
 }
 
 /// Median of `v` (upper median for an even length); 0 when empty.
@@ -419,11 +420,9 @@ pub(crate) fn measure_band_noted(
             period_ms: None,
             order: None,
             tone_spacing_hz: None,
+            symbol_rate_line: None,
         };
-        let note = RateNote {
-            line: None,
-            cv: 0.0,
-        };
+        let note = RateNote { cv: 0.0 };
         return (record, note);
     }
     let v = gated_view(iq, rate_hz, bandwidth_hz);
@@ -479,14 +478,22 @@ pub(crate) fn measure_band_noted(
         .saturating_add(offset.round() as i64)
         .max(0);
     let bandwidth_hz = (bins * bin_hz).round().max(bin_hz.round()) as u64;
-    let rate = rate_of(&v, full, rate_hz, (offset, bandwidth_hz));
+    // On-off keying's chip from its run lengths, unless the veto finds the signal is
+    // not keyed on and off ([`ook_veto`]): then the rate and order as for any other.
+    let fit = ook_fit(&v, full, rate_hz, (offset, bandwidth_hz))
+        .filter(|f| !ook_veto(f, &v, rate_hz, (offset, bandwidth_hz)));
+    let rate = match fit {
+        Some(f) => Some((f.baud, RateLine::Runs)),
+        None => rate_of(&v, rate_hz, (offset, bandwidth_hz)),
+    };
     // FSK order and spacing from the instantaneous-frequency clusters, else the
     // two-peak rule on the measured spectrum; PSK order only without tones. Neither
     // for a chip rate read from on-off keying's runs: that fit found two envelope
-    // levels and no tones in the band it fitted, and the measured band of a weak
-    // keyed signal is mostly noise, whose instantaneous frequency reads as tones.
+    // levels and no tones in the band it fitted (and the veto no PSK order), and the
+    // measured band of a weak keyed signal is mostly noise, whose instantaneous
+    // frequency reads as tones.
     let snr_db = db[peak] - floor;
-    let keyed = rate.is_some_and(|(_, line)| line == RUNS_LINE);
+    let keyed = fit.is_some();
     let fsk = (!keyed)
         .then(|| {
             fsk_clusters(&v.runs, rate_hz, (offset, bandwidth_hz)).or_else(|| {
@@ -513,33 +520,64 @@ pub(crate) fn measure_band_noted(
         period_ms: b.period_ms,
         order: fsk.map(|(o, _)| o).or(psk),
         tone_spacing_hz: fsk.map(|(_, s)| s),
+        symbol_rate_line: rate.map(|(_, line)| line),
     };
-    let note = RateNote {
-        line: rate.map(|(_, line)| line),
-        cv: v.cv,
-    };
+    let note = RateNote { cv: v.cv };
     (record, note)
 }
 
-/// The symbol rate of the view's rate samples ([`View::runs`]: each run as
-/// received when gated, else the whole window) and the line it came from, when
-/// the envelope moves (`cv` at least `FM_MAX_CV`): the on-off keying's chip
-/// rate from its run lengths ([`ook_unit_rate`], `"runs"`) when the envelope
-/// sits at two levels, it shows no FSK tones and its runs are whole multiples of
-/// one unit, over the rate samples and, when gated, over the whole window `full`
-/// (the gate cuts its runs from the window's power, whole-band: a weak keyed
-/// signal's loudest chunks gate as bursts a millisecond long, and the keying's off
-/// runs lie between them), else
-/// [`cyclo_symbol_rate`] of the occupied band `offset_hz ± bandwidth_hz / 2`
-/// (from the block centre, band-passed per run), up to its width
-/// (`"cyclo"`); else, or when neither finds one, the [`symbol_rate`] keying
-/// line (`"keying"`).
+/// On-off keying's chip rate from its run lengths ([`ook_unit_rate`]) of the occupied
+/// band `offset_hz ± bandwidth_hz / 2`, when the envelope moves (`cv` at least
+/// `FM_MAX_CV`): over the view's rate samples ([`View::runs`]) and, when the view is
+/// gated on under `OOK_REFIT_MAX_DUTY` of the window, over the whole window `full` (the
+/// gate cuts its runs from the window's power, whole-band: a weak keyed signal's
+/// loudest chunks gate as bursts a millisecond long, and the keying's off runs lie
+/// between them; a gate that holds more found real bursts).
+fn ook_fit(v: &View, full: &[Complex<f32>], rate_hz: u64, band: (f64, u64)) -> Option<OokFit> {
+    if v.cv < FM_MAX_CV {
+        return None;
+    }
+    ook_unit_rate(&v.runs, rate_hz, band).or_else(|| {
+        (v.gated && v.bursts.duty < OOK_REFIT_MAX_DUTY)
+            .then(|| ook_unit_rate(&[full], rate_hz, band))
+            .flatten()
+    })
+}
+
+/// A gated view whose runs hold less than this share of the window is fitted over the
+/// whole window too ([`ook_fit`]): the weak HackRF remote's gate held 1 % of its 471 ms
+/// window, 1 ms chunks of a keyed train; real bursts (FSK or PSK packets 100 ms apart)
+/// held 4-24 %, and refitting them cost a full window per measure.
+const OOK_REFIT_MAX_DUTY: f32 = 0.05;
+
+/// Whether a run-length fit is vetoed, its rate and label left to the other rules: the
+/// fitted off runs stand more than `OOK_OFF_MAX_OVER_NOISE_DB` over the noise floor (or
+/// it cannot be measured), twice the fitted band carries FSK tones, or the measured band
+/// carries a PSK order ([`psk_order`]: OOK's carrier line rules one out).
+fn ook_veto(fit: &OokFit, v: &View, rate_hz: u64, band: (f64, u64)) -> bool {
+    fit.off_over_noise_db
+        .is_none_or(|db| db > OOK_OFF_MAX_OVER_NOISE_DB)
+        || fit.wide_tones
+        || psk_order(&v.runs, rate_hz, band).is_some()
+}
+
+/// On-off keying's off level is the noise: the fitted off runs stand at most this many
+/// dB over the band's noise floor. Measured: the real remotes' 1.1-5.3 dB, a PSK burst's
+/// envelope dips, which are signal, 15 dB at 8 dB SNR and 28-29 dB at 30 dB. The envelope
+/// CV inside the on runs did not tell them apart (0.15-0.21 on both).
+const OOK_OFF_MAX_OVER_NOISE_DB: f64 = 8.0;
+
+/// The symbol rate of the view's rate samples ([`View::runs`]: each run as received
+/// when gated, else the whole window) and the line it came from, when no run-length fit
+/// stands ([`ook_fit`]): when the envelope moves (`cv` at least `FM_MAX_CV`)
+/// [`cyclo_symbol_rate`] of the occupied band `offset_hz ± bandwidth_hz / 2` (from the
+/// block centre, band-passed per run), up to its width (`cyclo`); else, or when it finds
+/// none, the [`symbol_rate`] keying line (`keying`).
 fn rate_of(
     v: &View,
-    full: &[Complex<f32>],
     rate_hz: u64,
     (offset_hz, bandwidth_hz): (f64, u64),
-) -> Option<(Baud, &'static str)> {
+) -> Option<(Baud, RateLine)> {
     let bw = bandwidth_hz as f64;
     let cyclo = || {
         let runs: Vec<Vec<Complex<f32>>> = v
@@ -549,31 +587,19 @@ fn rate_of(
             .collect();
         cyclo_symbol_rate(&runs, rate_hz, bw)
     };
-    let runs = || {
-        ook_unit_rate(&v.runs, rate_hz, (offset_hz, bandwidth_hz)).or_else(|| {
-            v.gated
-                .then(|| ook_unit_rate(&[full], rate_hz, (offset_hz, bandwidth_hz)))
-                .flatten()
-        })
-    };
     let moves = v.cv >= FM_MAX_CV;
     moves
-        .then(runs)
+        .then(cyclo)
         .flatten()
-        .map(|r| (r, RUNS_LINE))
-        .or_else(|| moves.then(cyclo).flatten().map(|r| (r, "cyclo")))
-        .or_else(|| symbol_rate(&v.runs, rate_hz, v.cv, bandwidth_hz).map(|r| (r, "keying")))
+        .map(|r| (r, RateLine::Cyclo))
+        .or_else(|| {
+            symbol_rate(&v.runs, rate_hz, v.cv, bandwidth_hz).map(|r| (r, RateLine::Keying))
+        })
 }
 
-/// The [`RateNote::line`] of a chip rate read from on-off keying's run lengths.
-const RUNS_LINE: &str = "runs";
-
-/// How layer 1 measured a record's symbol rate, for its label's evidence.
+/// How layer 1 measured a record, for its label's evidence.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RateNote {
-    /// The line the rate came from (`"runs"`, `"cyclo"` or `"keying"`); `None` without
-    /// a rate.
-    pub line: Option<&'static str>,
     /// Envelope CV of the samples the rate was searched over.
     pub cv: f32,
 }
@@ -605,9 +631,9 @@ fn tone_pair(
 ///
 /// 1. `"noise"` (0.5) when `snr_db < 6`.
 /// 2. `"ook"` (0.6) when the record's symbol rate is on-off keying's chip from its run
-///    lengths (the evidence's `(runs)`: two envelope levels, the lower off, no FSK
-///    tones and runs of whole chips in the band it was fitted in; [`measure_band_masked`])
-///    and it carries no order. Only [`layer1_label_noted`] knows the line.
+///    lengths (`symbol_rate_line` `runs`: two envelope levels, the lower off, no FSK
+///    tones, runs of whole chips and a flat on level in the band it was fitted in, and
+///    no PSK order; [`measure_band_masked`]) and it carries no order.
 /// 3. `"fsk"` (0.6) when the record carries an FSK `order` and
 ///    `tone_spacing_hz` ([`measure_band_masked`]), or the power spectrum has
 ///    exactly two dominant peaks inside the occupied band 500–3000 Hz apart
@@ -651,10 +677,9 @@ pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Lab
     layer1_label_noted(f, None, iq, rate_hz)
 }
 
-/// [`layer1_label`] whose evidence names the line `f`'s symbol rate came from
-/// and the envelope CV it was searched with, from `note` (the
-/// [`measure_band_noted`] that measured `f`); without one it names no line and
-/// reports the whole block's CV.
+/// [`layer1_label`] whose evidence reports the envelope CV the rate was searched
+/// with, from `note` (the [`measure_band_noted`] that measured `f`); without one the
+/// whole block's CV. The rules are [`layer1_label`]'s: the note changes no name.
 pub(crate) fn layer1_label_noted(
     f: &FeatureRecord,
     note: Option<&RateNote>,
@@ -662,12 +687,11 @@ pub(crate) fn layer1_label_noted(
     rate_hz: u64,
 ) -> Label {
     let cv = envelope_cv(iq);
-    let runs = note.is_some_and(|n| n.line == Some(RUNS_LINE));
-    let (name, confidence, reason) = classify_block(f, iq, rate_hz, cv, runs);
+    let (name, confidence, reason) = classify_block(f, iq, rate_hz, cv);
     let baud = f.symbol_rate_baud.map_or_else(
         || "none".to_string(),
-        |b| match note.and_then(|n| n.line) {
-            Some(line) => format!("{} Bd ({line})", b.0),
+        |b| match f.symbol_rate_line {
+            Some(line) => format!("{} Bd ({})", b.0, line.name()),
             None => format!("{} Bd", b.0),
         },
     );
@@ -790,14 +814,14 @@ pub fn ssb_dial_hz(center_hz: u64, usb: bool) -> u64 {
 }
 
 /// [`layer1_label`]'s rules over `f` and its block `iq`; `runs` when `f`'s symbol rate
-/// is on-off keying's chip from its run lengths ([`RUNS_LINE`]).
+/// is on-off keying's chip from its run lengths ([`RateLine::Runs`]) by `f`'s line.
 fn classify_block(
     f: &FeatureRecord,
     iq: &[Complex<f32>],
     rate_hz: u64,
     cv: f32,
-    runs: bool,
 ) -> (&'static str, f32, String) {
+    let runs = f.symbol_rate_line == Some(RateLine::Runs);
     if f.snr_db < NOISE_SNR_DB || iq.is_empty() || rate_hz == 0 {
         return ("noise", 0.5, format!("snr below {NOISE_SNR_DB} dB"));
     }
@@ -1245,6 +1269,26 @@ mod tests {
     const CENTER: u64 = 144_800_000;
     const BIN_HZ: f64 = RATE as f64 / 1024.0;
     const WIDE_RATE: u64 = 192_000;
+
+    /// The public [`super::layer1_label`] of `f`, asserted to name what production's
+    /// path ([`measure_selection`] over the whole block at [`CENTER`]) names whenever
+    /// `f` is that path's record: the tests below run on both.
+    fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Label {
+        let l = super::layer1_label(f, iq, rate_hz);
+        let whole = Band {
+            offset_hz: 0,
+            bandwidth_hz: Hz(rate_hz),
+        };
+        if let Some((pf, pl)) = measure_selection(iq, rate_hz, CENTER, whole)
+            && pf == *f
+        {
+            assert_eq!(
+                pl.name, l.name,
+                "production names {pl:?}, layer1_label {l:?}"
+            );
+        }
+        l
+    }
 
     fn show(what: &str, f: &FeatureRecord, l: &Label) {
         eprintln!("{what}: {f:?} -> {} ({})", l.name, l.evidence);
@@ -2281,5 +2325,47 @@ mod tests {
         assert!(f.snr_db >= NOISE_SNR_DB, "snr_db {}", f.snr_db);
         assert_eq!(f.order, None, "{f:?}");
         assert_eq!(f.tone_spacing_hz, None, "{f:?}");
+    }
+
+    /// The veto on its own: fitted over the whole window (as a gate holding under
+    /// `OOK_REFIT_MAX_DUTY` would have it, bypassing that skip), patterned PSK bursts and
+    /// POCSAG over NBFM at 8 dB do fit run lengths, and each fit is vetoed: the PSK
+    /// bursts' off runs are their envelope dips, signal well over the noise, and POCSAG's
+    /// narrow band holds one tone of two (FSK tones in twice the band).
+    #[test]
+    fn the_veto_rejects_the_run_fits_of_psk_bursts_and_nbfm_pocsag() {
+        let psk = |order| SynthSpec::Psk {
+            symbol_rate_baud: 2_400,
+            order,
+            bits: "a5c3f0e1a5c3f0e1".into(),
+            repeat: 8,
+            gap_ms: 100,
+        };
+        let pocsag = SynthSpec::Pocsag {
+            address: 1_234_567,
+            function: 3,
+            text: "HELLO WORLD THIS IS A PAGE".into(),
+            baud: 2_400,
+        };
+        for (what, spec, snr) in [
+            ("bpsk bursts 30 dB", psk(2), 30.0),
+            ("qpsk bursts 30 dB", psk(4), 30.0),
+            ("qpsk bursts 8 dB", psk(4), 8.0),
+            ("pocsag 2400 8 dB", pocsag, 8.0),
+        ] {
+            let imp = Impairments {
+                snr_db: Some(snr),
+                ..Default::default()
+            };
+            let iq = synthesise(&spec, &imp, RATE as u32, 0);
+            let f = measure(&iq, RATE, CENTER);
+            let v = gated_view(&iq, RATE, RATE);
+            let band = (f.center_hz.0 as f64 - CENTER as f64, f.bandwidth_hz.0);
+            let fit = ook_unit_rate(&v.runs, RATE, band)
+                .or_else(|| ook_unit_rate(&[&iq[..]], RATE, band))
+                .unwrap_or_else(|| panic!("{what}: no fit to veto: {f:?}"));
+            eprintln!("{what}: {fit:?}");
+            assert!(ook_veto(&fit, &v, RATE, band), "{what}: {fit:?}");
+        }
     }
 }
