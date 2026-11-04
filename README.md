@@ -1,30 +1,32 @@
 # ZetaSDR
 
 ZetaSDR is an agentic RF runtime: a node that owns signal sources, keeps a live picture of the
-spectrum and exposes "what is there, what is it, decode it" as typed operations that a human, a
-script or an LLM can invoke. This branch is the core node (ports and leases, IQ ring, stream bus,
-jobs, the operation set, a SigMF file source and the `zeta` CLI) and the DSP slice (channel
-extraction, spectrum, NBFM demodulation, APRS decoding, layer-1 measurement and classifiers),
-with the transports and agent of plan 3, the hardware and foreign sources of plan 4 (KiwiSDR,
-SoapySDR, external-process stages), the federation of plan 5 (another node as a source, VITA
-49.2 over the websocket and UDP, a Pi 5 build), the web UI of plan 6 (waterfall, context
-menu, agent transcript, graph view), the audio path of plan 7 (48 kHz audio from every
-demodulator, wideband FM, AM and SSB, a signal catalogue for layer 2) and the wideband work of
-plan 8 (a shared channel bank per wide capture, quantised spectrum rows, zoom and pan, the
-`scan` job, a memory-budgeted IQ ring) and the speech path of plan 10 (transcription of a
-channel: [docs/speech.md](docs/speech.md)).
+spectrum and exposes "what is there, what is it, decode it" as typed operations (36 of them) that a
+human, a script or an LLM can invoke.
+
+One node process holds the radios (SoapySDR devices such as a HackRF or a USRP B210 in a worker
+child, KiwiSDR receivers, SigMF recordings, VITA 49.2 senders, other nodes' radios), leases each
+one's tuning to jobs, and runs every job as a graph of stages: channelisers and a shared filter
+bank, spectrum and scan, NBFM/WFM/AM/SSB demodulators, decoders as table rows (APRS, POCSAG, RDS,
+ACARS, ADS-B via dump1090, radiosondes via rs1729), layer-1 measurement, classify, identify and
+watch, burst captures and a layer-4 bit chain for signals nobody has named, transcription through a
+speech daemon, a mix of every talking channel. It is driven by the `zeta` CLI, an authenticated
+HTTP + websocket API, a browser page served by the node (waterfall, jobs, map, subjects, explore and
+bits panes, themes), an MCP server and an in-process agent over any OpenAI-compatible LLM. The ACMA
+licence register can be attached as a knowledge provider.
+
+- How the pieces plug together, and which may run on another host:
+  [docs/architecture/mudmap.html](docs/architecture/mudmap.html) (the mudmap).
+- Every crate and where planned work lands: [docs/architecture/index.html](docs/architecture/index.html).
+- The agent guide (every operation and the field craft): [AGENTS.md](AGENTS.md), generated from the
+  schema and [docs/agents/field-craft.md](docs/agents/field-craft.md).
+- Worked recipes: [RECIPES.md](RECIPES.md). Speech: [docs/speech.md](docs/speech.md). Themes:
+  [docs/themes.md](docs/themes.md). Acceptance checks: [UAT.md](UAT.md). Open work: [TODO.md](TODO.md).
 
 Design: [docs/superpowers/specs/2026-10-18-zetasdr-design.md](docs/superpowers/specs/2026-10-18-zetasdr-design.md).
-Plans: [docs/superpowers/plans/2026-10-18-core-node.md](docs/superpowers/plans/2026-10-18-core-node.md),
-[docs/superpowers/plans/2026-10-18-dsp-slice.md](docs/superpowers/plans/2026-10-18-dsp-slice.md),
-[docs/superpowers/plans/2026-10-18-transports-agent.md](docs/superpowers/plans/2026-10-18-transports-agent.md),
-[docs/superpowers/plans/2026-10-19-hardware-sources.md](docs/superpowers/plans/2026-10-19-hardware-sources.md),
-[docs/superpowers/plans/2026-10-19-federation.md](docs/superpowers/plans/2026-10-19-federation.md),
-[docs/superpowers/plans/2026-10-19-ui.md](docs/superpowers/plans/2026-10-19-ui.md),
-[docs/superpowers/plans/2026-10-19-audio-wfm.md](docs/superpowers/plans/2026-10-19-audio-wfm.md),
-[docs/superpowers/plans/2026-10-19-wideband.md](docs/superpowers/plans/2026-10-19-wideband.md),
-[docs/superpowers/plans/2026-10-20-speech.md](docs/superpowers/plans/2026-10-20-speech.md),
-[docs/superpowers/plans/2026-11-03-layer4-bits.md](docs/superpowers/plans/2026-11-03-layer4-bits.md) (plan 19.2: layer 4 bits, from a capture to a bit stream and its framing hypotheses).
+The plan series, with each plan's status and what was proved live:
+[docs/superpowers/plans/2026-10-18-zetasdr-plan-series.md](docs/superpowers/plans/2026-10-18-zetasdr-plan-series.md)
+(plans 1-24 and 26 are merged; 19.3 is not started and 25 is parked).
 
 ## Tests
 
@@ -406,6 +408,36 @@ zeta job start --kind <mode id> --source S --center-hz C --bandwidth-hz B
 Every decoded event carries `protocol`, `t_ns` and a one-line `summary` (the page shows it). `zeta classify` is the quick answer to "what is this": it tries the best five rows with a short decode and lists them under `tried`. `zeta job start --kind identify` is the thorough one: it measures the band, then runs each fitting row as a child job in score order, publishing a `candidate` event for each, and ends with a verdict in `job_context.identify`; a proof leaves that decoder running. `docs/agents/field-craft.md` ("Decoding modes") has the details and a worked operator row.
 
 A program row can also take demodulated audio instead of IQ (`decoder.demod`, `input.container` `raw` or `wav`): the radiosonde rows `rs41_decode`, `dfm_decode` and `m20_decode` run the rs1729 decoders (package `sonde-decoders`) over an NBFM channel anywhere in 400.05-406 MHz, and their events carry a `position`. `zeta source free --center-hz C --bandwidth-hz B` says which sources could take a band now (a suggestion, not a reservation). `zeta job start --kind watch` holds a band (400-406 MHz for sondes), reports each new signal that persists as a `signal` event, runs `identify` on it and keeps the decoder that proves, in its own capture or on a free second radio (`decode_on: free`); stopping the watch stops what it started, and `docs/agents/field-craft.md` ("Watching a band for sondes") walks through it. The web page outlines a watch on the waterfall and has a map layer (`view set map on`, `view set home LAT,LON` for distance and bearing) for events with a position, a marker and track per subject for a row that names one and per job otherwise: Leaflet 1.9.4 is vendored, and OpenStreetMap tiles are fetched only when the browser is online. The Subjects tab (`view set subjects auto|on|off`) lists a row's subjects, one line per aircraft or sonde; a click there selects the marker and the reverse. Subjects live on the page, so a refresh refills from live traffic. A `sink_sondehub` stage, added by the watch's `sondehub` param (a callsign and your position) or by `graph put`, posts sonde telemetry to SondeHub in batches; nothing is uploaded otherwise.
+
+## Exploring unknown signals
+
+When nothing proves a signal, the answer is `unknown` with its measured features, and the node has
+the tools to look further (field craft: "Exploring an unknown signal" and "Working layer 4").
+
+```bash
+zeta station set --lat -27.38 --lon 153.12 --alt-m 4          # once: position, region, antennas
+zeta --knowledge-acma http://HOST:3110 knowledge lookup --region AU --center-hz 404025000 --bandwidth-hz 25000
+zeta job start --kind capture --source S --center-hz C --bandwidth-hz B   # write the signal's bursts as SigMF
+zeta capture list                                               # the burst store, newest first
+zeta capture classify --capture ID                              # "what is this?" on a stored window
+zeta bits start --capture ID --then-tail 4,5000                 # capture -> demod -> clock -> slicer -> bit_view
+```
+
+`measure` is burst-aware: on a burst train it measures over the on-time and reports `duty`,
+`bursts`, `burst_ms` and `period_ms`, and for on-off keying it fits the chip rate from the run
+lengths (`symbol_rate_line: runs`). `--knowledge-acma URL` attaches the ACMA licence register (an
+MCP server) as a provider of `knowledge_lookup`, `classify` and `identify`: licensee, site, distance
+from the station, power and the decoded emission designator, a hypothesis about who transmits and
+never a proof of what a signal is. The burst store keeps 256 MB and 7 days by default
+(`--bursts-keep-mb`, `--bursts-keep-days`; pinned captures are kept); a watch with `on_unknown:
+capture` fills it by itself. `bits_start` builds `capture_in -> [channel ->] resample ->
+fsk|psk|ook demod -> clock_recover -> slicer -> bit_view` from the capture's feature record and
+refuses rather than guesses a rate; `job_context` then holds the clock, the slicer and `bit_view`'s
+hypotheses (line code, frame period, sync-word and CRC candidates). `graph_start` runs any graph
+with no radio at its root (`capture_in`, `stream_in`, `mix`). The page's Explore pane lists the
+captures (What is this, Download, Delete, Work the bits) and the Bits pane shows the bits and the
+hypotheses. The node stops at classification: reading the content of someone else's link is the
+operator's decision.
 
 ## External stages
 
