@@ -1,0 +1,37 @@
+name: Gist
+description: An idea, optionally with a GitHub gist holding a patch, a mode row, a theme, a plugin or a recipe.
+labels: [gist]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ZetaSDR does not merge pull requests at this stage. Describe the idea here; if you have code, put it in a GitHub gist and link it.
+        The maintainer may adopt it in a commit that credits you with a `Suggested-by:` line. What you send is offered under Apache-2.0, the project's licence (see CONTRIBUTING.md).
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What it is, in a few sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What it would let you do, or what problem it solves.
+    validations:
+      required: true
+  - type: input
+    id: gist
+    attributes:
+      label: Gist link
+      description: A https://gist.github.com/... link, if there is code.
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: What the gist was written against, `zeta --version` or a commit.
+    validations:
+      required: false

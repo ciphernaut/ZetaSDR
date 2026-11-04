@@ -19,7 +19,7 @@ bookworm and newer. `smoke.sh` checks `zeta schema` is JSON with an `op` key and
 
 Soapy is not built: nothing is attached to the Pi yet. To drive an SDR on the Pi later,
 build on the Pi itself: `sudo apt install libsoapysdr-dev` plus the device's SoapySDR module,
-then `RUSTFLAGS="--cfg soapy" cargo build --release -p zeta` (see the main README).
+then `RUSTFLAGS="--cfg soapy" cargo build --release -p zeta` (see [Sources](../../docs/guide.md#sources) in the guide).
 
 ## Install (Pi)
 
