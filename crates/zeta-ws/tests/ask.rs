@@ -410,12 +410,9 @@ async fn ask_page_tools_default_off_and_on_offers_view_set_with_the_ready_themes
     .await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-    // Nothing reached the node's ops.
-    while let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_millis(300), ops.recv()).await {
-        let Payload::Event(p) = frame.payload else {
-            continue;
-        };
-        assert_ne!(p["op"]["op"], "view_set", "view_set reached the node");
+    // No operation at all reached the node during these runs.
+    if let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_millis(300), ops.recv()).await {
+        panic!("an op reached the node: {:?}", frame.payload);
     }
     ts.stop().await;
 }

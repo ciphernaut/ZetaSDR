@@ -913,3 +913,78 @@ async fn view_set_is_an_unknown_tool_without_page_tools() {
     let reqs = requests(&fake);
     assert!(!reqs[0]["tools"].to_string().contains("view_set"));
 }
+
+#[tokio::test]
+async fn view_set_refuses_keys_that_act_listing_the_presentation_keys() {
+    let call = |key: &str, value: &str| ("view_set", json!({"key": key, "value": value}));
+    let fake = fake(vec![
+        tool_call_response(&[
+            call("scanner", "cb"),
+            call("zoom_out", "scan"),
+            call("home", "-27.5,153"),
+            call("auto_scan_stop", "keep"),
+            call("volume", "11"),
+        ]),
+        text_response("Refused.", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![]);
+    let agent = Agent::new(llm(&fake), &exec, page_cfg());
+    let t = agent.run("scan the band from the page").await.unwrap();
+    assert_eq!(t.calls.len(), 5);
+    for c in &t.calls {
+        assert!(!c.ok, "{c:?}");
+        assert_eq!(c.result["error"], "unknown", "{c:?}");
+        assert_eq!(c.result["field"], "key", "{c:?}");
+        assert_eq!(
+            c.result["known"],
+            json!(zeta_agent::page::VIEW_KEYS),
+            "{c:?}"
+        );
+    }
+    assert!(exec.calls.lock().unwrap().is_empty());
+    // The tool's schema names the allowed keys as an enum.
+    let reqs = requests(&fake);
+    let tool = reqs[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == "view_set")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        tool["function"]["parameters"]["properties"]["key"]["enum"],
+        json!(zeta_agent::page::VIEW_KEYS)
+    );
+    for acting in ["scanner", "zoom_out", "auto_scan_stop", "home"] {
+        assert!(
+            !zeta_agent::page::VIEW_KEYS.contains(&acting),
+            "{acting} must not be settable"
+        );
+    }
+}
+
+/// The page refuses the same keys before applying: its `AGENT_VIEW_KEYS` (view.js) is the
+/// agent's `VIEW_KEYS`, and every key is one of the page's view policies.
+#[test]
+fn the_page_allows_the_same_view_keys() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../zeta-ui/web/view.js");
+    let js = std::fs::read_to_string(path).unwrap();
+    let start = js
+        .find("export const AGENT_VIEW_KEYS = [")
+        .expect("AGENT_VIEW_KEYS in view.js");
+    let rest = &js[start..];
+    let list = &rest[rest.find('[').unwrap() + 1..rest.find("];").unwrap()];
+    let page: Vec<&str> = list
+        .split(',')
+        .map(|k| k.trim().trim_matches('"'))
+        .filter(|k| !k.is_empty())
+        .collect();
+    assert_eq!(page, zeta_agent::page::VIEW_KEYS);
+    for key in zeta_agent::page::VIEW_KEYS {
+        assert!(
+            js.contains(&format!("key: \"{key}\"")),
+            "{key} is not a view policy"
+        );
+    }
+}

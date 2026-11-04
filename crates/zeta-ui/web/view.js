@@ -42,6 +42,8 @@
 //       the station's (`view set home` takes precedence; `none` falls back to the station)
 //   themeIds() -> [id]   the ids `view set theme` accepts: the built-ins until
 //       setThemeIds(ids) gives the ready ids `themes_list` answered (app.js loadThemes)
+//   AGENT_VIEW_KEYS   the keys an agent's `view_set` may set (presentation only; app.js
+//       refuses any other before applying)
 //   VIEW_KEY   the sessionStorage key holding the values set ({key: value}, defaults left out)
 //   mountView() -> View
 //     view.get(key)             the value (the default when not set)
@@ -62,6 +64,22 @@ import { planIds } from "./plans.js";
 import { paneIds } from "./panes.js";
 
 export const VIEW_KEY = "zeta.view";
+
+// The keys the agent's page-only `view_set` may set: presentation only (zeta-agent's
+// VIEW_KEYS). `zoom_out`, `scanner` and `auto_scan_stop` drive scans and `home` moves where
+// distances count from: those are the operator's to type.
+export const AGENT_VIEW_KEYS = [
+  "theme",
+  "side",
+  "map",
+  "pane",
+  "subjects",
+  "finished_rows_s",
+  "subject_dim_s",
+  "subject_drop_s",
+  "plan",
+  "follow",
+];
 
 const SOURCE_ID = /^[A-Za-z0-9_.:-]+$/;
 const DECIMAL = /^[+-]?(\d+(\.\d*)?|\.\d+)$/;

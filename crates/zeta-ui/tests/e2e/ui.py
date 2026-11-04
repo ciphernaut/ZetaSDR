@@ -3824,7 +3824,8 @@ def scenario_duplicate_start_renders_the_job(page, url, secret):
 # `zeta-fake-llm`, answering by request: "think" lists the sources (with reasoning and content)
 # then answers "one source"; "stop the measure" calls job_stop on 01NOPE then answers "I was not
 # allowed to stop it."; "every CB channel" lists the sources, plan_starts fm_demod on ch20 and
-# ch59 of uhf_cb_au on `cb`, then answers "Started 2 channels.".
+# ch59 of uhf_cb_au on `cb`, then answers "Started 2 channels."; "switch to the plain theme"
+# calls the page-only view_set {key: theme, value: plain}, then answers "Switched to plain.".
 
 def llm_url():
     url = os.environ.get("ZETA_UI_URL_LLM")

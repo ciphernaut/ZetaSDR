@@ -128,6 +128,7 @@ import { playJob } from "./audio.js";
 import { closeGraph, redrawOpenGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
 import {
+  AGENT_VIEW_KEYS,
   homeOf,
   mountView,
   runViewCommand,
@@ -680,6 +681,11 @@ async function askAgent(text, allowOverride = null) {
     for (const c of r.calls || []) {
       if (c.tool !== "view_set" || !c.ok || !c.arguments) continue;
       const { key, value } = c.arguments;
+      if (!AGENT_VIEW_KEYS.includes(key)) {
+        const allowed = AGENT_VIEW_KEYS.join(", ");
+        t.note(`the agent may not set view ${key} (allowed: ${allowed})`, true);
+        continue;
+      }
       const v = runViewCommand(state.view, ["set", String(key), String(value)]);
       t.note(v.text, v.error);
     }
