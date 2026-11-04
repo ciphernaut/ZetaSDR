@@ -158,6 +158,17 @@ function plural(n, word) {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
+// One /ask call record (`{tool, arguments, ok, result}`) as a turn shows it.
+function callText(c) {
+  if (!c) return "";
+  const args = c.arguments === undefined ? "" : ` ${JSON.stringify(c.arguments)}`;
+  const r = c.result;
+  const outcome = c.ok
+    ? "ok"
+    : `error: ${(r && (r.message || r.error)) || JSON.stringify(r)}`;
+  return `→ ${c.tool}${args}\n  ${outcome}`;
+}
+
 // `L<layer> <name> <confidence, 2 dp>`, as the overlay labels read.
 function labelText(l) {
   if (!l || typeof l !== "object") return String(l);
@@ -299,20 +310,27 @@ export class Transcript {
     this.#append(text, "user");
   }
 
-  // `turnLog` is /ask's `turn_log`: after the answer line, one collapsed `<details
-  // class="turn">` per turn that has reasoning or content.
-  assistant(text, error = false, turnLog = []) {
+  // `turnLog` is /ask's `turn_log` and `calls` its `calls`, in order: after the answer line,
+  // one collapsed `<details class="turn">` per turn that has reasoning, content or tool
+  // calls, holding them (each call as `tool {arguments}` and its outcome). A model run
+  // without thinking has no reasoning, so its calls are what a turn shows.
+  assistant(text, error = false, turnLog = [], calls = []) {
     this.#append(text, error ? "assistant error" : "assistant");
+    let next = 0;
     for (const turn of turnLog) {
-      if (!turn || (!turn.reasoning && !turn.content)) continue;
+      if (!turn) continue;
+      // `calls` is the completion's tool-call count (TurnEntry.calls).
+      const k = Number.isInteger(turn.calls) ? turn.calls : 0;
+      const mine = calls.slice(next, next + k);
+      next += k;
+      if (!turn.reasoning?.trim() && !turn.content && !mine.length) continue;
       const d = document.createElement("details");
       d.className = "turn";
       const sum = document.createElement("summary");
-      // `calls` is the completion's tool-call count (TurnEntry.calls).
-      const k = Number.isInteger(turn.calls) ? turn.calls : 0;
       sum.textContent = `turn ${turn.turn} (${plural(k, "call")})`;
       d.append(sum);
-      for (const part of [turn.reasoning, turn.content]) {
+      const parts = [turn.reasoning?.trim(), turn.content, ...mine.map(callText)];
+      for (const part of parts) {
         if (!part) continue;
         const pre = document.createElement("pre");
         pre.textContent = part;

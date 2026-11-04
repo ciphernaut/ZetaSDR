@@ -170,7 +170,7 @@ To run demodulators on active channels only, not on all 80, use `examples/python
 4. A `conflict` names the holders and starts nothing. Report it and stop: the operator decides whether those jobs go. Do not retry with `replace` or `job_stop` them unless the request named them.
 5. A partial set is completed by running `plan_start` again: running channels come back as `existing`.
 
-A result of `not_allowed` means the run may not do that: the agent is not allowed to stop jobs, or to put any in `replace`, unless the operator unlocked it for the run. Do not retry and do not work around it with other calls. Tell the operator to say `allow stops on`, or press the retry button, then ask again.
+A result of `not_allowed` means the run may not do that: the agent is not allowed to stop jobs, or to put any in `replace`, unless the operator unlocked it for the run. Do not retry and do not work around it with other calls. Tell the operator to say `allow stops on` (`allow deletes on` for a refused `capture_delete`), or press the retry button, then ask again.
 
 ### Listening to many channels
 

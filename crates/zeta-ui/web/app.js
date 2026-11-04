@@ -105,21 +105,23 @@
 // failures such as a node without a speech daemon.
 //
 // Exports `state` ({api, transcript, jobs, wf, coarse, subjects, subjectsPane, panes, ov, map, menu,
-// audio, mic, sources, selected, view, lastJobs, allowStops}), `onSourceChange(fn)` for the later views (waterfall, audio,
+// audio, mic, sources, selected, view, lastJobs, allowStops, allowDeletes}), `onSourceChange(fn)` for the later views (waterfall, audio,
 // voice), `conflictActions(err, retry)`, `runSourceCommand(state, words)` and
 // `runPlanCommand(state, words)`.
 //
-// Typed commands beside `view` and `source`: `allow stops on|off` (state.allowStops, off at
-// load; every following /ask carries `allow: {stop_jobs, replace}` of it; an answer from a run
-// that may stop jobs ends " [may stop jobs]", each turn of its `turn_log` is a collapsed
-// `details.turn`, and a refused call (`not_allowed`) adds the note with the action `allow stops
-// and ask again`, which re-sends that one request with both flags true and leaves the switch
-// off; the note's buttons disable once clicked), `stop all` (a `jobs_stop` of every job but the
+// Typed commands beside `view` and `source`: `allow stops on|off` (state.allowStops) and
+// `allow deletes on|off` (state.allowDeletes), both off at load; every following /ask carries
+// `allow: {stop_jobs, replace, delete_captures}` of them; an answer from a run that may stop
+// jobs ends " [may stop jobs]" (" [may delete captures]" likewise), each turn of its `turn_log`
+// (a failed run's too) is a collapsed `details.turn` with that turn's tool calls, and a refused
+// call (`not_allowed`) adds a note naming what was refused with the action `allow … and ask
+// again`, which re-sends that one request with the refused flags true and leaves the switches
+// as they were; the note's buttons disable once clicked), `stop all` (a `jobs_stop` of every job but the
 // page's spectrum) and `plan start <plan> <kind> [<attach>] [ch N,N-M]` (a `plan_start` op on
 // the shown source through applyOp: conflicts get retry buttons, refused channels and
 // warnings a note each).
 
-import { connect, Unauthorized } from "./api.js";
+import { OpError, connect, Unauthorized } from "./api.js";
 import { QUIET_OPS, Transcript, errorText, startJobs, startOpsFeed } from "./agent.js";
 import { mountWaterfall } from "./waterfall.js";
 import { mountOverlays } from "./overlays.js";
@@ -172,6 +174,7 @@ export const state = {
   coarse: null, // coarse.js: the automatic scans of a view past the capture
   lastJobs: [], // the last job_list result
   allowStops: false, // `allow stops on|off`: /ask may stop and replace jobs (not persisted)
+  allowDeletes: false, // `allow deletes on|off`: /ask may delete captures (not persisted)
 };
 const sourceListeners = [];
 
@@ -672,11 +675,17 @@ async function askAgent(text, allowOverride = null) {
   if (!state.api) return;
   t.user(text);
   try {
-    const flag = state.allowStops;
-    const allow = allowOverride ?? { stop_jobs: flag, replace: flag };
+    const stops = state.allowStops;
+    const allow = allowOverride ?? {
+      stop_jobs: stops,
+      replace: stops,
+      delete_captures: state.allowDeletes,
+    };
     const r = await state.api.ask(text, 32, allow);
-    const may = r.allow && (r.allow.stop_jobs || r.allow.replace) ? " [may stop jobs]" : "";
-    t.assistant((r.answer ?? "(no answer)") + may, false, r.turn_log || []);
+    let may = "";
+    if (r.allow && (r.allow.stop_jobs || r.allow.replace)) may += " [may stop jobs]";
+    if (r.allow && r.allow.delete_captures) may += " [may delete captures]";
+    t.assistant((r.answer ?? "(no answer)") + may, false, r.turn_log || [], r.calls || []);
     // The agent's page-only `view_set` calls are this tab's to apply, as if typed.
     for (const c of r.calls || []) {
       if (c.tool !== "view_set" || !c.ok || !c.arguments) continue;
@@ -689,18 +698,34 @@ async function askAgent(text, allowOverride = null) {
       const v = runViewCommand(state.view, ["set", String(key), String(value)]);
       t.note(v.text, v.error);
     }
-    if ((r.calls || []).some((c) => c.result && c.result.error === "not_allowed")) {
-      t.note("the agent was not allowed to stop or replace jobs", false, [
+    const refused = (r.calls || []).filter((c) => c.result && c.result.error === "not_allowed");
+    if (refused.length) {
+      // A refused `capture_delete` needs `delete_captures`; any other refusal is a stop or a
+      // replace. The retry re-sends this one request with the refused flags true on top of
+      // the switches; the session stays as it was (`allow stops|deletes on` are the switches).
+      const deletes = refused.some((c) => c.tool === "capture_delete");
+      const stopsRefused = refused.some((c) => c.tool !== "capture_delete");
+      const what = [stopsRefused && "stop or replace jobs", deletes && "delete captures"]
+        .filter(Boolean)
+        .join(" or ");
+      const label = [stopsRefused && "stops", deletes && "deletes"].filter(Boolean).join(" and ");
+      t.note(`the agent was not allowed to ${what}`, false, [
         {
-          label: "allow stops and ask again",
-          // This one request again with both flags true; the session stays as it was
-          // (`allow stops on` is the switch). The note's buttons disable on click.
-          run: () => askAgent(text, { stop_jobs: true, replace: true }),
+          label: `allow ${label} and ask again`,
+          // The note's buttons disable on click.
+          run: () =>
+            askAgent(text, {
+              stop_jobs: stopsRefused || allow.stop_jobs,
+              replace: stopsRefused || allow.replace,
+              delete_captures: deletes || !!allow.delete_captures,
+            }),
         },
       ]);
     }
   } catch (e) {
-    t.assistant(e.message, true);
+    // A failed run (502) still carries the transcript so far: show its turns.
+    const tr = e instanceof OpError && e.json && e.json.transcript;
+    t.assistant(e.message, true, (tr && tr.turn_log) || [], (tr && tr.calls) || []);
   }
   state.jobs?.refresh();
 }
@@ -731,11 +756,13 @@ async function runCommand(text) {
       return;
     }
   }
-  const allow = /^allow\s+stops\s+(on|off)$/.exec(text);
+  const allow = /^allow\s+(stops|deletes)\s+(on|off)$/.exec(text);
   if (allow) {
     state.transcript.user(text);
-    state.allowStops = allow[1] === "on";
-    state.transcript.note(`allow stops: ${allow[1]}`);
+    const on = allow[2] === "on";
+    if (allow[1] === "stops") state.allowStops = on;
+    else state.allowDeletes = on;
+    state.transcript.note(`allow ${allow[1]}: ${allow[2]}`);
     return;
   }
   // Exactly these words: "stop all jobs" and the like are requests for the agent.

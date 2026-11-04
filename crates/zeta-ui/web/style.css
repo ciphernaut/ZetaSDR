@@ -428,6 +428,9 @@ html[data-side="none"]:not([data-footprint="narrow"]) .pane-head {
 .line.assistant::before { content: "◆ "; }
 .line.note { color: var(--dim); font-style: italic; }
 .line.error { color: var(--error); }
+/* An /ask turn: its reasoning, content and calls wrap within the pane. */
+details.turn > summary { color: var(--dim); cursor: pointer; }
+details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px 0 4px 1.2em; }
 
 /* A job row, two lines and never wider than the column (spec 4.7):
      line 1  .kind (with its tags)  .state  ...........  .actions

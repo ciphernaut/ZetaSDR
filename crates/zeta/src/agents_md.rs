@@ -81,7 +81,7 @@ fn note(op: &str) -> Option<&'static str> {
             "Run the classifiers over the capture's whole window as `classify` does over the ring (the record's stored `allocations` take part): `{labels, tried, allocations}`. A `no_frame` does not prove the protocol absent. A window shorter than a row's `identify.min_span_ms` is `skipped_span`.",
         ),
         "capture_delete" => Some(
-            "Delete a capture and its files. A pinned capture is refused (`capture <id> is pinned`). Deleting is the operator's decision: through `ask` the run needs `allow.delete_captures` (`zeta ask --allow-delete`), else the call is refused as `not_allowed`: report that, do not retry. Never delete a capture the request did not name.",
+            "Delete a capture and its files. A pinned capture is refused (`capture <id> is pinned`). Deleting is the operator's decision: through `ask` the run needs `allow.delete_captures` (`zeta ask --allow-delete`; on the page, `allow deletes on`), else the call is refused as `not_allowed`: report that, do not retry. Never delete a capture the request did not name.",
         ),
         "source_unpin" => Some("Release the pin; the source idles if nothing else holds it."),
         "source_free" => Some(

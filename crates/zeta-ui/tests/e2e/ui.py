@@ -3800,6 +3800,12 @@ def scenario_allow_stops_toggle_is_noted(page, url, secret):
     run_cmd(page, "allow stops off")
     expect(page.locator("#transcript .line.note:not(.error)", has_text="allow stops: off")
            ).to_have_count(1)
+    run_cmd(page, "allow deletes on")
+    expect(page.locator("#transcript .line.note:not(.error)", has_text="allow deletes: on")
+           ).to_have_count(1)
+    run_cmd(page, "allow deletes off")
+    expect(page.locator("#transcript .line.note:not(.error)", has_text="allow deletes: off")
+           ).to_have_count(1)
 
 
 def scenario_duplicate_start_renders_the_job(page, url, secret):
@@ -3833,6 +3839,9 @@ def llm_url():
     return url.rstrip("/")
 
 
+NO_ALLOW = {"stop_jobs": False, "replace": False, "delete_captures": False}
+
+
 def capture_asks(page):
     """The JSON bodies of the page's POST /ask requests, appended as they are sent."""
     bodies = []
@@ -3850,7 +3859,7 @@ def scenario_ask_sends_32_turns_and_the_allowance(page, url, secret):
     expect(answer).to_have_count(1)
     assert len(asks) == 1, f"one /ask request: {asks}"
     assert asks[0]["max_turns"] == 32, asks[0]
-    assert asks[0]["allow"] == {"stop_jobs": False, "replace": False}, asks[0]
+    assert asks[0]["allow"] == NO_ALLOW, asks[0]
     expect(answer).not_to_contain_text("[may stop jobs]")
     turn = page.locator("#transcript details.turn", has_text="turn 1 (1 call)")
     expect(turn).to_have_count(1)
@@ -3865,6 +3874,11 @@ def scenario_not_allowed_shows_the_unlock_and_reruns_with_the_allowance(page, ur
     run_cmd(page, "stop the measure")
     expect(page.locator("#transcript .line.assistant",
                         has_text="I was not allowed to stop it.")).to_have_count(1)
+    # A turn with only a tool call (no reasoning or content: thinking off) still shows,
+    # with the call and its refusal.
+    turn = page.locator("#transcript details.turn", has_text="turn 1 (1 call)").first
+    expect(turn).to_contain_text("→ job_stop")
+    expect(turn).to_contain_text("error:")
     note = page.locator("#transcript .line.note",
                         has_text="the agent was not allowed to stop or replace jobs")
     expect(note).to_have_count(1)
@@ -3877,7 +3891,8 @@ def scenario_not_allowed_shows_the_unlock_and_reruns_with_the_allowance(page, ur
     assert asks[0]["allow"]["stop_jobs"] is False, asks[0]
     assert asks[1]["allow"]["stop_jobs"] is True, asks[1]
     assert asks[1]["request"] == "stop the measure", asks[1]
-    assert asks[1]["allow"] == {"stop_jobs": True, "replace": True}, asks[1]
+    assert asks[1]["allow"] == {"stop_jobs": True, "replace": True, "delete_captures": False}, \
+        asks[1]
     # The note's button disables once clicked, and the unlock was for that request only:
     # the session's `allow stops` switch is still off for the next plain ask.
     expect(button).to_be_disabled()
@@ -3886,7 +3901,35 @@ def scenario_not_allowed_shows_the_unlock_and_reruns_with_the_allowance(page, ur
     expect(answer).to_have_count(1)
     expect(answer).not_to_contain_text("[may stop jobs]")
     assert len(asks) == 3, f"three /ask requests: {asks}"
-    assert asks[2]["allow"] == {"stop_jobs": False, "replace": False}, asks[2]
+    assert asks[2]["allow"] == NO_ALLOW, asks[2]
+
+
+def scenario_not_allowed_delete_offers_the_delete_unlock(page, url, secret):
+    url = llm_url()
+    select_source(page, url, secret, "cb")
+    asks = capture_asks(page)
+    run_cmd(page, "delete the capture")
+    expect(page.locator("#transcript .line.assistant",
+                        has_text="I was not allowed to delete it.")).to_have_count(1)
+    note = page.locator("#transcript .line.note",
+                        has_text="the agent was not allowed to delete captures")
+    expect(note).to_have_count(1)
+    button = note.get_by_role("button", name="allow deletes and ask again")
+    expect(button).to_have_count(1)
+    button.click()
+    expect(page.locator("#transcript .line.assistant", has_text="[may delete captures]")
+           ).to_have_count(1)
+    assert len(asks) == 2, f"two /ask requests: {asks}"
+    assert asks[0]["allow"] == NO_ALLOW, asks[0]
+    assert asks[1]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True}, \
+        asks[1]
+    # The switch: every following ask carries delete_captures until turned off.
+    run_cmd(page, "allow deletes on")
+    run_cmd(page, "think")
+    expect(page.locator("#transcript .line.assistant", has_text="one source")).to_have_count(1)
+    assert len(asks) == 3, f"three /ask requests: {asks}"
+    assert asks[2]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True}, \
+        asks[2]
 
 
 def scenario_ask_switches_the_theme_with_a_job_running(page, url, secret):

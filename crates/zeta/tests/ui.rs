@@ -554,8 +554,8 @@ fn fake_themes(dir: &Path) -> PathBuf {
 }
 
 /// The fake model's scripts, in `zeta-fake-llm --scripts` form, keyed by a substring of the
-/// request: a refused stop, a fan-out through `plan_start`, a page-only `view_set`, and a
-/// turn with reasoning and content.
+/// request: a refused stop, a refused capture delete, a fan-out through `plan_start`, a
+/// page-only `view_set`, and a turn with reasoning and content.
 fn fake_llm_scripts() -> serde_json::Value {
     use serde_json::json;
     use zeta_agent::fake::{text_response, tool_call_response, tool_call_response_with};
@@ -572,6 +572,10 @@ fn fake_llm_scripts() -> serde_json::Value {
             tool_call_response(&[("source_list", json!({}))]),
             tool_call_response(&[("plan_start", plan_start)]),
             text_response("Started 2 channels.", "stop"),
+        ]},
+        {"match": "delete the capture", "replies": [
+            tool_call_response(&[("capture_delete", json!({"capture": "01NOPE"}))]),
+            text_response("I was not allowed to delete it.", "stop"),
         ]},
         {"match": "stop all jobs", "replies": [
             tool_call_response(&[("jobs_stop", json!({"source": null, "kind": null, "plan": null}))]),
