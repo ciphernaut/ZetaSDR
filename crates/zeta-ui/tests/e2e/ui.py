@@ -3888,6 +3888,29 @@ def scenario_not_allowed_shows_the_unlock_and_reruns_with_the_allowance(page, ur
     assert asks[2]["allow"] == {"stop_jobs": False, "replace": False}, asks[2]
 
 
+def scenario_ask_switches_the_theme_with_a_job_running(page, url, secret):
+    url = llm_url()
+    select_source(page, url, secret, "cb")
+    # A running job on the source must not stand in the way of a view setting.
+    job = start_job(url, secret, "measure", "cb", 476_900_000, 10_000)
+    try:
+        page.wait_for_function(
+            "() => document.documentElement.dataset.theme === 'console'", timeout=5_000)
+        asks = capture_asks(page)
+        run_cmd(page, "switch to the plain theme")
+        expect(page.locator("#transcript .line.assistant", has_text="Switched to plain.")
+               ).to_have_count(1)
+        page.wait_for_function(
+            "() => document.documentElement.dataset.theme === 'plain'", timeout=5_000)
+        expect(page.locator('html[data-theme="plain"]')).to_have_count(1)
+        expect(view_line(page, "theme = plain")).to_be_visible()
+        assert len(asks) == 1, f"one /ask request: {asks}"
+        assert asks[0]["page_tools"] is True, asks[0]
+        assert job_record(url, secret, job)["state"]["status"] == "running", "the job kept running"
+    finally:
+        stop_job(url, secret, job)
+
+
 def scenario_ask_fans_out_through_plan_start(page, url, secret):
     url = llm_url()
     select_source(page, url, secret, "cb")

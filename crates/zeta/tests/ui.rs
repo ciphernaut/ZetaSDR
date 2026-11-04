@@ -554,8 +554,8 @@ fn fake_themes(dir: &Path) -> PathBuf {
 }
 
 /// The fake model's scripts, in `zeta-fake-llm --scripts` form, keyed by a substring of the
-/// request: a refused stop, a fan-out through `plan_start`, and a turn with reasoning and
-/// content.
+/// request: a refused stop, a fan-out through `plan_start`, a page-only `view_set`, and a
+/// turn with reasoning and content.
 fn fake_llm_scripts() -> serde_json::Value {
     use serde_json::json;
     use zeta_agent::fake::{text_response, tool_call_response, tool_call_response_with};
@@ -576,6 +576,10 @@ fn fake_llm_scripts() -> serde_json::Value {
         {"match": "stop all jobs", "replies": [
             tool_call_response(&[("jobs_stop", json!({"source": null, "kind": null, "plan": null}))]),
             text_response("Stopped them.", "stop"),
+        ]},
+        {"match": "switch to the plain theme", "replies": [
+            tool_call_response(&[("view_set", json!({"key": "theme", "value": "plain"}))]),
+            text_response("Switched to plain.", "stop"),
         ]},
         {"match": "think", "replies": [
             tool_call_response_with(

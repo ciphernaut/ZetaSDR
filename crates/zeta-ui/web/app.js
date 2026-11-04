@@ -676,6 +676,13 @@ async function askAgent(text, allowOverride = null) {
     const r = await state.api.ask(text, 32, allow);
     const may = r.allow && (r.allow.stop_jobs || r.allow.replace) ? " [may stop jobs]" : "";
     t.assistant((r.answer ?? "(no answer)") + may, false, r.turn_log || []);
+    // The agent's page-only `view_set` calls are this tab's to apply, as if typed.
+    for (const c of r.calls || []) {
+      if (c.tool !== "view_set" || !c.ok || !c.arguments) continue;
+      const { key, value } = c.arguments;
+      const v = runViewCommand(state.view, ["set", String(key), String(value)]);
+      t.note(v.text, v.error);
+    }
     if ((r.calls || []).some((c) => c.result && c.result.error === "not_allowed")) {
       t.note("the agent was not allowed to stop or replace jobs", false, [
         {
