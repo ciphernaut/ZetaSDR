@@ -1,0 +1,13 @@
+title = "ZetaSDR gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "documented placeholders and test fixtures"
+paths = [
+  '''(^|/)s3cret''',
+]
+regexes = [
+  '''ui-secret-0123456789''',
+]

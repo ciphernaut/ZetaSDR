@@ -1,0 +1,4 @@
+# Allowlist for the built-in coordinate and local-host checks of public-check.sh.
+# One entry per line: PATH-GLOB:EXTENDED-REGEX. A hit on a line of a file whose
+# path matches PATH-GLOB is dropped when the regex matches the line.
+# Entries are added with the demo station and synthesised test values (Task 3).
