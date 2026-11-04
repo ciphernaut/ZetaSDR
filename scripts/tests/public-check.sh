@@ -101,6 +101,18 @@ local_host_with_port_fails() {
   pass local_host_with_port_fails
 }
 
+# A host name in capitals is the same host: the check ignores case.
+local_host_in_capitals_fails() {
+  local d
+  d=$(repo lhostcaps)
+  echo "curl $lhost/x" | tr '[:lower:]' '[:upper:]' >"$d/a.md"
+  track "$d"
+  run "$d"
+  [ $rc -eq 1 ] || fail local_host_in_capitals_fails "rc=$rc $out"
+  case $out in *"a.md:1: local-host"*) ;; *) fail local_host_in_capitals_fails "$out" ;; esac
+  pass local_host_in_capitals_fails
+}
+
 # The real repository's allowlist excuses kiwisdr.local; a tree without its own allowlist
 # has none, so the same line fails there.
 allowlist_is_the_scanned_trees_own() {
@@ -200,6 +212,7 @@ message_omits_pattern
 bad_denylist_regex_fails
 coordinates_fail_unless_allowed
 local_host_with_port_fails
+local_host_in_capitals_fails
 allowlist_is_the_scanned_trees_own
 example_host_entry_is_anchored
 svg_and_binary_are_scanned

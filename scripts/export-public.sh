@@ -35,7 +35,8 @@
 # PUBLIC_DATE               release date YYYY-MM-DD for the tag (and the --squash commit)
 #                           (default today, UTC)
 # CARGO_TARGET_DIR          build output for the cargo gates (default $CLAUDE_JOB_DIR/target,
-#                           else the source checkout's target/); never inside DEST
+#                           else $XDG_CACHE_HOME/zetasdr/export-target, never the source
+#                           checkout); never inside DEST
 # EXPORT_SKIP_CARGO=1       skip the cargo gates (the script's own tests); listed as skipped
 set -euo pipefail
 
@@ -47,7 +48,8 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # of DEST. None of it is used.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
   GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX \
-  GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CEILING_DIRECTORIES
+  GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CEILING_DIRECTORIES \
+  GIT_SHALLOW_FILE GIT_GRAFT_FILE GIT_REPLACE_REF_BASE GIT_NO_REPLACE_OBJECTS
 
 die() {
   echo "export: $*" >&2
@@ -153,6 +155,12 @@ assert_dest_repo() {
   g=$(qgit rev-parse --absolute-git-dir 2>/dev/null) || gate_failed "dest-repo (no repository in DEST)"
   [ "$(realpath -- "$g")" = "$(realpath -- "$dest/.git")" ] ||
     gate_failed "dest-repo (git would act on another repository)"
+  # The object store too: GIT_OBJECT_DIRECTORY (or a config) could point it elsewhere.
+  g=$(qgit rev-parse --git-path objects 2>/dev/null) || gate_failed "dest-repo (no object store)"
+  case $(cd "$dest" && realpath -m -- "$g")/ in
+  "$(realpath -- "$dest/.git")"/*) ;;
+  *) gate_failed "dest-repo (the object store lies outside DEST/.git)" ;;
+  esac
   [ ! -e "$dest/.git/objects/info/alternates" ] || gate_failed "alternates (DEST borrows objects)"
 }
 
@@ -420,7 +428,7 @@ PY
     [ "$s" -le 1 ] || gate_failed "history (grep status $s)"
   }
   coord_re='-?[0-9]{1,3}\.[0-9]{4,}, ?-?[0-9]{1,3}\.[0-9]{4,}'
-  host_re='[a-z0-9-]+\.local:[0-9]+'
+  host_re='[A-Za-z0-9-]+\.[Ll][Oo][Cc][Aa][Ll]:[0-9]+'
   # (each grep writes a file first: a failure inside a process substitution
   # would not end the gate)
   if [ -s "$tmp/deny" ]; then
@@ -543,7 +551,7 @@ else
   elif [ -n "${CLAUDE_JOB_DIR:-}" ]; then
     target=$CLAUDE_JOB_DIR/target
   else
-    target=$srcp/target
+    target=${XDG_CACHE_HOME:-$HOME/.cache}/zetasdr/export-target
   fi
   mkdir -p "$target"
   target=$(cd "$target" && pwd -P)

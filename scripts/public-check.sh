@@ -78,7 +78,8 @@ if [ -f "$root/scripts/public-allow.txt" ]; then
 fi
 
 coord_re='-?[0-9]{1,3}\.[0-9]{4,}, ?-?[0-9]{1,3}\.[0-9]{4,}'
-host_re='[a-z0-9-]+\.local:[0-9]+'
+# Case-insensitive: a host name in capitals is the same host.
+host_re='[A-Za-z0-9-]+\.[Ll][Oo][Cc][Aa][Ll]:[0-9]+'
 
 : >"$tmp/hits"
 

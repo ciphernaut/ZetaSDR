@@ -460,6 +460,23 @@ inherited_git_dir_is_ignored() {
   pass inherited_git_dir_is_ignored
 }
 
+# Grafts, a shallow file and replace refs inherited from the caller change which
+# history git sees: none of them is honoured, so DEST keeps every commit.
+inherited_grafts_are_ignored() {
+  local d o tip n
+  d=$(history_fixture grafts)
+  tip=$(git -C "$d" rev-parse HEAD)
+  n=$(git -C "$d" rev-list --count HEAD)
+  echo "$tip" >"$base/graft-file"
+  o="$base/grafts-out"
+  run "$d" "$o" GIT_GRAFT_FILE="$base/graft-file" GIT_SHALLOW_FILE="$base/graft-file" \
+    GIT_REPLACE_REF_BASE=refs/elsewhere/ GIT_NO_REPLACE_OBJECTS=1
+  [ $rc -eq 0 ] || fail inherited_grafts_are_ignored "rc=$rc $out"
+  [ "$(git -C "$o" rev-list --count HEAD)" = "$n" ] ||
+    fail inherited_grafts_are_ignored "$(git -C "$o" rev-list --count HEAD) of $n commits"
+  pass inherited_grafts_are_ignored
+}
+
 # DEST/.git holds nothing private outside its objects: no machine identity in a
 # reflog, no remote-tracking refs or their logs.
 dest_metadata_is_clean() {
@@ -654,6 +671,7 @@ history_unreplaced_leak_fails
 history_tip_tree_matches_source
 source_repo_untouched
 inherited_git_dir_is_ignored
+inherited_grafts_are_ignored
 dest_metadata_is_clean
 metadata_gate_fails
 no_alternates
