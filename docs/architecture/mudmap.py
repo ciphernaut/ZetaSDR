@@ -14,7 +14,7 @@ import html, pathlib, sys
 HERE = pathlib.Path(__file__).parent
 AS_OF = "2026-11-04 (plan26-zeta)"
 FONT = "Inter, 'Segoe UI', Helvetica, Arial, sans-serif"
-W, H = 1440, 700
+W, H = 1440, 784
 WHERE = {
     "LOCAL": "#0f766e",   # must run on the node's host
     "REMOTE": "#1d4ed8",  # runs on another host
@@ -118,7 +118,7 @@ box(NX0, NY0, NX1 - NX0, NY1 - NY0, "zeta serve: the node",
 kids = [
     (400, "zeta soapy-worker", "One child per --source-soapy ID=ARGS, spawned and respawned by the node; a driver crash faults the source, not the node.", "LOCAL"),
     (598, "Programs, plugins", "dump1090, rs41mod / dfm09mod / m20mod (handler report at startup); --plugin KIND=PATH (any language, sdk/python). stdio, cleared env.", "LOCAL"),
-    (796, "Speech daemon", "local-voice (voiced) on the GPU: --stt-socket PATH (a Unix socket, so this host). Or --stt-node URL: another node's POST /stt does it.", "EITHER"),
+    (796, "Speech daemon", "local-voice (voiced) on this host's GPU, reached over a Unix socket: --stt-socket PATH. The alternative, another node's /stt, is on the right.", "LOCAL"),
 ]
 KY, KH, KW = 346, 116, 194
 for x, t, b, w in kids:
@@ -152,16 +152,18 @@ text(1104, 376, "HTTPS PUT", size=10, anchor="end")
 line([(CL_X, 510), (10, 510), (10, 112), (RX + RW / 2, 112), (RX + RW / 2, 128)], dash=True)
 text(700, 108, "zeta ask: its own HTTP chat + tools to the LLM (--llm-url), wherever it runs", size=10, anchor="middle", italic=True)
 
-text(RX, 436, "REMOTE RADIOS (IQ in, tune out)", size=10.5, bold=True, op=0.7)
+box(RX, 420, RW, 80, "Speech on another node", "HTTP POST /stt to that node: --stt-node URL (secret ZETA_STT_NODE_SECRET); exclusive with --stt-socket.", "REMOTE")
+line([(NX1, 286), (RX, 460)])
+text(RX, 520, "REMOTE RADIOS (IQ in, tune out)", size=10.5, bold=True, op=0.7)
 radios = [
-    (446, 70, "KiwiSDR", "--source-kiwi ID=HOST:PORT: websocket over the internet; 0-30 MHz, 12 kHz, limited slots.", "REMOTE"),
-    (526, 80, "Another ZetaSDR node", "--source-node ID=SRC@URL (secret ZETA_NODE_SECRET_<ID>): HTTP + ws, IQ as VRT; 250 kHz unless widened. A Pi at the antenna.", "REMOTE"),
-    (616, 62, "VRT sender", "--source-vrt ID=udp://ADDR:PORT: VITA 49.2 over UDP, a LAN address.", "REMOTE"),
+    (530, 70, "KiwiSDR", "--source-kiwi ID=HOST:PORT: websocket over the internet; 0-30 MHz, 12 kHz, limited slots.", "REMOTE"),
+    (610, 80, "Another ZetaSDR node", "--source-node ID=SRC@URL (secret ZETA_NODE_SECRET_<ID>): HTTP + ws, IQ as VRT; 250 kHz unless widened. A Pi at the antenna.", "REMOTE"),
+    (700, 62, "VRT sender", "--source-vrt ID=udp://ADDR:PORT: VITA 49.2 over UDP, a LAN address.", "REMOTE"),
 ]
 for y, h, t, b, w in radios:
     box(RX, y, RW, h, t, b, w)
-    line([(NX1, 290), (RX, y + h / 2)], both=True)
-text(1420, 694, "To use a USB radio on another host, run a node there and attach it with --source-node.", size=10, anchor="end", italic=True, op=0.8)
+    line([(NX1, 292), (RX, y + h / 2)], both=True)
+text(1420, 778, "To use a USB radio on another host, run a node there and attach it with --source-node.", size=10, anchor="end", italic=True, op=0.8)
 
 svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
        f'aria-label="ZetaSDR mudmap: clients on the left reach one node over HTTP; on the node\'s host sit the Soapy worker and USB radios, decoder programs, plugins and the speech daemon; to the right the LLM, the ACMA register, SondeHub and the remote radios." '
