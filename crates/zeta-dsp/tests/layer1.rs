@@ -282,3 +282,41 @@ fn a_real_ook_remote_labels_ook() {
         assert_eq!(l.name, "ook", "{name}: {l:?}");
     }
 }
+
+/// Three HackRF windows of one press of two buttons (62 500 Hz, 20-34 dB SNR, the
+/// remote about 1.9 kHz over the capture centre): 431 ms, 71 ms and 471 ms, each a
+/// train of whole frames. On the node they measured as bursts (duty 0.076, 1.0 and
+/// 0.011), the first two at the 800 bit/s bit rate from the cyclostationary line and
+/// unknown, the third `fsk` with no rate.
+const OOK_SPARSE_REMOTES: [&str; 3] = [
+    "ook-remote-hackrf-sparse-1",
+    "ook-remote-hackrf-sparse-2",
+    "ook-remote-hackrf-sparse-3",
+];
+
+/// Every sparse window, the 71 ms one too (under two frames, 90-odd on and off runs
+/// of a few chips each, enough for the fit), measures the chip rate, never the
+/// remote's 800 bit/s bit rate.
+#[test]
+fn a_sparse_ook_remote_window_measures_its_chip_rate() {
+    for name in OOK_SPARSE_REMOTES {
+        let (f, _) = ook_remote(name);
+        let baud = f.symbol_rate_baud.map(|b| b.0 as f64);
+        assert!(
+            baud.is_some_and(
+                |b| (b - OOK_REMOTE_BAUD).abs() <= OOK_REMOTE_BAUD * OOK_REMOTE_BAUD_TOLERANCE
+            ),
+            "{name}: {f:?}"
+        );
+    }
+}
+
+/// Every sparse window labels `ook`: no FSK tones from the noise of its off samples.
+#[test]
+fn a_sparse_ook_remote_window_labels_ook() {
+    for name in OOK_SPARSE_REMOTES {
+        let (f, l) = ook_remote(name);
+        assert_eq!(l.name, "ook", "{name}: {f:?} {l:?}");
+        assert_eq!(f.tone_spacing_hz, None, "{name}: {f:?}");
+    }
+}

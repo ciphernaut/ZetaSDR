@@ -479,17 +479,25 @@ pub(crate) fn measure_band_noted(
         .saturating_add(offset.round() as i64)
         .max(0);
     let bandwidth_hz = (bins * bin_hz).round().max(bin_hz.round()) as u64;
-    let rate = rate_of(&v, rate_hz, (offset, bandwidth_hz));
+    let rate = rate_of(&v, full, rate_hz, (offset, bandwidth_hz));
     // FSK order and spacing from the instantaneous-frequency clusters, else the
-    // two-peak rule on the measured spectrum; PSK order only without tones.
+    // two-peak rule on the measured spectrum; PSK order only without tones. Neither
+    // for a chip rate read from on-off keying's runs: that fit found two envelope
+    // levels and no tones in the band it fitted, and the measured band of a weak
+    // keyed signal is mostly noise, whose instantaneous frequency reads as tones.
     let snr_db = db[peak] - floor;
-    let fsk = fsk_clusters(&v.runs, rate_hz, (offset, bandwidth_hz)).or_else(|| {
-        let (a, b) = (lo - first, hi - first);
-        tone_pair(db, (a, b), floor + OCCUPIED_DB, bin_hz, true)
-            .map(|(a, b)| (2, Hz((b - a).round() as u64)))
-    });
+    let keyed = rate.is_some_and(|(_, line)| line == RUNS_LINE);
+    let fsk = (!keyed)
+        .then(|| {
+            fsk_clusters(&v.runs, rate_hz, (offset, bandwidth_hz)).or_else(|| {
+                let (a, b) = (lo - first, hi - first);
+                tone_pair(db, (a, b), floor + OCCUPIED_DB, bin_hz, true)
+                    .map(|(a, b)| (2, Hz((b - a).round() as u64)))
+            })
+        })
+        .flatten();
     let psk = match (fsk, rate) {
-        (None, Some(_)) => psk_order(&v.runs, rate_hz, (offset, bandwidth_hz)),
+        (None, Some(_)) if !keyed => psk_order(&v.runs, rate_hz, (offset, bandwidth_hz)),
         _ => None,
     };
     let b = &v.bursts;
@@ -518,13 +526,17 @@ pub(crate) fn measure_band_noted(
 /// the envelope moves (`cv` at least `FM_MAX_CV`): the on-off keying's chip
 /// rate from its run lengths ([`ook_unit_rate`], `"runs"`) when the envelope
 /// sits at two levels, it shows no FSK tones and its runs are whole multiples of
-/// one unit, else
+/// one unit, over the rate samples and, when gated, over the whole window `full`
+/// (the gate cuts its runs from the window's power, whole-band: a weak keyed
+/// signal's loudest chunks gate as bursts a millisecond long, and the keying's off
+/// runs lie between them), else
 /// [`cyclo_symbol_rate`] of the occupied band `offset_hz ± bandwidth_hz / 2`
 /// (from the block centre, band-passed per run), up to its width
 /// (`"cyclo"`); else, or when neither finds one, the [`symbol_rate`] keying
 /// line (`"keying"`).
 fn rate_of(
     v: &View,
+    full: &[Complex<f32>],
     rate_hz: u64,
     (offset_hz, bandwidth_hz): (f64, u64),
 ) -> Option<(Baud, &'static str)> {
@@ -537,14 +549,24 @@ fn rate_of(
             .collect();
         cyclo_symbol_rate(&runs, rate_hz, bw)
     };
+    let runs = || {
+        ook_unit_rate(&v.runs, rate_hz, (offset_hz, bandwidth_hz)).or_else(|| {
+            v.gated
+                .then(|| ook_unit_rate(&[full], rate_hz, (offset_hz, bandwidth_hz)))
+                .flatten()
+        })
+    };
     let moves = v.cv >= FM_MAX_CV;
     moves
-        .then(|| ook_unit_rate(&v.runs, rate_hz, (offset_hz, bandwidth_hz)))
+        .then(runs)
         .flatten()
-        .map(|r| (r, "runs"))
+        .map(|r| (r, RUNS_LINE))
         .or_else(|| moves.then(cyclo).flatten().map(|r| (r, "cyclo")))
         .or_else(|| symbol_rate(&v.runs, rate_hz, v.cv, bandwidth_hz).map(|r| (r, "keying")))
 }
+
+/// The [`RateNote::line`] of a chip rate read from on-off keying's run lengths.
+const RUNS_LINE: &str = "runs";
 
 /// How layer 1 measured a record's symbol rate, for its label's evidence.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -582,45 +604,49 @@ fn tone_pair(
 /// Conservative layer-1 label for a measured block. Rules, first match wins:
 ///
 /// 1. `"noise"` (0.5) when `snr_db < 6`.
-/// 2. `"fsk"` (0.6) when the record carries an FSK `order` and
+/// 2. `"ook"` (0.6) when the record's symbol rate is on-off keying's chip from its run
+///    lengths (the evidence's `(runs)`: two envelope levels, the lower off, no FSK
+///    tones and runs of whole chips in the band it was fitted in; [`measure_band_masked`])
+///    and it carries no order. Only [`layer1_label_noted`] knows the line.
+/// 3. `"fsk"` (0.6) when the record carries an FSK `order` and
 ///    `tone_spacing_hz` ([`measure_band_masked`]), or the power spectrum has
 ///    exactly two dominant peaks inside the occupied band 500–3000 Hz apart
 ///    and within 6 dB of each other, or, for a constant-envelope signal (CV
 ///    below 0.2) with a keying line, when its discriminator audio does (AFSK
 ///    on FM).
-/// 3. `"ook"` (0.6) when the envelope CV is at least 0.25, the record has a
+/// 4. `"ook"` (0.6) when the envelope CV is at least 0.25, the record has a
 ///    symbol rate and no PSK order, and over the burst runs
 ///    ([`order::envelope_runs`]: the gaps between bursts are not an off
 ///    level) the envelope CV is still at least 0.25 and the envelope sits at
 ///    two levels, the lower one off ([`order::two_levels`]).
-/// 4. `"wfm"` (0.9) when the occupied band is 40–250 kHz and
+/// 5. `"wfm"` (0.9) when the occupied band is 40–250 kHz and
 ///    [`pilot_line_db`] finds a 19 kHz pilot at least 10 dB above its
 ///    region, with no envelope or deviation gate (multipath and noise ripple
 ///    a real station's envelope; the pilot is the stronger evidence).
 ///    Otherwise `"wfm"` (0.6) when the occupied band is 60–250 kHz, the
 ///    envelope CV is below 0.45 and the discriminator audio deviates by more
 ///    than 5 kHz RMS.
-/// 5. `"psk"` (0.6) when the record carries a PSK `order` (no tone spacing)
+/// 6. `"psk"` (0.6) when the record carries a PSK `order` (no tone spacing)
 ///    and a symbol rate. It precedes `am`: the carrier-line test of `am`
 ///    reads a narrow PSK main lobe as a carrier (15.9 dB on 2400 Bd BPSK),
 ///    while the PSK order requires no line in `x` itself.
-/// 6. `"am"` (0.6) when a carrier line sits at the block centre (the
+/// 7. `"am"` (0.6) when a carrier line sits at the block centre (the
 ///    strongest of the centre bin and its two neighbours at least 6 dB above
 ///    the mean power of the bins 1–5 kHz either side) and the envelope CV is
 ///    at least 0.25.
-/// 7. `"ssb"` (0.6) when there is no such centre line, the envelope CV is at
+/// 8. `"ssb"` (0.6) when there is no such centre line, the envelope CV is at
 ///    least 0.25, the occupied band is 1.5–4 kHz and at least 80 % of its
 ///    power lies on one side of centre; the evidence names `usb` (above) or
 ///    `lsb` (below) and the dial frequency [`ssb_dial_hz`] gives.
-/// 8. `"am"` (0.6) for low-index AM: the same centre line, an envelope CV
+/// 9. `"am"` (0.6) for low-index AM: the same centre line, an envelope CV
 ///    of at least 0.1 both whole-band and within half the occupied band (so
 ///    wideband noise on a bare carrier does not pass), and an RMS phase
 ///    deviation of the discriminator audio (radians per sample, band-limited
 ///    as for `fm`) below the CV, so the envelope moves more than the phase.
-/// 9. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
-///    25 kHz and the discriminator audio deviates by more than 100 Hz RMS;
-///    `"carrier"` (0.7) under the same gate when it does not.
-/// 10. Otherwise `"unknown"` (0.5).
+/// 10. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
+///     25 kHz and the discriminator audio deviates by more than 100 Hz RMS;
+///     `"carrier"` (0.7) under the same gate when it does not.
+/// 11. Otherwise `"unknown"` (0.5).
 pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Label {
     layer1_label_noted(f, None, iq, rate_hz)
 }
@@ -636,7 +662,8 @@ pub(crate) fn layer1_label_noted(
     rate_hz: u64,
 ) -> Label {
     let cv = envelope_cv(iq);
-    let (name, confidence, reason) = classify_block(f, iq, rate_hz, cv);
+    let runs = note.is_some_and(|n| n.line == Some(RUNS_LINE));
+    let (name, confidence, reason) = classify_block(f, iq, rate_hz, cv, runs);
     let baud = f.symbol_rate_baud.map_or_else(
         || "none".to_string(),
         |b| match note.and_then(|n| n.line) {
@@ -762,14 +789,24 @@ pub fn ssb_dial_hz(center_hz: u64, usb: bool) -> u64 {
     }
 }
 
+/// [`layer1_label`]'s rules over `f` and its block `iq`; `runs` when `f`'s symbol rate
+/// is on-off keying's chip from its run lengths ([`RUNS_LINE`]).
 fn classify_block(
     f: &FeatureRecord,
     iq: &[Complex<f32>],
     rate_hz: u64,
     cv: f32,
+    runs: bool,
 ) -> (&'static str, f32, String) {
     if f.snr_db < NOISE_SNR_DB || iq.is_empty() || rate_hz == 0 {
         return ("noise", 0.5, format!("snr below {NOISE_SNR_DB} dB"));
+    }
+    if runs && f.order.is_none() && f.symbol_rate_baud.is_some() {
+        return (
+            "ook",
+            0.6,
+            "two envelope levels whose on and off runs are whole chips".into(),
+        );
     }
     let bin_hz = rate_hz as f64 / SIZE as f64;
     let db = spectrum(iq);
