@@ -684,6 +684,10 @@ fn ui_scenarios_pass_in_headless_chromium() {
     let themes = themes.to_str().expect("themes path is UTF-8");
     let fake_lines = repo_root().join("crates/zeta-ext/tests/fake_lines");
     let fake_lines = fake_lines.to_str().expect("fake_lines path is UTF-8");
+    // adsb_decode's program pinned to the test stand-in, so the mode is ready whether or
+    // not the host has dump1090 (a CI runner has none; the ADS-B width scenario needs it).
+    let fake_dump1090 = repo_root().join("crates/zeta-ext/tests/fake_dump1090");
+    let fake_dump1090 = fake_dump1090.to_str().expect("fake_dump1090 path is UTF-8");
     let serve = ServeProc::start_full(
         dir.path(),
         SECRET,
@@ -714,6 +718,7 @@ fn ui_scenarios_pass_in_headless_chromium() {
         &["--stt-socket", sock],
         &[
             ("ZETA_HANDLER_FAKE_LINES", fake_lines),
+            ("ZETA_HANDLER_DUMP1090", fake_dump1090),
             ("ZETA_PLUGIN_ENV_FAKE_LINES", FAKE_POS_LINES),
             ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", FAKE_POS_AFTER_BYTES),
         ],
