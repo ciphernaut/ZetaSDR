@@ -396,6 +396,9 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 }
 .pane-head .count { margin-inline-start: auto; font-variant-numeric: tabular-nums; }
 .pane-head .count:empty { display: none; }
+/* A pane's own buttons under its header (the Jobs pane's Clear all, app.js armClearAll). */
+.pane-tools { display: flex; justify-content: flex-end; gap: 4px; padding: 2px 8px; }
+.pane-tools button { font-size: 11px; }
 /* Folded: the header bar only; the other pane takes the column. Wide footprint only: the
    narrow drawer keeps both panes and its headers do not fold. */
 html:not([data-footprint="narrow"]) section.pane[data-collapsed] > :not(h2) { display: none; }
@@ -665,6 +668,8 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 #explore td { max-width: 18em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 8px 1px 4px; }
 #explore td button { margin-right: 4px; font-size: 11px; }
 #explore td.actions { max-width: none; overflow: visible; }
+#explore .explore-tools { display: flex; justify-content: flex-end; gap: 4px; padding: 2px 8px; }
+#explore .explore-tools button { font-size: 11px; }
 #explore td input.bits-rate { width: 5.5em; margin-right: 4px; font-size: 11px; }
 
 /* The Bits pane (bits.js). */
