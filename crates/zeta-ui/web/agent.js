@@ -61,8 +61,7 @@
 //       reads `<kind> elastic` and has only Stop. The row of the page's own automatic scan
 //       (the id in sessionStorage[AUTO_SCAN_KEY], coarse.js) reads `scan auto`; a scan the
 //       page did not start reads `scan`. Each row shows kind, source,
-//       state, id, an `.events` cell (filled by overlays.js: a count, or `—` over its
-//       watch cap), on rows of an AUDIO_KINDS kind a
+//       state, id, an `.events` cell (filled by overlays.js: a count of the job's events seen on its source's feed), on rows of an AUDIO_KINDS kind a
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job) and, while
 //       running, a `button.transcribe` (Transcribe) calling onTranscribe(job) (ruling R14), a
 //       `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
