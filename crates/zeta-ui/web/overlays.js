@@ -3,7 +3,7 @@
 // squelch tags.
 //
 // Exports:
-//   mountOverlays(el, wf, api, {jobsEl, plan, applyOp, footprint}) -> Overlays
+//   mountOverlays(el, wf, api, {jobsEl, plan, applyOp, footprint, notice}) -> Overlays
 //       Adds a pointer-transparent layer over the waterfall canvas inside `el` (the
 //       #waterfall element `wf` was mounted in). `jobsEl` (default #jobs) holds the job rows
 //       agent.js renders; their `.events` cell carries the counters. `plan` (default `auto`)
@@ -15,7 +15,8 @@
 //       footprint's outlines can be dragged. `onOutlineMenu(job, x, y)` is called with a
 //       retunable outline's job and a client point: by `contextmenu` on the outline (wide), or
 //       by a LONG_PRESS_MS press on its `.job-tag` in the narrow footprint (cancelled by
-//       pointerup/pointercancel or a move over LONG_PRESS_MOVE_PX).
+//       pointerup/pointercancel or a move over LONG_PRESS_MOVE_PX). `notice(text)` puts an
+//       error line in the transcript (app.js: the shown source has no feed).
 //   Job tags: each running rigid job's outline holds a `.job-tag[data-job]` (ov.tag/untag):
 //       `.kind`, `.short` (the last 6 characters of the id), a `.dot.open|closed` (only for a
 //       SQUELCH_KINDS job with a known squelch state; refreshed wherever the squelch is
@@ -52,8 +53,10 @@
 //   Overlays:
 //     ov.syncOutlines(jobs, source)  the outline half of ov.sync alone (app.js calls it after
 //                            each `source_list` poll, so a pin shows without waiting for jobs)
-//     ov.setSource(id)       the selected source: changing it drops every watch, label,
-//                            ribbon and outline (they belong to the previous source's band)
+//     ov.setSource(id)       the selected source: changing it closes the old source's feed,
+//                            drops every counter, squelch gate, label, ribbon and outline
+//                            (they belong to the previous source's band) and opens the new
+//                            source's feed (below)
 //     ov.sync(jobs, source)  a `job_list` result (from the 2 s poll) and the selected
 //                            source's `source_list` record: outlines (ov.outline,
 //                            key = job id, text = kind) the tuning of every running rigid job
@@ -62,20 +65,32 @@
 //                            `pin` (key "pin", text "pin"; plan 12 spec 4.1), and unoutlines
 //                            the rest; with none the capture itself (wf.band, key
 //                            "capture", text "capture"; not in scan mode) is outlined,
-//                            following the band as it changes. Then watchJob for the
-//                            MAX_WATCHED most recent (created_ns) running jobs on the
-//                            selected source, those of agent.js SQUELCH_KINDS (fm/am
-//                            rows, squelch tag only) only in slots no other job takes,
-//                            unwatch the rest, refresh the job-row counters
-//                            (`—`, tooltip "not watched (limit 4)", on the rows over the cap;
-//                            each watch holds one of the node's `max_ws` sockets). `spectrum` jobs are skipped: their events
-//                            are the waterfall's and are ignored here anyway. Event streams
-//                            of jobs not yet watched are resolved with one GET /streams per
-//                            poll; a job whose streams are listed but none is an `event`
-//                            stream (e.g. `wfm_demod`) goes in `noEventStream` (job id ->
-//                            graph JSON) and is not looked up again until it leaves the
-//                            running list or its graph changes. An attached `transcribe`
-//                            job is watched like any other (its source is its input's).
+//                            following the band as it changes. Then the job-row counters
+//                            of every running job on the selected source (`spectrum` jobs
+//                            skipped: their events are the waterfall's) are refreshed, a
+//                            job no longer running is forgotten (counter, gate, label,
+//                            marks), and the squelch gates are seeded (below).
+//                            The feed: every event of every job on the selected source
+//                            comes on one stream, the source's feed (in GET /streams the
+//                            stream of kind `event` with provenance `job` null and `source`
+//                            the selected one), one text-mode socket however many jobs run
+//                            (an attached `transcribe` job's too: its source is its
+//                            input's). It is opened by setSource; a node that lists no
+//                            feed for the source (an older node) is noted once per source,
+//                            `no event feed for <id>; job events are not shown`, through
+//                            `notice`, and asked again on each ov.sync (outlines still
+//                            draw). After a drop the feed id is resolved again by the same
+//                            rule. Each frame names its job: a job running on the source in
+//                            the last poll (ov.lastJobs) whose mode row is settled is
+//                            rendered (below); any other frame goes to ov.hold (the
+//                            `pending` list, filled by Task 6; dropped for now). A `lagged`
+//                            message, or an open of the feed after its first (a
+//                            reconnect), is a hole in every job's events at once:
+//                            ov.reseedAll forgets every known squelch gate and seeds them
+//                            again; the counters stand. Seeding: each SQUELCH_KINDS job
+//                            whose gate is unknown has its `job_context` asked, once the
+//                            feed is open, at most SEED_IN_FLIGHT reads in flight (the next
+//                            sync sends the rest).
 //                            Then the positioned jobs: the MAX_POSITIONED most recent
 //                            running jobs on the other sources whose kind is a mode row
 //                            with a `position` map or a `subject` (spec 7.2: the map follows
@@ -87,24 +102,24 @@
 //                            subscribed only once its row is known, so an event never
 //                            arrives before it, and what the lookup learns is applied at
 //                            once by a second sync. A positioned job whose source becomes
-//                            the selected one is handed to the ordinary watch.
-//     ov.watching(jobId) -> bool  false for a running job over either cap, so its events
-//                            are not seen (the Subjects pane says so)
-//     ov.watchJob(job, streamIds)  subscribes to the job's event streams (an id or an array:
-//                            an attached `transcribe` job has two, its `vad` and its
-//                            `transcript` stage's; text mode, each re-resolved by provenance
-//                            after a drop) and renders each event by payload shape (so by
-//                            `protocol`, whichever stream it came on):
+//                            the selected one is left to the feed.
+//     ov.watching(jobId) -> bool  false for a positioned job on another source over
+//                            MAX_POSITIONED, so its events are not seen (the Subjects pane
+//                            says so); true for every job on the selected source
+//     ov.watchJob(job)       makes a job on the selected source known to the feed before a
+//                            poll lists it (menu.js: an identify run, whose candidates come
+//                            within seconds); no socket is opened
+//     ov.render(job, payload, {positionOnly})  draws one event of `job` by payload shape (so
+//                            by `protocol`); `positionOnly` (a positioned job's) stops after
+//                            ov.onEvent:
 //         - `db` array (spectrum): ignored;
 //         - `protocol: squelch`: not counted, never drawn; on an fm_demod or am_demod job
 //           (agent.js SQUELCH_KINDS; any other job's is ignored) kept as the
 //           job's last squelch event (ov.squelch, forgotten when the job's graph changes)
 //           and the row's tag set from it at once (agent.js setSquelchTag; the 2 s
-//           re-render keeps it through agent.js); when such a job's watch starts, its
-//           `job_context` is asked and its latched `squelch` event seeds that state
-//           unless a live one came first (the gate changes rarely, so a late watch would
-//           otherwise miss it); while no gate is known it is asked again on each ov.sync,
-//           one request at a time (an event sent before the subscription was live is lost);
+//           re-render keeps it through agent.js); the seed (above) reads the latched
+//           `squelch` event of the job's `job_context` unless a live one came first (the
+//           gate changes rarely, so a page that came late would otherwise miss it);
 //         - every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
@@ -186,15 +201,17 @@
 //                            of startNs and endNs (wf.xForNs), tagged `text`; re-laid on every
 //                            column and view change and removed (null) once endNs left the columns
 //     ov.unspan(key)         removes the span drawn under `key`, if any
-//     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a watched job
+//     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a job on the
+//                            selected source
 //     ov.lastEvent(jobId) -> ms|null  performance.now() of the last event counted in the job's
 //                            row (agent.js folds idle plan channels on it)
 //     ov.activity(jobId) -> {watched, speaking, hot}  what the page knows of the job now
-//     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a watched job,
+//                            (watched: running on the selected source, so on the feed)
+//     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a job on the
+//                            selected source,
 //                            before it is drawn, and of a positioned job on another source
 //                            (the map reads `position` from them)
-//     ov.jobRow(job, counter)  shows `counter` (when > 0, or the string `—` for a job over
-//                            the cap) in that job's row `.events` cell
+//     ov.jobRow(job, counter)  shows `counter` (when > 0) in that job's row `.events` cell
 //     ov.destroy()
 
 import { SQUELCH_KINDS, setSquelchTag } from "./agent.js";
@@ -204,8 +221,10 @@ import { bandText } from "./units.js";
 
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
-export const MAX_WATCHED = 4;
 export const MAX_POSITIONED = 4;
+// At most this many `job_context` reads seeding squelch gates are in flight at once; the
+// next ov.sync sends the rest.
+export const SEED_IN_FLIGHT = 4;
 export const MAX_RIBBONS = 200;
 const EXPIRE_EVERY_MS = 1000;
 const KEYED_RIBBON_MS = 500;
@@ -313,9 +332,11 @@ class Overlays {
       applyOp = async () => null,
       footprint = () => "wide",
       onOutlineMenu = () => {},
+      notice = () => {},
     } = {},
   ) {
     this.plan = plan;
+    this.notice = notice;
     this.applyOp = applyOp;
     this.footprint = footprint;
     this.onOutlineMenu = onOutlineMenu;
@@ -330,10 +351,16 @@ class Overlays {
     this.api = api;
     this.jobsEl = jobsEl;
     this.sourceId = null;
-    this.watched = new Map(); // job id -> {job, ids, subs, closed}
-    this.noEventStream = new Map(); // job id -> JSON of the graph that has no event stream
-    this.resolving = false; // a GET /streams for unwatched jobs is in flight
-    this.counters = new Map(); // job id -> non-spectrum events seen while watched
+    // The shown source's feed: {id, source, sub, opened (it has opened once)}, or null.
+    this.feed = null;
+    this.feedOpening = null; // the source whose feed a GET /streams is resolving
+    this.feedNoted = new Set(); // sources noted as having no feed
+    this.hideFeeds = false; // zetaTest.hideFeeds: resolve as if no feed were listed
+    this.pending = []; // feed frames held until their job is known (Task 6 fills it)
+    this.seeding = new Set(); // job ids whose `job_context` squelch read is in flight
+    // Jobs made known before a poll lists them (ov.watchJob: menu.js's identify), until one does.
+    this.early = new Map(); // job id -> job record
+    this.counters = new Map(); // job id -> non-spectrum events seen on the feed
     this.lastEvents = new Map(); // job id -> performance.now() of its last counted event
     this.hotJob = null; // the job id whose tag, outline and row show `hot`
     this.speaking = []; // the job ids a mix is playing now: `speaking` on each
@@ -350,7 +377,7 @@ class Overlays {
     this.positioned = new Map(); // job id -> {job, ids, subs, closed, positionOnly: true}
     this.resolvingPositioned = false; // a GET /streams for unwatched positioned jobs
     this.subjects = subjects; // the row cache and the subjects (subjects.js)
-    this.overCap = new Set(); // running job ids over MAX_WATCHED or MAX_POSITIONED
+    this.overCap = new Set(); // positioned job ids on other sources over MAX_POSITIONED
     this.destroyed = false;
     // Above zero inside a pass over many outlines (ov.layout, ov.sync, ov.syncOutlines):
     // layoutTags only marks the tags dirty, and the pass lays them out once at its end.
@@ -375,11 +402,15 @@ class Overlays {
   setSource(id) {
     if (id === this.sourceId) return;
     this.sourceId = id;
-    for (const jobId of [...this.watched.keys()]) this.unwatch(jobId);
+    this.closeFeed();
+    this.pending = [];
+    this.early.clear();
+    this.counters.clear();
+    this.lastEvents.clear();
+    this.squelches.clear();
     for (const [jobId, rec] of [...this.positioned]) {
       if (rec.job.source === id) this.unwatchPositioned(jobId);
     }
-    this.noEventStream.clear();
     for (const r of this.ribbons) r.el.remove();
     this.ribbons = [];
     for (const l of this.labels.values()) l.el.remove();
@@ -388,49 +419,27 @@ class Overlays {
     for (const key of [...this.outlines.keys()]) this.unoutline(key);
     for (const key of [...this.spans.keys()]) this.unspan(key);
     this.captureOutlined = false;
+    this.openFeed();
   }
 
   sync(jobs, source) {
     this.batchTags(() => {
       if (this.destroyed) return;
       this.syncOutlines(jobs, source);
+      for (const id of [...this.early.keys()]) {
+        if (jobs.some((j) => j.id === id)) this.early.delete(id);
+      }
       const want = jobs.filter(
-        (j) =>
-          j.source === this.sourceId &&
-          j.kind !== "spectrum" &&
-          j.state &&
-          j.state.status === "running",
+        (j) => j.source === this.sourceId && j.kind !== "spectrum" && isRunning(j),
       );
       this.syncMarks(want);
-      for (const [id, graph] of [...this.noEventStream]) {
-        const j = want.find((x) => x.id === id);
-        if (!j || graphKey(j) !== graph) this.noEventStream.delete(id);
-      }
-      // Jobs known to have no event stream take no socket and so no place under the cap.
-      // Decoders first, then the SQUELCH_KINDS jobs (whose stream only tags their row), each
-      // newest first: a squelch tag never crowds a decoder's ribbons and counter out.
-      const squelchOnly = (j) => (SQUELCH_KINDS.includes(j.kind) ? 1 : 0);
-      const capped = want
-        .filter((j) => !this.noEventStream.has(j.id))
-        .sort((a, b) => squelchOnly(a) - squelchOnly(b) || (b.created_ns ?? 0) - (a.created_ns ?? 0))
-        .slice(0, MAX_WATCHED);
-      const ids = new Set(capped.map((j) => j.id));
-      for (const id of [...this.watched.keys()]) if (!ids.has(id)) this.unwatch(id);
-      for (const j of capped) {
-        const known = this.watched.get(j.id);
-        if (!known) continue;
-        known.job = j;
-        // The node sends a gate's `squelch` event on the first block and on each change only,
-        // so one that came between the context read and the subscription is lost for good: a
-        // watched squelch kind with no gate known asks its context again, once per poll.
-        if (SQUELCH_KINDS.includes(j.kind) && !this.squelches.has(j.id)) this.seedSquelch(known);
+      const ids = new Set(want.map((j) => j.id));
+      for (const id of new Set([...this.counters.keys(), ...this.squelches.keys()])) {
+        if (!ids.has(id) && !this.early.has(id)) this.forget(id);
       }
       this.lookup(jobs);
-      const fresh = capped.filter((j) => !this.watched.has(j.id) && this.rowKnown(j));
-      if (fresh.length > 0) this.resolve(fresh);
-      this.overCap = new Set(
-        want.filter((j) => !ids.has(j.id) && !this.noEventStream.has(j.id)).map((j) => j.id),
-      );
+      // A source without a feed (an older node, or one listed late) is asked again each poll.
+      if (!this.feed) this.openFeed();
       for (const j of want) {
         // A `graph_put` restarted the job (perhaps with its squelch off): forget the old state.
         const sq = this.squelches.get(j.id);
@@ -439,14 +448,144 @@ class Overlays {
           setSquelchTag(this.jobRowEl(j), null);
           this.refreshTag(this.outlines.get(j.id));
         }
-        const over = !ids.has(j.id) && !this.noEventStream.has(j.id);
-        this.jobRow(j, over ? "—" : this.counters.get(j.id) || 0);
+        this.jobRow(j, this.counters.get(j.id) || 0);
       }
+      this.seedPass(want);
       // agent.js re-rendered the rows: the hovered job's row is hot again.
       if (this.hotJob) this.setHot(this.hotJob, true);
       this.setSpeaking(this.speaking);
       this.syncPositioned(jobs);
     });
+  }
+
+  // What the page holds for a job on the shown source that is no longer running.
+  forget(jobId) {
+    this.counters.delete(jobId);
+    this.lastEvents.delete(jobId);
+    this.squelches.delete(jobId);
+    this.unlabel(jobId);
+    for (const key of [...this.marks.keys()]) if (key.startsWith(`${jobId}:`)) this.unmark(key);
+  }
+
+  // ---- the shown source's feed ---------------------------------------------------------
+
+  // The id of `source`'s feed in a GET /streams answer: kind `event`, no job, that source.
+  async findFeed(source) {
+    const streams = await this.api.streams();
+    if (this.hideFeeds) return null;
+    const f = streams.find(
+      (x) =>
+        x.kind === "event" &&
+        x.provenance &&
+        x.provenance.job === null &&
+        x.provenance.source === source,
+    );
+    return f ? f.id : null;
+  }
+
+  // Subscribes the shown source's feed, once; a source the node lists no feed for is noted
+  // once and tried again on each sync.
+  async openFeed() {
+    const source = this.sourceId;
+    if (this.destroyed || source === null || this.feed || this.feedOpening === source) return;
+    this.feedOpening = source;
+    let id;
+    try {
+      id = await this.findFeed(source);
+    } catch {
+      return; // a failed request: the next sync asks again
+    } finally {
+      if (this.feedOpening === source) this.feedOpening = null;
+    }
+    if (this.destroyed || this.sourceId !== source || this.feed) return;
+    if (id === null) {
+      if (!this.feedNoted.has(source)) {
+        this.feedNoted.add(source);
+        this.notice(`no event feed for ${source}; job events are not shown`);
+      }
+      return;
+    }
+    const feed = { id, source, sub: null, opened: false };
+    feed.sub = this.api.streamText(id, (msg) => this.onFeedMessage(feed, msg), null, {
+      onReconnect: async () => {
+        const next = await this.findFeed(source);
+        if (next) feed.id = next;
+        return next;
+      },
+      // A reopened feed missed what was sent while it was down: every gate is read again.
+      onOpen: () => {
+        if (this.feed !== feed) return;
+        if (feed.opened) {
+          this.reseedAll();
+          return;
+        }
+        feed.opened = true;
+        this.seedPass(this.shownJobs());
+      },
+    });
+    this.feed = feed;
+  }
+
+  closeFeed() {
+    if (this.feed) this.feed.sub.close();
+    this.feed = null;
+  }
+
+  onFeedMessage(feed, msg) {
+    if (this.destroyed || this.feed !== feed) return;
+    if (msg.type === "frame") {
+      const job = this.feedJob(msg.job);
+      if (job) this.render(job, msg.payload);
+      else this.hold(msg);
+    } else if (msg.type === "lagged") {
+      this.reseedAll();
+    }
+  }
+
+  // The running job on the shown source a feed frame belongs to, once its row is settled.
+  feedJob(jobId) {
+    const j = this.lastJobs.find(
+      (x) => x.id === jobId && x.source === this.sourceId && isRunning(x),
+    );
+    if (j) return j.kind !== "spectrum" && this.rowKnown(j) ? j : null;
+    return this.early.get(jobId) ?? null; // as menu.js made it known, row or not
+  }
+
+  // A frame whose job the last poll did not list as running (Task 6 holds and replays it).
+  hold(_frame) {}
+
+  // A lag or a reconnect of the feed: every gate may have changed unseen; forget them and
+  // read them again (Task 7 completes this).
+  reseedAll() {
+    this.squelches.clear();
+    this.seedPass(this.shownJobs());
+  }
+
+  // The running non-spectrum jobs on the shown source in the last poll.
+  shownJobs() {
+    return this.lastJobs.filter(
+      (j) => j.source === this.sourceId && j.kind !== "spectrum" && isRunning(j),
+    );
+  }
+
+  // A `job_context` read for each SQUELCH_KINDS job among `jobs` whose gate is unknown, at most
+  // SEED_IN_FLIGHT at once; only once the feed is open, so a gate change after the read is seen.
+  seedPass(jobs) {
+    if (!this.feed || !this.feed.opened) return;
+    for (const j of jobs) {
+      if (this.seeding.size >= SEED_IN_FLIGHT) return;
+      if (!SQUELCH_KINDS.includes(j.kind)) continue;
+      if (this.squelches.has(j.id) || this.seeding.has(j.id)) continue;
+      this.seedSquelch(j);
+    }
+  }
+
+  // Makes `job` known to the feed now, before the 2 s poll lists it (menu.js: an identify
+  // run's candidates come within seconds). No socket is opened; the next poll that lists the
+  // job takes over.
+  watchJob(job) {
+    if (this.destroyed || job.source !== this.sourceId) return;
+    if (!this.lastJobs.some((j) => j.id === job.id)) this.early.set(job.id, job);
   }
 
   // Whether the job's mode row is settled (a row, or no row): no event before that.
@@ -480,7 +619,7 @@ class Overlays {
       })
       .sort((a, b) => (b.created_ns ?? 0) - (a.created_ns ?? 0));
     const want = followed.slice(0, MAX_POSITIONED);
-    for (const j of followed.slice(MAX_POSITIONED)) this.overCap.add(j.id);
+    this.overCap = new Set(followed.slice(MAX_POSITIONED).map((j) => j.id));
     const ids = new Set(want.map((j) => j.id));
     for (const id of [...this.positioned.keys()]) if (!ids.has(id)) this.unwatchPositioned(id);
     for (const j of want) {
@@ -566,80 +705,42 @@ class Overlays {
     }
   }
 
-  // One GET /streams for the jobs not yet watched: watch those with an event stream, cache
-  // those whose streams are listed without one. A job with no stream listed yet (just
-  // started), or a failed request, is tried again on the next poll.
-  async resolve(jobs) {
-    if (this.resolving) return;
-    this.resolving = true;
-    let streams = null;
-    try {
-      streams = await this.api.streams();
-    } catch {
-      streams = null;
-    } finally {
-      this.resolving = false;
-    }
-    if (!streams || this.destroyed) return;
-    for (const j of jobs) {
-      if (j.source !== this.sourceId || this.watched.has(j.id)) continue;
-      const mine = streams.filter((x) => x.provenance && x.provenance.job === j.id);
-      const ev = mine.filter((x) => x.kind === "event").map((x) => x.id);
-      if (ev.length > 0) this.watchJob(j, ev);
-      else if (mine.length > 0) this.noEventStream.set(j.id, graphKey(j));
-    }
-  }
-
-  watchJob(job, streamIds) {
-    if (this.destroyed || job.source !== this.sourceId) return;
-    const known = this.watched.get(job.id);
-    if (known) {
-      known.job = job;
-      return;
-    }
-    const ids = Array.isArray(streamIds) ? [...streamIds] : [streamIds];
-    const rec = { job, ids, subs: [], closed: false };
-    this.watched.set(job.id, rec);
-    ids.forEach((_, slot) => this.subscribe(rec, slot));
-    if (SQUELCH_KINDS.includes(job.kind)) this.seedSquelch(rec);
-  }
-
-  // The gate the job's context latched (its last `squelch` event), asked once the
-  // subscriptions are open: a job whose only event came before this watch is still tagged.
-  // A live event seen meanwhile is newer and wins; a failed request leaves the live path.
-  // ov.sync asks again, once per poll and one request at a time (rec.seeding), while the
-  // gate is still unknown.
-  async seedSquelch(rec) {
-    if (rec.seeding) return;
-    rec.seeding = true;
-    const job = rec.job;
+  // The gate the job's context latched (its last `squelch` event), asked once the feed is
+  // open: a job whose only `squelch` event came before the page subscribed is still tagged.
+  // A live event seen meanwhile is newer and wins; a failed request or an answer without a
+  // gate leaves it unknown, and the next ov.sync asks again.
+  async seedSquelch(job) {
+    this.seeding.add(job.id);
+    const source = this.sourceId;
     let r = null;
     try {
       r = await this.api.op({ op: "job_context", job: job.id });
     } catch {
       return;
     } finally {
-      rec.seeding = false;
+      this.seeding.delete(job.id);
     }
+    if (this.destroyed || this.sourceId !== source) return;
+    const now = this.lastJobs.find((x) => x.id === job.id && isRunning(x));
     const p = r && r.value && r.value.squelch;
-    if (rec.closed || this.destroyed || this.watched.get(job.id) !== rec) return;
-    if (!p || p.protocol !== "squelch" || this.squelches.has(job.id)) return;
-    this.squelches.set(job.id, { event: p, graph: graphKey(rec.job) });
-    setSquelchTag(this.jobRowEl(rec.job), p);
+    if (!now || !p || p.protocol !== "squelch" || this.squelches.has(job.id)) return;
+    this.squelches.set(job.id, { event: p, graph: graphKey(now) });
+    setSquelchTag(this.jobRowEl(now), p);
     this.refreshTag(this.outlines.get(job.id));
   }
 
-  unwatch(jobId) {
-    const rec = this.watched.get(jobId);
-    if (!rec) return;
-    rec.closed = true;
-    for (const sub of rec.subs) sub.close();
-    this.watched.delete(jobId);
-    this.counters.delete(jobId);
-    this.lastEvents.delete(jobId);
-    this.squelches.delete(jobId);
-    this.unlabel(jobId);
-    for (const key of [...this.marks.keys()]) if (key.startsWith(`${jobId}:`)) this.unmark(key);
+  // A positioned job's event stream `slot` (another source's job: the map's alone).
+  subscribe(rec, slot) {
+    rec.subs[slot] = this.api.streamText(
+      rec.ids[slot],
+      (msg) => {
+        if (!rec.closed && msg.type === "frame") {
+          this.render(rec.job, msg.payload, { positionOnly: rec.positionOnly });
+        }
+      },
+      null,
+      { onReconnect: () => this.lookupStream(rec, slot) },
+    );
   }
 
   // The id for subscription `slot` of `rec` after a drop: its stream if still listed, else
@@ -656,24 +757,12 @@ class Overlays {
     return id;
   }
 
-  subscribe(rec, slot) {
-    rec.subs[slot] = this.api.streamText(
-      rec.ids[slot],
-      (msg) => {
-        if (!rec.closed && msg.type === "frame") this.render(rec, msg.payload);
-      },
-      null,
-      { onReconnect: () => this.lookupStream(rec, slot) },
-    );
-  }
-
-  render(rec, p) {
-    const job = rec.job;
+  render(job, p, { positionOnly = false } = {}) {
     const owner = job.input ?? job.id; // whose colour and band its ribbons take
     const obj = p && typeof p === "object" && !Array.isArray(p);
     if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
     for (const fn of this.eventFns) fn(job, p);
-    if (rec.positionOnly) return; // another source's job: the map's alone
+    if (positionOnly) return; // another source's job: the map's alone
     if (obj && p.protocol === "squelch") {
       // Only a demodulator job's own squelch tags its row (never, say, a decoder's demod).
       if (SQUELCH_KINDS.includes(job.kind)) {
@@ -743,11 +832,13 @@ class Overlays {
     return this.lastEvents.get(jobId) ?? null;
   }
 
-  // What the page knows of a job's activity: watched (its event stream subscribed, so its
-  // squelch and events are seen), speaking (a mix hears it), hot (hovered).
+  // What the page knows of a job's activity: watched (a running job on the shown source, so
+  // its squelch and events come on the feed), speaking (a mix hears it), hot (hovered).
   activity(jobId) {
     return {
-      watched: this.watched.has(jobId),
+      watched: this.lastJobs.some(
+        (j) => j.id === jobId && j.source === this.sourceId && isRunning(j),
+      ),
       speaking: this.speaking.includes(jobId),
       hot: this.hotJob === jobId,
     };
@@ -763,11 +854,6 @@ class Overlays {
     const row = this.jobRowEl(job);
     const cell = row && row.querySelector(".events");
     if (!cell) return;
-    if (typeof counter === "string") {
-      cell.textContent = counter;
-      cell.title = `not watched (limit ${MAX_WATCHED})`;
-      return;
-    }
     cell.textContent = counter > 0 ? String(counter) : "";
     cell.title = counter > 0 ? `${counter} events since this page started watching` : "";
   }
@@ -1702,7 +1788,7 @@ class Overlays {
     this.destroyed = true;
     clearInterval(this.timer);
     this.ro.disconnect();
-    for (const id of [...this.watched.keys()]) this.unwatch(id);
+    this.closeFeed();
     for (const id of [...this.positioned.keys()]) this.unwatchPositioned(id);
     for (const o of this.outlines.values()) if (o.tag) o.tag.remove(); // the rail's
     this.layer.remove();

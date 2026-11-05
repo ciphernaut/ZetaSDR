@@ -57,8 +57,8 @@
 //                                             mode decode-to-identify considered as
 //                                             `tried <mode> <score> <outcome>`
 //   identify   Identify (thorough)            job_start kind=identify, bandwidth_hz at least
-//                                             IDENTIFY_MIN_BANDWIDTH_HZ; its event stream is
-//                                             watched at once (ov.watchJob: it may prove and
+//                                             IDENTIFY_MIN_BANDWIDTH_HZ; it is made known to
+//                                             the feed at once (ov.watchJob: it may prove and
 //                                             end before the 2 s job poll would), so each
 //                                             `candidate` event shows as a ribbon (its
 //                                             `summary`, class `candidate`)
@@ -795,7 +795,7 @@ class Menu {
         await this.applyOp(this.attachOp(r.value));
       }
       if (action === "identify" && r && r.result === "job" && r.value) {
-        await this.watchIdentify(r.value, s);
+        this.watchIdentify(r.value, s);
       }
     }
   }
@@ -868,20 +868,10 @@ class Menu {
     });
   }
 
-  // Watch identify job `id`'s event stream now: its candidates come within seconds and a
-  // proof ends it, possibly before the 2 s job poll would have watched it.
-  async watchIdentify(id, s) {
-    if (!this.ov || !this.ov.api) return;
-    let streams = [];
-    try {
-      streams = await this.ov.api.streams();
-    } catch {
-      return;
-    }
-    const ids = streams
-      .filter((x) => x.kind === "event" && x.provenance && x.provenance.job === id)
-      .map((x) => x.id);
-    if (ids.length === 0) return;
+  // Make identify job `id` known to the feed now: its candidates come within seconds and a
+  // proof ends it, possibly before the 2 s job poll would have listed it.
+  watchIdentify(id, s) {
+    if (!this.ov) return;
     const t = jobTuning("identify", s);
     this.ov.watchJob(
       {
@@ -892,7 +882,6 @@ class Menu {
         tuning: { center_hz: t.centerHz, bandwidth_hz: t.bandwidthHz },
         state: { status: "running" },
       },
-      ids,
     );
   }
 

@@ -860,6 +860,7 @@ function start(api) {
     applyOp,
     footprint: () => document.documentElement.dataset.footprint || "wide",
     onOutlineMenu: (job, x, y) => state.menu?.openOutline(job, x, y),
+    notice: (text) => state.transcript?.note(text, true),
   });
   state.map = mountMap($("#map"), api, state.view, {
     jobs: () => state.lastJobs,
@@ -1494,6 +1495,11 @@ window.zetaTest = {
   },
   poll() {
     return state.jobs ? state.jobs.refresh() : Promise.resolve();
+  },
+  // Resolve the shown source's feed as if the node listed none (an older node), or again
+  // as it is; takes effect at the next feed lookup (a source switch, a sync without a feed).
+  hideFeeds(on) {
+    if (state.ov) state.ov.hideFeeds = !!on;
   },
   // The idle age (ms) after which plan channels fold into a group (agent.js JOBS_FOLD_IDLE_MS),
   // for the page's lifetime; the rows are drawn again at once.

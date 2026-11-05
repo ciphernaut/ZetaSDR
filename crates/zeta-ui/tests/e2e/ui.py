@@ -3159,42 +3159,32 @@ def scenario_quiet_channel_row_is_tagged_squelch(page, url, secret):
                 stop_job(url, secret, j)
 
 
-def scenario_watched_jobs_are_capped(page, url, secret):
-    # Six measure jobs: the four most recent are watched (one event socket each), the other
-    # two rows show "—" and open nothing, so this tab holds at most ops + waterfall + 4.
+def scenario_every_job_on_the_source_is_watched(page, url, secret):
+    # Six measure jobs and four fm_demods on tone: every row counts or is tagged, no row
+    # says "not watched", and the page holds ops + waterfall + feed = 3 sockets throughout.
     select_source(page, url, secret, "tone")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
     jobs = []
     try:
-        for i in range(6):  # distinct bands: an identical rigid start is a duplicate
+        for i in range(6):
             jobs.append(start_job(url, secret, "measure", "tone", 100_000_000, 10_000 + 100 * i))
-        page.evaluate("window.zetaTest.poll()")
-        expect(page.locator('#jobs .job[data-state="running"]', has_text="measure")).to_have_count(6)
-        for j in jobs[:2]:
-            cell = page.locator(f'#jobs .job[data-id="{j}"] .events')
-            expect(cell).to_have_text("—")
-            expect(cell).to_have_attribute("title", "not watched (limit 4)")
-        for j in jobs[2:]:
-            cell = page.locator(f'#jobs .job[data-id="{j}"] .events')
-            expect(cell).not_to_have_attribute("title", "not watched (limit 4)")
-        # The four watches open (measure events can take seconds to come, so sockets are
-        # counted rather than events), and no more than four.
-        deadline = time.monotonic() + 5.0
-        while ws_connections(url, secret) < 2 + 4 and time.monotonic() < deadline:
-            time.sleep(0.2)
-        counts = stable_ws_connections(url, secret)
-        assert max(counts) <= 2 + 4, f"ws_connections {counts}"
-        # Four newer fm_demods (squelch streams only) take no decoder's slot: they go
-        # unwatched and the four measures keep theirs.
         for i in range(4):
             jobs.append(start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500 + 100 * i))
         page.evaluate("window.zetaTest.poll()")
-        for j in jobs[6:]:
-            expect(page.locator(f'#jobs .job[data-id="{j}"] .events')).to_have_attribute(
-                "title", "not watched (limit 4)")
-        for j in jobs[2:6]:
+        # The page's own (elastic) spectrum job is listed too.
+        expect(page.locator('#jobs .job[data-state="running"]').filter(
+            has_not_text="spectrum")).to_have_count(10)
+        for j in jobs[:6]:
             cell = page.locator(f'#jobs .job[data-id="{j}"] .events')
-            expect(cell).not_to_have_attribute("title", "not watched (limit 4)")
+            expect(cell).not_to_have_text("—")
+            page.wait_for_function(
+                "(id) => { const e = document.querySelector(`#jobs .job[data-id=\"${id}\"] .events`);"
+                " return !!e && parseInt(e.textContent, 10) > 0; }", arg=j, timeout=5_000)
+        for j in jobs[6:]:
+            expect(job_row(page, j).locator(".kind .tag.squelch")).to_be_visible(timeout=5_000)
+        expect(page.locator('#jobs .job .events[title^="not watched"]')).to_have_count(0)
+        counts = stable_ws_connections(url, secret)
+        assert max(counts) <= 3, f"ws_connections {counts}"
     finally:
         for j in jobs:
             stop_job(url, secret, j)
@@ -3216,20 +3206,25 @@ HOG_JS = """async ([n, id, proto]) => {
 
 
 def scenario_ws_busy_is_noted_once(page, url, secret):
-    # With every stream slot taken (by another page), a new watch is refused with 503: one
-    # error line in the transcript, and the watch opens once a slot frees.
+    # With every stream slot taken (by another page), the shown source's feed is refused with
+    # 503: one error line in the transcript, and the feed opens once a slot frees. The feed is
+    # held back over the switch (zetaTest.hideFeeds) and let go once the pool is full: a
+    # switch frees the old source's sockets first, so it would take a freed slot.
     select_source(page, url, secret, "tone")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+    page.evaluate("window.zetaTest.hideFeeds(true)")
+    page.click('.src-tab[data-id="retune"]')
+    expect(page.locator('.src-tab[data-id="retune"]')).to_have_attribute("aria-selected", "true")
     ops = [s for s in http_json(url, secret, "/streams")
-           if s["provenance"]["source"] == "node"][0]["id"]
+           if s["provenance"]["source"] == "node" and s["provenance"]["job"] is None][0]["id"]
     proto = "zeta.bearer." + base64.urlsafe_b64encode(secret.encode()).decode().rstrip("=")
     hog = page.context.new_page()
-    job = None
     try:
         hog.goto(url + "/ui/")
+        # ops + waterfall here, no feed yet; plus whatever the hog page holds.
         free = MAX_WS - stable_ws_connections(url, secret)[-1]
         assert hog.evaluate(HOG_JS, [free, ops, proto]) == free, "hog sockets did not open"
-        job = start_job(url, secret, "measure", "tone", 100_000_000, 10_000)
+        page.evaluate("window.zetaTest.hideFeeds(false)")
         page.evaluate("window.zetaTest.poll()")
         busy = page.locator("#transcript .line.note.error", has_text="out of stream slots")
         expect(busy).to_have_count(1)
@@ -3238,7 +3233,7 @@ def scenario_ws_busy_is_noted_once(page, url, secret):
         expect(busy).to_have_count(1)
         expect(busy.locator(".count")).to_have_text("")
         hog.evaluate("window.hog.forEach((ws) => ws.close())")
-        # ops + waterfall + the watch, once the hog's sockets are gone and the backoff (at
+        # ops + waterfall + the feed, once the hog's sockets are gone and the backoff (at
         # most 8 s) has run out.
         deadline = time.monotonic() + 15.0
         counts = []
@@ -3246,9 +3241,37 @@ def scenario_ws_busy_is_noted_once(page, url, secret):
             counts = stable_ws_connections(url, secret)
             if counts[-1] == 3 and len(set(counts)) == 1:
                 break
-        assert counts and counts[-1] == 3, f"the refused watch never opened: {counts}"
+        assert counts and counts[-1] == 3, f"the refused feed never opened: {counts}"
     finally:
         hog.close()
+
+
+def scenario_no_feed_is_noted_once(page, url, secret):
+    # A node without a feed for the shown source (an older node; stubbed here with
+    # zetaTest.hideFeeds) is noted once; the outlines still draw, and once the feed is listed
+    # the next sync opens it (no second note) and the row's squelch tag comes.
+    select_source(page, url, secret, "tone")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+    page.evaluate("window.zetaTest.hideFeeds(true)")
+    page.click('.src-tab[data-id="retune"]')
+    expect(page.locator('.src-tab[data-id="retune"]')).to_have_attribute("aria-selected", "true")
+    note = page.locator("#transcript .line.note.error",
+                        has_text="no event feed for retune; job events are not shown")
+    expect(note).to_have_count(1)
+    job = None
+    try:
+        job = start_job(url, secret, "fm_demod", "retune", 250_015_000, 12_500)
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f'#waterfall .outline[data-key="{job}"]')).to_be_visible()
+        page.evaluate("window.zetaTest.poll()")
+        page.wait_for_timeout(500)
+        expect(note).to_have_count(1)
+        page.evaluate("window.zetaTest.hideFeeds(false)")
+        page.evaluate("window.zetaTest.poll()")
+        page.evaluate("window.zetaTest.poll()")
+        expect(job_row(page, job).locator(".kind .tag.squelch")).to_be_visible(timeout=5_000)
+        expect(note).to_have_count(1)
+    finally:
         if job:
             stop_job(url, secret, job)
 
@@ -4942,11 +4965,13 @@ def scenario_subjects_survive_a_source_switch(page, url, secret):
 
 
 def scenario_subjects_name_the_jobs_not_watched(page, url, secret):
+    # Every job on the shown source is watched (its feed): the cap in play is MAX_POSITIONED,
+    # on the positioned jobs of the other sources, so the five run on `retune`.
     select_source(page, url, secret, "tone")
     jobs = []
     try:
         for bw in (40_000, 41_000, 42_000, 43_000, 44_000):
-            jobs.append(start_job(url, secret, "fake_subjects", "tone", 100_000_000, bw))
+            jobs.append(start_job(url, secret, "fake_subjects", "retune", 250_000_000, bw))
         job_row(page, jobs[-1])
         open_subjects(page)
         sections = page.locator("#subjects section.subject-job")

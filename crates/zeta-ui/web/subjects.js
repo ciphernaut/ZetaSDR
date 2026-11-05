@@ -61,7 +61,7 @@
 //         (app.js shows the pane)
 //     pane.destroy()
 
-import { MAX_WATCHED } from "./overlays.js";
+import { MAX_POSITIONED } from "./overlays.js";
 import { distanceBearing, positionOf } from "./map.js";
 import { metricText } from "./units.js";
 import { homeOf } from "./view.js";
@@ -601,7 +601,7 @@ class SubjectsPane {
     const h3 = document.createElement("h3");
     const note = document.createElement("div");
     note.className = "not-watched";
-    note.textContent = `not watched (limit ${MAX_WATCHED})`;
+    note.textContent = `not watched (limit ${MAX_POSITIONED})`;
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const head = document.createElement("tr");
