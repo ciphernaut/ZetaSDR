@@ -1628,17 +1628,22 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
         ),
     };
     assert_eq!(state(&node, &watch), Some(JobState::Stopped));
+    // The cancelled restart's task may still be finishing the decoder's launch (it takes
+    // the lease) before it stops it: wait for the end state, which a leaked lease never
+    // reaches.
     let only_measure = [(measure.0.clone(), "measure".to_string())];
-    until("only the measure job runs", Duration::from_secs(10), || {
-        running(&node) == only_measure
-    })
+    let holders = || -> Vec<JobId> {
+        node.lease_holders(&rx())
+            .into_iter()
+            .map(|(j, _)| j)
+            .collect()
+    };
+    until(
+        "only the measure job runs and holds the radio",
+        Duration::from_secs(10),
+        || running(&node) == only_measure && holders() == [measure.clone()],
+    )
     .await;
-    let holders: Vec<JobId> = node
-        .lease_holders(&rx())
-        .into_iter()
-        .map(|(j, _)| j)
-        .collect();
-    assert_eq!(holders, [measure]);
     stop_all(&node).await;
 }
 
