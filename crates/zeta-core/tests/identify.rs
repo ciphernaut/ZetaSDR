@@ -316,12 +316,16 @@ fn running(node: &Node) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Stop every running job, then check the node holds nothing on the source.
+/// Stop every running job, then check the node comes to hold nothing on the source (a
+/// cancelled child launch finishing in a task takes the lease until the task stops it).
 async fn stop_all(node: &Node) {
     for (id, _) in running(node) {
         node.job_stop(&JobId(id)).await.unwrap();
     }
-    assert!(node.lease_holders(&rx()).is_empty());
+    until("no lease on rx", Duration::from_secs(5), || {
+        node.lease_holders(&rx()).is_empty()
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -555,18 +559,21 @@ async fn a_replace_of_identify_completes_while_a_child_is_stopped() {
     assert_eq!(state(&node, &id), JobState::Stopped);
     assert_ne!(state(&node, &child), JobState::Running);
     // The next child's launch was queued on the gate behind the replace: identify cannot
-    // wait for it under that gate, so a task stops it once it is up.
+    // wait for it under that gate, so a task stops it once it is up. That launch takes the
+    // lease before the stop: wait for the end state, which a leaked lease never reaches.
     let only_measure = [(measure.0.clone(), "measure".to_string())];
-    until("only the measure job runs", Duration::from_secs(5), || {
-        running(&node) == only_measure
-    })
+    let holders = || -> Vec<JobId> {
+        node.lease_holders(&rx())
+            .into_iter()
+            .map(|(j, _)| j)
+            .collect()
+    };
+    until(
+        "only the measure job runs and holds the radio",
+        Duration::from_secs(5),
+        || running(&node) == only_measure && holders() == [measure.clone()],
+    )
     .await;
-    let holders: Vec<JobId> = node
-        .lease_holders(&rx())
-        .into_iter()
-        .map(|(j, _)| j)
-        .collect();
-    assert_eq!(holders, [measure]);
     let events = events.await.unwrap();
     assert!(
         events.iter().all(|e| e["outcome"] != "proved"),
