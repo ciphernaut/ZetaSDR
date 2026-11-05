@@ -434,3 +434,48 @@ async fn a_gap_in_the_input_restarts_the_clock() {
     }
     assert!(audio.iter().any(|&(s, _)| s >= second_t0), "{audio:?}");
 }
+
+#[tokio::test]
+async fn a_dropout_shorter_than_the_hangover_keeps_the_run() {
+    // A demodulator's audio can miss a few frames mid-speech (tens of ms): that is not a
+    // squelch closing, so the run carries on and is not chopped into short pieces.
+    let rate = 48_000u64;
+    let bus = Arc::new(StreamBus::new(1024));
+    let a_out = bus.register(StreamKind::Audio, prov(0));
+    let e_out = bus.register(StreamKind::Event, prov(0));
+    let mut rx_a = bus.subscribe(&a_out).unwrap();
+    let mut rx_e = bus.subscribe(&e_out).unwrap();
+    let (tx, rx_in) = broadcast::channel(1024);
+    let h = spawn(bus, rx_in, vec![a_out, e_out]);
+    // 500 ms of noise, then 1.2 s of a loud tone, then noise, sent as 20 ms frames; 100 ms
+    // of the tone (five frames) never arrive.
+    let mut x = noise(5 * CHUNK, 41);
+    let tone: Vec<f32> = (0..(1.2 * rate as f64) as usize)
+        .map(|n| 0.3 * (2.0 * std::f64::consts::PI * 440.0 * n as f64 / rate as f64).sin() as f32)
+        .collect();
+    x.extend(noisy(tone, 42));
+    x.extend(noise(5 * CHUNK, 43));
+    let frame = 960usize;
+    // Frames 50..75 are 0.5-1.0 s into the input, inside the tone.
+    let lost = 50..55;
+    for (k, c) in x.chunks(frame).enumerate() {
+        if lost.contains(&k) {
+            continue;
+        }
+        tx.send(audio(c.to_vec(), rate, 1, T_BASE + k as u64 * 20_000_000))
+            .unwrap();
+    }
+    drop(tx);
+    assert!(h.await.unwrap().is_ok());
+    let (events, _) = drain(&mut rx_a, &mut rx_e);
+    let speech: Vec<bool> = events.iter().map(|e| e.0).collect();
+    assert_eq!(
+        speech,
+        [true, false],
+        "one run across the dropout: {events:?}"
+    );
+    assert!(
+        events[0].1.abs_diff(T_BASE + 500_000_000) <= FRAME_NS,
+        "{events:?}"
+    );
+}

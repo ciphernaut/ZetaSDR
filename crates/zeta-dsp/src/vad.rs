@@ -411,12 +411,14 @@ impl State {
             }
         }
         let start = frame.provenance.span.start_ns;
-        // A frame that starts more than a detector frame after the last input ended
-        // follows a gap (a squelch that closed publishes nothing): the samples held
-        // before it are not followed by these, so they go out now and the clock
-        // restarts at this frame's own time.
+        // A frame that starts more than the hangover after the last input ended follows
+        // a gap (a squelch that closed publishes nothing): the samples held before it
+        // are not followed by these, so they go out now and the clock restarts at this
+        // frame's own time. A shorter dropout (a few frames lost mid-speech) could not
+        // have ended a run, so the input is taken as continuous, as it always was.
+        let bridge_ns = (params.hangover_ms as u64).max(FRAME_MS) * 1_000_000;
         let mut out = match self.in_end {
-            Some(end) if start.0 > end.0 + FRAME_MS * 1_000_000 => self.gap(rate, ch),
+            Some(end) if start.0 > end.0 + bridge_ns => self.gap(rate, ch),
             _ => Vec::new(),
         };
         if self.pending.is_empty() {
