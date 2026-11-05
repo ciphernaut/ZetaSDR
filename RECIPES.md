@@ -71,8 +71,7 @@ dead channel; ACARS traffic depends on aircraft in range.
 {"op":"jobs_stop","source":"b210","kind":"acars_decode","plan":null}
 ```
 
-**Gotchas.** The page watches at most four jobs for tag state (`TODO.md`, "the page watches at
-most 4 jobs"), so with seven running some tags show no squelch dot; the jobs are fine. A decoder's
+**Gotchas.** The page watches every job on the shown source through the source's feed. A decoder's
 outline dragged on the waterfall is a `job_retune` off its channel and stops decoding ACARS there:
 put it back with `job_retune` to the row's centre and 10 000 Hz. ADS-B on the same radio must wait
 for these to stop; put it on a second radio (next recipe).

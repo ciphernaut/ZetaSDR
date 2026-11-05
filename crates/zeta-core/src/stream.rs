@@ -229,6 +229,7 @@ impl StreamBus {
                     && let Some(feed) = feeds.get(source)
                     && !self.unfed.read().unwrap().contains(&frame.stream)
                     && let Some((_, ftx)) = streams.get(feed)
+                    && ftx.receiver_count() > 0
                 {
                     let _ = ftx.send(Frame {
                         stream: feed.clone(),

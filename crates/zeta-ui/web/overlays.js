@@ -227,7 +227,7 @@ export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
 export const MAX_POSITIONED = 4;
 // At most this many `job_context` reads seeding squelch gates are in flight at once; the
-// next ov.sync sends the rest.
+// reads chain, each answer sends the next.
 export const SEED_IN_FLIGHT = 4;
 // Feed frames held for a job no poll has listed yet; the oldest go first.
 export const PENDING_MAX = 200;
@@ -417,6 +417,7 @@ class Overlays {
   setSource(id) {
     if (id === this.sourceId) return;
     this.sourceId = id;
+    this.seedGen++; // a read issued on an earlier visit must not apply
     this.closeFeed();
     this.pending = [];
     this.counters.clear();
@@ -537,9 +538,6 @@ class Overlays {
           return;
         }
         feed.opened = true;
-        // Events published before this open were never seen: a "no gate yet" answer from
-        // before it is stale, so those jobs are asked again.
-        this.gateless.clear();
         this.seedPass(this.shownJobs());
       },
     });

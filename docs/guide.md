@@ -506,9 +506,9 @@ else it gets 401.
 | `POST /op` | apply one operation (`{"op": ...}` JSON) |
 | `GET /schema` | the operation schema |
 | `GET /streams` | live streams |
-| `GET /stream/{id}` of a source's feed | every event of every job on the source over one socket; the feed is the `event` stream in `GET /streams` with that `provenance.source` and `job: null` |
 | `GET /agents-md` | the node's agent guide |
 | `GET /stream/{id}` | websocket of one stream |
+| `GET /stream/{id}` of a source's feed | every event of every job on the source over one socket; the feed is the `event` stream in `GET /streams` with that `provenance.source` and `job: null` |
 | `GET /streams/{id}/tail?max_frames=N&timeout_ms=T` | the `stream_tail` operation: up to N frames arriving within T ms |
 
 `plan_start` (`zeta plan start`) starts a kind on a plan's channels, with an optional attach, in one operation; the agent is told to use it for a kind on every channel, and never to stop or replace jobs the request did not name (`not_allowed`, unlocked per run).
@@ -669,8 +669,8 @@ a thin segment, a hot or speaking tag stays full, and the outline, tag, row and 
 colour per job. Idle plan channels fold into one `<n> idle <kind> on <plan>` group when more than
 8 are idle, judged only from what the page knows: a kind with no squelch, a job on the shown source (all are watched, through its feed)
 whose squelch is known closed for 60 s, or an unwatched job on a source whose mix the page plays
-and which that mix has not heard for 60 s. So without **Listen to all** most CB demodulators stay
-listed; a row under the pointer stays put. A selection drag
+and which that mix has not heard for 60 s. So idle channels on the shown source fold on their own
+squelch evidence with no mix; only jobs on other sources need **Listen to all**. A row under the pointer stays put. A selection drag
 can no longer start inside a running retunable job's band (its outline takes the pointer): start
 the box outside it or on another part of the waterfall.
 
