@@ -16,7 +16,7 @@ description = "WebSocket transport for a ZetaSDR node"
 test-server = ["zeta-source-file/test-fixtures"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 axum = { version = "0.8.9", features = ["ws"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
