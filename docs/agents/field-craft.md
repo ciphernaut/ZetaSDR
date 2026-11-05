@@ -135,6 +135,10 @@ A `fm_demod` or `am_demod` has an automatic squelch: an idle channel publishes n
 
 Every transcript event of an attached job is also written to the node's `transcripts.log`. `zeta transcripts tail --lines N --job ID` reads the last lines (default 50, one JSON line each: `job`, `source`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns`, `text`, `language`, `dropped`, `error`), so you can answer "what was said on 476.4 MHz" after the fact without a live `stream tail`. It reads the state directory, so it does not work with `--node`. A line with `error` set is a failed utterance, not silence.
 
+### Reading past events
+
+Every event of every job on a source (every decoded frame, detection or transcript the source's feed carried, whether or not a page or a `stream tail` was open) is also written to the node's `events.log`. `zeta events tail --lines N [--job ID] [--source ID] [--protocol NAME]` reads the last lines (default 50, one JSON line each: `t_ns`, `source`, `job`, `channel`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns` and the event under `event`), so "what did ACARS hear overnight" is `zeta events tail --protocol acars --lines 500` after the fact, and "which aircraft were up on 131.450" is the same filtered by `--job`. It reads the state directory, so it does not work with `--node`. The log holds the last 32 MiB plus one rotated file; a job's events before that are gone.
+
 Digital voice decoders (DMR, D-STAR, M17) will be transcribed the same way: they produce audio, so `job attach --kind transcribe` to them.
 
 ### Taking the radio from another job

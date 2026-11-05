@@ -103,6 +103,7 @@ Holding a capture, receive gain and transcripts:
 ./target/debug/zeta source unpin --source b210
 ./target/debug/zeta source gain --source b210 --db 45     # or --auto
 ./target/debug/zeta transcripts tail --lines 20 --job job-7   # default 50 lines, local state dir only
+./target/debug/zeta events tail --lines 200 --protocol acars  # every job's events, local state dir only
 ./target/debug/zeta plans [--plan uhf_cb_au]     # channel plans with their channels expanded
 ./target/debug/zeta jobs stop --source b210   # every job on a source in one operation (no filter: every job; the page's spectrum stays)
 ./target/debug/zeta plan start --plan uhf_cb_au --kind fm_demod --source b210 --channels 1,2,5-8 --attach transcribe   # one lease decision, one job per channel
@@ -125,7 +126,12 @@ beside the pin) and re-applied at the next start, where it wins over `gain=` in 
 `transcribe` job is also appended as one JSON line to `<state-dir>/transcripts.log` (`t_ns`, `job`,
 `input`, `source`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns`, `text`, `language`,
 `dropped`, `error`; rotated to `transcripts.log.1` past 8 MiB); `transcripts tail` reads it and is a
-usage error with `--node`.
+usage error with `--node`. Every event of every job on a source (what the source's feed carries:
+every decoded frame, detection or transcript, whether or not a page or a `stream tail` is open; an
+`fft`'s rows stay out) is appended as one JSON line to `<state-dir>/events.log` (`t_ns`, `source`,
+`job`, `channel`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns` and the event itself under
+`event`; rotated to `events.log.1` past 32 MiB); `events tail [--job ID] [--source ID]
+[--protocol NAME]` reads it and is a usage error with `--node`.
 
 `fm_demod` shapes its audio as a voice receiver does: a 3.4 kHz low-pass and a 530 µs
 de-emphasis after the discriminator (`audio_lowpass_hz`, `deemphasis_us` on its node; `null`

@@ -1,11 +1,16 @@
 //! Rotating JSON-lines files in the state directory: `ops.log` (one line per
-//! applied op) and `transcripts.log` (one line per transcript event).
+//! applied op), `transcripts.log` (one line per transcript event) and `events.log`
+//! (one line per event frame of every source's feed).
 
 use std::io::Write;
 use std::path::PathBuf;
 
 /// Size past which a log is rotated to `<name>.1`.
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// As [`MAX_BYTES`] for `events.log`: every decoded event of every source goes
+/// there, so a night of traffic must fit in its two files.
+pub(super) const EVENTS_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// An append-only JSON-lines file; at most two files (`<name>`, `<name>.1`) exist.
 pub(super) struct JsonLog {

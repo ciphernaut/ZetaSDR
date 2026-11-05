@@ -220,11 +220,12 @@ struct BankSlot {
     bank: Option<Arc<dyn ChannelBank>>,
 }
 
-/// The node's two JSON-lines logs in the state directory.
+/// The node's three JSON-lines logs in the state directory.
 #[derive(Clone, Copy)]
 enum LogFile {
     Ops,
     Transcripts,
+    Events,
 }
 
 impl LogFile {
@@ -232,6 +233,7 @@ impl LogFile {
         match self {
             LogFile::Ops => "ops.log",
             LogFile::Transcripts => "transcripts.log",
+            LogFile::Events => "events.log",
         }
     }
 }
@@ -298,8 +300,11 @@ struct Inner {
     /// Every `transcript` event of a `transcribe` job, one JSON line each; see
     /// [`Inner::tee_transcripts`].
     transcripts_log: jsonlog::JsonLog,
+    /// Every event frame of every source's feed, one JSON line each; see
+    /// [`Inner::tee_events`].
+    events_log: jsonlog::JsonLog,
     /// Per [`LogFile`]: whether a failed write is already in `persist_errors`.
-    log_failed: [std::sync::atomic::AtomicBool; 2],
+    log_failed: [std::sync::atomic::AtomicBool; 3],
     /// Running transcript tees (see [`Inner::tee_transcripts`]).
     tees: Arc<std::sync::atomic::AtomicUsize>,
     /// Running tasks of every job's stage set (its stages, its IQ forwarder, a
@@ -343,6 +348,7 @@ impl Inner {
         let log = match which {
             LogFile::Ops => &self.ops_log,
             LogFile::Transcripts => &self.transcripts_log,
+            LogFile::Events => &self.events_log,
         };
         if let Err(e) = log.append(line)
             && !self.log_failed[which as usize].swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -846,6 +852,10 @@ impl Node {
                 persist_errors: Mutex::new(Vec::new()),
                 ops_log: jsonlog::JsonLog::new(cfg.state_dir.join("ops.log")),
                 transcripts_log: jsonlog::JsonLog::new(cfg.state_dir.join("transcripts.log")),
+                events_log: jsonlog::JsonLog::with_max_bytes(
+                    cfg.state_dir.join("events.log"),
+                    jsonlog::EVENTS_MAX_BYTES,
+                ),
                 log_failed: Default::default(),
                 tees: Arc::default(),
                 stages: Arc::default(),
@@ -979,6 +989,7 @@ impl Node {
             ports.insert(source.clone(), port.clone());
         }
         inner.bus.register_feed(&source);
+        inner.tee_events(&source);
         inner.note_capabilities(port.as_ref());
         if let Some(band) = port.current() {
             inner.sync_bank(&source, band);

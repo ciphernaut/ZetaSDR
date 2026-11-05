@@ -72,6 +72,26 @@ async fn main() -> ExitCode {
             })
         });
     }
+    if let cli::Command::Events(cli::EventsCmd::Tail {
+        lines,
+        job,
+        source,
+        protocol,
+    }) = cli.command
+    {
+        return tail_log(&state_dir, "events.log", lines, |line| {
+            if job.is_none() && source.is_none() && protocol.is_none() {
+                return true;
+            }
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| {
+                job.as_deref().is_none_or(|id| v["job"] == id)
+                    && source.as_deref().is_none_or(|id| v["source"] == id)
+                    && protocol
+                        .as_deref()
+                        .is_none_or(|p| v["event"]["protocol"] == p)
+            })
+        });
+    }
     if (cli.command.mutates()
         || matches!(
             cli.command,

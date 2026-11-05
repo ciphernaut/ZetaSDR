@@ -453,6 +453,65 @@ impl Inner {
         }
     }
 
+    /// Append every event frame of `source`'s feed (every event of every job on it,
+    /// as a page watching the source sees them; an `fft`'s rows stay out, as they
+    /// stay out of the feed) to `events.log`, one task per source, subscribed
+    /// before this returns. The tee ends on the node's shutdown (draining what is
+    /// buffered) or when the feed is unregistered; it keeps the feed fed whether or
+    /// not a page is open. A lag is recorded once per source in `persist_errors`.
+    pub(super) fn tee_events(self: &Arc<Self>, source: &SourceId) {
+        let Some(mut rx) = self
+            .bus
+            .feed_of(source)
+            .and_then(|feed| self.bus.subscribe(&feed))
+        else {
+            return;
+        };
+        let (source, token) = (source.clone(), self.shutdown.child_token());
+        // Weak: a tee never keeps the node alive.
+        let inner = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut lagged = false;
+            let log = |frame: Frame| {
+                if let Some(inner) = inner.upgrade() {
+                    let tuning = frame.provenance.job.as_ref().and_then(|job| {
+                        inner.jobs.lock().unwrap().get(job).map(|e| e.record.tuning)
+                    });
+                    inner.log_line(LogFile::Events, &event_line(&frame, tuning));
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        // What is still buffered, past any lag, until empty.
+                        loop {
+                            match rx.try_recv() {
+                                Ok(frame) => log(frame),
+                                Err(TryRecvError::Lagged(_)) => continue,
+                                Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+                            }
+                        }
+                    }
+                    r = rx.recv() => match r {
+                        Ok(frame) => log(frame),
+                        Err(RecvError::Lagged(n)) => {
+                            if !std::mem::replace(&mut lagged, true)
+                                && let Some(inner) = inner.upgrade()
+                            {
+                                inner.persist_errors.lock().unwrap().push(format!(
+                                    "events.log: source {}: {n} events skipped",
+                                    source.0
+                                ));
+                            }
+                        }
+                        Err(RecvError::Closed) => return,
+                    },
+                }
+            }
+        });
+    }
+
     /// Relaunch every running elastic job on `source` but `except` under the same
     /// id, on the source's current capture: its stages are stopped (the record
     /// stays `Running`, the lease held), then [`Inner::launch`] joins the capture,
@@ -1471,6 +1530,29 @@ fn transcript_line(job: &serde_json::Value, frame: &Frame) -> Option<serde_json:
     m.insert("dropped".into(), (v["dropped"] == true).into());
     m.insert("error".into(), text("error").into());
     Some(line)
+}
+
+/// The `events.log` line for `frame`: `t_ns`, the frame's provenance (`source`,
+/// `job`, `channel`, `start_ns`, `end_ns`), the job's `center_hz` and
+/// `bandwidth_hz` (`tuning`; `null` for a job no longer listed) and the event
+/// itself as `event` (`null` for a frame that is not an event).
+fn event_line(frame: &Frame, tuning: Option<Tuning>) -> serde_json::Value {
+    let prov = &frame.provenance;
+    let event = match &frame.payload {
+        Payload::Event(v) => v.clone(),
+        _ => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "t_ns": now().0,
+        "source": prov.source.0,
+        "job": prov.job.as_ref().map(|j| j.0.clone()),
+        "channel": prov.channel.as_ref().map(|c| c.0.clone()),
+        "center_hz": tuning.map(|t| t.center_hz.0),
+        "bandwidth_hz": tuning.map(|t| t.bandwidth_hz.0),
+        "start_ns": prov.span.start_ns.0,
+        "end_ns": prov.span.end_ns.0,
+        "event": event,
+    })
 }
 
 /// Register a job stream; the rows of an `fft` stage are spectrum data, not events a

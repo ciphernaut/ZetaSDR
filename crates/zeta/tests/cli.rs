@@ -2527,6 +2527,51 @@ fn transcripts_tail_prints_the_last_lines_filtered_by_job() {
         ));
 }
 
+#[test]
+fn events_tail_prints_the_last_lines_filtered_by_job_source_and_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let first = r#"{"t_ns":1,"source":"b210","job":"J1","channel":null,"center_hz":131450000,"bandwidth_hz":12500,"start_ns":10,"end_ns":20,"event":{"protocol":"acars","reg":"C-FGEO"}}"#;
+    let second = r#"{"t_ns":2,"source":"b210","job":"J2","channel":null,"center_hz":144800000,"bandwidth_hz":12500,"start_ns":30,"end_ns":40,"event":{"protocol":"aprs","from":"VK1ABC"}}"#;
+    let third = r#"{"t_ns":3,"source":"hackrf","job":"J3","channel":null,"center_hz":148600000,"bandwidth_hz":12500,"start_ns":50,"end_ns":60,"event":{"protocol":"pocsag","address":1}}"#;
+    std::fs::write(
+        state.join("events.log"),
+        format!("{first}\n{second}\n{third}\n"),
+    )
+    .unwrap();
+    let tail = |args: &[&str]| {
+        let out = zeta_bin()
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["events", "tail"])
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    assert_eq!(tail(&["--lines", "1"]), format!("{third}\n"));
+    assert_eq!(tail(&["--job", "J1"]), format!("{first}\n"));
+    assert_eq!(tail(&["--source", "b210"]), format!("{first}\n{second}\n"));
+    assert_eq!(tail(&["--protocol", "aprs"]), format!("{second}\n"));
+    assert_eq!(
+        tail(&["--source", "b210", "--protocol", "pocsag"]),
+        String::new()
+    );
+    assert_eq!(tail(&[]), format!("{first}\n{second}\n{third}\n"));
+
+    zeta_bin()
+        .args(["--node", "http://127.0.0.1:1", "events", "tail"])
+        .assert()
+        .code(1)
+        .stderr(contains(
+            "events tail reads the state directory: not supported with --node",
+        ));
+}
+
 /// `source gain` takes exactly one of `--db N` and `--auto` (a usage error, exit
 /// 1, otherwise); a file source has no adjustable gain (`other`, exit 2).
 #[test]

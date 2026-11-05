@@ -474,7 +474,13 @@ async fn tee_ends_with_the_job_and_a_lag_is_recorded_once() {
     // The tee goes on after the lag: what was still buffered is written.
     assert!(until(2_000, || !lines(&path).is_empty()).await);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let errors = node.persist_errors();
+    // The source's `events.log` tee lags on the same burst and records its own
+    // entry; this tee's is the one for the job.
+    let errors: Vec<_> = node
+        .persist_errors()
+        .into_iter()
+        .filter(|e| e.starts_with("transcripts.log: "))
+        .collect();
     assert_eq!(errors.len(), 1, "{errors:?}");
     let prefix = format!("transcripts.log: job {}: ", id.0);
     assert!(

@@ -332,6 +332,9 @@ pub enum Command {
     /// The transcript log in the state directory (local; not an operation)
     #[command(subcommand)]
     Transcripts(TranscriptsCmd),
+    /// The event log in the state directory (local; not an operation)
+    #[command(subcommand)]
+    Events(EventsCmd),
     /// Run the node, resuming persisted jobs, until Ctrl-C
     Serve(ServeArgs),
     /// Let a local model call the node's operations to satisfy a request
@@ -678,6 +681,25 @@ pub enum TranscriptsCmd {
         /// Only lines whose `job` or `input` is this job id
         #[arg(long, value_name = "ID")]
         job: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EventsCmd {
+    /// Print the last event lines of every job (every source's feed), one JSON line each, oldest first
+    Tail {
+        /// How many lines
+        #[arg(long, value_name = "N", default_value_t = 50)]
+        lines: usize,
+        /// Only lines whose `job` is this job id
+        #[arg(long, value_name = "ID")]
+        job: Option<String>,
+        /// Only lines whose `source` is this source id
+        #[arg(long, value_name = "ID")]
+        source: Option<String>,
+        /// Only lines whose event's `protocol` is this (e.g. acars, aprs, pocsag)
+        #[arg(long, value_name = "NAME")]
+        protocol: Option<String>,
     },
 }
 
@@ -1371,7 +1393,8 @@ impl Command {
             | Command::SoapyWorker(_)
             | Command::Ops(_)
             | Command::Modes(ModesCmd::Check { .. })
-            | Command::Transcripts(_) => {
+            | Command::Transcripts(_)
+            | Command::Events(_) => {
                 return Ok(None);
             }
         }))
