@@ -241,7 +241,7 @@ Plan 23 delivered the ADS-B request: a row names its subject (`key`, columns, `w
 
 - POCSAG has no subject (each page is its own message); an address list in the Subjects tab would need a key on the pager's address.
 - AIS vessels (MMSI as key) when the AIS row lands; it needs only a row.
-- The node-side half is a separate gist ("Subjects: state does not survive a refresh").
+- The node-side half is a separate gist ("Subjects: a running job keeps its tables on the node").
 
 ## Build: an install script for the AMBE/IMBE vocoder libraries
 
@@ -353,9 +353,11 @@ Found in the plan 21 final review, 2026-11-01. `graph_put` and `job_retune` can 
 
 Found in the plan 22 final review, 2026-11-01. Mutes live in the mix's graph, so stopping the mix (`stop all` included) forgets them. The page offers Mute in mix only on the demodulator kinds, though the mix hears any job with audio. And how the page's audio behaves on a real phone is untested: the resume and the re-anchor on a suspended context were only run against a context suspended in headless Chromium.
 
-## Subjects: state does not survive a refresh
+## Subjects: a running job keeps its tables on the node
 
-Plan 23 merges each subject's events on the page, so a refresh starts the Subjects tab, the tracks and the dim and drop clocks empty and refills them from live traffic (an aircraft re-announces within seconds; a sonde every second, an APRS station only when it next transmits). A node-side store, kept as `job_context.subjects` (the merged state by key, last seen, count, the track), would survive a refresh, serve the agent and the CLI ("which aircraft are up?") and let a second page open on the same picture. Decide where the dim and drop settings live then.
+From the operator, 2026-11-06: "whilst a job is running then the relevant tables should be updated and maintained", whether or not a page is open. Found that morning: the seven ACARS decoders on the B210 ran all night (00:02 on) and decoded fine (CRC-clean blocks such as `C-FGEO` / `AC0035` on 131.450 MHz reached the job streams and the b210 feed), but events are live-only (the bus hands each frame to whoever is subscribed then; nothing in the state directory keeps them), so with no page open the night's traffic went nowhere and could not be reviewed.
+
+Plan 23 merges each subject's events on the page, so a refresh starts the Subjects tab, the tracks and the dim and drop clocks empty and refills them from live traffic (an aircraft re-announces within seconds; a sonde every second, an APRS station only when it next transmits). Wanted: the node maintains each running job's tables itself, the subject state as `job_context.subjects` (the merged state by key, first and last seen, count, the track) and, for rows with no subject (POCSAG, RDS), a bounded recent-events list; persisted with the job so a node restart keeps them, cleared when the job is stopped (or kept as a closed record: decide). The page then seeds the Subjects tab from the node and follows the feed, so a refresh, a second page, the agent and the CLI ("what did ACARS hear since midnight?", "which aircraft are up?") all see the same picture. A rolling event log in the state directory beside `ops.log` and `transcripts.log` is the cheap first half (replay, review, fixtures). Decide where the dim and drop settings live then.
 
 ## Subjects: leftovers
 
