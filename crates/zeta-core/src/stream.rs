@@ -1,6 +1,9 @@
 //! Typed stream bus: every output stream, with provenance, between stages, jobs and clients.
+//!
+//! Each source may have a feed: an event stream that `publish` fans every other event frame of
+//! that source into, provenance (and so the job) intact; `register_unfed` streams stay out of it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -9,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::port::IqBlock;
-use crate::types::{Hz, Provenance, StreamId, StreamKind};
+use crate::types::{Hz, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 
 #[derive(Clone, Debug)]
 pub enum Payload {
@@ -129,6 +132,8 @@ pub struct StreamBus {
     capacity: usize,
     dropped: AtomicU64,
     streams: RwLock<HashMap<StreamId, (StreamInfo, broadcast::Sender<Frame>)>>,
+    feeds: RwLock<HashMap<SourceId, StreamId>>,
+    unfed: RwLock<HashSet<StreamId>>,
 }
 
 impl StreamBus {
@@ -137,7 +142,42 @@ impl StreamBus {
             capacity,
             dropped: AtomicU64::new(0),
             streams: RwLock::new(HashMap::new()),
+            feeds: RwLock::new(HashMap::new()),
+            unfed: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// The source's event feed, registered on first call; later calls answer the same id.
+    pub fn register_feed(&self, source: &SourceId) -> StreamId {
+        let mut feeds = self.feeds.write().unwrap();
+        if let Some(id) = feeds.get(source) {
+            return id.clone();
+        }
+        let id = self.register(
+            StreamKind::Event,
+            Provenance {
+                source: source.clone(),
+                job: None,
+                channel: None,
+                span: Span {
+                    start_ns: Timestamp(0),
+                    end_ns: Timestamp(0),
+                },
+            },
+        );
+        feeds.insert(source.clone(), id.clone());
+        id
+    }
+
+    pub fn feed_of(&self, source: &SourceId) -> Option<StreamId> {
+        self.feeds.read().unwrap().get(source).cloned()
+    }
+
+    /// As [`StreamBus::register`], but the stream's frames stay out of its source's feed.
+    pub fn register_unfed(&self, kind: StreamKind, provenance: Provenance) -> StreamId {
+        let id = self.register(kind, provenance);
+        self.unfed.write().unwrap().insert(id.clone());
+        id
     }
 
     pub fn register(&self, kind: StreamKind, provenance: Provenance) -> StreamId {
@@ -156,7 +196,10 @@ impl StreamBus {
     /// no subscribers are dropped silently; frames whose kind differs from the
     /// registered stream's are dropped and counted in [`StreamBus::dropped`].
     pub fn publish(&self, frame: Frame) {
-        if let Some((info, tx)) = self.streams.read().unwrap().get(&frame.stream) {
+        // Lock order is feeds, then streams (as in `register_feed`).
+        let feeds = self.feeds.read().unwrap();
+        let streams = self.streams.read().unwrap();
+        if let Some((info, tx)) = streams.get(&frame.stream) {
             if info.kind != frame.kind {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -176,6 +219,23 @@ impl StreamBus {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            if frame.kind == StreamKind::Event {
+                if feeds.values().any(|f| *f == frame.stream) {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                let source = &frame.provenance.source;
+                if source.0 != "node"
+                    && let Some(feed) = feeds.get(source)
+                    && !self.unfed.read().unwrap().contains(&frame.stream)
+                    && let Some((_, ftx)) = streams.get(feed)
+                {
+                    let _ = ftx.send(Frame {
+                        stream: feed.clone(),
+                        ..frame.clone()
+                    });
+                }
+            }
             let _ = tx.send(frame);
         }
     }
@@ -190,6 +250,8 @@ impl StreamBus {
     /// once they have drained what was already sent.
     pub fn unregister(&self, id: &StreamId) {
         self.streams.write().unwrap().remove(id);
+        self.unfed.write().unwrap().remove(id);
+        self.feeds.write().unwrap().retain(|_, f| f != id);
     }
 
     pub fn subscribe(&self, id: &StreamId) -> Option<broadcast::Receiver<Frame>> {
@@ -234,6 +296,111 @@ mod tests {
                 end_ns: Timestamp(1),
             },
         }
+    }
+
+    fn job_prov(src: &str, job: &str) -> Provenance {
+        Provenance {
+            job: Some(crate::types::JobId(job.into())),
+            ..prov(src)
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_carries_every_event_of_a_source_with_its_job() {
+        let bus = StreamBus::new(8);
+        let feed = bus.register_feed(&SourceId("a".into()));
+        let mut rx = bus.subscribe(&feed).unwrap();
+        let s1 = bus.register(StreamKind::Event, job_prov("a", "j1"));
+        let s2 = bus.register(StreamKind::Event, job_prov("a", "j2"));
+        let mut own = bus.subscribe(&s1).unwrap();
+        bus.publish(Frame::new(
+            s1.clone(),
+            job_prov("a", "j1"),
+            Payload::Event(serde_json::json!({"n": 1})),
+        ));
+        bus.publish(Frame::new(
+            s2.clone(),
+            job_prov("a", "j2"),
+            Payload::Event(serde_json::json!({"n": 2})),
+        ));
+        let f1 = rx.recv().await.unwrap();
+        let f2 = rx.recv().await.unwrap();
+        assert_eq!(
+            (
+                f1.stream.clone(),
+                f1.provenance.job.clone().unwrap().0.as_str()
+            ),
+            (feed.clone(), "j1")
+        );
+        assert_eq!(
+            (
+                f2.stream.clone(),
+                f2.provenance.job.clone().unwrap().0.as_str()
+            ),
+            (feed.clone(), "j2")
+        );
+        assert!(matches!(f1.payload, Payload::Event(ref v) if *v == serde_json::json!({"n": 1})));
+        // The job's own stream still carries the frame, under its own id.
+        assert_eq!(own.recv().await.unwrap().stream, s1);
+    }
+
+    #[tokio::test]
+    async fn feed_skips_unfed_streams_other_sources_audio_and_node() {
+        let bus = StreamBus::new(8);
+        let feed = bus.register_feed(&SourceId("a".into()));
+        let mut rx = bus.subscribe(&feed).unwrap();
+        let unfed = bus.register_unfed(StreamKind::Event, job_prov("a", "fft"));
+        let other = bus.register(StreamKind::Event, job_prov("b", "j"));
+        let audio = bus.register(StreamKind::Audio, job_prov("a", "j"));
+        let node = bus.register(StreamKind::Event, job_prov("node", "mix"));
+        let fed = bus.register(StreamKind::Event, job_prov("a", "j"));
+        let ev = |n| Payload::Event(serde_json::json!({"n": n}));
+        bus.publish(Frame::new(
+            unfed,
+            job_prov("a", "fft"),
+            Payload::Event(serde_json::json!({"q": [1]})),
+        ));
+        bus.publish(Frame::new(other, job_prov("b", "j"), ev(1)));
+        bus.publish(Frame::new(
+            audio,
+            job_prov("a", "j"),
+            Payload::Audio {
+                sample_rate_hz: Hz(48_000),
+                channels: 1,
+                samples: Arc::from([0.0f32]),
+            },
+        ));
+        bus.publish(Frame::new(node, job_prov("node", "mix"), ev(1)));
+        bus.publish(Frame::new(fed, job_prov("a", "j"), ev(2)));
+        let f = rx.recv().await.unwrap();
+        assert!(matches!(f.payload, Payload::Event(ref v) if *v == serde_json::json!({"n": 2})));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn feed_is_registered_once_and_never_written_directly() {
+        let bus = StreamBus::new(8);
+        let feed = bus.register_feed(&SourceId("a".into()));
+        assert_eq!(bus.register_feed(&SourceId("a".into())), feed);
+        assert_eq!(bus.feed_of(&SourceId("a".into())), Some(feed.clone()));
+        assert_eq!(bus.feed_of(&SourceId("b".into())), None);
+        let mut rx = bus.subscribe(&feed).unwrap();
+        bus.publish(Frame::new(
+            feed.clone(),
+            prov("a"),
+            Payload::Event(serde_json::json!({"n": 1})),
+        ));
+        assert_eq!(bus.dropped(), 1);
+        assert!(rx.try_recv().is_err());
+        let info = bus.list().into_iter().find(|i| i.id == feed).unwrap();
+        assert_eq!(
+            (
+                info.kind,
+                info.provenance.job,
+                info.provenance.source.0.as_str()
+            ),
+            (StreamKind::Event, None, "a")
+        );
     }
 
     #[tokio::test]
