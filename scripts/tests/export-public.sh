@@ -298,7 +298,8 @@ author_is_public_author() {
   [ "$(git -C "$o" log -1 --format='%an <%ae>|%cn <%ce>')" = \
     "Sage Grigull <ciphernaut@proton.me>|Sage Grigull <ciphernaut@proton.me>" ] ||
     fail author_is_public_author "default: $(git -C "$o" log -1 --format='%an <%ae>|%cn <%ce>')"
-  [ "$(git -C "$o" log -1 --format='%aI|%cI')" = "2026-12-01T00:00:00+00:00|2026-12-01T00:00:00+00:00" ] ||
+  # Compare epoch seconds: git versions print UTC in %aI as +00:00 or as Z.
+  [ "$(git -C "$o" log -1 --format='%at|%ct')" = "1796083200|1796083200" ] ||
     fail author_is_public_author "date: $(git -C "$o" log -1 --format='%aI|%cI')"
   [ "$(git -C "$o" for-each-ref --format='%(taggername) %(taggeremail)' refs/tags/v0.1.0)" = \
     "Sage Grigull <ciphernaut@proton.me>" ] || fail author_is_public_author "tagger"
