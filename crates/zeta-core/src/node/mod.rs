@@ -246,11 +246,13 @@ fn last_audio(outputs: &[(StreamKind, StreamId)]) -> Option<StreamId> {
 }
 
 /// Whether a mix may read `rec`: not an attached job (it is a chain over a job's audio),
-/// a job a controller owns (a trial) or another mix (a `mix` job, or any job whose graph
-/// holds a `mix` node, as a `graph_start` of one does).
+/// a job a controller owns (a trial), another mix (a `mix` job, or any job whose graph
+/// holds a `mix` node, as a `graph_start` of one does) or a job centred on a plan
+/// channel that carries no voice (CB ch22 and ch23: data, its noise is no one talking).
 fn mixable(rec: &JobRecord) -> bool {
     rec.input.is_none()
         && rec.owner.is_none()
+        && crate::plans::no_voice_at(rec.tuning.center_hz.0).is_none()
         && rec.kind != JobKind::Mix.name()
         && !rec
             .graph
@@ -2164,5 +2166,15 @@ mod tests {
         let mut graph_mix = rec("graph", None, None);
         graph_mix.graph = crate::ops::mix_graph(None);
         assert!(!mixable(&graph_mix));
+    }
+
+    #[test]
+    fn mixable_refuses_a_job_on_a_no_voice_plan_channel() {
+        let mut ch22 = rec("fm_demod", None, None);
+        ch22.tuning.center_hz = Hz(476_950_000);
+        assert!(!mixable(&ch22));
+        let mut ch20 = rec("fm_demod", None, None);
+        ch20.tuning.center_hz = Hz(476_900_000);
+        assert!(mixable(&ch20));
     }
 }

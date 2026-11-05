@@ -119,8 +119,9 @@ fn plans_prints_the_table_and_refuses_an_unknown_id() {
     let v = json(&out);
     assert_eq!(v["result"], "channel_plans");
     let plans = v["value"]["plans"].as_array().expect("plans array");
-    assert_eq!(plans.len(), 1);
+    assert_eq!(plans.len(), 2);
     assert_eq!(plans[0]["id"], "uhf_cb_au");
+    assert_eq!(plans[1]["id"], "acars_vhf");
     assert_eq!(plans[0]["channels"].as_array().unwrap().len(), 80);
     let out = zeta(dir.path(), &["plans", "--plan", "uhf_cb_au"])
         .assert()
@@ -137,7 +138,10 @@ fn plans_prints_the_table_and_refuses_an_unknown_id() {
         .clone();
     let v = json(&out);
     assert_eq!(v["error"], "other");
-    assert_eq!(v["message"], "unknown plan nope (known: uhf_cb_au)");
+    assert_eq!(
+        v["message"],
+        "unknown plan nope (known: uhf_cb_au, acars_vhf)"
+    );
 }
 
 #[test]

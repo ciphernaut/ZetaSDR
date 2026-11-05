@@ -371,7 +371,10 @@ async fn channels_are_validated_before_anything_happens() {
     {
         Err(OpError::Unknown { field, known, .. }) => {
             assert_eq!(field, "plan");
-            assert_eq!(known, vec!["uhf_cb_au".to_string()]);
+            assert_eq!(
+                known,
+                vec!["uhf_cb_au".to_string(), "acars_vhf".to_string()]
+            );
         }
         other => panic!("expected unknown plan, got {other:?}"),
     }
@@ -629,6 +632,27 @@ async fn attach_follows_every_started_channel_and_warns_over_capacity() {
     let (started, _, warnings) = plan_result(node2.apply(fm_attach(vec![1, 2])).await);
     assert_eq!(started.len(), 2);
     assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[tokio::test]
+async fn the_data_channels_start_without_an_attached_transcribe() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open_with(dir.path(), &radio, attach_registry(Readiness::always())).await;
+    let (started, _, warnings) = plan_result(node.apply(fm_attach(vec![20, 22, 23])).await);
+    let by = |n| started.iter().find(|s| s.channel == n).unwrap();
+    assert!(by(20).attached.is_some());
+    for n in [22, 23] {
+        assert_eq!(
+            (by(n).attached.clone(), by(n).attach_error.clone()),
+            (None, None)
+        );
+    }
+    assert_eq!(running(&node).len(), 4, "three demods, one transcribe");
+    assert_eq!(
+        warnings,
+        ["ch22, ch23: data, no voice: no transcribe attached"]
+    );
 }
 
 #[tokio::test]

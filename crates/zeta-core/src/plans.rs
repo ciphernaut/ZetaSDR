@@ -23,6 +23,9 @@ pub struct ChannelPlan {
     pub segments: &'static [Segment],
     /// Channel number and what it is reserved for.
     pub notes: &'static [(u32, &'static str)],
+    /// Channels that carry data, never voice: `plan_start` attaches no `transcribe`
+    /// to them and a mix does not read a job centred on one.
+    pub no_voice: &'static [u32],
 }
 
 /// A frequency within this many Hz of a channel centre is on the channel.
@@ -62,10 +65,75 @@ pub const UHF_CB_AU: ChannelPlan = ChannelPlan {
         (35, "emergency"),
         (40, "road (convention)"),
     ],
+    no_voice: &[22, 23],
 };
 
-/// Every plan the node knows; a frequency on two plans takes the first.
-pub const PLANS: &[ChannelPlan] = &[UHF_CB_AU];
+/// VHF ACARS: the seven channels aircraft use around 131 MHz, numbered by
+/// frequency. They sit on no raster, so each is a segment of one.
+pub const ACARS_VHF: ChannelPlan = ChannelPlan {
+    id: "acars_vhf",
+    name: "VHF ACARS",
+    region: "world",
+    bandwidth_hz: 10_000,
+    segments: &[
+        Segment {
+            first: 1,
+            count: 1,
+            first_hz: 130_025_000,
+            step_hz: 0,
+        },
+        Segment {
+            first: 2,
+            count: 1,
+            first_hz: 130_450_000,
+            step_hz: 0,
+        },
+        Segment {
+            first: 3,
+            count: 1,
+            first_hz: 131_125_000,
+            step_hz: 0,
+        },
+        Segment {
+            first: 4,
+            count: 1,
+            first_hz: 131_450_000,
+            step_hz: 0,
+        },
+        Segment {
+            first: 5,
+            count: 1,
+            first_hz: 131_550_000,
+            step_hz: 0,
+        },
+        Segment {
+            first: 6,
+            count: 1,
+            first_hz: 131_725_000,
+            step_hz: 0,
+        },
+        Segment {
+            first: 7,
+            count: 1,
+            first_hz: 131_825_000,
+            step_hz: 0,
+        },
+    ],
+    notes: &[
+        (1, "North America"),
+        (2, "North America"),
+        (3, "North America"),
+        (4, "Asia"),
+        (5, "worldwide primary"),
+        (6, "Europe"),
+        (7, "Europe"),
+    ],
+    no_voice: &[1, 2, 3, 4, 5, 6, 7],
+};
+
+/// Every plan the node knows; a frequency on two plans takes the first. The page's
+/// `auto` plan policy names the first plan for its `Start plan…` entry.
+pub const PLANS: &[ChannelPlan] = &[UHF_CB_AU, ACARS_VHF];
 
 /// The plan in [`PLANS`] with this `id`.
 pub fn plan(id: &str) -> Option<&'static ChannelPlan> {
@@ -122,6 +190,11 @@ pub fn channel_at(hz: u64) -> Option<(&'static ChannelPlan, u32)> {
     })
 }
 
+/// The plan channel at `hz` (as [`channel_at`]) when that channel carries no voice.
+pub fn no_voice_at(hz: u64) -> Option<(&'static ChannelPlan, u32)> {
+    channel_at(hz).filter(|(p, n)| p.no_voice.contains(n))
+}
+
 /// The smallest gap between two sorted channel centres of the plan, Hz.
 pub fn adjacent_hz(plan: &ChannelPlan) -> u64 {
     let c = channels(plan);
@@ -156,6 +229,43 @@ mod tests {
         let one = bounding(&UHF_CB_AU, &[20]);
         assert_eq!(one.center_hz, Hz(476_900_000));
         assert_eq!(one.bandwidth_hz, Hz(12_500));
+    }
+
+    #[test]
+    fn acars_vhf_holds_the_seven_channels_in_one_capture() {
+        let c = channels(&ACARS_VHF);
+        let hz: Vec<u64> = c.iter().map(|x| x.1).collect();
+        assert_eq!(
+            hz,
+            [
+                130_025_000,
+                130_450_000,
+                131_125_000,
+                131_450_000,
+                131_550_000,
+                131_725_000,
+                131_825_000
+            ]
+        );
+        let all: Vec<u32> = (1..=7).collect();
+        assert_eq!(c.iter().map(|x| x.0).collect::<Vec<_>>(), all);
+        assert_eq!(adjacent_hz(&ACARS_VHF), 100_000);
+        // The band the field-craft recipe tunes for ACARS: 130.925 MHz, under 2 MHz.
+        let t = bounding(&ACARS_VHF, &all);
+        assert_eq!(t.center_hz, Hz(130_925_000));
+        assert_eq!(t.bandwidth_hz, Hz(1_810_000));
+        let n = channel_at(131_550_000).map(|(p, n)| (p.id, n));
+        assert_eq!(n, Some(("acars_vhf", 5)));
+    }
+
+    #[test]
+    fn no_voice_names_the_cb_data_channels_and_every_acars_channel() {
+        let n = |hz| no_voice_at(hz).map(|(p, n)| (p.id, n));
+        assert_eq!(n(476_950_000), Some(("uhf_cb_au", 22)));
+        assert_eq!(n(476_975_000), Some(("uhf_cb_au", 23)));
+        assert_eq!(n(476_900_000), None);
+        assert_eq!(n(131_550_000), Some(("acars_vhf", 5)));
+        assert_eq!(n(147_050_000), None);
     }
 
     #[test]

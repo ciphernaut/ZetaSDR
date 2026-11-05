@@ -26,9 +26,8 @@ Each of these is a mode row: `zeta modes list` gives its id (the `kind` to start
 
 "Set up a background decoder for all ACARS and ADS-B activity":
 
-1. `source_ensure` the radio at 130 925 000 Hz with 2 400 000 Hz. That band covers every ACARS channel above.
-2. Start one `acars_decode` per channel inside it. They share the capture.
-3. Start `adsb_decode` on a second source. A radio serves one band at a time, so on one radio it must wait until the ACARS jobs are stopped.
+1. `plan_start` with `plan: "acars_vhf"`, `kind: "acars_decode"` and the radio: one `acars_decode` on each of the seven channels above, all in one capture of 1 810 000 Hz about 130 925 000 Hz (`channels` narrows it, `[5]` for 131 550 000 Hz alone).
+2. Start `adsb_decode` on a second source. A radio serves one band at a time, so on one radio it must wait until the ACARS jobs are stopped.
 
 `knowledge_lookup` says which decoder proves a band's signature (`decoder` names the mode id, the job kind; `null` when no mode proves it yet). `classify` tries the best-scoring modes with a quick attempt (APRS, POCSAG, ACARS, RDS) as decode-to-identify and lists each under `tried` with its outcome; it never runs a program row such as ADS-B (`skipped_quick`: use `adsb_decode`). A CRC-clean decode is the strongest layer 2 evidence there is. A signature match without one is a guess: say so.
 

@@ -199,7 +199,8 @@ pub enum Op {
     /// jobs started or stopped later join and leave by themselves within a second. It
     /// outputs `audio` and `event` streams; each change of who is talking publishes
     /// `{"protocol": "mix", "active": [{"job", "source", "center_hz"}], "t_ns", "summary"}`.
-    /// Attached jobs, a `watch`'s or `identify`'s own jobs and other mixes are not mixed.
+    /// Attached jobs, a `watch`'s or `identify`'s own jobs, other mixes and jobs centred
+    /// on a plan channel that carries no voice (UHF CB ch22 and ch23) are not mixed.
     /// With a mix of the same set of sources already running the result is its id; `null`
     /// matches only `null`, so a list naming every source is another mix. It runs until
     /// stopped, and a node restart resumes it after the jobs it mixes.
@@ -279,8 +280,10 @@ pub enum Op {
     /// wider than the source is `out_of_range` on `bandwidth_hz`. Each channel is then
     /// started in channel-number order inside that capture: one that fails is listed
     /// under `refused` with its error and the rest go on. With `attach`, each started
-    /// job (and each `existing` one without one) gets one attached; a failure is that
-    /// channel's `attach_error`, the job kept. The result: `capture`, `started`
+    /// job (and each `existing` one without one) gets one attached, except on a channel
+    /// that carries no voice (UHF CB ch22 and ch23, every ACARS channel), which a
+    /// warning names; a failure is that channel's `attach_error`, the job kept. The
+    /// result: `capture`, `started`
     /// (`channel`, `center_hz`, `job`, `attached`, `attach_error`), `existing`
     /// (`channel`, `center_hz`, `job`, `attached`), `refused` (`channel`, `center_hz`,
     /// `error`) and `warnings` (strings to repeat to the operator; empty when there is
@@ -3684,7 +3687,30 @@ async fn plan_start(
     // attach needs no gate (an attached job holds no lease).
     let mut warnings = Vec::new();
     if let Some(a) = &attach {
-        for s in &mut started {
+        // A channel that carries no voice (CB ch22, ch23) gets no attached stage: its
+        // demodulator runs, and the warning names the channels left out.
+        let no_voice = |n: u32| p.no_voice.contains(&n);
+        let mut skipped: Vec<u32> = started
+            .iter()
+            .map(|s| s.channel)
+            .chain(
+                existing
+                    .iter()
+                    .filter(|e| e.attached.is_none())
+                    .map(|e| e.channel),
+            )
+            .filter(|&n| no_voice(n))
+            .collect();
+        skipped.sort_unstable();
+        if !skipped.is_empty() {
+            let chs: Vec<String> = skipped.iter().map(|n| format!("ch{n}")).collect();
+            warnings.push(format!(
+                "{}: data, no voice: no {} attached",
+                chs.join(", "),
+                a.name()
+            ));
+        }
+        for s in started.iter_mut().filter(|s| !no_voice(s.channel)) {
             match attach_one(node, a, &s.job, &language).await {
                 Ok(id) => s.attached = Some(id),
                 Err(e) => s.attach_error = Some(e),
@@ -3692,7 +3718,10 @@ async fn plan_start(
         }
         // An existing entry has no error field: one that cannot be attached stays
         // without, says why in a warning, and a second run tries again.
-        for e in existing.iter_mut().filter(|e| e.attached.is_none()) {
+        for e in existing
+            .iter_mut()
+            .filter(|e| e.attached.is_none() && !no_voice(e.channel))
+        {
             match attach_one(node, a, &e.job, &language).await {
                 Ok(id) => e.attached = Some(id),
                 Err(err) => warnings.push(format!("ch{}: attach failed: {err}", e.channel)),

@@ -783,7 +783,10 @@ async fn channel_plans_lists_uhf_cb_au() {
     let Ok(OpResult::ChannelPlans { plans }) = node.apply(Op::ChannelPlans {}).await else {
         panic!("expected ChannelPlans");
     };
-    assert_eq!(plans.len(), 1);
+    assert_eq!(
+        plans.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        ["uhf_cb_au", "acars_vhf"]
+    );
     let p = &plans[0];
     assert_eq!((p.id.as_str(), p.region.as_str()), ("uhf_cb_au", "au"));
     assert_eq!((p.bandwidth_hz, p.adjacent_hz), (Hz(12_500), Hz(12_500)));
