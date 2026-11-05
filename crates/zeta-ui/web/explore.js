@@ -15,6 +15,10 @@
 //   `symbol_rate_baud` the row's `input.bits-rate`, prefilled from the features' symbol rate,
 //   null when empty so the node fills it; the transcript says `started bits <id> on <kHz> kHz`
 //   or the error, then the Bits pane is selected; a rate typed survives the 2 s redraw).
+//   Above the rows a `.explore-tools` bar holds Delete all (`button[data-action="delete-all"]`,
+//   armed like Delete: `sure?` for DELETE_CONFIRM_MS, then a second click deletes every
+//   capture that is not pinned, one `capture_delete` each, and notes
+//   `deleted <n> captures` with `(<m> pinned kept)` or the failures appended).
 //   Draws the cached region (ov.span, tagged with the id's last 6 characters) of each capture
 //   still on the waterfall's columns (one that ended before the oldest column is skipped).
 //   Registers the `explore` pane with the strip, eligible while any capture exists, and selects
@@ -22,7 +26,7 @@
 //   reload never takes the pane back from the stored one (spec 5.7, auto-selected the first
 //   time a capture appears, never again).
 
-import { bandText, khzText } from "./units.js";
+import { bandText, khzText, registerText } from "./units.js";
 
 export const EXPLORE_POLL_MS = 2000;
 export const DELETE_CONFIRM_MS = 3000;
@@ -84,6 +88,8 @@ class ExplorePane {
     this.timer = null;
     this.destroyed = false;
     this.armed = new Map(); // capture id -> timer of the pending delete confirmation
+    this.armedAll = null; // timer of the pending Delete all confirmation
+    this.deletingAll = false;
     this.busy = new Set();
     this.rates = new Map(); // capture id -> the symbol rate typed in its row
     this.onInput = (ev) => {
@@ -224,7 +230,16 @@ class ExplorePane {
     }
     const table = document.createElement("table");
     table.append(body);
-    this.el.replaceChildren(table);
+    const tools = document.createElement("div");
+    tools.className = "explore-tools";
+    const all = document.createElement("button");
+    all.type = "button";
+    all.dataset.action = "delete-all";
+    all.textContent = this.armedAll !== null ? "sure?" : "Delete all";
+    all.title = "capture_delete every capture that is not pinned";
+    all.disabled = this.deletingAll || !this.captures.some((c) => !c.pinned);
+    tools.append(all);
+    this.el.replaceChildren(tools, table);
   }
 
   // The symbol rate Work the bits sends: what was typed, else the features' (empty: none).
@@ -243,6 +258,7 @@ class ExplorePane {
 
   async click(ev) {
     const b = ev.target.closest("button[data-action]");
+    if (b && b.dataset.action === "delete-all") return this.removeAll();
     const tr = ev.target.closest("tr.capture");
     if (!b || !tr) return;
     const id = tr.dataset.id;
@@ -273,6 +289,8 @@ class ExplorePane {
       for (const t of v.tried || []) {
         this.t.note(`tried ${t.mode} ${Number(t.score).toFixed(2)} ${t.outcome}`);
       }
+      const reg = registerText(v.allocations);
+      if (reg) this.t.note(`${id}: ${reg}`);
     } catch (e) {
       this.t.note(`capture_classify: ${e.message}`, true);
     }
@@ -342,9 +360,46 @@ class ExplorePane {
     await this.poll();
   }
 
+  // Delete all (see the header): arm, then every unpinned capture of the last list.
+  async removeAll() {
+    if (this.deletingAll) return;
+    if (this.armedAll === null) {
+      this.armedAll = setTimeout(() => {
+        this.armedAll = null;
+        if (!this.destroyed) this.render();
+      }, DELETE_CONFIRM_MS);
+      this.render();
+      return;
+    }
+    clearTimeout(this.armedAll);
+    this.armedAll = null;
+    this.deletingAll = true;
+    this.render();
+    const pinned = this.captures.filter((c) => c.pinned).length;
+    let deleted = 0;
+    const failed = [];
+    try {
+      for (const c of this.captures.filter((x) => !x.pinned)) {
+        try {
+          await this.api.op({ op: "capture_delete", capture: c.id });
+          deleted += 1;
+        } catch (e) {
+          failed.push(`${c.id}: ${e.message}`);
+        }
+      }
+    } finally {
+      this.deletingAll = false;
+    }
+    const kept = pinned ? ` (${pinned} pinned kept)` : "";
+    this.t.note(`deleted ${deleted} capture${deleted === 1 ? "" : "s"}${kept}`);
+    for (const f of failed) this.t.note(`capture_delete ${f}`, true);
+    await this.poll();
+  }
+
   destroy() {
     this.destroyed = true;
     clearTimeout(this.timer);
+    clearTimeout(this.armedAll);
     for (const t of this.armed.values()) clearTimeout(t);
     this.el.removeEventListener("click", this.onClick);
     this.el.removeEventListener("input", this.onInput);

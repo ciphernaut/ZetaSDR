@@ -870,6 +870,8 @@ function start(api) {
   state.ov.onEvent((job, p) => {
     state.subjects?.event(job, p);
     state.map?.event(job, p);
+    const line = verdictLine(job, p);
+    if (line) state.transcript.note(line);
   });
   state.subjectsPane = mountSubjectsPane($("#subjects"), state.subjects, state.view, {
     jobs: () => state.lastJobs,
@@ -972,11 +974,56 @@ function start(api) {
       state.panes?.select("bits");
     },
   });
+  armClearAll($("#jobs-clear"));
   state.mic = mountMic($("#mic"), api, (text) => {
     $("#cmd").value = text;
     submitCommand();
   });
   loadSources();
+}
+
+// The transcript line of a watched job's verdict, or null: a watch's `unknown`, `decoding`
+// and `lost` events and an identify's `verdict` event, as `<kind> <id tail>: <summary>`
+// (an unknown's summary carries the register's nearest transmitter). Its ribbon still
+// shows on the waterfall; the line keeps it.
+export const VERDICT_WATCH_STATES = new Set(["unknown", "decoding", "lost"]);
+function verdictLine(job, p) {
+  if (!p || typeof p !== "object" || typeof p.summary !== "string") return null;
+  const watch = p.protocol === "watch" && VERDICT_WATCH_STATES.has(p.state);
+  if (!watch && p.protocol !== "verdict") return null;
+  return `${job.kind} ${String(job.id).slice(-6)}: ${p.summary}`;
+}
+
+// The Jobs pane's Clear all: a first click arms it (`sure?` for CLEAR_CONFIRM_MS), a second
+// applies the typed `stop all` (one `jobs_stop`, every job but the page's elastic spectrum)
+// and then drops the finished rows as `view clear` does.
+export const CLEAR_CONFIRM_MS = 3000;
+function armClearAll(btn) {
+  if (!btn) return;
+  let armed = null;
+  const label = btn.textContent;
+  btn.addEventListener("click", async () => {
+    if (armed === null) {
+      btn.textContent = "sure?";
+      armed = setTimeout(() => {
+        armed = null;
+        btn.textContent = label;
+      }, CLEAR_CONFIRM_MS);
+      return;
+    }
+    clearTimeout(armed);
+    armed = null;
+    btn.textContent = label;
+    btn.disabled = true;
+    try {
+      state.transcript.user("stop all");
+      await applyOp({ op: "jobs_stop", source: null, kind: null, plan: null });
+      await state.jobs?.refresh(); // the stopped jobs are finished rows before the clear
+      state.view?.clear();
+    } finally {
+      btn.disabled = false;
+    }
+  });
 }
 
 // The channel names drawn again: the outlines and the axis (the job rows redraw themselves

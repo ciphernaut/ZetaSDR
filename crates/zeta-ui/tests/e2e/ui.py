@@ -3440,6 +3440,9 @@ def scenario_identify_from_a_box_shows_candidates(page, url, secret):
         expect(menu).to_be_hidden()
         ribbon = page.locator("#waterfall .ov-ribbon.candidate", has_text="pocsag_decode: proved")
         expect(ribbon.first).to_be_visible(timeout=10_000)
+        # The verdict event is kept as a transcript line, not only a passing ribbon.
+        expect(page.locator("#transcript .line.note", has_text="identify ").filter(
+            has_text=re.compile(r"POCSAG at 148\.\d{4} MHz: "))).to_have_count(1, timeout=10_000)
         # The suite's `fake_pos` row (ui.rs) is too wide for this box: never tried here.
         cands = page.locator("#waterfall .ov-ribbon.candidate").all_text_contents()
         tried = [c for c in cands if c.startswith("fake_pos:") and "skipped_band" not in c]
@@ -6141,6 +6144,50 @@ def scenario_explore_what_is_this_and_delete(page, url, secret):
     page.wait_for_timeout(2500)
     assert view_value(page, "pane") == "pane none", view_value(page, "pane")
     clear_captures(url, secret)
+
+
+def scenario_explore_delete_all_removes_every_capture(page, url, secret):
+    clear_captures(url, secret)
+    job = start_job(url, secret, "capture", "tone", 100_001_000, 6_000)
+    two_windows(url, secret, job)
+    wait_until(lambda: len(capture_ops(url, secret, "capture_list", signal=None)) == 2,
+               30, "two captures")
+    login(page, url, secret)
+    page.locator('#panes .pane-tab[data-pane="explore"]').click()
+    expect(page.locator("#explore tr.capture")).to_have_count(2, timeout=20000)
+    all_btn = page.locator('#explore button[data-action="delete-all"]')
+    all_btn.click()
+    expect(all_btn).to_have_text("sure?")
+    assert len(capture_ops(url, secret, "capture_list", signal=None)) == 2, "one click deletes nothing"
+    all_btn.click()
+    expect(page.locator("#transcript .line.note", has_text="deleted 2 captures")).to_have_count(1)
+    expect(page.locator("#explore tr.capture")).to_have_count(0)
+    assert capture_ops(url, secret, "capture_list", signal=None) == [], "the store is empty"
+
+
+def scenario_jobs_clear_all_stops_and_drops_the_rows(page, url, secret):
+    url = llm_url()
+    select_source(page, url, secret, "cb")
+    jobs = lambda kind: running_kind(url, secret, kind, "cb")
+    job = start_job(url, secret, "measure", "cb", 476_900_000, 10_000)
+    try:
+        row = page.locator(f'#jobs .job[data-job="{job}"]')
+        expect(row).to_have_count(1, timeout=10000)
+        btn = page.locator("#jobs-clear")
+        btn.click()
+        expect(btn).to_have_text("sure?")
+        assert jobs("measure") == [job], "one click stops nothing"
+        btn.click()
+        expect(page.locator("#transcript .line.op", has_text="jobs_stop").filter(
+            has_text="1 stopped, 0 failed")).to_have_count(1)
+        assert not jobs("measure"), "Clear all stopped the job"
+        assert jobs("spectrum"), "the page's elastic spectrum keeps running"
+        # Its finished row is dropped at once, not after finished_rows_s.
+        expect(row).to_have_count(0)
+        expect(btn).to_have_text("Clear all")
+    finally:
+        for j in jobs("measure"):
+            stop_job(url, secret, j)
 
 
 def scenario_a_capture_draws_a_bracket_while_on_screen(page, url, secret):

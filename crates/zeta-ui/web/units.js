@@ -9,6 +9,21 @@
 //       "6401 m", `kt`, `km_h` -> "780 km/h", `m_s` -> "+5.0 m/s" (a climb rate stays a climb
 //       rate, one decimal and its sign), `deg` -> "245°" (359.6 -> "0°"); no unit or a
 //       non-number as sent, an object as JSON; null or undefined -> ""
+//   registerText(allocations) -> "register says <EMISSION> <licensee>, <site>, <d> km, <p> W"
+//       for the nearest `tx` assignment of a classification's or verdict's allocations
+//       (parts it lacks left out), or null when there is none
+
+export function registerText(allocations) {
+  const tx = (allocations || [])
+    .filter((a) => a && a.role === "tx")
+    .sort((a, b) => (a.distance_km ?? Infinity) - (b.distance_km ?? Infinity))[0];
+  if (!tx) return null;
+  const where = [tx.licensee, tx.site].filter((x) => typeof x === "string" && x);
+  if (typeof tx.distance_km === "number") where.push(`${tx.distance_km.toFixed(0)} km`);
+  if (typeof tx.power_w === "number") where.push(`${tx.power_w} W`);
+  const code = typeof tx.emission === "string" ? ` ${tx.emission}` : "";
+  return `register says${code} ${where.join(", ")}`.trim();
+}
 
 export function mhzText(hz) {
   return (hz / 1e6).toFixed(4);

@@ -87,6 +87,10 @@ pub struct StageContext {
     /// The absolute frequency of the receiver's DC (the capture's centre), `Some`
     /// only for a job on a local hardware source (`ops::local_hardware`).
     pub dc_hz: Option<u64>,
+    /// The job's own band `[lo, hi]` in absolute Hz, `Some` only for a rigid job on a
+    /// radio: its capture may be wider (a shared or pinned one), and a stage that looks
+    /// at the whole capture (`detect` over the `fft` rows) keeps to it.
+    pub band: Option<[u64; 2]>,
     /// The node's list of audio outputs, `Some` for every job in a node (only a `mix`
     /// stage reads it).
     pub mix_inputs: Option<MixInputs>,
@@ -106,6 +110,7 @@ impl StageContext {
             note: None,
             mode: None,
             dc_hz: None,
+            band: None,
             mix_inputs: None,
             station: None,
             bursts: None,
@@ -128,6 +133,11 @@ impl StageContext {
     /// This context with the receiver's DC at `hz` (`None` for none).
     pub fn with_dc_hz(self, hz: Option<u64>) -> Self {
         Self { dc_hz: hz, ..self }
+    }
+
+    /// This context with the job's own band `[lo, hi]` (`None` for none).
+    pub fn with_band(self, band: Option<[u64; 2]>) -> Self {
+        Self { band, ..self }
     }
 
     /// This context with `note`.

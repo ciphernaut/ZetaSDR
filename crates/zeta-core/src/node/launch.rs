@@ -211,10 +211,16 @@ impl Inner {
             .expandable_kind(&rec.kind)
             .and_then(|k| k.mode_row(&self.modes).ok().flatten())
             .map(|row| Arc::new(row.clone()));
+        // A rigid job on a radio keeps to its own band inside a wider capture.
+        let band = (port.is_some() && !rec.elastic).then(|| {
+            let (c, half) = (rec.tuning.center_hz.0, rec.tuning.bandwidth_hz.0 / 2);
+            [c.saturating_sub(half), c + half]
+        });
         let ctx = StageContext {
             bank,
             mode,
             dc_hz,
+            band,
             station: self.station.lock().unwrap().clone(),
             bursts: Some(self.bursts.clone()),
             ..StageContext::new(rec.source.clone())

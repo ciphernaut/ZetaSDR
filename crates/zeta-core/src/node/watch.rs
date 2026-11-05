@@ -250,6 +250,19 @@ impl Signal {
     }
 }
 
+/// The index of the tracked signal whose band overlaps `center_hz` ± `bandwidth_hz`/2 and
+/// whose centre lies nearest `center_hz`: a wide track that also covers a narrow one's
+/// centre (two runs the detector sees side by side) never takes the narrow one's verdict
+/// or announcement.
+fn nearest(signals: &[Tracked], center_hz: u64, bandwidth_hz: u64) -> Option<usize> {
+    signals
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.signal.overlaps(center_hz, bandwidth_hz))
+        .min_by_key(|(_, x)| x.signal.center_hz.abs_diff(center_hz))
+        .map(|(i, _)| i)
+}
+
 /// A signal the watch follows (`job_context.watch.signals`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Tracked {
@@ -1167,10 +1180,7 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                 false => d.gone_since_ns = Some(t),
             }
         }
-        let tracked = w
-            .signals
-            .iter()
-            .position(|x| x.signal.overlaps(s.center_hz, s.bandwidth_hz));
+        let tracked = nearest(&w.signals, s.center_hz, s.bandwidth_hz);
         match (new, tracked) {
             (true, Some(i)) => {
                 w.signals[i].signal = s;
@@ -1241,7 +1251,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     }
     let verdict = inner.verdicts.lock().unwrap().remove(&id);
     w.current = None;
-    let Some(i) = w.signals.iter().position(|x| x.signal.overlaps(center, 1)) else {
+    let Some(i) = nearest(&w.signals, center, 1) else {
         // Its signal is gone from the list: a proof's decoder is not kept.
         if let Some(job) = verdict
             .as_ref()
@@ -1388,7 +1398,7 @@ fn khz(hz: u64) -> String {
 
 /// ` <bw> kHz[, <baud> Bd][, duty <d>]` from a verdict's layer-1 `features`, or nothing
 /// without a record.
-fn measured(features: &serde_json::Value) -> String {
+pub(super) fn measured(features: &serde_json::Value) -> String {
     let Some(bw) = features["bandwidth_hz"].as_u64() else {
         return String::new();
     };
@@ -1429,7 +1439,7 @@ fn info_word(e: &serde_json::Value) -> String {
 /// the nearest `tx` assignment of `allocations` (an identify verdict's, nearest
 /// first): without a decoded designator `; register says <licensee>, <site>, <d> km`;
 /// nothing when there is no transmitter.
-fn register_says(allocations: &serde_json::Value) -> String {
+pub(super) fn register_says(allocations: &serde_json::Value) -> String {
     let nearest = allocations
         .as_array()
         .into_iter()
@@ -1605,5 +1615,42 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
                 return Next::Started;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tracked(center_hz: u64, bandwidth_hz: u64) -> Tracked {
+        Tracked {
+            signal: Signal {
+                center_hz,
+                bandwidth_hz,
+                snr_db: 20.0,
+                first_ns: 0,
+                last_ns: 0,
+            },
+            present: true,
+            tries: 0,
+            next_retry_ns: None,
+            handled: false,
+            band_hz: 12_500,
+            score: 0.0,
+            features: None,
+            allocations: None,
+            captured: false,
+            captures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_verdict_goes_to_the_nearest_overlapping_track() {
+        // Seen live 2026-11-05: a 22.5 kHz track at 404.0254 MHz also covers the 7 kHz
+        // track at 404.0285 MHz, and took every one of its verdicts ("identify 9 of 4").
+        let signals = vec![tracked(404_025_377, 22_500), tracked(404_028_540, 7_031)];
+        assert_eq!(nearest(&signals, 404_028_540, 1), Some(1));
+        assert_eq!(nearest(&signals, 404_025_400, 1), Some(0));
+        assert_eq!(nearest(&signals, 404_100_000, 1), None);
     }
 }
