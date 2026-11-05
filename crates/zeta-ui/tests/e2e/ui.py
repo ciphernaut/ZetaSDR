@@ -3337,7 +3337,7 @@ def scenario_squelch_dots_are_not_starved_by_squelch_off_demods(page, url, secre
 def scenario_no_feed_is_noted_once(page, url, secret):
     # A node without a feed for the shown source (an older node; stubbed here with
     # zetaTest.hideFeeds) is noted once; the outlines still draw, and once the feed is listed
-    # the next sync opens it (no second note) and the row's squelch tag comes.
+    # the next sync opens it (no second note) and the page learns the job's squelch gate.
     select_source(page, url, secret, "tone")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
     page.evaluate("window.zetaTest.hideFeeds(true)")
@@ -3357,7 +3357,11 @@ def scenario_no_feed_is_noted_once(page, url, secret):
         page.evaluate("window.zetaTest.hideFeeds(false)")
         page.evaluate("window.zetaTest.poll()")
         page.evaluate("window.zetaTest.poll()")
-        expect(job_row(page, job).locator(".kind .tag.squelch")).to_be_visible(timeout=5_000)
+        # The tag shows only while the gate is closed, and whether the recording holds a signal
+        # in this band depends on where earlier scenarios left the source: the page knowing the
+        # gate is the proof the feed was opened and the job seeded.
+        page.wait_for_function(
+            f"() => window.zetaTest.squelchJobs().includes('{job}')", timeout=5_000)
         expect(note).to_have_count(1)
     finally:
         if job:

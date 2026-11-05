@@ -537,6 +537,9 @@ class Overlays {
           return;
         }
         feed.opened = true;
+        // Events published before this open were never seen: a "no gate yet" answer from
+        // before it is stale, so those jobs are asked again.
+        this.gateless.clear();
         this.seedPass(this.shownJobs());
       },
     });

@@ -1495,6 +1495,10 @@ window.zetaTest = {
   home() {
     return state.view ? homeOf(state.view) : null;
   },
+  // The ids of the running jobs on the shown source whose squelch gate the page knows.
+  squelchJobs() {
+    return state.ov ? [...state.ov.squelches.keys()] : [];
+  },
   poll() {
     return state.jobs ? state.jobs.refresh() : Promise.resolve();
   },
