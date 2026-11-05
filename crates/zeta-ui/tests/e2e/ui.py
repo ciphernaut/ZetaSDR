@@ -3202,6 +3202,9 @@ def scenario_frame_before_poll_is_drawn_after_it(page, url, secret):
         # The first measure event lands within about a second; wait for two.
         page.wait_for_timeout(2_500)
         assert page.evaluate("window.zetaTest.pendingFrames()") >= 1
+        # A poll that started before the job did lands: the frame survives it.
+        page.evaluate("window.zetaTest.staleSync()")
+        assert page.evaluate("window.zetaTest.pendingFrames()") >= 1
         page.evaluate("window.zetaTest.pausePolling(false)")
         page.evaluate("window.zetaTest.poll()")
         page.wait_for_function(

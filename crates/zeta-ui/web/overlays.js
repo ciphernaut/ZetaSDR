@@ -366,6 +366,7 @@ class Overlays {
     this.hideFeeds = false; // zetaTest.hideFeeds: resolve as if no feed were listed
     this.pending = []; // feed frames held until their job is known (ov.hold)
     this.pollAsked = false; // a poll requested by ov.hold is in flight
+    this.pollAgain = false; // another is wanted once it ends
     this.seeding = new Set(); // job ids whose `job_context` squelch read is in flight
     // job id -> graphKey of a job whose context answered with no gate (its squelch off) or
     // whose read failed: not asked again until its graph changes or ov.reseedAll runs.
@@ -565,35 +566,53 @@ class Overlays {
   // Keeps a frame whose job the last poll did not list as running (or whose row is not yet
   // settled) and asks for a poll; ov.replayPending draws it once the job is known.
   hold(frame) {
-    this.pending.push(frame);
+    this.pending.push({ frame, seen: 0 });
     if (this.pending.length > PENDING_MAX) this.pending.splice(0, this.pending.length - PENDING_MAX);
-    if (this.pollAsked) return;
+    this.askPoll();
+  }
+
+  // Asks for a poll; one in flight at a time. A request made while one is in flight (which
+  // may have started before the frame was held) is repeated once it ends.
+  askPoll() {
+    if (this.pollAsked) {
+      this.pollAgain = true;
+      return;
+    }
     this.pollAsked = true;
     Promise.resolve()
       .then(() => this.requestPoll())
       .catch(() => {})
       .finally(() => {
         this.pollAsked = false;
+        if (this.pollAgain && !this.destroyed) {
+          this.pollAgain = false;
+          this.askPoll();
+        }
       });
   }
 
   // Renders the held frames whose job is known now, in order. A frame stays while its job's
-  // row is unsettled, or (on a sync not from a fresh poll) while no poll has listed the job;
-  // a fresh poll that does not list it as running drops the frame.
+  // row is unsettled. A fresh poll that does not list its job counts against it: the first
+  // keeps it (the poll may have started before the job did) and asks for one more poll, the
+  // second drops it.
   replayPending(fresh) {
     if (!this.pending.length) return;
     const held = this.pending;
     this.pending = [];
-    for (const f of held) {
-      const job = this.feedJob(f.job);
+    let again = false;
+    for (const h of held) {
+      const job = this.feedJob(h.frame.job);
       if (job) {
-        this.render(job, f.payload);
+        this.render(job, h.frame.payload);
         continue;
       }
-      const j = this.lastJobs.find((x) => x.id === f.job);
+      const j = this.lastJobs.find((x) => x.id === h.frame.job);
       const listed = j && j.source === this.sourceId && isRunning(j) && j.kind !== "spectrum";
-      if (listed || !fresh) this.pending.push(f);
+      if (!listed && fresh && ++h.seen >= 2) continue;
+      if (!listed && fresh) again = true;
+      this.pending.push(h);
     }
+    if (again) this.askPoll();
   }
 
   // A lag or a reconnect of the feed: every gate may have changed unseen; forget them and

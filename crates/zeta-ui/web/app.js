@@ -1503,6 +1503,11 @@ window.zetaTest = {
     pollPaused = !!on;
     state.jobs?.pause(pollPaused);
   },
+  // Runs ov.sync with the current (stale) job list as a fresh poll: a poll that started
+  // before a held frame's job did.
+  staleSync() {
+    if (state.ov) state.ov.sync([...state.lastJobs], shown());
+  },
   // How many feed frames the overlays hold for a job no poll has listed yet.
   pendingFrames() {
     return state.ov ? state.ov.pending.length : 0;
