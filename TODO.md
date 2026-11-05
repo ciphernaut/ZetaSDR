@@ -70,11 +70,11 @@ An `identify` run's trial children (and a watch's identify runs) are ordinary re
 
 ## Node: stream sockets are a fixed pool
 
-One open page held 12-16 of the node's 16 stream slots (`max_ws`); a second page got `stream refused: too many stream connections` on every stream and could not paint (the B210 live run of plans 15/18, 2026-11-01; the operator's page hit it again while agent `stream tail`s ran). The default was raised 16 → 64 the same day. Still to do: a `--max-streams N` flag on `serve` (env `ZETA_MAX_STREAMS`), per-client fairness so one page cannot take the whole pool, and the page releasing the streams it no longer shows.
+One open page held 12-16 of the node's 16 stream slots (`max_ws`); a second page got `stream refused: too many stream connections` on every stream and could not paint (the B210 live run of plans 15/18, 2026-11-01; the operator's page hit it again while agent `stream tail`s ran). The default was raised 16 → 64 the same day. Still to do: a `--max-streams N` flag on `serve` (env `ZETA_MAX_STREAMS`), per-client fairness so one page cannot take the whole pool. The page now holds one feed socket per shown source (plan 27).
 
-## UI: the page watches at most 4 jobs, so a tag loses its squelch dot
+## Page: positioned jobs on other sources onto their feeds
 
-With four demods and a `transcribe` attached, the oldest demod's tag had no squelch dot: the transcribe took a watched slot first (`MAX_WATCHED` 4, decoders before squelch-only jobs). Watch the squelch for every rigid job on the shown source, or prefer demodulators for the slots. The jobs fold uses the watched-mix active set for unwatched jobs, so without a mix the fold only covers watched and squelch-less jobs. From the B210 live run of plans 15/18, 2026-11-01.
+`MAX_POSITIONED` and the per-job sockets remain for the map's jobs on other sources. One feed per such source replaces them.
 
 ## Jobs: an attached job's record keeps its input's old tuning after a retune
 
@@ -431,10 +431,6 @@ What "the language" should give it, as a direction (not designed yet):
 - The field craft as the playbook a model reads (it is already AGENTS.md), extended with worked sessions like this one written as recipes rather than prose.
 
 Prerequisites already in TODO: recipes (below), the rtl_433 live decoder (spec draft `docs/superpowers/specs/2026-11-04-ism-remotes-design.md`), the layer-1 OOK fixes. Brainstorm with the operator before a spec.
-
-## UI: transcript ribbons stop at the 4-job watch cap on a plan
-
-Seen 2026-11-05 on 39 CB transcribers: the page watches the event streams of the `MAX_WATCHED` (4) newest running jobs on the shown source, so after a `plan_start` the watched four are the last channels' transcribers (ch37-40) and every ribbon from ch9, ch16 and ch20 is lost; the rows over the cap say "not watched (limit 4)". Not the theme: no theme touches `overlays.js`. Each watched transcriber costs two sockets (`vad` and `transcript`) out of the node's 64 (`max_ws`), so lifting the cap alone cannot cover 40 channels. Options, cheapest first: re-attach the busy channels' transcribers so they are newest (no code); `MAX_WATCHED` 40 and subscribe only to `transcript` (one page fits, two do not); the same with `max_ws` 256 and the `--max-streams` flag; **one event feed per source** (a filtered stream of every event of every job on a source, one socket per page: also fixes the squelch dots and the fold evidence); a node-level `transcripts` stream beside `ops`, nearly free since `launch.rs` `tee_transcripts` already subscribes to every transcript output for `transcripts.log`. Recommended: the per-source feed, with the `transcripts` stream as its first subset.
 
 ## Architecture: fan-out, and the transcriber as part of its demodulator's graph (towards a ComfyUI-style editor)
 

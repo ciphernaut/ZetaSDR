@@ -860,6 +860,8 @@ demodulator's audio, holds no radio lease and ends when that job stops:
 2. `job attach --kind transcribe --job THAT_ID`. Its chain is `stream_in → denoise → vad → transcribe` (without the `denoise` when the demodulator already denoises its own audio, below).
 3. `stream list` shows two event streams on the attached job (`vad`'s and `transcribe`'s); `stream tail` them. A `transcript` event is one utterance (`text`, `language`, `start_ns`, `end_ns`); `vad` events mark where speech starts and stops. An empty tail means no utterance ended in the window, not that nothing was said.
 
+`stream_tail` the source's feed (`stream_list`: the `event` stream with that source and no `job`) shows every transcript, `vad` and `squelch` event of every job on the radio in one call, each frame naming its job.
+
 Transcription is per demodulator: a `mix` (see "Listening to many channels") is not transcribed unless the operator asks for it.
 
 The node needs a speech backend (`--stt-socket` or `--stt-node`); without one the attached job fails naming it, so report that and do not retry. Language: the attached job transcribes `en` unless it was attached with `language`; a language the backend does not list (see `GET /stt/languages`) fails the job naming the languages it has. Do not guess a language from the band.

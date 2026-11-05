@@ -210,7 +210,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
     page.wait_for_timeout(500)
     health = http_json(url, secret, "/health")
-    assert health["ws_connections"] <= 2, f"duplicate sockets: {health}"
+    assert health["ws_connections"] <= 3, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
     expect(page.locator("#transcript")).to_contain_text("source_list → ok (10 sources)")
