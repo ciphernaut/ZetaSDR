@@ -724,7 +724,7 @@ node, secret = "127.0.0.1:7979", os.environ["ZETA_SECRET"]
 req = urllib.request.Request(f"http://{node}/streams", headers={"Authorization": "Bearer " + secret})
 streams = json.load(urllib.request.urlopen(req))
 ops = next(s["id"] for s in streams if s["provenance"]["source"] == "node")
-feed = next(s["id"] for s in streams if s["provenance"]["source"] == "b210" and s["kind"] == "event" and s["provenance"]["job"] is None)  # the b210 feed: swap it for `ops` below to watch the radio instead
+feed = next((s["id"] for s in streams if s["provenance"]["source"] == "b210" and s["kind"] == "event" and s["provenance"]["job"] is None), None)  # connect to `feed` instead of `ops` below to watch the b210 radio (when it is not None)
 proto = "zeta.bearer." + base64.urlsafe_b64encode(secret.encode()).decode().rstrip("=")
 with connect(f"ws://{node}/stream/{ops}", subprotocols=["zeta", proto]) as ws:
     for msg in ws:
