@@ -11,7 +11,9 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use zeta_core::stream::{Frame, Payload};
-use zeta_core::types::{ChannelId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
+use zeta_core::types::{
+    ChannelId, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
+};
 use zeta_ws::testing::{TestOpts, TestServer, spawn, spawn_with};
 use zeta_ws::{Limits, WsMessage};
 
@@ -40,6 +42,27 @@ fn publish(ts: &TestServer, id: &StreamId, v: Value) {
         stream: id.clone(),
         kind: StreamKind::Event,
         provenance: prov(),
+        payload: Payload::Event(v),
+    });
+}
+
+fn job_prov(src: &str, job: &str) -> Provenance {
+    Provenance {
+        source: SourceId(src.to_string()),
+        job: Some(JobId(job.to_string())),
+        channel: None,
+        span: Span {
+            start_ns: Timestamp(1_000),
+            end_ns: Timestamp(2_000),
+        },
+    }
+}
+
+fn publish_as(ts: &TestServer, id: &StreamId, prov: Provenance, v: Value) {
+    ts.node.bus().publish(Frame {
+        stream: id.clone(),
+        kind: StreamKind::Event,
+        provenance: prov,
         payload: Payload::Event(v),
     });
 }
@@ -352,4 +375,49 @@ async fn tail_route_matches_stream_tail_op() {
         json!({"result": "frames", "value": {"frames": [], "missed": 0}})
     );
     ts.stop().await;
+}
+
+#[tokio::test]
+async fn a_feed_socket_sees_frames_of_two_jobs_with_their_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let feed = ts.node.bus().register_feed(&SourceId("tone".into()));
+    let mut ws = connect(&ts, &feed.0, Some(BEARER)).await.unwrap();
+    let j1 = ts
+        .node
+        .bus()
+        .register(StreamKind::Event, job_prov("tone", "j1"));
+    let j2 = ts
+        .node
+        .bus()
+        .register(StreamKind::Event, job_prov("tone", "j2"));
+    publish_as(
+        &ts,
+        &j1,
+        job_prov("tone", "j1"),
+        json!({"protocol": "transcript", "text": "one"}),
+    );
+    publish_as(
+        &ts,
+        &j2,
+        job_prov("tone", "j2"),
+        json!({"protocol": "squelch", "open": true}),
+    );
+    let a = parse(next(&mut ws, Duration::from_secs(2)).await);
+    let b = parse(next(&mut ws, Duration::from_secs(2)).await);
+    let WsMessage::Frame(a) = a else {
+        panic!("{a:?}")
+    };
+    let WsMessage::Frame(b) = b else {
+        panic!("{b:?}")
+    };
+    assert_eq!(
+        (
+            a.stream,
+            a.job.unwrap().0.as_str(),
+            a.payload["text"].as_str()
+        ),
+        (feed.clone(), "j1", Some("one"))
+    );
+    assert_eq!((b.stream, b.job.unwrap().0.as_str()), (feed, "j2"));
 }

@@ -506,6 +506,7 @@ else it gets 401.
 | `POST /op` | apply one operation (`{"op": ...}` JSON) |
 | `GET /schema` | the operation schema |
 | `GET /streams` | live streams |
+| `GET /stream/{id}` of a source's feed | every event of every job on the source over one socket; the feed is the `event` stream in `GET /streams` with that `provenance.source` and `job: null` |
 | `GET /agents-md` | the node's agent guide |
 | `GET /stream/{id}` | websocket of one stream |
 | `GET /streams/{id}/tail?max_frames=N&timeout_ms=T` | the `stream_tail` operation: up to N frames arriving within T ms |
@@ -721,7 +722,9 @@ import base64, json, os, urllib.request
 from websockets.sync.client import connect
 node, secret = "127.0.0.1:7979", os.environ["ZETA_SECRET"]
 req = urllib.request.Request(f"http://{node}/streams", headers={"Authorization": "Bearer " + secret})
-ops = next(s["id"] for s in json.load(urllib.request.urlopen(req)) if s["provenance"]["source"] == "node")
+streams = json.load(urllib.request.urlopen(req))
+ops = next(s["id"] for s in streams if s["provenance"]["source"] == "node")
+feed = next(s["id"] for s in streams if s["provenance"]["source"] == "b210" and s["kind"] == "event" and s["provenance"]["job"] is None)  # the b210 feed: swap it for `ops` below to watch the radio instead
 proto = "zeta.bearer." + base64.urlsafe_b64encode(secret.encode()).decode().rstrip("=")
 with connect(f"ws://{node}/stream/{ops}", subprotocols=["zeta", proto]) as ws:
     for msg in ws:
