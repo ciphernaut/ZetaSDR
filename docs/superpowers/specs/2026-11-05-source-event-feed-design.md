@@ -76,7 +76,7 @@ reads with one socket) applied per radio, so an agent gets it for free: `stream_
   `StreamInfo {id, kind, provenance}`; `publish` drops a frame whose kind differs from its
   stream's. `StreamInfo` is `deny_unknown_fields` and serialised to every `--node` client, so a new
   field breaks an older `zeta` client with `decoding node response: unknown field`
-  (`deploy/field-host/z.sh` has the note). This plan adds no field to it.
+  (the field host's `z.sh` deploy helper has the note). This plan adds no field to it.
 - A job's output streams and its inner edge streams are both registered on the bus by
   `node_outputs` in `launch.rs`; a `scan` registers its row stream itself (`launch_scan`); the
   `ops` stream is registered by `Node::open` with provenance source `node` (`NODE_SOURCE`). The
