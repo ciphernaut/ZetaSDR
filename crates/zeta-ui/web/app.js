@@ -1523,6 +1523,25 @@ window.zetaTest = {
     const f = state.ov && state.ov.feed;
     if (f) state.ov.onFeedMessage(f, { type: "lagged", missed: 1 });
   },
+  // Seed reads (job_context for a squelch gate) wait, once answered, while on.
+  holdSeeds(on) {
+    const ov = state.ov;
+    if (!ov) return;
+    if (on && !ov.seedHold) {
+      ov.seedHold = new Promise((r) => (ov.seedRelease = r));
+    } else if (!on && ov.seedHold) {
+      const r = ov.seedRelease;
+      ov.seedHold = null;
+      r();
+    }
+  },
+  // How many times reseedAll ran, and how many seed reads were discarded as stale.
+  reseeds() {
+    return state.ov ? state.ov.reseeds : 0;
+  },
+  staleSeedsDiscarded() {
+    return state.ov ? state.ov.staleSeeds : 0;
+  },
   feedReconnect() {
     const f = state.ov && state.ov.feed;
     if (f) f.sub.drop();

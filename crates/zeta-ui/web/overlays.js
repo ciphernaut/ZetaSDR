@@ -371,6 +371,9 @@ class Overlays {
     // job id -> graphKey of a job whose context answered with no gate (its squelch off) or
     // whose read failed: not asked again until its graph changes or ov.reseedAll runs.
     this.gateless = new Map();
+    this.reseeds = 0; // reseedAll runs (zetaTest.reseeds)
+    this.staleSeeds = 0; // reads discarded for answering after a reseedAll
+    this.seedHold = null; // zetaTest.holdSeeds: a promise every read awaits once answered
     this.seedGen = 0; // bumped by ov.reseedAll: a read issued before it is discarded
     this.counters = new Map(); // job id -> non-spectrum events seen on the feed
     this.lastEvents = new Map(); // job id -> performance.now() of its last counted event
@@ -623,7 +626,7 @@ class Overlays {
     this.seedGen++;
     this.squelches.clear();
     this.gateless.clear();
-    this.seeding.clear();
+    this.reseeds++;
     this.pending = [];
     for (const j of this.shownJobs()) {
       setSquelchTag(this.jobRowEl(j), null);
@@ -790,10 +793,16 @@ class Overlays {
       r = await this.api.op({ op: "job_context", job: job.id });
     } catch {
       r = null;
-    } finally {
-      if (gen === this.seedGen) this.seeding.delete(job.id);
     }
-    if (this.destroyed || this.sourceId !== source || gen !== this.seedGen) return;
+    // The id stays in ov.seeding until the answer is processed, so the cap stays honest.
+    if (this.seedHold) await this.seedHold;
+    this.seeding.delete(job.id);
+    if (this.destroyed || this.sourceId !== source) return;
+    if (gen !== this.seedGen) {
+      this.staleSeeds++;
+      this.seedPass(this.shownJobs());
+      return;
+    }
     const now = this.lastJobs.find((x) => x.id === job.id && isRunning(x));
     const p = r && r.value && r.value.squelch;
     if (now && !this.squelches.has(job.id)) {

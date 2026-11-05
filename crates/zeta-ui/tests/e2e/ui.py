@@ -2474,8 +2474,9 @@ def scenario_job_rows_fold_idle_plan_channels(page, url, secret):
 
 
 def scenario_feed_lag_reseeds_squelch_dots(page, url, secret):
-    # A quiet fm_demod (closed) is tagged; a lag or a reconnect of the feed forgets the dot
-    # and the next read of job_context brings it back.
+    # A quiet fm_demod (closed) is tagged. A lag forgets the dot at once (seed reads held so
+    # the gap is observable) and the read brings it back; a reconnect re-seeds again; a read
+    # in flight across a second reseed is discarded as stale.
     quiet = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500)
     try:
         select_source(page, url, secret, "tone")
@@ -2483,12 +2484,33 @@ def scenario_feed_lag_reseeds_squelch_dots(page, url, secret):
         tag = job_row(page, quiet).locator(".kind .tag.squelch")
         expect(tag).to_be_visible(timeout=5_000)
         assert "closed" in (tag.get_attribute("title") or "")
+        r0 = page.evaluate("window.zetaTest.reseeds()")
+        page.evaluate("window.zetaTest.holdSeeds(true)")
         page.evaluate("window.zetaTest.feedLag()")
-        expect(job_row(page, quiet).locator(".kind .tag.squelch")).to_be_visible(timeout=5_000)
+        assert page.evaluate("window.zetaTest.reseeds()") == r0 + 1
+        expect(job_row(page, quiet).locator(".kind .tag.squelch")).to_have_count(0)
+        page.evaluate("window.zetaTest.holdSeeds(false)")
+        tag = job_row(page, quiet).locator(".kind .tag.squelch")
+        expect(tag).to_be_visible(timeout=5_000)
+        assert "closed" in (tag.get_attribute("title") or "")
+        # A reconnect: the socket reopens and the feed re-seeds.
+        before = stable_ws_connections(url, secret)[-1]
         page.evaluate("window.zetaTest.feedReconnect()")
-        page.evaluate("window.zetaTest.poll()")
-        expect(job_row(page, quiet).locator(".kind .tag.squelch")).to_be_visible(timeout=8_000)
+        wait_until(lambda: page.evaluate("window.zetaTest.reseeds()") >= r0 + 2, 10.0,
+                   "the reopened feed re-seeds")
+        assert stable_ws_connections(url, secret)[-1] == before
+        expect(job_row(page, quiet).locator(".kind .tag.squelch")).to_be_visible(timeout=5_000)
+        # A read in flight across a second reseed answers into a hole: discarded.
+        s0 = page.evaluate("window.zetaTest.staleSeedsDiscarded()")
+        page.evaluate("window.zetaTest.holdSeeds(true)")
+        page.evaluate("window.zetaTest.feedLag()")
+        page.evaluate("window.zetaTest.feedLag()")
+        page.evaluate("window.zetaTest.holdSeeds(false)")
+        wait_until(lambda: page.evaluate("window.zetaTest.staleSeedsDiscarded()") > s0, 5.0,
+                   "the pre-hole read is discarded")
+        expect(job_row(page, quiet).locator(".kind .tag.squelch")).to_be_visible(timeout=5_000)
     finally:
+        page.evaluate("window.zetaTest.holdSeeds(false)")
         stop_job(url, secret, quiet)
 
 
