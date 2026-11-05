@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 use zeta_core::node::{NODE_SOURCE, Node, NodeConfig, OPS_RESULT_LIMIT_BYTES};
+use zeta_core::ops::JobKind;
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::stream::{Frame, Payload};
-use zeta_core::types::{JobId, SourceId, StreamKind};
+use zeta_core::types::{Hz, JobId, SourceId, StreamKind};
 use zeta_source_file::{FileOpts, FileSource, fixtures};
 
 fn cfg(dir: &Path) -> NodeConfig {
@@ -30,20 +31,30 @@ fn cfg(dir: &Path) -> NodeConfig {
 fn registry() -> StageRegistry {
     let mut r = StageRegistry::new();
     r.register(Arc::new(PassthroughStage::new()));
+    zeta_dsp::register_all(&mut r);
     r
 }
 
 async fn open(dir: &Path) -> Node {
+    open_with(dir, None, false).await
+}
+
+/// `run` starts the file source (its samples flow) once the node is open.
+async fn open_with(dir: &Path, tune_range: Option<(Hz, Hz)>, run: bool) -> Node {
     let meta = fixtures::write_tone(dir);
     let opts = FileOpts {
         realtime: false,
         block_samples: 4800,
         repeat: true,
-        tune_range: None,
+        tune_range,
     };
-    let src: Arc<dyn Port> =
-        Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
-    Node::open(cfg(dir), registry(), vec![src]).await.unwrap()
+    let file = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
+    let src: Arc<dyn Port> = file.clone();
+    let node = Node::open(cfg(dir), registry(), vec![src]).await.unwrap();
+    if run {
+        file.start();
+    }
+    node
 }
 
 async fn next(rx: &mut tokio::sync::broadcast::Receiver<Frame>) -> (Frame, Value) {
@@ -540,4 +551,80 @@ async fn read_only_ops_are_logged_without_their_result() {
     assert_eq!(lines[3]["outcome"], "error");
     assert_eq!(lines[3]["error"]["error"], "unknown");
     assert!(lines[4].get("result").is_some(), "{}", lines[4]);
+}
+
+fn job_start(kind: JobKind, bandwidth_hz: u64) -> Op {
+    Op::JobStart {
+        kind,
+        source: SourceId("file0".into()),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(bandwidth_hz),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![],
+    }
+}
+
+async fn started(node: &Node, op: Op) -> JobId {
+    match node.apply(op).await.unwrap() {
+        OpResult::Job(id) => id,
+        other => panic!("expected a job, got {other:?}"),
+    }
+}
+
+/// Every event frame the feed of `file0` carries for `secs`.
+async fn feed_for(node: &Node, secs: u64) -> Vec<(Frame, Value)> {
+    let feed = node.bus().feed_of(&SourceId("file0".into())).expect("feed");
+    let mut rx = node.bus().subscribe(&feed).unwrap();
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let mut out = Vec::new();
+    while let Ok(r) = tokio::time::timeout_at(end, rx.recv()).await {
+        match r {
+            Ok(f) => {
+                if let Payload::Event(ref v) = f.payload {
+                    let v = v.clone();
+                    out.push((f, v));
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spectrum_jobs_rows_never_reach_the_feed_but_a_measure_event_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open_with(dir.path(), None, true).await;
+    node.bus().register_feed(&SourceId("file0".into()));
+    let spectrum = started(&node, job_start(JobKind::Spectrum, 48_000)).await;
+    let measure = started(&node, job_start(JobKind::Measure, 48_000)).await;
+    let frames = feed_for(&node, 2).await;
+    assert!(
+        frames
+            .iter()
+            .any(|(f, v)| f.provenance.job.as_ref() == Some(&measure)
+                && v.get("label").is_some()
+                && v.get("center_hz").is_some()),
+        "no measure event in the feed: {} frames",
+        frames.len()
+    );
+    for (f, v) in &frames {
+        assert!(v.get("q").is_none() && v.get("db").is_none(), "{v}");
+        assert_ne!(f.provenance.job.as_ref(), Some(&spectrum));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scans_rows_never_reach_the_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open_with(dir.path(), Some((Hz(90_000_000), Hz(110_000_000))), true).await;
+    node.bus().register_feed(&SourceId("file0".into()));
+    let scan = started(&node, job_start(JobKind::Scan, 48_000)).await;
+    let frames = feed_for(&node, 2).await;
+    for (f, v) in &frames {
+        assert_ne!(f.provenance.job.as_ref(), Some(&scan), "{v}");
+    }
 }

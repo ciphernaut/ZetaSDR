@@ -250,7 +250,15 @@ impl Inner {
         let edge_streams: Vec<_> = graph
             .edges
             .iter()
-            .map(|e| self.bus.register(e.kind, prov.clone()))
+            .map(|e| {
+                let from = graph.nodes.iter().find(|n| n.id == e.from);
+                register_event_stream(
+                    &self.bus,
+                    from.map_or("", |n| n.kind.as_str()),
+                    e.kind,
+                    prov.clone(),
+                )
+            })
             .collect();
         let roots = graph.nodes.iter().zip(&stages).any(|(n, st)| {
             !st.spec().inputs.is_empty() && !graph.edges.iter().any(|e| e.to == n.id)
@@ -296,7 +304,7 @@ impl Inner {
             let before = job_outputs.len();
             let kinds = stage.outputs_for(&n.params);
             let outputs = node_outputs(stage.spec(), &kinds, leaving, |k| {
-                let sid = self.bus.register(k, prov.clone());
+                let sid = register_event_stream(&self.bus, &n.kind, k, prov.clone());
                 streams.push(sid.clone());
                 job_outputs.push((k, sid.clone()));
                 sid
@@ -817,7 +825,7 @@ impl Inner {
         }
         let token = self.shutdown.child_token();
         let (prov, run, ended) = self.record_running(rec, &token)?;
-        let out = self.bus.register(StreamKind::Event, prov.clone());
+        let out = self.bus.register_unfed(StreamKind::Event, prov.clone());
         let scan = Scan {
             id: id.clone(),
             grid,
@@ -1357,7 +1365,7 @@ async fn fft_step(
     let bus = &inner.bus;
     let input = bus.register(StreamKind::Iq, prov.clone());
     let rx = bus.subscribe(&input).expect("registered");
-    let output = bus.register(StreamKind::Event, prov.clone());
+    let output = bus.register_unfed(StreamKind::Event, prov.clone());
     let mut rows = bus.subscribe(&output).expect("registered");
     bus.publish(Frame::new(input.clone(), prov.clone(), Payload::Iq(block)));
     // Closing the input ends the stage once it has drained the block.
@@ -1457,4 +1465,19 @@ fn transcript_line(job: &serde_json::Value, frame: &Frame) -> Option<serde_json:
     m.insert("dropped".into(), (v["dropped"] == true).into());
     m.insert("error".into(), text("error").into());
     Some(line)
+}
+
+/// Register a job stream; the rows of an `fft` stage are spectrum data, not events a
+/// source's feed should carry, so they stay out of it.
+fn register_event_stream(
+    bus: &crate::stream::StreamBus,
+    from_kind: &str,
+    kind: StreamKind,
+    prov: Provenance,
+) -> StreamId {
+    if from_kind == "fft" {
+        bus.register_unfed(kind, prov)
+    } else {
+        bus.register(kind, prov)
+    }
 }

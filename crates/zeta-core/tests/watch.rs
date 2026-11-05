@@ -1761,3 +1761,27 @@ async fn stopping_the_watch_stops_a_running_capture_child() {
     .await;
     assert!(events.watch("captured").is_empty(), "{:#?}", events.all());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_graphs_fft_edge_is_unfed_but_its_signal_events_are_fed() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let feed = node.bus().register_feed(&rx());
+    let mut feed_rx = node.bus().subscribe(&feed).unwrap();
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let end = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut signal = false;
+    while let Ok(r) = tokio::time::timeout_at(end, feed_rx.recv()).await {
+        let Ok(f) = r else { continue };
+        if let Payload::Event(ref v) = f.payload {
+            assert!(v.get("q").is_none(), "an fft row reached the feed: {v}");
+            if v["protocol"] == "signal" && f.provenance.job.as_ref() == Some(&watch) {
+                signal = true;
+            }
+        }
+    }
+    assert!(signal, "no signal event from the watch in the feed");
+    stop_all(&node).await;
+}
