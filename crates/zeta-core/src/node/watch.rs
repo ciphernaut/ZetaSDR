@@ -1388,7 +1388,7 @@ fn khz(hz: u64) -> String {
 
 /// ` <bw> kHz[, <baud> Bd][, duty <d>]` from a verdict's layer-1 `features`, or nothing
 /// without a record.
-fn measured(features: &serde_json::Value) -> String {
+pub(super) fn measured(features: &serde_json::Value) -> String {
     let Some(bw) = features["bandwidth_hz"].as_u64() else {
         return String::new();
     };
@@ -1429,7 +1429,7 @@ fn info_word(e: &serde_json::Value) -> String {
 /// the nearest `tx` assignment of `allocations` (an identify verdict's, nearest
 /// first): without a decoded designator `; register says <licensee>, <site>, <d> km`;
 /// nothing when there is no transmitter.
-fn register_says(allocations: &serde_json::Value) -> String {
+pub(super) fn register_says(allocations: &serde_json::Value) -> String {
     let nearest = allocations
         .as_array()
         .into_iter()

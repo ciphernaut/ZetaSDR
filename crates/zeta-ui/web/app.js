@@ -868,6 +868,8 @@ function start(api) {
   state.ov.onEvent((job, p) => {
     state.subjects?.event(job, p);
     state.map?.event(job, p);
+    const line = verdictLine(job, p);
+    if (line) state.transcript.note(line);
   });
   state.subjectsPane = mountSubjectsPane($("#subjects"), state.subjects, state.view, {
     jobs: () => state.lastJobs,
@@ -976,6 +978,18 @@ function start(api) {
     submitCommand();
   });
   loadSources();
+}
+
+// The transcript line of a watched job's verdict, or null: a watch's `unknown`, `decoding`
+// and `lost` events and an identify's `verdict` event, as `<kind> <id tail>: <summary>`
+// (an unknown's summary carries the register's nearest transmitter). Its ribbon still
+// shows on the waterfall; the line keeps it.
+export const VERDICT_WATCH_STATES = new Set(["unknown", "decoding", "lost"]);
+function verdictLine(job, p) {
+  if (!p || typeof p !== "object" || typeof p.summary !== "string") return null;
+  const watch = p.protocol === "watch" && VERDICT_WATCH_STATES.has(p.state);
+  if (!watch && p.protocol !== "verdict") return null;
+  return `${job.kind} ${String(job.id).slice(-6)}: ${p.summary}`;
 }
 
 // The Jobs pane's Clear all: a first click arms it (`sure?` for CLEAR_CONFIRM_MS), a second

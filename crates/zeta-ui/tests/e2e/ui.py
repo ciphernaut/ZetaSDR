@@ -3334,6 +3334,9 @@ def scenario_identify_from_a_box_shows_candidates(page, url, secret):
         expect(menu).to_be_hidden()
         ribbon = page.locator("#waterfall .ov-ribbon.candidate", has_text="pocsag_decode: proved")
         expect(ribbon.first).to_be_visible(timeout=10_000)
+        # The verdict event is kept as a transcript line, not only a passing ribbon.
+        expect(page.locator("#transcript .line.note", has_text="identify ").filter(
+            has_text=re.compile(r"POCSAG at 148\.\d{4} MHz: "))).to_have_count(1, timeout=10_000)
         # The suite's `fake_pos` row (ui.rs) is too wide for this box: never tried here.
         cands = page.locator("#waterfall .ov-ribbon.candidate").all_text_contents()
         tried = [c for c in cands if c.startswith("fake_pos:") and "skipped_band" not in c]

@@ -175,7 +175,7 @@
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
 
-import { bandText, mhzText } from "./units.js";
+import { bandText, mhzText, registerText } from "./units.js";
 
 // How far past the ring's earliest sample a `too_old` retry starts, as the front moves on.
 const RING_FRONT_MARGIN_NS = 300_000_000;
@@ -773,6 +773,8 @@ class Menu {
         for (const t of r.value.tried || []) {
           this.t.note(`tried ${t.mode} ${Number(t.score).toFixed(2)} ${t.outcome}`);
         }
+        const reg = registerText(r.value.allocations);
+        if (reg) this.t.note(reg);
       }
     } else if (action === "iq_read") {
       const r = await this.applyOp({ op: "iq_read", selection });

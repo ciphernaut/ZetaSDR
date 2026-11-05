@@ -165,8 +165,46 @@ impl Inner {
     }
 
     /// Record the run's verdict (`{"identify": ...}`) in its context and, for an owned
-    /// run, hand it to the owner too: the owned record goes as soon as the run ends.
-    fn verdict(&self, r: &Run, verdict: serde_json::Value) {
+    /// run, hand it to the owner too: the owned record goes as soon as the run ends. The
+    /// verdict is also published as one `verdict` event (`mode`, `label`, `center_hz`,
+    /// `job`, `allocations`, `summary`): a proof's `<label> at <MHz>: <the decoder's
+    /// summary>`, an unknown's `unknown at <MHz>: <label> <features>; register says ...`
+    /// as the watch words it, `center_hz` the measured centre.
+    fn verdict(&self, r: &Run, verdict: serde_json::Value, center_hz: u64) {
+        let v = &verdict["identify"]["verdict"];
+        let at = format!("{:.4} MHz", center_hz as f64 / 1e6);
+        let label = v["label"].as_str().unwrap_or("unknown");
+        let summary = match v["mode"].as_str() {
+            Some(_) => format!(
+                "{label} at {at}: {}",
+                v["summary"].as_str().unwrap_or("proved")
+            ),
+            None => format!(
+                "unknown at {at}: {label}{}{}",
+                super::watch::measured(&v["features"]),
+                super::watch::register_says(&v["allocations"]),
+            ),
+        };
+        let t = now();
+        let payload = serde_json::json!({
+            "protocol": "verdict",
+            "mode": v["mode"],
+            "label": label,
+            "center_hz": center_hz,
+            "job": v["job"],
+            "allocations": v["allocations"],
+            "summary": summary,
+            "t_ns": t.0,
+        });
+        let prov = Provenance {
+            span: Span {
+                start_ns: t,
+                end_ns: t,
+            },
+            ..r.prov.clone()
+        };
+        self.bus
+            .publish(Frame::new(r.out.clone(), prov, Payload::Event(payload)));
         if r.owner.is_some() {
             self.verdicts
                 .lock()
@@ -571,7 +609,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                     },
                     "attempts": attempts,
                 }});
-                inner.verdict(&r, verdict);
+                inner.verdict(&r, verdict, m_center);
                 return Ok(());
             }
         }
@@ -589,7 +627,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         },
         "attempts": attempts,
     }});
-    inner.verdict(&r, verdict);
+    inner.verdict(&r, verdict, m_center);
     Ok(())
 }
 

@@ -263,7 +263,8 @@ async fn until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
     }
 }
 
-/// Wait for `id` to end and return its candidate events.
+/// Wait for `id` to end and return its candidate events (the `verdict` event, which
+/// must come last and once, is checked against the context's verdict and left out).
 async fn ended(
     node: &Node,
     id: &JobId,
@@ -275,10 +276,22 @@ async fn ended(
     })
     .await;
     assert_eq!(state(node, id), JobState::Stopped);
-    let events = tokio::time::timeout(Duration::from_secs(5), events)
+    let mut events = tokio::time::timeout(Duration::from_secs(5), events)
         .await
         .expect("identify's stream closes")
         .unwrap();
+    let last = events.pop().expect("identify published events");
+    assert_eq!(last["protocol"], "verdict", "{last}");
+    let ctx = node.job_context(id).unwrap();
+    let v = &ctx["identify"]["verdict"];
+    assert_eq!(last["mode"], v["mode"], "{last} vs {ctx}");
+    assert_eq!(last["job"], v["job"].clone(), "{last} vs {ctx}");
+    assert_eq!(last["allocations"], v["allocations"], "{last} vs {ctx}");
+    let summary = last["summary"].as_str().unwrap();
+    match v["mode"].is_null() {
+        true => assert!(summary.starts_with("unknown at "), "{last}"),
+        false => assert!(summary.contains(" at "), "{last}"),
+    }
     for e in &events {
         assert_eq!(e["protocol"], "candidate", "{e}");
         let summary = format!(
@@ -733,7 +746,30 @@ async fn the_verdict_carries_the_nearest_allocations_and_the_score_term() {
     let node = node_over(dir.path(), &fixtures().gfsk).await;
     node.add_knowledge(Arc::new(Register));
     let (id, events) = identify(&node, APRS_HZ).await;
+    let stream = node
+        .bus()
+        .list()
+        .into_iter()
+        .find(|s| s.provenance.job.as_ref() == Some(&id) && s.kind == StreamKind::Event)
+        .unwrap()
+        .id;
+    let mut tap = node.bus().subscribe(&stream).unwrap();
     let events = ended(&node, &id, events, Duration::from_secs(40)).await;
+    // The verdict event words the register's transmitter as the watch's unknown does.
+    let mut last = None;
+    while let Ok(f) = tap.try_recv() {
+        if let Payload::Event(v) = f.payload {
+            last = Some(v);
+        }
+    }
+    let last = last.expect("events");
+    let summary = last["summary"].as_str().unwrap();
+    assert!(
+        summary.contains(
+            "; register says 16K0F1D (16 kHz FM data) Test Paging Pty Ltd, Mt Coot-tha, 12 km"
+        ),
+        "{summary}"
+    );
     let ctx = node.job_context(&id).unwrap();
     let verdict = &ctx["identify"]["verdict"];
     assert!(verdict["mode"].is_null(), "{ctx}");

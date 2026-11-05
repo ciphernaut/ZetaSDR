@@ -705,6 +705,8 @@ class Overlays {
         const key = `${job.id}:${Math.round(p.center_hz)}`;
         if (p.state === "gone") this.unmark(key);
         else if (p.state === "new") this.mark(p.center_hz, p.summary, key);
+        // A mark only: a busy band's new/gone ribbons would bury the watch's verdicts.
+        return;
       }
       if (p.protocol === "transcript") {
         if (job.input && typeof p.text === "string" && !p.dropped && !present(p.error)) {
