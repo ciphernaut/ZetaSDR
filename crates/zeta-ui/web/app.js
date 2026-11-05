@@ -124,7 +124,7 @@
 import { OpError, connect, Unauthorized } from "./api.js";
 import { QUIET_OPS, Transcript, errorText, startJobs, startOpsFeed } from "./agent.js";
 import { mountWaterfall } from "./waterfall.js";
-import { mountOverlays } from "./overlays.js";
+import { mountOverlays, setMaxWatched } from "./overlays.js";
 import { mountMenu } from "./menu.js";
 import { playJob } from "./audio.js";
 import { closeGraph, redrawOpenGraph, showGraph } from "./graph.js";
@@ -1499,6 +1499,11 @@ window.zetaTest = {
   // for the page's lifetime; the rows are drawn again at once.
   foldIdle(ms) {
     if (state.jobs) state.jobs.foldIdle(ms);
+  },
+  // The most jobs the page watches (overlays.js MAX_WATCHED, 12), for the page's lifetime;
+  // the next poll applies it.
+  maxWatched(n) {
+    setMaxWatched(n);
   },
   // The node build this document connected to (null before login or on an older node).
   build() {

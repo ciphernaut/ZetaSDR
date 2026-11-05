@@ -67,7 +67,7 @@
 //                            selected source, those of agent.js SQUELCH_KINDS (fm/am
 //                            rows, squelch tag only) only in slots no other job takes,
 //                            unwatch the rest, refresh the job-row counters
-//                            (`—`, tooltip "not watched (limit 4)", on the rows over the cap;
+//                            (`—`, tooltip "not watched (limit 12)", on the rows over the cap;
 //                            each watch holds one of the node's `max_ws` sockets). `spectrum` jobs are skipped: their events
 //                            are the waterfall's and are ignored here anyway. Event streams
 //                            of jobs not yet watched are resolved with one GET /streams per
@@ -204,7 +204,14 @@ import { bandText } from "./units.js";
 
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
-export const MAX_WATCHED = 4;
+// The most jobs on the shown source whose event streams the page follows, one of the node's
+// `max_ws` sockets (64) each. Twelve covers the seven ACARS channels of one capture with room
+// to spare and leaves room for a second page; MAX_POSITIONED (other sources) stays 4.
+// `let` so a test can lower it (app.js zetaTest.maxWatched); importers see the live value.
+export let MAX_WATCHED = 12;
+export function setMaxWatched(n) {
+  MAX_WATCHED = n;
+}
 export const MAX_POSITIONED = 4;
 export const MAX_RIBBONS = 200;
 const EXPIRE_EVERY_MS = 1000;

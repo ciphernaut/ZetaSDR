@@ -772,8 +772,8 @@ export function startJobs(
   }
   // The plan id of a running job on a plan channel that folds, on evidence the page has:
   // (a) its kind has no squelch (counted closed) and it sent no event for foldIdleMs;
-  // (b) it is watched (overlays.js, at most MAX_WATCHED = 4 jobs: TODO.md "UI: the page
-  //     watches at most 4 jobs"), its squelch known closed and no event for foldIdleMs;
+  // (b) it is watched (overlays.js, at most MAX_WATCHED = 12 jobs), its squelch known
+  //     closed and no event for foldIdleMs;
   // (c) it is an unwatched squelch kind (its squelch and events unknown) on a source the
   //     mix the page watches (watchedMix(), mix.js MixWatch: the one `speaking` comes from)
   //     covers, and that mix has not heard it (`speaking`) for foldIdleMs (lastSpeaking);

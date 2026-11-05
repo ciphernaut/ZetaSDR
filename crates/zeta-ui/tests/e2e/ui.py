@@ -2474,7 +2474,7 @@ def scenario_job_rows_fold_idle_plan_channels(page, url, secret):
 
 
 def scenario_job_rows_fold_only_on_evidence(page, url, secret):
-    # The page watches at most 4 jobs (overlays.js MAX_WATCHED): an unwatched demodulator's
+    # The page watches at most MAX_WATCHED jobs (overlays.js, 12; lowered to 4 here): an unwatched demodulator's
     # squelch and events are unknown, so it folds only while a mix covering its source says it
     # has not heard it for the idle age. Eighteen fm_demod on cb's three plan channels (six
     # widths each): the tone holds ch20 open, its guard keeps ch59 and ch60 closed. The four
@@ -2482,6 +2482,7 @@ def scenario_job_rows_fold_only_on_evidence(page, url, secret):
     # than JOBS_FOLD_MIN (8) on the mix's evidence alone.
     stop_mixes(url, secret)
     select_source(page, url, secret, "cb")
+    page.evaluate("window.zetaTest.maxWatched(4)")
     plans = http_json(url, secret, "/op", {"op": "channel_plans"})["value"]["plans"]
     plan = next(p for p in plans if p["id"] == "uhf_cb_au")
     inside = [ch for ch in plan["channels"] if 476_880_000 <= ch["center_hz"] <= 476_920_000]
@@ -3160,10 +3161,12 @@ def scenario_quiet_channel_row_is_tagged_squelch(page, url, secret):
 
 
 def scenario_watched_jobs_are_capped(page, url, secret):
-    # Six measure jobs: the four most recent are watched (one event socket each), the other
-    # two rows show "—" and open nothing, so this tab holds at most ops + waterfall + 4.
+    # The cap lowered to 4 (MAX_WATCHED ships 12): of six measure jobs the four most recent
+    # are watched (one event socket each), the other two rows show "—" and open nothing, so
+    # this tab holds at most ops + waterfall + 4.
     select_source(page, url, secret, "tone")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+    page.evaluate("window.zetaTest.maxWatched(4)")
     jobs = []
     try:
         for i in range(6):  # distinct bands: an identical rigid start is a duplicate
@@ -3195,6 +3198,12 @@ def scenario_watched_jobs_are_capped(page, url, secret):
         for j in jobs[2:6]:
             cell = page.locator(f'#jobs .job[data-id="{j}"] .events')
             expect(cell).not_to_have_attribute("title", "not watched (limit 4)")
+        # At the shipped cap all ten are watched: no row is marked.
+        page.evaluate("window.zetaTest.maxWatched(12)")
+        page.evaluate("window.zetaTest.poll()")
+        for j in jobs:
+            cell = page.locator(f'#jobs .job[data-id="{j}"] .events')
+            expect(cell).not_to_have_attribute("title", re.compile("not watched"))
     finally:
         for j in jobs:
             stop_job(url, secret, j)
@@ -4943,6 +4952,7 @@ def scenario_subjects_survive_a_source_switch(page, url, secret):
 
 def scenario_subjects_name_the_jobs_not_watched(page, url, secret):
     select_source(page, url, secret, "tone")
+    page.evaluate("window.zetaTest.maxWatched(4)")
     jobs = []
     try:
         for bw in (40_000, 41_000, 42_000, 43_000, 44_000):

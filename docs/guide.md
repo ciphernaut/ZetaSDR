@@ -666,7 +666,7 @@ tags move to a rail, a column left of the frequency axis, each at its band's hei
 the plan channel (or the kind) and the centre in MHz; a tag that overlaps a full one collapses to
 a thin segment, a hot or speaking tag stays full, and the outline, tag, row and ribbons share one
 colour per job. Idle plan channels fold into one `<n> idle <kind> on <plan>` group when more than
-8 are idle, judged only from what the page knows: a kind with no squelch, a watched job (at most 4)
+8 are idle, judged only from what the page knows: a kind with no squelch, a watched job (at most 12)
 whose squelch is known closed for 60 s, or an unwatched job on a source whose mix the page plays
 and which that mix has not heard for 60 s. So without **Listen to all** most CB demodulators stay
 listed; a row under the pointer stays put. A selection drag
