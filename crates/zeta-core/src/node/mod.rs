@@ -976,6 +976,7 @@ impl Node {
             }
             ports.insert(source.clone(), port.clone());
         }
+        inner.bus.register_feed(&source);
         inner.note_capabilities(port.as_ref());
         if let Some(band) = port.current() {
             inner.sync_bank(&source, band);

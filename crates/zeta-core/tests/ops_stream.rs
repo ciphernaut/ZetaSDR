@@ -280,6 +280,60 @@ async fn ops_stream_is_listed_with_node_provenance() {
     assert_eq!(node_streams[0].provenance.channel, None);
 }
 
+async fn list(node: &Node) -> Vec<zeta_core::stream::StreamInfo> {
+    let OpResult::Streams(s) = node.apply(Op::StreamList {}).await.unwrap() else {
+        panic!("stream_list answers Streams");
+    };
+    s
+}
+
+fn feeds_of(
+    streams: &[zeta_core::stream::StreamInfo],
+    source: &str,
+) -> Vec<zeta_core::types::StreamId> {
+    streams
+        .iter()
+        .filter(|s| s.provenance.source.0 == source && s.provenance.job.is_none())
+        .map(|s| {
+            assert_eq!(s.kind, StreamKind::Event);
+            s.id.clone()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn stream_list_has_one_feed_per_source_and_a_job_adds_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let before = feeds_of(&list(&node).await, "file0");
+    assert_eq!(before.len(), 1);
+    assert_eq!(feeds_of(&list(&node).await, NODE_SOURCE).len(), 1);
+    started(&node, job_start(JobKind::Measure, 48_000)).await;
+    assert_eq!(feeds_of(&list(&node).await, "file0"), before);
+}
+
+#[tokio::test]
+async fn a_port_added_after_open_has_a_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    std::fs::create_dir_all(dir.path().join("second")).unwrap();
+    let meta = fixtures::write_tone(&dir.path().join("second"));
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: None,
+    };
+    let second = Arc::new(FileSource::open(SourceId("second".into()), &meta, opts).unwrap());
+    node.add_port(second).unwrap();
+    let feed = node.bus().feed_of(&SourceId("second".into()));
+    assert!(feed.is_some());
+    let OpResult::Streams(s) = node.apply(Op::StreamList {}).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(feeds_of(&s, "second"), vec![feed.unwrap()]);
+}
+
 #[tokio::test]
 async fn a_tail_of_the_ops_stream_never_sees_its_own_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -598,7 +652,6 @@ async fn feed_for(node: &Node, secs: u64) -> Vec<(Frame, Value)> {
 async fn a_spectrum_jobs_rows_never_reach_the_feed_but_a_measure_event_does() {
     let dir = tempfile::tempdir().unwrap();
     let node = open_with(dir.path(), None, true).await;
-    node.bus().register_feed(&SourceId("file0".into()));
     let spectrum = started(&node, job_start(JobKind::Spectrum, 48_000)).await;
     let measure = started(&node, job_start(JobKind::Measure, 48_000)).await;
     let frames = feed_for(&node, 2).await;
@@ -621,7 +674,6 @@ async fn a_spectrum_jobs_rows_never_reach_the_feed_but_a_measure_event_does() {
 async fn a_scans_rows_never_reach_the_feed() {
     let dir = tempfile::tempdir().unwrap();
     let node = open_with(dir.path(), Some((Hz(90_000_000), Hz(110_000_000))), true).await;
-    node.bus().register_feed(&SourceId("file0".into()));
     let scan = started(&node, job_start(JobKind::Scan, 48_000)).await;
     let frames = feed_for(&node, 2).await;
     for (f, v) in &frames {

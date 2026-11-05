@@ -357,6 +357,10 @@ pub enum Op {
     /// streams have source `node` too, with their `job`): one event per
     /// applied operation with its outcome and caller (`transport`: `local`,
     /// `http`, `ui` or `agent`), logged after the operation completes.
+    /// One more per source is its feed (kind `event`, provenance that source and no `job`):
+    /// every event frame of every job on the source, each with its own `job`, `channel` and
+    /// span, spectrum rows excepted. `stream_tail` a feed to see what a radio is doing in one
+    /// call.
     StreamList {},
     /// Collect frames from a stream until `max_frames` (1..=1000) arrive or
     /// `timeout_ms` (1..=10000) passes, whichever is first; frames published

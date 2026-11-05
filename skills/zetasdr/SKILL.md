@@ -340,7 +340,7 @@ CLI: `zeta iq read --source <id> --start-ns 1760000000000000000 --end-ns 1760000
 
 ### stream_list
 
-List the streams: id, kind and provenance. One is always the node's own `ops` event stream (provenance source `node` and no `job`; a mix's streams have source `node` too, with their `job`): one event per applied operation with its outcome and caller (`transport`: `local`, `http`, `ui` or `agent`), logged after the operation completes.
+List the streams: id, kind and provenance. One is always the node's own `ops` event stream (provenance source `node` and no `job`; a mix's streams have source `node` too, with their `job`): one event per applied operation with its outcome and caller (`transport`: `local`, `http`, `ui` or `agent`), logged after the operation completes. One more per source is its feed (kind `event`, provenance that source and no `job`): every event frame of every job on the source, each with its own `job`, `channel` and span, spectrum rows excepted. `stream_tail` a feed to see what a radio is doing in one call.
 
 JSON: `{"op":"stream_list"}`
 

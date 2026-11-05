@@ -1768,7 +1768,7 @@ async fn a_watch_graphs_fft_edge_is_unfed_but_its_signal_events_are_fed() {
     zeta_core::node::watch::test_timing(0, 0);
     let dir = tempfile::tempdir().unwrap();
     let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
-    let feed = node.bus().register_feed(&rx());
+    let feed = node.bus().feed_of(&rx()).expect("feed");
     let mut feed_rx = node.bus().subscribe(&feed).unwrap();
     let watch = start_watch(&node, serde_json::json!({})).await;
     let end = tokio::time::Instant::now() + Duration::from_secs(8);

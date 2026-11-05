@@ -147,6 +147,11 @@ async fn attach_transcribe_emits_transcript_events() {
         .unwrap();
     src.start();
     let wfm = start(&node, JobKind::WfmDemod, 200_000).await;
+    let feed = node
+        .bus()
+        .feed_of(&record(&node, &wfm).source)
+        .expect("the source's feed");
+    let mut feed_rx = node.bus().subscribe(&feed).unwrap();
     let id = match attach(&node, &wfm).await {
         Ok(OpResult::Job(id)) => id,
         r => panic!("attach: {r:?}"),
@@ -166,6 +171,16 @@ async fn attach_transcribe_emits_transcript_events() {
     assert!(t["end_ns"].as_u64() > t["start_ns"].as_u64(), "{t}");
     assert_eq!(fake.calls()[0].1, "en");
     assert_eq!(record(&node, &id).state, JobState::Running);
+    let mut on_feed = false;
+    while let Ok(f) = feed_rx.try_recv() {
+        if let Payload::Event(v) = &f.payload
+            && v["protocol"] == "transcript"
+        {
+            assert_eq!(f.provenance.job.as_ref(), Some(&id));
+            on_feed = true;
+        }
+    }
+    assert!(on_feed, "the transcript event reached the source's feed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
