@@ -371,6 +371,7 @@ class Overlays {
     // job id -> graphKey of a job whose context answered with no gate (its squelch off) or
     // whose read failed: not asked again until its graph changes or ov.reseedAll runs.
     this.gateless = new Map();
+    this.seedGen = 0; // bumped by ov.reseedAll: a read issued before it is discarded
     this.counters = new Map(); // job id -> non-spectrum events seen on the feed
     this.lastEvents = new Map(); // job id -> performance.now() of its last counted event
     this.hotJob = null; // the job id whose tag, outline and row show `hot`
@@ -615,11 +616,19 @@ class Overlays {
     if (again) this.askPoll();
   }
 
-  // A lag or a reconnect of the feed: every gate may have changed unseen; forget them and
-  // read them again (Task 7 completes this).
+  // A lag or a reconnect of the feed: every gate may have changed unseen. Forget them, clear
+  // every row's and tag's dot, drop the held frames (the counters stay) and read the gates
+  // again. A read issued before this is discarded when it answers (ov.seedGen).
   reseedAll() {
+    this.seedGen++;
     this.squelches.clear();
     this.gateless.clear();
+    this.seeding.clear();
+    this.pending = [];
+    for (const j of this.shownJobs()) {
+      setSquelchTag(this.jobRowEl(j), null);
+      this.refreshTag(this.outlines.get(j.id));
+    }
     this.seedPass(this.shownJobs());
   }
 
@@ -775,15 +784,16 @@ class Overlays {
     this.seeding.add(job.id);
     const source = this.sourceId;
     const graph = graphKey(job);
+    const gen = this.seedGen;
     let r = null;
     try {
       r = await this.api.op({ op: "job_context", job: job.id });
     } catch {
       r = null;
     } finally {
-      this.seeding.delete(job.id);
+      if (gen === this.seedGen) this.seeding.delete(job.id);
     }
-    if (this.destroyed || this.sourceId !== source) return;
+    if (this.destroyed || this.sourceId !== source || gen !== this.seedGen) return;
     const now = this.lastJobs.find((x) => x.id === job.id && isRunning(x));
     const p = r && r.value && r.value.squelch;
     if (now && !this.squelches.has(job.id)) {

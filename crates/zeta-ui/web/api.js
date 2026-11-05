@@ -240,6 +240,10 @@ export class Api {
         clearTimeout(timer);
         if (ws) ws.close();
       },
+      // Closes the socket without closing the subscription: the reconnect path runs.
+      drop() {
+        if (ws) ws.close();
+      },
     };
   }
 

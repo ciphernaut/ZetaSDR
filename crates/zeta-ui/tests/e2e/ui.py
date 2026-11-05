@@ -2473,13 +2473,30 @@ def scenario_job_rows_fold_idle_plan_channels(page, url, secret):
             stop_job(url, secret, j)
 
 
+def scenario_feed_lag_reseeds_squelch_dots(page, url, secret):
+    # A quiet fm_demod (closed) is tagged; a lag or a reconnect of the feed forgets the dot
+    # and the next read of job_context brings it back.
+    quiet = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500)
+    try:
+        select_source(page, url, secret, "tone")
+        page.evaluate("window.zetaTest.poll()")
+        tag = job_row(page, quiet).locator(".kind .tag.squelch")
+        expect(tag).to_be_visible(timeout=5_000)
+        assert "closed" in (tag.get_attribute("title") or "")
+        page.evaluate("window.zetaTest.feedLag()")
+        expect(job_row(page, quiet).locator(".kind .tag.squelch")).to_be_visible(timeout=5_000)
+        page.evaluate("window.zetaTest.feedReconnect()")
+        page.evaluate("window.zetaTest.poll()")
+        expect(job_row(page, quiet).locator(".kind .tag.squelch")).to_be_visible(timeout=8_000)
+    finally:
+        stop_job(url, secret, quiet)
+
+
 def scenario_job_rows_fold_only_on_evidence(page, url, secret):
-    # The page watches at most 4 jobs (overlays.js MAX_WATCHED): an unwatched demodulator's
-    # squelch and events are unknown, so it folds only while a mix covering its source says it
-    # has not heard it for the idle age. Eighteen fm_demod on cb's three plan channels (six
-    # widths each): the tone holds ch20 open, its guard keeps ch59 and ch60 closed. The four
-    # newest are watched (three of them on ch59/ch60), so nine quiet rows are unwatched: more
-    # than JOBS_FOLD_MIN (8) on the mix's evidence alone.
+    # Every job on the shown source is watched (the feed), so each fm_demod's own squelch is
+    # the evidence: eighteen fm_demod on cb's three plan channels (six widths each), the tone
+    # holds ch20 open and its guard keeps ch59 and ch60 closed. The twelve quiet rows fold
+    # without a mix; a mix keeps them folded and ch20's talking rows out of the group.
     stop_mixes(url, secret)
     select_source(page, url, secret, "cb")
     plans = http_json(url, secret, "/op", {"op": "channel_plans"})["value"]["plans"]
@@ -2499,26 +2516,10 @@ def scenario_job_rows_fold_only_on_evidence(page, url, secret):
         for _ in range(3):  # the watched ones' squelch states arrive
             page.evaluate("window.zetaTest.poll()")
             page.wait_for_timeout(700)
-        # No mix: the fourteen unwatched rows stay out, the watched closed ones are too few.
-        expect(group).to_have_count(0)
-        for j, _ in jobs:
-            expect(page.locator(f'#jobs > .job[data-id="{j}"]')).to_have_count(1)
-        # A mix over every source: the quiet unwatched ones fold, ch20's speaking rows do not.
-        http_mix_start(url, secret, None)
+        quiet = [j for j, hz in jobs if hz != ch20]
         talking = [j for j, hz in jobs if hz == ch20]
-        for j in talking:
-            expect(page.locator(f'#jobs .job[data-id="{j}"].speaking')).to_have_count(
-                1, timeout=8_000)
-        # The mix's silence is evidence only once it has lasted the idle age: under a 60 s
-        # age nothing folds right after the mix starts (the jobs are seconds old).
-        page.evaluate("window.zetaTest.foldIdle(60000)")
-        for _ in range(3):
-            page.evaluate("window.zetaTest.poll()")
-            page.wait_for_timeout(500)
-            assert group.count() == 0, "folded on the mix's evidence with no idle age"
-        page.evaluate("window.zetaTest.foldIdle(0)")
+        assert len(quiet) == 12, quiet
 
-        # A watched row's squelch may take a poll to be re-seeded: poll until the group shows.
         def grouped():
             page.evaluate("window.zetaTest.poll()")
             if group.count() == 1:
@@ -2526,20 +2527,34 @@ def scenario_job_rows_fold_only_on_evidence(page, url, secret):
             page.wait_for_timeout(500)
             return False
 
-        wait_until(grouped, 10.0, "the quiet rows fold under the mix")
+        # No mix: the quiet rows fold on their own squelch.
+        wait_until(grouped, 10.0, "the quiet rows fold without a mix")
+        for j in quiet:
+            expect(group.locator(f'.job[data-id="{j}"]')).to_have_count(1)
+        for j in talking:
+            expect(group.locator(f'.job[data-id="{j}"]')).to_have_count(0)
+        # A mix over every source: the group stays, ch20's speaking rows are not in it.
+        http_mix_start(url, secret, None)
+        for j in talking:
+            expect(page.locator(f'#jobs .job[data-id="{j}"].speaking')).to_have_count(
+                1, timeout=8_000)
         expect(group).to_have_count(1)
+        for j in quiet:
+            expect(group.locator(f'.job[data-id="{j}"]')).to_have_count(1)
         for j in talking:
             expect(group.locator(f'.job[data-id="{j}"]')).to_have_count(0)
         expect(group.locator("summary")).to_have_text(
             re.compile(r"^\d+ idle fm_demod on uhf_cb_au"))
-        # A newer mix on another source is the one the page watches: the mix over cb is no
-        # evidence then, and the unwatched rows leave the group.
+        # A newer mix on another source is the one the page watches: the group stays, its
+        # evidence is the rows' own squelch, not the mix.
         other = http_mix_start(url, secret, ["tone"])
         page.evaluate("window.zetaTest.poll()")
         wait_until(lambda: page.evaluate("window.zetaMix.job") == other, 5.0,
                    "the newest mix is the one watched")
         page.evaluate("window.zetaTest.poll()")
-        expect(group).to_have_count(0)
+        expect(group).to_have_count(1)
+        for j in quiet:
+            expect(group.locator(f'.job[data-id="{j}"]')).to_have_count(1)
     finally:
         stop_mixes(url, secret)
         for j, _ in jobs:

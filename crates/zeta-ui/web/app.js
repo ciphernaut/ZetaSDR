@@ -1517,6 +1517,16 @@ window.zetaTest = {
   hideFeeds(on) {
     if (state.ov) state.ov.hideFeeds = !!on;
   },
+  // Tell the shown source's feed it lagged (a `lagged` message), or drop its socket so it
+  // reconnects.
+  feedLag() {
+    const f = state.ov && state.ov.feed;
+    if (f) state.ov.onFeedMessage(f, { type: "lagged", missed: 1 });
+  },
+  feedReconnect() {
+    const f = state.ov && state.ov.feed;
+    if (f) f.sub.drop();
+  },
   // The idle age (ms) after which plan channels fold into a group (agent.js JOBS_FOLD_IDLE_MS),
   // for the page's lifetime; the rows are drawn again at once.
   foldIdle(ms) {
