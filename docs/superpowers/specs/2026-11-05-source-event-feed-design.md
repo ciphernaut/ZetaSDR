@@ -2,7 +2,9 @@
 
 Design spec, 2026-11-05. Decided with the operator after the CB transcribers' ribbons went missing
 on the page; the operator chose this option over raising the watch cap, a `transcripts` stream and
-merging the transcriber into its demodulator. A reviewer read it as the builder before hand-over.
+merging the transcriber into its demodulator. A reviewer read it as the builder before hand-over;
+its findings are folded in (the fft rule at both registration sites, the scan's two row streams,
+`add_port`, the lag re-seed, the ws-busy scenario's trigger).
 Builds on the stream bus (`crates/zeta-core/src/stream.rs`), the stream websocket
 (`crates/zeta-ws/src/stream.rs`), the job launch (`crates/zeta-core/src/node/launch.rs`) and the
 page's overlays (`crates/zeta-ui/web/overlays.js`).
@@ -62,7 +64,7 @@ reads with one socket) applied per radio, so an agent gets it for free: `stream_
 
 - A feed that carries spectrum rows. The waterfall's `fft` rows (20 a second, 1024 bins, three
   elastic spectrum jobs on the field host) and a scan's rows would swamp it; they have their own
-  streams and the page reads them in binary mode.
+  streams and the page reads them there (text mode, `waterfall.js`).
 - A frame on the feed that lost its job. Every feed frame carries its original provenance, so the
   reader knows which job, channel and span it belongs to.
 - Lag that lies. A slow reader is told `lagged` with a count, as on every stream, never silently
@@ -102,8 +104,9 @@ reads with one socket) applied per radio, so an agent gets it for free: `stream_
 
 ### 4.1 The feed on the node
 
-Every source attached to the node gets one `event` stream, its **feed**, registered when the
-source is attached in `Node::open` (beside the `ops` stream) with provenance
+Every source attached to the node gets one `event` stream, its **feed**, registered where the
+source is attached, `Node::add_port` (which `open` calls per port and which tests call after
+`open`, so the bus's feed table is mutable after construction), with provenance
 `{source: <id>, job: null, channel: null, span: 0..0}`. It lives as long as the node; a source
 fault or heal does not touch it. There is no feed for `node`: the `ops` stream is the node's, and
 the mix watch already costs one socket.
@@ -119,13 +122,21 @@ the feed's id and everything else (provenance with its job, channel and span, pa
 No task, no extra receiver, ordering as published. A frame published to the feed's own id directly
 is dropped and counted in `dropped` (nothing but the bus writes a feed).
 
-**Not fed:** the output streams of an `fft` stage, and a scan's row stream. `node_outputs` marks
-the `fft` stage's registrations and `launch_scan` marks its row stream; everything else a job
-publishes (squelch, vad, transcript, measure, detect's `signal`, the watch's own events, every
-decoder row, `candidate`, `bits`) is fed. Registration takes the choice: `register_unfed` beside
-`register`, so the rule is at the one place a stream is made. (My call over inspecting payloads at
-publish time: a registration-time flag costs nothing per frame and names the two cases. The test
-in 5.1 pins that a spectrum row never reaches a feed, whichever way a later change registers one.)
+**Not fed:** every `Event` stream that leaves an `fft` node, and a scan's row streams. The fft
+rule has two sites in `launch.rs`: the edge registration at the top of `launch_inner` (every edge
+is registered before any stage is consulted, and a `watch` carries its rows on an `fft → detect`
+edge), keyed by the `from` node's kind, and `node_outputs`' `fresh` closure for an fft's job
+output (a `spectrum` job). The scan has two: `out` in `launch_scan` and the per-step temporary
+stream `fft_step` makes with the scan's provenance. Everything else a job publishes (squelch, vad,
+transcript, measure, detect's `signal`, the watch's own events, every decoder row, `candidate`) is
+fed, inner edge streams included: an operator chain such as `decoder → correlate → bit_view` on a
+radio job delivers an event once per stage that forwards it, and the page's counter counts each
+(accepted; no built-in radio graph has a non-fft inner event edge today). `bits_start` and mix
+jobs have source `node` and are never fed (`bits.js` keeps its own socket). Registration takes the
+choice: `register_unfed` beside `register`, so the rule is at the places a stream is made. (My call
+over inspecting payloads at publish time: a registration-time flag costs nothing per frame. The
+test in 5.1 pins that a spectrum row never reaches a feed from a spectrum job, a watch or a scan,
+whichever way a later change registers one.)
 
 **Lag.** A feed is a broadcast channel like any other, `BUS_CAPACITY` deep; a slow socket sees
 `{"type":"lagged","missed":N}` and continues. The feed's rate on the field host is small (squelch
@@ -144,6 +155,13 @@ is found in `api.streams()` by the rule in 4.1 (`kind === "event"`, `provenance.
 `provenance.source === id`); `onReconnect` resolves it again the same way; a node without a feed
 for the source (an older node) is noted once in the transcript, `no event feed for <source>; job
 events are not shown`, and retried on each sync, as the ops feed does.
+
+A `lagged` message or a reconnect of the feed is a hole of unknown size in every job's events at
+once, so the page treats it as it treats a job whose graph changed: every known squelch gate on the
+shown source is forgotten (dots cleared) and re-seeded from `job_context` as below, the `pending`
+list is cleared, and the counters stand (they are approximate on every stream). (My call: the
+alternative, keeping the dots as they were, leaves an idle channel's dot wrong until its next
+transition, which on CB can be an hour, and that is the class of bug this plan exists to fix.)
 
 Each frame is rendered by `ov.render(job, payload)` exactly as today, the job found by the frame's
 `job` in the last poll's list (`this.lastJobs`). The dispatch rules of the header comment stand
@@ -170,9 +188,11 @@ running job on the shown source has a counter from its first fed event. The Subj
 on other sources over `MAX_POSITIONED`; `ov.watching(jobId)` stays for that and answers true for
 every job on the shown source.
 
-**What stays.** `seedSquelch` for every SQUELCH_KINDS job on the shown source, one `job_context`
-at a time as today (39 reads on a page load of the CB plan, serialised; `ops.log` shows them as
-read-only ops without results). The positioned-jobs watch on other sources (`syncPositioned`,
+**What stays.** `seedSquelch` for every SQUELCH_KINDS job on the shown source whose gate is
+unknown (a page load of the CB plan: 39 `job_context` reads; after a lag or reconnect: 39 again),
+at most 4 in flight (today's guard is per job, so up to `MAX_WATCHED` ran concurrently; the bound
+keeps that shape and lands 39 reads in about ten round trips, within one 2 s poll on a LAN).
+`ops.log` shows them as read-only ops without results. The positioned-jobs watch on other sources (`syncPositioned`,
 `MAX_POSITIONED`) is unchanged. The mix watch (`mix.js`) is unchanged. `activity(id)` answers
 `watched: true` for every running job on the shown source, which gives `foldPlan` rule (b) its
 evidence for all of them.
@@ -214,8 +234,9 @@ when "Listen to all" is on the mix's event and audio sockets: five, for 78 jobs 
 - `feed_carries_every_event_of_a_source_with_its_job`: two jobs' event streams on source `a`
   (different job ids) publish; a subscriber of `a`'s feed receives both frames in order, each
   with `stream` = the feed id and its own `provenance.job`.
-- `feed_does_not_carry_spectrum_rows_or_other_sources`: an `fft`-registered stream's frame and a
-  source `b` job's frame do not reach `a`'s feed; a scan's row stream likewise.
+- `feed_does_not_carry_spectrum_rows_or_other_sources`: a `spectrum` job's rows, a `watch`'s
+  `fft → detect` edge rows, a scan's `out` and its per-step rows, and a source `b` job's frame do
+  not reach `a`'s feed, while the watch's `signal` events do.
 - `feed_is_not_written_directly`: a frame published with the feed's id is dropped and counted.
 - `stream_list_lists_one_feed_per_source`: with two sources attached, `stream_list` has exactly
   one `event` stream per source with `job: null`, plus the `ops` stream (source `node`), and a
@@ -235,8 +256,9 @@ when "Listen to all" is on the mix's event and audio sockets: five, for 78 jobs 
   six `measure` jobs on `tone` (distinct bandwidths) all count events in their rows, no row has the
   `—` cell, and `ws_connections` stays at ops + waterfall + feed (3) through the run; four further
   `fm_demod`s get squelch dots too and the count stays 3.
-- `scenario_ws_busy_is_noted_once`: the hog now exhausts the pool against the feed; the page's
-  one note and recovery as before.
+- `scenario_ws_busy_is_noted_once`: a job start no longer opens a socket, so the trigger changes:
+  the hog fills the pool (its own `/ui/` page now holds a feed socket too), then the page switches
+  source (or is loaded) and its feed is refused; one note, and the feed opens once a slot frees.
 - `scenario_transcript_ribbon_appears`, `scenario_quiet_channel_row_is_tagged_squelch`,
   `scenario_aprs_ribbon_appears`, `scenario_pocsag_ribbon_appears` pass unchanged (they are the
   proof that rendering did not change).
@@ -246,6 +268,9 @@ when "Listen to all" is on the mix's event and audio sockets: five, for 78 jobs 
   source's jobs or removed with the test's assertion adjusted (builder's call; say which).
 - New `scenario_frame_before_poll_is_drawn_after_it`: a job started and publishing before the
   page's next poll gets its first event counted (the pending replay), not lost.
+- New `scenario_feed_lag_reseeds_squelch_dots`: with the feed's socket stalled past `lagged` (or
+  closed and reconnected), a demodulator whose gate changed meanwhile shows the right dot after
+  the re-seed, and a job's counter is not reset.
 - Suite time must stay under the 600 s deadline; the replaced scenario was among the slower ones
   (it waits on sockets), so the budget should not worsen.
 
