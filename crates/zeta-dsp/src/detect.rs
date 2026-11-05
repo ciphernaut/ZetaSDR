@@ -488,11 +488,34 @@ fn row_masked(v: &serde_json::Value) -> Vec<[usize; 2]> {
     pairs().unwrap_or_default()
 }
 
+/// The bin ranges `[lo, hi)` of a row of `size` bins (bin `k` at `center_hz + (k - size
+/// / 2) * bin_hz`) that lie outside `band` `[lo, hi]` Hz; none when the row is inside it.
+pub fn outside_band(size: usize, center_hz: u64, bin_hz: f64, band: [u64; 2]) -> Vec<[usize; 2]> {
+    if size == 0 || bin_hz.is_nan() || bin_hz <= 0.0 {
+        return Vec::new();
+    }
+    let half = (size / 2) as f64;
+    let at = |hz: u64| (hz as f64 - center_hz as f64) / bin_hz + half;
+    // The first bin at or over the low edge, and one past the last at or under the high.
+    let first = at(band[0]).ceil().clamp(0.0, size as f64) as usize;
+    let end = ((at(band[1]).floor() + 1.0).clamp(0.0, size as f64) as usize).max(first);
+    let mut out = Vec::new();
+    if first > 0 {
+        out.push([0, first]);
+    }
+    if end < size {
+        out.push([end, size]);
+    }
+    out
+}
+
 /// Detects signals in spectrum rows (the `fft` stage's events): each row's [`runs`] go
 /// through a [`Tracker`] and every announcement is published, at most
 /// [`SIGNAL_EVENTS_PER_S`] a second ([`Pacer`]), as one `signal` event,
 /// `{protocol, state, center_hz, bandwidth_hz, snr_db, first_ns, last_ns, summary,
-/// t_ns}`, `t_ns` the row's start; events that are not spectrum rows are ignored.
+/// t_ns}`, `t_ns` the row's start; events that are not spectrum rows are ignored. With
+/// the job's own band in the context (a `watch` in a wider capture), the bins outside
+/// it are masked ([`outside_band`]): a signal elsewhere in the capture is not its own.
 pub struct DetectStage {
     spec: StageSpec,
 }
@@ -539,8 +562,9 @@ impl Stage for DetectStage {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
+        let band = ctx.band;
         let p: DetectParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("detect params: {e}")))?;
         p.check()
@@ -563,7 +587,12 @@ impl Stage for DetectStage {
             let Some(q) = row_levels(v) else {
                 return Ok(Vec::new());
             };
-            let masked = row_masked(v);
+            let mut masked = row_masked(v);
+            let centre = v.get("center_hz").and_then(|x| x.as_u64());
+            let bin_hz = v.get("bin_hz").and_then(|x| x.as_f64());
+            if let (Some(band), Some(c), Some(b)) = (band, centre, bin_hz) {
+                masked.extend(outside_band(q.len(), c, b, band));
+            }
             let Some(row) = row_view(v, &q, &masked) else {
                 return Ok(Vec::new());
             };
@@ -632,6 +661,54 @@ mod tests {
         let q = row(&[(k, 3, up)]);
         assert_eq!(runs(&view(&q), &DetectParams::default()).len(), 1);
         assert!(runs(&view_masked(&q, &[[k, k + 3]]), &DetectParams::default()).is_empty());
+    }
+
+    #[test]
+    fn outside_band_masks_the_capture_beyond_the_jobs_band() {
+        // A 150 kHz band 1 MHz above the centre: everything below and above it is masked.
+        let lo = CENTER_HZ + 925_000;
+        let hi = CENTER_HZ + 1_075_000;
+        let m = outside_band(SIZE, CENTER_HZ, BIN_HZ, [lo, hi]);
+        assert_eq!(m.len(), 2, "{m:?}");
+        let freq = |k: usize| CENTER_HZ as f64 + (k as f64 - (SIZE / 2) as f64) * BIN_HZ;
+        assert_eq!(m[0][0], 0);
+        assert!(
+            freq(m[0][1]) >= lo as f64 && freq(m[0][1] - 1) < lo as f64,
+            "{m:?}"
+        );
+        assert!(
+            freq(m[1][0] - 1) <= hi as f64 && freq(m[1][0]) > hi as f64,
+            "{m:?}"
+        );
+        assert_eq!(m[1][1], SIZE);
+        // A band wider than the row masks nothing.
+        assert!(outside_band(SIZE, CENTER_HZ, BIN_HZ, [0, u64::MAX / 2]).is_empty());
+        // A band wholly outside the row masks all of it.
+        let off = outside_band(
+            SIZE,
+            CENTER_HZ,
+            BIN_HZ,
+            [CENTER_HZ * 2, CENTER_HZ * 2 + 1000],
+        );
+        assert_eq!(off, vec![[0, SIZE]]);
+    }
+
+    #[test]
+    fn a_signal_outside_the_band_is_not_a_run() {
+        // Two 10 kHz bumps, 1 MHz below and 1 MHz above the centre; the band holds the upper.
+        let up = 10 + 24;
+        let (kl, kh) = (bin(-1_000_000.0) - 1, bin(1_000_000.0) - 1);
+        let q = row(&[(kl, 3, up), (kh, 3, up)]);
+        assert_eq!(runs(&view(&q), &DetectParams::default()).len(), 2);
+        let m = outside_band(
+            SIZE,
+            CENTER_HZ,
+            BIN_HZ,
+            [CENTER_HZ + 925_000, CENTER_HZ + 1_075_000],
+        );
+        let found = runs(&view_masked(&q, &m), &DetectParams::default());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].center_hz > CENTER_HZ, "{found:?}");
     }
 
     #[test]

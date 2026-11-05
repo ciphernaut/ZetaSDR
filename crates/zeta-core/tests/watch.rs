@@ -571,6 +571,78 @@ async fn a_signal_inside_another_jobs_band_is_ignored() {
     stop_all(&node).await;
 }
 
+/// Start a watch on `band` (inside the capture) with `detect` params `params`.
+async fn start_watch_on(node: &Node, band: Tuning, params: Value) -> JobId {
+    let mut g = JobKind::Watch
+        .expand(
+            &rx(),
+            band,
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    let mut params = params;
+    for (k, v) in [("persist_ms", PERSIST_MS), ("gone_ms", GONE_MS)] {
+        if params.get(k).is_none() {
+            params[k] = v.into();
+        }
+    }
+    g.nodes
+        .iter_mut()
+        .find(|n| n.kind == "detect")
+        .unwrap()
+        .params = params;
+    node.job_start("watch", rx(), band, g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_narrow_watch_sees_only_its_own_band_of_a_wider_capture() {
+    // Seen live 2026-11-05: a 154 kHz watch in a 6 MHz capture announced signals 4 MHz away.
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let narrow = |center_hz| Tuning {
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(150_000),
+    };
+    // The capture held at the recording's band, as a pin or a wide job holds a radio.
+    let pin = Op::SourcePin {
+        source: rx(),
+        center_hz: Hz(CENTER_HZ),
+        bandwidth_hz: Hz(RATE_HZ as u64),
+        replace: vec![],
+    };
+    node.apply(pin).await.unwrap();
+    // On the burst: the control. 300 kHz under the centre: nothing transmits there.
+    let on = start_watch_on(&node, narrow(POCSAG_HZ), serde_json::json!({})).await;
+    let off = start_watch_on(&node, narrow(CENTER_HZ - OFFSET_HZ), serde_json::json!({})).await;
+    let (on_events, off_events) = (Events::of(&node, &on), Events::of(&node, &off));
+    until(
+        "the watch on the burst announces it",
+        Duration::from_secs(15),
+        || on_events.signals().iter().any(|s| s["state"] == "new"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let all = off_events.all();
+    assert!(off_events.signals().is_empty(), "{all:#?}");
+    assert!(off_events.watch("identifying").is_empty(), "{all:#?}");
+    let new = on_events.signals();
+    assert!(
+        new.iter()
+            .all(|s| s["center_hz"].as_u64().unwrap().abs_diff(POCSAG_HZ) <= 75_000),
+        "{new:#?}"
+    );
+    stop_all(&node).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn watch_children_run_inside_the_watch_capture() {
     let _one = SERIAL.lock().await;

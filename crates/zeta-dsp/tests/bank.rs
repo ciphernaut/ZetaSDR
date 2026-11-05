@@ -117,6 +117,7 @@ fn spawn(
         note: None,
         mode: None,
         dc_hz: None,
+        band: None,
         mix_inputs: None,
         station: None,
         bursts: None,
