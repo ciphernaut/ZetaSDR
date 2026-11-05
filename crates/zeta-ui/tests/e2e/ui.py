@@ -3246,6 +3246,30 @@ def scenario_ws_busy_is_noted_once(page, url, secret):
         hog.close()
 
 
+def scenario_squelch_dots_are_not_starved_by_squelch_off_demods(page, url, secret):
+    # Five fm_demods with their squelch off answer job_context with no gate; they must not
+    # hold the seed slots (SEED_IN_FLIGHT, 4) poll after poll: the normal fm_demod started
+    # last is tagged within a few seconds.
+    jobs = []
+    try:
+        for i in range(5):
+            j = start_job(url, secret, "fm_demod", "tone", 100_015_000, 13_000 + 100 * i)
+            jobs.append(j)
+            graph = http_json(url, secret, "/op", {"op": "graph_get", "job": j})["value"]
+            demod = [n for n in graph["nodes"] if n["kind"] == "nbfm_demod"]
+            assert len(demod) == 1, f"fm_demod graph {graph}"
+            demod[0]["params"]["squelch"] = False
+            http_json(url, secret, "/op", {"op": "graph_put", "job": j, "graph": graph})
+        last = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500)
+        jobs.append(last)
+        select_source(page, url, secret, "tone")
+        page.evaluate("window.zetaTest.poll()")
+        expect(job_row(page, last).locator(".kind .tag.squelch")).to_be_visible(timeout=5_000)
+    finally:
+        for j in jobs:
+            stop_job(url, secret, j)
+
+
 def scenario_no_feed_is_noted_once(page, url, secret):
     # A node without a feed for the shown source (an older node; stubbed here with
     # zetaTest.hideFeeds) is noted once; the outlines still draw, and once the feed is listed

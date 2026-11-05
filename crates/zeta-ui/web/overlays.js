@@ -89,8 +89,11 @@
 //                            ov.reseedAll forgets every known squelch gate and seeds them
 //                            again; the counters stand. Seeding: each SQUELCH_KINDS job
 //                            whose gate is unknown has its `job_context` asked, once the
-//                            feed is open, at most SEED_IN_FLIGHT reads in flight (the next
-//                            sync sends the rest).
+//                            feed is open, at most SEED_IN_FLIGHT reads in flight, each
+//                            completion sending the next (so the reads chain within a
+//                            poll); a job whose context holds no gate (its squelch off) or
+//                            whose read failed is not asked again until its graph changes
+//                            or ov.reseedAll runs.
 //                            Then the positioned jobs: the MAX_POSITIONED most recent
 //                            running jobs on the other sources whose kind is a mode row
 //                            with a `position` map or a `subject` (spec 7.2: the map follows
@@ -358,6 +361,9 @@ class Overlays {
     this.hideFeeds = false; // zetaTest.hideFeeds: resolve as if no feed were listed
     this.pending = []; // feed frames held until their job is known (Task 6 fills it)
     this.seeding = new Set(); // job ids whose `job_context` squelch read is in flight
+    // job id -> graphKey of a job whose context answered with no gate (its squelch off) or
+    // whose read failed: not asked again until its graph changes or ov.reseedAll runs.
+    this.gateless = new Map();
     // Jobs made known before a poll lists them (ov.watchJob: menu.js's identify), until one does.
     this.early = new Map(); // job id -> job record
     this.counters = new Map(); // job id -> non-spectrum events seen on the feed
@@ -408,6 +414,7 @@ class Overlays {
     this.counters.clear();
     this.lastEvents.clear();
     this.squelches.clear();
+    this.gateless.clear();
     for (const [jobId, rec] of [...this.positioned]) {
       if (rec.job.source === id) this.unwatchPositioned(jobId);
     }
@@ -434,7 +441,8 @@ class Overlays {
       );
       this.syncMarks(want);
       const ids = new Set(want.map((j) => j.id));
-      for (const id of new Set([...this.counters.keys(), ...this.squelches.keys()])) {
+      const held = [...this.counters.keys(), ...this.squelches.keys(), ...this.gateless.keys()];
+      for (const id of new Set(held)) {
         if (!ids.has(id) && !this.early.has(id)) this.forget(id);
       }
       this.lookup(jobs);
@@ -463,6 +471,7 @@ class Overlays {
     this.counters.delete(jobId);
     this.lastEvents.delete(jobId);
     this.squelches.delete(jobId);
+    this.gateless.delete(jobId);
     this.unlabel(jobId);
     for (const key of [...this.marks.keys()]) if (key.startsWith(`${jobId}:`)) this.unmark(key);
   }
@@ -558,6 +567,7 @@ class Overlays {
   // read them again (Task 7 completes this).
   reseedAll() {
     this.squelches.clear();
+    this.gateless.clear();
     this.seedPass(this.shownJobs());
   }
 
@@ -570,12 +580,19 @@ class Overlays {
 
   // A `job_context` read for each SQUELCH_KINDS job among `jobs` whose gate is unknown, at most
   // SEED_IN_FLIGHT at once; only once the feed is open, so a gate change after the read is seen.
+  // Each read that completes starts the next (seedSquelch), so the reads chain within a poll.
+  // A job whose context held no gate is skipped until its graph changes (ov.gateless).
   seedPass(jobs) {
     if (!this.feed || !this.feed.opened) return;
     for (const j of jobs) {
       if (this.seeding.size >= SEED_IN_FLIGHT) return;
       if (!SQUELCH_KINDS.includes(j.kind)) continue;
       if (this.squelches.has(j.id) || this.seeding.has(j.id)) continue;
+      const g = this.gateless.get(j.id);
+      if (g !== undefined) {
+        if (g === graphKey(j)) continue;
+        this.gateless.delete(j.id);
+      }
       this.seedSquelch(j);
     }
   }
@@ -707,26 +724,34 @@ class Overlays {
 
   // The gate the job's context latched (its last `squelch` event), asked once the feed is
   // open: a job whose only `squelch` event came before the page subscribed is still tagged.
-  // A live event seen meanwhile is newer and wins; a failed request or an answer without a
-  // gate leaves it unknown, and the next ov.sync asks again.
+  // A live event seen meanwhile is newer and wins. A failed request or an answer without a
+  // gate puts the job in ov.gateless (with its graph): not asked again until its graph
+  // changes or ov.reseedAll runs. Each completion runs the seed pass again for the next job.
   async seedSquelch(job) {
     this.seeding.add(job.id);
     const source = this.sourceId;
+    const graph = graphKey(job);
     let r = null;
     try {
       r = await this.api.op({ op: "job_context", job: job.id });
     } catch {
-      return;
+      r = null;
     } finally {
       this.seeding.delete(job.id);
     }
     if (this.destroyed || this.sourceId !== source) return;
     const now = this.lastJobs.find((x) => x.id === job.id && isRunning(x));
     const p = r && r.value && r.value.squelch;
-    if (!now || !p || p.protocol !== "squelch" || this.squelches.has(job.id)) return;
-    this.squelches.set(job.id, { event: p, graph: graphKey(now) });
-    setSquelchTag(this.jobRowEl(now), p);
-    this.refreshTag(this.outlines.get(job.id));
+    if (now && !this.squelches.has(job.id)) {
+      if (p && p.protocol === "squelch") {
+        this.squelches.set(job.id, { event: p, graph: graphKey(now) });
+        setSquelchTag(this.jobRowEl(now), p);
+        this.refreshTag(this.outlines.get(job.id));
+      } else {
+        this.gateless.set(job.id, graph);
+      }
+    }
+    this.seedPass(this.shownJobs());
   }
 
   // A positioned job's event stream `slot` (another source's job: the map's alone).
