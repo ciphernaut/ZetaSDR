@@ -3190,6 +3190,30 @@ def scenario_every_job_on_the_source_is_watched(page, url, secret):
             stop_job(url, secret, j)
 
 
+def scenario_frame_before_poll_is_drawn_after_it(page, url, secret):
+    # A measure job started between polls publishes its first event before the page knows
+    # the job: the frame is held and counted once the poll lands, not lost.
+    select_source(page, url, secret, "tone")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
+    page.evaluate("window.zetaTest.pausePolling(true)")
+    job = None
+    try:
+        job = start_job(url, secret, "measure", "tone", 100_000_000, 10_000)
+        # The first measure event lands within about a second; wait for two.
+        page.wait_for_timeout(2_500)
+        assert page.evaluate("window.zetaTest.pendingFrames()") >= 1
+        page.evaluate("window.zetaTest.pausePolling(false)")
+        page.evaluate("window.zetaTest.poll()")
+        page.wait_for_function(
+            "(id) => { const e = document.querySelector(`#jobs .job[data-id=\"${id}\"] .events`);"
+            " return !!e && parseInt(e.textContent, 10) >= 1; }", arg=job, timeout=5_000)
+        assert page.evaluate("window.zetaTest.pendingFrames()") == 0
+    finally:
+        page.evaluate("window.zetaTest.pausePolling(false)")
+        if job:
+            stop_job(url, secret, job)
+
+
 MAX_WS = 64  # zeta-ws Limits::default().max_ws
 
 HOG_JS = """async ([n, id, proto]) => {

@@ -57,11 +57,10 @@
 //                                             mode decode-to-identify considered as
 //                                             `tried <mode> <score> <outcome>`
 //   identify   Identify (thorough)            job_start kind=identify, bandwidth_hz at least
-//                                             IDENTIFY_MIN_BANDWIDTH_HZ; it is made known to
-//                                             the feed at once (ov.watchJob: it may prove and
-//                                             end before the 2 s job poll would), so each
-//                                             `candidate` event shows as a ribbon (its
-//                                             `summary`, class `candidate`)
+//                                             IDENTIFY_MIN_BANDWIDTH_HZ; each `candidate`
+//                                             event shows as a ribbon (its `summary`, class
+//                                             `candidate`), held by the feed until a poll
+//                                             lists the job
 //   watch      Watch this band                job_start kind=watch on the selection as is
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
 //   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
@@ -794,9 +793,6 @@ class Menu {
       if (action in TRANSCRIBE && r && r.result === "job" && r.value) {
         await this.applyOp(this.attachOp(r.value));
       }
-      if (action === "identify" && r && r.result === "job" && r.value) {
-        this.watchIdentify(r.value, s);
-      }
     }
   }
 
@@ -866,23 +862,6 @@ class Menu {
       elastic: false,
       replace: [],
     });
-  }
-
-  // Make identify job `id` known to the feed now: its candidates come within seconds and a
-  // proof ends it, possibly before the 2 s job poll would have listed it.
-  watchIdentify(id, s) {
-    if (!this.ov) return;
-    const t = jobTuning("identify", s);
-    this.ov.watchJob(
-      {
-        id,
-        kind: "identify",
-        source: s.sourceId,
-        elastic: false,
-        tuning: { center_hz: t.centerHz, bandwidth_hz: t.bandwidthHz },
-        state: { status: "running" },
-      },
-    );
   }
 
   // A scan time-shares the radio: the waterfall lets go of the source first (refused while a

@@ -861,6 +861,7 @@ function start(api) {
     footprint: () => document.documentElement.dataset.footprint || "wide",
     onOutlineMenu: (job, x, y) => state.menu?.openOutline(job, x, y),
     notice: (text) => state.transcript?.note(text, true),
+    requestPoll: () => (pollPaused || !state.jobs ? Promise.resolve() : state.jobs.refresh()),
   });
   state.map = mountMap($("#map"), api, state.view, {
     jobs: () => state.lastJobs,
@@ -1458,6 +1459,7 @@ function answerRibbon(text) {
 // `hz` first, a ribbon at hz (keyed by `key` when given, of job id `job` when given; the
 // element), and draw a probe label
 // at a frequency.
+let pollPaused = false;
 window.zetaTest = {
   get lastRowFormat() {
     return state.wf ? state.wf.lastRowFormat : null;
@@ -1495,6 +1497,15 @@ window.zetaTest = {
   },
   poll() {
     return state.jobs ? state.jobs.refresh() : Promise.resolve();
+  },
+  // The jobs poll timer and the feed's poll request do nothing while on; poll() still works.
+  pausePolling(on) {
+    pollPaused = !!on;
+    state.jobs?.pause(pollPaused);
+  },
+  // How many feed frames the overlays hold for a job no poll has listed yet.
+  pendingFrames() {
+    return state.ov ? state.ov.pending.length : 0;
   },
   // Resolve the shown source's feed as if the node listed none (an older node), or again
   // as it is; takes effect at the next feed lookup (a source switch, a sync without a feed).

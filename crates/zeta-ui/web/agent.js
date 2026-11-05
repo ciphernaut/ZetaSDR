@@ -711,6 +711,7 @@ export function startJobs(
   let rowHot = null;
   let ageTimer = null;
   let stopped = false;
+  let paused = false; // zetaTest.pausePolling: the timer's polls do nothing (refresh still works)
   let last = null;
   // id -> performance.now() when this page first saw the job finished (-Infinity: cleared).
   const finishedAt = new Map();
@@ -893,13 +894,16 @@ export function startJobs(
     }
   };
   const loop = async () => {
-    await refresh();
+    if (!paused) await refresh();
     if (!stopped) timer = setTimeout(loop, JOBS_POLL_MS);
   };
   loop();
   return {
     refresh,
     redraw,
+    pause(on) {
+      paused = !!on;
+    },
     // The idle age at which plan channels fold (JOBS_FOLD_IDLE_MS), drawn again at once.
     foldIdle(ms) {
       foldIdleMs = Number(ms);

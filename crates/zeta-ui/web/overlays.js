@@ -3,7 +3,7 @@
 // squelch tags.
 //
 // Exports:
-//   mountOverlays(el, wf, api, {jobsEl, plan, applyOp, footprint, notice}) -> Overlays
+//   mountOverlays(el, wf, api, {jobsEl, plan, applyOp, footprint, notice, requestPoll}) -> Overlays
 //       Adds a pointer-transparent layer over the waterfall canvas inside `el` (the
 //       #waterfall element `wf` was mounted in). `jobsEl` (default #jobs) holds the job rows
 //       agent.js renders; their `.events` cell carries the counters. `plan` (default `auto`)
@@ -82,8 +82,12 @@
 //                            draw). After a drop the feed id is resolved again by the same
 //                            rule. Each frame names its job: a job running on the source in
 //                            the last poll (ov.lastJobs) whose mode row is settled is
-//                            rendered (below); any other frame goes to ov.hold (the
-//                            `pending` list, filled by Task 6; dropped for now). A `lagged`
+//                            rendered (below); any other frame goes to ov.hold: it joins
+//                            `pending` (at most PENDING_MAX, the oldest out first) and a
+//                            poll is asked for (opts.requestPoll, one in flight); after
+//                            each sync the held frames whose job is now running with its
+//                            row settled are rendered in order, and those of a job a
+//                            fresh poll does not list as running are dropped. A `lagged`
 //                            message, or an open of the feed after its first (a
 //                            reconnect), is a hole in every job's events at once:
 //                            ov.reseedAll forgets every known squelch gate and seeds them
@@ -109,9 +113,6 @@
 //     ov.watching(jobId) -> bool  false for a positioned job on another source over
 //                            MAX_POSITIONED, so its events are not seen (the Subjects pane
 //                            says so); true for every job on the selected source
-//     ov.watchJob(job)       makes a job on the selected source known to the feed before a
-//                            poll lists it (menu.js: an identify run, whose candidates come
-//                            within seconds); no socket is opened
 //     ov.render(job, payload, {positionOnly})  draws one event of `job` by payload shape (so
 //                            by `protocol`); `positionOnly` (a positioned job's) stops after
 //                            ov.onEvent:
@@ -228,6 +229,8 @@ export const MAX_POSITIONED = 4;
 // At most this many `job_context` reads seeding squelch gates are in flight at once; the
 // next ov.sync sends the rest.
 export const SEED_IN_FLIGHT = 4;
+// Feed frames held for a job no poll has listed yet; the oldest go first.
+export const PENDING_MAX = 200;
 export const MAX_RIBBONS = 200;
 const EXPIRE_EVERY_MS = 1000;
 const KEYED_RIBBON_MS = 500;
@@ -336,10 +339,12 @@ class Overlays {
       footprint = () => "wide",
       onOutlineMenu = () => {},
       notice = () => {},
+      requestPoll = () => Promise.resolve(),
     } = {},
   ) {
     this.plan = plan;
     this.notice = notice;
+    this.requestPoll = requestPoll;
     this.applyOp = applyOp;
     this.footprint = footprint;
     this.onOutlineMenu = onOutlineMenu;
@@ -359,13 +364,12 @@ class Overlays {
     this.feedOpening = null; // the source whose feed a GET /streams is resolving
     this.feedNoted = new Set(); // sources noted as having no feed
     this.hideFeeds = false; // zetaTest.hideFeeds: resolve as if no feed were listed
-    this.pending = []; // feed frames held until their job is known (Task 6 fills it)
+    this.pending = []; // feed frames held until their job is known (ov.hold)
+    this.pollAsked = false; // a poll requested by ov.hold is in flight
     this.seeding = new Set(); // job ids whose `job_context` squelch read is in flight
     // job id -> graphKey of a job whose context answered with no gate (its squelch off) or
     // whose read failed: not asked again until its graph changes or ov.reseedAll runs.
     this.gateless = new Map();
-    // Jobs made known before a poll lists them (ov.watchJob: menu.js's identify), until one does.
-    this.early = new Map(); // job id -> job record
     this.counters = new Map(); // job id -> non-spectrum events seen on the feed
     this.lastEvents = new Map(); // job id -> performance.now() of its last counted event
     this.hotJob = null; // the job id whose tag, outline and row show `hot`
@@ -410,7 +414,6 @@ class Overlays {
     this.sourceId = id;
     this.closeFeed();
     this.pending = [];
-    this.early.clear();
     this.counters.clear();
     this.lastEvents.clear();
     this.squelches.clear();
@@ -430,12 +433,11 @@ class Overlays {
   }
 
   sync(jobs, source) {
+    // A poll's list is a new array; the lookup's second sync passes the last one again.
+    const fresh = jobs !== this.lastJobs;
     this.batchTags(() => {
       if (this.destroyed) return;
       this.syncOutlines(jobs, source);
-      for (const id of [...this.early.keys()]) {
-        if (jobs.some((j) => j.id === id)) this.early.delete(id);
-      }
       const want = jobs.filter(
         (j) => j.source === this.sourceId && j.kind !== "spectrum" && isRunning(j),
       );
@@ -443,7 +445,7 @@ class Overlays {
       const ids = new Set(want.map((j) => j.id));
       const held = [...this.counters.keys(), ...this.squelches.keys(), ...this.gateless.keys()];
       for (const id of new Set(held)) {
-        if (!ids.has(id) && !this.early.has(id)) this.forget(id);
+        if (!ids.has(id)) this.forget(id);
       }
       this.lookup(jobs);
       // A source without a feed (an older node, or one listed late) is asked again each poll.
@@ -463,6 +465,7 @@ class Overlays {
       if (this.hotJob) this.setHot(this.hotJob, true);
       this.setSpeaking(this.speaking);
       this.syncPositioned(jobs);
+      this.replayPending(fresh);
     });
   }
 
@@ -556,12 +559,42 @@ class Overlays {
     const j = this.lastJobs.find(
       (x) => x.id === jobId && x.source === this.sourceId && isRunning(x),
     );
-    if (j) return j.kind !== "spectrum" && this.rowKnown(j) ? j : null;
-    return this.early.get(jobId) ?? null; // as menu.js made it known, row or not
+    return j && j.kind !== "spectrum" && this.rowKnown(j) ? j : null;
   }
 
-  // A frame whose job the last poll did not list as running (Task 6 holds and replays it).
-  hold(_frame) {}
+  // Keeps a frame whose job the last poll did not list as running (or whose row is not yet
+  // settled) and asks for a poll; ov.replayPending draws it once the job is known.
+  hold(frame) {
+    this.pending.push(frame);
+    if (this.pending.length > PENDING_MAX) this.pending.splice(0, this.pending.length - PENDING_MAX);
+    if (this.pollAsked) return;
+    this.pollAsked = true;
+    Promise.resolve()
+      .then(() => this.requestPoll())
+      .catch(() => {})
+      .finally(() => {
+        this.pollAsked = false;
+      });
+  }
+
+  // Renders the held frames whose job is known now, in order. A frame stays while its job's
+  // row is unsettled, or (on a sync not from a fresh poll) while no poll has listed the job;
+  // a fresh poll that does not list it as running drops the frame.
+  replayPending(fresh) {
+    if (!this.pending.length) return;
+    const held = this.pending;
+    this.pending = [];
+    for (const f of held) {
+      const job = this.feedJob(f.job);
+      if (job) {
+        this.render(job, f.payload);
+        continue;
+      }
+      const j = this.lastJobs.find((x) => x.id === f.job);
+      const listed = j && j.source === this.sourceId && isRunning(j) && j.kind !== "spectrum";
+      if (listed || !fresh) this.pending.push(f);
+    }
+  }
 
   // A lag or a reconnect of the feed: every gate may have changed unseen; forget them and
   // read them again (Task 7 completes this).
@@ -595,14 +628,6 @@ class Overlays {
       }
       this.seedSquelch(j);
     }
-  }
-
-  // Makes `job` known to the feed now, before the 2 s poll lists it (menu.js: an identify
-  // run's candidates come within seconds). No socket is opened; the next poll that lists the
-  // job takes over.
-  watchJob(job) {
-    if (this.destroyed || job.source !== this.sourceId) return;
-    if (!this.lastJobs.some((j) => j.id === job.id)) this.early.set(job.id, job);
   }
 
   // Whether the job's mode row is settled (a row, or no row): no event before that.
