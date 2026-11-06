@@ -2,9 +2,10 @@
 
 ## Reporting a vulnerability
 
-Report it privately through GitHub's private vulnerability reporting: on
-<https://github.com/ciphernaut/ZetaSDR>, open **Security**, then **Report a vulnerability**. Please
-do not open a public issue for it. Say what an attacker can reach and do, with the version or
+Report it privately through GitHub's private vulnerability reporting, at
+<https://github.com/ciphernaut/ZetaSDR/security/advisories/new> (the same form as **Security**,
+then **Report a vulnerability**, on the repository page; GitHub asks you to sign in). Only the
+maintainer sees the report. Please do not open a public issue for it. Say what an attacker can reach and do, with the version or
 commit and the steps to reproduce. You will get an answer as soon as the maintainer can give one;
 this is a one-person project, so allow a few days.
 
