@@ -1,4 +1,4 @@
-# Plan 28: decoder wave 2, rows and small stages
+# Plan 29: decoder wave 2, rows and small stages
 
 Design spec, 2026-11-06. Written from the operator's gists in `TODO.md` ("Feature: more digital
 decoding modes", "Feature: decoder wave 2 (rows on the sonde frameworks)", "UI: state-stream
@@ -637,7 +637,7 @@ column filled; `scenario_aprs_ribbon_appears` asserts the roster line (`aprs 1 s
 VK3ABC`), so it passes either way. The M17 play and Transcribe buttons are covered by a unit-level check of the
 `AUDIO_KINDS`-or-row rule rather than a scenario (no M17 fixture plays in the suite).
 
-Live acceptance (`UAT.md` Plan 28, the operator's):
+Live acceptance (`UAT.md` Plan 29, the operator's):
 
 - AIS: on the field host's B210 with the discone, `plan_start ais_vhf` (or two `ais_decode` jobs),
   Moreton Bay and Port of Brisbane traffic: vessels appear in the Subjects tab with names within a

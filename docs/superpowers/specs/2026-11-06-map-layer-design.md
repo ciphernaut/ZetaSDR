@@ -1,4 +1,4 @@
-# The map layer: licensed sites as the likely origins of signals
+# Plan 32, the map layer: licensed sites as the likely origins of signals
 
 Design spec, 2026-11-06. From the operator's brainstorm of the same day, kept apart from the
 digital-mode sprints (`2026-11-06-decoder-wave2-design.md`, `2026-11-06-aircraft-links-design.md`,

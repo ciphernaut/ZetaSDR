@@ -1,4 +1,4 @@
-# Aircraft data links: the VDL Mode 2 and HFDL rows
+# Plan 30, aircraft data links: the VDL Mode 2 and HFDL rows
 
 Design spec, 2026-11-06. From two operator notes in `TODO.md`: "Modes: VDL Mode 2 beside ACARS,
 and an airband capture plan" (2026-11-05) and "Feature: VDL Mode 2 and HFDL rows (the other

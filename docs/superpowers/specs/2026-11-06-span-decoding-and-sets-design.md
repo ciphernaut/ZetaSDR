@@ -1,4 +1,4 @@
-# Span decoding and named sets
+# Plan 31: span decoding and named sets
 
 Design spec, 2026-11-06. Two gists from TODO become one design: "Whole-span POCSAG and APRS as a
 `watch` with `decode_on: capture`" (decoder wave 2) and the "airband" set from the VDL2 gist (a
