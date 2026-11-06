@@ -2,12 +2,15 @@
 
 Design spec, 2026-11-06. From two operator notes in `TODO.md`: "Modes: VDL Mode 2 beside ACARS,
 and an airband capture plan" (2026-11-05) and "Feature: VDL Mode 2 and HFDL rows (the other
-aircraft data links)" (2026-11-02). A reviewer read it as the builder before hand-over; its
-questions are folded in (section 8 lists the calls, section 7 what only the operator can answer).
-Builds on the mode registry (`docs/superpowers/specs/2026-10-27-mode-registry-design.md`,
-`crates/zeta-core/src/modes/`), the external-program adaptor (`crates/zeta-ext/src/external.rs`),
-`zeta modes check` (`crates/zeta/src/modes_check.rs`) and subjects
-(`docs/superpowers/specs/2026-11-02-subjects-design.md`).
+aircraft data links)" (2026-11-02). A reviewer read it as the builder before hand-over, and the
+operator answered its questions the same day: section 7 records the decisions, section 8 the
+calls made here. Builds on the mode registry
+(`docs/superpowers/specs/2026-10-27-mode-registry-design.md`, `crates/zeta-core/src/modes/`),
+the external-program adaptor (`crates/zeta-ext/src/external.rs`), `zeta modes check`
+(`crates/zeta/src/modes_check.rs`) and subjects (`docs/superpowers/specs/2026-11-02-subjects-design.md`,
+`crates/zeta-ui/web/subjects.js`). The map layer (plan 32,
+`docs/superpowers/specs/2026-11-06-map-layer-design.md`) draws from the source position this
+plan adds; it does not design the map side.
 
 ## 1. Intent and why
 
@@ -33,9 +36,15 @@ row today, and both are generic rather than VDL2's:
    large`, checked on the field host); the only frequency placeholder is `$center_hz`.
 
 This plan closes both gaps in the row schema and adds two rows, `vdl2_decode` and `hfdl_decode`.
-It changes nothing in the node's job machinery: a row is data, and the agent, the page and the
-CLI get both modes the way they got the sondes. The fixtures are the one novelty: neither mode
-has a synthesiser, so each row's check runs on a short capture recorded off the air.
+What the operator wants from them (section 7, decision 4) is aircraft on the map wherever the
+link carries a position (ADS-C reports libacars decodes inside dumpvdl2; HFDL's structured
+`pos`), with the same details ACARS and ADS-B give (`reg`, `flight`, `label`, `text`) and a link
+to the job, and one aircraft table on the page across ACARS and VDL2 (decision 20). Beside the
+rows, two small generic pieces: a per-source position (a KiwiSDR knows where it is; decision
+10) and a page-side merge of subjects across rows (section 4.8). The node's job machinery does
+not change: a row is data, and the agent, the page and the CLI get both modes the way they got
+the sondes. The fixtures are the one novelty: neither mode has a synthesiser, so each row's
+check runs on a short capture recorded off the air.
 
 ## 2. Goals, non-goals, anti-goals
 
@@ -45,40 +54,56 @@ has a synthesiser, so each row's check runs on a short capture recorded off the 
   becomes a flat event with the row's own field names, and `summary`, `subject`, `position` and
   `time` work as on every other row.
 - `vdl2_decode`: dumpvdl2 on one 25 kHz channel, events keyed on the AVLC source address with
-  the ACARS fields as columns, started like any decoder (`job_start --kind vdl2_decode`,
-  `identify`, the page's decode menu), beside the ACARS jobs on the same radio.
-- `hfdl_decode`: dumphfdl on one HFDL channel of a KiwiSDR (or any HF source), the same shape.
+  the ACARS fields as columns and a `position` on the frames that carry an ADS-C report,
+  started like any decoder (`job_start --kind vdl2_decode`, `identify`, the page's decode menu),
+  beside the ACARS jobs on the same radio.
+- `hfdl_decode`: dumphfdl on one HFDL channel of a KiwiSDR (or any HF source), the same shape,
+  `position` from the HFDL position PDUs.
 - Both rows carry a check: `zeta modes check --strict vdl2_decode hfdl_decode` passes on a host
   that has the programs, against fixtures in the repository; on a host without them it says
   `skipped: dumpvdl2 missing`, as `adsb_decode` does without dump1090.
 - Both catalogue entries gain their `decoder`, so `knowledge_lookup` at 136.975 MHz answers
   `vdl2_decode`.
+- The page shows one aircraft table across `acars_decode` and `vdl2_decode` (and `hfdl_decode`),
+  an aircraft heard on two links being one row, merged by `reg` or by ICAO address.
+- A source carries its own position (`source_list`): a KiwiSDR's from its status page where the
+  Kiwi has one, else a configured one; the station stays the node's. `hfdl_decode` events say
+  which source heard them, so the map layer can draw them from the receiver, not the station.
 - The agent guide says how to run VDL2 beside ACARS on one radio, and how to find an HFDL
   channel on a Kiwi.
 
 ### Non-goals
 
-- Positions from VDL2. Some ACARS texts carry one (and CPDLC/ADS-C in the X.25 half); parsing
-  message texts is later work. HFDL's structured `pos` is taken, since it is a field, not a
-  text (a call, section 8).
+- Positions parsed out of free ACARS message texts (some airline texts carry one). The
+  positions this plan maps are structured fields libacars and dumphfdl decode: ADS-C over
+  ARINC 622 inside the ACARS block, and HFDL's `pos`.
 - Multi-channel decoding. dumpvdl2 and dumphfdl each decode several channels from one wide
   stream; a row decodes one channel per job, as every row does. Every-channel-in-the-capture
-  decoding is the span-decoder work (TODO "Span decoders and trunking").
-- The CPDLC, ADS-C, CM and X.25 payloads dumpvdl2 and dumphfdl decode. The rows carry the
-  AVLC/LPDU identity and the ACARS block; the rest stays in the program's line and is not an
-  event field in this plan (a later row revision can map more; nothing here prevents it).
+  decoding is the span-decoder work (plan 31, the sibling spec on span decoding and named sets).
+- The CPDLC, CM and X.25/ATN payloads dumpvdl2 and dumphfdl decode (ADS-C over the ATN half
+  included: its JSON is a different, deeper tree). The rows carry the AVLC/LPDU identity, the
+  ACARS block and the ARINC 622 ADS-C basic report; the rest stays in the program's line and is
+  not an event field in this plan (a later row revision can map more; nothing here prevents it).
 - Ground-station tables, `--gs-file`, `--system-table`, `--station-id`, feeds to airframes.io
   or similar. The rows run the programs bare.
 - The "airband" named set: one call that starts ACARS + VDL2 on one radio and ADS-B on another,
-  as `plan_start` does for a channel plan. That is the sibling spec on span decoding and named
-  sets, not this one. This plan gives it the rows it will start.
-- Merging ACARS and VDL2 into one aircraft table on the page (the operator's "nicer still").
-  Section 7 asks; it is page work on top of this plan.
+  as `plan_start` does for a channel plan. That is plan 31, not this one. This plan gives it the
+  rows it will start.
+- The map side of the source position: what the Map tab draws for a positioned source, bearings
+  from it, cutting the register's sites by its reach. Plan 32 does that from the field this plan
+  adds (`SourceInfo.position`).
+- Wiring the operator's own KiwiSDR into the deployed node. The operator adds it to their
+  instance themselves (decision 7); no task, deploy helper, unit file or persisted state here
+  does. This plan makes sure a Kiwi they add works: `hfdl_decode` on a `--source-kiwi` source,
+  and the source's position.
+- Patching the vendored catalogue's HFDL frequency ranges (decision 21: left as upstream).
 
 ### Anti-goals
 
 - A field map that only VDL2 can use. Pointers into a parsed line are generic; nothing in the
   schema or the adaptor knows dumpvdl2's names.
+- A merge rule the page hard-codes for two rows. The merge is declared on the rows
+  (`subject.merge`) and the page applies it to any rows that declare it.
 - A fixture that is large or that carries anything private. The repository is public; each
   fixture is small, reviewed line by line, and holds only link-layer and operational traffic.
 - A row that passes its check on the field host and nowhere else without saying why. A missing
@@ -86,6 +111,9 @@ has a synthesiser, so each row's check runs on a short capture recorded off the 
 - A row that works only when the capture is wide enough by luck. The rows state their channel
   width and rate; the node's channeliser and the adaptor's resampler do the rest, bank or no
   bank.
+- The local KiwiSDR's host name in a tracked file. It is "the local KiwiSDR" in prose and
+  `kiwi-host` in URLs, paths and flags; the real name lives in untracked configuration and a
+  developer shell's environment only.
 
 ## 3. Constraints
 
@@ -100,18 +128,36 @@ has a synthesiser, so each row's check runs on a short capture recorded off the 
   program's rate need not divide anything; a change of input rate restarts the resampler.
 - `$center_hz` is the first IQ frame's centre: the channel's, since the channel node mixes the
   job band to baseband. Placeholders are the fixed list `PROGRAM_PLACEHOLDERS` (`$port`,
-  `$rate_hz`, `$center_hz`, `$fifo`); an unknown one is `broken` at `decoder.args[i]`.
-- The publisher (`external.rs`, `Publisher::publish`) parses each line with the row's parser,
-  then `summary::envelope` fills `protocol`, `summary`, `t_ns` and `position` from the flat
-  object's top-level keys. `time` must be an ISO 8601 UTC string.
+  `$rate_hz`, `$center_hz`, `$fifo`; `row.rs`), substituted by `substitute` in `external.rs`; an
+  unknown one is `broken` at `decoder.args[i]`.
+- The publisher (`external.rs`, `Publisher::publish`) parses each line with the row's parser
+  (`crate::parsers::parse`), then `summary::envelope` fills `protocol`, `summary`, `t_ns` and
+  `position` from the flat object's top-level keys (`position` needs numbers at the mapped
+  `lat`/`lon`; `alt_unit: ft` converts). `time` must be an ISO 8601 UTC string.
 - A subject's `key`, `columns[].field`, `heading`, `label`, the `position` map and the summary
   template must all name `event.schema.properties`, else `broken` naming the field.
 - `zeta modes check` opens a node on a file source over the test's SigMF pair; a `fixture`
   test's path is read as given (today: relative to the current directory) and the job centre is
   the meta's `captures[0].core:frequency`. Skips are `no test` and `<program> missing`;
-  `--strict` turns every skip into a fail. The file source reads `cf32_le`, `ci16_le` and `ci8`.
-- A KiwiSDR source delivers 12 kHz of IQ, blocks stamped at the nominal 12 000 Hz; the true
-  rate is a little over (`reported_sample_rate`). `bandwidth_hz` is at most 12 000.
+  `--strict` turns every skip into a fail. It takes one id (`ModesCmd::Check { id: Option<String> }`),
+  and waits for the first event with one `stream_tail` capped at `TAIL_MAX_MS` (10 s). The file
+  source reads `cf32_le`, `ci16_le` and `ci8`.
+- `.gitignore` ignores `*.sigmf-data` repository-wide; the OOK fixtures' data files under
+  `crates/zeta-dsp/tests/data/` are tracked because they were force-added. A new fixture
+  directory needs an un-ignore rule (`!/modes/fixtures/*.sigmf-data`) or the same force-add,
+  and the plan says which.
+- The e2e suite (`crates/zeta/tests/ui.rs`, `crates/zeta-ui/tests/e2e/ui.py`) runs `zeta serve`
+  with a `--modes-dir` of fake `json_lines` rows (`fake_pos`, `fake_subjects`, `fake_fold`)
+  whose program is zeta-ext's `fake_lines` with `--lines-file`: that is how a page scenario
+  gets decoder events without a decoder. The subjects scenarios (`scenario_subjects_*`) read
+  `#subjects section.subject-job` and `tr.subject[data-key]`.
+- A KiwiSDR source (`crates/zeta-source-kiwi`) delivers 12 kHz of IQ, blocks stamped at the
+  nominal 12 000 Hz; the true rate is a little over (`reported_sample_rate`). `bandwidth_hz` is
+  at most 12 000. The crate speaks the Kiwi websocket protocol over `tokio-tungstenite`
+  (`session.rs`) and has no HTTP client; `Capabilities` (`crates/zeta-core/src/types.rs`) has
+  `remote: bool` and no position; `Port` (`port.rs`) has defaulted accessors `fault`, `gain`,
+  `stats`, `worker`, and `source_list` (`ops.rs`, `Op::SourceList`) fills `SourceInfo` from
+  them. `--source-kiwi ID=HOST:PORT[/PASSWORD]` is parsed by `parse_kiwi` (`crates/zeta/src/sources.rs`).
 - The B210 capture at 8 MHz gets a polyphase bank of 8 bins (1 MHz spacing, 2 MHz per bin,
   `pfb.rs`); a channel wider than a bin (`TooWide`) is filtered directly from the capture.
   The lease cannot widen a capture under a running rigid job ("widen capture ... not yet
@@ -131,8 +177,20 @@ has a synthesiser, so each row's check runs on a short capture recorded off the 
     `Airborne`, `On ground`; libacars `reg`, `flight`, `msg_text`, `crc_ok`, `err`, `more`,
     `blk_id`, `msg_num`, `msg_num_seq`, `sublabel`, `mfi`; dumphfdl `hfdl`, `lpdu`, `spdu`,
     `mpdu`, `hfnpdu`, `ac_info`, `icao`, `flight_id`, `pos`, `lat`, `lon`, `bit_rate`,
-    `freq_skew`, `gs_status`. The exact nesting is confirmed against the first real lines
-    (section 6); the rows' pointers below are the expected paths.
+    `freq_skew`, `gs_status`.
+  - Read in libacars's source (`acars.c`, `arinc.c`, `adsc.c`, 2026-11-06): the ACARS node's
+    key is `acars` with `err`, `crc_ok`, `more`, `reg`, `mode`, `label`, `blk_id`, `ack`,
+    `flight`, `msg_num`, `msg_num_seq` (downlinks), `sublabel`, `mfi` (when set), `msg_text`;
+    its child for labels A6, AA, B6, BA and H1 is `arinc622` (`msg_type` `adsc_msg`, `crc_ok`,
+    `gs_addr`, `air_addr`), whose child is `adsc`: a `tags` array of one-key objects
+    (`basic_report`, `emerg_basic_report`, `flight_id`, `predicted_route`, `earth_ref_data`,
+    `air_ref_data`, `meteo_data`, `airframe_id`, `intermediate_projection`, `fixed_projection`,
+    the event reports, ...) and `err`. `basic_report` (and `emerg_basic_report` and the event
+    reports, which share its formatter) carries `lat`, `lon` (degrees, doubles), `alt`
+    (integer feet), `ts_sec` (seconds past the hour), `pos_accuracy_nm`, `nav_redundancy`,
+    `tcas_avail`. The tree-to-JSON nesting (child under parent) is read from the node links,
+    not from a captured line: the exact depth and the tag wrapper are confirmed on the first
+    real line (section 6).
 - The repository is public: fixtures and row notes use roles, not host names or positions
   (the demo station is Brisbane Airport). `scripts/public-check.sh` must stay clean.
 
@@ -146,9 +204,10 @@ A program row's `decoder.output` gains one optional map:
 "output": {
   "via": "stdout", "port": null, "parser": "json_lines",
   "fields": {
-    "addr":   "/vdl2/avlc/src/addr",
+    "icao":   "/vdl2/avlc/src/addr",
     "reg":    "/vdl2/avlc/acars/reg",
-    "icao":   ["/hfdl/lpdu/src/ac_info/icao", "/hfdl/lpdu/dst/ac_info/icao"]
+    "lat":    ["/vdl2/avlc/acars/arinc622/adsc/tags/0/basic_report/lat",
+               "/vdl2/avlc/acars/arinc622/adsc/tags/1/basic_report/lat"]
   }
 }
 ```
@@ -157,13 +216,16 @@ A program row's `decoder.output` gains one optional map:
   `decoder.output.fields.<key>`. Every schema property must be a key of the map when the map is
   present, else `broken` naming `event.schema.properties.<name>` ("not mapped by
   `decoder.output.fields`"): with a map, the event holds the mapped fields and nothing else, so
-  an unmapped property would be a field that never arrives.
+  an unmapped property would be a field that never arrives. The envelope's own fields
+  (`protocol`, `summary`, `t_ns`, `position`), which `envelope` adds after the map and which
+  existing rows list in their schema, are exempt from that rule.
 - A value is one JSON pointer (RFC 6901, `serde_json::Value::pointer`; must start with `/`,
-  else `broken`) or a list of them, the first that resolves to a non-null value winning (the
-  `{a?b}` rule of summaries, applied at the source). A pointer that resolves to nothing, or to
-  JSON `null`, leaves the field out of the event; `{field?}` in the summary then drops it, and a
-  subject key that is absent makes the event "about no subject" (a ribbon, no table row), as
-  `row.rs` already defines for a null key.
+  else `broken`) or a non-empty list of them, the first that resolves to a non-null value
+  winning (the `{a?b}` rule of summaries, applied at the source). A pointer that resolves to
+  nothing, or to JSON `null`, leaves the field out of the event; `{field?}` in the summary then
+  drops it, a subject key that is absent makes the event "about no subject" (a ribbon, no table
+  row), as `row.rs` already defines for a null key, and a `position` whose `lat` or `lon` is
+  absent is no position (`envelope` already does this).
 - The value is copied as it is: numbers stay numbers, strings strings; an object or array is
   copied too (nothing in this plan needs one, and refusing them would gain nothing).
 - Applied in `Publisher::publish` between the parser and `envelope`, for every parser: SBS,
@@ -177,11 +239,12 @@ every consumer reading the decoder's nesting: the schema, the summary template, 
 columns and the page's column labels would all spell `vdl2.avlc.acars.reg`, and a dumpvdl2 line
 flattens to some sixty keys (`app`, `burst`, `xid` parameters), of which the page and the agent
 want ten. A map names what the row promises, with the names the row chooses (`reg`, `flight`,
-`label`, `text`: the same words `acars_decode` uses, so the two aircraft tables read alike). It
-costs no dependency (`serde_json` has pointers), handles keys with dots and slashes by the
-standard's escaping, and the list form gives "src or dst" without inventing syntax. It is also
-what a later `time`-from-`{sec, usec}` or a text parser would plug into: the event is a flat
-object with known names once the map has run.
+`label`, `text`: the same words `acars_decode` uses, so the two aircraft tables read alike, and
+so the page can merge them, 4.8). It costs no dependency (`serde_json` has pointers), handles
+keys with dots and slashes by the standard's escaping, and the list form gives "src or dst" and
+"the first tag that is a basic report" without inventing syntax. It is also what a later
+`time`-from-`{sec, usec}` or a text parser would plug into: the event is a flat object with
+known names once the map has run.
 
 ### 4.2 `$center_khz`
 
@@ -209,26 +272,30 @@ with up to three decimals (`8942`, `8942.5`, `136975`). Added to `PROGRAM_PLACEH
     "input": {"stream": "iq", "format": "cs16", "rate_hz": 105000, "via": "stdin"},
     "output": {"via": "stdout", "port": null, "parser": "json_lines",
       "fields": {
-        "addr": "/vdl2/avlc/src/addr", "addr_type": "/vdl2/avlc/src/type", "status": "/vdl2/avlc/src/status",
+        "icao": "/vdl2/avlc/src/addr", "addr_type": "/vdl2/avlc/src/type", "status": "/vdl2/avlc/src/status",
         "dst": "/vdl2/avlc/dst/addr", "frame_type": "/vdl2/avlc/frame_type",
         "reg": "/vdl2/avlc/acars/reg", "flight": "/vdl2/avlc/acars/flight", "label": "/vdl2/avlc/acars/label",
         "msg_num": "/vdl2/avlc/acars/msg_num", "ack": "/vdl2/avlc/acars/ack", "text": "/vdl2/avlc/acars/msg_text",
-        "crc_ok": "/vdl2/avlc/acars/crc_ok", "sig_level": "/vdl2/burst/sig_level", "noise_level": "/vdl2/burst/noise_level"
+        "crc_ok": "/vdl2/avlc/acars/crc_ok",
+        "lat": ["/vdl2/avlc/acars/arinc622/adsc/tags/0/basic_report/lat", "/vdl2/avlc/acars/arinc622/adsc/tags/1/basic_report/lat", "/vdl2/avlc/acars/arinc622/adsc/tags/0/emerg_basic_report/lat"],
+        "lon": ["/vdl2/avlc/acars/arinc622/adsc/tags/0/basic_report/lon", "/vdl2/avlc/acars/arinc622/adsc/tags/1/basic_report/lon", "/vdl2/avlc/acars/arinc622/adsc/tags/0/emerg_basic_report/lon"],
+        "alt_ft": ["/vdl2/avlc/acars/arinc622/adsc/tags/0/basic_report/alt", "/vdl2/avlc/acars/arinc622/adsc/tags/1/basic_report/alt", "/vdl2/avlc/acars/arinc622/adsc/tags/0/emerg_basic_report/alt"],
+        "sig_level": "/vdl2/burst/sig_level", "noise_level": "/vdl2/burst/noise_level"
       }},
     "install": {"debian": null, "url": "https://github.com/szpajder/dumpvdl2"}
   },
-  "event": {"schema": {"type": "object", "properties": {"addr": {"type": "string"}, "...": "one per mapped field; the ACARS ones nullable"}},
-            "summary": "{addr} {reg?} {flight?} {label?} {text?}"},
+  "event": {"schema": {"type": "object", "properties": {"icao": {"type": "string"}, "...": "one per mapped field; the ACARS and ADS-C ones nullable"}},
+            "summary": "{icao} {reg?} {flight?} {label?} {text?}"},
   "identify": {"proof": "event", "min_events": 1, "dwell_ms": 15000, "min_span_ms": 1000, "quick": null},
   "catalogue": ["vhf-data-link-mode-2-vdl-m2"],
-  "test": {"kind": "fixture", "path": "fixtures/vdl2-136975k-1.sigmf-meta", "expect": {"addr": "<the aircraft's ICAO hex>"}, "within_ms": 10000},
-  "position": null,
+  "test": {"kind": "fixture", "path": "fixtures/vdl2-136975k-1.sigmf-meta", "expect": {"icao": "<the aircraft's ICAO hex>"}, "within_ms": 10000},
+  "position": {"lat": "lat", "lon": "lon", "alt_m": "alt_ft", "alt_unit": "ft"},
   "time": null,
-  "subject": {"key": "addr", "name": "aircraft", "waterfall": "summary",
+  "subject": {"key": "icao", "name": "aircraft", "waterfall": "summary",
     "columns": [{"field": "addr_type", "label": "Type", "unit": null}, {"field": "reg", "label": "Reg", "unit": null},
                 {"field": "flight", "label": "Flight", "unit": null}, {"field": "label", "label": "Label", "unit": null},
                 {"field": "text", "label": "Text", "unit": null}],
-    "heading": null, "label": "flight"},
+    "heading": null, "label": "flight", "merge": ["reg", "icao"], "track_points": 100, "track_min_m": 1000},
   "notes": "..."
 }
 ```
@@ -246,12 +313,26 @@ dumpvdl2 never retunes or offsets. `S16_LE` is the spelling 2.6.0 accepts (its h
 `S16LE`; constraint above); `cs16` is the adaptor's `x * 32 767`.
 
 **Events and the subject.** Every AVLC frame dumpvdl2 decodes is an event (XID, supervisory,
-information frames, ground-station squitters), keyed on the source address: an aircraft's row
-carries its downlinks with `reg`, `flight`, `label`, `text` from the ACARS block when the frame
-has one; the ground station (`addr_type` "Ground station") gets a row of its own whose ACARS
-columns name the aircraft each uplink is for. `label` is the subject's name field (`flight`),
-`waterfall` is `summary` (one line for the job, as ACARS). `t_ns` is the IQ frame's time:
-dumpvdl2's `t` is `{sec, usec}`, not ISO, and the frame time is within a block of it.
+information frames, ground-station squitters), keyed on the source address (`icao`: an
+aircraft's 24-bit ICAO address, a ground station's own address; `addr_type` tells them apart).
+An aircraft's row carries its downlinks with `reg`, `flight`, `label`, `text` from the ACARS
+block when the frame has one; the ground station (`addr_type` "Ground station") gets a row of
+its own whose ACARS columns name the aircraft each uplink is for. The operator does not mind
+which way the table is keyed (decision 4), so the default stands. `label` is the subject's name
+field (`flight`), `waterfall` is `summary` (one line for the job, as ACARS). `t_ns` is the IQ
+frame's time: dumpvdl2's `t` is `{sec, usec}`, not ISO, and the frame time is within a block of
+it.
+
+**Positions.** An ADS-C report rides an ACARS downlink (labels A6/B6 and friends) that libacars
+decodes into `acars.arinc622.adsc.tags[]`; a periodic or demand report's first tag is the
+`basic_report` with `lat`, `lon` (degrees) and `alt` (feet). The map lists the first two tag
+slots and the emergency report (the list form, 4.1); a frame with none leaves `lat`/`lon` out
+and the event has no `position`, so it updates the subject's state only. `position` converts
+feet to metres (`alt_unit: ft`, as `adsb_decode` does). The subject's `track_points` and
+`track_min_m` (100 points, 1 km) draw a track per aircraft, and the page's existing subject row
+carries the fix, its distance and the job: that is "ADS-B-like details and a link to the job"
+with no page change. The exact pointer paths are **to be confirmed on the fixture** (section
+6): the nesting is read from libacars's source, not from a captured line.
 
 **Beside ACARS on one radio.** The lease cannot widen a running capture, so the order matters:
 `source_pin` the radio at 133 500 000 Hz, 8 000 000 Hz first (130.025–136.975 MHz inside it,
@@ -293,13 +374,13 @@ correct and says what to do. The field-craft text says this.
   "event": {"schema": {"...": "one property per mapped field"}, "summary": "{icao?gs_id} {flight?} {pdu?} {text?}"},
   "identify": {"proof": "event", "min_events": 1, "dwell_ms": 40000, "min_span_ms": 1000, "quick": null},
   "catalogue": ["high-frequency-data-link-hfdl"],
-  "test": {"kind": "fixture", "path": "fixtures/hfdl-<freq>k-1.sigmf-meta", "expect": {"gs_id": "<the ground station's number>"}, "within_ms": 40000},
+  "test": {"kind": "fixture", "path": "fixtures/hfdl-<freq>k-1.sigmf-meta", "expect": {"gs_id": "<the ground station's number>"}, "within_ms": 10000},
   "position": {"lat": "lat", "lon": "lon", "alt_m": null},
   "time": null,
   "subject": {"key": "icao", "name": "aircraft", "waterfall": "summary",
     "columns": [{"field": "flight", "label": "Flight", "unit": null}, {"field": "gs", "label": "Ground station", "unit": null},
                 {"field": "pdu", "label": "PDU", "unit": null}, {"field": "text", "label": "Text", "unit": null}],
-    "heading": null, "label": "flight", "track_points": 100, "track_min_m": 1000},
+    "heading": null, "label": "flight", "merge": ["reg", "icao"], "track_points": 100, "track_min_m": 1000},
   "notes": "..."
 }
 ```
@@ -330,18 +411,54 @@ quiet channel they are the proof the channel is alive. A ground station is named
 (`gs_id`, always in the line) and by `gs`, its name, when dumphfdl has one: the names come from
 the system table, which the row does not carry (a non-goal), so the summary, the check's
 `expect` and the field craft lean on the number and show the name when it is there. `position`
-is mapped from the
-performance-data and frequency-data PDUs' `pos`; a track on the map per aircraft (1 km steps:
-these are airliners hundreds of km out). `identify.dwell_ms` is 40 s so a dwell holds at least
-one 32 s HFDL frame; `within_ms` for the check the same.
+is mapped from the performance-data and frequency-data PDUs' `pos`; a track on the map per
+aircraft (1 km steps: these are airliners hundreds of km out). `identify.dwell_ms` is 40 s so a
+dwell holds at least one 32 s HFDL frame; the check's `within_ms` is 10 s because the fixture
+is cut so a squitter lands in its first seconds (section 6).
 
 **Frequencies.** `centers_hz` is empty and `range_hz` spans the HF aero bands: the active
 frequencies per ground station change with the hour (the system table), so the agent is told to
 take them from a list (dumphfdl's `etc/systable.conf` upstream, the operator's own, or the
 TODO's three bands near 8.9, 10.0 and 11.4 MHz for the nearest stations) and to start the job on
-the dial frequency. A `--system-table` is not needed to decode.
+the dial frequency. A `--system-table` is not needed to decode. The imported catalogue's HFDL
+entry lists only 2.885–2.914 and 21.89–22.11 MHz, so `knowledge_lookup` at 8.9, 10.0 or 11.4
+MHz does not surface it; the operator left the import as upstream has it (decision 21), and the
+field craft's frequency list is the answer.
 
-### 4.5 Fixtures and `modes check`
+### 4.5 A source's position
+
+A KiwiSDR is somewhere else, so a signal it hears was received there, not at the station. The
+operator wants each Kiwi to carry its own position, read from the Kiwi where it has GPS, else
+configured (decision 10). This plan adds the field on the node side; plan 32 draws from it.
+
+- `Port` gains `fn position(&self) -> Option<SourcePosition> { None }` beside `gain`, `stats`
+  and `worker` (`port.rs`). `SourcePosition { lat: f64, lon: f64, alt_m: Option<f64>, from:
+  PositionFrom }` with `from` one of `status` (read from the receiver), `configured` (the
+  operator's flag); it lives in `types.rs` beside `Capabilities`. `SourceInfo` (`ops.rs`) gains
+  `position: Option<SourcePosition>`, nullable in the schema and `#[serde(default)]`, so a
+  plan-27 client reads a plan-30 node and the reverse.
+- The Kiwi source reads the receiver's status page once per connection (`GET /status` on the
+  same host and port, a plain HTTP/1.0 request over a `TcpStream`, no new dependency): the Kiwi
+  prints `key=value` lines, among them `gps=(lat, lon)` and `asl=<metres>`; a Kiwi with a GPS
+  fix fills `gps` from it, one without from its admin configuration, and a page without a
+  `gps=` line gives no position. The field names are confirmed against the local KiwiSDR from
+  a developer shell in the plan's first task. A read that fails is no position and no fault: the
+  Kiwi still receives.
+- Configured: a generic flag, `--source-position ID=LAT,LON[,ALT_M]`, for any source id (a
+  KiwiSDR whose status lies, another node's source, a VRT stream): kept in `NodeConfig`
+  (`source_positions`), it wins over what the port reports. The node's own position stays the
+  station (`station_set`); a source without a position and `Capabilities.remote` false is at
+  the station, which is what plan 32 assumes today.
+- How `hfdl_decode` events carry it: they do not carry coordinates. Every frame's provenance
+  names its `source`, the per-source feed and `events.log` record it, and the page already
+  knows which source a job runs on; a consumer reads `source_list[].position` for that source.
+  Nothing in the envelope or the row changes, so an operator's own program row on a Kiwi gets
+  the same.
+- Not configured on the operator's node by this plan: the operator adds their Kiwi themselves
+  (decision 7). The UAT task is theirs: add it as `--source-kiwi`, see its position in
+  `source_list`, run `hfdl_decode`.
+
+### 4.6 Fixtures and `modes check`
 
 Neither mode has a synthesiser (D8PSK and HFDL's PSK framing are weeks of work each, and a real
 burst is a better proof). Each row's test is a `fixture`: a SigMF pair recorded off the air,
@@ -350,17 +467,18 @@ committed to the repository.
 **Where.** `modes/fixtures/<mode>-<dial kHz>k-<n>.sigmf-{meta,data}`, beside the rows they
 prove (the DSP crate's `crates/zeta-dsp/tests/data/` keeps the layer-1 captures its own tests
 load by `CARGO_MANIFEST_DIR`; a mode fixture is loaded by `zeta`, from a row, so it lives with
-the rows). A row's `fixture.path` is relative, as above. `modes check` resolves a relative path
-against `$ZETA_FIXTURES_DIR` when set, else against `modes/` under the current directory (a
-checkout root); an absolute path is taken as it is (operator rows). A pair that is not there is
-`skipped: fixture <path> not found (ZETA_FIXTURES_DIR unset; looked in <dir>)`, and `--strict`
-makes that a fail as it makes every skip a fail (no new rule: `--strict` means "every row proves
-itself here"). The deployed binary on the field host is run from its checkout, so
+the rows). `.gitignore` gains `!/modes/fixtures/*.sigmf-data` so the pairs are tracked by an
+ordinary `git add`. A row's `fixture.path` is relative, as above. `modes check` resolves a
+relative path against `$ZETA_FIXTURES_DIR` when set, else against `modes/` under the current
+directory (a checkout root); an absolute path is taken as it is (operator rows). A pair that is
+not there is `skipped: fixture <path> not found (ZETA_FIXTURES_DIR unset; looked in <dir>)`, and
+`--strict` makes that a fail as it makes every skip a fail (no new rule: `--strict` means "every
+row proves itself here"). The deployed binary on the field host is run from its checkout, so
 `zeta modes check --strict vdl2_decode` there works without the variable. The embedded-row
 check in CI (`crates/zeta/tests/modes_check.rs`) pins both programs to a path none lives at,
 so it expects `skipped: dumpvdl2 missing` and `skipped: dumphfdl missing`, not a fixture lookup.
 
-**Size.** Today's fixtures are 35–275 KB each, 1.9 MB in all. Budget: at most 300 KB per
+**Size.** Today's fixtures are 35–275 KB each, 1.8 MB in all. Budget: at most 300 KB per
 fixture, one fixture per row. `iq read` writes `cf32` at the capture's rate (a minute of an 8
 MHz B210 capture is 3.8 GB), so the TODO's "a minute off air with `iq read`" is the raw
 recording, not the fixture:
@@ -370,91 +488,156 @@ recording, not the fixture:
   post-roll; VDL2 bursts are tens of milliseconds, so three or four of them are under 100 KB.
   The burst gate was built on 30 ms OOK remotes and suits a VDL2 burst; should it clip one,
   the fallback is `iq read` on a narrow pinned capture and a cut by hand.
-- HFDL: `iq read` 60 s of the Kiwi's 12 kHz (5.8 MB `cf32`), run `dumphfdl --iq-file` over it
-  offline to find the slots that decode, cut 5–10 s around a squitter and an aircraft frame,
-  and write the cut as `ci8` (the file source reads `ci8`; 12 kHz × 10 s × 2 bytes = 240 KB).
-  A one-off conversion script under `scripts/` with uv inline metadata, not a node feature.
+- HFDL: 60 s of the Kiwi's 12 kHz (5.8 MB `cf32`, an `iq read` of the ring or a whole-window
+  `capture`), `dumphfdl --iq-file` over it offline to find the slots that decode, a cut of 5–10
+  s with a squitter in its first seconds and an aircraft frame after it, written as `ci8` (the
+  file source reads `ci8`; 12 kHz × 10 s × 2 bytes = 240 KB). A one-off conversion script under
+  `scripts/` with uv inline metadata, not a node feature.
 
 Each meta carries `zeta:expected` in its annotation as the OOK fixtures do (the event fields
 the check expects), and the test's `expect` names the same subset.
 
-**Recording is operator time, so the rows do not wait for it.** The B210 is held by the ACARS
-plan (a `capture` job on 136.975 MHz is a `conflict` until the radio is pinned at 133.5 MHz /
-8 MHz, and stopping or re-pinning jobs is the operator's call, never the builder's), and the
-node has no Kiwi source configured. The default is two landings: the schema and the two rows
-first, each with its fixture test pointing at a pair that is not yet there (`skipped: fixture
-... not found` on every host; `--strict` fails them, as it should until the proof exists), then
-the fixtures, recorded when the operator pins the B210 and names a Kiwi (section 7, questions
-4 and 5). The fake-program tests (5.2) prove the rows' maps in CI meanwhile.
+**Recording is operator time, so the rows do not wait for it.** The operator decided
+(decisions 6 and 7):
+
+- The B210 is **not** re-pinned now. Recording the VDL2 fixture (the radio pinned at 133.5 MHz
+  / 8 MHz with the ACARS plan inside it, or the ACARS jobs stopped for a few minutes) is a UAT
+  task the operator and the builder work through together later; stopping or re-pinning jobs
+  is the operator's call, never the builder's. `vdl2_decode` lands with its check `skipped:
+  fixture ... not found` on every host (`--strict` fails it, as it should until the proof
+  exists).
+- The local KiwiSDR (on the LAN, port 8073) may be used for **testing only**: a one-off HFDL
+  fixture recording and ad-hoc runs from a developer shell with a throwaway `zeta` process
+  (its own `--state-dir`, `--source-kiwi hf=kiwi-host:8073`), never the deployed node, never a
+  unit file, deploy helper or persisted state. Its host name reaches the shell through an
+  untracked environment variable (`ZETA_KIWI_HOST`) and nothing tracked; when the variable is
+  unset or the Kiwi is unreachable, the fixture task is skipped and `hfdl_decode` lands like
+  `vdl2_decode`, check skipped, with the recording as a UAT task.
+- The fake-program tests (5.2) prove the rows' maps in CI meanwhile.
 
 **Public.** Before a fixture is committed, run its decoder over it and read every line. Keep
 link-layer frames (XID, squitters, logons), position reports and OOOI/airline operational
 messages; cut any free-text message (crew text, `5Z`-style company messages, anything with a
 name in it). Strip the meta of anything but the SigMF core fields, `zeta:expected` and a
-`zeta:source` role (`b210`, `kiwi`): no host names, no station positions beyond the demo
-station's. The row's `expect` names an aircraft's ICAO hex or a ground station's name, both
-public. `scripts/public-check.sh` runs over the meta as over any tracked text file.
+`zeta:source` role (`b210`, `kiwi`): no host names, no receiver or station positions beyond the
+demo station's. The row's `expect` names an aircraft's ICAO hex or a ground station's number,
+both public. `scripts/public-check.sh` runs over the meta as over any tracked text file.
 
-### 4.6 Install hints and the catalogue
+### 4.7 Install hints and the catalogue
 
 `install` is `{"debian": null, "url": "https://github.com/szpajder/dumpvdl2"}` and the same
 for dumphfdl: neither is in Debian or Ubuntu, so the startup handler line reads `missing
 (<url>)`. The rows' `notes` add the one sentence that helps: the OpenWebRX+ apt repository
 packages `dumpvdl2`, `dumphfdl` and `libacars2`, and both build from source in a few minutes
 (libacars first). `ZETA_HANDLER_DUMPVDL2` and `ZETA_HANDLER_DUMPHFDL` name a program outside
-`PATH`, by the existing rule.
+`PATH`, by the existing rule (`proc.rs`).
 
 The catalogue needs no edit: a signature's `decoder` is the ready-or-unavailable row whose
 `catalogue` lists the entry (`catalogue.rs`, `CatalogueKnowledge::decoder`). The rows list
-`vhf-data-link-mode-2-vdl-m2` and `high-frequency-data-link-hfdl`. One gap stays: the imported
-HFDL entry lists only 2.885–2.914 and 21.89–22.11 MHz as frequency ranges, so `knowledge_lookup`
-at 8.9, 10.0 or 11.4 MHz does not surface it. The default is to leave the import as upstream
-has it and rely on the field craft's frequency list; section 7 asks whether to patch it instead.
+`vhf-data-link-mode-2-vdl-m2` and `high-frequency-data-link-hfdl`. The HFDL entry's frequency
+ranges stay as upstream has them (decision 21).
 
-### 4.7 Docs and TODO
+### 4.8 One aircraft table across the links
+
+The operator wants one aircraft table across `acars_decode` and `vdl2_decode` (decision 20),
+merged by a shared field: `reg`, or the ICAO address when both carry it. Today
+(`crates/zeta-ui/web/subjects.js`) the `SubjectStore` keeps subjects per job (`jobs: job id →
+key → subject`, merged by `store.event(job, payload)`, where the key is `payload[row.subject.key]`),
+and the `SubjectsPane` draws one `section.subject-job[data-job]` per running job, with the
+row's columns plus `Position`, `Distance`, `Last seen` and `Count`. The map, the waterfall, dim
+and drop, selection (`{job, key}`) and the e2e scenarios all work on those per-job subjects.
+
+The merge is a view on top, not a change to the store:
+
+- **On the row.** `subject.merge: ["reg", "icao"]`, optional (`#[serde(default)]`, empty when
+  left out, nullable in the schema): the event fields whose equal values mean "the same
+  subject", across rows whose subjects share `subject.name` (the plural noun, "aircraft"). Each
+  must name a schema property, else `broken` at `subject.merge[i]`. The subject's own key
+  counts as a field of its state. `acars_decode` gets `["reg"]` (it has no ICAO), `vdl2_decode`
+  and `hfdl_decode` `["reg", "icao"]`. `adsb_decode` is left alone in this plan (adding
+  `["icao"]` to it later is one line; the operator asked for ACARS and VDL2).
+- **On the page.** When two or more running jobs' rows declare `merge` and share
+  `subject.name`, the pane draws one `section.subject-merged[data-name="aircraft"]` for them in
+  place of their per-job sections. Its rows are groups of per-job subjects: two subjects are one
+  group when, for any field in either row's `merge`, both have a non-blank value and the values
+  are equal (the key included; union-find over the running jobs' subjects, recomputed on each
+  render, which is already throttled). A group's state is the member states merged
+  newest-last-seen wins, its position the newest member's, its `count` the sum, `first_seen`
+  the earliest, `last_seen` the latest, `dim` when every member is dim. The key column shows
+  the first `merge` field the group has (`reg`, else `icao`); the columns are the union of the
+  rows' `columns` by field (`acars` and `vdl2` share `flight`, `label`, `text`), then a `Via`
+  column listing the protocols heard (`acars`, `vdl2`), then `Position`, `Distance`, `Last
+  seen`, `Count` as today. The heading reads `aircraft, N (acars_decode b210, vdl2_decode
+  b210)`. A press on a merged row selects the newest member's `{job, key}` in the store, so the
+  map and the waterfall highlight as they do today; the merged row is `selected` when any
+  member is. A job whose row has no `merge`, or is alone in its `subject.name`, keeps its
+  per-job section unchanged.
+- **Agent and CLI.** Nothing: events stay per job and per row, `events.log` and
+  `stream_tail` unchanged. The agent sees `merge` in `modes_show` and the guide says what it
+  means in one sentence.
+
+**Why a view, not a store change.** Per-job subjects are what every other consumer holds
+(selection, tracks, dim/drop, the fold ribbons); merging in the store would change the identity
+the map and the waterfall key on. A grouped view costs one function and one section kind, and
+falls back to today's tables the moment the rows disagree.
+
+### 4.9 Docs and TODO
 
 - Field craft, "Decoding pagers, aircraft and FM data": a bullet each. VDL2: 136 975 000 Hz
   worldwide (the European channels listed), 25 000 Hz; needs dumpvdl2; beside ACARS pin the
   radio at 133 500 000 Hz / 8 000 000 Hz first, then the ACARS plan and the VDL2 job, in that
-  order; report `summary`, and that a ground-station row's ACARS columns name the aircraft of
-  each uplink. HFDL: on a Kiwi, `center_hz` is the listed (dial) frequency, 6 000 Hz; the
-  signal is 1.44 kHz above it, so a `measure` box on the carrier reads 2.4 kHz of PSK offset
-  up; a squitter every 32 s proves the channel; frequencies from a list, not a raster.
+  order; report `summary`, that a ground-station row's ACARS columns name the aircraft of each
+  uplink, and that an ADS-C report gives the frame a `position`. HFDL: on a Kiwi, `center_hz`
+  is the listed (dial) frequency, 6 000 Hz; the signal is 1.44 kHz above it, so a `measure` box
+  on the carrier reads 2.4 kHz of PSK offset up; a squitter every 32 s proves the channel;
+  frequencies from a list, not a raster. One sentence on `subject.merge` (the page shows one
+  aircraft table across the links) and one on a source's `position` in `source_list`
+  ("Remote HF receivers (KiwiSDR)").
 - The "Set up a background decoder for all ACARS and ADS-B activity" recipe gains the VDL2
-  line; the sibling spec's named set replaces the recipe later.
-- `agents_md.rs`, `args` doc text: `$center_khz`; `modes_list` text: `fields`.
+  line; plan 31's named set replaces the recipe later.
+- `agents_md.rs`: `--source-position` in the flags, `$center_khz` in the `args` doc text,
+  `fields` and `merge` in the `modes_list`/`modes_show` text, `position` in `source_list`'s.
 - TODO: the two source notes are replaced by one line pointing at this spec and the plan, with
-  the airband set and the merged aircraft table left as their own gists; "Modes: fixtures off
-  the air" is a new short gist only if the HFDL rate question (section 6) leaves work behind.
-- UAT: VDL2 on the B210 beside the ACARS plan, HFDL on the operator's Kiwi (section 5.4).
+  the airband set left to plan 31's gist; new short gists for what this plan leaves (section 6:
+  `adsb_decode` in the merge, ADS-C over the ATN half, the VDL2 fixture if still unrecorded).
+- UAT: VDL2 on the B210 beside the ACARS plan (recording the fixture first), the operator's own
+  Kiwi added as a source with its position and `hfdl_decode` on it (section 5.4).
 
 ## 5. Testing
 
 ### 5.1 Row schema (`crates/zeta-core`, `row.rs` and `summary.rs` unit tests)
 
 - A `fields` map with a pointer, a list of pointers (first non-null wins, null skipped), a
-  pointer to nothing (field absent), a pointer to an object (copied).
+  pointer to nothing (field absent), a pointer to an object (copied), a pointer with an array
+  index (`/a/tags/0/basic_report/lat`).
 - `broken` cases: a key not in the schema (`decoder.output.fields.<key>`); a schema property not
-  in the map (`event.schema.properties.<name>`); a pointer not starting with `/`; an empty list.
+  in the map (`event.schema.properties.<name>`), the envelope fields exempt; a pointer not
+  starting with `/`; an empty list.
 - `summary`, `subject.key` and `position` resolved on a mapped event: `{reg?}` dropped when the
-  pointer resolved to nothing; a null `icao` is "no subject".
+  pointer resolved to nothing; a null `icao` is "no subject"; `alt_unit: ft` on a mapped
+  `alt_ft`.
+- `subject.merge`: round-trips, defaults to empty, names schema properties (`subject.merge[i]`
+  when not), reported by `modes_show`.
 - `$center_khz`: 8 942 000 → `8942`; 8 942 500 → `8942.5`; 136 975 000 → `136975`; an unknown
   placeholder is still `broken` at `decoder.args[i]`.
-- `tests/modes.rs`: both embedded rows parse and validate against zeta-dsp's stages; their
-  `label`s and `protocol`s are pinned (`VDL2`/`vdl2`, `HFDL`/`hfdl`).
+- `tests/modes.rs`: both embedded rows parse and validate against zeta-dsp's stages (`EMBEDDED`
+  8 → 10, in `modes/mod.rs` and the test); their `label`s and `protocol`s are pinned
+  (`VDL2`/`vdl2`, `HFDL`/`hfdl`); `the_rows_name_the_planned_subjects` covers `merge`.
 
 ### 5.2 Adaptor (`crates/zeta-ext`)
 
 - `Publisher::publish` with a map over a captured real dumpvdl2 line (kept as a test vector in
-  `crates/zeta-ext/tests/data/`, reviewed as a fixture is) yields `addr`, `reg`, `text` and no
-  `vdl2` key; the same line without a map yields today's whole object.
+  `crates/zeta-ext/tests/data/`, reviewed as a fixture is; until a real line exists, a line
+  built to libacars's documented shape, marked as such in the file) yields `icao`, `reg`,
+  `text`, `position` and no `vdl2` key; the same line without a map yields today's whole object.
 - `substitute` fills `$center_khz`.
-- A fake program (`crates/zeta/tests/data/fake-dumpvdl2.sh`: reads stdin, prints the captured
-  line once, exits 0) pinned by `ZETA_HANDLER_DUMPVDL2` runs an operator-dir copy of
-  `vdl2_decode` end to end in `tests/modes_check.rs` over any synthesised capture (the `psk`
-  family): the first event's `addr` is the vector's, its `summary` reads as the template says,
-  and `subject` folding on the page is not involved. The same for dumphfdl, with the `icao`
-  list form exercised (a downlink line and an uplink line).
+- The existing `fake_lines` (`crates/zeta-ext/tests/fake_lines.py`, `--lines-file PATH`)
+  stands in for the programs: an operator-dir copy of `vdl2_decode` with `programs:
+  ["fake_lines"]` pinned by `ZETA_HANDLER_FAKE_LINES` (or an absolute path, as the e2e's fake
+  rows do) and `args: ["--lines-file", <the vector>]` runs end to end in
+  `crates/zeta/tests/modes_check.rs` over any synthesised capture (a `psk` family test): the
+  first event's `icao` is the vector's and its `summary` reads as the template says. The same
+  for dumphfdl, with the `icao` list form exercised (a downlink line and an uplink line).
 
 ### 5.3 `modes check` (`crates/zeta/tests/modes_check.rs`)
 
@@ -464,81 +647,105 @@ has it and rely on the field craft's frequency list; section 7 asks whether to p
   and `--strict` fails it; with `ZETA_FIXTURES_DIR` pointing at a directory holding the pair it
   runs. An absolute path is used as given (the existing `a_fixture_test_row_is_checked`).
 
-### 5.4 Live (UAT, the field host)
+### 5.4 Source position and the page
 
-- `zeta modes check --strict vdl2_decode` and `zeta modes check --strict hfdl_decode` from the
-  checkout each print `ok` with the real programs (`modes check` takes one id; the builder may
-  let it take several, but nothing here needs it).
-- VDL2: pin the B210 at 133.5 MHz / 8 MHz, `plan_start acars_vhf`, start `vdl2_decode` on
-  136.975 MHz; within a minute the Subjects tab shows aircraft rows with `Reg`/`Flight`/`Text`,
-  the ground station's row with uplinks, `knowledge_lookup` on the band names `vdl2_decode`,
-  and `job_context` shows no `external.unparsed` growth.
-- HFDL: on the operator's Kiwi, `hfdl_decode` on one of the nearest station's listed
-  frequencies; a squitter event within 40 s, an aircraft row with a position on the map when
-  one logs on.
+- `crates/zeta-source-kiwi/tests/kiwi.rs` (the fake Kiwi server): a status page with `gps=`
+  and `asl=` gives `position()` `{lat, lon, alt_m, from: status}`; one without gives `None`; a
+  status read that fails leaves the source tuning and faultless.
+- `crates/zeta/tests/cli.rs` or `transports.rs`: `--source-position ID=LAT,LON[,ALT_M]` parses,
+  refuses a bad value naming the flag, and `source_list` reports `position` with `from:
+  configured`; a file source without the flag reports `null`.
+- e2e (`ui.py`): `scenario_subjects_merge_across_rows`: two fake rows (`fake_acars`, keyed
+  `reg`, `merge: ["reg"]`; `fake_vdl2`, keyed `icao`, `merge: ["reg", "icao"]`, both `name:
+  aircraft`) started on the tone source; the pane shows one `section.subject-merged` with one
+  row for the aircraft both heard (`Via` reads `fake_acars, fake_vdl2`, `Count` is the sum), one
+  for the aircraft only VDL2 heard, and no per-job sections for the two; stopping `fake_vdl2`
+  returns `fake_acars` to its own section. Added to the suite's list in `ui.rs`.
+
+### 5.5 Live (UAT, the field host; the operator's radio time)
+
+- Record the VDL2 fixture together: pin the B210 at 133.5 MHz / 8 MHz (the ACARS plan keeps
+  running inside), `capture` on 136.975 MHz / 25 kHz, review and commit; then `zeta modes check
+  --strict vdl2_decode` from the checkout prints `ok`.
+- VDL2: with the pin in place, `plan_start acars_vhf`, start `vdl2_decode` on 136.975 MHz;
+  within a minute the Subjects tab shows one aircraft table with `Reg`/`Flight`/`Text` and
+  `Via`, the ground station's row with uplinks, a `position` on an ADS-C frame when one is
+  heard, `knowledge_lookup` on the band names `vdl2_decode`, and `job_context` shows no
+  `external.unparsed` growth.
+- The operator's Kiwi: add it to their instance as `--source-kiwi`; `source_list` shows its
+  `position`; `hfdl_decode` on one of the nearest station's listed frequencies gives a squitter
+  event within 40 s and an aircraft row with a position on the map when one logs on. `zeta
+  modes check --strict hfdl_decode` prints `ok` when the HFDL fixture is in.
 
 ## 6. Left to the plan
 
-- The exact JSON paths. The pointers above follow the key names found in the binaries and the
-  decoders' documented output; the first task of the plan captures one real line of each (the
-  field host has both programs and the traffic) and fixes the pointers and the schema types
-  against it before the rows are written. Same for `lat`/`lon` being degrees as numbers.
+- The exact JSON paths. The pointers above follow the key names found in the binaries,
+  libacars's source and the decoders' documented output; the plan's first task confirms them
+  against dumpvdl2's and dumphfdl's upstream JSON formatters (the B210 is not available for a
+  live VDL2 line now) and against a live dumphfdl line from the local KiwiSDR when the shell
+  can reach it, and fixes the schema types. The ADS-C tag wrapper and depth are confirmed on
+  the VDL2 fixture; the row's pointers are revised then if they differ. Same for `lat`/`lon`
+  being degrees as numbers.
 - Whether dumphfdl decodes at 12 kHz input. It accepts the rate; if the fixture does not decode
   at 12 kHz but does at 24 kHz offline, `input.rate_hz` becomes 24 000 and the adaptor
   upsamples (L/M = 2/1). The rate is the row's, so nothing else moves.
 - The HFDL fixture's frequency and the field-craft frequency list: taken from dumphfdl's system
   table for the two stations nearest the demo station, at the hour the fixture is recorded.
 - `modes check` waits for the first event with one `stream_tail`, capped at `TAIL_MAX_MS`
-  (10 s), so an HFDL `within_ms` of 40 000 would be cut silently. Either the check tails in a
-  loop until `within_ms` has passed, or the HFDL fixture is cut so a squitter lands in its first
-  seconds and `within_ms` drops to 10 000; the plan picks one and says which.
+  (10 s). The HFDL fixture is cut so a squitter lands in its first seconds and `within_ms` is
+  10 000 (the row above says so); the check is not changed.
+- The Kiwi status page's exact lines (`gps=(lat, lon)`, `asl=`), confirmed on the local
+  KiwiSDR from a developer shell; and whether a Kiwi without GPS prints its configured
+  location under the same key (expected: yes).
 - Whether `fields` lives on `ProgramOutput` as `Option<BTreeMap<String, FieldPath>>` with
   `FieldPath` an untagged `String | Vec<String>`, or a small struct; the row tests are the
   contract.
-- Recording the fixtures is operator time on the field host's radios (the B210 is on the ACARS
-  plan; the Kiwi is the operator's choice): the plan's first tasks are the lines and the
-  fixtures, the rows and tests follow.
+- The merged table's exact DOM and the `Via` column's text; the e2e scenario is the contract.
 - A lone `vdl2_decode` on a direct-conversion radio centres the capture on the channel and puts
-  the radio's DC spur mid-channel. The plan checks once whether dumpvdl2 copes on the B210 (it
-  has no DC-offset option); if not, the field craft says to pin the radio off the channel, as
-  the ACARS case does anyway, and the general fix (a capture offset for lone jobs) is a gist.
-- Order of work: the schema (`fields`, `$center_khz`) with its unit tests; the fake-program
-  tests; the two rows and their fixtures; docs and AGENTS.md regeneration; UAT.
+  the radio's DC spur mid-channel. Checked once when the VDL2 fixture is recorded (dumpvdl2 has
+  no DC-offset option); if it fails, the field craft says to pin the radio off the channel, as
+  the ACARS case does anyway, and the general fix (a capture offset for lone jobs) is already a
+  TODO gist ("Lease: keep a lone job's capture centre off its channel").
+- Order of work: the schema (`fields`, `$center_khz`, `merge`) with its unit tests; the
+  fake-program tests; the two rows; the source position; the page's merged table; the HFDL
+  fixture when the local Kiwi is reachable; docs and AGENTS.md regeneration; UAT.
 
-## 7. Questions for the operator
+## 7. The operator's decisions (2026-11-06)
 
-Only what changes what gets built:
+Numbered as in the sprint's questions to the operator.
 
-1. **Whose row is an uplink?** This design keys VDL2 events on the AVLC source address, so the
-   ground station gets a table row whose ACARS columns name the aircraft each uplink is for,
-   and aircraft rows carry downlinks only. The alternative keys on the aircraft whichever
-   direction the frame goes (needs a conditional in the field map, "src when src is an
-   aircraft, else dst", which pointers cannot say), or keys on the ACARS `reg` and loses
-   XID/link frames from the table. Which table do you want to read?
-2. **One aircraft table across ACARS and VDL2?** The TODO's "one table with ACARS keyed on
-   `reg` would be nicer still" is page work (two rows' subjects merged by a shared field),
-   not a row. Do you want it in this plan's scope, or as its own gist after the rows land?
-3. **The imported catalogue's HFDL entry** lists frequency ranges that miss 8.9, 10.0 and 11.4
-   MHz, so `knowledge_lookup` there will not name HFDL even with the row in place. Patch the
-   vendored iNTERCEPT `signals.json` locally (and note it in `docs/licensing.md`), or leave the
-   import as upstream has it and rely on the field craft's frequency list? The default is to
-   leave it.
-4. **Which Kiwi for HFDL?** The node has no KiwiSDR source configured, and the HFDL fixture
-   and the live check both need one. Name a Kiwi the node may hold a slot on (yours, or a
-   public one you choose); without one, `hfdl_decode` lands with its check `skipped: fixture
-   ... not found` and no live acceptance.
-5. **May the B210 be re-pinned for the VDL2 fixture?** Recording it needs the B210 pinned at
-   133 500 000 Hz / 8 000 000 Hz (the ACARS plan keeps running inside the pin) or the ACARS
-   jobs stopped for a few minutes. Stopping or re-pinning is your call: say when, or do it
-   yourself and say so. Until then the rows land with their fixture checks skipped (4.5).
+4. **Keying.** The operator does not mind which address keys the table: the default stands
+   (the AVLC source address; a ground station gets its own row). What they want is aircraft
+   positions on the map wherever the link carries one (ADS-C reports libacars decodes inside
+   dumpvdl2), with ACARS- and ADS-B-like details (`reg`, `flight`, `label`, `text`) and a link
+   to the job. So the row **does** get `position`, mapped from the ARINC 622 ADS-C basic report
+   at `/vdl2/avlc/acars/arinc622/adsc/tags/<i>/basic_report/{lat,lon,alt}` (feet; 4.3), the
+   exact path to be confirmed on the fixture. Frames without one update the subject only.
+6. **The B210 is not re-pinned now.** Recording the VDL2 fixture and the live check are UAT
+   tasks worked through together later; the rows land with their fixture checks skipped.
+7. **The Kiwi.** The operator will add their own KiwiSDR (on the LAN, port 8073) to their node
+   instance themselves; no plan task, deploy helper, unit file or persisted state adds it. The
+   plan makes sure a Kiwi they add works (`hfdl_decode` on a `--source-kiwi` source, the
+   per-source position). Test use is allowed: a one-off HFDL fixture recording and ad-hoc runs
+   from a developer shell with a throwaway `zeta` process, never the deployed node. Its host
+   name is private: "the local KiwiSDR" and `kiwi-host` in tracked files. UAT gets "add your
+   Kiwi as a source and run `hfdl_decode`".
+10. **Kiwi position: yes, now.** Each KiwiSDR source carries its own position, read from the
+    Kiwi's status where it has GPS, else configured; signals received through it are placed,
+    cut and drawn from the Kiwi's position, not the station's. This spec defines the field on
+    the source (4.5) and how events reach it (by provenance); plan 32 draws from it.
+20. **One aircraft table across ACARS and VDL2: yes, in this plan.** The page merges the rows'
+    subjects by a shared field (`reg`, or ICAO when both carry it); 4.8.
+21. **The catalogue's HFDL ranges:** left as upstream.
 
 ## 8. Calls made in this document
 
 - Pointers, not flattening (4.1); the list form for "first of"; with a map the event is the
-  mapped fields only, and an unmapped schema property is `broken`.
-- No conditional in the field map. "src when it is an aircraft, else dst" is a real need
-  (question 1) but a small expression language is a worse answer than one more row revision;
-  the list form covers HFDL because an uplink's `src.ac_info` is absent.
+  mapped fields only, and an unmapped schema property is `broken`, the envelope's four fields
+  excepted.
+- No conditional in the field map. "src when it is an aircraft, else dst" would need a small
+  expression language, a worse answer than one more row revision; the list form covers HFDL
+  because an uplink's `src.ac_info` is absent, and covers the ADS-C tag slots.
 - `$center_khz` as a placeholder rather than a unit suffix on `$center_hz`, to match the
   existing fixed-list style and its validation.
 - `--oversample 1` (105 kHz) for VDL2: the cheapest exact per-channel rate, since the node
@@ -549,25 +756,42 @@ Only what changes what gets built:
 - VDL2 `bandwidth_hz` 25 000 (the channel raster; the D8PSK occupies about 17 kHz), the five
   common channels as `centers_hz`, `range_hz` null (the catalogue's 117.975–137 MHz is the whole
   voice airband and would score every airband signal as plausible VDL2).
+- VDL2's key field is named `icao` (the AVLC address is the aircraft's ICAO 24-bit address),
+  not `addr`, so the merge field has one name across `vdl2_decode`, `hfdl_decode` and
+  `adsb_decode`; `addr_type` says when it is a ground station's.
 - VDL2 events: every decoded AVLC frame, not only those with an ACARS block; a frame's `t_ns`
   is the IQ frame's time, not dumpvdl2's `{sec, usec}` (a `time` from a split seconds field is
-  not worth a schema feature for a few milliseconds).
+  not worth a schema feature for a few milliseconds); `position` from the ADS-C basic report
+  only (the first two tag slots and the emergency report), altitude in feet converted by
+  `alt_unit`.
 - HFDL `bandwidth_hz` 6000 centred on the dial frequency, for the reason in 4.4; `position`
   mapped from `hfnpdu.pos` (a structured field; the TODO's "no position" was about ACARS texts),
-  `track_min_m` 1000; `identify.dwell_ms` 40 000 to hold one HFDL frame; squitters are events
-  about no subject.
+  `track_min_m` 1000; `identify.dwell_ms` 40 000 to hold one HFDL frame; the check's
+  `within_ms` 10 000 with the fixture cut to open on a squitter; squitters are events about no
+  subject.
 - HFDL `centers_hz` empty with `range_hz` [2.8, 22.1] MHz, the frequency list in prose, since
   the active set follows the system table by hour.
 - HFDL ground stations by number (`gs_id`), the name (`gs`) shown when dumphfdl has one, rather
   than carrying a system table for the names (from the builder check).
+- The source position as a `Port` accessor plus a generic `--source-position` flag, not a
+  Kiwi-only `lat=,lon=` suffix on `--source-kiwi`: any remote source may have one, and the
+  Kiwi flag's `/PASSWORD` tail makes a suffix awkward. The Kiwi reads its own from `/status`
+  over a plain HTTP request on the socket it already opens, no HTTP client dependency. Events
+  carry the position by provenance (`source`), not as a field.
+- The merge declared on the rows (`subject.merge`, grouped by `subject.name`) and applied by
+  the page as a view over per-job subjects, not a store change and not a page rule naming two
+  rows (4.8). `adsb_decode` is not given `merge` in this plan.
 - Two landings by default, rows before fixtures, with the fixture checks skipped until the
-  operator's radio time (4.5; from the builder check).
-- The vendored catalogue is not patched unless the operator says so (question 3).
+  operator's radio time (4.6); the VDL2 fixture is a UAT task (decision 6); the HFDL fixture is
+  recorded from the local KiwiSDR with a throwaway `zeta` from a developer shell when it is
+  reachable, never from the deployed node (decision 7).
 - Fixtures under `modes/fixtures/`, relative to `ZETA_FIXTURES_DIR` or `modes/` under the
-  current directory, at most 300 KB each, `ci8` allowed, reviewed for content before commit;
-  a missing fixture is a skip with the lookup named, and `--strict` fails it like every skip.
+  current directory, at most 300 KB each, `ci8` allowed, reviewed for content before commit, an
+  un-ignore rule for their `.sigmf-data`; a missing fixture is a skip with the lookup named,
+  and `--strict` fails it like every skip.
 - `install.debian` null with the OpenWebRX+ repository named in `notes`, rather than
   `debian: "dumpvdl2"` (which would print an `apt install` line that fails on a stock Debian).
-- The catalogue entries are not edited for `decoder` (derived from the rows); the HFDL
-  frequency-range gap is the operator's call (question 3).
-- The airband named set and the merged aircraft table are out of scope and named as such.
+- The catalogue entries are not edited for `decoder` (derived from the rows) nor for the HFDL
+  frequency ranges (decision 21).
+- The airband named set (plan 31) and the map side of the source position (plan 32) are out of
+  scope and named as such.
