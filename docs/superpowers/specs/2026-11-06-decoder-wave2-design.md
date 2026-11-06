@@ -10,8 +10,10 @@ findings are folded in (where a graph row's stage may live and the handler looku
 skip rule for graph rows, the CI gate's order, the e2e fixture's home, four citation fixes) and the
 two calls it asked for are settled under section 15; nothing new went to the operator.
 
-Decisions here are the author's unless marked "builder's call" (left open) or listed in section 14
-(the operator's).
+Decisions here are the author's unless marked "builder's call" (left open) or listed in section 14,
+the operator's decisions of 2026-11-06 (Codec 2 as the external `c2dec`, FLEX synthesised-only,
+M17 proven on air only if the register shows a station in range, pager text kept on disk with an
+`access` marker for a later access control, no recording in the repo).
 
 ## 1. Intent and why
 
@@ -38,7 +40,8 @@ AIS NMEA sinks), trunking.
 What this document adds beyond rows is small and generic, and each piece is named as such in
 section 4: a tolerance form in `modes check`'s `expect`, program handlers on graph rows (for the
 vocoder), the stream kinds a row's job emits in `modes_list` (so the page knows an audio row), the
-rows' `notes` rendered into AGENTS.md, and a fifth quick attempt (`ais`).
+rows' `notes` rendered into AGENTS.md, a fifth quick attempt (`ais`), and an `access` marker on
+a row and its events (the hook the operator asked for ahead of access control).
 
 ## 2. Goals, non-goals, anti-goals
 
@@ -79,12 +82,14 @@ rows' `notes` rendered into AGENTS.md, and a fifth quick attempt (`ais`).
   a synthesised test; a program row's real decode is proven by `--strict` on the field host and
   recorded in `checked`, as plan 16 ruled.
 - A copyleft dependency in the workspace. `deny.toml` forbids GPL, LGPL and AGPL and CI runs
-  `cargo deny`; this document does not ask for an exception (the question is the operator's,
-  section 14).
+  `cargo deny`; this document asks for no exception, and the operator wants none (section 14:
+  Codec 2 runs as the external `c2dec`).
 - A generator derived from a GPL decoder's source. The DFM, M20, FLEX and M17 synthesisers follow
   the RS41 rule (plan 17 section 5.3): public descriptions, the external program as the oracle only.
-- A pager row that treats message content differently from POCSAG without the operator's word.
-  FLEX follows the POCSAG row exactly (section 11).
+- A pager row that treats message content differently from POCSAG. FLEX follows the POCSAG row
+  exactly (section 11); the operator kept pager text on disk (section 14), and both rows mark
+  their events `access: "restricted"` (section 4.7) so a later access control can gate them
+  without a change to the rows.
 - An inner graph edge carrying events at frame rate. Plan 27 feeds every inner event edge to the
   source's feed and the page counts each frame; a decoder chain that publishes 25 events a second
   per voice frame would swamp both. Each row here is one stage from IQ to its outputs.
@@ -215,6 +220,23 @@ generated texts that enumerate the four names (`note("classify")`, field craft) 
 `parsers/multimon.rs` reads FLEX lines (section 6.2); every other non-POCSAG, non-FLEX line stays
 `{text}`.
 
+### 4.7 The `access` marker
+
+The operator keeps pager text on disk for now and wants the events that carry it flagged as
+needing a restricted access level, so an access-control layer, when it arrives, can gate them without
+touching the rows (section 14). The cheapest marker that reaches every place an event lands:
+`ModeRow` gains `access`, `null` (the default; every row today, so every existing row and operator
+row keeps loading) or `"restricted"`: the row's events carry content a deployment may want to show
+to fewer people than the spectrum. `pocsag_decode` and `flex_decode` set it `"restricted"`, and
+`summary::envelope` adds `"access": "restricted"` to each event of such a row (so `events.log`, the
+source's feed, `--then-tail`, the page's ribbons and the agent's `stream_tail` all see it; a row
+without it adds nothing, not `null`, so no pinned event shape moves), and `modes_list`'s
+`ModeInfo` carries `access` so a client can tell before it starts the job. Plan 31 (section 4.8 of
+its spec) defines the same marker with the same shape for the same two rows. Nothing reads the marker yet: no filter, no redaction, no retention
+switch. The access-control design that reads it is a `TODO.md` gist this wave writes ("Access:
+ACLs on restricted rows"). About 40 lines in `row.rs`, `summary.rs`, `ops.rs`, plus the two
+row files and the `job_start`/`modes_list` notes (one sentence each).
+
 ## 5. AIS
 
 ### 5.1 In-crate, and why
@@ -336,8 +358,9 @@ notes "FLEX pagers at 1600, 3200 or 6400 bps (2- or 4-level FSK, ±4800 Hz), 250
        measured centre. One event per page, like POCSAG. It runs multimon-ng on the node's host."
 ```
 
-`centers_hz` is empty: this document knows no live FLEX centre in Australia (section 14). The
-`multimon` parser gains the FLEX branch, both line forms multimon-ng prints:
+`centers_hz` is empty: the operator's FLEX source is offline and has no antenna (section 14), so
+this wave knows no live FLEX centre; FLEX is synthesised-only now, and the live check is a UAT task
+(section 12). The `multimon` parser gains the FLEX branch, both line forms multimon-ng prints:
 `FLEX|<time>|<baud>/<levels>/<K|C>/<phase>|<cycle>.<frame>|<capcode>|<ALN|NUM|TON|BIN>|<text>`
 (FLEX_NEXT, the form in the parser's existing test) and
 `FLEX: <time> <baud>/<levels>/<K> <cycle>.<frame> [<capcode>] <ALN> <text>` (the older `FLEX`
@@ -398,8 +421,9 @@ spec's example frames give).
 
 The TODO wanted Codec 2 in-crate. `deny.toml` forbids copyleft and CI runs `cargo deny`: the
 pure-Rust `codec2` crate is LGPL-2.1 AND MIT and libcodec2 behind `codec2-sys` is LGPL-2.1, so
-neither can enter the workspace without a licence exception (section 14, question 1). What can is
-what the sondes and ADS-B do: a program on the host. `c2dec` from the `codec2` package (Debian and
+neither can enter the workspace without a licence exception, and the operator wants none (section
+14: the external program stands; an in-crate port may come later if it earns its place). What can
+enter is what the sondes and ADS-B do: a program on the host. `c2dec` from the `codec2` package (Debian and
 Ubuntu, 1.2.0 on the field host) reads Codec 2 frames on stdin and writes 16-bit 8 kHz speech on
 stdout (`c2dec 3200 - -`), one 8-byte frame to 160 samples at 3200 bps, one to 320 at 1600.
 
@@ -493,8 +517,8 @@ against the oracle and said so.
 
 Fallback, as plan 17 section 5.3: one task's budget per sonde. A generator the oracle still does not
 decode at the end of it is dropped from the wave with its findings in the plan, and the row keeps
-`test: null`. Whether a short public sample recording may stand in as a `fixture` test instead is
-the operator's (section 14).
+`test: null`. No recording enters the repository as a stand-in (the operator held the RS41 rule,
+section 14): a row the synthesiser cannot reach in budget stays `skipped: no test`.
 
 Size: 300-450 lines each, plus 60 for Manchester and Hamming(8,4) helpers.
 
@@ -557,9 +581,9 @@ and `kiss` integration 50, row and e2e 80: about 600-750 lines.
 | `m17_decode` (graph + handler, new) | amateur_voice | 12 500 Hz, no centres | `event`, `quick: null`, dwell 5 s | `m17-rf-protocol` | row `notes`; `note("job_start")` and `note("job_attach")`; field craft: a "Decoding digital voice" paragraph under "Transcribing a channel" | 1800-2600 |
 | `dfm_decode`, `m20_decode` (tests only) | weather_science | unchanged | unchanged | unchanged | field craft's "no synthesised test yet" sentence goes | 700-1000 |
 | `aprs_decode` (fields + position) | amateur_digital | unchanged | unchanged | unchanged | "Decoding APRS" gains the position sentence; row `notes` added | 600-750 |
-| shared (section 4) | | | | | `note("modes_list")` (`outputs`), `note("classify")` (five quick names), the modes guide (row notes) | 300-450 |
+| shared (section 4) | | | | | `note("modes_list")` (`outputs`, `access`), `note("classify")` (five quick names), the modes guide (row notes) | 350-500 |
 
-Whole wave: about 5 200-7 250 lines including tests and generators. The prose locations above are
+Whole wave: about 5 250-7 300 lines including tests and generators. The prose locations above are
 all generated-and-checked text (`agents_md.rs`, `field-craft.md`, the rows' `notes`); `README.md`'s
 "Legal" paragraph and `docs/guide.md`'s decoder list are the hand-written ones.
 
@@ -574,8 +598,10 @@ all generated-and-checked text (`agents_md.rs`, `field-craft.md`, the rows' `not
   ribbons, `--then-tail`). The guard is the README's "Legal" paragraph ("Whether you may receive and
   decode a given transmission where you are, pager traffic in particular, depends on your local law
   and is your responsibility") and the field-craft rule that the agent states the legal line once
-  when a request goes that way. FLEX does the same: the README paragraph names FLEX beside POCSAG,
-  and no redaction or retention switch is added without the operator's word (section 14).
+  when a request goes that way. FLEX does the same: the README paragraph names FLEX beside POCSAG.
+  The operator kept pager text on disk and added no redaction or retention switch (section 14);
+  what this wave adds is the `access` marker on both rows and their events (section 4.7), so the
+  access-control layer the TODO gist describes can gate pager text when it arrives.
 - **M17** is amateur voice, public by licence condition. An encrypted stream (`encryption` not
   null) is reported with its callsigns and type and is never fed to the vocoder: the layer-4
   boundary ("never attempts to break encryption") applies as written. Packet-mode content is not
@@ -609,6 +635,9 @@ Unit (each in its crate):
   checked with the in-tree encoders, never the decoders.
 - `compare`: the tolerance form passes within, fails outside, and a non-number fails with the diff
   line.
+- `access`: `envelope` adds `access: "restricted"` for a row that sets it and nothing for one that
+  does not (`summary.rs`); `pocsag_decode` and `flex_decode` are the only embedded rows with it
+  (`modes.rs`); `modes_list` carries it; an operator row without the field loads (the default).
 - Rows: `crates/zeta-core/tests/modes.rs` gains the three new rows as `ready` on a host with their
   programs and `unavailable` without (`ZETA_HANDLER_C2DEC=/nonexistent`), `modes_list` `outputs`
   for `m17_decode` and `aprs_decode`, a graph row with a bad `handlers` entry `broken` naming
@@ -645,8 +674,15 @@ Live acceptance (`UAT.md` Plan 29, the operator's):
   on the channel lists `ais_decode proved`.
 - APRS: `aprs_decode` on 144 800 000 Hz: stations with positions get markers; a Mic-E tracker
   (common on 2 m) decodes to a fix.
-- FLEX and M17: section 14 asks what is in range; without a live signal the synthesised `--strict`
-  check is the proof and the UAT entry says so.
+- FLEX: the operator's FLEX source is offline and has no antenna (section 14), so the synthesised
+  `--strict` check is this wave's proof; the UAT entry is the live check for when a source is up:
+  find a FLEX centre (`knowledge_lookup` on the pager bands, or a `scan`), start `flex_decode` on
+  the measured centre, read one page with `capcode` and `text`.
+- M17: first ask the register (`knowledge_lookup` through the ACMA provider, or the register
+  server) for amateur assignments or repeaters near the station that an M17 station could be
+  heard on; with one, the UAT entry is `m17_decode` on that channel until a stream decodes to
+  callsigns and audio plays on the page; without one, the synthesised `--strict` check on the
+  field host (with `c2dec` installed) is the acceptance and the UAT entry says which it was.
 - DFM/M20: `--strict` passes against `dfm09mod` and `m20mod`; a live DFM or M20 is not expected
   over Brisbane (the Bureau flies RS41) and the watch's existing rows handle one if it comes.
 
@@ -654,7 +690,7 @@ Live acceptance (`UAT.md` Plan 29, the operator's):
 
 Order of work (the plan's), by value and by what unblocks what: section 4 first (the tolerance,
 handlers, `outputs`, notes), then APRS positions (smallest, visible at once on the field host),
-AIS, DFM and M20 synthesis, FLEX, M17 last; M17 is the largest item and may be its own plan (28b)
+AIS, DFM and M20 synthesis, FLEX, M17 last; M17 is the largest item and may be its own plan (29b)
 if the wave's reviews run long. Each row lands with its row, stage, generator, tests and prose in
 one task cluster, as the sonde rows did.
 
@@ -676,28 +712,31 @@ Leftovers to write into `TODO.md` when the plan lands: APRS objects and items as
 own; an in-crate FLEX decoder (the slot); M17 packet-mode content and the 1600 mode's data bytes;
 AIS message types beyond 1-5, 18, 21, 24; a `vocoder` handler for AMBE/IMBE on the same stage
 shape (ties to the install-script gist); AIS and APRS feeds out (the Feeds gist); the FLEX
-synthesiser at 3200 and 6400 bps.
+synthesiser at 3200 and 6400 bps; and the access-control gist the `access` marker waits for
+("Access: ACLs on restricted rows": who may read `events.log`, the feeds and `--then-tail`
+of a `restricted` row, and how a transport states its level).
 
-## 14. Questions for the operator
+## 14. The operator's decisions (2026-11-06)
 
-1. **Codec 2 and the licence rule.** `deny.toml` forbids copyleft and CI enforces it. The pure-Rust
-   `codec2` crate is LGPL-2.1 AND MIT and libcodec2 is LGPL-2.1. This document runs Codec 2 as the
-   external `c2dec` program (package `codec2`, already on the field host), so M17 audio needs a
-   program the way ADS-B needs dump1090. Do you want that, or an LGPL-2.1 exception in `deny.toml`
-   for the `codec2` crate so M17 decodes to audio with nothing installed?
-2. **FLEX in range.** Do you know a live FLEX channel reachable from the field host or the desk
-   (a centre frequency), or is FLEX synthesised-only for now? The answer sets the row's
-   `centers_hz` and whether the UAT has a live line.
-3. **M17 on air.** Do you have, or can you borrow, an M17-capable transmitter (an OpenRTX radio, a
-   Module17) for an on-air check, or is the synthesised `--strict` check the acceptance for this
-   wave?
-4. **A recording as a fixture.** If the public descriptions of DFM or M20 prove insufficient to
-   synthesise a frame the oracle decodes within the task budget, may a short public sample
-   recording (a few seconds, its licence recorded) enter the repo as a `fixture` test for that row,
-   or does the RS41 rule ("no recording in the repo") hold and the row keeps `test: null`?
-5. **Pager content on disk.** POCSAG pages already land in `events.log` and the page's ribbons;
-   FLEX pages will too, under the same README paragraph and nothing else. Keep that, or do you want a
-   retention or redaction switch for pager text before FLEX lands?
+Answered on the sprint's questions; each is folded into the sections it touches.
+
+1. **Codec 2 is the external `c2dec`.** No LGPL exception in `deny.toml`: M17 audio needs the
+   `codec2` package on the host, as ADS-B needs dump1090, under the project's handler rule. An
+   in-crate Codec 2 may be reconsidered later if it earns its place (sections 4.2, 7.2).
+2. **FLEX is synthesised-only for now.** The operator's FLEX source is offline and has no antenna.
+   The row ships with empty `centers_hz`, the synthesised `--strict` check is the proof, and the
+   live check is a UAT task for when a source is up (sections 6.2, 12).
+3. **M17: look in the register first.** Before the live check, ask the ACMA register
+   (`knowledge_lookup`, or the register server) for nearby amateur assignments or repeater
+   activity an M17 station could be heard on; with one, the UAT task listens there; without one,
+   the synthesised strict check is the acceptance. A UAT task either way (section 12).
+4. **Pager text stays on disk, flagged.** POCSAG and FLEX pages keep landing in `events.log`,
+   the feeds and the page as today; no retention or redaction switch. The events and the rows
+   that carry pager text are marked `access: "restricted"` so a later access-control layer can gate them,
+   and that layer is a `TODO.md` gist (sections 4.7, 11, 13).
+5. **No recording in the repository.** If the DFM or M20 synthesiser is not reached in its task
+   budget, the row keeps `test: null` and `modes check` keeps printing `skipped: no test`; no
+   public sample recording stands in as a fixture (section 8).
 
 ## 15. Calls made in this document (check these while reading)
 
@@ -713,8 +752,11 @@ synthesiser at 3200 and 6400 bps.
 - AIS type 24 is read beside 1-5, 18, 21 so class B vessels get names.
 - The AIS `nmea` field is an array of sentences (a type 5 spans two).
 - FLEX synthesis is 1600 bps 2-level only; 3200 and 6400 are a leftover.
-- FLEX has no subject and no filter, as POCSAG; the README paragraph is the guard (section 14
-  asks before anything more).
+- FLEX has no subject and no filter, as POCSAG; the README paragraph is the guard, by the
+  operator's decision (section 14), and the `access` marker on both pager rows is the hook for
+  the access control that comes later.
+- `access` is a row field and an envelope field, not a new event kind or a filter: the
+  cheapest marker that reaches every place an event lands, with nothing reading it yet.
 - M17 emits two events per stream (LSF and EOT), not one per frame.
 - A missing `c2dec` makes `m17_decode` `unavailable` rather than a ready row without audio: one
   rule for missing programs, and the package is small.
@@ -731,4 +773,6 @@ synthesiser at 3200 and 6400 bps.
 - CI installs `codec2` and `multimon-ng` so the M17 and FLEX synthesisers are proven on every
   push; the sonde decoders stay field-host-only.
 - Row `notes` are rendered into AGENTS.md (the row schema promised it; nothing did it).
-- M17 is last in the order and may split into its own plan.
+- M17 is last in the order and may split into its own plan (29b).
+- Codec 2 stays external (`c2dec`), FLEX ships without a live centre, DFM/M20 keep `test: null`
+  if their synthesisers miss the budget: the operator's decisions, not this document's.
