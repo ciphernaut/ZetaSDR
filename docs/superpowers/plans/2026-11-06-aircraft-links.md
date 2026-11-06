@@ -4,7 +4,7 @@
 
 **Goal:** Two program rows, `vdl2_decode` (dumpvdl2) and `hfdl_decode` (dumphfdl), decode the other aircraft data links beside ACARS and ADS-B, with aircraft positions where the link carries one, one aircraft table on the page across the links, and a per-source position so a KiwiSDR's catches are placed where the Kiwi is.
 
-**Architecture:** Two generic additions to the mode-row schema (`decoder.output.fields`, a JSON-pointer map from a program's nested JSON line to the row's flat event fields, applied in the adaptor's `Publisher::publish` before `envelope`; the `$center_khz` placeholder) and one to `subject` (`merge`, the fields that identify one subject across rows). The rows are data in `modes/`, checked by `zeta modes check` against off-air fixtures under `modes/fixtures/` (resolved through `ZETA_FIXTURES_DIR` or `modes/` under the current directory). A `Port::position` accessor and `SourceInfo.position` give any source a position (the Kiwi reads its own from `/status`; `--source-position` configures one). The page merges per-job subjects into one table as a view in `subjects.js`, never in the store. No change to the node's job, lease or launch machinery.
+**Architecture:** Two generic additions to the mode-row schema (`decoder.output.fields`, a JSON-pointer map from a program's nested JSON line to the row's flat event fields, applied in the adaptor's `Publisher::publish` before `envelope`; the `$center_khz` placeholder) and one to `subject` (`merge`, the fields that identify one subject across rows). The rows are data in `modes/`, checked by `zeta modes check` against off-air fixtures under `modes/fixtures/` (resolved through `ZETA_FIXTURES_DIR` or `modes/` under the current directory). A `Port::position` accessor and `SourceInfo.position` give any source a position (the Kiwi reads its own from `/status`; `--source-position` configures one); that part is defined by plan 32 (spec 4.11, Task 2), which owns it, and Tasks 5 and 6 here are its shared shape. The page merges per-job subjects into one table as a view in `subjects.js`, never in the store. No change to the node's job, lease or launch machinery.
 
 **Tech Stack:** Rust (serde, schemars, `serde_json::Value::pointer`, tokio), the `modes/*.json` rows, vanilla JS page (`crates/zeta-ui/web/subjects.js`), the Playwright e2e suite (`crates/zeta-ui/tests/e2e/ui.py`), a uv-inline-metadata Python script for the fixture cut.
 
@@ -35,8 +35,8 @@ Opus where the task defines an interface later tasks consume, confirms behaviour
 | 2 the adaptor applies the map | Sonnet | one function and a placeholder, tests pin it |
 | 3 `modes check` fixture lookup | Sonnet | path resolution and a message |
 | 4 the two rows, paths confirmed upstream, fake-program checks | Opus | the pointers must match the decoders' real JSON |
-| 5 a source's position: type, accessor, `SourceInfo`, `--source-position` | Sonnet | plumbing with a fixed shape |
-| 6 the Kiwi reads `/status` | Opus | protocol work on a socket, confirmed against the local KiwiSDR when reachable |
+| 5 a source's position (shared with plan 32 Task 2): type, accessor, `SourceInfo`, `--source-position` | Sonnet | plumbing with a fixed shape |
+| 6 the Kiwi reads `/status` (shared with plan 32 Task 2) | Opus | protocol work on a socket, confirmed against the local KiwiSDR when reachable |
 | 7 the page's merged aircraft table | Opus | a new view in `subjects.js`, a new e2e scenario |
 | 8 the HFDL fixture (conditional) | Opus | live radio work, content review, a script |
 | 9 field craft and the guide | Sonnet | |
@@ -50,7 +50,7 @@ Inputs the spec implies but no obvious test exercises; each gets a test in the t
 
 1. A dumpvdl2 line whose ADS-C `tags` has no basic report, or one in a later slot than the map lists, must give an event with no `position` and every other field intact, never a parse failure or a position of nulls. (Task 2: `a_mapped_line_without_the_listed_tag_has_no_position`.)
 2. A pointer that resolves to a string where `position` wants a number (`"lat": "n/a"`) gives no `position`; the event still publishes. (Task 2: `a_non_numeric_fix_is_no_position`.)
-3. A Kiwi whose `/status` hangs or refuses must not delay or fail the tune: the source streams, `position()` is `None`, no fault. (Task 6: `a_hanging_status_page_neither_blocks_nor_faults`.)
+3. A Kiwi whose `/status` hangs or refuses must not delay or fail the tune: the source streams, `position()` is `None`, no fault. (Shared with plan 32's Task 2, test `a_hanging_status_neither_blocks_nor_faults`; here Task 6: `a_hanging_status_page_neither_blocks_nor_faults`.)
 4. The merged table when one of the two jobs stops, or a member subject is dropped by `subject_drop_s`: the survivor returns to its own section, a selection on a dropped member clears, no stale merged row. (Task 7: the scenario's last steps.)
 5. `--source-position` naming a source no flag defines, or a latitude out of range, is refused at startup naming the flag, before the node opens. (Task 5: `source_position_refuses_unknown_ids_and_bad_values`.)
 
@@ -209,12 +209,14 @@ Acceptance: ten embedded rows, both `ready` on a host with the programs and `una
 
 ### Task 5: A source's position: `SourcePosition`, `Port::position`, `SourceInfo.position`, `--source-position`
 
+**Shared with plan 32 (its section 4.11 and Task 2), which owns it.** The names and shape below are exactly plan 32's Task 2. If plan 32 landed on `main` first, skip this task and Task 6 and consume `SourceInfo.position` (the `hfdl_decode` work in Tasks 4 and 10 needs nothing else); if this plan lands first, implement them as written and plan 32 reuses them as landed. Do not diverge from that shape.
+
 **Files:**
-- Modify: `crates/zeta-core/src/types.rs` (`SourcePosition`, `PositionFrom`), `crates/zeta-core/src/port.rs` (`Port::position`), `crates/zeta-core/src/ops.rs` (`SourceInfo.position`, filled in `Op::SourceList`), `crates/zeta-core/src/node/mod.rs` (`NodeConfig.source_positions: BTreeMap<SourceId, SourcePosition>`, `Node::source_position(&SourceId) -> Option<SourcePosition>`: configured else the port's), `crates/zeta/src/cli.rs` and `crates/zeta/src/sources.rs` (`--source-position ID=LAT,LON[,ALT_M]`, repeatable; `parse_source_position`), `crates/zeta/src/node_setup.rs` (`open_with` takes the map; an id no source flag defines is refused `--source-position: unknown source <id>`), `crates/zeta/src/agents_md.rs` (the flag line beside `--source-kiwi`; `source_list` text: "`position` `{lat, lon, alt_m, from}` where the source knows where it is, `null` otherwise")
-- Test: `crates/zeta/src/sources.rs` tests, `crates/zeta-core/tests/ops_sources.rs` (or the existing source-list test file), `crates/zeta/tests/cli.rs`
+- Modify: `crates/zeta-core/src/types.rs` (`SourcePosition`, `PositionFrom`), `crates/zeta-core/src/port.rs` (`Port::position`), `crates/zeta-core/src/ops.rs` (`SourceInfo.position`, listed in `require_worker`, filled in `Op::SourceList` from the port when it reports `from: status`, else from `NodeConfig.source_positions`, else `null`), `crates/zeta-core/src/node/mod.rs` (`NodeConfig.source_positions: BTreeMap<SourceId, SourcePosition>`), `crates/zeta/src/cli.rs` and `crates/zeta/src/sources.rs` (`--source-position ID=LAT,LON[,ALT_M]`, repeatable; `parse_source_position`), `crates/zeta/src/node_setup.rs` (`open_with` takes the map; an id no source flag defines is refused `--source-position: unknown source <id>`), `crates/zeta/src/agents_md.rs` (the flag line beside `--source-kiwi`; `source_list` text: "`position` `{lat, lon, alt_m, from}` where the source knows where it is, `null` otherwise")
+- Test: `crates/zeta/src/sources.rs` tests, `crates/zeta-core/tests/sources_record.rs`, `crates/zeta/tests/cli.rs`
 
 **Interfaces:**
-- Produces: `#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)] pub struct SourcePosition { pub lat: f64, pub lon: f64, #[schemars(required, schema_with = "nullable::<f64>")] pub alt_m: Option<f64>, pub from: PositionFrom }`; `#[serde(rename_all = "snake_case")] pub enum PositionFrom { Status, Configured }`; `Port::position(&self) -> Option<SourcePosition> { None }`; `SourceInfo { ..., #[serde(default)] #[schemars(required, schema_with = "crate::types::nullable::<SourcePosition>")] pub position: Option<SourcePosition> }`; `pub fn parse_source_position(s: &str) -> Result<(String, SourcePosition), String>` (lat in -90..=90, lon in -180..=180, errors `expected ID=LAT,LON[,ALT_M], got <s>` / `lat out of range` / `lon out of range`).
+- Produces: `#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)] #[serde(deny_unknown_fields)] pub struct SourcePosition { pub lat: f64, pub lon: f64, #[schemars(required, schema_with = "nullable::<f64>")] pub alt_m: Option<f64>, pub from: PositionFrom }`; `#[serde(rename_all = "snake_case")] pub enum PositionFrom { Status, Configured }`; `Port::position(&self) -> Option<SourcePosition> { None }` (what the port itself knows; never the flag); `SourceInfo { ..., #[serde(default)] #[schemars(required, schema_with = "crate::types::nullable::<SourcePosition>")] pub position: Option<SourcePosition> }`; `pub fn parse_source_position(s: &str) -> Result<(String, SourcePosition), String>` (lat in -90..=90, lon in -180..=180, errors `expected ID=LAT,LON[,ALT_M], got <s>` / `lat out of range` / `lon out of range`); `--source-kiwi`'s grammar is unchanged.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -223,11 +225,11 @@ Acceptance: ten embedded rows, both `ready` on a host with the programs and `una
 #[test] fn source_position_parses_with_and_without_altitude() { /* "k=-27.3842,153.1175,4" -> ("k", {lat, lon, alt_m: Some(4.0), from: Configured}); "k=-27.3842,153.1175" -> alt_m None */ }
 #[test] fn source_position_refuses_unknown_ids_and_bad_values() { /* "k=-91,0" -> "lat out of range"; "k=0" -> "expected ID=LAT,LON[,ALT_M]"; and, in cli.rs, `zeta --source-file f=... --source-position nope=0,0 source list` exits 2 with "--source-position: unknown source nope" */ }
 // zeta-core
-#[tokio::test] async fn source_list_reports_a_configured_position_and_null_without() { /* a file source: position null; with NodeConfig.source_positions set: {lat, lon, alt_m, from: "configured"} */ }
+#[tokio::test] async fn source_list_reports_a_configured_position_and_null_without() { /* a file source: position null; with NodeConfig.source_positions set: {lat, lon, alt_m, from: "configured"}; a port reporting a status position and a configured entry shows the status one */ }
 #[test] fn the_schema_lists_position_as_nullable() { /* node schema: SourceInfo.position type includes "null" and is required */ }
 ```
 
-- [ ] **Step 2: Run to verify they fail** — `cargo test -p zeta sources::` , `cargo test -p zeta-core --test ops_sources` — Expected: FAIL to compile.
+- [ ] **Step 2: Run to verify they fail** — `cargo test -p zeta sources::` , `cargo test -p zeta-core --test sources_record` — Expected: FAIL to compile.
 - [ ] **Step 3: Implement** the type, the accessor, the field, the config map, the flag and its refusal, the guide lines.
 - [ ] **Step 4: Run** — `cargo test -p zeta-core`, `cargo test -p zeta --test cli --test agents_md`, `cargo run -q -p zeta -- agents-md --check` (regenerate `AGENTS.md` and `SKILL.md`) — Expected: PASS, generated files updated.
 - [ ] **Step 5: Commit**
@@ -243,37 +245,43 @@ Acceptance: `source_list` shows `position` for a configured source and `null` fo
 
 ### Task 6: The Kiwi reads its position from `/status`
 
+**Shared with plan 32 (its section 4.11 and Task 2), which owns it;** the names are plan 32's. If plan 32 landed first, skip this task. The tests below are the same tests as plan 32's, not additional ones.
+
 **Files:**
-- Modify: `crates/zeta-source-kiwi/src/source.rs` (`KiwiSource::position`, `Status.position`), `crates/zeta-source-kiwi/src/session.rs` (a `status_page(host, port, timeout) -> Result<String, String>` HTTP/1.0 GET over a `TcpStream`, called once per connection before the websocket upgrade, bounded by `handshake_timeout_ms`; a new `pub(crate) fn parse_status_position(text: &str) -> Option<SourcePosition>` reading `gps=(lat, lon)` and `asl=<m>`), `crates/zeta-source-kiwi/src/testing.rs` (`FakeScript.status: Option<String>`; `FakeKiwi` answers `GET /status` with it, or hangs when `status_hang: true`), `docs/agents/field-craft.md` is Task 9's
-- Test: `crates/zeta-source-kiwi/src/session.rs` tests, `crates/zeta-source-kiwi/tests/kiwi.rs`
+- Create: `crates/zeta-source-kiwi/src/status.rs` (`KiwiStatus {position: Option<(f64, f64)>, asl_m: Option<f64>, gps_good: Option<u32>, name: Option<String>}`, `pub fn parse(text: &str) -> KiwiStatus`, `pub async fn fetch(url: &str, timeout: Duration) -> Result<KiwiStatus, String>`: a hand-written HTTP/1.0 `GET` over a `TcpStream`, the body after the blank line)
+- Modify: `crates/zeta-source-kiwi/src/lib.rs` (`pub mod status;`), `crates/zeta-source-kiwi/src/source.rs` (`KiwiConfig.status_url`, default `http://<host>:<port>/status`; `KiwiSource::position`), `crates/zeta-source-kiwi/src/session.rs` (`Status.position`, `Status.status_errors`; the fetch once per connection as one task bounded by `handshake_timeout_ms`, after `SET auth` is accepted and before the first `SND`), `docs/agents/field-craft.md` is Task 9's
+- Test: `crates/zeta-source-kiwi/src/status.rs` tests, the session tests' file in `crates/zeta-source-kiwi/tests/` (a one-shot HTTP stub on a `TcpListener`; the fake Kiwi is unchanged and its tests point `status_url` at the stub or at nothing)
 
 **Interfaces:**
 - Consumes: Task 5's `SourcePosition`, `PositionFrom::Status`, `Port::position`.
-- Produces: `KiwiSource::position()` returns the last status read (`from: Status`), `None` before the first connection or when the page had no `gps=` line; `pub const KIWI_STATUS_PATH: &str = "/status"`; the status read's failure is counted in `Status.status_errors` and never faults the source.
-- Confirmed live: when a developer shell has `ZETA_KIWI_HOST` set, run a throwaway `zeta --state-dir ./tmp/kiwi-state --source-kiwi hf=$ZETA_KIWI_HOST:8073 source list` after a short job (or `curl http://$ZETA_KIWI_HOST:8073/status`) and check the `gps=` and `asl=` lines are as assumed; adjust the parser; write the shape found (keys only, no values) in the ledger. The local KiwiSDR is never added to the deployed node.
+- Produces: `KiwiSource::position()` returns the last status read (`from: Status`, `alt_m` the status's `asl_m`), `None` before the first successful fetch; `parse` treats `gps=` outside -90..90/-180..180, `(0, 0)` (an unconfigured Kiwi) or a missing line as no position, ignores unknown lines; a failed fetch is counted in `Status.status_errors`, never clears a position already known, and never delays the tune or faults the source. The status wins over `--source-position` (Task 5's overlay).
+- Confirmed live: when a developer shell has `ZETA_KIWI_HOST` set, run `curl -s http://$ZETA_KIWI_HOST:8073/status | grep -E '^(gps|asl|gps_good)='` (or a throwaway `zeta --state-dir ./tmp/kiwi-state --source-kiwi hf=$ZETA_KIWI_HOST:8073 source list` after a short job) and check the line names are as assumed; adjust the parser; write the shape found (keys only, no values) in the ledger. The local KiwiSDR is never added to the deployed node.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the failing tests** (plan 32's names)
 
 ```rust
-// session.rs
-#[test] fn status_position_reads_gps_and_asl() { /* "status=active\ngps=(-27.3842, 153.1175)\nasl=4\n" -> Some({-27.3842, 153.1175, Some(4.0), Status}); "gps=(0.000000, 0.000000)" with "gps_good=0" is still a position (the configured one); no gps line -> None; "gps=(x, y)" -> None */ }
-// tests/kiwi.rs
-#[tokio::test] async fn a_kiwi_with_a_status_page_reports_its_position() { /* FakeScript with status Some(...): after the first tune, source.position() == Some(...), source_list-style read through Port */ }
-#[tokio::test] async fn a_kiwi_without_gps_in_its_status_reports_none() {}
-#[tokio::test] async fn a_hanging_status_page_neither_blocks_nor_faults() { /* status_hang: true, handshake_timeout_ms 500: tune returns Ok within 2 s, position None, fault None, frames arrive */ }
+// status.rs
+#[test] fn parses_the_position_altitude_and_fixes() { /* "status=active\ngps=(-27.40, 153.10)\nasl=12\ngps_good=9\n" -> position Some((-27.40, 153.10)), asl_m Some(12.0), gps_good Some(9) */ }
+#[test] fn an_origin_gps_is_no_position() { /* "gps=(0, 0)" -> None; "gps=(95, 10)" -> None; no gps line -> None; "gps=junk" -> None */ }
+#[tokio::test] async fn fetch_reads_one_status_from_a_stub_and_times_out_on_silence() {}
+// the session tests' file
+#[tokio::test] async fn a_connection_fills_the_position_from_the_status_stub() {}
+#[tokio::test] async fn a_failed_status_leaves_the_position_as_it_was_and_counts() {}
+#[tokio::test] async fn a_hanging_status_neither_blocks_nor_faults() { /* the stub accepts and never writes, handshake_timeout_ms 500: tune returns Ok within 2 s, position None, fault None, frames arrive */ }
+#[tokio::test] async fn no_status_and_no_flag_is_no_position() {}
 ```
 
-- [ ] **Step 2: Run to verify they fail** — `cargo test -p zeta-source-kiwi` — Expected: FAIL to compile.
-- [ ] **Step 3: Implement** the status GET, the parser, the `FakeKiwi` extension and the accessor.
-- [ ] **Step 4: Run** — `cargo test -p zeta-source-kiwi` — Expected: PASS. Then the live confirmation above when possible; ledger line either way.
+- [ ] **Step 2: Run to verify they fail** — `cargo test -p zeta-source-kiwi --features test-fake` — Expected: FAIL to compile.
+- [ ] **Step 3: Implement** `status.rs`, the session fetch and the accessor.
+- [ ] **Step 4: Run** — `cargo test -p zeta-source-kiwi --features test-fake` — Expected: PASS. Then the live confirmation above when possible; ledger line either way.
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/zeta-source-kiwi
-git commit -m "Kiwi: the source reads its position from the receiver's /status page once per connection (gps=, asl=), never blocking or faulting on it"
+git commit -m "Kiwi: the source reads its position from the receiver's /status page once per connection (gps=, asl=, gps_good=), never blocking or faulting on it"
 ```
 
-Acceptance: the four tests pass; with a Kiwi that has `gps=` in its status, `zeta source list` shows `position.from: "status"`.
+Acceptance: the tests pass; with a Kiwi that has `gps=` in its status, `zeta source list` shows `position.from: "status"`.
 
 ---
 
@@ -405,7 +413,7 @@ Acceptance: the gate is green; TODO carries no stale VDL2/HFDL note; UAT lists t
 4. The fixture lookup is decided in `check_row` before a node opens, like `<program> missing`, so a missing fixture costs no node.
 5. The two rows ship with placeholder `test.path`s and `expect`s until their fixtures exist; the fake-program checks (`fake_lines --lines-file`) prove the maps in CI, and the test vectors are synthetic until a fixture replaces them.
 6. The source position is a `Port` accessor plus a generic, repeatable `--source-position ID=LAT,LON[,ALT_M]` kept in `NodeConfig.source_positions`, refused at startup for an id no source flag defines; it is not an op (a gist in Task 10).
-7. The Kiwi's status read is one HTTP/1.0 GET on a fresh `TcpStream` per connection, bounded by `handshake_timeout_ms`, counted on failure and never a fault.
+7. The Kiwi's status read is one HTTP/1.0 GET on a fresh `TcpStream` per connection, one task bounded by `handshake_timeout_ms`, counted on failure and never a fault; the status wins over `--source-position`. Decisions 6 and 7 are plan 32's Task 2 shape (shared).
 8. The merged table is a view in `SubjectsPane` over per-job subjects, grouped by `subject.name` and joined by union-find on `merge` fields; the store, the map and selection keep per-job identity; `adsb_decode` is not given `merge`.
 9. Task 8 is conditional on a developer shell reaching the local KiwiSDR through `ZETA_KIWI_HOST`; the plan never names the host and never configures the deployed node; a skipped Task 8 becomes a UAT task.
 10. The VDL2 fixture is not recorded by this plan (the operator's decision 6); the ADS-C pointer paths are confirmed from upstream source now and on the fixture later.
@@ -417,5 +425,5 @@ Spec section 7: keying stands and the row gains `position` (decision 4); no B210
 ## Self-review notes
 
 - Spec coverage: 4.1 → Tasks 1, 2; 4.2 → Tasks 1, 2; 4.3, 4.4 → Task 4 (fixtures: Task 8 and UAT); 4.5 → Tasks 5, 6; 4.6 → Tasks 3, 8; 4.7 → Task 4 (`install`, `notes`); 4.8 → Task 7; 4.9 → Tasks 9, 10; 5.1 → Tasks 1, 4; 5.2 → Tasks 2, 4; 5.3 → Task 3; 5.4 → Tasks 5, 6, 7; 5.5 → Task 10's UAT; 6 → Tasks 4 (paths), 8 (12 kHz), 6 (status lines), 1 (`FieldPath`), 7 (DOM).
-- Names used across tasks: `FieldPath`/`pointers`/`ProgramOutput.fields`/`Subject.merge`/`center_khz_text`/`ENVELOPE_FIELDS` (1 → 2, 4, 7), `apply_fields` (2), `fixture_path`/`FIXTURES_DIR_ENV` (3 → 4, 8), `SourcePosition`/`PositionFrom`/`Port::position`/`SourceInfo.position`/`NodeConfig.source_positions` (5 → 6), `MERGE_SECTION_CLASS`/`section.subject-merged` (7).
+- Names used across tasks: `FieldPath`/`pointers`/`ProgramOutput.fields`/`Subject.merge`/`center_khz_text`/`ENVELOPE_FIELDS` (1 → 2, 4, 7), `apply_fields` (2), `fixture_path`/`FIXTURES_DIR_ENV` (3 → 4, 8), `SourcePosition`/`PositionFrom`/`Port::position`/`SourceInfo.position`/`NodeConfig.source_positions`/`KiwiStatus`/`status::parse`/`status::fetch`/`KiwiConfig.status_url`/`Status.status_errors` (plan 32 Task 2's names; 5 → 6), `MERGE_SECTION_CLASS`/`section.subject-merged` (7).
 - Where the spec no longer matches the code (reported to the caller too): `Capabilities` lives in `crates/zeta-core/src/types.rs`, not `port.rs`; `*.sigmf-data` is ignored repository-wide (the existing fixtures were force-added), so Task 3 adds the un-ignore rule; the fake program the spec's 5.2 proposed (`fake-dumpvdl2.sh`) already exists as `crates/zeta-ext/tests/fake_lines` with `--lines-file`, which the e2e's fake rows use, so the plan uses it; `modes check` takes one id (`id: Option<String>`), so UAT runs it per row; the Kiwi crate has no HTTP client (websocket only), hence the raw GET; `SourceInfo` is built in `ops.rs` under `Op::SourceList`, not in `node/`; the plan series table ends at plan 26 (no rows 27-29), so Task 10 adds row 30 only.

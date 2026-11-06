@@ -90,8 +90,8 @@ check runs on a short capture recorded off the air.
   as `plan_start` does for a channel plan. That is plan 31, not this one. This plan gives it the
   rows it will start.
 - The map side of the source position: what the Map tab draws for a positioned source, bearings
-  from it, cutting the register's sites by its reach. Plan 32 does that from the field this plan
-  adds (`SourceInfo.position`).
+  from it, cutting the register's sites by its reach. Plan 32 does that, and also owns the field
+  itself (`SourceInfo.position`, section 4.5).
 - Wiring the operator's own KiwiSDR into the deployed node. The operator adds it to their
   instance themselves (decision 7); no task, deploy helper, unit file or persisted state here
   does. This plan makes sure a Kiwi they add works: `hfdl_decode` on a `--source-kiwi` source,
@@ -429,26 +429,25 @@ field craft's frequency list is the answer.
 
 A KiwiSDR is somewhere else, so a signal it hears was received there, not at the station. The
 operator wants each Kiwi to carry its own position, read from the Kiwi where it has GPS, else
-configured (decision 10). This plan adds the field on the node side; plan 32 draws from it.
+configured (decision 10).
 
-- `Port` gains `fn position(&self) -> Option<SourcePosition> { None }` beside `gain`, `stats`
-  and `worker` (`port.rs`). `SourcePosition { lat: f64, lon: f64, alt_m: Option<f64>, from:
-  PositionFrom }` with `from` one of `status` (read from the receiver), `configured` (the
-  operator's flag); it lives in `types.rs` beside `Capabilities`. `SourceInfo` (`ops.rs`) gains
-  `position: Option<SourcePosition>`, nullable in the schema and `#[serde(default)]`, so a
-  plan-27 client reads a plan-30 node and the reverse.
-- The Kiwi source reads the receiver's status page once per connection (`GET /status` on the
-  same host and port, a plain HTTP/1.0 request over a `TcpStream`, no new dependency): the Kiwi
-  prints `key=value` lines, among them `gps=(lat, lon)` and `asl=<metres>`; a Kiwi with a GPS
-  fix fills `gps` from it, one without from its admin configuration, and a page without a
-  `gps=` line gives no position. The field names are confirmed against the local KiwiSDR from
-  a developer shell in the plan's first task. A read that fails is no position and no fault: the
-  Kiwi still receives.
-- Configured: a generic flag, `--source-position ID=LAT,LON[,ALT_M]`, for any source id (a
-  KiwiSDR whose status lies, another node's source, a VRT stream): kept in `NodeConfig`
-  (`source_positions`), it wins over what the port reports. The node's own position stays the
-  station (`station_set`); a source without a position and `Capabilities.remote` false is at
-  the station, which is what plan 32 assumes today.
+**Defined by plan 32 (spec section 4.11, plan Task 2), not here.** That one definition holds the
+record and its names, and plan 32's Task 2 owns the implementation: `Port::position() ->
+Option<SourcePosition>` (default `None`), `SourcePosition {lat, lon, alt_m: Option<f64>, from:
+status | configured}` in `types.rs`, `SourceInfo.position` (nullable, `#[serde(default)]`, listed
+in `require_worker`), the Kiwi's once-per-connection `GET /status` read (`gps=(lat, lon)`,
+`asl=`, `gps_good=`; `(0, 0)` or out of range is none; a hand-written HTTP/1.0 request on a
+`TcpStream`, one bounded task that never delays the tune or faults the source, counted in
+`Status.status_errors` when it fails; `KiwiConfig.status_url`), and the generic configured
+fallback `--source-position ID=LAT,LON[,ALT_M]` for any source id, kept in
+`NodeConfig.source_positions` (a `--source-kiwi` tail was rejected: its `/PASSWORD` may contain
+a comma). The status wins over the flag when both exist. If plan 30 lands on `main` first, it
+implements exactly that shape and plan 32 reuses it as landed; if plan 32 lands first, plan 30's
+task reduces to consuming `SourceInfo.position`. The node's own position stays the station
+(`station_set`); a source with no position and `Capabilities.remote` false is at the station.
+
+What is plan 30's own:
+
 - How `hfdl_decode` events carry it: they do not carry coordinates. Every frame's provenance
   names its `source`, the per-source feed and `events.log` record it, and the page already
   knows which source a job runs on; a consumer reads `source_list[].position` for that source.
@@ -456,7 +455,7 @@ configured (decision 10). This plan adds the field on the node side; plan 32 dra
   the same.
 - Not configured on the operator's node by this plan: the operator adds their Kiwi themselves
   (decision 7). The UAT task is theirs: add it as `--source-kiwi`, see its position in
-  `source_list`, run `hfdl_decode`.
+  `source_list` (or give it `--source-position` if its status has none), run `hfdl_decode`.
 
 ### 4.6 Fixtures and `modes check`
 
@@ -595,7 +594,7 @@ falls back to today's tables the moment the rows disagree.
   ("Remote HF receivers (KiwiSDR)").
 - The "Set up a background decoder for all ACARS and ADS-B activity" recipe gains the VDL2
   line; plan 31's named set replaces the recipe later.
-- `agents_md.rs`: `--source-position` in the flags, `$center_khz` in the `args` doc text,
+- `agents_md.rs`: `--source-position` in the flags (shared with plan 32's Task 2; whichever lands first writes it), `$center_khz` in the `args` doc text,
   `fields` and `merge` in the `modes_list`/`modes_show` text, `position` in `source_list`'s.
 - TODO: the two source notes are replaced by one line pointing at this spec and the plan, with
   the airband set left to plan 31's gist; new short gists for what this plan leaves (section 6:
@@ -649,12 +648,12 @@ falls back to today's tables the moment the rows disagree.
 
 ### 5.4 Source position and the page
 
-- `crates/zeta-source-kiwi/tests/kiwi.rs` (the fake Kiwi server): a status page with `gps=`
-  and `asl=` gives `position()` `{lat, lon, alt_m, from: status}`; one without gives `None`; a
-  status read that fails leaves the source tuning and faultless.
-- `crates/zeta/tests/cli.rs` or `transports.rs`: `--source-position ID=LAT,LON[,ALT_M]` parses,
-  refuses a bad value naming the flag, and `source_list` reports `position` with `from:
-  configured`; a file source without the flag reports `null`.
+- The source position's tests are plan 32's (section 6.2, Task 2): `status::parse` and a
+  one-shot HTTP stub (`gps=` and `asl=` give `position()` `{lat, lon, alt_m, from: status}`;
+  none without; a status read that fails or hangs leaves the source tuning and faultless);
+  `--source-position ID=LAT,LON[,ALT_M]` parses, refuses a bad value or an unknown id naming the
+  flag, and `source_list` reports `position` with `from: configured`, `null` for a file source
+  without it. Plan 30 adds none of its own beyond reading the field.
 - e2e (`ui.py`): `scenario_subjects_merge_across_rows`: two fake rows (`fake_acars`, keyed
   `reg`, `merge: ["reg"]`; `fake_vdl2`, keyed `icao`, `merge: ["reg", "icao"]`, both `name:
   aircraft`) started on the tone source; the pane shows one `section.subject-merged` with one
@@ -673,7 +672,7 @@ falls back to today's tables the moment the rows disagree.
   heard, `knowledge_lookup` on the band names `vdl2_decode`, and `job_context` shows no
   `external.unparsed` growth.
 - The operator's Kiwi: add it to their instance as `--source-kiwi`; `source_list` shows its
-  `position`; `hfdl_decode` on one of the nearest station's listed frequencies gives a squitter
+  `position` (from its status, else `--source-position`); `hfdl_decode` on one of the nearest station's listed frequencies gives a squitter
   event within 40 s and an aircraft row with a position on the map when one logs on. `zeta
   modes check --strict hfdl_decode` prints `ok` when the HFDL fixture is in.
 
@@ -733,7 +732,8 @@ Numbered as in the sprint's questions to the operator.
 10. **Kiwi position: yes, now.** Each KiwiSDR source carries its own position, read from the
     Kiwi's status where it has GPS, else configured; signals received through it are placed,
     cut and drawn from the Kiwi's position, not the station's. This spec defines the field on
-    the source (4.5) and how events reach it (by provenance); plan 32 draws from it.
+    the source (4.5, defined by plan 32's section 4.11 and implemented by its Task 2) and how
+    events reach it (by provenance); plan 32 draws from it.
 20. **One aircraft table across ACARS and VDL2: yes, in this plan.** The page merges the rows'
     subjects by a shared field (`reg`, or ICAO when both carry it); 4.8.
 21. **The catalogue's HFDL ranges:** left as upstream.
@@ -775,9 +775,10 @@ Numbered as in the sprint's questions to the operator.
   than carrying a system table for the names (from the builder check).
 - The source position as a `Port` accessor plus a generic `--source-position` flag, not a
   Kiwi-only `lat=,lon=` suffix on `--source-kiwi`: any remote source may have one, and the
-  Kiwi flag's `/PASSWORD` tail makes a suffix awkward. The Kiwi reads its own from `/status`
-  over a plain HTTP request on the socket it already opens, no HTTP client dependency. Events
-  carry the position by provenance (`source`), not as a field.
+  Kiwi flag's `/PASSWORD` tail may contain a comma. The Kiwi reads its own from `/status` over a
+  plain HTTP request on a `TcpStream`, no HTTP client dependency, and the status wins over the
+  flag. One definition, in plan 32 (4.11, Task 2). Events carry the position by provenance
+  (`source`), not as a field.
 - The merge declared on the rows (`subject.merge`, grouped by `subject.name`) and applied by
   the page as a view over per-job subjects, not a store change and not a page rule naming two
   rows (4.8). `adsb_decode` is not given `merge` in this plan.
