@@ -8,7 +8,8 @@ channel plan). It also answers "Span decoders and trunking" (the span half), "na
 Builds on the watch (`crates/zeta-core/src/node/watch.rs`, plan 17 spec section 6 and plan 19.1 spec
 5.5), `plan_start` (`ops.rs`), the lease manager (`lease.rs`), the mode registry (`modes/`) and the
 page's jobs pane (`crates/zeta-ui/web/agent.js`). A reviewer read it as the builder before hand-over;
-its questions are folded in, settled in section 9 or left to the operator in section 8.
+its questions are folded in, settled in section 9 or by the operator in section 8 (answers of
+2026-11-06).
 
 ## 1. Intent and why
 
@@ -77,6 +78,14 @@ plan, started, listed and stopped by name.
 - A `params` field on `job_start` (9.1).
 - Plan groups (`lower 40 voice`): a set's `members` filter is the cross-radio analogue; the one-field
   group on `plan_start` stays its own gist.
+- Moving a span watch's long-running decoders off the wideband radio. The operator's direction
+  (2026-11-06, 8.1): long-running jobs move to additional narrowband tuners (a HackRF, a LimeSDR) so
+  the wideband radio is freed for the span watch and the page, and the long-term goal is a tap off
+  an FPGA polyphase channel bank over a very wide band, where every channel is a tuner of its own.
+  Nothing in this design's mechanism changes for it: `decode_on: free` and `prefer` are the seam such
+  a placement policy plugs into, and stopping the watch stops its decoders as today.
+- Access control on pager text (8.3): the rows that carry it are marked now (4.8) so a later ACL can
+  gate them; the ACL itself is a TODO gist.
 
 ### Anti-goals
 
@@ -138,11 +147,15 @@ plan, started, listed and stopped by name.
 - **The agent's gate** (`zeta-agent/src/agent.rs`): `Allow {stop_jobs, replace, delete_captures}`;
   `GATED_REPLACE_OPS` lists the ops whose non-empty `replace` is refused without `allow.replace`;
   `job_stop` passes only for a job the run started (plan 23 spec 4.6).
-- **The page**: `agent.js` hides owned jobs and folds a plan's channels under a group row
-  (`foldPlan`, `JOBS_FOLD_MIN`); plan 27 gave it one event feed per source, so a watch's own events
-  (`decoding`, `lost`) reach it with their `job`; `subjects.js` keys its store by (job, key) and draws
-  one section per job; the selection menu (`menu.js`) has "Watch this band" and "Start plan…"; "panes
-  earn a tab" (a new view goes behind a tab or a menu, never into the waterfall).
+- **The page**: `agent.js` hides owned jobs (`!j.owner`) and folds a plan's channels under a group
+  row (`foldPlan`: an idleness fold, more than `JOBS_FOLD_MIN` running channels with their squelch
+  closed, drawn through `jobGroup` and `placeChildren`); `job_list` records carry `context`, so the
+  2 s poll already brings `context.watch.decoding`; plan 27 gave the page one event feed per source,
+  so a watch's own events (`decoding`, `lost`) reach it with their `job` between polls; `subjects.js`
+  keys its store by (job, key) and draws one section per job, and it is the module that reads
+  `modes_list` (the selection menu's entries, `menu.js` `ENTRIES`, are a static list today); the
+  menu has "Watch this band" and "Start plan…"; "panes earn a tab" (a new view goes behind a tab or
+  a menu, never into the waterfall).
 - **The e2e suite** runs about 474 s of a 690 s deadline (`crates/zeta/tests/ui.rs` `DEADLINE`), with
   the traps of the "UI e2e gotchas" note; its node has the `tone` and `cb` file fixtures and the
   POCSAG and APRS fixtures the ribbon scenarios use.
@@ -274,9 +287,9 @@ few hundred hertz; the channel filter covers it).
 - `decode_on: free` is honoured as today, bounded by the cap. The field craft says what it means for a
   span watch: each decoder would take a free radio for one channel, so leave it `capture`.
 - The watch is started inside a pin or on a free band and conflicts as today when neither; it never
-  retunes anything after start. Stopping it stops its decoders (today's rule; a decoder the operator
-  wants kept is restarted by hand, or the watch is left running). `replace` naming the watch stops it
-  and its decoders under the gate as today.
+  retunes anything after start. Stopping it stops its decoders (today's rule, confirmed by the
+  operator, 8.1; a decoder the operator wants kept is restarted by hand, or the watch is left
+  running). `replace` naming the watch stops it and its decoders under the gate as today.
 - The agent's rules are unchanged: a `conflict` on the watch's start is reported; the decoders are the
   watch's, not the agent's, so `job_stop` on one is refused without the allowance (plan 23 spec 4.6
   records the watch's id as the agent's when it started it: stopping the watch it started passes).
@@ -293,24 +306,58 @@ few hundred hertz; the channel filter covers it).
 ### 4.7 The page
 
 - **Menu.** The selection menu gains "Decode <mode> across this band…" beside "Watch this band": a
-  submenu of the `ready` rows whose `band.bandwidth_hz` fits the selection (the mode list `modes_list`
-  already gives the menu), which starts a `watch` on the selection and `graph_put`s `modes: [<id>]`,
+  submenu of the `ready` rows whose `band.bandwidth_hz` fits the selection (the menu reads
+  `modes_list` once when it first opens, as `subjects.js` does for its rows; its other entries stay
+  the static list), which starts a `watch` on the selection and `graph_put`s `modes: [<id>]`,
   `persist_ms: 500`, `width_hz` `[0.5×, 1.5×]` of the row's width on its `detect` node. Two ops, one
   click; the transcript line names both.
 - **Jobs pane.** A watch's kept decoders fold under the watch's row as a plan's channels fold under
-  their group (`foldPlan`'s mechanism with a new key: the watch's id). Membership comes from the
-  source's feed (`decoding` and `lost` events carry `job`) seeded from `job_context.watch.decoding` when
-  a watch appears in a poll (the plan-27 `seedSquelch` pattern, one read per watch). The group's
-  summary line: `"<watch> · pocsag_decode × 6 decoding, 2 waiting"`. A decoder the operator stops from
-  the group is a `job_stop` of that job, as today.
+  their group: the same `details.job-group` row (`jobGroup`, `placeChildren`) with a new key, the
+  watch's id, and a membership predicate instead of `foldPlan`'s idleness one (a decoder folds under
+  its watch whatever its activity, and the group is drawn from one member up, not from
+  `JOBS_FOLD_MIN`). Membership comes from the poll itself: `job_list` records carry `context`, so
+  `context.watch.decoding[].job` names the watch's decoders every 2 s, and the source's feed
+  (`decoding` and `lost` events carry `job`) moves a row between polls. The group's summary line:
+  `"<watch> · pocsag_decode × 6 decoding, 2 waiting"`. A decoder the operator stops from the group is
+  a `job_stop` of that job, as today.
 - **Waterfall.** Each decoder has its own outline and ribbons on its own channel, as any job: a span
   watch over a pager band reads as a row of outlines inside the watch's band outline, with `signal`
   marks where the detector sees something not yet decoded. Nothing new.
 - **Subjects.** Decoders of one watch whose row has a `subject` block merge into one section titled by
   the watch, keyed by (watch, key) instead of (job, key), with a `Channel` column (the decoder's
-  centre in MHz) first after the key; an APRS or a future VDL2 span is one table of stations or
-  aircraft across the band. A watch whose rows have no `subject` (POCSAG today) adds no section (9.6).
-  The Subjects store already drops a section when its job goes; a merged section goes with the watch.
+  centre in MHz) first after the key; a pager span is one table of addresses across the band, an
+  APRS or a future VDL2 span one table of stations or aircraft. A watch whose rows have no `subject`
+  adds no section (9.6). The Subjects store already drops a section when its job goes; a merged
+  section goes with the watch.
+
+### 4.8 The pager table and the access marker
+
+The operator wants the pager table (8.2): `pocsag_decode` gains a `subject` block, `{key: "address",
+name: "addresses", waterfall: "summary", columns: [{field: "kind", label: "Kind", unit: null},
+{field: "text", label: "Text", unit: null}], heading: null, label: null}`, a row edit under this
+plan (`modes/pocsag_decode.json`; the embedded-row tests in `crates/zeta-core/tests/modes.rs` that
+name the planned subjects gain the row). The table lists every address heard with its last message
+text, in the page and the merged store, and the waterfall draws one summary line per decoder
+instead of a ribbon per page (the `summary` policy, as ACARS). Pager text stays enabled and lands
+where every event lands (`events.log`, the ribbons, `--then-tail`): the README's "Legal" paragraph
+and the field craft's one-time legal line are the guard, as the decoder-wave-2 spec says for FLEX.
+
+Access control comes later; what lands now is the cheapest marker an ACL can gate on (8.3):
+
+- `ModeRow` gains `access`, `null` (the default; every row today) or `"restricted"`: the row's events
+  carry content a deployment may want to show to fewer people than the spectrum. `pocsag_decode`
+  sets it; the decoder-wave-2 spec's `flex_decode` sets the same (coordinated there: section 6.2 of
+  that spec, the row text), and an operator row may set it on anything.
+- Every event a job of such a row publishes carries `access: "restricted"`, added where `position`
+  is added from the row (the row envelope), so `events.log` lines, the feeds and `stream_tail` all
+  say it without reading the row; events of other rows carry no `access` field (not `null`: an older
+  reader sees nothing new).
+- `modes_list` and `modes_show` report `access`, and `job_list` does not (the row says it; the record
+  stays as it is, constraint: `JobRecord` strictness).
+- Nothing gates on it yet: no transport, no page view and no log reader changes behaviour. The gist
+  "Access: ACLs on restricted rows" (section 6) is where the gating goes: per-secret or per-transport
+  access levels, an event filter on the feeds and `stream_tail`, a Subjects table that hides the
+  text column below the level, and the `events.log` reader honouring it.
 
 ## 5. Named sets
 
@@ -486,17 +533,26 @@ the set stays the unit the node owns.
 - `RECIPES.md`: the ACARS and ADS-B recipes become the `airband` set with a pointer; the convention
   paragraph says sets are the stored form.
 - TODO: strike the whole-span bullet of decoder wave 2 and the airband half of the VDL2 gist; narrow
-  "Span decoders and trunking" to trunking; narrow the recipes gist to what 5.6 leaves; add "Sets: a
-  `source_pin` member" and "Watch: a `subject` block for `pocsag_decode`" if the operator wants them
-  (8.3, 8.1).
+  "Span decoders and trunking" to trunking; narrow the recipes gist to what 5.6 leaves; strike the
+  "POCSAG has no subject" leftover under "Subjects: leftovers" (4.8 gives it one); add the gist
+  "Access: ACLs on restricted rows" (4.8: what the marker is, what gates on it later, that
+  `pocsag_decode` and `flex_decode` carry it); record the operator's direction on narrowband tuners
+  and the FPGA channel bank (non-goals) as a line in the architecture gists. No pin member and no
+  radio preference by driver: the operator kept the defaults (8.4, 8.5), so neither becomes a gist.
+- The legal line: `README.md` "Legal" says pager rows are marked `access: restricted` for a later
+  ACL and that nothing gates on it yet; the field craft's "Decoding pagers, aircraft and FM data"
+  says the same in one sentence.
 - UAT (the operator's, on the field host): (a) `set_start pagers_au` with `radios: {radio: b210}`:
   within five minutes `job_context.watch.decoding` lists a decoder on each active pager carrier, the
   `decoding` summaries name the licensee from the register, the page shows the decoders folded under
-  the watch, and a tail of a decoder's events shows pages; after an hour the watch has not churned
+  the watch, the Subjects tab shows one pager table titled by the watch with a Channel column and
+  the addresses heard, a tail of a decoder's events shows pages each carrying `access:
+  "restricted"`, and `zeta events tail` shows the same lines; after an hour the watch has not churned
   (count `lost` events against `decoding`). (b) `set_start airband` with `{wide: b210, second:
   hackrf}`: seven ACARS and one ADS-B start, `vdl2` is `refused unavailable`, the page groups them under
   "Airband data links"; a second `set_start` answers all `existing`; `set_stop` leaves the page's own
-  spectrum and nothing else.
+  spectrum and nothing else. (c) `set_start airband` with `{wide: b210, second: null}`: the node
+  picks the HackRF for `second` and the result's `radios` says so.
 
 ## 7. Tests
 
@@ -548,6 +604,12 @@ no-row GFSK burst. Tests:
   watch's band, an empty list: each refused naming `modes[<i>]`, the watch unchanged.
 - The existing suite passes unchanged: `modes: null` is today's watch, and the defaults for the new
   params are today's constants.
+- The row and the marker (`crates/zeta-core/tests/modes.rs`, the event tests beside the POCSAG
+  stage's): `the_rows_name_the_planned_subjects` gains `pocsag_decode` (`address`; columns `kind`,
+  `text`); `a_restricted_rows_events_carry_the_access_marker` (a `pocsag_decode` job over the suite's
+  page: every event has `access: "restricted"`; an `aprs_decode` job's events have no `access` key);
+  `modes_list_and_show_carry_the_subject` also reads `access`; `a_row_with_a_bad_access_word_is_broken`
+  (`access: "secret"` is `broken` naming `access`).
 
 ### 7.2 Sets (`crates/zeta-core/tests/sets.rs`)
 
@@ -595,38 +657,42 @@ directory the test writes (a built-in-shaped `two_radio` set: a `plan_start` mem
 - `scenario_decode_across_entry_starts_a_watch_with_modes`: the selection menu on the POCSAG fixture
   shows "Decode POCSAG pagers across this band…"; one click gives a running watch whose `detect` node
   has `modes: ["pocsag_decode"]`, and within the fixture's cycle a `pocsag_decode` job appears folded
-  under the watch's row in the jobs pane with the group's summary text.
+  under the watch's row in the jobs pane with the group's summary text; the Subjects tab then shows
+  one section titled by the watch with a `Channel` column and the row for address 1234567 (the
+  pager table of 4.8, merged per watch), so the Subjects check rides on the one watch this scenario
+  starts.
 - `scenario_set_menu_starts_a_set_and_groups_its_jobs`: a test set in the e2e node's `--sets-dir`
   with two members on roles mapped to `tone` and `cb` (bands inside each fixture's capture: a
   `measure` on `tone`, an `fm_demod` on ch20 of `cb`); "Start set…" → picker → `set_start`; the jobs
   pane shows the group with "+1 on cb" on the `tone` source and the member row on `cb` after a source
   switch; `set_stop` from the group's button clears both.
-- `scenario_subjects_merge_a_watchs_decoders`: two `aprs_decode` decoders under one watch (the APRS
-  fixture twice at two offsets, or a stub watch context the test hook can seed) draw one section with
-  a Channel column.
-- Budget: three scenarios of 10-20 s each against about 216 s of headroom; if the suite nears the
-  deadline the Subjects scenario is folded into the first (the builder's call, said in the plan).
+- Budget: two scenarios of 10-20 s each against about 216 s of headroom. A third, two `aprs_decode`
+  decoders under one watch drawing one section (the APRS fixture at two offsets), is the builder's
+  option when the budget allows; the first scenario already proves the merge with one decoder.
 
-## 8. Questions for the operator
+## 8. The operator's decisions (2026-11-06)
 
-1. **Pager text and the Subjects table.** `pocsag_decode` has no `subject` block, so a span watch over
-   the pager band shows ribbons per channel and no table. Do you want a pager table (key `address`,
-   columns `kind`, `text`), knowing it lists every address heard with its message text in the page and
-   the merged store? If so it is a row edit under this plan; if not, the ribbons stand.
-2. **Radio choice for `null` roles.** The node picks the first free source in `source_list` order that
-   covers the role's band, roles in file order. On the field host that puts ADS-B on whichever of the
-   B210 and HackRF is left after the wide role: fine, or should the ADS-B role name a preference (by
-   driver, since no file may name a host's ids)?
-3. **Pins in sets.** The CB recipe pins the capture before `plan_start`. A set holds its capture through
-   its members' leases instead, so the capture goes when the last member stops. Do you want a
-   `source_pin` member kind now (the set then also unpins on `set_stop`), or is "no pins in sets"
-   right?
-4. **Stopping the watch stops its decoders** (today's rule, unchanged). For a pager watch that has run
-   all day, is that what you want from `job_stop` on the watch, or should a span watch's decoders be
-   left running (they are ordinary jobs) for a `jobs_stop` to clear?
-5. **`seed_known` off by default** for `pagers_au`: the first burst on a known channel after a quiet
-   spell is lost while the decoder starts (a second or so). Would you rather the set seed every
-   register-known pager channel at start and accept decoders sitting on dead assignments?
+The reviewer's five questions, answered by the operator; the design above is written to these.
+
+1. **Stopping the watch stops its decoders**: the default stands (`job_stop` on a span watch that has
+   run all day stops every decoder it keeps; a decoder wanted longer is restarted by hand or the
+   watch is left running). The operator's direction, recorded in the non-goals and nowhere as a
+   mechanism: long-running jobs move to additional narrowband tuners (HackRF, LimeSDR) so the
+   wideband radio is freed; the long-term goal is a tap off an FPGA polyphase channel bank over a
+   very wide band.
+2. **The pager Subjects table**: yes. `pocsag_decode` gains a `subject` block keyed `address` with the
+   columns `kind` and `text` (4.8), a row edit in this plan; a span watch over the pager band shows
+   one table titled by the watch.
+3. **Pager text on disk**: enabled now, as every other row's events. The rows that carry pager text
+   are marked for a later ACL with the cheapest marker that works: the row field `access:
+   "restricted"`, copied onto every event of the row's jobs (4.8), on `pocsag_decode` here and on
+   the decoder-wave-2 spec's `flex_decode` the same way. The ACL is the TODO gist "Access: ACLs on
+   restricted rows".
+4. **Radio choice for `null` roles**: the default stands (the first free source in `source_list` order
+   that covers the role's band, roles in file order, 5.4). No preference by driver.
+5. **Pins in sets**: the default stands (no pins in sets; a set holds its capture through its members'
+   leases, 5.6). No `source_pin` member.
+6. **`seed_known`**: the default stands (off; `pagers_au` leaves it off, 4.3 and 9.3).
 
 ## 9. Calls made in this document (check these while reading)
 
@@ -639,17 +705,19 @@ directory the test writes (a built-in-shaped `two_radio` set: a `plan_start` mem
    watch's free placement takes one at a time, so the fixed order cannot deadlock; a sequential per-
    radio start with a rollback would stop jobs the operator saw start, which the field craft forbids.
 3. **Known channels rank and hold, never move.** The decoder sits on the detector's centroid; a known
-   centre is a bet about priority and a name for the summary. `seed_known` is off in `pagers_au` (8.5).
+   centre is a bet about priority and a name for the summary. `seed_known` is off in `pagers_au`
+   (confirmed, 8.6).
 4. **`confirm_ms` 180 s for `pagers_au`.** A direct start has no proof; a pager carrier transmits idle
    codewords between pages and `pocsag_decode` publishes only messages, so a minute is too short for a
    quiet carrier and three is the author's guess; the UAT checks churn against it.
 5. **Re-adoption uses `max(gone_ms, hold_ms)`.** Today's `gone_ms` confirmation would drop and restart
    a resumed pager channel in a quiet spell.
-6. **Subjects merge per watch,** keyed (watch, key), with a Channel column; POCSAG adds no table (8.1).
+6. **Subjects merge per watch,** keyed (watch, key), with a Channel column; POCSAG gets its `subject`
+   block in this plan (8.2, 4.8), so a pager span is one table of addresses.
 7. **The set group's stop button sends `set_stop`** with a confirm step; a member row's stop stays a
    `job_stop` of that job.
 8. **The CB recipe stays a recipe**; `airband` and `pagers_au` are the two built-in sets. A set has no
-   pin member (8.3) and no mix.
+   pin member (confirmed, 8.5) and no mix.
 9. **A not-`ready` member is refused, not blocking:** the airband set ships with `vdl2` and reports it
    `unavailable` until the row and dumpvdl2 exist, so ACARS and ADS-B start today.
 10. **A conflict anywhere starts nothing anywhere.** `members` is how the operator takes what is free.
@@ -674,6 +742,14 @@ directory the test writes (a built-in-shaped `two_radio` set: a `plan_start` mem
     row's own unit.
 20. **Known channels come from an uncapped band query** (`band_assignments`, deduplicated by centre),
     not from identify's five-nearest `nearest_allocations`.
+21. **The access marker is a row field copied onto events,** not a job-record field and not a
+    transport setting (8.3, 4.8): the row is where the knowledge lives, the event is what a log
+    reader or a feed filter sees, and `JobRecord` stays as it is. `"restricted"` is the only word
+    this plan defines; a later ACL may add levels.
+22. **The watch and set folds are membership folds,** not `foldPlan`'s idleness fold: a decoder is
+    under its watch from the first poll that lists it, whatever its activity, and a set's members are
+    under the set. They share the group row's DOM (`jobGroup`, `placeChildren`, the fold memory) and
+    nothing of `foldPlan`'s predicate.
 
 ## 10. Left to the plan
 
@@ -688,8 +764,10 @@ directory the test writes (a built-in-shaped `two_radio` set: a `plan_start` mem
   op's path.
 - The shape of `decide` (a method returning an enum, or `ensure_locked` split into a decision and an
   application) and whether `hold_band` is rewritten on top of it.
-- The `foldPlan` generalisation (a group key function per fold kind) and the Subjects store's merged
-  key.
+- The group-row generalisation in `agent.js` (a group key function per fold kind over the shared
+  `jobGroup`/`placeChildren` DOM) and the Subjects store's merged key.
+- Where the row envelope adds `access` to events (beside `position`), and whether `events.log`'s
+  reader (`zeta events tail`) shows it as a column or leaves it in the JSON.
 - Order of work: watch policy and tests first (deployable alone; `pagers_au` can be run as the two-op
   form), then sets on the node with their tests and the agent gate, then the page, then docs and the
   generated files; the UAT runs after the second step on the field host.
