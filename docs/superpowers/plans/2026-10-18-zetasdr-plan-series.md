@@ -459,6 +459,30 @@ Deferred (ledger summary):
 - Plan 17 inputs (in `TODO.md`): generic `fsk`/`psk`/`ook` synthesiser families, the echo
   impairment, audio-input program rows.
 
+## Sprint 2026-11-06
+
+Opened with the operator on 2026-11-06: "a larger sprint", starting with video. The operator's
+framing for the whole sprint: the node is a framework for radios yet to come (an FPGA front end
+with its own channel bank among them), not a solution around one device; a question about one
+radio is answered as a framework piece. Each row is one plan; specs come from a brainstorming
+session before the plan, as before.
+
+| Order | Plan | Why here | Depends on |
+|---|---|---|---|
+| 28.1 | The source transport, made rate-proof | A worker child hands IQ to the node through a shared-memory ring (worker protocol 2: descriptors on the pipe, `cf32` slots, drops counted), each Soapy source probes its rate ladder at open and reports a `measured` cap the lease applies (`insufficient bandwidth` names it), the B210 sweep before and after. Spec `docs/superpowers/specs/2026-11-06-video-decode-design.md` sections 3, 5.6, 5.7; plan `docs/superpowers/plans/2026-11-06-source-transport.md`. | 20 |
+| 28.2 | Analog video, decoded and watched live | `video_decode` (wide FM, composite sync and line lock, luma `gray8` fields; the 6.5 MHz audio subcarrier if it falls out), the websocket's video body with `smooth`, `sharp` and `thumb` profiles, the thumbnail riding the band and the full view with feeds switchable, `zeta stream save`, fixtures of the operator's four transmitters from the B210. Spec as above (the rest of it); plan to be written once 28.1's sweep fixes the default rung. UAT deferred: the operator sets up each transmitter. | 28.1 |
+
+Queued behind them, specs first, in the operator's order of interest: colour (chroma), recording
+(stills and clips into the capture store), discovery (a video carrier found by the watch), the
+host-capabilities baseline (`TODO.md` "Node: a baseline of the host's capabilities"), VTX channel
+tables from the open VTX firmware (`TODO.md` "Plans: VTX channel tables"), `sc16` on the worker
+wire.
+
+## Plan 28.1 status
+
+Not started. The sweep before (Task 0) and after (Task 8) go here as two tables: rate, delivered,
+overflows per minute, worker CPU, node CPU, fault.
+
 ## Plan 14 status
 
 Plan 14 is delivered on `worktree-plan-14` (tasks 1-5), 2026-10-27, merged to `main` the same day.
