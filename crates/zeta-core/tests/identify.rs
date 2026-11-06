@@ -660,17 +660,20 @@ async fn identify_resumed_after_a_restart_stops_its_stale_child() {
         .expect("identify's event stream")
         .id;
     let mut events = node.bus().subscribe(&stream).expect("subscribed");
-    // No samples yet: the stale child ends all the same, and its lease with it.
-    until("the stale child ends", Duration::from_secs(3), || {
-        state(&node, &child) != JobState::Running
-    })
+    // No samples yet: the stale child ends all the same, and its lease with it. Its state
+    // turns before its lease is released, so wait for both (a leaked lease never gets there).
+    let holders = || -> Vec<JobId> {
+        node.lease_holders(&rx())
+            .into_iter()
+            .map(|(j, _)| j)
+            .collect()
+    };
+    until(
+        "the stale child ends and only identify holds the radio",
+        Duration::from_secs(3),
+        || state(&node, &child) != JobState::Running && holders() == [id.clone()],
+    )
     .await;
-    let holders: Vec<JobId> = node
-        .lease_holders(&rx())
-        .into_iter()
-        .map(|(j, _)| j)
-        .collect();
-    assert_eq!(holders, std::slice::from_ref(&id));
     assert_eq!(state(&node, &id), JobState::Running);
     // Samples arrive: the run measures and publishes its candidates.
     src.start();
