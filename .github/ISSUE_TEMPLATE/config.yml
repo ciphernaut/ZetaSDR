@@ -1,5 +1,4 @@
 blank_issues_enabled: false
-contact_links:
-  - name: Security vulnerability
-    url: https://github.com/ciphernaut/ZetaSDR/security/advisories/new
-    about: Report it privately (only the maintainer sees it), not in a public issue. SECURITY.md says what to include.
+# No security link here: with private vulnerability reporting on, GitHub adds its own
+# "Report a security vulnerability" entry to the chooser (see SECURITY.md).
+contact_links: []
