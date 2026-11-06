@@ -142,8 +142,17 @@ async fn measure_on_the_bank_path_emits_within_4_s() {
         .unwrap();
     src.start();
     let id = start_measure(&node, channel_hz(3)).await;
-    let note = node.job_context(&id).expect("job listed")["channel"].clone();
-    assert_eq!(note["path"], "bank");
+    // The channel stage notes its path when it starts, after job_start has answered.
+    let note = || node.job_context(&id).expect("job listed")["channel"].clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while note()["path"].is_null() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no channel path noted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(note()["path"], "bank");
     let (ev, span_ns) = first_event(&node, &id, Duration::from_secs(4))
         .await
         .expect("a measure event");
