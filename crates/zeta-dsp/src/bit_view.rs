@@ -969,7 +969,7 @@ pub(crate) mod test_streams {
     use zeta_core::stream::{Frame, Payload, StreamBus};
     use zeta_core::types::{JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 
-    use crate::crc::{CRC16_CCITT, crc};
+    use crate::crc::{CRC16_CCITT, CrcSpec, crc};
     use crate::slicer::bits_event;
 
     /// The frame sync `framed_stream` plants.
@@ -1001,11 +1001,25 @@ pub(crate) mod test_streams {
     /// A body that would put [`SYNC`] anywhere but at a frame start is drawn again, so
     /// the sync occurs exactly `frames` times.
     pub fn framed_stream(frames: usize, body_bytes: usize, seed: u64) -> Vec<u8> {
-        framed_stream_of(&vec![body_bytes; frames], seed)
+        framed_stream_with(frames, body_bytes, seed, &CRC16_CCITT)
+    }
+
+    /// [`framed_stream`] closed by `spec`'s CRC (its width in bits) instead.
+    pub fn framed_stream_with(
+        frames: usize,
+        body_bytes: usize,
+        seed: u64,
+        spec: &CrcSpec,
+    ) -> Vec<u8> {
+        framed_stream_of_with(&vec![body_bytes; frames], seed, spec)
     }
 
     /// [`framed_stream`] with a body of `body_bytes[k]` in frame `k`.
     pub fn framed_stream_of(body_bytes: &[usize], seed: u64) -> Vec<u8> {
+        framed_stream_of_with(body_bytes, seed, &CRC16_CCITT)
+    }
+
+    fn framed_stream_of_with(body_bytes: &[usize], seed: u64, spec: &CrcSpec) -> Vec<u8> {
         const SYNC_W: usize = 16;
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let mut out = Vec::new();
@@ -1024,7 +1038,7 @@ pub(crate) mod test_streams {
             for &b in &body {
                 push_msb(&mut out, u64::from(b), 8);
             }
-            push_msb(&mut out, crc(&CRC16_CCITT, &body), 16);
+            push_msb(&mut out, crc(spec, &body), u32::from(spec.width));
             let stray = (start.saturating_sub(SYNC_W - 1)..=out.len() - SYNC_W)
                 .filter(|&i| i != start)
                 .any(|i| {
@@ -1139,14 +1153,29 @@ mod tests {
     use zeta_core::stream::{Frame, Payload};
 
     use super::test_streams::{
-        T0, bits_frames, bits_frames_at, framed_stream, framed_stream_of, random_bits, run_events,
+        T0, bits_frames, bits_frames_at, framed_stream, framed_stream_of, framed_stream_with,
+        random_bits, run_events,
     };
+
+    use crate::crc::CRC16_MODBUS;
 
     const SECOND_NS: u64 = 1_000_000_000;
     use super::{
         BitViewStage, CRC_CANDIDATES_MAX, CRC_MAX_FRAMES, CRC_MIN_FRAMES, NEXT_SYNC_PERIOD,
         hypotheses,
     };
+
+    #[test]
+    fn a_modbus_crc_is_found_on_a_framed_stream() {
+        let h = hypotheses(&[&framed_stream_with(14, 136, 1, &CRC16_MODBUS)]);
+        assert!(
+            h.crc_candidates
+                .iter()
+                .any(|c| c.crc == "crc16-modbus" && c.frames >= 12),
+            "{:?}",
+            h.crc_candidates
+        );
+    }
 
     #[test]
     fn a_framed_stream_gives_its_sync_period_and_crc() {
