@@ -157,7 +157,9 @@ pub enum Op {
         /// stopped and names the rest.
         replace: Vec<JobId>,
     },
-    /// Attach a job of an attachable `kind` (`transcribe`) to the running job `job`: it
+    /// Attach a job of an attachable `kind` (`transcribe`) to the running job `job`, a job
+    /// whose kind emits audio: the voice demodulators and any mode row whose `outputs`
+    /// lists `audio`. It
     /// reads that job's audio output stream (the last one in its graph order when it
     /// has several; audio passed between two of its stages does not count) instead of
     /// the radio, holds no lease, copies the job's `source` and `tuning`, and records
@@ -2177,6 +2179,9 @@ pub struct ModeInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub access: Option<String>,
+    /// The stream kinds a job of the row emits (`event`, `audio`, ...); a row whose
+    /// `outputs` lists `audio` can be played and transcribed. Empty for a broken row.
+    pub outputs: Vec<StreamKind>,
 }
 
 impl From<&LoadedMode> for ModeInfo {
@@ -2195,6 +2200,7 @@ impl From<&LoadedMode> for ModeInfo {
             checked: m.checked,
             subject: m.row.subject.clone(),
             access: m.row.access.clone(),
+            outputs: m.outputs.clone(),
         }
     }
 }

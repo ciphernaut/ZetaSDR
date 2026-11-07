@@ -24,6 +24,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::stage::StageRegistry;
+use crate::types::StreamKind;
 
 pub(crate) use row::FRAME_DECODE_STAGE;
 pub use row::{
@@ -74,6 +75,9 @@ pub struct LoadedMode {
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     #[serde(deserialize_with = "nullable")]
     pub checked: Option<u64>,
+    /// The stream kinds a job of the row emits (see [`template::outputs`]); empty for a
+    /// broken row.
+    pub outputs: Vec<StreamKind>,
 }
 
 /// Deserialize a required `Option<T>`: a missing key is an error, `null` is `None`.
@@ -250,6 +254,7 @@ impl ModeRegistry {
             let id = row.id.0.clone();
             return self.add_broken(&id, Some(row), file, e);
         }
+        let outputs = template::outputs(&row, stages);
         let loaded = LoadedMode {
             row,
             state: ModeState::Ready,
@@ -257,6 +262,7 @@ impl ModeRegistry {
             file,
             program: None,
             checked: None,
+            outputs,
         };
         match self.modes.iter_mut().find(|m| m.row.id == loaded.row.id) {
             Some(m) => *m = loaded,
@@ -285,6 +291,7 @@ impl ModeRegistry {
             file,
             program: None,
             checked: None,
+            outputs: Vec::new(),
         });
     }
 

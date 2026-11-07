@@ -15,6 +15,7 @@ use super::{Decoder, Demod, FrameBlock, InputStream, ModeRow};
 use crate::graph::{Edge, Graph, GraphId, Node, NodeId};
 use crate::ops::OpError;
 use crate::port::Tuning;
+use crate::stage::StageRegistry;
 use crate::types::StreamKind;
 
 /// The stage kind that runs a program row's decoder; its params are `{"mode": <id>}`.
@@ -121,6 +122,31 @@ pub fn expand(row: &ModeRow, tuning: Tuning, out_rate_hz: u64) -> Result<Graph, 
         }
         Decoder::Frame(block) => Ok(frame_graph(block, tuning, out_rate_hz)),
     }
+}
+
+/// The stream kinds a job of `row` emits. A graph row's are those of its terminal nodes
+/// (no edge leaves them), from each stage's `spec().outputs`, in node order, each kind
+/// once. A program row and a frame row emit events only (a frame row's audio stays
+/// inside its chain).
+pub fn outputs(row: &ModeRow, stages: &StageRegistry) -> Vec<StreamKind> {
+    let Decoder::Graph { nodes, edges, .. } = &row.decoder else {
+        return vec![StreamKind::Event];
+    };
+    let mut out: Vec<StreamKind> = Vec::new();
+    for n in nodes
+        .iter()
+        .filter(|n| !edges.iter().any(|e| e.from == n.id))
+    {
+        let Some(spec) = stages.spec(&n.kind) else {
+            continue;
+        };
+        for k in &spec.outputs {
+            if !out.contains(k) {
+                out.push(*k);
+            }
+        }
+    }
+    out
 }
 
 /// A frame row's chain: `channel` at `out_rate_hz`, `resample` to the chain rate

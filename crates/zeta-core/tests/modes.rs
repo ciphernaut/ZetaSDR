@@ -880,3 +880,59 @@ async fn reload_modes_keeps_a_graph_rows_handler_state() {
     assert_eq!(m.reason, Some(reason));
     assert_eq!(reg.get("pocsag_decode").unwrap().state, ModeState::Ready);
 }
+
+#[test]
+fn every_embedded_row_emits_events_today() {
+    let reg = ModeRegistry::load(&stages(), None);
+    for m in reg.all() {
+        assert_eq!(m.outputs, [StreamKind::Event], "{}", m.row.id.0);
+    }
+}
+
+#[tokio::test]
+async fn modes_list_reports_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let Ok(OpResult::Modes { modes }) = node
+        .apply(Op::ModesList {
+            family: None,
+            state: None,
+        })
+        .await
+    else {
+        panic!("expected modes");
+    };
+    let aprs = modes.iter().find(|m| m.id.0 == "aprs_decode").unwrap();
+    let v = serde_json::to_value(aprs).unwrap();
+    assert_eq!(v["outputs"], serde_json::json!(["event"]));
+}
+
+#[test]
+fn outputs_of_a_graph_row_are_its_terminal_stages_kinds() {
+    let mut row: serde_json::Value =
+        serde_json::from_str(&renamed_pocsag("Pagers and voice")).unwrap();
+    row["id"] = "pocsag_voice".into();
+    row["decoder"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "fm", "kind": "nbfm_demod",
+            "params": {"deviation_hz": 3000, "audio_rate_hz": 48000, "squelch": false}
+        }));
+    row["decoder"]["edges"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "from": "channel", "to": "fm", "kind": "iq"
+        }));
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("pv.json"), row.to_string()).unwrap();
+    let reg = ModeRegistry::load(&stages(), Some(dir.path()));
+    let m = reg.get("pocsag_voice").unwrap();
+    assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
+    assert_eq!(m.outputs, [StreamKind::Event, StreamKind::Audio]);
+}
