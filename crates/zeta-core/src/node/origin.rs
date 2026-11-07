@@ -1174,6 +1174,28 @@ mod tests {
         assert_eq!((bare.agree, bare.terms.modulation), (Agree::Unknown, 0.2));
     }
 
+    /// The field host's broadcast band lookups: layer 1 labels a broadcast FM station
+    /// `wfm`, and an F8E (or F3E) row must agree with it rather than disagree. The other
+    /// letters cover the labels layer 1 can emit for their emissions too: `A` keyed
+    /// (A1A, A1D, A2D) reads as `ook`; `carrier` stays `N`'s alone.
+    #[test]
+    fn a_wfm_band_agrees_with_an_f8e_row_and_keyed_a_rows_with_ook() {
+        let fits = |designator: &str, label: &str, bw: u64| {
+            let row = tx(Some(designator), None, 97_900_000, Some(5.0));
+            score_row(&row, &q(&[label], 97_900_000, bw), None, None)
+                .unwrap()
+                .agree
+        };
+        assert_eq!(fits("200KF8E", "wfm", 200_000), Agree::Fits);
+        assert_eq!(fits("180KF3E", "wfm", 200_000), Agree::Fits);
+        assert_eq!(fits("16K0A1D", "ook", 16_000), Agree::Fits);
+        // A bare carrier (or a spur) does not agree with an AM row.
+        assert_eq!(fits("12K5A3E", "carrier", 12_500), Agree::Disagrees);
+        // Phase modulation and the sidebands still disagree with a broadcast label.
+        assert_eq!(fits("16K0G3E", "wfm", 16_000), Agree::Disagrees);
+        assert_eq!(fits("200KJ3E", "wfm", 200_000), Agree::Disagrees);
+    }
+
     #[test]
     fn reach_scores_in_unknown_and_out() {
         let band = q(&[], CENTER, 12_500);

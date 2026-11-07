@@ -16,12 +16,14 @@ const MODULATION_SCORE: f32 = 0.3;
 pub const ALLOCATION_SCORE: f32 = 0.2;
 /// An assignment's bandwidth fits a row's within these factors of `band.bandwidth_hz`.
 const ALLOCATION_WIDTH: (f64, f64) = (0.5, 1.5);
-/// The layer-1 labels each emission designator's modulation letter is compatible with.
+/// The layer-1 labels each emission designator's modulation letter is compatible with:
+/// `F` also with `wfm` (broadcast F3E/F8E), `A` also with `ook` (keyed A1A/A1D/A2D).
+/// `carrier` stays `N`'s alone, so a bare carrier or spur does not agree with every AM row.
 pub(crate) const DESIGNATOR_LABELS: &[(char, &[&str])] = &[
-    ('F', &["fm", "fsk"]),
+    ('F', &["fm", "fsk", "wfm"]),
     ('G', &["fm", "fsk", "psk"]),
     ('D', &["psk"]),
-    ('A', &["am", "ssb"]),
+    ('A', &["am", "ssb", "ook"]),
     ('H', &["am", "ssb"]),
     ('J', &["am", "ssb"]),
     ('R', &["am", "ssb"]),
@@ -32,9 +34,9 @@ pub(crate) const DESIGNATOR_LABELS: &[(char, &[&str])] = &[
 /// provider lists the nearest first): its decoded designator's `bandwidth_hz` (else the
 /// assignment's own `bandwidth_hz`) within 0.5-1.5 times the row's `band.bandwidth_hz`,
 /// and its modulation letter compatible with one of the row's `modulation` labels
-/// (`F`, `G` with `fm`/`fsk`; `G`, `D` with `psk`; `A`, `H`, `J`, `R` with `am`/`ssb`;
-/// `N` with `carrier`). An assignment without a designator passes the modulation test;
-/// one without any bandwidth fits none. Plan rows and receivers never match.
+/// (`F`, `G` with `fm`/`fsk`; `F` with `wfm`; `G`, `D` with `psk`; `A`, `H`, `J`, `R`
+/// with `am`/`ssb`; `A` with `ook`; `N` with `carrier`). An assignment without a
+/// designator passes the modulation test; one without any bandwidth fits none. Plan rows and receivers never match.
 pub fn allocation_match<'a>(row: &LoadedMode, allocs: &'a [Allocation]) -> Option<&'a Allocation> {
     let bw = row.row.band.bandwidth_hz as f64;
     let (lo, hi) = ALLOCATION_WIDTH;
