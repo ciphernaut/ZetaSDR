@@ -28,6 +28,7 @@
 //! then is `Ok(())` (lines still unread are published first). Any other exit is
 //! `Failed("<mode id>: <program> exited with <status> (<stderr tail>)")`.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,7 @@ use async_trait::async_trait;
 use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin};
@@ -46,8 +48,8 @@ use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zeta_core::modes::{
-    Container, Decoder, InputStream, InputVia, ModeRegistry, ModeRow, ModeState, OutputVia, Parser,
-    ProgramBlock, SampleFormat,
+    Container, Decoder, FieldPath, InputStream, InputVia, ModeRegistry, ModeRow, ModeState,
+    OutputVia, Parser, ProgramBlock, SampleFormat,
 };
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
@@ -238,7 +240,11 @@ pub async fn run_row(
 
     // `$center_hz` is the first frame's centre: wait for it only when it is used.
     let mut first = None;
-    if block.args.iter().any(|a| a.contains("$center_hz")) {
+    if block
+        .args
+        .iter()
+        .any(|a| a.contains("$center_hz") || a.contains("$center_khz"))
+    {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(StageError::Cancelled),
@@ -370,6 +376,7 @@ pub async fn run_row(
     let publisher = Publisher {
         row,
         parser: block.output.parser,
+        fields: block.output.fields.as_ref(),
         out,
         bus: &bus,
         ctx: &ctx,
@@ -473,7 +480,8 @@ async fn pump(
     }
 }
 
-/// The row's args with `$port`, `$rate_hz`, `$center_hz` and `$fifo` substituted.
+/// The row's args with `$port`, `$rate_hz`, `$center_hz`, `$center_khz` and `$fifo`
+/// substituted.
 fn substitute(block: &ProgramBlock, port: u16, center_hz: u64, fifo: Option<&Path>) -> Vec<String> {
     let fifo = fifo.map(|f| f.display().to_string()).unwrap_or_default();
     block
@@ -483,9 +491,31 @@ fn substitute(block: &ProgramBlock, port: u16, center_hz: u64, fifo: Option<&Pat
             a.replace("$port", &port.to_string())
                 .replace("$rate_hz", &block.input.rate_hz.to_string())
                 .replace("$center_hz", &center_hz.to_string())
+                .replace("$center_khz", &zeta_core::modes::center_khz_text(center_hz))
                 .replace("$fifo", &fifo)
         })
         .collect()
+}
+
+/// The event's fields read out of a parsed `line`: for each key of `map` the first pointer
+/// that resolves to a non-null value, cloned (a string stripped of the path's `trim`
+/// characters at both ends); a key with none is absent.
+pub fn apply_fields(map: &BTreeMap<String, FieldPath>, line: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for (key, path) in map {
+        let found = path
+            .pointers()
+            .iter()
+            .filter_map(|p| line.pointer(p))
+            .find(|v| !v.is_null());
+        let Some(v) = found else { continue };
+        let v = match (v.as_str(), path.trim()) {
+            (Some(s), Some(t)) => Value::from(s.trim_matches(|c| t.contains(c))),
+            _ => v.clone(),
+        };
+        out.insert(key.clone(), v);
+    }
+    Value::Object(out)
 }
 
 /// The parser's name as a row spells it, upper-cased (`SBS`, `JSON_LINES`).
@@ -500,6 +530,7 @@ fn parser_name(p: Parser) -> String {
 struct Publisher<'a> {
     row: &'a ModeRow,
     parser: Parser,
+    fields: Option<&'a BTreeMap<String, FieldPath>>,
     out: StreamId,
     bus: &'a StreamBus,
     ctx: &'a StageContext,
@@ -523,11 +554,14 @@ impl Publisher<'_> {
         if text.trim().is_empty() {
             return;
         }
-        let Some(fields) = crate::parsers::parse(self.parser, &text) else {
+        let Some(mut fields) = crate::parsers::parse(self.parser, &text) else {
             lock(&self.unparsed).count += 1;
             self.note_unparsed(false);
             return;
         };
+        if let Some(map) = self.fields {
+            fields = apply_fields(map, &fields);
+        }
         let prov = lock(&self.last_prov).clone().unwrap_or_else(|| {
             let t = now();
             Provenance {
@@ -1029,5 +1063,18 @@ mod tests {
             ]
         );
         assert_eq!(parser_name(Parser::Sbs), "SBS");
+    }
+
+    #[test]
+    fn substitute_fills_center_khz() {
+        let row = zeta_core::modes::parse(include_str!("../../../modes/adsb_decode.json")).unwrap();
+        let Decoder::Program(mut block) = row.decoder else {
+            panic!("a program row")
+        };
+        block.args = ["$center_khz", "$center_hz"].map(String::from).to_vec();
+        assert_eq!(
+            substitute(&block, 0, 8_942_500, None),
+            ["8942.5", "8942500"]
+        );
     }
 }

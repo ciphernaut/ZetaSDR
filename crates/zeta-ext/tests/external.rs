@@ -558,3 +558,184 @@ fn params_take_the_mode_only() {
     assert_eq!(s.get("additionalProperties"), Some(&json!(false)), "{s:?}");
     assert_eq!(s.get("required"), Some(&json!(["mode"])), "{s:?}");
 }
+
+// The vectors in tests/data are SYNTHETIC: built by hand to the shape of the upstream
+// formatters (dumpvdl2, dumphfdl, libacars), with invented values, until off-air
+// fixtures replace them.
+fn data(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name)
+}
+
+fn vector(name: &str) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(data(name)).unwrap()).unwrap()
+}
+
+/// The vdl2 row's `decoder.output.fields` map.
+fn vdl2_map() -> Value {
+    let tags = "/vdl2/avlc/acars/arinc622/adsc/tags";
+    let first = |leaf: &str| {
+        json!([
+            format!("{tags}/0/basic_report/{leaf}"),
+            format!("{tags}/1/basic_report/{leaf}"),
+            format!("{tags}/0/emerg_basic_report/{leaf}")
+        ])
+    };
+    json!({
+        "icao": "/vdl2/avlc/src/addr",
+        "addr_type": "/vdl2/avlc/src/type",
+        "status": "/vdl2/avlc/src/status",
+        "dst": "/vdl2/avlc/dst/addr",
+        "frame_type": "/vdl2/avlc/frame_type",
+        "reg": {"pointers": ["/vdl2/avlc/acars/reg"], "trim": "."},
+        "flight": "/vdl2/avlc/acars/flight",
+        "label": "/vdl2/avlc/acars/label",
+        "msg_num": "/vdl2/avlc/acars/msg_num",
+        "ack": "/vdl2/avlc/acars/ack",
+        "text": "/vdl2/avlc/acars/msg_text",
+        "crc_ok": "/vdl2/avlc/acars/crc_ok",
+        "lat": first("lat"),
+        "lon": first("lon"),
+        "alt_ft": first("alt"),
+        "sig_level": "/vdl2/sig_level",
+        "noise_level": "/vdl2/noise_level"
+    })
+}
+
+fn field_map(v: Value) -> std::collections::BTreeMap<String, zeta_core::modes::FieldPath> {
+    serde_json::from_value(v).unwrap()
+}
+
+/// A program row printing the lines of `lines` through `fake_lines`; with `map` its
+/// schema lists every mapped field and the position is the vdl2 one.
+fn mapped_row(id: &str, lines: &str, map: Option<Value>) -> Value {
+    let lines = data(lines).display().to_string();
+    let mut props = serde_json::Map::new();
+    for k in map.iter().flat_map(|m| m.as_object().unwrap().keys()) {
+        props.insert(
+            k.clone(),
+            json!({"type": ["string", "number", "boolean", "null"]}),
+        );
+    }
+    let mut r = row(
+        id,
+        &fake("fake_lines"),
+        &["--lines-file", &lines],
+        "cs16",
+        48_000,
+        "stdin",
+        "stdout",
+        "json_lines",
+        "line",
+        Value::Object(props),
+    );
+    if let Some(m) = map {
+        r["decoder"]["output"]["fields"] = m;
+        r["position"] = json!({"lat": "lat", "lon": "lon", "alt_m": "alt_ft", "alt_unit": "ft"});
+    }
+    r
+}
+
+#[test]
+fn apply_fields_takes_the_first_present_pointer_and_copies_values_as_they_are() {
+    let map = field_map(vdl2_map());
+    let line = vector("dumpvdl2-adsc.json");
+    let ev = zeta_ext::apply_fields(&map, &line);
+    assert_eq!(ev["icao"], "7C0000");
+    assert_eq!(ev["reg"], "VH-ZET", "the leading dot is trimmed");
+    assert_eq!(line["vdl2"]["avlc"]["acars"]["reg"], ".VH-ZET");
+    assert_eq!(ev["flight"], "ZET1");
+    assert_eq!(ev["text"], "/BNECAYA.ADS.VH-ZET0712...");
+    assert_eq!(ev["lat"], json!(-27.38));
+    assert_eq!(ev["lon"], json!(153.12));
+    assert_eq!(ev["alt_ft"], json!(37000));
+    assert_eq!(ev["crc_ok"], json!(true));
+    assert_eq!(ev["sig_level"], json!(-21.512345));
+    assert!(ev.get("vdl2").is_none(), "{ev}");
+    let one = field_map(json!({"avlc": "/vdl2/avlc/src", "gone": "/vdl2/nope"}));
+    let ev = zeta_ext::apply_fields(&one, &line);
+    assert_eq!(ev["avlc"]["type"], "Aircraft", "an object is copied");
+    assert!(ev.get("gone").is_none(), "{ev}");
+    let trim = field_map(json!({
+        "f": {"pointers": ["/f"], "trim": " "},
+        "n": {"pointers": ["/n"], "trim": " "}
+    }));
+    let ev = zeta_ext::apply_fields(&trim, &json!({"f": "ZET1  ", "n": 5}));
+    assert_eq!(ev["f"], "ZET1");
+    assert_eq!(ev["n"], 5);
+}
+
+#[test]
+fn a_mapped_line_without_the_listed_tag_has_no_position() {
+    let reg = registry(&[mapped_row("m_xid", "dumpvdl2-xid.json", Some(vdl2_map()))]);
+    let fields = zeta_ext::apply_fields(&field_map(vdl2_map()), &vector("dumpvdl2-xid.json"));
+    assert_eq!(fields["icao"], "7C0000");
+    for k in ["reg", "lat", "lon"] {
+        assert!(fields.get(k).is_none(), "{k} in {fields}");
+    }
+    let ev = zeta_core::modes::summary::envelope(&reg.get("m_xid").unwrap().row, 1, fields);
+    assert_eq!(ev["icao"], "7C0000");
+    assert!(ev.get("position").is_none(), "{ev}");
+}
+
+#[test]
+fn a_non_numeric_fix_is_no_position() {
+    let reg = registry(&[mapped_row("m_na", "dumpvdl2-adsc.json", Some(vdl2_map()))]);
+    let mut line = vector("dumpvdl2-adsc.json");
+    line["vdl2"]["avlc"]["acars"]["arinc622"]["adsc"]["tags"][0]["basic_report"]["lat"] =
+        json!("n/a");
+    let fields = zeta_ext::apply_fields(&field_map(vdl2_map()), &line);
+    let ev = zeta_core::modes::summary::envelope(&reg.get("m_na").unwrap().row, 1, fields);
+    assert_eq!(ev["icao"], "7C0000");
+    assert!(ev.get("position").is_none(), "{ev}");
+}
+
+#[test]
+fn the_hfdl_list_form_keys_downlinks_and_uplinks_on_the_aircraft() {
+    let map = field_map(json!({
+        "icao": [
+            "/hfdl/lpdu/src/ac_info/icao",
+            "/hfdl/lpdu/dst/ac_info/icao",
+            "/hfdl/lpdu/ac_info/icao"
+        ],
+        "gs_id": ["/hfdl/lpdu/dst/id", "/hfdl/lpdu/src/id", "/hfdl/spdu/src/id"]
+    }));
+    // Downlink: the ground station is the destination (id 4), the aircraft the source.
+    let down = zeta_ext::apply_fields(&map, &vector("dumphfdl-downlink.json"));
+    assert_eq!(down["icao"], "7C0000");
+    assert_eq!(down["gs_id"], 4);
+    // Uplink: the aircraft is the destination. Its `dst.id` (the aircraft id 42) exists, so
+    // the first `gs_id` pointer wins over `src.id` (the ground station, 4): this order
+    // gives the ground station for downlinks and SPDUs only.
+    let up = zeta_ext::apply_fields(&map, &vector("dumphfdl-uplink.json"));
+    assert_eq!(up["icao"], "7C0000");
+    assert_eq!(up["gs_id"], 42);
+    let spdu = zeta_ext::apply_fields(&map, &vector("dumphfdl-spdu.json"));
+    assert!(spdu.get("icao").is_none(), "{spdu}");
+    assert_eq!(spdu["gs_id"], 4);
+}
+
+#[tokio::test]
+async fn a_row_with_fields_publishes_the_mapped_event_and_without_them_the_whole_object() {
+    let reg = Arc::new(registry(&[
+        mapped_row("m_with", "dumpvdl2-adsc.json", Some(vdl2_map())),
+        mapped_row("m_without", "dumpvdl2-adsc.json", None),
+    ]));
+    let mut r = start(ExternalDecodeStage::new(reg.clone()), "m_with");
+    send(&r.tx, 4, 480, 48_000);
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["icao"], "7C0000", "{v}");
+    assert_eq!(v["position"]["lat"], json!(-27.38), "{v}");
+    assert!(v.get("vdl2").is_none(), "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+
+    let mut r = start(ExternalDecodeStage::new(reg), "m_without");
+    send(&r.tx, 4, 480, 48_000);
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["vdl2"]["avlc"]["src"]["addr"], "7C0000", "{v}");
+    assert!(v.get("icao").is_none(), "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}

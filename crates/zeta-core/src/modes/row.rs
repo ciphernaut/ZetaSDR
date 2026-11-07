@@ -415,8 +415,11 @@ pub struct ProgramOutput {
     pub fields: Option<BTreeMap<String, FieldPath>>,
 }
 
-/// Where in a program's parsed line an event field is read: one JSON pointer, or a list
-/// tried in order.
+/// Where in a program's parsed line an event field is read, in one of three forms:
+/// - one JSON pointer;
+/// - a list of pointers tried in order;
+/// - an object `{"pointers": [...], "trim": "."}`: the list, with the characters of `trim`
+///   stripped from both ends of a string result.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum FieldPath {
@@ -424,6 +427,18 @@ pub enum FieldPath {
     One(String),
     /// JSON pointers tried in order, the first resolving to a non-null value winning.
     First(Vec<String>),
+    /// The pointers tried in order, a string result stripped of the `trim` characters.
+    Trimmed(TrimmedPaths),
+}
+
+/// The object form of [`FieldPath`]: pointers tried in order, and the characters stripped
+/// from both ends of a string result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct TrimmedPaths {
+    pub pointers: Vec<String>,
+    pub trim: String,
 }
 
 impl FieldPath {
@@ -432,6 +447,15 @@ impl FieldPath {
         match self {
             FieldPath::One(p) => std::slice::from_ref(p),
             FieldPath::First(ps) => ps,
+            FieldPath::Trimmed(t) => &t.pointers,
+        }
+    }
+
+    /// The characters stripped from both ends of a string value, for the trimmed form.
+    pub fn trim(&self) -> Option<&str> {
+        match self {
+            FieldPath::Trimmed(t) => Some(&t.trim),
+            _ => None,
         }
     }
 
@@ -444,6 +468,9 @@ impl FieldPath {
         }
         if self.pointers().iter().any(|p| !p.starts_with('/')) {
             return Err(RowError::new(at, "a JSON pointer starts with \"/\""));
+        }
+        if self.trim() == Some("") {
+            return Err(RowError::new(at, "an empty trim"));
         }
         Ok(())
     }
@@ -1509,6 +1536,39 @@ mod tests {
             serde_json::json!(["/x", "/y"])
         );
         assert_eq!(parse(&serde_json::to_string(&row).unwrap()).unwrap(), row);
+    }
+
+    #[test]
+    fn a_trimmed_field_path_round_trips_and_needs_pointers_and_trim() {
+        let p: FieldPath =
+            serde_json::from_value(serde_json::json!({"pointers": ["/a/reg"], "trim": "."}))
+                .unwrap();
+        assert_eq!(
+            p,
+            FieldPath::Trimmed(TrimmedPaths {
+                pointers: vec!["/a/reg".into()],
+                trim: ".".into()
+            })
+        );
+        assert_eq!(p.pointers(), ["/a/reg".to_string()]);
+        assert_eq!(p.trim(), Some("."));
+        p.check("reg").unwrap();
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            serde_json::json!({"pointers": ["/a/reg"], "trim": "."})
+        );
+        let empty: FieldPath =
+            serde_json::from_value(serde_json::json!({"pointers": [], "trim": "."})).unwrap();
+        assert_eq!(
+            empty.check("reg").unwrap_err(),
+            RowError::new("decoder.output.fields.reg", "an empty list")
+        );
+        let bare: FieldPath =
+            serde_json::from_value(serde_json::json!({"pointers": ["/a"], "trim": ""})).unwrap();
+        assert_eq!(
+            bare.check("reg").unwrap_err(),
+            RowError::new("decoder.output.fields.reg", "an empty trim")
+        );
     }
 
     #[test]

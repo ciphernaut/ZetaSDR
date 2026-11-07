@@ -15,7 +15,9 @@ pub mod sink_sondehub;
 
 pub use acma::AcmaKnowledge;
 pub use adsb::{ADSB_MODE, ADSB_RATE_HZ, AdsbDecodeStage, AdsbParams, find_dump1090};
-pub use external::{EXTERNAL_DECODE_KIND, ExternalDecodeStage, ExternalParams, ModesHandle};
+pub use external::{
+    EXTERNAL_DECODE_KIND, ExternalDecodeStage, ExternalParams, ModesHandle, apply_fields,
+};
 pub use parsers::sbs;
 pub use proc::HANDLER_VERSION_TIMEOUT;
 pub use sink_sondehub::{BATCH_MS, SONDEHUB_KIND, SONDEHUB_URL, SondehubParams, SondehubStage};
