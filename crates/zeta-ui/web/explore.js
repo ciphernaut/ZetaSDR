@@ -14,7 +14,8 @@
 //   Work the bits (`bits_start {capture, modulation: null, symbol_rate_baud, order: null}`,
 //   `symbol_rate_baud` the row's `input.bits-rate`, prefilled from the features' symbol rate,
 //   null when empty so the node fills it; the transcript says `started bits <id> on <kHz> kHz`
-//   or the error, then the Bits pane is selected; a rate typed survives the 2 s redraw).
+//   or the error, then the Bits pane is selected; a rate typed and the focus in it survive
+//   the 2 s redraw).
 //   Above the rows a `.explore-tools` bar holds Delete all (`button[data-action="delete-all"]`,
 //   armed like Delete: `sure?` for DELETE_CONFIRM_MS, then a second click deletes every
 //   capture that is not pinned, one `capture_delete` each, and notes
@@ -24,8 +25,8 @@
 //   Each poll also lists `signature_list {state: null}`; under the captures a
 //   `table.signatures` holds the records in EXPLORE_SIGNATURE_STATES, newest first, one
 //   `tr.signature[data-id]` each: `td.name` (an `input.sig-name` prefilled with the name,
-//   `readonly` once accepted; a name typed survives the redraw), `td.confidence` (two
-//   decimals), `td.state` (`proposed`, `accepted`, or `accepted · learned` and the row id
+//   `readonly` once accepted; a name typed, and the focus and caret in it, survive the
+//   redraw), `td.confidence` (two decimals), `td.state` (`proposed`, `accepted`, or `accepted · learned` and the row id
 //   when `decoder` is set), `td.evidence` (signatureText) and `td.actions`: Accept
 //   (proposed only: `signature_accept {id, name}`, `name` the input when it was changed,
 //   else null; the transcript notes `accepted <name> (<id tail>)` and the `decoder_note`
@@ -45,6 +46,8 @@ export const DELETE_CONFIRM_MS = 3000;
 export const EXPLORE_SIGNATURE_STATES = ["proposed", "accepted"];
 // The characters of an id the transcript and the brackets name it by.
 const ID_TAIL = 6;
+// The row fields the operator types in; a redraw keeps the focus and caret in them.
+const FIELDS = "input.sig-name, input.bits-rate";
 
 // A signature's evidence cell: its `evidence`, else `<modulation> <kHz> kHz`.
 export function signatureText(rec) {
@@ -278,7 +281,42 @@ class ExplorePane {
     tools.append(all);
     const parts = [tools, table];
     if (this.signatures.length) parts.push(this.signatureTable());
+    const place = this.focusedField();
     this.el.replaceChildren(...parts);
+    this.restoreField(place);
+  }
+
+  // The operator's place in a row's name or rate field (the element, its row and class,
+  // the selection), when one has focus: the redraw replaces it, so restoreField puts the
+  // focus and the caret back in the new one.
+  focusedField() {
+    const a = document.activeElement;
+    if (!a || !this.el.contains(a) || !a.matches(FIELDS)) return null;
+    const tr = a.closest("tr[data-id]");
+    if (!tr) return null;
+    let sel = null;
+    try {
+      // A number input has no selection (null, or a throw in older engines).
+      if (a.selectionStart !== null) sel = [a.selectionStart, a.selectionEnd, a.selectionDirection];
+    } catch {
+      sel = null;
+    }
+    return { row: tr.className.split(" ")[0], id: tr.dataset.id, cls: a.className, sel };
+  }
+
+  restoreField(place) {
+    if (!place) return;
+    const tr = [...this.el.querySelectorAll(`tr.${place.row}`)].find((r) => r.dataset.id === place.id);
+    const input = tr?.querySelector(`input.${place.cls}`);
+    if (!input) return;
+    input.focus({ preventScroll: true });
+    if (place.sel && !input.readOnly) {
+      try {
+        input.setSelectionRange(...place.sel);
+      } catch {
+        // No selection on this input type.
+      }
+    }
   }
 
   // The `table.signatures` under the captures (see the header).

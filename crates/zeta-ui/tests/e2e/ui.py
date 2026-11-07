@@ -6323,6 +6323,52 @@ def two_captures_of(url, secret, source, center_hz, bandwidth_hz):
     return mine()
 
 
+# Whether the input `sel` matched when `window.__field` was taken is gone from the page
+# (the pane's poll redrew it) and the one there now has the focus.
+FIELD_REDRAWN_JS = """(sel) => {
+  const now = document.querySelector(sel);
+  return !!now && !document.contains(window.__field) && document.activeElement === now;
+}"""
+
+
+def type_across_a_poll(page, sel, keys):
+    """Type `keys` into `sel` (already focused) slowly enough that the pane's poll redraws
+    the row at least once meanwhile (checked)."""
+    page.evaluate("(sel) => { window.__field = document.querySelector(sel); }", sel)
+    page.locator(sel).press_sequentially(keys, delay=EXPLORE_TYPE_DELAY_MS)
+    page.wait_for_function(FIELD_REDRAWN_JS, arg=sel, timeout=5000)
+
+
+# The delay between keystrokes: sixteen of them outlast EXPLORE_POLL_MS (2 s).
+EXPLORE_TYPE_DELAY_MS = 200
+
+
+def scenario_typing_survives_the_explore_poll(page, url, secret):
+    clear_captures(url, secret)
+    clear_signatures(url, secret)
+    capture = two_captures_of(url, secret, "fsk", 433_920_000, 12_000)[0]
+    sig = propose(url, secret, capture["id"])
+    login(page, url, secret)
+    page.locator('#panes .pane-tab[data-pane="explore"]').click()
+    name = f'#explore tr.signature[data-id="{sig["id"]}"] input.sig-name'
+    expect(page.locator(name)).to_have_count(1, timeout=20000)
+    # A name typed into the middle: the focus and the caret come back after each redraw.
+    page.fill(name, "abcdef")
+    page.press(name, "End")
+    for _ in range(3):
+        page.press(name, "ArrowLeft")
+    type_across_a_poll(page, name, "0123456789012345")
+    expect(page.locator(name)).to_have_value("abc0123456789012345def")
+    # The rate field keeps the focus too.
+    rate = f'#explore tr.capture[data-id="{capture["id"]}"] input.bits-rate'
+    page.fill(rate, "")
+    page.focus(rate)
+    type_across_a_poll(page, rate, "1234567890123456")
+    expect(page.locator(rate)).to_have_value("1234567890123456")
+    clear_signatures(url, secret)
+    clear_captures(url, secret)
+
+
 # Defined after every scenario that counts captures: its accepts pin their captures, which
 # `clear_captures` cannot delete, and `scenarios()` runs them in definition order.
 def scenario_proposal_accepted_from_the_page(page, url, secret):
@@ -6346,8 +6392,9 @@ def scenario_proposal_accepted_from_the_page(page, url, secret):
     page.click(row + 'button[data-action="accept"]')
     expect(page.locator("#transcript .line.note",
                         has_text=f"accepted fsk test link ({sig['id'][-6:]})")).to_have_count(1)
-    # `measure` reads no symbol rate off direct 2-FSK, so this one writes no learned row.
-    expect(page.locator(row + "td.state")).to_have_text("accepted")
+    # `measure` reads no symbol rate off direct 2-FSK today, so this one writes no learned
+    # row (`accepted`); one that read a rate would add ` · learned <row>`.
+    expect(page.locator(row + "td.state")).to_have_text(re.compile(r"^accepted"))
     expect(page.locator(row + "input.sig-name")).to_have_attribute("readonly", "")
     expect(page.locator(row + 'button[data-action="accept"]')).to_have_count(0)
     accepted = capture_ops(url, secret, "signature_show", id=sig["id"])
