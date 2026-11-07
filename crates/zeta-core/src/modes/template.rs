@@ -160,6 +160,7 @@ pub fn check_band(row: &ModeRow, tuning: Tuning, source_rate_hz: u64) -> Result<
         min,
         max: source_rate_hz,
         suggested: Some(row.band.bandwidth_hz),
+        why: None,
     })
 }
 

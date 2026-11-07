@@ -149,6 +149,7 @@ async fn ensure_out_of_range_suggests_dropped_zeros() {
             min,
             max,
             suggested,
+            ..
         }) => {
             assert_eq!(field, "center_hz");
             assert_eq!((value, min, max), (101_500, 1_000_000, 6_000_000_000));
@@ -1523,6 +1524,7 @@ fn expand_rejects_band_wider_than_channel_rate() {
             min: 1,
             max: 12_000,
             suggested: None,
+            why: None,
         }
     );
 }
@@ -1762,6 +1764,7 @@ async fn stream_tail_validates_limits() {
                 min: 1,
                 max,
                 suggested: None,
+                why: None,
             })
         );
     }
@@ -1838,6 +1841,7 @@ async fn deviation_out_of_range_names_field() {
             min,
             max,
             suggested,
+            ..
         }) => {
             assert_eq!(field, "deviation_hz");
             assert_eq!((value, min, max), (5, 100, 75_000));
@@ -2646,6 +2650,7 @@ fn adsb_expand_refuses_narrow_band() {
             min,
             max,
             suggested,
+            ..
         }) => {
             assert_eq!(field, "bandwidth_hz");
             assert_eq!(value, 1_000_000);
@@ -3511,4 +3516,52 @@ async fn source_list_reports_the_ring_depth() {
         si["required"].as_array().unwrap().contains(&"ring".into()),
         "{si}"
     );
+}
+
+fn capped_port(id: &str, cap: Claim<Hz>) -> Arc<WidePort> {
+    let mut p = WidePort::new(id);
+    p.caps.max_bandwidth_hz = cap;
+    Arc::new(p)
+}
+
+async fn refused_wide_band(cap: Claim<Hz>) -> OpError {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![capped_port("b210", cap)])
+        .await
+        .unwrap();
+    let op = Op::SourceEnsure {
+        source: SourceId("b210".into()),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(24_000_000),
+        replace: vec![],
+    };
+    node.apply(op).await.expect_err("24 MHz is over the cap")
+}
+
+#[tokio::test]
+async fn a_request_wider_than_a_measured_cap_is_refused_as_insufficient_bandwidth() {
+    let err = refused_wide_band(Claim::Measured(Hz(20_480_000))).await;
+    let text = "insufficient bandwidth: b210 delivers at most 20480000 Hz (measured at open)";
+    match &err {
+        OpError::OutOfRange {
+            field, max, why, ..
+        } => {
+            assert_eq!(field, "bandwidth_hz");
+            assert_eq!(*max, 20_480_000);
+            assert_eq!(why.as_deref(), Some(text));
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+    assert!(err.to_string().ends_with(&format!(": {text}")));
+}
+
+#[tokio::test]
+async fn an_asserted_cap_refuses_without_a_why() {
+    let err = refused_wide_band(Claim::Asserted(Hz(20_480_000))).await;
+    match &err {
+        OpError::OutOfRange { why, .. } => assert_eq!(*why, None),
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+    let json = serde_json::to_value(&err).unwrap();
+    assert!(!json.as_object().unwrap().contains_key("why"), "{json}");
 }

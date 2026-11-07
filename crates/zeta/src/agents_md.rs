@@ -14,7 +14,7 @@ const RULES: &[&str] = &[
     "One unit per field: frequencies and bandwidths are integers in hertz in fields ending `_hz`, rates are in baud in fields ending `_baud`, times are integer nanoseconds since the UNIX epoch in fields ending `_ns`, durations are integer milliseconds in fields ending `_ms`, gains are decibels in fields ending `_db`.",
     "Every field is required and unknown fields are rejected.",
     "Call operations, do not explain.",
-    "Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it.",
+    "Errors carry `error`, the offending `field`, the acceptable range and, when the value looks like dropped zeros, `suggested`. Use it. A `why` of `insufficient bandwidth: ...` names the source's measured ceiling, not a decoder gap: move to a wider radio or re-probe (delete `sources/<id>.json`) rather than wait for a mode.",
     "Unknown signals are reported as unknown, never guessed.",
     "Ids are never invented: `source` values come from `source list`, `job` values from `job list`.",
     "Jobs belong to the operator: never `job_stop` a job or put one in `replace` unless the request names it, the run allows it or, for `job_stop`, you started it in this run. A `conflict` is reported with its holders; the operator decides.",
