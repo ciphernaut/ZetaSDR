@@ -239,6 +239,8 @@ struct Ended {
     not_found: Option<String>,
     /// How long the worker lived after its hello; `None` without a hello.
     lived: Option<Duration>,
+    /// It died by a signal it was not sent here (a crash, not our kill).
+    crashed: bool,
 }
 
 pub(crate) struct Supervisor {
@@ -348,6 +350,7 @@ impl Supervisor {
                     fault,
                     not_found: None,
                     lived: None,
+                    crashed: false,
                 });
             }
         };
@@ -368,6 +371,7 @@ impl Supervisor {
                             hello.protocol
                         );
                         ended.not_found = None;
+                        ended.crashed = false;
                         return self.ended(ended);
                     }
                     Ok(hello) => return Some(self.on_hello(w, hello)),
@@ -388,6 +392,7 @@ impl Supervisor {
                         self.cfg.timings.hello.as_secs_f64()
                     );
                     ended.not_found = None;
+                    ended.crashed = false;
                     return self.ended(ended);
                 }
                 _ = &mut *cancel => {
@@ -559,6 +564,7 @@ impl Supervisor {
             let mine = s.link.as_ref().is_some_and(|l| Arc::ptr_eq(l, &w.link));
             if mine { s.worker_fault.take() } else { None }
         };
+        let crashed = status.is_some_and(|s| s.signal().is_some());
         let (fault, not_found) =
             exit_fault(self.id(), &self.cfg.args, status, worker_fault, last_stderr);
         {
@@ -579,6 +585,7 @@ impl Supervisor {
             fault,
             not_found,
             lived,
+            crashed,
         }
     }
 
@@ -593,6 +600,16 @@ impl Supervisor {
                 (Some(args), Some(cached)) => {
                     self.caps = Some(cached.clone());
                     let attach = Attach::NotFound { args: args.clone() };
+                    let _ = first.send((attach, self.caps.clone()));
+                }
+                // A driver crash opening a device seen before (UHD still releasing
+                // it from a node that just stopped): faulted, respawned with backoff
+                // below, never the node's end.
+                (None, Some(cached)) if ended.crashed => {
+                    self.caps = Some(cached.clone());
+                    let attach = Attach::Crashed {
+                        fault: ended.fault.clone(),
+                    };
                     let _ = first.send((attach, self.caps.clone()));
                 }
                 _ => {

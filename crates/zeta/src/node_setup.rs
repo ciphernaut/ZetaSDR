@@ -194,7 +194,8 @@ const NEVER_SEEN: &str = "never seen on this host; plug it in once";
 /// By default the device runs in a `zeta soapy-worker` child of this process, spawned
 /// and supervised by a [`WorkerPort`](zeta_source_worker::port::WorkerPort), so a driver
 /// crash faults the source and the worker is respawned instead of the node going down.
-/// A device absent at startup attaches faulted (and is polled for) when the source
+/// A device absent at startup, or whose worker crashes opening it, attaches faulted
+/// (and is polled for, or respawned with backoff) when the source
 /// record in `state_dir` holds the capabilities an earlier open cached; never seen, it
 /// is refused. `in_process` (`--soapy-in-process`) opens the driver here instead, the
 /// path before workers existed, for diagnosis. The worker port is also returned on its
@@ -226,8 +227,10 @@ async fn open_soapy(
         timings: Timings::default(),
     };
     match WorkerPort::open(cfg, cached).await {
-        // A hello, or a device not found that was seen before: the supervisor has
-        // logged that it is waiting for the device, and the port is faulted until then.
+        // A hello, or a device seen before that was not found or whose worker crashed
+        // opening it (UHD still releasing it from a node that just stopped): the
+        // supervisor has logged that it is waiting for the device, and the port is
+        // faulted until a respawn says hello.
         Ok((port, _attach)) => Ok((port.clone() as Arc<dyn Port>, Some(port))),
         Err(e) if !seen && e.starts_with("device not found: ") => {
             Err(format!("{e} ({NEVER_SEEN})"))

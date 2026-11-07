@@ -97,6 +97,11 @@ pub enum Attach {
     /// The worker found no device (exit 3); `args` is what it looked for. The
     /// port is attached faulted with the cached capabilities and polls.
     NotFound { args: String },
+    /// The worker died by a signal before its hello (a driver crash opening the
+    /// device, e.g. UHD still releasing it from a node that just stopped); `fault`
+    /// names the signal. Only with `cached`: the port is attached faulted with the
+    /// cached capabilities and the worker respawns with backoff, as after any crash.
+    Crashed { fault: String },
     /// The worker could not be used; the text is the fault. [`WorkerPort::open`]
     /// returns it as its error, so no port is ever attached this way.
     Refused(String),
@@ -126,8 +131,10 @@ impl WorkerPort {
     /// A hello attaches with the hello's capability record. A device-not-found
     /// exit attaches only with `cached` (the record from an earlier open):
     /// the port is faulted `device not found: <args>` and the supervisor is
-    /// already polling. Anything else (not found and nothing cached, an open
-    /// that failed, a worker that died or never said hello) is the error,
+    /// already polling. A worker that died by a signal before its hello also
+    /// attaches only with `cached` ([`Attach::Crashed`]): faulted, respawning
+    /// with backoff. Anything else (not found or crashed with nothing cached,
+    /// an open that failed, a worker that never said hello) is the error,
     /// returned after the child was reaped, so a refused source leaves no
     /// process behind.
     pub async fn open(

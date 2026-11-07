@@ -262,6 +262,48 @@ async fn not_found_without_a_cache_is_refused_and_leaves_no_child() {
     assert_eq!(starts(&rec).len(), 1, "no respawn after a refusal");
 }
 
+/// The field host's deploy (2026-11-08): the first B210 worker died with SIGSEGV
+/// opening the device while UHD was still releasing it from the old node, and the
+/// node exited. A first spawn that crashes before its hello, on a device an earlier
+/// open cached, attaches faulted and respawns with backoff like any later crash;
+/// never seen, it is still refused (the node could not list it).
+#[tokio::test]
+async fn a_crash_before_the_first_hello_with_a_cache_attaches_faulted_and_heals() {
+    // Spawn 0 dies by SIGSEGV before the fake starts (it writes its own `start`
+    // line, so the wrapper writes spawn 0's); later spawns stream.
+    let crash_first = "if [ \"$N\" -eq 0 ]; then echo 'start 0' >> \"$REC\"; kill -SEGV $$; fi\n\
+                       exec \"$FAKE\" --script stream \"$@\"";
+    let crashed = "soapy worker for f died: signal 11 (SIGSEGV)";
+
+    let dir = tempdir();
+    let (cfg, rec) = cfg_wrapped(dir.path(), crash_first);
+    let (port, attach) = open(cfg, Some(cached_caps())).await;
+    match &attach {
+        Attach::Crashed { fault } => assert_eq!(fault, crashed),
+        a => panic!("expected Crashed, got {a:?}"),
+    }
+    assert_eq!(port.capabilities(), &cached_caps());
+    assert_eq!(port.fault().as_deref(), Some(crashed));
+    let healed = port.healed().unwrap();
+    assert!(
+        wait_for(Duration::from_secs(5), || *healed.borrow() > 0).await,
+        "no heal: {:?}",
+        port.fault()
+    );
+    assert_eq!(starts(&rec).len(), 2, "one respawn");
+    port.heal_settled();
+    assert_eq!(port.fault(), None);
+    assert_eq!(port.worker().unwrap().restarts, 1);
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+
+    let dir = tempdir();
+    let (cfg, rec) = cfg_wrapped(dir.path(), crash_first);
+    let err = WorkerPort::open(cfg, None).await.err().expect("refused");
+    assert_eq!(err, crashed);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(starts(&rec).len(), 1, "no respawn after a refusal");
+}
+
 #[tokio::test]
 async fn open_fails_is_refused_with_the_last_stderr_line() {
     let err = WorkerPort::open(cfg("open-fails"), Some(cached_caps()))

@@ -363,7 +363,8 @@ they belong to the serving node and are rejected. Source ids are unique across t
   `source <id>: <fault>`) and never ends the node; the node respawns the worker, and when the device
   is back it restores the gain and the pin and relaunches the jobs that failed with the fault, the
   `watch` and its decoders included. `source list` shows the child as `worker` (`pid`, `restarts`,
-  `since_ns`). A device absent at startup attaches faulted when an earlier start saw it, else the
+  `since_ns`). A device absent at startup, or whose worker crashes opening it (UHD still releasing
+  it from a node that just stopped), attaches faulted when an earlier start saw it, else the
   flag is refused. A one-shot command that attaches a Soapy source starts a worker (and a UHD open)
   like it once opened the device in-process; `--soapy-in-process` keeps that path for diagnosing the
   worker (ignored with `--node`).
