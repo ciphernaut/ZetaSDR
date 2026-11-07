@@ -206,6 +206,9 @@ Scope estimate: the stage set about 1500-2500 lines in `zeta-dsp` with fixtures 
 - Pins are left behind when an accept loses a race to a reject or hits an I/O error.
 - One malformed allocation drops all of a capture's allocations in `signature_propose`.
 - The page's event views show a frame job's `timing` and `bits` events as noise.
+- A superseded signature's `learned_<id>` row stays live in the registry, so it still takes a classify slot and an identify dwell: skip learned rows whose record is superseded (2026-11-08).
+- Several proposals can be pending for one signal (a capture's 0.3 and a bits job's 0.9), and accepting both gives overlapping records: fold a new proposal into a pending one of the same band (2026-11-08).
+- `LEARNED_MIN_SCORE` lets centre and bandwidth alone label a different emitter of similar width `learned`, after which the watch never captures it: require a rate or framing match too, or keep capturing learned matches now and then (2026-11-08).
 
 ## Program rows on events
 
