@@ -93,6 +93,11 @@
       }
     ],
     "heading": null,
-    "label": null
+    "label": null,
+    "identity": {
+      "field": "src",
+      "register": "callsign",
+      "strip": "ssid"
+    }
   }
 }

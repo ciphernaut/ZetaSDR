@@ -13,8 +13,8 @@ use crate::bursts::CaptureRecord;
 use crate::classify::Classification;
 use crate::job::JobRecord;
 use crate::knowledge::{Allocation, DEFAULT_REGION, KnowledgeProvider};
-use crate::modes::ModeRegistry;
 use crate::modes::score::{designator_fits, row_width};
+use crate::modes::{Identity, ModeRegistry};
 use crate::ops::{BITS_KIND, GRAPH_KIND, SignalBand};
 use crate::reach::Reach;
 use crate::station::{Antenna, Station};
@@ -321,15 +321,7 @@ pub fn answer(
         }
     }
     let mut origins: Vec<Origin> = best.into_values().chain(unnamed).collect();
-    origins.sort_by(|a, b| {
-        let (x, y) = (&a.allocation, &b.allocation);
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| nearest_first(x.distance_km, y.distance_km))
-            .then_with(|| x.licence_no.cmp(&y.licence_no))
-            .then_with(|| x.site.cmp(&y.site))
-            .then_with(|| x.center_hz.map(|h| h.0).cmp(&y.center_hz.map(|h| h.0)))
-    });
+    origins.sort_by(origin_order);
     origins.truncate(ORIGIN_SITES);
     let (from, from_note) = match vantage {
         Vantage::Station(s) => (
@@ -370,6 +362,19 @@ pub fn answer(
         reach,
         t_ns: now(),
     }
+}
+
+/// The answer's order: best score first, a confirmed origin before an equal score, then
+/// nearest, then by licence, site and centre.
+fn origin_order(a: &Origin, b: &Origin) -> std::cmp::Ordering {
+    let (x, y) = (&a.allocation, &b.allocation);
+    b.score
+        .total_cmp(&a.score)
+        .then_with(|| b.confirmed.is_some().cmp(&a.confirmed.is_some()))
+        .then_with(|| nearest_first(x.distance_km, y.distance_km))
+        .then_with(|| x.licence_no.cmp(&y.licence_no))
+        .then_with(|| x.site.cmp(&y.site))
+        .then_with(|| x.center_hz.map(|h| h.0).cmp(&y.center_hz.map(|h| h.0)))
 }
 
 /// Known distances first, nearest first.
@@ -529,6 +534,40 @@ pub fn confirm(a: &mut OriginAnswer, field: &str, value: &str) -> Option<usize> 
         value: value.to_string(),
     });
     Some(i)
+}
+
+/// The identity an event's `identity.field` value `v` carries (design 4.6): a string,
+/// trimmed, upper-cased, with an AX.25 `-N` SSID suffix (`N` digits) removed when
+/// `strip` is `ssid`; `None` for a non-string or a value left blank.
+pub fn identity_value(identity: &Identity, v: &serde_json::Value) -> Option<String> {
+    let mut s = v.as_str()?.trim();
+    if identity.strip.as_deref() == Some("ssid")
+        && let Some((call, n)) = s.rsplit_once('-')
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit())
+    {
+        s = call.trim_end();
+    }
+    (!s.is_empty()).then(|| s.to_ascii_uppercase())
+}
+
+/// [`confirm`] `value` (from the event field `field`) in `a`, then re-sort `a` so the
+/// confirmed origin, score 1, leads. The republished `summary`,
+/// `confirmed <value>: <licensee>, <site>` (the parts the row has; its service when it
+/// has neither), or `None`, changing nothing, when no origin's callsign is `value`.
+pub fn confirm_identity(a: &mut OriginAnswer, field: &str, value: &str) -> Option<String> {
+    let i = confirm(a, field, value)?;
+    let al = &a.origins[i].allocation;
+    let name: Vec<&str> = [al.licensee.as_deref(), al.site.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let name = match name.is_empty() {
+        true => al.service.clone(),
+        false => name.join(", "),
+    };
+    a.origins.sort_by(origin_order);
+    Some(format!("confirmed {value}: {name}"))
 }
 
 /// Job kinds with no band to look up: the refusal names the kind.
@@ -733,12 +772,50 @@ impl Inner {
         source: &SourceId,
         a: &OriginAnswer,
     ) -> Result<(), NodeError> {
+        self.keep_origin_as(id, source, a, summary(a))
+    }
+
+    /// [`Inner::keep_origin`] with the event's `summary` given.
+    fn keep_origin_as(
+        &self,
+        id: &JobId,
+        source: &SourceId,
+        a: &OriginAnswer,
+        summary: String,
+    ) -> Result<(), NodeError> {
         self.context_merge(id, serde_json::json!({ "origins": a }))?;
-        self.publish_origin(id, source, a);
+        self.publish_origin(id, source, a, summary);
         Ok(())
     }
 
-    fn publish_origin(&self, id: &JobId, source: &SourceId, a: &OriginAnswer) {
+    /// A decoded identity `value` (from the event field `field`) seen by job `id`
+    /// (design 4.6): when the job's context holds `origins` and one of them has the
+    /// callsign `value`, it is confirmed ([`confirm_identity`]), kept and republished
+    /// with `summary` `confirmed <value>: <licensee>, <site>`; true then. False,
+    /// changing nothing, for no `origins` or no match (confirm-only).
+    pub(super) fn confirm_origin(
+        &self,
+        id: &JobId,
+        source: &SourceId,
+        field: &str,
+        value: &str,
+    ) -> bool {
+        let kept = self
+            .jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|e| e.record.context.get("origins").cloned());
+        let Some(mut a) = kept.and_then(|v| serde_json::from_value::<OriginAnswer>(v).ok()) else {
+            return false;
+        };
+        let Some(summary) = confirm_identity(&mut a, field, value) else {
+            return false;
+        };
+        self.keep_origin_as(id, source, &a, summary).is_ok()
+    }
+
+    fn publish_origin(&self, id: &JobId, source: &SourceId, a: &OriginAnswer, summary: String) {
         let payload = serde_json::json!({
             "protocol": "origin",
             "job": id.0,
@@ -753,7 +830,7 @@ impl Inner {
             "receivers": a.receivers,
             "plans": a.plans,
             "reach": a.reach,
-            "summary": summary(a),
+            "summary": summary,
             "t_ns": a.t_ns.0,
         });
         let prov = Provenance {
@@ -1195,6 +1272,71 @@ mod tests {
             "register gave no rows"
         );
         assert_eq!(summary(&empty_answer(vec![], None)), "no register provider");
+    }
+
+    #[test]
+    fn identity_value_is_stripped_and_compared_case_insensitively() {
+        let ssid = Identity {
+            field: "src".into(),
+            register: "callsign".into(),
+            strip: Some("ssid".into()),
+        };
+        let plain = Identity {
+            strip: None,
+            ..ssid.clone()
+        };
+        let v = |s: &str| serde_json::Value::from(s);
+        assert_eq!(
+            identity_value(&ssid, &v("xx4ex-7")).as_deref(),
+            Some("XX4EX")
+        );
+        assert_eq!(
+            identity_value(&ssid, &v(" XX4EX-15 ")).as_deref(),
+            Some("XX4EX")
+        );
+        assert_eq!(identity_value(&ssid, &v("XX4EX")).as_deref(), Some("XX4EX"));
+        // Only a numeric `-N` is an SSID.
+        assert_eq!(
+            identity_value(&ssid, &v("XX4EX-A")).as_deref(),
+            Some("XX4EX-A")
+        );
+        assert_eq!(
+            identity_value(&plain, &v("XX4EX-7")).as_deref(),
+            Some("XX4EX-7")
+        );
+        assert_eq!(identity_value(&ssid, &v("  ")), None);
+        assert_eq!(identity_value(&ssid, &v("-7")), None);
+        assert_eq!(identity_value(&ssid, &serde_json::Value::Null), None);
+        assert_eq!(identity_value(&ssid, &serde_json::json!(7)), None);
+    }
+
+    #[test]
+    fn a_confirmed_origin_goes_first_and_names_itself() {
+        let band = q(&["fm"], CENTER, 12_500);
+        let mut best = tx(Some("12K5F3E"), None, CENTER, Some(5.0));
+        best.licensee = Some("Example Broadcasting".into());
+        best.site = Some("Example Ridge".into());
+        best.licence_no = Some("0000002".into());
+        let mut marked = tx(Some("16K0F1D"), None, CENTER, Some(17.0));
+        marked.callsign = Some("XX4EX".into());
+        let origins = [best, marked]
+            .iter()
+            .map(|r| score_row(r, &band, None, None).unwrap())
+            .collect();
+        let mut a = empty_answer(origins, Some(2));
+        assert_eq!(confirm_identity(&mut a, "src", "XX4ZZ"), None);
+        assert!(a.origins.iter().all(|o| o.confirmed.is_none()));
+        let s = confirm_identity(&mut a, "src", "XX4EX").unwrap();
+        assert_eq!(s, "confirmed XX4EX: Example Water Authority, Example Hill");
+        assert_eq!(a.origins[0].allocation.callsign.as_deref(), Some("XX4EX"));
+        assert_eq!(a.origins[0].score, 1.0);
+        assert_eq!(
+            a.origins[0].confirmed,
+            Some(Confirmed {
+                field: "src".into(),
+                value: "XX4EX".into()
+            })
+        );
     }
 
     struct TestPort {

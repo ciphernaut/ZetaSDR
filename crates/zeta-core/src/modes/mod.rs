@@ -21,10 +21,10 @@ use crate::stage::StageRegistry;
 
 pub use row::{
     AltUnit, Band, Container, Decoder, DecoderKind, Demod, ENVELOPE_FIELDS, Event, Family,
-    FieldPath, Identify, InputStream, InputVia, Install, ModeId, ModeRow, OutputVia, Parser,
-    PositionMap, ProgramBlock, ProgramInput, ProgramOutput, Proof, QUICK_ATTEMPTS, RowError,
-    RowTest, SampleFormat, Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec,
-    center_khz_text, is_mode_id, parse, validate,
+    FieldPath, IDENTITY_REGISTERS, IDENTITY_STRIPS, Identify, Identity, InputStream, InputVia,
+    Install, ModeId, ModeRow, OutputVia, Parser, PositionMap, ProgramBlock, ProgramInput,
+    ProgramOutput, Proof, QUICK_ATTEMPTS, RowError, RowTest, SampleFormat, Subject, SubjectColumn,
+    SubjectUnit, SubjectWaterfall, TestSpec, center_khz_text, is_mode_id, parse, validate,
 };
 
 /// Where a loaded row stands: `ready` (parsed, validated and, for a program row, its
