@@ -480,8 +480,26 @@ wire.
 
 ## Plan 28.1 status
 
-Not started. The sweep before (Task 0) and after (Task 8) go here as two tables: rate, delivered,
-overflows per minute, worker CPU, node CPU, fault.
+What was built: the Soapy worker hands IQ to the node through a shared-memory ring (a memfd of `cf32`
+slots of 2 MiB, 64 MiB per source by default, created per spawn and inherited as fd 3), and the pipe
+carries worker protocol 2, control JSON plus 40-byte block descriptors, so control never queues behind
+samples; a worker without a ring falls back to blocks on the pipe, and a protocol-1 child is still
+accepted. `source_list[].worker` shows `transport` and `transport_dropped`. At open the worker probes
+the device's rates from the top (at most 6 rungs, 1.5 s each) and reports the first clean one (no
+overflows, at least 98 % delivered) as `max_bandwidth_hz: {measured: N}`; `max_rate_hz=N` asserts a cap
+with no probe; the cap is cached in `sources/<id>.json` and passed to every respawn. A request wider than
+a measured cap is refused `out_of_range` with `why: insufficient bandwidth: ...`. The hello timeout is
+45 s. The sweep script is `scripts/rate-sweep.sh`.
+
+### Sweep before
+
+| rate | delivered | overflows/min | worker CPU | node CPU | fault |
+|---|---|---|---|---|---|
+
+### Sweep after
+
+| rate | delivered | overflows/min | worker CPU | node CPU | fault |
+|---|---|---|---|---|---|
 
 ## Plan 14 status
 

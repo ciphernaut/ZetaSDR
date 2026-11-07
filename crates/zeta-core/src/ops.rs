@@ -65,7 +65,9 @@ pub enum Op {
     /// process the source runs in (`pid`, `restarts`, `since_ns`; `transport`,
     /// how its blocks reach the node: `path` `shm` or `pipe`, `format`,
     /// `ring_bytes`, `null` while none runs or from an older worker; and
-    /// `transport_dropped`, the blocks it dropped because the node fell behind;
+    /// `transport_dropped`, what it could not hand over: ring pieces (2 MiB) the node
+    /// had not released, or whole blocks its own pump could not take (pipe queue full,
+    /// broadcast lagging);
     /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
     /// before the first block; a `classify` or `iq_read` span older than it fails
     /// `too_old`). Jobs on a faulted source fail with
