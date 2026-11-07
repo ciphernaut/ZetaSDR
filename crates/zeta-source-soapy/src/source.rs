@@ -82,6 +82,9 @@ struct Status {
     restart_times: VecDeque<Instant>,
     /// `(when, samples)` per block over the last [`RATE_WINDOW`].
     window: VecDeque<(Instant, u64)>,
+    /// Samples received since the source opened, never reset (see
+    /// [`SoapySource::samples_delivered`]).
+    delivered: u64,
     /// The overall receive gain as last applied (read at open); `None` for a
     /// device that reports no gain range.
     gain: Option<GainInfo>,
@@ -400,6 +403,13 @@ impl SoapySource {
     /// (the rate probe's own excluded).
     pub fn read_timeouts(&self) -> u64 {
         self.status.lock().unwrap().timeouts
+    }
+
+    /// Samples received since the source opened, the rate probe's own
+    /// included: a counter that is never reset, so the difference of two reads
+    /// is what arrived between them.
+    pub fn samples_delivered(&self) -> u64 {
+        self.status.lock().unwrap().delivered
     }
 
     /// Samples per second actually delivered over the last 10 s (since the
@@ -1031,6 +1041,7 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                     let now = Instant::now();
                     st.last_end = end;
                     st.window.push_back((now, n as u64));
+                    st.delivered += n as u64;
                     while st
                         .window
                         .front()

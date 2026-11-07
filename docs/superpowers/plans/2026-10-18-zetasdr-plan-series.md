@@ -537,8 +537,8 @@ under-caps the B210: 30.72 Msps delivered cleanly on the old pipe once streaming
 settle was too short after a UHD master-clock change. Fixed on the branch: the settle is 1.5 s after every
 tune, a rung rejected for overflows (not for a short delivered rate) gets one more settle and dwell, and
 the hello timeout is 60 s (a cold FPGA load of 2-4 s plus up to 6 rungs of two 3 s attempts, about 40 s).
-The retry re-tunes the same band, which a live stream already holds, so it extends the settle without
-restarting the device. Re-measure on the field host's B210.
+The retry re-issues the tune, which is a no-op on the running stream, so it is a second settle and a
+fresh dwell, and each attempt's delivered rate is judged on the samples of its own dwell. Re-measure on the field host's B210.
 
 A `kill -ABRT` of the B210's worker healed in 4.4 s with `--rate-cap-hz 20480000 --ring-fd 3` on the
 respawn and no second probe.

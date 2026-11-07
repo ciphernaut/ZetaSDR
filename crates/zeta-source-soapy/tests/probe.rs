@@ -133,7 +133,11 @@ async fn a_rung_that_overflows_on_both_attempts_falls_to_the_next_rung() {
         })
     );
     // Two attempts at the top rung, a settle and a dwell each, then the next.
-    assert!(start.elapsed() >= 3 * (TIMING.settle + TIMING.dwell));
+    let took = start.elapsed();
+    let attempt = TIMING.settle + TIMING.dwell;
+    assert!(took >= 3 * attempt, "{took:?}");
+    // Not a third attempt at the top rung.
+    assert!(took < 4 * attempt, "{took:?}");
     assert_eq!(
         rate_calls(&dev, opened),
         ["set_sample_rate(6144000)", "set_sample_rate(3072000)"]
@@ -160,6 +164,25 @@ async fn a_rung_that_overflows_twice_then_streams_clean_on_the_retry_is_accepted
     );
     assert!(start.elapsed() >= 2 * (TIMING.settle + TIMING.dwell));
     assert_eq!(rate_calls(&dev, opened), ["set_sample_rate(6144000)"]);
+}
+
+#[tokio::test]
+async fn a_first_attempt_that_lost_samples_does_not_fail_a_clean_retry() {
+    // Reads 60 to 100 (inside the first dwell) deliver half their samples,
+    // and two overflow: a stumble that costs about 13 % of that dwell. The
+    // retry's own dwell is whole, and is what the rung is judged on (the
+    // source's windowed rate would still carry the stumble).
+    let lost: Vec<u64> = (60..=100).collect();
+    let dev = Arc::new(ladder().short_reads_at(6.144e6, &lost, 0.5, &IN_DWELL));
+    let src = source(&dev);
+    assert_eq!(
+        probe_rate(&src, CENTER).await,
+        Ok(ProbeResult {
+            cap_hz: 6_144_000,
+            tried: 1,
+            clean: true,
+        })
+    );
 }
 
 #[tokio::test]

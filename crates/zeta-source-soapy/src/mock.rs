@@ -150,6 +150,7 @@ impl MockDevice {
             delivered,
             overflow_every,
             overflow_reads: Vec::new(),
+            short_reads: Vec::new(),
         });
         self
     }
@@ -168,6 +169,31 @@ impl MockDevice {
             delivered: 1.0,
             overflow_every: 0,
             overflow_reads: reads.to_vec(),
+            short_reads: Vec::new(),
+        });
+        self
+    }
+
+    /// With paced reads, while the rate set is `rate_hz`: the reads numbered
+    /// in `reads` (as for [`MockDevice::overflow_reads_at`]) return only
+    /// `delivered` of their samples and the rest deliver in full, so a test
+    /// places a stretch of lost samples in time. The reads in `overflows`
+    /// overflow as for [`MockDevice::overflow_reads_at`], so a stumble can
+    /// both drop samples and overflow.
+    pub fn short_reads_at(
+        mut self,
+        rate_hz: f64,
+        reads: &[u64],
+        delivered: f64,
+        overflows: &[u64],
+    ) -> Self {
+        let paces = self.paced.get_or_insert_with(Arc::default);
+        Arc::make_mut(paces).push(Pace {
+            rate_hz,
+            delivered,
+            overflow_every: 0,
+            overflow_reads: overflows.to_vec(),
+            short_reads: reads.to_vec(),
         });
         self
     }
@@ -439,6 +465,8 @@ struct Pace {
     delivered: f64,
     overflow_every: u32,
     overflow_reads: Vec<u64>,
+    /// When not empty, `delivered` applies to these reads only.
+    short_reads: Vec<u64>,
 }
 
 /// A stream's pacing: the device's rate, the per-rate behaviour, and
@@ -475,6 +503,9 @@ impl Paced {
         if every > 0 && clock.3.is_multiple_of(u64::from(every)) {
             return Some(Err(ReadError::Overflow));
         }
+        let short =
+            pace.is_some_and(|p| p.short_reads.is_empty() || p.short_reads.contains(&clock.3));
+        let delivered = if short { delivered } else { 1.0 };
         Some(Ok((len as f64 * delivered).round() as usize))
     }
 }

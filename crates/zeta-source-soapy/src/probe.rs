@@ -7,7 +7,9 @@
 //! [`PROBE_SETTLE`], then dwells [`PROBE_DWELL`], and the first rate that
 //! delivers at least [`PROBE_MIN_DELIVERED`] of itself with at most
 //! [`PROBE_MAX_OVERFLOWS`] overflow in the dwell is clean; a rung rejected for
-//! overflows is tried [`PROBE_RETRIES`] more time after a fresh retune. Only a clean rate is
+//! overflows is tried [`PROBE_RETRIES`] more time: the retry re-issues the tune, which is a no-op on the running
+//! stream, so it is a second settle and a fresh dwell, and every attempt's
+//! delivered rate is judged on the samples of its own dwell. Only a clean rate is
 //! reported as the source's `max_bandwidth_hz`, `Measured`: the worker keeps
 //! the driver's asserted cap when none is (see [`ProbeResult::clean`]).
 
@@ -39,8 +41,9 @@ pub const PROBE_MAX_OVERFLOWS: u64 = 1;
 /// already holds it, so the device is not restarted), waits [`PROBE_SETTLE`]
 /// again and dwells again, and is judged as the first attempt was; a device
 /// that stumbles for a second or two after a rate change has then had that
-/// long to settle. A rung that is short of [`PROBE_MIN_DELIVERED`], fails to
-/// tune or loses the device is not retried.
+/// long to settle. A rung that is only short of [`PROBE_MIN_DELIVERED`] (no
+/// overflow beyond the allowance), fails to tune or loses the device is not
+/// retried.
 pub const PROBE_RETRIES: u32 = 1;
 /// The fraction of a candidate's rate that must arrive for it to pass: a host
 /// that falls behind delivers short without always overflowing.
@@ -107,7 +110,8 @@ pub async fn probe_rate_cap(src: &SoapySource, center_hz: u64) -> Result<u64, St
 /// [`PROBE_DWELL`], and take the first rate that delivered at least
 /// [`PROBE_MIN_DELIVERED`] of itself with at most [`PROBE_MAX_OVERFLOWS`] new
 /// overflow in the dwell (a rung that overflowed gets [`PROBE_RETRIES`] more
-/// attempts, each a retune, settle and dwell). None passing is the slowest rate that
+/// attempts: the tune is re-issued, a no-op on the running stream, then a
+/// settle and a dwell). None passing is the slowest rate that
 /// streamed, not clean; a candidate whose tune fails is skipped. Every tune
 /// failing is an error, and so is a device the source gives up as lost during
 /// the probe: no cap comes out of a rate that killed the device. The stream is
@@ -163,21 +167,29 @@ async fn probe(
                 return Err(e);
             }
             let before = src.overflows();
+            let samples_before = src.samples_delivered();
             tokio::time::sleep(timing.dwell).await;
             if let Some(e) = lost(src, rate) {
                 return Err(e);
             }
             let overflows = src.overflows() - before;
-            let measured = src.measured_rate_hz().unwrap_or(0.0);
-            if measured < PROBE_MIN_DELIVERED * rate as f64 {
-                break;
-            }
-            if overflows <= PROBE_MAX_OVERFLOWS {
+            // The samples of this dwell alone: the source's windowed rate
+            // would carry the settle, and a first attempt's stumble.
+            let received = src.samples_delivered() - samples_before;
+            let due = rate as f64 * timing.dwell.as_secs_f64();
+            let short = (received as f64) < PROBE_MIN_DELIVERED * due;
+            let overflowed = overflows > PROBE_MAX_OVERFLOWS;
+            if !short && !overflowed {
                 return Ok(ProbeResult {
                     cap_hz: rate,
                     tried,
                     clean: true,
                 });
+            }
+            // Short with no overflow beyond the allowance is a host that
+            // cannot keep up, not a stumble: no retry.
+            if !overflowed {
+                break;
             }
         }
     }
