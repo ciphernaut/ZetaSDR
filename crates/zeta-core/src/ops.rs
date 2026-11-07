@@ -17,8 +17,8 @@ use crate::job::{JobRecord, JobState};
 use crate::knowledge::{Allocation, DEFAULT_REGION, Signature, nearest_allocations};
 use crate::lease::LeaseError;
 use crate::modes::{
-    Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow, ModeState,
-    Subject, is_mode_id, template,
+    Access, Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow,
+    ModeState, Subject, is_mode_id, template,
 };
 use crate::node::{AfterGate, Node, NodeError};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
@@ -2176,9 +2176,9 @@ pub struct ModeInfo {
     pub subject: Option<Subject>,
     /// `'restricted'` on a row whose events carry content a later access control may
     /// gate (pager text); `null` otherwise.
-    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[schemars(required, schema_with = "crate::types::nullable::<Access>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
-    pub access: Option<String>,
+    pub access: Option<Access>,
     /// The stream kinds a job of the row emits (`event`, `audio`, ...); a row whose
     /// `outputs` lists `audio` can be played and transcribed. Empty for a broken row.
     pub outputs: Vec<StreamKind>,
@@ -2199,7 +2199,7 @@ impl From<&LoadedMode> for ModeInfo {
             program: m.program.as_ref().map(|p| p.display().to_string()),
             checked: m.checked,
             subject: m.row.subject.clone(),
-            access: m.row.access.clone(),
+            access: m.row.access,
             outputs: m.outputs.clone(),
         }
     }

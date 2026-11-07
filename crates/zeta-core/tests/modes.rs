@@ -5,8 +5,8 @@ use std::path::Path;
 
 use zeta_core::graph::NodeId;
 use zeta_core::modes::{
-    Container, Decoder, Family, Identity, InputStream, ModeRegistry, ModeState, SubjectWaterfall,
-    parse, template, validate,
+    Access, Container, Decoder, Family, Identity, InputStream, ModeRegistry, ModeState,
+    SubjectWaterfall, parse, template, validate,
 };
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpError, OpResult};
@@ -485,10 +485,27 @@ fn only_the_pager_rows_are_restricted() {
     let restricted: Vec<&str> = reg
         .all()
         .iter()
-        .filter(|m| m.row.access.as_deref() == Some("restricted"))
+        .filter(|m| m.row.access == Some(Access::Restricted))
         .map(|m| m.row.id.0.as_str())
         .collect();
     assert_eq!(restricted, ["pocsag_decode"]);
+}
+
+#[test]
+fn a_row_with_a_bad_access_word_is_broken() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&renamed_pocsag("Secret pagers")).unwrap();
+    v["id"] = "secret_pagers".into();
+    v["access"] = "secret".into();
+    std::fs::write(dir.path().join("secret_pagers.json"), v.to_string()).unwrap();
+    let reg = ModeRegistry::load(&stages(), Some(dir.path()));
+    let m = reg.get("secret_pagers").expect("listed");
+    assert_eq!(m.state, ModeState::Broken);
+    assert!(
+        m.reason.as_deref().unwrap().starts_with("access:"),
+        "{:?}",
+        m.reason
+    );
 }
 
 #[tokio::test]

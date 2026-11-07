@@ -84,11 +84,29 @@ pub struct ModeRow {
     /// page tabulates and folds them; `null` keeps one ribbon per event.
     #[serde(default)]
     pub subject: Option<Subject>,
-    /// `null` (the default) or `'restricted'`: the row's events carry content a deployment
-    /// may want to show to fewer people than the spectrum (pager text); `'restricted'`
-    /// adds `access: 'restricted'` to each event.
+    /// `restricted` marks a row whose events carry content a deployment may show to fewer
+    /// people than the spectrum (pager text); copied onto every event as `access`; `null`
+    /// for the rest. Nothing gates on it yet.
     #[serde(default)]
-    pub access: Option<String>,
+    pub access: Option<Access>,
+}
+
+/// How widely a row's events may be shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    // No variant doc: it would turn the schema into a `oneOf` with no top-level `type`,
+    // which `types::nullable` needs (ModeInfo.access is a nullable `Access`).
+    Restricted,
+}
+
+impl Access {
+    /// The word as the row file and the events spell it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Access::Restricted => "restricted",
+        }
+    }
 }
 
 /// What a mode's events are about: the event field naming it, the table columns the
@@ -729,10 +747,16 @@ pub fn parse(text: &str) -> Result<ModeRow, RowError> {
 }
 
 /// The field whose value is not one of its allowed words (`subject.waterfall`,
-/// `subject.columns[<i>].unit`, `position.alt_unit`), read from the row's JSON.
+/// `subject.columns[<i>].unit`, `position.alt_unit`, `access`), read from the row's JSON.
 fn bad_word_field(text: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let word = |x: &serde_json::Value, ok: &[&str]| x.as_str().is_none_or(|w| !ok.contains(&w));
+    if let Some(a) = v.get("access")
+        && !a.is_null()
+        && word(a, &[Access::Restricted.word()])
+    {
+        return Some("access".into());
+    }
     if let Some(a) = v.pointer("/position/alt_unit")
         && word(a, &["m", "ft"])
     {

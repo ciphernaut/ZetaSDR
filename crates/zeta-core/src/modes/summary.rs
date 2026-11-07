@@ -9,9 +9,6 @@ use super::{AltUnit, ModeRow};
 /// Metres in a foot.
 const FT_M: f64 = 0.3048;
 
-/// The `access` value that marks a row's events as restricted content.
-const ACCESS_RESTRICTED: &str = "restricted";
-
 /// What a template drops with an absent optional field: the separator run just before it.
 fn is_separator(c: char) -> bool {
     c.is_whitespace() || matches!(c, '·' | ':' | '>' | ',')
@@ -147,8 +144,8 @@ pub fn envelope(row: &ModeRow, start_ns: u64, mut fields: Value) -> Value {
         if let Some(p) = position {
             m.insert("position".into(), p);
         }
-        if row.access.as_deref() == Some(ACCESS_RESTRICTED) {
-            m.insert("access".into(), ACCESS_RESTRICTED.into());
+        if let Some(a) = row.access {
+            m.insert("access".into(), a.word().into());
         }
     }
     fields
