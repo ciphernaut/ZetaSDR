@@ -3329,10 +3329,10 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
         Op::CaptureClassify { capture } => capture_classify(node, &capture).await,
         Op::CaptureDelete { capture } => {
             capture_record(node, &capture)?;
-            node.bursts()
-                .delete(&capture)
-                .map(|_| OpResult::Ok)
-                .map_err(other)
+            node.bursts().delete(&capture).map_err(other)?;
+            // A session whose last capture this was goes with it.
+            node.sweep_sessions();
+            Ok(OpResult::Ok)
         }
         Op::SignatureList { state } => Ok(OpResult::Signatures(node.signatures().list(state))),
         Op::SignatureShow { id } => node

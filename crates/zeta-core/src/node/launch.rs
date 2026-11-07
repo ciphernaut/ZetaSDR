@@ -241,6 +241,9 @@ impl Inner {
         let graph = rec.graph.clone();
         // A `transcribe` job's record for its transcript tees (see `tee_transcripts`).
         let tee = (rec.kind == JobKind::Transcribe.name()).then(|| rec.clone());
+        // A `bits`, `graph` or frame row's job's record for its proposal watch (see
+        // `super::propose::watch_for_proposals`).
+        let proposer = super::propose::proposes(self, &rec).then(|| rec.clone());
         // A `watch`'s controller runs beside its stages (see `super::watch`).
         let watch =
             (rec.kind == JobKind::Watch.name()).then(|| (watch::Seed::of(&rec), rec.tuning));
@@ -290,6 +293,8 @@ impl Inner {
         for (n, stage) in graph.nodes.iter().zip(stages) {
             let mut inputs = Vec::new();
             let mut leaving = Vec::new();
+            // This node's job outputs: its edges into a sink, then its own streams.
+            let first_output = job_outputs.len();
             for (e, sid) in graph.edges.iter().zip(&edge_streams) {
                 if e.to == n.id {
                     inputs.push(self.bus.subscribe(sid).expect("registered"));
@@ -318,6 +323,14 @@ impl Inner {
             // Subscribed before the stage runs, so its first event is not missed.
             if let Some(rec) = &tee {
                 self.tee_transcripts(rec, &job_outputs[before..], &token);
+            }
+            if let Some(rec) = &proposer {
+                super::propose::watch_for_proposals(
+                    self,
+                    rec,
+                    &job_outputs[first_output..],
+                    &token,
+                );
             }
             let ids: Vec<StreamId> = outputs.into_iter().map(|(_, s)| s).collect();
             let own = ids.clone();
@@ -1137,6 +1150,16 @@ pub(super) async fn supervise(
             .filter(|r| r.kind == JobKind::Capture.name());
         if let Some(rec) = capture {
             super::capture::capture_finished(&inner, &rec, failure.as_deref(), stage_ended).await;
+        }
+        // The exploration job's session record, its context as the end left it.
+        let ending = inner
+            .jobs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|e| e.record.clone());
+        if let Some(rec) = ending {
+            super::propose::record_session(&inner, &rec);
         }
         let end = match failure {
             Some(reason) => JobState::Failed { reason },

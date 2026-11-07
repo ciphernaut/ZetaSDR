@@ -7,6 +7,7 @@ mod jsonlog;
 mod launch;
 pub use launch::DRAIN_TIMEOUT_MS;
 mod persist;
+mod propose;
 mod recover;
 mod retune;
 mod sources;
@@ -286,6 +287,11 @@ struct Inner {
     bursts: Arc<crate::bursts::BurstStore>,
     /// The learned signatures, opened at `open`.
     signatures: Arc<crate::signatures::SignatureStore>,
+    /// The exploration jobs' session records (see [`propose::record_session`]),
+    /// swept at `open`, after a `capture_delete` and after every `capture` job's end.
+    sessions: crate::sessions::SessionStore,
+    /// Held across a job's proposal (see [`propose`]), so one job never proposes twice.
+    proposing: Mutex<()>,
     leases: LeaseManager,
     bus: Arc<StreamBus>,
     ports: RwLock<HashMap<SourceId, Arc<dyn Port>>>,
@@ -571,6 +577,13 @@ impl Inner {
         }
     }
 
+    /// Remove the session records none of whose captures is left in the burst store
+    /// (see [`crate::sessions::SessionStore::sweep`]).
+    fn sweep_sessions(&self) {
+        let live = self.bursts.list().into_iter().map(|r| r.id).collect();
+        self.sessions.sweep(&live);
+    }
+
     /// See [`Node::job_context_merge`].
     fn context_merge(&self, id: &JobId, patch: serde_json::Value) -> Result<(), NodeError> {
         let mut jobs = self.jobs.lock().unwrap();
@@ -816,6 +829,8 @@ impl Node {
         }
         let signatures = crate::signatures::SignatureStore::open(&cfg.state_dir).map_err(io)?;
         load_errors.extend(signatures.load_errors().iter().cloned());
+        let sessions = crate::sessions::SessionStore::open(&cfg.state_dir).map_err(io)?;
+        sessions.sweep(&bursts.list().into_iter().map(|r| r.id).collect());
         let modes = modes
             .unwrap_or_else(|| Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref())));
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
@@ -845,6 +860,8 @@ impl Node {
                 themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
                 bursts,
                 signatures,
+                sessions,
+                proposing: Mutex::new(()),
                 leases: LeaseManager::new(),
                 bus,
                 ports: RwLock::new(HashMap::new()),
@@ -1070,6 +1087,16 @@ impl Node {
     /// The learned signatures (`state_dir/signatures`).
     pub fn signatures(&self) -> Arc<crate::signatures::SignatureStore> {
         self.inner.signatures.clone()
+    }
+
+    /// The exploration jobs' session records (`state_dir/sessions`), oldest first.
+    pub fn sessions(&self) -> Vec<crate::sessions::Session> {
+        self.inner.sessions.list()
+    }
+
+    /// Remove the session records none of whose captures is left in the burst store.
+    pub(crate) fn sweep_sessions(&self) {
+        self.inner.sweep_sessions();
     }
 
     /// An `unknown` error naming `id` and the store's signature ids.

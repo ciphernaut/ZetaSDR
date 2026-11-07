@@ -1766,6 +1766,49 @@ async fn on_unknown_capture_captures_once_per_signal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_capture_child_proposes_once() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(1_000, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let node = fsk_node(dir.path()).await;
+    let params = serde_json::json!({"on_unknown": "capture", "capture": {"bursts": 2}});
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    until("a captured event", Duration::from_secs(60), || {
+        !events.watch("captured").is_empty()
+    })
+    .await;
+    let child = JobId(
+        events.watch("capturing")[0]["job"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
+    until("one proposal", Duration::from_secs(10), || {
+        node.signatures().list(None).len() == 1
+    })
+    .await;
+    let sig = node.signatures().list(None).remove(0);
+    assert_eq!(sig.provenance.jobs, [child, watch.clone()], "{sig:?}");
+    assert_eq!(sig.provenance.proposed_by, "node", "{sig:?}");
+    let captures = events.watch("captured")[0]["captures"].clone();
+    assert_eq!(
+        serde_json::json!(sig.provenance.captures),
+        captures,
+        "{sig:?}"
+    );
+    // The signal's retries identify again; they propose nothing more.
+    until("a second unknown", Duration::from_secs(60), || {
+        events.watch("unknown").len() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(node.signatures().list(None).len(), 1);
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bad_capture_block_is_refused_naming_the_field() {
     let _one = SERIAL.lock().await;
     zeta_core::node::watch::test_timing(0, 0);
