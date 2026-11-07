@@ -471,12 +471,33 @@ session before the plan, as before.
 |---|---|---|---|
 | 28.1 | The source transport, made rate-proof | A worker child hands IQ to the node through a shared-memory ring (worker protocol 2: descriptors on the pipe, `cf32` slots, drops counted), each Soapy source probes its rate ladder at open and reports a `measured` cap the lease applies (`insufficient bandwidth` names it), the B210 sweep before and after. Spec `docs/superpowers/specs/2026-11-06-video-decode-design.md` sections 3, 5.6, 5.7; plan `docs/superpowers/plans/2026-11-06-source-transport.md`. | 20 |
 | 28.2 | Analog video, decoded and watched live | `video_decode` (wide FM, composite sync and line lock, luma `gray8` fields; the 6.5 MHz audio subcarrier if it falls out), the websocket's video body with `smooth`, `sharp` and `thumb` profiles, the thumbnail riding the band and the full view with feeds switchable, `zeta stream save`, fixtures of the operator's four transmitters from the B210. Spec as above (the rest of it); plan to be written once 28.1's sweep fixes the default rung. UAT deferred: the operator sets up each transmitter. | 28.1 |
+| 30 | Aircraft data links | `vdl2_decode` and `hfdl_decode` program rows over a field map on a row's `output` (`decoder.output.fields`, `$center_khz`, `subject.merge`), a per-source position (`--source-position`, the Kiwi's `/status`), one merged aircraft table on the page, the fixture lookup for `modes check`. Built on `worktree-agent-a1ff3bab5d4d2658f`, commits 4e34d62..4d16a91 (plus the docs); see Plan 30 status. Spec `docs/superpowers/specs/2026-11-06-aircraft-links-design.md`; plan `docs/superpowers/plans/2026-11-06-aircraft-links.md`. | 16, 28.2 |
 
 Queued behind them, specs first, in the operator's order of interest: colour (chroma), recording
 (stills and clips into the capture store), discovery (a video carrier found by the watch), the
 host-capabilities baseline (`TODO.md` "Node: a baseline of the host's capabilities"), VTX channel
 tables from the open VTX firmware (`TODO.md` "Plans: VTX channel tables"), `sc16` on the worker
 wire.
+
+## Plan 30 status
+
+Built on `worktree-agent-a1ff3bab5d4d2658f` (commits 4e34d62..4d16a91, then the docs commit), not yet on `main`.
+
+What shipped:
+
+- Row schema (4e34d62, d852f58): `decoder.output.fields` (`FieldPath`: one pointer, a list where the first non-null wins, or `{"pointers": [...], "trim": "<chars>"}`), the `$center_khz` placeholder, `subject.merge` and `ENVELOPE_FIELDS`, with the rules in `validate`; the adaptor applies the map in `Publisher::publish` before `envelope`. Test vectors under `crates/zeta-ext/tests/data/dump{vdl2,hfdl}-*.json` are synthetic, built to the upstream formatters' shapes.
+- Fixture lookup (ae6c93b): `modes check` resolves relative fixture paths under `ZETA_FIXTURES_DIR` or `modes/` and reports `skipped: fixture <path> not found (...)`; `modes/fixtures/.gitkeep` and a `.gitignore` un-ignore rule.
+- Rows (af05ea1, 335c720): `vdl2_decode` and `hfdl_decode` (10 embedded rows), pointers confirmed against the upstream source (dumpvdl2 2.6.0, dumphfdl 1.7.0, libacars). Both are checked end to end through `fake_lines` in `crates/zeta/tests/modes_check.rs`; their fixture checks are skipped until recorded.
+- Source position (2bec799) and the Kiwi's status read (4546e32): `SourcePosition {lat, lon, alt_m, from}`, `Port::position`, `SourceInfo.position`, `--source-position ID=LAT,LON[,ALT_M]`; one bounded HTTP/1.0 GET of the receiver's `/status` per connection. Live confirmation skipped (no Kiwi reachable from the build shell); the status keys `gps`, `asl`, `gps_good`, `name` are assumed.
+- Merged table (d3ea271): `section.subject-merged[data-name]` over rows declaring `subject.merge`; `acars_decode` merges on `reg`; e2e `scenario_subjects_merge_across_rows`.
+- Guide (4d16a91): the field craft covers VDL2 beside ACARS, HFDL on a Kiwi, the merged table and a source's position.
+- Fixtures: none recorded. Task 8 (the HFDL fixture) was skipped because `ZETA_KIWI_HOST` was unset in the build shell, and the VDL2 fixture is the operator's (decision 6).
+
+What the gate proves (run by the controller after the final review): the row and adaptor tests, the fake-program checks, the e2e scenario (the UI suite was 164/164 at d3ea271) and the Kiwi status tests.
+
+Calls made on the spec's silence: `FieldPath` is an untagged `String | Vec<String>` and the map an `Option<BTreeMap<String, FieldPath>>`; the every-property-mapped rule exempts `ENVELOPE_FIELDS`; `apply_fields` runs for every parser and leaves a flat object unchanged; the fixture lookup is decided in `check_row` before a node opens; the two rows ship placeholder `test.path`s and empty `expect`s; the source position is a `Port` accessor plus a generic repeatable flag, not an op; the status read is one fresh-socket GET per connection, never a fault, and the status wins over the flag; the merged table is a view in `SubjectsPane` joined by union-find on the merge fields (`adsb_decode` is not given `merge`); Task 8 is conditional on `ZETA_KIWI_HOST`; the VDL2 fixture is not recorded here and the ADS-C pointers are confirmed from source now, on the fixture later.
+
+Waits for the operator: `UAT.md` "Plan 30" (the VDL2 fixture, a live VDL2 run, the operator's own Kiwi, the HFDL fixture). Deferred minors are in `TODO.md`.
 
 ## Plan 28.1 status
 

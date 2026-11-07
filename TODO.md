@@ -85,9 +85,23 @@ Found in the whole-branch review of plan 27 (2026-11-05); none blocks the feed, 
 - Out-of-order job polls: agent.js `refresh` has no in-flight guard, so an older `job_list` landing after a newer one makes `ov.sync` forget a just-started job (its counter and gate reset). The feed's poll requests make it slightly more likely.
 - A failed `job_context` seed read is marked gateless and not asked again until a lag, a reconnect or a graph change, so a transient error leaves that row without a dot. Retry errors on the next sync instead.
 - Test nits: no test that `unregister` clears the feed table and the unfed set; a bare `panic!()` in ops_stream's `a_port_added_after_open_has_a_feed`; attach.rs's feed drain stops on `Lagged`; no websocket test of `lagged` on a feed socket; `node_source_frames_are_not_fed` uses a fake mix provenance rather than a real mix job.
-## Modes: VDL Mode 2 beside ACARS, and an airband capture plan
+## Aircraft data links: done in plan 30
 
-From the operator, 2026-11-05, after starting the seven ACARS decoders on the B210. Decode VDL2 concurrently with ACARS from one capture: 130.025-136.975 MHz fits an 8 MHz capture centred near 133.5 MHz, well inside the B210's 61.44 MHz. The register (`knowledge_lookup`) has SITA assignments on 136.975 MHz at Brisbane Airport, the worldwide VDL2 common channel; the catalogue knows VDL-M2 (D8PSK, about 25 kHz) with `decoder` null. `dumpvdl2` is installed on the field host (`/usr/bin/dumpvdl2`) and the program-row machinery already fits it: `--iq-file - --sample-format S16LE --oversample N --centerfreq $center_hz $center_hz` with `input: {stream: iq, format: cs16, rate_hz: 105000*N, via: stdin}` and `--output decoded:json:file:path=-` read as `json_lines` from stdout. The gap: `json_lines` takes the line's top-level object as the event, and dumpvdl2 nests everything under `vdl2.avlc...` (the ACARS payload under `vdl2.avlc.acars`), so `summary`, `subject` and `position` cannot name its fields. Wanted: a field map on a row's `output` (event field <- JSON pointer), or flattening to dotted names, then a `vdl2_decode` row with `subject` keyed on the aircraft address (one table with ACARS keyed on `reg` would be nicer still). Also from the operator: on a really wide receiver take ADS-B and the UHF signals too. One B210 LO cannot hold 130 MHz and 1090 MHz at once (its two RX channels share the LO), so ADS-B goes on the HackRF (a scan held it on 2026-11-05) or a second front end; a named "airband" set that starts ACARS + VDL2 on one radio and ADS-B on another, as `plan_start` does for a channel plan, is the generic shape.
+Done in plan 30 (`docs/superpowers/specs/2026-11-06-aircraft-links-design.md`, `docs/superpowers/plans/2026-11-06-aircraft-links.md`); the airband named set (ACARS and VDL2 on one radio, ADS-B on another, started as one `plan_start`) is plan 31's.
+
+## Aircraft links: deferred minors from plan 30
+
+- `adsb_decode` has no `subject.merge` yet (one line adds `["icao"]`).
+- ADS-C over the X.25/ATN half is not mapped.
+- The VDL2 fixture is unrecorded until UAT, and so is the HFDL one (Task 8 was skipped: no Kiwi reachable from the build shell).
+- The ADS-C tag wrapper is confirmed only on the fixture: the slot index varies (the map lists slots 0 and 1) and the altitude unit (feet) is from the ADS-C spec.
+- `--source-position` is per node start, not an op.
+- The merged table's `Via` lists protocols, not job ids.
+- In a merged group keyed by `reg` the ICAO address is shown nowhere (vdl2's `icao` is its key, not a column).
+- The `job_start` note's identify-dwell list omits the new rows.
+- A 200 `/status` page from a Kiwi without a usable `gps=` is neither counted nor diagnosable.
+- The `$center_khz` first-frame wait has no direct test.
+- A string that trims to "" is kept as "".
 
 ## Jobs: an attached job's record keeps its input's old tuning after a retune
 
@@ -304,10 +318,6 @@ Done: plan 21 (`docs/superpowers/plans/2026-11-01-agent-bulk-ops.md`), plus `job
 ## Agent guide: layer-3 and UX additions
 
 Items 1-3 of the first list shipped in plan 19.1 (the register and `as_of`, the low-duty rule, the unknown-signal playbook with its legal line: "Exploring an unknown signal"). Still open: (5, from the operator, 2026-11-01) expand this guidance as each mode and layer-3 component lands, including when not to touch running jobs; (4) lead the operator with the map and the one-line `summary`, name channels and licensees in plain words, and offer the next investigative step (measure, identify, knowledge lookup, direction-find). Plan 19.2 and 19.3 extend the playbook with bits, frames and signature write-back.
-
-## Feature: VDL Mode 2 and HFDL rows (the other aircraft data links)
-
-From the operator, 2026-11-02 ("ACARS and VDL"). Plain VHF ACARS is `acars_decode`; most airline traffic has moved to VDL Mode 2 (136.975 MHz in Australia plus a few channels, D8PSK at 31.5 kbaud, 25 kHz spacing). `dumpvdl2` 2.6.0 and `dumphfdl` are installed on the field host (`libacars` inside both). Wanted: a program row `vdl2_decode` like `adsb_decode` (IQ over stdin at the sample rate the decoder wants, its JSON output through `json_lines`), subject key the AVLC source address (the aircraft's ICAO), the ACARS fields it carries (`reg`, `flight`, `label`, `text`) as columns, no `position` (some message texts carry one; parse later); and `hfdl_decode` the same shape on a KiwiSDR source (HFDL ground stations around 8.9, 10.0 and 11.4 MHz; a 2.4 kHz channel fits the Kiwi's 12 kHz). Neither has a synthesiser: the `modes check` fixture is a minute recorded off the air with `iq read` (VDL2 near Brisbane is busy). One small plan, no node changes.
 
 ## Station: a GPS fix from the B210
 
