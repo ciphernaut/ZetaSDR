@@ -21,15 +21,17 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 8] = [
+const EMBEDDED: [&str; 10] = [
     "acars_decode",
     "adsb_decode",
     "aprs_decode",
     "dfm_decode",
+    "hfdl_decode",
     "m20_decode",
     "pocsag_decode",
     "rds_decode",
     "rs41_decode",
+    "vdl2_decode",
 ];
 
 fn cfg(dir: &Path, modes_dir: &Path) -> NodeConfig {
@@ -61,7 +63,7 @@ fn renamed_pocsag(name: &str) -> String {
 fn embedded_rows_parse_and_validate() {
     let stages = stages();
     let embedded = ModeRegistry::embedded();
-    assert_eq!(embedded.len(), 8);
+    assert_eq!(embedded.len(), EMBEDDED.len());
     for (file, text) in &embedded {
         let row = parse(text).unwrap_or_else(|e| panic!("{file}: {e}"));
         validate(&row, &stages).unwrap_or_else(|e| panic!("{file}: {e}"));
@@ -140,13 +142,16 @@ async fn modes_list_filters_by_family_and_state() {
         other => panic!("expected modes, got {other:?}"),
     };
     let all = list(None, None).await;
-    assert_eq!(all.len(), 9, "{all:?}");
+    assert_eq!(all.len(), EMBEDDED.len() + 1, "{all:?}");
     let aviation: Vec<String> = list(Some(Family::Aviation), None)
         .await
         .into_iter()
         .map(|m| m.id.0)
         .collect();
-    assert_eq!(aviation, ["acars_decode", "adsb_decode"]);
+    assert_eq!(
+        aviation,
+        ["acars_decode", "adsb_decode", "hfdl_decode", "vdl2_decode"]
+    );
     let broken = list(None, Some(ModeState::Broken)).await;
     assert_eq!(broken.len(), 1);
     assert_eq!(broken[0].id.0, "junk_mode");
@@ -430,6 +435,8 @@ fn the_rows_thin_their_tracks_as_planned() {
         ("aprs_decode", 100, 0.0),
         ("acars_decode", 100, 0.0),
         ("rds_decode", 100, 0.0),
+        ("vdl2_decode", 100, 1000.0),
+        ("hfdl_decode", 100, 1000.0),
     ];
     let reg = ModeRegistry::load(&stages(), None);
     for (id, points, min_m) in plan {
@@ -452,7 +459,7 @@ fn the_rows_name_the_planned_subjects() {
     );
     use SubjectWaterfall::{Fold, Summary};
     let sondes: &[&str] = &["alt", "vel_v"];
-    let plan: [Plan; 7] = [
+    let plan: [Plan; 9] = [
         (
             "adsb_decode",
             "icao",
@@ -508,6 +515,24 @@ fn the_rows_name_the_planned_subjects() {
             Some("flight"),
         ),
         ("rds_decode", "pi", "stations", Fold, &[], None, Some("ps")),
+        (
+            "vdl2_decode",
+            "icao",
+            "aircraft",
+            Summary,
+            &["addr_type", "reg", "flight", "label", "text"],
+            None,
+            Some("flight"),
+        ),
+        (
+            "hfdl_decode",
+            "icao",
+            "aircraft",
+            Summary,
+            &["flight", "gs", "pdu", "text"],
+            None,
+            Some("flight"),
+        ),
     ];
     let reg = ModeRegistry::load(&stages(), None);
     for (id, key, name, waterfall, columns, heading, label) in plan {
@@ -534,4 +559,70 @@ fn the_rows_name_the_planned_subjects() {
         .find(|m| m.row.id.0 == "pocsag_decode")
         .unwrap();
     assert_eq!(pocsag.row.subject, None);
+}
+
+/// The aircraft data-link rows as plan 30 pins them: dumpvdl2 at 105 kHz beside ACARS,
+/// dumphfdl at a Kiwi's 12 kHz on the listed (dial) frequency in kHz.
+#[test]
+fn the_aircraft_link_rows_are_pinned() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let row = |id: &str| {
+        let m = reg.get(id).unwrap_or_else(|| panic!("{id} listed"));
+        assert_eq!(m.state, ModeState::Ready, "{id}: {:?}", m.reason);
+        serde_json::to_value(&m.row).unwrap()
+    };
+    let vdl2 = row("vdl2_decode");
+    assert_eq!(vdl2["label"], "VDL2");
+    assert_eq!(vdl2["protocol"], "vdl2");
+    assert_eq!(vdl2["family"], "aviation");
+    assert_eq!(vdl2["band"]["bandwidth_hz"], 25000);
+    assert_eq!(vdl2["band"]["centers_hz"][0], 136_975_000);
+    assert_eq!(vdl2["subject"]["key"], "icao");
+    assert_eq!(vdl2["subject"]["merge"], serde_json::json!(["reg", "icao"]));
+    assert_eq!(vdl2["position"]["alt_unit"], "ft");
+    assert_eq!(vdl2["decoder"]["input"]["rate_hz"], 105_000);
+    assert_eq!(
+        vdl2["decoder"]["install"]["debian"],
+        serde_json::Value::Null
+    );
+    assert_eq!(vdl2["identify"]["dwell_ms"], 15000);
+    assert_eq!(
+        vdl2["decoder"]["output"]["fields"]["reg"],
+        serde_json::json!({"pointers": ["/vdl2/avlc/acars/reg"], "trim": "."})
+    );
+    assert_eq!(
+        vdl2["decoder"]["output"]["fields"]["sig_level"],
+        "/vdl2/sig_level"
+    );
+
+    let hfdl = row("hfdl_decode");
+    assert_eq!(hfdl["label"], "HFDL");
+    assert_eq!(hfdl["protocol"], "hfdl");
+    assert_eq!(hfdl["family"], "aviation");
+    assert_eq!(hfdl["band"]["bandwidth_hz"], 6000);
+    assert_eq!(hfdl["band"]["centers_hz"], serde_json::json!([]));
+    assert_eq!(
+        hfdl["band"]["range_hz"],
+        serde_json::json!([2_800_000, 22_100_000])
+    );
+    assert_eq!(hfdl["decoder"]["input"]["rate_hz"], 12000);
+    assert!(
+        hfdl["decoder"]["args"]
+            .as_array()
+            .unwrap()
+            .contains(&"$center_khz".into()),
+        "{hfdl}"
+    );
+    assert_eq!(
+        hfdl["decoder"]["install"]["debian"],
+        serde_json::Value::Null
+    );
+    assert_eq!(hfdl["identify"]["dwell_ms"], 40000);
+    assert_eq!(hfdl["subject"]["merge"], serde_json::json!(["reg", "icao"]));
+    let fields = &hfdl["decoder"]["output"]["fields"];
+    assert!(fields.get("aircraft_id").is_none(), "{fields}");
+    assert_eq!(
+        fields["gs_id"],
+        serde_json::json!(["/hfdl/spdu/src/id", "/hfdl/lpdu/hfnpdu/gs/id"])
+    );
 }

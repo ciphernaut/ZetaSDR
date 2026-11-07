@@ -1,0 +1,120 @@
+{
+  "id": "vdl2_decode",
+  "name": "VDL Mode 2 aircraft data link",
+  "family": "aviation",
+  "band": {
+    "bandwidth_hz": 25000,
+    "centers_hz": [136975000, 136725000, 136775000, 136825000, 136875000],
+    "min_hz": null,
+    "range_hz": null
+  },
+  "modulation": ["psk"],
+  "label": "VDL2",
+  "protocol": "vdl2",
+  "decoder": {
+    "kind": "program",
+    "programs": ["dumpvdl2"],
+    "args": [
+      "--iq-file", "-", "--sample-format", "S16_LE", "--oversample", "1",
+      "--centerfreq", "$center_hz", "--output", "decoded:json:file:path=-", "$center_hz"
+    ],
+    "input": { "stream": "iq", "format": "cs16", "rate_hz": 105000, "via": "stdin" },
+    "output": {
+      "via": "stdout",
+      "port": null,
+      "parser": "json_lines",
+      "fields": {
+        "icao": "/vdl2/avlc/src/addr",
+        "addr_type": "/vdl2/avlc/src/type",
+        "status": "/vdl2/avlc/src/status",
+        "dst": "/vdl2/avlc/dst/addr",
+        "frame_type": "/vdl2/avlc/frame_type",
+        "reg": { "pointers": ["/vdl2/avlc/acars/reg"], "trim": "." },
+        "flight": "/vdl2/avlc/acars/flight",
+        "label": "/vdl2/avlc/acars/label",
+        "msg_num": "/vdl2/avlc/acars/msg_num",
+        "ack": "/vdl2/avlc/acars/ack",
+        "text": "/vdl2/avlc/acars/msg_text",
+        "crc_ok": "/vdl2/avlc/acars/crc_ok",
+        "lat": [
+          "/vdl2/avlc/acars/arinc622/adsc/tags/0/basic_report/lat",
+          "/vdl2/avlc/acars/arinc622/adsc/tags/1/basic_report/lat",
+          "/vdl2/avlc/acars/arinc622/adsc/tags/0/emerg_basic_report/lat"
+        ],
+        "lon": [
+          "/vdl2/avlc/acars/arinc622/adsc/tags/0/basic_report/lon",
+          "/vdl2/avlc/acars/arinc622/adsc/tags/1/basic_report/lon",
+          "/vdl2/avlc/acars/arinc622/adsc/tags/0/emerg_basic_report/lon"
+        ],
+        "alt_ft": [
+          "/vdl2/avlc/acars/arinc622/adsc/tags/0/basic_report/alt",
+          "/vdl2/avlc/acars/arinc622/adsc/tags/1/basic_report/alt",
+          "/vdl2/avlc/acars/arinc622/adsc/tags/0/emerg_basic_report/alt"
+        ],
+        "sig_level": "/vdl2/sig_level",
+        "noise_level": "/vdl2/noise_level"
+      }
+    },
+    "install": { "debian": null, "url": "https://github.com/szpajder/dumpvdl2" }
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "icao": { "type": "string" },
+        "addr_type": { "type": ["string", "null"] },
+        "status": { "type": ["string", "null"] },
+        "dst": { "type": ["string", "null"] },
+        "frame_type": { "type": ["string", "null"] },
+        "reg": { "type": ["string", "null"] },
+        "flight": { "type": ["string", "null"] },
+        "label": { "type": ["string", "null"] },
+        "msg_num": { "type": ["string", "null"] },
+        "ack": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] },
+        "crc_ok": { "type": ["boolean", "null"] },
+        "lat": { "type": ["number", "null"] },
+        "lon": { "type": ["number", "null"] },
+        "alt_ft": { "type": ["integer", "null"] },
+        "sig_level": { "type": ["number", "null"] },
+        "noise_level": { "type": ["number", "null"] }
+      }
+    },
+    "summary": "{icao} {reg?} {flight?} {label?} {text?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 15000,
+    "min_span_ms": 1000,
+    "quick": null
+  },
+  "catalogue": ["vhf-data-link-mode-2-vdl-m2"],
+  "test": {
+    "kind": "fixture",
+    "path": "fixtures/vdl2-136975k-1.sigmf-meta",
+    "expect": {},
+    "within_ms": 10000
+  },
+  "position": { "lat": "lat", "lon": "lon", "alt_m": "alt_ft", "alt_unit": "ft" },
+  "time": null,
+  "notes": "VDL Mode 2 (D8PSK, 10.5 kbaud) in 25 kHz channels at 136.725-136.975 MHz, decoded by dumpvdl2; every AVLC frame is an event keyed on its source address, and an ADS-C report riding an ACARS downlink carries the aircraft's position. A ground station gets its own row, whose ACARS columns name the aircraft of each uplink. Beside ACARS on one radio the order matters, because a running capture cannot widen: pin the radio at 133 500 000 Hz with 8 000 000 Hz first, then start the ACARS plan, then the VDL2 job (136 975 000 Hz, 25 000 Hz); started the other way round, VDL2 is a conflict naming the ACARS jobs. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).",
+  "subject": {
+    "key": "icao",
+    "name": "aircraft",
+    "waterfall": "summary",
+    "columns": [
+      { "field": "addr_type", "label": "Type", "unit": null },
+      { "field": "reg", "label": "Reg", "unit": null },
+      { "field": "flight", "label": "Flight", "unit": null },
+      { "field": "label", "label": "Label", "unit": null },
+      { "field": "text", "label": "Text", "unit": null }
+    ],
+    "heading": null,
+    "label": "flight",
+    "merge": ["reg", "icao"],
+    "track_points": 100,
+    "track_min_m": 1000
+  }
+}

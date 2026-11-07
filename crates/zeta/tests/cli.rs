@@ -2711,6 +2711,9 @@ const SONDE_HANDLERS: [&str; 3] = [
     "ZETA_HANDLER_M20MOD",
 ];
 
+/// The aircraft data-link rows' programs, each pinned to `path` whatever the host has.
+const AIRCRAFT_LINK_HANDLERS: [&str; 2] = ["ZETA_HANDLER_DUMPVDL2", "ZETA_HANDLER_DUMPHFDL"];
+
 /// `zeta modes list` (one-shot) prints the embedded rows, all ready; `--family`
 /// narrows it and `modes show` prints one row.
 #[test]
@@ -2723,7 +2726,7 @@ fn modes_list_prints_the_embedded_rows() {
     // whatever the host has.
     let mut cmd = zeta(dir.path(), &["--modes-dir", &modes_dir, "modes", "list"]);
     cmd.env("ZETA_HANDLER_DUMP1090", fake_dump1090());
-    for var in SONDE_HANDLERS {
+    for var in SONDE_HANDLERS.iter().chain(&AIRCRAFT_LINK_HANDLERS) {
         cmd.env(var, fake_lines());
     }
     let out = cmd.assert().success().get_output().stdout.clone();
@@ -2738,10 +2741,12 @@ fn modes_list_prints_the_embedded_rows() {
             "adsb_decode",
             "aprs_decode",
             "dfm_decode",
+            "hfdl_decode",
             "m20_decode",
             "pocsag_decode",
             "rds_decode",
-            "rs41_decode"
+            "rs41_decode",
+            "vdl2_decode"
         ]
     );
     assert!(rows.iter().all(|m| m["state"] == "ready"), "{v}");
@@ -2761,7 +2766,7 @@ fn modes_list_prints_the_embedded_rows() {
     .get_output()
     .stdout
     .clone();
-    assert_eq!(json(&out)["value"]["modes"].as_array().unwrap().len(), 2);
+    assert_eq!(json(&out)["value"]["modes"].as_array().unwrap().len(), 4);
     let out = zeta(
         dir.path(),
         &["--modes-dir", &modes_dir, "modes", "show", "rds_decode"],

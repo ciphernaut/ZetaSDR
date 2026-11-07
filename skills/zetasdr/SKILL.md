@@ -132,7 +132,7 @@ Set the source's overall receive gain live (`gain_db` in dB within `source list`
 
 ### job_start
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|dfm_decode|hfdl_decode|m20_decode|rs41_decode|vdl2_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
@@ -151,7 +151,7 @@ CLI: `zeta job start --kind passthrough --source <id> --center-hz 144800000 --ba
 
 Attach a job of an attachable `kind` (`transcribe`) to the running job `job`: it reads that job's audio output stream (the last one in its graph order when it has several; audio passed between two of its stages does not count) instead of the radio, holds no lease, copies the job's `source` and `tuning`, and records it as its `input`. It follows its input through a `job_retune` or a `graph_put` restart: it is relaunched under its own id on the input's new stream once the input runs again (`failed` with the reason when it cannot be). It ends `stopped` when the input job stops or fails for its own reason. On a node restart it resumes after its input, or is `failed` with `input job <id> not running` when the input does not run.
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|dfm_decode|hfdl_decode|m20_decode|rs41_decode|vdl2_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - job: string; an id from `job list`
 - language: string or null
 
@@ -274,7 +274,7 @@ Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or o
 
 - plan: string; an id from `channel_plans`
 - channels: array or null; channel numbers of the plan (integers), `null` for all
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|dfm_decode|m20_decode|rs41_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|dfm_decode|hfdl_decode|m20_decode|rs41_decode|vdl2_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - source: string; an id from `source list`
 - deviation_hz: integer or null
 - sideband: string or null

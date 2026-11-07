@@ -1,0 +1,106 @@
+{
+  "id": "hfdl_decode",
+  "name": "HFDL aircraft data link (HF)",
+  "family": "aviation",
+  "band": {
+    "bandwidth_hz": 6000,
+    "centers_hz": [],
+    "min_hz": null,
+    "range_hz": [2800000, 22100000]
+  },
+  "modulation": ["psk"],
+  "label": "HFDL",
+  "protocol": "hfdl",
+  "decoder": {
+    "kind": "program",
+    "programs": ["dumphfdl"],
+    "args": [
+      "--iq-file", "-", "--sample-format", "CS16", "--sample-rate", "$rate_hz",
+      "--centerfreq", "$center_khz", "--output", "decoded:json:file:path=-", "$center_khz"
+    ],
+    "input": { "stream": "iq", "format": "cs16", "rate_hz": 12000, "via": "stdin" },
+    "output": {
+      "via": "stdout",
+      "port": null,
+      "parser": "json_lines",
+      "fields": {
+        "icao": [
+          "/hfdl/lpdu/src/ac_info/icao",
+          "/hfdl/lpdu/dst/ac_info/icao",
+          "/hfdl/lpdu/ac_info/icao"
+        ],
+        "gs_id": ["/hfdl/spdu/src/id", "/hfdl/lpdu/hfnpdu/gs/id"],
+        "gs": ["/hfdl/spdu/src/name", "/hfdl/lpdu/hfnpdu/gs/name"],
+        "flight": {
+          "pointers": ["/hfdl/lpdu/hfnpdu/flight_id", "/hfdl/lpdu/hfnpdu/acars/flight"],
+          "trim": " "
+        },
+        "pdu": ["/hfdl/lpdu/hfnpdu/type/name", "/hfdl/lpdu/type/name"],
+        "lat": "/hfdl/lpdu/hfnpdu/pos/lat",
+        "lon": "/hfdl/lpdu/hfnpdu/pos/lon",
+        "reg": { "pointers": ["/hfdl/lpdu/hfnpdu/acars/reg"], "trim": "." },
+        "label": "/hfdl/lpdu/hfnpdu/acars/label",
+        "text": "/hfdl/lpdu/hfnpdu/acars/msg_text",
+        "bit_rate": "/hfdl/bit_rate",
+        "sig_level": "/hfdl/sig_level",
+        "freq_skew": "/hfdl/freq_skew"
+      }
+    },
+    "install": { "debian": null, "url": "https://github.com/szpajder/dumphfdl" }
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "icao": { "type": ["string", "null"] },
+        "gs_id": { "type": ["integer", "null"] },
+        "gs": { "type": ["string", "null"] },
+        "flight": { "type": ["string", "null"] },
+        "pdu": { "type": ["string", "null"] },
+        "lat": { "type": ["number", "null"] },
+        "lon": { "type": ["number", "null"] },
+        "reg": { "type": ["string", "null"] },
+        "label": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] },
+        "bit_rate": { "type": ["integer", "null"] },
+        "sig_level": { "type": ["number", "null"] },
+        "freq_skew": { "type": ["number", "null"] }
+      }
+    },
+    "summary": "{icao?gs_id} {flight?} {pdu?} {text?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 40000,
+    "min_span_ms": 1000,
+    "quick": null
+  },
+  "catalogue": ["high-frequency-data-link-hfdl"],
+  "test": {
+    "kind": "fixture",
+    "path": "fixtures/hfdl-pending.sigmf-meta",
+    "expect": {},
+    "within_ms": 10000
+  },
+  "position": { "lat": "lat", "lon": "lon", "alt_m": null },
+  "time": null,
+  "notes": "HFDL (PSK on a 1440 Hz subcarrier, 300-1800 bit/s) between airliners and ground stations at 2.8-22.1 MHz, decoded by dumphfdl, typically on a KiwiSDR's 12 kHz band. Start the job with center_hz on the listed (dial) frequency: the signal sits 1.44 kHz above it, inside the 6 kHz band. Take the frequencies from a list (dumphfdl's system table, or the operator's own), not a raster; they change with the hour. Each ground station sends a squitter every 32 s, so a squitter (pdu absent, gs_id set) within a minute proves the channel even when no aircraft is heard. An aircraft is keyed on its ICAO address once dumphfdl has heard its logon. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).",
+  "subject": {
+    "key": "icao",
+    "name": "aircraft",
+    "waterfall": "summary",
+    "columns": [
+      { "field": "flight", "label": "Flight", "unit": null },
+      { "field": "gs", "label": "Ground station", "unit": null },
+      { "field": "pdu", "label": "PDU", "unit": null },
+      { "field": "text", "label": "Text", "unit": null }
+    ],
+    "heading": null,
+    "label": "flight",
+    "merge": ["reg", "icao"],
+    "track_points": 100,
+    "track_min_m": 1000
+  }
+}

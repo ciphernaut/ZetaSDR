@@ -336,8 +336,8 @@ mod tests {
         // Nothing matches but rds's empty centre list.
         let got = ids(&score_rows(&modes, 1, 1, "noise", &|_| 0.0, &|_| 0.0));
         let order: Vec<&str> = got.iter().map(|g| g.0.as_str()).collect();
-        // rds at 0.4; then at 0 rs41 (priority 1), then aviation (acars, adsb), pagers,
-        // weather_science (dfm, m20), amateur_digital.
+        // rds at 0.4; then at 0 rs41 (priority 1), then aviation (acars, adsb, hfdl,
+        // vdl2), pagers, weather_science (dfm, m20), amateur_digital.
         assert_eq!(
             order,
             [
@@ -345,6 +345,8 @@ mod tests {
                 "rs41_decode",
                 "acars_decode",
                 "adsb_decode",
+                "hfdl_decode",
+                "vdl2_decode",
                 "pocsag_decode",
                 "dfm_decode",
                 "m20_decode",

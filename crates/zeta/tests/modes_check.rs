@@ -16,10 +16,16 @@ const NO_SONDE: [(&str, &str); 3] = [
     ("ZETA_HANDLER_DFM09MOD", "/nonexistent/zeta-test/dfm09mod"),
     ("ZETA_HANDLER_M20MOD", "/nonexistent/zeta-test/m20mod"),
 ];
+/// The aircraft data-link rows' programs, pinned to a path none lives at, whatever the
+/// host has.
+const NO_AIRCRAFT_LINKS: [(&str, &str); 2] = [
+    ("ZETA_HANDLER_DUMPVDL2", "/nonexistent/zeta-test/dumpvdl2"),
+    ("ZETA_HANDLER_DUMPHFDL", "/nonexistent/zeta-test/dumphfdl"),
+];
 
 /// `zeta --state-dir <dir>/state --modes-dir <dir>/modes modes check <args>` with no
-/// remote node, no operator rows but the test's own, and dump1090 and the sonde decoders
-/// missing.
+/// remote node, no operator rows but the test's own, and dump1090, the sonde decoders,
+/// dumpvdl2 and dumphfdl missing.
 fn check(dir: &Path, args: &[&str]) -> Command {
     let modes = dir.join("modes");
     std::fs::create_dir_all(&modes).unwrap();
@@ -31,6 +37,7 @@ fn check(dir: &Path, args: &[&str]) -> Command {
         .env("XDG_CONFIG_HOME", common::no_xdg_config())
         .env("ZETA_HANDLER_DUMP1090", NO_DUMP1090)
         .envs(NO_SONDE)
+        .envs(NO_AIRCRAFT_LINKS)
         .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--modes-dir")
@@ -72,6 +79,13 @@ fn modes_check_passes_the_four_in_crate_rows() {
             .any(|l| l == "rs41_decode: skipped: rs41mod missing"),
         "{out}"
     );
+    for (id, program) in [("vdl2_decode", "dumpvdl2"), ("hfdl_decode", "dumphfdl")] {
+        assert!(
+            out.lines()
+                .any(|l| l == format!("{id}: skipped: {program} missing")),
+            "{out}"
+        );
+    }
     assert_eq!(code, 0, "{out}");
 }
 
@@ -90,7 +104,10 @@ fn an_unknown_id_lists_the_known_ones() {
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(
-        err.contains("unknown mode nope (known: acars_decode, adsb_decode, aprs_decode"),
+        err.contains(
+            "unknown mode nope (known: acars_decode, adsb_decode, aprs_decode, dfm_decode, \
+             hfdl_decode, m20_decode, pocsag_decode, rds_decode, rs41_decode, vdl2_decode"
+        ),
         "{err}"
     );
 }
@@ -99,8 +116,13 @@ fn an_unknown_id_lists_the_known_ones() {
 fn write_row(dir: &Path, id: &str, test: serde_json::Value) {
     let mut row: serde_json::Value =
         serde_json::from_str(include_str!("../../../modes/aprs_decode.json")).unwrap();
-    row["id"] = id.into();
     row["test"] = test;
+    write_whole_row(dir, id, row);
+}
+
+/// An operator row: `row` under `id`, in `<dir>/modes/<id>.json`.
+fn write_whole_row(dir: &Path, id: &str, mut row: serde_json::Value) {
+    row["id"] = id.into();
     let modes = dir.join("modes");
     std::fs::create_dir_all(&modes).unwrap();
     std::fs::write(
@@ -415,5 +437,66 @@ fn rs41_decode_passes_its_synthesised_check() {
     let (out, code) =
         stdout(check(dir.path(), &["rs41_decode"]).env("ZETA_HANDLER_RS41MOD", rs41mod));
     assert_eq!(out.trim(), "rs41_decode: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+/// zeta-ext's stand-in for an external decoder: prints a file's lines whatever its input.
+fn fake_lines() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../zeta-ext/tests/fake_lines")
+}
+
+/// One of zeta-ext's synthetic decoder output lines (`crates/zeta-ext/tests/data`).
+fn ext_vector(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../zeta-ext/tests/data")
+        .join(name)
+}
+
+/// The embedded row `text` as an operator row `id` run by `fake_lines` printing `vector`,
+/// checked on an fsk burst (the fake ignores its input) for `expect`: the row's own
+/// `decoder.output.fields` map turns the decoder's line into the event.
+fn fake_program_row(dir: &Path, text: &str, id: &str, vector: &str, expect: serde_json::Value) {
+    let mut row: serde_json::Value = serde_json::from_str(text).unwrap();
+    row["decoder"]["programs"] = serde_json::json!([fake_lines().display().to_string()]);
+    row["decoder"]["args"] =
+        serde_json::json!(["--lines-file", ext_vector(vector).display().to_string()]);
+    row["test"] = serde_json::json!({
+        "kind": "synth", "family": "fsk", "symbol_rate_baud": 1200, "deviation_hz": 4500,
+        "order": 2, "bits": "pattern:aa", "repeat": 1,
+        "expect": expect, "within_ms": 10000
+    });
+    write_whole_row(dir, id, row);
+}
+
+/// The VDL2 row's pointers turn a dumpvdl2 ADS-C line into the event, the registration's
+/// leading dot trimmed as `acars_decode` spells it.
+#[test]
+fn the_vdl2_row_decodes_through_the_fake_program() {
+    let dir = tempfile::tempdir().unwrap();
+    fake_program_row(
+        dir.path(),
+        include_str!("../../../modes/vdl2_decode.json"),
+        "vdl2_fake",
+        "dumpvdl2-adsc.json",
+        serde_json::json!({"icao": "7C0000", "reg": "VH-ZET"}),
+    );
+    let (out, code) = stdout(&mut check(dir.path(), &["vdl2_fake"]));
+    assert_eq!(out.trim(), "vdl2_fake: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+/// The HFDL row keys an uplink on the aircraft it is for (`dst`).
+#[test]
+fn the_hfdl_row_decodes_an_uplink_through_the_fake_program() {
+    let dir = tempfile::tempdir().unwrap();
+    fake_program_row(
+        dir.path(),
+        include_str!("../../../modes/hfdl_decode.json"),
+        "hfdl_fake",
+        "dumphfdl-uplink.json",
+        serde_json::json!({"icao": "7C0000"}),
+    );
+    let (out, code) = stdout(&mut check(dir.path(), &["hfdl_fake"]));
+    assert_eq!(out.trim(), "hfdl_fake: ok", "{out}");
     assert_eq!(code, 0);
 }

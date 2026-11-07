@@ -699,21 +699,24 @@ fn the_hfdl_list_form_keys_downlinks_and_uplinks_on_the_aircraft() {
             "/hfdl/lpdu/dst/ac_info/icao",
             "/hfdl/lpdu/ac_info/icao"
         ],
-        "gs_id": ["/hfdl/lpdu/dst/id", "/hfdl/lpdu/src/id", "/hfdl/spdu/src/id"]
+        "gs_id": ["/hfdl/spdu/src/id", "/hfdl/lpdu/hfnpdu/gs/id"]
     }));
-    // Downlink: the ground station is the destination (id 4), the aircraft the source.
+    // Downlink: the aircraft is the source; the station is the one the performance-data
+    // PDU names (an LPDU's `src`/`dst` are both always present, so they cannot tell).
     let down = zeta_ext::apply_fields(&map, &vector("dumphfdl-downlink.json"));
     assert_eq!(down["icao"], "7C0000");
     assert_eq!(down["gs_id"], 4);
-    // Uplink: the aircraft is the destination. Its `dst.id` (the aircraft id 42) exists, so
-    // the first `gs_id` pointer wins over `src.id` (the ground station, 4): this order
-    // gives the ground station for downlinks and SPDUs only.
+    // Uplink: the aircraft is the destination; the PDU names no station, so no `gs_id`.
     let up = zeta_ext::apply_fields(&map, &vector("dumphfdl-uplink.json"));
     assert_eq!(up["icao"], "7C0000");
-    assert_eq!(up["gs_id"], 42);
+    assert!(up.get("gs_id").is_none(), "{up}");
+    // A squitter: no aircraft, its own station.
     let spdu = zeta_ext::apply_fields(&map, &vector("dumphfdl-spdu.json"));
     assert!(spdu.get("icao").is_none(), "{spdu}");
     assert_eq!(spdu["gs_id"], 4);
+    // A logon PDU carries the aircraft's address directly on the LPDU.
+    let logon = json!({"hfdl": {"lpdu": {"ac_info": {"icao": "7C0001"}}}});
+    assert_eq!(zeta_ext::apply_fields(&map, &logon)["icao"], "7C0001");
 }
 
 #[tokio::test]
