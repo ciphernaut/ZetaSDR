@@ -582,12 +582,34 @@ OVERLAY_BLANK_JS = """() => {
 }"""
 
 
+# Whether the painted columns cover at least `s` seconds of signal, oldest start to newest
+# end (a box over every painted column spans that). A fresh job's first rows can come
+# faster than real time, so the count of painted columns alone does not say.
+SPAN_AT_LEAST_JS = """(s) => {
+  const w = window.zetaTest.waterfall();
+  if (!w || !(w.columns > 0)) return false;
+  const oldest = w.oldestNs();
+  const newest = w.ringEnd[(w.columns - 1) % w.ringEnd.length];
+  return !!oldest && newest - oldest >= s * 1e9;
+}"""
+
+
+def wait_span(page, s, timeout=15_000):
+    """Wait until the painted columns cover `s` seconds of signal (SPAN_AT_LEAST_JS)."""
+    page.wait_for_function(SPAN_AT_LEAST_JS, arg=s, timeout=timeout)
+
+
+# The signal a box over every painted column spans before a menu that classifies or fits
+# it opens, s: three times the second the layer-1 classifier needs.
+MENU_SPAN_S = 3.0
+
+
 def open_menu_on_tone(page, url, secret):
     """Log in, show the tone and open the menu on a selection (see drag_menu)."""
     show_tone_waterfall(page, url, secret)
     # The layer-1 classifier needs about a second of a pure tone to call it a carrier
     # (shorter spans read the discriminator's edge transients as FM deviation).
-    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    wait_span(page, MENU_SPAN_S)
     return drag_menu(page)
 
 
@@ -720,7 +742,7 @@ def scenario_fit_first_lands_on_the_tone(page, url, secret):
 def scenario_fit_first_without_a_signal_starts_at_the_box(page, url, secret):
     # Noise only: the fit finds no signal and the job starts at the box as drawn.
     select_source(page, url, secret, "quiet")
-    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    wait_span(page, MENU_SPAN_S)
     menu = drag_menu(page, 0.40, 0.60)
     footer = page.locator("#ctx-footer").text_content()
     m = re.search(r"center_hz=(\d+) bandwidth_hz=(\d+)", footer)
@@ -809,7 +831,8 @@ def ensure_lines(page):
 
 def scenario_zoom_inside_capture_is_render_only(page, url, secret):
     show_tone_waterfall(page, url, secret)
-    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    # Columns painted 40 px from the right edge before the zoom (one column a pixel).
+    page.wait_for_function("() => window.zetaTest.wf().painted > 45", timeout=15_000)
     wait_ticks(page, "100.024", "99.976", "before zooming")
     job = page.evaluate(WF_STATE_JS)["jobId"]
     # Wheel up at the centre: x2 in, about the pointer (the band's centre).
@@ -6788,13 +6811,17 @@ def scenario_too_old_classify_reissues_on_the_latest_span(page, url, secret):
     page.click('.src-tab[data-id="tone"]')
     expect(page.locator('.src-tab[data-id="tone"]')).to_have_attribute("aria-selected", "true")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
-    # The ring holds a few seconds; the page keeps more columns than that.
-    page.wait_for_function("() => window.zetaTest.wf().painted > 260", timeout=30_000)
+    # The ring holds a few seconds (at most 4); the page keeps more columns than that.
+    wait_span(page, 7.0, timeout=30_000)
     drag_menu(page)
     footer = page.locator("#ctx-footer").text_content()
     m = re.search(r" ring (\d+\.\d) s", footer)
     assert m, f"no ring depth in the footer {footer!r}"
     assert 1.0 <= float(m.group(1)) <= 4.0, footer
+    # The box starts well before the ring's earliest sample.
+    span = re.search(r"start_ns=(\d+) end_ns=(\d+)", footer)
+    span_s = (int(span.group(2)) - int(span.group(1))) / 1e9
+    assert span_s >= float(m.group(1)) + 2.0, f"box of {span_s:.1f} s on a ring of {footer!r}"
     page.click('#ctx .ctx-item[data-action="classify"]')
     expect(page.locator("#transcript .line.note", has_text="buffer moved on; classified the last")
            .first).to_be_visible(timeout=20000)
@@ -7016,6 +7043,44 @@ document.addEventListener('securitypolicyviolation', (e) => {
 """
 
 
+class LineTimes:
+    """With `ZETA_UI_PROFILE=<file>`: the wall time each line of this file took, per scenario.
+
+    A line's time runs from its `line` event to the next event in its frame, so a helper's
+    line counts inside the line that called it too. `report` appends the slowest lines."""
+
+    def __init__(self, path):
+        self.out = open(path, "a")
+        self.acc, self.at = {}, {}
+
+    def _local(self, frame, event, _arg):
+        now = time.monotonic()
+        if event in ("line", "return"):
+            prev = self.at.pop(id(frame), None)
+            if prev is not None:
+                key = (frame.f_code.co_name, prev[0])
+                self.acc[key] = self.acc.get(key, 0.0) + now - prev[1]
+            if event == "line":
+                self.at[id(frame)] = (frame.f_lineno, now)
+        return self._local
+
+    def _global(self, frame, _event, _arg):
+        return self._local if frame.f_code.co_filename == __file__ else None
+
+    def start(self):
+        self.acc.clear()
+        self.at.clear()
+        sys.settrace(self._global)
+
+    def report(self, name, took_s):
+        sys.settrace(None)
+        self.out.write(f"== {name} {took_s:.1f} s\n")
+        for (fn, line), dt in sorted(self.acc.items(), key=lambda kv: -kv[1])[:10]:
+            if dt >= 0.25:
+                self.out.write(f"  {dt:6.2f} {fn}:{line}\n")
+        self.out.flush()
+
+
 def main(argv):
     if len(argv) < 3:
         print(__doc__.strip(), file=sys.stderr)
@@ -7029,6 +7094,8 @@ def main(argv):
             print(f"no scenario {argv[3]!r}; known: {[n for n, _ in scenarios()]}",
                   file=sys.stderr)
             return 2
+    profile = LineTimes(os.environ["ZETA_UI_PROFILE"]) if os.environ.get("ZETA_UI_PROFILE") \
+        else None
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True, args=CHROMIUM_ARGS)
         try:
@@ -7044,7 +7111,13 @@ def main(argv):
                 page.on("pageerror", lambda e: console.append(f"pageerror: {e}"))
                 started = time.monotonic()
                 try:
-                    fn(page, url, secret)
+                    if profile:
+                        profile.start()
+                    try:
+                        fn(page, url, secret)
+                    finally:
+                        if profile:
+                            profile.report(name, time.monotonic() - started)
                     if not page.is_closed() and page.url.startswith(url):
                         seen = page.evaluate("window.__cspViolations || []")
                         assert not seen, f"Content-Security-Policy violations: {seen}"
