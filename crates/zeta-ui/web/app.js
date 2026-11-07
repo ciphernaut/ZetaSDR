@@ -94,7 +94,10 @@
 // job's set (map.origin keyed by the job id, faded from the job's last event, ov.lastEvent),
 // and is a transcript line as a watch's verdict is (verdictLine); What is this on a box and
 // on a capture light one-shot sets from their classification's `origins` (`classify:<t_ns>`,
-// `capture:<id>`); each jobs poll seeds the running jobs' `context.origins` (map.seed). The
+// `capture:<id>`); each jobs poll seeds the running jobs' `context.origins` (map.seed). A
+// job row's or the Bits header's Origins lights the job's set from the op's answer at once,
+// and notes it (units.js originSummary) only for a job the overlays do not follow
+// (ov.follows). The
 // Map tab's `.count` is the number of lit sites (map.litCount; empty at zero), kept over
 // renderTabs; the page never switches to the map by itself.
 //
@@ -158,6 +161,7 @@ import { mountSubjects, mountSubjectsPane } from "./subjects.js";
 import { mountPanes } from "./panes.js";
 import { mountExplorePane } from "./explore.js";
 import { mountBitsPane } from "./bits.js";
+import { originSummary } from "./units.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -582,29 +586,19 @@ function originJobOp(job) {
   return { op: "origin_lookup", job, source: null, center_hz: null, bandwidth_hz: null, modulation: null };
 }
 
-// The sites an answer names, as the node's `origin` event summarises them (at most this many).
-const ORIGIN_NOTE_SITES = 3;
-
-// Origins by job `id`. The answer reaches the page as an `origin` event on the job's source
-// feed, except for a job on source `node` (a `bits` job replaying a capture), which the
-// overlays do not follow: its answer lights the map and is noted here.
+// Origins by job `id`. The answer lights the map at once (an `origin` event for the same job,
+// arriving on the feed as well, replaces it under the same key). It is noted in the
+// transcript only for a job the overlays do not follow (a `bits` job on source `node`, a job
+// on another source that is not positioned), whose event the page never sees; a followed
+// job's event writes its own line.
 async function askOrigins(id) {
   const r = await applyOp(originJobOp(id));
-  const job = (state.lastJobs || []).find((j) => j.id === id);
   const a = r && r.value;
-  if (!job || job.source !== "node" || !a || !Array.isArray(a.origins)) return;
+  if (!a || !Array.isArray(a.origins)) return;
   state.map?.origin(id, a);
-  const f = a.band ? `${a.band.center_hz / 1e6} MHz` : "the band";
-  const n = a.origins.length;
-  const sites = a.origins.slice(0, ORIGIN_NOTE_SITES).map((o) => {
-    const al = o.allocation || {};
-    const name = [al.licensee, al.site].filter(Boolean).join(", ") || al.service;
-    return `${name} ${o.agree} ${Number(o.score).toFixed(1)}`;
-  });
-  state.transcript?.note(
-    `${job.kind} ${String(id).slice(-6)}: ` +
-      (n === 0 ? `no licensed transmitter on ${f}` : `${n} ${n === 1 ? "site" : "sites"} on ${f}: ${sites.join("; ")}`),
-  );
+  if (state.ov?.follows(id)) return;
+  const job = (state.lastJobs || []).find((j) => j.id === id);
+  state.transcript?.note(`${job ? job.kind : "job"} ${String(id).slice(-6)}: ${originSummary(a)}`);
 }
 
 // The op attaching a transcription to job `id` (the language left to the backend).

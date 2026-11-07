@@ -110,6 +110,10 @@
 //                            arrives before it, and what the lookup learns is applied at
 //                            once by a second sync. A positioned job whose source becomes
 //                            the selected one is left to the feed.
+//     ov.follows(jobId) -> bool  whether the job's events reach ov.onEvent: a running job on
+//                            the selected source (the feed), or a positioned job on another
+//                            source subscribed here; false for any other (a `bits` job on
+//                            source `node`, a plain job on another source)
 //     ov.watching(jobId) -> bool  false for a positioned job on another source over
 //                            MAX_POSITIONED, so its events are not seen (the Subjects pane
 //                            says so); true for every job on the selected source
@@ -679,6 +683,10 @@ class Overlays {
 
   watching(jobId) {
     return !this.overCap.has(jobId);
+  }
+
+  follows(jobId) {
+    return this.activity(jobId).watched || this.positioned.has(jobId);
   }
 
   // The running jobs on the other sources whose mode row carries a `position` or a `subject`,

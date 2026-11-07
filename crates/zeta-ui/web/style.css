@@ -190,6 +190,7 @@ input:focus { border-color: var(--accent); }
 #map { position: absolute; inset: 0; background: var(--bg); }
 html[data-main="rf"] #map { display: none; }
 html[data-main="map"] #map { display: block; inset: 0; }
+#map[hidden] { display: none; }
 html[data-main="map"] #waterfall { visibility: hidden; }
 #map .leaflet-popup-content .age { color: var(--map-dim); font-size: 11px; }
 #map path.map-pos { stroke: var(--map-mark); fill: var(--map-mark); fill-opacity: 0.8; stroke-width: 2; }

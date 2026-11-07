@@ -5,7 +5,9 @@
 // Exports:
 //   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor, onOrigins})
 //       -> Menu   (`onOrigins(key, answer)`: What is this's classification `origins`, keyed
-//       `classify:<t_ns>`, for the map to light)
+//       `classify:<t_ns>`, and the Origins entry's band-form answer, keyed
+//       `band:<source>:<centre Hz>` and noted in the transcript as units.js originSummary
+//       words it, for the map to light)
 //       Opens #ctx at the pointer after each wf.onSelect. `applyOp(op) -> Promise<result|null>`
 //       is app.js's command-line op path (shows its outcome per ruling R6; null when it
 //       failed, the failure already reported); `attachOp(jobId)` the `job_attach` op that
@@ -176,7 +178,7 @@
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
 
-import { bandText, mhzText, registerText } from "./units.js";
+import { bandText, mhzText, originSummary, registerText } from "./units.js";
 
 // How far past the ring's earliest sample a `too_old` retry starts, as the front moves on.
 const RING_FRONT_MARGIN_NS = 300_000_000;
@@ -777,7 +779,10 @@ class Menu {
         bandwidth_hz: s.bandwidthHz,
         modulation: named ? [named] : null,
       });
-      if (r && r.value) this.onOrigins(`band:${s.sourceId}:${Math.round(s.centerHz)}`, r.value);
+      if (r && r.value) {
+        this.t.note(originSummary(r.value));
+        this.onOrigins(`band:${s.sourceId}:${Math.round(s.centerHz)}`, r.value);
+      }
       return;
     }
     const selection = {

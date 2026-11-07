@@ -4796,6 +4796,15 @@ def scenario_map_is_a_source_tab(page, url, secret):
         tab.click()
         page.wait_for_function(main_is % "map", timeout=5_000)
         expect(page.locator("#map")).to_be_visible()
+        # A logout with the map shown leaves no map box over the login.
+        page.evaluate("() => { window.zetaTest.setSecret('wrong'); window.zetaTest.poll(); }")
+        expect(page.locator("#login")).to_be_visible()
+        page.wait_for_function(
+            "() => getComputedStyle(document.getElementById('map')).display === 'none'",
+            timeout=5_000)
+        page.fill("#secret", secret)
+        page.click("#connect")
+        expect(page.locator("#login")).to_be_hidden()
     finally:
         run_cmd(page, "view reset")
         page.set_viewport_size(WIDE)
@@ -4900,6 +4909,7 @@ def scenario_origins_light_sites(page, url, secret):
     page.set_viewport_size(WIDE)
     # At the tone's centre, the row's own 40 kHz (its `min_hz`; a narrower band is refused).
     job = start_fake_pos(page, url, secret)
+    other = None
     badge = page.locator("#tabs .map-tab .count")
     try:
         # Lit while the map was never shown (no Leaflet map yet): the badge counts them and
@@ -4946,9 +4956,20 @@ def scenario_origins_light_sites(page, url, secret):
         expect(badge).to_have_text("", timeout=1_000)
         page.locator("#tabs .src-tab.map-tab").click()
         expect(page.locator("#map path.map-site")).to_have_count(0)
+        # A job the overlays do not follow (an fm_demod on a source the page does not show,
+        # not positioned): Origins lights its sites from the op's answer and notes them.
+        other = start_job(url, secret, "fm_demod", "tone", 100_000_000, 12_500)
+        page.locator('#tabs .src-tab[data-id="quiet"]').click()
+        job_row(page, other).locator("button.origins").click()
+        page.wait_for_function("(j) => window.zetaTest.litKeys().includes(j)", arg=other,
+                               timeout=10_000)
+        expect(page.locator("#transcript .line.note", has_text=re.compile(
+            rf"fm_demod {other[-6:]}: \d+ sites? on 100 MHz"))).to_have_count(1, timeout=5_000)
     finally:
         run_cmd(page, "view reset")
         stop_job(url, secret, job)
+        if other:
+            stop_job(url, secret, other)
 
 
 def scenario_origins_from_the_menu_and_bits(page, url, secret):
@@ -4972,6 +4993,9 @@ def scenario_origins_from_the_menu_and_bits(page, url, secret):
         expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=10_000)
         keys = page.evaluate("() => window.zetaTest.litKeys()")
         assert len(keys) == 1 and keys[0].startswith("band:"), keys
+        # Spec 4.8: the entry says what it found in the transcript, as the node words it.
+        expect(page.locator("#transcript .line.note", has_text=re.compile(
+            r"^2 sites on [\d.]+ MHz: Example "))).to_have_count(1, timeout=5_000)
         page.locator("#tabs .src-tab.map-tab").click()
         expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
         # The tone's label is `carrier`, which neither stub transmitter (FM, AM) fits: the
