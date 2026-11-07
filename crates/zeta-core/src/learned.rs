@@ -43,8 +43,20 @@ pub const LEARNED_MIN_SCORE: f32 = 0.7;
 const LEARNED_MAX_SCORE: f32 = 1.0;
 /// The tier of a learned signature in `knowledge_lookup`.
 pub const LEARNED_TIER: &str = "learned";
-/// The least confidence of a learned label that names an `identify` unknown verdict.
+/// The least match score (see [`score`], not the label's confidence × score) of a
+/// learned label that names an `identify` unknown verdict: a features-only signature
+/// (confidence 0.3) names it too.
 pub const LEARNED_VERDICT_MIN: f32 = 0.5;
+
+/// The match score behind the learned label `label` given for `measured`: its record's
+/// [`score`] again (`None` for another label, or a record gone from the accepted ones).
+pub fn label_score(store: &SignatureStore, label: &Label, measured: &Measurement) -> Option<f32> {
+    let (id, _) = learned_match(label)?;
+    let r = store
+        .get(id)
+        .filter(|r| r.state == crate::signatures::SignatureState::Accepted)?;
+    score(&r, &measured.features, &measured.label.name).map(|(s, _)| s)
+}
 
 /// A learned label's record id and signature name (from its evidence
 /// `learned <id>: ...` and its name `learned <name>`); `None` for any other label.

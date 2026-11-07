@@ -1975,11 +1975,11 @@ async fn a_watch_graphs_fft_edge_is_unfed_but_its_signal_events_are_fed() {
 
 /// Accept, straight into the node's store, a signature of the fixture `meta`'s signal
 /// (the band at [`OFFSET_HZ`], 12.5 kHz wide) from layer 1's measurement of its burst
-/// (the cycle's first second); framed with a CRC that checked on five frames
-/// (confidence 0.9), so a match reaches identify's verdict floor.
+/// (the cycle's first second); features only (confidence 0.3), as the node's own
+/// proposals are.
 async fn accept_signature(node: &Node, meta: &Path) -> zeta_core::signatures::SignatureRecord {
     use zeta_core::classify::{Band, ClassifierSet};
-    use zeta_core::signatures::{NewSignature, PROPOSE_CRC_FRAMES};
+    use zeta_core::signatures::NewSignature;
     let (m, iq) = zeta_core::capture::read_cf32(meta).unwrap();
     let burst = &iq[..RATE_HZ as usize];
     let mut set = ClassifierSet::default();
@@ -1998,8 +1998,8 @@ async fn accept_signature(node: &Node, meta: &Path) -> zeta_core::signatures::Si
         name: Some("test link".into()),
         features: measured.features,
         modulation: measured.label.name,
-        framing: Some(frame_framing()),
-        crc_frames: PROPOSE_CRC_FRAMES,
+        framing: None,
+        crc_frames: 0,
         evidence: "test".into(),
         source: rx(),
         station: None,
@@ -2023,6 +2023,7 @@ async fn the_watch_does_not_capture_a_learned_signal() {
     let dir = tempfile::tempdir().unwrap();
     let node = fsk_node(dir.path()).await;
     let sig = accept_signature(&node, &fixtures().fsk).await;
+    assert!((sig.confidence - 0.3).abs() < 1e-6, "{sig:?}");
     let params = serde_json::json!({"on_unknown": "capture", "capture": {"bursts": 2}});
     let watch = start_watch(&node, params).await;
     let events = Events::of(&node, &watch);

@@ -881,8 +881,7 @@ async fn trials_stay_on_the_band_when_the_capture_is_no_wider() {
 
 /// Accept, straight into the node's store, a signature of the band `width_hz` wide at
 /// `offset_hz` from the centre of `meta`'s recording, from layer 1's measurement of its
-/// first second; framed with a CRC that checked on five frames (confidence 0.9), so a
-/// match reaches the verdict's floor.
+/// first second; features only (confidence 0.3), as the node's own proposals are.
 async fn accept_signature(
     node: &Node,
     meta: &Path,
@@ -890,7 +889,7 @@ async fn accept_signature(
     width_hz: u64,
 ) -> zeta_core::signatures::SignatureRecord {
     use zeta_core::classify::{Band, ClassifierSet};
-    use zeta_core::signatures::{NewSignature, PROPOSE_CRC_FRAMES};
+    use zeta_core::signatures::NewSignature;
     let (m, iq) = zeta_core::capture::read_cf32(meta).unwrap();
     let second = &iq[..iq.len().min(m.sample_rate_hz.0 as usize)];
     let mut set = ClassifierSet::default();
@@ -909,12 +908,8 @@ async fn accept_signature(
         name: Some("test link".into()),
         features: measured.features,
         modulation: measured.label.name,
-        framing: Some(serde_json::json!({
-            "sync": {"hex": "2dd4", "bits": 16},
-            "length": {"fixed_bits": 272},
-            "crc": "crc16-ccitt",
-        })),
-        crc_frames: PROPOSE_CRC_FRAMES,
+        framing: None,
+        crc_frames: 0,
         evidence: "test".into(),
         source: rx(),
         station: None,
@@ -952,8 +947,11 @@ async fn identify_reports_a_learned_signal_in_its_unknown_verdict() {
     assert_eq!(verdict["label"], "learned test link", "{ctx}");
     assert_eq!(verdict["learned"]["id"], sig.id.as_str(), "{ctx}");
     assert_eq!(verdict["learned"]["name"], "test link", "{ctx}");
+    // A features-only record names the verdict by its match score; the confidence
+    // reported is the label's, 0.3 times that score (0.7 to 1.0).
+    assert!((sig.confidence - 0.3).abs() < 1e-6, "{sig:?}");
     let confidence = verdict["learned"]["confidence"].as_f64().unwrap();
-    assert!(confidence >= 0.5, "{ctx}");
+    assert!((0.21 - 1e-4..=0.3 + 1e-4).contains(&confidence), "{ctx}");
     assert!(verdict["features"]["bandwidth_hz"].is_u64(), "{ctx}");
     // The verdict event words it as the watch does.
     let mut last = None;

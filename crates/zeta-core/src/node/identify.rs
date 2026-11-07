@@ -26,7 +26,7 @@ use super::{Inner, NodeError, source_fault_reason};
 use crate::classify::{Band, Measurement, Outcome};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::{Allocation, DEFAULT_REGION, nearest_allocations};
-use crate::learned::{LEARNED_VERDICT_MIN, learned_match};
+use crate::learned::{LEARNED_VERDICT_MIN, label_score, learned_match};
 use crate::modes::Proof;
 use crate::modes::score::{allocation_match, allocation_term, score_rows};
 use crate::modes::{LoadedMode, ModeState};
@@ -488,8 +488,8 @@ impl Inner {
 /// it running and ends the job with the verdict; (4) an exhausted list ends the job
 /// with `mode: null`, the layer-1 label and features, `recentred`, `allocations` and
 /// `learned`: the accepted signature the measurement matches (`{id, name, confidence}`,
-/// the label then `learned <name>`) when its layer-2 label reaches
-/// [`LEARNED_VERDICT_MIN`], else `null`.
+/// the label's confidence; the verdict's label then `learned <name>`) when its match
+/// score reaches [`LEARNED_VERDICT_MIN`], else `null`.
 async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     // A child the run before a restart was trying (resumed as an ordinary job): stopped
     // first, needing no samples, so a measurement that fails cannot orphan it.
@@ -513,14 +513,19 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         .as_ref()
         .map_or("unknown", |m| m.label.name.as_str())
         .to_string();
-    // The accepted signature the measurement matches best, sure enough to name it.
+    // The accepted signature the measurement matches best, its score high enough to
+    // name it (whatever the record's confidence).
     let learned = match &measured {
-        Some(m) => classifiers.learned(m).await,
-        None => Vec::new(),
-    }
-    .into_iter()
-    .filter(|l| l.confidence >= LEARNED_VERDICT_MIN)
-    .max_by(|a, b| a.confidence.total_cmp(&b.confidence));
+        Some(m) => classifiers
+            .learned(m)
+            .await
+            .into_iter()
+            .filter(|l| {
+                label_score(&inner.signatures, l, m).is_some_and(|s| s >= LEARNED_VERDICT_MIN)
+            })
+            .max_by(|a, b| a.confidence.total_cmp(&b.confidence)),
+        None => None,
+    };
     let learned_json = learned.as_ref().and_then(|l| {
         learned_match(l).map(
             |(id, name)| serde_json::json!({"id": id, "name": name, "confidence": l.confidence}),
