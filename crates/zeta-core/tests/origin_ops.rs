@@ -499,6 +499,54 @@ async fn the_band_form_returns_only_and_is_read_only() {
     assert_eq!(fits.agree, Agree::Fits);
 }
 
+/// `classify` over the tone's ring with a register attached: the answer's modulation is
+/// the measured layer-1 label and the register's licensee lights.
+#[tokio::test]
+async fn classify_on_a_tone_scores_origins_on_the_measured_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path(), true).await;
+    for c in zeta_dsp::classifiers(node.modes()) {
+        node.add_classifier(c);
+    }
+    let source = SourceId("file0".into());
+    let mut earliest = None;
+    for _ in 0..80 {
+        earliest = node
+            .ring(&source)
+            .and_then(|r| r.read().unwrap().earliest());
+        if earliest.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let start = earliest.expect("ring has data").0;
+    let selection = zeta_core::types::Selection {
+        source,
+        span: zeta_core::types::Span {
+            start_ns: zeta_core::types::Timestamp(start),
+            end_ns: zeta_core::types::Timestamp(start + 50_000_000),
+        },
+        center_hz: Hz(TONE_HZ),
+        bandwidth_hz: Hz(BAND_HZ),
+    };
+    let Ok(OpResult::Classification {
+        labels, origins, ..
+    }) = node.apply(Op::Classify { selection }).await
+    else {
+        panic!("expected Classification");
+    };
+    let l1 = labels.iter().find(|l| l.layer == 1).expect("layer 1");
+    let origins = origins.expect("origins");
+    assert_eq!(origins.modulation, vec![l1.name.clone()], "{labels:?}");
+    assert!(
+        origins
+            .origins
+            .iter()
+            .any(|o| { o.allocation.licensee.as_deref() == Some("Example Water Authority") }),
+        "{origins:?}"
+    );
+}
+
 /// The band form refuses a source the node does not have, as other source ops do.
 #[tokio::test]
 async fn the_band_form_refuses_an_unknown_source() {

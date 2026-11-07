@@ -250,7 +250,7 @@ JSON: `{"op":"capture_classify","capture":"<id>"}`
 
 CLI: `zeta capture classify --capture <id>`
 
-Run the classifiers over the capture's whole window as `classify` does over the ring (the record's stored `allocations` take part): `{labels, tried, allocations, origins}` (`origins` is `origin_lookup`'s answer for the capture's band and source, scored on the measured layer-1 label). A `no_frame` does not prove the protocol absent. A window shorter than a row's `identify.min_span_ms` is `skipped_span`.
+Run the classifiers over the capture's whole window as `classify` does over the ring (the record's stored `allocations` take part): `{labels, tried, allocations, origins}` (`origins` is `origin_lookup`'s answer for the capture's band and source, scored on the measured layer-1 label; a hand `capture` job's `job_context.capture.classified` carries the same). A `no_frame` does not prove the protocol absent. A window shorter than a row's `identify.min_span_ms` is `skipped_span`.
 
 ### capture_delete
 

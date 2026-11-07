@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::launch::{AfterGate, StageRunning, supervise};
-use super::origin::{OriginQuery, origins};
+use super::origin::{OriginQuery, measured_modulation, origins};
 use super::persist::now;
 use super::{Inner, NodeError, source_fault_reason};
 use crate::classify::{Band, Measurement, Outcome};
@@ -541,10 +541,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         bandwidth_hz: measured
             .as_ref()
             .map_or(r.tuning.bandwidth_hz, |m| m.features.bandwidth_hz),
-        modulation: measured
-            .as_ref()
-            .map(|m| vec![m.label.name.clone()])
-            .unwrap_or_default(),
+        modulation: measured_modulation(measured.as_ref().map(|m| m.label.name.as_str())),
         symbol_rate_baud: measured.as_ref().and_then(|m| m.features.symbol_rate_baud),
         job: Some(r.id.clone()),
         at: now(),
@@ -553,6 +550,8 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         a = origins(&inner, &q) => a,
         _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
     };
+    // The answer is already in hand for the verdict: a failed merge (the job was removed
+    // under the run) only loses the context copy and the event, so the run goes on.
     let _ = inner.keep_origin(&r.id, r.port.id(), &origins);
     let allocation = |m: &LoadedMode| allocation_term(m, &allocations);
     let scored = score_rows(&inner.modes, m_center, bw, &layer1, &|_| 0.0, &allocation);

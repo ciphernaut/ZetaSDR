@@ -1,6 +1,6 @@
 //! The end of a `capture` job (design 5.5). A hand-started capture runs the quick
 //! classifiers over its first window and records the result under
-//! `job_context.capture.classified` (`{labels, tried, allocations}`, or `{error}`); a
+//! `job_context.capture.classified` (`{labels, tried, allocations, origins}`, or `{error}`); a
 //! watch's capture child inherits the watch's `unknown` verdict instead and is reported
 //! to its watch, which publishes `captured`.
 

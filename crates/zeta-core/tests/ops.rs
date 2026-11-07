@@ -918,6 +918,10 @@ async fn classify_lists_allocations_beside_the_labels() {
     }))
     .unwrap();
     assert!(matches!(old, OpResult::Classification { allocations, .. } if allocations.is_empty()));
+    // A stored `Classification` without `origins` loads with `None`.
+    let stored: zeta_core::classify::Classification =
+        serde_json::from_value(serde_json::json!({"labels": [], "tried": []})).unwrap();
+    assert!(stored.origins.is_none());
 }
 
 #[tokio::test]

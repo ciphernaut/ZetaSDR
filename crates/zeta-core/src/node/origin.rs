@@ -564,13 +564,12 @@ pub fn job_modulation(rec: &JobRecord, modes: &ModeRegistry) -> Vec<String> {
     label.map(|l| vec![l.to_string()]).unwrap_or_default()
 }
 
-/// The modulation a classification measured: its layer-1 label (`fm`, `fsk`, ...), none
-/// for no layer-1 label or for `noise`.
-pub fn measured_modulation(c: &Classification) -> Vec<String> {
-    c.labels
-        .iter()
-        .find(|l| l.layer == 1 && l.name != "noise")
-        .map(|l| vec![l.name.clone()])
+/// The modulation a measurement gives the origin query from its layer-1 `label`
+/// (`fm`, `fsk`, ...): that label, none for no label or for `noise`.
+pub fn measured_modulation(label: Option<&str>) -> Vec<String> {
+    label
+        .filter(|l| *l != "noise")
+        .map(|l| vec![l.to_string()])
         .unwrap_or_default()
 }
 
@@ -589,7 +588,12 @@ impl Inner {
             source: source.clone(),
             center_hz,
             bandwidth_hz,
-            modulation: measured_modulation(&c),
+            modulation: measured_modulation(
+                c.labels
+                    .iter()
+                    .find(|l| l.layer == 1)
+                    .map(|l| l.name.as_str()),
+            ),
             symbol_rate_baud: None,
             job: None,
             at: now(),
@@ -1150,6 +1154,13 @@ mod tests {
         let mut extra = serde_json::to_value(&band).unwrap();
         extra["extra"] = 1.into();
         assert!(serde_json::from_value::<OriginQuery>(extra).is_err());
+    }
+
+    #[test]
+    fn a_noise_or_missing_label_gives_no_modulation() {
+        assert_eq!(measured_modulation(Some("fm")), vec!["fm".to_string()]);
+        assert!(measured_modulation(Some("noise")).is_empty());
+        assert!(measured_modulation(None).is_empty());
     }
 
     #[test]
