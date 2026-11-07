@@ -11,16 +11,32 @@ use zeta_source_soapy::caps::RateModel;
 use zeta_source_soapy::device::RangeHz;
 use zeta_source_soapy::mock::MockDevice;
 use zeta_source_soapy::probe::{
-    PROBE_DWELL, PROBE_MAX_OVERFLOWS, PROBE_MAX_RUNGS, PROBE_SETTLE, ProbeResult, probe_candidates,
-    probe_rate, probe_rate_cap,
+    PROBE_DWELL, PROBE_MAX_OVERFLOWS, PROBE_MAX_RUNGS, PROBE_RETRIES, PROBE_SETTLE, ProbeResult,
+    ProbeTiming, probe_candidates, probe_rate_with,
 };
 use zeta_source_soapy::{SoapySource, ZetaArgs, split_zeta_args};
 
 const CENTER: u64 = 100_000_000;
+/// The probe's clock in these tests: the settle and dwell the read numbers
+/// below are placed for, shorter than the production 1.5 s settle so a probe
+/// of the small mock ladder stays cheap.
+const TIMING: ProbeTiming = ProbeTiming {
+    settle: Duration::from_millis(200),
+    dwell: Duration::from_millis(1500),
+};
+
+async fn probe_rate(src: &SoapySource, center: u64) -> Result<ProbeResult, String> {
+    probe_rate_with(src, center, TIMING).await
+}
+
+async fn probe_rate_cap(src: &SoapySource, center: u64) -> Result<u64, String> {
+    probe_rate(src, center).await.map(|p| p.cap_hz)
+}
 /// Every tenth read overflows: a rung the device cannot keep up with.
 const OVERFLOWING: u32 = 10;
 /// Reads 60 and 120 after a retune: about 0.6 s and 1.2 s in, inside the dwell
-/// that follows the 0.2 s settle (reads are 10 ms at the top rung).
+/// that follows the 0.2 s settle (reads are 10 ms at the top rung), as the
+/// tests' [`TIMING`] has it.
 const IN_DWELL: [u64; 2] = [60, 120];
 /// Read 1: as the stream starts after a retune, inside the settle.
 const IN_SETTLE: u64 = 1;
@@ -98,15 +114,52 @@ async fn a_rung_with_one_overflow_in_its_dwell_is_clean() {
 }
 
 #[tokio::test]
-async fn a_rung_with_two_overflows_in_its_dwell_is_rejected() {
-    let dev = Arc::new(ladder().overflow_reads_at(6.144e6, &IN_DWELL));
+async fn a_rung_that_overflows_on_both_attempts_falls_to_the_next_rung() {
+    assert_eq!(PROBE_RETRIES, 1);
+    // An overflow every 0.3 s in the retry's dwell as in the first, the
+    // samples all arriving (an overflow every tenth read would deliver short,
+    // which is not retried): the rung is rejected, and `tried` counts it once.
+    let every_30: Vec<u64> = (1..=100).map(|i| i * 30).collect();
+    let dev = Arc::new(ladder().overflow_reads_at(6.144e6, &every_30));
     let src = source(&dev);
     let opened = dev.calls().len();
-    assert_eq!(probe_rate_cap(&src, CENTER).await, Ok(3_072_000));
+    let start = Instant::now();
+    assert_eq!(
+        probe_rate(&src, CENTER).await,
+        Ok(ProbeResult {
+            cap_hz: 3_072_000,
+            tried: 2,
+            clean: true,
+        })
+    );
+    // Two attempts at the top rung, a settle and a dwell each, then the next.
+    assert!(start.elapsed() >= 3 * (TIMING.settle + TIMING.dwell));
     assert_eq!(
         rate_calls(&dev, opened),
         ["set_sample_rate(6144000)", "set_sample_rate(3072000)"]
     );
+}
+
+#[tokio::test]
+async fn a_rung_that_overflows_twice_then_streams_clean_on_the_retry_is_accepted() {
+    // The stream overflows twice in the first dwell (reads 60 and 120 after
+    // it starts) and never again: the retry's dwell is clean. The retry tunes
+    // the same band, which a live stream already holds, so the device is not
+    // restarted: the second attempt is a longer settle and a fresh dwell.
+    let dev = Arc::new(ladder().overflow_reads_at(6.144e6, &IN_DWELL));
+    let src = source(&dev);
+    let opened = dev.calls().len();
+    let start = Instant::now();
+    assert_eq!(
+        probe_rate(&src, CENTER).await,
+        Ok(ProbeResult {
+            cap_hz: 6_144_000,
+            tried: 1,
+            clean: true,
+        })
+    );
+    assert!(start.elapsed() >= 2 * (TIMING.settle + TIMING.dwell));
+    assert_eq!(rate_calls(&dev, opened), ["set_sample_rate(6144000)"]);
 }
 
 #[tokio::test]
@@ -151,7 +204,9 @@ async fn a_probe_that_never_streams_clean_caps_at_the_lowest_rung() {
         })
     );
     let took = start.elapsed();
-    let bound = (PROBE_SETTLE + PROBE_DWELL + Duration::from_millis(500)) * PROBE_MAX_RUNGS as u32;
+    // Each rung is tried twice: a settle and a dwell per attempt.
+    let attempts = PROBE_MAX_RUNGS as u32 * (1 + PROBE_RETRIES);
+    let bound = (TIMING.settle + TIMING.dwell + Duration::from_millis(500)) * attempts;
     assert!(took <= bound, "{took:?} > {bound:?}");
     assert_eq!(rate_calls(&dev, opened).len(), PROBE_MAX_RUNGS);
 }
@@ -200,6 +255,13 @@ async fn a_probe_whose_every_tune_fails_is_an_error() {
     let opened = dev.calls().len();
     assert!(probe_rate_cap(&src, 10_000_000_000).await.is_err());
     assert!(rate_calls(&dev, opened).is_empty());
+}
+
+#[test]
+fn the_production_settle_outlasts_a_master_clock_switch() {
+    assert_eq!(ProbeTiming::default().settle, PROBE_SETTLE);
+    assert_eq!(ProbeTiming::default().dwell, PROBE_DWELL);
+    assert_eq!(PROBE_SETTLE, Duration::from_millis(1500));
 }
 
 #[test]

@@ -24,11 +24,11 @@ use crate::supervisor::{Link, Shared, Supervisor};
 use crate::wire::{Cmd, Reply};
 
 /// How long a worker has to say hello after it is spawned: UHD loads a B210's
-/// FPGA image before the device opens (2-4 s, more on a cold boot), and the
-/// worker then probes its rates before the hello (up to six rungs of 1.7 s
-/// each, the settle and the dwell, plus a retune per rung); both must fit with
-/// margin.
-pub const HELLO_TIMEOUT: Duration = Duration::from_secs(45);
+/// FPGA image before the device opens (2-4 s cold), and the worker then probes
+/// its rates before the hello: up to six rungs, each up to two attempts of a
+/// 1.5 s settle and a 1.5 s dwell, so about 40 s with the load. Both must fit
+/// with margin.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(60);
 /// The wait before the first respawn after a worker ended.
 pub const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 /// The cap the respawn wait doubles up to, and the poll interval while the

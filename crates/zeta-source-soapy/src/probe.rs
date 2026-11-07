@@ -6,7 +6,8 @@
 //! down ([`probe_candidates`]): after each retune it lets the stream settle for
 //! [`PROBE_SETTLE`], then dwells [`PROBE_DWELL`], and the first rate that
 //! delivers at least [`PROBE_MIN_DELIVERED`] of itself with at most
-//! [`PROBE_MAX_OVERFLOWS`] overflow in the dwell is clean. Only a clean rate is
+//! [`PROBE_MAX_OVERFLOWS`] overflow in the dwell is clean; a rung rejected for
+//! overflows is tried [`PROBE_RETRIES`] more time after a fresh retune. Only a clean rate is
 //! reported as the source's `max_bandwidth_hz`, `Measured`: the worker keeps
 //! the driver's asserted cap when none is (see [`ProbeResult::clean`]).
 
@@ -19,9 +20,11 @@ use crate::SoapySource;
 use crate::caps::{RateModel, pick_rate};
 
 /// How long the stream runs after each retune before the probe counts
-/// anything: a retune restarts the stream, and a driver may drop a buffer or
-/// two while it does, which says nothing about the rate the host sustains.
-pub const PROBE_SETTLE: Duration = Duration::from_millis(200);
+/// anything: a retune restarts the stream, and a device may drop and overflow
+/// for a second or two after a rate change (a B210 does after its master clock
+/// switches, though the same rung then streams almost cleanly), which says
+/// nothing about the rate the host sustains.
+pub const PROBE_SETTLE: Duration = Duration::from_millis(1500);
 /// How long each candidate rate streams, after [`PROBE_SETTLE`], while its
 /// overflows and delivered samples are counted.
 pub const PROBE_DWELL: Duration = Duration::from_millis(1500);
@@ -31,6 +34,14 @@ pub const PROBE_DWELL: Duration = Duration::from_millis(1500);
 /// rates), so a single sporadic overflow must not fail a rate the host keeps
 /// up with, while a host that cannot keep up overflows many times a second.
 pub const PROBE_MAX_OVERFLOWS: u64 = 1;
+/// How many times a rung rejected for overflows is tried again before the
+/// probe moves down: the retry tunes the same band again (a live stream
+/// already holds it, so the device is not restarted), waits [`PROBE_SETTLE`]
+/// again and dwells again, and is judged as the first attempt was; a device
+/// that stumbles for a second or two after a rate change has then had that
+/// long to settle. A rung that is short of [`PROBE_MIN_DELIVERED`], fails to
+/// tune or loses the device is not retried.
+pub const PROBE_RETRIES: u32 = 1;
 /// The fraction of a candidate's rate that must arrive for it to pass: a host
 /// that falls behind delivers short without always overflowing.
 pub const PROBE_MIN_DELIVERED: f64 = 0.98;
@@ -70,6 +81,23 @@ pub struct ProbeResult {
     pub clean: bool,
 }
 
+/// The probe's clock: [`PROBE_SETTLE`] and [`PROBE_DWELL`] by default, shorter
+/// in tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeTiming {
+    pub settle: Duration,
+    pub dwell: Duration,
+}
+
+impl Default for ProbeTiming {
+    fn default() -> Self {
+        ProbeTiming {
+            settle: PROBE_SETTLE,
+            dwell: PROBE_DWELL,
+        }
+    }
+}
+
 /// [`probe_rate`]'s cap.
 pub async fn probe_rate_cap(src: &SoapySource, center_hz: u64) -> Result<u64, String> {
     probe_rate(src, center_hz).await.map(|p| p.cap_hz)
@@ -78,19 +106,33 @@ pub async fn probe_rate_cap(src: &SoapySource, center_hz: u64) -> Result<u64, St
 /// Stream each of [`probe_candidates`] at `center_hz`, [`PROBE_SETTLE`] then
 /// [`PROBE_DWELL`], and take the first rate that delivered at least
 /// [`PROBE_MIN_DELIVERED`] of itself with at most [`PROBE_MAX_OVERFLOWS`] new
-/// overflow in the dwell. None passing is the slowest rate that
+/// overflow in the dwell (a rung that overflowed gets [`PROBE_RETRIES`] more
+/// attempts, each a retune, settle and dwell). None passing is the slowest rate that
 /// streamed, not clean; a candidate whose tune fails is skipped. Every tune
 /// failing is an error, and so is a device the source gives up as lost during
 /// the probe: no cap comes out of a rate that killed the device. The stream is
 /// then closed and the source left as it opened: nothing tuned, the probe's
 /// overflows not counted (a lost device's fault stays).
 pub async fn probe_rate(src: &SoapySource, center_hz: u64) -> Result<ProbeResult, String> {
-    let found = probe(src, center_hz).await;
+    probe_rate_with(src, center_hz, ProbeTiming::default()).await
+}
+
+/// [`probe_rate`] with its own settle and dwell.
+pub async fn probe_rate_with(
+    src: &SoapySource,
+    center_hz: u64,
+    timing: ProbeTiming,
+) -> Result<ProbeResult, String> {
+    let found = probe(src, center_hz, timing).await;
     src.end_probe().await;
     found
 }
 
-async fn probe(src: &SoapySource, center_hz: u64) -> Result<ProbeResult, String> {
+async fn probe(
+    src: &SoapySource,
+    center_hz: u64,
+    timing: ProbeTiming,
+) -> Result<ProbeResult, String> {
     // The reader thread ends when nothing receives; hold a receiver throughout.
     let _rx = src.subscribe();
     let mut lowest: Option<u64> = None;
@@ -101,33 +143,42 @@ async fn probe(src: &SoapySource, center_hz: u64) -> Result<ProbeResult, String>
             center_hz: Hz(center_hz),
             bandwidth_hz: Hz(rate),
         };
-        let tuned = src.tune(band).await;
-        if let Some(e) = lost(src, rate) {
-            return Err(e);
-        }
-        if let Err(e) = tuned {
-            errors.push(format!("{rate} Hz: {e}"));
-            continue;
-        }
-        tried += 1;
-        lowest = Some(lowest.map_or(rate, |l| l.min(rate)));
-        tokio::time::sleep(PROBE_SETTLE).await;
-        if let Some(e) = lost(src, rate) {
-            return Err(e);
-        }
-        let before = src.overflows();
-        tokio::time::sleep(PROBE_DWELL).await;
-        if let Some(e) = lost(src, rate) {
-            return Err(e);
-        }
-        let overflows = src.overflows() - before;
-        let measured = src.measured_rate_hz().unwrap_or(0.0);
-        if overflows <= PROBE_MAX_OVERFLOWS && measured >= PROBE_MIN_DELIVERED * rate as f64 {
-            return Ok(ProbeResult {
-                cap_hz: rate,
-                tried,
-                clean: true,
-            });
+        let mut counted = false;
+        for _attempt in 0..=PROBE_RETRIES {
+            let tuned = src.tune(band).await;
+            if let Some(e) = lost(src, rate) {
+                return Err(e);
+            }
+            if let Err(e) = tuned {
+                errors.push(format!("{rate} Hz: {e}"));
+                break;
+            }
+            if !counted {
+                counted = true;
+                tried += 1;
+                lowest = Some(lowest.map_or(rate, |l| l.min(rate)));
+            }
+            tokio::time::sleep(timing.settle).await;
+            if let Some(e) = lost(src, rate) {
+                return Err(e);
+            }
+            let before = src.overflows();
+            tokio::time::sleep(timing.dwell).await;
+            if let Some(e) = lost(src, rate) {
+                return Err(e);
+            }
+            let overflows = src.overflows() - before;
+            let measured = src.measured_rate_hz().unwrap_or(0.0);
+            if measured < PROBE_MIN_DELIVERED * rate as f64 {
+                break;
+            }
+            if overflows <= PROBE_MAX_OVERFLOWS {
+                return Ok(ProbeResult {
+                    cap_hz: rate,
+                    tried,
+                    clean: true,
+                });
+            }
         }
     }
     let cap_hz = lowest.ok_or_else(|| {

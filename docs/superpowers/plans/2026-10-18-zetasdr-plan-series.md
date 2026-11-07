@@ -485,13 +485,13 @@ slots of 2 MiB, 64 MiB per source by default, created per spawn and inherited as
 carries worker protocol 2, control JSON plus 40-byte block descriptors, so control never queues behind
 samples; a worker without a ring falls back to blocks on the pipe, and a protocol-1 child is still
 accepted. `source_list[].worker` shows `transport` and `transport_dropped`. At open the worker probes
-the device's rates from the top (at most 6 rungs, a 0.2 s settle and a 1.5 s dwell each) and reports
+the device's rates from the top (at most 6 rungs, a 1.5 s settle and a 1.5 s dwell each, a rung rejected for overflows tried once more) and reports
 the first clean one (at most one overflow in the dwell, at least 98 % delivered) as
 `max_bandwidth_hz: {measured: N}`; with no rung clean it keeps the driver's asserted cap and logs the
 `max_rate_hz=` to pin. `max_rate_hz=N` asserts a cap with no probe; a measured cap is cached in
 `sources/<id>.json` and passed to every respawn, and a respawn's measured cap replaces an asserted one.
 A request wider than a measured cap is refused `out_of_range` with `why: insufficient bandwidth: ...`.
-The hello timeout is 45 s. The sweep script is `scripts/rate-sweep.sh`.
+The hello timeout is 60 s. The sweep script is `scripts/rate-sweep.sh`.
 
 The ring holds `slots` blocks, not `slots × 2 MiB` of samples: each block takes a slot whatever its
 size, and a B210 block is 10 ms (two slots at 30.72 Msps, as a block of 307 200 samples is wider than
@@ -534,7 +534,11 @@ job.
 
 The ring removes most of the overflows at 15.36 and 20.48 (71 and 206 a minute before). But the probe
 under-caps the B210: 30.72 Msps delivered cleanly on the old pipe once streaming, so the probe's 200 ms
-settle is too short after a UHD master-clock change. Open, with the operator.
+settle was too short after a UHD master-clock change. Fixed on the branch: the settle is 1.5 s after every
+tune, a rung rejected for overflows (not for a short delivered rate) gets one more settle and dwell, and
+the hello timeout is 60 s (a cold FPGA load of 2-4 s plus up to 6 rungs of two 3 s attempts, about 40 s).
+The retry re-tunes the same band, which a live stream already holds, so it extends the settle without
+restarting the device. Re-measure on the field host's B210.
 
 A `kill -ABRT` of the B210's worker healed in 4.4 s with `--rate-cap-hz 20480000 --ring-fd 3` on the
 respawn and no second probe.
