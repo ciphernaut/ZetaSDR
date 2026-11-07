@@ -533,12 +533,15 @@ job.
 | 30.72 M | refused: `insufficient bandwidth: b210 delivers at most 20480000 Hz (measured at open)` | | | | |
 
 The ring removes most of the overflows at 15.36 and 20.48 (71 and 206 a minute before). But the probe
-under-caps the B210: 30.72 Msps delivered cleanly on the old pipe once streaming, so the probe's 200 ms
+under-capped the B210 at first: 30.72 Msps delivered cleanly on the old pipe once streaming, so the probe's 200 ms
 settle was too short after a UHD master-clock change. Fixed on the branch: the settle is 1.5 s after every
 tune, a rung rejected for overflows (not for a short delivered rate) gets one more settle and dwell, and
 the hello timeout is 60 s (a cold FPGA load of 2-4 s plus up to 6 rungs of two 3 s attempts, about 40 s).
 The retry re-issues the tune, which is a no-op on the running stream, so it is a second settle and a
-fresh dwell, and each attempt's delivered rate is judged on the samples of its own dwell. Re-measure on the field host's B210.
+fresh dwell, and each attempt's delivered rate is judged on the samples of its own dwell. Redeployed as
+`plan28.1b-zeta` at 16:26 with the B210's `capabilities` key removed (node stopped): the B210 probed
+`rate cap 30720000 Hz measured (2 rungs tried)`, and a minute at 30.72 Msps delivered 30.72 M with 0
+overflows (11 a minute on the old pipe).
 
 A `kill -ABRT` of the B210's worker healed in 4.4 s with `--rate-cap-hz 20480000 --ring-fd 3` on the
 respawn and no second probe.
