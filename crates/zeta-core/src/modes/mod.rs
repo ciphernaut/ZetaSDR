@@ -11,6 +11,7 @@
 //! accepted signature's row written, say): every reader takes the registry from the
 //! handle at each use, so it sees the old rows or the new ones, never a mix.
 
+pub mod handlers;
 mod row;
 pub mod score;
 pub mod summary;
@@ -27,17 +28,17 @@ use crate::stage::StageRegistry;
 pub(crate) use row::FRAME_DECODE_STAGE;
 pub use row::{
     AltUnit, Band, Container, Decoder, DecoderKind, Demod, ENVELOPE_FIELDS, Event, FRAME_PARSERS,
-    Family, FieldPath, FrameBlock, FrameDemod, IDENTITY_REGISTERS, IDENTITY_STRIPS, Identify,
-    Identity, InputStream, InputVia, Install, ModeId, ModeRow, OutputVia, Parser, PositionMap,
-    ProgramBlock, ProgramInput, ProgramOutput, Proof, QUICK_ATTEMPTS, RowError, RowTest,
-    SampleFormat, Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec, center_khz_text,
-    is_mode_id, parse, validate,
+    Family, FieldPath, FrameBlock, FrameDemod, Handler, IDENTITY_REGISTERS, IDENTITY_STRIPS,
+    Identify, Identity, InputStream, InputVia, Install, ModeId, ModeRow, OutputVia, Parser,
+    PositionMap, ProgramBlock, ProgramInput, ProgramOutput, Proof, QUICK_ATTEMPTS, RowError,
+    RowTest, SampleFormat, Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec,
+    center_khz_text, is_mode_id, parse, validate,
 };
 
-/// Where a loaded row stands: `ready` (parsed, validated and, for a program row, its
-/// program found), `broken` (the row does not parse or validate; `reason` names the
-/// field) or `unavailable` (a program row whose program is not on this host; `reason`
-/// says which).
+/// Where a loaded row stands: `ready` (parsed, validated and, for a program row or a
+/// graph row with `handlers`, its programs found), `broken` (the row does not parse or
+/// validate; `reason` names the field) or `unavailable` (a row whose program, or one of
+/// whose handlers, is not on this host; `reason` says which).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModeState {
@@ -63,12 +64,13 @@ pub struct LoadedMode {
     /// The file the row came from: `modes/<id>.json` for an embedded row, the path for
     /// an operator row.
     pub file: String,
-    /// The program a program row runs; `null` until probed, and for a graph row.
+    /// The program a program row runs (a graph row's first handler); `null` until
+    /// probed, and for a row with no handlers.
     #[schemars(required, schema_with = "crate::types::nullable::<PathBuf>")]
     #[serde(deserialize_with = "nullable")]
     pub program: Option<PathBuf>,
-    /// When `zeta modes check` last passed this program row on this host (UNIX seconds,
-    /// from `modes-checked.json` in the state directory); `null` if never.
+    /// When `zeta modes check` last passed this row with handlers on this host (UNIX
+    /// seconds, from `modes-checked.json` in the state directory); `null` if never.
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     #[serde(deserialize_with = "nullable")]
     pub checked: Option<u64>,
@@ -306,8 +308,9 @@ impl ModeRegistry {
         self.modes.iter().map(|m| m.row.id.0.clone()).collect()
     }
 
-    /// Record the program a program row runs after probing: found, the row is ready;
-    /// not found (`None`), it is unavailable with `reason`. A broken row stays broken.
+    /// Record the program a row with handlers runs after probing (a program row's
+    /// program, a graph row's first handler): found, the row is ready; not found
+    /// (`None`), it is unavailable with `reason`. A broken row stays broken.
     pub fn set_program(&mut self, id: &str, program: Option<PathBuf>, reason: Option<String>) {
         let Some(m) = self.modes.iter_mut().find(|m| m.row.id.0 == id) else {
             return;
@@ -324,14 +327,14 @@ impl ModeRegistry {
     }
 
     /// Carry what probing found from `old` (the registry this one replaces) to each
-    /// program row of the same id: its `program`, `state` and `reason`, so a reload
-    /// keeps the probe's answer without probing again. Only where both rows are
-    /// program rows with the same decoder block (an edited block's answer may no longer
-    /// hold: such a row stays as loaded, its program looked up at launch) and neither
-    /// is broken.
+    /// row with handlers (a program row, a graph row naming `handlers`) of the same id:
+    /// its `program`, `state` and `reason`, so a reload keeps the probe's answer
+    /// without probing again. Only where both rows have the same decoder block (an
+    /// edited block's answer may no longer hold: such a row stays as loaded, its
+    /// programs looked up at launch) and neither is broken.
     pub fn carry_programs(&mut self, old: &ModeRegistry) {
         for m in &mut self.modes {
-            if m.state == ModeState::Broken || !matches!(m.row.decoder, Decoder::Program(_)) {
+            if m.state == ModeState::Broken || m.row.decoder.handler_blocks().is_empty() {
                 continue;
             }
             let Some(o) = old.get(&m.row.id.0) else {
@@ -416,6 +419,7 @@ fn placeholder(id: &str) -> ModeRow {
         decoder: Decoder::Graph {
             nodes: vec![],
             edges: vec![],
+            handlers: vec![],
         },
         event: Event {
             schema: serde_json::json!({}),

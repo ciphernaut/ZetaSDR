@@ -599,3 +599,54 @@ fn the_hfdl_row_decodes_an_uplink_through_the_fake_program() {
     assert_eq!(out.trim(), "hfdl_fake: ok", "{out}");
     assert_eq!(code, 0);
 }
+
+/// The embedded `pocsag_decode` row (its test block included) as an operator row
+/// `pocsag_voc` naming one handler, `program`.
+fn write_pocsag_with_handler(dir: &Path, program: &str) {
+    let mut row: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/pocsag_decode.json")).unwrap();
+    row["decoder"]["handlers"] = serde_json::json!([{
+        "programs": [program],
+        "install": {"debian": "nothing", "url": "https://example.invalid"}
+    }]);
+    write_whole_row(dir, "pocsag_voc", row);
+}
+
+/// A graph row whose handler is missing is skipped naming it, and `--strict` fails it.
+#[test]
+fn a_graph_row_with_a_missing_handler_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pocsag_with_handler(dir.path(), "zeta-no-such-handler");
+    let (out, code) = stdout(&mut check(dir.path(), &["pocsag_voc"]));
+    assert_eq!(
+        out.trim(),
+        "pocsag_voc: skipped: zeta-no-such-handler missing",
+        "{out}"
+    );
+    assert_eq!(code, 0);
+    let (out, code) = stdout(&mut check(dir.path(), &["--strict", "pocsag_voc"]));
+    assert_eq!(
+        out.trim(),
+        "pocsag_voc: fail: zeta-no-such-handler missing",
+        "{out}"
+    );
+    assert_eq!(code, 1);
+}
+
+/// A graph row whose handler is found runs its check, and a pass is recorded in
+/// `modes-checked.json` as a program row's is (a plain graph row's is not).
+#[test]
+fn a_graph_row_with_its_handler_found_records_its_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pocsag_with_handler(dir.path(), &fake_lines().display().to_string());
+    let (out, code) = stdout(&mut check(dir.path(), &["pocsag_voc"]));
+    assert_eq!(out.trim(), "pocsag_voc: ok", "{out}");
+    assert_eq!(code, 0);
+    let (out, code) = stdout(&mut check(dir.path(), &["pocsag_decode"]));
+    assert_eq!(out.trim(), "pocsag_decode: ok", "{out}");
+    assert_eq!(code, 0);
+    let text = std::fs::read_to_string(dir.path().join("state/modes-checked.json")).unwrap();
+    let checked: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(checked["pocsag_voc"].is_u64(), "{text}");
+    assert!(checked.get("pocsag_decode").is_none(), "{text}");
+}

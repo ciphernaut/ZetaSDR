@@ -271,9 +271,14 @@ pub enum Decoder {
     /// Today's `Graph` shape without its id; the channel node's `center_hz`,
     /// `bandwidth_hz` and `out_rate_hz` are written `"$center_hz"`, `"$bandwidth_hz"`,
     /// `"$out_rate_hz"` for the expander to fill.
+    #[schemars(transform = require_all)]
     Graph {
         nodes: Vec<Node>,
         edges: Vec<Edge>,
+        /// Programs a stage of the graph needs on the host, probed at startup as a
+        /// program row's program is: a missing one makes the row `unavailable`.
+        #[serde(default)]
+        handlers: Vec<Handler>,
     },
     Program(ProgramBlock),
     /// `channel → resample → <demod> → clock_recover → slicer → frame_decode`: the
@@ -298,6 +303,30 @@ impl Decoder {
             Decoder::Frame(_) => DecoderKind::Frame,
         }
     }
+
+    /// The programs the row needs on the host, each with where to get it: a program
+    /// row's one block, a graph row's `handlers` in order; none for a plain graph row
+    /// or a frame row (its chain is all in-process stages).
+    pub fn handler_blocks(&self) -> Vec<(&[String], &Install)> {
+        match self {
+            Decoder::Program(p) => vec![(p.programs.as_slice(), &p.install)],
+            Decoder::Graph { handlers, .. } => handlers
+                .iter()
+                .map(|h| (h.programs.as_slice(), &h.install))
+                .collect(),
+            Decoder::Frame(_) => vec![],
+        }
+    }
+}
+
+/// A program a stage of a graph row needs on the host.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeHandler", transform = require_all)]
+pub struct Handler {
+    /// Names tried on `PATH` in order (or an absolute path), the first found used.
+    pub programs: Vec<String>,
+    pub install: Install,
 }
 
 /// A frame row's decoder: the demodulator, the framing and what reads each frame.
@@ -947,7 +976,21 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
         _ => {}
     }
     match &row.decoder {
-        Decoder::Graph { nodes, edges } => validate_graph(nodes, edges, stages),
+        Decoder::Graph {
+            nodes,
+            edges,
+            handlers,
+        } => {
+            for (i, h) in handlers.iter().enumerate() {
+                if h.programs.is_empty() {
+                    return Err(RowError::new(
+                        format!("decoder.handlers[{i}].programs"),
+                        "names no program (give at least one name or absolute path)",
+                    ));
+                }
+            }
+            validate_graph(nodes, edges, stages)
+        }
         Decoder::Program(p) => validate_program(p),
         Decoder::Frame(b) => validate_frame(b, stages),
     }
@@ -2009,6 +2052,62 @@ mod tests {
         // An unknown field of the block or its demod is refused naming it.
         let text = edited(FRAME, |v| v["decoder"]["demod"]["bogus"] = 1.into());
         assert_eq!(parse(&text).unwrap_err().field, "bogus");
+    }
+
+    /// A handler block as a graph row names it.
+    fn codec2_handlers() -> serde_json::Value {
+        serde_json::json!([{
+            "programs": ["c2dec"],
+            "install": {"debian": "codec2", "url": "https://github.com/drowe67/codec2"}
+        }])
+    }
+
+    #[test]
+    fn a_graph_row_may_name_handlers() {
+        let row = parse(&edited(POCSAG, |v| {
+            v["decoder"]["handlers"] = codec2_handlers()
+        }))
+        .unwrap();
+        // The handlers pass; with no stages the graph itself is what fails (tests/modes.rs
+        // validates the row whole against zeta-dsp's stages).
+        let e = validate(&row, &no_stages()).unwrap_err();
+        assert_eq!(e.field, "decoder", "{e}");
+        assert!(e.error.contains("unknown stage kind"), "{e}");
+        let blocks = row.decoder.handler_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, ["c2dec"]);
+        assert_eq!(blocks[0].1.debian.as_deref(), Some("codec2"));
+        let Decoder::Graph { handlers, .. } = &parse(POCSAG).unwrap().decoder else {
+            panic!("graph row");
+        };
+        assert!(handlers.is_empty(), "a row without the key has none");
+        assert!(parse(POCSAG).unwrap().decoder.handler_blocks().is_empty());
+        // A program row's one block.
+        let adsb = parse(ADSB).unwrap();
+        let blocks = adsb.decoder.handler_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0.first().map(String::as_str), Some("dump1090"));
+    }
+
+    #[test]
+    fn an_empty_handler_program_list_is_broken_naming_the_field() {
+        let empty = serde_json::json!([{"programs": [], "install": {"url": "x"}}]);
+        let row = parse(&edited(POCSAG, |v| v["decoder"]["handlers"] = empty)).unwrap();
+        let e = validate(&row, &no_stages()).unwrap_err();
+        assert_eq!(e.field, "decoder.handlers[0].programs", "{e}");
+    }
+
+    #[test]
+    fn a_handler_with_an_unknown_key_is_broken() {
+        let text = edited(
+            POCSAG,
+            |v| {
+                v["decoder"]["handlers"] =
+                    serde_json::json!([{"programs": ["a"], "install": {"url": "x"}, "bogus": 1}])
+            },
+        );
+        let e = parse(&text).unwrap_err();
+        assert!(e.field.contains("bogus"), "{e}");
     }
 
     #[test]

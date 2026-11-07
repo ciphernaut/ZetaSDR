@@ -31,7 +31,7 @@ pub fn expand(row: &ModeRow, tuning: Tuning, out_rate_hz: u64) -> Result<Graph, 
         ("$out_rate_hz", out_rate_hz),
     ];
     match &row.decoder {
-        Decoder::Graph { nodes, edges } => {
+        Decoder::Graph { nodes, edges, .. } => {
             let ids: HashMap<&NodeId, NodeId> =
                 nodes.iter().map(|n| (&n.id, NodeId::new())).collect();
             let id = |old: &NodeId| {

@@ -11,9 +11,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
-use zeta_core::modes::{
-    Decoder, LoadedMode, ModeRegistry, ModeState, ModesHandle, RowTest, TestSpec,
-};
+use zeta_core::modes::{LoadedMode, ModeRegistry, ModeState, ModesHandle, RowTest, TestSpec};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::stream::Payload;
 use zeta_core::types::{Hz, SourceId, StreamKind, Timestamp};
@@ -142,7 +140,7 @@ pub async fn run(
         println!("{line}");
         match outcome {
             Outcome::Ok => {
-                if matches!(m.row.decoder, Decoder::Program(_)) {
+                if !m.row.decoder.handler_blocks().is_empty() {
                     let at = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
@@ -177,10 +175,17 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
     let Some(test) = &m.row.test else {
         return skip("no test".into());
     };
-    if m.state == ModeState::Unavailable
-        && let Decoder::Program(p) = &m.row.decoder
-    {
-        let handler = p.programs.first().map_or("program", String::as_str);
+    if m.state == ModeState::Unavailable {
+        // The first handler list not on this host (the first list when all are found
+        // now: the probe said otherwise).
+        let blocks = m.row.decoder.handler_blocks();
+        let missing = blocks
+            .iter()
+            .find(|(p, _)| zeta_ext::proc::find_handler(p).is_none())
+            .or(blocks.first());
+        let handler = missing
+            .and_then(|(p, _)| p.first())
+            .map_or("program", String::as_str);
         return skip(format!("{handler} missing"));
     }
     if let TestSpec::Fixture { path } = &test.kind

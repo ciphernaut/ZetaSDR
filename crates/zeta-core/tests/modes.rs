@@ -799,3 +799,84 @@ fn a_bad_identity_is_broken_naming_the_field() {
         .remove("strip");
     validate(&parse(&v.to_string()).unwrap(), &stages).unwrap();
 }
+
+/// The embedded `pocsag_decode` row as an operator row `id` naming one handler program
+/// that no host has.
+fn pocsag_with_a_missing_handler(id: &str) -> serde_json::Value {
+    let mut v: serde_json::Value = serde_json::from_str(&renamed_pocsag("Voice pagers")).unwrap();
+    v["id"] = id.into();
+    v["decoder"]["handlers"] = serde_json::json!([{
+        "programs": ["zeta-no-such-handler"],
+        "install": {"debian": "nothing", "url": "https://example.invalid"}
+    }]);
+    v
+}
+
+/// A graph row may name handlers: it validates whole against zeta-dsp's stages.
+#[test]
+fn a_graph_row_with_handlers_validates() {
+    let row = parse(&pocsag_with_a_missing_handler("pocsag_voc").to_string()).unwrap();
+    validate(&row, &stages()).unwrap();
+    assert_eq!(row.decoder.handler_blocks().len(), 1);
+}
+
+/// A graph row its probe left unavailable is refused by `job_start` with its reason,
+/// as a program row is.
+#[tokio::test]
+async fn job_start_refuses_an_unavailable_graph_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut reg = ModeRegistry::load(&stages(), None);
+    let reason = "c2dec: missing (apt install codec2; u) — modes: pocsag_decode";
+    reg.set_program("pocsag_decode", None, Some(reason.into()));
+    let node = Node::open_with_modes(
+        cfg(dir.path(), &modes),
+        stages(),
+        vec![],
+        Some(std::sync::Arc::new(reg)),
+    )
+    .await
+    .unwrap();
+    let e = node
+        .apply(Op::JobStart {
+            kind: zeta_core::ops::JobKind::PocsagDecode,
+            source: zeta_core::types::SourceId("src".into()),
+            center_hz: Hz(153_350_000),
+            bandwidth_hz: Hz(12_500),
+            deviation_hz: None,
+            sideband: None,
+            elastic: false,
+            replace: vec![],
+        })
+        .await
+        .unwrap_err();
+    let OpError::Other { message } = &e else {
+        panic!("{e:?}");
+    };
+    assert!(message.contains("unavailable"), "{message}");
+    assert!(message.contains("c2dec: missing"), "{message}");
+}
+
+/// A reload carries a graph row's probed handler state over, as a program row's.
+#[tokio::test]
+async fn reload_modes_keeps_a_graph_rows_handler_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let row = pocsag_with_a_missing_handler("pocsag_voc");
+    std::fs::write(modes.join("pocsag_voc.json"), row.to_string()).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let mut probed = (*node.modes()).clone();
+    let reason = "zeta-no-such-handler: missing (u) — modes: pocsag_voc".to_string();
+    probed.set_program("pocsag_voc", None, Some(reason.clone()));
+    node.modes_handle().set(std::sync::Arc::new(probed));
+    node.reload_modes().unwrap();
+    let reg = node.modes();
+    let m = reg.get("pocsag_voc").unwrap();
+    assert_eq!(m.state, ModeState::Unavailable);
+    assert_eq!(m.reason, Some(reason));
+    assert_eq!(reg.get("pocsag_decode").unwrap().state, ModeState::Ready);
+}

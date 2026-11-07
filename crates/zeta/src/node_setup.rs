@@ -12,7 +12,7 @@ use std::time::Duration;
 use zeta_core::bursts::BurstPolicy;
 use zeta_core::classify::StubClassifier;
 use zeta_core::knowledge::StaticKnowledge;
-use zeta_core::modes::{Decoder, ModeRegistry, ModeState, ProgramBlock};
+use zeta_core::modes::{Install, ModeRegistry, ModeState};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
@@ -79,30 +79,47 @@ pub fn registry(
     registry
 }
 
-/// Find the program of every program row, one probe per distinct `programs` list (rows
-/// in id order), and record it in `modes` (`set_program`): found, the rows are ready
-/// with it; missing, they are unavailable with the report line as their reason. The
-/// lookup honours `ZETA_HANDLER_<PROGRAM>` (and `ZETA_DUMP1090` for dump1090), an
-/// override naming no executable file being missing. Returns the handler report, one line per
-/// list (spec 5.3): `zeta: handlers: <programs[0]>: found <path> (<version>)` or
-/// `zeta: handlers: <programs[0]>: missing (<hint>; <url>) — modes: <ids>`, the hint
+/// Find the handlers of every row that needs programs on the host (a program row's
+/// program, a graph row's `handlers`:
+/// [`handler_blocks`](zeta_core::modes::Decoder::handler_blocks)), one probe per
+/// distinct `programs` list (rows in id order), and record each row in `modes`
+/// (`set_program`): every handler found, the row is ready with its first handler's
+/// path; one missing, it is unavailable with that list's report line as its reason.
+/// The lookup honours `ZETA_HANDLER_<PROGRAM>` (and `ZETA_DUMP1090` for dump1090), an
+/// override naming no executable file being missing. Returns the handler report, one
+/// line per list (spec 5.3): `zeta: handlers: <programs[0]>: found <path> (<version>)`
+/// or `zeta: handlers: <programs[0]>: missing (<hint>; <url>) — modes: <ids>`, the hint
 /// `apt install <debian>`, else `dnf install <fedora>`, else `brew install <brew>`,
 /// left out (with its `; `) when the row names no package.
 pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
-    let mut groups: Vec<(ProgramBlock, Vec<String>)> = Vec::new();
+    // Each distinct list with where to get it and the rows naming it; each row with
+    // its lists in order.
+    let mut groups: Vec<(Vec<String>, Install, Vec<String>)> = Vec::new();
+    let mut rows: Vec<(String, Vec<Vec<String>>)> = Vec::new();
     for m in modes.all().iter().filter(|m| m.state != ModeState::Broken) {
-        let Decoder::Program(b) = &m.row.decoder else {
+        let blocks = m.row.decoder.handler_blocks();
+        if blocks.is_empty() {
             continue;
-        };
-        match groups.iter_mut().find(|(g, _)| g.programs == b.programs) {
-            Some((_, ids)) => ids.push(m.row.id.0.clone()),
-            None => groups.push((b.clone(), vec![m.row.id.0.clone()])),
         }
+        let id = m.row.id.0.clone();
+        for (programs, install) in &blocks {
+            match groups.iter_mut().find(|(p, _, _)| p == programs) {
+                Some((_, _, ids)) => {
+                    if !ids.contains(&id) {
+                        ids.push(id.clone());
+                    }
+                }
+                None => groups.push((programs.to_vec(), (*install).clone(), vec![id.clone()])),
+            }
+        }
+        rows.push((id, blocks.iter().map(|(p, _)| p.to_vec()).collect()));
     }
     let mut lines = Vec::new();
-    for (block, ids) in groups {
-        let first = block.programs.first().cloned().unwrap_or_default();
-        match zeta_ext::proc::find_handler(&block.programs) {
+    // Each list's answer: its path, or the reason it is missing.
+    let mut found: Vec<(Vec<String>, Result<PathBuf, String>)> = Vec::new();
+    for (programs, i, ids) in groups {
+        let first = programs.first().cloned().unwrap_or_default();
+        let answer = match zeta_ext::proc::find_handler(&programs) {
             Some(path) => {
                 let version = zeta_ext::proc::handler_version(&path).await;
                 let version = if version.is_empty() {
@@ -114,12 +131,9 @@ pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
                     "zeta: handlers: {first}: found {} ({version})",
                     path.display()
                 ));
-                for id in &ids {
-                    modes.set_program(id, Some(path.clone()), None);
-                }
+                Ok(path)
             }
             None => {
-                let i = &block.install;
                 let hint = [("apt", &i.debian), ("dnf", &i.fedora), ("brew", &i.brew)]
                     .into_iter()
                     .find_map(|(tool, pkg)| pkg.as_ref().map(|p| format!("{tool} install {p}; ")))
@@ -130,9 +144,25 @@ pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
                     ids.join(", ")
                 );
                 lines.push(format!("zeta: handlers: {reason}"));
-                for id in &ids {
-                    modes.set_program(id, None, Some(reason.clone()));
-                }
+                Err(reason)
+            }
+        };
+        found.push((programs, answer));
+    }
+    let answer = |programs: &Vec<String>| {
+        found
+            .iter()
+            .find(|(p, _)| p == programs)
+            .map(|(_, a)| a.clone())
+            .unwrap_or_else(|| Err(String::new()))
+    };
+    for (id, lists) in rows {
+        let answers: Vec<Result<PathBuf, String>> = lists.iter().map(answer).collect();
+        match answers.iter().find_map(|a| a.as_ref().err()) {
+            Some(reason) => modes.set_program(&id, None, Some(reason.clone())),
+            None => {
+                let first = answers.into_iter().next().and_then(Result::ok);
+                modes.set_program(&id, first, None);
             }
         }
     }
@@ -812,5 +842,37 @@ mod tests {
             assert!(out >= bw, "adsb_decode {rate} {bw}: {out}");
             validate(&g, &registry).unwrap_or_else(|e| panic!("adsb_decode {rate}: {e}"));
         }
+    }
+
+    /// A graph row naming a handler no host has is probed like a program row: it is
+    /// unavailable with the report line as its reason, and the rows without handlers
+    /// stay ready.
+    #[tokio::test]
+    async fn probe_marks_a_graph_row_with_a_missing_handler_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut row: serde_json::Value =
+            serde_json::from_str(include_str!("../../../modes/pocsag_decode.json")).unwrap();
+        row["id"] = "pocsag_voc".into();
+        row["decoder"]["handlers"] = serde_json::json!([{
+            "programs": ["zeta-no-such-handler"],
+            "install": {"debian": "nothing", "url": "https://example.invalid"}
+        }]);
+        std::fs::write(dir.path().join("pocsag_voc.json"), row.to_string()).unwrap();
+        let registry = registry(None, &ModesHandle::default(), None);
+        let mut modes = ModeRegistry::load(&registry, Some(dir.path()));
+        assert_eq!(modes.get("pocsag_voc").unwrap().state, ModeState::Ready);
+        let report = probe_handlers(&mut modes).await;
+        let reason = "zeta-no-such-handler: missing (apt install nothing; \
+                      https://example.invalid) — modes: pocsag_voc";
+        let m = modes.get("pocsag_voc").unwrap();
+        assert_eq!(m.state, ModeState::Unavailable);
+        assert_eq!(m.reason.as_deref(), Some(reason));
+        assert_eq!(m.program, None);
+        let ours: Vec<&String> = report
+            .iter()
+            .filter(|l| l.contains("zeta-no-such-handler"))
+            .collect();
+        assert_eq!(ours, [&format!("zeta: handlers: {reason}")], "{report:?}");
+        assert_eq!(modes.get("pocsag_decode").unwrap().state, ModeState::Ready);
     }
 }
