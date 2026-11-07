@@ -360,17 +360,19 @@ notes "FLEX pagers at 1600, 3200 or 6400 bps (2- or 4-level FSK, ±4800 Hz), 250
 
 `centers_hz` is empty: the operator's FLEX source is offline and has no antenna (section 14), so
 this wave knows no live FLEX centre; FLEX is synthesised-only now, and the live check is a UAT task
-(section 12). The `multimon` parser gains the FLEX branch, both line forms multimon-ng prints:
-`FLEX|<time>|<baud>/<levels>/<K|C>/<phase>|<cycle>.<frame>|<capcode>|<ALN|NUM|TON|BIN>|<text>`
-(FLEX_NEXT, the form in the parser's existing test) and
-`FLEX: <time> <baud>/<levels>/<K> <cycle>.<frame> [<capcode>] <ALN> <text>` (the older `FLEX`
-demodulator). Fields: `capcode` (integer), `baud` (integer), `levels` (integer), `phase` (string or
+(section 12). The `multimon` parser gains the FLEX branch, the line forms multimon-ng 1.5.0 prints
+(pinned against its real output in Task 12; an earlier draft of this section quoted wrong forms):
+`FLEX_NEXT|<baud>/<levels>|<cycle>.<frame>.<phase>|<capcode>|<address type>|<vector type>|<ALN|NUM|TON|BIN>|<text>`
+(the FLEX_NEXT demodulator, this row's; an ALN page has a fragment field such as `3.0.K` before the
+text), `FLEX|[<time>|]<baud>/<levels>/<K|C>/<phase>|<cycle>.<frame>|<capcode>|ALN|<text>` (the older
+`FLEX` demodulator's alphanumeric page) and its other pages,
+`FLEX: <time> <baud>/<levels>/<phase> <cycle>.<frame> [<capcode>] <NUM|...> <text>`.
+Fields: `capcode` (integer), `baud` (integer), `levels` (integer), `phase` (string or
 null), `cycle`, `frame` (integer), `kind` (`alpha`, `numeric`, `tone`, `binary` or null), `text`
 (string or null). multimon's timestamp is the host clock and is dropped (`t_ns` is the frame's).
 `summary`: `"{capcode}: {text?}"`, POCSAG's shape. No subject, as POCSAG: each page is its own
 message (the "address list in the Subjects tab" gist stays open). The exact lines are pinned
-against output captured from multimon-ng on the field host during `--strict` (builder's task; the
-format in the parser's test is the starting point).
+against output captured from multimon-ng during `--strict` (Task 12; the parser's tests hold them).
 
 ### 6.3 The synthesiser
 

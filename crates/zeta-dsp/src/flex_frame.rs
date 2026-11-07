@@ -1,21 +1,24 @@
 //! FLEX paging frame generator: builds one 1.875 s frame at 1600 bit/s, 2-level, holding
 //! one alphanumeric page, for the `flex` synthesiser family (`zeta modes check flex_decode`).
 //!
-//! Written from public descriptions, not from any decoder's source: the Signal
-//! Identification Wiki's FLEX page (<https://www.sigidwiki.com/wiki/FLEX>: 1600, 3200
-//! and 6400 bit/s, 2- or 4-level FSK at ±4800 Hz, 1.875 s frames, 128 frames a 4-minute
-//! cycle), the FLEX patents' frame descriptions (US 6,038,549 and US 6,378,073: a frame
-//! is sync 1, the frame information word and sync 2, then blocks 0 to 10; US 6,396,411:
-//! sync 1 opens with the 32-bit bit sync pattern) and the published protocol summaries
-//! they draw on (sync 1 of bit sync, the A word naming the rate, B and the inverted A;
-//! 11 blocks of 8 BCH(31,21) words, interleaved by column; the block information word,
-//! the address field, the vector field and the message field; the short address as the
-//! capcode offset by 32768), and the published
-//! descriptions of the 64-bit sync code (`AAAA:A6C6AAAA:~AAAA`, with `0x870C` for
-//! 1600 bit/s 2-level). multimon-ng 1.5.0's sources (GPL) were not read: the program was
-//! run only as a black-box oracle, fed audio through `-a FLEX_NEXT -v 3`, whose debug
-//! lines name the stage it reached (sync, frame information word, block information
-//! word, address, vector) and what it read there. What the oracle settled is marked.
+//! Written without any decoder's source. The frame outline (1.875 s frames, 128 to a
+//! 4-minute cycle; a frame is sync 1, the frame information word and sync 2, then blocks
+//! 0 to 10; sync 1 opens with a 32-bit bit sync pattern) is as the FLEX patents
+//! US 6,038,549, US 6,378,073 and US 6,396,411 describe it. Those patents were found by
+//! search and only search summaries of these passages were seen, not the patents
+//! themselves; they are credited with nothing more. The rates and the ±4800 Hz
+//! deviation are general knowledge (the design spec points to the Signal Identification
+//! Wiki's FLEX page, <https://www.sigidwiki.com/wiki/FLEX>, which was not fetched for this
+//! module). The field
+//! layouts below (the sync words and the 64-bit sync code `AAAA:A6C6AAAA:~AAAA` with
+//! `0x870C` for 1600 bit/s 2-level, the word bit order, the frame and block information
+//! words, the interleave, the short address as the capcode plus 32768, the vector and
+//! the message words) are from general knowledge of the protocol, each confirmed against
+//! the oracle where marked. The oracle is multimon-ng 1.5.0, whose sources (GPL) were not
+//! read: it was run only as a black box, fed audio through `-a FLEX_NEXT -v 3`, whose
+//! debug lines name the stage it reached (sync, frame information word, block information
+//! word, address, vector) and what it read there; `strings` was run on its binary only to
+//! see its output formats.
 //!
 //! - **Line**: NRZ 2-FSK at [`BAUD`]; [`FRAME_BITS`] bits a frame.
 //! - **Words**: 21 data bits `i0..i20` (`i0` the least significant bit of the values

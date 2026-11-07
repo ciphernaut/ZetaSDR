@@ -251,8 +251,13 @@ mod tests {
         assert_eq!(v["text"], Value::Null);
     }
 
-    // The FLEX lines below are multimon-ng 1.5.0's own output, captured from it decoding
-    // the `flex` synthesiser's frames (and variants of them with other vector types).
+    // Captured from multimon-ng 1.5.0 decoding the `flex` synthesiser's frames (and
+    // variants with other vector types and texts), verbatim: the FLEX_NEXT ALN (`3.0.K`
+    // and `0.0.C`), NUM, BIN and `A|B C` lines; the FLEX ALN lines with and without the
+    // time; the spaced NUM line and its `--flex-no-ts` pipe form. Made up, in the captured
+    // forms: the FLEX_NEXT 3200/4 TON line (no tone page was synthesised), the FLEX
+    // `A|B C` line (captured as `A|B`), the UNK line (a captured one, shortened) and the
+    // lines that must not parse.
 
     #[test]
     fn flex_next_lines_give_the_fields() {
