@@ -1,0 +1,52 @@
+{
+  "id": "flex_decode",
+  "name": "FLEX pagers",
+  "family": "pagers",
+  "band": {
+    "bandwidth_hz": 25000,
+    "centers_hz": [],
+    "min_hz": 12500,
+    "range_hz": null
+  },
+  "modulation": ["fm", "fsk"],
+  "label": "FLEX",
+  "protocol": "flex",
+  "decoder": {
+    "kind": "program",
+    "programs": ["multimon-ng"],
+    "args": ["-t", "raw", "-a", "FLEX_NEXT", "-q", "-"],
+    "demod": {"kind": "nbfm", "deviation_hz": 4800, "audio_rate_hz": 22050},
+    "input": {"stream": "audio", "format": "s16", "rate_hz": 22050, "via": "stdin", "container": "raw"},
+    "output": {"via": "stdout", "port": null, "parser": "multimon"},
+    "install": {"debian": "multimon-ng", "url": "https://github.com/EliasOenal/multimon-ng"}
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "capcode": { "type": "integer" },
+        "baud": { "type": "integer" },
+        "levels": { "type": "integer" },
+        "phase": { "type": ["string", "null"] },
+        "cycle": { "type": "integer" },
+        "frame": { "type": "integer" },
+        "kind": { "type": ["string", "null"], "enum": ["numeric", "alpha", "tone", "binary", null] },
+        "text": { "type": ["string", "null"] }
+      }
+    },
+    "summary": "{capcode}: {text?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 15000,
+    "min_span_ms": 1000,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": ["flex"],
+  "access": "restricted",
+  "test": null,
+  "notes": "FLEX pagers at 1600, 3200 or 6400 bps (2- or 4-level FSK, ±4800 Hz), 25000 Hz band; 929-932 MHz in the US, 151.8-153.4 MHz elsewhere per the catalogue; start it on the measured centre. One event per page, like POCSAG. It runs multimon-ng on the node's host."
+}

@@ -3071,7 +3071,7 @@ async fn an_unknown_mode_id_names_the_known_ids() {
         .await
         .unwrap();
     let op: Op = serde_json::from_value(serde_json::json!({
-        "op": "job_start", "kind": "flex_decode", "source": "rtl0",
+        "op": "job_start", "kind": "nonesuch_decode", "source": "rtl0",
         "center_hz": 929_612_500u64, "bandwidth_hz": 25_000, "deviation_hz": null,
         "sideband": null, "elastic": false, "replace": [],
     }))
@@ -3083,7 +3083,7 @@ async fn an_unknown_mode_id_names_the_known_ids() {
             known,
         }) => {
             assert_eq!(field, "kind");
-            assert_eq!(value, "flex_decode");
+            assert_eq!(value, "nonesuch_decode");
             assert!(known.iter().any(|k| k == "fm_demod"), "{known:?}");
             assert!(known.iter().any(|k| k == "pocsag_decode"), "{known:?}");
             assert!(!known.iter().any(|k| k == "transcribe"), "{known:?}");

@@ -18,7 +18,13 @@ fn zeta_bin() -> Command {
     let mut cmd = Command::cargo_bin("zeta").unwrap();
     cmd.env_remove("ZETA_NODE")
         .env_remove("ZETA_SECRET")
-        .env("XDG_CONFIG_HOME", common::no_xdg_config());
+        .env("XDG_CONFIG_HOME", common::no_xdg_config())
+        // multimon-ng is pinned missing, whatever the host has: a test that wants the FLEX
+        // row ready sets it again.
+        .env(
+            "ZETA_HANDLER_MULTIMON_NG",
+            "/nonexistent/zeta-test/multimon-ng",
+        );
     cmd
 }
 
@@ -1111,7 +1117,8 @@ fn job_start_identify_then_tail_prints_candidates() {
         .iter()
         .partition(|f| f["payload"]["protocol"] == "origin");
     assert_eq!(origin.len(), 1, "{v}");
-    assert_eq!(frames.len(), 2, "{v}");
+    // The tried one, a sonde row out of range, and the FLEX row (unavailable: multimon-ng is pinned missing).
+    assert_eq!(frames.len(), 3, "{v}");
     for f in &frames {
         let p = &f["payload"];
         assert_eq!(p["protocol"], "candidate", "{v}");
@@ -2731,6 +2738,9 @@ const SONDE_HANDLERS: [&str; 3] = [
 /// The aircraft data-link rows' programs, each pinned to `path` whatever the host has.
 const AIRCRAFT_LINK_HANDLERS: [&str; 2] = ["ZETA_HANDLER_DUMPVDL2", "ZETA_HANDLER_DUMPHFDL"];
 
+/// The FLEX row's program, pinned like the others.
+const PAGER_HANDLERS: [&str; 1] = ["ZETA_HANDLER_MULTIMON_NG"];
+
 /// `zeta modes list` (one-shot) prints the embedded rows, all ready; `--family`
 /// narrows it and `modes show` prints one row.
 #[test]
@@ -2743,7 +2753,11 @@ fn modes_list_prints_the_embedded_rows() {
     // whatever the host has.
     let mut cmd = zeta(dir.path(), &["--modes-dir", &modes_dir, "modes", "list"]);
     cmd.env("ZETA_HANDLER_DUMP1090", fake_dump1090());
-    for var in SONDE_HANDLERS.iter().chain(&AIRCRAFT_LINK_HANDLERS) {
+    for var in SONDE_HANDLERS
+        .iter()
+        .chain(&AIRCRAFT_LINK_HANDLERS)
+        .chain(&PAGER_HANDLERS)
+    {
         cmd.env(var, fake_lines());
     }
     let out = cmd.assert().success().get_output().stdout.clone();
@@ -2759,6 +2773,7 @@ fn modes_list_prints_the_embedded_rows() {
             "ais_decode",
             "aprs_decode",
             "dfm_decode",
+            "flex_decode",
             "hfdl_decode",
             "m20_decode",
             "pocsag_decode",
@@ -3108,7 +3123,7 @@ fn job_start_accepts_a_mode_id_string() {
         .stdout
         .clone();
     assert_eq!(json(&out)["result"], "job");
-    let out = start("flex_decode")
+    let out = start("nonesuch_decode")
         .assert()
         .code(2)
         .get_output()
@@ -3117,7 +3132,7 @@ fn job_start_accepts_a_mode_id_string() {
     let v = json(&out);
     assert_eq!(v["error"], "unknown", "{v}");
     assert_eq!(v["field"], "kind", "{v}");
-    assert_eq!(v["value"], "flex_decode", "{v}");
+    assert_eq!(v["value"], "nonesuch_decode", "{v}");
     let known: Vec<&str> = v["known"]
         .as_array()
         .unwrap()

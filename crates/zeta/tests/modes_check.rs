@@ -18,6 +18,11 @@ const NO_SONDE: [(&str, &str); 3] = [
 ];
 /// The aircraft data-link rows' programs, pinned to a path none lives at, whatever the
 /// host has.
+/// The pager decoder's program, pinned to a path none lives at, whatever the host has.
+const NO_MULTIMON: (&str, &str) = (
+    "ZETA_HANDLER_MULTIMON_NG",
+    "/nonexistent/zeta-test/multimon-ng",
+);
 const NO_AIRCRAFT_LINKS: [(&str, &str); 2] = [
     ("ZETA_HANDLER_DUMPVDL2", "/nonexistent/zeta-test/dumpvdl2"),
     ("ZETA_HANDLER_DUMPHFDL", "/nonexistent/zeta-test/dumphfdl"),
@@ -38,6 +43,7 @@ fn check(dir: &Path, args: &[&str]) -> Command {
         .env("ZETA_HANDLER_DUMP1090", NO_DUMP1090)
         .envs(NO_SONDE)
         .envs(NO_AIRCRAFT_LINKS)
+        .env(NO_MULTIMON.0, NO_MULTIMON.1)
         .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--modes-dir")
@@ -71,6 +77,11 @@ fn modes_check_passes_the_in_crate_rows() {
     assert!(
         out.lines()
             .any(|l| l == "adsb_decode: skipped: dump1090 missing"),
+        "{out}"
+    );
+    // FLEX has no test until its synthesiser lands.
+    assert!(
+        out.lines().any(|l| l == "flex_decode: skipped: no test"),
         "{out}"
     );
     // DFM has no test yet; the RS41 and M20 decoders are pinned missing here.
@@ -112,7 +123,7 @@ fn an_unknown_id_lists_the_known_ones() {
     assert!(
         err.contains(
             "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
-             dfm_decode, hfdl_decode, m20_decode, pocsag_decode, rds_decode, rs41_decode, \
+             dfm_decode, flex_decode, hfdl_decode, m20_decode, pocsag_decode, rds_decode, rs41_decode, \
              vdl2_decode"
         ),
         "{err}"

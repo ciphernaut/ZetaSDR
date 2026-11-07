@@ -21,12 +21,13 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 11] = [
+const EMBEDDED: [&str; 12] = [
     "acars_decode",
     "adsb_decode",
     "ais_decode",
     "aprs_decode",
     "dfm_decode",
+    "flex_decode",
     "hfdl_decode",
     "m20_decode",
     "pocsag_decode",
@@ -164,10 +165,11 @@ async fn modes_list_filters_by_family_and_state() {
         modes.join("junk.json").display().to_string()
     );
     let pagers = list(Some(Family::Pagers), Some(ModeState::Ready)).await;
-    assert_eq!(pagers.len(), 1);
-    assert_eq!(pagers[0].id.0, "pocsag_decode");
+    assert_eq!(pagers.len(), 2);
+    assert_eq!(pagers[0].id.0, "flex_decode");
+    assert_eq!(pagers[1].id.0, "pocsag_decode");
     // The wire form: snake-case `state`, `family` and `decoder_kind`, nullable fields `null`.
-    let v = serde_json::to_value(&pagers[0]).unwrap();
+    let v = serde_json::to_value(&pagers[1]).unwrap();
     assert_eq!(v["state"], "ready");
     assert_eq!(v["family"], "pagers");
     assert_eq!(v["decoder_kind"], "graph");
@@ -489,7 +491,7 @@ fn only_the_pager_rows_are_restricted() {
         .filter(|m| m.row.access == Some(Access::Restricted))
         .map(|m| m.row.id.0.as_str())
         .collect();
-    assert_eq!(restricted, ["pocsag_decode"]);
+    assert_eq!(restricted, ["flex_decode", "pocsag_decode"]);
 }
 
 #[test]

@@ -7,7 +7,7 @@ set of typed operations (36 of them). The same operations are reached from the `
 authenticated HTTP and websocket API, a web page the node serves (waterfall, jobs, map,
 transcripts), an MCP server, and an agent that lets a local LLM call them. Every job is a graph of
 stages: channelisers, NBFM/WFM/AM/SSB demodulators, decoders (APRS on 2 m, radiosondes, ADS-B,
-then RDS, ACARS and POCSAG pagers), measurement and classification, a band watch that identifies
+then RDS, ACARS, and POCSAG and FLEX pagers), measurement and classification, a band watch that identifies
 what appears, burst capture, transcription and a mix of every talking channel. It is for the
 radio amateur who wants the radio to do the fiddly work (hear what is on 2 m and 70 cm, track a
 radiosonde, see the aircraft overhead), and for an agent that needs operations it can call rather
@@ -141,7 +141,7 @@ endpoint (`--llm-url`, `--llm-model`), and `zeta-mcp` offers every operation as 
 
 ## Legal
 
-The node has decoders for public protocols: APRS, radiosondes, ADS-B, ACARS, RDS and POCSAG.
+The node has decoders for public protocols: APRS, AIS, radiosondes, ADS-B, ACARS, RDS, and POCSAG and FLEX pagers.
 Having a decoder is not permission to use it. Whether you may receive and decode a given
 transmission where you are, pager traffic in particular, depends on your local law and is your
 responsibility; nothing here is legal advice. For an unknown third-party signal the agent's
