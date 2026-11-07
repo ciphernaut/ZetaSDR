@@ -2172,6 +2172,11 @@ pub struct ModeInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<Subject>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub subject: Option<Subject>,
+    /// `'restricted'` on a row whose events carry content a later access control may
+    /// gate (pager text); `null` otherwise.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub access: Option<String>,
 }
 
 impl From<&LoadedMode> for ModeInfo {
@@ -2189,6 +2194,7 @@ impl From<&LoadedMode> for ModeInfo {
             program: m.program.as_ref().map(|p| p.display().to_string()),
             checked: m.checked,
             subject: m.row.subject.clone(),
+            access: m.row.access.clone(),
         }
     }
 }

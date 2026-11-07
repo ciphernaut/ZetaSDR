@@ -84,6 +84,11 @@ pub struct ModeRow {
     /// page tabulates and folds them; `null` keeps one ribbon per event.
     #[serde(default)]
     pub subject: Option<Subject>,
+    /// `null` (the default) or `'restricted'`: the row's events carry content a deployment
+    /// may want to show to fewer people than the spectrum (pager text); `'restricted'`
+    /// adds `access: 'restricted'` to each event.
+    #[serde(default)]
+    pub access: Option<String>,
 }
 
 /// What a mode's events are about: the event field naming it, the table columns the

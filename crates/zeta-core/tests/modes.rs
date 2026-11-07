@@ -480,6 +480,41 @@ async fn modes_list_and_show_carry_the_subject() {
 }
 
 #[test]
+fn only_the_pager_rows_are_restricted() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let restricted: Vec<&str> = reg
+        .all()
+        .iter()
+        .filter(|m| m.row.access.as_deref() == Some("restricted"))
+        .map(|m| m.row.id.0.as_str())
+        .collect();
+    assert_eq!(restricted, ["pocsag_decode"]);
+}
+
+#[tokio::test]
+async fn modes_list_carries_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let Ok(OpResult::Modes { modes }) = node
+        .apply(Op::ModesList {
+            family: None,
+            state: None,
+        })
+        .await
+    else {
+        panic!("expected modes");
+    };
+    let info =
+        |id: &str| serde_json::to_value(modes.iter().find(|m| m.id.0 == id).unwrap()).unwrap();
+    assert_eq!(info("pocsag_decode")["access"], "restricted");
+    assert_eq!(info("aprs_decode")["access"], serde_json::Value::Null);
+}
+
+#[test]
 fn the_rows_thin_their_tracks_as_planned() {
     let plan = [
         ("adsb_decode", 100, 500.0),

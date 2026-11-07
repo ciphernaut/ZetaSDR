@@ -436,6 +436,7 @@ fn placeholder(id: &str) -> ModeRow {
         position: None,
         time: None,
         subject: None,
+        access: None,
     }
 }
 
