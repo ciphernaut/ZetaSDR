@@ -1,0 +1,26 @@
+{
+  "annotations": [
+    {
+      "core:freq_lower_edge": 136962500,
+      "core:freq_upper_edge": 136987500,
+      "core:sample_count": 26083,
+      "core:sample_start": 0,
+      "zeta:expected": {
+        "icao": "76CD10"
+      },
+      "zeta:source": "b210"
+    }
+  ],
+  "captures": [
+    {
+      "core:datetime": "2026-11-07T13:44:27Z",
+      "core:frequency": 136975000,
+      "core:sample_start": 0
+    }
+  ],
+  "global": {
+    "core:datatype": "ci8",
+    "core:sample_rate": 51200,
+    "core:version": "1.0.0"
+  }
+}

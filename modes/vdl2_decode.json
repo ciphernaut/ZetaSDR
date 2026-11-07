@@ -94,7 +94,7 @@
   "test": {
     "kind": "fixture",
     "path": "fixtures/vdl2-136975k-1.sigmf-meta",
-    "expect": {},
+    "expect": { "icao": "76CD10" },
     "within_ms": 10000
   },
   "position": { "lat": "lat", "lon": "lon", "alt_m": "alt_ft", "alt_unit": "ft" },

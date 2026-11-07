@@ -481,3 +481,15 @@ From the operator, 2026-11-06, raised while scoping plan 28 (analog video): a vi
 ## Plans: VTX channel tables from the open VTX firmware
 
 From the operator, 2026-11-06, while scoping plan 28. The 5.8 GHz FPV channels are letter-named (A1-A8 descending, B on 19 MHz steps, E irregular, F, R on 37 MHz steps) and the plan registry numbers channels on uniform steps and matches a job within 1 kHz, so plan 28 ships no video plan. Later: lift the channel tables from the open VTX firmware (OpenVTx's and Betaflight's VTX tables, which carry every band and power level the transmitters themselves use), as `fpv_58` and `fpv_13` rows with letter names, and give a plan a match tolerance wide enough for a job centred on a measured carrier (plan 28's rule) to take its channel's name. `plan_start` on a video plan is not wanted.
+
+## Bug: `source_list` reports the startup ring length after a retune
+
+From plan 30's live acceptance, 2026-11-07. The B210's ring was sized for 10 s at the startup capture of 3.84 MHz. Pinned at 10.24 MHz it held about 3.5 s, yet `source_list` still reported `ring.seconds: 10.0`, and `iq read` of 9 s answered `too_old`. Either resize the ring on a retune (it is a byte budget, so seconds shrink as the rate grows) or report the seconds the current rate actually holds.
+
+## Capture: the burst gate does not suit VDL2 on the B210
+
+From plan 30's live acceptance, 2026-11-07. A `capture` job on 136.975 MHz, 25 kHz fired on spikes of about 1 ms, wrote 32 windows in about 20 s, then stopped at its burst cap; none decoded. The VDL2 fixture was recorded off the ring instead (an `iq read` of the last 3 s on each `vdl2_decode` event, channelised offline). Spec 4.6 assumed the gate would serve VDL2. Look at a minimum burst length for the gate and at "record on decode" as a capture mode.
+
+## Station: the B210 hears little in airband
+
+From plan 30's live acceptance, 2026-11-07, at midnight local: no visible carriers at 136-138 MHz, no ACARS frame in 30 minutes on seven channels, one strong aircraft on VDL2. Night traffic explains part; the antenna or its coverage at airband is the other suspect. UAT 30.2 needs a daytime rerun.
