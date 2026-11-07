@@ -98,10 +98,13 @@ Done in plan 30 (`docs/superpowers/specs/2026-11-06-aircraft-links-design.md`, `
 - `--source-position` is per node start, not an op.
 - The merged table's `Via` lists protocols, not job ids.
 - In a merged group keyed by `reg` the ICAO address is shown nowhere (vdl2's `icao` is its key, not a column).
-- The `job_start` note's identify-dwell list omits the new rows.
 - A 200 `/status` page from a Kiwi without a usable `gps=` is neither counted nor diagnosable.
 - The `$center_khz` first-frame wait has no direct test.
 - A string that trims to "" is kept as "".
+- An older federated node refuses a plan-30 node's `source_list`: `--source-node` from an older binary rejects the unknown `position` field (as `ring` and `worker` did before it). Either both ends upgrade together, or `zeta-source-node` parses `SourceInfo` leniently.
+- `NodePort` (`crates/zeta-source-node`) does not forward a remote source's `position`: a one-line `Port::position` copying `remote.position`.
+- The fake-program checks assert no `summary`, and HFDL's only the uplink.
+- No scenario covers a merged group's member dropped by `subject_drop_s` (Review Focus 4).
 
 ## Jobs: an attached job's record keeps its input's old tuning after a retune
 

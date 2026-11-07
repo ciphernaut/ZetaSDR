@@ -32,7 +32,7 @@ Each of these is a mode row: `zeta modes list` gives its id (the `kind` to start
 2. For VDL2, `source_pin` the radio at 133 500 000 Hz / 8 000 000 Hz first, then `plan_start` `acars_vhf` as above, then `job_start --kind vdl2_decode --center-hz 136975000 --bandwidth-hz 25000`: every job fits the pin and is leased without a tune. Started the other way round, VDL2 is a `conflict` naming the ACARS jobs.
 3. Start `adsb_decode` on a second source. A radio serves one band at a time, so on one radio it must wait until the ACARS jobs are stopped.
 
-When rows declare `subject.merge` (`acars_decode` and `vdl2_decode` both do), the page shows one aircraft table across the links, with a `Via` column listing the protocols heard. `merge_skip` names the subjects a row keeps apart (a VDL2 ground station, whose `reg` is the last uplink's aircraft).
+When rows declare `subject.merge` (`acars_decode` and `vdl2_decode` both do), the page shows one aircraft table across the links, with a `Via` column listing the protocols heard. `merge_skip` names the subjects a row keeps apart (a VDL2 ground station, whose `reg` is the last uplink's aircraft). The seven `acars_vhf` jobs share that one table too: an aircraft heard on two ACARS channels is one row, and the heading lists the jobs.
 
 `knowledge_lookup` says which decoder proves a band's signature (`decoder` names the mode id, the job kind; `null` when no mode proves it yet). `classify` tries the best-scoring modes with a quick attempt (APRS, POCSAG, ACARS, RDS) as decode-to-identify and lists each under `tried` with its outcome; it never runs a program row such as ADS-B (`skipped_quick`: use `adsb_decode`). A CRC-clean decode is the strongest layer 2 evidence there is. A signature match without one is a guess: say so.
 
