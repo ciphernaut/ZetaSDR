@@ -348,7 +348,7 @@ pub(crate) struct Decoded {
 }
 
 /// Pack `bits` (whole bytes) into bytes by `order`.
-fn pack(bits: &[u8], order: BitOrder) -> Vec<u8> {
+pub(crate) fn pack(bits: &[u8], order: BitOrder) -> Vec<u8> {
     bits.chunks(BYTE_BITS)
         .map(|c| {
             let b = c.iter().fold(0u8, |a, &v| (a << 1) | (v & 1)) << (BYTE_BITS - c.len());
@@ -444,7 +444,7 @@ fn crc_bytes(def: &CrcDef) -> usize {
 /// The CRC field as it trails the frame. The byte order follows the usual convention
 /// for each CRC: big-endian for a non-reflected CRC (CCITT), little-endian for a
 /// reflected one (`refout`: Modbus, DNP, X.25), as they are sent on the line.
-fn crc_field(def: &CrcDef, value: u64) -> Vec<u8> {
+pub(crate) fn crc_field(def: &CrcDef, value: u64) -> Vec<u8> {
     let n = crc_bytes(def);
     let be: Vec<u8> = (0..n)
         .rev()
@@ -457,8 +457,10 @@ fn crc_field(def: &CrcDef, value: u64) -> Vec<u8> {
     }
 }
 
-/// Whether `bytes` close with the CRC of the rest, under `def`.
-fn crc_matches(def: &CrcDef, bytes: &[u8]) -> bool {
+/// Whether `bytes` close with the CRC of the rest, under `def` (its field as
+/// [`crc_field`] writes it). `bit_view` checks its CRC candidates with it, so a candidate
+/// it lists decodes CRC-clean here.
+pub(crate) fn crc_matches(def: &CrcDef, bytes: &[u8]) -> bool {
     let n = crc_bytes(def);
     if bytes.len() < n {
         return false;

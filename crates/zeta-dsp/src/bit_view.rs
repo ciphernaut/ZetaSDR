@@ -17,7 +17,8 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Provenance, Span, StreamId, StreamKind, Timestamp};
 
 use crate::correlate::BitsIn;
-use crate::crc::{CRCS, CrcSpec, crc};
+use crate::crc::{CRCS, CrcDef};
+use crate::framing::{BitOrder, crc_matches, pack};
 use crate::{Input, run_map_ending};
 
 /// The stage kind, as graphs name it.
@@ -282,27 +283,30 @@ fn flatness(segments: &[Vec<u8>]) -> f32 {
     (1.0 - tv / 2.0).clamp(0.0, 1.0) as f32
 }
 
-/// The line code scores of `segments`: `nrz` the [`flatness`] of the bits as they are,
-/// `nrzi` that of the bits decoded as NRZI (a bit is a change of level), `differential`
-/// that of the bits XORed with the previous one (on two levels the same decoding as
-/// NRZI, so the same score), `manchester` the share of runs of at most
-/// [`MANCHESTER_RUN_MAX`] bits (1 when no run exceeds it). `likely` is the highest,
-/// `nrz` unless another beats it by more than [`ENCODING_MARGIN`] (random-looking bits
-/// read about the same under every decoding), then the first of `manchester`, `nrzi`,
-/// `differential` on a tie. Each decoding is taken within a segment.
+/// `segment` decoded against the previous line bit, as `frame_decode`'s line codes
+/// are: with `hold` 1 its `nrzi` (NRZ-S: a 1 where the line holds, a 0 on a change),
+/// with `hold` 0 its `differential` (a 1 on a change).
+fn decoded(segment: &[u8], hold: u8) -> Vec<u8> {
+    segment.windows(2).map(|w| w[0] ^ w[1] ^ hold).collect()
+}
+
+/// The line code scores of `segments`, named as `frame_decode`'s line codes: `nrz` the
+/// [`flatness`] of the bits as they are, `nrzi` that of the bits decoded as NRZ-S (a 1
+/// where the level holds), `differential` that of the bits decoded as a change of level
+/// (each XORed with the previous one: the complement of NRZ-S, with the same runs, so
+/// the same score), `manchester` the share of runs of at most [`MANCHESTER_RUN_MAX`]
+/// bits (1 when no run exceeds it). `likely` is the highest, `nrz` unless another beats
+/// it by more than [`ENCODING_MARGIN`] (random-looking bits read about the same under
+/// every decoding), then the first of `manchester`, `nrzi`, `differential` on a tie (so
+/// `nrzi` over `differential`, which a framing may try in its turn). Each decoding is
+/// taken within a segment.
 fn encoding_of(segments: &[&[u8]], runs: &[(u8, u32)]) -> Encoding {
     let plain: Vec<Vec<u8>> = segments.iter().map(|s| s.to_vec()).collect();
-    let changes: Vec<Vec<u8>> = segments
-        .iter()
-        .map(|s| s.windows(2).map(|w| u8::from(w[0] != w[1])).collect())
-        .collect();
-    let xored: Vec<Vec<u8>> = segments
-        .iter()
-        .map(|s| s.windows(2).map(|w| w[0] ^ w[1]).collect())
-        .collect();
+    let holds: Vec<Vec<u8>> = segments.iter().map(|s| decoded(s, 1)).collect();
+    let changes: Vec<Vec<u8>> = segments.iter().map(|s| decoded(s, 0)).collect();
     let nrz = flatness(&plain);
-    let nrzi = flatness(&changes);
-    let differential = flatness(&xored);
+    let nrzi = flatness(&holds);
+    let differential = flatness(&changes);
     let manchester = if runs.is_empty() {
         0.0
     } else {
@@ -557,21 +561,6 @@ fn syncs(segs: &Segments, by_width: &[(u32, Words)]) -> Vec<Sync> {
         .collect()
 }
 
-/// `bits` packed MSB first into bytes; with `reflect` each byte bit-reversed (the
-/// bytes of an LSB-first stream).
-fn pack(bits: &[u8], reflect: bool) -> Vec<u8> {
-    bits.chunks(BYTE_BITS)
-        .map(|c| {
-            let b = c.iter().fold(0u8, |acc, &v| (acc << 1) | v);
-            if reflect { b.reverse_bits() } else { b }
-        })
-        .collect()
-}
-
-fn value_of(bits: &[u8]) -> u64 {
-    bits.iter().fold(0u64, |acc, &v| (acc << 1) | u64::from(v))
-}
-
 /// The frames of `period` bits cut at the occurrences of `sync` that fit inside their
 /// segment, at most [`CRC_MAX_FRAMES`].
 fn period_frames<'a>(bits: &'a [u8], segs: &Segments, sync: &Sync, period: usize) -> Vec<&'a [u8]> {
@@ -594,39 +583,42 @@ fn next_sync_frames<'a>(bits: &'a [u8], sync: &Sync) -> Vec<&'a [u8]> {
         .collect()
 }
 
-/// The CRCs that check on `frames` cut at `sync` (listed with `period_bits`): a frame's
-/// last `width` bits are the CRC, the bits between the sync and it the data, packed MSB
-/// first; a frame whose data is not whole bytes (or empty) is not tried for that spec.
-/// Tried as sent and LSB first (every data byte bit-reversed, the CRC field read
-/// reversed); a spec is listed when it checks on at least [`CRC_MIN_FRAMES`], with
-/// `checked` the frames it was tried on.
+/// The CRCs that check on `frames` cut at `sync` (listed with `period_bits`), checked
+/// as `frame_decode` checks them: the bits after the sync packed into bytes MSB first
+/// (as sent) and LSB first (each byte bit-reversed, listed ` lsb-first`), the trailing
+/// field in the CRC's own byte order (big-endian unless the CRC is reflected), so a
+/// framing of the sync, the cut, the CRC and that bit order decodes every frame that
+/// checked here CRC-clean. A frame whose bits after the sync are not whole bytes, or
+/// leave no data before the field, is not tried for that spec. A spec is listed when it
+/// checks on at least [`CRC_MIN_FRAMES`], with `checked` the frames it was tried on.
 fn crcs_for(frames: &[&[u8]], sync: &Sync, period_bits: u32, out: &mut Vec<CrcCandidate>) {
     if frames.len() < CRC_MIN_FRAMES {
         return;
     }
     let sync_w = sync.width as usize;
+    // Each frame's bits after the sync, packed in both bit orders, once for every spec.
+    let packed: Vec<[Vec<u8>; 2]> = frames
+        .iter()
+        .filter_map(|f| {
+            let rest = f.get(sync_w..)?;
+            (!rest.is_empty() && rest.len() % BYTE_BITS == 0)
+                .then(|| [pack(rest, BitOrder::Msb), pack(rest, BitOrder::Lsb)])
+        })
+        .collect();
     for spec in CRCS {
-        let width = spec.width as usize;
-        let (mut plain, mut lsb, mut checked) = (0u32, 0u32, 0u32);
-        for f in frames {
-            let Some(data_bits) = f.len().checked_sub(sync_w + width) else {
-                continue;
-            };
-            if data_bits == 0 || data_bits % BYTE_BITS != 0 {
+        let def = CrcDef::from(spec);
+        let field_bytes = usize::from(spec.width).div_ceil(BYTE_BITS);
+        let (mut msb, mut lsb, mut checked) = (0u32, 0u32, 0u32);
+        for [m, l] in &packed {
+            if m.len() <= field_bytes {
                 continue;
             }
             checked += 1;
-            let data = &f[sync_w..sync_w + data_bits];
-            let field = value_of(&f[sync_w + data_bits..]);
-            if crc(spec, &pack(data, false)) == field {
-                plain += 1;
-            }
-            if crc(spec, &pack(data, true)) == reflect(field, spec) {
-                lsb += 1;
-            }
+            msb += u32::from(crc_matches(&def, m));
+            lsb += u32::from(crc_matches(&def, l));
         }
         for (name, passed) in [
-            (spec.name.to_string(), plain),
+            (spec.name.to_string(), msb),
             (format!("{} lsb-first", spec.name), lsb),
         ] {
             if passed as usize >= CRC_MIN_FRAMES {
@@ -640,10 +632,6 @@ fn crcs_for(frames: &[&[u8]], sync: &Sync, period_bits: u32, out: &mut Vec<CrcCa
             }
         }
     }
-}
-
-fn reflect(v: u64, spec: &CrcSpec) -> u64 {
-    v.reverse_bits() >> (u64::BITS - u32::from(spec.width))
 }
 
 /// What one window of bits suggests (see each field's type), the window given as its
@@ -969,7 +957,8 @@ pub(crate) mod test_streams {
     use zeta_core::stream::{Frame, Payload, StreamBus};
     use zeta_core::types::{JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 
-    use crate::crc::{CRC16_CCITT, CrcSpec, crc};
+    use crate::crc::{CRC16_CCITT, CrcDef, CrcSpec, crc};
+    use crate::framing::crc_field;
     use crate::slicer::bits_event;
 
     /// The frame sync `framed_stream` plants.
@@ -1004,7 +993,8 @@ pub(crate) mod test_streams {
         framed_stream_with(frames, body_bytes, seed, &CRC16_CCITT)
     }
 
-    /// [`framed_stream`] closed by `spec`'s CRC (its width in bits) instead.
+    /// [`framed_stream`] closed by `spec`'s CRC instead (its field big-endian, or
+    /// little-endian for a reflected CRC, as `frame_decode` reads it).
     pub fn framed_stream_with(
         frames: usize,
         body_bytes: usize,
@@ -1038,7 +1028,10 @@ pub(crate) mod test_streams {
             for &b in &body {
                 push_msb(&mut out, u64::from(b), 8);
             }
-            push_msb(&mut out, crc(spec, &body), u32::from(spec.width));
+            // The CRC field as `frame_decode` reads it: big-endian unless reflected.
+            for b in crc_field(&CrcDef::from(spec), crc(spec, &body)) {
+                push_msb(&mut out, u64::from(b), 8);
+            }
             let stray = (start.saturating_sub(SYNC_W - 1)..=out.len() - SYNC_W)
                 .filter(|&i| i != start)
                 .any(|i| {
@@ -1198,6 +1191,25 @@ mod tests {
             "{}",
             h.summary
         );
+    }
+
+    /// `nrzi` decodes as `frame_decode`'s (NRZ-S), `differential` as a change of level:
+    /// an operator copying `encoding.likely` into a framing gets the line code scored.
+    #[test]
+    fn nrzi_is_nrz_s_and_differential_a_change() {
+        use crate::framing::{LineCode, decode_frames, encode_frames, test_support::fx};
+        assert_eq!(super::decoded(&[0, 0, 1, 1, 0], 1), vec![1, 0, 1, 0]);
+        assert_eq!(super::decoded(&[0, 0, 1, 1, 0], 0), vec![0, 1, 0, 1]);
+        // On frame_decode's own line: its nrzi recovers the frames the decoding read.
+        let mut f = fx("2dd4", 16, crate::framing::Length::Fixed { fixed_bits: 80 });
+        f.encoding = LineCode::Nrzi;
+        let line = encode_frames(&[vec![0xA5; 8]], &f);
+        // The encoder starts from a low line.
+        let ours = super::decoded(&[&[0], &line[..]].concat(), 1);
+        f.encoding = LineCode::Nrz;
+        let (frames, _) = decode_frames(&ours, &f);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0].crc_ok, Some(true));
     }
 
     #[test]

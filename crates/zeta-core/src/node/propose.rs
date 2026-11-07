@@ -626,7 +626,8 @@ fn propose_for_job(
 }
 
 /// A `frame_decode` framing from `bit_view`'s hypotheses `h` and its CRC candidate
-/// `candidate`: the likely line code, the candidate's sync (its width from the
+/// `candidate`: NRZ (`bit_view` hunts syncs and checks CRCs on the line bits as they
+/// are, whatever line code it finds likely), the candidate's sync (its width from the
 /// `sync_candidates` entry), a fixed length of the period less the sync (frames to
 /// the next sync when the period is 0), and the CRC (`bit_order` `lsb` for a
 /// ` lsb-first` one).
@@ -647,7 +648,7 @@ pub fn framing_from_hypothesis(h: &Value, candidate: &Value) -> Value {
         None => (crc, "msb"),
     };
     json!({
-        "encoding": h["encoding"]["likely"],
+        "encoding": "nrz",
         "sync": {"hex": sync, "bits": bits},
         "preamble": null,
         "whitening": "none",
@@ -764,5 +765,80 @@ mod tests {
         assert_eq!(f["length"], json!({"to_next_sync": true}));
         assert_eq!(f["crc"], "crc16-ccitt");
         assert_eq!(f["bit_order"], "lsb");
+        // bit_view hunts syncs and checks CRCs on the line bits as they are.
+        let h = json!({"encoding": {"likely": "manchester"}, "sync_candidates": []});
+        assert_eq!(framing_from_hypothesis(&h, &c)["encoding"], "nrz");
+    }
+
+    /// `n` pseudo-random bodies of `len` bytes.
+    fn bodies(n: usize, len: usize, seed: u64) -> Vec<Vec<u8>> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                (0..len)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        (s >> 24) as u8
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Every CRC candidate `bit_view` lists, framed by `framing_from_hypothesis`,
+    /// decodes CRC-clean under `frame_decode`'s framing, for every CRC of the table sent
+    /// either bit order; and the CRC the frames were written with is among them, its
+    /// fixed cut decoding every frame CRC-clean.
+    #[test]
+    fn every_bit_view_crc_candidate_decodes_crc_clean() {
+        use zeta_dsp::framing::{Framing, decode_frames, encode_frames};
+        const FRAMES: usize = 20;
+        const BODY: usize = 32;
+        for (k, spec) in zeta_dsp::crc::CRCS.iter().enumerate() {
+            for order in ["msb", "lsb"] {
+                let crc_bits = usize::from(spec.width);
+                let written: Framing = serde_json::from_value(json!({
+                    "encoding": "nrz", "sync": {"hex": "2dd4", "bits": 16},
+                    "length": {"fixed_bits": BODY * 8 + crc_bits},
+                    "crc": spec.name, "bit_order": order,
+                }))
+                .unwrap();
+                let line = encode_frames(&bodies(FRAMES, BODY, k as u64 + 1), &written);
+                let h = serde_json::to_value(zeta_dsp::bit_view::hypotheses(&[&line])).unwrap();
+                let want = match order {
+                    "lsb" => format!("{}{LSB_FIRST_SUFFIX}", spec.name),
+                    _ => spec.name.to_string(),
+                };
+                let candidates = h["crc_candidates"].as_array().unwrap();
+                assert!(
+                    candidates.iter().any(|c| c["crc"] == want.as_str()
+                        && c["sync"] == "2dd4"
+                        && c["period_bits"] != 0),
+                    "{want}: not among {candidates:?}"
+                );
+                for c in candidates {
+                    let framing = framing_from_hypothesis(&h, c);
+                    let f: Framing = serde_json::from_value(framing.clone()).unwrap();
+                    let (frames, _) = decode_frames(&line, &f);
+                    let clean = frames.iter().filter(|f| f.crc_ok == Some(true)).count();
+                    assert!(
+                        clean as u64 >= c["frames"].as_u64().unwrap(),
+                        "{want}: candidate {c} decodes {clean} clean of {} under {framing}",
+                        frames.len()
+                    );
+                    // A stray sync in a body cuts a to-the-next-sync frame short, so
+                    // only the fixed cut is held to every frame.
+                    if c["crc"] == want.as_str() && c["sync"] == "2dd4" && c["period_bits"] != 0 {
+                        assert_eq!(frames.len(), FRAMES, "{want}: {framing}");
+                        assert!(
+                            frames.iter().all(|f| f.crc_ok == Some(true)),
+                            "{want}: {framing}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
