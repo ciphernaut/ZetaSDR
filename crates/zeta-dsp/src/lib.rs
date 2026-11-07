@@ -12,6 +12,7 @@ use zeta_core::types::{Span, Timestamp};
 
 pub mod acars;
 pub mod afsk;
+pub mod ais_msg;
 pub mod am;
 pub mod aprs;
 pub mod aprs_info;

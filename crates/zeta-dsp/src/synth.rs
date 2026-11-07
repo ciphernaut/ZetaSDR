@@ -1,5 +1,5 @@
 //! Signal generators: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 / APRS, POCSAG, RDS, Mode S,
-//! ACARS, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
+//! ACARS, AIS, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
 //! `zeta modes check` runs the rows' tests on them. The test-only helpers stay in
 //! `fixtures`, behind feature `test-fixtures`.
 
@@ -910,6 +910,82 @@ fn repeat_bursts(
     out
 }
 
+/// AIS's line: GMSK at 9600 baud, 2400 Hz deviation (modulation index 0.5).
+pub const AIS_BAUD: u32 = 9600;
+pub const AIS_DEVIATION_HZ: u64 = 2400;
+/// The training sequence before each frame's start flag, `0101...`.
+pub const AIS_TRAINING_BITS: usize = 24;
+/// MMSIs are nine digits.
+const AIS_MMSI: std::ops::RangeInclusive<u32> = 100_000_000..=999_999_999;
+/// The family's speed is under this (102.2 kt is "102.2 or more", 102.3 not available).
+const AIS_SOG_MAX_KT: f64 = 102.2;
+/// A vessel name's most characters.
+const AIS_NAME_MAX: usize = 20;
+/// Most repeats of the `ais` family.
+const AIS_REPEAT_MAX: u32 = 60;
+
+/// One AIS frame's line levels: the training, then the HDLC frame (flags and stuffing
+/// from [`hdlc_frame_bits`]) of the payload's bytes least significant bit first with the
+/// CRC-16/X.25 appended little-endian, as [`ax25_ui_frame`] appends it; NRZI-encoded.
+fn ais_frame_levels(payload: &[u8]) -> Vec<u8> {
+    let mut frame = crate::ais_msg::payload_to_hdlc_bytes(payload);
+    let fcs = crate::crc16_x25(&frame);
+    frame.extend_from_slice(&fcs.to_le_bytes());
+    let mut bits: Vec<u8> = (0..AIS_TRAINING_BITS).map(|i| (i % 2) as u8).collect();
+    bits.extend(hdlc_frame_bits(&frame, 1, 1));
+    nrzi_encode(&bits)
+}
+
+/// The `ais` family's capture at `rate_hz`: half a second of silence, then per repeat
+/// the type 1 frame and (with a name) the type 5 frame, every frame GMSK at
+/// [`AIS_BAUD`] and [`AIS_DEVIATION_HZ`], `gap_ms` after the last; half a second of
+/// silence after.
+fn ais_iq(spec: &SynthSpec, rate_hz: u32) -> Vec<Complex<f32>> {
+    let SynthSpec::Ais {
+        mmsi,
+        lat,
+        lon,
+        sog_kt,
+        cog_deg,
+        name,
+        repeat,
+        gap_ms,
+    } = spec
+    else {
+        return Vec::new();
+    };
+    use crate::ais_msg::{position_report_bits, static_report_bits};
+    let mut payloads = vec![position_report_bits(*mmsi, *lat, *lon, *sog_kt, *cog_deg)];
+    if let Some(n) = name {
+        payloads.push(static_report_bits(*mmsi, n));
+    }
+    let frames: Vec<Vec<Complex<f32>>> = payloads
+        .iter()
+        .map(|p| {
+            gfsk_modulate(
+                &ais_frame_levels(p),
+                2,
+                AIS_BAUD,
+                AIS_DEVIATION_HZ as f64,
+                rate_hz,
+            )
+        })
+        .collect();
+    let silence = rate_hz as usize / 2;
+    let gap = (u64::from(rate_hz) * gap_ms / 1000) as usize;
+    let mut out = vec![Complex::new(0.0, 0.0); silence];
+    for r in 0..*repeat {
+        for (i, f) in frames.iter().enumerate() {
+            if r > 0 || i > 0 {
+                out.resize(out.len() + gap, Complex::new(0.0, 0.0));
+            }
+            out.extend_from_slice(f);
+        }
+    }
+    out.resize(out.len() + silence, Complex::new(0.0, 0.0));
+    out
+}
+
 /// The RS41's line: 4800 baud GFSK at 2400 Hz deviation.
 const RS41_BAUD: u32 = 4800;
 const RS41_DEVIATION_HZ: f64 = 2400.0;
@@ -1162,6 +1238,21 @@ pub enum SynthSpec {
         vel_v: f64,
         frames: u32,
     },
+    /// AIS ([`ais_frames_iq`]): per repeat a type 1 position report (`mmsi`, the position,
+    /// `sog_kt`, `cog_deg`) and, with `name`, a type 5 static report, GMSK at 9600 baud,
+    /// frames `gap_ms` apart (50 by default).
+    Ais {
+        mmsi: u32,
+        lat: f64,
+        lon: f64,
+        sog_kt: f64,
+        cog_deg: f64,
+        #[serde(default)]
+        name: Option<String>,
+        repeat: u32,
+        #[serde(default = "default_gap_ms")]
+        gap_ms: u64,
+    },
 }
 
 /// Impairments applied to a synthesised signal; each defaults to none.
@@ -1363,20 +1454,60 @@ impl SynthSpec {
                     return Err("vel_v: -100..=100".into());
                 }
             }
+            SynthSpec::Ais {
+                mmsi,
+                lat,
+                lon,
+                sog_kt,
+                cog_deg,
+                name,
+                repeat,
+                gap_ms,
+            } => {
+                if !AIS_MMSI.contains(mmsi) {
+                    return Err("mmsi: nine digits".into());
+                }
+                if !(lat.is_finite() && (-90.0..=90.0).contains(lat)) {
+                    return Err("lat: -90..=90".into());
+                }
+                if !(lon.is_finite() && (-180.0..=180.0).contains(lon)) {
+                    return Err("lon: -180..=180".into());
+                }
+                if !(sog_kt.is_finite() && (0.0..AIS_SOG_MAX_KT).contains(sog_kt)) {
+                    return Err(format!("sog_kt: 0 to under {AIS_SOG_MAX_KT}"));
+                }
+                if !(cog_deg.is_finite() && (0.0..360.0).contains(cog_deg)) {
+                    return Err("cog_deg: 0 to under 360".into());
+                }
+                if let Some(n) = name
+                    && (n.chars().count() > AIS_NAME_MAX
+                        || !n.chars().all(crate::ais_msg::is_six_bit_text))
+                {
+                    return Err(format!(
+                        "name: at most {AIS_NAME_MAX} characters of the AIS set (A-Z, 0-9, space, !\"#$%&'()*+,-./:;<=>?)"
+                    ));
+                }
+                if !(1..=AIS_REPEAT_MAX).contains(repeat) {
+                    return Err(format!("repeat: 1..={AIS_REPEAT_MAX}"));
+                }
+                if *gap_ms > BURST_GAP_MAX_MS {
+                    return Err(format!("gap_ms: 0..={BURST_GAP_MAX_MS}"));
+                }
+            }
             SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
         }
         Ok(())
     }
 
     /// The sample rate the family's capture is synthesised at: the one each decoder is
-    /// proven at (APRS, POCSAG and ACARS at 48 kHz, which the `channel` stage divides
+    /// proven at (APRS, POCSAG, ACARS and AIS at 48 kHz, which the `channel` stage divides
     /// down; RDS at 240 kHz; Mode S at 2.4 MHz; a bare NBFM tone at 48 kHz).
     pub fn rate_hz(&self) -> u32 {
         match self {
             SynthSpec::Aprs { .. } | SynthSpec::Pocsag { .. } | SynthSpec::Acars { .. } => 48_000,
             SynthSpec::Rds { .. } => 240_000,
             SynthSpec::ModesIdent { .. } => 2_400_000,
-            SynthSpec::NbfmTone { .. } | SynthSpec::Rs41 { .. } => 48_000,
+            SynthSpec::NbfmTone { .. } | SynthSpec::Rs41 { .. } | SynthSpec::Ais { .. } => 48_000,
             SynthSpec::Fsk {
                 symbol_rate_baud, ..
             }
@@ -1529,6 +1660,11 @@ pub fn synthesise(
             frames,
         } => {
             let mut iq = rs41_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Ais { .. } => {
+            let mut iq = ais_iq(spec, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -2034,5 +2170,71 @@ mod tests {
         let mut v = framing_json();
         v["deviation_hz"] = 0.0.into();
         assert!(parse_params(v.as_object().unwrap().clone()).is_err());
+    }
+
+    fn ais_json() -> serde_json::Value {
+        serde_json::json!({
+            "family": "ais", "mmsi": 503000001, "lat": -27.3842, "lon": 153.1175,
+            "sog_kt": 12.3, "cog_deg": 45.0, "name": "ZETA TEST", "repeat": 3
+        })
+    }
+
+    #[test]
+    fn ais_family_validates_and_is_48_khz() {
+        let parse = |v: serde_json::Value| parse_params(v.as_object().unwrap().clone());
+        let (spec, _) = parse(ais_json()).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        let bad = |key: &str, val: serde_json::Value| {
+            let mut v = ais_json();
+            v[key] = val;
+            parse(v).unwrap_err()
+        };
+        assert!(bad("mmsi", 1.into()).contains("mmsi"));
+        assert!(bad("sog_kt", 150.0.into()).contains("sog_kt"));
+        assert!(bad("name", "x".repeat(21).into()).contains("name"));
+        assert!(bad("name", "zeta".into()).contains("name"));
+        assert!(bad("lat", 91.0.into()).contains("lat"));
+        assert!(bad("lon", (-181.0).into()).contains("lon"));
+        assert!(bad("cog_deg", 360.0.into()).contains("cog_deg"));
+        assert!(bad("repeat", 0.into()).contains("repeat"));
+        let mut v = ais_json();
+        v.as_object_mut().unwrap().remove("name");
+        assert!(parse(v).is_ok());
+    }
+
+    #[test]
+    fn ais_frames_deframe_to_their_parameters() {
+        // The bit-order self-check: the chain `ais_decode` runs.
+        let (spec, imp) = parse_params(ais_json().as_object().unwrap().clone()).unwrap();
+        let iq = synthesise(&spec, &imp, 48_000, 161_975_000);
+        let mut prev = Complex::new(0.0, 0.0);
+        let audio = crate::nbfm::nbfm_demod(&iq, 48_000, 2400, &mut prev);
+        let line = crate::pocsag::BitSync::new(48_000, 9600).feed(&audio);
+        let mut last = 0u8;
+        let bits: Vec<u8> = line
+            .iter()
+            .map(|&b| {
+                let d = u8::from(b == last);
+                last = b;
+                d
+            })
+            .collect();
+        let frames = crate::ax25::HdlcDeframer::new().feed(&bits);
+        assert!(!frames.is_empty(), "no frame deframed");
+        let msgs: Vec<_> = frames
+            .iter()
+            .filter_map(|f| crate::ais_msg::decode(&crate::ais_msg::hdlc_bytes_to_payload(f)))
+            .collect();
+        let pos = msgs.iter().find(|m| m.msg_type == 1).expect("a type 1");
+        assert_eq!(pos.mmsi, 503_000_001);
+        assert!((pos.lat.unwrap() - -27.3842).abs() < 1e-4, "{:?}", pos.lat);
+        assert!((pos.lon.unwrap() - 153.1175).abs() < 1e-4, "{:?}", pos.lon);
+        assert_eq!(
+            msgs.iter().filter(|m| m.msg_type == 1).count(),
+            3,
+            "{msgs:?}"
+        );
+        let st = msgs.iter().find(|m| m.msg_type == 5).expect("a type 5");
+        assert_eq!(st.name.as_deref(), Some("ZETA TEST"));
     }
 }
