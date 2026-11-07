@@ -791,8 +791,11 @@ async fn channel_plans_lists_uhf_cb_au() {
     };
     assert_eq!(
         plans.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-        ["uhf_cb_au", "acars_vhf"]
+        ["uhf_cb_au", "acars_vhf", "ais_vhf"]
     );
+    let ais = &plans[2];
+    assert_eq!((ais.bandwidth_hz, ais.channels.len()), (Hz(25_000), 2));
+    assert_eq!(ais.channels[1].note.as_deref(), Some("channel B, 88B"));
     let p = &plans[0];
     assert_eq!((p.id.as_str(), p.region.as_str()), ("uhf_cb_au", "au"));
     assert_eq!((p.bandwidth_hz, p.adjacent_hz), (Hz(12_500), Hz(12_500)));

@@ -21,9 +21,10 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 10] = [
+const EMBEDDED: [&str; 11] = [
     "acars_decode",
     "adsb_decode",
+    "ais_decode",
     "aprs_decode",
     "dfm_decode",
     "hfdl_decode",
@@ -543,6 +544,7 @@ fn the_rows_thin_their_tracks_as_planned() {
         ("rds_decode", 100, 0.0),
         ("vdl2_decode", 100, 1000.0),
         ("hfdl_decode", 100, 1000.0),
+        ("ais_decode", 200, 50.0),
     ];
     let reg = ModeRegistry::load(&stages(), None);
     for (id, points, min_m) in plan {
@@ -565,7 +567,7 @@ fn the_rows_name_the_planned_subjects() {
     );
     use SubjectWaterfall::{Fold, Summary};
     let sondes: &[&str] = &["alt", "vel_v"];
-    let plan: [Plan; 9] = [
+    let plan: [Plan; 10] = [
         (
             "adsb_decode",
             "icao",
@@ -638,6 +640,15 @@ fn the_rows_name_the_planned_subjects() {
             &["flight", "gs", "pdu", "text"],
             None,
             Some("flight"),
+        ),
+        (
+            "ais_decode",
+            "mmsi",
+            "vessels",
+            Summary,
+            &["name", "callsign", "sog_kt", "cog_deg", "destination"],
+            Some("cog_deg"),
+            Some("name"),
         ),
     ];
     let reg = ModeRegistry::load(&stages(), None);

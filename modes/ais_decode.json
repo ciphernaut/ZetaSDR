@@ -1,0 +1,109 @@
+{
+  "id": "ais_decode",
+  "name": "AIS vessel traffic",
+  "family": "maritime",
+  "band": {
+    "bandwidth_hz": 25000,
+    "centers_hz": [161975000, 162025000],
+    "min_hz": 12500,
+    "range_hz": null
+  },
+  "modulation": ["fsk", "fm"],
+  "label": "AIS",
+  "protocol": "ais",
+  "decoder": {
+    "kind": "graph",
+    "nodes": [
+      {
+        "id": "channel",
+        "kind": "channel",
+        "params": {
+          "center_hz": "$center_hz",
+          "bandwidth_hz": "$bandwidth_hz",
+          "out_rate_hz": "$out_rate_hz"
+        }
+      },
+      {
+        "id": "decode",
+        "kind": "ais_decode",
+        "params": {}
+      }
+    ],
+    "edges": [
+      { "from": "channel", "to": "decode", "kind": "iq" }
+    ]
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "mmsi": { "type": "integer" },
+        "msg_type": { "type": "integer" },
+        "channel": { "type": ["string", "null"] },
+        "repeat": { "type": "integer" },
+        "nmea": { "type": "array", "items": { "type": "string" } },
+        "lat": { "type": ["number", "null"] },
+        "lon": { "type": ["number", "null"] },
+        "sog_kt": { "type": ["number", "null"] },
+        "cog_deg": { "type": ["number", "null"] },
+        "heading_deg": { "type": ["integer", "null"] },
+        "nav_status": { "type": ["integer", "null"] },
+        "name": { "type": ["string", "null"] },
+        "callsign": { "type": ["string", "null"] },
+        "destination": { "type": ["string", "null"] },
+        "imo": { "type": ["integer", "null"] },
+        "ship_type": { "type": ["integer", "null"] },
+        "aton_type": { "type": ["integer", "null"] },
+        "virtual_aton": { "type": ["boolean", "null"] }
+      }
+    },
+    "summary": "{name?mmsi} {lat?:.4},{lon?:.4} {sog_kt?:.1}"
+  },
+  "position": { "lat": "lat", "lon": "lon", "alt_m": null },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 10000,
+    "min_span_ms": 1000,
+    "quick": "ais",
+    "priority": 0
+  },
+  "catalogue": ["ais", "automatic-identification-system-ais"],
+  "subject": {
+    "key": "mmsi",
+    "name": "vessels",
+    "waterfall": "summary",
+    "columns": [
+      { "field": "name", "label": "Name", "unit": null },
+      { "field": "callsign", "label": "Callsign", "unit": null },
+      { "field": "sog_kt", "label": "Speed", "unit": "kt" },
+      { "field": "cog_deg", "label": "Course", "unit": "deg" },
+      { "field": "destination", "label": "Destination", "unit": null }
+    ],
+    "heading": "cog_deg",
+    "label": "name",
+    "track_points": 200,
+    "track_min_m": 50
+  },
+  "notes": "AIS on 161975000 Hz (channel A, 87B) and 162025000 Hz (channel B, 88B), 25000 Hz band, one job per channel. A moving class A ship reports every 2-10 s, one at anchor every 3 min, class B every 30 s; names arrive in separate static messages, so a vessel's row fills over a few minutes.",
+  "test": {
+    "kind": "synth",
+    "family": "ais",
+    "mmsi": 503000001,
+    "lat": -27.3842,
+    "lon": 153.1175,
+    "sog_kt": 12.3,
+    "cog_deg": 45.0,
+    "name": null,
+    "repeat": 3,
+    "snr_db": 20,
+    "expect": {
+      "mmsi": 503000001,
+      "msg_type": 1,
+      "lat": { "near": -27.3842, "within": 0.0001 },
+      "lon": { "near": 153.1175, "within": 0.0001 }
+    },
+    "within_ms": 5000
+  }
+}

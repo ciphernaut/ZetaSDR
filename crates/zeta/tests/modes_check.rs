@@ -56,10 +56,16 @@ fn stdout(cmd: &mut Command) -> (String, i32) {
 }
 
 #[test]
-fn modes_check_passes_the_four_in_crate_rows() {
+fn modes_check_passes_the_in_crate_rows() {
     let dir = tempfile::tempdir().unwrap();
     let (out, code) = stdout(&mut check(dir.path(), &[]));
-    for id in ["acars_decode", "aprs_decode", "pocsag_decode", "rds_decode"] {
+    for id in [
+        "acars_decode",
+        "ais_decode",
+        "aprs_decode",
+        "pocsag_decode",
+        "rds_decode",
+    ] {
         assert!(out.lines().any(|l| l == format!("{id}: ok")), "{out}");
     }
     assert!(
@@ -105,8 +111,9 @@ fn an_unknown_id_lists_the_known_ones() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(
         err.contains(
-            "unknown mode nope (known: acars_decode, adsb_decode, aprs_decode, dfm_decode, \
-             hfdl_decode, m20_decode, pocsag_decode, rds_decode, rs41_decode, vdl2_decode"
+            "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
+             dfm_decode, hfdl_decode, m20_decode, pocsag_decode, rds_decode, rs41_decode, \
+             vdl2_decode"
         ),
         "{err}"
     );

@@ -415,7 +415,7 @@ pub struct Identify {
     /// The shortest selection `classify` tries the row on.
     pub min_span_ms: u64,
     /// The in-crate attempt `classify` runs on a buffered span (`aprs`, `pocsag`,
-    /// `acars`, `rds`, or `frame` on a frame row: one CRC-clean frame of its chain);
+    /// `acars`, `rds`, `ais`, or `frame` on a frame row: one CRC-clean frame of its chain);
     /// `null` for rows tried only by the `identify` job.
     #[serde(default)]
     pub quick: Option<String>,
@@ -714,7 +714,7 @@ const PROGRAM_PLACEHOLDERS: [&str; 5] = ["$port", "$rate_hz", "$center_hz", "$ce
 /// from the rule that the map names every schema property.
 pub const ENVELOPE_FIELDS: [&str; 4] = ["protocol", "summary", "t_ns", "position"];
 /// The in-crate attempts `identify.quick` may name (`frame` on a frame row only).
-pub const QUICK_ATTEMPTS: [&str; 5] = ["aprs", "pocsag", "acars", "rds", "frame"];
+pub const QUICK_ATTEMPTS: [&str; 6] = ["aprs", "pocsag", "acars", "rds", "frame", "ais"];
 /// The parsers a frame row's `decoder.parser` may name.
 pub const FRAME_PARSERS: &[&str] = &["opaque", "modbus_rtu", "dnp3", "iec101", "iec104"];
 /// The stage a frame row's framing is checked by and runs in.

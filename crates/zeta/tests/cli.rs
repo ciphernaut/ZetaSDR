@@ -119,9 +119,10 @@ fn plans_prints_the_table_and_refuses_an_unknown_id() {
     let v = json(&out);
     assert_eq!(v["result"], "channel_plans");
     let plans = v["value"]["plans"].as_array().expect("plans array");
-    assert_eq!(plans.len(), 2);
+    assert_eq!(plans.len(), 3);
     assert_eq!(plans[0]["id"], "uhf_cb_au");
     assert_eq!(plans[1]["id"], "acars_vhf");
+    assert_eq!(plans[2]["id"], "ais_vhf");
     assert_eq!(plans[0]["channels"].as_array().unwrap().len(), 80);
     let out = zeta(dir.path(), &["plans", "--plan", "uhf_cb_au"])
         .assert()
@@ -140,7 +141,7 @@ fn plans_prints_the_table_and_refuses_an_unknown_id() {
     assert_eq!(v["error"], "other");
     assert_eq!(
         v["message"],
-        "unknown plan nope (known: uhf_cb_au, acars_vhf)"
+        "unknown plan nope (known: uhf_cb_au, acars_vhf, ais_vhf)"
     );
 }
 
@@ -1063,15 +1064,26 @@ fn scan_kind_is_accepted_and_lists_as_running() {
     assert_eq!(listed(dir.path())["state"]["status"], "stopped");
 }
 
-/// `identify` on the tone: the two rows wider than 12.5 kHz are `skipped_band` at once,
-/// then the first row tried is `no_frame` after its dwell; the job is still trying the
-/// next when the tail ends, so it is stopped (and its child with it).
+/// `identify` on the tone: `rs41_decode`, out of its range, is `skipped_band` at once,
+/// then the first row tried (`ais_decode`) is `no_frame` after its dwell; the job is
+/// still trying the next when the tail ends, so it is stopped (and its child with it).
 #[test]
 fn job_start_identify_then_tail_prints_candidates() {
     let dir = tempfile::tempdir().unwrap();
+    // `ais_decode` (an `fm` row like POCSAG and APRS, family maritime) is tried first on
+    // the tone and dwells 10 s, longer than a tail may wait: an operator copy dwells 5 s.
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut ais: Value =
+        serde_json::from_str(include_str!("../../../modes/ais_decode.json")).unwrap();
+    ais["identify"]["dwell_ms"] = 5000.into();
+    std::fs::write(modes.join("ais_decode.json"), ais.to_string()).unwrap();
+    let modes_dir = modes.display().to_string();
     let out = zeta(
         dir.path(),
         &[
+            "--modes-dir",
+            &modes_dir,
             "job",
             "start",
             "--kind",
@@ -1099,7 +1111,7 @@ fn job_start_identify_then_tail_prints_candidates() {
         .iter()
         .partition(|f| f["payload"]["protocol"] == "origin");
     assert_eq!(origin.len(), 1, "{v}");
-    assert_eq!(frames.len(), 3, "{v}");
+    assert_eq!(frames.len(), 2, "{v}");
     for f in &frames {
         let p = &f["payload"];
         assert_eq!(p["protocol"], "candidate", "{v}");
@@ -2744,6 +2756,7 @@ fn modes_list_prints_the_embedded_rows() {
         [
             "acars_decode",
             "adsb_decode",
+            "ais_decode",
             "aprs_decode",
             "dfm_decode",
             "hfdl_decode",

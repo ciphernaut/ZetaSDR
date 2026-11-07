@@ -347,7 +347,7 @@ mod tests {
         let got = ids(&score_rows(&modes, 1, 1, "noise", &|_| 0.0, &|_| 0.0));
         let order: Vec<&str> = got.iter().map(|g| g.0.as_str()).collect();
         // rds at 0.4; then at 0 rs41 (priority 1), then aviation (acars, adsb, hfdl,
-        // vdl2), pagers, weather_science (dfm, m20), amateur_digital.
+        // vdl2), maritime (ais), pagers, weather_science (dfm, m20), amateur_digital.
         assert_eq!(
             order,
             [
@@ -357,6 +357,7 @@ mod tests {
                 "adsb_decode",
                 "hfdl_decode",
                 "vdl2_decode",
+                "ais_decode",
                 "pocsag_decode",
                 "dfm_decode",
                 "m20_decode",

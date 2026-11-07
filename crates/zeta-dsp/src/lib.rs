@@ -12,6 +12,7 @@ use zeta_core::types::{Span, Timestamp};
 
 pub mod acars;
 pub mod afsk;
+pub mod ais;
 pub mod ais_msg;
 pub mod am;
 pub mod aprs;
@@ -74,6 +75,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(am::AmDemodStage::new()));
     reg.register(Arc::new(am::SsbDemodStage::new()));
     reg.register(Arc::new(aprs::AprsDecodeStage::new()));
+    reg.register(Arc::new(ais::AisDecodeStage::new()));
     reg.register(Arc::new(pocsag::PocsagDecodeStage::new()));
     reg.register(Arc::new(rds::RdsDecodeStage::new()));
     reg.register(Arc::new(acars::AcarsDecodeStage::new()));

@@ -910,9 +910,8 @@ fn repeat_bursts(
     out
 }
 
-/// AIS's line: GMSK at 9600 baud, 2400 Hz deviation (modulation index 0.5).
-pub const AIS_BAUD: u32 = 9600;
-pub const AIS_DEVIATION_HZ: u64 = 2400;
+/// AIS's line, as the receiver ([`crate::ais`]) reads it.
+pub use crate::ais::{AIS_BAUD, AIS_DEVIATION_HZ};
 /// The training sequence before each frame's start flag, `0101...`.
 pub const AIS_TRAINING_BITS: usize = 24;
 /// MMSIs are nine digits.

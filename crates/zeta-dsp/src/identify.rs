@@ -1,8 +1,8 @@
 //! Layer-2 decode-to-identify: score the mode rows against the measured band and try the
 //! best [`CLASSIFY_TRIES`] that have a quick in-process attempt (APRS, POCSAG, ACARS,
-//! RDS, or a frame row's chain) over the channel, reporting only what passes its own
-//! check: the AX.25 FCS, the POCSAG BCH code, the ACARS CRC-16, the RDS checkwords or
-//! the frame row's CRC (design 6.2, 7.2).
+//! RDS, AIS, or a frame row's chain) over the channel, reporting only what passes its own
+//! check: the AX.25 FCS, the POCSAG BCH code, the ACARS CRC-16, the RDS checkwords, the
+//! AIS frame's CRC-16 or the frame row's CRC (design 6.2, 7.2).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,6 +19,7 @@ use zeta_core::types::Hz;
 
 use crate::acars::decode_acars_iq;
 use crate::afsk::Afsk1200Demod;
+use crate::ais::decode_ais_iq;
 use crate::ax25::{HdlcDeframer, parse_ax25_ui};
 use crate::catalogue::catalogue_score;
 use crate::channel::extract_offset;
@@ -260,6 +261,7 @@ fn quick_attempt(row: &ModeRow) -> Option<Attempt> {
         "pocsag" => Some(blocking(pocsag_attempt)),
         "acars" => Some(blocking(acars_attempt)),
         "rds" => Some(blocking(rds_attempt)),
+        "ais" => Some(blocking(ais_attempt)),
         "frame" => {
             let Decoder::Frame(block) = &row.decoder else {
                 return None;
@@ -272,6 +274,17 @@ fn quick_attempt(row: &ModeRow) -> Option<Attempt> {
         }
         _ => None,
     }
+}
+
+fn ais_attempt(chan: &[Complex<f32>], rate: u64) -> Option<String> {
+    let msgs = decode_ais_iq(chan, rate);
+    let first = msgs.first()?;
+    Some(format!(
+        "{} AIS frames CRC-clean; first MMSI {} type {}",
+        msgs.len(),
+        first.mmsi,
+        first.msg_type
+    ))
 }
 
 fn rds_attempt(chan: &[Complex<f32>], rate: u64) -> Option<String> {
@@ -367,11 +380,13 @@ mod tests {
     #[tokio::test]
     async fn identifies_pocsag_in_baseband_iq() {
         let iq = pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+        // On the row's own centre: at a frequency no row names, every row scores 0 and
+        // the 5 tried are the first by family (aviation, maritime) without POCSAG.
         let labels = d()
             .classify(
                 &iq,
                 Hz(48_000),
-                Hz(152_000_000),
+                Hz(148_637_500),
                 Band::whole(Hz(48_000)),
                 None,
             )
