@@ -10,7 +10,7 @@ use zeta_core::ops::{JobKind, Op, OpError, OpResult};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::stream::Payload;
-use zeta_core::types::{Hz, SourceId, StreamKind};
+use zeta_core::types::{Hz, PositionFrom, SourceId, SourcePosition, StreamKind};
 use zeta_source_kiwi::testing::{FakeKiwi, FakeReply, FakeScript};
 use zeta_source_kiwi::{KiwiConfig, KiwiSource};
 
@@ -28,6 +28,8 @@ fn config(fake: &FakeKiwi, delays: &[u64]) -> KiwiConfig {
     cfg.reconnect_delays_ms = delays.to_vec();
     cfg.read_timeout_ms = 2_000;
     cfg.handshake_timeout_ms = 2_000;
+    // The fake answers websockets only; status tests point this at a stub.
+    cfg.status_url = None;
     cfg
 }
 
@@ -549,4 +551,143 @@ async fn dropping_the_source_or_its_receivers_closes_the_socket() {
         "source dropped"
     );
     drop(rx);
+}
+
+/// What the status stub does with each connection, in order; the last
+/// repeats.
+#[derive(Clone, Copy)]
+enum StubReply {
+    Page(&'static str),
+    Close,
+    Hang,
+}
+
+/// A loopback HTTP server answering `/status` reads; returns its URL.
+async fn status_stub(replies: Vec<StubReply>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/status", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        for i in 0.. {
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                return;
+            };
+            match replies[i.min(replies.len() - 1)] {
+                StubReply::Page(body) => {
+                    let mut buf = [0u8; 1024];
+                    let _ = tcp.read(&mut buf).await;
+                    let page = format!("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n{body}");
+                    let _ = tcp.write_all(page.as_bytes()).await;
+                }
+                StubReply::Close => drop(tcp),
+                StubReply::Hang => held.push(tcp),
+            }
+        }
+    });
+    url
+}
+
+const STATUS_PAGE: &str =
+    "status=active\nname=a kiwi\ngps=(-27.40, 153.10)\ngps_good=9\nasl=12\nusers=0\n";
+
+fn from_status() -> SourcePosition {
+    SourcePosition {
+        lat: -27.40,
+        lon: 153.10,
+        alt_m: Some(12.0),
+        from: PositionFrom::Status,
+    }
+}
+
+#[tokio::test]
+async fn a_connection_fills_the_position_from_the_status_stub() {
+    let fake = fake(vec![FakeReply::Ok], None).await;
+    let mut cfg = config(&fake, &[10]);
+    cfg.status_url = Some(status_stub(vec![StubReply::Page(STATUS_PAGE)]).await);
+    let src = Arc::new(KiwiSource::new(SourceId("kiwi0".into()), cfg));
+    let _rx = src.subscribe();
+    assert_eq!(src.position(), None, "nothing before the first connection");
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    assert!(
+        wait_until(2_000, || src.position() == Some(from_status())).await,
+        "{:?}",
+        src.position()
+    );
+    assert_eq!(src.status_errors(), 0);
+    assert_eq!(src.fault(), None);
+}
+
+#[tokio::test]
+async fn a_failed_status_leaves_the_position_as_it_was_and_counts() {
+    // Each connection drops after 20 frames, so the session reconnects and
+    // reads the status again; every read after the first fails.
+    let dropping = fake(vec![FakeReply::Ok], Some(20)).await;
+    let mut cfg = config(&dropping, &[10; 20]);
+    cfg.status_url = Some(status_stub(vec![StubReply::Page(STATUS_PAGE), StubReply::Close]).await);
+    let src = Arc::new(KiwiSource::new(SourceId("kiwi0".into()), cfg));
+    let _rx = src.subscribe();
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    assert!(wait_until(2_000, || src.position() == Some(from_status())).await);
+    assert!(
+        wait_until(5_000, || src.status_errors() >= 1).await,
+        "a reconnect reads the status again"
+    );
+    assert!(dropping.connections() >= 2);
+    assert_eq!(
+        src.position(),
+        Some(from_status()),
+        "a failure clears nothing"
+    );
+
+    // A port that refuses outright is counted too.
+    let refusing = fake(vec![FakeReply::Ok], None).await;
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/status", l.local_addr().unwrap())
+    };
+    let mut cfg = config(&refusing, &[10]);
+    cfg.status_url = Some(closed);
+    let src = Arc::new(KiwiSource::new(SourceId("kiwi0".into()), cfg));
+    let _rx = src.subscribe();
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    assert!(wait_until(2_000, || src.status_errors() == 1).await);
+    assert_eq!(src.position(), None);
+    assert_eq!(src.fault(), None);
+}
+
+#[tokio::test]
+async fn a_hanging_status_neither_blocks_nor_faults() {
+    let fake = fake(vec![FakeReply::Ok], None).await;
+    let mut cfg = config(&fake, &[10]);
+    cfg.handshake_timeout_ms = 500;
+    cfg.status_url = Some(status_stub(vec![StubReply::Hang]).await);
+    let src = Arc::new(KiwiSource::new(SourceId("kiwi0".into()), cfg));
+    let mut rx = src.subscribe();
+    let tune = src.tune(tuning(7_100_000, 10_000));
+    let got = tokio::time::timeout(Duration::from_secs(2), tune)
+        .await
+        .expect("tune within 2 s");
+    assert!(got.is_ok(), "{got:?}");
+    next_block(&mut rx).await;
+    assert!(
+        wait_until(2_000, || src.status_errors() == 1).await,
+        "the read gives up after handshake_timeout_ms"
+    );
+    assert_eq!(src.position(), None);
+    assert_eq!(src.fault(), None);
+    next_block(&mut rx).await;
+}
+
+#[tokio::test]
+async fn no_status_and_no_flag_is_no_position() {
+    let fake = fake(vec![FakeReply::Ok], None).await;
+    let src = source(&fake, &[10]);
+    let mut rx = src.subscribe();
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    next_block(&mut rx).await;
+    assert_eq!(src.position(), None);
+    assert_eq!(src.status_errors(), 0);
+    let (node, _dir) = node_with(src).await;
+    assert_eq!(node.source_position(&SourceId("kiwi0".into())), None);
 }

@@ -31,7 +31,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
 use zeta_core::port::{IqBlock, Tuning};
-use zeta_core::types::{Hz, Timestamp};
+use zeta_core::types::{Hz, PositionFrom, SourcePosition, Timestamp};
 
 use crate::proto::{
     CMD_AGC, CMD_COMPRESSION_OFF, CMD_GEN, CMD_GENATTN, CMD_IDENT, CMD_KEEPALIVE, CMD_SQUELCH,
@@ -69,6 +69,10 @@ pub(crate) struct Status {
     pub seq_gaps: u64,
     /// Malformed `MSG`s, each skipped as a warning.
     pub msg_errors: u64,
+    /// The last successful status page read; a failed read keeps it.
+    pub position: Option<SourcePosition>,
+    /// Status page reads that failed.
+    pub status_errors: u64,
 }
 
 /// What a frame asks the driver to do, in order.
@@ -351,6 +355,38 @@ async fn close(mut sink: Sink) {
     let _ = timeout(Duration::from_secs(1), sink.close()).await;
 }
 
+/// Read the status page once for this connection, on its own task so it never
+/// delays the stream: bounded by `handshake_timeout_ms` and ended with the
+/// session. A success sets the position; a failure is counted and keeps it.
+fn spawn_status_read(ctx: &Ctx) {
+    let Some(url) = ctx.cfg.status_url.clone() else {
+        return;
+    };
+    let limit = Duration::from_millis(ctx.cfg.handshake_timeout_ms);
+    let status = ctx.status.clone();
+    let cancel = ctx.cancel.clone();
+    tokio::spawn(async move {
+        let read = tokio::select! {
+            _ = cancel.cancelled() => return,
+            r = crate::status::fetch(&url, limit) => r,
+        };
+        let mut s = status.lock().unwrap();
+        match read {
+            Ok(page) => {
+                if let Some((lat, lon)) = page.position {
+                    s.position = Some(SourcePosition {
+                        lat,
+                        lon,
+                        alt_m: page.asl_m,
+                        from: PositionFrom::Status,
+                    });
+                }
+            }
+            Err(_) => s.status_errors += 1,
+        }
+    });
+}
+
 /// One websocket connection, from connect to its end.
 async fn connection(
     ctx: &Ctx,
@@ -467,6 +503,7 @@ async fn connection(
                     if let Some(r) = ready.take() {
                         let _ = r.send(Ok(()));
                     }
+                    spawn_status_read(ctx);
                 }
                 Event::Block { snd, gap } => {
                     let rate = u64::from(conn.audio_rate.unwrap_or_default());

@@ -3,6 +3,7 @@
 pub mod proto;
 mod session;
 mod source;
+pub mod status;
 #[cfg(feature = "test-fake")]
 pub mod testing;
 

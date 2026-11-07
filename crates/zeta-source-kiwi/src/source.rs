@@ -9,9 +9,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
-use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId};
+use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId, SourcePosition};
 
 use crate::session::{self, Ctx, Status};
+use crate::status::KIWI_STATUS_PATH;
 
 /// Highest centre frequency a KiwiSDR tunes, in Hz.
 const TUNE_MAX_HZ: u64 = 30_000_000;
@@ -33,11 +34,14 @@ pub struct KiwiConfig {
     pub read_timeout_ms: u64,
     /// Bound on connecting plus the `sample_rate`/`audio_rate` handshake.
     pub handshake_timeout_ms: u64,
+    /// The receiver's status page, read once per connection for its position
+    /// (bounded by `handshake_timeout_ms`); `None` reads nothing.
+    pub status_url: Option<String>,
 }
 
 impl KiwiConfig {
     /// Defaults: reconnect after 1, 2, 4, 8 and 16 s; 10 s read and handshake
-    /// timeouts. A password with a space, `=` or control character cannot be
+    /// timeouts; the status page at `http://<host>:<port>/status`. A password with a space, `=` or control character cannot be
     /// sent in `SET auth` and is refused (the error does not echo it).
     pub fn new(
         host: impl Into<String>,
@@ -50,8 +54,10 @@ impl KiwiConfig {
         {
             return Err("kiwi password must not contain a space, '=' or control character".into());
         }
+        let host = host.into();
         Ok(Self {
-            host: host.into(),
+            status_url: Some(format!("http://{host}:{port}{KIWI_STATUS_PATH}")),
+            host,
             port,
             password,
             reconnect_delays_ms: vec![1000, 2000, 4000, 8000, 16000],
@@ -76,6 +82,7 @@ impl fmt::Debug for KiwiConfig {
             .field("reconnect_delays_ms", &self.reconnect_delays_ms)
             .field("read_timeout_ms", &self.read_timeout_ms)
             .field("handshake_timeout_ms", &self.handshake_timeout_ms)
+            .field("status_url", &self.status_url)
             .finish()
     }
 }
@@ -167,6 +174,11 @@ impl KiwiSource {
     /// Breaks in the frame sequence numbers (lost frames).
     pub fn seq_gaps(&self) -> u64 {
         self.status.lock().unwrap().seq_gaps
+    }
+
+    /// Status page reads that failed (each leaves the position as it was).
+    pub fn status_errors(&self) -> u64 {
+        self.status.lock().unwrap().status_errors
     }
 
     fn io(&self, reason: &str) -> PortError {
@@ -312,5 +324,10 @@ impl Port for KiwiSource {
 
     fn fault(&self) -> Option<String> {
         self.status.lock().unwrap().fault.clone()
+    }
+
+    /// The last successful status page read; `None` before the first.
+    fn position(&self) -> Option<SourcePosition> {
+        self.status.lock().unwrap().position
     }
 }
