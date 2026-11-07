@@ -1953,7 +1953,6 @@ impl Node {
         let _ = self.inner.relaunch_elastic(source, None).await;
     }
 
-    /// The node's station, when one is set.
     /// Where source `id` is: what its port reports itself (`from: status`), else the
     /// operator's `--source-position` entry (`from: configured`), else `None`.
     pub fn source_position(&self, id: &SourceId) -> Option<SourcePosition> {
@@ -1965,6 +1964,7 @@ impl Node {
         })
     }
 
+    /// The node's station, when one is set.
     pub fn station(&self) -> Option<crate::station::Station> {
         self.inner.station.lock().unwrap().clone()
     }
