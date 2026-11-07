@@ -523,8 +523,9 @@ mod tests {
     fn brisbane_airport_round_trips() {
         let i = parse_info("APRS", b"!2723.05S/15307.05E>ZetaSDR");
         assert_eq!(i.data_type, DataType::Position);
-        near(i.lat, -27.3842, 0.0001);
-        near(i.lon, 153.1175, 0.0001);
+        const FIX_TOL: f64 = 0.0001;
+        near(i.lat, -27.3842, FIX_TOL);
+        near(i.lon, 153.1175, FIX_TOL);
         assert_eq!(i.symbol.as_deref(), Some("/>"));
         assert_eq!(i.comment.as_deref(), Some("ZetaSDR"));
     }
