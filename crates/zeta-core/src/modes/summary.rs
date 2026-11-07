@@ -66,7 +66,8 @@ fn text(v: Option<&Value>, format: Option<NumberFormat>) -> String {
 /// null; `{a?b}` is `a` when present and non-null, else `b` as `{b}`. Any of these may
 /// end in a number format, `{field:.N}` or `{field:+.N}` (`N` 0-6; `{lat?:.4}`), which
 /// prints a number with `N` decimals (and a sign with `+`); a value that is not a
-/// number renders as without it. Trailing whitespace is trimmed.
+/// number renders as without it. Leading and trailing whitespace is trimmed (a template
+/// whose leading optional fields are absent starts at its first present one).
 pub fn fill(template: &str, event: &Value) -> String {
     let mut out = String::new();
     // Where the literal text after the last substituted value begins: only that
@@ -101,8 +102,7 @@ pub fn fill(template: &str, event: &Value) -> String {
         literal_from = out.len();
     }
     out.push_str(rest);
-    out.truncate(out.trim_end().len());
-    out
+    out.trim().to_string()
 }
 
 /// `fields` with `protocol` (the row's), `summary` (its template filled from `fields`)
@@ -226,6 +226,13 @@ mod tests {
 
     #[test]
     fn optional_drops_its_separator() {
+        // Absent leading optionals leave no leading separator (hfdl_decode's summary).
+        let hfdl = "{icao?} {gs_id?} {gs?} {flight?} {pdu?} {text?}";
+        assert_eq!(
+            fill(hfdl, &json!({"pdu": "Logon confirm"})),
+            "Logon confirm"
+        );
+        assert_eq!(fill(hfdl, &json!({"icao": null, "gs_id": 4})), "4");
         let ev = json!({"ps": "ZETA FM", "pi": "2AB1", "rt": null});
         assert_eq!(fill("{ps?pi} · {rt?}", &ev), "ZETA FM");
         let ev = json!({"pi": "2AB1", "rt": "hello"});

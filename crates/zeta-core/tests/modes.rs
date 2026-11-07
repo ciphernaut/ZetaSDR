@@ -619,6 +619,22 @@ fn the_aircraft_link_rows_are_pinned() {
     );
     assert_eq!(hfdl["identify"]["dwell_ms"], 40000);
     assert_eq!(hfdl["subject"]["merge"], serde_json::json!(["reg", "icao"]));
+    // A frame from an aircraft whose logon was missed has neither `icao` nor `gs_id`: the
+    // summary drops absent fields instead of printing `null`.
+    let summary = hfdl["event"]["summary"].as_str().unwrap();
+    assert_eq!(summary, "{icao?} {gs_id?} {gs?} {flight?} {pdu?} {text?}");
+    let fill = zeta_core::modes::summary::fill;
+    assert_eq!(
+        fill(summary, &serde_json::json!({"pdu": "Performance data"})),
+        "Performance data"
+    );
+    assert_eq!(
+        fill(
+            summary,
+            &serde_json::json!({"gs_id": 4, "gs": "Example GS"})
+        ),
+        "4 Example GS"
+    );
     let fields = &hfdl["decoder"]["output"]["fields"];
     assert!(fields.get("aircraft_id").is_none(), "{fields}");
     assert_eq!(

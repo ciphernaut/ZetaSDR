@@ -68,7 +68,7 @@
         "freq_skew": { "type": ["number", "null"] }
       }
     },
-    "summary": "{icao?gs_id} {flight?} {pdu?} {text?}"
+    "summary": "{icao?} {gs_id?} {gs?} {flight?} {pdu?} {text?}"
   },
   "identify": {
     "proof": "event",
