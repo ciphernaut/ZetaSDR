@@ -597,6 +597,19 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.notch_hz: integer (optional, default 0)
 - params.rows_per_s: integer (optional, default 20)
 
+### frame_decode
+
+- inputs: event
+- outputs: event
+- params.sync: object (Word: hex, bits)
+- params.length: any
+- params.bit_order: string (BitOrder: msb|lsb) (optional, default "msb")
+- params.crc: any (optional, default null)
+- params.encoding: string (LineCode: nrz|nrzi|manchester|differential) (optional, default "nrz")
+- params.max_errors: integer (optional, default 0)
+- params.preamble: any (optional, default null)
+- params.whitening: any (optional, default "none")
+
 ### fsk_demod
 
 - inputs: iq

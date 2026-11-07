@@ -27,6 +27,8 @@ pub mod crc;
 pub mod denoise;
 pub mod detect;
 pub mod fft;
+pub mod frame_decode;
+pub mod framing;
 pub mod fsk;
 #[cfg(feature = "gpu")]
 pub mod gpu_fft;
@@ -80,6 +82,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(clock::ClockRecoverStage::new()));
     reg.register(Arc::new(slicer::SlicerStage::new()));
     reg.register(Arc::new(correlate::CorrelateStage::new()));
+    reg.register(Arc::new(frame_decode::FrameDecodeStage::new()));
     reg.register(Arc::new(bit_view::BitViewStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));
     reg.register(Arc::new(vad::VadStage::new()));
