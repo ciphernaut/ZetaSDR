@@ -42,12 +42,7 @@ pub fn allocation_match<'a>(row: &LoadedMode, allocs: &'a [Allocation]) -> Optio
         if a.role.as_deref() != Some("tx") || a.kind.as_deref() == Some("plan") {
             return false;
         }
-        let width = a
-            .emission_decoded
-            .as_ref()
-            .map(|e| e.bandwidth_hz)
-            .or(a.bandwidth_hz);
-        let Some(width) = width else {
+        let Some(width) = row_width(a) else {
             return false;
         };
         if !(bw * lo..=bw * hi).contains(&(width.0 as f64)) {
@@ -56,12 +51,27 @@ pub fn allocation_match<'a>(row: &LoadedMode, allocs: &'a [Allocation]) -> Optio
         let Some(e) = &a.emission_decoded else {
             return true;
         };
-        DESIGNATOR_LABELS
-            .iter()
-            .filter(|(c, _)| *c == e.modulation)
-            .flat_map(|(_, labels)| labels.iter())
-            .any(|l| row.row.modulation.iter().any(|m| m == l))
+        designator_fits(e.modulation, &row.row.modulation)
     })
+}
+
+/// An assignment's width: its decoded designator's `bandwidth_hz`, else its own
+/// `bandwidth_hz`; `None` without either.
+pub(crate) fn row_width(a: &Allocation) -> Option<crate::types::Hz> {
+    a.emission_decoded
+        .as_ref()
+        .map(|e| e.bandwidth_hz)
+        .or(a.bandwidth_hz)
+}
+
+/// Whether an emission designator's modulation `letter` is compatible with one of the
+/// layer-1 `labels` ([`DESIGNATOR_LABELS`]); a letter the table lacks fits none.
+pub(crate) fn designator_fits(letter: char, labels: &[String]) -> bool {
+    DESIGNATOR_LABELS
+        .iter()
+        .filter(|(c, _)| *c == letter)
+        .flat_map(|(_, compatible)| compatible.iter())
+        .any(|l| labels.iter().any(|m| m == l))
 }
 
 /// [`ALLOCATION_SCORE`] when [`allocation_match`] finds a `tx` assignment that fits

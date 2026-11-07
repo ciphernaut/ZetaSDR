@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::Inner;
 use super::persist::now;
 use crate::knowledge::{Allocation, DEFAULT_REGION, KnowledgeProvider};
-use crate::modes::score::DESIGNATOR_LABELS;
+use crate::modes::score::{designator_fits, row_width};
 use crate::ops::SignalBand;
 use crate::reach::Reach;
 use crate::station::{Antenna, Station};
@@ -36,6 +36,8 @@ pub const ORIGIN_MODULATION_UNKNOWN: f32 = 0.2;
 pub const ORIGIN_REACH_IN: f32 = 0.2;
 /// Reach term when the site's distance is not known (no vantage).
 pub const ORIGIN_REACH_UNKNOWN: f32 = 0.1;
+/// Decimal places an origin's score is rounded to.
+pub const ORIGIN_SCORE_DECIMALS: i32 = 2;
 /// How many sites [`summary`] names.
 pub const ORIGIN_SUMMARY_SITES: usize = 3;
 
@@ -232,40 +234,57 @@ pub async fn origins(inner: &Inner, q: &OriginQuery) -> OriginAnswer {
     let names = providers.iter().map(|p| p.name().to_string()).collect();
     let registers = providers.iter().any(|p| p.gives_assignments());
     let from = vantage.station().cloned();
-    let tasks: Vec<_> = providers
-        .into_iter()
-        .map(|p| {
-            let (region, from) = (region.clone(), from.clone());
-            let (c, b) = (q.center_hz, q.bandwidth_hz);
-            tokio::spawn(async move {
-                let rows = p.allocations_from(&region, c, b, from.as_ref()).await;
-                let reach = p.reach_from(&region, c, b, from.as_ref()).await;
-                (rows, reach, p.gives_assignments())
-            })
-        })
-        .collect();
-    let (mut rows, mut reach, mut register_rows) = (Vec::new(), None, 0);
-    for t in tasks {
-        // A provider that panicked answers nothing.
-        if let Ok((r, re, register)) = t.await {
-            if register {
-                register_rows += r.len() as u32;
+    // A JoinSet aborts the lookups still running when the caller is dropped.
+    let mut set = tokio::task::JoinSet::new();
+    let mut ids = HashMap::new();
+    for (i, p) in providers.iter().enumerate() {
+        let (p, region, from) = (p.clone(), region.clone(), from.clone());
+        let (c, b) = (q.center_hz, q.bandwidth_hz);
+        let handle = set.spawn(async move {
+            let rows = p.allocations_from(&region, c, b, from.as_ref()).await;
+            let reach = p.reach_from(&region, c, b, from.as_ref()).await;
+            (i, rows, reach)
+        });
+        ids.insert(handle.id(), i);
+    }
+    let mut answers: Vec<Option<(Vec<Allocation>, Option<Reach>)>> = vec![None; providers.len()];
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((i, r, re)) => answers[i] = Some((r, re)),
+            // A provider that failed answers nothing; say which.
+            Err(e) => {
+                let name = ids.get(&e.id()).map_or("?", |&i| providers[i].name());
+                eprintln!("zeta: origin: provider {name}: lookup failed ({e})");
             }
-            rows.extend(r);
-            reach = reach.or(re);
         }
+    }
+    let (mut rows, mut reach, mut register_rows) = (Vec::new(), None, 0);
+    for (p, a) in providers.iter().zip(answers) {
+        let Some((r, re)) = a else { continue };
+        if p.gives_assignments() {
+            register_rows += r.len() as u32;
+        }
+        rows.extend(r);
+        // The first provider, in order, that has a reach.
+        reach = reach.or(re);
     }
     let register_rows = registers.then_some(register_rows);
     answer(q, rows, reach, &vantage, names, register_rows)
 }
 
-/// The deduplication key of an origin.
-type SiteKey = (Option<String>, Option<String>, Option<u64>);
+/// The deduplication key of an origin: licence, site and resolved centre.
+type SiteKey = (Option<String>, Option<String>, u64);
+
+/// A row's centre: its `center_hz`, else the middle of `min_hz..max_hz`.
+fn row_center(a: &Allocation) -> u64 {
+    a.center_hz.map_or(a.min_hz.0 / 2 + a.max_hz.0 / 2, |h| h.0)
+}
 
 /// Score `rows` against `q` into an answer: `tx` assignments scored ([`score_row`]),
 /// receivers (`rx` assignments) and plan rows counted, deduplicated by `(licence_no,
-/// site, center_hz)` keeping the best score, best first then nearest (no distance
-/// last), at most [`ORIGIN_SITES`]. `providers` and `register_rows` are kept as given.
+/// site, centre)` (the centre as [`score_row`] resolves it; a row with neither licence
+/// nor site is never folded) keeping the best score, best first then nearest (no
+/// distance last), at most [`ORIGIN_SITES`]. `providers` and `register_rows` are kept as given.
 pub fn answer(
     q: &OriginQuery,
     rows: Vec<Allocation>,
@@ -276,6 +295,7 @@ pub fn answer(
 ) -> OriginAnswer {
     let (mut receivers, mut plans) = (0, 0);
     let mut best: HashMap<SiteKey, Origin> = HashMap::new();
+    let mut unnamed: Vec<Origin> = Vec::new();
     // The vantage's antenna the reach was computed for.
     let antenna = reach.as_ref().and_then(|r| {
         vantage
@@ -294,16 +314,16 @@ pub fn answer(
         let Some(o) = score_row(&a, q, reach.as_ref(), antenna) else {
             continue;
         };
-        let key = (
-            a.licence_no.clone(),
-            a.site.clone(),
-            a.center_hz.map(|h| h.0),
-        );
+        if a.licence_no.is_none() && a.site.is_none() {
+            unnamed.push(o);
+            continue;
+        }
+        let key = (a.licence_no.clone(), a.site.clone(), row_center(&a));
         if best.get(&key).is_none_or(|kept| o.score > kept.score) {
             best.insert(key, o);
         }
     }
-    let mut origins: Vec<Origin> = best.into_values().collect();
+    let mut origins: Vec<Origin> = best.into_values().chain(unnamed).collect();
     origins.sort_by(|a, b| {
         let (x, y) = (&a.allocation, &b.allocation);
         b.score
@@ -384,13 +404,8 @@ pub fn score_row(
     if a.kind.as_deref() != Some("assignment") || a.role.as_deref() != Some("tx") {
         return None;
     }
-    let width = a
-        .emission_decoded
-        .as_ref()
-        .map(|e| e.bandwidth_hz)
-        .or(a.bandwidth_hz)
-        .map(|h| h.0);
-    let center = a.center_hz.map_or(a.min_hz.0 / 2 + a.max_hz.0 / 2, |h| h.0);
+    let width = row_width(a).map(|h| h.0);
+    let center = row_center(a);
     if center.abs_diff(q.center_hz.0) > width.unwrap_or(0) / 2 + q.bandwidth_hz.0 / 2 {
         return None;
     }
@@ -409,17 +424,10 @@ pub fn score_row(
         }
     };
     let (agree, modulation_term) = match &a.emission_decoded {
-        Some(e) if !q.modulation.is_empty() => {
-            let fits = DESIGNATOR_LABELS
-                .iter()
-                .filter(|(c, _)| *c == e.modulation)
-                .flat_map(|(_, labels)| labels.iter())
-                .any(|l| q.modulation.iter().any(|m| m == l));
-            match fits {
-                true => (Agree::Fits, ORIGIN_MODULATION_FITS),
-                false => (Agree::Disagrees, 0.0),
-            }
-        }
+        Some(e) if !q.modulation.is_empty() => match designator_fits(e.modulation, &q.modulation) {
+            true => (Agree::Fits, ORIGIN_MODULATION_FITS),
+            false => (Agree::Disagrees, 0.0),
+        },
         _ => (Agree::Unknown, ORIGIN_MODULATION_UNKNOWN),
     };
     let reach_term = match a.distance_km {
@@ -439,11 +447,18 @@ pub fn score_row(
     };
     Some(Origin {
         allocation: a.clone(),
-        score: terms.width + terms.modulation + terms.reach,
+        score: round_score(terms.width + terms.modulation + terms.reach),
         agree,
         terms,
         confirmed: None,
     })
+}
+
+/// `score` to [`ORIGIN_SCORE_DECIMALS`] places, so equal sums of the terms compare
+/// equal whatever order f32 added them in.
+fn round_score(score: f32) -> f32 {
+    let scale = 10f32.powi(ORIGIN_SCORE_DECIMALS);
+    (score * scale).round() / scale
 }
 
 /// `hz` in MHz without trailing zeros: `403.025`.
@@ -455,18 +470,18 @@ fn mhz(hz: Hz) -> String {
 /// One line for an answer (design 4.3): `<n> sites on <f> MHz: <licensee>, <site>
 /// <d> km <agree> <score>; ...` naming the first [`ORIGIN_SUMMARY_SITES`] (the
 /// distance left out when unknown); `no licensed transmitter on <f> MHz` when nothing
-/// is lit; `register gave no rows` when the providers that give assignments returned
-/// none at all (an attached register that is unreachable, or empty there); `no
-/// register provider` when none of the providers asked gives assignments.
+/// is lit (whatever provider lit them). With nothing lit, `register_rows` picks the
+/// words: `no register provider` when none of the providers asked gives assignments,
+/// `register gave no rows` when they returned none at all (an attached register that
+/// is unreachable, or empty there), else `no licensed transmitter on <f> MHz`.
 pub fn summary(a: &OriginAnswer) -> String {
-    match a.register_rows {
-        None => return "no register provider".to_string(),
-        Some(0) => return "register gave no rows".to_string(),
-        Some(_) => {}
-    }
     let f = mhz(a.band.center_hz);
     if a.origins.is_empty() {
-        return format!("no licensed transmitter on {f} MHz");
+        return match a.register_rows {
+            None => "no register provider".to_string(),
+            Some(0) => "register gave no rows".to_string(),
+            Some(_) => format!("no licensed transmitter on {f} MHz"),
+        };
     }
     let sites: Vec<String> = a
         .origins
@@ -500,7 +515,8 @@ pub fn summary(a: &OriginAnswer) -> String {
 
 /// Confirm the first origin whose `callsign` equals `value` (both trimmed, case
 /// ignored): its score becomes 1 and `confirmed` `{field, value}`, its terms stay. The
-/// index of that origin, or `None`, changing nothing, when none matches.
+/// index of that origin, or `None`, changing nothing, when none matches. The order is
+/// left as it was: a caller re-sorts if the order matters.
 pub fn confirm(a: &mut OriginAnswer, field: &str, value: &str) -> Option<usize> {
     let want = value.trim();
     let i = a.origins.iter().position(|o| {
@@ -975,7 +991,7 @@ mod tests {
         }
     }
 
-    /// A position a few kilometres from the demo station.
+    /// A position near the demo station (Brisbane Airport), not any real receiver's.
     const KIWI: SourcePosition = SourcePosition {
         lat: -27.47,
         lon: 153.02,
@@ -984,8 +1000,15 @@ mod tests {
     };
 
     async fn node(dir: &std::path::Path) -> super::super::Node {
+        node_with(dir, Default::default()).await
+    }
+
+    async fn node_with(
+        dir: &std::path::Path,
+        source_positions: std::collections::BTreeMap<SourceId, SourcePosition>,
+    ) -> super::super::Node {
         let cfg = super::super::NodeConfig {
-            source_positions: Default::default(),
+            source_positions,
             burst_policy: Default::default(),
             state_dir: dir.join("state"),
             ring_seconds: 1.0,
@@ -1203,5 +1226,134 @@ mod tests {
             Some(1),
         );
         assert_eq!(a.origins[0].terms.reach, ORIGIN_REACH_IN);
+    }
+
+    #[tokio::test]
+    async fn a_configured_position_gives_a_remote_source_its_vantage() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = SourcePosition {
+            lat: -27.40,
+            lon: 153.10,
+            alt_m: None,
+            from: PositionFrom::Configured,
+        };
+        let n = node_with(
+            dir.path(),
+            [(SourceId("peer".into()), configured)]
+                .into_iter()
+                .collect(),
+        )
+        .await;
+        let want = Station {
+            lat: -27.40,
+            lon: 153.10,
+            alt_m: 0.0,
+            region: "AU".into(),
+            antennas: Station::default_antennas(0.0),
+        };
+        assert_eq!(
+            vantage_for(&n.inner, &SourceId("peer".into())),
+            Vantage::Source(want, SourceId("peer".into()))
+        );
+    }
+
+    /// Answers one `tx` row and does not say it gives assignments.
+    struct Undeclared;
+
+    #[async_trait]
+    impl KnowledgeProvider for Undeclared {
+        fn name(&self) -> &str {
+            "undeclared"
+        }
+        async fn allocations(&self, _: &str, c: Hz, _: Hz) -> Vec<Allocation> {
+            vec![tx(Some("12K5F3E"), None, c.0, Some(12.0))]
+        }
+        async fn signatures(&self, _: Hz, _: Hz) -> Vec<crate::knowledge::Signature> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn sites_from_an_undeclared_provider_are_listed_in_the_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path()).await;
+        n.add_knowledge(Arc::new(Undeclared));
+        let a = origins(&n.inner, &q(&["fm"], CENTER, 12_500)).await;
+        assert_eq!((a.register_rows, a.origins.len()), (None, 1));
+        let s = summary(&a);
+        assert!(
+            s.starts_with("1 site on 403.025 MHz: Example Water Authority, Example Hill 12 km"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn equal_sums_tie_and_order_by_distance() {
+        let sum = |t: (f32, f32, f32)| round_score(t.0 + t.1 + t.2);
+        assert_eq!(sum((0.1, 0.4, 0.2)), sum((0.4, 0.2, 0.1)));
+        assert_eq!(sum((0.1, 0.4, 0.2)), 0.7);
+        // With no label every modulation term is 0.2: a width-less row 5 km away
+        // (0.1 + 0.2 + 0.2) ties a half-width row with no distance (0.2 + 0.2 + 0.1).
+        let band = q(&[], CENTER, 12_500);
+        let mut far = tx(None, Some(37_500), CENTER, None);
+        far.licence_no = Some("0000002".into());
+        let near = tx(None, None, CENTER, Some(5.0));
+        let r = reach(Some(150.0));
+        let (x, y) = (
+            score_row(&near, &band, Some(&r), None).unwrap(),
+            score_row(&far, &band, Some(&r), None).unwrap(),
+        );
+        assert_eq!((x.score, y.score), (0.5, 0.5));
+        for rows in [
+            vec![far.clone(), near.clone()],
+            vec![near.clone(), far.clone()],
+        ] {
+            let a = answer(
+                &band,
+                rows,
+                Some(r.clone()),
+                &Vantage::None("x"),
+                vec![],
+                None,
+            );
+            assert_eq!(a.origins[0].allocation.distance_km, Some(5.0));
+            assert_eq!(a.origins[1].allocation.distance_km, None);
+        }
+    }
+
+    #[test]
+    fn rows_without_licence_or_site_are_not_folded_and_centres_resolve() {
+        let band = q(&[], CENTER, 12_500);
+        let mut a = tx(None, Some(12_500), CENTER, None);
+        a.licence_no = None;
+        a.site = None;
+        let mut b = a.clone();
+        b.licensee = Some("Example Broadcasting".into());
+        let ans = answer(&band, vec![a, b], None, &Vantage::None("x"), vec![], None);
+        assert_eq!(ans.origins.len(), 2);
+        // No centre_hz: the resolved centres differ, so the same licence and site stay two.
+        let mut c = tx(None, Some(12_500), CENTER, None);
+        c.center_hz = None;
+        let mut d = c.clone();
+        (d.min_hz, d.max_hz) = (Hz(CENTER + 2_000), Hz(CENTER + 2_000));
+        let ans = answer(
+            &band,
+            vec![c.clone(), d],
+            None,
+            &Vantage::None("x"),
+            vec![],
+            None,
+        );
+        assert_eq!(ans.origins.len(), 2);
+        // The same resolved centre folds.
+        let ans = answer(
+            &band,
+            vec![c.clone(), c],
+            None,
+            &Vantage::None("x"),
+            vec![],
+            None,
+        );
+        assert_eq!(ans.origins.len(), 1);
     }
 }
