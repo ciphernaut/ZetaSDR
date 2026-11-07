@@ -592,6 +592,9 @@ pub(crate) fn decode_from(bits: &[u8], f: &Framing, continued: bool) -> Decoded 
                     .find(|&k| hit_at(d, k).is_some());
                 match next {
                     Some(k) => (k - pl) as i64 - b0 as i64,
+                    // Past the longest frame, no later sync can close it validly:
+                    // dropped as a bad length now, so its bits settle.
+                    None if d.len() - b0 > MAX_FRAME_BITS => (d.len() - b0) as i64,
                     None => {
                         let nb = (d.len() - b0) as i64;
                         let frame = valid(nb).then(|| cut(d, r, errors, b0, nb as usize));
@@ -628,7 +631,8 @@ pub(crate) fn decode_from(bits: &[u8], f: &Framing, continued: bool) -> Decoded 
 /// bits are settled: when a frame's rest is not yet in, settling stops before its
 /// sync (and the preamble and line context it depends on), so the decoder may be
 /// called again from there with new bits appended. A `to_next_sync` frame closed only
-/// by the input's end comes last and lies past the settled count.
+/// by the input's end comes last and lies past the settled count; one already past
+/// [`MAX_FRAME_BITS`] with no sync after it is dropped and settled past.
 ///
 /// The line code is decoded first, then the sync hunted at every line bit (at most
 /// `max_errors` bit errors, the preamble's bits right before it exactly). A frame

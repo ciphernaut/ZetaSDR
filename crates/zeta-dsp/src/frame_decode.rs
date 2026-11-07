@@ -299,9 +299,11 @@ fn frame_event(ctx: &StageContext, sync: &str, found: &Found) -> serde_json::Val
 /// provenance), in the row's envelope when the job runs a mode row. The bits of one
 /// segment are buffered until settled; a new segment (an `offset_bits` that is not the
 /// previous event's end), a time seam or a lag closes the segment (cutting an open
-/// `to_next_sync` frame) and clears the buffer, as the input's end does. The buffer
-/// holds at most [`BUFFER_BITS_MAX`] bits, the oldest dropped and counted. Every event
-/// read is forwarded unchanged, the frames its bits close right after it. Notes
+/// `to_next_sync` frame) and clears the buffer, as the input's end does; an open
+/// `to_next_sync` frame past [`MAX_FRAME_BITS`](crate::framing::MAX_FRAME_BITS) is
+/// dropped as a bad length at once. The buffer holds at most [`BUFFER_BITS_MAX`] bits,
+/// the oldest dropped and counted. Every event read is forwarded unchanged, the frames
+/// its bits close right after it. Notes
 /// `frame_decode` (`frames`, `crc_ok`, `crc_bad`, `sync_hits`, `bad_length`,
 /// `dropped_bits`, `stream` its output) after each frame, at the first `bits` event
 /// and whenever a count changes.
@@ -414,7 +416,7 @@ mod tests {
     use crate::bit_view::test_streams::{BAUD, T0, bits_frames, bits_frames_at, run_events};
     use crate::correlate::BitsIn;
     use crate::framing::test_support::{bodies, bodies_of, fx};
-    use crate::framing::{Length, LineCode, decode_frames, encode_frames};
+    use crate::framing::{Length, LineCode, MAX_FRAME_BITS, decode_frames, encode_frames};
 
     const SECOND_NS: u64 = 1_000_000_000;
 
@@ -579,18 +581,26 @@ mod tests {
 
     #[tokio::test]
     async fn an_unclosed_to_next_sync_frame_is_bounded() {
+        // Once an open frame passes MAX_FRAME_BITS it can never be valid: it is dropped
+        // as a bad length and settled past, so the buffer stays near one frame long.
+        const CHUNK: usize = 65_536;
         let f = fx("2dd4", 16, Length::ToNextSync { to_next_sync: true });
         let mut bits = crate::slicer::bits_from_hex("2dd4", 16);
         bits.extend(std::iter::repeat_n(0u8, 2_000_000));
-        let splits: Vec<usize> = (1..bits.len() / 65_536).map(|k| k * 65_536).collect();
+        let splits: Vec<usize> = (1..bits.len() / CHUNK).map(|k| k * CHUNK).collect();
         let input = bits_frames(&bits, &splits);
         let mut state = FrameState::new(f.clone());
         for fr in &input {
             let b = BitsIn::parse("frame_decode", fr.clone()).unwrap().unwrap();
             assert!(state.feed(b).is_empty());
             assert!(state.buffered() <= BUFFER_BITS_MAX);
+            assert!(
+                state.buffered() <= MAX_FRAME_BITS + 2 * CHUNK,
+                "{}",
+                state.buffered()
+            );
         }
-        assert!(state.dropped_bits > 0);
+        assert_eq!(state.dropped_bits, 0);
         let (events, context) = run_events(
             &FrameDecodeStage::new(),
             serde_json::to_value(&f).unwrap(),
@@ -599,7 +609,8 @@ mod tests {
         .await;
         assert!(frames_of(&events).is_empty());
         let note = &context["frame_decode"];
-        assert!(note["dropped_bits"].as_u64().unwrap() > 0, "{note}");
+        assert_eq!(note["dropped_bits"], 0, "{note}");
+        assert_eq!(note["bad_length"], 1, "{note}");
         assert_eq!(note["frames"], 0);
     }
 
