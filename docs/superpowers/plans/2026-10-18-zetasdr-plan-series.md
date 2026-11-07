@@ -493,8 +493,23 @@ a measured cap is refused `out_of_range` with `why: insufficient bandwidth: ...`
 
 ### Sweep before
 
+Run 2026-11-07 15:15-15:20 AEST on the field host's B210 through the deployed pre-change node
+(`events-log-zeta`, main 6043e56), `bash scripts/rate-sweep.sh deploy/field-host/z.sh b210 1090000000 …`,
+one minute per rate, the radio free of rigid jobs (the operator stopped the ADS-B decoder for it; the
+page's elastic spectrum job followed the capture). CPU was not captured (the sampler read lifetime
+averages; the after-sweep uses `top -b`).
+
 | rate | delivered | overflows/min | worker CPU | node CPU | fault |
 |---|---|---|---|---|---|
+| 15.36 M | 15.31 M | 71 | – | – | none |
+| 20.48 M | 20.39 M | 206 | – | – | none |
+| 30.72 M | 30.71 M | 11 | – | – | none |
+| 61.44 M | 51.48 M | 1702 | – | – | none |
+
+The device holds 30.72 Msps almost cleanly through the f32 pipe; 61.44 Msps is the rung that falls
+over (16 % short, overflows climbing, no fault within the minute). The "16-24 Msps reliable ceiling"
+of the earlier note was pessimistic. The overflow counts at 15.36 and 20.48 are higher than at 30.72;
+unexplained, to be compared with the after-sweep.
 
 ### Sweep after
 
