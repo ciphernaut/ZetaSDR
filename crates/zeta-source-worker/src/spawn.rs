@@ -18,7 +18,9 @@ use crate::ring::Ring;
 pub const RING_FD: RawFd = 3;
 
 /// Make `cmd`'s child inherit `ring` as [`RING_FD`]. The ring must outlive
-/// the spawn.
+/// the spawn: the hook names its descriptor by number. Descriptor 3 must not
+/// be one the parent wants its child to see as something else (the node's
+/// worker gets only stdin, stdout and stderr besides), as `dup2` replaces it.
 pub fn inherit_ring(cmd: &mut tokio::process::Command, ring: &Ring) {
     inherit_ring_std(cmd.as_std_mut(), ring);
 }

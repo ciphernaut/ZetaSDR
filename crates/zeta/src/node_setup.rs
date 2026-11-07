@@ -206,6 +206,7 @@ async fn open_soapy(
     state_dir: &Path,
 ) -> Result<(Arc<dyn Port>, Option<Arc<WorkerPort>>), String> {
     use zeta_source_worker::port::{Timings, WorkerConfig};
+    use zeta_source_worker::ring::DEFAULT_RING_BYTES;
     if in_process {
         return zeta_source_soapy_driver::open(SourceId(id.to_owned()), args)
             .map(|s| (Arc::new(s) as Arc<dyn Port>, None))
@@ -223,6 +224,7 @@ async fn open_soapy(
             .map(String::from)
             .to_vec(),
         timings: Timings::default(),
+        ring_bytes: DEFAULT_RING_BYTES,
     };
     match WorkerPort::open(cfg, cached).await {
         // A hello, or a device not found that was seen before: the supervisor has

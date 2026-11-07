@@ -348,10 +348,13 @@ pub fn supported() -> bool {
 }
 
 /// A close-on-exec memfd of `len` bytes, so it reaches a child only where
-/// the spawner hands it over on purpose.
+/// the spawner hands it over on purpose. Its size is sealed: a child that
+/// shrank the file would turn the node's next read of the mapping into a
+/// SIGBUS.
 fn memfd(name: &std::ffi::CStr, len: usize) -> io::Result<OwnedFd> {
     // SAFETY: `name` is a valid C string; the call takes no other pointers.
-    let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    let raw =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -361,6 +364,11 @@ fn memfd(name: &std::ffi::CStr, len: usize) -> io::Result<OwnedFd> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ring too large"))?;
     // SAFETY: a plain syscall on a descriptor this process owns.
     if unsafe { libc::ftruncate(fd.as_raw_fd(), size) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)

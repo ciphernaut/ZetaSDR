@@ -23,21 +23,25 @@
 //! or a closed stdin, never a kill). `ZETA_FAKE_CRASH_ONCE=1` crashes only on
 //! the first spawn (the marker `<record>.crashed` says it has);
 //! `ZETA_FAKE_PRINT=1` prints `noise` to stdout after the redirect, which must
-//! land on stderr; `ZETA_FAKE_PROTOCOL=N` says hello with protocol `N` instead
-//! of serving, then waits to be killed; `ZETA_FAKE_WAIT_RUNTIME=1` ends with a
-//! plain runtime drop, which waits on the blocked stdin read.
+//! land on stderr; `ZETA_FAKE_PROTOCOL=1` serves as a protocol-1 worker would
+//! (it ignores `--ring-fd`, sends every block on the pipe, and its hello and
+//! status have no `transport` or `transport_dropped`), while any other
+//! `ZETA_FAKE_PROTOCOL=N` says hello with protocol `N` instead of serving,
+//! then waits to be killed; `ZETA_FAKE_WAIT_RUNTIME=1` ends with a plain
+//! runtime drop, which waits on the blocked stdin read.
 //!
 //! `--ring-fd N` serves through the ring inherited on descriptor `N`, as the
 //! real worker does (a ring that will not open is one stderr line, then the
 //! pipe); `ZETA_FAKE_NO_RING=1` ignores the flag, as a worker of an older
-//! build would. `ZETA_FAKE_READ_SAMPLES=N` scripts the mock's reads `N`
+//! build would. `ZETA_FAKE_BAD_SLOT=1` rewrites the first descriptor to name
+//! slot 9999, which no ring has. `ZETA_FAKE_READ_SAMPLES=N` scripts the mock's reads `N`
 //! samples long instead of [`READ_SAMPLES`], and raises the mock's rate
 //! ceiling to `100 N` when that is above its own, since the source reads a
 //! hundredth of a second at a time: a tune to that rate then gets blocks of
 //! `N` samples.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -57,7 +61,7 @@ use zeta_source_worker::ring::Ring;
 use zeta_source_worker::serve::{
     EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
 };
-use zeta_source_worker::wire::{Control, Frame, Hello, write_frame};
+use zeta_source_worker::wire::{Control, Frame, Hello, read_frame, write_frame};
 
 /// Samples per scripted read, unless `ZETA_FAKE_READ_SAMPLES` says otherwise.
 const READ_SAMPLES: usize = 16_384;
@@ -356,6 +360,73 @@ fn crash_after(after: Duration, record: Option<&Path>) {
     });
 }
 
+/// How the fake bends the frames `serve` writes before they reach the parent.
+#[derive(Clone, Copy)]
+struct Bend {
+    /// Speak protocol 1: no `transport` in the hello, no `transport_dropped`
+    /// in the status.
+    protocol_1: bool,
+    /// Name slot 9999 in the first descriptor.
+    bad_slot: bool,
+}
+
+/// How long the end of the worker waits for the bending thread to pass the
+/// last frames on.
+const BEND_FLUSH: Duration = Duration::from_secs(1);
+
+/// Put a thread between `serve` and `frames` that rewrites each frame per
+/// `bend`: the returned writer is what `serve` writes to, and the receiver
+/// answers once the thread has passed the last frame on.
+fn bend_frames(mut frames: File, bend: Bend) -> io::Result<(File, std::sync::mpsc::Receiver<()>)> {
+    let mut fds = [0; 2];
+    // SAFETY: `pipe2` writes two descriptors into the array it is given.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors were just opened and nothing else owns them.
+    let (mut rd, wr) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    let (done_tx, done) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("fake-bend".into())
+        .spawn(move || {
+            let mut bad_slot = bend.bad_slot;
+            while let Ok(Some(mut f)) = read_frame(&mut rd) {
+                if let (true, Frame::Descriptor(d)) = (bad_slot, &mut f) {
+                    d.slot = 9999;
+                    bad_slot = false;
+                }
+                let written = match (&f, bend.protocol_1) {
+                    (Frame::Control(c), true) => write_protocol_1(&mut frames, c),
+                    _ => write_frame(&mut frames, &f),
+                };
+                if written.and_then(|()| frames.flush()).is_err() {
+                    break;
+                }
+            }
+            let _ = done_tx.send(());
+        })?;
+    Ok((wr, done))
+}
+
+/// Write `c` as a protocol-1 worker would: protocol 1 and no `transport` in a
+/// hello, no `transport_dropped` in a status. The frame is written by hand
+/// (kind 0, the length, the JSON), as the keys are left out entirely.
+fn write_protocol_1(w: &mut impl Write, c: &Control) -> io::Result<()> {
+    let mut v = serde_json::to_value(c).map_err(io::Error::other)?;
+    if let Some(h) = v.get_mut("hello").and_then(|h| h.as_object_mut()) {
+        h.remove("transport");
+        h.insert("protocol".into(), 1.into());
+    }
+    if let Some(s) = v.get_mut("status").and_then(|s| s.as_object_mut()) {
+        s.remove("transport_dropped");
+    }
+    let payload = serde_json::to_vec(&v).map_err(io::Error::other)?;
+    let len = u32::try_from(payload.len()).map_err(io::Error::other)?;
+    w.write_all(&[0])?;
+    w.write_all(&len.to_le_bytes())?;
+    w.write_all(&payload)
+}
+
 /// Say hello with `protocol` on `frames`, as a worker of another build would,
 /// then wait for the parent to kill the process.
 fn wrong_hello(port: &dyn Port, protocol: u32, mut frames: File) -> ExitCode {
@@ -500,18 +571,40 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_OPEN_FAILED);
             }
         };
-        if let Some(protocol) = std::env::var("ZETA_FAKE_PROTOCOL")
+        let protocol: Option<u32> = std::env::var("ZETA_FAKE_PROTOCOL")
             .ok()
-            .and_then(|v| v.parse().ok())
-        {
-            return wrong_hello(port.as_ref(), protocol, frames);
+            .and_then(|v| v.parse().ok());
+        let bend = Bend {
+            protocol_1: protocol == Some(1),
+            bad_slot: std::env::var("ZETA_FAKE_BAD_SLOT").is_ok_and(|v| v == "1"),
+        };
+        if let Some(p) = protocol.filter(|p| *p != 1) {
+            return wrong_hello(port.as_ref(), p, frames);
         }
         let port: Arc<dyn Port> = Arc::new(Recorded {
             inner: port,
             record: record.clone(),
         });
-        let ring = open_ring(args.ring_fd);
-        let code = serve(port, "fake", requests, frames, ring).await;
+        // A protocol-1 worker knows nothing of rings.
+        let ring = if bend.protocol_1 {
+            None
+        } else {
+            open_ring(args.ring_fd)
+        };
+        let code = if bend.protocol_1 || bend.bad_slot {
+            let (out, bent) = match bend_frames(frames, bend) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("zeta-fake-worker: frame pipe: {e}");
+                    return ExitCode::from(EXIT_OPEN_FAILED);
+                }
+            };
+            let code = serve(port, "fake", requests, out, ring).await;
+            let _ = tokio::task::spawn_blocking(move || bent.recv_timeout(BEND_FLUSH)).await;
+            code
+        } else {
+            serve(port, "fake", requests, frames, ring).await
+        };
         record.line("served");
         drop(keep);
         code

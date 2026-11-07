@@ -15,7 +15,8 @@
 //! and flushes per frame, so control messages and blocks keep one order and a
 //! parent that reads slowly never blocks the status task's fault check (blocks
 //! beyond [`MAX_QUEUED_BLOCKS`] are dropped and counted as lost instead). Both
-//! kinds of drop add up in the status's `transport_dropped`.
+//! kinds of drop, and blocks the pump lost to a lagging broadcast, add up in
+//! the status's `transport_dropped`.
 //!
 //! [`requests_until_signal`] is the stdin a worker hands `serve`: SIGTERM and
 //! SIGINT become a `shutdown` request, and a watchdog ends the process if the
@@ -262,8 +263,9 @@ pub async fn serve(
 
 /// Forward every block of `rx`: into `ring` as descriptors when there is one,
 /// whole on the pipe otherwise. Blocks (or ring pieces) dropped for a full
-/// ring or a full writer queue are added to `dropped`; those and blocks lost
-/// to a lagging broadcast are logged at most every [`LOST_LOG_EVERY`].
+/// ring or a full writer queue, and blocks lost to a lagging broadcast (the
+/// pump fell behind the port, so they never reached the node either), are
+/// added to `dropped` and logged at most every [`LOST_LOG_EVERY`].
 async fn pump(
     mut rx: broadcast::Receiver<IqBlock>,
     writer: Writer,
@@ -287,7 +289,10 @@ async fn pump(
                     dropped.fetch_add(n, Ordering::Relaxed);
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => lost += n,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                lost += n;
+                dropped.fetch_add(n, Ordering::Relaxed);
+            }
             Err(broadcast::error::RecvError::Closed) => return,
         }
         if lost > 0 && logged.is_none_or(|t| t.elapsed() >= LOST_LOG_EVERY) {

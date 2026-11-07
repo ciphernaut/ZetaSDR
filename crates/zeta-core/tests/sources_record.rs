@@ -38,6 +38,8 @@ impl Port for WorkerFixture {
             pid: Some(1),
             restarts: 0,
             since_ns: None,
+            transport: None,
+            transport_dropped: 0,
         })
     }
 }
@@ -119,7 +121,9 @@ async fn source_list_shows_worker_for_a_worker_port_and_null_otherwise() {
         Some(WorkerInfo {
             pid: Some(1),
             restarts: 0,
-            since_ns: None
+            since_ns: None,
+            transport: None,
+            transport_dropped: 0,
         })
     );
     let json = serde_json::to_value(&v).unwrap();

@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use zeta_core::port::{Port, PortError, Tuning};
+use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, TransportPath, Tuning};
 use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId};
 use zeta_source_worker::port::{Attach, Timings, WorkerConfig, WorkerPort};
+use zeta_source_worker::ring::{DEFAULT_RING_BYTES, Ring};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_zeta-fake-worker");
 
@@ -36,6 +37,7 @@ fn cfg(script: &str) -> WorkerConfig {
         program: PathBuf::from(FAKE),
         args: ["--id", "f", "--script", script].map(String::from).to_vec(),
         timings: timings(),
+        ring_bytes: DEFAULT_RING_BYTES,
     }
 }
 
@@ -71,6 +73,7 @@ fn cfg_wrapped(dir: &Path, body: &str) -> (WorkerConfig, PathBuf) {
             rec.display().to_string(),
         ],
         timings: timings(),
+        ring_bytes: DEFAULT_RING_BYTES,
     };
     (cfg, rec)
 }
@@ -138,6 +141,44 @@ fn within(gap: u64, want: u64) -> bool {
 
 fn alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The command line of process `pid`.
+fn cmdline(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect()
+}
+
+/// The `--ring-fd` value on process `pid`'s command line, if any.
+fn ring_fd_arg(pid: u32) -> Option<String> {
+    let args = cmdline(pid);
+    let at = args.iter().position(|a| a == "--ring-fd")?;
+    args.get(at + 1).cloned()
+}
+
+/// The next block on `rx`, within 5 s.
+async fn next_block(rx: &mut IqReceiver) -> IqBlock {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a block within 5 s")
+        {
+            Ok(b) => return b,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(e) => panic!("the block broadcast ended: {e}"),
+        }
+    }
+}
+
+/// Whether `b` holds the mock's samples: `v - jv` for a running count `v`.
+fn mock_samples(b: &IqBlock) -> bool {
+    !b.samples.is_empty()
+        && b.samples.iter().all(|s| s.im == -s.re)
+        && b.samples.windows(2).all(|w| w[1].re == w[0].re + 1.0)
 }
 
 async fn open(cfg: WorkerConfig, cached: Option<Capabilities>) -> (Arc<WorkerPort>, Attach) {
@@ -550,13 +591,13 @@ async fn a_hello_of_another_protocol_is_refused_and_the_child_reaped() {
     let (cfg, _rec) = cfg_wrapped(
         dir.path(),
         &format!(
-            "echo $$ > '{}'\nZETA_FAKE_PROTOCOL=99 exec \"$FAKE\" --script stream \"$@\"",
+            "echo $$ > '{}'\nZETA_FAKE_PROTOCOL=3 exec \"$FAKE\" --script stream \"$@\"",
             pidfile.display()
         ),
     );
     let t0 = Instant::now();
     let err = WorkerPort::open(cfg, None).await.err().expect("refused");
-    assert_eq!(err, "soapy worker for f: protocol 99, expected 2");
+    assert_eq!(err, "soapy worker for f: protocol 3, expected 1 or 2");
     assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     let pid: u32 = std::fs::read_to_string(&pidfile)
         .unwrap()
@@ -622,4 +663,147 @@ async fn close_ends_a_worker_whose_runtime_waits_on_stdin_before_the_grace() {
     assert!(!alive(pid), "worker {pid} outlived the close");
     let text = std::fs::read_to_string(&rec).unwrap();
     assert!(text.lines().any(|l| l == "served"), "{text}");
+}
+
+#[tokio::test]
+async fn blocks_arrive_through_the_ring_and_the_worker_info_says_shm() {
+    let (port, _) = open(cfg("stream"), None).await;
+    let w = port.worker().unwrap();
+    let transport = w
+        .transport
+        .expect("a protocol-2 worker names its transport");
+    assert_eq!(transport.path, TransportPath::Shm);
+    assert_eq!(transport.format, "cf32");
+    // The header and as many whole slots as fit.
+    let ring_bytes = Ring::create(DEFAULT_RING_BYTES).unwrap().bytes();
+    assert_eq!(transport.ring_bytes, ring_bytes as u64);
+    assert_eq!(w.transport_dropped, 0);
+    assert_eq!(ring_fd_arg(w.pid.unwrap()).as_deref(), Some("3"));
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    let mut last: Option<IqBlock> = None;
+    for _ in 0..3 {
+        let b = next_block(&mut rx).await;
+        assert_eq!(b.sample_rate_hz, Hz(2_000_000));
+        assert_eq!(b.center_hz, Hz(100_000_000));
+        assert!(
+            mock_samples(&b),
+            "{:?}",
+            &b.samples[..4.min(b.samples.len())]
+        );
+        if let Some(prev) = &last {
+            assert!(b.t0.0 > prev.t0.0, "{:?} after {:?}", b.t0, prev.t0);
+        }
+        last = Some(b);
+    }
+    assert_eq!(port.fault(), None);
+}
+
+#[tokio::test]
+async fn each_spawn_gets_its_own_ring() {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "ZETA_FAKE_CRASH_ONCE=1 exec \"$FAKE\" --script 'crash-after-ms 500' \"$@\"",
+    );
+    let (port, _) = open(cfg, None).await;
+    let first = port.worker().unwrap();
+    let first_ino = port.ring_ino().expect("a live ring");
+    assert_eq!(ring_fd_arg(first.pid.unwrap()).as_deref(), Some("3"));
+    let healed = port.healed().unwrap();
+    assert!(
+        wait_for(Duration::from_secs(5), || *healed.borrow() > 0).await,
+        "no heal"
+    );
+    let second = port.worker().unwrap();
+    assert_eq!(second.restarts, 1);
+    assert_ne!(second.pid, first.pid);
+    assert!(
+        second.since_ns > first.since_ns,
+        "{second:?} after {first:?}"
+    );
+    assert_eq!(ring_fd_arg(second.pid.unwrap()).as_deref(), Some("3"));
+    assert_eq!(second.transport.unwrap().path, TransportPath::Shm);
+    let second_ino = port.ring_ino().expect("a live ring");
+    assert_ne!(second_ino, first_ino, "the respawn reused the old memfd");
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert!(mock_samples(&next_block(&mut rx).await));
+}
+
+#[tokio::test]
+async fn a_descriptor_outside_the_ring_is_a_bad_frame() {
+    let dir = tempdir();
+    // Only the first spawn names a slot the ring does not have.
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "[ \"$N\" = 0 ] && export ZETA_FAKE_BAD_SLOT=1\nexec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, _) = open(cfg, None).await;
+    let healed = port.healed().unwrap();
+    // The first descriptor follows the tune; its reply may or may not get in
+    // before the worker is ended for it.
+    let _ = port.tune(tuning(100_000_000, 2_000_000)).await;
+    assert!(
+        wait_for(Duration::from_secs(3), || port
+            .fault()
+            .is_some_and(|f| f.contains("bad frame")))
+        .await,
+        "fault: {:?}",
+        port.fault()
+    );
+    let fault = port.fault().unwrap();
+    assert!(fault.contains("slot 9999"), "{fault}");
+    assert!(
+        wait_for(Duration::from_secs(5), || *healed.borrow() > 0).await,
+        "no heal"
+    );
+    port.heal_settled();
+    assert_eq!(port.worker().unwrap().restarts, 1);
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert!(mock_samples(&next_block(&mut rx).await));
+    assert_eq!(port.fault(), None);
+}
+
+#[tokio::test]
+async fn without_a_ring_the_child_streams_on_the_pipe() {
+    let mut c = cfg("stream");
+    c.ring_bytes = 0;
+    let (port, _) = open(c, None).await;
+    let w = port.worker().unwrap();
+    assert_eq!(ring_fd_arg(w.pid.unwrap()), None);
+    let transport = w
+        .transport
+        .expect("a protocol-2 worker names its transport");
+    assert_eq!(transport.path, TransportPath::Pipe);
+    assert_eq!(transport.ring_bytes, 0);
+    assert_eq!(port.ring_ino(), None);
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    let b = next_block(&mut rx).await;
+    assert_eq!(b.sample_rate_hz, Hz(2_000_000));
+    assert!(mock_samples(&b));
+}
+
+#[tokio::test]
+async fn a_protocol_1_child_is_still_accepted() {
+    // A worker of an older build: it ignores `--ring-fd`, says hello with
+    // protocol 1 and no transport, and sends its blocks on the pipe.
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "ZETA_FAKE_PROTOCOL=1 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, attach) = open(cfg, None).await;
+    assert!(matches!(attach, Attach::Hello), "{attach:?}");
+    let w = port.worker().unwrap();
+    assert_eq!(w.transport, None);
+    assert_eq!(w.transport_dropped, 0);
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    let b = next_block(&mut rx).await;
+    assert_eq!(b.center_hz, Hz(100_000_000));
+    assert!(mock_samples(&b));
+    assert_eq!(port.fault(), None);
 }

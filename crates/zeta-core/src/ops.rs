@@ -62,8 +62,11 @@ pub enum Op {
     /// rate delivered over the last 10 s, `null` before any; `overflows`,
     /// `timeouts`, `restarts`, streams reopened because their samples ran ahead
     /// of the clock; `null` for a source that keeps none), and `worker`, the child
-    /// process the source runs in (`pid`, `restarts`, `since_ns`; `null` for a
-    /// source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
+    /// process the source runs in (`pid`, `restarts`, `since_ns`; `transport`,
+    /// how its blocks reach the node: `path` `shm` or `pipe`, `format`,
+    /// `ring_bytes`, `null` while none runs or from an older worker; and
+    /// `transport_dropped`, the blocks it dropped because the node fell behind;
+    /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
     /// before the first block; a `classify` or `iq_read` span older than it fails
     /// `too_old`). Jobs on a faulted source fail with
     /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,

@@ -80,13 +80,17 @@ impl Default for Timings {
     }
 }
 
-/// What to spawn: `program` with `args`, serving source `id`.
+/// What to spawn: `program` with `args`, serving source `id`. With
+/// `ring_bytes > 0` (and memfds available) each spawn gets a shared-memory
+/// ring of that size for its blocks, and `--ring-fd 3` after `args`; with 0
+/// the blocks come on the pipe.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub id: SourceId,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub timings: Timings,
+    pub ring_bytes: usize,
 }
 
 /// What the first spawn said.
@@ -197,6 +201,25 @@ impl WorkerPort {
                 self.close_bound.as_secs_f64()
             );
         }
+    }
+
+    /// The inode of the live worker's ring memfd, so a test can tell one
+    /// spawn's ring from the next; `None` without a live ring.
+    #[cfg(feature = "test-bin")]
+    pub fn ring_ino(&self) -> Option<u64> {
+        use std::os::fd::AsRawFd;
+        let ring = self.shared.snapshot().ring.clone()?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat` writes a `stat` into the buffer and nothing else; the
+        // descriptor is the ring's, alive while `ring` is held, and the buffer
+        // is read only when the call succeeded.
+        let st = unsafe {
+            if libc::fstat(ring.fd().as_raw_fd(), st.as_mut_ptr()) < 0 {
+                return None;
+            }
+            st.assume_init()
+        };
+        Some(st.st_ino)
     }
 
     /// Refuse a band the device cannot take before anything is sent, with the
@@ -391,6 +414,8 @@ impl Port for WorkerPort {
             pid: s.pid,
             restarts: s.restarts,
             since_ns: s.since_ns,
+            transport: s.transport.clone(),
+            transport_dropped: s.transport_dropped,
         })
     }
 }

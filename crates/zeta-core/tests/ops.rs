@@ -2134,7 +2134,17 @@ async fn source_list_carries_nullable_stats() {
         .filter_map(Value::as_str)
         .collect();
     req.sort();
-    assert_eq!(req, ["pid", "restarts", "since_ns"], "{wi}");
+    assert_eq!(
+        req,
+        [
+            "pid",
+            "restarts",
+            "since_ns",
+            "transport",
+            "transport_dropped"
+        ],
+        "{wi}"
+    );
     let json = serde_json::to_value(&v).unwrap();
     assert!(json[0].get("stats").is_some_and(Value::is_null), "{json}");
     let si = &schema()["result"]["$defs"]["SourceInfo"];
