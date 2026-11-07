@@ -43,45 +43,88 @@ pub fn probe_candidates(model: &RateModel) -> Vec<u64> {
     }
 }
 
-/// Stream each of [`probe_candidates`] at `center_hz` for [`PROBE_DWELL`] and
-/// return the first rate that delivered at least [`PROBE_MIN_DELIVERED`] of
-/// itself with no new overflow. None passing is the last rate that streamed
-/// (the slowest); a candidate whose tune fails is skipped, and every tune
-/// failing is an error. The stream is then closed and the source left as it
-/// opened: nothing tuned, the probe's overflows not counted.
-pub async fn probe_rate_cap(src: &SoapySource, center_hz: u64) -> Result<u64, String> {
-    let cap = probe(src, center_hz).await;
-    src.end_probe().await;
-    cap
+/// What a rate probe found: the cap, how many candidate rates streamed (their
+/// tune succeeded), and whether the cap streamed cleanly (`false`: none did,
+/// and the cap is the slowest rate that streamed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeResult {
+    pub cap_hz: u64,
+    pub tried: usize,
+    pub clean: bool,
 }
 
-async fn probe(src: &SoapySource, center_hz: u64) -> Result<u64, String> {
+/// [`probe_rate`]'s cap.
+pub async fn probe_rate_cap(src: &SoapySource, center_hz: u64) -> Result<u64, String> {
+    probe_rate(src, center_hz).await.map(|p| p.cap_hz)
+}
+
+/// Stream each of [`probe_candidates`] at `center_hz` for [`PROBE_DWELL`] and
+/// take the first rate that delivered at least [`PROBE_MIN_DELIVERED`] of
+/// itself with no new overflow. None passing is the slowest rate that
+/// streamed, not clean; a candidate whose tune fails is skipped. Every tune
+/// failing is an error, and so is a device the source gives up as lost during
+/// the probe: no cap comes out of a rate that killed the device. The stream is
+/// then closed and the source left as it opened: nothing tuned, the probe's
+/// overflows not counted (a lost device's fault stays).
+pub async fn probe_rate(src: &SoapySource, center_hz: u64) -> Result<ProbeResult, String> {
+    let found = probe(src, center_hz).await;
+    src.end_probe().await;
+    found
+}
+
+async fn probe(src: &SoapySource, center_hz: u64) -> Result<ProbeResult, String> {
     // The reader thread ends when nothing receives; hold a receiver throughout.
     let _rx = src.subscribe();
-    let mut last = None;
+    let mut lowest: Option<u64> = None;
+    let mut tried = 0;
     let mut errors = Vec::new();
     for rate in probe_candidates(src.rate_model()) {
         let band = Tuning {
             center_hz: Hz(center_hz),
             bandwidth_hz: Hz(rate),
         };
-        if let Err(e) = src.tune(band).await {
+        let tuned = src.tune(band).await;
+        if let Some(e) = lost(src, rate) {
+            return Err(e);
+        }
+        if let Err(e) = tuned {
             errors.push(format!("{rate} Hz: {e}"));
             continue;
         }
-        last = Some(rate);
+        tried += 1;
+        lowest = Some(lowest.map_or(rate, |l| l.min(rate)));
         let before = src.overflows();
         tokio::time::sleep(PROBE_DWELL).await;
+        if let Some(e) = lost(src, rate) {
+            return Err(e);
+        }
         let overflows = src.overflows() - before;
         let measured = src.measured_rate_hz().unwrap_or(0.0);
         if overflows == 0 && measured >= PROBE_MIN_DELIVERED * rate as f64 {
-            return Ok(rate);
+            return Ok(ProbeResult {
+                cap_hz: rate,
+                tried,
+                clean: true,
+            });
         }
     }
-    last.ok_or_else(|| {
+    let cap_hz = lowest.ok_or_else(|| {
         format!(
             "rate probe: no candidate rate tuned ({})",
             errors.join("; ")
         )
+    })?;
+    Ok(ProbeResult {
+        cap_hz,
+        tried,
+        clean: false,
+    })
+}
+
+/// The probe's error when the source gave its device up as lost at `rate`.
+fn lost(src: &SoapySource, rate: u64) -> Option<String> {
+    src.is_lost().then(|| {
+        let fault = src.fault().unwrap_or_default();
+        format!("rate probe: device lost at {rate} Hz: {fault}")
     })
 }

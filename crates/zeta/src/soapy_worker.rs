@@ -67,7 +67,7 @@ mod imp {
     use zeta_core::port::Port;
     use zeta_core::types::{Claim, Hz, SourceId};
     use zeta_source_soapy::SoapySource;
-    use zeta_source_soapy::probe::{probe_candidates, probe_rate_cap};
+    use zeta_source_soapy::probe::probe_rate;
     use zeta_source_worker::ring::Ring;
     use zeta_source_worker::serve::{
         EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
@@ -137,9 +137,11 @@ mod imp {
 
     /// Set the source's rate cap before it is served: `asserted` (`max_rate_hz=`) as
     /// asserted; else `cached` (`--rate-cap-hz`) as measured; else the cap the rate
-    /// probe measures at the centre of the tune range, logged in one stderr line. A
-    /// probe that cannot tune any rate leaves the device's own asserted cap, with a
-    /// stderr line saying why.
+    /// probe measures at the centre of the tune range, logged in one stderr line
+    /// (`, none clean` when no rate streamed cleanly and the cap is the slowest that
+    /// streamed). A probe that cannot tune any rate, or that lost the device, leaves the
+    /// device's own asserted cap, with a stderr line saying why: `serve` then reports
+    /// a lost device's fault and exits, and the respawn probes again.
     async fn set_rate_cap(
         src: &mut SoapySource,
         id: &str,
@@ -152,14 +154,12 @@ mod imp {
             (None, None) => {
                 let caps = src.capabilities();
                 let center = (caps.tune_min_hz.value().0 + caps.tune_max_hz.value().0) / 2;
-                match probe_rate_cap(src, center).await {
-                    Ok(cap) => {
-                        let tried = probe_candidates(src.rate_model())
-                            .iter()
-                            .position(|&r| r == cap)
-                            .map_or(0, |i| i + 1);
+                match probe_rate(src, center).await {
+                    Ok(p) => {
+                        let (cap, tried) = (p.cap_hz, p.tried);
+                        let none_clean = if p.clean { "" } else { ", none clean" };
                         eprintln!(
-                            "zeta-soapy-worker[{id}]: rate cap {cap} Hz measured ({tried} rungs tried)"
+                            "zeta-soapy-worker[{id}]: rate cap {cap} Hz measured ({tried} rungs tried{none_clean})"
                         );
                         Claim::Measured(Hz(cap))
                     }

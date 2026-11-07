@@ -438,6 +438,12 @@ impl SoapySource {
         apply_gain(self.dev.as_ref(), &self.status, db).map_err(PortError::Io)
     }
 
+    /// Whether the reader gave the device up as lost (unplugged, an overflow
+    /// storm, a failed retune): final, every later `tune` refuses.
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
     /// The error of a call on a source whose device was given up as lost; no
     /// device call has been made.
     fn lost_error(&self) -> Option<PortError> {

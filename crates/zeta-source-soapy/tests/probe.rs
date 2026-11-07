@@ -9,7 +9,9 @@ use zeta_core::types::{Claim, Hz, SourceId};
 use zeta_source_soapy::caps::RateModel;
 use zeta_source_soapy::device::RangeHz;
 use zeta_source_soapy::mock::MockDevice;
-use zeta_source_soapy::probe::{PROBE_DWELL, PROBE_MAX_RUNGS, probe_candidates, probe_rate_cap};
+use zeta_source_soapy::probe::{
+    PROBE_DWELL, PROBE_MAX_RUNGS, ProbeResult, probe_candidates, probe_rate, probe_rate_cap,
+};
 use zeta_source_soapy::{SoapySource, ZetaArgs, split_zeta_args};
 
 const CENTER: u64 = 100_000_000;
@@ -49,7 +51,14 @@ async fn a_ladder_is_probed_from_the_top_and_the_first_clean_rung_wins() {
     ));
     let src = source(&dev);
     let opened = dev.calls().len();
-    assert_eq!(probe_rate_cap(&src, CENTER).await, Ok(2_048_000));
+    assert_eq!(
+        probe_rate(&src, CENTER).await,
+        Ok(ProbeResult {
+            cap_hz: 2_048_000,
+            tried: 3,
+            clean: true,
+        })
+    );
     assert_eq!(
         rate_calls(&dev, opened),
         [
@@ -92,13 +101,53 @@ async fn a_probe_that_never_streams_clean_caps_at_the_lowest_rung() {
     let opened = dev.calls().len();
     let start = Instant::now();
     assert_eq!(
-        probe_rate_cap(&src, CENTER).await,
-        Ok(*candidates.last().unwrap())
+        probe_rate(&src, CENTER).await,
+        Ok(ProbeResult {
+            cap_hz: *candidates.last().unwrap(),
+            tried: PROBE_MAX_RUNGS,
+            clean: false,
+        })
     );
     let took = start.elapsed();
     let bound = (PROBE_DWELL + Duration::from_millis(500)) * PROBE_MAX_RUNGS as u32;
     assert!(took <= bound, "{took:?} > {bound:?}");
     assert_eq!(rate_calls(&dev, opened).len(), PROBE_MAX_RUNGS);
+}
+
+#[tokio::test]
+async fn a_rung_that_loses_the_device_ends_the_probe_with_an_error() {
+    // Every read at the top rung overflows: the reader gives the device up as
+    // lost after its overflow storm, inside the dwell. No cap may come out.
+    let dev = Arc::new(ladder().pace_at(6.144e6, 1.0, 1));
+    let src = source(&dev);
+    let opened = dev.calls().len();
+    let err = probe_rate(&src, CENTER).await.unwrap_err();
+    assert!(err.contains("overflow storm"), "{err}");
+    assert!(src.fault().is_some_and(|f| f.contains("overflow storm")));
+    assert_eq!(rate_calls(&dev, opened), ["set_sample_rate(6144000)"]);
+}
+
+#[tokio::test]
+async fn the_fallback_is_the_lowest_rung_that_tuned_and_counts_only_those() {
+    // The top rung's tune fails; the rest all overflow: the cap is the lowest
+    // rung, five rungs tried, none clean.
+    let mut dev = ladder();
+    let candidates = probe_candidates(source(&Arc::new(ladder())).rate_model());
+    for &r in &candidates {
+        dev = dev.pace_at(r as f64, 1.0, OVERFLOWING);
+    }
+    let dev = Arc::new(dev);
+    let src = source(&dev);
+    // After the open, whose rate-range probe calls `set_sample_rate` too.
+    dev.fail_next("set_sample_rate", "busy");
+    assert_eq!(
+        probe_rate(&src, CENTER).await,
+        Ok(ProbeResult {
+            cap_hz: *candidates.last().unwrap(),
+            tried: PROBE_MAX_RUNGS - 1,
+            clean: false,
+        })
+    );
 }
 
 #[tokio::test]
