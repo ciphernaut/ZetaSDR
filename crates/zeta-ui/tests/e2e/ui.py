@@ -6345,9 +6345,17 @@ def scenario_panes_show_one_at_a_time(page, url, secret):
     assert not errors, f"console errors: {errors}"
 
 
+def wait_pane_parent(page, parent_id):
+    """Wait until the pane host #pane is a child of the element `parent_id`."""
+    page.wait_for_function(
+        "(id) => document.querySelector('#pane')?.parentElement?.id === id",
+        arg=parent_id, timeout=5_000)
+
+
 def scenario_dock_right(page, url, secret):
     """`view set dock right` moves #pane into the side column as a third folding section above
-    the Jobs pane, the waterfall keeping #main's height; `bottom` moves it back; `auto` follows
+    the Jobs pane, the waterfall keeping #main's height, whether the dock or the pane comes
+    first; `bottom` moves it back and a return to `right` comes back unfolded; `auto` follows
     the theme's `layout.dock`; the narrow footprint ignores the dock."""
     select_source(page, url, secret, "tone")
     page.set_viewport_size(WIDE)
@@ -6358,7 +6366,7 @@ def scenario_dock_right(page, url, secret):
         sec = page.locator("#side section.pane.dock")
         expect(sec).to_have_count(1)
         expect(sec.locator(".pane-head")).to_contain_text("Subjects")
-        assert page.evaluate("() => document.querySelector('#pane').parentElement.id") == "pane-dock"
+        wait_pane_parent(page, "pane-dock")
         order = page.evaluate(
             "() => [...document.querySelectorAll('#side > section')].map(s => s.className)")
         assert order[1].endswith("dock") and "jobs" in order[2], order
@@ -6368,24 +6376,45 @@ def scenario_dock_right(page, url, secret):
         assert sec.bounding_box()["height"] >= 0.25 * main["height"], sec.bounding_box()
         expect(page.locator("#pane-dock #subjects tr.subject").first).to_be_visible(timeout=10_000)
         expect(sec.locator(".pane-head .count")).to_have_text(re.compile(r"^[1-9]\d*$"))
-        sec.locator(".pane-head").click()
+        head = sec.locator(".pane-head")
+        head.click()
         expect(sec).to_have_attribute("data-collapsed", "")
-        sec.locator(".pane-head").click()
-        assert page.evaluate(
-            "() => !document.querySelector('#pane-dock').hasAttribute('data-collapsed')")
+        expect(head).to_have_attribute("aria-expanded", "false")
+        head.click()
+        page.wait_for_function(
+            "() => !document.querySelector('#pane-dock').hasAttribute('data-collapsed')",
+            timeout=5_000)
+        # Folded, then bottom: #pane goes back under the main view and the section goes.
+        head.click()
+        expect(sec).to_have_attribute("data-collapsed", "")
         run_cmd(page, "view set dock bottom")
-        assert page.evaluate("() => document.querySelector('#pane').parentElement.id") == "main"
+        wait_pane_parent(page, "main")
+        expect(page.locator("#side section.pane.dock")).to_have_count(0)
+        # The pane first, the dock after: the selected pane goes into the column, unfolded.
+        run_cmd(page, "view set dock right")
+        wait_pane_parent(page, "pane-dock")
+        expect(sec).to_have_count(1)
+        expect(sec).not_to_have_attribute("data-collapsed", "")
+        expect(sec.locator(".pane-head")).to_have_attribute("aria-expanded", "true")
+        expect(page.locator("#pane-dock #subjects")).to_be_visible()
+        run_cmd(page, "view set dock bottom")
+        wait_pane_parent(page, "main")
         expect(page.locator("#side section.pane.dock")).to_have_count(0)
         run_cmd(page, "view set dock auto")
         run_cmd(page, "view set theme fixture_dock_right")
         page.wait_for_function("() => document.documentElement.dataset.dock === 'right'",
                                timeout=5_000)
+        wait_pane_parent(page, "pane-dock")
         run_cmd(page, "view set theme console")
         page.wait_for_function("() => document.documentElement.dataset.dock === 'bottom'",
                                timeout=5_000)
+        wait_pane_parent(page, "main")
         page.set_viewport_size(NARROW)
         run_cmd(page, "view set dock right")
-        assert page.evaluate("() => document.querySelector('#pane').parentElement.id") == "main"
+        page.wait_for_function("() => document.documentElement.dataset.dock === 'right'",
+                               timeout=5_000)
+        wait_pane_parent(page, "main")
+        expect(page.locator("#side section.pane.dock")).to_have_count(0)
     finally:
         run_cmd(page, "view reset")
         page.set_viewport_size(WIDE)

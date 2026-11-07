@@ -217,7 +217,8 @@ Regions:
   `.pane-head` is its header button; `section.pane[data-collapsed]` is a folded one.
   `section.pane.dock` (`#pane-dock`) is the third, between the two, present only while a pane is
   selected and the dock is `right`: its `.pane-head` names the pane (with a `.count` for
-  Subjects) and its body is the pane host `#pane`; its share of the column is `--dock-share`.
+  Subjects: the subjects the running jobs hold, counted before merged groups fold, so it can be
+  more than the table's rows) and its body is the pane host `#pane`; its share of the column is `--dock-share`.
 - `#panes`: the pane strip (the tabs for the subjects and explore views).
 - `#bar`: the command bar.
 

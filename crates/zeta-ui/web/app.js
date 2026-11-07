@@ -1309,7 +1309,8 @@ function applyPanes() {
 // is the applied theme's `layout.dock`, else bottom. <html data-dock> carries the resolved
 // value in both footprints; the narrow footprint leaves #pane in #main (panes take the main
 // area's place there). The move is a DOM move of the same element, so the panes see nothing.
-// The fold is page memory (state.dockCollapsed), not a policy, forgotten when no pane is shown.
+// The fold is page memory (state.dockCollapsed), not a policy, forgotten when no pane is shown
+// or the dock leaves `right`.
 let themeDock = null; // the applied theme's layout.dock ("bottom" | "right" | null)
 
 function resolveDock() {
@@ -1326,7 +1327,9 @@ function applyDock() {
   const main = document.getElementById("main");
   if (!host || !main) return;
   const pane = state.panes ? state.panes.current() : null;
-  if (!pane) state.dockCollapsed = false;
+  // The fold is forgotten when no pane is shown or the dock leaves `right`, so a return to
+  // `right` comes back unfolded; a trip through the narrow footprint keeps it.
+  if (!pane || dock !== "right") state.dockCollapsed = false;
   let sec = document.getElementById("pane-dock");
   const app = document.getElementById("app");
   if (dock !== "right" || !pane || footprint() === "narrow") {
@@ -1368,7 +1371,8 @@ function applyDock() {
 }
 
 // The docked section's header: the shown pane's tab label, capitalised (`Subjects`), and for
-// Subjects the number of subjects the running jobs have; the count is empty for the others.
+// Subjects the number of subjects the running jobs have, counted before merged groups fold (so
+// it can exceed the table's rows; docs/themes.md says so); the count is empty for the others.
 function paintDockHead() {
   const head = document.querySelector("#pane-dock .pane-head");
   const pane = state.panes ? state.panes.current() : null;
