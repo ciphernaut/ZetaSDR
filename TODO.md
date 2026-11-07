@@ -482,6 +482,10 @@ Antenna caveat: the field host's 2 m / 70 cm vertical hears strong LEO passes on
 
 The ring's hello declares `format: "cf32"`. A compact format (`sc16`, converted at the node) halves the memory bandwidth and is the natural next step for a 61.44 Msps or FPGA front end; not needed while the ring is a memcpy.
 
+## Worker: pack small blocks into one ring slot
+
+Each block takes a whole 2 MiB slot, so a B210's 10 ms blocks fill the 64 MiB ring in about 155 ms at 30.72 Msps; packing several small blocks into one slot (or sizing slots to the block) would buffer the full ring's worth of samples.
+
 ## Test: `ops::too_old_carries_the_rings_earliest_ns` flaked once with a subtract overflow
 
 Seen 2026-11-07 during plan 28.1, passed on rerun. Likely a timing assumption between the ring's `earliest_ns` and now.

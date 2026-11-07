@@ -485,11 +485,18 @@ slots of 2 MiB, 64 MiB per source by default, created per spawn and inherited as
 carries worker protocol 2, control JSON plus 40-byte block descriptors, so control never queues behind
 samples; a worker without a ring falls back to blocks on the pipe, and a protocol-1 child is still
 accepted. `source_list[].worker` shows `transport` and `transport_dropped`. At open the worker probes
-the device's rates from the top (at most 6 rungs, 1.5 s each) and reports the first clean one (no
-overflows, at least 98 % delivered) as `max_bandwidth_hz: {measured: N}`; `max_rate_hz=N` asserts a cap
-with no probe; the cap is cached in `sources/<id>.json` and passed to every respawn. A request wider than
-a measured cap is refused `out_of_range` with `why: insufficient bandwidth: ...`. The hello timeout is
-45 s. The sweep script is `scripts/rate-sweep.sh`.
+the device's rates from the top (at most 6 rungs, a 0.2 s settle and a 1.5 s dwell each) and reports
+the first clean one (at most one overflow in the dwell, at least 98 % delivered) as
+`max_bandwidth_hz: {measured: N}`; with no rung clean it keeps the driver's asserted cap and logs the
+`max_rate_hz=` to pin. `max_rate_hz=N` asserts a cap with no probe; a measured cap is cached in
+`sources/<id>.json` and passed to every respawn, and a respawn's measured cap replaces an asserted one.
+A request wider than a measured cap is refused `out_of_range` with `why: insufficient bandwidth: ...`.
+The hello timeout is 45 s. The sweep script is `scripts/rate-sweep.sh`.
+
+The ring holds `slots` blocks, not `slots × 2 MiB` of samples: each block takes a slot whatever its
+size, and a B210 block is 10 ms (two slots at 30.72 Msps, as a block of 307 200 samples is wider than
+one), so the 64 MiB default (31 slots) buffers about 155 ms there; packing small blocks into one slot is
+a later gist.
 
 ### Sweep before
 
