@@ -6,9 +6,9 @@
 //! [`AisMsg::fields`] gives (`mmsi`, `msg_type`, `repeat`, `lat`, `lon`, `sog_kt`,
 //! `cog_deg`, `heading_deg`, `nav_status`, `name`, `callsign`, `destination`, `imo`,
 //! `ship_type`, `aton_type`, `virtual_aton`), decoded by [`zeta_dsp::ais_msg`] as the
-//! in-crate AIS stage decodes them. Each sentence is read alone: a field past the end
-//! of a fragment is `null`, and every field is `null` when the payload is too short for
-//! an MMSI (a later fragment).
+//! in-crate AIS stage decodes them. Each sentence is read alone: only a message's first
+//! fragment is decoded, a field past its end is `null`, and every field is `null` for a
+//! later fragment or a payload too short for an MMSI.
 
 use serde_json::{Value, json};
 use zeta_dsp::ais_msg::{self, AisMsg};
@@ -37,7 +37,10 @@ pub fn parse(line: &str) -> Option<Value> {
     let mut bits = ais_msg::unarmour(payload)?;
     bits.truncate(bits.len().saturating_sub(usize::from(fill_bits)));
     let channel = (!f[4].is_empty()).then_some(f[4]);
-    let fields = match ais_msg::decode(&bits) {
+    // Only a message's first fragment starts with its header: a later one carries the
+    // middle of a message, which read alone could pass for a vessel.
+    let first = f[2] == "1";
+    let fields = match ais_msg::decode(&bits).filter(|_| first) {
         Some(m) => m.fields(),
         None => AisMsg::default()
             .fields()
@@ -73,6 +76,19 @@ mod tests {
         );
         assert_eq!(v["cog_deg"], 51.0);
         assert_eq!(v["name"], Value::Null);
+    }
+
+    #[test]
+    fn a_later_fragment_is_not_decoded_as_a_message() {
+        // The published type 1 payload sent as fragment 2 of 2: read alone it would decode
+        // as a vessel, but a continuation carries the middle of another message.
+        let body = "AIVDM,2,2,3,B,177KQJ5000G?tO`K>RA1wUbN0TKH,0";
+        let cs = body.bytes().fold(0u8, |a, b| a ^ b);
+        let v = parse(&format!("!{body}*{cs:02X}")).unwrap();
+        assert_eq!(v["payload"], "177KQJ5000G?tO`K>RA1wUbN0TKH");
+        assert_eq!(v["mmsi"], Value::Null);
+        assert_eq!(v["msg_type"], Value::Null);
+        assert_eq!(v["lat"], Value::Null);
     }
 
     #[test]

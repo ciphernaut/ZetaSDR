@@ -1237,9 +1237,9 @@ pub enum SynthSpec {
         vel_v: f64,
         frames: u32,
     },
-    /// AIS ([`ais_frames_iq`]): per repeat a type 1 position report (`mmsi`, the position,
-    /// `sog_kt`, `cog_deg`) and, with `name`, a type 5 static report, GMSK at 9600 baud,
-    /// frames `gap_ms` apart (50 by default).
+    /// AIS: per repeat a type 1 position report (`mmsi`, the position, `sog_kt`,
+    /// `cog_deg`; [`crate::ais_msg::position_report_bits`]) and, with `name`, a type 5
+    /// static report, GMSK at 9600 baud, frames `gap_ms` apart (50 by default).
     Ais {
         mmsi: u32,
         lat: f64,

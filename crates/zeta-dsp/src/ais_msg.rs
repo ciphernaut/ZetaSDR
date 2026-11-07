@@ -22,6 +22,8 @@ const AIS_POS_SCALE: f64 = 600_000.0;
 /// The largest latitude and longitude, in degrees; "not available" is 91 and 181.
 const AIS_LAT_MAX: f64 = 90.0;
 const AIS_LON_MAX: f64 = 180.0;
+/// Speed and course over ground are in tenths (0.1 kt, 0.1 degree).
+const AIS_SOG_COG_SCALE: f64 = 10.0;
 /// Speed over ground in 0.1 kt; 1023 is not available.
 const AIS_SOG_NA: u64 = 1023;
 /// Course over ground in 0.1 degree; 3600 is not available.
@@ -135,12 +137,12 @@ impl Fields<'_> {
 
     fn sog(&self, from: usize) -> Option<f64> {
         let v = self.uint(from, 10)?;
-        (v != AIS_SOG_NA).then(|| v as f64 / 10.0)
+        (v != AIS_SOG_NA).then(|| v as f64 / AIS_SOG_COG_SCALE)
     }
 
     fn cog(&self, from: usize) -> Option<f64> {
         let v = self.uint(from, 12)?;
-        (v < AIS_COG_NA).then(|| v as f64 / 10.0)
+        (v < AIS_COG_NA).then(|| v as f64 / AIS_SOG_COG_SCALE)
     }
 
     fn heading(&self, from: usize) -> Option<u16> {
@@ -343,13 +345,17 @@ pub fn position_report_bits(mmsi: u32, lat: f64, lon: f64, sog_kt: f64, cog_deg:
     push_uint(&mut b, u64::from(mmsi), 30);
     push_uint(&mut b, AIS_STATUS_UNDER_WAY, 4);
     push_int(&mut b, AIS_TURN_NA, 8);
-    push_uint(&mut b, ((sog_kt * 10.0).round() as u64).min(AIS_SOG_NA), 10);
+    push_uint(
+        &mut b,
+        ((sog_kt * AIS_SOG_COG_SCALE).round() as u64).min(AIS_SOG_NA),
+        10,
+    );
     push_uint(&mut b, 0, 1);
     push_int(&mut b, (lon * AIS_POS_SCALE).round() as i64, 28);
     push_int(&mut b, (lat * AIS_POS_SCALE).round() as i64, 27);
     push_uint(
         &mut b,
-        ((cog_deg * 10.0).round() as u64).min(AIS_COG_NA),
+        ((cog_deg * AIS_SOG_COG_SCALE).round() as u64).min(AIS_COG_NA),
         12,
     );
     push_uint(&mut b, AIS_HEADING_NA, 9);
