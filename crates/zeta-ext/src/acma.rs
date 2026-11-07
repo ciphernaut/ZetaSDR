@@ -236,8 +236,10 @@ impl AcmaKnowledge {
     }
 
     /// The assignments query's rows. The first query that answers settles whether
-    /// the register has `CALL_SIGN`: one rejected for naming it marks the column
-    /// absent and is asked again with `NULL AS CALL_SIGN`, as every later query is.
+    /// the register has `CALL_SIGN`: while unsettled, a query naming it that fails
+    /// (with any error) is asked again with `NULL AS CALL_SIGN`; when that answers the
+    /// column is absent and every later query selects NULL, and when it fails too
+    /// nothing is settled and the first error stands.
     async fn assignment_rows(
         &self,
         center_hz: Hz,
@@ -258,11 +260,18 @@ impl AcmaKnowledge {
                 self.call_sign.store(CALL_SIGN_PRESENT, Ordering::SeqCst);
                 Ok(rows)
             }
-            Err(e) if state == CALL_SIGN_UNKNOWN && names_call_sign_column(&e) => {
-                self.call_sign.store(CALL_SIGN_ABSENT, Ordering::SeqCst);
-                self.query_rows(&assignments_sql(center_hz, bandwidth_hz, bbox, false))
-                    .await
-            }
+            // Any error while unsettled is asked again without the column: a register
+            // may wrap SQLite's `no such column` in text that names nothing.
+            Err(first) if state == CALL_SIGN_UNKNOWN => match self
+                .query_rows(&assignments_sql(center_hz, bandwidth_hz, bbox, false))
+                .await
+            {
+                Ok(rows) => {
+                    self.call_sign.store(CALL_SIGN_ABSENT, Ordering::SeqCst);
+                    Ok(rows)
+                }
+                Err(_) => Err(first),
+            },
             Err(e) => Err(e),
         }
     }
@@ -421,13 +430,6 @@ impl KnowledgeProvider for AcmaKnowledge {
         self.here(Some(station), center_hz, space.unwrap_or(false))
             .map(|h| h.reach)
     }
-}
-
-/// Whether an `execute_sql` error is the register rejecting the `CALL_SIGN` column
-/// (SQLite's `no such column: d.CALL_SIGN`, or another engine's wording of it).
-fn names_call_sign_column(error: &str) -> bool {
-    let e = error.to_ascii_uppercase();
-    e.contains("CALL_SIGN") && e.contains("COLUMN")
 }
 
 /// Whether the register answers for `region` (Australia only).

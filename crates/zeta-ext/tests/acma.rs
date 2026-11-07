@@ -468,7 +468,12 @@ async fn allocations_from_another_station_cuts_and_measures_from_it() {
 
 #[tokio::test]
 async fn a_register_without_the_call_sign_column_is_probed_once_and_selects_null() {
-    for mode in [Mode::NoCallSignColumnRpc, Mode::NoCallSignColumnTool] {
+    for mode in [
+        Mode::NoCallSignColumnRpc,
+        Mode::NoCallSignColumnTool,
+        Mode::NoCallSignColumnGeneric,
+        Mode::NoCallSignColumnJson,
+    ] {
         let (url, stub) = serve(mode).await;
         let provider = provider(&url, demo_station());
         for center in [404_025_000, 404_030_000] {
@@ -477,7 +482,7 @@ async fn a_register_without_the_call_sign_column_is_probed_once_and_selects_null
                 .iter()
                 .filter(|x| x.kind.as_deref() == Some("assignment"))
                 .collect();
-            assert_eq!(asg.len(), 4, "{a:?}");
+            assert_eq!(asg.len(), 4, "{mode:?}: {a:?}");
             assert!(a.iter().all(|x| x.callsign.is_none()));
             let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
                 .as_str()
@@ -503,4 +508,25 @@ async fn a_register_with_the_column_is_asked_once_per_lookup() {
     }
     assert_eq!(stub.queries.load(Ordering::SeqCst), 2);
     assert_eq!(stub.rejected.load(Ordering::SeqCst), 0);
+}
+
+/// A register that fails every query, with or without `CALL_SIGN`, settles nothing: each
+/// lookup asks twice (the probe and the retry), and the lookup fails.
+#[tokio::test]
+async fn a_register_failing_every_query_keeps_probing() {
+    let (url, stub) = serve(Mode::SqlFails).await;
+    let provider = provider(&url, demo_station());
+    for _ in 0..2 {
+        let a = provider
+            .allocations("AU", Hz(404_025_000), Hz(16_000))
+            .await;
+        assert!(a.is_empty(), "{a:?}");
+    }
+    assert_eq!(stub.queries.load(Ordering::SeqCst), 4);
+    assert_eq!(provider.errors(), 2);
+    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(q.contains("NULL AS CALL_SIGN"), "{q}");
 }

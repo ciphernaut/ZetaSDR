@@ -62,6 +62,15 @@ pub enum Mode {
     NoCallSignColumnRpc,
     /// The same register answering the rejection as a tool error's text.
     NoCallSignColumnTool,
+    /// The same register wrapping the rejection as a JSON-RPC error that names no
+    /// column (`query failed`).
+    NoCallSignColumnGeneric,
+    /// The same register answering the rejection as a JSON error object in the tool's
+    /// text (`{"error":"query failed"}`).
+    NoCallSignColumnJson,
+    /// Every `execute_sql` call is a JSON-RPC error (`query failed`), with or without
+    /// `CALL_SIGN`; the plan still answers.
+    SqlFails,
 }
 
 /// What the stub answers from, and what it saw.
@@ -78,7 +87,8 @@ pub struct Stub {
     pub sql: Mutex<Option<Value>>,
     /// `execute_sql` calls seen.
     pub queries: AtomicUsize,
-    /// `execute_sql` calls rejected for naming a missing `CALL_SIGN`.
+    /// `execute_sql` calls rejected for naming a missing `CALL_SIGN` (every call under
+    /// [`Mode::SqlFails`]).
     pub rejected: AtomicUsize,
     /// `execute_sql` calls whose SQL named no band the stub could read: answered with every
     /// row, unfiltered, and said on stderr. A test that relies on the cut asserts it is 0.
@@ -148,18 +158,26 @@ fn execute_sql(s: &Stub, id: &Value, args: &Value) -> Result<Value, Value> {
     let sql = args["sql"].as_str().unwrap_or_default();
     let older = matches!(
         s.mode,
-        Mode::NoCallSignColumnRpc | Mode::NoCallSignColumnTool
+        Mode::NoCallSignColumnRpc
+            | Mode::NoCallSignColumnTool
+            | Mode::NoCallSignColumnGeneric
+            | Mode::NoCallSignColumnJson
     );
-    if older && sql.contains("d.CALL_SIGN") {
+    if s.mode == Mode::SqlFails || (older && sql.contains("d.CALL_SIGN")) {
         s.rejected.fetch_add(1, Ordering::SeqCst);
         let error = "no such column: d.CALL_SIGN";
-        if s.mode == Mode::NoCallSignColumnRpc {
-            return Err(json!({"jsonrpc":"2.0","id":id,
-                "error":{"code":-32603,"message":error}}));
-        }
-        return Err(json!({"jsonrpc":"2.0","id":id,
-            "result":{"isError":true,"content":[{"type":"text",
-                "text":format!("SQL error: {error}")}]}}));
+        return Err(match s.mode {
+            Mode::NoCallSignColumnRpc => json!({"jsonrpc":"2.0","id":id,
+                "error":{"code":-32603,"message":error}}),
+            Mode::NoCallSignColumnGeneric | Mode::SqlFails => json!({"jsonrpc":"2.0","id":id,
+                "error":{"code":-32603,"message":"query failed"}}),
+            Mode::NoCallSignColumnJson => json!({"jsonrpc":"2.0","id":id,
+                "result":{"content":[{"type":"text",
+                    "text":json!({"error":"query failed"}).to_string()}]}}),
+            _ => json!({"jsonrpc":"2.0","id":id,
+                "result":{"isError":true,"content":[{"type":"text",
+                    "text":format!("SQL error: {error}")}]}}),
+        });
     }
     let mut rows = s.rows.clone();
     if s.mode == Mode::NullBandwidth
