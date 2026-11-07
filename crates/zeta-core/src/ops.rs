@@ -2452,7 +2452,6 @@ pub enum OpError {
         suggested: Option<u64>,
         /// Why the bound is what it is, when that is worth saying (a source's
         /// measured ceiling: `insufficient bandwidth: ...`).
-        #[serde(skip_serializing_if = "Option::is_none")]
         #[schemars(required, schema_with = "crate::types::nullable::<String>")]
         why: Option<String>,
     },

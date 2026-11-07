@@ -3553,6 +3553,7 @@ async fn a_request_wider_than_a_measured_cap_is_refused_as_insufficient_bandwidt
         other => panic!("expected OutOfRange, got {other:?}"),
     }
     assert!(err.to_string().ends_with(&format!(": {text}")));
+    assert_eq!(serde_json::to_value(&err).unwrap()["why"], text);
 }
 
 #[tokio::test]
@@ -3563,5 +3564,6 @@ async fn an_asserted_cap_refuses_without_a_why() {
         other => panic!("expected OutOfRange, got {other:?}"),
     }
     let json = serde_json::to_value(&err).unwrap();
-    assert!(!json.as_object().unwrap().contains_key("why"), "{json}");
+    assert_eq!(json["why"], serde_json::Value::Null, "{json}");
+    assert!(json.as_object().unwrap().contains_key("why"), "{json}");
 }
