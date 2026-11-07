@@ -204,6 +204,17 @@ html[data-main="map"] #waterfall { visibility: hidden; }
 #map .map-subject.selected .arrow.dot { background: var(--map-sel); }
 #map .map-subject.selected .label { box-shadow: 0 0 0 1px var(--map-sel); }
 #map path.map-home { stroke: var(--map-sel); fill: var(--map-sel); fill-opacity: 0.6; stroke-width: 2; }
+/* Lit sites (map.js, plan 32): brightness (`--site-brightness`, score × freshness) is the
+   fill's opacity; a site whose designator disagrees is a dashed ring with no fill; bearings
+   run from where the signal was received, as bright as their site. */
+#map path.map-site { stroke: var(--user); fill: var(--user); stroke-width: 2; fill-opacity: calc(0.8 * var(--site-brightness, 1)); stroke-opacity: calc(0.3 + 0.7 * var(--site-brightness, 1)); }
+#map path.map-site[data-agree="disagrees"] { fill: none; }
+#map path.map-bearing { stroke: var(--user); stroke-width: 1.5; fill: none; stroke-opacity: calc(0.7 * var(--site-brightness, 1)); }
+#map .map-source { width: auto; height: auto; white-space: nowrap; padding: 0 3px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); border: 1px solid var(--map-sel); }
+#map .leaflet-popup-content .map-origin + .map-origin, #map .leaflet-popup-content .map-lookup { margin-top: 6px; }
+#map .leaflet-popup-content .map-lookup { color: var(--map-dim); font-size: 11px; }
+/* No station: the sites are not cut by reach (map.js syncNote). */
+#map .map-note { position: absolute; z-index: 1000; top: 8px; right: 8px; max-width: 60%; padding: 2px 6px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); pointer-events: none; }
 /* The pane under the waterfall (panes.js): the strip's selected pane, at the height the jobs
    panel has; the waterfall and the map keep the rest. */
 #pane { position: absolute; left: 0; right: 0; bottom: 0; height: 40%; overflow: hidden; background: var(--bg); border-top: 1px solid var(--border); }

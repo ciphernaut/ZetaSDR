@@ -1,6 +1,6 @@
 // explore.js: the Explore pane (plan 19 spec 5.7), the captures the node holds.
 //
-// mountExplorePane(el, api, view, transcript, {panes, ov, wf, onBits})
+// mountExplorePane(el, api, view, transcript, {panes, ov, wf, onBits, onOrigins})
 //   -> {render(), eligible(), destroy()}
 //   Polls `capture_list` once at load, then every EXPLORE_POLL_MS while the pane is shown, has
 //   been shown once this load, a `capture` job runs (fed by noteJobs(jobs) from each job_list;
@@ -63,10 +63,12 @@ export function mountExplorePane(
   api,
   view,
   transcript,
-  { panes = null, ov = () => null, wf = () => null, onBits = null } = {},
+  { panes = null, ov = () => null, wf = () => null, onBits = null, onOrigins = null } = {},
 ) {
   const pane = new ExplorePane(el, api, view, transcript, panes, ov, wf);
   pane.onBits = onBits; // (job id) after a bits_start: the Bits pane shows that job
+  // (`capture:<id>`, answer) after a capture_classify with `origins`: the map lights them
+  pane.onOrigins = onOrigins;
   return pane;
 }
 
@@ -291,6 +293,7 @@ class ExplorePane {
       }
       const reg = registerText(v.allocations);
       if (reg) this.t.note(`${id}: ${reg}`);
+      if (v.origins) this.onOrigins?.(`capture:${id}`, v.origins);
     } catch (e) {
       this.t.note(`capture_classify: ${e.message}`, true);
     }

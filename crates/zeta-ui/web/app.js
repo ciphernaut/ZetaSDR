@@ -90,6 +90,13 @@
 // zoom and outlines, and shows the map in its place, in both footprints). The Map tab sets
 // `main map` (a second click `main rf`), a source tab `main rf` after selecting its source;
 // the shown source is unchanged meanwhile and its tab carries class `kept`.
+// Lit sites (plan 32 spec 4.4): an `origin` event of a job the overlays follow lights the
+// job's set (map.origin keyed by the job id, faded from the job's last event, ov.lastEvent),
+// and is a transcript line as a watch's verdict is (verdictLine); What is this on a box and
+// on a capture light one-shot sets from their classification's `origins` (`classify:<t_ns>`,
+// `capture:<id>`); each jobs poll seeds the running jobs' `context.origins` (map.seed). The
+// Map tab's `.count` is the number of lit sites (map.litCount; empty at zero), kept over
+// renderTabs; the page never switches to the map by itself.
 //
 // The subjects (subjects.js): the store is mounted before the overlays, which hand it every
 // event first and ask it for mode rows; each jobs poll drops the subjects of jobs that ended.
@@ -334,6 +341,14 @@ function mapTab() {
   return tab;
 }
 
+// The Map tab's badge: the number of lit sites, empty at zero.
+function paintMapCount() {
+  const el = document.querySelector("#tabs .map-tab .count");
+  if (!el) return;
+  const n = state.map ? state.map.litCount() : 0;
+  el.textContent = n > 0 ? String(n) : "";
+}
+
 // A pinned source's tab title (spec 4.1): `pin <lo>–<hi> MHz`, then `; gain <db> dB` (or
 // `gain automatic`) when the source has adjustable gain.
 function pinTitle(src) {
@@ -426,6 +441,7 @@ function renderTabs(sources) {
     }),
     mapTab(),
   );
+  paintMapCount();
   const saved = load(SOURCE_KEY);
   const pick = sources.find((s) => s.id === saved) || sources[0];
   if (pick) select(pick.id);
@@ -904,10 +920,13 @@ function start(api) {
   state.map = mountMap($("#map"), api, state.view, {
     jobs: () => state.lastJobs,
     subjects: state.subjects,
+    lastEvent: (id) => (state.ov ? state.ov.lastEvent(id) : null),
   });
+  state.map.onChange(paintMapCount);
   state.ov.onEvent((job, p) => {
     state.subjects?.event(job, p);
     state.map?.event(job, p);
+    if (p && p.protocol === "origin") state.map?.origin(job.id, p);
     const line = verdictLine(job, p);
     if (line) state.transcript.note(line);
   });
@@ -928,6 +947,7 @@ function start(api) {
     panes: state.panes,
     ov: () => state.ov,
     wf: () => state.wf,
+    onOrigins: (key, answer) => state.map?.origin(key, answer),
     onBits: (id) => state.bits?.setJob(id),
   });
   state.bits = mountBitsPane($("#bits"), api, state.view, state.transcript, {
@@ -962,6 +982,7 @@ function start(api) {
     ov: state.ov,
     ringSeconds: (id) => state.sources.find((x) => x.id === id)?.ring?.seconds ?? null,
     plan: () => resolvePlan(state.view.get("plan")),
+    onOrigins: (key, answer) => state.map?.origin(key, answer),
     command: (text) => {
       const cmd = $("#cmd");
       cmd.value = text;
@@ -985,7 +1006,10 @@ function start(api) {
       state.lastJobs = jobs;
       state.explore?.noteJobs(jobs);
       state.bits?.noteJobs(jobs);
-      if (state.map) state.map.sync();
+      if (state.map) {
+        state.map.sync();
+        state.map.seed(jobs);
+      }
       state.subjects?.sync(jobs);
       if (state.ov) state.ov.sync(jobs, shown());
       applyPanes();
@@ -1024,14 +1048,15 @@ function start(api) {
 }
 
 // The transcript line of a watched job's verdict, or null: a watch's `unknown`, `decoding`
-// and `lost` events and an identify's `verdict` event, as `<kind> <id tail>: <summary>`
-// (an unknown's summary carries the register's nearest transmitter). Its ribbon still
+// and `lost` events, an identify's `verdict` event and any job's `origin` event (plan 32
+// spec 4.3), as `<kind> <id tail>: <summary>` (an unknown's summary carries the register's
+// nearest transmitter). Its ribbon still
 // shows on the waterfall; the line keeps it.
 export const VERDICT_WATCH_STATES = new Set(["unknown", "decoding", "lost"]);
 function verdictLine(job, p) {
   if (!p || typeof p !== "object" || typeof p.summary !== "string") return null;
   const watch = p.protocol === "watch" && VERDICT_WATCH_STATES.has(p.state);
-  if (!watch && p.protocol !== "verdict") return null;
+  if (!watch && p.protocol !== "verdict" && p.protocol !== "origin") return null;
   return `${job.kind} ${String(job.id).slice(-6)}: ${p.summary}`;
 }
 
@@ -1674,6 +1699,10 @@ window.zetaTest = {
   // answered).
   themeIds() {
     return themeIds();
+  },
+  // The keys of the map's lit sets (map.js litKeys: job ids and one-shot keys).
+  litKeys() {
+    return state.map ? state.map.litKeys() : [];
   },
   // The home in force (view.js homeOf: view `home`, else the station read at load), or null.
   home() {

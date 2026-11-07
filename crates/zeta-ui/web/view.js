@@ -29,6 +29,9 @@
 //                          `pane` set that contradicts `on` or `off` puts it back to auto
 //         subject_dim_s    a positive integer of seconds (default 60): a silent subject dims
 //         subject_drop_s   a positive integer of seconds (default 300): and then is dropped
+//         origin_fade_s    a positive integer of seconds (default ORIGIN_FADE_S_DEFAULT, 300):
+//                          a lit site's brightness falls to nothing over this long after its
+//                          signal was last active, then the site goes (map.js tick)
 //         pane             none | a registered pane's id (default none; panes.js): the pane
 //                          shown under the waterfall. A stored id is kept over a reload before
 //                          its pane registers (the strip shows none until it does)
@@ -71,6 +74,8 @@ import { planIds } from "./plans.js";
 import { paneIds } from "./panes.js";
 
 export const VIEW_KEY = "zeta.view";
+// The `origin_fade_s` default: a lit site fades over the subjects' drop time.
+export const ORIGIN_FADE_S_DEFAULT = 300;
 
 // The keys the agent's page-only `view_set` may set: presentation only (zeta-agent's
 // VIEW_KEYS). `zoom_out`, `scanner` and `auto_scan_stop` drive scans and `home` moves where
@@ -217,6 +222,12 @@ export const POLICIES = [
     key: "subject_drop_s",
     parse: positiveSeconds,
     default_: 300,
+    describe: "a positive integer of seconds",
+  },
+  {
+    key: "origin_fade_s",
+    parse: positiveSeconds,
+    default_: ORIGIN_FADE_S_DEFAULT,
     describe: "a positive integer of seconds",
   },
   {

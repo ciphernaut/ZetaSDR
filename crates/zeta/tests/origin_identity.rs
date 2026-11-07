@@ -1,9 +1,9 @@
 //! Identity confirmation (plan 32, design 4.6) end to end: a `zeta serve` child with a
 //! `--modes-dir` row whose subject declares `identity` (`src` against the register's
 //! `callsign`, the SSID stripped), run by zeta-ext's `fake_lines` (pinned with
-//! `ZETA_HANDLER_FAKE_LINES`, as `ui.rs` pins it), and `--knowledge-acma` pointing at a
-//! 127.0.0.1 stub of the register service answering one synthetic `tx` row on the tone
-//! band with callsign `XX4EX`. `fake_lines` prints one event every 0.5 s; once the job's
+//! `ZETA_HANDLER_FAKE_LINES`, as `ui.rs` pins it), and `--knowledge-acma` pointing at
+//! zeta-ext's register stub (`testing::acma_stub`) on 127.0.0.1 answering one synthetic
+//! `tx` row on the tone band with callsign `XX4EX`. `fake_lines` prints one event every 0.5 s; once the job's
 //! origins are looked up, the node confirms the lit site from it (once, however often it
 //! repeats, and again after a fresh lookup), or, for another callsign, changes nothing.
 //! The `origin` frames are counted in the node's `events.log`, which carries the
@@ -11,14 +11,13 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::ServeProc;
 use serde_json::{Value, json};
 use zeta_client::NodeClient;
+use zeta_ext::testing::acma_stub::{self, Mode};
 
 const SECRET: &str = "origin-identity-secret-0123";
 /// The tone fixture's centre (`common::ServeProc` adds it as `tone`).
@@ -42,86 +41,23 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The register's assignments: one `tx` row on the tone band, near the demo station.
-fn register_rows() -> Value {
-    json!({
-        "columns": ["FREQUENCY", "BANDWIDTH", "EMISSION", "DEVICE_TYPE", "TRANSMITTER_POWER",
-            "TRANSMITTER_POWER_UNIT", "LICENCE_NO", "SITE_NAME", "LATITUDE", "LONGITUDE",
-            "LICENCEE", "CALL_SIGN"],
-        "rows": [[TONE_HZ, 25000, "16K0F3E", "T", 5, "W", "0000001", "Example Hill",
-            -27.35, 153.08, "Example Water Authority", "XX4EX"]],
-        "truncated": false, "rowCount": 1
-    })
-}
-
-/// The JSON-RPC answer to one MCP request; `None` for a notification.
-fn mcp_answer(req: &Value) -> Option<Value> {
-    let id = req["id"].clone();
-    let result = match req["method"].as_str()? {
-        "initialize" => json!({"protocolVersion": "2025-03-26"}),
-        "tools/call" => {
-            let out = match req["params"]["name"].as_str() {
-                Some("execute_sql") => register_rows(),
-                _ => json!({"match_count": 0, "allocation": null}),
-            };
-            json!({"content": [{"type": "text", "text": out.to_string()}]})
-        }
-        _ => return None,
-    };
-    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
-}
-
-/// One HTTP/1.1 request on `s`, answered and closed.
-fn answer(mut s: TcpStream) {
-    let mut r = BufReader::new(s.try_clone().expect("clone stream"));
-    let mut start = String::new();
-    if r.read_line(&mut start).is_err() {
-        return;
-    }
-    let mut len = 0usize;
-    loop {
-        let mut h = String::new();
-        if r.read_line(&mut h).is_err() || h.trim().is_empty() {
-            break;
-        }
-        if let Some((k, v)) = h.split_once(':')
-            && k.eq_ignore_ascii_case("content-length")
-        {
-            len = v.trim().parse().unwrap_or(0);
-        }
-    }
-    let mut body = vec![0; len];
-    if r.read_exact(&mut body).is_err() {
-        return;
-    }
-    let (status, extra, text) = if start.starts_with("GET /health") {
-        ("200 OK", "", r#"{"status":"ok"}"#.to_string())
-    } else {
-        let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        match mcp_answer(&req) {
-            Some(v) => ("200 OK", "mcp-session-id: session-0\r\n", v.to_string()),
-            None => ("202 Accepted", "", String::new()),
-        }
-    };
-    let _ = write!(
-        s,
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra}\
-         content-length: {}\r\nconnection: close\r\n\r\n{text}",
-        text.len()
-    );
-}
-
-/// A stub of the register service on 127.0.0.1; its `http://HOST:PORT`. It serves as long
-/// as the test process lives.
-fn register_stub() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind the register stub");
-    let url = format!("http://{}", l.local_addr().unwrap());
-    std::thread::spawn(move || {
-        for s in l.incoming().map_while(Result::ok) {
-            std::thread::spawn(move || answer(s));
-        }
-    });
-    url
+/// The register's assignments: one `tx` row on the tone band, near the demo station, in
+/// the stub's column order (`acma_stub::COLUMNS`).
+fn register_rows() -> Vec<Value> {
+    vec![json!([
+        TONE_HZ,
+        25000,
+        "16K0F3E",
+        "T",
+        5,
+        "W",
+        "0000001",
+        "Example Hill",
+        -27.35,
+        153.08,
+        "Example Water Authority",
+        "XX4EX"
+    ])]
 }
 
 /// A `fake_lines` row shaped as `ui.rs`'s `fake_pos` row (so no sweep tries it) whose
@@ -171,7 +107,7 @@ fn node(dir: &Path, line: &str) -> ServeProc {
     std::fs::create_dir_all(&modes).unwrap();
     std::fs::write(modes.join("fake_ident.json"), identity_row().to_string()).unwrap();
     let fake_lines = repo_root().join("crates/zeta-ext/tests/fake_lines");
-    let register = register_stub();
+    let register = acma_stub::serve_on_thread(register_rows(), Mode::Normal);
     ServeProc::start_full(
         dir,
         SECRET,

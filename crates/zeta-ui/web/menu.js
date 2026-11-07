@@ -3,7 +3,9 @@
 // or asks the agent.
 //
 // Exports:
-//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor}) -> Menu
+//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor, onOrigins})
+//       -> Menu   (`onOrigins(key, answer)`: What is this's classification `origins`, keyed
+//       `classify:<t_ns>`, for the map to light)
 //       Opens #ctx at the pointer after each wf.onSelect. `applyOp(op) -> Promise<result|null>`
 //       is app.js's command-line op path (shows its outcome per ruling R6; null when it
 //       failed, the failure already reported); `attachOp(jobId)` the `job_attach` op that
@@ -444,9 +446,10 @@ export function clampSpan(startNs, endNs, newest) {
 class Menu {
   constructor(
     wf,
-    { applyOp, attachOp, ask, transcript, ov, plan = () => null, ringSeconds = () => null, command = () => {}, muteFor = () => null },
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {} },
   ) {
     this.wf = wf;
+    this.onOrigins = onOrigins;
     this.muteFor = muteFor;
     this.applyOp = applyOp;
     this.ringSeconds = ringSeconds;
@@ -774,6 +777,8 @@ class Menu {
         }
         const reg = registerText(r.value.allocations);
         if (reg) this.t.note(reg);
+        const o = r.value.origins;
+        if (o) this.onOrigins(`classify:${o.t_ns}`, o);
       }
     } else if (action === "iq_read") {
       const r = await this.applyOp({ op: "iq_read", selection });

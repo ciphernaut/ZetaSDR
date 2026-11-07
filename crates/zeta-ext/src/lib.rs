@@ -12,6 +12,8 @@ pub mod mcp_client;
 pub mod parsers;
 pub mod proc;
 pub mod sink_sondehub;
+#[cfg(feature = "test-fake")]
+pub mod testing;
 
 pub use acma::AcmaKnowledge;
 pub use adsb::{ADSB_MODE, ADSB_RATE_HZ, AdsbDecodeStage, AdsbParams, find_dump1090};

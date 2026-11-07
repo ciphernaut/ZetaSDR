@@ -1,14 +1,9 @@
 //! The `acma` knowledge provider against a stub of the register service.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
 use serde_json::{Value, json};
 use zeta_core::knowledge::KnowledgeProvider;
 use zeta_core::reach::ReachClass;
@@ -16,178 +11,75 @@ use zeta_core::station::Station;
 use zeta_core::types::Hz;
 use zeta_ext::acma::AcmaKnowledge;
 use zeta_ext::mcp_client::McpClient;
-
-#[derive(Clone, Copy, Default, PartialEq)]
-enum Mode {
-    #[default]
-    Normal,
-    Satellite,
-    RpcError,
-    Html,
-    Slow,
-    /// One row without a `BANDWIDTH` (NULL in the register).
-    NullBandwidth,
-    /// A service that answers no `CALL_SIGN` column.
-    NoCallSign,
-    /// An older register whose `device_details` lacks `CALL_SIGN`: SQL naming
-    /// `d.CALL_SIGN` is rejected with SQLite's error as a JSON-RPC error.
-    NoCallSignColumnRpc,
-    /// The same register answering the rejection as a tool error's text.
-    NoCallSignColumnTool,
-}
-
-#[derive(Default)]
-struct Stub {
-    mode: Mode,
-    /// Tool calls seen.
-    calls: AtomicUsize,
-    /// `get_frequency_allocation` calls seen.
-    plans: AtomicUsize,
-    /// The last `execute_sql` arguments.
-    sql: Mutex<Option<Value>>,
-    /// `execute_sql` calls seen.
-    queries: AtomicUsize,
-    /// `execute_sql` calls rejected for naming a missing `CALL_SIGN`.
-    rejected: AtomicUsize,
-}
-
-fn sse(v: Value) -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/event-stream")],
-        format!("event: message\ndata: {v}\n\n"),
-    )
-        .into_response()
-}
+use zeta_ext::testing::acma_stub::{self, Mode, Stub};
 
 /// Four 404.025 MHz assignments shaped as the register answers them (2026-11-02), every row
 /// synthetic: licensees, licences, sites and callsigns made up, the sites near the demo
 /// station. The last column, `CALL_SIGN`, is one a service may not answer.
-fn rows() -> Value {
-    json!({
-        "columns": ["FREQUENCY", "BANDWIDTH", "EMISSION", "DEVICE_TYPE", "TRANSMITTER_POWER",
-            "TRANSMITTER_POWER_UNIT", "LICENCE_NO", "SITE_NAME", "LATITUDE", "LONGITUDE",
-            "LICENCEE", "CALL_SIGN"],
-        "rows": [
-            [404025000, 25000, "16K0F2D  ", "T", 1, "W", "9000001/1", "Example Rail Site A",
-                -27.950, 153.250, "Example Rail Operator", null],
-            [404025000, 25000, "16K0F2D  ", "R", null, "W", "9000001/1",
-                "Example Rail Site B", -27.955, 153.255, "Example Rail Operator", null],
-            [404025000, 25000, "16K0F1D  ", "T", 1, "W", "9000002/1",
-                "Example Site Hill Rd", -27.300, 153.100, "Example Water Authority", "XX4EX"],
-            [404025000, 25000, "16K0F1D  ", "R", null, "W", "9000002/1",
-                "Example Depot", -27.250, 153.120, "Example Water Authority", "XX4EX"]
-        ],
-        "truncated": false, "rowCount": 4, "result_id": "r1", "_hints": []
-    })
-}
-
-fn plan(satellite: bool) -> Value {
-    let services = if satellite {
-        json!([{"name": "MOBILE-SATELLITE", "primary": true}])
-    } else {
+fn rows() -> Vec<Value> {
+    vec![
         json!([
-            {"name": "FIXED", "primary": true, "inline_footnotes": []},
-            {"name": "MOBILE", "primary": true, "qualifier": "except aeronautical mobile (R)"},
-            {"name": "METEOROLOGICAL AIDS", "primary": false},
-            {"name": "RADIOLOCATION", "primary": false, "inline_footnotes": ["AUS29"]}
-        ])
-    };
-    json!({"match_count": 1, "allocation": {"freq_start_hz": 403000000,
-        "freq_end_hz": 406000000, "unit": "MHz", "page": 50, "services": services,
-        "footnotes": [], "raw": ""}, "regions": {}})
+            404025000,
+            25000,
+            "16K0F2D  ",
+            "T",
+            1,
+            "W",
+            "9000001/1",
+            "Example Rail Site A",
+            -27.950,
+            153.250,
+            "Example Rail Operator",
+            null
+        ]),
+        json!([
+            404025000,
+            25000,
+            "16K0F2D  ",
+            "R",
+            null,
+            "W",
+            "9000001/1",
+            "Example Rail Site B",
+            -27.955,
+            153.255,
+            "Example Rail Operator",
+            null
+        ]),
+        json!([
+            404025000,
+            25000,
+            "16K0F1D  ",
+            "T",
+            1,
+            "W",
+            "9000002/1",
+            "Example Site Hill Rd",
+            -27.300,
+            153.100,
+            "Example Water Authority",
+            "XX4EX"
+        ]),
+        json!([
+            404025000,
+            25000,
+            "16K0F1D  ",
+            "R",
+            null,
+            "W",
+            "9000002/1",
+            "Example Depot",
+            -27.250,
+            153.120,
+            "Example Water Authority",
+            "XX4EX"
+        ]),
+    ]
 }
 
-async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Response {
-    let req: Value = serde_json::from_str(&body).unwrap();
-    let id = req["id"].clone();
-    match req["method"].as_str().unwrap() {
-        "initialize" => {
-            let mut r =
-                sse(json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-03-26"}}));
-            r.headers_mut()
-                .insert("mcp-session-id", "session-0".parse().unwrap());
-            r
-        }
-        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
-        "tools/call" => {
-            assert_eq!(headers.get("mcp-session-id").unwrap(), "session-0");
-            s.calls.fetch_add(1, Ordering::SeqCst);
-            if req["params"]["name"] == "get_frequency_allocation" {
-                s.plans.fetch_add(1, Ordering::SeqCst);
-            }
-            match s.mode {
-                Mode::RpcError => {
-                    return sse(json!({"jsonrpc":"2.0","id":id,
-                        "error":{"code":-32603,"message":"database is locked"}}));
-                }
-                Mode::Html => return "<html>".into_response(),
-                Mode::Slow => tokio::time::sleep(Duration::from_secs(3)).await,
-                _ => {}
-            }
-            let args = &req["params"]["arguments"];
-            let out = match req["params"]["name"].as_str().unwrap() {
-                "execute_sql" => {
-                    *s.sql.lock().unwrap() = Some(args.clone());
-                    s.queries.fetch_add(1, Ordering::SeqCst);
-                    let older = matches!(
-                        s.mode,
-                        Mode::NoCallSignColumnRpc | Mode::NoCallSignColumnTool
-                    );
-                    if older && args["sql"].as_str().unwrap().contains("d.CALL_SIGN") {
-                        s.rejected.fetch_add(1, Ordering::SeqCst);
-                        let error = "no such column: d.CALL_SIGN";
-                        if s.mode == Mode::NoCallSignColumnRpc {
-                            return sse(json!({"jsonrpc":"2.0","id":id,
-                                "error":{"code":-32603,"message":error}}));
-                        }
-                        return sse(json!({"jsonrpc":"2.0","id":id,
-                            "result":{"isError":true,"content":[{"type":"text",
-                                "text":format!("SQL error: {error}")}]}}));
-                    }
-                    let mut r = rows();
-                    if s.mode == Mode::NullBandwidth {
-                        r["rows"][0][1] = Value::Null;
-                    }
-                    if older {
-                        // `NULL AS CALL_SIGN`: the column, empty.
-                        for row in r["rows"].as_array_mut().unwrap() {
-                            row[11] = Value::Null;
-                        }
-                    }
-                    if s.mode == Mode::NoCallSign {
-                        r["columns"].as_array_mut().unwrap().pop();
-                        for row in r["rows"].as_array_mut().unwrap() {
-                            row.as_array_mut().unwrap().pop();
-                        }
-                    }
-                    r
-                }
-                "get_frequency_allocation" => plan(s.mode == Mode::Satellite),
-                t => panic!("unexpected tool {t}"),
-            };
-            sse(json!({"jsonrpc":"2.0","id":id,
-                "result":{"content":[{"type":"text","text":out.to_string()}]}}))
-        }
-        m => panic!("unexpected method {m}"),
-    }
-}
-
+/// The register stub (`zeta_ext::testing::acma_stub`) answering [`rows`].
 async fn serve(mode: Mode) -> (String, Arc<Stub>) {
-    let stub = Arc::new(Stub {
-        mode,
-        ..Stub::default()
-    });
-    let app = Router::new()
-        .route("/mcp", post(mcp))
-        .route(
-            "/health",
-            get(|| async { r#"{"status":"ok","version":"1.11.0","isSyncing":false}"# }),
-        )
-        .with_state(stub.clone());
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-    (url, stub)
+    acma_stub::serve(rows(), mode).await
 }
 
 /// The demo station, Brisbane Airport.

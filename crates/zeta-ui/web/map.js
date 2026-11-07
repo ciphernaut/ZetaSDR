@@ -24,7 +24,8 @@
 //       newer half whole: a track keeps its start and old detail coarsens with age
 //   drawnPoints(kept, latest) -> [[lat, lon]]   the line: the kept points, ending at the latest
 //       fix (`cap` at most, as `kept` is under it)
-//   mountMap(el, api, view, {jobs, subjects}) -> MapPane
+//   mountMap(el, api, view, {jobs, subjects, lastEvent}) -> MapPane   (`lastEvent(jobId)`:
+//       performance.now() of the job's last event on the feed, overlays.js lastEvent)
 //       `el` (#map) is shown while view.get("main") is "map" and hidden otherwise (view.onChange;
 //       `invalidateSize` on each show).
 //       Leaflet (vendor/leaflet, served by the node) is loaded the first time the map shows,
@@ -41,6 +42,28 @@
 //                               hidden, so the track is whole when it shows.
 //     map.sync()                after each jobs poll: the tracks of jobs no longer running
 //                               (stopped, failed, forgotten) are dropped with their marker
+//                               and so are the lit sets keyed by those jobs' ids
+//     map.origin(key, answer, {activity, litAt})   light the sites of an origin answer (plan 32
+//                               spec 4.4: an `origin` event's payload, a classification's
+//                               `origins`, a job's `job_context.origins`) as the set `key`: a
+//                               job id (the set goes with the job; a new answer replaces it)
+//                               or a one-shot key (`classify:<t_ns>`, `capture:<id>`,
+//                               `band:<t_ns>`). An answer with no origins removes the set.
+//                               `activity()` (default for a job key: opts.lastEvent(job)) is
+//                               when the set's signal was last active (performance.now() ms);
+//                               `litAt` (default now) when it lit. Sets are kept while the map
+//                               is hidden.
+//     map.tick()                each second (the subjects' tick): brightness = score ×
+//                               freshness, freshness = max(0, 1 − age / view
+//                               `origin_fade_s`), age the seconds since the later of `litAt`
+//                               and `activity()`; a set at zero goes
+//     map.seed(jobs)            after each jobs poll: a running job's `context.origins` not
+//                               lit yet (by job id and the answer's `t_ns`) lights, its
+//                               `litAt` the answer's `t_ns` on the page's clock, unless
+//                               already faded
+//     map.litCount() -> n       distinct lit site positions (the Map tab's badge)
+//     map.litKeys() -> [key]    the lit sets' keys
+//     map.onChange(fn)          fn() after the lit sites change (lit, faded, dropped)
 //     map.rowText(jobId) -> "<km, 1 dp> km, <deg rounded>°" | null
 //                               the job's last fix from the home (view.js homeOf: view `home`,
 //                               else the node's station; null without a home or
@@ -64,9 +87,23 @@
 //   subject and lists its values; a click selects it in the store. The store's selection marks
 //   the marker and raises it over the others, panning only when it is off the map; each of the
 //   store's ticks dims it with its subject, being heard again lights it, and a drop removes it.
+//   A lit set draws one L.circleMarker (class `map-site`, `data-agree` fits|disagrees|unknown
+//   from its best origin, `data-confirmed` when any is confirmed, the CSS custom property
+//   `--site-brightness` 0..1) per distinct position among its origins, taking the best score;
+//   a `disagrees` site is a dashed ring with no fill. One non-interactive L.polyline (class
+//   `map-bearing`, the same brightness) runs from the answer's `from` to each `fits` or
+//   `unknown` site while `from` is set; with `from.kind` `source` a non-interactive L.marker
+//   (class `map-source`) labelled with the source id stands at `from`. Its tooltip: licensee /
+//   site / `<emission> (<words>)` / `<score> <agree>` / `<d> km, <bearing>°` (only with a
+//   distance) / `confirmed by <value>`; its popup lists each origin there with those lines,
+//   `licence <no>`, `<power> W`, the measured band and labels, the source, `from <station|
+//   source id>` and `modulation not measured` for an unknown, and no buttons: a click selects
+//   nothing. While a set's `from_note` is `no station set`, `div.map-note` in the map's corner
+//   says the sites are not cut by reach, once per load. The first lit site centres the map
+//   when nothing else has (no home, no fix).
 
 import { subjectLabel, subjectValues } from "./subjects.js";
-import { metricText } from "./units.js";
+import { bandText, metricText } from "./units.js";
 import { homeOf } from "./view.js";
 
 const SUBJECT_DRAW_MS = 500;
@@ -79,6 +116,13 @@ export const OSM_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 export const OSM_ATTRIBUTION =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 const FIRST_ZOOM = 10;
+// A lit site's marker radius, and the note shown while an answer had no vantage.
+const SITE_RADIUS = 7;
+const SITE_DASH = "4 4";
+const NO_STATION = "no station set";
+export const NO_STATION_NOTE = "no station set: sites are not cut by reach (station_set)";
+// One-shot set keys; any other key is a job id.
+const ONE_SHOT_KEY = /^(classify|capture|band):/;
 const LEAFLET_JS = "vendor/leaflet/leaflet.js";
 const LEAFLET_CSS = "vendor/leaflet/leaflet.css";
 const EARTH_KM = 6371.0088;
@@ -198,17 +242,102 @@ function subjectPopup(s) {
   return box;
 }
 
+// The positions an answer's origins stand at: one per distinct (lat, lon), its origins best
+// first (the answer's order) and `best` the first of them; origins without a position skip.
+function sitesOf(origins) {
+  const at = new Map();
+  for (const o of Array.isArray(origins) ? origins : []) {
+    const a = o && o.allocation;
+    if (!a || !Number.isFinite(a.lat) || !Number.isFinite(a.lon)) continue;
+    const k = `${a.lat},${a.lon}`;
+    if (!at.has(k)) at.set(k, { lat: a.lat, lon: a.lon, origins: [] });
+    at.get(k).origins.push(o);
+  }
+  return [...at.values()].map((s) => {
+    s.origins.sort((x, y) => (y.score ?? 0) - (x.score ?? 0));
+    return { ...s, best: s.origins[0] };
+  });
+}
+
+// An emission designator's words: `Frequency modulation, data` from its decoded parts.
+function emissionWords(e) {
+  if (!e) return "";
+  return [e.modulation_name, e.info_name].filter((x) => typeof x === "string" && x).join(", ");
+}
+
+// The tooltip's lines for one origin (spec 4.4, Hover).
+function tooltipLines(o) {
+  const a = o.allocation;
+  const lines = [];
+  if (a.licensee) lines.push(a.licensee);
+  if (a.site) lines.push(a.site);
+  if (a.emission) {
+    const words = emissionWords(a.emission_decoded);
+    lines.push(words ? `${a.emission} (${words})` : a.emission);
+  }
+  lines.push(`${Number(o.score).toFixed(2)} ${o.agree}`);
+  if (Number.isFinite(a.distance_km)) {
+    const b = Number.isFinite(a.bearing_deg) ? `, ${Math.round(a.bearing_deg) % 360}°` : "";
+    lines.push(`${a.distance_km.toFixed(1)} km${b}`);
+  }
+  if (o.confirmed) lines.push(`confirmed by ${o.confirmed.value}`);
+  return lines;
+}
+
+function linesBox(lines, cls = "") {
+  const box = document.createElement("div");
+  if (cls) box.className = cls;
+  for (const text of lines) {
+    const line = document.createElement("div");
+    line.textContent = text;
+    box.append(line);
+  }
+  return box;
+}
+
+// The popup (spec 4.4, Click): each origin at the site with the tooltip's lines and the
+// assignment's, then what the lookup measured. Informational only: no buttons.
+function sitePopup(site, answer) {
+  const box = document.createElement("div");
+  for (const o of site.origins) {
+    const a = o.allocation;
+    const lines = tooltipLines(o);
+    if (a.licence_no) lines.push(`licence ${a.licence_no}`);
+    if (Number.isFinite(a.power_w)) lines.push(`${a.power_w} W`);
+    if (o.agree === "unknown") lines.push("modulation not measured");
+    box.append(linesBox(lines, "map-origin"));
+  }
+  const tail = [];
+  if (answer.band) {
+    const labels = (answer.modulation || []).join(" ");
+    const band = bandText(answer.band.center_hz, answer.band.bandwidth_hz);
+    tail.push(labels ? `${band} ${labels}` : band);
+  }
+  if (answer.source) tail.push(`source ${answer.source}`);
+  const from = answer.from;
+  if (from) tail.push(`from ${from.kind === "source" && from.source ? from.source : "station"}`);
+  box.append(linesBox(tail, "map-lookup"));
+  return box;
+}
+
 export function mountMap(el, api, view, opts = {}) {
   return new MapPane(el, api, view, opts);
 }
 
 class MapPane {
-  constructor(el, api, view, { jobs = () => [], subjects = null } = {}) {
+  constructor(el, api, view, { jobs = () => [], subjects = null, lastEvent = () => null } = {}) {
     this.el = el;
     this.api = api;
     this.view = view;
     this.jobs = jobs;
     this.subjects = subjects;
+    this.lastEvent = lastEvent;
+    // key -> {key, job, answer, litAt, activity, sites: [{lat, lon, origins, best}], drawn}
+    this.sets = new Map();
+    this.seeded = new Map(); // job id -> t_ns of the last answer lit for it
+    this.changeFns = [];
+    this.note = null; // div.map-note, while shown
+    this.noteDone = false; // the note was shown and went: not again this load
     // job id -> {points: [[lat, lon]], summary, at, marker, line}
     // `${job id}\u0000${key}` -> {job, key, subject, kept, points (the line, as drawnPoints),
     //   marker, line, box, arrow, label}
@@ -224,7 +353,10 @@ class MapPane {
       if (key === "main") this.show();
       else if (key === "home") this.drawHome();
     });
-    subjects?.onTick(() => this.markDim());
+    subjects?.onTick(() => {
+      this.markDim();
+      this.tick();
+    });
     subjects?.onSelect((sel) => this.markSelected(sel));
     subjects?.onDrop((jobId, key) => this.dropSubject(jobId, key));
     this.show();
@@ -258,11 +390,183 @@ class MapPane {
     L.tileLayer(OSM_TILES, { attribution: OSM_ATTRIBUTION, maxZoom: 19 }).addTo(this.map);
     const first = this.tracks.values().next().value;
     const home = homeOf(this.view);
+    const site = [...this.sets.values()].find((s) => s.sites.length > 0)?.sites[0];
     if (first) this.centre(first.points[0]);
     else if (home) this.centre([home.lat, home.lon]);
+    else if (site) this.centre([site.lat, site.lon]);
     else this.map.setView([0, 0], 2);
     this.drawHome();
     for (const id of this.tracks.keys()) this.draw(id);
+    for (const s of this.sets.values()) this.drawSet(s);
+  }
+
+  // ---- lit sites (plan 32 spec 4.4) ----
+
+  origin(key, answer, { activity = null, litAt = null } = {}) {
+    if (this.destroyed || !answer || typeof answer !== "object") return;
+    const job = ONE_SHOT_KEY.test(key) ? null : key;
+    if (job !== null && answer.t_ns !== undefined) this.seeded.set(job, answer.t_ns);
+    this.unlight(key);
+    const sites = sitesOf(answer.origins);
+    if (sites.length === 0) {
+      this.changed();
+      return;
+    }
+    const set = {
+      key,
+      job,
+      answer,
+      litAt: litAt ?? performance.now(),
+      activity: activity ?? (job !== null ? () => this.lastEvent(job) : () => null),
+      sites,
+      drawn: null,
+    };
+    set.brightness = this.freshness(set);
+    if (set.brightness <= 0) {
+      this.changed();
+      return;
+    }
+    this.sets.set(key, set);
+    this.drawSet(set);
+    this.changed();
+  }
+
+  // 0..1: how fresh the set's signal is (1 just active, 0 faded).
+  freshness(set) {
+    const active = set.activity();
+    const last = Math.max(set.litAt, Number.isFinite(active) ? active : -Infinity);
+    const age = (performance.now() - last) / 1000;
+    return Math.max(0, 1 - age / this.view.get("origin_fade_s"));
+  }
+
+  tick() {
+    if (this.destroyed) return;
+    let gone = false;
+    for (const set of [...this.sets.values()]) {
+      set.brightness = this.freshness(set);
+      if (set.brightness <= 0) {
+        this.unlight(set.key);
+        gone = true;
+      } else {
+        this.paintSet(set);
+      }
+    }
+    if (gone) this.changed();
+  }
+
+  seed(jobs) {
+    if (this.destroyed) return;
+    for (const j of jobs || []) {
+      if (!j.state || j.state.status !== "running") continue;
+      const a = j.context && j.context.origins;
+      if (!a || typeof a !== "object" || this.sets.has(j.id)) continue;
+      if (this.seeded.has(j.id) && this.seeded.get(j.id) === a.t_ns) continue;
+      this.seeded.set(j.id, a.t_ns);
+      // The answer's age on the page's clock.
+      const ageMs = Number.isFinite(a.t_ns) ? Math.max(0, Date.now() - a.t_ns / 1e6) : 0;
+      this.origin(j.id, a, { litAt: performance.now() - ageMs });
+    }
+  }
+
+  litCount() {
+    const at = new Set();
+    for (const s of this.sets.values()) for (const p of s.sites) at.add(`${p.lat},${p.lon}`);
+    return at.size;
+  }
+
+  litKeys() {
+    return [...this.sets.keys()];
+  }
+
+  onChange(fn) {
+    this.changeFns.push(fn);
+  }
+
+  changed() {
+    this.syncNote();
+    for (const fn of this.changeFns) fn();
+  }
+
+  unlight(key) {
+    const set = this.sets.get(key);
+    if (!set) return;
+    this.eraseSet(set);
+    this.sets.delete(key);
+  }
+
+  eraseSet(set) {
+    if (!set.drawn) return;
+    for (const m of set.drawn.markers) m.remove();
+    for (const l of set.drawn.lines) l.remove();
+    set.drawn.source?.remove();
+    set.drawn = null;
+  }
+
+  drawSet(set) {
+    if (!this.map || set.drawn) return;
+    const L = this.L;
+    const from = set.answer.from;
+    const drawn = { markers: [], lines: [], source: null };
+    for (const site of set.sites) {
+      const agree = site.best.agree;
+      const at = [site.lat, site.lon];
+      if (from && agree !== "disagrees") {
+        drawn.lines.push(
+          L.polyline([[from.lat, from.lon], at], {
+            className: "map-bearing",
+            interactive: false,
+          }).addTo(this.map),
+        );
+      }
+      const m = L.circleMarker(at, {
+        radius: SITE_RADIUS,
+        className: "map-site",
+        fill: agree !== "disagrees",
+        dashArray: agree === "disagrees" ? SITE_DASH : null,
+      }).addTo(this.map);
+      const el = m.getElement();
+      if (el) {
+        el.dataset.agree = agree;
+        if (site.origins.some((o) => o.confirmed)) el.dataset.confirmed = "";
+      }
+      m.bindTooltip(() => linesBox(tooltipLines(site.best)));
+      m.bindPopup(() => sitePopup(site, set.answer));
+      drawn.markers.push(m);
+    }
+    if (from && from.kind === "source" && from.source) {
+      const label = document.createElement("span");
+      label.textContent = from.source;
+      const icon = L.divIcon({ html: label, className: "map-source", iconSize: null });
+      drawn.source = L.marker([from.lat, from.lon], { icon, interactive: false }).addTo(this.map);
+    }
+    set.drawn = drawn;
+    this.paintSet(set);
+    const first = set.sites[0];
+    this.centre([first.lat, first.lon]);
+  }
+
+  // The set's brightness on its markers and lines.
+  paintSet(set) {
+    if (!set.drawn) return;
+    const b = String(Math.round(set.brightness * 100) / 100);
+    for (const x of [...set.drawn.markers, ...set.drawn.lines]) {
+      x.getElement()?.style.setProperty("--site-brightness", b);
+    }
+  }
+
+  // div.map-note while a lit set had no station to look from; once per load.
+  syncNote() {
+    const want = [...this.sets.values()].some((s) => s.answer.from_note === NO_STATION);
+    if (want && !this.note && !this.noteDone) {
+      this.note = document.createElement("div");
+      this.note.className = "map-note";
+      this.note.textContent = NO_STATION_NOTE;
+      this.el.append(this.note);
+    } else if (!want && this.note) {
+      this.note.remove();
+      this.note = null;
+      this.noteDone = true;
+    }
   }
 
   centre(latlng) {
@@ -477,6 +781,14 @@ class MapPane {
       t.line?.remove();
       this.tracks.delete(id);
     }
+    let gone = false;
+    for (const set of [...this.sets.values()]) {
+      if (set.job === null || running.has(set.job)) continue;
+      this.unlight(set.key);
+      gone = true;
+    }
+    for (const id of [...this.seeded.keys()]) if (!running.has(id)) this.seeded.delete(id);
+    if (gone) this.changed();
   }
 
   rowText(id) {
@@ -499,6 +811,9 @@ class MapPane {
     this.map?.remove();
     this.map = null;
     this.tracks.clear();
+    this.sets.clear();
+    this.note?.remove();
+    this.note = null;
     this.el.hidden = true;
   }
 }

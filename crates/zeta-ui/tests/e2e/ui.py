@@ -59,6 +59,16 @@ def http_json(url, secret, path, body=None):
         return json.loads(resp.read())
 
 
+# The demo station, Brisbane Airport: ui.rs `station_set`s the node to it at start, and a
+# scenario that clears or moves the station puts it back.
+DEMO_STATION = {"lat": -27.3842, "lon": 153.1175, "alt_m": 4.0}
+
+
+def set_demo_station(url, secret):
+    http_json(url, secret, "/op", {"op": "station_set", **DEMO_STATION, "region": "AU",
+                                   "antennas": None})
+
+
 def login(page, url, secret):
     page.goto(url + "/ui/")
     expect(page.locator("#login")).to_be_visible()
@@ -1660,10 +1670,10 @@ def scenario_view_set_show_reset(page, url, secret):
     for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
                  "finished_rows_s 60", "scanner auto", "plan auto", "main rf", "map auto",
                  "home none",
-                 "subjects auto", "subject_dim_s 60", "subject_drop_s 300", "pane none",
-                 "theme console", "side both", "dock auto"):
+                 "subjects auto", "subject_dim_s 60", "subject_drop_s 300",
+                 "origin_fade_s 300", "pane none", "theme console", "side both", "dock auto"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 15, f"view show: {shown!r}"
+    assert shown.count("\n") == 16, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -4714,6 +4724,15 @@ def scenario_map_is_a_source_tab(page, url, secret):
 def scenario_home_gives_distance_and_bearing(page, url, secret):
     page.route(OSM_TILES, lambda r: r.abort())
     errors = page_errors(page)
+    # No station, so `home none` leaves the row without a distance (the page reads it at load).
+    http_json(url, secret, "/op", {"op": "station_clear"})
+    try:
+        home_gives_distance_and_bearing(page, url, secret, errors)
+    finally:
+        set_demo_station(url, secret)
+
+
+def home_gives_distance_and_bearing(page, url, secret, errors):
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set home -27.50,153.00")
     expect(view_line(page, "home = -27.5,153")).to_be_visible()
@@ -4761,7 +4780,114 @@ def scenario_station_is_the_default_home(page, url, secret):
     finally:
         if job:
             stop_job(url, secret, job)
-        http_json(url, secret, "/op", {"op": "station_clear"})
+        set_demo_station(url, secret)
+
+
+# ---- lit sites (plan 32 Task 9) ---------------------------------------------------------
+# The node's register stub (ui.rs fake_register_rows) answers two transmitters on the tone's
+# band, 16K0F1D at Example Hill 9 km north-west of the demo station and 12K5A3E at Example
+# Ridge 20 km east, and a receiver; the node's station is the demo station.
+
+def lit_sites(page):
+    """The lit sites on the map as (agree, confirmed) pairs."""
+    return page.locator("#map path.map-site").evaluate_all(
+        "els => els.map(e => [e.dataset.agree, e.dataset.confirmed !== undefined])")
+
+
+def origins_of(url, secret, job):
+    """`origin_lookup` by `job`, measured as FM (the fake_pos row states no modulation): the
+    16K0F1D row fits, the 12K5A3E row disagrees. The answer."""
+    return http_json(url, secret, "/op", {"op": "origin_lookup", "job": job, "source": None,
+                                          "center_hz": None, "bandwidth_hz": None,
+                                          "modulation": ["fm"]})["value"]
+
+
+def scenario_origins_light_sites(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    select_source(page, url, secret, "tone")
+    page.set_viewport_size(WIDE)
+    # At the tone's centre, the row's own 40 kHz (its `min_hz`; a narrower band is refused).
+    job = start_fake_pos(page, url, secret)
+    try:
+        origins_of(url, secret, job)                       # the node's answer; the page follows the feed
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        agree = sorted(a for a, _ in lit_sites(page))
+        assert agree == ["disagrees", "fits"], agree
+        expect(page.locator("#map path.map-bearing")).to_have_count(1)
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("2")
+        page.locator('#map path.map-site[data-agree="fits"]').hover()
+        tip = page.locator("#map .leaflet-tooltip")
+        expect(tip).to_contain_text("Example Water Authority")
+        expect(tip).to_contain_text("16K0F1D")
+        expect(tip).to_contain_text(re.compile(r"0\.\d+ fits"))
+        page.locator('#map path.map-site[data-agree="fits"]').click()
+        pop = page.locator("#map .leaflet-popup-content")
+        expect(pop).to_contain_text("licence 0000001")
+        expect(pop.locator("button")).to_have_count(0)
+        expect(page.locator("#transcript .line.note", has_text="2 sites on")).to_have_count(1)
+        run_cmd(page, "view set origin_fade_s 2")
+        # fake_pos sent its last event 2 s in.
+        expect(page.locator("#map path.map-site")).to_have_count(0, timeout=8_000)
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("")
+        origins_of(url, secret, job)
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        page.locator('#tabs .src-tab[data-id="tone"]').click()
+        stop_job(url, secret, job)
+        page.evaluate("() => window.zetaTest.poll()")
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(0)
+    finally:
+        run_cmd(page, "view reset")
+        stop_job(url, secret, job)
+
+
+def scenario_no_station_lights_without_bearings(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    http_json(url, secret, "/op", {"op": "station_clear"})
+    job = None
+    try:
+        select_source(page, url, secret, "tone")
+        job = start_fake_pos(page, url, secret)
+        answer = origins_of(url, secret, job)
+        assert answer["from"] is None and answer["from_note"] == "no station set", answer
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        expect(page.locator("#map path.map-bearing")).to_have_count(0)
+        note = page.locator("#map .map-note")
+        expect(note).to_be_visible()
+        expect(note).to_contain_text("no station set")
+        page.locator('#map path.map-site[data-agree="fits"]').hover()
+        tip = page.locator("#map .leaflet-tooltip")
+        expect(tip).to_contain_text("Example Water Authority")
+        assert " km" not in tip.text_content(), tip.text_content()
+    finally:
+        run_cmd(page, "view reset")
+        if job:
+            stop_job(url, secret, job)
+        set_demo_station(url, secret)
+
+
+def scenario_classify_lights_sites(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    try:
+        menu = open_menu_on_tone(page, url, secret)
+        page.click('#ctx .ctx-item[data-action="classify"]')
+        expect(menu).to_be_hidden()
+        line = page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
+        expect(line.first).to_be_visible(timeout=15_000)
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=5_000)
+        keys = page.evaluate("() => window.zetaTest.litKeys()")
+        assert len(keys) == 1 and keys[0].startswith("classify:"), keys
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        expect(page.locator("#map path.map-bearing")).to_have_count(
+            sum(1 for a, _ in lit_sites(page) if a != "disagrees"))
+        run_cmd(page, "view set origin_fade_s 2")
+        expect(page.locator("#map path.map-site")).to_have_count(0, timeout=6_000)
+        assert page.evaluate("() => window.zetaTest.litKeys()") == []
+    finally:
+        run_cmd(page, "view reset")
 
 
 # ---- subjects (plan 23 Task 2) ----------------------------------------------------------
@@ -5052,6 +5178,16 @@ def scenario_subjects_dim_and_drop(page, url, secret):
 
 
 def scenario_subjects_distance_and_sort(page, url, secret):
+    # No station, so the table has no distance column until `view set home` (the page reads
+    # the station at load).
+    http_json(url, secret, "/op", {"op": "station_clear"})
+    try:
+        subjects_distance_and_sort(page, url, secret)
+    finally:
+        set_demo_station(url, secret)
+
+
+def subjects_distance_and_sort(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
