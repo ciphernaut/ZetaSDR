@@ -673,7 +673,8 @@ async fn with_no_provider_providers_and_origins_are_empty_and_the_summary_says_s
     let dir = tempfile::tempdir().unwrap();
     let node = node(dir.path(), false).await;
     let a = lookup(&node, by_band("file0", TONE_HZ, Some(&["fm"]))).await;
-    assert!(a.providers.is_empty());
+    // Only the node's own accepted signatures, which give no allocations.
+    assert_eq!(a.providers, vec!["learned".to_string()]);
     assert!(a.origins.is_empty());
     assert_eq!(a.register_rows, None);
     assert_eq!(summary(&a), "no register provider");

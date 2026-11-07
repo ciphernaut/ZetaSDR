@@ -866,7 +866,7 @@ async fn an_unknown_summary_names_the_licensee() {
     // The origins ride beside the allocations: the provider asked, the site lit.
     assert_eq!(
         e["origins"]["providers"],
-        serde_json::json!(["register"]),
+        serde_json::json!(["learned", "register"]),
         "{e}"
     );
     assert_eq!(

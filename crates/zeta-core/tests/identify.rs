@@ -861,7 +861,7 @@ async fn an_identify_run_publishes_one_origin_event_and_its_verdict_carries_orig
     assert_eq!(origins["source"], "rx", "{ctx}");
     assert_eq!(
         origins["providers"],
-        serde_json::json!(["register"]),
+        serde_json::json!(["learned", "register"]),
         "{ctx}"
     );
     assert_eq!(

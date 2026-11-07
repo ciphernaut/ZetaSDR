@@ -1651,7 +1651,10 @@ mod tests {
             )
         );
         assert_eq!(serde_json::to_value(&a).unwrap()["from"]["kind"], "source");
-        assert_eq!(a.providers, vec!["recording".to_string()]);
+        assert_eq!(
+            a.providers,
+            vec!["learned".to_string(), "recording".to_string()]
+        );
         assert_eq!(a.register_rows, Some(1));
         assert_eq!(a.origins.len(), 1);
         assert_eq!(a.reach, Some(reach(Some(150.0))));
@@ -1690,12 +1693,22 @@ mod tests {
         // Plans only: the built-in signatures and no assignment row.
         n.add_knowledge(Arc::new(crate::knowledge::StaticKnowledge::builtin()));
         let a = origins(&n.inner, &query).await;
-        assert_eq!(a.providers, vec!["static".to_string()]);
+        assert_eq!(
+            a.providers,
+            vec!["learned".to_string(), "static".to_string()]
+        );
         assert_eq!(a.register_rows, None);
         assert_eq!(summary(&a), "no register provider");
         n.add_knowledge(Arc::new(SilentRegister));
         let a = origins(&n.inner, &query).await;
-        assert_eq!(a.providers, vec!["static".to_string(), "acma".to_string()]);
+        assert_eq!(
+            a.providers,
+            vec![
+                "learned".to_string(),
+                "static".to_string(),
+                "acma".to_string()
+            ]
+        );
         assert_eq!(a.register_rows, Some(0));
         assert_eq!(summary(&a), "register gave no rows");
     }
