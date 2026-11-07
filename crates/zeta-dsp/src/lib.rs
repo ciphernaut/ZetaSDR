@@ -14,6 +14,7 @@ pub mod acars;
 pub mod afsk;
 pub mod am;
 pub mod aprs;
+pub mod aprs_info;
 pub mod ax25;
 pub mod bank;
 pub mod bit_view;

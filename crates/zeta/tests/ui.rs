@@ -822,7 +822,14 @@ fn ui_scenarios_pass_in_headless_chromium() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    // A positioned packet (Brisbane Airport), so the station lands on the map.
+    let iq = zeta_dsp::fixtures::aprs_packet_iq(
+        "VK3ABC",
+        "APRS",
+        "!2723.05S/15307.05E>ZetaSDR",
+        48_000,
+        0.0,
+    );
     let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "aprs", &iq, 48_000, 144_800_000);
     let aprs = format!("aprs={}", meta.display());
     // A fixture for the node the rebuild scenario starts and restarts by itself.

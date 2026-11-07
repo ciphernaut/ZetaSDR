@@ -1,4 +1,5 @@
-//! APRS decode stage: AFSK1200 demodulation, HDLC deframing and AX.25 UI parsing.
+//! APRS decode stage: AFSK1200 demodulation, HDLC deframing and AX.25 UI parsing; the
+//! information field read by [`crate::aprs_info`] for the position and data type.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{StreamId, StreamKind};
 
 use crate::afsk::Afsk1200Demod;
+use crate::aprs_info::parse_info;
 use crate::ax25::{HdlcDeframer, parse_ax25_ui};
 use crate::{Input, run_map};
 
@@ -136,6 +138,17 @@ impl Stage for AprsDecodeStage {
                     let _ = write!(s, "{b:02x}");
                     s
                 });
+                let mut fields = serde_json::json!({
+                    "src": f.src,
+                    "dst": f.dst,
+                    "path": f.path,
+                    "info": String::from_utf8_lossy(&f.info),
+                    "info_hex": info_hex,
+                    "fcs_ok": true,
+                });
+                if let Some(m) = fields.as_object_mut() {
+                    m.extend(parse_info(&f.dst, &f.info).fields());
+                }
                 events.push(Frame::new(
                     out.clone(),
                     frame.provenance.clone(),
@@ -143,14 +156,7 @@ impl Stage for AprsDecodeStage {
                         &ctx,
                         frame.provenance.span.start_ns.0,
                         "aprs",
-                        serde_json::json!({
-                            "src": f.src,
-                            "dst": f.dst,
-                            "path": f.path,
-                            "info": String::from_utf8_lossy(&f.info),
-                            "info_hex": info_hex,
-                            "fcs_ok": true,
-                        }),
+                        fields,
                     )),
                 ));
             }
@@ -253,9 +259,69 @@ mod tests {
                 "protocol": "aprs", "src": "VK3ABC", "dst": "APRS", "path": ["WIDE1-1"],
                 "info": ">hi", "info_hex": "3e6869", "fcs_ok": true,
                 "summary": "VK3ABC > APRS: >hi", "t_ns": 5,
+                "lat": null, "lon": null, "alt_m": null, "course_deg": null, "speed_kt": null,
+                "symbol": null, "comment": null, "data_type": "status", "object": null,
             })
         );
         assert!(rx_out.try_recv().is_err(), "exactly one event");
+    }
+
+    /// The one event the stage emits for a packet from VK3ABC carrying `info`.
+    async fn event_for(info: &[u8]) -> serde_json::Value {
+        let (tx, mut rx_out, h) = spawn(serde_json::json!({}));
+        let frame = ax25_ui_frame("VK3ABC", "APRS", &[], info);
+        let mut audio = vec![0.0f32; 4_800];
+        audio.extend(afsk1200_modulate(
+            &nrzi_encode(&hdlc_frame_bits(&frame, 32, 4)),
+            48_000,
+        ));
+        audio.extend(vec![0.0f32; 4_800]);
+        for chunk in audio.chunks(4_800) {
+            tx.send(audio_frame(chunk.to_vec(), 48_000)).unwrap();
+        }
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        let f = rx_out.recv().await.unwrap();
+        let Payload::Event(v) = f.payload else {
+            panic!("expected an event")
+        };
+        v
+    }
+
+    #[tokio::test]
+    async fn a_positioned_packet_carries_its_fix() {
+        let v = event_for(b"!2723.05S/15307.05E>ZetaSDR").await;
+        assert_eq!(v["data_type"], "position");
+        assert!(
+            (v["lat"].as_f64().unwrap() + 27.3842).abs() <= 0.0001,
+            "{v}"
+        );
+        assert!(
+            (v["lon"].as_f64().unwrap() - 153.1175).abs() <= 0.0001,
+            "{v}"
+        );
+        assert_eq!(v["symbol"], "/>");
+        assert_eq!(v["comment"], "ZetaSDR");
+        // The row maps the fix into `position`.
+        assert!(
+            (v["position"]["lat"].as_f64().unwrap() + 27.3842).abs() <= 0.0001,
+            "{v}"
+        );
+        assert_eq!(v["summary"], "VK3ABC > APRS: !2723.05S/15307.05E>ZetaSDR");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_position_is_still_an_event() {
+        for info in [&b"!garbage"[..], b"=4903.5"] {
+            let v = event_for(info).await;
+            assert_eq!(v["src"], "VK3ABC", "{v}");
+            assert_eq!(v["dst"], "APRS", "{v}");
+            assert_eq!(v["info"], String::from_utf8_lossy(info).as_ref(), "{v}");
+            assert_eq!(v["data_type"], "position", "{v}");
+            assert_eq!(v["lat"], serde_json::Value::Null, "{v}");
+            assert_eq!(v["lon"], serde_json::Value::Null, "{v}");
+            assert!(v.get("position").is_none(), "{v}");
+        }
     }
 
     #[tokio::test]

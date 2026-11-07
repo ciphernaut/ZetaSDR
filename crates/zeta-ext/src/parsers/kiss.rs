@@ -4,9 +4,11 @@
 //! unescaped to `C0` and `DB`. The AX.25 frame comes from the TNC without its
 //! FCS (a TNC passes only CRC-good frames); a trailing FCS that checks is
 //! stripped too. The frame is read as `aprs_decode` reads one:
-//! `{src, dst, path, info, fcs_ok}`.
+//! `{src, dst, path, info, fcs_ok}` and the fields `aprs_info` reads from the info
+//! (`lat`, `lon`, `alt_m`, `course_deg`, `speed_kt`, `symbol`, `comment`, `data_type`, `object`).
 
 use serde_json::{Value, json};
+use zeta_dsp::aprs_info::parse_info;
 use zeta_dsp::ax25::parse_ax25_ui;
 
 const FEND: u8 = 0xC0;
@@ -30,13 +32,17 @@ pub fn parse(line: &str) -> Option<Value> {
         _ => &frame[..],
     };
     let f = parse_ax25_ui(body)?;
-    Some(json!({
+    let mut v = json!({
         "src": f.src,
         "dst": f.dst,
         "path": f.path,
         "info": String::from_utf8_lossy(&f.info),
         "fcs_ok": true,
-    }))
+    });
+    if let Some(m) = v.as_object_mut() {
+        m.extend(parse_info(&f.dst, &f.info).fields());
+    }
+    Some(v)
 }
 
 /// The bytes of a hex line, whitespace ignored; `None` for anything else.
@@ -109,9 +115,28 @@ mod tests {
                 .unwrap()
                 .starts_with("!3745.00S/14458.00E>zeta")
         );
+        // The position read from the info, as `aprs_decode` reads it.
+        assert_eq!(v["data_type"], "position");
+        assert!((v["lat"].as_f64().unwrap() + 37.75).abs() < 1e-9, "{v}");
+        assert!(
+            (v["lon"].as_f64().unwrap() - (144.0 + 58.0 / 60.0)).abs() < 1e-9,
+            "{v}"
+        );
+        assert_eq!(v["symbol"], "/>");
+        assert_eq!(v["alt_m"], Value::Null);
+        assert_eq!(v["object"], Value::Null);
         // With the FCS still on, lower case and without spaces.
         let line = kiss_hex(&with_fcs).replace(' ', "").to_lowercase();
         assert_eq!(parse(&line).unwrap()["src"], "VK3ZET-9");
+    }
+
+    #[test]
+    fn a_frame_without_a_position_reads_its_type() {
+        let with_fcs = ax25_ui_frame("VK3ZET", "APZETA", &[], b">on air");
+        let v = parse(&kiss_hex(&with_fcs[..with_fcs.len() - 2])).unwrap();
+        assert_eq!(v["data_type"], "status");
+        assert_eq!(v["lat"], Value::Null);
+        assert_eq!(v["info"], ">on air");
     }
 
     #[test]
