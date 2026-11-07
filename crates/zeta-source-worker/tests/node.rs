@@ -16,7 +16,7 @@ use zeta_core::node::{Node, NodeConfig, load_source};
 use zeta_core::ops::{Op, OpResult, SourceInfo};
 use zeta_core::port::{Port, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Hz, JobId, SourceId, Timestamp};
+use zeta_core::types::{Claim, Hz, JobId, SourceId, Timestamp};
 use zeta_source_worker::port::{Attach, Timings, WorkerConfig, WorkerPort};
 use zeta_source_worker::ring::{DEFAULT_RING_BYTES, MIN_SLOTS, SLOT_SAMPLES};
 
@@ -315,6 +315,40 @@ async fn a_heal_before_the_port_is_attached_ends_the_held_fault() {
     })
     .await;
     assert_eq!(source(&node).await.fault, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cap_measured_on_a_respawn_reaches_the_source_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let rec = dir.path().join("record");
+    // The first spawn asserts the mock's cap and crashes once; the respawn (the crash
+    // marker beside the record now there) measures one.
+    let env = format!(
+        "export ZETA_FAKE_CRASH_ONCE=1; [ -e '{}.crashed' ] && export ZETA_FAKE_MEASURED_CAP=20480000;",
+        rec.display()
+    );
+    let (port, attach) = WorkerPort::open(cfg("crash-after-ms 500", &rec, &env), None)
+        .await
+        .unwrap();
+    assert_eq!(attach, Attach::Hello);
+    let node = node_over(&state_dir, port).await;
+    let cap = || {
+        load_source(&state_dir.join("sources"), &f())
+            .and_then(|r| r.capabilities)
+            .map(|c| c.max_bandwidth_hz)
+    };
+    assert_eq!(cap(), Some(Claim::Asserted(Hz(20_000_000))));
+    until(
+        "the measured cap reaches sources/f.json",
+        Duration::from_secs(10),
+        || cap() == Some(Claim::Measured(Hz(20_480_000))),
+    )
+    .await;
+    assert_eq!(
+        source(&node).await.capabilities.max_bandwidth_hz,
+        Claim::Measured(Hz(20_480_000))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

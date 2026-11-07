@@ -513,12 +513,22 @@ fn a_block_wider_than_a_slot_is_split() {
             .any(|d| d.n as usize == READ - 2 * SLOT_SAMPLES),
         "{pieces:?}"
     );
+    let mut within_a_block = 0;
     for w in pieces.windows(2) {
         assert_eq!(w[1].seq, w[0].seq + 1);
+        // Only pieces of one block are spaced exactly: a full piece is never
+        // a block's last (a read is two full slots and the rest), and the
+        // next block may start re-anchored, as an overflow or a slow host
+        // under load makes the source do.
+        if w[0].n as usize != SLOT_SAMPLES {
+            continue;
+        }
+        within_a_block += 1;
         let want = u64::from(w[0].n) * 1_000_000_000 / RATE;
         let got = w[1].t0_ns - w[0].t0_ns;
         // Each t0 is rounded down on its own, so a step may be 1 ns longer.
         assert!(got == want || got == want + 1, "{:?} then {:?}", w[0], w[1]);
     }
+    assert!(within_a_block >= 2, "{pieces:?}");
     child.kill().unwrap();
 }

@@ -27,14 +27,17 @@
 //! probe). Once the port's capability record holds a measured cap (the first
 //! hello's, or the cached one), each spawn is told it with `--rate-cap-hz N`,
 //! unless the configured args already carry the flag, so a respawn skips the
-//! probe.
+//! probe. A record whose cap was only asserted (a probe that found no rung
+//! clean, or a device that could not be probed) is replaced by a later hello
+//! that differs from it in nothing but a measured cap: the port then reports
+//! that record, the node caches it on the heal, and later spawns are told it.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt;
@@ -71,6 +74,10 @@ pub(crate) struct Shared {
     pub(crate) id: SourceId,
     snap: Mutex<Snapshot>,
     pub(crate) tx: broadcast::Sender<IqBlock>,
+    /// The capability record a respawn measured, replacing the asserted one
+    /// the port attached with (see [`measured_replaces`]). Set at most once:
+    /// after it, every spawn is passed the measured cap and reports it back.
+    pub(crate) measured: OnceLock<Capabilities>,
 }
 
 impl Shared {
@@ -79,6 +86,7 @@ impl Shared {
             id,
             snap: Mutex::new(Snapshot::default()),
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
+            measured: OnceLock::new(),
         }
     }
 
@@ -446,11 +454,24 @@ impl Supervisor {
     fn on_hello(&mut self, w: Worker, hello: Hello) -> State {
         match &self.caps {
             None => self.caps = Some(hello.capabilities.clone()),
-            Some(c) if *c != hello.capabilities => eprintln!(
+            Some(c) if *c == hello.capabilities => {}
+            Some(c) if measured_replaces(c, &hello.capabilities) => {
+                eprintln!(
+                    "zeta: soapy worker for {}: rate cap {} Hz measured on respawn",
+                    self.id(),
+                    hello.capabilities.max_bandwidth_hz.value().0
+                );
+                // Before the heal is announced below, so the node's recovery
+                // caches this record. The port attached before any of this
+                // (`first` is answered once): only a record it was given can
+                // be replaced, so `measured` is still empty here.
+                let _ = self.shared.measured.set(hello.capabilities.clone());
+                self.caps = Some(hello.capabilities.clone());
+            }
+            Some(_) => eprintln!(
                 "zeta: soapy worker for {}: capabilities changed; keeping the first",
                 self.id()
             ),
-            Some(_) => {}
         }
         {
             let mut s = self.shared.snapshot();
@@ -515,20 +536,28 @@ impl Supervisor {
     /// the kernel has no memfds, or the ring cannot be made (a line, then the
     /// pipe).
     fn new_ring(&self) -> Option<Arc<Ring>> {
-        if self.cfg.ring_bytes == 0 || !ring::supported() {
+        if self.cfg.ring_bytes == 0 {
+            return None;
+        }
+        if !ring::supported() {
+            self.no_ring("this kernel gives out no memfds");
             return None;
         }
         match Ring::create(self.cfg.ring_bytes) {
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {
-                eprintln!(
-                    "zeta: soapy worker for {}: ring of {} bytes: {e}; blocks go on the pipe",
-                    self.id(),
-                    self.cfg.ring_bytes
-                );
+                self.no_ring(&format!("a ring of {} bytes: {e}", self.cfg.ring_bytes));
                 None
             }
         }
+    }
+
+    /// The one line a spawn without the ring it was configured for prints.
+    fn no_ring(&self, why: &str) {
+        eprintln!(
+            "zeta: soapy worker for {}: no shared-memory ring ({why}); blocks on the pipe",
+            self.id()
+        );
     }
 
     /// `--rate-cap-hz N` for the next spawn: the port's capability record (the
@@ -779,6 +808,18 @@ impl Supervisor {
     }
 }
 
+/// Whether `new` is `old` with its asserted rate cap now measured, and nothing
+/// else changed: the one change a later hello may make to the port's record.
+fn measured_replaces(old: &Capabilities, new: &Capabilities) -> bool {
+    let (Claim::Asserted(_), Claim::Measured(_)) = (&old.max_bandwidth_hz, &new.max_bandwidth_hz)
+    else {
+        return false;
+    };
+    let mut same = old.clone();
+    same.max_bandwidth_hz = new.max_bandwidth_hz.clone();
+    same == *new
+}
+
 /// The fault a worker's end leaves, and for a device-not-found exit what was
 /// looked for. The worker names it on its last stderr line (`device not
 /// found: <args>`); a worker that did not is described by its arguments.
@@ -856,9 +897,10 @@ fn now_ns() -> u64 {
 /// on the pipe, or as descriptors of `ring`'s slots, copied out and freed
 /// here. Returns `bad frame: <why>` when it stopped because the worker broke
 /// the protocol (a malformed frame, a descriptor the ring cannot hold or that
-/// came without a ring); the worker is then ended and respawned. A stream cut
-/// short mid-frame is not that: a dying worker does it, and its exit says
-/// more.
+/// came without a ring, or whose `seq` is not the next: the producer numbers
+/// its blocks 0, 1, 2, … and this reader holds it to that); the worker is
+/// then ended and respawned. A stream cut short mid-frame is not that: a dying
+/// worker does it, and its exit says more.
 fn read_stdout(
     mut stdout: File,
     shared: &Shared,
@@ -867,6 +909,9 @@ fn read_stdout(
     hello: oneshot::Sender<Hello>,
 ) -> Option<String> {
     let mut hello = Some(hello);
+    // The `seq` the next descriptor must carry: a stale or repeated one would
+    // name a slot the producer may be rewriting (see `Ring::read`).
+    let mut expected: u64 = 0;
     let bad = |why: String| {
         let why = format!("bad frame: {why}");
         eprintln!("zeta: soapy worker for {}: {why}", shared.id.0);
@@ -891,8 +936,12 @@ fn read_stdout(
                 let Some(ring) = ring else {
                     return bad("a ring descriptor, but the worker has no ring".into());
                 };
+                if d.seq != expected {
+                    return bad(format!("descriptor seq {}, expected {expected}", d.seq));
+                }
                 match from_ring(ring, &d) {
                     Ok(b) => {
+                        expected += 1;
                         let _ = shared.tx.send(b);
                     }
                     Err(e) => return bad(e.to_string()),

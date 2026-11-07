@@ -39,7 +39,9 @@
 //! real worker does (a ring that will not open is one stderr line, then the
 //! pipe); `ZETA_FAKE_NO_RING=1` ignores the flag, as a worker of an older
 //! build would. `ZETA_FAKE_BAD_SLOT=1` rewrites the first descriptor to name
-//! slot 9999, which no ring has. `ZETA_FAKE_READ_SAMPLES=N` scripts the mock's reads `N`
+//! slot 9999, which no ring has. `ZETA_FAKE_STALE_SEQ=1` rewrites the third
+//! descriptor to repeat the second (seq 1 in slot 1), a stale descriptor the
+//! ring's own checks would pass. `ZETA_FAKE_READ_SAMPLES=N` scripts the mock's reads `N`
 //! samples long instead of [`READ_SAMPLES`], and raises the mock's rate
 //! ceiling to `100 N` when that is above its own, since the source reads a
 //! hundredth of a second at a time: a tune to that rate then gets blocks of
@@ -395,6 +397,14 @@ struct Bend {
     protocol_1: bool,
     /// Name slot 9999 in the first descriptor.
     bad_slot: bool,
+    /// Repeat seq 1 in slot 1 as the third descriptor.
+    stale_seq: bool,
+}
+
+impl Bend {
+    fn any(self) -> bool {
+        self.protocol_1 || self.bad_slot || self.stale_seq
+    }
 }
 
 /// How long the end of the worker waits for the bending thread to pass the
@@ -417,10 +427,18 @@ fn bend_frames(mut frames: File, bend: Bend) -> io::Result<(File, std::sync::mps
         .name("fake-bend".into())
         .spawn(move || {
             let mut bad_slot = bend.bad_slot;
+            let mut descriptors = 0u64;
             while let Ok(Some(mut f)) = read_frame(&mut rd) {
-                if let (true, Frame::Descriptor(d)) = (bad_slot, &mut f) {
-                    d.slot = 9999;
-                    bad_slot = false;
+                if let Frame::Descriptor(d) = &mut f {
+                    if bad_slot {
+                        d.slot = 9999;
+                        bad_slot = false;
+                    }
+                    if bend.stale_seq && descriptors == 2 {
+                        d.seq = 1;
+                        d.slot = 1;
+                    }
+                    descriptors += 1;
                 }
                 let written = match (&f, bend.protocol_1) {
                     (Frame::Control(c), true) => write_protocol_1(&mut frames, c),
@@ -606,6 +624,7 @@ fn main() -> ExitCode {
         let bend = Bend {
             protocol_1: protocol == Some(1),
             bad_slot: std::env::var("ZETA_FAKE_BAD_SLOT").is_ok_and(|v| v == "1"),
+            stale_seq: std::env::var("ZETA_FAKE_STALE_SEQ").is_ok_and(|v| v == "1"),
         };
         if let Some(p) = protocol.filter(|p| *p != 1) {
             return wrong_hello(port.as_ref(), p, frames);
@@ -620,7 +639,7 @@ fn main() -> ExitCode {
         } else {
             open_ring(args.ring_fd)
         };
-        let code = if bend.protocol_1 || bend.bad_slot {
+        let code = if bend.any() {
             let (out, bent) = match bend_frames(frames, bend) {
                 Ok(b) => b,
                 Err(e) => {

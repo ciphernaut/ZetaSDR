@@ -132,9 +132,20 @@ impl Ring {
     }
 
     /// Maps a ring another process created, checking its header and that the
-    /// file is exactly the size the header says.
+    /// file is exactly the size the header says. The descriptor is made
+    /// close-on-exec first: it was inherited on purpose, and must not leak on
+    /// into anything this process runs in turn (a driver's helper).
     pub fn open(fd: OwnedFd) -> io::Result<Ring> {
         let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
+        // SAFETY: plain `fcntl` calls on a descriptor this process owns; they
+        // take no pointers.
+        unsafe {
+            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
         let mut st = MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `fstat` writes a `stat` into the buffer it is given and
         // nothing else; the buffer is read only when it succeeds.
@@ -242,6 +253,12 @@ impl Ring {
     /// Consumer: copies out the `n` samples of block `seq` in `slot`, after
     /// checking the descriptor against the ring. The slot stays held until
     /// [`Ring::release`].
+    ///
+    /// `seq` must be the block after the last one released (the node's reader
+    /// refuses any other descriptor before it gets here): only then is the
+    /// slot one the producer has finished and will not touch until it is
+    /// released. These checks alone cannot tell a stale `seq` from the right
+    /// one.
     pub fn read(&self, seq: u64, slot: u32, n: u32) -> Result<Arc<[Complex<f32>]>, RingError> {
         let bad = |why: String| Err(RingError::BadDescriptor(why));
         if slot as usize >= self.slots {
@@ -263,9 +280,13 @@ impl Ring {
         let mut out = Arc::<[Complex<f32>]>::new_uninit_slice(n as usize);
         let dst = Arc::get_mut(&mut out).expect("a fresh Arc is unique");
         // SAFETY: the slot lies inside the mapping and holds at least `n`
-        // samples, which the producer finished writing before `head` passed
-        // `seq`; it will not overwrite them until this block is released.
-        // `dst` is `n` fresh, distinct elements.
+        // samples, and `dst` is `n` fresh, distinct elements. The producer
+        // finished writing them before `head` passed `seq`, and will not
+        // overwrite them until this block is released, because `seq` is the
+        // next unreleased block: the caller holds descriptors to the order
+        // 0, 1, 2, ... (see above). A misbehaving child writing the slot anyway
+        // races only on plain `f32`s in shared memory, for which any bit
+        // pattern is valid, so the worst it does is garble its own samples.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.slot_ptr(slot as usize).cast_const(),
@@ -445,6 +466,21 @@ mod tests {
         assert_eq!(producer.try_write(4, &block(1, 0.0)), Err(RingFull));
         consumer.release(0);
         assert_eq!(producer.try_write(4, &block(1, 0.0)), Ok(0));
+    }
+
+    #[test]
+    fn open_makes_an_inherited_fd_close_on_exec() {
+        let producer = ring4();
+        // A plain `dup` is not close-on-exec, like a descriptor a child inherits.
+        // SAFETY: `dup` of a live descriptor; the copy is owned by nobody else.
+        let fd = unsafe { OwnedFd::from_raw_fd(libc::dup(producer.fd().as_raw_fd())) };
+        // SAFETY: `fcntl(F_GETFD)` on a live descriptor.
+        let before = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(before & libc::FD_CLOEXEC, 0, "flags {before:#x}");
+        let consumer = Ring::open(fd).expect("open the ring");
+        // SAFETY: as above, on the ring's own descriptor.
+        let flags = unsafe { libc::fcntl(consumer.fd().as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "flags {flags:#x}");
     }
 
     #[test]

@@ -25,8 +25,9 @@ use crate::wire::{Cmd, Reply};
 
 /// How long a worker has to say hello after it is spawned: UHD loads a B210's
 /// FPGA image before the device opens (2-4 s, more on a cold boot), and the
-/// worker then probes its rates before the hello (up to six rungs of 1.5 s
-/// each, plus a retune per rung); both must fit with margin.
+/// worker then probes its rates before the hello (up to six rungs of 1.7 s
+/// each, the settle and the dwell, plus a retune per rung); both must fit with
+/// margin.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(45);
 /// The wait before the first respawn after a worker ended.
 pub const BACKOFF_FIRST: Duration = Duration::from_secs(1);
@@ -247,14 +248,12 @@ impl WorkerPort {
     /// texts `SoapySource` gives, so a bad request never waits on a worker.
     fn check(&self, t: Tuning) -> Result<(), PortError> {
         let (center, bw) = (t.center_hz.0, t.bandwidth_hz.0);
-        let (min, max) = (
-            self.caps.tune_min_hz.value().0,
-            self.caps.tune_max_hz.value().0,
-        );
+        let caps = self.capabilities();
+        let (min, max) = (caps.tune_min_hz.value().0, caps.tune_max_hz.value().0);
         if !(min..=max).contains(&center) {
             return Err(out_of_range("center_hz", center, min, max));
         }
-        let max_bw = self.caps.max_bandwidth_hz.value().0;
+        let max_bw = caps.max_bandwidth_hz.value().0;
         if !(1..=max_bw).contains(&bw) {
             return Err(out_of_range("bandwidth_hz", bw, 1, max_bw));
         }
@@ -367,8 +366,10 @@ impl Port for WorkerPort {
         &self.id
     }
 
+    /// The record the port attached with, or the one a respawn measured in its
+    /// place (see the supervisor's module docs).
     fn capabilities(&self) -> &Capabilities {
-        &self.caps
+        self.shared.measured.get().unwrap_or(&self.caps)
     }
 
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {

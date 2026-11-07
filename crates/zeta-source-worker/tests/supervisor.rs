@@ -767,6 +767,43 @@ async fn a_descriptor_outside_the_ring_is_a_bad_frame() {
 }
 
 #[tokio::test]
+async fn a_descriptor_out_of_order_is_a_bad_frame() {
+    let dir = tempdir();
+    // Only the first spawn repeats seq 1 as its third descriptor, a slot the
+    // ring's own checks would let through.
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "[ \"$N\" = 0 ] && export ZETA_FAKE_STALE_SEQ=1\nexec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, _) = open(cfg, None).await;
+    let healed = port.healed().unwrap();
+    let _ = port.tune(tuning(100_000_000, 2_000_000)).await;
+    assert!(
+        wait_for(Duration::from_secs(3), || port
+            .fault()
+            .is_some_and(|f| f.contains("bad frame")))
+        .await,
+        "fault: {:?}",
+        port.fault()
+    );
+    let fault = port.fault().unwrap();
+    assert!(
+        fault.contains("bad frame: descriptor seq 1, expected 2"),
+        "{fault}"
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || *healed.borrow() > 0).await,
+        "no heal"
+    );
+    port.heal_settled();
+    assert_eq!(port.worker().unwrap().restarts, 1);
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert!(mock_samples(&next_block(&mut rx).await));
+    assert_eq!(port.fault(), None);
+}
+
+#[tokio::test]
 async fn without_a_ring_the_child_streams_on_the_pipe() {
     let mut c = cfg("stream");
     c.ring_bytes = 0;
@@ -917,4 +954,64 @@ async fn a_cap_learned_from_the_hello_is_passed_to_the_respawn() {
     let spawns = two_spawns(cfg, &rec, None).await;
     assert_eq!(caps_passed(&spawns[0]), 0, "{:?}", spawns[0]);
     assert_eq!(caps_passed(&spawns[1]), 1, "{:?}", spawns[1]);
+}
+
+#[tokio::test]
+async fn a_cap_measured_on_a_respawn_replaces_the_asserted_one() {
+    // Spawn 0 could not measure (its hello asserts the mock's 20 MHz) and
+    // crashes; spawn 1 measures 20.48 MHz and crashes too; spawn 2 streams,
+    // handed the `--rate-cap-hz` it was spawned with as the real worker is.
+    let dir = tempdir();
+    let rec = dir.path().join("record");
+    let wrapper = dir.path().join("wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "REC='{}'\nN=$(grep -c '^start' \"$REC\" 2>/dev/null || true)\n\
+             CAP=; prev=\n\
+             for a in \"$@\"; do\n\
+               echo \"arg $a\" >> \"$REC\"\n\
+               [ \"$prev\" = --rate-cap-hz ] && CAP=\"--rate-cap-hz $a\"\n\
+               prev=$a\n\
+             done\n\
+             case \"${{N:-0}}\" in\n\
+             0) exec '{FAKE}' --id f --script 'crash-after-ms 300' --record \"$REC\";;\n\
+             1) ZETA_FAKE_MEASURED_CAP=20480000 exec '{FAKE}' --id f --script 'crash-after-ms 300' --record \"$REC\";;\n\
+             *) exec '{FAKE}' --id f --script stream --record \"$REC\" $CAP;;\n\
+             esac\n",
+            rec.display()
+        ),
+    )
+    .unwrap();
+    let mut args = vec![wrapper.display().to_string()];
+    args.extend(worker_args("f", "driver=fake", None));
+    let cfg = WorkerConfig {
+        id: SourceId("f".into()),
+        program: PathBuf::from("/bin/sh"),
+        args,
+        timings: timings(),
+        ring_bytes: 0,
+    };
+    let (port, _) = open(cfg, None).await;
+    let attached = port.capabilities().clone();
+    assert_eq!(attached.max_bandwidth_hz, Claim::Asserted(Hz(20_000_000)));
+    assert!(
+        wait_for(Duration::from_secs(10), || starts(&rec).len() >= 3
+            && port.worker().is_some_and(|w| w.pid.is_some()))
+        .await,
+        "spawns: {:?}",
+        starts(&rec)
+    );
+    assert_eq!(
+        port.capabilities().max_bandwidth_hz,
+        Claim::Measured(Hz(20_480_000))
+    );
+    // The rest of the record is unchanged.
+    let mut want = attached;
+    want.max_bandwidth_hz = Claim::Measured(Hz(20_480_000));
+    assert_eq!(port.capabilities(), &want);
+    let spawns = spawn_args(&rec);
+    assert_eq!(caps_passed(&spawns[0]), 0, "{:?}", spawns[0]);
+    assert_eq!(caps_passed(&spawns[1]), 0, "{:?}", spawns[1]);
+    assert_eq!(caps_passed(&spawns[2]), 1, "{:?}", spawns[2]);
 }
