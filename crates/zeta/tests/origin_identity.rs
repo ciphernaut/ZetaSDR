@@ -267,14 +267,20 @@ async fn a_decoded_callsign_confirms_a_lit_site_and_republishes() {
     // The same callsign heard again republishes nothing.
     settle(dir.path(), &job).await;
     assert_eq!(logged(dir.path(), &job, "origin").len(), 2);
-    // A fresh lookup replaces the kept origins; the station confirms them again.
+    // A fresh lookup replaces the kept origins and keeps their confirmation: its frame
+    // already carries it, so the station heard again republishes nothing.
     look_up(&c, &job).await;
-    let frames = origin_frames(dir.path(), &job, 4).await;
-    assert!(frames[2]["origins"][0]["confirmed"].is_null(), "{frames:?}");
-    assert_eq!(frames[3]["summary"], summary);
+    let frames = origin_frames(dir.path(), &job, 3).await;
+    let first = &frames[2]["origins"][0];
+    assert_eq!(
+        first["confirmed"],
+        json!({"field": "src", "value": "XX4EX"}),
+        "{frames:?}"
+    );
+    assert_eq!(first["score"], 1.0);
     assert_eq!(confirmed(&c, &job).await["score"], 1.0);
     settle(dir.path(), &job).await;
-    assert_eq!(logged(dir.path(), &job, "origin").len(), 4);
+    assert_eq!(logged(dir.path(), &job, "origin").len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
