@@ -520,8 +520,24 @@ unexplained, to be compared with the after-sweep.
 
 ### Sweep after
 
+Trial deploy 2026-11-07 16:04 AEST as `plan28.1-zeta` from the branch. At open the B210 probed 61.44
+(an overflow storm), 30.72 (drops and overflows in the seconds after the master-clock change) and took
+20.48 Msps as its measured cap; the HackRF took 20 Msps on its first rung. Both radios run on the ring
+(`transport.path: shm`, no drops). CPU read with `top -p` at 20.48 Msps with only the page's spectrum
+job.
+
 | rate | delivered | overflows/min | worker CPU | node CPU | fault |
 |---|---|---|---|---|---|
+| 15.36 M | 15.36 M | 0 | – | – | none |
+| 20.48 M | 20.48 M | 4 | 23 % | 10 % | none |
+| 30.72 M | refused: `insufficient bandwidth: b210 delivers at most 20480000 Hz (measured at open)` | | | | |
+
+The ring removes most of the overflows at 15.36 and 20.48 (71 and 206 a minute before). But the probe
+under-caps the B210: 30.72 Msps delivered cleanly on the old pipe once streaming, so the probe's 200 ms
+settle is too short after a UHD master-clock change. Open, with the operator.
+
+A `kill -ABRT` of the B210's worker healed in 4.4 s with `--rate-cap-hz 20480000 --ring-fd 3` on the
+respawn and no second probe.
 
 ## Plan 14 status
 
