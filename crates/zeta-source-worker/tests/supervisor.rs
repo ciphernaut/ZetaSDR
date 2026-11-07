@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, TransportPath, Tuning};
 use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId};
-use zeta_source_worker::port::{Attach, Timings, WorkerConfig, WorkerPort};
+use zeta_source_worker::port::{Attach, Timings, WorkerConfig, WorkerPort, worker_args};
 use zeta_source_worker::ring::{DEFAULT_RING_BYTES, Ring};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_zeta-fake-worker");
@@ -806,4 +806,77 @@ async fn a_protocol_1_child_is_still_accepted() {
     assert_eq!(b.center_hz, Hz(100_000_000));
     assert!(mock_samples(&b));
     assert_eq!(port.fault(), None);
+}
+
+/// The `arg` lines the wrapper recorded for each spawn, split at its `start`.
+fn spawn_args(rec: &Path) -> Vec<Vec<String>> {
+    let mut spawns = vec![vec![]];
+    for l in std::fs::read_to_string(rec).unwrap_or_default().lines() {
+        if let Some(a) = l.strip_prefix("arg ") {
+            spawns.last_mut().unwrap().push(a.to_string());
+        } else if l.starts_with("start ") {
+            spawns.push(vec![]);
+        }
+    }
+    spawns.pop();
+    spawns
+}
+
+#[tokio::test]
+async fn a_cached_measured_cap_is_passed_to_the_respawn() {
+    let mut measured = cached_caps();
+    measured.max_bandwidth_hz = Claim::Measured(Hz(20_480_000));
+    let base = ["soapy-worker", "--id", "f", "--args", "driver=fake"];
+    assert_eq!(worker_args("f", "driver=fake", None), base);
+    assert_eq!(
+        worker_args("f", "driver=fake", Some(&cached_caps())),
+        base,
+        "an asserted cap is probed again"
+    );
+    let args = worker_args("f", "driver=fake", Some(&measured));
+    assert_eq!(args[..5], base);
+    assert_eq!(args[5..], ["--rate-cap-hz", "20480000"]);
+
+    // A wrapper records the arguments of each spawn, then runs the fake:
+    // spawn 0 crashes, the respawn streams.
+    let dir = tempdir();
+    let rec = dir.path().join("record");
+    let wrapper = dir.path().join("wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "REC='{}'\nN=$(grep -c '^start' \"$REC\" 2>/dev/null || true)\n\
+             for a in \"$@\"; do echo \"arg $a\" >> \"$REC\"; done\n\
+             case \"${{N:-0}}\" in\n\
+             0) exec '{FAKE}' --id f --script 'crash-after-ms 300' --record \"$REC\";;\n\
+             *) exec '{FAKE}' --id f --script stream --record \"$REC\";;\n\
+             esac\n",
+            rec.display()
+        ),
+    )
+    .unwrap();
+    let mut wrapped = vec![wrapper.display().to_string()];
+    wrapped.extend(args);
+    let cfg = WorkerConfig {
+        id: SourceId("f".into()),
+        program: PathBuf::from("/bin/sh"),
+        args: wrapped,
+        timings: timings(),
+        ring_bytes: 0,
+    };
+    let (port, _) = open(cfg, Some(measured)).await;
+    assert!(
+        wait_for(Duration::from_secs(5), || starts(&rec).len() >= 2).await,
+        "spawns: {:?}",
+        starts(&rec)
+    );
+    let spawns = spawn_args(&rec);
+    assert_eq!(spawns.len(), 2, "{spawns:?}");
+    for args in &spawns {
+        assert!(
+            args.windows(2).any(|w| w == ["--rate-cap-hz", "20480000"]),
+            "{args:?}"
+        );
+    }
+    drop(port);
 }

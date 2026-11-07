@@ -348,18 +348,55 @@ impl SoapySource {
         self
     }
 
-    /// Read overflows (samples dropped by the driver) since the source opened.
+    /// The rates this source asks its device for, built at open.
+    pub fn rate_model(&self) -> &RateModel {
+        &self.rates
+    }
+
+    /// Replace the capability record's `max_bandwidth_hz` (the worker's rate
+    /// cap, measured by [`crate::probe::probe_rate_cap`] or asserted by
+    /// `max_rate_hz=`), before the source is shared. A later `tune` never
+    /// changes it.
+    pub fn set_max_bandwidth(&mut self, claim: Claim<Hz>) {
+        self.caps.max_bandwidth_hz = claim;
+    }
+
+    /// After the rate probe: stop the stream and wait for its reader to end,
+    /// then forget the tuning and the probe's overflows and timeouts, so the
+    /// source is as it opened (nothing tuned, nothing counted against it).
+    pub(crate) async fn end_probe(&self) {
+        let _gate = self.gate.lock().await;
+        let handle = self
+            .reader
+            .lock()
+            .unwrap()
+            .take()
+            .and_then(|mut r| r.handle.take());
+        if let Some(h) = handle {
+            let _ = tokio::task::spawn_blocking(move || h.join()).await;
+        }
+        let mut st = self.status.lock().unwrap();
+        st.current = None;
+        st.band = None;
+        st.window.clear();
+        st.overflows = 0;
+        st.timeouts = 0;
+    }
+
+    /// Read overflows (samples dropped by the driver) since the source opened
+    /// (the rate probe's own excluded).
     pub fn overflows(&self) -> u64 {
         self.status.lock().unwrap().overflows
     }
 
-    /// Reads that timed out (100 ms without samples) since the source opened.
+    /// Reads that timed out (100 ms without samples) since the source opened
+    /// (the rate probe's own excluded).
     pub fn read_timeouts(&self) -> u64 {
         self.status.lock().unwrap().timeouts
     }
 
-    /// Samples per second actually delivered over the last 10 s, for reports;
-    /// the capabilities stay `Asserted`.
+    /// Samples per second actually delivered over the last 10 s (since the
+    /// last retune), for reports and the rate probe.
     pub fn measured_rate_hz(&self) -> Option<f64> {
         let st = self.status.lock().unwrap();
         let (first, last) = (st.window.front()?, st.window.back()?);

@@ -1573,6 +1573,23 @@ fn soapy_worker_is_hidden_from_help() {
         .stdout(contains("--args"));
 }
 
+/// The node passes a cached measured cap back to the worker as `--rate-cap-hz`, so a
+/// respawn skips the rate probe.
+#[test]
+fn soapy_worker_takes_a_rate_cap() {
+    zeta_bin()
+        .args(["soapy-worker", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--rate-cap-hz"));
+    zeta_bin()
+        .args(["soapy-worker", "--id", "x", "--args", "driver=hackrf"])
+        .args(["--rate-cap-hz", "fast"])
+        .assert()
+        .code(1)
+        .stderr(contains("invalid value 'fast' for '--rate-cap-hz"));
+}
+
 /// `--soapy-in-process` is a global flag: a node without a Soapy source accepts it.
 #[test]
 fn soapy_in_process_is_accepted_as_a_global_flag() {

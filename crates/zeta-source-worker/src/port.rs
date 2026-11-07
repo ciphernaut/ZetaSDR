@@ -18,7 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{oneshot, watch};
 use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning, WorkerInfo};
-use zeta_core::types::{Capabilities, SourceId};
+use zeta_core::types::{Capabilities, Claim, Hz, SourceId};
 
 use crate::supervisor::{Link, Shared, Supervisor};
 use crate::wire::{Cmd, Reply};
@@ -91,6 +91,21 @@ pub struct WorkerConfig {
     pub args: Vec<String>,
     pub timings: Timings,
     pub ring_bytes: usize,
+}
+
+/// The arguments `zeta` is spawned with as the worker of `--source-soapy
+/// id=args`: `soapy-worker --id ID --args ARGS`, and `--rate-cap-hz N` when the
+/// capabilities cached from an earlier open carry a measured cap `N`, so the
+/// worker reports it instead of probing the device's rates again. An asserted
+/// cap is not passed: the worker probes, or reads it from `max_rate_hz=`.
+pub fn worker_args(id: &str, args: &str, cached: Option<&Capabilities>) -> Vec<String> {
+    let mut out = ["soapy-worker", "--id", id, "--args", args]
+        .map(String::from)
+        .to_vec();
+    if let Some(Claim::Measured(Hz(cap))) = cached.map(|c| &c.max_bandwidth_hz) {
+        out.extend(["--rate-cap-hz".into(), cap.to_string()]);
+    }
+    out
 }
 
 /// What the first spawn said.
