@@ -47,6 +47,6 @@
   },
   "catalogue": ["flex"],
   "access": "restricted",
-  "test": null,
+  "test": {"kind": "synth", "family": "flex", "capcode": 1234567, "text": "HELLO ZETA", "baud": 1600, "repeat": 2, "expect": {"capcode": 1234567, "text": "HELLO ZETA"}, "within_ms": 6000},
   "notes": "FLEX pagers at 1600, 3200 or 6400 bps (2- or 4-level FSK, ±4800 Hz), 25000 Hz band; 929-932 MHz in the US, 151.8-153.4 MHz elsewhere per the catalogue; start it on the measured centre. One event per page, like POCSAG. It runs multimon-ng on the node's host."
 }

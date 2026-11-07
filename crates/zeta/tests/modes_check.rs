@@ -79,9 +79,10 @@ fn modes_check_passes_the_in_crate_rows() {
             .any(|l| l == "adsb_decode: skipped: dump1090 missing"),
         "{out}"
     );
-    // FLEX has no test until its synthesiser lands.
+    // FLEX's program is pinned missing here.
     assert!(
-        out.lines().any(|l| l == "flex_decode: skipped: no test"),
+        out.lines()
+            .any(|l| l == "flex_decode: skipped: multimon-ng missing"),
         "{out}"
     );
     // DFM has no test yet; the RS41 and M20 decoders are pinned missing here.
@@ -557,7 +558,6 @@ fn rs41_decode_passes_its_synthesised_check() {
     assert_eq!(code, 0);
 }
 
-/// zeta-ext's stand-in for an external decoder: prints a file's lines whatever its input.
 /// The M20 row proves itself against the real `m20mod`: the synthesised frames pass
 /// through the row's own chain and the decoder reports the serial and the position.
 #[test]
@@ -573,6 +573,22 @@ fn m20_decode_passes_its_synthesised_check() {
     assert_eq!(code, 0);
 }
 
+/// The FLEX row proves itself against the real multimon-ng: the synthesised frames pass
+/// through the row's own chain and the decoder reports the capcode and the text.
+#[test]
+fn flex_decode_passes_its_synthesised_check() {
+    let Some(multimon) = which("multimon-ng") else {
+        eprintln!("multimon-ng not on this host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) =
+        stdout(check(dir.path(), &["--strict", "flex_decode"]).env(NO_MULTIMON.0, multimon));
+    assert_eq!(out.trim(), "flex_decode: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+/// zeta-ext's stand-in for an external decoder: prints a file's lines whatever its input.
 fn fake_lines() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../zeta-ext/tests/fake_lines")
 }

@@ -1,5 +1,5 @@
 //! Signal generators: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 / APRS, POCSAG, RDS, Mode S,
-//! ACARS, AIS, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
+//! ACARS, AIS, FLEX, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
 //! `zeta modes check` runs the rows' tests on them. The test-only helpers stay in
 //! `fixtures`, behind feature `test-fixtures`.
 
@@ -336,22 +336,6 @@ pub fn awgn(x: &mut [Complex<f32>], snr_db: f32, seed: u64) {
     }
 }
 
-/// POCSAG codeword for 21 data bits (bit 20 the message flag): the bits, the
-/// 10 BCH(31,21) check bits (remainder modulo `x^10+x^9+x^8+x^6+x^5+x^3+1`),
-/// then an even-parity bit. Computed here rather than with the decoder's
-/// [`bch_ok`](crate::pocsag::bch_ok) so the two check each other.
-fn pocsag_codeword(data21: u32) -> u32 {
-    const POLY: u32 = 0x769;
-    let mut r = (data21 & 0x1F_FFFF) << 10;
-    for i in (10..31).rev() {
-        if r & (1 << i) != 0 {
-            r ^= POLY << (i - 10);
-        }
-    }
-    let w = ((data21 & 0x1F_FFFF) << 11) | (r << 1);
-    w | (w.count_ones() & 1)
-}
-
 /// Message codewords' 20-bit payloads for `text`: numeric (function 0) as
 /// bit-reversed BCD nibbles of `0123456789*U -)(`, padded with spaces; alpha
 /// otherwise, as 7-bit ASCII LSB first, then EOT and zero fill. Panics on a
@@ -396,14 +380,14 @@ pub fn pocsag_encode(messages: &[(u32, u8, &str)], baud: u32) -> Vec<u8> {
         while (words.len() % 16) / 2 != (address & 7) as usize {
             words.push(IDLE);
         }
-        words.push(pocsag_codeword(
+        words.push(crate::bch::bch3121_word(
             (((address >> 3) & 0x3FFFF) << 2) | function as u32,
         ));
         if !(text.is_empty() && (function == 1 || function == 2)) {
             words.extend(
                 pocsag_payload(function, text)
                     .into_iter()
-                    .map(|d| pocsag_codeword((1 << 20) | d)),
+                    .map(|d| crate::bch::bch3121_word((1 << 20) | d)),
             );
         }
     }
@@ -1100,6 +1084,35 @@ fn m20_iq(
     gfsk_modulate(&chips, 2, BAUD, DEVIATION_HZ, rate_hz)
 }
 
+/// The FLEX family's FSK deviation, Hz: the tones sit this far either side of the carrier.
+pub const FLEX_DEVIATION_HZ: f64 = 4800.0;
+/// The only line rate the `flex` family synthesises, bit/s.
+const FLEX_BAUD: u32 = crate::flex_frame::BAUD;
+/// Most frames the `flex` family sends.
+const FLEX_REPEAT_MAX: u32 = 10;
+
+/// `repeat` FLEX frames back to back (frames 0.. of cycle 0), each carrying the page
+/// for `capcode` with `text` ([`crate::flex_frame`]): NRZ 2-FSK at 1600 baud, a 1 at
+/// `+FLEX_DEVIATION_HZ`, over NBFM at `rate_hz`.
+fn flex_iq(capcode: u32, text: &str, repeat: u32, rate_hz: u32) -> Vec<Complex<f32>> {
+    use crate::flex_frame::{FRAMES_PER_CYCLE, FlexParams, flex_frame_bits};
+    let mut bits = Vec::new();
+    for n in 0..repeat {
+        bits.extend(flex_frame_bits(&FlexParams {
+            capcode,
+            text: text.into(),
+            cycle: 0,
+            frame: (n % u32::from(FRAMES_PER_CYCLE)) as u8,
+        }));
+    }
+    let spb = (rate_hz / FLEX_BAUD) as usize;
+    let audio: Vec<f32> = bits
+        .iter()
+        .flat_map(|&b| std::iter::repeat_n(if b != 0 { 1.0 } else { -1.0 }, spb))
+        .collect();
+    nbfm_modulate(&audio, rate_hz, rate_hz, FLEX_DEVIATION_HZ, 0.0)
+}
+
 /// Bounds on the generic families' numbers, so a bad row is an error, not an abort or
 /// a huge allocation. `deviation_hz` is given for `fsk`, whose tones must fit the rate.
 fn generic_params(
@@ -1335,6 +1348,15 @@ pub enum SynthSpec {
         alt_m: f64,
         vel_v: f64,
         frames: u32,
+    },
+    /// `repeat` FLEX frames back to back ([`crate::flex_frame`]), each paging the short
+    /// address `capcode` with the alphanumeric `text`: 2-FSK at `baud` (1600 only in this
+    /// wave) and 4800 Hz deviation over NBFM.
+    Flex {
+        capcode: u32,
+        text: String,
+        baud: u32,
+        repeat: u32,
     },
     /// AIS: per repeat a type 1 position report (`mmsi`, the position, `sog_kt`,
     /// `cog_deg`; [`crate::ais_msg::position_report_bits`]) and, with `name`, a type 5
@@ -1619,13 +1641,38 @@ impl SynthSpec {
                     return Err(format!("gap_ms: 0..={BURST_GAP_MAX_MS}"));
                 }
             }
+            SynthSpec::Flex {
+                capcode,
+                text,
+                baud,
+                repeat,
+            } => {
+                use crate::flex_frame::{CAPCODE_MAX, CAPCODE_MIN, TEXT_MAX};
+                if *baud != FLEX_BAUD {
+                    return Err(format!("baud: this wave synthesises {FLEX_BAUD} bps"));
+                }
+                if !(CAPCODE_MIN..=CAPCODE_MAX).contains(capcode) {
+                    return Err(format!(
+                        "capcode: {CAPCODE_MIN}..={CAPCODE_MAX} (a short address)"
+                    ));
+                }
+                if text.len() > TEXT_MAX || !text.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+                {
+                    return Err(format!(
+                        "text: at most {TEXT_MAX} characters of printable ASCII"
+                    ));
+                }
+                if !(1..=FLEX_REPEAT_MAX).contains(repeat) {
+                    return Err(format!("repeat: 1..={FLEX_REPEAT_MAX}"));
+                }
+            }
             SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
         }
         Ok(())
     }
 
     /// The sample rate the family's capture is synthesised at: the one each decoder is
-    /// proven at (APRS, POCSAG, ACARS and AIS at 48 kHz, which the `channel` stage divides
+    /// proven at (APRS, POCSAG, ACARS, AIS and FLEX at 48 kHz, which the `channel` stage divides
     /// down; RDS at 240 kHz; Mode S at 2.4 MHz; a bare NBFM tone at 48 kHz).
     pub fn rate_hz(&self) -> u32 {
         match self {
@@ -1636,6 +1683,7 @@ impl SynthSpec {
             | SynthSpec::Rs41 { .. }
             | SynthSpec::Dfm { .. }
             | SynthSpec::M20 { .. }
+            | SynthSpec::Flex { .. }
             | SynthSpec::Ais { .. } => 48_000,
             SynthSpec::Fsk {
                 symbol_rate_baud, ..
@@ -1813,6 +1861,16 @@ pub fn synthesise(
             frames,
         } => {
             let mut iq = m20_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Flex {
+            capcode,
+            text,
+            repeat,
+            ..
+        } => {
+            let mut iq = flex_iq(*capcode, text, *repeat, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -2460,5 +2518,77 @@ mod tests {
         );
         let st = msgs.iter().find(|m| m.msg_type == 5).expect("a type 5");
         assert_eq!(st.name.as_deref(), Some("ZETA TEST"));
+    }
+
+    fn flex_json() -> serde_json::Value {
+        serde_json::json!({
+            "family": "flex", "capcode": 1234567, "text": "HELLO ZETA", "baud": 1600, "repeat": 2
+        })
+    }
+
+    #[test]
+    fn flex_family_refuses_other_rates() {
+        let parse = |v: serde_json::Value| parse_params(v.as_object().unwrap().clone());
+        let bad = |key: &str, val: serde_json::Value| {
+            let mut v = flex_json();
+            v[key] = val;
+            parse(v).unwrap_err()
+        };
+        for baud in [3200, 6400, 1200] {
+            assert_eq!(
+                bad("baud", baud.into()),
+                "baud: this wave synthesises 1600 bps"
+            );
+        }
+        assert_eq!(
+            bad("capcode", 0.into()),
+            "capcode: 1..=1933312 (a short address)"
+        );
+        assert_eq!(
+            bad("capcode", 1_933_313.into()),
+            "capcode: 1..=1933312 (a short address)"
+        );
+        let text_err = "text: at most 251 characters of printable ASCII";
+        assert_eq!(bad("text", "x".repeat(252).into()), text_err);
+        assert_eq!(bad("text", "caf\u{e9}".into()), text_err);
+        assert_eq!(bad("text", "a\nb".into()), text_err);
+        assert!(
+            parse({
+                let mut v = flex_json();
+                v["text"] = "x".repeat(251).into();
+                v
+            })
+            .is_ok()
+        );
+        assert_eq!(bad("repeat", 0.into()), "repeat: 1..=10");
+        assert_eq!(bad("repeat", 11.into()), "repeat: 1..=10");
+    }
+
+    #[test]
+    fn flex_family_is_48_khz_and_frames_back_to_back() {
+        let (spec, imp) = parse_params(flex_json().as_object().unwrap().clone()).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        let iq = synthesise(&spec, &imp, 48_000, 152_000_000);
+        // Two 1.875 s frames, the carrier never stopping.
+        assert_eq!(iq.len(), 2 * 90_000);
+        assert!(iq.iter().all(|s| (s.norm() - 1.0).abs() < 1e-3));
+        // 2-FSK: the tones sit at the deviation either side.
+        let n = 1 << 16;
+        let (p, bin) = spectrum(&iq, 48_000, n);
+        let (neg, pos) = (peak_hz(&p, bin, 0, n / 2), peak_hz(&p, bin, n / 2, n));
+        assert!((pos - FLEX_DEVIATION_HZ).abs() <= 2.0 * bin, "{pos}");
+        assert!((neg + FLEX_DEVIATION_HZ).abs() <= 2.0 * bin, "{neg}");
+    }
+
+    #[test]
+    fn pocsag_words_come_from_the_shared_bch_encoder() {
+        // The POCSAG encoder's address word is the shared BCH(31,21) word.
+        let bits = pocsag_encode(&[(8, 3, "")], 1200);
+        let word = |n: usize| {
+            bits[576 + 32 * n..576 + 32 * (n + 1)]
+                .iter()
+                .fold(0u32, |a, &b| (a << 1) | b as u32)
+        };
+        assert_eq!(word(1), crate::bch::bch3121_word((1 << 2) | 3));
     }
 }
