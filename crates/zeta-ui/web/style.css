@@ -217,6 +217,9 @@ html[data-main="map"] #waterfall { visibility: hidden; }
 #map .map-source { width: auto; height: auto; white-space: nowrap; padding: 0 3px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); border: 1px solid var(--map-sel); }
 #map .leaflet-popup-content .map-origin + .map-origin, #map .leaflet-popup-content .map-lookup { margin-top: 6px; }
 #map .leaflet-popup-content .map-lookup { color: var(--map-dim); font-size: 11px; }
+/* map.js osm-dark: OpenStreetMap's tiles darkened on that tile layer's container alone, so the
+   markers, tracks and labels in the other panes keep their colours. */
+#map .leaflet-tile-pane > .map-tiles-dark { filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.9); }
 /* map.js: tiles that do not load say so, bottom left over the map, above the attribution. */
 #map .map-tile-note { position: absolute; z-index: 1000; bottom: 24px; left: 8px; max-width: 60%; padding: 2px 6px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); pointer-events: none; }
 /* The layers control's toggle: Leaflet's images/layers.png is not vendored, so a drawn stack. */

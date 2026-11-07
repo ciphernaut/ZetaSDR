@@ -295,8 +295,8 @@ async fn ui_files_carry_a_content_security_policy() {
             .unwrap_or_else(|| panic!("no img-src: {csp}"));
         assert_eq!(
             img,
-            "img-src 'self' data: https://tile.openstreetmap.org https://*.basemaps.cartocdn.com \
-             https://*.tile.opentopomap.org https://server.arcgisonline.com",
+            "img-src 'self' data: https://tile.openstreetmap.org https://*.tile.opentopomap.org \
+             https://server.arcgisonline.com",
             "{csp}"
         );
         // The tile hosts refuse a request without the page's origin as its Referer.

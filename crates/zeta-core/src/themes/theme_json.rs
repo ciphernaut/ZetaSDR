@@ -55,8 +55,8 @@ pub struct Layout {
     #[serde(default)]
     pub dock: Option<Dock>,
     /// The map's tile provider while the view's `map_tiles` is `auto`, one of [`MAP_TILES`].
-    /// Optional; absent (served as `null`), the page picks by `color_scheme`: CARTO Dark
-    /// Matter for a dark theme, OpenStreetMap for a light one.
+    /// Optional; absent (served as `null`), the page picks by `color_scheme`: `osm-dark`
+    /// (OpenStreetMap under a dark filter) for a dark theme, `osm` for a light one.
     #[serde(default)]
     pub map_tiles: Option<String>,
 }
@@ -73,13 +73,7 @@ pub enum Dock {
 const DOCKS: [&str; 2] = ["bottom", "right"];
 
 /// The ids `layout.map_tiles` takes: the page's tile providers (map.js TILE_PROVIDERS).
-pub const MAP_TILES: [&str; 5] = [
-    "osm",
-    "carto-light",
-    "carto-dark",
-    "opentopo",
-    "esri-imagery",
-];
+pub const MAP_TILES: [&str; 5] = ["osm", "osm-dark", "opentopo", "esri-street", "esri-imagery"];
 
 /// A font file in the theme's folder, declared as an `@font-face` under the theme.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -404,16 +398,30 @@ mod tests {
             let t = load(&edited(|v| v["layout"]["map_tiles"] = id.into())).unwrap();
             assert_eq!(t.layout.map_tiles.as_deref(), Some(id));
         }
-        let t = load(&edited(|v| v["layout"]["map_tiles"] = "carto-dark".into())).unwrap();
+        let t = load(&edited(|v| v["layout"]["map_tiles"] = "osm-dark".into())).unwrap();
         let served = serde_json::to_value(&t.layout).unwrap();
-        assert_eq!(served["map_tiles"], "carto-dark", "{served}");
+        assert_eq!(served["map_tiles"], "osm-dark", "{served}");
+    }
+
+    /// Only keyless providers: CARTO's servers answer every tile with an "API KEY REQUIRED"
+    /// placeholder, so a theme naming one is refused.
+    #[test]
+    fn layout_map_tiles_are_the_keyless_providers() {
+        assert_eq!(
+            MAP_TILES,
+            ["osm", "osm-dark", "opentopo", "esri-street", "esri-imagery"]
+        );
+        for gone in ["carto-light", "carto-dark"] {
+            let e = refused(&edited(|v| v["layout"]["map_tiles"] = gone.into()));
+            assert_eq!(e.field, "layout.map_tiles", "{e}");
+        }
     }
 
     #[test]
     fn layout_map_tiles_not_a_provider_is_refused_naming_the_field() {
         let e = refused(&edited(|v| v["layout"]["map_tiles"] = "google".into()));
         assert_eq!(e.field, "layout.map_tiles", "{e}");
-        assert!(e.error.contains("carto-dark"), "{e}");
+        assert!(e.error.contains("osm-dark"), "{e}");
         let e = refused(&edited(|v| v["layout"]["map_tiles"] = "auto".into()));
         assert_eq!(e.field, "layout.map_tiles", "{e}");
         let e = refused(&edited(|v| v["layout"]["map_tiles"] = 1.into()));

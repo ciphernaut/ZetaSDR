@@ -4551,7 +4551,7 @@ def scenario_audio_comes_back_from_a_suspended_context(page, url, secret):
 # map must still draw.
 
 TILE_HOSTS = re.compile(
-    r"^https://([a-z0-9-]+\.)?(tile\.openstreetmap\.org|basemaps\.cartocdn\.com"
+    r"^https://([a-z0-9-]+\.)?(tile\.openstreetmap\.org"
     r"|tile\.opentopomap\.org|server\.arcgisonline\.com)/")
 
 
@@ -4625,17 +4625,17 @@ def scenario_map_marker_draws_without_tiles(page, url, secret):
 TILE_TABLE = {
     "osm": ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
             "© OpenStreetMap contributors"),
-    "carto-dark": ("CARTO Dark Matter",
-                   "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-                   "© OpenStreetMap contributors © CARTO"),
+    "osm-dark": ("OpenStreetMap dark", "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                 "© OpenStreetMap contributors"),
     "opentopo": ("OpenTopoMap", "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
                  "© OpenStreetMap contributors, SRTM | © OpenTopoMap (CC-BY-SA)"),
 }
 
 
 def scenario_map_tiles(page, url, secret):
-    """Plan 32 Task 11b: the tile layer follows the view's `map_tiles` (auto: CARTO Dark Matter
-    under the dark console theme), the layers control sets it, and tiles that fail say so."""
+    """Plan 32 Task 11b: the tile layer follows the view's `map_tiles` (auto: OpenStreetMap
+    darkened by a filter on its tile layer alone under the dark console theme), the layers
+    control sets it, and tiles that fail say so."""
     page.route(TILE_HOSTS, lambda r: r.abort())
     errors = page_errors(page)
     select_source(page, url, secret, "tone")
@@ -4657,16 +4657,35 @@ def scenario_map_tiles(page, url, secret):
                                      "(view set map_tiles ")
         return note
 
+    def filters():
+        # The tile layer's CSS filter, and those of the panes that must stay unfiltered.
+        return page.evaluate("""() => {
+          const f = (sel) => {
+            const el = document.querySelector('#map ' + sel);
+            return el ? getComputedStyle(el).filter : null;
+          };
+          return {layer: f('.leaflet-tile-pane > .leaflet-layer'), tilePane: f('.leaflet-tile-pane'),
+                  overlay: f('.leaflet-overlay-pane'), marker: f('.leaflet-marker-pane'),
+                  tooltip: f('.leaflet-tooltip-pane'), map: f('')};
+        }""")
+
     try:
         run_cmd(page, "view set main map")
         expect(mp).to_be_visible(timeout=5_000)
-        expect_layer("carto-dark")
+        note = expect_layer("osm-dark")
+        # The same tiles as osm, so the note offers a provider on another server.
+        assert "view set map_tiles osm)" not in note.text_content(), note.text_content()
         expect(mp.locator(".leaflet-control-attribution")).to_contain_text(
-            "© OpenStreetMap contributors © CARTO")
+            "© OpenStreetMap contributors")
+        got = filters()
+        assert "invert" in (got["layer"] or ""), got
+        for pane in ("tilePane", "overlay", "marker", "tooltip", "map"):
+            assert got[pane] == "none", got
         run_cmd(page, "view set map_tiles osm")
         expect(view_line(page, "map_tiles = osm")).to_be_visible(timeout=2_000)
         note = expect_layer("osm")
         assert "view set map_tiles osm)" not in note.text_content(), note.text_content()
+        assert filters()["layer"] == "none", filters()
         # The layers control lists the providers by label; choosing one sets the policy.
         ctl = mp.locator(".leaflet-control-layers")
         ctl.hover(timeout=2_000)
@@ -4678,14 +4697,14 @@ def scenario_map_tiles(page, url, secret):
         assert "map_tiles opentopo" in shown, shown
         run_cmd(page, "view set map_tiles sideways")
         expect(view_line(page, "sideways", error=True)).to_contain_text(
-            "auto, osm, carto-light, carto-dark, opentopo, esri-imagery", timeout=2_000)
+            "auto, osm, osm-dark, opentopo, esri-street, esri-imagery", timeout=2_000)
         run_cmd(page, "view reset")
         expect(view_line(page, "view policies reset")).to_be_visible(timeout=2_000)
         shown = view_show(page)
         assert "map_tiles auto" in shown, shown
         run_cmd(page, "view set main map")
         page.wait_for_function(
-            "() => window.zetaTest.tileLayer()?.id === 'carto-dark'", timeout=5_000)
+            "() => window.zetaTest.tileLayer()?.id === 'osm-dark'", timeout=5_000)
         # Ruling M: `auto` under a light theme (vibecoder, color_scheme light) is OpenStreetMap.
         run_cmd(page, "view set theme vibecoder")
         expect(page.locator("html")).to_have_attribute("data-map-tiles", "osm", timeout=5_000)

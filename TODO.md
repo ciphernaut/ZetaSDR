@@ -524,7 +524,7 @@ Plan 32 (origins from the register lit on a Map tab, the dock, a Kiwi's position
 - Demotion rules for one-transmitter services (a broadcaster with one licence on one site scores like any fit): a service-aware term in the origin score.
 - The Explore table's licensee column still reads `allocations` (the nearest transmitter), not `origins` (the best-scored site), so the two can name different licensees for one capture.
 - The CALL_SIGN probe never resets: a register upgraded to a build with the column needs a node restart before callsigns appear.
-- The tile notice goes quiet after a partial failure, and a provider that serves blank tiles raises none.
+- The tile notice goes quiet after a partial failure, and a provider that serves blank tiles raises none: a server answering 200 with a placeholder image (CARTO's ~2 KB "API KEY REQUIRED" tile, seen on the field host 2026-11-08, which is why CARTO was dropped) is a `tileload`, not a `tileerror`, and `naturalWidth` is 256 either way. A check would sample a loaded tile's pixels (a canvas read, which needs CORS-enabled tiles) or its byte size (a fetch, outside `img-src`).
 - The console theme's kept tab is only un-dimmed, not restyled as the other themes do.
 - The dock-head Subjects count is the store count (every subject held), not the rows the table shows after its filters.
 - The RF thumbnail (spec 4.12, Task 12, dropped because the e2e suite ran about 570 s against its 690 s deadline): a small live RF view in the map's corner (`RF_THUMB_W` 240 x `RF_THUMB_H` 120, `RF_THUMB_FPS` 2) drawn from the source's spectrum feed, a click returning to the RF view. It wants its own scenario and a timer, so it waits for a faster suite or a deadline change.

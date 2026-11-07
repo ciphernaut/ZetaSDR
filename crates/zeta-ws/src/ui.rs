@@ -38,9 +38,8 @@ async fn file(Path(path): Path<String>) -> Response {
 
 /// The map's tile servers (map.js TILE_PROVIDERS; a test checks the two agree): the only
 /// outside origins, for images only.
-const TILE_HOSTS: [&str; 4] = [
+const TILE_HOSTS: [&str; 3] = [
     "https://tile.openstreetmap.org",
-    "https://*.basemaps.cartocdn.com",
     "https://*.tile.opentopomap.org",
     "https://server.arcgisonline.com",
 ];

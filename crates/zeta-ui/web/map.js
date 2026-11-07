@@ -6,12 +6,16 @@
 //   SUBJECT_TRACK_POINTS   the points of a subject's track when its row names no
 //                  `subject.track_points`
 //   TILE_PROVIDERS   the map's tile layers, keyless all: [{id, label, url, attribution,
-//                  maxZoom, subdomains}], ids osm, carto-light, carto-dark, opentopo,
-//                  esri-imagery (the view's `map_tiles` values besides auto; zeta-ws ui.rs
-//                  lists their hosts in the CSP's img-src, and zeta-core's theme_json their
-//                  ids for `layout.map_tiles`)
+//                  maxZoom, subdomains, className}], ids osm, osm-dark, opentopo,
+//                  esri-street, esri-imagery (the view's `map_tiles` values besides auto;
+//                  zeta-ws ui.rs lists their hosts in the CSP's img-src, and zeta-core's
+//                  theme_json their ids for `layout.map_tiles`). osm-dark is osm's tiles
+//                  with a CSS filter on that tile layer's container alone (style.css
+//                  `.map-tiles-dark`), so markers, tracks and labels keep their colours.
+//                  CARTO's basemaps are gone: they now answer every tile with an "API KEY
+//                  REQUIRED" image.
 //   resolveMapTiles(value, theme) -> id   the provider the view's `map_tiles` names: `auto`
-//       is the theme's `layout.map_tiles` when it names one, else carto-dark for a theme
+//       is the theme's `layout.map_tiles` when it names one, else osm-dark for a theme
 //       whose `color_scheme` is dark (or not known yet: the default console is dark) and
 //       osm for a light one
 //   distanceBearing(home, pos) -> {km, deg}
@@ -88,7 +92,9 @@
 //   the view's `map_tiles` (view.set), and the change swaps the layer. A layer's first
 //   `tileerror` shows `div.map-tile-note` on the map, once per provider per load: `map tiles
 //   from <label> are not loading; try another (view set map_tiles <id>)`, naming a provider
-//   not failed yet; a later `tileload` from that provider, or a swap, hides it.
+//   not failed yet on another tile server (osm and osm-dark share one); a later `tileload`
+//   from that provider, or a swap, hides it. A server that answers 200 with a placeholder
+//   image raises no note (TODO.md).
 //   Drawn, once Leaflet is in: one L.circleMarker (class `map-pos`) at each job's newest fix,
 //   whose popup is the last event's `summary` and its age (`12 s ago`, from when this page
 //   received it), and one non-interactive L.polyline (class `map-track`) through its fixes;
@@ -141,20 +147,13 @@ export const TILE_PROVIDERS = [
     subdomains: "",
   },
   {
-    id: "carto-light",
-    label: "CARTO Positron",
-    url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-    attribution: `${OSM} © CARTO`,
-    maxZoom: 20,
-    subdomains: "abcd",
-  },
-  {
-    id: "carto-dark",
-    label: "CARTO Dark Matter",
-    url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-    attribution: `${OSM} © CARTO`,
-    maxZoom: 20,
-    subdomains: "abcd",
+    id: "osm-dark",
+    label: "OpenStreetMap dark",
+    url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    attribution: OSM,
+    maxZoom: 19,
+    subdomains: "",
+    className: "map-tiles-dark",
   },
   {
     id: "opentopo",
@@ -163,6 +162,14 @@ export const TILE_PROVIDERS = [
     attribution: `${OSM}, SRTM | © OpenTopoMap (CC-BY-SA)`,
     maxZoom: 17,
     subdomains: "abc",
+  },
+  {
+    id: "esri-street",
+    label: "Esri World Street Map",
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+    attribution: "Tiles © Esri — Source: Esri, HERE, Garmin, USGS, NGA, and other contributors",
+    maxZoom: 19,
+    subdomains: "",
   },
   {
     id: "esri-imagery",
@@ -176,7 +183,7 @@ export const TILE_PROVIDERS = [
 ];
 const providerOf = (id) => TILE_PROVIDERS.find((p) => p.id === id);
 // `auto` under a theme that names no provider: by its colour scheme.
-const DARK_TILES = "carto-dark";
+const DARK_TILES = "osm-dark";
 const LIGHT_TILES = "osm";
 
 export function resolveMapTiles(value, theme) {
@@ -480,6 +487,7 @@ class MapPane {
         attribution: p.attribution,
         maxZoom: p.maxZoom,
         ...(p.subdomains ? { subdomains: p.subdomains } : {}),
+        ...(p.className ? { className: p.className } : {}),
       });
       layer.on("tileerror", () => this.tileError(p));
       layer.on("tileload", () => this.tileLoaded(p));
@@ -537,9 +545,9 @@ class MapPane {
   tileError(p) {
     if (this.destroyed || p.id !== this.tileId || this.tileFailed.has(p.id)) return;
     this.tileFailed.add(p.id);
-    const next =
-      TILE_PROVIDERS.find((x) => x.id !== p.id && !this.tileFailed.has(x.id)) ??
-      TILE_PROVIDERS.find((x) => x.id !== p.id);
+    // Another server: osm and osm-dark fetch the same tiles.
+    const elsewhere = TILE_PROVIDERS.filter((x) => x.url !== p.url);
+    const next = elsewhere.find((x) => !this.tileFailed.has(x.id)) ?? elsewhere[0];
     this.hideTileNote();
     this.tileNote = document.createElement("div");
     this.tileNote.className = "map-tile-note";
