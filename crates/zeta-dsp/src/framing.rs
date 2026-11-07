@@ -32,14 +32,18 @@ const PN9_POLY: u32 = 0x221;
 /// TI's PN9 seed.
 const PN9_SEED: u32 = 0x1FF;
 
-/// How bits are put on the line: `nrz` as is; `nrzi` a 1 where the line bit differs
-/// from the previous one; `manchester` `10` a 1 and `01` a 0, two line bits per bit;
-/// `differential` the XOR of the line bit with the previous one.
+/// How bits are put on the line: `nrz` as is; `nrzi` NRZ-S, the HDLC/AX.25
+/// convention (a 1 where the line bit equals the previous one, a 0 on a transition);
+/// `manchester` `10` a 1 and `01` a 0, two line bits per bit; `differential` the XOR
+/// of the line bit with the previous one (a 1 on a transition).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LineCode {
     #[default]
     Nrz,
+    // NRZ-S, the HDLC/AX.25 convention: a 1 where the line bit equals the previous
+    // one, a 0 on a transition. (Said in the enum's doc, the schema's description: a
+    // doc comment here would make the schema a `oneOf` that AGENTS.md shows as `any`.)
     Nrzi,
     Manchester,
     Differential,
@@ -100,7 +104,10 @@ impl Word {
     }
 }
 
-/// The whitening XORed over the bits after the sync.
+/// The whitening XORed over the frame after the sync, byte-wise as TI's CC1101 does
+/// it: each frame byte (as the row sees it, before `bit_order` on the line) is XORed
+/// with the register's low 8 bits, then the register advances 8 bits; restarted at
+/// each frame.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "WhiteningWire", into = "WhiteningWire")]
 #[schemars(with = "WhiteningWire")]
@@ -160,9 +167,10 @@ impl From<Whitening> for WhiteningWire {
     }
 }
 
-/// The first `n` bits of `w`'s sequence (all 0 for `none`): the register's LSB, then
-/// one shift, the parity of the tapped bits entering at the top.
-pub fn whitening_bits(w: &Whitening, n: usize) -> Vec<u8> {
+/// The first `n` bytes of `w`'s sequence (all 0 for `none`): each the register's low
+/// 8 bits, after which the register advances 8 bits (each shift right, the parity of
+/// the tapped bits entering at the top).
+pub fn whitening_bytes(w: &Whitening, n: usize) -> Vec<u8> {
     let (poly, seed) = match *w {
         Whitening::None => return vec![0; n],
         Whitening::Pn9 => (PN9_POLY, PN9_SEED),
@@ -179,9 +187,11 @@ pub fn whitening_bits(w: &Whitening, n: usize) -> Vec<u8> {
     let mut reg = seed & mask;
     (0..n)
         .map(|_| {
-            let out = (reg & 1) as u8;
-            let fb = (reg & taps).count_ones() & 1;
-            reg = (reg >> 1) | if fb == 1 { 1 << (width - 1) } else { 0 };
+            let out = (reg & 0xFF) as u8;
+            for _ in 0..BYTE_BITS {
+                let fb = (reg & taps).count_ones() & 1;
+                reg = (reg >> 1) | (fb << (width - 1));
+            }
             out
         })
         .collect()
@@ -199,7 +209,7 @@ pub struct LengthField {
     /// The field's bytes most significant first; else least significant first.
     pub big_endian: bool,
     pub unit: LengthUnit,
-    /// Added to the value, in `unit`s: the frame's bits after the sync are
+    /// Added to the field's value, in `unit`s: the frame's bits after the sync are
     /// `(value + add) × unit`.
     pub add: i64,
 }
@@ -304,8 +314,8 @@ pub struct DecodedFrame {
     /// The sync's first line bit in the input.
     pub at_bit: usize,
     pub sync_errors: u32,
-    /// The frame after the sync, the CRC field included, unwhitened and packed by
-    /// `bit_order`.
+    /// The frame after the sync, the CRC field included, packed by `bit_order` and
+    /// unwhitened.
     pub bytes: Vec<u8>,
     /// `None` without a CRC.
     pub crc_ok: Option<bool>,
@@ -364,12 +374,13 @@ fn unpack(bytes: &[u8], order: BitOrder) -> Vec<u8> {
         .collect()
 }
 
-fn xor_whitening(bits: &mut [u8], w: &Whitening) {
+/// XOR `w`'s sequence over a frame's `bytes` (its own inverse).
+fn whiten(bytes: &mut [u8], w: &Whitening) {
     if *w == Whitening::None {
         return;
     }
-    let seq = whitening_bits(w, bits.len());
-    for (b, p) in bits.iter_mut().zip(seq) {
+    let seq = whitening_bytes(w, bytes.len());
+    for (b, p) in bytes.iter_mut().zip(seq) {
         *b ^= p;
     }
 }
@@ -463,11 +474,13 @@ fn line_decode(bits: &[u8], code: LineCode) -> Vec<Vec<u8>> {
     match code {
         LineCode::Nrz => vec![bits.to_vec()],
         LineCode::Nrzi | LineCode::Differential => {
+            // NRZ-S: a 1 where the line holds; differential: a 1 where it changes.
+            let hold = u8::from(code == LineCode::Nrzi);
             let mut prev = 0u8;
             vec![
                 bits.iter()
                     .map(|&b| {
-                        let d = b ^ prev;
+                        let d = b ^ prev ^ hold;
                         prev = b;
                         d
                     })
@@ -511,9 +524,8 @@ pub(crate) fn decode(bits: &[u8], f: &Framing) -> Decoded {
         Some(errors)
     };
     let cut = |d: &[u8], at: usize, errors: u32, b0: usize, nb: usize| -> DecodedFrame {
-        let mut body = d[b0..b0 + nb].to_vec();
-        xor_whitening(&mut body, &f.whitening);
-        let bytes = pack(&body, f.bit_order);
+        let mut bytes = pack(&d[b0..b0 + nb], f.bit_order);
+        whiten(&mut bytes, &f.whitening);
         DecodedFrame {
             at_bit: at,
             sync_errors: errors,
@@ -557,9 +569,9 @@ pub(crate) fn decode(bits: &[u8], f: &Framing) -> Decoded {
                     r += s * sb;
                     continue;
                 }
-                let mut head = d[b0..b0 + need].to_vec();
-                xor_whitening(&mut head, &f.whitening);
-                let v = read_field(&pack(&head, f.bit_order), field) as i64;
+                let mut head = pack(&d[b0..b0 + need], f.bit_order);
+                whiten(&mut head, &f.whitening);
+                let v = read_field(&head, field) as i64;
                 v.saturating_add(field.add)
                     .saturating_mul(field.unit.bits())
             }
@@ -619,8 +631,8 @@ pub fn decode_frames(bits: &[u8], f: &Framing) -> (Vec<DecodedFrame>, usize) {
 
 /// The line bits of `bodies` framed by `f`, the inverse of [`decode_frames`]: per
 /// frame the preamble, the sync, then the body with a `field` length written into it
-/// (the body must reach the field's end) and the CRC appended when given, whitened and
-/// ordered by `bit_order`; the line code is encoded over everything (Manchester
+/// (the body must reach the field's end) and the CRC appended when given, the bytes
+/// whitened, then ordered by `bit_order`; the line code is encoded over everything (Manchester
 /// doubles the bits).
 pub fn encode_frames(bodies: &[Vec<u8>], f: &Framing) -> Vec<u8> {
     let crc = f
@@ -655,19 +667,19 @@ pub fn encode_frames(bodies: &[Vec<u8>], f: &Framing) -> Vec<u8> {
             let field = crc_field(def, crc_def(def, &bytes));
             bytes.extend(field);
         }
-        let mut body_bits = unpack(&bytes, f.bit_order);
-        xor_whitening(&mut body_bits, &f.whitening);
+        whiten(&mut bytes, &f.whitening);
         bits.extend_from_slice(&pre);
         bits.extend_from_slice(&sync);
-        bits.extend(body_bits);
+        bits.extend(unpack(&bytes, f.bit_order));
     }
     match f.encoding {
         LineCode::Nrz => bits,
         LineCode::Nrzi | LineCode::Differential => {
+            let hold = u8::from(f.encoding == LineCode::Nrzi);
             let mut prev = 0u8;
             bits.iter()
                 .map(|&d| {
-                    prev ^= d;
+                    prev ^= d ^ hold;
                     prev
                 })
                 .collect()
@@ -778,6 +790,23 @@ mod tests {
             assert_eq!(frames[0].at_bit, 1, "{enc:?}");
             assert_eq!(frames[1].at_bit, 1 + scale * 288, "{enc:?}");
         }
+        // NRZ-S holds the line for a 1; differential changes it for a 1.
+        assert_eq!(
+            line_decode(&[0, 0, 1, 1], LineCode::Nrzi),
+            [vec![1, 1, 0, 1]]
+        );
+        assert_eq!(
+            line_decode(&[0, 0, 1, 1], LineCode::Differential),
+            [vec![0, 0, 1, 0]]
+        );
+        let bs = bodies(10, 32, 1);
+        let mut f = fx("2dd4", 16, Length::Fixed { fixed_bits: 272 });
+        f.encoding = LineCode::Nrzi;
+        let nrzi = encode_frames(&bs, &f);
+        f.encoding = LineCode::Differential;
+        let differential = encode_frames(&bs, &f);
+        assert_ne!(nrzi, differential);
+        assert!(decode_frames(&nrzi, &f).0.is_empty());
     }
 
     #[test]
@@ -815,40 +844,65 @@ mod tests {
 
     #[test]
     fn pn9_matches_the_published_sequence() {
-        // The serial output, packed with its first bit as each byte's LSB (TI's
-        // convention: the whitening byte is the register's low 8 bits).
-        let seq = whitening_bits(&Whitening::Pn9, 64);
-        let packed: Vec<u8> = seq
-            .chunks(8)
-            .map(|c| c.iter().enumerate().fold(0, |a, (i, &b)| a | (b << i)))
-            .collect();
-        assert_eq!(packed, TI_PN9);
-        // The same through the decoder: zero bits after the sync come out as the
-        // sequence, LSB-first bytes with bit_order lsb and reversed bytes with msb.
+        // Byte-wise, TI's way: the register's low 8 bits, then 8 shifts.
+        assert_eq!(whitening_bytes(&Whitening::Pn9, 8), TI_PN9);
+        // Through the decoder, msb (the default): zero bits after the sync come out
+        // as the sequence's bytes, whatever the bit order.
         let mut f = fx("2dd4", 16, Length::Fixed { fixed_bits: 64 });
         f.crc = None;
         f.whitening = Whitening::Pn9;
-        f.bit_order = BitOrder::Lsb;
         let mut raw = crate::slicer::bits_from_hex("2dd4", 16);
         raw.extend([0u8; 64]);
         let (frames, _) = decode_frames(&raw, &f);
         assert_eq!(frames[0].bytes, TI_PN9);
         assert_eq!(frames[0].crc_ok, None);
-        f.bit_order = BitOrder::Msb;
-        let (frames, _) = decode_frames(&raw, &f);
-        let reversed: Vec<u8> = TI_PN9.iter().map(|b| b.reverse_bits()).collect();
-        assert_eq!(frames[0].bytes, reversed);
-        // Whitening round-trips.
+        f.bit_order = BitOrder::Lsb;
+        assert_eq!(decode_frames(&raw, &f).0[0].bytes, TI_PN9);
+        // A CC1101 stream (bytes XORed with the sequence, sent MSB first) decodes
+        // with pn9 and msb.
         let bs = bodies(4, 30, 5);
         let mut f = fx("2dd4", 16, Length::Fixed { fixed_bits: 256 });
         f.whitening = Whitening::Pn9;
-        assert_round_trip(&encode_frames(&bs, &f), &f, &bs);
+        let mut cc1101 = Vec::new();
+        for b in &bs {
+            let mut bytes = b.clone();
+            let crc = crate::crc::crc(&crate::crc::CRC16_CCITT, &bytes) as u16;
+            bytes.extend(crc.to_be_bytes());
+            let pn = whitening_bytes(&Whitening::Pn9, bytes.len());
+            cc1101.extend(crate::slicer::bits_from_hex("2dd4", 16));
+            for (x, p) in bytes.iter().zip(pn) {
+                cc1101.extend((0..8).rev().map(|i| ((x ^ p) >> i) & 1));
+            }
+        }
+        assert_eq!(encode_frames(&bs, &f), cc1101);
+        assert_round_trip(&cc1101, &f, &bs);
         f.whitening = Whitening::Lfsr {
             poly: 0x221,
             seed: 0x1FF,
         };
-        assert_eq!(whitening_bits(&f.whitening, 64), seq);
+        assert_eq!(whitening_bytes(&f.whitening, 8), TI_PN9);
         assert_round_trip(&encode_frames(&bs, &f), &f, &bs);
+        // A whitened length field is read after unwhitening.
+        let mut f = fx(
+            "2dd4",
+            16,
+            Length::Field {
+                field: LengthField {
+                    offset_bits: 0,
+                    bits: 8,
+                    big_endian: true,
+                    unit: LengthUnit::Bytes,
+                    add: 3,
+                },
+            },
+        );
+        f.whitening = Whitening::Pn9;
+        let mut bs = bodies_of(&[9, 30, 17], 6);
+        let raw = encode_frames(&bs, &f);
+        for b in &mut bs {
+            b[0] = (b.len() - 1) as u8;
+        }
+        assert_round_trip(&raw, &f, &bs);
     }
 
     #[test]
