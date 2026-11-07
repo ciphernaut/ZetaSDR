@@ -204,9 +204,10 @@ html[data-main="map"] #waterfall { visibility: hidden; }
 #map .map-subject.selected .arrow.dot { background: var(--map-sel); }
 #map .map-subject.selected .label { box-shadow: 0 0 0 1px var(--map-sel); }
 #map path.map-home { stroke: var(--map-sel); fill: var(--map-sel); fill-opacity: 0.6; stroke-width: 2; }
-/* Lit sites (map.js, plan 32): brightness (`--site-brightness`, score × freshness) is the
-   fill's opacity; a site whose designator disagrees is a dashed ring with no fill; bearings
-   run from where the signal was received, as bright as their site. */
+/* Lit sites (map.js, plan 32): a site's brightness (`--site-brightness`, its best score × its
+   set's freshness, set per site) is the fill's opacity; a site whose designator disagrees is a
+   dashed ring with no fill; bearings run from where the signal was received, as bright as
+   their site. */
 #map path.map-site { stroke: var(--user); fill: var(--user); stroke-width: 2; fill-opacity: calc(0.8 * var(--site-brightness, 1)); stroke-opacity: calc(0.3 + 0.7 * var(--site-brightness, 1)); }
 #map path.map-site[data-agree="disagrees"] { fill: none; }
 #map path.map-bearing { stroke: var(--user); stroke-width: 1.5; fill: none; stroke-opacity: calc(0.7 * var(--site-brightness, 1)); }

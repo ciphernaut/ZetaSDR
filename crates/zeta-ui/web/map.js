@@ -53,10 +53,10 @@
 //                               when the set's signal was last active (performance.now() ms);
 //                               `litAt` (default now) when it lit. Sets are kept while the map
 //                               is hidden.
-//     map.tick()                each second (the subjects' tick): brightness = score ×
-//                               freshness, freshness = max(0, 1 − age / view
+//     map.tick()                each second (the subjects' tick): each site's brightness = its
+//                               best score × the set's freshness, freshness = max(0, 1 − age / view
 //                               `origin_fade_s`), age the seconds since the later of `litAt`
-//                               and `activity()`; a set at zero goes
+//                               and `activity()`; a set whose freshness is zero goes
 //     map.seed(jobs)            after each jobs poll: a running job's `context.origins` not
 //                               lit yet (by job id and the answer's `t_ns`) lights, its
 //                               `litAt` the answer's `t_ns` on the page's clock, unless
@@ -89,15 +89,15 @@
 //   store's ticks dims it with its subject, being heard again lights it, and a drop removes it.
 //   A lit set draws one L.circleMarker (class `map-site`, `data-agree` fits|disagrees|unknown
 //   from its best origin, `data-confirmed` when any is confirmed, the CSS custom property
-//   `--site-brightness` 0..1) per distinct position among its origins, taking the best score;
-//   a `disagrees` site is a dashed ring with no fill. One non-interactive L.polyline (class
-//   `map-bearing`, the same brightness) runs from the answer's `from` to each `fits` or
+//   `--site-brightness` 0..1, the site's best score × the set's freshness) per distinct position
+//   among its origins; a `disagrees` site is a dashed ring with no fill. One non-interactive
+//   L.polyline (class `map-bearing`, its site's brightness) runs from the answer's `from` to each `fits` or
 //   `unknown` site while `from` is set; with `from.kind` `source` a non-interactive L.marker
 //   (class `map-source`) labelled with the source id stands at `from`. Its tooltip: licensee /
-//   site / `<emission> (<words>)` / `<score> <agree>` / `<d> km, <bearing>°` (only with a
-//   distance) / `confirmed by <value>`; its popup lists each origin there with those lines,
-//   `licence <no>`, `<power> W`, the measured band and labels, the source, `from <station|
-//   source id>` and `modulation not measured` for an unknown, and no buttons: a click selects
+//   site / `<emission> (<words>)` / `<score> <agree>` / `modulation not measured` (an unknown) /
+//   `<d> km, <bearing>°` (only with a distance) / `confirmed by <value>`; its popup lists each
+//   origin there with those lines, `licence <no>`, `<power> W`, then the measured band and labels,
+//   the source and `from <station|source id>`, and no buttons: a click selects
 //   nothing. While a set's `from_note` is `no station set`, `div.map-note` in the map's corner
 //   says the sites are not cut by reach, once per load. The first lit site centres the map
 //   when nothing else has (no home, no fix).
@@ -276,6 +276,7 @@ function tooltipLines(o) {
     lines.push(words ? `${a.emission} (${words})` : a.emission);
   }
   lines.push(`${Number(o.score).toFixed(2)} ${o.agree}`);
+  if (o.agree === "unknown") lines.push("modulation not measured");
   if (Number.isFinite(a.distance_km)) {
     const b = Number.isFinite(a.bearing_deg) ? `, ${Math.round(a.bearing_deg) % 360}°` : "";
     lines.push(`${a.distance_km.toFixed(1)} km${b}`);
@@ -304,7 +305,6 @@ function sitePopup(site, answer) {
     const lines = tooltipLines(o);
     if (a.licence_no) lines.push(`licence ${a.licence_no}`);
     if (Number.isFinite(a.power_w)) lines.push(`${a.power_w} W`);
-    if (o.agree === "unknown") lines.push("modulation not measured");
     box.append(linesBox(lines, "map-origin"));
   }
   const tail = [];
@@ -421,8 +421,8 @@ class MapPane {
       sites,
       drawn: null,
     };
-    set.brightness = this.freshness(set);
-    if (set.brightness <= 0) {
+    set.fresh = this.freshness(set);
+    if (set.fresh <= 0) {
       this.changed();
       return;
     }
@@ -443,8 +443,8 @@ class MapPane {
     if (this.destroyed) return;
     let gone = false;
     for (const set of [...this.sets.values()]) {
-      set.brightness = this.freshness(set);
-      if (set.brightness <= 0) {
+      set.fresh = this.freshness(set);
+      if (set.fresh <= 0) {
         this.unlight(set.key);
         gone = true;
       } else {
@@ -459,9 +459,9 @@ class MapPane {
     for (const j of jobs || []) {
       if (!j.state || j.state.status !== "running") continue;
       const a = j.context && j.context.origins;
-      if (!a || typeof a !== "object" || this.sets.has(j.id)) continue;
-      if (this.seeded.has(j.id) && this.seeded.get(j.id) === a.t_ns) continue;
-      this.seeded.set(j.id, a.t_ns);
+      // An answer already lit (by its event or an earlier seed) is skipped; a newer one
+      // replaces the job's set.
+      if (!a || typeof a !== "object" || this.seeded.get(j.id) === a.t_ns) continue;
       // The answer's age on the page's clock.
       const ageMs = Number.isFinite(a.t_ns) ? Math.max(0, Date.now() - a.t_ns / 1e6) : 0;
       this.origin(j.id, a, { litAt: performance.now() - ageMs });
@@ -506,17 +506,20 @@ class MapPane {
     if (!this.map || set.drawn) return;
     const L = this.L;
     const from = set.answer.from;
-    const drawn = { markers: [], lines: [], source: null };
+    // markers and lines: every layer drawn; parts: [{score, layers}] for paintSet.
+    const drawn = { markers: [], lines: [], parts: [], source: null };
     for (const site of set.sites) {
       const agree = site.best.agree;
       const at = [site.lat, site.lon];
+      const part = { score: Number(site.best.score) || 0, layers: [] };
+      drawn.parts.push(part);
       if (from && agree !== "disagrees") {
-        drawn.lines.push(
-          L.polyline([[from.lat, from.lon], at], {
-            className: "map-bearing",
-            interactive: false,
-          }).addTo(this.map),
-        );
+        const line = L.polyline([[from.lat, from.lon], at], {
+          className: "map-bearing",
+          interactive: false,
+        }).addTo(this.map);
+        drawn.lines.push(line);
+        part.layers.push(line);
       }
       const m = L.circleMarker(at, {
         radius: SITE_RADIUS,
@@ -532,6 +535,7 @@ class MapPane {
       m.bindTooltip(() => linesBox(tooltipLines(site.best)));
       m.bindPopup(() => sitePopup(site, set.answer));
       drawn.markers.push(m);
+      part.layers.push(m);
     }
     if (from && from.kind === "source" && from.source) {
       const label = document.createElement("span");
@@ -545,12 +549,13 @@ class MapPane {
     this.centre([first.lat, first.lon]);
   }
 
-  // The set's brightness on its markers and lines.
+  // Each site's brightness, its best score × the set's freshness, on its marker and its
+  // bearing.
   paintSet(set) {
     if (!set.drawn) return;
-    const b = String(Math.round(set.brightness * 100) / 100);
-    for (const x of [...set.drawn.markers, ...set.drawn.lines]) {
-      x.getElement()?.style.setProperty("--site-brightness", b);
+    for (const part of set.drawn.parts) {
+      const b = String(Math.round(part.score * set.fresh * 100) / 100);
+      for (const x of part.layers) x.getElement()?.style.setProperty("--site-brightness", b);
     }
   }
 

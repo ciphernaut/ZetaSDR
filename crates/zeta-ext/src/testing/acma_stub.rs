@@ -80,6 +80,9 @@ pub struct Stub {
     pub queries: AtomicUsize,
     /// `execute_sql` calls rejected for naming a missing `CALL_SIGN`.
     pub rejected: AtomicUsize,
+    /// `execute_sql` calls whose SQL named no band the stub could read: answered with every
+    /// row, unfiltered, and said on stderr. A test that relies on the cut asserts it is 0.
+    pub unbanded: AtomicUsize,
 }
 
 fn sse(v: Value) -> Response {
@@ -164,8 +167,12 @@ fn execute_sql(s: &Stub, id: &Value, args: &Value) -> Result<Value, Value> {
     {
         first[1] = Value::Null;
     }
-    if let Some(band) = band_of(sql) {
-        rows.retain(|r| overlaps(r, band));
+    match band_of(sql) {
+        Some(band) => rows.retain(|r| overlaps(r, band)),
+        None => {
+            s.unbanded.fetch_add(1, Ordering::SeqCst);
+            eprintln!("acma_stub: no band in the SQL, every row answered: {sql}");
+        }
     }
     let mut columns: Vec<&str> = COLUMNS.to_vec();
     if older {

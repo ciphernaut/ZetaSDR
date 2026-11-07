@@ -4808,14 +4808,26 @@ def scenario_origins_light_sites(page, url, secret):
     page.set_viewport_size(WIDE)
     # At the tone's centre, the row's own 40 kHz (its `min_hz`; a narrower band is refused).
     job = start_fake_pos(page, url, secret)
+    badge = page.locator("#tabs .map-tab .count")
     try:
+        # Lit while the map was never shown (no Leaflet map yet): the badge counts them and
+        # the map draws them on its first show.
         origins_of(url, secret, job)                       # the node's answer; the page follows the feed
+        expect(badge).to_have_text("2", timeout=10_000)
+        assert page.evaluate("() => window.zetaTest.litKeys()") == [job]
+        # A node annotation, not a decode (ruling N): a transcript line, no ribbon.
+        expect(page.locator("#transcript .line.note", has_text="2 sites on")).to_have_count(1)
+        expect(page.locator("#waterfall .ov-ribbon", has_text="sites on")).to_have_count(0)
         page.locator("#tabs .src-tab.map-tab").click()
         expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
         agree = sorted(a for a, _ in lit_sites(page))
         assert agree == ["disagrees", "fits"], agree
         expect(page.locator("#map path.map-bearing")).to_have_count(1)
-        expect(page.locator("#tabs .map-tab .count")).to_have_text("2")
+        # Brightness is the score times the freshness: the fitting site is the brighter.
+        bright = page.locator("#map path.map-site").evaluate_all(
+            """els => Object.fromEntries(els.map((e) =>
+                 [e.dataset.agree, Number(e.style.getPropertyValue('--site-brightness'))]))""")
+        assert bright["fits"] > bright["disagrees"] > 0, bright
         page.locator('#map path.map-site[data-agree="fits"]').hover()
         tip = page.locator("#map .leaflet-tooltip")
         expect(tip).to_contain_text("Example Water Authority")
@@ -4825,16 +4837,20 @@ def scenario_origins_light_sites(page, url, secret):
         pop = page.locator("#map .leaflet-popup-content")
         expect(pop).to_contain_text("licence 0000001")
         expect(pop.locator("button")).to_have_count(0)
-        expect(page.locator("#transcript .line.note", has_text="2 sites on")).to_have_count(1)
         run_cmd(page, "view set origin_fade_s 2")
         # fake_pos sent its last event 2 s in.
         expect(page.locator("#map path.map-site")).to_have_count(0, timeout=8_000)
-        expect(page.locator("#tabs .map-tab .count")).to_have_text("")
+        expect(badge).to_have_text("")
+        # A long fade again, so what follows is the job's stop and not the fade.
+        run_cmd(page, "view set origin_fade_s 300")
         origins_of(url, secret, job)
         expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
         page.locator('#tabs .src-tab[data-id="tone"]').click()
         stop_job(url, secret, job)
         page.evaluate("() => window.zetaTest.poll()")
+        # Review focus 3: the set goes with the job, at once.
+        page.wait_for_function("() => window.zetaTest.litKeys().length === 0", timeout=3_000)
+        expect(badge).to_have_text("", timeout=1_000)
         page.locator("#tabs .src-tab.map-tab").click()
         expect(page.locator("#map path.map-site")).to_have_count(0)
     finally:

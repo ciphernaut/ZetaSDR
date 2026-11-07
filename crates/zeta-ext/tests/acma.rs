@@ -180,6 +180,8 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
         .unwrap();
     assert_eq!((r.class, r.km), (ReachClass::Uhf, Some(150.0)));
     assert_eq!(r.antenna, "discone");
+    // The stub read the band from the query (its rows were cut by it, not passed whole).
+    assert_eq!(stub.unbanded.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

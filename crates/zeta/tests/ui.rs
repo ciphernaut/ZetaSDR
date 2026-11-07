@@ -399,12 +399,33 @@ const TONE_HZ: u64 = 100_000_000;
 /// it is up.
 const DEMO_STATION: (f64, f64, f64) = (-27.3842, 153.1175, 4.0);
 
+/// The synthetic sites' distances from the demo station: the hill (north-west), the ridge
+/// (east), and the receiver (as far south as east).
+const SITE_HILL_KM: f64 = 9.0;
+const SITE_RIDGE_KM: f64 = 20.0;
+const SITE_RX_KM: f64 = 8.0;
+/// Kilometres per degree of latitude (mean Earth radius).
+const KM_PER_DEG: f64 = 111.195;
+
+/// The point `north_km` north and `east_km` east of the demo station (flat-Earth offsets,
+/// close enough at these distances): `(lat, lon)`.
+fn from_demo_station(north_km: f64, east_km: f64) -> (f64, f64) {
+    let (lat, lon, _) = DEMO_STATION;
+    let lat_deg = north_km / KM_PER_DEG;
+    let lon_deg = east_km / (KM_PER_DEG * lat.to_radians().cos());
+    (lat + lat_deg, lon + lon_deg)
+}
+
 /// What the register stub answers (`acma_stub::COLUMNS` order), all on the tone's band and
 /// synthetic: a `tx` `16K0F1D` 9 km north-west of the demo station with callsign `XX4EX`, a
 /// `tx` `12K5A3E` 20 km east, and an `rx` row (never lit). The stub answers nothing on
 /// another band.
 fn fake_register_rows() -> Vec<serde_json::Value> {
     use serde_json::json;
+    let diagonal = SITE_HILL_KM * std::f64::consts::FRAC_1_SQRT_2;
+    let hill = from_demo_station(diagonal, -diagonal);
+    let ridge = from_demo_station(0.0, SITE_RIDGE_KM);
+    let depot = from_demo_station(-SITE_RX_KM, SITE_RX_KM);
     vec![
         json!([
             TONE_HZ,
@@ -415,8 +436,8 @@ fn fake_register_rows() -> Vec<serde_json::Value> {
             "W",
             "0000001",
             "Example Hill",
-            -27.3270,
-            153.1175,
+            hill.0,
+            hill.1,
             "Example Water Authority",
             "XX4EX"
         ]),
@@ -429,8 +450,8 @@ fn fake_register_rows() -> Vec<serde_json::Value> {
             "W",
             "0000002",
             "Example Ridge",
-            -27.3842,
-            153.3200,
+            ridge.0,
+            ridge.1,
             "Example Broadcasting",
             null
         ]),
@@ -443,8 +464,8 @@ fn fake_register_rows() -> Vec<serde_json::Value> {
             "W",
             "0000003",
             "Example Ridge",
-            -27.4500,
-            153.2000,
+            depot.0,
+            depot.1,
             "Example Water Authority",
             null
         ]),
