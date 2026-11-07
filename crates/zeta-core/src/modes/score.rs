@@ -223,6 +223,13 @@ mod tests {
         // POCSAG: bandwidth and modulation, not the centre.
         let pocsag = got.iter().find(|g| g.0 == "pocsag_decode").unwrap();
         assert!((pocsag.1 - 0.6).abs() < 1e-6, "{got:?}");
+        // FLEX's range starts at 151.8 MHz: 144.8 MHz earns it no centre credit, so it
+        // neither ties APRS nor outranks POCSAG there.
+        let flex = got.iter().find(|g| g.0 == "flex_decode").unwrap();
+        assert!(
+            flex.1 < got[0].1,
+            "flex is out of range at 144.8 MHz: {got:?}"
+        );
         let rds = got.iter().find(|g| g.0 == "rds_decode").unwrap();
         assert!(!rds.2, "rds needs 150 kHz: {got:?}");
         let adsb = got.iter().find(|g| g.0 == "adsb_decode").unwrap();
@@ -347,7 +354,7 @@ mod tests {
         let got = ids(&score_rows(&modes, 1, 1, "noise", &|_| 0.0, &|_| 0.0));
         let order: Vec<&str> = got.iter().map(|g| g.0.as_str()).collect();
         // rds at 0.4; then at 0 rs41 (priority 1), then aviation (acars, adsb, hfdl,
-        // vdl2), maritime (ais), pagers, weather_science (dfm, m20), amateur_digital.
+        // vdl2), maritime (ais), pagers (flex, pocsag), weather_science (dfm, m20), amateur_digital.
         assert_eq!(
             order,
             [
@@ -358,6 +365,7 @@ mod tests {
                 "hfdl_decode",
                 "vdl2_decode",
                 "ais_decode",
+                "flex_decode",
                 "pocsag_decode",
                 "dfm_decode",
                 "m20_decode",

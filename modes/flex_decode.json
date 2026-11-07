@@ -6,7 +6,7 @@
     "bandwidth_hz": 25000,
     "centers_hz": [],
     "min_hz": 12500,
-    "range_hz": null
+    "range_hz": [151800000, 932000000]
   },
   "modulation": ["fm", "fsk"],
   "label": "FLEX",

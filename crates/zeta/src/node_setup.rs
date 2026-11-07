@@ -803,9 +803,30 @@ mod tests {
                                 for e in g.edges.iter().filter(|e| e.from == n.id) {
                                     let to = g.nodes.iter().find(|m| m.id == e.to).unwrap();
                                     if to.kind == "nbfm_demod" {
+                                        // The node's audio rate, except where a program row
+                                        // names the rate its program reads (multimon-ng's
+                                        // 22 050 Hz for FLEX; the sonde rows' 48 000 Hz
+                                        // happens to equal the node's).
+                                        let want = match &kind {
+                                            JobKind::Mode(id) => modes
+                                                .get(&id.0)
+                                                .and_then(|m| match &m.row.decoder {
+                                                    zeta_core::modes::Decoder::Program(p) => {
+                                                        p.demod.as_ref().map(|d| match d {
+                                                            zeta_core::modes::Demod::Nbfm {
+                                                                audio_rate_hz,
+                                                                ..
+                                                            } => *audio_rate_hz,
+                                                        })
+                                                    }
+                                                    _ => None,
+                                                })
+                                                .unwrap_or(AUDIO_RATE_HZ),
+                                            _ => AUDIO_RATE_HZ,
+                                        };
                                         assert_eq!(
                                             param(to, "audio_rate_hz"),
-                                            AUDIO_RATE_HZ,
+                                            want,
                                             "{kind:?} {rate} {bw}"
                                         );
                                     }
