@@ -23,8 +23,11 @@
 //! `--llm-url` is a request-keyed fake model (zeta-agent's `serve_by_request` with
 //! [`fake_llm_scripts`]) is passed in `ZETA_UI_URL_LLM`.
 //!
-//! The run is killed and the test fails after [`DEADLINE`] (690 s) of wall clock.
-//! `ZETA_UI_ONLY=a,b` runs only those scenarios.
+//! The scenarios run in [`SHARDS`] shards at once (`ZETA_UI_SHARDS=<n>` overrides), each
+//! against its own set of those nodes and its own Chromium: ui.py's `SHARD_STARTS` cuts the
+//! scenarios into contiguous blocks. A shard still running after [`DEADLINE`] (690 s) of wall
+//! clock is killed and the test fails. `ZETA_UI_ONLY=a,b` runs only those scenarios, in one
+//! shard.
 //!
 //! Skipped, with `ui e2e skipped: <reason>` on stdout, only when Playwright for `python3` or
 //! its Chromium is missing. `python3` runs without `-I`: Playwright is commonly installed in
@@ -297,6 +300,11 @@ fn fsk_fixture(dir: &Path) -> PathBuf {
 /// 474 s at plan 24, 500.8 s after plan 19.2's Bits scenario, 547.7 s run alone on 2026-11-04;
 /// 1.25 × 547.7 s ≈ 685 s, so the limit is 690 s.
 const DEADLINE: Duration = Duration::from_secs(690);
+
+/// The shards run at once by default (ui.py's `SHARD_STARTS` says where each begins), each
+/// with its own nodes and Chromium: the scenarios mostly wait on fixtures played in real time,
+/// so two runs share a 2-CPU runner.
+const SHARDS: usize = 2;
 
 /// Waits for `child` until `deadline`, killing it then; its exit status (None when killed)
 /// and everything it wrote. Its pipes are drained on threads so it never blocks on them.
@@ -815,157 +823,226 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// One shard's nodes (see the module docs) and what keeps them up: ui.py runs against them.
+struct Nodes {
+    serve: ServeProc,
+    nostt: ServeProc,
+    llm: ServeProc,
+    shortring: ServeProc,
+    rebuild_meta: PathBuf,
+    _voiced: FakeDaemon,
+    dirs: Vec<tempfile::TempDir>,
+}
+
+impl Nodes {
+    fn start() -> Nodes {
+        let dir = tempfile::tempdir().unwrap();
+        let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+        let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "aprs", &iq, 48_000, 144_800_000);
+        let aprs = format!("aprs={}", meta.display());
+        // A fixture for the node the rebuild scenario starts and restarts by itself.
+        let rebuild_meta =
+            zeta_dsp::fixtures::write_fixture(dir.path(), "rebuild", &iq, 48_000, 144_800_000);
+        let audio =
+            zeta_dsp::fixtures::tone(WFM_AUDIO_RATE, 2 * WFM_AUDIO_RATE as usize, 1_000.0, 0.9);
+        let iq =
+            zeta_dsp::fixtures::wfm_modulate(&audio, WFM_AUDIO_RATE, WFM_RATE, 75_000.0, 0.0, true);
+        let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "wfm", &iq, WFM_RATE, 104_900_000);
+        let wfm = format!("wfm={}", meta.display());
+        let iq =
+            zeta_dsp::fixtures::pocsag_packet_iq(1_234_567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+        let meta =
+            zeta_dsp::fixtures::write_fixture(dir.path(), "pocsag", &iq, 48_000, 148_637_500);
+        let pocsag = format!("pocsag={}", meta.display());
+        let speech = format!("speech={}", speech_fixture(dir.path()).display());
+        // The tone recording played as a radio tunable over 200-300 MHz (well away from `tone`, so
+        // the page's automatic scans around `tone` never pick it), and as one tunable over
+        // 50-150 MHz (the scanner).
+        let retune = format!(
+            "retune={},tune_min_hz=200000000,tune_max_hz=300000000",
+            tone_at(dir.path(), "retune", 250_000_000).display()
+        );
+        let scanner = format!(
+            "scanner={},tune_min_hz=50000000,tune_max_hz=150000000",
+            zeta_source_file::fixtures::write_tone(dir.path()).display()
+        );
+        // The tone recording labelled at 476.9 MHz, channel 20 of the node's CB plan.
+        let cb = format!("cb={}", tone_at(dir.path(), "cb", 476_900_000).display());
+        // Noise only, at 20 MHz: a fitted demodulator finds no signal there.
+        let quiet = format!("quiet={}", quiet_fixture(dir.path()).display());
+        // Framed 2-FSK at 433.92 MHz: the Bits pane's stream, hypotheses and sync hits.
+        let fsk = format!("fsk={}", fsk_fixture(dir.path()).display());
+        let sock_dir = socket_dir();
+        let sock = sock_dir.path().join("voiced.sock");
+        let _voiced = fake_voiced(&sock);
+        let sock = sock.to_str().expect("socket path is UTF-8");
+        let modes = fake_modes(dir.path());
+        let modes = modes.to_str().expect("modes path is UTF-8");
+        let themes = fake_themes(dir.path());
+        let themes = themes.to_str().expect("themes path is UTF-8");
+        let fake_lines = repo_root().join("crates/zeta-ext/tests/fake_lines");
+        let fake_lines = fake_lines.to_str().expect("fake_lines path is UTF-8");
+        // adsb_decode's program pinned to the test stand-in, so the mode is ready whether or
+        // not the host has dump1090 (a CI runner has none; the ADS-B width scenario needs it).
+        let fake_dump1090 = repo_root().join("crates/zeta-ext/tests/fake_dump1090");
+        let fake_dump1090 = fake_dump1090.to_str().expect("fake_dump1090 path is UTF-8");
+        let register = acma_stub::serve_on_thread(fake_register_rows(), Mode::Normal);
+        let serve = ServeProc::start_full(
+            dir.path(),
+            SECRET,
+            &[
+                "--knowledge-acma",
+                &register,
+                "--modes-dir",
+                modes,
+                "--themes-dir",
+                themes,
+                "--source-file",
+                &aprs,
+                "--source-file",
+                &wfm,
+                "--source-file",
+                &pocsag,
+                "--source-file",
+                &speech,
+                "--source-file",
+                &retune,
+                "--source-file",
+                &scanner,
+                "--source-file",
+                &cb,
+                "--source-file",
+                &quiet,
+                "--source-file",
+                &fsk,
+            ],
+            &["--stt-socket", sock],
+            &[
+                ("ZETA_HANDLER_FAKE_LINES", fake_lines),
+                ("ZETA_HANDLER_DUMP1090", fake_dump1090),
+                ("ZETA_PLUGIN_ENV_FAKE_LINES", FAKE_POS_LINES),
+                ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", FAKE_POS_AFTER_BYTES),
+            ],
+        );
+        set_demo_station(&serve.url);
+        // No speech daemon: XDG_RUNTIME_DIR points where no voiced.sock is, so no default applies.
+        let nostt_dir = tempfile::tempdir().unwrap();
+        let runtime = nostt_dir.path().to_str().expect("tempdir is UTF-8");
+        let nostt_speech = format!("speech={}", speech_fixture(nostt_dir.path()).display());
+        let nostt = ServeProc::start_env(
+            nostt_dir.path(),
+            SECRET,
+            &["--source-file", &nostt_speech],
+            &[("XDG_RUNTIME_DIR", runtime)],
+        );
+        // A fake model answering by request, behind a node with `tone` and `cb`.
+        let llm_dir = tempfile::tempdir().unwrap();
+        let fake_llm = start_fake_llm();
+        let cb_llm = format!(
+            "cb={}",
+            tone_at(llm_dir.path(), "cb", 476_900_000).display()
+        );
+        let llm = ServeProc::start_full(
+            llm_dir.path(),
+            SECRET,
+            &["--source-file", &cb_llm],
+            &["--llm-url", &fake_llm, "--llm-model", "fake"],
+            &[],
+        );
+        // A ring of a few seconds (a 1 MB budget), so a box outlives the buffer behind it.
+        let short_dir = tempfile::tempdir().unwrap();
+        let shortring =
+            ServeProc::start_env(short_dir.path(), SECRET, &["--ring-budget-mb", "1"], &[]);
+        Nodes {
+            serve,
+            nostt,
+            llm,
+            shortring,
+            rebuild_meta,
+            _voiced,
+            dirs: vec![dir, sock_dir, nostt_dir, llm_dir, short_dir],
+        }
+    }
+
+    /// The state directory of the main node.
+    fn state_dir(&self) -> PathBuf {
+        self.dirs[0].path().join("state")
+    }
+
+    /// ui.py against these nodes, `shard` (`<i>/<n>`) of the scenarios or, with `only`, those.
+    fn run_ui(&self, shard: Option<&str>, only: Option<&std::ffi::OsStr>) -> Child {
+        let mut cmd = Command::new("python3");
+        cmd.arg("crates/zeta-ui/tests/e2e/ui.py")
+            .args([&self.serve.url, SECRET]);
+        if let Some(only) = only {
+            cmd.arg(only);
+        }
+        if let Some(shard) = shard {
+            cmd.env("ZETA_UI_SHARD", shard);
+        }
+        cmd.env("ZETA_UI_STATE_DIR", self.state_dir())
+            .env("ZETA_UI_URL_NOSTT", &self.nostt.url)
+            .env("ZETA_UI_URL_LLM", &self.llm.url)
+            .env("ZETA_UI_URL_SHORTRING", &self.shortring.url)
+            .env("ZETA_BIN", env!("CARGO_BIN_EXE_zeta"))
+            .env("ZETA_UI_REBUILD_META", &self.rebuild_meta)
+            .current_dir(repo_root())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run ui.py")
+    }
+}
+
+/// How many shards run at once: `ZETA_UI_SHARDS`, else [`SHARDS`]; 1 with `ZETA_UI_ONLY`.
+fn shard_count(only: bool) -> usize {
+    if only {
+        return 1;
+    }
+    match std::env::var("ZETA_UI_SHARDS") {
+        Ok(n) => n.parse().expect("ZETA_UI_SHARDS is a count"),
+        Err(_) => SHARDS,
+    }
+}
+
 #[test]
 fn ui_scenarios_pass_in_headless_chromium() {
     if let Some(reason) = skip_reason() {
         println!("ui e2e skipped: {reason}");
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let iq = zeta_dsp::fixtures::aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "aprs", &iq, 48_000, 144_800_000);
-    let aprs = format!("aprs={}", meta.display());
-    // A fixture for the node the rebuild scenario starts and restarts by itself.
-    let rebuild_meta =
-        zeta_dsp::fixtures::write_fixture(dir.path(), "rebuild", &iq, 48_000, 144_800_000);
-    let audio = zeta_dsp::fixtures::tone(WFM_AUDIO_RATE, 2 * WFM_AUDIO_RATE as usize, 1_000.0, 0.9);
-    let iq =
-        zeta_dsp::fixtures::wfm_modulate(&audio, WFM_AUDIO_RATE, WFM_RATE, 75_000.0, 0.0, true);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "wfm", &iq, WFM_RATE, 104_900_000);
-    let wfm = format!("wfm={}", meta.display());
-    let iq = zeta_dsp::fixtures::pocsag_packet_iq(1_234_567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
-    let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "pocsag", &iq, 48_000, 148_637_500);
-    let pocsag = format!("pocsag={}", meta.display());
-    let speech = format!("speech={}", speech_fixture(dir.path()).display());
-    // The tone recording played as a radio tunable over 200-300 MHz (well away from `tone`, so
-    // the page's automatic scans around `tone` never pick it), and as one tunable over
-    // 50-150 MHz (the scanner).
-    let retune = format!(
-        "retune={},tune_min_hz=200000000,tune_max_hz=300000000",
-        tone_at(dir.path(), "retune", 250_000_000).display()
-    );
-    let scanner = format!(
-        "scanner={},tune_min_hz=50000000,tune_max_hz=150000000",
-        zeta_source_file::fixtures::write_tone(dir.path()).display()
-    );
-    // The tone recording labelled at 476.9 MHz, channel 20 of the node's CB plan.
-    let cb = format!("cb={}", tone_at(dir.path(), "cb", 476_900_000).display());
-    // Noise only, at 20 MHz: a fitted demodulator finds no signal there.
-    let quiet = format!("quiet={}", quiet_fixture(dir.path()).display());
-    // Framed 2-FSK at 433.92 MHz: the Bits pane's stream, hypotheses and sync hits.
-    let fsk = format!("fsk={}", fsk_fixture(dir.path()).display());
-    let sock_dir = socket_dir();
-    let sock = sock_dir.path().join("voiced.sock");
-    let _voiced = fake_voiced(&sock);
-    let sock = sock.to_str().expect("socket path is UTF-8");
-    let modes = fake_modes(dir.path());
-    let modes = modes.to_str().expect("modes path is UTF-8");
-    let themes = fake_themes(dir.path());
-    let themes = themes.to_str().expect("themes path is UTF-8");
-    let fake_lines = repo_root().join("crates/zeta-ext/tests/fake_lines");
-    let fake_lines = fake_lines.to_str().expect("fake_lines path is UTF-8");
-    // adsb_decode's program pinned to the test stand-in, so the mode is ready whether or
-    // not the host has dump1090 (a CI runner has none; the ADS-B width scenario needs it).
-    let fake_dump1090 = repo_root().join("crates/zeta-ext/tests/fake_dump1090");
-    let fake_dump1090 = fake_dump1090.to_str().expect("fake_dump1090 path is UTF-8");
-    let register = acma_stub::serve_on_thread(fake_register_rows(), Mode::Normal);
-    let serve = ServeProc::start_full(
-        dir.path(),
-        SECRET,
-        &[
-            "--knowledge-acma",
-            &register,
-            "--modes-dir",
-            modes,
-            "--themes-dir",
-            themes,
-            "--source-file",
-            &aprs,
-            "--source-file",
-            &wfm,
-            "--source-file",
-            &pocsag,
-            "--source-file",
-            &speech,
-            "--source-file",
-            &retune,
-            "--source-file",
-            &scanner,
-            "--source-file",
-            &cb,
-            "--source-file",
-            &quiet,
-            "--source-file",
-            &fsk,
-        ],
-        &["--stt-socket", sock],
-        &[
-            ("ZETA_HANDLER_FAKE_LINES", fake_lines),
-            ("ZETA_HANDLER_DUMP1090", fake_dump1090),
-            ("ZETA_PLUGIN_ENV_FAKE_LINES", FAKE_POS_LINES),
-            ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", FAKE_POS_AFTER_BYTES),
-        ],
-    );
-    set_demo_station(&serve.url);
-    // No speech daemon: XDG_RUNTIME_DIR points where no voiced.sock is, so no default applies.
-    let nostt_dir = tempfile::tempdir().unwrap();
-    let runtime = nostt_dir.path().to_str().expect("tempdir is UTF-8");
-    let nostt_speech = format!("speech={}", speech_fixture(nostt_dir.path()).display());
-    let nostt = ServeProc::start_env(
-        nostt_dir.path(),
-        SECRET,
-        &["--source-file", &nostt_speech],
-        &[("XDG_RUNTIME_DIR", runtime)],
-    );
-    // A fake model answering by request, behind a node with `tone` and `cb`.
-    let llm_dir = tempfile::tempdir().unwrap();
-    let fake_llm = start_fake_llm();
-    let cb_llm = format!(
-        "cb={}",
-        tone_at(llm_dir.path(), "cb", 476_900_000).display()
-    );
-    let llm = ServeProc::start_full(
-        llm_dir.path(),
-        SECRET,
-        &["--source-file", &cb_llm],
-        &["--llm-url", &fake_llm, "--llm-model", "fake"],
-        &[],
-    );
-    // A ring of a few seconds (a 1 MB budget), so a box outlives the buffer behind it.
-    let short_dir = tempfile::tempdir().unwrap();
-    let shortring = ServeProc::start_env(short_dir.path(), SECRET, &["--ring-budget-mb", "1"], &[]);
-    let mut cmd = Command::new("python3");
-    cmd.arg("crates/zeta-ui/tests/e2e/ui.py")
-        .args([&serve.url, SECRET]);
-    if let Some(only) = std::env::var_os("ZETA_UI_ONLY") {
-        cmd.arg(only);
+    let only = std::env::var_os("ZETA_UI_ONLY");
+    let shards = shard_count(only.is_some());
+    let nodes: Vec<Nodes> = (0..shards).map(|_| Nodes::start()).collect();
+    let started = Instant::now();
+    let runs: Vec<_> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let shard = (shards > 1).then(|| format!("{i}/{shards}"));
+            let child = n.run_ui(shard.as_deref(), only.as_deref());
+            std::thread::spawn(move || wait_with_deadline(child, DEADLINE))
+        })
+        .collect();
+    let mut failed = Vec::new();
+    for (i, run) in runs.into_iter().enumerate() {
+        let (status, stdout, stderr) = run.join().expect("ui.py waiter");
+        println!("--- shard {i}/{shards}\n{stdout}");
+        match status {
+            None => failed.push(format!(
+                "shard {i}/{shards}: ui.py still running after {} s; killed\n--- stderr\n{stderr}",
+                DEADLINE.as_secs()
+            )),
+            Some(status) if !status.success() => failed.push(format!(
+                "shard {i}/{shards}: ui.py failed ({status}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}"
+            )),
+            Some(_) => {}
+        }
     }
-    let child = cmd
-        .env("ZETA_UI_STATE_DIR", dir.path().join("state"))
-        .env("ZETA_UI_URL_NOSTT", &nostt.url)
-        .env("ZETA_UI_URL_LLM", &llm.url)
-        .env("ZETA_UI_URL_SHORTRING", &shortring.url)
-        .env("ZETA_BIN", env!("CARGO_BIN_EXE_zeta"))
-        .env("ZETA_UI_REBUILD_META", &rebuild_meta)
-        .current_dir(repo_root())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("run ui.py");
-    let (status, stdout, stderr) = wait_with_deadline(child, DEADLINE);
-    println!("{stdout}");
-    let Some(status) = status else {
-        panic!(
-            "ui.py still running after {} s; killed\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
-            DEADLINE.as_secs()
-        );
-    };
-    assert!(
-        status.success(),
-        "ui.py failed ({status}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}"
+    println!(
+        "ui e2e: {shards} shard(s) in {:.1} s",
+        started.elapsed().as_secs_f64()
     );
-    drop(serve);
-    drop(nostt);
-    drop(llm);
-    drop(shortring);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+    drop(nodes);
 }

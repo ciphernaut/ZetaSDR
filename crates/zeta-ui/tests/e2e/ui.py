@@ -7034,6 +7034,30 @@ def scenarios():
             if name.startswith("scenario_") and callable(fn)]
 
 
+# With `ZETA_UI_SHARD=<i>/<n>`, ui.rs runs the scenarios in n shards at once, each against
+# its own set of nodes: shard i runs the i-th contiguous block of `scenarios()` (definition
+# order), the blocks starting at these scenarios. A block's first scenario runs on a fresh
+# node, so it must pass alone (as with `ZETA_UI_ONLY`). Rebalance from the `PASS <name>
+# (<s> s)` times so each block takes about the same time.
+SHARD_STARTS = {
+    1: [],
+    2: ["listen_to_all_starts_one_mix_and_plays"],
+    3: ["audio_play_opens_binary_socket", "subjects_store_merge_units_and_fill"],
+}
+
+
+def shard(todo, spec):
+    """The block of `todo` that shard `spec` (`<i>/<n>`, 0-based i) runs (SHARD_STARTS)."""
+    i, n = (int(x) for x in spec.split("/"))
+    names = [name for name, _ in todo]
+    starts = SHARD_STARTS.get(n)
+    assert starts is not None and 0 <= i < n, \
+        f"no shard {spec}: SHARD_STARTS has {list(SHARD_STARTS)}"
+    cuts = [0] + [names.index(s) for s in starts] + [len(todo)]
+    assert cuts == sorted(cuts), f"SHARD_STARTS[{n}] out of definition order: {starts}"
+    return todo[cuts[i]:cuts[i + 1]]
+
+
 # Collects the page's Content-Security-Policy violations (checked after every scenario).
 CSP_WATCH_JS = """
 window.__cspViolations = [];
@@ -7094,6 +7118,8 @@ def main(argv):
             print(f"no scenario {argv[3]!r}; known: {[n for n, _ in scenarios()]}",
                   file=sys.stderr)
             return 2
+    if os.environ.get("ZETA_UI_SHARD"):
+        todo = shard(todo, os.environ["ZETA_UI_SHARD"])
     profile = LineTimes(os.environ["ZETA_UI_PROFILE"]) if os.environ.get("ZETA_UI_PROFILE") \
         else None
     with sync_playwright() as pw:
