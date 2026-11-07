@@ -839,6 +839,15 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.audio_rate_hz: integer
 - params.deemphasis_us: integer
 
+## Mode rows
+
+The built-in decoder rows with notes (`modes_show` has every row in full; an operator row's notes reach `modes_show` only):
+- `dfm_decode`: Graw DFM-06/09/17 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. dfm09mod 1.8.1 (sonde-decoders) takes --json and --ecc (Hamming ECC on the frames, wanted); it has no --crc (an unknown option is read as the input file, error: open), and no --dist/--auto, so the id comes from the frames as decoded.
+- `hfdl_decode`: HFDL (PSK on a 1440 Hz subcarrier, 300-1800 bit/s) between airliners and ground stations at 2.8-22.1 MHz, decoded by dumphfdl, typically on a KiwiSDR's 12 kHz band. Start the job with center_hz on the listed (dial) frequency: the signal sits 1.44 kHz above it, inside the 6 kHz band. Take the frequencies from a list (dumphfdl's system table, or the operator's own), not a raster; they change with the hour. Each ground station sends a squitter every 32 s, so a squitter (pdu absent, gs_id set) within a minute proves the channel even when no aircraft is heard. An aircraft is keyed on its ICAO address once dumphfdl has heard its logon. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).
+- `m20_decode`: Meteomodem M20 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. m20mod 1.8.1 (sonde-decoders) takes --json only: it has no --ecc or --crc (an unknown option is read as the input file, error: open).
+- `rs41_decode`: Vaisala RS41 radiosondes (GFSK, 4800 baud, one frame a second) anywhere in 400.05-406 MHz; the frequency varies by flight, so start the job on the measured centre, not a raster. One job decodes one sonde.
+- `vdl2_decode`: VDL Mode 2 (D8PSK, 10.5 kbaud) in 25 kHz channels at 136.725-136.975 MHz, decoded by dumpvdl2; every AVLC frame is an event keyed on its source address, and an ADS-C report riding an ACARS downlink carries the aircraft's position. A ground station gets its own row, whose ACARS columns name the aircraft of each uplink. Beside ACARS on one radio the order matters, because a running capture cannot widen: pin the radio at 133 500 000 Hz with 8 000 000 Hz first, then start the ACARS plan, then the VDL2 job (136 975 000 Hz, 25 000 Hz); started the other way round, VDL2 is a conflict naming the ACARS jobs. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).
+
 ## Field craft
 
 Measured facts first, then method. Verify against the node's `knowledge lookup` before relying on any of this.

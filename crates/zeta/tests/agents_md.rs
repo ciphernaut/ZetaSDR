@@ -79,6 +79,30 @@ fn guide_covers_running_the_node_stages_and_descriptions() {
 }
 
 #[test]
+fn guide_lists_the_embedded_rows_notes() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    let at = |needle: &str| {
+        md.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?}"))
+    };
+    let rows = at("## Mode rows\n");
+    assert!(at("## Stage kinds\n") < rows && rows < at("## Field craft\n"));
+    for id in ["rs41_decode", "dfm_decode", "m20_decode"] {
+        assert!(
+            md.contains(&format!("- `{id}`: ")),
+            "no notes line for {id}"
+        );
+    }
+}
+
+#[test]
 fn channel_plans_cli_line_is_the_real_command() {
     let md = zeta()
         .arg("agents-md")

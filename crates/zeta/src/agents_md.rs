@@ -196,6 +196,21 @@ fn unit(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The `## Mode rows` section: one line per built-in decoder row that has `notes`, in
+/// file order. Named so it does not collide with the field craft's `### Decoding modes`.
+fn mode_rows() -> String {
+    let mut out = String::from(
+        "\n## Mode rows\n\nThe built-in decoder rows with notes (`modes_show` has every row in full; an operator row's notes reach `modes_show` only):\n",
+    );
+    for (file, text) in zeta_core::modes::ModeRegistry::embedded() {
+        let row = zeta_core::modes::parse(text).unwrap_or_else(|e| panic!("{file}: {e}"));
+        if let Some(notes) = row.notes {
+            out.push_str(&format!("- `{}`: {notes}\n", row.id.0));
+        }
+    }
+    out
+}
+
 /// Render the guide from the node schema (`op`, `result`, `error`, `stages`)
 /// and the field-craft text.
 pub fn render(schema: &Value, field_craft: &str) -> String {
@@ -284,6 +299,7 @@ pub fn render(schema: &Value, field_craft: &str) -> String {
             }
         }
     }
+    out.push_str(&mode_rows());
     out.push_str("\n## Field craft\n\n");
     out.push_str(field_craft);
     out
