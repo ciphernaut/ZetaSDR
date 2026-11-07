@@ -16,7 +16,7 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Provenance, Span, StreamId, StreamKind, Timestamp};
 
 use crate::correlate::BitsIn;
-use crate::framing::{Decoded, DecodedFrame, Framing, decode};
+use crate::framing::{Decoded, DecodedFrame, Framing, decode_from};
 use crate::util::event;
 use crate::{Input, is_seam, run_map_ending};
 
@@ -91,6 +91,9 @@ pub(crate) struct FrameState {
     /// The stream the notes name.
     stream: String,
     pub dropped_bits: u64,
+    /// `buf` starts mid-segment (bits were settled or dropped before it): its first
+    /// bit is line context, not a bit to hunt at.
+    continued: bool,
 }
 
 impl FrameState {
@@ -107,6 +110,7 @@ impl FrameState {
             counts: Counts::default(),
             stream: String::new(),
             dropped_bits: 0,
+            continued: false,
         }
     }
 
@@ -167,13 +171,15 @@ impl FrameState {
         if self.buf.len() > BUFFER_BITS_MAX {
             let excess = self.buf.len() - BUFFER_BITS_MAX;
             self.buf.drain(..excess);
+            self.continued = true;
             self.dropped_bits += excess as u64;
             self.counts.dropped_bits = self.dropped_bits;
         }
-        let d = decode(&self.buf, &self.f);
+        let d = decode_from(&self.buf, &self.f, self.continued);
         let settled = d.settled;
         let after = self.take(d, false);
         self.buf.drain(..settled);
+        self.continued |= settled > 0;
         let base = self.base();
         while self.pieces.len() > 1 && self.pieces[1].abs <= base {
             self.pieces.pop_front();
@@ -187,10 +193,11 @@ impl FrameState {
         let found = if self.buf.is_empty() {
             Vec::new()
         } else {
-            let d = decode(&self.buf, &self.f);
+            let d = decode_from(&self.buf, &self.f, self.continued);
             self.take(d, true)
         };
         self.buf.clear();
+        self.continued = false;
         self.pieces.clear();
         self.end = None;
         found
@@ -407,7 +414,7 @@ mod tests {
     use crate::bit_view::test_streams::{BAUD, T0, bits_frames, bits_frames_at, run_events};
     use crate::correlate::BitsIn;
     use crate::framing::test_support::{bodies, bodies_of, fx};
-    use crate::framing::{Length, encode_frames};
+    use crate::framing::{Length, LineCode, decode_frames, encode_frames};
 
     const SECOND_NS: u64 = 1_000_000_000;
 
@@ -469,6 +476,36 @@ mod tests {
             events.iter().filter(|e| e["protocol"] == "bits").count(),
             splits.len() + 1
         );
+    }
+
+    #[tokio::test]
+    async fn nrzi_frames_are_decoded_across_events_split_at_frame_ends() {
+        // A run-heavy sync admitting one error: the last bit of a frame and the sync's
+        // first seven bits are within one error of it, so a continuation that hunted
+        // the context bit it keeps would cut a garbage frame there.
+        for enc in [LineCode::Nrzi, LineCode::Differential] {
+            let mut f = fx("7f", 8, Length::Fixed { fixed_bits: 272 });
+            f.encoding = enc;
+            f.max_errors = 1;
+            let bs = bodies(8, 32, 15);
+            let bits = encode_frames(&bs, &f);
+            const PERIOD: usize = 8 + 272;
+            assert_eq!(decode_frames(&bits, &f).0.len(), 8, "{enc:?} batch");
+            let splits: Vec<usize> = (1..8).map(|k| k * PERIOD).collect();
+            let (events, context) = run_events(
+                &FrameDecodeStage::new(),
+                serde_json::to_value(&f).unwrap(),
+                bits_frames(&bits, &splits),
+            )
+            .await;
+            let frames = frames_of(&events);
+            assert_eq!(frames.len(), 8, "{enc:?}: {frames:?}");
+            for (fr, b) in frames.iter().zip(&bs) {
+                assert_eq!(fr["crc_ok"], true, "{enc:?}");
+                assert!(fr["bytes"].as_str().unwrap().starts_with(&hex(b)));
+            }
+            assert_eq!(context["frame_decode"]["sync_hits"], 8, "{enc:?}");
+        }
     }
 
     #[tokio::test]

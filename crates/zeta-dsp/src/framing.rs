@@ -496,12 +496,21 @@ fn line_decode(bits: &[u8], code: LineCode) -> Vec<Vec<u8>> {
 /// The frames of one segment of line bits: what [`decode_frames`] returns, with the
 /// counts and the pending frames the stage needs.
 pub(crate) fn decode(bits: &[u8], f: &Framing) -> Decoded {
+    decode_from(bits, f, false)
+}
+
+/// [`decode`] of a continuation: with `continued`, `bits` start with the context
+/// line bit an earlier pass settled short of (nrzi and differential), whose own
+/// decoded bit is unknown, so no sync or preamble may use it.
+pub(crate) fn decode_from(bits: &[u8], f: &Framing, continued: bool) -> Decoded {
     let s = f.scale();
     let sync = f.sync.to_bits();
     let pre = f.preamble.as_ref().map(Word::to_bits).unwrap_or_default();
     let (sb, pl) = (sync.len(), pre.len());
     let lookback = f.lookback();
     let ctx = lookback - s * pl;
+    // The first decoded index a sync's preamble (or the sync itself) may cover.
+    let first = if continued { ctx } else { 0 };
     let crc = f
         .crc
         .as_ref()
@@ -511,7 +520,7 @@ pub(crate) fn decode(bits: &[u8], f: &Framing) -> Decoded {
     // The sync's errors at decoded index `j` of `d`, `None` past the limit or without
     // the preamble right before it.
     let hit_at = |d: &[u8], j: usize| -> Option<u32> {
-        if j < pl || d[j - pl..j] != pre[..] {
+        if j < pl + first || d[j - pl..j] != pre[..] {
             return None;
         }
         let mut errors = 0u32;
@@ -1041,6 +1050,13 @@ mod tests {
         assert_eq!(checked(v), Err("length.field.bits: 1..=32".into()));
         let mut v = base();
         v["extra"] = json!(1);
+        assert!(checked(v).is_err());
+        // An untagged length variant refuses another variant's key.
+        let mut v = base();
+        v["length"] = json!({"fixed_bits": 272, "to_next_sync": true});
+        assert!(checked(v).is_err());
+        let mut v = base();
+        v["length"] = json!({"to_next_sync": true, "extra": 1});
         assert!(checked(v).is_err());
         assert!(
             checked(json!({"sync": {"hex": "2dd4", "bits": 16}, "length": {"to_next_sync": true}, "whitening": "pn9", "encoding": "manchester", "bit_order": "lsb", "crc": "crc16-modbus"}))
