@@ -615,6 +615,10 @@ async fn an_existing_learned_row_is_kept_as_is() {
     assert_eq!(rec.decoder_note.as_deref(), Some(note.as_str()), "{rec:?}");
     let kept: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(kept["name"], "edited");
+    // The operator's file, written after `open`, is listed at once.
+    let info = listed(&node, &id).await.expect("listed before a restart");
+    assert_eq!(info.state, ModeState::Ready, "{info:?}");
+    assert_eq!(info.name, "edited");
     // After a restart the operator's row still loads.
     drop(node);
     let node = open_in(dir.path(), &modes_dir, None).await;
@@ -639,6 +643,25 @@ async fn accept_without_a_writable_modes_directory_accepts_and_says_so() {
     assert!(!error.is_empty(), "{rec:?}");
     assert!(node.bursts().get(&cap.id).unwrap().pinned, "{rec:?}");
     assert_eq!(node.signatures().get(&rec.id).unwrap(), rec);
+}
+
+/// `modes_dir: None` is no operator directory: a framed accept writes nothing (never
+/// under `HOME` or `XDG_CONFIG_HOME`) and says so.
+#[tokio::test]
+async fn a_node_without_a_modes_dir_writes_no_learned_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let rec = propose_framed(&node, vec![]);
+    let rec = accept(&node, &rec.id).await;
+    assert_eq!(rec.state, SignatureState::Accepted);
+    assert_eq!((&rec.decoder, &rec.decoder_file), (&None, &None), "{rec:?}");
+    let note = rec.decoder_note.as_deref();
+    assert_eq!(note, Some("no modes directory: row not written"), "{rec:?}");
+    assert!(listed(&node, &row_id(&rec)).await.is_none());
+    // A reload reads the embedded rows only, as `open` does.
+    let before = node.modes().ids();
+    assert!(node.reload_modes().unwrap().is_empty());
+    assert_eq!(node.modes().ids(), before);
 }
 
 #[tokio::test]

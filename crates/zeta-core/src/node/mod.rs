@@ -86,9 +86,11 @@ pub struct NodeConfig {
     /// added, so resumed jobs get a bank as fresh ones do. `None`: no banks
     /// (until [`Node::set_bank_factory`]).
     pub bank_factory: Option<Arc<dyn BankFactory>>,
-    /// The operator's mode rows (`--modes-dir`), read after the embedded ones; `None`
-    /// reads none (the CLI resolves the default, [`crate::modes::default_operator_dir`]).
-    /// A missing directory reads as empty.
+    /// The operator's mode rows (`--modes-dir`), read after the embedded ones (at `open`
+    /// and by [`Node::reload_modes`]) and where an accepted signature's row is written;
+    /// `None` is no operator directory: only the embedded rows, no row written (the CLI
+    /// resolves the default, [`crate::modes::default_operator_dir`]). A missing
+    /// directory reads as empty.
     pub modes_dir: Option<PathBuf>,
     /// What the burst store (`state_dir/bursts`) keeps; `BurstPolicy::default()` is
     /// 256 MiB and 7 days.
@@ -284,7 +286,7 @@ struct Inner {
     modes: ModesHandle,
     /// The operator's modes directory as configured (`NodeConfig.modes_dir`): what
     /// `reload_modes` reads and where an accepted signature's row is written (`None`:
-    /// [`crate::modes::default_operator_dir`]).
+    /// none, so only the embedded rows load and no row is written).
     modes_dir: Option<PathBuf>,
     /// Held across [`Node::reload_modes`] (no await inside).
     reloading: Mutex<()>,
@@ -381,11 +383,18 @@ impl Inner {
             if !rec.band_holds(tuning.center_hz) || width < lo * theirs || width > hi * theirs {
                 continue;
             }
-            if self.signatures.supersede(&rec.id, mode, now_ns).is_ok() {
-                eprintln!(
+            match self.signatures.supersede(&rec.id, mode, now_ns) {
+                Ok(_) => eprintln!(
                     "zeta: signature {} ({}) superseded by {mode}",
                     rec.id, rec.name
-                );
+                ),
+                // Superseded (or otherwise answered) meanwhile: nothing failed.
+                Err(crate::signatures::StoreError::State { .. }) => {}
+                Err(e) => self
+                    .persist_errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("signatures: {}: supersede by {mode}: {e}", rec.id)),
             }
         }
     }
@@ -1153,8 +1162,8 @@ impl Node {
         self.inner.modes.clone()
     }
 
-    /// Read the mode rows again (the embedded ones, then the operator directory:
-    /// `NodeConfig.modes_dir`, else [`crate::modes::default_operator_dir`]) against the
+    /// Read the mode rows again (the embedded ones, then the operator directory
+    /// `NodeConfig.modes_dir`, none when it is `None`, as at `open`) against the
     /// node's stages, carry each program row's probed program and state over from the
     /// rows in force ([`ModeRegistry::carry_programs`]), read the checked times, and put
     /// the new registry in force. Jobs already running keep the graphs they were
@@ -1164,11 +1173,7 @@ impl Node {
         let inner = &self.inner;
         // One reload at a time: a later one reads every file an earlier one saw.
         let _one = inner.reloading.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = inner
-            .modes_dir
-            .clone()
-            .or_else(crate::modes::default_operator_dir);
-        let mut modes = ModeRegistry::load(&inner.registry, dir.as_deref());
+        let mut modes = ModeRegistry::load(&inner.registry, inner.modes_dir.as_deref());
         modes.carry_programs(&inner.modes());
         modes.load_checked(&inner.state_dir.join(MODES_CHECKED_FILE));
         let lines = modes.startup_lines();
@@ -1346,11 +1351,12 @@ impl Node {
 
     /// After `rec`'s accept, when [`crate::signatures::writes_row`]: write its
     /// [`crate::signatures::learned_row`] to `<modes dir>/learned_<id>.json` (pretty
-    /// JSON, the directory made; the modes directory is `NodeConfig.modes_dir`, else
-    /// [`crate::modes::default_operator_dir`]) and [`Node::reload_modes`], noting the
-    /// row (`decoder`) and its file in the record. A file already there is kept as it
-    /// is (`row learned_<id> already present: kept as is`), never overwritten; with no
-    /// modes directory (`no modes directory: row not written`) or a failed write
+    /// JSON, the directory made; the modes directory is `NodeConfig.modes_dir`) and
+    /// [`Node::reload_modes`], noting the row (`decoder`) and its file in the record. A
+    /// file already there is kept as it is (`row learned_<id> already present: kept as
+    /// is`), never overwritten, and the rows are reloaded so it is listed at once; with
+    /// no modes directory (`NodeConfig.modes_dir` `None`: `no modes directory: row not
+    /// written`) or a failed write
     /// (`row not written: <error>`) no row is noted. Never fails: the record stays
     /// accepted, its captures pinned, whatever becomes of the row.
     fn write_learned_row(
@@ -1363,12 +1369,14 @@ impl Node {
             return rec;
         }
         let mode = format!("{LEARNED_ROW_PREFIX}{}", rec.id.to_lowercase());
-        let dir = self
-            .inner
-            .modes_dir
-            .clone()
-            .or_else(crate::modes::default_operator_dir);
-        let (decoder, file, note) = match dir {
+        let reload = || {
+            if let Ok(lines) = self.reload_modes() {
+                for line in lines {
+                    eprintln!("{line}");
+                }
+            }
+        };
+        let (decoder, file, note) = match self.inner.modes_dir.clone() {
             None => (
                 None,
                 None,
@@ -1399,14 +1407,12 @@ impl Node {
                     });
                 match written {
                     Ok(()) => {
-                        if let Ok(lines) = self.reload_modes() {
-                            for line in lines {
-                                eprintln!("{line}");
-                            }
-                        }
+                        reload();
                         (Some(mode), Some(file), None)
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // An operator file that appeared after `open` is listed at once.
+                        reload();
                         (Some(mode), Some(file), Some(kept))
                     }
                     Err(e) => (None, None, Some(format!("row not written: {e}"))),
