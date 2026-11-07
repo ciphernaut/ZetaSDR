@@ -29,6 +29,11 @@ enum Mode {
     NullBandwidth,
     /// A service that answers no `CALL_SIGN` column.
     NoCallSign,
+    /// An older register whose `device_details` lacks `CALL_SIGN`: SQL naming
+    /// `d.CALL_SIGN` is rejected with SQLite's error as a JSON-RPC error.
+    NoCallSignColumnRpc,
+    /// The same register answering the rejection as a tool error's text.
+    NoCallSignColumnTool,
 }
 
 #[derive(Default)]
@@ -40,6 +45,10 @@ struct Stub {
     plans: AtomicUsize,
     /// The last `execute_sql` arguments.
     sql: Mutex<Option<Value>>,
+    /// `execute_sql` calls seen.
+    queries: AtomicUsize,
+    /// `execute_sql` calls rejected for naming a missing `CALL_SIGN`.
+    rejected: AtomicUsize,
 }
 
 fn sse(v: Value) -> Response {
@@ -119,9 +128,31 @@ async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Re
             let out = match req["params"]["name"].as_str().unwrap() {
                 "execute_sql" => {
                     *s.sql.lock().unwrap() = Some(args.clone());
+                    s.queries.fetch_add(1, Ordering::SeqCst);
+                    let older = matches!(
+                        s.mode,
+                        Mode::NoCallSignColumnRpc | Mode::NoCallSignColumnTool
+                    );
+                    if older && args["sql"].as_str().unwrap().contains("d.CALL_SIGN") {
+                        s.rejected.fetch_add(1, Ordering::SeqCst);
+                        let error = "no such column: d.CALL_SIGN";
+                        if s.mode == Mode::NoCallSignColumnRpc {
+                            return sse(json!({"jsonrpc":"2.0","id":id,
+                                "error":{"code":-32603,"message":error}}));
+                        }
+                        return sse(json!({"jsonrpc":"2.0","id":id,
+                            "result":{"isError":true,"content":[{"type":"text",
+                                "text":format!("SQL error: {error}")}]}}));
+                    }
                     let mut r = rows();
                     if s.mode == Mode::NullBandwidth {
                         r["rows"][0][1] = Value::Null;
+                    }
+                    if older {
+                        // `NULL AS CALL_SIGN`: the column, empty.
+                        for row in r["rows"].as_array_mut().unwrap() {
+                            row[11] = Value::Null;
+                        }
                     }
                     if s.mode == Mode::NoCallSign {
                         r["columns"].as_array_mut().unwrap().pop();
@@ -180,6 +211,7 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
     let (url, stub) = serve(Mode::Normal).await;
     let provider = provider(&url, demo_station());
     assert_eq!(provider.name(), "acma");
+    assert!(provider.gives_assignments());
     let a = provider
         .allocations("AU", Hz(404_025_000), Hz(16_000))
         .await;
@@ -538,4 +570,43 @@ async fn allocations_from_another_station_cuts_and_measures_from_it() {
             .await,
         None
     );
+}
+
+#[tokio::test]
+async fn a_register_without_the_call_sign_column_is_probed_once_and_selects_null() {
+    for mode in [Mode::NoCallSignColumnRpc, Mode::NoCallSignColumnTool] {
+        let (url, stub) = serve(mode).await;
+        let provider = provider(&url, demo_station());
+        for center in [404_025_000, 404_030_000] {
+            let a = provider.allocations("AU", Hz(center), Hz(16_000)).await;
+            let asg: Vec<_> = a
+                .iter()
+                .filter(|x| x.kind.as_deref() == Some("assignment"))
+                .collect();
+            assert_eq!(asg.len(), 4, "{a:?}");
+            assert!(a.iter().all(|x| x.callsign.is_none()));
+            let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(q.contains("NULL AS CALL_SIGN"), "{q}");
+        }
+        // One rejected probe, then each lookup asks once: 1 + 2 queries.
+        assert_eq!(stub.rejected.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.queries.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.errors(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_register_with_the_column_is_asked_once_per_lookup() {
+    let (url, stub) = serve(Mode::Normal).await;
+    let provider = provider(&url, demo_station());
+    for _ in 0..2 {
+        provider
+            .allocations("AU", Hz(404_025_000), Hz(16_000))
+            .await;
+    }
+    assert_eq!(stub.queries.load(Ordering::SeqCst), 2);
+    assert_eq!(stub.rejected.load(Ordering::SeqCst), 0);
 }
