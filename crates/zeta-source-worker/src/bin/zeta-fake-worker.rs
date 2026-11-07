@@ -8,7 +8,8 @@
 //!   port faults and the worker exits 5.
 //! - `not-found`: exits 3 after `device not found: fake` on stderr.
 //! - `open-fails`: exits 4 after `fake open: no such device` on stderr.
-//! - `crash-after-ms N`: `stream`, and N ms after start `abort()` (SIGABRT).
+//! - `crash-after-ms N`: `stream`, and N ms after start `abort()` (SIGABRT,
+//!   without a core dump).
 //! - `hang-hello`: never writes a hello.
 //! - `hang-open`: installs the stop-signal handling the real worker installs,
 //!   prints `hanging in open` on stderr and blocks for good, as a driver hung
@@ -370,6 +371,13 @@ fn parse_ms(s: &str) -> Result<Duration, String> {
 
 /// Abort the process `after` from now, unless `ZETA_FAKE_CRASH_ONCE=1` and the
 /// marker beside the record file says an earlier spawn has crashed already.
+///
+/// The process is made non-dumpable first: the death is still SIGABRT, but
+/// without a core dump. A dump goes through the host's crash handler (apport,
+/// systemd-coredump), which holds the dying process for 100 ms unloaded and
+/// several times that when tests crash fakes at once on a loaded runner, so
+/// the time from the abort to the exit, and every timing measured across it,
+/// would depend on the host rather than on the supervisor.
 fn crash_after(after: Duration, record: Option<&Path>) {
     let marker = record.map(|p| {
         let mut m = p.as_os_str().to_owned();
@@ -385,6 +393,8 @@ fn crash_after(after: Duration, record: Option<&Path>) {
         if let Some(m) = marker {
             let _ = File::create(m);
         }
+        // SAFETY: `prctl` with plain integer arguments; no pointers.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
         std::process::abort();
     });
 }
