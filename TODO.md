@@ -468,3 +468,12 @@ From the operator, 2026-11-06, raised while scoping plan 28 (analog video): a vi
 ## Plans: VTX channel tables from the open VTX firmware
 
 From the operator, 2026-11-06, while scoping plan 28. The 5.8 GHz FPV channels are letter-named (A1-A8 descending, B on 19 MHz steps, E irregular, F, R on 37 MHz steps) and the plan registry numbers channels on uniform steps and matches a job within 1 kHz, so plan 28 ships no video plan. Later: lift the channel tables from the open VTX firmware (OpenVTx's and Betaflight's VTX tables, which carry every band and power level the transmitters themselves use), as `fpv_58` and `fpv_13` rows with letter names, and give a plan a match tolerance wide enough for a job centred on a measured carrier (plan 28's rule) to take its channel's name. `plan_start` on a video plan is not wanted.
+
+## Feature: SatNOGS support
+
+From the operator, 2026-11-07. SatNOGS (Libre Space Foundation) is the open network of satellite ground stations. SatNOGS DB holds the transmitters (frequency, mode, baud) and the TLEs. SatNOGS Network schedules observations onto stations, and `satnogs-client` with its `gr-satnogs` flowgraphs records each pass and uploads the waterfall, the audio and the decoded frames. Three layers, smallest first:
+- **The DB as a catalogue.** Read transmitters and TLEs the way the register is read (`knowledge_lookup`), predict passes for the station, and run a pass job that follows Doppler by retuning its channel inside a held capture. Nothing tracks a moving carrier today; the lease already lets a channel move within its band.
+- **Decoders as rows.** The common amateur downlinks: AFSK1200 and G3RUH 9600 AX.25 beside the APRS decoder, GMSK, CW beacons, and NOAA APT from the digital-modes gist, fed by the pass job.
+- **The node as a SatNOGS station.** Either take scheduled observations from the Network API and upload the artefacts and frames (an API token and the station id in config, like the SondeHub feed), or run `satnogs-client` against the node's source as an external program.
+
+Antenna caveat: the field host's 2 m / 70 cm vertical hears strong LEO passes only. Spec first; layer 1 is a plan on its own.
