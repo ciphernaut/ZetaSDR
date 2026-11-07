@@ -149,6 +149,25 @@ impl MockDevice {
             rate_hz,
             delivered,
             overflow_every,
+            overflow_reads: Vec::new(),
+        });
+        self
+    }
+
+    /// With paced reads, while the rate set is `rate_hz`: the reads numbered
+    /// in `reads` (from 1, counted from when the pace last restarted) overflow
+    /// at once and the rest deliver in full, so a test places single overflows
+    /// in time (a read is a hundredth of a second of samples for rates above
+    /// 1.6 MHz). Such an overflow is an event between full reads: it costs no
+    /// samples, so the delivered rate stays whole and only the overflow count
+    /// says anything.
+    pub fn overflow_reads_at(mut self, rate_hz: f64, reads: &[u64]) -> Self {
+        let paces = self.paced.get_or_insert_with(Arc::default);
+        Arc::make_mut(paces).push(Pace {
+            rate_hz,
+            delivered: 1.0,
+            overflow_every: 0,
+            overflow_reads: reads.to_vec(),
         });
         self
     }
@@ -419,6 +438,7 @@ struct Pace {
     rate_hz: f64,
     delivered: f64,
     overflow_every: u32,
+    overflow_reads: Vec<u64>,
 }
 
 /// A stream's pacing: the device's rate, the per-rate behaviour, and
@@ -437,17 +457,17 @@ impl Paced {
         if rate <= 0.0 {
             return None;
         }
-        let (delivered, every) = self
-            .paces
-            .iter()
-            .find(|p| (p.rate_hz - rate).abs() < 0.5)
-            .map_or((1.0, 0), |p| (p.delivered, p.overflow_every));
+        let pace = self.paces.iter().find(|p| (p.rate_hz - rate).abs() < 0.5);
+        let (delivered, every) = pace.map_or((1.0, 0), |p| (p.delivered, p.overflow_every));
         let clock = match &mut self.clock {
             Some(c) if c.0 == rate => c,
             c => c.insert((rate, Instant::now(), 0, 0)),
         };
-        clock.2 += len as u64;
         clock.3 += 1;
+        if pace.is_some_and(|p| p.overflow_reads.contains(&clock.3)) {
+            return Some(Err(ReadError::Overflow));
+        }
+        clock.2 += len as u64;
         let due = clock.1 + Duration::from_secs_f64(clock.2 as f64 / rate);
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);

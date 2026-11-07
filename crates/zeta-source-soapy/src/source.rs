@@ -362,8 +362,10 @@ impl SoapySource {
     }
 
     /// After the rate probe: stop the stream and wait for its reader to end,
-    /// then forget the tuning and the probe's overflows and timeouts, so the
-    /// source is as it opened (nothing tuned, nothing counted against it).
+    /// then forget the tuning, the probe's overflows, timeouts and stream
+    /// restarts (the restart window too) and any fault a rung left, so the
+    /// source is as a fresh open leaves it (nothing tuned, nothing counted
+    /// against it). A device given up as lost keeps its fault: that is final.
     pub(crate) async fn end_probe(&self) {
         let _gate = self.gate.lock().await;
         let handle = self
@@ -381,6 +383,11 @@ impl SoapySource {
         st.window.clear();
         st.overflows = 0;
         st.timeouts = 0;
+        st.restarts = 0;
+        st.restart_times.clear();
+        if !self.is_lost() {
+            st.fault = None;
+        }
     }
 
     /// Read overflows (samples dropped by the driver) since the source opened

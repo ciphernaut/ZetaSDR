@@ -5,7 +5,8 @@
 //! serving: `max_rate_hz=N` in the args asserts it; `--rate-cap-hz N` (a cap an earlier
 //! open measured, passed back by the node) reports it as measured; otherwise the device's
 //! rates are probed from the top ([`zeta_source_soapy::probe`]) and the first that
-//! streams cleanly is the measured cap.
+//! streams cleanly is the measured cap. A probe that finds no rate clean measures
+//! nothing: the device's own asserted cap stays, and the respawn probes again.
 //!
 //! A node attaches every `--source-soapy` device through this child (see
 //! `node_setup::open_soapy`), so a driver that crashes, hangs or leaks takes down a
@@ -137,11 +138,14 @@ mod imp {
 
     /// Set the source's rate cap before it is served: `asserted` (`max_rate_hz=`) as
     /// asserted; else `cached` (`--rate-cap-hz`) as measured; else the cap the rate
-    /// probe measures at the centre of the tune range, logged in one stderr line
-    /// (`, none clean` when no rate streamed cleanly and the cap is the slowest that
-    /// streamed). A probe that cannot tune any rate, or that lost the device, leaves the
-    /// device's own asserted cap, with a stderr line saying why: `serve` then reports
-    /// a lost device's fault and exits, and the respawn probes again.
+    /// probe measures at the centre of the tune range, logged in one stderr line. Only
+    /// a clean rate is a measurement: a probe that found none leaves the device's own
+    /// asserted cap, and its line names the slowest rate that streamed as the
+    /// `max_rate_hz=` to pin (a measured cap would be cached by the node and replayed
+    /// on every start, so a bad probe must not become one). A probe that cannot tune
+    /// any rate, or that lost the device, leaves the asserted cap too, with a stderr
+    /// line saying why: `serve` then reports a lost device's fault and exits, and the
+    /// respawn probes again.
     async fn set_rate_cap(
         src: &mut SoapySource,
         id: &str,
@@ -155,13 +159,21 @@ mod imp {
                 let caps = src.capabilities();
                 let center = (caps.tune_min_hz.value().0 + caps.tune_max_hz.value().0) / 2;
                 match probe_rate(src, center).await {
-                    Ok(p) => {
+                    Ok(p) if p.clean => {
                         let (cap, tried) = (p.cap_hz, p.tried);
-                        let none_clean = if p.clean { "" } else { ", none clean" };
                         eprintln!(
-                            "zeta-soapy-worker[{id}]: rate cap {cap} Hz measured ({tried} rungs tried{none_clean})"
+                            "zeta-soapy-worker[{id}]: rate cap {cap} Hz measured ({tried} rungs tried)"
                         );
                         Claim::Measured(Hz(cap))
+                    }
+                    Ok(p) => {
+                        // `cap_hz` is the slowest rate that streamed when none was
+                        // clean.
+                        let (lowest, tried) = (p.cap_hz, p.tried);
+                        eprintln!(
+                            "zeta-soapy-worker[{id}]: rate cap not measured: no rung clean ({tried} rungs tried, lowest {lowest} Hz); set max_rate_hz={lowest} to pin one"
+                        );
+                        return;
                     }
                     Err(e) => {
                         eprintln!("zeta-soapy-worker[{id}]: {e}; keeping the asserted cap");

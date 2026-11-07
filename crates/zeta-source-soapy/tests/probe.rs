@@ -1,5 +1,6 @@
 //! The rate probe against the paced mock device: candidates from the top of
-//! the ladder, the first clean one wins, and zeta's own `max_rate_hz=` item.
+//! the ladder, the first clean one wins (a sporadic overflow allowed, the
+//! settle after a retune not counted), and zeta's own `max_rate_hz=` item.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,13 +11,19 @@ use zeta_source_soapy::caps::RateModel;
 use zeta_source_soapy::device::RangeHz;
 use zeta_source_soapy::mock::MockDevice;
 use zeta_source_soapy::probe::{
-    PROBE_DWELL, PROBE_MAX_RUNGS, ProbeResult, probe_candidates, probe_rate, probe_rate_cap,
+    PROBE_DWELL, PROBE_MAX_OVERFLOWS, PROBE_MAX_RUNGS, PROBE_SETTLE, ProbeResult, probe_candidates,
+    probe_rate, probe_rate_cap,
 };
 use zeta_source_soapy::{SoapySource, ZetaArgs, split_zeta_args};
 
 const CENTER: u64 = 100_000_000;
 /// Every tenth read overflows: a rung the device cannot keep up with.
 const OVERFLOWING: u32 = 10;
+/// Reads 60 and 120 after a retune: about 0.6 s and 1.2 s in, inside the dwell
+/// that follows the 0.2 s settle (reads are 10 ms at the top rung).
+const IN_DWELL: [u64; 2] = [60, 120];
+/// Read 1: as the stream starts after a retune, inside the settle.
+const IN_SETTLE: u64 = 1;
 
 /// A UHD-like device at a 6.144 MHz master clock (a tenth of a B210's, so
 /// the paced reads stay cheap in a debug build), streaming in real time once
@@ -76,6 +83,41 @@ async fn a_ladder_is_probed_from_the_top_and_the_first_clean_rung_wins() {
 }
 
 #[tokio::test]
+async fn a_rung_with_one_overflow_in_its_dwell_is_clean() {
+    assert_eq!(PROBE_MAX_OVERFLOWS, 1);
+    let dev = Arc::new(ladder().overflow_reads_at(6.144e6, &IN_DWELL[..1]));
+    let src = source(&dev);
+    assert_eq!(
+        probe_rate(&src, CENTER).await,
+        Ok(ProbeResult {
+            cap_hz: 6_144_000,
+            tried: 1,
+            clean: true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_rung_with_two_overflows_in_its_dwell_is_rejected() {
+    let dev = Arc::new(ladder().overflow_reads_at(6.144e6, &IN_DWELL));
+    let src = source(&dev);
+    let opened = dev.calls().len();
+    assert_eq!(probe_rate_cap(&src, CENTER).await, Ok(3_072_000));
+    assert_eq!(
+        rate_calls(&dev, opened),
+        ["set_sample_rate(6144000)", "set_sample_rate(3072000)"]
+    );
+}
+
+#[tokio::test]
+async fn an_overflow_while_the_retune_settles_is_not_counted() {
+    // Two overflows in all, but the first falls in the settle window.
+    let dev = Arc::new(ladder().overflow_reads_at(6.144e6, &[IN_SETTLE, IN_DWELL[0]]));
+    let src = source(&dev);
+    assert_eq!(probe_rate_cap(&src, CENTER).await, Ok(6_144_000));
+}
+
+#[tokio::test]
 async fn a_rung_short_of_the_delivered_floor_is_rejected() {
     let dev = Arc::new(ladder().pace_at(6.144e6, 0.9, 0));
     let src = source(&dev);
@@ -109,7 +151,7 @@ async fn a_probe_that_never_streams_clean_caps_at_the_lowest_rung() {
         })
     );
     let took = start.elapsed();
-    let bound = (PROBE_DWELL + Duration::from_millis(500)) * PROBE_MAX_RUNGS as u32;
+    let bound = (PROBE_SETTLE + PROBE_DWELL + Duration::from_millis(500)) * PROBE_MAX_RUNGS as u32;
     assert!(took <= bound, "{took:?} > {bound:?}");
     assert_eq!(rate_calls(&dev, opened).len(), PROBE_MAX_RUNGS);
 }

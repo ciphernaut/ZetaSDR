@@ -2,10 +2,13 @@
 //!
 //! A device asserts the top of its rate range (a B210 61.44 MHz), but the host
 //! may not keep up with it: blocks overflow, or fewer samples arrive than the
-//! rate says. The worker therefore streams each candidate rate for
-//! [`PROBE_DWELL`], from the top down ([`probe_candidates`]), and reports the
-//! first that delivers at least [`PROBE_MIN_DELIVERED`] of its rate with no
-//! overflow as the source's `max_bandwidth_hz`, `Measured`.
+//! rate says. The worker therefore streams each candidate rate, from the top
+//! down ([`probe_candidates`]): after each retune it lets the stream settle for
+//! [`PROBE_SETTLE`], then dwells [`PROBE_DWELL`], and the first rate that
+//! delivers at least [`PROBE_MIN_DELIVERED`] of itself with at most
+//! [`PROBE_MAX_OVERFLOWS`] overflow in the dwell is clean. Only a clean rate is
+//! reported as the source's `max_bandwidth_hz`, `Measured`: the worker keeps
+//! the driver's asserted cap when none is (see [`ProbeResult::clean`]).
 
 use std::time::Duration;
 
@@ -15,9 +18,21 @@ use zeta_core::types::Hz;
 use crate::SoapySource;
 use crate::caps::{RateModel, pick_rate};
 
-/// How long each candidate rate streams.
+/// How long the stream runs after each retune before the probe counts
+/// anything: a retune restarts the stream, and a driver may drop a buffer or
+/// two while it does, which says nothing about the rate the host sustains.
+pub const PROBE_SETTLE: Duration = Duration::from_millis(200);
+/// How long each candidate rate streams, after [`PROBE_SETTLE`], while its
+/// overflows and delivered samples are counted.
 pub const PROBE_DWELL: Duration = Duration::from_millis(1500);
-/// The fraction of a candidate's rate that must arrive for it to pass.
+/// The most overflows in a dwell a rate may have and still pass. Not zero: the
+/// field host's B210 overflowed now and then at every rate in the plan's sweep
+/// (11 a minute at 30.72 Msps, which it otherwise holds, and more at slower
+/// rates), so a single sporadic overflow must not fail a rate the host keeps
+/// up with, while a host that cannot keep up overflows many times a second.
+pub const PROBE_MAX_OVERFLOWS: u64 = 1;
+/// The fraction of a candidate's rate that must arrive for it to pass: a host
+/// that falls behind delivers short without always overflowing.
 pub const PROBE_MIN_DELIVERED: f64 = 0.98;
 /// The most ladder rungs tried, from the top.
 pub const PROBE_MAX_RUNGS: usize = 6;
@@ -45,7 +60,9 @@ pub fn probe_candidates(model: &RateModel) -> Vec<u64> {
 
 /// What a rate probe found: the cap, how many candidate rates streamed (their
 /// tune succeeded), and whether the cap streamed cleanly (`false`: none did,
-/// and the cap is the slowest rate that streamed).
+/// and the cap is the slowest rate that streamed). A result that is not clean
+/// is no measurement: the worker keeps the driver's asserted cap and says to
+/// pin one with `max_rate_hz=`, so it is never cached and replayed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeResult {
     pub cap_hz: u64,
@@ -58,9 +75,10 @@ pub async fn probe_rate_cap(src: &SoapySource, center_hz: u64) -> Result<u64, St
     probe_rate(src, center_hz).await.map(|p| p.cap_hz)
 }
 
-/// Stream each of [`probe_candidates`] at `center_hz` for [`PROBE_DWELL`] and
-/// take the first rate that delivered at least [`PROBE_MIN_DELIVERED`] of
-/// itself with no new overflow. None passing is the slowest rate that
+/// Stream each of [`probe_candidates`] at `center_hz`, [`PROBE_SETTLE`] then
+/// [`PROBE_DWELL`], and take the first rate that delivered at least
+/// [`PROBE_MIN_DELIVERED`] of itself with at most [`PROBE_MAX_OVERFLOWS`] new
+/// overflow in the dwell. None passing is the slowest rate that
 /// streamed, not clean; a candidate whose tune fails is skipped. Every tune
 /// failing is an error, and so is a device the source gives up as lost during
 /// the probe: no cap comes out of a rate that killed the device. The stream is
@@ -93,6 +111,10 @@ async fn probe(src: &SoapySource, center_hz: u64) -> Result<ProbeResult, String>
         }
         tried += 1;
         lowest = Some(lowest.map_or(rate, |l| l.min(rate)));
+        tokio::time::sleep(PROBE_SETTLE).await;
+        if let Some(e) = lost(src, rate) {
+            return Err(e);
+        }
         let before = src.overflows();
         tokio::time::sleep(PROBE_DWELL).await;
         if let Some(e) = lost(src, rate) {
@@ -100,7 +122,7 @@ async fn probe(src: &SoapySource, center_hz: u64) -> Result<ProbeResult, String>
         }
         let overflows = src.overflows() - before;
         let measured = src.measured_rate_hz().unwrap_or(0.0);
-        if overflows == 0 && measured >= PROBE_MIN_DELIVERED * rate as f64 {
+        if overflows <= PROBE_MAX_OVERFLOWS && measured >= PROBE_MIN_DELIVERED * rate as f64 {
             return Ok(ProbeResult {
                 cap_hz: rate,
                 tried,
