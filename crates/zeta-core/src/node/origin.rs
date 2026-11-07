@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::persist::now;
 use super::{Inner, Node, NodeError};
+use crate::bursts::CaptureRecord;
+use crate::classify::Classification;
 use crate::job::JobRecord;
 use crate::knowledge::{Allocation, DEFAULT_REGION, KnowledgeProvider};
 use crate::modes::ModeRegistry;
@@ -562,10 +564,80 @@ pub fn job_modulation(rec: &JobRecord, modes: &ModeRegistry) -> Vec<String> {
     label.map(|l| vec![l.to_string()]).unwrap_or_default()
 }
 
+/// The modulation a classification measured: its layer-1 label (`fm`, `fsk`, ...), none
+/// for no layer-1 label or for `noise`.
+pub fn measured_modulation(c: &Classification) -> Vec<String> {
+    c.labels
+        .iter()
+        .find(|l| l.layer == 1 && l.name != "noise")
+        .map(|l| vec![l.name.clone()])
+        .unwrap_or_default()
+}
+
+impl Inner {
+    /// `c` with its origins scored: the band `center_hz` and `bandwidth_hz` of `source`,
+    /// the modulation `c` measured ([`measured_modulation`]). A `source` the node no
+    /// longer has reads as local ([`vantage_for`]).
+    pub(crate) async fn score_classification(
+        &self,
+        mut c: Classification,
+        source: &SourceId,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+    ) -> Classification {
+        let q = OriginQuery {
+            source: source.clone(),
+            center_hz,
+            bandwidth_hz,
+            modulation: measured_modulation(&c),
+            symbol_rate_baud: None,
+            job: None,
+            at: now(),
+        };
+        c.origins = Some(origins(self, &q).await);
+        c
+    }
+
+    /// [`crate::ops::classify_capture`] with the origins scored from the capture's own
+    /// source and band.
+    pub(crate) async fn classify_capture_scored(
+        &self,
+        rec: &CaptureRecord,
+    ) -> Result<Classification, String> {
+        let set = self.classifiers.read().unwrap().clone();
+        let c = crate::ops::classify_capture(&set, rec).await?;
+        Ok(self
+            .score_classification(c, &rec.source, rec.center_hz, rec.bandwidth_hz)
+            .await)
+    }
+}
+
 impl Node {
+    /// [`Inner::score_classification`].
+    pub(crate) async fn score_classification(
+        &self,
+        c: Classification,
+        source: &SourceId,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+    ) -> Classification {
+        self.inner
+            .score_classification(c, source, center_hz, bandwidth_hz)
+            .await
+    }
+
+    /// [`Inner::classify_capture_scored`].
+    pub(crate) async fn classify_capture_scored(
+        &self,
+        rec: &CaptureRecord,
+    ) -> Result<Classification, String> {
+        self.inner.classify_capture_scored(rec).await
+    }
+
     /// The `origin_lookup` op (design 4.2): by `job` alone, or by `source`, `center_hz`
     /// and `bandwidth_hz` together (anything else is refused, [`ORIGIN_FORMS`]). The band
-    /// form only answers, `modulation` `None` reading as unknown. The job form reads the
+    /// form only answers, `modulation` `None` reading as unknown, and refuses a source
+    /// the node does not have ([`NodeError::UnknownSource`]). The job form reads the
     /// band from the job ([`Inner::origin_job`]), publishes the answer and keeps it.
     pub async fn origin_lookup(
         &self,
@@ -578,6 +650,9 @@ impl Node {
         match (job, source, center_hz, bandwidth_hz) {
             (Some(job), None, None, None) => self.inner.origin_job(&job, modulation).await,
             (None, Some(source), Some(center_hz), Some(bandwidth_hz)) => {
+                if self.inner.port(&source).is_none() {
+                    return Err(NodeError::UnknownSource(source));
+                }
                 let q = OriginQuery {
                     source,
                     center_hz,
@@ -638,19 +713,31 @@ impl Inner {
             at: now(),
         };
         let a = origins(self, &q).await;
-        self.publish_origin(&rec, &a);
-        self.context_merge(id, serde_json::json!({ "origins": a }))?;
+        self.keep_origin(&rec.id, &rec.source, &a)?;
         Ok(a)
     }
 
-    /// Publish `a` as one `origin` event (design 4.3) on `rec`'s event output, and so on
-    /// its source's feed. A job with no event output registered now (an audio
-    /// demodulator, a job that ended) publishes on a stream registered for the one frame,
-    /// with the job's provenance, so the feed still carries it.
-    fn publish_origin(&self, rec: &JobRecord, a: &OriginAnswer) {
+    /// Merge `a` into job `id`'s context as `origins`, then publish it as one `origin`
+    /// event (design 4.3) on the job's event output, and so on its source's feed; nothing
+    /// is published when the merge fails (the job is gone). A job with no event output
+    /// registered now (an audio demodulator, a job that ended) publishes on a stream
+    /// registered for the one frame, with the job's provenance, so the feed still
+    /// carries it. `source` is the job's own source.
+    pub(super) fn keep_origin(
+        &self,
+        id: &JobId,
+        source: &SourceId,
+        a: &OriginAnswer,
+    ) -> Result<(), NodeError> {
+        self.context_merge(id, serde_json::json!({ "origins": a }))?;
+        self.publish_origin(id, source, a);
+        Ok(())
+    }
+
+    fn publish_origin(&self, id: &JobId, source: &SourceId, a: &OriginAnswer) {
         let payload = serde_json::json!({
             "protocol": "origin",
-            "job": rec.id.0,
+            "job": id.0,
             "source": a.source.0,
             "band": a.band,
             "modulation": a.modulation,
@@ -666,18 +753,18 @@ impl Inner {
             "t_ns": a.t_ns.0,
         });
         let prov = Provenance {
-            source: rec.source.clone(),
-            job: Some(rec.id.clone()),
+            source: source.clone(),
+            job: Some(id.clone()),
             channel: None,
             span: Span {
                 start_ns: a.t_ns,
                 end_ns: a.t_ns,
             },
         };
-        let out = self.jobs.lock().unwrap().get(&rec.id).and_then(|e| {
+        let out = self.jobs.lock().unwrap().get(id).and_then(|e| {
             e.outputs
                 .iter()
-                .find(|(k, s)| *k == StreamKind::Event && self.bus.subscribe(s).is_some())
+                .find(|(k, s)| *k == StreamKind::Event && self.bus.receiver_count(s).is_some())
                 .map(|(_, s)| s.clone())
         });
         let (stream, transient) = match out {

@@ -100,10 +100,12 @@ async fn classify_span(
             labels,
             tried,
             allocations,
+            origins,
         }) => Classification {
             labels,
             tried,
             allocations,
+            origins,
         },
         other => panic!("expected a classification, got {other:?}"),
     };

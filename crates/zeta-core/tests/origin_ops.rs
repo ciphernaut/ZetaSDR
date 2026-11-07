@@ -499,6 +499,24 @@ async fn the_band_form_returns_only_and_is_read_only() {
     assert_eq!(fits.agree, Agree::Fits);
 }
 
+/// The band form refuses a source the node does not have, as other source ops do.
+#[tokio::test]
+async fn the_band_form_refuses_an_unknown_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path(), true).await;
+    let Err(OpError::Unknown {
+        field,
+        value,
+        known,
+    }) = node.apply(by_band("nowhere", TONE_HZ, None)).await
+    else {
+        panic!("expected unknown source");
+    };
+    assert_eq!(field, "source");
+    assert_eq!(value, "nowhere");
+    assert!(known.contains(&"file0".to_string()), "{known:?}");
+}
+
 #[tokio::test]
 async fn both_or_neither_form_is_invalid() {
     let dir = tempfile::tempdir().unwrap();

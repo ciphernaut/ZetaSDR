@@ -2248,6 +2248,14 @@ pub enum OpResult {
         /// Always written; an older node's answer without it loads as empty.
         #[serde(default)]
         allocations: Vec<Allocation>,
+        /// The licensed transmitters the band may come from, scored on the measured
+        /// layer-1 label (`origin_lookup`'s answer); `null` from an older node.
+        #[serde(default)]
+        #[schemars(
+            required,
+            schema_with = "crate::types::nullable::<crate::node::OriginAnswer>"
+        )]
+        origins: Option<crate::node::OriginAnswer>,
     },
     /// A source's gain after `source_set_gain`.
     Gain(GainInfo),
@@ -3981,13 +3989,13 @@ async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
         labels,
         tried,
         allocations,
-    } = classify_capture(&node.classifiers(), &rec)
-        .await
-        .map_err(other)?;
+        origins,
+    } = node.classify_capture_scored(&rec).await.map_err(other)?;
     Ok(OpResult::Classification {
         labels,
         tried,
         allocations,
+        origins,
     })
 }
 
@@ -4034,18 +4042,23 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region);
     let allocations =
         nearest_allocations(&node.knowledge(), &region, sel.center_hz, sel.bandwidth_hz).await;
+    let classified = node
+        .classifiers()
+        .run_all(&samples, rate, center, band, None, allocations)
+        .await;
     let Classification {
         labels,
         tried,
         allocations,
+        origins,
     } = node
-        .classifiers()
-        .run_all(&samples, rate, center, band, None, allocations)
+        .score_classification(classified, &sel.source, sel.center_hz, sel.bandwidth_hz)
         .await;
     Ok(OpResult::Classification {
         labels,
         tried,
         allocations,
+        origins,
     })
 }
 

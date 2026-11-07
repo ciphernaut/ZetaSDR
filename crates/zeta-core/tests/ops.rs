@@ -828,14 +828,19 @@ async fn classify_op_runs_stub_and_returns_empty_labels() {
     node.add_classifier(Arc::new(StubClassifier));
     src.start();
     let selection = selection(&node, 100_000_000, 48_000).await;
-    assert_eq!(
-        node.apply(Op::Classify { selection }).await,
-        Ok(OpResult::Classification {
-            labels: vec![],
-            tried: vec![],
-            allocations: vec![],
-        })
-    );
+    let Ok(OpResult::Classification {
+        labels,
+        tried,
+        allocations,
+        origins,
+    }) = node.apply(Op::Classify { selection }).await
+    else {
+        panic!("expected Classification");
+    };
+    assert!(labels.is_empty() && tried.is_empty() && allocations.is_empty());
+    // Every classify scores its origins; with no register there are none to light.
+    let origins = origins.expect("origins");
+    assert!(origins.origins.is_empty() && origins.register_rows.is_none());
 }
 
 /// A licence register's answer: one transmitter, 16K0F1D, and one plan row.

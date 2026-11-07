@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use super::Inner;
 use crate::job::JobRecord;
-use crate::ops::classify_capture;
 
 /// Called by the launch's supervisor when the `capture` job `rec` (as it stands, its
 /// context included) has ended, before its end is recorded: `failed` is the reason of a
@@ -39,8 +38,7 @@ pub(super) async fn capture_finished(
     let Some(window) = inner.bursts.get(first) else {
         return;
     };
-    let set = inner.classifiers.read().unwrap().clone();
-    let classified = match classify_capture(&set, &window).await {
+    let classified = match inner.classify_capture_scored(&window).await {
         Ok(c) => serde_json::to_value(c).unwrap_or_default(),
         Err(e) => serde_json::json!({"error": e}),
     };

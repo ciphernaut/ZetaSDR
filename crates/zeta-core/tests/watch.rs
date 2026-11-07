@@ -796,6 +796,16 @@ async fn an_unknown_summary_names_the_licensee() {
     assert!(summary.contains(register), "{e}");
     let licensee = "Test Telemetry Pty Ltd";
     assert_eq!(e["allocations"][0]["licensee"], licensee, "{e}");
+    // The origins ride beside the allocations: the provider asked, the site lit.
+    assert_eq!(
+        e["origins"]["providers"],
+        serde_json::json!(["register"]),
+        "{e}"
+    );
+    assert_eq!(
+        e["origins"]["origins"][0]["allocation"]["licensee"], licensee,
+        "{e}"
+    );
     // The signal keeps the verdict's record and register answer.
     let ctx = node.job_context(&watch).unwrap();
     let s = &ctx["watch"]["signals"][0];
