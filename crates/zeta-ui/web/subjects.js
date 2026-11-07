@@ -40,7 +40,8 @@
 //   subjectSummary(subject) -> the row's summary template filled from the merged state
 //   subjectValues(subject) -> [{label, text, title}]   the row's columns through metricText
 //   fillSummary(template, fields) -> string   summary.rs's `fill`: `{f}`, `{f?}` (dropped with
-//     the separators before it), `{a?b}`, each with an optional `:.N` or `:+.N`
+//     the separators before it), `{a?b}`, each with an optional `:.N` or `:+.N`; trimmed at
+//     both ends
 //   mountSubjectsPane(el, store, view, {jobs, watching, footprint}) -> pane
 //     One `section.subject-job[data-job]` per running job with subjects or whose row has table
 //     columns, so a job heard nothing from yet says `0 aircraft` (an `h3` and a table of
@@ -139,7 +140,7 @@ export function fillSummary(template, fields) {
     else out += fieldText(fieldOf(fields, b), format);
     literalFrom = out.length;
   }
-  return (out + rest).trimEnd();
+  return (out + rest).trim();
 }
 
 // ---- a subject's text -------------------------------------------------------------------
