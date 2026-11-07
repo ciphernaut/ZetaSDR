@@ -27,6 +27,8 @@ enum Mode {
     Slow,
     /// One row without a `BANDWIDTH` (NULL in the register).
     NullBandwidth,
+    /// A service that answers no `CALL_SIGN` column.
+    NoCallSign,
 }
 
 #[derive(Default)]
@@ -49,21 +51,22 @@ fn sse(v: Value) -> Response {
 }
 
 /// Four 404.025 MHz assignments shaped as the register answers them (2026-11-02), every row
-/// synthetic: licensees, licences and sites made up, the sites near the demo station.
+/// synthetic: licensees, licences, sites and callsigns made up, the sites near the demo
+/// station. The last column, `CALL_SIGN`, is one a service may not answer.
 fn rows() -> Value {
     json!({
         "columns": ["FREQUENCY", "BANDWIDTH", "EMISSION", "DEVICE_TYPE", "TRANSMITTER_POWER",
             "TRANSMITTER_POWER_UNIT", "LICENCE_NO", "SITE_NAME", "LATITUDE", "LONGITUDE",
-            "LICENCEE"],
+            "LICENCEE", "CALL_SIGN"],
         "rows": [
             [404025000, 25000, "16K0F2D  ", "T", 1, "W", "9000001/1", "Example Rail Site A",
-                -27.950, 153.250, "Example Rail Operator"],
+                -27.950, 153.250, "Example Rail Operator", null],
             [404025000, 25000, "16K0F2D  ", "R", null, "W", "9000001/1",
-                "Example Rail Site B", -27.955, 153.255, "Example Rail Operator"],
+                "Example Rail Site B", -27.955, 153.255, "Example Rail Operator", null],
             [404025000, 25000, "16K0F1D  ", "T", 1, "W", "9000002/1",
-                "Example Site Hill Rd", -27.300, 153.100, "Example Water Authority"],
+                "Example Site Hill Rd", -27.300, 153.100, "Example Water Authority", "XX4EX"],
             [404025000, 25000, "16K0F1D  ", "R", null, "W", "9000002/1",
-                "Example Depot", -27.250, 153.120, "Example Water Authority"]
+                "Example Depot", -27.250, 153.120, "Example Water Authority", "XX4EX"]
         ],
         "truncated": false, "rowCount": 4, "result_id": "r1", "_hints": []
     })
@@ -119,6 +122,12 @@ async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Re
                     let mut r = rows();
                     if s.mode == Mode::NullBandwidth {
                         r["rows"][0][1] = Value::Null;
+                    }
+                    if s.mode == Mode::NoCallSign {
+                        r["columns"].as_array_mut().unwrap().pop();
+                        for row in r["rows"].as_array_mut().unwrap() {
+                            row.as_array_mut().unwrap().pop();
+                        }
                     }
                     r
                 }
@@ -400,5 +409,133 @@ async fn a_device_without_a_bandwidth_is_kept() {
             .any(|x| x.site.as_deref() == Some("Example Rail Site A")
                 && x.center_hz == Some(Hz(404_025_000))),
         "{asg:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_sql_names_call_sign_and_a_column_fills_it() {
+    let (url, stub) = serve(Mode::Normal).await;
+    let provider = provider(&url, demo_station());
+    let a = provider
+        .allocations("AU", Hz(404_025_000), Hz(16_000))
+        .await;
+    let asg: Vec<_> = a
+        .iter()
+        .filter(|x| x.kind.as_deref() == Some("assignment"))
+        .collect();
+    assert_eq!(asg.len(), 4);
+    let tx = asg
+        .iter()
+        .find(|x| x.emission.as_deref() == Some("16K0F1D") && x.role.as_deref() == Some("tx"))
+        .unwrap();
+    assert_eq!(tx.callsign.as_deref(), Some("XX4EX"));
+    let rail = asg
+        .iter()
+        .find(|x| x.site.as_deref() == Some("Example Rail Site A"))
+        .unwrap();
+    assert_eq!(rail.callsign, None);
+    assert!(
+        a.iter()
+            .filter(|x| x.kind.as_deref() == Some("plan"))
+            .all(|x| x.callsign.is_none())
+    );
+    let sql = stub.sql.lock().unwrap().clone().unwrap();
+    let q = sql["sql"].as_str().unwrap();
+    assert!(q.contains("d.CALL_SIGN AS CALL_SIGN"), "{q}");
+}
+
+#[tokio::test]
+async fn a_stub_without_the_column_leaves_callsign_null() {
+    let (url, _) = serve(Mode::NoCallSign).await;
+    let without = provider(&url, demo_station())
+        .allocations("AU", Hz(404_025_000), Hz(16_000))
+        .await;
+    let (url, _) = serve(Mode::Normal).await;
+    let with = provider(&url, demo_station())
+        .allocations("AU", Hz(404_025_000), Hz(16_000))
+        .await;
+    assert_eq!(without.len(), 8);
+    assert!(without.iter().all(|x| x.callsign.is_none()));
+    // Nothing else changes.
+    let cleared: Vec<_> = with
+        .into_iter()
+        .map(|mut x| {
+            x.callsign = None;
+            x
+        })
+        .collect();
+    assert_eq!(without, cleared);
+}
+
+#[tokio::test]
+async fn allocations_from_another_station_cuts_and_measures_from_it() {
+    let (url, stub) = serve(Mode::Normal).await;
+    let provider = provider(&url, demo_station());
+    // 100 km due north of the demo station.
+    let mut north = demo_station().unwrap();
+    north.lat += 100.0 / 111.195;
+    let a = provider
+        .allocations_from("AU", Hz(404_025_000), Hz(16_000), Some(&north))
+        .await;
+    let asg: Vec<_> = a
+        .iter()
+        .filter(|x| x.kind.as_deref() == Some("assignment"))
+        .collect();
+    // The rail sites, about 165 km from the north station, fall outside the 150 km
+    // reach; the hill site 9 km from the demo station is about 91 km from it.
+    assert!(
+        !asg.is_empty()
+            && asg
+                .iter()
+                .all(|x| x.licensee.as_deref() == Some("Example Water Authority")),
+        "{asg:?}"
+    );
+    let hill = asg
+        .iter()
+        .find(|x| x.site.as_deref() == Some("Example Site Hill Rd"))
+        .unwrap();
+    let d = hill.distance_km.unwrap();
+    assert!((90.0..92.0).contains(&d), "{d}");
+    let b = hill.bearing_deg.unwrap();
+    assert!((150.0..200.0).contains(&b), "{b}"); // about south
+    // The query's box is around the north station.
+    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (lo, hi) = (north.lat - 150.0 / 111.0, north.lat + 150.0 / 111.0);
+    assert!(
+        q.contains(&format!("s.LATITUDE BETWEEN {lo:.6} AND {hi:.6}")),
+        "{q}"
+    );
+    let r = provider
+        .reach_from("AU", Hz(404_025_000), Hz(16_000), Some(&north))
+        .await
+        .unwrap();
+    assert_eq!(r.km, Some(150.0));
+
+    // No vantage: no distances and no box, though the provider has a station.
+    let a = provider
+        .allocations_from("AU", Hz(404_025_000), Hz(16_000), None)
+        .await;
+    let asg: Vec<_> = a
+        .iter()
+        .filter(|x| x.kind.as_deref() == Some("assignment"))
+        .collect();
+    assert_eq!(asg.len(), 4);
+    assert!(
+        asg.iter()
+            .all(|x| x.distance_km.is_none() && x.bearing_deg.is_none())
+    );
+    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!q.contains("LATITUDE BETWEEN"), "{q}");
+    assert_eq!(
+        provider
+            .reach_from("AU", Hz(404_025_000), Hz(16_000), None)
+            .await,
+        None
     );
 }

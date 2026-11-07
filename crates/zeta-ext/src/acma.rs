@@ -104,6 +104,7 @@ struct Row {
     lat: Option<f64>,
     lon: Option<f64>,
     licensee: Option<String>,
+    callsign: Option<String>,
 }
 
 /// The station, the antenna serving the band and the band's reach from it.
@@ -115,7 +116,8 @@ struct Here {
 
 impl AcmaKnowledge {
     /// `override_km` replaces the reach rule's kilometres (see [`reach_for`]);
-    /// `station` is asked once per lookup.
+    /// `station` is asked once per `allocations` or `reach`; the `_from` methods take
+    /// their vantage instead.
     pub fn new(client: McpClient, override_km: Option<f64>, station: StationFn) -> Self {
         Self {
             client,
@@ -304,12 +306,26 @@ impl KnowledgeProvider for AcmaKnowledge {
         ACMA_PROVIDER
     }
 
+    /// From the node's station, asked now.
     async fn allocations(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Allocation> {
+        let station = (self.station)();
+        self.allocations_from(region, center_hz, bandwidth_hz, station.as_ref())
+            .await
+    }
+
+    /// Distances, bearings, the reach cut and the query's box all from `from`;
+    /// without it the list is by frequency distance, as with no station.
+    async fn allocations_from(
+        &self,
+        region: &str,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+        from: Option<&Station>,
+    ) -> Vec<Allocation> {
         if !answers(region) {
             return Vec::new();
         }
-        let station = (self.station)();
-        self.guarded(self.lookup(station, center_hz, bandwidth_hz))
+        self.guarded(self.lookup(from.cloned(), center_hz, bandwidth_hz))
             .await
             .unwrap_or_default()
     }
@@ -322,11 +338,25 @@ impl KnowledgeProvider for AcmaKnowledge {
     /// station (the reach is not applied then). It reuses the plan answer of the
     /// `allocations()` just made at this centre (see [`ACMA_PLAN_TTL`]) and asks the
     /// service only when there is none; a plan that failed reads as no space band.
-    async fn reach(&self, region: &str, center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
+    async fn reach(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Option<Reach> {
+        let station = (self.station)();
+        self.reach_from(region, center_hz, bandwidth_hz, station.as_ref())
+            .await
+    }
+
+    /// The band's reach from `from`, as [`reach`](KnowledgeProvider::reach) gives it
+    /// from the station; `None` without `from`.
+    async fn reach_from(
+        &self,
+        region: &str,
+        center_hz: Hz,
+        _bandwidth_hz: Hz,
+        from: Option<&Station>,
+    ) -> Option<Reach> {
         if !answers(region) {
             return None;
         }
-        let station = (self.station)()?;
+        let station = from?.clone();
         let space = match self.fresh_memo(center_hz) {
             Some(space) => space,
             None => self
@@ -400,6 +430,7 @@ fn parse_rows(v: &Value) -> Result<Vec<Row>, String> {
         "LATITUDE",
         "LONGITUDE",
         "LICENCEE",
+        "CALL_SIGN",
     ]
     .map(col);
     Ok(rows
@@ -426,6 +457,8 @@ fn parse_rows(v: &Value) -> Result<Vec<Row>, String> {
                 lat: get(8).and_then(Value::as_f64),
                 lon: get(9).and_then(Value::as_f64),
                 licensee: text(10),
+                // `None` too from a service whose answer lacks the column.
+                callsign: text(11),
             })
         })
         .collect())
@@ -459,7 +492,7 @@ fn assignments_sql(center_hz: Hz, bandwidth_hz: Hz, bbox: Option<(f64, f64, f64)
          d.DEVICE_TYPE AS DEVICE_TYPE, d.TRANSMITTER_POWER AS TRANSMITTER_POWER, \
          d.TRANSMITTER_POWER_UNIT AS TRANSMITTER_POWER_UNIT, d.LICENCE_NO AS LICENCE_NO, \
          s.NAME AS SITE_NAME, s.LATITUDE AS LATITUDE, s.LONGITUDE AS LONGITUDE, \
-         c.LICENCEE AS LICENCEE \
+         c.LICENCEE AS LICENCEE, d.CALL_SIGN AS CALL_SIGN \
          FROM device_details d \
          JOIN site s ON s.SITE_ID = d.SITE_ID \
          LEFT JOIN licence l ON l.LICENCE_NO = d.LICENCE_NO \
@@ -528,6 +561,7 @@ fn assignment(r: Row, here: Option<&Here>) -> Allocation {
         center_hz: Some(Hz(r.frequency)),
         bandwidth_hz: Some(Hz(r.bandwidth)),
         licence_no: r.licence_no,
+        callsign: r.callsign,
         role,
         emission: r.emission,
         emission_decoded,
