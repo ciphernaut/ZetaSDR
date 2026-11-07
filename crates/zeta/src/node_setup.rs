@@ -705,8 +705,22 @@ mod tests {
                                 "{rate} {bw} {min}"
                             );
                         }
-                        Err(OpError::OutOfRange { field, .. }) if field == "bandwidth_hz" => {
-                            assert!(rate == 12_000 && bw == 12_500, "{kind:?} {rate} {bw}");
+                        // A band wider than the source is refused, for every kind (the
+                        // 12.5 kHz band at a 12 kHz source); and an IQ program row refuses a
+                        // band narrower than its own least (`band.min_hz`, else
+                        // `band.bandwidth_hz`: VDL2's 25 kHz), at any rate.
+                        Err(OpError::OutOfRange { field, min, .. }) if field == "bandwidth_hz" => {
+                            let row_least = match &kind {
+                                JobKind::Mode(id) => modes
+                                    .get(&id.0)
+                                    .map(|m| m.row.band.min_hz.unwrap_or(m.row.band.bandwidth_hz)),
+                                _ => None,
+                            };
+                            assert!(
+                                (rate == 12_000 && bw == 12_500)
+                                    || row_least.is_some_and(|least| bw < least && min == least),
+                                "{kind:?} {rate} {bw} {min}"
+                            );
                         }
                         // An identify runs no graph: the node drives the source and its
                         // child jobs itself.
