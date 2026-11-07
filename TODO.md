@@ -163,7 +163,6 @@ From the operator, 2026-10-27. Plan 19.2 shipped the stages (`capture_in`, `resa
 - Live chains by hand on a real capture (spec 9 item 3, after 19.3): the 404.025 MHz captures through `bits_start` and the Bits tab.
 - LoRa chirp-rate detection in `measure` (an unknown 250 kHz chirp is reported unknown today).
 - The `measure` upgrades 19.1 did not take: `measure` finds no symbol rate on short FSK bursts (the e2e fixture's captures had none, so `bits_start` needs `symbol_rate_baud` given), and better order estimates from constellation moments.
-- Write-back of a successful hypothesis as a signature (plan 19.3).
 
 ## Bits: deferred minors from plan 19.2
 
@@ -181,18 +180,36 @@ From the operator, 2026-10-27. Plan 19.2 shipped the stages (`capture_in`, `resa
 - A `stream_in` root in `graph_start` names a stream id that changes per launch (a relaunch or a resume reads a dead stream): fail it at `graph_start`, or document it.
 - A wider sync word hides a 16-bit sync followed by a constant header byte: the CRC search then cuts frames at the 24-bit word; try the CRC from each contained width.
 
-## Feature: generic layer-4 framing decoders (bits to structured frames)
+## Feature: built-in rows for the layer-4 parsers
 
-From the 2026-10-29 404.025 MHz investigation. The bit-level loop above gets an unknown signal to a bit stream; it stops there and the agent reads raw hex. A generic framing layer would carry the common clear, unencrypted link protocols seen on licensed UHF data channels, so the agent can report structured frames instead of hex.
-
-Scope, generic only: a `frame_decode` stage (or a `framing` family of mode rows) that takes a `bits` stream and applies a declared framing: preamble/sync-word hunt, length field, bit order and whitening (NRZI, Manchester, differential), and a CRC check (a small library of polynomials: CRC-16-CCITT, -IBM, -DNP, CRC-32). On a clean frame it emits an `event` with the raw payload bytes and the framing that matched; it does not interpret the payload. Then thin, well-known serial-over-radio parsers as separate rows, each a pure bytes-to-fields decoder with a CRC gate: Modbus RTU, DNP3, IEC 60870-5-101/104. These are published open standards; the decoder is the generic protocol, chosen by signature match or named by the operator, never built against one named licensee's traffic.
+Plan 19.3 delivered `frame_decode`, frame rows, and the `frame_parse` parsers (`modbus_rtu`, `dnp3`, `iec101`, `iec104`), which an operator frame row reaches through `decoder.parser`. What remains (2026-11-08): built-in parser rows for dnp3, iec101 and iec104 were dropped, because a row with no centre is tried on every band in classify and identify, and iec104 has no check strong enough against noise. A built-in parser row wants a way to be excluded from blind scoring and chosen only by a signature match or by name; then each row gets its synthesiser test so `modes check` proves it offline.
 
 Boundary (explicit, so a future session does not drift): this decodes clear, unencrypted, standards-based framing that the node is lawfully receiving. It never attempts to break encryption, never targets a specific operator's link as the deliverable, and emits no transmit path. An encrypted or proprietary payload is reported as `framed, opaque` with its length and CRC status, not decoded.
 
-Needs: the `bits` stream kind and the layer-4 demod/slicer stages above (prerequisite); a CRC/whitening helper in `zeta-dsp`; one `frame_decode` stage; one row per serial protocol with its `event` schema and `summary`. Each protocol row gets a synthesiser test (plan 17's families plus a framing generator) so `modes check` proves it offline, no live capture of anyone's link required.
-
-
 Scope estimate: the stage set about 1500-2500 lines in `zeta-dsp` with fixtures (synthesised FSK/PSK/OOK at known rates); `bit_view` heuristics 400-600; signature write-back 200-300; the `measure` upgrades 300-500. Two or three plans.
+
+## Signatures: deferred minors from plan 19.3
+
+- `matches` counts every classify, a `capture_classify` replay included.
+- No decay of a learned signature's confidence (a spec non-goal).
+- A hand `signature_propose` with a framing carries no CRC count, so it is 0.6 at most.
+- The Bits pane does not show `frame` events (a `crc ok|bad` tag per frame row would).
+- A learned row's `band.centers_hz` is one centre, so a link that moves channel scores only the signature.
+- The IEC 101 fixed-length frame is not decoded.
+- `frame_decode`'s `manchester` phase is chosen per segment by the sync hunt.
+- `measure` recovers no symbol rate from direct FSK keying on the e2e fixture (7 of 8 captures), so a framed accept from such a capture writes no learned row (it needs a rate): improve FSK symbol-rate measurement (2026-11-08).
+- Sessions with no captures (graph jobs, frame-row jobs on a radio) are never swept, so `state_dir/sessions` grows without bound: add a cap or an age limit (2026-11-08).
+- The demod/slicer chain loses bodies with long zero runs (the 11a iec104 vector does not decode end to end): a scrambled or bit-stuffed test vector, or a slicer that holds its threshold through runs (2026-11-08).
+- `matched()` writes the record on every match, watch retries included.
+- identify counts a learned match even when a decoder then proves the row.
+- A panicked stage in `offline::run_chain` never unregisters its bus stream.
+- Pins are left behind when an accept loses a race to a reject or hits an I/O error.
+- One malformed allocation drops all of a capture's allocations in `signature_propose`.
+- The page's event views show a frame job's `timing` and `bits` events as noise.
+
+## Program rows on events
+
+A program row whose `decoder.input.stream` is `event` (JSON lines of a running job's events, `frame` events included, on stdin), so an operator pipes a frame row to an external parser or handler, Modbus RTU being the operator's example (2026-11-06). Today only a plugin stage on a graph row takes event input.
 
 ## Architecture: a mode registry and a generic external-decoder adaptor
 
