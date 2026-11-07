@@ -3957,7 +3957,8 @@ def llm_url():
     return url.rstrip("/")
 
 
-NO_ALLOW = {"stop_jobs": False, "replace": False, "delete_captures": False}
+NO_ALLOW = {"stop_jobs": False, "replace": False, "delete_captures": False,
+            "accept_signatures": False}
 
 
 def capture_asks(page):
@@ -4009,7 +4010,8 @@ def scenario_not_allowed_shows_the_unlock_and_reruns_with_the_allowance(page, ur
     assert asks[0]["allow"]["stop_jobs"] is False, asks[0]
     assert asks[1]["allow"]["stop_jobs"] is True, asks[1]
     assert asks[1]["request"] == "stop the measure", asks[1]
-    assert asks[1]["allow"] == {"stop_jobs": True, "replace": True, "delete_captures": False}, \
+    assert asks[1]["allow"] == {"stop_jobs": True, "replace": True, "delete_captures": False,
+                                "accept_signatures": False}, \
         asks[1]
     # The note's button disables once clicked, and the unlock was for that request only:
     # the session's `allow stops` switch is still off for the next plain ask.
@@ -4039,14 +4041,16 @@ def scenario_not_allowed_delete_offers_the_delete_unlock(page, url, secret):
            ).to_have_count(1)
     assert len(asks) == 2, f"two /ask requests: {asks}"
     assert asks[0]["allow"] == NO_ALLOW, asks[0]
-    assert asks[1]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True}, \
+    assert asks[1]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True,
+                                "accept_signatures": False}, \
         asks[1]
     # The switch: every following ask carries delete_captures until turned off.
     run_cmd(page, "allow deletes on")
     run_cmd(page, "think")
     expect(page.locator("#transcript .line.assistant", has_text="one source")).to_have_count(1)
     assert len(asks) == 3, f"three /ask requests: {asks}"
-    assert asks[2]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True}, \
+    assert asks[2]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True,
+                                "accept_signatures": False}, \
         asks[2]
 
 

@@ -284,6 +284,8 @@ struct Inner {
     themes: RwLock<Arc<crate::themes::ThemeRegistry>>,
     /// The `capture` jobs' windows, opened (and expired) at `open`.
     bursts: Arc<crate::bursts::BurstStore>,
+    /// The learned signatures, opened at `open`.
+    signatures: Arc<crate::signatures::SignatureStore>,
     leases: LeaseManager,
     bus: Arc<StreamBus>,
     ports: RwLock<HashMap<SourceId, Arc<dyn Port>>>,
@@ -812,6 +814,8 @@ impl Node {
         if cfg.burst_policy.expire_at_open {
             bursts.expire();
         }
+        let signatures = crate::signatures::SignatureStore::open(&cfg.state_dir).map_err(io)?;
+        load_errors.extend(signatures.load_errors().iter().cloned());
         let modes = modes
             .unwrap_or_else(|| Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref())));
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
@@ -840,6 +844,7 @@ impl Node {
                 modes,
                 themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
                 bursts,
+                signatures,
                 leases: LeaseManager::new(),
                 bus,
                 ports: RwLock::new(HashMap::new()),
@@ -959,7 +964,8 @@ impl Node {
 
     /// Files in `state_dir/jobs` that could not be read as a `JobRecord`, or
     /// whose record id is not a ULID matching the file name; files in
-    /// `state_dir/sources` that could not be read as a [`SourceRecord`]; and the
+    /// `state_dir/sources` that could not be read as a [`SourceRecord`]; files in
+    /// `state_dir/signatures` that could not be read as a signature record; and the
     /// pins `open` could not restore.
     pub fn load_errors(&self) -> &[String] {
         &self.load_errors
@@ -1061,6 +1067,169 @@ impl Node {
         self.inner.bursts.clone()
     }
 
+    /// The learned signatures (`state_dir/signatures`).
+    pub fn signatures(&self) -> Arc<crate::signatures::SignatureStore> {
+        self.inner.signatures.clone()
+    }
+
+    /// An `unknown` error naming `id` and the store's signature ids.
+    pub(crate) fn unknown_signature(&self, id: &str) -> OpError {
+        OpError::Unknown {
+            field: "id".into(),
+            value: id.into(),
+            known: self
+                .signatures()
+                .list(None)
+                .into_iter()
+                .map(|r| r.id)
+                .collect(),
+        }
+    }
+
+    /// The store's refusal as the ops answer it: an unknown id names the store's ids, a
+    /// record in the wrong state is `signature <id> is <state>, not proposed`.
+    fn signature_error(&self, e: crate::signatures::StoreError) -> OpError {
+        use crate::signatures::StoreError;
+        match e {
+            StoreError::Unknown(id) => self.unknown_signature(&id),
+            StoreError::State { id, state } => OpError::Other {
+                message: format!("signature {id} is {state}, not proposed"),
+            },
+            e @ StoreError::Io(_) => OpError::Other {
+                message: e.to_string(),
+            },
+        }
+    }
+
+    /// `signature_propose`: a proposal from the capture `capture`, by the transport
+    /// `by`. The capture's feature record and its layer-1 label (by
+    /// [`crate::ops::classify_capture`]; `noise` is refused) make the waveform; its set's
+    /// captures, its job, its first `tx` assignment and the node's station the
+    /// provenance. A `framing` the `frame_decode` stage refuses is `framing: <reason>`.
+    pub async fn signature_propose(
+        &self,
+        capture: &str,
+        name: Option<String>,
+        framing: Option<serde_json::Value>,
+        by: &str,
+    ) -> Result<crate::signatures::SignatureRecord, OpError> {
+        use crate::modes::FRAME_DECODE_STAGE;
+        use crate::signatures::{NOISE_LABEL, NewSignature};
+        let other = |message: String| OpError::Other { message };
+        let bursts = self.bursts();
+        let rec = bursts.get(capture).ok_or_else(|| OpError::Unknown {
+            field: "capture".into(),
+            value: capture.into(),
+            known: bursts.list().into_iter().map(|r| r.id).collect(),
+        })?;
+        let features: crate::classify::FeatureRecord = serde_json::from_value(rec.features.clone())
+            .map_err(|_| other(format!("capture {capture} has no feature record")))?;
+        if let Some(f) = &framing {
+            let registry = &self.inner.registry;
+            if registry.spec(FRAME_DECODE_STAGE).is_none() {
+                return Err(other(format!(
+                    "framing: {FRAME_DECODE_STAGE} is not a registered stage"
+                )));
+            }
+            registry
+                .check_params(FRAME_DECODE_STAGE, f)
+                .map_err(|e| other(format!("framing: {e}")))?;
+        }
+        let classified = crate::ops::classify_capture(&self.classifiers(), &rec)
+            .await
+            .map_err(other)?;
+        let label = classified
+            .labels
+            .into_iter()
+            .find(|l| l.layer == 1)
+            .ok_or_else(|| other(format!("capture {capture} has no layer-1 label")))?;
+        if label.name == NOISE_LABEL {
+            return Err(other(format!(
+                "capture {capture} is noise: nothing to propose"
+            )));
+        }
+        let allocation =
+            serde_json::from_value::<Vec<crate::knowledge::Allocation>>(rec.allocations.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|a| a.role.as_deref() == Some("tx"));
+        // The set's captures in the order they were written.
+        let mut captures: Vec<String> = bursts
+            .list()
+            .into_iter()
+            .filter(|r| r.set == rec.set)
+            .map(|r| r.id)
+            .collect();
+        captures.reverse();
+        let evidence = match framing {
+            Some(_) => format!("framing given by hand; {}", label.evidence),
+            None => format!("features only: {}", label.evidence),
+        };
+        let new = NewSignature {
+            name,
+            features,
+            modulation: label.name,
+            framing,
+            crc_frames: 0,
+            evidence,
+            source: rec.source,
+            station: self.station(),
+            captures,
+            jobs: vec![rec.job],
+            allocation,
+            proposed_by: by.to_string(),
+        };
+        self.signatures()
+            .propose(new, now().0)
+            .map_err(|e| self.signature_error(e))
+    }
+
+    /// `signature_accept`: accept the proposal `id` (renamed to `name` when given) by the
+    /// transport `by`, pinning every one of its captures still in the burst store. The
+    /// captures are pinned first, so an accepted record never has captures left to expire.
+    pub fn signature_accept(
+        &self,
+        id: &str,
+        name: Option<String>,
+        by: &str,
+    ) -> Result<crate::signatures::SignatureRecord, OpError> {
+        use crate::signatures::{SignatureState, StoreError};
+        let store = self.signatures();
+        let rec = store.get(id).ok_or_else(|| self.unknown_signature(id))?;
+        if rec.state != SignatureState::Proposed {
+            return Err(self.signature_error(StoreError::State {
+                id: rec.id,
+                state: rec.state,
+            }));
+        }
+        let bursts = self.bursts();
+        for c in &rec.provenance.captures {
+            match bursts.pin(c) {
+                // Expired or deleted since the proposal: nothing left to keep.
+                Ok(()) | Err(crate::bursts::StoreError::Unknown(_)) => {}
+                Err(e) => {
+                    return Err(OpError::Other {
+                        message: format!("capture {c}: {e}"),
+                    });
+                }
+            }
+        }
+        store
+            .accept(id, name, by, now().0)
+            .map_err(|e| self.signature_error(e))
+    }
+
+    /// `signature_reject`: reject the proposal `id`, by the transport `by`.
+    pub fn signature_reject(
+        &self,
+        id: &str,
+        by: &str,
+    ) -> Result<crate::signatures::SignatureRecord, OpError> {
+        self.signatures()
+            .reject(id, by, now().0)
+            .map_err(|e| self.signature_error(e))
+    }
+
     pub(crate) fn knowledge(&self) -> Vec<Arc<dyn KnowledgeProvider>> {
         self.inner.knowledge.read().unwrap().clone()
     }
@@ -1134,7 +1303,7 @@ impl Node {
         let logged = op.clone();
         let start_ns = now();
         let started = std::time::Instant::now();
-        let outcome = crate::ops::apply(self, op).await;
+        let outcome = crate::ops::apply(self, op, transport).await;
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let payload = crate::ops::ops_payload(&logged, &outcome, elapsed_ms, transport);
         let mut line = payload.clone();

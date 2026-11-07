@@ -562,7 +562,7 @@ pub const QUICK_ATTEMPTS: [&str; 5] = ["aprs", "pocsag", "acars", "rds", "frame"
 /// The parsers a frame row's `decoder.parser` may name.
 pub const FRAME_PARSERS: &[&str] = &["opaque"];
 /// The stage a frame row's framing is checked by and runs in.
-const FRAME_DECODE_STAGE: &str = "frame_decode";
+pub(crate) const FRAME_DECODE_STAGE: &str = "frame_decode";
 /// Name suffixes of fields that hold an integer in their unit.
 const UNIT_SUFFIXES: [&str; 4] = ["_hz", "_ms", "_ns", "_baud"];
 

@@ -18,6 +18,7 @@ pub mod plans;
 pub mod port;
 pub mod reach;
 pub mod ring;
+pub mod signatures;
 pub mod stage;
 pub mod station;
 pub mod stream;

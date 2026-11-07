@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::stage::StageRegistry;
 
+pub(crate) use row::FRAME_DECODE_STAGE;
 pub use row::{
     AltUnit, Band, Container, Decoder, DecoderKind, Demod, Event, FRAME_PARSERS, Family,
     FrameBlock, FrameDemod, Identify, InputStream, InputVia, Install, ModeId, ModeRow, OutputVia,

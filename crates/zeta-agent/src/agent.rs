@@ -11,7 +11,8 @@ use zeta_client::{ToolDef, op_from_call, op_tools, system_prompt};
 use zeta_core::ops::OpError;
 
 /// What a run may do beyond reading and starting: stopping jobs is the
-/// operator's call, so both switches are off unless the run is allowed.
+/// operator's call, as are deleting captures and answering signature proposals, so
+/// every switch is off unless the run is allowed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Allow {
@@ -21,7 +22,12 @@ pub struct Allow {
     pub replace: bool,
     /// `capture_delete` may be applied.
     pub delete_captures: bool,
+    /// `signature_accept` and `signature_reject` may be applied.
+    pub accept_signatures: bool,
 }
+
+/// The operations that answer a signature proposal: the operator's decision.
+pub const GATED_SIGNATURE_OPS: &[&str] = &["signature_accept", "signature_reject"];
 
 /// The operations whose `replace` stops jobs to make room.
 pub const GATED_REPLACE_OPS: &[&str] = &[
@@ -33,7 +39,9 @@ pub const GATED_REPLACE_OPS: &[&str] = &[
 ];
 
 /// `Some(error)` when `op` would stop jobs and the run is not allowed to:
-/// a `job_stop`, or a gated op with a non-empty `replace`. The executor is
+/// a `job_stop`, or a gated op with a non-empty `replace`; likewise a
+/// `capture_delete` without `delete_captures`, and a `signature_accept` or
+/// `signature_reject` without `accept_signatures`. The executor is
 /// never reached; the error goes back to the model as the call's result.
 pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
     // `op_from_call` always inserts `"op"`, so a value without a name never comes from a call.
@@ -47,6 +55,17 @@ pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
             "field": "op",
             "op": name,
             "message": "deleting captures is not allowed in this run: report it to the operator; they unlock it by allowing capture deletes for the run",
+        }));
+    }
+    if GATED_SIGNATURE_OPS.contains(&name) {
+        if allow.accept_signatures {
+            return None;
+        }
+        return Some(json!({
+            "error": "not_allowed",
+            "field": "op",
+            "op": name,
+            "message": "accepting or rejecting a signature is the operator's decision: report the proposal to the operator; they unlock it by allowing signatures for the run",
         }));
     }
     let field = if name == "job_stop" || name == "jobs_stop" {
@@ -387,6 +406,42 @@ impl<E: Executor> Agent<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_accept_and_reject_are_gated() {
+        let accept = json!({"op": "signature_accept", "id": "01SIG", "name": null});
+        let reject = json!({"op": "signature_reject", "id": "01SIG"});
+        for op in [&accept, &reject] {
+            let refused = gate(op, Allow::default()).expect("refused");
+            assert_eq!(
+                refused,
+                json!({
+                    "error": "not_allowed",
+                    "field": "op",
+                    "op": op["op"],
+                    "message": "accepting or rejecting a signature is the operator's decision: report the proposal to the operator; they unlock it by allowing signatures for the run",
+                })
+            );
+            // Allowing stops and deletes does not allow signatures.
+            let others = Allow {
+                stop_jobs: true,
+                replace: true,
+                delete_captures: true,
+                accept_signatures: false,
+            };
+            assert!(gate(op, others).is_some());
+            let allowed = Allow {
+                accept_signatures: true,
+                ..Allow::default()
+            };
+            assert!(gate(op, allowed).is_none());
+        }
+        let propose =
+            json!({"op": "signature_propose", "capture": "01CAP", "name": null, "framing": null});
+        assert!(gate(&propose, Allow::default()).is_none());
+        let list = json!({"op": "signature_list", "state": null});
+        assert!(gate(&list, Allow::default()).is_none());
+    }
 
     #[test]
     fn own_jobs_count_bits_start_results() {

@@ -272,7 +272,7 @@ async fn ask_allow_defaults_to_false_and_rejects_an_unknown_key() {
     let t: Value = resp.json().await.unwrap();
     assert_eq!(
         t["allow"],
-        json!({"stop_jobs": false, "replace": false, "delete_captures": false})
+        json!({"stop_jobs": false, "replace": false, "delete_captures": false, "accept_signatures": false})
     );
     assert_eq!(t["turn_log"].as_array().unwrap().len(), 2);
 
@@ -286,7 +286,7 @@ async fn ask_allow_defaults_to_false_and_rejects_an_unknown_key() {
     let t: Value = resp.json().await.unwrap();
     assert_eq!(
         t["allow"],
-        json!({"stop_jobs": true, "replace": false, "delete_captures": false})
+        json!({"stop_jobs": true, "replace": false, "delete_captures": false, "accept_signatures": false})
     );
 
     let resp = ask(

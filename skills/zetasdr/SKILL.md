@@ -45,7 +45,7 @@ There are two ways to run:
 - One-shot, `zeta <group> <verb> ...`: opens the node, applies one operation, prints the JSON result and exits (0 on success, 2 with a JSON error). It never resumes jobs: a job started one-shot is persisted as `running` and runs once `zeta serve` starts. `job start --then-tail MAX_FRAMES,TIMEOUT_MS` keeps that one-shot node up after the start, tails the job's audio output when it has one (a demodulator), else its first event stream, then stops the job and prints `[job_result, frames_result, {"stopped": true}]`; add `--keep` to leave it running (`{"stopped": false}`). If the job is not running (e.g. failed) it prints `[job_result, job_record]`, the record's `state` carrying `status` and `reason`, and exits 2; `stream tail` on its own only sees streams of jobs running in the same process, and `job attach` needs its input job running in the same node, so attach against `zeta serve` (`--node`). A one-shot `iq read` or `classify` reads the ring that the command itself fills from the source, waiting up to 5 s for it to cover the span. One-shot commands, read-only ones included, restore the pins and the gain of the sources they attach (so even a one-shot `source list` tunes a pinned radio). One-shot commands, like `zeta serve`, start and probe every `--plugin` program at startup, so with plugins configured even a one-shot `source list` costs one process start per plugin.
 - `zeta serve`: resumes persisted jobs and keeps them running until Ctrl-C.
 - Against a running node, `zeta --node URL --secret SECRET <group> <verb> ...` (or the `ZETA_NODE` and `ZETA_SECRET` variables): the operation is sent to that node over HTTP and applied there, so jobs started this way keep running; `--state-dir`, the `--source-*` flags, `--plugin`, `--modes-dir`, `--themes-dir`, `--knowledge-acma` and `--bursts-keep-*` belong to the serving node and are rejected (a usage error, exit 1); `--stt-socket`, `--stt-node` and `--soapy-in-process` belong to it too but are ignored, and so are `ZETA_KNOWLEDGE_ACMA`, `ZETA_BURSTS_KEEP_MB`, `ZETA_BURSTS_KEEP_DAYS` and `ZETA_RING_BUDGET_MB` from the environment. `zeta soapy find` always runs locally. `--then-tail` is not supported with `--node` yet (a usage error, exit 1): start the job, then `stream list` and `stream tail` against the node. Start that node with `zeta serve --listen PORT` (binds 127.0.0.1) or `--listen ADDR:PORT` (a LAN address) and a secret. `zeta-mcp --node URL` offers the same operations as MCP tools, and `zeta ask "REQUEST"` lets a local model call them.
-- `zeta serve --listen PORT --llm-url URL --llm-model NAME` (the other `--llm-*` flags of `zeta ask` apply too) enables `POST /ask` with `{"request": "TEXT", "max_turns": 8, "allow": {"stop_jobs": false, "replace": false, "delete_captures": false}}` (`max_turns` 1-32, default 8; `allow` optional, all false by default: without them the agent's `job_stop` and non-empty `replace` calls and its `capture_delete` are refused as `not_allowed`; `page_tools` optional, false by default: the web page sends `true`, which adds the page-only `view_set` tool, answered by the agent itself and applied by the page, never by the node): the node runs the agent against itself, so every operation it applies appears on the `ops` stream, and answers the transcript (`request`, `answer`, `calls`, `turns`) as `zeta ask` prints it, plus `allow` as the run had it and `turn_log`, one entry per model completion with its reasoning, content and call count. One run at a time (409 while one is in progress); 503 when serve has no `--llm-url`; a failed run is 502 with the error and the transcript so far; 504 after 300 s.
+- `zeta serve --listen PORT --llm-url URL --llm-model NAME` (the other `--llm-*` flags of `zeta ask` apply too) enables `POST /ask` with `{"request": "TEXT", "max_turns": 8, "allow": {"stop_jobs": false, "replace": false, "delete_captures": false, "accept_signatures": false}}` (`max_turns` 1-32, default 8; `allow` optional, all false by default: without them the agent's `job_stop` and non-empty `replace` calls, its `capture_delete` and its `signature_accept` and `signature_reject` are refused as `not_allowed`; `page_tools` optional, false by default: the web page sends `true`, which adds the page-only `view_set` tool, answered by the agent itself and applied by the page, never by the node): the node runs the agent against itself, so every operation it applies appears on the `ops` stream, and answers the transcript (`request`, `answer`, `calls`, `turns`) as `zeta ask` prints it, plus `allow` as the run had it and `turn_log`, one entry per model completion with its reasoning, content and call count. One run at a time (409 while one is in progress); 503 when serve has no `--llm-url`; a failed run is 502 with the error and the transcript so far; 504 after 300 s.
 - `zeta serve --listen PORT --stt-socket PATH` (env `ZETA_STT_SOCKET`; default `$XDG_RUNTIME_DIR/voiced.sock` when that file exists) enables `POST /stt?lang=CODE` (`lang` defaults to `en`): the body is a 16 kHz mono `audio/wav` (at most 4 MiB), the node hands it to the speech daemon at that Unix socket and answers `{"text": "TRANSCRIPT"}`. The daemon is `local-voice` or any daemon speaking its protocol: one line per connection, `file:<absolute wav path>` answered `ok:<text>` or `error:<message>`, and `languages` answered `ok:en,de,...` (a daemon answering `error:` there is taken to know English only). Instead of a daemon, `--stt-node URL` (env `ZETA_STT_NODE`, secret in `ZETA_STT_NODE_SECRET`, never printed) forwards each request to that node's `POST /stt`; the two flags are exclusive, for every command (exit 1). A forwarded request carries `X-Zeta-Stt-Hop: 1`, and a node that would forward it again answers 508 (`stt forwarding loop`). `GET /stt/languages` answers `{"backend": NAME, "languages": [CODES]}` (503 without a backend). 415 when the body is not WAV, 413 when too large, 422 `{"error": "unsupported", "language", "supported"}` for a language the backend lacks, 502 when the daemon reports an error, 503 when serve has no backend or cannot reach it, 503 `{"error": "busy", "message", "wait_ms"}` when every one of the daemon's 4 slots stayed taken for 30 s (a node forwarding with `--stt-node` reports that as a `busy` drop, not an error), 504 when the daemon does not answer within 30 s of its turn.
 
 While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `jobs stop`, `plan start`, `mix start`, `graph put`, `station set`, `station clear`, `capture delete`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
@@ -267,6 +267,69 @@ JSON: `{"op":"capture_delete","capture":"<id>"}`
 CLI: `zeta capture delete --capture <id>`
 
 Delete a capture and its files. A pinned capture is refused (`capture <id> is pinned`). Deleting is the operator's decision: through `ask` the run needs `allow.delete_captures` (`zeta ask --allow-delete`; on the page, `allow deletes on`), else the call is refused as `not_allowed`: report that, do not retry. Never delete a capture the request did not name.
+
+### signature_list
+
+The learned signatures (`state_dir/signatures`), newest first, narrowed to `state` (`proposed`, `accepted`, `rejected`, `superseded`; `null` for all). Each record has `id`, `name`, `state`, the waveform (`min_hz`, `max_hz`, `bandwidth_hz`, `modulation`, `order`, `symbol_rate_baud`, `tone_spacing_hz`, `burst` `{duty, burst_ms, period_ms}`), `framing` (`null`, or the `frame_decode` params that checked), `decoder`, `decoder_file`, `decoder_note`, `confidence` (0.3 for features only, 0.6 with a framing, 0.9 with a CRC that checks on at least 5 frames), `evidence`, `provenance` (`source`, `station`, `captures`, `jobs`, `allocation`, `proposed_ns`, `proposed_by`, `accepted_ns`, `accepted_by`, `superseded_by`, `superseded_ns`), `matches` and `last_matched_ns`.
+
+- state: string or null
+
+JSON: `{"op":"signature_list","state":null}`
+
+CLI: `zeta signature list [--state S]`
+
+A learned signature is what the node, or the operator by hand (`signature_propose`), proposes about a signal no mode row knows; it waits as `proposed` until the operator accepts or rejects it. `state` `null` lists every record. Take ids from here, never invent them.
+
+### signature_show
+
+One learned signature's record. An unknown `id` is `unknown` (`field: "id"`, `known` the store's ids).
+
+- id: string; an id from `signature list`
+
+JSON: `{"op":"signature_show","id":"<id>"}`
+
+CLI: `zeta signature show --id <id>`
+
+One record by `id`. An unknown `id` is an `unknown` error (`field: "id"`, `known` the store's ids): take ids from `signature_list`.
+
+### signature_propose
+
+Propose a signature by hand from a capture: its feature record and layer-1 label (a `noise` capture is refused), every capture of its set, the nearest `tx` assignment it kept and the station. `name` `null` gives the node's `<modulation> <width> kHz at <MHz>`; `framing` is the `frame_decode` params that checked (refused when the stage refuses them), `null` for none. The record is `proposed`; a proposal is harmless: it waits for the operator.
+
+- capture: string
+- name: string or null
+- framing: object or null
+
+JSON: `{"op":"signature_propose","capture":"<id>","name":null,"framing":null}`
+
+CLI: `zeta signature propose --capture <id> [--name NAME] [--framing-file FILE]`
+
+On the CLI, `--framing-file FILE` holds the `framing` JSON, the params of the `frame_decode` stage (under Stage kinds), e.g. `{"sync": {"hex": "2dd4", "bits": 16}, "length": {"fixed_bits": 272}, "crc": "crc16-ccitt"}`; a framing the stage refuses is `other` with `framing: <reason>` naming the field. An unknown `capture` is `unknown`; a capture without a feature record (`capture <id> has no feature record`) or labelled `noise` (`capture <id> is noise: nothing to propose`) proposes nothing. The confidence is 0.3 without a framing and 0.6 with one. Report the proposal's `id`, `name` and `confidence`.
+
+### signature_accept
+
+Accept a proposed signature; `name` `null` keeps the proposed one. Its provenance captures are pinned. A record not `proposed` is refused (`signature <id> is <state>, not proposed`). Accepting or rejecting is the operator's decision: through `ask` the run needs `allow.accept_signatures` (`zeta ask --allow-signatures`; on the page, `allow signatures on`), else `not_allowed`: report the proposal, do not retry.
+
+- id: string; an id from `signature list`
+- name: string or null
+
+JSON: `{"op":"signature_accept","id":"<id>","name":null}`
+
+CLI: `zeta signature accept --id <id> [--name NAME]`
+
+Through `ask` without `allow.accept_signatures` the call is refused as `not_allowed`: report the proposal (its `id`, `name`, `confidence` and `evidence`), do not retry. Never accept a proposal the request did not name. The captures it was learned from are pinned: never expired nor deleted. A record not `proposed` is `other` (`signature <id> is accepted, not proposed`).
+
+### signature_reject
+
+Reject a proposed signature (the record stays, `rejected`). A record not `proposed` is refused (`signature <id> is <state>, not proposed`). Accepting or rejecting is the operator's decision: through `ask` the run needs `allow.accept_signatures` (`zeta ask --allow-signatures`; on the page, `allow signatures on`), else `not_allowed`: report the proposal, do not retry.
+
+- id: string; an id from `signature list`
+
+JSON: `{"op":"signature_reject","id":"<id>"}`
+
+CLI: `zeta signature reject --id <id>`
+
+Through `ask` without `allow.accept_signatures` the call is refused as `not_allowed`: report the proposal, do not retry. Never reject a proposal the request did not name. The record stays, `rejected`; its captures are not pinned.
 
 ### plan_start
 
