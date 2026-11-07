@@ -578,6 +578,36 @@ async function offerReplace(op, err) {
 }
 
 // The op attaching a transcription to job `id` (the language left to the backend).
+// The job form of origin_lookup (the node reads the job's band and modulation).
+function originJobOp(job) {
+  return { op: "origin_lookup", job, source: null, center_hz: null, bandwidth_hz: null, modulation: null };
+}
+
+// The sites an answer names, as the node's `origin` event summarises them (at most this many).
+const ORIGIN_NOTE_SITES = 3;
+
+// Origins by job `id`. The answer reaches the page as an `origin` event on the job's source
+// feed, except for a job on source `node` (a `bits` job replaying a capture), which the
+// overlays do not follow: its answer lights the map and is noted here.
+async function askOrigins(id) {
+  const r = await applyOp(originJobOp(id));
+  const job = (state.lastJobs || []).find((j) => j.id === id);
+  const a = r && r.value;
+  if (!job || job.source !== "node" || !a || !Array.isArray(a.origins)) return;
+  state.map?.origin(id, a);
+  const f = a.band ? `${a.band.center_hz / 1e6} MHz` : "the band";
+  const n = a.origins.length;
+  const sites = a.origins.slice(0, ORIGIN_NOTE_SITES).map((o) => {
+    const al = o.allocation || {};
+    const name = [al.licensee, al.site].filter(Boolean).join(", ") || al.service;
+    return `${name} ${o.agree} ${Number(o.score).toFixed(1)}`;
+  });
+  state.transcript.note(
+    `${job.kind} ${String(id).slice(-6)}: ` +
+      (n === 0 ? `no licensed transmitter on ${f}` : `${n} ${n === 1 ? "site" : "sites"} on ${f}: ${sites.join("; ")}`),
+  );
+}
+
 function attachOp(id) {
   return { op: "job_attach", kind: "transcribe", job: id, language: null };
 }
@@ -953,6 +983,7 @@ function start(api) {
   state.bits = mountBitsPane($("#bits"), api, state.view, state.transcript, {
     panes: state.panes,
     jobs: () => state.lastJobs,
+    onOrigins: (id) => askOrigins(id),
   });
   state.subjects.onLearn(applyPanes);
   loadStationHome(api);
@@ -1024,6 +1055,7 @@ function start(api) {
     onPlay: toggleAudio,
     onTranscribe: (job) => applyOp(attachOp(job.id)),
     onGraph: (job) => showGraph(api, job.id),
+    onOrigins: (job) => askOrigins(job.id),
     playing: (id) => !!state.audio && state.audio.jobId === id,
     onHot: (id, on) => state.ov?.setHot(id, on),
     squelch: (id) => (state.ov ? state.ov.squelch(id) : null),

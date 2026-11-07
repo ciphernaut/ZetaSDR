@@ -70,12 +70,13 @@ export function withCorrelate(graph, pattern, bits) {
   return graph;
 }
 
-export function mountBitsPane(el, api, view, transcript, { panes = null, jobs = () => [] } = {}) {
-  return new BitsPane(el, api, view, transcript, panes, jobs);
+export function mountBitsPane(el, api, view, transcript, { panes = null, jobs = () => [], onOrigins = null } = {}) {
+  return new BitsPane(el, api, view, transcript, panes, jobs, onOrigins);
 }
 
 class BitsPane {
-  constructor(el, api, view, transcript, panes, jobs) {
+  constructor(el, api, view, transcript, panes, jobs, onOrigins) {
+    this.onOrigins = onOrigins;
     this.el = el;
     this.api = api;
     this.view = view;
@@ -125,7 +126,11 @@ class BitsPane {
     this.binaryEl = document.createElement("span");
     this.binaryEl.id = "bits-binary";
     this.binaryEl.title = "the byte under the pointer";
-    head.append(this.selectEl, this.clockEl, this.binaryEl);
+    const origins = document.createElement("button");
+    origins.dataset.action = "origins";
+    origins.textContent = "Origins";
+    origins.title = "origin_lookup by this job: the licensed transmitters it may come from";
+    head.append(this.selectEl, this.clockEl, this.binaryEl, origins);
     const body = document.createElement("div");
     body.className = "bits-body";
     this.rowsEl = document.createElement("div");
@@ -505,6 +510,11 @@ class BitsPane {
 
   async click(ev) {
     const b = ev.target.closest("button[data-action]");
+    if (b && b.dataset.action === "origins") {
+      const job = this.shownJob || this.jobId;
+      if (job && this.onOrigins) await this.onOrigins(job);
+      return;
+    }
     if (!b || b.dataset.action !== "try") return;
     const li = b.closest("li");
     if (!li || !this.shownJob || this.trying) return;

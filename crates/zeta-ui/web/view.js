@@ -93,6 +93,7 @@ export const AGENT_VIEW_KEYS = [
   "subject_drop_s",
   "plan",
   "follow",
+  "origin_fade_s",
 ];
 
 const SOURCE_ID = /^[A-Za-z0-9_.:-]+$/;

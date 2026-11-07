@@ -4812,7 +4812,7 @@ def scenario_origins_light_sites(page, url, secret):
     try:
         # Lit while the map was never shown (no Leaflet map yet): the badge counts them and
         # the map draws them on its first show.
-        origins_of(url, secret, job)                       # the node's answer; the page follows the feed
+        job_row(page, job).locator("button.origins").click()   # the job form; the page follows the feed
         expect(badge).to_have_text("2", timeout=10_000)
         assert page.evaluate("() => window.zetaTest.litKeys()") == [job]
         # A node annotation, not a decode (ruling N): a transcript line, no ribbon.
@@ -4820,20 +4820,24 @@ def scenario_origins_light_sites(page, url, secret):
         expect(page.locator("#waterfall .ov-ribbon", has_text="sites on")).to_have_count(0)
         page.locator("#tabs .src-tab.map-tab").click()
         expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        # The job form reads the job's own modulation (the fake_pos row states none): unknown.
         agree = sorted(a for a, _ in lit_sites(page))
-        assert agree == ["disagrees", "fits"], agree
-        expect(page.locator("#map path.map-bearing")).to_have_count(1)
-        # Brightness is the score times the freshness: the fitting site is the brighter.
+        assert agree == ["unknown", "unknown"], agree
+        expect(page.locator("#map path.map-bearing")).to_have_count(2)
+        # Brightness is the score times the freshness, per site.
         bright = page.locator("#map path.map-site").evaluate_all(
-            """els => Object.fromEntries(els.map((e) =>
-                 [e.dataset.agree, Number(e.style.getPropertyValue('--site-brightness'))]))""")
-        assert bright["fits"] > bright["disagrees"] > 0, bright
-        page.locator('#map path.map-site[data-agree="fits"]').hover()
+            "els => els.map((e) => Number(e.style.getPropertyValue('--site-brightness')))")
+        assert len(bright) == 2 and min(bright) > 0, bright
         tip = page.locator("#map .leaflet-tooltip")
+        site = page.locator("#map path.map-site")
+        for i in range(2):
+            site.nth(i).hover()
+            if "Example Water Authority" in (tip.text_content() or ""):
+                break
         expect(tip).to_contain_text("Example Water Authority")
         expect(tip).to_contain_text("16K0F1D")
-        expect(tip).to_contain_text(re.compile(r"0\.\d+ fits"))
-        page.locator('#map path.map-site[data-agree="fits"]').click()
+        expect(tip).to_contain_text(re.compile(r"0\.\d+ unknown"))
+        site.nth(i).click()
         pop = page.locator("#map .leaflet-popup-content")
         expect(pop).to_contain_text("licence 0000001")
         expect(pop.locator("button")).to_have_count(0)
@@ -4843,7 +4847,7 @@ def scenario_origins_light_sites(page, url, secret):
         expect(badge).to_have_text("")
         # A long fade again, so what follows is the job's stop and not the fade.
         run_cmd(page, "view set origin_fade_s 300")
-        origins_of(url, secret, job)
+        job_row(page, job).locator("button.origins").click()
         expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
         page.locator('#tabs .src-tab[data-id="tone"]').click()
         stop_job(url, secret, job)
@@ -4856,6 +4860,43 @@ def scenario_origins_light_sites(page, url, secret):
     finally:
         run_cmd(page, "view reset")
         stop_job(url, secret, job)
+
+
+def scenario_origins_from_the_menu_and_bits(page, url, secret):
+    page.route(OSM_TILES, lambda r: r.abort())
+    clear_captures(url, secret)
+    stop_bits_jobs(url, secret)
+    try:
+        # The box menu's entry: the band form of the selection.
+        menu = open_menu_on_tone(page, url, secret)
+        page.click('#ctx .ctx-item[data-action="origins"]')
+        expect(menu).to_be_hidden()
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=10_000)
+        keys = page.evaluate("() => window.zetaTest.litKeys()")
+        assert len(keys) == 1 and keys[0].startswith("band:"), keys
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        page.locator('#tabs .src-tab[data-id="tone"]').click()
+        # The Bits header's button: a bits job on a tone capture asks by its job.
+        cap = start_job(url, secret, "capture", "tone", 100_001_000, 6_000)
+        two_windows(url, secret, cap)
+        wait_until(lambda: len(capture_ops(url, secret, "capture_list", signal=None)) == 2,
+                   30, "two captures")
+        newest = capture_ops(url, secret, "capture_list", signal=None)[0]["id"]
+        http_json(url, secret, "/op", {"op": "bits_start", "capture": newest,
+                                       "modulation": "fsk", "symbol_rate_baud": 4800,
+                                       "order": 2})
+        page.evaluate("() => window.zetaTest.poll()")
+        page.locator('#panes .pane-tab[data-pane="bits"]').click()
+        page.locator('#bits button[data-action="origins"]').click()
+        expect(page.locator("#transcript .line.note", has_text="bits ")).to_contain_text(
+            "sites on", timeout=10_000)
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).not_to_have_count(0, timeout=10_000)
+    finally:
+        run_cmd(page, "view reset")
+        stop_bits_jobs(url, secret)
+        clear_captures(url, secret)
 
 
 def scenario_no_station_lights_without_bearings(page, url, secret):

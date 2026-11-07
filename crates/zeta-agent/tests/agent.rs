@@ -957,6 +957,12 @@ async fn view_set_refuses_keys_that_act_listing_the_presentation_keys() {
         tool["function"]["parameters"]["properties"]["key"]["enum"],
         json!(zeta_agent::page::VIEW_KEYS)
     );
+    for key in ["main", "dock", "origin_fade_s"] {
+        assert!(
+            zeta_agent::page::VIEW_KEYS.contains(&key),
+            "{key} is settable"
+        );
+    }
     for acting in ["scanner", "zoom_out", "auto_scan_stop", "home"] {
         assert!(
             !zeta_agent::page::VIEW_KEYS.contains(&acting),

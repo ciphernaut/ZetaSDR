@@ -252,6 +252,7 @@ function denoiseNode(job) {
 
 const ENTRIES = [
   ["classify", "What is this?"],
+  ["origins", "Origins"],
   ["capture", "Capture bursts"],
   ["identify", "Identify (thorough)"],
   ["watch", "Watch this band"],
@@ -464,6 +465,7 @@ class Menu {
     this.fitting = null;
     this.fitGen = 0;
     this.labelKeys = [];
+    this.boxLabel = null; // the last classification's top layer-1 label {centerHz, bandwidthHz, name}
     this.pointer = { x: 0, y: 0 };
 
     this.el = document.createElement("div");
@@ -760,6 +762,21 @@ class Menu {
       return;
     }
     this.close();
+    if (action === "origins") {
+      // The band form; the box's layer-1 label (when it was classified) names its modulation.
+      const bl = this.boxLabel;
+      const named = bl && bl.centerHz === s.centerHz && bl.bandwidthHz === s.bandwidthHz ? bl.name : null;
+      const r = await this.applyOp({
+        op: "origin_lookup",
+        job: null,
+        source: s.sourceId,
+        center_hz: s.centerHz,
+        bandwidth_hz: s.bandwidthHz,
+        modulation: named ? [named] : null,
+      });
+      if (r && r.value) this.onOrigins(`band:${s.sourceId}:${Math.round(s.centerHz)}`, r.value);
+      return;
+    }
     const selection = {
       source: s.sourceId,
       span: { start_ns: s.startNs, end_ns: s.endNs },
@@ -915,6 +932,7 @@ class Menu {
         : LABEL_FALLBACK_STEP_HZ;
     // Only the top layer-2 label is drawn; the others appear in the transcript.
     const l1 = labels.filter((l) => l.layer !== 2);
+    this.boxLabel = l1[0] ? { centerHz: s.centerHz, bandwidthHz: s.bandwidthHz, name: l1[0].name } : null;
     const top2 = labels
       .filter((l) => l.layer === 2)
       .reduce((a, b) => (a && (a.confidence ?? 0) >= (b.confidence ?? 0) ? a : b), null);
