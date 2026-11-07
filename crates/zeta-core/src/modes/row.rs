@@ -5,6 +5,8 @@
 //! and one-line summary, and the decode-to-identify rule. Every struct rejects unknown
 //! fields; [`parse`] names the offending field, [`validate`] checks what serde cannot.
 
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +115,10 @@ pub struct Subject {
     /// by more than 10 degrees joins it too.
     #[serde(default)]
     pub track_min_m: f64,
+    /// The event fields whose equal values mean the same subject across rows sharing
+    /// `name`; empty for none.
+    #[serde(default)]
+    pub merge: Vec<String>,
 }
 
 /// `subject.track_points` when a row leaves it out.
@@ -306,8 +312,9 @@ pub enum Proof {
 pub struct ProgramBlock {
     /// Names tried on `PATH` in order (or an absolute path), the first found used.
     pub programs: Vec<String>,
-    /// Arguments, with `$port`, `$rate_hz`, `$center_hz` and `$fifo` (the named pipe of
-    /// `input.via: fifo`) substituted.
+    /// Arguments, with `$port`, `$rate_hz`, `$center_hz`, `$center_khz` (the centre in kHz,
+    /// an integer when it divides) and `$fifo` (the named pipe of `input.via: fifo`)
+    /// substituted.
     pub args: Vec<String>,
     pub input: ProgramInput,
     pub output: ProgramOutput,
@@ -402,6 +409,44 @@ pub struct ProgramOutput {
     #[serde(default)]
     pub port: Option<String>,
     pub parser: Parser,
+    /// Event field ← JSON pointer(s) into the parsed line, the first that resolves to a
+    /// non-null value winning; `null` takes the whole object.
+    #[serde(default)]
+    pub fields: Option<BTreeMap<String, FieldPath>>,
+}
+
+/// Where in a program's parsed line an event field is read: one JSON pointer, or a list
+/// tried in order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum FieldPath {
+    /// One JSON pointer (`/vdl2/avlc/src/addr`).
+    One(String),
+    /// JSON pointers tried in order, the first resolving to a non-null value winning.
+    First(Vec<String>),
+}
+
+impl FieldPath {
+    /// The pointer, or the pointers in the order they are tried.
+    pub fn pointers(&self) -> &[String] {
+        match self {
+            FieldPath::One(p) => std::slice::from_ref(p),
+            FieldPath::First(ps) => ps,
+        }
+    }
+
+    /// Check the path of event field `field`: a list is not empty, and every pointer
+    /// starts with `/`.
+    pub fn check(&self, field: &str) -> Result<(), RowError> {
+        let at = format!("decoder.output.fields.{field}");
+        if self.pointers().is_empty() {
+            return Err(RowError::new(at, "an empty list"));
+        }
+        if self.pointers().iter().any(|p| !p.starts_with('/')) {
+            return Err(RowError::new(at, "a JSON pointer starts with \"/\""));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -509,7 +554,10 @@ const GRAPH_PLACEHOLDERS: [(&str, u64); 3] = [
     ("$out_rate_hz", 48_000),
 ];
 /// The placeholders a program's `args` may use.
-const PROGRAM_PLACEHOLDERS: [&str; 4] = ["$port", "$rate_hz", "$center_hz", "$fifo"];
+const PROGRAM_PLACEHOLDERS: [&str; 5] = ["$port", "$rate_hz", "$center_hz", "$center_khz", "$fifo"];
+/// The event fields the node adds after a program's `decoder.output.fields` map, exempt
+/// from the rule that the map names every schema property.
+pub const ENVELOPE_FIELDS: [&str; 4] = ["protocol", "summary", "t_ns", "position"];
 /// The in-crate attempts `identify.quick` may name.
 pub const QUICK_ATTEMPTS: [&str; 4] = ["aprs", "pocsag", "acars", "rds"];
 /// Name suffixes of fields that hold an integer in their unit.
@@ -685,6 +733,42 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
                     known.join(", ")
                 ),
             ));
+        }
+    }
+    if let Some(sub) = &row.subject {
+        for (i, m) in sub.merge.iter().enumerate() {
+            if !properties.contains_key(m) && *m != sub.key {
+                return Err(RowError::new(
+                    format!("subject.merge[{i}]"),
+                    "not in event.schema.properties",
+                ));
+            }
+        }
+    }
+    if let Decoder::Program(ProgramBlock {
+        output: ProgramOutput {
+            fields: Some(fields),
+            ..
+        },
+        ..
+    }) = &row.decoder
+    {
+        for (key, path) in fields {
+            if !properties.contains_key(key) {
+                return Err(RowError::new(
+                    format!("decoder.output.fields.{key}"),
+                    "not in event.schema.properties",
+                ));
+            }
+            path.check(key)?;
+        }
+        for name in properties.keys() {
+            if !ENVELOPE_FIELDS.contains(&name.as_str()) && !fields.contains_key(name) {
+                return Err(RowError::new(
+                    format!("event.schema.properties.{name}"),
+                    "not mapped by decoder.output.fields",
+                ));
+            }
         }
     }
     let id = &row.identify;
@@ -910,6 +994,17 @@ fn placeholders(arg: &str) -> Vec<&str> {
         out.push(&arg[i..i + 1 + len]);
     }
     out
+}
+
+/// `center_hz` in kHz as `$center_khz` is written: an integer when it divides (`8942`),
+/// else up to three decimals with trailing zeros trimmed (`8942.5`).
+pub fn center_khz_text(center_hz: u64) -> String {
+    let (khz, rest) = (center_hz / 1000, center_hz % 1000);
+    if rest == 0 {
+        return khz.to_string();
+    }
+    let decimals = format!("{rest:03}");
+    format!("{khz}.{}", decimals.trim_end_matches('0'))
 }
 
 #[cfg(test)]
@@ -1355,5 +1450,179 @@ mod tests {
         for bad in ["{a:x}", "{a:.7}", "{a:.}", "{:.1}"] {
             assert!(summary_fields(bad).is_err(), "{bad}");
         }
+    }
+
+    /// `ADSB` with a `decoder.output.fields` map over its schema: every property but the
+    /// envelope's `protocol` mapped to `/<name>`, then `edit` applied to the map.
+    fn with_fields(edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) -> String {
+        edited(ADSB, |v| {
+            let mut map = serde_json::Map::new();
+            for name in v["event"]["schema"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+            {
+                if !ENVELOPE_FIELDS.contains(&name.as_str()) {
+                    map.insert(name.clone(), format!("/{name}").into());
+                }
+            }
+            edit(&mut map);
+            v["decoder"]["output"]["fields"] = map.into();
+        })
+    }
+
+    /// The program block of a row.
+    fn program(row: &ModeRow) -> &ProgramBlock {
+        let Decoder::Program(p) = &row.decoder else {
+            panic!("a program row");
+        };
+        p
+    }
+
+    #[test]
+    fn fields_map_round_trips_and_defaults_to_null() {
+        let row = parse(ADSB).unwrap();
+        assert_eq!(program(&row).output.fields, None);
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["decoder"]["output"]["fields"], serde_json::Value::Null);
+        let text = with_fields(|m| {
+            m.insert("icao".into(), "/a/b".into());
+            m.insert("lat".into(), serde_json::json!(["/x", "/y"]));
+        });
+        let row = parse(&text).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        let fields = program(&row).output.fields.clone().unwrap();
+        assert_eq!(fields["icao"], FieldPath::One("/a/b".into()));
+        assert_eq!(
+            fields["lat"],
+            FieldPath::First(vec!["/x".into(), "/y".into()])
+        );
+        assert_eq!(fields["icao"].pointers(), ["/a/b".to_string()]);
+        assert_eq!(
+            fields["lat"].pointers(),
+            ["/x".to_string(), "/y".to_string()]
+        );
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["decoder"]["output"]["fields"]["icao"], "/a/b");
+        assert_eq!(
+            v["decoder"]["output"]["fields"]["lat"],
+            serde_json::json!(["/x", "/y"])
+        );
+        assert_eq!(parse(&serde_json::to_string(&row).unwrap()).unwrap(), row);
+    }
+
+    #[test]
+    fn fields_keys_must_be_schema_properties() {
+        let text = with_fields(|m| {
+            m.insert("nope".into(), "/nope".into());
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new(
+                "decoder.output.fields.nope",
+                "not in event.schema.properties"
+            ),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn every_schema_property_is_mapped_except_the_envelope() {
+        let text = with_fields(|m| {
+            m.remove("altitude_ft");
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new(
+                "event.schema.properties.altitude_ft",
+                "not mapped by decoder.output.fields"
+            ),
+            "{e}"
+        );
+        // ADSB's schema lists `protocol`, which `with_fields` leaves unmapped.
+        let text = with_fields(|m| assert!(!m.contains_key("protocol")));
+        validate(&parse(&text).unwrap(), &no_stages()).unwrap();
+    }
+
+    #[test]
+    fn a_pointer_must_start_with_a_slash_and_a_list_may_not_be_empty() {
+        let text = with_fields(|m| {
+            m.insert("icao".into(), "icao".into());
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new(
+                "decoder.output.fields.icao",
+                "a JSON pointer starts with \"/\""
+            ),
+            "{e}"
+        );
+        let text = with_fields(|m| {
+            m.insert("lat".into(), serde_json::json!(["/x", "y"]));
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "decoder.output.fields.lat", "{e}");
+        let text = with_fields(|m| {
+            m.insert("icao".into(), serde_json::json!([]));
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("decoder.output.fields.icao", "an empty list"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn center_khz_is_an_integer_when_it_divides() {
+        assert_eq!(center_khz_text(8_942_000), "8942");
+        assert_eq!(center_khz_text(8_942_500), "8942.5");
+        assert_eq!(center_khz_text(136_975_000), "136975");
+        assert_eq!(center_khz_text(8_942_125), "8942.125");
+    }
+
+    #[test]
+    fn center_khz_is_a_known_placeholder_and_others_still_break() {
+        let text = edited(ADSB, |v| v["decoder"]["args"][0] = "$center_khz".into());
+        validate(&parse(&text).unwrap(), &no_stages()).unwrap();
+        let text = edited(ADSB, |v| v["decoder"]["args"][0] = "$centre_khz".into());
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "decoder.args[0]", "{e}");
+        assert!(e.error.contains("$center_khz"), "{e}");
+    }
+
+    #[test]
+    fn merge_round_trips_defaults_empty_and_names_schema_fields() {
+        let row = parse(ADSB).unwrap();
+        assert!(row.subject.as_ref().unwrap().merge.is_empty());
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["subject"]["merge"], serde_json::json!([]));
+        let text = edited(ADSB, |v| {
+            v["subject"]["merge"] = serde_json::json!(["icao"])
+        });
+        let row = parse(&text).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        assert_eq!(
+            row.subject.as_ref().unwrap().merge,
+            vec!["icao".to_string()]
+        );
+        assert_eq!(parse(&serde_json::to_string(&row).unwrap()).unwrap(), row);
+        let text = edited(ADSB, |v| {
+            v["subject"]["merge"] = serde_json::json!(["callsign", "nope"])
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("subject.merge[1]", "not in event.schema.properties"),
+            "{e}"
+        );
+        let text = edited(ADSB, |v| {
+            v["subject"]["merge"] = serde_json::json!(["nope"])
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "subject.merge[0]", "{e}");
     }
 }
