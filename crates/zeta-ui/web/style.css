@@ -349,6 +349,7 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 #waterfall .ov-ribbon.acars { color: var(--text); border-inline-start-color: var(--accent); }
 #waterfall .ov-ribbon.transcript { color: var(--text); border-inline-start-color: var(--ok); }
 #waterfall .ov-ribbon.transcript-error { color: var(--error); border-inline-start-color: var(--error); }
+#waterfall .ov-ribbon.signature { color: var(--user); border-inline-start-color: var(--accent); }
 #waterfall .ov-ribbon.agent {
   white-space: normal; overflow-wrap: anywhere; color: var(--accent); border-inline-start-color: var(--accent);
 }
@@ -671,6 +672,15 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 #explore .explore-tools { display: flex; justify-content: flex-end; gap: 4px; padding: 2px 8px; }
 #explore .explore-tools button { font-size: 11px; }
 #explore td input.bits-rate { width: 5.5em; margin-right: 4px; font-size: 11px; }
+#explore table.signatures { margin-top: 6px; border-top: 1px solid var(--border); }
+#explore tr.signature td { color: var(--text); }
+#explore tr.signature td.confidence, #explore tr.signature td.evidence { color: var(--dim); }
+#explore tr.signature.proposed td.state { color: var(--user); }
+#explore tr.signature.accepted td.state { color: var(--ok); }
+#explore tr.signature td.state code { font-family: var(--font-mono); }
+#explore tr.signature td.name { max-width: none; }
+#explore tr.signature input.sig-name { width: 16em; font-size: 11px; }
+#explore tr.signature input.sig-name[readonly] { border-color: transparent; background: transparent; color: var(--text); }
 
 /* The Bits pane (bits.js). */
 #bits { height: 100%; display: flex; flex-direction: column; background: var(--bg); font-size: 12px; }
