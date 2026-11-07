@@ -210,7 +210,7 @@ html[data-main="map"] #waterfall { visibility: hidden; }
    their site. */
 #map path.map-site { stroke: var(--user); fill: var(--user); stroke-width: 2; fill-opacity: calc(0.8 * var(--site-brightness, 1)); stroke-opacity: calc(0.3 + 0.7 * var(--site-brightness, 1)); }
 #map path.map-site[data-agree="disagrees"] { fill: none; }
-/* A site a register-independent hit confirms (a callsign heard, a decoded id): a ring outside it. */
+/* A site confirmed by a heard callsign or decoded id: a ring outside it. */
 #map path.map-site[data-confirmed] { stroke: var(--map-sel); stroke-width: 5; paint-order: stroke; stroke-opacity: 1; }
 #map path.map-bearing { stroke: var(--user); stroke-width: 1.5; fill: none; stroke-opacity: calc(0.7 * var(--site-brightness, 1)); }
 #map .map-source { width: auto; height: auto; white-space: nowrap; padding: 0 3px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); border: 1px solid var(--map-sel); }

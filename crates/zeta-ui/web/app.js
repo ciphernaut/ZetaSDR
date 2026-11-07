@@ -577,7 +577,6 @@ async function offerReplace(op, err) {
   state.transcript?.note(conflictText(err), true, actions);
 }
 
-// The op attaching a transcription to job `id` (the language left to the backend).
 // The job form of origin_lookup (the node reads the job's band and modulation).
 function originJobOp(job) {
   return { op: "origin_lookup", job, source: null, center_hz: null, bandwidth_hz: null, modulation: null };
@@ -602,12 +601,13 @@ async function askOrigins(id) {
     const name = [al.licensee, al.site].filter(Boolean).join(", ") || al.service;
     return `${name} ${o.agree} ${Number(o.score).toFixed(1)}`;
   });
-  state.transcript.note(
+  state.transcript?.note(
     `${job.kind} ${String(id).slice(-6)}: ` +
       (n === 0 ? `no licensed transmitter on ${f}` : `${n} ${n === 1 ? "site" : "sites"} on ${f}: ${sites.join("; ")}`),
   );
 }
 
+// The op attaching a transcription to job `id` (the language left to the backend).
 function attachOp(id) {
   return { op: "job_attach", kind: "transcribe", job: id, language: null };
 }
@@ -1762,6 +1762,10 @@ window.zetaTest = {
   // the map is made.
   tileLayer() {
     return state.map ? state.map.tileLayer() : null;
+  },
+  // Lights `answer` (an origin answer) under the one-shot `key` (`band:…`).
+  lightOrigin(key, answer) {
+    state.map?.origin(key, answer);
   },
   // The keys of the map's lit sets (map.js litKeys: job ids and one-shot keys).
   litKeys() {

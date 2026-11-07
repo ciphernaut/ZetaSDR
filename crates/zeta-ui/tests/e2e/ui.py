@@ -4874,11 +4874,23 @@ def lit_sites(page):
         "els => els.map(e => [e.dataset.agree, e.dataset.confirmed !== undefined])")
 
 
-def origins_of(url, secret, job):
-    """`origin_lookup` by `job`, measured as FM (the fake_pos row states no modulation): the
-    16K0F1D row fits, the 12K5A3E row disagrees. The answer."""
-    return http_json(url, secret, "/op", {"op": "origin_lookup", "job": job, "source": None,
-                                          "center_hz": None, "bandwidth_hz": None,
+def hover_site_of(page, licensee):
+    """Hover each lit site until its tooltip names `licensee`; that site's locator."""
+    site = page.locator("#map path.map-site")
+    tip = page.locator("#map .leaflet-tooltip")
+    for i in range(site.count()):
+        site.nth(i).hover()
+        if licensee in (tip.text_content() or ""):
+            return site.nth(i)
+    raise AssertionError(f"no lit site of {licensee}")
+
+
+def origins_of(url, secret, job, source=None, center_hz=None, bandwidth_hz=None):
+    """`origin_lookup` by `job` (or, with `job` None, the band of `source`), measured as FM
+    (the fake_pos row states no modulation): the 16K0F1D row fits, the 12K5A3E row
+    disagrees. The answer."""
+    return http_json(url, secret, "/op", {"op": "origin_lookup", "job": job, "source": source,
+                                          "center_hz": center_hz, "bandwidth_hz": bandwidth_hz,
                                           "modulation": ["fm"]})["value"]
 
 
@@ -4910,15 +4922,12 @@ def scenario_origins_light_sites(page, url, secret):
         assert len(bright) == 2 and min(bright) > 0, bright
         tip = page.locator("#map .leaflet-tooltip")
         site = page.locator("#map path.map-site")
-        for i in range(2):
-            site.nth(i).hover()
-            if "Example Water Authority" in (tip.text_content() or ""):
-                break
+        hill = hover_site_of(page, "Example Water Authority")
         expect(tip).to_contain_text("Example Water Authority")
         expect(tip).to_contain_text("16K0F1D")
         expect(tip).to_contain_text(re.compile(r"0\.\d+ unknown"))
-        site.nth(i).click()
-        pop = page.locator("#map .leaflet-popup-content")
+        hill.click()
+        pop =page.locator("#map .leaflet-popup-content")
         expect(pop).to_contain_text("licence 0000001")
         expect(pop.locator("button")).to_have_count(0)
         run_cmd(page, "view set origin_fade_s 2")
@@ -4947,8 +4956,17 @@ def scenario_origins_from_the_menu_and_bits(page, url, secret):
     clear_captures(url, secret)
     stop_bits_jobs(url, secret)
     try:
-        # The box menu's entry: the band form of the selection.
+        # A labelled box: What is this labels the FM tone (layer 1: fm); its lit set is
+        # dropped so only the menu's own answer is on the map.
         menu = open_menu_on_tone(page, url, secret)
+        page.click('#ctx .ctx-item[data-action="classify"]')
+        expect(page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
+               .first).to_be_visible(timeout=15_000)
+        for k in page.evaluate("() => window.zetaTest.litKeys()"):
+            page.evaluate("(k) => window.zetaTest.lightOrigin(k, {origins: []})", k)
+        assert page.evaluate("() => window.zetaTest.litKeys()") == []
+        # The box menu's entry: the band form, the label's modulation named.
+        drag_menu(page)
         page.click('#ctx .ctx-item[data-action="origins"]')
         expect(menu).to_be_hidden()
         expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=10_000)
@@ -4956,6 +4974,32 @@ def scenario_origins_from_the_menu_and_bits(page, url, secret):
         assert len(keys) == 1 and keys[0].startswith("band:"), keys
         page.locator("#tabs .src-tab.map-tab").click()
         expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        # The tone's label is `carrier`, which neither stub transmitter (FM, AM) fits: the
+        # label reached the node (a null modulation would read `unknown`).
+        agree = sorted(a for a, _ in lit_sites(page))
+        assert agree == ["disagrees", "disagrees"], agree
+        # The drawing of a fit, from the node's answer for FM (the fitting site is brighter,
+        # the disagreeing one a dashed ring, one bearing).
+        page.evaluate("() => window.zetaTest.lightOrigin(window.zetaTest.litKeys()[0], {origins: []})")
+        fm = origins_of(url, secret, None, "tone", 100_000_000, 9_600)
+        page.evaluate("(a) => window.zetaTest.lightOrigin('band:fm', a)", fm)
+        expect(page.locator("#map path.map-site")).to_have_count(2)
+        agree = sorted(a for a, _ in lit_sites(page))
+        assert agree == ["disagrees", "fits"], agree
+        expect(page.locator("#map path.map-bearing")).to_have_count(1)
+        marks =page.locator("#map path.map-site").evaluate_all(
+            """els => Object.fromEntries(els.map((e) => [e.dataset.agree,
+                 [Number(e.style.getPropertyValue('--site-brightness')),
+                  e.getAttribute('stroke-dasharray')]]))""")
+        assert marks["fits"][0] > marks["disagrees"][0] > 0, marks
+        assert marks["disagrees"][1] and not marks["fits"][1], marks
+        # A confirmed origin (a heard callsign) wears the ring.
+        page.evaluate("""() => window.zetaTest.lightOrigin('band:ring', {
+            t_ns: Date.now() * 1e6, origins: [{score: 1, agree: 'fits',
+              confirmed: {field: 'callsign', value: 'XX4EX'},
+              allocation: {lat: -27.45, lon: 153.0, licensee: 'Example Water Authority',
+                           site: 'Example Hill'}}]})""")
+        expect(page.locator("#map path.map-site[data-confirmed]")).to_have_count(1)
         page.locator('#tabs .src-tab[data-id="tone"]').click()
         # The Bits header's button: a bits job on a tone capture asks by its job.
         cap = start_job(url, secret, "capture", "tone", 100_001_000, 6_000)

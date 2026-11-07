@@ -765,7 +765,10 @@ class Menu {
     if (action === "origins") {
       // The band form; the box's layer-1 label (when it was classified) names its modulation.
       const bl = this.boxLabel;
-      const named = bl && bl.centerHz === s.centerHz && bl.bandwidthHz === s.bandwidthHz ? bl.name : null;
+      // A `noise` label measures no modulation (the node's measured_modulation drops it too).
+      // The label counts for a selection centred inside the classified box.
+      const inBox = bl && Math.abs(bl.centerHz - s.centerHz) <= bl.bandwidthHz / 2;
+      const named = inBox && bl.name !== "noise" ? bl.name : null;
       const r = await this.applyOp({
         op: "origin_lookup",
         job: null,

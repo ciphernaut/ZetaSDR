@@ -126,7 +126,7 @@ class BitsPane {
     this.binaryEl = document.createElement("span");
     this.binaryEl.id = "bits-binary";
     this.binaryEl.title = "the byte under the pointer";
-    const origins = document.createElement("button");
+    const origins = (this.originsEl = document.createElement("button"));
     origins.dataset.action = "origins";
     origins.textContent = "Origins";
     origins.title = "origin_lookup by this job: the licensed transmitters it may come from";
@@ -371,6 +371,7 @@ class BitsPane {
     const list = this.eligible();
     const cur = this.current();
     this.selectEl.hidden = list.length < 2;
+    this.originsEl.disabled = !cur;
     const key = list.map((j) => j.id).join(",") + "|" + (cur?.id ?? "");
     if (this.selectEl.dataset.key === key) return;
     this.selectEl.dataset.key = key;
