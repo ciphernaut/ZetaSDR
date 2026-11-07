@@ -1,9 +1,10 @@
 //! One mode's row: the schema of a `modes/*.json` file and its validation.
 //!
 //! A row names a decoder mode (`job_start --kind <id>`): its band, the layer-1 labels it
-//! presents as, the decoder (a graph template or an external program), its event schema
-//! and one-line summary, and the decode-to-identify rule. Every struct rejects unknown
-//! fields; [`parse`] names the offending field, [`validate`] checks what serde cannot.
+//! presents as, the decoder (a graph template, an external program or a frame chain),
+//! its event schema and one-line summary, and the decode-to-identify rule. Every struct
+//! rejects unknown fields; [`parse`] names the offending field, [`validate`] checks what
+//! serde cannot.
 
 use std::collections::BTreeMap;
 
@@ -232,7 +233,7 @@ impl Band {
     }
 }
 
-/// The decoder: a graph template, or an external program.
+/// The decoder: a graph template, an external program, or a frame chain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields, rename = "ModeDecoder")]
@@ -245,6 +246,9 @@ pub enum Decoder {
         edges: Vec<Edge>,
     },
     Program(ProgramBlock),
+    /// `channel → resample → <demod> → clock_recover → slicer → frame_decode`: the
+    /// demodulator and the framing `frame_decode` cuts frames by.
+    Frame(FrameBlock),
 }
 
 /// Which kind of decoder a row has, as `modes_list` reports it.
@@ -253,6 +257,7 @@ pub enum Decoder {
 pub enum DecoderKind {
     Graph,
     Program,
+    Frame,
 }
 
 impl Decoder {
@@ -260,8 +265,49 @@ impl Decoder {
         match self {
             Decoder::Graph { .. } => DecoderKind::Graph,
             Decoder::Program(_) => DecoderKind::Program,
+            Decoder::Frame(_) => DecoderKind::Frame,
         }
     }
+}
+
+/// A frame row's decoder: the demodulator, the framing and what reads each frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
+pub struct FrameBlock {
+    pub demod: FrameDemod,
+    /// `frame_decode`'s params (sync, length, CRC, line code, whitening, bit order),
+    /// checked by that stage.
+    pub framing: serde_json::Value,
+    /// What reads each frame's bytes, one of [`FRAME_PARSERS`] (`opaque` when left out:
+    /// the bytes as they are).
+    #[serde(default = "default_parser")]
+    pub parser: String,
+}
+
+/// The demodulator a frame row's chain runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "FrameDemod", transform = require_all)]
+pub struct FrameDemod {
+    pub modulation: crate::bits::Modulation,
+    pub symbol_rate_baud: u32,
+    /// Symbols' levels: 2 or 4 for fsk, 2, 4 or 8 for psk, 2 for ook (2 when left out).
+    #[serde(default = "default_order")]
+    pub order: u8,
+    /// FSK's tone spacing; `null` for the demodulator's own estimate.
+    #[serde(default)]
+    pub tone_spacing_hz: Option<u64>,
+}
+
+/// `decoder.parser` when a frame row leaves it out.
+fn default_parser() -> String {
+    "opaque".into()
+}
+
+/// `decoder.demod.order` when a frame row leaves it out.
+fn default_order() -> u8 {
+    2
 }
 
 /// The mode's events: their JSON Schema and the one-line summary template.
@@ -292,7 +338,8 @@ pub struct Identify {
     /// The shortest selection `classify` tries the row on.
     pub min_span_ms: u64,
     /// The in-crate attempt `classify` runs on a buffered span (`aprs`, `pocsag`,
-    /// `acars`, `rds`); `null` for rows tried only by the `identify` job.
+    /// `acars`, `rds`, or `frame` on a frame row: one CRC-clean frame of its chain);
+    /// `null` for rows tried only by the `identify` job.
     #[serde(default)]
     pub quick: Option<String>,
     /// Among rows of equal score, the higher priority is tried first (0 when absent).
@@ -589,8 +636,12 @@ const PROGRAM_PLACEHOLDERS: [&str; 5] = ["$port", "$rate_hz", "$center_hz", "$ce
 /// The event fields the node adds after a program's `decoder.output.fields` map, exempt
 /// from the rule that the map names every schema property.
 pub const ENVELOPE_FIELDS: [&str; 4] = ["protocol", "summary", "t_ns", "position"];
-/// The in-crate attempts `identify.quick` may name.
-pub const QUICK_ATTEMPTS: [&str; 4] = ["aprs", "pocsag", "acars", "rds"];
+/// The in-crate attempts `identify.quick` may name (`frame` on a frame row only).
+pub const QUICK_ATTEMPTS: [&str; 5] = ["aprs", "pocsag", "acars", "rds", "frame"];
+/// The parsers a frame row's `decoder.parser` may name.
+pub const FRAME_PARSERS: &[&str] = &["opaque", "modbus_rtu", "dnp3", "iec101", "iec104"];
+/// The stage a frame row's framing is checked by and runs in.
+pub(crate) const FRAME_DECODE_STAGE: &str = "frame_decode";
 /// Name suffixes of fields that hold an integer in their unit.
 const UNIT_SUFFIXES: [&str; 4] = ["_hz", "_ms", "_ns", "_baud"];
 
@@ -828,10 +879,79 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             ),
         ));
     }
+    let frame_row = matches!(row.decoder, Decoder::Frame(_));
+    match id.quick.as_deref() {
+        Some("frame") if !frame_row => {
+            return Err(RowError::new(
+                "identify.quick",
+                "frame needs decoder.kind frame",
+            ));
+        }
+        Some(q) if frame_row && q != "frame" => {
+            return Err(RowError::new(
+                "identify.quick",
+                format!("{q:?} on a frame row: frame (or null)"),
+            ));
+        }
+        _ => {}
+    }
     match &row.decoder {
         Decoder::Graph { nodes, edges } => validate_graph(nodes, edges, stages),
         Decoder::Program(p) => validate_program(p),
+        Decoder::Frame(b) => validate_frame(b, stages),
     }
+}
+
+/// A frame row's demodulator, parser and framing (checked by `stages`' `frame_decode`,
+/// its error's field under `decoder.framing`).
+fn validate_frame(b: &FrameBlock, stages: &StageRegistry) -> Result<(), RowError> {
+    let d = &b.demod;
+    if d.symbol_rate_baud == 0 {
+        return Err(RowError::new(
+            "decoder.demod.symbol_rate_baud",
+            "at least 1",
+        ));
+    }
+    let orders = d.modulation.orders();
+    if !orders.contains(&d.order) {
+        let names: Vec<String> = orders.iter().map(u8::to_string).collect();
+        let list = match names.split_last() {
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+            None => String::new(),
+        };
+        return Err(RowError::new(
+            "decoder.demod.order",
+            format!("{} is not {list} for {}", d.order, d.modulation.name()),
+        ));
+    }
+    if !FRAME_PARSERS.contains(&b.parser.as_str()) {
+        return Err(RowError::new(
+            "decoder.parser",
+            format!("{:?} is not one of {}", b.parser, FRAME_PARSERS.join(", ")),
+        ));
+    }
+    if stages.spec(FRAME_DECODE_STAGE).is_none() {
+        return Err(RowError::new(
+            "decoder.framing",
+            format!("{FRAME_DECODE_STAGE} is not a registered stage"),
+        ));
+    }
+    stages
+        .check_params(FRAME_DECODE_STAGE, &b.framing)
+        .map_err(|e| {
+            // The stage names the field (`sync.bits: ...`); a serde error does not.
+            let named = e.split_once(": ").filter(|(f, _)| {
+                !f.is_empty()
+                    && f.bytes().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'[' | b']')
+                    })
+            });
+            match named {
+                Some((f, rest)) => RowError::new(format!("decoder.framing.{f}"), rest),
+                None => RowError::new("decoder.framing", e),
+            }
+        })
 }
 
 /// `^[a-z][a-z0-9_]*$`.
@@ -1725,6 +1845,128 @@ mod tests {
                 "not in event.schema.properties"
             ),
             "{e}"
+        );
+    }
+
+    /// A frame row: fsk at 4800 Bd, framed by a 16-bit sync, 272 bits and a CRC.
+    const FRAME: &str = r#"{
+        "id": "fsk_test_frames", "name": "FSK test frames", "family": "general",
+        "band": {"bandwidth_hz": 12500, "centers_hz": [433920000]},
+        "modulation": ["fsk", "fm"], "label": "FSK frames", "protocol": "frame",
+        "decoder": {"kind": "frame",
+            "demod": {"modulation": "fsk", "symbol_rate_baud": 4800, "order": 2, "tone_spacing_hz": null},
+            "framing": {"sync": {"hex": "2dd4", "bits": 16}, "length": {"fixed_bits": 272}, "crc": "crc16-ccitt"},
+            "parser": "opaque"},
+        "event": {"schema": {"type": "object", "properties": {"protocol": {"type": "string"},
+            "length_bytes": {"type": "integer"}, "crc_ok": {"type": "boolean"}}},
+            "summary": "frame {length_bytes} B"},
+        "identify": {"proof": "field", "field": "crc_ok", "min_events": 1, "dwell_ms": 10000,
+            "min_span_ms": 1000, "quick": "frame"},
+        "catalogue": []
+    }"#;
+
+    /// A `frame_decode` stand-in whose params check refuses `sync.bits` over 64 as
+    /// zeta-dsp's does, naming the field.
+    struct FakeFrameDecode(crate::stage::StageSpec);
+
+    #[async_trait::async_trait]
+    impl crate::stage::Stage for FakeFrameDecode {
+        fn spec(&self) -> &crate::stage::StageSpec {
+            &self.0
+        }
+        fn backend(&self) -> crate::stage::Backend {
+            crate::stage::Backend::Cpu
+        }
+        fn check_params(&self, params: &serde_json::Value) -> Result<(), String> {
+            match params["sync"]["bits"].as_u64() {
+                Some(1..=64) => Ok(()),
+                _ => Err("sync.bits: 1..=64".into()),
+            }
+        }
+        async fn run(
+            &self,
+            _params: serde_json::Value,
+            _inputs: Vec<tokio::sync::broadcast::Receiver<crate::stream::Frame>>,
+            _outputs: Vec<crate::types::StreamId>,
+            _bus: std::sync::Arc<crate::stream::StreamBus>,
+            _cancel: tokio_util::sync::CancellationToken,
+            _ctx: crate::stage::StageContext,
+        ) -> Result<(), crate::stage::StageError> {
+            Ok(())
+        }
+    }
+
+    fn frame_stages() -> StageRegistry {
+        let mut r = StageRegistry::new();
+        r.register(std::sync::Arc::new(FakeFrameDecode(
+            crate::stage::StageSpec {
+                kind: "frame_decode",
+                inputs: vec![crate::types::StreamKind::Event],
+                outputs: vec![crate::types::StreamKind::Event],
+                params_schema: schemars::json_schema!({}),
+            },
+        )));
+        r
+    }
+
+    #[test]
+    fn a_frame_row_validates_its_framing_through_the_stage() {
+        let row = parse(FRAME).unwrap();
+        validate(&row, &frame_stages()).unwrap();
+        assert_eq!(row.decoder.kind(), DecoderKind::Frame);
+        let e = validate(&row, &no_stages()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "decoder.framing: frame_decode is not a registered stage"
+        );
+        let text = edited(FRAME, |v| {
+            v["decoder"]["framing"]["sync"]["bits"] = 70.into()
+        });
+        let e = validate(&parse(&text).unwrap(), &frame_stages()).unwrap_err();
+        assert_eq!(e, RowError::new("decoder.framing.sync.bits", "1..=64"));
+    }
+
+    #[test]
+    fn a_frame_row_checks_its_demod_and_parser() {
+        let check = |edit: fn(&mut serde_json::Value)| {
+            validate(&parse(&edited(FRAME, edit)).unwrap(), &frame_stages())
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            check(|v| v["decoder"]["demod"]["order"] = 3.into()),
+            "decoder.demod.order: 3 is not 2 or 4 for fsk"
+        );
+        assert_eq!(
+            check(|v| {
+                v["decoder"]["demod"]["modulation"] = "psk".into();
+                v["decoder"]["demod"]["order"] = 3.into();
+            }),
+            "decoder.demod.order: 3 is not 2, 4 or 8 for psk"
+        );
+        assert_eq!(
+            check(|v| v["decoder"]["demod"]["symbol_rate_baud"] = 0.into()),
+            "decoder.demod.symbol_rate_baud: at least 1"
+        );
+        let e = check(|v| v["decoder"]["parser"] = "bogus".into());
+        assert!(e.starts_with("decoder.parser: \"bogus\""), "{e}");
+        let e = check(|v| v["identify"]["quick"] = "aprs".into());
+        assert!(e.starts_with("identify.quick: "), "{e}");
+        // `quick` may be null on a frame row.
+        let text = edited(FRAME, |v| v["identify"]["quick"] = serde_json::Value::Null);
+        validate(&parse(&text).unwrap(), &frame_stages()).unwrap();
+        // An unknown field of the block or its demod is refused naming it.
+        let text = edited(FRAME, |v| v["decoder"]["demod"]["bogus"] = 1.into());
+        assert_eq!(parse(&text).unwrap_err().field, "bogus");
+    }
+
+    #[test]
+    fn quick_frame_needs_a_frame_row() {
+        let text = edited(POCSAG, |v| v["identify"]["quick"] = "frame".into());
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "identify.quick: frame needs decoder.kind frame"
         );
     }
 }

@@ -1,8 +1,11 @@
 //! Layer-2 decode-to-identify: score the mode rows against the measured band and try the
 //! best [`CLASSIFY_TRIES`] that have a quick in-process attempt (APRS, POCSAG, ACARS,
-//! RDS) over the channel, reporting only what passes its own check: the AX.25 FCS, the
-//! POCSAG BCH code, the ACARS CRC-16 or the RDS checkwords (design 6.2, 7.2).
+//! RDS, or a frame row's chain) over the channel, reporting only what passes its own
+//! check: the AX.25 FCS, the POCSAG BCH code, the ACARS CRC-16, the RDS checkwords or
+//! the frame row's CRC (design 6.2, 7.2).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,7 +13,7 @@ use num_complex::Complex;
 use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, Outcome, Tried};
 use zeta_core::knowledge::Allocation;
 use zeta_core::modes::score::{allocation_term, score_rows};
-use zeta_core::modes::{LoadedMode, ModeRegistry, ModeState};
+use zeta_core::modes::{Decoder, LoadedMode, ModeRow, ModeState, ModesHandle};
 use zeta_core::ops::channel_rate_hz;
 use zeta_core::types::Hz;
 
@@ -61,11 +64,13 @@ const DEVIATION_HZ: u64 = 3_000;
 /// a proof does not stop the sweep. Upstream features are not used. The
 /// register's assignments handed to the run score [`allocation_term`].
 pub struct DecodeToIdentify {
-    modes: Arc<ModeRegistry>,
+    modes: ModesHandle,
 }
 
 impl DecodeToIdentify {
-    pub fn new(modes: Arc<ModeRegistry>) -> DecodeToIdentify {
+    /// Decode-to-identify over the rows `modes` holds at each run (none while it is
+    /// empty).
+    pub fn new(modes: ModesHandle) -> DecodeToIdentify {
         DecodeToIdentify { modes }
     }
 }
@@ -139,7 +144,9 @@ impl Classifier for DecodeToIdentify {
         let span_ms = iq.len() as u64 * 1000 / rate;
         let catalogue = |id: &str| catalogue_score(id, m_center, m_bw, layer1);
         let allocation = |m: &LoadedMode| allocation_term(m, allocations);
-        let scored = score_rows(&self.modes, m_center, m_bw, layer1, &catalogue, &allocation);
+        // One registry for the whole run, however the handle is reloaded meanwhile.
+        let modes = self.modes.get().unwrap_or_default();
+        let scored = score_rows(&modes, m_center, m_bw, layer1, &catalogue, &allocation);
         // Each channel is extracted once, when the first row that runs on it does.
         let mut chans: Vec<((i64, u64), Option<(Vec<Complex<f32>>, u64)>)> = Vec::new();
         let mut labels = Vec::new();
@@ -150,54 +157,52 @@ impl Classifier for DecodeToIdentify {
             .take(CLASSIFY_TRIES)
         {
             let row = &s.mode.row;
-            let attempt = row.identify.quick.as_deref().and_then(quick_attempt);
-            let outcome = if row.identify.min_span_ms > span_ms {
-                Outcome::SkippedSpan
-            } else if attempt.is_none() {
-                Outcome::SkippedQuick
-            } else if !row.band.fits(box_hz) {
-                Outcome::SkippedBand
-            } else if s.mode.state != ModeState::Ready {
-                Outcome::Unavailable
-            } else {
-                // Under the RDS gate every row runs on the band's own channel. Over
-                // it, a row narrower than the band runs on its own width around the
-                // measured centre, not on the whole broadcast-wide band.
-                let row_bw = row.band.bandwidth_hz.max(MIN_BW_HZ);
-                let key = match wide && row_bw < bw.max(MIN_BW_HZ) {
-                    true => (m_center as i64 - center_hz.0 as i64, row_bw),
-                    false => (offset, bw),
-                };
-                let i = match chans.iter().position(|(k, _)| *k == key) {
-                    Some(i) => i,
-                    None => {
-                        chans.push((key, extract(iq, rate, key.0, key.1)));
-                        chans.len() - 1
+            let attempt = quick_attempt(row);
+            let outcome = match &attempt {
+                _ if row.identify.min_span_ms > span_ms => Outcome::SkippedSpan,
+                None => Outcome::SkippedQuick,
+                Some(_) if !row.band.fits(box_hz) => Outcome::SkippedBand,
+                Some(_) if s.mode.state != ModeState::Ready => Outcome::Unavailable,
+                Some(attempt) => {
+                    // Under the RDS gate every row runs on the band's own channel. Over
+                    // it, a row narrower than the band runs on its own width around the
+                    // measured centre, not on the whole broadcast-wide band.
+                    let row_bw = row.band.bandwidth_hz.max(MIN_BW_HZ);
+                    let key = match wide && row_bw < bw.max(MIN_BW_HZ) {
+                        true => (m_center as i64 - center_hz.0 as i64, row_bw),
+                        false => (offset, bw),
+                    };
+                    let i = match chans.iter().position(|(k, _)| *k == key) {
+                        Some(i) => i,
+                        None => {
+                            chans.push((key, extract(iq, rate, key.0, key.1)));
+                            chans.len() - 1
+                        }
+                    };
+                    let mut found = match &chans[i].1 {
+                        Some((c, r)) => attempt(c.clone(), *r).await,
+                        None => None,
+                    };
+                    // A box between the floor and the RDS gate may hold the signal off its
+                    // centre: once more on the row's own width at the measured centre.
+                    if found.is_none() && !wide && layer1 != "noise" {
+                        let slice = (m_center as i64 - center_hz.0 as i64, row_bw);
+                        if slice != key {
+                            found = slice_attempt(iq, rate, slice, attempt).await;
+                        }
                     }
-                };
-                let mut found = chans[i]
-                    .1
-                    .as_ref()
-                    .and_then(|(c, r)| attempt.and_then(|a| a(c, *r)));
-                // A box between the floor and the RDS gate may hold the signal off its
-                // centre: once more on the row's own width at the measured centre.
-                if found.is_none() && !wide && layer1 != "noise" {
-                    let slice = (m_center as i64 - center_hz.0 as i64, row_bw);
-                    if slice != key {
-                        found = attempt.and_then(|a| slice_attempt(iq, rate, slice, a));
+                    match found {
+                        Some(evidence) => {
+                            labels.push(Label {
+                                layer: 2,
+                                name: row.label.clone(),
+                                confidence: 1.0,
+                                evidence: format!("decode {}: {evidence}", row.id.0),
+                            });
+                            Outcome::Proved
+                        }
+                        None => Outcome::NoFrame,
                     }
-                }
-                match found {
-                    Some(evidence) => {
-                        labels.push(Label {
-                            layer: 2,
-                            name: row.label.clone(),
-                            confidence: 1.0,
-                            evidence: format!("decode {}: {evidence}", row.id.0),
-                        });
-                        Outcome::Proved
-                    }
-                    None => Outcome::NoFrame,
                 }
             };
             tried.push(Tried {
@@ -226,28 +231,45 @@ fn extract(
 
 /// `attempt` over the channel at `(offset, bandwidth)` from the block centre: its
 /// evidence when a frame passes its check.
-fn slice_attempt(
+async fn slice_attempt(
     iq: &[Complex<f32>],
     rate: u64,
     (offset, bw): (i64, u64),
-    attempt: Attempt,
+    attempt: &Attempt,
 ) -> Option<String> {
     let (chan, out_rate) = extract(iq, rate, offset, bw)?;
-    attempt(&chan, out_rate)
+    attempt(chan, out_rate).await
 }
+
+/// What an [`Attempt`] returns: its evidence, once the decoder has run.
+type AttemptFuture = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
 
 /// One decoder tried over the extracted channel (IQ at the given rate): its
 /// evidence when a frame passes its check.
-type Attempt = fn(&[Complex<f32>], u64) -> Option<String>;
+type Attempt = Arc<dyn Fn(Vec<Complex<f32>>, u64) -> AttemptFuture + Send + Sync>;
 
-/// The in-crate attempt an `identify.quick` name runs (the names
-/// `zeta_core::modes::QUICK_ATTEMPTS` validates).
-fn quick_attempt(name: &str) -> Option<Attempt> {
-    match name {
-        "aprs" => Some(aprs_attempt),
-        "pocsag" => Some(pocsag_attempt),
-        "acars" => Some(acars_attempt),
-        "rds" => Some(rds_attempt),
+/// The in-crate attempt `row`'s `identify.quick` names (the names
+/// `zeta_core::modes::QUICK_ATTEMPTS` validates): `frame` runs the frame row's own chain
+/// ([`crate::frame_quick::attempt`]).
+fn quick_attempt(row: &ModeRow) -> Option<Attempt> {
+    let blocking = |f: fn(&[Complex<f32>], u64) -> Option<String>| -> Attempt {
+        Arc::new(move |chan: Vec<Complex<f32>>, rate| Box::pin(async move { f(&chan, rate) }))
+    };
+    match row.identify.quick.as_deref()? {
+        "aprs" => Some(blocking(aprs_attempt)),
+        "pocsag" => Some(blocking(pocsag_attempt)),
+        "acars" => Some(blocking(acars_attempt)),
+        "rds" => Some(blocking(rds_attempt)),
+        "frame" => {
+            let Decoder::Frame(block) = &row.decoder else {
+                return None;
+            };
+            let block = Arc::new(block.clone());
+            Some(Arc::new(move |chan: Vec<Complex<f32>>, rate| {
+                let block = block.clone();
+                Box::pin(async move { crate::frame_quick::attempt(chan, rate, &block).await })
+            }))
+        }
         _ => None,
     }
 }
@@ -313,13 +335,14 @@ mod tests {
     use crate::fixtures::{
         acars_packet_iq, aprs_packet_iq, nbfm_modulate, pocsag_packet_iq, rds_station_iq, tone,
     };
+    use zeta_core::modes::ModeRegistry;
     use zeta_core::stage::StageRegistry;
 
     /// Decode-to-identify over the embedded rows.
     fn d() -> DecodeToIdentify {
         let mut stages = StageRegistry::new();
         crate::register_all(&mut stages);
-        DecodeToIdentify::new(Arc::new(ModeRegistry::load(&stages, None)))
+        DecodeToIdentify::new(Arc::new(ModeRegistry::load(&stages, None)).into())
     }
 
     #[tokio::test]

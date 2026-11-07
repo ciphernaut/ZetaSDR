@@ -53,7 +53,7 @@ async fn node_over_with(
         modes_dir,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     src.start();

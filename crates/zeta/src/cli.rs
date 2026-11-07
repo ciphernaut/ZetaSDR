@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
 use zeta_core::modes::{Family, ModeState};
 use zeta_core::ops::{JobKind, Modulation, Op, OpError, Sideband, SignalBand};
+use zeta_core::signatures::SignatureState;
 use zeta_core::station::{Antenna, AntennaKind, Station};
 use zeta_core::types::{Baud, Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
 
@@ -340,6 +341,9 @@ pub enum Command {
     /// The burst captures the node stored
     #[command(subcommand)]
     Capture(CaptureCmd),
+    /// The learned signatures: proposals waiting for the operator, and accepted ones
+    #[command(subcommand)]
+    Signature(SignatureCmd),
     /// Many jobs at once
     #[command(subcommand)]
     Jobs(JobsCmd),
@@ -497,6 +501,54 @@ pub enum CaptureCmd {
         #[arg(long)]
         capture: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SignatureCmd {
+    /// List the learned signatures, newest first; with --state only those in that state
+    List {
+        /// Only this state: proposed, accepted, rejected or superseded
+        #[arg(long, value_name = "S", value_parser = parse_signature_state)]
+        state: Option<SignatureState>,
+    },
+    /// Print one signature's record
+    Show {
+        /// A signature id (from `signature list`)
+        #[arg(long)]
+        id: String,
+    },
+    /// Propose a signature by hand from a capture
+    Propose {
+        /// A capture id (from `capture list`)
+        #[arg(long)]
+        capture: String,
+        /// The signature's name [default: the node's, `<modulation> <width> kHz at <MHz>`]
+        #[arg(long)]
+        name: Option<String>,
+        /// A JSON file holding the `frame_decode` params that checked
+        #[arg(long, value_name = "FILE")]
+        framing_file: Option<PathBuf>,
+    },
+    /// Accept a proposed signature (its captures are pinned)
+    Accept {
+        /// A signature id (from `signature list`)
+        #[arg(long)]
+        id: String,
+        /// The operator's name for it [default: the proposed one]
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Reject a proposed signature
+    Reject {
+        /// A signature id (from `signature list`)
+        #[arg(long)]
+        id: String,
+    },
+}
+
+/// `--state`: `proposed`, `accepted`, `rejected` or `superseded`.
+fn parse_signature_state(s: &str) -> Result<SignatureState, String> {
+    serde_json::from_value(s.into()).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Subcommand)]
@@ -813,6 +865,10 @@ pub struct AskArgs {
     /// Let the agent delete captures (`capture_delete`)
     #[arg(long)]
     pub allow_delete: bool,
+    /// Let the agent accept or reject learned signatures (`signature_accept`,
+    /// `signature_reject`)
+    #[arg(long)]
+    pub allow_signatures: bool,
 }
 
 /// The usage error for `--stt-socket` with `--stt-node`.
@@ -1194,6 +1250,11 @@ impl Command {
                 | Command::Bits(BitsCmd::Start { .. })
                 | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
                 | Command::Capture(CaptureCmd::Delete { .. })
+                | Command::Signature(
+                    SignatureCmd::Propose { .. }
+                        | SignatureCmd::Accept { .. }
+                        | SignatureCmd::Reject { .. }
+                )
                 | Command::Jobs(JobsCmd::Stop { .. })
         )
     }
@@ -1225,7 +1286,8 @@ impl Command {
     }
 
     /// The operation this subcommand applies; `None` for `serve`. Fails only
-    /// when `graph put` or `graph start` cannot read or parse its file.
+    /// when `graph put`, `graph start` or `signature propose --framing-file` cannot read
+    /// or parse its file.
     pub fn into_op(self) -> Result<Option<Op>, OpError> {
         let job = |a: JobArg| JobId(a.job);
         Ok(Some(match self {
@@ -1413,6 +1475,21 @@ impl Command {
             Command::Capture(CaptureCmd::Show { capture }) => Op::CaptureShow { capture },
             Command::Capture(CaptureCmd::Classify { capture }) => Op::CaptureClassify { capture },
             Command::Capture(CaptureCmd::Delete { capture }) => Op::CaptureDelete { capture },
+            Command::Signature(SignatureCmd::List { state }) => Op::SignatureList { state },
+            Command::Signature(SignatureCmd::Show { id }) => Op::SignatureShow { id },
+            Command::Signature(SignatureCmd::Propose {
+                capture,
+                name,
+                framing_file,
+            }) => Op::SignaturePropose {
+                capture,
+                name,
+                framing: framing_file.map(|f| read_json(&f)).transpose()?,
+            },
+            Command::Signature(SignatureCmd::Accept { id, name }) => {
+                Op::SignatureAccept { id, name }
+            }
+            Command::Signature(SignatureCmd::Reject { id }) => Op::SignatureReject { id },
             Command::Station(StationCmd::Get) => Op::StationGet {},
             Command::Station(StationCmd::Clear) => Op::StationClear {},
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
@@ -1445,6 +1522,14 @@ pub fn narrow_plans(result: &mut zeta_core::ops::OpResult, id: Option<&str>) {
 }
 
 fn read_graph(path: &std::path::Path) -> Result<Graph, OpError> {
+    let json = read_json(path)?;
+    serde_json::from_value(json).map_err(|e| OpError::Other {
+        message: format!("{}: {e}", path.display()),
+    })
+}
+
+/// The JSON file `path`; a read or parse failure names the file.
+fn read_json(path: &std::path::Path) -> Result<serde_json::Value, OpError> {
     let other = |e: &dyn std::fmt::Display| OpError::Other {
         message: format!("{}: {e}", path.display()),
     };
@@ -1539,5 +1624,92 @@ mod cli_bits_tests {
             }
             op => panic!("bits start: {op:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_signature_tests {
+    use super::*;
+
+    fn op(args: &[&str]) -> Op {
+        let cli = Cli::try_parse_from(args).unwrap();
+        cli.command.into_op().unwrap().expect("an op")
+    }
+
+    #[test]
+    fn cli_signature_accept_takes_the_id_and_the_name() {
+        assert_eq!(
+            op(&["zeta", "signature", "accept", "--id", "X", "--name", "a b"]),
+            Op::SignatureAccept {
+                id: "X".into(),
+                name: Some("a b".into())
+            }
+        );
+        assert_eq!(
+            op(&["zeta", "signature", "reject", "--id", "X"]),
+            Op::SignatureReject { id: "X".into() }
+        );
+    }
+
+    #[test]
+    fn cli_signature_list_takes_an_optional_state() {
+        assert_eq!(
+            op(&["zeta", "signature", "list"]),
+            Op::SignatureList { state: None }
+        );
+        assert_eq!(
+            op(&["zeta", "signature", "list", "--state", "accepted"]),
+            Op::SignatureList {
+                state: Some(SignatureState::Accepted)
+            }
+        );
+        assert!(Cli::try_parse_from(["zeta", "signature", "list", "--state", "nope"]).is_err());
+    }
+
+    #[test]
+    fn cli_signature_propose_reads_the_framing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("framing.json");
+        let framing =
+            serde_json::json!({"sync": {"hex": "2dd4", "bits": 16}, "length": {"fixed_bits": 272}});
+        std::fs::write(&file, framing.to_string()).unwrap();
+        let path = file.to_str().unwrap();
+        assert_eq!(
+            op(&[
+                "zeta",
+                "signature",
+                "propose",
+                "--capture",
+                "C",
+                "--framing-file",
+                path
+            ]),
+            Op::SignaturePropose {
+                capture: "C".into(),
+                name: None,
+                framing: Some(framing)
+            }
+        );
+        let missing = Cli::try_parse_from([
+            "zeta",
+            "signature",
+            "propose",
+            "--capture",
+            "C",
+            "--framing-file",
+            "/nonexistent/f.json",
+        ])
+        .unwrap();
+        assert!(missing.command.into_op().is_err());
+    }
+
+    #[test]
+    fn cli_signature_writes_are_refused_beside_serve_and_reads_are_not() {
+        let mutates = |args: &[&str]| Cli::try_parse_from(args).unwrap().command.mutates();
+        assert!(mutates(&["zeta", "signature", "propose", "--capture", "C"]));
+        assert!(mutates(&["zeta", "signature", "accept", "--id", "X"]));
+        assert!(mutates(&["zeta", "signature", "reject", "--id", "X"]));
+        assert!(!mutates(&["zeta", "signature", "list"]));
+        assert!(!mutates(&["zeta", "signature", "show", "--id", "X"]));
     }
 }

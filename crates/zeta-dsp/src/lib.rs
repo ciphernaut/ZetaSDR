@@ -27,6 +27,10 @@ pub mod crc;
 pub mod denoise;
 pub mod detect;
 pub mod fft;
+pub mod frame_decode;
+pub mod frame_parse;
+pub mod frame_quick;
+pub mod framing;
 pub mod fsk;
 #[cfg(feature = "gpu")]
 pub mod gpu_fft;
@@ -34,7 +38,9 @@ pub mod identify;
 pub mod measure;
 pub mod mix;
 pub mod nbfm;
+pub mod offline;
 pub mod ook;
+pub mod parsers;
 pub mod pfb;
 pub mod pocsag;
 pub mod psk;
@@ -80,6 +86,8 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(clock::ClockRecoverStage::new()));
     reg.register(Arc::new(slicer::SlicerStage::new()));
     reg.register(Arc::new(correlate::CorrelateStage::new()));
+    reg.register(Arc::new(frame_decode::FrameDecodeStage::new()));
+    reg.register(Arc::new(frame_parse::FrameParseStage::new()));
     reg.register(Arc::new(bit_view::BitViewStage::new()));
     reg.register(Arc::new(denoise::DenoiseStage::new()));
     reg.register(Arc::new(vad::VadStage::new()));
@@ -99,9 +107,9 @@ pub fn gpu_available() -> bool {
     }
 }
 
-/// This crate's classifiers, lowest layer first; decode-to-identify tries the rows of
-/// `modes`.
-pub fn classifiers(modes: Arc<zeta_core::modes::ModeRegistry>) -> Vec<Arc<dyn Classifier>> {
+/// This crate's classifiers, lowest layer first; decode-to-identify tries the rows
+/// `modes` holds at each run.
+pub fn classifiers(modes: zeta_core::modes::ModesHandle) -> Vec<Arc<dyn Classifier>> {
     vec![
         Arc::new(measure::Layer1Classifier),
         Arc::new(identify::DecodeToIdentify::new(modes)),

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
@@ -207,9 +207,10 @@ impl Inner {
         let (mix_node, mix_job) = (inner.clone(), id.clone());
         // The row the job's kind expands from, for the events' envelope; a row that is
         // not ready never got this far (the expand refused it).
+        let modes = self.modes();
         let mode = self
             .expandable_kind(&rec.kind)
-            .and_then(|k| k.mode_row(&self.modes).ok().flatten())
+            .and_then(|k| k.mode_row(&modes).ok().flatten())
             .map(|row| Arc::new(row.clone()));
         // A rigid job on a radio keeps to its own band inside a wider capture.
         let band = (port.is_some() && !rec.elastic).then(|| {
@@ -241,6 +242,9 @@ impl Inner {
         let graph = rec.graph.clone();
         // A `transcribe` job's record for its transcript tees (see `tee_transcripts`).
         let tee = (rec.kind == JobKind::Transcribe.name()).then(|| rec.clone());
+        // A `bits` or `graph` job's or a mode row's job's record for its watch (proposals,
+        // the row's first proof: see `super::propose::watch_for_proposals`).
+        let proposer = super::propose::watches(self, &rec).then(|| rec.clone());
         // A `watch`'s controller runs beside its stages (see `super::watch`).
         let watch =
             (rec.kind == JobKind::Watch.name()).then(|| (watch::Seed::of(&rec), rec.tuning));
@@ -287,9 +291,13 @@ impl Inner {
             .collect();
         let mut set = JoinSet::new();
         let mut drain: Drain = HashMap::new();
+        // The proposal watchers, awaited by `supervise` before the session record.
+        let mut watchers = Vec::new();
         for (n, stage) in graph.nodes.iter().zip(stages) {
             let mut inputs = Vec::new();
             let mut leaving = Vec::new();
+            // This node's job outputs: its edges into a sink, then its own streams.
+            let first_output = job_outputs.len();
             for (e, sid) in graph.edges.iter().zip(&edge_streams) {
                 if e.to == n.id {
                     inputs.push(self.bus.subscribe(sid).expect("registered"));
@@ -318,6 +326,14 @@ impl Inner {
             // Subscribed before the stage runs, so its first event is not missed.
             if let Some(rec) = &tee {
                 self.tee_transcripts(rec, &job_outputs[before..], &token);
+            }
+            if let Some(rec) = &proposer {
+                watchers.extend(super::propose::watch_for_proposals(
+                    self,
+                    rec,
+                    &job_outputs[first_output..],
+                    &token,
+                ));
             }
             let ids: Vec<StreamId> = outputs.into_iter().map(|(_, s)| s).collect();
             let own = ids.clone();
@@ -372,7 +388,7 @@ impl Inner {
             port,
             set,
             token,
-            (streams, drains.then_some(drain)),
+            (streams, drains.then_some(drain), watchers),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run
@@ -646,7 +662,7 @@ impl Inner {
             return Ok(());
         }
         let bin_rate = self.bank_bin_rate(&rec.source, band);
-        let modes = &self.modes;
+        let modes = &self.modes();
         let graph = kind.reexpand(&rec.source, rec.tuning, rate, bin_rate, &rec.graph, modes);
         // At the same rate the stored graph stands while one of today's expansions (on
         // the bank or the source rate) still gives it, or when none can be made.
@@ -695,7 +711,7 @@ impl Inner {
                 band.bandwidth_hz,
                 bin_rate,
                 &rec.graph,
-                &self.modes,
+                &self.modes(),
             )
             .map_err(NodeError::Expand)?;
         *stages = self.stages(&graph)?;
@@ -814,7 +830,7 @@ impl Inner {
                     None,
                     None,
                     None,
-                    &self.modes,
+                    &self.modes(),
                 )
                 .map_err(|e| NodeError::Other(format!("scan graph: {e}")))?;
         }
@@ -919,7 +935,7 @@ impl Inner {
             Some(port),
             set,
             token,
-            (vec![out.clone()], None),
+            (vec![out.clone()], None, Vec::new()),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run
@@ -1060,6 +1076,11 @@ fn node_outputs(
 /// unregistered, so each consumer sees its input close, flushes and ends in turn, and
 /// the rest are cancelled once all have ended or [`DRAIN_TIMEOUT_MS`] after the first
 /// clean end. A failure still cancels at once.
+///
+/// `watchers` (the job's proposal watchers, see [`super::propose::watch_for_proposals`])
+/// are awaited once the stages have ended and the token is cancelled, at most
+/// [`super::propose::PROPOSAL_DRAIN_MS`], so a proposal from the job's last events is
+/// noted before its session record is written.
 pub(super) async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
@@ -1067,7 +1088,7 @@ pub(super) async fn supervise(
     port: Option<Arc<dyn Port>>,
     mut set: JoinSet<Result<(), StageError>>,
     token: CancellationToken,
-    (streams, mut drain): (Vec<StreamId>, Option<Drain>),
+    (streams, mut drain, watchers): (Vec<StreamId>, Option<Drain>, Vec<JoinHandle<()>>),
 ) {
     let mut failure = None;
     // Whether a stage ended the job (not a stop, nothing failing).
@@ -1116,6 +1137,12 @@ pub(super) async fn supervise(
     if drain.is_some() {
         token.cancel();
     }
+    // Every stage has ended: the watchers drain what is buffered on the cancelled token,
+    // then end, before the session record below reads the job's context.
+    if !watchers.is_empty() {
+        token.cancel();
+        super::propose::drain_watchers(watchers).await;
+    }
     // An elastic job being relaunched keeps its record `Running` and its lease
     // for the relaunch (see `Inner::relaunch_elastic`). A run whose entry a later
     // run took leaves the record, the lease and the port to that run.
@@ -1137,6 +1164,16 @@ pub(super) async fn supervise(
             .filter(|r| r.kind == JobKind::Capture.name());
         if let Some(rec) = capture {
             super::capture::capture_finished(&inner, &rec, failure.as_deref(), stage_ended).await;
+        }
+        // The exploration job's session record, its context as the end left it.
+        let ending = inner
+            .jobs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|e| e.record.clone());
+        if let Some(rec) = ending {
+            super::propose::record_session(&inner, &rec);
         }
         let end = match failure {
             Some(reason) => JobState::Failed { reason },

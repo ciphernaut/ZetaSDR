@@ -3,7 +3,8 @@
 //! as an ordinary child job, one at a time in score order, publishing one `candidate`
 //! event per row on its own event stream. A proof leaves that row's child running and
 //! ends the job `Stopped` with the verdict in `job_context.identify`; an exhausted list
-//! ends it the same way with `mode: null` and the layer-1 label and features.
+//! ends it the same way with `mode: null` and the layer-1 label and features, or the
+//! learned signature the measurement matches (`learned`).
 //!
 //! A stop of the job, or any other end of its loop (a fault fails it with the source's
 //! fault, as any job on a faulted source), stops the child it is trying (never a proved
@@ -25,6 +26,7 @@ use super::{Inner, NodeError, source_fault_reason};
 use crate::classify::{Band, Measurement, Outcome};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::{Allocation, DEFAULT_REGION, nearest_allocations};
+use crate::learned::{LEARNED_VERDICT_MIN, label_score, learned_match};
 use crate::modes::Proof;
 use crate::modes::score::{allocation_match, allocation_term, score_rows};
 use crate::modes::{LoadedMode, ModeState};
@@ -124,7 +126,7 @@ impl Inner {
             Some(port),
             set,
             token,
-            (vec![out.clone()], None),
+            (vec![out.clone()], None, Vec::new()),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run
@@ -169,8 +171,11 @@ impl Inner {
     /// verdict is also published as one `verdict` event (`mode`, `label`, `center_hz`,
     /// `job`, `allocations`, `summary`): a proof's `<label> at <MHz>: <the decoder's
     /// summary>`, an unknown's `unknown at <MHz>: <label> <features>; register says ...`
-    /// as the watch words it, `center_hz` the measured centre.
-    fn verdict(&self, r: &Run, verdict: serde_json::Value, center_hz: u64) {
+    /// (with a learned match `learned <name> at <MHz>: <features>`) as the watch words it,
+    /// `center_hz` the measured centre. A proof (a `mode`) on the band `tuning` (the
+    /// proved child's) supersedes the accepted signatures it overlaps
+    /// ([`Inner::supersede_by`]).
+    fn verdict(&self, r: &Run, verdict: serde_json::Value, center_hz: u64, tuning: Tuning) {
         let v = &verdict["identify"]["verdict"];
         let at = format!("{:.4} MHz", center_hz as f64 / 1e6);
         let label = v["label"].as_str().unwrap_or("unknown");
@@ -179,6 +184,9 @@ impl Inner {
                 "{label} at {at}: {}",
                 v["summary"].as_str().unwrap_or("proved")
             ),
+            None if v["learned"].is_object() => {
+                format!("{label} at {at}:{}", super::watch::measured(&v["features"]))
+            }
             None => format!(
                 "unknown at {at}: {label}{}{}",
                 super::watch::measured(&v["features"]),
@@ -186,6 +194,9 @@ impl Inner {
             ),
         };
         let t = now();
+        if let Some(mode) = v["mode"].as_str() {
+            self.supersede_by(mode, tuning, t.0);
+        }
         let payload = serde_json::json!({
             "protocol": "verdict",
             "mode": v["mode"],
@@ -333,7 +344,7 @@ impl Inner {
                 bin_rate,
                 None,
                 None,
-                &self.modes,
+                &self.modes(),
             )
             .map_err(|e| e.to_string())?;
         let rec = JobRecord {
@@ -480,7 +491,10 @@ impl Inner {
 /// job for its `identify.dwell_ms`, centred on the measured centre when that lies in
 /// the band (else on the band's): `no_frame` stops it before the next, `proved` leaves
 /// it running and ends the job with the verdict; (4) an exhausted list ends the job
-/// with `mode: null`, the layer-1 label and features, `recentred` and `allocations`.
+/// with `mode: null`, the layer-1 label and features, `recentred`, `allocations` and
+/// `learned`: the accepted signature the measurement matches (`{id, name, confidence}`,
+/// the label's confidence; the verdict's label then `learned <name>`) when its match
+/// score reaches [`LEARNED_VERDICT_MIN`], else `null`.
 async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     // A child the run before a restart was trying (resumed as an ordinary job): stopped
     // first, needing no samples, so a measurement that fails cannot orphan it.
@@ -504,6 +518,24 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         .as_ref()
         .map_or("unknown", |m| m.label.name.as_str())
         .to_string();
+    // The accepted signature the measurement matches best, its score high enough to
+    // name it (whatever the record's confidence).
+    let learned = match &measured {
+        Some(m) => classifiers
+            .learned(m)
+            .await
+            .into_iter()
+            .filter(|l| {
+                label_score(&inner.signatures, l, m).is_some_and(|s| s >= LEARNED_VERDICT_MIN)
+            })
+            .max_by(|a, b| a.confidence.total_cmp(&b.confidence)),
+        None => None,
+    };
+    let learned_json = learned.as_ref().and_then(|l| {
+        learned_match(l).map(
+            |(id, name)| serde_json::json!({"id": id, "name": name, "confidence": l.confidence}),
+        )
+    });
     let m_center = measured
         .as_ref()
         .map_or(r.tuning.center_hz.0, |m| m.features.center_hz.0);
@@ -533,7 +565,8 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
     };
     let allocation = |m: &LoadedMode| allocation_term(m, &allocations);
-    let scored = score_rows(&inner.modes, m_center, bw, &layer1, &|_| 0.0, &allocation);
+    let modes = inner.modes();
+    let scored = score_rows(&modes, m_center, bw, &layer1, &|_| 0.0, &allocation);
     let faulted = |f: String| StageError::Failed(source_fault_reason(r.port.id(), &f));
     let mut current = ChildGuard {
         inner: inner.clone(),
@@ -606,10 +639,11 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                         "job": child.0,
                         "recentred": recentred,
                         "allocations": allocations,
+                        "learned": null,
                     },
                     "attempts": attempts,
                 }});
-                inner.verdict(&r, verdict, m_center);
+                inner.verdict(&r, verdict, m_center, trial);
                 return Ok(());
             }
         }
@@ -617,17 +651,22 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     if let Some(f) = r.port.fault() {
         return Err(faulted(f));
     }
+    // `learned <name>` when a match is sure enough, else the layer-1 label.
+    let label = learned
+        .filter(|_| learned_json.is_some())
+        .map_or(layer1, |l| l.name);
     let verdict = serde_json::json!({"identify": {
         "verdict": {
             "mode": null,
-            "label": layer1,
+            "label": label,
             "features": measured.as_ref().map(|m| &m.features),
             "recentred": recentred,
             "allocations": allocations,
+            "learned": learned_json,
         },
         "attempts": attempts,
     }});
-    inner.verdict(&r, verdict, m_center);
+    inner.verdict(&r, verdict, m_center, trial);
     Ok(())
 }
 

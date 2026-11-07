@@ -487,7 +487,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 36, "one schema per Op variant");
+    assert_eq!(vs.len(), 41, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -644,7 +644,12 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                         !time || name.ends_with("_ns") || name.ends_with("_ms"),
                         "{path}.{name} is a time field without _ns/_ms"
                     );
-                    if name.ends_with("_ms") {
+                    // A learned signature's burst shape keeps the feature record's
+                    // measured milliseconds (a number, maybe null), not a timeout; a
+                    // knowledge `Signature` inlines it as its nullable `burst`.
+                    let burst =
+                        path.ends_with(".Burst") || path.ends_with(".Signature.properties.burst");
+                    if name.ends_with("_ms") && !burst {
                         assert_eq!(s["type"], "integer", "{path}.{name} is not an integer");
                     }
                     if ["_hz", "_ns", "_baud"].iter().any(|u| name.ends_with(u)) {

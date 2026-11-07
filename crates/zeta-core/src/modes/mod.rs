@@ -6,6 +6,10 @@
 //! Loading never fails: a row that does not parse or validate is kept as `broken` with
 //! its reason (and an operator file that fails leaves the row it meant to replace in
 //! force), so a bad row never stops the node.
+//!
+//! A node holds its registry in a [`ModesHandle`], which `reload` replaces whole (an
+//! accepted signature's row written, say): every reader takes the registry from the
+//! handle at each use, so it sees the old rows or the new ones, never a mix.
 
 mod row;
 pub mod score;
@@ -13,18 +17,20 @@ pub mod summary;
 pub mod template;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::stage::StageRegistry;
 
+pub(crate) use row::FRAME_DECODE_STAGE;
 pub use row::{
-    AltUnit, Band, Container, Decoder, DecoderKind, Demod, ENVELOPE_FIELDS, Event, Family,
-    FieldPath, Identify, InputStream, InputVia, Install, ModeId, ModeRow, OutputVia, Parser,
-    PositionMap, ProgramBlock, ProgramInput, ProgramOutput, Proof, QUICK_ATTEMPTS, RowError,
-    RowTest, SampleFormat, Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec,
-    center_khz_text, is_mode_id, parse, validate,
+    AltUnit, Band, Container, Decoder, DecoderKind, Demod, ENVELOPE_FIELDS, Event, FRAME_PARSERS,
+    Family, FieldPath, FrameBlock, FrameDemod, Identify, InputStream, InputVia, Install, ModeId,
+    ModeRow, OutputVia, Parser, PositionMap, ProgramBlock, ProgramInput, ProgramOutput, Proof,
+    QUICK_ATTEMPTS, RowError, RowTest, SampleFormat, Subject, SubjectColumn, SubjectUnit,
+    SubjectWaterfall, TestSpec, center_khz_text, is_mode_id, parse, validate,
 };
 
 /// Where a loaded row stands: `ready` (parsed, validated and, for a program row, its
@@ -130,6 +136,10 @@ const EMBEDDED: [(&str, &str); 10] = [
     ),
 ];
 
+/// The file in the state directory recording when `zeta modes check` last passed each
+/// program row (see [`ModeRegistry::load_checked`]).
+pub const MODES_CHECKED_FILE: &str = "modes-checked.json";
+
 /// `$XDG_CONFIG_HOME/zetasdr/modes`, else `$HOME/.config/zetasdr/modes`; `None` when
 /// neither variable is set.
 pub fn default_operator_dir() -> Option<PathBuf> {
@@ -141,6 +151,34 @@ pub fn default_operator_dir() -> Option<PathBuf> {
     var("XDG_CONFIG_HOME")
         .map(|x| x.join("zetasdr/modes"))
         .or_else(|| var("HOME").map(|h| h.join(".config/zetasdr/modes")))
+}
+
+/// The loaded mode registry, shared by the node and the stages and classifiers that
+/// read its rows; empty until it is set, and replaced whole by each later `set` (a
+/// reload). A reader takes [`ModesHandle::get`] at each use and keeps that registry
+/// for the use, so it sees one consistent set of rows.
+#[derive(Clone, Debug, Default)]
+pub struct ModesHandle(Arc<RwLock<Option<Arc<ModeRegistry>>>>);
+
+impl ModesHandle {
+    /// The registry the handle holds now; `None` until one is set.
+    pub fn get(&self) -> Option<Arc<ModeRegistry>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Hold `modes` from now on, replacing the registry held before.
+    pub fn set(&self, modes: Arc<ModeRegistry>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Some(modes);
+    }
+}
+
+impl From<Arc<ModeRegistry>> for ModesHandle {
+    /// A handle holding `modes`.
+    fn from(modes: Arc<ModeRegistry>) -> Self {
+        let handle = ModesHandle::default();
+        handle.set(modes);
+        handle
+    }
 }
 
 /// Every mode the node knows, sorted by id.
@@ -282,6 +320,29 @@ impl ModeRegistry {
         };
         m.program = program;
         m.reason = reason;
+    }
+
+    /// Carry what probing found from `old` (the registry this one replaces) to each
+    /// program row of the same id: its `program`, `state` and `reason`, so a reload
+    /// keeps the probe's answer without probing again. Only where both rows are
+    /// program rows with the same decoder block (an edited block's answer may no longer
+    /// hold: such a row stays as loaded, its program looked up at launch) and neither
+    /// is broken.
+    pub fn carry_programs(&mut self, old: &ModeRegistry) {
+        for m in &mut self.modes {
+            if m.state == ModeState::Broken || !matches!(m.row.decoder, Decoder::Program(_)) {
+                continue;
+            }
+            let Some(o) = old.get(&m.row.id.0) else {
+                continue;
+            };
+            if o.state == ModeState::Broken || o.row.decoder != m.row.decoder {
+                continue;
+            }
+            m.program = o.program.clone();
+            m.state = o.state;
+            m.reason = o.reason.clone();
+        }
     }
 
     /// Read `path` (`modes-checked.json` in the state directory: an object of UNIX

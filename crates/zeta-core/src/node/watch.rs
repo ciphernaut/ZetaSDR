@@ -8,10 +8,12 @@
 //! `replace` or a failure (a stage's, the loop's, a panic of the loop included). A
 //! `graph_put` restart or a node restart re-adopts the decoders from the persisted
 //! context instead: those whose job no longer runs are dropped, those whose signal does
-//! not reappear within the detector's `gone_ms` are stopped. An unknown signal is tried
-//! again after [`RETRY_MS`] while it persists, at most [`RETRY_MAX`] times; with
-//! `on_unknown: capture` its bursts are captured once per run by an owned `capture`
-//! child (see [`capture`]).
+//! not reappear within the detector's `gone_ms` are stopped. Only events in the decoder
+//! row's own `protocol` count against its silence (a frame row's `timing` and forwarded
+//! `bits` flow on noise). An unknown signal is tried again after [`RETRY_MS`] while it
+//! persists, at most [`RETRY_MAX`] times; with `on_unknown: capture` its bursts are
+//! captured once per run by an owned `capture` child (see [`capture`]), unless identify
+//! named a learned signature for it (summary `learned <name> at <MHz>: ...`).
 //!
 //! Events, `protocol: "watch"`, go on the job's event stream beside `detect`'s `signal`
 //! events: `state` `identifying | decoding | unknown | lost | capturing | captured`, with
@@ -286,6 +288,10 @@ struct Tracked {
     /// The last unknown verdict's register answer (identify's `allocations`).
     #[serde(default)]
     allocations: Option<serde_json::Value>,
+    /// The learned signature the last unknown verdict named (identify's `learned`):
+    /// such a signal is not captured.
+    #[serde(default)]
+    learned: Option<serde_json::Value>,
     /// Whether this run has started a capture of it (`on_unknown: capture`).
     #[serde(default)]
     captured: bool,
@@ -607,7 +613,7 @@ impl Inner {
     /// and the watch's band, else the signal's own width at score 0.
     fn identify_band(&self, r: &Run, s: &Signal) -> (u64, f32) {
         score_rows(
-            &self.modes,
+            &self.modes(),
             s.center_hz,
             s.bandwidth_hz,
             "",
@@ -664,7 +670,15 @@ impl Inner {
             bandwidth_hz: Hz(t.band_hz),
         };
         let graph = JobKind::Identify
-            .expand(&r.prov.source, tuning, Hz(0), None, None, None, &self.modes)
+            .expand(
+                &r.prov.source,
+                tuning,
+                Hz(0),
+                None,
+                None,
+                None,
+                &self.modes(),
+            )
             .map_err(|e| e.to_string())?;
         let rec = JobRecord {
             format: JOB_RECORD_FORMAT,
@@ -739,7 +753,7 @@ impl Inner {
             bin_rate,
             None,
             None,
-            &self.modes,
+            &self.modes(),
         );
         let started = match graph {
             Ok(mut graph) => {
@@ -814,7 +828,7 @@ impl Inner {
             return kept(None, sink);
         }
         let width = self
-            .modes
+            .modes()
             .get(mode)
             .map_or(signal.bandwidth_hz, |m| m.row.band.bandwidth_hz);
         let ports: Vec<Arc<dyn Port>> = {
@@ -1205,6 +1219,7 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                     score,
                     features: None,
                     allocations: None,
+                    learned: None,
                     captured: false,
                     captures: Vec::new(),
                 });
@@ -1359,12 +1374,23 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     let label = v["verdict"]["label"].as_str().unwrap_or("unknown");
     let features = v["verdict"]["features"].clone();
     let allocations = v["verdict"]["allocations"].clone();
-    let mut summary = format!(
-        "unknown at {}: {label}{}{}",
-        tracked.signal.mhz(),
-        measured(&features),
-        register_says(&allocations),
-    );
+    let learned = Some(v["verdict"]["learned"].clone()).filter(|l| l.is_object());
+    let mut summary = match &learned {
+        // A signal an accepted signature knows: named, and not captured. Its retries go
+        // on, so a real decoder may still prove it.
+        Some(l) => format!(
+            "learned {} at {}:{}",
+            l["name"].as_str().unwrap_or_default(),
+            tracked.signal.mhz(),
+            measured(&features),
+        ),
+        None => format!(
+            "unknown at {}: {label}{}{}",
+            tracked.signal.mhz(),
+            measured(&features),
+            register_says(&allocations),
+        ),
+    };
     summary.push_str(&format!(
         " (identify {} of {})",
         tracked.tries,
@@ -1375,6 +1401,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     }
     tracked.features = Some(features.clone());
     tracked.allocations = Some(allocations.clone());
+    tracked.learned = learned;
     let signal = tracked.signal.clone();
     let e = Event {
         signal: Some(&signal),
@@ -1478,11 +1505,25 @@ pub(super) fn register_says(allocations: &serde_json::Value) -> String {
 async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     let t = now().0;
     for d in &mut w.decoding {
+        // Only the row's own events are its signal: a frame row's `timing` and forwarded
+        // `bits` flow on noise too. A mode no longer loaded counts every event.
+        let protocol = inner.modes().get(&d.mode).map(|m| m.row.protocol.clone());
+        let counts = |v: &serde_json::Value| {
+            protocol
+                .as_deref()
+                .is_none_or(|p| v["protocol"].as_str() == Some(p))
+        };
         for rx in w.subs.get_mut(&d.job).into_iter().flatten() {
             loop {
                 match rx.try_recv() {
-                    Ok(f) if matches!(f.payload, Payload::Event(_)) => d.last_event_ns = t,
-                    Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+                    Ok(f) => {
+                        if let Payload::Event(v) = &f.payload
+                            && counts(v)
+                        {
+                            d.last_event_ns = t;
+                        }
+                    }
+                    Err(TryRecvError::Lagged(_)) => {}
                     Err(_) => break,
                 }
             }
@@ -1639,6 +1680,7 @@ mod tests {
             score: 0.0,
             features: None,
             allocations: None,
+            learned: None,
             captured: false,
             captures: Vec::new(),
         }

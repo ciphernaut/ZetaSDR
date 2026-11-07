@@ -19,7 +19,7 @@
 //         subscription keeps its normal backoff either way.
 //     api.op(obj) -> Promise<result JSON>              POST /op with `X-Zeta-Client: ui` (its
 //         ops-stream record carries transport "ui"); throws OpError (with .json)
-//     api.ask(text, maxTurns = 32, allow = {stop_jobs: false, replace: false, delete_captures: false})
+//     api.ask(text, maxTurns = 32, allow = {stop_jobs: false, replace: false, delete_captures: false, accept_signatures: false})
 //         -> Promise<Transcript>  POST /ask {request, max_turns, allow, page_tools: true}
 //         (the page applies the agent's `view_set` calls);
 //         throws OpError (503 with {"error":"other","message":...} when serve has no LLM)
@@ -149,7 +149,12 @@ export class Api {
     return this.#request("POST", "/op", obj, null, { "X-Zeta-Client": "ui" });
   }
 
-  ask(text, maxTurns = 32, allow = { stop_jobs: false, replace: false, delete_captures: false }) {
+  ask(text, maxTurns = 32, allow = {
+    stop_jobs: false,
+    replace: false,
+    delete_captures: false,
+    accept_signatures: false,
+  }) {
     // `page_tools`: the agent may change this page's view (`view_set`); the page applies it.
     return this.#request("POST", "/ask", {
       request: text,

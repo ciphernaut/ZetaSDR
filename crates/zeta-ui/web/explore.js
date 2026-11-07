@@ -14,15 +14,27 @@
 //   Work the bits (`bits_start {capture, modulation: null, symbol_rate_baud, order: null}`,
 //   `symbol_rate_baud` the row's `input.bits-rate`, prefilled from the features' symbol rate,
 //   null when empty so the node fills it; the transcript says `started bits <id> on <kHz> kHz`
-//   or the error, then the Bits pane is selected; a rate typed survives the 2 s redraw).
+//   or the error, then the Bits pane is selected; a rate typed and the focus in it survive
+//   the 2 s redraw).
 //   Above the rows a `.explore-tools` bar holds Delete all (`button[data-action="delete-all"]`,
 //   armed like Delete: `sure?` for DELETE_CONFIRM_MS, then a second click deletes every
 //   capture that is not pinned, one `capture_delete` each, and notes
 //   `deleted <n> captures` with `(<m> pinned kept)` or the failures appended).
 //   Draws the cached region (ov.span, tagged with the id's last 6 characters) of each capture
 //   still on the waterfall's columns (one that ended before the oldest column is skipped).
-//   Registers the `explore` pane with the strip, eligible while any capture exists, and selects
-//   it when a capture appears that the load's first poll did not list (once per load): a
+//   Each poll also lists `signature_list {state: null}`; under the captures a
+//   `table.signatures` holds the records in EXPLORE_SIGNATURE_STATES, newest first, one
+//   `tr.signature[data-id]` each: `td.name` (an `input.sig-name` prefilled with the name,
+//   `readonly` once accepted; a name typed, and the focus and caret in it, survive the
+//   redraw), `td.confidence` (two decimals), `td.state` (`proposed`, `accepted`, or `accepted · learned` and the row id
+//   when `decoder` is set), `td.evidence` (signatureText) and `td.actions`: Accept
+//   (proposed only: `signature_accept {id, name}`, `name` the input when it was changed,
+//   else null; the transcript notes `accepted <name> (<id tail>)` and the `decoder_note`
+//   when set) and Reject (armed like Delete: `sure?` for DELETE_CONFIRM_MS, then
+//   `signature_reject`, noting `rejected <name> (<id tail>)`).
+//   Registers the `explore` pane with the strip, eligible while any capture or any listed
+//   signature exists, and selects it when a capture appears that the load's first poll did
+//   not list (once per load): a
 //   reload never takes the pane back from the stored one (spec 5.7, auto-selected the first
 //   time a capture appears, never again).
 
@@ -30,6 +42,20 @@ import { bandText, khzText, registerText } from "./units.js";
 
 export const EXPLORE_POLL_MS = 2000;
 export const DELETE_CONFIRM_MS = 3000;
+// The signature states the pane lists (a rejected or superseded record is history).
+export const EXPLORE_SIGNATURE_STATES = ["proposed", "accepted"];
+// The characters of an id the transcript and the brackets name it by.
+const ID_TAIL = 6;
+// The row fields the operator types in; a redraw keeps the focus and caret in them.
+const FIELDS = "input.sig-name, input.bits-rate";
+
+// A signature's evidence cell: its `evidence`, else `<modulation> <kHz> kHz`.
+export function signatureText(rec) {
+  if (!rec) return "";
+  if (typeof rec.evidence === "string" && rec.evidence) return rec.evidence;
+  const bw = typeof rec.bandwidth_hz === "number" ? ` ${khzText(rec.bandwidth_hz)} kHz` : "";
+  return `${rec.modulation ?? "?"}${bw}`;
+}
 
 function timeText(ns) {
   const d = new Date(Math.round(ns / 1e6));
@@ -92,9 +118,14 @@ class ExplorePane {
     this.deletingAll = false;
     this.busy = new Set();
     this.rates = new Map(); // capture id -> the symbol rate typed in its row
+    this.signatures = []; // the listed records in EXPLORE_SIGNATURE_STATES, newest first
+    this.names = new Map(); // signature id -> the name typed in its row
+    this.armedReject = new Map(); // signature id -> timer of the pending reject confirmation
     this.onInput = (ev) => {
       const tr = ev.target.closest("tr.capture");
       if (tr && ev.target.classList.contains("bits-rate")) this.rates.set(tr.dataset.id, ev.target.value);
+      const sig = ev.target.closest("tr.signature");
+      if (sig && ev.target.classList.contains("sig-name")) this.names.set(sig.dataset.id, ev.target.value);
     };
     el.addEventListener("input", this.onInput);
     this.onClick = (ev) => this.click(ev);
@@ -112,7 +143,7 @@ class ExplorePane {
   }
 
   eligible() {
-    return this.captures.length > 0;
+    return this.captures.length > 0 || this.signatures.length > 0;
   }
 
   shown() {
@@ -145,15 +176,24 @@ class ExplorePane {
   async poll() {
     if (this.destroyed) return;
     let listed = false;
-    try {
-      const r = await this.api.op({ op: "capture_list", signal: null });
-      if (this.destroyed) return;
-      if (r && r.result === "captures" && Array.isArray(r.value)) {
-        this.captures = r.value;
-        listed = true;
-      }
-    } catch {
-      // The next poll tries again.
+    const [caps, sigs] = await Promise.allSettled([
+      this.api.op({ op: "capture_list", signal: null }),
+      this.api.op({ op: "signature_list", state: null }),
+    ]);
+    if (this.destroyed) return;
+    // A failed list keeps the last one; the next poll tries again.
+    const r = caps.status === "fulfilled" ? caps.value : null;
+    if (r && r.result === "captures" && Array.isArray(r.value)) {
+      this.captures = r.value;
+      listed = true;
+    }
+    const s = sigs.status === "fulfilled" ? sigs.value : null;
+    if (s && s.result === "signatures" && Array.isArray(s.value)) {
+      this.signatures = s.value
+        .filter((x) => x && EXPLORE_SIGNATURE_STATES.includes(x.state))
+        .sort((a, b) => (b.provenance?.proposed_ns ?? 0) - (a.provenance?.proposed_ns ?? 0));
+      const ids = new Set(this.signatures.map((x) => x.id));
+      for (const id of this.names.keys()) if (!ids.has(id)) this.names.delete(id);
     }
     this.render();
     this.syncSpans();
@@ -185,7 +225,7 @@ class ExplorePane {
       const key = `capture:${c.id}`;
       const lo = c.center_hz - c.bandwidth_hz / 2;
       const hi = c.center_hz + c.bandwidth_hz / 2;
-      if (ov.span(lo, hi, c.start_ns, c.end_ns, c.id.slice(-6), key)) want.add(key);
+      if (ov.span(lo, hi, c.start_ns, c.end_ns, c.id.slice(-ID_TAIL), key)) want.add(key);
     }
     for (const key of this.spans) if (!want.has(key)) ov.unspan(key);
     this.spans = want;
@@ -239,7 +279,98 @@ class ExplorePane {
     all.title = "capture_delete every capture that is not pinned";
     all.disabled = this.deletingAll || !this.captures.some((c) => !c.pinned);
     tools.append(all);
-    this.el.replaceChildren(tools, table);
+    const parts = [tools, table];
+    if (this.signatures.length) parts.push(this.signatureTable());
+    const place = this.focusedField();
+    this.el.replaceChildren(...parts);
+    this.restoreField(place);
+  }
+
+  // The operator's place in a row's name or rate field (the element, its row and class,
+  // the selection), when one has focus: the redraw replaces it, so restoreField puts the
+  // focus and the caret back in the new one.
+  focusedField() {
+    const a = document.activeElement;
+    if (!a || !this.el.contains(a) || !a.matches(FIELDS)) return null;
+    const tr = a.closest("tr[data-id]");
+    if (!tr) return null;
+    let sel = null;
+    try {
+      // A number input has no selection (null, or a throw in older engines).
+      if (a.selectionStart !== null) sel = [a.selectionStart, a.selectionEnd, a.selectionDirection];
+    } catch {
+      sel = null;
+    }
+    return { row: tr.className.split(" ")[0], id: tr.dataset.id, cls: a.className, sel };
+  }
+
+  restoreField(place) {
+    if (!place) return;
+    const tr = [...this.el.querySelectorAll(`tr.${place.row}`)].find((r) => r.dataset.id === place.id);
+    const input = tr?.querySelector(`input.${place.cls}`);
+    if (!input) return;
+    input.focus({ preventScroll: true });
+    if (place.sel && !input.readOnly) {
+      try {
+        input.setSelectionRange(...place.sel);
+      } catch {
+        // No selection on this input type.
+      }
+    }
+  }
+
+  // The `table.signatures` under the captures (see the header).
+  signatureTable() {
+    const body = document.createElement("tbody");
+    for (const s of this.signatures) {
+      const tr = document.createElement("tr");
+      tr.className = `signature ${s.state}`;
+      tr.dataset.id = s.id;
+      const accepted = s.state === "accepted";
+      const name = document.createElement("td");
+      name.className = "name";
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "sig-name";
+      input.value = accepted ? s.name : (this.names.get(s.id) ?? s.name);
+      input.readOnly = accepted;
+      input.title = accepted ? s.name : "the name Accept gives it";
+      name.append(input);
+      const conf = document.createElement("td");
+      conf.className = "confidence";
+      conf.textContent = typeof s.confidence === "number" ? s.confidence.toFixed(2) : "";
+      const state = document.createElement("td");
+      state.className = "state";
+      if (accepted && s.decoder) {
+        const row = document.createElement("code");
+        row.textContent = s.decoder;
+        state.append("accepted · learned ", row);
+      } else state.textContent = s.state;
+      state.title = [s.decoder_file, s.decoder_note].filter(Boolean).join(" · ") || state.textContent;
+      const evidence = document.createElement("td");
+      evidence.className = "evidence";
+      evidence.textContent = signatureText(s);
+      evidence.title = evidence.textContent;
+      const actions = document.createElement("td");
+      actions.className = "actions";
+      const buttons = accepted ? [] : [
+        ["accept", "Accept"],
+        ["reject", this.armedReject.has(s.id) ? "sure?" : "Reject"],
+      ];
+      for (const [action, label] of buttons) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.dataset.action = action;
+        b.textContent = label;
+        actions.append(b);
+      }
+      tr.append(name, conf, state, evidence, actions);
+      body.append(tr);
+    }
+    const table = document.createElement("table");
+    table.className = "signatures";
+    table.append(body);
+    return table;
   }
 
   // The symbol rate Work the bits sends: what was typed, else the features' (empty: none).
@@ -259,6 +390,12 @@ class ExplorePane {
   async click(ev) {
     const b = ev.target.closest("button[data-action]");
     if (b && b.dataset.action === "delete-all") return this.removeAll();
+    const sig = ev.target.closest("tr.signature");
+    if (b && sig) {
+      if (b.dataset.action === "reject") return this.reject(sig.dataset.id);
+      if (b.dataset.action === "accept") return this.accept(sig.dataset.id, sig.querySelector("input.sig-name")?.value);
+      return;
+    }
     const tr = ev.target.closest("tr.capture");
     if (!b || !tr) return;
     const id = tr.dataset.id;
@@ -360,6 +497,55 @@ class ExplorePane {
     await this.poll();
   }
 
+  // Accept (see the header): `name` is the row's input, sent only when it was changed.
+  async accept(id, typed) {
+    const key = `${id}accept`;
+    if (this.busy.has(key)) return;
+    this.busy.add(key);
+    const s = this.signatures.find((x) => x.id === id);
+    const text = (typed ?? "").trim();
+    const name = text && text !== s?.name ? text : null;
+    try {
+      const r = await this.api.op({ op: "signature_accept", id, name });
+      const rec = r && r.result === "signature" ? r.value : null;
+      if (rec) {
+        this.names.delete(id);
+        this.t.note(`accepted ${rec.name} (${rec.id.slice(-ID_TAIL)})`);
+        if (rec.decoder_note) this.t.note(`${rec.id.slice(-ID_TAIL)}: ${rec.decoder_note}`);
+      }
+    } catch (e) {
+      this.t.note(`signature_accept: ${e.message}`, true);
+    } finally {
+      this.busy.delete(key);
+    }
+    await this.poll();
+  }
+
+  // Reject (see the header): arm, then a second click within DELETE_CONFIRM_MS rejects.
+  async reject(id) {
+    if (!this.armedReject.has(id)) {
+      this.armedReject.set(
+        id,
+        setTimeout(() => {
+          this.armedReject.delete(id);
+          if (!this.destroyed) this.render();
+        }, DELETE_CONFIRM_MS),
+      );
+      this.render();
+      return;
+    }
+    clearTimeout(this.armedReject.get(id));
+    this.armedReject.delete(id);
+    try {
+      const r = await this.api.op({ op: "signature_reject", id });
+      const rec = r && r.result === "signature" ? r.value : null;
+      if (rec) this.t.note(`rejected ${rec.name} (${rec.id.slice(-ID_TAIL)})`);
+    } catch (e) {
+      this.t.note(`signature_reject: ${e.message}`, true);
+    }
+    await this.poll();
+  }
+
   // Delete all (see the header): arm, then every unpinned capture of the last list.
   async removeAll() {
     if (this.deletingAll) return;
@@ -401,6 +587,7 @@ class ExplorePane {
     clearTimeout(this.timer);
     clearTimeout(this.armedAll);
     for (const t of this.armed.values()) clearTimeout(t);
+    for (const t of this.armedReject.values()) clearTimeout(t);
     this.el.removeEventListener("click", this.onClick);
     this.el.removeEventListener("input", this.onInput);
     this.panes?.unregister("explore");

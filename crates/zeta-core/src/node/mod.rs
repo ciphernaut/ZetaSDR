@@ -7,6 +7,7 @@ mod jsonlog;
 mod launch;
 pub use launch::DRAIN_TIMEOUT_MS;
 mod persist;
+mod propose;
 mod recover;
 mod retune;
 mod sources;
@@ -26,7 +27,7 @@ use crate::graph::{self, Graph, GraphError};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
-use crate::modes::ModeRegistry;
+use crate::modes::{MODES_CHECKED_FILE, ModeRegistry, ModesHandle};
 use crate::ops::{
     FM_DEVIATION_DEFAULT_HZ, JobKind, Op, OpError, OpResult, Sideband, WFM_DEVIATION_DEFAULT_HZ,
 };
@@ -86,9 +87,11 @@ pub struct NodeConfig {
     /// added, so resumed jobs get a bank as fresh ones do. `None`: no banks
     /// (until [`Node::set_bank_factory`]).
     pub bank_factory: Option<Arc<dyn BankFactory>>,
-    /// The operator's mode rows (`--modes-dir`), read after the embedded ones; `None`
-    /// reads none (the CLI resolves the default, [`crate::modes::default_operator_dir`]).
-    /// A missing directory reads as empty.
+    /// The operator's mode rows (`--modes-dir`), read after the embedded ones (at `open`
+    /// and by [`Node::reload_modes`]) and where an accepted signature's row is written;
+    /// `None` is no operator directory: only the embedded rows, no row written (the CLI
+    /// resolves the default, [`crate::modes::default_operator_dir`]). A missing
+    /// directory reads as empty.
     pub modes_dir: Option<PathBuf>,
     /// What the burst store (`state_dir/bursts`) keeps; `BurstPolicy::default()` is
     /// 256 MiB and 7 days.
@@ -284,12 +287,26 @@ struct Inner {
     source_positions: BTreeMap<SourceId, SourcePosition>,
     backends: Vec<Backend>,
     registry: StageRegistry,
-    /// The decoder modes, loaded at `open` against `registry`.
-    modes: Arc<ModeRegistry>,
+    /// The decoder modes, loaded at `open` against `registry` and replaced whole by
+    /// [`Node::reload_modes`]; read through [`Inner::modes`] at each use.
+    modes: ModesHandle,
+    /// The operator's modes directory as configured (`NodeConfig.modes_dir`): what
+    /// `reload_modes` reads and where an accepted signature's row is written (`None`:
+    /// none, so only the embedded rows load and no row is written).
+    modes_dir: Option<PathBuf>,
+    /// Held across [`Node::reload_modes`] (no await inside).
+    reloading: Mutex<()>,
     /// The page themes: the built-in ones until the caller sets its own with `set_themes`.
     themes: RwLock<Arc<crate::themes::ThemeRegistry>>,
     /// The `capture` jobs' windows, opened (and expired) at `open`.
     bursts: Arc<crate::bursts::BurstStore>,
+    /// The learned signatures, opened at `open`.
+    signatures: Arc<crate::signatures::SignatureStore>,
+    /// The exploration jobs' session records (see [`propose::record_session`]),
+    /// swept at `open`, after a `capture_delete` and after every `capture` job's end.
+    sessions: crate::sessions::SessionStore,
+    /// Held across a job's proposal (see [`propose`]), so one job never proposes twice.
+    proposing: Mutex<()>,
     leases: LeaseManager,
     bus: Arc<StreamBus>,
     ports: RwLock<HashMap<SourceId, Arc<dyn Port>>>,
@@ -339,12 +356,53 @@ struct Inner {
 }
 
 impl Inner {
+    /// The decoder modes as they stand now: one registry, which a caller keeps for the
+    /// whole of one use so a reload meanwhile never mixes two sets of rows.
+    pub(crate) fn modes(&self) -> Arc<ModeRegistry> {
+        self.modes.get().unwrap_or_default()
+    }
+
     /// The kind a job recorded as `kind` was expanded from, when the node expands its
     /// graph: a built-in kind, or a `Mode` the registry has a row for. A record of any
     /// other kind (a [`Node::job_start`] caller's own name) keeps its graph as stored.
     pub(crate) fn expandable_kind(&self, kind: &str) -> Option<JobKind> {
         JobKind::from_name(kind)
-            .filter(|k| !matches!(k, JobKind::Mode(id) if self.modes.get(&id.0).is_none()))
+            .filter(|k| !matches!(k, JobKind::Mode(id) if self.modes().get(&id.0).is_none()))
+    }
+
+    /// A mode row's proof (`mode`, on the band `tuning`) supersedes each accepted
+    /// signature it overlaps: one whose band holds `tuning`'s centre
+    /// ([`crate::signatures::SignatureRecord::band_holds`]) when `tuning`'s width is
+    /// within [`SUPERSEDE_WIDTH_RANGE`] times the record's bandwidth. A `learned_*` row
+    /// (generated from a signature) supersedes nothing. Each one superseded is marked so
+    /// in the store at `now_ns` (its captures stay pinned) and named on stderr. A record
+    /// a concurrent proof superseded first is left as that one marked it.
+    pub(crate) fn supersede_by(&self, mode: &str, tuning: Tuning, now_ns: u64) {
+        use crate::signatures::{LEARNED_ROW_PREFIX, SUPERSEDE_WIDTH_RANGE};
+        if mode.starts_with(LEARNED_ROW_PREFIX) {
+            return;
+        }
+        let (lo, hi) = SUPERSEDE_WIDTH_RANGE;
+        let width = tuning.bandwidth_hz.0 as f64;
+        for rec in self.signatures.accepted() {
+            let theirs = rec.bandwidth_hz.0 as f64;
+            if !rec.band_holds(tuning.center_hz) || width < lo * theirs || width > hi * theirs {
+                continue;
+            }
+            match self.signatures.supersede(&rec.id, mode, now_ns) {
+                Ok(_) => eprintln!(
+                    "zeta: signature {} ({}) superseded by {mode}",
+                    rec.id, rec.name
+                ),
+                // Superseded (or otherwise answered) meanwhile: nothing failed.
+                Err(crate::signatures::StoreError::State { .. }) => {}
+                Err(e) => self
+                    .persist_errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("signatures: {}: supersede by {mode}: {e}", rec.id)),
+            }
+        }
     }
 
     /// Append `line` to the log `which`. A failure never fails anything; the
@@ -575,6 +633,13 @@ impl Inner {
         }
     }
 
+    /// Remove the session records none of whose captures is left in the burst store
+    /// (see [`crate::sessions::SessionStore::sweep`]).
+    fn sweep_sessions(&self) {
+        let live = self.bursts.list().into_iter().map(|r| r.id).collect();
+        self.sessions.sweep(&live);
+    }
+
     /// See [`Node::job_context_merge`].
     fn context_merge(&self, id: &JobId, patch: serde_json::Value) -> Result<(), NodeError> {
         let mut jobs = self.jobs.lock().unwrap();
@@ -803,6 +868,19 @@ impl Node {
         ports: Vec<Arc<dyn Port>>,
         modes: Option<Arc<ModeRegistry>>,
     ) -> Result<Self, NodeError> {
+        let handle = modes.map(ModesHandle::from).unwrap_or_default();
+        Self::open_with_handle(cfg, registry, ports, handle).await
+    }
+
+    /// [`Node::open`] on the registry `modes` holds (the handle the caller's stages
+    /// read the rows through, so a [`Node::reload_modes`] reaches them too); an empty
+    /// handle is filled from `cfg.modes_dir` against `registry`, as `open` does.
+    pub async fn open_with_handle(
+        cfg: NodeConfig,
+        registry: StageRegistry,
+        ports: Vec<Arc<dyn Port>>,
+        modes: ModesHandle,
+    ) -> Result<Self, NodeError> {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (records, mut load_errors) = load(&jobs_dir)?;
@@ -818,8 +896,23 @@ impl Node {
         if cfg.burst_policy.expire_at_open {
             bursts.expire();
         }
-        let modes = modes
-            .unwrap_or_else(|| Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref())));
+        let signatures = crate::signatures::SignatureStore::open(&cfg.state_dir).map_err(io)?;
+        load_errors.extend(signatures.load_errors().iter().cloned());
+        // Every node lists and scores its accepted signatures.
+        let learned_knowledge: Arc<dyn KnowledgeProvider> =
+            Arc::new(crate::learned::LearnedKnowledge(signatures.clone()));
+        let mut classifiers = ClassifierSet::default();
+        classifiers.register(Arc::new(crate::learned::LearnedClassifier(
+            signatures.clone(),
+        )));
+        let sessions = crate::sessions::SessionStore::open(&cfg.state_dir).map_err(io)?;
+        sessions.sweep(&bursts.list().into_iter().map(|r| r.id).collect());
+        if modes.get().is_none() {
+            modes.set(Arc::new(ModeRegistry::load(
+                &registry,
+                cfg.modes_dir.as_deref(),
+            )));
+        }
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
         // `Node::apply` and are never logged.
@@ -845,8 +938,13 @@ impl Node {
                 backends: cfg.backends,
                 registry,
                 modes,
+                modes_dir: cfg.modes_dir.clone(),
+                reloading: Mutex::new(()),
                 themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
                 bursts,
+                signatures,
+                sessions,
+                proposing: Mutex::new(()),
                 leases: LeaseManager::new(),
                 bus,
                 ports: RwLock::new(HashMap::new()),
@@ -854,8 +952,8 @@ impl Node {
                 bank_factory: RwLock::new(cfg.bank_factory),
                 banks: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
-                knowledge: RwLock::new(Vec::new()),
-                classifiers: RwLock::new(ClassifierSet::default()),
+                knowledge: RwLock::new(vec![learned_knowledge]),
+                classifiers: RwLock::new(classifiers),
                 persist_errors: Mutex::new(Vec::new()),
                 ops_log: jsonlog::JsonLog::new(cfg.state_dir.join("ops.log")),
                 transcripts_log: jsonlog::JsonLog::new(cfg.state_dir.join("transcripts.log")),
@@ -966,7 +1064,8 @@ impl Node {
 
     /// Files in `state_dir/jobs` that could not be read as a `JobRecord`, or
     /// whose record id is not a ULID matching the file name; files in
-    /// `state_dir/sources` that could not be read as a [`SourceRecord`]; and the
+    /// `state_dir/sources` that could not be read as a [`SourceRecord`]; files in
+    /// `state_dir/signatures` that could not be read as a signature record; and the
     /// pins `open` could not restore.
     pub fn load_errors(&self) -> &[String] {
         &self.load_errors
@@ -1058,14 +1157,309 @@ impl Node {
         self.inner.classifiers.write().unwrap().register(c);
     }
 
-    /// The decoder modes loaded at `open` (see [`crate::modes`]).
+    /// The decoder modes as they stand now (see [`crate::modes`]): loaded at `open`,
+    /// replaced by [`Node::reload_modes`].
     pub fn modes(&self) -> Arc<ModeRegistry> {
+        self.inner.modes()
+    }
+
+    /// The handle the node holds its modes in: a classifier or provider given it reads
+    /// the rows as they stand at each use, a reload included.
+    pub fn modes_handle(&self) -> ModesHandle {
         self.inner.modes.clone()
+    }
+
+    /// Read the mode rows again (the embedded ones, then the operator directory
+    /// `NodeConfig.modes_dir`, none when it is `None`, as at `open`) against the
+    /// node's stages, carry each program row's probed program and state over from the
+    /// rows in force ([`ModeRegistry::carry_programs`]), read the checked times, and put
+    /// the new registry in force. Jobs already running keep the graphs they were
+    /// expanded to. The broken rows' startup lines
+    /// ([`ModeRegistry::startup_lines`]), for the caller to show.
+    pub fn reload_modes(&self) -> Result<Vec<String>, NodeError> {
+        let inner = &self.inner;
+        // One reload at a time: a later one reads every file an earlier one saw.
+        let _one = inner.reloading.lock().unwrap_or_else(|e| e.into_inner());
+        let mut modes = ModeRegistry::load(&inner.registry, inner.modes_dir.as_deref());
+        modes.carry_programs(&inner.modes());
+        modes.load_checked(&inner.state_dir.join(MODES_CHECKED_FILE));
+        let lines = modes.startup_lines();
+        inner.modes.set(Arc::new(modes));
+        Ok(lines)
     }
 
     /// The burst store: the windows `capture` jobs wrote.
     pub fn bursts(&self) -> Arc<crate::bursts::BurstStore> {
         self.inner.bursts.clone()
+    }
+
+    /// The learned signatures (`state_dir/signatures`).
+    pub fn signatures(&self) -> Arc<crate::signatures::SignatureStore> {
+        self.inner.signatures.clone()
+    }
+
+    /// The exploration jobs' session records (`state_dir/sessions`), oldest first.
+    pub fn sessions(&self) -> Vec<crate::sessions::Session> {
+        self.inner.sessions.list()
+    }
+
+    /// Remove the session records none of whose captures is left in the burst store.
+    pub(crate) fn sweep_sessions(&self) {
+        self.inner.sweep_sessions();
+    }
+
+    /// An `unknown` error naming `id` and the store's signature ids.
+    pub(crate) fn unknown_signature(&self, id: &str) -> OpError {
+        OpError::Unknown {
+            field: "id".into(),
+            value: id.into(),
+            known: self
+                .signatures()
+                .list(None)
+                .into_iter()
+                .map(|r| r.id)
+                .collect(),
+        }
+    }
+
+    /// The store's refusal as the ops answer it: an unknown id names the store's ids, a
+    /// record in the wrong state is `signature <id> is <state>, not proposed`.
+    fn signature_error(&self, e: crate::signatures::StoreError) -> OpError {
+        use crate::signatures::StoreError;
+        match e {
+            StoreError::Unknown(id) => self.unknown_signature(&id),
+            StoreError::State { id, state } => OpError::Other {
+                message: format!("signature {id} is {state}, not proposed"),
+            },
+            e @ StoreError::Io(_) => OpError::Other {
+                message: e.to_string(),
+            },
+        }
+    }
+
+    /// `signature_propose`: a proposal from the capture `capture`, by the transport
+    /// `by`. The capture's feature record and its layer-1 label (by
+    /// [`crate::ops::classify_capture`]; `noise` is refused) make the waveform; its set's
+    /// captures, its job, its first `tx` assignment and the node's station the
+    /// provenance. A `framing` the `frame_decode` stage refuses is `framing: <reason>`.
+    pub async fn signature_propose(
+        &self,
+        capture: &str,
+        name: Option<String>,
+        framing: Option<serde_json::Value>,
+        by: &str,
+    ) -> Result<crate::signatures::SignatureRecord, OpError> {
+        use crate::modes::FRAME_DECODE_STAGE;
+        use crate::signatures::{NOISE_LABEL, NewSignature};
+        let other = |message: String| OpError::Other { message };
+        let bursts = self.bursts();
+        let rec = bursts.get(capture).ok_or_else(|| OpError::Unknown {
+            field: "capture".into(),
+            value: capture.into(),
+            known: bursts.list().into_iter().map(|r| r.id).collect(),
+        })?;
+        let features: crate::classify::FeatureRecord = serde_json::from_value(rec.features.clone())
+            .map_err(|_| other(format!("capture {capture} has no feature record")))?;
+        if let Some(f) = &framing {
+            let registry = &self.inner.registry;
+            if registry.spec(FRAME_DECODE_STAGE).is_none() {
+                return Err(other(format!(
+                    "framing: {FRAME_DECODE_STAGE} is not a registered stage"
+                )));
+            }
+            registry
+                .check_params(FRAME_DECODE_STAGE, f)
+                .map_err(|e| other(format!("framing: {e}")))?;
+        }
+        let classified = crate::ops::classify_capture(&self.classifiers(), &rec)
+            .await
+            .map_err(other)?;
+        let label = classified
+            .labels
+            .into_iter()
+            .find(|l| l.layer == 1)
+            .ok_or_else(|| other(format!("capture {capture} has no layer-1 label")))?;
+        if label.name == NOISE_LABEL {
+            return Err(other(format!(
+                "capture {capture} is noise: nothing to propose"
+            )));
+        }
+        let allocation =
+            serde_json::from_value::<Vec<crate::knowledge::Allocation>>(rec.allocations.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|a| a.role.as_deref() == Some("tx"));
+        // The set's captures in the order they were written.
+        let mut captures: Vec<String> = bursts
+            .list()
+            .into_iter()
+            .filter(|r| r.set == rec.set)
+            .map(|r| r.id)
+            .collect();
+        captures.reverse();
+        let evidence = match framing {
+            Some(_) => format!("framing given by hand; {}", label.evidence),
+            None => format!("features only: {}", label.evidence),
+        };
+        let new = NewSignature {
+            name,
+            features,
+            modulation: label.name,
+            framing,
+            crc_frames: 0,
+            evidence,
+            source: rec.source,
+            station: self.station(),
+            captures,
+            jobs: vec![rec.job],
+            allocation,
+            proposed_by: by.to_string(),
+        };
+        self.signatures()
+            .propose(new, now().0)
+            .map_err(|e| self.signature_error(e))
+    }
+
+    /// `signature_accept`: accept the proposal `id` (renamed to `name` when given) by the
+    /// transport `by`, pinning every one of its captures still in the burst store. The
+    /// captures are pinned first, so an accepted record never has captures left to expire.
+    pub fn signature_accept(
+        &self,
+        id: &str,
+        name: Option<String>,
+        by: &str,
+    ) -> Result<crate::signatures::SignatureRecord, OpError> {
+        use crate::signatures::{SignatureState, StoreError};
+        let store = self.signatures();
+        let rec = store.get(id).ok_or_else(|| self.unknown_signature(id))?;
+        if rec.state != SignatureState::Proposed {
+            return Err(self.signature_error(StoreError::State {
+                id: rec.id,
+                state: rec.state,
+            }));
+        }
+        let bursts = self.bursts();
+        for c in &rec.provenance.captures {
+            match bursts.pin(c) {
+                // Expired or deleted since the proposal: nothing left to keep.
+                Ok(()) | Err(crate::bursts::StoreError::Unknown(_)) => {}
+                Err(e) => {
+                    return Err(OpError::Other {
+                        message: format!("capture {c}: {e}"),
+                    });
+                }
+            }
+        }
+        let rec = store
+            .accept(id, name, by, now().0)
+            .map_err(|e| self.signature_error(e))?;
+        Ok(self.write_learned_row(rec))
+    }
+
+    /// After `rec`'s accept, when [`crate::signatures::writes_row`]: write its
+    /// [`crate::signatures::learned_row`] to `<modes dir>/learned_<id>.json` (pretty
+    /// JSON, the directory made; the modes directory is `NodeConfig.modes_dir`) and
+    /// [`Node::reload_modes`], noting the row (`decoder`) and its file in the record. A
+    /// file already there is kept as it is (`row learned_<id> already present: kept as
+    /// is`), never overwritten, and the rows are reloaded so it is listed at once; with
+    /// no modes directory (`NodeConfig.modes_dir` `None`: `no modes directory: row not
+    /// written`) or a failed write
+    /// (`row not written: <error>`) no row is noted. Never fails: the record stays
+    /// accepted, its captures pinned, whatever becomes of the row.
+    fn write_learned_row(
+        &self,
+        rec: crate::signatures::SignatureRecord,
+    ) -> crate::signatures::SignatureRecord {
+        use crate::signatures::{LEARNED_ROW_PREFIX, learned_row, writes_row};
+        use std::io::Write;
+        if !writes_row(&rec) {
+            return rec;
+        }
+        let mode = format!("{LEARNED_ROW_PREFIX}{}", rec.id.to_lowercase());
+        let reload = || {
+            if let Ok(lines) = self.reload_modes() {
+                for line in lines {
+                    eprintln!("{line}");
+                }
+            }
+        };
+        let (decoder, file, note) = match self.inner.modes_dir.clone() {
+            None => (
+                None,
+                None,
+                Some("no modes directory: row not written".into()),
+            ),
+            Some(dir) => {
+                let path = dir.join(format!("{mode}.json"));
+                let file = path.display().to_string();
+                let kept = format!("row {mode} already present: kept as is");
+                let written = serde_json::to_vec_pretty(&learned_row(&rec, &mode))
+                    .map_err(std::io::Error::other)
+                    .and_then(|json| {
+                        // `AlreadyExists` below means the row file only (a plain file
+                        // where the directory should be is a failure).
+                        std::fs::create_dir_all(&dir).map_err(std::io::Error::other)?;
+                        // `create_new`: a file there (the operator's, or one written
+                        // meanwhile) is never overwritten.
+                        let mut f = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&path)?;
+                        let body = f.write_all(&json).and_then(|()| f.write_all(b"\n"));
+                        if body.is_err() {
+                            // No half-written row left to be kept as the operator's.
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        body
+                    });
+                match written {
+                    Ok(()) => {
+                        reload();
+                        (Some(mode), Some(file), None)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // An operator file that appeared after `open` is listed at once.
+                        reload();
+                        (Some(mode), Some(file), Some(kept))
+                    }
+                    Err(e) => (None, None, Some(format!("row not written: {e}"))),
+                }
+            }
+        };
+        match self.signatures().set_decoder(&rec.id, decoder, file, note) {
+            Ok(rec) => rec,
+            Err(e) => {
+                self.inner
+                    .persist_errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("signatures: {}: {e}", rec.id));
+                rec
+            }
+        }
+    }
+
+    /// `signature_reject`: reject the proposal `id`, by the transport `by`.
+    pub fn signature_reject(
+        &self,
+        id: &str,
+        by: &str,
+    ) -> Result<crate::signatures::SignatureRecord, OpError> {
+        self.signatures()
+            .reject(id, by, now().0)
+            .map_err(|e| self.signature_error(e))
+    }
+
+    /// A classify's proofs (each `tried` row that `proved`, on the classified band
+    /// `band`) supersede the accepted signatures they overlap ([`Inner::supersede_by`]).
+    pub(crate) fn supersede_proved(&self, tried: &[crate::classify::Tried], band: Tuning) {
+        let t = now().0;
+        for p in tried
+            .iter()
+            .filter(|p| p.outcome == crate::classify::Outcome::Proved)
+        {
+            self.inner.supersede_by(&p.mode, band, t);
+        }
     }
 
     pub(crate) fn knowledge(&self) -> Vec<Arc<dyn KnowledgeProvider>> {
@@ -1107,7 +1501,7 @@ impl Node {
     pub fn schema(&self) -> serde_json::Value {
         let mut v = crate::ops::schema();
         v["stages"] = self.inner.registry.describe();
-        let ids = self.inner.modes.ids();
+        let ids = self.inner.modes().ids();
         for part in ["op", "result", "error"] {
             let Some(kinds) = v[part]["$defs"]
                 .get_mut("JobKind")
@@ -1141,7 +1535,7 @@ impl Node {
         let logged = op.clone();
         let start_ns = now();
         let started = std::time::Instant::now();
-        let outcome = crate::ops::apply(self, op).await;
+        let outcome = crate::ops::apply(self, op, transport).await;
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let payload = crate::ops::ops_payload(&logged, &outcome, elapsed_ms, transport);
         let mut line = payload.clone();
@@ -1779,7 +2173,7 @@ impl Node {
                 rate,
                 bin_rate,
                 graph,
-                &self.inner.modes,
+                &self.inner.modes(),
             )
             .is_ok_and(|g| graph::same_pipeline(&g, graph))
         })

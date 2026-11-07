@@ -105,14 +105,17 @@
 // failures such as a node without a speech daemon.
 //
 // Exports `state` ({api, transcript, jobs, wf, coarse, subjects, subjectsPane, panes, ov, map, menu,
-// audio, mic, sources, selected, view, lastJobs, allowStops, allowDeletes}), `onSourceChange(fn)` for the later views (waterfall, audio,
+// audio, mic, sources, selected, view, lastJobs, allowStops, allowDeletes, allowSignatures}),
+// `onSourceChange(fn)` for the later views (waterfall, audio,
 // voice), `conflictActions(err, retry)`, `runSourceCommand(state, words)` and
 // `runPlanCommand(state, words)`.
 //
-// Typed commands beside `view` and `source`: `allow stops on|off` (state.allowStops) and
-// `allow deletes on|off` (state.allowDeletes), both off at load; every following /ask carries
-// `allow: {stop_jobs, replace, delete_captures}` of them; an answer from a run that may stop
-// jobs ends " [may stop jobs]" (" [may delete captures]" likewise), each turn of its `turn_log`
+// Typed commands beside `view` and `source`: `allow stops on|off` (state.allowStops),
+// `allow deletes on|off` (state.allowDeletes) and `allow signatures on|off`
+// (state.allowSignatures), all off at load; every following /ask carries
+// `allow: {stop_jobs, replace, delete_captures, accept_signatures}` of them; an answer from a
+// run that may stop jobs ends " [may stop jobs]" (" [may delete captures]" and
+// " [may accept signatures]" likewise), each turn of its `turn_log`
 // (a failed run's too) is a collapsed `details.turn` with that turn's tool calls, and a refused
 // call (`not_allowed`) adds a note naming what was refused with the action `allow … and ask
 // again`, which re-sends that one request with the refused flags true and leaves the switches
@@ -150,6 +153,8 @@ import { mountBitsPane } from "./bits.js";
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
 const SOURCE_KEY = "zeta.source";
+// The agent calls `allow signatures` unlocks: answering a proposal is the operator's.
+const SIGNATURE_DECISIONS = ["signature_accept", "signature_reject"];
 
 export const state = {
   api: null,
@@ -175,6 +180,8 @@ export const state = {
   lastJobs: [], // the last job_list result
   allowStops: false, // `allow stops on|off`: /ask may stop and replace jobs (not persisted)
   allowDeletes: false, // `allow deletes on|off`: /ask may delete captures (not persisted)
+  // `allow signatures on|off`: /ask may accept and reject signatures (not persisted)
+  allowSignatures: false,
 };
 const sourceListeners = [];
 
@@ -668,8 +675,8 @@ export async function runPlanCommand(st, words) {
 }
 
 // Sends `text` to /ask and shows the answer (or the error, e.g. no LLM configured). The
-// allowance is the session's `allow stops` switch unless `allowOverride` gives one for this
-// request only (the unlock button's re-run); the switch itself is never changed here.
+// allowance is the session's `allow` switches unless `allowOverride` gives one for this
+// request only (the unlock button's re-run); the switches are never changed here.
 async function askAgent(text, allowOverride = null) {
   const t = state.transcript;
   if (!state.api) return;
@@ -680,11 +687,13 @@ async function askAgent(text, allowOverride = null) {
       stop_jobs: stops,
       replace: stops,
       delete_captures: state.allowDeletes,
+      accept_signatures: state.allowSignatures,
     };
     const r = await state.api.ask(text, 32, allow);
     let may = "";
     if (r.allow && (r.allow.stop_jobs || r.allow.replace)) may += " [may stop jobs]";
     if (r.allow && r.allow.delete_captures) may += " [may delete captures]";
+    if (r.allow && r.allow.accept_signatures) may += " [may accept signatures]";
     t.assistant((r.answer ?? "(no answer)") + may, false, r.turn_log || [], r.calls || []);
     // The agent's page-only `view_set` calls are this tab's to apply, as if typed.
     for (const c of r.calls || []) {
@@ -700,15 +709,25 @@ async function askAgent(text, allowOverride = null) {
     }
     const refused = (r.calls || []).filter((c) => c.result && c.result.error === "not_allowed");
     if (refused.length) {
-      // A refused `capture_delete` needs `delete_captures`; any other refusal is a stop or a
+      // A refused `capture_delete` needs `delete_captures`, a refused `signature_accept` or
+      // `signature_reject` needs `accept_signatures`; any other refusal is a stop or a
       // replace. The retry re-sends this one request with the refused flags true on top of
-      // the switches; the session stays as it was (`allow stops|deletes on` are the switches).
+      // the switches; the session stays as it was (`allow stops|deletes|signatures on` are
+      // the switches).
+      const isSignature = (c) => SIGNATURE_DECISIONS.includes(c.tool);
       const deletes = refused.some((c) => c.tool === "capture_delete");
-      const stopsRefused = refused.some((c) => c.tool !== "capture_delete");
-      const what = [stopsRefused && "stop or replace jobs", deletes && "delete captures"]
+      const signatures = refused.some(isSignature);
+      const stopsRefused = refused.some((c) => c.tool !== "capture_delete" && !isSignature(c));
+      const what = [
+        stopsRefused && "stop or replace jobs",
+        deletes && "delete captures",
+        signatures && "accept or reject signatures",
+      ]
         .filter(Boolean)
         .join(" or ");
-      const label = [stopsRefused && "stops", deletes && "deletes"].filter(Boolean).join(" and ");
+      const label = [stopsRefused && "stops", deletes && "deletes", signatures && "signatures"]
+        .filter(Boolean)
+        .join(" and ");
       t.note(`the agent was not allowed to ${what}`, false, [
         {
           label: `allow ${label} and ask again`,
@@ -718,6 +737,7 @@ async function askAgent(text, allowOverride = null) {
               stop_jobs: stopsRefused || allow.stop_jobs,
               replace: stopsRefused || allow.replace,
               delete_captures: deletes || !!allow.delete_captures,
+              accept_signatures: signatures || !!allow.accept_signatures,
             }),
         },
       ]);
@@ -756,12 +776,13 @@ async function runCommand(text) {
       return;
     }
   }
-  const allow = /^allow\s+(stops|deletes)\s+(on|off)$/.exec(text);
+  const allow = /^allow\s+(stops|deletes|signatures)\s+(on|off)$/.exec(text);
   if (allow) {
     state.transcript.user(text);
     const on = allow[2] === "on";
     if (allow[1] === "stops") state.allowStops = on;
-    else state.allowDeletes = on;
+    else if (allow[1] === "deletes") state.allowDeletes = on;
+    else state.allowSignatures = on;
     state.transcript.note(`allow ${allow[1]}: ${allow[2]}`);
     return;
   }

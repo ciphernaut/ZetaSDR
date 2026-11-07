@@ -1,5 +1,6 @@
 //! The watch's explore policy (design 5.5): with `on_unknown: capture` on its `detect`
-//! node, the first time a signal's identify run ends unknown the watch starts an owned
+//! node, the first time a signal's identify run ends unknown (naming no learned
+//! signature: identify's `learned`) the watch starts an owned
 //! `capture` child (`channel → burst_capture`) on the signal's band, the `capture` block's
 //! params on its `burst_capture` node, and publishes `capturing` (`signal`, `job`); when
 //! the child ends, `captured` (`signal`, `captures`, `summary`), the ids also listed under
@@ -35,8 +36,12 @@ fn band(s: &Signal) -> Tuning {
 }
 
 /// The signal `w.signals[i]`'s identify run has just ended unknown: start its capture
-/// when the policy asks for one and this run has not captured it yet.
+/// when the policy asks for one, this run has not captured it yet and the verdict named
+/// no learned signature (a known signal needs no capture, and would propose nothing).
 pub(super) async fn on_unknown(inner: &Arc<Inner>, r: &Run, w: &mut State, i: usize) {
+    if w.signals[i].learned.is_some() {
+        return;
+    }
     let Some(params) = r.seed.policy.capture.clone() else {
         return;
     };
@@ -97,7 +102,7 @@ async fn start(
             None,
             None,
             None,
-            &inner.modes,
+            &inner.modes(),
         )
         .map_err(|e| e.to_string())?;
     let node = graph

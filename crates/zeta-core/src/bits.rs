@@ -66,7 +66,7 @@ pub enum Modulation {
 }
 
 impl Modulation {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Modulation::Fsk => "fsk",
             Modulation::Psk => "psk",
@@ -75,7 +75,7 @@ impl Modulation {
     }
 
     /// The orders the demodulator takes.
-    fn orders(self) -> &'static [u8] {
+    pub fn orders(self) -> &'static [u8] {
         match self {
             Modulation::Fsk => &[2, 4],
             Modulation::Psk => &[2, 4, 8],
@@ -85,7 +85,7 @@ impl Modulation {
 
     /// The modulation a layer-1 label names: `fsk` and `fm` (FSK heard through a
     /// discriminator) are FSK.
-    fn from_label(label: &str) -> Option<Modulation> {
+    pub(crate) fn from_label(label: &str) -> Option<Modulation> {
         match label {
             "fsk" | "fm" => Some(Modulation::Fsk),
             "psk" => Some(Modulation::Psk),
@@ -359,36 +359,46 @@ pub fn bits_plan(
 /// `resample` (or, when the plan shifts, `channel` at its centre, band and
 /// `channel_rate_hz`, then `resample` unless that is already the chain rate) → `demod` (`fsk_demod` given the plan's `tone_spacing_hz`, `null` when it
 /// has none) → `clock` → `slicer` → `bit_view`.
-pub fn bits_graph(plan: &BitsPlan) -> Graph {
+/// The three decision nodes of a chain, as `(id, kind, params)`: the demodulator
+/// (`demod`: `fsk_demod`, `psk_demod` or `ook_demod`), `clock_recover` (`clock`) and the
+/// slicer (`slicer`), for `modulation` at `symbol_rate_baud` and `order` (FSK's
+/// `tone_spacing_hz`, `None` for the demodulator's own estimate). `bits_graph` and a
+/// frame row's expansion both build their chain from these.
+pub fn decision_nodes(
+    modulation: Modulation,
+    symbol_rate_baud: u32,
+    order: u8,
+    tone_spacing_hz: Option<u64>,
+) -> [(&'static str, &'static str, serde_json::Value); 3] {
     use serde_json::{Value, json};
-    let baud = plan.symbol_rate_baud.0;
-    let demod = match plan.modulation {
+    let baud = symbol_rate_baud;
+    let demod = match modulation {
         Modulation::Fsk => (
             "fsk_demod",
             json!({
                 "symbol_rate_baud": baud,
-                "order": plan.order,
-                "tone_spacing_hz": plan.tone_spacing_hz.map(|s| s.0),
+                "order": order,
+                "tone_spacing_hz": tone_spacing_hz,
             }),
         ),
         Modulation::Psk => (
             "psk_demod",
-            json!({"symbol_rate_baud": baud, "order": plan.order}),
+            json!({"symbol_rate_baud": baud, "order": order}),
         ),
         Modulation::Ook => ("ook_demod", json!({"symbol_rate_baud": baud})),
     };
     // The default Mueller and Müller detector mistimes 4-level input, and on OOK it
     // reads no timing across a keyed plateau (both strobes on the same level): early-late
     // takes the slope at the on/off edges.
-    let algorithm = match (plan.modulation, plan.order) {
+    let algorithm = match (modulation, order) {
         (Modulation::Fsk, 4) | (Modulation::Ook, _) => json!("early_late"),
         _ => Value::Null,
     };
-    let (levels, constellation) = match plan.modulation {
-        Modulation::Fsk => (plan.order, Value::Null),
+    let (levels, constellation) = match modulation {
+        Modulation::Fsk => (order, Value::Null),
         Modulation::Psk => (
             2,
-            json!(match plan.order {
+            json!(match order {
                 2 => "bpsk",
                 4 => "qpsk",
                 _ => "8psk",
@@ -396,6 +406,23 @@ pub fn bits_graph(plan: &BitsPlan) -> Graph {
         ),
         Modulation::Ook => (2, Value::Null),
     };
+    [
+        ("demod", demod.0, demod.1),
+        (
+            "clock",
+            "clock_recover",
+            json!({"symbol_rate_baud": baud, "algorithm": algorithm}),
+        ),
+        (
+            "slicer",
+            crate::ops::SLICER_STAGE,
+            json!({"levels": levels, "constellation": constellation}),
+        ),
+    ]
+}
+
+pub fn bits_graph(plan: &BitsPlan) -> Graph {
+    use serde_json::{Value, json};
     let mut nodes: Vec<(&str, &str, Value, StreamKind)> = vec![(
         "capture_in",
         crate::ops::CAPTURE_IN_STAGE,
@@ -427,22 +454,20 @@ pub fn bits_graph(plan: &BitsPlan) -> Graph {
             StreamKind::Iq,
         ));
     }
-    nodes.extend([
-        ("demod", demod.0, demod.1, StreamKind::Audio),
-        (
-            "clock",
-            "clock_recover",
-            json!({"symbol_rate_baud": baud, "algorithm": algorithm}),
-            StreamKind::Audio,
-        ),
-        (
-            "slicer",
-            crate::ops::SLICER_STAGE,
-            json!({"levels": levels, "constellation": constellation}),
-            StreamKind::Event,
-        ),
-        ("bit_view", "bit_view", json!({}), StreamKind::Event),
-    ]);
+    let decision = decision_nodes(
+        plan.modulation,
+        plan.symbol_rate_baud.0,
+        plan.order,
+        plan.tone_spacing_hz.map(|s| s.0),
+    );
+    let leaving = [StreamKind::Audio, StreamKind::Audio, StreamKind::Event];
+    nodes.extend(
+        decision
+            .into_iter()
+            .zip(leaving)
+            .map(|((id, kind, params), k)| (id, kind, params, k)),
+    );
+    nodes.push(("bit_view", "bit_view", json!({}), StreamKind::Event));
     let edges = nodes
         .windows(2)
         .map(|w| Edge {

@@ -355,6 +355,7 @@ async fn job_stop_is_applied_when_stops_are_allowed() {
         stop_jobs: true,
         replace: false,
         delete_captures: false,
+        accept_signatures: false,
     };
     let agent = Agent::new(llm(&fake), &exec, c);
     let t = agent.run("stop it").await.unwrap();
@@ -419,6 +420,7 @@ fn jobs_stop_needs_stops_allowed() {
         stop_jobs: true,
         replace: false,
         delete_captures: false,
+        accept_signatures: false,
     };
     assert!(gate(&op, allowed).is_none());
 }
@@ -779,6 +781,7 @@ fn gate_covers_every_delete_taking_op() {
         stop_jobs: true,
         replace: true,
         delete_captures: false,
+        accept_signatures: false,
     };
     assert!(gate(&json!({"op": "capture_delete", "capture": "a"}), stops).is_some());
     assert!(
@@ -889,6 +892,7 @@ async fn view_set_is_not_gated_by_the_allowance() {
         stop_jobs: false,
         replace: false,
         delete_captures: false,
+        accept_signatures: false,
     };
     let agent = Agent::new(llm(&fake), RecordingExecutor::new(vec![]), c);
     let t = agent.run("switch to the console theme").await.unwrap();

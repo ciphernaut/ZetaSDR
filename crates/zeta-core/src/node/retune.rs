@@ -78,7 +78,7 @@ impl Node {
             capture.bandwidth_hz,
             bin_rate,
             &rec.graph,
-            &self.inner.modes,
+            &self.inner.modes(),
             &RETUNE_CARRIED_PARAMS,
         ) {
             Ok(g) => g,

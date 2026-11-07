@@ -3957,7 +3957,8 @@ def llm_url():
     return url.rstrip("/")
 
 
-NO_ALLOW = {"stop_jobs": False, "replace": False, "delete_captures": False}
+NO_ALLOW = {"stop_jobs": False, "replace": False, "delete_captures": False,
+            "accept_signatures": False}
 
 
 def capture_asks(page):
@@ -4009,7 +4010,8 @@ def scenario_not_allowed_shows_the_unlock_and_reruns_with_the_allowance(page, ur
     assert asks[0]["allow"]["stop_jobs"] is False, asks[0]
     assert asks[1]["allow"]["stop_jobs"] is True, asks[1]
     assert asks[1]["request"] == "stop the measure", asks[1]
-    assert asks[1]["allow"] == {"stop_jobs": True, "replace": True, "delete_captures": False}, \
+    assert asks[1]["allow"] == {"stop_jobs": True, "replace": True, "delete_captures": False,
+                                "accept_signatures": False}, \
         asks[1]
     # The note's button disables once clicked, and the unlock was for that request only:
     # the session's `allow stops` switch is still off for the next plain ask.
@@ -4039,14 +4041,16 @@ def scenario_not_allowed_delete_offers_the_delete_unlock(page, url, secret):
            ).to_have_count(1)
     assert len(asks) == 2, f"two /ask requests: {asks}"
     assert asks[0]["allow"] == NO_ALLOW, asks[0]
-    assert asks[1]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True}, \
+    assert asks[1]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True,
+                                "accept_signatures": False}, \
         asks[1]
     # The switch: every following ask carries delete_captures until turned off.
     run_cmd(page, "allow deletes on")
     run_cmd(page, "think")
     expect(page.locator("#transcript .line.assistant", has_text="one source")).to_have_count(1)
     assert len(asks) == 3, f"three /ask requests: {asks}"
-    assert asks[2]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True}, \
+    assert asks[2]["allow"] == {"stop_jobs": False, "replace": False, "delete_captures": True,
+                                "accept_signatures": False}, \
         asks[2]
 
 
@@ -6322,6 +6326,154 @@ def scenario_work_the_bits_shows_a_stream_and_a_sync_hit(page, url, secret):
     expect(page.locator("#jobs .job button.bits").first).to_be_visible(timeout=10000)
     stop_bits_jobs(url, secret)
     clear_captures(url, secret)
+
+
+# The fsk fixture's framing (`crates/zeta/tests/ui.rs`'s `fsk_fixture`): the sync FSK_SYNC
+# 0x2dd4, then FSK_BODY_BYTES (136) bytes of body and the body's 2-byte CRC-16-CCITT, so
+# (136 + 2) × 8 = 1104 bits after the sync.
+FSK_FRAMING = {"sync": {"hex": "2dd4", "bits": 16}, "length": {"fixed_bits": 1104},
+               "crc": "crc16-ccitt"}
+# A framing with a CRC for the `pocsag` capture: its sync codeword, then one batch (16
+# codewords). The node checks a hand framing's shape only (the `frame_decode` params), not
+# against the capture, and POCSAG's BCH is not a `frame_decode` CRC: CRC-16-CCITT stands in.
+POCSAG_FRAMING = {"sync": {"hex": "7cd215d8", "bits": 32}, "length": {"fixed_bits": 512},
+                  "crc": "crc16-ccitt"}
+
+
+def propose(url, secret, capture, framing=None, name=None):
+    """`signature_propose` by hand from `capture`; the record."""
+    return capture_ops(url, secret, "signature_propose", capture=capture, name=name,
+                       framing=framing)
+
+
+def clear_signatures(url, secret):
+    """Reject every proposed signature (an accepted one stays: there is no unaccept)."""
+    for s in capture_ops(url, secret, "signature_list", state="proposed"):
+        capture_ops(url, secret, "signature_reject", id=s["id"])
+
+
+def two_captures_of(url, secret, source, center_hz, bandwidth_hz):
+    """A capture job's two whole windows on `source`; its captures, newest first."""
+    job = start_job(url, secret, "capture", source, center_hz, bandwidth_hz)
+    two_windows(url, secret, job)
+    mine = lambda: [c for c in capture_ops(url, secret, "capture_list", signal=None)
+                    if c["job"] == job]
+    wait_until(lambda: len(mine()) == 2, 30, f"two captures on {source}")
+    return mine()
+
+
+# Whether the input `sel` matched when `window.__field` was taken is gone from the page
+# (the pane's poll redrew it) and the one there now has the focus.
+FIELD_REDRAWN_JS = """(sel) => {
+  const now = document.querySelector(sel);
+  return !!now && !document.contains(window.__field) && document.activeElement === now;
+}"""
+
+
+def type_across_a_poll(page, sel, keys):
+    """Type `keys` into `sel` (already focused) slowly enough that the pane's poll redraws
+    the row at least once meanwhile (checked)."""
+    page.evaluate("(sel) => { window.__field = document.querySelector(sel); }", sel)
+    page.locator(sel).press_sequentially(keys, delay=EXPLORE_TYPE_DELAY_MS)
+    page.wait_for_function(FIELD_REDRAWN_JS, arg=sel, timeout=5000)
+
+
+# The delay between keystrokes: sixteen of them outlast EXPLORE_POLL_MS (2 s).
+EXPLORE_TYPE_DELAY_MS = 200
+
+
+def scenario_typing_survives_the_explore_poll(page, url, secret):
+    clear_captures(url, secret)
+    clear_signatures(url, secret)
+    capture = two_captures_of(url, secret, "fsk", 433_920_000, 12_000)[0]
+    sig = propose(url, secret, capture["id"])
+    login(page, url, secret)
+    page.locator('#panes .pane-tab[data-pane="explore"]').click()
+    name = f'#explore tr.signature[data-id="{sig["id"]}"] input.sig-name'
+    expect(page.locator(name)).to_have_count(1, timeout=20000)
+    # A name typed into the middle: the focus and the caret come back after each redraw.
+    page.fill(name, "abcdef")
+    page.press(name, "End")
+    for _ in range(3):
+        page.press(name, "ArrowLeft")
+    type_across_a_poll(page, name, "0123456789012345")
+    expect(page.locator(name)).to_have_value("abc0123456789012345def")
+    # The rate field keeps the focus too.
+    rate = f'#explore tr.capture[data-id="{capture["id"]}"] input.bits-rate'
+    page.fill(rate, "")
+    page.focus(rate)
+    type_across_a_poll(page, rate, "1234567890123456")
+    expect(page.locator(rate)).to_have_value("1234567890123456")
+    clear_signatures(url, secret)
+    clear_captures(url, secret)
+
+
+# Defined after every scenario that counts captures: its accepts pin their captures, which
+# `clear_captures` cannot delete, and `scenarios()` runs them in definition order.
+def scenario_proposal_accepted_from_the_page(page, url, secret):
+    clear_captures(url, secret)
+    clear_signatures(url, secret)
+    newest = two_captures_of(url, secret, "fsk", 433_920_000, 12_000)[0]
+    sig = propose(url, secret, newest["id"], framing=FSK_FRAMING)
+    other = propose(url, secret, newest["id"])
+    login(page, url, secret)
+    page.locator('#panes .pane-tab[data-pane="explore"]').click()
+    # The capture job ended on its own, so the node may add its own features-only proposal
+    # at any moment: the rows counted are the ones proposed here, by id.
+    rows = page.locator(f'#explore tr.signature[data-id="{sig["id"]}"], '
+                        f'#explore tr.signature[data-id="{other["id"]}"]')
+    expect(rows).to_have_count(2, timeout=20000)
+    row = f'#explore tr.signature[data-id="{sig["id"]}"] >> '
+    expect(page.locator(row + "td.confidence")).to_have_text("0.60")
+    expect(page.locator(row + "td.state")).to_have_text("proposed")
+    expect(page.locator(row + "td.evidence")).to_contain_text("framing given by hand")
+    page.fill(row + "input.sig-name", "fsk test link")
+    page.click(row + 'button[data-action="accept"]')
+    expect(page.locator("#transcript .line.note",
+                        has_text=f"accepted fsk test link ({sig['id'][-6:]})")).to_have_count(1)
+    # `measure` reads no symbol rate off direct 2-FSK today, so this one writes no learned
+    # row (`accepted`); one that read a rate would add ` · learned <row>`.
+    expect(page.locator(row + "td.state")).to_have_text(re.compile(r"^accepted"))
+    expect(page.locator(row + "input.sig-name")).to_have_attribute("readonly", "")
+    expect(page.locator(row + 'button[data-action="accept"]')).to_have_count(0)
+    accepted = capture_ops(url, secret, "signature_show", id=sig["id"])
+    assert accepted["state"] == "accepted" and accepted["name"] == "fsk test link", accepted
+    assert all(c["pinned"] for c in capture_ops(url, secret, "capture_list", signal=None)), \
+        "captures pinned"
+    other_row = f'#explore tr.signature[data-id="{other["id"]}"] >> '
+    page.click(other_row + 'button[data-action="reject"]')
+    expect(page.locator(other_row + 'button[data-action="reject"]')).to_have_text("sure?")
+    page.click(other_row + 'button[data-action="reject"]')
+    expect(rows).to_have_count(1, timeout=20000)
+    assert capture_ops(url, secret, "signature_show", id=other["id"])["state"] == "rejected"
+    # A framing with a CRC and a measured symbol rate (the pocsag capture's keying line,
+    # 1200 Bd) writes `learned_<id>.json` to the node's modes directory on Accept. Its
+    # classify proves pocsag_decode, so the node proposes nothing of its own here.
+    capture = two_captures_of(url, secret, "pocsag", 148_637_500, 12_500)[0]
+    assert capture["features"].get("symbol_rate_baud"), capture["features"]
+    framed = propose(url, secret, capture["id"], framing=POCSAG_FRAMING)
+    learned = f'#explore tr.signature[data-id="{framed["id"]}"] >> '
+    expect(page.locator(learned + "td.state")).to_have_text("proposed", timeout=20000)
+    page.click(learned + 'button[data-action="accept"]')
+    expect(page.locator("#transcript .line.note",
+                        has_text=f"accepted {framed['name']} ({framed['id'][-6:]})")
+           ).to_have_count(1)
+    row_id = f"learned_{framed['id'].lower()}"
+    expect(page.locator(learned + "td.state")).to_contain_text("learned", timeout=20000)
+    expect(page.locator(learned + "td.state")).to_have_text(f"accepted · learned {row_id}")
+    rec = capture_ops(url, secret, "signature_show", id=framed["id"])
+    assert rec["decoder"] == row_id and rec["name"] == framed["name"], rec
+    # The pinned captures stay in the store for the rest of the run (unpin is not an op).
+
+
+def scenario_allow_signatures_switch(page, url, secret):
+    login(page, url, secret)
+    run_cmd(page, "allow signatures on")
+    expect(page.locator("#transcript .line.note:not(.error)",
+                        has_text="allow signatures: on")).to_have_count(1)
+    run_cmd(page, "allow signatures off")
+    expect(page.locator("#transcript .line.note:not(.error)",
+                        has_text="allow signatures: off")).to_have_count(1)
 
 
 def scenarios():

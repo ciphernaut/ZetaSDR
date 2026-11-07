@@ -266,6 +266,72 @@ pub enum Op {
         /// An id from `capture_list`.
         capture: String,
     },
+    /// The learned signatures (`state_dir/signatures`), newest first, narrowed to `state`
+    /// (`proposed`, `accepted`, `rejected`, `superseded`; `null` for all). Each record has
+    /// `id`, `name`, `state`, the waveform (`min_hz`, `max_hz`, `bandwidth_hz`,
+    /// `modulation`, `order`, `symbol_rate_baud`, `tone_spacing_hz`, `burst` `{duty,
+    /// burst_ms, period_ms}`), `framing` (`null`, or the `frame_decode` params that
+    /// checked), `decoder`, `decoder_file`, `decoder_note`, `confidence` (0.3 for features
+    /// only, 0.6 with a framing, 0.9 with a CRC that checks on at least 5 frames),
+    /// `evidence`, `provenance` (`source`, `station`, `captures`, `jobs`, `allocation`,
+    /// `proposed_ns`, `proposed_by`, `accepted_ns`, `accepted_by`, `superseded_by`,
+    /// `superseded_ns`), `matches` and `last_matched_ns`.
+    SignatureList {
+        /// The state to narrow to; `null` for every record.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(
+            required,
+            schema_with = "crate::modes::nullable_enum::<crate::signatures::SignatureState>"
+        )]
+        state: Option<crate::signatures::SignatureState>,
+    },
+    /// One learned signature's record. An unknown `id` is `unknown` (`field: "id"`,
+    /// `known` the store's ids).
+    SignatureShow {
+        /// An id from `signature_list`.
+        id: String,
+    },
+    /// Propose a signature by hand from a capture: its feature record and layer-1 label
+    /// (a `noise` capture is refused), every capture of its set, the nearest `tx`
+    /// assignment it kept and the station. `name` `null` gives the node's `<modulation>
+    /// <width> kHz at <MHz>`; `framing` is the `frame_decode` params that checked
+    /// (refused when the stage refuses them), `null` for none. The record is `proposed`;
+    /// a proposal is harmless: it waits for the operator.
+    SignaturePropose {
+        /// An id from `capture_list`.
+        capture: String,
+        /// The signature's name; `null` for the node's.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+        name: Option<String>,
+        /// The `frame_decode` params (`sync`, `length`, `crc`, ...); `null` for none.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "nullable_object")]
+        framing: Option<serde_json::Value>,
+    },
+    /// Accept a proposed signature; `name` `null` keeps the proposed one. Its provenance
+    /// captures are pinned. A record not `proposed` is refused (`signature <id> is
+    /// <state>, not proposed`). Accepting or rejecting is the operator's decision: through
+    /// `ask` the run needs `allow.accept_signatures` (`zeta ask --allow-signatures`; on
+    /// the page, `allow signatures on`), else `not_allowed`: report the proposal, do not
+    /// retry.
+    SignatureAccept {
+        /// An id from `signature_list`.
+        id: String,
+        /// The operator's name for it; `null` keeps the proposed one.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+        name: Option<String>,
+    },
+    /// Reject a proposed signature (the record stays, `rejected`). A record not
+    /// `proposed` is refused (`signature <id> is <state>, not proposed`). Accepting or
+    /// rejecting is the operator's decision: through `ask` the run needs
+    /// `allow.accept_signatures` (`zeta ask --allow-signatures`; on the page, `allow
+    /// signatures on`), else `not_allowed`: report the proposal, do not retry.
+    SignatureReject {
+        /// An id from `signature_list`.
+        id: String,
+    },
     /// Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on
     /// the channels numbered in `channels`, each at its channel's `center_hz` with the
     /// plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's
@@ -490,6 +556,11 @@ pub enum Op {
         selection: Selection,
     },
     Schema {},
+}
+
+/// Schema of a required `Option<serde_json::Value>` holding an object: `["object","null"]`.
+fn nullable_object(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": ["object", "null"]})
 }
 
 /// Deserialize a required `Option<u64>`: without `#[serde(default)]` a missing
@@ -2248,6 +2319,11 @@ pub enum OpResult {
     },
     /// `station_set`, `station_get` and `station_clear`: the station, `null` for none.
     Station(Option<crate::station::Station>),
+    /// `signature_list`: the records, newest first.
+    Signatures(Vec<crate::signatures::SignatureRecord>),
+    /// `signature_show`, `signature_propose`, `signature_accept` and `signature_reject`:
+    /// the record.
+    Signature(Box<crate::signatures::SignatureRecord>),
     Schema(serde_json::Value),
 }
 
@@ -2272,6 +2348,11 @@ impl Op {
             Op::CaptureShow { .. } => "capture_show",
             Op::CaptureClassify { .. } => "capture_classify",
             Op::CaptureDelete { .. } => "capture_delete",
+            Op::SignatureList { .. } => "signature_list",
+            Op::SignatureShow { .. } => "signature_show",
+            Op::SignaturePropose { .. } => "signature_propose",
+            Op::SignatureAccept { .. } => "signature_accept",
+            Op::SignatureReject { .. } => "signature_reject",
             Op::PlanStart { .. } => "plan_start",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
@@ -2315,6 +2396,8 @@ impl Op {
                 | Op::StationGet {}
                 | Op::CaptureList { .. }
                 | Op::CaptureShow { .. }
+                | Op::SignatureList { .. }
+                | Op::SignatureShow { .. }
         )
     }
 
@@ -2373,6 +2456,8 @@ impl OpResult {
             OpResult::Station(_) => "station",
             OpResult::Captures(_) => "captures",
             OpResult::Capture { .. } => "capture",
+            OpResult::Signatures(_) => "signatures",
+            OpResult::Signature(_) => "signature",
         }
     }
 
@@ -2618,6 +2703,11 @@ pub fn schema() -> serde_json::Value {
         }
     }
     v
+}
+
+/// A signature record as the `signature_*` ops answer it.
+fn signature_result(r: crate::signatures::SignatureRecord) -> OpResult {
+    OpResult::Signature(Box::new(r))
 }
 
 fn other(e: impl std::fmt::Display) -> OpError {
@@ -2877,7 +2967,9 @@ async fn idle_after_replace(node: &Node, port: &dyn Port, replace: &[JobId], e: 
     node.idle_if_unheld(port).await;
 }
 
-pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
+/// Apply `op` on `node` for the caller `transport` (what a hand proposal's
+/// `proposed_by` and an accept's `accepted_by` record).
+pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResult, OpError> {
     match op {
         Op::SourceList {} => {
             let mut v: Vec<SourceInfo> = node
@@ -3249,11 +3341,29 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
         Op::CaptureClassify { capture } => capture_classify(node, &capture).await,
         Op::CaptureDelete { capture } => {
             capture_record(node, &capture)?;
-            node.bursts()
-                .delete(&capture)
-                .map(|_| OpResult::Ok)
-                .map_err(other)
+            node.bursts().delete(&capture).map_err(other)?;
+            // A session whose last capture this was goes with it.
+            node.sweep_sessions();
+            Ok(OpResult::Ok)
         }
+        Op::SignatureList { state } => Ok(OpResult::Signatures(node.signatures().list(state))),
+        Op::SignatureShow { id } => node
+            .signatures()
+            .get(&id)
+            .map(signature_result)
+            .ok_or_else(|| node.unknown_signature(&id)),
+        Op::SignaturePropose {
+            capture,
+            name,
+            framing,
+        } => node
+            .signature_propose(&capture, name, framing, transport)
+            .await
+            .map(signature_result),
+        Op::SignatureAccept { id, name } => node
+            .signature_accept(&id, name, transport)
+            .map(signature_result),
+        Op::SignatureReject { id } => node.signature_reject(&id, transport).map(signature_result),
         Op::MixStart { sources } => node
             .mix_start(sources)
             .await
@@ -3928,7 +4038,8 @@ fn capture_record(node: &Node, id: &str) -> Result<crate::bursts::CaptureRecord,
 }
 
 /// `capture_classify`: the classifiers over the capture's samples in the record's band, with the
-/// allocations the record kept.
+/// allocations the record kept. A row proved on the band supersedes the accepted
+/// signatures it overlaps.
 async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
     let rec = capture_record(node, id)?;
     let Classification {
@@ -3938,6 +4049,11 @@ async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
     } = classify_capture(&node.classifiers(), &rec)
         .await
         .map_err(other)?;
+    let band = Tuning {
+        center_hz: rec.center_hz,
+        bandwidth_hz: rec.bandwidth_hz,
+    };
+    node.supersede_proved(&tried, band);
     Ok(OpResult::Classification {
         labels,
         tried,
@@ -3974,7 +4090,8 @@ pub(crate) async fn classify_capture(
         .await)
 }
 
-/// Run the classifier set over the selection's band and span of the source ring.
+/// Run the classifier set over the selection's band and span of the source ring. A row
+/// proved on the band supersedes the accepted signatures it overlaps.
 async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     let (rate, center, samples) = ring_samples(node, &sel)?;
     // `check_band` has proved the band lies inside the ring's.
@@ -3996,6 +4113,11 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         .classifiers()
         .run_all(&samples, rate, center, band, None, allocations)
         .await;
+    let band = Tuning {
+        center_hz: sel.center_hz,
+        bandwidth_hz: sel.bandwidth_hz,
+    };
+    node.supersede_proved(&tried, band);
     Ok(OpResult::Classification {
         labels,
         tried,

@@ -45,11 +45,7 @@ pub async fn run(
         Err(e) => return fail(&e),
     };
     let max_turns = args.max_turns;
-    let allow = Allow {
-        stop_jobs: args.allow_stop,
-        replace: args.allow_replace,
-        delete_captures: args.allow_delete,
-    };
+    let allow = allow_of(&args);
     match remote {
         Some(client) => {
             let (schema, md) = match (client.schema().await, client.agents_md().await) {
@@ -106,6 +102,16 @@ pub async fn run(
             remotes.close().await;
             code
         }
+    }
+}
+
+/// What the run may do beyond reading and starting, from the `--allow-*` flags.
+pub fn allow_of(args: &AskArgs) -> Allow {
+    Allow {
+        stop_jobs: args.allow_stop,
+        replace: args.allow_replace,
+        delete_captures: args.allow_delete,
+        accept_signatures: args.allow_signatures,
     }
 }
 
@@ -178,4 +184,40 @@ fn print(json: serde_json::Result<String>, code: u8) -> ExitCode {
 fn fail(msg: &str) -> ExitCode {
     eprintln!("zeta: {msg}");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn allow(flags: &[&str]) -> Allow {
+        let mut args = vec!["zeta", "ask", "--llm-url", "http://llm", "--llm-model", "m"];
+        args.extend_from_slice(flags);
+        args.push("what sources?");
+        match crate::cli::Cli::try_parse_from(args).unwrap().command {
+            crate::cli::Command::Ask(a) => allow_of(&a),
+            c => panic!("ask: {c:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_allow_signatures_allows_accepting_signatures_only() {
+        assert_eq!(allow(&[]), Allow::default());
+        assert_eq!(
+            allow(&["--allow-signatures"]),
+            Allow {
+                accept_signatures: true,
+                ..Allow::default()
+            }
+        );
+        assert_eq!(
+            allow(&["--allow-delete", "--allow-stop"]),
+            Allow {
+                stop_jobs: true,
+                delete_captures: true,
+                ..Allow::default()
+            }
+        );
+    }
 }

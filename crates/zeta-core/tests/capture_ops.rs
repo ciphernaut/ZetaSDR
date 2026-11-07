@@ -32,7 +32,7 @@ async fn open(dir: &Path) -> Node {
     registry.register(Arc::new(PassthroughStage::new()));
     zeta_dsp::register_all(&mut registry);
     let node = Node::open(cfg, registry, vec![]).await.unwrap();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     node
