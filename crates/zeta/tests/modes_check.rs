@@ -99,13 +99,66 @@ fn write_row(dir: &Path, id: &str, test: serde_json::Value) {
         serde_json::from_str(include_str!("../../../modes/aprs_decode.json")).unwrap();
     row["id"] = id.into();
     row["test"] = test;
+    write_row_json(dir, &row);
+}
+
+/// `row` as an operator row file `<dir>/modes/<id>.json`.
+fn write_row_json(dir: &Path, row: &serde_json::Value) {
+    let id = row["id"].as_str().expect("a row id");
     let modes = dir.join("modes");
     std::fs::create_dir_all(&modes).unwrap();
     std::fs::write(
         modes.join(format!("{id}.json")),
-        serde_json::to_string_pretty(&row).unwrap(),
+        serde_json::to_string_pretty(row).unwrap(),
     )
     .unwrap();
+}
+
+/// A frame row is checked over the `framing` synthesiser family: its chain cuts the
+/// synthesised frames and the first event is a CRC-clean frame.
+#[test]
+fn a_frame_row_is_checked_over_the_framing_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let framing = serde_json::json!({"sync": {"hex": "2dd4", "bits": 16},
+        "length": {"fixed_bits": 272}, "crc": "crc16-ccitt"});
+    let row = serde_json::json!({
+        "id": "fsk_test_frames",
+        "name": "FSK test frames",
+        "family": "general",
+        "band": {"bandwidth_hz": 12500, "centers_hz": [433920000]},
+        "modulation": ["fsk", "fm"],
+        "label": "FSK frames",
+        "protocol": "frame",
+        "decoder": {
+            "kind": "frame",
+            "demod": {"modulation": "fsk", "symbol_rate_baud": 4800, "order": 2, "tone_spacing_hz": null},
+            "framing": framing,
+            "parser": "opaque"
+        },
+        "event": {
+            "schema": {"type": "object", "properties": {
+                "protocol": {"type": "string"},
+                "sync": {"type": "string"},
+                "length_bytes": {"type": "integer"},
+                "bytes": {"type": "string"},
+                "crc_ok": {"type": "boolean"},
+                "payload": {"type": "string"}
+            }},
+            "summary": "frame {length_bytes} B"
+        },
+        "identify": {"proof": "field", "field": "crc_ok", "min_events": 1, "dwell_ms": 10000,
+            "min_span_ms": 1000, "quick": "frame"},
+        "catalogue": [],
+        "test": {
+            "kind": "synth", "family": "framing", "modulation": "fsk", "symbol_rate_baud": 4800,
+            "deviation_hz": 2400.0, "frames": 8, "body_bytes": 32, "framing": framing,
+            "repeat": 1, "snr_db": 20, "expect": {"crc_ok": true}, "within_ms": 10000
+        }
+    });
+    write_row_json(dir.path(), &row);
+    let (out, code) = stdout(&mut check(dir.path(), &["fsk_test_frames"]));
+    assert_eq!(out.trim(), "fsk_test_frames: ok", "{out}");
+    assert_eq!(code, 0);
 }
 
 #[test]

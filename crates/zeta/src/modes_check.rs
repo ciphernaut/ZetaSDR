@@ -9,10 +9,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use tokio::sync::broadcast;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
 use zeta_core::modes::{Decoder, LoadedMode, ModeRegistry, ModeState, RowTest, TestSpec};
 use zeta_core::ops::{JobKind, Op, OpResult};
+use zeta_core::stream::Payload;
 use zeta_core::types::{Hz, SourceId, StreamKind, Timestamp};
 
 use crate::node_setup;
@@ -28,7 +30,8 @@ const DEFAULT_CENTER_HZ: u64 = 100_000_000;
 /// Longest the job's event stream may take to appear after the job starts.
 const STREAM_WAIT: Duration = Duration::from_secs(2);
 
-/// The longest one `stream_tail` waits (`TAIL_MAX_TIMEOUT_MS`).
+/// The longest a check waits for its event: the cap of one `stream_tail`
+/// (`TAIL_MAX_TIMEOUT_MS`).
 const TAIL_MAX_MS: u64 = 10_000;
 
 /// What every row's check shares: the rows and stage registry one loading produced
@@ -192,7 +195,7 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         Ok(other) => return Outcome::Fail(format!("job_start answered {other:?}")),
         Err(e) => return Outcome::Fail(serde_json::to_string(&e).unwrap_or_default()),
     };
-    let outcome = first_event(&node, &job, test.within_ms).await;
+    let outcome = first_event(&node, &job, &m.row.protocol, test.within_ms).await;
     let _ = node.apply(Op::JobStop { job }).await;
     match outcome {
         Ok(event) => compare(&test.expect, &event),
@@ -251,24 +254,28 @@ fn capture(m: &LoadedMode, test: &RowTest, scratch: &Path) -> Result<(PathBuf, u
     }
 }
 
-/// The payload of the first event on the job's first event stream within `within_ms`
-/// (of the stream appearing), or why there is none: the job failed, or the time passed.
+/// The payload of the first event in the row's `protocol` on the job's decoder output
+/// within `within_ms` (of the stream appearing; a frame row's `frame_decode` forwards the
+/// slicer's `bits` events beside its frames), or why there is none: the job failed, or
+/// the time passed.
 async fn first_event(
     node: &zeta_core::node::Node,
     job: &zeta_core::types::JobId,
+    protocol: &str,
     within_ms: u64,
 ) -> Result<Value, String> {
     let deadline = tokio::time::Instant::now() + STREAM_WAIT;
+    // The decoder's events are the job's last event output in graph order (a frame
+    // row's `clock_recover` publishes its timing on an earlier one).
     let stream = loop {
-        let mut mine: Vec<_> = node
-            .bus()
-            .list()
+        let last = node
+            .job_outputs(job)
             .into_iter()
-            .filter(|s| s.provenance.job.as_ref() == Some(job) && s.kind == StreamKind::Event)
-            .collect();
-        mine.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-        if let Some(s) = mine.into_iter().next() {
-            break s.id;
+            .filter(|(k, _)| *k == StreamKind::Event)
+            .map(|(_, s)| s)
+            .next_back();
+        if let Some(s) = last {
+            break s;
         }
         if let Some(why) = failure(node, job) {
             return Err(why);
@@ -278,18 +285,24 @@ async fn first_event(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let tail = Op::StreamTail {
-        stream,
-        max_frames: 1,
-        timeout_ms: within_ms.clamp(1, TAIL_MAX_MS) as u32,
+    let none = || failure(node, job).unwrap_or(format!("no event within {within_ms} ms"));
+    let Some(mut rx) = node.bus().subscribe(&stream) else {
+        return Err(none());
     };
-    match node.apply(tail).await {
-        Ok(OpResult::Frames { frames, .. }) => match frames.into_iter().next() {
-            Some(f) => Ok(f.payload),
-            None => Err(failure(node, job).unwrap_or(format!("no event within {within_ms} ms"))),
-        },
-        Ok(other) => Err(format!("stream_tail answered {other:?}")),
-        Err(e) => Err(serde_json::to_string(&e).unwrap_or_default()),
+    let until =
+        tokio::time::Instant::now() + Duration::from_millis(within_ms.clamp(1, TAIL_MAX_MS));
+    loop {
+        match tokio::time::timeout_at(until, rx.recv()).await {
+            Ok(Ok(f)) => {
+                if let Payload::Event(v) = f.payload
+                    && v["protocol"] == protocol
+                {
+                    return Ok(v);
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return Err(none()),
+        }
     }
 }
 

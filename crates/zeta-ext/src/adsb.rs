@@ -37,7 +37,7 @@ pub fn find_dump1090() -> Option<PathBuf> {
     let row = embedded_row();
     match &row.decoder {
         Decoder::Program(b) => crate::proc::find_handler(&b.programs),
-        Decoder::Graph { .. } => None,
+        _ => None,
     }
 }
 

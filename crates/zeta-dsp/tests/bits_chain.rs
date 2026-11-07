@@ -164,7 +164,8 @@ async fn fsk_errors(order: u8, deviation_hz: f64, imp: Impairments, clock: Value
         &iq,
         IN_RATE as u64,
     )
-    .await;
+    .await
+    .expect("the chain runs");
     let bits_per_symbol = if order == 4 { 2 } else { 1 };
     align_errors_tail(
         &recovered_bits(&events),
@@ -195,7 +196,8 @@ async fn ook_errors(snr_db: f32) -> usize {
         &iq,
         IN_RATE as u64,
     )
-    .await;
+    .await
+    .expect("the chain runs");
     align_errors(&recovered_bits(&events), &want)
 }
 
@@ -281,7 +283,8 @@ async fn psk_bits(order: u8, constellation: &str, imp: Impairments) -> (Vec<u8>,
         &iq,
         IN_RATE as u64,
     )
-    .await;
+    .await
+    .expect("the chain runs");
     (recovered_bits(&events), want)
 }
 
@@ -334,7 +337,8 @@ async fn a_short_bpsk_burst_recovers_its_bits_without_resample() {
         &iq,
         FSK_RATE,
     )
-    .await;
+    .await
+    .expect("the chain runs");
     let e = align_errors(&recovered_bits(&events), &want);
     assert_eq!(e, 0, "{e} bit errors");
 }
@@ -537,7 +541,9 @@ async fn remote_codes_from(
         .iter()
         .map(|(k, p)| (k.as_str(), p.clone()))
         .collect();
-    let events = run_chain_at(&stages, &iq, rate, m.center_hz.0).await;
+    let events = run_chain_at(&stages, &iq, rate, m.center_hz.0)
+        .await
+        .expect("the chain runs");
     let chips = recovered_bits(&events);
     let shown: String = chips.iter().map(|c| char::from(b'0' + c)).collect();
     (plan, (shown, ev1527_codes(&chips)))
@@ -733,6 +739,7 @@ async fn framing_events(spec: &SynthSpec) -> Vec<Value> {
         IN_RATE as u64,
     )
     .await
+    .expect("the chain runs")
     .into_iter()
     .filter(|e| e["protocol"] == "frame")
     .collect()

@@ -28,6 +28,7 @@ pub mod denoise;
 pub mod detect;
 pub mod fft;
 pub mod frame_decode;
+pub mod frame_quick;
 pub mod framing;
 pub mod fsk;
 #[cfg(feature = "gpu")]

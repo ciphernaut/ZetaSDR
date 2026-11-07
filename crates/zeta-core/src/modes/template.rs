@@ -4,12 +4,14 @@
 //! `"$out_rate_hz"`) filled with the job's integers; a `program` row becomes a `channel`
 //! at the same rate into [`EXTERNAL_DECODE_KIND`], which resamples to the program's
 //! `input.rate_hz` (an audio row's channel runs through its `demod`, an `nbfm_demod`
-//! with the squelch off, first). Every node and the graph get fresh ids, as the built-in kinds'
-//! graphs do: a re-expansion carries params by stage kind, never by node id.
+//! with the squelch off, first). A `frame` row becomes `channel → resample → <demod> →
+//! clock_recover → slicer → frame_decode` (the resampler left out when the channel is
+//! already at the chain rate). Every node and the graph get fresh ids, as the built-in
+//! kinds' graphs do: a re-expansion carries params by stage kind, never by node id.
 
 use std::collections::HashMap;
 
-use super::{Decoder, Demod, InputStream, ModeRow};
+use super::{Decoder, Demod, FrameBlock, InputStream, ModeRow};
 use crate::graph::{Edge, Graph, GraphId, Node, NodeId};
 use crate::ops::OpError;
 use crate::port::Tuning;
@@ -117,6 +119,70 @@ pub fn expand(row: &ModeRow, tuning: Tuning, out_rate_hz: u64) -> Result<Graph, 
                 edges,
             })
         }
+        Decoder::Frame(block) => Ok(frame_graph(block, tuning, out_rate_hz)),
+    }
+}
+
+/// A frame row's chain: `channel` at `out_rate_hz`, `resample` to the chain rate
+/// ([`crate::bits::chain_rate_hz`]; left out when the channel is at it), the three
+/// [`crate::bits::decision_nodes`], `frame_decode` with the row's framing, and
+/// `frame_parse` when the parser is not `opaque`.
+fn frame_graph(block: &FrameBlock, tuning: Tuning, out_rate_hz: u64) -> Graph {
+    use serde_json::json;
+    let d = &block.demod;
+    let chain = crate::bits::chain_rate_hz(out_rate_hz, d.symbol_rate_baud, d.modulation, d.order);
+    let mut nodes: Vec<(&str, serde_json::Value, StreamKind)> = vec![(
+        "channel",
+        json!({
+            "center_hz": tuning.center_hz.0,
+            "bandwidth_hz": tuning.bandwidth_hz.0,
+            "out_rate_hz": out_rate_hz,
+        }),
+        StreamKind::Iq,
+    )];
+    if chain != out_rate_hz {
+        nodes.push(("resample", json!({"out_rate_hz": chain}), StreamKind::Iq));
+    }
+    let decision =
+        crate::bits::decision_nodes(d.modulation, d.symbol_rate_baud, d.order, d.tone_spacing_hz);
+    let leaving = [StreamKind::Audio, StreamKind::Audio, StreamKind::Event];
+    nodes.extend(
+        decision
+            .into_iter()
+            .zip(leaving)
+            .map(|((_, kind, params), k)| (kind, params, k)),
+    );
+    nodes.push(("frame_decode", block.framing.clone(), StreamKind::Event));
+    if block.parser != "opaque" {
+        nodes.push((
+            "frame_parse",
+            json!({"parser": block.parser}),
+            StreamKind::Event,
+        ));
+    }
+    let nodes: Vec<(Node, StreamKind)> = nodes
+        .into_iter()
+        .map(|(kind, params, leaving)| {
+            let node = Node {
+                id: NodeId::new(),
+                kind: kind.into(),
+                params,
+            };
+            (node, leaving)
+        })
+        .collect();
+    let edges = nodes
+        .windows(2)
+        .map(|w| Edge {
+            from: w[0].0.id.clone(),
+            to: w[1].0.id.clone(),
+            kind: w[0].1,
+        })
+        .collect();
+    Graph {
+        id: GraphId::new(),
+        nodes: nodes.into_iter().map(|(n, _)| n).collect(),
+        edges,
     }
 }
 
@@ -139,14 +205,17 @@ fn demod_node(demod: &Demod) -> Node {
     }
 }
 
-/// Refuse a band narrower than an IQ program row needs: `band.min_hz` (else
-/// `band.bandwidth_hz`) is the least, `band.bandwidth_hz` the suggestion, the source
-/// rate `source_rate_hz` the most. A `graph` row takes any band its channel can cut.
+/// Refuse a band narrower than an IQ program row or a frame row needs: `band.min_hz`
+/// (else `band.bandwidth_hz`) is the least, `band.bandwidth_hz` the suggestion, the
+/// source rate `source_rate_hz` the most. A `graph` row takes any band its channel can
+/// cut.
 pub fn check_band(row: &ModeRow, tuning: Tuning, source_rate_hz: u64) -> Result<(), OpError> {
-    let Decoder::Program(block) = &row.decoder else {
-        return Ok(());
+    let checked = match &row.decoder {
+        Decoder::Program(block) => block.input.stream == InputStream::Iq,
+        Decoder::Frame(_) => true,
+        Decoder::Graph { .. } => false,
     };
-    if block.input.stream != InputStream::Iq {
+    if !checked {
         return Ok(());
     }
     let min = row.band.min_hz.unwrap_or(row.band.bandwidth_hz);
