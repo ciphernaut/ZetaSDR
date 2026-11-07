@@ -21,13 +21,18 @@ Each of these is a mode row: `zeta modes list` gives its id (the `kind` to start
 
 - POCSAG (`pocsag_decode`): 148-149 MHz in AU (Telstra at 148 637 500 Hz among them), 466 075 000 Hz in much of Europe, 929-932 MHz in the US. 12 500 Hz band.
 - ACARS (`acars_decode`): 131 550 000 Hz (worldwide primary), 131 725 000 and 131 825 000 Hz (Europe), 130 025 000, 130 450 000 and 131 125 000 Hz (North America), 131 450 000 Hz (Asia). 10 000 Hz each.
+- VDL Mode 2 (`vdl2_decode`): 136 975 000 Hz worldwide (136 725 000, 136 775 000, 136 825 000 and 136 875 000 Hz in Europe), 25 000 Hz band. It needs dumpvdl2 on the node's host (the install hint names it; the OpenWebRX+ apt repository packages it). An event is one AVLC frame keyed on the ICAO address `icao` (`addr_type` tells an aircraft from a ground station): report its `summary`. A ground-station row's ACARS columns (`reg`, `flight`, `label`, `text`) name the aircraft of each uplink, and an ADS-C report gives the frame a `position`.
+- HFDL (`hfdl_decode`): see "Remote HF receivers (KiwiSDR)"; 6 000 Hz band at a listed dial frequency, 2 800 000-22 100 000 Hz.
 - RDS (`rds_decode`): any FM broadcast station, 200 000 Hz band. The first event takes a few seconds.
 - ADS-B (`adsb_decode`): 1 090 000 000 Hz with a 2 400 000 Hz band; under 2 000 000 Hz is refused. It needs dump1090 on the node's host: when it is missing, the startup handler report names it with its package and `modes_list` shows `adsb_decode` `unavailable` with the reason.
 
 "Set up a background decoder for all ACARS and ADS-B activity":
 
 1. `plan_start` with `plan: "acars_vhf"`, `kind: "acars_decode"` and the radio: one `acars_decode` on each of the seven channels above, all in one capture of 1 810 000 Hz about 130 925 000 Hz (`channels` narrows it, `[5]` for 131 550 000 Hz alone).
-2. Start `adsb_decode` on a second source. A radio serves one band at a time, so on one radio it must wait until the ACARS jobs are stopped.
+2. For VDL2, `source_pin` the radio at 133 500 000 Hz / 8 000 000 Hz first, then `plan_start` `acars_vhf` as above, then `job_start --kind vdl2_decode --center-hz 136975000 --bandwidth-hz 25000`: every job fits the pin and is leased without a tune. Started the other way round, VDL2 is a `conflict` naming the ACARS jobs.
+3. Start `adsb_decode` on a second source. A radio serves one band at a time, so on one radio it must wait until the ACARS jobs are stopped.
+
+When rows declare `subject.merge` (`acars_decode` and `vdl2_decode` both do), the page shows one aircraft table across the links, with a `Via` column listing the protocols heard.
 
 `knowledge_lookup` says which decoder proves a band's signature (`decoder` names the mode id, the job kind; `null` when no mode proves it yet). `classify` tries the best-scoring modes with a quick attempt (APRS, POCSAG, ACARS, RDS) as decode-to-identify and lists each under `tried` with its outcome; it never runs a program row such as ADS-B (`skipped_quick`: use `adsb_decode`). A CRC-clean decode is the strongest layer 2 evidence there is. A signature match without one is a guess: say so.
 
@@ -93,6 +98,10 @@ SondeHub is a feed out of the node, so nothing uploads unless the operator gave 
 ### Remote HF receivers (KiwiSDR)
 
 A KiwiSDR source covers 0-30 MHz and delivers 12 kHz of IQ per connection, so `bandwidth_hz` is at most 12 000: work one HF channel at a time with `measure` jobs or `classify` selections inside the band you tuned (e.g. 7 100 000 Hz with 10 000 Hz for 40 m), not wide `spectrum` sweeps. A Kiwi has a limited number of user slots; when they are all taken the source faults with `too_busy` and the job fails with that reason: report it, do not retry in a loop. The connection opens on the first tune and holds a slot until the node exits. Reception is site-dependent: the receiver's location, antenna, local noise and the time of day decide what is audible, so an empty band on one Kiwi says nothing about the band elsewhere.
+
+`source_list` gives each source a `position` `{lat, lon, alt_m, from}`: `from` is `status` when the source reported it (a Kiwi with GPS reads `gps=` and `asl=` from its status page once per connection) or `configured` from `--source-position ID=LAT,LON[,ALT_M]`; `null` otherwise. A signal heard through a Kiwi was received there, not at the station: do not measure its range or bearing from the station.
+
+HFDL (`hfdl_decode`, needs dumphfdl on the node's host) works on a Kiwi unresampled: `center_hz` is the listed (dial) frequency and `bandwidth_hz` 6 000. The signal sits 1.44 kHz above the dial frequency, so a `measure` box on the carrier reads 2.4 kHz of PSK offset up. A ground-station squitter every 32 s proves the channel (an identify dwell of 40 s holds one). Frequencies come from a list (dumphfdl's `etc/systable.conf` upstream, or the operator's own), not a raster. Events are keyed on `icao`, known once the aircraft's logon was heard, with `gs` the ground station, `pdu`, `flight` and a `position` from performance-data PDUs.
 
 ### Sources on another node (federation)
 
