@@ -54,6 +54,7 @@ async fn fm_demod_job_produces_audio_with_tone() {
     let mut reg = StageRegistry::new();
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
@@ -159,6 +160,7 @@ async fn aprs_decode_job_decodes_fixture_packet() {
     let mut reg = StageRegistry::new();
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
@@ -249,6 +251,7 @@ async fn node_over(
     let mut reg = StageRegistry::new();
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,

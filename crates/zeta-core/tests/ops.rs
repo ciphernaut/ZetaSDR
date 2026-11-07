@@ -95,6 +95,7 @@ impl Port for WidePort {
 
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,

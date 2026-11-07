@@ -12,7 +12,7 @@ mod retune;
 mod sources;
 pub mod watch;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -35,7 +35,8 @@ use crate::ring::IqRing;
 use crate::stage::{Backend, MixInput, StageRegistry};
 use crate::stream::{Frame, Payload, StreamBus};
 use crate::types::{
-    Capabilities, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
+    Capabilities, Hz, JobId, PositionFrom, Provenance, SourceId, SourcePosition, Span, StreamId,
+    StreamKind, Timestamp,
 };
 
 pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
@@ -92,6 +93,9 @@ pub struct NodeConfig {
     /// What the burst store (`state_dir/bursts`) keeps; `BurstPolicy::default()` is
     /// 256 MiB and 7 days.
     pub burst_policy: crate::bursts::BurstPolicy,
+    /// Where the operator said sources are (`--source-position`); a source that
+    /// reports its own position (`Port::position`) overrides its entry.
+    pub source_positions: BTreeMap<SourceId, SourcePosition>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -276,6 +280,8 @@ struct Inner {
     ring_seconds: f64,
     ring_budget_bytes: u64,
     scan_dwell_ms: u64,
+    /// Where the operator said sources are (`--source-position`).
+    source_positions: BTreeMap<SourceId, SourcePosition>,
     backends: Vec<Backend>,
     registry: StageRegistry,
     /// The decoder modes, loaded at `open` against `registry`.
@@ -835,6 +841,7 @@ impl Node {
                 ring_seconds: cfg.ring_seconds,
                 ring_budget_bytes: cfg.ring_budget_bytes,
                 scan_dwell_ms: cfg.scan_dwell_ms,
+                source_positions: cfg.source_positions,
                 backends: cfg.backends,
                 registry,
                 modes,
@@ -1947,6 +1954,17 @@ impl Node {
     }
 
     /// The node's station, when one is set.
+    /// Where source `id` is: what its port reports itself (`from: status`), else the
+    /// operator's `--source-position` entry (`from: configured`), else `None`.
+    pub fn source_position(&self, id: &SourceId) -> Option<SourcePosition> {
+        self.port(id).and_then(|p| p.position()).or_else(|| {
+            self.inner.source_positions.get(id).map(|p| SourcePosition {
+                from: PositionFrom::Configured,
+                ..*p
+            })
+        })
+    }
+
     pub fn station(&self) -> Option<crate::station::Station> {
         self.inner.station.lock().unwrap().clone()
     }

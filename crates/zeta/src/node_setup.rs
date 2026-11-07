@@ -4,6 +4,7 @@
 //! knowledge (the builtin signatures and the signal catalogue) and classifiers
 //! (`zeta_dsp::classifiers`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::stream_in::StreamInStage;
-use zeta_core::types::{Hz, SourceId};
+use zeta_core::types::{Hz, SourceId, SourcePosition};
 use zeta_ext::{ExternalDecodeStage, ModesHandle};
 use zeta_plugin::host::PluginCommand;
 use zeta_source_file::{FileOpts, FileSource};
@@ -348,6 +349,7 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 pub async fn open(
     state_dir: PathBuf,
     sources: &[SourceSpec],
+    source_positions: BTreeMap<SourceId, SourcePosition>,
     plugins: &[PluginSpec],
     resume: bool,
     ring_budget_mb: Option<u64>,
@@ -364,6 +366,7 @@ pub async fn open(
         modes,
         modes_dir,
         sources,
+        source_positions,
         resume,
         ring_budget_mb,
         burst_policy,
@@ -426,6 +429,7 @@ pub async fn open_with(
     modes: Arc<ModeRegistry>,
     modes_dir: Option<PathBuf>,
     sources: &[SourceSpec],
+    source_positions: BTreeMap<SourceId, SourcePosition>,
     resume: bool,
     ring_budget_mb: Option<u64>,
     burst_policy: BurstPolicy,
@@ -437,6 +441,7 @@ pub async fn open_with(
         modes,
         modes_dir,
         sources,
+        source_positions,
         resume,
         ring_budget_mb,
         burst_policy,
@@ -461,6 +466,7 @@ async fn open_into(
     modes: Arc<ModeRegistry>,
     modes_dir: Option<PathBuf>,
     sources: &[SourceSpec],
+    source_positions: BTreeMap<SourceId, SourcePosition>,
     resume: bool,
     ring_budget_mb: Option<u64>,
     burst_policy: BurstPolicy,
@@ -540,6 +546,7 @@ async fn open_into(
         backends.push(Backend::Gpu);
     }
     let cfg = NodeConfig {
+        source_positions,
         burst_policy,
         state_dir,
         ring_seconds: 10.0,

@@ -23,6 +23,10 @@ pub async fn run(
     remote: Option<NodeClient>,
     state_dir: PathBuf,
     sources: &[SourceSpec],
+    source_positions: std::collections::BTreeMap<
+        zeta_core::types::SourceId,
+        zeta_core::types::SourcePosition,
+    >,
     plugins: &[PluginSpec],
     ring_budget_mb: Option<u64>,
     burst_policy: zeta_core::bursts::BurstPolicy,
@@ -73,6 +77,7 @@ pub async fn run(
             let opened = node_setup::open(
                 state_dir,
                 sources,
+                source_positions,
                 plugins,
                 false,
                 ring_budget_mb,

@@ -56,6 +56,7 @@ async fn main() -> ExitCode {
         Err(cli) => cli,
     };
     let (sources, plugins) = (cli.sources(), cli.plugins.clone());
+    let source_positions = cli.source_positions();
     let mut burst_policy = cli.burst_policy();
     let state_dir = match cli.state_dir.map_or_else(node_setup::default_state_dir, Ok) {
         Ok(d) => d,
@@ -147,6 +148,7 @@ async fn main() -> ExitCode {
     let (node, remotes) = match node_setup::open(
         state_dir.clone(),
         &sources,
+        source_positions,
         &plugins,
         op.is_none(),
         cli.ring_budget_mb,

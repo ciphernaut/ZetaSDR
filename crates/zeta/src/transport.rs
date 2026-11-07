@@ -40,6 +40,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
     }
     if matches!(cli.command, Command::Ask(_)) {
         let (sources, plugins) = (cli.sources(), cli.plugins.clone());
+        let source_positions = cli.source_positions();
         let burst_policy = cli.burst_policy();
         let Command::Ask(args) = cli.command else {
             unreachable!("matched above")
@@ -57,6 +58,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             None,
             state_dir,
             &sources,
+            source_positions,
             &plugins,
             cli.ring_budget_mb,
             burst_policy,
@@ -110,6 +112,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
             Some(client),
             PathBuf::new(),
             &[],
+            Default::default(),
             &[],
             None,
             Default::default(),

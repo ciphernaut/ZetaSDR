@@ -41,6 +41,7 @@ async fn node_over_with(
     let mut reg = StageRegistry::new();
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 600.0,

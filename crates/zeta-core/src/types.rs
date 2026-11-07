@@ -25,7 +25,9 @@ pub struct Span {
 
 macro_rules! ulid_id {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+        #[derive(
+            Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+        )]
         pub struct $name(pub String);
 
         impl $name {
@@ -127,6 +129,29 @@ pub(crate) fn nullable<T: JsonSchema>(g: &mut schemars::SchemaGenerator) -> sche
     };
     s.insert("type".into(), serde_json::Value::Array(ty));
     s
+}
+
+/// Where a source is, in degrees and metres.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SourcePosition {
+    pub lat: f64,
+    pub lon: f64,
+    /// Altitude in metres; `null` when not known.
+    #[schemars(required, schema_with = "nullable::<f64>")]
+    pub alt_m: Option<f64>,
+    pub from: PositionFrom,
+}
+
+/// Where a [`SourcePosition`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionFrom {
+    /// The source reported it itself (a KiwiSDR's status page).
+    Status,
+    /// The operator configured it (`--source-position`).
+    Configured,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

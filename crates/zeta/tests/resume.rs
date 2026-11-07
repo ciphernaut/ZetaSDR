@@ -36,6 +36,7 @@ fn modes() -> zeta_core::modes::ModeRegistry {
 
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,

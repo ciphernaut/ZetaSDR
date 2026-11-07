@@ -45,6 +45,7 @@ async fn live_llm_tunes_a_source() {
         stats: None,
         worker: None,
         ring: None,
+        position: None,
     }]);
     let tuning = OpResult::Tuning(Tuning {
         center_hz: Hz(101_500_000),

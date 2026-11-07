@@ -14,6 +14,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use zeta_core::types::{PositionFrom, SourcePosition};
 use zeta_source_node::NODE_DEFAULT_MAX_BANDWIDTH_HZ;
 
 /// One source to attach to the node.
@@ -241,6 +242,38 @@ fn parse_kiwi_with(s: &str, env: impl Fn(&str) -> Option<String>) -> Result<Sour
         port,
         password,
     })
+}
+
+/// `--source-position`: `ID=LAT,LON[,ALT_M]` (degrees, metres). Whether the id names a
+/// source is checked by the caller, which knows them all.
+pub fn parse_source_position(s: &str) -> Result<(String, SourcePosition), String> {
+    let bad = || format!("expected ID=LAT,LON[,ALT_M], got {s:?}");
+    let (id, rest) = split_id(s).ok_or_else(bad)?;
+    let nums: Vec<f64> = rest
+        .split(',')
+        .map(|n| n.trim().parse::<f64>().ok().filter(|v| v.is_finite()))
+        .collect::<Option<_>>()
+        .ok_or_else(bad)?;
+    let (lat, lon, alt_m) = match nums[..] {
+        [lat, lon] => (lat, lon, None),
+        [lat, lon, alt] => (lat, lon, Some(alt)),
+        _ => return Err(bad()),
+    };
+    if !(-90.0..=90.0).contains(&lat) {
+        return Err("lat out of range".into());
+    }
+    if !(-180.0..=180.0).contains(&lon) {
+        return Err("lon out of range".into());
+    }
+    Ok((
+        id.into(),
+        SourcePosition {
+            lat,
+            lon,
+            alt_m,
+            from: PositionFrom::Configured,
+        },
+    ))
 }
 
 /// The variable holding node source `id`'s secret: `ZETA_NODE_SECRET_<ID>`, mapped as
@@ -686,5 +719,38 @@ mod tests {
         assert_eq!(e, "--source-node pi: set ZETA_NODE_SECRET_PI");
         let e = node_secret_with("pi", |_| Some(String::new())).unwrap_err();
         assert!(e.contains("ZETA_NODE_SECRET_PI"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    #[test]
+    fn source_position_parses_with_and_without_altitude() {
+        let (id, p) = parse_source_position("k=-27.3842,153.1175,4").unwrap();
+        assert_eq!(id, "k");
+        assert_eq!(
+            p,
+            SourcePosition {
+                lat: -27.3842,
+                lon: 153.1175,
+                alt_m: Some(4.0),
+                from: PositionFrom::Configured
+            }
+        );
+        let (_, p) = parse_source_position("k=-27.3842,153.1175").unwrap();
+        assert_eq!(p.alt_m, None);
+    }
+
+    #[test]
+    fn source_position_refuses_bad_values() {
+        let e = |s: &str| parse_source_position(s).unwrap_err();
+        assert_eq!(e("k=-91,0"), "lat out of range");
+        assert_eq!(e("k=0,181"), "lon out of range");
+        assert_eq!(e("k=0"), "expected ID=LAT,LON[,ALT_M], got \"k=0\"");
+        assert!(e("=0,0").starts_with("expected ID=LAT,LON[,ALT_M]"));
+        assert!(e("k=a,0").starts_with("expected ID=LAT,LON[,ALT_M]"));
+        assert!(e("k=0,0,1,2").starts_with("expected ID=LAT,LON[,ALT_M]"));
     }
 }

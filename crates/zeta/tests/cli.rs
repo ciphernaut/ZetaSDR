@@ -3443,3 +3443,45 @@ fn bursts_keep_flags_reach_the_store() {
         assert!(String::from_utf8_lossy(&out).contains(name));
     }
 }
+
+#[test]
+fn source_position_flag_shows_in_source_list_and_refuses_unknown_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(
+        dir.path(),
+        &[
+            "--source-position",
+            "tone=-27.3842,153.1175,4",
+            "source",
+            "list",
+        ],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(
+        v["value"][0]["position"],
+        serde_json::json!({"lat": -27.3842, "lon": 153.1175, "alt_m": 4.0, "from": "configured"})
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    zeta(
+        dir.path(),
+        &["--source-position", "nope=0,0", "source", "list"],
+    )
+    .assert()
+    .code(1)
+    .stderr(contains("--source-position: unknown source nope"));
+
+    let dir = tempfile::tempdir().unwrap();
+    zeta(
+        dir.path(),
+        &["--source-position", "tone=-91,0", "source", "list"],
+    )
+    .assert()
+    .code(1)
+    .stderr(contains("--source-position: lat out of range"));
+}

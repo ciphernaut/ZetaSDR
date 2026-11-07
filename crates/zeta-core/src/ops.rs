@@ -65,7 +65,9 @@ pub enum Op {
     /// process the source runs in (`pid`, `restarts`, `since_ns`; `null` for a
     /// source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
     /// before the first block; a `classify` or `iq_read` span older than it fails
-    /// `too_old`). Jobs on a faulted source fail with
+    /// `too_old`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
+    /// source reported it, `configured` from `--source-position`) where the source knows
+    /// where it is, `null` otherwise. Jobs on a faulted source fail with
     /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,
     /// `job_start`) clears it. A channelised job's `job_context` holds `channel.path`:
     /// `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
@@ -1784,6 +1786,15 @@ pub struct SourceInfo {
     #[serde(default)]
     #[schemars(required, schema_with = "crate::types::nullable::<RingInfo>")]
     pub ring: Option<RingInfo>,
+    /// Where the source itself is (`Port::position`, a KiwiSDR's status page) or was
+    /// configured to be (`--source-position`); `null` when unknown. A signal heard
+    /// through a remote source was received there, not at the station.
+    #[serde(default)]
+    #[schemars(
+        required,
+        schema_with = "crate::types::nullable::<crate::types::SourcePosition>"
+    )]
+    pub position: Option<crate::types::SourcePosition>,
 }
 
 /// Schemars omits a serde-defaulted field from `required`, and `#[schemars(required)]`
@@ -1796,7 +1807,7 @@ fn require_worker(schema: &mut schemars::Schema) {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
     {
-        for field in ["worker", "ring"] {
+        for field in ["worker", "ring", "position"] {
             if !req.iter().any(|r| r == field) {
                 req.push(field.into());
             }
@@ -2890,6 +2901,7 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                     gain: node.port(&id).and_then(|p| p.gain()),
                     stats: node.port(&id).and_then(|p| p.stats()),
                     worker: node.port(&id).and_then(|p| p.worker()),
+                    position: node.source_position(&id),
                     ring: node.ring(&id).map(|r| RingInfo {
                         seconds: r.read().unwrap().capacity_seconds(),
                     }),

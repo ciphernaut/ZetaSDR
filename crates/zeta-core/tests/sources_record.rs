@@ -10,7 +10,7 @@ use zeta_core::node::{Node, NodeConfig, load_source};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::port::{IqReceiver, Port, PortError, Tuning, WorkerInfo};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Capabilities, SourceId};
+use zeta_core::types::{Capabilities, PositionFrom, SourceId, SourcePosition};
 use zeta_source_file::{FileOpts, FileSource, fixtures};
 
 /// A recording that claims to run in a child process, as a Soapy worker port does.
@@ -44,6 +44,7 @@ impl Port for WorkerFixture {
 
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
@@ -157,4 +158,107 @@ fn a_format_1_record_from_before_capabilities_loads_with_none_and_its_pin() {
         })
     );
     assert_eq!(rec.gain.and_then(|g| g.db), Some(40.0));
+}
+
+/// A recording that also reports a position of its own, as a KiwiSDR with GPS does.
+struct Located(FileSource);
+
+#[async_trait]
+impl Port for Located {
+    fn id(&self) -> &SourceId {
+        self.0.id()
+    }
+    fn capabilities(&self) -> &Capabilities {
+        self.0.capabilities()
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        self.0.tune(t).await
+    }
+    fn current(&self) -> Option<Tuning> {
+        self.0.current()
+    }
+    fn subscribe(&self) -> IqReceiver {
+        self.0.subscribe()
+    }
+    fn position(&self) -> Option<SourcePosition> {
+        Some(SourcePosition {
+            lat: -27.0,
+            lon: 153.0,
+            alt_m: Some(10.0),
+            from: PositionFrom::Status,
+        })
+    }
+}
+
+fn brisbane() -> SourcePosition {
+    SourcePosition {
+        lat: -27.3842,
+        lon: 153.1175,
+        alt_m: Some(4.0),
+        from: PositionFrom::Configured,
+    }
+}
+
+#[tokio::test]
+async fn source_list_reports_a_configured_position_and_null_without() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(file(dir.path()))],
+    )
+    .await
+    .unwrap();
+    let json = serde_json::to_value(sources(&node).await).unwrap();
+    assert!(json[0]["position"].is_null(), "{json}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = cfg(dir.path());
+    c.source_positions
+        .insert(SourceId("file0".into()), brisbane());
+    let node = Node::open(c, registry(), vec![Arc::new(file(dir.path()))])
+        .await
+        .unwrap();
+    let json = serde_json::to_value(sources(&node).await).unwrap();
+    assert_eq!(
+        json[0]["position"],
+        serde_json::json!({"lat": -27.3842, "lon": 153.1175, "alt_m": 4.0, "from": "configured"})
+    );
+
+    // A port's own position wins over the configured one.
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = cfg(dir.path());
+    c.source_positions
+        .insert(SourceId("file0".into()), brisbane());
+    let node = Node::open(c, registry(), vec![Arc::new(Located(file(dir.path())))])
+        .await
+        .unwrap();
+    let json = serde_json::to_value(sources(&node).await).unwrap();
+    assert_eq!(
+        json[0]["position"],
+        serde_json::json!({"lat": -27.0, "lon": 153.0, "alt_m": 10.0, "from": "status"})
+    );
+}
+
+#[tokio::test]
+async fn the_schema_lists_position_as_nullable() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(file(dir.path()))],
+    )
+    .await
+    .unwrap();
+    let schema = node.schema();
+    let si = &schema["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"position".into()),
+        "{si}"
+    );
+    let ty = si["properties"]["position"]["type"].to_string();
+    assert!(ty.contains("null"), "{si}");
 }

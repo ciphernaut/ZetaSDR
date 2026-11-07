@@ -84,6 +84,7 @@ pub async fn spawn_with(dir: &Path, opts: TestOpts) -> TestServer {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
     let cfg = NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 10.0,

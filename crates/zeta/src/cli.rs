@@ -41,6 +41,14 @@ pub struct Cli {
         value_name = "ID=HOST:PORT[/PASSWORD]"
     )]
     source_kiwi: Vec<String>,
+    /// Say where source <ID> is, in degrees and metres (repeatable); a source that reports
+    /// its own position (a KiwiSDR with GPS) overrides it. The station stays the node's
+    #[arg(
+        long = "source-position",
+        global = true,
+        value_name = "ID=LAT,LON[,ALT_M]"
+    )]
+    source_position: Vec<String>,
     /// Use source SOURCE of the ZetaSDR node at URL (http://HOST:PORT) as source <ID>
     /// (repeatable). Its secret comes from ZETA_NODE_SECRET_<ID> (ID upper-cased, other
     /// characters as `_`) and is never printed. Requests are capped at 250000 Hz wide
@@ -81,6 +89,9 @@ pub struct Cli {
     /// `try_parse_checked`).
     #[arg(skip)]
     sources: Vec<SourceSpec>,
+    /// Every `--source-position` parsed (filled by `try_parse_checked`).
+    #[arg(skip)]
+    source_positions: std::collections::BTreeMap<SourceId, zeta_core::types::SourcePosition>,
     /// Memory budget in MB for one source's IQ ring (default: a quarter of RAM, at most 4 GiB)
     #[arg(long, global = true, env = "ZETA_RING_BUDGET_MB", value_name = "MB")]
     pub ring_budget_mb: Option<u64>,
@@ -228,6 +239,24 @@ impl Cli {
                 );
             }
         }
+        for raw in std::mem::take(&mut self.source_position) {
+            let (id, pos) = match sources::parse_source_position(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    return err(
+                        ErrorKind::ValueValidation,
+                        format!("--source-position: {e}"),
+                    );
+                }
+            };
+            if !ids.contains(id.as_str()) {
+                return err(
+                    ErrorKind::ValueValidation,
+                    format!("--source-position: unknown source {id}"),
+                );
+            }
+            self.source_positions.insert(SourceId(id), pos);
+        }
         let mut kinds = std::collections::HashSet::new();
         for p in &self.plugins {
             if !kinds.insert(&p.kind) {
@@ -246,6 +275,13 @@ impl Cli {
     /// then `--source-node`, then `--source-vrt`, each in flag order.
     pub fn sources(&self) -> Vec<SourceSpec> {
         self.sources.clone()
+    }
+
+    /// The `--source-position` entries, by source id.
+    pub fn source_positions(
+        &self,
+    ) -> std::collections::BTreeMap<SourceId, zeta_core::types::SourcePosition> {
+        self.source_positions.clone()
     }
 
     /// Whether any flag that configures the local node (sources, plugins, state dir, modes

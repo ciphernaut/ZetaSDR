@@ -268,4 +268,8 @@ pub trait Port: Send + Sync {
     fn worker(&self) -> Option<WorkerInfo> {
         None
     }
+    /// What the port itself knows about where it is; never the configured flag.
+    fn position(&self) -> Option<crate::types::SourcePosition> {
+        None
+    }
 }

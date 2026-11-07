@@ -89,6 +89,7 @@ async fn a_capture_job_ends_stopped_with_its_records_in_the_store() {
     registry.register(Arc::new(PassthroughStage::new()));
     zeta_dsp::register_all(&mut registry);
     let cfg = NodeConfig {
+        source_positions: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 4.0,
         ring_budget_bytes: u64::MAX,
@@ -195,6 +196,7 @@ async fn a_hand_capture_classifies_its_first_window_and_a_watch_child_does_not()
     registry.register(Arc::new(PassthroughStage::new()));
     zeta_dsp::register_all(&mut registry);
     let cfg = NodeConfig {
+        source_positions: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 4.0,
         ring_budget_bytes: u64::MAX,

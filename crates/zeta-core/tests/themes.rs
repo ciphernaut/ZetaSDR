@@ -335,6 +335,7 @@ async fn themes_list_answers_every_theme() {
     std::fs::create_dir_all(&bad).unwrap();
     std::fs::write(bad.join("theme.json"), r#"{"id":"broken","bogus":1}"#).unwrap();
     let cfg = NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,

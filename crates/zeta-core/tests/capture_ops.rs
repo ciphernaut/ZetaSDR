@@ -17,6 +17,7 @@ const POCSAG_HZ: u64 = 148_637_500;
 
 async fn open(dir: &Path) -> Node {
     let cfg = NodeConfig {
+        source_positions: Default::default(),
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
