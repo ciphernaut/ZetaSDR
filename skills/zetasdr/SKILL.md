@@ -680,6 +680,12 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.preamble: any (optional, default null)
 - params.whitening: any (optional, default "none")
 
+### frame_parse
+
+- inputs: event
+- outputs: event
+- params.parser: string
+
 ### fsk_demod
 
 - inputs: iq
