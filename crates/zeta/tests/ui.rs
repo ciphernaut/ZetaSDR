@@ -446,6 +446,17 @@ fn fake_subjects_lines() -> String {
 const FAKE_FOLD_LINES: &str = "{\"id\":\"S1\",\"alt\":1000}\n{\"id\":\"S2\",\"alt\":2000}\n\
 {\"id\":\"S1\",\"alt\":1100}\n{\"id\":\"S2\",\"alt\":2100}\n{\"id\":\"S2\",\"alt\":2200}";
 
+/// `fake_acars`'s lines: VH-ZET twice, VH-ABC once.
+const FAKE_ACARS_LINES: &str = "{\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"label\":\"H1\",\"text\":\"one\"}\n\
+{\"reg\":\"VH-ABC\",\"flight\":\"ABC1\",\"label\":\"Q0\",\"text\":\"link test\"}\n\
+{\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"label\":\"H1\",\"text\":\"two\"}";
+
+/// `fake_vdl2`'s lines: 7C0000 (`reg` VH-ZET, so one aircraft with `fake_acars`'s VH-ZET)
+/// twice, 7C0001 with no `reg` once.
+const FAKE_VDL2_LINES: &str = "{\"icao\":\"7C0000\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"alpha\"}\n\
+{\"icao\":\"7C0001\",\"reg\":null,\"flight\":\"QFA9\",\"text\":\"gamma\"}\n\
+{\"icao\":\"7C0000\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"beta\"}";
+
 /// A modes directory under `dir` holding the fake rows and their lines files; its path.
 fn fake_modes(dir: &Path) -> PathBuf {
     use serde_json::json;
@@ -455,6 +466,10 @@ fn fake_modes(dir: &Path) -> PathBuf {
     std::fs::write(&subjects_file, fake_subjects_lines()).expect("write fake_subjects.lines");
     let fold_file = dir.join("fake_fold.lines");
     std::fs::write(&fold_file, FAKE_FOLD_LINES).expect("write fake_fold.lines");
+    let acars_file = dir.join("fake_acars.lines");
+    std::fs::write(&acars_file, FAKE_ACARS_LINES).expect("write fake_acars.lines");
+    let vdl2_file = dir.join("fake_vdl2.lines");
+    std::fs::write(&vdl2_file, FAKE_VDL2_LINES).expect("write fake_vdl2.lines");
     let number = json!({"type": ["number", "null"]});
     let text = json!({"type": ["string", "null"]});
     let rows = [
@@ -507,6 +522,61 @@ fn fake_modes(dir: &Path) -> PathBuf {
                 "columns": [{"field": "alt", "label": "Altitude", "unit": "m"}],
                 "heading": null,
                 "label": null,
+            }),
+        ),
+        // Two links to the same aircraft, one table on the page by `reg` (plan 30 spec 4.8).
+        fake_subject_row(
+            "fake_acars",
+            &acars_file,
+            json!({
+                "schema": {"type": "object", "properties": {
+                    "reg": {"type": "string"},
+                    "flight": text,
+                    "label": text,
+                    "text": text,
+                }},
+                "summary": "{reg} {label?}: {text?}",
+            }),
+            serde_json::Value::Null,
+            json!({
+                "key": "reg",
+                "name": "aircraft",
+                "waterfall": "summary",
+                "columns": [
+                    {"field": "flight", "label": "Flight", "unit": null},
+                    {"field": "label", "label": "Label", "unit": null},
+                    {"field": "text", "label": "Text", "unit": null},
+                ],
+                "heading": null,
+                "label": "flight",
+                "merge": ["reg"],
+            }),
+        ),
+        fake_subject_row(
+            "fake_vdl2",
+            &vdl2_file,
+            json!({
+                "schema": {"type": "object", "properties": {
+                    "icao": {"type": "string"},
+                    "reg": text,
+                    "flight": text,
+                    "text": text,
+                }},
+                "summary": "{icao} {reg?} {text?}",
+            }),
+            serde_json::Value::Null,
+            json!({
+                "key": "icao",
+                "name": "aircraft",
+                "waterfall": "summary",
+                "columns": [
+                    {"field": "reg", "label": "Reg", "unit": null},
+                    {"field": "flight", "label": "Flight", "unit": null},
+                    {"field": "text", "label": "Text", "unit": null},
+                ],
+                "heading": null,
+                "label": "flight",
+                "merge": ["reg", "icao"],
             }),
         ),
     ];

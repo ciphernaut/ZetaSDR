@@ -52,6 +52,18 @@
 //     its rows keep their order (a header click sorts once, a new row goes last), resuming on
 //     leave. A press (`pointerdown`) on a row selects it, so a row moving cannot lose a click, and
 //     a selection (from here or the map) scrolls its row into view.
+//     One table across rows (plan 30 spec 4.8), a view over the per-job subjects: when two or
+//     more running jobs' rows declare `subject.merge` and share `subject.name`, one
+//     `section.subject-merged[data-name]` (MERGE_SECTION_CLASS) stands at the first one's place
+//     instead of their per-job sections, headed `<name>, N (<kind> <source>, ...)`. Its rows are
+//     groups of subjects (`mergeGroups`): two join when a field in either row's `merge`, the key
+//     included, has equal non-blank values in both. A group's state is its members' merged,
+//     newest last seen winning, its position the newest member's with one, `count` the sum,
+//     `dim` when all are. Its key column (`data-col` the first `merge` field) shows the first
+//     `merge` field the group has; then the union of the rows' columns, `Via` (the members'
+//     protocols) and the usual tail. Its `tr.subject[data-job][data-key]` names the newest
+//     member, the one a press selects; it is `selected` when any member is. A job alone in its
+//     name, or whose row has no `merge`, keeps its own section.
 //     Redrawn at most every RENDER_MS on a change, and each second; not at all while hidden (the
 //     `hidden` attribute, or the narrow footprint's other tab), so whoever shows it calls render.
 //     Cells are written only when they differ, so a tooltip outlives a redraw. All text by
@@ -69,6 +81,7 @@ import { homeOf } from "./view.js";
 const TICK_MS = 1000;
 const RENDER_MS = 500;
 const SORT_STEP_MS = 10_000;
+const MERGE_SECTION_CLASS = "subject-merged";
 
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 
@@ -423,6 +436,79 @@ function setText(el, text, title = null) {
   if (title !== null && el.title !== title) el.title = title;
 }
 
+// ---- one table across rows (spec 4.8) ---------------------------------------------------
+
+const mergedId = (name) => `merged:${name}`;
+
+// A drawn row's identity in its section: a group's own id, else the subject's key.
+const idOf = (s) => s.id ?? s.key;
+
+// A subject's value of `field` as text, the key counting as its key field; null when absent,
+// blank or not a scalar.
+function fieldValue(s, field) {
+  const v = field === s.row.subject.key ? s.key : s.state[field];
+  if (!["string", "number", "boolean"].includes(typeof v)) return null;
+  const text = String(v).trim();
+  return text === "" ? null : text;
+}
+
+// The union of the rows' `merge` fields, in order.
+function mergeFields(rows) {
+  return [...new Set(rows.flatMap((row) => row.subject.merge ?? []))];
+}
+
+// The merged section's row: the union of the rows' columns by field, the first `merge` field's
+// left out (the key column shows it), so `subjectValues` fills a group's cells.
+function mergedRow(name, rows) {
+  const merge = mergeFields(rows);
+  const seen = new Set([merge[0]]);
+  const columns = [];
+  for (const c of rows.flatMap((row) => row.subject.columns)) {
+    if (seen.has(c.field)) continue;
+    seen.add(c.field);
+    columns.push(c);
+  }
+  return { subject: { key: merge[0], name, columns, merge, label: null } };
+}
+
+// A group of subjects as one: shaped as a subject, naming its newest member.
+function groupOf(members, fields, row) {
+  members.sort((a, b) => a.last_seen - b.last_seen);
+  const newest = members[members.length - 1];
+  const state = Object.create(null);
+  for (const m of members) Object.assign(state, m.state);
+  const fixed = members.filter((m) => m.position);
+  const newestFirst = [...members].reverse();
+  let keyText = newest.key;
+  for (const f of fields) {
+    const v = newestFirst.map((m) => fieldValue(m, f)).find((x) => x !== null);
+    if (v !== undefined) {
+      keyText = v;
+      break;
+    }
+  }
+  return {
+    id: members.map((m) => `${m.job}\u0001${m.key}`).sort()[0],
+    members,
+    job: newest.job,
+    key: newest.key,
+    keyText,
+    state,
+    position: fixed.length > 0 ? fixed[fixed.length - 1].position : null,
+    first_seen: Math.min(...members.map((m) => m.first_seen)),
+    last_seen: newest.last_seen,
+    count: members.reduce((n, m) => n + m.count, 0),
+    dim: members.every((m) => m.dim),
+    via: [...new Set(members.map((m) => m.row.protocol))].sort().join(", "),
+    row,
+  };
+}
+
+// A drawn row holds the selection: the subject, or any member of a group.
+function holds(s, sel) {
+  return !!sel && (s.members ?? [s]).some((m) => m.job === sel.job && m.key === sel.key);
+}
+
 export function mountSubjectsPane(el, store, view, opts = {}) {
   return new SubjectsPane(el, store, view, opts);
 }
@@ -435,10 +521,10 @@ class SubjectsPane {
     this.jobs = jobs;
     this.watching = watching;
     this.footprint = footprint;
-    // job id -> {el, h3, note, table, head, body, sig, rows: key -> tr, hover, order: the keys as
-    // last sorted}
+    // section id (a job id, or `merged:<name>`) -> {el, h3, note, table, head, body, sig,
+    // rows: row id -> tr, hover, order: the row ids as last sorted}
     this.sections = new Map();
-    this.sorts = new Map(); // job id -> {col, dir}
+    this.sorts = new Map(); // section id -> {col, dir}
     this.pending = null; // the throttled redraw's timer
     this.lastRender = 0;
     this.destroyed = false;
@@ -449,7 +535,7 @@ class SubjectsPane {
     store.onChange(() => this.schedule());
     store.onSelect((sel) => {
       this.render();
-      if (sel) this.sections.get(sel.job)?.rows.get(sel.key)?.scrollIntoView({ block: "nearest" });
+      if (sel) this.el.querySelector("tr.subject.selected")?.scrollIntoView({ block: "nearest" });
     });
     view.onChange((key) => {
       if (key === "home" || key === "subjects") this.render();
@@ -483,12 +569,14 @@ class SubjectsPane {
   click(ev) {
     const th = ev.target.closest("th[data-col]");
     if (!th) return;
-    const jobId = th.closest("section.subject-job").dataset.job;
+    const el = th.closest(`section.subject-job, section.${MERGE_SECTION_CLASS}`);
+    if (!el) return;
+    const id = el.classList.contains(MERGE_SECTION_CLASS) ? mergedId(el.dataset.name) : el.dataset.job;
     const col = th.dataset.col;
-    const cur = this.sorts.get(jobId);
-    this.sorts.set(jobId, { col, dir: cur && cur.col === col ? -cur.dir : 1 });
+    const cur = this.sorts.get(id);
+    this.sorts.set(id, { col, dir: cur && cur.col === col ? -cur.dir : 1 });
     // Asked for under the pointer: sorted once, then held as any other order.
-    const sec = this.sections.get(jobId);
+    const sec = this.sections.get(id);
     if (sec) sec.order = null;
     this.render();
   }
@@ -505,10 +593,11 @@ class SubjectsPane {
     return this.footprint() === "narrow" && document.documentElement.dataset.pane !== "subjects";
   }
 
-  // The table's columns for a job's row: {col, label, text(s, values), value(s)}.
-  columns(row) {
+  // The table's columns for a row: {col, label, text(s, values), value(s)}. `key` replaces the
+  // key column and `extra` goes after the row's own columns (the merged section's).
+  columns(row, { key = null, extra = [] } = {}) {
     const sub = row.subject;
-    const key = { col: sub.key, label: sub.key, text: (s) => s.key, value: (s) => s.key };
+    key ??= { col: sub.key, label: sub.key, text: (s) => s.key, value: (s) => s.key };
     const lastSeen = {
       col: "last_seen",
       label: "Last seen",
@@ -528,6 +617,7 @@ class SubjectsPane {
     const cols = [
       key,
       ...sub.columns.map(ofColumn),
+      ...extra,
       {
         col: "position",
         label: "Position",
@@ -557,17 +647,68 @@ class SubjectsPane {
     return cols;
   }
 
-  // The default order, or the job's sort over newest heard first, a tie keeping that order.
-  sorted(jobId, cols) {
-    const subjects = this.store.list(jobId).reverse();
-    const wanted = this.sorts.get(jobId);
+  // The merged section's columns for `row` (`mergedRow`): the key column showing the first
+  // `merge` field a group has, the row's, then `Via`.
+  mergedColumns(row) {
+    const merge = row.subject.merge;
+    const key = { col: merge[0], label: merge.join(" / "), text: (g) => g.keyText, value: (g) => g.keyText };
+    const via = { col: "via", label: "Via", text: (g) => g.via, value: (g) => g.via };
+    return this.columns(row, { key, extra: [via] });
+  }
+
+  // The rows of the merged section: the subjects of `jobs` (rows with a `merge`, one
+  // `subject.name`) joined by union-find, two subjects one group when a field in either row's
+  // `merge` has equal non-blank values in both; each group as `groupOf`, drawn by `row`.
+  mergeGroups(jobs, row) {
+    const subjects = jobs.flatMap((j) => this.store.list(j.id));
+    const fields = row.subject.merge;
+    const parent = subjects.map((_, i) => i);
+    const find = (i) => {
+      while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+      return i;
+    };
+    const union = (a, b) => {
+      parent[find(a)] = find(b);
+    };
+    // `field value` -> the first subject whose row merges on `field` and has `value`: every
+    // later one with that value, merging on it or not, joins it.
+    const owners = new Map();
+    const at = (f, v) => `${f}\u0000${v}`;
+    subjects.forEach((s, i) => {
+      for (const f of s.row.subject.merge ?? []) {
+        const v = fieldValue(s, f);
+        if (v === null) continue;
+        if (owners.has(at(f, v))) union(i, owners.get(at(f, v)));
+        else owners.set(at(f, v), i);
+      }
+    });
+    subjects.forEach((s, i) => {
+      for (const f of fields) {
+        const v = fieldValue(s, f);
+        if (v !== null && owners.has(at(f, v))) union(i, owners.get(at(f, v)));
+      }
+    });
+    const groups = new Map(); // root -> members
+    subjects.forEach((s, i) => {
+      const root = find(i);
+      if (!groups.has(root)) groups.set(root, []);
+      groups.get(root).push(s);
+    });
+    return [...groups.values()].map((members) => groupOf(members, fields, row));
+  }
+
+  // The default order, or the section's sort over `items` (newest heard first), a tie keeping
+  // that order.
+  sorted(id, items, cols) {
+    const wanted = this.sorts.get(id);
     const col = wanted && cols.find((c) => c.col === wanted.col);
     if (!col) {
       const step = (s) => Math.floor(s.last_seen / SORT_STEP_MS);
-      return subjects.sort((a, b) => step(b) - step(a) || a.key.localeCompare(b.key));
+      const name = (s) => s.keyText ?? s.key;
+      return items.sort((a, b) => step(b) - step(a) || name(a).localeCompare(name(b)));
     }
     const sort = wanted;
-    return subjects
+    return items
       .map((s) => ({ s, v: col.value(s) }))
       .sort((a, b) => {
         const an = a.v === null || a.v === undefined;
@@ -578,26 +719,33 @@ class SubjectsPane {
       .map((x) => x.s);
   }
 
-  // The sorted subjects in the order the pointer is holding, a new row last; else as sorted,
-  // which then is the order to hold.
+  // The sorted rows in the order the pointer is holding, a new row last; else as sorted, which
+  // then is the order to hold.
   held(sec, subjects) {
     if (!sec.hover || !sec.order) {
-      sec.order = subjects.map((s) => s.key);
+      sec.order = subjects.map(idOf);
       return subjects;
     }
-    const at = new Map(sec.order.map((key, i) => [key, i]));
-    const place = (s) => at.get(s.key) ?? at.size;
+    const at = new Map(sec.order.map((id, i) => [id, i]));
+    const place = (s) => at.get(idOf(s)) ?? at.size;
     const kept = subjects.sort((a, b) => place(a) - place(b));
-    sec.order = kept.map((s) => s.key);
+    sec.order = kept.map(idOf);
     return kept;
   }
 
-  section(jobId) {
-    let sec = this.sections.get(jobId);
+  // The section `id`, made on first use: a job's (`subject-job[data-job]`), or with `name` the
+  // merged one (`subject-merged[data-name]`).
+  section(id, name = null) {
+    let sec = this.sections.get(id);
     if (sec) return sec;
     const el = document.createElement("section");
-    el.className = "subject-job";
-    el.dataset.job = jobId;
+    if (name === null) {
+      el.className = "subject-job";
+      el.dataset.job = id;
+    } else {
+      el.className = MERGE_SECTION_CLASS;
+      el.dataset.name = name;
+    }
     const h3 = document.createElement("h3");
     const note = document.createElement("div");
     note.className = "not-watched";
@@ -617,15 +765,12 @@ class SubjectsPane {
       sec.hover = false;
       this.render();
     });
-    this.sections.set(jobId, sec);
+    this.sections.set(id, sec);
     return sec;
   }
 
-  drawSection(sec, job, row, subjects, cols, watched) {
-    setText(
-      sec.h3,
-      `${job.kind} ${job.source}, ${subjects.length} ${row.subject.name}`,
-    );
+  drawSection(sec, heading, subjects, cols, watched) {
+    setText(sec.h3, heading);
     if (watched) sec.note.remove();
     else if (!sec.note.isConnected) sec.h3.after(sec.note);
     sec.table.hidden = subjects.length === 0;
@@ -645,29 +790,30 @@ class SubjectsPane {
       sec.body.replaceChildren();
       sec.rows.clear();
     }
-    const keep = new Set(subjects.map((s) => s.key));
-    for (const [key, tr] of [...sec.rows]) {
-      if (keep.has(key)) continue;
+    const keep = new Set(subjects.map(idOf));
+    for (const [id, tr] of [...sec.rows]) {
+      if (keep.has(id)) continue;
       tr.remove();
-      sec.rows.delete(key);
+      sec.rows.delete(id);
     }
     const sel = this.store.selected();
     subjects.forEach((s, i) => {
-      let tr = sec.rows.get(s.key);
+      let tr = sec.rows.get(idOf(s));
       if (!tr) {
         tr = document.createElement("tr");
         tr.className = "subject";
-        tr.dataset.job = s.job;
-        tr.dataset.key = s.key;
         for (const c of cols) {
           const td = document.createElement("td");
           td.dataset.col = c.col;
           tr.append(td);
         }
-        sec.rows.set(s.key, tr);
+        sec.rows.set(idOf(s), tr);
       }
+      // A group's newest member can change under the same row.
+      if (tr.dataset.job !== s.job) tr.dataset.job = s.job;
+      if (tr.dataset.key !== s.key) tr.dataset.key = s.key;
       tr.classList.toggle("dim", s.dim);
-      tr.classList.toggle("selected", !!sel && sel.job === s.job && sel.key === s.key);
+      tr.classList.toggle("selected", holds(s, sel));
       const values = subjectValues(s);
       cols.forEach((c, n) => {
         const text = c.text(s, values);
@@ -677,34 +823,82 @@ class SubjectsPane {
     });
   }
 
+  drawJobSection(sec, { job, watched }) {
+    const row = this.store.rowOf(job.kind);
+    const cols = this.columns(row);
+    const subjects = this.held(sec, this.sorted(job.id, this.store.list(job.id).reverse(), cols));
+    this.drawSection(sec, `${job.kind} ${job.source}, ${subjects.length} ${row.subject.name}`, subjects, cols, watched);
+  }
+
+  drawMergedSection(sec, { id, name, members }) {
+    const row = mergedRow(
+      name,
+      members.map((x) => this.store.rowOf(x.job.kind)),
+    );
+    const cols = this.mergedColumns(row);
+    const groups = this.mergeGroups(
+      members.map((x) => x.job),
+      row,
+    ).sort((a, b) => b.last_seen - a.last_seen);
+    const subjects = this.held(sec, this.sorted(id, groups, cols));
+    const via = members.map((x) => `${x.job.kind} ${x.job.source}`).join(", ");
+    this.drawSection(sec, `${name}, ${subjects.length} (${via})`, subjects, cols, members.every((x) => x.watched));
+  }
+
+  // The sections to draw, in order: a job's own, or for the jobs whose rows declare `merge` and
+  // share a `subject.name`, two or more of them, one merged section at the first one's place.
+  // `wanted` is in the order of `subjectJobs()` save the not-watched last; a merged section's
+  // members keep `subjectJobs()`'s order.
+  parts(wanted, jobs) {
+    const order = new Map(jobs.map((j, i) => [j.id, i]));
+    const byName = new Map(); // subject.name -> the merging jobs' entries
+    for (const x of wanted) {
+      const sub = this.store.rowOf(x.job.kind).subject;
+      if ((sub.merge ?? []).length === 0) continue;
+      if (!byName.has(sub.name)) byName.set(sub.name, []);
+      byName.get(sub.name).push(x);
+    }
+    const parts = [];
+    for (const x of wanted) {
+      const name = this.store.rowOf(x.job.kind).subject.name;
+      const members = byName.get(name);
+      if (!members || members.length < 2 || !members.includes(x)) parts.push({ id: x.job.id, ...x });
+      else if (members[0] === x) {
+        members.sort((a, b) => order.get(a.job.id) - order.get(b.job.id));
+        parts.push({ id: mergedId(name), name, members });
+      }
+    }
+    return parts;
+  }
+
   render() {
     if (this.destroyed || this.isHidden()) return;
     this.lastRender = Date.now();
-    const wanted = this.subjectJobs()
-      .map((job) => ({ job, subjects: this.store.list(job.id), watched: this.watching(job.id) }))
+    const jobs = this.subjectJobs();
+    const wanted = jobs
+      .map((job) => ({ job, watched: this.watching(job.id) }))
       .filter(
         (x) =>
-          x.subjects.length > 0 ||
+          this.store.size(x.job.id) > 0 ||
           !x.watched ||
           this.store.rowOf(x.job.kind).subject.columns.length > 0,
       )
       .sort((a, b) => b.watched - a.watched);
-    const ids = new Set(wanted.map((x) => x.job.id));
+    const parts = this.parts(wanted, jobs);
+    const ids = new Set(parts.map((p) => p.id));
     for (const [id, sec] of [...this.sections]) {
       if (ids.has(id)) continue;
       sec.el.remove();
       this.sections.delete(id);
     }
-    const listed = new Set((this.jobs() || []).map((j) => j.id));
+    const listed = new Set([...(this.jobs() || []).map((j) => j.id), ...ids]);
     for (const id of [...this.sorts.keys()]) {
       if (!listed.has(id)) this.sorts.delete(id);
     }
-    wanted.forEach(({ job, watched }, i) => {
-      const row = this.store.rowOf(job.kind);
-      const sec = this.section(job.id);
-      const cols = this.columns(row);
-      const subjects = this.held(sec, this.sorted(job.id, cols));
-      this.drawSection(sec, job, row, subjects, cols, watched);
+    parts.forEach((part, i) => {
+      const sec = this.section(part.id, part.name ?? null);
+      if (part.members) this.drawMergedSection(sec, part);
+      else this.drawJobSection(sec, part);
       if (this.el.children[i] !== sec.el) this.el.insertBefore(sec.el, this.el.children[i] || null);
     });
   }

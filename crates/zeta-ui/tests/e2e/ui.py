@@ -5084,6 +5084,38 @@ def scenario_subjects_name_the_jobs_not_watched(page, url, secret):
             stop_job(url, secret, job)
 
 
+def scenario_subjects_merge_across_rows(page, url, secret):
+    # Two links to the same aircraft (plan 30 spec 4.8): fake_acars keyed by `reg`, fake_vdl2
+    # by `icao` with a `reg`, both `merge` and both `aircraft`, so one table.
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    a = start_subject_job(page, url, secret, "fake_acars", bandwidth_hz=41_000)
+    v = start_subject_job(page, url, secret, "fake_vdl2", bandwidth_hz=42_000)
+    try:
+        open_subjects(page)
+        merged = page.locator("#subjects section.subject-merged")
+        expect(merged).to_have_count(1, timeout=10_000)
+        expect(page.locator("#subjects section.subject-job")).to_have_count(0)
+        expect(merged.locator("h3")).to_contain_text("aircraft, 3", timeout=10_000)
+        zet = merged.locator('tr.subject:has(td[data-col="reg"]:text-is("VH-ZET"))')
+        expect(zet).to_have_count(1)
+        expect(zet.locator('td[data-col="via"]')).to_have_text("fake_acars, fake_vdl2")
+        expect(zet.locator('td[data-col="count"]')).to_have_text("4")
+        expect(merged.locator("tr.subject")).to_have_count(3)  # VH-ZET, VH-ABC, 7C0001
+        # A header sorts the merged table as any other: by count ascending, VH-ZET last.
+        merged.locator('th[data-col="count"]').click()
+        last = merged.locator("tr.subject").last.locator('td[data-col="reg"]')
+        expect(last).to_have_text("VH-ZET")
+        zet.dispatch_event("pointerdown", {"button": 0})
+        expect(zet).to_have_class(re.compile(r"\bselected\b"))
+        assert not errors, f"console errors: {errors}"
+    finally:
+        http_json(url, secret, "/op", {"op": "job_stop", "job": v})
+    expect(page.locator("#subjects section.subject-merged")).to_have_count(0)
+    expect(page.locator('#subjects section.subject-job[data-job="%s"]' % a)).to_have_count(1)
+    http_json(url, secret, "/op", {"op": "job_stop", "job": a})
+
+
 # ---- the waterfall's one line (plan 23 Task 3) -----------------------------------------
 
 def scenario_summary_line_replaces_ribbons_per_aircraft(page, url, secret):

@@ -206,7 +206,7 @@ html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
    row sticks to it and its first column (the key) stays put when the rest is scrolled in. */
 #subjects { display: flex; flex-direction: column; }
 #subjects[hidden] { display: none; }
-#subjects .subject-job { flex: 0 1 auto; min-height: 0; margin: 4px 8px; overflow: auto; }
+#subjects .subject-job, #subjects .subject-merged { flex: 0 1 auto; min-height: 0; margin: 4px 8px; overflow: auto; }
 #subjects h3 { position: sticky; left: 0; margin: 4px 0; font-size: 12px; font-weight: normal; color: var(--accent); }
 #subjects .not-watched { position: sticky; left: 0; color: var(--error); font-size: 11px; }
 #subjects table { min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
