@@ -848,7 +848,7 @@ async fn a_watch_and_its_decoder_come_back_and_nothing_is_lost() {
     let node = Node::open(cfg(dir.path(), true), registry(), vec![port.clone()])
         .await
         .unwrap();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     src.start();

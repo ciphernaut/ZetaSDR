@@ -163,7 +163,7 @@ async fn node_unstarted(
     let port: Arc<dyn Port> = wrap(src.clone());
     let node = Node::open(cfg, registry(), vec![port]).await.unwrap();
     // The node subscribed (ring, bank) when the port was added: the caller starts it.
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     (node, src)
@@ -893,7 +893,7 @@ async fn accept_signature(
     let (m, iq) = zeta_core::capture::read_cf32(meta).unwrap();
     let second = &iq[..iq.len().min(m.sample_rate_hz.0 as usize)];
     let mut set = ClassifierSet::default();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         set.register(c);
     }
     let band = Band {

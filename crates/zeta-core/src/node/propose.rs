@@ -8,11 +8,15 @@
 //!   [`PROPOSE_CRC_FRAMES`] CRC-clean frames: a `hypotheses` event with a CRC candidate
 //!   that checks on that many, or that many `frame` events with `crc_ok`
 //!   ([`watch_for_proposals`]).
+//! - Every mode row's job is watched for the row's first proof, which supersedes the
+//!   accepted signatures it overlaps (`Inner::supersede_by`; a `learned_*` row's never
+//!   does).
 //!
 //! Each proposal publishes a `signature` event (`state: proposed`) and is noted to the
 //! job (`job_context.proposal`, or `job_context.capture.proposal` for a capture). Each
 //! of those jobs writes a [`Session`] at its end ([`record_session`]).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -30,12 +34,12 @@ use crate::knowledge::Allocation;
 use crate::modes::{Decoder, FRAME_DECODE_STAGE, ModeRow};
 use crate::ops::{BITS_KIND, CAPTURE_IN_STAGE, GRAPH_KIND, JobKind};
 use crate::sessions::{Outcome, Session};
-use crate::signatures::{NOISE_LABEL, NewSignature, PROPOSE_CRC_FRAMES, SignatureRecord};
+use crate::signatures::{
+    LEARNED_ROW_PREFIX, NOISE_LABEL, NewSignature, PROPOSE_CRC_FRAMES, SignatureRecord,
+};
 use crate::stream::{Frame, Payload};
 use crate::types::{Baud, Hz, Provenance, Span, StreamId, StreamKind, Timestamp};
 
-/// The id prefix of a mode row generated from a signature: its job never proposes.
-pub(crate) const LEARNED_ROW_PREFIX: &str = "learned_";
 /// A layer-2 decode label this sure proved its mode.
 const PROVED_CONFIDENCE: f32 = 1.0;
 /// How a layer-2 decode label's evidence opens (`decode <row>: ...`); a catalogue
@@ -260,13 +264,17 @@ fn publish(inner: &Inner, stream: StreamId, prov: Provenance, sig: &SignatureRec
         .publish(Frame::new(stream, prov, Payload::Event(payload)));
 }
 
+/// The mode row a `Mode` job of kind `kind` runs, if it runs one.
+fn mode_row(inner: &Inner, kind: &str) -> Option<ModeRow> {
+    match inner.expandable_kind(kind)? {
+        JobKind::Mode(id) => inner.modes().get(&id.0).map(|m| m.row.clone()),
+        _ => None,
+    }
+}
+
 /// The frame row `kind` names, if it names one.
-fn frame_row<'a>(inner: &'a Inner, kind: &str) -> Option<&'a ModeRow> {
-    inner
-        .modes
-        .get(kind)
-        .map(|m| &m.row)
-        .filter(|r| matches!(r.decoder, Decoder::Frame(_)))
+fn frame_row(inner: &Inner, kind: &str) -> Option<ModeRow> {
+    mode_row(inner, kind).filter(|r| matches!(r.decoder, Decoder::Frame(_)))
 }
 
 /// Whether the job `rec` watches its frames for a proposal: a `bits` or `graph` job, or
@@ -277,6 +285,13 @@ pub(super) fn proposes(inner: &Inner, rec: &JobRecord) -> bool {
         || (frame_row(inner, &rec.kind).is_some() && !rec.kind.starts_with(LEARNED_ROW_PREFIX))
 }
 
+/// Whether the job `rec`'s events are watched ([`watch_for_proposals`]): it
+/// [`proposes`], or it runs a mode row (whose first proof supersedes the accepted
+/// signatures it overlaps).
+pub(super) fn watches(inner: &Inner, rec: &JobRecord) -> bool {
+    proposes(inner, rec) || mode_row(inner, &rec.kind).is_some()
+}
+
 /// What set a job's proposal off.
 enum Trigger<'a> {
     /// A `hypotheses` event and its CRC candidate.
@@ -285,13 +300,44 @@ enum Trigger<'a> {
     Frames(u32),
 }
 
-/// For a job [`proposes`] says watches: watch `rec`'s `Event` outputs among `outputs`
-/// for [`PROPOSE_CRC_FRAMES`] CRC-clean frames, one task per output, each subscribed
-/// before this returns. A task ends once its job proposed (by any of its tasks, or an
-/// earlier run: `job_context.proposal`), when its stream is unregistered, or on `token`
-/// (draining what is buffered); it is not one of the job's stages. The tasks' handles:
-/// the job's supervisor awaits them (at most [`PROPOSAL_DRAIN_MS`]) before it writes
-/// the session record, so a proposal from the job's last events is in it.
+/// The first proof of a mode row's job, which supersedes the accepted signatures it
+/// overlaps ([`Inner::supersede_by`]): an event of the row's `protocol` (with
+/// `identify.proof: field`, one whose field is true). Shared by the job's watch tasks,
+/// so one run supersedes once.
+struct Proof {
+    protocol: String,
+    field: Option<String>,
+    seen: Arc<AtomicBool>,
+}
+
+impl Proof {
+    /// Whether the event `v` proves the row.
+    fn proves(&self, v: &Value) -> bool {
+        v["protocol"] == self.protocol.as_str()
+            && self.field.as_ref().is_none_or(|f| v[f.as_str()] == true)
+    }
+}
+
+/// What one watch task still looks for.
+struct Watch {
+    /// The mode row's first proof, while unseen (`None` for a job of no mode row).
+    proof: Option<Proof>,
+    /// Whether the job may still propose.
+    propose: bool,
+    /// The CRC-clean frames seen so far.
+    clean: u32,
+}
+
+/// For a job [`watches`] says is watched: watch `rec`'s `Event` outputs among
+/// `outputs`, one task per output, each subscribed before this returns, for
+/// [`PROPOSE_CRC_FRAMES`] CRC-clean frames when it [`proposes`] (and has not proposed:
+/// `job_context.proposal`) and, for a mode row's job, for the row's first proof (see
+/// [`Proof`]), which supersedes the accepted signatures it overlaps. A task ends once
+/// neither is left to see (the job proposed, by any of its tasks, and the proof was
+/// seen), when its stream is unregistered, or on `token` (draining what is buffered);
+/// it is not one of the job's stages. The tasks' handles: the job's supervisor awaits
+/// them (at most [`PROPOSAL_DRAIN_MS`]) before it writes the session record, so a
+/// proposal from the job's last events is in it.
 pub(super) fn watch_for_proposals(
     inner: &Arc<Inner>,
     rec: &JobRecord,
@@ -299,13 +345,28 @@ pub(super) fn watch_for_proposals(
     token: &CancellationToken,
 ) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
-    if !proposes(inner, rec) || proposal_of(&rec.context).is_some() {
+    let propose = proposes(inner, rec) && proposal_of(&rec.context).is_none();
+    let row = mode_row(inner, &rec.kind);
+    if !propose && row.is_none() {
         return handles;
     }
+    let seen = Arc::new(AtomicBool::new(false));
     let rec = Arc::new(rec.clone());
     for (_, sid) in outputs.iter().filter(|(k, _)| *k == StreamKind::Event) {
         let Some(mut rx) = inner.bus.subscribe(sid) else {
             continue;
+        };
+        let mut watch = Watch {
+            proof: row.as_ref().map(|r| Proof {
+                protocol: r.protocol.clone(),
+                field: match r.identify.proof {
+                    crate::modes::Proof::Field => r.identify.field.clone(),
+                    crate::modes::Proof::Event => None,
+                },
+                seen: seen.clone(),
+            }),
+            propose,
+            clean: 0,
         };
         // Weak: a watcher never keeps the node alive.
         let (inner, rec, sid, token) = (
@@ -315,8 +376,7 @@ pub(super) fn watch_for_proposals(
             token.clone(),
         );
         handles.push(tokio::spawn(async move {
-            let mut clean = 0u32;
-            let mut on = |frame: Frame| on_frame(&inner, &rec, &sid, &mut clean, frame);
+            let mut on = |frame: Frame| on_frame(&inner, &rec, &sid, &mut watch, frame);
             loop {
                 tokio::select! {
                     biased;
@@ -359,13 +419,13 @@ pub(super) async fn drain_watchers(watchers: Vec<JoinHandle<()>>) {
     }
 }
 
-/// One event of the job `rec`'s stream `sid`: propose when it is the trigger. Whether
-/// the watch is over.
+/// One event of the job `rec`'s stream `sid`: supersede when it is the mode row's first
+/// proof, propose when it is the trigger. Whether the watch is over.
 fn on_frame(
     inner: &Weak<Inner>,
     rec: &JobRecord,
     sid: &StreamId,
-    clean: &mut u32,
+    watch: &mut Watch,
     frame: Frame,
 ) -> bool {
     let Some(inner) = inner.upgrade() else {
@@ -374,6 +434,30 @@ fn on_frame(
     let Payload::Event(v) = &frame.payload else {
         return false;
     };
+    if let Some(proof) = &watch.proof {
+        if proof.proves(v) && !proof.seen.swap(true, Ordering::SeqCst) {
+            inner.supersede_by(&rec.kind, rec.tuning, now().0);
+        }
+        if proof.seen.load(Ordering::SeqCst) {
+            watch.proof = None;
+        }
+    }
+    if watch.propose && proposal_event(&inner, rec, sid, &mut watch.clean, &frame, v) {
+        watch.propose = false;
+    }
+    !watch.propose && watch.proof.is_none()
+}
+
+/// The event `v` (of `frame`) of the proposing job `rec`'s stream `sid`: propose when
+/// it is the trigger. Whether the job's proposal watch is over.
+fn proposal_event(
+    inner: &Inner,
+    rec: &JobRecord,
+    sid: &StreamId,
+    clean: &mut u32,
+    frame: &Frame,
+    v: &Value,
+) -> bool {
     let candidate;
     let trigger = if v["protocol"] == "hypotheses" {
         let found = v["crc_candidates"].as_array().and_then(|cs| {
@@ -399,8 +483,8 @@ fn on_frame(
     } else {
         return false;
     };
-    if proposal_of(&context_of(&inner, rec)).is_none() {
-        propose_for_job(&inner, rec, trigger, sid, frame.provenance.clone());
+    if proposal_of(&context_of(inner, rec)).is_none() {
+        propose_for_job(inner, rec, trigger, sid, frame.provenance.clone());
     }
     true
 }
@@ -477,7 +561,7 @@ fn propose_for_job(
     let features = first
         .as_ref()
         .and_then(|w| serde_json::from_value::<FeatureRecord>(w.features.clone()).ok())
-        .unwrap_or_else(|| tuning_features(rec, row));
+        .unwrap_or_else(|| tuning_features(rec, row.as_ref()));
     let modulation = rec.context["bits"]["modulation"]
         .as_str()
         .map(str::to_string)
@@ -503,7 +587,7 @@ fn propose_for_job(
             )
         }
         Trigger::Frames(n) => {
-            let framing = match row.map(|r| &r.decoder) {
+            let framing = match row.as_ref().map(|r| &r.decoder) {
                 Some(Decoder::Frame(b)) => b.framing.clone(),
                 _ => rec
                     .graph
@@ -642,7 +726,7 @@ pub(super) fn record_session(inner: &Inner, rec: &JobRecord) {
     s.features = match (first, row) {
         (Some(w), _) => w.features,
         (None, Some(row)) => {
-            serde_json::to_value(tuning_features(rec, Some(row))).unwrap_or_default()
+            serde_json::to_value(tuning_features(rec, Some(&row))).unwrap_or_default()
         }
         (None, None) => Value::Null,
     };

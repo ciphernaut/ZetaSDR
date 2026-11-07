@@ -172,8 +172,10 @@ impl Inner {
     /// `job`, `allocations`, `summary`): a proof's `<label> at <MHz>: <the decoder's
     /// summary>`, an unknown's `unknown at <MHz>: <label> <features>; register says ...`
     /// (with a learned match `learned <name> at <MHz>: <features>`) as the watch words it,
-    /// `center_hz` the measured centre.
-    fn verdict(&self, r: &Run, verdict: serde_json::Value, center_hz: u64) {
+    /// `center_hz` the measured centre. A proof (a `mode`) on the band `tuning` (the
+    /// proved child's) supersedes the accepted signatures it overlaps
+    /// ([`Inner::supersede_by`]).
+    fn verdict(&self, r: &Run, verdict: serde_json::Value, center_hz: u64, tuning: Tuning) {
         let v = &verdict["identify"]["verdict"];
         let at = format!("{:.4} MHz", center_hz as f64 / 1e6);
         let label = v["label"].as_str().unwrap_or("unknown");
@@ -192,6 +194,9 @@ impl Inner {
             ),
         };
         let t = now();
+        if let Some(mode) = v["mode"].as_str() {
+            self.supersede_by(mode, tuning, t.0);
+        }
         let payload = serde_json::json!({
             "protocol": "verdict",
             "mode": v["mode"],
@@ -339,7 +344,7 @@ impl Inner {
                 bin_rate,
                 None,
                 None,
-                &self.modes,
+                &self.modes(),
             )
             .map_err(|e| e.to_string())?;
         let rec = JobRecord {
@@ -560,7 +565,8 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
     };
     let allocation = |m: &LoadedMode| allocation_term(m, &allocations);
-    let scored = score_rows(&inner.modes, m_center, bw, &layer1, &|_| 0.0, &allocation);
+    let modes = inner.modes();
+    let scored = score_rows(&modes, m_center, bw, &layer1, &|_| 0.0, &allocation);
     let faulted = |f: String| StageError::Failed(source_fault_reason(r.port.id(), &f));
     let mut current = ChildGuard {
         inner: inner.clone(),
@@ -637,7 +643,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                     },
                     "attempts": attempts,
                 }});
-                inner.verdict(&r, verdict, m_center);
+                inner.verdict(&r, verdict, m_center, trial);
                 return Ok(());
             }
         }
@@ -660,7 +666,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         },
         "attempts": attempts,
     }});
-    inner.verdict(&r, verdict, m_center);
+    inner.verdict(&r, verdict, m_center, trial);
     Ok(())
 }
 

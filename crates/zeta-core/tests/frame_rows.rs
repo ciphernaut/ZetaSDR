@@ -141,7 +141,7 @@ async fn open(dir: &Path, modes_dir: &Path) -> Node {
     let src = Arc::new(FileSource::open(rx(), capture(), opts).unwrap());
     let port: Arc<dyn Port> = src.clone();
     let node = Node::open(cfg, stages(), vec![port]).await.unwrap();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     src.start();

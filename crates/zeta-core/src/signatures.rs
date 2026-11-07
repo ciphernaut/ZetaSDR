@@ -28,6 +28,13 @@ pub const CONFIDENCE_CRC: f32 = 0.9;
 pub const PROPOSE_CRC_FRAMES: u32 = 5;
 /// The layer-1 label of a window with no signal in it: nothing to propose.
 pub const NOISE_LABEL: &str = "noise";
+/// A mode row's proof supersedes an accepted signature whose band holds the proved
+/// band's centre when the proved band's width is within this range of times the
+/// signature's bandwidth.
+pub const SUPERSEDE_WIDTH_RANGE: (f64, f64) = (0.5, 2.0);
+/// The id prefix of a mode row generated from a signature ([`learned_row`]): its job
+/// never proposes, and its proof supersedes nothing.
+pub const LEARNED_ROW_PREFIX: &str = "learned_";
 
 /// Where a signature stands: `proposed` (waiting for the operator), `accepted`,
 /// `rejected`, or `superseded` (a mode row proved its band).
@@ -220,6 +227,99 @@ pub fn default_name(modulation: &str, bandwidth_hz: Hz, center_hz: Hz) -> String
         bandwidth_hz.0 as f64 / 1e3,
         center_hz.0 as f64 / 1e6
     )
+}
+
+/// A generated row's `identify`: how long `identify` waits for a CRC-clean frame, the
+/// shortest span `classify` tries it on, and the frames that prove it.
+const LEARNED_DWELL_MS: u64 = 10_000;
+const LEARNED_MIN_SPAN_MS: u64 = 1_000;
+const LEARNED_MIN_EVENTS: u32 = 1;
+/// A generated row's demodulator order when the record measured none.
+const LEARNED_DEFAULT_ORDER: u8 = 2;
+/// The `protocol`, quick attempt and parser of a generated row: `frame_decode`'s frames,
+/// read as they are.
+const FRAME_PROTOCOL: &str = "frame";
+const OPAQUE_PARSER: &str = "opaque";
+/// The boolean field of a `frame` event that proves a generated row.
+const CRC_OK_FIELD: &str = "crc_ok";
+
+/// The frame row generated from the framed signature `rec`, under the id `mode_id`
+/// (`learned_<id>`, the record's id lowercased): the record's band (its bandwidth, its
+/// centre the one well-known centre), its modulation (`fsk` also as `fm`, FSK heard
+/// through a discriminator), a frame decoder of the record's demodulator (`order` 2
+/// when the record has none; a label no demodulator takes reads as `fsk`) and framing
+/// with the `opaque` parser, `frame_decode`'s event schema, and proof by one
+/// CRC-clean frame. The operator may edit the file freely: it is never overwritten.
+pub fn learned_row(rec: &SignatureRecord, mode_id: &str) -> crate::modes::ModeRow {
+    use crate::bits::Modulation;
+    use crate::modes::{
+        Band, Decoder, Event, Family, FrameBlock, FrameDemod, Identify, ModeId, ModeRow, Proof,
+    };
+    let center = rec.min_hz.0 + (rec.max_hz.0 - rec.min_hz.0) / 2;
+    let mut modulation = vec![rec.modulation.clone()];
+    if rec.modulation == Modulation::Fsk.name() {
+        modulation.push("fm".into());
+    }
+    ModeRow {
+        id: ModeId(mode_id.into()),
+        name: rec.name.clone(),
+        family: Family::General,
+        band: Band {
+            bandwidth_hz: rec.bandwidth_hz.0,
+            centers_hz: vec![center],
+            min_hz: None,
+            range_hz: None,
+        },
+        modulation,
+        label: rec.name.clone(),
+        protocol: FRAME_PROTOCOL.into(),
+        decoder: Decoder::Frame(FrameBlock {
+            demod: FrameDemod {
+                modulation: Modulation::from_label(&rec.modulation).unwrap_or(Modulation::Fsk),
+                symbol_rate_baud: rec.symbol_rate_baud.map_or(0, |b| b.0),
+                order: rec.order.unwrap_or(LEARNED_DEFAULT_ORDER),
+                tone_spacing_hz: rec.tone_spacing_hz.map(|h| h.0),
+            },
+            framing: rec.framing.clone().unwrap_or(Value::Null),
+            parser: OPAQUE_PARSER.into(),
+        }),
+        event: Event {
+            schema: serde_json::json!({"type": "object", "properties": {
+                "protocol": {"type": "string"},
+                "sync": {"type": "string"},
+                "length_bytes": {"type": "integer"},
+                "bytes": {"type": "string"},
+                "crc_ok": {"type": "boolean"},
+                "payload": {"type": "string"},
+            }}),
+            summary: "frame {length_bytes} B".into(),
+        },
+        identify: Identify {
+            proof: Proof::Field,
+            field: Some(CRC_OK_FIELD.into()),
+            min_events: LEARNED_MIN_EVENTS,
+            dwell_ms: LEARNED_DWELL_MS,
+            min_span_ms: LEARNED_MIN_SPAN_MS,
+            quick: Some(FRAME_PROTOCOL.into()),
+            priority: 0,
+        },
+        catalogue: vec![],
+        test: None,
+        notes: Some(format!(
+            "generated from signature {}; edit freely (a parser, a subject); not overwritten",
+            rec.id
+        )),
+        position: None,
+        time: None,
+        subject: None,
+    }
+}
+
+/// Whether accepting `rec` writes its [`learned_row`]: a framing whose `crc` is set, and
+/// a symbol rate.
+pub fn writes_row(rec: &SignatureRecord) -> bool {
+    let crc = rec.framing.as_ref().and_then(|f| f.get("crc"));
+    crc.is_some_and(|c| !c.is_null()) && rec.symbol_rate_baud.is_some()
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

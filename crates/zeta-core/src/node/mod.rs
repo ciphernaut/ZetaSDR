@@ -27,7 +27,7 @@ use crate::graph::{self, Graph, GraphError};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{LeaseError, LeaseManager};
-use crate::modes::ModeRegistry;
+use crate::modes::{MODES_CHECKED_FILE, ModeRegistry, ModesHandle};
 use crate::ops::{
     FM_DEVIATION_DEFAULT_HZ, JobKind, Op, OpError, OpResult, Sideband, WFM_DEVIATION_DEFAULT_HZ,
 };
@@ -279,8 +279,15 @@ struct Inner {
     scan_dwell_ms: u64,
     backends: Vec<Backend>,
     registry: StageRegistry,
-    /// The decoder modes, loaded at `open` against `registry`.
-    modes: Arc<ModeRegistry>,
+    /// The decoder modes, loaded at `open` against `registry` and replaced whole by
+    /// [`Node::reload_modes`]; read through [`Inner::modes`] at each use.
+    modes: ModesHandle,
+    /// The operator's modes directory as configured (`NodeConfig.modes_dir`): what
+    /// `reload_modes` reads and where an accepted signature's row is written (`None`:
+    /// [`crate::modes::default_operator_dir`]).
+    modes_dir: Option<PathBuf>,
+    /// Held across [`Node::reload_modes`] (no await inside).
+    reloading: Mutex<()>,
     /// The page themes: the built-in ones until the caller sets its own with `set_themes`.
     themes: RwLock<Arc<crate::themes::ThemeRegistry>>,
     /// The `capture` jobs' windows, opened (and expired) at `open`.
@@ -341,12 +348,46 @@ struct Inner {
 }
 
 impl Inner {
+    /// The decoder modes as they stand now: one registry, which a caller keeps for the
+    /// whole of one use so a reload meanwhile never mixes two sets of rows.
+    pub(crate) fn modes(&self) -> Arc<ModeRegistry> {
+        self.modes.get().unwrap_or_default()
+    }
+
     /// The kind a job recorded as `kind` was expanded from, when the node expands its
     /// graph: a built-in kind, or a `Mode` the registry has a row for. A record of any
     /// other kind (a [`Node::job_start`] caller's own name) keeps its graph as stored.
     pub(crate) fn expandable_kind(&self, kind: &str) -> Option<JobKind> {
         JobKind::from_name(kind)
-            .filter(|k| !matches!(k, JobKind::Mode(id) if self.modes.get(&id.0).is_none()))
+            .filter(|k| !matches!(k, JobKind::Mode(id) if self.modes().get(&id.0).is_none()))
+    }
+
+    /// A mode row's proof (`mode`, on the band `tuning`) supersedes each accepted
+    /// signature it overlaps: one whose band holds `tuning`'s centre
+    /// ([`crate::signatures::SignatureRecord::band_holds`]) when `tuning`'s width is
+    /// within [`SUPERSEDE_WIDTH_RANGE`] times the record's bandwidth. A `learned_*` row
+    /// (generated from a signature) supersedes nothing. Each one superseded is marked so
+    /// in the store at `now_ns` (its captures stay pinned) and named on stderr. A record
+    /// a concurrent proof superseded first is left as that one marked it.
+    pub(crate) fn supersede_by(&self, mode: &str, tuning: Tuning, now_ns: u64) {
+        use crate::signatures::{LEARNED_ROW_PREFIX, SUPERSEDE_WIDTH_RANGE};
+        if mode.starts_with(LEARNED_ROW_PREFIX) {
+            return;
+        }
+        let (lo, hi) = SUPERSEDE_WIDTH_RANGE;
+        let width = tuning.bandwidth_hz.0 as f64;
+        for rec in self.signatures.accepted() {
+            let theirs = rec.bandwidth_hz.0 as f64;
+            if !rec.band_holds(tuning.center_hz) || width < lo * theirs || width > hi * theirs {
+                continue;
+            }
+            if self.signatures.supersede(&rec.id, mode, now_ns).is_ok() {
+                eprintln!(
+                    "zeta: signature {} ({}) superseded by {mode}",
+                    rec.id, rec.name
+                );
+            }
+        }
     }
 
     /// Append `line` to the log `which`. A failure never fails anything; the
@@ -812,6 +853,19 @@ impl Node {
         ports: Vec<Arc<dyn Port>>,
         modes: Option<Arc<ModeRegistry>>,
     ) -> Result<Self, NodeError> {
+        let handle = modes.map(ModesHandle::from).unwrap_or_default();
+        Self::open_with_handle(cfg, registry, ports, handle).await
+    }
+
+    /// [`Node::open`] on the registry `modes` holds (the handle the caller's stages
+    /// read the rows through, so a [`Node::reload_modes`] reaches them too); an empty
+    /// handle is filled from `cfg.modes_dir` against `registry`, as `open` does.
+    pub async fn open_with_handle(
+        cfg: NodeConfig,
+        registry: StageRegistry,
+        ports: Vec<Arc<dyn Port>>,
+        modes: ModesHandle,
+    ) -> Result<Self, NodeError> {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (records, mut load_errors) = load(&jobs_dir)?;
@@ -838,8 +892,12 @@ impl Node {
         )));
         let sessions = crate::sessions::SessionStore::open(&cfg.state_dir).map_err(io)?;
         sessions.sweep(&bursts.list().into_iter().map(|r| r.id).collect());
-        let modes = modes
-            .unwrap_or_else(|| Arc::new(ModeRegistry::load(&registry, cfg.modes_dir.as_deref())));
+        if modes.get().is_none() {
+            modes.set(Arc::new(ModeRegistry::load(
+                &registry,
+                cfg.modes_dir.as_deref(),
+            )));
+        }
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
         // `Node::apply` and are never logged.
@@ -864,6 +922,8 @@ impl Node {
                 backends: cfg.backends,
                 registry,
                 modes,
+                modes_dir: cfg.modes_dir.clone(),
+                reloading: Mutex::new(()),
                 themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
                 bursts,
                 signatures,
@@ -1081,9 +1141,39 @@ impl Node {
         self.inner.classifiers.write().unwrap().register(c);
     }
 
-    /// The decoder modes loaded at `open` (see [`crate::modes`]).
+    /// The decoder modes as they stand now (see [`crate::modes`]): loaded at `open`,
+    /// replaced by [`Node::reload_modes`].
     pub fn modes(&self) -> Arc<ModeRegistry> {
+        self.inner.modes()
+    }
+
+    /// The handle the node holds its modes in: a classifier or provider given it reads
+    /// the rows as they stand at each use, a reload included.
+    pub fn modes_handle(&self) -> ModesHandle {
         self.inner.modes.clone()
+    }
+
+    /// Read the mode rows again (the embedded ones, then the operator directory:
+    /// `NodeConfig.modes_dir`, else [`crate::modes::default_operator_dir`]) against the
+    /// node's stages, carry each program row's probed program and state over from the
+    /// rows in force ([`ModeRegistry::carry_programs`]), read the checked times, and put
+    /// the new registry in force. Jobs already running keep the graphs they were
+    /// expanded to. The broken rows' startup lines
+    /// ([`ModeRegistry::startup_lines`]), for the caller to show.
+    pub fn reload_modes(&self) -> Result<Vec<String>, NodeError> {
+        let inner = &self.inner;
+        // One reload at a time: a later one reads every file an earlier one saw.
+        let _one = inner.reloading.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = inner
+            .modes_dir
+            .clone()
+            .or_else(crate::modes::default_operator_dir);
+        let mut modes = ModeRegistry::load(&inner.registry, dir.as_deref());
+        modes.carry_programs(&inner.modes());
+        modes.load_checked(&inner.state_dir.join(MODES_CHECKED_FILE));
+        let lines = modes.startup_lines();
+        inner.modes.set(Arc::new(modes));
+        Ok(lines)
     }
 
     /// The burst store: the windows `capture` jobs wrote.
@@ -1248,9 +1338,92 @@ impl Node {
                 }
             }
         }
-        store
+        let rec = store
             .accept(id, name, by, now().0)
-            .map_err(|e| self.signature_error(e))
+            .map_err(|e| self.signature_error(e))?;
+        Ok(self.write_learned_row(rec))
+    }
+
+    /// After `rec`'s accept, when [`crate::signatures::writes_row`]: write its
+    /// [`crate::signatures::learned_row`] to `<modes dir>/learned_<id>.json` (pretty
+    /// JSON, the directory made; the modes directory is `NodeConfig.modes_dir`, else
+    /// [`crate::modes::default_operator_dir`]) and [`Node::reload_modes`], noting the
+    /// row (`decoder`) and its file in the record. A file already there is kept as it
+    /// is (`row learned_<id> already present: kept as is`), never overwritten; with no
+    /// modes directory (`no modes directory: row not written`) or a failed write
+    /// (`row not written: <error>`) no row is noted. Never fails: the record stays
+    /// accepted, its captures pinned, whatever becomes of the row.
+    fn write_learned_row(
+        &self,
+        rec: crate::signatures::SignatureRecord,
+    ) -> crate::signatures::SignatureRecord {
+        use crate::signatures::{LEARNED_ROW_PREFIX, learned_row, writes_row};
+        use std::io::Write;
+        if !writes_row(&rec) {
+            return rec;
+        }
+        let mode = format!("{LEARNED_ROW_PREFIX}{}", rec.id.to_lowercase());
+        let dir = self
+            .inner
+            .modes_dir
+            .clone()
+            .or_else(crate::modes::default_operator_dir);
+        let (decoder, file, note) = match dir {
+            None => (
+                None,
+                None,
+                Some("no modes directory: row not written".into()),
+            ),
+            Some(dir) => {
+                let path = dir.join(format!("{mode}.json"));
+                let file = path.display().to_string();
+                let kept = format!("row {mode} already present: kept as is");
+                let written = serde_json::to_vec_pretty(&learned_row(&rec, &mode))
+                    .map_err(std::io::Error::other)
+                    .and_then(|json| {
+                        // `AlreadyExists` below means the row file only (a plain file
+                        // where the directory should be is a failure).
+                        std::fs::create_dir_all(&dir).map_err(std::io::Error::other)?;
+                        // `create_new`: a file there (the operator's, or one written
+                        // meanwhile) is never overwritten.
+                        let mut f = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&path)?;
+                        let body = f.write_all(&json).and_then(|()| f.write_all(b"\n"));
+                        if body.is_err() {
+                            // No half-written row left to be kept as the operator's.
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        body
+                    });
+                match written {
+                    Ok(()) => {
+                        if let Ok(lines) = self.reload_modes() {
+                            for line in lines {
+                                eprintln!("{line}");
+                            }
+                        }
+                        (Some(mode), Some(file), None)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        (Some(mode), Some(file), Some(kept))
+                    }
+                    Err(e) => (None, None, Some(format!("row not written: {e}"))),
+                }
+            }
+        };
+        match self.signatures().set_decoder(&rec.id, decoder, file, note) {
+            Ok(rec) => rec,
+            Err(e) => {
+                self.inner
+                    .persist_errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("signatures: {}: {e}", rec.id));
+                rec
+            }
+        }
     }
 
     /// `signature_reject`: reject the proposal `id`, by the transport `by`.
@@ -1262,6 +1435,18 @@ impl Node {
         self.signatures()
             .reject(id, by, now().0)
             .map_err(|e| self.signature_error(e))
+    }
+
+    /// A classify's proofs (each `tried` row that `proved`, on the classified band
+    /// `band`) supersede the accepted signatures they overlap ([`Inner::supersede_by`]).
+    pub(crate) fn supersede_proved(&self, tried: &[crate::classify::Tried], band: Tuning) {
+        let t = now().0;
+        for p in tried
+            .iter()
+            .filter(|p| p.outcome == crate::classify::Outcome::Proved)
+        {
+            self.inner.supersede_by(&p.mode, band, t);
+        }
     }
 
     pub(crate) fn knowledge(&self) -> Vec<Arc<dyn KnowledgeProvider>> {
@@ -1303,7 +1488,7 @@ impl Node {
     pub fn schema(&self) -> serde_json::Value {
         let mut v = crate::ops::schema();
         v["stages"] = self.inner.registry.describe();
-        let ids = self.inner.modes.ids();
+        let ids = self.inner.modes().ids();
         for part in ["op", "result", "error"] {
             let Some(kinds) = v[part]["$defs"]
                 .get_mut("JobKind")
@@ -1975,7 +2160,7 @@ impl Node {
                 rate,
                 bin_rate,
                 graph,
-                &self.inner.modes,
+                &self.inner.modes(),
             )
             .is_ok_and(|g| graph::same_pipeline(&g, graph))
         })

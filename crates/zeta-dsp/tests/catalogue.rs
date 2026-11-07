@@ -188,7 +188,7 @@ async fn knowledge_lookup_returns_catalogue_signatures() {
         modes_dir: None,
     };
     let node = Node::open(cfg, stages(), vec![]).await.unwrap();
-    node.add_knowledge(Arc::new(CatalogueKnowledge::new(node.modes())));
+    node.add_knowledge(Arc::new(CatalogueKnowledge::new(node.modes_handle())));
     let op = Op::KnowledgeLookup {
         region: "AU".into(),
         center_hz: Hz(104_900_000),
@@ -260,7 +260,7 @@ async fn lookup(center_hz: u64, bandwidth_hz: u64) -> Vec<zeta_core::knowledge::
         modes_dir: None,
     };
     let node = Node::open(cfg, stages(), vec![]).await.unwrap();
-    node.add_knowledge(Arc::new(CatalogueKnowledge::new(node.modes())));
+    node.add_knowledge(Arc::new(CatalogueKnowledge::new(node.modes_handle())));
     let op = Op::KnowledgeLookup {
         region: "AU".into(),
         center_hz: Hz(center_hz),

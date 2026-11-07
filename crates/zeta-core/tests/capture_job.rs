@@ -207,7 +207,7 @@ async fn a_hand_capture_classifies_its_first_window_and_a_watch_child_does_not()
     };
     let port: Arc<dyn Port> = source.clone();
     let node = Node::open(cfg, registry, vec![port]).await.unwrap();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     source.start();

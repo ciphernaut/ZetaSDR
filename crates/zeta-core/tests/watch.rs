@@ -355,7 +355,7 @@ async fn node_over(
     let node = Node::open(cfg, registry(), ports.into_iter().map(|(p, _)| p).collect())
         .await
         .unwrap();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     for s in srcs {
@@ -1983,7 +1983,7 @@ async fn accept_signature(node: &Node, meta: &Path) -> zeta_core::signatures::Si
     let (m, iq) = zeta_core::capture::read_cf32(meta).unwrap();
     let burst = &iq[..RATE_HZ as usize];
     let mut set = ClassifierSet::default();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         set.register(c);
     }
     let band = Band {

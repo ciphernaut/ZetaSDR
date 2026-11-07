@@ -89,7 +89,7 @@ async fn open_with(dir: &Path, extra: Option<Arc<dyn Stage>>) -> Node {
         registry.register(stage);
     }
     let node = Node::open(cfg, registry, vec![]).await.unwrap();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     node

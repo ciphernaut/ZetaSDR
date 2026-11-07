@@ -5,14 +5,15 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tokio::sync::broadcast;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
-use zeta_core::modes::{Decoder, LoadedMode, ModeRegistry, ModeState, RowTest, TestSpec};
+use zeta_core::modes::{
+    Decoder, LoadedMode, ModeRegistry, ModeState, ModesHandle, RowTest, TestSpec,
+};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::stream::Payload;
 use zeta_core::types::{Hz, SourceId, StreamKind, Timestamp};
@@ -39,7 +40,7 @@ const TAIL_MAX_MS: u64 = 10_000;
 struct Ctx {
     state_dir: PathBuf,
     registry: zeta_core::stage::StageRegistry,
-    modes: Arc<ModeRegistry>,
+    modes: ModesHandle,
     modes_dir: Option<PathBuf>,
 }
 
@@ -61,7 +62,7 @@ pub async fn run(
     only: Option<String>,
     strict: bool,
 ) -> ExitCode {
-    let (registry, modes, modes_dir) =
+    let (registry, handle, modes_dir) =
         match node_setup::load_modes(&state_dir, plugins, None, modes_dir).await {
             Ok(l) => l,
             Err(e) => {
@@ -69,6 +70,7 @@ pub async fn run(
                 return ExitCode::FAILURE;
             }
         };
+    let modes = handle.get().unwrap_or_default();
     if let Some(id) = &only
         && modes.get(id).is_none()
     {
@@ -81,7 +83,7 @@ pub async fn run(
     let ctx = Ctx {
         state_dir,
         registry,
-        modes: modes.clone(),
+        modes: handle.clone(),
         modes_dir,
     };
     let state_dir = &ctx.state_dir;

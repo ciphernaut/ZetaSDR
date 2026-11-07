@@ -170,7 +170,7 @@ async fn open(dir: &Path, iq: Option<&[Complex<f32>]>, row: bool) -> Node {
         src = Some(s);
     }
     let node = Node::open(cfg, registry, ports).await.unwrap();
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     if let Some(s) = src {

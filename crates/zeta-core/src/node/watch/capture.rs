@@ -102,7 +102,7 @@ async fn start(
             None,
             None,
             None,
-            &inner.modes,
+            &inner.modes(),
         )
         .map_err(|e| e.to_string())?;
     let node = graph

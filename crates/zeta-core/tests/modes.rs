@@ -201,6 +201,58 @@ async fn a_node_without_a_modes_dir_lists_only_the_embedded_rows() {
     }
 }
 
+/// `reload_modes` reads the operator directory again: a row written after `open` is
+/// listed, and a program row keeps the program and state its probe gave it.
+#[tokio::test]
+async fn reload_modes_picks_up_a_new_row_and_keeps_program_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    // As the CLI's probe leaves them: one program found, one not.
+    let mut probed = (*node.modes()).clone();
+    probed.set_program("adsb_decode", Some("/usr/bin/dump1090".into()), None);
+    let missing = "no program found (tried rs41mod)".to_string();
+    probed.set_program("rs41_decode", None, Some(missing.clone()));
+    node.modes_handle().set(std::sync::Arc::new(probed));
+    let mut row: serde_json::Value = serde_json::from_str(&renamed_pocsag("Local pagers")).unwrap();
+    row["id"] = "local_pagers".into();
+    std::fs::write(modes.join("local_pagers.json"), row.to_string()).unwrap();
+    assert!(
+        node.modes().get("local_pagers").is_none(),
+        "not before the reload"
+    );
+    let lines = node.reload_modes().unwrap();
+    assert!(lines.is_empty(), "{lines:?}");
+    let OpResult::Modes { modes: listed } = node
+        .apply(Op::ModesList {
+            family: None,
+            state: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("modes")
+    };
+    let new = listed.iter().find(|m| m.id.0 == "local_pagers");
+    assert_eq!(new.map(|m| m.state), Some(ModeState::Ready), "{listed:?}");
+    let reg = node.modes();
+    let adsb = reg.get("adsb_decode").unwrap();
+    assert_eq!(adsb.state, ModeState::Ready);
+    assert_eq!(adsb.program, Some("/usr/bin/dump1090".into()));
+    let rs41 = reg.get("rs41_decode").unwrap();
+    assert_eq!(rs41.state, ModeState::Unavailable);
+    assert_eq!(rs41.program, None);
+    assert_eq!(rs41.reason, Some(missing));
+    // A broken file's startup line is returned.
+    std::fs::write(modes.join("bad.json"), r#"{"id":"bad_row"}"#).unwrap();
+    let lines = node.reload_modes().unwrap();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("zeta: mode bad_row"), "{lines:?}");
+}
+
 #[tokio::test]
 async fn modes_show_unknown_names_the_known_ids() {
     let dir = tempfile::tempdir().unwrap();

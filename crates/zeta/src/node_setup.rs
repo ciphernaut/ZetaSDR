@@ -45,7 +45,7 @@ pub fn default_state_dir() -> Result<PathBuf, String> {
 
 /// `modes-checked.json` in `state_dir`: when each program row last passed `zeta modes check`.
 pub fn checked_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("modes-checked.json")
+    state_dir.join(zeta_core::modes::MODES_CHECKED_FILE)
 }
 
 /// Longest a `transcribe` stage waits for the speech backend to answer one utterance.
@@ -388,15 +388,16 @@ fn load_themes(themes_dir: Option<PathBuf>) -> Arc<zeta_core::themes::ThemeRegis
 /// The stage registry (built-ins, `transcribe` on `speech`, each probed `--plugin`) and
 /// the mode rows validated against it: `load`, the checked times of `state_dir`, one
 /// stderr line per broken row, the handler report ([`probe_handlers`]), and the registry
-/// handle `external_decode` reads the rows through filled. Also the operator directory
-/// used (`modes_dir`, else the default). Used by [`open`] and by `zeta modes check`,
-/// which opens many nodes on one loading.
+/// handle `external_decode` reads the rows through filled: the one handle the node is
+/// opened on, so its reloads reach the stages too. Also the operator directory used
+/// (`modes_dir`, else the default). Used by [`open`] and by `zeta modes check`, which
+/// opens many nodes on one loading.
 pub async fn load_modes(
     state_dir: &Path,
     plugins: &[PluginSpec],
     speech: Option<Arc<dyn SpeechBackend>>,
     modes_dir: Option<PathBuf>,
-) -> Result<(StageRegistry, Arc<ModeRegistry>, Option<PathBuf>), String> {
+) -> Result<(StageRegistry, ModesHandle, Option<PathBuf>), String> {
     let handle = ModesHandle::default();
     let registry = with_plugins(plugins, speech, &handle, &state_dir.join("run")).await?;
     // The rows validate against every stage (`external_decode` and the plugins
@@ -411,19 +412,18 @@ pub async fn load_modes(
     for line in probe_handlers(&mut modes).await {
         eprintln!("{line}");
     }
-    let modes = Arc::new(modes);
-    let _ = handle.set(modes.clone());
-    Ok((registry, modes, modes_dir))
+    handle.set(Arc::new(modes));
+    Ok((registry, handle, modes_dir))
 }
 
-/// [`open`] on rows already loaded by [`load_modes`] (their registry and the operator
-/// directory it used). A node that fails to open closes the ports it had opened (see
-/// [`RemotePorts::close`]) before the error is returned.
+/// [`open`] on rows already loaded by [`load_modes`] (their registry, the handle holding
+/// them and the operator directory it used). A node that fails to open closes the ports
+/// it had opened (see [`RemotePorts::close`]) before the error is returned.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_with(
     state_dir: PathBuf,
     registry: StageRegistry,
-    modes: Arc<ModeRegistry>,
+    modes: ModesHandle,
     modes_dir: Option<PathBuf>,
     sources: &[SourceSpec],
     resume: bool,
@@ -458,7 +458,7 @@ pub async fn open_with(
 async fn open_into(
     state_dir: PathBuf,
     registry: StageRegistry,
-    modes: Arc<ModeRegistry>,
+    modes: ModesHandle,
     modes_dir: Option<PathBuf>,
     sources: &[SourceSpec],
     resume: bool,
@@ -551,7 +551,7 @@ async fn open_into(
         bank_factory: Some(Arc::new(zeta_dsp::bank::PfbBankFactory)),
         modes_dir,
     };
-    let node = Node::open_with_modes(cfg, registry, ports, Some(modes))
+    let node = Node::open_with_handle(cfg, registry, ports, modes)
         .await
         .map_err(|e| e.to_string())?;
     for s in &files {
@@ -559,10 +559,10 @@ async fn open_into(
     }
     node.add_knowledge(Arc::new(StaticKnowledge::builtin()));
     node.add_knowledge(Arc::new(zeta_dsp::catalogue::CatalogueKnowledge::new(
-        node.modes(),
+        node.modes_handle(),
     )));
     node.add_classifier(Arc::new(StubClassifier));
-    for c in zeta_dsp::classifiers(node.modes()) {
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
     Ok(node)

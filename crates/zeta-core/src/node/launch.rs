@@ -207,9 +207,10 @@ impl Inner {
         let (mix_node, mix_job) = (inner.clone(), id.clone());
         // The row the job's kind expands from, for the events' envelope; a row that is
         // not ready never got this far (the expand refused it).
+        let modes = self.modes();
         let mode = self
             .expandable_kind(&rec.kind)
-            .and_then(|k| k.mode_row(&self.modes).ok().flatten())
+            .and_then(|k| k.mode_row(&modes).ok().flatten())
             .map(|row| Arc::new(row.clone()));
         // A rigid job on a radio keeps to its own band inside a wider capture.
         let band = (port.is_some() && !rec.elastic).then(|| {
@@ -241,9 +242,9 @@ impl Inner {
         let graph = rec.graph.clone();
         // A `transcribe` job's record for its transcript tees (see `tee_transcripts`).
         let tee = (rec.kind == JobKind::Transcribe.name()).then(|| rec.clone());
-        // A `bits`, `graph` or frame row's job's record for its proposal watch (see
-        // `super::propose::watch_for_proposals`).
-        let proposer = super::propose::proposes(self, &rec).then(|| rec.clone());
+        // A `bits` or `graph` job's or a mode row's job's record for its watch (proposals,
+        // the row's first proof: see `super::propose::watch_for_proposals`).
+        let proposer = super::propose::watches(self, &rec).then(|| rec.clone());
         // A `watch`'s controller runs beside its stages (see `super::watch`).
         let watch =
             (rec.kind == JobKind::Watch.name()).then(|| (watch::Seed::of(&rec), rec.tuning));
@@ -661,7 +662,7 @@ impl Inner {
             return Ok(());
         }
         let bin_rate = self.bank_bin_rate(&rec.source, band);
-        let modes = &self.modes;
+        let modes = &self.modes();
         let graph = kind.reexpand(&rec.source, rec.tuning, rate, bin_rate, &rec.graph, modes);
         // At the same rate the stored graph stands while one of today's expansions (on
         // the bank or the source rate) still gives it, or when none can be made.
@@ -710,7 +711,7 @@ impl Inner {
                 band.bandwidth_hz,
                 bin_rate,
                 &rec.graph,
-                &self.modes,
+                &self.modes(),
             )
             .map_err(NodeError::Expand)?;
         *stages = self.stages(&graph)?;
@@ -829,7 +830,7 @@ impl Inner {
                     None,
                     None,
                     None,
-                    &self.modes,
+                    &self.modes(),
                 )
                 .map_err(|e| NodeError::Other(format!("scan graph: {e}")))?;
         }

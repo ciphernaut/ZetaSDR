@@ -85,7 +85,7 @@ impl Modulation {
 
     /// The modulation a layer-1 label names: `fsk` and `fm` (FSK heard through a
     /// discriminator) are FSK.
-    fn from_label(label: &str) -> Option<Modulation> {
+    pub(crate) fn from_label(label: &str) -> Option<Modulation> {
         match label {
             "fsk" | "fm" => Some(Modulation::Fsk),
             "psk" => Some(Modulation::Psk),

@@ -3,14 +3,14 @@
 //! and modulations, served as a knowledge provider and used by a layer-2
 //! classifier that names a measured signal.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use num_complex::Complex;
 use serde::Deserialize;
 use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, Tried};
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
-use zeta_core::modes::{ModeRegistry, ModeState};
+use zeta_core::modes::{ModeRegistry, ModeState, ModesHandle};
 use zeta_core::types::Hz;
 
 use crate::measure::measure_selection;
@@ -91,26 +91,27 @@ fn overlaps(min: Hz, max: Hz, center: Hz, bandwidth: Hz) -> bool {
 
 /// The catalogue as a knowledge provider: one signature per frequency range
 /// overlapping the queried band; no allocations. A signature's `decoder` is the
-/// mode that proves the entry: the `ready` or `unavailable` row of `modes` whose
-/// `catalogue` lists the entry's id (`None` when no row does).
+/// mode that proves the entry: the `ready` or `unavailable` row of `modes` (the rows
+/// it holds at the lookup) whose `catalogue` lists the entry's id (`None` when no row
+/// does).
 pub struct CatalogueKnowledge {
-    modes: Arc<ModeRegistry>,
+    modes: ModesHandle,
 }
 
 impl CatalogueKnowledge {
-    pub fn new(modes: Arc<ModeRegistry>) -> CatalogueKnowledge {
+    pub fn new(modes: ModesHandle) -> CatalogueKnowledge {
         CatalogueKnowledge { modes }
     }
+}
 
-    /// The id of the row that proves catalogue entry `entry_id`.
-    fn decoder(&self, entry_id: &str) -> Option<String> {
-        self.modes
-            .all()
-            .iter()
-            .filter(|m| matches!(m.state, ModeState::Ready | ModeState::Unavailable))
-            .find(|m| m.row.catalogue.iter().any(|c| c == entry_id))
-            .map(|m| m.row.id.0.clone())
-    }
+/// The id of the row of `modes` that proves catalogue entry `entry_id`.
+fn decoder(modes: Option<&ModeRegistry>, entry_id: &str) -> Option<String> {
+    modes?
+        .all()
+        .iter()
+        .filter(|m| matches!(m.state, ModeState::Ready | ModeState::Unavailable))
+        .find(|m| m.row.catalogue.iter().any(|c| c == entry_id))
+        .map(|m| m.row.id.0.clone())
 }
 
 #[async_trait]
@@ -129,6 +130,9 @@ impl KnowledgeProvider for CatalogueKnowledge {
     }
 
     async fn signatures(&self, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Signature> {
+        // One registry for the whole lookup.
+        let modes = self.modes.get();
+        let modes = modes.as_deref();
         catalogue()
             .iter()
             .flat_map(|e| {
@@ -142,7 +146,7 @@ impl KnowledgeProvider for CatalogueKnowledge {
                         bandwidth_hz: e.bandwidth_max_hz.unwrap_or(Hz(0)),
                         modulation: e.modulations.first().cloned().unwrap_or_default(),
                         symbol_rate_baud: None,
-                        decoder: self.decoder(&e.id),
+                        decoder: decoder(modes, &e.id),
                         order: None,
                         tone_spacing_hz: None,
                         burst: None,

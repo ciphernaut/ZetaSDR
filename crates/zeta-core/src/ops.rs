@@ -4026,7 +4026,8 @@ fn capture_record(node: &Node, id: &str) -> Result<crate::bursts::CaptureRecord,
 }
 
 /// `capture_classify`: the classifiers over the capture's samples in the record's band, with the
-/// allocations the record kept.
+/// allocations the record kept. A row proved on the band supersedes the accepted
+/// signatures it overlaps.
 async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
     let rec = capture_record(node, id)?;
     let Classification {
@@ -4036,6 +4037,11 @@ async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
     } = classify_capture(&node.classifiers(), &rec)
         .await
         .map_err(other)?;
+    let band = Tuning {
+        center_hz: rec.center_hz,
+        bandwidth_hz: rec.bandwidth_hz,
+    };
+    node.supersede_proved(&tried, band);
     Ok(OpResult::Classification {
         labels,
         tried,
@@ -4072,7 +4078,8 @@ pub(crate) async fn classify_capture(
         .await)
 }
 
-/// Run the classifier set over the selection's band and span of the source ring.
+/// Run the classifier set over the selection's band and span of the source ring. A row
+/// proved on the band supersedes the accepted signatures it overlaps.
 async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     let (rate, center, samples) = ring_samples(node, &sel)?;
     // `check_band` has proved the band lies inside the ring's.
@@ -4094,6 +4101,11 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         .classifiers()
         .run_all(&samples, rate, center, band, None, allocations)
         .await;
+    let band = Tuning {
+        center_hz: sel.center_hz,
+        bandwidth_hz: sel.bandwidth_hz,
+    };
+    node.supersede_proved(&tried, band);
     Ok(OpResult::Classification {
         labels,
         tried,

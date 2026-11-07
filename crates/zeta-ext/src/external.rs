@@ -3,9 +3,10 @@
 //! The params are `{"mode": "<row id>"}` only: the program block (programs, args,
 //! input, output, parser) is resolved from the loaded [`ModeRegistry`] at launch, never
 //! taken from the graph, so a `graph_put` cannot run an arbitrary program. The stage
-//! reaches the registry through a [`ModesHandle`] filled once the registry is loaded
-//! (the stage registry the rows validate against is built first); a run with the handle
-//! still empty fails `external_decode: no mode registry`.
+//! reaches the registry through a [`ModesHandle`] set once the registry is loaded (the
+//! stage registry the rows validate against is built first) and replaced on a reload,
+//! read at each run; a run with the handle still empty fails `external_decode: no mode
+//! registry`.
 //!
 //! **A run.** Pick a free loopback port when the args or output use `$port`; substitute
 //! `$port`, `$rate_hz` (the row's `input.rate_hz`), `$center_hz` (the first IQ frame's
@@ -32,7 +33,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -73,8 +74,9 @@ pub const WAV_HEADER_LEN: usize = 44;
 /// The RIFF and data sizes of a WAV header on a stream of unknown length.
 pub const WAV_STREAM_SIZE: u32 = 0xFFFF_FFFF;
 
-/// The loaded mode registry, filled once after the registry is loaded.
-pub type ModesHandle = Arc<OnceLock<Arc<ModeRegistry>>>;
+/// The loaded mode registry, set once the rows are loaded and replaced on a reload; a
+/// run reads the rows the handle holds when it starts.
+pub use zeta_core::modes::ModesHandle;
 
 /// `external_decode`'s params: the row to run.
 #[derive(JsonSchema, Serialize, Deserialize)]
@@ -97,13 +99,11 @@ pub struct ExternalDecodeStage {
 impl ExternalDecodeStage {
     /// The stage running the rows of `modes`.
     pub fn new(modes: Arc<ModeRegistry>) -> Self {
-        let handle = ModesHandle::default();
-        let _ = handle.set(modes);
-        Self::deferred(handle)
+        Self::deferred(ModesHandle::from(modes))
     }
 
-    /// The stage running the rows of the registry `handle` will hold (set it once the
-    /// registry is loaded; until then every run fails).
+    /// The stage running the rows of the registry `handle` holds at each run (set it
+    /// once the registry is loaded; until then every run fails).
     pub fn deferred(handle: ModesHandle) -> Self {
         Self {
             spec: StageSpec {

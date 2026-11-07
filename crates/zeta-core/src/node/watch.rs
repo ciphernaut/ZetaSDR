@@ -613,7 +613,7 @@ impl Inner {
     /// and the watch's band, else the signal's own width at score 0.
     fn identify_band(&self, r: &Run, s: &Signal) -> (u64, f32) {
         score_rows(
-            &self.modes,
+            &self.modes(),
             s.center_hz,
             s.bandwidth_hz,
             "",
@@ -670,7 +670,15 @@ impl Inner {
             bandwidth_hz: Hz(t.band_hz),
         };
         let graph = JobKind::Identify
-            .expand(&r.prov.source, tuning, Hz(0), None, None, None, &self.modes)
+            .expand(
+                &r.prov.source,
+                tuning,
+                Hz(0),
+                None,
+                None,
+                None,
+                &self.modes(),
+            )
             .map_err(|e| e.to_string())?;
         let rec = JobRecord {
             format: JOB_RECORD_FORMAT,
@@ -745,7 +753,7 @@ impl Inner {
             bin_rate,
             None,
             None,
-            &self.modes,
+            &self.modes(),
         );
         let started = match graph {
             Ok(mut graph) => {
@@ -820,7 +828,7 @@ impl Inner {
             return kept(None, sink);
         }
         let width = self
-            .modes
+            .modes()
             .get(mode)
             .map_or(signal.bandwidth_hz, |m| m.row.band.bandwidth_hz);
         let ports: Vec<Arc<dyn Port>> = {
@@ -1499,7 +1507,7 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     for d in &mut w.decoding {
         // Only the row's own events are its signal: a frame row's `timing` and forwarded
         // `bits` flow on noise too. A mode no longer loaded counts every event.
-        let protocol = inner.modes.get(&d.mode).map(|m| m.row.protocol.clone());
+        let protocol = inner.modes().get(&d.mode).map(|m| m.row.protocol.clone());
         let counts = |v: &serde_json::Value| {
             protocol
                 .as_deref()

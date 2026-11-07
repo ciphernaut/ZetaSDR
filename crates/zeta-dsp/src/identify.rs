@@ -13,7 +13,7 @@ use num_complex::Complex;
 use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, Outcome, Tried};
 use zeta_core::knowledge::Allocation;
 use zeta_core::modes::score::{allocation_term, score_rows};
-use zeta_core::modes::{Decoder, LoadedMode, ModeRegistry, ModeRow, ModeState};
+use zeta_core::modes::{Decoder, LoadedMode, ModeRow, ModeState, ModesHandle};
 use zeta_core::ops::channel_rate_hz;
 use zeta_core::types::Hz;
 
@@ -64,11 +64,13 @@ const DEVIATION_HZ: u64 = 3_000;
 /// a proof does not stop the sweep. Upstream features are not used. The
 /// register's assignments handed to the run score [`allocation_term`].
 pub struct DecodeToIdentify {
-    modes: Arc<ModeRegistry>,
+    modes: ModesHandle,
 }
 
 impl DecodeToIdentify {
-    pub fn new(modes: Arc<ModeRegistry>) -> DecodeToIdentify {
+    /// Decode-to-identify over the rows `modes` holds at each run (none while it is
+    /// empty).
+    pub fn new(modes: ModesHandle) -> DecodeToIdentify {
         DecodeToIdentify { modes }
     }
 }
@@ -142,7 +144,9 @@ impl Classifier for DecodeToIdentify {
         let span_ms = iq.len() as u64 * 1000 / rate;
         let catalogue = |id: &str| catalogue_score(id, m_center, m_bw, layer1);
         let allocation = |m: &LoadedMode| allocation_term(m, allocations);
-        let scored = score_rows(&self.modes, m_center, m_bw, layer1, &catalogue, &allocation);
+        // One registry for the whole run, however the handle is reloaded meanwhile.
+        let modes = self.modes.get().unwrap_or_default();
+        let scored = score_rows(&modes, m_center, m_bw, layer1, &catalogue, &allocation);
         // Each channel is extracted once, when the first row that runs on it does.
         let mut chans: Vec<((i64, u64), Option<(Vec<Complex<f32>>, u64)>)> = Vec::new();
         let mut labels = Vec::new();
@@ -331,13 +335,14 @@ mod tests {
     use crate::fixtures::{
         acars_packet_iq, aprs_packet_iq, nbfm_modulate, pocsag_packet_iq, rds_station_iq, tone,
     };
+    use zeta_core::modes::ModeRegistry;
     use zeta_core::stage::StageRegistry;
 
     /// Decode-to-identify over the embedded rows.
     fn d() -> DecodeToIdentify {
         let mut stages = StageRegistry::new();
         crate::register_all(&mut stages);
-        DecodeToIdentify::new(Arc::new(ModeRegistry::load(&stages, None)))
+        DecodeToIdentify::new(Arc::new(ModeRegistry::load(&stages, None)).into())
     }
 
     #[tokio::test]
