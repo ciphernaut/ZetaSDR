@@ -73,18 +73,18 @@ fn modes_check_passes_the_in_crate_rows() {
             .any(|l| l == "adsb_decode: skipped: dump1090 missing"),
         "{out}"
     );
-    // DFM and M20 have no test yet; RS41's decoder is pinned missing here.
-    for id in ["dfm_decode", "m20_decode"] {
+    // DFM has no test yet; the RS41 and M20 decoders are pinned missing here.
+    assert!(
+        out.lines().any(|l| l == "dfm_decode: skipped: no test"),
+        "{out}"
+    );
+    for (id, program) in [("rs41_decode", "rs41mod"), ("m20_decode", "m20mod")] {
         assert!(
-            out.lines().any(|l| l == format!("{id}: skipped: no test")),
+            out.lines()
+                .any(|l| l == format!("{id}: skipped: {program} missing")),
             "{out}"
         );
     }
-    assert!(
-        out.lines()
-            .any(|l| l == "rs41_decode: skipped: rs41mod missing"),
-        "{out}"
-    );
     for (id, program) in [("vdl2_decode", "dumpvdl2"), ("hfdl_decode", "dumphfdl")] {
         assert!(
             out.lines()
@@ -547,6 +547,21 @@ fn rs41_decode_passes_its_synthesised_check() {
 }
 
 /// zeta-ext's stand-in for an external decoder: prints a file's lines whatever its input.
+/// The M20 row proves itself against the real `m20mod`: the synthesised frames pass
+/// through the row's own chain and the decoder reports the serial and the position.
+#[test]
+fn m20_decode_passes_its_synthesised_check() {
+    let Some(m20mod) = which("m20mod") else {
+        eprintln!("m20mod not on this host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) =
+        stdout(check(dir.path(), &["--strict", "m20_decode"]).env("ZETA_HANDLER_M20MOD", m20mod));
+    assert_eq!(out.trim(), "m20_decode: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
 fn fake_lines() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../zeta-ext/tests/fake_lines")
 }

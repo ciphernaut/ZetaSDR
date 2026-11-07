@@ -39,6 +39,7 @@ pub mod fsk;
 #[cfg(feature = "gpu")]
 pub mod gpu_fft;
 pub mod identify;
+pub mod m20_frame;
 pub mod measure;
 pub mod mix;
 pub mod nbfm;

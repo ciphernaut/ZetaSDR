@@ -1069,6 +1069,37 @@ fn dfm_iq(
     gfsk_modulate(&chips, 2, BAUD, DEVIATION_HZ, rate_hz)
 }
 
+/// Most frames the `m20` family sends (one a second).
+const M20_FRAMES_MAX: u32 = 60;
+
+/// `frames` M20 frames (numbered from 0), one a second: each second the line idles on
+/// alternating half-symbols, then sends the header and the frame.
+fn m20_iq(
+    serial: &str,
+    lat: f64,
+    lon: f64,
+    alt_m: f64,
+    vel_v: f64,
+    frames: u32,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    use crate::m20_frame::{BAUD, DEVIATION_HZ, FRAME_CHIPS, M20Params, m20_frame_bits};
+    let second = BAUD as usize;
+    let mut chips = Vec::with_capacity(second * frames as usize);
+    for frame in 0..frames {
+        chips.extend((0..second - FRAME_CHIPS).map(|k| (k & 1) as u8));
+        chips.extend(m20_frame_bits(&M20Params {
+            serial: serial.into(),
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frame,
+        }));
+    }
+    gfsk_modulate(&chips, 2, BAUD, DEVIATION_HZ, rate_hz)
+}
+
 /// Bounds on the generic families' numbers, so a bad row is an error, not an abort or
 /// a huge allocation. `deviation_hz` is given for `fsk`, whose tones must fit the rate.
 fn generic_params(
@@ -1287,6 +1318,17 @@ pub enum SynthSpec {
     /// (Manchester coded) and 4 kHz deviation carrying `serial` (`DFM-` and the number),
     /// the position and the climb.
     Dfm {
+        serial: String,
+        lat: f64,
+        lon: f64,
+        alt_m: f64,
+        vel_v: f64,
+        frames: u32,
+    },
+    /// `frames` Meteomodem M20 frames one second apart ([`crate::m20_frame`]): 2-FSK at
+    /// 9600 baud (Manchester coded) carrying `serial` (`M20-YMM-S-NNNNN`, as `m20mod`
+    /// prints the id), the position and the climb; the line idles between frames.
+    M20 {
         serial: String,
         lat: f64,
         lon: f64,
@@ -1519,6 +1561,24 @@ impl SynthSpec {
                 }
                 sonde_position(*lat, *lon, *alt_m, *vel_v)?;
             }
+            SynthSpec::M20 {
+                serial,
+                lat,
+                lon,
+                alt_m,
+                vel_v,
+                frames,
+            } => {
+                if !(1..=M20_FRAMES_MAX).contains(frames) {
+                    return Err(format!("frames: 1..={M20_FRAMES_MAX}"));
+                }
+                if crate::m20_frame::serial_parts(serial).is_none() {
+                    return Err(
+                        "serial: M20-YMM-S-NNNNN (Y 0-9, MM 01-12, S 1-8, NNNNN 0-8191)".into(),
+                    );
+                }
+                sonde_position(*lat, *lon, *alt_m, *vel_v)?;
+            }
             SynthSpec::Ais {
                 mmsi,
                 lat,
@@ -1575,6 +1635,7 @@ impl SynthSpec {
             SynthSpec::NbfmTone { .. }
             | SynthSpec::Rs41 { .. }
             | SynthSpec::Dfm { .. }
+            | SynthSpec::M20 { .. }
             | SynthSpec::Ais { .. } => 48_000,
             SynthSpec::Fsk {
                 symbol_rate_baud, ..
@@ -1740,6 +1801,18 @@ pub fn synthesise(
             frames,
         } => {
             let mut iq = dfm_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::M20 {
+            serial,
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frames,
+        } => {
+            let mut iq = m20_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -1994,6 +2067,39 @@ mod tests {
         assert_eq!(iq.len(), 96_000);
         assert!(iq[28_000].norm() > 0.99 && iq[30_000].norm() == 0.0);
         assert!(iq[48_000].norm() > 0.99);
+    }
+
+    #[test]
+    fn m20_family_is_bounded_and_one_frame_a_second() {
+        let parse = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"family": "m20", "serial": "M20-611-2-01234",
+                "lat": -27.3842, "lon": 153.1175, "alt_m": 5000, "vel_v": 4.5, "frames": 3});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse_params(v.as_object().unwrap().clone()).map(|(s, _)| s)
+        };
+        let serial_err = "serial: M20-YMM-S-NNNNN (Y 0-9, MM 01-12, S 1-8, NNNNN 0-8191)";
+        let cases = [
+            (serde_json::json!({"frames": 0}), "frames: 1..=60"),
+            (serde_json::json!({"frames": 61}), "frames: 1..=60"),
+            (serde_json::json!({"serial": "M20-611201234"}), serial_err),
+            (serde_json::json!({"serial": "M20-611-2-09999"}), serial_err),
+            (serde_json::json!({"lat": 91.0}), "lat: -90..=90"),
+            (serde_json::json!({"lon": -181.0}), "lon: -180..=180"),
+            (serde_json::json!({"alt_m": 70000}), "alt_m: -1000..=60000"),
+            (serde_json::json!({"vel_v": 500.0}), "vel_v: -100..=100"),
+        ];
+        for (extra, err) in cases {
+            assert_eq!(parse(extra.clone()), Err(err.into()), "{extra}");
+        }
+        let spec = parse(serde_json::json!({})).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 403_000_000);
+        // One frame a second: each second is 9600 half-symbols at 5 samples each, the
+        // line idling between frames, so the carrier never stops.
+        assert_eq!(iq.len(), 3 * 48_000);
+        assert!(iq.iter().all(|s| (s.norm() - 1.0).abs() < 1e-3));
     }
 
     #[test]
