@@ -12,7 +12,11 @@
 //         finished_rows_s  a non-negative integer of seconds, 0 = never shown (default 60)
 //         scanner          auto | a source id (default auto)
 //         plan             auto | none | a loaded channel plan id (default auto; plans.js)
-//         map              on | off (default off): the map pane (map.js)
+//         main             rf | map (default rf): what #main shows, the waterfall or the map
+//                          (app.js applyMain; the Map tab of the sources strip sets it); a
+//                          `main` set that contradicts `map on` or `off` puts it back to auto
+//         map              auto | on | off (default auto): an alias of `main`: `on` sets
+//                          `main map`, `off` sets `main rf`, `auto` changes nothing
 //         home             `LAT,LON` (lat -90..90, lon -180..180, decimal degrees) | none
 //                          (default none): where the map's home marker sits and the job rows'
 //                          distance and bearing count from (none: the node's station, when
@@ -71,6 +75,7 @@ export const VIEW_KEY = "zeta.view";
 export const AGENT_VIEW_KEYS = [
   "theme",
   "side",
+  "main",
   "map",
   "pane",
   "subjects",
@@ -156,7 +161,27 @@ export const POLICIES = [
       return ["auto", "none", ...planIds()].join(", ");
     },
   },
-  { key: "map", values: ["on", "off"], default_: "off", describe: "on, off" },
+  {
+    key: "main",
+    values: ["rf", "map"],
+    default_: "rf",
+    describe: "rf, map",
+    then(v, view, put) {
+      const m = view.get("map");
+      if ((m === "on" && v !== "map") || (m === "off" && v !== "rf")) put("map", "auto");
+    },
+  },
+  {
+    key: "map",
+    values: ["auto", "on", "off"],
+    default_: "auto",
+    describe: "auto, on, off",
+    // The alias: `on` and `off` choose what #main shows.
+    then(v, view, put) {
+      if (v === "on") put("main", "map");
+      else if (v === "off") put("main", "rf");
+    },
+  },
   {
     key: "home",
     parse: (t) => {

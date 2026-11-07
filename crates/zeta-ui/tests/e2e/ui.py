@@ -1595,6 +1595,7 @@ THEME_HOOKS = [
     ".job-tag", ".job-tag .kind", ".job-tag .channel", ".job-tag .centre", ".ov-ribbon",
     ".outline", ".graph-node.selected", ".job-tag.hot", ".job-tag.speaking",
     ".job-tag .dot.closed", "html[data-theme]", "html[data-rail]", "html[data-footprint]",
+    ".map-tab", "html[data-main]",
 ]
 
 
@@ -1614,7 +1615,7 @@ def scenario_theme_hooks(page, url, secret):
         demod = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500, deviation_hz=5000)
         row = job_row(page, demod)
         page.evaluate("window.zetaTest.ribbon('hooks')")
-        run_cmd(page, "view set map on")
+        run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
         page.click("#pane-transcript .pane-head")
         tag = page.locator(f'#rail .job-tag[data-job="{demod}"]')
@@ -1654,11 +1655,12 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, "follow = free")).to_have_text("follow = free")
     shown = view_show(page)
     for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
-                 "finished_rows_s 60", "scanner auto", "plan auto", "map off", "home none",
+                 "finished_rows_s 60", "scanner auto", "plan auto", "main rf", "map auto",
+                 "home none",
                  "subjects auto", "subject_dim_s 60", "subject_drop_s 300", "pane none",
                  "theme console", "side both"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 13, f"view show: {shown!r}"
+    assert shown.count("\n") == 14, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -1667,7 +1669,7 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, '"-1"', error=True)).to_be_visible()
     run_cmd(page, "view set nosuch 1")
     expect(view_line(page, "nosuch", error=True)).to_contain_text(
-        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner, plan, map, home, "
+        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner, plan, main, map, home, "
         "subjects, subject_dim_s, subject_drop_s")
     run_cmd(page, "view reset")
     expect(view_line(page, "view policies reset")).to_be_visible()
@@ -4562,8 +4564,8 @@ def scenario_map_marker_draws_without_tiles(page, url, secret):
     errors = page_errors(page)
     select_source(page, url, secret, "tone")
     expect(page.locator("#map")).to_be_hidden()
-    run_cmd(page, "view set map on")
-    expect(view_line(page, "map = on")).to_be_visible()
+    run_cmd(page, "view set main map")
+    expect(view_line(page, "main = map")).to_be_visible()
     mp = page.locator("#map")
     expect(mp).to_be_visible()
     expect(mp.locator(".leaflet-control-attribution")).to_contain_text(
@@ -4589,7 +4591,7 @@ def scenario_map_marker_draws_without_tiles(page, url, secret):
         page.evaluate("window.zetaTest.poll()")
         expect(mp.locator(".leaflet-interactive")).to_have_count(0)
         expect(track).to_have_count(0)
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
         expect(mp).to_be_hidden()
         assert not errors, f"console errors: {errors}"
     finally:
@@ -4602,7 +4604,7 @@ def scenario_map_follows_a_positioned_job_on_another_source(page, url, secret):
     page.route(OSM_TILES, lambda r: r.abort())
     errors = page_errors(page)
     select_source(page, url, secret, "aprs")
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     mp = page.locator("#map")
     expect(mp).to_be_visible()
     job = start_fake_pos(page, url, secret)
@@ -4618,10 +4620,66 @@ def scenario_map_follows_a_positioned_job_on_another_source(page, url, secret):
         stop_job(url, secret, job)
         page.evaluate("window.zetaTest.poll()")
         expect(mp.locator(".leaflet-interactive")).to_have_count(0)
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
         assert not errors, f"console errors: {errors}"
     finally:
         stop_job(url, secret, job)
+
+
+def scenario_map_is_a_source_tab(page, url, secret):
+    # Spec 4.4: the Map is a tab of the sources strip; `main map` swaps it for the waterfall in
+    # #main and keeps the shown source (its job and axis), `map on|off` is its alias.
+    page.route(OSM_TILES, lambda r: r.abort())
+    select_source(page, url, secret, "tone")
+    page.set_viewport_size(WIDE)
+    main_is = "() => document.documentElement.dataset.main === '%s'"
+    try:
+        tab = page.locator("#tabs .src-tab.map-tab")
+        expect(tab).to_have_count(1)
+        expect(page.locator("#map-toggle")).to_have_count(0)
+        # The waterfall settled first: its spectrum job painting, the axis drawn.
+        page.wait_for_function(
+            """() => {
+              const wf = window.zetaTest.wf();
+              const t = document.querySelectorAll('#waterfall .wf-axis .tick');
+              return !!wf && !!wf.jobId && wf.painted > 0 && t.length === 5;
+            }""", timeout=10_000)
+        before = ticks(page)
+        job0 = page.evaluate("() => window.zetaTest.wf().jobId")
+        tab.click()
+        page.wait_for_function(main_is % "map", timeout=5_000)
+        expect(page.locator("#map")).to_be_visible()
+        expect(page.locator("#waterfall")).to_be_hidden()
+        assert page.evaluate("() => window.zetaTest.shown()") == "tone", page.evaluate("() => window.zetaTest.shown()")
+        expect(tab).to_have_attribute("aria-selected", "true")
+        tone = page.locator('#tabs .src-tab[data-id="tone"]')
+        expect(tone).to_have_class(re.compile(r"\bkept\b"))
+        expect(tone).to_have_attribute("aria-selected", "false")
+        shown = view_show(page)
+        assert "main map" in shown and "map auto" in shown, shown
+        # A jobs poll (another source's jobs gone) keeps the tab and the map shown.
+        stop_spectrum_jobs(url, secret, "retune")
+        page.evaluate("() => window.zetaTest.poll()")
+        expect(tab).to_have_count(1)
+        assert page.evaluate("() => document.documentElement.dataset.main") == "map", "a jobs poll left the map"
+        tone.click()
+        page.wait_for_function(main_is % "rf", timeout=5_000)
+        expect(tone).not_to_have_class(re.compile(r"\bkept\b"))
+        after = ticks(page)
+        assert after == before, f"ticks {before} then {after}"
+        job1 = page.evaluate("() => window.zetaTest.wf().jobId")
+        assert job1 == job0, f"spectrum job {job0} then {job1}"
+        run_cmd(page, "view set map on")
+        page.wait_for_function(main_is % "map", timeout=5_000)
+        run_cmd(page, "view set map off")
+        page.wait_for_function(main_is % "rf", timeout=5_000)
+        page.set_viewport_size(NARROW)
+        tab.click()
+        page.wait_for_function(main_is % "map", timeout=5_000)
+        expect(page.locator("#map")).to_be_visible()
+    finally:
+        run_cmd(page, "view reset")
+        page.set_viewport_size(WIDE)
 
 
 def scenario_home_gives_distance_and_bearing(page, url, secret):
@@ -4897,14 +4955,14 @@ def scenario_subjects_tab_appears_only_with_a_subject_job(page, url, secret):
         toggle.click()
         expect(pane).to_be_visible()
         assert "pane subjects" in view_show(page)
-        # With the map on too, the map takes the right of the top and the table the bottom.
+        # With the map shown too, the map takes the top and the table the bottom.
         page.route(OSM_TILES, lambda r: r.abort())
-        run_cmd(page, "view set map on")
+        run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
         mp = page.locator("#map").bounding_box()
         box = pane.bounding_box()
         assert mp["y"] + mp["height"] <= box["y"] + 2, f"{mp} {box}"
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
     finally:
         stop_job(url, secret, job)
     page.evaluate("window.zetaTest.poll()")
@@ -4922,7 +4980,7 @@ def scenario_subjects_table_has_padding_and_scrolls_sideways(page, url, secret):
     page.route(OSM_TILES, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     page.set_viewport_size(WIDE)
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
         open_subjects(page)
@@ -4939,7 +4997,7 @@ def scenario_subjects_table_has_padding_and_scrolls_sideways(page, url, secret):
         # The key stays in view while the rest is scrolled in.
         fb = page.locator("#subjects thead th").first.bounding_box()
         assert fb["x"] - pb["x"] >= 4, f"{fb} {pb}"
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
     finally:
         stop_job(url, secret, job)
 
@@ -5317,7 +5375,7 @@ def map_with_subjects(page, url, secret):
     of its fixed aircraft drawn; the job id."""
     page.route(OSM_TILES, lambda r: r.abort())
     select_source(page, url, secret, "tone")
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     expect(page.locator("#map")).to_be_visible()
     job = start_subject_job(page, url, secret, "fake_subjects")
     expect(page.locator("#map .map-subject")).to_have_count(2, timeout=10_000)
@@ -5602,7 +5660,7 @@ def scenario_map_follows_dim_and_drop(page, url, secret):
     expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
     run_cmd(page, "view set subject_drop_s 4")
     expect(view_line(page, "subject_drop_s = 4")).to_be_visible()
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
         expect(page.locator("#map .map-subject")).to_have_count(2, timeout=10_000)
@@ -5621,7 +5679,7 @@ def scenario_a_dimmed_subject_relights(page, url, secret):
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set subject_dim_s 1")
     expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
         expect(page.locator("#map .map-subject.dim")).to_have_count(2, timeout=10_000)
@@ -6098,16 +6156,16 @@ def scenario_panes_show_one_at_a_time(page, url, secret):
         run_cmd(page, "view set subjects auto")
         expect(pane).to_be_hidden()
         expect(tab).to_be_visible()
-        # The map stays its own toggle: with the pane open it keeps the top's right half.
+        # The map is the main area's: with the pane open it keeps the top.
         page.route(OSM_TILES, lambda r: r.abort())
         tab.click()
-        run_cmd(page, "view set map on")
+        run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
         mp = page.locator("#map").bounding_box()
         box = pane.bounding_box()
         assert mp["y"] + mp["height"] <= box["y"] + 1, f"{mp} {box}"
         assert page.locator("#panes .pane-tab:visible").count() == 1
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
         # The selection is the view's, kept over a reload.
         page.reload()
         expect(pane).to_be_visible(timeout=10_000)

@@ -206,7 +206,9 @@ Regions:
 
 - `#top`: the top bar. `.brand`: the product name in it.
 - `.src-tab`: a source tab (a button); `.src-tab[aria-selected="true"]` is the selected one.
-  Its parts are `.name`, `.range`, `.centre` and `.health`.
+  Its parts are `.name`, `.range`, `.centre` and `.health`. `.map-tab` is the Map tab after the
+  source tabs (also a `.src-tab`, with `.name` and a `.count`); while it is selected the shown
+  source's tab carries `.kept`.
 - `#rail`: the frequency-aligned rail beside the axis (present while `data-rail` is `on`).
 - `.wf-axis`: the frequency axis. `#waterfall`: the waterfall region. `.wf-canvas`: its canvas.
 - `#side`: the side column. `section.pane` is a pane in it (`#pane-transcript`, `#pane-jobs`);
@@ -218,7 +220,8 @@ With only the binary and no checkout, fetch the starting files from a running no
 `/ui/themes/plain/theme.json` and `/ui/themes/plain/style.css` (no bearer needed). The
 `style.css` comes back wrapped in the theme's scope, so start from `theme.json` and an empty
 `style.css`. `#cmd`: its input. `#mic`: the microphone button.
-- `#map`: the map pane. `#graph`: the graph view (a modal dialog).
+- `#map`: the map, in the waterfall's place while the Map tab is selected. `#graph`: the graph
+  view (a modal dialog).
 - `[role="menu"]`: a menu (`#ctx`, the box menu, and `#ctx-outline`, the outline menu); its entries
   are `.ctx-item`.
 
@@ -246,7 +249,8 @@ State hooks (classes and attributes the page toggles; style them, never depend o
 - `.job[data-state="failed"]`: a failed job (there is no `.failed` class).
 
 On `<html>`: `html[data-theme]` (the active theme's `id`), `html[data-rail]` (`on` or `off`, from
-`layout.rail`) and `html[data-footprint]` (`wide` or `narrow`).
+`layout.rail`), `html[data-footprint]` (`wide` or `narrow`) and `html[data-main]` (`rf` or `map`:
+what the main area shows, the waterfall or the map; the view's `main`).
 
 ## Worked example
 

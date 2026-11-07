@@ -149,6 +149,12 @@ input:focus { border-color: var(--accent); }
 .src-tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 .src-tab[aria-selected="true"] .name { color: var(--accent); }
 .src-tab.fault .name { color: var(--error); }
+/* The Map tab (app.js mapTab): after the source tabs; the shown source's tab keeps its colour
+   (`kept`) while the map is shown, so the page shows which source it returns to. */
+.src-tab.kept { color: var(--text); }
+.src-tab.kept .name { color: var(--accent); }
+.map-tab .count { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.map-tab .count:empty { display: none; }
 /* A pinned source (plan 12 spec 4.1): `pin` after the range; the title names the band. */
 .src-tab .tag.pin {
   border: 1px solid var(--accent);
@@ -172,16 +178,18 @@ input:focus { border-color: var(--accent); }
 .pane-tab[hidden] { display: none; }
 .pane-tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
 #drawer-toggle { display: none; align-self: center; }
-#map-toggle { display: none; align-self: center; }
-#map-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 #listen-all { align-self: center; }
 #listen-all[aria-pressed="true"] { border-color: var(--ok); color: var(--ok); }
 
 #main { grid-area: main; position: relative; min-width: 0; min-height: 0; }
 #waterfall { position: absolute; inset: 0; background: var(--bg); }
-/* The map (map.js, view `map on`): a pane beside the waterfall in the wide footprint. */
-#map { position: absolute; top: 0; bottom: 0; right: 0; left: 50%; background: var(--bg); }
-html[data-map="on"] #waterfall { right: 50%; }
+/* The map (map.js): the Map tab's view, in the waterfall's place while the view's `main` is
+   map (<html data-main>, app.js applyMain). The hidden waterfall keeps its box, so its
+   canvases keep their size and its job keeps streaming (waterfall.js paints nothing then). */
+#map { position: absolute; inset: 0; background: var(--bg); }
+html[data-main="rf"] #map { display: none; }
+html[data-main="map"] #map { display: block; inset: 0; }
+html[data-main="map"] #waterfall { visibility: hidden; }
 #map .leaflet-popup-content .age { color: var(--map-dim); font-size: 11px; }
 #map path.map-pos { stroke: var(--map-mark); fill: var(--map-mark); fill-opacity: 0.8; stroke-width: 2; }
 #map path.map-track { stroke: var(--map-mark); stroke-opacity: 0.7; stroke-width: 2; fill: none; }
@@ -553,12 +561,7 @@ html[data-footprint="narrow"] .brand { display: none; }
 html[data-footprint="narrow"] .src-tab .range { display: none; }
 html[data-footprint="narrow"] .src-tab .centre { display: inline; }
 html[data-footprint="narrow"] #drawer-toggle { display: inline-block; }
-/* Narrow: the map is a tab in the waterfall's place (#map-toggle), not a pane beside it. */
-html[data-footprint="narrow"][data-map="on"] #map-toggle { display: inline-block; }
-html[data-footprint="narrow"] #waterfall { right: 0; }
-html[data-footprint="narrow"] #map { left: 0; z-index: 5; }
-html[data-footprint="narrow"]:not([data-pane="map"]) #map { display: none; }
-/* And so is the strip's pane (its tab), the whole of #main. */
+/* Narrow: the strip's pane (its tab) is the whole of #main, over the waterfall or the map. */
 html[data-footprint="narrow"] #pane { top: 0; height: auto; z-index: 5; border-top: 0; }
 html[data-footprint="narrow"] #side { display: none; }
 html[data-footprint="narrow"][data-drawer="open"] #side {

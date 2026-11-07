@@ -25,7 +25,8 @@
 //   drawnPoints(kept, latest) -> [[lat, lon]]   the line: the kept points, ending at the latest
 //       fix (`cap` at most, as `kept` is under it)
 //   mountMap(el, api, view, {jobs, subjects}) -> MapPane
-//       `el` (#map) is shown while view.get("map") is "on" and hidden otherwise (view.onChange).
+//       `el` (#map) is shown while view.get("main") is "map" and hidden otherwise (view.onChange;
+//       `invalidateSize` on each show).
 //       Leaflet (vendor/leaflet, served by the node) is loaded the first time the map shows,
 //       so a page that never shows it never loads it. `jobs()` returns the last `job_list`
 //       result, `subjects` the store (subjects.js). `api` is the node's client (unused so far:
@@ -220,7 +221,7 @@ class MapPane {
     this.ro = new ResizeObserver(() => this.map?.invalidateSize());
     this.ro.observe(el);
     view.onChange((key) => {
-      if (key === "map") this.show();
+      if (key === "main") this.show();
       else if (key === "home") this.drawHome();
     });
     subjects?.onTick(() => this.markDim());
@@ -231,7 +232,7 @@ class MapPane {
 
   show() {
     if (this.destroyed) return;
-    const on = this.view.get("map") === "on";
+    const on = this.view.get("main") === "map";
     this.el.hidden = !on;
     if (!on) return;
     if (this.map) {

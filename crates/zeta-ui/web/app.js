@@ -84,9 +84,12 @@
 // The map (map.js) is mounted in #map at login: the overlays hand it every event of the jobs
 // they watch and of the positioned jobs on the other sources (ov.onEvent), each jobs poll drops the tracks of jobs that ended (map.sync), and
 // a job row with a fix shows its distance and bearing from the view's `home` (map.rowText).
-// With view `map on` <html data-map="on"> is set: in the wide footprint the map is a pane
-// beside the waterfall; in the narrow one #map-toggle (`map`, beside the source tabs) shows
-// it in the waterfall's place (<html data-pane="map">) and back.
+// The map is the Map tab of the sources strip (renderTabs appends it after the source tabs):
+// the view's `main` (rf | map; `map on|off` is its alias) says what #main shows, and
+// <html data-main> follows it (applyMain; style.css hides the waterfall, which keeps its job,
+// zoom and outlines, and shows the map in its place, in both footprints). The Map tab sets
+// `main map` (a second click `main rf`), a source tab `main rf` after selecting its source;
+// the shown source is unchanged meanwhile and its tab carries class `kept`.
 //
 // The subjects (subjects.js): the store is mounted before the overlays, which hand it every
 // event first and ask it for mode rows; each jobs poll drops the subjects of jobs that ended.
@@ -293,11 +296,39 @@ function rangeText(src) {
 function select(id) {
   state.selected = id;
   store(SOURCE_KEY, id);
-  for (const tab of document.querySelectorAll(".src-tab")) {
-    tab.setAttribute("aria-selected", String(tab.dataset.id === id));
-  }
+  syncMainTabs();
   const src = state.sources.find((s) => s.id === id) || null;
   for (const fn of sourceListeners) fn(src);
+}
+
+// The strip's selection from the view's `main` and the shown source: the Map tab is the
+// selected one while `main` is map, the shown source's tab then keeps class `kept`.
+function syncMainTabs() {
+  const map = !!state.view && state.view.get("main") === "map";
+  for (const tab of document.querySelectorAll("#tabs .src-tab")) {
+    const isMap = tab.classList.contains("map-tab");
+    const shownTab = !isMap && tab.dataset.id === state.selected;
+    tab.setAttribute("aria-selected", String(isMap ? map : shownTab && !map));
+    if (!isMap) tab.classList.toggle("kept", shownTab && map);
+  }
+}
+
+// The Map tab: not a source (source_list never lists it, syncTabs never touches it).
+function mapTab() {
+  const tab = document.createElement("button");
+  tab.className = "src-tab map-tab";
+  tab.setAttribute("role", "tab");
+  tab.dataset.view = "map";
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = "Map";
+  const count = document.createElement("span");
+  count.className = "count";
+  tab.append(name, count);
+  tab.onclick = () => {
+    if (state.view) state.view.set("main", state.view.get("main") === "map" ? "rf" : "map");
+  };
+  return tab;
 }
 
 // A pinned source's tab title (spec 4.1): `pin <lo>–<hi> MHz`, then `; gain <db> dB` (or
@@ -384,9 +415,13 @@ function renderTabs(sources) {
       centre.textContent = centreText(s);
       tab.append(name, range, centre);
       decorateTab(tab, s);
-      tab.onclick = () => select(s.id);
+      tab.onclick = () => {
+        select(s.id);
+        if (state.view && state.view.get("main") !== "rf") state.view.set("main", "rf");
+      };
       return tab;
     }),
+    mapTab(),
   );
   const saved = load(SOURCE_KEY);
   const pick = sources.find((s) => s.id === saved) || sources[0];
@@ -903,12 +938,12 @@ function start(api) {
   applySide();
   mountSideHeads();
   applyRail();
-  applyMapPane();
+  applyMain();
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
     if (key === "theme") applyTheme();
     if (key === "side") applySide();
-    if (key === "map") applyMapPane();
+    if (key === "main") applyMain();
     if (key === "pane") applyPanes();
   });
   state.ov.setSource(state.selected);
@@ -1033,8 +1068,6 @@ function redrawPlan() {
   if (state.wf) state.wf.drawAxis();
 }
 
-// <html data-map="on"> while the view's `map` policy is on (style.css lays the pane out);
-// off also leaves the narrow footprint's map tab.
 // The node's station as the home while the view's `home` is none (view.js homeOf): read
 // once per page load; `view set home` keeps precedence. A node without one, or an older
 // node without the op, leaves no home.
@@ -1205,27 +1238,24 @@ function applyRail() {
   state.ov.setRail(document.documentElement.dataset.rail === "on" ? state.wf.rail : null);
 }
 
-function applyMapPane() {
+// <html data-main="rf|map"> from the view's `main` (style.css shows the waterfall or the map
+// in #main), the strip's selection with it; the box menu's selection goes, as a source switch
+// drops it.
+function applyMain() {
+  const main = state.view ? state.view.get("main") : "rf";
   const root = document.documentElement;
-  const on = !!state.view && state.view.get("map") === "on";
-  if (on) root.dataset.map = "on";
-  else {
-    delete root.dataset.map;
-    if (root.dataset.pane === "map") delete root.dataset.pane;
+  if (root.dataset.main !== main) {
+    root.dataset.main = main;
+    if (main === "map") state.menu?.close();
   }
-  $("#map-toggle").setAttribute("aria-pressed", String(root.dataset.pane === "map"));
+  syncMainTabs();
   state.panes?.render();
 }
 
-// The pane strip and #pane from the view's `pane` and the panes' eligibility (panes.js), and
-// the map's narrow tab, which a pane's tab replaces. Run on a view change, a row learned, a jobs
-// poll and a footprint change, never on a message.
+// The pane strip and #pane from the view's `pane` and the panes' eligibility (panes.js). Run on
+// a view change, a row learned, a jobs poll and a footprint change, never on a message.
 function applyPanes() {
   state.panes?.render();
-  $("#map-toggle").setAttribute(
-    "aria-pressed",
-    String(document.documentElement.dataset.pane === "map"),
-  );
 }
 
 // The shown source's last `source_list` record (null when unknown).
@@ -1616,6 +1646,10 @@ window.zetaTest = {
     if (!c) return null;
     return { scanJobId: c.scanJobId, followed: c.followed, source: c.source, rows: c.rows };
   },
+  // The shown source's id (state.selected; unchanged while the Map tab is selected).
+  shown() {
+    return state.selected ?? null;
+  },
   // The waterfall: {sourceId, jobId, painted, badge, coarsePainted, coarseMasked, easing, view
   // (the band shown, {lo, hi} or null), band (the capture)}, or null without one.
   wf() {
@@ -1659,12 +1693,6 @@ function boot() {
     else root.dataset.drawer = "open";
   });
   $("#listen-all").addEventListener("click", () => listen(null, { toggle: true }));
-  $("#map-toggle").addEventListener("click", () => {
-    const root = document.documentElement;
-    if (root.dataset.pane === "map") delete root.dataset.pane;
-    else root.dataset.pane = "map";
-    applyMapPane();
-  });
   $("#login-form").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const secret = $("#secret").value;

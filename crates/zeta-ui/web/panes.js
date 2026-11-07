@@ -26,9 +26,9 @@
 // A tab shows while its pane is eligible or selected, `aria-selected` on the selected one. A
 // click on the selected tab deselects (`pane none`). <html data-strip="<id>"> is set while a
 // pane is selected in the wide footprint (style.css gives it the bottom of #main). In the
-// narrow footprint a pane is shown in the waterfall's place only while <html data-pane> names
-// it (as the map's tab does): a click on its tab selects it and sets data-pane, a click on
-// the one shown clears both.
+// narrow footprint a pane is shown in the main area's place (over the waterfall or the map)
+// only while <html data-pane> names it: a click on its tab selects it and sets data-pane, a
+// click on the one shown clears both.
 
 let live = null;
 
