@@ -4,10 +4,11 @@
 //!   features-only signature ([`crate::signatures::CONFIDENCE_FEATURES`]) at its end
 //!   ([`capture_ended`]), unless its classify proved a mode, its label is `noise`, or an
 //!   accepted signature's band already holds the window's centre.
-//! - A `bits` job, a `graph` job and a frame row's job propose once when they reach
+//! - A `bits` job and a `graph` job propose once when they reach
 //!   [`PROPOSE_CRC_FRAMES`] CRC-clean frames: a `hypotheses` event with a CRC candidate
 //!   that checks on that many, or that many `frame` events with `crc_ok`
-//!   ([`watch_for_proposals`]).
+//!   ([`watch_for_proposals`]). A mode row's job (a frame row's) never proposes: its
+//!   frames prove the row (its session's `proved`).
 //! - Every mode row's job is watched for the row's first proof, which supersedes the
 //!   accepted signatures it overlaps (`Inner::supersede_by`; a `learned_*` row's never
 //!   does).
@@ -34,9 +35,7 @@ use crate::knowledge::Allocation;
 use crate::modes::{Decoder, FRAME_DECODE_STAGE, ModeRow};
 use crate::ops::{BITS_KIND, CAPTURE_IN_STAGE, GRAPH_KIND, JobKind};
 use crate::sessions::{Outcome, Session};
-use crate::signatures::{
-    LEARNED_ROW_PREFIX, NOISE_LABEL, NewSignature, PROPOSE_CRC_FRAMES, SignatureRecord,
-};
+use crate::signatures::{NOISE_LABEL, NewSignature, PROPOSE_CRC_FRAMES, SignatureRecord};
 use crate::stream::{Frame, Payload};
 use crate::types::{Baud, Hz, Provenance, Span, StreamId, StreamKind, Timestamp};
 
@@ -277,19 +276,18 @@ fn frame_row(inner: &Inner, kind: &str) -> Option<ModeRow> {
     mode_row(inner, kind).filter(|r| matches!(r.decoder, Decoder::Frame(_)))
 }
 
-/// Whether the job `rec` watches its frames for a proposal: a `bits` or `graph` job, or
-/// a frame row's job (not a `learned_*` row's).
-pub(super) fn proposes(inner: &Inner, rec: &JobRecord) -> bool {
-    rec.kind == BITS_KIND
-        || rec.kind == GRAPH_KIND
-        || (frame_row(inner, &rec.kind).is_some() && !rec.kind.starts_with(LEARNED_ROW_PREFIX))
+/// Whether the job `rec` watches its frames for a proposal: a `bits` or `graph` job.
+/// A mode row's job (a frame row's, a `learned_*` row's) does not: the row already
+/// decodes the signal, and its frames prove the row (its session's `proved`).
+fn proposes(rec: &JobRecord) -> bool {
+    rec.kind == BITS_KIND || rec.kind == GRAPH_KIND
 }
 
 /// Whether the job `rec`'s events are watched ([`watch_for_proposals`]): it
 /// [`proposes`], or it runs a mode row (whose first proof supersedes the accepted
 /// signatures it overlaps).
 pub(super) fn watches(inner: &Inner, rec: &JobRecord) -> bool {
-    proposes(inner, rec) || mode_row(inner, &rec.kind).is_some()
+    proposes(rec) || mode_row(inner, &rec.kind).is_some()
 }
 
 /// What set a job's proposal off.
@@ -345,7 +343,7 @@ pub(super) fn watch_for_proposals(
     token: &CancellationToken,
 ) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
-    let propose = proposes(inner, rec) && proposal_of(&rec.context).is_none();
+    let propose = proposes(rec) && proposal_of(&rec.context).is_none();
     let row = mode_row(inner, &rec.kind);
     if !propose && row.is_none() {
         return handles;
@@ -557,11 +555,10 @@ fn propose_for_job(
 ) {
     let captures = job_captures(rec);
     let first = captures.first().and_then(|c| inner.bursts.get(c));
-    let row = frame_row(inner, &rec.kind);
     let features = first
         .as_ref()
         .and_then(|w| serde_json::from_value::<FeatureRecord>(w.features.clone()).ok())
-        .unwrap_or_else(|| tuning_features(rec, row.as_ref()));
+        .unwrap_or_else(|| tuning_features(rec, None));
     let modulation = rec.context["bits"]["modulation"]
         .as_str()
         .map(str::to_string)
@@ -587,16 +584,13 @@ fn propose_for_job(
             )
         }
         Trigger::Frames(n) => {
-            let framing = match row.as_ref().map(|r| &r.decoder) {
-                Some(Decoder::Frame(b)) => b.framing.clone(),
-                _ => rec
-                    .graph
-                    .nodes
-                    .iter()
-                    .find(|n| n.kind == FRAME_DECODE_STAGE)
-                    .map(|n| n.params.clone())
-                    .unwrap_or(Value::Null),
-            };
+            let framing = rec
+                .graph
+                .nodes
+                .iter()
+                .find(|n| n.kind == FRAME_DECODE_STAGE)
+                .map(|n| n.params.clone())
+                .unwrap_or(Value::Null);
             (framing, n, format!("{n} CRC-clean frames ({})", rec.kind))
         }
     };

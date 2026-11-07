@@ -590,33 +590,33 @@ async fn a_proposal_from_a_jobs_last_events_is_in_its_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_frame_row_job_proposes_on_five_clean_frames() {
+async fn a_frame_row_job_proposes_nothing() {
     let _one = SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let node = open(dir.path(), Some(&framed_iq()), true).await;
     let job = frame_row_job(&node).await;
-    until("a proposal", Duration::from_secs(20), || {
-        !node.signatures().list(None).is_empty()
+    // The row decodes the signal: its frames are its proof, not a proposal's.
+    until("five CRC-clean frames", Duration::from_secs(20), || {
+        node.job_context(&job)
+            .is_some_and(|c| c["frame_decode"]["crc_ok"].as_u64().is_some_and(|n| n >= 5))
     })
     .await;
-    let sig = node.signatures().list(None).remove(0);
-    assert_eq!(
-        sig.evidence,
-        format!("5 CRC-clean frames ({ROW_ID})"),
-        "{sig:?}"
-    );
-    assert_eq!(sig.confidence, CONFIDENCE_CRC, "{sig:?}");
-    assert_eq!(sig.framing, Some(framing()), "{sig:?}");
-    assert_eq!(sig.modulation, "fsk", "{sig:?}");
-    assert_eq!(sig.symbol_rate_baud.map(|b| b.0), Some(BAUD), "{sig:?}");
-    assert_eq!(sig.provenance.captures, Vec::<String>::new(), "{sig:?}");
-    assert_eq!(sig.provenance.jobs, std::slice::from_ref(&job), "{sig:?}");
-    assert_eq!(sig.min_hz.0, CENTER_HZ - BANDWIDTH_HZ / 2, "{sig:?}");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(node.signatures().list(None).is_empty());
     let ctx = node.job_context(&job).unwrap();
-    assert_eq!(ctx["proposal"], sig.id.as_str(), "{ctx}");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(node.signatures().list(None).len(), 1);
+    assert!(ctx.get("proposal").is_none(), "{ctx}");
     node.job_stop(&job).await.unwrap();
+    until("the session record", Duration::from_secs(5), || {
+        session(dir.path(), &job).is_some()
+    })
+    .await;
+    let s = session(dir.path(), &job).unwrap();
+    assert_eq!(
+        s["outcome"],
+        json!({"kind": "proved", "mode": ROW_ID}),
+        "{s}"
+    );
+    assert!(node.signatures().list(None).is_empty());
 }
 
 async fn frame_row_job(node: &Node) -> JobId {
