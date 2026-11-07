@@ -644,8 +644,11 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                         "{path}.{name} is a time field without _ns/_ms"
                     );
                     // A learned signature's burst shape keeps the feature record's
-                    // measured milliseconds (a number, maybe null), not a timeout.
-                    if name.ends_with("_ms") && !path.ends_with(".Burst") {
+                    // measured milliseconds (a number, maybe null), not a timeout; a
+                    // knowledge `Signature` inlines it as its nullable `burst`.
+                    let burst =
+                        path.ends_with(".Burst") || path.ends_with(".Signature.properties.burst");
+                    if name.ends_with("_ms") && !burst {
                         assert_eq!(s["type"], "integer", "{path}.{name} is not an integer");
                     }
                     if ["_hz", "_ns", "_baud"].iter().any(|u| name.ends_with(u)) {

@@ -10,6 +10,7 @@ pub mod emission;
 pub mod graph;
 pub mod job;
 pub mod knowledge;
+pub mod learned;
 pub mod lease;
 pub mod modes;
 pub mod node;

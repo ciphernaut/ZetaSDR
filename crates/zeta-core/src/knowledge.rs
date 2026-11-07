@@ -92,10 +92,12 @@ pub(crate) fn require_all(schema: &mut schemars::Schema) {
     schema.insert("required".into(), props.into());
 }
 
-/// What a known signal looks like and which decoder handles it.
+/// What a known signal looks like and which decoder handles it. The fields after
+/// `decoder` are `null` for the seed and the catalogue; a learned signature
+/// ([`crate::learned::LearnedKnowledge`]) fills those its record holds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
 pub struct Signature {
     pub name: String,
     pub min_hz: Hz,
@@ -106,6 +108,38 @@ pub struct Signature {
     pub symbol_rate_baud: Option<Baud>,
     #[schemars(required)]
     pub decoder: Option<String>,
+    /// Modulation order (2 or 4 tones, or PSK points).
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<u8>")]
+    pub order: Option<u8>,
+    /// Spacing of adjacent FSK tones.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<Hz>")]
+    pub tone_spacing_hz: Option<Hz>,
+    /// The burst shape (duty, burst length, period).
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<crate::signatures::Burst>")]
+    pub burst: Option<crate::signatures::Burst>,
+    /// The framing's sync word, hex.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<String>")]
+    pub sync: Option<String>,
+    /// The framing's line code (`nrz`, `nrzi`, `manchester`, ...).
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<String>")]
+    pub encoding: Option<String>,
+    /// The framing's CRC.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<String>")]
+    pub crc: Option<String>,
+    /// How sure the signature is (a learned record's confidence).
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<f32>")]
+    pub confidence: Option<f32>,
+    /// Where it comes from: `learned` for an accepted learned signature.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<String>")]
+    pub tier: Option<String>,
 }
 
 #[async_trait]
@@ -168,7 +202,7 @@ fn invalid(e: serde_json::Error) -> std::io::Error {
 }
 
 /// Whether `[min, max]` overlaps `[center - bw/2, center + bw/2]`.
-fn overlaps(min: Hz, max: Hz, center: Hz, bandwidth: Hz) -> bool {
+pub(crate) fn overlaps(min: Hz, max: Hz, center: Hz, bandwidth: Hz) -> bool {
     let half = bandwidth.0 / 2;
     min.0 <= center.0.saturating_add(half) && max.0 >= center.0.saturating_sub(half)
 }

@@ -288,9 +288,11 @@ async fn ended(
     assert_eq!(last["job"], v["job"].clone(), "{last} vs {ctx}");
     assert_eq!(last["allocations"], v["allocations"], "{last} vs {ctx}");
     let summary = last["summary"].as_str().unwrap();
-    match v["mode"].is_null() {
-        true => assert!(summary.starts_with("unknown at "), "{last}"),
-        false => assert!(summary.contains(" at "), "{last}"),
+    match (v["mode"].is_null(), v["learned"].is_null()) {
+        (true, true) => assert!(summary.starts_with("unknown at "), "{last}"),
+        // A learned match names the signature, as the watch does.
+        (true, false) => assert!(summary.starts_with("learned "), "{last}"),
+        (false, _) => assert!(summary.contains(" at "), "{last}"),
     }
     for e in &events {
         assert_eq!(e["protocol"], "candidate", "{e}");
@@ -875,4 +877,97 @@ async fn trials_stay_on_the_band_when_the_capture_is_no_wider() {
         );
     }
     stop_all(&node).await;
+}
+
+/// Accept, straight into the node's store, a signature of the band `width_hz` wide at
+/// `offset_hz` from the centre of `meta`'s recording, from layer 1's measurement of its
+/// first second; framed with a CRC that checked on five frames (confidence 0.9), so a
+/// match reaches the verdict's floor.
+async fn accept_signature(
+    node: &Node,
+    meta: &Path,
+    offset_hz: i64,
+    width_hz: u64,
+) -> zeta_core::signatures::SignatureRecord {
+    use zeta_core::classify::{Band, ClassifierSet};
+    use zeta_core::signatures::{NewSignature, PROPOSE_CRC_FRAMES};
+    let (m, iq) = zeta_core::capture::read_cf32(meta).unwrap();
+    let second = &iq[..iq.len().min(m.sample_rate_hz.0 as usize)];
+    let mut set = ClassifierSet::default();
+    for c in zeta_dsp::classifiers(node.modes()) {
+        set.register(c);
+    }
+    let band = Band {
+        offset_hz,
+        bandwidth_hz: Hz(width_hz),
+    };
+    let measured = set
+        .measure(second, m.sample_rate_hz, m.center_hz, band)
+        .await
+        .expect("layer 1 measures the band");
+    let new = NewSignature {
+        name: Some("test link".into()),
+        features: measured.features,
+        modulation: measured.label.name,
+        framing: Some(serde_json::json!({
+            "sync": {"hex": "2dd4", "bits": 16},
+            "length": {"fixed_bits": 272},
+            "crc": "crc16-ccitt",
+        })),
+        crc_frames: PROPOSE_CRC_FRAMES,
+        evidence: "test".into(),
+        source: rx(),
+        station: None,
+        captures: vec![],
+        jobs: vec![],
+        allocation: None,
+        proposed_by: "cli".into(),
+    };
+    let store = node.signatures();
+    let rec = store.propose(new, 1).unwrap();
+    store.accept(&rec.id, None, "cli", 2).unwrap()
+}
+
+/// An accepted signature of the GFSK signal: identify still tries every row and ends
+/// with no mode, but its verdict names the learned match (`label` and `learned`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identify_reports_a_learned_signal_in_its_unknown_verdict() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().gfsk).await;
+    let sig = accept_signature(&node, &fixtures().gfsk, 0, BANDWIDTH_HZ).await;
+    let (id, events) = identify(&node, APRS_HZ).await;
+    let stream = node
+        .bus()
+        .list()
+        .into_iter()
+        .find(|s| s.provenance.job.as_ref() == Some(&id) && s.kind == StreamKind::Event)
+        .unwrap()
+        .id;
+    let mut tap = node.bus().subscribe(&stream).unwrap();
+    ended(&node, &id, events, Duration::from_secs(40)).await;
+    let ctx = node.job_context(&id).unwrap();
+    let verdict = &ctx["identify"]["verdict"];
+    assert!(verdict["mode"].is_null(), "{ctx}");
+    assert_eq!(verdict["label"], "learned test link", "{ctx}");
+    assert_eq!(verdict["learned"]["id"], sig.id.as_str(), "{ctx}");
+    assert_eq!(verdict["learned"]["name"], "test link", "{ctx}");
+    let confidence = verdict["learned"]["confidence"].as_f64().unwrap();
+    assert!(confidence >= 0.5, "{ctx}");
+    assert!(verdict["features"]["bandwidth_hz"].is_u64(), "{ctx}");
+    // The verdict event words it as the watch does.
+    let mut last = None;
+    while let Ok(f) = tap.try_recv() {
+        if let Payload::Event(v) = f.payload {
+            last = Some(v);
+        }
+    }
+    let last = last.expect("events");
+    let summary = last["summary"].as_str().unwrap();
+    assert!(summary.starts_with("learned test link at "), "{summary}");
+    assert_eq!(last["label"], "learned test link", "{last}");
+    // The match is counted.
+    let after = node.signatures().get(&sig.id).unwrap();
+    assert!(after.matches >= 1, "{after:?}");
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
 }

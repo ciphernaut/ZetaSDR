@@ -829,6 +829,13 @@ impl Node {
         }
         let signatures = crate::signatures::SignatureStore::open(&cfg.state_dir).map_err(io)?;
         load_errors.extend(signatures.load_errors().iter().cloned());
+        // Every node lists and scores its accepted signatures.
+        let learned_knowledge: Arc<dyn KnowledgeProvider> =
+            Arc::new(crate::learned::LearnedKnowledge(signatures.clone()));
+        let mut classifiers = ClassifierSet::default();
+        classifiers.register(Arc::new(crate::learned::LearnedClassifier(
+            signatures.clone(),
+        )));
         let sessions = crate::sessions::SessionStore::open(&cfg.state_dir).map_err(io)?;
         sessions.sweep(&bursts.list().into_iter().map(|r| r.id).collect());
         let modes = modes
@@ -869,8 +876,8 @@ impl Node {
                 bank_factory: RwLock::new(cfg.bank_factory),
                 banks: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
-                knowledge: RwLock::new(Vec::new()),
-                classifiers: RwLock::new(ClassifierSet::default()),
+                knowledge: RwLock::new(vec![learned_knowledge]),
+                classifiers: RwLock::new(classifiers),
                 persist_errors: Mutex::new(Vec::new()),
                 ops_log: jsonlog::JsonLog::new(cfg.state_dir.join("ops.log")),
                 transcripts_log: jsonlog::JsonLog::new(cfg.state_dir.join("transcripts.log")),

@@ -143,6 +143,14 @@ impl KnowledgeProvider for CatalogueKnowledge {
                         modulation: e.modulations.first().cloned().unwrap_or_default(),
                         symbol_rate_baud: None,
                         decoder: self.decoder(&e.id),
+                        order: None,
+                        tone_spacing_hz: None,
+                        burst: None,
+                        sync: None,
+                        encoding: None,
+                        crc: None,
+                        confidence: None,
+                        tier: None,
                     })
             })
             .collect()

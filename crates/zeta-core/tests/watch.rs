@@ -53,6 +53,55 @@ struct Fixtures {
     fsk: PathBuf,
     /// The rows of the in-crate decoders with a 1500 ms dwell, for the FSK test's pace.
     quick_modes: PathBuf,
+    /// Eight CRC-framed 4800-baud FSK frames every 2 s: [`FRAME_ROW`] proves them.
+    framed: PathBuf,
+    /// [`Fixtures::quick_modes`] and [`FRAME_ROW`].
+    frame_modes: PathBuf,
+}
+
+/// The frame row of the frame-row watch test, at [`POCSAG_HZ`].
+const FRAME_ROW: &str = "fsk_test_frames";
+const FRAME_BAUD: u32 = 4_800;
+
+/// The frame row's framing: a 16-bit sync, a fixed 272-bit frame, a CRC-16/CCITT.
+fn frame_framing() -> Value {
+    serde_json::json!({"sync": {"hex": "2dd4", "bits": 16}, "length": {"fixed_bits": 272},
+        "crc": "crc16-ccitt"})
+}
+
+/// The frame row (as `tests/frame_rows.rs`) on the fixtures' signal centre, with a 4 s
+/// dwell.
+fn frame_row() -> Value {
+    serde_json::json!({
+        "id": FRAME_ROW,
+        "name": "FSK test frames",
+        "family": "general",
+        "band": {"bandwidth_hz": 12_500, "centers_hz": [POCSAG_HZ]},
+        "modulation": ["fsk", "fm"],
+        "label": "FSK frames",
+        "protocol": "frame",
+        "decoder": {
+            "kind": "frame",
+            "demod": {"modulation": "fsk", "symbol_rate_baud": FRAME_BAUD, "order": 2,
+                "tone_spacing_hz": null},
+            "framing": frame_framing(),
+            "parser": "opaque"
+        },
+        "event": {
+            "schema": {"type": "object", "properties": {
+                "protocol": {"type": "string"},
+                "sync": {"type": "string"},
+                "length_bytes": {"type": "integer"},
+                "bytes": {"type": "string"},
+                "crc_ok": {"type": "boolean"},
+                "payload": {"type": "string"}
+            }},
+            "summary": "frame {length_bytes} B"
+        },
+        "identify": {"proof": "field", "field": "crc_ok", "min_events": 1, "dwell_ms": 4_000,
+            "min_span_ms": 1000, "quick": "frame"},
+        "catalogue": []
+    })
 }
 
 fn fixtures() -> &'static Fixtures {
@@ -93,11 +142,29 @@ fn fixtures() -> &'static Fixtures {
             let name = Path::new(&file).file_name().unwrap().to_owned();
             std::fs::write(quick_modes.join(name), row.to_string()).unwrap();
         }
+        let params = serde_json::json!({"family": "framing", "modulation": "fsk",
+            "symbol_rate_baud": FRAME_BAUD, "deviation_hz": 2400.0, "frames": 8,
+            "body_bytes": 32, "seed": 7, "framing": frame_framing(), "repeat": 1,
+            "offset_hz": OFFSET_HZ as f64});
+        let (spec, imp) =
+            zeta_dsp::synth::parse_params(params.as_object().unwrap().clone()).unwrap();
+        let frames = zeta_dsp::synth::synthesise(&spec, &imp, RATE_HZ, CENTER_HZ);
+        let framed = write(dir.path(), "framed", &cycle(frames, 3), CENTER_HZ);
+        let frame_modes = dir.path().join("frame_modes");
+        std::fs::create_dir_all(&frame_modes).unwrap();
+        for entry in std::fs::read_dir(&quick_modes).unwrap() {
+            let p = entry.unwrap().path();
+            std::fs::copy(&p, frame_modes.join(p.file_name().unwrap())).unwrap();
+        }
+        let row = frame_row().to_string();
+        std::fs::write(frame_modes.join(format!("{FRAME_ROW}.json")), row).unwrap();
         Fixtures {
             _dir: dir,
             pocsag,
             fsk,
             quick_modes,
+            framed,
+            frame_modes,
         }
     })
 }
@@ -1904,4 +1971,117 @@ async fn a_watch_graphs_fft_edge_is_unfed_but_its_signal_events_are_fed() {
     }
     assert!(signal, "no signal event from the watch in the feed");
     stop_all(&node).await;
+}
+
+/// Accept, straight into the node's store, a signature of the fixture `meta`'s signal
+/// (the band at [`OFFSET_HZ`], 12.5 kHz wide) from layer 1's measurement of its burst
+/// (the cycle's first second); framed with a CRC that checked on five frames
+/// (confidence 0.9), so a match reaches identify's verdict floor.
+async fn accept_signature(node: &Node, meta: &Path) -> zeta_core::signatures::SignatureRecord {
+    use zeta_core::classify::{Band, ClassifierSet};
+    use zeta_core::signatures::{NewSignature, PROPOSE_CRC_FRAMES};
+    let (m, iq) = zeta_core::capture::read_cf32(meta).unwrap();
+    let burst = &iq[..RATE_HZ as usize];
+    let mut set = ClassifierSet::default();
+    for c in zeta_dsp::classifiers(node.modes()) {
+        set.register(c);
+    }
+    let band = Band {
+        offset_hz: OFFSET_HZ as i64,
+        bandwidth_hz: Hz(12_500),
+    };
+    let measured = set
+        .measure(burst, m.sample_rate_hz, m.center_hz, band)
+        .await
+        .expect("layer 1 measures the band");
+    let new = NewSignature {
+        name: Some("test link".into()),
+        features: measured.features,
+        modulation: measured.label.name,
+        framing: Some(frame_framing()),
+        crc_frames: PROPOSE_CRC_FRAMES,
+        evidence: "test".into(),
+        source: rx(),
+        station: None,
+        captures: vec![],
+        jobs: vec![],
+        allocation: None,
+        proposed_by: "cli".into(),
+    };
+    let store = node.signatures();
+    let rec = store.propose(new, 1).unwrap();
+    store.accept(&rec.id, None, "cli", 2).unwrap()
+}
+
+/// `on_unknown: capture` over a signal an accepted signature knows: every identify run
+/// ends unknown but names the learned match, so the signal is neither captured nor
+/// proposed again, and its retries go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_watch_does_not_capture_a_learned_signal() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(1_000, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let node = fsk_node(dir.path()).await;
+    let sig = accept_signature(&node, &fixtures().fsk).await;
+    let params = serde_json::json!({"on_unknown": "capture", "capture": {"bursts": 2}});
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    // The retry identifies again: the retry schedule is kept.
+    until("a second unknown", Duration::from_secs(90), || {
+        events.watch("unknown").len() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let all = events.all();
+    for e in events.watch("unknown") {
+        let summary = e["summary"].as_str().unwrap();
+        assert!(summary.starts_with("learned test link at "), "{e}");
+    }
+    assert!(events.watch("capturing").is_empty(), "{all:#?}");
+    assert!(events.watch("captured").is_empty(), "{all:#?}");
+    let ctx = node.job_context(&watch).unwrap();
+    let s = &ctx["watch"]["signals"][0];
+    assert_ne!(s["captured"], true, "{ctx}");
+    // No proposal beside the accepted record.
+    let sigs = node.signatures().list(None);
+    assert_eq!(sigs.len(), 1, "{sigs:#?}");
+    assert_eq!(sigs[0].id, sig.id);
+    assert!(sigs[0].matches >= 2, "{:?}", sigs[0]);
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// A frame row's decoder keeps publishing `timing` (and forwarded `bits`) events on
+/// noise: only events in the row's own protocol (`frame`) count as its signal, so once
+/// the signal is gone and the frames stop it is dropped after the silence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_row_decoder_is_dropped_when_its_frames_stop() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 2_000);
+    let dir = tempfile::tempdir().unwrap();
+    let src = file_source("rx", &fixtures().framed);
+    let port = Muting::new(src.clone(), false);
+    let node = node_over(
+        dir.path(),
+        vec![(port.clone() as Arc<dyn Port>, src)],
+        Some(&fixtures().frame_modes),
+    )
+    .await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let decoding = &events.watch("decoding")[0];
+    assert_eq!(decoding["mode"], FRAME_ROW, "{decoding}");
+    port.mute();
+    until("a lost event", Duration::from_secs(30), || {
+        !events.watch("lost").is_empty()
+    })
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert_eq!(lost["mode"], FRAME_ROW, "{lost}");
+    assert_eq!(state(&node, &job), Some(JobState::Stopped));
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
 }

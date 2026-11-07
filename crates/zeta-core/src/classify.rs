@@ -297,6 +297,37 @@ impl ClassifierSet {
         }
         None
     }
+
+    /// The labels of the layer-2 classifiers named `learned` (the accepted signatures'
+    /// scorer, [`crate::learned::LearnedClassifier`]) for `measured`, run with no IQ:
+    /// the `identify` job's learned match.
+    pub async fn learned(&self, measured: &Measurement) -> Vec<Label> {
+        let band = Band {
+            offset_hz: 0,
+            bandwidth_hz: measured.features.bandwidth_hz,
+        };
+        let mut out = Vec::new();
+        for c in self
+            .classifiers
+            .iter()
+            .filter(|c| c.layer() == crate::learned::LEARNED_LAYER)
+            .filter(|c| c.name() == crate::learned::LEARNED)
+        {
+            let (labels, _, _) = c
+                .classify_measured(
+                    &[],
+                    Hz(0),
+                    measured.features.center_hz,
+                    band,
+                    Some(&measured.features),
+                    Some(measured),
+                    &[],
+                )
+                .await;
+            out.extend(labels);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
