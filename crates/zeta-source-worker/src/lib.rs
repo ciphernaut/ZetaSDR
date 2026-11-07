@@ -4,6 +4,7 @@
 
 pub mod env;
 pub mod port;
+pub mod ring;
 pub mod serve;
 mod supervisor;
 pub mod wire;
