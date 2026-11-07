@@ -5049,6 +5049,9 @@ def scenario_origins_from_the_menu_and_bits(page, url, secret):
         run_cmd(page, "view reset")
         stop_bits_jobs(url, secret)
         clear_captures(url, secret)
+        # The capture job ended on its own, so the node may have proposed a signature of
+        # it (plan 19.3): one left proposed keeps the Explore tab eligible after this.
+        clear_signatures(url, secret)
 
 
 def scenario_no_station_lights_without_bearings(page, url, secret):
