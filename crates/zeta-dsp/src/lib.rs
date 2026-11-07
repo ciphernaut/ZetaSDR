@@ -29,6 +29,7 @@ pub mod correlate;
 pub mod crc;
 pub mod denoise;
 pub mod detect;
+pub mod dfm_frame;
 pub mod fft;
 pub mod frame_decode;
 pub mod frame_parse;

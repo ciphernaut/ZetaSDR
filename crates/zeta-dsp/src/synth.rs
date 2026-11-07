@@ -1023,6 +1023,52 @@ fn rs41_iq(
     out
 }
 
+/// The bounds a radiosonde family's position and climb share.
+fn sonde_position(lat: f64, lon: f64, alt_m: f64, vel_v: f64) -> Result<(), String> {
+    if !(lat.is_finite() && (-90.0..=90.0).contains(&lat)) {
+        return Err("lat: -90..=90".into());
+    }
+    if !(lon.is_finite() && (-180.0..=180.0).contains(&lon)) {
+        return Err("lon: -180..=180".into());
+    }
+    if !(alt_m.is_finite() && (-1000.0..=60_000.0).contains(&alt_m)) {
+        return Err("alt_m: -1000..=60000".into());
+    }
+    if !(vel_v.is_finite() && (-100.0..=100.0).contains(&vel_v)) {
+        return Err("vel_v: -100..=100".into());
+    }
+    Ok(())
+}
+
+/// Most frames the `dfm` family sends (13.4 s at 224 ms a frame).
+const DFM_FRAMES_MAX: u32 = 60;
+
+/// `frames` DFM frames (numbered from 0) back to back, as the sonde sends them: no gap,
+/// no preamble.
+fn dfm_iq(
+    serial: &str,
+    lat: f64,
+    lon: f64,
+    alt_m: f64,
+    vel_v: f64,
+    frames: u32,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    use crate::dfm_frame::{BAUD, DEVIATION_HZ, DfmParams, dfm_frame_bits};
+    let mut chips = Vec::new();
+    for frame in 0..frames {
+        chips.extend(dfm_frame_bits(&DfmParams {
+            serial: serial.into(),
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frame,
+        }));
+    }
+    gfsk_modulate(&chips, 2, BAUD, DEVIATION_HZ, rate_hz)
+}
+
 /// Bounds on the generic families' numbers, so a bad row is an error, not an abort or
 /// a huge allocation. `deviation_hz` is given for `fsk`, whose tones must fit the rate.
 fn generic_params(
@@ -1237,6 +1283,17 @@ pub enum SynthSpec {
         vel_v: f64,
         frames: u32,
     },
+    /// `frames` Graw DFM frames back to back ([`crate::dfm_frame`]): 2-FSK at 2500 baud
+    /// (Manchester coded) and 4 kHz deviation carrying `serial` (`DFM-` and the number),
+    /// the position and the climb.
+    Dfm {
+        serial: String,
+        lat: f64,
+        lon: f64,
+        alt_m: f64,
+        vel_v: f64,
+        frames: u32,
+    },
     /// AIS: per repeat a type 1 position report (`mmsi`, the position, `sog_kt`,
     /// `cog_deg`; [`crate::ais_msg::position_report_bits`]) and, with `name`, a type 5
     /// static report, GMSK at 9600 baud, frames `gap_ms` apart (50 by default).
@@ -1440,18 +1497,27 @@ impl SynthSpec {
                 {
                     return Err("serial: 8 characters of A-Z and 0-9".into());
                 }
-                if !(lat.is_finite() && (-90.0..=90.0).contains(lat)) {
-                    return Err("lat: -90..=90".into());
+                sonde_position(*lat, *lon, *alt_m, *vel_v)?;
+            }
+            SynthSpec::Dfm {
+                serial,
+                lat,
+                lon,
+                alt_m,
+                vel_v,
+                frames,
+            } => {
+                if !(1..=DFM_FRAMES_MAX).contains(frames) {
+                    return Err(format!("frames: 1..={DFM_FRAMES_MAX}"));
                 }
-                if !(lon.is_finite() && (-180.0..=180.0).contains(lon)) {
-                    return Err("lon: -180..=180".into());
+                let digits = serial.strip_prefix("DFM-").unwrap_or("");
+                if digits.is_empty()
+                    || !digits.bytes().all(|c| c.is_ascii_digit())
+                    || digits.parse::<u32>().is_err()
+                {
+                    return Err("serial: DFM- and a decimal number under 2^32".into());
                 }
-                if !(alt_m.is_finite() && (-1000.0..=60_000.0).contains(alt_m)) {
-                    return Err("alt_m: -1000..=60000".into());
-                }
-                if !(vel_v.is_finite() && (-100.0..=100.0).contains(vel_v)) {
-                    return Err("vel_v: -100..=100".into());
-                }
+                sonde_position(*lat, *lon, *alt_m, *vel_v)?;
             }
             SynthSpec::Ais {
                 mmsi,
@@ -1506,7 +1572,10 @@ impl SynthSpec {
             SynthSpec::Aprs { .. } | SynthSpec::Pocsag { .. } | SynthSpec::Acars { .. } => 48_000,
             SynthSpec::Rds { .. } => 240_000,
             SynthSpec::ModesIdent { .. } => 2_400_000,
-            SynthSpec::NbfmTone { .. } | SynthSpec::Rs41 { .. } | SynthSpec::Ais { .. } => 48_000,
+            SynthSpec::NbfmTone { .. }
+            | SynthSpec::Rs41 { .. }
+            | SynthSpec::Dfm { .. }
+            | SynthSpec::Ais { .. } => 48_000,
             SynthSpec::Fsk {
                 symbol_rate_baud, ..
             }
@@ -1659,6 +1728,18 @@ pub fn synthesise(
             frames,
         } => {
             let mut iq = rs41_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Dfm {
+            serial,
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frames,
+        } => {
+            let mut iq = dfm_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -1913,6 +1994,44 @@ mod tests {
         assert_eq!(iq.len(), 96_000);
         assert!(iq[28_000].norm() > 0.99 && iq[30_000].norm() == 0.0);
         assert!(iq[48_000].norm() > 0.99);
+    }
+
+    #[test]
+    fn dfm_family_is_bounded_and_at_the_line_rate() {
+        let parse = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"family": "dfm", "serial": "DFM-19123456",
+                "lat": -27.3842, "lon": 153.1175, "alt_m": 5000, "vel_v": 4.5, "frames": 3});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse_params(v.as_object().unwrap().clone()).map(|(s, _)| s)
+        };
+        let cases = [
+            (serde_json::json!({"frames": 0}), "frames: 1..=60"),
+            (serde_json::json!({"frames": 61}), "frames: 1..=60"),
+            (
+                serde_json::json!({"serial": "19123456"}),
+                "serial: DFM- and a decimal number under 2^32",
+            ),
+            (
+                serde_json::json!({"serial": "DFM-99999999999"}),
+                "serial: DFM- and a decimal number under 2^32",
+            ),
+            (serde_json::json!({"lat": 91.0}), "lat: -90..=90"),
+            (serde_json::json!({"lon": -181.0}), "lon: -180..=180"),
+            (serde_json::json!({"alt_m": 70000}), "alt_m: -1000..=60000"),
+            (serde_json::json!({"vel_v": 500.0}), "vel_v: -100..=100"),
+        ];
+        for (extra, err) in cases {
+            assert_eq!(parse(extra.clone()), Err(err.into()), "{extra}");
+        }
+        let spec = parse(serde_json::json!({})).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 403_000_000);
+        // Three frames back to back, 224 ms each (560 half-symbols at 2500 baud), with no
+        // gap: 3 x 10 752 samples at 48 kHz.
+        assert_eq!(iq.len(), 3 * 10_752);
+        assert!(iq.iter().all(|s| (s.norm() - 1.0).abs() < 1e-3));
     }
 
     #[test]
