@@ -1,4 +1,4 @@
-//! `zeta soapy-worker --id ID --args ARGS`: one SoapySDR device served over stdin and
+//! `zeta soapy-worker --id ID --args ARGS [--ring-fd N]`: one SoapySDR device served over stdin and
 //! stdout to the node that spawned it.
 //!
 //! A node attaches every `--source-soapy` device through this child (see
@@ -54,12 +54,13 @@ mod imp {
 #[cfg(soapy)]
 mod imp {
     use std::fs::File;
-    use std::os::fd::FromRawFd;
+    use std::os::fd::{FromRawFd, OwnedFd};
     use std::process::ExitCode;
     use std::sync::Arc;
 
     use zeta_core::port::Port;
     use zeta_core::types::SourceId;
+    use zeta_source_worker::ring::Ring;
     use zeta_source_worker::serve::{
         EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
     };
@@ -114,7 +115,24 @@ mod imp {
                 return ExitCode::from(EXIT_OPEN_FAILED);
             }
         };
-        serve(port, &driver, requests, frames).await
+        // After the device: a ring that will not open costs the speed, not the device.
+        let ring = args.ring_fd.and_then(open_ring);
+        serve(port, &driver, requests, frames, ring).await
+    }
+
+    /// The node's ring, inherited on `fd`; a ring that will not open is one stderr line,
+    /// and the worker serves on the pipe.
+    fn open_ring(fd: i32) -> Option<Ring> {
+        // SAFETY: the node put the ring on `fd` for this process (`--ring-fd`), and
+        // nothing else here owns that descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        match Ring::open(owned) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("zeta-soapy-worker: ring fd {fd}: {e}; serving on the pipe");
+                None
+            }
+        }
     }
 
     /// Ask the kernel to send SIGTERM when the parent goes, so a node killed with

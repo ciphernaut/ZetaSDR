@@ -1,7 +1,7 @@
-//! `zeta-fake-worker --id ID --script SCRIPT [--record PATH]`: a source worker
-//! for tests. Its stdout speaks the real protocol through [`serve`]; its port is
-//! a `SoapySource` over a scripted `MockDevice`, or a `FileSource` over a SigMF
-//! recording, chosen by `--script`:
+//! `zeta-fake-worker --id ID --script SCRIPT [--record PATH] [--ring-fd N]`: a
+//! source worker for tests. Its stdout speaks the real protocol through
+//! [`serve`]; its port is a `SoapySource` over a scripted `MockDevice`, or a
+//! `FileSource` over a SigMF recording, chosen by `--script`:
 //!
 //! - `stream`: samples forever, paced at the tuned rate.
 //! - `gone-after-ms N`: samples, then after N ms the device vanishes, so the
@@ -26,10 +26,19 @@
 //! land on stderr; `ZETA_FAKE_PROTOCOL=N` says hello with protocol `N` instead
 //! of serving, then waits to be killed; `ZETA_FAKE_WAIT_RUNTIME=1` ends with a
 //! plain runtime drop, which waits on the blocked stdin read.
+//!
+//! `--ring-fd N` serves through the ring inherited on descriptor `N`, as the
+//! real worker does (a ring that will not open is one stderr line, then the
+//! pipe); `ZETA_FAKE_NO_RING=1` ignores the flag, as a worker of an older
+//! build would. `ZETA_FAKE_READ_SAMPLES=N` scripts the mock's reads `N`
+//! samples long instead of [`READ_SAMPLES`], and raises the mock's rate
+//! ceiling to `100 N` when that is above its own, since the source reads a
+//! hundredth of a second at a time: a tune to that rate then gets blocks of
+//! `N` samples.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::fd::FromRawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, Weak};
@@ -42,14 +51,18 @@ use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning};
 use zeta_core::types::{Capabilities, Hz, SourceId};
 use zeta_source_file::{FileOpts, FileSource, read_meta};
 use zeta_source_soapy::SoapySource;
+use zeta_source_soapy::device::RangeHz;
 use zeta_source_soapy::mock::{MockDevice, MockRead};
+use zeta_source_worker::ring::Ring;
 use zeta_source_worker::serve::{
     EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
 };
 use zeta_source_worker::wire::{Control, Frame, Hello, write_frame};
 
-/// Samples per scripted read.
+/// Samples per scripted read, unless `ZETA_FAKE_READ_SAMPLES` says otherwise.
 const READ_SAMPLES: usize = 16_384;
+/// The mock device's own rate ceiling (`MockDevice::hackrf_like`).
+const MOCK_MAX_RATE_HZ: f64 = 20e6;
 /// How much the feeder keeps scripted ahead of the reader (at least
 /// [`FEED_QUEUE_MIN`] reads), so the reader never finds the script empty (an
 /// empty script reads as a 100 ms timeout).
@@ -62,17 +75,25 @@ struct Args {
     id: String,
     script: String,
     record: Option<PathBuf>,
+    ring_fd: Option<RawFd>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
-    let (mut id, mut script, mut record) = (None, None, None);
+    let (mut id, mut script, mut record, mut ring_fd) = (None, None, None, None);
     while let Some(flag) = it.next() {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--id" => id = Some(value),
             "--script" => script = Some(value),
             "--record" => record = Some(PathBuf::from(value)),
+            "--ring-fd" => {
+                ring_fd = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--ring-fd {value:?}: not a descriptor"))?,
+                );
+            }
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
@@ -80,7 +101,36 @@ fn parse_args() -> Result<Args, String> {
         id: id.ok_or("--id is required")?,
         script: script.ok_or("--script is required")?,
         record,
+        ring_fd,
     })
+}
+
+/// The scripted read size: `ZETA_FAKE_READ_SAMPLES`, or [`READ_SAMPLES`].
+fn read_samples() -> usize {
+    std::env::var("ZETA_FAKE_READ_SAMPLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(READ_SAMPLES)
+}
+
+/// The ring on `--ring-fd`, unless there is none or `ZETA_FAKE_NO_RING=1`; a
+/// ring that will not open is a stderr line and the pipe.
+fn open_ring(fd: Option<RawFd>) -> Option<Ring> {
+    let fd = fd?;
+    if std::env::var("ZETA_FAKE_NO_RING").is_ok_and(|v| v == "1") {
+        return None;
+    }
+    // SAFETY: the parent put the ring on `fd` for this process, and nothing
+    // else here owns that descriptor.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    match Ring::open(owned) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("zeta-fake-worker: ring fd {fd}: {e}; serving on the pipe");
+            None
+        }
+    }
 }
 
 /// The `--record` file, appended one line at a time.
@@ -158,25 +208,37 @@ impl Port for Recorded {
 /// clock guard. With `gone_after`, the feeder stops after that long from start
 /// and scripts `Gone("unplugged")`.
 fn mock_source(id: &str, gone_after: Option<Duration>) -> Result<Arc<SoapySource>, String> {
-    let dev = Arc::new(MockDevice::hackrf_like());
+    let read = read_samples();
+    let mut dev = MockDevice::hackrf_like();
+    // The source reads a hundredth of a second at a time: a wider scripted
+    // read needs a rate at which the source's buffer holds it whole.
+    let ceiling = read as f64 * 100.0;
+    if ceiling > MOCK_MAX_RATE_HZ {
+        dev = dev.with_rates(vec![RangeHz {
+            min_hz: 1e6,
+            max_hz: ceiling,
+            step_hz: 0.0,
+        }]);
+    }
+    let dev = Arc::new(dev);
     let src = Arc::new(
         SoapySource::with_device(SourceId(id.into()), dev.clone()).map_err(|e| e.to_string())?,
     );
     let weak = Arc::downgrade(&src);
     std::thread::Builder::new()
         .name("fake-feeder".into())
-        .spawn(move || feed(&dev, &weak, gone_after))
+        .spawn(move || feed(&dev, &weak, gone_after, read))
         .map_err(|e| e.to_string())?;
     Ok(src)
 }
 
-/// Keep [`FEED_QUEUE`] of paced reads of [`READ_SAMPLES`] in the mock's script
+/// Keep [`FEED_QUEUE`] of paced reads of `read` samples in the mock's script
 /// at the source's current rate. Each read is a `Slow` step: its sleep is the
 /// read's share of the rate, shortened while the samples actually delivered
 /// (counted on a receiver of the source's own broadcast) lag the wall clock
 /// and lengthened while they lead it, so thread wake-up overshoot does not
 /// add up to a slow stream. Whole milliseconds are carried from read to read.
-fn feed(dev: &MockDevice, src: &Weak<SoapySource>, gone_after: Option<Duration>) {
+fn feed(dev: &MockDevice, src: &Weak<SoapySource>, gone_after: Option<Duration>, read: usize) {
     let start = Instant::now();
     let Some(mut rx) = src.upgrade().map(|s| s.subscribe()) else {
         return;
@@ -192,7 +254,7 @@ fn feed(dev: &MockDevice, src: &Weak<SoapySource>, gone_after: Option<Duration>)
         loop {
             match rx.try_recv() {
                 Ok(b) => delivered += b.samples.len() as u64,
-                Err(TryRecvError::Lagged(n)) => delivered += n * READ_SAMPLES as u64,
+                Err(TryRecvError::Lagged(n)) => delivered += n * read as u64,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Closed) => {
                     let Some(s) = src.upgrade() else { return };
@@ -217,11 +279,11 @@ fn feed(dev: &MockDevice, src: &Weak<SoapySource>, gone_after: Option<Duration>)
             }),
         };
         p.delivered += delivered;
-        let per_read_ms = READ_SAMPLES as f64 * 1e3 / rate as f64;
+        let per_read_ms = read as f64 * 1e3 / rate as f64;
         let due = p.since.elapsed().as_secs_f64() * rate as f64;
         let lag_ms = (due - p.delivered as f64) * 1e3 / rate as f64;
         let sleep_ms = (per_read_ms - lag_ms / 8.0).max(0.0);
-        let queued = p.pushed.saturating_sub(p.delivered / READ_SAMPLES as u64);
+        let queued = p.pushed.saturating_sub(p.delivered / read as u64);
         let target =
             ((FEED_QUEUE.as_secs_f64() * 1e3 / per_read_ms).ceil() as u64).max(FEED_QUEUE_MIN);
         let reads: Vec<MockRead> = (queued..target)
@@ -230,7 +292,7 @@ fn feed(dev: &MockDevice, src: &Weak<SoapySource>, gone_after: Option<Duration>)
                 let ms = (p.ideal_ms.round() as u64).saturating_sub(p.whole_ms);
                 p.whole_ms += ms;
                 p.pushed += 1;
-                MockRead::Slow(READ_SAMPLES, ms)
+                MockRead::Slow(read, ms)
             })
             .collect();
         if !reads.is_empty() {
@@ -448,7 +510,8 @@ fn main() -> ExitCode {
             inner: port,
             record: record.clone(),
         });
-        let code = serve(port, "fake", requests, frames).await;
+        let ring = open_ring(args.ring_fd);
+        let code = serve(port, "fake", requests, frames, ring).await;
         record.line("served");
         drop(keep);
         code

@@ -357,6 +357,10 @@ pub struct SoapyWorkerArgs {
     /// SoapySDR device arguments, zeta's own gain= and ppm= included
     #[arg(long)]
     pub args: String,
+    /// The inherited descriptor of the node's shared-memory ring; blocks go through
+    /// it rather than the stdout pipe
+    #[arg(long, value_name = "FD")]
+    pub ring_fd: Option<i32>,
 }
 
 #[derive(Debug, Subcommand)]
