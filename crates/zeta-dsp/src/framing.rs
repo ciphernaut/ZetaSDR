@@ -641,34 +641,48 @@ pub fn decode_frames(bits: &[u8], f: &Framing) -> (Vec<DecodedFrame>, usize) {
     (frames, d.settled)
 }
 
-/// Whether [`encode_frames`] can frame a body of `body_len` bytes under `f` (it asserts
-/// otherwise): with a `field` length rule the body must reach the field's end, the frame
-/// (the CRC included) must be whole units and its length must fit the field.
+/// Whether a body of `body_len` bytes frames and decodes under `f` ([`encode_frames`]
+/// panics otherwise): the frame (the CRC included) must fit [`MAX_FRAME_BITS`]; a fixed
+/// length must equal it; with a `field` length rule the body must reach the field's end,
+/// the frame must be whole units and its length must fit the field.
 pub fn check_body(f: &Framing, body_len: usize) -> Result<(), String> {
-    let Length::Field { field } = &f.length else {
-        return Ok(());
-    };
-    let end = (field.offset_bits + field.bits) as usize;
-    if body_len * BYTE_BITS < end {
-        return Err(format!(
-            "a {body_len}-byte body ends before the length field (bit {end})"
-        ));
-    }
     let crc_n = f
         .crc
         .as_ref()
         .and_then(|c| c.resolve().ok())
         .map_or(0, |(d, _)| crc_bytes(&d));
-    let total = ((body_len + crc_n) * BYTE_BITS) as i64;
-    let unit = field.unit.bits();
-    if total % unit != 0 {
-        return Err("the frame is not a whole number of length units".into());
+    let frame_bits = (body_len + crc_n) * BYTE_BITS;
+    if frame_bits > MAX_FRAME_BITS {
+        return Err(format!(
+            "a {body_len}-byte body and its {crc_n}-byte CRC pass {MAX_FRAME_BITS} bits"
+        ));
     }
-    let v = total / unit - field.add;
-    if v < 0 || (field.bits < u64::BITS && (v as u64) >= (1u64 << field.bits)) {
-        return Err(format!("the length {v} does not fit the length field"));
+    match &f.length {
+        Length::Fixed { fixed_bits } if frame_bits != *fixed_bits as usize => Err(format!(
+            "length.fixed_bits: {fixed_bits} bits is {} B, body {body_len} + crc {crc_n} is {} B",
+            *fixed_bits as usize / BYTE_BITS,
+            body_len + crc_n
+        )),
+        Length::Field { field } => {
+            let end = (field.offset_bits + field.bits) as usize;
+            if body_len * BYTE_BITS < end {
+                return Err(format!(
+                    "a {body_len}-byte body ends before the length field (bit {end})"
+                ));
+            }
+            let total = frame_bits as i64;
+            let unit = field.unit.bits();
+            if total % unit != 0 {
+                return Err("the frame is not a whole number of length units".into());
+            }
+            let v = total / unit - field.add;
+            if v < 0 || (field.bits < u64::BITS && (v as u64) >= (1u64 << field.bits)) {
+                return Err(format!("the length {v} does not fit the length field"));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// The line bits of `bodies` framed by `f`, the inverse of [`decode_frames`]: per
@@ -688,21 +702,10 @@ pub fn encode_frames(bodies: &[Vec<u8>], f: &Framing) -> Vec<u8> {
     let mut bits = Vec::new();
     for body in bodies {
         let mut bytes = body.clone();
+        check_body(f, bytes.len()).unwrap_or_else(|e| panic!("encode_frames: {e}"));
         if let Length::Field { field } = &f.length {
-            let end = (field.offset_bits + field.bits) as usize;
-            assert!(
-                bytes.len() * BYTE_BITS >= end,
-                "encode_frames: a {}-byte body ends before the length field",
-                bytes.len()
-            );
             let total = ((bytes.len() + crc_n) * BYTE_BITS) as i64;
-            let unit = field.unit.bits();
-            assert!(total % unit == 0, "encode_frames: length not whole units");
-            let v = total / unit - field.add;
-            assert!(
-                v >= 0 && (field.bits >= u64::BITS || (v as u64) < (1u64 << field.bits)),
-                "encode_frames: length {v} does not fit the field"
-            );
+            let v = total / field.unit.bits() - field.add;
             write_field(&mut bytes, field, v as u64);
         }
         if let Some(def) = &crc {

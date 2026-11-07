@@ -1999,6 +1999,22 @@ mod tests {
     }
 
     #[test]
+    fn the_framing_family_refuses_bodies_that_cannot_decode() {
+        // 272 bits is 34 B: a 30-byte body and its CRC make 32 B.
+        let mut v = framing_json();
+        v["body_bytes"] = 30.into();
+        let e = parse_params(v.as_object().unwrap().clone()).unwrap_err();
+        assert!(e.contains("length.fixed_bits"), "{e}");
+        // A body over what a frame event may hold.
+        let mut v = framing_json();
+        let over = crate::framing::MAX_FRAME_BITS / 8 + 1;
+        v["framing"]["length"] = serde_json::json!({ "fixed_bits": 272 });
+        v["frames"] = 1.into();
+        v["body_bytes"] = over.into();
+        assert!(parse_params(v.as_object().unwrap().clone()).is_err());
+    }
+
+    #[test]
     fn the_framing_family_refuses_a_bad_framing_naming_the_field() {
         let mut v = framing_json();
         v["framing"]["sync"]["bits"] = 70.into();
