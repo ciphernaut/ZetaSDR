@@ -37,8 +37,13 @@ pub const ORIGIN_WIDTH_LOOSE: (f64, f64) = (0.25, 4.0);
 pub const ORIGIN_MODULATION_FITS: f32 = 0.4;
 /// Modulation term when there is no designator or no label.
 pub const ORIGIN_MODULATION_UNKNOWN: f32 = 0.2;
-/// Reach term when the site's distance is known and within the reach.
+/// Reach term when the site's distance is known and within the reach, at the station
+/// (distance 0) or for a reach with no radius; graded down toward the limit
+/// ([`ORIGIN_REACH_FLOOR`]).
 pub const ORIGIN_REACH_IN: f32 = 0.2;
+/// The share of [`ORIGIN_REACH_IN`] a site exactly at the reach limit keeps: the term
+/// falls linearly from the full term at the station to this share at the limit.
+pub const ORIGIN_REACH_FLOOR: f32 = 0.5;
 /// Reach term when the site's distance is not known (no vantage).
 pub const ORIGIN_REACH_UNKNOWN: f32 = 0.1;
 /// Decimal places an origin's score is rounded to.
@@ -397,8 +402,10 @@ fn nearest_first(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
 /// score, so an on-channel row outscores one that only overlaps the band's edge; modulation, the designator's letter against `q.modulation`
 /// by `DESIGNATOR_LABELS`; reach, the row's `distance_km` against the reach toward the
 /// site ([`Reach::km_toward`] with the row's `bearing_deg` and `antenna`, the vantage's
-/// antenna the reach was computed for; `reach.km` when either is missing). A reach
-/// with no radius, or none at all, holds any known distance.
+/// antenna the reach was computed for; `reach.km` when either is missing), graded
+/// `ORIGIN_REACH_IN * (1 - (1 - ORIGIN_REACH_FLOOR) * distance / reach)` and rounded
+/// (0.2 at the station, 0.1 at the limit, 0 beyond). A reach with no radius, or none at
+/// all, holds any known distance at the full term.
 pub fn score_row(
     a: &Allocation,
     q: &OriginQuery,
@@ -451,6 +458,12 @@ pub fn score_row(
             _ => r.km,
         }) {
             Some(km) if d > km => 0.0,
+            // Graded by distance over the reach: the full term at the station, the
+            // floor's share at the limit, so a near site outranks a far one.
+            Some(km) if km > 0.0 => {
+                let share = 1.0 - (1.0 - ORIGIN_REACH_FLOOR) * (d / km) as f32;
+                round_score(ORIGIN_REACH_IN * share)
+            }
             _ => ORIGIN_REACH_IN,
         },
     };
@@ -1127,12 +1140,59 @@ mod tests {
             on.score,
             edge.score
         );
-        // The other terms keep their weights, and the score stays rounded.
-        assert_eq!((on.terms.modulation, on.terms.reach), (0.4, 0.2));
-        assert_eq!((edge.terms.modulation, edge.terms.reach), (0.4, 0.2));
+        // The other terms keep their weights (10 km of a 100 km reach: 0.19), and the
+        // score stays rounded.
+        assert_eq!((on.terms.modulation, on.terms.reach), (0.4, 0.19));
+        assert_eq!((edge.terms.modulation, edge.terms.reach), (0.4, 0.19));
         assert_eq!(on.score, round_score(on.score));
         // At the band's centre the term is the full grade.
         assert_eq!(row(97_893_000).terms.width, ORIGIN_WIDTH_FULL);
+    }
+
+    /// The field host's 2026-11-08 FM lookup: a 97.9 MHz station 5 km away tied at 0.79
+    /// with one 266 km away against a 300 km reach. The reach term is graded by distance
+    /// over the reach: full at the station, half at the limit, none beyond.
+    #[test]
+    fn the_near_on_channel_row_outranks_the_far_one_within_reach() {
+        let band = q(&["wfm"], 97_893_000, 200_000);
+        let r = reach(Some(300.0));
+        let row = |km| {
+            score_row(
+                &tx(Some("200KF8E"), None, 97_900_000, Some(km)),
+                &band,
+                Some(&r),
+                None,
+            )
+            .unwrap()
+        };
+        let (near, far) = (row(5.0), row(266.0));
+        assert!(near.score > far.score, "{} vs {}", near.score, far.score);
+        assert!(
+            near.terms.reach > far.terms.reach,
+            "{:?} {:?}",
+            near.terms,
+            far.terms
+        );
+        // Full at the station, half the term at the reach limit, none beyond.
+        assert_eq!(row(0.0).terms.reach, ORIGIN_REACH_IN);
+        assert_eq!(
+            row(300.0).terms.reach,
+            round_score(ORIGIN_REACH_IN * ORIGIN_REACH_FLOOR)
+        );
+        assert_eq!(row(301.0).terms.reach, 0.0);
+        assert_eq!(row(150.0).terms.reach, 0.15);
+        // The term and the score stay rounded.
+        assert_eq!(far.terms.reach, round_score(far.terms.reach));
+        assert_eq!(far.score, round_score(far.score));
+        // A reach with no radius holds any known distance at the full term.
+        let any = score_row(
+            &tx(Some("200KF8E"), None, 97_900_000, Some(266.0)),
+            &band,
+            Some(&reach(None)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(any.terms.reach, ORIGIN_REACH_IN);
     }
 
     #[test]
@@ -1206,12 +1266,14 @@ mod tests {
                 .terms
                 .reach
         };
-        assert_eq!(term(Some(9.0)), ORIGIN_REACH_IN);
+        assert_eq!(term(Some(0.0)), ORIGIN_REACH_IN);
+        // 9 km of 50: 0.2 * (1 - 0.5 * 0.18).
+        assert_eq!(term(Some(9.0)), 0.18);
         assert_eq!(term(None), ORIGIN_REACH_UNKNOWN);
         assert_eq!(term(Some(90.0)), 0.0);
         assert_eq!((ORIGIN_REACH_IN, ORIGIN_REACH_UNKNOWN), (0.2, 0.1));
         let full = score_row(
-            &tx(Some("12K5F3E"), None, CENTER, Some(9.0)),
+            &tx(Some("12K5F3E"), None, CENTER, Some(0.0)),
             &q(&["fm"], CENTER, 12_500),
             Some(&r),
             None,
@@ -1816,12 +1878,13 @@ mod tests {
         };
         let mut r = reach(Some(50.0));
         r.antenna = "yagi".into();
-        // 90 km on bearing 315: inside the sector the reach doubles to 100 km.
+        // 90 km on bearing 315: inside the sector the reach doubles to 100 km (0.11 of
+        // the graded term, 0.2 * (1 - 0.5 * 0.9)).
         let row = tx(None, Some(12_500), CENTER, Some(90.0));
         let term = |row: &Allocation, ant: Option<&Antenna>| {
             score_row(row, &band, Some(&r), ant).unwrap().terms.reach
         };
-        assert_eq!(term(&row, Some(&beam)), ORIGIN_REACH_IN);
+        assert_eq!(term(&row, Some(&beam)), 0.11);
         // Without the antenna, or without a bearing, `reach.km` (50) decides.
         assert_eq!(term(&row, None), 0.0);
         let mut no_bearing = row.clone();
@@ -1831,7 +1894,8 @@ mod tests {
         let mut behind = tx(None, Some(12_500), CENTER, Some(30.0));
         behind.bearing_deg = Some(135.0);
         assert_eq!(term(&behind, Some(&beam)), 0.0);
-        assert_eq!(term(&behind, None), ORIGIN_REACH_IN);
+        // 30 km of 50: 0.2 * (1 - 0.5 * 0.6).
+        assert_eq!(term(&behind, None), 0.14);
 
         // `answer` finds the antenna on the vantage's station by `reach.antenna`.
         let mut station = demo_station();
@@ -1844,7 +1908,7 @@ mod tests {
             vec!["acma".into()],
             Some(1),
         );
-        assert_eq!(a.origins[0].terms.reach, ORIGIN_REACH_IN);
+        assert_eq!(a.origins[0].terms.reach, 0.11);
     }
 
     #[tokio::test]
