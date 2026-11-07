@@ -1,6 +1,7 @@
 /target
 /.superpowers
 *.sigmf-data
+!/modes/fixtures/*.sigmf-data
 /scratch
 /.claude/
 /crates/zeta-source-soapy-driver/target

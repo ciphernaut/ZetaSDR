@@ -24,7 +24,9 @@ fn check(dir: &Path, args: &[&str]) -> Command {
     let modes = dir.join("modes");
     std::fs::create_dir_all(&modes).unwrap();
     let mut cmd = Command::cargo_bin("zeta").unwrap();
-    cmd.env_remove("ZETA_NODE")
+    // A developer shell's fixture directory must not leak into any test.
+    cmd.env_remove("ZETA_FIXTURES_DIR")
+        .env_remove("ZETA_NODE")
         .env_remove("ZETA_SECRET")
         .env("XDG_CONFIG_HOME", common::no_xdg_config())
         .env("ZETA_HANDLER_DUMP1090", NO_DUMP1090)
@@ -126,6 +128,72 @@ fn a_fixture_test_row_is_checked() {
     let (out, code) = stdout(&mut check(dir.path(), &["aprs_fixture"]));
     assert_eq!(out.trim(), "aprs_fixture: ok", "{out}");
     assert_eq!(code, 0);
+}
+
+/// A fixture row (`aprs_fixture`) whose test path is `path`.
+fn write_fixture_row(dir: &Path, path: &str) {
+    write_row(
+        dir,
+        "aprs_fixture",
+        serde_json::json!({
+            "kind": "fixture",
+            "path": path,
+            "expect": {"src": "VK3ABC", "fcs_ok": true},
+            "within_ms": 5000
+        }),
+    );
+}
+
+#[test]
+fn a_relative_fixture_is_found_under_zeta_fixtures_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = dir.path().join("fx");
+    std::fs::create_dir_all(&fx).unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    write_fixture(&fx, "aprs", &iq, 48_000, 144_800_000);
+    write_fixture_row(dir.path(), "aprs.sigmf-meta");
+    let (out, code) = stdout(check(dir.path(), &["aprs_fixture"]).env("ZETA_FIXTURES_DIR", &fx));
+    assert_eq!(out.trim(), "aprs_fixture: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_relative_fixture_defaults_to_modes_under_the_current_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
+    write_fixture(&modes, "aprs", &iq, 48_000, 144_800_000);
+    write_fixture_row(dir.path(), "aprs.sigmf-meta");
+    let (out, code) = stdout(check(dir.path(), &["aprs_fixture"]).current_dir(dir.path()));
+    assert_eq!(out.trim(), "aprs_fixture: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_missing_fixture_is_skipped_naming_the_lookup_and_strict_fails_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // The cwd is canonical so the message's `<cwd>/modes` matches what the process sees.
+    let cwd = dir.path().canonicalize().unwrap();
+    write_fixture_row(&cwd, "fixtures/none.sigmf-meta");
+    let why = format!(
+        "fixture fixtures/none.sigmf-meta not found (ZETA_FIXTURES_DIR unset; looked in {}/modes)",
+        cwd.display()
+    );
+    let (out, code) = stdout(
+        check(&cwd, &["aprs_fixture"])
+            .env_remove("ZETA_FIXTURES_DIR")
+            .current_dir(&cwd),
+    );
+    assert_eq!(out.trim(), format!("aprs_fixture: skipped: {why}"), "{out}");
+    assert_eq!(code, 0);
+    let (out, code) = stdout(
+        check(&cwd, &["--strict", "aprs_fixture"])
+            .env_remove("ZETA_FIXTURES_DIR")
+            .current_dir(&cwd),
+    );
+    assert_eq!(out.trim(), format!("aprs_fixture: fail: {why}"), "{out}");
+    assert_eq!(code, 1);
 }
 
 #[test]

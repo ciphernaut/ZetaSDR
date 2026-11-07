@@ -31,6 +31,45 @@ const STREAM_WAIT: Duration = Duration::from_secs(2);
 /// The longest one `stream_tail` waits (`TAIL_MAX_TIMEOUT_MS`).
 const TAIL_MAX_MS: u64 = 10_000;
 
+/// The environment variable naming the directory a relative fixture path resolves under.
+pub const FIXTURES_DIR_ENV: &str = "ZETA_FIXTURES_DIR";
+
+/// Where a relative fixture path resolves when `FIXTURES_DIR_ENV` is unset: `modes/` under
+/// the current directory.
+pub const DEFAULT_FIXTURES_DIR: &str = "modes";
+
+/// The meta file of a fixture test: an absolute path as given, a relative one under
+/// `$ZETA_FIXTURES_DIR` or else `./modes`. `Err` names the lookup when it is not a file
+/// (for an absolute path: `looked in` its parent directory).
+fn fixture_path(path: &str) -> Result<PathBuf, String> {
+    let given = Path::new(path);
+    let (resolved, looked_in, env) = if given.is_absolute() {
+        let parent = given.parent().unwrap_or(given).to_path_buf();
+        (given.to_path_buf(), parent, None)
+    } else {
+        match std::env::var_os(FIXTURES_DIR_ENV) {
+            Some(dir) => (Path::new(&dir).join(given), PathBuf::from(&dir), Some(dir)),
+            None => {
+                let dir = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(DEFAULT_FIXTURES_DIR);
+                (dir.join(given), dir, None)
+            }
+        }
+    };
+    if resolved.is_file() {
+        return Ok(resolved);
+    }
+    let how = match env {
+        Some(v) => format!("{FIXTURES_DIR_ENV}={}", v.to_string_lossy()),
+        None => format!("{FIXTURES_DIR_ENV} unset"),
+    };
+    Err(format!(
+        "fixture {path} not found ({how}; looked in {})",
+        looked_in.display()
+    ))
+}
+
 /// What every row's check shares: the rows and stage registry one loading produced
 /// (plugins probed once), cloned into each row's node.
 struct Ctx {
@@ -138,6 +177,11 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
         let handler = p.programs.first().map_or("program", String::as_str);
         return skip(format!("{handler} missing"));
     }
+    if let TestSpec::Fixture { path } = &test.kind
+        && let Err(why) = fixture_path(path)
+    {
+        return skip(why);
+    }
     let scratch = ctx
         .state_dir
         .join(format!("check-{}-{}", std::process::id(), m.row.id.0));
@@ -206,6 +250,8 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
 fn capture(m: &LoadedMode, test: &RowTest, scratch: &Path) -> Result<(PathBuf, u64), String> {
     match &test.kind {
         TestSpec::Fixture { path } => {
+            let path = fixture_path(path)?.display().to_string();
+            let path = path.as_str();
             let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
             let meta: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
             let center = meta["captures"][0]["core:frequency"]
