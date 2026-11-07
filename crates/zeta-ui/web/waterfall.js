@@ -93,7 +93,7 @@
 // Stop button), setSource runs again for the same source: it reuses another running spectrum
 // job or starts a fresh elastic one of its own (a scan running there is followed instead, and
 // the own job is started again only once it ended). The badge hides at the first frame after
-// that.
+// that, also one that comes while the map is shown, so a relaunch badge is clear on return.
 //
 // Layout: frequency is vertical (highest at the top), time runs right to left: each event
 // becomes one CSS-pixel column (Math.round(devicePixelRatio) backing pixels, at least 1) at

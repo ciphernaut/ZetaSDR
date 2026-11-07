@@ -4650,18 +4650,28 @@ def scenario_map_is_a_source_tab(page, url, secret):
         page.wait_for_function(main_is % "map", timeout=5_000)
         expect(page.locator("#map")).to_be_visible()
         expect(page.locator("#waterfall")).to_be_hidden()
-        assert page.evaluate("() => window.zetaTest.shown()") == "tone", page.evaluate("() => window.zetaTest.shown()")
+        shown_id = page.evaluate("() => window.zetaTest.shown()")
+        assert shown_id == "tone", shown_id
         expect(tab).to_have_attribute("aria-selected", "true")
         tone = page.locator('#tabs .src-tab[data-id="tone"]')
         expect(tone).to_have_class(re.compile(r"\bkept\b"))
         expect(tone).to_have_attribute("aria-selected", "false")
         shown = view_show(page)
         assert "main map" in shown and "map auto" in shown, shown
-        # A jobs poll (another source's jobs gone) keeps the tab and the map shown.
+        # A jobs poll and the source_list after it (another source's jobs gone, syncTabs run)
+        # keep the tab and the map shown.
         stop_spectrum_jobs(url, secret, "retune")
-        page.evaluate("() => window.zetaTest.poll()")
+        with page.expect_response(
+                lambda r: is_op("source_list")(r.request), timeout=10_000) as resp:
+            page.evaluate("() => window.zetaTest.poll()")
+        resp.value.finished()
+        page.evaluate("() => new Promise((r) => requestAnimationFrame(() => r()))")
         expect(tab).to_have_count(1)
-        assert page.evaluate("() => document.documentElement.dataset.main") == "map", "a jobs poll left the map"
+        expect(tab).to_have_attribute("aria-selected", "true")
+        expect(tone).to_have_class(re.compile(r"\bkept\b"))
+        main = page.evaluate("() => document.documentElement.dataset.main")
+        assert main == "map", f"after a source_list: main {main}"
+        assert "main map" in view_show(page)
         tone.click()
         page.wait_for_function(main_is % "rf", timeout=5_000)
         expect(tone).not_to_have_class(re.compile(r"\bkept\b"))
@@ -4672,6 +4682,22 @@ def scenario_map_is_a_source_tab(page, url, secret):
         run_cmd(page, "view set map on")
         page.wait_for_function(main_is % "map", timeout=5_000)
         run_cmd(page, "view set map off")
+        page.wait_for_function(main_is % "rf", timeout=5_000)
+        # The box menu goes with the waterfall (as a source switch drops it). Switched from
+        # the command line: a click on the Map tab would close it as any press outside does.
+        page.wait_for_function("() => window.zetaTest.wf().painted > 40", timeout=10_000)
+        menu = drag_menu(page)
+        run_cmd(page, "view set main map")
+        page.wait_for_function(main_is % "map", timeout=5_000)
+        expect(menu).to_be_hidden()
+        run_cmd(page, "view set main rf")
+        page.wait_for_function(main_is % "rf", timeout=5_000)
+        # A stored `map on` from before `main` still shows the map after a reload.
+        page.evaluate("() => sessionStorage.setItem('zeta.view', JSON.stringify({map: 'on'}))")
+        page.reload()
+        page.wait_for_function(main_is % "map", timeout=10_000)
+        expect(page.locator("#map")).to_be_visible()
+        run_cmd(page, "view reset")
         page.wait_for_function(main_is % "rf", timeout=5_000)
         page.set_viewport_size(NARROW)
         tab.click()

@@ -41,7 +41,7 @@ button, #cmd, .src-tab, .pane-tab, .job-tag, #jobs .job, section.pane, #waterfal
     var(--bg);
   font-family: var(--font-ui);
 }
-.brand, .pane-head, .pane-tab, .src-tab .name, #listen-all, #map-toggle, #drawer-toggle,
+.brand, .pane-head, .pane-tab, .src-tab .name, #listen-all, #drawer-toggle,
 #mic, .job .kind, .job-tag .kind, .job-tag .channel, .job-group > summary, #graph .graph-title,
 #login h1, #bar .prompt {
   font-family: "Orbitron", var(--font-ui);
@@ -110,7 +110,9 @@ input:focus, #cmd:focus {
   color: var(--text);
   box-shadow: inset 0 0 10px rgba(255, 43, 214, 0.3);
 }
-.src-tab[aria-selected="true"] .name { color: var(--accent); text-shadow: 0 0 6px rgba(255, 43, 214, 0.7); }
+.src-tab[aria-selected="true"] .name,
+.src-tab.kept .name { color: var(--accent); text-shadow: 0 0 6px rgba(255, 43, 214, 0.7); }
+.src-tab.kept { --line: var(--accent); color: var(--text); }
 .src-tab.fault { --line: var(--error); }
 .src-tab.fault .name { color: var(--error); }
 .src-tab .tag.pin { border-color: var(--error); color: var(--error); border-radius: 0; }
@@ -124,13 +126,13 @@ input:focus, #cmd:focus {
 .health .v { margin-inline-end: 8px; color: var(--ok); }
 
 /* ---- action buttons and pane tabs ---- */
-.pane-tab, #listen-all, #map-toggle, #drawer-toggle { font-size: 10px; align-self: center; }
+.pane-tab, #listen-all, #drawer-toggle { font-size: 10px; align-self: center; }
 .pane-tab {
   --line: color-mix(in srgb, var(--c-action) 55%, transparent);
   color: var(--c-action);
   padding: 2px 12px 2px 8px;
 }
-.pane-tab[aria-selected="true"], #map-toggle[aria-pressed="true"], #listen-all[aria-pressed="true"] {
+.pane-tab[aria-selected="true"], #listen-all[aria-pressed="true"] {
   --line: var(--accent);
   color: var(--accent);
   box-shadow: inset 0 0 8px rgba(255, 43, 214, 0.35);

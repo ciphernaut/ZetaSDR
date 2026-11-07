@@ -281,6 +281,9 @@ export function mountView() {
     const kept = p.restore ? p.restore(String(v)) : parseValue(p, String(v));
     if (kept !== undefined) values[k] = kept;
   }
+  // A stored `map on` from a page before `main` (spec 4.4) still shows the map (`off` is
+  // `main rf`, the default).
+  if (!("main" in values) && values.map === "on") values.main = "map";
   const changeCbs = [];
   const clearCbs = [];
   const fire = (key) => {

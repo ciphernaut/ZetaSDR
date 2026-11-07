@@ -159,7 +159,9 @@ input:focus, #cmd:focus {
   color: var(--text);
   box-shadow: 0 0 12px rgba(255, 79, 200, 0.28);
 }
-.src-tab[aria-selected="true"] .name { color: var(--accent); }
+.src-tab[aria-selected="true"] .name,
+.src-tab.kept .name { color: var(--accent); }
+.src-tab.kept { --ground: color-mix(in srgb, var(--accent) 14%, var(--bar)); color: var(--text); }
 .src-tab.fault { --edge: linear-gradient(var(--error), var(--error)); }
 .src-tab.fault .name { color: var(--error); }
 .src-tab .tag.pin { border-color: var(--error); color: var(--error); border-radius: 3px 8px 3px 8px; }
@@ -173,9 +175,9 @@ input:focus, #cmd:focus {
 .health .v { margin-inline-end: 8px; color: var(--ok); }
 
 /* ---- action buttons and pane tabs ---- */
-.pane-tab, #listen-all, #map-toggle, #drawer-toggle { font-size: 11px; align-self: center; }
+.pane-tab, #listen-all, #drawer-toggle { font-size: 11px; align-self: center; }
 .pane-tab { color: var(--c-action); padding: 1px 10px; }
-.pane-tab[aria-selected="true"], #map-toggle[aria-pressed="true"], #listen-all[aria-pressed="true"] {
+.pane-tab[aria-selected="true"], #listen-all[aria-pressed="true"] {
   --ground: color-mix(in srgb, var(--accent) 18%, var(--bar));
   color: var(--text);
   box-shadow: 0 0 10px rgba(255, 79, 200, 0.35);

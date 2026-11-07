@@ -152,13 +152,16 @@ input::placeholder { color: #64748b; }
 .src-tab:focus-visible .name { color: #3730a3; }
 /* The selected source: the gradient, white text. */
 .src-tab[aria-selected="true"],
-.src-tab[aria-selected="true"]:hover:not(:disabled) {
+.src-tab[aria-selected="true"]:hover:not(:disabled),
+.src-tab.kept,
+.src-tab.kept:hover:not(:disabled) {
   background: var(--grad);
   border-color: transparent;
   color: rgba(255, 255, 255, 0.86);
   box-shadow: 0 6px 16px -6px rgba(124, 58, 237, 0.55);
 }
-.src-tab[aria-selected="true"] .name { color: #ffffff; }
+.src-tab[aria-selected="true"] .name,
+.src-tab.kept .name { color: #ffffff; }
 .src-tab[aria-selected="true"] .health {
   display: inline-flex;
   gap: 4px;
@@ -175,7 +178,7 @@ input::placeholder { color: #64748b; }
   color: #92400e;
   font-weight: 600;
 }
-.pane-tab, #map-toggle, #drawer-toggle { align-self: center; }
+.pane-tab, #drawer-toggle { align-self: center; }
 .pane-tab {
   height: 30px;
   padding: 0 11px;
@@ -186,7 +189,7 @@ input::placeholder { color: #64748b; }
   color: var(--dim);
 }
 .pane-tab:hover:not(:disabled) { background: #f1f5f9; border-color: transparent; color: var(--text); }
-.pane-tab[aria-selected="true"], #map-toggle[aria-pressed="true"] {
+.pane-tab[aria-selected="true"] {
   background: #eef2ff;
   border-color: #c7d2fe;
   color: #3730a3;
