@@ -1606,6 +1606,7 @@ THEME_HOOKS = [
     ".outline", ".graph-node.selected", ".job-tag.hot", ".job-tag.speaking",
     ".job-tag .dot.closed", "html[data-theme]", "html[data-rail]", "html[data-footprint]",
     ".map-tab", "html[data-main]", "html[data-dock]", "section.pane.dock",
+    "html[data-map-tiles]", "#map .map-tile-note",
 ]
 
 
@@ -1671,9 +1672,10 @@ def scenario_view_set_show_reset(page, url, secret):
                  "finished_rows_s 60", "scanner auto", "plan auto", "main rf", "map auto",
                  "home none",
                  "subjects auto", "subject_dim_s 60", "subject_drop_s 300",
-                 "origin_fade_s 300", "pane none", "theme console", "side both", "dock auto"):
+                 "origin_fade_s 300", "pane none", "theme console", "side both", "dock auto",
+                 "map_tiles auto"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 16, f"view show: {shown!r}"
+    assert shown.count("\n") == 17, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -4540,9 +4542,13 @@ def scenario_audio_comes_back_from_a_suspended_context(page, url, secret):
 # ---- the map (plan 17 Task 9) -----------------------------------------------------------
 # The node's `fake_pos` mode row (ui.rs) runs zeta-ext's `fake_lines`, which prints two fixes
 # of sonde S1 (-27.40,153.10 then -27.41,153.11) 2 s into the job. The map's tiles come from
-# tile.openstreetmap.org, which every map scenario aborts: the map must still draw.
+# the tile providers' hosts (map.js TILE_PROVIDERS), which every scenario aborts (main routes
+# them for each context, and the map scenarios again): real tiles are never fetched, and the
+# map must still draw.
 
-OSM_TILES = "**/tile.openstreetmap.org/**"
+TILE_HOSTS = re.compile(
+    r"^https://([a-z0-9-]+\.)?(tile\.openstreetmap\.org|basemaps\.cartocdn\.com"
+    r"|tile\.opentopomap\.org|server\.arcgisonline\.com)/")
 
 
 def page_errors(page):
@@ -4554,7 +4560,7 @@ def page_errors(page):
         if m.type != "error":
             return
         where = (m.location or {}).get("url", "")
-        if "tile.openstreetmap.org" in where:
+        if TILE_HOSTS.search(where):
             return
         seen.append(f"{m.text} ({where})")
 
@@ -4573,7 +4579,7 @@ def start_fake_pos(page, url, secret):
 
 
 def scenario_map_marker_draws_without_tiles(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     errors = page_errors(page)
     select_source(page, url, secret, "tone")
     expect(page.locator("#map")).to_be_hidden()
@@ -4611,10 +4617,84 @@ def scenario_map_marker_draws_without_tiles(page, url, secret):
         stop_job(url, secret, job)
 
 
+# map.js TILE_PROVIDERS, as the brief tables them: id -> (label, url, attribution).
+TILE_TABLE = {
+    "osm": ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "© OpenStreetMap contributors"),
+    "carto-dark": ("CARTO Dark Matter",
+                   "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+                   "© OpenStreetMap contributors © CARTO"),
+    "opentopo": ("OpenTopoMap", "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+                 "© OpenStreetMap contributors, SRTM | © OpenTopoMap (CC-BY-SA)"),
+}
+
+
+def scenario_map_tiles(page, url, secret):
+    """Plan 32 Task 11b: the tile layer follows the view's `map_tiles` (auto: CARTO Dark Matter
+    under the dark console theme), the layers control sets it, and tiles that fail say so."""
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    mp = page.locator("#map")
+    layer = lambda: page.evaluate("() => window.zetaTest.tileLayer()")  # noqa: E731
+
+    def expect_layer(tid):
+        page.wait_for_function(
+            f"() => window.zetaTest.tileLayer()?.id === {json.dumps(tid)}", timeout=5_000)
+        got = layer()
+        label, turl, attribution = TILE_TABLE[tid]
+        assert got == {"id": tid, "url": turl, "attribution": attribution}, got
+        expect(page.locator("html")).to_have_attribute("data-map-tiles", tid, timeout=2_000)
+        expect(mp.locator(".leaflet-tile-pane > .leaflet-layer")).to_have_count(1, timeout=2_000)
+        # The aborted tiles: a note naming the provider and another one to try.
+        note = mp.locator(".map-tile-note")
+        expect(note).to_be_visible(timeout=5_000)
+        expect(note).to_contain_text(f"map tiles from {label} are not loading; try another "
+                                     "(view set map_tiles ")
+        return note
+
+    try:
+        run_cmd(page, "view set main map")
+        expect(mp).to_be_visible(timeout=5_000)
+        expect_layer("carto-dark")
+        expect(mp.locator(".leaflet-control-attribution")).to_contain_text(
+            "© OpenStreetMap contributors © CARTO")
+        run_cmd(page, "view set map_tiles osm")
+        expect(view_line(page, "map_tiles = osm")).to_be_visible(timeout=2_000)
+        note = expect_layer("osm")
+        assert "view set map_tiles osm)" not in note.text_content(), note.text_content()
+        # The layers control lists the providers by label; choosing one sets the policy.
+        ctl = mp.locator(".leaflet-control-layers")
+        ctl.hover(timeout=2_000)
+        labels = ctl.locator(".leaflet-control-layers-base label")
+        expect(labels).to_have_count(5, timeout=2_000)
+        labels.filter(has_text="OpenTopoMap").click(timeout=2_000)
+        expect_layer("opentopo")
+        shown = view_show(page)
+        assert "map_tiles opentopo" in shown, shown
+        run_cmd(page, "view set map_tiles sideways")
+        expect(view_line(page, "sideways", error=True)).to_contain_text(
+            "auto, osm, carto-light, carto-dark, opentopo, esri-imagery", timeout=2_000)
+        run_cmd(page, "view reset")
+        expect(view_line(page, "view policies reset")).to_be_visible(timeout=2_000)
+        shown = view_show(page)
+        assert "map_tiles auto" in shown, shown
+        run_cmd(page, "view set main map")
+        page.wait_for_function(
+            "() => window.zetaTest.tileLayer()?.id === 'carto-dark'", timeout=5_000)
+        # Ruling M: `auto` under a light theme (vibecoder, color_scheme light) is OpenStreetMap.
+        run_cmd(page, "view set theme vibecoder")
+        expect(page.locator("html")).to_have_attribute("data-map-tiles", "osm", timeout=5_000)
+        page.wait_for_function("() => window.zetaTest.tileLayer()?.id === 'osm'", timeout=5_000)
+        assert not errors, f"console errors: {errors}"
+    finally:
+        run_cmd(page, "view reset")
+
+
 def scenario_map_follows_a_positioned_job_on_another_source(page, url, secret):
     # Spec 7.2: every running positioned job gets a marker, not only the shown source's (the
     # two-radio form: the page shows the watching radio, the decoder runs on the other).
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     errors = page_errors(page)
     select_source(page, url, secret, "aprs")
     run_cmd(page, "view set main map")
@@ -4642,7 +4722,7 @@ def scenario_map_follows_a_positioned_job_on_another_source(page, url, secret):
 def scenario_map_is_a_source_tab(page, url, secret):
     # Spec 4.4: the Map is a tab of the sources strip; `main map` swaps it for the waterfall in
     # #main and keeps the shown source (its job and axis), `map on|off` is its alias.
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     page.set_viewport_size(WIDE)
     main_is = "() => document.documentElement.dataset.main === '%s'"
@@ -4722,7 +4802,7 @@ def scenario_map_is_a_source_tab(page, url, secret):
 
 
 def scenario_home_gives_distance_and_bearing(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     errors = page_errors(page)
     # No station, so `home none` leaves the row without a distance (the page reads it at load).
     http_json(url, secret, "/op", {"op": "station_clear"})
@@ -4757,7 +4837,7 @@ def home_gives_distance_and_bearing(page, url, secret, errors):
 
 
 def scenario_station_is_the_default_home(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     errors = page_errors(page)
     http_json(url, secret, "/op", {"op": "station_set", "lat": -27.5, "lon": 153.0,
                                    "alt_m": 10.0, "region": "AU", "antennas": None})
@@ -4803,7 +4883,7 @@ def origins_of(url, secret, job):
 
 
 def scenario_origins_light_sites(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     page.set_viewport_size(WIDE)
     # At the tone's centre, the row's own 40 kHz (its `min_hz`; a narrower band is refused).
@@ -4863,7 +4943,7 @@ def scenario_origins_light_sites(page, url, secret):
 
 
 def scenario_origins_from_the_menu_and_bits(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     clear_captures(url, secret)
     stop_bits_jobs(url, secret)
     try:
@@ -4900,7 +4980,7 @@ def scenario_origins_from_the_menu_and_bits(page, url, secret):
 
 
 def scenario_no_station_lights_without_bearings(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     http_json(url, secret, "/op", {"op": "station_clear"})
     job = None
     try:
@@ -4926,7 +5006,7 @@ def scenario_no_station_lights_without_bearings(page, url, secret):
 
 
 def scenario_classify_lights_sites(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     try:
         menu = open_menu_on_tone(page, url, secret)
         page.click('#ctx .ctx-item[data-action="classify"]')
@@ -5168,7 +5248,7 @@ def scenario_subjects_tab_appears_only_with_a_subject_job(page, url, secret):
         expect(pane).to_be_visible()
         assert "pane subjects" in view_show(page)
         # With the map shown too, the map takes the top and the table the bottom.
-        page.route(OSM_TILES, lambda r: r.abort())
+        page.route(TILE_HOSTS, lambda r: r.abort())
         run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
         mp = page.locator("#map").bounding_box()
@@ -5189,7 +5269,7 @@ def scenario_subjects_tab_appears_only_with_a_subject_job(page, url, secret):
 
 
 def scenario_subjects_table_has_padding_and_scrolls_sideways(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     page.set_viewport_size(WIDE)
     run_cmd(page, "view set main map")
@@ -5595,7 +5675,7 @@ def scenario_protocol_text_has_no_adsb_case(page, url, secret):
 def map_with_subjects(page, url, secret):
     """The map on, its tiles aborted, and `fake_subjects` running on the tone source with both
     of its fixed aircraft drawn; the job id."""
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set main map")
     expect(page.locator("#map")).to_be_visible()
@@ -5876,7 +5956,7 @@ def scenario_selected_row_scrolls_into_view(page, url, secret):
 
 
 def scenario_map_follows_dim_and_drop(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set subject_dim_s 1")
     expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
@@ -5897,7 +5977,7 @@ def scenario_map_follows_dim_and_drop(page, url, secret):
 
 
 def scenario_a_dimmed_subject_relights(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set subject_dim_s 1")
     expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
@@ -6379,7 +6459,7 @@ def scenario_panes_show_one_at_a_time(page, url, secret):
         expect(pane).to_be_hidden()
         expect(tab).to_be_visible()
         # The map is the main area's: with the pane open it keeps the top.
-        page.route(OSM_TILES, lambda r: r.abort())
+        page.route(TILE_HOSTS, lambda r: r.abort())
         tab.click()
         run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
@@ -6714,6 +6794,7 @@ def main(argv):
                 ctx = browser.new_context(viewport=WIDE)
                 ctx.set_default_timeout(TIMEOUT_MS)
                 ctx.add_init_script(CSP_WATCH_JS)
+                ctx.route(TILE_HOSTS, lambda r: r.abort())
                 page = ctx.new_page()
                 console = []
                 page.on("console", lambda m: console.append(f"{m.type}: {m.text}")

@@ -63,6 +63,7 @@ among them (it is reserved, see Footprints).
 | `layout.rail` | `true` puts the job tags in the rail beside the axis (`<html data-rail="on">`), `false` on their outlines (`"off"`) |
 | `layout.ribbon_tilt_deg` | number, -30 to 30 inclusive; the lean of transcript ribbons (the wrapper emits `--ribbon-tilt` from it, so `--ribbon-tilt` is not a token) |
 | `layout.dock` | optional, `bottom` (when absent) or `right`: where the selected pane docks while the view's `dock` is `auto`, under the waterfall or map, or as a third section of the side column (`<html data-dock>`); any other value is refused naming `layout.dock` |
+| `layout.map_tiles` | optional, one of `osm`, `carto-light`, `carto-dark`, `opentopo`, `esri-imagery`: the map's tile provider while the view's `map_tiles` is `auto` (`<html data-map-tiles>`); absent, a dark `color_scheme` gets `carto-dark` and a light one `osm`; any other value is refused naming `layout.map_tiles` |
 | `tokens` | an object of custom properties from the list below; an unknown key is refused naming it |
 | `ramp` | the waterfall's colour stops: 2 to 16 of `[t, [r, g, b]]`, `t` strictly ascending, the first exactly 0 and the last exactly 1, channels 0-255 |
 | `fonts` | optional; each `{family, file, weight}` names a file in the folder and becomes an `@font-face` under the theme (`weight` is a CSS range such as `400 700`); use the family through `--font-ui` and `--font-mono`. `family` and `weight` may not contain a quote or the characters refused in token values |
@@ -258,7 +259,7 @@ On `<html>`: `html[data-theme]` (the active theme's `id`), `html[data-rail]` (`o
 `layout.rail`), `html[data-footprint]` (`wide` or `narrow`), `html[data-main]` (`rf` or `map`:
 what the main area shows, the waterfall or the map; the view's `main`) and `html[data-dock]`
 (`bottom` or `right`: where the selected pane docks, the view's `dock` resolved through
-`layout.dock`; set in every footprint, though the narrow one ignores it).
+`layout.dock`; set in every footprint, though the narrow one ignores it) and `html[data-map-tiles]` (the map's tile provider: the view's `map_tiles` resolved through `layout.map_tiles` and `color_scheme`). `#map .map-tile-note` is the map's notice that its tiles are not loading, naming another provider to try.
 
 ## Worked example
 

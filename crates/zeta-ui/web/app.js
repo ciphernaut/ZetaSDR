@@ -153,7 +153,7 @@ import {
 import { channelLabel, loadPlans, resolvePlan } from "./plans.js";
 import { MixWatch, isMuted, mixCovering, muteOp } from "./mix.js";
 import { mountCoarse } from "./coarse.js";
-import { mountMap } from "./map.js";
+import { mountMap, resolveMapTiles } from "./map.js";
 import { mountSubjects, mountSubjectsPane } from "./subjects.js";
 import { mountPanes } from "./panes.js";
 import { mountExplorePane } from "./explore.js";
@@ -951,6 +951,7 @@ function start(api) {
     jobs: () => state.lastJobs,
     subjects: state.subjects,
     lastEvent: (id) => (state.ov ? state.ov.lastEvent(id) : null),
+    tiles: resolveTiles,
   });
   state.map.onChange(paintMapCount);
   state.ov.onEvent((job, p) => {
@@ -994,6 +995,7 @@ function start(api) {
   applyRail();
   applyMain();
   applyDock();
+  applyMapTiles();
   state.subjects.onChange(paintDockHead);
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
@@ -1002,6 +1004,7 @@ function start(api) {
     if (key === "main") applyMain();
     if (key === "pane") applyPanes();
     if (key === "dock") applyDock();
+    if (key === "map_tiles") applyMapTiles();
   });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
@@ -1193,7 +1196,9 @@ async function applyTheme() {
   root.dataset.theme = id;
   root.dataset.rail = theme.layout?.rail === false ? "off" : "on";
   themeDock = theme.layout?.dock ?? null;
+  themeTiles = theme;
   applyDock();
+  applyMapTiles();
   applyRail();
   if (state.wf) {
     state.wf.refreshThemeColours();
@@ -1344,6 +1349,23 @@ function applyPanes() {
 // The fold is page memory (state.dockCollapsed), not a policy, forgotten when no pane is shown
 // or the dock leaves `right`.
 let themeDock = null; // the applied theme's layout.dock ("bottom" | "right" | null)
+
+// ---- the map's tiles ----------------------------------------------------------------------
+// The view's `map_tiles` resolved through the applied theme (map.js resolveMapTiles: its
+// `layout.map_tiles`, else by its `color_scheme`) onto <html data-map-tiles> and the map's
+// one tile layer. Run at load, on a `map_tiles` change and when a theme applies.
+let themeTiles = null; // the applied theme.json (its color_scheme and layout.map_tiles)
+
+function resolveTiles() {
+  return resolveMapTiles(state.view ? state.view.get("map_tiles") : "auto", themeTiles);
+}
+
+function applyMapTiles() {
+  const id = resolveTiles();
+  const root = document.documentElement;
+  if (root.dataset.mapTiles !== id) root.dataset.mapTiles = id;
+  state.map?.applyTiles();
+}
 
 function resolveDock() {
   const v = state.view ? state.view.get("dock") : "auto";
@@ -1735,6 +1757,11 @@ window.zetaTest = {
   // answered).
   themeIds() {
     return themeIds();
+  },
+  // The map's tile layer in force (map.js tileLayer: {id, url, attribution}), or null before
+  // the map is made.
+  tileLayer() {
+    return state.map ? state.map.tileLayer() : null;
   },
   // The keys of the map's lit sets (map.js litKeys: job ids and one-shot keys).
   litKeys() {

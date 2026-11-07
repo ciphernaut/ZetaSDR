@@ -216,6 +216,10 @@ html[data-main="map"] #waterfall { visibility: hidden; }
 #map .map-source { width: auto; height: auto; white-space: nowrap; padding: 0 3px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); border: 1px solid var(--map-sel); }
 #map .leaflet-popup-content .map-origin + .map-origin, #map .leaflet-popup-content .map-lookup { margin-top: 6px; }
 #map .leaflet-popup-content .map-lookup { color: var(--map-dim); font-size: 11px; }
+/* map.js: tiles that do not load say so, bottom left over the map, above the attribution. */
+#map .map-tile-note { position: absolute; z-index: 1000; bottom: 24px; left: 8px; max-width: 60%; padding: 2px 6px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); pointer-events: none; }
+/* The layers control's toggle: Leaflet's images/layers.png is not vendored, so a drawn stack. */
+#map .leaflet-control-layers-toggle { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 26 26'%3E%3Cpath d='M13 4 24 10 13 16 2 10Z' fill='%23555'/%3E%3Cpath d='M4.5 14.5 13 19.5 21.5 14.5 24 16 13 22 2 16Z' fill='%23888'/%3E%3C/svg%3E"); background-size: 26px 26px; background-repeat: no-repeat; background-position: center; }
 /* No station: the sites are not cut by reach (map.js syncNote). */
 #map .map-note { position: absolute; z-index: 1000; top: 8px; right: 8px; max-width: 60%; padding: 2px 6px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); pointer-events: none; }
 /* The pane under the waterfall (panes.js): the strip's selected pane, at the height the jobs

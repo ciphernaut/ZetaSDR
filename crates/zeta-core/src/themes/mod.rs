@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use theme_json::{
-    ColorScheme, Dock, FontFace, Layout, ThemeError, ThemeJson, ThemeState, is_theme_id, parse,
-    validate,
+    ColorScheme, Dock, FontFace, Layout, MAP_TILES, ThemeError, ThemeJson, ThemeState, is_theme_id,
+    parse, validate,
 };
 pub use tokens::TOKENS;
 

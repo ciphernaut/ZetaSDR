@@ -5,9 +5,15 @@
 //   TRACK_POINTS   fixes kept per job track (the oldest dropped first)
 //   SUBJECT_TRACK_POINTS   the points of a subject's track when its row names no
 //                  `subject.track_points`
-//   OSM_TILES, OSM_ATTRIBUTION   the only tile layer: OpenStreetMap's, with its attribution;
-//                  a tile that fails (offline, or the e2e suite aborting the host) leaves its
-//                  square blank
+//   TILE_PROVIDERS   the map's tile layers, keyless all: [{id, label, url, attribution,
+//                  maxZoom, subdomains}], ids osm, carto-light, carto-dark, opentopo,
+//                  esri-imagery (the view's `map_tiles` values besides auto; zeta-ws ui.rs
+//                  lists their hosts in the CSP's img-src, and zeta-core's theme_json their
+//                  ids for `layout.map_tiles`)
+//   resolveMapTiles(value, theme) -> id   the provider the view's `map_tiles` names: `auto`
+//       is the theme's `layout.map_tiles` when it names one, else carto-dark for a theme
+//       whose `color_scheme` is dark (or not known yet: the default console is dark) and
+//       osm for a light one
 //   distanceBearing(home, pos) -> {km, deg}
 //       Great-circle distance (haversine, mean Earth radius) and initial bearing (degrees
 //       clockwise from true north, 0 <= deg < 360) from `home` to `pos`, both {lat, lon} in
@@ -24,8 +30,10 @@
 //       newer half whole: a track keeps its start and old detail coarsens with age
 //   drawnPoints(kept, latest) -> [[lat, lon]]   the line: the kept points, ending at the latest
 //       fix (`cap` at most, as `kept` is under it)
-//   mountMap(el, api, view, {jobs, subjects, lastEvent}) -> MapPane   (`lastEvent(jobId)`:
-//       performance.now() of the job's last event on the feed, overlays.js lastEvent)
+//   mountMap(el, api, view, {jobs, subjects, lastEvent, tiles}) -> MapPane
+//       (`lastEvent(jobId)`: performance.now() of the job's last event on the feed,
+//       overlays.js lastEvent; `tiles()` the provider id in force, app.js resolving the
+//       view's `map_tiles` through the theme)
 //       `el` (#map) is shown while view.get("main") is "map" and hidden otherwise (view.onChange;
 //       `invalidateSize` on each show).
 //       Leaflet (vendor/leaflet, served by the node) is loaded the first time the map shows,
@@ -70,7 +78,17 @@
 //                               a fix), for its jobs pane row (agent.js). A job with subjects
 //                               answers for its one subject on the map; with more it is null,
 //                               since the table has them.
+//     map.applyTiles()          the provider `tiles()` names becomes the tile layer (app.js
+//                               calls it on a `map_tiles` or theme change); a map not made
+//                               yet starts with it
+//     map.tileLayer() -> {id, url, attribution} | null   the tile layer in force
 //     map.destroy()
+//   Tiles: exactly one tile layer at a time, TILE_PROVIDERS' entry for `tiles()`. A Leaflet
+//   layers control (top left, under the zoom) lists the providers by label; choosing one sets
+//   the view's `map_tiles` (view.set), and the change swaps the layer. A layer's first
+//   `tileerror` shows `div.map-tile-note` on the map, once per provider per load: `map tiles
+//   from <label> are not loading; try another (view set map_tiles <id>)`, naming a provider
+//   not failed yet; a later `tileload` from that provider, or a swap, hides it.
 //   Drawn, once Leaflet is in: one L.circleMarker (class `map-pos`) at each job's newest fix,
 //   whose popup is the last event's `summary` and its age (`12 s ago`, from when this page
 //   received it), and one non-interactive L.polyline (class `map-track`) through its fixes;
@@ -112,9 +130,61 @@ export const SUBJECT_TRACK_POINTS = 100;
 const TURN_DEG = 10;
 // Over any marker a screen's height of latitude would otherwise put in front.
 const SELECTED_Z = 10000;
-export const OSM_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
-export const OSM_ATTRIBUTION =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const OSM = "© OpenStreetMap contributors";
+export const TILE_PROVIDERS = [
+  {
+    id: "osm",
+    label: "OpenStreetMap",
+    url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    attribution: OSM,
+    maxZoom: 19,
+    subdomains: "",
+  },
+  {
+    id: "carto-light",
+    label: "CARTO Positron",
+    url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+    attribution: `${OSM} © CARTO`,
+    maxZoom: 20,
+    subdomains: "abcd",
+  },
+  {
+    id: "carto-dark",
+    label: "CARTO Dark Matter",
+    url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+    attribution: `${OSM} © CARTO`,
+    maxZoom: 20,
+    subdomains: "abcd",
+  },
+  {
+    id: "opentopo",
+    label: "OpenTopoMap",
+    url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+    attribution: `${OSM}, SRTM | © OpenTopoMap (CC-BY-SA)`,
+    maxZoom: 17,
+    subdomains: "abc",
+  },
+  {
+    id: "esri-imagery",
+    label: "Esri World Imagery",
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attribution:
+      "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+    maxZoom: 19,
+    subdomains: "",
+  },
+];
+const providerOf = (id) => TILE_PROVIDERS.find((p) => p.id === id);
+// `auto` under a theme that names no provider: by its colour scheme.
+const DARK_TILES = "carto-dark";
+const LIGHT_TILES = "osm";
+
+export function resolveMapTiles(value, theme) {
+  if (providerOf(value)) return value;
+  const named = theme?.layout?.map_tiles;
+  if (providerOf(named)) return named;
+  return theme?.color_scheme === "light" ? LIGHT_TILES : DARK_TILES;
+}
 const FIRST_ZOOM = 10;
 // A lit site's marker radius, and the note shown while an answer had no vantage.
 const SITE_RADIUS = 7;
@@ -325,8 +395,25 @@ export function mountMap(el, api, view, opts = {}) {
 }
 
 class MapPane {
-  constructor(el, api, view, { jobs = () => [], subjects = null, lastEvent = () => null } = {}) {
+  constructor(
+    el,
+    api,
+    view,
+    {
+      jobs = () => [],
+      subjects = null,
+      lastEvent = () => null,
+      tiles = () => resolveMapTiles(view.get("map_tiles"), null),
+    } = {},
+  ) {
     this.el = el;
+    this.tiles = tiles;
+    this.tileLayers = new Map(); // provider id -> L.tileLayer, made with the map
+    this.tileId = null; // the provider of the layer on the map
+    this.tileNote = null; // div.map-tile-note, while shown
+    this.tileNoteFor = null; // the provider it names
+    this.tileFailed = new Set(); // providers whose tiles failed this load
+    this.swapping = false; // applyTiles is changing the layer (not a choice in the control)
     this.api = api;
     this.view = view;
     this.jobs = jobs;
@@ -387,7 +474,29 @@ class MapPane {
     if (this.destroyed || this.map) return;
     this.L = L;
     this.map = L.map(this.el, { worldCopyJump: true });
-    L.tileLayer(OSM_TILES, { attribution: OSM_ATTRIBUTION, maxZoom: 19 }).addTo(this.map);
+    const base = {};
+    for (const p of TILE_PROVIDERS) {
+      const layer = L.tileLayer(p.url, {
+        attribution: p.attribution,
+        maxZoom: p.maxZoom,
+        ...(p.subdomains ? { subdomains: p.subdomains } : {}),
+      });
+      layer.on("tileerror", () => this.tileError(p));
+      layer.on("tileload", () => this.tileLoaded(p));
+      this.tileLayers.set(p.id, layer);
+      base[p.label] = layer;
+    }
+    this.applyTiles();
+    L.control.layers(base, null, { position: "topleft" }).addTo(this.map);
+    // A choice in the control: it has swapped the layer itself; the policy follows it, and
+    // applyTiles keeps the one layer either way. Leaflet fires this for applyTiles' own adds
+    // too, which are not a choice.
+    this.map.on("baselayerchange", (e) => {
+      if (this.swapping) return;
+      const p = TILE_PROVIDERS.find((x) => this.tileLayers.get(x.id) === e.layer);
+      if (p && p.id !== this.view.get("map_tiles")) this.view.set("map_tiles", p.id);
+      this.applyTiles();
+    });
     const first = this.tracks.values().next().value;
     const home = homeOf(this.view);
     const site = [...this.sets.values()].find((s) => s.sites.length > 0)?.sites[0];
@@ -398,6 +507,56 @@ class MapPane {
     this.drawHome();
     for (const id of this.tracks.keys()) this.draw(id);
     for (const s of this.sets.values()) this.drawSet(s);
+  }
+
+  // ---- tiles (plan 32 Task 11b) ----
+
+  applyTiles() {
+    if (!this.map) return;
+    const asked = this.tiles();
+    const id = providerOf(asked) ? asked : DARK_TILES;
+    const want = this.tileLayers.get(id);
+    this.swapping = true;
+    try {
+      for (const [other, layer] of this.tileLayers) {
+        if (other !== id && this.map.hasLayer(layer)) this.map.removeLayer(layer);
+      }
+      if (!this.map.hasLayer(want)) want.addTo(this.map);
+    } finally {
+      this.swapping = false;
+    }
+    if (this.tileId !== id) this.hideTileNote();
+    this.tileId = id;
+  }
+
+  tileLayer() {
+    const p = providerOf(this.tileId);
+    return p ? { id: p.id, url: p.url, attribution: p.attribution } : null;
+  }
+
+  tileError(p) {
+    if (this.destroyed || p.id !== this.tileId || this.tileFailed.has(p.id)) return;
+    this.tileFailed.add(p.id);
+    const next =
+      TILE_PROVIDERS.find((x) => x.id !== p.id && !this.tileFailed.has(x.id)) ??
+      TILE_PROVIDERS.find((x) => x.id !== p.id);
+    this.hideTileNote();
+    this.tileNote = document.createElement("div");
+    this.tileNote.className = "map-tile-note";
+    this.tileNote.textContent =
+      `map tiles from ${p.label} are not loading; ` + `try another (view set map_tiles ${next.id})`;
+    this.tileNoteFor = p.id;
+    this.el.append(this.tileNote);
+  }
+
+  tileLoaded(p) {
+    if (this.tileNoteFor === p.id) this.hideTileNote();
+  }
+
+  hideTileNote() {
+    this.tileNote?.remove();
+    this.tileNote = null;
+    this.tileNoteFor = null;
   }
 
   // ---- lit sites (plan 32 spec 4.4) ----
@@ -819,6 +978,7 @@ class MapPane {
     this.sets.clear();
     this.note?.remove();
     this.note = null;
+    this.hideTileNote();
     this.el.hidden = true;
   }
 }

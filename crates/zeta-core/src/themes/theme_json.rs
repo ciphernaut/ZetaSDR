@@ -54,6 +54,11 @@ pub struct Layout {
     /// the side column. Optional; `bottom` when absent (served as `null`).
     #[serde(default)]
     pub dock: Option<Dock>,
+    /// The map's tile provider while the view's `map_tiles` is `auto`, one of [`MAP_TILES`].
+    /// Optional; absent (served as `null`), the page picks by `color_scheme`: CARTO Dark
+    /// Matter for a dark theme, OpenStreetMap for a light one.
+    #[serde(default)]
+    pub map_tiles: Option<String>,
 }
 
 /// `layout.dock`: the pane host under the main view or in the side column.
@@ -66,6 +71,15 @@ pub enum Dock {
 
 /// The words `layout.dock` takes.
 const DOCKS: [&str; 2] = ["bottom", "right"];
+
+/// The ids `layout.map_tiles` takes: the page's tile providers (map.js TILE_PROVIDERS).
+pub const MAP_TILES: [&str; 5] = [
+    "osm",
+    "carto-light",
+    "carto-dark",
+    "opentopo",
+    "esri-imagery",
+];
 
 /// A font file in the theme's folder, declared as an `@font-face` under the theme.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -140,6 +154,14 @@ pub fn parse(text: &str) -> Result<ThemeJson, ThemeError> {
         return Err(ThemeError::new(
             "layout.dock",
             format!("{dock} is not one of {}", DOCKS.join(", ")),
+        ));
+    }
+    if let Some(tiles) = field("layout").get("map_tiles").filter(|t| !t.is_null())
+        && !tiles.as_str().is_some_and(|t| MAP_TILES.contains(&t))
+    {
+        return Err(ThemeError::new(
+            "layout.map_tiles",
+            format!("{tiles} is not one of {}", MAP_TILES.join(", ")),
         ));
     }
     check::<Layout>("layout", field("layout"))?;
@@ -373,6 +395,29 @@ mod tests {
         assert_eq!(e.field, "layout.dock", "{e}");
         let e = refused(&edited(|v| v["layout"]["dock"] = 1.into()));
         assert_eq!(e.field, "layout.dock", "{e}");
+    }
+
+    #[test]
+    fn layout_map_tiles_parses_a_provider_id_and_is_none_when_absent() {
+        assert_eq!(load(FIXTURE).unwrap().layout.map_tiles, None);
+        for id in MAP_TILES {
+            let t = load(&edited(|v| v["layout"]["map_tiles"] = id.into())).unwrap();
+            assert_eq!(t.layout.map_tiles.as_deref(), Some(id));
+        }
+        let t = load(&edited(|v| v["layout"]["map_tiles"] = "carto-dark".into())).unwrap();
+        let served = serde_json::to_value(&t.layout).unwrap();
+        assert_eq!(served["map_tiles"], "carto-dark", "{served}");
+    }
+
+    #[test]
+    fn layout_map_tiles_not_a_provider_is_refused_naming_the_field() {
+        let e = refused(&edited(|v| v["layout"]["map_tiles"] = "google".into()));
+        assert_eq!(e.field, "layout.map_tiles", "{e}");
+        assert!(e.error.contains("carto-dark"), "{e}");
+        let e = refused(&edited(|v| v["layout"]["map_tiles"] = "auto".into()));
+        assert_eq!(e.field, "layout.map_tiles", "{e}");
+        let e = refused(&edited(|v| v["layout"]["map_tiles"] = 1.into()));
+        assert_eq!(e.field, "layout.map_tiles", "{e}");
     }
 
     #[test]

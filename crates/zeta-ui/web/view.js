@@ -45,6 +45,10 @@
 //         dock             auto | bottom | right (default auto): where #pane shows, under the
 //                          main view or as a third folding section of the side column
 //                          (app.js applyDock); auto is the theme's `layout.dock`, else bottom
+//         map_tiles        auto | osm | carto-light | carto-dark | opentopo | esri-imagery
+//                          (default auto): the map's tile provider (map.js TILE_PROVIDERS;
+//                          app.js applyMapTiles); auto is the theme's `layout.map_tiles`, else
+//                          carto-dark under a dark theme and osm under a light one
 //   homePoint(value) -> {lat, lon} | null   the `home` policy's value as numbers (null: none)
 //   setStationHome(point|null)  the node's station position ({lat, lon}; app.js reads it once
 //       with `station_get` at page load), the home used while the view's `home` is none
@@ -94,6 +98,7 @@ export const AGENT_VIEW_KEYS = [
   "plan",
   "follow",
   "origin_fade_s",
+  "map_tiles",
 ];
 
 const SOURCE_ID = /^[A-Za-z0-9_.:-]+$/;
@@ -266,6 +271,12 @@ export const POLICIES = [
     values: ["auto", "bottom", "right"],
     default_: "auto",
     describe: "auto, bottom, right",
+  },
+  {
+    key: "map_tiles",
+    values: ["auto", "osm", "carto-light", "carto-dark", "opentopo", "esri-imagery"],
+    default_: "auto",
+    describe: "auto, osm, carto-light, carto-dark, opentopo, esri-imagery",
   },
 ];
 
