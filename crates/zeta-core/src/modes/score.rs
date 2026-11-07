@@ -17,7 +17,7 @@ pub const ALLOCATION_SCORE: f32 = 0.2;
 /// An assignment's bandwidth fits a row's within these factors of `band.bandwidth_hz`.
 const ALLOCATION_WIDTH: (f64, f64) = (0.5, 1.5);
 /// The layer-1 labels each emission designator's modulation letter is compatible with.
-const DESIGNATOR_LABELS: &[(char, &[&str])] = &[
+pub(crate) const DESIGNATOR_LABELS: &[(char, &[&str])] = &[
     ('F', &["fm", "fsk"]),
     ('G', &["fm", "fsk", "psk"]),
     ('D', &["psk"]),

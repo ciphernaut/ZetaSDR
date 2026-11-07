@@ -116,6 +116,12 @@ pub struct Signature {
 #[async_trait]
 pub trait KnowledgeProvider: Send + Sync {
     fn name(&self) -> &str;
+    /// Whether this provider lists licensed assignments (`kind` `assignment`): a
+    /// licence register, which the origin query tells apart from band plans (an empty
+    /// answer from one is "the register gave no rows", not "no register").
+    fn gives_assignments(&self) -> bool {
+        false
+    }
     async fn allocations(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Allocation>;
     async fn signatures(&self, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Signature>;
     /// How far from the station this provider searched for the band, when it
@@ -232,6 +238,13 @@ impl StaticKnowledge {
 impl KnowledgeProvider for StaticKnowledge {
     fn name(&self) -> &str {
         "static"
+    }
+
+    /// When its allocations file holds an assignment row.
+    fn gives_assignments(&self) -> bool {
+        self.allocations
+            .iter()
+            .any(|a| a.kind.as_deref() == Some("assignment"))
     }
 
     async fn allocations(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Allocation> {
