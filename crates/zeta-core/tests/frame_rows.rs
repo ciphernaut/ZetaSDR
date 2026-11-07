@@ -121,6 +121,11 @@ async fn open(dir: &Path, modes_dir: &Path) -> Node {
         row_json().to_string(),
     )
     .unwrap();
+    open_over(dir, modes_dir, capture()).await
+}
+
+/// [`open`] over the capture `iq`, with the rows already in `modes_dir`.
+async fn open_over(dir: &Path, modes_dir: &Path, iq: &Path) -> Node {
     let cfg = NodeConfig {
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
@@ -138,7 +143,7 @@ async fn open(dir: &Path, modes_dir: &Path) -> Node {
         repeat: true,
         tune_range: None,
     };
-    let src = Arc::new(FileSource::open(rx(), capture(), opts).unwrap());
+    let src = Arc::new(FileSource::open(rx(), iq, opts).unwrap());
     let port: Arc<dyn Port> = src.clone();
     let node = Node::open(cfg, stages(), vec![port]).await.unwrap();
     for c in zeta_dsp::classifiers(node.modes_handle()) {
@@ -220,7 +225,7 @@ fn a_bad_framing_or_parser_names_the_field() {
         v["decoder"]["framing"]["sync"]["bits"] = 70.into()
     }));
     assert_eq!(e.field, "decoder.framing.sync.bits", "{e}");
-    let e = check(edited(|v| v["decoder"]["parser"] = "modbus_rtu".into()));
+    let e = check(edited(|v| v["decoder"]["parser"] = "bogus".into()));
     assert_eq!(e.field, "decoder.parser", "{e}");
     assert!(e.error.contains("modbus_rtu"), "{e}");
     // `quick: frame` belongs to a frame row only.
@@ -396,4 +401,99 @@ async fn identify_proves_a_frame_row() {
             node.job_stop(&r.id).await.unwrap();
         }
     }
+}
+
+/// The rate `zeta modes check` synthesises a row's test at.
+const CHECK_RATE_HZ: u32 = 240_000;
+
+/// The DNP3 link frame the operator row's test sends, after the sync word `05 64`: the
+/// header (length 11, control `c4`, destination 1, source 0) and one data block, each
+/// with its CRC-16/DNP. Decodable by the chain: a frame with long runs of zero bits is not.
+const DNP3_BODY: &str = "0bc4010000008c85c0c1013c020652c3";
+
+/// An operator row (in a temp modes directory, never the real one) naming the `dnp3`
+/// parser, the DNP3 framing and a real centre decodes its vector through `job_start`:
+/// the first event carries the row's `protocol` and the vector's `destination`. A 9600 Bd
+/// row is synthesised at 240 kHz (as `zeta modes check` does) with 2400 Hz deviation
+/// (4800 falls outside a 12.5 kHz channel), a quiet lead-in, and `body_bytes` given
+/// beside `bodies`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_operator_parser_row_decodes_its_vector() {
+    let _one = SERIAL.lock().await;
+    let framing = json!({"sync": {"hex": "0564", "bits": 16}, "length": {"to_next_sync": true},
+        "crc": null});
+    let row = json!({
+        "id": "dnp3_link", "name": "DNP3 link", "family": "iot",
+        "band": {"bandwidth_hz": BANDWIDTH_HZ, "centers_hz": [CENTER_HZ]},
+        "modulation": ["fsk", "fm"], "label": "DNP3", "protocol": "dnp3",
+        "decoder": {"kind": "frame",
+            "demod": {"modulation": "fsk", "symbol_rate_baud": 9600, "order": 2, "tone_spacing_hz": null},
+            "framing": framing, "parser": "dnp3"},
+        "event": {"schema": {"type": "object", "properties": {
+            "protocol": {"type": "string"}, "destination": {"type": "integer"},
+            "source": {"type": "integer"}, "user_data": {"type": "string"}}},
+            "summary": "dnp3 {source} -> {destination}"},
+        "identify": {"proof": "event", "min_events": 1, "dwell_ms": 10000, "min_span_ms": 1000,
+            "quick": "frame", "priority": 0},
+        "catalogue": []
+    });
+    let params = json!({"family": "framing", "modulation": "fsk", "symbol_rate_baud": 9600,
+        "deviation_hz": 2400.0, "frames": 6, "body_bytes": 16, "bodies": vec![DNP3_BODY; 6],
+        "framing": framing, "repeat": 1, "snr_db": 20.0});
+    let params = params.as_object().unwrap().clone();
+    let (spec, imp) = zeta_dsp::synth::parse_params(params).unwrap();
+    let burst = zeta_dsp::synth::synthesise(&spec, &imp, CHECK_RATE_HZ, CENTER_HZ);
+    // A quiet lead-in before the burst, as `zeta modes check` has: the capture loops, and
+    // a burst that starts on the loop's first sample gives the demodulator no settling.
+    let silence = burst[0] - burst[0];
+    let mut iq = vec![silence; (CHECK_RATE_HZ / 10) as usize];
+    iq.extend_from_slice(&burst);
+    let cap = tempfile::tempdir().unwrap();
+    let meta = CaptureMeta {
+        sample_rate_hz: Hz(CHECK_RATE_HZ as u64),
+        center_hz: Hz(CENTER_HZ),
+        start: Timestamp(0),
+        annotations: Vec::new(),
+    };
+    let path = write_cf32(cap.path(), "dnp3", &meta, &iq).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    std::fs::write(modes.join("dnp3_link.json"), row.to_string()).unwrap();
+    let node = open_over(dir.path(), &modes, &path).await;
+    let id = start(&node, JobKind::from_name("dnp3_link").unwrap()).await;
+    let events = || -> Vec<_> {
+        node.job_outputs(&id)
+            .into_iter()
+            .filter(|(k, _)| *k == StreamKind::Event)
+            .map(|(_, s)| s)
+            .collect()
+    };
+    until("the job's event outputs", Duration::from_secs(5), || {
+        !events().is_empty()
+    })
+    .await;
+    let stream = events().pop().expect("the job's parsed output");
+    let mut rx = node.bus().subscribe(&stream).unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Ok(f) => {
+                    if let Payload::Event(v) = f.payload
+                        && v["protocol"] == "dnp3"
+                    {
+                        return v;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("stream closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a parsed frame within 10 s");
+    assert_eq!(first["destination"], 1, "{first}");
+    assert_eq!(first["source"], 0, "{first}");
+    assert_eq!(first["user_data"], "c0c1013c0206", "{first}");
+    node.job_stop(&id).await.unwrap();
 }

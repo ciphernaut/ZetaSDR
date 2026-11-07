@@ -75,9 +75,9 @@ A frame row (`decoder.kind: frame`) decodes a framed burst in-process. Its `deco
 
 A learned signature is such a row, written by the operator's accept (`learned_<id>` in the node's modes directory). A node with no modes directory writes no row and says so. An existing row is kept as it is. A built-in or operator row that proves an overlapping signal supersedes the learned one.
 
-Parsers: none yet.
+Parsers read a frame's bytes into fields, each behind the protocol's own check, and publish an event only when the check passes. Four exist, named by `decoder.parser` of an operator frame row: `dnp3` (every CRC-16/DNP), `iec101` (the repeated length, the checksum and the end byte; the variable-length frame only), `iec104` (the APCI and the ASDU header) and `modbus_rtu` (CRC-16/MODBUS). No built-in rows ship for them: a row with no well-known centre would be tried on every band, and `iec104` has no check strong enough to keep noise from proving it. The operator names the band, the centre and the framing in use. Modbus RTU frames carry no sync word of their own (they are UART characters delimited by silence), so its row names the modem framing. For `dnp3`, `iec101` and `iec104` the frame starts with the framing's sync word (`05 64`, `68`), and the parser is handed the sync and the frame's bytes together.
 
-The boundary stays as the spec put it.
+The boundary the parsers keep is the spec's:
 
 This decodes clear, unencrypted, standards-based framing that the node is lawfully receiving. It never attempts to break encryption, never targets a specific operator's link as the deliverable, and emits no transmit path. An encrypted or proprietary payload is reported as `framed, opaque` with its length and CRC status, not decoded.
 

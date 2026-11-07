@@ -560,7 +560,7 @@ const PROGRAM_PLACEHOLDERS: [&str; 4] = ["$port", "$rate_hz", "$center_hz", "$fi
 /// The in-crate attempts `identify.quick` may name (`frame` on a frame row only).
 pub const QUICK_ATTEMPTS: [&str; 5] = ["aprs", "pocsag", "acars", "rds", "frame"];
 /// The parsers a frame row's `decoder.parser` may name.
-pub const FRAME_PARSERS: &[&str] = &["opaque"];
+pub const FRAME_PARSERS: &[&str] = &["opaque", "modbus_rtu", "dnp3", "iec101", "iec104"];
 /// The stage a frame row's framing is checked by and runs in.
 pub(crate) const FRAME_DECODE_STAGE: &str = "frame_decode";
 /// Name suffixes of fields that hold an integer in their unit.
@@ -1577,8 +1577,8 @@ mod tests {
             check(|v| v["decoder"]["demod"]["symbol_rate_baud"] = 0.into()),
             "decoder.demod.symbol_rate_baud: at least 1"
         );
-        let e = check(|v| v["decoder"]["parser"] = "modbus_rtu".into());
-        assert!(e.starts_with("decoder.parser: \"modbus_rtu\""), "{e}");
+        let e = check(|v| v["decoder"]["parser"] = "bogus".into());
+        assert!(e.starts_with("decoder.parser: \"bogus\""), "{e}");
         let e = check(|v| v["identify"]["quick"] = "aprs".into());
         assert!(e.starts_with("identify.quick: "), "{e}");
         // `quick` may be null on a frame row.

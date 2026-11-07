@@ -161,6 +161,52 @@ fn a_frame_row_is_checked_over_the_framing_family() {
     assert_eq!(code, 0);
 }
 
+/// An operator frame row naming a parser is checked over the `framing` family: the
+/// parser's own check is what lets an event through, so the first event is its fields.
+#[test]
+fn an_operator_parser_row_is_checked_over_the_framing_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let framing = serde_json::json!({"sync": {"hex": "0564", "bits": 16},
+        "length": {"to_next_sync": true}, "crc": null});
+    let row = serde_json::json!({
+        "id": "dnp3_link",
+        "name": "DNP3 link",
+        "family": "iot",
+        "band": {"bandwidth_hz": 12500, "centers_hz": [433920000]},
+        "modulation": ["fsk", "fm"],
+        "label": "DNP3",
+        "protocol": "dnp3",
+        "decoder": {
+            "kind": "frame",
+            "demod": {"modulation": "fsk", "symbol_rate_baud": 9600, "order": 2, "tone_spacing_hz": null},
+            "framing": framing,
+            "parser": "dnp3"
+        },
+        "event": {
+            "schema": {"type": "object", "properties": {
+                "protocol": {"type": "string"},
+                "destination": {"type": "integer"},
+                "source": {"type": "integer"}
+            }},
+            "summary": "dnp3 {source} -> {destination}"
+        },
+        "identify": {"proof": "event", "min_events": 1, "dwell_ms": 10000,
+            "min_span_ms": 1000, "quick": "frame", "priority": 0},
+        "catalogue": [],
+        "test": {
+            "kind": "synth", "family": "framing", "modulation": "fsk", "symbol_rate_baud": 9600,
+            "deviation_hz": 2400.0, "frames": 6, "body_bytes": 16,
+            "bodies": vec!["0bc4010000008c85c0c1013c020652c3"; 6], "framing": framing,
+            "repeat": 1, "snr_db": 20, "expect": {"destination": 1, "source": 0},
+            "within_ms": 10000
+        }
+    });
+    write_row_json(dir.path(), &row);
+    let (out, code) = stdout(&mut check(dir.path(), &["--strict", "dnp3_link"]));
+    assert_eq!(out.trim(), "dnp3_link: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
 #[test]
 fn a_fixture_test_row_is_checked() {
     let dir = tempfile::tempdir().unwrap();
