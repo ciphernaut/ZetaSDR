@@ -124,7 +124,7 @@ impl Inner {
             Some(port),
             set,
             token,
-            (vec![out.clone()], None),
+            (vec![out.clone()], None, Vec::new()),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
@@ -290,6 +290,8 @@ impl Inner {
             .collect();
         let mut set = JoinSet::new();
         let mut drain: Drain = HashMap::new();
+        // The proposal watchers, awaited by `supervise` before the session record.
+        let mut watchers = Vec::new();
         for (n, stage) in graph.nodes.iter().zip(stages) {
             let mut inputs = Vec::new();
             let mut leaving = Vec::new();
@@ -325,12 +327,12 @@ impl Inner {
                 self.tee_transcripts(rec, &job_outputs[before..], &token);
             }
             if let Some(rec) = &proposer {
-                super::propose::watch_for_proposals(
+                watchers.extend(super::propose::watch_for_proposals(
                     self,
                     rec,
                     &job_outputs[first_output..],
                     &token,
-                );
+                ));
             }
             let ids: Vec<StreamId> = outputs.into_iter().map(|(_, s)| s).collect();
             let own = ids.clone();
@@ -385,7 +387,7 @@ impl Inner {
             port,
             set,
             token,
-            (streams, drains.then_some(drain)),
+            (streams, drains.then_some(drain), watchers),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run
@@ -932,7 +934,7 @@ impl Inner {
             Some(port),
             set,
             token,
-            (vec![out.clone()], None),
+            (vec![out.clone()], None, Vec::new()),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run
@@ -1073,6 +1075,11 @@ fn node_outputs(
 /// unregistered, so each consumer sees its input close, flushes and ends in turn, and
 /// the rest are cancelled once all have ended or [`DRAIN_TIMEOUT_MS`] after the first
 /// clean end. A failure still cancels at once.
+///
+/// `watchers` (the job's proposal watchers, see [`super::propose::watch_for_proposals`])
+/// are awaited once the stages have ended and the token is cancelled, at most
+/// [`super::propose::PROPOSAL_DRAIN_MS`], so a proposal from the job's last events is
+/// noted before its session record is written.
 pub(super) async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
@@ -1080,7 +1087,7 @@ pub(super) async fn supervise(
     port: Option<Arc<dyn Port>>,
     mut set: JoinSet<Result<(), StageError>>,
     token: CancellationToken,
-    (streams, mut drain): (Vec<StreamId>, Option<Drain>),
+    (streams, mut drain, watchers): (Vec<StreamId>, Option<Drain>, Vec<JoinHandle<()>>),
 ) {
     let mut failure = None;
     // Whether a stage ended the job (not a stop, nothing failing).
@@ -1128,6 +1135,12 @@ pub(super) async fn supervise(
     }
     if drain.is_some() {
         token.cancel();
+    }
+    // Every stage has ended: the watchers drain what is buffered on the cancelled token,
+    // then end, before the session record below reads the job's context.
+    if !watchers.is_empty() {
+        token.cancel();
+        super::propose::drain_watchers(watchers).await;
     }
     // An elastic job being relaunched keeps its record `Running` and its lease
     // for the relaunch (see `Inner::relaunch_elastic`). A run whose entry a later

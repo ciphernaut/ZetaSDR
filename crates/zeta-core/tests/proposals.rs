@@ -448,11 +448,8 @@ async fn no_proposal_when_an_accepted_signature_holds_the_band() {
     assert!(ctx["capture"].get("proposal").is_none(), "{ctx}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_bits_job_proposes_once_however_many_passes() {
-    let _one = SERIAL.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    let node = open(dir.path(), None, false).await;
+/// The framed capture written to the store, and a `bits` job started on it.
+async fn bits_on_framed(node: &Node) -> (String, JobId) {
     let iq = framed_iq();
     let ms = iq.len() as u64 * 1_000 / RATE_HZ as u64;
     let features = json!({
@@ -493,6 +490,15 @@ async fn a_bits_job_proposes_once_however_many_passes() {
         Ok(OpResult::Job(id)) => id,
         r => panic!("bits_start: {r:?}"),
     };
+    (cap, job)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bits_job_proposes_once_however_many_passes() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path(), None, false).await;
+    let (cap, job) = bits_on_framed(&node).await;
     until("a proposal", Duration::from_secs(20), || {
         !node.signatures().list(None).is_empty()
     })
@@ -538,6 +544,49 @@ async fn a_bits_job_proposes_once_however_many_passes() {
     );
     assert!(s["hypotheses"]["crc_candidates"].is_array(), "{s}");
     assert_eq!(s["captures"], json!([cap]), "{s}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proposal_from_a_jobs_last_events_is_in_its_session() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path(), None, false).await;
+    let (_cap, job) = bits_on_framed(&node).await;
+    // One unpaced pass: `bit_view` publishes its hypotheses as its input closes, and the
+    // job drains and ends right after them.
+    let mut graph = node
+        .job_list()
+        .into_iter()
+        .find(|r| r.id == job)
+        .unwrap()
+        .graph;
+    let src = graph
+        .nodes
+        .iter_mut()
+        .find(|n| n.kind == "capture_in")
+        .unwrap();
+    src.params["loop"] = json!(false);
+    src.params["realtime"] = json!(false);
+    let r = node
+        .apply(Op::GraphPut {
+            job: job.clone(),
+            graph,
+        })
+        .await;
+    assert!(matches!(r, Ok(OpResult::Ok)), "{r:?}");
+    ended(&node, &job).await;
+    let ctx = node.job_context(&job).unwrap();
+    let id = ctx["proposal"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a proposal: {ctx}"))
+        .to_string();
+    until("the session record", Duration::from_secs(5), || {
+        session(dir.path(), &job).is_some()
+    })
+    .await;
+    let s = session(dir.path(), &job).unwrap();
+    assert_eq!(s["outcome"], json!({"kind": "proposal", "id": id}), "{s}");
+    assert_eq!(node.signatures().list(None).len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

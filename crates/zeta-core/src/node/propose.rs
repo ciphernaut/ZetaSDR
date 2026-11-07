@@ -14,9 +14,11 @@
 //! of those jobs writes a [`Session`] at its end ([`record_session`]).
 
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::Inner;
@@ -46,6 +48,15 @@ const LSB_FIRST_SUFFIX: &str = " lsb-first";
 const HEX_DIGIT_BITS: u64 = 4;
 /// Who the node's proposals are by.
 const PROPOSED_BY: &str = "node";
+/// The allocation role of a transmitter's assignment: a proposal's `allocation` is the
+/// first one.
+const TX_ROLE: &str = "tx";
+/// A watched job's modulation when neither its bits plan nor a demodulator node names
+/// one.
+const UNKNOWN_MODULATION: &str = "unknown";
+/// The longest a job's end waits for its proposal watchers to drain (see
+/// [`drain_watchers`]).
+pub(super) const PROPOSAL_DRAIN_MS: u64 = 2_000;
 
 /// The `capture` job `rec` (its context as `capture_finished` left it) ended on its own
 /// with at least one window written; `classified` is a hand run's classify of its
@@ -152,7 +163,7 @@ fn first_tx(window: &CaptureRecord) -> Option<Allocation> {
     serde_json::from_value::<Vec<Allocation>>(window.allocations.clone())
         .unwrap_or_default()
         .into_iter()
-        .find(|a| a.role.as_deref() == Some("tx"))
+        .find(|a| a.role.as_deref() == Some(TX_ROLE))
 }
 
 /// `rec`'s context as it stands now (its launch-time copy when it is gone).
@@ -278,15 +289,18 @@ enum Trigger<'a> {
 /// for [`PROPOSE_CRC_FRAMES`] CRC-clean frames, one task per output, each subscribed
 /// before this returns. A task ends once its job proposed (by any of its tasks, or an
 /// earlier run: `job_context.proposal`), when its stream is unregistered, or on `token`
-/// (draining what is buffered); it is not one of the job's stages.
+/// (draining what is buffered); it is not one of the job's stages. The tasks' handles:
+/// the job's supervisor awaits them (at most [`PROPOSAL_DRAIN_MS`]) before it writes
+/// the session record, so a proposal from the job's last events is in it.
 pub(super) fn watch_for_proposals(
     inner: &Arc<Inner>,
     rec: &JobRecord,
     outputs: &[(StreamKind, StreamId)],
     token: &CancellationToken,
-) {
+) -> Vec<JoinHandle<()>> {
+    let mut handles = Vec::new();
     if !proposes(inner, rec) || proposal_of(&rec.context).is_some() {
-        return;
+        return handles;
     }
     let rec = Arc::new(rec.clone());
     for (_, sid) in outputs.iter().filter(|(k, _)| *k == StreamKind::Event) {
@@ -300,7 +314,7 @@ pub(super) fn watch_for_proposals(
             sid.clone(),
             token.clone(),
         );
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             let mut clean = 0u32;
             let mut on = |frame: Frame| on_frame(&inner, &rec, &sid, &mut clean, frame);
             loop {
@@ -328,7 +342,20 @@ pub(super) fn watch_for_proposals(
                     },
                 }
             }
-        });
+        }));
+    }
+    handles
+}
+
+/// Await a job's proposal watchers (they drain what is buffered once its token is
+/// cancelled, then end), at most [`PROPOSAL_DRAIN_MS`] in all; one still running then
+/// is aborted, so a watcher never holds up the job's end.
+pub(super) async fn drain_watchers(watchers: Vec<JoinHandle<()>>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(PROPOSAL_DRAIN_MS);
+    for mut w in watchers {
+        if tokio::time::timeout_at(deadline, &mut w).await.is_err() {
+            w.abort();
+        }
     }
 }
 
@@ -455,7 +482,7 @@ fn propose_for_job(
         .as_str()
         .map(str::to_string)
         .or_else(|| demod_modulation(rec))
-        .unwrap_or_else(|| "unknown".into());
+        .unwrap_or_else(|| UNKNOWN_MODULATION.into());
     let (framing, crc_frames, evidence) = match trigger {
         Trigger::Hypothesis(h, c) => {
             let frames = c["frames"].as_u64().unwrap_or_default();
@@ -559,20 +586,19 @@ fn keeps_session(inner: &Inner, rec: &JobRecord) -> bool {
 /// The session record of the exploration job `rec` (as it stands at its end), ended
 /// at `ended_ns`: its captures (`capture.written`, `bits.captures`, its graph's
 /// `capture_in`), `bit_view` and `frame_decode` from its context, and its outcome: the
-/// proposal noted to it, else `proved` when a frame row's job decoded a CRC-clean
-/// frame, else none. `features` is left `null` for [`record_session`].
-pub(super) fn session_of(rec: &JobRecord, ended_ns: u64) -> Session {
+/// proposal noted to it, else `proved` when it is a frame row's job (`frame_row`) that
+/// decoded a CRC-clean frame, else none. `features` is left `null` for
+/// [`record_session`].
+pub(super) fn session_of(rec: &JobRecord, frame_row: bool, ended_ns: u64) -> Session {
     let ctx = &rec.context;
-    let capture = rec.kind == JobKind::Capture.name();
-    let captures = if capture {
+    let captures = if rec.kind == JobKind::Capture.name() {
         strings(&ctx["capture"]["written"])
     } else {
         job_captures(rec)
     };
-    let row = !capture && rec.kind != BITS_KIND && rec.kind != GRAPH_KIND;
     let outcome = match proposal_of(ctx) {
         Some(id) => Outcome::Proposal { id: id.into() },
-        None if row
+        None if frame_row
             && ctx["frame_decode"]["crc_ok"]
                 .as_u64()
                 .is_some_and(|n| n >= 1) =>
@@ -610,9 +636,10 @@ pub(super) fn record_session(inner: &Inner, rec: &JobRecord) {
     if !keeps_session(inner, rec) {
         return;
     }
-    let mut s = session_of(rec, now().0);
+    let row = frame_row(inner, &rec.kind);
+    let mut s = session_of(rec, row.is_some(), now().0);
     let first = s.captures.first().and_then(|c| inner.bursts.get(c));
-    s.features = match (first, frame_row(inner, &rec.kind)) {
+    s.features = match (first, row) {
         (Some(w), _) => w.features,
         (None, Some(row)) => {
             serde_json::to_value(tuning_features(rec, Some(row))).unwrap_or_default()
