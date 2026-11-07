@@ -1,4 +1,4 @@
-//! `zeta-fake-worker --id ID --script SCRIPT [--record PATH] [--ring-fd N]`: a
+//! `zeta-fake-worker --id ID --script SCRIPT [--record PATH] [--rate-cap-hz N] [--ring-fd N]`: a
 //! source worker for tests. Its stdout speaks the real protocol through
 //! [`serve`]; its port is a `SoapySource` over a scripted `MockDevice`, or a
 //! `FileSource` over a SigMF recording, chosen by `--script`:
@@ -30,6 +30,11 @@
 //! then waits to be killed; `ZETA_FAKE_WAIT_RUNTIME=1` ends with a plain
 //! runtime drop, which waits on the blocked stdin read.
 //!
+//! A mock source's hello reports `max_bandwidth_hz: Measured(N)` with
+//! `--rate-cap-hz N` (as the real worker reports a cap the node passed back),
+//! or else with `ZETA_FAKE_MEASURED_CAP=N` (as a worker that probed); without
+//! either the mock's own asserted cap.
+//!
 //! `--ring-fd N` serves through the ring inherited on descriptor `N`, as the
 //! real worker does (a ring that will not open is one stderr line, then the
 //! pipe); `ZETA_FAKE_NO_RING=1` ignores the flag, as a worker of an older
@@ -52,7 +57,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 
 use async_trait::async_trait;
 use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning};
-use zeta_core::types::{Capabilities, Hz, SourceId};
+use zeta_core::types::{Capabilities, Claim, Hz, SourceId};
 use zeta_source_file::{FileOpts, FileSource, read_meta};
 use zeta_source_soapy::SoapySource;
 use zeta_source_soapy::device::RangeHz;
@@ -79,18 +84,27 @@ struct Args {
     id: String,
     script: String,
     record: Option<PathBuf>,
+    rate_cap_hz: Option<u64>,
     ring_fd: Option<RawFd>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     let (mut id, mut script, mut record, mut ring_fd) = (None, None, None, None);
+    let mut rate_cap_hz = None;
     while let Some(flag) = it.next() {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--id" => id = Some(value),
             "--script" => script = Some(value),
             "--record" => record = Some(PathBuf::from(value)),
+            "--rate-cap-hz" => {
+                rate_cap_hz = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--rate-cap-hz {value:?}: not a rate"))?,
+                );
+            }
             "--ring-fd" => {
                 ring_fd = Some(
                     value
@@ -105,6 +119,7 @@ fn parse_args() -> Result<Args, String> {
         id: id.ok_or("--id is required")?,
         script: script.ok_or("--script is required")?,
         record,
+        rate_cap_hz,
         ring_fd,
     })
 }
@@ -211,7 +226,11 @@ impl Port for Recorded {
 /// the wall clock would be restarted and in the end faulted by the source's
 /// clock guard. With `gone_after`, the feeder stops after that long from start
 /// and scripts `Gone("unplugged")`.
-fn mock_source(id: &str, gone_after: Option<Duration>) -> Result<Arc<SoapySource>, String> {
+fn mock_source(
+    id: &str,
+    gone_after: Option<Duration>,
+    rate_cap_hz: Option<u64>,
+) -> Result<Arc<SoapySource>, String> {
     let read = read_samples();
     let mut dev = MockDevice::hackrf_like();
     // The source reads a hundredth of a second at a time: a wider scripted
@@ -225,9 +244,17 @@ fn mock_source(id: &str, gone_after: Option<Duration>) -> Result<Arc<SoapySource
         }]);
     }
     let dev = Arc::new(dev);
-    let src = Arc::new(
-        SoapySource::with_device(SourceId(id.into()), dev.clone()).map_err(|e| e.to_string())?,
-    );
+    let mut src =
+        SoapySource::with_device(SourceId(id.into()), dev.clone()).map_err(|e| e.to_string())?;
+    let measured = rate_cap_hz.or_else(|| {
+        std::env::var("ZETA_FAKE_MEASURED_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    if let Some(hz) = measured {
+        src.set_max_bandwidth(Claim::Measured(Hz(hz)));
+    }
+    let src = Arc::new(src);
     let weak = Arc::downgrade(&src);
     std::thread::Builder::new()
         .name("fake-feeder".into())
@@ -531,13 +558,15 @@ fn main() -> ExitCode {
         // A receiver held for the life of the worker, see the `file` script.
         let mut keep: Option<IqReceiver> = None;
         let port: Result<Arc<dyn Port>, String> = match (name, arg) {
-            ("stream", _) => mock_source(&args.id, None).map(|s| s as Arc<dyn Port>),
+            ("stream", _) => {
+                mock_source(&args.id, None, args.rate_cap_hz).map(|s| s as Arc<dyn Port>)
+            }
             ("gone-after-ms", ms) => parse_ms(ms)
-                .and_then(|g| mock_source(&args.id, Some(g)))
+                .and_then(|g| mock_source(&args.id, Some(g), args.rate_cap_hz))
                 .map(|s| s as Arc<dyn Port>),
             ("crash-after-ms", ms) => parse_ms(ms).and_then(|after| {
                 crash_after(after, args.record.as_deref());
-                mock_source(&args.id, None).map(|s| s as Arc<dyn Port>)
+                mock_source(&args.id, None, args.rate_cap_hz).map(|s| s as Arc<dyn Port>)
             }),
             ("file", spec) => {
                 let (path, crash) = match spec.split_once(',') {

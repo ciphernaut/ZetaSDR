@@ -16,12 +16,14 @@ const CENTER: u64 = 100_000_000;
 /// Every tenth read overflows: a rung the device cannot keep up with.
 const OVERFLOWING: u32 = 10;
 
-/// A B210 at its 61.44 MHz master clock, streaming in real time once the
-/// script is empty.
-fn b210() -> MockDevice {
+/// A UHD-like device at a 6.144 MHz master clock (a tenth of a B210's, so
+/// the paced reads stay cheap in a debug build), streaming in real time once
+/// the script is empty. Its top rungs: 6.144, 3.072, 2.048, 1.536, 1.2288 and
+/// 1.024 MHz.
+fn ladder() -> MockDevice {
     MockDevice::hackrf_like()
         .with_driver("b200")
-        .with_uhd_decimation(61.44e6)
+        .with_uhd_decimation(6.144e6)
         .with_paced_reads()
 }
 
@@ -40,20 +42,20 @@ fn rate_calls(dev: &MockDevice, from: usize) -> Vec<String> {
 
 #[tokio::test]
 async fn a_ladder_is_probed_from_the_top_and_the_first_clean_rung_wins() {
-    let dev = Arc::new(b210().pace_at(61.44e6, 1.0, OVERFLOWING).pace_at(
-        30.72e6,
+    let dev = Arc::new(ladder().pace_at(6.144e6, 1.0, OVERFLOWING).pace_at(
+        3.072e6,
         1.0,
         OVERFLOWING,
     ));
     let src = source(&dev);
     let opened = dev.calls().len();
-    assert_eq!(probe_rate_cap(&src, CENTER).await, Ok(20_480_000));
+    assert_eq!(probe_rate_cap(&src, CENTER).await, Ok(2_048_000));
     assert_eq!(
         rate_calls(&dev, opened),
         [
-            "set_sample_rate(61440000)",
-            "set_sample_rate(30720000)",
-            "set_sample_rate(20480000)"
+            "set_sample_rate(6144000)",
+            "set_sample_rate(3072000)",
+            "set_sample_rate(2048000)"
         ]
     );
     assert_eq!(src.fault(), None);
@@ -66,20 +68,20 @@ async fn a_ladder_is_probed_from_the_top_and_the_first_clean_rung_wins() {
 
 #[tokio::test]
 async fn a_rung_short_of_the_delivered_floor_is_rejected() {
-    let dev = Arc::new(b210().pace_at(61.44e6, 0.9, 0));
+    let dev = Arc::new(ladder().pace_at(6.144e6, 0.9, 0));
     let src = source(&dev);
     let opened = dev.calls().len();
-    assert_eq!(probe_rate_cap(&src, CENTER).await, Ok(30_720_000));
+    assert_eq!(probe_rate_cap(&src, CENTER).await, Ok(3_072_000));
     assert_eq!(
         rate_calls(&dev, opened),
-        ["set_sample_rate(61440000)", "set_sample_rate(30720000)"]
+        ["set_sample_rate(6144000)", "set_sample_rate(3072000)"]
     );
 }
 
 #[tokio::test]
 async fn a_probe_that_never_streams_clean_caps_at_the_lowest_rung() {
-    let mut dev = b210();
-    let src0 = source(&Arc::new(b210()));
+    let mut dev = ladder();
+    let src0 = source(&Arc::new(ladder()));
     let candidates = probe_candidates(src0.rate_model());
     assert_eq!(candidates.len(), PROBE_MAX_RUNGS);
     for &r in &candidates {
@@ -102,7 +104,7 @@ async fn a_probe_that_never_streams_clean_caps_at_the_lowest_rung() {
 #[tokio::test]
 async fn a_probe_whose_every_tune_fails_is_an_error() {
     // Centre outside the device's range: every candidate's tune is refused.
-    let dev = Arc::new(b210());
+    let dev = Arc::new(ladder());
     let src = source(&dev);
     let opened = dev.calls().len();
     assert!(probe_rate_cap(&src, 10_000_000_000).await.is_err());
@@ -111,9 +113,18 @@ async fn a_probe_whose_every_tune_fails_is_an_error() {
 
 #[test]
 fn a_ladder_is_probed_from_the_top_at_most_six_rungs() {
-    let src = source(&Arc::new(b210()));
+    let src = source(&Arc::new(ladder()));
     assert_eq!(
         probe_candidates(src.rate_model()),
+        [
+            6_144_000, 3_072_000, 2_048_000, 1_536_000, 1_228_800, 1_024_000
+        ]
+    );
+    let b210 = MockDevice::hackrf_like()
+        .with_driver("b200")
+        .with_uhd_decimation(61.44e6);
+    assert_eq!(
+        probe_candidates(source(&Arc::new(b210)).rate_model()),
         [
             61_440_000, 30_720_000, 20_480_000, 15_360_000, 12_288_000, 10_240_000
         ]
@@ -135,7 +146,7 @@ fn a_range_device_probes_max_half_quarter() {
 
 #[test]
 fn set_max_bandwidth_replaces_the_claim() {
-    let mut src = source(&Arc::new(b210()));
+    let mut src = source(&Arc::new(ladder()));
     src.set_max_bandwidth(Claim::Measured(Hz(20_480_000)));
     assert_eq!(
         src.capabilities().max_bandwidth_hz,

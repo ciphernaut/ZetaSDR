@@ -22,6 +22,12 @@
 //! The ring lives as long as its `Worker` and is dropped when the worker is
 //! reaped. A worker of protocol 1 or 2 is accepted; a protocol-1 worker (or a
 //! protocol-2 one whose ring would not open) sends its blocks on the pipe.
+//!
+//! A worker measures its rate cap when it opens (the soapy worker's rate
+//! probe). Once the port's capability record holds a measured cap (the first
+//! hello's, or the cached one), each spawn is told it with `--rate-cap-hz N`,
+//! unless the configured args already carry the flag, so a respawn skips the
+//! probe.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -35,9 +41,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, oneshot, watch};
 use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, TransportInfo, Tuning};
-use zeta_core::types::{Capabilities, Hz, SourceId, Timestamp};
+use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
 
-use crate::port::{Attach, WorkerConfig};
+use crate::port::{Attach, RATE_CAP_FLAG, WorkerConfig};
 use crate::ring::{self, Ring};
 use crate::serve::{EXIT_FAULTED, EXIT_NOT_FOUND, EXIT_OPEN_FAILED};
 use crate::spawn::{RING_FD, inherit_ring};
@@ -525,13 +531,35 @@ impl Supervisor {
         }
     }
 
-    /// Spawn the worker with the scrubbed environment, and its ring on
-    /// [`RING_FD`] when there is one, and start its reader threads.
+    /// `--rate-cap-hz N` for the next spawn: the port's capability record (the
+    /// first hello's, else the cached one) holds a measured cap `N` and the
+    /// configured args do not already pass one.
+    fn rate_cap_args(&self) -> Option<[String; 2]> {
+        if self.cfg.args.iter().any(|a| a == RATE_CAP_FLAG) {
+            return None;
+        }
+        match &self
+            .caps
+            .as_ref()
+            .or(self.cached.as_ref())?
+            .max_bandwidth_hz
+        {
+            Claim::Measured(Hz(n)) => Some([RATE_CAP_FLAG.into(), n.to_string()]),
+            Claim::Asserted(_) => None,
+        }
+    }
+
+    /// Spawn the worker with the scrubbed environment, a measured rate cap
+    /// ([`Supervisor::rate_cap_args`]), and its ring on [`RING_FD`] when there
+    /// is one, and start its reader threads.
     async fn spawn(&self) -> std::io::Result<Worker> {
         let ring = self.new_ring();
         let mut cmd = Command::new(&self.cfg.program);
-        cmd.args(&self.cfg.args)
-            .env_clear()
+        cmd.args(&self.cfg.args);
+        if let Some(cap) = self.rate_cap_args() {
+            cmd.args(cap);
+        }
+        cmd.env_clear()
             .envs(crate::env::scrubbed())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

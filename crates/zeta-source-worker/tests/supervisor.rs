@@ -822,33 +822,27 @@ fn spawn_args(rec: &Path) -> Vec<Vec<String>> {
     spawns
 }
 
-#[tokio::test]
-async fn a_cached_measured_cap_is_passed_to_the_respawn() {
-    let mut measured = cached_caps();
-    measured.max_bandwidth_hz = Claim::Measured(Hz(20_480_000));
-    let base = ["soapy-worker", "--id", "f", "--args", "driver=fake"];
-    assert_eq!(worker_args("f", "driver=fake", None), base);
-    assert_eq!(
-        worker_args("f", "driver=fake", Some(&cached_caps())),
-        base,
-        "an asserted cap is probed again"
-    );
-    let args = worker_args("f", "driver=fake", Some(&measured));
-    assert_eq!(args[..5], base);
-    assert_eq!(args[5..], ["--rate-cap-hz", "20480000"]);
+/// How often `--rate-cap-hz 20480000` is among a spawn's arguments.
+fn caps_passed(args: &[String]) -> usize {
+    args.windows(2)
+        .filter(|w| w == &["--rate-cap-hz", "20480000"])
+        .count()
+}
 
-    // A wrapper records the arguments of each spawn, then runs the fake:
-    // spawn 0 crashes, the respawn streams.
-    let dir = tempdir();
-    let rec = dir.path().join("record");
-    let wrapper = dir.path().join("wrapper.sh");
+/// A config whose wrapper records each spawn's arguments as `arg` lines, then
+/// runs the fake: spawn 0 with `first` (shell before the exec, e.g. an env
+/// assignment) and `crash-after-ms 300`, every later spawn streaming. `args`
+/// are what the node would spawn `zeta` with.
+fn cfg_recording_args(dir: &Path, first: &str, args: Vec<String>) -> (WorkerConfig, PathBuf) {
+    let rec = dir.join("record");
+    let wrapper = dir.join("wrapper.sh");
     std::fs::write(
         &wrapper,
         format!(
             "REC='{}'\nN=$(grep -c '^start' \"$REC\" 2>/dev/null || true)\n\
              for a in \"$@\"; do echo \"arg $a\" >> \"$REC\"; done\n\
              case \"${{N:-0}}\" in\n\
-             0) exec '{FAKE}' --id f --script 'crash-after-ms 300' --record \"$REC\";;\n\
+             0) {first} exec '{FAKE}' --id f --script 'crash-after-ms 300' --record \"$REC\";;\n\
              *) exec '{FAKE}' --id f --script stream --record \"$REC\";;\n\
              esac\n",
             rec.display()
@@ -864,19 +858,63 @@ async fn a_cached_measured_cap_is_passed_to_the_respawn() {
         timings: timings(),
         ring_bytes: 0,
     };
-    let (port, _) = open(cfg, Some(measured)).await;
+    (cfg, rec)
+}
+
+/// The arguments of each spawn of `cfg`, once there are two.
+async fn two_spawns(
+    cfg: WorkerConfig,
+    rec: &Path,
+    cached: Option<Capabilities>,
+) -> Vec<Vec<String>> {
+    let (port, _) = open(cfg, cached).await;
     assert!(
-        wait_for(Duration::from_secs(5), || starts(&rec).len() >= 2).await,
+        wait_for(Duration::from_secs(5), || starts(rec).len() >= 2).await,
         "spawns: {:?}",
-        starts(&rec)
+        starts(rec)
     );
-    let spawns = spawn_args(&rec);
-    assert_eq!(spawns.len(), 2, "{spawns:?}");
-    for args in &spawns {
-        assert!(
-            args.windows(2).any(|w| w == ["--rate-cap-hz", "20480000"]),
-            "{args:?}"
-        );
-    }
     drop(port);
+    let spawns = spawn_args(rec);
+    assert!(spawns.len() >= 2, "{spawns:?}");
+    spawns
+}
+
+#[tokio::test]
+async fn a_cached_measured_cap_is_passed_to_the_respawn() {
+    let mut measured = cached_caps();
+    measured.max_bandwidth_hz = Claim::Measured(Hz(20_480_000));
+    let base = ["soapy-worker", "--id", "f", "--args", "driver=fake"];
+    assert_eq!(worker_args("f", "driver=fake", None), base);
+    assert_eq!(
+        worker_args("f", "driver=fake", Some(&cached_caps())),
+        base,
+        "an asserted cap is probed again"
+    );
+    let args = worker_args("f", "driver=fake", Some(&measured));
+    assert_eq!(args[..5], base);
+    assert_eq!(args[5..], ["--rate-cap-hz", "20480000"]);
+
+    // Cached at start: every spawn carries the cap once, the supervisor adding
+    // no second copy.
+    let dir = tempdir();
+    let (cfg, rec) = cfg_recording_args(dir.path(), "", args);
+    let spawns = two_spawns(cfg, &rec, Some(measured)).await;
+    for args in &spawns[..2] {
+        assert_eq!(caps_passed(args), 1, "{args:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_cap_learned_from_the_hello_is_passed_to_the_respawn() {
+    // Nothing cached: spawn 0 probes (its hello says Measured 20.48 MHz) and
+    // crashes; the respawn is told the cap instead of probing again.
+    let dir = tempdir();
+    let (cfg, rec) = cfg_recording_args(
+        dir.path(),
+        "ZETA_FAKE_MEASURED_CAP=20480000",
+        worker_args("f", "driver=fake", None),
+    );
+    let spawns = two_spawns(cfg, &rec, None).await;
+    assert_eq!(caps_passed(&spawns[0]), 0, "{:?}", spawns[0]);
+    assert_eq!(caps_passed(&spawns[1]), 1, "{:?}", spawns[1]);
 }

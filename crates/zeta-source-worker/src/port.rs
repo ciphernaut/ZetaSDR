@@ -24,8 +24,10 @@ use crate::supervisor::{Link, Shared, Supervisor};
 use crate::wire::{Cmd, Reply};
 
 /// How long a worker has to say hello after it is spawned: UHD loads a B210's
-/// FPGA image before the device opens, which takes seconds on a cold boot.
-pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+/// FPGA image before the device opens (2-4 s, more on a cold boot), and the
+/// worker then probes its rates before the hello (up to six rungs of 1.5 s
+/// each, plus a retune per rung); both must fit with margin.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(45);
 /// The wait before the first respawn after a worker ended.
 pub const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 /// The cap the respawn wait doubles up to, and the poll interval while the
@@ -93,6 +95,10 @@ pub struct WorkerConfig {
     pub ring_bytes: usize,
 }
 
+/// The worker flag that passes a measured rate cap back, so the worker reports
+/// it instead of probing; see [`worker_args`] and the supervisor's respawns.
+pub const RATE_CAP_FLAG: &str = "--rate-cap-hz";
+
 /// The arguments `zeta` is spawned with as the worker of `--source-soapy
 /// id=args`: `soapy-worker --id ID --args ARGS`, and `--rate-cap-hz N` when the
 /// capabilities cached from an earlier open carry a measured cap `N`, so the
@@ -103,7 +109,7 @@ pub fn worker_args(id: &str, args: &str, cached: Option<&Capabilities>) -> Vec<S
         .map(String::from)
         .to_vec();
     if let Some(Claim::Measured(Hz(cap))) = cached.map(|c| &c.max_bandwidth_hz) {
-        out.extend(["--rate-cap-hz".into(), cap.to_string()]);
+        out.extend([RATE_CAP_FLAG.into(), cap.to_string()]);
     }
     out
 }
