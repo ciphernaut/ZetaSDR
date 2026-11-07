@@ -7,14 +7,17 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::Inner;
 use super::persist::now;
+use super::{Inner, Node, NodeError};
+use crate::job::JobRecord;
 use crate::knowledge::{Allocation, DEFAULT_REGION, KnowledgeProvider};
+use crate::modes::ModeRegistry;
 use crate::modes::score::{designator_fits, row_width};
-use crate::ops::SignalBand;
+use crate::ops::{BITS_KIND, GRAPH_KIND, SignalBand};
 use crate::reach::Reach;
 use crate::station::{Antenna, Station};
-use crate::types::{Baud, Hz, JobId, SourceId, Timestamp};
+use crate::stream::{Frame, Payload};
+use crate::types::{Baud, Hz, JobId, Provenance, SourceId, Span, StreamKind, Timestamp};
 
 /// At most this many origins in one answer, best score first, then nearest.
 pub const ORIGIN_SITES: usize = 50;
@@ -180,10 +183,6 @@ impl Vantage {
 /// such as a capture's source gone since) is heard at the station; a remote one at its
 /// position ([`Inner::source_position`]), with the default antennas and the station's
 /// region (else [`DEFAULT_REGION`]).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the origin_lookup op (plan 32 Task 4) calls it")
-)]
 pub fn vantage_for(inner: &Inner, source: &SourceId) -> Vantage {
     let station = inner.station.lock().unwrap().clone();
     let remote = inner.port(source).is_some_and(|p| p.capabilities().remote);
@@ -215,10 +214,6 @@ pub fn vantage_for(inner: &Inner, source: &SourceId) -> Vantage {
 /// the rows into an answer ([`answer`]); the reach is that of the first provider (in
 /// order) that has one. The region is the vantage's, else the station's, else
 /// [`DEFAULT_REGION`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the origin_lookup op (plan 32 Task 4) calls it")
-)]
 pub async fn origins(inner: &Inner, q: &OriginQuery) -> OriginAnswer {
     let vantage = vantage_for(inner, &q.source);
     let region = match vantage.station() {
@@ -532,6 +527,169 @@ pub fn confirm(a: &mut OriginAnswer, field: &str, value: &str) -> Option<usize> 
         value: value.to_string(),
     });
     Some(i)
+}
+
+/// Job kinds with no band to look up: the refusal names the kind.
+pub const ORIGIN_NO_BAND_KINDS: [&str; 3] = ["mix", "spectrum", "scan"];
+
+/// The refusal of an `origin_lookup` given both forms, neither, or a part of the band.
+const ORIGIN_FORMS: &str = "origin_lookup: give job, or source, center_hz and bandwidth_hz";
+
+/// The layer-1 labels a job states by what it runs (design 4.2): a decoder row's
+/// `modulation`; a demodulator's kind (`fm_demod`/`nbfm_demod` → `fm`, `am_demod` →
+/// `am`, `ssb_demod` → `ssb`, `wfm_demod` → `wfm`); a `bits` or `graph` job's chain
+/// demodulator (`fsk_demod` → `fsk`, `psk_demod` → `psk`, `ook_demod` → `ook`); else
+/// none (unknown).
+pub fn job_modulation(rec: &JobRecord, modes: &ModeRegistry) -> Vec<String> {
+    if let Some(m) = modes.get(&rec.kind) {
+        return m.row.modulation.clone();
+    }
+    let label = match rec.kind.as_str() {
+        "fm_demod" | "nbfm_demod" => Some("fm"),
+        "am_demod" => Some("am"),
+        "ssb_demod" => Some("ssb"),
+        "wfm_demod" => Some("wfm"),
+        k if k == BITS_KIND || k == GRAPH_KIND => {
+            rec.graph.nodes.iter().find_map(|n| match n.kind.as_str() {
+                "fsk_demod" => Some("fsk"),
+                "psk_demod" => Some("psk"),
+                "ook_demod" => Some("ook"),
+                _ => None,
+            })
+        }
+        _ => None,
+    };
+    label.map(|l| vec![l.to_string()]).unwrap_or_default()
+}
+
+impl Node {
+    /// The `origin_lookup` op (design 4.2): by `job` alone, or by `source`, `center_hz`
+    /// and `bandwidth_hz` together (anything else is refused, [`ORIGIN_FORMS`]). The band
+    /// form only answers, `modulation` `None` reading as unknown. The job form reads the
+    /// band from the job ([`Inner::origin_job`]), publishes the answer and keeps it.
+    pub async fn origin_lookup(
+        &self,
+        job: Option<JobId>,
+        source: Option<SourceId>,
+        center_hz: Option<Hz>,
+        bandwidth_hz: Option<Hz>,
+        modulation: Option<Vec<String>>,
+    ) -> Result<OriginAnswer, NodeError> {
+        match (job, source, center_hz, bandwidth_hz) {
+            (Some(job), None, None, None) => self.inner.origin_job(&job, modulation).await,
+            (None, Some(source), Some(center_hz), Some(bandwidth_hz)) => {
+                let q = OriginQuery {
+                    source,
+                    center_hz,
+                    bandwidth_hz,
+                    modulation: modulation.unwrap_or_default(),
+                    symbol_rate_baud: None,
+                    job: None,
+                    at: now(),
+                };
+                Ok(origins(&self.inner, &q).await)
+            }
+            _ => Err(NodeError::Other(ORIGIN_FORMS.to_string())),
+        }
+    }
+}
+
+impl Inner {
+    /// The job form of `origin_lookup`: the band is the job's `tuning` (an attached
+    /// job copies its input's; a `bits` job's is its capture's, and the vantage is the
+    /// capture's source, `context.bits.source`, its symbol rate the plan's);
+    /// `modulation` `None` is [`job_modulation`]. The answer is published as one
+    /// `origin` event ([`Inner::publish_origin`]) and merged into the job's context as
+    /// `origins`. `UnknownJob` for a job the node does not know; `Other` for a kind in
+    /// [`ORIGIN_NO_BAND_KINDS`] or a band of no width.
+    async fn origin_job(
+        &self,
+        id: &JobId,
+        modulation: Option<Vec<String>>,
+    ) -> Result<OriginAnswer, NodeError> {
+        let rec = self
+            .jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|e| e.record.clone())
+            .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        if ORIGIN_NO_BAND_KINDS.contains(&rec.kind.as_str()) || rec.tuning.bandwidth_hz.0 == 0 {
+            return Err(NodeError::Other(format!(
+                "origin_lookup: a {} job has no band",
+                rec.kind
+            )));
+        }
+        let bits = (rec.kind == BITS_KIND)
+            .then(|| rec.context.get("bits"))
+            .flatten();
+        let source = bits
+            .and_then(|b| serde_json::from_value::<SourceId>(b["source"].clone()).ok())
+            .unwrap_or_else(|| rec.source.clone());
+        let symbol_rate_baud =
+            bits.and_then(|b| serde_json::from_value::<Baud>(b["symbol_rate_baud"].clone()).ok());
+        let q = OriginQuery {
+            source,
+            center_hz: rec.tuning.center_hz,
+            bandwidth_hz: rec.tuning.bandwidth_hz,
+            modulation: modulation.unwrap_or_else(|| job_modulation(&rec, &self.modes)),
+            symbol_rate_baud,
+            job: Some(id.clone()),
+            at: now(),
+        };
+        let a = origins(self, &q).await;
+        self.publish_origin(&rec, &a);
+        self.context_merge(id, serde_json::json!({ "origins": a }))?;
+        Ok(a)
+    }
+
+    /// Publish `a` as one `origin` event (design 4.3) on `rec`'s event output, and so on
+    /// its source's feed. A job with no event output registered now (an audio
+    /// demodulator, a job that ended) publishes on a stream registered for the one frame,
+    /// with the job's provenance, so the feed still carries it.
+    fn publish_origin(&self, rec: &JobRecord, a: &OriginAnswer) {
+        let payload = serde_json::json!({
+            "protocol": "origin",
+            "job": rec.id.0,
+            "source": a.source.0,
+            "band": a.band,
+            "modulation": a.modulation,
+            "from": a.from,
+            "from_note": a.from_note,
+            "origins": a.origins,
+            "providers": a.providers,
+            "register_rows": a.register_rows,
+            "receivers": a.receivers,
+            "plans": a.plans,
+            "reach": a.reach,
+            "summary": summary(a),
+            "t_ns": a.t_ns.0,
+        });
+        let prov = Provenance {
+            source: rec.source.clone(),
+            job: Some(rec.id.clone()),
+            channel: None,
+            span: Span {
+                start_ns: a.t_ns,
+                end_ns: a.t_ns,
+            },
+        };
+        let out = self.jobs.lock().unwrap().get(&rec.id).and_then(|e| {
+            e.outputs
+                .iter()
+                .find(|(k, s)| *k == StreamKind::Event && self.bus.subscribe(s).is_some())
+                .map(|(_, s)| s.clone())
+        });
+        let (stream, transient) = match out {
+            Some(s) => (s, false),
+            None => (self.bus.register(StreamKind::Event, prov.clone()), true),
+        };
+        self.bus
+            .publish(Frame::new(stream.clone(), prov, Payload::Event(payload)));
+        if transient {
+            self.bus.unregister(&stream);
+        }
+    }
 }
 
 #[cfg(test)]

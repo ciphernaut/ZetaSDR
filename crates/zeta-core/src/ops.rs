@@ -463,6 +463,35 @@ pub enum Op {
         center_hz: Hz,
         bandwidth_hz: Hz,
     },
+    /// The licensed transmitters a signal may come from, scored against the
+    /// band and modulation, seen from the source's vantage. Give `job`, or `source`,
+    /// `center_hz` and `bandwidth_hz`, never both. By job: the band is the job's (a
+    /// `bits` job's is its capture's, the capture's source the vantage), `modulation`
+    /// `null` is read from the job (a decoder row's labels, a demodulator's kind, a
+    /// `bits` chain's demodulator); the answer is published as one `origin` event on the
+    /// job's event stream and kept as `job_context.origins`. By band: returned only,
+    /// `modulation` `null` is unknown. A `mix`, `spectrum` or `scan` job has no band.
+    OriginLookup {
+        /// An id from `job_list`; `null` for the band form.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<JobId>")]
+        job: Option<JobId>,
+        /// An id from `source_list`; `null` for the job form.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<SourceId>")]
+        source: Option<SourceId>,
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<Hz>")]
+        center_hz: Option<Hz>,
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<Hz>")]
+        bandwidth_hz: Option<Hz>,
+        /// Layer-1 labels (`fm`, `fsk`, ...); `null` to read them from the job, or as
+        /// unknown for the band form.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<Vec<String>>")]
+        modulation: Option<Vec<String>>,
+    },
     /// The channel plans the node knows, each with its channels expanded
     /// and sorted by frequency.
     ChannelPlans {},
@@ -2248,6 +2277,8 @@ pub enum OpResult {
     },
     /// `station_set`, `station_get` and `station_clear`: the station, `null` for none.
     Station(Option<crate::station::Station>),
+    /// `origin_lookup`: the lit sites, best first.
+    Origins(crate::node::OriginAnswer),
     Schema(serde_json::Value),
 }
 
@@ -2285,6 +2316,7 @@ impl Op {
             Op::GraphStart { .. } => "graph_start",
             Op::BitsStart { .. } => "bits_start",
             Op::KnowledgeLookup { .. } => "knowledge_lookup",
+            Op::OriginLookup { .. } => "origin_lookup",
             Op::ChannelPlans {} => "channel_plans",
             Op::ModesList { .. } => "modes_list",
             Op::ThemesList {} => "themes_list",
@@ -2315,6 +2347,8 @@ impl Op {
                 | Op::StationGet {}
                 | Op::CaptureList { .. }
                 | Op::CaptureShow { .. }
+                // The band form only: the job form writes the job's context.
+                | Op::OriginLookup { job: None, .. }
         )
     }
 
@@ -2373,6 +2407,7 @@ impl OpResult {
             OpResult::Station(_) => "station",
             OpResult::Captures(_) => "captures",
             OpResult::Capture { .. } => "capture",
+            OpResult::Origins(_) => "origins",
         }
     }
 
@@ -3326,6 +3361,17 @@ pub(crate) async fn apply(node: &Node, op: Op) -> Result<OpResult, OpError> {
                 reach,
             })
         }
+        Op::OriginLookup {
+            job,
+            source,
+            center_hz,
+            bandwidth_hz,
+            modulation,
+        } => node
+            .origin_lookup(job, source, center_hz, bandwidth_hz, modulation)
+            .await
+            .map(OpResult::Origins)
+            .map_err(|e| node_error(node, e)),
         Op::ChannelPlans {} => Ok(OpResult::ChannelPlans {
             plans: crate::plans::PLANS.iter().map(PlanInfo::from).collect(),
         }),

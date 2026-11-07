@@ -9,10 +9,10 @@ pub use launch::DRAIN_TIMEOUT_MS;
 mod origin;
 pub use origin::{
     Agree, Confirmed, From as OriginFrom, FromKind, ORIGIN_MODULATION_FITS,
-    ORIGIN_MODULATION_UNKNOWN, ORIGIN_REACH_IN, ORIGIN_REACH_UNKNOWN, ORIGIN_SITES,
-    ORIGIN_SUMMARY_SITES, ORIGIN_WIDTH_FULL, ORIGIN_WIDTH_HALF, ORIGIN_WIDTH_LOOSE,
+    ORIGIN_MODULATION_UNKNOWN, ORIGIN_NO_BAND_KINDS, ORIGIN_REACH_IN, ORIGIN_REACH_UNKNOWN,
+    ORIGIN_SITES, ORIGIN_SUMMARY_SITES, ORIGIN_WIDTH_FULL, ORIGIN_WIDTH_HALF, ORIGIN_WIDTH_LOOSE,
     ORIGIN_WIDTH_NONE, ORIGIN_WIDTH_RANGE, Origin, OriginAnswer, OriginQuery, Terms, Vantage,
-    answer as origin_answer, confirm, score_row, summary,
+    answer as origin_answer, confirm, job_modulation, score_row, summary,
 };
 mod persist;
 mod recover;

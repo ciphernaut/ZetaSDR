@@ -52,7 +52,7 @@ There are two ways to run:
 
 While `zeta serve` runs it owns the state directory (it holds `serve.lock` there). Mutating one-shot commands (`job start`, `job attach`, `job retune`, `job stop`, `jobs stop`, `plan start`, `mix start`, `graph put`, `station set`, `station clear`, `capture delete`, `source ensure`, `source pin`, `source unpin`, `source gain`) are then refused with an `other` error naming the server's pid; read-only commands still work. Use `--node` to change a node that `zeta serve` owns.
 
-Every operation the node applies is appended to `ops.log` in the state directory (rotated at 8 MiB) with its caller's transport (read-only operations are logged without their result); `zeta ops tail --lines N` prints the last N (local only). Every `transcript` event of a `transcribe` job is appended to `transcripts.log` in the state directory (rotated at 8 MiB) with the job, its input, the source and the channel's centre; `zeta transcripts tail --lines N [--job ID]` prints the last N (local only). Every event of every job on a source (what the source's feed carries: every decoded frame, detection or transcript, whether or not a page or a `stream tail` is open; an `fft`'s rows stay out) is appended to `events.log` in the state directory (rotated at 32 MiB) as `t_ns`, `source`, `job`, `channel`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns` and the event itself under `event`; `zeta events tail --lines N [--job ID] [--source ID] [--protocol NAME]` prints the last N (local only), so \"what did ACARS hear overnight\" is `zeta events tail --protocol acars --lines 500` after the fact.";
+Every operation the node applies is appended to `ops.log` in the state directory (rotated at 8 MiB) with its caller's transport (read-only operations are logged without their result); `zeta ops tail --lines N` prints the last N (local only). Every `transcript` event of a `transcribe` job is appended to `transcripts.log` in the state directory (rotated at 8 MiB) with the job, its input, the source and the channel's centre; `zeta transcripts tail --lines N [--job ID]` prints the last N (local only). Every event of every job on a source (what the source's feed carries: every decoded frame, detection, transcript, a `watch`'s and an `identify`'s own events, and an `origin_lookup`'s `origin` answer, whether or not a page or a `stream tail` is open; an `fft`'s rows stay out) is appended to `events.log` in the state directory (rotated at 32 MiB) as `t_ns`, `source`, `job`, `channel`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns` and the event itself under `event`; `zeta events tail --lines N [--job ID] [--source ID] [--protocol NAME]` prints the last N (local only), so \"what did ACARS hear overnight\" is `zeta events tail --protocol acars --lines 500` after the fact, and the sites lit for a job are `zeta events tail --protocol origin --job ID`.";
 
 /// Hand-written sentence appended to an operation's section.
 fn note(op: &str) -> Option<&'static str> {
@@ -115,6 +115,9 @@ fn note(op: &str) -> Option<&'static str> {
         "knowledge_lookup" => Some(
             "Two providers answer: the built-in seed signatures, and `catalogue`, the 594-signal iNTERCEPT catalogue (Apache-2.0; one signature per frequency range of each signal overlapping the band, `bandwidth_hz` its widest bandwidth, `modulation` the first it lists). A signature's `decoder` is the id of the mode (`modes_list`) that proves it, the `kind` to start on the band to decode it; `null` means no mode row proves it yet. `classify` runs only the modes with a quick attempt (APRS, POCSAG, ACARS, RDS) as decode-to-identify. The built-in two have no allocations. With `--knowledge-acma` a third provider, `acma`, answers: the register's plan services and assignments overlapping the band, each with licensee, site, distance and bearing from the station, power, role, the decoded emission designator and `reach` (whether a signal from that site can plausibly arrive here). It needs the station (`station set`): without one it gives no distances. An unreachable service gives no allocations, so an empty `allocations` list means no provider data, not nothing allocated.",
         ),
+        "origin_lookup" => Some(
+            "Which licensed transmitters a signal may come from. Two forms, never both: `job` alone, or `source`, `center_hz` and `bandwidth_hz` together (anything else is refused `origin_lookup: give job, or source, center_hz and bandwidth_hz`). By job: the band is the job's (an attached job's is its input's; a `bits` job's is its capture's, from the capture's source), and `modulation: null` is read from the job: a decoder row's `modulation` labels (`modes_list`), a demodulator's kind (`fm_demod` reads `fm`, `am_demod` `am`, `ssb_demod` `ssb`, `wfm_demod` `wfm`), a `bits` chain's demodulator (`fsk`, `psk`, `ook`), else none. The answer is also published as one `origin` event on the job's event stream (so on its source's feed and in `events.log`) and kept as `job_context.origins` (the last answer only). A `mix`, `spectrum` or `scan` job has no band and is refused naming the kind. By band: the answer is returned only, nothing is published or kept, and `modulation: null` reads as unknown; the op never measures, so run `classify` on the band to score against a measurement. The answer: `origins`, at most 50 lit sites best first, each `{allocation, score, agree, terms, confirmed}`: `allocation` the register row as `knowledge_lookup` gives it; `score` 0..1, the sum of `terms` (`width` 0.4 when the row's width is 0.5-1.5 times the band's, 0.2 within 0.25-4, 0.1 for a row with no width; `modulation` 0.4 when the designator fits a label, 0 when it disagrees, 0.2 unknown; `reach` 0.2 within the reach, 0 beyond, 0.1 with no distance), 1 once `confirmed` by a decoded identity; `agree` `fits`, `disagrees` or `unknown` (no designator, or no label). `from` is where the query was made from: `{lat, lon, kind: station}` for a local radio or a recording, and for a remote source (a KiwiSDR) with a `position` (`source_list`) `{lat, lon, kind: source, source}`: the rows are cut to the reach around that receiver and the distances and bearings are from it, not the station. `from` is `null` with `from_note` saying why (`no station set`, or `remote source without a position`: no reach cut, the rows nearest in frequency across the region). `providers` names the providers asked, `register_rows` the rows the register returned (`null` with no register attached), `receivers` and `plans` the rows seen and not scored. The `origin` event carries the answer's fields with `job` and a `summary`: `<n> sites on <MHz> MHz: <licensee>, <site> <d> km <agree> <score>; ...`, or `no licensed transmitter on <MHz> MHz`, `register gave no rows`, `no register provider`. A lit site is a hypothesis, not an identification: report it as \"consistent with Example Water Authority at Example Hill\", never \"it is\", unless `confirmed`.",
+        ),
         "channel_plans" => Some(
             "`channel_plans` lists the channel plans the node knows (`uhf_cb_au`: Australian UHF CB, 80 channels, two rasters 12.5 kHz apart; `acars_vhf`: the seven VHF ACARS channels, 130.025-131.825 MHz, 10 kHz each). Name a channel by its number to the user (\"ch20\") and start jobs at its `center_hz` with the plan's `bandwidth_hz`.",
         ),
@@ -141,6 +144,8 @@ fn example_for(op: &str, field: &str) -> Option<Value> {
         ("job_attach", "kind") => Some("transcribe".into()),
         ("plan_start", "plan") => Some("uhf_cb_au".into()),
         ("plan_start", "attach") => Some("transcribe".into()),
+        // The job form: the band fields stay `null`.
+        ("origin_lookup", "job") => Some("<id>".into()),
         _ => None,
     }
 }
@@ -200,8 +205,13 @@ pub fn render(schema: &Value, field_craft: &str) -> String {
         }
         for (f, s) in &fields {
             let h = hint(f).map(|h| format!("; {h}")).unwrap_or_default();
-            let u = unit(f).map(|u| format!(" ({u})")).unwrap_or_default();
-            out.push_str(&format!("- {f}: {}{u}{h}\n", type_of(s, defs)));
+            let t = type_of(s, defs);
+            // A nullable `Hz` field inlines its type and loses the name: say the unit.
+            let u = unit(f)
+                .or_else(|| (f.ends_with("_hz") && !t.contains("(Hz)")).then_some("Hz"))
+                .map(|u| format!(" ({u})"))
+                .unwrap_or_default();
+            out.push_str(&format!("- {f}: {t}{u}{h}\n"));
         }
         if !fields.is_empty() {
             out.push('\n');
@@ -437,6 +447,9 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     }
     if op == "bits_start" {
         return "zeta bits start --capture <id> [--modulation fsk|psk|ook] [--symbol-rate-baud N] [--order N] [--then-tail MAX_FRAMES,TIMEOUT_MS] [--keep]".into();
+    }
+    if op == "origin_lookup" {
+        return "zeta origin lookup --job ID | --source S --center-hz N --bandwidth-hz N [--modulation fm,fsk]".into();
     }
     if op == "plan_start" {
         return "zeta plan start --plan uhf_cb_au --kind fm_demod --source <id> [--channels 1,2,5-8] [--attach transcribe] [--language de] [--replace ID,ID]".into();
