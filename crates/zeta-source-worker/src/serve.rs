@@ -138,6 +138,7 @@ fn status_of(port: &dyn Port) -> Status {
         current: port.current(),
         gain: port.gain(),
         stats: port.stats(),
+        transport_dropped: 0,
     }
 }
 
@@ -162,6 +163,7 @@ pub async fn serve(
         capabilities: port.capabilities().clone(),
         gain: port.gain(),
         driver: driver.to_string(),
+        transport: None,
     }));
 
     let pump = tokio::spawn(pump(port.subscribe(), writer.clone()));

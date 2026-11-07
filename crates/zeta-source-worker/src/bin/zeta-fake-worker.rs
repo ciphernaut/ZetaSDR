@@ -302,6 +302,7 @@ fn wrong_hello(port: &dyn Port, protocol: u32, mut frames: File) -> ExitCode {
         capabilities: port.capabilities().clone(),
         gain: port.gain(),
         driver: "fake".into(),
+        transport: None,
     }));
     if let Err(e) = write_frame(&mut frames, &hello).and_then(|()| frames.flush()) {
         eprintln!("zeta-fake-worker: hello: {e}");

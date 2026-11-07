@@ -556,7 +556,7 @@ async fn a_hello_of_another_protocol_is_refused_and_the_child_reaped() {
     );
     let t0 = Instant::now();
     let err = WorkerPort::open(cfg, None).await.err().expect("refused");
-    assert_eq!(err, "soapy worker for f: protocol 99, expected 1");
+    assert_eq!(err, "soapy worker for f: protocol 99, expected 2");
     assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     let pid: u32 = std::fs::read_to_string(&pidfile)
         .unwrap()

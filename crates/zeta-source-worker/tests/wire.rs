@@ -2,7 +2,9 @@ use std::io::Cursor;
 
 use num_complex::Complex;
 use serde_json::json;
-use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, Tuning};
+use zeta_core::port::{
+    GainInfo, IqBlock, PortError, PortStats, TransportInfo, TransportPath, Tuning,
+};
 use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, Timestamp};
 use zeta_source_worker::wire::*;
 
@@ -72,12 +74,13 @@ fn control_messages_round_trip_in_the_spec_shape() {
                 capabilities: caps(),
                 gain: Some(gain()),
                 driver: "hackrf".into(),
+                transport: None,
             }),
             json!({"hello": {
-                "protocol": 1,
+                "protocol": 2,
                 "capabilities": serde_json::to_value(caps()).unwrap(),
                 "gain": serde_json::to_value(gain()).unwrap(),
-                "driver": "hackrf"}}),
+                "driver": "hackrf", "transport": null}}),
         ),
         (
             Control::Reply {
@@ -118,11 +121,12 @@ fn control_messages_round_trip_in_the_spec_shape() {
                     timeouts: 2,
                     restarts: 3,
                 }),
+                transport_dropped: 0,
             }),
             json!({"status": {"fault": "unplugged",
                 "current": {"center_hz": 144800000, "bandwidth_hz": 12500},
                 "gain": null,
-                "stats": {"measured_rate_hz": 2000000, "overflows": 1, "timeouts": 2, "restarts": 3}}}),
+                "stats": {"measured_rate_hz": 2000000, "overflows": 1, "timeouts": 2, "restarts": 3}, "transport_dropped": 0}}),
         ),
     ];
     for (c, shape) in cases {
@@ -192,6 +196,7 @@ fn a_truncated_frame_is_an_error_and_a_clean_eof_is_none() {
             current: None,
             gain: None,
             stats: None,
+            transport_dropped: 0,
         })),
     )
     .unwrap();
@@ -201,6 +206,11 @@ fn a_truncated_frame_is_an_error_and_a_clean_eof_is_none() {
             "cut at {cut}"
         );
     }
+    // A descriptor payload one byte short.
+    let mut short = vec![2u8, 39, 0, 0, 0];
+    short.extend([0u8; 39]);
+    let e = read_frame(&mut Cursor::new(short)).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
     // An unknown kind byte.
     assert!(read_frame(&mut Cursor::new(vec![9, 0, 0, 0, 0])).is_err());
     // A block whose length does not match its header.
@@ -241,4 +251,69 @@ fn requests_parse_from_one_json_line() {
     )
     .unwrap();
     assert_eq!(buf, b"{\"id\":9,\"cmd\":\"shutdown\"}\n");
+}
+
+#[test]
+fn a_descriptor_round_trips_byte_for_byte() {
+    let d = Descriptor {
+        seq: 7,
+        slot: 3,
+        t0_ns: 10,
+        sample_rate_hz: 30_720_000,
+        center_hz: 5_845_000_000,
+        n: 262_144,
+    };
+    let mut buf = Vec::new();
+    write_frame(&mut buf, &Frame::Descriptor(d)).unwrap();
+    assert_eq!(buf.len(), 1 + 4 + 40);
+    assert_eq!(buf[0], 2);
+    assert_eq!(&buf[1..5], &40u32.to_le_bytes());
+    assert_eq!(&buf[5..13], &7u64.to_le_bytes());
+    assert_eq!(&buf[13..17], &3u32.to_le_bytes());
+    assert_eq!(&buf[41..45], &262_144u32.to_le_bytes());
+    let Some(Frame::Descriptor(back)) = read_frame(&mut Cursor::new(buf)).unwrap() else {
+        panic!("expected a descriptor");
+    };
+    assert_eq!(back, d);
+}
+
+#[test]
+fn hello_carries_the_transport_and_reads_without_it() {
+    let h = Hello {
+        protocol: PROTOCOL,
+        capabilities: caps(),
+        gain: None,
+        driver: "x".into(),
+        transport: Some(TransportInfo {
+            path: TransportPath::Shm,
+            format: "cf32".into(),
+            ring_bytes: 67_108_864,
+        }),
+    };
+    let v = serde_json::to_value(Control::Hello(h.clone())).unwrap();
+    assert_eq!(
+        v["hello"]["transport"],
+        json!({"path": "shm", "format": "cf32", "ring_bytes": 67108864})
+    );
+    let Control::Hello(back) = serde_json::from_value(v).unwrap() else {
+        panic!("expected a hello");
+    };
+    assert_eq!(back, h);
+
+    let v = json!({"hello": {"protocol": 1,
+        "capabilities": serde_json::to_value(caps()).unwrap(),
+        "gain": null, "driver": "x"}});
+    let Control::Hello(old) = serde_json::from_value(v).unwrap() else {
+        panic!("expected a hello");
+    };
+    assert_eq!(old.transport, None);
+}
+
+#[test]
+fn status_reads_without_transport_dropped() {
+    let v = json!({"status": {"fault": null, "current": null, "gain": null, "stats": null}});
+    let Control::Status(s) = serde_json::from_value(v).unwrap() else {
+        panic!("expected a status");
+    };
+    assert_eq!(s.transport_dropped, 0);
 }

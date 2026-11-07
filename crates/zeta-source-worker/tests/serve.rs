@@ -127,7 +127,7 @@ fn hello_is_the_first_frame_and_carries_the_capabilities() {
     let hello = read_hello(&Frames::new(stdout));
     assert_eq!(hello.driver, "fake");
     assert_eq!(hello.protocol, PROTOCOL);
-    assert_eq!(hello.protocol, 1);
+    assert_eq!(hello.protocol, 2);
     let Claim::Asserted(Hz(max)) = hello.capabilities.max_bandwidth_hz else {
         panic!("{:?}", hello.capabilities.max_bandwidth_hz);
     };

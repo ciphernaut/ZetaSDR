@@ -767,6 +767,9 @@ fn read_stdout(mut stdout: File, shared: &Shared, link: &Arc<Link>, hello: onesh
                 // No receivers is normal: nothing is subscribed yet.
                 let _ = shared.tx.send(b);
             }
+            Frame::Descriptor(_) => {
+                // The node does not map the ring yet; a descriptor is dropped.
+            }
             Frame::Control(Control::Hello(h)) => {
                 let Some(tx) = hello.take() else {
                     eprintln!("zeta: soapy worker for {}: a second hello", shared.id.0);

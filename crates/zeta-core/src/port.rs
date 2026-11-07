@@ -76,6 +76,27 @@ pub struct WorkerInfo {
     pub since_ns: Option<u64>,
 }
 
+/// How a worker child hands its blocks to the node: `shm` is a shared-memory
+/// ring the node maps (the wire carries only descriptors), `pipe` carries the
+/// samples in the frames themselves. `format` is the ring's sample format
+/// (`cf32`) and `ring_bytes` its size in bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct TransportInfo {
+    pub path: TransportPath,
+    pub format: String,
+    pub ring_bytes: u64,
+}
+
+/// The path a worker's blocks take to the node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportPath {
+    Shm,
+    Pipe,
+}
+
 /// A block of complex baseband samples.
 #[derive(Clone, Debug)]
 pub struct IqBlock {
