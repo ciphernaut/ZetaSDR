@@ -96,35 +96,68 @@ fn serve(path: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
-    /// The hosts of map.js's TILE_PROVIDERS urls, a `{s}.` subdomain as `*.`.
-    fn provider_hosts() -> Vec<String> {
-        let (_, js) = zeta_ui::asset("map.js").expect("map.js");
-        let js = std::str::from_utf8(js).unwrap();
+    /// A JS asset's text.
+    fn js(name: &str) -> &'static str {
+        let (_, js) = zeta_ui::asset(name).unwrap_or_else(|| panic!("{name}"));
+        std::str::from_utf8(js).unwrap()
+    }
+
+    /// map.js's TILE_PROVIDERS array, its text.
+    fn tile_providers() -> &'static str {
+        let js = js("map.js");
         let start = js
             .find("export const TILE_PROVIDERS = [")
             .expect("TILE_PROVIDERS in map.js");
         let end = start + js[start..].find("\n];").expect("TILE_PROVIDERS ends");
-        let mut hosts: Vec<String> = js[start..end]
-            .split("url: \"")
+        &js[start..end]
+    }
+
+    /// The quoted values after each `key` (ending in `"`) in `text`.
+    fn quoted_after<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
+        text.split(key)
             .skip(1)
-            .map(|rest| {
-                let url = &rest[..rest.find('"').unwrap()];
+            .map(|rest| &rest[..rest.find('"').unwrap()])
+            .collect()
+    }
+
+    /// The hosts of map.js's TILE_PROVIDERS urls, a `{s}.` subdomain as `*.`.
+    fn provider_hosts() -> BTreeSet<String> {
+        quoted_after(tile_providers(), "url: \"")
+            .into_iter()
+            .map(|url| {
                 let host = url
                     .strip_prefix("https://")
                     .unwrap_or_else(|| panic!("{url} is not https"));
                 let host = &host[..host.find('/').unwrap()];
                 format!("https://{}", host.replace("{s}.", "*."))
             })
-            .collect();
-        hosts.dedup();
-        hosts
+            .collect()
     }
 
     #[test]
     fn the_csp_names_exactly_the_tile_providers_hosts() {
-        assert_eq!(provider_hosts(), TILE_HOSTS);
+        let hosts: BTreeSet<String> = TILE_HOSTS.iter().map(|h| h.to_string()).collect();
+        assert_eq!(provider_hosts(), hosts);
+        assert_eq!(hosts.len(), TILE_HOSTS.len(), "TILE_HOSTS repeats a host");
         let img = format!("img-src 'self' data: {};", TILE_HOSTS.join(" "));
         assert!(CSP.contains(&img), "{}", &*CSP);
+    }
+
+    /// The tile ids agree: map.js TILE_PROVIDERS, view.js's `map_tiles` values (less
+    /// `auto`) and zeta-core's `layout.map_tiles` ids, in the same order.
+    #[test]
+    fn the_tile_ids_agree_across_map_js_view_js_and_the_theme_schema() {
+        let providers = quoted_after(tile_providers(), "id: \"");
+        let view = js("view.js");
+        let policy = &view[view.find("key: \"map_tiles\"").expect("map_tiles policy")..];
+        let values = &policy[policy.find("values: [").unwrap()..];
+        let values = &values[..values.find(']').unwrap()];
+        let mut ids: Vec<&str> = values.split('"').skip(1).step_by(2).collect();
+        assert_eq!(ids.first(), Some(&"auto"), "{ids:?}");
+        ids.remove(0);
+        assert_eq!(providers, ids);
+        assert_eq!(providers, zeta_core::themes::MAP_TILES);
     }
 }
