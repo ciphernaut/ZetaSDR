@@ -124,7 +124,32 @@ pub struct Subject {
     /// `merge` (it keeps a row of its own); empty for none.
     #[serde(default)]
     pub merge_skip: BTreeMap<String, serde_json::Value>,
+    /// How a subject is matched against the licence register, so a decoded identity can
+    /// confirm a lit site; `null` for a subject the register has no field for.
+    #[serde(default)]
+    pub identity: Option<Identity>,
 }
+
+/// How a mode's decoded subject is matched against the register (design 4.6): the event
+/// field's value, after `strip`, compared trimmed and case-insensitively with the
+/// register field `register` of each lit site.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeIdentity", transform = require_all)]
+pub struct Identity {
+    /// The event field holding the identity (`src`).
+    pub field: String,
+    /// The `Allocation` field it is compared with: only `callsign`.
+    pub register: String,
+    /// What to remove before comparing: `ssid`, an AX.25 `-N` suffix; `null` for nothing.
+    #[serde(default)]
+    pub strip: Option<String>,
+}
+
+/// The register fields an [`Identity`] may name.
+pub const IDENTITY_REGISTERS: [&str; 1] = ["callsign"];
+/// The strips an [`Identity`] may name.
+pub const IDENTITY_STRIPS: [&str; 1] = ["ssid"];
 
 /// `subject.track_points` when a row leaves it out.
 fn default_track_points() -> u32 {
@@ -803,6 +828,27 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
         }
         named.extend(sub.heading.clone().map(|h| ("subject.heading".into(), h)));
         named.extend(sub.label.clone().map(|l| ("subject.label".into(), l)));
+        if let Some(id) = &sub.identity {
+            if !IDENTITY_REGISTERS.contains(&id.register.as_str()) {
+                return Err(RowError::new(
+                    "subject.identity.register",
+                    format!(
+                        "{:?} is not one of {}",
+                        id.register,
+                        IDENTITY_REGISTERS.join(", ")
+                    ),
+                ));
+            }
+            if let Some(s) = &id.strip
+                && !IDENTITY_STRIPS.contains(&s.as_str())
+            {
+                return Err(RowError::new(
+                    "subject.identity.strip",
+                    format!("{s:?} is not null or one of {}", IDENTITY_STRIPS.join(", ")),
+                ));
+            }
+            named.push(("subject.identity.field".into(), id.field.clone()));
+        }
     }
     for (field, name) in named {
         if !properties.contains_key(&name) {

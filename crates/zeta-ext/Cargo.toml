@@ -12,8 +12,13 @@ keywords = ["sdr", "radio", "dsp"]
 categories = ["science"]
 description = "ZetaSDR stages backed by external decoder programs (external_decode, adsb_decode)"
 
+[features]
+# The register stub other crates' tests run (`testing::acma_stub`).
+test-fake = ["dep:axum"]
+
 [dependencies]
 async-trait = "0.1.92"
+axum = { version = "0.8.9", optional = true }
 num-complex = "0.4.6"
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -27,6 +32,6 @@ zeta-dsp = { path = "../zeta-dsp" }
 zeta-plugin = { path = "../zeta-plugin" }
 
 [dev-dependencies]
-axum = "0.8.9"
 tokio = { version = "1.53.3", features = ["rt-multi-thread"] }
 zeta-dsp = { path = "../zeta-dsp", features = ["test-fixtures"] }
+zeta-ext = { path = ".", features = ["test-fake"] }

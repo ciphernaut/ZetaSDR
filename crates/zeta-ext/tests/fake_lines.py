@@ -14,6 +14,8 @@ space-separated>, "n": <how many>}`. FAKE_WAV=1 makes it read a 44-byte WAV
 header first (exiting 3 unless it starts `RIFF....WAVE`), print
 `{"wav": {"rate_hz": R, "bits": B, "channels": C}}` as its first line, then count
 only the bytes after the header and exit 3 should a second `RIFF` follow.
+$FAKE_REPEAT_BYTES (default 0: never) writes the lines again each time that many
+more input bytes have arrived after the last write.
 `--lines-file PATH` takes the lines from that file instead of $FAKE_LINES, which is
 node-wide when a node runs this as a mode row: two rows differ by their `args`.
 """
@@ -58,6 +60,8 @@ def main() -> int:
     after = int(os.environ.get("FAKE_AFTER_BYTES", "1024"))
     via = os.environ.get("FAKE_VIA", "stdout")
     exit_after = os.environ.get("FAKE_EXIT_AFTER") == "1"
+    repeat = int(os.environ.get("FAKE_REPEAT_BYTES", "0"))
+    next_at = 0
 
     out = sys.stdout.buffer
     if via.startswith("tcp:"):
@@ -89,6 +93,7 @@ def main() -> int:
     if after == 0:
         send()
         sent = True
+        next_at = repeat
         if exit_after:
             return 3
     while True:
@@ -106,8 +111,12 @@ def main() -> int:
         if not sent and total >= after:
             send()
             sent = True
+            next_at = total + repeat
             if exit_after:
                 return 3
+        elif sent and repeat and total >= next_at:
+            send()
+            next_at = total + repeat
     sys.stderr.write(f"fake_lines: input closed after {total} bytes\n")
     return 0
 

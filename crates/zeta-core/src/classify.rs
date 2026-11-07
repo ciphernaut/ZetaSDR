@@ -125,6 +125,14 @@ pub struct Classification {
     pub tried: Vec<Tried>,
     #[serde(default)]
     pub allocations: Vec<Allocation>,
+    /// The licensed transmitters the band may come from, scored on the measured
+    /// layer-1 label; `None` only for a value an older node stored.
+    #[serde(default)]
+    #[schemars(
+        required,
+        schema_with = "crate::types::nullable::<crate::node::OriginAnswer>"
+    )]
+    pub origins: Option<crate::node::OriginAnswer>,
 }
 
 /// The band a classifier analyses within an IQ block: its centre's offset

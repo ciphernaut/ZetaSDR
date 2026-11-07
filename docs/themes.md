@@ -62,6 +62,8 @@ among them (it is reserved, see Footprints).
 | `color_scheme` | `dark` or `light`, set as `color-scheme` on `<html>` |
 | `layout.rail` | `true` puts the job tags in the rail beside the axis (`<html data-rail="on">`), `false` on their outlines (`"off"`) |
 | `layout.ribbon_tilt_deg` | number, -30 to 30 inclusive; the lean of transcript ribbons (the wrapper emits `--ribbon-tilt` from it, so `--ribbon-tilt` is not a token) |
+| `layout.dock` | optional, `bottom` (when absent) or `right`: where the selected pane docks while the view's `dock` is `auto`, under the waterfall or map, or as a third section of the side column (`<html data-dock>`); any other value is refused naming `layout.dock` |
+| `layout.map_tiles` | optional, one of `osm`, `carto-light`, `carto-dark`, `opentopo`, `esri-imagery`: the map's tile provider while the view's `map_tiles` is `auto` (`<html data-map-tiles>`); absent, a dark `color_scheme` gets `carto-dark` and a light one `osm`; any other value is refused naming `layout.map_tiles` |
 | `tokens` | an object of custom properties from the list below; an unknown key is refused naming it |
 | `ramp` | the waterfall's colour stops: 2 to 16 of `[t, [r, g, b]]`, `t` strictly ascending, the first exactly 0 and the last exactly 1, channels 0-255 |
 | `fonts` | optional; each `{family, file, weight}` names a file in the folder and becomes an `@font-face` under the theme (`weight` is a CSS range such as `400 700`); use the family through `--font-ui` and `--font-mono`. `family` and `weight` may not contain a quote or the characters refused in token values |
@@ -134,6 +136,7 @@ Each token is a custom property the core stylesheet declares in `:root`.
 - `--axis-w`: the waterfall's frequency axis.
 - `--side-w`: the side column.
 - `--side-collapsed-w`: the side column folded.
+- `--dock-share`: the docked pane's share of the side column while the dock is `right` (default 40%).
 - `--bar-h-top`: the top bar's height.
 - `--bar-h-bottom`: the command bar's height.
 - `--bar-h`: the current bar height (defaults to `--bar-h-top`).
@@ -199,18 +202,24 @@ selectors (`#bar .prompt`, `html[data-side]`, `.thin`, `.expanded`, `#wf-badge`,
 fixed along with the page when it changes; a theme of your own should keep to the hooks below. The
 core's menu rules are written with ID selectors, so a theme that styles menus must write
 `#ctx, #ctx-outline` (a bare `[role="menu"]` loses to them). An end-to-end scenario (`scenario_theme_hooks`) checks that each
-selector below matches on a page with a running demodulator, a ribbon, a collapsed pane, the map
-and the graph view open, so renaming one fails the suite.
+selector below matches on a page with a running demodulator, a ribbon, a collapsed pane, a pane
+docked right, the map and the graph view open, so renaming one fails the suite.
 
 Regions:
 
 - `#top`: the top bar. `.brand`: the product name in it.
 - `.src-tab`: a source tab (a button); `.src-tab[aria-selected="true"]` is the selected one.
-  Its parts are `.name`, `.range`, `.centre` and `.health`.
+  Its parts are `.name`, `.range`, `.centre` and `.health`. `.map-tab` is the Map tab after the
+  source tabs (also a `.src-tab`, with `.name` and a `.count`); while it is selected the shown
+  source's tab carries `.kept`.
 - `#rail`: the frequency-aligned rail beside the axis (present while `data-rail` is `on`).
 - `.wf-axis`: the frequency axis. `#waterfall`: the waterfall region. `.wf-canvas`: its canvas.
 - `#side`: the side column. `section.pane` is a pane in it (`#pane-transcript`, `#pane-jobs`);
   `.pane-head` is its header button; `section.pane[data-collapsed]` is a folded one.
+  `section.pane.dock` (`#pane-dock`) is the third, between the two, present only while a pane is
+  selected and the dock is `right`: its `.pane-head` names the pane (with a `.count` for
+  Subjects: the subjects the running jobs hold, counted before merged groups fold, so it can be
+  more than the table's rows) and its body is the pane host `#pane`; its share of the column is `--dock-share`.
 - `#panes`: the pane strip (the tabs for the subjects and explore views).
 - `#bar`: the command bar.
 
@@ -218,7 +227,8 @@ With only the binary and no checkout, fetch the starting files from a running no
 `/ui/themes/plain/theme.json` and `/ui/themes/plain/style.css` (no bearer needed). The
 `style.css` comes back wrapped in the theme's scope, so start from `theme.json` and an empty
 `style.css`. `#cmd`: its input. `#mic`: the microphone button.
-- `#map`: the map pane. `#graph`: the graph view (a modal dialog).
+- `#map`: the map, in the waterfall's place while the Map tab is selected. `#graph`: the graph
+  view (a modal dialog).
 - `[role="menu"]`: a menu (`#ctx`, the box menu, and `#ctx-outline`, the outline menu); its entries
   are `.ctx-item`.
 
@@ -246,7 +256,10 @@ State hooks (classes and attributes the page toggles; style them, never depend o
 - `.job[data-state="failed"]`: a failed job (there is no `.failed` class).
 
 On `<html>`: `html[data-theme]` (the active theme's `id`), `html[data-rail]` (`on` or `off`, from
-`layout.rail`) and `html[data-footprint]` (`wide` or `narrow`).
+`layout.rail`), `html[data-footprint]` (`wide` or `narrow`), `html[data-main]` (`rf` or `map`:
+what the main area shows, the waterfall or the map; the view's `main`) and `html[data-dock]`
+(`bottom` or `right`: where the selected pane docks, the view's `dock` resolved through
+`layout.dock`; set in every footprint, though the narrow one ignores it) and `html[data-map-tiles]` (the map's tile provider: the view's `map_tiles` resolved through `layout.map_tiles` and `color_scheme`). `#map .map-tile-note` is the map's notice that its tiles are not loading, naming another provider to try.
 
 ## Worked example
 

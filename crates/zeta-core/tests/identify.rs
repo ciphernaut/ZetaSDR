@@ -283,6 +283,10 @@ async fn ended(
         .unwrap();
     let last = events.pop().expect("identify published events");
     assert_eq!(last["protocol"], "verdict", "{last}");
+    // One `origin` event per run, ahead of the candidates.
+    let origin = events.iter().filter(|e| e["protocol"] == "origin").count();
+    assert_eq!(origin, 1, "{events:#?}");
+    events.retain(|e| e["protocol"] != "origin");
     let ctx = node.job_context(id).unwrap();
     let v = &ctx["identify"]["verdict"];
     assert_eq!(last["mode"], v["mode"], "{last} vs {ctx}");
@@ -684,7 +688,10 @@ async fn identify_resumed_after_a_restart_stops_its_stale_child() {
         loop {
             match events.recv().await {
                 Ok(f) => {
-                    if let Payload::Event(v) = f.payload {
+                    // The run's one `origin` event comes ahead of its candidates.
+                    if let Payload::Event(v) = f.payload
+                        && v["protocol"] != "origin"
+                    {
                         return v;
                     }
                 }
@@ -809,6 +816,63 @@ async fn the_verdict_carries_the_nearest_allocations_and_the_score_term() {
     // that) has no allocation.
     let acars = outcome(&events, "acars_decode").expect("acars_decode considered");
     assert!(acars["allocation"].is_null(), "{acars}");
+}
+
+/// An identify run publishes one `origin` event after its lookup, and its verdict (and the
+/// job's context) carry the same answer, scored on the measured band and label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identify_run_publishes_one_origin_event_and_its_verdict_carries_origins() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().gfsk).await;
+    node.add_knowledge(Arc::new(Register));
+    let (id, events) = identify(&node, APRS_HZ).await;
+    until("identify ends", Duration::from_secs(40), || {
+        state(&node, &id) != JobState::Running
+    })
+    .await;
+    let events = tokio::time::timeout(Duration::from_secs(5), events)
+        .await
+        .expect("identify's stream closes")
+        .unwrap();
+    let frames: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["protocol"] == "origin")
+        .collect();
+    assert_eq!(frames.len(), 1, "{events:#?}");
+    let frame = frames[0];
+    let ctx = node.job_context(&id).unwrap();
+    let verdict = &ctx["identify"]["verdict"];
+    let origins = &verdict["origins"];
+    // The measured band and label.
+    assert_eq!(
+        origins["band"]["center_hz"], verdict["features"]["center_hz"],
+        "{ctx}"
+    );
+    assert_eq!(
+        origins["band"]["bandwidth_hz"], verdict["features"]["bandwidth_hz"],
+        "{ctx}"
+    );
+    assert_eq!(
+        origins["modulation"],
+        serde_json::json!([verdict["label"]]),
+        "{ctx}"
+    );
+    assert_eq!(origins["source"], "rx", "{ctx}");
+    assert_eq!(
+        origins["providers"],
+        serde_json::json!(["register"]),
+        "{ctx}"
+    );
+    assert_eq!(
+        origins["origins"][0]["allocation"]["licensee"], LICENSEE,
+        "{ctx}"
+    );
+    // The event and the context's `origins` are the same answer.
+    assert_eq!(frame["origins"], origins["origins"], "{frame}");
+    assert_eq!(frame["band"], origins["band"], "{frame}");
+    assert_eq!(frame["job"], id.0.as_str(), "{frame}");
+    assert_eq!(ctx["origins"]["t_ns"], origins["t_ns"], "{ctx}");
 }
 
 /// Identify's band centred 2 kHz above the tone: each trial job starts on the measured

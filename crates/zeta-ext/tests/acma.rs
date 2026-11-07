@@ -1,14 +1,9 @@
 //! The `acma` knowledge provider against a stub of the register service.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
 use serde_json::{Value, json};
 use zeta_core::knowledge::KnowledgeProvider;
 use zeta_core::reach::ReachClass;
@@ -16,138 +11,75 @@ use zeta_core::station::Station;
 use zeta_core::types::Hz;
 use zeta_ext::acma::AcmaKnowledge;
 use zeta_ext::mcp_client::McpClient;
-
-#[derive(Clone, Copy, Default, PartialEq)]
-enum Mode {
-    #[default]
-    Normal,
-    Satellite,
-    RpcError,
-    Html,
-    Slow,
-    /// One row without a `BANDWIDTH` (NULL in the register).
-    NullBandwidth,
-}
-
-#[derive(Default)]
-struct Stub {
-    mode: Mode,
-    /// Tool calls seen.
-    calls: AtomicUsize,
-    /// `get_frequency_allocation` calls seen.
-    plans: AtomicUsize,
-    /// The last `execute_sql` arguments.
-    sql: Mutex<Option<Value>>,
-}
-
-fn sse(v: Value) -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/event-stream")],
-        format!("event: message\ndata: {v}\n\n"),
-    )
-        .into_response()
-}
+use zeta_ext::testing::acma_stub::{self, Mode, Stub};
 
 /// Four 404.025 MHz assignments shaped as the register answers them (2026-11-02), every row
-/// synthetic: licensees, licences and sites made up, the sites near the demo station.
-fn rows() -> Value {
-    json!({
-        "columns": ["FREQUENCY", "BANDWIDTH", "EMISSION", "DEVICE_TYPE", "TRANSMITTER_POWER",
-            "TRANSMITTER_POWER_UNIT", "LICENCE_NO", "SITE_NAME", "LATITUDE", "LONGITUDE",
-            "LICENCEE"],
-        "rows": [
-            [404025000, 25000, "16K0F2D  ", "T", 1, "W", "9000001/1", "Example Rail Site A",
-                -27.950, 153.250, "Example Rail Operator"],
-            [404025000, 25000, "16K0F2D  ", "R", null, "W", "9000001/1",
-                "Example Rail Site B", -27.955, 153.255, "Example Rail Operator"],
-            [404025000, 25000, "16K0F1D  ", "T", 1, "W", "9000002/1",
-                "Example Site Hill Rd", -27.300, 153.100, "Example Water Authority"],
-            [404025000, 25000, "16K0F1D  ", "R", null, "W", "9000002/1",
-                "Example Depot", -27.250, 153.120, "Example Water Authority"]
-        ],
-        "truncated": false, "rowCount": 4, "result_id": "r1", "_hints": []
-    })
-}
-
-fn plan(satellite: bool) -> Value {
-    let services = if satellite {
-        json!([{"name": "MOBILE-SATELLITE", "primary": true}])
-    } else {
+/// synthetic: licensees, licences, sites and callsigns made up, the sites near the demo
+/// station. The last column, `CALL_SIGN`, is one a service may not answer.
+fn rows() -> Vec<Value> {
+    vec![
         json!([
-            {"name": "FIXED", "primary": true, "inline_footnotes": []},
-            {"name": "MOBILE", "primary": true, "qualifier": "except aeronautical mobile (R)"},
-            {"name": "METEOROLOGICAL AIDS", "primary": false},
-            {"name": "RADIOLOCATION", "primary": false, "inline_footnotes": ["AUS29"]}
-        ])
-    };
-    json!({"match_count": 1, "allocation": {"freq_start_hz": 403000000,
-        "freq_end_hz": 406000000, "unit": "MHz", "page": 50, "services": services,
-        "footnotes": [], "raw": ""}, "regions": {}})
+            404025000,
+            25000,
+            "16K0F2D  ",
+            "T",
+            1,
+            "W",
+            "9000001/1",
+            "Example Rail Site A",
+            -27.950,
+            153.250,
+            "Example Rail Operator",
+            null
+        ]),
+        json!([
+            404025000,
+            25000,
+            "16K0F2D  ",
+            "R",
+            null,
+            "W",
+            "9000001/1",
+            "Example Rail Site B",
+            -27.955,
+            153.255,
+            "Example Rail Operator",
+            null
+        ]),
+        json!([
+            404025000,
+            25000,
+            "16K0F1D  ",
+            "T",
+            1,
+            "W",
+            "9000002/1",
+            "Example Site Hill Rd",
+            -27.300,
+            153.100,
+            "Example Water Authority",
+            "XX4EX"
+        ]),
+        json!([
+            404025000,
+            25000,
+            "16K0F1D  ",
+            "R",
+            null,
+            "W",
+            "9000002/1",
+            "Example Depot",
+            -27.250,
+            153.120,
+            "Example Water Authority",
+            "XX4EX"
+        ]),
+    ]
 }
 
-async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Response {
-    let req: Value = serde_json::from_str(&body).unwrap();
-    let id = req["id"].clone();
-    match req["method"].as_str().unwrap() {
-        "initialize" => {
-            let mut r =
-                sse(json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-03-26"}}));
-            r.headers_mut()
-                .insert("mcp-session-id", "session-0".parse().unwrap());
-            r
-        }
-        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
-        "tools/call" => {
-            assert_eq!(headers.get("mcp-session-id").unwrap(), "session-0");
-            s.calls.fetch_add(1, Ordering::SeqCst);
-            if req["params"]["name"] == "get_frequency_allocation" {
-                s.plans.fetch_add(1, Ordering::SeqCst);
-            }
-            match s.mode {
-                Mode::RpcError => {
-                    return sse(json!({"jsonrpc":"2.0","id":id,
-                        "error":{"code":-32603,"message":"database is locked"}}));
-                }
-                Mode::Html => return "<html>".into_response(),
-                Mode::Slow => tokio::time::sleep(Duration::from_secs(3)).await,
-                _ => {}
-            }
-            let args = &req["params"]["arguments"];
-            let out = match req["params"]["name"].as_str().unwrap() {
-                "execute_sql" => {
-                    *s.sql.lock().unwrap() = Some(args.clone());
-                    let mut r = rows();
-                    if s.mode == Mode::NullBandwidth {
-                        r["rows"][0][1] = Value::Null;
-                    }
-                    r
-                }
-                "get_frequency_allocation" => plan(s.mode == Mode::Satellite),
-                t => panic!("unexpected tool {t}"),
-            };
-            sse(json!({"jsonrpc":"2.0","id":id,
-                "result":{"content":[{"type":"text","text":out.to_string()}]}}))
-        }
-        m => panic!("unexpected method {m}"),
-    }
-}
-
+/// The register stub (`zeta_ext::testing::acma_stub`) answering [`rows`].
 async fn serve(mode: Mode) -> (String, Arc<Stub>) {
-    let stub = Arc::new(Stub {
-        mode,
-        ..Stub::default()
-    });
-    let app = Router::new()
-        .route("/mcp", post(mcp))
-        .route(
-            "/health",
-            get(|| async { r#"{"status":"ok","version":"1.11.0","isSyncing":false}"# }),
-        )
-        .with_state(stub.clone());
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-    (url, stub)
+    acma_stub::serve(rows(), mode).await
 }
 
 /// The demo station, Brisbane Airport.
@@ -171,6 +103,7 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
     let (url, stub) = serve(Mode::Normal).await;
     let provider = provider(&url, demo_station());
     assert_eq!(provider.name(), "acma");
+    assert!(provider.gives_assignments());
     let a = provider
         .allocations("AU", Hz(404_025_000), Hz(16_000))
         .await;
@@ -247,6 +180,8 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
         .unwrap();
     assert_eq!((r.class, r.km), (ReachClass::Uhf, Some(150.0)));
     assert_eq!(r.antenna, "discone");
+    // The stub read the band from the query (its rows were cut by it, not passed whole).
+    assert_eq!(stub.unbanded.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -401,4 +336,197 @@ async fn a_device_without_a_bandwidth_is_kept() {
                 && x.center_hz == Some(Hz(404_025_000))),
         "{asg:?}"
     );
+}
+
+#[tokio::test]
+async fn the_sql_names_call_sign_and_a_column_fills_it() {
+    let (url, stub) = serve(Mode::Normal).await;
+    let provider = provider(&url, demo_station());
+    let a = provider
+        .allocations("AU", Hz(404_025_000), Hz(16_000))
+        .await;
+    let asg: Vec<_> = a
+        .iter()
+        .filter(|x| x.kind.as_deref() == Some("assignment"))
+        .collect();
+    assert_eq!(asg.len(), 4);
+    let tx = asg
+        .iter()
+        .find(|x| x.emission.as_deref() == Some("16K0F1D") && x.role.as_deref() == Some("tx"))
+        .unwrap();
+    assert_eq!(tx.callsign.as_deref(), Some("XX4EX"));
+    let rail = asg
+        .iter()
+        .find(|x| x.site.as_deref() == Some("Example Rail Site A"))
+        .unwrap();
+    assert_eq!(rail.callsign, None);
+    assert!(
+        a.iter()
+            .filter(|x| x.kind.as_deref() == Some("plan"))
+            .all(|x| x.callsign.is_none())
+    );
+    let sql = stub.sql.lock().unwrap().clone().unwrap();
+    let q = sql["sql"].as_str().unwrap();
+    assert!(q.contains("d.CALL_SIGN AS CALL_SIGN"), "{q}");
+}
+
+#[tokio::test]
+async fn a_stub_without_the_column_leaves_callsign_null() {
+    let (url, _) = serve(Mode::NoCallSign).await;
+    let without = provider(&url, demo_station())
+        .allocations("AU", Hz(404_025_000), Hz(16_000))
+        .await;
+    let (url, _) = serve(Mode::Normal).await;
+    let with = provider(&url, demo_station())
+        .allocations("AU", Hz(404_025_000), Hz(16_000))
+        .await;
+    assert_eq!(without.len(), 8);
+    assert!(without.iter().all(|x| x.callsign.is_none()));
+    // Nothing else changes.
+    let cleared: Vec<_> = with
+        .into_iter()
+        .map(|mut x| {
+            x.callsign = None;
+            x
+        })
+        .collect();
+    assert_eq!(without, cleared);
+}
+
+#[tokio::test]
+async fn allocations_from_another_station_cuts_and_measures_from_it() {
+    let (url, stub) = serve(Mode::Normal).await;
+    let provider = provider(&url, demo_station());
+    // 100 km due north of the demo station.
+    let mut north = demo_station().unwrap();
+    north.lat += 100.0 / 111.195;
+    let a = provider
+        .allocations_from("AU", Hz(404_025_000), Hz(16_000), Some(&north))
+        .await;
+    let asg: Vec<_> = a
+        .iter()
+        .filter(|x| x.kind.as_deref() == Some("assignment"))
+        .collect();
+    // The rail sites, about 165 km from the north station, fall outside the 150 km
+    // reach; the hill site 9 km from the demo station is about 91 km from it.
+    assert!(
+        !asg.is_empty()
+            && asg
+                .iter()
+                .all(|x| x.licensee.as_deref() == Some("Example Water Authority")),
+        "{asg:?}"
+    );
+    let hill = asg
+        .iter()
+        .find(|x| x.site.as_deref() == Some("Example Site Hill Rd"))
+        .unwrap();
+    let d = hill.distance_km.unwrap();
+    assert!((90.0..92.0).contains(&d), "{d}");
+    let b = hill.bearing_deg.unwrap();
+    assert!((150.0..200.0).contains(&b), "{b}"); // about south
+    // The query's box is around the north station.
+    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (lo, hi) = (north.lat - 150.0 / 111.0, north.lat + 150.0 / 111.0);
+    assert!(
+        q.contains(&format!("s.LATITUDE BETWEEN {lo:.6} AND {hi:.6}")),
+        "{q}"
+    );
+    let r = provider
+        .reach_from("AU", Hz(404_025_000), Hz(16_000), Some(&north))
+        .await
+        .unwrap();
+    assert_eq!(r.km, Some(150.0));
+
+    // No vantage: no distances and no box, though the provider has a station.
+    let a = provider
+        .allocations_from("AU", Hz(404_025_000), Hz(16_000), None)
+        .await;
+    let asg: Vec<_> = a
+        .iter()
+        .filter(|x| x.kind.as_deref() == Some("assignment"))
+        .collect();
+    assert_eq!(asg.len(), 4);
+    assert!(
+        asg.iter()
+            .all(|x| x.distance_km.is_none() && x.bearing_deg.is_none())
+    );
+    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!q.contains("LATITUDE BETWEEN"), "{q}");
+    assert_eq!(
+        provider
+            .reach_from("AU", Hz(404_025_000), Hz(16_000), None)
+            .await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_register_without_the_call_sign_column_is_probed_once_and_selects_null() {
+    for mode in [
+        Mode::NoCallSignColumnRpc,
+        Mode::NoCallSignColumnTool,
+        Mode::NoCallSignColumnGeneric,
+        Mode::NoCallSignColumnJson,
+    ] {
+        let (url, stub) = serve(mode).await;
+        let provider = provider(&url, demo_station());
+        for center in [404_025_000, 404_030_000] {
+            let a = provider.allocations("AU", Hz(center), Hz(16_000)).await;
+            let asg: Vec<_> = a
+                .iter()
+                .filter(|x| x.kind.as_deref() == Some("assignment"))
+                .collect();
+            assert_eq!(asg.len(), 4, "{mode:?}: {a:?}");
+            assert!(a.iter().all(|x| x.callsign.is_none()));
+            let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(q.contains("NULL AS CALL_SIGN"), "{q}");
+        }
+        // One rejected probe, then each lookup asks once: 1 + 2 queries.
+        assert_eq!(stub.rejected.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.queries.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.errors(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_register_with_the_column_is_asked_once_per_lookup() {
+    let (url, stub) = serve(Mode::Normal).await;
+    let provider = provider(&url, demo_station());
+    for _ in 0..2 {
+        provider
+            .allocations("AU", Hz(404_025_000), Hz(16_000))
+            .await;
+    }
+    assert_eq!(stub.queries.load(Ordering::SeqCst), 2);
+    assert_eq!(stub.rejected.load(Ordering::SeqCst), 0);
+}
+
+/// A register that fails every query, with or without `CALL_SIGN`, settles nothing: each
+/// lookup asks twice (the probe and the retry), and the lookup fails.
+#[tokio::test]
+async fn a_register_failing_every_query_keeps_probing() {
+    let (url, stub) = serve(Mode::SqlFails).await;
+    let provider = provider(&url, demo_station());
+    for _ in 0..2 {
+        let a = provider
+            .allocations("AU", Hz(404_025_000), Hz(16_000))
+            .await;
+        assert!(a.is_empty(), "{a:?}");
+    }
+    assert_eq!(stub.queries.load(Ordering::SeqCst), 4);
+    assert_eq!(provider.errors(), 2);
+    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(q.contains("NULL AS CALL_SIGN"), "{q}");
 }

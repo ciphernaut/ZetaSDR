@@ -52,7 +52,7 @@ button {
    every part of it. One list, lifted by :not(#id) over the core's and this file's one-id colour
    rules (#connect, #mic.recording, a faulted tab's name), so no part keeps a green of its own. */
 :is(button:hover:not(:disabled), button:focus-visible,
-    #listen-all[aria-pressed="true"], #map-toggle[aria-pressed="true"],
+    #listen-all[aria-pressed="true"], .src-tab.kept,
     .job button.play[aria-pressed="true"],
     .src-tab[aria-selected="true"], .pane-tab[aria-selected="true"]):not(#zeta-inv) {
   background: var(--text);
@@ -61,7 +61,7 @@ button {
   outline: none;
 }
 :is(button:hover:not(:disabled), button:focus-visible,
-    #listen-all[aria-pressed="true"], #map-toggle[aria-pressed="true"],
+    #listen-all[aria-pressed="true"], .src-tab.kept,
     .job button.play[aria-pressed="true"],
     .src-tab[aria-selected="true"], .pane-tab[aria-selected="true"]):not(#zeta-inv) * {
   color: #000;
@@ -99,7 +99,8 @@ input:focus { border-color: var(--text); }
 &:not([data-footprint="narrow"]) .src-tab:not([aria-selected="true"]) .range { display: none; }
 /* The selected source and pane tab: inverse video, a row of black text on green
    (the inverse rule under buttons draws it; hovered and focused tabs read the same way) */
-.src-tab[aria-selected="true"] .name { font-weight: 700; }
+.src-tab[aria-selected="true"] .name,
+.src-tab.kept .name { font-weight: 700; }
 .src-tab.fault .name { color: var(--error); }
 .src-tab .tag.pin { border: 1px solid var(--error); color: var(--error); }
 .src-tab[aria-selected="true"] .health {
@@ -110,7 +111,7 @@ input:focus { border-color: var(--text); }
 }
 .health .k { color: inherit; }
 .health .v { margin-inline-end: 1ch; font-weight: 700; }
-#listen-all, #map-toggle, #drawer-toggle { align-self: center; }
+#listen-all, #drawer-toggle { align-self: center; }
 
 /* ---- the command bar: a prompt and the line, a block cursor waiting after the prompt ---- */
 #bar {

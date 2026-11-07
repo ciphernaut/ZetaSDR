@@ -84,9 +84,22 @@
 // The map (map.js) is mounted in #map at login: the overlays hand it every event of the jobs
 // they watch and of the positioned jobs on the other sources (ov.onEvent), each jobs poll drops the tracks of jobs that ended (map.sync), and
 // a job row with a fix shows its distance and bearing from the view's `home` (map.rowText).
-// With view `map on` <html data-map="on"> is set: in the wide footprint the map is a pane
-// beside the waterfall; in the narrow one #map-toggle (`map`, beside the source tabs) shows
-// it in the waterfall's place (<html data-pane="map">) and back.
+// The map is the Map tab of the sources strip (renderTabs appends it after the source tabs):
+// the view's `main` (rf | map; `map on|off` is its alias) says what #main shows, and
+// <html data-main> follows it (applyMain; style.css hides the waterfall, which keeps its job,
+// zoom and outlines, and shows the map in its place, in both footprints). The Map tab sets
+// `main map` (a second click `main rf`), a source tab `main rf` after selecting its source;
+// the shown source is unchanged meanwhile and its tab carries class `kept`.
+// Lit sites (plan 32 spec 4.4): an `origin` event of a job the overlays follow lights the
+// job's set (map.origin keyed by the job id, faded from the job's last event, ov.lastEvent),
+// and is a transcript line as a watch's verdict is (verdictLine); What is this on a box and
+// on a capture light one-shot sets from their classification's `origins` (`classify:<t_ns>`,
+// `capture:<id>`); each jobs poll seeds the running jobs' `context.origins` (map.seed). A
+// job row's or the Bits header's Origins lights the job's set from the op's answer at once,
+// and notes it (units.js originSummary) only for a job the overlays do not follow
+// (ov.follows). The
+// Map tab's `.count` is the number of lit sites (map.litCount; empty at zero), kept over
+// renderTabs; the page never switches to the map by itself.
 //
 // The subjects (subjects.js): the store is mounted before the overlays, which hand it every
 // event first and ask it for mode rows; each jobs poll drops the subjects of jobs that ended.
@@ -95,6 +108,8 @@
 // selected, and the pane shows in #pane under the waterfall while the view's `pane` is
 // `subjects` (`view set subjects on|off` is an alias). In the narrow footprint the pane is a
 // tab in the waterfall's place (<html data-pane="subjects">) that the strip's tab opens and closes.
+// The view's `dock` (auto | bottom | right; auto the theme's `layout.dock`) moves #pane, whichever
+// pane it shows, into the side column as a third folding section in the wide footprint (applyDock).
 // The Bits pane (bits.js, #bits) is the strip's `bits` tab, eligible while a running job has a
 // slicer stream; Explore's Work the bits and a job row's Bits button select it on that job. A
 // `bits` job runs on source `node`, so it draws no outline (overlays.js outlines only the
@@ -144,11 +159,12 @@ import {
 import { channelLabel, loadPlans, resolvePlan } from "./plans.js";
 import { MixWatch, isMuted, mixCovering, muteOp } from "./mix.js";
 import { mountCoarse } from "./coarse.js";
-import { mountMap } from "./map.js";
+import { mountMap, resolveMapTiles } from "./map.js";
 import { mountSubjects, mountSubjectsPane } from "./subjects.js";
 import { mountPanes } from "./panes.js";
 import { mountExplorePane } from "./explore.js";
 import { mountBitsPane } from "./bits.js";
+import { originSummary } from "./units.js";
 
 export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
@@ -182,6 +198,7 @@ export const state = {
   allowDeletes: false, // `allow deletes on|off`: /ask may delete captures (not persisted)
   // `allow signatures on|off`: /ask may accept and reject signatures (not persisted)
   allowSignatures: false,
+  dockCollapsed: false, // the docked pane's section folded (applyDock; not persisted)
 };
 const sourceListeners = [];
 
@@ -300,11 +317,47 @@ function rangeText(src) {
 function select(id) {
   state.selected = id;
   store(SOURCE_KEY, id);
-  for (const tab of document.querySelectorAll(".src-tab")) {
-    tab.setAttribute("aria-selected", String(tab.dataset.id === id));
-  }
+  syncMainTabs();
   const src = state.sources.find((s) => s.id === id) || null;
   for (const fn of sourceListeners) fn(src);
+}
+
+// The strip's selection from the view's `main` and the shown source: the Map tab is the
+// selected one while `main` is map, the shown source's tab then keeps class `kept`.
+function syncMainTabs() {
+  const map = !!state.view && state.view.get("main") === "map";
+  for (const tab of document.querySelectorAll("#tabs .src-tab")) {
+    const isMap = tab.classList.contains("map-tab");
+    const shownTab = !isMap && tab.dataset.id === state.selected;
+    tab.setAttribute("aria-selected", String(isMap ? map : shownTab && !map));
+    if (!isMap) tab.classList.toggle("kept", shownTab && map);
+  }
+}
+
+// The Map tab: not a source (source_list never lists it, syncTabs never touches it).
+function mapTab() {
+  const tab = document.createElement("button");
+  tab.className = "src-tab map-tab";
+  tab.setAttribute("role", "tab");
+  tab.dataset.view = "map";
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = "Map";
+  const count = document.createElement("span");
+  count.className = "count";
+  tab.append(name, count);
+  tab.onclick = () => {
+    if (state.view) state.view.set("main", state.view.get("main") === "map" ? "rf" : "map");
+  };
+  return tab;
+}
+
+// The Map tab's badge: the number of lit sites, empty at zero.
+function paintMapCount() {
+  const el = document.querySelector("#tabs .map-tab .count");
+  if (!el) return;
+  const n = state.map ? state.map.litCount() : 0;
+  el.textContent = n > 0 ? String(n) : "";
 }
 
 // A pinned source's tab title (spec 4.1): `pin <lo>–<hi> MHz`, then `; gain <db> dB` (or
@@ -391,10 +444,15 @@ function renderTabs(sources) {
       centre.textContent = centreText(s);
       tab.append(name, range, centre);
       decorateTab(tab, s);
-      tab.onclick = () => select(s.id);
+      tab.onclick = () => {
+        select(s.id);
+        if (state.view && state.view.get("main") !== "rf") state.view.set("main", "rf");
+      };
       return tab;
     }),
+    mapTab(),
   );
+  paintMapCount();
   const saved = load(SOURCE_KEY);
   const pick = sources.find((s) => s.id === saved) || sources[0];
   if (pick) select(pick.id);
@@ -528,6 +586,26 @@ async function offerReplace(op, err) {
     ? conflictActions(err, (replace) => applyOp({ ...op, replace }))
     : [];
   state.transcript?.note(conflictText(err), true, actions);
+}
+
+// The job form of origin_lookup (the node reads the job's band and modulation).
+function originJobOp(job) {
+  return { op: "origin_lookup", job, source: null, center_hz: null, bandwidth_hz: null, modulation: null };
+}
+
+// Origins by job `id`. The answer lights the map at once (an `origin` event for the same job,
+// arriving on the feed as well, replaces it under the same key). It is noted in the
+// transcript only for a job the overlays do not follow (a `bits` job on source `node`, a job
+// on another source that is not positioned), whose event the page never sees; a followed
+// job's event writes its own line.
+async function askOrigins(id) {
+  const r = await applyOp(originJobOp(id));
+  const a = r && r.value;
+  if (!a || !Array.isArray(a.origins)) return;
+  state.map?.origin(id, a);
+  if (state.ov?.follows(id)) return;
+  const job = (state.lastJobs || []).find((j) => j.id === id);
+  state.transcript?.note(`${job ? job.kind : "job"} ${String(id).slice(-6)}: ${originSummary(a)}`);
 }
 
 // The op attaching a transcription to job `id` (the language left to the backend).
@@ -887,10 +965,14 @@ function start(api) {
   state.map = mountMap($("#map"), api, state.view, {
     jobs: () => state.lastJobs,
     subjects: state.subjects,
+    lastEvent: (id) => (state.ov ? state.ov.lastEvent(id) : null),
+    tiles: resolveTiles,
   });
+  state.map.onChange(paintMapCount);
   state.ov.onEvent((job, p) => {
     state.subjects?.event(job, p);
     state.map?.event(job, p);
+    if (p && p.protocol === "origin") state.map?.origin(job.id, p);
     const line = verdictLine(job, p);
     if (line) state.transcript.note(line);
   });
@@ -911,11 +993,13 @@ function start(api) {
     panes: state.panes,
     ov: () => state.ov,
     wf: () => state.wf,
+    onOrigins: (key, answer) => state.map?.origin(key, answer),
     onBits: (id) => state.bits?.setJob(id),
   });
   state.bits = mountBitsPane($("#bits"), api, state.view, state.transcript, {
     panes: state.panes,
     jobs: () => state.lastJobs,
+    onOrigins: (id) => askOrigins(id),
   });
   state.subjects.onLearn(applyPanes);
   loadStationHome(api);
@@ -924,13 +1008,18 @@ function start(api) {
   applySide();
   mountSideHeads();
   applyRail();
-  applyMapPane();
+  applyMain();
+  applyDock();
+  applyMapTiles();
+  state.subjects.onChange(paintDockHead);
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
     if (key === "theme") applyTheme();
     if (key === "side") applySide();
-    if (key === "map") applyMapPane();
+    if (key === "main") applyMain();
     if (key === "pane") applyPanes();
+    if (key === "dock") applyDock();
+    if (key === "map_tiles") applyMapTiles();
   });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
@@ -942,6 +1031,7 @@ function start(api) {
     ov: state.ov,
     ringSeconds: (id) => state.sources.find((x) => x.id === id)?.ring?.seconds ?? null,
     plan: () => resolvePlan(state.view.get("plan")),
+    onOrigins: (key, answer) => state.map?.origin(key, answer),
     command: (text) => {
       const cmd = $("#cmd");
       cmd.value = text;
@@ -965,7 +1055,10 @@ function start(api) {
       state.lastJobs = jobs;
       state.explore?.noteJobs(jobs);
       state.bits?.noteJobs(jobs);
-      if (state.map) state.map.sync();
+      if (state.map) {
+        state.map.sync();
+        state.map.seed(jobs);
+      }
       state.subjects?.sync(jobs);
       if (state.ov) state.ov.sync(jobs, shown());
       applyPanes();
@@ -980,6 +1073,7 @@ function start(api) {
     onPlay: toggleAudio,
     onTranscribe: (job) => applyOp(attachOp(job.id)),
     onGraph: (job) => showGraph(api, job.id),
+    onOrigins: (job) => askOrigins(job.id),
     playing: (id) => !!state.audio && state.audio.jobId === id,
     onHot: (id, on) => state.ov?.setHot(id, on),
     squelch: (id) => (state.ov ? state.ov.squelch(id) : null),
@@ -1004,14 +1098,15 @@ function start(api) {
 }
 
 // The transcript line of a watched job's verdict, or null: a watch's `unknown`, `decoding`
-// and `lost` events and an identify's `verdict` event, as `<kind> <id tail>: <summary>`
-// (an unknown's summary carries the register's nearest transmitter). Its ribbon still
+// and `lost` events, an identify's `verdict` event and any job's `origin` event (plan 32
+// spec 4.3), as `<kind> <id tail>: <summary>` (an unknown's summary carries the register's
+// nearest transmitter). Its ribbon still
 // shows on the waterfall; the line keeps it.
 export const VERDICT_WATCH_STATES = new Set(["unknown", "decoding", "lost"]);
 function verdictLine(job, p) {
   if (!p || typeof p !== "object" || typeof p.summary !== "string") return null;
   const watch = p.protocol === "watch" && VERDICT_WATCH_STATES.has(p.state);
-  if (!watch && p.protocol !== "verdict") return null;
+  if (!watch && p.protocol !== "verdict" && p.protocol !== "origin") return null;
   return `${job.kind} ${String(job.id).slice(-6)}: ${p.summary}`;
 }
 
@@ -1054,8 +1149,6 @@ function redrawPlan() {
   if (state.wf) state.wf.drawAxis();
 }
 
-// <html data-map="on"> while the view's `map` policy is on (style.css lays the pane out);
-// off also leaves the narrow footprint's map tab.
 // The node's station as the home while the view's `home` is none (view.js homeOf): read
 // once per page load; `view set home` keeps precedence. A node without one, or an older
 // node without the op, leaves no home.
@@ -1117,6 +1210,10 @@ async function applyTheme() {
   if (seq !== themeSwitch) return;
   root.dataset.theme = id;
   root.dataset.rail = theme.layout?.rail === false ? "off" : "on";
+  themeDock = theme.layout?.dock ?? null;
+  themeTiles = theme;
+  applyDock();
+  applyMapTiles();
   applyRail();
   if (state.wf) {
     state.wf.refreshThemeColours();
@@ -1217,6 +1314,14 @@ function mountSideHeads() {
       state.view.set("side", next);
     });
   }
+  // The docked pane's header bar (applyDock builds the section on demand): folds it in the
+  // page's memory, the `side` policy untouched.
+  document.getElementById("side")?.addEventListener("click", (ev) => {
+    const head = ev.target.closest("#pane-dock .pane-head");
+    if (!head || footprint() === "narrow") return;
+    state.dockCollapsed = !state.dockCollapsed;
+    applyDock();
+  });
 }
 
 // The job tags live in the waterfall's rail when the theme's layout has one (<html
@@ -1226,27 +1331,135 @@ function applyRail() {
   state.ov.setRail(document.documentElement.dataset.rail === "on" ? state.wf.rail : null);
 }
 
-function applyMapPane() {
+// <html data-main="rf|map"> from the view's `main` (style.css shows the waterfall or the map
+// in #main), the strip's selection with it; the box menu's selection goes, as a source switch
+// drops it.
+function applyMain() {
+  const main = state.view ? state.view.get("main") : "rf";
   const root = document.documentElement;
-  const on = !!state.view && state.view.get("map") === "on";
-  if (on) root.dataset.map = "on";
-  else {
-    delete root.dataset.map;
-    if (root.dataset.pane === "map") delete root.dataset.pane;
+  if (root.dataset.main !== main) {
+    root.dataset.main = main;
+    if (main === "map") state.menu?.close();
   }
-  $("#map-toggle").setAttribute("aria-pressed", String(root.dataset.pane === "map"));
+  syncMainTabs();
   state.panes?.render();
 }
 
-// The pane strip and #pane from the view's `pane` and the panes' eligibility (panes.js), and
-// the map's narrow tab, which a pane's tab replaces. Run on a view change, a row learned, a jobs
-// poll and a footprint change, never on a message.
+// The pane strip and #pane from the view's `pane` and the panes' eligibility (panes.js), then
+// where #pane docks. Run on a view change, a row learned, a jobs poll and a footprint change,
+// never on a message.
 function applyPanes() {
   state.panes?.render();
-  $("#map-toggle").setAttribute(
-    "aria-pressed",
-    String(document.documentElement.dataset.pane === "map"),
-  );
+  applyDock();
+}
+
+// ---- the dock ---------------------------------------------------------------------------
+// The view's `dock` (auto | bottom | right) places the pane host #pane: `bottom` as the last
+// child of #main (style.css gives it the bottom of the main area), `right` in the side column
+// as a third section, `section.pane.dock#pane-dock`, between the Transcript and the Jobs pane,
+// with a header bar naming the shown pane (and, for Subjects, a count) that folds it. `auto`
+// is the applied theme's `layout.dock`, else bottom. <html data-dock> carries the resolved
+// value in both footprints; the narrow footprint leaves #pane in #main (panes take the main
+// area's place there). The move is a DOM move of the same element, so the panes see nothing.
+// The fold is page memory (state.dockCollapsed), not a policy, forgotten when no pane is shown
+// or the dock leaves `right`.
+let themeDock = null; // the applied theme's layout.dock ("bottom" | "right" | null)
+
+// ---- the map's tiles ----------------------------------------------------------------------
+// The view's `map_tiles` resolved through the applied theme (map.js resolveMapTiles: its
+// `layout.map_tiles`, else by its `color_scheme`) onto <html data-map-tiles> and the map's
+// one tile layer. Run at load, on a `map_tiles` change and when a theme applies.
+let themeTiles = null; // the applied theme.json (its color_scheme and layout.map_tiles)
+
+function resolveTiles() {
+  return resolveMapTiles(state.view ? state.view.get("map_tiles") : "auto", themeTiles);
+}
+
+function applyMapTiles() {
+  const id = resolveTiles();
+  const root = document.documentElement;
+  if (root.dataset.mapTiles !== id) root.dataset.mapTiles = id;
+  state.map?.applyTiles();
+}
+
+function resolveDock() {
+  const v = state.view ? state.view.get("dock") : "auto";
+  if (v === "bottom" || v === "right") return v;
+  return themeDock === "right" ? "right" : "bottom";
+}
+
+function applyDock() {
+  const dock = resolveDock();
+  const root = document.documentElement;
+  if (root.dataset.dock !== dock) root.dataset.dock = dock;
+  const host = document.getElementById("pane");
+  const main = document.getElementById("main");
+  if (!host || !main) return;
+  const pane = state.panes ? state.panes.current() : null;
+  // The fold is forgotten when no pane is shown or the dock leaves `right`, so a return to
+  // `right` comes back unfolded; a trip through the narrow footprint keeps it.
+  if (!pane || dock !== "right") state.dockCollapsed = false;
+  let sec = document.getElementById("pane-dock");
+  const app = document.getElementById("app");
+  if (dock !== "right" || !pane || footprint() === "narrow") {
+    if (host.parentElement !== main) main.append(host);
+    sec?.remove();
+    delete app?.dataset.dockOpen;
+    return;
+  }
+  if (!sec) {
+    sec = document.createElement("section");
+    sec.className = "pane dock";
+    sec.id = "pane-dock";
+    const h2 = document.createElement("h2");
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "pane-head";
+    head.setAttribute("aria-controls", "pane-dock");
+    const label = document.createElement("span");
+    label.className = "label";
+    const count = document.createElement("span");
+    count.className = "count";
+    head.append(label, " ", count);
+    h2.append(head);
+    sec.append(h2);
+    const side = document.getElementById("side");
+    side.insertBefore(sec, side.querySelector(".pane.jobs"));
+  }
+  if (host.parentElement !== sec) sec.append(host);
+  // An open docked pane keeps the column wide under `side none` (style.css).
+  if (state.dockCollapsed) {
+    sec.dataset.collapsed = "";
+    delete app?.dataset.dockOpen;
+  } else {
+    delete sec.dataset.collapsed;
+    if (app) app.dataset.dockOpen = "";
+  }
+  sec.querySelector(".pane-head").setAttribute("aria-expanded", String(!state.dockCollapsed));
+  paintDockHead();
+}
+
+// The docked section's header: the shown pane's tab label, capitalised (`Subjects`), and for
+// Subjects the number of subjects the running jobs have, counted before merged groups fold (so
+// it can exceed the table's rows; docs/themes.md says so); the count is empty for the others.
+function paintDockHead() {
+  const head = document.querySelector("#pane-dock .pane-head");
+  const pane = state.panes ? state.panes.current() : null;
+  if (!head || !pane) return;
+  const tab = document.querySelector(`#panes .pane-tab[data-pane="${CSS.escape(pane)}"]`);
+  const text = (tab ? tab.textContent : pane).trim();
+  const label = text.charAt(0).toUpperCase() + text.slice(1);
+  const labelEl = head.querySelector(".label");
+  if (labelEl.textContent !== label) labelEl.textContent = label;
+  let count = "";
+  if (pane === "subjects" && state.subjects && state.subjectsPane) {
+    const n = state.subjectsPane
+      .subjectJobs()
+      .reduce((sum, j) => sum + state.subjects.size(j.id), 0);
+    count = String(n);
+  }
+  const countEl = head.querySelector(".count");
+  if (countEl.textContent !== count) countEl.textContent = count;
 }
 
 // The shown source's last `source_list` record (null when unknown).
@@ -1358,6 +1571,7 @@ function logout(api) {
   state.ov = null;
   state.map = null;
   state.panes = null;
+  applyDock(); // #pane back in #main, the docked section gone
   state.explore = null;
   state.bits = null;
   state.subjectsPane = null;
@@ -1559,6 +1773,19 @@ window.zetaTest = {
   themeIds() {
     return themeIds();
   },
+  // The map's tile layer in force (map.js tileLayer: {id, url, attribution}), or null before
+  // the map is made.
+  tileLayer() {
+    return state.map ? state.map.tileLayer() : null;
+  },
+  // Lights `answer` (an origin answer) under the one-shot `key` (`band:…`).
+  lightOrigin(key, answer) {
+    state.map?.origin(key, answer);
+  },
+  // The keys of the map's lit sets (map.js litKeys: job ids and one-shot keys).
+  litKeys() {
+    return state.map ? state.map.litKeys() : [];
+  },
   // The home in force (view.js homeOf: view `home`, else the station read at load), or null.
   home() {
     return state.view ? homeOf(state.view) : null;
@@ -1637,6 +1864,10 @@ window.zetaTest = {
     if (!c) return null;
     return { scanJobId: c.scanJobId, followed: c.followed, source: c.source, rows: c.rows };
   },
+  // The shown source's id (state.selected; unchanged while the Map tab is selected).
+  shown() {
+    return state.selected ?? null;
+  },
   // The waterfall: {sourceId, jobId, painted, badge, coarsePainted, coarseMasked, easing, view
   // (the band shown, {lo, hi} or null), band (the capture)}, or null without one.
   wf() {
@@ -1680,12 +1911,6 @@ function boot() {
     else root.dataset.drawer = "open";
   });
   $("#listen-all").addEventListener("click", () => listen(null, { toggle: true }));
-  $("#map-toggle").addEventListener("click", () => {
-    const root = document.documentElement;
-    if (root.dataset.pane === "map") delete root.dataset.pane;
-    else root.dataset.pane = "map";
-    applyMapPane();
-  });
   $("#login-form").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const secret = $("#secret").value;

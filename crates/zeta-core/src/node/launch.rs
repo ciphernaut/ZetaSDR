@@ -17,6 +17,7 @@ use super::{Inner, JobEntry, LogFile, NodeError, ring_seconds_for, source_fault_
 use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
+use crate::modes::Identity;
 use crate::ops::{
     JobKind, SPECTRUM_ROWS_PER_S, ScanGrid, local_hardware, scan_edge_mask_in_force, scan_grid,
     scan_mask_default, scan_notch_in_force, spectrum_size,
@@ -219,7 +220,7 @@ impl Inner {
         });
         let ctx = StageContext {
             bank,
-            mode,
+            mode: mode.clone(),
             dc_hz,
             band,
             station: self.station.lock().unwrap().clone(),
@@ -245,6 +246,12 @@ impl Inner {
         // A `bits` or `graph` job's or a mode row's job's record for its watch (proposals,
         // the row's first proof: see `super::propose::watch_for_proposals`).
         let proposer = super::propose::watches(self, &rec).then(|| rec.clone());
+        // A job whose mode row declares `subject.identity`: its record and the identity,
+        // for its identity tees (see `tee_identity`).
+        let identity = mode
+            .as_ref()
+            .and_then(|m| m.subject.as_ref()?.identity.clone())
+            .map(|i| (rec.clone(), i));
         // A `watch`'s controller runs beside its stages (see `super::watch`).
         let watch =
             (rec.kind == JobKind::Watch.name()).then(|| (watch::Seed::of(&rec), rec.tuning));
@@ -334,6 +341,9 @@ impl Inner {
                     &job_outputs[first_output..],
                     &token,
                 ));
+            }
+            if let Some((rec, id)) = &identity {
+                self.tee_identity(rec, id, &job_outputs[before..], &token);
             }
             let ids: Vec<StreamId> = outputs.into_iter().map(|(_, s)| s).collect();
             let own = ids.clone();
@@ -464,6 +474,62 @@ impl Inner {
                             Err(RecvError::Closed) => return,
                         },
                     }
+                }
+            });
+        }
+    }
+
+    /// Match the decoded identities of `rec`'s `Event` outputs among `outputs` against the
+    /// job's kept origins (design 4.6), one task per output, each subscribed before this
+    /// returns. An event whose `identity.field` holds a non-blank string
+    /// ([`super::origin::identity_value`]) is handed to [`Inner::confirm_origin`], which
+    /// confirms the kept origins it matches; a mismatch, or a value that already confirmed
+    /// every origin it matches in the context kept now, changes nothing (so a repeat
+    /// publishes nothing, and a fresh lookup is confirmed again). The job's own `origin` events are passed over. A tee ends when its
+    /// stream is unregistered at the job's end or on `token`; it never ends the job, and a
+    /// lag only skips events.
+    pub(super) fn tee_identity(
+        self: &Arc<Self>,
+        rec: &JobRecord,
+        identity: &Identity,
+        outputs: &[(StreamKind, StreamId)],
+        token: &CancellationToken,
+    ) {
+        for (_, sid) in outputs.iter().filter(|(k, _)| *k == StreamKind::Event) {
+            let Some(mut rx) = self.bus.subscribe(sid) else {
+                continue;
+            };
+            let (id, source, token) = (rec.id.clone(), rec.source.clone(), token.clone());
+            let identity = identity.clone();
+            // Weak: a tee never keeps the node alive.
+            let inner = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    let frame = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return,
+                        r = rx.recv() => match r {
+                            Ok(frame) => frame,
+                            Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Closed) => return,
+                        },
+                    };
+                    let Payload::Event(v) = &frame.payload else {
+                        continue;
+                    };
+                    if v.get("protocol").and_then(|p| p.as_str()) == Some("origin") {
+                        continue;
+                    }
+                    let Some(value) = v
+                        .get(&identity.field)
+                        .and_then(|f| super::origin::identity_value(&identity, f))
+                    else {
+                        continue;
+                    };
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    inner.confirm_origin(&id, &source, &identity.field, &value);
                 }
             });
         }

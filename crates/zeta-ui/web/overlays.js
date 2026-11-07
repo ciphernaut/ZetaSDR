@@ -110,6 +110,10 @@
 //                            arrives before it, and what the lookup learns is applied at
 //                            once by a second sync. A positioned job whose source becomes
 //                            the selected one is left to the feed.
+//     ov.follows(jobId) -> bool  whether the job's events reach ov.onEvent: a running job on
+//                            the selected source (the feed), or a positioned job on another
+//                            source subscribed here; false for any other (a `bits` job on
+//                            source `node`, a plain job on another source)
 //     ov.watching(jobId) -> bool  false for a positioned job on another source over
 //                            MAX_POSITIONED, so its events are not seen (the Subjects pane
 //                            says so); true for every job on the selected source
@@ -124,6 +128,8 @@
 //           re-render keeps it through agent.js); the seed (above) reads the latched
 //           `squelch` event of the job's `job_context` unless a live one came first (the
 //           gate changes rarely, so a page that came late would otherwise miss it);
+//         - `protocol: origin` (the node's origin answer for the job): never drawn, not
+//           counted, not ov.lastEvent (ov.onEvent hands it to the map and the transcript);
 //         - every other event bumps the job row's counter;
 //         - `label` and `center_hz` (measure): ov.label(center_hz, label, job.id), replacing
 //           that job's previous label;
@@ -679,6 +685,10 @@ class Overlays {
     return !this.overCap.has(jobId);
   }
 
+  follows(jobId) {
+    return this.activity(jobId).watched || this.positioned.has(jobId);
+  }
+
   // The running jobs on the other sources whose mode row carries a `position` or a `subject`,
   // newest first, up to MAX_POSITIONED: subscribed for ov.onEvent alone.
   syncPositioned(jobs) {
@@ -852,6 +862,9 @@ class Overlays {
     if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) return; // spectrum rows
     for (const fn of this.eventFns) fn(job, p);
     if (positionOnly) return; // another source's job: the map's alone
+    // The node's annotation of the job (plan 32 ruling N), not a decode: the map and the
+    // transcript have it (ov.onEvent); no ribbon, no count, not the job's activity.
+    if (obj && p.protocol === "origin") return;
     if (obj && p.protocol === "squelch") {
       // Only a demodulator job's own squelch tags its row (never, say, a decoder's demod).
       if (SQUELCH_KINDS.includes(job.kind)) {

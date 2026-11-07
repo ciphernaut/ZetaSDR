@@ -5,8 +5,8 @@ use std::path::Path;
 
 use zeta_core::graph::NodeId;
 use zeta_core::modes::{
-    Container, Decoder, Family, InputStream, ModeRegistry, ModeState, SubjectWaterfall, parse,
-    template, validate,
+    Container, Decoder, Family, Identity, InputStream, ModeRegistry, ModeState, SubjectWaterfall,
+    parse, template, validate,
 };
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpError, OpResult};
@@ -701,4 +701,66 @@ fn the_aircraft_link_rows_are_pinned() {
         fields["gs_id"],
         serde_json::json!(["/hfdl/spdu/src/id", "/hfdl/lpdu/hfnpdu/gs/id"])
     );
+}
+
+/// Only `aprs_decode` declares how its subject matches the register (design 4.6): its
+/// `src`, against the `callsign`, the AX.25 SSID stripped.
+#[test]
+fn aprs_has_an_identity_and_the_other_builtins_none() {
+    let reg = ModeRegistry::load(&stages(), None);
+    for m in reg.all() {
+        let identity = m.row.subject.as_ref().and_then(|s| s.identity.clone());
+        if m.row.id.0 == "aprs_decode" {
+            assert_eq!(
+                identity,
+                Some(Identity {
+                    field: "src".into(),
+                    register: "callsign".into(),
+                    strip: Some("ssid".into()),
+                })
+            );
+        } else {
+            assert_eq!(identity, None, "{}", m.row.id.0);
+        }
+    }
+}
+
+/// An identity naming a field the event schema lacks, a register field other than
+/// `callsign`, or a strip other than `ssid` loads broken, the reason naming the field.
+#[test]
+fn a_bad_identity_is_broken_naming_the_field() {
+    let (_, text) = ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("aprs_decode.json"))
+        .expect("embedded aprs_decode");
+    let stages = stages();
+    let cases = [
+        ("field", serde_json::json!("nope"), "subject.identity.field"),
+        (
+            "register",
+            serde_json::json!("mmsi"),
+            "subject.identity.register",
+        ),
+        (
+            "strip",
+            serde_json::json!("prefix"),
+            "subject.identity.strip",
+        ),
+    ];
+    for (key, value, field) in cases {
+        let mut v: serde_json::Value = serde_json::from_str(text).unwrap();
+        v["subject"]["identity"][key] = value;
+        let row = parse(&v.to_string()).unwrap();
+        let e = validate(&row, &stages).expect_err(field);
+        assert_eq!(e.field, field, "{e}");
+    }
+    // `strip` may be null or left out.
+    let mut v: serde_json::Value = serde_json::from_str(text).unwrap();
+    v["subject"]["identity"]["strip"] = serde_json::Value::Null;
+    validate(&parse(&v.to_string()).unwrap(), &stages).unwrap();
+    v["subject"]["identity"]
+        .as_object_mut()
+        .unwrap()
+        .remove("strip");
+    validate(&parse(&v.to_string()).unwrap(), &stages).unwrap();
 }

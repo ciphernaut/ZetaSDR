@@ -1,6 +1,6 @@
 //! The end of a `capture` job (design 5.5). A hand-started capture runs the quick
 //! classifiers over its first window and records the result under
-//! `job_context.capture.classified` (`{labels, tried, allocations}`, or `{error}`); a
+//! `job_context.capture.classified` (`{labels, tried, allocations, origins}`, or `{error}`); a
 //! watch's capture child inherits the watch's `unknown` verdict instead and is reported
 //! to its watch, which publishes `captured`. Either, when it ended on its own with a
 //! window written, may propose a features-only signature (see
@@ -11,7 +11,6 @@ use std::sync::Arc;
 use super::Inner;
 use super::propose::capture_ended;
 use crate::job::JobRecord;
-use crate::ops::classify_capture;
 
 /// Called by the launch's supervisor when the `capture` job `rec` (as it stands, its
 /// context included) has ended, before its end is recorded: `failed` is the reason of a
@@ -51,8 +50,7 @@ pub(super) async fn capture_finished(
     let Some(window) = inner.bursts.get(first) else {
         return;
     };
-    let set = inner.classifiers.read().unwrap().clone();
-    let classified = classify_capture(&set, &window).await;
+    let classified = inner.classify_capture_scored(&window).await;
     capture["classified"] = match &classified {
         Ok(c) => serde_json::to_value(c).unwrap_or_default(),
         Err(e) => serde_json::json!({"error": e}),

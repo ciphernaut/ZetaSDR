@@ -487,7 +487,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 41, "one schema per Op variant");
+    assert_eq!(vs.len(), 42, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -833,14 +833,19 @@ async fn classify_op_runs_stub_and_returns_empty_labels() {
     node.add_classifier(Arc::new(StubClassifier));
     src.start();
     let selection = selection(&node, 100_000_000, 48_000).await;
-    assert_eq!(
-        node.apply(Op::Classify { selection }).await,
-        Ok(OpResult::Classification {
-            labels: vec![],
-            tried: vec![],
-            allocations: vec![],
-        })
-    );
+    let Ok(OpResult::Classification {
+        labels,
+        tried,
+        allocations,
+        origins,
+    }) = node.apply(Op::Classify { selection }).await
+    else {
+        panic!("expected Classification");
+    };
+    assert!(labels.is_empty() && tried.is_empty() && allocations.is_empty());
+    // Every classify scores its origins; with no register there are none to light.
+    let origins = origins.expect("origins");
+    assert!(origins.origins.is_empty() && origins.register_rows.is_none());
 }
 
 /// A licence register's answer: one transmitter, 16K0F1D, and one plan row.
@@ -918,6 +923,10 @@ async fn classify_lists_allocations_beside_the_labels() {
     }))
     .unwrap();
     assert!(matches!(old, OpResult::Classification { allocations, .. } if allocations.is_empty()));
+    // A stored `Classification` without `origins` loads with `None`.
+    let stored: zeta_core::classify::Classification =
+        serde_json::from_value(serde_json::json!({"labels": [], "tried": []})).unwrap();
+    assert!(stored.origins.is_none());
 }
 
 #[tokio::test]

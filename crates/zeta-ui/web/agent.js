@@ -81,6 +81,8 @@
 //       label only, run() decides from the mix's graph at the click. A running row whose
 //       job's `context.slicer.stream` exists (a `bits` or `graph` job with a slicer) has a
 //       `button.bits` (Bits) calling onBits(job) (app.js: the Bits pane on that job).
+//       `button.origins` (Origins, a running job with a band: not mix, spectrum or scan) calling
+//       onOrigins(job) (app.js: origin_lookup by the job).
 //       onJobs(jobs) is called with the whole list after each render; redraw() renders the
 //       last list again (after the playing state changed).
 //       Each render writes the running rows' count into countEl (the Jobs header's `.count`).
@@ -445,10 +447,13 @@ export function setSquelchTag(row, event) {
   tag.title = title;
 }
 
+// Job kinds with no band of their own: `origin_lookup` refuses them.
+const NO_BAND_KINDS = ["mix", "spectrum", "scan"];
+
 function jobRow(
   job,
   onStop,
-  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits },
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins },
 ) {
   const row = document.createElement("div");
   const attached = !!job.input;
@@ -581,6 +586,14 @@ function jobRow(
     b.onclick = () => onBits(job);
     actions.append(b);
   }
+  if (onOrigins && status === "running" && job.tuning && !NO_BAND_KINDS.includes(job.kind)) {
+    const b = document.createElement("button");
+    b.className = "origins";
+    b.textContent = "Origins";
+    b.title = `origin_lookup ${job.id}`;
+    b.onclick = () => onOrigins(job);
+    actions.append(b);
+  }
   if (onGraph) actions.append(graphButton(job, onGraph));
   actions.append(stopButton(job, onStop));
   row.append(actions);
@@ -691,6 +704,7 @@ export function startJobs(
     mixText = null,
     mute = null,
     onBits = null,
+    onOrigins = null,
     countEl = null,
     lastEvent = null,
     activity = null,
@@ -732,6 +746,7 @@ export function startJobs(
     mixText,
     mute,
     onBits,
+    onOrigins,
   };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;

@@ -15,6 +15,8 @@ pub const VIEW_SET: &str = "view_set";
 pub const VIEW_KEYS: &[&str] = &[
     "theme",
     "side",
+    "dock",
+    "main",
     "map",
     "pane",
     "subjects",
@@ -23,6 +25,8 @@ pub const VIEW_KEYS: &[&str] = &[
     "subject_drop_s",
     "plan",
     "follow",
+    "origin_fade_s",
+    "map_tiles",
 ];
 
 /// What a run with page tools knows about the page it serves.

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::emission::Emission;
 use crate::reach::Reach;
+use crate::station::Station;
 use crate::types::{Baud, Hz};
 
 /// A band plan entry: what a region allocates `[min_hz, max_hz]` to, or (from a
@@ -63,6 +64,10 @@ pub struct Allocation {
     #[serde(default)]
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     pub licence_no: Option<String>,
+    /// The assignment's callsign, when the register holds one.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub callsign: Option<String>,
     /// `tx` or `rx`.
     #[serde(default)]
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
@@ -145,12 +150,41 @@ pub struct Signature {
 #[async_trait]
 pub trait KnowledgeProvider: Send + Sync {
     fn name(&self) -> &str;
+    /// Whether this provider lists licensed assignments (`kind` `assignment`): a
+    /// licence register, which the origin query tells apart from band plans (an empty
+    /// answer from one is "the register gave no rows", not "no register").
+    fn gives_assignments(&self) -> bool {
+        false
+    }
     async fn allocations(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Allocation>;
     async fn signatures(&self, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Signature>;
     /// How far from the station this provider searched for the band, when it
     /// applies a reach.
     async fn reach(&self, _region: &str, _center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
         None
+    }
+    /// [`allocations`](Self::allocations) as seen from `from` instead of the node's
+    /// station: a provider that measures distance or cuts by reach does both from
+    /// `from`, and from nowhere when it is `None`. A static provider ignores it.
+    async fn allocations_from(
+        &self,
+        region: &str,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+        _from: Option<&Station>,
+    ) -> Vec<Allocation> {
+        self.allocations(region, center_hz, bandwidth_hz).await
+    }
+    /// [`reach`](Self::reach) from `from` instead of the node's station; `None`
+    /// without one.
+    async fn reach_from(
+        &self,
+        region: &str,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+        _from: Option<&Station>,
+    ) -> Option<Reach> {
+        self.reach(region, center_hz, bandwidth_hz).await
     }
 }
 
@@ -240,6 +274,13 @@ impl KnowledgeProvider for StaticKnowledge {
         "static"
     }
 
+    /// When its allocations file holds an assignment row.
+    fn gives_assignments(&self) -> bool {
+        self.allocations
+            .iter()
+            .any(|a| a.kind.as_deref() == Some("assignment"))
+    }
+
     async fn allocations(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Allocation> {
         self.allocations
             .iter()
@@ -287,6 +328,77 @@ mod tests {
         async fn signatures(&self, _: Hz, _: Hz) -> Vec<Signature> {
             Vec::new()
         }
+    }
+
+    #[test]
+    fn allocation_without_callsign_loads_and_writes_null() {
+        // An allocation as an older node or capture record wrote it: no `callsign`.
+        let old = r#"{"provider":"acma","region":"AU","min_hz":1,"max_hz":2,
+            "service":"assignment","note":null,"licence_no":"0000001"}"#;
+        let a: Allocation = serde_json::from_str(old).unwrap();
+        assert_eq!(a.callsign, None);
+        assert_eq!(a.licence_no.as_deref(), Some("0000001"));
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["callsign"], serde_json::Value::Null);
+        assert!(v.as_object().unwrap().contains_key("callsign"));
+        let schema = serde_json::to_value(schemars::schema_for!(Allocation)).unwrap();
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|r| r == "callsign"), "{required:?}");
+        let with = Allocation {
+            callsign: Some("XX4EX".into()),
+            ..Allocation::default()
+        };
+        let back: Allocation =
+            serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back.callsign.as_deref(), Some("XX4EX"));
+    }
+
+    /// Answers `rows` and counts the calls to `allocations` and `reach`.
+    struct Recording {
+        rows: Vec<Allocation>,
+        calls: std::sync::atomic::AtomicUsize,
+        reaches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl KnowledgeProvider for Recording {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        async fn allocations(&self, _: &str, _: Hz, _: Hz) -> Vec<Allocation> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.rows.clone()
+        }
+        async fn signatures(&self, _: Hz, _: Hz) -> Vec<Signature> {
+            Vec::new()
+        }
+        async fn reach(&self, _: &str, _: Hz, _: Hz) -> Option<Reach> {
+            self.reaches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn default_allocations_from_calls_allocations() {
+        let p = Recording {
+            rows: vec![row(Some("assignment"), "a1", Some(1.0))],
+            calls: Default::default(),
+            reaches: Default::default(),
+        };
+        let station = crate::station::Station {
+            lat: -27.3842,
+            lon: 153.1175,
+            alt_m: 4.0,
+            region: "AU".into(),
+            antennas: crate::station::Station::default_antennas(4.0),
+        };
+        let from = p.allocations_from("AU", Hz(1), Hz(1), Some(&station)).await;
+        assert_eq!(from, p.allocations("AU", Hz(1), Hz(1)).await);
+        assert_eq!(p.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(p.allocations_from("AU", Hz(1), Hz(1), None).await.len(), 1);
+        assert_eq!(p.reach_from("AU", Hz(1), Hz(1), Some(&station)).await, None);
+        assert_eq!(p.reaches.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn row(kind: Option<&str>, service: &str, distance_km: Option<f64>) -> Allocation {

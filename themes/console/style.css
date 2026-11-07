@@ -80,7 +80,7 @@
 .src-tab[aria-selected="true"] .name { color: #000; }
 .src-tab.fault { background: var(--error); }
 .src-tab[aria-selected="true"] { flex: 1; }
-.src-tab:not([aria-selected="true"]) { opacity: 0.8; }
+.src-tab:not([aria-selected="true"]):not(.kept) { opacity: 0.8; }
 .src-tab .tag.pin { border-color: #000; color: #000; }
 .src-tab[aria-selected="true"] .health {
   display: inline-flex;
@@ -92,7 +92,6 @@
 .health .v { margin-inline-end: 8px; }
 /* Action bars, the last one end-capped. */
 .pane-tab,
-#map-toggle,
 #listen-all,
 #drawer-toggle {
   background: var(--c-action);
@@ -102,12 +101,11 @@
   text-transform: uppercase;   /* bar caption */
 }
 .pane-tab[aria-selected="true"],
-#map-toggle[aria-pressed="true"],
 #listen-all[aria-pressed="true"] {
   background: var(--c-speaking);
   color: #000;
 }
-/* The last visible bar: Listen to all on wide (the map and drawer toggles are hidden there),
+/* The last visible bar: Listen to all on wide (the drawer toggle is hidden there),
    the drawer toggle on narrow. The command bar's mic takes its end cap with its own rule
    below. */
 #listen-all,

@@ -50,7 +50,36 @@ pub struct Layout {
     pub rail: bool,
     /// The transcript ribbons' lean in degrees, -30..=30.
     pub ribbon_tilt_deg: i32,
+    /// Where the pane host docks while the view's `dock` is `auto`: under the main view or in
+    /// the side column. Optional; `bottom` when absent (served as `null`).
+    #[serde(default)]
+    pub dock: Option<Dock>,
+    /// The map's tile provider while the view's `map_tiles` is `auto`, one of [`MAP_TILES`].
+    /// Optional; absent (served as `null`), the page picks by `color_scheme`: CARTO Dark
+    /// Matter for a dark theme, OpenStreetMap for a light one.
+    #[serde(default)]
+    pub map_tiles: Option<String>,
 }
+
+/// `layout.dock`: the pane host under the main view or in the side column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dock {
+    Bottom,
+    Right,
+}
+
+/// The words `layout.dock` takes.
+const DOCKS: [&str; 2] = ["bottom", "right"];
+
+/// The ids `layout.map_tiles` takes: the page's tile providers (map.js TILE_PROVIDERS).
+pub const MAP_TILES: [&str; 5] = [
+    "osm",
+    "carto-light",
+    "carto-dark",
+    "opentopo",
+    "esri-imagery",
+];
 
 /// A font file in the theme's folder, declared as an `@font-face` under the theme.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -118,6 +147,23 @@ pub fn parse(text: &str) -> Result<ThemeJson, ThemeError> {
     check::<String>("name", field("name"))?;
     check::<String>("description", field("description"))?;
     check::<ColorScheme>("color_scheme", field("color_scheme"))?;
+    // `layout.dock` named on its own: a wrong word would otherwise be refused as `layout`.
+    if let Some(dock) = field("layout").get("dock").filter(|d| !d.is_null())
+        && !dock.as_str().is_some_and(|d| DOCKS.contains(&d))
+    {
+        return Err(ThemeError::new(
+            "layout.dock",
+            format!("{dock} is not one of {}", DOCKS.join(", ")),
+        ));
+    }
+    if let Some(tiles) = field("layout").get("map_tiles").filter(|t| !t.is_null())
+        && !tiles.as_str().is_some_and(|t| MAP_TILES.contains(&t))
+    {
+        return Err(ThemeError::new(
+            "layout.map_tiles",
+            format!("{tiles} is not one of {}", MAP_TILES.join(", ")),
+        ));
+    }
     check::<Layout>("layout", field("layout"))?;
     check::<BTreeMap<String, String>>("tokens", field("tokens"))?;
     check::<Vec<(f64, [u8; 3])>>("ramp", field("ramp"))?;
@@ -330,6 +376,48 @@ mod tests {
     fn a_ribbon_tilt_out_of_range_is_refused() {
         let e = refused(&edited(|v| v["layout"]["ribbon_tilt_deg"] = 31.into()));
         assert_eq!(e.field, "layout.ribbon_tilt_deg", "{e}");
+    }
+
+    #[test]
+    fn layout_dock_parses_bottom_right_and_is_none_when_absent() {
+        assert_eq!(load(FIXTURE).unwrap().layout.dock, None);
+        let t = load(&edited(|v| v["layout"]["dock"] = "bottom".into())).unwrap();
+        assert_eq!(t.layout.dock, Some(Dock::Bottom));
+        let t = load(&edited(|v| v["layout"]["dock"] = "right".into())).unwrap();
+        assert_eq!(t.layout.dock, Some(Dock::Right));
+        let served = serde_json::to_value(&t.layout).unwrap();
+        assert_eq!(served["dock"], "right", "{served}");
+    }
+
+    #[test]
+    fn layout_dock_left_is_refused_naming_the_field() {
+        let e = refused(&edited(|v| v["layout"]["dock"] = "left".into()));
+        assert_eq!(e.field, "layout.dock", "{e}");
+        let e = refused(&edited(|v| v["layout"]["dock"] = 1.into()));
+        assert_eq!(e.field, "layout.dock", "{e}");
+    }
+
+    #[test]
+    fn layout_map_tiles_parses_a_provider_id_and_is_none_when_absent() {
+        assert_eq!(load(FIXTURE).unwrap().layout.map_tiles, None);
+        for id in MAP_TILES {
+            let t = load(&edited(|v| v["layout"]["map_tiles"] = id.into())).unwrap();
+            assert_eq!(t.layout.map_tiles.as_deref(), Some(id));
+        }
+        let t = load(&edited(|v| v["layout"]["map_tiles"] = "carto-dark".into())).unwrap();
+        let served = serde_json::to_value(&t.layout).unwrap();
+        assert_eq!(served["map_tiles"], "carto-dark", "{served}");
+    }
+
+    #[test]
+    fn layout_map_tiles_not_a_provider_is_refused_naming_the_field() {
+        let e = refused(&edited(|v| v["layout"]["map_tiles"] = "google".into()));
+        assert_eq!(e.field, "layout.map_tiles", "{e}");
+        assert!(e.error.contains("carto-dark"), "{e}");
+        let e = refused(&edited(|v| v["layout"]["map_tiles"] = "auto".into()));
+        assert_eq!(e.field, "layout.map_tiles", "{e}");
+        let e = refused(&edited(|v| v["layout"]["map_tiles"] = 1.into()));
+        assert_eq!(e.field, "layout.map_tiles", "{e}");
     }
 
     #[test]

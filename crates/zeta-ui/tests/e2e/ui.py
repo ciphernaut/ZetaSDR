@@ -59,6 +59,16 @@ def http_json(url, secret, path, body=None):
         return json.loads(resp.read())
 
 
+# The demo station, Brisbane Airport: ui.rs `station_set`s the node to it at start, and a
+# scenario that clears or moves the station puts it back.
+DEMO_STATION = {"lat": -27.3842, "lon": 153.1175, "alt_m": 4.0}
+
+
+def set_demo_station(url, secret):
+    http_json(url, secret, "/op", {"op": "station_set", **DEMO_STATION, "region": "AU",
+                                   "antennas": None})
+
+
 def login(page, url, secret):
     page.goto(url + "/ui/")
     expect(page.locator("#login")).to_be_visible()
@@ -1585,8 +1595,8 @@ def scenario_theme_switch_live(page, url, secret):
 
 
 # The selectors docs/themes.md promises a theme may target (spec 5). Each must match on a page
-# with a running demodulator, a ribbon, a collapsed pane, the map and the graph view open, and
-# each must appear verbatim in the docs.
+# with a running demodulator, a ribbon, a collapsed pane, a pane docked right, the map and the
+# graph view open, and each must appear verbatim in the docs.
 THEME_HOOKS = [
     "#top", ".brand", ".src-tab", '.src-tab[aria-selected="true"]', "#rail", ".wf-axis",
     "#waterfall", ".wf-canvas", "#side", "section.pane", ".pane-head",
@@ -1595,6 +1605,8 @@ THEME_HOOKS = [
     ".job-tag", ".job-tag .kind", ".job-tag .channel", ".job-tag .centre", ".ov-ribbon",
     ".outline", ".graph-node.selected", ".job-tag.hot", ".job-tag.speaking",
     ".job-tag .dot.closed", "html[data-theme]", "html[data-rail]", "html[data-footprint]",
+    ".map-tab", "html[data-main]", "html[data-dock]", "section.pane.dock",
+    "html[data-map-tiles]", "#map .map-tile-note",
 ]
 
 
@@ -1614,8 +1626,11 @@ def scenario_theme_hooks(page, url, secret):
         demod = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500, deviation_hz=5000)
         row = job_row(page, demod)
         page.evaluate("window.zetaTest.ribbon('hooks')")
-        run_cmd(page, "view set map on")
+        run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
+        run_cmd(page, "view set dock right")
+        run_cmd(page, "view set pane explore")
+        expect(page.locator("#side section.pane.dock")).to_have_count(1)
         page.click("#pane-transcript .pane-head")
         tag = page.locator(f'#rail .job-tag[data-job="{demod}"]')
         expect(tag.locator(".dot.closed")).to_have_count(1, timeout=5_000)
@@ -1654,11 +1669,13 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, "follow = free")).to_have_text("follow = free")
     shown = view_show(page)
     for text in ("follow free", "zoom_out scan", "auto_scan_stop inside",
-                 "finished_rows_s 60", "scanner auto", "plan auto", "map off", "home none",
-                 "subjects auto", "subject_dim_s 60", "subject_drop_s 300", "pane none",
-                 "theme console", "side both"):
+                 "finished_rows_s 60", "scanner auto", "plan auto", "main rf", "map auto",
+                 "home none",
+                 "subjects auto", "subject_dim_s 60", "subject_drop_s 300",
+                 "origin_fade_s 300", "pane none", "theme console", "side both", "dock auto",
+                 "map_tiles auto"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 13, f"view show: {shown!r}"
+    assert shown.count("\n") == 17, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -1667,7 +1684,7 @@ def scenario_view_set_show_reset(page, url, secret):
     expect(view_line(page, '"-1"', error=True)).to_be_visible()
     run_cmd(page, "view set nosuch 1")
     expect(view_line(page, "nosuch", error=True)).to_contain_text(
-        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner, plan, map, home, "
+        "follow, zoom_out, auto_scan_stop, finished_rows_s, scanner, plan, main, map, home, "
         "subjects, subject_dim_s, subject_drop_s")
     run_cmd(page, "view reset")
     expect(view_line(page, "view policies reset")).to_be_visible()
@@ -4529,9 +4546,13 @@ def scenario_audio_comes_back_from_a_suspended_context(page, url, secret):
 # ---- the map (plan 17 Task 9) -----------------------------------------------------------
 # The node's `fake_pos` mode row (ui.rs) runs zeta-ext's `fake_lines`, which prints two fixes
 # of sonde S1 (-27.40,153.10 then -27.41,153.11) 2 s into the job. The map's tiles come from
-# tile.openstreetmap.org, which every map scenario aborts: the map must still draw.
+# the tile providers' hosts (map.js TILE_PROVIDERS), which every scenario aborts (main routes
+# them for each context, and the map scenarios again): real tiles are never fetched, and the
+# map must still draw.
 
-OSM_TILES = "**/tile.openstreetmap.org/**"
+TILE_HOSTS = re.compile(
+    r"^https://([a-z0-9-]+\.)?(tile\.openstreetmap\.org|basemaps\.cartocdn\.com"
+    r"|tile\.opentopomap\.org|server\.arcgisonline\.com)/")
 
 
 def page_errors(page):
@@ -4543,7 +4564,7 @@ def page_errors(page):
         if m.type != "error":
             return
         where = (m.location or {}).get("url", "")
-        if "tile.openstreetmap.org" in where:
+        if TILE_HOSTS.search(where):
             return
         seen.append(f"{m.text} ({where})")
 
@@ -4562,12 +4583,12 @@ def start_fake_pos(page, url, secret):
 
 
 def scenario_map_marker_draws_without_tiles(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     errors = page_errors(page)
     select_source(page, url, secret, "tone")
     expect(page.locator("#map")).to_be_hidden()
-    run_cmd(page, "view set map on")
-    expect(view_line(page, "map = on")).to_be_visible()
+    run_cmd(page, "view set main map")
+    expect(view_line(page, "main = map")).to_be_visible()
     mp = page.locator("#map")
     expect(mp).to_be_visible()
     expect(mp.locator(".leaflet-control-attribution")).to_contain_text(
@@ -4593,20 +4614,94 @@ def scenario_map_marker_draws_without_tiles(page, url, secret):
         page.evaluate("window.zetaTest.poll()")
         expect(mp.locator(".leaflet-interactive")).to_have_count(0)
         expect(track).to_have_count(0)
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
         expect(mp).to_be_hidden()
         assert not errors, f"console errors: {errors}"
     finally:
         stop_job(url, secret, job)
 
 
+# map.js TILE_PROVIDERS, as the brief tables them: id -> (label, url, attribution).
+TILE_TABLE = {
+    "osm": ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "© OpenStreetMap contributors"),
+    "carto-dark": ("CARTO Dark Matter",
+                   "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+                   "© OpenStreetMap contributors © CARTO"),
+    "opentopo": ("OpenTopoMap", "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+                 "© OpenStreetMap contributors, SRTM | © OpenTopoMap (CC-BY-SA)"),
+}
+
+
+def scenario_map_tiles(page, url, secret):
+    """Plan 32 Task 11b: the tile layer follows the view's `map_tiles` (auto: CARTO Dark Matter
+    under the dark console theme), the layers control sets it, and tiles that fail say so."""
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    mp = page.locator("#map")
+    layer = lambda: page.evaluate("() => window.zetaTest.tileLayer()")  # noqa: E731
+
+    def expect_layer(tid):
+        page.wait_for_function(
+            f"() => window.zetaTest.tileLayer()?.id === {json.dumps(tid)}", timeout=5_000)
+        got = layer()
+        label, turl, attribution = TILE_TABLE[tid]
+        assert got == {"id": tid, "url": turl, "attribution": attribution}, got
+        expect(page.locator("html")).to_have_attribute("data-map-tiles", tid, timeout=2_000)
+        expect(mp.locator(".leaflet-tile-pane > .leaflet-layer")).to_have_count(1, timeout=2_000)
+        # The aborted tiles: a note naming the provider and another one to try.
+        note = mp.locator(".map-tile-note")
+        expect(note).to_be_visible(timeout=5_000)
+        expect(note).to_contain_text(f"map tiles from {label} are not loading; try another "
+                                     "(view set map_tiles ")
+        return note
+
+    try:
+        run_cmd(page, "view set main map")
+        expect(mp).to_be_visible(timeout=5_000)
+        expect_layer("carto-dark")
+        expect(mp.locator(".leaflet-control-attribution")).to_contain_text(
+            "© OpenStreetMap contributors © CARTO")
+        run_cmd(page, "view set map_tiles osm")
+        expect(view_line(page, "map_tiles = osm")).to_be_visible(timeout=2_000)
+        note = expect_layer("osm")
+        assert "view set map_tiles osm)" not in note.text_content(), note.text_content()
+        # The layers control lists the providers by label; choosing one sets the policy.
+        ctl = mp.locator(".leaflet-control-layers")
+        ctl.hover(timeout=2_000)
+        labels = ctl.locator(".leaflet-control-layers-base label")
+        expect(labels).to_have_count(5, timeout=2_000)
+        labels.filter(has_text="OpenTopoMap").click(timeout=2_000)
+        expect_layer("opentopo")
+        shown = view_show(page)
+        assert "map_tiles opentopo" in shown, shown
+        run_cmd(page, "view set map_tiles sideways")
+        expect(view_line(page, "sideways", error=True)).to_contain_text(
+            "auto, osm, carto-light, carto-dark, opentopo, esri-imagery", timeout=2_000)
+        run_cmd(page, "view reset")
+        expect(view_line(page, "view policies reset")).to_be_visible(timeout=2_000)
+        shown = view_show(page)
+        assert "map_tiles auto" in shown, shown
+        run_cmd(page, "view set main map")
+        page.wait_for_function(
+            "() => window.zetaTest.tileLayer()?.id === 'carto-dark'", timeout=5_000)
+        # Ruling M: `auto` under a light theme (vibecoder, color_scheme light) is OpenStreetMap.
+        run_cmd(page, "view set theme vibecoder")
+        expect(page.locator("html")).to_have_attribute("data-map-tiles", "osm", timeout=5_000)
+        page.wait_for_function("() => window.zetaTest.tileLayer()?.id === 'osm'", timeout=5_000)
+        assert not errors, f"console errors: {errors}"
+    finally:
+        run_cmd(page, "view reset")
+
+
 def scenario_map_follows_a_positioned_job_on_another_source(page, url, secret):
     # Spec 7.2: every running positioned job gets a marker, not only the shown source's (the
     # two-radio form: the page shows the watching radio, the decoder runs on the other).
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     errors = page_errors(page)
     select_source(page, url, secret, "aprs")
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     mp = page.locator("#map")
     expect(mp).to_be_visible()
     job = start_fake_pos(page, url, secret)
@@ -4622,15 +4717,115 @@ def scenario_map_follows_a_positioned_job_on_another_source(page, url, secret):
         stop_job(url, secret, job)
         page.evaluate("window.zetaTest.poll()")
         expect(mp.locator(".leaflet-interactive")).to_have_count(0)
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
         assert not errors, f"console errors: {errors}"
     finally:
         stop_job(url, secret, job)
 
 
+def scenario_map_is_a_source_tab(page, url, secret):
+    # Spec 4.4: the Map is a tab of the sources strip; `main map` swaps it for the waterfall in
+    # #main and keeps the shown source (its job and axis), `map on|off` is its alias.
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    select_source(page, url, secret, "tone")
+    page.set_viewport_size(WIDE)
+    main_is = "() => document.documentElement.dataset.main === '%s'"
+    try:
+        tab = page.locator("#tabs .src-tab.map-tab")
+        expect(tab).to_have_count(1)
+        expect(page.locator("#map-toggle")).to_have_count(0)
+        # The waterfall settled first: its spectrum job painting, the axis drawn.
+        page.wait_for_function(
+            """() => {
+              const wf = window.zetaTest.wf();
+              const t = document.querySelectorAll('#waterfall .wf-axis .tick');
+              return !!wf && !!wf.jobId && wf.painted > 0 && t.length === 5;
+            }""", timeout=10_000)
+        before = ticks(page)
+        job0 = page.evaluate("() => window.zetaTest.wf().jobId")
+        tab.click()
+        page.wait_for_function(main_is % "map", timeout=5_000)
+        expect(page.locator("#map")).to_be_visible()
+        expect(page.locator("#waterfall")).to_be_hidden()
+        shown_id = page.evaluate("() => window.zetaTest.shown()")
+        assert shown_id == "tone", shown_id
+        expect(tab).to_have_attribute("aria-selected", "true")
+        tone = page.locator('#tabs .src-tab[data-id="tone"]')
+        expect(tone).to_have_class(re.compile(r"\bkept\b"))
+        expect(tone).to_have_attribute("aria-selected", "false")
+        shown = view_show(page)
+        assert "main map" in shown and "map auto" in shown, shown
+        # A jobs poll and the source_list after it (another source's jobs gone, syncTabs run)
+        # keep the tab and the map shown.
+        stop_spectrum_jobs(url, secret, "retune")
+        with page.expect_response(
+                lambda r: is_op("source_list")(r.request), timeout=10_000) as resp:
+            page.evaluate("() => window.zetaTest.poll()")
+        resp.value.finished()
+        page.evaluate("() => new Promise((r) => requestAnimationFrame(() => r()))")
+        expect(tab).to_have_count(1)
+        expect(tab).to_have_attribute("aria-selected", "true")
+        expect(tone).to_have_class(re.compile(r"\bkept\b"))
+        main = page.evaluate("() => document.documentElement.dataset.main")
+        assert main == "map", f"after a source_list: main {main}"
+        assert "main map" in view_show(page)
+        tone.click()
+        page.wait_for_function(main_is % "rf", timeout=5_000)
+        expect(tone).not_to_have_class(re.compile(r"\bkept\b"))
+        after = ticks(page)
+        assert after == before, f"ticks {before} then {after}"
+        job1 = page.evaluate("() => window.zetaTest.wf().jobId")
+        assert job1 == job0, f"spectrum job {job0} then {job1}"
+        run_cmd(page, "view set map on")
+        page.wait_for_function(main_is % "map", timeout=5_000)
+        run_cmd(page, "view set map off")
+        page.wait_for_function(main_is % "rf", timeout=5_000)
+        # The box menu goes with the waterfall (as a source switch drops it). Switched from
+        # the command line: a click on the Map tab would close it as any press outside does.
+        page.wait_for_function("() => window.zetaTest.wf().painted > 40", timeout=10_000)
+        menu = drag_menu(page)
+        run_cmd(page, "view set main map")
+        page.wait_for_function(main_is % "map", timeout=5_000)
+        expect(menu).to_be_hidden()
+        run_cmd(page, "view set main rf")
+        page.wait_for_function(main_is % "rf", timeout=5_000)
+        # A stored `map on` from before `main` still shows the map after a reload.
+        page.evaluate("() => sessionStorage.setItem('zeta.view', JSON.stringify({map: 'on'}))")
+        page.reload()
+        page.wait_for_function(main_is % "map", timeout=10_000)
+        expect(page.locator("#map")).to_be_visible()
+        run_cmd(page, "view reset")
+        page.wait_for_function(main_is % "rf", timeout=5_000)
+        page.set_viewport_size(NARROW)
+        tab.click()
+        page.wait_for_function(main_is % "map", timeout=5_000)
+        expect(page.locator("#map")).to_be_visible()
+        # A logout with the map shown leaves no map box over the login.
+        page.evaluate("() => { window.zetaTest.setSecret('wrong'); window.zetaTest.poll(); }")
+        expect(page.locator("#login")).to_be_visible()
+        page.wait_for_function(
+            "() => getComputedStyle(document.getElementById('map')).display === 'none'",
+            timeout=5_000)
+        page.fill("#secret", secret)
+        page.click("#connect")
+        expect(page.locator("#login")).to_be_hidden()
+    finally:
+        run_cmd(page, "view reset")
+        page.set_viewport_size(WIDE)
+
+
 def scenario_home_gives_distance_and_bearing(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     errors = page_errors(page)
+    # No station, so `home none` leaves the row without a distance (the page reads it at load).
+    http_json(url, secret, "/op", {"op": "station_clear"})
+    try:
+        home_gives_distance_and_bearing(page, url, secret, errors)
+    finally:
+        set_demo_station(url, secret)
+
+
+def home_gives_distance_and_bearing(page, url, secret, errors):
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set home -27.50,153.00")
     expect(view_line(page, "home = -27.5,153")).to_be_visible()
@@ -4655,7 +4850,7 @@ def scenario_home_gives_distance_and_bearing(page, url, secret):
 
 
 def scenario_station_is_the_default_home(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     errors = page_errors(page)
     http_json(url, secret, "/op", {"op": "station_set", "lat": -27.5, "lon": 153.0,
                                    "alt_m": 10.0, "region": "AU", "antennas": None})
@@ -4678,7 +4873,230 @@ def scenario_station_is_the_default_home(page, url, secret):
     finally:
         if job:
             stop_job(url, secret, job)
-        http_json(url, secret, "/op", {"op": "station_clear"})
+        set_demo_station(url, secret)
+
+
+# ---- lit sites (plan 32 Task 9) ---------------------------------------------------------
+# The node's register stub (ui.rs fake_register_rows) answers two transmitters on the tone's
+# band, 16K0F1D at Example Hill 9 km north-west of the demo station and 12K5A3E at Example
+# Ridge 20 km east, and a receiver; the node's station is the demo station.
+
+def lit_sites(page):
+    """The lit sites on the map as (agree, confirmed) pairs."""
+    return page.locator("#map path.map-site").evaluate_all(
+        "els => els.map(e => [e.dataset.agree, e.dataset.confirmed !== undefined])")
+
+
+def hover_site_of(page, licensee):
+    """Hover each lit site until its tooltip names `licensee`; that site's locator."""
+    site = page.locator("#map path.map-site")
+    tip = page.locator("#map .leaflet-tooltip")
+    for i in range(site.count()):
+        site.nth(i).hover()
+        if licensee in (tip.text_content() or ""):
+            return site.nth(i)
+    raise AssertionError(f"no lit site of {licensee}")
+
+
+def origins_of(url, secret, job, source=None, center_hz=None, bandwidth_hz=None):
+    """`origin_lookup` by `job` (or, with `job` None, the band of `source`), measured as FM
+    (the fake_pos row states no modulation): the 16K0F1D row fits, the 12K5A3E row
+    disagrees. The answer."""
+    return http_json(url, secret, "/op", {"op": "origin_lookup", "job": job, "source": source,
+                                          "center_hz": center_hz, "bandwidth_hz": bandwidth_hz,
+                                          "modulation": ["fm"]})["value"]
+
+
+def scenario_origins_light_sites(page, url, secret):
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    select_source(page, url, secret, "tone")
+    page.set_viewport_size(WIDE)
+    # At the tone's centre, the row's own 40 kHz (its `min_hz`; a narrower band is refused).
+    job = start_fake_pos(page, url, secret)
+    other = None
+    badge = page.locator("#tabs .map-tab .count")
+    try:
+        # Lit while the map was never shown (no Leaflet map yet): the badge counts them and
+        # the map draws them on its first show.
+        job_row(page, job).locator("button.origins").click()   # the job form; the page follows the feed
+        expect(badge).to_have_text("2", timeout=10_000)
+        assert page.evaluate("() => window.zetaTest.litKeys()") == [job]
+        # A node annotation, not a decode (ruling N): a transcript line, no ribbon.
+        expect(page.locator("#transcript .line.note", has_text="2 sites on")).to_have_count(1)
+        expect(page.locator("#waterfall .ov-ribbon", has_text="sites on")).to_have_count(0)
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        # The job form reads the job's own modulation (the fake_pos row states none): unknown.
+        agree = sorted(a for a, _ in lit_sites(page))
+        assert agree == ["unknown", "unknown"], agree
+        expect(page.locator("#map path.map-bearing")).to_have_count(2)
+        # Brightness is the score times the freshness, per site.
+        bright = page.locator("#map path.map-site").evaluate_all(
+            "els => els.map((e) => Number(e.style.getPropertyValue('--site-brightness')))")
+        assert len(bright) == 2 and min(bright) > 0, bright
+        tip = page.locator("#map .leaflet-tooltip")
+        site = page.locator("#map path.map-site")
+        hill = hover_site_of(page, "Example Water Authority")
+        expect(tip).to_contain_text("Example Water Authority")
+        expect(tip).to_contain_text("16K0F1D")
+        expect(tip).to_contain_text(re.compile(r"0\.\d+ unknown"))
+        hill.click()
+        pop =page.locator("#map .leaflet-popup-content")
+        expect(pop).to_contain_text("licence 0000001")
+        expect(pop.locator("button")).to_have_count(0)
+        run_cmd(page, "view set origin_fade_s 2")
+        # fake_pos sent its last event 2 s in.
+        expect(page.locator("#map path.map-site")).to_have_count(0, timeout=8_000)
+        expect(badge).to_have_text("")
+        # A long fade again, so what follows is the job's stop and not the fade.
+        run_cmd(page, "view set origin_fade_s 300")
+        job_row(page, job).locator("button.origins").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        page.locator('#tabs .src-tab[data-id="tone"]').click()
+        stop_job(url, secret, job)
+        page.evaluate("() => window.zetaTest.poll()")
+        # Review focus 3: the set goes with the job, at once.
+        page.wait_for_function("() => window.zetaTest.litKeys().length === 0", timeout=3_000)
+        expect(badge).to_have_text("", timeout=1_000)
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(0)
+        # A job the overlays do not follow (an fm_demod on a source the page does not show,
+        # not positioned): Origins lights its sites from the op's answer and notes them.
+        other = start_job(url, secret, "fm_demod", "tone", 100_000_000, 12_500)
+        page.locator('#tabs .src-tab[data-id="quiet"]').click()
+        job_row(page, other).locator("button.origins").click()
+        page.wait_for_function("(j) => window.zetaTest.litKeys().includes(j)", arg=other,
+                               timeout=10_000)
+        expect(page.locator("#transcript .line.note", has_text=re.compile(
+            rf"fm_demod {other[-6:]}: \d+ sites? on 100 MHz"))).to_have_count(1, timeout=5_000)
+    finally:
+        run_cmd(page, "view reset")
+        stop_job(url, secret, job)
+        if other:
+            stop_job(url, secret, other)
+
+
+def scenario_origins_from_the_menu_and_bits(page, url, secret):
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    clear_captures(url, secret)
+    stop_bits_jobs(url, secret)
+    try:
+        # A labelled box: What is this labels the FM tone (layer 1: fm); its lit set is
+        # dropped so only the menu's own answer is on the map.
+        menu = open_menu_on_tone(page, url, secret)
+        page.click('#ctx .ctx-item[data-action="classify"]')
+        expect(page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
+               .first).to_be_visible(timeout=15_000)
+        for k in page.evaluate("() => window.zetaTest.litKeys()"):
+            page.evaluate("(k) => window.zetaTest.lightOrigin(k, {origins: []})", k)
+        assert page.evaluate("() => window.zetaTest.litKeys()") == []
+        # The box menu's entry: the band form, the label's modulation named.
+        drag_menu(page)
+        page.click('#ctx .ctx-item[data-action="origins"]')
+        expect(menu).to_be_hidden()
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=10_000)
+        keys = page.evaluate("() => window.zetaTest.litKeys()")
+        assert len(keys) == 1 and keys[0].startswith("band:"), keys
+        # Spec 4.8: the entry says what it found in the transcript, as the node words it.
+        expect(page.locator("#transcript .line.note", has_text=re.compile(
+            r"^2 sites on [\d.]+ MHz: Example "))).to_have_count(1, timeout=5_000)
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        # The tone's label is `carrier`, which neither stub transmitter (FM, AM) fits: the
+        # label reached the node (a null modulation would read `unknown`).
+        agree = sorted(a for a, _ in lit_sites(page))
+        assert agree == ["disagrees", "disagrees"], agree
+        # The drawing of a fit, from the node's answer for FM (the fitting site is brighter,
+        # the disagreeing one a dashed ring, one bearing).
+        page.evaluate("() => window.zetaTest.lightOrigin(window.zetaTest.litKeys()[0], {origins: []})")
+        fm = origins_of(url, secret, None, "tone", 100_000_000, 9_600)
+        page.evaluate("(a) => window.zetaTest.lightOrigin('band:fm', a)", fm)
+        expect(page.locator("#map path.map-site")).to_have_count(2)
+        agree = sorted(a for a, _ in lit_sites(page))
+        assert agree == ["disagrees", "fits"], agree
+        expect(page.locator("#map path.map-bearing")).to_have_count(1)
+        marks =page.locator("#map path.map-site").evaluate_all(
+            """els => Object.fromEntries(els.map((e) => [e.dataset.agree,
+                 [Number(e.style.getPropertyValue('--site-brightness')),
+                  e.getAttribute('stroke-dasharray')]]))""")
+        assert marks["fits"][0] > marks["disagrees"][0] > 0, marks
+        assert marks["disagrees"][1] and not marks["fits"][1], marks
+        # A confirmed origin (a heard callsign) wears the ring.
+        page.evaluate("""() => window.zetaTest.lightOrigin('band:ring', {
+            t_ns: Date.now() * 1e6, origins: [{score: 1, agree: 'fits',
+              confirmed: {field: 'callsign', value: 'XX4EX'},
+              allocation: {lat: -27.45, lon: 153.0, licensee: 'Example Water Authority',
+                           site: 'Example Hill'}}]})""")
+        expect(page.locator("#map path.map-site[data-confirmed]")).to_have_count(1)
+        page.locator('#tabs .src-tab[data-id="tone"]').click()
+        # The Bits header's button: a bits job on a tone capture asks by its job.
+        cap = start_job(url, secret, "capture", "tone", 100_001_000, 6_000)
+        two_windows(url, secret, cap)
+        wait_until(lambda: len(capture_ops(url, secret, "capture_list", signal=None)) == 2,
+                   30, "two captures")
+        newest = capture_ops(url, secret, "capture_list", signal=None)[0]["id"]
+        http_json(url, secret, "/op", {"op": "bits_start", "capture": newest,
+                                       "modulation": "fsk", "symbol_rate_baud": 4800,
+                                       "order": 2})
+        page.evaluate("() => window.zetaTest.poll()")
+        page.locator('#panes .pane-tab[data-pane="bits"]').click()
+        page.locator('#bits button[data-action="origins"]').click()
+        expect(page.locator("#transcript .line.note", has_text="bits ")).to_contain_text(
+            "sites on", timeout=10_000)
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).not_to_have_count(0, timeout=10_000)
+    finally:
+        run_cmd(page, "view reset")
+        stop_bits_jobs(url, secret)
+        clear_captures(url, secret)
+
+
+def scenario_no_station_lights_without_bearings(page, url, secret):
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    http_json(url, secret, "/op", {"op": "station_clear"})
+    job = None
+    try:
+        select_source(page, url, secret, "tone")
+        job = start_fake_pos(page, url, secret)
+        answer = origins_of(url, secret, job)
+        assert answer["from"] is None and answer["from_note"] == "no station set", answer
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        expect(page.locator("#map path.map-bearing")).to_have_count(0)
+        note = page.locator("#map .map-note")
+        expect(note).to_be_visible()
+        expect(note).to_contain_text("no station set")
+        page.locator('#map path.map-site[data-agree="fits"]').hover()
+        tip = page.locator("#map .leaflet-tooltip")
+        expect(tip).to_contain_text("Example Water Authority")
+        assert " km" not in tip.text_content(), tip.text_content()
+    finally:
+        run_cmd(page, "view reset")
+        if job:
+            stop_job(url, secret, job)
+        set_demo_station(url, secret)
+
+
+def scenario_classify_lights_sites(page, url, secret):
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    try:
+        menu = open_menu_on_tone(page, url, secret)
+        page.click('#ctx .ctx-item[data-action="classify"]')
+        expect(menu).to_be_hidden()
+        line = page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
+        expect(line.first).to_be_visible(timeout=15_000)
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=5_000)
+        keys = page.evaluate("() => window.zetaTest.litKeys()")
+        assert len(keys) == 1 and keys[0].startswith("classify:"), keys
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        expect(page.locator("#map path.map-bearing")).to_have_count(
+            sum(1 for a, _ in lit_sites(page) if a != "disagrees"))
+        run_cmd(page, "view set origin_fade_s 2")
+        expect(page.locator("#map path.map-site")).to_have_count(0, timeout=6_000)
+        assert page.evaluate("() => window.zetaTest.litKeys()") == []
+    finally:
+        run_cmd(page, "view reset")
 
 
 # ---- subjects (plan 23 Task 2) ----------------------------------------------------------
@@ -4901,14 +5319,14 @@ def scenario_subjects_tab_appears_only_with_a_subject_job(page, url, secret):
         toggle.click()
         expect(pane).to_be_visible()
         assert "pane subjects" in view_show(page)
-        # With the map on too, the map takes the right of the top and the table the bottom.
-        page.route(OSM_TILES, lambda r: r.abort())
-        run_cmd(page, "view set map on")
+        # With the map shown too, the map takes the top and the table the bottom.
+        page.route(TILE_HOSTS, lambda r: r.abort())
+        run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
         mp = page.locator("#map").bounding_box()
         box = pane.bounding_box()
         assert mp["y"] + mp["height"] <= box["y"] + 2, f"{mp} {box}"
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
     finally:
         stop_job(url, secret, job)
     page.evaluate("window.zetaTest.poll()")
@@ -4923,10 +5341,10 @@ def scenario_subjects_tab_appears_only_with_a_subject_job(page, url, secret):
 
 
 def scenario_subjects_table_has_padding_and_scrolls_sideways(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     page.set_viewport_size(WIDE)
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
         open_subjects(page)
@@ -4943,7 +5361,7 @@ def scenario_subjects_table_has_padding_and_scrolls_sideways(page, url, secret):
         # The key stays in view while the rest is scrolled in.
         fb = page.locator("#subjects thead th").first.bounding_box()
         assert fb["x"] - pb["x"] >= 4, f"{fb} {pb}"
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
     finally:
         stop_job(url, secret, job)
 
@@ -4969,6 +5387,16 @@ def scenario_subjects_dim_and_drop(page, url, secret):
 
 
 def scenario_subjects_distance_and_sort(page, url, secret):
+    # No station, so the table has no distance column until `view set home` (the page reads
+    # the station at load).
+    http_json(url, secret, "/op", {"op": "station_clear"})
+    try:
+        subjects_distance_and_sort(page, url, secret)
+    finally:
+        set_demo_station(url, secret)
+
+
+def subjects_distance_and_sort(page, url, secret):
     select_source(page, url, secret, "tone")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
@@ -5319,9 +5747,9 @@ def scenario_protocol_text_has_no_adsb_case(page, url, secret):
 def map_with_subjects(page, url, secret):
     """The map on, its tiles aborted, and `fake_subjects` running on the tone source with both
     of its fixed aircraft drawn; the job id."""
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     expect(page.locator("#map")).to_be_visible()
     job = start_subject_job(page, url, secret, "fake_subjects")
     expect(page.locator("#map .map-subject")).to_have_count(2, timeout=10_000)
@@ -5600,13 +6028,13 @@ def scenario_selected_row_scrolls_into_view(page, url, secret):
 
 
 def scenario_map_follows_dim_and_drop(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set subject_dim_s 1")
     expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
     run_cmd(page, "view set subject_drop_s 4")
     expect(view_line(page, "subject_drop_s = 4")).to_be_visible()
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
         expect(page.locator("#map .map-subject")).to_have_count(2, timeout=10_000)
@@ -5621,11 +6049,11 @@ def scenario_map_follows_dim_and_drop(page, url, secret):
 
 
 def scenario_a_dimmed_subject_relights(page, url, secret):
-    page.route(OSM_TILES, lambda r: r.abort())
+    page.route(TILE_HOSTS, lambda r: r.abort())
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set subject_dim_s 1")
     expect(view_line(page, "subject_dim_s = 1")).to_be_visible()
-    run_cmd(page, "view set map on")
+    run_cmd(page, "view set main map")
     job = start_subject_job(page, url, secret, "fake_subjects")
     try:
         expect(page.locator("#map .map-subject.dim")).to_have_count(2, timeout=10_000)
@@ -6102,16 +6530,16 @@ def scenario_panes_show_one_at_a_time(page, url, secret):
         run_cmd(page, "view set subjects auto")
         expect(pane).to_be_hidden()
         expect(tab).to_be_visible()
-        # The map stays its own toggle: with the pane open it keeps the top's right half.
-        page.route(OSM_TILES, lambda r: r.abort())
+        # The map is the main area's: with the pane open it keeps the top.
+        page.route(TILE_HOSTS, lambda r: r.abort())
         tab.click()
-        run_cmd(page, "view set map on")
+        run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
         mp = page.locator("#map").bounding_box()
         box = pane.bounding_box()
         assert mp["y"] + mp["height"] <= box["y"] + 1, f"{mp} {box}"
         assert page.locator("#panes .pane-tab:visible").count() == 1
-        run_cmd(page, "view set map off")
+        run_cmd(page, "view set main rf")
         # The selection is the view's, kept over a reload.
         page.reload()
         expect(pane).to_be_visible(timeout=10_000)
@@ -6124,6 +6552,82 @@ def scenario_panes_show_one_at_a_time(page, url, secret):
     pane_tab(page).click()
     expect(pane_tab(page)).to_be_hidden()
     assert not errors, f"console errors: {errors}"
+
+
+def wait_pane_parent(page, parent_id):
+    """Wait until the pane host #pane is a child of the element `parent_id`."""
+    page.wait_for_function(
+        "(id) => document.querySelector('#pane')?.parentElement?.id === id",
+        arg=parent_id, timeout=5_000)
+
+
+def scenario_dock_right(page, url, secret):
+    """`view set dock right` moves #pane into the side column as a third folding section above
+    the Jobs pane, the waterfall keeping #main's height, whether the dock or the pane comes
+    first; `bottom` moves it back and a return to `right` comes back unfolded; `auto` follows
+    the theme's `layout.dock`; the narrow footprint ignores the dock."""
+    select_source(page, url, secret, "tone")
+    page.set_viewport_size(WIDE)
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        run_cmd(page, "view set dock right")  # the dock first, the pane after
+        open_subjects(page)
+        sec = page.locator("#side section.pane.dock")
+        expect(sec).to_have_count(1)
+        expect(sec.locator(".pane-head")).to_contain_text("Subjects")
+        wait_pane_parent(page, "pane-dock")
+        order = page.evaluate(
+            "() => [...document.querySelectorAll('#side > section')].map(s => s.className)")
+        assert order[1].endswith("dock") and "jobs" in order[2], order
+        wf, main = page.locator("#waterfall").bounding_box(), page.locator("#main").bounding_box()
+        assert abs(wf["height"] - main["height"]) <= 2, (wf, main)
+        # The table reads in the column: the section has room and its rows show.
+        assert sec.bounding_box()["height"] >= 0.25 * main["height"], sec.bounding_box()
+        expect(page.locator("#pane-dock #subjects tr.subject").first).to_be_visible(timeout=10_000)
+        expect(sec.locator(".pane-head .count")).to_have_text(re.compile(r"^[1-9]\d*$"))
+        head = sec.locator(".pane-head")
+        head.click()
+        expect(sec).to_have_attribute("data-collapsed", "")
+        expect(head).to_have_attribute("aria-expanded", "false")
+        head.click()
+        page.wait_for_function(
+            "() => !document.querySelector('#pane-dock').hasAttribute('data-collapsed')",
+            timeout=5_000)
+        # Folded, then bottom: #pane goes back under the main view and the section goes.
+        head.click()
+        expect(sec).to_have_attribute("data-collapsed", "")
+        run_cmd(page, "view set dock bottom")
+        wait_pane_parent(page, "main")
+        expect(page.locator("#side section.pane.dock")).to_have_count(0)
+        # The pane first, the dock after: the selected pane goes into the column, unfolded.
+        run_cmd(page, "view set dock right")
+        wait_pane_parent(page, "pane-dock")
+        expect(sec).to_have_count(1)
+        expect(sec).not_to_have_attribute("data-collapsed", "")
+        expect(sec.locator(".pane-head")).to_have_attribute("aria-expanded", "true")
+        expect(page.locator("#pane-dock #subjects")).to_be_visible()
+        run_cmd(page, "view set dock bottom")
+        wait_pane_parent(page, "main")
+        expect(page.locator("#side section.pane.dock")).to_have_count(0)
+        run_cmd(page, "view set dock auto")
+        run_cmd(page, "view set theme fixture_dock_right")
+        page.wait_for_function("() => document.documentElement.dataset.dock === 'right'",
+                               timeout=5_000)
+        wait_pane_parent(page, "pane-dock")
+        run_cmd(page, "view set theme console")
+        page.wait_for_function("() => document.documentElement.dataset.dock === 'bottom'",
+                               timeout=5_000)
+        wait_pane_parent(page, "main")
+        page.set_viewport_size(NARROW)
+        run_cmd(page, "view set dock right")
+        page.wait_for_function("() => document.documentElement.dataset.dock === 'right'",
+                               timeout=5_000)
+        wait_pane_parent(page, "main")
+        expect(page.locator("#side section.pane.dock")).to_have_count(0)
+    finally:
+        run_cmd(page, "view reset")
+        page.set_viewport_size(WIDE)
+        stop_job(url, secret, job)
 
 
 def capture_ops(url, secret, op, **kw):
@@ -6510,6 +7014,7 @@ def main(argv):
                 ctx = browser.new_context(viewport=WIDE)
                 ctx.set_default_timeout(TIMEOUT_MS)
                 ctx.add_init_script(CSP_WATCH_JS)
+                ctx.route(TILE_HOSTS, lambda r: r.abort())
                 page = ctx.new_page()
                 console = []
                 page.on("console", lambda m: console.append(f"{m.type}: {m.text}")

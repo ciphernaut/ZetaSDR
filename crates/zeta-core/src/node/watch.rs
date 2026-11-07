@@ -18,7 +18,7 @@
 //! Events, `protocol: "watch"`, go on the job's event stream beside `detect`'s `signal`
 //! events: `state` `identifying | decoding | unknown | lost | capturing | captured`, with
 //! `signal`, `job`, `mode`, `source`, `placed` (`capture | free`), `features` and
-//! `allocations` (for `unknown`), `captures` (for `captured`), `summary` and `t_ns`
+//! `allocations` and `origins` (for `unknown`), `captures` (for `captured`), `summary` and `t_ns`
 //! (fields that do not apply are `null`).
 
 use std::collections::HashMap;
@@ -519,6 +519,8 @@ struct Event<'a> {
     features: Option<serde_json::Value>,
     /// The register's allocations for an `unknown` (the identify verdict's).
     allocations: Option<serde_json::Value>,
+    /// The origins of an `unknown` (the identify verdict's).
+    origins: Option<serde_json::Value>,
     /// The captures a `captured` lists.
     captures: Option<&'a [String]>,
 }
@@ -542,6 +544,7 @@ impl Inner {
             "placed": e.placed.map(Placed::as_str),
             "features": e.features,
             "allocations": e.allocations,
+            "origins": e.origins,
             "captures": e.captures,
             "summary": summary,
             "t_ns": t.0,
@@ -1402,12 +1405,14 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     tracked.features = Some(features.clone());
     tracked.allocations = Some(allocations.clone());
     tracked.learned = learned;
+    let origins = v["verdict"]["origins"].clone();
     let signal = tracked.signal.clone();
     let e = Event {
         signal: Some(&signal),
         job: Some(&id),
         features: Some(features),
         allocations: Some(allocations),
+        origins: Some(origins),
         ..Event::default()
     };
     inner.watch_event(r, "unknown", summary, e);

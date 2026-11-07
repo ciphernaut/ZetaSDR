@@ -4,7 +4,7 @@
 //! per lookup: `get_frequency_allocation` for the plan and one fixed `execute_sql`
 //! query for the assignments, cut to the band's reach around the station.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,12 @@ pub const ACMA_LOG_EVERY: Duration = Duration::from_secs(60);
 /// instead of asking again, so one `knowledge_lookup` is one deadline.
 pub const ACMA_PLAN_TTL: Duration = Duration::from_secs(60);
 
+/// Whether the register's `device_details` has a `CALL_SIGN` column: not known yet,
+/// it has, or it has not (an older build of the register service).
+const CALL_SIGN_UNKNOWN: u8 = 0;
+const CALL_SIGN_PRESENT: u8 = 1;
+const CALL_SIGN_ABSENT: u8 = 2;
+
 /// Mean earth radius for the haversine distance.
 const EARTH_RADIUS_KM: f64 = 6371.0088;
 /// Kilometres per degree of latitude, for the query's bounding box.
@@ -56,6 +62,9 @@ pub struct AcmaKnowledge {
     logged: AtomicU64,
     last_log: Mutex<Option<Instant>>,
     plan_memo: Mutex<Option<PlanMemo>>,
+    /// What the first assignments query learned about `CALL_SIGN`
+    /// (`CALL_SIGN_UNKNOWN` until then).
+    call_sign: AtomicU8,
 }
 
 /// What the last plan lookup at a centre said about space services: `space` is
@@ -104,6 +113,7 @@ struct Row {
     lat: Option<f64>,
     lon: Option<f64>,
     licensee: Option<String>,
+    callsign: Option<String>,
 }
 
 /// The station, the antenna serving the band and the band's reach from it.
@@ -115,7 +125,8 @@ struct Here {
 
 impl AcmaKnowledge {
     /// `override_km` replaces the reach rule's kilometres (see [`reach_for`]);
-    /// `station` is asked once per lookup.
+    /// `station` is asked once per `allocations` or `reach`; the `_from` methods take
+    /// their vantage instead.
     pub fn new(client: McpClient, override_km: Option<f64>, station: StationFn) -> Self {
         Self {
             client,
@@ -126,6 +137,7 @@ impl AcmaKnowledge {
             logged: AtomicU64::new(0),
             last_log: Mutex::new(None),
             plan_memo: Mutex::new(None),
+            call_sign: AtomicU8::new(CALL_SIGN_UNKNOWN),
         }
     }
 
@@ -223,6 +235,61 @@ impl AcmaKnowledge {
         })
     }
 
+    /// The assignments query's rows. The first query that answers settles whether
+    /// the register has `CALL_SIGN`: while unsettled, a query naming it that fails
+    /// (with any error) is asked again with `NULL AS CALL_SIGN`; when that answers the
+    /// column is absent and every later query selects NULL, and when it fails too
+    /// nothing is settled and the first error stands.
+    async fn assignment_rows(
+        &self,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+        bbox: Option<(f64, f64, f64)>,
+    ) -> Result<Vec<Row>, String> {
+        let state = self.call_sign.load(Ordering::SeqCst);
+        if state == CALL_SIGN_ABSENT {
+            return self
+                .query_rows(&assignments_sql(center_hz, bandwidth_hz, bbox, false))
+                .await;
+        }
+        match self
+            .query_rows(&assignments_sql(center_hz, bandwidth_hz, bbox, true))
+            .await
+        {
+            Ok(rows) => {
+                self.call_sign.store(CALL_SIGN_PRESENT, Ordering::SeqCst);
+                Ok(rows)
+            }
+            // Any error while unsettled is asked again without the column: a register
+            // may wrap SQLite's `no such column` in text that names nothing.
+            Err(first) if state == CALL_SIGN_UNKNOWN => match self
+                .query_rows(&assignments_sql(center_hz, bandwidth_hz, bbox, false))
+                .await
+            {
+                Ok(rows) => {
+                    self.call_sign.store(CALL_SIGN_ABSENT, Ordering::SeqCst);
+                    Ok(rows)
+                }
+                Err(_) => Err(first),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One `execute_sql` call, read as rows. A tool error the client hands back as
+    /// text is an error carrying that whole text.
+    async fn query_rows(&self, sql: &str) -> Result<Vec<Row>, String> {
+        let answer = self
+            .client
+            .call("execute_sql", json!({"sql": sql, "limit": ACMA_SQL_LIMIT}))
+            .await
+            .map_err(|e| format!("execute_sql: {e}"))?;
+        if let Value::String(text) = &answer {
+            return Err(format!("execute_sql: {text}"));
+        }
+        parse_rows(&answer)
+    }
+
     async fn lookup(
         &self,
         station: Option<Station>,
@@ -242,13 +309,7 @@ impl AcmaKnowledge {
                 .km_toward(h.antenna.azimuth_deg.unwrap_or(0.0), &h.antenna)?;
             Some((h.station.lat, h.station.lon, widest))
         });
-        let sql = assignments_sql(center_hz, bandwidth_hz, bbox);
-        let answer = self
-            .client
-            .call("execute_sql", json!({"sql": sql, "limit": ACMA_SQL_LIMIT}))
-            .await
-            .map_err(|e| format!("execute_sql: {e}"))?;
-        let rows = parse_rows(&answer)?;
+        let rows = self.assignment_rows(center_hz, bandwidth_hz, bbox).await?;
 
         let mut out: Vec<Allocation> = plan
             .iter()
@@ -304,12 +365,30 @@ impl KnowledgeProvider for AcmaKnowledge {
         ACMA_PROVIDER
     }
 
+    fn gives_assignments(&self) -> bool {
+        true
+    }
+
+    /// From the node's station, asked now.
     async fn allocations(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Vec<Allocation> {
+        let station = (self.station)();
+        self.allocations_from(region, center_hz, bandwidth_hz, station.as_ref())
+            .await
+    }
+
+    /// Distances, bearings, the reach cut and the query's box all from `from`;
+    /// without it the list is by frequency distance, as with no station.
+    async fn allocations_from(
+        &self,
+        region: &str,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+        from: Option<&Station>,
+    ) -> Vec<Allocation> {
         if !answers(region) {
             return Vec::new();
         }
-        let station = (self.station)();
-        self.guarded(self.lookup(station, center_hz, bandwidth_hz))
+        self.guarded(self.lookup(from.cloned(), center_hz, bandwidth_hz))
             .await
             .unwrap_or_default()
     }
@@ -322,11 +401,25 @@ impl KnowledgeProvider for AcmaKnowledge {
     /// station (the reach is not applied then). It reuses the plan answer of the
     /// `allocations()` just made at this centre (see [`ACMA_PLAN_TTL`]) and asks the
     /// service only when there is none; a plan that failed reads as no space band.
-    async fn reach(&self, region: &str, center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
+    async fn reach(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Option<Reach> {
+        let station = (self.station)();
+        self.reach_from(region, center_hz, bandwidth_hz, station.as_ref())
+            .await
+    }
+
+    /// The band's reach from `from`, as [`reach`](KnowledgeProvider::reach) gives it
+    /// from the station; `None` without `from`.
+    async fn reach_from(
+        &self,
+        region: &str,
+        center_hz: Hz,
+        _bandwidth_hz: Hz,
+        from: Option<&Station>,
+    ) -> Option<Reach> {
         if !answers(region) {
             return None;
         }
-        let station = (self.station)()?;
+        let station = from?.clone();
         let space = match self.fresh_memo(center_hz) {
             Some(space) => space,
             None => self
@@ -400,6 +493,7 @@ fn parse_rows(v: &Value) -> Result<Vec<Row>, String> {
         "LATITUDE",
         "LONGITUDE",
         "LICENCEE",
+        "CALL_SIGN",
     ]
     .map(col);
     Ok(rows
@@ -426,6 +520,8 @@ fn parse_rows(v: &Value) -> Result<Vec<Row>, String> {
                 lat: get(8).and_then(Value::as_f64),
                 lon: get(9).and_then(Value::as_f64),
                 licensee: text(10),
+                // `None` too from a service whose answer lacks the column.
+                callsign: text(11),
             })
         })
         .collect())
@@ -447,19 +543,26 @@ fn head(v: &Value) -> String {
 /// The fixed assignments query: devices whose `FREQUENCY ± BANDWIDTH / 2` overlaps
 /// the band (a device with no `BANDWIDTH` counts as 0 Hz wide, so it is matched on its
 /// frequency rather than dropped by a NULL comparison), joined to their site, licence and licensee, inside a box of `km`
-/// around `(lat, lon)` when one is given, nearest in frequency first.
-fn assignments_sql(center_hz: Hz, bandwidth_hz: Hz, bbox: Option<(f64, f64, f64)>) -> String {
+/// around `(lat, lon)` when one is given, nearest in frequency first. Without
+/// `call_sign` (a register lacking the column) `CALL_SIGN` is selected as `NULL`.
+fn assignments_sql(
+    center_hz: Hz,
+    bandwidth_hz: Hz,
+    bbox: Option<(f64, f64, f64)>,
+    call_sign: bool,
+) -> String {
     let half = bandwidth_hz.0 / 2;
     let (lo, hi) = (
         center_hz.0.saturating_sub(half),
         center_hz.0.saturating_add(half),
     );
+    let call_sign = if call_sign { "d.CALL_SIGN" } else { "NULL" };
     let mut sql = format!(
         "SELECT d.FREQUENCY AS FREQUENCY, d.BANDWIDTH AS BANDWIDTH, d.EMISSION AS EMISSION, \
          d.DEVICE_TYPE AS DEVICE_TYPE, d.TRANSMITTER_POWER AS TRANSMITTER_POWER, \
          d.TRANSMITTER_POWER_UNIT AS TRANSMITTER_POWER_UNIT, d.LICENCE_NO AS LICENCE_NO, \
          s.NAME AS SITE_NAME, s.LATITUDE AS LATITUDE, s.LONGITUDE AS LONGITUDE, \
-         c.LICENCEE AS LICENCEE \
+         c.LICENCEE AS LICENCEE, {call_sign} AS CALL_SIGN \
          FROM device_details d \
          JOIN site s ON s.SITE_ID = d.SITE_ID \
          LEFT JOIN licence l ON l.LICENCE_NO = d.LICENCE_NO \
@@ -528,6 +631,7 @@ fn assignment(r: Row, here: Option<&Here>) -> Allocation {
         center_hz: Some(Hz(r.frequency)),
         bandwidth_hz: Some(Hz(r.bandwidth)),
         licence_no: r.licence_no,
+        callsign: r.callsign,
         role,
         emission: r.emission,
         emission_decoded,

@@ -320,6 +320,9 @@ pub enum Command {
     /// Band plans and known signal signatures
     #[command(subcommand)]
     Knowledge(KnowledgeCmd),
+    /// The licensed transmitters a signal may come from
+    #[command(subcommand)]
+    Origin(OriginCmd),
     /// The channel plans the node knows (e.g. uhf_cb_au) with their channels
     Plans {
         /// Only this plan
@@ -1129,6 +1132,30 @@ pub enum KnowledgeCmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum OriginCmd {
+    /// Score the register's rows on a job's band (publishes an `origin` event and keeps
+    /// the answer in the job's context) or on a band (answers only)
+    Lookup {
+        /// A job id (from `job list`); its band and modulation are read from it
+        #[arg(long, conflicts_with_all = ["source", "center_hz", "bandwidth_hz"], required_unless_present = "source")]
+        job: Option<String>,
+        /// A source id (from `source list`), with --center-hz and --bandwidth-hz
+        #[arg(long, requires_all = ["center_hz", "bandwidth_hz"])]
+        source: Option<String>,
+        /// The band's centre, Hz
+        #[arg(long, value_name = "HZ", requires = "source")]
+        center_hz: Option<u64>,
+        /// The band's width, Hz
+        #[arg(long, value_name = "HZ", requires = "source")]
+        bandwidth_hz: Option<u64>,
+        /// Layer-1 labels, comma separated (fm,fsk); omitted: read from the job, or
+        /// unknown for a band
+        #[arg(long, value_name = "LABEL[,LABEL]", value_delimiter = ',')]
+        modulation: Option<Vec<String>>,
+    },
+}
+
 /// `job start --kind`: a built-in kind's name, or any mode id (`^[a-z][a-z0-9_]*$`; the
 /// node says when it has no such row).
 fn parse_job_kind(s: &str) -> Result<JobKind, String> {
@@ -1256,6 +1283,8 @@ impl Command {
                         | SignatureCmd::Reject { .. }
                 )
                 | Command::Jobs(JobsCmd::Stop { .. })
+                // The job form writes the job's context.
+                | Command::Origin(OriginCmd::Lookup { job: Some(_), .. })
         )
     }
 
@@ -1393,6 +1422,19 @@ impl Command {
                 region,
                 center_hz: Hz(center_hz),
                 bandwidth_hz: Hz(bandwidth_hz),
+            },
+            Command::Origin(OriginCmd::Lookup {
+                job,
+                source,
+                center_hz,
+                bandwidth_hz,
+                modulation,
+            }) => Op::OriginLookup {
+                job: job.map(JobId),
+                source: source.map(SourceId),
+                center_hz: center_hz.map(Hz),
+                bandwidth_hz: bandwidth_hz.map(Hz),
+                modulation,
             },
             Command::Plans { plan } => {
                 if let Some(id) = plan
@@ -1711,5 +1753,61 @@ mod cli_signature_tests {
         assert!(mutates(&["zeta", "signature", "reject", "--id", "X"]));
         assert!(!mutates(&["zeta", "signature", "list"]));
         assert!(!mutates(&["zeta", "signature", "show", "--id", "X"]));
+    }
+}
+
+#[cfg(test)]
+mod cli_origin_tests {
+    use super::*;
+
+    #[test]
+    fn cli_origin_lookup_takes_a_job_or_a_band() {
+        let cli = Cli::try_parse_from(["zeta", "origin", "lookup", "--job", "J1"]).unwrap();
+        assert!(cli.command.mutates());
+        assert_eq!(
+            cli.command.into_op().unwrap(),
+            Some(Op::OriginLookup {
+                job: Some(JobId("J1".into())),
+                source: None,
+                center_hz: None,
+                bandwidth_hz: None,
+                modulation: None,
+            })
+        );
+        let cli = Cli::try_parse_from([
+            "zeta",
+            "origin",
+            "lookup",
+            "--source",
+            "rx",
+            "--center-hz",
+            "403025000",
+            "--bandwidth-hz",
+            "12500",
+            "--modulation",
+            "fm,fsk",
+        ])
+        .unwrap();
+        assert!(!cli.command.mutates());
+        assert_eq!(
+            cli.command.into_op().unwrap(),
+            Some(Op::OriginLookup {
+                job: None,
+                source: Some(SourceId("rx".into())),
+                center_hz: Some(Hz(403_025_000)),
+                bandwidth_hz: Some(Hz(12_500)),
+                modulation: Some(vec!["fm".into(), "fsk".into()]),
+            })
+        );
+        // --job is exclusive with the band; the band needs all three; one form is required.
+        for bad in [
+            &["--job", "J1", "--source", "rx"][..],
+            &["--source", "rx", "--center-hz", "1"][..],
+            &["--center-hz", "1", "--bandwidth-hz", "2"][..],
+            &[][..],
+        ] {
+            let args = ["zeta", "origin", "lookup"].iter().chain(bad.iter());
+            assert!(Cli::try_parse_from(args).is_err(), "{bad:?}");
+        }
     }
 }

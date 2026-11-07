@@ -13,7 +13,10 @@
 //! 433.92 MHz, the Bits pane's; see [`fsk_fixture`]), and `--modes-dir` holding the
 //! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
 //! job; see [`fake_pos_row`]); the node's state directory is passed to ui.py in
-//! `ZETA_UI_STATE_DIR`. That node has a fake
+//! `ZETA_UI_STATE_DIR`. That node's station is the demo station ([`DEMO_STATION`],
+//! `station_set` once it is up), and its `--knowledge-acma` is zeta-ext's register stub
+//! (`testing::acma_stub`) on 127.0.0.1 answering [`fake_register_rows`] (the tone's band
+//! only). That node has a fake
 //! `voiced` (`--stt-socket`, zeta-speech's `FakeDaemon`) answering `ok:what sources are there`
 //! to every valid staged WAV; a second node without a speech daemon, with only the `speech`
 //! fixture, is passed in `ZETA_UI_URL_NOSTT`; a third node with the `cb` fixture whose
@@ -35,6 +38,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{ServeProc, speech_fixture};
+use zeta_ext::testing::acma_stub::{self, Mode};
 use zeta_speech::testing::FakeDaemon;
 
 const SECRET: &str = "ui-secret-0123456789";
@@ -388,6 +392,102 @@ fn fake_pos_row() -> serde_json::Value {
     })
 }
 
+/// The `tone` fixture's centre (`common::ServeProc` adds it as `tone`).
+const TONE_HZ: u64 = 100_000_000;
+
+/// The demo station, Brisbane Airport: lat, lon, alt_m. The node is `station_set` to it once
+/// it is up.
+const DEMO_STATION: (f64, f64, f64) = (-27.3842, 153.1175, 4.0);
+
+/// The synthetic sites' distances from the demo station: the hill (north-west), the ridge
+/// (east), and the receiver (as far south as east).
+const SITE_HILL_KM: f64 = 9.0;
+const SITE_RIDGE_KM: f64 = 20.0;
+const SITE_RX_KM: f64 = 8.0;
+/// Kilometres per degree of latitude (mean Earth radius).
+const KM_PER_DEG: f64 = 111.195;
+
+/// The point `north_km` north and `east_km` east of the demo station (flat-Earth offsets,
+/// close enough at these distances): `(lat, lon)`.
+fn from_demo_station(north_km: f64, east_km: f64) -> (f64, f64) {
+    let (lat, lon, _) = DEMO_STATION;
+    let lat_deg = north_km / KM_PER_DEG;
+    let lon_deg = east_km / (KM_PER_DEG * lat.to_radians().cos());
+    (lat + lat_deg, lon + lon_deg)
+}
+
+/// What the register stub answers (`acma_stub::COLUMNS` order), all on the tone's band and
+/// synthetic: a `tx` `16K0F1D` 9 km north-west of the demo station with callsign `XX4EX`, a
+/// `tx` `12K5A3E` 20 km east, and an `rx` row (never lit). The stub answers nothing on
+/// another band.
+fn fake_register_rows() -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let diagonal = SITE_HILL_KM * std::f64::consts::FRAC_1_SQRT_2;
+    let hill = from_demo_station(diagonal, -diagonal);
+    let ridge = from_demo_station(0.0, SITE_RIDGE_KM);
+    let depot = from_demo_station(-SITE_RX_KM, SITE_RX_KM);
+    vec![
+        json!([
+            TONE_HZ,
+            16000,
+            "16K0F1D",
+            "T",
+            5,
+            "W",
+            "0000001",
+            "Example Hill",
+            hill.0,
+            hill.1,
+            "Example Water Authority",
+            "XX4EX"
+        ]),
+        json!([
+            TONE_HZ,
+            12500,
+            "12K5A3E",
+            "T",
+            50,
+            "W",
+            "0000002",
+            "Example Ridge",
+            ridge.0,
+            ridge.1,
+            "Example Broadcasting",
+            null
+        ]),
+        json!([
+            TONE_HZ,
+            16000,
+            "16K0F1D",
+            "R",
+            null,
+            "W",
+            "0000003",
+            "Example Ridge",
+            depot.0,
+            depot.1,
+            "Example Water Authority",
+            null
+        ]),
+    ]
+}
+
+/// `station_set` the demo station on the node at `url`.
+fn set_demo_station(url: &str) {
+    let (lat, lon, alt_m) = DEMO_STATION;
+    let op = serde_json::json!({"op": "station_set", "lat": lat, "lon": lon, "alt_m": alt_m,
+                                "region": "AU", "antennas": null});
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for station_set");
+    let client = zeta_client::NodeClient::new(url, SECRET).expect("a node client");
+    let answer = rt
+        .block_on(client.apply_value(op))
+        .expect("the node answers");
+    assert!(answer.is_ok(), "station_set refused: {answer:?}");
+}
+
 /// What `fake_lines` prints for a `fake_pos` job: one sonde moving from -27.40,153.10 to
 /// -27.41,153.11.
 const FAKE_POS_LINES: &str = "{\"id\":\"S1\",\"lat\":-27.40,\"lon\":153.10,\"alt\":1000}\n\
@@ -594,7 +694,8 @@ fn fake_modes(dir: &Path) -> PathBuf {
 }
 
 /// A themes directory under `dir`: `fixture_theme`, an operator theme (accent `#ff00ff`, no
-/// rail, a black-to-magenta ramp, no style.css), and a broken `console` override (an unknown
+/// rail, a black-to-magenta ramp, no style.css), `fixture_dock_right` (the same, with
+/// `layout.dock` right), and a broken `console` override (an unknown
 /// `footprints` key), which leaves the built-in console in force; its path.
 fn fake_themes(dir: &Path) -> PathBuf {
     use serde_json::json;
@@ -619,7 +720,11 @@ fn fake_themes(dir: &Path) -> PathBuf {
     let mut bad = fixture.clone();
     bad["id"] = json!("bad_bg");
     bad["tokens"] = json!({"--wf-bg": "not-a-colour"});
-    for theme in [fixture, broken, hsl, bad] {
+    // An operator theme whose `layout.dock` docks the panes in the side column.
+    let mut dock_right = fixture.clone();
+    dock_right["id"] = json!("fixture_dock_right");
+    dock_right["layout"] = json!({"rail": false, "ribbon_tilt_deg": 0, "dock": "right"});
+    for theme in [fixture, broken, hsl, bad, dock_right] {
         let folder = themes.join(theme["id"].as_str().unwrap());
         std::fs::create_dir_all(&folder).expect("create a theme folder");
         let text = serde_json::to_string_pretty(&theme).unwrap();
@@ -763,10 +868,13 @@ fn ui_scenarios_pass_in_headless_chromium() {
     // not the host has dump1090 (a CI runner has none; the ADS-B width scenario needs it).
     let fake_dump1090 = repo_root().join("crates/zeta-ext/tests/fake_dump1090");
     let fake_dump1090 = fake_dump1090.to_str().expect("fake_dump1090 path is UTF-8");
+    let register = acma_stub::serve_on_thread(fake_register_rows(), Mode::Normal);
     let serve = ServeProc::start_full(
         dir.path(),
         SECRET,
         &[
+            "--knowledge-acma",
+            &register,
             "--modes-dir",
             modes,
             "--themes-dir",
@@ -798,6 +906,7 @@ fn ui_scenarios_pass_in_headless_chromium() {
             ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", FAKE_POS_AFTER_BYTES),
         ],
     );
+    set_demo_station(&serve.url);
     // No speech daemon: XDG_RUNTIME_DIR points where no voiced.sock is, so no default applies.
     let nostt_dir = tempfile::tempdir().unwrap();
     let runtime = nostt_dir.path().to_str().expect("tempdir is UTF-8");

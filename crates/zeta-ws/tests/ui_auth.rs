@@ -265,7 +265,12 @@ async fn subprotocol_is_not_accepted_on_plain_routes() {
 async fn ui_files_carry_a_content_security_policy() {
     let dir = tempfile::tempdir().unwrap();
     let ts = spawn(dir.path()).await;
-    for path in ["/ui/", "/ui/app.js", "/ui/style.css"] {
+    for path in [
+        "/ui/",
+        "/ui/app.js",
+        "/ui/style.css",
+        "/ui/themes/console/theme.json",
+    ] {
         let resp = no_redirect()
             .get(format!("{}{path}", ts.url))
             .send()
@@ -281,10 +286,25 @@ async fn ui_files_carry_a_content_security_policy() {
         assert!(csp.contains("default-src 'self'"), "{csp}");
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
         assert!(csp.contains("connect-src 'self' ws: wss:"), "{csp}");
-        // The map's tiles, and nothing else, come from outside the node.
-        assert!(
-            csp.contains("img-src 'self' data: https://tile.openstreetmap.org;"),
+        // The map's tiles, and nothing else, come from outside the node: exactly the tile
+        // providers' hosts (map.js TILE_PROVIDERS; ui.rs checks the two lists agree).
+        let img = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("img-src "))
+            .unwrap_or_else(|| panic!("no img-src: {csp}"));
+        assert_eq!(
+            img,
+            "img-src 'self' data: https://tile.openstreetmap.org https://*.basemaps.cartocdn.com \
+             https://*.tile.opentopomap.org https://server.arcgisonline.com",
             "{csp}"
+        );
+        // The tile hosts refuse a request without the page's origin as its Referer.
+        assert_eq!(
+            h.get("referrer-policy")
+                .unwrap_or_else(|| panic!("{path}: no Referrer-Policy")),
+            "strict-origin-when-cross-origin",
+            "{path}"
         );
         assert_eq!(
             h.get("x-content-type-options").unwrap(),

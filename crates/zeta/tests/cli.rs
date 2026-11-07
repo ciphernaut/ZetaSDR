@@ -1084,7 +1084,7 @@ fn job_start_identify_then_tail_prints_candidates() {
             "12500",
             // `stream_tail` waits at most 10 000 ms: one second's measure and a 5 s dwell.
             "--then-tail",
-            "3,10000",
+            "4,10000",
         ],
     )
     .assert()
@@ -1093,9 +1093,14 @@ fn job_start_identify_then_tail_prints_candidates() {
     .stdout
     .clone();
     let v = json(&out);
-    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    let all = v[1]["value"]["frames"].as_array().expect("frames array");
+    // The run's one `origin` event leads, then its candidates.
+    let (origin, frames): (Vec<_>, Vec<_>) = all
+        .iter()
+        .partition(|f| f["payload"]["protocol"] == "origin");
+    assert_eq!(origin.len(), 1, "{v}");
     assert_eq!(frames.len(), 3, "{v}");
-    for f in frames {
+    for f in &frames {
         let p = &f["payload"];
         assert_eq!(p["protocol"], "candidate", "{v}");
         let summary = format!(

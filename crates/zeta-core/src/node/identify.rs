@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::launch::{AfterGate, StageRunning, supervise};
+use super::origin::{OriginQuery, measured_modulation, origins};
 use super::persist::now;
 use super::{Inner, NodeError, source_fault_reason};
 use crate::classify::{Band, Measurement, Outcome};
@@ -564,6 +565,26 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         a = lookup => a,
         _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
     };
+    // The origins of the measured band, scored on the measured label; one `origin`
+    // event after the lookup, and `origins` in the job's context.
+    let q = OriginQuery {
+        source: r.port.id().clone(),
+        center_hz: Hz(m_center),
+        bandwidth_hz: measured
+            .as_ref()
+            .map_or(r.tuning.bandwidth_hz, |m| m.features.bandwidth_hz),
+        modulation: measured_modulation(measured.as_ref().map(|m| m.label.name.as_str())),
+        symbol_rate_baud: measured.as_ref().and_then(|m| m.features.symbol_rate_baud),
+        job: Some(r.id.clone()),
+        at: now(),
+    };
+    let origins = tokio::select! {
+        a = origins(&inner, &q) => a,
+        _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
+    };
+    // The answer is already in hand for the verdict: a failed merge (the job was removed
+    // under the run) only loses the context copy and the event, so the run goes on.
+    let _ = inner.keep_origin(&r.id, r.port.id(), &origins);
     let allocation = |m: &LoadedMode| allocation_term(m, &allocations);
     let modes = inner.modes();
     let scored = score_rows(&modes, m_center, bw, &layer1, &|_| 0.0, &allocation);
@@ -640,6 +661,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                         "recentred": recentred,
                         "allocations": allocations,
                         "learned": null,
+                        "origins": origins,
                     },
                     "attempts": attempts,
                 }});
@@ -663,6 +685,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             "recentred": recentred,
             "allocations": allocations,
             "learned": learned_json,
+            "origins": origins,
         },
         "attempts": attempts,
     }});

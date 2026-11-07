@@ -93,12 +93,13 @@
 // Stop button), setSource runs again for the same source: it reuses another running spectrum
 // job or starts a fresh elastic one of its own (a scan running there is followed instead, and
 // the own job is started again only once it ended). The badge hides at the first frame after
-// that.
+// that, also one that comes while the map is shown, so a relaunch badge is clear on return.
 //
 // Layout: frequency is vertical (highest at the top), time runs right to left: each event
 // becomes one CSS-pixel column (Math.round(devicePixelRatio) backing pixels, at least 1) at
 // the right edge after the canvas is shifted left by that much with drawImage. At most
-// MAX_ROWS_PER_S columns per second are painted; extra events are dropped. Rows: spectrum
+// MAX_ROWS_PER_S columns per second are painted; extra events are dropped, and so is every
+// event while the map is shown in the waterfall's place (<html data-main="map">). Rows: spectrum
 // event v2 (`q` of up to 8192 u8 levels with `floor_db` and `step_db`, db = floor_db +
 // q * step_db) is decoded straight into colour through a 256-entry lookup table, without a
 // float array; an older node's `db` array is still drawn. Each canvas pixel row shows the
@@ -192,6 +193,11 @@ export const EASE_MS = 400;
 export const COARSE_ALONE_MS = 1000;
 // The ring entry of a column painted from the coarse layer alone.
 const COARSE_ONLY = Object.freeze({ coarseOnly: true });
+
+// Whether the map is shown in the waterfall's place (app.js applyMain): nothing is painted then.
+function behindMap() {
+  return document.documentElement.dataset.main === "map";
+}
 // The theme's colour variable `name` (a custom property of <html>), trimmed.
 export function themeColour(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -1295,6 +1301,12 @@ class Waterfall {
   // ---- painting ------------------------------------------------------------------------
 
   addEvent(msg) {
+    // Hidden behind the map (<html data-main="map">): no draw. The rows count as painted, so
+    // the coarse layer does not move on its own meanwhile.
+    if (behindMap()) {
+      this.lastPaint = performance.now();
+      return;
+    }
     const row = decodeRow(msg.payload);
     if (!row) return;
     const now = performance.now();
@@ -1345,6 +1357,7 @@ class Waterfall {
       ? { lo: Math.min(sp.lo, row.lo), hi: Math.max(sp.hi, row.hi) }
       : { lo: row.lo, hi: row.hi };
     this.fillColumn(row, false, this.coarseColumn);
+    if (behindMap()) return;
     // The fine rows stopped (or never came): the coarse layer moves on its own.
     const now = performance.now();
     if (now - this.lastPaint < COARSE_ALONE_MS) return;

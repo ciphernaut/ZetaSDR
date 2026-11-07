@@ -12,6 +12,34 @@
 //   registerText(allocations) -> "register says <EMISSION> <licensee>, <site>, <d> km, <p> W"
 //       for the nearest `tx` assignment of a classification's or verdict's allocations
 //       (parts it lacks left out), or null when there is none
+//   originSummary(answer) -> one line for an `origin_lookup` answer, as the node's
+//       origin::summary words it: "<n> sites on <f> MHz: <licensee>, <site> <d> km <agree>
+//       <score>; ..." naming the first ORIGIN_SUMMARY_SITES (the distance left out when
+//       unknown, the service when the row names neither licensee nor site); with no origins,
+//       "no register provider" (`register_rows` null), "register gave no rows" (0), else
+//       "no licensed transmitter on <f> MHz". <f> is MHz without trailing zeros.
+
+// The sites originSummary names (origin.rs ORIGIN_SUMMARY_SITES).
+export const ORIGIN_SUMMARY_SITES = 3;
+
+export function originSummary(a) {
+  const hz = a && a.band ? Number(a.band.center_hz) : NaN;
+  const f = Number.isFinite(hz) ? (hz / 1e6).toFixed(6).replace(/\.?0+$/, "") : "?";
+  const origins = (a && Array.isArray(a.origins)) ? a.origins : [];
+  if (origins.length === 0) {
+    if (a?.register_rows === null || a?.register_rows === undefined) return "no register provider";
+    if (a.register_rows === 0) return "register gave no rows";
+    return `no licensed transmitter on ${f} MHz`;
+  }
+  const sites = origins.slice(0, ORIGIN_SUMMARY_SITES).map((o) => {
+    const al = o.allocation || {};
+    let s = [al.licensee, al.site].filter(Boolean).join(", ") || al.service || "";
+    if (typeof al.distance_km === "number") s += ` ${al.distance_km.toFixed(0)} km`;
+    return `${s} ${o.agree} ${Number(o.score).toFixed(1)}`;
+  });
+  const n = origins.length;
+  return `${n} ${n === 1 ? "site" : "sites"} on ${f} MHz: ${sites.join("; ")}`;
+}
 
 export function registerText(allocations) {
   const tx = (allocations || [])

@@ -6,6 +6,15 @@ mod identify;
 mod jsonlog;
 mod launch;
 pub use launch::DRAIN_TIMEOUT_MS;
+mod origin;
+pub use origin::{
+    Agree, Confirmed, From as OriginFrom, FromKind, ORIGIN_MODULATION_FITS,
+    ORIGIN_MODULATION_UNKNOWN, ORIGIN_NO_BAND_KINDS, ORIGIN_REACH_IN, ORIGIN_REACH_UNKNOWN,
+    ORIGIN_SITES, ORIGIN_SUMMARY_SITES, ORIGIN_WIDTH_FULL, ORIGIN_WIDTH_HALF, ORIGIN_WIDTH_LOOSE,
+    ORIGIN_WIDTH_NONE, ORIGIN_WIDTH_RANGE, Origin, OriginAnswer, OriginQuery, Terms, Vantage,
+    answer as origin_answer, confirm, confirm_identity, identity_value, job_modulation, score_row,
+    summary,
+};
 mod persist;
 mod propose;
 mod recover;
@@ -360,6 +369,18 @@ impl Inner {
     /// whole of one use so a reload meanwhile never mixes two sets of rows.
     pub(crate) fn modes(&self) -> Arc<ModeRegistry> {
         self.modes.get().unwrap_or_default()
+    }
+
+    /// Where source `id` is: what its port reports itself (`from: status`), else the
+    /// operator's `--source-position` entry (`from: configured`), else `None`. The one
+    /// definition behind [`Node::source_position`] and the origin query's vantage.
+    pub(crate) fn source_position(&self, id: &SourceId) -> Option<SourcePosition> {
+        self.port(id).and_then(|p| p.position()).or_else(|| {
+            self.source_positions.get(id).map(|p| SourcePosition {
+                from: PositionFrom::Configured,
+                ..*p
+            })
+        })
     }
 
     /// The kind a job recorded as `kind` was expanded from, when the node expands its
@@ -2350,12 +2371,7 @@ impl Node {
     /// Where source `id` is: what its port reports itself (`from: status`), else the
     /// operator's `--source-position` entry (`from: configured`), else `None`.
     pub fn source_position(&self, id: &SourceId) -> Option<SourcePosition> {
-        self.port(id).and_then(|p| p.position()).or_else(|| {
-            self.inner.source_positions.get(id).map(|p| SourcePosition {
-                from: PositionFrom::Configured,
-                ..*p
-            })
-        })
+        self.inner.source_position(id)
     }
 
     /// The node's station, when one is set.

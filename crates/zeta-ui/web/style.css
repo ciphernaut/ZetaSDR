@@ -48,6 +48,7 @@
   --axis-w: 64px;          /* the waterfall's frequency axis */
   --side-w: 360px;         /* the side column */
   --side-collapsed-w: 44px;
+  --dock-share: 40%;       /* the docked pane's share of the side column (dock right) */
   --bar-h-top: 34px;       /* the top bar */
   --bar-h-bottom: 38px;    /* the command bar */
   --bar-h: var(--bar-h-top);
@@ -149,6 +150,12 @@ input:focus { border-color: var(--accent); }
 .src-tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 .src-tab[aria-selected="true"] .name { color: var(--accent); }
 .src-tab.fault .name { color: var(--error); }
+/* The Map tab (app.js mapTab): after the source tabs; the shown source's tab keeps its colour
+   (`kept`) while the map is shown, so the page shows which source it returns to. */
+.src-tab.kept { color: var(--text); }
+.src-tab.kept .name { color: var(--accent); }
+.map-tab .count { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.map-tab .count:empty { display: none; }
 /* A pinned source (plan 12 spec 4.1): `pin` after the range; the title names the band. */
 .src-tab .tag.pin {
   border: 1px solid var(--accent);
@@ -172,16 +179,19 @@ input:focus { border-color: var(--accent); }
 .pane-tab[hidden] { display: none; }
 .pane-tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
 #drawer-toggle { display: none; align-self: center; }
-#map-toggle { display: none; align-self: center; }
-#map-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 #listen-all { align-self: center; }
 #listen-all[aria-pressed="true"] { border-color: var(--ok); color: var(--ok); }
 
 #main { grid-area: main; position: relative; min-width: 0; min-height: 0; }
 #waterfall { position: absolute; inset: 0; background: var(--bg); }
-/* The map (map.js, view `map on`): a pane beside the waterfall in the wide footprint. */
-#map { position: absolute; top: 0; bottom: 0; right: 0; left: 50%; background: var(--bg); }
-html[data-map="on"] #waterfall { right: 50%; }
+/* The map (map.js): the Map tab's view, in the waterfall's place while the view's `main` is
+   map (<html data-main>, app.js applyMain). The hidden waterfall keeps its box, so its
+   canvases keep their size and its job keeps streaming (waterfall.js paints nothing then). */
+#map { position: absolute; inset: 0; background: var(--bg); }
+html[data-main="rf"] #map { display: none; }
+html[data-main="map"] #map { display: block; inset: 0; }
+#map[hidden] { display: none; }
+html[data-main="map"] #waterfall { visibility: hidden; }
 #map .leaflet-popup-content .age { color: var(--map-dim); font-size: 11px; }
 #map path.map-pos { stroke: var(--map-mark); fill: var(--map-mark); fill-opacity: 0.8; stroke-width: 2; }
 #map path.map-track { stroke: var(--map-mark); stroke-opacity: 0.7; stroke-width: 2; fill: none; }
@@ -195,11 +205,34 @@ html[data-map="on"] #waterfall { right: 50%; }
 #map .map-subject.selected .arrow.dot { background: var(--map-sel); }
 #map .map-subject.selected .label { box-shadow: 0 0 0 1px var(--map-sel); }
 #map path.map-home { stroke: var(--map-sel); fill: var(--map-sel); fill-opacity: 0.6; stroke-width: 2; }
+/* Lit sites (map.js, plan 32): a site's brightness (`--site-brightness`, its best score × its
+   set's freshness, set per site) is the fill's opacity; a site whose designator disagrees is a
+   dashed ring with no fill; bearings run from where the signal was received, as bright as
+   their site. */
+#map path.map-site { stroke: var(--user); fill: var(--user); stroke-width: 2; fill-opacity: calc(0.8 * var(--site-brightness, 1)); stroke-opacity: calc(0.3 + 0.7 * var(--site-brightness, 1)); }
+#map path.map-site[data-agree="disagrees"] { fill: none; }
+/* A site confirmed by a heard callsign or decoded id: a ring outside it. */
+#map path.map-site[data-confirmed] { stroke: var(--map-sel); stroke-width: 5; paint-order: stroke; stroke-opacity: 1; }
+#map path.map-bearing { stroke: var(--user); stroke-width: 1.5; fill: none; stroke-opacity: calc(0.7 * var(--site-brightness, 1)); }
+#map .map-source { width: auto; height: auto; white-space: nowrap; padding: 0 3px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); border: 1px solid var(--map-sel); }
+#map .leaflet-popup-content .map-origin + .map-origin, #map .leaflet-popup-content .map-lookup { margin-top: 6px; }
+#map .leaflet-popup-content .map-lookup { color: var(--map-dim); font-size: 11px; }
+/* map.js: tiles that do not load say so, bottom left over the map, above the attribution. */
+#map .map-tile-note { position: absolute; z-index: 1000; bottom: 24px; left: 8px; max-width: 60%; padding: 2px 6px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); pointer-events: none; }
+/* The layers control's toggle: Leaflet's images/layers.png is not vendored, so a drawn stack. */
+#map .leaflet-control-layers-toggle { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 26 26'%3E%3Cpath d='M13 4 24 10 13 16 2 10Z' fill='%23555'/%3E%3Cpath d='M4.5 14.5 13 19.5 21.5 14.5 24 16 13 22 2 16Z' fill='%23888'/%3E%3C/svg%3E"); background-size: 26px 26px; background-repeat: no-repeat; background-position: center; }
+/* No station: the sites are not cut by reach (map.js syncNote). */
+#map .map-note { position: absolute; z-index: 1000; top: 8px; right: 8px; max-width: 60%; padding: 2px 6px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); pointer-events: none; }
 /* The pane under the waterfall (panes.js): the strip's selected pane, at the height the jobs
    panel has; the waterfall and the map keep the rest. */
 #pane { position: absolute; left: 0; right: 0; bottom: 0; height: 40%; overflow: hidden; background: var(--bg); border-top: 1px solid var(--border); }
 #pane[hidden] { display: none; }
 html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
+/* Docked right (view `dock`, app.js applyDock): #pane is the body of the side column's third
+   section, section.pane.dock, and the main view keeps the whole of #main. */
+section.pane.dock { flex: 1 1 var(--dock-share); border-block-start: 1px solid var(--border); }
+html[data-dock="right"] #pane-dock > #pane { position: static; height: auto; flex: 1; min-height: 0; border-top: 0; }
+html[data-dock="right"][data-strip] #waterfall, html[data-dock="right"][data-strip] #map { bottom: 0; }
 /* The Subjects pane (subjects.js) fills it. */
 #subjects { height: 100%; overflow: auto; background: var(--bg); }
 /* The pane is a column of sections; each section scrolls both ways on its own, so its header
@@ -404,16 +437,17 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
    narrow drawer keeps both panes and its headers do not fold. */
 html:not([data-footprint="narrow"]) section.pane[data-collapsed] > :not(h2) { display: none; }
 html:not([data-footprint="narrow"]) section.pane[data-collapsed] { flex: 0 0 auto; }
-html:not([data-footprint="narrow"]) .pane.transcript[data-collapsed] + .pane.jobs {
+html:not([data-footprint="narrow"]) .pane.transcript[data-collapsed] ~ .pane.jobs {
   flex: 1; max-height: none;
 }
 html[data-footprint="narrow"] .pane-head { pointer-events: none; cursor: default; }
 html[data-footprint="narrow"] .pane-head:disabled { opacity: 1; }   /* inert, not dimmed (app.js applySide) */
-/* Both folded: the column narrows to the two header bars, read downwards. */
-html[data-side="none"]:not([data-footprint="narrow"]) #app {
+/* Both folded: the column narrows to the two header bars, read downwards, unless a docked
+   pane is open in it (#app[data-dock-open], app.js applyDock). */
+html[data-side="none"]:not([data-footprint="narrow"]) #app:not([data-dock-open]) {
   grid-template-columns: minmax(0, 1fr) var(--side-collapsed-w);
 }
-html[data-side="none"]:not([data-footprint="narrow"]) .pane-head {
+html[data-side="none"]:not([data-footprint="narrow"]) :where(#app:not([data-dock-open])) .pane-head {
   writing-mode: vertical-rl;
   inline-size: auto;
   block-size: 100%;
@@ -554,12 +588,7 @@ html[data-footprint="narrow"] .brand { display: none; }
 html[data-footprint="narrow"] .src-tab .range { display: none; }
 html[data-footprint="narrow"] .src-tab .centre { display: inline; }
 html[data-footprint="narrow"] #drawer-toggle { display: inline-block; }
-/* Narrow: the map is a tab in the waterfall's place (#map-toggle), not a pane beside it. */
-html[data-footprint="narrow"][data-map="on"] #map-toggle { display: inline-block; }
-html[data-footprint="narrow"] #waterfall { right: 0; }
-html[data-footprint="narrow"] #map { left: 0; z-index: 5; }
-html[data-footprint="narrow"]:not([data-pane="map"]) #map { display: none; }
-/* And so is the strip's pane (its tab), the whole of #main. */
+/* Narrow: the strip's pane (its tab) is the whole of #main, over the waterfall or the map. */
 html[data-footprint="narrow"] #pane { top: 0; height: auto; z-index: 5; border-top: 0; }
 html[data-footprint="narrow"] #side { display: none; }
 html[data-footprint="narrow"][data-drawer="open"] #side {

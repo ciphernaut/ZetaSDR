@@ -21,7 +21,7 @@ fn rendering_lists_every_op_variant() {
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let variants = v["value"]["op"]["oneOf"].as_array().unwrap();
-    assert_eq!(variants.len(), 41);
+    assert_eq!(variants.len(), 42);
     let md = zeta()
         .arg("agents-md")
         .assert()
@@ -286,6 +286,32 @@ fn exploring_an_unknown_signal_is_in_the_guide() {
         "register says",
         "legal line",
         "measured over the bursts",
+    ] {
+        assert!(md.contains(needle), "missing {needle}");
+    }
+}
+
+#[test]
+fn origin_lookup_is_in_the_guide() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    for needle in [
+        "### origin_lookup",
+        "CLI: `zeta origin lookup --job ID | --source S --center-hz N --bandwidth-hz N [--modulation fm,fsk]`",
+        "`job_context.origins`",
+        "`modulation: null` reads as unknown",
+        "`from_note`",
+        "kind: source, source}",
+        "remote source without a position",
+        "consistent with",
+        "`origin_lookup`'s `origin` answer",
+        "--protocol origin",
     ] {
         assert!(md.contains(needle), "missing {needle}");
     }
