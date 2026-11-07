@@ -3,10 +3,11 @@
 //! `callsign`, the SSID stripped), run by zeta-ext's `fake_lines` (pinned with
 //! `ZETA_HANDLER_FAKE_LINES`, as `ui.rs` pins it), and `--knowledge-acma` pointing at a
 //! 127.0.0.1 stub of the register service answering one synthetic `tx` row on the tone
-//! band with callsign `XX4EX`. The job's origins are looked up first; `fake_lines` then
-//! prints one event, and the node confirms the lit site from it, or, for another
-//! callsign, changes nothing. The `origin` frames are counted in the node's
-//! `events.log`, which carries the source's feed and so every frame of the job's stream.
+//! band with callsign `XX4EX`. `fake_lines` prints one event every 0.5 s; once the job's
+//! origins are looked up, the node confirms the lit site from it (once, however often it
+//! repeats, and again after a fresh lookup), or, for another callsign, changes nothing.
+//! The `origin` frames are counted in the node's `events.log`, which carries the
+//! source's feed and so every frame of the job's stream.
 
 mod common;
 
@@ -24,9 +25,12 @@ const SECRET: &str = "origin-identity-secret-0123";
 const TONE_HZ: u64 = 100_000_000;
 /// The test row's band, as `ui.rs`'s `fake_pos` row is started on `tone`.
 const BAND_HZ: u64 = 40_000;
-/// `fake_lines` prints its line after this many input bytes: 3 s of the 48 kHz cs16 IQ,
-/// so the origin lookup made right after the start has been kept by then.
-const AFTER_BYTES: &str = "576000";
+/// `fake_lines` prints its line at once, then again after every this many input bytes:
+/// 0.5 s of the 48 kHz cs16 IQ. Whenever the lookup lands, a later line follows it.
+const REPEAT_BYTES: &str = "96000";
+/// Decoded events seen after a point, before an absence there is believed: each one
+/// went through the tee too, which reads the same stream.
+const SETTLE_EVENTS: usize = 3;
 /// How long an end state may take to show.
 const WITHIN: Duration = Duration::from_secs(20);
 
@@ -181,7 +185,8 @@ fn node(dir: &Path, line: &str) -> ServeProc {
         &[
             ("ZETA_HANDLER_FAKE_LINES", fake_lines.to_str().unwrap()),
             ("ZETA_PLUGIN_ENV_FAKE_LINES", line),
-            ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", AFTER_BYTES),
+            ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", "0"),
+            ("ZETA_PLUGIN_ENV_FAKE_REPEAT_BYTES", REPEAT_BYTES),
         ],
     )
 }
@@ -210,6 +215,12 @@ async fn start_and_look_up(c: &NodeClient) -> String {
     )
     .await;
     let job = job.as_str().expect("a job id").to_string();
+    look_up(c, &job).await;
+    job
+}
+
+/// `origin_lookup` by `job`; the XX4EX row must be lit.
+async fn look_up(c: &NodeClient, job: &str) {
     let a = op(
         c,
         json!({"op": "origin_lookup", "job": job, "source": null, "center_hz": null,
@@ -223,17 +234,66 @@ async fn start_and_look_up(c: &NodeClient) -> String {
         .filter_map(|o| o["allocation"]["callsign"].as_str())
         .collect();
     assert_eq!(calls, ["XX4EX"], "the XX4EX row is lit: {a}");
-    job
 }
 
-/// The `events.log` events of `job` with `protocol` `protocol`.
+/// The `events.log` lines of `job` whose event's `protocol` is `protocol`, each with its
+/// `t_ns` (when it was logged) and `event`.
 fn logged(dir: &Path, job: &str, protocol: &str) -> Vec<Value> {
     let text = std::fs::read_to_string(dir.join("state/events.log")).unwrap_or_default();
     text.lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter(|l| l["job"] == job && l["event"]["protocol"] == protocol)
-        .map(|l| l["event"].clone())
         .collect()
+}
+
+/// The `origin` frames of `job` in `events.log`, once there are at least `n`.
+async fn origin_frames(dir: &Path, job: &str, n: usize) -> Vec<Value> {
+    until(WITHIN, async || {
+        let f: Vec<Value> = logged(dir, job, "origin")
+            .into_iter()
+            .map(|l| l["event"].clone())
+            .collect();
+        (f.len() >= n).then_some(f)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "fewer than {n} origin frames: {:?}",
+            logged(dir, job, "origin")
+        )
+    })
+}
+
+/// Wait until [`SETTLE_EVENTS`] decoded events of `job` were logged after the last
+/// `origin` frame was.
+async fn settle(dir: &Path, job: &str) {
+    let last = logged(dir, job, "origin")
+        .last()
+        .map(|l| l["t_ns"].as_u64().unwrap())
+        .expect("an origin frame");
+    until(WITHIN, async || {
+        let after = logged(dir, job, "fake_ident")
+            .iter()
+            .filter(|l| l["t_ns"].as_u64().unwrap() > last)
+            .count();
+        (after >= SETTLE_EVENTS).then_some(())
+    })
+    .await
+    .expect("decoded events after the last origin frame");
+}
+
+/// Poll until `job`'s kept origins lead with one confirmed by `XX4EX`; that origin.
+async fn confirmed(c: &NodeClient, job: &str) -> Value {
+    let Some(origin) = until(WITHIN, async || {
+        let ctx = context(c, job).await;
+        let o = ctx["origins"]["origins"][0].clone();
+        (o["confirmed"] == json!({"field": "src", "value": "XX4EX"})).then_some(o)
+    })
+    .await
+    else {
+        panic!("no confirmation: {}", context(c, job).await);
+    };
+    origin
 }
 
 /// Poll `f` until it gives `Some`, at most `within`.
@@ -260,35 +320,25 @@ async fn a_decoded_callsign_confirms_a_lit_site_and_republishes() {
     let serve = node(dir.path(), r#"{"src":"XX4EX-7"}"#);
     let c = NodeClient::new(&serve.url, SECRET).unwrap();
     let job = start_and_look_up(&c).await;
-    let Some(origin) = until(WITHIN, async || {
-        let ctx = context(&c, &job).await;
-        let o = ctx["origins"]["origins"][0].clone();
-        (o["confirmed"] == json!({"field": "src", "value": "XX4EX"})).then_some(o)
-    })
-    .await
-    else {
-        panic!("no confirmation: {}", context(&c, &job).await);
-    };
+    let origin = confirmed(&c, &job).await;
     assert_eq!(origin["score"], 1.0);
     assert_eq!(origin["allocation"]["callsign"], "XX4EX");
-    let frames = until(WITHIN, async || {
-        let f = logged(dir.path(), &job, "origin");
-        (f.len() >= 2).then_some(f)
-    })
-    .await
-    .unwrap_or_else(|| {
-        panic!(
-            "no second origin frame: {:?}",
-            logged(dir.path(), &job, "origin")
-        )
-    });
-    assert_eq!(frames.len(), 2, "{frames:?}");
-    assert_eq!(
-        frames[1]["summary"],
-        "confirmed XX4EX: Example Water Authority, Example Hill"
-    );
-    assert_eq!(frames[1]["origins"][0]["confirmed"]["value"], "XX4EX");
+    let summary = "confirmed XX4EX: Example Water Authority, Example Hill";
+    let frames = origin_frames(dir.path(), &job, 2).await;
     assert!(frames[0]["origins"][0]["confirmed"].is_null(), "{frames:?}");
+    assert_eq!(frames[1]["summary"], summary);
+    assert_eq!(frames[1]["origins"][0]["confirmed"]["value"], "XX4EX");
+    // The same callsign heard again republishes nothing.
+    settle(dir.path(), &job).await;
+    assert_eq!(logged(dir.path(), &job, "origin").len(), 2);
+    // A fresh lookup replaces the kept origins; the station confirms them again.
+    look_up(&c, &job).await;
+    let frames = origin_frames(dir.path(), &job, 4).await;
+    assert!(frames[2]["origins"][0]["confirmed"].is_null(), "{frames:?}");
+    assert_eq!(frames[3]["summary"], summary);
+    assert_eq!(confirmed(&c, &job).await["score"], 1.0);
+    settle(dir.path(), &job).await;
+    assert_eq!(logged(dir.path(), &job, "origin").len(), 4);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -297,13 +347,9 @@ async fn a_mismatching_callsign_changes_nothing() {
     let serve = node(dir.path(), r#"{"src":"XX4ZZ"}"#);
     let c = NodeClient::new(&serve.url, SECRET).unwrap();
     let job = start_and_look_up(&c).await;
-    until(WITHIN, async || {
-        (!logged(dir.path(), &job, "fake_ident").is_empty()).then_some(())
-    })
-    .await
-    .expect("the decoded event");
-    // The tee reads the same stream the log does: give it a moment past the event.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The lookup's frame logged, then several XX4ZZ events after it.
+    origin_frames(dir.path(), &job, 1).await;
+    settle(dir.path(), &job).await;
     let ctx = context(&c, &job).await;
     let origins = ctx["origins"]["origins"].as_array().expect("origins kept");
     assert!(origins.iter().all(|o| o["confirmed"].is_null()), "{ctx}");

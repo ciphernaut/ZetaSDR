@@ -466,9 +466,10 @@ impl Inner {
     /// Match the decoded identities of `rec`'s `Event` outputs among `outputs` against the
     /// job's kept origins (design 4.6), one task per output, each subscribed before this
     /// returns. An event whose `identity.field` holds a non-blank string
-    /// ([`super::origin::identity_value`]) differing from the last value matched is handed
-    /// to [`Inner::confirm_origin`]; a match becomes the last value matched, a mismatch
-    /// changes nothing. The job's own `origin` events are passed over. A tee ends when its
+    /// ([`super::origin::identity_value`]) is handed to [`Inner::confirm_origin`], which
+    /// confirms the kept origins it matches; a mismatch, or a value that already confirmed
+    /// every origin it matches in the context kept now, changes nothing (so a repeat
+    /// publishes nothing, and a fresh lookup is confirmed again). The job's own `origin` events are passed over. A tee ends when its
     /// stream is unregistered at the job's end or on `token`; it never ends the job, and a
     /// lag only skips events.
     pub(super) fn tee_identity(
@@ -487,7 +488,6 @@ impl Inner {
             // Weak: a tee never keeps the node alive.
             let inner = Arc::downgrade(self);
             tokio::spawn(async move {
-                let mut last: Option<String> = None;
                 loop {
                     let frame = tokio::select! {
                         biased;
@@ -510,15 +510,10 @@ impl Inner {
                     else {
                         continue;
                     };
-                    if last.as_deref() == Some(value.as_str()) {
-                        continue;
-                    }
                     let Some(inner) = inner.upgrade() else {
                         return;
                     };
-                    if inner.confirm_origin(&id, &source, &identity.field, &value) {
-                        last = Some(value);
-                    }
+                    inner.confirm_origin(&id, &source, &identity.field, &value);
                 }
             });
         }

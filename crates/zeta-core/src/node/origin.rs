@@ -7,7 +7,7 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::persist::now;
+use super::persist::{now, persist};
 use super::{Inner, Node, NodeError};
 use crate::bursts::CaptureRecord;
 use crate::classify::Classification;
@@ -19,7 +19,7 @@ use crate::ops::{BITS_KIND, GRAPH_KIND, SignalBand};
 use crate::reach::Reach;
 use crate::station::{Antenna, Station};
 use crate::stream::{Frame, Payload};
-use crate::types::{Baud, Hz, JobId, Provenance, SourceId, Span, StreamKind, Timestamp};
+use crate::types::{Baud, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 
 /// At most this many origins in one answer, best score first, then nearest.
 pub const ORIGIN_SITES: usize = 50;
@@ -515,25 +515,29 @@ pub fn summary(a: &OriginAnswer) -> String {
     format!("{n} {noun} on {f} MHz: {}", sites.join("; "))
 }
 
-/// Confirm the first origin whose `callsign` equals `value` (both trimmed, case
-/// ignored): its score becomes 1 and `confirmed` `{field, value}`, its terms stay. The
-/// index of that origin, or `None`, changing nothing, when none matches. The order is
-/// left as it was: a caller re-sorts if the order matters.
-pub fn confirm(a: &mut OriginAnswer, field: &str, value: &str) -> Option<usize> {
+/// Confirm every origin whose `callsign` equals `value` (both trimmed, case ignored):
+/// each one's score becomes 1 and `confirmed` `{field, value}`, its terms stay. The
+/// indices of those origins, in answer order; empty, changing nothing, when none
+/// matches. The order is left as it was: a caller re-sorts if the order matters.
+pub fn confirm(a: &mut OriginAnswer, field: &str, value: &str) -> Vec<usize> {
     let want = value.trim();
-    let i = a.origins.iter().position(|o| {
-        o.allocation
+    let mut hit = Vec::new();
+    for (i, o) in a.origins.iter_mut().enumerate() {
+        let matches = o
+            .allocation
             .callsign
             .as_deref()
-            .is_some_and(|c| c.trim().eq_ignore_ascii_case(want))
-    })?;
-    let o = &mut a.origins[i];
-    o.score = 1.0;
-    o.confirmed = Some(Confirmed {
-        field: field.to_string(),
-        value: value.to_string(),
-    });
-    Some(i)
+            .is_some_and(|c| c.trim().eq_ignore_ascii_case(want));
+        if matches {
+            o.score = 1.0;
+            o.confirmed = Some(Confirmed {
+                field: field.to_string(),
+                value: value.to_string(),
+            });
+            hit.push(i);
+        }
+    }
+    hit
 }
 
 /// The identity an event's `identity.field` value `v` carries (design 4.6): a string,
@@ -552,12 +556,30 @@ pub fn identity_value(identity: &Identity, v: &serde_json::Value) -> Option<Stri
 }
 
 /// [`confirm`] `value` (from the event field `field`) in `a`, then re-sort `a` so the
-/// confirmed origin, score 1, leads. The republished `summary`,
-/// `confirmed <value>: <licensee>, <site>` (the parts the row has; its service when it
-/// has neither), or `None`, changing nothing, when no origin's callsign is `value`.
+/// confirmed origins, score 1, lead. The republished `summary`,
+/// `confirmed <value>: <licensee>, <site>` naming the first confirmed origin after the
+/// sort (the parts its row has; its service when it has neither). `None`, changing
+/// nothing, when no origin's callsign is `value`, or when every one whose callsign is
+/// already has `confirmed.value` `value` (a repeat changes nothing).
 pub fn confirm_identity(a: &mut OriginAnswer, field: &str, value: &str) -> Option<String> {
-    let i = confirm(a, field, value)?;
-    let al = &a.origins[i].allocation;
+    let want = value.trim();
+    let mut matching = a.origins.iter().filter(|o| {
+        o.allocation
+            .callsign
+            .as_deref()
+            .is_some_and(|c| c.trim().eq_ignore_ascii_case(want))
+    });
+    if matching.all(|o| o.confirmed.as_ref().is_some_and(|c| c.value == value)) {
+        // No origin matches (`all` of none), or every match is confirmed already.
+        return None;
+    }
+    confirm(a, field, value);
+    a.origins.sort_by(origin_order);
+    let al = &a
+        .origins
+        .iter()
+        .find(|o| o.confirmed.as_ref().is_some_and(|c| c.value == value))?
+        .allocation;
     let name: Vec<&str> = [al.licensee.as_deref(), al.site.as_deref()]
         .into_iter()
         .flatten()
@@ -566,7 +588,6 @@ pub fn confirm_identity(a: &mut OriginAnswer, field: &str, value: &str) -> Optio
         true => al.service.clone(),
         false => name.join(", "),
     };
-    a.origins.sort_by(origin_order);
     Some(format!("confirmed {value}: {name}"))
 }
 
@@ -783,16 +804,59 @@ impl Inner {
         a: &OriginAnswer,
         summary: String,
     ) -> Result<(), NodeError> {
-        self.context_merge(id, serde_json::json!({ "origins": a }))?;
-        self.publish_origin(id, source, a, summary);
-        Ok(())
+        self.update_origins(id, source, |_| Some((a.clone(), summary)))
+            .map(|_| ())
+    }
+
+    /// Under one hold of the jobs lock: hand `update` job `id`'s kept `origins` (`None`
+    /// when there are none, or they do not parse) and, when it gives an answer and a
+    /// summary, keep that answer as `origins` (persisted) and publish it as one `origin`
+    /// event ([`Inner::publish_origin`]). Holding the lock throughout, a lookup and a
+    /// confirmation never overwrite each other, and the frames go out in the order the
+    /// context changed. `Ok(false)` when `update` gave nothing; `UnknownJob` for a job
+    /// the node does not know; a failed persist publishes nothing.
+    fn update_origins(
+        &self,
+        id: &JobId,
+        source: &SourceId,
+        update: impl FnOnce(Option<OriginAnswer>) -> Option<(OriginAnswer, String)>,
+    ) -> Result<bool, NodeError> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let entry = jobs
+            .get_mut(id)
+            .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        let kept = entry
+            .record
+            .context
+            .get("origins")
+            .and_then(|v| serde_json::from_value::<OriginAnswer>(v.clone()).ok());
+        let Some((a, summary)) = update(kept) else {
+            return Ok(false);
+        };
+        let ctx = &mut entry.record.context;
+        if !ctx.is_object() {
+            *ctx = serde_json::json!({});
+        }
+        let value = serde_json::to_value(&a).expect("an origin answer serialises");
+        ctx.as_object_mut()
+            .expect("context is an object")
+            .insert("origins".into(), value);
+        persist(&self.jobs_dir, &entry.record)?;
+        let out = entry
+            .outputs
+            .iter()
+            .find(|(k, s)| *k == StreamKind::Event && self.bus.receiver_count(s).is_some())
+            .map(|(_, s)| s.clone());
+        self.publish_origin(out, id, source, &a, summary);
+        Ok(true)
     }
 
     /// A decoded identity `value` (from the event field `field`) seen by job `id`
-    /// (design 4.6): when the job's context holds `origins` and one of them has the
-    /// callsign `value`, it is confirmed ([`confirm_identity`]), kept and republished
-    /// with `summary` `confirmed <value>: <licensee>, <site>`; true then. False,
-    /// changing nothing, for no `origins` or no match (confirm-only).
+    /// (design 4.6): every kept origin whose callsign is `value` is confirmed
+    /// ([`confirm_identity`]), the answer kept and republished with `summary`
+    /// `confirmed <value>: <licensee>, <site>`; true then. False, changing nothing, for
+    /// no kept `origins`, no match (confirm-only), or matches all confirmed by `value`
+    /// already (a repeat).
     pub(super) fn confirm_origin(
         &self,
         id: &JobId,
@@ -800,22 +864,25 @@ impl Inner {
         field: &str,
         value: &str,
     ) -> bool {
-        let kept = self
-            .jobs
-            .lock()
-            .unwrap()
-            .get(id)
-            .and_then(|e| e.record.context.get("origins").cloned());
-        let Some(mut a) = kept.and_then(|v| serde_json::from_value::<OriginAnswer>(v).ok()) else {
-            return false;
-        };
-        let Some(summary) = confirm_identity(&mut a, field, value) else {
-            return false;
-        };
-        self.keep_origin_as(id, source, &a, summary).is_ok()
+        self.update_origins(id, source, |kept| {
+            let mut a = kept?;
+            let summary = confirm_identity(&mut a, field, value)?;
+            Some((a, summary))
+        })
+        .unwrap_or(false)
     }
 
-    fn publish_origin(&self, id: &JobId, source: &SourceId, a: &OriginAnswer, summary: String) {
+    /// Publish `a` as one `origin` event on `out`, the job's event output, or, with none
+    /// (an audio demodulator, a job that ended), on a stream registered for the one frame
+    /// with the job's provenance, so the source's feed still carries it.
+    fn publish_origin(
+        &self,
+        out: Option<StreamId>,
+        id: &JobId,
+        source: &SourceId,
+        a: &OriginAnswer,
+        summary: String,
+    ) {
         let payload = serde_json::json!({
             "protocol": "origin",
             "job": id.0,
@@ -842,12 +909,6 @@ impl Inner {
                 end_ns: a.t_ns,
             },
         };
-        let out = self.jobs.lock().unwrap().get(id).and_then(|e| {
-            e.outputs
-                .iter()
-                .find(|(k, s)| *k == StreamKind::Event && self.bus.receiver_count(s).is_some())
-                .map(|(_, s)| s.clone())
-        });
         let (stream, transient) = match out {
             Some(s) => (s, false),
             None => (self.bus.register(StreamKind::Event, prov.clone()), true),
@@ -1178,9 +1239,9 @@ mod tests {
         let marked = score_row(&row, &band, None, None).unwrap();
         let mut a = empty_answer(vec![plain, marked.clone()], Some(2));
         let before = a.clone();
-        assert_eq!(confirm(&mut a, "callsign", "XX4ZZ"), None);
+        assert!(confirm(&mut a, "callsign", "XX4ZZ").is_empty());
         assert_eq!(a, before);
-        assert_eq!(confirm(&mut a, "callsign", " xx4ex "), Some(1));
+        assert_eq!(confirm(&mut a, "callsign", " xx4ex "), vec![1]);
         assert_eq!(a.origins[1].score, 1.0);
         assert_eq!(a.origins[1].terms, marked.terms);
         assert_eq!(
@@ -1319,24 +1380,50 @@ mod tests {
         best.licence_no = Some("0000002".into());
         let mut marked = tx(Some("16K0F1D"), None, CENTER, Some(17.0));
         marked.callsign = Some("XX4EX".into());
-        let origins = [best, marked]
+        // The same callsign licensed at a second, nearer site.
+        let mut second = marked.clone();
+        second.site = Some("Example Ridge".into());
+        second.licence_no = Some("0000003".into());
+        second.distance_km = Some(9.0);
+        let origins = [best, marked, second]
             .iter()
             .map(|r| score_row(r, &band, None, None).unwrap())
             .collect();
-        let mut a = empty_answer(origins, Some(2));
+        let mut a = empty_answer(origins, Some(3));
         assert_eq!(confirm_identity(&mut a, "src", "XX4ZZ"), None);
         assert!(a.origins.iter().all(|o| o.confirmed.is_none()));
         let s = confirm_identity(&mut a, "src", "XX4EX").unwrap();
-        assert_eq!(s, "confirmed XX4EX: Example Water Authority, Example Hill");
-        assert_eq!(a.origins[0].allocation.callsign.as_deref(), Some("XX4EX"));
-        assert_eq!(a.origins[0].score, 1.0);
+        // Every match is confirmed; the summary names the first after the sort.
+        assert_eq!(s, "confirmed XX4EX: Example Water Authority, Example Ridge");
+        let sites: Vec<_> = a
+            .origins
+            .iter()
+            .map(|o| o.allocation.site.as_deref())
+            .collect();
         assert_eq!(
-            a.origins[0].confirmed,
-            Some(Confirmed {
-                field: "src".into(),
-                value: "XX4EX".into()
-            })
+            sites,
+            [
+                Some("Example Ridge"),
+                Some("Example Hill"),
+                Some("Example Ridge")
+            ]
         );
+        for o in &a.origins[..2] {
+            assert_eq!(o.allocation.callsign.as_deref(), Some("XX4EX"));
+            assert_eq!(o.score, 1.0);
+            assert_eq!(
+                o.confirmed,
+                Some(Confirmed {
+                    field: "src".into(),
+                    value: "XX4EX".into()
+                })
+            );
+        }
+        assert_eq!(a.origins[2].confirmed, None);
+        // A repeat changes nothing, so nothing is republished.
+        let before = a.clone();
+        assert_eq!(confirm_identity(&mut a, "src", "XX4EX"), None);
+        assert_eq!(a, before);
     }
 
     struct TestPort {
