@@ -98,6 +98,8 @@
 // selected, and the pane shows in #pane under the waterfall while the view's `pane` is
 // `subjects` (`view set subjects on|off` is an alias). In the narrow footprint the pane is a
 // tab in the waterfall's place (<html data-pane="subjects">) that the strip's tab opens and closes.
+// The view's `dock` (auto | bottom | right; auto the theme's `layout.dock`) moves #pane, whichever
+// pane it shows, into the side column as a third folding section in the wide footprint (applyDock).
 // The Bits pane (bits.js, #bits) is the strip's `bits` tab, eligible while a running job has a
 // slicer stream; Explore's Work the bits and a job row's Bits button select it on that job. A
 // `bits` job runs on source `node`, so it draws no outline (overlays.js outlines only the
@@ -178,6 +180,7 @@ export const state = {
   lastJobs: [], // the last job_list result
   allowStops: false, // `allow stops on|off`: /ask may stop and replace jobs (not persisted)
   allowDeletes: false, // `allow deletes on|off`: /ask may delete captures (not persisted)
+  dockCollapsed: false, // the docked pane's section folded (applyDock; not persisted)
 };
 const sourceListeners = [];
 
@@ -939,12 +942,15 @@ function start(api) {
   mountSideHeads();
   applyRail();
   applyMain();
+  applyDock();
+  state.subjects.onChange(paintDockHead);
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
     if (key === "theme") applyTheme();
     if (key === "side") applySide();
     if (key === "main") applyMain();
     if (key === "pane") applyPanes();
+    if (key === "dock") applyDock();
   });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {
@@ -1129,6 +1135,8 @@ async function applyTheme() {
   if (seq !== themeSwitch) return;
   root.dataset.theme = id;
   root.dataset.rail = theme.layout?.rail === false ? "off" : "on";
+  themeDock = theme.layout?.dock ?? null;
+  applyDock();
   applyRail();
   if (state.wf) {
     state.wf.refreshThemeColours();
@@ -1229,6 +1237,14 @@ function mountSideHeads() {
       state.view.set("side", next);
     });
   }
+  // The docked pane's header bar (applyDock builds the section on demand): folds it in the
+  // page's memory, the `side` policy untouched.
+  document.getElementById("side")?.addEventListener("click", (ev) => {
+    const head = ev.target.closest("#pane-dock .pane-head");
+    if (!head || footprint() === "narrow") return;
+    state.dockCollapsed = !state.dockCollapsed;
+    applyDock();
+  });
 }
 
 // The job tags live in the waterfall's rail when the theme's layout has one (<html
@@ -1252,10 +1268,100 @@ function applyMain() {
   state.panes?.render();
 }
 
-// The pane strip and #pane from the view's `pane` and the panes' eligibility (panes.js). Run on
-// a view change, a row learned, a jobs poll and a footprint change, never on a message.
+// The pane strip and #pane from the view's `pane` and the panes' eligibility (panes.js), then
+// where #pane docks. Run on a view change, a row learned, a jobs poll and a footprint change,
+// never on a message.
 function applyPanes() {
   state.panes?.render();
+  applyDock();
+}
+
+// ---- the dock ---------------------------------------------------------------------------
+// The view's `dock` (auto | bottom | right) places the pane host #pane: `bottom` as the last
+// child of #main (style.css gives it the bottom of the main area), `right` in the side column
+// as a third section, `section.pane.dock#pane-dock`, between the Transcript and the Jobs pane,
+// with a header bar naming the shown pane (and, for Subjects, a count) that folds it. `auto`
+// is the applied theme's `layout.dock`, else bottom. <html data-dock> carries the resolved
+// value in both footprints; the narrow footprint leaves #pane in #main (panes take the main
+// area's place there). The move is a DOM move of the same element, so the panes see nothing.
+// The fold is page memory (state.dockCollapsed), not a policy, forgotten when no pane is shown.
+let themeDock = null; // the applied theme's layout.dock ("bottom" | "right" | null)
+
+function resolveDock() {
+  const v = state.view ? state.view.get("dock") : "auto";
+  if (v === "bottom" || v === "right") return v;
+  return themeDock === "right" ? "right" : "bottom";
+}
+
+function applyDock() {
+  const dock = resolveDock();
+  const root = document.documentElement;
+  if (root.dataset.dock !== dock) root.dataset.dock = dock;
+  const host = document.getElementById("pane");
+  const main = document.getElementById("main");
+  if (!host || !main) return;
+  const pane = state.panes ? state.panes.current() : null;
+  if (!pane) state.dockCollapsed = false;
+  let sec = document.getElementById("pane-dock");
+  const app = document.getElementById("app");
+  if (dock !== "right" || !pane || footprint() === "narrow") {
+    if (host.parentElement !== main) main.append(host);
+    sec?.remove();
+    delete app?.dataset.dockOpen;
+    return;
+  }
+  if (!sec) {
+    sec = document.createElement("section");
+    sec.className = "pane dock";
+    sec.id = "pane-dock";
+    const h2 = document.createElement("h2");
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "pane-head";
+    head.setAttribute("aria-controls", "pane-dock");
+    const label = document.createElement("span");
+    label.className = "label";
+    const count = document.createElement("span");
+    count.className = "count";
+    head.append(label, " ", count);
+    h2.append(head);
+    sec.append(h2);
+    const side = document.getElementById("side");
+    side.insertBefore(sec, side.querySelector(".pane.jobs"));
+  }
+  if (host.parentElement !== sec) sec.append(host);
+  // An open docked pane keeps the column wide under `side none` (style.css).
+  if (state.dockCollapsed) {
+    sec.dataset.collapsed = "";
+    delete app?.dataset.dockOpen;
+  } else {
+    delete sec.dataset.collapsed;
+    if (app) app.dataset.dockOpen = "";
+  }
+  sec.querySelector(".pane-head").setAttribute("aria-expanded", String(!state.dockCollapsed));
+  paintDockHead();
+}
+
+// The docked section's header: the shown pane's tab label, capitalised (`Subjects`), and for
+// Subjects the number of subjects the running jobs have; the count is empty for the others.
+function paintDockHead() {
+  const head = document.querySelector("#pane-dock .pane-head");
+  const pane = state.panes ? state.panes.current() : null;
+  if (!head || !pane) return;
+  const tab = document.querySelector(`#panes .pane-tab[data-pane="${CSS.escape(pane)}"]`);
+  const text = (tab ? tab.textContent : pane).trim();
+  const label = text.charAt(0).toUpperCase() + text.slice(1);
+  const labelEl = head.querySelector(".label");
+  if (labelEl.textContent !== label) labelEl.textContent = label;
+  let count = "";
+  if (pane === "subjects" && state.subjects && state.subjectsPane) {
+    const n = state.subjectsPane
+      .subjectJobs()
+      .reduce((sum, j) => sum + state.subjects.size(j.id), 0);
+    count = String(n);
+  }
+  const countEl = head.querySelector(".count");
+  if (countEl.textContent !== count) countEl.textContent = count;
 }
 
 // The shown source's last `source_list` record (null when unknown).
@@ -1367,6 +1473,7 @@ function logout(api) {
   state.ov = null;
   state.map = null;
   state.panes = null;
+  applyDock(); // #pane back in #main, the docked section gone
   state.explore = null;
   state.bits = null;
   state.subjectsPane = null;

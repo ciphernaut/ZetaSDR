@@ -1585,8 +1585,8 @@ def scenario_theme_switch_live(page, url, secret):
 
 
 # The selectors docs/themes.md promises a theme may target (spec 5). Each must match on a page
-# with a running demodulator, a ribbon, a collapsed pane, the map and the graph view open, and
-# each must appear verbatim in the docs.
+# with a running demodulator, a ribbon, a collapsed pane, a pane docked right, the map and the
+# graph view open, and each must appear verbatim in the docs.
 THEME_HOOKS = [
     "#top", ".brand", ".src-tab", '.src-tab[aria-selected="true"]', "#rail", ".wf-axis",
     "#waterfall", ".wf-canvas", "#side", "section.pane", ".pane-head",
@@ -1595,7 +1595,7 @@ THEME_HOOKS = [
     ".job-tag", ".job-tag .kind", ".job-tag .channel", ".job-tag .centre", ".ov-ribbon",
     ".outline", ".graph-node.selected", ".job-tag.hot", ".job-tag.speaking",
     ".job-tag .dot.closed", "html[data-theme]", "html[data-rail]", "html[data-footprint]",
-    ".map-tab", "html[data-main]",
+    ".map-tab", "html[data-main]", "html[data-dock]", "section.pane.dock",
 ]
 
 
@@ -1617,6 +1617,9 @@ def scenario_theme_hooks(page, url, secret):
         page.evaluate("window.zetaTest.ribbon('hooks')")
         run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
+        run_cmd(page, "view set dock right")
+        run_cmd(page, "view set pane explore")
+        expect(page.locator("#side section.pane.dock")).to_have_count(1)
         page.click("#pane-transcript .pane-head")
         tag = page.locator(f'#rail .job-tag[data-job="{demod}"]')
         expect(tag.locator(".dot.closed")).to_have_count(1, timeout=5_000)
@@ -1658,9 +1661,9 @@ def scenario_view_set_show_reset(page, url, secret):
                  "finished_rows_s 60", "scanner auto", "plan auto", "main rf", "map auto",
                  "home none",
                  "subjects auto", "subject_dim_s 60", "subject_drop_s 300", "pane none",
-                 "theme console", "side both"):
+                 "theme console", "side both", "dock auto"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 14, f"view show: {shown!r}"
+    assert shown.count("\n") == 15, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -6204,6 +6207,53 @@ def scenario_panes_show_one_at_a_time(page, url, secret):
     pane_tab(page).click()
     expect(pane_tab(page)).to_be_hidden()
     assert not errors, f"console errors: {errors}"
+
+
+def scenario_dock_right(page, url, secret):
+    """`view set dock right` moves #pane into the side column as a third folding section above
+    the Jobs pane, the waterfall keeping #main's height; `bottom` moves it back; `auto` follows
+    the theme's `layout.dock`; the narrow footprint ignores the dock."""
+    select_source(page, url, secret, "tone")
+    page.set_viewport_size(WIDE)
+    job = start_subject_job(page, url, secret, "fake_subjects")
+    try:
+        run_cmd(page, "view set dock right")  # the dock first, the pane after
+        open_subjects(page)
+        sec = page.locator("#side section.pane.dock")
+        expect(sec).to_have_count(1)
+        expect(sec.locator(".pane-head")).to_contain_text("Subjects")
+        assert page.evaluate("() => document.querySelector('#pane').parentElement.id") == "pane-dock"
+        order = page.evaluate(
+            "() => [...document.querySelectorAll('#side > section')].map(s => s.className)")
+        assert order[1].endswith("dock") and "jobs" in order[2], order
+        wf, main = page.locator("#waterfall").bounding_box(), page.locator("#main").bounding_box()
+        assert abs(wf["height"] - main["height"]) <= 2, (wf, main)
+        # The table reads in the column: the section has room and its rows show.
+        assert sec.bounding_box()["height"] >= 0.25 * main["height"], sec.bounding_box()
+        expect(page.locator("#pane-dock #subjects tr.subject").first).to_be_visible(timeout=10_000)
+        expect(sec.locator(".pane-head .count")).to_have_text(re.compile(r"^[1-9]\d*$"))
+        sec.locator(".pane-head").click()
+        expect(sec).to_have_attribute("data-collapsed", "")
+        sec.locator(".pane-head").click()
+        assert page.evaluate(
+            "() => !document.querySelector('#pane-dock').hasAttribute('data-collapsed')")
+        run_cmd(page, "view set dock bottom")
+        assert page.evaluate("() => document.querySelector('#pane').parentElement.id") == "main"
+        expect(page.locator("#side section.pane.dock")).to_have_count(0)
+        run_cmd(page, "view set dock auto")
+        run_cmd(page, "view set theme fixture_dock_right")
+        page.wait_for_function("() => document.documentElement.dataset.dock === 'right'",
+                               timeout=5_000)
+        run_cmd(page, "view set theme console")
+        page.wait_for_function("() => document.documentElement.dataset.dock === 'bottom'",
+                               timeout=5_000)
+        page.set_viewport_size(NARROW)
+        run_cmd(page, "view set dock right")
+        assert page.evaluate("() => document.querySelector('#pane').parentElement.id") == "main"
+    finally:
+        run_cmd(page, "view reset")
+        page.set_viewport_size(WIDE)
+        stop_job(url, secret, job)
 
 
 def capture_ops(url, secret, op, **kw):

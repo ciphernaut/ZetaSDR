@@ -630,6 +630,7 @@ View policies shape this, set from the command line and kept in the tab's `sessi
 | `scanner` | `auto`, or a source id |
 | `theme` | a ready theme's id, set on `<html data-theme>`: the built-ins `console` (default), `plain` (tags on the outlines, level ribbons), `cyberpunk`, `terminal`, `psytrance`, `vibecoder` (the light one), and any operator theme in `--themes-dir` (`zeta themes list`; `docs/themes.md` is the author's guide) |
 | `side` | `both`, `transcript`, `jobs`, `none`: which of the side panes show |
+| `dock` | `auto` (the theme's `layout.dock`, else `bottom`), `bottom` (the selected pane under the waterfall or map), `right` (the selected pane as a third folding section of the side column) |
 | `subjects` | `auto` (the Subjects tab shows while a running job's row has table columns), `on`, `off` |
 | `subject_dim_s` | seconds of silence before a subject dims, `60` |
 | `subject_drop_s` | seconds of silence before a subject goes from the table and the map, `300` |

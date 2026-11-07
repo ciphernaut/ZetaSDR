@@ -39,6 +39,9 @@
 //         side             both | transcript | jobs | none (default both): which of the side
 //                          column's panes are open, the others folded to their header bars
 //                          (app.js applySide)
+//         dock             auto | bottom | right (default auto): where #pane shows, under the
+//                          main view or as a third folding section of the side column
+//                          (app.js applyDock); auto is the theme's `layout.dock`, else bottom
 //   homePoint(value) -> {lat, lon} | null   the `home` policy's value as numbers (null: none)
 //   setStationHome(point|null)  the node's station position ({lat, lon}; app.js reads it once
 //       with `station_get` at page load), the home used while the view's `home` is none
@@ -75,6 +78,7 @@ export const VIEW_KEY = "zeta.view";
 export const AGENT_VIEW_KEYS = [
   "theme",
   "side",
+  "dock",
   "main",
   "map",
   "pane",
@@ -244,6 +248,12 @@ export const POLICIES = [
     values: ["both", "transcript", "jobs", "none"],
     default_: "both",
     describe: "both, transcript, jobs, none",
+  },
+  {
+    key: "dock",
+    values: ["auto", "bottom", "right"],
+    default_: "auto",
+    describe: "auto, bottom, right",
   },
 ];
 

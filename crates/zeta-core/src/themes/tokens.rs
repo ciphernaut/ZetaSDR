@@ -49,6 +49,7 @@ pub const TOKENS: &[&str] = &[
     "--axis-w",
     "--side-w",
     "--side-collapsed-w",
+    "--dock-share",
     "--bar-h-top",
     "--bar-h-bottom",
     "--bar-h",

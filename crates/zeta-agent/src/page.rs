@@ -15,6 +15,7 @@ pub const VIEW_SET: &str = "view_set";
 pub const VIEW_KEYS: &[&str] = &[
     "theme",
     "side",
+    "dock",
     "main",
     "map",
     "pane",

@@ -48,6 +48,7 @@
   --axis-w: 64px;          /* the waterfall's frequency axis */
   --side-w: 360px;         /* the side column */
   --side-collapsed-w: 44px;
+  --dock-share: 40%;       /* the docked pane's share of the side column (dock right) */
   --bar-h-top: 34px;       /* the top bar */
   --bar-h-bottom: 38px;    /* the command bar */
   --bar-h: var(--bar-h-top);
@@ -208,6 +209,11 @@ html[data-main="map"] #waterfall { visibility: hidden; }
 #pane { position: absolute; left: 0; right: 0; bottom: 0; height: 40%; overflow: hidden; background: var(--bg); border-top: 1px solid var(--border); }
 #pane[hidden] { display: none; }
 html[data-strip] #waterfall, html[data-strip] #map { bottom: 40%; }
+/* Docked right (view `dock`, app.js applyDock): #pane is the body of the side column's third
+   section, section.pane.dock, and the main view keeps the whole of #main. */
+section.pane.dock { flex: 1 1 var(--dock-share); border-block-start: 1px solid var(--border); }
+html[data-dock="right"] #pane-dock > #pane { position: static; height: auto; flex: 1; min-height: 0; border-top: 0; }
+html[data-dock="right"][data-strip] #waterfall, html[data-dock="right"][data-strip] #map { bottom: 0; }
 /* The Subjects pane (subjects.js) fills it. */
 #subjects { height: 100%; overflow: auto; background: var(--bg); }
 /* The pane is a column of sections; each section scrolls both ways on its own, so its header
@@ -411,16 +417,17 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
    narrow drawer keeps both panes and its headers do not fold. */
 html:not([data-footprint="narrow"]) section.pane[data-collapsed] > :not(h2) { display: none; }
 html:not([data-footprint="narrow"]) section.pane[data-collapsed] { flex: 0 0 auto; }
-html:not([data-footprint="narrow"]) .pane.transcript[data-collapsed] + .pane.jobs {
+html:not([data-footprint="narrow"]) .pane.transcript[data-collapsed] ~ .pane.jobs {
   flex: 1; max-height: none;
 }
 html[data-footprint="narrow"] .pane-head { pointer-events: none; cursor: default; }
 html[data-footprint="narrow"] .pane-head:disabled { opacity: 1; }   /* inert, not dimmed (app.js applySide) */
-/* Both folded: the column narrows to the two header bars, read downwards. */
-html[data-side="none"]:not([data-footprint="narrow"]) #app {
+/* Both folded: the column narrows to the two header bars, read downwards, unless a docked
+   pane is open in it (#app[data-dock-open], app.js applyDock). */
+html[data-side="none"]:not([data-footprint="narrow"]) #app:not([data-dock-open]) {
   grid-template-columns: minmax(0, 1fr) var(--side-collapsed-w);
 }
-html[data-side="none"]:not([data-footprint="narrow"]) .pane-head {
+html[data-side="none"]:not([data-footprint="narrow"]) :where(#app:not([data-dock-open])) .pane-head {
   writing-mode: vertical-rl;
   inline-size: auto;
   block-size: 100%;
