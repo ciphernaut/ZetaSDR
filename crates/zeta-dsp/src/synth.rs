@@ -10,6 +10,8 @@ use rustfft::FftPlanner;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::framing::Framing;
+
 /// Frequency-modulate real `audio` (nominally within ±1) onto a unit-magnitude
 /// carrier at `offset_hz` from centre. Audio is resampled to `iq_rate_hz` by
 /// linear interpolation; the output has `audio.len() * iq_rate_hz / audio_rate_hz`
@@ -771,12 +773,19 @@ fn generic_symbols(bits: &str, order: u8, symbol_rate_baud: u32) -> Result<Vec<u
         }
         None => hex_bits(bits).ok_or(ERR)?,
     };
+    Ok(bit_symbols(&mut b, order))
+}
+
+/// `b` as symbols `0..order`, MSB first; a lone last bit of a 4-level stream is padded
+/// with 0.
+fn bit_symbols(b: &mut Vec<u8>, order: u8) -> Vec<u8> {
+    let per_symbol = if order == 4 { 2 } else { 1 };
     if !b.len().is_multiple_of(per_symbol) {
         b.push(0);
     }
-    Ok(b.chunks(per_symbol)
+    b.chunks(per_symbol)
         .map(|c| c.iter().fold(0, |a, &x| a << 1 | x))
-        .collect())
+        .collect()
 }
 
 /// Gaussian-filtered FSK (BT 0.5, the pulse spanning 2 symbol periods) of `symbols`
@@ -965,6 +974,97 @@ fn generic_params(
     Ok(())
 }
 
+/// How the `framing` family sends its bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FramingModulation {
+    Fsk,
+    Psk,
+    Ook,
+}
+
+fn default_order() -> u8 {
+    2
+}
+
+/// Most body bytes in all the frames of a `framing` spec.
+const MAX_FRAMING_BYTES: u64 = 65_536;
+
+/// A hex string as bytes; `None` for an empty string, an odd length or a non-hex
+/// character.
+fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    let bits = hex_bits(hex)?;
+    Some(
+        bits.chunks(8)
+            .map(|b| b.iter().fold(0, |a, &x| a << 1 | x))
+            .collect(),
+    )
+}
+
+/// The frame bodies of a `framing` spec: `bodies` decoded when given, else `frames` of
+/// `body_bytes` bytes from xorshift64 seeded by `seed`. `Err` names the bad field.
+fn framing_bodies(
+    frames: u32,
+    body_bytes: u32,
+    seed: u64,
+    bodies: &[String],
+) -> Result<Vec<Vec<u8>>, String> {
+    if !bodies.is_empty() {
+        let out = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, h)| hex_bytes(h).ok_or(format!("bodies[{i}]: hex, whole bytes")))
+            .collect::<Result<Vec<_>, _>>()?;
+        if out.iter().map(|b| b.len() as u64).sum::<u64>() > MAX_FRAMING_BYTES {
+            return Err(format!("bodies: at most {MAX_FRAMING_BYTES} bytes in all"));
+        }
+        return Ok(out);
+    }
+    if frames == 0 {
+        return Err("frames: at least 1".into());
+    }
+    if body_bytes == 0 {
+        return Err("body_bytes: at least 1 (or give bodies)".into());
+    }
+    if u64::from(frames) * u64::from(body_bytes) > MAX_FRAMING_BYTES {
+        return Err(format!(
+            "frames x body_bytes: at most {MAX_FRAMING_BYTES} bytes in all"
+        ));
+    }
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    Ok((0..frames)
+        .map(|_| {
+            (0..body_bytes)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s >> 24) as u8
+                })
+                .collect()
+        })
+        .collect())
+}
+
+/// The planted bits of a [`SynthSpec::Framing`] (`None` for any other family or a spec
+/// that does not validate): every frame's bits as `encode_frames` lays them on the line.
+pub fn framing_bits(spec: &SynthSpec) -> Option<Vec<u8>> {
+    let SynthSpec::Framing {
+        frames,
+        body_bytes,
+        seed,
+        bodies,
+        framing,
+        ..
+    } = spec
+    else {
+        return None;
+    };
+    spec.validate().ok()?;
+    let bodies = framing_bodies(*frames, *body_bytes, *seed, bodies).ok()?;
+    Some(crate::framing::encode_frames(&bodies, framing))
+}
+
 /// What a mode row's `test` block synthesises (`family` names the variant); the
 /// parameters of [`synthesise`]'s signal.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1024,6 +1124,30 @@ pub enum SynthSpec {
     Ook {
         symbol_rate_baud: u32,
         bits: String,
+        repeat: u32,
+        #[serde(default = "default_gap_ms")]
+        gap_ms: u64,
+    },
+    /// `frames` frames framed by `framing` (what `frame_decode` cuts), their bits sent as
+    /// `modulation` says (`fsk`: Gaussian FSK at `deviation_hz`; `psk`; `ook`; `order`
+    /// 2 or 4 for fsk and psk). A frame's body is `body_bytes` pseudo-random bytes from
+    /// `seed`, or the `bodies` (hex, one per frame) when given; the CRC and a `field`
+    /// length are added by the framing. `symbol_rate_baud` is the line rate, a
+    /// Manchester chip rate included.
+    Framing {
+        modulation: FramingModulation,
+        symbol_rate_baud: u32,
+        #[serde(default = "default_order")]
+        order: u8,
+        #[serde(default)]
+        deviation_hz: f64,
+        frames: u32,
+        body_bytes: u32,
+        #[serde(default)]
+        seed: u64,
+        #[serde(default)]
+        bodies: Vec<String>,
+        framing: Framing,
         repeat: u32,
         #[serde(default = "default_gap_ms")]
         gap_ms: u64,
@@ -1178,6 +1302,36 @@ impl SynthSpec {
                 generic_params(*symbol_rate_baud, *repeat, *gap_ms, None)?;
                 generic_symbols(bits, 2, *symbol_rate_baud)?;
             }
+            SynthSpec::Framing {
+                modulation,
+                symbol_rate_baud,
+                order,
+                deviation_hz,
+                frames,
+                body_bytes,
+                seed,
+                bodies,
+                framing,
+                repeat,
+                gap_ms,
+            } => {
+                framing.check().map_err(|e| format!("framing.{e}"))?;
+                let fsk = *modulation == FramingModulation::Fsk;
+                if *modulation != FramingModulation::Ook && !matches!(order, 2 | 4) {
+                    return Err("order: 2 or 4".into());
+                }
+                generic_params(
+                    *symbol_rate_baud,
+                    *repeat,
+                    *gap_ms,
+                    fsk.then_some(*deviation_hz),
+                )?;
+                let bodies = framing_bodies(*frames, *body_bytes, *seed, bodies)?;
+                for (i, b) in bodies.iter().enumerate() {
+                    crate::framing::check_body(framing, b.len())
+                        .map_err(|e| format!("body {i}: {e}"))?;
+                }
+            }
             SynthSpec::Rs41 {
                 serial,
                 lat,
@@ -1230,6 +1384,9 @@ impl SynthSpec {
                 symbol_rate_baud, ..
             }
             | SynthSpec::Ook {
+                symbol_rate_baud, ..
+            }
+            | SynthSpec::Framing {
                 symbol_rate_baud, ..
             } => generic_rate_hz(*symbol_rate_baud),
         }
@@ -1334,6 +1491,31 @@ pub fn synthesise(
             let sym = generic_symbols(bits, 2, *symbol_rate_baud)
                 .expect("synth spec validated before synthesise");
             let burst = ook_modulate(&sym, *symbol_rate_baud, rate_hz);
+            let mut iq = repeat_bursts(burst, *repeat, *gap_ms, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Framing {
+            modulation,
+            symbol_rate_baud,
+            order,
+            deviation_hz,
+            repeat,
+            gap_ms,
+            ..
+        } => {
+            let mut bits = framing_bits(spec).expect("synth spec validated before synthesise");
+            let burst = match modulation {
+                FramingModulation::Fsk => {
+                    let sym = bit_symbols(&mut bits, *order);
+                    gfsk_modulate(&sym, *order, *symbol_rate_baud, *deviation_hz, rate_hz)
+                }
+                FramingModulation::Psk => {
+                    let sym = bit_symbols(&mut bits, *order);
+                    psk_modulate(&sym, *order, *symbol_rate_baud, rate_hz)
+                }
+                FramingModulation::Ook => ook_modulate(&bits, *symbol_rate_baud, rate_hz),
+            };
             let mut iq = repeat_bursts(burst, *repeat, *gap_ms, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
@@ -1794,5 +1976,47 @@ mod tests {
         let bad =
             serde_json::json!({"family": "aprs", "src": "A", "dst": "B", "info": "c", "bogus": 1});
         assert!(parse_params(bad.as_object().unwrap().clone()).is_err());
+    }
+
+    fn framing_json() -> serde_json::Value {
+        serde_json::json!({"family": "framing", "modulation": "fsk", "symbol_rate_baud": 4800,
+            "deviation_hz": 2400.0, "frames": 8, "body_bytes": 32,
+            "framing": {"sync": {"hex": "2dd4", "bits": 16}, "length": {"fixed_bits": 272},
+                "crc": "crc16-ccitt"}, "repeat": 1})
+    }
+
+    #[test]
+    fn the_framing_family_parses_and_plants_its_frames() {
+        let (spec, _) = parse_params(framing_json().as_object().unwrap().clone()).unwrap();
+        let bits = framing_bits(&spec).expect("a framing spec");
+        assert_eq!(bits.len(), 8 * (16 + 272));
+        let SynthSpec::Framing { framing, .. } = &spec else {
+            panic!("the framing family")
+        };
+        let (frames, _) = crate::framing::decode_frames(&bits, framing);
+        assert_eq!(frames.len(), 8);
+        assert!(frames.iter().all(|f| f.crc_ok == Some(true)));
+    }
+
+    #[test]
+    fn the_framing_family_refuses_a_bad_framing_naming_the_field() {
+        let mut v = framing_json();
+        v["framing"]["sync"]["bits"] = 70.into();
+        let e = parse_params(v.as_object().unwrap().clone()).unwrap_err();
+        assert!(e.starts_with("framing.sync.bits"), "{e}");
+        for key in ["frames", "body_bytes"] {
+            let mut v = framing_json();
+            v[key] = 0.into();
+            assert!(
+                parse_params(v.as_object().unwrap().clone()).is_err(),
+                "{key}"
+            );
+        }
+        let mut v = framing_json();
+        v["bodies"] = serde_json::json!(["zz"]);
+        assert!(parse_params(v.as_object().unwrap().clone()).is_err());
+        let mut v = framing_json();
+        v["deviation_hz"] = 0.0.into();
+        assert!(parse_params(v.as_object().unwrap().clone()).is_err());
     }
 }

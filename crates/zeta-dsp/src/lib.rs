@@ -36,6 +36,7 @@ pub mod identify;
 pub mod measure;
 pub mod mix;
 pub mod nbfm;
+pub mod offline;
 pub mod ook;
 pub mod pfb;
 pub mod pocsag;

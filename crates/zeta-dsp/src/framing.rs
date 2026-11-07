@@ -615,7 +615,10 @@ pub(crate) fn decode_from(bits: &[u8], f: &Framing, continued: bool) -> Decoded 
         r = ph + s * (b0 + nb);
         floor = r;
     };
-    out.settled = first_pending.map_or(end_settle, |p| p.min(end_settle));
+    // A Manchester frame ending at the last pair of an odd count reads past the input.
+    out.settled = first_pending
+        .map_or(end_settle, |p| p.min(end_settle))
+        .min(bits.len());
     out
 }
 
@@ -636,6 +639,36 @@ pub fn decode_frames(bits: &[u8], f: &Framing) -> (Vec<DecodedFrame>, usize) {
         frames.push(open);
     }
     (frames, d.settled)
+}
+
+/// Whether [`encode_frames`] can frame a body of `body_len` bytes under `f` (it asserts
+/// otherwise): with a `field` length rule the body must reach the field's end, the frame
+/// (the CRC included) must be whole units and its length must fit the field.
+pub fn check_body(f: &Framing, body_len: usize) -> Result<(), String> {
+    let Length::Field { field } = &f.length else {
+        return Ok(());
+    };
+    let end = (field.offset_bits + field.bits) as usize;
+    if body_len * BYTE_BITS < end {
+        return Err(format!(
+            "a {body_len}-byte body ends before the length field (bit {end})"
+        ));
+    }
+    let crc_n = f
+        .crc
+        .as_ref()
+        .and_then(|c| c.resolve().ok())
+        .map_or(0, |(d, _)| crc_bytes(&d));
+    let total = ((body_len + crc_n) * BYTE_BITS) as i64;
+    let unit = field.unit.bits();
+    if total % unit != 0 {
+        return Err("the frame is not a whole number of length units".into());
+    }
+    let v = total / unit - field.add;
+    if v < 0 || (field.bits < u64::BITS && (v as u64) >= (1u64 << field.bits)) {
+        return Err(format!("the length {v} does not fit the length field"));
+    }
+    Ok(())
 }
 
 /// The line bits of `bodies` framed by `f`, the inverse of [`decode_frames`]: per
@@ -1062,5 +1095,19 @@ mod tests {
             checked(json!({"sync": {"hex": "2dd4", "bits": 16}, "length": {"to_next_sync": true}, "whitening": "pn9", "encoding": "manchester", "bit_order": "lsb", "crc": "crc16-modbus"}))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_manchester_frame_missing_only_its_last_chip_settles_within_the_input() {
+        let mut f = fx("2dd4", 16, Length::Fixed { fixed_bits: 272 });
+        f.encoding = LineCode::Manchester;
+        let raw = encode_frames(&bodies(1, 32, 1), &f);
+        // The last chip is the complement of the last bit: the first-of-pair reading
+        // does not need it, so the frame is whole and the settled count would pass the end.
+        let cut = &raw[..raw.len() - 1];
+        let (frames, settled) = decode_frames(cut, &f);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].crc_ok, Some(true));
+        assert!(settled <= cut.len(), "settled {settled} of {}", cut.len());
     }
 }
