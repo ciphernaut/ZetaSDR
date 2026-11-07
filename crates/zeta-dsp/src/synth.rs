@@ -1,5 +1,5 @@
 //! Signal generators: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 / APRS, POCSAG, RDS, Mode S,
-//! ACARS, AIS, FLEX, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
+//! ACARS, AIS, FLEX, M17, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
 //! `zeta modes check` runs the rows' tests on them. The test-only helpers stay in
 //! `fixtures`, behind feature `test-fixtures`.
 
@@ -1113,6 +1113,112 @@ fn flex_iq(capcode: u32, text: &str, repeat: u32, rate_hz: u32) -> Vec<Complex<f
     nbfm_modulate(&audio, rate_hz, rate_hz, FLEX_DEVIATION_HZ, 0.0)
 }
 
+/// M17's symbol rate, baud (the M17 specification: 4FSK at 4800 symbols/s).
+pub const M17_BAUD: u32 = 4800;
+/// M17's outer deviation, Hz: the +3 and -3 symbols sit at ±2.4 kHz.
+pub const M17_DEVIATION_HZ: f64 = 2400.0;
+/// M17's root-raised-cosine roll-off.
+pub const M17_RRC_ALPHA: f64 = 0.5;
+/// Symbols the root-raised-cosine pulse spans (the specification's minimum).
+const RRC_SPAN_SYMBOLS: f64 = 8.0;
+/// Stream frames the `m17` family sends at most (10 s).
+const M17_FRAMES_MAX: u32 = 250;
+
+/// The root-raised-cosine impulse response at `t` symbol periods from its centre, for
+/// roll-off `alpha` (unnormalised; the removable points taken at their limits).
+fn rrc(t: f64, alpha: f64) -> f64 {
+    if t.abs() < 1e-9 {
+        return 1.0 - alpha + 4.0 * alpha / PI;
+    }
+    let quarter = 1.0 / (4.0 * alpha);
+    if (t.abs() - quarter).abs() < 1e-9 {
+        let a = PI / (4.0 * alpha);
+        return alpha / 2f64.sqrt() * ((1.0 + 2.0 / PI) * a.sin() + (1.0 - 2.0 / PI) * a.cos());
+    }
+    ((PI * t * (1.0 - alpha)).sin() + 4.0 * alpha * t * (PI * t * (1.0 + alpha)).cos())
+        / (PI * t * (1.0 - (4.0 * alpha * t).powi(2)))
+}
+
+/// 4FSK of `symbols` (each `0..=3` for -3, -1, +1, +3) at `symbol_rate_baud`, sampled at
+/// `rate_hz`: impulses at the symbol centres through a root-raised-cosine filter
+/// (roll-off `alpha`, spanning 8 symbols, unit DC gain), frequency modulated so a run of
+/// one symbol sits at its level times `deviation_hz / 3` (the outer symbols at
+/// ±`deviation_hz`). M17's modulator: the receiver's matched filter completes the
+/// raised cosine. `symbols.len() * rate_hz / symbol_rate_baud` samples.
+pub fn rrc_modulate_4fsk(
+    symbols: &[u8],
+    symbol_rate_baud: u32,
+    deviation_hz: f64,
+    rate_hz: u32,
+    alpha: f64,
+) -> Vec<Complex<f32>> {
+    if symbols.is_empty() {
+        return Vec::new();
+    }
+    let sps = f64::from(rate_hz) / f64::from(symbol_rate_baud);
+    let half = RRC_SPAN_SYMBOLS / 2.0;
+    let reach = (half * sps).floor() as isize;
+    // Unit DC gain: the pulse's area in symbol periods (its taps at whole-sample
+    // offsets, per sample period).
+    let gain: f64 = (-reach..=reach)
+        .map(|j| rrc(j as f64 / sps, alpha))
+        .sum::<f64>()
+        / sps;
+    let level = |s: u8| f64::from(s.min(3)) * 2.0 - 3.0;
+    let n = (symbols.len() as f64 * sps) as usize;
+    let last = symbols.len() - 1;
+    let mut phase = 0.0f64;
+    (0..n)
+        .map(|i| {
+            // Time in symbol periods; symbol k's centre is at k + 0.5.
+            let t = i as f64 / sps;
+            let lo = (t - 0.5 - half).ceil().max(0.0) as usize;
+            let hi = ((t - 0.5 + half).floor().max(0.0) as usize).min(last);
+            let shaped: f64 = (lo..=hi)
+                .map(|k| level(symbols[k]) * rrc(t - k as f64 - 0.5, alpha))
+                .sum::<f64>()
+                / gain;
+            phase += 2.0 * PI * shaped * deviation_hz / 3.0 / f64::from(rate_hz);
+            let (sn, cs) = phase.sin_cos();
+            Complex::new(cs as f32, sn as f32)
+        })
+        .collect()
+}
+
+/// An M17 voice stream ([`crate::m17`]): the preamble, the LSF (`dst`, `src`, TYPE voice
+/// at 3200 bps with `can`, META zero), `frames` stream frames with a zero payload (the
+/// last with the end-of-transmission bit), then the EOT marker; 4FSK at 4800 baud,
+/// ±2400 Hz, root-raised-cosine (alpha 0.5).
+fn m17_iq(src: &str, dst: &str, can: u8, frames: u32, rate_hz: u32) -> Vec<Complex<f32>> {
+    use crate::m17::{
+        DATA_TYPE_VOICE, ENCRYPTION_NONE, Lsf, META_BYTES, STREAM_PAYLOAD_BYTES, eot_symbols,
+        lsf_frame_symbols, preamble_symbols, stream_frame_symbols,
+    };
+    let lsf = Lsf {
+        dst: dst.into(),
+        src: src.into(),
+        stream: true,
+        data_type: DATA_TYPE_VOICE,
+        encryption: ENCRYPTION_NONE,
+        encryption_subtype: 0,
+        can,
+        meta: [0; META_BYTES],
+    };
+    let mut symbols = preamble_symbols();
+    symbols.extend(lsf_frame_symbols(&lsf));
+    let payload = [0u8; STREAM_PAYLOAD_BYTES];
+    for n in 0..frames {
+        symbols.extend(stream_frame_symbols(
+            &lsf,
+            n as u16,
+            &payload,
+            n + 1 == frames,
+        ));
+    }
+    symbols.extend(eot_symbols());
+    rrc_modulate_4fsk(&symbols, M17_BAUD, M17_DEVIATION_HZ, rate_hz, M17_RRC_ALPHA)
+}
+
 /// Bounds on the generic families' numbers, so a bad row is an error, not an abort or
 /// a huge allocation. `deviation_hz` is given for `fsk`, whose tones must fit the rate.
 fn generic_params(
@@ -1357,6 +1463,16 @@ pub enum SynthSpec {
         text: String,
         baud: u32,
         repeat: u32,
+    },
+    /// An M17 voice stream ([`crate::m17`]): the LSF from `src` to `dst` (callsigns of at
+    /// most nine base-40 characters; `ALL` is broadcast) with channel access number
+    /// `can`, then `frames` stream frames (1..=250, 40 ms each) of a zero Codec 2
+    /// payload; 4FSK at 4800 baud, ±2400 Hz.
+    M17 {
+        src: String,
+        dst: String,
+        can: u8,
+        frames: u32,
     },
     /// AIS: per repeat a type 1 position report (`mmsi`, the position, `sog_kt`,
     /// `cog_deg`; [`crate::ais_msg::position_report_bits`]) and, with `name`, a type 5
@@ -1666,13 +1782,37 @@ impl SynthSpec {
                     return Err(format!("repeat: 1..={FLEX_REPEAT_MAX}"));
                 }
             }
+            SynthSpec::M17 {
+                src,
+                dst,
+                can,
+                frames,
+            } => {
+                use crate::m17::{CAN_MAX, encode_callsign};
+                if src == "ALL" {
+                    return Err("src: ALL is the broadcast address, a destination only".into());
+                }
+                for (key, call) in [("src", src), ("dst", dst)] {
+                    if encode_callsign(call).is_none() {
+                        return Err(format!(
+                            "{key}: at most nine characters of A-Z, 0-9, space, -, / and ."
+                        ));
+                    }
+                }
+                if *can > CAN_MAX {
+                    return Err(format!("can: 0..={CAN_MAX}"));
+                }
+                if !(1..=M17_FRAMES_MAX).contains(frames) {
+                    return Err(format!("frames: 1..={M17_FRAMES_MAX}"));
+                }
+            }
             SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
         }
         Ok(())
     }
 
     /// The sample rate the family's capture is synthesised at: the one each decoder is
-    /// proven at (APRS, POCSAG, ACARS, AIS and FLEX at 48 kHz, which the `channel` stage divides
+    /// proven at (APRS, POCSAG, ACARS, AIS, FLEX and M17 at 48 kHz, which the `channel` stage divides
     /// down; RDS at 240 kHz; Mode S at 2.4 MHz; a bare NBFM tone at 48 kHz).
     pub fn rate_hz(&self) -> u32 {
         match self {
@@ -1684,7 +1824,8 @@ impl SynthSpec {
             | SynthSpec::Dfm { .. }
             | SynthSpec::M20 { .. }
             | SynthSpec::Flex { .. }
-            | SynthSpec::Ais { .. } => 48_000,
+            | SynthSpec::Ais { .. }
+            | SynthSpec::M17 { .. } => 48_000,
             SynthSpec::Fsk {
                 symbol_rate_baud, ..
             }
@@ -1876,6 +2017,16 @@ pub fn synthesise(
         }
         SynthSpec::Ais { .. } => {
             let mut iq = ais_iq(spec, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::M17 {
+            src,
+            dst,
+            can,
+            frames,
+        } => {
+            let mut iq = m17_iq(src, dst, *can, *frames, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -2590,5 +2741,148 @@ mod tests {
                 .fold(0u32, |a, &b| (a << 1) | b as u32)
         };
         assert_eq!(word(1), crate::bch::bch3121_word((1 << 2) | 3));
+    }
+
+    fn m17_json() -> serde_json::Value {
+        serde_json::json!({
+            "family": "m17", "src": "VK4ZET", "dst": "ALL", "can": 0, "frames": 25
+        })
+    }
+
+    #[test]
+    fn m17_family_validates() {
+        let parse = |v: serde_json::Value| parse_params(v.as_object().unwrap().clone());
+        let bad = |key: &str, val: serde_json::Value| {
+            let mut v = m17_json();
+            v[key] = val;
+            parse(v).unwrap_err()
+        };
+        let (spec, _) = parse(m17_json()).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        assert!(bad("src", "VK4ZETABCD".into()).starts_with("src:"));
+        assert!(bad("src", "vk4zet".into()).starts_with("src:"));
+        assert!(bad("src", "ALL".into()).starts_with("src:"));
+        assert!(bad("dst", "TOO-LONG-1".into()).starts_with("dst:"));
+        assert_eq!(bad("frames", 0.into()), "frames: 1..=250");
+        assert_eq!(bad("frames", 251.into()), "frames: 1..=250");
+        assert_eq!(bad("can", 16.into()), "can: 0..=15");
+        assert!(
+            parse({
+                let mut v = m17_json();
+                v["dst"] = "M17-M17 C".into();
+                v["can"] = 15.into();
+                v["frames"] = 250.into();
+                v
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn m17_iq_has_the_expected_length() {
+        let (spec, imp) = parse_params(m17_json().as_object().unwrap().clone()).unwrap();
+        let iq = synthesise(&spec, &imp, 48_000, 145_000_000);
+        // 40 ms of preamble, the LSF and 25 stream frames at 40 ms each, 40 ms of EOT.
+        let sps = 48_000 / M17_BAUD as usize;
+        let want = (1 + (25 + 1) + 1) * 48_000 * 40 / 1000;
+        assert!(iq.len().abs_diff(want) <= sps, "{} vs {want}", iq.len());
+        assert!(iq.iter().all(|s| (s.norm() - 1.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn rrc_4fsk_puts_a_symbol_run_on_its_tone() {
+        // A long run of each symbol settles on its frequency: -3d, -d, +d, +3d. Averaged
+        // over a symbol period it is exact; within the period the pulse's truncation to 8
+        // symbols (the specification's 81 taps at 10 samples a symbol) leaves a ripple
+        // under 1 % of the deviation.
+        let rate = 48_000;
+        let hz = |a: Complex<f32>, b: Complex<f32>| {
+            (b * a.conj()).arg() as f64 * f64::from(rate) / (2.0 * PI)
+        };
+        for (sym, want) in [(0u8, -2400.0), (1, -800.0), (2, 800.0), (3, 2400.0)] {
+            let iq = rrc_modulate_4fsk(&[sym; 48], M17_BAUD, M17_DEVIATION_HZ, rate, M17_RRC_ALPHA);
+            assert_eq!(iq.len(), 480);
+            let sps = (rate / M17_BAUD) as usize;
+            let inst: Vec<f64> = (240..240 + sps).map(|i| hz(iq[i], iq[i + 1])).collect();
+            let mean = inst.iter().sum::<f64>() / sps as f64;
+            assert!((mean - want).abs() < 1.0, "symbol {sym}: mean {mean}");
+            for f in inst {
+                assert!(
+                    (f - want).abs() < 0.01 * M17_DEVIATION_HZ,
+                    "symbol {sym}: {f}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn m17_iq_demodulates_back_to_its_frames() {
+        // A plain receiver: the discriminator, the matched root-raised-cosine filter,
+        // a sample at each symbol centre sliced to the nearest level. The LSF decodes
+        // with its CRC and every stream frame gives its number and LICH chunk.
+        use crate::m17::{
+            FRAME_BITS, FRAME_SYMBOLS, LICH_CHUNKS, Lsf, SYNC_STREAM, SYNC_SYMBOLS,
+            decode_lsf_frame, decode_stream_frame, symbols_to_bits, word_symbols,
+        };
+        let frames = 8u32;
+        let spec = SynthSpec::M17 {
+            src: "VK4ZET".into(),
+            dst: "ALL".into(),
+            can: 3,
+            frames,
+        };
+        let rate = spec.rate_hz();
+        let iq = synthesise(&spec, &Impairments::default(), rate, 0);
+        let sps = (rate / M17_BAUD) as usize;
+        // Frequency in units of deviation / 3, so the levels sit at -3, -1, +1, +3.
+        let scale = f64::from(rate) / (2.0 * PI) * 3.0 / M17_DEVIATION_HZ;
+        let mut f = vec![0.0f64; iq.len()];
+        for i in 1..iq.len() {
+            f[i] = (iq[i] * iq[i - 1].conj()).arg() as f64 * scale;
+        }
+        let reach = (RRC_SPAN_SYMBOLS / 2.0 * sps as f64) as isize;
+        let taps: Vec<f64> = (-reach..=reach)
+            .map(|j| rrc(j as f64 / sps as f64, M17_RRC_ALPHA))
+            .collect();
+        let gain: f64 = taps.iter().sum();
+        let symbols: Vec<u8> = (0..iq.len() / sps)
+            .map(|k| {
+                let c = (k * sps + sps / 2) as isize;
+                let y: f64 = taps
+                    .iter()
+                    .enumerate()
+                    .map(|(n, h)| {
+                        let i = c + n as isize - reach;
+                        h * f.get(i.max(0) as usize).copied().unwrap_or(0.0)
+                    })
+                    .sum::<f64>()
+                    / gain;
+                ((y + 3.0) / 2.0).round().clamp(0.0, 3.0) as u8
+            })
+            .collect();
+        let frame_bits = |at: usize| -> [u8; FRAME_BITS] {
+            symbols_to_bits(&symbols[at + SYNC_SYMBOLS..at + FRAME_SYMBOLS])
+                .try_into()
+                .unwrap()
+        };
+        let lsf =
+            Lsf::parse(&decode_lsf_frame(&frame_bits(FRAME_SYMBOLS)).expect("the LSF")).unwrap();
+        assert_eq!(
+            (lsf.src.as_str(), lsf.dst.as_str(), lsf.can),
+            ("VK4ZET", "ALL", 3)
+        );
+        for n in 0..frames as usize {
+            let at = (2 + n) * FRAME_SYMBOLS;
+            assert_eq!(
+                symbols[at..at + SYNC_SYMBOLS],
+                word_symbols(SYNC_STREAM),
+                "{n}"
+            );
+            let frame = decode_stream_frame(&frame_bits(at));
+            assert_eq!(usize::from(frame.frame_number), n);
+            assert_eq!(frame.last, n + 1 == frames as usize);
+            assert_eq!(frame.lich.unwrap().1 as usize, n % LICH_CHUNKS);
+            assert_eq!(frame.payload, [0; 16]);
+        }
     }
 }
