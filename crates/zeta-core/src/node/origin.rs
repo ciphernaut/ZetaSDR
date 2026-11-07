@@ -392,7 +392,9 @@ fn nearest_first(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
 /// `row_width` the decoded designator's, else the row's `bandwidth_hz`, else 0 (the
 /// centre is the row's `center_hz`, else the middle of `min_hz..max_hz`). The terms:
 /// width, by the ratio of `row_width` to the band's ([`ORIGIN_WIDTH_RANGE`],
-/// [`ORIGIN_WIDTH_LOOSE`]); modulation, the designator's letter against `q.modulation`
+/// [`ORIGIN_WIDTH_LOOSE`]), times `1 - |centre - q.center_hz| / (row_width/2 +
+/// bandwidth/2)` (1 on the band's centre, 0 at the gate's edge) and rounded like the
+/// score, so an on-channel row outscores one that only overlaps the band's edge; modulation, the designator's letter against `q.modulation`
 /// by `DESIGNATOR_LABELS`; reach, the row's `distance_km` against the reach toward the
 /// site ([`Reach::km_toward`] with the row's `bearing_deg` and `antenna`, the vantage's
 /// antenna the reach was computed for; `reach.km` when either is missing). A reach
@@ -408,10 +410,19 @@ pub fn score_row(
     }
     let width = row_width(a).map(|h| h.0);
     let center = row_center(a);
-    if center.abs_diff(q.center_hz.0) > width.unwrap_or(0) / 2 + q.bandwidth_hz.0 / 2 {
+    let offset = center.abs_diff(q.center_hz.0);
+    let gate = width.unwrap_or(0) / 2 + q.bandwidth_hz.0 / 2;
+    if offset > gate {
         return None;
     }
-    let width_term = match width {
+    // How far inside the gate the row's centre sits: 1 on the band's centre, 0 at the
+    // gate's edge, so a row that only overlaps the band's edge does not tie the one on it.
+    let centred = if gate == 0 {
+        1.0
+    } else {
+        1.0 - offset as f32 / gate as f32
+    };
+    let grade = match width {
         None => ORIGIN_WIDTH_NONE,
         Some(w) => {
             let r = w as f64 / q.bandwidth_hz.0 as f64;
@@ -425,6 +436,7 @@ pub fn score_row(
             }
         }
     };
+    let width_term = round_score(grade * centred);
     let (agree, modulation_term) = match &a.emission_decoded {
         Some(e) if !q.modulation.is_empty() => match designator_fits(e.modulation, &q.modulation) {
             true => (Agree::Fits, ORIGIN_MODULATION_FITS),
@@ -1083,6 +1095,44 @@ mod tests {
             (ORIGIN_WIDTH_FULL, ORIGIN_WIDTH_HALF, ORIGIN_WIDTH_NONE),
             (0.4, 0.2, 0.1)
         );
+    }
+
+    /// The field host's 2026-11-08 band lookup: a 200 kHz band measured at 97.893 MHz gave
+    /// the on-channel 97.9 MHz station and the 97.7 MHz rows (193 kHz off, inside the gate
+    /// only by their edge) the same 0.80. The width term is graded by how far the row's
+    /// centre sits inside the gate, so the fitting site is the brightest.
+    #[test]
+    fn an_on_channel_row_outscores_one_that_only_overlaps_the_band_edge() {
+        let band = q(&["fm"], 97_893_000, 200_000);
+        let row = |center| {
+            score_row(
+                &tx(Some("200KF8E"), None, center, Some(10.0)),
+                &band,
+                Some(&reach(Some(100.0))),
+                None,
+            )
+            .unwrap()
+        };
+        let on = row(97_900_000);
+        let edge = row(97_700_000);
+        assert_eq!(on.agree, Agree::Fits);
+        assert_eq!(edge.agree, Agree::Fits);
+        // 7 kHz off, against a 200 kHz reach: the width term barely moves.
+        assert!(on.terms.width > 0.38, "{:?}", on.terms);
+        // 193 kHz off, only just inside: next to nothing.
+        assert!(edge.terms.width < 0.05, "{:?}", edge.terms);
+        assert!(
+            on.score > edge.score + 0.3,
+            "{} vs {}",
+            on.score,
+            edge.score
+        );
+        // The other terms keep their weights, and the score stays rounded.
+        assert_eq!((on.terms.modulation, on.terms.reach), (0.4, 0.2));
+        assert_eq!((edge.terms.modulation, edge.terms.reach), (0.4, 0.2));
+        assert_eq!(on.score, round_score(on.score));
+        // At the band's centre the term is the full grade.
+        assert_eq!(row(97_893_000).terms.width, ORIGIN_WIDTH_FULL);
     }
 
     #[test]

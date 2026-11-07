@@ -324,7 +324,7 @@ the register side knows which kind of vantage it was given.
 | Term | Weight | Rule |
 |---|---|---|
 | frequency | gate | the row's centre and the band overlap: `abs(row.center_hz - center_hz) <= row_width/2 + bandwidth_hz/2`, `row_width` the decoded designator's bandwidth, else the row's `bandwidth_hz`, else 0. A row that fails is not a candidate. |
-| width | 0.4 | `r = row_width / bandwidth_hz`: 0.4 for 0.5 <= r <= 1.5; 0.2 for 0.25 <= r <= 4; 0 outside; 0.1 when the row has no width. |
+| width | 0.4 | `r = row_width / bandwidth_hz`: 0.4 for 0.5 <= r <= 1.5; 0.2 for 0.25 <= r <= 4; 0 outside; 0.1 when the row has no width. Amended after the live deploy (2026-11-08): the grade is multiplied by `1 - abs(row.center_hz - center_hz) / (row_width/2 + bandwidth_hz/2)` and rounded to 2 places, so a row that only overlaps the band's edge no longer ties the on-channel one. |
 | modulation | 0.4 | the designator's modulation letter compatible with one of `modulation` (`DESIGNATOR_LABELS`): 0.4, `agree: fits`; incompatible: 0, `agree: disagrees`; no designator or `modulation` empty: 0.2, `agree: unknown`. |
 | reach | 0.2 | `distance_km` known and within the reach toward the site: 0.2; no distance (no vantage): 0.1; known and out of reach (only a static provider's rows, the register's are cut already): 0. |
 
