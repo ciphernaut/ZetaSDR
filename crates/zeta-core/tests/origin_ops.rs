@@ -565,6 +565,26 @@ async fn the_band_form_refuses_an_unknown_source() {
     assert!(known.contains(&"file0".to_string()), "{known:?}");
 }
 
+/// The band form refuses a band of no width, as the job form refuses a job with none.
+#[tokio::test]
+async fn the_band_form_refuses_a_band_of_no_width() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path(), true).await;
+    let op = Op::OriginLookup {
+        job: None,
+        source: Some(SourceId("file0".into())),
+        center_hz: Some(Hz(TONE_HZ)),
+        bandwidth_hz: Some(Hz(0)),
+        modulation: None,
+    };
+    match node.apply(op).await {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, "origin_lookup: a band of no width")
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn both_or_neither_form_is_invalid() {
     let dir = tempfile::tempdir().unwrap();

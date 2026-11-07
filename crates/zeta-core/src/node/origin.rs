@@ -591,6 +591,19 @@ pub fn confirm_identity(a: &mut OriginAnswer, field: &str, value: &str) -> Optio
     Some(format!("confirmed {value}: {name}"))
 }
 
+/// Re-apply to `fresh` each confirmation `kept` holds ([`confirm`] by its field and
+/// value), then re-sort `fresh` when any landed: a fresh lookup replacing a kept answer
+/// does not lose an identity confirmed while it was out.
+pub fn carry_confirmed(kept: &OriginAnswer, fresh: &mut OriginAnswer) {
+    let mut hit = false;
+    for c in kept.origins.iter().filter_map(|o| o.confirmed.as_ref()) {
+        hit |= !confirm(fresh, &c.field, &c.value).is_empty();
+    }
+    if hit {
+        fresh.origins.sort_by(origin_order);
+    }
+}
+
 /// Job kinds with no band to look up: the refusal names the kind.
 pub const ORIGIN_NO_BAND_KINDS: [&str; 3] = ["mix", "spectrum", "scan"];
 
@@ -701,8 +714,9 @@ impl Node {
     /// The `origin_lookup` op (design 4.2): by `job` alone, or by `source`, `center_hz`
     /// and `bandwidth_hz` together (anything else is refused, [`ORIGIN_FORMS`]). The band
     /// form only answers, `modulation` `None` reading as unknown, and refuses a source
-    /// the node does not have ([`NodeError::UnknownSource`]). The job form reads the
-    /// band from the job ([`Inner::origin_job`]), publishes the answer and keeps it.
+    /// the node does not have ([`NodeError::UnknownSource`]) and a band of no width. The
+    /// job form reads the band from the job ([`Inner::origin_job`]), publishes the answer
+    /// and keeps it.
     pub async fn origin_lookup(
         &self,
         job: Option<JobId>,
@@ -716,6 +730,11 @@ impl Node {
             (None, Some(source), Some(center_hz), Some(bandwidth_hz)) => {
                 if self.inner.port(&source).is_none() {
                     return Err(NodeError::UnknownSource(source));
+                }
+                if bandwidth_hz.0 == 0 {
+                    return Err(NodeError::Other(
+                        "origin_lookup: a band of no width".to_string(),
+                    ));
                 }
                 let q = OriginQuery {
                     source,
@@ -777,8 +796,7 @@ impl Inner {
             at: now(),
         };
         let a = origins(self, &q).await;
-        self.keep_origin(&rec.id, &rec.source, &a)?;
-        Ok(a)
+        self.keep_origin(&rec.id, &rec.source, &a)
     }
 
     /// Merge `a` into job `id`'s context as `origins`, then publish it as one `origin`
@@ -787,25 +805,22 @@ impl Inner {
     /// registered now (an audio demodulator, a job that ended) publishes on a stream
     /// registered for the one frame, with the job's provenance, so the feed still
     /// carries it. `source` is the job's own source.
+    /// The kept answer's confirmations carry over ([`carry_confirmed`]), so one that
+    /// landed during the register round trip is not lost; the answer as kept.
     pub(super) fn keep_origin(
         &self,
         id: &JobId,
         source: &SourceId,
         a: &OriginAnswer,
-    ) -> Result<(), NodeError> {
-        self.keep_origin_as(id, source, a, summary(a))
-    }
-
-    /// [`Inner::keep_origin`] with the event's `summary` given.
-    fn keep_origin_as(
-        &self,
-        id: &JobId,
-        source: &SourceId,
-        a: &OriginAnswer,
-        summary: String,
-    ) -> Result<(), NodeError> {
-        self.update_origins(id, source, |_| Some((a.clone(), summary)))
-            .map(|_| ())
+    ) -> Result<OriginAnswer, NodeError> {
+        let mut out = a.clone();
+        self.update_origins(id, source, |kept| {
+            if let Some(kept) = kept {
+                carry_confirmed(&kept, &mut out);
+            }
+            Some((out.clone(), summary(&out)))
+        })?;
+        Ok(out)
     }
 
     /// Under one hold of the jobs lock: hand `update` job `id`'s kept `origins` (`None`
@@ -1369,6 +1384,40 @@ mod tests {
         assert_eq!(identity_value(&ssid, &v("-7")), None);
         assert_eq!(identity_value(&ssid, &serde_json::Value::Null), None);
         assert_eq!(identity_value(&ssid, &serde_json::json!(7)), None);
+    }
+
+    #[test]
+    fn a_fresh_answer_keeps_the_confirmations_of_the_kept_one() {
+        let band = q(&["fm"], CENTER, 12_500);
+        let mut best = tx(Some("12K5F3E"), None, CENTER, Some(5.0));
+        best.site = Some("Example Ridge".into());
+        best.licence_no = Some("0000002".into());
+        let mut marked = tx(Some("16K0F1D"), None, CENTER, Some(17.0));
+        marked.callsign = Some("XX4EX".into());
+        let origins: Vec<Origin> = [best, marked]
+            .iter()
+            .map(|r| score_row(r, &band, None, None).unwrap())
+            .collect();
+        let fresh = empty_answer(origins, Some(2));
+        // The kept answer was confirmed while the fresh lookup was out.
+        let mut kept = fresh.clone();
+        confirm_identity(&mut kept, "src", "XX4EX").unwrap();
+        let mut a = fresh.clone();
+        carry_confirmed(&kept, &mut a);
+        assert_eq!(a.origins[0].allocation.callsign.as_deref(), Some("XX4EX"));
+        assert_eq!(a.origins[0].score, 1.0);
+        assert_eq!(
+            a.origins[0].confirmed,
+            Some(Confirmed {
+                field: "src".into(),
+                value: "XX4EX".into()
+            })
+        );
+        assert!(a.origins[1].confirmed.is_none());
+        // Nothing confirmed kept: the fresh answer is left as it is.
+        let mut b = fresh.clone();
+        carry_confirmed(&fresh, &mut b);
+        assert_eq!(b, fresh);
     }
 
     #[test]
