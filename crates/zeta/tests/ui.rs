@@ -452,10 +452,12 @@ const FAKE_ACARS_LINES: &str = "{\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"label\
 {\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"label\":\"H1\",\"text\":\"two\"}";
 
 /// `fake_vdl2`'s lines: 7C0000 (`reg` VH-ZET, so one aircraft with `fake_acars`'s VH-ZET)
-/// twice, 7C0001 with no `reg` once.
-const FAKE_VDL2_LINES: &str = "{\"icao\":\"7C0000\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"alpha\"}\n\
-{\"icao\":\"7C0001\",\"reg\":null,\"flight\":\"QFA9\",\"text\":\"gamma\"}\n\
-{\"icao\":\"7C0000\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"beta\"}";
+/// twice, 7C0001 with no `reg` once, and the ground station 1A2B3C's uplink to VH-ZET once
+/// (its `reg` the uplink's aircraft, kept apart by `merge_skip`).
+const FAKE_VDL2_LINES: &str = "{\"icao\":\"7C0000\",\"addr_type\":\"Aircraft\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"alpha\"}\n\
+{\"icao\":\"7C0001\",\"addr_type\":\"Aircraft\",\"reg\":null,\"flight\":\"QFA9\",\"text\":\"gamma\"}\n\
+{\"icao\":\"7C0000\",\"addr_type\":\"Aircraft\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"beta\"}\n\
+{\"icao\":\"1A2B3C\",\"addr_type\":\"Ground station\",\"reg\":\"VH-ZET\",\"flight\":null,\"text\":\"uplink\"}";
 
 /// A modes directory under `dir` holding the fake rows and their lines files; its path.
 fn fake_modes(dir: &Path) -> PathBuf {
@@ -558,6 +560,7 @@ fn fake_modes(dir: &Path) -> PathBuf {
             json!({
                 "schema": {"type": "object", "properties": {
                     "icao": {"type": "string"},
+                    "addr_type": text,
                     "reg": text,
                     "flight": text,
                     "text": text,
@@ -573,10 +576,12 @@ fn fake_modes(dir: &Path) -> PathBuf {
                     {"field": "reg", "label": "Reg", "unit": null},
                     {"field": "flight", "label": "Flight", "unit": null},
                     {"field": "text", "label": "Text", "unit": null},
+                    {"field": "addr_type", "label": "Type", "unit": null},
                 ],
                 "heading": null,
                 "label": "flight",
                 "merge": ["reg", "icao"],
+                "merge_skip": {"addr_type": "Ground station"},
             }),
         ),
     ];

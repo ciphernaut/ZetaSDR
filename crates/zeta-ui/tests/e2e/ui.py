@@ -5086,7 +5086,9 @@ def scenario_subjects_name_the_jobs_not_watched(page, url, secret):
 
 def scenario_subjects_merge_across_rows(page, url, secret):
     # Two links to the same aircraft (plan 30 spec 4.8): fake_acars keyed by `reg`, fake_vdl2
-    # by `icao` with a `reg`, both `merge` and both `aircraft`, so one table.
+    # by `icao` with a `reg`, both `merge` and both `aircraft`, so one table. fake_vdl2's ground
+    # station 1A2B3C carries VH-ZET's `reg` from its uplink but matches `merge_skip`: a row of
+    # its own.
     errors = page_errors(page)
     select_source(page, url, secret, "tone")
     a = start_subject_job(page, url, secret, "fake_acars", bandwidth_hz=41_000)
@@ -5096,12 +5098,17 @@ def scenario_subjects_merge_across_rows(page, url, secret):
         merged = page.locator("#subjects section.subject-merged")
         expect(merged).to_have_count(1, timeout=10_000)
         expect(page.locator("#subjects section.subject-job")).to_have_count(0)
-        expect(merged.locator("h3")).to_contain_text("aircraft, 3", timeout=10_000)
+        expect(merged.locator("h3")).to_contain_text("aircraft, 4", timeout=10_000)
         zet = merged.locator('tr.subject:has(td[data-col="reg"]:text-is("VH-ZET"))')
         expect(zet).to_have_count(1)
         expect(zet.locator('td[data-col="via"]')).to_have_text("fake_acars, fake_vdl2")
         expect(zet.locator('td[data-col="count"]')).to_have_text("4")
-        expect(merged.locator("tr.subject")).to_have_count(3)  # VH-ZET, VH-ABC, 7C0001
+        # VH-ZET, VH-ABC, 7C0001 and the station 1A2B3C
+        expect(merged.locator("tr.subject")).to_have_count(4)
+        station = merged.locator('tr.subject[data-key="1A2B3C"]')
+        expect(station).to_have_count(1)
+        expect(station.locator('td[data-col="via"]')).to_have_text("fake_vdl2")
+        expect(station.locator('td[data-col="reg"]')).to_have_text("1A2B3C")
         # A header sorts the merged table as any other: by count ascending, VH-ZET last.
         merged.locator('th[data-col="count"]').click()
         last = merged.locator("tr.subject").last.locator('td[data-col="reg"]')

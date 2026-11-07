@@ -119,6 +119,10 @@ pub struct Subject {
     /// `name`; empty for none.
     #[serde(default)]
     pub merge: Vec<String>,
+    /// Field = value pairs; a subject whose state matches every pair takes no part in
+    /// `merge` (it keeps a row of its own); empty for none.
+    #[serde(default)]
+    pub merge_skip: BTreeMap<String, serde_json::Value>,
 }
 
 /// `subject.track_points` when a row leaves it out.
@@ -767,6 +771,14 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             if !properties.contains_key(m) && *m != sub.key {
                 return Err(RowError::new(
                     format!("subject.merge[{i}]"),
+                    "not in event.schema.properties",
+                ));
+            }
+        }
+        for k in sub.merge_skip.keys() {
+            if !properties.contains_key(k) {
+                return Err(RowError::new(
+                    format!("subject.merge_skip.{k}"),
                     "not in event.schema.properties",
                 ));
             }
@@ -1684,5 +1696,35 @@ mod tests {
         });
         let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
         assert_eq!(e.field, "subject.merge[0]", "{e}");
+    }
+
+    #[test]
+    fn merge_skip_round_trips_defaults_empty_and_names_schema_fields() {
+        let row = parse(ADSB).unwrap();
+        assert!(row.subject.as_ref().unwrap().merge_skip.is_empty());
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["subject"]["merge_skip"], serde_json::json!({}));
+        let text = edited(ADSB, |v| {
+            v["subject"]["merge_skip"] = serde_json::json!({"callsign": "Ground station"})
+        });
+        let row = parse(&text).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        assert_eq!(
+            row.subject.as_ref().unwrap().merge_skip,
+            BTreeMap::from([("callsign".to_string(), "Ground station".into())])
+        );
+        assert_eq!(parse(&serde_json::to_string(&row).unwrap()).unwrap(), row);
+        let text = edited(ADSB, |v| {
+            v["subject"]["merge_skip"] = serde_json::json!({"addr_type": "Ground station"})
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new(
+                "subject.merge_skip.addr_type",
+                "not in event.schema.properties"
+            ),
+            "{e}"
+        );
     }
 }

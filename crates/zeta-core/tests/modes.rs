@@ -581,6 +581,11 @@ fn the_aircraft_link_rows_are_pinned() {
     assert_eq!(vdl2["band"]["centers_hz"][0], 136_975_000);
     assert_eq!(vdl2["subject"]["key"], "icao");
     assert_eq!(vdl2["subject"]["merge"], serde_json::json!(["reg", "icao"]));
+    // A ground station's subject carries the last uplink's `reg`: it keeps a row of its own.
+    assert_eq!(
+        vdl2["subject"]["merge_skip"],
+        serde_json::json!({"addr_type": "Ground station"})
+    );
     assert_eq!(vdl2["position"]["alt_unit"], "ft");
     assert_eq!(vdl2["decoder"]["input"]["rate_hz"], 105_000);
     assert_eq!(
@@ -621,6 +626,7 @@ fn the_aircraft_link_rows_are_pinned() {
     );
     assert_eq!(hfdl["identify"]["dwell_ms"], 40000);
     assert_eq!(hfdl["subject"]["merge"], serde_json::json!(["reg", "icao"]));
+    assert_eq!(hfdl["subject"]["merge_skip"], serde_json::json!({}));
     // A frame from an aircraft whose logon was missed has neither `icao` nor `gs_id`: the
     // summary drops absent fields instead of printing `null`.
     let summary = hfdl["event"]["summary"].as_str().unwrap();

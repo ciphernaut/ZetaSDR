@@ -57,7 +57,9 @@
 //     `section.subject-merged[data-name]` (MERGE_SECTION_CLASS) stands at the first one's place
 //     instead of their per-job sections, headed `<name>, N (<kind> <source>, ...)`. Its rows are
 //     groups of subjects (`mergeGroups`): two join when a field in either row's `merge`, the key
-//     included, has equal non-blank values in both. A group's state is its members' merged,
+//     included, has equal non-blank values in both; a subject whose state matches every pair of
+//     its row's `subject.merge_skip` (`skipsMerge`: a VDL2 ground station) joins none and stands
+//     alone, its key column showing its own key. A group's state is its members' merged,
 //     newest last seen winning, its position the newest member's with one, `count` the sum,
 //     `dim` when all are. Its key column (`data-col` the first `merge` field) shows the first
 //     `merge` field the group has; then the union of the rows' columns, `Via` (the members'
@@ -452,6 +454,19 @@ function fieldValue(s, field) {
   return text === "" ? null : text;
 }
 
+// The subject takes no part in `merge`: its state matches every pair of its row's
+// `subject.merge_skip` (an empty map never matches).
+function skipsMerge(s) {
+  const pairs = Object.entries(s.row.subject.merge_skip ?? {});
+  return (
+    pairs.length > 0 &&
+    pairs.every(([f, v]) => {
+      const have = s.state[f];
+      return have !== null && have !== undefined && String(have) === String(v);
+    })
+  );
+}
+
 // The union of the rows' `merge` fields, in order.
 function mergeFields(rows) {
   return [...new Set(rows.flatMap((row) => row.subject.merge ?? []))];
@@ -487,6 +502,7 @@ function groupOf(members, fields, row) {
       break;
     }
   }
+  if (members.length === 1 && skipsMerge(newest)) keyText = newest.key;
   return {
     id: members.map((m) => `${m.job}\u0001${m.key}`).sort()[0],
     members,
@@ -674,7 +690,10 @@ class SubjectsPane {
     // later one with that value, merging on it or not, joins it.
     const owners = new Map();
     const at = (f, v) => `${f}\u0000${v}`;
+    // A subject that `skipsMerge` neither owns a value nor joins one: a group of its own.
+    const skip = subjects.map(skipsMerge);
     subjects.forEach((s, i) => {
+      if (skip[i]) return;
       for (const f of s.row.subject.merge ?? []) {
         const v = fieldValue(s, f);
         if (v === null) continue;
@@ -683,6 +702,7 @@ class SubjectsPane {
       }
     });
     subjects.forEach((s, i) => {
+      if (skip[i]) return;
       for (const f of fields) {
         const v = fieldValue(s, f);
         if (v !== null && owners.has(at(f, v))) union(i, owners.get(at(f, v)));

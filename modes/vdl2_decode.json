@@ -114,6 +114,7 @@
     "heading": null,
     "label": "flight",
     "merge": ["reg", "icao"],
+    "merge_skip": { "addr_type": "Ground station" },
     "track_points": 100,
     "track_min_m": 1000
   }
