@@ -346,7 +346,10 @@ they belong to the serving node and are rejected. Source ids are unique across t
   is never printed, but like `--secret` it is visible in `ps` to every user of the machine;
   leave out `/PASSWORD` and set `ZETA_KIWI_PASSWORD_<ID>` instead (`ID` upper-cased, other
   characters as `_`, so `kiwi-0` reads `ZETA_KIWI_PASSWORD_KIWI_0`). The flag wins when both
-  are given.
+  are given. The Kiwi's own position, from its status when it has GPS, is the vantage of
+  `origin_lookup`; `--source-position ID=LAT,LON[,ALT_M]` says where a source is when it does not
+  report one (one that does overrides it), so a Kiwi's lookups are cut to its own reach, not the
+  station's.
 - **SoapySDR**, `--source-soapy ID=ARGS` (`ARGS` such as `driver=hackrf,serial=...`): a local
   device, `push` false (the node reads it). Gain starts at the driver's default and is changed
   live with `source gain` (below); `gain=DB` in `ARGS` sets the opening gain (a `DB` outside the
@@ -419,7 +422,7 @@ zeta job start --kind <mode id> --source S --center-hz C --bandwidth-hz B
 
 Every decoded event carries `protocol`, `t_ns` and a one-line `summary` (the page shows it). `zeta classify` is the quick answer to "what is this": it tries the best five rows with a short decode and lists them under `tried`. `zeta job start --kind identify` is the thorough one: it measures the band, then runs each fitting row as a child job in score order, publishing a `candidate` event for each, and ends with a verdict in `job_context.identify`; a proof leaves that decoder running. [Field craft: Decoding modes](agents/field-craft.md#decoding-modes) has the details and a worked operator row.
 
-A program row can also take demodulated audio instead of IQ (`decoder.demod`, `input.container` `raw` or `wav`): the radiosonde rows `rs41_decode`, `dfm_decode` and `m20_decode` run the rs1729 decoders (package `sonde-decoders`) over an NBFM channel anywhere in 400.05-406 MHz, and their events carry a `position`. `zeta source free --center-hz C --bandwidth-hz B` says which sources could take a band now (a suggestion, not a reservation). `zeta job start --kind watch` holds a band (400-406 MHz for sondes), reports each new signal that persists as a `signal` event, runs `identify` on it and keeps the decoder that proves, in its own capture or on a free second radio (`decode_on: free`); stopping the watch stops what it started, and [Field craft: Watching a band for sondes](agents/field-craft.md#watching-a-band-for-sondes) walks through it. The web page outlines a watch on the waterfall and has a map layer (`view set map on`, `view set home LAT,LON` for distance and bearing) for events with a position, a marker and track per subject for a row that names one and per job otherwise: Leaflet 1.9.4 is vendored, and OpenStreetMap tiles are fetched only when the browser is online. The Subjects tab (`view set subjects auto|on|off`) lists a row's subjects, one line per aircraft or sonde; a click there selects the marker and the reverse. Subjects live on the page, so a refresh refills from live traffic. A `sink_sondehub` stage, added by the watch's `sondehub` param (a callsign and your position) or by `graph put`, posts sonde telemetry to SondeHub in batches; nothing is uploaded otherwise.
+A program row can also take demodulated audio instead of IQ (`decoder.demod`, `input.container` `raw` or `wav`): the radiosonde rows `rs41_decode`, `dfm_decode` and `m20_decode` run the rs1729 decoders (package `sonde-decoders`) over an NBFM channel anywhere in 400.05-406 MHz, and their events carry a `position`. `zeta source free --center-hz C --bandwidth-hz B` says which sources could take a band now (a suggestion, not a reservation). `zeta job start --kind watch` holds a band (400-406 MHz for sondes), reports each new signal that persists as a `signal` event, runs `identify` on it and keeps the decoder that proves, in its own capture or on a free second radio (`decode_on: free`); stopping the watch stops what it started, and [Field craft: Watching a band for sondes](agents/field-craft.md#watching-a-band-for-sondes) walks through it. The web page outlines a watch on the waterfall and has a Map tab beside the radios (`view set main map|rf`, `view set map on|off` the alias; `view set home LAT,LON` for distance and bearing; `view set dock right` moves the selected pane beside it) for events with a position, a marker and track per subject for a row that names one and per job otherwise: Leaflet 1.9.4 is vendored, and tiles are fetched only when the browser is online (`view set map_tiles` picks among OpenStreetMap, CARTO light and dark, OpenTopoMap and Esri imagery, and the map says so when its tiles do not load). Lit register sites share the map: brightness is score times freshness, a dashed ring disagrees with the measured modulation, a confirmed site has its own ring; each is consistent with the signal, not an identification. The Subjects tab (`view set subjects auto|on|off`) lists a row's subjects, one line per aircraft or sonde; a click there selects the marker and the reverse. Subjects live on the page, so a refresh refills from live traffic. A `sink_sondehub` stage, added by the watch's `sondehub` param (a callsign and your position) or by `graph put`, posts sonde telemetry to SondeHub in batches; nothing is uploaded otherwise.
 
 ## Exploring unknown signals
 
@@ -442,7 +445,7 @@ lengths (`symbol_rate_line: runs`). `--knowledge-acma URL` attaches the ACMA lic
 Australian Communications and Media Authority's register of radio licences, served by an MCP
 server) as a provider of `knowledge_lookup`, `classify` and `identify`: licensee, site, distance
 from the station, power and the decoded emission designator, a hypothesis about who transmits and
-never a proof of what a signal is. The burst store keeps 256 MB and 7 days by default
+never a proof of what a signal is. `zeta origin lookup --job ID` (or `--source S --center-hz N --bandwidth-hz N [--modulation fm,fsk]`) scores the register's rows on a band: up to 50 sites, best first, each with a score from its width, modulation and reach terms and an `agree` of `fits`, `disagrees` or `unknown`; for a job it also publishes an `origin` event and the page lights the sites on the map (the Origins button). The register may lack callsigns, in which case no site is ever confirmed by a decoded identity. The burst store keeps 256 MB and 7 days by default
 (`--bursts-keep-mb`, `--bursts-keep-days`; pinned captures are kept); a watch with `on_unknown:
 capture` fills it by itself. `bits_start` builds `capture_in -> [channel ->] resample ->
 fsk|psk|ook demod -> clock_recover -> slicer -> bit_view` from the capture's feature record and
@@ -631,9 +634,13 @@ View policies shape this, set from the command line and kept in the tab's `sessi
 | `theme` | a ready theme's id, set on `<html data-theme>`: the built-ins `console` (default), `plain` (tags on the outlines, level ribbons), `cyberpunk`, `terminal`, `psytrance`, `vibecoder` (the light one), and any operator theme in `--themes-dir` (`zeta themes list`; `docs/themes.md` is the author's guide) |
 | `side` | `both`, `transcript`, `jobs`, `none`: which of the side panes show |
 | `dock` | `auto` (the theme's `layout.dock`, else `bottom`), `bottom` (the selected pane under the waterfall or map), `right` (the selected pane as a third folding section of the side column) |
+| `main` | `rf` (the waterfall), `map` (the Map tab's map in its place) |
+| `map` | an alias of `main`: `on` sets `main map`, `off` sets `main rf` |
 | `subjects` | `auto` (the Subjects tab shows while a running job's row has table columns), `on`, `off` |
 | `subject_dim_s` | seconds of silence before a subject dims, `60` |
 | `subject_drop_s` | seconds of silence before a subject goes from the table and the map, `300` |
+| `origin_fade_s` | seconds over which a lit site's brightness falls to nothing after its signal was last active, `300` |
+| `map_tiles` | `auto` (the theme's `layout.map_tiles`, else `carto-dark` under a dark theme and `osm` under a light one), `osm`, `carto-light`, `carto-dark`, `opentopo`, `esri-imagery` |
 
 `view set <key> <value>`, `view show`, `view reset` (every policy back to its default) and
 `view clear` (drops the finished job rows from the list) are typed at the command line; an
