@@ -259,14 +259,16 @@ fn coordinate(b: &[u8], deg_digits: usize) -> Option<(u32, u32, u8)> {
 }
 
 /// Degrees from whole degrees and minutes in hundredths, at the centre of the cell the
-/// ambiguity leaves; `None` past `max` degrees or 60 minutes.
+/// ambiguity leaves; `None` at 60 minutes or more, or when the centred value is past
+/// `max` degrees (`90  .  N` at ambiguity 4 centres at 90.5 and is no fix).
 fn degrees(deg: u32, hundredths: u32, ambiguity: u8, max: u32) -> Option<f64> {
     let cell = *AMBIGUITY_CELL.get(usize::from(ambiguity))?;
-    if hundredths >= HUNDREDTHS_PER_DEGREE || deg > max || (deg == max && hundredths > 0) {
+    if hundredths >= HUNDREDTHS_PER_DEGREE {
         return None;
     }
     let h = f64::from(hundredths - hundredths % cell) + f64::from(cell / 2);
-    Some(f64::from(deg) + h / f64::from(HUNDREDTHS_PER_DEGREE))
+    let value = f64::from(deg) + h / f64::from(HUNDREDTHS_PER_DEGREE);
+    (value <= f64::from(max)).then_some(value)
 }
 
 /// `ccc/sss` at the start of `b`: the course (000 and `...` unknown) and speed (`...` unknown).
@@ -517,6 +519,20 @@ mod tests {
         assert_eq!(j.ambiguity, 4);
         near(j.lat, 49.5, 1e-6);
         near(j.lon, -72.5, 1e-6);
+    }
+
+    #[test]
+    fn ambiguity_centred_past_the_pole_or_the_antimeridian_is_no_fix() {
+        // 90 degrees with blank minutes centres at 90.5: no fix.
+        no_fix(&parse_info("APRS", b"!90  .  N/072  .  W-"));
+        // 180 degrees of longitude likewise centres at 180.5.
+        no_fix(&parse_info("APRS", b"!49  .  N/180  .  W-"));
+        // At ambiguity 0 the limits themselves still read.
+        let i = parse_info("APRS", b"!9000.00N/18000.00W-");
+        near(i.lat, 90.0, 1e-9);
+        near(i.lon, -180.0, 1e-9);
+        // Past the limit at ambiguity 0: no fix.
+        no_fix(&parse_info("APRS", b"!9000.01N/07201.75W-"));
     }
 
     #[test]

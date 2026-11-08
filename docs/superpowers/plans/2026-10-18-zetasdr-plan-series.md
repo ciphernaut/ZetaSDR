@@ -497,11 +497,11 @@ wire.
 
 ## Plan 29 status
 
-Built on `worktree-agent-a90e5005948f16feb`, not yet on `main`. Spec `docs/superpowers/specs/2026-11-06-decoder-wave2-design.md`, plan `docs/superpowers/plans/2026-11-06-decoder-wave2.md`.
+Built on the plan 29 branch. Spec `docs/superpowers/specs/2026-11-06-decoder-wave2-design.md`, plan `docs/superpowers/plans/2026-11-06-decoder-wave2.md`.
 
 What shipped: the shared machinery (`expect` `{near, within}` tolerances, the `access` marker as `enum Access { Restricted }` on `pocsag_decode` and `flex_decode`, `handlers` on graph rows, a row's `outputs` and the page's audio rule, `## Mode rows` in AGENTS.md); APRS positions (uncompressed, compressed, Mic-E) with callsign subjects on the map; AIS (`ais_decode`, the `ais` quick attempt, the row, the `ais_vhf` plan); M20 synthesis proven against `m20mod`; FLEX (`flex_decode` over `multimon-ng`, the parser pinned to its real output); M17 (the codes, the `m17_decode` stage, Codec 2 through `c2dec` as ordinary job audio), not split into 29b.
 
-What the gate proved: every in-crate row `ok`, `--strict flex_decode` against multimon-ng and `--strict m17_decode` with c2dec (CI installs both and runs the strict step), `--strict m20_decode` against `m20mod`, the APRS map e2e scenario `map_tracks_an_aprs_station` (one new scenario; the UI suite ran 607.5 s); the controller runs the full gate.
+What the gate proved: every in-crate row `ok`, `--strict flex_decode` against multimon-ng and `--strict m17_decode` with c2dec (CI installs both and runs the strict step), `--strict m20_decode` against `m20mod`, the APRS map e2e scenario `map_tracks_an_aprs_station` (one new scenario; the UI suite ran 607.5 s, inside its deadline, 690 s at the time, and above the plan's 600 s target); the controller runs the full gate.
 
 What waits for the field host: `--strict` on the sonde rows and `UAT.md` "Plan 29".
 
@@ -509,8 +509,8 @@ Rulings (roles only):
 - AIS BT is 0.5. `BitSync` held at 9600 baud on 48 kHz, so no Gardner fallback. The AIS discriminator runs at 2x deviation with a 50 Hz DC blocker.
 - The M17 modulator is RRC alpha 0.5; the M17 discriminator is 2x deviation.
 - `within_ms`: AIS 5000, M20 8000, FLEX 6000, M17 5000.
-- DFM fallback taken: `dfm09mod` decodes the generated positions but never the serial, so `dfm_decode` keeps `test: null` (the operator declined a position-only test); `TODO.md` holds the next step.
-- Scoring effects: AIS is tried on FM signals; `m17_decode` on narrow FM/FSK; `classify` counts only rows with a quick attempt towards its five tries. `flex_decode` has `band.range_hz` 151.8-932 MHz (the spec said null, which tied it with APRS at 144.8 MHz). `ais_decode` keeps modulation `["fsk","fm"]`.
+- DFM fallback taken: `dfm09mod` decodes the generated positions but never the serial, so `dfm_decode` keeps `test: null` (the controller declined a position-only test on the operator's behalf, since spec 8 requires the id); `TODO.md` holds the next step.
+- Scoring effects: AIS is tried on FM signals; `m17_decode` on narrow FM/FSK; `classify` leaves out graph rows whose `identify.quick` is null (today `m17_decode`); program rows keep their `skipped_quick` slots. `flex_decode` has `band.range_hz` 151.8-932 MHz (the spec said null, which tied it with APRS at 144.8 MHz). `ais_decode` keeps modulation `["fsk","fm"]`.
 - Counts follow the base: 13 embedded rows, six quick attempts (the plan predated plans 30 and 19.3).
 - The M17 specification document is GNU FDL 1.3 (not CC BY-SA); only facts and tables were taken, no code.
 - `access` is implemented now in plan 31's shape; whichever plan lands second drops the duplicate.

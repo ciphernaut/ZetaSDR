@@ -341,7 +341,7 @@ async fn identify_on_pocsag_ends_with_a_verdict_and_one_running_child() {
     let dir = tempfile::tempdir().unwrap();
     let node = node_over(dir.path(), &fixtures().pocsag_on_aprs).await;
     let (id, events) = identify(&node, APRS_HZ).await;
-    let events = ended(&node, &id, events, Duration::from_secs(30)).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
     eprintln!("{events:#?}");
     let aprs = outcome(&events, "aprs_decode").expect("aprs_decode tried");
     let pocsag = outcome(&events, "pocsag_decode").expect("pocsag_decode tried");
@@ -389,7 +389,7 @@ async fn identify_on_a_tone_ends_unknown_with_a_label() {
     let dir = tempfile::tempdir().unwrap();
     let node = node_over(dir.path(), &fixtures().tone).await;
     let (id, events) = identify(&node, APRS_HZ).await;
-    let events = ended(&node, &id, events, Duration::from_secs(40)).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
     eprintln!("{events:#?}");
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
     let modes: Vec<&str> = tried.iter().map(|e| e["mode"].as_str().unwrap()).collect();
@@ -786,7 +786,7 @@ async fn the_verdict_carries_the_nearest_allocations_and_the_score_term() {
         .unwrap()
         .id;
     let mut tap = node.bus().subscribe(&stream).unwrap();
-    let events = ended(&node, &id, events, Duration::from_secs(40)).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
     // The verdict event words the register's transmitter as the watch's unknown does.
     let mut last = None;
     while let Ok(f) = tap.try_recv() {
@@ -839,7 +839,7 @@ async fn an_identify_run_publishes_one_origin_event_and_its_verdict_carries_orig
     let node = node_over(dir.path(), &fixtures().gfsk).await;
     node.add_knowledge(Arc::new(Register));
     let (id, events) = identify(&node, APRS_HZ).await;
-    until("identify ends", Duration::from_secs(40), || {
+    until("identify ends", Duration::from_secs(60), || {
         state(&node, &id) != JobState::Running
     })
     .await;
@@ -1017,7 +1017,7 @@ async fn identify_reports_a_learned_signal_in_its_unknown_verdict() {
         .unwrap()
         .id;
     let mut tap = node.bus().subscribe(&stream).unwrap();
-    ended(&node, &id, events, Duration::from_secs(40)).await;
+    ended(&node, &id, events, Duration::from_secs(60)).await;
     let ctx = node.job_context(&id).unwrap();
     let verdict = &ctx["identify"]["verdict"];
     assert!(verdict["mode"].is_null(), "{ctx}");

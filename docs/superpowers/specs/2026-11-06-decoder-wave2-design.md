@@ -382,9 +382,11 @@ one 1.875 s frame: bit sync, the A and B sync words for 1600/2, the frame inform
 second sync, then the 11 blocks of 8 BCH(31,21)-coded words interleaved as the protocol sends them,
 holding one short address, its vector word and the alphanumeric message words for `text`, idle words
 elsewhere; 2-FSK at 1600 baud and ±4800 Hz over NBFM at 48 kHz. The BCH encoder is the one
-`pocsag_encode` uses, lifted into `crc.rs` or a `bch.rs`. Sources: the public FLEX descriptions
-(the sigidwiki page, the Motorola FLEX patents' frame descriptions, Motorola's published protocol
-specification if the operator has it); never multimon-ng's `flex.c` or `flex_next.c` (GPL). The
+`pocsag_encode` uses, lifted into `crc.rs` or a `bch.rs`. Sources: public FLEX descriptions only;
+never multimon-ng's `flex.c` or `flex_next.c` (GPL). As built, the frame outline came from search
+summaries of the FLEX patents (US 6,038,549, US 6,378,073, US 6,396,411), not the patents
+themselves; the sigidwiki page was not fetched and Motorola's protocol specification was not to
+hand, so `flex_frame.rs` credits them with nothing; multimon-ng's output settled the rest. The
 oracle is multimon-ng itself: `zeta modes check --strict flex_decode` on the field host. Expect
 `{capcode: 1234567, text: "HELLO ZETA"}`, `within_ms 6000`. Fallback as plan 17 section 5.3: one
 task's budget; if multimon-ng does not decode the synthesised frame by then, the row ships with
@@ -414,7 +416,9 @@ BERT `0xDF55`, EOT `0x555D`), the decorrelator, the interleaver, the K=5 rate-1/
 code with its P1/P2/P3 puncturing (a Viterbi decoder), Golay(24,12) for the LICH, the LSF's
 CRC-16 (poly `0x5935`, init `0xFFFF`), base-40 callsigns. The LSF arrives whole at stream start or
 reassembled from six LICH chunks, so a receiver joining mid-stream has the callsigns within
-240 ms. The M17 specification is public (the M17 Project, CC BY-SA); the MIT crate `m17core` may
+240 ms. The M17 specification is public (the M17 Project; the document is GNU FDL 1.3 and its
+code snippets GPL-2): only its prose, tables and constants are used, no code. The MIT crate
+`m17core` may
 serve as a test oracle or a dev-dependency for vectors, not as the implementation (builder's call,
 under the rule that the stage decodes what the synthesiser of section 7.4 builds and what the
 spec's example frames give).

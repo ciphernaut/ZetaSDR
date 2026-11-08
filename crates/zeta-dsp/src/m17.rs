@@ -4,8 +4,8 @@
 //! Written from the M17 Protocol Specification (the M17 Project, revision 2.0.10 of
 //! 2026-10-16, <https://github.com/M17-Project/M17_spec>, `M17_spec.tex`; the document is
 //! under the GNU FDL 1.3). Only its prose and tables were used: no M17 implementation's
-//! source was read (libm17 and m17-cxx-demod are GPL), nor the C examples of its address
-//! appendix. Every constant below is the specification's, from the section named:
+//! source was read (libm17 and m17-cxx-demod are GPL), nor were the C examples of its
+//! address appendix used (their opening lines were seen while searching the text). Every constant below is the specification's, from the section named:
 //!
 //! - **Symbols** (Physical Layer, "Dibit, Symbol, and Frequency-shift"): 4FSK at 4800
 //!   symbols/s, dibits most significant bit first, `01` → +3, `00` → +1, `10` → -1,
@@ -355,10 +355,11 @@ pub fn puncture(bits: &[u8], pattern: &[u8]) -> Vec<u8> {
 
 /// Hard-decision Viterbi decoding of punctured bits: the punctured places are restored
 /// as erasures (no cost either way), the path ending in state 0 (the tail) is traced
-/// back and the 4 tail bits are dropped.
+/// back and the 4 tail bits are dropped. A pattern that keeps no bit (empty or all
+/// zeros) decodes to nothing.
 pub fn viterbi_decode(bits: &[u8], pattern: &[u8]) -> Vec<u8> {
     const UNREACHED: u32 = u32::MAX / 2;
-    if pattern.is_empty() {
+    if !pattern.contains(&1) {
         return Vec::new();
     }
     let mut coded: Vec<Option<u8>> = Vec::with_capacity(bits.len() * 2);
@@ -857,6 +858,13 @@ mod tests {
         coded[10] ^= 1;
         coded[150] ^= 1;
         assert_eq!(viterbi_decode(&coded, P2), input);
+    }
+
+    #[test]
+    fn viterbi_with_a_pattern_keeping_no_bit_decodes_nothing() {
+        let coded = puncture(&conv_encode(&bits(16, 3)), P1);
+        assert!(viterbi_decode(&coded, &[]).is_empty());
+        assert!(viterbi_decode(&coded, &[0, 0, 0]).is_empty());
     }
 
     #[test]

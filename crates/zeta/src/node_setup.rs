@@ -154,7 +154,7 @@ pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
             .iter()
             .find(|(p, _)| p == programs)
             .map(|(_, a)| a.clone())
-            .unwrap_or_else(|| Err(String::new()))
+            .expect("every program list was probed")
     };
     for (id, lists) in rows {
         let answers: Vec<Result<PathBuf, String>> = lists.iter().map(answer).collect();
@@ -372,7 +372,7 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// jobs run on. `themes_dir` is the operator's themes (`--themes-dir`; `None` for
 /// [`zeta_core::themes::default_operator_dir`]). `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for
 /// [`zeta_core::modes::default_operator_dir`]); each broken row is reported on stderr, one
-/// line each, then the handler report of the program rows ([`probe_handlers`]); neither
+/// line each, then the handler report of the rows with handlers ([`probe_handlers`]); neither
 /// fails the node. Errors name the flag, never a Kiwi password or a node secret. The node
 /// comes with its [`RemotePorts`].
 #[allow(clippy::too_many_arguments)]

@@ -3,10 +3,9 @@
 //!
 //! Written without any decoder's source. The frame outline (1.875 s frames, 128 to a
 //! 4-minute cycle; a frame is sync 1, the frame information word and sync 2, then blocks
-//! 0 to 10; sync 1 opens with a 32-bit bit sync pattern) is as the FLEX patents
-//! US 6,038,549, US 6,378,073 and US 6,396,411 describe it. Those patents were found by
-//! search and only search summaries of these passages were seen, not the patents
-//! themselves; they are credited with nothing more. The rates and the ±4800 Hz
+//! 0 to 10; sync 1 opens with a 32-bit bit sync pattern) is as search summaries of the
+//! FLEX patents US 6,038,549, US 6,378,073 and US 6,396,411 describe it. The patents
+//! themselves were not read; they are credited with nothing more. The rates and the ±4800 Hz
 //! deviation are general knowledge (the design spec points to the Signal Identification
 //! Wiki's FLEX page, <https://www.sigidwiki.com/wiki/FLEX>, which was not fetched for this
 //! module). The field

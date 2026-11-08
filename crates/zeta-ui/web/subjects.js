@@ -11,7 +11,9 @@
 //         failure stays unknown, for the next poll to try. True when anything was learned; one
 //         lookup at a time (a call during another answers false, and whoever acts on the
 //         other's true asks again).
-//     store.rowOf(kind) -> row | null | undefined (undefined: not yet known)
+//     store.rowOf(kind) -> row | null | undefined (undefined: not yet known); the row is
+//         `modes_show`'s `mode.row` with the mode's `outputs` (the stream kinds its job emits)
+//         beside its fields, so `rowOf(kind).outputs` answers whether the job plays audio
 //     store.event(job, payload) -> subject | null   merges the event: non-null, non-blank fields
 //         into `state`, the fix into `position`, `count` and `last_seen`. Null when the job's row has
 //         no subject, the job has an `owner` (a watch's run or its trial) or is a running identify's
@@ -208,7 +210,9 @@ class SubjectStore {
         let row = null;
         if (this.rowIds.has(kind)) {
           const r = await this.api.op({ op: "modes_show", id: kind });
-          row = (r && r.value && r.value.mode && r.value.mode.row) || null;
+          const mode = r && r.value && r.value.mode;
+          // `outputs` sits beside `row` on the mode; the jobs list's audio rule reads it.
+          row = mode && mode.row ? { ...mode.row, outputs: mode.outputs ?? [] } : null;
         }
         this.rows.set(kind, row);
         learned = true;

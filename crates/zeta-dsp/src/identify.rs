@@ -251,9 +251,6 @@ type AttemptFuture = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
 /// evidence when a frame passes its check.
 type Attempt = Arc<dyn Fn(Vec<Complex<f32>>, u64) -> AttemptFuture + Send + Sync>;
 
-/// The in-crate attempt `row`'s `identify.quick` names (the names
-/// `zeta_core::modes::QUICK_ATTEMPTS` validates): `frame` runs the frame row's own chain
-/// ([`crate::frame_quick::attempt`]).
 /// Whether `classify` lists `row` at all: every row but a graph row with no quick
 /// attempt (`identify.quick: null`, today `m17_decode`), which has neither an
 /// in-process attempt nor a program, so only `identify` tries it. A program row stays a
@@ -262,6 +259,9 @@ fn classify_candidate(row: &ModeRow) -> bool {
     !(matches!(row.decoder, Decoder::Graph { .. }) && row.identify.quick.is_none())
 }
 
+/// The in-crate attempt `row`'s `identify.quick` names (the names
+/// `zeta_core::modes::QUICK_ATTEMPTS` validates): `frame` runs the frame row's own chain
+/// ([`crate::frame_quick::attempt`]).
 fn quick_attempt(row: &ModeRow) -> Option<Attempt> {
     let blocking = |f: fn(&[Complex<f32>], u64) -> Option<String>| -> Attempt {
         Arc::new(move |chan: Vec<Complex<f32>>, rate| Box::pin(async move { f(&chan, rate) }))

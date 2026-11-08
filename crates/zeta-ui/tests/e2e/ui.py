@@ -5855,6 +5855,19 @@ def scenario_map_tracks_an_aprs_station(page, url, secret):
                  m.isAudioJob({kind: 'aprs_decode'}, () => ({outputs: ['event']})),
                  m.isAudioJob({kind: 'fm_demod'}, () => null)])""")
         assert audio == [True, False, True], f"isAudioJob {audio}"
+        # The store the jobs list asks (`audioKind`) carries the live row's outputs.
+        live = page.evaluate(
+            """async () => {
+                 const { state } = await import('./app.js');
+                 await state.subjects.lookup(['aprs_decode', 'm17_decode']);
+                 const m = await import('./agent.js');
+                 const rowOf = (k) => state.subjects.rowOf(k);
+                 return [rowOf('aprs_decode')?.outputs ?? null,
+                         m.isAudioJob({kind: 'aprs_decode'}, rowOf),
+                         rowOf('m17_decode')?.outputs ?? null,
+                         m.isAudioJob({kind: 'm17_decode'}, rowOf)];
+               }""")
+        assert live == [["event"], False, ["event", "audio"], True], f"live row outputs {live}"
         run_cmd(page, "view set main rf")
         assert not errors, f"console errors: {errors}"
     finally:
