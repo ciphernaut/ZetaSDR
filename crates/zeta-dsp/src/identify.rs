@@ -1,6 +1,7 @@
-//! Layer-2 decode-to-identify: score the mode rows against the measured band and try the
-//! best [`CLASSIFY_TRIES`] that have a quick in-process attempt (APRS, POCSAG, ACARS,
-//! RDS, AIS, or a frame row's chain) over the channel, reporting only what passes its own
+//! Layer-2 decode-to-identify: score the mode rows against the measured band, consider the
+//! best [`CLASSIFY_TRIES`] (a program row among them as `skipped_quick`; a graph row with
+//! no quick attempt, `m17_decode`, left out) and run those with a quick in-process attempt
+//! (APRS, POCSAG, ACARS, RDS, AIS, or a frame row's chain) over the channel, reporting only what passes its own
 //! check: the AX.25 FCS, the POCSAG BCH code, the ACARS CRC-16, the RDS checkwords, the
 //! AIS frame's CRC-16 or the frame row's CRC (design 6.2, 7.2).
 
@@ -53,7 +54,8 @@ const DEVIATION_HZ: u64 = 3_000;
 /// Decode-to-identify over the mode rows. The band is scored with
 /// [`score_rows`] from layer 1's measurement when it is handed one (else it
 /// measures the band itself), and the best [`CLASSIFY_TRIES`] rows are
-/// considered in score order: a row whose `min_span_ms` exceeds the block is
+/// considered in score order (a graph row with no quick attempt is left out, see
+/// [`classify_candidate`]; a program row takes its slot): a row whose `min_span_ms` exceeds the block is
 /// `skipped_span`, one without a quick attempt `skipped_quick`, one wider
 /// than the box `skipped_band`, one not ready `unavailable`; the rest run
 /// their quick attempt on one channel extracted from the requested band, at
@@ -152,19 +154,13 @@ impl Classifier for DecodeToIdentify {
         let mut chans: Vec<((i64, u64), Option<(Vec<Complex<f32>>, u64)>)> = Vec::new();
         let mut labels = Vec::new();
         let mut tried = Vec::new();
-        // Only the rows with a quick attempt count towards [`CLASSIFY_TRIES`]: a row
-        // without one (a program row, or `m17_decode`, whose empty centre list scores
-        // anywhere) is listed as skipped above the last one tried, never in its place.
-        let mut counted = 0;
-        for s in scored.into_iter().filter(|s| s.in_range) {
-            if counted == CLASSIFY_TRIES {
-                break;
-            }
+        for s in scored
+            .into_iter()
+            .filter(|s| s.in_range && classify_candidate(&s.mode.row))
+            .take(CLASSIFY_TRIES)
+        {
             let row = &s.mode.row;
             let attempt = quick_attempt(row);
-            if attempt.is_some() {
-                counted += 1;
-            }
             let outcome = match &attempt {
                 _ if row.identify.min_span_ms > span_ms => Outcome::SkippedSpan,
                 None => Outcome::SkippedQuick,
@@ -258,6 +254,14 @@ type Attempt = Arc<dyn Fn(Vec<Complex<f32>>, u64) -> AttemptFuture + Send + Sync
 /// The in-crate attempt `row`'s `identify.quick` names (the names
 /// `zeta_core::modes::QUICK_ATTEMPTS` validates): `frame` runs the frame row's own chain
 /// ([`crate::frame_quick::attempt`]).
+/// Whether `classify` lists `row` at all: every row but a graph row with no quick
+/// attempt (`identify.quick: null`, today `m17_decode`), which has neither an
+/// in-process attempt nor a program, so only `identify` tries it. A program row stays a
+/// candidate and takes its slot as `skipped_quick`.
+fn classify_candidate(row: &ModeRow) -> bool {
+    !(matches!(row.decoder, Decoder::Graph { .. }) && row.identify.quick.is_none())
+}
+
 fn quick_attempt(row: &ModeRow) -> Option<Attempt> {
     let blocking = |f: fn(&[Complex<f32>], u64) -> Option<String>| -> Attempt {
         Arc::new(move |chan: Vec<Complex<f32>>, rate| Box::pin(async move { f(&chan, rate) }))

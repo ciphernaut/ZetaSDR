@@ -1,7 +1,9 @@
 //! M17 decode stage (design 7): 4FSK symbols from a channel's IQ, the sync bursts, the
 //! LSF (whole, or rebuilt from the six LICH chunks of the stream frames), two events per
-//! stream (one when the LSF is in hand, one at the end), and the stream's Codec 2 speech
-//! through the external `c2dec` (the row's handler 0) as ordinary job audio.
+//! stream (one when the LSF is in hand, one at the end: the last frame, the EOT marker, a
+//! lost signal or the input's end), one event with `type: packet` and no content for a
+//! packet-mode transmission, and the stream's Codec 2 speech through the external `c2dec`
+//! (the row's handler 0) as ordinary job audio.
 //!
 //! The receiver: the FM discriminator ([`nbfm_demod`], scaled so the outer symbols sit at
 //! ±1), a root-raised-cosine matched filter (completing the transmitter's raised cosine),
@@ -594,7 +596,7 @@ impl Vocoder {
                     raw.drain(..whole)
                         .collect::<Vec<u8>>()
                         .chunks(2)
-                        .map(|b| f32::from(i16::from_ne_bytes([b[0], b[1]])) / 32_768.0),
+                        .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32_768.0),
                 );
                 while speech.len() >= C2_FRAME_SAMPLES {
                     let chunk: Vec<f32> = speech.drain(..C2_FRAME_SAMPLES).collect();
@@ -749,8 +751,13 @@ impl Streams {
                         last_fn: 0,
                         vocoder: None,
                     };
+                    let packet = !lsf.stream;
                     self.announce(&mut open, lsf, 0, t, prov, events);
-                    self.open = Some(open);
+                    // A packet-mode transmission is its one event (design 7.3): nothing
+                    // stays open for an EOT event.
+                    if !packet {
+                        self.open = Some(open);
+                    }
                 }
             },
             M17Frame::Stream {
@@ -877,13 +884,10 @@ impl Stage for M17DecodeStage {
                     return Ok(publish(&ctx, &events_out, last_prov.as_ref(), events));
                 }
                 None => {
-                    // The input ended mid-stream: its speech so far is still handed back.
-                    if let Some(v) = streams.open.as_mut().and_then(|o| o.vocoder.as_mut())
-                        && let Some(h) = v.finish()
-                    {
-                        streams.env.drains.lock().unwrap().push(h);
-                    }
-                    return Ok(Vec::new());
+                    // The input ended mid-stream: the stream closes with its EOT event at
+                    // its last frame, and its speech so far is still handed back.
+                    streams.close(last_t, &mut events);
+                    return Ok(publish(&ctx, &events_out, last_prov.as_ref(), events));
                 }
             };
             let Payload::Iq(block) = &frame.payload else {
@@ -911,14 +915,18 @@ impl Stage for M17DecodeStage {
             Ok(publish(&ctx, &events_out, Some(&frame.provenance), events))
         })
         .await;
-        let pending: Vec<JoinHandle<()>> = std::mem::take(&mut *drains.lock().unwrap());
+        let mut pending: Vec<JoinHandle<()>> = std::mem::take(&mut *drains.lock().unwrap());
         if result.is_ok() {
-            for h in pending {
-                let _ = tokio::time::timeout(VOCODER_DRAIN, h).await;
-            }
-        } else {
-            pending.iter().for_each(JoinHandle::abort);
+            // Every reader gets the one deadline; any still running after it is aborted
+            // (its child is killed with it).
+            let _ = tokio::time::timeout(VOCODER_DRAIN, async {
+                for h in pending.iter_mut() {
+                    let _ = h.await;
+                }
+            })
+            .await;
         }
+        pending.iter().for_each(JoinHandle::abort);
         result
     }
 }
@@ -1243,6 +1251,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_input_ending_mid_stream_closes_it() {
+        let _env = VOCODER_ENV.lock().await;
+        set_vocoder(&fake_c2dec());
+        let iq = m17_capture(25);
+        // The preamble, the LSF and 10 stream frames, then the input ends.
+        let sps = (RATE / u64::from(M17_BAUD)) as usize;
+        let run = run_stage(&iq[..12 * FRAME_SYMBOLS * sps], |r| r.events.len() >= 2).await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert_eq!(run.events.len(), 2, "{:?}", run.events);
+        let b = &run.events[1];
+        assert_eq!(b["eot"], true, "{b}");
+        assert_eq!(b["src"], "VK4ZET", "{b}");
+        // The last frame whose next burst was in the input.
+        let last = b["frame"].as_u64().unwrap();
+        assert!((8..=9).contains(&last), "{b}");
+    }
+
+    #[tokio::test]
+    async fn a_packet_transmission_is_one_event() {
+        use crate::m17::{SYNC_PACKET, word_symbols};
+        let _env = VOCODER_ENV.lock().await;
+        set_vocoder(&fake_c2dec());
+        let mut l = lsf(ENCRYPTION_NONE);
+        l.stream = false;
+        let mut symbols = preamble_symbols();
+        symbols.extend(lsf_frame_symbols(&l));
+        for _ in 0..3 {
+            // Packet frames' contents are not decoded in this wave: any symbols serve.
+            symbols.extend(word_symbols(SYNC_PACKET));
+            symbols.extend((0..FRAME_SYMBOLS - 8).map(|k| (k % 4) as u8));
+        }
+        symbols.extend(eot_symbols());
+        let carrier = vec![Complex::new(1.0f32, 0.0); RATE as usize / 10];
+        let mut iq = carrier.clone();
+        iq.extend(rrc_modulate_4fsk(
+            &symbols,
+            M17_BAUD,
+            M17_DEVIATION_HZ,
+            RATE as u32,
+            M17_RRC_ALPHA,
+        ));
+        iq.extend(carrier);
+        let run = run_stage(&iq, |r| !r.events.is_empty()).await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert_eq!(run.events.len(), 1, "{:?}", run.events);
+        let a = &run.events[0];
+        assert_eq!(a["type"], "packet", "{a}");
+        assert_eq!(a["codec"], serde_json::Value::Null, "{a}");
+        assert_eq!(a["eot"], false, "{a}");
+        assert!(run.audio.is_empty());
+    }
+
+    #[tokio::test]
     async fn joining_mid_stream_finds_the_lsf_from_the_lich() {
         let _env = VOCODER_ENV.lock().await;
         set_vocoder(&fake_c2dec());
@@ -1281,8 +1342,6 @@ mod tests {
             a["summary"].as_str().unwrap().contains("voice scrambler"),
             "{a}"
         );
-        // Give a vocoder the time it would take to answer: still no audio.
-        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(run.audio.is_empty(), "{} audio frames", run.audio.len());
     }
 

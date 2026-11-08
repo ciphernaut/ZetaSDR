@@ -173,16 +173,10 @@ async fn program_rows_are_skipped_quick() {
     let dir = tempfile::tempdir().unwrap();
     let node = node_over_with(dir.path(), &ais_capture(), AIS_A_HZ, None).await;
     let c = classify_span(&node, AIS_A_HZ, 25_000, 2_000_000_000).await;
-    // A program row that scores (flex_decode's 25 kHz band and fsk label match) is tried
-    // but has no quick attempt. So is m17_decode, a graph row with `quick: null`, whose
-    // "anywhere" centre and fsk label put it above vdl2_decode here.
+    // A program row that scores (vdl2_decode's 25 kHz band matches) is tried but has no
+    // quick attempt.
     assert_eq!(
-        outcome(&c, "flex_decode"),
-        Some(Outcome::SkippedQuick),
-        "{c:?}"
-    );
-    assert_eq!(
-        outcome(&c, "m17_decode"),
+        outcome(&c, "vdl2_decode"),
         Some(Outcome::SkippedQuick),
         "{c:?}"
     );
@@ -309,6 +303,19 @@ async fn sonde_rows_do_not_fill_the_tried_list_outside_their_range() {
     }
     assert!(outcome(&c, "pocsag_decode").is_some(), "{c:?}");
     assert!(outcome(&c, "aprs_decode").is_some(), "{c:?}");
+}
+
+/// `m17_decode` (a graph row with no quick attempt, whose empty centre list scores
+/// anywhere) is left out of classify's list, so it never takes POCSAG's slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m17_takes_no_classify_slot_from_pocsag() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
+    assert_eq!(outcome(&c, "m17_decode"), None, "{c:?}");
+    assert_eq!(outcome(&c, "pocsag_decode"), Some(Outcome::Proved), "{c:?}");
+    assert_eq!(c.tried.len(), zeta_dsp::identify::CLASSIFY_TRIES, "{c:?}");
 }
 
 /// AIS channel A.
