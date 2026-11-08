@@ -35,7 +35,7 @@ use crate::classify::{Classifier, ClassifierSet};
 use crate::graph::{self, Graph, GraphError};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
-use crate::lease::{LeaseError, LeaseManager};
+use crate::lease::{Decision, LeaseError, LeaseManager};
 use crate::modes::{MODES_CHECKED_FILE, ModeRegistry, ModesHandle};
 use crate::ops::{
     FM_DEVIATION_DEFAULT_HZ, JobKind, Op, OpError, OpResult, Sideband, WFM_DEVIATION_DEFAULT_HZ,
@@ -2367,6 +2367,19 @@ impl Node {
             self.inner.note_fault_if_faulted(port.id());
         }
         tuned
+    }
+
+    /// What [`Node::hold_band`] of `want` on `port` would do, under the source's gate
+    /// the caller holds, with nothing leased or tuned; see [`LeaseManager::decide`].
+    // `set_start` decides every source in use before it tunes any.
+    #[allow(dead_code)]
+    pub(crate) fn decide(
+        &self,
+        port: &dyn Port,
+        want: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Decision {
+        self.inner.leases.decide(port, want, guard)
     }
 
     /// Lease `want` on `port` as a rigid request under the source's gate the caller

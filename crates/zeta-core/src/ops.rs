@@ -24,6 +24,7 @@ use crate::modes::{
 use crate::node::{AfterGate, Node, NodeError};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
 use crate::ring::RingError;
+use crate::stage::Readiness;
 use crate::station::Station;
 use crate::stream::{Frame, Payload, StreamInfo};
 use crate::types::{
@@ -3162,11 +3163,10 @@ pub(crate) fn check_start_fields(
     })
 }
 
-/// What [`check_plan_start_fields`] resolved: the plan, its channels `(number, centre)`,
-/// the channel numbers to start (sorted), the deviation and the attach language.
+/// What [`check_plan_start_fields`] resolved: the plan, the channel numbers to start
+/// (sorted), the deviation and the attach language.
 pub(crate) struct PlanFields {
     pub plan: &'static crate::plans::ChannelPlan,
-    pub all: Vec<(u32, u64)>,
     pub numbers: Vec<u32>,
     pub deviation: Option<Hz>,
     pub language: String,
@@ -3235,6 +3235,21 @@ pub(crate) fn check_plan_start_fields(
         ));
     }
     let deviation = check_start_fields(kind, deviation_hz, sideband)?;
+    let language = check_attach_fields(attach, language)?;
+    Ok(PlanFields {
+        plan: p,
+        numbers,
+        deviation,
+        language,
+    })
+}
+
+/// `plan_start`'s checks of `attach` and `language`: an attachable `attach`, and
+/// `language` only with `attach` and a BCP-47 code; the language (`en` for `null`).
+fn check_attach_fields(
+    attach: Option<&JobKind>,
+    language: Option<&str>,
+) -> Result<String, FieldError> {
     if let Some(a) = attach
         && !a.attachable()
     {
@@ -3255,13 +3270,7 @@ pub(crate) fn check_plan_start_fields(
             )),
         ));
     }
-    Ok(PlanFields {
-        plan: p,
-        all,
-        numbers,
-        deviation,
-        language,
-    })
+    Ok(language)
 }
 
 /// Stop the `replace` holders under `guard` (see [`Node::replace_holders`]);
@@ -3915,10 +3924,313 @@ fn load_warning(n: usize, kind: &JobKind, capacity: u32) -> String {
     )
 }
 
+/// What [`plan_check`] resolved: the plan, the channel numbers to start (sorted), the
+/// kind and its start params.
+pub(crate) struct PlanChannels {
+    pub plan: &'static crate::plans::ChannelPlan,
+    pub numbers: Vec<u32>,
+    pub kind: JobKind,
+    pub deviation: Option<Hz>,
+    pub sideband: Option<Sideband>,
+}
+
+impl PlanChannels {
+    /// Channel `n`'s band: its centre (0 Hz for a number the plan lacks) and the
+    /// plan's channel width.
+    pub(crate) fn channel_band(&self, n: u32) -> Tuning {
+        let centre = crate::plans::channels(self.plan)
+            .into_iter()
+            .find(|&(m, _)| m == n)
+            .map_or(0, |(_, hz)| hz);
+        Tuning {
+            center_hz: Hz(centre),
+            bandwidth_hz: Hz(self.plan.bandwidth_hz),
+        }
+    }
+
+    /// The band bounding the channels `numbers` (see [`crate::plans::bounding`]).
+    pub(crate) fn bounding(&self, numbers: &[u32]) -> Tuning {
+        crate::plans::bounding(self.plan, numbers)
+    }
+}
+
+/// `plan_start`'s step 1 without `attach`, `language` and the source: the plan's
+/// fields as [`check_plan_start_fields`] checks them, then the kind's mode row ready.
+/// Nothing has happened yet.
+// `set_start` checks a member's channels apart from its attach.
+#[allow(dead_code)]
+pub(crate) fn plan_check(
+    node: &Node,
+    plan: &str,
+    channels: Option<Vec<u32>>,
+    kind: JobKind,
+    deviation_hz: Option<u64>,
+    sideband: Option<Sideband>,
+) -> Result<PlanChannels, OpError> {
+    plan_check_as(
+        node,
+        plan,
+        channels,
+        kind,
+        (deviation_hz, sideband),
+        (None, None),
+    )
+    .map(|(pc, _)| pc)
+}
+
+/// [`plan_check`] with `plan_start`'s `attach` and `language` checked in their place
+/// among the fields (before the mode row); also the attach language.
+fn plan_check_as(
+    node: &Node,
+    plan: &str,
+    channels: Option<Vec<u32>>,
+    kind: JobKind,
+    (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
+    (attach, language): (Option<&JobKind>, Option<&str>),
+) -> Result<(PlanChannels, String), OpError> {
+    let PlanFields {
+        plan,
+        numbers,
+        deviation,
+        language,
+        ..
+    } = check_plan_start_fields(
+        plan,
+        channels.as_deref(),
+        &kind,
+        (deviation_hz, sideband),
+        (attach, language),
+    )
+    .map_err(|e| e.error)?;
+    kind.mode_row(&node.modes())?;
+    let pc = PlanChannels {
+        plan,
+        numbers,
+        kind,
+        deviation,
+        sideband,
+    };
+    Ok((pc, language))
+}
+
+/// `plan_start`'s checks of `attach` and `language` (attachable, a language only with
+/// an attach, BCP-47) and of the attached stage's readiness: the language (`en` for
+/// `null`) and the stage's readiness (`None` without `attach`). A stage that is not
+/// ready is refused as `plan_start` refuses it.
+// `set_start` checks a member's attach apart from its channels.
+#[allow(dead_code)]
+pub(crate) fn plan_attach_check(
+    node: &Node,
+    attach: &Option<JobKind>,
+    language: &Option<String>,
+) -> Result<(String, Option<Readiness>), OpError> {
+    let language =
+        check_attach_fields(attach.as_ref(), language.as_deref()).map_err(|e| e.error)?;
+    Ok((language, attach_readiness(node, attach.as_ref())?))
+}
+
+/// The readiness of the stage `attach` names (`None` without one, or for a stage
+/// that reports none); a stage that is not ready is refused, nothing done.
+fn attach_readiness(node: &Node, attach: Option<&JobKind>) -> Result<Option<Readiness>, OpError> {
+    let readiness = attach.and_then(|a| node.stage_readiness(a.name()));
+    if let (Some(a), Some(r)) = (attach, &readiness)
+        && !r.ready
+    {
+        return Err(other(format!(
+            "{}: {}; start without attach",
+            a.name(),
+            r.reason.as_deref().unwrap_or("not ready")
+        )));
+    }
+    Ok(readiness)
+}
+
+/// `plan_start`'s step 2: the channels of `pc` an identical rigid job already runs on
+/// `source` (with the running job of the `attach` kind reading it), and the channels
+/// left to start. A job `replace` names is about to stop, so its channel is started
+/// again.
+pub(crate) fn plan_existing(
+    node: &Node,
+    pc: &PlanChannels,
+    source: &SourceId,
+    replace: &[JobId],
+    attach: &Option<JobKind>,
+) -> (Vec<PlanExisting>, Vec<u32>) {
+    let mut existing = Vec::new();
+    let mut to_start = Vec::new();
+    for &n in &pc.numbers {
+        let band = pc.channel_band(n);
+        let dup = node
+            .duplicate_of(
+                source,
+                pc.kind.name(),
+                band,
+                pc.deviation.map(|d| d.0),
+                pc.sideband,
+            )
+            .filter(|j| !replace.contains(j));
+        match dup {
+            Some(job) => existing.push(PlanExisting {
+                channel: n,
+                center_hz: band.center_hz,
+                attached: attach.as_ref().and_then(|a| attached_to(node, &job, a)),
+                job,
+            }),
+            None => to_start.push(n),
+        }
+    }
+    (existing, to_start)
+}
+
+/// Two [`AfterGate`]s on `source` as one: either alone, or a relaunch of every
+/// elastic job when both ask for something.
+fn merge_after(source: &SourceId, a: AfterGate, b: AfterGate) -> AfterGate {
+    match (a, b) {
+        (AfterGate::Nothing, b) => b,
+        (a, AfterGate::Nothing) => a,
+        _ => AfterGate::Relaunch {
+            source: source.clone(),
+            except: None,
+        },
+    }
+}
+
+/// `plan_start`'s step 6: start each channel `to_start` of `pc` on `source` inside the
+/// capture `granted`, which the caller already holds under the source's gate (`guard`),
+/// in the order given; a start that fails is that channel's refusal and the rest go
+/// on. Also what is left for after the gate (run it with [`Node::after_gate`] once the
+/// gate goes).
+pub(crate) async fn plan_start_channels(
+    node: &Node,
+    pc: &PlanChannels,
+    source: &SourceId,
+    to_start: &[u32],
+    granted: Tuning,
+    guard: &tokio::sync::OwnedMutexGuard<()>,
+) -> (Vec<PlanStarted>, Vec<PlanRefused>, AfterGate) {
+    let bin_rate = node.bank_bin_rate(source, granted);
+    let modes = node.modes();
+    let (mut started, mut refused) = (Vec::new(), Vec::new());
+    let mut after = AfterGate::Nothing;
+    for &n in to_start {
+        let tuning = pc.channel_band(n);
+        let r = match pc.kind.expand(
+            source,
+            tuning,
+            granted.bandwidth_hz,
+            bin_rate,
+            pc.deviation,
+            pc.sideband,
+            &modes,
+        ) {
+            Ok(graph) => {
+                let (r, a) = node
+                    .job_start_gated(
+                        pc.kind.name(),
+                        source.clone(),
+                        tuning,
+                        graph,
+                        Some(granted.bandwidth_hz),
+                        false,
+                        Some(guard),
+                    )
+                    .await;
+                after = merge_after(source, after, a);
+                r.map_err(|e| node_error(node, e))
+            }
+            Err(e) => Err(e),
+        };
+        match r {
+            Ok(job) => started.push(PlanStarted {
+                channel: n,
+                center_hz: tuning.center_hz,
+                job,
+                attached: None,
+                attach_error: None,
+            }),
+            Err(error) => refused.push(PlanRefused {
+                channel: n,
+                center_hz: tuning.center_hz,
+                error,
+            }),
+        }
+    }
+    (started, refused, after)
+}
+
+/// `plan_start`'s step 7: attach a job of `attach` in `language` to every started job,
+/// and to each existing one without one; the warnings (channels that carry no voice,
+/// an existing job that could not be attached, the stage's load per its `readiness`).
+/// The attach needs no gate (an attached job holds no lease).
+pub(crate) async fn plan_attach(
+    node: &Node,
+    pc: &PlanChannels,
+    attach: &JobKind,
+    language: &str,
+    readiness: &Option<Readiness>,
+    started: &mut [PlanStarted],
+    existing: &mut [PlanExisting],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    // A channel that carries no voice (CB ch22, ch23) gets no attached stage: its
+    // demodulator runs, and the warning names the channels left out.
+    let no_voice = |n: u32| pc.plan.no_voice.contains(&n);
+    let mut skipped: Vec<u32> = started
+        .iter()
+        .map(|s| s.channel)
+        .chain(
+            existing
+                .iter()
+                .filter(|e| e.attached.is_none())
+                .map(|e| e.channel),
+        )
+        .filter(|&n| no_voice(n))
+        .collect();
+    skipped.sort_unstable();
+    if !skipped.is_empty() {
+        let chs: Vec<String> = skipped.iter().map(|n| format!("ch{n}")).collect();
+        warnings.push(format!(
+            "{}: data, no voice: no {} attached",
+            chs.join(", "),
+            attach.name()
+        ));
+    }
+    for s in started.iter_mut().filter(|s| !no_voice(s.channel)) {
+        match attach_one(node, attach, &s.job, language).await {
+            Ok(id) => s.attached = Some(id),
+            Err(e) => s.attach_error = Some(e),
+        }
+    }
+    // An existing entry has no error field: one that cannot be attached stays
+    // without, says why in a warning, and a second run tries again.
+    for e in existing
+        .iter_mut()
+        .filter(|e| e.attached.is_none() && !no_voice(e.channel))
+    {
+        match attach_one(node, attach, &e.job, language).await {
+            Ok(id) => e.attached = Some(id),
+            Err(err) => warnings.push(format!("ch{}: attach failed: {err}", e.channel)),
+        }
+    }
+    if let Some(c) = readiness.as_ref().and_then(|r| r.capacity) {
+        let n = node
+            .job_list()
+            .into_iter()
+            .filter(|r| r.state == JobState::Running && r.kind == attach.name())
+            .count();
+        if n > c as usize {
+            warnings.push(load_warning(n, attach, c));
+        }
+    }
+    warnings
+}
+
 /// `plan_start`: validate, find the channels already running, preflight the attached
 /// stage, stop `replace`, take one lease decision for the band bounding the channels to
 /// start, start each in channel-number order under the same hold of the source's gate,
-/// then attach to the started jobs (and to the existing ones without one).
+/// then attach to the started jobs (and to the existing ones without one). The
+/// composition of [`plan_check`] (with `attach` checked among the fields),
+/// [`plan_existing`], [`plan_start_channels`] and [`plan_attach`].
 #[allow(clippy::too_many_arguments)]
 async fn plan_start(
     node: &Node,
@@ -3931,65 +4243,28 @@ async fn plan_start(
     replace: Vec<JobId>,
 ) -> Result<OpResult, OpError> {
     // 1. Validate: nothing has happened yet.
-    let PlanFields {
-        plan: p,
-        all,
-        numbers,
-        deviation,
-        language,
-    } = check_plan_start_fields(
+    let (pc, language) = plan_check_as(
+        node,
         &plan,
-        channels.as_deref(),
-        &kind,
+        channels,
+        kind,
         (deviation_hz, sideband),
         (attach.as_ref(), language.as_deref()),
-    )
-    .map_err(|e| e.error)?;
-    kind.mode_row(&node.modes())?;
+    )?;
     let port = node
         .port(&source)
         .ok_or_else(|| unknown_source(node, &source))?;
-    let channel_band = |n: u32| Tuning {
-        center_hz: Hz(all.iter().find(|&&(m, _)| m == n).map_or(0, |&(_, hz)| hz)),
-        bandwidth_hz: Hz(p.bandwidth_hz),
-    };
 
     // One hold of the source's gate covers every step that follows up to the last
     // start: no other caller's tune slips between the lease decision and the starts.
     let guard = node.gate_guard(&source).await;
-    // 2. The channels an identical rigid job already runs on (one that `replace` names
-    // is about to stop, so its channel is started again).
-    let mut existing = Vec::new();
-    let mut to_start = Vec::new();
-    for &n in &numbers {
-        let band = channel_band(n);
-        let dup = node
-            .duplicate_of(&source, kind.name(), band, deviation.map(|d| d.0), sideband)
-            .filter(|j| !replace.contains(j));
-        match dup {
-            Some(job) => existing.push(PlanExisting {
-                channel: n,
-                center_hz: band.center_hz,
-                attached: attach.as_ref().and_then(|a| attached_to(node, &job, a)),
-                job,
-            }),
-            None => to_start.push(n),
-        }
-    }
+    // 2. The channels an identical rigid job already runs on.
+    let (mut existing, to_start) = plan_existing(node, &pc, &source, &replace, &attach);
     // 3. The attached stage must be ready: refused, with nothing done, otherwise.
-    let readiness = attach.as_ref().and_then(|a| node.stage_readiness(a.name()));
-    if let (Some(a), Some(r)) = (&attach, &readiness)
-        && !r.ready
-    {
-        return Err(other(format!(
-            "{}: {}; start without attach",
-            a.name(),
-            r.reason.as_deref().unwrap_or("not ready")
-        )));
-    }
+    let readiness = attach_readiness(node, attach.as_ref())?;
     // The bounding band against the source's ranges before anything is stopped: its
     // width is the corrective `out_of_range`.
-    let bounding = crate::plans::bounding(p, &to_start);
+    let bounding = pc.bounding(&to_start);
     if !to_start.is_empty() {
         checked_port(node, &source, &bounding)?;
     }
@@ -3999,15 +4274,13 @@ async fn plan_start(
         idle_after_replace(node, port.as_ref(), &replace, &e).await;
         return Err(node_error(node, e));
     }
-    let mut started = Vec::new();
-    let mut refused = Vec::new();
-    let capture = if to_start.is_empty() {
+    let (mut started, refused, capture) = if to_start.is_empty() {
         drop(guard);
         if !replace.is_empty() {
             node.idle_if_unheld(port.as_ref()).await;
         }
-        port.current()
-            .unwrap_or_else(|| crate::plans::bounding(p, &numbers))
+        let capture = port.current().unwrap_or_else(|| pc.bounding(&pc.numbers));
+        (Vec::new(), Vec::new(), capture)
     } else {
         // 5. One lease decision for the bounding band, taken as a rigid start of it
         // would be. The lease is held only until the channels hold theirs inside its
@@ -4027,131 +4300,42 @@ async fn plan_start(
                 return Err(node_error(node, e));
             }
         };
-        // 6. Each channel inside the capture, in channel-number order; a start that
-        // fails is that channel's refusal and the rest go on.
-        let bin_rate = node.bank_bin_rate(&source, granted);
-        let modes = node.modes();
+        // 6. Each channel inside the capture, in channel-number order.
+        let (started, refused, after) =
+            plan_start_channels(node, &pc, &source, &to_start, granted, &guard).await;
         // The tune above moved the capture: the elastic jobs follow once the gate goes.
-        let mut after = match tuned {
+        let moved = match tuned {
             true => AfterGate::Relaunch {
                 source: source.clone(),
                 except: None,
             },
             false => AfterGate::Nothing,
         };
-        for n in to_start {
-            let tuning = channel_band(n);
-            let r = match kind.expand(
-                &source,
-                tuning,
-                granted.bandwidth_hz,
-                bin_rate,
-                deviation,
-                sideband,
-                &modes,
-            ) {
-                Ok(graph) => {
-                    let (r, a) = node
-                        .job_start_gated(
-                            kind.name(),
-                            source.clone(),
-                            tuning,
-                            graph,
-                            Some(granted.bandwidth_hz),
-                            false,
-                            Some(&guard),
-                        )
-                        .await;
-                    after = match (after, a) {
-                        (AfterGate::Nothing, a) => a,
-                        (merged, AfterGate::Nothing) => merged,
-                        _ => AfterGate::Relaunch {
-                            source: source.clone(),
-                            except: None,
-                        },
-                    };
-                    r.map_err(|e| node_error(node, e))
-                }
-                Err(e) => Err(e),
-            };
-            match r {
-                Ok(job) => started.push(PlanStarted {
-                    channel: n,
-                    center_hz: tuning.center_hz,
-                    job,
-                    attached: None,
-                    attach_error: None,
-                }),
-                Err(error) => refused.push(PlanRefused {
-                    channel: n,
-                    center_hz: tuning.center_hz,
-                    error,
-                }),
-            }
-        }
+        let after = merge_after(&source, moved, after);
         drop(hold);
         drop(guard);
         node.after_gate(after).await;
         if started.is_empty() && !replace.is_empty() {
             node.idle_if_unheld(port.as_ref()).await;
         }
-        granted
+        (started, refused, granted)
     };
-    // 7. Attach to every started job, and to each existing one without one; the
-    // attach needs no gate (an attached job holds no lease).
-    let mut warnings = Vec::new();
-    if let Some(a) = &attach {
-        // A channel that carries no voice (CB ch22, ch23) gets no attached stage: its
-        // demodulator runs, and the warning names the channels left out.
-        let no_voice = |n: u32| p.no_voice.contains(&n);
-        let mut skipped: Vec<u32> = started
-            .iter()
-            .map(|s| s.channel)
-            .chain(
-                existing
-                    .iter()
-                    .filter(|e| e.attached.is_none())
-                    .map(|e| e.channel),
+    // 7. Attach to every started job, and to each existing one without one.
+    let warnings = match &attach {
+        Some(a) => {
+            plan_attach(
+                node,
+                &pc,
+                a,
+                &language,
+                &readiness,
+                &mut started,
+                &mut existing,
             )
-            .filter(|&n| no_voice(n))
-            .collect();
-        skipped.sort_unstable();
-        if !skipped.is_empty() {
-            let chs: Vec<String> = skipped.iter().map(|n| format!("ch{n}")).collect();
-            warnings.push(format!(
-                "{}: data, no voice: no {} attached",
-                chs.join(", "),
-                a.name()
-            ));
+            .await
         }
-        for s in started.iter_mut().filter(|s| !no_voice(s.channel)) {
-            match attach_one(node, a, &s.job, &language).await {
-                Ok(id) => s.attached = Some(id),
-                Err(e) => s.attach_error = Some(e),
-            }
-        }
-        // An existing entry has no error field: one that cannot be attached stays
-        // without, says why in a warning, and a second run tries again.
-        for e in existing
-            .iter_mut()
-            .filter(|e| e.attached.is_none() && !no_voice(e.channel))
-        {
-            match attach_one(node, a, &e.job, &language).await {
-                Ok(id) => e.attached = Some(id),
-                Err(err) => warnings.push(format!("ch{}: attach failed: {err}", e.channel)),
-            }
-        }
-        if let Some(c) = readiness.and_then(|r| r.capacity) {
-            let n = node
-                .job_list()
-                .into_iter()
-                .filter(|r| r.state == JobState::Running && r.kind == a.name())
-                .count();
-            if n > c as usize {
-                warnings.push(load_warning(n, a, c));
-            }
-        }
-    }
+        None => Vec::new(),
+    };
     Ok(OpResult::PlanStart {
         plan,
         source,
