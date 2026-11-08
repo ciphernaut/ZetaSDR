@@ -15,7 +15,7 @@ The toolchain is pinned in `rust-toolchain.toml` (1.97). The gates CI runs (`.gi
 cargo fmt --check                    # in a worktree nested in the checkout: per crate, cargo fmt -p <crate> -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace -- --skip ui_scenarios_pass_in_headless_chromium
-cargo test -p zeta --test ui -- --nocapture   # the web page end to end, about 9 min
+cargo test -p zeta --test ui -- --nocapture   # the web page end to end, about 5 min
 cargo run -q -p zeta -- agents-md --check
 cargo run -q -p zeta -- agents-md --skill --check
 bash scripts/public-check.sh         # leak check; needs gitleaks and strings
@@ -38,6 +38,10 @@ For example: `cargo test -p zeta-core --features test-fixtures --test watch -- -
 The test runs the first `python3` on `PATH` with Playwright: `uv venv && . .venv/bin/activate && uv pip install playwright && python -m playwright install chromium`.
 
 When it can't run, it **passes** and prints `ui e2e skipped: <reason>`, so check for that line.
+
+It runs the scenarios in two shards at once, each with its own nodes (ui.py's `SHARD_STARTS`;
+`ZETA_UI_SHARDS=<n>` overrides, `ZETA_UI_ONLY=a,b` runs those in one shard).
+`ZETA_UI_PROFILE=<file>` writes the slowest lines of each scenario there.
 
 ### Flaky in CI only
 

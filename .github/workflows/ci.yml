@@ -64,10 +64,11 @@ jobs:
 
   ui:
     runs-on: ubuntu-24.04
-    # A normal run takes about 15 minutes (the suite alone about 9). Chromium's system
-    # packages come from the runner's Ubuntu mirror, which once took 10 minutes for 20 MB:
-    # the margin absorbs that and still stops a hung suite long before GitHub's 6 hours.
-    timeout-minutes: 35
+    # A normal run takes about 11 minutes (the suite alone about 5, in two shards, each
+    # killed after ui.rs's DEADLINE of 7.5). Chromium's system packages come from the
+    # runner's Ubuntu mirror, which once took 10 minutes for 20 MB: the margin absorbs that
+    # and still stops a hung suite long before GitHub's 6 hours.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

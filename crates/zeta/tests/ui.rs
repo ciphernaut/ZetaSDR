@@ -25,7 +25,7 @@
 //!
 //! The scenarios run in [`SHARDS`] shards at once (`ZETA_UI_SHARDS=<n>` overrides), each
 //! against its own set of those nodes and its own Chromium: ui.py's `SHARD_STARTS` cuts the
-//! scenarios into contiguous blocks. A shard still running after [`DEADLINE`] (690 s) of wall
+//! scenarios into contiguous blocks. A shard still running after [`DEADLINE`] (450 s) of wall
 //! clock is killed and the test fails. `ZETA_UI_ONLY=a,b` runs only those scenarios, in one
 //! shard.
 //!
@@ -296,10 +296,12 @@ fn fsk_fixture(dir: &Path) -> PathBuf {
     zeta_dsp::fixtures::write_fixture(dir, "fsk", &iq, 48_000, 433_920_000)
 }
 
-/// Wall-clock limit on the whole ui.py run, about 1.25 times the slowest measured run: about
-/// 474 s at plan 24, 500.8 s after plan 19.2's Bits scenario, 547.7 s run alone on 2026-11-04;
-/// 1.25 × 547.7 s ≈ 685 s, so the limit is 690 s.
-const DEADLINE: Duration = Duration::from_secs(690);
+/// Wall-clock limit on each shard's ui.py run. One run of every scenario took 575-615 s on
+/// 2026-11-08 (the limit was 690 s); split in two shards (SHARDS) it took about 260 s, and
+/// about 310 s pinned to two CPUs (`taskset -c 0,1`, as on CI's runners). 450 s is about
+/// 1.45 times the pinned run, room for a few more scenarios before SHARD_STARTS or SHARDS
+/// needs a look.
+const DEADLINE: Duration = Duration::from_secs(450);
 
 /// The shards run at once by default (ui.py's `SHARD_STARTS` says where each begins), each
 /// with its own nodes and Chromium: the scenarios mostly wait on fixtures played in real time,
