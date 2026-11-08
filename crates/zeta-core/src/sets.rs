@@ -658,6 +658,40 @@ impl SetRegistry {
     }
 }
 
+/// Current on-disk format of [`SetInstance`].
+pub const SETS_INSTANCE_FORMAT: u32 = 1;
+
+/// A set's running instance, written by `set_start` to `state_dir/sets/<set id>.json`
+/// and read back when the node opens: the source each role runs on and the jobs each
+/// member started (an attached job beside its demodulator). One per set at a time;
+/// dropped by `set_stop`, or once every job it names has ended.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetInstance {
+    pub format: u32,
+    pub set: String,
+    pub radios: std::collections::BTreeMap<String, crate::types::SourceId>,
+    pub since_ns: crate::types::Timestamp,
+    pub members: Vec<InstanceMember>,
+}
+
+/// One member of a [`SetInstance`] and its jobs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct InstanceMember {
+    pub id: String,
+    pub jobs: Vec<crate::types::JobId>,
+}
+
+impl SetInstance {
+    /// Every job the instance names, member by member.
+    pub fn jobs(&self) -> impl Iterator<Item = &crate::types::JobId> {
+        self.members.iter().flat_map(|m| m.jobs.iter())
+    }
+}
+
 /// `$XDG_CONFIG_HOME/zetasdr/sets`, else `$HOME/.config/zetasdr/sets`; `None` when
 /// neither variable is set.
 pub fn default_operator_dir() -> Option<PathBuf> {

@@ -53,7 +53,8 @@ pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
 
 pub(crate) use launch::AfterGate;
 use launch::{feed_bank, feed_ring};
-use persist::{io, load, now, persist};
+pub(crate) use persist::now;
+use persist::{io, load, load_instances, persist, persist_instance, remove_instance};
 pub use sources::{GainSetting, SOURCE_RECORD_FORMAT, SourceRecord, load_source};
 use sources::{load_sources, persist_source};
 
@@ -312,6 +313,14 @@ struct Inner {
     reloading: Mutex<()>,
     /// The named sets, loaded at `open` from `NodeConfig.sets_dir` over the embedded ones.
     sets: Arc<crate::sets::SetRegistry>,
+    /// `state_dir/sets`: one [`crate::sets::SetInstance`] file per running set.
+    sets_dir: PathBuf,
+    /// The running sets' instances by set id, read back at `open` and written through by
+    /// `set_start` and `set_stop`.
+    set_instances: Mutex<BTreeMap<String, crate::sets::SetInstance>>,
+    /// Held across `set_start` and `set_stop`, so two of them never update one instance
+    /// at once. Taken before any source's gate, and no other operation takes it.
+    set_gate: tokio::sync::Mutex<()>,
     /// The page themes: the built-in ones until the caller sets its own with `set_themes`.
     themes: RwLock<Arc<crate::themes::ThemeRegistry>>,
     /// The `capture` jobs' windows, opened (and expired) at `open`.
@@ -809,6 +818,11 @@ fn resume_capture(
     elastic.into_iter().find(|t| contains(t))
 }
 
+/// Whether a job in `state` has ended: stopped or failed.
+pub(crate) fn job_ended(state: &JobState) -> bool {
+    matches!(state, JobState::Stopped | JobState::Failed { .. })
+}
+
 /// A job's failure caused by its source's port, `source <id>: <error>`: the reason every
 /// fault-caused failure carries (a stage that saw the fault, a launch whose tune the port
 /// refused), so the node's recovery of the source can find the jobs it should relaunch.
@@ -946,6 +960,11 @@ impl Node {
             &registry,
             cfg.sets_dir.as_deref(),
         ));
+        // The running sets' instances: an unreadable file is a persist error, never a
+        // failure to open.
+        let sets_dir = cfg.state_dir.join("sets");
+        let (instances, instance_errors) = load_instances(&sets_dir);
+        let set_instances = instances.into_iter().map(|i| (i.set.clone(), i)).collect();
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
         // `Node::apply` and are never logged.
@@ -974,6 +993,9 @@ impl Node {
                 modes_dir: cfg.modes_dir.clone(),
                 reloading: Mutex::new(()),
                 sets,
+                sets_dir,
+                set_instances: Mutex::new(set_instances),
+                set_gate: tokio::sync::Mutex::new(()),
                 themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
                 bursts,
                 signatures,
@@ -988,7 +1010,7 @@ impl Node {
                 jobs: Mutex::new(HashMap::new()),
                 knowledge: RwLock::new(vec![learned_knowledge]),
                 classifiers: RwLock::new(classifiers),
-                persist_errors: Mutex::new(Vec::new()),
+                persist_errors: Mutex::new(instance_errors),
                 ops_log: jsonlog::JsonLog::new(cfg.state_dir.join("ops.log")),
                 transcripts_log: jsonlog::JsonLog::new(cfg.state_dir.join("transcripts.log")),
                 events_log: jsonlog::JsonLog::with_max_bytes(
@@ -1164,6 +1186,64 @@ impl Node {
     /// The named sets (`set_list`): the embedded ones and the operator's `sets_dir`.
     pub fn sets(&self) -> Arc<crate::sets::SetRegistry> {
         self.inner.sets.clone()
+    }
+
+    /// The running sets' instances by set id (`state_dir/sets`, read back at `open`).
+    pub fn set_instances(&self) -> BTreeMap<String, crate::sets::SetInstance> {
+        self.inner.set_instances.lock().unwrap().clone()
+    }
+
+    /// Hold the node's set gate until the guard drops (see `Inner::set_gate`).
+    pub(crate) async fn set_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.set_gate.lock().await
+    }
+
+    /// Keep `inst` as its set's running instance and write it to `state_dir/sets`. A
+    /// write that fails is returned; the instance is kept in memory all the same, so a
+    /// `set_stop` in this run still finds it.
+    pub(crate) fn put_set_instance(&self, inst: crate::sets::SetInstance) -> Result<(), NodeError> {
+        let written = persist_instance(&self.inner.sets_dir, &inst);
+        self.inner
+            .set_instances
+            .lock()
+            .unwrap()
+            .insert(inst.set.clone(), inst);
+        written
+    }
+
+    /// Forget set `set`'s instance and remove its file.
+    pub(crate) fn drop_set_instance(&self, set: &str) -> Result<(), NodeError> {
+        self.inner.set_instances.lock().unwrap().remove(set);
+        remove_instance(&self.inner.sets_dir, set)
+    }
+
+    /// Drop every instance none of whose jobs still runs (each stopped, failed or
+    /// forgotten from the history); a file that cannot be removed is a persist error.
+    pub(crate) fn prune_set_instances(&self) {
+        let live: std::collections::HashSet<JobId> = self
+            .job_list()
+            .into_iter()
+            .filter(|r| !job_ended(&r.state))
+            .map(|r| r.id)
+            .collect();
+        let ended: Vec<String> = self
+            .inner
+            .set_instances
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, i)| !i.jobs().any(|j| live.contains(j)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ended {
+            if let Err(e) = self.drop_set_instance(&id) {
+                self.inner
+                    .persist_errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("sets/{id}.json: {e}"));
+            }
+        }
     }
 
     /// The page themes (the built-in ones unless `set_themes` replaced them).
@@ -2372,7 +2452,6 @@ impl Node {
     /// What [`Node::hold_band`] of `want` on `port` would do, under the source's gate
     /// the caller holds, with nothing leased or tuned; see [`LeaseManager::decide`].
     // `set_start` decides every source in use before it tunes any.
-    #[allow(dead_code)]
     pub(crate) fn decide(
         &self,
         port: &dyn Port,

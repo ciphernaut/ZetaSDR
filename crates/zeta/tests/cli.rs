@@ -3054,6 +3054,37 @@ fn zeta_sets_prints_the_two_builtin_sets() {
     assert!(rows.iter().all(|s| s["running"].is_null()), "{v}");
 }
 
+/// `zeta set stop` of a set that does not run stops nothing; `zeta set start` of an
+/// unknown set names the known ones and of an unmapped role names it.
+#[test]
+fn zeta_set_start_and_stop_answer_as_the_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(dir.path(), &["set", "stop", "--set", "airband"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "set_stopped", "{v}");
+    assert_eq!(v["value"]["stopped"], serde_json::json!([]), "{v}");
+    assert_eq!(v["value"]["ended"], serde_json::json!([]), "{v}");
+    zeta(
+        dir.path(),
+        &["set", "start", "--set", "nope", "--radio", "wide=tone"],
+    )
+    .assert()
+    .failure()
+    .stdout(contains("airband").and(contains("pagers_au")));
+    zeta(
+        dir.path(),
+        &["set", "start", "--set", "airband", "--radio", "wide=tone"],
+    )
+    .assert()
+    .failure()
+    .stdout(contains("radios.second: unmapped"));
+}
+
 /// A theme folder that does not validate is logged at startup and listed as broken; the
 /// node runs.
 #[test]

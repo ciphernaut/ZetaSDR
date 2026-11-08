@@ -364,6 +364,9 @@ pub enum Command {
     Themes(ThemesCmd),
     /// The named sets the node knows (airband, pagers_au, the operator's own)
     Sets,
+    /// Start or stop a named set
+    #[command(subcommand)]
+    Set(SetCmd),
     /// Run every classifier over a selection of a source ring
     Classify(SelectionArgs),
     /// JSON schemas of operations, results and errors
@@ -678,6 +681,57 @@ pub enum PlanCmd {
         #[command(flatten)]
         replace: ReplaceArg,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SetCmd {
+    /// Start a set's members on the sources its roles are mapped to, under one lease
+    /// decision per source
+    Start {
+        /// Set id (from `zeta sets`)
+        #[arg(long, value_name = "ID")]
+        set: String,
+        /// Role to source, e.g. wide=b210,second=hackrf; repeatable. `ROLE=` with
+        /// nothing after it sends the role as `null`
+        #[arg(long = "radio", value_name = "ROLE=SOURCE[,ROLE=SOURCE]", value_parser = parse_radios)]
+        radios: Vec<Radios>,
+        /// Member ids to start, comma-separated; absent = every member
+        #[arg(long, value_name = "ID[,ID]", value_delimiter = ',')]
+        members: Option<Vec<String>>,
+        #[command(flatten)]
+        replace: ReplaceArg,
+    },
+    /// Stop the jobs of a set's running instance
+    Stop {
+        /// Set id (from `zeta sets`)
+        #[arg(long, value_name = "ID")]
+        set: String,
+    },
+}
+
+/// The role-to-source pairs of one `--radio`; a source `None` is `ROLE=` (pick one).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Radios(Vec<(String, Option<SourceId>)>);
+
+/// `wide=b210,second=` into `(role, source)` pairs, `None` for an empty source; an item
+/// without `=` or with an empty role is an error.
+pub fn parse_radios(s: &str) -> Result<Radios, String> {
+    s.split(',')
+        .map(|item| match item.split_once('=') {
+            Some((role, _)) if role.trim().is_empty() => {
+                Err(format!("radio: `{item}` names no role"))
+            }
+            Some((role, source)) => {
+                let source = source.trim();
+                Ok((
+                    role.trim().to_string(),
+                    (!source.is_empty()).then(|| SourceId(source.to_string())),
+                ))
+            }
+            None => Err(format!("radio: `{item}` is not ROLE=SOURCE")),
+        })
+        .collect::<Result<_, _>>()
+        .map(Radios)
 }
 
 /// The channel numbers of `--channels`: sorted, no repeats.
@@ -1281,6 +1335,7 @@ impl Command {
                     | JobCmd::Stop(_)
             ) | Command::Graph(GraphCmd::Put { .. } | GraphCmd::Start { .. })
                 | Command::Plan(PlanCmd::Start { .. })
+                | Command::Set(SetCmd::Start { .. } | SetCmd::Stop { .. })
                 | Command::Mix(MixCmd::Start { .. })
                 | Command::Bits(BitsCmd::Start { .. })
                 | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
@@ -1546,6 +1601,18 @@ impl Command {
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Themes(ThemesCmd::List) => Op::ThemesList {},
             Command::Sets => Op::SetList {},
+            Command::Set(SetCmd::Start {
+                set,
+                radios,
+                members,
+                replace,
+            }) => Op::SetStart {
+                set,
+                radios: radios.into_iter().flat_map(|r| r.0).collect(),
+                members,
+                replace: replace.into_ids(),
+            },
+            Command::Set(SetCmd::Stop { set }) => Op::SetStop { set },
             Command::Classify(s) => Op::Classify {
                 selection: s.into(),
             },
@@ -1762,6 +1829,82 @@ mod cli_signature_tests {
         assert!(mutates(&["zeta", "signature", "reject", "--id", "X"]));
         assert!(!mutates(&["zeta", "signature", "list"]));
         assert!(!mutates(&["zeta", "signature", "show", "--id", "X"]));
+    }
+}
+
+#[cfg(test)]
+mod cli_set_tests {
+    use super::*;
+
+    fn op(args: &[&str]) -> Op {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.command.mutates(), "{args:?}");
+        cli.command.into_op().unwrap().expect("an op")
+    }
+
+    #[test]
+    fn zeta_set_start_and_stop_map_to_the_ops() {
+        let start = [
+            "zeta",
+            "set",
+            "start",
+            "--set",
+            "airband",
+            "--radio",
+            "wide=b210",
+            "--radio",
+            "second=",
+        ];
+        assert_eq!(
+            op(&start),
+            Op::SetStart {
+                set: "airband".into(),
+                radios: [
+                    ("wide".to_string(), Some(SourceId("b210".into()))),
+                    ("second".to_string(), None),
+                ]
+                .into_iter()
+                .collect(),
+                members: None,
+                replace: vec![],
+            }
+        );
+        assert_eq!(
+            op(&[
+                "zeta",
+                "set",
+                "start",
+                "--set",
+                "airband",
+                "--radio",
+                "wide=b210,second=hackrf",
+                "--members",
+                "acars,vdl2",
+                "--replace",
+                "J1",
+            ]),
+            Op::SetStart {
+                set: "airband".into(),
+                radios: [
+                    ("wide".to_string(), Some(SourceId("b210".into()))),
+                    ("second".to_string(), Some(SourceId("hackrf".into()))),
+                ]
+                .into_iter()
+                .collect(),
+                members: Some(vec!["acars".into(), "vdl2".into()]),
+                replace: vec![JobId("J1".into())],
+            }
+        );
+        assert_eq!(
+            op(&["zeta", "set", "stop", "--set", "airband"]),
+            Op::SetStop {
+                set: "airband".into()
+            }
+        );
+        for bad in ["wide", "=b210"] {
+            let args = ["zeta", "set", "start", "--set", "airband", "--radio", bad];
+            assert!(Cli::try_parse_from(args).is_err(), "{bad}");
+        }
     }
 }
 

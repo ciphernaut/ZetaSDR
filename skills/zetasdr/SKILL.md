@@ -19,6 +19,7 @@ ZetaSDR is an agentic SDR runtime. You drive it through a small typed operation 
 - For a kind on every channel of a plan use `plan_start`, never one `job_start` per channel.
 - Plan ids come from `channel_plans`: read it before naming a plan. A band with no plan takes one `job_start` per measured station; never invent a plan.
 - To stop every job, or every job of a source, kind or plan, use `jobs_stop`, never one `job_stop` per job.
+- For a named set use `set_start`, never its members by hand; set ids come from `set_list`.
 
 ## Running the node
 
@@ -534,11 +535,40 @@ The themes the page can use, one row each: `id`, `name`, `description`, `color_s
 
 ### set_list
 
-The named sets the node knows (`sets/*.json` built in, then the operator's `--sets-dir`), sorted by id. A set names the jobs of a daily setup by radio role (`radios`: each role with a `note` saying what radio it needs), never by source: each `members` entry is a `job_start` or `plan_start` (`op`) of a `kind` on a role, with a one-line `summary`. A set that does not parse or validate is `broken` with its `reason` (`<field>: <error>`, e.g. `members[0].params.hold_ms: ...`) and never stops the node; an operator set with a built-in's `id` replaces it, and a broken one that meant to is listed as `<id>@<file name>`, the built-in staying in force. A member's kind need not be a ready row here (a set may name a decoder this host lacks). `running` is the set's running instance, `null` when it does not run.
+The named sets the node knows (`sets/*.json` built in, then the operator's `--sets-dir`), sorted by id. A set names the jobs of a daily setup by radio role (`radios`: each role with a `note` saying what radio it needs), never by source: each `members` entry is a `job_start` or `plan_start` (`op`) of a `kind` on a role, with a one-line `summary`. A set that does not parse or validate is `broken` with its `reason` (`<field>: <error>`, e.g. `members[0].params.hold_ms: ...`) and never stops the node; an operator set with a built-in's `id` replaces it, and a broken one that meant to is listed as `<id>@<file name>`, the built-in staying in force. A member's kind need not be a ready row here (a set may name a decoder this host lacks). `running` is the set's running instance, `null` when it does not run: `radios` (the source each role runs on), `since_ns`, and one `members` entry per job it started (`id` the member, `job`, `state`: the job's state, `ended` once it no longer runs). An instance none of whose jobs runs is dropped.
 
 JSON: `{"op":"set_list"}`
 
 CLI: `zeta sets`
+
+Read it before naming a set: set ids, their roles (`radios`, each with a `note` saying what radio it needs) and members come from here. `running` says whether a set runs, on which sources, and each of its jobs' state (`ended` for one stopped or failed since).
+
+### set_start
+
+Start a named set from `set_list`: each member on the source its role is mapped to, as `plan_start` does for one source, under one lease decision per source. In this order: (1) everything is checked first (an unknown `set` or member id is `unknown`; a broken set, a role a chosen member uses left out of `radios` (`radios.<role>: unmapped`), or two roles on one source whose members that source cannot capture at once are `other`; an unknown source is `unknown` on `radios.<role>`; a set that already runs on another mapping is `other`: `set_stop` it first); a member whose kind is a mode row that is not ready, or a kind this node does not know, is `refused` and the rest go on; a `plan_start` member whose `attach` stage is not ready starts without it and a warning says so; (2) the band bounding each source's members is checked against the source's ranges (`out_of_range` on `radios.<role>`); (3) the gates of every source in use are taken in source-id order and held to the end; (4) a member (a `plan_start` member's channel) whose identical rigid job already runs is `existing`; (5) the `replace` jobs, each holding one of the sources in use, are stopped; (6) every source is decided before any is tuned: a `conflict` on any source is the whole answer, naming the role and the source (`radios.<role> (<source>) is held by [...]`), with nothing tuned or started anywhere; then each source is leased (and tuned when needed) for its bounding band; (7) the members start source by source in the set's role order, each inside its capture, a member's own failure being its `refused` entry; (8) the instance is recorded (`set_list.running`), and `attach` follows each started channel. The result: `radios` (each role's `source` and `capture`), `started` (`member`, `channel` for a plan member, `center_hz`, `job`, `attached`, `attach_error`), `existing` (`member`, `channel`, `center_hz`, `job`, `attached`), `refused` (`member`, `channel`, `error`) and `warnings`. Running the same request twice starts only what is missing.
+
+- set: string; an id from `set_list`
+- radios: object; each role of the set (from `set_list`) to an id from `source list`
+- members: array or null; member ids of the set (strings), `null` for every member
+- replace: array; ids from `job list` (strings), `[]` for none
+
+JSON: `{"op":"set_start","set":"airband","radios":{"second":"<id>","wide":"<id>"},"members":null,"replace":[]}`
+
+CLI: `zeta set start --set airband --radio wide=<id>,second=<id> [--members acars,adsb] [--replace ID,ID]`
+
+One call starts a whole set; never start its members by hand. Map every role the chosen members use to a source from `source_list` that can capture the role's band (the role's `note` says what it needs). A `conflict` names the role and the source with the holders, and nothing started anywhere: report it; the operator decides, and `members` narrows the next request to what is free. `replace`: as on `job_start`, never a job the request did not name. Read the four lists: `started`, `existing` (already running, skipped), `refused` (a member this node cannot run, such as a decoder whose program is missing, or a start that failed; the others went on) and `warnings` (repeat them). Run it again to complete a partial set: running members are `existing`.
+
+### set_stop
+
+Stop the jobs of a set's running instance that still run, those on a radio first and then those attached to them, and drop the instance. Jobs the instance did not start are left alone. The result lists `stopped`, `ended` (jobs that no longer ran when asked, such as one stopped by hand) and `failed` (`job`, `error`; the others go on, and the instance is kept). A set that does not run stops nothing.
+
+- set: string; an id from `set_list`
+
+JSON: `{"op":"set_stop","set":"airband"}`
+
+CLI: `zeta set stop --set airband`
+
+Stops only the jobs the set's instance started; jobs started by hand on the same radios keep running. Stopping a set is the operator's decision: use it only when the request names the set, or you started it in this run. Report how many stopped, those that had already `ended`, and any `failed`.
 
 ### modes_show
 

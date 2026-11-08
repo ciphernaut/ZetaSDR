@@ -21,6 +21,7 @@ const RULES: &[&str] = &[
     "For a kind on every channel of a plan use `plan_start`, never one `job_start` per channel.",
     "Plan ids come from `channel_plans`: read it before naming a plan. A band with no plan takes one `job_start` per measured station; never invent a plan.",
     "To stop every job, or every job of a source, kind or plan, use `jobs_stop`, never one `job_stop` per job.",
+    "For a named set use `set_start`, never its members by hand; set ids come from `set_list`.",
 ];
 
 const RUNNING: &str = "Every command takes these global flags:
@@ -125,6 +126,15 @@ fn note(op: &str) -> Option<&'static str> {
         "plan_start" => Some(
             "Starts `kind` on the channels of a plan (`channels`, `null` for all of them) at each channel's `center_hz` with the plan's `bandwidth_hz`, under one lease decision for the band that bounds them: inside the current capture nothing retunes, otherwise the source is tuned when only elastic jobs hold it, and a scan or a rigid holder elsewhere is a `conflict` naming the holders with nothing started. Check `source_list` first. `kind` must run on the radio (not `transcribe`, `spectrum`, `scan`, `watch` or `identify`). `deviation_hz` and `sideband` are passed to every start as on `job_start` (`null` is the kind's default; give 2500 for `fm_demod` on 12.5 kHz channels). `attach` is `null` or `transcribe`, attached to every channel started or already running except the data channels (UHF CB ch22 and ch23, every ACARS and AIS channel: their demodulators start, untranscribed, and a warning names them), and needs a ready stage (a speech backend for `transcribe`), else the op is refused with the stage's reason: start without `attach`. `language` must be `null` without `attach`. `replace`: as on `job_start`. The result lists `started` (channel, `center_hz`, `job`, `attached`, `attach_error`), `existing` (channels an identical running job already holds, skipped), `refused` (channels whose own start failed, with the error; the others went on) and `warnings`: repeat the `warnings` to the operator. Run it again to complete a partial set: running channels are `existing`, so nothing doubles.",
         ),
+        "set_list" => Some(
+            "Read it before naming a set: set ids, their roles (`radios`, each with a `note` saying what radio it needs) and members come from here. `running` says whether a set runs, on which sources, and each of its jobs' state (`ended` for one stopped or failed since).",
+        ),
+        "set_start" => Some(
+            "One call starts a whole set; never start its members by hand. Map every role the chosen members use to a source from `source_list` that can capture the role's band (the role's `note` says what it needs). A `conflict` names the role and the source with the holders, and nothing started anywhere: report it; the operator decides, and `members` narrows the next request to what is free. `replace`: as on `job_start`, never a job the request did not name. Read the four lists: `started`, `existing` (already running, skipped), `refused` (a member this node cannot run, such as a decoder whose program is missing, or a start that failed; the others went on) and `warnings` (repeat them). Run it again to complete a partial set: running members are `existing`.",
+        ),
+        "set_stop" => Some(
+            "Stops only the jobs the set's instance started; jobs started by hand on the same radios keep running. Stopping a set is the operator's decision: use it only when the request names the set, or you started it in this run. Report how many stopped, those that had already `ended`, and any `failed`.",
+        ),
         "job_list" => Some(
             "Stopped and failed jobs are kept as history, newest 20 only (older ones are forgotten with their files); a running job is never dropped. Through `ask` (the agent transport) each record is returned without its `graph`; `graph_get` fetches one.",
         ),
@@ -160,6 +170,8 @@ fn example_for(op: &str, field: &str) -> Option<Value> {
         ("job_attach", "kind") => Some("transcribe".into()),
         ("plan_start", "plan") => Some("uhf_cb_au".into()),
         ("plan_start", "attach") => Some("transcribe".into()),
+        ("set_start" | "set_stop", "set") => Some("airband".into()),
+        ("set_start", "radios") => Some(serde_json::json!({"wide": "<id>", "second": "<id>"})),
         // The job form: the band fields stay `null`.
         ("origin_lookup", "job") => Some("<id>".into()),
         _ => None,
@@ -174,6 +186,9 @@ fn hint(op: &str, field: &str) -> Option<&'static str> {
     match field {
         "source" => Some("an id from `source list`"),
         "plan" => Some("an id from `channel_plans`"),
+        "set" => Some("an id from `set_list`"),
+        "radios" => Some("each role of the set (from `set_list`) to an id from `source list`"),
+        "members" => Some("member ids of the set (strings), `null` for every member"),
         "sources" => Some("ids from `source list` (strings), `null` for every source"),
         "channels" => Some("channel numbers of the plan (integers), `null` for all"),
         "job" => Some("an id from `job list`"),
@@ -473,6 +488,9 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     }
     if op == "set_list" {
         return "zeta sets".into();
+    }
+    if op == "set_start" {
+        return "zeta set start --set airband --radio wide=<id>,second=<id> [--members acars,adsb] [--replace ID,ID]".into();
     }
     if op == "jobs_stop" {
         return "zeta jobs stop [--source ID] [--kind KIND] [--plan ID]".into();
