@@ -2797,3 +2797,65 @@ async fn a_replace_of_a_span_watch_stops_its_decoders() {
     .await;
     stop_all(&node).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_span_watch_with_decode_on_free_starts_its_decoder_on_a_free_source() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let a = file_source("rx", &fixtures().pocsag_fsk);
+    let b = file_source_with("rx2", &fixtures().pocsag_fsk, false);
+    let ports: Vec<(Arc<dyn Port>, Arc<FileSource>)> = vec![(a.clone(), a), (b.clone(), b)];
+    let node = node_over(dir.path(), ports, None).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["decode_on"] = "free".into();
+    params["prefer"] = serde_json::json!(["rx2"]);
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let jobs = n_decoders_without_identify(&node, &watch, 1).await;
+    let job = jobs[0].clone();
+    until("a decoding event", Duration::from_secs(5), || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    let d = &events.watch("decoding")[0];
+    assert_eq!(d["via"], "modes", "{d}");
+    assert_eq!(d["placed"], "free", "{d}");
+    assert_eq!(d["source"], "rx2", "{d}");
+    assert!(
+        d["summary"]
+            .as_str()
+            .unwrap()
+            .ends_with("on rx2 (free, modes)"),
+        "{d}"
+    );
+    assert!(
+        events.watch("identifying").is_empty(),
+        "{:#?}",
+        events.all()
+    );
+    let rec = record(&node, &job).unwrap();
+    assert_eq!(rec.source, SourceId("rx2".into()));
+    assert_eq!(rec.kind, "pocsag_decode");
+    assert_eq!(rec.tuning.bandwidth_hz, Hz(POCSAG_WIDTH_HZ), "{rec:?}");
+    assert!(on_page(rec.tuning.center_hz.0, OFFSET_HZ), "{rec:?}");
+    let ctx = node.job_context(&watch).unwrap();
+    assert_eq!(ctx["watch"]["decoding"][0]["placed"], "free", "{ctx}");
+    assert_eq!(ctx["watch"]["decoding"][0]["via"], "modes", "{ctx}");
+    // Only the watch holds its own radio; the decoder holds the free one.
+    let holders = |s: &str| -> Vec<JobId> {
+        node.lease_holders(&SourceId(s.into()))
+            .into_iter()
+            .map(|(j, _)| j)
+            .collect()
+    };
+    assert_eq!(holders("rx"), std::slice::from_ref(&watch));
+    assert_eq!(holders("rx2"), std::slice::from_ref(&job));
+    node.job_stop(&watch).await.unwrap();
+    until("the decoder stops", Duration::from_secs(10), || {
+        state(&node, &job) == Some(JobState::Stopped)
+    })
+    .await;
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+}

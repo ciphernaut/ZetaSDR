@@ -959,12 +959,14 @@ impl Inner {
         started
     }
 
-    /// Start `mode` directly on the tracked signal `i` (one listed row fits it): on the
-    /// watch's own source (inside its capture, no tune) at the signal's centroid with the
-    /// row's width, with the policy's `sondehub` sink, kept as a decoder `via: modes`
-    /// (event `decoding`). The start runs in its own task, cancellable as identify's
-    /// launches are. A start that fails counts as an unknown try of the signal (event
-    /// `unknown`) and is the `Err`; `Ok(None)`: cancelled.
+    /// Start `mode` directly on the tracked signal `i` (one listed row fits it) at the
+    /// signal's centroid with the row's width and the policy's `sondehub` sink, kept as a
+    /// decoder `via: modes` (event `decoding`). Under `decode_on: free` it goes to a free
+    /// source as a proved decoder would ([`Inner::start_free`]), else (or when none
+    /// takes it) on the watch's own source, inside its capture with no tune. The start
+    /// on the watch's source runs in its own task, cancellable as identify's launches
+    /// are. A start that fails counts as an unknown try of the signal (event `unknown`)
+    /// and is the `Err`; `Ok(None)`: cancelled.
     async fn start_direct(
         self: &Arc<Self>,
         r: &Run,
@@ -973,13 +975,23 @@ impl Inner {
         mode: &str,
     ) -> Result<Option<JobId>, String> {
         let signal = w.signals[i].signal.clone();
-        let width = self
-            .modes()
-            .get(mode)
-            .map_or(signal.bandwidth_hz, |m| m.row.band.bandwidth_hz);
+        let mut why = None;
+        if r.seed.policy.free {
+            match self.start_free(r, mode, &signal).await {
+                Ok((job, source, sink)) => {
+                    let placed = (source, Placed::Free, None);
+                    self.keep_direct(r, w, i, mode, &job, placed, sink);
+                    return Ok(Some(job));
+                }
+                Err(e) => why = Some(e),
+            }
+            if r.cancel.is_cancelled() {
+                return Ok(None);
+            }
+        }
         let tuning = Tuning {
             center_hz: Hz(signal.center_hz),
-            bandwidth_hz: Hz(width),
+            bandwidth_hz: Hz(self.row_width(mode, &signal)),
         };
         let (inner, source, m) = (self.clone(), r.prov.source.clone(), mode.to_string());
         let sondehub = r.seed.policy.sondehub.clone();
@@ -1007,13 +1019,7 @@ impl Inner {
         let (job, sink) = match started {
             Ok(s) => s,
             Err(e) => {
-                let t = now().0;
-                let tracked = &mut w.signals[i];
-                tracked.tries += 1;
-                match tracked.tries > RETRY_MAX {
-                    true => tracked.handled = true,
-                    false => tracked.next_retry_ns = Some(t.saturating_add(retry_ms() * 1_000_000)),
-                }
+                count_try(&mut w.signals[i], now().0);
                 let summary = format!("unknown at {}: {mode} did not start: {e}", signal.mhz());
                 let ev = Event {
                     signal: Some(&signal),
@@ -1024,6 +1030,25 @@ impl Inner {
                 return Err(e);
             }
         };
+        let placed = (r.prov.source.clone(), Placed::Capture, why);
+        self.keep_direct(r, w, i, mode, &job, placed, sink);
+        Ok(Some(job))
+    }
+
+    /// Keep the directly started decoder `job` of the tracked signal `i`, placed on
+    /// `(source, placed, why it fell back to the capture)`: listed in `decoding` `via:
+    /// modes`, its events followed, and the event `decoding` published.
+    #[allow(clippy::too_many_arguments)]
+    fn keep_direct(
+        &self,
+        r: &Run,
+        w: &mut State,
+        i: usize,
+        mode: &str,
+        job: &JobId,
+        (source, placed, why): (SourceId, Placed, Option<String>),
+        sink: SinkOutcome,
+    ) {
         let sink_error = match sink {
             SinkOutcome::Refused(why) | SinkOutcome::Lost(why) => Some(why),
             SinkOutcome::Off | SinkOutcome::On | SinkOutcome::Cancelled => None,
@@ -1032,15 +1057,15 @@ impl Inner {
         let tracked = &mut w.signals[i];
         tracked.handled = true;
         let gone_since_ns = (!tracked.present).then_some(t);
-        let source = r.prov.source.clone();
-        w.subs.insert(job.clone(), self.decoder_subs(&job));
+        let signal = tracked.signal.clone();
+        w.subs.insert(job.clone(), self.decoder_subs(job));
         w.decoding.push(Decoding {
             mode: mode.to_string(),
             job: job.clone(),
             source: source.clone(),
             signal: signal.clone(),
             since_ns: t,
-            placed: Placed::Capture,
+            placed,
             via: Via::Modes,
             sink_error: sink_error.clone(),
             last_event_ns: t,
@@ -1048,57 +1073,48 @@ impl Inner {
             confirm_by_ns: None,
         });
         let mut summary = format!(
-            "decoding {mode} at {} on {} (capture, modes)",
+            "decoding {mode} at {} on {} ({}, modes)",
             signal.mhz(),
-            source.0
+            source.0,
+            placed.as_str()
         );
+        if let Some(why) = why {
+            summary.push_str(&format!(": {why}"));
+        }
         if let Some(why) = sink_error {
             summary.push_str(&format!("; sondehub sink refused: {why}"));
         }
         let e = Event {
             signal: Some(&signal),
-            job: Some(&job),
+            job: Some(job),
             mode: Some(mode),
             source: Some(&source),
-            placed: Some(Placed::Capture),
+            placed: Some(placed),
             via: Some(Via::Modes),
             ..Event::default()
         };
         self.watch_event(r, "decoding", summary, e);
-        Ok(Some(job))
     }
 
-    /// Place a decoder identify proved (`proved`, running `mode` inside the watch's
-    /// capture) by the watch's policy: `capture` keeps it there; `free` starts `mode` on
-    /// the signal's centre and the row's width on a free source other than the watch's
-    /// (`prefer` first, then `source list` order), trying the next on a refusal (a
-    /// `conflict`: not free after all), then stops `proved`; with none it stays in the
-    /// capture. The decoder's job, source, placement and, when it fell back, why, with
-    /// what came of giving it the sink.
-    async fn place_decoder(
+    /// `mode`'s row width, else the signal's own.
+    fn row_width(&self, mode: &str, signal: &Signal) -> u64 {
+        self.modes()
+            .get(mode)
+            .map_or(signal.bandwidth_hz, |m| m.row.band.bandwidth_hz)
+    }
+
+    /// Start `mode` on the signal's centre and the row's width on a free source other
+    /// than the watch's (`prefer` first, then `source list` order), trying the next on a
+    /// refusal (a `conflict`: not free after all). The job, its source and what came of
+    /// the sink; else why none took it (`no free source`, or `no free source took it
+    /// (<source>: <why>; ...)`).
+    async fn start_free(
         self: &Arc<Self>,
         r: &Run,
         mode: &str,
         signal: &Signal,
-        proved: &JobId,
-    ) -> Placement {
-        let kept = |why: Option<String>, sink: SinkOutcome| Placement {
-            job: proved.clone(),
-            source: r.prov.source.clone(),
-            placed: Placed::Capture,
-            why,
-            sink,
-        };
-        if !r.seed.policy.free {
-            let sink = self
-                .sink_into(r, proved, r.seed.policy.sondehub.as_ref())
-                .await;
-            return kept(None, sink);
-        }
-        let width = self
-            .modes()
-            .get(mode)
-            .map_or(signal.bandwidth_hz, |m| m.row.band.bandwidth_hz);
+    ) -> Result<(JobId, SourceId, SinkOutcome), String> {
+        let width = self.row_width(mode, signal);
         let ports: Vec<Arc<dyn Port>> = {
             let mut v: Vec<_> = self.ports.read().unwrap().values().cloned().collect();
             v.sort_by(|a, b| a.id().0.cmp(&b.id().0));
@@ -1128,22 +1144,53 @@ impl Inner {
                 .start_on(&source, mode, tuning, r.seed.policy.sondehub.as_ref())
                 .await
             {
-                Ok((job, sink)) => {
-                    self.stop_started(r, proved, &r.prov.source).await;
-                    return Placement {
-                        job,
-                        source,
-                        placed: Placed::Free,
-                        why: None,
-                        sink,
-                    };
-                }
+                Ok((job, sink)) => return Ok((job, source, sink)),
                 Err(e) => refused.push(format!("{}: {e}", source.0)),
             }
         }
-        let why = match refused.is_empty() {
+        Err(match refused.is_empty() {
             true => "no free source".to_string(),
             false => format!("no free source took it ({})", refused.join("; ")),
+        })
+    }
+
+    /// Place a decoder identify proved (`proved`, running `mode` inside the watch's
+    /// capture) by the watch's policy: `capture` keeps it there; `free` starts `mode` on
+    /// a free source ([`Inner::start_free`]), then stops `proved`; with none it stays in
+    /// the capture. The decoder's job, source, placement and, when it fell back, why, with
+    /// what came of giving it the sink.
+    async fn place_decoder(
+        self: &Arc<Self>,
+        r: &Run,
+        mode: &str,
+        signal: &Signal,
+        proved: &JobId,
+    ) -> Placement {
+        let kept = |why: Option<String>, sink: SinkOutcome| Placement {
+            job: proved.clone(),
+            source: r.prov.source.clone(),
+            placed: Placed::Capture,
+            why,
+            sink,
+        };
+        if !r.seed.policy.free {
+            let sink = self
+                .sink_into(r, proved, r.seed.policy.sondehub.as_ref())
+                .await;
+            return kept(None, sink);
+        }
+        let why = match self.start_free(r, mode, signal).await {
+            Ok((job, source, sink)) => {
+                self.stop_started(r, proved, &r.prov.source).await;
+                return Placement {
+                    job,
+                    source,
+                    placed: Placed::Free,
+                    why: None,
+                    sink,
+                };
+            }
+            Err(why) => why,
         };
         let sink = self
             .sink_into(r, proved, r.seed.policy.sondehub.as_ref())
@@ -1637,16 +1684,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         return true;
     }
     let tracked = &mut w.signals[i];
-    tracked.tries += 1;
-    match tracked.tries > RETRY_MAX {
-        true => {
-            tracked.handled = true;
-            tracked.next_retry_ns = None;
-        }
-        false => {
-            tracked.next_retry_ns = Some(now().0.saturating_add(retry_ms() * 1_000_000));
-        }
-    }
+    count_try(tracked, now().0);
     let label = v["verdict"]["label"].as_str().unwrap_or("unknown");
     let features = v["verdict"]["features"].clone();
     let allocations = v["verdict"]["allocations"].clone();
@@ -1944,11 +1982,7 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
                 // Not startable now (a conflict, a fault): counted as an unknown try.
                 w.current = None;
                 let tracked = &mut w.signals[i];
-                tracked.tries += 1;
-                match tracked.tries > RETRY_MAX {
-                    true => tracked.handled = true,
-                    false => tracked.next_retry_ns = Some(t.saturating_add(retry_ms() * 1_000_000)),
-                }
+                count_try(tracked, t);
                 let signal = tracked.signal.clone();
                 // No identify ran, so no register answer: `allocations` stays null.
                 let summary = format!("unknown at {}: identify did not start: {e}", signal.mhz());
@@ -1963,19 +1997,26 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
     }
 }
 
-/// The tracked signal `i` fits none of the policy's `modes`: `unknown` at once (no
-/// identify run, so no register answer or origins), counted as a try and retried after
-/// [`RETRY_MS`] as an identify's unknown, and captured under `on_unknown: capture`.
-async fn no_fit(inner: &Arc<Inner>, r: &Run, w: &mut State, i: usize, t: u64) {
-    let tracked = &mut w.signals[i];
+/// Count a try of `tracked` that ended without a decoder (an unknown verdict, a start
+/// that failed, no listed row fitting): past [`RETRY_MAX`] it is left alone (`handled`,
+/// no retry) until it goes and comes back, else tried again [`RETRY_MS`] after `now_ns`.
+fn count_try(tracked: &mut Tracked, now_ns: u64) {
     tracked.tries += 1;
     match tracked.tries > RETRY_MAX {
         true => {
             tracked.handled = true;
             tracked.next_retry_ns = None;
         }
-        false => tracked.next_retry_ns = Some(t.saturating_add(retry_ms() * 1_000_000)),
+        false => tracked.next_retry_ns = Some(now_ns.saturating_add(retry_ms() * 1_000_000)),
     }
+}
+
+/// The tracked signal `i` fits none of the policy's `modes`: `unknown` at once (no
+/// identify run, so no register answer or origins), counted as a try and retried after
+/// [`RETRY_MS`] as an identify's unknown, and captured under `on_unknown: capture`.
+async fn no_fit(inner: &Arc<Inner>, r: &Run, w: &mut State, i: usize, t: u64) {
+    let tracked = &mut w.signals[i];
+    count_try(tracked, t);
     let signal = tracked.signal.clone();
     let summary = format!(
         "unknown at {}: no listed mode fits {} kHz",
