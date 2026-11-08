@@ -6,8 +6,8 @@ keeps a live picture of the spectrum and offers "what is there, what is it, deco
 set of typed operations (36 of them). The same operations are reached from the `zeta` CLI, an
 authenticated HTTP and websocket API, a web page the node serves (waterfall, jobs, map,
 transcripts), an MCP server, and an agent that lets a local LLM call them. Every job is a graph of
-stages: channelisers, NBFM/WFM/AM/SSB demodulators, decoders (APRS on 2 m, radiosondes, ADS-B,
-then RDS, ACARS, and POCSAG and FLEX pagers), measurement and classification, a band watch that identifies
+stages: channelisers, NBFM/WFM/AM/SSB demodulators, decoders (APRS on 2 m with positions on the map, AIS, radiosondes, ADS-B,
+then RDS, ACARS, POCSAG and FLEX pagers, and M17 digital voice), measurement and classification, a band watch that identifies
 what appears, burst capture, transcription and a mix of every talking channel. It is for the
 radio amateur who wants the radio to do the fiddly work (hear what is on 2 m and 70 cm, track a
 radiosonde, see the aircraft overhead), and for an agent that needs operations it can call rather

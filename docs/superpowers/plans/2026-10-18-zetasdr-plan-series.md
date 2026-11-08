@@ -485,6 +485,7 @@ session before the plan, as before.
 |---|---|---|---|
 | 28.1 | The source transport, made rate-proof | A worker child hands IQ to the node through a shared-memory ring (worker protocol 2: descriptors on the pipe, `cf32` slots, drops counted), each Soapy source probes its rate ladder at open and reports a `measured` cap the lease applies (`insufficient bandwidth` names it), the B210 sweep before and after. Spec `docs/superpowers/specs/2026-11-06-video-decode-design.md` sections 3, 5.6, 5.7; plan `docs/superpowers/plans/2026-11-06-source-transport.md`. | 20 |
 | 28.2 | Analog video, decoded and watched live | `video_decode` (wide FM, composite sync and line lock, luma `gray8` fields; the 6.5 MHz audio subcarrier if it falls out), the websocket's video body with `smooth`, `sharp` and `thumb` profiles, the thumbnail riding the band and the full view with feeds switchable, `zeta stream save`, fixtures of the operator's four transmitters from the B210. Spec as above (the rest of it); plan to be written once 28.1's sweep fixes the default rung. UAT deferred: the operator sets up each transmitter. | 28.1 |
+| 29 | Decoder wave 2 | AIS in-crate, FLEX over multimon-ng, M17 with c2dec, DFM/M20 synthesis, APRS positions; expect tolerances, handlers on graph rows, outputs, row notes in the guide, the access marker. Spec `docs/superpowers/specs/2026-11-06-decoder-wave2-design.md`, plan `docs/superpowers/plans/2026-11-06-decoder-wave2.md`; built on `worktree-agent-a90e5005948f16feb`, see Plan 29 status. | 16, 17, 23 |
 | 30 | Aircraft data links | `vdl2_decode` and `hfdl_decode` program rows over a field map on a row's `output` (`decoder.output.fields`, `$center_khz`, `subject.merge`), a per-source position (`--source-position`, the Kiwi's `/status`), one merged aircraft table on the page, the fixture lookup for `modes check`. Built on `worktree-agent-a1ff3bab5d4d2658f`, commits 4e34d62..4d16a91 (plus the docs); see Plan 30 status. Spec `docs/superpowers/specs/2026-11-06-aircraft-links-design.md`; plan `docs/superpowers/plans/2026-11-06-aircraft-links.md`. | 16, 23 (subjects); the source position shared with 32 |
 | 32 | Map layer | Origins from the register lit on a Map tab beside the radios; the dock; a Kiwi's position; map tiles from five providers. Built on `worktree-agent-a80225b3e557540e0`, commits 56ffb38..c68cf95f (from the merge of plan 30); see Plan 32 status. Spec `docs/superpowers/specs/2026-11-06-map-layer-design.md`; plan `docs/superpowers/plans/2026-11-06-map-layer.md`. | 30 (the source position), 23 (subjects) |
 
@@ -493,6 +494,28 @@ Queued behind them, specs first, in the operator's order of interest: colour (ch
 host-capabilities baseline (`TODO.md` "Node: a baseline of the host's capabilities"), VTX channel
 tables from the open VTX firmware (`TODO.md` "Plans: VTX channel tables"), `sc16` on the worker
 wire.
+
+## Plan 29 status
+
+Built on `worktree-agent-a90e5005948f16feb`, not yet on `main`. Spec `docs/superpowers/specs/2026-11-06-decoder-wave2-design.md`, plan `docs/superpowers/plans/2026-11-06-decoder-wave2.md`.
+
+What shipped: the shared machinery (`expect` `{near, within}` tolerances, the `access` marker as `enum Access { Restricted }` on `pocsag_decode` and `flex_decode`, `handlers` on graph rows, a row's `outputs` and the page's audio rule, `## Mode rows` in AGENTS.md); APRS positions (uncompressed, compressed, Mic-E) with callsign subjects on the map; AIS (`ais_decode`, the `ais` quick attempt, the row, the `ais_vhf` plan); M20 synthesis proven against `m20mod`; FLEX (`flex_decode` over `multimon-ng`, the parser pinned to its real output); M17 (the codes, the `m17_decode` stage, Codec 2 through `c2dec` as ordinary job audio), not split into 29b.
+
+What the gate proved: every in-crate row `ok`, `--strict flex_decode` against multimon-ng and `--strict m17_decode` with c2dec (CI installs both and runs the strict step), `--strict m20_decode` against `m20mod`, the APRS map e2e scenario `map_tracks_an_aprs_station` (one new scenario; the UI suite ran 607.5 s); the controller runs the full gate.
+
+What waits for the field host: `--strict` on the sonde rows and `UAT.md` "Plan 29".
+
+Rulings (roles only):
+- AIS BT is 0.5. `BitSync` held at 9600 baud on 48 kHz, so no Gardner fallback. The AIS discriminator runs at 2x deviation with a 50 Hz DC blocker.
+- The M17 modulator is RRC alpha 0.5; the M17 discriminator is 2x deviation.
+- `within_ms`: AIS 5000, M20 8000, FLEX 6000, M17 5000.
+- DFM fallback taken: `dfm09mod` decodes the generated positions but never the serial, so `dfm_decode` keeps `test: null` (the operator declined a position-only test); `TODO.md` holds the next step.
+- Scoring effects: AIS is tried on FM signals; `m17_decode` on narrow FM/FSK; `classify` counts only rows with a quick attempt towards its five tries. `flex_decode` has `band.range_hz` 151.8-932 MHz (the spec said null, which tied it with APRS at 144.8 MHz). `ais_decode` keeps modulation `["fsk","fm"]`.
+- Counts follow the base: 13 embedded rows, six quick attempts (the plan predated plans 30 and 19.3).
+- The M17 specification document is GNU FDL 1.3 (not CC BY-SA); only facts and tables were taken, no code.
+- `access` is implemented now in plan 31's shape; whichever plan lands second drops the duplicate.
+
+Leftovers and the access-levels gist are in `TODO.md` ("Decoder wave 2: leftovers from plan 29", "Access: ACLs on restricted rows").
 
 ## Plan 32 status
 
