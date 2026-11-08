@@ -23,13 +23,26 @@
 //! free source), and rows tied for nearest (one channel width) run an identify
 //! restricted to them.
 //!
+//! Every watch keeps at most the `detect` node's `max_decoders` decoders (spec 4.4),
+//! counting those on free sources: over the cap a signal that would take one is
+//! `waiting` (one event per signal), and when a slot frees the present waiting signal
+//! that ranks highest ([`rank`]: a known channel, then score, then SNR) takes it; nothing
+//! is pre-empted. With `confirm_ms`, a direct start that publishes no event within it
+//! while its signal is present is stopped `unproven`. A `lost` decoder's channel, and
+//! that of a decoder the operator stopped, is cooled for `cooldown_ms`
+//! (`job_context.watch.cooled`): a signal on it is tracked but neither started nor
+//! identified until the cooldown passes. A re-adopted decoder is confirmed within the
+//! longer of `gone_ms` and `hold_ms`.
+//!
 //! Events, `protocol: "watch"`, go on the job's event stream beside `detect`'s `signal`
-//! events: `state` `identifying | decoding | unknown | lost | capturing | captured`, with
-//! `signal`, `job`, `mode`, `source`, `placed` (`capture | free`), `features` and
-//! `allocations` and `origins` (for `unknown`), `captures` (for `captured`), `via` (for
-//! `decoding`: `identify | modes`), `why` (for `lost`), `summary` and `t_ns` (fields that
-//! do not apply are `null`).
+//! events: `state` `identifying | decoding | waiting | unknown | lost | capturing |
+//! captured`, with `signal`, `job`, `mode`, `source`, `placed` (`capture | free`),
+//! `features` and `allocations` and `origins` (for `unknown`), `captures` (for
+//! `captured`), `via` (for `decoding`: `identify | modes`), `why` (for `lost`: `gone and
+//! silent | not seen again | unproven | relaunch failed`), `summary` and `t_ns` (fields
+//! that do not apply are `null`).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -244,10 +257,8 @@ pub(super) struct Policy {
     /// How long a kept decoder whose signal is `gone` may stay silent before it is `lost`.
     hold_ms: u64,
     /// After a `lost` or `unproven`, how long its channel starts no new decoder.
-    #[allow(dead_code)] // read by the cooldown
     cooldown_ms: u64,
     /// With `modes`, how long a directly started decoder has to publish an event (0: off).
-    #[allow(dead_code)] // read by the direct start
     confirm_ms: u64,
     /// With `modes`, start a decoder on every known channel in the band at once.
     #[allow(dead_code)] // read by the known-channel seeding
@@ -491,7 +502,41 @@ struct Decoding {
     /// this passes.
     #[serde(skip)]
     confirm_by_ns: Option<u64>,
+    /// A direct start under `confirm_ms` that has published no event yet: stopped
+    /// `unproven` when this passes while its signal is present.
+    #[serde(skip)]
+    unproven_by_ns: Option<u64>,
 }
+
+/// A channel no new decoder starts on until `until_ns` (`job_context.watch.cooled`):
+/// the centre and width of a decoder that was `lost` (`why` its loss's) or stopped by
+/// the operator (`why` [`WHY_STOPPED`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Cooled {
+    center_hz: u64,
+    bandwidth_hz: u64,
+    until_ns: u64,
+    why: String,
+}
+
+/// A known channel (spec 4.3): a centre the watch expected before the detector saw
+/// anything. A signal on one ranks first for a free slot.
+#[derive(Clone, Debug)]
+struct Known {
+    center_hz: u64,
+    bandwidth_hz: u64,
+}
+
+/// The `why` of a `lost` decoder whose signal went and that stayed silent for the hold.
+const WHY_SILENT: &str = "gone and silent";
+/// The `why` of a `lost` re-adopted decoder whose signal was not seen again in time.
+const WHY_NOT_SEEN: &str = "not seen again";
+/// The `why` of a `lost` direct start that published nothing within `confirm_ms`.
+const WHY_UNPROVEN: &str = "unproven";
+/// The `why` of a `lost` proved decoder that could not be relaunched with its sink.
+const WHY_RELAUNCH: &str = "relaunch failed";
+/// The `why` of a cooled channel whose decoder the operator stopped (not a `lost`).
+const WHY_STOPPED: &str = "stopped";
 
 /// What a running watch needs; made at launch from the record ([`Seed`]) and the
 /// streams the launch registered.
@@ -514,6 +559,8 @@ pub(super) struct Seed {
     adopt: Vec<Decoding>,
     /// The identify a run before a node restart was waiting on.
     stale: Option<JobId>,
+    /// The channels a run before this one cooled (persisted `watch.cooled`).
+    cooled: Vec<Cooled>,
 }
 
 impl Seed {
@@ -523,6 +570,7 @@ impl Seed {
             policy: Policy::of(&rec.graph),
             adopt: serde_json::from_value(w["decoding"].clone()).unwrap_or_default(),
             stale: w["current"].as_str().map(|s| JobId(s.into())),
+            cooled: serde_json::from_value(w["cooled"].clone()).unwrap_or_default(),
         }
     }
 }
@@ -558,6 +606,10 @@ struct State {
     decoding: Vec<Decoding>,
     /// The policy's `max_decoders`, reported as `cap.max`.
     max_decoders: u32,
+    /// The channels no new decoder starts on yet.
+    cooled: Vec<Cooled>,
+    /// The known channels in the band (none yet: spec 4.3 fills them).
+    known: Vec<Known>,
     /// The identify run in progress and the centre of the signal it is on.
     current: Option<(JobId, u64)>,
     /// The decoders' event streams, by job.
@@ -651,13 +703,48 @@ impl State {
             "signals": self.signals,
             "decoding": self.decoding,
             "current": self.current.as_ref().map(|(j, _)| j.0.clone()),
+            "cooled": self.cooled,
             "cap": {
                 "max": self.max_decoders,
                 "decoding": self.decoding.len(),
-                "waiting": 0,
+                "waiting": self.signals.iter().filter(|s| s.waiting).count(),
             },
         }})
     }
+
+    /// Whether every decoder slot is taken.
+    fn full(&self) -> bool {
+        self.decoding.len() >= self.max_decoders as usize
+    }
+
+    /// Drop the cooled channels whose cooldown has passed by `now`; whether any went.
+    fn prune_cooled(&mut self, now: u64) -> bool {
+        let before = self.cooled.len();
+        self.cooled.retain(|c| c.until_ns > now);
+        self.cooled.len() != before
+    }
+}
+
+/// Whether `center_hz` ± `bandwidth_hz`/2 overlaps a channel `w` has cooled until after
+/// `now`.
+fn cooled_overlaps(w: &State, center_hz: u64, bandwidth_hz: u64, now: u64) -> bool {
+    w.cooled.iter().any(|c| {
+        c.until_ns > now && 2 * c.center_hz.abs_diff(center_hz) < c.bandwidth_hz + bandwidth_hz
+    })
+}
+
+/// How `a` ranks against `b` for a free decoder slot (greater first): a signal on a
+/// `known` channel first, then the queue's `score`, then SNR.
+fn rank(a: &Tracked, b: &Tracked, known: &[Known]) -> Ordering {
+    let on_known = |t: &Tracked| {
+        known
+            .iter()
+            .any(|k| t.signal.overlaps(k.center_hz, k.bandwidth_hz))
+    };
+    on_known(a)
+        .cmp(&on_known(b))
+        .then(a.score.total_cmp(&b.score))
+        .then(a.signal.snr_db.total_cmp(&b.signal.snr_db))
 }
 
 /// One `watch` event's fields beyond `state` and `summary`.
@@ -677,8 +764,8 @@ struct Event<'a> {
     captures: Option<&'a [String]>,
     /// How a `decoding` decoder was started.
     via: Option<Via>,
-    /// Why a `lost` decoder was stopped (`gone and silent`, `not seen again`, or why it
-    /// could not be relaunched).
+    /// Why a `lost` decoder was stopped: `gone and silent`, `not seen again`,
+    /// `unproven` or `relaunch failed`.
     why: Option<String>,
 }
 
@@ -1091,7 +1178,10 @@ impl Inner {
         let t = now().0;
         let tracked = &mut w.signals[i];
         tracked.handled = true;
+        tracked.waiting = false;
         let gone_since_ns = (!tracked.present).then_some(t);
+        let confirm_ns = r.seed.policy.confirm_ms.saturating_mul(1_000_000);
+        let unproven_by_ns = (confirm_ns > 0).then(|| t.saturating_add(confirm_ns));
         let signal = tracked.signal.clone();
         w.subs.insert(job.clone(), self.decoder_subs(job));
         w.decoding.push(Decoding {
@@ -1106,6 +1196,7 @@ impl Inner {
             last_event_ns: t,
             gone_since_ns,
             confirm_by_ns: None,
+            unproven_by_ns,
         });
         let mut summary = format!(
             "decoding {mode} at {} on {} ({}, modes)",
@@ -1402,6 +1493,8 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
         signals: Vec::new(),
         decoding: Vec::new(),
         max_decoders: r.seed.policy.max_decoders,
+        cooled: std::mem::take(&mut r.seed.cooled),
+        known: Vec::new(),
         current: None,
         subs: HashMap::new(),
         pending: None,
@@ -1446,6 +1539,7 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
     release(&inner, &r.prov.source, current, pending, decoders, captures).await;
     if teardown {
         w.signals.clear();
+        w.cooled.clear();
     }
     inner.watch_save(&r, &w);
     result
@@ -1463,7 +1557,13 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
             Some(false) => {}
         }
     }
-    let gone_ns = r.seed.policy.gone_ms.saturating_mul(1_000_000);
+    // A resumed channel in a quiet spell is held as a kept one is (spec 9.5).
+    let confirm_ns = r
+        .seed
+        .policy
+        .gone_ms
+        .max(r.seed.policy.hold_ms)
+        .saturating_mul(1_000_000);
     for mut d in std::mem::take(&mut r.seed.adopt) {
         match inner.wait_running(r, &d.job).await {
             None => return cancelled(),
@@ -1472,7 +1572,7 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
         }
         let t = now().0;
         d.last_event_ns = t;
-        d.confirm_by_ns = Some(t.saturating_add(gone_ns));
+        d.confirm_by_ns = Some(t.saturating_add(confirm_ns));
         w.subs.insert(d.job.clone(), inner.decoder_subs(&d.job));
         w.decoding.push(d);
     }
@@ -1488,7 +1588,8 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
         if let Some(f) = r.port.fault() {
             return Err(StageError::Failed(source_fault_reason(r.port.id(), &f)));
         }
-        let mut changed = signals(inner, r, w);
+        let mut changed = w.prune_cooled(now().0);
+        changed |= signals(inner, r, w);
         changed |= verdict(inner, r, w).await;
         if r.cancel.is_cancelled() {
             return cancelled();
@@ -1666,7 +1767,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
                     mode: Some(&mode),
                     source: Some(&source),
                     placed: Some(placed),
-                    why: Some(why),
+                    why: Some(WHY_RELAUNCH.into()),
                     ..Event::default()
                 };
                 inner.watch_event(r, "lost", summary, e);
@@ -1692,6 +1793,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             last_event_ns: t,
             gone_since_ns,
             confirm_by_ns: None,
+            unproven_by_ns: None,
         });
         w.pending = None;
         let mut summary = format!(
@@ -1850,9 +1952,12 @@ pub(super) fn register_says(allocations: &serde_json::Value) -> String {
     out
 }
 
-/// Note the decoders' events; drop those whose job no longer runs; stop (`lost`) those
-/// whose signal has gone and that stayed silent for the policy's `hold_ms`, and re-adopted ones
-/// whose signal did not reappear in time. Whether the state changed.
+/// Note the decoders' events; drop those whose job no longer runs (the operator stopped
+/// it: its channel is cooled [`WHY_STOPPED`]); stop (`lost`) those whose signal has gone
+/// and that stayed silent for the policy's `hold_ms`, re-adopted ones whose signal did
+/// not reappear in time, and direct starts that published nothing within `confirm_ms`
+/// while their signal was present (`unproven`), cooling each one's channel for the
+/// policy's `cooldown_ms`. Each frees a slot for [`next`]. Whether the state changed.
 async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     let t = now().0;
     for d in &mut w.decoding {
@@ -1872,6 +1977,7 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
                             && counts(v)
                         {
                             d.last_event_ns = t;
+                            d.unproven_by_ns = None;
                         }
                     }
                     Err(TryRecvError::Lagged(_)) => {}
@@ -1881,6 +1987,7 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         }
     }
     let silence_ns = r.seed.policy.hold_ms.saturating_mul(1_000_000);
+    let until_ns = t.saturating_add(r.seed.policy.cooldown_ms.saturating_mul(1_000_000));
     let mut changed = false;
     let mut kept = Vec::with_capacity(w.decoding.len());
     for d in std::mem::take(&mut w.decoding) {
@@ -1891,26 +1998,30 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             continue;
         }
         if !inner.runs(&d.job) {
+            // Stopped by the operator (or ended on its own): its slot is free, and its
+            // channel rests for the cooldown before the watch starts it again.
             w.subs.remove(&d.job);
+            free_channel(inner, w, &d, until_ns, WHY_STOPPED);
             changed = true;
             continue;
         }
         let unconfirmed = d.confirm_by_ns.is_some_and(|by| t >= by);
+        let unproven = d.gone_since_ns.is_none() && d.unproven_by_ns.is_some_and(|by| t >= by);
         let silent = d
             .gone_since_ns
             .is_some_and(|_| t.saturating_sub(d.last_event_ns.max(d.since_ns)) >= silence_ns);
-        if !(unconfirmed || silent) {
-            kept.push(d);
-            continue;
-        }
+        let why = match (unconfirmed, unproven, silent) {
+            (true, _, _) => WHY_NOT_SEEN,
+            (false, true, _) => WHY_UNPROVEN,
+            (false, false, true) => WHY_SILENT,
+            (false, false, false) => {
+                kept.push(d);
+                continue;
+            }
+        };
         inner.stop_started(r, &d.job, &d.source).await;
         w.subs.remove(&d.job);
-        w.signals
-            .retain(|x| !x.signal.overlaps(d.signal.center_hz, d.signal.bandwidth_hz));
-        let why = match unconfirmed {
-            true => "not seen again",
-            false => "gone and silent",
-        };
+        free_channel(inner, w, &d, until_ns, why);
         let summary = format!("lost {} at {}: {why}", d.mode, d.signal.mhz());
         let e = Event {
             signal: Some(&d.signal),
@@ -1926,6 +2037,28 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     }
     w.decoding = kept;
     changed
+}
+
+/// The decoder `d` no longer runs: cool its channel (its centre, its row's width) until
+/// `until_ns` for `why`, forget the tracked signals on it that have gone, and put those
+/// still present back in the queue (started afresh once the cooldown passes).
+fn free_channel(inner: &Inner, w: &mut State, d: &Decoding, until_ns: u64, why: &str) {
+    w.cooled.push(Cooled {
+        center_hz: d.signal.center_hz,
+        bandwidth_hz: inner.row_width(&d.mode, &d.signal),
+        until_ns,
+        why: why.to_string(),
+    });
+    let (center_hz, bandwidth_hz) = (d.signal.center_hz, d.signal.bandwidth_hz);
+    w.signals
+        .retain(|x| x.present || !x.signal.overlaps(center_hz, bandwidth_hz));
+    for x in &mut w.signals {
+        if x.signal.overlaps(center_hz, bandwidth_hz) {
+            x.handled = false;
+            x.next_retry_ns = None;
+            x.waiting = false;
+        }
+    }
 }
 
 /// With no identify in progress, stop any running job this watch owns that it does not
@@ -1955,26 +2088,35 @@ enum Next {
     Cancelled,
 }
 
-/// Act on the best-scoring queued signal that is due, unless another job's band now
-/// overlaps it (it is then dropped). With `modes: null`, start an identify run on it
-/// (event `identifying`). With `modes`, by the listed rows its width fits
-/// ([`SPAN_WIDTH_FIT`]): none, it is `unknown` at once (a try, retried and captured as an
-/// identify's unknown); else the fitting row whose width lies nearest the signal's starts
-/// directly ([`Inner::start_direct`]), and rows tied for nearest (one channel width) run
-/// an identify restricted to them.
+/// Act on the queued signal that is due and ranks highest ([`rank`]), unless another
+/// job's band now overlaps it (it is then dropped). A signal on a cooled channel is not
+/// due until its cooldown passes. With `modes: null`, start an identify run on it (event
+/// `identifying`). With `modes`, by the listed rows its width fits ([`SPAN_WIDTH_FIT`]):
+/// none, it is `unknown` at once (a try, retried and captured as an identify's unknown);
+/// else the fitting row whose width lies nearest the signal's starts directly
+/// ([`Inner::start_direct`]), and rows tied for nearest (one channel width) run an
+/// identify restricted to them. A signal that would take a decoder while all
+/// `max_decoders` slots are kept waits instead ([`wait`]) and takes a slot when one
+/// frees and it ranks highest; nothing is pre-empted.
 async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
     let t = now().0;
+    let mut marked = false;
     loop {
+        let full = w.full();
         let due = w
             .signals
             .iter()
             .enumerate()
-            .filter(|(_, x)| x.present && !x.handled)
+            .filter(|(_, x)| x.present && !x.handled && !(full && x.waiting))
             .filter(|(_, x)| x.next_retry_ns.is_none_or(|n| t >= n))
-            .max_by(|a, b| a.1.score.total_cmp(&b.1.score).then(b.0.cmp(&a.0)))
+            .filter(|(_, x)| !cooled_overlaps(w, x.signal.center_hz, x.signal.bandwidth_hz, t))
+            .max_by(|a, b| rank(a.1, b.1, &w.known).then(b.0.cmp(&a.0)))
             .map(|(i, _)| i);
         let Some(i) = due else {
-            return Next::Idle;
+            return match marked {
+                true => Next::Started,
+                false => Next::Idle,
+            };
         };
         if inner.held_elsewhere(r, w, &w.signals[i].signal) {
             w.signals.remove(i);
@@ -1986,20 +2128,28 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
             let fits = inner.fitting_rows(r, signal);
             let nearest = nearest_fits(&fits, signal.bandwidth_hz);
             w.signals[i].fits = fits.into_iter().map(|(id, _)| id).collect();
-            match nearest.as_slice() {
-                [] => {
-                    no_fit(inner, r, w, i, t).await;
-                    return Next::Started;
-                }
-                [mode] => {
-                    return match inner.start_direct(r, w, i, mode).await {
-                        Ok(None) => Next::Cancelled,
-                        Ok(Some(_)) | Err(_) => Next::Started,
-                    };
-                }
-                _ => candidates = Some(nearest),
+            if nearest.is_empty() {
+                no_fit(inner, r, w, i, t).await;
+                return Next::Started;
             }
+            if full {
+                wait(inner, r, w, i);
+                marked = true;
+                continue;
+            }
+            if let [mode] = nearest.as_slice() {
+                return match inner.start_direct(r, w, i, mode).await {
+                    Ok(None) => Next::Cancelled,
+                    Ok(Some(_)) | Err(_) => Next::Started,
+                };
+            }
+            candidates = Some(nearest);
+        } else if full {
+            wait(inner, r, w, i);
+            marked = true;
+            continue;
         }
+        w.signals[i].waiting = false;
         let tracked = w.signals[i].clone();
         match inner
             .start_identify(r, w, &tracked, candidates.as_deref())
@@ -2033,6 +2183,28 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
             }
         }
     }
+}
+
+/// Every slot is kept: the tracked signal `i` waits for one (event `waiting` the first
+/// time, summary `waiting at <MHz>: <n> of <cap> decoding`).
+fn wait(inner: &Inner, r: &Run, w: &mut State, i: usize) {
+    let tracked = &mut w.signals[i];
+    if tracked.waiting {
+        return;
+    }
+    tracked.waiting = true;
+    let signal = tracked.signal.clone();
+    let summary = format!(
+        "waiting at {}: {} of {} decoding",
+        signal.mhz(),
+        w.decoding.len(),
+        w.max_decoders
+    );
+    let e = Event {
+        signal: Some(&signal),
+        ..Event::default()
+    };
+    inner.watch_event(r, "waiting", summary, e);
 }
 
 /// Count a try of `tracked` that ended without a decoder (an unknown verdict, a start
@@ -2120,6 +2292,52 @@ mod tests {
             ["pocsag_decode", "aprs_decode"]
         );
         assert!(nearest_fits(&[], 22_000).is_empty());
+    }
+
+    #[test]
+    fn a_slot_goes_to_a_known_channel_then_score_then_snr() {
+        let (mut a, mut b) = (tracked(148_600_000, 12_500), tracked(148_700_000, 12_500));
+        a.score = 2.0;
+        b.signal.snr_db = 40.0;
+        assert_eq!(rank(&a, &b, &[]), Ordering::Greater, "score before SNR");
+        b.score = 2.0;
+        assert_eq!(rank(&a, &b, &[]), Ordering::Less, "then SNR");
+        let known = [Known {
+            center_hz: 148_600_000,
+            bandwidth_hz: 12_500,
+        }];
+        assert_eq!(rank(&a, &b, &known), Ordering::Greater, "known first");
+    }
+
+    #[test]
+    fn a_cooled_channel_blocks_only_overlapping_signals_until_it_passes() {
+        let mut w = State {
+            signals: Vec::new(),
+            decoding: Vec::new(),
+            max_decoders: 1,
+            cooled: vec![Cooled {
+                center_hz: 148_600_000,
+                bandwidth_hz: 12_500,
+                until_ns: 100,
+                why: WHY_UNPROVEN.into(),
+            }],
+            known: Vec::new(),
+            current: None,
+            subs: HashMap::new(),
+            pending: None,
+            capturing: Vec::new(),
+            captured: Vec::new(),
+            guard: None,
+        };
+        assert!(cooled_overlaps(&w, 148_605_000, 13_000, 99));
+        assert!(
+            !cooled_overlaps(&w, 148_625_000, 13_000, 99),
+            "a channel away"
+        );
+        assert!(!cooled_overlaps(&w, 148_605_000, 13_000, 100), "passed");
+        assert!(!w.prune_cooled(99));
+        assert!(w.prune_cooled(100));
+        assert!(w.cooled.is_empty());
     }
 
     #[test]
