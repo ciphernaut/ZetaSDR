@@ -497,7 +497,7 @@ def scenario_pocsag_ribbon_appears(page, url, secret):
         page.evaluate("window.zetaTest.poll()")
         ribbon = page.locator("#waterfall .ov-ribbon.pocsag", has_text="1234567")
         expect(ribbon.first).to_be_visible(timeout=15_000)
-        expect(ribbon.first).to_contain_text("1234567: HELLO ZETA")
+        expect(ribbon.first).to_have_text("pocsag 1 addresses, last 1234567")
         page.wait_for_function(
             """(id) => {
               const e = document.querySelector(`#jobs .job[data-id="${id}"] .events`);

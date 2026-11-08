@@ -467,7 +467,7 @@ async fn modes_list_and_show_carry_the_subject() {
         |id: &str| serde_json::to_value(modes.iter().find(|m| m.id.0 == id).unwrap()).unwrap();
     assert_eq!(info("adsb_decode")["subject"]["key"], "icao");
     assert_eq!(info("adsb_decode")["subject"]["waterfall"], "summary");
-    assert_eq!(info("pocsag_decode")["subject"], serde_json::Value::Null);
+    assert_eq!(info("pocsag_decode")["subject"]["key"], "address");
     let Ok(OpResult::Mode { mode }) = node
         .apply(Op::ModesShow {
             id: "adsb_decode".into(),
@@ -571,7 +571,7 @@ fn the_rows_name_the_planned_subjects() {
     );
     use SubjectWaterfall::{Fold, Summary};
     let sondes: &[&str] = &["alt", "vel_v"];
-    let plan: [Plan; 11] = [
+    let plan: [Plan; 12] = [
         (
             "adsb_decode",
             "icao",
@@ -606,6 +606,15 @@ fn the_rows_name_the_planned_subjects() {
             Fold,
             sondes,
             Some("heading"),
+            None,
+        ),
+        (
+            "pocsag_decode",
+            "address",
+            "addresses",
+            Summary,
+            &["kind", "text"],
+            None,
             None,
         ),
         (
@@ -683,12 +692,6 @@ fn the_rows_name_the_planned_subjects() {
         assert_eq!(sub.heading.as_deref(), heading, "{id}");
         assert_eq!(sub.label.as_deref(), label, "{id}");
     }
-    let pocsag = reg
-        .all()
-        .iter()
-        .find(|m| m.row.id.0 == "pocsag_decode")
-        .unwrap();
-    assert_eq!(pocsag.row.subject, None);
 }
 
 /// The aircraft data-link rows as plan 30 pins them: dumpvdl2 at 105 kHz beside ACARS,

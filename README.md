@@ -144,7 +144,8 @@ endpoint (`--llm-url`, `--llm-model`), and `zeta-mcp` offers every operation as 
 The node has decoders for public protocols: APRS, AIS, radiosondes, ADS-B, ACARS, HFDL, VDL2, RDS, POCSAG and FLEX pagers, and M17 digital voice.
 Having a decoder is not permission to use it. Whether you may receive and decode a given
 transmission where you are, pager traffic in particular, depends on your local law and is your
-responsibility; nothing here is legal advice. For an unknown third-party signal the agent's
+responsibility; nothing here is legal advice. Pager rows (`pocsag_decode`, `flex_decode`) are marked
+`access: restricted` so a later access control can gate their events; nothing gates on it yet. For an unknown third-party signal the agent's
 playbook stops at measuring and classifying it, capturing a few bursts and reporting who the
 licence register says transmits there; it does not set out to recover the content. The node sends
 nothing to outside services you have not configured (the page's map fetches OpenStreetMap tiles
