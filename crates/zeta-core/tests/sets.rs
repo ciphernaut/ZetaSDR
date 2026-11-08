@@ -251,6 +251,74 @@ fn a_watch_members_params_are_checked_at_load() {
     );
 }
 
+/// A watch member may name a row this node lacks or cannot run: refused when the set
+/// starts, never at load.
+#[test]
+fn a_watch_member_naming_an_unknown_or_unavailable_row_is_ready_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let sets_dir = dir.path().join("sets");
+    write_set(
+        &sets_dir,
+        "unknown.json",
+        &one_member(
+            "unknown",
+            &watch_member(1_000_000, r#"{"modes": ["no_such_row"]}"#),
+        ),
+    );
+    write_set(
+        &sets_dir,
+        "lacking.json",
+        &one_member(
+            "lacking",
+            &watch_member(1_000_000, r#"{"modes": ["vdl2_decode"]}"#),
+        ),
+    );
+    let stages = registry();
+    let mut modes = ModeRegistry::load(&stages, None);
+    modes.set_program("vdl2_decode", None, Some("dumpvdl2 not found".into()));
+    assert_eq!(
+        modes.get("vdl2_decode").unwrap().state,
+        zeta_core::modes::ModeState::Unavailable
+    );
+    let sets = SetRegistry::load(&modes, &stages, Some(&sets_dir));
+    for id in ["unknown", "lacking"] {
+        let s = sets.get(id).unwrap();
+        assert_eq!(s.state, SetState::Ready, "{id}: {s:?}");
+    }
+}
+
+/// A watch member's `prefer` would name sources: a set file never does.
+#[test]
+fn a_watch_member_with_prefer_is_broken_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let sets_dir = dir.path().join("sets");
+    write_set(
+        &sets_dir,
+        "preferring.json",
+        &one_member(
+            "preferring",
+            &watch_member(
+                1_000_000,
+                r#"{"modes": ["pocsag_decode"], "prefer": ["b210"]}"#,
+            ),
+        ),
+    );
+    write_set(
+        &sets_dir,
+        "empty_prefer.json",
+        &one_member(
+            "empty_prefer",
+            &watch_member(1_000_000, r#"{"modes": ["pocsag_decode"], "prefer": []}"#),
+        ),
+    );
+    let sets = load(Some(&sets_dir));
+    assert_eq!(
+        broken(&sets, "preferring"),
+        "members[0].params.prefer: a set file names no source; the request does"
+    );
+    assert_eq!(sets.get("empty_prefer").unwrap().state, SetState::Ready);
+}
+
 #[test]
 fn a_watch_member_narrower_than_its_row_is_broken_at_load() {
     let dir = tempfile::tempdir().unwrap();

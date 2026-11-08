@@ -366,12 +366,38 @@ pub(crate) fn check_modes_list(
             let reason = m.reason.as_deref().unwrap_or("no reason given");
             return Err(format!("modes[{i}]: {id} is {state} ({reason})"));
         }
-        let width = m.row.band.bandwidth_hz;
-        if width > band_hz {
-            return Err(format!(
-                "modes[{i}]: {id} is {width} Hz wide; the watch's band is {band_hz} Hz"
-            ));
+        check_mode_width(i, m, band_hz)?;
+    }
+    Ok(())
+}
+
+/// [`check_modes_list`] as a set file is checked at load: the list not empty, and each
+/// row the registry holds (whatever its state) no wider than the band. An unknown,
+/// broken or unavailable row passes: a set may name a row this host lacks, refused when
+/// the set starts.
+pub(crate) fn check_modes_list_at_load(
+    modes: &ModeRegistry,
+    list: &[String],
+    band_hz: u64,
+) -> Result<(), String> {
+    if list.is_empty() {
+        return Err(WATCH_MODES_EMPTY.into());
+    }
+    for (i, id) in list.iter().enumerate() {
+        if let Some(m) = modes.get(id) {
+            check_mode_width(i, m, band_hz)?;
         }
+    }
+    Ok(())
+}
+
+/// Entry `i` of a watch's `modes`, the row `m`, no wider than the band `band_hz`.
+fn check_mode_width(i: usize, m: &crate::modes::LoadedMode, band_hz: u64) -> Result<(), String> {
+    let (id, width) = (&m.row.id.0, m.row.band.bandwidth_hz);
+    if width > band_hz {
+        return Err(format!(
+            "modes[{i}]: {id} is {width} Hz wide; the watch's band is {band_hz} Hz"
+        ));
     }
     Ok(())
 }

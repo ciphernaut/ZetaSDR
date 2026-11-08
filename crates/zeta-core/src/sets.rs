@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::modes::{ModeRegistry, is_mode_id};
-use crate::ops::{JobKind, OpError, Sideband};
+use crate::ops::{JobKind, Sideband};
 use crate::stage::StageRegistry;
 use crate::types::Hz;
 
@@ -390,15 +390,15 @@ fn validate_member(
             params,
             ..
         } => {
-            if !kind.startable()
-                || matches!(kind, JobKind::Spectrum | JobKind::Scan | JobKind::Identify)
-            {
+            crate::ops::check_startable(kind).map_err(|e| SetError::new("kind", e.to_string()))?;
+            // A capture-following, stepping or trial-running kind is no set's member.
+            if matches!(kind, JobKind::Spectrum | JobKind::Scan | JobKind::Identify) {
                 return Err(SetError::new(
                     "kind",
                     format!("{} cannot be a set member", kind.name()),
                 ));
             }
-            start_params(kind, *deviation_hz, *sideband)?;
+            crate::ops::check_start_fields(kind, *deviation_hz, *sideband).map_err(field)?;
             if bandwidth_hz.0 == 0 {
                 return Err(SetError::new("bandwidth_hz", "at least 1 Hz"));
             }
@@ -418,82 +418,27 @@ fn validate_member(
             attach,
             language,
             ..
-        } => {
-            let Some(p) = crate::plans::plan(plan) else {
-                let known: Vec<&str> = crate::plans::PLANS.iter().map(|p| p.id).collect();
-                return Err(SetError::new(
-                    "plan",
-                    format!("unknown plan {plan}; known: {}", known.join(", ")),
-                ));
-            };
-            let known: Vec<u32> = crate::plans::channels(p).iter().map(|&(n, _)| n).collect();
-            for (j, n) in channels.iter().flatten().enumerate() {
-                if !known.contains(n) {
-                    return Err(SetError::new(
-                        format!("channels[{j}]"),
-                        format!("{plan} has no channel {n}"),
-                    ));
-                }
-                if channels.iter().flatten().take(j).any(|o| o == n) {
-                    return Err(SetError::new(
-                        format!("channels[{j}]"),
-                        format!("{n} is listed twice"),
-                    ));
-                }
-            }
-            if !kind.startable()
-                || matches!(
-                    kind,
-                    JobKind::Spectrum | JobKind::Scan | JobKind::Watch | JobKind::Identify
-                )
-            {
-                return Err(SetError::new(
-                    "kind",
-                    format!("{} cannot be started per channel", kind.name()),
-                ));
-            }
-            start_params(kind, *deviation_hz, *sideband)?;
-            if let Some(a) = attach
-                && !a.attachable()
-            {
-                return Err(SetError::new(
-                    "attach",
-                    format!("{} is not attachable", a.name()),
-                ));
-            }
-            match language {
-                Some(_) if attach.is_none() => Err(SetError::new("language", "needs attach")),
-                Some(l) if !crate::ops::is_bcp47(l) => Err(SetError::new(
-                    "language",
-                    format!("{l:?} is not a BCP-47 code such as en, de or pt-BR; pass null for en"),
-                )),
-                _ => Ok(()),
-            }
-        }
+        } => crate::ops::check_plan_start_fields(
+            plan,
+            channels.as_deref(),
+            kind,
+            (*deviation_hz, *sideband),
+            (attach.as_ref(), language.as_deref()),
+        )
+        .map(|_| ())
+        .map_err(field),
     }
 }
 
-/// `job_start`'s `deviation_hz` and `sideband` checks, naming the field.
-fn start_params(
-    kind: &JobKind,
-    deviation_hz: Option<u64>,
-    sideband: Option<Sideband>,
-) -> Result<(), SetError> {
-    crate::ops::check_start_params(kind, deviation_hz, sideband)
-        .map(|_| ())
-        .map_err(|e| {
-            let field = match &e {
-                OpError::OutOfRange { field, .. } => field.clone(),
-                OpError::Other { message } if message.starts_with("sideband") => "sideband".into(),
-                _ => "deviation_hz".into(),
-            };
-            SetError::new(field, e.to_string())
-        })
+/// An op's field error as the member's: `<field>: <error>`.
+fn field(e: crate::ops::FieldError) -> SetError {
+    SetError::new(e.field, e.error.to_string())
 }
 
 /// A `watch` member's `params`: the `detect` stage's own check (named by the first
-/// key that fails on its own, so `params.hold_ms`), then its `modes` against the
-/// member's band (`params.modes[<j>]`).
+/// key that fails on its own, so `params.hold_ms`), no `prefer` sources, then its
+/// `modes` against the member's band (`params.modes[<j>]`; a row this node lacks or
+/// cannot run passes, refused when the set starts).
 fn watch_params(
     params: &Value,
     band_hz: u64,
@@ -521,19 +466,31 @@ fn watch_params(
             None => SetError::new("params", whole),
         });
     }
+    // A set file names no source: the request maps its roles.
+    if params
+        .get("prefer")
+        .and_then(Value::as_array)
+        .is_some_and(|p| !p.is_empty())
+    {
+        return Err(SetError::new(
+            "params.prefer",
+            "a set file names no source; the request does",
+        ));
+    }
     let list: Option<Vec<String>> = params.get("modes").and_then(Value::as_array).map(|a| {
         a.iter()
             .filter_map(|s| s.as_str().map(String::from))
             .collect()
     });
     if let Some(list) = list {
-        crate::node::watch::check_modes_list(modes, &list, band_hz)
+        crate::node::watch::check_modes_list_at_load(modes, &list, band_hz)
             .map_err(|e| SetError::new("params", e))
             .map_err(|e| match e.error.split_once(": ") {
                 // `modes[<j>]: ...` names its field: `params.modes[<j>]`.
                 Some((f, rest)) if f.starts_with("modes[") => {
                     SetError::new(format!("params.{f}"), rest)
                 }
+                Some(("modes", rest)) => SetError::new("params.modes", rest),
                 _ => SetError::new("params.modes", e.error),
             })?;
     }

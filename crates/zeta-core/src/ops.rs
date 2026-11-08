@@ -3123,6 +3123,147 @@ pub(crate) fn check_start_params(
     }
 }
 
+/// An op error with the request field it is about (`plan`, `channels`, `kind`,
+/// `deviation_hz`, `sideband`, `attach`, `language`), for a caller that names fields
+/// itself (a set file's member).
+#[derive(Debug)]
+pub(crate) struct FieldError {
+    pub field: &'static str,
+    pub error: OpError,
+}
+
+impl FieldError {
+    fn new(field: &'static str, error: OpError) -> Self {
+        Self { field, error }
+    }
+}
+
+/// `job_start`'s refusal of a kind that does not start on the radio (see
+/// [`JobKind::startable`]).
+pub(crate) fn check_startable(kind: &JobKind) -> Result<(), OpError> {
+    match kind.startable() {
+        true => Ok(()),
+        false => Err(kind.start_refusal()),
+    }
+}
+
+/// [`check_start_params`] with the field its error is about.
+pub(crate) fn check_start_fields(
+    kind: &JobKind,
+    deviation_hz: Option<u64>,
+    sideband: Option<Sideband>,
+) -> Result<Option<Hz>, FieldError> {
+    check_start_params(kind, deviation_hz, sideband).map_err(|e| {
+        let field = match &e {
+            OpError::Other { message } if message.starts_with("sideband") => "sideband",
+            _ => "deviation_hz",
+        };
+        FieldError::new(field, e)
+    })
+}
+
+/// What [`check_plan_start_fields`] resolved: the plan, its channels `(number, centre)`,
+/// the channel numbers to start (sorted), the deviation and the attach language.
+pub(crate) struct PlanFields {
+    pub plan: &'static crate::plans::ChannelPlan,
+    pub all: Vec<(u32, u64)>,
+    pub numbers: Vec<u32>,
+    pub deviation: Option<Hz>,
+    pub language: String,
+}
+
+/// `plan_start`'s checks of its own fields, in order, touching nothing: the plan known,
+/// each channel known and listed once (`null` for all), a kind that runs per channel,
+/// `deviation_hz` and `sideband` as `job_start` checks them, an attachable `attach`,
+/// and `language` only with `attach` and a BCP-47 code. Each error names its field.
+pub(crate) fn check_plan_start_fields(
+    plan: &str,
+    channels: Option<&[u32]>,
+    kind: &JobKind,
+    (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
+    (attach, language): (Option<&JobKind>, Option<&str>),
+) -> Result<PlanFields, FieldError> {
+    let Some(p) = crate::plans::plan(plan) else {
+        return Err(FieldError::new(
+            "plan",
+            OpError::Unknown {
+                field: "plan".into(),
+                value: plan.into(),
+                known: crate::plans::PLANS.iter().map(|p| p.id.into()).collect(),
+            },
+        ));
+    };
+    let all = crate::plans::channels(p);
+    let mut known: Vec<u32> = all.iter().map(|&(n, _)| n).collect();
+    known.sort_unstable();
+    let numbers: Vec<u32> = match channels {
+        None => known,
+        Some(listed) => {
+            let mut seen = Vec::with_capacity(listed.len());
+            for &n in listed {
+                if !known.contains(&n) {
+                    return Err(FieldError::new(
+                        "channels",
+                        OpError::Unknown {
+                            field: "channels".into(),
+                            value: n.to_string(),
+                            known: known.iter().map(u32::to_string).collect(),
+                        },
+                    ));
+                }
+                if seen.contains(&n) {
+                    return Err(FieldError::new(
+                        "channels",
+                        other(format!("channels: {n} is listed twice")),
+                    ));
+                }
+                seen.push(n);
+            }
+            seen.sort_unstable();
+            seen
+        }
+    };
+    if !kind.startable()
+        || matches!(
+            kind,
+            JobKind::Spectrum | JobKind::Scan | JobKind::Watch | JobKind::Identify
+        )
+    {
+        return Err(FieldError::new(
+            "kind",
+            other(format!("{} cannot be started per channel", kind.name())),
+        ));
+    }
+    let deviation = check_start_fields(kind, deviation_hz, sideband)?;
+    if let Some(a) = attach
+        && !a.attachable()
+    {
+        return Err(FieldError::new(
+            "attach",
+            other(format!("{} is not attachable", a.name())),
+        ));
+    }
+    if language.is_some() && attach.is_none() {
+        return Err(FieldError::new("language", other("language needs attach")));
+    }
+    let language = language.unwrap_or(ATTACH_LANGUAGE_DEFAULT).to_string();
+    if !is_bcp47(&language) {
+        return Err(FieldError::new(
+            "language",
+            other(format!(
+                "language {language:?} is not a BCP-47 code such as en, de or pt-BR; pass null for en"
+            )),
+        ));
+    }
+    Ok(PlanFields {
+        plan: p,
+        all,
+        numbers,
+        deviation,
+        language,
+    })
+}
+
 /// Stop the `replace` holders under `guard` (see [`Node::replace_holders`]);
 /// nothing to do without a guard, which [`Node::gate_for_replace`] gives only
 /// when `replace` names jobs.
@@ -3270,9 +3411,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             elastic,
             replace,
         } => {
-            if !kind.startable() {
-                return Err(kind.start_refusal());
-            }
+            check_startable(&kind)?;
             if elastic && !kind.elastic_capable() {
                 return Err(OpError::Other {
                     message: format!("{} cannot be elastic", kind.name()),
@@ -3792,63 +3931,20 @@ async fn plan_start(
     replace: Vec<JobId>,
 ) -> Result<OpResult, OpError> {
     // 1. Validate: nothing has happened yet.
-    let Some(p) = crate::plans::plan(&plan) else {
-        return Err(OpError::Unknown {
-            field: "plan".into(),
-            value: plan,
-            known: crate::plans::PLANS.iter().map(|p| p.id.into()).collect(),
-        });
-    };
-    let all = crate::plans::channels(p);
-    let mut known: Vec<u32> = all.iter().map(|&(n, _)| n).collect();
-    known.sort_unstable();
-    let numbers: Vec<u32> = match channels {
-        None => known,
-        Some(listed) => {
-            let mut seen = Vec::with_capacity(listed.len());
-            for n in listed {
-                if !known.contains(&n) {
-                    return Err(OpError::Unknown {
-                        field: "channels".into(),
-                        value: n.to_string(),
-                        known: known.iter().map(u32::to_string).collect(),
-                    });
-                }
-                if seen.contains(&n) {
-                    return Err(other(format!("channels: {n} is listed twice")));
-                }
-                seen.push(n);
-            }
-            seen.sort_unstable();
-            seen
-        }
-    };
-    if !kind.startable()
-        || matches!(
-            kind,
-            JobKind::Spectrum | JobKind::Scan | JobKind::Watch | JobKind::Identify
-        )
-    {
-        return Err(other(format!(
-            "{} cannot be started per channel",
-            kind.name()
-        )));
-    }
-    let deviation = check_start_params(&kind, deviation_hz, sideband)?;
-    if let Some(a) = &attach
-        && !a.attachable()
-    {
-        return Err(other(format!("{} is not attachable", a.name())));
-    }
-    if language.is_some() && attach.is_none() {
-        return Err(other("language needs attach"));
-    }
-    let language = language.unwrap_or_else(|| ATTACH_LANGUAGE_DEFAULT.into());
-    if !is_bcp47(&language) {
-        return Err(other(format!(
-            "language {language:?} is not a BCP-47 code such as en, de or pt-BR; pass null for en"
-        )));
-    }
+    let PlanFields {
+        plan: p,
+        all,
+        numbers,
+        deviation,
+        language,
+    } = check_plan_start_fields(
+        &plan,
+        channels.as_deref(),
+        &kind,
+        (deviation_hz, sideband),
+        (attach.as_ref(), language.as_deref()),
+    )
+    .map_err(|e| e.error)?;
     kind.mode_row(&node.modes())?;
     let port = node
         .port(&source)
