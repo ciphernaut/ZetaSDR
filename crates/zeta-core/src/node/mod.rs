@@ -1609,7 +1609,7 @@ impl Node {
         capture_rate_hz: Option<Hz>,
         elastic: bool,
     ) -> Result<JobId, NodeError> {
-        self.check_prefer(&graph)?;
+        self.check_watch_policy(&graph, tuning)?;
         let rec = JobRecord {
             format: JOB_RECORD_FORMAT,
             id: JobId::new(),
@@ -2062,17 +2062,40 @@ impl Node {
         Ok(())
     }
 
-    /// A watch's `detect` node names only this node's sources in `prefer`:
-    /// `bad params on node <id>: prefer[<i>]: unknown source <id>` otherwise. Checked
-    /// at `job_start` and `graph_put` only, so a resume on a node started without one of
-    /// them still runs (the watch then skips it).
-    fn check_prefer(&self, graph: &Graph) -> Result<(), NodeError> {
-        let ports = self.inner.ports.read().unwrap();
-        for n in graph
+    /// A watch's `detect` node names only this node's sources in `prefer`
+    /// (`bad params on node <id>: prefer[<i>]: unknown source <id>` otherwise), and its
+    /// `modes`, when not `null`, only loaded, ready rows no wider than the watch's band
+    /// `tuning` (see [`watch::check_modes_list`]). Checked at `job_start` and `graph_put`
+    /// only, so a resume on a node started without one of them still runs (the watch
+    /// then skips it).
+    pub(crate) fn check_watch_policy(
+        &self,
+        graph: &Graph,
+        tuning: Tuning,
+    ) -> Result<(), NodeError> {
+        let detects = graph
             .nodes
             .iter()
-            .filter(|n| n.kind == crate::ops::DETECT_STAGE)
-        {
+            .filter(|n| n.kind == crate::ops::DETECT_STAGE);
+        let modes = self.inner.modes();
+        for n in detects.clone() {
+            let Some(list) = n.params.get("modes").and_then(|m| m.as_array()) else {
+                continue;
+            };
+            let list: Vec<String> = list
+                .iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect();
+            if let Err(reason) = watch::check_modes_list(&modes, &list, tuning.bandwidth_hz.0) {
+                return Err(GraphError::BadParams {
+                    node: n.id.clone(),
+                    reason,
+                }
+                .into());
+            }
+        }
+        let ports = self.inner.ports.read().unwrap();
+        for n in detects {
             let Some(prefer) = n.params.get("prefer").and_then(|p| p.as_array()) else {
                 continue;
             };
@@ -2105,7 +2128,7 @@ impl Node {
         elastic: bool,
         guard: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<JobId, NodeError>, AfterGate) {
-        if let Err(e) = self.check_prefer(&graph) {
+        if let Err(e) = self.check_watch_policy(&graph, tuning) {
             return (Err(e), AfterGate::Nothing);
         }
         let rec = JobRecord {
@@ -2211,7 +2234,6 @@ impl Node {
         let mut graph = graph;
         crate::ops::fill_squelch_params(&mut graph);
         graph::validate(&graph, &self.inner.registry)?;
-        self.check_prefer(&graph)?;
         let current = {
             let jobs = self.inner.jobs.lock().unwrap();
             let entry = jobs
@@ -2219,6 +2241,7 @@ impl Node {
                 .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
             entry.record.clone()
         };
+        self.check_watch_policy(&graph, current.tuning)?;
         let running = current.state == JobState::Running;
         // An operator's put of the node's graph with only carried params changed keeps
         // the record's rate (and so stays re-expandable).

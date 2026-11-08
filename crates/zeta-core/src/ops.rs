@@ -1763,7 +1763,9 @@ pub fn fill_squelch_params(graph: &mut Graph) -> bool {
 }
 
 /// The stage kind of a `watch`'s detector (registered by `zeta-dsp`); its params carry
-/// the watch's policy too (`decode_on`, `prefer`, `sondehub`), see `node::watch`.
+/// the watch's policy too (`decode_on`, `prefer`, `sondehub`, `on_unknown`, `capture`,
+/// `modes`, `max_decoders`, `hold_ms`, `cooldown_ms`, `confirm_ms`, `seed_known`), see
+/// `node::watch`.
 pub const DETECT_STAGE: &str = "detect";
 
 /// The stage kind of the sonde feed a watch appends to its decoders when its `detect`
@@ -1791,6 +1793,21 @@ pub const BITS_KIND: &str = "bits";
 /// The `detect` stage's default `gone_ms`: an announced signal unmatched this long is
 /// `gone`. The watch re-adopts a decoder only when its signal reappears within it.
 pub const DETECT_GONE_MS_DEFAULT: u64 = 30_000;
+
+/// A watch's default `max_decoders`: kept decoders at once, those on free sources
+/// included.
+pub const WATCH_MAX_DECODERS_DEFAULT: u32 = 16;
+/// A watch's default `hold_ms`: how long a kept decoder whose signal is `gone` may stay
+/// silent before it is `lost`.
+pub const WATCH_HOLD_MS_DEFAULT: u64 = 120_000;
+/// A watch's default `cooldown_ms`: after a decoder on a channel is `lost` or
+/// `unproven`, how long no new decoder starts on a signal overlapping it.
+pub const WATCH_COOLDOWN_MS_DEFAULT: u64 = 30_000;
+/// A watch's default `confirm_ms` (off): how long a decoder started without identify has
+/// to publish an event while its signal is present.
+pub const WATCH_CONFIRM_MS_DEFAULT: u64 = 0;
+/// The refusal of a watch's `modes: []`, from the `detect` stage's check and the node's.
+pub const WATCH_MODES_EMPTY: &str = "modes: empty list (null lets identify decide)";
 
 /// The params [`JobKind::reexpand`] carries from a stored graph to the node of the same
 /// stage kind: what an operator may set with `graph_put` and still have the node's graph.

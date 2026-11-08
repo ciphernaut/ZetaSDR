@@ -4,7 +4,7 @@
 //! leaves the decoder running (inside the capture, or moved to a free source under
 //! `decode_on: free`); the watch then owns it: it is listed in `job_context.watch`
 //! (`signals`, `decoding`, `current`), stopped once its signal has gone and it has been
-//! silent for [`SILENCE_MS`] (`lost`), and stopped with the watch on a `job_stop`, a
+//! silent for the `detect` node's `hold_ms` (default [`SILENCE_MS`]) (`lost`), and stopped with the watch on a `job_stop`, a
 //! `replace` or a failure (a stage's, the loop's, a panic of the loop included). A
 //! `graph_put` restart or a node restart re-adopts the decoders from the persisted
 //! context instead: those whose job no longer runs are dropped, those whose signal does
@@ -18,8 +18,9 @@
 //! Events, `protocol: "watch"`, go on the job's event stream beside `detect`'s `signal`
 //! events: `state` `identifying | decoding | unknown | lost | capturing | captured`, with
 //! `signal`, `job`, `mode`, `source`, `placed` (`capture | free`), `features` and
-//! `allocations` and `origins` (for `unknown`), `captures` (for `captured`), `summary` and `t_ns`
-//! (fields that do not apply are `null`).
+//! `allocations` and `origins` (for `unknown`), `captures` (for `captured`), `via` (for
+//! `decoding`: `identify | modes`), `why` (for `lost`), `summary` and `t_ns` (fields that
+//! do not apply are `null`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,9 +35,14 @@ use super::persist::now;
 use super::{Inner, source_fault_reason};
 use crate::graph::{self, Edge, Graph, Node as GraphNode, NodeId};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
+use crate::modes::ModeRegistry;
 use crate::modes::ModeState;
 use crate::modes::score::score_rows;
-use crate::ops::{DETECT_GONE_MS_DEFAULT, DETECT_STAGE, JobKind, SONDEHUB_STAGE};
+use crate::ops::{
+    DETECT_GONE_MS_DEFAULT, DETECT_STAGE, JobKind, SONDEHUB_STAGE, WATCH_CONFIRM_MS_DEFAULT,
+    WATCH_COOLDOWN_MS_DEFAULT, WATCH_HOLD_MS_DEFAULT, WATCH_MAX_DECODERS_DEFAULT,
+    WATCH_MODES_EMPTY,
+};
 use crate::port::{Port, Tuning};
 use crate::stage::StageError;
 use crate::stream::{Frame, Payload};
@@ -50,8 +56,8 @@ pub const RETRY_MS: u64 = 60_000;
 /// it goes and comes back).
 pub const RETRY_MAX: u32 = 3;
 /// How long a decoder whose signal has gone may stay silent (no event) before it is
-/// stopped as `lost`.
-pub const SILENCE_MS: u64 = 120_000;
+/// stopped as `lost`, unless the `detect` node sets `hold_ms`.
+pub const SILENCE_MS: u64 = WATCH_HOLD_MS_DEFAULT;
 
 #[cfg(feature = "test-fixtures")]
 static RETRY_OVERRIDE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -188,11 +194,30 @@ pub(super) struct Policy {
     /// With `on_unknown: capture`, the `burst_capture` params (the `capture` block, `{}`
     /// for the defaults) of the capture an unknown signal gets; `None` with `report`.
     capture: Option<serde_json::Value>,
+    /// The mode rows signals are decoded with directly; `None` lets identify decide.
+    #[allow(dead_code)] // read by the direct start
+    modes: Option<Vec<String>>,
+    /// Kept decoders at once.
+    max_decoders: u32,
+    /// How long a kept decoder whose signal is `gone` may stay silent before it is `lost`.
+    hold_ms: u64,
+    /// After a `lost` or `unproven`, how long its channel starts no new decoder.
+    #[allow(dead_code)] // read by the cooldown
+    cooldown_ms: u64,
+    /// With `modes`, how long a directly started decoder has to publish an event (0: off).
+    #[allow(dead_code)] // read by the direct start
+    confirm_ms: u64,
+    /// With `modes`, start a decoder on every known channel in the band at once.
+    #[allow(dead_code)] // read by the known-channel seeding
+    seed_known: bool,
 }
 
 impl Policy {
     /// The policy in `graph`'s `detect` node: `decode_on` (`capture`, default, or
-    /// `free`), `prefer` (source ids) and the detector's `gone_ms`.
+    /// `free`), `prefer` (source ids), the detector's `gone_ms`, `sondehub`,
+    /// `on_unknown`/`capture`, `modes`, `max_decoders`, `hold_ms` (left out: the
+    /// silence constant, or a test's override of it), `cooldown_ms`, `confirm_ms` and
+    /// `seed_known`.
     fn of(graph: &Graph) -> Policy {
         let p = graph
             .nodes
@@ -216,8 +241,76 @@ impl Policy {
                 serde_json::Value::Null => serde_json::json!({}),
                 v => v.clone(),
             }),
+            modes: p["modes"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            }),
+            max_decoders: p["max_decoders"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(WATCH_MAX_DECODERS_DEFAULT),
+            hold_ms: p["hold_ms"].as_u64().unwrap_or_else(silence_ms),
+            cooldown_ms: p["cooldown_ms"]
+                .as_u64()
+                .unwrap_or(WATCH_COOLDOWN_MS_DEFAULT),
+            confirm_ms: p["confirm_ms"].as_u64().unwrap_or(WATCH_CONFIRM_MS_DEFAULT),
+            seed_known: p["seed_known"].as_bool().unwrap_or(false),
         }
     }
+}
+
+/// How a kept decoder came to be started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Via {
+    /// An identify run proved it.
+    Identify,
+    /// Started directly from the watch's `modes`.
+    Modes,
+}
+
+impl Via {
+    /// The `via` of a decoder persisted before the field existed.
+    fn identify() -> Via {
+        Via::Identify
+    }
+}
+
+/// Check a watch's `modes` list against `modes` for a band `band_hz` wide: each id a
+/// loaded, ready row no wider than the band, and the list not empty. The reason names
+/// the entry: `modes[<i>]: unknown mode <id>`, `modes[<i>]: <id> is broken (<reason>)`
+/// (or `unavailable`), `modes[<i>]: <id> is <w> Hz wide; the watch's band is <b> Hz`,
+/// or `modes: empty list (null lets identify decide)`.
+pub(crate) fn check_modes_list(
+    modes: &ModeRegistry,
+    list: &[String],
+    band_hz: u64,
+) -> Result<(), String> {
+    if list.is_empty() {
+        return Err(WATCH_MODES_EMPTY.into());
+    }
+    for (i, id) in list.iter().enumerate() {
+        let Some(m) = modes.get(id) else {
+            return Err(format!("modes[{i}]: unknown mode {id}"));
+        };
+        let state = match m.state {
+            ModeState::Ready => None,
+            ModeState::Broken => Some("broken"),
+            ModeState::Unavailable => Some("unavailable"),
+        };
+        if let Some(state) = state {
+            let reason = m.reason.as_deref().unwrap_or("no reason given");
+            return Err(format!("modes[{i}]: {id} is {state} ({reason})"));
+        }
+        let width = m.row.band.bandwidth_hz;
+        if width > band_hz {
+            return Err(format!(
+                "modes[{i}]: {id} is {width} Hz wide; the watch's band is {band_hz} Hz"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A signal as `detect` announced it.
@@ -333,6 +426,9 @@ struct Decoding {
     signal: Signal,
     since_ns: u64,
     placed: Placed,
+    /// How it was started (a decoder persisted before the field: `identify`).
+    #[serde(default = "Via::identify")]
+    via: Via,
     /// Why the decoder runs without the `sondehub` sink it was asked to have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sink_error: Option<String>,
@@ -411,6 +507,8 @@ impl Run {
 struct State {
     signals: Vec<Tracked>,
     decoding: Vec<Decoding>,
+    /// The policy's `max_decoders`, reported as `cap.max`.
+    max_decoders: u32,
     /// The identify run in progress and the centre of the signal it is on.
     current: Option<(JobId, u64)>,
     /// The decoders' event streams, by job.
@@ -504,6 +602,11 @@ impl State {
             "signals": self.signals,
             "decoding": self.decoding,
             "current": self.current.as_ref().map(|(j, _)| j.0.clone()),
+            "cap": {
+                "max": self.max_decoders,
+                "decoding": self.decoding.len(),
+                "waiting": 0,
+            },
         }})
     }
 }
@@ -523,6 +626,11 @@ struct Event<'a> {
     origins: Option<serde_json::Value>,
     /// The captures a `captured` lists.
     captures: Option<&'a [String]>,
+    /// How a `decoding` decoder was started.
+    via: Option<Via>,
+    /// Why a `lost` decoder was stopped (`gone and silent`, `not seen again`, or why it
+    /// could not be relaunched).
+    why: Option<String>,
 }
 
 impl Inner {
@@ -546,6 +654,8 @@ impl Inner {
             "allocations": e.allocations,
             "origins": e.origins,
             "captures": e.captures,
+            "via": e.via,
+            "why": e.why,
             "summary": summary,
             "t_ns": t.0,
         });
@@ -1054,6 +1164,7 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
     let mut w = State {
         signals: Vec::new(),
         decoding: Vec::new(),
+        max_decoders: r.seed.policy.max_decoders,
         current: None,
         subs: HashMap::new(),
         pending: None,
@@ -1314,6 +1425,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
                     mode: Some(&mode),
                     source: Some(&source),
                     placed: Some(placed),
+                    why: Some(why),
                     ..Event::default()
                 };
                 inner.watch_event(r, "lost", summary, e);
@@ -1324,7 +1436,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         };
         let t = now().0;
         // A signal that went while identify ran sends no further `gone`: count its
-        // silence from now, so the decoder is still dropped after SILENCE_MS.
+        // silence from now, so the decoder is still dropped after the hold.
         let gone_since_ns = (!w.signals[i].present).then_some(t);
         w.subs.insert(job.clone(), inner.decoder_subs(&job));
         w.decoding.push(Decoding {
@@ -1334,6 +1446,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             signal: signal.clone(),
             since_ns: t,
             placed,
+            via: Via::Identify,
             sink_error: sink_error.clone(),
             last_event_ns: t,
             gone_since_ns,
@@ -1358,6 +1471,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             mode: Some(&mode),
             source: Some(&source),
             placed: Some(placed),
+            via: Some(Via::Identify),
             ..Event::default()
         };
         inner.watch_event(r, "decoding", summary, e);
@@ -1505,7 +1619,7 @@ pub(super) fn register_says(allocations: &serde_json::Value) -> String {
 }
 
 /// Note the decoders' events; drop those whose job no longer runs; stop (`lost`) those
-/// whose signal has gone and that stayed silent for [`SILENCE_MS`], and re-adopted ones
+/// whose signal has gone and that stayed silent for the policy's `hold_ms`, and re-adopted ones
 /// whose signal did not reappear in time. Whether the state changed.
 async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     let t = now().0;
@@ -1534,7 +1648,7 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             }
         }
     }
-    let silence_ns = silence_ms().saturating_mul(1_000_000);
+    let silence_ns = r.seed.policy.hold_ms.saturating_mul(1_000_000);
     let mut changed = false;
     let mut kept = Vec::with_capacity(w.decoding.len());
     for d in std::mem::take(&mut w.decoding) {
@@ -1572,6 +1686,7 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             mode: Some(&d.mode),
             source: Some(&d.source),
             placed: Some(d.placed),
+            why: Some(why.to_string()),
             ..Event::default()
         };
         inner.watch_event(r, "lost", summary, e);

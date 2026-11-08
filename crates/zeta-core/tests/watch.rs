@@ -2097,3 +2097,196 @@ async fn a_frame_row_decoder_is_dropped_when_its_frames_stop() {
     stop_all(&node).await;
     zeta_core::node::watch::test_timing(0, 0);
 }
+
+/// The watch's band in the `modes` refusal test: narrower than `rds_decode`'s 200 kHz.
+const NARROW_BAND_HZ: u64 = 100_000;
+/// The id of the broken operator row the `modes` refusal test loads.
+const BROKEN_ROW: &str = "pocsag_broken";
+
+/// `node`'s watch graph `graph` with `modes` set on its `detect` node.
+fn with_modes(graph: &Graph, modes: Value) -> Graph {
+    let mut g = graph.clone();
+    let detect = g.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params["modes"] = modes;
+    g
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_put_with_a_bad_modes_list_is_refused() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    // An operator row with a bad field: listed `broken`.
+    let modes_dir = dir.path().join("modes");
+    std::fs::create_dir_all(&modes_dir).unwrap();
+    let (_, text) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("pocsag_decode.json"))
+        .unwrap();
+    let mut row: Value = serde_json::from_str(text).unwrap();
+    row["id"] = BROKEN_ROW.into();
+    row["band"]["bandwidth_hz"] = "x".into();
+    std::fs::write(
+        modes_dir.join(format!("{BROKEN_ROW}.json")),
+        row.to_string(),
+    )
+    .unwrap();
+    let src = file_source("rx", &fixtures().pocsag);
+    let port = Muting::new(src.clone(), false);
+    let node = node_over(
+        dir.path(),
+        vec![(port.clone() as Arc<dyn Port>, src)],
+        Some(&modes_dir),
+    )
+    .await;
+    let node = Arc::new(node);
+    let band = Tuning {
+        center_hz: Hz(POCSAG_HZ),
+        bandwidth_hz: Hz(NARROW_BAND_HZ),
+    };
+    // Refused at the start too, starting nothing.
+    let mut g = JobKind::Watch
+        .expand(
+            &rx(),
+            band,
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    g = with_modes(&g, serde_json::json!(["no_such_mode"]));
+    let e = node
+        .job_start("watch", rx(), band, g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("modes[0]: unknown mode no_such_mode"),
+        "{e}"
+    );
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    let watch = start_watch_on(&node, band, serde_json::json!({})).await;
+    let stream = node.job_outputs(&watch);
+    let graph = record(&node, &watch).unwrap().graph;
+    let cases = [
+        (
+            serde_json::json!(["pocsag_decode", "no_such_mode"]),
+            "modes[1]: unknown mode no_such_mode".to_string(),
+        ),
+        (
+            serde_json::json!([BROKEN_ROW]),
+            format!("modes[0]: {BROKEN_ROW} is broken ("),
+        ),
+        (
+            serde_json::json!(["rds_decode"]),
+            format!(
+                "modes[0]: rds_decode is 200000 Hz wide; the watch's band is {NARROW_BAND_HZ} Hz"
+            ),
+        ),
+        (serde_json::json!([]), "modes: empty list".to_string()),
+    ];
+    for (modes, want) in cases {
+        let op = Op::GraphPut {
+            job: watch.clone(),
+            graph: with_modes(&graph, modes.clone()),
+        };
+        let e = node.apply(op).await.unwrap_err();
+        assert!(e.to_string().contains(&want), "{modes}: {e}");
+        // Nothing restarted: the same run and its graph.
+        assert_eq!(record(&node, &watch).unwrap().graph, graph, "{modes}");
+        assert_eq!(node.job_outputs(&watch), stream, "{modes}");
+        assert_eq!(state(&node, &watch), Some(JobState::Running), "{modes}");
+    }
+    // A list of loaded rows that fit the band is taken.
+    let op = Op::GraphPut {
+        job: watch.clone(),
+        graph: with_modes(&graph, serde_json::json!(["pocsag_decode"])),
+    };
+    node.apply(op).await.unwrap();
+    until("the watch runs again", Duration::from_secs(5), || {
+        state(&node, &watch) == Some(JobState::Running)
+    })
+    .await;
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_event_carries_why_and_a_decoding_event_carries_via() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 2_000);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let decoding_event = &events.watch("decoding")[0];
+    assert_eq!(decoding_event["via"], "identify", "{decoding_event}");
+    assert_eq!(
+        decoding_event.get("why"),
+        Some(&Value::Null),
+        "{decoding_event}"
+    );
+    assert_eq!(decoding(&node, &watch)[0]["via"], "identify");
+    let identifying = &events.watch("identifying")[0];
+    assert_eq!(identifying.get("via"), Some(&Value::Null), "{identifying}");
+    port.mute();
+    until("a lost event", Duration::from_secs(20), || {
+        !events.watch("lost").is_empty()
+    })
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert_eq!(lost["why"], "gone and silent", "{lost}");
+    assert!(
+        lost["summary"]
+            .as_str()
+            .unwrap()
+            .contains("gone and silent"),
+        "{lost}"
+    );
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// The process-wide silence the hold test sets: far longer than the test waits.
+const LONG_SILENCE_MS: u64 = 60_000;
+/// The hold the hold test's `detect` node sets.
+const SHORT_HOLD_MS: u64 = 1_500;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_ms_on_the_detect_node_replaces_the_silence_constant() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, LONG_SILENCE_MS);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({"hold_ms": SHORT_HOLD_MS})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let cap = |n: &Node| n.job_context(&watch).map(|c| c["watch"]["cap"].clone());
+    until("cap counts the decoder", Duration::from_secs(5), || {
+        cap(&node) == Some(serde_json::json!({"max": 16, "decoding": 1, "waiting": 0}))
+    })
+    .await;
+    port.mute();
+    // The detector's `gone` comes `GONE_MS` after the last burst; the hold has run out
+    // by then. The silence constant (a minute) would keep it far longer.
+    until(
+        "a lost event",
+        Duration::from_millis(GONE_MS + 6_000),
+        || !events.watch("lost").is_empty(),
+    )
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert_eq!(lost["why"], "gone and silent", "{lost}");
+    until("cap counts nothing", Duration::from_secs(5), || {
+        cap(&node) == Some(serde_json::json!({"max": 16, "decoding": 0, "waiting": 0}))
+    })
+    .await;
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
