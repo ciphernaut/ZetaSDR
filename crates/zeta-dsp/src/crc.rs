@@ -120,6 +120,20 @@ pub const CRC8: CrcSpec = CrcSpec {
     check: 0xF4,
 };
 
+/// CRC-16/M17: the M17 Project specification's LSF CRC (its CRC section: polynomial
+/// 0x5935, init 0xFFFF, neither input nor output reflected, no final XOR; its test
+/// vectors give 0x772B for `123456789`, 0xFFFF for no bytes, 0x206E for `A`).
+pub const CRC16_M17: CrcSpec = CrcSpec {
+    name: "crc16-m17",
+    width: 16,
+    poly: 0x5935,
+    init: 0xFFFF,
+    refin: false,
+    refout: false,
+    xorout: 0,
+    check: 0x772B,
+};
+
 /// Every spec, in search order. The 8-bit one is last: it checks by chance most often.
 pub const CRCS: &[CrcSpec] = &[
     CRC16_CCITT,
@@ -129,6 +143,7 @@ pub const CRCS: &[CrcSpec] = &[
     CRC32,
     CRC16_X25,
     CRC16_KERMIT,
+    CRC16_M17,
     CRC8,
 ];
 
@@ -258,7 +273,18 @@ mod tests {
     fn the_two_new_specs_check() {
         assert_eq!(by_name("crc8").unwrap().check, 0xF4);
         assert_eq!(by_name("crc16-modbus").unwrap().check, 0x4B37);
-        assert_eq!(CRCS.len(), 8);
+        assert_eq!(CRCS.len(), 9);
+    }
+
+    #[test]
+    fn crc16_m17_has_the_specifications_check_value() {
+        // The M17 specification's CRC test vectors (its CRC section).
+        assert_eq!(by_name("crc16-m17").unwrap().check, 0x772B);
+        assert_eq!(crc(&CRC16_M17, b""), 0xFFFF);
+        assert_eq!(crc(&CRC16_M17, b"A"), 0x206E);
+        assert_eq!(crc(&CRC16_M17, b"123456789"), 0x772B);
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(crc(&CRC16_M17, &all), 0x1C31);
     }
 
     #[test]

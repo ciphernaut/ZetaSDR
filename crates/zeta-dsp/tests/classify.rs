@@ -20,15 +20,17 @@ const CENTER: u64 = 144_800_000;
 /// registered and at least 2 s in the ring. Played in real time, so the
 /// first 2 s are still in the ring for several `classify` calls.
 async fn node_over(dir: &std::path::Path, iq: &[Complex<f32>]) -> Node {
-    node_over_with(dir, iq, None).await
+    node_over_with(dir, iq, CENTER, None).await
 }
 
+/// As [`node_over`], the capture centred on `center_hz`.
 async fn node_over_with(
     dir: &std::path::Path,
     iq: &[Complex<f32>],
+    center_hz: u64,
     modes_dir: Option<std::path::PathBuf>,
 ) -> Node {
-    let meta = write_fixture(dir, "fixture", iq, 48_000, CENTER);
+    let meta = write_fixture(dir, "fixture", iq, 48_000, center_hz);
     let opts = FileOpts {
         realtime: true,
         block_samples: 4800,
@@ -169,12 +171,12 @@ async fn a_short_selection_reports_skipped_span_and_a_layer1_label() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn program_rows_are_skipped_quick() {
     let dir = tempfile::tempdir().unwrap();
-    let iq = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
-    let node = node_over(dir.path(), &iq).await;
-    let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
-    // A program row in range (adsb_decode has no range) is tried but has no quick attempt.
+    let node = node_over_with(dir.path(), &ais_capture(), AIS_A_HZ, None).await;
+    let c = classify_span(&node, AIS_A_HZ, 25_000, 2_000_000_000).await;
+    // A program row that scores (vdl2_decode's 25 kHz band matches) is tried but has no
+    // quick attempt.
     assert_eq!(
-        outcome(&c, "adsb_decode"),
+        outcome(&c, "vdl2_decode"),
         Some(Outcome::SkippedQuick),
         "{c:?}"
     );
@@ -301,4 +303,51 @@ async fn sonde_rows_do_not_fill_the_tried_list_outside_their_range() {
     }
     assert!(outcome(&c, "pocsag_decode").is_some(), "{c:?}");
     assert!(outcome(&c, "aprs_decode").is_some(), "{c:?}");
+}
+
+/// `m17_decode` (a graph row with no quick attempt, whose empty centre list scores
+/// anywhere) is left out of classify's list, so it never takes POCSAG's slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m17_takes_no_classify_slot_from_pocsag() {
+    let dir = tempfile::tempdir().unwrap();
+    let iq = pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+    let node = node_over(dir.path(), &iq).await;
+    let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
+    assert_eq!(outcome(&c, "m17_decode"), None, "{c:?}");
+    assert_eq!(outcome(&c, "pocsag_decode"), Some(Outcome::Proved), "{c:?}");
+    assert_eq!(c.tried.len(), zeta_dsp::identify::CLASSIFY_TRIES, "{c:?}");
+}
+
+/// AIS channel A.
+const AIS_A_HZ: u64 = 161_975_000;
+
+/// The `ais` family's capture at 48 kHz: three type 1 reports from MMSI 503000001.
+fn ais_capture() -> Vec<Complex<f32>> {
+    let p = serde_json::json!({
+        "family": "ais", "mmsi": 503000001, "lat": -27.3842, "lon": 153.1175,
+        "sog_kt": 12.3, "cog_deg": 45.0, "name": null, "repeat": 3
+    });
+    let (spec, imp) = zeta_dsp::synth::parse_params(p.as_object().unwrap().clone()).unwrap();
+    zeta_dsp::synth::synthesise(&spec, &imp, 48_000, AIS_A_HZ)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classify_proves_ais_on_its_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over_with(dir.path(), &ais_capture(), AIS_A_HZ, None).await;
+    let c = classify_span(&node, AIS_A_HZ, 25_000, 2_000_000_000).await;
+    assert_eq!(outcome(&c, "ais_decode"), Some(Outcome::Proved), "{c:?}");
+    let label = c
+        .labels
+        .iter()
+        .find(|l| l.layer == 2 && l.name == "AIS")
+        .unwrap_or_else(|| panic!("no AIS label: {c:?}"));
+    // The file repeats, so the 2 s span holds more than the three reports.
+    assert!(
+        label.evidence.starts_with("decode ais_decode: ")
+            && label
+                .evidence
+                .ends_with(" AIS frames CRC-clean; first MMSI 503000001 type 1"),
+        "{label:?}"
+    );
 }

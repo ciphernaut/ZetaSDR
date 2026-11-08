@@ -238,7 +238,7 @@ Open work left from plan 16's mode registry (delivered; see the plan series):
 - **Feeds.** `sink` stage kinds for the standard feeds (APRS-IS, SBS/Beast, AIS NMEA, PSK Reporter, WSPRnet, KISS TNC) so results leave the node the way other tools expect.
 - **Time.** UTC-slotted modes (FT8/FT4 15 s, WSPR 2 min, JT65 1 min) and TDMA (DMR, TETRA) need true block timestamps. The HackRF timestamp bug is fixed (plan 14); the 2 h clock run that would clear the WSJT family is still outstanding (plan series, "Outcome").
 - **Span decoders and trunking.** OnAir and OpenWebRX+ decode every POCSAG/APRS/VDL2 channel in a capture at once. On a pin that is one job per channel on the bank today; a decoder that finds its own channels would take the whole capture. Trunking (P25, DMR Tier III, MPT1327) needs a follower that starts voice jobs from control-channel events inside the pin.
-- **Vocoders.** Codec 2 (M17, FreeDV) in-crate; AMBE/IMBE only through an external `mbelib` build, never shipped; HD Radio HDC off.
+- **Vocoders.** Codec 2 (M17, FreeDV) runs as the external `c2dec` (the operator's decision, plan 29; no copyleft dependency in-crate); AMBE/IMBE only through a handler on an external `mbelib` build, never shipped; HD Radio HDC off.
 - **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback.
 - **Wideband modes** (DVB-T 8 MHz, DAB 1.5 MHz, LTE) run the direct path at full rate and want the GPU FFT; park them behind the HackRF-first set.
 - **`sync_bank` flapping** (from the 2026-10-27 investigation, not reproduced). A bank replaced while `feed_bank` still drains old-band blocks can swap back and forth, stalling a channel stage silently.
@@ -299,14 +299,36 @@ Scope estimate: 50-100 lines in `crates/zeta-ext/src/proc.rs` and `node_setup.rs
 
 ## Feature: decoder wave 2 (rows on the sonde frameworks)
 
-From plan 17, 2026-10-29. Plan 17 shipped the frameworks (audio-input program rows, the generic `fsk`/`psk`/`ook` synthesiser families and the echo impairment, the `watch` job, `source_free`, `position` and the map, the SondeHub sink), so these are rows and small stages, not new machinery:
+Plan 29 shipped AIS, FLEX, M17, M20 synthesis and APRS positions (see "Decoder wave 2: leftovers from plan 29"). What stays:
 
-- **Voice.** M17 (4FSK 4800 baud, Codec 2, open) and DMR (4FSK, AMBE+2 through the vocoder libraries, see the install-script gist above): audio-output rows whose audio feeds `job attach --kind transcribe` unchanged.
-- **AIS** (161.975 / 162.025 MHz, GMSK 9600, NMEA out; a `nmea` parser row, positions onto the map) and **FLEX** pagers (1600/3200/6400).
-- **Whole-span POCSAG and APRS** as a `watch` with `decode_on: capture`: the detect stage finds the channels in a pin and the watch starts one decoder per signal, instead of one hand-started job per channel.
+- **DMR voice** (4FSK, AMBE+2 through the vocoder libraries, see the install-script gist above): an audio-output row on the shape of `m17_decode` with a `vocoder` handler.
+- **Whole-span POCSAG and APRS** (now plan 31's) as a `watch` with `decode_on: capture`: the detect stage finds the channels in a pin and the watch starts one decoder per signal, instead of one hand-started job per channel.
 - **Stereo** for `wfm_demod` (see the stereo gist above) now that audio rows exist to consume it.
-- **DFM and M20 frame synthesis.** `dfm_decode` and `m20_decode` have no `test` (they print `skipped: no test`, and `--strict` fails them); an `rs41`-style generator for each, proven against `dfm09mod`/`m20mod`, writes them in. The RS41 generator is the template (public protocol descriptions only, never `rs41mod.c`).
-- **APRS positions on the map.** The APRS row has no `position` map; add one (the decoder's `info` carries it only after parsing, so a position field wants the parser) so APRS stations appear beside the sondes. One APRS job hears many stations, so this also needs the map's per-(job, key) tracks from the ADS-B display gist above; without them every station's fix lands on one marker.
+- **DFM serial.** `dfm_decode` keeps `test: null` (it prints `skipped: no test`, and `--strict` fails it). Plan 29 task 9 built `crates/zeta-dsp/src/dfm_frame.rs` and the `dfm` family, and `dfm09mod --json --ecc` decodes their position, climb, time and satellites through the row's own chain, but the id stays `DFM-xxxxxxxx`: the serial's place in the sensor (configuration) field is not settled (channels 4-15, half layouts `half << 8 | index` and others, sequential or fixed-plus-alternating sensor sequences and runs up to 1200 frames all left the placeholder). The operator's ruling at the fallback was to leave `test: null` rather than a position-only test. Next: a public description of the DFM-09 configuration channels (the TH Koeln thesis's appendix A "From a Frame to a Data Packet" was not in the published excerpt), then set the row's `test` (`expect {id, lat}`, `within_ms` about 15000).
+
+## Decoder wave 2: leftovers from plan 29
+
+- **APRS objects and items** as subjects of their own (they are named, not placed, today).
+- **An in-crate FLEX decoder.** `flex_decode` runs `multimon-ng` (the slot): the row turns into a graph row with the same schema and test.
+- **M17:** packet-mode content; the 1600 mode's data bytes, and the 1600 mode against `c2dec`; a real M17 capture (no recording is in the repository, so the decoder has only been proven against its own synthesiser).
+- **AIS:** message types beyond 1-5, 18, 21 and 24; per-burst AFC beyond about 1.5 kHz of offset; `gfsk_modulate`'s BT if the stage wanted 0.4 (it runs at 0.5).
+- **Classify tie-break.** POCSAG off any row's centre loses its slot to AIS: maritime ties sort before pagers, so AIS takes the fifth `CLASSIFY_TRIES` slot. Break the tie on modulation or label, or try more rows.
+- **Identify dwell cost.** Plan 29 added three dwells to every identify and to each signal a watch reports, tried before POCSAG and the rest: `m17_decode` scores 1.0 on every 12.5 kHz FM/FSK signal anywhere (its row has no `band.range_hz`) and dwells 5 s; `ais_decode` scores 0.6 on any FM signal 12.5-37.5 kHz wide and dwells 10 s; `flex_decode` dwells 15 s when `multimon-ng` is installed, and its band range, 151.8-932 MHz, makes it a candidate across the pager and UHF bands. That is up to about 15 s more per narrow FM signal, 30 s with FLEX in range. Narrow the ranges or shorten the dwells if watches feel it; an amateur-band `range_hz` for M17 is the operator's call (a spec change). Two smaller edges: `flex_decode` still scores where it is unavailable (no `multimon-ng`), costing a skipped slot; and `c2dec` is spawned with `env_clear`, so a snap or relocated install that needs its environment fails with only an exit status (its stderr goes to null).
+- **A `vocoder` handler** for AMBE/IMBE on the M17 stage's shape (ties to the install-script gist).
+- **Feeds out** for AIS and APRS (the Feeds gist under the sink architecture below).
+- **The FLEX synthesiser** at 3200 and 6400 bps.
+- **Deferred minors from review**, each small: `reload_modes` never probes new or edited rows (a new graph row with a missing handler fails inside the stage, not at `job_start`); APRS parser guards (13+ character garbage may read as a compressed fix, Mic-E accepts A-K in destination characters 4-6, items under 3 characters are accepted); AIS type 21 name extension joins only when the base is 20 characters; the DFM and M20 generators' small edges (`dfm_dat_field` never rolls the day, M20 altitude clamps negative to 0, fixed east velocity undocumented); M17 `rrc_modulate_4fsk` does not validate baud or alpha and address round trips drop trailing spaces.
+
+## Access: ACLs on restricted rows
+
+From the operator, 2026-11-06. Pager events and the rows that produce them (`pocsag_decode`, `flex_decode`) carry `access: "restricted"` now, and nothing reads it. The design to come:
+
+- an access level per transport caller (the secret is one level today);
+- `events.log`, `--then-tail` and `stream_tail` of a `restricted` row gated to the higher level;
+- the page's ribbons and the agent's view likewise;
+- the level stated in `GET /health`.
+
+Until then the README's Legal paragraph is the guard.
 
 ## Bug: `--then-tail` on a program row with a squelched demod tails the squelch events first
 

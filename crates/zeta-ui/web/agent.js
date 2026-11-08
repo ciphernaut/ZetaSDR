@@ -45,6 +45,7 @@
 //                               (tooltip: its power and floor, the neighbour's `adjacent_db`
 //                               when measured, and whether the guard holds it), removes it
 //                               otherwise (null: none seen)
+//   isAudioJob(job, rowOf)      AUDIO_KINDS, or a mode row whose `outputs` lists `audio` (startJobs' `audioKind`: kind -> row)
 //   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, squelch,
 //                                   view, position, onHot})
 //                                                       -> {close, refresh, redraw}
@@ -115,6 +116,11 @@ export const JOB_FOLD_KEY = "zeta.jobfold."; // + plan id: "open" | "closed", th
 // The row spans whose full text is their title (line two cuts them with an ellipsis).
 const TITLED = ["band", "source", "events"];
 export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod", "mix"];
+// Whether a job's row gets ▶ and Transcribe: its kind is a voice demodulator, or its mode
+// row's `outputs` (modes_list) lists `audio`. `rowOf(kind)` gives the row, or null/undefined.
+export function isAudioJob(job, rowOf) {
+  return AUDIO_KINDS.includes(job.kind) || !!rowOf?.(job.kind)?.outputs?.includes("audio");
+}
 export const SQUELCH_KINDS = ["fm_demod", "am_demod"];
 export const QUIET_OPS = new Set([
   "job_list",
@@ -453,7 +459,7 @@ const NO_BAND_KINDS = ["mix", "spectrum", "scan"];
 function jobRow(
   job,
   onStop,
-  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins },
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins, audioKind },
 ) {
   const row = document.createElement("div");
   const attached = !!job.input;
@@ -549,7 +555,7 @@ function jobRow(
     row.append(actions);
     return row;
   }
-  const audio = !attached && AUDIO_KINDS.includes(job.kind);
+  const audio = !attached && isAudioJob(job, audioKind);
   if (audio && onPlay) {
     const on = playing ? playing(job.id) : false;
     const play = document.createElement("button");
@@ -705,6 +711,7 @@ export function startJobs(
     mute = null,
     onBits = null,
     onOrigins = null,
+    audioKind = null,
     countEl = null,
     lastEvent = null,
     activity = null,
@@ -747,6 +754,7 @@ export function startJobs(
     mute,
     onBits,
     onOrigins,
+    audioKind,
   };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;

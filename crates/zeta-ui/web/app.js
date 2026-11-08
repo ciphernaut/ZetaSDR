@@ -1049,6 +1049,7 @@ function start(api) {
     },
   });
   state.jobs = startJobs(api, $("#jobs"), state.transcript, {
+    audioKind: (kind) => state.subjects?.rowOf(kind) ?? null,
     view: state.view,
     countEl: $(".pane.jobs h2 .count"),
     onJobs: (jobs) => {

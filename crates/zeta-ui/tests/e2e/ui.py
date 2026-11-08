@@ -5905,6 +5905,56 @@ def scenario_map_draws_one_marker_per_subject(page, url, secret):
         stop_job(url, secret, job)
 
 
+def scenario_map_tracks_an_aprs_station(page, url, secret):
+    # Plan 29 Task 6: the APRS row maps a decoded position (the fixture's packet is
+    # "!2723.05S/15307.05E>ZetaSDR", Brisbane Airport), so the station lands on the map and in
+    # the Subjects table.
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    errors = page_errors(page)
+    select_source(page, url, secret, "aprs")
+    run_cmd(page, "view set main map")
+    mp = page.locator("#map")
+    expect(mp).to_be_visible()
+    job = start_job(url, secret, "aprs_decode", "aprs", 144_800_000, 12_500)
+    try:
+        job_row(page, job)
+        station = map_subject(page, "VK3ABC")
+        expect(station).to_have_count(1, timeout=15_000)
+        station.click()
+        expect(mp.locator(".leaflet-popup-content")).to_contain_text("VK3ABC")
+        open_subjects(page)
+        row = subject_row(page, "VK3ABC")
+        expect(row).to_be_visible()
+        expect(row.locator('td[data-col="position"]')).to_contain_text("-27.38, 153.12")
+        # The audio-row rule (Task 4): a row whose outputs list audio counts as an audio job.
+        audio = page.evaluate(
+            """() => import('./agent.js').then((m) => [
+                 m.isAudioJob({kind: 'm17_decode'}, () => ({outputs: ['event', 'audio']})),
+                 m.isAudioJob({kind: 'aprs_decode'}, () => ({outputs: ['event']})),
+                 m.isAudioJob({kind: 'fm_demod'}, () => null)])""")
+        assert audio == [True, False, True], f"isAudioJob {audio}"
+        # The store the jobs list asks (`audioKind`) carries the live row's outputs.
+        live = page.evaluate(
+            """async () => {
+                 const { state } = await import('./app.js');
+                 await state.subjects.lookup(['aprs_decode', 'm17_decode']);
+                 const m = await import('./agent.js');
+                 const rowOf = (k) => state.subjects.rowOf(k);
+                 return [rowOf('aprs_decode')?.outputs ?? null,
+                         m.isAudioJob({kind: 'aprs_decode'}, rowOf),
+                         rowOf('m17_decode')?.outputs ?? null,
+                         m.isAudioJob({kind: 'm17_decode'}, rowOf)];
+               }""")
+        assert live == [["event"], False, ["event", "audio"], True], f"live row outputs {live}"
+        run_cmd(page, "view set main rf")
+        assert not errors, f"console errors: {errors}"
+    finally:
+        stop_job(url, secret, job)
+        page.evaluate("window.zetaTest.poll()")
+        run_cmd(page, "view set subjects auto")
+        run_cmd(page, "view set pane none")
+
+
 def scenario_a_keyed_job_with_one_subject_keeps_its_row_distance(page, url, secret):
     select_source(page, url, secret, "tone")
     run_cmd(page, "view set home -27.50,153.00")

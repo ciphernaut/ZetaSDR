@@ -144,6 +144,9 @@ pub fn envelope(row: &ModeRow, start_ns: u64, mut fields: Value) -> Value {
         if let Some(p) = position {
             m.insert("position".into(), p);
         }
+        if let Some(a) = row.access {
+            m.insert("access".into(), a.word().into());
+        }
     }
     fields
 }
@@ -293,6 +296,22 @@ mod tests {
         let mut v: Value = serde_json::from_str(text).unwrap();
         edit(&mut v);
         super::super::parse(&v.to_string()).unwrap()
+    }
+
+    #[test]
+    fn a_restricted_row_marks_its_events() {
+        let ev = envelope(
+            &row(|v| v["access"] = "restricted".into()),
+            7,
+            json!({"icao": "7C6B28"}),
+        );
+        assert_eq!(ev["access"], "restricted");
+    }
+
+    #[test]
+    fn a_plain_row_adds_no_marker() {
+        let ev = envelope(&row(|_| {}), 7, json!({"icao": "7C6B28"}));
+        assert!(ev.get("access").is_none());
     }
 
     fn positioned() -> ModeRow {

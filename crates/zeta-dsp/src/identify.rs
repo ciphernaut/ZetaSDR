@@ -1,8 +1,9 @@
-//! Layer-2 decode-to-identify: score the mode rows against the measured band and try the
-//! best [`CLASSIFY_TRIES`] that have a quick in-process attempt (APRS, POCSAG, ACARS,
-//! RDS, or a frame row's chain) over the channel, reporting only what passes its own
-//! check: the AX.25 FCS, the POCSAG BCH code, the ACARS CRC-16, the RDS checkwords or
-//! the frame row's CRC (design 6.2, 7.2).
+//! Layer-2 decode-to-identify: score the mode rows against the measured band, consider the
+//! best [`CLASSIFY_TRIES`] (a program row among them as `skipped_quick`; a graph row with
+//! no quick attempt, `m17_decode`, left out) and run those with a quick in-process attempt
+//! (APRS, POCSAG, ACARS, RDS, AIS, or a frame row's chain) over the channel, reporting only what passes its own
+//! check: the AX.25 FCS, the POCSAG BCH code, the ACARS CRC-16, the RDS checkwords, the
+//! AIS frame's CRC-16 or the frame row's CRC (design 6.2, 7.2).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,6 +20,7 @@ use zeta_core::types::Hz;
 
 use crate::acars::decode_acars_iq;
 use crate::afsk::Afsk1200Demod;
+use crate::ais::decode_ais_iq;
 use crate::ax25::{HdlcDeframer, parse_ax25_ui};
 use crate::catalogue::catalogue_score;
 use crate::channel::extract_offset;
@@ -52,7 +54,8 @@ const DEVIATION_HZ: u64 = 3_000;
 /// Decode-to-identify over the mode rows. The band is scored with
 /// [`score_rows`] from layer 1's measurement when it is handed one (else it
 /// measures the band itself), and the best [`CLASSIFY_TRIES`] rows are
-/// considered in score order: a row whose `min_span_ms` exceeds the block is
+/// considered in score order (a graph row with no quick attempt is left out, see
+/// [`classify_candidate`]; a program row takes its slot): a row whose `min_span_ms` exceeds the block is
 /// `skipped_span`, one without a quick attempt `skipped_quick`, one wider
 /// than the box `skipped_band`, one not ready `unavailable`; the rest run
 /// their quick attempt on one channel extracted from the requested band, at
@@ -153,7 +156,7 @@ impl Classifier for DecodeToIdentify {
         let mut tried = Vec::new();
         for s in scored
             .into_iter()
-            .filter(|s| s.in_range)
+            .filter(|s| s.in_range && classify_candidate(&s.mode.row))
             .take(CLASSIFY_TRIES)
         {
             let row = &s.mode.row;
@@ -248,6 +251,14 @@ type AttemptFuture = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
 /// evidence when a frame passes its check.
 type Attempt = Arc<dyn Fn(Vec<Complex<f32>>, u64) -> AttemptFuture + Send + Sync>;
 
+/// Whether `classify` lists `row` at all: every row but a graph row with no quick
+/// attempt (`identify.quick: null`, today `m17_decode`), which has neither an
+/// in-process attempt nor a program, so only `identify` tries it. A program row stays a
+/// candidate and takes its slot as `skipped_quick`.
+fn classify_candidate(row: &ModeRow) -> bool {
+    !(matches!(row.decoder, Decoder::Graph { .. }) && row.identify.quick.is_none())
+}
+
 /// The in-crate attempt `row`'s `identify.quick` names (the names
 /// `zeta_core::modes::QUICK_ATTEMPTS` validates): `frame` runs the frame row's own chain
 /// ([`crate::frame_quick::attempt`]).
@@ -260,6 +271,7 @@ fn quick_attempt(row: &ModeRow) -> Option<Attempt> {
         "pocsag" => Some(blocking(pocsag_attempt)),
         "acars" => Some(blocking(acars_attempt)),
         "rds" => Some(blocking(rds_attempt)),
+        "ais" => Some(blocking(ais_attempt)),
         "frame" => {
             let Decoder::Frame(block) = &row.decoder else {
                 return None;
@@ -272,6 +284,17 @@ fn quick_attempt(row: &ModeRow) -> Option<Attempt> {
         }
         _ => None,
     }
+}
+
+fn ais_attempt(chan: &[Complex<f32>], rate: u64) -> Option<String> {
+    let msgs = decode_ais_iq(chan, rate);
+    let first = msgs.first()?;
+    Some(format!(
+        "{} AIS frames CRC-clean; first MMSI {} type {}",
+        msgs.len(),
+        first.mmsi,
+        first.msg_type
+    ))
 }
 
 fn rds_attempt(chan: &[Complex<f32>], rate: u64) -> Option<String> {
@@ -367,11 +390,13 @@ mod tests {
     #[tokio::test]
     async fn identifies_pocsag_in_baseband_iq() {
         let iq = pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
+        // On the row's own centre: at a frequency no row names, every row scores 0 and
+        // the 5 tried are the first by family (aviation, maritime) without POCSAG.
         let labels = d()
             .classify(
                 &iq,
                 Hz(48_000),
-                Hz(152_000_000),
+                Hz(148_637_500),
                 Band::whole(Hz(48_000)),
                 None,
             )

@@ -275,6 +275,40 @@ async fn plan_start_starts_every_channel_under_one_tune() {
 }
 
 #[tokio::test]
+async fn plan_start_ais_vhf_runs_ais_decode_on_both_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    let kind = JobKind::Mode(zeta_core::modes::ModeId("ais_decode".into()));
+    match node
+        .apply(plan_op("ais_vhf", None, kind, None, None, &[]))
+        .await
+    {
+        Ok(OpResult::PlanStart {
+            plan,
+            capture,
+            started,
+            refused,
+            ..
+        }) => {
+            assert_eq!(plan, "ais_vhf");
+            assert!(refused.is_empty(), "{refused:?}");
+            let centres: Vec<(u32, u64)> =
+                started.iter().map(|s| (s.channel, s.center_hz.0)).collect();
+            assert_eq!(centres, [(1, 161_975_000), (2, 162_025_000)]);
+            // ch1's lower edge 161_962_500 to ch2's upper edge 162_037_500.
+            assert_eq!(capture, band(162_000_000, 75_000));
+        }
+        other => panic!("expected plan_start, got {other:?}"),
+    }
+    for r in node.job_list() {
+        assert_eq!(r.kind, "ais_decode");
+        assert_eq!(r.tuning.bandwidth_hz, Hz(25_000));
+    }
+    assert_eq!(radio.tunes(), 1);
+}
+
+#[tokio::test]
 async fn a_holder_outside_the_band_is_a_conflict_and_nothing_starts() {
     let dir = tempfile::tempdir().unwrap();
     let radio = Radio::new(RADIO);
@@ -374,7 +408,11 @@ async fn channels_are_validated_before_anything_happens() {
             assert_eq!(field, "plan");
             assert_eq!(
                 known,
-                vec!["uhf_cb_au".to_string(), "acars_vhf".to_string()]
+                vec![
+                    "uhf_cb_au".to_string(),
+                    "acars_vhf".to_string(),
+                    "ais_vhf".to_string()
+                ]
             );
         }
         other => panic!("expected unknown plan, got {other:?}"),

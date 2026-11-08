@@ -791,8 +791,11 @@ async fn channel_plans_lists_uhf_cb_au() {
     };
     assert_eq!(
         plans.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-        ["uhf_cb_au", "acars_vhf"]
+        ["uhf_cb_au", "acars_vhf", "ais_vhf"]
     );
+    let ais = &plans[2];
+    assert_eq!((ais.bandwidth_hz, ais.channels.len()), (Hz(25_000), 2));
+    assert_eq!(ais.channels[1].note.as_deref(), Some("channel B, 88B"));
     let p = &plans[0];
     assert_eq!((p.id.as_str(), p.region.as_str()), ("uhf_cb_au", "au"));
     assert_eq!((p.bandwidth_hz, p.adjacent_hz), (Hz(12_500), Hz(12_500)));
@@ -3068,7 +3071,7 @@ async fn an_unknown_mode_id_names_the_known_ids() {
         .await
         .unwrap();
     let op: Op = serde_json::from_value(serde_json::json!({
-        "op": "job_start", "kind": "flex_decode", "source": "rtl0",
+        "op": "job_start", "kind": "nonesuch_decode", "source": "rtl0",
         "center_hz": 929_612_500u64, "bandwidth_hz": 25_000, "deviation_hz": null,
         "sideband": null, "elastic": false, "replace": [],
     }))
@@ -3080,7 +3083,7 @@ async fn an_unknown_mode_id_names_the_known_ids() {
             known,
         }) => {
             assert_eq!(field, "kind");
-            assert_eq!(value, "flex_decode");
+            assert_eq!(value, "nonesuch_decode");
             assert!(known.iter().any(|k| k == "fm_demod"), "{known:?}");
             assert!(known.iter().any(|k| k == "pocsag_decode"), "{known:?}");
             assert!(!known.iter().any(|k| k == "transcribe"), "{known:?}");

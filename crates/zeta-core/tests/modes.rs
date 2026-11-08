@@ -5,8 +5,8 @@ use std::path::Path;
 
 use zeta_core::graph::NodeId;
 use zeta_core::modes::{
-    Container, Decoder, Family, Identity, InputStream, ModeRegistry, ModeState, SubjectWaterfall,
-    parse, template, validate,
+    Access, Container, Decoder, Family, Identity, InputStream, ModeRegistry, ModeState,
+    SubjectWaterfall, parse, template, validate,
 };
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpError, OpResult};
@@ -21,12 +21,15 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 10] = [
+const EMBEDDED: [&str; 13] = [
     "acars_decode",
     "adsb_decode",
+    "ais_decode",
     "aprs_decode",
     "dfm_decode",
+    "flex_decode",
     "hfdl_decode",
+    "m17_decode",
     "m20_decode",
     "pocsag_decode",
     "rds_decode",
@@ -163,10 +166,11 @@ async fn modes_list_filters_by_family_and_state() {
         modes.join("junk.json").display().to_string()
     );
     let pagers = list(Some(Family::Pagers), Some(ModeState::Ready)).await;
-    assert_eq!(pagers.len(), 1);
-    assert_eq!(pagers[0].id.0, "pocsag_decode");
+    assert_eq!(pagers.len(), 2);
+    assert_eq!(pagers[0].id.0, "flex_decode");
+    assert_eq!(pagers[1].id.0, "pocsag_decode");
     // The wire form: snake-case `state`, `family` and `decoder_kind`, nullable fields `null`.
-    let v = serde_json::to_value(&pagers[0]).unwrap();
+    let v = serde_json::to_value(&pagers[1]).unwrap();
     assert_eq!(v["state"], "ready");
     assert_eq!(v["family"], "pagers");
     assert_eq!(v["decoder_kind"], "graph");
@@ -480,17 +484,71 @@ async fn modes_list_and_show_carry_the_subject() {
 }
 
 #[test]
+fn only_the_pager_rows_are_restricted() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let restricted: Vec<&str> = reg
+        .all()
+        .iter()
+        .filter(|m| m.row.access == Some(Access::Restricted))
+        .map(|m| m.row.id.0.as_str())
+        .collect();
+    assert_eq!(restricted, ["flex_decode", "pocsag_decode"]);
+}
+
+#[test]
+fn a_row_with_a_bad_access_word_is_broken() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&renamed_pocsag("Secret pagers")).unwrap();
+    v["id"] = "secret_pagers".into();
+    v["access"] = "secret".into();
+    std::fs::write(dir.path().join("secret_pagers.json"), v.to_string()).unwrap();
+    let reg = ModeRegistry::load(&stages(), Some(dir.path()));
+    let m = reg.get("secret_pagers").expect("listed");
+    assert_eq!(m.state, ModeState::Broken);
+    assert!(
+        m.reason.as_deref().unwrap().starts_with("access:"),
+        "{:?}",
+        m.reason
+    );
+}
+
+#[tokio::test]
+async fn modes_list_carries_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let Ok(OpResult::Modes { modes }) = node
+        .apply(Op::ModesList {
+            family: None,
+            state: None,
+        })
+        .await
+    else {
+        panic!("expected modes");
+    };
+    let info =
+        |id: &str| serde_json::to_value(modes.iter().find(|m| m.id.0 == id).unwrap()).unwrap();
+    assert_eq!(info("pocsag_decode")["access"], "restricted");
+    assert_eq!(info("aprs_decode")["access"], serde_json::Value::Null);
+}
+
+#[test]
 fn the_rows_thin_their_tracks_as_planned() {
     let plan = [
         ("adsb_decode", 100, 500.0),
         ("rs41_decode", 500, 100.0),
         ("dfm_decode", 500, 100.0),
         ("m20_decode", 500, 100.0),
-        ("aprs_decode", 100, 0.0),
+        ("aprs_decode", 100, 50.0),
         ("acars_decode", 100, 0.0),
         ("rds_decode", 100, 0.0),
         ("vdl2_decode", 100, 1000.0),
         ("hfdl_decode", 100, 1000.0),
+        ("ais_decode", 200, 50.0),
+        ("m17_decode", 100, 50.0),
     ];
     let reg = ModeRegistry::load(&stages(), None);
     for (id, points, min_m) in plan {
@@ -513,7 +571,7 @@ fn the_rows_name_the_planned_subjects() {
     );
     use SubjectWaterfall::{Fold, Summary};
     let sondes: &[&str] = &["alt", "vel_v"];
-    let plan: [Plan; 9] = [
+    let plan: [Plan; 11] = [
         (
             "adsb_decode",
             "icao",
@@ -556,7 +614,7 @@ fn the_rows_name_the_planned_subjects() {
             "stations",
             Summary,
             &["dst", "info"],
-            None,
+            Some("course_deg"),
             None,
         ),
         (
@@ -586,6 +644,24 @@ fn the_rows_name_the_planned_subjects() {
             &["flight", "gs", "pdu", "text"],
             None,
             Some("flight"),
+        ),
+        (
+            "ais_decode",
+            "mmsi",
+            "vessels",
+            Summary,
+            &["name", "callsign", "sog_kt", "cog_deg", "destination"],
+            Some("cog_deg"),
+            Some("name"),
+        ),
+        (
+            "m17_decode",
+            "src",
+            "stations",
+            Fold,
+            &["dst", "type", "can", "encryption"],
+            None,
+            None,
         ),
     ];
     let reg = ModeRegistry::load(&stages(), None);
@@ -763,4 +839,163 @@ fn a_bad_identity_is_broken_naming_the_field() {
         .unwrap()
         .remove("strip");
     validate(&parse(&v.to_string()).unwrap(), &stages).unwrap();
+}
+
+/// The embedded `pocsag_decode` row as an operator row `id` naming one handler program
+/// that no host has.
+fn pocsag_with_a_missing_handler(id: &str) -> serde_json::Value {
+    let mut v: serde_json::Value = serde_json::from_str(&renamed_pocsag("Voice pagers")).unwrap();
+    v["id"] = id.into();
+    v["decoder"]["handlers"] = serde_json::json!([{
+        "programs": ["zeta-no-such-handler"],
+        "install": {"debian": "nothing", "url": "https://example.invalid"}
+    }]);
+    v
+}
+
+/// A graph row may name handlers: it validates whole against zeta-dsp's stages.
+#[test]
+fn a_graph_row_with_handlers_validates() {
+    let row = parse(&pocsag_with_a_missing_handler("pocsag_voc").to_string()).unwrap();
+    validate(&row, &stages()).unwrap();
+    assert_eq!(row.decoder.handler_blocks().len(), 1);
+}
+
+/// A graph row its probe left unavailable is refused by `job_start` with its reason,
+/// as a program row is.
+#[tokio::test]
+async fn job_start_refuses_an_unavailable_graph_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut reg = ModeRegistry::load(&stages(), None);
+    let reason = "c2dec: missing (apt install codec2; u) — modes: pocsag_decode";
+    reg.set_program("pocsag_decode", None, Some(reason.into()));
+    let node = Node::open_with_modes(
+        cfg(dir.path(), &modes),
+        stages(),
+        vec![],
+        Some(std::sync::Arc::new(reg)),
+    )
+    .await
+    .unwrap();
+    let e = node
+        .apply(Op::JobStart {
+            kind: zeta_core::ops::JobKind::PocsagDecode,
+            source: zeta_core::types::SourceId("src".into()),
+            center_hz: Hz(153_350_000),
+            bandwidth_hz: Hz(12_500),
+            deviation_hz: None,
+            sideband: None,
+            elastic: false,
+            replace: vec![],
+        })
+        .await
+        .unwrap_err();
+    let OpError::Other { message } = &e else {
+        panic!("{e:?}");
+    };
+    assert!(message.contains("unavailable"), "{message}");
+    assert!(message.contains("c2dec: missing"), "{message}");
+}
+
+/// A reload carries a graph row's probed handler state over, as a program row's.
+#[tokio::test]
+async fn reload_modes_keeps_a_graph_rows_handler_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let row = pocsag_with_a_missing_handler("pocsag_voc");
+    std::fs::write(modes.join("pocsag_voc.json"), row.to_string()).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let mut probed = (*node.modes()).clone();
+    let reason = "zeta-no-such-handler: missing (u) — modes: pocsag_voc".to_string();
+    probed.set_program("pocsag_voc", None, Some(reason.clone()));
+    node.modes_handle().set(std::sync::Arc::new(probed));
+    node.reload_modes().unwrap();
+    let reg = node.modes();
+    let m = reg.get("pocsag_voc").unwrap();
+    assert_eq!(m.state, ModeState::Unavailable);
+    assert_eq!(m.reason, Some(reason));
+    assert_eq!(reg.get("pocsag_decode").unwrap().state, ModeState::Ready);
+}
+
+#[test]
+fn every_embedded_row_emits_events_today() {
+    let reg = ModeRegistry::load(&stages(), None);
+    for m in reg.all() {
+        let want: &[StreamKind] = match m.row.id.0.as_str() {
+            // M17's speech is ordinary job audio beside its events.
+            "m17_decode" => &[StreamKind::Event, StreamKind::Audio],
+            _ => &[StreamKind::Event],
+        };
+        assert_eq!(m.outputs, want, "{}", m.row.id.0);
+    }
+}
+
+/// The M17 row runs its stage in-process and Codec 2 through its one handler, `c2dec`.
+#[test]
+fn the_m17_row_names_c2dec() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let m = reg.get("m17_decode").expect("m17_decode listed");
+    assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
+    let blocks = m.row.decoder.handler_blocks();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].0, ["c2dec".to_string()]);
+    let v = serde_json::to_value(&m.row).unwrap();
+    assert_eq!(v["family"], "amateur_voice");
+    assert_eq!(v["band"]["bandwidth_hz"], 12500);
+    assert_eq!(v["label"], "M17");
+    assert_eq!(v["identify"]["quick"], serde_json::Value::Null);
+    assert_eq!(v["catalogue"], serde_json::json!(["m17-rf-protocol"]));
+}
+
+#[tokio::test]
+async fn modes_list_reports_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let Ok(OpResult::Modes { modes }) = node
+        .apply(Op::ModesList {
+            family: None,
+            state: None,
+        })
+        .await
+    else {
+        panic!("expected modes");
+    };
+    let aprs = modes.iter().find(|m| m.id.0 == "aprs_decode").unwrap();
+    let v = serde_json::to_value(aprs).unwrap();
+    assert_eq!(v["outputs"], serde_json::json!(["event"]));
+}
+
+#[test]
+fn outputs_of_a_graph_row_are_its_terminal_stages_kinds() {
+    let mut row: serde_json::Value =
+        serde_json::from_str(&renamed_pocsag("Pagers and voice")).unwrap();
+    row["id"] = "pocsag_voice".into();
+    row["decoder"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "fm", "kind": "nbfm_demod",
+            "params": {"deviation_hz": 3000, "audio_rate_hz": 48000, "squelch": false}
+        }));
+    row["decoder"]["edges"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "from": "channel", "to": "fm", "kind": "iq"
+        }));
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("pv.json"), row.to_string()).unwrap();
+    let reg = ModeRegistry::load(&stages(), Some(dir.path()));
+    let m = reg.get("pocsag_voice").unwrap();
+    assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
+    assert_eq!(m.outputs, [StreamKind::Event, StreamKind::Audio]);
 }

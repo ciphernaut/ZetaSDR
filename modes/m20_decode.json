@@ -46,7 +46,7 @@
     "priority": 0
   },
   "catalogue": ["m20-radiosonde"],
-  "test": null,
+  "test": {"kind": "synth", "family": "m20", "serial": "M20-611-2-01234", "lat": -27.3842, "lon": 153.1175, "alt_m": 5000, "vel_v": 4.5, "frames": 6, "snr_db": 20, "offset_hz": 0, "ppm": 0, "expect": {"id": "M20-611-2-01234", "lat": {"near": -27.3842, "within": 0.001}}, "within_ms": 8000},
   "notes": "Meteomodem M20 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. m20mod 1.8.1 (sonde-decoders) takes --json only: it has no --ecc or --crc (an unknown option is read as the input file, error: open).",
   "subject": {
     "key": "id",

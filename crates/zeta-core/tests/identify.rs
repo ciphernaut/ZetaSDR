@@ -341,17 +341,23 @@ async fn identify_on_pocsag_ends_with_a_verdict_and_one_running_child() {
     let dir = tempfile::tempdir().unwrap();
     let node = node_over(dir.path(), &fixtures().pocsag_on_aprs).await;
     let (id, events) = identify(&node, APRS_HZ).await;
-    let events = ended(&node, &id, events, Duration::from_secs(20)).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
     eprintln!("{events:#?}");
     let aprs = outcome(&events, "aprs_decode").expect("aprs_decode tried");
     let pocsag = outcome(&events, "pocsag_decode").expect("pocsag_decode tried");
     assert_eq!(aprs["outcome"], "no_frame", "{aprs}");
     assert_eq!(pocsag["outcome"], "proved", "{pocsag}");
-    // The attempts (those with a child job) in score order: APRS scores over POCSAG here.
+    // The attempts (those with a child job) in score order: APRS scores over POCSAG here,
+    // M17 (its empty centre list scores anywhere) ties APRS and goes after it, and AIS
+    // (an `fm` row too, family maritime) ties POCSAG and goes before it.
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
-    assert_eq!(tried.len(), 2, "{events:#?}");
+    assert_eq!(tried.len(), 4, "{events:#?}");
     assert_eq!(tried[0]["mode"], "aprs_decode");
-    assert!(tried[0]["score"].as_f64() >= tried[1]["score"].as_f64());
+    assert_eq!(tried[1]["mode"], "m17_decode");
+    assert_eq!(tried[1]["outcome"], "no_frame");
+    assert_eq!(tried[2]["mode"], "ais_decode");
+    assert_eq!(tried[2]["outcome"], "no_frame");
+    assert!(tried[0]["score"].as_f64() >= tried[3]["score"].as_f64());
     assert!(
         pocsag["evidence"]
             .as_str()
@@ -365,7 +371,7 @@ async fn identify_on_pocsag_ends_with_a_verdict_and_one_running_child() {
     assert_eq!(verdict["mode"], "pocsag_decode", "{ctx}");
     assert_eq!(verdict["label"], "POCSAG", "{ctx}");
     assert_eq!(verdict["job"], pocsag["job"], "{ctx}");
-    assert_eq!(ctx["identify"]["attempts"], 2, "{ctx}");
+    assert_eq!(ctx["identify"]["attempts"], 4, "{ctx}");
     let child = verdict["job"].as_str().unwrap().to_string();
     assert_eq!(running(&node), [(child.clone(), "pocsag_decode".into())]);
     let holders: Vec<String> = node
@@ -383,12 +389,18 @@ async fn identify_on_a_tone_ends_unknown_with_a_label() {
     let dir = tempfile::tempdir().unwrap();
     let node = node_over(dir.path(), &fixtures().tone).await;
     let (id, events) = identify(&node, APRS_HZ).await;
-    let events = ended(&node, &id, events, Duration::from_secs(40)).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
     eprintln!("{events:#?}");
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
     let modes: Vec<&str> = tried.iter().map(|e| e["mode"].as_str().unwrap()).collect();
-    assert_eq!(modes.len(), 3, "{events:#?}");
-    for m in ["aprs_decode", "pocsag_decode", "acars_decode"] {
+    assert_eq!(modes.len(), 5, "{events:#?}");
+    for m in [
+        "aprs_decode",
+        "m17_decode",
+        "pocsag_decode",
+        "acars_decode",
+        "ais_decode",
+    ] {
         assert!(modes.contains(&m), "{m} not tried: {events:#?}");
     }
     for e in &tried {
@@ -400,7 +412,7 @@ async fn identify_on_a_tone_ends_unknown_with_a_label() {
     let label = verdict["label"].as_str().unwrap();
     assert!(label == "carrier" || label == "fm", "{ctx}");
     assert!(verdict["features"]["bandwidth_hz"].is_u64(), "{ctx}");
-    assert_eq!(ctx["identify"]["attempts"], 3, "{ctx}");
+    assert_eq!(ctx["identify"]["attempts"], 5, "{ctx}");
     assert!(running(&node).is_empty(), "{:?}", running(&node));
     assert!(node.lease_holders(&rx()).is_empty());
 }
@@ -774,7 +786,7 @@ async fn the_verdict_carries_the_nearest_allocations_and_the_score_term() {
         .unwrap()
         .id;
     let mut tap = node.bus().subscribe(&stream).unwrap();
-    let events = ended(&node, &id, events, Duration::from_secs(40)).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
     // The verdict event words the register's transmitter as the watch's unknown does.
     let mut last = None;
     while let Ok(f) = tap.try_recv() {
@@ -827,7 +839,7 @@ async fn an_identify_run_publishes_one_origin_event_and_its_verdict_carries_orig
     let node = node_over(dir.path(), &fixtures().gfsk).await;
     node.add_knowledge(Arc::new(Register));
     let (id, events) = identify(&node, APRS_HZ).await;
-    until("identify ends", Duration::from_secs(40), || {
+    until("identify ends", Duration::from_secs(60), || {
         state(&node, &id) != JobState::Running
     })
     .await;
@@ -1005,7 +1017,7 @@ async fn identify_reports_a_learned_signal_in_its_unknown_verdict() {
         .unwrap()
         .id;
     let mut tap = node.bus().subscribe(&stream).unwrap();
-    ended(&node, &id, events, Duration::from_secs(40)).await;
+    ended(&node, &id, events, Duration::from_secs(60)).await;
     let ctx = node.job_context(&id).unwrap();
     let verdict = &ctx["identify"]["verdict"];
     assert!(verdict["mode"].is_null(), "{ctx}");

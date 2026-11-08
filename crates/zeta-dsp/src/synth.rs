@@ -1,5 +1,5 @@
 //! Signal generators: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 / APRS, POCSAG, RDS, Mode S,
-//! ACARS, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
+//! ACARS, AIS, FLEX, M17, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
 //! `zeta modes check` runs the rows' tests on them. The test-only helpers stay in
 //! `fixtures`, behind feature `test-fixtures`.
 
@@ -336,22 +336,6 @@ pub fn awgn(x: &mut [Complex<f32>], snr_db: f32, seed: u64) {
     }
 }
 
-/// POCSAG codeword for 21 data bits (bit 20 the message flag): the bits, the
-/// 10 BCH(31,21) check bits (remainder modulo `x^10+x^9+x^8+x^6+x^5+x^3+1`),
-/// then an even-parity bit. Computed here rather than with the decoder's
-/// [`bch_ok`](crate::pocsag::bch_ok) so the two check each other.
-fn pocsag_codeword(data21: u32) -> u32 {
-    const POLY: u32 = 0x769;
-    let mut r = (data21 & 0x1F_FFFF) << 10;
-    for i in (10..31).rev() {
-        if r & (1 << i) != 0 {
-            r ^= POLY << (i - 10);
-        }
-    }
-    let w = ((data21 & 0x1F_FFFF) << 11) | (r << 1);
-    w | (w.count_ones() & 1)
-}
-
 /// Message codewords' 20-bit payloads for `text`: numeric (function 0) as
 /// bit-reversed BCD nibbles of `0123456789*U -)(`, padded with spaces; alpha
 /// otherwise, as 7-bit ASCII LSB first, then EOT and zero fill. Panics on a
@@ -396,14 +380,14 @@ pub fn pocsag_encode(messages: &[(u32, u8, &str)], baud: u32) -> Vec<u8> {
         while (words.len() % 16) / 2 != (address & 7) as usize {
             words.push(IDLE);
         }
-        words.push(pocsag_codeword(
+        words.push(crate::bch::bch3121_word(
             (((address >> 3) & 0x3FFFF) << 2) | function as u32,
         ));
         if !(text.is_empty() && (function == 1 || function == 2)) {
             words.extend(
                 pocsag_payload(function, text)
                     .into_iter()
-                    .map(|d| pocsag_codeword((1 << 20) | d)),
+                    .map(|d| crate::bch::bch3121_word((1 << 20) | d)),
             );
         }
     }
@@ -910,6 +894,81 @@ fn repeat_bursts(
     out
 }
 
+/// AIS's line, as the receiver ([`crate::ais`]) reads it.
+pub use crate::ais::{AIS_BAUD, AIS_DEVIATION_HZ};
+/// The training sequence before each frame's start flag, `0101...`.
+pub const AIS_TRAINING_BITS: usize = 24;
+/// MMSIs are nine digits.
+const AIS_MMSI: std::ops::RangeInclusive<u32> = 100_000_000..=999_999_999;
+/// The family's speed is under this (102.2 kt is "102.2 or more", 102.3 not available).
+const AIS_SOG_MAX_KT: f64 = 102.2;
+/// A vessel name's most characters.
+const AIS_NAME_MAX: usize = 20;
+/// Most repeats of the `ais` family.
+const AIS_REPEAT_MAX: u32 = 60;
+
+/// One AIS frame's line levels: the training, then the HDLC frame (flags and stuffing
+/// from [`hdlc_frame_bits`]) of the payload's bytes least significant bit first with the
+/// CRC-16/X.25 appended little-endian, as [`ax25_ui_frame`] appends it; NRZI-encoded.
+fn ais_frame_levels(payload: &[u8]) -> Vec<u8> {
+    let mut frame = crate::ais_msg::payload_to_hdlc_bytes(payload);
+    let fcs = crate::crc16_x25(&frame);
+    frame.extend_from_slice(&fcs.to_le_bytes());
+    let mut bits: Vec<u8> = (0..AIS_TRAINING_BITS).map(|i| (i % 2) as u8).collect();
+    bits.extend(hdlc_frame_bits(&frame, 1, 1));
+    nrzi_encode(&bits)
+}
+
+/// The `ais` family's capture at `rate_hz`: half a second of silence, then per repeat
+/// the type 1 frame and (with a name) the type 5 frame, every frame GMSK at
+/// [`AIS_BAUD`] and [`AIS_DEVIATION_HZ`], `gap_ms` after the last; half a second of
+/// silence after.
+fn ais_iq(spec: &SynthSpec, rate_hz: u32) -> Vec<Complex<f32>> {
+    let SynthSpec::Ais {
+        mmsi,
+        lat,
+        lon,
+        sog_kt,
+        cog_deg,
+        name,
+        repeat,
+        gap_ms,
+    } = spec
+    else {
+        return Vec::new();
+    };
+    use crate::ais_msg::{position_report_bits, static_report_bits};
+    let mut payloads = vec![position_report_bits(*mmsi, *lat, *lon, *sog_kt, *cog_deg)];
+    if let Some(n) = name {
+        payloads.push(static_report_bits(*mmsi, n));
+    }
+    let frames: Vec<Vec<Complex<f32>>> = payloads
+        .iter()
+        .map(|p| {
+            gfsk_modulate(
+                &ais_frame_levels(p),
+                2,
+                AIS_BAUD,
+                AIS_DEVIATION_HZ as f64,
+                rate_hz,
+            )
+        })
+        .collect();
+    let silence = rate_hz as usize / 2;
+    let gap = (u64::from(rate_hz) * gap_ms / 1000) as usize;
+    let mut out = vec![Complex::new(0.0, 0.0); silence];
+    for r in 0..*repeat {
+        for (i, f) in frames.iter().enumerate() {
+            if r > 0 || i > 0 {
+                out.resize(out.len() + gap, Complex::new(0.0, 0.0));
+            }
+            out.extend_from_slice(f);
+        }
+    }
+    out.resize(out.len() + silence, Complex::new(0.0, 0.0));
+    out
+}
+
 /// The RS41's line: 4800 baud GFSK at 2400 Hz deviation.
 const RS41_BAUD: u32 = 4800;
 const RS41_DEVIATION_HZ: f64 = 2400.0;
@@ -946,6 +1005,218 @@ fn rs41_iq(
         );
     }
     out
+}
+
+/// The bounds a radiosonde family's position and climb share.
+fn sonde_position(lat: f64, lon: f64, alt_m: f64, vel_v: f64) -> Result<(), String> {
+    if !(lat.is_finite() && (-90.0..=90.0).contains(&lat)) {
+        return Err("lat: -90..=90".into());
+    }
+    if !(lon.is_finite() && (-180.0..=180.0).contains(&lon)) {
+        return Err("lon: -180..=180".into());
+    }
+    if !(alt_m.is_finite() && (-1000.0..=60_000.0).contains(&alt_m)) {
+        return Err("alt_m: -1000..=60000".into());
+    }
+    if !(vel_v.is_finite() && (-100.0..=100.0).contains(&vel_v)) {
+        return Err("vel_v: -100..=100".into());
+    }
+    Ok(())
+}
+
+/// Most frames the `dfm` family sends (13.4 s at 224 ms a frame).
+const DFM_FRAMES_MAX: u32 = 60;
+
+/// `frames` DFM frames (numbered from 0) back to back, as the sonde sends them: no gap,
+/// no preamble.
+fn dfm_iq(
+    serial: &str,
+    lat: f64,
+    lon: f64,
+    alt_m: f64,
+    vel_v: f64,
+    frames: u32,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    use crate::dfm_frame::{BAUD, DEVIATION_HZ, DfmParams, dfm_frame_bits};
+    let mut chips = Vec::new();
+    for frame in 0..frames {
+        chips.extend(dfm_frame_bits(&DfmParams {
+            serial: serial.into(),
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frame,
+        }));
+    }
+    gfsk_modulate(&chips, 2, BAUD, DEVIATION_HZ, rate_hz)
+}
+
+/// Most frames the `m20` family sends (one a second).
+const M20_FRAMES_MAX: u32 = 60;
+
+/// `frames` M20 frames (numbered from 0), one a second: each second the line idles on
+/// alternating half-symbols, then sends the header and the frame.
+fn m20_iq(
+    serial: &str,
+    lat: f64,
+    lon: f64,
+    alt_m: f64,
+    vel_v: f64,
+    frames: u32,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    use crate::m20_frame::{BAUD, DEVIATION_HZ, FRAME_CHIPS, M20Params, m20_frame_bits};
+    let second = BAUD as usize;
+    let mut chips = Vec::with_capacity(second * frames as usize);
+    for frame in 0..frames {
+        chips.extend((0..second - FRAME_CHIPS).map(|k| (k & 1) as u8));
+        chips.extend(m20_frame_bits(&M20Params {
+            serial: serial.into(),
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frame,
+        }));
+    }
+    gfsk_modulate(&chips, 2, BAUD, DEVIATION_HZ, rate_hz)
+}
+
+/// The FLEX family's FSK deviation, Hz: the tones sit this far either side of the carrier.
+pub const FLEX_DEVIATION_HZ: f64 = 4800.0;
+/// The only line rate the `flex` family synthesises, bit/s.
+const FLEX_BAUD: u32 = crate::flex_frame::BAUD;
+/// Most frames the `flex` family sends.
+const FLEX_REPEAT_MAX: u32 = 10;
+
+/// `repeat` FLEX frames back to back (frames 0.. of cycle 0), each carrying the page
+/// for `capcode` with `text` ([`crate::flex_frame`]): NRZ 2-FSK at 1600 baud, a 1 at
+/// `+FLEX_DEVIATION_HZ`, over NBFM at `rate_hz`.
+fn flex_iq(capcode: u32, text: &str, repeat: u32, rate_hz: u32) -> Vec<Complex<f32>> {
+    use crate::flex_frame::{FRAMES_PER_CYCLE, FlexParams, flex_frame_bits};
+    let mut bits = Vec::new();
+    for n in 0..repeat {
+        bits.extend(flex_frame_bits(&FlexParams {
+            capcode,
+            text: text.into(),
+            cycle: 0,
+            frame: (n % u32::from(FRAMES_PER_CYCLE)) as u8,
+        }));
+    }
+    let spb = (rate_hz / FLEX_BAUD) as usize;
+    let audio: Vec<f32> = bits
+        .iter()
+        .flat_map(|&b| std::iter::repeat_n(if b != 0 { 1.0 } else { -1.0 }, spb))
+        .collect();
+    nbfm_modulate(&audio, rate_hz, rate_hz, FLEX_DEVIATION_HZ, 0.0)
+}
+
+/// M17's symbol rate, baud (the M17 specification: 4FSK at 4800 symbols/s).
+pub const M17_BAUD: u32 = 4800;
+/// M17's outer deviation, Hz: the +3 and -3 symbols sit at ±2.4 kHz.
+pub const M17_DEVIATION_HZ: f64 = 2400.0;
+/// M17's root-raised-cosine roll-off.
+pub const M17_RRC_ALPHA: f64 = 0.5;
+/// Symbols the root-raised-cosine pulse spans (the specification's minimum).
+pub(crate) const RRC_SPAN_SYMBOLS: f64 = 8.0;
+/// Stream frames the `m17` family sends at most (10 s).
+const M17_FRAMES_MAX: u32 = 250;
+
+/// The root-raised-cosine impulse response at `t` symbol periods from its centre, for
+/// roll-off `alpha` (unnormalised; the removable points taken at their limits).
+pub(crate) fn rrc(t: f64, alpha: f64) -> f64 {
+    if t.abs() < 1e-9 {
+        return 1.0 - alpha + 4.0 * alpha / PI;
+    }
+    let quarter = 1.0 / (4.0 * alpha);
+    if (t.abs() - quarter).abs() < 1e-9 {
+        let a = PI / (4.0 * alpha);
+        return alpha / 2f64.sqrt() * ((1.0 + 2.0 / PI) * a.sin() + (1.0 - 2.0 / PI) * a.cos());
+    }
+    ((PI * t * (1.0 - alpha)).sin() + 4.0 * alpha * t * (PI * t * (1.0 + alpha)).cos())
+        / (PI * t * (1.0 - (4.0 * alpha * t).powi(2)))
+}
+
+/// 4FSK of `symbols` (each `0..=3` for -3, -1, +1, +3) at `symbol_rate_baud`, sampled at
+/// `rate_hz`: impulses at the symbol centres through a root-raised-cosine filter
+/// (roll-off `alpha`, spanning 8 symbols, unit DC gain), frequency modulated so a run of
+/// one symbol sits at its level times `deviation_hz / 3` (the outer symbols at
+/// ±`deviation_hz`). M17's modulator: the receiver's matched filter completes the
+/// raised cosine. `symbols.len() * rate_hz / symbol_rate_baud` samples.
+pub fn rrc_modulate_4fsk(
+    symbols: &[u8],
+    symbol_rate_baud: u32,
+    deviation_hz: f64,
+    rate_hz: u32,
+    alpha: f64,
+) -> Vec<Complex<f32>> {
+    if symbols.is_empty() {
+        return Vec::new();
+    }
+    let sps = f64::from(rate_hz) / f64::from(symbol_rate_baud);
+    let half = RRC_SPAN_SYMBOLS / 2.0;
+    let reach = (half * sps).floor() as isize;
+    // Unit DC gain: the pulse's area in symbol periods (its taps at whole-sample
+    // offsets, per sample period).
+    let gain: f64 = (-reach..=reach)
+        .map(|j| rrc(j as f64 / sps, alpha))
+        .sum::<f64>()
+        / sps;
+    let level = |s: u8| f64::from(s.min(3)) * 2.0 - 3.0;
+    let n = (symbols.len() as f64 * sps) as usize;
+    let last = symbols.len() - 1;
+    let mut phase = 0.0f64;
+    (0..n)
+        .map(|i| {
+            // Time in symbol periods; symbol k's centre is at k + 0.5.
+            let t = i as f64 / sps;
+            let lo = (t - 0.5 - half).ceil().max(0.0) as usize;
+            let hi = ((t - 0.5 + half).floor().max(0.0) as usize).min(last);
+            let shaped: f64 = (lo..=hi)
+                .map(|k| level(symbols[k]) * rrc(t - k as f64 - 0.5, alpha))
+                .sum::<f64>()
+                / gain;
+            phase += 2.0 * PI * shaped * deviation_hz / 3.0 / f64::from(rate_hz);
+            let (sn, cs) = phase.sin_cos();
+            Complex::new(cs as f32, sn as f32)
+        })
+        .collect()
+}
+
+/// An M17 voice stream ([`crate::m17`]): the preamble, the LSF (`dst`, `src`, TYPE voice
+/// at 3200 bps with `can`, META zero), `frames` stream frames with a zero payload (the
+/// last with the end-of-transmission bit), then the EOT marker; 4FSK at 4800 baud,
+/// ±2400 Hz, root-raised-cosine (alpha 0.5).
+fn m17_iq(src: &str, dst: &str, can: u8, frames: u32, rate_hz: u32) -> Vec<Complex<f32>> {
+    use crate::m17::{
+        DATA_TYPE_VOICE, ENCRYPTION_NONE, Lsf, META_BYTES, STREAM_PAYLOAD_BYTES, eot_symbols,
+        lsf_frame_symbols, preamble_symbols, stream_frame_symbols,
+    };
+    let lsf = Lsf {
+        dst: dst.into(),
+        src: src.into(),
+        stream: true,
+        data_type: DATA_TYPE_VOICE,
+        encryption: ENCRYPTION_NONE,
+        encryption_subtype: 0,
+        can,
+        meta: [0; META_BYTES],
+    };
+    let mut symbols = preamble_symbols();
+    symbols.extend(lsf_frame_symbols(&lsf));
+    let payload = [0u8; STREAM_PAYLOAD_BYTES];
+    for n in 0..frames {
+        symbols.extend(stream_frame_symbols(
+            &lsf,
+            n as u16,
+            &payload,
+            n + 1 == frames,
+        ));
+    }
+    symbols.extend(eot_symbols());
+    rrc_modulate_4fsk(&symbols, M17_BAUD, M17_DEVIATION_HZ, rate_hz, M17_RRC_ALPHA)
 }
 
 /// Bounds on the generic families' numbers, so a bad row is an error, not an abort or
@@ -1162,6 +1433,62 @@ pub enum SynthSpec {
         vel_v: f64,
         frames: u32,
     },
+    /// `frames` Graw DFM frames back to back ([`crate::dfm_frame`]): 2-FSK at 2500 baud
+    /// (Manchester coded) and 4 kHz deviation carrying `serial` (`DFM-` and the number),
+    /// the position and the climb.
+    Dfm {
+        serial: String,
+        lat: f64,
+        lon: f64,
+        alt_m: f64,
+        vel_v: f64,
+        frames: u32,
+    },
+    /// `frames` Meteomodem M20 frames one second apart ([`crate::m20_frame`]): 2-FSK at
+    /// 9600 baud (Manchester coded) carrying `serial` (`M20-YMM-S-NNNNN`, as `m20mod`
+    /// prints the id), the position and the climb; the line idles between frames.
+    M20 {
+        serial: String,
+        lat: f64,
+        lon: f64,
+        alt_m: f64,
+        vel_v: f64,
+        frames: u32,
+    },
+    /// `repeat` FLEX frames back to back ([`crate::flex_frame`]), each paging the short
+    /// address `capcode` with the alphanumeric `text`: 2-FSK at `baud` (1600 only in this
+    /// wave) and 4800 Hz deviation over NBFM.
+    Flex {
+        capcode: u32,
+        text: String,
+        baud: u32,
+        repeat: u32,
+    },
+    /// An M17 voice stream ([`crate::m17`]): the LSF from `src` to `dst` (callsigns of at
+    /// most nine base-40 characters; `ALL` is broadcast) with channel access number
+    /// `can`, then `frames` stream frames (1..=250, 40 ms each) of a zero Codec 2
+    /// payload; 4FSK at 4800 baud, ±2400 Hz.
+    M17 {
+        src: String,
+        dst: String,
+        can: u8,
+        frames: u32,
+    },
+    /// AIS: per repeat a type 1 position report (`mmsi`, the position, `sog_kt`,
+    /// `cog_deg`; [`crate::ais_msg::position_report_bits`]) and, with `name`, a type 5
+    /// static report, GMSK at 9600 baud, frames `gap_ms` apart (50 by default).
+    Ais {
+        mmsi: u32,
+        lat: f64,
+        lon: f64,
+        sog_kt: f64,
+        cog_deg: f64,
+        #[serde(default)]
+        name: Option<String>,
+        repeat: u32,
+        #[serde(default = "default_gap_ms")]
+        gap_ms: u64,
+    },
 }
 
 /// Impairments applied to a synthesised signal; each defaults to none.
@@ -1350,17 +1677,133 @@ impl SynthSpec {
                 {
                     return Err("serial: 8 characters of A-Z and 0-9".into());
                 }
+                sonde_position(*lat, *lon, *alt_m, *vel_v)?;
+            }
+            SynthSpec::Dfm {
+                serial,
+                lat,
+                lon,
+                alt_m,
+                vel_v,
+                frames,
+            } => {
+                if !(1..=DFM_FRAMES_MAX).contains(frames) {
+                    return Err(format!("frames: 1..={DFM_FRAMES_MAX}"));
+                }
+                let digits = serial.strip_prefix("DFM-").unwrap_or("");
+                if digits.is_empty()
+                    || !digits.bytes().all(|c| c.is_ascii_digit())
+                    || digits.parse::<u32>().is_err()
+                {
+                    return Err("serial: DFM- and a decimal number under 2^32".into());
+                }
+                sonde_position(*lat, *lon, *alt_m, *vel_v)?;
+            }
+            SynthSpec::M20 {
+                serial,
+                lat,
+                lon,
+                alt_m,
+                vel_v,
+                frames,
+            } => {
+                if !(1..=M20_FRAMES_MAX).contains(frames) {
+                    return Err(format!("frames: 1..={M20_FRAMES_MAX}"));
+                }
+                if crate::m20_frame::serial_parts(serial).is_none() {
+                    return Err(
+                        "serial: M20-YMM-S-NNNNN (Y 0-9, MM 01-12, S 1-8, NNNNN 0-8191)".into(),
+                    );
+                }
+                sonde_position(*lat, *lon, *alt_m, *vel_v)?;
+            }
+            SynthSpec::Ais {
+                mmsi,
+                lat,
+                lon,
+                sog_kt,
+                cog_deg,
+                name,
+                repeat,
+                gap_ms,
+            } => {
+                if !AIS_MMSI.contains(mmsi) {
+                    return Err("mmsi: nine digits".into());
+                }
                 if !(lat.is_finite() && (-90.0..=90.0).contains(lat)) {
                     return Err("lat: -90..=90".into());
                 }
                 if !(lon.is_finite() && (-180.0..=180.0).contains(lon)) {
                     return Err("lon: -180..=180".into());
                 }
-                if !(alt_m.is_finite() && (-1000.0..=60_000.0).contains(alt_m)) {
-                    return Err("alt_m: -1000..=60000".into());
+                if !(sog_kt.is_finite() && (0.0..AIS_SOG_MAX_KT).contains(sog_kt)) {
+                    return Err(format!("sog_kt: 0 to under {AIS_SOG_MAX_KT}"));
                 }
-                if !(vel_v.is_finite() && (-100.0..=100.0).contains(vel_v)) {
-                    return Err("vel_v: -100..=100".into());
+                if !(cog_deg.is_finite() && (0.0..360.0).contains(cog_deg)) {
+                    return Err("cog_deg: 0 to under 360".into());
+                }
+                if let Some(n) = name
+                    && (n.chars().count() > AIS_NAME_MAX
+                        || !n.chars().all(crate::ais_msg::is_six_bit_text))
+                {
+                    return Err(format!(
+                        "name: at most {AIS_NAME_MAX} characters of the AIS set (A-Z, 0-9, space, !\"#$%&'()*+,-./:;<=>?)"
+                    ));
+                }
+                if !(1..=AIS_REPEAT_MAX).contains(repeat) {
+                    return Err(format!("repeat: 1..={AIS_REPEAT_MAX}"));
+                }
+                if *gap_ms > BURST_GAP_MAX_MS {
+                    return Err(format!("gap_ms: 0..={BURST_GAP_MAX_MS}"));
+                }
+            }
+            SynthSpec::Flex {
+                capcode,
+                text,
+                baud,
+                repeat,
+            } => {
+                use crate::flex_frame::{CAPCODE_MAX, CAPCODE_MIN, TEXT_MAX};
+                if *baud != FLEX_BAUD {
+                    return Err(format!("baud: this wave synthesises {FLEX_BAUD} bps"));
+                }
+                if !(CAPCODE_MIN..=CAPCODE_MAX).contains(capcode) {
+                    return Err(format!(
+                        "capcode: {CAPCODE_MIN}..={CAPCODE_MAX} (a short address)"
+                    ));
+                }
+                if text.len() > TEXT_MAX || !text.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+                {
+                    return Err(format!(
+                        "text: at most {TEXT_MAX} characters of printable ASCII"
+                    ));
+                }
+                if !(1..=FLEX_REPEAT_MAX).contains(repeat) {
+                    return Err(format!("repeat: 1..={FLEX_REPEAT_MAX}"));
+                }
+            }
+            SynthSpec::M17 {
+                src,
+                dst,
+                can,
+                frames,
+            } => {
+                use crate::m17::{CAN_MAX, encode_callsign};
+                if src == "ALL" {
+                    return Err("src: ALL is the broadcast address, a destination only".into());
+                }
+                for (key, call) in [("src", src), ("dst", dst)] {
+                    if encode_callsign(call).is_none() {
+                        return Err(format!(
+                            "{key}: at most nine characters of A-Z, 0-9, space, -, / and ."
+                        ));
+                    }
+                }
+                if *can > CAN_MAX {
+                    return Err(format!("can: 0..={CAN_MAX}"));
+                }
+                if !(1..=M17_FRAMES_MAX).contains(frames) {
+                    return Err(format!("frames: 1..={M17_FRAMES_MAX}"));
                 }
             }
             SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
@@ -1369,14 +1812,20 @@ impl SynthSpec {
     }
 
     /// The sample rate the family's capture is synthesised at: the one each decoder is
-    /// proven at (APRS, POCSAG and ACARS at 48 kHz, which the `channel` stage divides
+    /// proven at (APRS, POCSAG, ACARS, AIS, FLEX and M17 at 48 kHz, which the `channel` stage divides
     /// down; RDS at 240 kHz; Mode S at 2.4 MHz; a bare NBFM tone at 48 kHz).
     pub fn rate_hz(&self) -> u32 {
         match self {
             SynthSpec::Aprs { .. } | SynthSpec::Pocsag { .. } | SynthSpec::Acars { .. } => 48_000,
             SynthSpec::Rds { .. } => 240_000,
             SynthSpec::ModesIdent { .. } => 2_400_000,
-            SynthSpec::NbfmTone { .. } | SynthSpec::Rs41 { .. } => 48_000,
+            SynthSpec::NbfmTone { .. }
+            | SynthSpec::Rs41 { .. }
+            | SynthSpec::Dfm { .. }
+            | SynthSpec::M20 { .. }
+            | SynthSpec::Flex { .. }
+            | SynthSpec::Ais { .. }
+            | SynthSpec::M17 { .. } => 48_000,
             SynthSpec::Fsk {
                 symbol_rate_baud, ..
             }
@@ -1529,6 +1978,55 @@ pub fn synthesise(
             frames,
         } => {
             let mut iq = rs41_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Dfm {
+            serial,
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frames,
+        } => {
+            let mut iq = dfm_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::M20 {
+            serial,
+            lat,
+            lon,
+            alt_m,
+            vel_v,
+            frames,
+        } => {
+            let mut iq = m20_iq(serial, *lat, *lon, *alt_m, *vel_v, *frames, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Flex {
+            capcode,
+            text,
+            repeat,
+            ..
+        } => {
+            let mut iq = flex_iq(*capcode, text, *repeat, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Ais { .. } => {
+            let mut iq = ais_iq(spec, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::M17 {
+            src,
+            dst,
+            can,
+            frames,
+        } => {
+            let mut iq = m17_iq(src, dst, *can, *frames, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -1778,6 +2276,77 @@ mod tests {
         assert_eq!(iq.len(), 96_000);
         assert!(iq[28_000].norm() > 0.99 && iq[30_000].norm() == 0.0);
         assert!(iq[48_000].norm() > 0.99);
+    }
+
+    #[test]
+    fn m20_family_is_bounded_and_one_frame_a_second() {
+        let parse = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"family": "m20", "serial": "M20-611-2-01234",
+                "lat": -27.3842, "lon": 153.1175, "alt_m": 5000, "vel_v": 4.5, "frames": 3});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse_params(v.as_object().unwrap().clone()).map(|(s, _)| s)
+        };
+        let serial_err = "serial: M20-YMM-S-NNNNN (Y 0-9, MM 01-12, S 1-8, NNNNN 0-8191)";
+        let cases = [
+            (serde_json::json!({"frames": 0}), "frames: 1..=60"),
+            (serde_json::json!({"frames": 61}), "frames: 1..=60"),
+            (serde_json::json!({"serial": "M20-611201234"}), serial_err),
+            (serde_json::json!({"serial": "M20-611-2-09999"}), serial_err),
+            (serde_json::json!({"lat": 91.0}), "lat: -90..=90"),
+            (serde_json::json!({"lon": -181.0}), "lon: -180..=180"),
+            (serde_json::json!({"alt_m": 70000}), "alt_m: -1000..=60000"),
+            (serde_json::json!({"vel_v": 500.0}), "vel_v: -100..=100"),
+        ];
+        for (extra, err) in cases {
+            assert_eq!(parse(extra.clone()), Err(err.into()), "{extra}");
+        }
+        let spec = parse(serde_json::json!({})).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 403_000_000);
+        // One frame a second: each second is 9600 half-symbols at 5 samples each, the
+        // line idling between frames, so the carrier never stops.
+        assert_eq!(iq.len(), 3 * 48_000);
+        assert!(iq.iter().all(|s| (s.norm() - 1.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn dfm_family_is_bounded_and_at_the_line_rate() {
+        let parse = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"family": "dfm", "serial": "DFM-19123456",
+                "lat": -27.3842, "lon": 153.1175, "alt_m": 5000, "vel_v": 4.5, "frames": 3});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse_params(v.as_object().unwrap().clone()).map(|(s, _)| s)
+        };
+        let cases = [
+            (serde_json::json!({"frames": 0}), "frames: 1..=60"),
+            (serde_json::json!({"frames": 61}), "frames: 1..=60"),
+            (
+                serde_json::json!({"serial": "19123456"}),
+                "serial: DFM- and a decimal number under 2^32",
+            ),
+            (
+                serde_json::json!({"serial": "DFM-99999999999"}),
+                "serial: DFM- and a decimal number under 2^32",
+            ),
+            (serde_json::json!({"lat": 91.0}), "lat: -90..=90"),
+            (serde_json::json!({"lon": -181.0}), "lon: -180..=180"),
+            (serde_json::json!({"alt_m": 70000}), "alt_m: -1000..=60000"),
+            (serde_json::json!({"vel_v": 500.0}), "vel_v: -100..=100"),
+        ];
+        for (extra, err) in cases {
+            assert_eq!(parse(extra.clone()), Err(err.into()), "{extra}");
+        }
+        let spec = parse(serde_json::json!({})).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        let iq = synthesise(&spec, &Impairments::default(), 48_000, 403_000_000);
+        // Three frames back to back, 224 ms each (560 half-symbols at 2500 baud), with no
+        // gap: 3 x 10 752 samples at 48 kHz.
+        assert_eq!(iq.len(), 3 * 10_752);
+        assert!(iq.iter().all(|s| (s.norm() - 1.0).abs() < 1e-3));
     }
 
     #[test]
@@ -2034,5 +2603,286 @@ mod tests {
         let mut v = framing_json();
         v["deviation_hz"] = 0.0.into();
         assert!(parse_params(v.as_object().unwrap().clone()).is_err());
+    }
+
+    fn ais_json() -> serde_json::Value {
+        serde_json::json!({
+            "family": "ais", "mmsi": 503000001, "lat": -27.3842, "lon": 153.1175,
+            "sog_kt": 12.3, "cog_deg": 45.0, "name": "ZETA TEST", "repeat": 3
+        })
+    }
+
+    #[test]
+    fn ais_family_validates_and_is_48_khz() {
+        let parse = |v: serde_json::Value| parse_params(v.as_object().unwrap().clone());
+        let (spec, _) = parse(ais_json()).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        let bad = |key: &str, val: serde_json::Value| {
+            let mut v = ais_json();
+            v[key] = val;
+            parse(v).unwrap_err()
+        };
+        assert!(bad("mmsi", 1.into()).contains("mmsi"));
+        assert!(bad("sog_kt", 150.0.into()).contains("sog_kt"));
+        assert!(bad("name", "x".repeat(21).into()).contains("name"));
+        assert!(bad("name", "zeta".into()).contains("name"));
+        assert!(bad("lat", 91.0.into()).contains("lat"));
+        assert!(bad("lon", (-181.0).into()).contains("lon"));
+        assert!(bad("cog_deg", 360.0.into()).contains("cog_deg"));
+        assert!(bad("repeat", 0.into()).contains("repeat"));
+        let mut v = ais_json();
+        v.as_object_mut().unwrap().remove("name");
+        assert!(parse(v).is_ok());
+    }
+
+    #[test]
+    fn ais_frames_deframe_to_their_parameters() {
+        // The bit-order self-check: the chain `ais_decode` runs.
+        let (spec, imp) = parse_params(ais_json().as_object().unwrap().clone()).unwrap();
+        let iq = synthesise(&spec, &imp, 48_000, 161_975_000);
+        let mut prev = Complex::new(0.0, 0.0);
+        let audio = crate::nbfm::nbfm_demod(&iq, 48_000, 2400, &mut prev);
+        let line = crate::pocsag::BitSync::new(48_000, 9600).feed(&audio);
+        let mut last = 0u8;
+        let bits: Vec<u8> = line
+            .iter()
+            .map(|&b| {
+                let d = u8::from(b == last);
+                last = b;
+                d
+            })
+            .collect();
+        let frames = crate::ax25::HdlcDeframer::new().feed(&bits);
+        assert!(!frames.is_empty(), "no frame deframed");
+        let msgs: Vec<_> = frames
+            .iter()
+            .filter_map(|f| crate::ais_msg::decode(&crate::ais_msg::hdlc_bytes_to_payload(f)))
+            .collect();
+        let pos = msgs.iter().find(|m| m.msg_type == 1).expect("a type 1");
+        assert_eq!(pos.mmsi, 503_000_001);
+        assert!((pos.lat.unwrap() - -27.3842).abs() < 1e-4, "{:?}", pos.lat);
+        assert!((pos.lon.unwrap() - 153.1175).abs() < 1e-4, "{:?}", pos.lon);
+        assert_eq!(
+            msgs.iter().filter(|m| m.msg_type == 1).count(),
+            3,
+            "{msgs:?}"
+        );
+        let st = msgs.iter().find(|m| m.msg_type == 5).expect("a type 5");
+        assert_eq!(st.name.as_deref(), Some("ZETA TEST"));
+    }
+
+    fn flex_json() -> serde_json::Value {
+        serde_json::json!({
+            "family": "flex", "capcode": 1234567, "text": "HELLO ZETA", "baud": 1600, "repeat": 2
+        })
+    }
+
+    #[test]
+    fn flex_family_refuses_other_rates() {
+        let parse = |v: serde_json::Value| parse_params(v.as_object().unwrap().clone());
+        let bad = |key: &str, val: serde_json::Value| {
+            let mut v = flex_json();
+            v[key] = val;
+            parse(v).unwrap_err()
+        };
+        for baud in [3200, 6400, 1200] {
+            assert_eq!(
+                bad("baud", baud.into()),
+                "baud: this wave synthesises 1600 bps"
+            );
+        }
+        assert_eq!(
+            bad("capcode", 0.into()),
+            "capcode: 1..=1933312 (a short address)"
+        );
+        assert_eq!(
+            bad("capcode", 1_933_313.into()),
+            "capcode: 1..=1933312 (a short address)"
+        );
+        let text_err = "text: at most 251 characters of printable ASCII";
+        assert_eq!(bad("text", "x".repeat(252).into()), text_err);
+        assert_eq!(bad("text", "caf\u{e9}".into()), text_err);
+        assert_eq!(bad("text", "a\nb".into()), text_err);
+        assert!(
+            parse({
+                let mut v = flex_json();
+                v["text"] = "x".repeat(251).into();
+                v
+            })
+            .is_ok()
+        );
+        assert_eq!(bad("repeat", 0.into()), "repeat: 1..=10");
+        assert_eq!(bad("repeat", 11.into()), "repeat: 1..=10");
+    }
+
+    #[test]
+    fn flex_family_is_48_khz_and_frames_back_to_back() {
+        let (spec, imp) = parse_params(flex_json().as_object().unwrap().clone()).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        let iq = synthesise(&spec, &imp, 48_000, 152_000_000);
+        // Two 1.875 s frames, the carrier never stopping.
+        assert_eq!(iq.len(), 2 * 90_000);
+        assert!(iq.iter().all(|s| (s.norm() - 1.0).abs() < 1e-3));
+        // 2-FSK: the tones sit at the deviation either side.
+        let n = 1 << 16;
+        let (p, bin) = spectrum(&iq, 48_000, n);
+        let (neg, pos) = (peak_hz(&p, bin, 0, n / 2), peak_hz(&p, bin, n / 2, n));
+        assert!((pos - FLEX_DEVIATION_HZ).abs() <= 2.0 * bin, "{pos}");
+        assert!((neg + FLEX_DEVIATION_HZ).abs() <= 2.0 * bin, "{neg}");
+    }
+
+    #[test]
+    fn pocsag_words_come_from_the_shared_bch_encoder() {
+        // The POCSAG encoder's address word is the shared BCH(31,21) word.
+        let bits = pocsag_encode(&[(8, 3, "")], 1200);
+        let word = |n: usize| {
+            bits[576 + 32 * n..576 + 32 * (n + 1)]
+                .iter()
+                .fold(0u32, |a, &b| (a << 1) | b as u32)
+        };
+        assert_eq!(word(1), crate::bch::bch3121_word((1 << 2) | 3));
+    }
+
+    fn m17_json() -> serde_json::Value {
+        serde_json::json!({
+            "family": "m17", "src": "VK4ZET", "dst": "ALL", "can": 0, "frames": 25
+        })
+    }
+
+    #[test]
+    fn m17_family_validates() {
+        let parse = |v: serde_json::Value| parse_params(v.as_object().unwrap().clone());
+        let bad = |key: &str, val: serde_json::Value| {
+            let mut v = m17_json();
+            v[key] = val;
+            parse(v).unwrap_err()
+        };
+        let (spec, _) = parse(m17_json()).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        assert!(bad("src", "VK4ZETABCD".into()).starts_with("src:"));
+        assert!(bad("src", "vk4zet".into()).starts_with("src:"));
+        assert!(bad("src", "ALL".into()).starts_with("src:"));
+        assert!(bad("dst", "TOO-LONG-1".into()).starts_with("dst:"));
+        assert_eq!(bad("frames", 0.into()), "frames: 1..=250");
+        assert_eq!(bad("frames", 251.into()), "frames: 1..=250");
+        assert_eq!(bad("can", 16.into()), "can: 0..=15");
+        assert!(
+            parse({
+                let mut v = m17_json();
+                v["dst"] = "M17-M17 C".into();
+                v["can"] = 15.into();
+                v["frames"] = 250.into();
+                v
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn m17_iq_has_the_expected_length() {
+        let (spec, imp) = parse_params(m17_json().as_object().unwrap().clone()).unwrap();
+        let iq = synthesise(&spec, &imp, 48_000, 145_000_000);
+        // 40 ms of preamble, the LSF and 25 stream frames at 40 ms each, 40 ms of EOT.
+        let sps = 48_000 / M17_BAUD as usize;
+        let want = (1 + (25 + 1) + 1) * 48_000 * 40 / 1000;
+        assert!(iq.len().abs_diff(want) <= sps, "{} vs {want}", iq.len());
+        assert!(iq.iter().all(|s| (s.norm() - 1.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn rrc_4fsk_puts_a_symbol_run_on_its_tone() {
+        // A long run of each symbol settles on its frequency: -3d, -d, +d, +3d. Averaged
+        // over a symbol period it is exact; within the period the pulse's truncation to 8
+        // symbols (the specification's 81 taps at 10 samples a symbol) leaves a ripple
+        // under 1 % of the deviation.
+        let rate = 48_000;
+        let hz = |a: Complex<f32>, b: Complex<f32>| {
+            (b * a.conj()).arg() as f64 * f64::from(rate) / (2.0 * PI)
+        };
+        for (sym, want) in [(0u8, -2400.0), (1, -800.0), (2, 800.0), (3, 2400.0)] {
+            let iq = rrc_modulate_4fsk(&[sym; 48], M17_BAUD, M17_DEVIATION_HZ, rate, M17_RRC_ALPHA);
+            assert_eq!(iq.len(), 480);
+            let sps = (rate / M17_BAUD) as usize;
+            let inst: Vec<f64> = (240..240 + sps).map(|i| hz(iq[i], iq[i + 1])).collect();
+            let mean = inst.iter().sum::<f64>() / sps as f64;
+            assert!((mean - want).abs() < 1.0, "symbol {sym}: mean {mean}");
+            for f in inst {
+                assert!(
+                    (f - want).abs() < 0.01 * M17_DEVIATION_HZ,
+                    "symbol {sym}: {f}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn m17_iq_demodulates_back_to_its_frames() {
+        // A plain receiver: the discriminator, the matched root-raised-cosine filter,
+        // a sample at each symbol centre sliced to the nearest level. The LSF decodes
+        // with its CRC and every stream frame gives its number and LICH chunk.
+        use crate::m17::{
+            FRAME_BITS, FRAME_SYMBOLS, LICH_CHUNKS, Lsf, SYNC_STREAM, SYNC_SYMBOLS,
+            decode_lsf_frame, decode_stream_frame, symbols_to_bits, word_symbols,
+        };
+        let frames = 8u32;
+        let spec = SynthSpec::M17 {
+            src: "VK4ZET".into(),
+            dst: "ALL".into(),
+            can: 3,
+            frames,
+        };
+        let rate = spec.rate_hz();
+        let iq = synthesise(&spec, &Impairments::default(), rate, 0);
+        let sps = (rate / M17_BAUD) as usize;
+        // Frequency in units of deviation / 3, so the levels sit at -3, -1, +1, +3.
+        let scale = f64::from(rate) / (2.0 * PI) * 3.0 / M17_DEVIATION_HZ;
+        let mut f = vec![0.0f64; iq.len()];
+        for i in 1..iq.len() {
+            f[i] = (iq[i] * iq[i - 1].conj()).arg() as f64 * scale;
+        }
+        let reach = (RRC_SPAN_SYMBOLS / 2.0 * sps as f64) as isize;
+        let taps: Vec<f64> = (-reach..=reach)
+            .map(|j| rrc(j as f64 / sps as f64, M17_RRC_ALPHA))
+            .collect();
+        let gain: f64 = taps.iter().sum();
+        let symbols: Vec<u8> = (0..iq.len() / sps)
+            .map(|k| {
+                let c = (k * sps + sps / 2) as isize;
+                let y: f64 = taps
+                    .iter()
+                    .enumerate()
+                    .map(|(n, h)| {
+                        let i = c + n as isize - reach;
+                        h * f.get(i.max(0) as usize).copied().unwrap_or(0.0)
+                    })
+                    .sum::<f64>()
+                    / gain;
+                ((y + 3.0) / 2.0).round().clamp(0.0, 3.0) as u8
+            })
+            .collect();
+        let frame_bits = |at: usize| -> [u8; FRAME_BITS] {
+            symbols_to_bits(&symbols[at + SYNC_SYMBOLS..at + FRAME_SYMBOLS])
+                .try_into()
+                .unwrap()
+        };
+        let lsf =
+            Lsf::parse(&decode_lsf_frame(&frame_bits(FRAME_SYMBOLS)).expect("the LSF")).unwrap();
+        assert_eq!(
+            (lsf.src.as_str(), lsf.dst.as_str(), lsf.can),
+            ("VK4ZET", "ALL", 3)
+        );
+        for n in 0..frames as usize {
+            let at = (2 + n) * FRAME_SYMBOLS;
+            assert_eq!(
+                symbols[at..at + SYNC_SYMBOLS],
+                word_symbols(SYNC_STREAM),
+                "{n}"
+            );
+            let frame = decode_stream_frame(&frame_bits(at));
+            assert_eq!(usize::from(frame.frame_number), n);
+            assert_eq!(frame.last, n + 1 == frames as usize);
+            assert_eq!(frame.lich.unwrap().1 as usize, n % LICH_CHUNKS);
+            assert_eq!(frame.payload, [0; 16]);
+        }
     }
 }

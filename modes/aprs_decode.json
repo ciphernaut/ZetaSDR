@@ -52,11 +52,24 @@
         "path": { "type": "array", "items": { "type": "string" } },
         "info": { "type": "string" },
         "info_hex": { "type": "string" },
-        "fcs_ok": { "type": "boolean" }
+        "fcs_ok": { "type": "boolean" },
+        "lat": { "type": ["number", "null"] },
+        "lon": { "type": ["number", "null"] },
+        "alt_m": { "type": ["number", "null"] },
+        "course_deg": { "type": ["number", "null"] },
+        "speed_kt": { "type": ["number", "null"] },
+        "symbol": { "type": ["string", "null"] },
+        "comment": { "type": ["string", "null"] },
+        "data_type": {
+          "type": "string",
+          "enum": ["position", "mic_e", "object", "item", "message", "status", "telemetry", "weather", "other"]
+        },
+        "object": { "type": ["string", "null"] }
       }
     },
     "summary": "{src} > {dst}: {info}"
   },
+  "position": {"lat": "lat", "lon": "lon", "alt_m": "alt_m"},
   "identify": {
     "proof": "field",
     "field": "fcs_ok",
@@ -71,11 +84,18 @@
     "family": "aprs",
     "src": "VK3ABC",
     "dst": "APRS",
-    "info": ">hi",
+    "info": "!2723.05S/15307.05E>ZetaSDR",
     "echo": {"delay_us": 100, "gain_db": -6},
-    "expect": {"protocol": "aprs", "src": "VK3ABC", "fcs_ok": true},
+    "expect": {
+      "protocol": "aprs",
+      "src": "VK3ABC",
+      "fcs_ok": true,
+      "lat": {"near": -27.3842, "within": 0.0001},
+      "lon": {"near": 153.1175, "within": 0.0001}
+    },
     "within_ms": 5000
   },
+  "notes": "APRS at 144 800 000 Hz in AU and EU, 144 390 000 Hz in the US, 12 500 Hz band; one job hears every station on the channel. Positions in the three common formats (uncompressed, compressed, Mic-E) land on the map; objects and items are named, not placed.",
   "subject": {
     "key": "src",
     "name": "stations",
@@ -92,8 +112,10 @@
         "unit": null
       }
     ],
-    "heading": null,
+    "heading": "course_deg",
     "label": null,
+    "track_points": 100,
+    "track_min_m": 50,
     "identity": {
       "field": "src",
       "register": "callsign",

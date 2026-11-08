@@ -11,9 +11,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
-use zeta_core::modes::{
-    Decoder, LoadedMode, ModeRegistry, ModeState, ModesHandle, RowTest, TestSpec,
-};
+use zeta_core::modes::{LoadedMode, ModeRegistry, ModeState, ModesHandle, RowTest, TestSpec};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::stream::Payload;
 use zeta_core::types::{Hz, SourceId, StreamKind, Timestamp};
@@ -84,6 +82,7 @@ struct Ctx {
 }
 
 /// How one row's check ended.
+#[derive(Debug, PartialEq)]
 enum Outcome {
     Ok,
     Fail(String),
@@ -141,7 +140,7 @@ pub async fn run(
         println!("{line}");
         match outcome {
             Outcome::Ok => {
-                if matches!(m.row.decoder, Decoder::Program(_)) {
+                if !m.row.decoder.handler_blocks().is_empty() {
                     let at = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
@@ -176,10 +175,17 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
     let Some(test) = &m.row.test else {
         return skip("no test".into());
     };
-    if m.state == ModeState::Unavailable
-        && let Decoder::Program(p) = &m.row.decoder
-    {
-        let handler = p.programs.first().map_or("program", String::as_str);
+    if m.state == ModeState::Unavailable {
+        // The first handler list not on this host (the first list when all are found
+        // now: the probe said otherwise).
+        let blocks = m.row.decoder.handler_blocks();
+        let missing = blocks
+            .iter()
+            .find(|(p, _)| zeta_ext::proc::find_handler(p).is_none())
+            .or(blocks.first());
+        let handler = missing
+            .and_then(|(p, _)| p.first())
+            .map_or("program", String::as_str);
         return skip(format!("{handler} missing"));
     }
     if let TestSpec::Fixture { path } = &test.kind
@@ -368,24 +374,120 @@ fn failure(node: &zeta_core::node::Node, job: &zeta_core::types::JobId) -> Optio
     }
 }
 
-/// `expect` (an object) as a subset of `event`: each expected key must equal the event's.
-/// `t_ns` and `summary` are only compared when `expect` names them. The failure is the
-/// compact diff, `<key>: expected <v>, got <v|missing>` for each key that differs.
+/// `expect` (an object) as a subset of `event`: each expected key must equal the event's,
+/// or, for `{"near": N, "within": D}` (exactly those two keys), be a number within `D` of
+/// `N`. `t_ns` and `summary` are only compared when `expect` names them. The failure is
+/// the compact diff, `<key>: expected <v>, got <v|missing>` for each key that differs.
 fn compare(expect: &Value, event: &Value) -> Outcome {
     let Some(want) = expect.as_object() else {
         return Outcome::Fail(format!("expect is not an object: {expect}"));
     };
     let diff: Vec<String> = want
         .iter()
-        .filter(|(k, v)| event.get(k.as_str()) != Some(v))
-        .map(|(k, v)| match event.get(k.as_str()) {
-            Some(got) => format!("{k}: expected {v}, got {got}"),
-            None => format!("{k}: expected {v}, got missing"),
+        .filter_map(|(k, v)| {
+            let got = event.get(k.as_str());
+            let ok = match tolerance(v) {
+                Some(Ok((near, within))) => got
+                    .and_then(Value::as_f64)
+                    .is_some_and(|g| (g - near).abs() <= within),
+                Some(Err(why)) => return Some(format!("{k}: {why}")),
+                None => got == Some(v),
+            };
+            if ok {
+                return None;
+            }
+            let shown = got.map_or_else(|| "missing".to_string(), Value::to_string);
+            Some(format!("{k}: expected {}, got {shown}", expected_text(v)))
         })
         .collect();
     if diff.is_empty() {
         Outcome::Ok
     } else {
         Outcome::Fail(diff.join("; "))
+    }
+}
+
+/// `want` as a tolerance, `(near, within)`: `None` when it is not an object of exactly the
+/// keys `near` and `within`, the complaint when either is malformed.
+fn tolerance(want: &Value) -> Option<Result<(f64, f64), &'static str>> {
+    let o = want.as_object()?;
+    if o.len() != 2 {
+        return None;
+    }
+    let (near, within) = (o.get("near")?, o.get("within")?);
+    let Some(near) = near.as_f64() else {
+        return Some(Err("expect.near must be a number"));
+    };
+    match within.as_f64() {
+        Some(w) if w >= 0.0 => Some(Ok((near, w))),
+        _ => Some(Err("expect.within must be a non-negative number")),
+    }
+}
+
+/// An expected value as the diff shows it: `within 0.0001 of -27.3842` for a tolerance,
+/// the compact JSON otherwise.
+fn expected_text(want: &Value) -> String {
+    match tolerance(want) {
+        Some(Ok(_)) => format!("within {} of {}", want["within"], want["near"]),
+        _ => want.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fail(s: &str) -> Outcome {
+        Outcome::Fail(s.into())
+    }
+
+    #[test]
+    fn compare_accepts_a_value_within_the_tolerance() {
+        let want = json!({"lat": {"near": -27.3842, "within": 0.0001}, "id": "X"});
+        let ev = json!({"lat": -27.38417, "id": "X", "t_ns": 1});
+        assert_eq!(compare(&want, &ev), Outcome::Ok);
+    }
+
+    #[test]
+    fn compare_rejects_outside_with_the_diff_line() {
+        let want = json!({"lat": {"near": -27.3842, "within": 0.0001}});
+        let ev = json!({"lat": -27.39});
+        assert_eq!(
+            compare(&want, &ev),
+            fail("lat: expected within 0.0001 of -27.3842, got -27.39")
+        );
+    }
+
+    #[test]
+    fn compare_rejects_a_bad_tolerance_and_a_non_number() {
+        let want = json!({"lat": {"near": -27.3842, "within": 0.0001}});
+        assert_eq!(
+            compare(&want, &json!({"lat": "x"})),
+            fail("lat: expected within 0.0001 of -27.3842, got \"x\"")
+        );
+        assert_eq!(
+            compare(&want, &json!({})),
+            fail("lat: expected within 0.0001 of -27.3842, got missing")
+        );
+        let ev = json!({"lat": 1});
+        assert_eq!(
+            compare(&json!({"lat": {"near": "a", "within": 1}}), &ev),
+            fail("lat: expect.near must be a number")
+        );
+        assert_eq!(
+            compare(&json!({"lat": {"near": 1, "within": -1}}), &ev),
+            fail("lat: expect.within must be a non-negative number")
+        );
+    }
+
+    #[test]
+    fn compare_keeps_exact_equality_for_other_objects() {
+        let ev = json!({"path": ["A", "B"], "lat": 1});
+        assert_eq!(compare(&json!({"path": ["A", "B"]}), &ev), Outcome::Ok);
+        assert!(matches!(
+            compare(&json!({"lat": {"near": 1}}), &ev),
+            Outcome::Fail(m) if m.starts_with("lat: ")
+        ));
     }
 }

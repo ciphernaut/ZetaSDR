@@ -1,0 +1,97 @@
+{
+  "id": "m17_decode",
+  "name": "M17 digital voice",
+  "family": "amateur_voice",
+  "band": {
+    "bandwidth_hz": 12500,
+    "centers_hz": [],
+    "min_hz": null,
+    "range_hz": null
+  },
+  "modulation": ["fsk", "fm"],
+  "label": "M17",
+  "protocol": "m17",
+  "decoder": {
+    "kind": "graph",
+    "nodes": [
+      {
+        "id": "channel",
+        "kind": "channel",
+        "params": {
+          "center_hz": "$center_hz",
+          "bandwidth_hz": "$bandwidth_hz",
+          "out_rate_hz": "$out_rate_hz"
+        }
+      },
+      {
+        "id": "decode",
+        "kind": "m17_decode",
+        "params": {}
+      }
+    ],
+    "edges": [
+      { "from": "channel", "to": "decode", "kind": "iq" }
+    ],
+    "handlers": [
+      {
+        "programs": ["c2dec"],
+        "install": { "debian": "codec2", "url": "https://github.com/drowe67/codec2" }
+      }
+    ]
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "src": { "type": "string" },
+        "dst": { "type": "string" },
+        "can": { "type": "integer" },
+        "type": { "type": "string", "enum": ["voice", "voice_data", "data", "packet"] },
+        "encryption": { "type": ["string", "null"], "enum": ["scrambler", "aes", "other", null] },
+        "codec": { "type": ["string", "null"], "enum": ["3200", "1600", null] },
+        "frame": { "type": "integer" },
+        "eot": { "type": "boolean" },
+        "lat": { "type": ["number", "null"] },
+        "lon": { "type": ["number", "null"] }
+      }
+    },
+    "summary": "{src} > {dst}: {type} {encryption?}"
+  },
+  "position": { "lat": "lat", "lon": "lon", "alt_m": null },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 5000,
+    "min_span_ms": 1000,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": ["m17-rf-protocol"],
+  "subject": {
+    "key": "src",
+    "name": "stations",
+    "waterfall": "fold",
+    "columns": [
+      { "field": "dst", "label": "Destination", "unit": null },
+      { "field": "type", "label": "Type", "unit": null },
+      { "field": "can", "label": "CAN", "unit": null },
+      { "field": "encryption", "label": "Encryption", "unit": null }
+    ],
+    "heading": null,
+    "label": null,
+    "track_points": 100,
+    "track_min_m": 50
+  },
+  "notes": "M17 (4FSK, 4800 baud, Codec 2) on any 2 m or 70 cm simplex or repeater channel, 12500 Hz band; start it on the measured centre. Its audio is ordinary job audio: listen to it or attach transcribe. Encrypted streams are reported, not decoded. It needs c2dec (package codec2) on the node's host.",
+  "test": {
+    "kind": "synth",
+    "family": "m17",
+    "src": "VK4ZET",
+    "dst": "ALL",
+    "can": 0,
+    "frames": 25,
+    "expect": { "src": "VK4ZET", "dst": "ALL", "type": "voice" },
+    "within_ms": 5000
+  }
+}

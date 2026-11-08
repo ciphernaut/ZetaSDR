@@ -18,6 +18,13 @@ const NO_SONDE: [(&str, &str); 3] = [
 ];
 /// The aircraft data-link rows' programs, pinned to a path none lives at, whatever the
 /// host has.
+/// The pager decoder's program, pinned to a path none lives at, whatever the host has.
+const NO_MULTIMON: (&str, &str) = (
+    "ZETA_HANDLER_MULTIMON_NG",
+    "/nonexistent/zeta-test/multimon-ng",
+);
+/// The M17 row's vocoder, pinned to a path none lives at, whatever the host has.
+const NO_C2DEC: (&str, &str) = ("ZETA_HANDLER_C2DEC", "/nonexistent/zeta-test/c2dec");
 const NO_AIRCRAFT_LINKS: [(&str, &str); 2] = [
     ("ZETA_HANDLER_DUMPVDL2", "/nonexistent/zeta-test/dumpvdl2"),
     ("ZETA_HANDLER_DUMPHFDL", "/nonexistent/zeta-test/dumphfdl"),
@@ -38,6 +45,8 @@ fn check(dir: &Path, args: &[&str]) -> Command {
         .env("ZETA_HANDLER_DUMP1090", NO_DUMP1090)
         .envs(NO_SONDE)
         .envs(NO_AIRCRAFT_LINKS)
+        .env(NO_MULTIMON.0, NO_MULTIMON.1)
+        .env(NO_C2DEC.0, NO_C2DEC.1)
         .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--modes-dir")
@@ -56,10 +65,16 @@ fn stdout(cmd: &mut Command) -> (String, i32) {
 }
 
 #[test]
-fn modes_check_passes_the_four_in_crate_rows() {
+fn modes_check_passes_the_in_crate_rows() {
     let dir = tempfile::tempdir().unwrap();
     let (out, code) = stdout(&mut check(dir.path(), &[]));
-    for id in ["acars_decode", "aprs_decode", "pocsag_decode", "rds_decode"] {
+    for id in [
+        "acars_decode",
+        "ais_decode",
+        "aprs_decode",
+        "pocsag_decode",
+        "rds_decode",
+    ] {
         assert!(out.lines().any(|l| l == format!("{id}: ok")), "{out}");
     }
     assert!(
@@ -67,18 +82,30 @@ fn modes_check_passes_the_four_in_crate_rows() {
             .any(|l| l == "adsb_decode: skipped: dump1090 missing"),
         "{out}"
     );
-    // DFM and M20 have no test yet; RS41's decoder is pinned missing here.
-    for id in ["dfm_decode", "m20_decode"] {
+    // FLEX's program is pinned missing here.
+    assert!(
+        out.lines()
+            .any(|l| l == "flex_decode: skipped: multimon-ng missing"),
+        "{out}"
+    );
+    // M17's vocoder is pinned missing here.
+    assert!(
+        out.lines()
+            .any(|l| l == "m17_decode: skipped: c2dec missing"),
+        "{out}"
+    );
+    // DFM has no test yet; the RS41 and M20 decoders are pinned missing here.
+    assert!(
+        out.lines().any(|l| l == "dfm_decode: skipped: no test"),
+        "{out}"
+    );
+    for (id, program) in [("rs41_decode", "rs41mod"), ("m20_decode", "m20mod")] {
         assert!(
-            out.lines().any(|l| l == format!("{id}: skipped: no test")),
+            out.lines()
+                .any(|l| l == format!("{id}: skipped: {program} missing")),
             "{out}"
         );
     }
-    assert!(
-        out.lines()
-            .any(|l| l == "rs41_decode: skipped: rs41mod missing"),
-        "{out}"
-    );
     for (id, program) in [("vdl2_decode", "dumpvdl2"), ("hfdl_decode", "dumphfdl")] {
         assert!(
             out.lines()
@@ -105,8 +132,9 @@ fn an_unknown_id_lists_the_known_ones() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(
         err.contains(
-            "unknown mode nope (known: acars_decode, adsb_decode, aprs_decode, dfm_decode, \
-             hfdl_decode, m20_decode, pocsag_decode, rds_decode, rs41_decode, vdl2_decode"
+            "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
+             dfm_decode, flex_decode, hfdl_decode, m17_decode, m20_decode, pocsag_decode, rds_decode, \
+             rs41_decode, vdl2_decode"
         ),
         "{err}"
     );
@@ -539,6 +567,50 @@ fn rs41_decode_passes_its_synthesised_check() {
     assert_eq!(code, 0);
 }
 
+/// The M20 row proves itself against the real `m20mod`: the synthesised frames pass
+/// through the row's own chain and the decoder reports the serial and the position.
+#[test]
+fn m20_decode_passes_its_synthesised_check() {
+    let Some(m20mod) = which("m20mod") else {
+        eprintln!("m20mod not on this host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) =
+        stdout(check(dir.path(), &["--strict", "m20_decode"]).env("ZETA_HANDLER_M20MOD", m20mod));
+    assert_eq!(out.trim(), "m20_decode: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+/// The FLEX row proves itself against the real multimon-ng: the synthesised frames pass
+/// through the row's own chain and the decoder reports the capcode and the text.
+#[test]
+fn flex_decode_passes_its_synthesised_check() {
+    let Some(multimon) = which("multimon-ng") else {
+        eprintln!("multimon-ng not on this host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) =
+        stdout(check(dir.path(), &["--strict", "flex_decode"]).env(NO_MULTIMON.0, multimon));
+    assert_eq!(out.trim(), "flex_decode: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+/// The M17 row proves itself against the real `c2dec`: the synthesised stream passes
+/// through the row's own chain and the stage reports the callsigns and the type.
+#[test]
+fn m17_decode_passes_its_synthesised_check() {
+    let Some(c2dec) = which("c2dec") else {
+        eprintln!("c2dec not on this host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) = stdout(check(dir.path(), &["--strict", "m17_decode"]).env(NO_C2DEC.0, c2dec));
+    assert_eq!(out.trim(), "m17_decode: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
 /// zeta-ext's stand-in for an external decoder: prints a file's lines whatever its input.
 fn fake_lines() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../zeta-ext/tests/fake_lines")
@@ -598,4 +670,55 @@ fn the_hfdl_row_decodes_an_uplink_through_the_fake_program() {
     let (out, code) = stdout(&mut check(dir.path(), &["hfdl_fake"]));
     assert_eq!(out.trim(), "hfdl_fake: ok", "{out}");
     assert_eq!(code, 0);
+}
+
+/// The embedded `pocsag_decode` row (its test block included) as an operator row
+/// `pocsag_voc` naming one handler, `program`.
+fn write_pocsag_with_handler(dir: &Path, program: &str) {
+    let mut row: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/pocsag_decode.json")).unwrap();
+    row["decoder"]["handlers"] = serde_json::json!([{
+        "programs": [program],
+        "install": {"debian": "nothing", "url": "https://example.invalid"}
+    }]);
+    write_whole_row(dir, "pocsag_voc", row);
+}
+
+/// A graph row whose handler is missing is skipped naming it, and `--strict` fails it.
+#[test]
+fn a_graph_row_with_a_missing_handler_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pocsag_with_handler(dir.path(), "zeta-no-such-handler");
+    let (out, code) = stdout(&mut check(dir.path(), &["pocsag_voc"]));
+    assert_eq!(
+        out.trim(),
+        "pocsag_voc: skipped: zeta-no-such-handler missing",
+        "{out}"
+    );
+    assert_eq!(code, 0);
+    let (out, code) = stdout(&mut check(dir.path(), &["--strict", "pocsag_voc"]));
+    assert_eq!(
+        out.trim(),
+        "pocsag_voc: fail: zeta-no-such-handler missing",
+        "{out}"
+    );
+    assert_eq!(code, 1);
+}
+
+/// A graph row whose handler is found runs its check, and a pass is recorded in
+/// `modes-checked.json` as a program row's is (a plain graph row's is not).
+#[test]
+fn a_graph_row_with_its_handler_found_records_its_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pocsag_with_handler(dir.path(), &fake_lines().display().to_string());
+    let (out, code) = stdout(&mut check(dir.path(), &["pocsag_voc"]));
+    assert_eq!(out.trim(), "pocsag_voc: ok", "{out}");
+    assert_eq!(code, 0);
+    let (out, code) = stdout(&mut check(dir.path(), &["pocsag_decode"]));
+    assert_eq!(out.trim(), "pocsag_decode: ok", "{out}");
+    assert_eq!(code, 0);
+    let text = std::fs::read_to_string(dir.path().join("state/modes-checked.json")).unwrap();
+    let checked: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(checked["pocsag_voc"].is_u64(), "{text}");
+    assert!(checked.get("pocsag_decode").is_none(), "{text}");
 }

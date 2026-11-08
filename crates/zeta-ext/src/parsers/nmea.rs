@@ -2,12 +2,16 @@
 //! such as AIS-catcher and rtl-ais print them:
 //! `!AIVDM,<fragments>,<fragment>,<message id>,<channel>,<payload>,<fill bits>*<checksum>`.
 //!
-//! Each sentence is one event, `{channel, payload, fill_bits, msg_type, mmsi}`:
-//! the payload's 6-bit armouring is decoded far enough for the message type
-//! (bits 0-5) and the MMSI (bits 8-37), `null` when the payload is too short
-//! (a later fragment). Full AIS fields arrive in plan 17.
+//! Each sentence is one event, `{channel, payload, fill_bits}` plus the AIS fields
+//! [`AisMsg::fields`] gives (`mmsi`, `msg_type`, `repeat`, `lat`, `lon`, `sog_kt`,
+//! `cog_deg`, `heading_deg`, `nav_status`, `name`, `callsign`, `destination`, `imo`,
+//! `ship_type`, `aton_type`, `virtual_aton`), decoded by [`zeta_dsp::ais_msg`] as the
+//! in-crate AIS stage decodes them. Each sentence is read alone: only a message's first
+//! fragment is decoded, a field past its end is `null`, and every field is `null` for a
+//! later fragment or a payload too short for an MMSI.
 
 use serde_json::{Value, json};
+use zeta_dsp::ais_msg::{self, AisMsg};
 
 /// The fields of one AIS sentence; `None` for any other line, or a sentence
 /// whose checksum does not match.
@@ -30,37 +34,27 @@ pub fn parse(line: &str) -> Option<Value> {
     }
     let payload = f[5];
     let fill_bits: u8 = f[6].parse().ok().filter(|n| *n <= 5)?;
-    let bits = unarmour(payload)?;
-    let field = |from: usize, len: usize| {
-        (bits.len() >= from + len).then(|| {
-            bits[from..from + len]
-                .iter()
-                .fold(0u64, |a, &b| (a << 1) | u64::from(b))
-        })
-    };
+    let mut bits = ais_msg::unarmour(payload)?;
+    bits.truncate(bits.len().saturating_sub(usize::from(fill_bits)));
     let channel = (!f[4].is_empty()).then_some(f[4]);
-    Some(json!({
+    // Only a message's first fragment starts with its header: a later one carries the
+    // middle of a message, which read alone could pass for a vessel.
+    let first = f[2] == "1";
+    let fields = match ais_msg::decode(&bits).filter(|_| first) {
+        Some(m) => m.fields(),
+        None => AisMsg::default()
+            .fields()
+            .into_iter()
+            .map(|(k, _)| (k, Value::Null))
+            .collect(),
+    };
+    let mut v = json!({
         "channel": channel,
         "payload": payload,
         "fill_bits": fill_bits,
-        "msg_type": field(0, 6),
-        "mmsi": field(8, 30),
-    }))
-}
-
-/// The payload's bits, six per character (`0`-`W` and `` ` ``-`w`); `None`
-/// for a character outside the armouring.
-fn unarmour(payload: &str) -> Option<Vec<u8>> {
-    let mut bits = Vec::with_capacity(payload.len() * 6);
-    for c in payload.bytes() {
-        let v = match c {
-            b'0'..=b'W' => c - b'0',
-            b'`'..=b'w' => c - b'0' - 8,
-            _ => return None,
-        };
-        bits.extend((0..6).rev().map(|i| (v >> i) & 1));
-    }
-    Some(bits)
+    });
+    v.as_object_mut().expect("an object").extend(fields);
+    Some(v)
 }
 
 #[cfg(test)]
@@ -75,6 +69,26 @@ mod tests {
         assert_eq!(v["fill_bits"], 0);
         assert_eq!(v["msg_type"], 1);
         assert_eq!(v["mmsi"], 477_553_000);
+        assert!(v["lat"].is_number(), "{v}");
+        assert!(
+            (v["lat"].as_f64().unwrap() - 47.582_833).abs() < 1e-6,
+            "{v}"
+        );
+        assert_eq!(v["cog_deg"], 51.0);
+        assert_eq!(v["name"], Value::Null);
+    }
+
+    #[test]
+    fn a_later_fragment_is_not_decoded_as_a_message() {
+        // The published type 1 payload sent as fragment 2 of 2: read alone it would decode
+        // as a vessel, but a continuation carries the middle of another message.
+        let body = "AIVDM,2,2,3,B,177KQJ5000G?tO`K>RA1wUbN0TKH,0";
+        let cs = body.bytes().fold(0u8, |a, b| a ^ b);
+        let v = parse(&format!("!{body}*{cs:02X}")).unwrap();
+        assert_eq!(v["payload"], "177KQJ5000G?tO`K>RA1wUbN0TKH");
+        assert_eq!(v["mmsi"], Value::Null);
+        assert_eq!(v["msg_type"], Value::Null);
+        assert_eq!(v["lat"], Value::Null);
     }
 
     #[test]
@@ -87,6 +101,8 @@ mod tests {
         // A short later fragment: too few bits for an MMSI.
         let v = parse("!AIVDM,2,2,3,A,8888,2").unwrap();
         assert_eq!(v["mmsi"], Value::Null);
+        assert_eq!(v["msg_type"], Value::Null);
+        assert_eq!(v["lat"], Value::Null);
         assert_eq!(v["fill_bits"], 2);
     }
 }

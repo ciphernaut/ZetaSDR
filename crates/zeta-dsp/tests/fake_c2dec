@@ -1,0 +1,11 @@
+#!/bin/sh
+# A stand-in for Codec 2's `c2dec 3200 - -` in the m17_decode stage's tests: for every
+# 8-byte Codec 2 frame on stdin it writes 160 silent 16-bit samples (320 zero bytes) to
+# stdout, and exits 0 at the end of its input. The stage starts it with an empty
+# environment, so the PATH is its own.
+PATH=/usr/bin:/bin
+while :; do
+    n=$(dd bs=8 count=1 iflag=fullblock 2>/dev/null | wc -c)
+    [ "$n" -gt 0 ] || exit 0
+    head -c 320 /dev/zero
+done

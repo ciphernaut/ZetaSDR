@@ -131,9 +131,33 @@ pub const ACARS_VHF: ChannelPlan = ChannelPlan {
     no_voice: &[1, 2, 3, 4, 5, 6, 7],
 };
 
+/// AIS: the two maritime VHF channels, 87B and 88B, in one capture. Data only.
+pub const AIS_VHF: ChannelPlan = ChannelPlan {
+    id: "ais_vhf",
+    name: "AIS VHF",
+    region: "world",
+    bandwidth_hz: 25_000,
+    segments: &[
+        Segment {
+            first: 1,
+            count: 1,
+            first_hz: 161_975_000,
+            step_hz: 0,
+        },
+        Segment {
+            first: 2,
+            count: 1,
+            first_hz: 162_025_000,
+            step_hz: 0,
+        },
+    ],
+    notes: &[(1, "channel A, 87B"), (2, "channel B, 88B")],
+    no_voice: &[1, 2],
+};
+
 /// Every plan the node knows; a frequency on two plans takes the first. The page's
 /// `auto` plan policy names the first plan for its `Start plan…` entry.
-pub const PLANS: &[ChannelPlan] = &[UHF_CB_AU, ACARS_VHF];
+pub const PLANS: &[ChannelPlan] = &[UHF_CB_AU, ACARS_VHF, AIS_VHF];
 
 /// The plan in [`PLANS`] with this `id`.
 pub fn plan(id: &str) -> Option<&'static ChannelPlan> {
@@ -256,6 +280,19 @@ mod tests {
         assert_eq!(t.bandwidth_hz, Hz(1_810_000));
         let n = channel_at(131_550_000).map(|(p, n)| (p.id, n));
         assert_eq!(n, Some(("acars_vhf", 5)));
+    }
+
+    #[test]
+    fn ais_vhf_holds_both_channels_in_one_capture() {
+        let c = channels(&AIS_VHF);
+        assert_eq!(c, [(1, 161_975_000), (2, 162_025_000)]);
+        let t = bounding(&AIS_VHF, &[1, 2]);
+        assert_eq!(t.center_hz, Hz(162_000_000));
+        assert_eq!(t.bandwidth_hz, Hz(75_000));
+        assert_eq!(
+            no_voice_at(162_025_000).map(|(p, n)| (p.id, n)),
+            Some(("ais_vhf", 2))
+        );
     }
 
     #[test]

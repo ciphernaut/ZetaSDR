@@ -59,8 +59,16 @@ jobs:
       - name: Toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # The FLEX row's decoder and the M17 row's vocoder, so their synthesised checks run
+      # (the host-gated tests and the strict step below).
+      - name: multimon-ng and codec2
+        run: sudo apt-get update && sudo apt-get install -y multimon-ng codec2
       # The web page end to end has its own job (ui), which fails if it skips.
       - run: cargo test --workspace -- --skip ui_scenarios_pass_in_headless_chromium
+      - name: The FLEX row against multimon-ng and the M17 row against c2dec (fail if skipped)
+        run: |
+          cargo run -q -p zeta -- --state-dir "$RUNNER_TEMP/zeta-check" modes check --strict flex_decode
+          cargo run -q -p zeta -- --state-dir "$RUNNER_TEMP/zeta-check" modes check --strict m17_decode
 
   ui:
     runs-on: ubuntu-24.04

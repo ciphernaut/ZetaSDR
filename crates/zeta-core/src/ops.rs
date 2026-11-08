@@ -17,8 +17,8 @@ use crate::job::{JobRecord, JobState};
 use crate::knowledge::{Allocation, DEFAULT_REGION, Signature, nearest_allocations};
 use crate::lease::LeaseError;
 use crate::modes::{
-    Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow, ModeState,
-    Subject, is_mode_id, template,
+    Access, Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow,
+    ModeState, Subject, is_mode_id, template,
 };
 use crate::node::{AfterGate, Node, NodeError};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
@@ -157,16 +157,17 @@ pub enum Op {
         /// stopped and names the rest.
         replace: Vec<JobId>,
     },
-    /// Attach a job of an attachable `kind` (`transcribe`) to the running job `job`: it
-    /// reads that job's audio output stream (the last one in its graph order when it
-    /// has several; audio passed between two of its stages does not count) instead of
-    /// the radio, holds no lease, copies the job's `source` and `tuning`, and records
-    /// it as its `input`. It follows its input through a
-    /// `job_retune` or a `graph_put` restart: it is relaunched under its own id on the
-    /// input's new stream once the input runs again (`failed` with the reason when it
-    /// cannot be). It ends `stopped` when the input job stops or fails for its own
-    /// reason. On a node restart it resumes after its input, or is
-    /// `failed` with `input job <id> not running` when the input does not run.
+    /// Attach a job of an attachable `kind` (`transcribe`) to the running job `job`, a job
+    /// whose kind emits audio: the voice demodulators and any mode row whose `outputs`
+    /// lists `audio`. It reads that job's audio output stream (the last one in its graph
+    /// order when it has several; audio passed between two of its stages does not count)
+    /// instead of the radio, holds no lease, copies the job's `source` and `tuning`, and
+    /// records it as its `input`. It follows its input through a `job_retune` or a
+    /// `graph_put` restart: it is relaunched under its own id on the input's new stream
+    /// once the input runs again (`failed` with the reason when it cannot be). It ends
+    /// `stopped` when the input job stops or fails for its own reason. On a node restart
+    /// it resumes after its input, or is `failed` with `input job <id> not running` when
+    /// the input does not run.
     JobAttach {
         kind: JobKind,
         job: JobId,
@@ -2159,11 +2160,13 @@ pub struct ModeInfo {
     /// The file the row came from: `modes/<id>.json` for a built-in row, the path for an
     /// operator row (the file to fix when the row is broken).
     pub file: String,
-    /// The program a program row runs; `null` for a graph row or one not yet probed.
+    /// The program a program row runs, or a graph row's first handler (`c2dec` for
+    /// `m17_decode`); `null` for a row with no handlers or one not yet probed.
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub program: Option<String>,
-    /// When `zeta modes check` last passed this program row on this host (UNIX seconds); `null` if never.
+    /// When `zeta modes check` last passed this row with handlers (a program row, or a
+    /// graph row naming handlers) on this host (UNIX seconds); `null` if never.
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub checked: Option<u64>,
@@ -2172,6 +2175,14 @@ pub struct ModeInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<Subject>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub subject: Option<Subject>,
+    /// `'restricted'` on a row whose events carry content a later access control may
+    /// gate (pager text); `null` otherwise.
+    #[schemars(required, schema_with = "crate::types::nullable::<Access>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub access: Option<Access>,
+    /// The stream kinds a job of the row emits (`event`, `audio`, ...); a row whose
+    /// `outputs` lists `audio` can be played and transcribed. Empty for a broken row.
+    pub outputs: Vec<StreamKind>,
 }
 
 impl From<&LoadedMode> for ModeInfo {
@@ -2189,6 +2200,8 @@ impl From<&LoadedMode> for ModeInfo {
             program: m.program.as_ref().map(|p| p.display().to_string()),
             checked: m.checked,
             subject: m.row.subject.clone(),
+            access: m.row.access,
+            outputs: m.outputs.clone(),
         }
     }
 }

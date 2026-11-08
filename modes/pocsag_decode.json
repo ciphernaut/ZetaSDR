@@ -53,6 +53,7 @@
     "quick": "pocsag"
   },
   "catalogue": ["pocsag", "pocsag-2", "pager-pocsag-1200"],
+  "access": "restricted",
   "test": {
     "kind": "synth",
     "family": "pocsag",
