@@ -100,7 +100,7 @@ pub(crate) fn nullable_enum<T: JsonSchema>(g: &mut schemars::SchemaGenerator) ->
 }
 
 /// The embedded rows, one file each under `modes/` in the repo.
-const EMBEDDED: [(&str, &str); 12] = [
+const EMBEDDED: [(&str, &str); 13] = [
     (
         "modes/acars_decode.json",
         include_str!("../../../../modes/acars_decode.json"),
@@ -128,6 +128,10 @@ const EMBEDDED: [(&str, &str); 12] = [
     (
         "modes/hfdl_decode.json",
         include_str!("../../../../modes/hfdl_decode.json"),
+    ),
+    (
+        "modes/m17_decode.json",
+        include_str!("../../../../modes/m17_decode.json"),
     ),
     (
         "modes/m20_decode.json",

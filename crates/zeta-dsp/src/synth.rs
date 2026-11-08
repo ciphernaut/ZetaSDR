@@ -1120,13 +1120,13 @@ pub const M17_DEVIATION_HZ: f64 = 2400.0;
 /// M17's root-raised-cosine roll-off.
 pub const M17_RRC_ALPHA: f64 = 0.5;
 /// Symbols the root-raised-cosine pulse spans (the specification's minimum).
-const RRC_SPAN_SYMBOLS: f64 = 8.0;
+pub(crate) const RRC_SPAN_SYMBOLS: f64 = 8.0;
 /// Stream frames the `m17` family sends at most (10 s).
 const M17_FRAMES_MAX: u32 = 250;
 
 /// The root-raised-cosine impulse response at `t` symbol periods from its centre, for
 /// roll-off `alpha` (unnormalised; the removable points taken at their limits).
-fn rrc(t: f64, alpha: f64) -> f64 {
+pub(crate) fn rrc(t: f64, alpha: f64) -> f64 {
     if t.abs() < 1e-9 {
         return 1.0 - alpha + 4.0 * alpha / PI;
     }

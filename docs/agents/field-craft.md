@@ -157,6 +157,10 @@ An `fm_demod` shapes its audio as a voice receiver does: a 3.4 kHz low-pass (`au
 
 A `fm_demod` or `am_demod` has an automatic squelch: an idle channel publishes no audio, so a quiet transcript is normal. `squelch` events say why a row is quiet (idle, or open). It opens 6 dB over the tracked noise floor (`squelch_db: null`, the default) and closes after 300 ms under it. To fix or disable it, `graph get`, set `squelch_db` (an absolute threshold in dBFS, -120..=0, not dB above the floor) or `squelch: false` on the demodulator's node, `graph put`; such a put keeps the job re-expandable at later capture changes. A `--then-tail` of an idle squelched channel is empty: that is the squelch, not a fault.
 
+### Decoding digital voice
+
+M17 is decoded in the node: `job start --kind m17_decode --source S --center-hz HZ --bandwidth-hz 12500` on a 2 m or 70 cm channel, `HZ` the measured centre (4FSK at 4800 baud). Each stream gives two events: one when its link setup is in hand (at its first frame, or within six frames from the LICH when the job joins mid-stream; `frame` says which) and one at its end (`eot: true`, the last frame number). Both name `src`, `dst`, `can`, `type`, `encryption` and `codec`, and `lat`/`lon` when the stream carries a GNSS position. Its speech is ordinary job audio: the page plays it, and `job attach --kind transcribe --job THAT_ID` transcribes it as it does a demodulator's. An encrypted stream (`encryption` not null) is reported with its fields and never decoded, so it has no audio. The speech comes from `c2dec` (package codec2) on the node's host; without it the row is `unavailable` naming the package. When `c2dec` exits mid-stream, the events keep coming, that stream's audio stops, and `job context` says why under `m17.vocoder`; the next stream starts it again. DMR and D-STAR have no decoder row.
+
 ### Reading transcripts
 
 Every transcript event of an attached job is also written to the node's `transcripts.log`. `zeta transcripts tail --lines N --job ID` reads the last lines (default 50, one JSON line each: `job`, `source`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns`, `text`, `language`, `dropped`, `error`), so you can answer "what was said on 476.4 MHz" after the fact without a live `stream tail`. It reads the state directory, so it does not work with `--node`. A line with `error` set is a failed utterance, not silence.
@@ -164,8 +168,6 @@ Every transcript event of an attached job is also written to the node's `transcr
 ### Reading past events
 
 Every event of every job on a source (every decoded frame, detection or transcript the source's feed carried, whether or not a page or a `stream tail` was open) is also written to the node's `events.log`. `zeta events tail --lines N [--job ID] [--source ID] [--protocol NAME]` reads the last lines (default 50, one JSON line each: `t_ns`, `source`, `job`, `channel`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns` and the event under `event`), so "what did ACARS hear overnight" is `zeta events tail --protocol acars --lines 500` after the fact, and "which aircraft were up on 131.450" is the same filtered by `--job`. It reads the state directory, so it does not work with `--node`. The log holds the last 32 MiB plus one rotated file; a job's events before that are gone.
-
-Digital voice decoders (DMR, D-STAR, M17) will be transcribed the same way: they produce audio, so `job attach --kind transcribe` to them.
 
 ### Taking the radio from another job
 
@@ -260,7 +262,7 @@ A signal nobody has named goes up a ladder; stop at the first rung that answers,
 
 When `classify` answers `too_old` the ring has moved on: the error carries the ring's earliest start in its detail; re-issue on the latest span it still holds, and say so.
 
-The playbook ends at classification and, when the operator accepts one, the signature written back so the next encounter is a layer 2 match or, for a framed signature with a CRC and a symbol rate, a decode. It stops before decoding the content of a third-party transmission: measuring, classifying, capturing a few bursts to identify the signal and saying who the register says is licensed is in scope; recovering and reading the messages of someone else's link is not, and interception law varies by country, so that is the operator's decision and legal responsibility. State this legal line once when a request goes that way, and do not repeat it. A known public protocol the node has a decoder row for (APRS, POCSAG, ADS-B, ACARS, AIS, radiosondes) is the ordinary use of the radio and is not held back by it. Bits and frame hypotheses are ops now (below), and so is the signature write-back (item 11 below).
+The playbook ends at classification and, when the operator accepts one, the signature written back so the next encounter is a layer 2 match or, for a framed signature with a CRC and a symbol rate, a decode. It stops before decoding the content of a third-party transmission: measuring, classifying, capturing a few bursts to identify the signal and saying who the register says is licensed is in scope; recovering and reading the messages of someone else's link is not, and interception law varies by country, so that is the operator's decision and legal responsibility. State this legal line once when a request goes that way, and do not repeat it. A known public protocol the node has a decoder row for (APRS, POCSAG, ADS-B, ACARS, AIS, radiosondes, M17) is the ordinary use of the radio and is not held back by it. Bits and frame hypotheses are ops now (below), and so is the signature write-back (item 11 below).
 
 ### Working layer 4
 

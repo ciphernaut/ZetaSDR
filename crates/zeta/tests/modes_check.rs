@@ -23,6 +23,8 @@ const NO_MULTIMON: (&str, &str) = (
     "ZETA_HANDLER_MULTIMON_NG",
     "/nonexistent/zeta-test/multimon-ng",
 );
+/// The M17 row's vocoder, pinned to a path none lives at, whatever the host has.
+const NO_C2DEC: (&str, &str) = ("ZETA_HANDLER_C2DEC", "/nonexistent/zeta-test/c2dec");
 const NO_AIRCRAFT_LINKS: [(&str, &str); 2] = [
     ("ZETA_HANDLER_DUMPVDL2", "/nonexistent/zeta-test/dumpvdl2"),
     ("ZETA_HANDLER_DUMPHFDL", "/nonexistent/zeta-test/dumphfdl"),
@@ -44,6 +46,7 @@ fn check(dir: &Path, args: &[&str]) -> Command {
         .envs(NO_SONDE)
         .envs(NO_AIRCRAFT_LINKS)
         .env(NO_MULTIMON.0, NO_MULTIMON.1)
+        .env(NO_C2DEC.0, NO_C2DEC.1)
         .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--modes-dir")
@@ -85,6 +88,12 @@ fn modes_check_passes_the_in_crate_rows() {
             .any(|l| l == "flex_decode: skipped: multimon-ng missing"),
         "{out}"
     );
+    // M17's vocoder is pinned missing here.
+    assert!(
+        out.lines()
+            .any(|l| l == "m17_decode: skipped: c2dec missing"),
+        "{out}"
+    );
     // DFM has no test yet; the RS41 and M20 decoders are pinned missing here.
     assert!(
         out.lines().any(|l| l == "dfm_decode: skipped: no test"),
@@ -124,8 +133,8 @@ fn an_unknown_id_lists_the_known_ones() {
     assert!(
         err.contains(
             "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
-             dfm_decode, flex_decode, hfdl_decode, m20_decode, pocsag_decode, rds_decode, rs41_decode, \
-             vdl2_decode"
+             dfm_decode, flex_decode, hfdl_decode, m17_decode, m20_decode, pocsag_decode, rds_decode, \
+             rs41_decode, vdl2_decode"
         ),
         "{err}"
     );
@@ -585,6 +594,20 @@ fn flex_decode_passes_its_synthesised_check() {
     let (out, code) =
         stdout(check(dir.path(), &["--strict", "flex_decode"]).env(NO_MULTIMON.0, multimon));
     assert_eq!(out.trim(), "flex_decode: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+/// The M17 row proves itself against the real `c2dec`: the synthesised stream passes
+/// through the row's own chain and the stage reports the callsigns and the type.
+#[test]
+fn m17_decode_passes_its_synthesised_check() {
+    let Some(c2dec) = which("c2dec") else {
+        eprintln!("c2dec not on this host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) = stdout(check(dir.path(), &["--strict", "m17_decode"]).env(NO_C2DEC.0, c2dec));
+    assert_eq!(out.trim(), "m17_decode: ok", "{out}");
     assert_eq!(code, 0);
 }
 

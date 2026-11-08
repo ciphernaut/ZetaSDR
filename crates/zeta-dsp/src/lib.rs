@@ -42,6 +42,7 @@ pub mod fsk;
 pub mod gpu_fft;
 pub mod identify;
 pub mod m17;
+pub mod m17_decode;
 pub mod m20_frame;
 pub mod measure;
 pub mod mix;
@@ -84,6 +85,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(pocsag::PocsagDecodeStage::new()));
     reg.register(Arc::new(rds::RdsDecodeStage::new()));
     reg.register(Arc::new(acars::AcarsDecodeStage::new()));
+    reg.register(Arc::new(m17_decode::M17DecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
     reg.register(Arc::new(detect::DetectStage::new()));
     reg.register(Arc::new(burst_capture::BurstCaptureStage::new()));

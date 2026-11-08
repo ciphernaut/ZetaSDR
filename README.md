@@ -141,7 +141,7 @@ endpoint (`--llm-url`, `--llm-model`), and `zeta-mcp` offers every operation as 
 
 ## Legal
 
-The node has decoders for public protocols: APRS, AIS, radiosondes, ADS-B, ACARS, RDS, and POCSAG and FLEX pagers.
+The node has decoders for public protocols: APRS, AIS, radiosondes, ADS-B, ACARS, RDS, POCSAG and FLEX pagers, and M17 digital voice.
 Having a decoder is not permission to use it. Whether you may receive and decode a given
 transmission where you are, pager traffic in particular, depends on your local law and is your
 responsibility; nothing here is legal advice. For an unknown third-party signal the agent's

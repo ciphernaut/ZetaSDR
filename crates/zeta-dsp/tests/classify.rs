@@ -173,10 +173,16 @@ async fn program_rows_are_skipped_quick() {
     let dir = tempfile::tempdir().unwrap();
     let node = node_over_with(dir.path(), &ais_capture(), AIS_A_HZ, None).await;
     let c = classify_span(&node, AIS_A_HZ, 25_000, 2_000_000_000).await;
-    // A program row that scores (vdl2_decode's 25 kHz band matches) is tried but has no
-    // quick attempt.
+    // A program row that scores (flex_decode's 25 kHz band and fsk label match) is tried
+    // but has no quick attempt. So is m17_decode, a graph row with `quick: null`, whose
+    // "anywhere" centre and fsk label put it above vdl2_decode here.
     assert_eq!(
-        outcome(&c, "vdl2_decode"),
+        outcome(&c, "flex_decode"),
+        Some(Outcome::SkippedQuick),
+        "{c:?}"
+    );
+    assert_eq!(
+        outcome(&c, "m17_decode"),
         Some(Outcome::SkippedQuick),
         "{c:?}"
     );

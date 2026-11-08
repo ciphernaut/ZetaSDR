@@ -152,13 +152,19 @@ impl Classifier for DecodeToIdentify {
         let mut chans: Vec<((i64, u64), Option<(Vec<Complex<f32>>, u64)>)> = Vec::new();
         let mut labels = Vec::new();
         let mut tried = Vec::new();
-        for s in scored
-            .into_iter()
-            .filter(|s| s.in_range)
-            .take(CLASSIFY_TRIES)
-        {
+        // Only the rows with a quick attempt count towards [`CLASSIFY_TRIES`]: a row
+        // without one (a program row, or `m17_decode`, whose empty centre list scores
+        // anywhere) is listed as skipped above the last one tried, never in its place.
+        let mut counted = 0;
+        for s in scored.into_iter().filter(|s| s.in_range) {
+            if counted == CLASSIFY_TRIES {
+                break;
+            }
             let row = &s.mode.row;
             let attempt = quick_attempt(row);
+            if attempt.is_some() {
+                counted += 1;
+            }
             let outcome = match &attempt {
                 _ if row.identify.min_span_ms > span_ms => Outcome::SkippedSpan,
                 None => Outcome::SkippedQuick,

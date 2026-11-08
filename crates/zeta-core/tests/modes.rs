@@ -21,7 +21,7 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 12] = [
+const EMBEDDED: [&str; 13] = [
     "acars_decode",
     "adsb_decode",
     "ais_decode",
@@ -29,6 +29,7 @@ const EMBEDDED: [&str; 12] = [
     "dfm_decode",
     "flex_decode",
     "hfdl_decode",
+    "m17_decode",
     "m20_decode",
     "pocsag_decode",
     "rds_decode",
@@ -547,6 +548,7 @@ fn the_rows_thin_their_tracks_as_planned() {
         ("vdl2_decode", 100, 1000.0),
         ("hfdl_decode", 100, 1000.0),
         ("ais_decode", 200, 50.0),
+        ("m17_decode", 100, 50.0),
     ];
     let reg = ModeRegistry::load(&stages(), None);
     for (id, points, min_m) in plan {
@@ -569,7 +571,7 @@ fn the_rows_name_the_planned_subjects() {
     );
     use SubjectWaterfall::{Fold, Summary};
     let sondes: &[&str] = &["alt", "vel_v"];
-    let plan: [Plan; 10] = [
+    let plan: [Plan; 11] = [
         (
             "adsb_decode",
             "icao",
@@ -651,6 +653,15 @@ fn the_rows_name_the_planned_subjects() {
             &["name", "callsign", "sog_kt", "cog_deg", "destination"],
             Some("cog_deg"),
             Some("name"),
+        ),
+        (
+            "m17_decode",
+            "src",
+            "stations",
+            Fold,
+            &["dst", "type", "can", "encryption"],
+            None,
+            None,
         ),
     ];
     let reg = ModeRegistry::load(&stages(), None);
@@ -915,8 +926,30 @@ async fn reload_modes_keeps_a_graph_rows_handler_state() {
 fn every_embedded_row_emits_events_today() {
     let reg = ModeRegistry::load(&stages(), None);
     for m in reg.all() {
-        assert_eq!(m.outputs, [StreamKind::Event], "{}", m.row.id.0);
+        let want: &[StreamKind] = match m.row.id.0.as_str() {
+            // M17's speech is ordinary job audio beside its events.
+            "m17_decode" => &[StreamKind::Event, StreamKind::Audio],
+            _ => &[StreamKind::Event],
+        };
+        assert_eq!(m.outputs, want, "{}", m.row.id.0);
     }
+}
+
+/// The M17 row runs its stage in-process and Codec 2 through its one handler, `c2dec`.
+#[test]
+fn the_m17_row_names_c2dec() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let m = reg.get("m17_decode").expect("m17_decode listed");
+    assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
+    let blocks = m.row.decoder.handler_blocks();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].0, ["c2dec".to_string()]);
+    let v = serde_json::to_value(&m.row).unwrap();
+    assert_eq!(v["family"], "amateur_voice");
+    assert_eq!(v["band"]["bandwidth_hz"], 12500);
+    assert_eq!(v["label"], "M17");
+    assert_eq!(v["identify"]["quick"], serde_json::Value::Null);
+    assert_eq!(v["catalogue"], serde_json::json!(["m17-rf-protocol"]));
 }
 
 #[tokio::test]

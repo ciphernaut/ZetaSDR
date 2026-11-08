@@ -19,12 +19,13 @@ fn zeta_bin() -> Command {
     cmd.env_remove("ZETA_NODE")
         .env_remove("ZETA_SECRET")
         .env("XDG_CONFIG_HOME", common::no_xdg_config())
-        // multimon-ng is pinned missing, whatever the host has: a test that wants the FLEX
-        // row ready sets it again.
+        // multimon-ng and c2dec are pinned missing, whatever the host has: a test that
+        // wants the FLEX or the M17 row ready sets them again.
         .env(
             "ZETA_HANDLER_MULTIMON_NG",
             "/nonexistent/zeta-test/multimon-ng",
-        );
+        )
+        .env("ZETA_HANDLER_C2DEC", "/nonexistent/zeta-test/c2dec");
     cmd
 }
 
@@ -2741,6 +2742,9 @@ const AIRCRAFT_LINK_HANDLERS: [&str; 2] = ["ZETA_HANDLER_DUMPVDL2", "ZETA_HANDLE
 /// The FLEX row's program, pinned like the others.
 const PAGER_HANDLERS: [&str; 1] = ["ZETA_HANDLER_MULTIMON_NG"];
 
+/// The M17 row's vocoder, pinned like the others.
+const VOICE_HANDLERS: [&str; 1] = ["ZETA_HANDLER_C2DEC"];
+
 /// `zeta modes list` (one-shot) prints the embedded rows, all ready; `--family`
 /// narrows it and `modes show` prints one row.
 #[test]
@@ -2757,6 +2761,7 @@ fn modes_list_prints_the_embedded_rows() {
         .iter()
         .chain(&AIRCRAFT_LINK_HANDLERS)
         .chain(&PAGER_HANDLERS)
+        .chain(&VOICE_HANDLERS)
     {
         cmd.env(var, fake_lines());
     }
@@ -2775,6 +2780,7 @@ fn modes_list_prints_the_embedded_rows() {
             "dfm_decode",
             "flex_decode",
             "hfdl_decode",
+            "m17_decode",
             "m20_decode",
             "pocsag_decode",
             "rds_decode",
