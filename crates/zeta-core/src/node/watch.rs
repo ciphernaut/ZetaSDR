@@ -21,7 +21,13 @@
 //! fitting row nearest its width starts directly on the signal's centroid (`decoding`
 //! with `via: modes`, no identify run, in the capture or under `decode_on: free` on a
 //! free source), and rows tied for nearest (one channel width) run an identify
-//! restricted to them.
+//! restricted to them. At the start of each run a span watch learns its known channels
+//! (spec 4.3, `job_context.watch.known`): the listed rows' centres in the band and the
+//! licensed transmitters there whose emission fits a listed row ([`band_assignments`],
+//! asked once). A signal on one ranks first for a slot and a direct start on a
+//! register's names the licensee; with `seed_known` a decoder starts on each at once,
+//! `lost` `not seen again` unless a `new` on its channel comes within `hold_ms`. A known
+//! channel never moves a decoder.
 //!
 //! Every watch keeps at most the `detect` node's `max_decoders` decoders (spec 4.4),
 //! counting those on free sources: over the cap a signal that would take one is
@@ -60,6 +66,7 @@ use super::persist::now;
 use super::{Inner, source_fault_reason};
 use crate::graph::{self, Edge, Graph, Node as GraphNode, NodeId};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
+use crate::knowledge::{Allocation, DEFAULT_REGION, band_assignments};
 use crate::modes::ModeRegistry;
 use crate::modes::ModeState;
 use crate::modes::score::score_rows;
@@ -265,7 +272,6 @@ pub(super) struct Policy {
     /// With `modes`, how long a directly started decoder has to publish an event (0: off).
     confirm_ms: u64,
     /// With `modes`, start a decoder on every known channel in the band at once.
-    #[allow(dead_code)] // read by the known-channel seeding
     seed_known: bool,
 }
 
@@ -523,12 +529,46 @@ struct Cooled {
     why: String,
 }
 
-/// A known channel (spec 4.3): a centre the watch expected before the detector saw
-/// anything. A signal on one ranks first for a free slot.
-#[derive(Clone, Debug)]
+/// A known channel (spec 4.3, `job_context.watch.known.channels`): a centre a span
+/// watch expected before the detector saw anything, a listed row's centre or a licensed
+/// transmitter whose emission fits a listed row. A signal on one ranks first for a free
+/// slot and a direct start on a register's names the licensee; with `seed_known` its
+/// decoder starts at once.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Known {
     center_hz: u64,
+    /// The row's channel width.
     bandwidth_hz: u64,
+    /// The listed row it decodes with.
+    mode: String,
+    from: KnownFrom,
+    licensee: Option<String>,
+    site: Option<String>,
+    distance_km: Option<f64>,
+    /// The register's assignments folded into it (0 for a row's centre).
+    sites: usize,
+    /// The nearest site's assignment, for the `decoding` summary.
+    #[serde(skip)]
+    allocation: Option<Allocation>,
+}
+
+/// Where a known channel comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum KnownFrom {
+    /// A listed row's `band.centers_hz`.
+    Row,
+    /// A licence register's transmitter.
+    Register,
+}
+
+/// The known channel `s` overlaps (by the known's width): a register's first (it names
+/// a licensee), then the nearest centre.
+fn known_at<'a>(known: &'a [Known], s: &Signal) -> Option<&'a Known> {
+    known
+        .iter()
+        .filter(|k| s.overlaps(k.center_hz, k.bandwidth_hz))
+        .min_by_key(|k| (k.allocation.is_none(), k.center_hz.abs_diff(s.center_hz)))
 }
 
 /// The `why` of a `lost` decoder whose signal went and that stayed silent for the hold.
@@ -612,8 +652,11 @@ struct State {
     max_decoders: u32,
     /// The channels no new decoder starts on yet.
     cooled: Vec<Cooled>,
-    /// The known channels in the band (none yet: spec 4.3 fills them).
+    /// A span watch's known channels in the band, built once at the start of a run.
     known: Vec<Known>,
+    /// What the register query for `known` asked and was answered (`{"providers",
+    /// "assignments"}`); null without `modes`.
+    register: serde_json::Value,
     /// The identify run in progress and the centre of the signal it is on.
     current: Option<(JobId, u64)>,
     /// The decoders' event streams, by job.
@@ -708,6 +751,14 @@ impl State {
             "decoding": self.decoding,
             "current": self.current.as_ref().map(|(j, _)| j.0.clone()),
             "cooled": self.cooled,
+            "known": match &self.register {
+                serde_json::Value::Object(r) => {
+                    let mut k = r.clone();
+                    k.insert("channels".into(), serde_json::json!(self.known));
+                    serde_json::Value::Object(k)
+                }
+                _ => serde_json::Value::Null,
+            },
             "cap": {
                 "max": self.max_decoders,
                 "decoding": self.decoding.len(),
@@ -740,11 +791,7 @@ fn cooled_overlaps(w: &State, center_hz: u64, bandwidth_hz: u64, now: u64) -> bo
 /// How `a` ranks against `b` for a free decoder slot (greater first): a signal on a
 /// `known` channel first, then the queue's `score`, then SNR.
 fn rank(a: &Tracked, b: &Tracked, known: &[Known]) -> Ordering {
-    let on_known = |t: &Tracked| {
-        known
-            .iter()
-            .any(|k| t.signal.overlaps(k.center_hz, k.bandwidth_hz))
-    };
+    let on_known = |t: &Tracked| known_at(known, &t.signal).is_some();
     on_known(a)
         .cmp(&on_known(b))
         .then(a.score.total_cmp(&b.score))
@@ -1187,6 +1234,10 @@ impl Inner {
         let confirm_ns = r.seed.policy.confirm_ms.saturating_mul(1_000_000);
         let unproven_by_ns = (confirm_ns > 0).then(|| t.saturating_add(confirm_ns));
         let signal = tracked.signal.clone();
+        let register = known_at(&w.known, &signal)
+            .and_then(|k| k.allocation.as_ref())
+            .map(|a| register_says(&serde_json::json!([a])))
+            .unwrap_or_default();
         w.subs.insert(job.clone(), self.decoder_subs(job));
         w.decoding.push(Decoding {
             mode: mode.to_string(),
@@ -1203,7 +1254,7 @@ impl Inner {
             unproven_by_ns,
         });
         let mut summary = format!(
-            "decoding {mode} at {} on {} ({}, modes)",
+            "decoding {mode} at {} on {} ({}, modes){register}",
             signal.mhz(),
             source.0,
             placed.as_str()
@@ -1499,6 +1550,7 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
         max_decoders: r.seed.policy.max_decoders,
         cooled: std::mem::take(&mut r.seed.cooled),
         known: Vec::new(),
+        register: serde_json::Value::Null,
         current: None,
         subs: HashMap::new(),
         pending: None,
@@ -1581,6 +1633,15 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
         w.subs.insert(d.job.clone(), inner.decoder_subs(&d.job));
         w.decoding.push(d);
     }
+    if r.seed.policy.modes.is_some() {
+        match known_channels(inner, r).await {
+            None => return cancelled(),
+            Some((known, register)) => (w.known, w.register) = (known, register),
+        }
+        if r.seed.policy.seed_known && seed(inner, r, w).await.is_none() {
+            return cancelled();
+        }
+    }
     inner.watch_save(r, w);
     loop {
         tokio::select! {
@@ -1615,6 +1676,166 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
     }
 }
 
+/// A span watch's known channels (spec 4.3) and what the register query asked and
+/// answered (`{"providers": <providers giving assignments>, "assignments": <centres
+/// answered>}`; an unreachable register answers nothing, which this cannot tell from
+/// nothing licensed): each listed ready row's `band.centers_hz` inside the band
+/// (`from: row`), then each transmitter [`band_assignments`] finds in the band (the
+/// station's region, else [`DEFAULT_REGION`]; centres within half the narrowest listed
+/// row's width are one) whose decoded emission width fits a listed row by
+/// [`WIDTH_FIT`] (`from: register`, the row whose width lies nearest). `None`:
+/// cancelled.
+async fn known_channels(inner: &Arc<Inner>, r: &Run) -> Option<(Vec<Known>, serde_json::Value)> {
+    let modes = inner.modes();
+    let band = r.tuning;
+    let rows: Vec<(String, u64, Vec<u64>)> = r
+        .seed
+        .policy
+        .modes
+        .iter()
+        .flatten()
+        .filter_map(|id| {
+            let m = modes.get(id)?;
+            let width = m.row.band.bandwidth_hz;
+            (m.state == ModeState::Ready && width <= band.bandwidth_hz.0)
+                .then(|| (id.clone(), width, m.row.band.centers_hz.clone()))
+        })
+        .collect();
+    let inside = |hz: u64| hz.abs_diff(band.center_hz.0) <= band.bandwidth_hz.0 / 2;
+    let mut known: Vec<Known> = rows
+        .iter()
+        .flat_map(|(id, width, centres)| {
+            centres.iter().filter(|c| inside(**c)).map(|c| Known {
+                center_hz: *c,
+                bandwidth_hz: *width,
+                mode: id.clone(),
+                from: KnownFrom::Row,
+                licensee: None,
+                site: None,
+                distance_km: None,
+                sites: 0,
+                allocation: None,
+            })
+        })
+        .collect();
+    let providers = inner.knowledge.read().unwrap().clone();
+    let asked = providers.iter().filter(|p| p.gives_assignments()).count();
+    let Some(narrowest) = rows.iter().map(|(_, w, _)| *w).min() else {
+        let register = serde_json::json!({"providers": asked, "assignments": 0});
+        return Some((known, register));
+    };
+    let region = inner
+        .station
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region.clone());
+    let lookup = band_assignments(
+        &providers,
+        &region,
+        band.center_hz,
+        band.bandwidth_hz,
+        Hz(narrowest / 2),
+    );
+    let found = tokio::select! {
+        a = lookup => a,
+        _ = r.cancel.cancelled() => return None,
+    };
+    for b in &found {
+        let a = &b.allocation;
+        let (Some(center), Some(emission)) = (a.center_hz, a.emission_decoded.as_ref()) else {
+            continue;
+        };
+        let licensed = emission.bandwidth_hz.0;
+        let row = rows
+            .iter()
+            .filter(|(_, w, _)| fits_within(WIDTH_FIT, *w, licensed))
+            .min_by(|x, y| {
+                let off = |w: u64| (w as f64 / licensed as f64).ln().abs();
+                off(x.1).total_cmp(&off(y.1))
+            });
+        let Some((id, width, _)) = row else {
+            continue;
+        };
+        known.push(Known {
+            center_hz: center.0,
+            bandwidth_hz: *width,
+            mode: id.clone(),
+            from: KnownFrom::Register,
+            licensee: a.licensee.clone(),
+            site: a.site.clone(),
+            distance_km: a.distance_km,
+            sites: b.sites,
+            allocation: Some(a.clone()),
+        });
+    }
+    let register = serde_json::json!({"providers": asked, "assignments": found.len()});
+    Some((known, register))
+}
+
+/// `seed_known`: start a decoder at once on each known channel up to the cap, at the
+/// known centre with its row ([`Inner::start_direct`] on a tracked signal there that
+/// the detector has not seen), unless a decoder (an adopted one, an earlier seed)
+/// already covers it, its channel is cooled or another job holds it. Each must be
+/// confirmed by a `new` on its channel within `hold_ms` or is `lost` `not seen again`.
+/// `None`: cancelled.
+async fn seed(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Option<()> {
+    let hold_ns = r.seed.policy.hold_ms.saturating_mul(1_000_000);
+    for k in w.known.clone() {
+        if w.full() {
+            break;
+        }
+        let t = now().0;
+        let signal = Signal {
+            center_hz: k.center_hz,
+            bandwidth_hz: k.bandwidth_hz,
+            snr_db: 0.0,
+            first_ns: t,
+            last_ns: t,
+        };
+        let decoded = w
+            .decoding
+            .iter()
+            .any(|d| d.signal.overlaps(signal.center_hz, signal.bandwidth_hz));
+        if decoded
+            || cooled_overlaps(w, signal.center_hz, signal.bandwidth_hz, t)
+            || inner.held_elsewhere(r, w, &signal)
+        {
+            continue;
+        }
+        w.signals.push(Tracked {
+            signal,
+            present: false,
+            tries: 0,
+            next_retry_ns: None,
+            handled: false,
+            band_hz: k.bandwidth_hz,
+            score: 0.0,
+            features: None,
+            allocations: None,
+            learned: None,
+            captured: false,
+            captures: Vec::new(),
+            fits: vec![k.mode.clone()],
+            waiting: false,
+        });
+        let i = w.signals.len() - 1;
+        match inner.start_direct(r, w, i, &k.mode).await {
+            Ok(None) => return None,
+            Ok(Some(job)) => {
+                if let Some(d) = w.decoding.iter_mut().find(|d| d.job == job) {
+                    d.confirm_by_ns = Some(d.since_ns.saturating_add(hold_ns));
+                }
+            }
+            // Its `unknown` is published; nothing on the air to retry.
+            Err(_) => {
+                w.signals.remove(i);
+            }
+        }
+    }
+    Some(())
+}
+
 /// Take `detect`'s announcements since the last tick into the state; whether it changed.
 fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
     let mut changed = false;
@@ -1644,9 +1865,14 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
         {
             match new {
                 true => {
+                    // The decoder stays where it runs (a seeded one on its known centre).
                     d.signal = s.clone();
                     d.gone_since_ns = None;
-                    d.confirm_by_ns = None;
+                    // A seeded decoder's `confirm_ms` counts from its signal's first `new`.
+                    if d.confirm_by_ns.take().is_some() && d.unproven_by_ns.is_some() {
+                        let confirm_ns = r.seed.policy.confirm_ms.saturating_mul(1_000_000);
+                        d.unproven_by_ns = Some(t.saturating_add(confirm_ns));
+                    }
                 }
                 false => d.gone_since_ns = Some(t),
             }
@@ -2333,6 +2559,13 @@ mod tests {
         let known = [Known {
             center_hz: 148_600_000,
             bandwidth_hz: 12_500,
+            mode: "pocsag_decode".into(),
+            from: KnownFrom::Row,
+            licensee: None,
+            site: None,
+            distance_km: None,
+            sites: 0,
+            allocation: None,
         }];
         assert_eq!(rank(&a, &b, &known), Ordering::Greater, "known first");
     }
@@ -2350,6 +2583,7 @@ mod tests {
                 why: WHY_UNPROVEN.into(),
             }],
             known: Vec::new(),
+            register: serde_json::Value::Null,
             current: None,
             subs: HashMap::new(),
             pending: None,

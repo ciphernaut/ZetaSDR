@@ -939,32 +939,92 @@ async fn an_unknown_signal_is_retried_at_most_three_times() {
     zeta_core::node::watch::test_timing(0, 0);
 }
 
-/// A licence register's answer: one transmitter licensed for 16K0F1D on the band.
-struct Register;
+/// A licence register's answer, after `delay`: `rows` when given, else one transmitter
+/// licensed for 16K0F1D at the centre of whatever band it is asked about.
+struct Register {
+    rows: Option<Vec<Allocation>>,
+    delay: Duration,
+}
+
+impl Register {
+    /// One transmitter licensed for 16K0F1D at the centre asked about.
+    fn licensed() -> Register {
+        Register {
+            rows: None,
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// `rows`, whatever it is asked.
+    fn with(rows: Vec<Allocation>) -> Register {
+        Register {
+            rows: Some(rows),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// [`Register::with`] answering after `delay`.
+    fn slow(rows: Vec<Allocation>, delay: Duration) -> Register {
+        Register {
+            rows: Some(rows),
+            delay,
+        }
+    }
+}
+
+/// A transmitter licensed at `center_hz` for `bw_hz` (`emission`, decoded) to
+/// `licensee` at `site`, `km` from the station.
+fn assignment(
+    center_hz: u64,
+    bw_hz: u64,
+    emission: &str,
+    licensee: &str,
+    site: &str,
+    km: f64,
+) -> Allocation {
+    Allocation {
+        provider: "register".into(),
+        region: "AU".into(),
+        min_hz: Hz(center_hz - bw_hz / 2),
+        max_hz: Hz(center_hz + bw_hz / 2),
+        service: "assignment".into(),
+        note: None,
+        kind: Some("assignment".into()),
+        licensee: Some(licensee.into()),
+        site: Some(site.into()),
+        distance_km: Some(km),
+        center_hz: Some(Hz(center_hz)),
+        bandwidth_hz: Some(Hz(bw_hz)),
+        role: Some("tx".into()),
+        emission: Some(emission.into()),
+        emission_decoded: zeta_core::emission::parse_emission(emission),
+        ..Allocation::default()
+    }
+}
 
 #[async_trait]
 impl KnowledgeProvider for Register {
     fn name(&self) -> &str {
         "register"
     }
+    fn gives_assignments(&self) -> bool {
+        true
+    }
     async fn allocations(&self, region: &str, center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Allocation> {
+        tokio::time::sleep(self.delay).await;
+        if let Some(rows) = &self.rows {
+            return rows.clone();
+        }
         vec![Allocation {
-            provider: "register".into(),
             region: region.into(),
-            min_hz: Hz(center_hz.0 - 8_000),
-            max_hz: Hz(center_hz.0 + 8_000),
-            service: "assignment".into(),
-            note: None,
-            kind: Some("assignment".into()),
-            licensee: Some("Test Telemetry Pty Ltd".into()),
-            site: Some("Mt Gravatt".into()),
-            distance_km: Some(7.6),
-            center_hz: Some(center_hz),
-            bandwidth_hz: Some(Hz(16_000)),
-            role: Some("tx".into()),
-            emission: Some("16K0F1D".into()),
-            emission_decoded: zeta_core::emission::parse_emission("16K0F1D"),
-            ..Allocation::default()
+            ..assignment(
+                center_hz.0,
+                16_000,
+                "16K0F1D",
+                "Test Telemetry Pty Ltd",
+                "Mt Gravatt",
+                7.6,
+            )
         }]
     }
     async fn signatures(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Signature> {
@@ -983,7 +1043,7 @@ async fn an_unknown_summary_names_the_licensee() {
         Some(&fixtures().quick_modes),
     )
     .await;
-    node.add_knowledge(Arc::new(Register));
+    node.add_knowledge(Arc::new(Register::licensed()));
     let node = Arc::new(node);
     let watch = start_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);
@@ -3416,5 +3476,163 @@ async fn a_span_watch_is_readopted_with_the_hold() {
     }
     assert!(events.watch("lost").is_empty(), "{:#?}", events.all());
     assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
+/// The known-channel tests' register: one 12.5 kHz data transmitter licensed at the
+/// second page of `pocsag3` (which is also `pocsag_decode`'s listed centre).
+fn telco() -> Allocation {
+    assignment(
+        CENTER_HZ + SPAN_OFFSETS_HZ[1],
+        12_500,
+        "12K5F1D",
+        "Telco",
+        "Mount X",
+        3.0,
+    )
+}
+
+/// The `watch.known` record.
+fn known(node: &Node, watch: &JobId) -> Value {
+    node.job_context(watch)
+        .map(|c| c["watch"]["known"].clone())
+        .unwrap_or_default()
+}
+
+/// The known channels' `(center_hz, from)`.
+fn known_channels(node: &Node, watch: &JobId) -> Vec<(u64, String)> {
+    known(node, watch)["channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|k| {
+            (
+                k["center_hz"].as_u64().unwrap_or(0),
+                k["from"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn known_channels_rank_first_and_name_the_licensee() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    node.add_knowledge(Arc::new(Register::with(vec![telco()])));
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["max_decoders"] = 1.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    until("the known channels", Duration::from_secs(5), || {
+        known_channels(&node, &watch)
+            == [
+                (POCSAG_HZ, "row".to_string()),
+                (CENTER_HZ + SPAN_OFFSETS_HZ[1], "register".to_string()),
+            ]
+    })
+    .await;
+    let k = known(&node, &watch);
+    assert_eq!(k["providers"], 1, "{k}");
+    assert_eq!(k["assignments"], 1, "{k}");
+    let register = &k["channels"][1];
+    assert_eq!(register["licensee"], "Telco", "{k}");
+    assert_eq!(register["site"], "Mount X", "{k}");
+    assert_eq!(register["mode"], "pocsag_decode", "{k}");
+    assert_eq!(register["sites"], 1, "{k}");
+    assert_eq!(register["bandwidth_hz"], POCSAG_WIDTH_HZ, "{k}");
+    assert_eq!(k["channels"][0]["sites"], 0, "{k}");
+    until("a decoding event", SPAN_ALL_THREE, || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    // The one slot goes to the known channel, not the page below it.
+    let e = &events.watch("decoding")[0];
+    let hz = e["signal"]["center_hz"].as_u64().unwrap();
+    assert!(on_page(hz, SPAN_OFFSETS_HZ[1]), "{e}");
+    let summary = e["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("; register says 12K5F1D (12.5 kHz FM data) Telco, Mount X, 3 km"),
+        "{e}"
+    );
+    stop_all(&node).await;
+}
+
+/// The seeding test's hold: the seeded decoder is lost this long after its start.
+const SEED_HOLD_MS: u64 = 2_000;
+/// How long the seeding test's register takes: the test's event collector subscribes
+/// meanwhile, so it sees the seeded decoder's `decoding`.
+const SEED_REGISTER_DELAY: Duration = Duration::from_millis(500);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seed_known_starts_the_known_channel_before_any_signal() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    // Noise only: the detector never announces a signal.
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, true).await;
+    node.add_knowledge(Arc::new(Register::slow(vec![telco()], SEED_REGISTER_DELAY)));
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["seed_known"] = true.into();
+    params["hold_ms"] = SEED_HOLD_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    until("a seeded decoder", Duration::from_secs(10), || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    let e = events.watch("decoding")[0].clone();
+    assert_eq!(e["via"], "modes", "{e}");
+    assert_eq!(e["mode"], "pocsag_decode", "{e}");
+    let center = CENTER_HZ + SPAN_OFFSETS_HZ[1];
+    assert_eq!(e["signal"]["center_hz"], center, "{e}");
+    let news = || {
+        events
+            .signals()
+            .iter()
+            .filter(|s| s["state"] == "new")
+            .count()
+    };
+    assert_eq!(news(), 0, "{:#?}", events.all());
+    // The row's centre and the register's are one channel: one decoder.
+    let job = JobId(e["job"].as_str().unwrap().into());
+    assert_eq!(decoder_center(&node, &job), center);
+    until(
+        "it is lost",
+        Duration::from_millis(SEED_HOLD_MS + 5_000),
+        || !events.watch("lost").is_empty(),
+    )
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert_eq!(lost["why"], "not seen again", "{lost}");
+    assert_eq!(events.watch("decoding").len(), 1, "{:#?}", events.all());
+    assert_eq!(news(), 0, "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
+/// The unreachable register's delay before it answers nothing.
+const UNREACHABLE_DELAY: Duration = Duration::from_millis(50);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_register_leaves_known_from_rows_only() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    node.add_knowledge(Arc::new(Register::slow(Vec::new(), UNREACHABLE_DELAY)));
+    let node = Arc::new(node);
+    let watch = start_watch(&node, span_params(&["pocsag_decode"])).await;
+    until("the row's channel only", Duration::from_secs(5), || {
+        known_channels(&node, &watch) == [(POCSAG_HZ, "row".to_string())]
+    })
+    .await;
+    let k = known(&node, &watch);
+    assert_eq!(k["providers"], 1, "{k}");
+    assert_eq!(k["assignments"], 0, "{k}");
+    n_decoders_without_identify(&node, &watch, 2).await;
     stop_all(&node).await;
 }
