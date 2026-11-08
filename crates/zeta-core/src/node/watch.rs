@@ -16,10 +16,12 @@
 //! named a learned signature for it (summary `learned <name> at <MHz>: ...`).
 //!
 //! With `modes` on the `detect` node (a span watch, spec 4.2), a signal is matched to the
-//! listed rows its measured width fits ([`WIDTH_FIT`]) instead: one row starts that
-//! decoder directly on the signal's centroid inside the capture (`decoding` with `via:
-//! modes`, no identify run), none makes it `unknown` at once (`no listed mode fits`,
-//! retried and captured as above), several run an identify restricted to them.
+//! listed rows its measured width fits ([`SPAN_WIDTH_FIT`]) instead: none makes it
+//! `unknown` at once (`no listed mode fits`, retried and captured as above); else the
+//! fitting row nearest its width starts directly on the signal's centroid (`decoding`
+//! with `via: modes`, no identify run, in the capture or under `decode_on: free` on a
+//! free source), and rows tied for nearest (one channel width) run an identify
+//! restricted to them.
 //!
 //! Events, `protocol: "watch"`, go on the job's event stream beside `detect`'s `signal`
 //! events: `state` `identifying | decoding | unknown | lost | capturing | captured`, with
@@ -68,10 +70,36 @@ pub const SILENCE_MS: u64 = WATCH_HOLD_MS_DEFAULT;
 /// `band.bandwidth_hz` (the scoring's width term).
 pub const WIDTH_FIT: (f64, f64) = (0.5, 1.5);
 
+/// A span watch's listed row fits a detected signal whose width lies within these
+/// multiples of the row's `band.bandwidth_hz`: wider than [`WIDTH_FIT`] above, since the
+/// detector reads a strong FSK signal's skirts (a 12.5 kHz page reads 19-25 kHz).
+pub const SPAN_WIDTH_FIT: (f64, f64) = (0.5, 2.0);
+/// Two fitting rows whose width ratios lie this close (in |ln ratio|) tie for nearest.
+const RATIO_TIE: f64 = 1e-9;
+
+/// Whether a signal `signal_hz` wide fits a row `row_hz` wide within `fit`.
+fn fits_within(fit: (f64, f64), row_hz: u64, signal_hz: u64) -> bool {
+    let row = row_hz as f64;
+    (row * fit.0..=row * fit.1).contains(&(signal_hz as f64))
+}
+
 /// Whether a signal `signal_hz` wide fits a row `row_hz` wide by [`WIDTH_FIT`].
 fn width_fits(row_hz: u64, signal_hz: u64) -> bool {
-    let row = row_hz as f64;
-    (row * WIDTH_FIT.0..=row * WIDTH_FIT.1).contains(&(signal_hz as f64))
+    fits_within(WIDTH_FIT, row_hz, signal_hz)
+}
+
+/// Of the fitting rows `fits` (`(id, band.bandwidth_hz)`), those whose width ratio
+/// (`signal_hz` / the row's width) lies nearest 1 (by |ln ratio|): one row is started
+/// directly, several (rows of one channel width) tie and go to a restricted identify.
+fn nearest_fits(fits: &[(String, u64)], signal_hz: u64) -> Vec<String> {
+    let off = |row_hz: u64| (signal_hz as f64 / row_hz as f64).ln().abs();
+    let Some(best) = fits.iter().map(|(_, w)| off(*w)).min_by(f64::total_cmp) else {
+        return Vec::new();
+    };
+    fits.iter()
+        .filter(|(_, w)| off(*w) - best <= RATIO_TIE)
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 #[cfg(feature = "test-fixtures")]
@@ -405,8 +433,8 @@ struct Tracked {
     /// The captures its capture wrote.
     #[serde(default)]
     captures: Vec<String>,
-    /// The policy's `modes` rows its width fits (and the watch's band holds); empty with
-    /// `modes: null`.
+    /// The policy's `modes` rows its width fits by [`SPAN_WIDTH_FIT`] (and the watch's
+    /// band holds); empty with `modes: null`.
     #[serde(default)]
     fits: Vec<String>,
     /// Whether it waits for a free decoder slot.
@@ -766,24 +794,31 @@ impl Inner {
         })
     }
 
-    /// The rows of the policy's `modes` that fit `s`: ready, its measured width within
-    /// [`WIDTH_FIT`] of the row's band, and the row's band no wider than the watch's.
-    /// Empty with `modes: null`.
-    fn fitting_rows(&self, r: &Run, s: &Signal) -> Vec<String> {
+    /// The rows of the policy's `modes` that fit `s`, with their widths: ready, its
+    /// measured width within [`SPAN_WIDTH_FIT`] of the row's band, and the row's band no
+    /// wider than the watch's. Empty with `modes: null`.
+    fn fitting_rows(&self, r: &Run, s: &Signal) -> Vec<(String, u64)> {
         let Some(list) = &r.seed.policy.modes else {
             return Vec::new();
         };
         let modes = self.modes();
         list.iter()
-            .filter(|id| {
-                modes.get(id).is_some_and(|m| {
-                    let width = m.row.band.bandwidth_hz;
-                    m.state == ModeState::Ready
-                        && width_fits(width, s.bandwidth_hz)
-                        && width <= r.tuning.bandwidth_hz.0
-                })
+            .filter_map(|id| {
+                let m = modes.get(id)?;
+                let width = m.row.band.bandwidth_hz;
+                (m.state == ModeState::Ready
+                    && fits_within(SPAN_WIDTH_FIT, width, s.bandwidth_hz)
+                    && width <= r.tuning.bandwidth_hz.0)
+                    .then(|| (id.clone(), width))
             })
-            .cloned()
+            .collect()
+    }
+
+    /// The ids of [`Inner::fitting_rows`].
+    fn fit_ids(&self, r: &Run, s: &Signal) -> Vec<String> {
+        self.fitting_rows(r, s)
+            .into_iter()
+            .map(|(id, _)| id)
             .collect()
     }
 
@@ -959,7 +994,7 @@ impl Inner {
         started
     }
 
-    /// Start `mode` directly on the tracked signal `i` (one listed row fits it) at the
+    /// Start `mode` directly on the tracked signal `i` (the listed row nearest it) at the
     /// signal's centroid with the row's width and the policy's `sondehub` sink, kept as a
     /// decoder `via: modes` (event `decoding`). Under `decode_on: free` it goes to a free
     /// source as a proved decoder would ([`Inner::start_free`]), else (or when none
@@ -1513,7 +1548,7 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
         let tracked = nearest(&w.signals, s.center_hz, s.bandwidth_hz);
         match (new, tracked) {
             (true, Some(i)) => {
-                w.signals[i].fits = inner.fitting_rows(r, &s);
+                w.signals[i].fits = inner.fit_ids(r, &s);
                 w.signals[i].signal = s;
                 w.signals[i].present = true;
             }
@@ -1526,7 +1561,7 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                     continue;
                 }
                 let (band_hz, score) = inner.identify_band(r, &s);
-                let fits = inner.fitting_rows(r, &s);
+                let fits = inner.fit_ids(r, &s);
                 w.signals.push(Tracked {
                     signal: s,
                     present: true,
@@ -1922,10 +1957,11 @@ enum Next {
 
 /// Act on the best-scoring queued signal that is due, unless another job's band now
 /// overlaps it (it is then dropped). With `modes: null`, start an identify run on it
-/// (event `identifying`). With `modes`, by the listed rows its width fits: none, it is
-/// `unknown` at once (a try, retried and captured as an identify's unknown); one, that
-/// row's decoder starts directly ([`Inner::start_direct`]); several, an identify run
-/// restricted to them.
+/// (event `identifying`). With `modes`, by the listed rows its width fits
+/// ([`SPAN_WIDTH_FIT`]): none, it is `unknown` at once (a try, retried and captured as an
+/// identify's unknown); else the fitting row whose width lies nearest the signal's starts
+/// directly ([`Inner::start_direct`]), and rows tied for nearest (one channel width) run
+/// an identify restricted to them.
 async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
     let t = now().0;
     loop {
@@ -1946,9 +1982,11 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
         }
         let mut candidates = None;
         if r.seed.policy.modes.is_some() {
-            let fits = inner.fitting_rows(r, &w.signals[i].signal);
-            w.signals[i].fits = fits.clone();
-            match fits.as_slice() {
+            let signal = &w.signals[i].signal;
+            let fits = inner.fitting_rows(r, signal);
+            let nearest = nearest_fits(&fits, signal.bandwidth_hz);
+            w.signals[i].fits = fits.into_iter().map(|(id, _)| id).collect();
+            match nearest.as_slice() {
                 [] => {
                     no_fit(inner, r, w, i, t).await;
                     return Next::Started;
@@ -1959,7 +1997,7 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
                         Ok(Some(_)) | Err(_) => Next::Started,
                     };
                 }
-                _ => candidates = Some(fits),
+                _ => candidates = Some(nearest),
             }
         }
         let tracked = w.signals[i].clone();
@@ -2058,6 +2096,30 @@ mod tests {
             fits: Vec::new(),
             waiting: false,
         }
+    }
+
+    #[test]
+    fn a_span_fit_is_tolerant_and_prefers_the_nearest_width() {
+        // A strong 12.5 kHz page reads 22 kHz: it fits now, not by identify's rule.
+        assert!(fits_within(SPAN_WIDTH_FIT, 12_500, 22_000));
+        assert!(!width_fits(12_500, 22_000));
+        // Bounds inclusive; a 60 kHz signal fits no 12.5 or 25 kHz row.
+        assert!(fits_within(SPAN_WIDTH_FIT, 12_500, 25_000));
+        assert!(fits_within(SPAN_WIDTH_FIT, 12_500, 6_250));
+        assert!(!fits_within(SPAN_WIDTH_FIT, 12_500, 60_000));
+        assert!(!fits_within(SPAN_WIDTH_FIT, 25_000, 60_000));
+        let row = |id: &str, w: u64| (id.to_string(), w);
+        // 20 kHz: 25 kHz (ratio 0.8) is nearer than 12.5 kHz (ratio 1.6).
+        let fits = [row("acars", 12_500), row("vdl2", 25_000)];
+        assert_eq!(nearest_fits(&fits, 20_000), ["vdl2"]);
+        assert_eq!(nearest_fits(&fits, 14_000), ["acars"]);
+        // One channel width: a tie, for the restricted identify.
+        let fits = [row("pocsag_decode", 12_500), row("aprs_decode", 12_500)];
+        assert_eq!(
+            nearest_fits(&fits, 22_000),
+            ["pocsag_decode", "aprs_decode"]
+        );
+        assert!(nearest_fits(&[], 22_000).is_empty());
     }
 
     #[test]

@@ -62,6 +62,8 @@ struct Fixtures {
     pocsag3: PathBuf,
     /// The page at [`OFFSET_HZ`] beside the GFSK burst at [`FSK_BESIDE_HZ`], every 2 s.
     pocsag_fsk: PathBuf,
+    /// A GFSK burst about 60 kHz wide at [`FSK_BESIDE_HZ`] every 2 s, at the suite's noise.
+    wide: PathBuf,
 }
 
 /// The span tests' pages, above the capture's centre.
@@ -137,6 +139,8 @@ fn fixtures() -> &'static Fixtures {
         let narrow = fsk_burst(FSK_BESIDE_HZ, NARROW_FSK_BAUD, NARROW_FSK_DEVIATION_HZ);
         let beside = cycle_at(sum(&[&page, &narrow]), 4, SPAN_FSK_SNR_DB);
         let pocsag_fsk = write(dir.path(), "pocsag_fsk", &beside, CENTER_HZ);
+        let burst = fsk_burst(FSK_BESIDE_HZ, WIDE_FSK_BAUD, WIDE_FSK_DEVIATION_HZ);
+        let wide = write(dir.path(), "wide", &cycle(burst, 6), CENTER_HZ);
         let quick_modes = dir.path().join("modes");
         std::fs::create_dir_all(&quick_modes).unwrap();
         for (file, text) in zeta_core::modes::ModeRegistry::embedded() {
@@ -175,6 +179,7 @@ fn fixtures() -> &'static Fixtures {
             frame_modes,
             pocsag3,
             pocsag_fsk,
+            wide,
         }
     })
 }
@@ -185,6 +190,10 @@ const FSK_DEVIATION_HZ: f64 = 3_000.0;
 /// `pocsag_fsk`'s GFSK burst: narrow enough (about 4 kHz) that no 12.5 kHz row fits it.
 const NARROW_FSK_BAUD: u32 = 1_200;
 const NARROW_FSK_DEVIATION_HZ: f64 = 1_000.0;
+/// The `wide` fixture's GFSK burst: about 60 kHz (Carson), far wider than any 12.5 or
+/// 25 kHz row's tolerant fit.
+const WIDE_FSK_BAUD: u32 = 9_600;
+const WIDE_FSK_DEVIATION_HZ: f64 = 20_000.0;
 /// The span fixtures' noise, under each fixture's mean power: each page stands about
 /// 34 dB over the floor in a detector bin, where the detector reads it 13-14 kHz wide.
 /// (The suite's 20 dB leaves the lone page 50 dB up, its skirts read 19-25 kHz wide, and
@@ -2858,4 +2867,107 @@ async fn a_span_watch_with_decode_on_free_starts_its_decoder_on_a_free_source() 
     })
     .await;
     assert!(running(&node).is_empty(), "{:?}", running(&node));
+}
+
+/// A width window wide enough for the suite's loud page (read 19-25 kHz).
+const LOUD_WIDTH_HZ: [u64; 2] = [6_000, 40_000];
+/// A width window wide enough for the `wide` fixture's burst.
+const WIDE_WIDTH_HZ: [u64; 2] = [6_000, 200_000];
+/// Identify's own width fit: the most a 12.5 kHz row takes by it.
+const IDENTIFY_FIT_MAX_HZ: u64 = POCSAG_WIDTH_HZ * 3 / 2;
+/// The span fit's upper bound for a 12.5 kHz row.
+const SPAN_FIT_MAX_HZ: u64 = 2 * POCSAG_WIDTH_HZ;
+
+/// Publish a `detect` announcement `state` of a signal at `center_hz`, `bandwidth_hz`
+/// wide, on `watch`'s event stream, as the detector would.
+fn announce(node: &Node, watch: &JobId, state: &str, center_hz: u64, bandwidth_hz: u64) {
+    let out = node
+        .job_outputs(watch)
+        .into_iter()
+        .find(|(k, _)| *k == StreamKind::Event)
+        .unwrap()
+        .1;
+    let prov = node
+        .bus()
+        .list()
+        .into_iter()
+        .find(|i| i.id == out)
+        .unwrap()
+        .provenance;
+    let v = serde_json::json!({"protocol": "signal", "state": state, "center_hz": center_hz,
+        "bandwidth_hz": bandwidth_hz, "snr_db": 30.0});
+    node.bus().publish(Frame::new(out, prov, Payload::Event(v)));
+}
+
+/// The width the detector reads a strong 12.5 kHz page at (its skirts).
+const PAGE_READ_WIDE_HZ: u64 = 22_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_read_wide_still_starts_its_decoder_directly() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    // Noise only: the one signal is the announcement the test makes, read as wide as the
+    // detector reads the suite's loud page (19-25 kHz), wider than identify's rule takes.
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, true).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["width_hz"] = serde_json::json!(LOUD_WIDTH_HZ);
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    const { assert!(PAGE_READ_WIDE_HZ > IDENTIFY_FIT_MAX_HZ) };
+    until("the watch runs its loop", Duration::from_secs(5), || {
+        node.job_context(&watch)
+            .is_some_and(|c| c["watch"]["cap"].is_object())
+    })
+    .await;
+    announce(&node, &watch, "new", POCSAG_HZ, PAGE_READ_WIDE_HZ);
+    let jobs = n_decoders_without_identify(&node, &watch, 1).await;
+    until("a decoding event", Duration::from_secs(5), || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    let all = events.all();
+    assert!(events.watch("identifying").is_empty(), "{all:#?}");
+    let d = &events.watch("decoding")[0];
+    assert_eq!(d["via"], "modes", "{d}");
+    assert_eq!(d["signal"]["bandwidth_hz"], PAGE_READ_WIDE_HZ, "{d}");
+    let rec = record(&node, &jobs[0]).unwrap();
+    assert_eq!(rec.kind, "pocsag_decode");
+    assert_eq!(rec.tuning.center_hz, Hz(POCSAG_HZ), "{rec:?}");
+    assert_eq!(rec.tuning.bandwidth_hz, Hz(POCSAG_WIDTH_HZ), "{rec:?}");
+    let ctx = node.job_context(&watch).unwrap();
+    assert_eq!(
+        ctx["watch"]["signals"][0]["fits"],
+        serde_json::json!(["pocsag_decode"]),
+        "{ctx}"
+    );
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_far_wider_signal_fits_no_listed_mode() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().wide, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode", "aprs_decode"]);
+    params["width_hz"] = serde_json::json!(WIDE_WIDTH_HZ);
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    until("an unknown", Duration::from_secs(30), || {
+        !events.watch("unknown").is_empty()
+    })
+    .await;
+    let all = events.all();
+    let e = &events.watch("unknown")[0];
+    let read = e["signal"]["bandwidth_hz"].as_u64().unwrap();
+    assert!(read > SPAN_FIT_MAX_HZ, "{e}");
+    let summary = e["summary"].as_str().unwrap();
+    assert!(summary.contains("no listed mode fits"), "{e}");
+    assert!(events.watch("identifying").is_empty(), "{all:#?}");
+    assert!(events.watch("decoding").is_empty(), "{all:#?}");
+    assert!(owned(&node, &watch).is_empty());
+    stop_all(&node).await;
 }
