@@ -102,6 +102,11 @@ pub struct NodeConfig {
     /// resolves the default, [`crate::modes::default_operator_dir`]). A missing
     /// directory reads as empty.
     pub modes_dir: Option<PathBuf>,
+    /// The operator's named sets (`--sets-dir`), read after the embedded ones at `open`
+    /// and validated against the mode rows; `None` is no operator directory: only the
+    /// embedded sets (the CLI resolves the default, [`crate::sets::default_operator_dir`]).
+    /// A missing directory reads as empty.
+    pub sets_dir: Option<PathBuf>,
     /// What the burst store (`state_dir/bursts`) keeps; `BurstPolicy::default()` is
     /// 256 MiB and 7 days.
     pub burst_policy: crate::bursts::BurstPolicy,
@@ -305,6 +310,8 @@ struct Inner {
     modes_dir: Option<PathBuf>,
     /// Held across [`Node::reload_modes`] (no await inside).
     reloading: Mutex<()>,
+    /// The named sets, loaded at `open` from `NodeConfig.sets_dir` over the embedded ones.
+    sets: Arc<crate::sets::SetRegistry>,
     /// The page themes: the built-in ones until the caller sets its own with `set_themes`.
     themes: RwLock<Arc<crate::themes::ThemeRegistry>>,
     /// The `capture` jobs' windows, opened (and expired) at `open`.
@@ -934,6 +941,11 @@ impl Node {
                 cfg.modes_dir.as_deref(),
             )));
         }
+        let sets = Arc::new(crate::sets::SetRegistry::load(
+            &modes.get().unwrap_or_default(),
+            &registry,
+            cfg.sets_dir.as_deref(),
+        ));
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
         // `Node::apply` and are never logged.
@@ -961,6 +973,7 @@ impl Node {
                 modes,
                 modes_dir: cfg.modes_dir.clone(),
                 reloading: Mutex::new(()),
+                sets,
                 themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
                 bursts,
                 signatures,
@@ -1146,6 +1159,11 @@ impl Node {
     /// Use `themes` as the page themes (`themes_list`, the served theme files).
     pub fn set_themes(&self, themes: Arc<crate::themes::ThemeRegistry>) {
         *self.inner.themes.write().unwrap() = themes;
+    }
+
+    /// The named sets (`set_list`): the embedded ones and the operator's `sets_dir`.
+    pub fn sets(&self) -> Arc<crate::sets::SetRegistry> {
+        self.inner.sets.clone()
     }
 
     /// The page themes (the built-in ones unless `set_themes` replaced them).

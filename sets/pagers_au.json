@@ -1,0 +1,14 @@
+{
+  "id": "pagers_au",
+  "name": "Australian POCSAG pagers",
+  "notes": "One watch over 148.0-149.0 MHz starts a POCSAG decoder on each pager carrier it finds and keeps it through the gaps between pages.",
+  "radios": {
+    "radio": {"note": "a radio that captures 148.0-149.0 MHz (1 MHz)"}
+  },
+  "members": [
+    {"id": "watch", "radio": "radio", "op": "job_start", "kind": "watch",
+     "center_hz": 148500000, "bandwidth_hz": 1000000, "deviation_hz": null, "sideband": null,
+     "params": {"modes": ["pocsag_decode"], "persist_ms": 500, "width_hz": [6000, 20000],
+                "gone_ms": 60000, "hold_ms": 600000, "cooldown_ms": 120000, "confirm_ms": 180000}}
+  ]
+}

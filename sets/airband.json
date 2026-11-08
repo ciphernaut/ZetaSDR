@@ -1,0 +1,17 @@
+{
+  "id": "airband",
+  "name": "Airband data links",
+  "notes": "ACARS and VDL2 share one capture around 133.5 MHz; ADS-B needs its own radio at 1090 MHz.",
+  "radios": {
+    "wide": {"note": "a radio that captures 130.0-137.0 MHz at once (8 MHz)"},
+    "second": {"note": "a radio for 1090 MHz with 2.4 MHz"}
+  },
+  "members": [
+    {"id": "acars", "radio": "wide", "op": "plan_start", "plan": "acars_vhf", "channels": null,
+     "kind": "acars_decode", "deviation_hz": null, "sideband": null, "attach": null, "language": null},
+    {"id": "vdl2", "radio": "wide", "op": "job_start", "kind": "vdl2_decode",
+     "center_hz": 136975000, "bandwidth_hz": 25000, "deviation_hz": null, "sideband": null},
+    {"id": "adsb", "radio": "second", "op": "job_start", "kind": "adsb_decode",
+     "center_hz": 1090000000, "bandwidth_hz": 2400000, "deviation_hz": null, "sideband": null}
+  ]
+}

@@ -178,6 +178,7 @@ async fn knowledge_lookup_returns_catalogue_signatures() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 10.0,
@@ -251,6 +252,7 @@ async fn lookup(center_hz: u64, bandwidth_hz: u64) -> Vec<zeta_core::knowledge::
     let dir = tempfile::tempdir().unwrap();
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 10.0,

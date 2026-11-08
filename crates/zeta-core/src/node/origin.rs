@@ -1686,6 +1686,7 @@ mod tests {
             resume: false,
             bank_factory: None,
             modes_dir: None,
+            sets_dir: None,
         };
         let ports = vec![
             TestPort::port("radio", false, None),

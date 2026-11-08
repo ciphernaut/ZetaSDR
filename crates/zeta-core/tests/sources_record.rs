@@ -45,6 +45,7 @@ impl Port for WorkerFixture {
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,

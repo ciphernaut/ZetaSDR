@@ -62,6 +62,7 @@ async fn retune_resizes_ring_within_budget() {
     let budget = 128 << 20;
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 10.0,

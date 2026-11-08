@@ -152,6 +152,7 @@ fn registry_lingering(linger: Duration) -> StageRegistry {
 fn cfg(dir: &Path) -> NodeConfig {
     NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
@@ -444,6 +445,7 @@ async fn replace_stops_a_scan_holder() {
         // the gate the replace holds while the replace stops it.
         let cfg = NodeConfig {
             source_positions: Default::default(),
+            sets_dir: None,
             burst_policy: Default::default(),
             scan_dwell_ms: 0,
             ..cfg(dir.path())

@@ -3032,6 +3032,28 @@ fn themes_list_prints_the_builtins() {
     assert!(rows.iter().all(|t| t["state"] == "ready"), "{v}");
 }
 
+/// `zeta sets` prints the two built-in sets, ready, with no running instance.
+#[test]
+fn zeta_sets_prints_the_two_builtin_sets() {
+    let dir = tempfile::tempdir().unwrap();
+    let sets = dir.path().join("sets");
+    std::fs::create_dir_all(&sets).unwrap();
+    let sets_dir = sets.display().to_string();
+    let out = zeta(dir.path(), &["--sets-dir", &sets_dir, "sets"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "sets", "{v}");
+    let rows = v["value"].as_array().expect("sets array");
+    let ids: Vec<&str> = rows.iter().filter_map(|s| s["id"].as_str()).collect();
+    assert_eq!(ids, ["airband", "pagers_au"], "{v}");
+    assert!(rows.iter().all(|s| s["state"] == "ready"), "{v}");
+    assert!(rows.iter().all(|s| s["running"].is_null()), "{v}");
+}
+
 /// A theme folder that does not validate is logged at startup and listed as broken; the
 /// node runs.
 #[test]

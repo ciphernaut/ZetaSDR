@@ -155,6 +155,7 @@ async fn main() -> ExitCode {
         burst_policy,
         cli.modes_dir.clone(),
         cli.themes_dir.clone(),
+        cli.sets_dir.clone(),
         speech.clone(),
     )
     .await

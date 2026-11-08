@@ -91,6 +91,7 @@ async fn detect_publishes_new_and_gone_for_a_synthesised_burst() {
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,

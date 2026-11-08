@@ -3,6 +3,7 @@
 //! (unknown fields rejected, every field required, one unit per field) and
 //! corrective on error (errors name the field and range and propose a value).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use num_complex::Complex;
@@ -576,6 +577,17 @@ pub enum Op {
     /// The themes the page can use, one row each (built-ins, then the operator's
     /// `--themes-dir`), sorted by id.
     ThemesList {},
+    /// The named sets the node knows (`sets/*.json` built in, then the operator's
+    /// `--sets-dir`), sorted by id. A set names the jobs of a daily setup by radio role
+    /// (`radios`: each role with a `note` saying what radio it needs), never by source:
+    /// each `members` entry is a `job_start` or `plan_start` (`op`) of a `kind` on a role,
+    /// with a one-line `summary`. A set that does not parse or validate is `broken` with
+    /// its `reason` (`<field>: <error>`, e.g. `members[0].params.hold_ms: ...`) and never
+    /// stops the node; an operator set with a built-in's `id` replaces it, and a broken
+    /// one that meant to is listed as `<id>@<file name>`, the built-in staying in force.
+    /// A member's kind need not be a ready row here (a set may name a decoder this host
+    /// lacks). `running` is the set's running instance, `null` when it does not run.
+    SetList {},
     /// One mode's row as loaded, with its `state` and `reason`.
     ModesShow {
         id: String,
@@ -2223,6 +2235,98 @@ impl From<&LoadedMode> for ModeInfo {
     }
 }
 
+/// One set as `set_list` reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetInfo {
+    pub id: String,
+    /// The set's display name; a broken file's id when nothing parsed.
+    pub name: String,
+    pub notes: String,
+    pub state: crate::sets::SetState,
+    /// Why the set is broken (`<field>: <error>`); `null` when ready.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub reason: Option<String>,
+    /// `sets/<id>.json` for a built-in set, the path for an operator set.
+    pub file: String,
+    /// The roles, each with a note saying what radio it needs.
+    pub radios: BTreeMap<String, crate::sets::Radio>,
+    /// The members in the file's order.
+    pub members: Vec<SetMemberInfo>,
+    /// The set's running instance; `null` when it does not run.
+    #[schemars(required, schema_with = "crate::types::nullable::<SetRunning>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub running: Option<SetRunning>,
+}
+
+/// One member of a set as `set_list` reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetMemberInfo {
+    pub id: String,
+    /// The role it runs on.
+    pub radio: String,
+    /// `job_start` or `plan_start`.
+    pub op: String,
+    pub kind: String,
+    /// One line: `vdl2_decode at 136.975 MHz, 25 kHz wide`.
+    pub summary: String,
+}
+
+/// A set's running instance.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetRunning {
+    /// The source each role runs on.
+    pub radios: BTreeMap<String, SourceId>,
+    pub since_ns: Timestamp,
+    /// One entry per job the instance started.
+    pub members: Vec<SetRunningMember>,
+}
+
+/// One job of a set's running instance.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetRunningMember {
+    /// The member id.
+    pub id: String,
+    pub job: JobId,
+    /// The job's state, or `ended` when it no longer runs.
+    pub state: String,
+}
+
+impl From<&crate::sets::LoadedSet> for SetInfo {
+    fn from(s: &crate::sets::LoadedSet) -> Self {
+        SetInfo {
+            id: s.set.id.0.clone(),
+            name: s.set.name.clone(),
+            notes: s.set.notes.clone(),
+            state: s.state,
+            reason: s.reason.clone(),
+            file: s.file.clone(),
+            radios: s.set.radios.iter().cloned().collect(),
+            members: s
+                .set
+                .members
+                .iter()
+                .map(|m| SetMemberInfo {
+                    id: m.id().to_string(),
+                    radio: m.radio().to_string(),
+                    op: m.op_name().to_string(),
+                    kind: m.kind().name().to_string(),
+                    summary: m.summary(),
+                })
+                .collect(),
+            running: None,
+        }
+    }
+}
+
 /// One theme as `themes_list` reports it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2334,6 +2438,8 @@ pub enum OpResult {
     Themes {
         themes: Vec<ThemeInfo>,
     },
+    /// `set_list`: one entry per set, sorted by id.
+    Sets(Vec<SetInfo>),
     /// `modes_show`: the row as loaded.
     Mode {
         mode: Box<LoadedMode>,
@@ -2439,6 +2545,7 @@ impl Op {
             Op::ChannelPlans {} => "channel_plans",
             Op::ModesList { .. } => "modes_list",
             Op::ThemesList {} => "themes_list",
+            Op::SetList {} => "set_list",
             Op::ModesShow { .. } => "modes_show",
             Op::Classify { .. } => "classify",
             Op::Schema {} => "schema",
@@ -2462,6 +2569,7 @@ impl Op {
                 | Op::ChannelPlans {}
                 | Op::ModesList { .. }
                 | Op::ThemesList {}
+                | Op::SetList {}
                 | Op::ModesShow { .. }
                 | Op::StationGet {}
                 | Op::CaptureList { .. }
@@ -2518,6 +2626,7 @@ impl OpResult {
             OpResult::ChannelPlans { .. } => "channel_plans",
             OpResult::Modes { .. } => "modes",
             OpResult::Themes { .. } => "themes",
+            OpResult::Sets(_) => "sets",
             OpResult::Mode { .. } => "mode",
             OpResult::Classification { .. } => "classification",
             OpResult::Gain(_) => "gain",
@@ -2990,7 +3099,7 @@ async fn reconcile_rate(
 
 /// `job_start`'s checks of `sideband` (only `ssb_demod` takes one) and `deviation_hz`
 /// (only `fm_demod` and `wfm_demod`, within 100..=75000 Hz); the deviation as `Hz`.
-fn check_start_params(
+pub(crate) fn check_start_params(
     kind: &JobKind,
     deviation_hz: Option<u64>,
     sideband: Option<Sideband>,
@@ -3536,6 +3645,9 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
         Op::ThemesList {} => Ok(OpResult::Themes {
             themes: node.themes().all().iter().map(ThemeInfo::from).collect(),
         }),
+        Op::SetList {} => Ok(OpResult::Sets(
+            node.sets().all().iter().map(SetInfo::from).collect(),
+        )),
         Op::ModesShow { id } => {
             let modes = node.modes();
             match modes.get(&id) {

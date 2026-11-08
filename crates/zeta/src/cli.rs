@@ -84,6 +84,11 @@ pub struct Cli {
     /// ~/.config/zetasdr/themes]
     #[arg(long, global = true, value_name = "PATH")]
     pub themes_dir: Option<PathBuf>,
+    /// Directory of the operator's named sets (*.json), read after the built-in ones; a set
+    /// with a built-in id replaces it [default: $XDG_CONFIG_HOME/zetasdr/sets or
+    /// ~/.config/zetasdr/sets]
+    #[arg(long, global = true, value_name = "PATH")]
+    pub sets_dir: Option<PathBuf>,
     #[command(flatten)]
     pub speech: SpeechArgs,
     /// Every source flag parsed, file then soapy then kiwi then node then vrt (filled by
@@ -285,8 +290,8 @@ impl Cli {
         self.source_positions.clone()
     }
 
-    /// Whether any flag that configures the local node (sources, plugins, state dir, modes
-    /// dir, `--knowledge-acma`, `--bursts-keep-*`; with `--node` their environment variables
+    /// Whether any flag that configures the local node (sources, plugins, state dir, modes,
+    /// themes and sets dirs, `--knowledge-acma`, `--bursts-keep-*`; with `--node` their environment variables
     /// were already dropped by `try_parse_checked`) was given.
     pub fn configures_local_node(&self) -> bool {
         !self.sources.is_empty()
@@ -294,6 +299,7 @@ impl Cli {
             || self.state_dir.is_some()
             || self.modes_dir.is_some()
             || self.themes_dir.is_some()
+            || self.sets_dir.is_some()
             || self.knowledge_acma.is_some()
             || self.bursts_keep_mb.is_some()
             || self.bursts_keep_days.is_some()
@@ -356,6 +362,8 @@ pub enum Command {
     /// The themes the page can use
     #[command(subcommand)]
     Themes(ThemesCmd),
+    /// The named sets the node knows (airband, pagers_au, the operator's own)
+    Sets,
     /// Run every classifier over a selection of a source ring
     Classify(SelectionArgs),
     /// JSON schemas of operations, results and errors
@@ -1537,6 +1545,7 @@ impl Command {
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Themes(ThemesCmd::List) => Op::ThemesList {},
+            Command::Sets => Op::SetList {},
             Command::Classify(s) => Op::Classify {
                 selection: s.into(),
             },

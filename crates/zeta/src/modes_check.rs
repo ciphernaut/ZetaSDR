@@ -222,6 +222,7 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         ctx.registry.clone(),
         ctx.modes.clone(),
         ctx.modes_dir.clone(),
+        None,
         &[source],
         Default::default(),
         false,
