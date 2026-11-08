@@ -547,11 +547,37 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     expect(page.locator("#side")).to_be_visible()
 
 
+def watch_job_list_records(page):
+    """Count the `job_list` records the page's websockets receive (the ops stream's, one
+    per poll) from now on; the list whose length is the count."""
+    seen = []
+
+    def on_ws(ws):
+        ws.on("framereceived", lambda f: seen.append(1)
+              if isinstance(f, str) and '"job_list"' in f else None)
+
+    page.on("websocket", on_ws)
+    return seen
+
+
+def wait_job_list_records(page, seen, n, within_ms=10_000):
+    """Wait until `seen` (watch_job_list_records) counts `n` records, then a beat for the
+    page to draw the last."""
+    waited = 0
+    while len(seen) < n:
+        assert waited < within_ms, f"{len(seen)} job_list records in {within_ms} ms, want {n}"
+        page.wait_for_timeout(50)
+        waited += 50
+    page.wait_for_timeout(200)
+
+
 def scenario_transcript_hides_polls(page, url, secret):
     page.set_viewport_size(WIDE)
+    seen = watch_job_list_records(page)
     login(page, url, secret)
     expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
-    page.wait_for_timeout(5_000)
+    # The load's poll and the next (JOBS_POLL_MS) reached the page and drew nothing.
+    wait_job_list_records(page, seen, 2)
     polls = page.locator("#transcript .line.op", has_text="job_list")
     expect(polls).to_have_count(0)
     page.fill("#cmd", '{"op":"job_list"}')
@@ -560,7 +586,7 @@ def scenario_transcript_hides_polls(page, url, secret):
     expect(typed).to_have_count(1)
     # Later polls stay hidden and do not fold into the typed line (the typed op's own "ui"
     # record is hidden too: its one line comes from the /op reply).
-    page.wait_for_timeout(2_500)
+    wait_job_list_records(page, seen, len(seen) + 2)
     expect(typed).to_have_count(1)
     expect(typed.locator(".count")).to_have_text("")
     # Another caller's poll shows, tagged with its transport (ruling R6).
@@ -6684,13 +6710,20 @@ def clear_captures(url, secret):
         capture_ops(url, secret, "capture_delete", capture=c["id"])
 
 
-def two_windows(url, secret, job):
-    """graph_put the capture job's burst_capture node to two whole windows (the tone has
-    no bursts, so the defaults would wait out their timeout)."""
+# The windows two_windows writes, ms: long enough for a count, a bracket or the fsk
+# fixture's frames (about 0.23 s each). A capture whose content is classified or measured
+# for its keying asks for MEASURED_WINDOW_MS, the stage's default.
+WINDOW_MS = 1_000
+MEASURED_WINDOW_MS = 2_000
+
+
+def two_windows(url, secret, job, window_ms=WINDOW_MS):
+    """graph_put the capture job's burst_capture node to two whole windows of `window_ms`
+    (the tone has no bursts, so the defaults would wait out their timeout)."""
     g = capture_ops(url, secret, "graph_get", job=job)
     for n in g["nodes"]:
         if n["kind"] == "burst_capture":
-            n["params"].update({"bursts": 2, "whole": True})
+            n["params"].update({"bursts": 2, "whole": True, "window_ms": window_ms})
     http_json(url, secret, "/op", {"op": "graph_put", "job": job, "graph": g})
 
 
@@ -6699,18 +6732,22 @@ def scenario_capture_bursts_from_the_box_menu_and_explore_lists_it(page, url, se
     menu = open_menu_on_tone(page, url, secret)
     page.click('#ctx .ctx-item[data-action="capture"]')
     expect(page.locator("#transcript .line.note", has_text="fitted capture to").first).to_be_visible(timeout=20000)
+    # The menu's job: the running one (job_list keeps earlier scenarios' ended jobs).
     job = next(j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
-               if j["kind"] == "capture")["id"]
+               if j["kind"] == "capture" and j["state"]["status"] == "running")["id"]
     two_windows(url, secret, job)
     expect(page.locator('#panes .pane-tab[data-pane="explore"]')).to_be_visible(timeout=30000)
     expect(page.locator("#explore tr.capture")).to_have_count(2, timeout=30000)
+    # Ended, so no window of it lands in a later scenario.
+    wait_until(lambda: job_status(url, secret, job) != "running", 10, "the capture job ended")
 
 
 def scenario_explore_what_is_this_and_delete(page, url, secret):
     # Self-seeding: its own two windows on the tone, so it passes alone.
     clear_captures(url, secret)
     job = start_job(url, secret, "capture", "tone", 100_001_000, 6_000)
-    two_windows(url, secret, job)
+    # Classified below (a carrier).
+    two_windows(url, secret, job, MEASURED_WINDOW_MS)
     wait_until(lambda: len(capture_ops(url, secret, "capture_list", signal=None)) == 2,
                30, "two captures")
     login(page, url, secret)
@@ -6905,10 +6942,11 @@ def clear_signatures(url, secret):
         capture_ops(url, secret, "signature_reject", id=s["id"])
 
 
-def two_captures_of(url, secret, source, center_hz, bandwidth_hz):
-    """A capture job's two whole windows on `source`; its captures, newest first."""
+def two_captures_of(url, secret, source, center_hz, bandwidth_hz, window_ms=WINDOW_MS):
+    """A capture job's two whole windows (of `window_ms`) on `source`; its captures, newest
+    first."""
     job = start_job(url, secret, "capture", source, center_hz, bandwidth_hz)
-    two_windows(url, secret, job)
+    two_windows(url, secret, job, window_ms)
     mine = lambda: [c for c in capture_ops(url, secret, "capture_list", signal=None)
                     if c["job"] == job]
     wait_until(lambda: len(mine()) == 2, 30, f"two captures on {source}")
@@ -6931,8 +6969,8 @@ def type_across_a_poll(page, sel, keys):
     page.wait_for_function(FIELD_REDRAWN_JS, arg=sel, timeout=5000)
 
 
-# The delay between keystrokes: sixteen of them outlast EXPLORE_POLL_MS (2 s).
-EXPLORE_TYPE_DELAY_MS = 200
+# The delay between keystrokes: sixteen of them (2.4 s) outlast EXPLORE_POLL_MS (2 s).
+EXPLORE_TYPE_DELAY_MS = 150
 
 
 def scenario_typing_survives_the_explore_poll(page, url, secret):
@@ -7002,7 +7040,8 @@ def scenario_proposal_accepted_from_the_page(page, url, secret):
     # A framing with a CRC and a measured symbol rate (the pocsag capture's keying line,
     # 1200 Bd) writes `learned_<id>.json` to the node's modes directory on Accept. Its
     # classify proves pocsag_decode, so the node proposes nothing of its own here.
-    capture = two_captures_of(url, secret, "pocsag", 148_637_500, 12_500)[0]
+    capture = two_captures_of(url, secret, "pocsag", 148_637_500, 12_500,
+                              MEASURED_WINDOW_MS)[0]
     assert capture["features"].get("symbol_rate_baud"), capture["features"]
     framed = propose(url, secret, capture["id"], framing=POCSAG_FRAMING)
     learned = f'#explore tr.signature[data-id="{framed["id"]}"] >> '
