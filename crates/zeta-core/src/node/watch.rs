@@ -28,11 +28,15 @@
 //! `waiting` (one event per signal), and when a slot frees the present waiting signal
 //! that ranks highest ([`rank`]: a known channel, then score, then SNR) takes it; nothing
 //! is pre-empted. With `confirm_ms`, a direct start that publishes no event within it
-//! while its signal is present is stopped `unproven`. A `lost` decoder's channel, and
-//! that of a decoder the operator stopped, is cooled for `cooldown_ms`
-//! (`job_context.watch.cooled`): a signal on it is tracked but neither started nor
-//! identified until the cooldown passes. A re-adopted decoder is confirmed within the
-//! longer of `gone_ms` and `hold_ms`.
+//! while its signal is present is stopped `unproven`. In a span watch, a `lost`
+//! decoder's channel, and that of a decoder the operator stopped, is cooled for
+//! `cooldown_ms` (`job_context.watch.cooled`): a signal on it is tracked but neither
+//! started nor identified until the cooldown passes, and a signal still present after a
+//! loss the watch raised counts a try (past [`RETRY_MAX`] it is left alone until it goes
+//! and comes back). A span watch's re-adopted decoder is confirmed within the longer of
+//! `gone_ms` and `hold_ms`. A watch without `modes` keeps its earlier rules: no
+//! cooldown, a lost or stopped decoder's signal left alone until it comes back, and
+//! re-adoption confirmed within `gone_ms`.
 //!
 //! Events, `protocol: "watch"`, go on the job's event stream beside `detect`'s `signal`
 //! events: `state` `identifying | decoding | waiting | unknown | lost | capturing |
@@ -1557,13 +1561,14 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
             Some(false) => {}
         }
     }
-    // A resumed channel in a quiet spell is held as a kept one is (spec 9.5).
-    let confirm_ns = r
-        .seed
-        .policy
-        .gone_ms
-        .max(r.seed.policy.hold_ms)
-        .saturating_mul(1_000_000);
+    // A span watch's resumed channel in a quiet spell is held as a kept one is (spec
+    // 9.5); any other watch confirms within the detector's `gone_ms`.
+    let policy = &r.seed.policy;
+    let confirm_ms = match policy.modes.is_some() {
+        true => policy.gone_ms.max(policy.hold_ms),
+        false => policy.gone_ms,
+    };
+    let confirm_ns = confirm_ms.saturating_mul(1_000_000);
     for mut d in std::mem::take(&mut r.seed.adopt) {
         match inner.wait_running(r, &d.job).await {
             None => return cancelled(),
@@ -1953,11 +1958,12 @@ pub(super) fn register_says(allocations: &serde_json::Value) -> String {
 }
 
 /// Note the decoders' events; drop those whose job no longer runs (the operator stopped
-/// it: its channel is cooled [`WHY_STOPPED`]); stop (`lost`) those whose signal has gone
-/// and that stayed silent for the policy's `hold_ms`, re-adopted ones whose signal did
-/// not reappear in time, and direct starts that published nothing within `confirm_ms`
-/// while their signal was present (`unproven`), cooling each one's channel for the
-/// policy's `cooldown_ms`. Each frees a slot for [`next`]. Whether the state changed.
+/// it; a span watch cools its channel [`WHY_STOPPED`]); stop (`lost`) those whose signal
+/// has gone and that stayed silent for the policy's `hold_ms`, re-adopted ones whose
+/// signal did not reappear in time, and direct starts that published nothing within
+/// `confirm_ms` while their signal was present (`unproven`). A span watch cools each
+/// lost one's channel for the policy's `cooldown_ms` ([`free_channel`]); any other watch
+/// forgets its signal. Each frees a slot for [`next`]. Whether the state changed.
 async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     let t = now().0;
     for d in &mut w.decoding {
@@ -1988,6 +1994,7 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     }
     let silence_ns = r.seed.policy.hold_ms.saturating_mul(1_000_000);
     let until_ns = t.saturating_add(r.seed.policy.cooldown_ms.saturating_mul(1_000_000));
+    let span = r.seed.policy.modes.is_some();
     let mut changed = false;
     let mut kept = Vec::with_capacity(w.decoding.len());
     for d in std::mem::take(&mut w.decoding) {
@@ -1998,10 +2005,13 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             continue;
         }
         if !inner.runs(&d.job) {
-            // Stopped by the operator (or ended on its own): its slot is free, and its
-            // channel rests for the cooldown before the watch starts it again.
+            // Stopped by the operator (or ended on its own): its slot is free. A span
+            // watch's channel rests for the cooldown before the watch starts it again;
+            // any other watch leaves its signal alone until it goes and comes back.
             w.subs.remove(&d.job);
-            free_channel(inner, w, &d, until_ns, WHY_STOPPED);
+            if span {
+                free_channel(inner, w, &d, until_ns, WHY_STOPPED, None);
+            }
             changed = true;
             continue;
         }
@@ -2021,7 +2031,12 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         };
         inner.stop_started(r, &d.job, &d.source).await;
         w.subs.remove(&d.job);
-        free_channel(inner, w, &d, until_ns, why);
+        match span {
+            true => free_channel(inner, w, &d, until_ns, why, Some(t)),
+            false => w
+                .signals
+                .retain(|x| !x.signal.overlaps(d.signal.center_hz, d.signal.bandwidth_hz)),
+        }
         let summary = format!("lost {} at {}: {why}", d.mode, d.signal.mhz());
         let e = Event {
             signal: Some(&d.signal),
@@ -2039,10 +2054,20 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     changed
 }
 
-/// The decoder `d` no longer runs: cool its channel (its centre, its row's width) until
-/// `until_ns` for `why`, forget the tracked signals on it that have gone, and put those
-/// still present back in the queue (started afresh once the cooldown passes).
-fn free_channel(inner: &Inner, w: &mut State, d: &Decoding, until_ns: u64, why: &str) {
+/// A span watch's decoder `d` no longer runs: cool its channel (its centre, its row's
+/// width) until `until_ns` for `why`, forget the tracked signals on it that have gone,
+/// and put those still present back in the queue, started afresh once the cooldown
+/// passes. After a loss the watch raised (`lost_at`, its time), each requeued signal
+/// counts a try ([`count_try`]): past [`RETRY_MAX`] it is left alone until it goes and
+/// comes back, so a carrier no decoder proves does not churn.
+fn free_channel(
+    inner: &Inner,
+    w: &mut State,
+    d: &Decoding,
+    until_ns: u64,
+    why: &str,
+    lost_at: Option<u64>,
+) {
     w.cooled.push(Cooled {
         center_hz: d.signal.center_hz,
         bandwidth_hz: inner.row_width(&d.mode, &d.signal),
@@ -2057,6 +2082,9 @@ fn free_channel(inner: &Inner, w: &mut State, d: &Decoding, until_ns: u64, why: 
             x.handled = false;
             x.next_retry_ns = None;
             x.waiting = false;
+            if let Some(t) = lost_at {
+                count_try(x, t);
+            }
         }
     }
 }

@@ -1218,10 +1218,7 @@ async fn a_restart_readopts_or_drops() {
     let file = |id: &JobId| jobs.join(format!("{}.json", id.0));
     let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
     let node = Arc::new(node);
-    // A re-adopted decoder is confirmed within max(gone_ms, hold_ms): the hold no longer
-    // than `gone_ms`, so the dropped case is decided by `gone_ms` as before.
-    let params = serde_json::json!({"gone_ms": READOPT_GONE_MS, "hold_ms": READOPT_GONE_MS});
-    let watch = start_watch(&node, params).await;
+    let watch = start_watch(&node, serde_json::json!({"gone_ms": READOPT_GONE_MS})).await;
     let events = Events::of(&node, &watch);
     let job = decoded(&node, &events, &watch).await;
     drop(events);
@@ -3259,6 +3256,59 @@ async fn an_unproven_decoder_is_stopped_and_its_channel_cooled() {
         .any(|e| e["job"] == page_job.0.as_str());
     assert!(!page_lost, "{:#?}", events.all());
     stop_all(&node).await;
+}
+
+/// The churn test's timing: each start of the noise's decoder is unproven quickly, and
+/// its channel and retry come round soon after.
+const CHURN_CONFIRM_MS: u64 = 1_500;
+const CHURN_COOLDOWN_MS: u64 = 1_000;
+const CHURN_RETRY_MS: u64 = 1_000;
+/// How long the churn test watches for a start past the last try: several rounds.
+const CHURN_QUIET: Duration = Duration::from_secs(10);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carrier_no_decoder_proves_stops_being_restarted_after_its_tries() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(CHURN_RETRY_MS, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().noise12k, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["confirm_ms"] = CHURN_CONFIRM_MS.into();
+    params["cooldown_ms"] = CHURN_COOLDOWN_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let near_noise = |hz: u64| hz.abs_diff(CENTER_HZ + NOISE_OFFSET_HZ) <= SPAN_CENTRE_TOLERANCE_HZ;
+    let on_noise = |e: &Value| e["signal"]["center_hz"].as_u64().is_some_and(near_noise);
+    let count = |state: &str| events.watch(state).iter().filter(|e| on_noise(e)).count();
+    // The first start and RETRY_MAX more, each lost unproven.
+    let starts = zeta_core::node::watch::RETRY_MAX as usize + 1;
+    until(
+        "every try is lost unproven",
+        Duration::from_secs(40),
+        || count("lost") >= starts,
+    )
+    .await;
+    tokio::time::sleep(CHURN_QUIET).await;
+    let all = events.all();
+    assert_eq!(count("decoding"), starts, "{all:#?}");
+    assert_eq!(count("lost"), starts, "{all:#?}");
+    for e in events.watch("lost").iter().filter(|e| on_noise(e)) {
+        assert_eq!(e["why"], "unproven", "{e}");
+    }
+    // Still tracked and present, left alone.
+    let ctx = node.job_context(&watch).unwrap();
+    let noise = ctx["watch"]["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["center_hz"].as_u64().is_some_and(near_noise))
+        .cloned()
+        .unwrap_or_else(|| panic!("{ctx}"));
+    assert_eq!(noise["present"], true, "{noise}");
+    assert_eq!(noise["handled"], true, "{noise}");
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
 }
 
 /// The jobs_stop test's cooldown: the stopped channels rest this long before they start
