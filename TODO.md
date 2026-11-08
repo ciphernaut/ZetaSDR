@@ -550,3 +550,15 @@ Plan 32 (origins from the register lit on a Map tab, the dock, a Kiwi's position
 - The console theme's kept tab is only un-dimmed, not restyled as the other themes do.
 - The dock-head Subjects count is the store count (every subject held), not the rows the table shows after its filters.
 - The RF thumbnail (spec 4.12, Task 12, dropped because the e2e suite ran about 570 s against its 690 s deadline): a small live RF view in the map's corner (`RF_THUMB_W` 240 x `RF_THUMB_H` 120, `RF_THUMB_FPS` 2) drawn from the source's spectrum feed, a click returning to the RF view. It wants its own scenario and a timer, so it waits for a faster suite or a deadline change.
+
+## Jobs: test runs push the operator's stopped records out of the job history
+
+From the 2026-11-08 live acceptance. The node keeps the 20 newest job records (`JOB_HISTORY_MAX`, `crates/zeta-core/src/node/mod.rs`), so 16 stopped test jobs evicted 16 of the operator's older stopped records (a 477 MHz demod with its transcriber and mix, FM demods, RDS, measures). Ideas: a larger cap, keep records the operator started apart from agent or test ones, or keep one record per (kind, band) so a re-run replaces its predecessor instead of a stranger's.
+
+## Modes: positions in ACARS free text
+
+From the 2026-11-08 live acceptance. An ACARS `3L` message carried "S 27.751/E153.531" in its text, which no field map reads. A small parser for the common free-text position forms (as plan 29 did for APRS) would put such aircraft on the map.
+
+## AIS: not yet proven on air
+
+From the 2026-11-08 live acceptance: 15 min on the HackRF (indoor antenna) and 11 min on the B210 at 161.975/162.025 MHz gave no events; a ring cut showed one 25 ms burst about 12 dB over the floor in 9.5 s, which did not decode. The channels are nearly empty at the field host, so this says little about the decoder. Decode the kept cut with another AIS decoder offline, and retry from a site in view of shipping.
