@@ -608,26 +608,29 @@ OVERLAY_BLANK_JS = """() => {
 }"""
 
 
-# Whether the painted columns cover at least `s` seconds of signal, oldest start to newest
-# end (a box over every painted column spans that). A fresh job's first rows can come
-# faster than real time, so the count of painted columns alone does not say.
+# Whether drag_menu's box (from 40 px to 20 px short of the canvas's right edge, the
+# waterfall's own slotAt for each end) would span at least `s` seconds of signal. A fresh
+# job's first rows can come faster than real time, so a count of painted columns does not
+# say.
 SPAN_AT_LEAST_JS = """(s) => {
   const w = window.zetaTest.waterfall();
   if (!w || !(w.columns > 0)) return false;
-  const oldest = w.oldestNs();
-  const newest = w.ringEnd[(w.columns - 1) % w.ringEnd.length];
-  return !!oldest && newest - oldest >= s * 1e9;
+  const left = w.slotAt(40);
+  const right = w.slotAt(w.canvas.clientWidth - 20);
+  if (left === null || right === null || !w.ringStart[left]) return false;
+  return w.ringEnd[right] - w.ringStart[left] >= s * 1e9;
 }"""
 
 
 def wait_span(page, s, timeout=15_000):
-    """Wait until the painted columns cover `s` seconds of signal (SPAN_AT_LEAST_JS)."""
+    """Wait until drag_menu's box would span `s` seconds of signal (SPAN_AT_LEAST_JS)."""
     page.wait_for_function(SPAN_AT_LEAST_JS, arg=s, timeout=timeout)
 
 
-# The signal a box over every painted column spans before a menu that classifies or fits
-# it opens, s: three times the second the layer-1 classifier needs.
-MENU_SPAN_S = 3.0
+# The signal drag_menu's box spans before a menu that classifies or fits it opens, s:
+# twice the second the layer-1 classifier needs (the 60 painted columns waited for before
+# gave about 2.5 s).
+MENU_SPAN_S = 2.0
 
 
 def open_menu_on_tone(page, url, secret):
@@ -983,7 +986,7 @@ AUTO_SCAN_JS = "() => sessionStorage.getItem('zeta.autoScan')"
 
 def scenario_scan_entry_starts_a_scan_job(page, url, secret):
     show_tone_waterfall(page, url, secret)
-    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    wait_span(page, 1.5)  # drag_menu asserts at least 1 s
     # The whole height: the file source's own band, which a scan covers in one step.
     menu = drag_menu(page, 0.0, 1.05)
     expect(page.locator('#ctx .ctx-item[data-action="scan"]')).to_have_text("Scan this span")
@@ -1011,7 +1014,7 @@ def scenario_scan_entry_starts_a_scan_job(page, url, secret):
 
 def scenario_scan_of_a_sub_band_scans_just_that_band(page, url, secret):
     show_tone_waterfall(page, url, secret)
-    page.wait_for_function("() => window.zetaTest.wf().painted > 60", timeout=15_000)
+    wait_span(page, 1.5)  # drag_menu asserts at least 1 s
     # The upper fifth of the capture, off centre: one step of that width, kept inside the
     # recording (a capture-wide step centred there would leave it and fail the scan).
     drag_menu(page, 0.10, 0.30)
@@ -6849,7 +6852,7 @@ def scenario_too_old_classify_reissues_on_the_latest_span(page, url, secret):
     expect(page.locator('.src-tab[data-id="tone"]')).to_have_attribute("aria-selected", "true")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
     # The ring holds a few seconds (at most 4); the page keeps more columns than that.
-    wait_span(page, 7.0, timeout=30_000)
+    wait_span(page, 6.5, timeout=30_000)
     drag_menu(page)
     footer = page.locator("#ctx-footer").text_content()
     m = re.search(r" ring (\d+\.\d) s", footer)
