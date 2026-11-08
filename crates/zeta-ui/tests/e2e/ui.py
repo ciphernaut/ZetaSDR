@@ -1102,6 +1102,13 @@ def view_show(page):
     return lines.last.text_content()
 
 
+def current_capture(url, secret, source, within_s=10.0):
+    """`source`'s current capture (source_list's `current`), waiting for one: right after a
+    source is shown, the page's spectrum job may not have tuned it yet."""
+    return wait_until(lambda: source_info(url, secret, source)["current"], within_s,
+                      f"a capture on {source}")
+
+
 def wait_until(pred, within_s, what, step_s=0.2):
     """Poll `pred()` until it returns a truthy value or `within_s` passes; that value."""
     deadline = time.monotonic() + within_s
@@ -1125,7 +1132,7 @@ def scenario_page_job_is_elastic_and_a_rigid_start_needs_no_replace(page, url, s
     expect(row.locator(".kind")).to_have_text("spectrum elastic")
     expect(row.locator("button")).to_have_count(1)
     expect(row.locator("button.stop")).to_have_count(1)
-    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    cur = current_capture(url, secret, "retune")["center_hz"]
     band = cur + 1_000_000 if cur + 1_000_000 < 299_000_000 else cur - 1_000_000
     r = http_json(url, secret, "/op", {"op": "job_start", "kind": "passthrough",
                                        "source": "retune", "center_hz": band,
@@ -1817,7 +1824,7 @@ def scenario_conflict_offers_replace(page, url, secret):
                     and j["tuning"]["center_hz"] == 251_000_000]
             return news[0]["id"] if mine["state"]["status"] == "stopped" and news else None
         new = wait_until(handed_over, 5.0, "A stopped and the new job running")
-        cur = source_info(url, secret, "retune")["current"]
+        cur = current_capture(url, secret, "retune")
         assert cur["center_hz"] == 251_000_000, f"current {cur}"
         expect(page.locator("#transcript .line.op",
                             has_text=re.compile(rf"replace=… → job {new}"))).to_have_count(1)
@@ -2113,7 +2120,7 @@ def scenario_capturable_view_on_unheld_source_retunes_under_zoom_out_scan(page, 
     try:
         select_source(page, url, secret, "retune")
         page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
-        cur = source_info(url, secret, "retune")["current"]["center_hz"]
+        cur = current_capture(url, secret, "retune")["center_hz"]
         want = cur + 100_000 if cur + 100_000 < 299_000_000 else cur - 100_000
         page.fill('#band input[name="center"]', f"{want / 1e6:.6f}")
         page.fill('#band input[name="width"]', "24")
@@ -2147,7 +2154,7 @@ def scenario_zoom_in_stops_the_shown_source_scan(page, url, secret):
     try:
         select_source(page, url, secret, "retune")
         page.wait_for_function("() => window.zetaTest.wf().painted > 5", timeout=10_000)
-        cur = source_info(url, secret, "retune")["current"]["center_hz"]
+        cur = current_capture(url, secret, "retune")["center_hz"]
         set_band(page, cur, 96_000)
         own = wait_until(lambda: running_scan_jobs(url, secret, "retune"), 3.0,
                          "the page's scan on retune")[0]["id"]
@@ -2323,7 +2330,7 @@ def scenario_rigid_bands_are_outlined(page, url, secret):
     # No rigid holder: the capture itself is outlined.
     expect(outlines(page)).to_have_count(1)
     expect(outlines(page).first).to_contain_text("capture")
-    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    cur = current_capture(url, secret, "retune")["center_hz"]
     lo = start_job(url, secret, "passthrough", "retune", cur - 8_000, 4_000)
     hi = None
     try:
@@ -2350,7 +2357,7 @@ def scenario_rigid_bands_are_outlined(page, url, secret):
 def scenario_tags_show_kind_id_and_link_rows(page, url, secret):
     select_source(page, url, secret, "retune")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
-    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    cur = current_capture(url, secret, "retune")["center_hz"]
     a = b = None
     hot = re.compile(r"\bhot\b")
     try:
@@ -2390,7 +2397,7 @@ def scenario_tags_show_kind_id_and_link_rows(page, url, secret):
 def scenario_rail_tags_align(page, url, secret):
     select_source(page, url, secret, "retune")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
-    capture = source_info(url, secret, "retune")["current"]
+    capture = current_capture(url, secret, "retune")
     cur = capture["center_hz"]
     a = start_job(url, secret, "passthrough", "retune", cur - 8_000, 4_000)
     b = start_job(url, secret, "passthrough", "retune", cur + 8_000, 4_000)
@@ -2495,7 +2502,7 @@ def scenario_side_folds(page, url, secret):
 
 def scenario_job_row_two_lines(page, url, secret):
     select_source(page, url, secret, "tone")
-    cur = source_info(url, secret, "tone")["current"]["center_hz"]
+    cur = current_capture(url, secret, "tone")["center_hz"]
     job = start_job(url, secret, "fm_demod", "tone", cur, 12_500, deviation_hz=5000)
     try:
         row = job_row(page, job)
@@ -2675,7 +2682,7 @@ def show_retune(page, url, secret):
     """Show `retune`; (its capture's centre, Hz per CSS pixel of the waterfall)."""
     select_source(page, url, secret, "retune")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
-    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    cur = current_capture(url, secret, "retune")["center_hz"]
     hzpp = 48_000 / page.locator("#waterfall canvas.wf-canvas").bounding_box()["height"]
     return cur, hzpp
 
@@ -2851,7 +2858,7 @@ def scenario_drag_outside_the_capture_conflicts_snaps_back_and_the_retry_moves_i
             return (ra["state"]["status"] == "stopped"
                     and rb["tuning"]["center_hz"] == body["center_hz"])
         wait_until(moved, 5.0, "A stopped, B moved")
-        assert source_info(url, secret, "retune")["current"]["center_hz"] == body["center_hz"]
+        assert current_capture(url, secret, "retune")["center_hz"] == body["center_hz"]
         expect(page.locator("#transcript .line.op", has_text=re.compile(
             rf"^job_retune job={b} .*replace=… → job {b}"))).to_have_count(1)
     finally:
@@ -2863,7 +2870,7 @@ def scenario_drag_outside_the_capture_conflicts_snaps_back_and_the_retry_moves_i
 def move_retune_capture(url, secret):
     """Hold `retune` with a rigid passthrough on its capture, then move the capture 1 MHz with
     a rigid start that replaces it; (the new job's id, the old centre, the new centre)."""
-    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    cur = current_capture(url, secret, "retune")["center_hz"]
     held = start_job(url, secret, "passthrough", "retune", cur, 10_000)
     band = cur + 1_000_000 if cur + 1_000_000 < 299_000_000 else cur - 1_000_000
     r = http_json(url, secret, "/op", {"op": "job_start", "kind": "passthrough",
@@ -2875,7 +2882,7 @@ def move_retune_capture(url, secret):
 
 
 def capture_of(url, secret):
-    c = source_info(url, secret, "retune")["current"]
+    c = current_capture(url, secret, "retune")
     return c["center_hz"] - c["bandwidth_hz"] / 2, c["center_hz"] + c["bandwidth_hz"] / 2
 
 
@@ -2971,7 +2978,7 @@ def scenario_narrow_long_press_opens_the_outline_menu(page, url, secret):
     login(page, url, secret)
     page.click('.src-tab[data-id="retune"]')
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
-    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    cur = current_capture(url, secret, "retune")["center_hz"]
     job = start_job(url, secret, "passthrough", "retune", cur, 10_000)
     try:
         page.evaluate("window.zetaTest.poll()")
@@ -3073,7 +3080,7 @@ def stream_of(url, secret, job, kind):
 
 def scenario_graph_headline(page, url, secret):
     select_source(page, url, secret, "tone")
-    cur = source_info(url, secret, "tone")["current"]["center_hz"]
+    cur = current_capture(url, secret, "tone")["center_hz"]
     job = start_job(url, secret, "fm_demod", "tone", cur, 12_500, deviation_hz=5000)
     try:
         open_graph(page, job)
@@ -3559,7 +3566,7 @@ def scenario_watch_entry_starts_a_watch_and_outlines_its_band(page, url, secret)
 def scenario_owned_jobs_are_hidden_from_the_jobs_pane(page, url, secret):
     select_source(page, url, secret, "tone")
     page.wait_for_function("() => window.zetaTest.wf().painted > 30", timeout=15_000)
-    cur = source_info(url, secret, "tone")["current"]
+    cur = current_capture(url, secret, "tone")
     watch = start_job(url, secret, "watch", "tone", cur["center_hz"], cur["bandwidth_hz"])
     try:
         graph = http_json(url, secret, "/op", {"op": "graph_get", "job": watch})["value"]
@@ -5733,7 +5740,7 @@ def scenario_keyed_ribbons_with_equal_text_stay_two(page, url, secret):
 def scenario_ribbon_rides_band(page, url, secret):
     select_source(page, url, secret, "retune")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
-    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    cur = current_capture(url, secret, "retune")["center_hz"]
     job = start_job(url, secret, "passthrough", "retune", cur, 10_000)
     try:
         page.evaluate("window.zetaTest.poll()")
@@ -5772,7 +5779,7 @@ def scenario_ribbon_rides_band(page, url, secret):
 def scenario_ribbon_clips_at_other_band(page, url, secret):
     select_source(page, url, secret, "retune")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
-    cur = source_info(url, secret, "retune")["current"]["center_hz"]
+    cur = current_capture(url, secret, "retune")["center_hz"]
     set_band(page, cur, 40_000)
     lo = start_job(url, secret, "passthrough", "retune", cur - 2_000, 1_000)
     hi = start_job(url, secret, "passthrough", "retune", cur + 2_000, 1_000)
@@ -5793,7 +5800,7 @@ def scenario_ribbon_clips_at_other_band(page, url, secret):
 
 def scenario_dir_auto(page, url, secret):
     select_source(page, url, secret, "tone")
-    cur = source_info(url, secret, "tone")["current"]["center_hz"]
+    cur = current_capture(url, secret, "tone")["center_hz"]
     page.evaluate(f"window.zetaTest.ribbon({cur}, 'مرحبا بالعالم', 'transcript')")
     rib = page.locator("#waterfall .ov-ribbon.transcript", has_text="مرحبا")
     assert rib.get_attribute("dir") == "auto"
