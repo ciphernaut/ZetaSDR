@@ -1070,18 +1070,72 @@ async fn set_stop_with_ended_members_stops_the_rest() {
 }
 
 #[tokio::test]
-async fn an_instance_whose_jobs_all_ended_is_dropped() {
+async fn an_instance_whose_jobs_all_ended_reads_not_running_and_the_next_start_drops_it() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = (Radio::new("a"), Radio::new("b"));
     let node = open_two(dir.path(), &a, &b).await;
     let r = started_set(&node, set_op(TWO, &[("b", Some("b"))], Some(&["m"]), &[])).await;
     node.apply(Op::JobStop { job: r.job("m") }).await.unwrap();
     until("m ends", || running_jobs(&node).is_empty()).await;
+    // `set_list` is a read: it shows the set as not running and leaves the file.
     assert!(running_of(&node, TWO).await.is_none());
-    assert!(!instance_file(dir.path(), TWO).exists());
-    // A new mapping is then a fresh start, not a refusal.
+    assert!(instance_file(dir.path(), TWO).is_file());
+    assert_eq!(node.set_instances().len(), 1);
+    // A new mapping is then a fresh start, not a refusal; the old instance is gone.
     let r = started_set(&node, set_op(TWO, &[("b", Some("a"))], Some(&["m"]), &[])).await;
     assert_eq!(r.started_members(), [("m", None)]);
+    let inst = node.set_instances().remove(TWO).expect("the new instance");
+    assert_eq!(inst.radios.get("b").map(|s| s.0.as_str()), Some("a"));
+    assert_eq!(inst.jobs().collect::<Vec<_>>(), vec![&r.job("m")]);
+    let text = std::fs::read_to_string(instance_file(dir.path(), TWO)).unwrap();
+    let on_disk: zeta_core::sets::SetInstance = serde_json::from_str(&text).unwrap();
+    assert_eq!(on_disk, inst);
+}
+
+/// A `set_start` future dropped once its starts are under way (here inside the elastic
+/// spectrum's relaunch, the first point it waits at after a tune): every job it started
+/// is already in the instance, so `set_stop` stops them all and leaves no holder.
+#[tokio::test]
+async fn a_set_start_dropped_after_its_starts_leaves_every_job_to_set_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Radio::new("a"), Radio::new("b"));
+    let node = open_two(dir.path(), &a, &b).await;
+    let spectrum = Op::JobStart {
+        kind: JobKind::Spectrum,
+        source: SourceId("a".into()),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(1_000_000),
+        deviation_hz: None,
+        sideband: None,
+        elastic: true,
+        replace: vec![],
+    };
+    job(&node, spectrum).await;
+    let dropped =
+        tokio::time::timeout(Duration::ZERO, node.apply(set_op(TWO, AB, None, &[]))).await;
+    assert!(
+        dropped.is_err(),
+        "the set_start was not dropped: {dropped:?}"
+    );
+    assert_eq!((a.tunes(), b.tunes()), (2, 1), "both sources tuned");
+    let inst = node.set_instances().remove(TWO).expect("the instance");
+    let jobs: Vec<JobId> = inst.jobs().cloned().collect();
+    assert_eq!(jobs.len(), 5, "{inst:?}");
+    assert!(instance_file(dir.path(), TWO).is_file());
+    for j in &jobs {
+        assert!(running_jobs(&node).contains(j), "{j:?} runs");
+    }
+    let (stopped, ended, _) = stopped_set(&node, TWO).await;
+    assert_eq!(stopped, jobs);
+    assert!(ended.is_empty());
+    until("the set's jobs end", || {
+        let run = running_jobs(&node);
+        jobs.iter().all(|j| !run.contains(j))
+    })
+    .await;
+    assert!(holders(&node, "b").await.is_empty());
+    assert!(holders(&node, "a").await.is_empty());
+    assert!(!instance_file(dir.path(), TWO).exists());
 }
 
 #[tokio::test]

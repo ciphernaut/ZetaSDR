@@ -1219,7 +1219,9 @@ impl Node {
 
     /// Drop every instance none of whose jobs still runs (each stopped, failed or
     /// forgotten from the history); a file that cannot be removed is a persist error.
-    pub(crate) fn prune_set_instances(&self) {
+    /// It writes the state dir, so only a mutating op calls it, under the set gate
+    /// (`set_start`); `set_list` computes the same in memory.
+    pub(crate) fn prune_set_instances(&self, _set_gate: &tokio::sync::MutexGuard<'_, ()>) {
         let live: std::collections::HashSet<JobId> = self
             .job_list()
             .into_iter()

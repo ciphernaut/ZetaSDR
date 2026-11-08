@@ -590,7 +590,7 @@ pub enum Op {
     /// lacks). `running` is the set's running instance, `null` when it does not run:
     /// `radios` (the source each role runs on), `since_ns`, and one `members` entry per
     /// job it started (`id` the member, `job`, `state`: the job's state, `ended` once it
-    /// no longer runs). An instance none of whose jobs runs is dropped.
+    /// no longer runs). An instance none of whose jobs runs reads `null`.
     SetList {},
     /// Start a named set from `set_list`: each member on the source its role is mapped
     /// to, as `plan_start` does for one source, under one lease decision per source. In
@@ -635,7 +635,8 @@ pub enum Op {
     /// and then those attached to them, and drop the instance. Jobs the instance did not
     /// start are left alone. The result lists `stopped`, `ended` (jobs that no longer ran
     /// when asked, such as one stopped by hand) and `failed` (`job`, `error`; the others go
-    /// on, and the instance is kept). A set that does not run stops nothing.
+    /// on). When a stop fails the instance is kept, so a second `set_stop` can finish it. A set
+    /// that does not run stops nothing.
     SetStop {
         /// A set id from `set_list`.
         set: String,
@@ -4505,16 +4506,18 @@ async fn plan_start(
     })
 }
 
-/// `set_list`: every set with its running instance, once the instances none of whose
-/// jobs runs are dropped.
+/// `set_list`: every set with its running instance. A read: it writes nothing, and an
+/// instance none of whose jobs runs reads `null` (its file goes at the next
+/// `set_start` or `set_stop`).
 fn set_list(node: &Node) -> Vec<SetInfo> {
-    node.prune_set_instances();
-    let instances = node.set_instances();
     let states: std::collections::HashMap<JobId, JobState> = node
         .job_list()
         .into_iter()
         .map(|r| (r.id, r.state))
         .collect();
+    let live = |j: &JobId| states.get(j).is_some_and(|s| !crate::node::job_ended(s));
+    let mut instances = node.set_instances();
+    instances.retain(|_, i| i.jobs().any(live));
     node.sets()
         .all()
         .iter()
@@ -4736,7 +4739,7 @@ async fn set_start(
     members: Option<Vec<String>>,
     replace: Vec<JobId>,
 ) -> Result<OpResult, OpError> {
-    let _set_gate = node.set_gate().await;
+    let set_gate = node.set_gate().await;
     // 1. Checks: nothing has happened yet.
     let sets = node.sets();
     let Some(loaded) = sets.get(&set) else {
@@ -4816,7 +4819,7 @@ async fn set_start(
             .expect("every chosen member's role is mapped")
     };
     // One instance per set: another mapping of a role it runs is refused.
-    node.prune_set_instances();
+    node.prune_set_instances(&set_gate);
     let previous = node.set_instances().remove(&set);
     if let Some(inst) = &previous
         && role_source
@@ -5123,65 +5126,9 @@ async fn set_start(
             }
         }
     }
-    // 7. The starts, source by source in the file's role order, each inside its capture.
-    for (role, _) in &file.radios {
-        for c in checked.iter_mut().filter(|c| c.role == role.as_str()) {
-            let Some(capture) = granted.get(&c.source).copied() else {
-                continue;
-            };
-            let guard = gate_of(&guards, &c.source);
-            let a = match &c.what {
-                SetMemberStart::Job {
-                    kind,
-                    tuning,
-                    deviation,
-                    sideband,
-                    params,
-                } if c.existing_job.is_none() => {
-                    let (r, a) = start_set_job(
-                        node,
-                        &c.source,
-                        kind,
-                        *tuning,
-                        (*deviation, *sideband),
-                        params.as_ref(),
-                        capture,
-                        guard,
-                    )
-                    .await;
-                    match r {
-                        Ok(job) => c.started_job = Some(job),
-                        Err(error) => refused.push(SetRefused {
-                            member: c.id.to_string(),
-                            channel: None,
-                            error,
-                        }),
-                    }
-                    a
-                }
-                SetMemberStart::Plan { pc, .. } if !c.plan_left.is_empty() => {
-                    let (started, no, a) =
-                        plan_start_channels(node, pc, &c.source, &c.plan_left, capture, guard)
-                            .await;
-                    c.plan_started = started;
-                    refused.extend(no.into_iter().map(|r| SetRefused {
-                        member: c.id.to_string(),
-                        channel: Some(r.channel),
-                        error: r.error,
-                    }));
-                    a
-                }
-                _ => AfterGate::Nothing,
-            };
-            let merged = merge_after(
-                &c.source,
-                after.remove(&c.source).unwrap_or(AfterGate::Nothing),
-                a,
-            );
-            after.insert(c.source.clone(), merged);
-        }
-    }
-    // 8. The instance, written under the gates: the roles in use and each member's jobs.
+    // 8 (begun before 7). The instance: the roles in use, then each job recorded and
+    // written under the gates as soon as it starts, so a future dropped between two
+    // starts leaves every started job to `set_stop`.
     let mut inst = previous.unwrap_or_else(|| crate::sets::SetInstance {
         format: crate::sets::SETS_INSTANCE_FORMAT,
         set: set.clone(),
@@ -5209,23 +5156,87 @@ async fn set_start(
             inst.members[i].jobs.push(job.clone());
         }
     };
-    for c in &checked {
-        for job in c
-            .started_job
-            .iter()
-            .chain(c.plan_started.iter().map(|s| &s.job))
-        {
-            record(&mut inst, c.id, job);
-        }
-    }
+    // Written only once it names a job; a failed write is one warning.
     let keep = |inst: &crate::sets::SetInstance, warnings: &mut Vec<String>| {
         if inst.jobs().next().is_none() {
             return;
         }
         if let Err(e) = node.put_set_instance(inst.clone()) {
-            warnings.push(format!("the set's instance was not written: {e}"));
+            let w = format!("the set's instance was not written: {e}");
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
         }
     };
+    // 7. The starts, source by source in the file's role order, each inside its capture.
+    for (role, _) in &file.radios {
+        for c in checked.iter_mut().filter(|c| c.role == role.as_str()) {
+            let Some(capture) = granted.get(&c.source).copied() else {
+                continue;
+            };
+            let guard = gate_of(&guards, &c.source);
+            let mut a = AfterGate::Nothing;
+            match &c.what {
+                SetMemberStart::Job {
+                    kind,
+                    tuning,
+                    deviation,
+                    sideband,
+                    params,
+                } if c.existing_job.is_none() => {
+                    let (r, after_start) = start_set_job(
+                        node,
+                        &c.source,
+                        kind,
+                        *tuning,
+                        (*deviation, *sideband),
+                        params.as_ref(),
+                        capture,
+                        guard,
+                    )
+                    .await;
+                    a = after_start;
+                    match r {
+                        Ok(job) => {
+                            record(&mut inst, c.id, &job);
+                            keep(&inst, &mut warnings);
+                            c.started_job = Some(job);
+                        }
+                        Err(error) => refused.push(SetRefused {
+                            member: c.id.to_string(),
+                            channel: None,
+                            error,
+                        }),
+                    }
+                }
+                SetMemberStart::Plan { pc, .. } => {
+                    // Channel by channel, each recorded as it starts.
+                    for &n in &c.plan_left {
+                        let (started, no, after_start) =
+                            plan_start_channels(node, pc, &c.source, &[n], capture, guard).await;
+                        a = merge_after(&c.source, a, after_start);
+                        for s in started {
+                            record(&mut inst, c.id, &s.job);
+                            keep(&inst, &mut warnings);
+                            c.plan_started.push(s);
+                        }
+                        refused.extend(no.into_iter().map(|r| SetRefused {
+                            member: c.id.to_string(),
+                            channel: Some(r.channel),
+                            error: r.error,
+                        }));
+                    }
+                }
+                _ => {}
+            }
+            let merged = merge_after(
+                &c.source,
+                after.remove(&c.source).unwrap_or(AfterGate::Nothing),
+                a,
+            );
+            after.insert(c.source.clone(), merged);
+        }
+    }
     keep(&inst, &mut warnings);
     drop(holds);
     drop(guards);

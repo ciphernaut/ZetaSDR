@@ -535,7 +535,7 @@ The themes the page can use, one row each: `id`, `name`, `description`, `color_s
 
 ### set_list
 
-The named sets the node knows (`sets/*.json` built in, then the operator's `--sets-dir`), sorted by id. A set names the jobs of a daily setup by radio role (`radios`: each role with a `note` saying what radio it needs), never by source: each `members` entry is a `job_start` or `plan_start` (`op`) of a `kind` on a role, with a one-line `summary`. A set that does not parse or validate is `broken` with its `reason` (`<field>: <error>`, e.g. `members[0].params.hold_ms: ...`) and never stops the node; an operator set with a built-in's `id` replaces it, and a broken one that meant to is listed as `<id>@<file name>`, the built-in staying in force. A member's kind need not be a ready row here (a set may name a decoder this host lacks). `running` is the set's running instance, `null` when it does not run: `radios` (the source each role runs on), `since_ns`, and one `members` entry per job it started (`id` the member, `job`, `state`: the job's state, `ended` once it no longer runs). An instance none of whose jobs runs is dropped.
+The named sets the node knows (`sets/*.json` built in, then the operator's `--sets-dir`), sorted by id. A set names the jobs of a daily setup by radio role (`radios`: each role with a `note` saying what radio it needs), never by source: each `members` entry is a `job_start` or `plan_start` (`op`) of a `kind` on a role, with a one-line `summary`. A set that does not parse or validate is `broken` with its `reason` (`<field>: <error>`, e.g. `members[0].params.hold_ms: ...`) and never stops the node; an operator set with a built-in's `id` replaces it, and a broken one that meant to is listed as `<id>@<file name>`, the built-in staying in force. A member's kind need not be a ready row here (a set may name a decoder this host lacks). `running` is the set's running instance, `null` when it does not run: `radios` (the source each role runs on), `since_ns`, and one `members` entry per job it started (`id` the member, `job`, `state`: the job's state, `ended` once it no longer runs). An instance none of whose jobs runs reads `null`.
 
 JSON: `{"op":"set_list"}`
 
@@ -560,7 +560,7 @@ One call starts a whole set; never start its members by hand. Map every role the
 
 ### set_stop
 
-Stop the jobs of a set's running instance that still run, those on a radio first and then those attached to them, and drop the instance. Jobs the instance did not start are left alone. The result lists `stopped`, `ended` (jobs that no longer ran when asked, such as one stopped by hand) and `failed` (`job`, `error`; the others go on, and the instance is kept). A set that does not run stops nothing.
+Stop the jobs of a set's running instance that still run, those on a radio first and then those attached to them, and drop the instance. Jobs the instance did not start are left alone. The result lists `stopped`, `ended` (jobs that no longer ran when asked, such as one stopped by hand) and `failed` (`job`, `error`; the others go on). When a stop fails the instance is kept, so a second `set_stop` can finish it. A set that does not run stops nothing.
 
 - set: string; an id from `set_list`
 

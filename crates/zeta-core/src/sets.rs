@@ -664,7 +664,8 @@ pub const SETS_INSTANCE_FORMAT: u32 = 1;
 /// A set's running instance, written by `set_start` to `state_dir/sets/<set id>.json`
 /// and read back when the node opens: the source each role runs on and the jobs each
 /// member started (an attached job beside its demodulator). One per set at a time;
-/// dropped by `set_stop`, or once every job it names has ended.
+/// dropped by `set_stop`, or by the next `set_start` once every job it names has ended
+/// (`set_list`, a read, then shows it as not running and leaves the file).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
