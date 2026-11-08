@@ -4,7 +4,9 @@
 //! event per row on its own event stream. A proof leaves that row's child running and
 //! ends the job `Stopped` with the verdict in `job_context.identify`; an exhausted list
 //! ends it the same way with `mode: null` and the layer-1 label and features, or the
-//! learned signature the measurement matches (`learned`).
+//! learned signature the measurement matches (`learned`). A run a watch starts with
+//! `context.identify.candidates` (its fitting `modes`) tries only those rows and
+//! publishes no `candidate` event for the rest.
 //!
 //! A stop of the job, or any other end of its loop (a fault fails it with the source's
 //! fault, as any job on a faulted source), stops the child it is trying (never a proved
@@ -56,6 +58,9 @@ struct Run {
     /// The controller that owns this run (a `watch`): set on the children it starts,
     /// and handed the verdict (see [`Inner::verdict`]).
     owner: Option<JobId>,
+    /// The rows the run may try, when its owner restricted it (a watch's fitting
+    /// `modes`, from `context.identify.candidates`); `None` tries every row.
+    candidates: Option<Vec<String>>,
 }
 
 /// How one attempt ended.
@@ -97,6 +102,11 @@ impl Inner {
         let stale = rec.context["identify"]["current"]
             .as_str()
             .map(|s| JobId(s.into()));
+        let candidates = rec.context["identify"]["candidates"].as_array().map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        });
         let (id, tuning, owner) = (rec.id.clone(), rec.tuning, rec.owner.clone());
         let token = self.shutdown.child_token();
         let (prov, run, ended) = self.record_running(rec, &token)?;
@@ -110,6 +120,7 @@ impl Inner {
             cancel: token.clone(),
             stale,
             owner,
+            candidates,
         };
         let mut set = JoinSet::new();
         let (running, body) = (
@@ -598,6 +609,13 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     // One pass in score order: a row that cannot run publishes its candidate at its turn.
     for s in &scored {
         let (mode, score) = (s.mode, s.score);
+        // A row the owner left out is not a candidate at all: no event.
+        if r.candidates
+            .as_ref()
+            .is_some_and(|c| !c.contains(&mode.row.id.0))
+        {
+            continue;
+        }
         let fit = allocation_match(mode, &allocations);
         if !s.fits_band {
             let min = mode.row.band.min_hz.unwrap_or(mode.row.band.bandwidth_hz);
