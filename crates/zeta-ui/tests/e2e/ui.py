@@ -5905,7 +5905,13 @@ def scenario_a_keyed_job_with_one_subject_keeps_its_row_distance(page, url, secr
     r = page.evaluate(
         """async () => {
           const { state } = await import('./app.js');
-          await state.subjects.lookup(['fake_subjects']);
+          // lookup() returns at once while the page's own lookup is in flight: poll
+          // until the row is known.
+          for (let i = 0; !state.subjects.rows.has('fake_subjects'); i += 1) {
+            if (i > 200) throw new Error('the fake_subjects row was never looked up');
+            await state.subjects.lookup(['fake_subjects']);
+            await new Promise((r) => setTimeout(r, 50));
+          }
           // In one tick: a jobs poll drops the subjects of a job that is not running.
           const job = {id: 'stub', kind: 'fake_subjects'};
           const fix = (icao, lat, lon) => {
@@ -5934,7 +5940,13 @@ def scenario_a_subject_track_thins_at_its_cap(page, url, secret):
         """async () => {
           const { state } = await import('./app.js');
           const { SUBJECT_TRACK_POINTS, TRACK_POINTS } = await import('./map.js');
-          await state.subjects.lookup(['fake_subjects']);
+          // lookup() returns at once while the page's own lookup is in flight: poll
+          // until the row is known.
+          for (let i = 0; !state.subjects.rows.has('fake_subjects'); i += 1) {
+            if (i > 200) throw new Error('the fake_subjects row was never looked up');
+            await state.subjects.lookup(['fake_subjects']);
+            await new Promise((r) => setTimeout(r, 50));
+          }
           const job = {id: 'stub', kind: 'fake_subjects'};
           let most = 0;
           const fix = (lat, lon) => {
@@ -6211,7 +6223,13 @@ def scenario_identify_trials_do_not_flap_the_subjects_pane(page, url, secret):
         """async () => {
           const { state } = await import('./app.js');
           const { mountSubjects, mountSubjectsPane } = await import('./subjects.js');
-          await state.subjects.lookup(['fake_subjects']);
+          // lookup() returns at once while the page's own lookup is in flight: poll
+          // until the row is known.
+          for (let i = 0; !state.subjects.rows.has('fake_subjects'); i += 1) {
+            if (i > 200) throw new Error('the fake_subjects row was never looked up');
+            await state.subjects.lookup(['fake_subjects']);
+            await new Promise((r) => setTimeout(r, 50));
+          }
           const api = {op: async () => ({value: {modes: []}})};
           const store = mountSubjects(api, state.view);
           store.rows.set('fake_subjects', state.subjects.rowOf('fake_subjects'));
@@ -6419,7 +6437,13 @@ def scenario_a_subject_key_is_trimmed_and_scalar(page, url, secret):
         """async () => {
           const { state } = await import('./app.js');
           const { metricText } = await import('./units.js');
-          await state.subjects.lookup(['fake_subjects']);
+          // lookup() returns at once while the page's own lookup is in flight: poll
+          // until the row is known.
+          for (let i = 0; !state.subjects.rows.has('fake_subjects'); i += 1) {
+            if (i > 200) throw new Error('the fake_subjects row was never looked up');
+            await state.subjects.lookup(['fake_subjects']);
+            await new Promise((r) => setTimeout(r, 50));
+          }
           const store = state.subjects;
           const job = {id: 'stub2', kind: 'fake_subjects'};
           const key = (icao) => store.event(job, {icao})?.key ?? null;
@@ -7084,7 +7108,7 @@ def scenarios():
 SHARD_STARTS = {
     1: [],
     2: ["listen_to_all_starts_one_mix_and_plays"],
-    3: ["audio_play_opens_binary_socket", "subjects_store_merge_units_and_fill"],
+    3: ["fm_demod_does_not_poll_streams", "subjects_distance_and_sort"],
 }
 
 
