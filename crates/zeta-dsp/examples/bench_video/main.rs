@@ -11,15 +11,16 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2.0);
     println!(
-        "{:>8} {:>9} {:>8} {:>8} {:>10} {:>7}",
-        "dev_MHz", "offset", "channel", "demod", "composite", "fields"
+        "{:>8} {:>9} {:>8} {:>8} {:>8} {:>10} {:>7}",
+        "dev_MHz", "offset", "band_MHz", "channel", "demod", "composite", "fields"
     );
     for case in bench::cases() {
         let c = bench::run(case, seconds);
         println!(
-            "{:>8.1} {:>9} {:>8.3} {:>8.3} {:>10.3} {:>7}",
+            "{:>8.1} {:>9} {:>8.0} {:>8.3} {:>8.3} {:>10.3} {:>7}",
             case.deviation_hz / 1e6,
             case.offset_hz,
+            case.band_hz as f64 / 1e6,
             c.channel,
             c.demod,
             c.composite,

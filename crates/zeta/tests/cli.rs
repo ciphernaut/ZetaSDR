@@ -1107,8 +1107,9 @@ fn job_start_identify_then_tail_prints_candidates() {
             "12500",
             // `stream_tail` waits at most 10 000 ms: one second's measure and the POCSAG
             // copy's 2 s dwell, the first row tried (AIS and APRS live elsewhere: skipped).
+            // Seven frames: the origin and six candidates.
             "--then-tail",
-            "6,10000",
+            "7,10000",
         ],
     )
     .assert()
@@ -1124,8 +1125,8 @@ fn job_start_identify_then_tail_prints_candidates() {
         .partition(|f| f["payload"]["protocol"] == "origin");
     assert_eq!(origin.len(), 1, "{v}");
     // M17 (unavailable: c2dec is pinned missing), the rows out of range (a sonde row,
-    // AIS, FLEX) and the tried one (POCSAG).
-    assert_eq!(frames.len(), 5, "{v}");
+    // AIS, FLEX, analog video's 6 MHz minimum band) and the tried one (POCSAG).
+    assert_eq!(frames.len(), 6, "{v}");
     for f in &frames {
         let p = &f["payload"];
         assert_eq!(p["protocol"], "candidate", "{v}");
@@ -2808,7 +2809,8 @@ fn modes_list_prints_the_embedded_rows() {
             "pocsag_decode",
             "rds_decode",
             "rs41_decode",
-            "vdl2_decode"
+            "vdl2_decode",
+            "video_decode"
         ]
     );
     assert!(rows.iter().all(|m| m["state"] == "ready"), "{v}");

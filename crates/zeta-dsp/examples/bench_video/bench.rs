@@ -19,11 +19,13 @@ pub const BAND_HZ: u64 = 24_000_000;
 pub const BLOCK: usize = 65_536;
 const CENTER_HZ: u64 = 1_300_000_000;
 
-/// One case: the card's deviation and where the carrier sits from the capture's centre.
+/// One case: the card's deviation, where the carrier sits from the capture's centre and
+/// the band the channel cuts.
 #[derive(Clone, Copy, Debug)]
 pub struct Case {
     pub deviation_hz: f64,
     pub offset_hz: i64,
+    pub band_hz: u64,
 }
 
 /// CPU-seconds per signal-second of each stage, and the fields decoded.
@@ -77,8 +79,8 @@ pub fn run(case: Case, seconds: f64) -> Cost {
     let (mut c, mut d, mut v, mut n, mut got) = (0.0, 0.0, 0.0, 0usize, 0usize);
     for b in &blocks {
         let t0 = cpu_s(&wall);
-        let (y, r) =
-            extract_direct(&mut chan, b, rate, case.offset_hz, BAND_HZ, rate).expect("channel");
+        let (y, r) = extract_direct(&mut chan, b, rate, case.offset_hz, case.band_hz, rate)
+            .expect("channel");
         let t1 = cpu_s(&wall);
         let (x, comp) = demod.process(&y, r).expect("demod");
         let t2 = cpu_s(&wall);
@@ -98,7 +100,7 @@ pub fn run(case: Case, seconds: f64) -> Cost {
 }
 
 /// The cases the bench prints: 8 and 1.5 MHz deviation, the carrier on the capture's
-/// centre and 1 MHz off it.
+/// centre and 1 MHz off it, in the row's 24 MHz band; and a 22 MHz band 1 MHz off at 8 MHz.
 pub fn cases() -> Vec<Case> {
     let mut out = Vec::new();
     for deviation_hz in [8.0e6, 1.5e6] {
@@ -106,8 +108,14 @@ pub fn cases() -> Vec<Case> {
             out.push(Case {
                 deviation_hz,
                 offset_hz,
+                band_hz: BAND_HZ,
             });
         }
     }
+    out.push(Case {
+        deviation_hz: 8.0e6,
+        offset_hz: 1_000_000,
+        band_hz: 22_000_000,
+    });
     out
 }

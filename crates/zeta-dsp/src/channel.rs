@@ -142,11 +142,18 @@ pub fn extract_offset_streaming(
 }
 
 /// Whether a band of `bandwidth_hz` cut at `out_rate_hz` from `rate_hz` skips the
-/// low-pass: no decimation and a band of at least three quarters of the rate, where the
-/// filter would pass nearly all of the block anyway and cost a 63-tap complex FIR per
-/// sample at the full rate (a video job's 24 MHz band at 30.72 Msps).
+/// low-pass: a wide input (at least [`THREADED_RATE_HZ`]), no decimation and a band of at
+/// least half the rate, where the filter would cost a 63-tap complex FIR per sample at the
+/// full rate (a video job's 20-24 MHz band at 30.72 Msps; a radio's rate rungs can be 1.5x
+/// apart, so a band may fill as little as two thirds of its rung). Nothing outside the
+/// band can land inside it: the offset is at most `(rate - band) / 2` and a shift without
+/// decimation is circular, so out-of-band content stays out of `±band/2` and the stage
+/// after (a demodulator filtering its own band) sees it only as the noise it was. Narrower
+/// inputs always filter, as they always have.
 pub fn skips_filter(rate_hz: u64, bandwidth_hz: u64, out_rate_hz: u64) -> bool {
-    rate_hz > 0 && out_rate_hz == rate_hz && u128::from(bandwidth_hz) * 4 >= u128::from(rate_hz) * 3
+    rate_hz >= THREADED_RATE_HZ
+        && out_rate_hz == rate_hz
+        && u128::from(bandwidth_hz) * 2 >= u128::from(rate_hz)
 }
 
 /// Samples between exact re-seeds of [`shift_into`]'s phasors.
@@ -370,8 +377,8 @@ impl Stage for ChannelStage {
     /// is judged first (on the bank's band, or on each block of the direct path) and the
     /// bank's width rule on the band actually cut; a `wide_hz` not cut adds `"wide": "off:
     /// <why>"` to that object. Where the direct path skips the low-pass ([`skips_filter`]:
-    /// no decimation, a band of three quarters of the rate or more) it adds `"filter":
-    /// "none"`. From an input rate of [`THREADED_RATE_HZ`] the direct path runs on a thread
+    /// an input of 10 MHz or more, no decimation, a band of half the rate or more) it adds
+    /// `"filter": "none"`. From an input rate of [`THREADED_RATE_HZ`] the direct path runs on a thread
     /// of its own and adds `"dropped": N` once its queue has dropped inputs.
     async fn run(
         &self,
@@ -1106,8 +1113,15 @@ mod tests {
     #[test]
     fn a_wide_band_at_decimation_1_passes_the_block_through() {
         assert!(skips_filter(VIDEO_RATE, 24_000_000, VIDEO_RATE));
-        assert!(!skips_filter(VIDEO_RATE, 22_000_000, VIDEO_RATE));
+        // 20.5-23 MHz on the 30.72 rung and 10.3-11.5 MHz on 15.36 skip too.
+        assert!(skips_filter(VIDEO_RATE, 22_000_000, VIDEO_RATE));
+        assert!(skips_filter(VIDEO_RATE, 15_360_000, VIDEO_RATE));
+        assert!(!skips_filter(VIDEO_RATE, 15_359_999, VIDEO_RATE));
+        assert!(skips_filter(15_360_000, 10_300_000, 15_360_000));
         assert!(!skips_filter(VIDEO_RATE, 24_000_000, VIDEO_RATE / 2));
+        // A narrow input filters, however wide its band: a 48 kHz band on 48 kHz.
+        assert!(!skips_filter(48_000, 48_000, 48_000));
+        assert!(!skips_filter(9_999_999, 9_999_999, 9_999_999));
         let iq: Arc<[Complex<f32>]> = noise_iq(65_536).into();
         let mut st = DirectChannel::new();
         let (out, rate) =
@@ -1174,6 +1188,22 @@ mod tests {
             &serde_json::json!({"channel": {
                 "path": "direct", "reason": "no bank", "filter": "none",
             }})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_narrow_input_with_a_full_band_is_still_filtered() {
+        let iq = tone(4_800, 1_000.0);
+        let p = serde_json::json!({
+            "center_hz": BLOCK_CENTER, "bandwidth_hz": RATE, "out_rate_hz": RATE,
+        });
+        let (got, notes) = run_noted(p, vec![frame_at(iq.clone(), RATE, BLOCK_CENTER)]).await;
+        let (want, _) = extract_offset(&iq, RATE, 0, RATE, RATE).unwrap();
+        assert_eq!(got, want);
+        assert_ne!(got, iq, "the filter ran");
+        assert_eq!(
+            notes.last().unwrap(),
+            &serde_json::json!({"channel": {"path": "direct", "reason": "no bank"}})
         );
     }
 
