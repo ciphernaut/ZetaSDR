@@ -62,8 +62,13 @@ pub enum Op {
     /// rate delivered over the last 10 s, `null` before any; `overflows`,
     /// `timeouts`, `restarts`, streams reopened because their samples ran ahead
     /// of the clock; `null` for a source that keeps none), and `worker`, the child
-    /// process the source runs in (`pid`, `restarts`, `since_ns`; `null` for a
-    /// source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
+    /// process the source runs in (`pid`, `restarts`, `since_ns`; `transport`,
+    /// how its blocks reach the node: `path` `shm` or `pipe`, `format`,
+    /// `ring_bytes`, `null` while none runs or from an older worker; and
+    /// `transport_dropped`, what it could not hand over: ring pieces (2 MiB) the node
+    /// had not released, or whole blocks its own pump could not take (pipe queue full,
+    /// broadcast lagging);
+    /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
     /// before the first block; a `classify` or `iq_read` span older than it fails
     /// `too_old`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
     /// source reported it, `configured` from `--source-position`) where the source knows
@@ -1253,6 +1258,7 @@ impl JobKind {
                     min: 1,
                     max: out,
                     suggested: None,
+                    why: None,
                 });
             }
         }
@@ -2598,6 +2604,10 @@ pub enum OpError {
         max: u64,
         #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
         suggested: Option<u64>,
+        /// Why the bound is what it is, when that is worth saying (a source's
+        /// measured ceiling: `insufficient bandwidth: ...`).
+        #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+        why: Option<String>,
     },
     /// The source is held by `holders` at `current`, which the request does
     /// not fit inside.
@@ -2666,11 +2676,16 @@ impl std::fmt::Display for OpError {
                 min,
                 max,
                 suggested,
+                why,
             } => {
                 write!(f, "{field} {value} out of range {min}..={max}")?;
                 match suggested {
-                    Some(s) if s > max => f.write_str(&crate::port::over_cap(Some(*s), *max)),
-                    Some(s) => write!(f, "; did you mean {s}?"),
+                    Some(s) if s > max => f.write_str(&crate::port::over_cap(Some(*s), *max))?,
+                    Some(s) => write!(f, "; did you mean {s}?")?,
+                    None => {}
+                }
+                match why {
+                    Some(w) => write!(f, ": {w}"),
                     None => Ok(()),
                 }
             }
@@ -2782,6 +2797,7 @@ fn range(field: &str, value: u64, min: u64, max: u64) -> Result<(), OpError> {
         min,
         max,
         suggested: suggest(value, min, max),
+        why: None,
     })
 }
 
@@ -2818,6 +2834,7 @@ fn port_error(e: PortError) -> OpError {
             min,
             max,
             suggested: suggested.or_else(|| suggest(value, min, max)),
+            why: None,
         },
         e => other(e),
     }
@@ -2890,7 +2907,19 @@ fn checked_port_up_to(
         caps.tune_min_hz.value().0,
         caps.tune_max_hz.value().0,
     )?;
-    range("bandwidth_hz", want.bandwidth_hz.0, 1, max_band(caps))?;
+    let widest = max_band(caps);
+    range("bandwidth_hz", want.bandwidth_hz.0, 1, widest).map_err(|mut e| {
+        if let (crate::types::Claim::Measured(cap), OpError::OutOfRange { why, .. }) =
+            (&caps.max_bandwidth_hz, &mut e)
+            && cap.0 == widest
+        {
+            *why = Some(format!(
+                "insufficient bandwidth: {} delivers at most {} Hz (measured at open)",
+                source.0, cap.0
+            ));
+        }
+        e
+    })?;
     Ok(port)
 }
 
@@ -4212,6 +4241,7 @@ fn limit(field: &str, value: u32, max: u64) -> Result<(), OpError> {
         min: 1,
         max,
         suggested: None,
+        why: None,
     })
 }
 

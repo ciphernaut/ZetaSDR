@@ -6,13 +6,16 @@
 //! needs `libsoapysdr-dev`). The receive gain is the driver's default unless the
 //! device args carry `gain=DB` ([`split_zeta_args`], applied at open by
 //! [`SoapySource::set_gain_now`]) or `source_set_gain` sets it
-//! ([`zeta_core::port::Port::set_gain`]).
+//! ([`zeta_core::port::Port::set_gain`]). At open the worker probes the rate
+//! ladder for the fastest rate the device streams cleanly ([`probe`]) unless
+//! `max_rate_hz=N` asserts one.
 
 pub mod caps;
 pub mod convert;
 pub mod device;
 #[cfg(feature = "test-mock")]
 pub mod mock;
+pub mod probe;
 pub mod source;
 
 pub use source::SoapySource;
@@ -27,16 +30,26 @@ pub struct ZetaArgs {
     /// tuned `N` ppm higher than every frequency zeta reports (see
     /// [`SoapySource::with_ppm`]).
     pub ppm: Option<f64>,
+    /// `max_rate_hz=N`: the fastest rate the device streams cleanly, asserted
+    /// by the operator; the worker reports it as the cap instead of probing
+    /// (see [`probe::probe_rate_cap`]).
+    pub max_rate_hz: Option<u64>,
 }
 
-/// Take zeta's own `gain=DB` and `ppm=N` keys out of SoapySDR device `args`: the
-/// args to hand the driver, and the values to apply after opening. A value that
-/// is not a finite number is an error.
+/// Take zeta's own `gain=DB`, `ppm=N` and `max_rate_hz=N` keys out of SoapySDR
+/// device `args`: the args to hand the driver, and the values to apply after
+/// opening. A gain or ppm that is not a finite number, or a rate that is not a
+/// positive whole number of Hz, is an error.
 pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
     let mut z = ZetaArgs::default();
     let mut rest = Vec::new();
     for kv in args.split(',').filter(|kv| !kv.is_empty()) {
         match kv.split_once('=') {
+            Some((k, v)) if k.trim() == "max_rate_hz" => {
+                let hz = v.trim().parse().ok().filter(|hz: &u64| *hz > 0);
+                z.max_rate_hz =
+                    Some(hz.ok_or_else(|| format!("max_rate_hz={v}: not a whole number of Hz"))?);
+            }
             Some((k, v)) if matches!(k.trim(), "gain" | "ppm") => {
                 let n: Option<f64> = v.trim().parse().ok().filter(|d: &f64| d.is_finite());
                 if k.trim() == "gain" {
@@ -83,7 +96,8 @@ mod tests {
                 "driver=uhd".into(),
                 ZetaArgs {
                     gain: Some(40.0),
-                    ppm: Some(3.4)
+                    ppm: Some(3.4),
+                    max_rate_hz: None,
                 }
             )
         );

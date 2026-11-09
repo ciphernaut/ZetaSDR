@@ -142,6 +142,8 @@ impl Port for FaultablePort {
             pid: Some(1),
             restarts: 0,
             since_ns: None,
+            transport: None,
+            transport_dropped: 0,
         })
     }
 }

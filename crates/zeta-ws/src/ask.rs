@@ -69,6 +69,7 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
                 min: MIN_TURNS,
                 max: MAX_TURNS,
                 suggested: Some(turns.clamp(MIN_TURNS, MAX_TURNS)),
+                why: None,
             },
         );
     };

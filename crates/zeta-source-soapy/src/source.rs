@@ -82,6 +82,9 @@ struct Status {
     restart_times: VecDeque<Instant>,
     /// `(when, samples)` per block over the last [`RATE_WINDOW`].
     window: VecDeque<(Instant, u64)>,
+    /// Samples received since the source opened, never reset (see
+    /// [`SoapySource::samples_delivered`]).
+    delivered: u64,
     /// The overall receive gain as last applied (read at open); `None` for a
     /// device that reports no gain range.
     gain: Option<GainInfo>,
@@ -348,18 +351,69 @@ impl SoapySource {
         self
     }
 
-    /// Read overflows (samples dropped by the driver) since the source opened.
+    /// The rates this source asks its device for, built at open.
+    pub fn rate_model(&self) -> &RateModel {
+        &self.rates
+    }
+
+    /// Replace the capability record's `max_bandwidth_hz` (the worker's rate
+    /// cap, measured by [`crate::probe::probe_rate_cap`] or asserted by
+    /// `max_rate_hz=`), before the source is shared. A later `tune` never
+    /// changes it.
+    pub fn set_max_bandwidth(&mut self, claim: Claim<Hz>) {
+        self.caps.max_bandwidth_hz = claim;
+    }
+
+    /// After the rate probe: stop the stream and wait for its reader to end,
+    /// then forget the tuning, the probe's overflows, timeouts and stream
+    /// restarts (the restart window too) and any fault a rung left, so the
+    /// source is as a fresh open leaves it (nothing tuned, nothing counted
+    /// against it). A device given up as lost keeps its fault: that is final.
+    pub(crate) async fn end_probe(&self) {
+        let _gate = self.gate.lock().await;
+        let handle = self
+            .reader
+            .lock()
+            .unwrap()
+            .take()
+            .and_then(|mut r| r.handle.take());
+        if let Some(h) = handle {
+            let _ = tokio::task::spawn_blocking(move || h.join()).await;
+        }
+        let mut st = self.status.lock().unwrap();
+        st.current = None;
+        st.band = None;
+        st.window.clear();
+        st.overflows = 0;
+        st.timeouts = 0;
+        st.restarts = 0;
+        st.restart_times.clear();
+        if !self.is_lost() {
+            st.fault = None;
+        }
+    }
+
+    /// Read overflows (samples dropped by the driver) since the source opened
+    /// (the rate probe's own excluded).
     pub fn overflows(&self) -> u64 {
         self.status.lock().unwrap().overflows
     }
 
-    /// Reads that timed out (100 ms without samples) since the source opened.
+    /// Reads that timed out (100 ms without samples) since the source opened
+    /// (the rate probe's own excluded).
     pub fn read_timeouts(&self) -> u64 {
         self.status.lock().unwrap().timeouts
     }
 
-    /// Samples per second actually delivered over the last 10 s, for reports;
-    /// the capabilities stay `Asserted`.
+    /// Samples received since the source opened, the rate probe's own
+    /// included: a counter that is never reset, so the difference of two reads
+    /// is what arrived between them.
+    pub fn samples_delivered(&self) -> u64 {
+        self.status.lock().unwrap().delivered
+    }
+
+    /// Samples per second actually delivered over the last 10 s (since the
+    /// last retune), for reports and the rate probe.
     pub fn measured_rate_hz(&self) -> Option<f64> {
         let st = self.status.lock().unwrap();
         let (first, last) = (st.window.front()?, st.window.back()?);
@@ -399,6 +453,12 @@ impl SoapySource {
             return Err(e);
         }
         apply_gain(self.dev.as_ref(), &self.status, db).map_err(PortError::Io)
+    }
+
+    /// Whether the reader gave the device up as lost (unplugged, an overflow
+    /// storm, a failed retune): final, every later `tune` refuses.
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
     }
 
     /// The error of a call on a source whose device was given up as lost; no
@@ -981,6 +1041,7 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                     let now = Instant::now();
                     st.last_end = end;
                     st.window.push_back((now, n as u64));
+                    st.delivered += n as u64;
                     while st
                         .window
                         .front()

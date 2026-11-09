@@ -483,8 +483,8 @@ session before the plan, as before.
 
 | Order | Plan | Why here | Depends on |
 |---|---|---|---|
-| 28.1 | The source transport, made rate-proof | A worker child hands IQ to the node through a shared-memory ring (worker protocol 2: descriptors on the pipe, `cf32` slots, drops counted), each Soapy source probes its rate ladder at open and reports a `measured` cap the lease applies (`insufficient bandwidth` names it), the B210 sweep before and after. Spec `docs/superpowers/specs/2026-11-06-video-decode-design.md` sections 3, 5.6, 5.7; plan `docs/superpowers/plans/2026-11-06-source-transport.md`. | 20 |
-| 28.2 | Analog video, decoded and watched live | `video_decode` (wide FM, composite sync and line lock, luma `gray8` fields; the 6.5 MHz audio subcarrier if it falls out), the websocket's video body with `smooth`, `sharp` and `thumb` profiles, the thumbnail riding the band and the full view with feeds switchable, `zeta stream save`, fixtures of the operator's four transmitters from the B210. Spec as above (the rest of it); plan to be written once 28.1's sweep fixes the default rung. UAT deferred: the operator sets up each transmitter. | 28.1 |
+| 28.1 | The source transport, made rate-proof | A worker child hands IQ to the node through a shared-memory ring (worker protocol 2: descriptors on the pipe, `cf32` slots, drops counted), each Soapy source probes its rate ladder at open and reports a `measured` cap the lease applies (`insufficient bandwidth` names it), the B210 sweep before and after. Spec `docs/superpowers/specs/2026-11-06-video-decode-design.md` sections 3, 5.6, 5.7; plan `docs/superpowers/plans/2026-11-06-source-transport.md`. **Merged** to `main` (97d958a) and deployed on the field host as `plan28.1-main-zeta`, 2026-11-07 (see "Plan 28.1 status"). | 20 |
+| 28.2 | Analog video, decoded and watched live | `video_decode` (wide FM, composite sync and line lock, luma `gray8` fields; the 6.5 MHz audio subcarrier if it falls out), the websocket's video body with `smooth`, `sharp` and `thumb` profiles, the thumbnail riding the band and the full view with feeds switchable, `zeta stream save`, fixtures of the operator's four transmitters from the B210. Spec as above (the rest of it); plan `docs/superpowers/plans/2026-11-08-video-decode.md` (written 2026-11-08, after 28.1 fixed the default rung at 30.72 Msps). UAT deferred: the operator sets up each transmitter. | 28.1 |
 | 29 | Decoder wave 2 | AIS in-crate, FLEX over multimon-ng, M17 with c2dec, DFM/M20 synthesis, APRS positions; expect tolerances, handlers on graph rows, outputs, row notes in the guide, the access marker. Spec `docs/superpowers/specs/2026-11-06-decoder-wave2-design.md`, plan `docs/superpowers/plans/2026-11-06-decoder-wave2.md`; built on `worktree-agent-a90e5005948f16feb`, see Plan 29 status. | 16, 17, 23 |
 | 30 | Aircraft data links | `vdl2_decode` and `hfdl_decode` program rows over a field map on a row's `output` (`decoder.output.fields`, `$center_khz`, `subject.merge`), a per-source position (`--source-position`, the Kiwi's `/status`), one merged aircraft table on the page, the fixture lookup for `modes check`. Built on `worktree-agent-a1ff3bab5d4d2658f`, commits 4e34d62..4d16a91 (plus the docs); see Plan 30 status. Spec `docs/superpowers/specs/2026-11-06-aircraft-links-design.md`; plan `docs/superpowers/plans/2026-11-06-aircraft-links.md`. | 16, 23 (subjects); the source position shared with 32 |
 | 32 | Map layer | Origins from the register lit on a Map tab beside the radios; the dock; a Kiwi's position; map tiles from five providers. Built on `worktree-agent-a80225b3e557540e0`, commits 56ffb38..c68cf95f (from the merge of plan 30); see Plan 32 status. Spec `docs/superpowers/specs/2026-11-06-map-layer-design.md`; plan `docs/superpowers/plans/2026-11-06-map-layer.md`. | 30 (the source position), 23 (subjects) |
@@ -553,8 +553,71 @@ Waits for the operator: `UAT.md` "Plan 30" (the VDL2 fixture, a live VDL2 run, t
 
 ## Plan 28.1 status
 
-Not started. The sweep before (Task 0) and after (Task 8) go here as two tables: rate, delivered,
-overflows per minute, worker CPU, node CPU, fault.
+What was built: the Soapy worker hands IQ to the node through a shared-memory ring (a memfd of `cf32`
+slots of 2 MiB, 64 MiB per source by default, created per spawn and inherited as fd 3), and the pipe
+carries worker protocol 2, control JSON plus 40-byte block descriptors, so control never queues behind
+samples; a worker without a ring falls back to blocks on the pipe, and a protocol-1 child is still
+accepted. `source_list[].worker` shows `transport` and `transport_dropped`. At open the worker probes
+the device's rates from the top (at most 6 rungs, a 1.5 s settle and a 1.5 s dwell each, a rung rejected for overflows tried once more) and reports
+the first clean one (at most one overflow in the dwell, at least 98 % delivered) as
+`max_bandwidth_hz: {measured: N}`; with no rung clean it keeps the driver's asserted cap and logs the
+`max_rate_hz=` to pin. `max_rate_hz=N` asserts a cap with no probe; a measured cap is cached in
+`sources/<id>.json` and passed to every respawn, and a respawn's measured cap replaces an asserted one.
+A request wider than a measured cap is refused `out_of_range` with `why: insufficient bandwidth: ...`.
+The hello timeout is 60 s. The sweep script is `scripts/rate-sweep.sh`.
+
+The ring holds `slots` blocks, not `slots × 2 MiB` of samples: each block takes a slot whatever its
+size, and a B210 block is 10 ms (two slots at 30.72 Msps, as a block of 307 200 samples is wider than
+one), so the 64 MiB default (31 slots) buffers about 155 ms there; packing small blocks into one slot is
+a later gist.
+
+### Sweep before
+
+Run 2026-11-07 15:15-15:20 AEST on the field host's B210 through the deployed pre-change node
+(`events-log-zeta`, main 6043e56), `bash scripts/rate-sweep.sh deploy/field-host/z.sh b210 1090000000 …`,
+one minute per rate, the radio free of rigid jobs (the operator stopped the ADS-B decoder for it; the
+page's elastic spectrum job followed the capture). CPU was not captured (the sampler read lifetime
+averages; the after-sweep uses `top -b`).
+
+| rate | delivered | overflows/min | worker CPU | node CPU | fault |
+|---|---|---|---|---|---|
+| 15.36 M | 15.31 M | 71 | – | – | none |
+| 20.48 M | 20.39 M | 206 | – | – | none |
+| 30.72 M | 30.71 M | 11 | – | – | none |
+| 61.44 M | 51.48 M | 1702 | – | – | none |
+
+The device holds 30.72 Msps almost cleanly through the f32 pipe; 61.44 Msps is the rung that falls
+over (16 % short, overflows climbing, no fault within the minute). The "16-24 Msps reliable ceiling"
+of the earlier note was pessimistic. The overflow counts at 15.36 and 20.48 are higher than at 30.72;
+unexplained, to be compared with the after-sweep.
+
+### Sweep after
+
+Trial deploy 2026-11-07 16:04 AEST as `plan28.1-zeta` from the branch. At open the B210 probed 61.44
+(an overflow storm), 30.72 (drops and overflows in the seconds after the master-clock change) and took
+20.48 Msps as its measured cap; the HackRF took 20 Msps on its first rung. Both radios run on the ring
+(`transport.path: shm`, no drops). CPU read with `top -p` at 20.48 Msps with only the page's spectrum
+job.
+
+| rate | delivered | overflows/min | worker CPU | node CPU | fault |
+|---|---|---|---|---|---|
+| 15.36 M | 15.36 M | 0 | – | – | none |
+| 20.48 M | 20.48 M | 4 | 23 % | 10 % | none |
+| 30.72 M | refused: `insufficient bandwidth: b210 delivers at most 20480000 Hz (measured at open)` | | | | |
+
+The ring removes most of the overflows at 15.36 and 20.48 (71 and 206 a minute before). But the probe
+under-capped the B210 at first: 30.72 Msps delivered cleanly on the old pipe once streaming, so the probe's 200 ms
+settle was too short after a UHD master-clock change. Fixed on the branch: the settle is 1.5 s after every
+tune, a rung rejected for overflows (not for a short delivered rate) gets one more settle and dwell, and
+the hello timeout is 60 s (a cold FPGA load of 2-4 s plus up to 6 rungs of two 3 s attempts, about 40 s).
+The retry re-issues the tune, which is a no-op on the running stream, so it is a second settle and a
+fresh dwell, and each attempt's delivered rate is judged on the samples of its own dwell. Redeployed as
+`plan28.1b-zeta` at 16:26 with the B210's `capabilities` key removed (node stopped): the B210 probed
+`rate cap 30720000 Hz measured (2 rungs tried)`, and a minute at 30.72 Msps delivered 30.72 M with 0
+overflows (11 a minute on the old pipe).
+
+A `kill -ABRT` of the B210's worker healed in 4.4 s with `--rate-cap-hz 20480000 --ring-fd 3` on the
+respawn and no second probe.
 
 ## Plan 14 status
 

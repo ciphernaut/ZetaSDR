@@ -18,14 +18,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{oneshot, watch};
 use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning, WorkerInfo};
-use zeta_core::types::{Capabilities, SourceId};
+use zeta_core::types::{Capabilities, Claim, Hz, SourceId};
 
 use crate::supervisor::{Link, Shared, Supervisor};
 use crate::wire::{Cmd, Reply};
 
 /// How long a worker has to say hello after it is spawned: UHD loads a B210's
-/// FPGA image before the device opens, which takes seconds on a cold boot.
-pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+/// FPGA image before the device opens (2-4 s cold), and the worker then probes
+/// its rates before the hello: up to six rungs, each up to two attempts of a
+/// 1.5 s settle and a 1.5 s dwell, so about 40 s with the load. Both must fit
+/// with margin.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(60);
 /// The wait before the first respawn after a worker ended.
 pub const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 /// The cap the respawn wait doubles up to, and the poll interval while the
@@ -80,13 +83,36 @@ impl Default for Timings {
     }
 }
 
-/// What to spawn: `program` with `args`, serving source `id`.
+/// What to spawn: `program` with `args`, serving source `id`. With
+/// `ring_bytes > 0` (and memfds available) each spawn gets a shared-memory
+/// ring of that size for its blocks, and `--ring-fd 3` after `args`; with 0
+/// the blocks come on the pipe.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub id: SourceId,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub timings: Timings,
+    pub ring_bytes: usize,
+}
+
+/// The worker flag that passes a measured rate cap back, so the worker reports
+/// it instead of probing; see [`worker_args`] and the supervisor's respawns.
+pub const RATE_CAP_FLAG: &str = "--rate-cap-hz";
+
+/// The arguments `zeta` is spawned with as the worker of `--source-soapy
+/// id=args`: `soapy-worker --id ID --args ARGS`, and `--rate-cap-hz N` when the
+/// capabilities cached from an earlier open carry a measured cap `N`, so the
+/// worker reports it instead of probing the device's rates again. An asserted
+/// cap is not passed: the worker probes, or reads it from `max_rate_hz=`.
+pub fn worker_args(id: &str, args: &str, cached: Option<&Capabilities>) -> Vec<String> {
+    let mut out = ["soapy-worker", "--id", id, "--args", args]
+        .map(String::from)
+        .to_vec();
+    if let Some(Claim::Measured(Hz(cap))) = cached.map(|c| &c.max_bandwidth_hz) {
+        out.extend([RATE_CAP_FLAG.into(), cap.to_string()]);
+    }
+    out
 }
 
 /// What the first spawn said.
@@ -206,18 +232,35 @@ impl WorkerPort {
         }
     }
 
+    /// The inode of the live worker's ring memfd, so a test can tell one
+    /// spawn's ring from the next; `None` without a live ring.
+    #[cfg(feature = "test-bin")]
+    pub fn ring_ino(&self) -> Option<u64> {
+        use std::os::fd::AsRawFd;
+        let ring = self.shared.snapshot().ring.clone()?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat` writes a `stat` into the buffer and nothing else; the
+        // descriptor is the ring's, alive while `ring` is held, and the buffer
+        // is read only when the call succeeded.
+        let st = unsafe {
+            if libc::fstat(ring.fd().as_raw_fd(), st.as_mut_ptr()) < 0 {
+                return None;
+            }
+            st.assume_init()
+        };
+        Some(st.st_ino)
+    }
+
     /// Refuse a band the device cannot take before anything is sent, with the
     /// texts `SoapySource` gives, so a bad request never waits on a worker.
     fn check(&self, t: Tuning) -> Result<(), PortError> {
         let (center, bw) = (t.center_hz.0, t.bandwidth_hz.0);
-        let (min, max) = (
-            self.caps.tune_min_hz.value().0,
-            self.caps.tune_max_hz.value().0,
-        );
+        let caps = self.capabilities();
+        let (min, max) = (caps.tune_min_hz.value().0, caps.tune_max_hz.value().0);
         if !(min..=max).contains(&center) {
             return Err(out_of_range("center_hz", center, min, max));
         }
-        let max_bw = self.caps.max_bandwidth_hz.value().0;
+        let max_bw = caps.max_bandwidth_hz.value().0;
         if !(1..=max_bw).contains(&bw) {
             return Err(out_of_range("bandwidth_hz", bw, 1, max_bw));
         }
@@ -330,8 +373,10 @@ impl Port for WorkerPort {
         &self.id
     }
 
+    /// The record the port attached with, or the one a respawn measured in its
+    /// place (see the supervisor's module docs).
     fn capabilities(&self) -> &Capabilities {
-        &self.caps
+        self.shared.measured.get().unwrap_or(&self.caps)
     }
 
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
@@ -398,6 +443,8 @@ impl Port for WorkerPort {
             pid: s.pid,
             restarts: s.restarts,
             since_ns: s.since_ns,
+            transport: s.transport.clone(),
+            transport_dropped: s.transport_dropped,
         })
     }
 }

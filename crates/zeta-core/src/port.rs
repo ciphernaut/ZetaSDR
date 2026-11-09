@@ -64,16 +64,48 @@ pub struct PortStats {
 /// worker's pid (`null` while none is running: dead, respawning or waiting for
 /// the device), how many times a worker was spawned after the first, and when
 /// the live worker said hello, in ns since the UNIX epoch (`null` while none
-/// is running).
+/// is running). `transport` is how the live worker hands its blocks over, as
+/// its hello said (`null` from a worker of protocol 1, which sends them on
+/// the pipe, or while none is running); `transport_dropped` counts the blocks
+/// the live worker dropped because the node had not freed a ring slot (or its
+/// pipe queue) in time. Both default when absent, so a source record of an
+/// older node still loads; every node of this version writes them, so the
+/// schema requires them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
 pub struct WorkerInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<u32>")]
     pub pid: Option<u32>,
     pub restarts: u64,
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     pub since_ns: Option<u64>,
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<TransportInfo>")]
+    pub transport: Option<TransportInfo>,
+    #[serde(default)]
+    pub transport_dropped: u64,
+}
+
+/// How a worker child hands its blocks to the node: `shm` is a shared-memory
+/// ring the node maps (the wire carries only descriptors), `pipe` carries the
+/// samples in the frames themselves. `format` is the ring's sample format
+/// (`cf32`) and `ring_bytes` its size in bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct TransportInfo {
+    pub path: TransportPath,
+    pub format: String,
+    pub ring_bytes: u64,
+}
+
+/// The path a worker's blocks take to the node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportPath {
+    Shm,
+    Pipe,
 }
 
 /// A block of complex baseband samples.
