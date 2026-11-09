@@ -1136,6 +1136,7 @@ async fn two_source_node_ranged(
         resume: false,
         bank_factory: None,
         modes_dir: None,
+        sets_dir: None,
     };
     let ports = vec![tone.clone() as Arc<dyn Port>, cb.clone() as Arc<dyn Port>];
     let node = Arc::new(Node::open(cfg, registry, ports).await.expect("open node"));
