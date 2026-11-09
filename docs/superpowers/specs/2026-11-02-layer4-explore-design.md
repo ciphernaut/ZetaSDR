@@ -240,7 +240,7 @@ reads "within 300 km (VHF, discone)":
 | `ground` | under 2 MHz | 300 km | ground wave and night skywave: the far rows are kept, ordered by distance |
 | `skywave` | 2-30 MHz | no cut: the whole register, nearest first | NVIS by day under 10 MHz reaches a few hundred km, a skip at night thousands; the transmitter may be abroad and outside the register, and the result's `note` says so |
 | `tropo` | 30-300 MHz | 300 km | line of sight is 4.1 √h km each end; tropospheric refraction and ducting carry VHF much further, hence the margin |
-| `uhf` | 300 MHz-1 GHz | 150 km | ducting still happens; 404.025 MHz at 12 km is well inside |
+| `uhf` | 300 MHz-1 GHz | 150 km | ducting still happens; a nearby UHF telemetry link is well inside |
 | `microwave` | over 1 GHz | 60 km | |
 
 A directional antenna (`yagi`, `dish`, or any with an `azimuth_deg`) doubles the reach inside a

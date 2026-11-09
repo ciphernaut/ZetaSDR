@@ -663,3 +663,7 @@ From the operator, 2026-11-09: there is no POCSAG channel plan, only the `pagers
 ## Station: USB 3 noise near a 2.4 GHz mouse receiver
 
 Field note, 2026-11-09: the desktop's wireless mouse receiver shares the room with the B210's USB 3 link (5 Gbps), a known 2.4 GHz noise source. If drop-outs return with the B210 streaming, move the receiver onto an extension lead away from USB 3 cables, or put the B210 on a ferrite-clipped or USB 2 cable. Not a node change; recorded so the cause is known.
+
+## Access: APRS station movements are personal data
+
+From the operator, 2026-11-09: aircraft and radiosonde positions are fine to keep, but an APRS station's position reports are a person's movements, even when the ham chose to beacon them. Today `aprs_decode` writes every position into `events.log` and the map keeps a track per station. Treat them like pager text: mark the row `access: "restricted"` (the marker plans 29 and 31 introduced) so the coming ACLs can gate them, add a retention limit for APRS positions in the event log, and let the map show a station's latest fix without keeping a trail by default. Never commit real APRS tracks or callsign positions to the repository (fixtures stay synthetic, as they are now: `VK3ABC`, the APRS specification's example positions, the demo station).

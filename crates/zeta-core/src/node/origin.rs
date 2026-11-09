@@ -1149,8 +1149,8 @@ mod tests {
         assert_eq!(row(97_893_000).terms.width, ORIGIN_WIDTH_FULL);
     }
 
-    /// The field host's 2026-11-08 FM lookup: a 97.9 MHz station 5 km away tied at 0.79
-    /// with one 266 km away against a 300 km reach. The reach term is graded by distance
+    /// A live FM lookup (2026-11-08): an on-channel station near the field host tied at 0.79
+    /// with one near the edge of a 300 km reach. The reach term is graded by distance
     /// over the reach: full at the station, half at the limit, none beyond.
     #[test]
     fn the_near_on_channel_row_outranks_the_far_one_within_reach() {
