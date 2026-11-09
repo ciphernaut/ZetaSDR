@@ -2679,8 +2679,8 @@ impl Node {
 
     /// `source_free`: the sources, in id order, that could take the band now
     /// ([`LeaseManager::free_sources`]: a pin over the whole band admits it), and every
-    /// other source that covers it with its holders, elastic jobs, pin and fault. Sources that cannot cover the band
-    /// are in neither list.
+    /// other source that covers it with its holders, elastic jobs, pin and fault.
+    /// Sources that cannot cover the band are in neither list.
     pub fn source_free(
         &self,
         center_hz: u64,

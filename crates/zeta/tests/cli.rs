@@ -1077,20 +1077,9 @@ fn scan_kind_is_accepted_and_lists_as_running() {
 #[test]
 fn job_start_identify_then_tail_prints_candidates() {
     let dir = tempfile::tempdir().unwrap();
-    // `ais_decode` (an `fm` row like POCSAG and APRS, family maritime) is tried first on
-    // the tone and dwells 10 s, longer than a tail may wait: an operator copy dwells 5 s.
-    let modes = dir.path().join("modes");
-    std::fs::create_dir_all(&modes).unwrap();
-    let mut ais: Value =
-        serde_json::from_str(include_str!("../../../modes/ais_decode.json")).unwrap();
-    ais["identify"]["dwell_ms"] = 5000.into();
-    std::fs::write(modes.join("ais_decode.json"), ais.to_string()).unwrap();
-    let modes_dir = modes.display().to_string();
     let out = zeta(
         dir.path(),
         &[
-            "--modes-dir",
-            &modes_dir,
             "job",
             "start",
             "--kind",
@@ -1101,9 +1090,10 @@ fn job_start_identify_then_tail_prints_candidates() {
             "100000000",
             "--bandwidth-hz",
             "12500",
-            // `stream_tail` waits at most 10 000 ms: one second's measure and a 5 s dwell.
+            // `stream_tail` waits at most 10 000 ms: one second's measure and POCSAG's 5 s
+            // dwell, the first row tried (AIS and APRS live elsewhere, so are skipped).
             "--then-tail",
-            "4,10000",
+            "6,10000",
         ],
     )
     .assert()
@@ -1118,8 +1108,9 @@ fn job_start_identify_then_tail_prints_candidates() {
         .iter()
         .partition(|f| f["payload"]["protocol"] == "origin");
     assert_eq!(origin.len(), 1, "{v}");
-    // The tried one, a sonde row out of range, and the FLEX row (unavailable: multimon-ng is pinned missing).
-    assert_eq!(frames.len(), 3, "{v}");
+    // M17 (unavailable: c2dec is pinned missing), the rows out of range (a sonde row,
+    // AIS, FLEX) and the tried one (POCSAG).
+    assert_eq!(frames.len(), 5, "{v}");
     for f in &frames {
         let p = &f["payload"];
         assert_eq!(p["protocol"], "candidate", "{v}");

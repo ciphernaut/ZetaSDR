@@ -612,8 +612,8 @@ pub enum Op {
     /// covering the band, `holders` every covering source's holders, `options` first
     /// `radios.<role>: no free source covers <center> Hz ± <half> Hz; busy: <id>
     /// (holders [...]), ...`, then `unpin source <id> (source_unpin)` for each pinned
-    /// one), or `other` with that text when no source covers the band at all; a member whose kind is a mode row that is not ready
-    /// (`refused` `other`, `<state>: <reason>`), or a kind this node does not know
+    /// one), or `other` with that text when no source covers the band at all; a member
+    /// whose kind is a mode row that is not ready (`refused` `other`, `<state>: <reason>`), or a kind this node does not know
     /// (`refused` `unknown` on `members[<i>].kind`), or a `watch` member whose
     /// `params.modes` names a row this node cannot run or one wider than its band
     /// (`refused` `other`, `members[<i>].params.modes[<j>]: ...`), is set aside and the
