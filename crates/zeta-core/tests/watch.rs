@@ -382,9 +382,47 @@ impl Stage for FakeSink {
     }
 }
 
+/// The failing decoder stage of [`FAIL_ROW`]: it runs [`FAIL_AFTER`], then fails.
+const FAIL_STAGE: &str = "fail_decode";
+/// How long [`FAIL_STAGE`] runs before it fails: past the watch's start of it.
+const FAIL_AFTER: Duration = Duration::from_millis(1_000);
+
+/// A decoder stage that fails [`FAIL_AFTER`] after it starts.
+struct Failing(StageSpec);
+
+#[async_trait]
+impl Stage for Failing {
+    fn spec(&self) -> &StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        _inputs: Vec<broadcast::Receiver<Frame>>,
+        _outputs: Vec<zeta_core::types::StreamId>,
+        _bus: Arc<StreamBus>,
+        cancel: tokio_util::sync::CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        tokio::select! {
+            _ = cancel.cancelled() => Err(StageError::Cancelled),
+            _ = tokio::time::sleep(FAIL_AFTER) => Err(StageError::Failed("test: fails".into())),
+        }
+    }
+}
+
 fn registry() -> StageRegistry {
     let mut r = StageRegistry::new();
     r.register(Arc::new(PassthroughStage::new()));
+    r.register(Arc::new(Failing(StageSpec {
+        kind: FAIL_STAGE,
+        inputs: vec![StreamKind::Iq],
+        outputs: vec![StreamKind::Event],
+        params_schema: schemars::json_schema!({"type": "object"}),
+    })));
     r.register(Arc::new(FakeSink(StageSpec {
         kind: "sink_sondehub",
         inputs: vec![StreamKind::Event],
@@ -3383,6 +3421,87 @@ async fn a_carrier_no_decoder_proves_stops_being_restarted_after_its_tries() {
         .unwrap_or_else(|| panic!("{ctx}"));
     assert_eq!(noise["present"], true, "{noise}");
     assert_eq!(noise["handled"], true, "{noise}");
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// The failing row: `pocsag_decode`'s channel and centres, decoded by [`FAIL_STAGE`].
+const FAIL_ROW: &str = "fail_test";
+
+/// A modes dir under `dir` holding [`FAIL_ROW`] alone.
+fn fail_modes(dir: &Path) -> PathBuf {
+    let modes = dir.join("fail_modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let embedded = zeta_core::modes::ModeRegistry::embedded();
+    let (_, text) = embedded
+        .iter()
+        .find(|(f, _)| f.ends_with("pocsag_decode.json"))
+        .expect("pocsag_decode embedded");
+    let mut row: Value = serde_json::from_str(text).unwrap();
+    row["id"] = FAIL_ROW.into();
+    row["name"] = "Failing test decoder".into();
+    row["label"] = "FAIL".into();
+    row["protocol"] = FAIL_ROW.into();
+    row["catalogue"] = serde_json::json!([]);
+    row.as_object_mut().unwrap().remove("test");
+    for n in row["decoder"]["nodes"].as_array_mut().unwrap() {
+        if n["id"] == "decode" {
+            n["kind"] = FAIL_STAGE.into();
+        }
+    }
+    std::fs::write(modes.join(format!("{FAIL_ROW}.json")), row.to_string()).unwrap();
+    modes
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decoder_that_keeps_failing_stops_being_restarted_after_its_tries() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(CHURN_RETRY_MS, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let modes = fail_modes(dir.path());
+    let src = file_source("rx", &fixtures().pocsag);
+    let node = node_over(dir.path(), vec![(src.clone() as _, src)], Some(&modes)).await;
+    assert_eq!(
+        node.modes().get(FAIL_ROW).map(|m| m.state.clone()),
+        Some(zeta_core::modes::ModeState::Ready)
+    );
+    let node = Arc::new(node);
+    let mut params = span_params(&[FAIL_ROW]);
+    params["cooldown_ms"] = CHURN_COOLDOWN_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let on = |e: &Value| {
+        e["signal"]["center_hz"]
+            .as_u64()
+            .is_some_and(|hz| on_page(hz, OFFSET_HZ))
+    };
+    let count = |state: &str| events.watch(state).iter().filter(|e| on(e)).count();
+    // The first start and RETRY_MAX more, each failing.
+    let starts = zeta_core::node::watch::RETRY_MAX as usize + 1;
+    until("every try starts", Duration::from_secs(40), || {
+        count("decoding") >= starts
+    })
+    .await;
+    tokio::time::sleep(CHURN_QUIET).await;
+    let all = events.all();
+    assert_eq!(count("decoding"), starts, "{all:#?}");
+    // Failed, not lost: no `lost` events; still tracked and present, left alone.
+    assert!(events.watch("lost").is_empty(), "{all:#?}");
+    let ctx = node.job_context(&watch).unwrap();
+    let page = ctx["watch"]["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["center_hz"]
+                .as_u64()
+                .is_some_and(|hz| on_page(hz, OFFSET_HZ))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("{ctx}"));
+    assert_eq!(page["present"], true, "{page}");
+    assert_eq!(page["handled"], true, "{page}");
+    assert!(decoder_ids(&node, &watch).is_empty(), "{ctx}");
     stop_all(&node).await;
     zeta_core::node::watch::test_timing(0, 0);
 }

@@ -597,8 +597,8 @@ struct Decoding {
 }
 
 /// A channel no new decoder starts on until `until_ns` (`job_context.watch.cooled`):
-/// the centre and width of a decoder that was `lost` (`why` its loss's) or stopped by
-/// the operator (`why` [`WHY_STOPPED`]).
+/// the centre and width of a decoder that was `lost` (`why` its loss's), stopped by
+/// the operator (`why` [`WHY_STOPPED`]) or that failed (`why` [`WHY_FAILED`]).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Cooled {
     center_hz: u64,
@@ -659,6 +659,8 @@ const WHY_UNPROVEN: &str = "unproven";
 const WHY_RELAUNCH: &str = "relaunch failed";
 /// The `why` of a cooled channel whose decoder the operator stopped (not a `lost`).
 const WHY_STOPPED: &str = "stopped";
+/// The `why` of a cooled channel whose decoder ended `Failed` (not a `lost`).
+const WHY_FAILED: &str = "failed";
 
 /// What a running watch needs; made at launch from the record ([`Seed`]) and the
 /// streams the launch registered.
@@ -944,6 +946,15 @@ impl Inner {
             .unwrap()
             .get(id)
             .is_some_and(|e| e.record.state == JobState::Running && e.cancel.is_some())
+    }
+
+    /// Whether `id` ended `Failed`.
+    fn failed(&self, id: &JobId) -> bool {
+        self.jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|e| matches!(e.record.state, JobState::Failed { .. }))
     }
 
     /// Wait up to [`ADOPT_WAIT`] for `id` to run; `None` when cancelled first.
@@ -2262,7 +2273,8 @@ pub(super) fn register_says(allocations: &serde_json::Value) -> String {
 }
 
 /// Note the decoders' events; drop those whose job no longer runs (the operator stopped
-/// it; a span watch cools its channel [`WHY_STOPPED`]); stop (`lost`) those whose signal
+/// it; a span watch cools its channel [`WHY_STOPPED`], or [`WHY_FAILED`] counting a try
+/// when it ended `Failed`); stop (`lost`) those whose signal
 /// has gone and that stayed silent for the policy's `hold_ms`, re-adopted ones whose
 /// signal did not reappear in time, and direct starts that published nothing within
 /// `confirm_ms` while their signal was present (`unproven`). A span watch cools each
@@ -2311,10 +2323,15 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         if !inner.runs(&d.job) {
             // Stopped by the operator (or ended on its own): its slot is free. A span
             // watch's channel rests for the cooldown before the watch starts it again;
-            // any other watch leaves its signal alone until it goes and comes back.
+            // any other watch leaves its signal alone until it goes and comes back. A
+            // decoder that failed counts a try, so one that keeps failing stops being
+            // restarted after [`RETRY_MAX`]; an operator stop counts none.
             w.subs.remove(&d.job);
             if span {
-                free_channel(inner, w, &d, until_ns, WHY_STOPPED, None);
+                match inner.failed(&d.job) {
+                    true => free_channel(inner, w, &d, until_ns, WHY_FAILED, Some(t)),
+                    false => free_channel(inner, w, &d, until_ns, WHY_STOPPED, None),
+                }
             }
             changed = true;
             continue;
@@ -2361,7 +2378,8 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
 /// A span watch's decoder `d` no longer runs: cool its channel (its centre, its row's
 /// width) until `until_ns` for `why`, forget the tracked signals on it that have gone,
 /// and put those still present back in the queue, started afresh once the cooldown
-/// passes. After a loss the watch raised (`lost_at`, its time), each requeued signal
+/// passes. After a loss the watch raised or a failure (`lost_at`, its time), each
+/// requeued signal
 /// counts a try ([`count_try`]): past [`RETRY_MAX`] it is left alone until it goes and
 /// comes back, so a carrier no decoder proves does not churn.
 fn free_channel(
