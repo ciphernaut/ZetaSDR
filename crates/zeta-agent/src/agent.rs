@@ -134,8 +134,10 @@ impl OwnJobs {
             }
             "plan_start" | "set_start" => {
                 // Only an instance this run created whole is its to stop: an `existing`
-                // member means the operator's own instance is running.
-                let whole = value["existing"].as_array().is_none_or(|e| e.is_empty())
+                // member means the operator's own instance is running, and a call that
+                // names `members` only answers for those, so it never makes the set own.
+                let whole = arguments["members"].is_null()
+                    && value["existing"].as_array().is_none_or(|e| e.is_empty())
                     && value["started"].as_array().is_some_and(|s| !s.is_empty());
                 if let (true, true, Some(set)) = (tool == "set_start", whole, value["set"].as_str())
                 {

@@ -504,6 +504,23 @@ fn a_set_with_existing_members_is_not_the_runs_to_stop() {
 }
 
 #[test]
+fn a_narrowed_set_start_is_not_the_runs_set_to_stop() {
+    // `members` narrows the call: the operator's instance may run the other members,
+    // and the `existing` answer only covers the members named.
+    let stop = json!({"op": "set_stop", "set": "airband"});
+    let mut own = OwnJobs::default();
+    own.record(
+        "set_start",
+        &json!({"set": "airband", "members": ["vdl2"]}),
+        &json!({"result": "set_start", "value": {"set": "airband",
+            "started": [{"job": "01V", "attached": null}],
+            "existing": []}}),
+    );
+    assert!(!own.allows_stop(&stop));
+    assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01V"})));
+}
+
+#[test]
 fn set_list_passes_the_gate() {
     assert!(gate(&json!({"op": "set_list"}), Allow::default()).is_none());
 }
