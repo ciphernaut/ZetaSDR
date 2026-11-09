@@ -222,14 +222,25 @@ fn is_boundary(c: char) -> bool {
     !(c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// The ids appearing in `request` as whole words, case-insensitive, in `ids` order.
+/// The ids appearing in `request` as whole words, case-insensitive, in `ids` order: an
+/// occurrence counts when the chars either side of it (or the start or end of the
+/// request) are boundaries. Ids may themselves hold `.` and `:` (`kiwi.1`, `node:b210`).
 pub fn named_in(request: &str, ids: &[SourceId]) -> Vec<SourceId> {
-    let words: Vec<&str> = request
-        .split(is_boundary)
-        .filter(|w| !w.is_empty())
-        .collect();
+    // ASCII lowercasing keeps byte offsets, so slices of `text` line up with `request`.
+    let text = request.to_ascii_lowercase();
+    let whole = |at: usize, len: usize| {
+        let before = text[..at].chars().next_back().is_none_or(is_boundary);
+        let after = text[at + len..].chars().next().is_none_or(is_boundary);
+        before && after
+    };
     ids.iter()
-        .filter(|id| words.iter().any(|w| w.eq_ignore_ascii_case(&id.0)))
+        .filter(|id| {
+            let needle = id.0.to_ascii_lowercase();
+            !needle.is_empty()
+                && text
+                    .match_indices(needle.as_str())
+                    .any(|(at, m)| whole(at, m.len()))
+        })
         .cloned()
         .collect()
 }
@@ -416,7 +427,7 @@ impl Selection {
         out.push_str(&fill(rule));
         out.push('\n');
         if let Some(note) = &self.note {
-            out.push_str(&format!("Note: {note}.\n"));
+            out.push_str(&format!("Note: {}.\n", note.trim_end_matches('.')));
         }
         out
     }
@@ -520,6 +531,35 @@ mod tests {
             vec![id("cb"), id("hackrf")]
         );
         assert_eq!(named_in("144.8 b210:", &ids), vec![id("b210")]);
+        assert_eq!(named_in("b210", &ids), vec![id("b210")]);
+    }
+
+    #[test]
+    fn ids_with_dots_and_colons_can_be_named() {
+        let ids = [id("kiwi.1"), id("b210")];
+        assert_eq!(named_in("use KIWI.1 now", &ids), vec![id("kiwi.1")]);
+        assert_eq!(named_in("kiwi.10", &ids), Vec::<SourceId>::new());
+        assert_eq!(named_in("xkiwi.1", &ids), Vec::<SourceId>::new());
+        assert_eq!(named_in("on kiwi.1.", &ids), vec![id("kiwi.1")]);
+
+        let ids = [id("node:hackrf"), id("cb")];
+        assert_eq!(
+            named_in("listen on Node:HackRF, please", &ids),
+            vec![id("node:hackrf")]
+        );
+        assert_eq!(named_in("node:hackrf2", &ids), Vec::<SourceId>::new());
+        assert_eq!(named_in("node:hackrf_b", &ids), Vec::<SourceId>::new());
+
+        // Under focus, a named dotted radio is admitted, not refused.
+        let sources = vec![src("cb", None), src("kiwi.1", None)];
+        let mut s = resolve(
+            "start a measure on kiwi.1",
+            &ctx(Some("cb"), FocusFrom::Shown, RadioPolicy::Focus),
+            &sources,
+            Caller::page(),
+        );
+        assert_eq!(s.radio, Some(id("kiwi.1")));
+        assert_eq!(s.admit("job_start", &json!({"source": "kiwi.1"})), None);
     }
 
     #[test]
@@ -598,6 +638,25 @@ mod tests {
         assert_eq!(s.radio, Some(id("cb")));
         assert_eq!(s.reason, Reason::Shown);
         assert_eq!(s.note.as_deref(), Some("focus cb is faulted: usb gone"));
+        assert!(
+            s.prompt_section()
+                .contains("\nNote: focus cb is faulted: usb gone.\n")
+        );
+
+        // A fault that ends in a period does not double it.
+        let sources = vec![src("cb", Some("usb gone."))];
+        let s = resolve(
+            "start a measure",
+            &ctx(Some("cb"), FocusFrom::Shown, RadioPolicy::Focus),
+            &sources,
+            Caller::page(),
+        );
+        let p = s.prompt_section();
+        assert!(
+            p.contains("\nNote: focus cb is faulted: usb gone.\n"),
+            "{p}"
+        );
+        assert!(!p.contains(".."), "{p}");
     }
 
     #[test]
