@@ -329,7 +329,7 @@ From the operator, 2026-11-06. Pager events and the rows that produce them (`poc
 - the level stated in `GET /health`;
 - the Subjects tab's text column, which shows pager text today (plan 31's `pocsag_decode` addresses table).
 
-Plan 31 added the marker's second carrier (`pocsag_decode` and `flex_decode` both carry it; `summary::envelope` inserts it on every event of a marked row). Still nothing reads it.
+Plan 29 landed the marker on both pager rows and `summary::envelope`, which inserts it on every event of a marked row. Plan 31 added a new place where pager text shows: the pager addresses table in the Subjects tab. Still nothing reads the marker.
 
 Until then the README's Legal paragraph is the guard.
 
@@ -570,8 +570,13 @@ Field risks:
 Small:
 - `known.register` cannot say `unreachable`: `KnowledgeProvider::allocations` has no error channel, so `job_context.watch.known` holds counts only.
 - The ACMA provider caps a query at 200 rows before `band_assignments` dedupes.
-- `cooled[]` is pruned per tick.
 - A seeded decoder's centre is the known centre until the first `new`.
+- A repeated `--radio` role on `zeta set start` collapses silently: the last mapping wins, with no usage error.
+- Set and plan groups on the page share sessionStorage fold keys, so a set and a plan with the same id share one fold state.
+- A failed `graph_put` after the page's Decode across leaves a plain watch running.
+- The unready-attach fallback in `set_start` swallows any other attach error when the stage is also unready: the member starts without attach and only the readiness reason is warned.
+- Re-adopted decoders' signals are not tracked (`Seed` does not persist `signals`), so after a restart an operator stop of such a decoder does not requeue its carrier until it goes and comes back.
+- A decoder's recorded signal follows the detector's latest centre while the decoder stays tuned where it started, and the cooldown after it uses the drifted centre.
 - A set file's `radios` order is the file's order on the node, but `set_list`'s JSON is a BTreeMap, so the page's picker orders roles by first use.
 - `pick_source` never considers `replace`: a source held only by a `replace` job counts as busy.
 - The menu's `modes_list` is cached per page load.
