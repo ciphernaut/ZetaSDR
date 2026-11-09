@@ -461,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn identifies_acars_in_baseband_iq() {
-        let iq = acars_packet_iq("VH-ZET", "H1", "#M1BPOS/ZETASDR TEST", 48_000, 0.0);
+        let iq = acars_packet_iq("VH-ZET", "H1", 'A', "#M1BPOS/ZETASDR TEST", 48_000, 0.0);
         let labels = whole(&iq).await;
         assert_eq!(labels.len(), 1, "{labels:?}");
         assert_eq!(labels[0].layer, 2);
@@ -477,7 +477,7 @@ mod tests {
     async fn aprs_and_pocsag_fixtures_have_no_acars_label_and_vice_versa() {
         let aprs = aprs_packet_iq("VK3ABC", "APRS", ">hi", 48_000, 0.0);
         let pocsag = pocsag_packet_iq(1234567, 3, "HELLO ZETA", 1200, 48_000, 0.0);
-        let acars = acars_packet_iq("VH-ZET", "H1", "#M1BPOS/ZETASDR TEST", 48_000, 0.0);
+        let acars = acars_packet_iq("VH-ZET", "H1", 'A', "#M1BPOS/ZETASDR TEST", 48_000, 0.0);
         for iq in [&aprs, &pocsag] {
             let labels = whole(iq).await;
             assert!(labels.iter().all(|l| l.name != "ACARS"), "{labels:?}");

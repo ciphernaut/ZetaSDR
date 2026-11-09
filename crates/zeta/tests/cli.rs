@@ -949,8 +949,14 @@ fn job_start_adsb_decode_prints_adsb_event() {
 #[test]
 fn job_start_acars_decode_prints_acars_event() {
     let dir = tempfile::tempdir().unwrap();
-    let iq =
-        zeta_dsp::fixtures::acars_packet_iq("VH-ZET", "H1", "#M1BPOS/ZETASDR TEST", 48_000, 0.0);
+    let iq = zeta_dsp::fixtures::acars_packet_iq(
+        "VH-ZET",
+        "H1",
+        'A',
+        "#M1BPOS/ZETASDR TEST",
+        48_000,
+        0.0,
+    );
     let meta = zeta_dsp::fixtures::write_fixture(dir.path(), "acars", &iq, 48_000, 131_550_000);
     let src = format!("acars={}", meta.display());
     let out = zeta(

@@ -83,6 +83,8 @@ pub struct AcarsBlock {
     pub label: String,
     /// `None` for a NUL block id (a squitter).
     pub block_id: Option<char>,
+    /// True for a downlink (aircraft to ground): a digit block id.
+    pub downlink: bool,
     /// Downlink (digit block id) message number, the text's first 4 chars.
     pub msg_no: Option<String>,
     /// Downlink flight id, the text's next 6 chars.
@@ -324,10 +326,9 @@ fn parse_block(body: &[u8]) -> Option<AcarsBlock> {
         label.replace_range(1.., "d");
     }
     let block_id = (head[11] != 0).then_some(head[11] as char);
+    let downlink = block_id.is_some_and(|c| c.is_ascii_digit());
     let (mut msg_no, mut flight, mut text) = (None, None, text);
-    if block_id.is_some_and(|c| c.is_ascii_digit())
-        && let Some((no, t)) = text.split_at_checked(4)
-    {
+    if downlink && let Some((no, t)) = text.split_at_checked(4) {
         msg_no = Some(s(no));
         text = t;
         if let Some((fid, t)) = text.split_at_checked(6) {
@@ -341,6 +342,7 @@ fn parse_block(body: &[u8]) -> Option<AcarsBlock> {
         ack: (head[8] != NAK).then_some(head[8] as char),
         label,
         block_id,
+        downlink,
         msg_no,
         flight,
         text: s(text),
@@ -495,6 +497,7 @@ mod tests {
             ack: None,
             label: "H1".into(),
             block_id: Some('A'),
+            downlink: false,
             msg_no: None,
             flight: None,
             text: TEXT.into(),
@@ -508,19 +511,19 @@ mod tests {
 
     #[test]
     fn roundtrip_block() {
-        let iq = acars_packet_iq("VH-ZET", "H1", TEXT, 48_000, 0.0);
+        let iq = acars_packet_iq("VH-ZET", "H1", 'A', TEXT, 48_000, 0.0);
         assert_eq!(decode_acars_iq(&iq, 48_000), vec![expected()]);
     }
 
     #[test]
     fn roundtrip_at_an_odd_channel_rate() {
-        let iq = acars_packet_iq("VH-ZET", "H1", TEXT, 53_333, 1_500.0);
+        let iq = acars_packet_iq("VH-ZET", "H1", 'A', TEXT, 53_333, 1_500.0);
         assert_eq!(decode_acars_iq(&iq, 53_333), vec![expected()]);
     }
 
     #[test]
     fn noisy_fixture_decodes_and_noise_alone_does_not() {
-        let mut iq = acars_packet_iq("VH-ZET", "H1", TEXT, 48_000, 0.0);
+        let mut iq = acars_packet_iq("VH-ZET", "H1", 'A', TEXT, 48_000, 0.0);
         awgn(&mut iq, 15.0, 7);
         assert_eq!(decode_acars_iq(&iq, 48_000), vec![expected()]);
         let mut noise = vec![Complex::new(0.0f32, 0.0); 96_000];
@@ -530,7 +533,7 @@ mod tests {
 
     #[test]
     fn pipeline_carries_state_across_feeds() {
-        let iq = acars_packet_iq("VH-ZET", "H1", TEXT, 48_000, 0.0);
+        let iq = acars_packet_iq("VH-ZET", "H1", 'A', TEXT, 48_000, 0.0);
         let mut p = AcarsPipeline::new(48_000).unwrap();
         let got: Vec<AcarsBlock> = iq.chunks(1_001).flat_map(|c| p.feed(c)).collect();
         assert_eq!(got, vec![expected()]);
@@ -547,6 +550,16 @@ mod tests {
         audio.extend(vec![0.0f32; 9_600]);
         let iq = am_modulate(&audio, 48_000, 48_000, 0.9, 0.0);
         assert_eq!(decode_acars_iq(&iq, 48_000), vec![]);
+    }
+
+    #[test]
+    fn downlink_follows_the_block_id() {
+        for (id, want) in [('5', true), ('A', false)] {
+            let iq = acars_packet_iq("VH-ZET", "H1", id, "M01AZET001HELLO", 48_000, 0.0);
+            let got = decode_acars_iq(&iq, 48_000);
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(got[0].downlink, want, "{id}");
+        }
     }
 
     #[test]

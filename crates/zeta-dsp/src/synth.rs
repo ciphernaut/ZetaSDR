@@ -685,13 +685,16 @@ pub fn acars_modulate(bytes: &[u8], audio_rate_hz: u32) -> Vec<f32> {
         .collect()
 }
 
-/// One ACARS uplink-style block (mode `2`, block id `A`, so the text is
-/// kept whole) as complex baseband: 0.2 s silence, [`acars_modulate`] at
+/// One ACARS block (mode `2`, `block_id`) as complex baseband. A letter block
+/// id is an uplink, whose text the decoder keeps whole; a digit is a downlink,
+/// whose first 4 text characters it splits off as `msg_no` and next 6 as
+/// `flight`. The audio is 0.2 s silence, [`acars_modulate`] at
 /// 48 kHz, 0.2 s silence, through [`am_modulate`] at index 0.9 and
 /// `offset_hz` from centre.
 pub fn acars_packet_iq(
     reg: &str,
     label: &str,
+    block_id: char,
     text: &str,
     iq_rate_hz: u32,
     offset_hz: f64,
@@ -700,7 +703,7 @@ pub fn acars_packet_iq(
     let silence = vec![0.0f32; AUDIO_RATE as usize / 5];
     let mut audio = silence.clone();
     audio.extend(acars_modulate(
-        &acars_block_bytes('2', reg, label, 'A', text),
+        &acars_block_bytes('2', reg, label, block_id, text),
         AUDIO_RATE,
     ));
     audio.extend_from_slice(&silence);
@@ -1491,6 +1494,12 @@ pub enum SynthSpec {
         reg: String,
         label: String,
         text: String,
+        /// The block id: a letter for an uplink, a digit for a downlink (whose
+        /// text then starts with a 4-character message number and a 6-character
+        /// flight id). Absent means `A`.
+        #[serde(default)]
+        #[schemars(with = "Option<String>")]
+        block_id: Option<char>,
     },
     /// Mode S identification frames (`icao`, `callsign`) sent `repeats` times.
     ModesIdent {
@@ -1971,7 +1980,14 @@ impl SynthSpec {
                     return Err("subcarrier_hz: above 0 and below half of rate_hz".into());
                 }
             }
-            SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
+            SynthSpec::Acars { block_id, .. } => {
+                if let Some(c) = block_id
+                    && !c.is_ascii_alphanumeric()
+                {
+                    return Err(format!("block_id: {c:?} is not an ASCII letter or digit"));
+                }
+            }
+            SynthSpec::Rds { .. } | SynthSpec::NbfmTone { .. } => {}
         }
         Ok(())
     }
@@ -2056,7 +2072,12 @@ pub fn synthesise(
             shift(&mut iq, off, rate_hz);
             iq
         }
-        SynthSpec::Acars { reg, label, text } => acars_packet_iq(reg, label, text, rate_hz, off),
+        SynthSpec::Acars {
+            reg,
+            label,
+            text,
+            block_id,
+        } => acars_packet_iq(reg, label, block_id.unwrap_or('A'), text, rate_hz, off),
         SynthSpec::ModesIdent {
             icao,
             callsign,
@@ -2630,6 +2651,33 @@ mod tests {
     }
 
     #[test]
+    fn a_digit_block_id_synthesises_a_downlink() {
+        let iq = acars_packet_iq(
+            "VH-ZET",
+            "H1",
+            '2',
+            "M01AZET001#M1BPOSS27231E153071",
+            48_000,
+            0.0,
+        );
+        let got = crate::acars::decode_acars_iq(&iq, 48_000);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].downlink);
+        assert_eq!(got[0].msg_no.as_deref(), Some("M01A"));
+        assert_eq!(got[0].flight.as_deref(), Some("ZET001"));
+        assert_eq!(got[0].text, "#M1BPOSS27231E153071");
+    }
+
+    #[test]
+    fn a_bad_synth_block_id_is_refused() {
+        let v = serde_json::json!({
+            "family": "acars", "reg": "VH-ZET", "label": "H1", "text": "X", "block_id": "#"
+        });
+        let e = parse_params(v.as_object().unwrap().clone()).unwrap_err();
+        assert!(e.starts_with("block_id"), "{e}");
+    }
+
+    #[test]
     fn parse_params_takes_the_echo() {
         let v = serde_json::json!({"family": "ook", "symbol_rate_baud": 1000,
             "bits": "80", "repeat": 2, "echo": {"delay_us": 100, "gain_db": -6.0}});
@@ -2665,6 +2713,7 @@ mod tests {
                 reg: "VH-ZET".into(),
                 label: "H1".into(),
                 text: "HELLO".into(),
+                block_id: None,
             },
             SynthSpec::ModesIdent {
                 icao: 0x7C6B28,

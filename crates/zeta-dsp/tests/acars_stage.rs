@@ -70,7 +70,7 @@ fn iq_frame(iq: &[num_complex::Complex<f32>], rate_hz: u64) -> Frame {
 }
 
 fn packet() -> Vec<num_complex::Complex<f32>> {
-    acars_packet_iq("VH-ZET", "H1", "#M1BPOS/ZETASDR TEST", 48_000, 0.0)
+    acars_packet_iq("VH-ZET", "H1", 'A', "#M1BPOS/ZETASDR TEST", 48_000, 0.0)
 }
 
 #[tokio::test]
