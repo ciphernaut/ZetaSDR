@@ -3,12 +3,13 @@
 use crate::exec::{Executor, to_json, trim_result};
 use crate::llm::{AgentError, LlmClient, LlmConfig};
 use crate::page::{PageTools, VIEW_SET, view_set, view_set_tool};
+use crate::radio::{Caller, RadioContext, Selection, resolve};
 use crate::wire::{ChatMessage, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use zeta_client::{ToolDef, op_from_call, op_tools, system_prompt};
-use zeta_core::ops::OpError;
+use zeta_core::ops::{OpError, SourceInfo};
 
 /// What a run may do beyond reading and starting: stopping jobs is the
 /// operator's call, as are deleting captures and answering signature proposals, so
@@ -154,10 +155,14 @@ pub struct AgentConfig {
     pub allow: Allow,
     /// The page-only tools (`view_set`), on only for a run the page asked for.
     pub page: Option<PageTools>,
+    /// The request's radio context; [`RadioContext::default`] is none at all.
+    pub radio: RadioContext,
+    /// Who asked.
+    pub caller: Caller,
 }
 
 impl AgentConfig {
-    /// `max_turns` defaults to 8.
+    /// `max_turns` defaults to 8, `radio` to no context and `caller` to the CLI.
     pub fn new(system_prompt: impl Into<String>, tools: Vec<ToolDef>) -> Self {
         Self {
             system_prompt: system_prompt.into(),
@@ -165,6 +170,8 @@ impl AgentConfig {
             max_turns: 8,
             allow: Allow::default(),
             page: None,
+            radio: RadioContext::default(),
+            caller: Caller::cli(),
         }
     }
 
@@ -209,6 +216,8 @@ pub struct Transcript {
     pub turn_log: Vec<TurnEntry>,
     /// What the run was allowed to stop.
     pub allow: Allow,
+    /// The run's radio selection: `Some` once the pre-read `source_list` succeeded.
+    pub selection: Option<Selection>,
 }
 
 /// Why a run stopped, with everything done up to that point.
@@ -249,7 +258,9 @@ pub fn is_question(request: &str) -> bool {
 /// The agent `zeta ask` and the node's `POST /ask` both run: tools from the
 /// node's `schema`, the system prompt from its guide `agents_md`. `page`
 /// (the node's ready theme ids) adds the page-only tools, for a run the web
-/// page asked for; `zeta ask` passes `None`.
+/// page asked for; `zeta ask` passes `None`. `radio` and `caller` pick the run's
+/// default radio (see [`crate::radio`]).
+#[allow(clippy::too_many_arguments)]
 pub fn build_agent<E: Executor>(
     llm: LlmConfig,
     exec: E,
@@ -258,11 +269,15 @@ pub fn build_agent<E: Executor>(
     max_turns: u32,
     allow: Allow,
     page: Option<PageTools>,
+    radio: RadioContext,
+    caller: Caller,
 ) -> Result<Agent<E>, AgentError> {
     let llm = LlmClient::new(llm)?;
     let mut cfg = AgentConfig::new(system_prompt(agents_md), op_tools(schema, agents_md));
     cfg.max_turns = max_turns;
     cfg.allow = allow;
+    cfg.radio = radio;
+    cfg.caller = caller;
     if let Some(page) = page {
         cfg.enable_page_tools(page.themes);
     }
@@ -289,6 +304,7 @@ impl<E: Executor> Agent<E> {
             turns: 0,
             turn_log: Vec::new(),
             allow: self.cfg.allow,
+            selection: None,
         };
         match self.turns(&mut transcript).await {
             Ok(()) => Ok(transcript),
@@ -298,8 +314,9 @@ impl<E: Executor> Agent<E> {
 
     async fn turns(&self, t: &mut Transcript) -> Result<(), AgentError> {
         self.llm.wait_ready().await?;
+        let section = self.select(t).await?;
         let mut messages = vec![
-            ChatMessage::system(self.cfg.system_prompt.clone()),
+            ChatMessage::system(format!("{}\n{section}", self.cfg.system_prompt)),
             ChatMessage::user(t.request.clone()),
         ];
         let mut own = OwnJobs::default();
@@ -336,7 +353,7 @@ impl<E: Executor> Agent<E> {
                 tool_call_id: None,
             });
             for call in &c.tool_calls {
-                let record = self.call(call, &mut own).await?;
+                let record = self.call(call, &mut own, t.selection.as_mut()).await?;
                 // Compact JSON, as `serde_json::to_string` writes it.
                 let content = record.result.to_string();
                 messages.push(ChatMessage::tool(call.id.clone(), content));
@@ -348,10 +365,45 @@ impl<E: Executor> Agent<E> {
         })
     }
 
+    /// The pre-read: one `source_list` through the executor, hidden from the model and
+    /// from `calls`, resolved into `t.selection`. Returns the `## This request` section.
+    /// A node error aborts the run; an op error (or a value that is not a source list)
+    /// leaves `selection` `None` and the no-context paragraph.
+    async fn select(&self, t: &mut Transcript) -> Result<String, AgentError> {
+        let sources = match self.exec.apply(json!({"op": "source_list"})).await? {
+            Ok(result) => serde_json::from_value::<Vec<SourceInfo>>(result["value"].clone()).ok(),
+            Err(_) => None,
+        };
+        let Some(sources) = sources else {
+            let fallback = resolve(
+                &t.request,
+                &RadioContext::default(),
+                &[],
+                self.cfg.caller.clone(),
+            );
+            return Ok(fallback.prompt_section());
+        };
+        let selection = resolve(
+            &t.request,
+            &self.cfg.radio,
+            &sources,
+            self.cfg.caller.clone(),
+        );
+        let section = selection.prompt_section();
+        t.selection = Some(selection);
+        Ok(section)
+    }
+
     /// Apply one tool call. Bad arguments and unknown tools are the model's
     /// fault: they become the call's result and never reach the node. A
     /// page-only tool is answered here, never gated and never applied.
-    async fn call(&self, call: &ToolCall, own: &mut OwnJobs) -> Result<CallRecord, AgentError> {
+    /// A radio op the selection refuses is recorded `ok: false` and never applied.
+    async fn call(
+        &self,
+        call: &ToolCall,
+        own: &mut OwnJobs,
+        selection: Option<&mut Selection>,
+    ) -> Result<CallRecord, AgentError> {
         let f = &call.function;
         if let (Some(page), VIEW_SET) = (&self.cfg.page, f.name.as_str()) {
             let (arguments, result) = match f.args() {
@@ -382,7 +434,10 @@ impl<E: Executor> Agent<E> {
         let result = match outcome {
             Ok(op) => match gate(&op, self.cfg.allow) {
                 Some(refusal) if !own.allows_stop(&op) => Err(refusal),
-                _ => self.exec.apply(op).await?,
+                _ => match selection.and_then(|s| s.admit(&f.name, &arguments)) {
+                    Some(refusal) => Err(refusal),
+                    None => self.exec.apply(op).await?,
+                },
             },
             Err(e) => Err(to_json(&e)),
         };

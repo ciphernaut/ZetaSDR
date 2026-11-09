@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use zeta_agent::{Allow, LocalExecutor, PageTools, build_agent};
+use zeta_agent::{Allow, Caller, LocalExecutor, PageTools, RadioContext, build_agent};
 use zeta_core::ops::OpError;
 
 use crate::http::{Shared, error_response, other};
@@ -77,6 +77,11 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
         return error_response(StatusCode::CONFLICT, other("an agent run is in progress"));
     };
     let schema = st.node.schema();
+    let caller = if req.page_tools {
+        Caller::page()
+    } else {
+        Caller::http()
+    };
     let page = req.page_tools.then(|| PageTools {
         themes: st
             .node
@@ -95,6 +100,8 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
         max_turns,
         req.allow.unwrap_or_default(),
         page,
+        RadioContext::default(),
+        caller,
     ) {
         Ok(a) => a,
         Err(e) => return error_response(StatusCode::BAD_GATEWAY, other(e.to_string())),

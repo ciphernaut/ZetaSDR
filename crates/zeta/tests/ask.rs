@@ -100,6 +100,10 @@ async fn ask_local_lists_sources_via_fake_llm() {
     assert_eq!(t["calls"][0]["tool"], "source_list");
     assert_eq!(t["calls"][0]["result"]["value"][0]["id"], "tone");
     assert_eq!(t["answer"], "tone");
+    // No radio flags: no context, the CLI caller.
+    assert_eq!(t["selection"]["policy"], "free-first", "{t}");
+    assert_eq!(t["selection"]["caller"]["transport"], "cli", "{t}");
+    assert_eq!(t["selection"]["candidates"], json!(["tone"]), "{t}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -157,9 +161,13 @@ async fn system_prompt_and_tools_come_from_agents_md() {
     let md =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENTS.md")).unwrap();
     let reqs = fake.requests.lock().unwrap();
-    assert_eq!(
-        reqs[0]["messages"][0]["content"],
-        zeta_client::system_prompt(&md)
+    // The guide's prompt, then the request's `## This request` section.
+    let system = reqs[0]["messages"][0]["content"].as_str().unwrap();
+    let head = format!("{}\n## This request\n", zeta_client::system_prompt(&md));
+    assert!(system.starts_with(&head), "{system}");
+    assert!(
+        system.contains("No default radio (no radio in focus)."),
+        "{system}"
     );
     let names: Vec<&str> = reqs[0]["tools"]
         .as_array()

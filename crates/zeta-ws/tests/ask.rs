@@ -79,16 +79,47 @@ async fn ask_runs_the_agent_and_its_calls_appear_on_the_ops_stream() {
     assert_eq!(t["calls"][0]["ok"], true);
     assert_eq!(t["turns"], 2);
 
-    let frame = tokio::time::timeout(Duration::from_secs(5), ops.recv())
-        .await
-        .expect("ops frame within 5 s")
-        .expect("ops stream open");
-    let Payload::Event(p) = frame.payload else {
-        panic!("ops frame is not an Event");
-    };
-    assert_eq!(p["op"]["op"], "source_list");
-    assert_eq!(p["outcome"], "ok");
-    assert_eq!(p["transport"], "agent");
+    // The run's pre-read `source_list` first, then the model's one call: two records.
+    for which in ["the pre-read", "the model's call"] {
+        let frame = tokio::time::timeout(Duration::from_secs(5), ops.recv())
+            .await
+            .unwrap_or_else(|_| panic!("ops frame for {which} within 5 s"))
+            .expect("ops stream open");
+        let Payload::Event(p) = frame.payload else {
+            panic!("ops frame is not an Event");
+        };
+        assert_eq!(p["op"]["op"], "source_list", "{which}");
+        assert_eq!(p["outcome"], "ok", "{which}");
+        assert_eq!(p["transport"], "agent", "{which}");
+    }
+    // The run has answered, so every record it made is already on the stream.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), ops.recv())
+            .await
+            .is_err(),
+        "a third ops record"
+    );
+    ts.stop().await;
+}
+
+#[tokio::test]
+async fn ask_answer_carries_the_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = scripted(vec![]).await;
+    let ts = with_llm(
+        dir.path(),
+        llm(&fake, false, Duration::from_millis(10)),
+        Limits::default(),
+    )
+    .await;
+    let resp = ask(&ts, Some(BEARER), &json!({"request": "what sources?"})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    let selection = &body["selection"];
+    assert_eq!(selection["policy"], "free-first", "{body}");
+    assert_eq!(selection["caller"]["transport"], "http", "{body}");
+    assert_eq!(selection["radio"], Value::Null, "{body}");
+    assert!(selection.get("focus").is_none(), "{body}");
     ts.stop().await;
 }
 
@@ -410,7 +441,18 @@ async fn ask_page_tools_default_off_and_on_offers_view_set_with_the_ready_themes
     .await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-    // No operation at all reached the node during these runs.
+    // Only the two runs' pre-read `source_list` reached the node, never a `view_set`.
+    for run in ["the run without page tools", "the run with them"] {
+        let frame = tokio::time::timeout(Duration::from_secs(5), ops.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the pre-read of {run} within 5 s"))
+            .expect("ops stream open");
+        let Payload::Event(p) = frame.payload else {
+            panic!("ops frame is not an Event");
+        };
+        assert_eq!(p["op"]["op"], "source_list", "{run}");
+        assert_eq!(p["transport"], "agent", "{run}");
+    }
     if let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_millis(300), ops.recv()).await {
         panic!("an op reached the node: {:?}", frame.payload);
     }

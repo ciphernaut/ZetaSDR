@@ -7,13 +7,14 @@ use zeta_agent::fake::{
     FakeLlm, RecordingExecutor, text_response, tool_call_response, tool_call_response_with,
 };
 use zeta_agent::{
-    Agent, AgentConfig, AgentError, AgentFailure, LlmClient, LlmConfig, LocalExecutor, is_question,
+    Agent, AgentConfig, AgentError, AgentFailure, Caller, Executor, FocusFrom, LlmClient,
+    LlmConfig, LocalExecutor, OffDefault, RadioContext, RadioPolicy, is_question, resolve,
 };
 use zeta_client::op_tools;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::SourceId;
+use zeta_core::types::{Hz, SourceId};
 use zeta_source_file::fixtures::write_tone;
 use zeta_source_file::{FileOpts, FileSource};
 
@@ -38,6 +39,18 @@ async fn fake(chat: Vec<Value>) -> FakeLlm {
 
 fn requests(fake: &FakeLlm) -> Vec<Value> {
     fake.requests.lock().unwrap().clone()
+}
+
+/// The `source_list` every run applies before its first completion (the pre-read).
+fn pre_read() -> Value {
+    json!({"op": "source_list"})
+}
+
+/// The system message of a run whose pre-read gave no source list (a `RecordingExecutor`
+/// answers `{"result": "ok"}`): the prompt and the no-context paragraph.
+fn system_without_sources(request: &str) -> String {
+    let section = resolve(request, &RadioContext::default(), &[], Caller::cli()).prompt_section();
+    format!("{SYSTEM}\n{section}")
 }
 
 /// A node on `dir/state` with a looping `tone` source (as zeta-ws's test harness opens it).
@@ -102,6 +115,8 @@ async fn tool_call_then_prose_is_answer() {
     assert_eq!(t.calls[0].tool, "source_list");
     assert!(t.calls[0].ok);
     assert_eq!(t.turns, 2);
+    // The pre-read's answer is no source list: no selection.
+    assert!(t.selection.is_none());
 
     let reqs = requests(&fake);
     assert_eq!(reqs.len(), 2);
@@ -109,7 +124,7 @@ async fn tool_call_then_prose_is_answer() {
     assert_eq!(
         messages,
         &json!([
-            {"role": "system", "content": SYSTEM},
+            {"role": "system", "content": system_without_sources("list the sources")},
             {"role": "user", "content": "list the sources"},
             {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "call_0", "type": "function",
@@ -175,7 +190,11 @@ async fn unknown_tool_is_fed_back_with_known_tools() {
     let agent = Agent::new(llm(&fake), &exec, cfg());
 
     let t = agent.run("tune tone").await.unwrap();
-    assert_eq!(exec.calls.lock().unwrap().len(), 1, "tune reached the node");
+    assert_eq!(
+        *exec.calls.lock().unwrap(),
+        [pre_read(), json!({"op": "source_list"})],
+        "tune reached the node"
+    );
     assert!(!t.calls[0].ok);
     let r = &t.calls[0].result;
     assert_eq!(r["error"], "unknown");
@@ -210,7 +229,7 @@ async fn prose_on_command_is_no_tool_call_error() {
         other => panic!("expected NoToolCall, got {other:?}"),
     }
     assert!(err.transcript.calls.is_empty());
-    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(*exec.calls.lock().unwrap(), [pre_read()]);
 }
 
 #[tokio::test]
@@ -249,7 +268,7 @@ async fn malformed_arguments_are_fed_back() {
     assert!(t.calls[1].ok);
     assert_eq!(
         *exec.calls.lock().unwrap(),
-        vec![json!({"op": "source_list"})]
+        vec![pre_read(), json!({"op": "source_list"})]
     );
 }
 
@@ -332,7 +351,7 @@ async fn job_stop_is_refused_until_stops_are_allowed() {
     let exec = RecordingExecutor::new(vec![]);
     let agent = Agent::new(llm(&fake), &exec, cfg());
     let t = agent.run("stop it").await.unwrap();
-    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(*exec.calls.lock().unwrap(), [pre_read()]);
     assert!(!t.calls[0].ok);
     let r = &t.calls[0].result;
     assert_eq!(r["error"], "not_allowed");
@@ -359,7 +378,7 @@ async fn job_stop_is_applied_when_stops_are_allowed() {
     };
     let agent = Agent::new(llm(&fake), &exec, c);
     let t = agent.run("stop it").await.unwrap();
-    assert_eq!(exec.calls.lock().unwrap().len(), 1);
+    assert_eq!(applied_ops(&exec), ["source_list", "job_stop"]);
     assert!(t.calls[0].ok);
 }
 
@@ -373,7 +392,7 @@ async fn a_non_empty_replace_is_refused_until_replace_is_allowed() {
     let exec = RecordingExecutor::new(vec![]);
     let agent = Agent::new(llm(&fake1), &exec, cfg());
     let t = agent.run("start").await.unwrap();
-    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(*exec.calls.lock().unwrap(), [pre_read()]);
     let r = &t.calls[0].result;
     assert!(!t.calls[0].ok);
     assert_eq!(r["error"], "not_allowed");
@@ -393,7 +412,7 @@ async fn a_non_empty_replace_is_refused_until_replace_is_allowed() {
     };
     let agent = Agent::new(llm(&fake2), &exec, c);
     let t = agent.run("start").await.unwrap();
-    assert_eq!(exec.calls.lock().unwrap().len(), 1);
+    assert_eq!(applied_ops(&exec), ["source_list", "job_start"]);
     assert!(t.calls[0].ok);
 }
 
@@ -407,7 +426,7 @@ async fn an_empty_replace_passes_the_gate() {
     let exec = RecordingExecutor::new(vec![]);
     let agent = Agent::new(llm(&fake), &exec, cfg());
     agent.run("start").await.unwrap();
-    assert_eq!(exec.calls.lock().unwrap().len(), 1);
+    assert_eq!(applied_ops(&exec), ["source_list", "job_start"]);
 }
 
 #[test]
@@ -579,7 +598,7 @@ async fn a_run_stops_the_job_it_started() {
     let exec = RecordingExecutor::new(vec![("job_start", started("J1"))]);
     let agent = Agent::new(llm(&fake), &exec, cfg());
     let t = agent.run("measure it").await.unwrap();
-    assert_eq!(applied_ops(&exec), ["job_start", "job_stop"]);
+    assert_eq!(applied_ops(&exec), ["source_list", "job_start", "job_stop"]);
     assert!(t.calls[1].ok, "{}", t.calls[1].result);
 }
 
@@ -740,7 +759,7 @@ async fn capture_delete_needs_delete_captures_allowed() {
     let exec = RecordingExecutor::new(vec![]);
     let agent = Agent::new(llm(&first), &exec, cfg());
     let t = agent.run("delete it").await.unwrap();
-    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(*exec.calls.lock().unwrap(), [pre_read()]);
     let r = &t.calls[0].result;
     assert_eq!(r["error"], "not_allowed");
     assert_eq!(r["field"], "op");
@@ -759,7 +778,7 @@ async fn capture_delete_needs_delete_captures_allowed() {
     };
     let agent = Agent::new(llm(&second), &exec, c);
     agent.run("delete it").await.unwrap();
-    assert_eq!(exec.calls.lock().unwrap().len(), 1);
+    assert_eq!(applied_ops(&exec), ["source_list", "capture_delete"]);
 }
 
 #[test]
@@ -821,7 +840,7 @@ async fn view_set_is_recorded_for_the_page_and_never_reaches_the_executor() {
         call.result,
         json!({"page": true, "key": "theme", "value": "plain", "applied": "by the page when this answer arrives"})
     );
-    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(*exec.calls.lock().unwrap(), [pre_read()]);
     // The tool is offered to the model.
     let reqs = requests(&fake);
     let names: Vec<&str> = reqs[0]["tools"]
@@ -849,7 +868,7 @@ async fn view_set_refuses_a_theme_that_is_not_ready_listing_the_ready_ids() {
     assert_eq!(call.result["error"], "unknown");
     assert_eq!(call.result["field"], "value");
     assert_eq!(call.result["known"], json!(["console", "plain"]));
-    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(*exec.calls.lock().unwrap(), [pre_read()]);
 }
 
 #[tokio::test]
@@ -877,7 +896,7 @@ async fn view_set_names_a_missing_or_unknown_field() {
     // Other keys pass through: the page validates them.
     assert!(t.calls[2].ok, "{:?}", t.calls[2]);
     assert_eq!(t.calls[2].result["key"], "side");
-    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(*exec.calls.lock().unwrap(), [pre_read()]);
 }
 
 #[tokio::test]
@@ -914,7 +933,7 @@ async fn view_set_is_an_unknown_tool_without_page_tools() {
     assert!(!call.ok);
     assert_eq!(call.result["error"], "unknown");
     assert_eq!(call.result["field"], "tool");
-    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(*exec.calls.lock().unwrap(), [pre_read()]);
     let reqs = requests(&fake);
     assert!(!reqs[0]["tools"].to_string().contains("view_set"));
 }
@@ -947,7 +966,7 @@ async fn view_set_refuses_keys_that_act_listing_the_presentation_keys() {
             "{c:?}"
         );
     }
-    assert!(exec.calls.lock().unwrap().is_empty());
+    assert_eq!(*exec.calls.lock().unwrap(), [pre_read()]);
     // The tool's schema names the allowed keys as an enum.
     let reqs = requests(&fake);
     let tool = reqs[0]["tools"]
@@ -998,4 +1017,375 @@ fn the_page_allows_the_same_view_keys() {
             "{key} is not a view policy"
         );
     }
+}
+
+// ---- Radio selection (plan 33): the pre-read, the prompt section, the gate ----
+
+/// A node on `dir/state` with two looping file sources of the tone recording, `tone` and
+/// `cb`, tunable over the given ranges (48 kHz wide at most).
+async fn two_source_node_ranged(
+    dir: &std::path::Path,
+    tone_range: (u64, u64),
+    cb_range: (u64, u64),
+) -> Arc<Node> {
+    let meta = write_tone(dir);
+    let open = |id: &str, (min, max): (u64, u64)| {
+        let opts = FileOpts {
+            realtime: true,
+            block_samples: 4800,
+            repeat: true,
+            tune_range: Some((Hz(min), Hz(max))),
+        };
+        Arc::new(FileSource::open(SourceId(id.to_string()), &meta, opts).expect("open source"))
+    };
+    let tone = open("tone", tone_range);
+    let cb = open("cb", cb_range);
+    let mut registry = StageRegistry::new();
+    registry.register(Arc::new(PassthroughStage::new()));
+    let cfg = NodeConfig {
+        source_positions: Default::default(),
+        burst_policy: Default::default(),
+        state_dir: dir.join("state"),
+        ring_seconds: 10.0,
+        ring_budget_bytes: u64::MAX,
+        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
+        backends: vec![Backend::Cpu],
+        resume: false,
+        bank_factory: None,
+        modes_dir: None,
+    };
+    let ports = vec![tone.clone() as Arc<dyn Port>, cb.clone() as Arc<dyn Port>];
+    let node = Arc::new(Node::open(cfg, registry, ports).await.expect("open node"));
+    tone.start();
+    cb.start();
+    node
+}
+
+/// [`two_source_node_ranged`] with both sources over 100..200 MHz.
+async fn two_source_node(dir: &std::path::Path) -> Arc<Node> {
+    two_source_node_ranged(dir, (100_000_000, 200_000_000), (100_000_000, 200_000_000)).await
+}
+
+/// `cfg()` with the radio context `focus` (shown on the page) under `policy`.
+fn radio_cfg(policy: RadioPolicy, focus: &str) -> AgentConfig {
+    let mut c = cfg();
+    c.radio = RadioContext::from_parts(
+        Some(SourceId(focus.to_string())),
+        FocusFrom::Shown,
+        Some(policy),
+        vec![],
+    );
+    c.caller = Caller::page();
+    c
+}
+
+/// Apply `op` on `node` directly (not through the agent); the executor's answer.
+async fn node_apply(node: &Arc<Node>, op: Value) -> Value {
+    LocalExecutor::new(node.clone())
+        .apply(op)
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("op failed: {e}"))
+}
+
+/// A passthrough job on `source` at 150 MHz, 20 kHz wide, holding the band; its id.
+async fn hold(node: &Arc<Node>, source: &str) -> String {
+    let r = node_apply(
+        node,
+        json!({"op": "job_start", "kind": "passthrough", "source": source,
+               "center_hz": 150_000_000u64, "bandwidth_hz": 20_000, "deviation_hz": null,
+               "sideband": null, "elastic": false, "replace": []}),
+    )
+    .await;
+    r["value"].as_str().expect("job id").to_string()
+}
+
+/// The ids of the jobs not stopped.
+async fn job_ids(node: &Arc<Node>) -> Vec<String> {
+    let r = node_apply(node, json!({"op": "job_list"})).await;
+    r["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| j["state"]["status"] != "stopped")
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The model's scripted `job_start` of a passthrough on `source` at 150 MHz.
+fn start_on(source: &str) -> Value {
+    tool_call_response(&[(
+        "job_start",
+        json!({"kind": "passthrough", "source": source, "center_hz": 150_000_000u64,
+               "bandwidth_hz": 20_000, "deviation_hz": null, "sideband": null,
+               "elastic": false, "replace": []}),
+    )])
+}
+
+/// The model's scripted `source_free` for 150 MHz.
+fn free_call() -> Value {
+    tool_call_response(&[(
+        "source_free",
+        json!({"center_hz": 150_000_000u64, "bandwidth_hz": 20_000}),
+    )])
+}
+
+/// The first chat request's one system message.
+fn system_content(fake: &FakeLlm) -> String {
+    let reqs = requests(fake);
+    let messages = reqs[0]["messages"].as_array().unwrap();
+    let systems: Vec<&Value> = messages.iter().filter(|m| m["role"] == "system").collect();
+    assert_eq!(systems.len(), 1, "one system message: {messages:?}");
+    systems[0]["content"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn the_system_message_ends_with_this_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = two_source_node(dir.path()).await;
+    let fake = fake(vec![text_response("Two radios.", "stop")]).await;
+    let agent = Agent::new(
+        llm(&fake),
+        LocalExecutor::new(node),
+        radio_cfg(RadioPolicy::Focus, "cb"),
+    );
+    let request = "which radios are there?";
+    let t = agent.run(request).await.unwrap();
+    assert_eq!(t.answer.as_deref(), Some("Two radios."));
+
+    let system = system_content(&fake);
+    assert!(system.starts_with(SYSTEM), "{system}");
+    assert_eq!(system.matches("## This request").count(), 1, "{system}");
+    let at = system.find("## This request").unwrap();
+    let section = &system[at..];
+    // The section is the last thing in the system message.
+    assert!(!section[2..].contains("\n## "), "{section}");
+    assert!(section.contains("Default radio: cb"), "{section}");
+    let reqs = requests(&fake);
+    let users: Vec<&Value> = reqs[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .collect();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["content"], request);
+    let sel = t.selection.expect("selection");
+    assert_eq!(sel.radio, Some(SourceId("cb".into())));
+    assert_eq!(sel.caller, Caller::page());
+}
+
+/// Records each applied op with how many chat requests the fake had seen by then.
+struct OrderedExecutor {
+    inner: LocalExecutor,
+    seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    log: std::sync::Mutex<Vec<(String, usize)>>,
+}
+
+#[async_trait::async_trait]
+impl Executor for OrderedExecutor {
+    async fn apply(&self, op: Value) -> Result<Result<Value, Value>, AgentError> {
+        let n = self.seen.lock().unwrap().len();
+        self.log
+            .lock()
+            .unwrap()
+            .push((op["op"].as_str().unwrap_or_default().to_string(), n));
+        self.inner.apply(op).await
+    }
+}
+
+#[tokio::test]
+async fn one_source_list_is_read_before_the_first_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = two_source_node(dir.path()).await;
+    let fake = fake(vec![
+        tool_call_response(&[("job_list", json!({}))]),
+        text_response("No jobs.", "stop"),
+    ])
+    .await;
+    let exec = OrderedExecutor {
+        inner: LocalExecutor::new(node),
+        seen: fake.requests.clone(),
+        log: Default::default(),
+    };
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("list the jobs").await.unwrap();
+    let log = exec.log.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        [("source_list".to_string(), 0), ("job_list".to_string(), 1)]
+    );
+    assert_eq!(t.calls.len(), 1);
+    assert_eq!(t.calls[0].tool, "job_list");
+}
+
+#[tokio::test]
+async fn strict_refuses_job_start_on_another_radio() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = two_source_node(dir.path()).await;
+    let fake = fake(vec![start_on("tone"), text_response("Refused.", "stop")]).await;
+    let agent = Agent::new(
+        llm(&fake),
+        LocalExecutor::new(node.clone()),
+        radio_cfg(RadioPolicy::Focus, "cb"),
+    );
+    let t = agent.run("start a passthrough on 150 MHz").await.unwrap();
+    assert!(!t.calls[0].ok, "{:?}", t.calls[0]);
+    assert_eq!(t.calls[0].result["error"], "policy");
+    assert_eq!(t.calls[0].result["default"], "cb");
+    let reqs = requests(&fake);
+    let tool = reqs[1]["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(tool["role"], "tool");
+    let content = tool["content"].as_str().unwrap();
+    assert!(content.contains("\"error\":\"policy\""), "{content}");
+    assert!(content.contains("\"default\":\"cb\""), "{content}");
+    assert!(job_ids(&node).await.is_empty());
+}
+
+#[tokio::test]
+async fn focus_fallback_starts_it_and_records_off_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = two_source_node(dir.path()).await;
+    let fake = fake(vec![
+        start_on("tone"),
+        text_response("Ran on tone.", "stop"),
+    ])
+    .await;
+    let agent = Agent::new(
+        llm(&fake),
+        LocalExecutor::new(node.clone()),
+        radio_cfg(RadioPolicy::FocusFallback, "cb"),
+    );
+    let t = agent.run("start a passthrough on 150 MHz").await.unwrap();
+    assert!(t.calls[0].ok, "{:?}", t.calls[0]);
+    let job = t.calls[0].result["value"].as_str().unwrap().to_string();
+    assert_eq!(job_ids(&node).await, std::slice::from_ref(&job));
+    let sel = t.selection.expect("selection");
+    assert_eq!(
+        sel.off_default,
+        [OffDefault {
+            tool: "job_start".into(),
+            source: SourceId("tone".into())
+        }]
+    );
+    node_apply(&node, json!({"op": "job_stop", "job": job})).await;
+}
+
+#[tokio::test]
+async fn focus_asks_when_the_focus_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = two_source_node(dir.path()).await;
+    let held = hold(&node, "cb").await;
+    let before = job_ids(&node).await;
+    assert_eq!(before, std::slice::from_ref(&held));
+    let fake = fake(vec![
+        free_call(),
+        text_response("cb is held; tone is free: use it?", "stop"),
+    ])
+    .await;
+    let agent = Agent::new(
+        llm(&fake),
+        LocalExecutor::new(node.clone()),
+        radio_cfg(RadioPolicy::Focus, "cb"),
+    );
+    let t = agent.run("start a passthrough on 150 MHz").await.unwrap();
+    assert_eq!(
+        t.answer.as_deref(),
+        Some("cb is held; tone is free: use it?")
+    );
+    assert!(t.calls[0].ok, "{:?}", t.calls[0]);
+    assert_eq!(t.calls[0].result["value"]["free"], json!(["tone"]));
+    assert_eq!(job_ids(&node).await, before);
+    node_apply(&node, json!({"op": "job_stop", "job": held})).await;
+}
+
+#[tokio::test]
+async fn ask_policy_answers_after_source_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = two_source_node(dir.path()).await;
+    let fake = fake(vec![
+        free_call(),
+        text_response("Which radio: tone or cb?", "stop"),
+    ])
+    .await;
+    let agent = Agent::new(
+        llm(&fake),
+        LocalExecutor::new(node.clone()),
+        radio_cfg(RadioPolicy::Ask, "cb"),
+    );
+    let t = agent.run("start a measure on 150 MHz").await.unwrap();
+    assert_eq!(t.answer.as_deref(), Some("Which radio: tone or cb?"));
+    assert!(job_ids(&node).await.is_empty());
+    let system = system_content(&fake);
+    assert!(
+        system.contains("No default radio (policy ask)."),
+        "{system}"
+    );
+}
+
+#[tokio::test]
+async fn ask_policy_does_not_relax_the_prose_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = two_source_node(dir.path()).await;
+    let fake = fake(vec![text_response("Which radio: tone or cb?", "stop")]).await;
+    let agent = Agent::new(
+        llm(&fake),
+        LocalExecutor::new(node),
+        radio_cfg(RadioPolicy::Ask, "cb"),
+    );
+    let f: AgentFailure = agent.run("start a measure on 150 MHz").await.unwrap_err();
+    assert!(
+        matches!(f.error, AgentError::NoToolCall { .. }),
+        "{:?}",
+        f.error
+    );
+    // The selection is kept on a failure too.
+    assert!(f.transcript.selection.is_some());
+}
+
+#[tokio::test]
+async fn no_free_radio_starts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    // cb does not cover 150 MHz; tone does, and a job holds it.
+    let node = two_source_node_ranged(
+        dir.path(),
+        (100_000_000, 200_000_000),
+        (300_000_000, 400_000_000),
+    )
+    .await;
+    let held = hold(&node, "tone").await;
+    let before = job_ids(&node).await;
+    let answer = format!("Nothing free: tone is held by passthrough {held}.");
+    let fake = fake(vec![free_call(), text_response(&answer, "stop")]).await;
+    let agent = Agent::new(
+        llm(&fake),
+        LocalExecutor::new(node.clone()),
+        radio_cfg(RadioPolicy::FocusFallback, "cb"),
+    );
+    let t = agent.run("start a passthrough on 150 MHz").await.unwrap();
+    assert_eq!(t.answer.as_deref(), Some(answer.as_str()));
+    assert_eq!(t.calls[0].result["value"]["free"], json!([]));
+    assert_eq!(job_ids(&node).await, before);
+    for c in &t.calls {
+        let replace = c.arguments["replace"].as_array();
+        assert!(replace.is_none_or(|r| r.is_empty()), "{c:?}");
+    }
+    node_apply(&node, json!({"op": "job_stop", "job": held})).await;
+}
+
+#[tokio::test]
+async fn a_run_without_context_states_no_radio_in_focus() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = two_source_node(dir.path()).await;
+    let fake = fake(vec![text_response("Two radios.", "stop")]).await;
+    let agent = Agent::new(llm(&fake), LocalExecutor::new(node), cfg());
+    let t = agent.run("which radios are there?").await.unwrap();
+    let system = system_content(&fake);
+    assert!(
+        system.contains("No default radio (no radio in focus)"),
+        "{system}"
+    );
+    let sel = t.selection.expect("selection");
+    assert_eq!(sel.policy, RadioPolicy::FreeFirst);
+    assert_eq!(sel.caller, Caller::cli());
 }

@@ -6,7 +6,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zeta_agent::{Allow, Executor, LlmConfig, LocalExecutor, RemoteExecutor, build_agent};
+use zeta_agent::{
+    Allow, Caller, Executor, LlmConfig, LocalExecutor, RadioContext, RemoteExecutor, build_agent,
+};
 use zeta_client::NodeClient;
 use zeta_speech::SpeechBackend;
 
@@ -124,7 +126,17 @@ async fn drive<E: Executor>(
     allow: Allow,
     request: &str,
 ) -> ExitCode {
-    let agent = match build_agent(cfg, exec, schema, md, max_turns, allow, None) {
+    let agent = match build_agent(
+        cfg,
+        exec,
+        schema,
+        md,
+        max_turns,
+        allow,
+        None,
+        RadioContext::default(),
+        Caller::cli(),
+    ) {
         Ok(a) => a,
         Err(e) => return fail(&e.to_string()),
     };
