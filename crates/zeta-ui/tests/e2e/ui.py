@@ -7641,8 +7641,10 @@ def scenario_video_pane_fills_main_and_switches_profile(page, url, secret):
         assert view_value(page, "video") == "video sharp"
         assert not errors, f"page errors {errors}"
     finally:
-        run_cmd(page, "view set video smooth")
-        stop_job(url, secret, job)
+        try:
+            stop_job(url, secret, job)
+        finally:
+            run_cmd(page, "view set video smooth")
 
 
 def scenario_video_pane_returns_the_waterfall_when_left(page, url, secret):
@@ -7652,9 +7654,13 @@ def scenario_video_pane_returns_the_waterfall_when_left(page, url, secret):
     job = start_video(url, secret, "video")
     try:
         open_video_pane(page, job)
+        # Shown: the main picture's socket (the tag's is paused).
+        page.wait_for_function("() => window.zetaVideo.sockets >= 1", timeout=10_000)
         pane_tab(page, "video").click()
         expect(page.locator("html")).not_to_have_attribute("data-full", "video")
         expect(page.locator("#waterfall")).to_be_visible()
+        # Left: the full view's sockets close and the tag's thumbnail is the one socket left.
+        page.wait_for_function("() => window.zetaVideo.sockets === 1", timeout=10_000)
         assert page.evaluate("getComputedStyle(document.getElementById('waterfall')).visibility") \
             != "hidden"
         assert not errors, f"page errors {errors}"
@@ -7663,6 +7669,7 @@ def scenario_video_pane_returns_the_waterfall_when_left(page, url, secret):
 
 
 def scenario_video_feed_stopping_falls_back_to_the_next(page, url, secret):
+    errors = page_errors(page)
     select_source(page, url, secret, "video")
     stop_videos(url, secret)
     first = start_video(url, secret, "video")
@@ -7681,6 +7688,10 @@ def scenario_video_feed_stopping_falls_back_to_the_next(page, url, secret):
         page.evaluate("window.zetaTest.poll()")
         expect(page.locator("html")).not_to_have_attribute("data-strip", "video", timeout=8_000)
         expect(pane_tab(page, "video")).to_be_hidden(timeout=8_000)
+        # A stopped job's sockets reconnect to its vanished stream once (the page's resilient
+        # reconnect), and Chromium logs each 404 as a console error: those are expected here.
+        other = [e for e in errors if not ("/stream/" in e and "404" in e)]
+        assert not other, f"page errors {other}"
     finally:
         stop_videos(url, secret)
 
@@ -7688,29 +7699,40 @@ def scenario_video_feed_stopping_falls_back_to_the_next(page, url, secret):
 def scenario_decode_video_greys_when_the_box_is_too_wide(page, url, secret):
     # The waterfall shows at most the capture's own width, so a real box is never wider than
     # the file's cap (asserted: its rate, 8 MHz); the page is told a 4 MHz cap instead.
+    cap = 4_000_000
+
     def route(r):
         if '"source_list"' not in (r.request.post_data or ""):
             return r.continue_()
         resp = r.fetch()
         data = resp.json()
         for src in data.get("value") or []:
-            src.setdefault("capabilities", {})["max_bandwidth_hz"] = {"asserted": 4_000_000}
+            src.setdefault("capabilities", {})["max_bandwidth_hz"] = {"asserted": cap}
         return r.fulfill(response=resp, body=json.dumps(data))
 
+    def box_hz():
+        footer = page.locator("#ctx-footer").text_content()
+        return int(re.search(r"bandwidth_hz=(\d+)", footer).group(1))
+
     page.route("**/op", route)
-    select_source(page, url, secret, "video")
-    wait_span(page, MENU_SPAN_S)
-    item = page.locator('#ctx .ctx-item[data-action="video"]')
-    drag_menu(page, 0.02, 0.98)  # about 7.7 MHz
-    expect(item).to_have_attribute("aria-disabled", "true", timeout=10_000)
-    title = item.get_attribute("title")
-    assert title.startswith("insufficient bandwidth") and "(measured at open)" not in title, title
-    page.keyboard.press("Escape")
-    drag_menu(page, 0.40, 0.60)  # about 1.6 MHz
-    expect(item).not_to_have_attribute("aria-disabled", "true")
-    assert item.get_attribute("title") is None
-    page.keyboard.press("Escape")
-    page.unroute("**/op", route)
+    try:
+        select_source(page, url, secret, "video")
+        wait_span(page, MENU_SPAN_S)
+        item = page.locator('#ctx .ctx-item[data-action="video"]')
+        drag_menu(page, 0.02, 0.98)
+        assert box_hz() > cap, f"wide box {box_hz()} Hz"
+        expect(item).to_have_attribute("aria-disabled", "true", timeout=10_000)
+        title = item.get_attribute("title")
+        assert title.startswith("insufficient bandwidth") and "(measured at open)" not in title, \
+            title
+        page.keyboard.press("Escape")
+        drag_menu(page, 0.40, 0.60)
+        assert box_hz() < cap, f"narrow box {box_hz()} Hz"
+        expect(item).not_to_have_attribute("aria-disabled", "true")
+        assert item.get_attribute("title") is None
+        page.keyboard.press("Escape")
+    finally:
+        page.unroute("**/op", route)
 
 
 def scenarios():

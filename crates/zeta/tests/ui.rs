@@ -296,11 +296,6 @@ fn fsk_fixture(dir: &Path) -> PathBuf {
     zeta_dsp::fixtures::write_fixture(dir, "fsk", &iq, 48_000, 433_920_000)
 }
 
-/// Wall-clock limit on each shard's ui.py run. One run of every scenario took 575-615 s on
-/// 2026-11-08 (the limit was 690 s); split in two shards (SHARDS) it took about 260 s, and
-/// about 310 s pinned to two CPUs (`taskset -c 0,1`, as on CI's runners). 450 s is about
-/// 1.45 times the pinned run, room for a few more scenarios before SHARD_STARTS or SHARDS
-/// needs a look.
 /// An analog PAL video recording, as gen_video writes it: 26 fields (13 whole frames, so the
 /// file loops without a seam) of the test card, FM at 1.5 MHz per volt, 8 MHz at 100 MHz,
 /// noise 25 dB under the carrier (about 33 MB in `dir`).
@@ -323,6 +318,11 @@ fn video_fixture(dir: &Path) -> PathBuf {
     zeta_dsp::fixtures::write_fixture(dir, "video", &iq, 8_000_000, 100_000_000)
 }
 
+/// Wall-clock limit on each shard's ui.py run. One run of every scenario took 575-615 s on
+/// 2026-11-08 (the limit was 690 s); split in two shards (SHARDS) it took about 260 s, and
+/// about 310 s pinned to two CPUs (`taskset -c 0,1`, as on CI's runners). 450 s is about
+/// 1.45 times the pinned run, room for a few more scenarios before SHARD_STARTS or SHARDS
+/// needs a look.
 const DEADLINE: Duration = Duration::from_secs(450);
 
 /// The shards run at once by default (ui.py's `SHARD_STARTS` says where each begins), each
